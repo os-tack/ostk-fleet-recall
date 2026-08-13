@@ -81,13 +81,13 @@ and archive eligibility do not force an unbounded post-filter scan.
 
 ```mermaid
 sequenceDiagram
-    participant A as OSTK agent
+    participant A as Fleet agent
     participant M as Fleet Recall service
     participant E as Pinned local embedder
     participant C as CockroachDB Cloud
 
     A->>M: recall(search, query, bounded limit)
-    M->>M: bind trusted tenant/project; validate arguments
+    M->>M: bind trusted tenant/project and validate arguments
     M->>E: encode query outside SQL transaction
     M->>C: scoped tsvector inverted-index query
     M->>C: scoped C-SPANN cosine query
