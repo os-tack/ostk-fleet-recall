@@ -14,10 +14,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate Mermaid diagrams
-        run: >-
-          npx --yes @mermaid-js/mermaid-cli@11.16.0
-          -i docs/ARCHITECTURE.md
-          -o /tmp/fleet-recall-architecture.md
+        run: |
+          printf '%s\n' '{"args":["--no-sandbox"]}' > "$RUNNER_TEMP/puppeteer.json"
+          npx --yes @mermaid-js/mermaid-cli@11.16.0 \
+            -p "$RUNNER_TEMP/puppeteer.json" \
+            -i docs/ARCHITECTURE.md \
+            -o "$RUNNER_TEMP/fleet-recall-architecture.md"
 
   video:
     runs-on: ubuntu-24.04
