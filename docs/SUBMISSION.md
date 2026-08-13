@@ -20,7 +20,7 @@ Durable, conflict-aware semantic memory for fleets of AI agents.
 
 **Repository**
 
-`[PUBLIC_GITHUB_REPOSITORY_URL]`
+<https://github.com/os-tack/ostk-fleet-recall>
 
 **Working demo**
 
@@ -145,7 +145,7 @@ Git history and pinned revisions make that boundary inspectable.
 | Distributed Vector Indexing | DDL and local representative `EXPLAIN`; cloud plan capture | Local ready; `[CAPTURE_CLOUD_PLAN]` |
 | CockroachDB Agent Skills | Pinned audit mapping guidance to code/tests and accepted deviations | Ready in repository |
 | AWS service | ECS/ALB/S3/Secrets/ECR/CloudWatch Terraform; LocalStack contract harness | LocalStack contract, Rust 1.94 image, migration, ingest, recall, and app-replacement persistence passed; `[DEPLOY_AND_CAPTURE]` in real AWS pending |
-| Public open source | Source, licenses, locked dependencies, setup and sample data | Local ready; `[PUSH_PUBLIC_REPO]` |
+| Public open source | Source, licenses, locked dependencies, setup and sample data | Published and anonymously verified at <https://github.com/os-tack/ostk-fleet-recall> |
 | Functional URL | HTTPS landing page, bounded recall, `/healthz` | Local HTTP healthy with recall hits; `[DEPLOY_AND_SMOKE_TEST]` pending |
 | Public video <3 min | YouTube/Vimeo link and final duration | `[RECORD_AND_UPLOAD]` |
 
@@ -198,10 +198,10 @@ to remember—and disagree—together.” End on the public demo URL and reposit
 
 ## Final release checklist
 
-- [ ] Public repository URL works in a logged-out browser.
-- [ ] Licenses, dependency lockfile, sample NDJSON, setup, architecture, and
+- [x] Public repository URL works in a logged-out browser.
+- [x] Licenses, dependency lockfile, sample NDJSON, setup, architecture, and
       pre-existing-work disclosure are present.
-- [ ] CI passes from a clean clone on Rust 1.94.
+- [x] CI passes from a clean clone on Rust 1.94.
 - [ ] CockroachDB Cloud uses TLS, a non-admin runtime user, backups, and an
       allowlist/private route.
 - [ ] Run one migration task, then verify `health` and all required indexes.
