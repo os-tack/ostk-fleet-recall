@@ -6,6 +6,12 @@ billing choices, DNS ownership, or database credentials. Do not place database
 URLs, passwords, AWS access keys, or secret values in this repository,
 Terraform variables, command-line arguments, screenshots, or shell history.
 
+Current release state: the local CockroachDB and LocalStack gates have produced
+local application evidence, while the real AWS deployment, CockroachDB Cloud
+verification, public HTTPS URL, and cloud reference-agent run are still
+pending. Do not present this runbook or its Terraform as proof that those live
+gates have already passed.
+
 The labels below are gates:
 
 - **APPROVAL REQUIRED** means the account owner must approve the named choice
@@ -328,21 +334,76 @@ Continue with [the AWS deployment runbook](../deploy/aws/README.md), using:
 - an immutable commit-derived ECR image tag; and
 - the certificate ARN plus exact demo hostname.
 
+Retain the safe judging defaults from `terraform.tfvars.example`:
+
+```hcl
+log_retention_days         = 60
+enable_deletion_protection = true
+```
+
 Keep `service_desired_count = 0` and `autoscaling_min_capacity = 0` through the
 first apply. Run exactly one migration task, grant the runtime user, run the
-one-off idempotent seed task, capture cloud `EXPLAIN` evidence, and only then
-approve scaling the service to one. Protect local Terraform state and
-`terraform.tfvars`; both are ignored but remain operationally sensitive.
+one-off idempotent seed task, and capture cloud `EXPLAIN` evidence. Then approve
+scaling the public service to one, validate HTTPS and recall, force a task
+replacement, and prove recall again. Only after that public demo is running and
+healthy should you run the standalone deterministic reference policy fleet:
 
-## Teardown and cost stop
+```bash
+RUN_ID=devpost-cloud-YYYYMMDDTHHMMSSZ
+mkdir -p target/aws-evidence
+./deploy/aws/run-reference-agent.sh "$RUN_ID" \
+  >"target/aws-evidence/reference-agent-$RUN_ID.json"
+jq -e '.schema == "fleet-reference-agent-run-v1" and .verified == true' \
+  "target/aws-evidence/reference-agent-$RUN_ID.json"
+```
+
+The wrapper requires `aws`, `curl`, `jq`, and `terraform`. It derives the real
+Terraform `demo_url`, fails unless `/healthz` succeeds, then starts four one-off
+Fargate tasks in sequence: Agent A records and idempotently replays the
+migration decision; Agent B finds it through lexical+dense RRF, verifies it by
+exact get, persists a cited action, and rereads that action; Agent C records an
+incompatible decision and proves the exact disputed A/C members and values;
+then the same deployment-bound B identity recalls the open conflict, persists a
+cited escalation, and rereads it. It validates each task override, exit, and
+structured CloudWatch receipt, then uses the public read-only recall API to
+require the exact action and escalation claim IDs. It emits a final JSON object
+only when the AWS tasks, CockroachDB memory chain, and public demo all
+correlate. This is the default AWS agent proof and invokes neither OSTK nor an
+LLM. A local run or Terraform test is not a substitute for this pending
+Fargate/CockroachDB Cloud capture.
+
+The receipt includes four per-step task/log coordinates and a `public_demo`
+section with the ready state, exact observed action/escalation claim IDs, and
+lexical+dense RRF diagnostics. Protect the raw JSON artifact, local Terraform
+state, and `terraform.tfvars`; all are ignored but remain operationally
+sensitive. Redact AWS account/infrastructure identifiers before screenshots or
+publication. The final video should use the fresh standalone Fleet Recall
+capture/render as its default agent sequence and show a reviewed, redacted form
+of the correlated AWS result as cloud proof. An OSTK render is an explicitly
+optional alternate.
+
+## Judging availability hold, then teardown
+
+The [official rules](https://cockroachdb-ai.devpost.com/rules) require the
+working project to remain available free of charge and without restriction
+until the judging period ends. Once the URL is submitted, keep the public ECS
+service, CockroachDB Cloud data plane, S3 model objects, runtime secrets,
+networking, DNS/TLS, and required logs operational through **September 15, 2026
+at 5:00 PM EDT / 4:00 PM CDT**. Monitor and repair the deployment during that
+hold; do not scale it to zero, revoke judging access, destroy it, or begin the
+steps below before the deadline. Keep ALB deletion protection enabled and the
+60-day CloudWatch log retention intact for the entire judging window.
 
 **APPROVAL REQUIRED — DESTRUCTIVE AND COST-BEARING:** Teardown deletes or
 disconnects resources and can destroy evidence or data. Preserve submission
-evidence and obtain explicit approval for every external deletion.
+evidence, wait until the judging hold has expired, and obtain explicit approval
+for every external deletion.
 
 1. Set ECS desired/minimum capacity to zero and apply; verify no tasks remain.
 2. Preserve required logs, screenshots, cloud plans, and the final demo URL.
-3. Run and review `terraform plan -destroy`, then approve `terraform destroy`.
+3. Set `enable_deletion_protection = false`, review and apply that deliberate
+   change, and verify that ALB protection is disabled. Only then run and review
+   a separate `terraform plan -destroy` before approving `terraform destroy`.
    The ECR repository may need its immutable images deleted first.
 4. Separately review resources Terraform does not own: NAT Gateway and Elastic
    IP, S3 objects/versions and bucket, the two Secrets Manager secrets, DNS and

@@ -7,10 +7,12 @@ repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 usage() {
     cat >&2 <<'EOF'
 usage: demo/video/run.sh --rehearsal [--headless]
-       demo/video/run.sh --live [RUN_ID] [--headless]
+       demo/video/run.sh --fleet-live [RUN_ID] [--headless]
+       demo/video/run.sh --ostk-live [RUN_ID] [--headless]
 
 --rehearsal renders the checked-in sanitized LocalStack/MCP evidence.
---live requires a verified target/ostk-demo/RUN_ID/final.json.
+--fleet-live renders fresh target/fleet-demo/RUN_ID/final.json evidence.
+--ostk-live renders an optional target/ostk-demo/RUN_ID/final.json run.
 EOF
     exit 64
 }
@@ -24,9 +26,19 @@ while [ "$#" -gt 0 ]; do
             [ -z "$mode" ] || usage
             mode=rehearsal
             ;;
-        --live)
+        --fleet-live)
             [ -z "$mode" ] || usage
-            mode=live
+            mode=fleet-live
+            if [ "$#" -gt 1 ]; then
+                case "$2" in
+                    -*) ;;
+                    *) run_id=$2; shift ;;
+                esac
+            fi
+            ;;
+        --ostk-live)
+            [ -z "$mode" ] || usage
+            mode=ostk-live
             if [ "$#" -gt 1 ]; then
                 case "$2" in
                     -*) ;;
@@ -55,51 +67,44 @@ for command_name in jq tmux; do
     }
 done
 
+require_real_directory() {
+    directory=$1
+    [ -d "$directory" ] && [ ! -L "$directory" ] || {
+        printf 'video demo: evidence directory is missing or symlinked\n' >&2
+        exit 1
+    }
+}
+
 case "$mode" in
     rehearsal)
         evidence_rel=docs/evidence/local-fleet-scenario.json
         evidence_path=$repo_root/$evidence_rel
-        jq -e '
-            def positive_integer:
-                type == "number" and isfinite and . > 0 and . == floor;
-            . as $root |
-            .scenario == "local-evidence-v1" and
-            .agent_a.committed == true and
-            .agent_a.replay_deduplicated == true and
-            (.agent_a.claim_id | positive_integer) and
-            (.agent_b.action_claim_id | positive_integer) and
-            (.agent_b.escalation_claim_id | positive_integer) and
-            (.agent_c.claim_id | positive_integer) and
-            (.conflict.id | positive_integer) and
-            ([
-                .agent_a.claim_id,
-                .agent_b.action_claim_id,
-                .agent_c.claim_id,
-                .agent_b.escalation_claim_id
-            ] | unique | length) == 4 and
-            .agent_b.cross_project_request_rejected == true and
-            .agent_b.retrieval_lanes == ["lexical", "dense"] and
-            .agent_b.fusion == "rrf" and
-            .agent_b.recalled_claim_id == .agent_a.claim_id and
-            .agent_b.action_based_on_claim_id == .agent_a.claim_id and
-            .agent_b.action == "hold workers until migration completes" and
-            .agent_b.escalation == "pause rollout for operator review" and
-            .agent_b.escalation_conflict_id == .conflict.id and
-            .agent_c.incompatible_value_recorded == true and
-            .conflict.state == "open" and
-            (.conflict.member_claim_ids | type == "array" and length == 2) and
-            ((.conflict.member_claim_ids | sort) ==
-                ([$root.agent_a.claim_id, $root.agent_c.claim_id] | sort))
-        ' "$evidence_path" >/dev/null || {
-            printf 'video demo: rehearsal evidence failed its contract\n' >&2
-            exit 1
-        }
+        "$script_dir/verify.sh" rehearsal "$evidence_path"
         ;;
-    live)
-        run_id=${run_id:-${OSTK_DEMO_RUN_ID:-}}
+    fleet-live)
+        run_id=${run_id:-${FLEET_VIDEO_RUN_ID:-}}
         case "$run_id" in
             ''|*[!A-Za-z0-9_-]*)
-                printf 'video demo: --live requires a safe OSTK run ID\n' >&2
+                printf 'video demo: --fleet-live requires a safe run ID\n' >&2
+                exit 64
+                ;;
+        esac
+        [ "${#run_id}" -le 48 ] || {
+            printf 'video demo: run ID must be at most 48 characters\n' >&2
+            exit 64
+        }
+        evidence_rel=target/fleet-demo/$run_id/final.json
+        evidence_path=$repo_root/$evidence_rel
+        require_real_directory "$repo_root/target"
+        require_real_directory "$repo_root/target/fleet-demo"
+        require_real_directory "$repo_root/target/fleet-demo/$run_id"
+        "$script_dir/verify.sh" fleet-live "$evidence_path" "$run_id"
+        ;;
+    ostk-live)
+        run_id=${run_id:-${FLEET_VIDEO_RUN_ID:-}}
+        case "$run_id" in
+            ''|*[!A-Za-z0-9_-]*)
+                printf 'video demo: --ostk-live requires a safe OSTK run ID\n' >&2
                 exit 64
                 ;;
         esac
@@ -109,45 +114,10 @@ case "$mode" in
         }
         evidence_rel=target/ostk-demo/$run_id/final.json
         evidence_path=$repo_root/$evidence_rel
-        jq -e --arg requested_run "$run_id" '
-            def positive_integer:
-                type == "number" and isfinite and . > 0 and . == floor;
-            .run_id as $run |
-            .schema_version == 1 and
-            .verified == true and
-            .run_id == $requested_run and
-            ($run | type == "string" and test("^[A-Za-z0-9_-]{1,48}$")) and
-            .orchestrator.product == "ostk" and
-            .orchestrator.required_cli_version == "7.7.7" and
-            .orchestrator.sessions == [
-                ("ostk-recall-a-" + $run),
-                ("ostk-recall-b-" + $run),
-                ("ostk-recall-c-" + $run)
-            ] and
-            .orchestrator.resumed_session == .orchestrator.sessions[1] and
-            (.memory.recalled_claim_id | positive_integer) and
-            (.memory.incompatible_claim_id | positive_integer) and
-            (.memory.open_conflict_id | positive_integer) and
-            .memory.recalled_claim_id != .memory.incompatible_claim_id and
-            .memory.retrieval_lanes == ["lexical", "dense"] and
-            .memory.fusion == "rrf" and
-            (.actions | type == "array" and length == 2) and
-            .actions[0].action == "hold workers until migration completes" and
-            .actions[1].action == "pause rollout and escalate for operator review" and
-            .actions[0].based_on_claim_id == .memory.recalled_claim_id and
-            .actions[1].based_on_conflict_id == .memory.open_conflict_id and
-            .actions[0].receipt == (
-                "s3://fleet-recall-local-actions/ostk-demo/" + $run +
-                "/agent-b/hold-workers.json"
-            ) and
-            .actions[1].receipt == (
-                "s3://fleet-recall-local-actions/ostk-demo/" + $run +
-                "/agent-b/pause-rollout.json"
-            )
-        ' "$evidence_path" >/dev/null || {
-            printf 'video demo: live evidence is missing or is not a verified OSTK final.json\n' >&2
-            exit 1
-        }
+        require_real_directory "$repo_root/target"
+        require_real_directory "$repo_root/target/ostk-demo"
+        require_real_directory "$repo_root/target/ostk-demo/$run_id"
+        "$script_dir/verify.sh" ostk-live "$evidence_path" "$run_id"
         ;;
 esac
 
@@ -194,6 +164,60 @@ agent_c_pane=$(tmux split-window -v -t "$main_pane" -c "$repo_root" \
     -P -F '#{pane_id}' "$pane_shell")
 agent_b_resume_pane=$(tmux split-window -v -t "$right_pane" -c "$repo_root" \
     -P -F '#{pane_id}' "$pane_shell")
+
+wait_for_pane_ready() {
+    pane=$1
+    previous_command=
+    stable_polls=0
+    attempt=0
+    while [ "$attempt" -lt 100 ]; do
+        current_command=$(tmux display-message -p -t "$pane" '#{pane_current_command}')
+        if [ -n "$current_command" ] && [ "$current_command" = "$previous_command" ]; then
+            stable_polls=$((stable_polls + 1))
+        else
+            stable_polls=0
+            previous_command=$current_command
+        fi
+        [ "$stable_polls" -ge 3 ] && break
+        attempt=$((attempt + 1))
+        sleep 0.05
+    done
+    [ "$stable_polls" -ge 3 ] || {
+        printf 'video demo: pane shell did not stabilize\n' >&2
+        exit 1
+    }
+
+    tmux send-keys -t "$pane" -l -- "printf '%s\\n' __FLEET_VIDEO_PANE_READY__"
+    tmux send-keys -t "$pane" Enter
+    attempt=0
+    while ! tmux capture-pane -p -t "$pane" | \
+        grep -F '__FLEET_VIDEO_PANE_READY__' >/dev/null; do
+        attempt=$((attempt + 1))
+        [ "$attempt" -lt 100 ] || {
+            printf 'video demo: pane shell did not accept input\n' >&2
+            exit 1
+        }
+        sleep 0.05
+    done
+
+    tmux send-keys -t "$pane" -l -- "printf '\\033[2J\\033[H'"
+    tmux send-keys -t "$pane" Enter
+    attempt=0
+    while tmux capture-pane -p -t "$pane" | \
+        grep -F '__FLEET_VIDEO_PANE_READY__' >/dev/null; do
+        attempt=$((attempt + 1))
+        [ "$attempt" -lt 100 ] || {
+            printf 'video demo: pane shell did not clear readiness marker\n' >&2
+            exit 1
+        }
+        sleep 0.05
+    done
+}
+
+for pane in "$main_pane" "$right_pane" "$agent_c_pane" \
+    "$agent_b_resume_pane" "$footer_pane"; do
+    wait_for_pane_ready "$pane"
+done
 
 tmux select-pane -t "$main_pane" -T 'AGENT A  •  MEMORY WRITER'
 tmux select-pane -t "$right_pane" -T 'AGENT B  •  RETRIEVER + ACTOR'

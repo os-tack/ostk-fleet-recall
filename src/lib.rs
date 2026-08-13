@@ -1,4 +1,4 @@
-//! Distributed semantic memory for OSTK agent fleets.
+//! Distributed semantic memory for agent fleets, with optional OSTK integration.
 //!
 //! The crate implements the same agent-facing `recall`/`remember` contract as
 //! `ostk-recall`, while keeping durable corpus and epistemic state in
@@ -13,6 +13,7 @@ pub mod context;
 pub mod error;
 pub mod ledger;
 pub mod mcp;
+pub mod reference_agent;
 pub mod service;
 pub mod store;
 

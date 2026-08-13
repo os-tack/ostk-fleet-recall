@@ -20,14 +20,23 @@ bold='\033[1m'
 reset='\033[0m'
 
 printf '\033[2J\033[H\033[?25l'
-if [ "$mode" = rehearsal ]; then
-    provenance="${yellow}REHEARSAL${reset} · sanitized evidence · no cloud/LLM calls"
-    source_name=docs/evidence/local-fleet-scenario.json
-else
-    run_id=$(jq -er '.run_id' "$evidence")
-    provenance="${green}LIVE EVIDENCE${reset} · verified OSTK 7.7.7 run ${white}$run_id${reset}"
-    source_name=target/ostk-demo/RUN_ID/final.json
-fi
+case "$mode" in
+    rehearsal)
+        provenance="${yellow}REHEARSAL${reset} · sanitized evidence · no cloud/LLM calls"
+        source_name=docs/evidence/local-fleet-scenario.json
+        ;;
+    fleet-live)
+        run_id=$(jq -er '.run_id' "$evidence")
+        provenance="${green}LOCAL LIVE MCP EVIDENCE${reset} · local CockroachDB run ${white}$run_id${reset} · NO AWS/CLOUD · no OSTK/LLM"
+        source_name=target/fleet-demo/RUN_ID/final.json
+        ;;
+    ostk-live)
+        run_id=$(jq -er '.run_id' "$evidence")
+        provenance="${lavender}OPTIONAL OSTK EVIDENCE${reset} · verified 7.7.7 run ${white}$run_id${reset}"
+        source_name=target/ostk-demo/RUN_ID/final.json
+        ;;
+    *) printf 'video footer: unknown mode\n' >&2; exit 64 ;;
+esac
 
 case "$stage" in
     intro) status="${blue}READY${reset} · A writes/replays → B recalls/acts → C conflicts → B resumes" ;;
@@ -39,10 +48,10 @@ case "$stage" in
     *) printf 'video footer: unknown stage\n' >&2; exit 64 ;;
 esac
 
-printf '%b\n' "${bold}${white}OSTK FLEET RECALL${reset}  │  $provenance"
+printf '%b\n' "${bold}${white}FLEET RECALL${reset}  │  $provenance"
 printf '%b\n' "${muted}CockroachDB 26.2${reset}  │  ${lavender}C-SPANN vector + lexical → RRF${reset}  │  $status"
 if [ "$stage" = verified ]; then
-    printf '%b\n' "${muted}fixture: $source_name · separate smoke gate: S3 + Secrets + task replacement${reset}"
+    printf '%b\n' "${muted}evidence: $source_name · separate smoke gate: S3 + Secrets + task replacement${reset}"
 else
-    printf '%b\n' "${muted}fixture: $source_name · deployment-bound identities · scoped tenant/project corpus${reset}"
+    printf '%b\n' "${muted}evidence: $source_name · deployment-bound identities · scoped tenant/project corpus${reset}"
 fi

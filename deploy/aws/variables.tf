@@ -80,6 +80,14 @@ variable "database_url_secret_arn" {
   description = "Secrets Manager ARN whose raw value is the TLS CockroachDB runtime URL."
   type        = string
   sensitive   = true
+
+  validation {
+    condition = can(regex(
+      "^arn:aws:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$",
+      var.database_url_secret_arn,
+    )) && !strcontains(var.database_url_secret_arn, "*")
+    error_message = "database_url_secret_arn must be one concrete commercial-partition Secrets Manager ARN without wildcards."
+  }
 }
 
 variable "migration_database_url_secret_arn" {
@@ -88,12 +96,31 @@ variable "migration_database_url_secret_arn" {
   default     = null
   nullable    = true
   sensitive   = true
+
+  validation {
+    condition = var.migration_database_url_secret_arn == null || (
+      can(regex(
+        "^arn:aws:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$",
+        var.migration_database_url_secret_arn,
+      )) && !strcontains(var.migration_database_url_secret_arn, "*")
+    )
+    error_message = "migration_database_url_secret_arn must be one concrete commercial-partition Secrets Manager ARN without wildcards."
+  }
 }
 
 variable "database_secret_kms_key_arns" {
   description = "Customer-managed KMS key ARNs used by either database secret."
   type        = list(string)
   default     = []
+
+  validation {
+    condition = alltrue([
+      for arn in var.database_secret_kms_key_arns :
+      can(regex("^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key/[0-9a-fA-F-]{36}$", arn)) &&
+      !strcontains(arn, "*")
+    ])
+    error_message = "database_secret_kms_key_arns must contain only concrete commercial-partition KMS key ARNs without aliases or wildcards."
+  }
 }
 
 variable "tenant_id" {
@@ -249,9 +276,17 @@ variable "autoscaling_cpu_target" {
 }
 
 variable "log_retention_days" {
-  description = "CloudWatch application log retention."
+  description = "CloudWatch application log retention; the 60-day default preserves judging evidence."
   type        = number
-  default     = 30
+  default     = 60
+
+  validation {
+    condition = contains([
+      1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731,
+      1096, 1827, 2192, 2557, 2922, 3288, 3653,
+    ], var.log_retention_days)
+    error_message = "log_retention_days must be a retention period supported by CloudWatch Logs."
+  }
 }
 
 variable "enable_container_insights" {
@@ -261,9 +296,9 @@ variable "enable_container_insights" {
 }
 
 variable "enable_deletion_protection" {
-  description = "Protect the ALB from accidental deletion. Enable outside an ephemeral demo."
+  description = "Protect the public ALB from accidental deletion during the judging window."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "tags" {

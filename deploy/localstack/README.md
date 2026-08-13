@@ -27,13 +27,12 @@ does **not** claim to emulate Fargate scheduling, ALB TLS/health registration,
 ECR push/pull, AWS IAM enforcement, multi-AZ networking, ECS Secrets Manager
 injection, or CloudWatch delivery. Those remain real-AWS staging gates.
 
-Evidence captured on 2026-08-13 is deliberately split. The base contract smoke
-passed with the production Rust 1.94 image, including recall after forced
-application-container replacement. The expanded three-identity scenario then
-passed separately against the release image and a fresh CockroachDB 26.2.3
-node. Re-running the combined script is pending restored reachability to
-LocalStack's external license activation service; that external failure is not
-reported as an application pass.
+On 2026-08-13 the combined current-source smoke passed with the production Rust
+1.94 image. One run verified the S3 and Secrets Manager contracts, migration,
+model delivery, ingestion, the full three-identity memory/action/conflict flow,
+forced application-container replacement, and recall from the unchanged
+CockroachDB 26.2.3 node afterward. This is local emulator/application evidence,
+not proof of Fargate, IAM, ALB, or CockroachDB Cloud behavior.
 
 ## Requirements
 

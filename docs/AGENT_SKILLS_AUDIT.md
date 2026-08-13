@@ -1,22 +1,41 @@
 # CockroachDB Agent Skills implementation audit
 
-Fleet Recall used CockroachDB's official Agent Skills as an engineering input,
-not merely as a submission label. This audit records the pinned guidance, the
-decisions it changed or confirmed, code evidence, validation, and consciously
-deferred risks.
+Fleet Recall used CockroachDB's official Agent Skills as a development-time
+engineering input, not merely as a submission label. The actor was the coding
+agent used to implement and review this repository under entrant direction. Its
+action was to invoke the pinned, machine-executable `SKILL.md` instructions,
+apply their transaction and SQL review guidance to the implementation, and add
+or check the code/tests traced below.
+
+The application does not import or execute these skills. They are not an ECS,
+AWS, CockroachDB Cloud, Fleet Recall runtime, or end-user dependency; the coding
+agent did not use them to operate a cloud deployment. This audit proves
+development-time use and inspectable effects only, not a completed hosted run.
 
 ## Provenance
 
-- Repository: <https://github.com/cockroachdb/agent-skills>
-- Reviewed commit: [`e14e86d23ce8ee2e7e40a34ce2944c2502b6eadd`](https://github.com/cockroachdb/agent-skills/tree/e14e86d23ce8ee2e7e40a34ce2944c2502b6eadd)
+- Repository: <https://github.com/cockroachlabs/cockroachdb-skills>
+- Reviewed commit: [`e14e86d23ce8ee2e7e40a34ce2944c2502b6eadd`](https://github.com/cockroachlabs/cockroachdb-skills/tree/e14e86d23ce8ee2e7e40a34ce2944c2502b6eadd)
 - Review date: 2026-08-13
 - Skills applied:
-  - [`designing-application-transactions`](https://github.com/cockroachdb/agent-skills/blob/e14e86d23ce8ee2e7e40a34ce2944c2502b6eadd/skills/cockroachdb-application-development/designing-application-transactions/SKILL.md), including its monitoring and concurrency-testing reference.
-  - [`cockroachdb-sql`](https://github.com/cockroachdb/agent-skills/blob/e14e86d23ce8ee2e7e40a34ce2944c2502b6eadd/skills/cockroachdb-query-and-schema-design/cockroachdb-sql/SKILL.md), including fundamental, schema, DML, query, optimization, and operational rule references.
+  - [`designing-application-transactions`](https://github.com/cockroachlabs/cockroachdb-skills/blob/e14e86d23ce8ee2e7e40a34ce2944c2502b6eadd/skills/cockroachdb-application-development/designing-application-transactions/SKILL.md), including its monitoring and concurrency-testing reference.
+  - [`cockroachdb-sql`](https://github.com/cockroachlabs/cockroachdb-skills/blob/e14e86d23ce8ee2e7e40a34ce2944c2502b6eadd/skills/cockroachdb-query-and-schema-design/cockroachdb-sql/SKILL.md), including fundamental, schema, DML, query, optimization, and operational rule references.
 
 The audit covered `migrations/0001_fleet_memory.sql`, the corpus and ledger SQL,
 transaction retry implementation, health/capability probes, live-database
 tests, deployment pooling, and the migration runbook.
+
+## Pinned invocation-to-evidence map
+
+| Machine-executable skill invoked by the coding agent | Development action | Resulting code/test trace |
+|---|---|---|
+| `designing-application-transactions` at `e14e86d` | Reviewed transaction boundaries, moved embedding work outside the retryable unit, restricted retries to fresh `40001` transactions, and required idempotency/concurrency checks. | `src/ledger/cockroach.rs` record/replay path; `src/store/cockroach.rs` retry classifier; replay, retry, and concurrent at-most-one-commit tests |
+| `cockroachdb-sql` at `e14e86d` | Reviewed DDL, scoped access paths, parameterized DML, vector/lexical query shapes, health capabilities, and representative `EXPLAIN` gates. | `migrations/0001_fleet_memory.sql`; SQL in `src/store/cockroach.rs` and `src/ledger/cockroach.rs`; schema, scope-isolation, health, and live plan tests |
+
+The commit and direct skill permalinks above pin the exact instructions. The
+repository paths and named tests below show what the coding agent changed or
+validated after invoking them; they do not imply that an agent skill runs in
+production or that AWS/CockroachDB Cloud evidence already exists.
 
 ## Guidance-to-implementation trace
 

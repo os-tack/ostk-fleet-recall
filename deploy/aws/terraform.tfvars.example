@@ -29,6 +29,12 @@ service_desired_count     = 0
 autoscaling_min_capacity  = 0
 autoscaling_max_capacity  = 2
 
+# Preserve judging evidence and protect the submitted endpoint through
+# September 15, 2026 5:00 PM EDT. Disable protection only for approved
+# post-judging teardown.
+log_retention_days         = 60
+enable_deletion_protection = true
+
 # Add an ACM certificate after pointing application DNS at the ALB.
 certificate_arn = null
 demo_hostname   = null

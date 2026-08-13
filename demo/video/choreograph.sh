@@ -33,6 +33,10 @@ wait_for_text() {
         attempt=$((attempt + 1))
         [ "$attempt" -lt 100 ] || {
             printf 'video choreography: pane did not render expected text: %s\n' "$expected" >&2
+            printf 'video choreography: pane path=%s command=%s\n' \
+                "$(tmux display-message -p -t "$target" '#{pane_current_path}')" \
+                "$(tmux display-message -p -t "$target" '#{pane_current_command}')" >&2
+            tmux capture-pane -p -S - -t "$target" >&2 || true
             return 1
         }
         sleep 0.05
@@ -44,7 +48,6 @@ send_command() {
     shift
     command_text=$*
     tmux select-pane -t "$target"
-    tmux send-keys -t "$target" C-l
     tmux send-keys -t "$target" -l -- "$command_text"
     tmux send-keys -t "$target" Enter
 }

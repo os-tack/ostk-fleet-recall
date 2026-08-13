@@ -44,6 +44,38 @@ run "dormant_http_bootstrap" {
   }
 
   assert {
+    condition = (
+      aws_cloudwatch_log_group.app.retention_in_days == 60 &&
+      aws_lb.app.enable_deletion_protection
+    )
+    error_message = "submission defaults must retain evidence and protect the public endpoint through judging"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ecs_task_definition.reference_agent.container_definitions)[0].command ==
+      ["reference-agent", "--step", "record-decision", "--run-id", "terraform-placeholder"]
+    )
+    error_message = "the one-off reference-agent task must default to the safe writer step"
+  }
+
+  assert {
+    condition = (
+      [for entry in jsondecode(aws_ecs_task_definition.reference_agent.container_definitions)[0].environment : entry.value if entry.name == "FLEET_RECALL_AGENT"] ==
+      ["agent-a"]
+    )
+    error_message = "the reference-agent task default must be deployment-bound to agent-a"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ecs_task_definition.reference_agent.container_definitions)[0].secrets[0].valueFrom ==
+      var.database_url_secret_arn
+    )
+    error_message = "the reference agent must use the runtime DML credential"
+  }
+
+  assert {
     condition     = aws_appautoscaling_target.app.min_capacity == 0
     error_message = "autoscaling must not race the first migration"
   }
@@ -147,4 +179,44 @@ run "rejects_inverted_capacity" {
   }
 
   expect_failures = [aws_appautoscaling_target.app]
+}
+
+run "rejects_unsupported_log_retention" {
+  command = plan
+
+  variables {
+    log_retention_days = 61
+  }
+
+  expect_failures = [var.log_retention_days]
+}
+
+run "rejects_wildcard_database_secret" {
+  command = plan
+
+  variables {
+    database_url_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:*"
+  }
+
+  expect_failures = [var.database_url_secret_arn]
+}
+
+run "rejects_wildcard_migration_secret" {
+  command = plan
+
+  variables {
+    migration_database_url_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:*"
+  }
+
+  expect_failures = [var.migration_database_url_secret_arn]
+}
+
+run "rejects_wildcard_database_kms_key" {
+  command = plan
+
+  variables {
+    database_secret_kms_key_arns = ["arn:aws:kms:us-east-1:123456789012:key/*"]
+  }
+
+  expect_failures = [var.database_secret_kms_key_arns]
 }

@@ -330,13 +330,34 @@ agent_b_escalation_id=$(printf '%s' "$agent_b_escalation_responses" | jq -er \
 
 summary=$(jq -cn \
     --arg run_id "$run_id" \
+    --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson claim_a_id "$claim_a_id" \
     --argjson agent_b_action_id "$agent_b_action_id" \
     --argjson agent_b_escalation_id "$agent_b_escalation_id" \
     --argjson claim_c_id "$claim_c_id" \
     --argjson conflict_id "$conflict_id" \
     '{
+        schema_version: 1,
+        verified: true,
+        evidence_kind: "fleet-recall-mcp-scenario",
+        capture: "live",
+        run_id: $run_id,
+        generated_at: $generated_at,
         scenario: $run_id,
+        provenance: {
+            generator: "deploy/localstack/fleet-demo.sh",
+            backend: "cockroachdb",
+            transport: "mcp-stdio",
+            ostk_used: false,
+            llm_used: false,
+            cloud_used: false
+        },
+        identities: {
+            writer: "agent-a",
+            retriever: "agent-b",
+            conflicting_writer: "agent-c",
+            resumed: "agent-b"
+        },
         agent_a: {
             claim_id: $claim_a_id,
             committed: true,
@@ -368,7 +389,7 @@ summary=$(jq -cn \
 if [ "$output_json" -eq 1 ]; then
     printf '%s\n' "$summary"
 else
-    printf '%s\n' 'OSTK Fleet Recall — three-agent CockroachDB scenario'
+    printf '%s\n' 'Fleet Recall — three-identity CockroachDB scenario'
     printf '  Agent A recorded claim %s; identical replay returned the same durable receipt.\n' "$claim_a_id"
     printf '  Agent B found claim %s through lexical+dense RRF, then recorded execution plan %s.\n' "$claim_a_id" "$agent_b_action_id"
     printf '%s\n' '  Cross-project injection was rejected.'

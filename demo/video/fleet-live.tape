@@ -1,4 +1,4 @@
-Output demo/video/generated/live.mp4
+Output demo/video/generated/fleet-live.mp4
 
 Require jq
 Require tmux
@@ -21,7 +21,7 @@ Set CursorBlink false
 Env FLEET_VIDEO_VHS "1"
 
 Hide
-Type "clear && ./demo/video/run.sh --live"
+Type "clear && ./demo/video/run.sh --fleet-live"
 Enter
 Sleep 750ms
 Show

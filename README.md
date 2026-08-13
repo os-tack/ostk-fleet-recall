@@ -2,9 +2,10 @@
 
 ![OSTK Fleet Recall: distributed, conflict-aware agent memory](docs/assets/devpost-thumbnail-v2.png)
 
-Shared, durable semantic memory for fleets of OSTK agents, backed by
-CockroachDB while preserving Recall's local-first semantics and two-tool MCP
-contract.
+Shared, durable semantic memory for agent fleets, backed by CockroachDB while
+preserving Recall's local-first semantics and two-tool MCP contract. It works
+with any MCP client; OSTK orchestration is an optional integration, not an
+install or runtime requirement.
 
 `ostk-recall` remains the private, local-first corpus powered by LanceDB and
 SQLite. Fleet Recall is the distributed backend for agents that need to share
@@ -19,11 +20,38 @@ The implemented hackathon surface is intentionally small:
 - `remember(record)` records a deliberate typed claim with provenance,
   idempotent mutation receipts, and conflict detection.
 - `ingest` is a trusted operator CLI for populating the active chunk corpus.
+- `reference-agent` runs one bounded step of the deterministic rollout-safety
+  policy used by the default AWS agent proof.
 - `demo` is a bounded, read-only HTTP surface; it exposes no mutation route.
+
+The reference policy agent is ordinary Fleet Recall application code: it
+retrieves memory, applies an explicit deterministic policy, and records a cited
+action. It does not invoke OSTK, an LLM, or a model API. The OSTK adapter is a
+strictly optional interoperability path.
 
 Attention schema space is reserved for future compatibility, but attention
 actions and a runtime attention workflow are **not implemented** in this
 hackathon slice. Additional canonical Recall actions are also future work.
+
+## Evidence status
+
+Local CockroachDB tests, the passing combined LocalStack contract smoke, and
+the sanitized video rehearsal are application evidence only; they are not
+proof of an AWS or CockroachDB Cloud deployment. The Terraform reference-agent
+task and `deploy/aws/run-reference-agent.sh` are implemented as the default
+cloud proof path, but the real AWS/CockroachDB Cloud run, post-replacement
+recall, and public HTTPS URL remain pending. Bracketed release placeholders in
+[`docs/SUBMISSION.md`](docs/SUBMISSION.md) stay unresolved until those live
+artifacts exist.
+
+The default final video path is a fresh standalone Fleet Recall MCP capture and
+render. A verified OSTK render may be used only as an explicitly optional
+alternate; neither the core demo nor the cloud proof requires it.
+
+After the public judging deployment exists, keep it free and unrestricted
+through **September 15, 2026 at 5:00 PM EDT / 4:00 PM CDT**. Do not scale it to
+zero or tear down its AWS, CockroachDB Cloud, DNS/TLS, model, secret, logging,
+or network dependencies before that hold expires.
 
 ## Local quickstart
 
@@ -392,15 +420,19 @@ only one-row functional behavior.
   is an emulator preflight, **not evidence of an AWS deployment**.
 - [Optional OSTK adapter demo](docs/OSTK_DEMO.md): can coordinate bounded OSTK
   model sessions through a checked-in non-native stdio bridge; Fleet Recall,
-  its deterministic scenario, and the default plan require no OSTK model run.
+  its deterministic policy agent, and the default plan require no OSTK or LLM
+  run.
 - [Reproducible terminal video](docs/VIDEO_DEMO.md): renders the four-pane tmux
-  scenario with VHS from either sanitized rehearsal evidence or a verified
-  opt-in OSTK run.
+  scenario with VHS from sanitized rehearsal evidence, a fresh verified
+  standalone Fleet Recall MCP run, or an explicitly optional verified OSTK
+  run.
 - [Cloud onboarding](docs/CLOUD_ONBOARDING.md): explicit AWS/CockroachDB account,
   approval, cost, identity, TLS, model, and teardown gates.
 - [AWS Terraform runbook](deploy/aws/README.md): dormant-by-default ECS/Fargate,
-  ALB, ECR, S3, Secrets Manager, and CloudWatch infrastructure. It requires a
-  real staging gate; this repository does **not claim that AWS is deployed**.
+  ALB, ECR, S3, Secrets Manager, and CloudWatch infrastructure, including the
+  four-step deterministic reference-agent proof flow. It requires a real
+  staging gate; this repository does **not claim that AWS or CockroachDB Cloud
+  is deployed**.
 - [Architecture](docs/ARCHITECTURE.md),
   [migration operations](docs/MIGRATIONS.md), and
   [security policy](docs/SECURITY.md).

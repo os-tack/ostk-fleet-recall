@@ -45,7 +45,8 @@ label() {
     printf '%b%-14s%b %s' "$muted" "$1" "$reset" "$2"
 }
 
-if [ "$mode" = rehearsal ]; then
+case "$mode" in
+rehearsal|fleet-live)
     claim_a=$(jq -er '.agent_a.claim_id' "$evidence")
     action=$(jq -er '.agent_b.action' "$evidence")
     action_claim=$(jq -er '.agent_b.action_claim_id' "$evidence")
@@ -54,10 +55,11 @@ if [ "$mode" = rehearsal ]; then
     members=$(jq -er '.conflict.member_claim_ids | map("#" + tostring) | join(" + ")' "$evidence")
     escalation=$(jq -er '.agent_b.escalation' "$evidence")
     escalation_claim=$(jq -er '.agent_b.escalation_claim_id' "$evidence")
-    agent_a_name=agent-a
-    agent_b_name=agent-b
-    agent_c_name=agent-c
-else
+    agent_a_name=$(jq -er '.identities.writer' "$evidence")
+    agent_b_name=$(jq -er '.identities.retriever' "$evidence")
+    agent_c_name=$(jq -er '.identities.conflicting_writer' "$evidence")
+    ;;
+ostk-live)
     claim_a=$(jq -er '.memory.recalled_claim_id' "$evidence")
     action=$(jq -er '.actions[0].action' "$evidence")
     action_claim=receipt
@@ -69,7 +71,12 @@ else
     agent_a_name=$(jq -er '.orchestrator.sessions[0]' "$evidence")
     agent_b_name=$(jq -er '.orchestrator.sessions[1]' "$evidence")
     agent_c_name=$(jq -er '.orchestrator.sessions[2]' "$evidence")
-fi
+    ;;
+*)
+    printf 'video pane: unknown mode: %s\n' "$mode" >&2
+    exit 64
+    ;;
+esac
 
 case "$role" in
     agent-a)
@@ -79,7 +86,7 @@ case "$role" in
         line "$(label value "${yellow}single dedicated migrator${reset}")"
         line ""
         line "${green}${bold}✓ COMMITTED${reset}      claim ${green}#$claim_a${reset}"
-        if [ "$mode" = rehearsal ]; then
+        if [ "$mode" != ostk-live ]; then
             line "${blue}\$ retry${reset}          same idempotency key"
             line "${green}${bold}✓ DEDUPLICATED${reset}  same claim ${green}#$claim_a${reset}; no duplicate"
         else
@@ -93,7 +100,7 @@ case "$role" in
         line "$(label lanes "${lavender}lexical + dense${reset}")"
         line "$(label fusion "${lavender}reciprocal-rank (RRF)${reset}")"
         line "$(label best-hit "${green}claim #$claim_a${reset}")"
-        if [ "$mode" = rehearsal ]; then
+        if [ "$mode" != ostk-live ]; then
             line "${green}✓ tenant/project boundary enforced${reset}"
         else
             line "${muted}scope injection: separate deterministic gate${reset}"

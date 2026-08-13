@@ -8,6 +8,37 @@ permissions:
   contents: read
 
 jobs:
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Mermaid diagrams
+        run: >-
+          npx --yes @mermaid-js/mermaid-cli@11.16.0
+          -i docs/ARCHITECTURE.md
+          -o /tmp/fleet-recall-architecture.md
+
+  video:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.8"
+          cache: false
+      - name: Install pinned video test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends jq tmux
+          GOBIN="$RUNNER_TEMP/bin" \
+            go install github.com/charmbracelet/vhs@v0.11.0
+          "$RUNNER_TEMP/bin/vhs" --version | grep -F 'vhs version v0.11.0'
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Test video evidence, provenance, tapes, and choreography
+        run: ./demo/video/tests/run.sh
+
   rust:
     runs-on: ubuntu-latest
     steps:
@@ -39,12 +70,15 @@ jobs:
         with:
           terraform_version: "1.15.8"
       - run: terraform fmt -check -recursive
-      - run: terraform init -backend=false
+      - run: terraform init -backend=false -lockfile=readonly
       - run: terraform validate
       - run: terraform test
       - name: Validate deployment shell scripts
         working-directory: .
-        run: find deploy -type f -name '*.sh' -exec sh -n {} +
+        run: find deploy demo -type f -name '*.sh' -exec sh -n {} +
+      - name: Test the AWS reference-agent evidence wrapper
+        working-directory: .
+        run: ./deploy/aws/tests/reference-agent-wrapper.sh
       - name: Render the LocalStack Compose contract
         working-directory: .
         env:

@@ -2,16 +2,26 @@
 
 Deadline: 2026-08-18 17:00 EDT / 16:00 CDT.
 
+Judging availability hold: keep the submitted project free, unrestricted, and
+operational through **2026-09-15 17:00 EDT / 16:00 CDT**. Do not tear down or
+scale the judging deployment to zero before that time.
+
 ## Critical path
 
 1. Cockroach schema, migrations, retry policy, and capability check.
 2. Scoped chunk ingestion plus indexed dense and lexical retrieval.
 3. Recall-compatible RRF, ranking attribution, and MCP `recall(search)`.
 4. Transactional `remember(record)` with claim retrieval and conflict surface.
-5. Reproducible, separately bound agent processes exercising shared MCP memory;
-   a read-only AWS ECS/Fargate demo over the same CockroachDB cluster.
-6. Restart/failure demonstration, cloud query-plan evidence, public repository, README,
-   architecture diagram, and sub-three-minute video.
+5. The standalone deterministic reference policy agent running as four
+   sequential, separately bound one-off ECS/Fargate tasks over the same
+   CockroachDB Cloud memory plane. Its verified memory/action/conflict JSON is
+   the default AWS agent proof; it uses neither OSTK nor an LLM.
+6. A read-only public AWS ECS/Fargate demo, restart/failure demonstration, cloud
+   query-plan evidence, public repository, README, architecture diagram, and
+   sub-three-minute video.
+7. Keep the verified submission stack and testing URL available through the end
+   of judging; teardown happens only after the hold expires and explicit
+   destructive approval is granted.
 
 ## Guardrails
 
@@ -20,6 +30,9 @@ Deadline: 2026-08-18 17:00 EDT / 16:00 CDT.
 - Runtime processes use a least-privilege SQL identity. CockroachDB Cloud
   Managed MCP is not part of this submission unless separately integrated and
   evidenced; the qualifying second CockroachDB tool is Agent Skills.
+- The default agent proof is the deterministic Fleet Recall reference policy
+  agent. OSTK is a strictly optional adapter, not an install, runtime, AWS, or
+  video dependency. Do not claim autonomous LLM reasoning or a model run.
 - Mutation retries are idempotent and bounded.
 - Ranking and transaction behavior receive backend-conformance tests.
 - Full-corpus migration is not required for the demo; use a representative,
@@ -32,3 +45,11 @@ Deadline: 2026-08-18 17:00 EDT / 16:00 CDT.
 - Ledger review: atomicity, idempotency, conflict lifecycle, retry safety.
 - Security review: tenant escape tests, secret handling, least privilege.
 - Submission review: requirements matrix and reproducible demo runbook.
+- Evidence review: label disposable CockroachDB and LocalStack results as local;
+  reserve AWS, CockroachDB Cloud, public URL, and restart claims for artifacts
+  captured from the real judging deployment.
+- Availability review: monitor the public URL and retain the ECS,
+  CockroachDB Cloud, S3, Secrets Manager, DNS/TLS, logs, and supporting network
+  resources through 2026-09-15 17:00 EDT. Keep 60-day CloudWatch retention and
+  ALB deletion protection enabled; after judging, disable protection in a
+  separately reviewed apply before planning teardown.

@@ -12,3 +12,11 @@ Generation prompt, condensed:
 > contradictory memory becomes an explicit coral conflict instead of being
 > overwritten. Midnight navy, cyan/teal, coral, exact title “OSTK FLEET
 > RECALL,” 3:2, no extra text, trademarks, people, watermark, or fake UI.
+
+`architecture.png` is the 1568×1018 gallery rendering of the deployment
+topology in `docs/ARCHITECTURE.md`. It was generated with the same pinned
+`@mermaid-js/mermaid-cli@11.16.0` parser used by CI, on a white background,
+with scale 2. It contains service names but no sponsor logos, account
+identifiers, deployment URLs, or credentials. Regenerate it after changing the
+first Mermaid block; CI separately renders every Mermaid block and rejects
+syntax errors.

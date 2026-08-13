@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 use ostk_fleet_recall::config::model_bundle_sha256;
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::McpServer;
+use ostk_fleet_recall::reference_agent::{ReferenceAgentStep, run_reference_agent};
 use ostk_fleet_recall::service::{
     FleetMemoryService, RecallAction, RecallRequest, RecallResult, ServiceError,
 };
@@ -136,6 +137,15 @@ enum Command {
         #[arg(long, default_value = "-", value_name = "PATH")]
         input: String,
     },
+    /// Run one bounded, deterministic policy-agent step against fleet memory.
+    ReferenceAgent {
+        /// Scenario step. Each step requires its documented deployment-bound agent.
+        #[arg(long, value_enum)]
+        step: ReferenceAgentStep,
+        /// Stable scenario coordinate shared across all four steps.
+        #[arg(long, value_name = "ID")]
+        run_id: String,
+    },
     /// Print the versioned SHA-256 for a local model2vec bundle.
     ModelDigest {
         /// Directory containing config.json, model.safetensors, and tokenizer.json.
@@ -207,8 +217,25 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve => run_serve(config).await?,
         Command::Demo { listen } => run_demo(config, listen).await?,
         Command::Ingest { input } => run_ingest(&config, &input).await?,
+        Command::ReferenceAgent { step, run_id } => {
+            run_reference_agent_step(&config, step, &run_id).await?;
+        }
         Command::ModelDigest { .. } => unreachable!("handled without deployment configuration"),
     }
+    Ok(())
+}
+
+async fn run_reference_agent_step(
+    config: &FleetConfig,
+    step: ReferenceAgentStep,
+    run_id: &str,
+) -> anyhow::Result<()> {
+    let (service, _) = build_memory_service(config).await?;
+    let evidence =
+        run_reference_agent(service.as_ref(), config.default_scope.clone(), step, run_id)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    println!("{}", serde_json::to_string(&evidence)?);
     Ok(())
 }
 
@@ -1010,6 +1037,26 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Demo { listen } if listen == "0.0.0.0:8080".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn reference_agent_cli_contract_matches_ecs_overrides() {
+        let cli = Cli::try_parse_from([
+            "ostk-fleet-recall",
+            "reference-agent",
+            "--step",
+            "recall-and-act",
+            "--run-id",
+            "cloud-proof-1",
+        ])
+        .expect("CLI");
+        assert!(matches!(
+            cli.command,
+            Command::ReferenceAgent {
+                step: ReferenceAgentStep::RecallAndAct,
+                ref run_id,
+            } if run_id == "cloud-proof-1"
         ));
     }
 

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
-description = "A shared, distributed semantic memory plane for OSTK agent fleets"
+description = "A shared, distributed semantic memory plane for agent fleets"
 repository = "https://github.com/os-tack/ostk-fleet-recall"
 publish = false
 

@@ -1,4 +1,23 @@
 {
+  "schema_version": 1,
+  "verified": true,
+  "evidence_kind": "fleet-recall-mcp-scenario",
+  "capture": "sanitized-rehearsal",
+  "run_id": "local-evidence-v1",
+  "provenance": {
+    "generator": "deploy/localstack/fleet-demo.sh",
+    "backend": "cockroachdb",
+    "transport": "mcp-stdio",
+    "ostk_used": false,
+    "llm_used": false,
+    "cloud_used": false
+  },
+  "identities": {
+    "writer": "agent-a",
+    "retriever": "agent-b",
+    "conflicting_writer": "agent-c",
+    "resumed": "agent-b"
+  },
   "agent_a": {
     "claim_id": 1,
     "committed": true,

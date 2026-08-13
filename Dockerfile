@@ -25,7 +25,7 @@ ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 
 LABEL org.opencontainers.image.title="ostk-fleet-recall" \
-      org.opencontainers.image.description="Distributed semantic memory for OSTK agent fleets" \
+      org.opencontainers.image.description="Distributed semantic memory for agent fleets" \
       org.opencontainers.image.source="https://github.com/os-tack/ostk-fleet-recall" \
       org.opencontainers.image.revision="$VCS_REF" \
       org.opencontainers.image.created="$BUILD_DATE" \

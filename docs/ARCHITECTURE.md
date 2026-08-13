@@ -1,50 +1,70 @@
 # Fleet Recall architecture
 
 Fleet Recall adapts Recall's local-first memory semantics into a shared,
-durable memory plane for a horizontally scaled OSTK agent fleet. The local
-`ostk-recall` corpus remains the workstation default. `ostk-fleet-recall` is a
-separate backend and deployment option for agents that must coordinate across
-process, host, and availability-zone boundaries.
+durable memory plane for horizontally scaled agent fleets, including OSTK.
+The local `ostk-recall` corpus remains the workstation default.
+`ostk-fleet-recall` is a separate backend and deployment option for agents
+that must coordinate across process, host, and availability-zone boundaries;
+using OSTK is optional.
 
 ## Deployment topology
 
 ```mermaid
 flowchart LR
-    operator["Operator / hackathon judge"]
+    visitor["Hackathon judge / demo visitor"]
+    operator["Operator"]
     alb["AWS Application Load Balancer\nHTTPS + /healthz"]
     demo["ECS/Fargate demo tasks\nread-only HTTP recall"]
     seed["One-off ECS seed task\nimmutable sample corpus"]
-    agents["Agent processes\ndeveloper/operator managed"]
+    policy["Reference policy agents A/B/C\none-off ECS/Fargate tasks"]
+    agents["Optional MCP clients\nlocal or separately deployed"]
     mcp["Fleet Recall MCP\nlocal stdio per trusted scope"]
     s3[("Amazon S3\npinned model bundle")]
     secrets["AWS Secrets Manager\nCockroach TLS URLs"]
+    inputs{"Task-specific inputs\nverified model + scoped TLS URL"}
     crdb[("CockroachDB Cloud\ndistributed SQL + C-SPANN")]
     migrator["One-off ECS migration task\nsingle writer"]
     logs["CloudWatch Logs\nContainer Insights"]
 
-    operator -->|HTTPS| alb
+    visitor -->|HTTPS| alb
+    operator -.->|launch evidence run| policy
     alb -->|HTTP 8080| demo
-    agents <-->|MCP stdin/stdout| mcp
-    s3 -->|3 objects; SHA-256 verified| demo
-    s3 -->|same pinned bundle| seed
-    s3 -->|same pinned bundle| migrator
-    secrets -->|runtime URL| demo
-    secrets -->|runtime URL| seed
-    secrets -->|DDL URL| migrator
-    demo -->|scoped SQL/TLS| crdb
-    seed -->|bounded idempotent ingest| crdb
-    mcp -->|scoped SQL/TLS| crdb
-    migrator -->|schema v1, once| crdb
+    agents <-->|MCP stdio| mcp
+    s3 -.-> inputs
+    secrets -.-> inputs
+    inputs -.-> demo
+    inputs -.-> seed
+    inputs -.-> migrator
+    inputs -.-> policy
+    demo --> crdb
+    seed --> crdb
+    policy --> crdb
+    mcp --> crdb
+    migrator --> crdb
     demo --> logs
     seed --> logs
+    policy --> logs
     migrator --> logs
 ```
 
-The checked-in Terraform provisions the HTTP demo, migration, and seed task
-definitions. It does not provision an OSTK worker fleet or MCP sidecars. The
-MCP path is exercised by separately bound local agent processes in the
-LocalStack scenario and is ready to be embedded in future OSTK worker tasks;
-that extension is not part of the hosted submission topology.
+The operator launches the one-off reference-policy evidence run. A hackathon
+judge or other demo visitor reaches only the read-only HTTP demo through the
+public load balancer.
+
+The checked-in Terraform provisions the HTTP demo, migration, seed, and
+reference-policy-agent task definitions. The evidence wrapper starts four
+independent Fargate tasks bound to agents A, B, C, and B: they record a
+decision, retrieve it through lexical+dense RRF, persist a cited rollout
+action, surface an incompatible decision, and persist a cited escalation. Each
+task receives only its trusted identity and run coordinate; CockroachDB is the
+durable handoff between processes. The policy is deliberately fixed and
+fail-closed, so this proof needs neither an LLM nor OSTK.
+
+The MCP path remains the product interface for arbitrary fleet clients and is
+exercised by separately bound local processes in the deterministic LocalStack
+scenario. An optional OSTK bridge can coordinate those clients, but Terraform
+does not provision OSTK workers or MCP sidecars and the hosted submission does
+not depend on either one.
 
 ECS containers are stateless. Replacing or scaling a task does not move memory:
 the corpus, typed claims, idempotency receipts, conflict ledger, and events
@@ -55,9 +75,18 @@ a future agent/session focus feature; the current vertical slice neither reads
 nor writes that table.
 
 The public demo exposes a bounded recall request and health endpoint, not a
-general mutation API. Fleet agents mutate memory over the local MCP process,
-where trusted tenant/project/agent coordinates come from deployment rather than
+general mutation API. Reference agents mutate through the same trusted service
+facade inside one-off tasks; general fleet clients mutate over MCP. In both
+paths tenant/project/agent coordinates come from deployment rather than
 caller-controlled JSON.
+
+The reference policy never executes recalled text. It accepts only one exact,
+typed migration decision from agent A, re-reads the selected claim by numeric
+ID, and emits one allowlisted action with the source claim ID attached. Agent C
+then records the deliberately incompatible value; the final agent-B task
+requires the exact two-member disputed conflict before it records a cited
+pause-and-escalate action. Any missing lane, actor, value, state, member, or
+citation fails the task closed.
 
 ## Memory planes
 
