@@ -1,0 +1,39 @@
+aws_region = "us-east-1"
+name       = "ostk-fleet-recall"
+
+# Existing network: an internet-facing ALB and private ECS subnets in two AZs.
+vpc_id          = "vpc-0123456789abcdef0"
+alb_subnet_ids  = ["subnet-aaaaaaaaaaaaaaaaa", "subnet-bbbbbbbbbbbbbbbbb"]
+task_subnet_ids = ["subnet-ccccccccccccccccc", "subnet-ddddddddddddddddd"]
+assign_public_ip = false
+
+# Each secret's raw value is a postgresql:// CockroachDB Cloud URL using TLS.
+database_url_secret_arn           = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-runtime-AbCdEf"
+migration_database_url_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-migrator-GhIjKl"
+
+tenant_id = "0198a849-f6ae-7d61-9800-000000000001"
+project   = "hackathon-demo"
+agent     = "demo-http"
+
+model_bucket_arn    = "arn:aws:s3:::example-private-model-bucket"
+model_object_prefix = "models/potion-retrieval-32M/RELEASE_ID"
+embedding_model     = "minishlab/potion-retrieval-32M"
+embedding_model_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+# Use an immutable commit SHA or release identifier. ECR tags are immutable.
+image_tag = "git-0123456789ab"
+
+# Bootstrap safely: apply with zero tasks, run the migration once, then change
+# both values to at least 1 and apply again. Use 2 for multi-AZ task redundancy.
+service_desired_count     = 0
+autoscaling_min_capacity  = 0
+autoscaling_max_capacity  = 2
+
+# Add an ACM certificate after pointing application DNS at the ALB.
+certificate_arn = null
+demo_hostname   = null
+
+tags = {
+  Environment = "hackathon"
+  Owner       = "ostk"
+}

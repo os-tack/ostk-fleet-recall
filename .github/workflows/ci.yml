@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo check --locked --all-targets
+      - run: cargo test --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
+      - name: Verify inactive RSA advisory path
+        run: |
+          test -z "$(cargo tree --locked --target x86_64-unknown-linux-gnu -i rsa 2>/dev/null)"
+          test -z "$(cargo tree --locked --target x86_64-unknown-linux-gnu -i sqlx-mysql 2>/dev/null)"
+
+  deployment:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/aws
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false
+      - run: terraform validate
+      - run: terraform test
+      - name: Validate deployment shell scripts
+        working-directory: .
+        run: find deploy -type f -name '*.sh' -exec sh -n {} +
+      - name: Render the LocalStack Compose contract
+        working-directory: .
+        env:
+          LOCALSTACK_AUTH_TOKEN: ci-placeholder
+          FLEET_RECALL_MODEL_BUNDLE: /tmp/ci-model-placeholder
+          FLEET_RECALL_EMBEDDING_MODEL_SHA256: "0000000000000000000000000000000000000000000000000000000000000000"
+        run: docker compose --env-file /dev/null -f deploy/localstack/compose.yaml config --quiet

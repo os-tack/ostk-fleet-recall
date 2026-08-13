@@ -1,0 +1,123 @@
+name: ostk-fleet-recall-local
+
+x-aws-environment: &aws-environment
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_REGION: us-east-1
+  AWS_CONFIG_FILE: /localstack/aws-config
+  AWS_ENDPOINT_URL: http://localstack:4566
+  FLEET_RECALL_AWS_ENDPOINT_URL: http://localstack:4566
+
+x-fleet-environment: &fleet-environment
+  FLEET_RECALL_DATABASE_SECRET_ID: ostk-fleet-recall/local/database-url
+  FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE: "1"
+  FLEET_RECALL_TENANT_ID: 0198a849-f6ae-7d61-9800-000000000001
+  FLEET_RECALL_PROJECT: localstack-demo
+  FLEET_RECALL_AGENT: local-compose
+  FLEET_RECALL_MAX_CONNECTIONS: "4"
+  FLEET_RECALL_EMBEDDING_MODEL: minishlab/potion-retrieval-32M
+  FLEET_RECALL_EMBEDDING_MODEL_PATH: /opt/ostk/models/potion-retrieval-32M
+  FLEET_RECALL_EMBEDDING_MODEL_SHA256: ${FLEET_RECALL_EMBEDDING_MODEL_SHA256:?run deploy/localstack/smoke.sh}
+  FLEET_RECALL_MODEL_S3_URI: s3://fleet-recall-local-models/bundles/demo
+  RUST_LOG: ostk_fleet_recall=info
+
+x-fleet-base: &fleet-base
+  image: ostk-fleet-recall:localstack
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  entrypoint: ["/bin/sh", "/localstack/app-entrypoint.sh"]
+  environment:
+    <<: [*aws-environment, *fleet-environment]
+  volumes:
+    - ./app-entrypoint.sh:/localstack/app-entrypoint.sh:ro
+    - ./aws-config:/localstack/aws-config:ro
+  networks:
+    - fleet
+
+services:
+  localstack:
+    image: localstack/localstack:2026.07.0
+    environment:
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:?LocalStack requires an auth token}
+      DEBUG: "${LOCALSTACK_DEBUG:-0}"
+      PERSISTENCE: "0"
+      SERVICES: s3,secretsmanager,sts,iam
+    ports:
+      - "127.0.0.1:${LOCALSTACK_PORT:-4566}:4566"
+    volumes:
+      - ./init/ready.d:/etc/localstack/init/ready.d:ro
+      - ${FLEET_RECALL_MODEL_BUNDLE:?set an absolute model bundle path}:/seed-model:ro
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:4566/_localstack/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 40
+      start_period: 10s
+    networks:
+      - fleet
+
+  cockroach:
+    image: cockroachdb/cockroach:v26.2.3
+    command:
+      - start-single-node
+      - --insecure
+      # The CockroachDB 26.2 Docker entrypoint owns the single-node SQL
+      # listener/proxy. Its documented mode rejects explicit non-loopback
+      # --listen-addr values, while the proxy remains reachable as `cockroach`.
+      - --http-addr=cockroach:8080
+      - --store=type=mem,size=1GiB
+    ports:
+      - "127.0.0.1:${COCKROACH_SQL_PORT:-26257}:26257"
+      - "127.0.0.1:${COCKROACH_HTTP_PORT:-8081}:8080"
+    healthcheck:
+      test: ["CMD", "cockroach", "sql", "--insecure", "--host=localhost:26257", "--execute=SELECT 1"]
+      interval: 3s
+      timeout: 4s
+      retries: 40
+      start_period: 10s
+    networks:
+      - fleet
+
+  migrate:
+    <<: *fleet-base
+    command: ["migrate"]
+    depends_on:
+      localstack:
+        condition: service_healthy
+      cockroach:
+        condition: service_healthy
+    restart: "no"
+
+  ingest:
+    <<: *fleet-base
+    command: ["ingest", "--input", "/demo/demo.ndjson"]
+    volumes:
+      - ./app-entrypoint.sh:/localstack/app-entrypoint.sh:ro
+      - ./aws-config:/localstack/aws-config:ro
+      - ../../examples:/demo:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  app:
+    <<: *fleet-base
+    command: ["demo", "--listen", "0.0.0.0:8080"]
+    ports:
+      - "127.0.0.1:${FLEET_RECALL_DEMO_PORT:-8088}:8080"
+    depends_on:
+      ingest:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+networks:
+  fleet:
+    name: ostk-fleet-recall-local

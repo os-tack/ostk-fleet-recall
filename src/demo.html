@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OSTK Fleet Recall</title>
+  <style>
+    :root { color-scheme: dark; --ink:#f6f3ed; --muted:#a9b1bd; --panel:#121722; --line:#293243; --cyan:#61dafb; --amber:#ffbf69; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; font:16px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--ink); background:radial-gradient(circle at 80% 10%,#172b3c 0,transparent 32rem),#090c12; }
+    main { width:min(980px,calc(100% - 2rem)); margin:auto; padding:5rem 0; }
+    .eyebrow { color:var(--cyan); letter-spacing:.18em; text-transform:uppercase; font-size:.78rem; }
+    h1 { font:700 clamp(2.5rem,8vw,6.5rem)/.9 system-ui,sans-serif; letter-spacing:-.07em; margin:.35em 0 .2em; max-width:850px; }
+    .lede { color:var(--muted); max-width:720px; font-size:1.05rem; }
+    .grid { display:grid; grid-template-columns:1.2fr .8fr; gap:1rem; margin-top:2.5rem; }
+    .panel { border:1px solid var(--line); background:color-mix(in srgb,var(--panel) 94%,transparent); border-radius:14px; padding:1.25rem; box-shadow:0 24px 80px #0007; }
+    label { display:block; color:var(--muted); margin-bottom:.5rem; }
+    .query { display:flex; gap:.6rem; }
+    input { width:100%; border:1px solid var(--line); border-radius:9px; background:#090d15; color:var(--ink); padding:.85rem 1rem; font:inherit; }
+    button { border:0; border-radius:9px; padding:.85rem 1.1rem; background:var(--cyan); color:#071016; font:700 .9rem inherit; cursor:pointer; }
+    button:disabled { opacity:.55; cursor:wait; }
+    .samples { display:flex; gap:.45rem; flex-wrap:wrap; margin-top:.75rem; }
+    .samples button { color:var(--muted); background:#1a2230; font-weight:500; padding:.45rem .65rem; }
+    #result { min-height:250px; white-space:pre-wrap; word-break:break-word; color:#d6e0eb; font-size:.82rem; overflow:auto; max-height:520px; }
+    .facts { list-style:none; padding:0; margin:0; }
+    .facts li { padding:.75rem 0; border-bottom:1px solid var(--line); }
+    .facts strong { display:block; color:var(--amber); font-size:.8rem; text-transform:uppercase; letter-spacing:.08em; }
+    footer { color:var(--muted); font-size:.8rem; margin-top:2rem; }
+    @media (max-width:760px) { main{padding:3rem 0}.grid{grid-template-columns:1fr}.query{flex-direction:column} }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Distributed memory · CockroachDB × AWS</div>
+  <h1>One memory plane for an agent fleet.</h1>
+  <p class="lede">Ask the live corpus. Every result is tenant- and project-scoped, fused from lexical and 512-dimensional vector lanes, and backed by conflict-aware durable claims.</p>
+  <div class="grid">
+    <section class="panel">
+      <form id="search">
+        <label for="query">Recall from the fleet</label>
+        <div class="query"><input id="query" maxlength="2000" value="Why did the fleet choose CockroachDB?" required><button id="submit">Recall</button></div>
+      </form>
+      <div class="samples"><button data-q="What database did the fleet choose?">database choice</button><button data-q="How are conflicting decisions represented?">conflicts</button><button data-q="What survives an agent restart?">durability</button></div>
+      <pre id="result" aria-live="polite">Ready.</pre>
+    </section>
+    <aside class="panel">
+      <ul class="facts">
+        <li><strong>Retrieval</strong>Lexical + C-SPANN vector lanes, reciprocal-rank fused</li>
+        <li><strong>Isolation</strong>Trusted tenant/project boundary; callers cannot reroute it</li>
+        <li><strong>Writes</strong>Serializable, retry-safe, idempotent deliberate memory</li>
+        <li><strong>Runtime</strong>AWS ECS/Fargate with CockroachDB as the shared substrate</li>
+      </ul>
+    </aside>
+  </div>
+  <footer>This public endpoint is deliberately read-only. Fleet agents write through the canonical MCP <code>remember</code> tool.</footer>
+</main>
+<script>
+const form=document.querySelector('#search'),input=document.querySelector('#query'),out=document.querySelector('#result'),submit=document.querySelector('#submit');
+document.querySelectorAll('[data-q]').forEach(b=>b.addEventListener('click',()=>{input.value=b.dataset.q;form.requestSubmit()}));
+form.addEventListener('submit',async e=>{e.preventDefault();submit.disabled=true;out.textContent='Searching lexical + vector lanes…';try{const r=await fetch('/api/recall',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query:input.value,limit:8})});const body=await r.json();out.textContent=JSON.stringify(body,null,2)}catch(_){out.textContent='The demo could not reach its memory service.'}finally{submit.disabled=false}});
+</script>
+</body>
+</html>

@@ -1,0 +1,57 @@
+[package]
+name = "ostk-fleet-recall"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+description = "A shared, distributed semantic memory plane for OSTK agent fleets"
+repository = "https://github.com/os-tack/ostk-fleet-recall"
+publish = false
+
+[lib]
+name = "ostk_fleet_recall"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ostk-fleet-recall"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json", "tokio"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+futures = "0.3"
+hex = "0.4"
+# All three crates resolve from one reviewed, immutable upstream revision. The
+# local ignored worktree is only a contributor convenience, never a build
+# input, so a clean checkout and CI see the same source graph.
+ostk-recall-core = { version = "=0.9.5", git = "https://github.com/os-tack/ostk-recall.git", rev = "7481c5a548ba52188240735a5f57f2286ba90e95" }
+ostk-recall-embed = { version = "=0.9.5", git = "https://github.com/os-tack/ostk-recall.git", rev = "7481c5a548ba52188240735a5f57f2286ba90e95" }
+ostk-recall-retrieval = { version = "=0.9.5", git = "https://github.com/os-tack/ostk-recall.git", rev = "7481c5a548ba52188240735a5f57f2286ba90e95" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "migrate", "uuid"] }
+thiserror = "2"
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
