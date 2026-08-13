@@ -39,10 +39,12 @@ RUN apt-get update \
     && groupadd --gid 10001 ostk \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin ostk \
     && install --directory --owner ostk --group ostk /opt/ostk/models \
+    && install --directory --owner ostk --group ostk --mode 0555 /opt/ostk/demo \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /workspace/target/release/ostk-fleet-recall /usr/local/bin/ostk-fleet-recall
 COPY --chmod=0555 deploy/container-entrypoint.sh /usr/local/bin/container-entrypoint
+COPY --chown=10001:10001 --chmod=0444 examples/demo.ndjson /opt/ostk/demo/demo.ndjson
 
 USER 10001:10001
 WORKDIR /home/ostk

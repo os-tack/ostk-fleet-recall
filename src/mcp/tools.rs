@@ -121,7 +121,7 @@ pub fn remember_tool() -> Value {
     });
     json!({
         "name": "remember",
-        "description": "Deliberately mutate fleet memory or working focus. Writes are scoped, audited, revision-aware, and replay-safe.",
+        "description": "Deliberately record fleet memory. Writes are scoped, audited, revision-aware, and replay-safe.",
         "inputSchema": {
             "type": "object",
             "properties": {

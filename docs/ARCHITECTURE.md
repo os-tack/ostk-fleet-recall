@@ -13,8 +13,9 @@ flowchart LR
     operator["Operator / hackathon judge"]
     alb["AWS Application Load Balancer\nHTTPS + /healthz"]
     demo["ECS/Fargate demo tasks\nread-only HTTP recall"]
-    agents["OSTK agent fleet\nECS tasks / developer machines"]
-    mcp["Fleet Recall MCP\nstdio sidecar per trusted scope"]
+    seed["One-off ECS seed task\nimmutable sample corpus"]
+    agents["Agent processes\ndeveloper/operator managed"]
+    mcp["Fleet Recall MCP\nlocal stdio per trusted scope"]
     s3[("Amazon S3\npinned model bundle")]
     secrets["AWS Secrets Manager\nCockroach TLS URLs"]
     crdb[("CockroachDB Cloud\ndistributed SQL + C-SPANN")]
@@ -25,17 +26,25 @@ flowchart LR
     alb -->|HTTP 8080| demo
     agents <-->|MCP stdin/stdout| mcp
     s3 -->|3 objects; SHA-256 verified| demo
-    s3 -->|3 objects; SHA-256 verified| mcp
+    s3 -->|same pinned bundle| seed
+    s3 -->|same pinned bundle| migrator
     secrets -->|runtime URL| demo
-    secrets -->|runtime URL| mcp
+    secrets -->|runtime URL| seed
     secrets -->|DDL URL| migrator
     demo -->|scoped SQL/TLS| crdb
+    seed -->|bounded idempotent ingest| crdb
     mcp -->|scoped SQL/TLS| crdb
     migrator -->|schema v1, once| crdb
     demo --> logs
-    mcp --> logs
+    seed --> logs
     migrator --> logs
 ```
+
+The checked-in Terraform provisions the HTTP demo, migration, and seed task
+definitions. It does not provision an OSTK worker fleet or MCP sidecars. The
+MCP path is exercised by separately bound local agent processes in the
+LocalStack scenario and is ready to be embedded in future OSTK worker tasks;
+that extension is not part of the hosted submission topology.
 
 ECS containers are stateless. Replacing or scaling a task does not move memory:
 the corpus, typed claims, idempotency receipts, conflict ledger, and events
@@ -80,11 +89,8 @@ sequenceDiagram
     A->>M: recall(search, query, bounded limit)
     M->>M: bind trusted tenant/project; validate arguments
     M->>E: encode query outside SQL transaction
-    par Dense lane
-        M->>C: scoped C-SPANN cosine query
-    and Lexical lane
-        M->>C: scoped tsvector inverted-index query
-    end
+    M->>C: scoped tsvector inverted-index query
+    M->>C: scoped C-SPANN cosine query
     M->>M: reciprocal-rank fusion
     M->>C: hydrate selected IDs with NO_FULL_SCAN guard
     M->>C: fetch related claims/conflicts only

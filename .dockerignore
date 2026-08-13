@@ -8,6 +8,7 @@
 target
 upstream
 /.fleet-recall/
+/.ostk/
 /.model-stage/
 /.models/
 /.aws/

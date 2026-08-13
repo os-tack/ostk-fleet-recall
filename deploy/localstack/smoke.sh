@@ -110,7 +110,12 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 docker build --quiet --tag ostk-fleet-recall:localstack "$repo_dir" >/dev/null
+docker run --rm --entrypoint /bin/sh ostk-fleet-recall:localstack -c '
+    test -r /opt/ostk/demo/demo.ndjson &&
+    test "$(wc -l < /opt/ostk/demo/demo.ndjson)" -eq 3
+'
 embedding_digest=$(docker run --rm \
+    --user "$(id -u):$(id -g)" \
     --volume "$model_bundle:/model:ro" \
     --entrypoint /usr/local/bin/ostk-fleet-recall \
     ostk-fleet-recall:localstack model-digest /model)
@@ -176,6 +181,22 @@ assert_demo_recall() {
 }
 
 assert_demo_recall
+fleet_scenario=$("$script_dir/fleet-demo.sh" --json)
+fleet_claim_id=$(printf '%s' "$fleet_scenario" | jq -er '.agent_a.claim_id')
+unset fleet_scenario
+
+assert_fleet_claim_recall() {
+    fleet_recall_response=$(curl --fail --silent --show-error \
+        --header 'content-type: application/json' \
+        --data '{"query":"How should workers coordinate database schema changes?","limit":10}' \
+        "$recall_url")
+    printf '%s' "$fleet_recall_response" | jq -e \
+        --argjson claim_id "$fleet_claim_id" \
+        'any(.data.hits[]; .extra.claim_id == $claim_id)' >/dev/null
+    unset fleet_recall_response
+}
+
+assert_fleet_claim_recall
 app_container_before=$(compose ps --quiet app)
 compose up --detach --no-deps --force-recreate --wait app >/dev/null
 app_container_after=$(compose ps --quiet app)
@@ -185,8 +206,9 @@ if [ -z "$app_container_before" ] || [ -z "$app_container_after" ] || \
     exit 1
 fi
 assert_demo_recall
+assert_fleet_claim_recall
 
-printf 'LocalStack AWS contracts, migration, model delivery, ingest, and recall after app replacement passed.\n'
+printf 'LocalStack AWS contracts, migration, model delivery, three-identity recall/action/conflict flow, and recall after app replacement passed.\n'
 if [ "${KEEP_LOCALSTACK:-0}" = "1" ]; then
     printf 'Demo remains at http://127.0.0.1:%s (KEEP_LOCALSTACK=1).\n' "$demo_port"
 fi

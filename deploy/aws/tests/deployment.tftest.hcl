@@ -6,6 +6,12 @@ mock_provider "aws" {
       json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
     }
   }
+
+  mock_resource "aws_ecr_repository" {
+    defaults = {
+      repository_url = "123456789012.dkr.ecr.us-east-1.amazonaws.com/ostk-fleet-recall-test"
+    }
+  }
 }
 
 variables {
@@ -45,6 +51,22 @@ run "dormant_http_bootstrap" {
   assert {
     condition     = local.app_command == ["demo", "--listen", "0.0.0.0:8080"]
     error_message = "the ECS command must match the tested demo CLI contract"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ecs_task_definition.seed.container_definitions)[0].command ==
+      ["ingest", "--input", "/opt/ostk/demo/demo.ndjson"]
+    )
+    error_message = "the one-off seed task must ingest the immutable demo corpus bundled in the image"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ecs_task_definition.seed.container_definitions)[0].secrets[0].valueFrom ==
+      var.database_url_secret_arn
+    )
+    error_message = "the seed task must use the runtime DML credential, never the migration credential"
   }
 
   assert {

@@ -5,6 +5,7 @@
 /.env.*
 !/.env.example
 /.fleet-recall/
+/.ostk/
 /.model-stage/
 /.models/
 /.aws/

@@ -2,10 +2,12 @@
 set -eu
 
 bucket=fleet-recall-local-models
+action_bucket=fleet-recall-local-actions
 prefix=bundles/demo
 secret_id=ostk-fleet-recall/local/database-url
 
 awslocal s3api create-bucket --bucket "$bucket" >/dev/null
+awslocal s3api create-bucket --bucket "$action_bucket" >/dev/null
 
 for name in config.json model.safetensors tokenizer.json; do
     test -f "/seed-model/$name"

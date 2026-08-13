@@ -13,6 +13,10 @@ preflight tool, not evidence that an AWS deployment occurred.
   application's domain-separated digest before model loading.
 - The non-transactional schema migration completes once on CockroachDB 26.2.
 - Synthetic NDJSON ingestion works with the pinned model.
+- Three deployment-bound MCP agent identities exercise record/replay, hybrid
+  recall, a persisted claim-linked execution plan, scope rejection, conflict
+  projection, and a persisted escalation against one shared CockroachDB
+  project.
 - The real `demo --listen 0.0.0.0:8080` process becomes ready and returns at
   least one hybrid recall hit through its bounded HTTP API.
 - Replacing only that stateless demo container preserves the same recall hit in
@@ -23,9 +27,13 @@ does **not** claim to emulate Fargate scheduling, ALB TLS/health registration,
 ECR push/pull, AWS IAM enforcement, multi-AZ networking, ECS Secrets Manager
 injection, or CloudWatch delivery. Those remain real-AWS staging gates.
 
-Last verified on 2026-08-13: the complete smoke script passed, including the
-production Rust 1.94 image build and recall after forced application-container
-replacement.
+Evidence captured on 2026-08-13 is deliberately split. The base contract smoke
+passed with the production Rust 1.94 image, including recall after forced
+application-container replacement. The expanded three-identity scenario then
+passed separately against the release image and a fresh CockroachDB 26.2.3
+node. Re-running the combined script is pending restored reachability to
+LocalStack's external license activation service; that external failure is not
+reported as an application pass.
 
 ## Requirements
 
@@ -76,15 +84,19 @@ arguments.
 
 `smoke.sh` builds the image, computes the bundle digest inside that image,
 starts LocalStack/CockroachDB, creates the S3 objects and secret, runs migration
-and ingestion as one-shot containers, starts the demo, and checks the AWS and
-HTTP contracts. It then force-recreates only the demo container, waits for its
-replacement to become healthy, and repeats recall against the unchanged
-Cockroach node. It tears the environment down on success or failure.
+and ingestion as one-shot containers, starts the demo, and checks the AWS,
+HTTP, and three-identity MCP contracts. Identity B records a rollout plan after
+recalling identity A's decision, then pauses and escalates after detecting
+identity C's incompatible claim. The harness then force-recreates only the demo
+container, waits for its replacement to become healthy, and repeats recall of
+the exact durable Agent A claim against the unchanged Cockroach node. It tears
+the environment down on success or failure.
 
 To inspect the running environment after the smoke gate:
 
 ```bash
 KEEP_LOCALSTACK=1 ./deploy/localstack/smoke.sh
+./deploy/localstack/fleet-demo.sh
 docker compose --env-file /dev/null -f deploy/localstack/compose.yaml logs -f app
 docker compose --env-file /dev/null -f deploy/localstack/compose.yaml down --volumes
 ```

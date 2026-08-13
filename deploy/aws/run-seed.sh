@@ -10,14 +10,14 @@ for command_name in aws jq terraform; do
     fi
 done
 
-migration=$(terraform -chdir="$script_dir" output -json migration_task)
-region=$(printf '%s' "$migration" | jq -er '.region')
-cluster=$(printf '%s' "$migration" | jq -er '.cluster')
-task_definition=$(printf '%s' "$migration" | jq -er '.task_definition')
-container_name=$(printf '%s' "$migration" | jq -er '.container_name')
-log_group=$(printf '%s' "$migration" | jq -er '.log_group')
+seed=$(terraform -chdir="$script_dir" output -json seed_task)
+region=$(printf '%s' "$seed" | jq -er '.region')
+cluster=$(printf '%s' "$seed" | jq -er '.cluster')
+task_definition=$(printf '%s' "$seed" | jq -er '.task_definition')
+container_name=$(printf '%s' "$seed" | jq -er '.container_name')
+log_group=$(printf '%s' "$seed" | jq -er '.log_group')
 
-network_configuration=$(printf '%s' "$migration" | jq -cer '{
+network_configuration=$(printf '%s' "$seed" | jq -cer '{
     awsvpcConfiguration: {
         subnets: .subnets,
         securityGroups: .security_groups,
@@ -25,7 +25,10 @@ network_configuration=$(printf '%s' "$migration" | jq -cer '{
     }
 }')
 overrides=$(jq -cn --arg name "$container_name" '{
-    containerOverrides: [{name: $name, command: ["migrate"]}]
+    containerOverrides: [{
+        name: $name,
+        command: ["ingest", "--input", "/opt/ostk/demo/demo.ndjson"]
+    }]
 }')
 
 run_result=$(aws ecs run-task \
@@ -40,13 +43,13 @@ run_result=$(aws ecs run-task \
 task_arn=$(printf '%s' "$run_result" | jq -r '.tasks[0].taskArn // empty')
 
 if [ -z "$task_arn" ]; then
-    echo "ECS did not start the migration task" >&2
+    echo "ECS did not start the seed task" >&2
     printf '%s' "$run_result" | jq -c '.failures // []' >&2
     exit 70
 fi
 unset run_result
 
-echo "waiting for the single migration task: $task_arn"
+echo "waiting for the idempotent demo-corpus seed task: $task_arn"
 aws ecs wait tasks-stopped --region "$region" --cluster "$cluster" --tasks "$task_arn"
 
 description=$(aws ecs describe-tasks \
@@ -61,15 +64,15 @@ reason=$(printf '%s' "$description" | jq -r --arg name "$container_name" \
 stopped_reason=$(printf '%s' "$description" | jq -r '.tasks[0].stoppedReason // ""')
 
 if [ -n "$exit_code" ]; then
-    echo "migration task exit code: $exit_code"
+    echo "seed task exit code: $exit_code"
 else
-    echo "migration task did not report a container exit code" >&2
+    echo "seed task did not report a container exit code" >&2
 fi
 if [ -n "$reason" ]; then
-    echo "migration task reason: $reason"
+    echo "seed task reason: $reason"
 fi
 if [ -n "$stopped_reason" ]; then
-    echo "migration task stopped reason: $stopped_reason"
+    echo "seed task stopped reason: $stopped_reason"
 fi
 echo "logs: aws logs tail '$log_group' --region '$region' --since 30m"
 

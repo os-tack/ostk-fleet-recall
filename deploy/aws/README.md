@@ -122,7 +122,24 @@ The wrapper starts one Fargate task from the dedicated migration task
 definition, waits for it to stop, and propagates its exit code. It never prints
 the injected database URL.
 
-## 5. Start and verify the demo
+## 5. Seed the immutable demo corpus
+
+After migration and runtime-user grants, run the idempotent one-off seed task:
+
+```bash
+./deploy/aws/run-seed.sh
+aws logs tail "$(terraform -chdir=deploy/aws output -raw log_group_name)" \
+  --region us-east-1 --since 30m
+```
+
+The production image contains only the repository's three-record synthetic
+`examples/demo.ndjson` at `/opt/ostk/demo/demo.ndjson`; it contains no tenant
+authority or secret. The seed task uses the least-privilege runtime database
+secret, loads and verifies the same pinned S3 model, and invokes the trusted
+`ingest` CLI. Stable source coordinates make rerunning this task safe. Do not
+start the public service until this task exits zero.
+
+## 6. Start and verify the demo
 
 Change the desired and minimum counts to `1` (or `2` for task-level
 redundancy), apply again, and inspect the service rollout:
@@ -134,6 +151,10 @@ aws ecs wait services-stable \
   --services "$(terraform -chdir=deploy/aws output -raw service_name)"
 DEMO_URL=$(terraform -chdir=deploy/aws output -raw demo_url)
 curl --fail "$DEMO_URL/healthz"
+curl --fail --silent --show-error \
+  --header 'content-type: application/json' \
+  --data '{"query":"durable shared semantic memory across restarts","limit":5}' \
+  "$DEMO_URL/api/recall" | jq -e '.data.hits | length >= 1'
 ```
 
 For the public submission, point a DNS name at the ALB and set both an ACM
@@ -142,6 +163,10 @@ into an HTTPS redirect and outputs the application hostname—not the ALB's
 `amazonaws.com` name, which normally does not match the certificate. DNS record
 creation remains explicit because the authoritative Route 53 zone may live in
 another account. The listener serves TLS 1.2 or newer.
+
+After the first successful recall, force one ECS task replacement and repeat
+the exact query. The replacement must return a hit from the unchanged
+CockroachDB corpus before the URL is used in Devpost.
 
 ## Runtime and least privilege
 

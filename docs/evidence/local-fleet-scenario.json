@@ -1,0 +1,35 @@
+{
+  "agent_a": {
+    "claim_id": 1,
+    "committed": true,
+    "replay_deduplicated": true
+  },
+  "agent_b": {
+    "action": "hold workers until migration completes",
+    "action_based_on_claim_id": 1,
+    "action_claim_id": 2,
+    "cross_project_request_rejected": true,
+    "escalation": "pause rollout for operator review",
+    "escalation_claim_id": 4,
+    "escalation_conflict_id": 1,
+    "fusion": "rrf",
+    "recalled_claim_id": 1,
+    "retrieval_lanes": [
+      "lexical",
+      "dense"
+    ]
+  },
+  "agent_c": {
+    "claim_id": 3,
+    "incompatible_value_recorded": true
+  },
+  "conflict": {
+    "id": 1,
+    "member_claim_ids": [
+      1,
+      3
+    ],
+    "state": "open"
+  },
+  "scenario": "local-evidence-v1"
+}

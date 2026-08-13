@@ -33,3 +33,17 @@ output "migration_task" {
     log_group        = aws_cloudwatch_log_group.app.name
   }
 }
+
+output "seed_task" {
+  description = "Machine-readable inputs consumed by run-seed.sh."
+  value = {
+    region           = data.aws_region.current.name
+    cluster          = aws_ecs_cluster.app.name
+    task_definition  = aws_ecs_task_definition.seed.arn
+    container_name   = local.container_name
+    subnets          = var.task_subnet_ids
+    security_groups  = [aws_security_group.service.id]
+    assign_public_ip = var.assign_public_ip ? "ENABLED" : "DISABLED"
+    log_group        = aws_cloudwatch_log_group.app.name
+  }
+}

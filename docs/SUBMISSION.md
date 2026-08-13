@@ -30,6 +30,40 @@ Durable, conflict-aware semantic memory for fleets of AI agents.
 
 `[PUBLIC_YOUTUBE_OR_VIMEO_URL]`
 
+**Project thumbnail**
+
+`docs/assets/devpost-thumbnail-v2.png` — 1536×1024 PNG (3:2, under 5 MB).
+
+**Built-with tags**
+
+`Rust`, `CockroachDB`, `Vector Search`, `Agent Skills`, `AWS`, `Amazon ECS`,
+`AWS Fargate`, `Amazon S3`, `Application Load Balancer`, `Amazon ECR`,
+`AWS Secrets Manager`, `Amazon CloudWatch`, `Terraform`, `MCP`, `model2vec`,
+`Axum`, `SQLx`, `OSTK`
+
+**Qualifying checkboxes**
+
+- CockroachDB: **Distributed Vector Indexing** and **Agent Skills Repo**.
+- AWS: **Amazon ECS / EKS** and **Amazon S3**. Mention ALB, ECR, Secrets
+  Manager, and CloudWatch in the narrative or “Other” field if available.
+- Do not select CockroachDB Cloud Managed MCP Server unless it is separately
+  used against the final cluster and captured.
+
+**Subjective form answers to confirm with the entrant**
+
+- Learning level: suggested **Significant**.
+- AI value usable in your career: suggested **Yes**.
+- Team members: `[CONFIRM_DEVPOST_TEAM]`.
+
+**Gallery plan**
+
+1. Project thumbnail: ready at `docs/assets/devpost-thumbnail-v2.png`.
+2. Architecture: render the current diagram in `docs/ARCHITECTURE.md` after the
+   hosted topology is final.
+3. Proof: capture the agent action/conflict result and post-replacement cloud
+   recall without account IDs, secret ARNs, credentials, or tenant-sensitive
+   logs.
+
 ## Inspiration
 
 A strong agent can remember locally, but a fleet has a different problem:
@@ -48,11 +82,22 @@ record deliberate typed claims with provenance. If two active claims make
 incompatible assertions about the same key, Fleet Recall marks them disputed
 and returns an explainable conflict instead of silently overwriting one.
 
-Every process is bound to a trusted tenant/project scope. Mutations are
-serializable and idempotent, so concurrent agents and client retries produce
-one claim, one receipt, and one audit trail. ECS workers are disposable;
-CockroachDB Cloud remains the memory source of truth after every task is
-replaced.
+Every Fleet Recall process is bound to a trusted tenant/project scope. Mutations are
+serializable and idempotent: an identical canonical request retried with the
+same tenant-wide key produces at most one durable claim, receipt, and audit
+trail, while independent incompatible writes remain distinct and become an
+explicit conflict. ECS workers are disposable;
+the final deployment will keep CockroachDB Cloud as the memory source of truth
+after every task is replaced. That cloud persistence claim remains gated until
+the real deployment and replacement capture pass.
+
+The submission core does not depend on OSTK. Its deterministic A/B/C evidence
+uses separately deployment-bound MCP clients. An optional OSTK adapter can run
+the same chain with bounded model sessions: each session invokes Fleet Recall's
+stdio MCP through a checked-in Bash bridge because OSTK 7.7.7 does not yet
+expose the exact two-tool catalog as a native driver. That adapter remains
+opt-in and unclaimed until a live run produces verified evidence; its boundary
+is explicit in `docs/OSTK_DEMO.md`.
 
 ## How we built it
 
@@ -144,12 +189,18 @@ Git history and pinned revisions make that boundary inspectable.
 | CockroachDB persistent memory | Local 26.2 schema/round-trip/conflict tests; cloud health and restart capture | Local ready; `[VERIFY_ON_CLOUD]` |
 | Distributed Vector Indexing | DDL and local representative `EXPLAIN`; cloud plan capture | Local ready; `[CAPTURE_CLOUD_PLAN]` |
 | CockroachDB Agent Skills | Pinned audit mapping guidance to code/tests and accepted deviations | Ready in repository |
-| AWS service | ECS/ALB/S3/Secrets/ECR/CloudWatch Terraform; LocalStack contract harness | LocalStack contract, Rust 1.94 image, migration, ingest, recall, and app-replacement persistence passed; `[DEPLOY_AND_CAPTURE]` in real AWS pending |
+| AWS service | ECS/ALB/S3/Secrets/ECR/CloudWatch Terraform; LocalStack contract harness | Base replacement smoke and expanded direct fleet scenario passed separately; combined rerun plus `[DEPLOY_AND_CAPTURE]` in real AWS pending |
 | Public open source | Source, licenses, locked dependencies, setup and sample data | Published and anonymously verified at <https://github.com/os-tack/ostk-fleet-recall> |
 | Functional URL | HTTPS landing page, bounded recall, `/healthz` | Local HTTP healthy with recall hits; `[DEPLOY_AND_SMOKE_TEST]` pending |
-| Public video <3 min | YouTube/Vimeo link and final duration | `[RECORD_AND_UPLOAD]` |
+| Public video <3 min | Reproducible tmux/VHS source, then YouTube/Vimeo link and final duration | 44-second 1600×900 rehearsal rendered; `[RENDER_LIVE_NARRATE_AND_UPLOAD]` |
 
 ## Video script (target 2:45)
+
+The four-terminal memory/action/conflict sequence is reproducibly rendered by
+`demo/video/render.sh`; see `docs/VIDEO_DEMO.md`. Rehearsal mode is visibly
+labelled and uses sanitized checked-in evidence. The submitted cut must use the
+verified live OSTK render for agent evidence and keep cloud proof as a separate
+captured gate.
 
 **0:00-0:18 — problem and promise**
 
@@ -165,18 +216,20 @@ Cloud, scoped vector/lexical indexes, and the separate migration task.
 **0:38-1:10 — durable shared recall**
 
 Agent A records a typed deployment decision through MCP. Agent B recalls the
-idea using different wording through MCP. Capture the MCP JSON response in the
-terminal; that authenticated surface, not the public HTTP UI, exposes the typed
-claim and provenance. Use the public demo only to find the persisted chunk
-through its read-only HTTP search. Replace or stop the serving ECS task, let ECS
-restore it, then repeat recall to demonstrate that memory stayed in
-CockroachDB.
+idea using different wording through MCP, then records the resulting execution
+plan: hold application workers until the dedicated migrator completes. Capture
+the MCP JSON response in the terminal; that deployment-bound stdio surface,
+not the public HTTP UI, exposes the typed claim and provenance. Use the public
+demo only to find the persisted chunk through its read-only HTTP search.
+Replace or stop the serving ECS task, let ECS restore it, then repeat recall to
+demonstrate that memory stayed in CockroachDB.
 
 **1:10-1:42 — conflict, not overwrite**
 
 Agent C records an incompatible typed value under the same claim key. Show both
 claims becoming disputed, the conflict rationale/member values, and complete
-coverage metadata. Replay the same idempotency key and show that counts do not
+coverage metadata. Agent B then pauses rollout and records an escalation for
+operator review. Replay the same idempotency key and show that counts do not
 increase.
 
 **1:42-2:08 — isolation and execution evidence**

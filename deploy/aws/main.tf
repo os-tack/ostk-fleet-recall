@@ -2,6 +2,7 @@ locals {
   container_name       = "memory"
   container_port       = 8080
   app_command          = ["demo", "--listen", "0.0.0.0:8080"]
+  seed_command         = ["ingest", "--input", "/opt/ostk/demo/demo.ndjson"]
   model_bucket_name    = trimprefix(var.model_bucket_arn, "arn:aws:s3:::")
   model_prefix         = trim(var.model_object_prefix, "/")
   model_s3_uri         = "s3://${local.model_bucket_name}/${local.model_prefix}"
@@ -385,6 +386,49 @@ resource "aws_ecs_task_definition" "migration" {
     secrets = [{
       name      = "FLEET_RECALL_DATABASE_URL"
       valueFrom = local.migration_secret_arn
+    }]
+    readonlyRootFilesystem = false
+    stopTimeout            = 30
+    linuxParameters = {
+      initProcessEnabled = true
+    }
+    logConfiguration = local.log_configuration
+  }])
+
+  depends_on = [
+    aws_iam_role_policy.database_secrets,
+    aws_iam_role_policy.model_bundle,
+  ]
+}
+
+resource "aws_ecs_task_definition" "seed" {
+  family                   = "${var.name}-seed"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = tostring(var.task_cpu)
+  memory                   = tostring(var.task_memory)
+  execution_role_arn       = aws_iam_role.execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = var.cpu_architecture
+  }
+
+  ephemeral_storage {
+    size_in_gib = var.ephemeral_storage_gib
+  }
+
+  container_definitions = jsonencode([{
+    name        = local.container_name
+    image       = local.image_uri
+    essential   = true
+    user        = "10001:10001"
+    command     = local.seed_command
+    environment = local.common_environment
+    secrets = [{
+      name      = "FLEET_RECALL_DATABASE_URL"
+      valueFrom = var.database_url_secret_arn
     }]
     readonlyRootFilesystem = false
     stopTimeout            = 30

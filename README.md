@@ -1,5 +1,7 @@
 # ostk-fleet-recall
 
+![OSTK Fleet Recall: distributed, conflict-aware agent memory](docs/assets/devpost-thumbnail-v2.png)
+
 Shared, durable semantic memory for fleets of OSTK agents, backed by
 CockroachDB while preserving Recall's local-first semantics and two-tool MCP
 contract.
@@ -127,11 +129,24 @@ docker run --detach \
   --http-addr=ostk-fleet-recall-crdb:8080 \
   --store=/cockroach/cockroach-data
 
-until docker exec ostk-fleet-recall-crdb \
-  cockroach sql --insecure --host=127.0.0.1:26257 \
-  --execute='SELECT 1' >/dev/null 2>&1; do
+FLEET_RECALL_CRDB_READY=0
+for _attempt in $(seq 1 120); do
+  if docker exec ostk-fleet-recall-crdb \
+    cockroach sql --insecure --host=127.0.0.1:26257 \
+    --execute='SELECT 1' >/dev/null 2>&1; then
+    FLEET_RECALL_CRDB_READY=1
+    break
+  fi
+  if [ "$(docker inspect --format '{{.State.Running}}' ostk-fleet-recall-crdb 2>/dev/null)" != true ]; then
+    docker logs ostk-fleet-recall-crdb
+    exit 1
+  fi
   sleep 1
 done
+if [ "$FLEET_RECALL_CRDB_READY" -ne 1 ]; then
+  docker logs ostk-fleet-recall-crdb
+  exit 1
+fi
 
 docker exec ostk-fleet-recall-crdb \
   cockroach sql --insecure --host=127.0.0.1:26257 \
@@ -189,9 +204,23 @@ it:
 "$FLEET_RECALL_BIN" demo --listen 127.0.0.1:8088 &
 FLEET_RECALL_DEMO_PID=$!
 
-until curl --fail --silent http://127.0.0.1:8088/healthz >/dev/null; do
+FLEET_RECALL_DEMO_READY=0
+for _attempt in $(seq 1 120); do
+  if curl --fail --silent http://127.0.0.1:8088/healthz >/dev/null; then
+    FLEET_RECALL_DEMO_READY=1
+    break
+  fi
+  if ! kill -0 "$FLEET_RECALL_DEMO_PID" 2>/dev/null; then
+    wait "$FLEET_RECALL_DEMO_PID"
+    exit 1
+  fi
   sleep 1
 done
+if [ "$FLEET_RECALL_DEMO_READY" -ne 1 ]; then
+  kill "$FLEET_RECALL_DEMO_PID" 2>/dev/null || true
+  wait "$FLEET_RECALL_DEMO_PID" || true
+  exit 1
+fi
 
 curl --fail --silent --show-error http://127.0.0.1:8088/api/status | jq
 curl --fail --silent --show-error \
@@ -361,6 +390,14 @@ only one-row functional behavior.
 - [LocalStack contract harness](deploy/localstack/README.md): builds the real
   image and exercises S3/Secrets Manager interfaces with local CockroachDB. It
   is an emulator preflight, **not evidence of an AWS deployment**.
+- [Optional OSTK adapter demo](docs/OSTK_DEMO.md): can coordinate bounded OSTK
+  model sessions through a checked-in non-native stdio bridge; Fleet Recall,
+  its deterministic scenario, and the default plan require no OSTK model run.
+- [Reproducible terminal video](docs/VIDEO_DEMO.md): renders the four-pane tmux
+  scenario with VHS from either sanitized rehearsal evidence or a verified
+  opt-in OSTK run.
+- [Cloud onboarding](docs/CLOUD_ONBOARDING.md): explicit AWS/CockroachDB account,
+  approval, cost, identity, TLS, model, and teardown gates.
 - [AWS Terraform runbook](deploy/aws/README.md): dormant-by-default ECS/Fargate,
   ALB, ECR, S3, Secrets Manager, and CloudWatch infrastructure. It requires a
   real staging gate; this repository does **not claim that AWS is deployed**.
