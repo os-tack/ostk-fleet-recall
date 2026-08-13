@@ -36,3 +36,19 @@ The full `deploy/localstack/smoke.sh` additionally validates S3 and Secrets
 Manager contracts plus stateless application replacement. LocalStack license
 activation is an external prerequisite, so failure to reach its licensing
 server must not be presented as application evidence.
+
+## Pending cloud receipts
+
+After the real AWS/CockroachDB Cloud deployment exists,
+`deploy/aws/run-reference-agent.sh` produces the correlated agent receipt and
+`deploy/aws/run-replacement-proof.sh` produces the full-serving-task-set
+replacement/persistence receipt. Run
+`deploy/aws/verify-publication-receipts.sh REFERENCE_JSON REPLACEMENT_JSON` to
+validate and cross-correlate them before publication. The verifier rejects
+common secret and AWS-account leaks, but chosen run/project/service names and
+the public hostname still require human review.
+
+These wrappers and their mock tests are capture tooling, not cloud evidence.
+No checked-in cloud receipt exists yet. Representative CockroachDB Cloud
+`EXPLAIN` evidence also remains a separate pending gate; index-presence status
+and RRF diagnostics do not prove physical plan selection.

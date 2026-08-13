@@ -30,6 +30,16 @@ Durable, conflict-aware semantic memory for fleets of AI agents.
 
 `[PUBLIC_HTTPS_DEMO_URL]`
 
+**Testing instructions**
+
+Open the working-demo URL without signing in. Enter “How does fleet memory
+survive agent restarts?” in the recall form and submit; the result should show
+bounded CockroachDB-backed hits and their source metadata. Then open
+`[PUBLIC_HTTPS_DEMO_URL]/healthz` and confirm `{"status":"ready"}`. The public
+surface is intentionally read-only: `/`, `/healthz`, `/api/status`, and bounded
+`POST /api/recall`; no mutation credential is needed or exposed. Replace the
+URL placeholder with the canonical origin before pasting these instructions.
+
 **Demo video (under three minutes)**
 
 `[PUBLIC_YOUTUBE_OR_VIMEO_URL]`
@@ -45,6 +55,11 @@ Durable, conflict-aware semantic memory for fleets of AI agents.
 `AWS Secrets Manager`, `Amazon CloudWatch`, `Terraform`, `MCP`, `model2vec`,
 `Axum`, `SQLx`. Add `OSTK` only if the optional adapter is actually used in a
 final captured artifact; it is not part of the default proof path.
+
+This is the target tag list, not permission to claim a provisioned service.
+Before submission, remove any AWS service that was not exercised in the final
+deployment and evidence capture. “Configured in Terraform” is weaker than the
+rules' requirement that listed components be meaningfully integrated.
 
 **Qualifying checkboxes**
 
@@ -69,6 +84,10 @@ final captured artifact; it is not part of the default proof path.
 3. Proof: capture the agent action/conflict result and post-replacement cloud
    recall without account IDs, secret ARNs, credentials, or tenant-sensitive
    logs.
+
+Run `./docs/assets/verify-media.sh` before uploading the gallery. The script
+checks the committed image formats, dimensions, and conservative 5 MB limit;
+the manual visual acceptance checks live in `docs/assets/README.md`.
 
 ## Inspiration
 
@@ -241,6 +260,8 @@ The local standalone capture proves the displayed application chain but is not
 AWS evidence. The cloud segment must use the real public URL and the verified
 `fleet-reference-agent-run-v1` output from the Fargate wrapper; both remain
 pending until deployment. Do not describe the policy decisions as LLM output.
+The final export must also contain narration or another accessible audio track;
+the 46-second silent rehearsal is source footage, not a submission-ready video.
 
 **0:00-0:18 — problem and promise**
 
@@ -312,6 +333,9 @@ to remember—and disagree—together.” End on the public demo URL and reposit
       recall evidence. Do not substitute a local or handcrafted result.
 - [ ] Video is public, under three minutes, legible at 1080p, and explicitly
       names CockroachDB tools and AWS services.
+- [ ] `./docs/assets/verify-media.sh --final-video <final.mp4>` passes; captions
+      are accurate, playback/embedding works from a logged-out browser, and the
+      Devpost preview plays without authentication.
 - [ ] Devpost fields replace every bracketed placeholder and identify how each
       qualifying tool/service is used.
 - [ ] Submit before August 18, 2026 at 5:00 PM EDT / 4:00 PM CDT.

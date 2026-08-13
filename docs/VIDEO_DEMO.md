@@ -10,6 +10,18 @@ Fleet Recall has two first-class recording modes that require no OSTK, agent
 orchestrator, LLM, model API, or cloud account. A third, explicitly optional
 mode can render an already verified OSTK adapter run.
 
+## Submission eligibility boundary
+
+Neither the sanitized rehearsal nor a standalone-only local capture is the
+final hackathon video. The [official rules](https://cockroachdb-ai.devpost.com/rules)
+require footage of the project functioning as deployed on AWS and footage of
+the CockroachDB memory layer at work. Use the terminal sequence as one proof
+segment in the final cut, then add fresh cloud footage showing the public demo,
+the verified reference-agent receipt, CockroachDB-backed recall before and
+after ECS task replacement, and the representative query plans. Keep the
+local/cloud provenance labels visible so one segment cannot be mistaken for
+the other.
+
 ## Fresh standalone Fleet Recall recording
 
 This is the primary live evidence path. Start the local smoke environment and
@@ -142,6 +154,29 @@ Manager, and recall after replacing the application container.
   readable.
 - Use `ffprobe` to confirm 1600×900 dimensions and a duration below three
   minutes before publication.
+
+For the final narrated export, run the stricter machine-readable gate:
+
+```bash
+./docs/assets/verify-media.sh --final-video path/to/final.mp4
+```
+
+It requires a 16:9 H.264/yuv420p video at 720p or better, a non-empty audio
+stream, and a duration strictly below 180 seconds. Then complete the checks a
+local file cannot prove:
+
+- Watch the entire upload from a logged-out browser at 720p and confirm all
+  terminal text, citations, cloud provenance, and the final URL are legible.
+- Confirm the YouTube or Vimeo page is public, embedding/playback is enabled,
+  captions are accurate, and the Devpost preview plays without authentication.
+- Show the application functioning on AWS and CockroachDB memory changing the
+  agent's behavior; architecture slides and repository tests alone do not meet
+  that footage requirement.
+- Use original narration and no music. Do not add third-party logos, brand
+  artwork, or copyrighted media unless permission has been confirmed; plain
+  service names should appear only where needed to explain the integration.
+- Rewatch once for account IDs, secret ARNs, credentials, tenant-sensitive
+  logs, browser autofill, notifications, and shell history before publishing.
 
 VHS 0.11+, tmux 3.4+, `jq`, Bash, an H.264-capable FFmpeg installation, and
 the Menlo font selected by the tapes are recording prerequisites. The fresh

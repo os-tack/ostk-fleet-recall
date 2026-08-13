@@ -20,6 +20,8 @@ jobs:
             -p "$RUNNER_TEMP/puppeteer.json" \
             -i docs/ARCHITECTURE.md \
             -o "$RUNNER_TEMP/fleet-recall-architecture.md"
+      - name: Validate submission images
+        run: ./docs/assets/verify-media.sh
 
   video:
     runs-on: ubuntu-24.04
@@ -81,6 +83,9 @@ jobs:
       - name: Test the AWS reference-agent evidence wrapper
         working-directory: .
         run: ./deploy/aws/tests/reference-agent-wrapper.sh
+      - name: Test AWS replacement and publication evidence wrappers
+        working-directory: .
+        run: ./deploy/aws/tests/replacement-proof.sh
       - name: Render the LocalStack Compose contract
         working-directory: .
         env:

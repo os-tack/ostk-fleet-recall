@@ -280,6 +280,7 @@ esac
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 wrapper=$script_dir/../run-reference-agent.sh
+publication_verifier=$script_dir/../verify-publication-receipts.sh
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/fleet-reference-agent-test.XXXXXX")
 trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 mock_bin=$test_root/bin
@@ -341,6 +342,11 @@ jq -e '
         embedding_dimension: 512
     }
 ' "$test_root/success.json" >/dev/null
+"$publication_verifier" "$test_root/success.json" \
+    > "$test_root/publication-validation.json"
+jq -e '.verified == true and .validation_only == true and
+    .receipts == ["reference-agent"]' \
+    "$test_root/publication-validation.json" >/dev/null
 if grep -Eq 'arn:|[0-9]{12}' "$test_root/success.json"; then
     echo "successful evidence leaked an AWS ARN or account ID" >&2
     exit 1

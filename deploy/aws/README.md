@@ -75,7 +75,7 @@ terraform test
 terraform apply -target=aws_ecr_repository.app
 ```
 
-The current Terraform suite contains eight runs covering dormant bootstrap,
+The current Terraform suite contains eleven runs covering dormant bootstrap,
 TLS hostname binding, model-prefix/bucket validation, capacity ordering, and
 supported CloudWatch retention. Passing it validates configuration logic; it
 does not prove that AWS resources have been deployed.
@@ -271,6 +271,54 @@ gate. The emitted receipt is designed for publication, but still review chosen
 run/project names, the demo URL, cluster coordinate, task IDs, and model/version
 metadata before sharing it. Never supplement it with the database URL, account
 ID, task ARN, secret ARN, or raw CloudWatch log export.
+
+## 8. Replace the complete serving task set and prove persistence
+
+Preserve the verified reference-agent receipt, then use it to force a fresh ECS
+service deployment. This is an intentional live AWS mutation: it replaces the
+running serving tasks and can briefly consume additional Fargate capacity while
+ECS rolls the deployment. Do not run it until the HTTPS service is healthy and
+the reference-agent wrapper has succeeded.
+
+```bash
+REFERENCE_RECEIPT="target/aws-evidence/reference-agent-$RUN_ID.json"
+REPLACEMENT_RECEIPT="target/aws-evidence/replacement-$RUN_ID.json"
+
+./deploy/aws/run-replacement-proof.sh "$REFERENCE_RECEIPT" \
+  >"$REPLACEMENT_RECEIPT"
+
+./deploy/aws/verify-publication-receipts.sh \
+  "$REFERENCE_RECEIPT" "$REPLACEMENT_RECEIPT"
+```
+
+Before replacement, the wrapper requires one stable, nonzero ECS service and
+observes the exact action and escalation claim IDs from the reference-agent
+receipt through public lexical+dense RRF. It invokes
+`aws ecs update-service --force-new-deployment`, waits for the service to
+stabilize, requires the complete post-deployment task-ID set to be disjoint
+from the pre-deployment set, and observes the same exact claims again. The
+resulting `fleet-ecs-replacement-run-v1` JSON contains only task IDs and bounded
+service coordinates, never task ARNs or account IDs.
+
+The publication verifier checks both complete schemas, internal claim/action
+correlations, the full-task-set replacement, before/after observations, and
+cross-receipt run/project/URL/deployment identity. It also rejects full AWS
+ARNs, 12-digit account IDs, database URLs, credential-bearing URLs,
+secret-bearing keys, and raw log-stream fields. Its success output is marked
+`validation_only: true`; it validates live receipts but is not a substitute for
+running either live wrapper.
+
+## Cloud `EXPLAIN` boundary
+
+Index presence from `/api/status` and observed lexical+dense RRF are not a
+substitute for the required representative Cloud `EXPLAIN`. The existing Rust
+plan test inserts more than 10,000 rows and is explicitly limited to a
+disposable database; do not point it at the submission corpus merely to fill
+the evidence checkbox. A publication-safe Cloud plan receipt remains pending
+until it can run the production query shapes against a separately approved
+disposable CockroachDB Cloud database (or through a bounded one-off diagnostic
+task) without exposing the database URL. Keep `[CAPTURE_CLOUD_PLAN]` unresolved
+until that real plan is captured and reviewed.
 
 ## Runtime and least privilege
 
