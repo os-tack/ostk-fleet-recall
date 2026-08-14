@@ -25,7 +25,11 @@ const context=vm.createContext({Set,String,Number,Array,Map,JSON,Date});
 vm.runInContext(
   [
     'hitClaimId',
+    'hitText',
     'uniqueHits',
+    'hitCategory',
+    'normalizedEvidenceCategory',
+    'filterHits',
     'conflictMatch',
     'chooseConflict',
   ].map(extractFunction).join('\n'),
@@ -52,8 +56,17 @@ class FakeNode {
     this.textContent=textContent;
     this.children=[];
     this.className='';
+    this.attributes={};
+    this.listeners={};
+    this.hidden=false;
+    this.id='';
   }
   append(...children){this.children.push(...children);}
+  replaceChildren(...children){this.children=[...children];}
+  setAttribute(name,value){this.attributes[name]=String(value);}
+  getAttribute(name){return this.attributes[name]??null;}
+  addEventListener(name,listener){this.listeners[name]=listener;}
+  click(){this.listeners.click?.();}
 }
 
 const fakeDocument={
@@ -78,9 +91,18 @@ function descendantTags(node){
   return [node.tagName,...node.children.flatMap(descendantTags)].filter(Boolean);
 }
 
+function descendants(node){
+  return [node,...node.children.flatMap(descendants)];
+}
+
+function nodeText(node){
+  return `${node.textContent||''}${node.children.map(nodeText).join('')}`;
+}
+
 const coordinateContext=vm.createContext({String,Number,encodeURIComponent});
 vm.runInContext(
   [
+    'hitClaimId',
     'repositoryPathAllowed',
     'repositorySourceContext',
     'hitCoordinate',
@@ -281,7 +303,7 @@ test('support diagnostics never reorder the fused evidence',()=>{
 
   assert.deepEqual(
     Array.from(context.uniqueHits(body),candidate=>candidate.chunk_id),
-    ['purpose','docs-support','code-support'],
+    ['purpose','docs-support','code-support','claim:12'],
   );
 });
 
@@ -295,7 +317,7 @@ test('a selected conflict removes only its duplicate claim cards',()=>{
   ];
   assert.deepEqual(
     Array.from(context.uniqueHits({data:{hits:ranked}}),candidate=>candidate.chunk_id),
-    ['claim:12','ordinary','claim:13'],
+    ['claim:12','ordinary','claim:13','fourth','fifth'],
   );
   assert.deepEqual(
     Array.from(context.uniqueHits({
@@ -303,6 +325,153 @@ test('a selected conflict removes only its duplicate claim cards',()=>{
     },{members:[{id:12},{id:13}]}),candidate=>candidate.chunk_id),
     ['ordinary','fourth','fifth'],
   );
+});
+
+test('source categories preserve fused order and recognize compact claim hits',()=>{
+  const compactClaim={
+    claim:{id:42,text:'Use one migration owner.'},
+    matched_passage:'Use one migration owner.\nkind: decision',
+  };
+  const ranked=[
+    hit('doc-1','first document'),
+    hit('code-1','first code',{},'code'),
+    compactClaim,
+    hit('conversation-1','other memory',{},'conversation'),
+    hit('doc-2','second document'),
+  ];
+
+  assert.equal(context.hitCategory(ranked[0]),'document');
+  assert.equal(context.hitCategory(ranked[1]),'code');
+  assert.equal(context.hitCategory(compactClaim),'claim');
+  assert.equal(context.hitCategory(ranked[3]),'other');
+  assert.equal(context.hitText(compactClaim),'Use one migration owner.');
+  assert.equal(context.normalizedEvidenceCategory('CODE'),'code');
+  assert.equal(context.normalizedEvidenceCategory('unknown'),'all');
+  assert.deepEqual(
+    Array.from(context.filterHits(ranked,'document'),candidate=>candidate.chunk_id),
+    ['doc-1','doc-2'],
+  );
+  assert.deepEqual(
+    Array.from(context.filterHits(ranked,'all'),candidate=>context.hitText(candidate)),
+    ['first document','first code','Use one migration owner.','other memory','second document'],
+  );
+  assert.deepEqual(Array.from(context.filterHits(null,'code')),[]);
+});
+
+const evidenceDomContext=vm.createContext({
+  String,Number,Array,Set,Date,Intl,URL,encodeURIComponent,document:fakeDocument,
+});
+vm.runInContext(
+  [
+    'element',
+    'readable',
+    'boundedText',
+    'sourceLabel',
+    'repositoryPathAllowed',
+    'repositorySourceContext',
+    'hitCoordinate',
+    'safeMarkdownHref',
+    'appendMarkdownText',
+    'inlineMarkdownTokens',
+    'renderInlineMarkdown',
+    'shortDate',
+    'hitClaimId',
+    'hitText',
+    'hitCategory',
+    'normalizedEvidenceCategory',
+    'filterHits',
+    'cleanSnippet',
+    'renderHitCard',
+    'renderEvidenceResults',
+  ].map(extractFunction).join('\n'),
+  evidenceDomContext,
+);
+
+test('evidence controls reveal every returned hit without losing fused rank',()=>{
+  const ranked=[
+    hit('doc-1','first document'),
+    hit('code-1','first code',{},'code'),
+    {claim:{id:42,text:'first claim'}},
+    hit('doc-2','second document'),
+    hit('code-2','second code',{},'code'),
+    hit('doc-3','third document'),
+    hit('conversation-1','other memory',{},'conversation'),
+  ];
+  const selections=[];
+  const section=evidenceDomContext.renderEvidenceResults(
+    ranked,
+    ranked,
+    'all',
+    category=>selections.push(category),
+  );
+  const nodes=descendants(section);
+  const filters=nodes.find(node=>node.className==='evidence-filters');
+  const list=nodes.find(node=>node.className==='hit-list');
+  const toggle=nodes.find(node=>node.tagName==='BUTTON'&&node.getAttribute('aria-controls')==='evidence-hit-list');
+  const filterButtons=filters.children;
+  const status=nodes.find(node=>node.getAttribute?.('role')==='status');
+
+  assert.equal(section.getAttribute('aria-labelledby'),'evidence-heading');
+  assert.equal(filters.getAttribute('role'),'group');
+  assert.equal(filters.getAttribute('aria-label'),'Filter evidence by source type');
+  assert.deepEqual(filterButtons.map(node=>node.textContent),['All','Documents','Code','Claims']);
+  assert.deepEqual(filterButtons.map(node=>node.getAttribute('aria-pressed')),['true','false','false','false']);
+  assert.equal(status.getAttribute('aria-live'),'polite');
+  assert.equal(status.textContent,'Showing 3 of 7 returned unique results');
+  assert.equal(list.children.length,3);
+  assert.equal(toggle.textContent,'Show 4 more results');
+  assert.equal(toggle.getAttribute('aria-expanded'),'false');
+  assert.equal(toggle.getAttribute('aria-controls'),list.id);
+
+  toggle.click();
+  assert.equal(list.children.length,7);
+  assert.equal(toggle.textContent,'Show fewer');
+  assert.equal(toggle.getAttribute('aria-expanded'),'true');
+  assert.match(nodeText(list.children[4]),/Fused rank 5/);
+
+  filterButtons[2].click();
+  assert.deepEqual(selections,['code']);
+  filterButtons[0].click();
+  assert.deepEqual(selections,['code']);
+});
+
+test('a backend-filtered response exposes the selected source and truthful count',()=>{
+  const codeHits=[
+    hit('code-4','fourth-ranked response hit',{},'code'),
+    hit('code-9','ninth-ranked response hit',{},'code'),
+  ];
+  const section=evidenceDomContext.renderEvidenceResults(codeHits,codeHits,'code');
+  const nodes=descendants(section);
+  const filters=nodes.find(node=>node.className==='evidence-filters');
+  const list=nodes.find(node=>node.className==='hit-list');
+  const status=nodes.find(node=>node.getAttribute?.('role')==='status');
+  const toggle=nodes.find(node=>node.tagName==='BUTTON'&&node.getAttribute('aria-controls')==='evidence-hit-list');
+
+  assert.deepEqual(filters.children.map(node=>node.getAttribute('aria-pressed')),['false','false','true','false']);
+  assert.equal(status.textContent,'Showing 2 of 2 returned code results');
+  assert.equal(list.children.length,2);
+  assert.equal(toggle.hidden,true);
+});
+
+test('dedicated claim results render their compact shape without claiming RRF rank',()=>{
+  const claims=[
+    {claim:{id:21,text:'Prefer one migration owner.',updated_at:'2026-08-14T00:00:00Z'}},
+    {claim:{id:22,text:'Let every worker migrate.',updated_at:'2026-08-14T00:00:00Z'}},
+  ];
+  const section=evidenceDomContext.renderEvidenceResults(claims,claims,'claim');
+  const nodes=descendants(section);
+  const filters=nodes.find(node=>node.className==='evidence-filters');
+  const list=nodes.find(node=>node.className==='hit-list');
+  const status=nodes.find(node=>node.getAttribute?.('role')==='status');
+
+  assert.deepEqual(filters.children.map(node=>node.getAttribute('aria-pressed')),['false','false','false','true']);
+  assert.equal(status.textContent,'Showing 2 of 2 returned claim results');
+  assert.equal(list.children.length,2);
+  assert.match(nodeText(list.children[0]),/Durable agent claim/);
+  assert.match(nodeText(list.children[0]),/Claim #21/);
+  assert.match(nodeText(list.children[0]),/Prefer one migration owner[.]/);
+  assert.match(nodeText(list.children[0]),/Claim rank 1/);
+  assert.doesNotMatch(nodeText(list.children[0]),/Fused rank/);
 });
 
 const conflict=(id,key,members,detected_at)=>({
@@ -392,7 +561,12 @@ test('presentation language stays tied to exact evidence',()=>{
   assert.doesNotMatch(page,/Sources behind this disagreement/);
   assert.doesNotMatch(page,/hasMatchingEscalation/);
   assert.doesNotMatch(page,/escalated for operator review/);
-  assert.match(page,/else if\(hit[.]source==='markdown'\)\{\s*card[.]append\(renderInlineMarkdown\(snippet,hit\)\)/);
-  assert.match(page,/if\(hit[.]source==='code'\)\{\s*const pre=element\('pre'\)/);
+  assert.match(page,/else if\(hit[?][.]source==='markdown'\)\{\s*card[.]append\(renderInlineMarkdown\(snippet,hit\)\)/);
+  assert.match(page,/if\(hit[?][.]source==='code'\)\{\s*const pre=element\('pre'\)/);
+  assert.match(page,/JSON[.]stringify\(\{query,limit:20,category:selectedCategory\}\)/);
+  assert.match(page,/typed claim search/);
+  assert.match(page,/selectedCategory==='claim'\?'retrieved claims in':'retrieved \+ fused in'/);
+  assert.match(page,/Where is the MCP server configured and which tools does it expose[?]/);
+  assert.match(page,/What AWS services does this project use[?]/);
   assert.doesNotMatch(page,/innerHTML/);
 });

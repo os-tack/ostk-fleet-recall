@@ -107,6 +107,10 @@
     .results-heading { display:flex; align-items:baseline; justify-content:space-between; gap:1rem; margin:1.2rem 0 .7rem; }
     .results-heading h3 { font:760 1.15rem/1.25 Inter,ui-sans-serif,system-ui,sans-serif; margin:0; letter-spacing:-.025em; }
     .results-heading span { color:var(--quiet); font:500 .68rem/1.3 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .evidence-filters { display:flex; align-items:center; gap:.45rem; flex-wrap:wrap; margin:0 0 .8rem; }
+    .evidence-filter { min-height:44px; border:1px solid var(--line); border-radius:999px; padding:.48rem .72rem; color:#b8c3d1; background:#0d1520; font:700 .7rem/1 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .evidence-filter:hover { border-color:var(--line-strong); }
+    .evidence-filter[aria-pressed="true"] { color:#dff8ff; border-color:#39748a; background:var(--cyan-soft); box-shadow:inset 0 0 0 1px #72d9f51f; }
     .hit-list { display:grid; gap:.7rem; }
     .hit-card { border:1px solid var(--line); background:var(--surface-strong); border-radius:14px; padding:1rem; overflow-wrap:anywhere; box-shadow:inset 0 1px 0 #ffffff07; }
     .hit-card.is-primary { border-color:#3d5870; background:linear-gradient(145deg,#172333,#111a27); padding:1.1rem; }
@@ -123,6 +127,9 @@
     .meta-separator { color:#536176; }
     .hit-coordinate { overflow-wrap:anywhere; }
     .hit-coordinate a { color:#b9ddff; text-underline-offset:.2em; text-decoration-thickness:1px; }
+    .evidence-more { display:flex; justify-content:center; margin-top:.85rem; }
+    .evidence-more button { min-width:min(100%,220px); color:#c9eefa; border:1px solid #31566a; background:#0d202b; }
+    .filter-empty { border:1px dashed var(--line); border-radius:14px; padding:1rem; color:var(--muted); background:#0b1119; }
     .empty-result,.error-result { border:1px solid var(--line); border-radius:14px; padding:1.05rem; color:var(--muted); background:#0c1119; }
     .error-result { border-color:#6f3838; color:#ffc7c2; background:#211313; }
     details { margin-top:.85rem; border-top:1px solid var(--line); padding-top:.65rem; }
@@ -162,6 +169,8 @@
       .query button { width:100%; }
       .sample-grid { grid-template-columns:1fr; }
       .results-heading { align-items:flex-start; flex-direction:column; gap:.15rem; }
+      .evidence-filters { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .evidence-filter { min-width:0; }
       .conflict-sides { grid-template-columns:1fr; }
       .hit-head { align-items:flex-start; flex-direction:column; gap:.25rem; }
     }
@@ -211,6 +220,14 @@
             <span class="sample-kicker">Implementation</span>
             <span class="sample-copy">SQLx, transactions, and the write path</span>
           </button>
+          <button type="button" aria-pressed="false" data-q="Where is the MCP server configured and which tools does it expose?">
+            <span class="sample-kicker">MCP wiring</span>
+            <span class="sample-copy">Server configuration and exposed tools</span>
+          </button>
+          <button type="button" aria-pressed="false" data-q="What AWS services does this project use?">
+            <span class="sample-kicker">AWS stack</span>
+            <span class="sample-copy">Trace the deployed cloud architecture</span>
+          </button>
         </div>
       </fieldset>
 
@@ -258,6 +275,7 @@ const rawResult=document.querySelector('#raw-result');
 const statusChip=document.querySelector('#status-chip');
 const statusText=document.querySelector('#status-text');
 let searching=false;
+let evidenceCategory='all';
 
 function element(tag,className,text){
   const node=document.createElement(tag);
@@ -276,11 +294,12 @@ function boundedText(value,limit){
 }
 
 function sourceLabel(hit){
-  if(String(hit.chunk_id||'').startsWith('claim:')||hit.source==='ostk_memory')return 'Durable agent claim';
-  if(hit.source==='markdown')return 'Documentation memory';
-  if(hit.source==='code')return 'Code memory';
-  if(hit.source==='conversation')return 'Conversation memory';
-  return readable(hit.source)||'Fleet memory';
+  const source=String(hit?.source||'').trim().toLocaleLowerCase();
+  if(hitClaimId(hit)!==null||String(hit?.chunk_id||'').startsWith('claim:')||source==='ostk_memory')return 'Durable agent claim';
+  if(source==='markdown')return 'Documentation memory';
+  if(source==='code')return 'Code memory';
+  if(source==='conversation')return 'Conversation memory';
+  return readable(source)||'Fleet memory';
 }
 
 function repositoryPathAllowed(value){
@@ -305,8 +324,8 @@ function repositorySourceContext(hit){
 }
 
 function hitCoordinate(hit){
-  const claimId=Number(hit?.extra?.claim_id);
-  if(Number.isSafeInteger(claimId)&&claimId>0)return {label:`Claim #${claimId}`,href:null};
+  const claimId=hitClaimId(hit);
+  if(claimId!==null)return {label:`Claim #${claimId}`,href:null};
   const source=repositorySourceContext(hit);
   if(!source)return null;
   const displayValue=source.repositoryPath||source.sourceId;
@@ -498,8 +517,16 @@ function conflictLabel(conflict){
 }
 
 function hitClaimId(hit){
-  const claimId=Number(hit?.extra?.claim_id);
+  const claimId=Number(hit?.extra?.claim_id??hit?.claim?.id);
   return Number.isSafeInteger(claimId)&&claimId>0?claimId:null;
+}
+
+function hitText(hit){
+  for(const candidate of [hit?.snippet,hit?.text,hit?.claim?.text,hit?.matched_passage]){
+    const text=String(candidate||'').trim();
+    if(text)return text;
+  }
+  return '';
 }
 
 function uniqueHits(body,conflict=null){
@@ -515,12 +542,31 @@ function uniqueHits(body,conflict=null){
     // those synthetic projections as evidence cards; preserve room for the
     // ranked source material that led to them.
     if(representedClaims.has(hitClaimId(hit)))return false;
-    const text=String(hit?.snippet||hit?.text||'').trim();
+    const text=hitText(hit);
     const key=text.toLocaleLowerCase().replace(/\s+/g,' ');
     if(!text||seen.has(key))return false;
     seen.add(key);
     return true;
-  }).slice(0,3);
+  });
+}
+
+function hitCategory(hit){
+  const source=String(hit?.source||'').trim().toLocaleLowerCase();
+  if(hitClaimId(hit)!==null||String(hit?.chunk_id||'').startsWith('claim:')||source==='ostk_memory')return 'claim';
+  if(source==='code')return 'code';
+  if(source==='markdown')return 'document';
+  return 'other';
+}
+
+function filterHits(hits,category='all'){
+  const ranked=Array.isArray(hits)?hits:[];
+  const selected=normalizedEvidenceCategory(category);
+  return selected==='all'?[...ranked]:ranked.filter(hit=>hitCategory(hit)===selected);
+}
+
+function normalizedEvidenceCategory(value){
+  const category=String(value||'').trim().toLocaleLowerCase();
+  return ['document','code','claim'].includes(category)?category:'all';
 }
 
 function conflictMatch(body,conflictId){
@@ -577,11 +623,11 @@ function memberValue(member){
 }
 
 function cleanSnippet(hit){
-  const text=String(hit?.snippet||hit?.text||'').trim();
+  const text=hitText(hit);
   return text.replace(/^Source document [^;]+; section [^.]+\.\s*/i,'').trim()||text;
 }
 
-function renderHitCard(hit,fusedRank){
+function renderHitCard(hit,fusedRank,category='all'){
   const isPrimary=fusedRank===1;
   const card=element('article',`hit-card${isPrimary?' is-primary':''}`);
   const head=element('div','hit-head');
@@ -602,29 +648,112 @@ function renderHitCard(hit,fusedRank){
   }
   card.append(head);
   const snippet=cleanSnippet(hit);
-  if(hit.source==='code'){
+  if(hit?.source==='code'){
     const pre=element('pre');
     pre.append(element('code','',snippet));
     card.append(pre);
-  }else if(hit.source==='markdown'){
+  }else if(hit?.source==='markdown'){
     card.append(renderInlineMarkdown(snippet,hit));
   }else{
     card.append(element('p','',snippet));
   }
   const meta=element('div','hit-meta');
-  meta.append(element('span','hit-rank',`Fused rank ${fusedRank}`));
-  const date=shortDate(hit.ts);
+  const rankLabel=normalizedEvidenceCategory(category)==='claim'?'Claim rank':'Fused rank';
+  meta.append(element('span','hit-rank',`${rankLabel} ${fusedRank}`));
+  const dateValue=hit?.ts||hit?.claim?.updated_at;
+  const date=shortDate(dateValue);
   if(date){
     meta.append(element('span','meta-separator','·'));
     const time=element('time','',date);
-    time.dateTime=hit.ts;
+    time.dateTime=dateValue;
     meta.append(time);
   }
   card.append(meta);
   return card;
 }
 
-function renderResult(body,query){
+function renderEvidenceResults(hits,allHits,category='all',onSelect=null){
+  const initialCount=3;
+  const rankedHits=Array.isArray(hits)?hits:[];
+  const allRankedHits=Array.isArray(allHits)?allHits:rankedHits;
+  const section=element('section','evidence-results');
+  section.setAttribute('aria-labelledby','evidence-heading');
+
+  const heading=element('div','results-heading');
+  const title=element('h3','','Evidence ranked for this question');
+  title.id='evidence-heading';
+  const resultStatus=element('span');
+  resultStatus.setAttribute('role','status');
+  resultStatus.setAttribute('aria-live','polite');
+  heading.append(title,resultStatus);
+  section.append(heading);
+
+  const filters=element('div','evidence-filters');
+  filters.setAttribute('role','group');
+  filters.setAttribute('aria-label','Filter evidence by source type');
+  const options=[
+    {value:'all',label:'All'},
+    {value:'document',label:'Documents'},
+    {value:'code',label:'Code'},
+    {value:'claim',label:'Claims'},
+  ];
+  const filterButtons=[];
+  const selected=normalizedEvidenceCategory(category);
+  let expanded=false;
+
+  const list=element('div','hit-list');
+  list.id='evidence-hit-list';
+  list.setAttribute('aria-label','Ranked evidence results');
+  const more=element('div','evidence-more');
+  const toggle=element('button');
+  toggle.type='button';
+  toggle.setAttribute('aria-controls',list.id);
+  toggle.addEventListener('click',()=>{
+    expanded=!expanded;
+    update();
+  });
+  more.append(toggle);
+
+  const update=()=>{
+    const filtered=filterHits(rankedHits,selected);
+    const visible=expanded?filtered:filtered.slice(0,initialCount);
+    const categoryLabel=options.find(option=>option.value===selected)?.label.toLocaleLowerCase()||'results';
+    const resultLabel=selected==='all'?'returned unique results':`returned ${selected} results`;
+    resultStatus.textContent=`Showing ${visible.length} of ${filtered.length} ${resultLabel}`;
+    filterButtons.forEach(({button,value})=>button.setAttribute('aria-pressed',String(value===selected)));
+    list.replaceChildren(...visible.map(hit=>{
+      const responseRank=allRankedHits.indexOf(hit)+1;
+      const fusedRank=responseRank>0?responseRank:rankedHits.indexOf(hit)+1;
+      return renderHitCard(hit,fusedRank,selected);
+    }));
+    if(!filtered.length){
+      list.append(element('div','filter-empty',`No ${categoryLabel} cleared the relevance boundary for this question.`));
+    }
+    const remaining=Math.max(0,filtered.length-initialCount);
+    toggle.hidden=remaining<=0;
+    toggle.textContent=expanded?'Show fewer':`Show ${remaining} more result${remaining===1?'':'s'}`;
+    toggle.setAttribute('aria-expanded',String(expanded));
+  };
+
+  options.forEach(option=>{
+    const button=element('button','evidence-filter');
+    button.type='button';
+    button.textContent=option.label;
+    button.setAttribute('data-category',option.value);
+    button.setAttribute('aria-pressed','false');
+    button.addEventListener('click',()=>{
+      if(option.value!==selected&&typeof onSelect==='function')onSelect(option.value);
+    });
+    filterButtons.push({button,value:option.value});
+    filters.append(button);
+  });
+
+  section.append(filters,list,more);
+  update();
+  return section;
+}
+
+function renderResult(body,query,category='all'){
   answer.replaceChildren();
   const allHits=Array.isArray(body?.data?.hits)?body.data.hits:[];
   const conflict=chooseConflict(body);
@@ -638,9 +767,11 @@ function renderResult(body,query){
   if(allHits.length){
     const lanes=Array.isArray(body?.diagnostics?.retrieval?.lanes)?body.diagnostics.retrieval.lanes:[];
     const note=element('div','match-note');
-    note.append(element('span','',lanes.includes('lexical')&&lanes.includes('dense')
-      ?'Searched lexical and vector lanes; RRF merged the candidates that cleared their bounds.'
-      :'The strongest bounded retrieval lane supplied these results. Rank is evidence order, not confidence.'));
+    note.append(element('span','',normalizedEvidenceCategory(category)==='claim'
+      ?'Searched durable typed claims by semantic passage. Rank is evidence order, not confidence.'
+      :lanes.includes('lexical')&&lanes.includes('dense')
+        ?'Searched lexical and vector lanes; RRF merged the candidates that cleared their bounds.'
+        :'The strongest bounded retrieval lane supplied these results. Rank is evidence order, not confidence.'));
     answer.append(note);
   }
 
@@ -671,14 +802,11 @@ function renderResult(body,query){
     answer.append(callout);
   }
 
-  if(hits.length){
-    const heading=element('div','results-heading');
-    heading.append(element('h3','','Evidence ranked for this question'));
-    heading.append(element('span','',`${hits.length} unique result${hits.length===1?'':'s'} shown`));
-    answer.append(heading);
-    const list=element('div','hit-list');
-    hits.forEach(hit=>list.append(renderHitCard(hit,allHits.indexOf(hit)+1)));
-    answer.append(list);
+  if(hits.length||allHits.length||normalizedEvidenceCategory(category)!=='all'){
+    answer.append(renderEvidenceResults(hits,allHits,category,nextCategory=>{
+      evidenceCategory=normalizedEvidenceCategory(nextCategory);
+      void performRecall(query,evidenceCategory);
+    }));
   }else{
     answer.append(element('div','empty-result','No memory cleared the relevance boundary for this question. Try one of the evidence trails or use a more specific project term.'));
   }
@@ -740,22 +868,25 @@ async function loadStatus(){
 sampleButtons.forEach(button=>button.addEventListener('click',()=>{
   if(searching)return;
   input.value=button.dataset.q;
+  evidenceCategory='all';
   syncSampleSelection(input.value);
   form.requestSubmit();
 }));
 
 input.addEventListener('input',()=>syncSampleSelection(input.value));
 
-form.addEventListener('submit',async event=>{
-  event.preventDefault();
+async function performRecall(query,category='all'){
   if(searching)return;
-  const query=input.value.trim();
+  const selectedCategory=normalizedEvidenceCategory(category);
   if(!query)return;
   input.value=query;
+  evidenceCategory=selectedCategory;
   syncSampleSelection(query);
   setBusy(true);
-  queryMeta.textContent='Searching lexical + vector lanes…';
-  answer.replaceChildren(element('div','loading','Checking recalled memories and typed conflicts…'));
+  queryMeta.textContent=selectedCategory==='claim'?'Searching durable typed claims…':'Searching lexical + vector lanes…';
+  answer.replaceChildren(element('div','loading',selectedCategory==='claim'
+    ?'Checking typed claims and their open conflicts…'
+    :'Checking recalled memories and typed conflicts…'));
   raw.hidden=true;
   raw.open=false;
   const started=performance.now();
@@ -763,18 +894,21 @@ form.addEventListener('submit',async event=>{
     const response=await fetch('/api/recall',{
       method:'POST',
       headers:{'content-type':'application/json','accept':'application/json'},
-      body:JSON.stringify({query,limit:8})
+      body:JSON.stringify({query,limit:20,category:selectedCategory})
     });
     const serverMs=responseDuration(response.headers.get('server-timing'));
     const body=await parseResponse(response);
     const roundTripMs=Math.max(0,performance.now()-started);
     const lanes=Array.isArray(body?.diagnostics?.retrieval?.lanes)?body.diagnostics.retrieval.lanes:[];
-    const retrieval=lanes.length?`${lanes.map(lane=>lane==='dense'?'vector':readable(lane)).join(' + ')} · RRF · `:'';
-    const conflict=renderResult(body,query);
+    const retrieval=selectedCategory==='claim'
+      ?'typed claim search · '
+      :lanes.length?`${lanes.map(lane=>lane==='dense'?'vector':readable(lane)).join(' + ')} · RRF · `:'';
+    const serverAction=selectedCategory==='claim'?'retrieved claims in':'retrieved + fused in';
+    const conflict=renderResult(body,query,selectedCategory);
     const conflictText=conflict?' · exact open conflict linked':'';
     queryMeta.textContent=serverMs===null
       ?`${retrieval}${Math.round(roundTripMs)} ms round trip${conflictText}`
-      :`${retrieval}retrieved + fused in ${Math.round(serverMs)} ms server time · ${Math.round(roundTripMs)} ms round trip${conflictText}`;
+      :`${retrieval}${serverAction} ${Math.round(serverMs)} ms server time · ${Math.round(roundTripMs)} ms round trip${conflictText}`;
     rawResult.textContent=JSON.stringify(body,null,2);
     raw.hidden=false;
   }catch(error){
@@ -784,6 +918,12 @@ form.addEventListener('submit',async event=>{
   }finally{
     setBusy(false);
   }
+}
+
+form.addEventListener('submit',event=>{
+  event.preventDefault();
+  const query=input.value.trim();
+  void performRecall(query,evidenceCategory);
 });
 
 loadStatus();
