@@ -31,6 +31,28 @@ pub struct CockroachMemoryService {
     embedder: Arc<dyn ChunkEmbedder>,
 }
 
+struct ChunkConflictProjection {
+    conflicts: Vec<Conflict>,
+    support_claim_count: usize,
+    support_claims_truncated: bool,
+}
+
+fn merge_supported_claim_ids(direct: &mut Vec<i64>, supported: Vec<i64>) -> bool {
+    let mut truncated = false;
+    for claim_id in supported {
+        if direct.binary_search(&claim_id).is_ok() {
+            continue;
+        }
+        if direct.len() == MAX_TOOL_RESULTS {
+            truncated = true;
+            break;
+        }
+        let insertion = direct.binary_search(&claim_id).unwrap_err();
+        direct.insert(insertion, claim_id);
+    }
+    truncated
+}
+
 impl std::fmt::Debug for CockroachMemoryService {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -112,6 +134,58 @@ impl CockroachMemoryService {
         Ok(apply_retrieval_metadata(hits, metadata))
     }
 
+    async fn project_chunk_conflicts(
+        &self,
+        scope: &FleetScope,
+        hits: &[RecallHit],
+    ) -> ServiceResult<ChunkConflictProjection> {
+        let mut claim_ids = hits
+            .iter()
+            .filter_map(|hit| {
+                hit.extra
+                    .get("claim_id")
+                    .and_then(Value::as_i64)
+                    .filter(|id| *id > 0)
+            })
+            .collect::<Vec<_>>();
+        claim_ids.sort_unstable();
+        claim_ids.dedup();
+        let mut evidence_chunk_ids = hits
+            .iter()
+            .filter(|hit| hit.extra.get("claim_id").and_then(Value::as_i64).is_none())
+            .map(|hit| hit.chunk_id.clone())
+            .collect::<Vec<_>>();
+        evidence_chunk_ids.sort_unstable();
+        evidence_chunk_ids.dedup();
+        let support_matches = if evidence_chunk_ids.is_empty() {
+            crate::ledger::SupportedClaimIds {
+                claim_ids: Vec::new(),
+                truncated: false,
+            }
+        } else {
+            self.ledger
+                .supported_claim_ids_for_chunk_ids(scope, &evidence_chunk_ids, MAX_TOOL_RESULTS)
+                .await
+                .map_err(service_error)?
+        };
+        let support_claim_count = support_matches.claim_ids.len();
+        let support_claims_truncated = support_matches.truncated
+            || merge_supported_claim_ids(&mut claim_ids, support_matches.claim_ids);
+        let conflicts = if claim_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.ledger
+                .conflicts_for_claim_ids(scope, &claim_ids, MAX_TOOL_RESULTS)
+                .await
+                .map_err(service_error)?
+        };
+        Ok(ChunkConflictProjection {
+            conflicts,
+            support_claim_count,
+            support_claims_truncated,
+        })
+    }
+
     async fn recall_search(
         &self,
         scope: &FleetScope,
@@ -148,30 +222,27 @@ impl CockroachMemoryService {
                 .await
                 .map_err(|error| ServiceError::Internal(format!("hybrid recall: {error}")))?;
                 let metadata_elided = self.hydrate_retrieval_metadata(&mut hits).await?;
-                let claim_ids = hits
-                    .iter()
-                    .filter_map(|hit| hit.extra.get("claim_id").and_then(Value::as_i64))
-                    .collect::<Vec<_>>();
-                let conflicts = if claim_ids.is_empty() {
-                    Vec::new()
-                } else {
-                    self.ledger
-                        .conflicts_for_claim_ids(scope, &claim_ids, MAX_TOOL_RESULTS)
-                        .await
-                        .map_err(service_error)?
-                };
+                let projection = self.project_chunk_conflicts(scope, &hits).await?;
                 let mut result = RecallResult::new(json!({ "hits": hits }));
-                result.conflicts = serialize_conflicts(&conflicts)?;
+                result.conflicts = serialize_conflicts(&projection.conflicts)?;
                 // Ordinary corpus rows are not NLI-checked. Typed conflict
                 // coverage applies only to synthetic claim projections, so
                 // the aggregate response is deliberately never "complete".
                 result.conflict_coverage = structured_conflict_coverage(false);
+                if projection.support_claims_truncated {
+                    result.warnings.push(json!({
+                        "code": "support_claim_projection_truncated",
+                        "message": "more typed claims cite the surfaced evidence than fit in the bounded conflict projection"
+                    }));
+                }
                 result.diagnostics.insert(
                     "retrieval".into(),
                     json!({
                         "lanes": ["lexical", "dense"],
                         "fusion": "rrf",
                         "metadata_elided": metadata_elided,
+                        "support_claims_matched": projection.support_claim_count,
+                        "support_claims_truncated": projection.support_claims_truncated,
                     }),
                 );
                 Ok(result)
@@ -716,6 +787,18 @@ mod tests {
         );
         assert!(bounded_limit(Some(0)).is_err());
         assert!(bounded_limit(Some(MAX_TOOL_RESULTS + 1)).is_err());
+    }
+
+    #[test]
+    fn support_claim_merge_deduplicates_before_enforcing_the_bound() {
+        let mut direct = (1..i64::try_from(MAX_TOOL_RESULTS).unwrap()).collect::<Vec<_>>();
+        let supported = (1..=i64::try_from(MAX_TOOL_RESULTS + 1).unwrap()).collect::<Vec<_>>();
+        assert!(merge_supported_claim_ids(&mut direct, supported));
+        assert_eq!(direct.len(), MAX_TOOL_RESULTS);
+        assert_eq!(
+            direct.last(),
+            Some(&i64::try_from(MAX_TOOL_RESULTS).unwrap())
+        );
     }
 
     #[test]

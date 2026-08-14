@@ -243,12 +243,26 @@ impl ClaimInput {
                 || support.source_config_id.len() > 256
                 || support.relation.len() > 64
                 || support
+                    .chunk_id
+                    .as_ref()
+                    .is_some_and(|chunk_id| chunk_id.trim().is_empty() || chunk_id.len() > 256)
+                || support
                     .excerpt
                     .as_ref()
                     .is_some_and(|excerpt| excerpt.len() > 8_000)
             {
                 return Err(FleetError::Memory(
                     "claim support exceeds a field-size limit".into(),
+                ));
+            }
+            if support.chunk_id.is_some()
+                && support.content_sha256.as_ref().is_some_and(|digest| {
+                    digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            {
+                return Err(FleetError::Memory(
+                    "chunk-backed claim support content_sha256 must be a 64-character hex digest"
+                        .into(),
                 ));
             }
         }
@@ -506,5 +520,31 @@ mod tests {
         value.text.push('é');
         let error = value.validate().unwrap_err();
         assert!(error.to_string().contains("16002 UTF-8 bytes"));
+    }
+
+    #[test]
+    fn chunk_backed_support_requires_bounded_identity_and_sha256_shape() {
+        let mut value = input();
+        value.support.push(ClaimSupportInput {
+            source_config_id: "rich-demo:docs:v1".into(),
+            source: "markdown".into(),
+            source_id: "docs/ARCHITECTURE.md".into(),
+            chunk_id: Some("chunk-1".into()),
+            content_sha256: Some("a".repeat(64)),
+            excerpt: Some("source-backed claim".into()),
+            relation: "supports".into(),
+        });
+        assert!(value.validate().is_ok());
+
+        value.support[0].chunk_id = Some(" ".into());
+        assert!(value.validate().is_err());
+        value.support[0].chunk_id = Some("chunk-1".into());
+        value.support[0].content_sha256 = Some("not-a-sha256".into());
+        assert!(value.validate().is_err());
+
+        // External citations remain compatible when no local chunk identity
+        // is asserted; their provider-specific digest is not reinterpreted.
+        value.support[0].chunk_id = None;
+        assert!(value.validate().is_ok());
     }
 }

@@ -13,7 +13,7 @@ use sqlx::{Row, Transaction};
 
 use crate::ledger::{
     Claim, ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimSupport, Conflict,
-    SemanticClaimHit,
+    SemanticClaimHit, SupportedClaimIds,
 };
 use crate::store::cockroach::{
     EMBEDDING_DIMENSION, RetryPolicy, serialize_vector, with_serializable_retry,
@@ -61,6 +61,16 @@ const CONFLICT_CLAIM_PROJECTION_SQL: &str = "SELECT id, project, kind, claim_key
 const CLAIM_CONFLICT_IDS_SQL: &str = "SELECT claim_id, conflict_id FROM memory_conflict_members@{NO_FULL_SCAN} \
      WHERE tenant_id = $1 AND project = $2 AND claim_id = ANY($3) \
      ORDER BY claim_id, conflict_id";
+const SUPPORTED_CLAIM_IDS_SQL: &str = "SELECT DISTINCT claim_id \
+     FROM memory_claim_support@{NO_FULL_SCAN} \
+     WHERE tenant_id = $1 AND project = $2 AND chunk_id = ANY($3) AND state = 'current' \
+     ORDER BY claim_id LIMIT $4";
+const SUPPORT_CHUNK_MATCH_SQL: &str = "SELECT EXISTS(\
+         SELECT 1 FROM memory_chunks@{NO_FULL_SCAN} \
+         WHERE tenant_id = $1 AND project = $2 AND chunk_id = $3 \
+           AND source_config_id = $4 AND source = $5 AND source_id = $6 \
+           AND ($7::STRING IS NULL OR content_sha256 = $7)\
+     )";
 
 /// Claim repository bound to one trusted tenant/project and embedding space.
 ///
@@ -679,6 +689,55 @@ impl ClaimLedger for CockroachClaimLedger {
         .await?;
         hydrate_conflicts(&self.pool, scope, rows).await
     }
+
+    async fn supported_claim_ids_for_chunk_ids(
+        &self,
+        scope: &FleetScope,
+        chunk_ids: &[String],
+        limit: usize,
+    ) -> Result<SupportedClaimIds> {
+        self.ensure_scope(scope)?;
+        validate_result_limit(limit)?;
+        if chunk_ids.is_empty() {
+            return Ok(SupportedClaimIds {
+                claim_ids: Vec::new(),
+                truncated: false,
+            });
+        }
+        if chunk_ids.len() > MAX_LEDGER_RESULTS {
+            return Err(FleetError::Memory(format!(
+                "support chunk filter accepts at most {MAX_LEDGER_RESULTS} ids"
+            )));
+        }
+        if chunk_ids
+            .iter()
+            .any(|id| id.trim().is_empty() || id.len() > 256)
+        {
+            return Err(FleetError::Memory(
+                "support chunk ids must be between 1 and 256 bytes".into(),
+            ));
+        }
+
+        let sentinel_limit = limit
+            .checked_add(1)
+            .ok_or_else(|| FleetError::Memory("support claim limit overflow".into()))?;
+        let mut claim_ids = sqlx::query_scalar::<_, i64>(SUPPORTED_CLAIM_IDS_SQL)
+            .bind(scope.tenant_id)
+            .bind(&scope.project)
+            .bind(chunk_ids)
+            .bind(
+                i64::try_from(sentinel_limit)
+                    .map_err(|_| FleetError::Memory("support claim limit exceeds INT8".into()))?,
+            )
+            .fetch_all(&self.pool)
+            .await?;
+        let truncated = claim_ids.len() > limit;
+        claim_ids.truncate(limit);
+        Ok(SupportedClaimIds {
+            claim_ids,
+            truncated,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1092,6 +1151,23 @@ async fn insert_support(
                 "claim support source and source_id must not be empty",
             ));
         }
+        if let Some(chunk_id) = support.chunk_id.as_deref() {
+            let exact_match: bool = sqlx::query_scalar(SUPPORT_CHUNK_MATCH_SQL)
+                .bind(scope.tenant_id)
+                .bind(&scope.project)
+                .bind(chunk_id)
+                .bind(&support.source_config_id)
+                .bind(&support.source)
+                .bind(&support.source_id)
+                .bind(&support.content_sha256)
+                .fetch_one(&mut **transaction)
+                .await?;
+            if !exact_match {
+                return Err(protocol_error(
+                    "claim support chunk does not match an active tenant/project corpus coordinate",
+                ));
+            }
+        }
         let row = sqlx::query(
             "INSERT INTO memory_claim_support (\
                  tenant_id, project, claim_id, source_config_id, source, source_id, chunk_id, \
@@ -1280,8 +1356,10 @@ fn validate_result_limit(limit: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ostk_recall_core::PrivacyTier;
+    use ostk_recall_core::{FacetSet, Links, PrivacyTier, Source};
     use uuid::Uuid;
+
+    use crate::store::cockroach::ScopedChunk;
 
     struct TestEmbedder;
 
@@ -1459,6 +1537,12 @@ mod tests {
         assert!(!CONFLICT_CLAIM_PROJECTION_SQL.contains("SELECT *"));
 
         assert!(CLAIM_CONFLICT_IDS_SQL.contains("@{NO_FULL_SCAN}"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("memory_claim_support@{NO_FULL_SCAN}"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("chunk_id = ANY($3)"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("state = 'current'"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("LIMIT $4"));
+        assert!(SUPPORT_CHUNK_MATCH_SQL.contains("memory_chunks@{NO_FULL_SCAN}"));
+        assert!(SUPPORT_CHUNK_MATCH_SQL.contains("content_sha256 = $7"));
     }
 
     #[test]
@@ -1589,6 +1673,39 @@ mod tests {
             RetryPolicy::default(),
         )
         .unwrap();
+        let support_text = "The implementation requires one migration owner before workers start.";
+        let support_chunk_id = format!("live-support-{}", Uuid::now_v7());
+        let support_sha256 = Chunk::content_hash(support_text);
+        let support_chunk = Chunk {
+            chunk_id: support_chunk_id.clone(),
+            source: Source::Markdown,
+            project: Some(scope.project.clone()),
+            source_id: "docs/live-migration.md".into(),
+            source_config_id: "live-docs-v1".into(),
+            chunk_index: 0,
+            ts: None,
+            role: Some("primary".into()),
+            text: support_text.into(),
+            sha256: support_sha256.clone(),
+            links: Links::default(),
+            facets: FacetSet::new(),
+            embedding_input_sha256: "live-support-embedding".into(),
+            extra: Value::Null,
+        };
+        store
+            .upsert_chunk(&ScopedChunk {
+                scope: scope.clone(),
+                chunk: support_chunk,
+                embedding_model: TestEmbedder.model_id().into(),
+                embedding: TestEmbedder
+                    .encode_batch(&[support_text])
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+                stale: false,
+            })
+            .await
+            .unwrap();
         let first = ClaimInput {
             kind: ClaimKind::Decision,
             text: "Use CockroachDB for shared fleet memory".into(),
@@ -1601,8 +1718,38 @@ mod tests {
             confidence: 1.0,
             valid_from: None,
             valid_to: None,
-            support: Vec::new(),
+            support: vec![crate::ledger::ClaimSupportInput {
+                source_config_id: "live-docs-v1".into(),
+                source: "markdown".into(),
+                source_id: "docs/live-migration.md".into(),
+                chunk_id: Some(support_chunk_id.clone()),
+                content_sha256: Some(support_sha256.clone()),
+                excerpt: Some(support_text.into()),
+                relation: "supports".into(),
+            }],
         };
+        let mut mismatched_support = first.clone();
+        mismatched_support.support[0].content_sha256 = Some("0".repeat(64));
+        let mismatch_key = format!("live-ledger/mismatched-support/{}", Uuid::now_v7());
+        let mismatch_error = ledger
+            .record_claim(&scope, &mismatched_support, &mismatch_key)
+            .await
+            .expect_err("a dangling or stale local support coordinate must fail closed");
+        assert!(
+            mismatch_error
+                .to_string()
+                .contains("does not match an active tenant/project corpus coordinate")
+        );
+        let mismatch_receipts: i64 = sqlx::query_scalar(
+            "SELECT count(*)::INT8 FROM memory_mutation_receipts \
+             WHERE tenant_id = $1 AND idempotency_key = $2",
+        )
+        .bind(scope.tenant_id)
+        .bind(&mismatch_key)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(mismatch_receipts, 0);
         let recorded = ledger
             .record_claim(&scope, &first, "live-ledger/first")
             .await
@@ -1658,6 +1805,29 @@ mod tests {
         assert_eq!(conflicts[0].member_count, 2);
         assert!(!conflicts[0].members_truncated);
         assert!(!conflicts[0].member_values_elided);
+        let supported = ledger
+            .supported_claim_ids_for_chunk_ids(&scope, std::slice::from_ref(&support_chunk_id), 10)
+            .await
+            .unwrap();
+        assert!(!supported.truncated);
+        assert_eq!(
+            supported.claim_ids.iter().copied().collect::<HashSet<_>>(),
+            [recorded.claim.id, disputed.claim.id]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
+        let support_conflicts = ledger
+            .conflicts_for_claim_ids(&scope, &supported.claim_ids, 10)
+            .await
+            .unwrap();
+        assert_eq!(support_conflicts.len(), 1);
+        assert_eq!(support_conflicts[0].id, conflicts[0].id);
+        let bounded_supported = ledger
+            .supported_claim_ids_for_chunk_ids(&scope, &[support_chunk_id], 1)
+            .await
+            .unwrap();
+        assert_eq!(bounded_supported.claim_ids.len(), 1);
+        assert!(bounded_supported.truncated);
         let semantic_hits = ledger
             .search_claims(&scope, &primary_passage, false, 10)
             .await

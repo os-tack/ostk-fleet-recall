@@ -3,6 +3,14 @@ use async_trait::async_trait;
 use crate::ledger::{Claim, ClaimInput, ClaimMutation, Conflict, SemanticClaimHit};
 use crate::{FleetScope, Result};
 
+/// Bounded claim coordinates resolved from exact source-chunk support rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportedClaimIds {
+    pub claim_ids: Vec<i64>,
+    /// True when more matching claims existed than the requested projection.
+    pub truncated: bool,
+}
+
 /// Semantic claim operations implemented atomically by each durable backend.
 ///
 /// The API intentionally does not expose SQL transaction handles. Recording a
@@ -40,4 +48,17 @@ pub trait ClaimLedger: Send + Sync {
         claim_ids: &[i64],
         limit: usize,
     ) -> Result<Vec<Conflict>>;
+
+    /// Resolve current typed claims that cite any exact surfaced corpus chunk.
+    ///
+    /// This is the provenance seam between semantic passage retrieval and the
+    /// conflict ledger: an ordinary spec/code hit can carry a known typed
+    /// disagreement without requiring its synthetic claim projection to rank
+    /// on the same page.
+    async fn supported_claim_ids_for_chunk_ids(
+        &self,
+        scope: &FleetScope,
+        chunk_ids: &[String],
+        limit: usize,
+    ) -> Result<SupportedClaimIds>;
 }

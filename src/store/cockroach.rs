@@ -30,6 +30,8 @@ pub const EMBEDDING_DIMENSION: usize = 512;
 pub const MAX_PUBLIC_NUMERIC_ID: i64 = 9_007_199_254_740_991;
 
 const INITIAL_MIGRATION_SQL: &str = include_str!("../../migrations/0001_fleet_memory.sql");
+const CLAIM_SUPPORT_CHUNK_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0002_claim_support_chunk_lookup.sql");
 
 /// Maximum ANN candidates examined before applying a time-range filter.
 ///
@@ -257,6 +259,7 @@ pub struct DatabaseCapabilities {
     pub vector_index_enabled: bool,
     pub lexical_index_enabled: bool,
     pub conflict_membership_index_enabled: bool,
+    pub claim_support_chunk_index_enabled: bool,
     pub cosine_distance_supported: bool,
     pub schema_version: i64,
 }
@@ -422,16 +425,27 @@ impl CockroachStore {
         // Constructing the migration from `include_str!` keeps deployment
         // single-binary without enabling SQLx's unrelated query macros.
         let migrator = Migrator {
-            migrations: Cow::Owned(vec![Migration::new(
-                1,
-                Cow::Borrowed("fleet memory substrate"),
-                MigrationType::Simple,
-                Cow::Borrowed(INITIAL_MIGRATION_SQL),
-                // CockroachDB 26.2 cannot build vector indexes through its
-                // legacy transactional schema changer (SQLSTATE 0A000).
-                // Execute this DDL migration outside one SQL transaction.
-                true,
-            )]),
+            migrations: Cow::Owned(vec![
+                Migration::new(
+                    1,
+                    Cow::Borrowed("fleet memory substrate"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(INITIAL_MIGRATION_SQL),
+                    // CockroachDB 26.2 cannot build vector indexes through its
+                    // legacy transactional schema changer (SQLSTATE 0A000).
+                    // Execute this DDL migration outside one SQL transaction.
+                    true,
+                ),
+                Migration::new(
+                    2,
+                    Cow::Borrowed("claim support chunk lookup"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(CLAIM_SUPPORT_CHUNK_MIGRATION_SQL),
+                    // Keep every CockroachDB schema change outside SQLx's
+                    // PostgreSQL-oriented transaction wrapper.
+                    true,
+                ),
+            ]),
             ignore_missing: false,
             // SQLx's PostgreSQL lock uses `pg_advisory_lock`, which
             // CockroachDB intentionally does not implement. CockroachDB's
@@ -508,6 +522,12 @@ impl CockroachStore {
         )
         .fetch_one(&mut *connection)
         .await?;
+        let claim_support_chunk_index_enabled: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM [SHOW INDEXES FROM memory_claim_support] \
+             WHERE index_name = 'memory_claim_support_chunk_idx')",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
         let cosine_distance_supported: bool =
             sqlx::query_scalar("SELECT ('[1,0]'::VECTOR(2) <=> '[1,0]'::VECTOR(2))::FLOAT8 = 0.0")
                 .fetch_one(&mut *connection)
@@ -523,6 +543,7 @@ impl CockroachStore {
             vector_index_enabled,
             lexical_index_enabled,
             conflict_membership_index_enabled,
+            claim_support_chunk_index_enabled,
             cosine_distance_supported,
             schema_version: schema_version.unwrap_or(0),
         })
@@ -539,10 +560,11 @@ impl CockroachStore {
         .fetch_one(&self.pool)
         .await?;
         let capabilities = self.capabilities().await?;
-        if capabilities.schema_version != 1
+        if capabilities.schema_version != 2
             || !capabilities.vector_index_enabled
             || !capabilities.lexical_index_enabled
             || !capabilities.conflict_membership_index_enabled
+            || !capabilities.claim_support_chunk_index_enabled
             || !capabilities.cosine_distance_supported
         {
             return Err(FleetError::Configuration(
@@ -1610,6 +1632,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn support_chunk_migration_adds_the_scoped_point_lookup() {
+        let migration = include_str!("../../migrations/0002_claim_support_chunk_lookup.sql");
+        assert!(migration.contains("CREATE INDEX memory_claim_support_chunk_idx"));
+        assert!(
+            migration.contains(
+                "ON memory_claim_support (tenant_id, project, chunk_id, state, claim_id)"
+            )
+        );
+        assert!(!migration.contains("DROP "));
+    }
+
     /// Set `FLEET_RECALL_TEST_DATABASE_URL` to a disposable `CockroachDB` 26.2
     /// database to exercise migrations, type casts, and index-backed lanes.
     #[tokio::test]
@@ -1631,8 +1665,9 @@ mod tests {
         assert!(capabilities.vector_index_enabled);
         assert!(capabilities.lexical_index_enabled);
         assert!(capabilities.conflict_membership_index_enabled);
+        assert!(capabilities.claim_support_chunk_index_enabled);
         assert!(capabilities.cosine_distance_supported);
-        assert_eq!(capabilities.schema_version, 1);
+        assert_eq!(capabilities.schema_version, 2);
 
         let cleanup = sqlx::query(
             "WITH deleted_active AS (\
