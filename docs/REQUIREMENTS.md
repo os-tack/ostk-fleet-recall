@@ -11,11 +11,11 @@ sanitized AWS/CockroachDB Cloud reference and replacement receipts.
 | Requirement | Fleet Recall evidence | Status |
 |---|---|---|
 | New project created during the contest | This repository; Recall and OSTK are disclosed as pre-existing foundations | Public initial history published and boundary documented |
-| Agentic application | The standalone deterministic reference policy agent recalls fleet state, applies an explicit rollout-safety policy, and persists cited actions; separately deployment-bound A/B/C identities exercise the full memory/action/conflict chain | Verified pre-polish revision 3 cloud evidence run `devpost-final-20260814T021819Z` proved decision/action/incompatible/escalation claims 5/6/7/8 and open conflict 2 across four one-off Fargate tasks using reference-agent task definition revision 3. OSTK is strictly optional, and no LLM decision or live model run is claimed |
-| CockroachDB persistent memory layer | Corpus, claim ledger, conflicts, receipts, actions, and events in CockroachDB | Live on CockroachDB Cloud 26.2.5 with schema version 1; migration, three-record seed, four-task policy chain, and post-replacement exact recall succeeded |
-| Distributed Vector Indexing | Prefix-scoped `VECTOR(512)` indexes for chunks and claim passages | Live status confirms the vector, lexical, and conflict-membership indexes plus cosine distance and dimension 512; lexical/dense RRF returned the expected claims. The [publication-safe Cloud `EXPLAIN`](evidence/cockroach-cloud-explain.txt) verifies both C-SPANN indexes and the lexical inverted index with the exact production SQL shapes on 10,001 disposable rows; all assertions passed |
+| Agentic application | The standalone deterministic reference policy agent recalls fleet state, applies an explicit rollout-safety policy, and persists cited actions; separately deployment-bound A/B/C identities exercise the full memory/action/conflict chain | Fresh release-bound run `devpost-final6-20260814T143523Z` proved decision/action/incompatible/escalation claims 15/16/17/18 and open conflict 5 across four one-off Fargate tasks using reference-agent task definition revision 6. The separate self-audit proved source-backed claims 9/10 and open conflict 3. OSTK is strictly optional, and no LLM decision or live model run is claimed |
+| CockroachDB persistent memory layer | Corpus, claim ledger, source support, conflicts, receipts, actions, and events in CockroachDB | Live on CockroachDB Cloud 26.2.5 with schema version 2; migration, the three-record bootstrap, the verifier-gated 536-chunk rich corpus, both live agent proofs, and post-replacement exact recall succeeded |
+| Distributed Vector Indexing | Prefix-scoped `VECTOR(512)` indexes for chunks and claim passages | Live status confirms the vector, lexical, conflict-membership, and claim-support-chunk indexes plus cosine distance and dimension 512; lexical/dense RRF returned the expected claims and projected an exact source-backed conflict. The [publication-safe Cloud `EXPLAIN`](evidence/cockroach-cloud-explain.txt) verifies both C-SPANN indexes and the lexical inverted index with the exact production SQL shapes on 10,001 disposable rows; all assertions passed |
 | Second CockroachDB tool | The coding agent invoked the pinned official Agent Skills to review and shape transactions, SQL, tests, and runbooks; see `AGENT_SKILLS_AUDIT.md` | Implemented and audited with a skill-to-code/test trace |
-| AWS service | ECS/Fargate behind ALB and CloudFront, private S3 model delivery, immutable ECR image, Secrets Manager database URLs, CloudWatch evidence, plus the LocalStack contract harness | Live migration and seed tasks succeeded; four reference-agent Fargate tasks verified the policy chain; a forced deployment replaced the complete serving task set and preserved exact hybrid recall |
+| AWS service | ECS/Fargate behind ALB and CloudFront, private S3 model delivery, immutable ECR image, Secrets Manager database URLs, CloudWatch evidence, plus the LocalStack contract harness | All four task-definition families reached revision 6; live migration and both seed tasks succeeded; the two-task self-audit and four-task reference run verified their chains; a forced deployment replaced the complete serving task set and preserved exact claims 16 and 18 through hybrid recall |
 | Public open-source repository | Public GitHub repository with explicit pre-existing-code disclosure | Published and anonymously verified |
 | Working demo URL | Public read-only status/demo surface at <https://d13zrqfh66r7ub.cloudfront.net> | Live and healthy through CloudFront; `/healthz`, `/api/status`, and bounded hybrid recall succeeded |
 | Public video under three minutes | Live AWS UI plus reviewed cloud agent/replacement receipts by default; standalone Fleet Recall is optional local terminal footage, and OSTK is an optional alternate | 46-second 1600×900 sanitized rehearsal rendered; final cloud footage, narration, and public upload pending |
@@ -50,6 +50,9 @@ Official references:
 7. The publication-safe Cockroach Cloud `EXPLAIN` artifact demonstrates use of
    both scoped vector indexes and the lexical inverted index on the 10,001-row
    disposable fixture with the exact production SQL shapes.
+8. A semantic source search resolves exact hash-bound claim support, surfaces
+   the relevant documentation and implementation chunks, and projects their
+   exact open conflict without applying corpus-wide natural-language inference.
 
 ## Evidence boundary
 
@@ -57,18 +60,24 @@ Official references:
   LocalStack contracts, checked-in sanitized rehearsal JSON, and a fresh
   standalone MCP video capture. These prove application behavior but not AWS or
   CockroachDB Cloud operation.
-- **Cloud evidence:** verified pre-polish revision 3 cloud evidence run
-  `devpost-final-20260814T021819Z` produced a verified four-task ECS/Fargate
-  chain against CockroachDB Cloud: decision claim 5, cited action claim 6,
-  incompatible claim 7, and escalation claim 8 citing open conflict 2. The
-  public HTTPS surface reported version 26.2.5/schema 1 and all required
-  capabilities; a fully disjoint serving-task replacement preserved exact
-  public action/escalation claims 6 and 8 through lexical/dense RRF. The
-  receipts are operator-held and sanitized for publication. The currently
-  deployed revision 4 serving image adds the conflict-first UI and bounded API
-  polish from `97eba7d` and passed CI plus separate public smoke checks; the
-  four-task and replacement receipts were not rerun on revision 4. The
-  publication-safe
+- **Cloud evidence:** the checked-in, publication-safe
+  [self-audit receipt](evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json)
+  proves semantic recall surfaced the exact documentation/code sources behind
+  claims 9 and 10 and projected open conflict 3. Fresh release-bound run
+  `devpost-final6-20260814T143523Z` produced the checked-in
+  [reference-agent](evidence/reference-agent-devpost-final6-20260814T143523Z.json),
+  [replacement](evidence/replacement-devpost-final6-20260814T143523Z.json), and
+  [validation](evidence/publication-validation-devpost-final6-20260814T143523Z.json)
+  receipts. They correlate decision claim 15, cited action claim 16,
+  incompatible claim 17, and escalation claim 18 citing open conflict 5, then
+  prove a fully disjoint revision-6 serving-task replacement preserved exact
+  public claims 16 and 18 through lexical/dense RRF. The public HTTPS surface
+  reported CockroachDB 26.2.5/schema 2 and all required capabilities. The
+  deployed ARM64 image is immutable tag `git-ba884f24858a` at source commit
+  `ba884f24858a58b09a915e0358e60e7fcc7e2c34`; all five CI jobs passed in run
+  `31808620621`. An earlier completed proof remains historical because it
+  predates this schema and image boundary; the fresh run ID prevents mixing its
+  deployment coordinates with the current claims and replacement. The publication-safe
   [Cloud `EXPLAIN`](evidence/cockroach-cloud-explain.txt) used the exact
   production SQL shapes against a separate 10,001-row database and selected
   `memory_chunks_semantic_idx`, `memory_chunks_source_semantic_idx`, and

@@ -8,10 +8,12 @@ Terraform variables, command-line arguments, screenshots, or shell history.
 
 Current release state: the onboarding path has been completed for the live
 submission candidate at
-<https://d13zrqfh66r7ub.cloudfront.net>. Migration and the three-record seed
-succeeded; CockroachDB Cloud reports version 26.2.5/schema 1 and all required
-capabilities; the four-task reference-agent chain and a complete serving-task
-replacement both verified exact hybrid recall. Publication-safe Cloud
+<https://d13zrqfh66r7ub.cloudfront.net>. The schema-2 migration, three-record
+bootstrap, and verifier-gated 536-chunk rich seed succeeded; CockroachDB Cloud
+reports version 26.2.5 and all required capabilities. A two-task source-conflict
+self-audit, the four-task reference-agent chain, and a complete disjoint
+serving-task replacement all verified against task-definition revision 6 and
+immutable image `git-ba884f24858a`. Publication-safe Cloud
 `EXPLAIN` verifies the exact production SQL shapes and all three intended
 indexes on a disposable 10,001-row fixture. The final public video and the
 remaining Devpost fields are still pending.
@@ -380,18 +382,31 @@ jq -e '.schema == "fleet-reference-agent-run-v1" and .verified == true' \
   "target/aws-evidence/reference-agent-$RUN_ID.json"
 ```
 
-For the live deployment, migration and the three-record seed exited
-successfully. Verified pre-polish revision 3 cloud evidence run
-`devpost-final-20260814T021819Z`, using reference-agent task definition revision
-3, then verified four Fargate tasks and the correlated
-decision/action/incompatible/escalation claim IDs 5/6/7/8 with open conflict ID
-2. Public lexical/dense RRF observed the exact action and escalation claims 6
-and 8. The replacement proof changed the complete serving task set to a fully
-disjoint set and observed those same exact claims afterward. The current
-revision 4 serving image adds the conflict-first UI and bounded API polish from
-`97eba7d`; it passed CI and separate public smoke checks, but the four-task and
-replacement receipts were not rerun on revision 4. The separate Cloud
-`EXPLAIN` proof then exercised the exact production
+For the live deployment, the schema-2 migration, three-record bootstrap, and
+536-chunk rich seed exited successfully. The checked-in
+[source-conflict self-audit](evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json)
+verified documentation-backed claim 9, code-backed claim 10, and their exact
+open conflict 3 through semantic recall. Fresh run
+`devpost-final6-20260814T143523Z` then produced the checked-in
+[reference-agent](evidence/reference-agent-devpost-final6-20260814T143523Z.json),
+[replacement](evidence/replacement-devpost-final6-20260814T143523Z.json), and
+[publication-validation](evidence/publication-validation-devpost-final6-20260814T143523Z.json)
+receipts. Reference-agent task definition revision 6 correlated
+decision/action/incompatible/escalation claims 15/16/17/18 with open conflict
+5. Public lexical/dense RRF observed exact action and escalation claims 16 and
+18. Serving task definition revision 6 then changed the complete task set to a
+fully disjoint set and observed those same exact claims afterward.
+
+The deployed ARM64 image is immutable tag `git-ba884f24858a`, digest
+`sha256:7d154a37fff589d2e68ec71c230025f3324cea96f85f7b51158f2d3097f2320b`,
+from source commit `ba884f24858a58b09a915e0358e60e7fcc7e2c34`; all four
+task-definition families are revision 6. GitHub Actions run `31808620621`
+completed all five jobs successfully. An earlier completed proof remains
+historical because it predates this schema/image boundary. A fresh run ID was
+used so current task, image, claim, conflict, and replacement coordinates could
+not be mixed with that prior deployment.
+
+The separate Cloud `EXPLAIN` proof exercised the exact production
 project-vector, source-vector, and lexical SQL shapes on a 10,001-row disposable
 fixture. It selected `memory_chunks_semantic_idx`,
 `memory_chunks_source_semantic_idx`, and `memory_chunks_lexical_idx`; all

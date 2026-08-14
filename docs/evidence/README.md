@@ -13,8 +13,8 @@ on August 13, 2026. It proves the deterministic application contract:
 - Both decision claims become the exact two members of one open conflict.
 - Identity B records a pause/escalation action that cites that conflict.
 
-The fixture uses evidence schema version 1 and explicitly records its source,
-CockroachDB backend, MCP transport, and `ostk_used`, `llm_used`, and
+The fixture's local receipt-format version is 1 and explicitly records its
+source, CockroachDB backend, MCP transport, and `ostk_used`, `llm_used`, and
 `cloud_used` provenance booleans. Its `capture` value is
 `sanitized-rehearsal`; it deliberately omits a generation timestamp so it
 cannot be mistaken for fresh evidence.
@@ -41,37 +41,55 @@ server must not be presented as application evidence.
 
 ## Live cloud receipts
 
-`deploy/aws/run-reference-agent.sh` produces the correlated agent receipt and
-`deploy/aws/run-replacement-proof.sh` produces the full-serving-task-set
-replacement/persistence receipt. Run
+`deploy/aws/run-self-audit-proof.sh` produces the source-backed documentation/
+code conflict receipt, `deploy/aws/run-reference-agent.sh` produces the
+correlated policy-agent receipt, and `deploy/aws/run-replacement-proof.sh`
+produces the full-serving-task-set replacement/persistence receipt. Run
 `deploy/aws/verify-publication-receipts.sh REFERENCE_JSON REPLACEMENT_JSON` to
 validate and cross-correlate them before publication. The verifier rejects
 common secret and AWS-account leaks, but chosen run/project/service names and
 the public hostname still require human review.
 
-The verified pre-polish revision 3 submission evidence run
-`devpost-final-20260814T021819Z` produced both verified receipts against
-<https://d13zrqfh66r7ub.cloudfront.net> and CockroachDB Cloud. Migration and the
-three-record seed had already succeeded. The reference receipt used task
-definition revision 3 and correlated four one-off Fargate tasks: decision claim
-5, action claim 6 citing it, incompatible claim 7, open conflict 2, and
-escalation claim 8 citing that conflict. The public check observed exact
-action/escalation claims 6 and 8. The replacement receipt exercised serving
-task definition revision 3 and recorded a fully disjoint task-set change; both
+The current publication set is checked in here:
+
+- [source-conflict self-audit](self-audit-devpost-self-audit-20260814T133640Z-rev6.json);
+- [reference-agent run](reference-agent-devpost-final6-20260814T143523Z.json);
+- [full serving-task replacement](replacement-devpost-final6-20260814T143523Z.json); and
+- [cross-receipt validation](publication-validation-devpost-final6-20260814T143523Z.json).
+
+The self-audit receipt proves that semantic recall surfaced the exact
+`examples/README.md`, `src/mcp/tools.rs`, and `src/application.rs` chunks behind
+incompatible Boolean claims 9 and 10, then projected their exact open conflict
+3. The receipt records two matched supported claims, all three surfaced source
+chunks, lexical+dense RRF, and no support truncation.
+
+Fresh release-bound run `devpost-final6-20260814T143523Z` used reference-agent
+task definition revision 6 and correlated four one-off Fargate tasks: decision
+claim 15, action claim 16 citing it, incompatible claim 17, open conflict 5,
+and escalation claim 18 citing that conflict. The public check observed exact
+action/escalation claims 16 and 18. The replacement receipt exercised serving
+task definition revision 6 and recorded a fully disjoint task-set change; both
 before and after observations returned those same exact claims through
-lexical/dense RRF.
+lexical/dense RRF. The validation receipt cross-checked the two artifacts.
 
-The currently deployed revision 4 serving image adds the conflict-first public
-UI, consistent JSON API errors, and measured server timing from `97eba7d`. It
-passed CI and separate public health, status, and recall smoke checks. No new
-four-agent or disjoint-replacement receipt was captured on revision 4; the
-operator-held receipts described above remain explicitly revision 3 evidence.
+The deployed ARM64 release uses immutable image tag `git-ba884f24858a`, digest
+`sha256:7d154a37fff589d2e68ec71c230025f3324cea96f85f7b51158f2d3097f2320b`,
+and source revision `ba884f24858a58b09a915e0358e60e7fcc7e2c34`. Serving,
+migration, seed, and reference-agent task definitions are all revision 6. The
+schema-2 migration, three-record bootstrap, and verifier-gated 536-chunk rich
+seed completed before proof capture.
 
-The sanitized status proof reports CockroachDB 26.2.5, schema version 1,
-enabled vector, lexical, and conflict-membership indexes, working cosine
-distance, and embedding dimension 512. The receipts and operational logs are
-kept in the ignored operator evidence directory; no raw log, task ARN, account
-ID, secret ARN, credential, or database URL is checked in here.
+An earlier completed proof remains valid historical evidence, but it predates
+the current schema and image boundary. The release proof deliberately uses a
+fresh run ID so current task, image, claim, conflict, and replacement
+correlations cannot be combined with prior-deployment coordinates.
+
+The sanitized status proof reports CockroachDB 26.2.5, schema version 2,
+enabled vector, lexical, conflict-membership, and claim-support-chunk indexes,
+working cosine distance, and embedding dimension 512. Raw receipts and
+operational logs remain in the ignored operator evidence directory; the four
+reviewed JSON files above contain no task ARN, account ID, secret ARN,
+credential, or database URL.
 
 CloudFront's default certificate protects the viewer connection. Its generated
 hostname uses AWS's TLSv1-minimum viewer policy, and the origin hop to the ALB
@@ -101,6 +119,8 @@ production database was neither queried nor modified, the disposable database
 was dropped, and the temporary workstation network rule was removed after
 capture.
 
-The final public video and Devpost-controlled fields are still pending. CI is
-green at `97eba7d`, including the CloudFront front door, patched Go builder
-image, and conflict-first UI/API release.
+The final public video and Devpost-controlled fields are still pending. GitHub
+Actions run
+[`31808620621`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31808620621)
+completed all five jobs successfully for
+`ba884f24858a58b09a915e0358e60e7fcc7e2c34`.

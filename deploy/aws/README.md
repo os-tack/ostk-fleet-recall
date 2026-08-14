@@ -11,13 +11,15 @@ autoscaling minimum are zero. Run the one-off migration successfully before
 starting any application task.
 
 This remains the reproducible deployment runbook. Its live submission candidate
-is available at <https://d13zrqfh66r7ub.cloudfront.net>. Migration and the
-three-record seed succeeded; CockroachDB Cloud status reports version
-26.2.5/schema 1 and all required capabilities; the four-task reference-agent
-run and a complete serving-task-set replacement both verified exact hybrid
-recall. Publication-safe Cloud `EXPLAIN` also verifies the exact production SQL
-shapes and all three intended indexes. The final public video and
-entrant-controlled Devpost fields remain pending.
+is available at <https://d13zrqfh66r7ub.cloudfront.net>. The schema-2 migration,
+three-record bootstrap, and verifier-gated 536-chunk rich seed succeeded;
+CockroachDB Cloud status reports version 26.2.5 and all required capabilities.
+The source-conflict self-audit, four-task reference-agent run, and fully
+disjoint serving-task replacement all verified against task-definition
+revision 6 and immutable image `git-ba884f24858a`. Publication-safe Cloud
+`EXPLAIN` also verifies the exact production SQL shapes and all three intended
+retrieval indexes. The final public video and entrant-controlled Devpost fields
+remain pending.
 
 ## Prerequisites
 
@@ -161,9 +163,12 @@ aws logs tail "$(terraform -chdir=deploy/aws output -raw log_group_name)" \
   --region us-east-1 --since 30m
 ```
 
-The production image contains both the repository's three-record bootstrap
-corpus and the deterministic, verifier-gated rich corpus. Neither contains
-tenant authority or secrets. The default invocation ingests
+The deployed `git-ba884f24858a` production image contains both the repository's
+three-record bootstrap corpus and a deterministic, verifier-gated 536-chunk
+rich corpus. A later source revision can produce a different verified count as
+the allowlisted documentation evolves; record that count at each release
+boundary. Neither corpus contains tenant authority or secrets. The default
+invocation ingests
 `/opt/ostk/demo/demo.ndjson`; `--rich-demo` selects
 `/opt/ostk/demo/rich-demo.ndjson`. Both one-off tasks use the least-privilege
 runtime database secret, load and verify the same pinned S3 model, and invoke
@@ -374,20 +379,30 @@ run/project names, the demo URL, cluster coordinate, task IDs, and model/version
 metadata before sharing it. Never supplement it with the database URL, account
 ID, task ARN, secret ARN, or raw CloudWatch log export.
 
-The verified pre-polish revision 3 cloud evidence run
-`devpost-final-20260814T021819Z` satisfied these checks across four one-off
-Fargate tasks using reference-agent task definition revision 3. It correlated
-decision claim 5, action claim 6 citing it, incompatible claim 7, open conflict
-2, and escalation claim 8 citing that conflict. Its public verification
-observed exact action/escalation claims 6 and 8 through lexical/dense RRF, with
-CockroachDB 26.2.5, schema version 1, all three required index capability flags,
-working cosine distance, and embedding dimension 512.
+The live revision-6 self-audit produced the checked-in, publication-safe
+[receipt](../../docs/evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json).
+It correlated documentation-backed claim 9 and code-backed claim 10 with exact
+open conflict 3, then required semantic recall to surface the cited source
+chunks and project that conflict. CockroachDB reported schema version 2, all
+four capability indexes, working cosine distance, and embedding dimension 512.
 
-The currently deployed revision 4 serving image adds the conflict-first public
-UI, consistent JSON API errors, and measured server timing from `97eba7d`. It
-passed CI and separate public health, status, and recall smoke checks. The
-four-agent and disjoint-replacement wrappers were not rerun on revision 4, so
-the receipts above remain explicitly revision 3 cloud evidence.
+Fresh run `devpost-final6-20260814T143523Z` then produced the checked-in
+[reference-agent](../../docs/evidence/reference-agent-devpost-final6-20260814T143523Z.json),
+[replacement](../../docs/evidence/replacement-devpost-final6-20260814T143523Z.json),
+and [validation](../../docs/evidence/publication-validation-devpost-final6-20260814T143523Z.json)
+receipts. Reference-agent task definition revision 6 correlated decision claim
+15, action claim 16 citing it, incompatible claim 17, open conflict 5, and
+escalation claim 18 citing that conflict. Public verification observed exact
+claims 16 and 18 through lexical/dense RRF.
+
+The deployed ARM64 image is immutable tag `git-ba884f24858a`, digest
+`sha256:7d154a37fff589d2e68ec71c230025f3324cea96f85f7b51158f2d3097f2320b`,
+and source commit `ba884f24858a58b09a915e0358e60e7fcc7e2c34`; serving,
+migration, seed, and reference-agent task definitions are all revision 6. CI
+run `31808620621` completed all five jobs successfully. An earlier completed
+proof remains historical because it predates this schema/image boundary. The
+fresh run ID prevents its deployment coordinates from being mixed with the
+current claims, conflict, or replacement.
 
 ## 8. Replace the complete serving task set and prove persistence
 
@@ -425,11 +440,11 @@ secret-bearing keys, and raw log-stream fields. Its success output is marked
 `validation_only: true`; it validates live receipts but is not a substitute for
 running either live wrapper.
 
-For the same verified revision 3 cloud evidence run, the replacement wrapper
-exercised serving task definition revision 3 and changed the complete task set
+For fresh run `devpost-final6-20260814T143523Z`, the replacement wrapper
+exercised serving task definition revision 6 and changed the complete task set
 to a fully disjoint set. Desired count remained one, the service returned
-ready, and the before/after public checks observed the same exact claims 6 and
-8 through lexical/dense RRF.
+ready, and the before/after public checks observed the same exact claims 16 and
+18 through lexical/dense RRF.
 
 ## Cloud `EXPLAIN` evidence
 

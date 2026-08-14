@@ -40,28 +40,41 @@ hackathon slice. Additional canonical Recall actions are also future work.
 
 The submission candidate is live at
 [https://d13zrqfh66r7ub.cloudfront.net](https://d13zrqfh66r7ub.cloudfront.net).
-The migration and three-record seed tasks completed against CockroachDB Cloud.
-The public status surface reports CockroachDB 26.2.5, schema version 1, enabled
-vector, lexical, and conflict-membership indexes, working cosine distance, and
-the pinned 512-dimension embedding model.
+The schema-2 migration and both idempotent seed tasks completed against
+CockroachDB Cloud. The deployed image contains the three-record bootstrap plus
+a verifier-gated 536-chunk rich corpus. The public status surface reports
+CockroachDB 26.2.5, schema version 2, enabled vector, lexical,
+conflict-membership, and claim-support-chunk indexes, working cosine distance,
+and the pinned 512-dimension embedding model.
 
-The verified pre-polish revision 3 cloud evidence run
-`devpost-final-20260814T021819Z`, using reference-agent task definition revision
-3, verified the complete policy chain across four one-off Fargate tasks:
-decision claim 5, cited action claim 6, incompatible claim 7, and escalation
-claim 8 citing open conflict 2. Public hybrid lexical/dense RRF then observed
-the exact persisted action and escalation claims 6 and 8. A forced deployment
-of serving task definition revision 3 replaced the complete task set with a
-fully disjoint set, and the replacement observed those same exact claims
-through the same hybrid path. This is live AWS/CockroachDB Cloud evidence;
+The deployed ARM64 release is source commit
+`ba884f24858a58b09a915e0358e60e7fcc7e2c34`, immutable image tag
+`git-ba884f24858a`, and digest
+`sha256:7d154a37fff589d2e68ec71c230025f3324cea96f85f7b51158f2d3097f2320b`.
+The serving, migration, seed, and reference-agent task definitions are all
+revision 6. GitHub Actions run
+[`31808620621`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31808620621)
+completed all five jobs successfully for that exact commit.
+
+The checked-in, publication-safe
+[source-conflict self-audit receipt](docs/evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json)
+proves that semantic recall surfaced the exact documentation and code sources
+behind incompatible Boolean claims 9 and 10 and projected their exact open
+conflict 3. The
+[reference-agent receipt](docs/evidence/reference-agent-devpost-final6-20260814T143523Z.json)
+then correlates decision, action, incompatible-decision, and escalation claims
+15/16/17/18 with open conflict 5 across four one-off Fargate tasks. The
+[replacement receipt](docs/evidence/replacement-devpost-final6-20260814T143523Z.json)
+records a fully disjoint serving-task-set replacement that preserved exact
+public claims 16 and 18 through lexical/dense RRF; the
+[publication verifier receipt](docs/evidence/publication-validation-devpost-final6-20260814T143523Z.json)
+cross-validates the pair. These are live AWS/CockroachDB Cloud results;
 LocalStack and local tests remain preflight evidence only.
 
-The currently deployed revision 4 serving image adds the conflict-first public
-UI, consistent JSON API errors, and measured server timing from `97eba7d`. It
-passed CI and separate public health, status, and recall smoke checks. The
-four-agent and disjoint-replacement receipts were not rerun on revision 4, so
-they remain explicitly revision 3 evidence rather than evidence for the current
-image.
+An earlier completed proof remains valid historical evidence, but it predates
+the schema-2 and revision-6 release boundary. The current publication proof uses
+a fresh `devpost-final6-20260814T143523Z` run ID so task, image, claim, conflict,
+and replacement correlations cannot be confused with the prior deployment.
 
 HTTPS is provided by CloudFront's default certificate. AWS fixes that
 generated-hostname viewer policy at a TLSv1 minimum, although newer TLS can be
@@ -77,9 +90,8 @@ plans select `memory_chunks_semantic_idx`,
 `memory_chunks_source_semantic_idx`, and `memory_chunks_lexical_idx`. The
 production database was untouched, the fixture database was dropped, and the
 temporary workstation network rule was removed. The final public video and
-remaining entrant/Devpost fields are still release gates. CI is green at
-`97eba7d`, including the CloudFront front door, patched Go builder image, and
-conflict-first UI/API release.
+remaining entrant/Devpost fields are still release gates. CI is green for all
+five jobs at `ba884f24858a` in run `31808620621`.
 
 The final-cut plan leads with the live AWS UI and then shows the reviewed cloud
 agent and replacement receipts; see [`docs/VIDEO_DEMO.md`](docs/VIDEO_DEMO.md).
