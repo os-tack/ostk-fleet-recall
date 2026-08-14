@@ -7,6 +7,7 @@ export TZ=UTC
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 manifest=$script_dir/documents.txt
+repository_manifest=$script_dir/repository-files.txt
 zero_revision=0000000000000000000000000000000000000000
 source_revision=${RICH_DEMO_SOURCE_REVISION:-$zero_revision}
 
@@ -35,6 +36,11 @@ fi
 
 if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
     printf 'document manifest must be a regular, non-symlink file: %s\n' "$manifest" >&2
+    exit 66
+fi
+
+if [ ! -f "$repository_manifest" ] || [ -L "$repository_manifest" ]; then
+    printf 'repository manifest must be a regular, non-symlink file: %s\n' "$repository_manifest" >&2
     exit 66
 fi
 
@@ -253,6 +259,207 @@ emit_document_chunks() {
                     }
                 '
     done < "$manifest"
+}
+
+emit_repository_chunks() {
+    while IFS='|' read -r relative_path source_area language; do
+        case $relative_path in
+            ''|'#'*) continue ;;
+        esac
+        case $relative_path in
+            /*|*'..'*)
+                printf 'unsafe repository path in manifest: %s\n' "$relative_path" >&2
+                exit 65
+                ;;
+        esac
+        for facet_value in "$source_area" "$language"; do
+            case $facet_value in
+                ''|*[!a-z0-9_]*)
+                    printf 'invalid repository facet in manifest for %s: %s\n' \
+                        "$relative_path" "$facet_value" >&2
+                    exit 65
+                    ;;
+            esac
+        done
+
+        source_file=$repo_root/$relative_path
+        if [ ! -f "$source_file" ] || [ -L "$source_file" ]; then
+            printf 'repository manifest entry must be a regular, non-symlink file: %s\n' \
+                "$relative_path" >&2
+            exit 66
+        fi
+
+        awk \
+            -v source_path="$relative_path" \
+            -v source_area="$source_area" \
+            -v language="$language" \
+            -v max_chars=1500 '
+            function clean(value) {
+                gsub(/\r/, "", value)
+                gsub(/\t/, " ", value)
+                gsub(/[[:space:]]+/, " ", value)
+                sub(/^ /, "", value)
+                sub(/ $/, "", value)
+                return value
+            }
+
+            function track_line(value, source_line, count, words, i) {
+                value = clean(value)
+                if (value == "") {
+                    return
+                }
+                count = split(value, words, " ")
+                for (i = 1; i <= count; i++) {
+                    if (block_lines == "") {
+                        block_lines = source_line
+                    } else {
+                        block_lines = block_lines " " source_line
+                    }
+                }
+            }
+
+            function emit_block(value, coordinates, count, coordinate_count, words, word_lines, prefix, start, end, i, remaining, current) {
+                value = clean(value)
+                coordinates = clean(coordinates)
+                if (value == "") {
+                    return
+                }
+
+                prefix = "Repository source " source_path "; area " source_area "; language " language ". "
+                count = split(value, words, " ")
+                coordinate_count = split(coordinates, word_lines, " ")
+                if (coordinate_count != count) {
+                    exit 2
+                }
+
+                start = 1
+                while (start <= count) {
+                    current = prefix
+                    end = start - 1
+                    while (end < count && length(current) + length(words[end + 1]) + 1 <= max_chars) {
+                        end++
+                        if (current == prefix) {
+                            current = current words[end]
+                        } else {
+                            current = current " " words[end]
+                        }
+                    }
+
+                    if (end < start) {
+                        end = start
+                        current = prefix words[start]
+                    }
+
+                    if (end < count) {
+                        remaining = length(prefix)
+                        for (i = end + 1; i <= count; i++) {
+                            remaining += length(words[i]) + 1
+                        }
+                        while (remaining < 240 && end > start) {
+                            remaining += length(words[end]) + 1
+                            end--
+                        }
+                        current = prefix words[start]
+                        for (i = start + 1; i <= end; i++) {
+                            current = current " " words[i]
+                        }
+                    }
+
+                    print chunk_index "\t" word_lines[start] "\t" word_lines[end] "\t" current
+                    chunk_index++
+                    start = end + 1
+                }
+            }
+
+            function flush() {
+                block = clean(block)
+                if (block == "") {
+                    return
+                }
+                if (length(block) < 480) {
+                    if (pending == "") {
+                        pending = block
+                        pending_lines = block_lines
+                    } else {
+                        pending = pending " " block
+                        pending_lines = pending_lines " " block_lines
+                    }
+                    if (length(pending) >= 900) {
+                        emit_block(pending, pending_lines)
+                        pending = ""
+                        pending_lines = ""
+                    }
+                } else {
+                    if (pending != "") {
+                        block = pending " " block
+                        block_lines = pending_lines " " block_lines
+                        pending = ""
+                        pending_lines = ""
+                    }
+                    emit_block(block, block_lines)
+                }
+                block = ""
+                block_lines = ""
+            }
+
+            BEGIN {
+                chunk_index = 0
+                block = ""
+                block_lines = ""
+                pending = ""
+                pending_lines = ""
+            }
+
+            {
+                line = $0
+                sub(/\r$/, "", line)
+                if (line ~ /^[[:space:]]*$/) {
+                    flush()
+                    next
+                }
+                gsub(/\t/, " ", line)
+                track_line(line, NR)
+                if (block == "") {
+                    block = line
+                } else {
+                    block = block " " line
+                }
+            }
+
+            END {
+                flush()
+                if (pending != "") {
+                    emit_block(pending, pending_lines)
+                }
+            }
+        ' "$source_file" |
+            jq -Rc \
+                --arg source_id "$relative_path" \
+                --arg source_area "$source_area" \
+                --arg language "$language" \
+                --arg source_revision "$source_revision" '
+                    split("\t") as $fields
+                    | {
+                        source: "code",
+                        source_id: $source_id,
+                        source_config_id: "rich-demo:repository:v1",
+                        chunk_index: ($fields[0] | tonumber),
+                        text: ($fields[3:] | join("\t")),
+                        role: "usage",
+                        extra: {
+                            source_revision: $source_revision,
+                            source_line_start: ($fields[1] | tonumber),
+                            source_line_end: ($fields[2] | tonumber)
+                        },
+                        facets: {
+                            dataset: ["rich-demo"],
+                            record_kind: ["source_code"],
+                            source_area: [$source_area],
+                            tags: ["repository", $language, $source_area]
+                        }
+                    }
+                '
+    done < "$repository_manifest"
 }
 
 extract_tools_excerpt() {
@@ -618,4 +825,5 @@ emit_operations_narrative() {
 
 emit_document_chunks
 emit_self_audit_sources
+emit_repository_chunks
 emit_operations_narrative

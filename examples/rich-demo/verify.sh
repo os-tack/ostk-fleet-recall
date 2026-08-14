@@ -39,9 +39,14 @@ fi
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 manifest=$script_dir/documents.txt
+repository_manifest=$script_dir/repository-files.txt
 
 if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
     fail "document manifest must be a regular, non-symlink file"
+fi
+
+if [ ! -f "$repository_manifest" ] || [ -L "$repository_manifest" ]; then
+    fail "repository manifest must be a regular, non-symlink file"
 fi
 
 if [ ! -f "$input" ] || [ -L "$input" ]; then
@@ -172,8 +177,8 @@ line_count=$(wc -l < "$input" | tr -d '[:space:]')
 case $line_count in
     ''|*[!0-9]*) fail "line count is not numeric" ;;
 esac
-if [ "$line_count" -lt 500 ] || [ "$line_count" -gt 1000 ]; then
-    fail "record count must be between 500 and 1000 (found $line_count)"
+if [ "$line_count" -lt 1000 ] || [ "$line_count" -gt 2000 ]; then
+    fail "record count must be between 1000 and 2000 (found $line_count)"
 fi
 
 if awk 'length($0) > 16384 { exit 1 }' "$input"; then
@@ -243,13 +248,16 @@ if ! jq -s -e '
             "source", "source_id", "source_config_id", "chunk_index",
             "text", "role", "facets", "extra"
         ]) | length) == 0
-        and (($record.source_config_id == "rich-demo:self-audit:v1"
+        and ((($record.source_config_id == "rich-demo:self-audit:v1"
+                or $record.source_config_id == "rich-demo:repository:v1")
                 and $record.source == "code")
-            or ($record.source_config_id != "rich-demo:self-audit:v1"
+            or (($record.source_config_id != "rich-demo:self-audit:v1"
+                    and $record.source_config_id != "rich-demo:repository:v1")
                 and $record.source == "markdown"))
         and (($record.source_id | type) == "string" and ($record.source_id | length) <= 4096)
         and ($record.source_config_id == "rich-demo:docs:v1"
             or $record.source_config_id == "rich-demo:self-audit:v1"
+            or $record.source_config_id == "rich-demo:repository:v1"
             or $record.source_config_id == "rich-demo:operations:v1")
         and (if $record.source_config_id == "rich-demo:docs:v1"
             then (($record.source_id | test("^(README[.]md|docs/[A-Za-z0-9._/-]+|deploy/[A-Za-z0-9._/-]+|examples/[A-Za-z0-9._/-]+)$"))
@@ -257,6 +265,10 @@ if ! jq -s -e '
                 and ($record.source_id | split("/") | all(.[]; . != "." and . != "..")))
             elif $record.source_config_id == "rich-demo:self-audit:v1"
             then ($record.source_id == "src/mcp/tools.rs" or $record.source_id == "src/application.rs")
+            elif $record.source_config_id == "rich-demo:repository:v1"
+            then (($record.source_id | test("^[A-Za-z0-9._/-]+$"))
+                and ($record.source_id | contains("//") | not)
+                and ($record.source_id | split("/") | all(.[]; . != "" and . != "." and . != "..")))
             else ($record.source_id | test("^rich-demo/operations/week-[0-9]{2}/[a-z0-9_-]+$"))
             end)
         and ($record.chunk_index | type == "number" and floor == . and . >= 0 and . < 10000)
@@ -282,6 +294,12 @@ if ! jq -s -e '
                 and $record.facets.source_area == ["source_code"]
                 and $record.facets.tags[0:2] == ["self_audit", "rust"]
                 and ($record.facets.tags | length) == 3)
+            elif $record.source_config_id == "rich-demo:repository:v1"
+            then ($record.facets.record_kind == ["source_code"]
+                and ($record.facets.source_area | length) == 1
+                and ($record.facets.tags | length) == 3
+                and $record.facets.tags[0] == "repository"
+                and $record.facets.tags[2] == $record.facets.source_area[0])
             else ($record.facets.record_kind == ["operations_narrative"]
                 and $record.facets.source_area == ["fleet_operations"]
                 and ($record.facets.event_type | length) == 1
@@ -319,7 +337,7 @@ fi
 
 if ! jq -s -e '
     [.[] | select(.source_config_id != "rich-demo:operations:v1")]
-    | group_by(.source_id)
+    | group_by([.source_config_id, .source_id])
     | all(.[];
         length as $count
         | (map(.chunk_index) | sort) == [range(0; $count)]
@@ -330,6 +348,7 @@ fi
 
 if ! jq -s -e \
     --rawfile document_manifest "$manifest" \
+    --rawfile repository_manifest "$repository_manifest" \
     --arg expected_tools_excerpt "$tools_excerpt" \
     --arg expected_application_excerpt "$application_excerpt" \
     --argjson expected_tools_line_start "$tools_line_start" \
@@ -341,13 +360,22 @@ if ! jq -s -e \
         | map(select(length > 0 and (startswith("#") | not)))
         | map(split("|")[0])
         | sort) as $expected_doc_sources
-    | ($expected_doc_sources | length) == 12
+    | ($repository_manifest
+        | split("\n")
+        | map(select(length > 0 and (startswith("#") | not)))
+        | map(split("|")[0])
+        | sort) as $expected_repository_sources
+    | ($expected_doc_sources | length) == 20
+    and ($expected_repository_sources | length) == 85
     and
-    ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) >= 300
+    ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) >= 400
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) >= 750
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:docs:v1") | .source_id] | unique | sort)
         == $expected_doc_sources
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1") | .source_id] | unique | sort)
+        == $expected_repository_sources
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1") | .source_id] | unique | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1") | .source_id] | sort)
         == ["src/application.rs", "src/mcp/tools.rs"]
@@ -355,6 +383,16 @@ if ! jq -s -e \
     and all(.[] | select(.source_config_id == "rich-demo:operations:v1"); .chunk_index == 0)
     and ([.[] | select(.source_config_id != "rich-demo:operations:v1") | .extra.source_revision]
         | unique | length) == 1
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/mcp/server.rs"
+            and (.text | test("mcp"; "i"))
+        )] | length) >= 1
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "deploy/aws/main.tf"
+            and (.text | test("aws_(ecs|cloudfront|lb|wafv2)"))
+        )] | length) >= 1
     and ([.[] | select(
             .source_config_id == "rich-demo:docs:v1"
             and .source_id == "examples/README.md"
@@ -477,6 +515,75 @@ while IFS='|' read -r relative_path _; do
     fi
 done < "$manifest"
 
+# Repository-code/configuration records use the same minimal-bound guarantee as
+# documents. Their normalized body must come from the linked source slice, and
+# the path-derived semantic metadata must exactly match the checked-in manifest.
+while IFS='|' read -r relative_path source_area language; do
+    case $relative_path in
+        ''|'#'*) continue ;;
+    esac
+    case $relative_path in
+        /*|*'..'*) fail "unsafe repository path in manifest: $relative_path" ;;
+    esac
+    for facet_value in "$source_area" "$language"; do
+        case $facet_value in
+            ''|*[!a-z0-9_]*) fail "invalid repository facet for $relative_path" ;;
+        esac
+    done
+
+    source_file=$repo_root/$relative_path
+    if [ ! -f "$source_file" ] || [ -L "$source_file" ]; then
+        fail "repository manifest entry must be a regular, non-symlink file: $relative_path"
+    fi
+    if ! jq -s -e \
+        --arg source_id "$relative_path" \
+        --arg source_area "$source_area" \
+        --arg language "$language" \
+        --rawfile source_text "$source_file" '
+        def clean_source:
+            gsub("\r"; "")
+            | gsub("\t"; " ")
+            | gsub("[[:space:]]+"; " ")
+            | sub("^ "; "")
+            | sub(" $"; "");
+        def normalized_slice($lines; $start; $finish):
+            $lines[($start - 1):$finish] | join(" ") | clean_source;
+        def exact_source_bounds($lines):
+            . as $record
+            | $record.extra.source_line_start as $start
+            | $record.extra.source_line_end as $finish
+            | ("Repository source " + $record.source_id
+                + "; area " + $source_area
+                + "; language " + $language + ". ") as $prefix
+            | ($record.text | startswith($prefix)) as $prefix_matches
+            | $record.text[($prefix | length):] as $body
+            | normalized_slice($lines; $start; $finish) as $slice
+            | $prefix_matches
+            and $finish <= ($lines | length)
+            and ($body | length) > 0
+            and ($slice | contains($body))
+            and ($start == $finish
+                or (normalized_slice($lines; $start + 1; $finish)
+                    | contains($body) | not))
+            and ($start == $finish
+                or (normalized_slice($lines; $start; $finish - 1)
+                    | contains($body) | not));
+
+        ($source_text | split("\n")) as $source_lines
+        | [.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == $source_id
+        )]
+        | length > 0
+        and all(.[];
+            .facets.source_area == [$source_area]
+            and .facets.tags == ["repository", $language, $source_area]
+            and exact_source_bounds($source_lines))
+    ' "$input" >/dev/null; then
+        fail "repository source coordinates or metadata do not exactly bound $relative_path"
+    fi
+done < "$repository_manifest"
+
 if ! jq -s -e '
     def week_id($week):
         "week-" + (if $week < 10 then "0" else "" end) + ($week | tostring);
@@ -545,6 +652,7 @@ fi
 jq -s -r '
     ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) as $docs
     | ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) as $audit
+    | ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) as $repository
     | ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) as $operations
-    | "verified rich demo: \(length) chunks (\($docs) documentation, \($audit) self-audit source, \($operations) operations)"
+    | "verified rich demo: \(length) chunks (\($docs) documentation, \($audit) self-audit source, \($repository) repository source, \($operations) operations)"
 ' "$input"

@@ -2,9 +2,13 @@
 
 This package deterministically builds a publication-safe Fleet Recall corpus
 without contacting a network or database. It combines section-aware chunks
-from twelve checked-in project, architecture, submission, migration, AWS,
-LocalStack, and examples documents, two exact checked-in Rust excerpts, and a
-synthetic twelve-week fleet-operations narrative.
+from the complete publication-safe tracked Markdown surface, bounded chunks
+from the repository's application code, MCP implementation, migrations,
+Terraform, deployment automation, CI, demos, and build configuration, two
+exact checked-in Rust excerpts used by the conflict proof, and a synthetic
+twelve-week fleet-operations narrative. The result makes the project itself
+semantically recallable without pretending that binary or private workstation
+state is useful agent memory.
 
 The operations narrative includes accepted and contingency decisions,
 observations, changes, handoffs, 11 explicit supersessions, exactly one
@@ -36,21 +40,38 @@ Run the deterministic reproduction test with:
 ./examples/rich-demo/test.sh
 ```
 
-The verifier requires 500–1,000 unique chunks, twelve documentation sources,
-the two exact self-audit code excerpts, 204 operations records across twelve
-weeks, the expected decision and correction mix, zero-based source chunk
-indexes, bounded physical lines and text, only the public ingest allowlist, and
-no credential-, token-, private-key-, account ARN-, or credential-bearing
-database URL patterns.
+The verifier requires 1,000–2,000 unique chunks, twenty documentation sources,
+85 repository source/configuration files, the two exact self-audit code
+excerpts, 204 operations records across twelve weeks, the expected decision and
+correction mix, zero-based per-source chunk indexes, bounded physical lines and
+text, only the public ingest allowlist, and no credential-, token-, private-key-,
+account ARN-, or credential-bearing database URL patterns. `test.sh`
+independently derives the full allowlisted set from `git ls-files` and compares
+it with both checked-in manifests, so a new safe tracked file cannot silently
+remain absent from the demo corpus.
+
+The publication boundary excludes binary media, dependency and Terraform lock
+files, generated example corpora, evidence receipts, license/vendor text,
+ignored or private files, and a small explicit set of public test fixtures whose
+dummy URLs or AWS account IDs intentionally resemble credentials. Excluding
+those fixture-bearing files keeps the decoded-output sensitive scan fail-closed
+without redacting or weakening exact source evidence. The manifests enumerate
+what is admitted; they do not crawl the operator's worktree at image-build time.
 
 Documentation and code `source_id` values are the original repository-relative
-paths. Each repository-backed record also carries its immutable 40-hex source
-revision and the minimal inclusive physical line range containing that chunk in
-bounded `extra` metadata. Local generation uses an all-zero sentinel; release
-builds pass the full source commit through `RICH_DEMO_SOURCE_REVISION`, and the
-public UI only creates exact line links for a nonzero immutable revision. The
-verifier checks every range against the checked-in source. The code records are
-extracted fail-closed from the current
+paths. Repository records use `source: "code"`,
+`record_kind: "source_code"`, and language plus subsystem facets such as
+`mcp_interface`, `aws_infrastructure`, and `cockroach_store`; this keeps a
+document/code filter simple while making questions such as “where is MCP
+configured?” or “which AWS services are used?” semantically specific. Each
+repository-backed record also carries its immutable 40-hex source revision and
+the minimal inclusive physical line range containing that chunk in bounded
+`extra` metadata. Local generation uses an all-zero sentinel; release builds
+pass the full source commit through `RICH_DEMO_SOURCE_REVISION`, and the public
+UI only creates exact line links for a nonzero immutable revision. The verifier
+reconstructs every normalized snippet from the checked-in linked range and
+rejects widened, narrowed, shifted, mutated, missing, or mislabeled records.
+The two conflict-proof code records are extracted fail-closed from the current
 `src/mcp/tools.rs` and `src/application.rs` contents; they are not duplicated
 fixtures. Synthetic operations records use stable
 `rich-demo/operations/week-NN/event-name` identifiers instead of pretending

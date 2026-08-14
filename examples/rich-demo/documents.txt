@@ -7,6 +7,14 @@ docs/MIGRATIONS.md|migrations
 docs/CLOUD_ONBOARDING.md|cloud_onboarding
 docs/AGENT_SKILLS_AUDIT.md|agent_skills
 docs/VIDEO_DEMO.md|video
+docs/DELIVERY.md|delivery
+docs/OSTK_DEMO.md|ostk_demo
+docs/SECURITY.md|security
+docs/adr/0001-product-and-backend-boundary.md|architecture_decision
+docs/assets/README.md|media
+docs/evidence/README.md|evidence
 deploy/aws/README.md|aws
+deploy/aws/network/README.md|aws_network
 deploy/localstack/README.md|localstack
 examples/README.md|examples
+examples/rich-demo/README.md|corpus_pipeline

@@ -26,6 +26,9 @@ RUN cargo build --locked --release --bin ostk-fleet-recall
 # build. The checked-in verifier is the gate; generated NDJSON never relies on
 # an operator workstation artifact being present in the Docker context.
 COPY README.md ./README.md
+COPY .dockerignore .gitignore Dockerfile deny.toml ./
+COPY .github ./.github
+COPY demo ./demo
 COPY docs ./docs
 COPY deploy ./deploy
 COPY examples ./examples

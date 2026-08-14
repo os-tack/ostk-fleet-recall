@@ -5,8 +5,9 @@ export LC_ALL=C
 export TZ=UTC
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 
-for command_name in cmp jq mktemp; do
+for command_name in cmp git jq mktemp sort; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "$command_name" >&2
         exit 69
@@ -54,6 +55,59 @@ widened_document_range=$test_root/widened-document-range.ndjson
 narrowed_document_range=$test_root/narrowed-document-range.ndjson
 shifted_code_range=$test_root/shifted-code-range.ndjson
 nul_text=$test_root/nul-text.ndjson
+missing_repository_source=$test_root/missing-repository-source.ndjson
+wrong_repository_metadata=$test_root/wrong-repository-metadata.ndjson
+mutated_repository_excerpt=$test_root/mutated-repository-excerpt.ndjson
+widened_repository_range=$test_root/widened-repository-range.ndjson
+expected_documents=$test_root/expected-documents.txt
+actual_documents=$test_root/actual-documents.txt
+expected_repository=$test_root/expected-repository.txt
+actual_repository=$test_root/actual-repository.txt
+
+# Independently derive the complete publication-safe tracked-text surface. The
+# checked-in manifests are Docker build inputs, so this Git-backed test prevents
+# a newly tracked source file from silently remaining absent from recall.
+git -C "$repo_root" ls-files '*.md' |
+    while IFS= read -r path; do
+        case $path in
+            licenses/README.md) continue ;;
+        esac
+        printf '%s\n' "$path"
+    done |
+    sort > "$expected_documents"
+awk -F'|' '!/^#/ && NF { print $1 }' "$script_dir/documents.txt" |
+    sort > "$actual_documents"
+if ! cmp -s "$expected_documents" "$actual_documents"; then
+    printf 'rich demo verification failed: document manifest is not the complete safe tracked Markdown set\n' >&2
+    exit 1
+fi
+
+git -C "$repo_root" ls-files |
+    while IFS= read -r path; do
+        case $path in
+            *.md|Cargo.lock|deploy/aws/.terraform.lock.hcl|deploy/aws/network/.terraform.lock.hcl) continue ;;
+            *.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico|*.pdf) continue ;;
+            LICENSE|LICENSE-APACHE|LICENSE-MIT) continue ;;
+            docs/evidence/*.json|docs/evidence/*.txt) continue ;;
+            examples/demo.ndjson|examples/rich-demo/repository-files.txt) continue ;;
+            demo/video/generated/.gitignore) continue ;;
+            .env.example|deploy/aws/terraform.tfvars.example) continue ;;
+            deploy/aws/tests/deployment.tftest.hcl) continue ;;
+            deploy/aws/tests/reference-agent-wrapper.sh) continue ;;
+            deploy/aws/tests/replacement-proof.sh) continue ;;
+            deploy/aws/tests/seed-wrapper.sh) continue ;;
+            deploy/aws/tests/self-audit-wrapper.sh) continue ;;
+            src/config.rs) continue ;;
+        esac
+        printf '%s\n' "$path"
+    done |
+    sort > "$expected_repository"
+awk -F'|' '!/^#/ && NF { print $1 }' "$script_dir/repository-files.txt" |
+    sort > "$actual_repository"
+if ! cmp -s "$expected_repository" "$actual_repository"; then
+    printf 'rich demo verification failed: repository manifest is not the complete safe tracked text set\n' >&2
+    exit 1
+fi
 
 "$script_dir/generate.sh" > "$first"
 "$script_dir/generate.sh" > "$second"
@@ -61,12 +115,13 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 552
-    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 346
+    length == 1492
+    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 423
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 863
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
 ' "$first" >/dev/null; then
-    printf 'rich demo verification failed: expected exactly 552 records (346 documentation, 2 self-audit source, 204 operations)\n' >&2
+    printf 'rich demo verification failed: exact repository corpus composition changed\n' >&2
     exit 1
 fi
 
@@ -182,6 +237,50 @@ fi
 jq -c 'select(.source_id != "src/application.rs")' "$first" > "$missing_self_audit"
 if "$script_dir/verify.sh" "$missing_self_audit" >/dev/null 2>&1; then
     printf 'rich demo verification failed: verifier accepted a missing self-audit source\n' >&2
+    exit 1
+fi
+
+jq -c 'select(.source_config_id != "rich-demo:repository:v1" or .source_id != "Dockerfile")' \
+    "$first" > "$missing_repository_source"
+if "$script_dir/verify.sh" "$missing_repository_source" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a missing repository source\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_config_id == "rich-demo:repository:v1"
+        and .source_id == "Dockerfile" and .chunk_index == 0
+    then .facets.source_area = ["application_code"]
+        | .facets.tags[2] = "application_code"
+    else .
+    end
+' "$first" > "$wrong_repository_metadata"
+if "$script_dir/verify.sh" "$wrong_repository_metadata" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted wrong repository metadata\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_config_id == "rich-demo:repository:v1"
+        and .source_id == "Dockerfile" and .chunk_index == 0
+    then .text += " unverified drift"
+    else .
+    end
+' "$first" > "$mutated_repository_excerpt"
+if "$script_dir/verify.sh" "$mutated_repository_excerpt" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a mutated repository excerpt\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_config_id == "rich-demo:repository:v1"
+        and .source_id == "Dockerfile" and .chunk_index == 0
+    then .extra.source_line_end += 1
+    else .
+    end
+' "$first" > "$widened_repository_range"
+if "$script_dir/verify.sh" "$widened_repository_range" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a widened repository source range\n' >&2
     exit 1
 fi
 
