@@ -282,17 +282,22 @@ mock_log_events() {
         [ "$step" = record-retraction-implementation-claim ]; then
         policy=untrusted-policy
     fi
+    project=fleet-project
+    if [ "$mock_scenario" = receipt-leak ]; then
+        project=$(printf '%s%s%s' 'postgres' 'ql://' 'mock:credential@db/fleet')
+    fi
     evidence=$(jq -cn \
         --arg run "$run_id" \
         --arg step "$evidence_step" \
         --arg agent "$agent" \
         --arg policy "$policy" \
+        --arg project "$project" \
         --argjson result "$result" '{
         schema: "fleet-reference-agent-evidence-v1",
         run_id: $run,
         step: $step,
         agent: $agent,
-        project: "fleet-project",
+        project: $project,
         policy: $policy,
         result: $result
     }')
@@ -396,6 +401,10 @@ jq -e '
     [.aws.tasks[].agent] == ["agent-a", "agent-c"] and
     .public_demo.read_only_verification == true
 ' "$test_root/success.json" >/dev/null
+if grep -F 'jq: error' "$test_root/success.err" >/dev/null; then
+    echo "self-audit wrapper emitted a jq error while validating its receipt" >&2
+    exit 1
+fi
 if grep -Eiq \
     'arn:|(^|[^0-9])[0-9]{12}([^0-9]|$)|postgres(ql)?://|log_(group|stream)|secret|password|session_token' \
     "$test_root/success.json"; then
@@ -429,6 +438,8 @@ expect_failure chain-mismatch \
     'self-audit steps did not form one source-backed Boolean conflict'
 expect_failure closed-conflict \
     'public semantic recall did not project the exact open source-backed two-member conflict'
+expect_failure receipt-leak \
+    'receipt contains a prohibited secret or unsanitized infrastructure/log coordinate'
 
 invalid_state=$test_root/invalid-run
 mkdir -p "$invalid_state"

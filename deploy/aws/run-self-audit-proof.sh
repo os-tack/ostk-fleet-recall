@@ -484,19 +484,24 @@ receipt=$(jq -cen \
 
 # Fail closed if a future edit accidentally publishes a raw cloud/log/secret
 # coordinate. Source hashes and bounded task IDs are intentional evidence.
-if ! printf '%s' "$receipt" | jq -e 'type == "object"' >/dev/null ||
-    printf '%s' "$receipt" | jq -e '
-        any(paths(strings) as $path |
-            getpath($path) as $value;
-            ($value | test("arn:(aws|aws-us-gov|aws-cn):"; "i")) or
-            (($path[-1] | tostring) != "content_sha256" and
-                ($value | test("(^|[^0-9])[0-9]{12}([^0-9]|$)"))) or
-            ($value | test("postgres(?:ql)?://"; "i")) or
-            ($value | test("[a-z][a-z0-9+.-]*://[^/@[:space:]]+@"; "i"))) or
-        any(paths(scalars) as $path |
-            ($path[-1] | tostring | ascii_downcase);
-            test("^(password|passwd|database_url|secret_arn|task_arn|task_definition_arn|log_group|log_stream|log_stream_prefix|log_stream_suffix|access_key|secret_access_key|session_token|authorization)$"))
-    ' >/dev/null; then
+# This is deliberately one positive "safe receipt" predicate: a jq parse or
+# compilation error therefore rejects the artifact instead of bypassing it.
+if ! printf '%s' "$receipt" | jq -e '
+    . as $root |
+    (type == "object") and
+    all(paths(strings);
+        . as $path |
+        ($root | getpath($path)) as $value |
+        (($value | test("arn:(aws|aws-us-gov|aws-cn):"; "i")) | not) and
+        (($path[-1] | tostring) == "content_sha256" or
+            (($value | test("(^|[^0-9])[0-9]{12}([^0-9]|$)")) | not)) and
+        (($value | test("postgres(?:ql)?://"; "i")) | not) and
+        (($value | test("[a-z][a-z0-9+.-]*://[^/@[:space:]]+@"; "i")) | not) and
+        (($value | test("(^|[^A-Z0-9])(AKIA|ASIA)[A-Z0-9]{16}([^A-Z0-9]|$)")) | not)) and
+    all(paths(scalars);
+        ((.[-1] | tostring | ascii_downcase |
+            test("^(password|passwd|database_url|secret_arn|task_arn|task_definition_arn|log_group|log_stream|log_stream_prefix|log_stream_suffix|access_key|secret_access_key|session_token|authorization)$")) | not))
+' >/dev/null; then
     fail "self-audit receipt contains a prohibited secret or unsanitized infrastructure/log coordinate"
 fi
 
