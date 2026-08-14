@@ -113,6 +113,10 @@
     .hit-head { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-bottom:.65rem; }
     .source-badge { color:var(--cyan); font-size:.68rem; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
     .hit-card p { margin:0; color:#e9eef5; font-size:.91rem; line-height:1.55; }
+    .hit-card .markdown-body strong { color:#fff; font-weight:750; }
+    .hit-card .markdown-body em { color:#d9e4f1; }
+    .hit-card .markdown-body code { border:1px solid #34445a; border-radius:5px; padding:.08em .32em; color:#bcecff; background:#09121d; font:500 .82em/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .hit-card .markdown-body a { color:#9cdef4; text-underline-offset:.2em; text-decoration-thickness:1px; }
     .hit-card pre { margin:0; white-space:pre-wrap; color:#dce9f4; font:500 .78rem/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; }
     .hit-meta { display:flex; gap:.45rem; align-items:center; flex-wrap:wrap; margin-top:.72rem; color:var(--muted); font:500 .68rem/1.35 ui-monospace,SFMono-Regular,Menlo,monospace; }
     .hit-rank { color:var(--quiet); }
@@ -291,11 +295,127 @@ function hitCoordinate(hit){
   const repositoryPath=/^(?:README\.md|docs\/[A-Za-z0-9._/-]+|deploy\/[A-Za-z0-9._/-]+|examples\/[A-Za-z0-9._/-]+|src\/[A-Za-z0-9._/-]+\.rs)$/.test(repositoryCandidate)
     && !repositoryCandidate.split('/').includes('..');
   const displayValue=repositoryPath?repositoryCandidate:sourceId;
-  const display=displayValue.length>80?`${displayValue.slice(0,79)}…`:displayValue;
+  const revision=String(hit?.extra?.source_revision||'');
+  const lineStart=hit?.extra?.source_line_start;
+  const lineEnd=hit?.extra?.source_line_end;
+  const immutableRevision=/^[0-9a-f]{40}$/.test(revision)&&!/^[0]+$/.test(revision);
+  const exactLines=Number.isSafeInteger(lineStart)&&lineStart>0&&lineStart<=1_000_000
+    &&Number.isSafeInteger(lineEnd)&&lineEnd>=lineStart&&lineEnd<=1_000_000
+    &&lineEnd-lineStart<=10_000;
+  const lineLabel=repositoryPath&&immutableRevision&&exactLines
+    ?`:L${lineStart}${lineEnd===lineStart?'':`-L${lineEnd}`}`:'';
+  const displayPath=displayValue.length>80?`${displayValue.slice(0,79)}…`:displayValue;
+  const display=`${displayPath}${lineLabel}`;
+  const repositoryRevision=immutableRevision&&exactLines?revision:'main';
+  const lineFragment=immutableRevision&&exactLines
+    ?`#L${lineStart}${lineEnd===lineStart?'':`-L${lineEnd}`}`:'';
   const href=repositoryPath
-    ?`https://github.com/os-tack/ostk-fleet-recall/blob/main/${repositoryCandidate.split('/').map(encodeURIComponent).join('/')}`
+    ?`https://github.com/os-tack/ostk-fleet-recall/blob/${repositoryRevision}/${repositoryCandidate.split('/').map(encodeURIComponent).join('/')}${lineFragment}`
     :null;
   return {label:display,href};
+}
+
+function safeMarkdownHref(value){
+  const candidate=String(value||'').trim();
+  if(!candidate)return null;
+  try{
+    const parsed=new URL(candidate);
+    if(parsed.protocol!=='https:'||parsed.username||parsed.password)return null;
+    return parsed.href;
+  }catch(_){
+    return null;
+  }
+}
+
+function appendMarkdownText(tokens,value){
+  if(!value)return;
+  const previous=tokens[tokens.length-1];
+  if(previous?.type==='text')previous.value+=value;
+  else tokens.push({type:'text',value});
+}
+
+function inlineMarkdownTokens(value){
+  const characters=[...String(value||'')];
+  const text=`${characters.slice(0,2000).join('')}${characters.length>2000?'…':''}`;
+  const tokens=[];
+  let cursor=0;
+  while(cursor<text.length){
+    if(text.startsWith('![',cursor)){
+      const labelEnd=text.indexOf('](',cursor+2);
+      const destinationEnd=labelEnd<0?-1:text.indexOf(')',labelEnd+2);
+      if(destinationEnd>=0){
+        appendMarkdownText(tokens,text.slice(cursor,destinationEnd+1));
+        cursor=destinationEnd+1;
+        continue;
+      }
+    }
+    if(text[cursor]==='`'){
+      const end=text.indexOf('`',cursor+1);
+      if(end>cursor+1){
+        tokens.push({type:'code',value:text.slice(cursor+1,end)});
+        cursor=end+1;
+        continue;
+      }
+    }
+    if(text.startsWith('**',cursor)){
+      const end=text.indexOf('**',cursor+2);
+      if(end>cursor+2){
+        tokens.push({type:'strong',value:text.slice(cursor+2,end)});
+        cursor=end+2;
+        continue;
+      }
+      appendMarkdownText(tokens,'**');
+      cursor+=2;
+      continue;
+    }
+    if(text[cursor]==='*'){
+      const end=text.indexOf('*',cursor+1);
+      if(end>cursor+1){
+        tokens.push({type:'emphasis',value:text.slice(cursor+1,end)});
+        cursor=end+1;
+        continue;
+      }
+    }
+    if(text[cursor]==='['){
+      const labelEnd=text.indexOf('](',cursor+1);
+      const destinationEnd=labelEnd<0?-1:text.indexOf(')',labelEnd+2);
+      if(labelEnd>cursor+1&&destinationEnd>=0){
+        const raw=text.slice(cursor,destinationEnd+1);
+        const href=safeMarkdownHref(text.slice(labelEnd+2,destinationEnd));
+        if(href){
+          tokens.push({type:'link',value:text.slice(cursor+1,labelEnd),href});
+        }else{
+          appendMarkdownText(tokens,raw);
+        }
+        cursor=destinationEnd+1;
+        continue;
+      }
+    }
+    appendMarkdownText(tokens,text[cursor]);
+    cursor+=1;
+  }
+  return tokens;
+}
+
+function renderInlineMarkdown(value){
+  const paragraph=element('p','markdown-body');
+  inlineMarkdownTokens(value).forEach(token=>{
+    if(token.type==='text'){
+      paragraph.append(document.createTextNode(token.value));
+      return;
+    }
+    if(token.type==='link'){
+      const link=element('a','',token.value);
+      link.href=token.href;
+      link.target='_blank';
+      link.rel='noopener noreferrer nofollow';
+      paragraph.append(link);
+      return;
+    }
+    const tag=token.type==='strong'?'strong':token.type==='emphasis'?'em':'code';
+    paragraph.append(element(tag,'',token.value));
+  });
+  return paragraph;
 }
 
 function shortDate(value){
@@ -417,7 +537,7 @@ function renderHitCard(hit,fusedRank){
       const link=element('a','',coordinate.label);
       link.href=coordinate.href;
       link.target='_blank';
-      link.rel='noopener';
+      link.rel='noopener noreferrer';
       coordinateNode.append(link);
     }else{
       coordinateNode.textContent=coordinate.label;
@@ -430,6 +550,8 @@ function renderHitCard(hit,fusedRank){
     const pre=element('pre');
     pre.append(element('code','',snippet));
     card.append(pre);
+  }else if(hit.source==='markdown'){
+    card.append(renderInlineMarkdown(snippet));
   }else{
     card.append(element('p','',snippet));
   }
