@@ -429,7 +429,15 @@ function inlineMarkdownTokens(value,hit=null){
         const raw=text.slice(cursor,destinationEnd+1);
         const href=safeMarkdownHref(text.slice(labelEnd+2,destinationEnd),hit);
         if(href){
-          tokens.push({type:'link',value:text.slice(cursor+1,labelEnd),href});
+          const label=text.slice(cursor+1,labelEnd);
+          const codeLabel=label.length>2&&label.startsWith('`')&&label.endsWith('`')
+            &&!label.slice(1,-1).includes('`');
+          tokens.push({
+            type:'link',
+            value:codeLabel?label.slice(1,-1):label,
+            href,
+            ...(codeLabel?{codeLabel:true}:{}),
+          });
         }else{
           appendMarkdownText(tokens,raw);
         }
@@ -451,10 +459,12 @@ function renderInlineMarkdown(value,hit=null){
       return;
     }
     if(token.type==='link'){
-      const link=element('a','',token.value);
+      const link=element('a');
       link.href=token.href;
       link.target='_blank';
       link.rel='noopener noreferrer nofollow';
+      if(token.codeLabel)link.append(element('code','',token.value));
+      else link.textContent=token.value;
       paragraph.append(link);
       return;
     }

@@ -171,6 +171,30 @@ test('HTTPS autolinks and immutable repository-relative links render safely',()=
   assert.ok(rendered.children[0].href.includes(`/blob/${revision}/docs/ARCHITECTURE.md`));
 });
 
+test('a wholly inline-code repository link label renders without backticks',()=>{
+  const revision='d'.repeat(40);
+  const source={source_id:'docs/VIDEO_DEMO.md',extra:{source_revision:revision}};
+  const rendered=markdownDomContext.renderInlineMarkdown(
+    '[`ARCHITECTURE.md`](ARCHITECTURE.md)',
+    source,
+  );
+  assert.deepEqual(descendantTags(rendered),['P','A','CODE']);
+  const link=rendered.children[0];
+  assert.equal(link.textContent,'');
+  assert.equal(link.children[0].textContent,'ARCHITECTURE.md');
+  assert.ok(link.href.includes(`/blob/${revision}/docs/ARCHITECTURE.md`));
+
+  for(const label of ['before `code`','``code``','`unbalanced']){
+    const literal=markdownDomContext.renderInlineMarkdown(
+      `[${label}](ARCHITECTURE.md)`,
+      source,
+    );
+    assert.deepEqual(descendantTags(literal),['P','A']);
+    assert.equal(literal.children[0].textContent,label);
+    assert.deepEqual(literal.children[0].children,[]);
+  }
+});
+
 test('repository-relative links fail closed on unsafe context or destination',()=>{
   const revision='c'.repeat(40);
   const source={source_id:'docs/VIDEO_DEMO.md',extra:{source_revision:revision}};
