@@ -47,6 +47,8 @@ wrong_self_audit_source=$test_root/wrong-self-audit-source.ndjson
 nonzero_self_audit_index=$test_root/nonzero-self-audit-index.ndjson
 mutated_tools_excerpt=$test_root/mutated-tools-excerpt.ndjson
 mutated_docs_marker=$test_root/mutated-docs-marker.ndjson
+mutated_primer_marker=$test_root/mutated-primer-marker.ndjson
+mutated_architecture_marker=$test_root/mutated-architecture-marker.ndjson
 nul_text=$test_root/nul-text.ndjson
 
 "$script_dir/generate.sh" > "$first"
@@ -220,6 +222,28 @@ jq -c '
 ' "$first" > "$mutated_docs_marker"
 if "$script_dir/verify.sh" "$mutated_docs_marker" >/dev/null 2>&1; then
     printf 'rich demo verification failed: verifier accepted a missing documentation marker\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "docs/PROJECT_PRIMER.md"
+    then .text |= gsub("SQLx 0.8 with its PostgreSQL driver"; "an unspecified database client")
+    else .
+    end
+' "$first" > "$mutated_primer_marker"
+if "$script_dir/verify.sh" "$mutated_primer_marker" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a missing project-primer implementation marker\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "docs/PROJECT_PRIMER.md"
+    then .text |= gsub("C-SPANN indexes"; "an unspecified vector index")
+    else .
+    end
+' "$first" > "$mutated_architecture_marker"
+if "$script_dir/verify.sh" "$mutated_architecture_marker" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a missing CockroachDB architecture marker\n' >&2
     exit 1
 fi
 

@@ -150,10 +150,11 @@ authorized live run produces verified evidence. Its boundary is documented in
   `ba884f24858a58b09a915e0358e60e7fcc7e2c34` on ECS/Fargate.
 - **CockroachDB Cloud 26.2.5** is the live memory plane for corpus chunks,
   typed claims, passage vectors, conflicts, idempotency receipts, and events.
-  The schema-2 migration, three-record bootstrap, and verifier-gated 536-chunk
-  rich corpus completed; `/api/status` reports the vector, lexical,
-  conflict-membership, and claim-support-chunk indexes, working cosine distance,
-  and embedding dimension 512.
+  Revision 6 deployed a verifier-gated 536-chunk rich corpus; `/api/status`
+  reports the vector, lexical, conflict-membership, and claim-support-chunk
+  indexes, working cosine distance, and embedding dimension 512. The source
+  generator now verifies 548 rows locally; they are not yet claimed as
+  deployed.
 - **Distributed Vector Indexing** with project- and source-prefixed
   `VECTOR(512)` cosine indexes, plus a stored `TSVECTOR` inverted index for
   hybrid recall.
@@ -253,7 +254,7 @@ Git history and pinned revisions make that boundary inspectable.
 
 | Requirement | Evidence to show judges | Release state |
 |---|---|---|
-| CockroachDB persistent memory | Local 26.2 schema/round-trip/conflict tests; cloud self-audit, reference-agent, health, and restart capture | Live Cloud 26.2.5/schema 2; migration, bootstrap plus 536-chunk rich seed, source-backed conflict, four-task chain, and exact post-replacement recall verified |
+| CockroachDB persistent memory | Local 26.2 schema/round-trip/conflict tests; cloud self-audit, reference-agent, health, and restart capture | Revision-6 cloud evidence verifies Cloud 26.2.5/schema 2; migration, bootstrap plus 536-chunk rich seed, source-backed conflict, four-task chain, and exact post-replacement recall. The current deterministic 548-row source artifact passes local verification and awaits its own release-bound seed proof |
 | Distributed Vector Indexing | DDL and local representative `EXPLAIN`; cloud plan and reference-agent lexical+dense RRF capture | Live capability flags, cosine operation, dimension 512, and lexical/dense RRF verified. The [publication-safe Cloud `EXPLAIN`](evidence/cockroach-cloud-explain.txt) selects both C-SPANN indexes and the lexical inverted index for the exact production SQL shapes on 10,001 disposable rows; all assertions passed |
 | CockroachDB Agent Skills | Pinned coding-agent invocation audit mapping each skill to decisions, code/tests, and accepted deviations | Ready in repository |
 | AWS service | ECS/ALB/CloudFront/S3/Secrets/ECR/CloudWatch Terraform; one-off self-audit/reference-agent wrappers; LocalStack contract harness | Live AWS revision-6 migration/seeds, healthy service, two self-audit tasks, four reference-agent tasks, and complete disjoint serving-task replacement verified |

@@ -243,7 +243,7 @@ if ! jq -s -e \
         | map(select(length > 0 and (startswith("#") | not)))
         | map(split("|")[0])
         | sort) as $expected_doc_sources
-    | ($expected_doc_sources | length) == 11
+    | ($expected_doc_sources | length) == 12
     and
     ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) >= 300
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
@@ -261,6 +261,25 @@ if ! jq -s -e \
             and (.text | contains("Use MCP `remember` for deliberate claims"))
             and (.text | contains("retractions, and conflicts"))
             and (.text | contains("provenance and transaction semantics are actually exercised"))
+        )] | length) == 1
+    and ([.[] | select(
+            .source_config_id == "rich-demo:docs:v1"
+            and .source_id == "docs/PROJECT_PRIMER.md"
+            and (.text | contains("Fleet Recall gives replaceable agents a shared memory plane"))
+        )] | length) == 1
+    and ([.[] | select(
+            .source_config_id == "rich-demo:docs:v1"
+            and .source_id == "docs/PROJECT_PRIMER.md"
+            and (.text | contains("SQLx 0.8 with its PostgreSQL driver"))
+            and (.text | contains("Tokio async runtime"))
+            and (.text | contains("Rustls TLS support"))
+        )] | length) == 1
+    and ([.[] | select(
+            .source_config_id == "rich-demo:docs:v1"
+            and .source_id == "docs/PROJECT_PRIMER.md"
+            and (.text | contains("serializable transactions"))
+            and (.text | contains("C-SPANN indexes"))
+            and (.text | contains("`TSVECTOR` lexical index"))
         )] | length) == 1
     and ([.[] | select(
             .source_config_id == "rich-demo:self-audit:v1"

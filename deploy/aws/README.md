@@ -10,16 +10,19 @@ The module is intentionally safe to bootstrap: its default service and
 autoscaling minimum are zero. Run the one-off migration successfully before
 starting any application task.
 
-This remains the reproducible deployment runbook. Its live submission candidate
-is available at <https://d13zrqfh66r7ub.cloudfront.net>. The schema-2 migration,
-three-record bootstrap, and verifier-gated 536-chunk rich seed succeeded;
-CockroachDB Cloud status reports version 26.2.5 and all required capabilities.
-The source-conflict self-audit, four-task reference-agent run, and fully
-disjoint serving-task replacement all verified against task-definition
-revision 6 and immutable image `git-ba884f24858a`. Publication-safe Cloud
-`EXPLAIN` also verifies the exact production SQL shapes and all three intended
-retrieval indexes. The final public video and entrant-controlled Devpost fields
-remain pending.
+This remains the reproducible deployment runbook. At the recorded revision-6
+release boundary, its live submission candidate was available at
+<https://d13zrqfh66r7ub.cloudfront.net>. The schema-2 migration, three-record
+bootstrap, and verifier-gated 536-chunk rich seed succeeded; CockroachDB Cloud
+reported version 26.2.5 and all required capabilities. The source-conflict
+self-audit, four-task reference-agent run, and fully disjoint serving-task
+replacement all verified against task-definition revision 6 and immutable
+image `git-ba884f24858a`. Publication-safe Cloud `EXPLAIN` also verified the
+exact production SQL shapes and all three intended retrieval indexes. The
+current source generator separately emits a deterministic, locally
+verifier-gated 548-row artifact; those rows are not claimed as deployed until
+a later immutable image is seeded and observed at its own release boundary.
+The final public video and entrant-controlled Devpost fields remain pending.
 
 ## Prerequisites
 
@@ -163,11 +166,13 @@ aws logs tail "$(terraform -chdir=deploy/aws output -raw log_group_name)" \
   --region us-east-1 --since 30m
 ```
 
-The deployed `git-ba884f24858a` production image contains both the repository's
+The recorded `git-ba884f24858a` production image contained both the repository's
 three-record bootstrap corpus and a deterministic, verifier-gated 536-chunk
-rich corpus. A later source revision can produce a different verified count as
-the allowlisted documentation evolves; record that count at each release
-boundary. Neither corpus contains tenant authority or secrets. The default
+rich corpus. The current source tree deterministically produces 548 rich-corpus
+rows. That artifact passes local verification, but this runbook does not call
+it deployed until a new immutable image is seeded and its observed count is
+captured at that release boundary. Neither corpus contains tenant authority or
+secrets. The default
 invocation ingests
 `/opt/ostk/demo/demo.ndjson`; `--rich-demo` selects
 `/opt/ostk/demo/rich-demo.ndjson`. Both one-off tasks use the least-privilege

@@ -772,6 +772,9 @@ async fn demo_recall(
     let mut arguments = Map::from_iter([
         ("query".into(), Value::String(input.query)),
         ("limit".into(), json!(input.limit)),
+        // Public cards should show distinct source coordinates rather than
+        // three neighboring chunks from one long document.
+        ("max_per_source_id".into(), json!(1)),
     ]);
     if let Some(source) = input.source {
         arguments.insert("source".into(), Value::String(source));
@@ -1376,6 +1379,7 @@ mod tests {
                 .and_then(Value::as_str)
                 .expect("demo query")
                 .to_owned();
+            assert_eq!(request.arguments.get("max_per_source_id"), Some(&json!(1)));
             self.queries.lock().unwrap().push(query);
             Ok(RecallResult::new(json!({
                 "hits": [{
@@ -2010,15 +2014,17 @@ mod tests {
         );
         assert!(page.contains("incompatible typed claims"));
         assert!(page.contains("claim_support_chunk_index_enabled"));
-        assert!(page.contains("support_claims_matched"));
-        assert!(page.contains("supporting_chunk_ids"));
+        assert!(page.contains("conflict_matches"));
+        assert!(page.contains("source_support"));
+        assert!(page.contains("fused_hit_rank"));
         assert!(page.contains("<details id=\"raw\" hidden>"));
         assert!(page.contains("View raw evidence envelope"));
         assert!(page.contains("response.headers.get('server-timing')"));
         assert!(page.contains("document.createElement(tag)"));
-        assert!(page.contains("Verified cloud evidence"));
-        assert!(page.contains("devpost-schema2-20260814T134502Z"));
-        assert!(page.contains("action claim #12 and escalation claim #14"));
+        assert!(page.contains("Verified on AWS"));
+        assert!(page.contains("syncSampleSelection"));
+        assert!(page.contains("aria-pressed=\"true\""));
+        assert!(page.contains("exact retrieved claim/source association"));
         assert!(page.contains("rich-demo/docs/"));
         assert!(page.contains("src\\/[A-Za-z0-9._/-]+\\.rs"));
         assert!(page.contains("https://github.com/os-tack/ostk-fleet-recall/blob/main/"));

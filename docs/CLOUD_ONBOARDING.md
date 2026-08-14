@@ -6,17 +6,20 @@ billing choices, DNS ownership, or database credentials. Do not place database
 URLs, passwords, AWS access keys, or secret values in this repository,
 Terraform variables, command-line arguments, screenshots, or shell history.
 
-Current release state: the onboarding path has been completed for the live
-submission candidate at
+Recorded revision-6 release state: the onboarding path was completed for the
+live submission candidate at
 <https://d13zrqfh66r7ub.cloudfront.net>. The schema-2 migration, three-record
 bootstrap, and verifier-gated 536-chunk rich seed succeeded; CockroachDB Cloud
-reports version 26.2.5 and all required capabilities. A two-task source-conflict
-self-audit, the four-task reference-agent chain, and a complete disjoint
-serving-task replacement all verified against task-definition revision 6 and
-immutable image `git-ba884f24858a`. Publication-safe Cloud
-`EXPLAIN` verifies the exact production SQL shapes and all three intended
-indexes on a disposable 10,001-row fixture. The final public video and the
-remaining Devpost fields are still pending.
+reported version 26.2.5 and all required capabilities. A two-task
+source-conflict self-audit, the four-task reference-agent chain, and a complete
+disjoint serving-task replacement all verified against task-definition
+revision 6 and immutable image `git-ba884f24858a`. Publication-safe Cloud
+`EXPLAIN` verified the exact production SQL shapes and all three intended
+indexes on a disposable 10,001-row fixture. Separately, the current source
+generator deterministically emits 548 rows and passes local verification;
+those rows are not part of this historical cloud claim until a later immutable
+image is seeded and observed at its own release boundary. The final public
+video and the remaining Devpost fields are still pending.
 
 The labels below are gates:
 
@@ -382,8 +385,8 @@ jq -e '.schema == "fleet-reference-agent-run-v1" and .verified == true' \
   "target/aws-evidence/reference-agent-$RUN_ID.json"
 ```
 
-For the live deployment, the schema-2 migration, three-record bootstrap, and
-536-chunk rich seed exited successfully. The checked-in
+For the recorded revision-6 deployment, the schema-2 migration, three-record
+bootstrap, and 536-chunk rich seed exited successfully. The checked-in
 [source-conflict self-audit](evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json)
 verified documentation-backed claim 9, code-backed claim 10, and their exact
 open conflict 3 through semantic recall. Fresh run
@@ -404,7 +407,9 @@ task-definition families are revision 6. GitHub Actions run `31808620621`
 completed all five jobs successfully. An earlier completed proof remains
 historical because it predates this schema/image boundary. A fresh run ID was
 used so current task, image, claim, conflict, and replacement coordinates could
-not be mixed with that prior deployment.
+not be mixed with that prior deployment. The current deterministic 548-row
+source artifact is locally verifier-gated and remains pending a distinct
+release-bound seed receipt.
 
 The separate Cloud `EXPLAIN` proof exercised the exact production
 project-vector, source-vector, and lexical SQL shapes on a 10,001-row disposable

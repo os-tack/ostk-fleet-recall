@@ -7,33 +7,39 @@
   <style>
     :root {
       color-scheme: dark;
-      --ink:#f7f4ee;
-      --muted:#aeb8c7;
-      --panel:#111722;
-      --panel-soft:#161e2b;
-      --line:#2a3547;
-      --cyan:#6fe5ff;
-      --cyan-soft:#102b36;
-      --amber:#ffc46b;
-      --amber-soft:#2d2113;
-      --red:#ff8f86;
-      --green:#79e4a8;
-      --shadow:#0008;
+      --ink:#f5f7fb;
+      --muted:#9ca9bb;
+      --quiet:#718096;
+      --surface:#101722;
+      --surface-strong:#141d2a;
+      --surface-soft:#0b111a;
+      --line:#263347;
+      --line-strong:#35465f;
+      --cyan:#72d9f5;
+      --cyan-soft:#102936;
+      --amber:#f4bc62;
+      --amber-soft:#2b2113;
+      --red:#ff938a;
+      --green:#78dda4;
+      --shadow:#02050a99;
     }
     * { box-sizing:border-box; }
     body {
       margin:0;
       min-height:100vh;
-      font:16px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+      font:16px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
       color:var(--ink);
       background:
-        radial-gradient(circle at 88% 2%,#173a4d 0,transparent 34rem),
-        radial-gradient(circle at 8% 72%,#2a2015 0,transparent 28rem),
-        #080b11;
+        linear-gradient(#ffffff08 1px,transparent 1px),
+        linear-gradient(90deg,#ffffff08 1px,transparent 1px),
+        radial-gradient(circle at 82% -10%,#17435b 0,transparent 34rem),
+        radial-gradient(circle at 2% 74%,#332410 0,transparent 30rem),
+        #070a0f;
+      background-size:44px 44px,44px 44px,auto,auto,auto;
     }
-    main { width:min(1080px,calc(100% - 2rem)); margin:auto; padding:3.5rem 0 4rem; }
+    main { width:min(1180px,calc(100% - 2rem)); margin:auto; padding:3.25rem 0 4rem; }
     .topline { display:flex; align-items:center; justify-content:space-between; gap:1rem; }
-    .eyebrow { color:var(--cyan); letter-spacing:.16em; text-transform:uppercase; font-size:.76rem; }
+    .eyebrow { color:var(--cyan); letter-spacing:.15em; text-transform:uppercase; font:700 .72rem/1.2 ui-monospace,SFMono-Regular,Menlo,monospace; }
     .status-chip {
       display:inline-flex;
       align-items:center;
@@ -41,92 +47,121 @@
       max-width:100%;
       border:1px solid var(--line);
       border-radius:999px;
-      padding:.48rem .75rem;
+      padding:.5rem .8rem;
       color:var(--muted);
-      background:#0c111a;
-      font-size:.72rem;
+      background:#090e16e8;
+      font:600 .7rem/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;
       line-height:1.35;
     }
     .status-dot { width:.55rem; height:.55rem; flex:0 0 auto; border-radius:50%; background:var(--amber); box-shadow:0 0 0 3px #ffc46b1f; }
     .status-chip.ready { color:#d9f9e6; border-color:#275a40; background:#0d1c16; }
     .status-chip.ready .status-dot { background:var(--green); box-shadow:0 0 0 3px #79e4a826; }
     .status-chip.error .status-dot { background:var(--red); box-shadow:0 0 0 3px #ff8f8626; }
-    h1 { font:750 clamp(2.7rem,7.8vw,6rem)/.93 system-ui,-apple-system,sans-serif; letter-spacing:-.065em; margin:.34em 0 .22em; max-width:980px; }
+    h1 { font:780 clamp(3rem,7vw,5.55rem)/.95 Inter,ui-sans-serif,system-ui,sans-serif; letter-spacing:-.06em; margin:.38em 0 .22em; max-width:960px; text-wrap:balance; }
     h1 span { color:var(--amber); }
-    .lede { color:var(--muted); max-width:790px; font-size:clamp(1rem,2vw,1.12rem); margin:0; }
-    .lede strong { color:var(--ink); font-weight:600; }
-    .grid { display:grid; grid-template-columns:minmax(0,1.55fr) minmax(260px,.75fr); gap:1rem; margin-top:2.4rem; align-items:start; }
-    .panel { border:1px solid var(--line); background:color-mix(in srgb,var(--panel) 95%,transparent); border-radius:16px; padding:1.25rem; box-shadow:0 24px 80px var(--shadow); }
+    .lede { color:var(--muted); max-width:820px; font-size:clamp(1rem,2vw,1.16rem); margin:0; }
+    .lede strong { color:var(--ink); font-weight:650; }
+    .grid { display:grid; grid-template-columns:minmax(0,1fr) 310px; gap:1.15rem; margin-top:2.5rem; align-items:start; }
+    .panel { border:1px solid var(--line); background:linear-gradient(145deg,#111925f5,#0c121cf5); border-radius:22px; padding:1.55rem; box-shadow:0 28px 90px var(--shadow); }
+    .recall-panel { padding:clamp(1.25rem,3vw,2rem); }
     .story-label { display:flex; align-items:center; gap:.5rem; color:var(--amber); margin:0 0 .45rem; font-size:.76rem; font-weight:700; letter-spacing:.09em; text-transform:uppercase; }
     .story-label::before { content:""; width:.45rem; height:.45rem; border-radius:50%; background:var(--amber); }
-    h2 { font:700 1.2rem/1.25 system-ui,-apple-system,sans-serif; margin:0; letter-spacing:-.02em; }
-    .form-copy { color:var(--muted); font-size:.85rem; margin:.25rem 0 .9rem; }
-    label { display:block; color:var(--muted); margin-bottom:.48rem; font-size:.84rem; }
-    .query { display:flex; gap:.6rem; }
-    input { width:100%; min-width:0; border:1px solid var(--line); border-radius:10px; background:#080d15; color:var(--ink); padding:.82rem .95rem; font:inherit; }
-    button { min-height:44px; border:0; border-radius:10px; padding:.75rem 1.05rem; background:var(--cyan); color:#071016; font:700 .88rem inherit; cursor:pointer; }
-    button:hover { filter:brightness(1.08); }
+    h2 { font:760 clamp(1.35rem,3vw,1.65rem)/1.2 Inter,ui-sans-serif,system-ui,sans-serif; margin:0; letter-spacing:-.035em; }
+    .form-copy { color:var(--muted); font-size:.9rem; margin:.3rem 0 1.15rem; }
+    label { display:block; color:#c7d0dc; margin-bottom:.52rem; font-size:.78rem; font-weight:700; letter-spacing:.04em; }
+    .query { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.65rem; }
+    input { width:100%; min-width:0; min-height:52px; border:1px solid var(--line-strong); border-radius:13px; background:#070c14; color:var(--ink); padding:.86rem 1rem; font:500 .94rem/1.35 ui-monospace,SFMono-Regular,Menlo,monospace; box-shadow:inset 0 1px 0 #ffffff08; }
+    button { min-height:44px; border:0; border-radius:12px; padding:.78rem 1.15rem; background:var(--cyan); color:#071016; font:750 .88rem/1.1 Inter,ui-sans-serif,system-ui,sans-serif; cursor:pointer; transition:transform .16s ease,filter .16s ease,border-color .16s ease,background .16s ease; }
+    button:hover { filter:brightness(1.07); transform:translateY(-1px); }
     button:disabled { opacity:.55; cursor:wait; filter:none; }
     input:focus-visible,button:focus-visible,summary:focus-visible { outline:3px solid #6fe5ff59; outline-offset:2px; }
-    .samples { display:flex; gap:.48rem; flex-wrap:wrap; margin-top:.75rem; }
-    .samples button { color:#cbd5e2; background:#1a2432; border:1px solid #2b3a4e; font-weight:500; padding:.48rem .68rem; }
-    .samples button:first-child { color:#ffe1b2; background:var(--amber-soft); border-color:#684820; }
-    .answer-shell { margin-top:1.25rem; border-top:1px solid var(--line); padding-top:1.1rem; }
-    .query-meta { min-height:1.45rem; color:var(--muted); font-size:.76rem; margin-bottom:.65rem; }
-    .initial-answer { border:1px dashed #3b4656; border-radius:12px; padding:1rem; color:var(--muted); background:#0b1018; }
+    fieldset.samples { border:0; padding:0; margin:1rem 0 0; min-width:0; }
+    .sample-legend { color:var(--quiet); font-size:.72rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; padding:0; margin-bottom:.55rem; }
+    .sample-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.55rem; }
+    .sample-grid button { display:block; min-width:0; text-align:left; color:#d4dbe5; background:#121b28; border:1px solid #2b3a4e; padding:.7rem .78rem; }
+    .sample-grid button[aria-pressed="true"] { color:#fff1d7; background:linear-gradient(135deg,#322413,#241b11); border-color:#8a5e27; box-shadow:inset 3px 0 0 var(--amber); }
+    .sample-kicker { display:block; color:var(--cyan); font-size:.66rem; letter-spacing:.08em; text-transform:uppercase; margin-bottom:.18rem; }
+    [aria-pressed="true"] .sample-kicker { color:var(--amber); }
+    .sample-copy { display:block; font-size:.83rem; line-height:1.28; }
+    .answer-shell { margin-top:1.45rem; border-top:1px solid var(--line); padding-top:1.25rem; }
+    .query-meta { min-height:1.45rem; color:var(--muted); font:500 .72rem/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; margin-bottom:.8rem; }
+    .initial-answer { border:1px dashed #3b4656; border-radius:15px; padding:1.15rem; color:var(--muted); background:#0a1018; }
     .initial-answer strong { display:block; color:var(--ink); margin-bottom:.25rem; }
     .loading { color:var(--muted); padding:.6rem 0; }
     .loading::before { content:""; display:inline-block; width:.66rem; height:.66rem; margin-right:.55rem; border:2px solid #314052; border-top-color:var(--cyan); border-radius:50%; animation:spin .8s linear infinite; }
     @keyframes spin { to { transform:rotate(360deg); } }
-    .conflict-callout { border:1px solid #765222; border-left:4px solid var(--amber); border-radius:12px; padding:1rem; background:linear-gradient(110deg,var(--amber-soft),#171611); }
-    .conflict-title { font:700 1.02rem/1.35 system-ui,-apple-system,sans-serif; color:#ffe1b2; margin:0; }
-    .conflict-copy { color:#dfc6a3; margin:.35rem 0 0; font-size:.87rem; }
-    .coverage-note { color:#aa9579; margin:.5rem 0 0; font-size:.72rem; }
-    .results-heading { display:flex; align-items:baseline; justify-content:space-between; gap:1rem; margin:1.05rem 0 .65rem; }
-    .results-heading h3 { font:700 1.2rem/1.25 system-ui,-apple-system,sans-serif; margin:0; letter-spacing:-.02em; }
-    .results-heading span { color:var(--muted); font-size:.72rem; }
-    .hit-list { display:grid; gap:.6rem; }
-    .hit-card { border:1px solid var(--line); background:var(--panel-soft); border-radius:11px; padding:.9rem 1rem; overflow-wrap:anywhere; }
-    .hit-card p { margin:0; color:#edf2f7; font:500 .94rem/1.55 system-ui,-apple-system,sans-serif; }
-    .hit-meta { display:flex; gap:.45rem; align-items:center; flex-wrap:wrap; margin-top:.62rem; color:var(--muted); font-size:.69rem; }
-    .hit-rank { color:var(--cyan); }
+    .answer-title { margin:0 0 .9rem; }
+    .answer-title span { display:block; color:var(--quiet); font-size:.7rem; font-weight:750; letter-spacing:.1em; text-transform:uppercase; margin-bottom:.25rem; }
+    .answer-title h3 { margin:0; font-size:1.05rem; line-height:1.4; letter-spacing:-.015em; overflow-wrap:anywhere; }
+    .match-note { display:flex; gap:.65rem; align-items:flex-start; border:1px solid #33435a; border-radius:13px; background:#0c1420; color:#b9c6d7; padding:.85rem .95rem; margin-bottom:.85rem; font-size:.82rem; }
+    .match-note strong { color:var(--ink); }
+    .conflict-callout { border:1px solid #7b5625; border-left:5px solid var(--amber); border-radius:16px; padding:1.15rem; background:linear-gradient(120deg,#2d2113,#16140f); box-shadow:0 16px 45px #0004; }
+    .conflict-eyebrow { color:var(--amber); font-size:.68rem; font-weight:800; letter-spacing:.1em; text-transform:uppercase; margin:0 0 .3rem; }
+    .conflict-title { font:760 1.13rem/1.35 Inter,ui-sans-serif,system-ui,sans-serif; color:#ffe5ba; margin:0; }
+    .conflict-copy { color:#dfc6a3; margin:.36rem 0 0; font-size:.87rem; }
+    .conflict-sides { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.55rem; margin-top:.85rem; }
+    .conflict-side { border:1px solid #65491f; border-radius:11px; background:#130f0a99; padding:.72rem .78rem; }
+    .conflict-agent { display:block; min-width:0; overflow-wrap:anywhere; color:#caa66d; font:700 .67rem/1.2 ui-monospace,SFMono-Regular,Menlo,monospace; text-transform:uppercase; letter-spacing:.06em; margin-bottom:.3rem; }
+    .conflict-value { min-width:0; overflow-wrap:anywhere; margin:0; color:#f3dfbe; font-size:.82rem; line-height:1.45; }
+    .coverage-note { color:#aa9579; margin:.72rem 0 0; font:500 .68rem/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .results-heading { display:flex; align-items:baseline; justify-content:space-between; gap:1rem; margin:1.2rem 0 .7rem; }
+    .results-heading h3 { font:760 1.15rem/1.25 Inter,ui-sans-serif,system-ui,sans-serif; margin:0; letter-spacing:-.025em; }
+    .results-heading span { color:var(--quiet); font:500 .68rem/1.3 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .hit-list { display:grid; gap:.7rem; }
+    .hit-card { border:1px solid var(--line); background:var(--surface-strong); border-radius:14px; padding:1rem; overflow-wrap:anywhere; box-shadow:inset 0 1px 0 #ffffff07; }
+    .hit-card.is-primary { border-color:#3d5870; background:linear-gradient(145deg,#172333,#111a27); padding:1.1rem; }
+    .hit-head { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-bottom:.65rem; }
+    .source-badge { color:var(--cyan); font-size:.68rem; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
+    .hit-card p { margin:0; color:#e9eef5; font-size:.91rem; line-height:1.55; }
+    .hit-card pre { margin:0; white-space:pre-wrap; color:#dce9f4; font:500 .78rem/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .hit-meta { display:flex; gap:.45rem; align-items:center; flex-wrap:wrap; margin-top:.72rem; color:var(--muted); font:500 .68rem/1.35 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .hit-rank { color:var(--quiet); }
     .meta-separator { color:#536176; }
     .hit-coordinate { overflow-wrap:anywhere; }
-    .hit-coordinate a { color:#b9ddff; text-underline-offset:.18em; }
-    .empty-result,.error-result { border:1px solid var(--line); border-radius:11px; padding:1rem; color:var(--muted); background:#0c1119; }
+    .hit-coordinate a { color:#b9ddff; text-underline-offset:.2em; text-decoration-thickness:1px; }
+    .empty-result,.error-result { border:1px solid var(--line); border-radius:14px; padding:1.05rem; color:var(--muted); background:#0c1119; }
     .error-result { border-color:#6f3838; color:#ffc7c2; background:#211313; }
     details { margin-top:.85rem; border-top:1px solid var(--line); padding-top:.65rem; }
-    summary { width:max-content; max-width:100%; min-height:44px; display:flex; align-items:center; cursor:pointer; color:var(--muted); font-size:.78rem; }
+    summary { width:max-content; max-width:100%; min-height:44px; display:flex; align-items:center; cursor:pointer; color:var(--muted); font:600 .72rem/1.3 ui-monospace,SFMono-Regular,Menlo,monospace; }
     summary::before { content:"+"; margin-right:.45rem; color:var(--cyan); }
     details[open] summary::before { content:"−"; }
     #raw-result { white-space:pre-wrap; word-break:break-word; color:#b9c6d6; font-size:.72rem; overflow:auto; max-height:430px; background:#090d14; border:1px solid var(--line); border-radius:9px; padding:.85rem; margin:.25rem 0 0; }
-    .facts { list-style:none; padding:0; margin:0; }
-    .facts li { padding:.78rem 0; border-bottom:1px solid var(--line); color:#dbe3ed; font-size:.86rem; }
-    .facts li:last-child { border-bottom:0; }
-    .facts strong { display:block; color:var(--amber); font-size:.7rem; text-transform:uppercase; letter-spacing:.09em; margin-bottom:.15rem; }
-    .facts code { color:#c5e9f3; overflow-wrap:anywhere; }
+    .rail-label { margin:0 0 .8rem; color:var(--quiet); font-size:.7rem; font-weight:800; letter-spacing:.1em; text-transform:uppercase; }
+    .steps { list-style:none; padding:0; margin:0; counter-reset:step; }
+    .steps li { position:relative; padding:0 0 1rem 2.35rem; counter-increment:step; }
+    .steps li:not(:last-child)::after { content:""; position:absolute; left:.78rem; top:1.65rem; bottom:.2rem; width:1px; background:var(--line); }
+    .steps li::before { content:counter(step); position:absolute; left:0; top:0; display:grid; place-items:center; width:1.55rem; height:1.55rem; border-radius:50%; color:#08202a; background:var(--cyan); font:800 .68rem/1 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .steps strong { display:block; color:var(--ink); font-size:.84rem; margin-bottom:.15rem; }
+    .steps p { margin:0; color:var(--muted); font-size:.78rem; line-height:1.45; }
+    .proof-card { margin-top:.55rem; border:1px solid #34523e; border-radius:13px; padding:.9rem; background:#0c1913; }
+    .proof-card strong { display:block; color:var(--green); font-size:.7rem; letter-spacing:.08em; text-transform:uppercase; margin-bottom:.28rem; }
+    .proof-card p { margin:0; color:#c6ddd0; font-size:.78rem; line-height:1.48; }
+    .proof-card code { color:#dcf5e5; }
+    .proof-card a { color:#a9ecc2; text-underline-offset:.2em; }
+    #status-text { min-width:0; overflow-wrap:anywhere; }
     .read-only { display:flex; gap:.62rem; align-items:flex-start; margin-top:1rem; color:var(--muted); font-size:.76rem; }
     .lock { color:var(--green); }
-    footer { color:var(--muted); font-size:.78rem; margin-top:1.6rem; }
+    footer { color:var(--quiet); font:500 .7rem/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; margin-top:1.6rem; }
     .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
     [hidden] { display:none !important; }
-    @media (max-width:780px) {
+    @media (max-width:860px) {
       main { padding:2.4rem 0 3rem; }
       .topline { align-items:flex-start; flex-direction:column; }
       .status-chip { border-radius:12px; }
       .grid { grid-template-columns:1fr; }
-      .query { flex-direction:column; }
-      .query button { width:100%; }
     }
-    @media (max-width:430px) {
+    @media (max-width:560px) {
       main { width:min(100% - 1.15rem,1080px); }
-      h1 { font-size:2.65rem; }
+      h1 { font-size:2.75rem; }
       .panel { padding:1rem; }
-      .samples { display:grid; grid-template-columns:1fr; }
-      .samples button { width:100%; text-align:left; }
+      .query { grid-template-columns:1fr; }
+      .query button { width:100%; }
+      .sample-grid { grid-template-columns:1fr; }
       .results-heading { align-items:flex-start; flex-direction:column; gap:.15rem; }
+      .conflict-sides { grid-template-columns:1fr; }
+      .hit-head { align-items:flex-start; flex-direction:column; gap:.25rem; }
     }
-    @media (prefers-reduced-motion:reduce) { .loading::before { animation:none; } }
+    @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto!important; transition:none!important; animation-duration:.01ms!important; animation-iteration-count:1!important; } }
   </style>
 </head>
 <body>
@@ -142,10 +177,10 @@
   <p class="lede"><strong>Fleet Recall surfaces incompatible decisions instead of silently choosing one.</strong> Search the live, project-scoped corpus; when a retrieved source is cited by incompatible typed claims, its open conflict travels with the result.</p>
 
   <div class="grid">
-    <section class="panel" aria-labelledby="demo-heading">
+    <section class="panel recall-panel" aria-labelledby="demo-heading">
       <p class="story-label">Conflict-aware recall</p>
       <h2 id="demo-heading">Ask the live agent memory</h2>
-      <p class="form-copy">Start with a real specification-versus-code disagreement, or try another question.</p>
+      <p class="form-copy">Ask a real question. Fleet Recall keeps ranked evidence and disagreements separate, so a conflict appears only when the retrieved memory actually leads to it.</p>
       <form id="search">
         <label for="query">Recall from the fleet</label>
         <div class="query">
@@ -153,19 +188,34 @@
           <button id="submit" type="submit">Recall</button>
         </div>
       </form>
-      <div class="samples" aria-label="Sample queries">
-        <button type="button" data-q="Does MCP remember support deliberate retractions?">⚠ spec vs code</button>
-        <button type="button" data-q="How are conflicting migration strategies represented and escalated?">migration conflict</button>
-        <button type="button" data-q="Why did the fleet choose CockroachDB?">database choice</button>
-        <button type="button" data-q="What survives an agent restart?">durability</button>
-      </div>
+      <fieldset class="samples">
+        <legend class="sample-legend">Try an evidence trail</legend>
+        <div class="sample-grid">
+          <button type="button" aria-pressed="true" data-q="Does MCP remember support deliberate retractions?">
+            <span class="sample-kicker">Open conflict</span>
+            <span class="sample-copy">Specification vs implementation</span>
+          </button>
+          <button type="button" aria-pressed="false" data-q="How are conflicting migration strategies represented and escalated?">
+            <span class="sample-kicker">Agent decision</span>
+            <span class="sample-copy">Migration strategy disagreement</span>
+          </button>
+          <button type="button" aria-pressed="false" data-q="Why does Fleet Recall use CockroachDB for shared agent memory?">
+            <span class="sample-kicker">Architecture</span>
+            <span class="sample-copy">Why this database and retrieval design</span>
+          </button>
+          <button type="button" aria-pressed="false" data-q="How does Rust write memories to CockroachDB?">
+            <span class="sample-kicker">Implementation</span>
+            <span class="sample-copy">SQLx, transactions, and the write path</span>
+          </button>
+        </div>
+      </fieldset>
 
       <div class="answer-shell">
         <div id="query-meta" class="query-meta" aria-live="polite"></div>
-        <div id="answer" aria-live="polite" aria-busy="false">
+        <div id="answer" aria-busy="false">
           <div class="initial-answer">
-            <strong>The contradiction is the demo.</strong>
-            Recall will return the relevant memories, surface typed same-key disagreements, and show when a matching escalation was recorded.
+            <strong>Evidence first. Conflict only when it belongs.</strong>
+            Run a sample or ask your own question to inspect ranked source memories, provenance, and any exact typed disagreement they trigger.
           </div>
         </div>
         <details id="raw" hidden>
@@ -176,14 +226,16 @@
     </section>
 
     <aside class="panel" aria-label="How Fleet Recall works">
-      <ul class="facts">
-        <li><strong>Conflict behavior</strong>Same-key typed contradictions surface as open conflicts until deliberately resolved</li>
-        <li><strong>Retrieval</strong>Lexical + C-SPANN vector lanes, reciprocal-rank fused</li>
-        <li><strong>Isolation</strong>Tenant and project scope is trusted server configuration</li>
-        <li><strong>Durability</strong>Shared memory survives individual agent and task replacement</li>
-        <li><strong>Verified cloud evidence</strong><code>devpost-schema2-20260814T134502Z</code> replaced the full revision 5 serving task set; exact cited action claim #12 and escalation claim #14 remained recallable under schema 2</li>
-        <li><strong>Runtime</strong>AWS ECS/Fargate backed by CockroachDB Cloud</li>
-      </ul>
+      <p class="rail-label">From question to evidence</p>
+      <ol class="steps">
+        <li><strong>Recall</strong><p>CockroachDB runs lexical and vector search inside the trusted tenant and project scope.</p></li>
+        <li><strong>Link provenance</strong><p>Each result retains its source coordinate; typed claims can cite an exact content hash.</p></li>
+        <li><strong>Surface disagreement</strong><p>Only a retrieved claim or matching source edge can carry its open conflict into the answer.</p></li>
+      </ol>
+      <div class="proof-card">
+        <strong>Verified on AWS</strong>
+        <p>A full Fargate task-set replacement preserved the exact cited action and escalation claims under CockroachDB schema 2. Inspect <a href="https://github.com/os-tack/ostk-fleet-recall/blob/main/docs/evidence/replacement-devpost-final6-20260814T143523Z.json" target="_blank" rel="noopener">run <code>devpost-final6-20260814T143523Z</code></a>.</p>
+      </div>
       <div class="read-only"><span class="lock" aria-hidden="true">●</span><span>This public experience is bounded and read-only. Writes stay behind the canonical MCP <code>remember</code> tool.</span></div>
     </aside>
   </div>
@@ -212,6 +264,11 @@ function element(tag,className,text){
 
 function readable(value){
   return String(value||'').replace(/[_-]+/g,' ').replace(/\s+/g,' ').trim();
+}
+
+function boundedText(value,limit){
+  const characters=[...String(value||'')];
+  return characters.length<=limit?characters.join(''):`${characters.slice(0,limit-1).join('')}…`;
 }
 
 function sourceLabel(hit){
@@ -257,43 +314,31 @@ function responseDuration(header){
   return Number.isFinite(value)&&value>=0?value:null;
 }
 
-function conflictSubject(conflict){
-  const members=Array.isArray(conflict.members)?conflict.members:[];
-  return members.find(member=>typeof member.subject==='string')?.subject||'';
-}
-
 function conflictLabel(conflict){
   const members=Array.isArray(conflict.members)?conflict.members:[];
   const predicate=members.find(member=>member.predicate)?.predicate;
   const keyTail=typeof conflict.claim_key==='string'?conflict.claim_key.split('::').pop():'';
-  return readable(predicate||keyTail||'the same decision');
+  return boundedText(readable(predicate||keyTail||'the same decision'),110);
 }
 
-function chooseConflict(conflicts){
-  return conflicts
-    .filter(conflict=>conflict&&conflict.state==='open'&&Array.isArray(conflict.members)&&conflict.members.length>0&&!conflict.members_truncated&&!conflict.member_values_elided)
-    .sort((left,right)=>Date.parse(right.detected_at||right.last_seen_at||0)-Date.parse(left.detected_at||left.last_seen_at||0))[0]||null;
-}
-
-function isClaimProjection(hit){
+function hitClaimId(hit){
   const claimId=Number(hit?.extra?.claim_id);
-  return (Number.isSafeInteger(claimId)&&claimId>0)||String(hit?.chunk_id||'').startsWith('claim:')||hit?.source==='ostk_memory';
+  return Number.isSafeInteger(claimId)&&claimId>0?claimId:null;
 }
 
-function uniqueHits(body){
+function uniqueHits(body,conflict=null){
   const hits=Array.isArray(body?.data?.hits)?body.data.hits:[];
-  const supportingIds=new Set(
-    (Array.isArray(body?.diagnostics?.retrieval?.supporting_chunk_ids)
-      ?body.diagnostics.retrieval.supporting_chunk_ids:[])
-      .filter(id=>typeof id==='string'&&id.length>0&&id.length<=256)
-      .slice(0,100)
+  const representedClaims=new Set(
+    conflict&&Array.isArray(conflict.members)
+      ?conflict.members.map(member=>Number(member?.id)).filter(id=>Number.isSafeInteger(id)&&id>0)
+      :[]
   );
-  const prioritized=hits
-    .map((hit,index)=>({hit,index,supporting:!isClaimProjection(hit)&&supportingIds.has(hit?.chunk_id)}))
-    .sort((left,right)=>Number(right.supporting)-Number(left.supporting)||left.index-right.index)
-    .map(candidate=>candidate.hit);
   const seen=new Set();
-  return prioritized.filter(hit=>{
+  return hits.filter(hit=>{
+    // The conflict panel renders its claim members side by side. Do not repeat
+    // those synthetic projections as evidence cards; preserve room for the
+    // ranked source material that led to them.
+    if(representedClaims.has(hitClaimId(hit)))return false;
     const text=String(hit?.snippet||hit?.text||'').trim();
     const key=text.toLocaleLowerCase().replace(/\s+/g,' ');
     if(!text||seen.has(key))return false;
@@ -302,23 +347,124 @@ function uniqueHits(body){
   }).slice(0,3);
 }
 
-function hasMatchingEscalation(conflict,hits){
-  const subject=conflictSubject(conflict);
-  if(!subject)return false;
-  return hits.some(hit=>{
-    const claimKey=hit?.extra?.claim_key;
-    const text=String(hit?.snippet||hit?.text||'');
-    return claimKey===`${subject}::escalation-status`&&/(escalat|operator review)/i.test(text);
-  });
+function conflictMatch(body,conflictId){
+  const matches=Array.isArray(body?.diagnostics?.retrieval?.conflict_matches)
+    ?body.diagnostics.retrieval.conflict_matches:[];
+  return matches.find(match=>Number(match?.conflict_id)===Number(conflictId))||null;
 }
 
-function renderResult(body){
+function chooseConflict(body){
+  const conflicts=Array.isArray(body?.conflicts)?body.conflicts:[];
+  const hits=Array.isArray(body?.data?.hits)?body.data.hits:[];
+  const rankedClaimIds=new Map();
+  hits.forEach((hit,index)=>{
+    const claimId=hitClaimId(hit);
+    if(claimId!==null&&!rankedClaimIds.has(claimId))rankedClaimIds.set(claimId,index);
+  });
+  return conflicts
+    .filter(conflict=>conflict&&conflict.state==='open'&&Array.isArray(conflict.members)&&conflict.members.length>=2&&!conflict.members_truncated&&!conflict.member_values_elided)
+    .map(conflict=>{
+      const memberIds=(conflict.members||[]).map(member=>Number(member?.id)).filter(id=>Number.isSafeInteger(id)&&id>0);
+      const directRanks=memberIds.map(id=>rankedClaimIds.get(id)).filter(rank=>Number.isInteger(rank));
+      const mapping=conflictMatch(body,conflict.id);
+      const sourceRanks=(Array.isArray(mapping?.source_support)?mapping.source_support:[])
+        .filter(support=>{
+          const rank=Number(support?.fused_hit_rank);
+          return memberIds.includes(Number(support?.claim_id))
+            &&Number.isInteger(rank)&&rank>0&&rank<=hits.length
+            &&String(support?.chunk_id||'')===String(hits[rank-1]?.chunk_id||'');
+        })
+        .map(support=>Number(support.fused_hit_rank));
+      const triggerRanks=[...directRanks.map(rank=>rank+1),...sourceRanks];
+      const bestRank=triggerRanks.length?Math.min(...triggerRanks):Number.POSITIVE_INFINITY;
+      return {conflict,bestRank,direct:directRanks.length>0,source:sourceRanks.length>0};
+    })
+    // A conflict is an answer only when a top-three qualified result maps to
+    // it through a direct claim or an exact current source-support edge.
+    // Aggregate conflict presence is deliberately insufficient; semantic
+    // relevance belongs to the retrieval layer rather than keyword matching
+    // in this presentation client.
+    .filter(candidate=>(candidate.direct||candidate.source)&&candidate.bestRank<=3)
+    .sort((left,right)=>
+      left.bestRank-right.bestRank
+      ||Number(right.direct)-Number(left.direct)
+      ||Date.parse(right.conflict.detected_at||right.conflict.last_seen_at||0)-Date.parse(left.conflict.detected_at||left.conflict.last_seen_at||0)
+    )[0]?.conflict||null;
+}
+
+function memberValue(member){
+  const text=String(member?.text||'').trim();
+  if(text)return boundedText(text,320);
+  if(typeof member?.value==='string')return boundedText(member.value,320);
+  if(member?.value!==undefined&&member?.value!==null)return boundedText(JSON.stringify(member.value),320);
+  return 'The recorded value is unavailable.';
+}
+
+function cleanSnippet(hit){
+  const text=String(hit?.snippet||hit?.text||'').trim();
+  return text.replace(/^Source document [^;]+; section [^.]+\.\s*/i,'').trim()||text;
+}
+
+function renderHitCard(hit,fusedRank){
+  const isPrimary=fusedRank===1;
+  const card=element('article',`hit-card${isPrimary?' is-primary':''}`);
+  const head=element('div','hit-head');
+  head.append(element('span','source-badge',`${fusedRank===1?'Best match':'Related evidence'} · ${sourceLabel(hit)}`));
+  const coordinate=hitCoordinate(hit);
+  if(coordinate){
+    const coordinateNode=element('span','hit-coordinate');
+    if(coordinate.href){
+      const link=element('a','',coordinate.label);
+      link.href=coordinate.href;
+      link.target='_blank';
+      link.rel='noopener';
+      coordinateNode.append(link);
+    }else{
+      coordinateNode.textContent=coordinate.label;
+    }
+    head.append(coordinateNode);
+  }
+  card.append(head);
+  const snippet=cleanSnippet(hit);
+  if(hit.source==='code'){
+    const pre=element('pre');
+    pre.append(element('code','',snippet));
+    card.append(pre);
+  }else{
+    card.append(element('p','',snippet));
+  }
+  const meta=element('div','hit-meta');
+  meta.append(element('span','hit-rank',`Fused rank ${fusedRank}`));
+  const date=shortDate(hit.ts);
+  if(date){
+    meta.append(element('span','meta-separator','·'));
+    const time=element('time','',date);
+    time.dateTime=hit.ts;
+    meta.append(time);
+  }
+  card.append(meta);
+  return card;
+}
+
+function renderResult(body,query){
   answer.replaceChildren();
   const allHits=Array.isArray(body?.data?.hits)?body.data.hits:[];
-  const hits=uniqueHits(body);
-  const conflicts=Array.isArray(body?.conflicts)?body.conflicts:[];
-  const conflict=chooseConflict(conflicts);
-  const supportClaims=Number(body?.diagnostics?.retrieval?.support_claims_matched);
+  const conflict=chooseConflict(body);
+  const hits=uniqueHits(body,conflict);
+
+  const title=element('div','answer-title');
+  title.append(element('span','',conflict?'Question answered with an open disagreement':'Ranked answer evidence'));
+  title.append(element('h3','',`Recall for “${boundedText(query,220)}”`));
+  answer.append(title);
+
+  if(allHits.length){
+    const lanes=Array.isArray(body?.diagnostics?.retrieval?.lanes)?body.diagnostics.retrieval.lanes:[];
+    const note=element('div','match-note');
+    note.append(element('span','',lanes.includes('lexical')&&lanes.includes('dense')
+      ?'Searched lexical and vector lanes; RRF merged the candidates that cleared their bounds.'
+      :'The strongest bounded retrieval lane supplied these results. Rank is evidence order, not confidence.'));
+    answer.append(note);
+  }
 
   if(conflict){
     const members=Array.isArray(conflict.members)?conflict.members:[];
@@ -328,64 +474,43 @@ function renderResult(body){
     const noun=fullyAttributed?`${count} agent${count===1?'':'s'}`:`${count} conflicting claim${count===1?'':'s'}`;
     const callout=element('section','conflict-callout');
     callout.setAttribute('aria-label','Open conflict');
+    callout.append(element('p','conflict-eyebrow','Retrieved evidence carries an open conflict'));
     callout.append(element('p','conflict-title',`⚠ ${noun} disagree on ${conflictLabel(conflict)}`));
-    const escalated=hasMatchingEscalation(conflict,allHits);
-    callout.append(element('p','conflict-copy',escalated?'The typed same-key conflict remains open → escalated for operator review.':'The typed same-key conflict remains open → operator review required.'));
+    callout.append(element('p','conflict-copy','The typed same-key conflict remains open → operator review required.'));
+    const sides=element('div','conflict-sides');
+    const renderedMembers=members.slice(0,2);
+    renderedMembers.forEach(member=>{
+      const side=element('div','conflict-side');
+      side.append(element('span','conflict-agent',boundedText(readable(member.actor),48)||`Claim ${member.id||''}`));
+      side.append(element('p','conflict-value',memberValue(member)));
+      sides.append(side);
+    });
+    callout.append(sides);
     const coverage=body?.conflict_coverage;
     const scope=coverage?.scope==='tenant_project'?'tenant + project scoped':readable(coverage?.scope)||'project scoped';
-    const sourceLink=Number.isSafeInteger(supportClaims)&&supportClaims>0
-      ?` · ${supportClaims} source-backed typed claim${supportClaims===1?'':'s'} matched`
-      :'';
-    callout.append(element('p','coverage-note',`Typed same-key detector · ${scope}${sourceLink} · ${readable(coverage?.status)||'bounded'} coverage`));
+    const memberDisclosure=renderedMembers.length<count?` · showing ${renderedMembers.length} of ${count} members`:'';
+    callout.append(element('p','coverage-note',`Typed same-key detector · ${scope} · exact retrieved claim/source association · ${readable(coverage?.status)||'bounded'} coverage${memberDisclosure}`));
     answer.append(callout);
   }
 
   if(hits.length){
     const heading=element('div','results-heading');
-    heading.append(element('h3','',conflict?'Supporting memories':'Top recalled memories'));
+    heading.append(element('h3','','Evidence ranked for this question'));
     heading.append(element('span','',`${hits.length} unique result${hits.length===1?'':'s'} shown`));
     answer.append(heading);
     const list=element('div','hit-list');
-    hits.forEach((hit,index)=>{
-      const card=element('article','hit-card');
-      card.append(element('p','',String(hit.snippet||hit.text).trim()));
-      const meta=element('div','hit-meta');
-      meta.append(element('span','hit-rank',`Memory ${index+1}`));
-      meta.append(element('span','meta-separator','·'));
-      meta.append(element('span','',sourceLabel(hit)));
-      const coordinate=hitCoordinate(hit);
-      if(coordinate){
-        meta.append(element('span','meta-separator','·'));
-        const coordinateNode=element('span','hit-coordinate');
-        if(coordinate.href){
-          const link=element('a','',coordinate.label);
-          link.href=coordinate.href;
-          link.target='_blank';
-          link.rel='noopener';
-          coordinateNode.append(link);
-        }else{
-          coordinateNode.textContent=coordinate.label;
-        }
-        meta.append(coordinateNode);
-      }
-      const date=shortDate(hit.ts);
-      if(date){
-        meta.append(element('span','meta-separator','·'));
-        const time=element('time','',date);
-        time.dateTime=hit.ts;
-        meta.append(time);
-      }
-      card.append(meta);
-      list.append(card);
-    });
+    hits.forEach(hit=>list.append(renderHitCard(hit,allHits.indexOf(hit)+1)));
     answer.append(list);
   }else{
-    answer.append(element('div','empty-result','No matching memories were returned. Try a broader question.'));
+    answer.append(element('div','empty-result','No memory cleared the relevance boundary for this question. Try one of the evidence trails or use a more specific project term.'));
   }
+  return conflict;
 }
 
 function renderError(message){
-  answer.replaceChildren(element('div','error-result',message));
+  const error=element('div','error-result',message);
+  error.setAttribute('role','alert');
+  answer.replaceChildren(error);
 }
 
 function setBusy(busy){
@@ -393,6 +518,13 @@ function setBusy(busy){
   submit.disabled=busy;
   sampleButtons.forEach(button=>button.disabled=busy);
   answer.setAttribute('aria-busy',String(busy));
+}
+
+function syncSampleSelection(query){
+  const normalized=String(query||'').trim();
+  sampleButtons.forEach(button=>{
+    button.setAttribute('aria-pressed',String(button.dataset.q===normalized));
+  });
 }
 
 async function parseResponse(response){
@@ -430,8 +562,11 @@ async function loadStatus(){
 sampleButtons.forEach(button=>button.addEventListener('click',()=>{
   if(searching)return;
   input.value=button.dataset.q;
+  syncSampleSelection(input.value);
   form.requestSubmit();
 }));
+
+input.addEventListener('input',()=>syncSampleSelection(input.value));
 
 form.addEventListener('submit',async event=>{
   event.preventDefault();
@@ -439,6 +574,7 @@ form.addEventListener('submit',async event=>{
   const query=input.value.trim();
   if(!query)return;
   input.value=query;
+  syncSampleSelection(query);
   setBusy(true);
   queryMeta.textContent='Searching lexical + vector lanes…';
   answer.replaceChildren(element('div','loading','Checking recalled memories and typed conflicts…'));
@@ -456,14 +592,11 @@ form.addEventListener('submit',async event=>{
     const roundTripMs=Math.max(0,performance.now()-started);
     const lanes=Array.isArray(body?.diagnostics?.retrieval?.lanes)?body.diagnostics.retrieval.lanes:[];
     const retrieval=lanes.length?`${lanes.map(lane=>lane==='dense'?'vector':readable(lane)).join(' + ')} · RRF · `:'';
-    const supportClaims=Number(body?.diagnostics?.retrieval?.support_claims_matched);
-    const supportText=Number.isSafeInteger(supportClaims)&&supportClaims>0
-      ?`${supportClaims} source-backed claim${supportClaims===1?'':'s'} · `
-      :'';
+    const conflict=renderResult(body,query);
+    const conflictText=conflict?' · exact open conflict linked':'';
     queryMeta.textContent=serverMs===null
-      ?`${retrieval}${supportText}${Math.round(roundTripMs)} ms round trip`
-      :`${retrieval}${supportText}retrieved + fused in ${Math.round(serverMs)} ms server time · ${Math.round(roundTripMs)} ms round trip`;
-    renderResult(body);
+      ?`${retrieval}${Math.round(roundTripMs)} ms round trip${conflictText}`
+      :`${retrieval}retrieved + fused in ${Math.round(serverMs)} ms server time · ${Math.round(roundTripMs)} ms round trip${conflictText}`;
     rawResult.textContent=JSON.stringify(body,null,2);
     raw.hidden=false;
   }catch(error){

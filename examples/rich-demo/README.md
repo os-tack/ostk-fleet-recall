@@ -2,7 +2,7 @@
 
 This package deterministically builds a publication-safe Fleet Recall corpus
 without contacting a network or database. It combines section-aware chunks
-from eleven checked-in project, architecture, submission, migration, AWS,
+from twelve checked-in project, architecture, submission, migration, AWS,
 LocalStack, and examples documents, two exact checked-in Rust excerpts, and a
 synthetic twelve-week fleet-operations narrative.
 
@@ -36,7 +36,7 @@ Run the deterministic reproduction test with:
 ./examples/rich-demo/test.sh
 ```
 
-The verifier requires 500–1,000 unique chunks, eleven documentation sources,
+The verifier requires 500–1,000 unique chunks, twelve documentation sources,
 the two exact self-audit code excerpts, 204 operations records across twelve
 weeks, the expected decision and correction mix, zero-based source chunk
 indexes, bounded physical lines and text, only the public ingest allowlist, and
@@ -64,6 +64,6 @@ jq -s '{
 }' examples/rich-demo/generated/rich-demo.ndjson
 ```
 
-This is a local optional demo fixture. It does not replace the three-record
-public seed, and generating or verifying it does not authorize ingestion into
-the live AWS/CockroachDB deployment.
+The verified artifact is baked into the production image as an explicit
+operator seed option. Generating or verifying it locally does not itself
+authorize ingestion into any live AWS/CockroachDB deployment.

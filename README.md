@@ -40,12 +40,16 @@ hackathon slice. Additional canonical Recall actions are also future work.
 
 The submission candidate is live at
 [https://d13zrqfh66r7ub.cloudfront.net](https://d13zrqfh66r7ub.cloudfront.net).
-The schema-2 migration and both idempotent seed tasks completed against
-CockroachDB Cloud. The deployed image contains the three-record bootstrap plus
-a verifier-gated 536-chunk rich corpus. The public status surface reports
-CockroachDB 26.2.5, schema version 2, enabled vector, lexical,
-conflict-membership, and claim-support-chunk indexes, working cosine distance,
-and the pinned 512-dimension embedding model.
+At the revision-6 evidence boundary, the schema-2 migration and both idempotent
+seed tasks completed against CockroachDB Cloud. That immutable deployed image
+contains the three-record bootstrap plus a verifier-gated 536-chunk rich
+corpus. The public status surface reports CockroachDB 26.2.5, schema version 2,
+enabled vector, lexical, conflict-membership, and claim-support-chunk indexes,
+working cosine distance, and the pinned 512-dimension embedding model. The
+current source generator separately emits a deterministic, locally
+verifier-gated 548-row rich corpus; those rows are not claimed as deployed
+until a later immutable image is seeded and observed at its own release
+boundary.
 
 The deployed ARM64 release is source commit
 `ba884f24858a58b09a915e0358e60e7fcc7e2c34`, immutable image tag
