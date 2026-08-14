@@ -9,8 +9,9 @@ use std::time::Duration;
 use anyhow::{Context as _, ensure};
 use async_trait::async_trait;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Request as AxumRequest, State};
 use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -60,6 +61,12 @@ const MAX_DEMO_QUERY_BYTES: usize = 2_000;
 const MAX_DEMO_RESULTS: usize = 20;
 const MAX_DEMO_RESPONSE_BYTES: usize = 512 * 1024;
 const DEMO_DEADLINE: Duration = Duration::from_secs(15);
+const DEMO_HEALTH_CACHE_TTL: Duration = Duration::from_secs(3);
+const DEMO_STATUS_CACHE_TTL: Duration = Duration::from_secs(30);
+const DEMO_STATUS_RATE_BURST: u32 = 12;
+const DEMO_STATUS_RATE_REFILL: Duration = Duration::from_secs(1);
+const DEMO_RECALL_RATE_BURST: u32 = 6;
+const DEMO_RECALL_RATE_REFILL: Duration = Duration::from_secs(5);
 
 const DEPLOYMENT_CONTROLLED_INGEST_KEYS: &[&str] = &[
     "tenant",
@@ -335,6 +342,191 @@ struct DemoState {
     scope: FleetScope,
     capacity: Arc<tokio::sync::Semaphore>,
     health_capacity: Arc<tokio::sync::Semaphore>,
+    rate_limits: Arc<DemoRateLimits>,
+    health_cache: Arc<DemoHealthCache>,
+    status_cache: Arc<DemoStatusCache>,
+    clock: Arc<dyn DemoClock>,
+}
+
+trait DemoClock: Send + Sync {
+    fn now(&self) -> tokio::time::Instant;
+}
+
+struct SystemDemoClock;
+
+impl DemoClock for SystemDemoClock {
+    fn now(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DemoRatePolicy {
+    burst: u32,
+    refill_interval: Duration,
+}
+
+struct DemoRateLimits {
+    status: DemoTokenBucket,
+    recall: DemoTokenBucket,
+}
+
+impl DemoRateLimits {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self::with_policies(
+            now,
+            DemoRatePolicy {
+                burst: DEMO_STATUS_RATE_BURST,
+                refill_interval: DEMO_STATUS_RATE_REFILL,
+            },
+            DemoRatePolicy {
+                burst: DEMO_RECALL_RATE_BURST,
+                refill_interval: DEMO_RECALL_RATE_REFILL,
+            },
+        )
+    }
+
+    fn with_policies(
+        now: tokio::time::Instant,
+        status: DemoRatePolicy,
+        recall: DemoRatePolicy,
+    ) -> Self {
+        Self {
+            status: DemoTokenBucket::new(status, now),
+            recall: DemoTokenBucket::new(recall, now),
+        }
+    }
+}
+
+struct DemoTokenBucket {
+    capacity: f64,
+    refill_interval: Duration,
+    state: std::sync::Mutex<DemoTokenBucketState>,
+}
+
+struct DemoTokenBucketState {
+    tokens: f64,
+    last_refill: tokio::time::Instant,
+}
+
+impl DemoTokenBucket {
+    fn new(policy: DemoRatePolicy, now: tokio::time::Instant) -> Self {
+        assert!(policy.burst > 0, "demo rate-limit burst must be positive");
+        assert!(
+            !policy.refill_interval.is_zero(),
+            "demo rate-limit refill interval must be positive"
+        );
+        let capacity = f64::from(policy.burst);
+        Self {
+            capacity,
+            refill_interval: policy.refill_interval,
+            state: std::sync::Mutex::new(DemoTokenBucketState {
+                tokens: capacity,
+                last_refill: now,
+            }),
+        }
+    }
+
+    fn try_acquire(&self, now: tokio::time::Instant) -> Result<(), Duration> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let elapsed = now.saturating_duration_since(state.last_refill);
+        let replenished = elapsed.as_secs_f64() / self.refill_interval.as_secs_f64();
+        state.tokens = (state.tokens + replenished).min(self.capacity);
+        state.last_refill = now;
+        if state.tokens >= 1.0 {
+            state.tokens -= 1.0;
+            Ok(())
+        } else {
+            Err(self.refill_interval.mul_f64(1.0 - state.tokens))
+        }
+    }
+}
+
+struct DemoStatusCache {
+    ttl: Duration,
+    entry: std::sync::Mutex<Option<CachedDemoStatus>>,
+    refresh: tokio::sync::Semaphore,
+}
+
+struct DemoHealthCache {
+    ttl: Duration,
+    ready_until: std::sync::Mutex<Option<tokio::time::Instant>>,
+    refresh: tokio::sync::Semaphore,
+}
+
+impl DemoHealthCache {
+    fn new(ttl: Duration) -> Self {
+        assert!(!ttl.is_zero(), "demo health cache TTL must be positive");
+        Self {
+            ttl,
+            ready_until: std::sync::Mutex::new(None),
+            refresh: tokio::sync::Semaphore::new(1),
+        }
+    }
+
+    fn ready(&self, now: tokio::time::Instant) -> bool {
+        let mut ready_until = self
+            .ready_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ready_until.is_some_and(|expires_at| expires_at > now) {
+            true
+        } else {
+            *ready_until = None;
+            false
+        }
+    }
+
+    fn store_ready(&self, now: tokio::time::Instant) {
+        let mut ready_until = self
+            .ready_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *ready_until = Some(now + self.ttl);
+    }
+}
+
+impl DemoStatusCache {
+    fn new(ttl: Duration) -> Self {
+        assert!(!ttl.is_zero(), "demo status cache TTL must be positive");
+        Self {
+            ttl,
+            entry: std::sync::Mutex::new(None),
+            refresh: tokio::sync::Semaphore::new(1),
+        }
+    }
+
+    fn get(&self, now: tokio::time::Instant) -> Option<Arc<Value>> {
+        let mut entry = self
+            .entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entry.as_ref().is_some_and(|cached| cached.expires_at > now) {
+            entry.as_ref().map(|cached| cached.value.clone())
+        } else {
+            *entry = None;
+            None
+        }
+    }
+
+    fn store(&self, now: tokio::time::Instant, value: Value) {
+        let mut entry = self
+            .entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *entry = Some(CachedDemoStatus {
+            expires_at: now + self.ttl,
+            value: Arc::new(value),
+        });
+    }
+}
+
+struct CachedDemoStatus {
+    expires_at: tokio::time::Instant,
+    value: Arc<Value>,
 }
 
 #[async_trait]
@@ -367,6 +559,7 @@ const fn default_demo_limit() -> usize {
 
 async fn run_demo(config: FleetConfig, listen: SocketAddr) -> anyhow::Result<()> {
     let (service, store) = build_memory_service(&config).await?;
+    let clock: Arc<dyn DemoClock> = Arc::new(SystemDemoClock);
     let state = DemoState {
         service,
         health: store,
@@ -375,6 +568,10 @@ async fn run_demo(config: FleetConfig, listen: SocketAddr) -> anyhow::Result<()>
         // ALB and ECS can probe concurrently. Keep readiness isolated from
         // public API capacity while bounding overlapping database checks.
         health_capacity: Arc::new(tokio::sync::Semaphore::new(2)),
+        rate_limits: Arc::new(DemoRateLimits::new(clock.now())),
+        health_cache: Arc::new(DemoHealthCache::new(DEMO_HEALTH_CACHE_TTL)),
+        status_cache: Arc::new(DemoStatusCache::new(DEMO_STATUS_CACHE_TTL)),
+        clock,
     };
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -389,8 +586,20 @@ async fn run_demo(config: FleetConfig, listen: SocketAddr) -> anyhow::Result<()>
 
 fn demo_router(state: DemoState) -> Router {
     let api = Router::new()
-        .route("/status", get(demo_status))
-        .route("/recall", post(demo_recall))
+        .route(
+            "/status",
+            get(demo_status).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                demo_status_rate_limit,
+            )),
+        )
+        .route(
+            "/recall",
+            post(demo_recall).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                demo_recall_rate_limit,
+            )),
+        )
         .fallback(demo_api_not_found)
         .method_not_allowed_fallback(demo_api_method_not_allowed);
     Router::new()
@@ -438,6 +647,23 @@ async fn demo_index() -> Response {
 }
 
 async fn demo_health(State(state): State<DemoState>) -> Response {
+    // Health probes are not rate limited: ALB/ECS liveness must not be able to
+    // throttle itself. A short success-only single-flight cache instead bounds
+    // database checks while keeping failures immediately observable.
+    if state.health_cache.ready(state.clock.now()) {
+        return demo_json(StatusCode::OK, json!({ "status": "ready" }));
+    }
+    let Ok(_refresh) = state.health_cache.refresh.try_acquire() else {
+        return demo_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "status": "unavailable", "reason": "readiness check in progress" }),
+        );
+    };
+    // A refresh may have completed between the first cache check and taking
+    // the non-waiting gate.
+    if state.health_cache.ready(state.clock.now()) {
+        return demo_json(StatusCode::OK, json!({ "status": "ready" }));
+    }
     let Ok(_permit) = state.health_capacity.clone().try_acquire_owned() else {
         return demo_json(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -445,7 +671,10 @@ async fn demo_health(State(state): State<DemoState>) -> Response {
         );
     };
     match tokio::time::timeout(Duration::from_secs(5), state.health.ready()).await {
-        Ok(Ok(())) => demo_json(StatusCode::OK, json!({ "status": "ready" })),
+        Ok(Ok(())) => {
+            state.health_cache.store_ready(state.clock.now());
+            demo_json(StatusCode::OK, json!({ "status": "ready" }))
+        }
         Ok(Err(())) | Err(_) => demo_json(
             StatusCode::SERVICE_UNAVAILABLE,
             json!({ "status": "unavailable" }),
@@ -453,8 +682,67 @@ async fn demo_health(State(state): State<DemoState>) -> Response {
     }
 }
 
+async fn demo_status_rate_limit(
+    State(state): State<DemoState>,
+    request: AxumRequest,
+    next: Next,
+) -> Response {
+    if let Err(retry_after) = state.rate_limits.status.try_acquire(state.clock.now()) {
+        return demo_too_many_requests("request rate limit exceeded; retry shortly", retry_after);
+    }
+    next.run(request).await
+}
+
+async fn demo_recall_rate_limit(
+    State(state): State<DemoState>,
+    request: AxumRequest,
+    next: Next,
+) -> Response {
+    if let Err(retry_after) = state.rate_limits.recall.try_acquire(state.clock.now()) {
+        return demo_too_many_requests("request rate limit exceeded; retry shortly", retry_after);
+    }
+    next.run(request).await
+}
+
 async fn demo_status(State(state): State<DemoState>) -> Response {
-    dispatch_demo_recall(state, RecallAction::Status, Map::new()).await
+    let started = std::time::Instant::now();
+    let (response, metric) = cached_demo_status(&state).await;
+    with_demo_server_timing(response, started, metric)
+}
+
+async fn cached_demo_status(state: &DemoState) -> (Response, &'static str) {
+    if let Some(value) = state.status_cache.get(state.clock.now()) {
+        return (
+            demo_json(StatusCode::OK, value.as_ref().clone()),
+            "fleet-recall-cache",
+        );
+    }
+    let Ok(_refresh) = state.status_cache.refresh.try_acquire() else {
+        return (
+            demo_too_many_requests(
+                "status refresh is in progress; retry shortly",
+                Duration::from_secs(1),
+            ),
+            "fleet-recall-overload",
+        );
+    };
+    // A refresh may have completed between the first cache check and taking
+    // the non-waiting gate.
+    if let Some(value) = state.status_cache.get(state.clock.now()) {
+        return (
+            demo_json(StatusCode::OK, value.as_ref().clone()),
+            "fleet-recall-cache",
+        );
+    }
+
+    let response = match execute_demo_recall(state, RecallAction::Status, Map::new()).await {
+        Ok(result) => bounded_demo_value(result).map_or_else(demo_response_too_large, |value| {
+            state.status_cache.store(state.clock.now(), value.clone());
+            demo_json(StatusCode::OK, value)
+        }),
+        Err(response) => response,
+    };
+    (response, "fleet-recall")
 }
 
 async fn demo_recall(
@@ -525,42 +813,83 @@ async fn dispatch_demo_recall(
     action: RecallAction,
     arguments: Map<String, Value>,
 ) -> Response {
+    let started = std::time::Instant::now();
+    let response = match execute_demo_recall(&state, action, arguments).await {
+        Ok(result) => bounded_demo_response(result),
+        Err(response) => response,
+    };
+    with_demo_server_timing(response, started, "fleet-recall")
+}
+
+async fn execute_demo_recall(
+    state: &DemoState,
+    action: RecallAction,
+    arguments: Map<String, Value>,
+) -> Result<RecallResult, Response> {
     let Ok(_permit) = state.capacity.clone().try_acquire_owned() else {
-        return demo_json(
-            StatusCode::TOO_MANY_REQUESTS,
-            json!({ "error": "demo is busy; retry shortly" }),
-        );
+        return Err(demo_too_many_requests(
+            "demo is busy; retry shortly",
+            Duration::from_secs(1),
+        ));
     };
     let request = RecallRequest::new(action, arguments);
-    let started = std::time::Instant::now();
-    let mut response =
-        match tokio::time::timeout(DEMO_DEADLINE, state.service.recall(state.scope, request)).await
-        {
-            Ok(Ok(result)) => bounded_demo_response(result),
-            Ok(Err(ServiceError::InvalidRequest(message))) => {
-                demo_json(StatusCode::BAD_REQUEST, json!({ "error": message }))
-            }
-            Ok(Err(ServiceError::Unavailable(_))) => demo_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                json!({ "error": "memory service temporarily unavailable" }),
-            ),
-            Ok(Err(ServiceError::Internal(_))) => demo_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": "memory operation failed" }),
-            ),
-            Err(_) => demo_json(
-                StatusCode::GATEWAY_TIMEOUT,
-                json!({ "error": "memory read deadline exceeded" }),
-            ),
-        };
+    match tokio::time::timeout(
+        DEMO_DEADLINE,
+        state.service.recall(state.scope.clone(), request),
+    )
+    .await
+    {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(ServiceError::InvalidRequest(message))) => Err(demo_json(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": message }),
+        )),
+        Ok(Err(ServiceError::Unavailable(_))) => Err(demo_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": "memory service temporarily unavailable" }),
+        )),
+        Ok(Err(ServiceError::Internal(_))) => Err(demo_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": "memory operation failed" }),
+        )),
+        Err(_) => Err(demo_json(
+            StatusCode::GATEWAY_TIMEOUT,
+            json!({ "error": "memory read deadline exceeded" }),
+        )),
+    }
+}
+
+fn with_demo_server_timing(
+    mut response: Response,
+    started: std::time::Instant,
+    metric: &str,
+) -> Response {
     let duration_ms = started.elapsed().as_secs_f64() * 1_000.0;
-    if let Ok(value) = HeaderValue::from_str(&format!("fleet-recall;dur={duration_ms:.1}")) {
+    if let Ok(value) = HeaderValue::from_str(&format!("{metric};dur={duration_ms:.1}")) {
         response.headers_mut().insert("server-timing", value);
     }
     response
 }
 
-fn bounded_demo_response(mut result: RecallResult) -> Response {
+fn demo_too_many_requests(message: &str, retry_after: Duration) -> Response {
+    let mut response = demo_json(StatusCode::TOO_MANY_REQUESTS, json!({ "error": message }));
+    let rounded_seconds = retry_after
+        .as_secs()
+        .saturating_add(u64::from(retry_after.subsec_nanos() > 0))
+        .max(1);
+    if let Ok(value) = HeaderValue::from_str(&rounded_seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+fn bounded_demo_response(result: RecallResult) -> Response {
+    bounded_demo_value(result).map_or_else(demo_response_too_large, |value| {
+        demo_json(StatusCode::OK, value)
+    })
+}
+
+fn bounded_demo_value(mut result: RecallResult) -> Option<Value> {
     const MAX_TEXT_CHARS: usize = 2_000;
     if let Some(hits) = result.data.get_mut("hits").and_then(Value::as_array_mut) {
         for hit in hits {
@@ -586,14 +915,18 @@ fn bounded_demo_response(mut result: RecallResult) -> Response {
         "diagnostics": result.diagnostics,
     });
     if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= MAX_DEMO_RESPONSE_BYTES) {
-        demo_json(StatusCode::OK, value)
+        Some(value)
     } else {
         tracing::warn!("bounded demo response exceeded output budget");
-        demo_json(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            json!({ "error": "result is too large; narrow the query or lower its limit" }),
-        )
+        None
     }
+}
+
+fn demo_response_too_large() -> Response {
+    demo_json(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        json!({ "error": "result is too large; narrow the query or lower its limit" }),
+    )
 }
 
 fn demo_json(status: StatusCode, value: Value) -> Response {
@@ -997,6 +1330,10 @@ mod tests {
     #[derive(Default)]
     struct DemoService {
         queries: Mutex<Vec<String>>,
+        status_calls: AtomicUsize,
+        status_failures_remaining: AtomicUsize,
+        status_payload: Mutex<Option<Value>>,
+        status_block: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     }
 
     #[async_trait]
@@ -1007,7 +1344,31 @@ mod tests {
             request: RecallRequest,
         ) -> ServiceResult<RecallResult> {
             if request.action == RecallAction::Status {
-                return Ok(RecallResult::new(json!({ "status": "ready" })));
+                self.status_calls.fetch_add(1, Ordering::SeqCst);
+                let block = self.status_block.lock().unwrap().clone();
+                if let Some(block) = block
+                    && block.acquire().await.is_err()
+                {
+                    return Err(ServiceError::Unavailable(
+                        "injected status blocker closed".into(),
+                    ));
+                }
+                if self
+                    .status_failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(ServiceError::Unavailable("injected status failure".into()));
+                }
+                let value = self
+                    .status_payload
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| json!({ "status": "ready" }));
+                return Ok(RecallResult::new(value));
             }
             let query = request
                 .arguments
@@ -1046,6 +1407,7 @@ mod tests {
     struct BlockingHealth {
         entered: AtomicUsize,
         release: tokio::sync::Semaphore,
+        succeed: bool,
     }
 
     #[async_trait]
@@ -1053,18 +1415,114 @@ mod tests {
         async fn ready(&self) -> Result<(), ()> {
             self.entered.fetch_add(1, Ordering::SeqCst);
             let _permit = self.release.acquire().await.map_err(|_| ())?;
-            Ok(())
+            if self.succeed { Ok(()) } else { Err(()) }
         }
     }
 
-    fn test_demo_router(service: Arc<DemoService>) -> Router {
-        demo_router(DemoState {
+    #[derive(Default)]
+    struct CountingHealth {
+        calls: AtomicUsize,
+        failures_remaining: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DemoHealth for CountingHealth {
+        async fn ready(&self) -> Result<(), ()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct ManualDemoClock {
+        now: Mutex<tokio::time::Instant>,
+    }
+
+    impl ManualDemoClock {
+        fn new() -> Self {
+            Self {
+                now: Mutex::new(tokio::time::Instant::now()),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut now = self.now.lock().unwrap();
+            *now = now.checked_add(duration).expect("test clock overflow");
+        }
+    }
+
+    impl DemoClock for ManualDemoClock {
+        fn now(&self) -> tokio::time::Instant {
+            *self.now.lock().unwrap()
+        }
+    }
+
+    fn test_rate_policy(burst: u32) -> DemoRatePolicy {
+        DemoRatePolicy {
+            burst,
+            refill_interval: Duration::from_millis(1),
+        }
+    }
+
+    fn controlled_demo_state(
+        service: Arc<dyn FleetMemoryService>,
+        clock: Arc<ManualDemoClock>,
+        status_policy: DemoRatePolicy,
+        recall_policy: DemoRatePolicy,
+        status_cache_ttl: Duration,
+    ) -> DemoState {
+        let now = clock.now();
+        let clock: Arc<dyn DemoClock> = clock;
+        DemoState {
             service,
             health: Arc::new(ReadyHealth),
             scope: scope(),
             capacity: Arc::new(tokio::sync::Semaphore::new(2)),
             health_capacity: Arc::new(tokio::sync::Semaphore::new(2)),
-        })
+            rate_limits: Arc::new(DemoRateLimits::with_policies(
+                now,
+                status_policy,
+                recall_policy,
+            )),
+            health_cache: Arc::new(DemoHealthCache::new(DEMO_HEALTH_CACHE_TTL)),
+            status_cache: Arc::new(DemoStatusCache::new(status_cache_ttl)),
+            clock,
+        }
+    }
+
+    fn controlled_demo_router(
+        service: Arc<dyn FleetMemoryService>,
+        clock: Arc<ManualDemoClock>,
+        status_policy: DemoRatePolicy,
+        recall_policy: DemoRatePolicy,
+        status_cache_ttl: Duration,
+    ) -> Router {
+        demo_router(controlled_demo_state(
+            service,
+            clock,
+            status_policy,
+            recall_policy,
+            status_cache_ttl,
+        ))
+    }
+
+    fn test_demo_router(service: Arc<DemoService>) -> Router {
+        controlled_demo_router(
+            service,
+            Arc::new(ManualDemoClock::new()),
+            test_rate_policy(100),
+            test_rate_policy(100),
+            DEMO_STATUS_CACHE_TTL,
+        )
     }
 
     async fn assert_demo_error(
@@ -1080,6 +1538,45 @@ mod tests {
             .expect("demo error must be bounded");
         let value: Value = serde_json::from_slice(&body).expect("demo error must be JSON");
         assert_eq!(value, json!({ "error": expected_message }));
+    }
+
+    async fn demo_status_request(router: &Router) -> Response {
+        router
+            .clone()
+            .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn demo_health_request(router: &Router) -> Response {
+        router
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn demo_recall_request(router: &Router, query: &str) -> Response {
+        router
+            .clone()
+            .oneshot(
+                Request::post("/api/recall")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "query": query, "limit": 8 })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn demo_server_timing(response: &Response) -> &str {
+        response
+            .headers()
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+            .expect("demo service response must expose server timing")
     }
 
     #[test]
@@ -1207,6 +1704,289 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn demo_route_rate_limits_bound_bursts_refill_and_remain_isolated() {
+        let service = Arc::new(DemoService::default());
+        let clock = Arc::new(ManualDemoClock::new());
+        let router = controlled_demo_router(
+            service.clone(),
+            clock.clone(),
+            DemoRatePolicy {
+                burst: 1,
+                refill_interval: Duration::from_millis(500),
+            },
+            DemoRatePolicy {
+                burst: 2,
+                refill_interval: Duration::from_secs(1),
+            },
+            DEMO_STATUS_CACHE_TTL,
+        );
+
+        assert_eq!(
+            demo_recall_request(&router, "first").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            demo_recall_request(&router, "second").await.status(),
+            StatusCode::OK
+        );
+        let limited_recall = demo_recall_request(&router, "limited").await;
+        assert_eq!(limited_recall.headers()[header::RETRY_AFTER], "1");
+        assert_demo_error(
+            limited_recall,
+            StatusCode::TOO_MANY_REQUESTS,
+            "request rate limit exceeded; retry shortly",
+        )
+        .await;
+        assert_eq!(service.queries.lock().unwrap().len(), 2);
+        let malformed_while_limited = router
+            .clone()
+            .oneshot(
+                Request::post("/api/recall")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"query":"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_demo_error(
+            malformed_while_limited,
+            StatusCode::TOO_MANY_REQUESTS,
+            "request rate limit exceeded; retry shortly",
+        )
+        .await;
+
+        // The status policy is independent from the exhausted recall bucket.
+        assert_eq!(demo_status_request(&router).await.status(), StatusCode::OK);
+        let limited_status = demo_status_request(&router).await;
+        assert_eq!(limited_status.headers()[header::RETRY_AFTER], "1");
+        assert_demo_error(
+            limited_status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "request rate limit exceeded; retry shortly",
+        )
+        .await;
+        let health = router
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        clock.advance(Duration::from_millis(500));
+        let refilled_status = demo_status_request(&router).await;
+        assert_eq!(refilled_status.status(), StatusCode::OK);
+        assert!(demo_server_timing(&refilled_status).starts_with("fleet-recall-cache;dur="));
+        assert_eq!(service.status_calls.load(Ordering::SeqCst), 1);
+
+        let still_limited_recall = demo_recall_request(&router, "still limited").await;
+        assert_eq!(still_limited_recall.status(), StatusCode::TOO_MANY_REQUESTS);
+        clock.advance(Duration::from_millis(500));
+        assert_eq!(
+            demo_recall_request(&router, "refilled").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(service.queries.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn demo_capacity_limit_also_returns_a_bounded_retry_after() {
+        let service = Arc::new(DemoService::default());
+        let state = controlled_demo_state(
+            service.clone(),
+            Arc::new(ManualDemoClock::new()),
+            test_rate_policy(10),
+            test_rate_policy(10),
+            DEMO_STATUS_CACHE_TTL,
+        );
+        let held = state
+            .capacity
+            .clone()
+            .try_acquire_many_owned(2)
+            .expect("hold all test API capacity");
+        let router = demo_router(state);
+
+        let response = demo_recall_request(&router, "bounded capacity").await;
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert!(demo_server_timing(&response).starts_with("fleet-recall;dur="));
+        assert_demo_error(
+            response,
+            StatusCode::TOO_MANY_REQUESTS,
+            "demo is busy; retry shortly",
+        )
+        .await;
+        assert!(service.queries.lock().unwrap().is_empty());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn demo_status_cache_serves_concurrent_hits_without_backend_work() {
+        let service = Arc::new(DemoService::default());
+        let router = controlled_demo_router(
+            service.clone(),
+            Arc::new(ManualDemoClock::new()),
+            test_rate_policy(16),
+            test_rate_policy(16),
+            DEMO_STATUS_CACHE_TTL,
+        );
+        let responses =
+            futures::future::join_all((0..8).map(|_| demo_status_request(&router))).await;
+
+        assert_eq!(service.status_calls.load(Ordering::SeqCst), 1);
+        let mut cache_hits = 0;
+        let mut cache_misses = 0;
+        for response in responses {
+            assert_eq!(response.status(), StatusCode::OK);
+            let timing = demo_server_timing(&response);
+            if timing.starts_with("fleet-recall-cache;dur=") {
+                cache_hits += 1;
+            } else {
+                assert!(timing.starts_with("fleet-recall;dur="));
+                cache_misses += 1;
+            }
+            let body = to_bytes(response.into_body(), MAX_DEMO_RESPONSE_BYTES)
+                .await
+                .expect("cached status response must remain bounded");
+            assert!(body.len() <= MAX_DEMO_RESPONSE_BYTES);
+        }
+        assert_eq!(cache_misses, 1);
+        assert_eq!(cache_hits, 7);
+    }
+
+    #[tokio::test]
+    async fn demo_status_slow_failure_rejects_concurrent_misses_without_fanout() {
+        let block = Arc::new(tokio::sync::Semaphore::new(0));
+        let service = Arc::new(DemoService {
+            status_failures_remaining: AtomicUsize::new(1),
+            status_block: Mutex::new(Some(block.clone())),
+            ..DemoService::default()
+        });
+        let router = controlled_demo_router(
+            service.clone(),
+            Arc::new(ManualDemoClock::new()),
+            test_rate_policy(10),
+            test_rate_policy(10),
+            DEMO_STATUS_CACHE_TTL,
+        );
+        let first = tokio::spawn({
+            let router = router.clone();
+            async move { demo_status_request(&router).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.status_calls.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one status refresh must enter the service");
+
+        for _ in 0..2 {
+            let rejected =
+                tokio::time::timeout(Duration::from_millis(100), demo_status_request(&router))
+                    .await
+                    .expect("concurrent status misses must fail without waiting");
+            assert_eq!(rejected.headers()[header::RETRY_AFTER], "1");
+            assert!(demo_server_timing(&rejected).starts_with("fleet-recall-overload;dur="));
+            assert_demo_error(
+                rejected,
+                StatusCode::TOO_MANY_REQUESTS,
+                "status refresh is in progress; retry shortly",
+            )
+            .await;
+        }
+        assert_eq!(service.status_calls.load(Ordering::SeqCst), 1);
+
+        block.add_permits(1);
+        let failed = first.await.unwrap();
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(demo_server_timing(&failed).starts_with("fleet-recall;dur="));
+        assert_eq!(service.status_calls.load(Ordering::SeqCst), 1);
+
+        let recovered = demo_status_request(&router).await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert!(demo_server_timing(&recovered).starts_with("fleet-recall;dur="));
+        assert_eq!(demo_status_request(&router).await.status(), StatusCode::OK);
+        assert_eq!(service.status_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn demo_status_cache_expires_on_the_manual_clock() {
+        let service = Arc::new(DemoService::default());
+        let clock = Arc::new(ManualDemoClock::new());
+        let ttl = Duration::from_secs(2);
+        let router = controlled_demo_router(
+            service.clone(),
+            clock.clone(),
+            test_rate_policy(10),
+            test_rate_policy(10),
+            ttl,
+        );
+
+        let first = demo_status_request(&router).await;
+        assert!(demo_server_timing(&first).starts_with("fleet-recall;dur="));
+        clock.advance(
+            ttl.checked_sub(Duration::from_millis(1))
+                .expect("test status-cache TTL exceeds one millisecond"),
+        );
+        let hit = demo_status_request(&router).await;
+        assert!(demo_server_timing(&hit).starts_with("fleet-recall-cache;dur="));
+        assert_eq!(service.status_calls.load(Ordering::SeqCst), 1);
+
+        clock.advance(Duration::from_millis(1));
+        let expired = demo_status_request(&router).await;
+        assert!(demo_server_timing(&expired).starts_with("fleet-recall;dur="));
+        assert_eq!(service.status_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn demo_status_failures_are_never_cached() {
+        let service = Arc::new(DemoService {
+            status_failures_remaining: AtomicUsize::new(1),
+            ..DemoService::default()
+        });
+        let router = test_demo_router(service.clone());
+
+        let failure = demo_status_request(&router).await;
+        assert!(demo_server_timing(&failure).starts_with("fleet-recall;dur="));
+        assert_demo_error(
+            failure,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "memory service temporarily unavailable",
+        )
+        .await;
+        let recovered = demo_status_request(&router).await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert!(demo_server_timing(&recovered).starts_with("fleet-recall;dur="));
+        let cached = demo_status_request(&router).await;
+        assert_eq!(cached.status(), StatusCode::OK);
+        assert!(demo_server_timing(&cached).starts_with("fleet-recall-cache;dur="));
+        assert_eq!(service.status_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_status_responses_remain_bounded_and_are_not_cached() {
+        let service = Arc::new(DemoService {
+            status_payload: Mutex::new(Some(json!({
+                "status": "ready",
+                "oversized": "x".repeat(MAX_DEMO_RESPONSE_BYTES),
+            }))),
+            ..DemoService::default()
+        });
+        let router = test_demo_router(service.clone());
+
+        for _ in 0..2 {
+            let response = demo_status_request(&router).await;
+            assert!(demo_server_timing(&response).starts_with("fleet-recall;dur="));
+            assert_demo_error(
+                response,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "result is too large; narrow the query or lower its limit",
+            )
+            .await;
+        }
+        assert_eq!(service.status_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn demo_page_leads_with_conflict_story_and_keeps_raw_evidence_collapsed() {
         let router = test_demo_router(Arc::new(DemoService::default()));
         let response = router
@@ -1235,7 +2015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demo_health_is_bounded_without_competing_with_recall_capacity() {
+    async fn demo_health_singleflights_without_competing_with_recall_capacity() {
         let service = Arc::new(DemoService::default());
         let capacity = Arc::new(tokio::sync::Semaphore::new(1));
         let held_recall = capacity.clone().try_acquire_owned().unwrap();
@@ -1243,13 +2023,20 @@ mod tests {
         let health = Arc::new(BlockingHealth {
             entered: AtomicUsize::new(0),
             release: tokio::sync::Semaphore::new(0),
+            succeed: true,
         });
-        let router = demo_router(DemoState {
+        let defaults = controlled_demo_state(
             service,
+            Arc::new(ManualDemoClock::new()),
+            test_rate_policy(100),
+            test_rate_policy(100),
+            DEMO_STATUS_CACHE_TTL,
+        );
+        let router = demo_router(DemoState {
             health: health.clone(),
-            scope: scope(),
             capacity,
             health_capacity,
+            ..defaults
         });
 
         let first_router = router.clone();
@@ -1259,32 +2046,156 @@ mod tests {
                 .await
                 .unwrap()
         });
-        let second_router = router.clone();
-        let second = tokio::spawn(async move {
-            second_router
-                .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
-                .await
-                .unwrap()
-        });
         tokio::time::timeout(Duration::from_secs(1), async {
-            while health.entered.load(Ordering::SeqCst) < 2 {
+            while health.entered.load(Ordering::SeqCst) < 1 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("two readiness probes must have dedicated capacity");
-
-        let third = router
-            .clone()
-            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        .expect("one readiness probe must enter the backend");
+        let second = demo_health_request(&router).await;
+        let third = demo_health_request(&router).await;
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(third.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(health.entered.load(Ordering::SeqCst), 1);
 
-        health.release.add_permits(2);
+        health.release.add_permits(1);
         assert_eq!(first.await.unwrap().status(), StatusCode::OK);
-        assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(demo_health_request(&router).await.status(), StatusCode::OK);
+        assert_eq!(health.entered.load(Ordering::SeqCst), 1);
         drop(held_recall);
+    }
+
+    #[tokio::test]
+    async fn demo_health_slow_failures_reject_concurrent_misses_without_fanout() {
+        let service = Arc::new(DemoService::default());
+        let health = Arc::new(BlockingHealth {
+            entered: AtomicUsize::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            succeed: false,
+        });
+        let defaults = controlled_demo_state(
+            service,
+            Arc::new(ManualDemoClock::new()),
+            test_rate_policy(10),
+            test_rate_policy(10),
+            DEMO_STATUS_CACHE_TTL,
+        );
+        let router = demo_router(DemoState {
+            health: health.clone(),
+            ..defaults
+        });
+        let first = tokio::spawn({
+            let router = router.clone();
+            async move { demo_health_request(&router).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while health.entered.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one health refresh must enter the backend");
+
+        for _ in 0..2 {
+            let rejected =
+                tokio::time::timeout(Duration::from_millis(100), demo_health_request(&router))
+                    .await
+                    .expect("concurrent health misses must fail without waiting");
+            assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = to_bytes(rejected.into_body(), 128)
+                .await
+                .expect("health overload response must be bounded");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({
+                    "status": "unavailable",
+                    "reason": "readiness check in progress",
+                })
+            );
+        }
+        assert_eq!(health.entered.load(Ordering::SeqCst), 1);
+
+        health.release.add_permits(1);
+        assert_eq!(
+            first.await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(health.entered.load(Ordering::SeqCst), 1);
+
+        // The failure was not cached: the next request owns a fresh backend
+        // attempt instead of inheriting the prior failure.
+        health.release.add_permits(1);
+        assert_eq!(
+            demo_health_request(&router).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(health.entered.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn demo_health_success_cache_expires_on_the_manual_clock() {
+        let service = Arc::new(DemoService::default());
+        let health = Arc::new(CountingHealth::default());
+        let clock = Arc::new(ManualDemoClock::new());
+        let defaults = controlled_demo_state(
+            service,
+            clock.clone(),
+            test_rate_policy(10),
+            test_rate_policy(10),
+            DEMO_STATUS_CACHE_TTL,
+        );
+        let router = demo_router(DemoState {
+            health: health.clone(),
+            ..defaults
+        });
+
+        assert_eq!(demo_health_request(&router).await.status(), StatusCode::OK);
+        assert_eq!(demo_health_request(&router).await.status(), StatusCode::OK);
+        clock.advance(
+            DEMO_HEALTH_CACHE_TTL
+                .checked_sub(Duration::from_millis(1))
+                .expect("test health-cache TTL exceeds one millisecond"),
+        );
+        assert_eq!(demo_health_request(&router).await.status(), StatusCode::OK);
+        assert_eq!(health.calls.load(Ordering::SeqCst), 1);
+
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(demo_health_request(&router).await.status(), StatusCode::OK);
+        assert_eq!(health.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn demo_health_failures_are_not_cached() {
+        let service = Arc::new(DemoService::default());
+        let health = Arc::new(CountingHealth {
+            failures_remaining: AtomicUsize::new(1),
+            ..CountingHealth::default()
+        });
+        let defaults = controlled_demo_state(
+            service,
+            Arc::new(ManualDemoClock::new()),
+            test_rate_policy(10),
+            test_rate_policy(10),
+            DEMO_STATUS_CACHE_TTL,
+        );
+        let router = demo_router(DemoState {
+            health: health.clone(),
+            ..defaults
+        });
+
+        let failed = demo_health_request(&router).await;
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let failed_body = to_bytes(failed.into_body(), 128)
+            .await
+            .expect("health failure response must be bounded");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&failed_body).unwrap(),
+            json!({ "status": "unavailable" })
+        );
+        assert_eq!(demo_health_request(&router).await.status(), StatusCode::OK);
+        assert_eq!(demo_health_request(&router).await.status(), StatusCode::OK);
+        assert_eq!(health.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
