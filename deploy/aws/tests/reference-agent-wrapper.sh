@@ -85,20 +85,28 @@ mock_curl() {
             printf '%s\n' '{"status":"ready"}'
             ;;
         https://fleet.example.test/api/status)
-            printf '%s\n' '{
-              "data": {
-                "status":"ready",
-                "database": {
-                  "version":"CockroachDB CCL v26.2.0",
-                  "vector_index_enabled":true,
-                  "lexical_index_enabled":true,
-                  "conflict_membership_index_enabled":true,
-                  "cosine_distance_supported":true,
-                  "schema_version":12
-                },
-                "embedding_model":"minishlab/potion-retrieval-32M",
-                "embedding_dimension":512
-              }
+            claim_support_chunk_index_enabled=true
+            if [ "$mock_scenario" = claim-support-index-disabled ]; then
+                claim_support_chunk_index_enabled=false
+            fi
+            jq -cn \
+                --argjson claim_support_chunk_index_enabled \
+                    "$claim_support_chunk_index_enabled" '{
+                data: {
+                    status: "ready",
+                    database: {
+                        version: "CockroachDB CCL v26.2.0",
+                        vector_index_enabled: true,
+                        lexical_index_enabled: true,
+                        conflict_membership_index_enabled: true,
+                        claim_support_chunk_index_enabled:
+                            $claim_support_chunk_index_enabled,
+                        cosine_distance_supported: true,
+                        schema_version: 2
+                    },
+                    embedding_model: "minishlab/potion-retrieval-32M",
+                    embedding_dimension: 512
+                }
             }'
             ;;
         https://fleet.example.test/api/recall)
@@ -337,8 +345,9 @@ jq -e '
         vector_index_enabled: true,
         lexical_index_enabled: true,
         conflict_membership_index_enabled: true,
+        claim_support_chunk_index_enabled: true,
         cosine_distance_supported: true,
-        schema_version: 12,
+        schema_version: 2,
         embedding_dimension: 512
     }
 ' "$test_root/success.json" >/dev/null
@@ -347,6 +356,16 @@ jq -e '
 jq -e '.verified == true and .validation_only == true and
     .receipts == ["reference-agent"]' \
     "$test_root/publication-validation.json" >/dev/null
+jq '.public_demo.cockroachdb_capabilities.claim_support_chunk_index_enabled = false' \
+    "$test_root/success.json" > "$test_root/disabled-index-receipt.json"
+if "$publication_verifier" "$test_root/disabled-index-receipt.json" \
+    > "$test_root/disabled-index-receipt.out" \
+    2> "$test_root/disabled-index-receipt.err"; then
+    echo "publication verifier accepted a disabled claim-support chunk index" >&2
+    exit 1
+fi
+grep -F 'failed its complete schema and correlation contract' \
+    "$test_root/disabled-index-receipt.err" >/dev/null
 if grep -Eq 'arn:|[0-9]{12}' "$test_root/success.json"; then
     echo "successful evidence leaked an AWS ARN or account ID" >&2
     exit 1
@@ -367,6 +386,18 @@ if run_mock "$test_root/insecure-demo" insecure-demo mock-run-http \
     exit 1
 fi
 grep -F 'demo_url must be an HTTPS URL' "$test_root/insecure-demo.err" >/dev/null
+
+disabled_index_state=$test_root/claim-support-index-disabled
+if run_mock "$disabled_index_state" claim-support-index-disabled mock-run-index \
+    > "$test_root/claim-support-index-disabled.out" \
+    2> "$test_root/claim-support-index-disabled.err"; then
+    echo "wrapper accepted a disabled claim-support chunk index" >&2
+    exit 1
+fi
+grep -F 'status did not prove the required CockroachDB retrieval capabilities' \
+    "$test_root/claim-support-index-disabled.err" >/dev/null
+[ "$(sed -n '1p' "$disabled_index_state/curl-count")" = 2 ]
+[ ! -f "$disabled_index_state/run-count" ]
 
 failure_state=$test_root/task-failure
 if run_mock "$failure_state" task-failure mock-run-2 \

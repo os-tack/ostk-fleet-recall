@@ -177,8 +177,9 @@ jq -cn '{
             vector_index_enabled: true,
             lexical_index_enabled: true,
             conflict_membership_index_enabled: true,
+            claim_support_chunk_index_enabled: true,
             cosine_distance_supported: true,
-            schema_version: 1,
+            schema_version: 2,
             embedding_dimension: 512
         }
     }
@@ -187,6 +188,16 @@ jq -cn '{
 "$verifier" "$reference" > "$test_root/reference-validation.json"
 jq -e '.verified == true and .receipts == ["reference-agent"]' \
     "$test_root/reference-validation.json" >/dev/null
+jq 'del(.public_demo.cockroachdb_capabilities.claim_support_chunk_index_enabled)' \
+    "$reference" > "$test_root/missing-index-capability.json"
+if "$verifier" "$test_root/missing-index-capability.json" \
+    > "$test_root/missing-index-capability.out" \
+    2> "$test_root/missing-index-capability.err"; then
+    echo "publication verifier accepted a missing claim-support chunk index" >&2
+    exit 1
+fi
+grep -F 'failed its complete schema and correlation contract' \
+    "$test_root/missing-index-capability.err" >/dev/null
 
 success_state=$test_root/success
 mkdir -p "$success_state"

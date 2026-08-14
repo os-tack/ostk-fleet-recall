@@ -133,6 +133,7 @@ if ! jq -e '
         type == "string" and (ascii_downcase | contains("cockroachdb"))) and
     (.public_demo.embedding_model | type == "string" and length > 0) and
     (.public_demo.cockroachdb_capabilities | exact_keys([
+        "claim_support_chunk_index_enabled",
         "conflict_membership_index_enabled", "cosine_distance_supported",
         "embedding_dimension", "lexical_index_enabled", "schema_version",
         "vector_index_enabled"
@@ -140,8 +141,9 @@ if ! jq -e '
     .public_demo.cockroachdb_capabilities.vector_index_enabled == true and
     .public_demo.cockroachdb_capabilities.lexical_index_enabled == true and
     .public_demo.cockroachdb_capabilities.conflict_membership_index_enabled == true and
+    .public_demo.cockroachdb_capabilities.claim_support_chunk_index_enabled == true and
     .public_demo.cockroachdb_capabilities.cosine_distance_supported == true and
-    (.public_demo.cockroachdb_capabilities.schema_version | positive_integer) and
+    .public_demo.cockroachdb_capabilities.schema_version == 2 and
     .public_demo.cockroachdb_capabilities.embedding_dimension == 512
 ' "$reference_receipt" >/dev/null; then
     fail "reference-agent receipt failed its complete schema and correlation contract"

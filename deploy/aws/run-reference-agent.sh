@@ -97,7 +97,6 @@ if ! status=$(curl_get "$demo_url/api/status"); then
     fail "public demo status probe failed before the reference-agent run: $demo_url/api/status"
 fi
 if ! status_receipt=$(printf '%s' "$status" | jq -ce '
-    def positive_integer: type == "number" and . > 0 and . == floor;
     select(
         .data.status == "ready" and
         (.data.database.version | type == "string" and
@@ -105,8 +104,9 @@ if ! status_receipt=$(printf '%s' "$status" | jq -ce '
         .data.database.vector_index_enabled == true and
         .data.database.lexical_index_enabled == true and
         .data.database.conflict_membership_index_enabled == true and
+        .data.database.claim_support_chunk_index_enabled == true and
         .data.database.cosine_distance_supported == true and
-        (.data.database.schema_version | positive_integer) and
+        .data.database.schema_version == 2 and
         (.data.embedding_model | type == "string" and length > 0) and
         .data.embedding_dimension == 512
     ) |
@@ -116,6 +116,8 @@ if ! status_receipt=$(printf '%s' "$status" | jq -ce '
         lexical_index_enabled: .data.database.lexical_index_enabled,
         conflict_membership_index_enabled:
             .data.database.conflict_membership_index_enabled,
+        claim_support_chunk_index_enabled:
+            .data.database.claim_support_chunk_index_enabled,
         cosine_distance_supported: .data.database.cosine_distance_supported,
         schema_version: .data.database.schema_version,
         embedding_model: .data.embedding_model,
