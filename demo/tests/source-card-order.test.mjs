@@ -34,9 +34,11 @@ vm.runInContext(
 
 const plain=value=>JSON.parse(JSON.stringify(value));
 
-const markdownContext=vm.createContext({String,URL});
+const markdownContext=vm.createContext({String,URL,encodeURIComponent});
 vm.runInContext(
   [
+    'repositoryPathAllowed',
+    'repositorySourceContext',
     'safeMarkdownHref',
     'appendMarkdownText',
     'inlineMarkdownTokens',
@@ -58,10 +60,12 @@ const fakeDocument={
   createElement:tag=>new FakeNode(String(tag).toUpperCase()),
   createTextNode:value=>new FakeNode(null,String(value)),
 };
-const markdownDomContext=vm.createContext({String,URL,document:fakeDocument});
+const markdownDomContext=vm.createContext({String,URL,encodeURIComponent,document:fakeDocument});
 vm.runInContext(
   [
     'element',
+    'repositoryPathAllowed',
+    'repositorySourceContext',
     'safeMarkdownHref',
     'appendMarkdownText',
     'inlineMarkdownTokens',
@@ -75,7 +79,14 @@ function descendantTags(node){
 }
 
 const coordinateContext=vm.createContext({String,Number,encodeURIComponent});
-vm.runInContext(extractFunction('hitCoordinate'),coordinateContext);
+vm.runInContext(
+  [
+    'repositoryPathAllowed',
+    'repositorySourceContext',
+    'hitCoordinate',
+  ].map(extractFunction).join('\n'),
+  coordinateContext,
+);
 
 const hit=(chunk_id,snippet,extra={},source='markdown')=>({
   chunk_id,
@@ -108,6 +119,9 @@ test('untrusted markdown HTML, images, and non-HTTPS links stay literal text',()
   const tokens=plain(markdownContext.inlineMarkdownTokens(unsafe));
   assert.deepEqual(tokens,[{type:'text',value:unsafe}]);
   assert.equal(markdownContext.safeMarkdownHref('http://example.com/docs'),null);
+  assert.equal(markdownContext.safeMarkdownHref('https:example.com/docs'),null);
+  assert.equal(markdownContext.safeMarkdownHref('https:\\example.com/docs'),null);
+  assert.equal(markdownContext.safeMarkdownHref('https://exam\nple.com/docs'),null);
   assert.equal(markdownContext.safeMarkdownHref('https://user@example.com/docs'),null);
   assert.equal(markdownContext.safeMarkdownHref('not a URL'),null);
 
@@ -125,6 +139,66 @@ test('safe inline markdown emits only the allowlisted DOM elements',()=>{
   assert.equal(link.href,'https://example.com/docs');
   assert.equal(link.target,'_blank');
   assert.equal(link.rel,'noopener noreferrer nofollow');
+});
+
+test('HTTPS autolinks and immutable repository-relative links render safely',()=>{
+  const revision='b'.repeat(40);
+  const source={
+    source_id:'docs/VIDEO_DEMO.md',
+    extra:{source_revision:revision},
+  };
+  const tokens=plain(markdownContext.inlineMarkdownTokens(
+    'See [ARCHITECTURE.md](ARCHITECTURE.md) and <https://example.com/docs>.',
+    source,
+  ));
+  assert.deepEqual(tokens,[
+    {type:'text',value:'See '},
+    {
+      type:'link',
+      value:'ARCHITECTURE.md',
+      href:`https://github.com/os-tack/ostk-fleet-recall/blob/${revision}/docs/ARCHITECTURE.md`,
+    },
+    {type:'text',value:' and '},
+    {type:'link',value:'https://example.com/docs',href:'https://example.com/docs'},
+    {type:'text',value:'.'},
+  ]);
+
+  const rendered=markdownDomContext.renderInlineMarkdown(
+    '[ARCHITECTURE.md](ARCHITECTURE.md) <https://example.com/docs>',
+    source,
+  );
+  assert.deepEqual(descendantTags(rendered),['P','A','A']);
+  assert.ok(rendered.children[0].href.includes(`/blob/${revision}/docs/ARCHITECTURE.md`));
+});
+
+test('repository-relative links fail closed on unsafe context or destination',()=>{
+  const revision='c'.repeat(40);
+  const source={source_id:'docs/VIDEO_DEMO.md',extra:{source_revision:revision}};
+  const unsafe='[up](../README.md) [root](/README.md) [network](//evil.example/x) '
+    +'[encoded](%2e%2e/README.md) [query](ARCHITECTURE.md?raw=1) '
+    +'[scheme](javascript:alert(1)) [credentials](https://user@example.com/x)';
+  assert.deepEqual(
+    plain(markdownContext.inlineMarkdownTokens(unsafe,source)),
+    [{type:'text',value:unsafe}],
+  );
+
+  for(const unsafeSource of [
+    {source_id:'docs/VIDEO_DEMO.md',extra:{source_revision:'0'.repeat(40)}},
+    {source_id:'docs/../VIDEO_DEMO.md',extra:{source_revision:revision}},
+    {source_id:'conversation/not-a-repository-path',extra:{source_revision:revision}},
+  ]){
+    const markdown='[ARCHITECTURE.md](ARCHITECTURE.md)';
+    assert.deepEqual(
+      plain(markdownContext.inlineMarkdownTokens(markdown,unsafeSource)),
+      [{type:'text',value:markdown}],
+    );
+  }
+
+  const nonHttps='<http://example.com> <javascript:alert(1)> <data:text/html,boom>';
+  assert.deepEqual(
+    plain(markdownContext.inlineMarkdownTokens(nonHttps,source)),
+    [{type:'text',value:nonHttps}],
+  );
 });
 
 test('malformed inline markdown remains literal and rendering input stays bounded',()=>{
@@ -294,7 +368,7 @@ test('presentation language stays tied to exact evidence',()=>{
   assert.doesNotMatch(page,/Sources behind this disagreement/);
   assert.doesNotMatch(page,/hasMatchingEscalation/);
   assert.doesNotMatch(page,/escalated for operator review/);
-  assert.match(page,/else if\(hit[.]source==='markdown'\)\{\s*card[.]append\(renderInlineMarkdown\(snippet\)\)/);
+  assert.match(page,/else if\(hit[.]source==='markdown'\)\{\s*card[.]append\(renderInlineMarkdown\(snippet,hit\)\)/);
   assert.match(page,/if\(hit[.]source==='code'\)\{\s*const pre=element\('pre'\)/);
   assert.doesNotMatch(page,/innerHTML/);
 });

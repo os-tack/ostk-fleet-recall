@@ -283,48 +283,84 @@ function sourceLabel(hit){
   return readable(hit.source)||'Fleet memory';
 }
 
-function hitCoordinate(hit){
-  const claimId=Number(hit?.extra?.claim_id);
-  if(Number.isSafeInteger(claimId)&&claimId>0)return {label:`Claim #${claimId}`,href:null};
+function repositoryPathAllowed(value){
+  const path=String(value||'');
+  return /^(?:README\.md|docs\/[A-Za-z0-9._/-]+|deploy\/[A-Za-z0-9._/-]+|examples\/[A-Za-z0-9._/-]+|src\/[A-Za-z0-9._/-]+\.rs)$/.test(path)
+    &&path.split('/').every(segment=>segment&&segment!=='.'&&segment!=='..');
+}
+
+function repositorySourceContext(hit){
   const sourceId=String(hit?.source_id||'').trim();
   if(!sourceId||sourceId.length>256)return null;
   const richDocumentPrefix='rich-demo/docs/';
   const repositoryCandidate=sourceId.startsWith(richDocumentPrefix)
     ?sourceId.slice(richDocumentPrefix.length)
     :sourceId;
-  const repositoryPath=/^(?:README\.md|docs\/[A-Za-z0-9._/-]+|deploy\/[A-Za-z0-9._/-]+|examples\/[A-Za-z0-9._/-]+|src\/[A-Za-z0-9._/-]+\.rs)$/.test(repositoryCandidate)
-    && !repositoryCandidate.split('/').includes('..');
-  const displayValue=repositoryPath?repositoryCandidate:sourceId;
   const revision=String(hit?.extra?.source_revision||'');
+  return {
+    sourceId,
+    repositoryPath:repositoryPathAllowed(repositoryCandidate)?repositoryCandidate:null,
+    immutableRevision:/^[0-9a-f]{40}$/.test(revision)&&!/^[0]+$/.test(revision)?revision:null,
+  };
+}
+
+function hitCoordinate(hit){
+  const claimId=Number(hit?.extra?.claim_id);
+  if(Number.isSafeInteger(claimId)&&claimId>0)return {label:`Claim #${claimId}`,href:null};
+  const source=repositorySourceContext(hit);
+  if(!source)return null;
+  const displayValue=source.repositoryPath||source.sourceId;
   const lineStart=hit?.extra?.source_line_start;
   const lineEnd=hit?.extra?.source_line_end;
-  const immutableRevision=/^[0-9a-f]{40}$/.test(revision)&&!/^[0]+$/.test(revision);
   const exactLines=Number.isSafeInteger(lineStart)&&lineStart>0&&lineStart<=1_000_000
     &&Number.isSafeInteger(lineEnd)&&lineEnd>=lineStart&&lineEnd<=1_000_000
     &&lineEnd-lineStart<=10_000;
-  const lineLabel=repositoryPath&&immutableRevision&&exactLines
+  const lineLabel=source.repositoryPath&&source.immutableRevision&&exactLines
     ?`:L${lineStart}${lineEnd===lineStart?'':`-L${lineEnd}`}`:'';
   const displayPath=displayValue.length>80?`${displayValue.slice(0,79)}…`:displayValue;
   const display=`${displayPath}${lineLabel}`;
-  const repositoryRevision=immutableRevision&&exactLines?revision:'main';
-  const lineFragment=immutableRevision&&exactLines
+  const repositoryRevision=source.immutableRevision&&exactLines?source.immutableRevision:'main';
+  const lineFragment=source.immutableRevision&&exactLines
     ?`#L${lineStart}${lineEnd===lineStart?'':`-L${lineEnd}`}`:'';
-  const href=repositoryPath
-    ?`https://github.com/os-tack/ostk-fleet-recall/blob/${repositoryRevision}/${repositoryCandidate.split('/').map(encodeURIComponent).join('/')}${lineFragment}`
+  const href=source.repositoryPath
+    ?`https://github.com/os-tack/ostk-fleet-recall/blob/${repositoryRevision}/${source.repositoryPath.split('/').map(encodeURIComponent).join('/')}${lineFragment}`
     :null;
   return {label:display,href};
 }
 
-function safeMarkdownHref(value){
+function safeMarkdownHref(value,hit=null){
   const candidate=String(value||'').trim();
-  if(!candidate)return null;
-  try{
-    const parsed=new URL(candidate);
-    if(parsed.protocol!=='https:'||parsed.username||parsed.password)return null;
-    return parsed.href;
-  }catch(_){
-    return null;
+  if(!candidate||candidate.length>512||candidate.includes('\\')
+    ||/[\u0000-\u0020\u007f]/.test(candidate))return null;
+  if(/^[A-Za-z][A-Za-z0-9+.-]*:/.test(candidate)){
+    if(!/^https:\/\//i.test(candidate))return null;
+    try{
+      const parsed=new URL(candidate);
+      if(parsed.protocol!=='https:'||parsed.username||parsed.password)return null;
+      return parsed.href;
+    }catch(_){
+      return null;
+    }
   }
+  const source=repositorySourceContext(hit);
+  if(!source?.repositoryPath||!source.immutableRevision)return null;
+  if(candidate.startsWith('/')||candidate.startsWith('//')
+    ||candidate.includes('%')||candidate.includes('?'))return null;
+  const hashIndex=candidate.indexOf('#');
+  const relativePath=hashIndex<0?candidate:candidate.slice(0,hashIndex);
+  const fragment=hashIndex<0?'':candidate.slice(hashIndex+1);
+  if(fragment&&!/^[A-Za-z0-9][A-Za-z0-9._~-]{0,200}$/.test(fragment))return null;
+  const base=source.repositoryPath.split('/').slice(0,-1);
+  const target=[];
+  for(const segment of relativePath.split('/')){
+    if(!segment||segment==='.')continue;
+    if(segment==='..'||!/^[A-Za-z0-9._-]+$/.test(segment))return null;
+    target.push(segment);
+  }
+  const resolved=target.length?[...base,...target].join('/'):source.repositoryPath;
+  if(!repositoryPathAllowed(resolved))return null;
+  const encodedPath=resolved.split('/').map(encodeURIComponent).join('/');
+  return `https://github.com/os-tack/ostk-fleet-recall/blob/${source.immutableRevision}/${encodedPath}${fragment?`#${fragment}`:''}`;
 }
 
 function appendMarkdownText(tokens,value){
@@ -334,12 +370,22 @@ function appendMarkdownText(tokens,value){
   else tokens.push({type:'text',value});
 }
 
-function inlineMarkdownTokens(value){
+function inlineMarkdownTokens(value,hit=null){
   const characters=[...String(value||'')];
   const text=`${characters.slice(0,2000).join('')}${characters.length>2000?'…':''}`;
   const tokens=[];
   let cursor=0;
   while(cursor<text.length){
+    if(text[cursor]==='<'){
+      const end=text.indexOf('>',cursor+1);
+      const label=end<0?'':text.slice(cursor+1,end);
+      const href=/^https:\/\/\S+$/i.test(label)?safeMarkdownHref(label):null;
+      if(href){
+        tokens.push({type:'link',value:label,href});
+        cursor=end+1;
+        continue;
+      }
+    }
     if(text.startsWith('![',cursor)){
       const labelEnd=text.indexOf('](',cursor+2);
       const destinationEnd=labelEnd<0?-1:text.indexOf(')',labelEnd+2);
@@ -381,7 +427,7 @@ function inlineMarkdownTokens(value){
       const destinationEnd=labelEnd<0?-1:text.indexOf(')',labelEnd+2);
       if(labelEnd>cursor+1&&destinationEnd>=0){
         const raw=text.slice(cursor,destinationEnd+1);
-        const href=safeMarkdownHref(text.slice(labelEnd+2,destinationEnd));
+        const href=safeMarkdownHref(text.slice(labelEnd+2,destinationEnd),hit);
         if(href){
           tokens.push({type:'link',value:text.slice(cursor+1,labelEnd),href});
         }else{
@@ -397,9 +443,9 @@ function inlineMarkdownTokens(value){
   return tokens;
 }
 
-function renderInlineMarkdown(value){
+function renderInlineMarkdown(value,hit=null){
   const paragraph=element('p','markdown-body');
-  inlineMarkdownTokens(value).forEach(token=>{
+  inlineMarkdownTokens(value,hit).forEach(token=>{
     if(token.type==='text'){
       paragraph.append(document.createTextNode(token.value));
       return;
@@ -551,7 +597,7 @@ function renderHitCard(hit,fusedRank){
     pre.append(element('code','',snippet));
     card.append(pre);
   }else if(hit.source==='markdown'){
-    card.append(renderInlineMarkdown(snippet));
+    card.append(renderInlineMarkdown(snippet,hit));
   }else{
     card.append(element('p','',snippet));
   }
