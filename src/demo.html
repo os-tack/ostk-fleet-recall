@@ -91,6 +91,8 @@
     .hit-meta { display:flex; gap:.45rem; align-items:center; flex-wrap:wrap; margin-top:.62rem; color:var(--muted); font-size:.69rem; }
     .hit-rank { color:var(--cyan); }
     .meta-separator { color:#536176; }
+    .hit-coordinate { overflow-wrap:anywhere; }
+    .hit-coordinate a { color:#b9ddff; text-underline-offset:.18em; }
     .empty-result,.error-result { border:1px solid var(--line); border-radius:11px; padding:1rem; color:var(--muted); background:#0c1119; }
     .error-result { border-color:#6f3838; color:#ffc7c2; background:#211313; }
     details { margin-top:.85rem; border-top:1px solid var(--line); padding-top:.65rem; }
@@ -102,6 +104,7 @@
     .facts li { padding:.78rem 0; border-bottom:1px solid var(--line); color:#dbe3ed; font-size:.86rem; }
     .facts li:last-child { border-bottom:0; }
     .facts strong { display:block; color:var(--amber); font-size:.7rem; text-transform:uppercase; letter-spacing:.09em; margin-bottom:.15rem; }
+    .facts code { color:#c5e9f3; overflow-wrap:anywhere; }
     .read-only { display:flex; gap:.62rem; align-items:flex-start; margin-top:1rem; color:var(--muted); font-size:.76rem; }
     .lock { color:var(--green); }
     footer { color:var(--muted); font-size:.78rem; margin-top:1.6rem; }
@@ -177,6 +180,7 @@
         <li><strong>Retrieval</strong>Lexical + C-SPANN vector lanes, reciprocal-rank fused</li>
         <li><strong>Isolation</strong>Tenant and project scope is trusted server configuration</li>
         <li><strong>Durability</strong>Shared memory survives individual agent and task replacement</li>
+        <li><strong>Verified replacement</strong><code>devpost-final-20260814T021819Z</code> replaced the full serving task set; the same cited action and escalation remained recallable (pre-polish rev3 evidence)</li>
         <li><strong>Runtime</strong>AWS ECS/Fargate backed by CockroachDB Cloud</li>
       </ul>
       <div class="read-only"><span class="lock" aria-hidden="true">●</span><span>This public experience is bounded and read-only. Writes stay behind the canonical MCP <code>remember</code> tool.</span></div>
@@ -214,6 +218,25 @@ function sourceLabel(hit){
   if(hit.source==='markdown')return 'Documentation memory';
   if(hit.source==='conversation')return 'Conversation memory';
   return readable(hit.source)||'Fleet memory';
+}
+
+function hitCoordinate(hit){
+  const claimId=Number(hit?.extra?.claim_id);
+  if(Number.isSafeInteger(claimId)&&claimId>0)return {label:`Claim #${claimId}`,href:null};
+  const sourceId=String(hit?.source_id||'').trim();
+  if(!sourceId||sourceId.length>256)return null;
+  const richDocumentPrefix='rich-demo/docs/';
+  const repositoryCandidate=sourceId.startsWith(richDocumentPrefix)
+    ?sourceId.slice(richDocumentPrefix.length)
+    :sourceId;
+  const repositoryPath=/^(?:README\.md|docs\/[A-Za-z0-9._/-]+|deploy\/[A-Za-z0-9._/-]+|examples\/[A-Za-z0-9._/-]+)$/.test(repositoryCandidate)
+    && !repositoryCandidate.split('/').includes('..');
+  const displayValue=repositoryPath?repositoryCandidate:sourceId;
+  const display=displayValue.length>80?`${displayValue.slice(0,79)}…`:displayValue;
+  const href=repositoryPath
+    ?`https://github.com/os-tack/ostk-fleet-recall/blob/main/${repositoryCandidate.split('/').map(encodeURIComponent).join('/')}`
+    :null;
+  return {label:display,href};
 }
 
 function shortDate(value){
@@ -309,6 +332,21 @@ function renderResult(body){
       meta.append(element('span','hit-rank',`Memory ${index+1}`));
       meta.append(element('span','meta-separator','·'));
       meta.append(element('span','',sourceLabel(hit)));
+      const coordinate=hitCoordinate(hit);
+      if(coordinate){
+        meta.append(element('span','meta-separator','·'));
+        const coordinateNode=element('span','hit-coordinate');
+        if(coordinate.href){
+          const link=element('a','',coordinate.label);
+          link.href=coordinate.href;
+          link.target='_blank';
+          link.rel='noopener';
+          coordinateNode.append(link);
+        }else{
+          coordinateNode.textContent=coordinate.label;
+        }
+        meta.append(coordinateNode);
+      }
       const date=shortDate(hit.ts);
       if(date){
         meta.append(element('span','meta-separator','·'));

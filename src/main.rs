@@ -2011,6 +2011,9 @@ mod tests {
         assert!(page.contains("View raw evidence envelope"));
         assert!(page.contains("response.headers.get('server-timing')"));
         assert!(page.contains("document.createElement(tag)"));
+        assert!(page.contains("Verified replacement"));
+        assert!(page.contains("rich-demo/docs/"));
+        assert!(page.contains("https://github.com/os-tack/ostk-fleet-recall/blob/main/"));
         assert!(!page.contains("innerHTML"));
     }
 
