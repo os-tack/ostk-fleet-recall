@@ -81,6 +81,9 @@ jobs:
             test "$(s5cmd version)" = "v2.3.0-991c9fb" &&
             test ! -e /usr/local/bin/aws &&
             test -x /usr/bin/curl &&
+            test -r /opt/ostk/demo/demo.ndjson &&
+            test -r /opt/ostk/demo/rich-demo.ndjson &&
+            test "$(wc -l </opt/ostk/demo/rich-demo.ndjson)" -ge 500 &&
             test -r /usr/share/licenses/s5cmd/s5cmd-LICENSE &&
             test -r /usr/share/licenses/s5cmd/go-LICENSE &&
             test -r /usr/share/licenses/s5cmd/vendor/github.com/aws/aws-sdk-go/LICENSE.txt &&
@@ -123,6 +126,9 @@ jobs:
       - name: Test the AWS reference-agent evidence wrapper
         working-directory: .
         run: ./deploy/aws/tests/reference-agent-wrapper.sh
+      - name: Test the AWS corpus seed selector
+        working-directory: .
+        run: ./deploy/aws/tests/seed-wrapper.sh
       - name: Test AWS replacement and publication evidence wrappers
         working-directory: .
         run: ./deploy/aws/tests/replacement-proof.sh

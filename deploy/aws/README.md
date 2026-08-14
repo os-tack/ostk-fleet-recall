@@ -156,16 +156,19 @@ After migration and runtime-user grants, run the idempotent one-off seed task:
 
 ```bash
 ./deploy/aws/run-seed.sh
+./deploy/aws/run-seed.sh --rich-demo
 aws logs tail "$(terraform -chdir=deploy/aws output -raw log_group_name)" \
   --region us-east-1 --since 30m
 ```
 
-The production image contains only the repository's three-record synthetic
-`examples/demo.ndjson` at `/opt/ostk/demo/demo.ndjson`; it contains no tenant
-authority or secret. The seed task uses the least-privilege runtime database
-secret, loads and verifies the same pinned S3 model, and invokes the trusted
-`ingest` CLI. Stable source coordinates make rerunning this task safe. Do not
-start the public service until this task exits zero.
+The production image contains both the repository's three-record bootstrap
+corpus and the deterministic, verifier-gated rich corpus. Neither contains
+tenant authority or secrets. The default invocation ingests
+`/opt/ostk/demo/demo.ndjson`; `--rich-demo` selects
+`/opt/ostk/demo/rich-demo.ndjson`. Both one-off tasks use the least-privilege
+runtime database secret, load and verify the same pinned S3 model, and invoke
+the trusted `ingest` CLI. Stable source coordinates make rerunning either task
+safe. Do not start the public service until both tasks exit zero.
 
 ## 6. Start and verify the demo
 
