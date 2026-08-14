@@ -58,7 +58,7 @@ variables {
   image_tag              = "git-0123456789ab"
 }
 
-run "dormant_http_bootstrap" {
+run "dormant_cloudfront_bootstrap" {
   command = plan
 
   assert {
@@ -134,17 +134,25 @@ run "dormant_http_bootstrap" {
   }
 
   assert {
-    condition     = startswith(output.demo_url, "http://")
-    error_message = "a certificate-free bootstrap must advertise HTTP, not false TLS"
+    condition = (
+      var.enable_cloudfront &&
+      length(var.alb_ingress_cidrs) == 0 &&
+      startswith(output.demo_url, "https://") &&
+      length(aws_cloudfront_distribution.app) == 1 &&
+      output.cloudfront_distribution_id == "EDFDVBD6EXAMPLE"
+    )
+    error_message = "omitting front-door variables must default to the generated HTTPS CloudFront endpoint"
   }
 
   assert {
     condition = (
-      length(aws_cloudfront_distribution.app) == 0 &&
-      output.cloudfront_distribution_id == null &&
-      aws_lb_listener.http[0].default_action[0].type == "forward"
+      length(aws_security_group.alb.ingress) == 1 &&
+      toset(one(aws_security_group.alb.ingress).prefix_list_ids) == toset(["pl-cloudfront-origin-facing"]) &&
+      one(aws_security_group.alb.ingress).cidr_blocks == null &&
+      aws_lb_listener.http[0].default_action[0].type == "fixed-response" &&
+      aws_lb_listener.http[0].default_action[0].fixed_response[0].status_code == "403"
     )
-    error_message = "the default direct mode must preserve the existing forwarding HTTP listener without CloudFront"
+    error_message = "omitting front-door variables must never expose direct CIDR ingress or a forwarding ALB listener"
   }
 }
 
@@ -152,8 +160,10 @@ run "tls_uses_certificate_hostname" {
   command = plan
 
   variables {
-    certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000001"
-    demo_hostname   = "recall.example.com"
+    enable_cloudfront = false
+    alb_ingress_cidrs = ["198.51.100.0/24"]
+    certificate_arn   = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000001"
+    demo_hostname     = "recall.example.com"
   }
 
   assert {
@@ -165,10 +175,24 @@ run "tls_uses_certificate_hostname" {
     condition = (
       length(aws_cloudfront_distribution.app) == 0 &&
       length(aws_lb_listener.https) == 1 &&
-      aws_lb_listener.http_redirect[0].default_action[0].type == "redirect"
+      aws_lb_listener.http_redirect[0].default_action[0].type == "redirect" &&
+      alltrue([
+        for ingress in aws_security_group.alb.ingress :
+        toset(ingress.cidr_blocks) == toset(["198.51.100.0/24"]) && ingress.prefix_list_ids == null
+      ])
     )
-    error_message = "the direct custom-ACM mode must remain available without creating CloudFront"
+    error_message = "direct custom-ACM mode must use only the explicitly allowed ingress CIDR without creating CloudFront"
   }
+}
+
+run "rejects_direct_alb_without_ingress_allowlist" {
+  command = plan
+
+  variables {
+    enable_cloudfront = false
+  }
+
+  expect_failures = [var.alb_ingress_cidrs]
 }
 
 run "cloudfront_https_front_door" {
@@ -306,7 +330,9 @@ run "rejects_tls_without_hostname" {
   command = plan
 
   variables {
-    certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000001"
+    enable_cloudfront = false
+    alb_ingress_cidrs = ["198.51.100.0/24"]
+    certificate_arn   = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000001"
   }
 
   expect_failures = [aws_lb_listener.https]

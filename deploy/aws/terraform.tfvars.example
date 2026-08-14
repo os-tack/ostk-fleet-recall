@@ -38,10 +38,12 @@ enable_deletion_protection = true
 # HTTPS option 1: use the generated cloudfront.net hostname. Terraform generates
 # the sensitive origin-header value, persists it in encrypted remote state, and
 # never outputs it.
-enable_cloudfront = false
+enable_cloudfront = true
+alb_ingress_cidrs = []
 
 # HTTPS option 2: add an ACM certificate after pointing application DNS at the
-# ALB. This direct mode is mutually exclusive with enable_cloudfront = true.
+# ALB. This direct mode is mutually exclusive with enable_cloudfront = true and
+# requires an explicit, reviewed alb_ingress_cidrs allowlist.
 certificate_arn = null
 demo_hostname   = null
 

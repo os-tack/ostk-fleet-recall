@@ -49,13 +49,23 @@ variable "assign_public_ip" {
 variable "alb_ingress_cidrs" {
   description = "IPv4 networks allowed to reach the ALB when CloudFront is disabled."
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+  default     = []
+
+  validation {
+    condition     = var.enable_cloudfront || length(var.alb_ingress_cidrs) > 0
+    error_message = "alb_ingress_cidrs must contain at least one IPv4 network when enable_cloudfront is false."
+  }
+
+  validation {
+    condition     = alltrue([for cidr in var.alb_ingress_cidrs : can(cidrnetmask(cidr))])
+    error_message = "alb_ingress_cidrs must contain only valid IPv4 CIDR networks."
+  }
 }
 
 variable "enable_cloudfront" {
   description = "Put the ALB behind an HTTPS-only CloudFront distribution using its default cloudfront.net certificate."
   type        = bool
-  default     = false
+  default     = true
 
   validation {
     condition     = !var.enable_cloudfront || var.certificate_arn == null
