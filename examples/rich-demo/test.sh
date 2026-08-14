@@ -297,7 +297,7 @@ fi
 
 jq -c '
     if .source_id == "README.md" and .chunk_index == 58
-    then .extra.source_line_start = 519
+    then .extra.source_line_start = .extra.source_line_end
     else .
     end
 ' "$first" > "$narrowed_document_range"
