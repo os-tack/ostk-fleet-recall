@@ -572,6 +572,11 @@ fn validate_search_args(args: &SearchArgs) -> ServiceResult<()> {
             "source must be between 1 and 256 bytes when present".into(),
         ));
     }
+    if args.include_history && !matches!(args.kind.as_deref(), Some("claim" | "assertion")) {
+        return Err(ServiceError::InvalidRequest(
+            "include_history is supported only for kind=claim or kind=assertion".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -766,6 +771,16 @@ mod tests {
             include_history: false,
         };
         assert!(validate_search_args(&args).is_ok());
+        args.include_history = true;
+        assert!(validate_search_args(&args).is_err());
+        args.kind = Some("claim".into());
+        assert!(validate_search_args(&args).is_ok());
+        args.kind = Some("assertion".into());
+        assert!(validate_search_args(&args).is_ok());
+        args.kind = Some("chunk".into());
+        assert!(validate_search_args(&args).is_err());
+        args.include_history = false;
+        args.kind = None;
         args.query = "x".repeat(100_001);
         assert!(validate_search_args(&args).is_err());
         args.query = "é".repeat(MAX_TSVECTOR_QUERY_LEXEME_BYTES / 2);

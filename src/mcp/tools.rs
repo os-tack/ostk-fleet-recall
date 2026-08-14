@@ -83,7 +83,11 @@ pub fn recall_tool() -> Value {
                 "min_score": { "type": "number", "default": 0.0 },
                 "kind": { "type": "string", "enum": ["chunk", "claim", "assertion"] },
                 "id": {},
-                "include_history": { "type": "boolean", "default": false },
+                "include_history": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Include inactive historical claims. Valid only for kind=claim or kind=assertion."
+                },
                 "include_resolved": { "type": "boolean", "default": false },
                 "intent": { "type": "string", "enum": ["symbol", "narrative", "trace", "general"], "default": "general" }
             },
@@ -91,7 +95,20 @@ pub fn recall_tool() -> Value {
             "additionalProperties": false,
             "allOf": [
                 { "if": { "properties": { "action": { "const": "search" } } }, "then": { "required": ["query"] } },
-                { "if": { "properties": { "action": { "const": "get" } } }, "then": { "required": ["id"] } }
+                { "if": { "properties": { "action": { "const": "get" } } }, "then": { "required": ["id"] } },
+                {
+                    "if": {
+                        "properties": { "include_history": { "const": true } },
+                        "required": ["include_history"]
+                    },
+                    "then": {
+                        "properties": {
+                            "action": { "const": "search" },
+                            "kind": { "enum": ["claim", "assertion"] }
+                        },
+                        "required": ["kind"]
+                    }
+                }
             ]
         },
         "outputSchema": output_schema("recall")
@@ -214,6 +231,20 @@ mod tests {
             tools[0]["inputSchema"]["properties"]["action"]["enum"],
             json!(["search", "get", "conflicts", "status"])
         );
+        let history_constraint = &tools[0]["inputSchema"]["allOf"][2];
+        assert_eq!(
+            history_constraint["if"]["properties"]["include_history"]["const"],
+            true
+        );
+        assert_eq!(
+            history_constraint["then"]["properties"]["kind"]["enum"],
+            json!(["claim", "assertion"])
+        );
+        assert_eq!(
+            history_constraint["then"]["properties"]["action"]["const"],
+            "search"
+        );
+        assert_eq!(history_constraint["then"]["required"], json!(["kind"]));
         assert_eq!(
             tools[1]["inputSchema"]["properties"]["action"]["enum"],
             json!(["record"])
