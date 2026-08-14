@@ -23,11 +23,18 @@ const ACTION_HOLD: &str = "hold workers until migration completes";
 const ACTION_ESCALATE: &str = "pause rollout for operator review";
 const SELF_AUDIT_PREDICATE: &str = "MCP remember supports deliberate retractions";
 const MIGRATION_CONFLICT_SOURCE_ID: &str = "rich-demo/operations/week-01/conflict-migration_owner";
+const MIGRATION_SOURCE_QUERY: &str =
+    "migration ownership dedicated migrator every worker independently operator review";
 const DOCUMENTATION_SOURCE_ID: &str = "examples/README.md";
 const TOOLS_SOURCE_ID: &str = "src/mcp/tools.rs";
 const APPLICATION_SOURCE_ID: &str = "src/application.rs";
 const DOCUMENTATION_SOURCE_CONFIG_ID: &str = "rich-demo:docs:v1";
 const SELF_AUDIT_SOURCE_CONFIG_ID: &str = "rich-demo:self-audit:v1";
+const DOCUMENTATION_SOURCE_QUERY: &str =
+    "Use MCP remember for deliberate retractions provenance transaction semantics";
+const TOOLS_SOURCE_QUERY: &str = "action type string enum record";
+const APPLICATION_SOURCE_QUERY: &str =
+    "RememberAction Record self remember_record outside hackathon vertical slice";
 const RETRACTION_SPEC_CLAIM_TEXT: &str = "Repository guidance says MCP remember supports deliberate retractions so their provenance and transaction semantics are exercised.";
 const RETRACTION_IMPLEMENTATION_CLAIM_TEXT: &str = "The current MCP remember tool and service implementation support record only; deliberate retraction is outside the implemented vertical slice.";
 
@@ -431,6 +438,7 @@ impl ExactSourceChunk {
 
 #[derive(Clone, Copy)]
 struct ExpectedSourceChunk<'a> {
+    query: &'a str,
     source: &'a str,
     source_id: &'a str,
     source_config_id: &'a str,
@@ -448,8 +456,8 @@ async fn record_retraction_spec_claim(
         run_id,
         SelfAuditClaimSpec {
             step: ReferenceAgentStep::RecordRetractionSpecClaim,
-            query: "Use MCP remember for deliberate retractions, provenance, and transaction semantics",
             sources: &[ExpectedSourceChunk {
+                query: DOCUMENTATION_SOURCE_QUERY,
                 source: "markdown",
                 source_id: DOCUMENTATION_SOURCE_ID,
                 source_config_id: DOCUMENTATION_SOURCE_CONFIG_ID,
@@ -480,15 +488,16 @@ async fn record_retraction_implementation_claim(
         run_id,
         SelfAuditClaimSpec {
             step: ReferenceAgentStep::RecordRetractionImplementationClaim,
-            query: "remember action record retract outside hackathon vertical slice",
             sources: &[
                 ExpectedSourceChunk {
+                    query: TOOLS_SOURCE_QUERY,
                     source: "code",
                     source_id: TOOLS_SOURCE_ID,
                     source_config_id: SELF_AUDIT_SOURCE_CONFIG_ID,
                     markers: &["\"action\"", "\"enum\": [\"record\"]"],
                 },
                 ExpectedSourceChunk {
+                    query: APPLICATION_SOURCE_QUERY,
                     source: "code",
                     source_id: APPLICATION_SOURCE_ID,
                     source_config_id: SELF_AUDIT_SOURCE_CONFIG_ID,
@@ -510,7 +519,6 @@ async fn record_retraction_implementation_claim(
 
 struct SelfAuditClaimSpec<'a> {
     step: ReferenceAgentStep,
-    query: &'a str,
     sources: &'a [ExpectedSourceChunk<'a>],
     text: &'a str,
     value: bool,
@@ -525,8 +533,7 @@ async fn record_self_audit_claim(
     run_id: &str,
     spec: SelfAuditClaimSpec<'_>,
 ) -> ServiceResult<Value> {
-    let sources =
-        retrieve_exact_source_chunks(service, scope.clone(), spec.query, spec.sources).await?;
+    let sources = retrieve_exact_source_chunks(service, scope.clone(), spec.sources).await?;
     let subject = self_audit_subject(run_id);
     let claim_key = expected_claim_key(&subject, SELF_AUDIT_PREDICATE);
     let mutation = service
@@ -597,32 +604,36 @@ async fn record_self_audit_claim(
 async fn retrieve_exact_source_chunks(
     service: &dyn FleetMemoryService,
     scope: FleetScope,
-    query: &str,
     expected_sources: &[ExpectedSourceChunk<'_>],
 ) -> ServiceResult<Vec<ExactSourceChunk>> {
-    let recall = service
-        .recall(
-            scope.clone(),
-            RecallRequest::new(
-                RecallAction::Search,
-                object(&json!({
-                    "query": query,
-                    "kind": "chunk",
-                    "limit": 100,
-                    "max_per_source_id": 8,
-                }))?,
-            ),
-        )
-        .await?;
-    verify_hybrid_retrieval(&recall.diagnostics)?;
-    let hits = recall
-        .data
-        .get("hits")
-        .and_then(Value::as_array)
-        .ok_or_else(|| invariant("self-audit semantic recall omitted its hits array"))?;
-
     let mut sources = Vec::with_capacity(expected_sources.len());
     for expected in expected_sources {
+        // Search once per required source. This keeps each proof lookup narrow
+        // enough to survive conservative dense-neighbor filtering while the
+        // exact source id, re-read, content hash, and marker checks below remain
+        // authoritative.
+        let recall = service
+            .recall(
+                scope.clone(),
+                RecallRequest::new(
+                    RecallAction::Search,
+                    object(&json!({
+                        "query": expected.query,
+                        "source": expected.source,
+                        "kind": "chunk",
+                        "limit": 32,
+                        "max_per_source_id": 8,
+                    }))?,
+                ),
+            )
+            .await?;
+        verify_hybrid_retrieval(&recall.diagnostics)?;
+        let hits = recall
+            .data
+            .get("hits")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invariant("self-audit semantic recall omitted its hits array"))?;
+
         let mut candidate_ids = Vec::new();
         for hit in hits {
             if hit.get("source").and_then(Value::as_str) == Some(expected.source)
@@ -948,8 +959,8 @@ async fn retrieve_migration_source(
     retrieve_exact_source_chunks(
         service,
         scope,
-        "migration ownership dedicated migrator every worker independently operator review",
         &[ExpectedSourceChunk {
+            query: MIGRATION_SOURCE_QUERY,
             source: "markdown",
             source_id: MIGRATION_CONFLICT_SOURCE_ID,
             source_config_id: "rich-demo:operations:v1",
@@ -1256,6 +1267,8 @@ mod tests {
         MigrationSourceMarker,
         MigrationSourceHash,
         SelfAuditSourceMissing,
+        SelfAuditToolsSourceMissing,
+        SelfAuditApplicationSourceMissing,
         SelfAuditSourceConfig,
         SelfAuditSourceMarker,
         SelfAuditSourceHash,
@@ -1308,7 +1321,19 @@ mod tests {
                 .get("query")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let hits = if query.contains("migration ownership dedicated migrator") {
+            let source = request.arguments.get("source").and_then(Value::as_str);
+            let bounded_source_search = request.arguments.get("kind").and_then(Value::as_str)
+                == Some("chunk")
+                && request.arguments.get("limit").and_then(Value::as_u64) == Some(32)
+                && request
+                    .arguments
+                    .get("max_per_source_id")
+                    .and_then(Value::as_u64)
+                    == Some(8);
+            let hits = if query == MIGRATION_SOURCE_QUERY
+                && source == Some("markdown")
+                && bounded_source_search
+            {
                 if self.tamper == Tamper::MigrationSourceMissing {
                     json!([])
                 } else {
@@ -1329,16 +1354,39 @@ mod tests {
                         "claim_key": "fleet-deployment-run-1::migration-strategy",
                     }
                 }])
-            } else {
-                let mut sources = vec![
-                    self_audit_source_fixture(DOCUMENTATION_SOURCE_ID),
-                    self_audit_source_fixture(TOOLS_SOURCE_ID),
-                    self_audit_source_fixture(APPLICATION_SOURCE_ID),
-                ];
+            } else if query == DOCUMENTATION_SOURCE_QUERY
+                && source == Some("markdown")
+                && bounded_source_search
+            {
                 if self.tamper == Tamper::SelfAuditSourceMissing {
-                    sources.retain(|source| source.source_id != DOCUMENTATION_SOURCE_ID);
+                    json!([])
+                } else {
+                    json!([self_audit_search_hit(&self_audit_source_fixture(
+                        DOCUMENTATION_SOURCE_ID
+                    ))])
                 }
-                Value::Array(sources.iter().map(self_audit_search_hit).collect())
+            } else if query == TOOLS_SOURCE_QUERY && source == Some("code") && bounded_source_search
+            {
+                if self.tamper == Tamper::SelfAuditToolsSourceMissing {
+                    json!([])
+                } else {
+                    json!([self_audit_search_hit(&self_audit_source_fixture(
+                        TOOLS_SOURCE_ID
+                    ))])
+                }
+            } else if query == APPLICATION_SOURCE_QUERY
+                && source == Some("code")
+                && bounded_source_search
+            {
+                if self.tamper == Tamper::SelfAuditApplicationSourceMissing {
+                    json!([])
+                } else {
+                    json!([self_audit_search_hit(&self_audit_source_fixture(
+                        APPLICATION_SOURCE_ID
+                    ))])
+                }
+            } else {
+                json!([])
             };
             let mut result = RecallResult::new(json!({ "hits": hits }));
             result.diagnostics.insert(
@@ -2056,6 +2104,7 @@ mod tests {
                 RecallAction::Get,
                 RecallAction::Search,
                 RecallAction::Get,
+                RecallAction::Search,
                 RecallAction::Get,
                 RecallAction::Get,
             ]
@@ -2129,6 +2178,26 @@ mod tests {
             assert!(
                 matches!(error, ServiceError::Internal(_)),
                 "source tamper {tamper:?} must fail as an invariant"
+            );
+            assert!(service.remember_keys().is_empty());
+        }
+
+        for tamper in [
+            Tamper::SelfAuditToolsSourceMissing,
+            Tamper::SelfAuditApplicationSourceMissing,
+        ] {
+            let service = FakeService::with_tamper(tamper);
+            let error = run_reference_agent(
+                &service,
+                test_scope("agent-c"),
+                ReferenceAgentStep::RecordRetractionImplementationClaim,
+                "run-1",
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, ServiceError::Internal(_)),
+                "missing code source {tamper:?} must fail as an invariant"
             );
             assert!(service.remember_keys().is_empty());
         }
