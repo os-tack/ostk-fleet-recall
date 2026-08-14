@@ -10,18 +10,19 @@ The module is intentionally safe to bootstrap: its default service and
 autoscaling minimum are zero. Run the one-off migration successfully before
 starting any application task.
 
-This remains the reproducible deployment runbook. At the recorded revision-6
-release boundary, its live submission candidate was available at
-<https://d13zrqfh66r7ub.cloudfront.net>. The schema-2 migration, three-record
-bootstrap, and verifier-gated 536-chunk rich seed succeeded; CockroachDB Cloud
-reported version 26.2.5 and all required capabilities. The source-conflict
-self-audit, four-task reference-agent run, and fully disjoint serving-task
-replacement all verified against task-definition revision 6 and immutable
-image `git-ba884f24858a`. Publication-safe Cloud `EXPLAIN` also verified the
-exact production SQL shapes and all three intended retrieval indexes. The
-current source generator separately emits a deterministic, locally
-verifier-gated 548-row artifact; those rows are not claimed as deployed until
-a later immutable image is seeded and observed at its own release boundary.
+This remains the reproducible deployment runbook. At the recorded revision-7
+release boundary, its live submission candidate is available at
+<https://d13zrqfh66r7ub.cloudfront.net>. Immutable image `git-efe6fbf4e2f1`
+at source commit `efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f` runs with all
+four task-definition families at revision 7. The rich-seed task exited zero and
+upserted exactly 548 rows: 342 documentation chunks, 2 code chunks, and 204
+operations chunks. The seven-query public smoke check and a browser review of
+the live UI succeeded. GitHub Actions run
+[`31821458425`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31821458425)
+completed all five jobs successfully. The checked-in source-conflict
+self-audit, reference-agent, replacement, and validation artifacts are
+historical revision-6 evidence; Cloud `EXPLAIN` is separately captured
+historical plan evidence. None was rerun on revision 7.
 The final public video and entrant-controlled Devpost fields remain pending.
 
 ## Prerequisites
@@ -166,14 +167,11 @@ aws logs tail "$(terraform -chdir=deploy/aws output -raw log_group_name)" \
   --region us-east-1 --since 30m
 ```
 
-The recorded `git-ba884f24858a` production image contained both the repository's
-three-record bootstrap corpus and a deterministic, verifier-gated 536-chunk
-rich corpus. The current source tree deterministically produces 548 rich-corpus
-rows. That artifact passes local verification, but this runbook does not call
-it deployed until a new immutable image is seeded and its observed count is
-captured at that release boundary. Neither corpus contains tenant authority or
-secrets. The default
-invocation ingests
+The recorded revision-7 production image `git-efe6fbf4e2f1` contains the
+repository's deterministic rich corpus. Its one-off rich-seed task exited zero
+and upserted exactly 548 rows: 342 documentation chunks, 2 code chunks, and 204
+operations chunks. The default and rich corpora contain no tenant authority or
+secrets. The default invocation ingests
 `/opt/ostk/demo/demo.ndjson`; `--rich-demo` selects
 `/opt/ostk/demo/rich-demo.ndjson`. Both one-off tasks use the least-privilege
 runtime database secret, load and verify the same pinned S3 model, and invoke
@@ -384,14 +382,16 @@ run/project names, the demo URL, cluster coordinate, task IDs, and model/version
 metadata before sharing it. Never supplement it with the database URL, account
 ID, task ARN, secret ARN, or raw CloudWatch log export.
 
-The live revision-6 self-audit produced the checked-in, publication-safe
+The following receipts are historical revision-6 cloud evidence. They were not
+rerun during the revision-7 cutover. The revision-6 self-audit produced the
+checked-in, publication-safe
 [receipt](../../docs/evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json).
 It correlated documentation-backed claim 9 and code-backed claim 10 with exact
 open conflict 3, then required semantic recall to surface the cited source
 chunks and project that conflict. CockroachDB reported schema version 2, all
 four capability indexes, working cosine distance, and embedding dimension 512.
 
-Fresh run `devpost-final6-20260814T143523Z` then produced the checked-in
+Historical revision-6 run `devpost-final6-20260814T143523Z` then produced the
 [reference-agent](../../docs/evidence/reference-agent-devpost-final6-20260814T143523Z.json),
 [replacement](../../docs/evidence/replacement-devpost-final6-20260814T143523Z.json),
 and [validation](../../docs/evidence/publication-validation-devpost-final6-20260814T143523Z.json)
@@ -400,14 +400,21 @@ receipts. Reference-agent task definition revision 6 correlated decision claim
 escalation claim 18 citing that conflict. Public verification observed exact
 claims 16 and 18 through lexical/dense RRF.
 
-The deployed ARM64 image is immutable tag `git-ba884f24858a`, digest
+Those historical receipts are bound to immutable ARM64 image tag
+`git-ba884f24858a`, digest
 `sha256:7d154a37fff589d2e68ec71c230025f3324cea96f85f7b51158f2d3097f2320b`,
 and source commit `ba884f24858a58b09a915e0358e60e7fcc7e2c34`; serving,
-migration, seed, and reference-agent task definitions are all revision 6. CI
-run `31808620621` completed all five jobs successfully. An earlier completed
-proof remains historical because it predates this schema/image boundary. The
-fresh run ID prevents its deployment coordinates from being mixed with the
-current claims, conflict, or replacement.
+migration, seed, and reference-agent task definitions were all revision 6.
+
+The current live release uses immutable image tag `git-efe6fbf4e2f1` at source
+commit `efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f`, with all four
+task-definition families at revision 7. Its rich-seed task exited zero and
+upserted exactly 548 rows (342 documentation, 2 code, and 204 operations).
+The browser-verified UI and seven-query public smoke check confirmed both exact
+conflict mappings, four relevant conflict-free answers, and zero results/zero
+conflicts for nonsense. CI run
+[`31821458425`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31821458425)
+completed all five jobs successfully.
 
 ## 8. Replace the complete serving task set and prove persistence
 
@@ -445,11 +452,12 @@ secret-bearing keys, and raw log-stream fields. Its success output is marked
 `validation_only: true`; it validates live receipts but is not a substitute for
 running either live wrapper.
 
-For fresh run `devpost-final6-20260814T143523Z`, the replacement wrapper
-exercised serving task definition revision 6 and changed the complete task set
-to a fully disjoint set. Desired count remained one, the service returned
-ready, and the before/after public checks observed the same exact claims 16 and
-18 through lexical/dense RRF.
+For historical revision-6 run `devpost-final6-20260814T143523Z`, the
+replacement wrapper exercised serving task definition revision 6 and changed
+the complete task set to a fully disjoint set. Desired count remained one, the
+service returned ready, and the before/after public checks observed the same
+exact claims 16 and 18 through lexical/dense RRF. This replacement proof was
+not rerun on revision 7.
 
 ## Cloud `EXPLAIN` evidence
 

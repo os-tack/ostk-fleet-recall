@@ -40,27 +40,28 @@ hackathon slice. Additional canonical Recall actions are also future work.
 
 The submission candidate is live at
 [https://d13zrqfh66r7ub.cloudfront.net](https://d13zrqfh66r7ub.cloudfront.net).
-At the revision-6 evidence boundary, the schema-2 migration and both idempotent
-seed tasks completed against CockroachDB Cloud. That immutable deployed image
-contains the three-record bootstrap plus a verifier-gated 536-chunk rich
-corpus. The public status surface reports CockroachDB 26.2.5, schema version 2,
-enabled vector, lexical, conflict-membership, and claim-support-chunk indexes,
-working cosine distance, and the pinned 512-dimension embedding model. The
-current source generator separately emits a deterministic, locally
-verifier-gated 548-row rich corpus; those rows are not claimed as deployed
-until a later immutable image is seeded and observed at its own release
-boundary.
+The live revision-7 cutover runs source commit
+`efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f` as immutable ARM64 image tag
+`git-efe6fbf4e2f1`. The serving, migration, seed, and reference-agent
+task-definition families are all revision 7. Its rich-seed task exited zero
+and upserted exactly 548 rows: 342 documentation chunks, 2 code chunks, and 204
+operations chunks. The public status surface reports CockroachDB 26.2.5,
+schema version 2, enabled vector, lexical, conflict-membership, and
+claim-support-chunk indexes, working cosine distance, and the pinned
+512-dimension embedding model. GitHub Actions run
+[`31821458425`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31821458425)
+completed all five jobs successfully for this release.
 
-The deployed ARM64 release is source commit
-`ba884f24858a58b09a915e0358e60e7fcc7e2c34`, immutable image tag
-`git-ba884f24858a`, and digest
-`sha256:7d154a37fff589d2e68ec71c230025f3324cea96f85f7b51158f2d3097f2320b`.
-The serving, migration, seed, and reference-agent task definitions are all
-revision 6. GitHub Actions run
-[`31808620621`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31808620621)
-completed all five jobs successfully for that exact commit.
+A [seven-query public smoke check](docs/evidence/public-relevance-efe6fbf-20260814.json)
+verified exact conflict mappings for the
+specification-versus-code and migration examples, relevant conflict-free
+results for the CockroachDB, Rust, project-purpose, and datastore-library
+questions, and zero results with zero conflicts for a nonsense query. The live
+UI was also verified in a browser.
 
-The checked-in, publication-safe
+The checked-in receipts below are **historical revision-6 cloud evidence**;
+the reference-agent and replacement proofs were not rerun during the
+revision-7 cutover. The publication-safe
 [source-conflict self-audit receipt](docs/evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json)
 proves that semantic recall surfaced the exact documentation and code sources
 behind incompatible Boolean claims 9 and 10 and projected their exact open
@@ -72,13 +73,9 @@ then correlates decision, action, incompatible-decision, and escalation claims
 records a fully disjoint serving-task-set replacement that preserved exact
 public claims 16 and 18 through lexical/dense RRF; the
 [publication verifier receipt](docs/evidence/publication-validation-devpost-final6-20260814T143523Z.json)
-cross-validates the pair. These are live AWS/CockroachDB Cloud results;
-LocalStack and local tests remain preflight evidence only.
-
-An earlier completed proof remains valid historical evidence, but it predates
-the schema-2 and revision-6 release boundary. The current publication proof uses
-a fresh `devpost-final6-20260814T143523Z` run ID so task, image, claim, conflict,
-and replacement correlations cannot be confused with the prior deployment.
+cross-validates the pair. These were observed live in AWS/CockroachDB Cloud,
+but they describe the revision-6 boundary, not a revision-7 reference-agent or
+replacement run. LocalStack and local tests remain preflight evidence only.
 
 HTTPS is provided by CloudFront's default certificate. AWS fixes that
 generated-hostname viewer policy at a TLSv1 minimum, although newer TLS can be
@@ -94,8 +91,8 @@ plans select `memory_chunks_semantic_idx`,
 `memory_chunks_source_semantic_idx`, and `memory_chunks_lexical_idx`. The
 production database was untouched, the fixture database was dropped, and the
 temporary workstation network rule was removed. The final public video and
-remaining entrant/Devpost fields are still release gates. CI is green for all
-five jobs at `ba884f24858a` in run `31808620621`.
+remaining entrant/Devpost fields are still release gates. This separately
+captured plan evidence was not rerun as part of the revision-7 cutover.
 
 The final-cut plan leads with the live AWS UI and then shows the reviewed cloud
 agent and replacement receipts; see [`docs/VIDEO_DEMO.md`](docs/VIDEO_DEMO.md).

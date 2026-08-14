@@ -6,20 +6,21 @@ billing choices, DNS ownership, or database credentials. Do not place database
 URLs, passwords, AWS access keys, or secret values in this repository,
 Terraform variables, command-line arguments, screenshots, or shell history.
 
-Recorded revision-6 release state: the onboarding path was completed for the
+Recorded revision-7 release state: the onboarding path was completed for the
 live submission candidate at
-<https://d13zrqfh66r7ub.cloudfront.net>. The schema-2 migration, three-record
-bootstrap, and verifier-gated 536-chunk rich seed succeeded; CockroachDB Cloud
-reported version 26.2.5 and all required capabilities. A two-task
-source-conflict self-audit, the four-task reference-agent chain, and a complete
-disjoint serving-task replacement all verified against task-definition
-revision 6 and immutable image `git-ba884f24858a`. Publication-safe Cloud
-`EXPLAIN` verified the exact production SQL shapes and all three intended
-indexes on a disposable 10,001-row fixture. Separately, the current source
-generator deterministically emits 548 rows and passes local verification;
-those rows are not part of this historical cloud claim until a later immutable
-image is seeded and observed at its own release boundary. The final public
-video and the remaining Devpost fields are still pending.
+<https://d13zrqfh66r7ub.cloudfront.net>. Immutable image `git-efe6fbf4e2f1`
+at source commit `efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f` runs with all
+four task-definition families at revision 7. The rich-seed task exited zero and
+upserted exactly 548 rows: 342 documentation chunks, 2 code chunks, and 204
+operations chunks. A seven-query public smoke check verified both exact
+conflict mappings, four relevant conflict-free answers, and zero results/zero
+conflicts for nonsense; the live UI was also browser-verified. GitHub Actions
+run [`31821458425`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31821458425)
+completed all five jobs successfully. The checked-in self-audit,
+reference-agent, replacement, and validation artifacts remain historical
+revision-6 evidence; the Cloud `EXPLAIN` is separately captured historical plan
+evidence. None was rerun on revision 7. The final
+public video and the remaining Devpost fields are still pending.
 
 The labels below are gates:
 
@@ -385,11 +386,24 @@ jq -e '.schema == "fleet-reference-agent-run-v1" and .verified == true' \
   "target/aws-evidence/reference-agent-$RUN_ID.json"
 ```
 
-For the recorded revision-6 deployment, the schema-2 migration, three-record
-bootstrap, and 536-chunk rich seed exited successfully. The checked-in
+For the current revision-7 deployment, immutable image `git-efe6fbf4e2f1` at
+source commit `efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f` runs with the
+serving, migration, seed, and reference-agent task-definition families all at
+revision 7. The rich-seed task exited zero and upserted exactly 548 rows: 342
+documentation chunks, 2 code chunks, and 204 operations chunks. The
+browser-verified live UI and seven-query public smoke check confirmed exact
+specification/code and migration conflict mappings, relevant conflict-free
+CockroachDB, Rust, project-purpose, and datastore-library results, and zero
+results/zero conflicts for nonsense. GitHub Actions run
+[`31821458425`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31821458425)
+completed all five jobs successfully.
+
+The checked-in artifacts that follow are historical revision-6 cloud evidence;
+the reference-agent and replacement proofs were not rerun during the
+revision-7 cutover. The
 [source-conflict self-audit](evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json)
 verified documentation-backed claim 9, code-backed claim 10, and their exact
-open conflict 3 through semantic recall. Fresh run
+open conflict 3 through semantic recall. Historical revision-6 run
 `devpost-final6-20260814T143523Z` then produced the checked-in
 [reference-agent](evidence/reference-agent-devpost-final6-20260814T143523Z.json),
 [replacement](evidence/replacement-devpost-final6-20260814T143523Z.json), and
@@ -400,24 +414,14 @@ decision/action/incompatible/escalation claims 15/16/17/18 with open conflict
 18. Serving task definition revision 6 then changed the complete task set to a
 fully disjoint set and observed those same exact claims afterward.
 
-The deployed ARM64 image is immutable tag `git-ba884f24858a`, digest
-`sha256:7d154a37fff589d2e68ec71c230025f3324cea96f85f7b51158f2d3097f2320b`,
-from source commit `ba884f24858a58b09a915e0358e60e7fcc7e2c34`; all four
-task-definition families are revision 6. GitHub Actions run `31808620621`
-completed all five jobs successfully. An earlier completed proof remains
-historical because it predates this schema/image boundary. A fresh run ID was
-used so current task, image, claim, conflict, and replacement coordinates could
-not be mixed with that prior deployment. The current deterministic 548-row
-source artifact is locally verifier-gated and remains pending a distinct
-release-bound seed receipt.
-
-The separate Cloud `EXPLAIN` proof exercised the exact production
-project-vector, source-vector, and lexical SQL shapes on a 10,001-row disposable
-fixture. It selected `memory_chunks_semantic_idx`,
+The separately captured historical Cloud `EXPLAIN` proof exercised the exact
+production project-vector, source-vector, and lexical SQL shapes on a
+10,001-row disposable fixture. It selected `memory_chunks_semantic_idx`,
 `memory_chunks_source_semantic_idx`, and `memory_chunks_lexical_idx`; all
 assertions passed. Production was untouched, the fixture database was dropped,
-and the temporary workstation network rule was removed. The first lexical plan
-ran immediately after `ANALYZE` and briefly saw stale statistics; the unchanged
+and the temporary workstation network rule was removed. It was not rerun on
+revision 7. The first lexical plan ran immediately after `ANALYZE` and briefly
+saw stale statistics; the unchanged
 query selected the inverted index once fresh statistics became visible roughly
 two minutes later. No `FORCE_INDEX` hint was used or implied.
 

@@ -1,0 +1,334 @@
+{
+  "schema": "fleet-public-relevance-smoke-v1",
+  "verified": true,
+  "verification_scope": {
+    "kind": "public_http_smoke",
+    "statement": "Seven bounded POST /api/recall requests reached the public HTTPS endpoint and returned the release behavior summarized below.",
+    "query_text_provenance": "Operator-recorded request inputs; the response envelope does not echo query text.",
+    "snippet_summary_provenance": "Human-reviewed paraphrases; verification binds their ordered ranks and source IDs to the raw captures, not the prose itself.",
+    "does_not_prove": [
+      "a fresh reference-agent write chain on serving revision 7",
+      "serving-process replacement or durable-memory survival on revision 7",
+      "write access through the deliberately read-only public demo"
+    ]
+  },
+  "captured_at": "2026-08-14T17:06:31Z",
+  "capture_window": {
+    "started_at": "2026-08-14T17:05:54Z",
+    "ended_at": "2026-08-14T17:06:31Z"
+  },
+  "public_url": "https://d13zrqfh66r7ub.cloudfront.net/",
+  "route": "POST /api/recall",
+  "release": {
+    "git_commit": "efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f",
+    "image_tag": "git-efe6fbf4e2f1",
+    "image_digest": "sha256:1df821f31bf26b7a7da503476dbaadcabdb7e8c74e132684968489e5e3f206b7",
+    "serving_revision": 7,
+    "platform": "linux/arm64",
+    "compressed_image_size_bytes": 47841090
+  },
+  "seed": {
+    "release_bound": true,
+    "ingest_exit_code": 0,
+    "row_count": 548,
+    "composition": {
+      "repository_documentation_chunks": 342,
+      "exact_self_audit_source_chunks": 2,
+      "synthetic_operations_narrative_chunks": 204
+    }
+  },
+  "ecr_scan": {
+    "scan_type": "BASIC",
+    "scope": "Amazon ECR Basic OS-package scan only; this does not claim Go, Rust, or application-dependency coverage.",
+    "status": "COMPLETE",
+    "completed_at": "2026-08-14T11:58:02-05:00",
+    "finding_severity_counts": {}
+  },
+  "queries": [
+    {
+      "id": "spec",
+      "query": "Does MCP remember support deliberate retractions?",
+      "captured_at": "2026-08-14T17:05:54Z",
+      "http_status": 200,
+      "server_duration_ms": 126.9,
+      "hit_count": 8,
+      "conflict_count": 1,
+      "top_hits": [
+        {
+          "rank": 1,
+          "source_id": "deploy/aws/README.md",
+          "snippet_summary": "The deployment proof flow binds the retraction specification claim to examples/README.md and the implementation claim to exact Rust source chunks."
+        },
+        {
+          "rank": 2,
+          "source_id": "claim/10",
+          "snippet_summary": "The implementation supports record only; deliberate retraction is outside the implemented slice."
+        },
+        {
+          "rank": 3,
+          "source_id": "claim/9",
+          "snippet_summary": "Repository guidance says deliberate retractions should exercise provenance and transaction semantics."
+        }
+      ],
+      "conflict_matches": [
+        {
+          "best_fused_hit_rank": 2,
+          "conflict_id": 3,
+          "direct_claim_ids": [
+            9,
+            10
+          ],
+          "source_support": [
+            {
+              "chunk_id": "2375fc7c69ac623e04c8f139d35240662f266b7569c2717c45f71f4ae6325e25",
+              "claim_id": 10,
+              "fused_hit_rank": 5
+            }
+          ]
+        }
+      ],
+      "retrieval": {
+        "lanes": [
+          "lexical",
+          "dense"
+        ],
+        "fusion": "rrf",
+        "dense_min_cosine_similarity": 0.18000000715255737,
+        "stratified_code_prefetch": 0
+      }
+    },
+    {
+      "id": "migration",
+      "query": "How are conflicting migration strategies represented and escalated?",
+      "captured_at": "2026-08-14T17:06:00Z",
+      "http_status": 200,
+      "server_duration_ms": 98.8,
+      "hit_count": 8,
+      "conflict_count": 4,
+      "top_hits": [
+        {
+          "rank": 1,
+          "source_id": "claim/7",
+          "snippet_summary": "A disputed claim says every worker should run schema migration independently at startup."
+        },
+        {
+          "rank": 2,
+          "source_id": "docs/SUBMISSION.md",
+          "snippet_summary": "The submission describes the public demo and leads with conflict-aware memory."
+        },
+        {
+          "rank": 3,
+          "source_id": "claim/17",
+          "snippet_summary": "A later disputed claim repeats the independently migrating worker strategy."
+        }
+      ],
+      "conflict_matches": [
+        {
+          "best_fused_hit_rank": 3,
+          "conflict_id": 5,
+          "direct_claim_ids": [
+            17
+          ],
+          "source_support": []
+        },
+        {
+          "best_fused_hit_rank": 8,
+          "conflict_id": 4,
+          "direct_claim_ids": [
+            13
+          ],
+          "source_support": []
+        },
+        {
+          "best_fused_hit_rank": 1,
+          "conflict_id": 2,
+          "direct_claim_ids": [
+            7
+          ],
+          "source_support": []
+        },
+        {
+          "best_fused_hit_rank": 7,
+          "conflict_id": 1,
+          "direct_claim_ids": [
+            3
+          ],
+          "source_support": []
+        }
+      ],
+      "retrieval": {
+        "lanes": [
+          "lexical",
+          "dense"
+        ],
+        "fusion": "rrf",
+        "dense_min_cosine_similarity": 0.18000000715255737,
+        "stratified_code_prefetch": 0
+      }
+    },
+    {
+      "id": "cockroach",
+      "query": "Why does Fleet Recall use CockroachDB for shared agent memory?",
+      "captured_at": "2026-08-14T17:06:06Z",
+      "http_status": 200,
+      "server_duration_ms": 70.0,
+      "hit_count": 8,
+      "conflict_count": 0,
+      "top_hits": [
+        {
+          "rank": 1,
+          "source_id": "docs/VIDEO_DEMO.md",
+          "snippet_summary": "The same MCP contract uses CockroachDB as a durable fleet plane when memory must be shared across processes and hosts."
+        },
+        {
+          "rank": 2,
+          "source_id": "demo/architecture",
+          "snippet_summary": "CockroachDB holds durable shared semantic memory so replaceable agents can recall across hosts and restarts."
+        },
+        {
+          "rank": 3,
+          "source_id": "README.md",
+          "snippet_summary": "The local setup starts a CockroachDB 26.2 single node for development."
+        }
+      ],
+      "conflict_matches": [],
+      "retrieval": {
+        "lanes": [
+          "lexical",
+          "dense"
+        ],
+        "fusion": "rrf",
+        "dense_min_cosine_similarity": 0.18000000715255737,
+        "stratified_code_prefetch": 0
+      }
+    },
+    {
+      "id": "rust",
+      "query": "How does Rust write memories to CockroachDB?",
+      "captured_at": "2026-08-14T17:06:12Z",
+      "http_status": 200,
+      "server_duration_ms": 63.3,
+      "hit_count": 8,
+      "conflict_count": 0,
+      "top_hits": [
+        {
+          "rank": 1,
+          "source_id": "docs/REQUIREMENTS.md",
+          "snippet_summary": "The requirements matrix links the project and CockroachDB vector-index references."
+        },
+        {
+          "rank": 2,
+          "source_id": "README.md",
+          "snippet_summary": "The local development instructions start CockroachDB 26.2 in a container."
+        },
+        {
+          "rank": 3,
+          "source_id": "docs/PROJECT_PRIMER.md",
+          "snippet_summary": "Rust writes through SQLx and PgPool on Tokio with Rustls; mutations use parameterized serializable transactions."
+        }
+      ],
+      "conflict_matches": [],
+      "retrieval": {
+        "lanes": [
+          "lexical",
+          "dense"
+        ],
+        "fusion": "rrf",
+        "dense_min_cosine_similarity": 0.18000000715255737,
+        "stratified_code_prefetch": 0
+      }
+    },
+    {
+      "id": "purpose",
+      "query": "Why does this project exist?",
+      "captured_at": "2026-08-14T17:06:19Z",
+      "http_status": 200,
+      "server_duration_ms": 63.4,
+      "hit_count": 8,
+      "conflict_count": 0,
+      "top_hits": [
+        {
+          "rank": 1,
+          "source_id": "docs/PROJECT_PRIMER.md",
+          "snippet_summary": "Temporary inference workers need a shared plane where decisions, evidence, corrections, and disagreements survive."
+        },
+        {
+          "rank": 2,
+          "source_id": "docs/REQUIREMENTS.md",
+          "snippet_summary": "The requirements matrix identifies the standalone policy agent and durable memory layer."
+        },
+        {
+          "rank": 3,
+          "source_id": "docs/SUBMISSION.md",
+          "snippet_summary": "The submission separates the hackathon-built fleet backend from pre-existing local-first foundations."
+        }
+      ],
+      "conflict_matches": [],
+      "retrieval": {
+        "lanes": [
+          "lexical",
+          "dense"
+        ],
+        "fusion": "rrf",
+        "dense_min_cosine_similarity": 0.18000000715255737,
+        "stratified_code_prefetch": 0
+      }
+    },
+    {
+      "id": "libraries",
+      "query": "What libraries are used to write to the datastore?",
+      "captured_at": "2026-08-14T17:06:25Z",
+      "http_status": 200,
+      "server_duration_ms": 112.4,
+      "hit_count": 8,
+      "conflict_count": 0,
+      "top_hits": [
+        {
+          "rank": 1,
+          "source_id": "docs/PROJECT_PRIMER.md",
+          "snippet_summary": "The datastore libraries are SQLx 0.8 with its PostgreSQL driver, Tokio, Rustls, and PgPool."
+        },
+        {
+          "rank": 2,
+          "source_id": "docs/CLOUD_ONBOARDING.md",
+          "snippet_summary": "Cloud onboarding records only non-secret cluster metadata, limits, and network authorization."
+        },
+        {
+          "rank": 3,
+          "source_id": "docs/ARCHITECTURE.md",
+          "snippet_summary": "Stateless serving containers keep memory in CockroachDB Cloud and load the pinned model from private object storage."
+        }
+      ],
+      "conflict_matches": [],
+      "retrieval": {
+        "lanes": [
+          "lexical",
+          "dense"
+        ],
+        "fusion": "rrf",
+        "dense_min_cosine_similarity": 0.18000000715255737,
+        "stratified_code_prefetch": 0
+      }
+    },
+    {
+      "id": "nonsense",
+      "query": "quantum chromodynamics penguins",
+      "captured_at": "2026-08-14T17:06:31Z",
+      "http_status": 200,
+      "server_duration_ms": 64.4,
+      "hit_count": 0,
+      "conflict_count": 0,
+      "top_hits": [],
+      "conflict_matches": [],
+      "retrieval": {
+        "lanes": [
+          "lexical",
+          "dense"
+        ],
+        "fusion": "rrf",
+        "dense_min_cosine_similarity": 0.18000000715255737,
+        "stratified_code_prefetch": 0
+      }
+    }
+  ]
+}

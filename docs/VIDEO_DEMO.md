@@ -20,10 +20,11 @@ reviewed excerpts of the verified reference-agent and replacement receipts and
 the representative query plans. Keep every local/cloud provenance label
 visible so one segment cannot be mistaken for another.
 
-The public conflict-first UI is the current revision 4 deployment. The
-correlated four-task agent and fully disjoint replacement receipts are verified
-**pre-polish revision 3** evidence from run
-`devpost-final-20260814T021819Z`; they were not rerun on revision 4. Do not cut
+The public conflict-first UI is the current revision-7 deployment at source
+commit `efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f`, with the 548-row rich seed.
+The correlated four-task agent and fully disjoint replacement receipts are
+verified **historical revision-6** evidence from run
+`devpost-final6-20260814T143523Z`; they were not rerun on revision 7. Do not cut
 the two sources together in a way that implies one revision or one continuous
 live take.
 
@@ -39,14 +40,14 @@ Use these exact two-line provenance cards. Do not abbreviate away the revision
 or source boundary:
 
 ```text
-LIVE PUBLIC DEMO · AWS + COCKROACHDB CLOUD · CURRENT REVISION 4 UI
-PUBLIC READ-ONLY ENDPOINT
+LIVE PUBLIC DEMO · AWS + COCKROACHDB CLOUD · CURRENT REVISION 7 UI
+548-ROW RICH SEED · PUBLIC READ-ONLY ENDPOINT
 
 VERIFIED CLOUD AGENT RECEIPT · AWS FARGATE + COCKROACHDB CLOUD
-PRE-POLISH REVISION 3 · RUN devpost-final-20260814T021819Z
+HISTORICAL REVISION 6 · RUN devpost-final6-20260814T143523Z
 
 VERIFIED CLOUD REPLACEMENT RECEIPT · AWS FARGATE + COCKROACHDB CLOUD
-PRE-POLISH REVISION 3 · RUN devpost-final-20260814T021819Z
+HISTORICAL REVISION 6 · RUN devpost-final6-20260814T143523Z
 
 PUBLICATION-SAFE COCKROACHDB CLOUD EXPLAIN · DISPOSABLE FIXTURE
 PRODUCTION DATABASE UNTOUCHED
@@ -72,11 +73,17 @@ linked repository path only if that row is present in the deployed corpus; do
 not describe a plain claim ID as a file citation. Point out “fused in …ms” as
 server recall time and “round trip …ms” as browser-to-cloud time. These
 are different measurements. Do not call RRF rank artifacts confidence scores.
+The checked-in
+[revision-7 public relevance receipt](evidence/public-relevance-efe6fbf-20260814.json)
+records the expected conflict and no-conflict query behavior for rehearsal;
+run the questions again immediately before recording rather than substituting
+the receipt for live footage.
 
 Narrate: “This is the current read-only AWS deployment, backed by CockroachDB
 Cloud. I can ask in normal language and get readable, cited memories—not a wall
-of JSON. The memory also surfaces the open disagreement and its matching
-operator escalation instead of silently choosing a winner.” Leave “View raw
+of JSON. When retrieved evidence leads to an open typed disagreement, the
+memory shows both sides and requires operator review instead of silently
+choosing a winner.” Leave “View raw
 evidence envelope” collapsed until the cards are understood; a brief expansion
 can establish the bounded raw evidence, but it must not become the interface.
 
@@ -92,17 +99,17 @@ Show the reviewed reference-agent receipt projection below with the verified
 cloud-agent label. Hold the `agents`, step sequence, `memory`, and `actions`
 fields in view. The exact chain is:
 
-1. Agent A records migration decision claim 5: “single dedicated migrator.”
-2. Agent B recalls it through lexical+dense RRF and records action claim 6,
-   citing claim 5.
+1. Agent A records migration decision claim 15: “single dedicated migrator.”
+2. Agent B recalls it through lexical+dense RRF and records action claim 16,
+   citing claim 15.
 3. Agent C records “every worker migrates independently” as incompatible claim
-   7 under the same typed migration-strategy key, opening conflict 2.
-4. The same bound B identity records escalation claim 8, “pause rollout for
-   operator review,” citing conflict 2.
+   17 under the same typed migration-strategy key, opening conflict 5.
+4. The same bound B identity records escalation claim 18, “pause rollout for
+   operator review,” citing conflict 5.
 
 Narrate: “These were four separately bound Fargate tasks over one CockroachDB
 memory plane. A and C made incompatible current claims under the same typed
-key. Fleet Recall preserved both, opened conflict 2, and B persisted an
+key. Fleet Recall preserved both, opened conflict 5, and B persisted an
 operator handoff that cites that conflict.” This is precise typed, same-key,
 current-interval conflict detection—not a claim of corpus-wide natural-language
 contradiction detection or LLM reasoning.
@@ -111,12 +118,12 @@ contradiction detection or LLM reasoning.
 
 Switch to the reviewed replacement receipt projection under the verified cloud
 replacement label. Keep `task_definition`, `before`, `after`, and `persistence`
-visible. Narrate: “This pre-polish revision 3 proof forced a new ECS deployment.
+visible. Narrate: “This historical revision-6 proof forced a new ECS deployment.
 The before and after task sets were fully disjoint, while desired capacity
-stayed one. Exact action and escalation claims 6 and 8 were recalled both before
+stayed one. Exact action and escalation claims 16 and 18 were recalled both before
 and after through lexical+dense RRF. The workers were replaceable; CockroachDB
-remained the memory source of truth.” Explicitly say this receipt is revision 3
-evidence, separate from the current revision 4 UI.
+remained the memory source of truth.” Explicitly say this receipt is historical
+revision-6 evidence, separate from the current revision-7 UI.
 
 ### 2:12–2:30 — local-first → fleet coda
 
@@ -141,8 +148,8 @@ The verifier's output is validation-only and is not a substitute for the two
 live-cloud receipts:
 
 ```bash
-REFERENCE_RECEIPT=target/aws-evidence/reference-agent-devpost-final-20260814T021819Z.json
-REPLACEMENT_RECEIPT=target/aws-evidence/replacement-devpost-final-20260814T021819Z.json
+REFERENCE_RECEIPT=target/aws-evidence/reference-agent-devpost-final6-20260814T143523Z.json
+REPLACEMENT_RECEIPT=target/aws-evidence/replacement-devpost-final6-20260814T143523Z.json
 
 ./deploy/aws/verify-publication-receipts.sh \
   "$REFERENCE_RECEIPT" "$REPLACEMENT_RECEIPT" >/dev/null
