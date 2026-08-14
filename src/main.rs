@@ -150,7 +150,7 @@ enum Command {
         /// Scenario step. Each step requires its documented deployment-bound agent.
         #[arg(long, value_enum)]
         step: ReferenceAgentStep,
-        /// Stable scenario coordinate shared across all four steps.
+        /// Stable scenario coordinate shared across the selected scenario steps.
         #[arg(long, value_name = "ID")]
         run_id: String,
     },
@@ -2004,15 +2004,20 @@ mod tests {
         let body = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
         let page = std::str::from_utf8(&body).expect("demo page must be UTF-8");
         assert!(page.contains("When agents disagree, memory should"));
+        assert!(page.contains("Does MCP remember support deliberate retractions?"));
         assert!(
             page.contains("How are conflicting migration strategies represented and escalated?")
         );
+        assert!(page.contains("incompatible typed claims"));
+        assert!(page.contains("claim_support_chunk_index_enabled"));
+        assert!(page.contains("support_claims_matched"));
         assert!(page.contains("<details id=\"raw\" hidden>"));
         assert!(page.contains("View raw evidence envelope"));
         assert!(page.contains("response.headers.get('server-timing')"));
         assert!(page.contains("document.createElement(tag)"));
         assert!(page.contains("Verified replacement"));
         assert!(page.contains("rich-demo/docs/"));
+        assert!(page.contains("src\\/[A-Za-z0-9._/-]+\\.rs"));
         assert!(page.contains("https://github.com/os-tack/ostk-fleet-recall/blob/main/"));
         assert!(!page.contains("innerHTML"));
     }

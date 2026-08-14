@@ -139,22 +139,23 @@
     </div>
   </div>
   <h1>When agents disagree, memory should <span>say so.</span></h1>
-  <p class="lede"><strong>Fleet Recall surfaces incompatible decisions instead of silently choosing one.</strong> Search the live, project-scoped memory plane to see hybrid retrieval and typed conflict detection working together.</p>
+  <p class="lede"><strong>Fleet Recall surfaces incompatible decisions instead of silently choosing one.</strong> Search the live, project-scoped corpus; when a retrieved source is cited by incompatible typed claims, its open conflict travels with the result.</p>
 
   <div class="grid">
     <section class="panel" aria-labelledby="demo-heading">
       <p class="story-label">Conflict-aware recall</p>
       <h2 id="demo-heading">Ask the live agent memory</h2>
-      <p class="form-copy">Start with the conflict story, or try another question.</p>
+      <p class="form-copy">Start with a real specification-versus-code disagreement, or try another question.</p>
       <form id="search">
         <label for="query">Recall from the fleet</label>
         <div class="query">
-          <input id="query" maxlength="2000" value="How are conflicting migration strategies represented and escalated?" autocomplete="off" required>
+          <input id="query" maxlength="2000" value="Does MCP remember support deliberate retractions?" autocomplete="off" required>
           <button id="submit" type="submit">Recall</button>
         </div>
       </form>
       <div class="samples" aria-label="Sample queries">
-        <button type="button" data-q="How are conflicting migration strategies represented and escalated?">⚠ conflicting agents</button>
+        <button type="button" data-q="Does MCP remember support deliberate retractions?">⚠ spec vs code</button>
+        <button type="button" data-q="How are conflicting migration strategies represented and escalated?">migration conflict</button>
         <button type="button" data-q="Why did the fleet choose CockroachDB?">database choice</button>
         <button type="button" data-q="What survives an agent restart?">durability</button>
       </div>
@@ -216,6 +217,7 @@ function readable(value){
 function sourceLabel(hit){
   if(String(hit.chunk_id||'').startsWith('claim:')||hit.source==='ostk_memory')return 'Durable agent claim';
   if(hit.source==='markdown')return 'Documentation memory';
+  if(hit.source==='code')return 'Code memory';
   if(hit.source==='conversation')return 'Conversation memory';
   return readable(hit.source)||'Fleet memory';
 }
@@ -229,7 +231,7 @@ function hitCoordinate(hit){
   const repositoryCandidate=sourceId.startsWith(richDocumentPrefix)
     ?sourceId.slice(richDocumentPrefix.length)
     :sourceId;
-  const repositoryPath=/^(?:README\.md|docs\/[A-Za-z0-9._/-]+|deploy\/[A-Za-z0-9._/-]+|examples\/[A-Za-z0-9._/-]+)$/.test(repositoryCandidate)
+  const repositoryPath=/^(?:README\.md|docs\/[A-Za-z0-9._/-]+|deploy\/[A-Za-z0-9._/-]+|examples\/[A-Za-z0-9._/-]+|src\/[A-Za-z0-9._/-]+\.rs)$/.test(repositoryCandidate)
     && !repositoryCandidate.split('/').includes('..');
   const displayValue=repositoryPath?repositoryCandidate:sourceId;
   const display=displayValue.length>80?`${displayValue.slice(0,79)}…`:displayValue;
@@ -301,6 +303,7 @@ function renderResult(body){
   const hits=uniqueHits(body);
   const conflicts=Array.isArray(body?.conflicts)?body.conflicts:[];
   const conflict=chooseConflict(conflicts);
+  const supportClaims=Number(body?.diagnostics?.retrieval?.support_claims_matched);
 
   if(conflict){
     const members=Array.isArray(conflict.members)?conflict.members:[];
@@ -315,7 +318,10 @@ function renderResult(body){
     callout.append(element('p','conflict-copy',escalated?'The typed same-key conflict remains open → escalated for operator review.':'The typed same-key conflict remains open → operator review required.'));
     const coverage=body?.conflict_coverage;
     const scope=coverage?.scope==='tenant_project'?'tenant + project scoped':readable(coverage?.scope)||'project scoped';
-    callout.append(element('p','coverage-note',`Typed same-key detector · ${scope} · ${readable(coverage?.status)||'bounded'} coverage`));
+    const sourceLink=Number.isSafeInteger(supportClaims)&&supportClaims>0
+      ?` · ${supportClaims} source-backed typed claim${supportClaims===1?'':'s'} matched`
+      :'';
+    callout.append(element('p','coverage-note',`Typed same-key detector · ${scope}${sourceLink} · ${readable(coverage?.status)||'bounded'} coverage`));
     answer.append(callout);
   }
 
@@ -393,6 +399,7 @@ async function loadStatus(){
     if(database.vector_index_enabled)indexes.push('vector');
     if(database.lexical_index_enabled)indexes.push('lexical');
     if(database.conflict_membership_index_enabled)indexes.push('conflict membership');
+    if(database.claim_support_chunk_index_enabled)indexes.push('source support');
     const indexText=indexes.length?`${indexes.join(' + ')} indexes`:'indexes checked';
     const state=readable(data.status)||'status unknown';
     statusText.textContent=`CockroachDB ${version} · ${indexText} · ${state}`;
@@ -434,9 +441,13 @@ form.addEventListener('submit',async event=>{
     const roundTripMs=Math.max(0,performance.now()-started);
     const lanes=Array.isArray(body?.diagnostics?.retrieval?.lanes)?body.diagnostics.retrieval.lanes:[];
     const retrieval=lanes.length?`${lanes.map(lane=>lane==='dense'?'vector':readable(lane)).join(' + ')} · RRF · `:'';
+    const supportClaims=Number(body?.diagnostics?.retrieval?.support_claims_matched);
+    const supportText=Number.isSafeInteger(supportClaims)&&supportClaims>0
+      ?`${supportClaims} source-backed claim${supportClaims===1?'':'s'} · `
+      :'';
     queryMeta.textContent=serverMs===null
-      ?`${retrieval}${Math.round(roundTripMs)} ms round trip`
-      :`${retrieval}retrieved + fused in ${Math.round(serverMs)} ms server time · ${Math.round(roundTripMs)} ms round trip`;
+      ?`${retrieval}${supportText}${Math.round(roundTripMs)} ms round trip`
+      :`${retrieval}${supportText}retrieved + fused in ${Math.round(serverMs)} ms server time · ${Math.round(roundTripMs)} ms round trip`;
     renderResult(body);
     rawResult.textContent=JSON.stringify(body,null,2);
     raw.hidden=false;
