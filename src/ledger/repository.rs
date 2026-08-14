@@ -7,6 +7,10 @@ use crate::{FleetScope, Result};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupportedClaimIds {
     pub claim_ids: Vec<i64>,
+    /// Surfaced corpus chunks that exactly support at least one projected
+    /// claim. These are current, hash-bound coordinates rather than every
+    /// chunk ever cited by the selected claims.
+    pub supporting_chunk_ids: Vec<String>,
     /// True when more matching claims existed than the requested projection.
     pub truncated: bool,
 }

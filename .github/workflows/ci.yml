@@ -22,6 +22,8 @@ jobs:
             -o "$RUNNER_TEMP/fleet-recall-architecture.md"
       - name: Validate submission images
         run: ./docs/assets/verify-media.sh
+      - name: Test demo source-card ordering
+        run: node --test demo/tests/source-card-order.test.mjs
 
   video:
     runs-on: ubuntu-24.04

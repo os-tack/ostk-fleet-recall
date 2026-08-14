@@ -34,6 +34,7 @@ pub struct CockroachMemoryService {
 struct ChunkConflictProjection {
     conflicts: Vec<Conflict>,
     support_claim_count: usize,
+    supporting_chunk_ids: Vec<String>,
     support_claims_truncated: bool,
 }
 
@@ -160,6 +161,7 @@ impl CockroachMemoryService {
         let support_matches = if evidence_chunk_ids.is_empty() {
             crate::ledger::SupportedClaimIds {
                 claim_ids: Vec::new(),
+                supporting_chunk_ids: Vec::new(),
                 truncated: false,
             }
         } else {
@@ -168,9 +170,14 @@ impl CockroachMemoryService {
                 .await
                 .map_err(service_error)?
         };
-        let support_claim_count = support_matches.claim_ids.len();
-        let support_claims_truncated = support_matches.truncated
-            || merge_supported_claim_ids(&mut claim_ids, support_matches.claim_ids);
+        let crate::ledger::SupportedClaimIds {
+            claim_ids: supported_claim_ids,
+            supporting_chunk_ids,
+            truncated,
+        } = support_matches;
+        let support_claim_count = supported_claim_ids.len();
+        let support_claims_truncated =
+            truncated || merge_supported_claim_ids(&mut claim_ids, supported_claim_ids);
         let conflicts = if claim_ids.is_empty() {
             Vec::new()
         } else {
@@ -182,6 +189,7 @@ impl CockroachMemoryService {
         Ok(ChunkConflictProjection {
             conflicts,
             support_claim_count,
+            supporting_chunk_ids,
             support_claims_truncated,
         })
     }
@@ -242,6 +250,7 @@ impl CockroachMemoryService {
                         "fusion": "rrf",
                         "metadata_elided": metadata_elided,
                         "support_claims_matched": projection.support_claim_count,
+                        "supporting_chunk_ids": projection.supporting_chunk_ids,
                         "support_claims_truncated": projection.support_claims_truncated,
                     }),
                 );

@@ -61,17 +61,30 @@ const CONFLICT_CLAIM_PROJECTION_SQL: &str = "SELECT id, project, kind, claim_key
 const CLAIM_CONFLICT_IDS_SQL: &str = "SELECT claim_id, conflict_id FROM memory_conflict_members@{NO_FULL_SCAN} \
      WHERE tenant_id = $1 AND project = $2 AND claim_id = ANY($3) \
      ORDER BY claim_id, conflict_id";
-const SUPPORTED_CLAIM_IDS_SQL: &str = "SELECT DISTINCT support.claim_id \
-     FROM memory_claim_support@{NO_FULL_SCAN} AS support \
-     JOIN memory_chunks@{NO_FULL_SCAN} AS chunk \
-       ON chunk.tenant_id = support.tenant_id AND chunk.project = support.project \
-      AND chunk.source_config_id = support.source_config_id AND chunk.source = support.source \
-      AND chunk.source_id = support.source_id AND chunk.chunk_id = support.chunk_id \
-      AND chunk.content_sha256 = support.content_sha256 \
-     WHERE support.tenant_id = $1 AND support.project = $2 \
-       AND support.chunk_id = ANY($3) AND support.content_sha256 IS NOT NULL \
-       AND support.state = 'current' \
-     ORDER BY support.claim_id LIMIT $4";
+const SUPPORTED_CLAIM_IDS_SQL: &str = "WITH matched_support AS (\
+       SELECT DISTINCT support.claim_id, support.chunk_id \
+       FROM memory_claim_support@{NO_FULL_SCAN} AS support \
+       JOIN memory_chunks@{NO_FULL_SCAN} AS chunk \
+         ON chunk.tenant_id = support.tenant_id AND chunk.project = support.project \
+        AND chunk.source_config_id = support.source_config_id AND chunk.source = support.source \
+        AND chunk.source_id = support.source_id AND chunk.chunk_id = support.chunk_id \
+        AND chunk.content_sha256 = support.content_sha256 \
+       WHERE support.tenant_id = $1 AND support.project = $2 \
+         AND support.chunk_id = ANY($3) AND support.content_sha256 IS NOT NULL \
+         AND support.state = 'current'\
+     ), bounded_claims AS (\
+       SELECT DISTINCT claim_id FROM matched_support ORDER BY claim_id LIMIT $4\
+     ), selected_claims AS (\
+       SELECT claim_id FROM bounded_claims ORDER BY claim_id LIMIT $5\
+     ), selected_chunks AS (\
+       SELECT DISTINCT matched.chunk_id \
+       FROM matched_support AS matched \
+       JOIN selected_claims AS selected ON selected.claim_id = matched.claim_id \
+       ORDER BY matched.chunk_id LIMIT $6\
+     ) \
+     SELECT claim_id, NULL::STRING AS chunk_id FROM bounded_claims \
+     UNION ALL \
+     SELECT NULL::INT8 AS claim_id, chunk_id FROM selected_chunks";
 const SUPPORT_CHUNK_MATCH_SQL: &str = "SELECT EXISTS(\
          SELECT 1 FROM memory_chunks@{NO_FULL_SCAN} \
          WHERE tenant_id = $1 AND project = $2 AND chunk_id = $3 \
@@ -708,6 +721,7 @@ impl ClaimLedger for CockroachClaimLedger {
         if chunk_ids.is_empty() {
             return Ok(SupportedClaimIds {
                 claim_ids: Vec::new(),
+                supporting_chunk_ids: Vec::new(),
                 truncated: false,
             });
         }
@@ -728,7 +742,7 @@ impl ClaimLedger for CockroachClaimLedger {
         let sentinel_limit = limit
             .checked_add(1)
             .ok_or_else(|| FleetError::Memory("support claim limit overflow".into()))?;
-        let mut claim_ids = sqlx::query_scalar::<_, i64>(SUPPORTED_CLAIM_IDS_SQL)
+        let rows = sqlx::query(SUPPORTED_CLAIM_IDS_SQL)
             .bind(scope.tenant_id)
             .bind(&scope.project)
             .bind(chunk_ids)
@@ -736,15 +750,69 @@ impl ClaimLedger for CockroachClaimLedger {
                 i64::try_from(sentinel_limit)
                     .map_err(|_| FleetError::Memory("support claim limit exceeds INT8".into()))?,
             )
+            .bind(
+                i64::try_from(limit)
+                    .map_err(|_| FleetError::Memory("support claim limit exceeds INT8".into()))?,
+            )
+            .bind(
+                i64::try_from(chunk_ids.len()).map_err(|_| {
+                    FleetError::Memory("supporting chunk limit exceeds INT8".into())
+                })?,
+            )
             .fetch_all(&self.pool)
             .await?;
-        let truncated = claim_ids.len() > limit;
-        claim_ids.truncate(limit);
-        Ok(SupportedClaimIds {
-            claim_ids,
-            truncated,
-        })
+        let mut coordinates = Vec::with_capacity(rows.len());
+        for row in rows {
+            coordinates.push((
+                row.try_get::<Option<i64>, _>("claim_id")?,
+                row.try_get::<Option<String>, _>("chunk_id")?,
+            ));
+        }
+        assemble_supported_claim_projection(coordinates, limit, chunk_ids)
     }
+}
+
+fn assemble_supported_claim_projection(
+    coordinates: Vec<(Option<i64>, Option<String>)>,
+    claim_limit: usize,
+    surfaced_chunk_ids: &[String],
+) -> Result<SupportedClaimIds> {
+    let surfaced_chunk_ids = surfaced_chunk_ids.iter().collect::<HashSet<_>>();
+    let mut claim_ids = Vec::new();
+    let mut supporting_chunk_ids = Vec::new();
+    for (claim_id, chunk_id) in coordinates {
+        match (claim_id, chunk_id) {
+            (Some(claim_id), None) if claim_id > 0 => claim_ids.push(claim_id),
+            (None, Some(chunk_id))
+                if !chunk_id.is_empty()
+                    && chunk_id.len() <= 256
+                    && surfaced_chunk_ids.contains(&chunk_id) =>
+            {
+                supporting_chunk_ids.push(chunk_id);
+            }
+            _ => {
+                return Err(FleetError::Memory(
+                    "invalid supported-claim projection returned by database".into(),
+                ));
+            }
+        }
+    }
+    claim_ids.sort_unstable();
+    claim_ids.dedup();
+    supporting_chunk_ids.sort_unstable();
+    supporting_chunk_ids.dedup();
+    if supporting_chunk_ids.len() > surfaced_chunk_ids.len() {
+        return Err(FleetError::Memory(
+            "supported-claim projection exceeded supporting chunk bound".into(),
+        ));
+    }
+    let truncated = claim_ids.len() > claim_limit;
+    claim_ids.truncate(claim_limit);
+    Ok(SupportedClaimIds {
+        claim_ids,
+        supporting_chunk_ids,
+        truncated,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1561,9 +1629,59 @@ mod tests {
         assert!(SUPPORTED_CLAIM_IDS_SQL.contains("support.chunk_id = ANY($3)"));
         assert!(SUPPORTED_CLAIM_IDS_SQL.contains("support.content_sha256 IS NOT NULL"));
         assert!(SUPPORTED_CLAIM_IDS_SQL.contains("support.state = 'current'"));
-        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("ORDER BY support.claim_id LIMIT $4"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("bounded_claims AS"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("ORDER BY claim_id LIMIT $4"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("selected_claims AS"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("ORDER BY claim_id LIMIT $5"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("selected_chunks AS"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("ORDER BY matched.chunk_id LIMIT $6"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("NULL::STRING AS chunk_id"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("NULL::INT8 AS claim_id"));
         assert!(SUPPORT_CHUNK_MATCH_SQL.contains("memory_chunks@{NO_FULL_SCAN}"));
         assert!(SUPPORT_CHUNK_MATCH_SQL.contains("content_sha256 = $7"));
+    }
+
+    #[test]
+    fn supported_claim_projection_maps_chunks_and_keeps_claim_sentinel_semantics() {
+        let projection = assemble_supported_claim_projection(
+            vec![
+                (Some(3), None),
+                (None, Some("source-b".into())),
+                (Some(1), None),
+                (Some(2), None),
+                (Some(2), None),
+                (None, Some("source-a".into())),
+                (None, Some("source-a".into())),
+            ],
+            2,
+            &["source-a".into(), "source-b".into()],
+        )
+        .unwrap();
+
+        assert_eq!(projection.claim_ids, [1, 2]);
+        assert_eq!(projection.supporting_chunk_ids, ["source-a", "source-b"]);
+        assert!(projection.truncated);
+
+        assert!(
+            assemble_supported_claim_projection(
+                vec![
+                    (Some(1), None),
+                    (None, Some("source-a".into())),
+                    (None, Some("source-b".into())),
+                ],
+                1,
+                &["source-a".into()],
+            )
+            .is_err()
+        );
+        assert!(
+            assemble_supported_claim_projection(
+                vec![(Some(1), Some("source-a".into()))],
+                1,
+                &["source-a".into()],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1837,6 +1955,10 @@ mod tests {
                 .into_iter()
                 .collect::<HashSet<_>>()
         );
+        assert_eq!(
+            supported.supporting_chunk_ids,
+            std::slice::from_ref(&support_chunk_id)
+        );
         let support_conflicts = ledger
             .conflicts_for_claim_ids(&scope, &supported.claim_ids, 10)
             .await
@@ -1848,6 +1970,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bounded_supported.claim_ids.len(), 1);
+        assert_eq!(
+            bounded_supported.supporting_chunk_ids,
+            std::slice::from_ref(&support_chunk_id)
+        );
         assert!(bounded_supported.truncated);
 
         // A stable chunk ID may be replaced as its source evolves. Historical
@@ -1879,6 +2005,7 @@ mod tests {
             .await
             .unwrap();
         assert!(stale_supported.claim_ids.is_empty());
+        assert!(stale_supported.supporting_chunk_ids.is_empty());
         assert!(!stale_supported.truncated);
 
         // Restore the original source revision so the remainder of this

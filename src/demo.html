@@ -181,7 +181,7 @@
         <li><strong>Retrieval</strong>Lexical + C-SPANN vector lanes, reciprocal-rank fused</li>
         <li><strong>Isolation</strong>Tenant and project scope is trusted server configuration</li>
         <li><strong>Durability</strong>Shared memory survives individual agent and task replacement</li>
-        <li><strong>Verified replacement</strong><code>devpost-final-20260814T021819Z</code> replaced the full serving task set; the same cited action and escalation remained recallable (pre-polish rev3 evidence)</li>
+        <li><strong>Verified cloud evidence</strong><code>devpost-schema2-20260814T134502Z</code> replaced the full revision 5 serving task set; exact cited action claim #12 and escalation claim #14 remained recallable under schema 2</li>
         <li><strong>Runtime</strong>AWS ECS/Fargate backed by CockroachDB Cloud</li>
       </ul>
       <div class="read-only"><span class="lock" aria-hidden="true">●</span><span>This public experience is bounded and read-only. Writes stay behind the canonical MCP <code>remember</code> tool.</span></div>
@@ -275,10 +275,25 @@ function chooseConflict(conflicts){
     .sort((left,right)=>Date.parse(right.detected_at||right.last_seen_at||0)-Date.parse(left.detected_at||left.last_seen_at||0))[0]||null;
 }
 
+function isClaimProjection(hit){
+  const claimId=Number(hit?.extra?.claim_id);
+  return (Number.isSafeInteger(claimId)&&claimId>0)||String(hit?.chunk_id||'').startsWith('claim:')||hit?.source==='ostk_memory';
+}
+
 function uniqueHits(body){
   const hits=Array.isArray(body?.data?.hits)?body.data.hits:[];
+  const supportingIds=new Set(
+    (Array.isArray(body?.diagnostics?.retrieval?.supporting_chunk_ids)
+      ?body.diagnostics.retrieval.supporting_chunk_ids:[])
+      .filter(id=>typeof id==='string'&&id.length>0&&id.length<=256)
+      .slice(0,100)
+  );
+  const prioritized=hits
+    .map((hit,index)=>({hit,index,supporting:!isClaimProjection(hit)&&supportingIds.has(hit?.chunk_id)}))
+    .sort((left,right)=>Number(right.supporting)-Number(left.supporting)||left.index-right.index)
+    .map(candidate=>candidate.hit);
   const seen=new Set();
-  return hits.filter(hit=>{
+  return prioritized.filter(hit=>{
     const text=String(hit?.snippet||hit?.text||'').trim();
     const key=text.toLocaleLowerCase().replace(/\s+/g,' ');
     if(!text||seen.has(key))return false;

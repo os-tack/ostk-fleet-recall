@@ -2011,11 +2011,14 @@ mod tests {
         assert!(page.contains("incompatible typed claims"));
         assert!(page.contains("claim_support_chunk_index_enabled"));
         assert!(page.contains("support_claims_matched"));
+        assert!(page.contains("supporting_chunk_ids"));
         assert!(page.contains("<details id=\"raw\" hidden>"));
         assert!(page.contains("View raw evidence envelope"));
         assert!(page.contains("response.headers.get('server-timing')"));
         assert!(page.contains("document.createElement(tag)"));
-        assert!(page.contains("Verified replacement"));
+        assert!(page.contains("Verified cloud evidence"));
+        assert!(page.contains("devpost-schema2-20260814T134502Z"));
+        assert!(page.contains("action claim #12 and escalation claim #14"));
         assert!(page.contains("rich-demo/docs/"));
         assert!(page.contains("src\\/[A-Za-z0-9._/-]+\\.rs"));
         assert!(page.contains("https://github.com/os-tack/ostk-fleet-recall/blob/main/"));
