@@ -1,9 +1,10 @@
 # AWS deployment runbook
 
 This Terraform module deploys the public, read-only Fleet Recall demo to an
-ECS/Fargate service behind an Application Load Balancer. CockroachDB Cloud is
-the durable memory plane. A private S3 prefix delivers the pinned local
-model2vec bundle to each replaceable task.
+ECS/Fargate service behind an Application Load Balancer. An optional CloudFront
+distribution provides an HTTPS front door on its generated `cloudfront.net`
+hostname. CockroachDB Cloud is the durable memory plane. A private S3 prefix
+delivers the pinned local model2vec bundle to each replaceable task.
 
 The module is intentionally safe to bootstrap: its default service and
 autoscaling minimum are zero. Run the one-off migration successfully before
@@ -82,10 +83,11 @@ authoritative state. Preserve its versions and access through the judging hold
 and until every managed resource has been intentionally destroyed. Native S3
 lock files require Terraform 1.10 or newer.
 
-The current Terraform suite contains eleven runs covering dormant bootstrap,
-TLS hostname binding, model-prefix/bucket validation, capacity ordering, and
-supported CloudWatch retention. Passing it validates configuration logic; it
-does not prove that AWS resources have been deployed.
+The current Terraform suite contains thirteen runs covering dormant bootstrap,
+direct TLS hostname binding, the isolated CloudFront front door,
+mutually-exclusive TLS modes, model-prefix/bucket validation, capacity
+ordering, and supported CloudWatch retention. Passing it validates
+configuration logic; it does not prove that AWS resources have been deployed.
 
 Log in to the output repository and push one immutable, architecture-matched
 tag. Run this from the repository root:
@@ -180,12 +182,41 @@ curl --fail --silent --show-error \
   "$DEMO_URL/api/recall" | jq -e '.data.hits | length >= 1'
 ```
 
-For the public submission, point a DNS name at the ALB and set both an ACM
-`certificate_arn` and its covered `demo_hostname`. Terraform changes port 80
-into an HTTPS redirect and outputs the application hostname—not the ALB's
-`amazonaws.com` name, which normally does not match the certificate. DNS record
-creation remains explicit because the authoritative Route 53 zone may live in
-another account. The listener serves TLS 1.2 or newer.
+Choose exactly one HTTPS mode for the public submission:
+
+- Set `enable_cloudfront = true` and leave `certificate_arn = null` to use the
+  generated CloudFront hostname. Terraform outputs
+  `https://<distribution>.cloudfront.net`, requires HTTPS from viewers, disables
+  caching, and forwards request bodies and `Content-Type` but no viewer cookies,
+  query strings, or `Authorization` header. The default behavior accepts only
+  `GET`/`HEAD`; the ordered `/api/recall` behavior accepts all CloudFront methods
+  so the bounded `POST` endpoint works. Security response headers and
+  `Cache-Control: no-store, max-age=0` are applied at the edge, and transient
+  500/502/503/504 responses have a zero error-cache TTL.
+- To use your own hostname, leave `enable_cloudfront = false`, point DNS at the
+  ALB, and set both a regional ACM `certificate_arn` and its covered
+  `demo_hostname`. Terraform changes port 80 into an HTTPS redirect and outputs
+  the application hostname—not the ALB's `amazonaws.com` name, which normally
+  does not match the certificate. DNS creation remains explicit because the
+  authoritative Route 53 zone may live in another account. The ALB listener
+  serves TLS 1.2 or newer.
+
+The modes are mutually exclusive. The default CloudFront certificate requires
+the generated `cloudfront.net` hostname and AWS fixes its viewer security policy
+at a TLSv1 minimum; it still negotiates newer TLS with capable clients. A custom
+CloudFront certificate/security policy is intentionally out of scope. Use the
+direct ACM mode when a custom hostname or a TLS 1.2 minimum is required.
+
+CloudFront connects to the ALB over HTTP port 80. That hop is deliberately
+isolated in two layers: the ALB security group replaces public CIDR ingress with
+AWS's `com.amazonaws.global.cloudfront.origin-facing` managed prefix list, and
+the listener returns 403 unless a 48-character origin header matches. Terraform
+generates the header with the Random provider, treats it as sensitive, persists
+it in encrypted remote Terraform state, and never outputs it. Anyone who can
+read Terraform state can still recover it, so keep state access
+least-privileged. The managed prefix list consumes 55 security-group rule quota
+entries; confirm the account's security-group quota before enabling this mode.
+Distribution creation and updates can take several minutes.
 
 After the first successful recall, force one ECS task replacement and repeat
 the exact query. The replacement must return a hit from the unchanged
@@ -359,11 +390,12 @@ HTTP API; the hackathon demo surface is intentionally read-only.
 
 The [official rules](https://cockroachdb-ai.devpost.com/rules) require the
 working project to remain available free of charge and without restriction
-through the end of judging. Once submitted, keep the ECS service, ALB and
-HTTPS/DNS route, CockroachDB Cloud database, S3 model bundle, runtime secret,
-network egress, and required logs available through **September 15, 2026 at
-5:00 PM EDT / 4:00 PM CDT**. Monitor `/healthz` and a bounded recall query, and
-repair failures without revoking judge access.
+through the end of judging. Once submitted, keep the ECS service, ALB,
+CloudFront distribution when enabled, HTTPS/DNS route, CockroachDB Cloud
+database, S3 model bundle, runtime secret, network egress, and required logs
+available through **September 15, 2026 at 5:00 PM EDT / 4:00 PM CDT**. Monitor
+`/healthz` and a bounded recall query, and repair failures without revoking judge
+access.
 
 Do not set the service or autoscaling minimum to zero, delete supporting
 resources, revoke credentials or network access, or run Terraform destroy

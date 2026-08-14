@@ -7,9 +7,32 @@ mock_provider "aws" {
     }
   }
 
+  mock_data "aws_ec2_managed_prefix_list" {
+    defaults = {
+      id = "pl-cloudfront-origin-facing"
+    }
+  }
+
   mock_resource "aws_ecr_repository" {
     defaults = {
       repository_url = "123456789012.dkr.ecr.us-east-1.amazonaws.com/ostk-fleet-recall-test"
+    }
+  }
+
+  mock_resource "aws_cloudfront_distribution" {
+    defaults = {
+      id          = "EDFDVBD6EXAMPLE"
+      domain_name = "d111111abcdef8.cloudfront.net"
+    }
+  }
+}
+
+mock_provider "random" {
+  override_during = plan
+
+  mock_resource "random_password" {
+    defaults = {
+      result = "mock-origin-header-value-with-48-safe-characters-000"
     }
   }
 }
@@ -114,6 +137,15 @@ run "dormant_http_bootstrap" {
     condition     = startswith(output.demo_url, "http://")
     error_message = "a certificate-free bootstrap must advertise HTTP, not false TLS"
   }
+
+  assert {
+    condition = (
+      length(aws_cloudfront_distribution.app) == 0 &&
+      output.cloudfront_distribution_id == null &&
+      aws_lb_listener.http[0].default_action[0].type == "forward"
+    )
+    error_message = "the default direct mode must preserve the existing forwarding HTTP listener without CloudFront"
+  }
 }
 
 run "tls_uses_certificate_hostname" {
@@ -128,6 +160,116 @@ run "tls_uses_certificate_hostname" {
     condition     = output.demo_url == "https://recall.example.com"
     error_message = "TLS output must use the certificate-covered hostname, not the ALB hostname"
   }
+
+  assert {
+    condition = (
+      length(aws_cloudfront_distribution.app) == 0 &&
+      length(aws_lb_listener.https) == 1 &&
+      aws_lb_listener.http_redirect[0].default_action[0].type == "redirect"
+    )
+    error_message = "the direct custom-ACM mode must remain available without creating CloudFront"
+  }
+}
+
+run "cloudfront_https_front_door" {
+  command = plan
+
+  variables {
+    enable_cloudfront = true
+  }
+
+  assert {
+    condition = (
+      output.demo_url == "https://d111111abcdef8.cloudfront.net" &&
+      output.cloudfront_distribution_id == "EDFDVBD6EXAMPLE"
+    )
+    error_message = "CloudFront mode must advertise the generated HTTPS hostname and distribution ID"
+  }
+
+  assert {
+    condition = (
+      data.aws_ec2_managed_prefix_list.cloudfront_origin_facing[0].name == "com.amazonaws.global.cloudfront.origin-facing" &&
+      length(aws_security_group.alb.ingress) == 1 &&
+      toset(one(aws_security_group.alb.ingress).prefix_list_ids) == toset(["pl-cloudfront-origin-facing"]) &&
+      one(aws_security_group.alb.ingress).cidr_blocks == null
+    )
+    error_message = "CloudFront mode must replace public ALB ingress with the AWS-managed origin-facing prefix list"
+  }
+
+  assert {
+    condition = (
+      aws_lb_listener.http[0].default_action[0].type == "fixed-response" &&
+      aws_lb_listener.http[0].default_action[0].fixed_response[0].status_code == "403" &&
+      aws_lb_listener_rule.cloudfront_origin[0].action[0].type == "forward" &&
+      one(aws_lb_listener_rule.cloudfront_origin[0].condition).http_header[0].http_header_name == local.cloudfront_origin_header_name &&
+      toset(one(aws_lb_listener_rule.cloudfront_origin[0].condition).http_header[0].values) == toset([random_password.cloudfront_origin[0].result])
+    )
+    error_message = "the ALB must deny requests by default and forward only the secret CloudFront origin header"
+  }
+
+  assert {
+    condition = (
+      random_password.cloudfront_origin[0].length == 48 &&
+      !random_password.cloudfront_origin[0].special &&
+      one(one(aws_cloudfront_distribution.app[0].origin).custom_header).name == local.cloudfront_origin_header_name &&
+      one(one(aws_cloudfront_distribution.app[0].origin).custom_header).value == random_password.cloudfront_origin[0].result &&
+      one(aws_cloudfront_distribution.app[0].origin).custom_origin_config[0].origin_protocol_policy == "http-only"
+    )
+    error_message = "CloudFront must use the generated secret header and HTTP-only ALB origin"
+  }
+
+  assert {
+    condition = (
+      aws_cloudfront_cache_policy.disabled[0].default_ttl == 0 &&
+      aws_cloudfront_cache_policy.disabled[0].min_ttl == 0 &&
+      aws_cloudfront_cache_policy.disabled[0].max_ttl == 0 &&
+      aws_cloudfront_cache_policy.disabled[0].parameters_in_cache_key_and_forwarded_to_origin[0].cookies_config[0].cookie_behavior == "none" &&
+      aws_cloudfront_cache_policy.disabled[0].parameters_in_cache_key_and_forwarded_to_origin[0].query_strings_config[0].query_string_behavior == "none" &&
+      aws_cloudfront_origin_request_policy.minimal[0].cookies_config[0].cookie_behavior == "none" &&
+      aws_cloudfront_origin_request_policy.minimal[0].query_strings_config[0].query_string_behavior == "none" &&
+      aws_cloudfront_origin_request_policy.minimal[0].headers_config[0].header_behavior == "whitelist" &&
+      toset(aws_cloudfront_origin_request_policy.minimal[0].headers_config[0].headers[0].items) == toset(["Content-Type"])
+    )
+    error_message = "CloudFront must disable caching and must not forward cookies, query strings, or authorization"
+  }
+
+  assert {
+    condition = (
+      toset(aws_cloudfront_distribution.app[0].default_cache_behavior[0].allowed_methods) == toset(["GET", "HEAD"]) &&
+      aws_cloudfront_distribution.app[0].default_cache_behavior[0].viewer_protocol_policy == "https-only" &&
+      aws_cloudfront_distribution.app[0].ordered_cache_behavior[0].path_pattern == "/api/recall" &&
+      toset(aws_cloudfront_distribution.app[0].ordered_cache_behavior[0].allowed_methods) == toset(["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]) &&
+      aws_cloudfront_distribution.app[0].ordered_cache_behavior[0].viewer_protocol_policy == "https-only" &&
+      aws_cloudfront_distribution.app[0].viewer_certificate[0].cloudfront_default_certificate
+    )
+    error_message = "CloudFront must require HTTPS, expose only reads by default, and allow all methods only on /api/recall"
+  }
+
+  assert {
+    condition = (
+      aws_cloudfront_response_headers_policy.security[0].security_headers_config[0].content_type_options[0].override &&
+      aws_cloudfront_response_headers_policy.security[0].security_headers_config[0].frame_options[0].frame_option == "DENY" &&
+      aws_cloudfront_response_headers_policy.security[0].security_headers_config[0].strict_transport_security[0].access_control_max_age_sec == 63072000 &&
+      one(aws_cloudfront_response_headers_policy.security[0].custom_headers_config[0].items).header == "Cache-Control" &&
+      one(aws_cloudfront_response_headers_policy.security[0].custom_headers_config[0].items).value == "no-store, max-age=0" &&
+      one(aws_cloudfront_response_headers_policy.security[0].custom_headers_config[0].items).override &&
+      toset([for response in aws_cloudfront_distribution.app[0].custom_error_response : response.error_code]) == toset([500, 502, 503, 504]) &&
+      alltrue([for response in aws_cloudfront_distribution.app[0].custom_error_response : response.error_caching_min_ttl == 0])
+    )
+    error_message = "CloudFront must add browser security headers and avoid caching transient origin errors"
+  }
+}
+
+run "rejects_cloudfront_with_direct_alb_certificate" {
+  command = plan
+
+  variables {
+    enable_cloudfront = true
+    certificate_arn   = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000001"
+    demo_hostname     = "recall.example.com"
+  }
+
+  expect_failures = [var.enable_cloudfront]
 }
 
 run "rejects_iam_wildcards_in_model_prefix" {

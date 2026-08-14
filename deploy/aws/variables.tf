@@ -47,20 +47,31 @@ variable "assign_public_ip" {
 }
 
 variable "alb_ingress_cidrs" {
-  description = "IPv4 networks allowed to reach the public demo."
+  description = "IPv4 networks allowed to reach the ALB when CloudFront is disabled."
   type        = list(string)
   default     = ["0.0.0.0/0"]
 }
 
+variable "enable_cloudfront" {
+  description = "Put the ALB behind an HTTPS-only CloudFront distribution using its default cloudfront.net certificate."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.enable_cloudfront || var.certificate_arn == null
+    error_message = "enable_cloudfront and certificate_arn are mutually exclusive; use either the CloudFront front door or direct ALB TLS."
+  }
+}
+
 variable "certificate_arn" {
-  description = "Optional ACM certificate ARN. When set, HTTP redirects to HTTPS."
+  description = "Optional ALB ACM certificate ARN. When set without CloudFront, HTTP redirects to HTTPS."
   type        = string
   default     = null
   nullable    = true
 }
 
 variable "demo_hostname" {
-  description = "Public DNS hostname covered by certificate_arn. Required when TLS is enabled."
+  description = "Public DNS hostname covered by certificate_arn. Required when direct ALB TLS is enabled."
   type        = string
   default     = null
   nullable    = true

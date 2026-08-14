@@ -35,7 +35,13 @@ autoscaling_max_capacity  = 2
 log_retention_days         = 60
 enable_deletion_protection = true
 
-# Add an ACM certificate after pointing application DNS at the ALB.
+# HTTPS option 1: use the generated cloudfront.net hostname. Terraform generates
+# the sensitive origin-header value, persists it in encrypted remote state, and
+# never outputs it.
+enable_cloudfront = false
+
+# HTTPS option 2: add an ACM certificate after pointing application DNS at the
+# ALB. This direct mode is mutually exclusive with enable_cloudfront = true.
 certificate_arn = null
 demo_hostname   = null
 

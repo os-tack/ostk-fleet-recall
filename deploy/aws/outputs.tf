@@ -4,8 +4,15 @@ output "ecr_repository_url" {
 }
 
 output "demo_url" {
-  description = "Public demo endpoint. With TLS this uses the certificate-covered application hostname, never the ALB hostname."
-  value       = var.certificate_arn == null ? "http://${aws_lb.app.dns_name}" : "https://${coalesce(var.demo_hostname, "invalid.invalid")}"
+  description = "Public demo endpoint: the CloudFront HTTPS hostname, direct ALB HTTP, or the certificate-covered direct ALB hostname."
+  value = var.enable_cloudfront ? "https://${aws_cloudfront_distribution.app[0].domain_name}" : (
+    var.certificate_arn == null ? "http://${aws_lb.app.dns_name}" : "https://${coalesce(var.demo_hostname, "invalid.invalid")}"
+  )
+}
+
+output "cloudfront_distribution_id" {
+  description = "CloudFront distribution ID, or null when the front door is disabled."
+  value       = var.enable_cloudfront ? aws_cloudfront_distribution.app[0].id : null
 }
 
 output "cluster_name" {

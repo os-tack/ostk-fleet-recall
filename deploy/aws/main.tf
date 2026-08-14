@@ -1,8 +1,10 @@
 locals {
-  container_name = "memory"
-  container_port = 8080
-  app_command    = ["demo", "--listen", "0.0.0.0:8080"]
-  seed_command   = ["ingest", "--input", "/opt/ostk/demo/demo.ndjson"]
+  container_name                = "memory"
+  container_port                = 8080
+  cloudfront_origin_header_name = "X-Fleet-Recall-Origin"
+  cloudfront_origin_id          = "fleet-recall-alb"
+  app_command                   = ["demo", "--listen", "0.0.0.0:8080"]
+  seed_command                  = ["ingest", "--input", "/opt/ostk/demo/demo.ndjson"]
   reference_agent_command = [
     "reference-agent", "--step", "record-decision", "--run-id", "terraform-placeholder"
   ]
@@ -158,7 +160,7 @@ resource "aws_security_group" "alb" {
   vpc_id      = var.vpc_id
 
   dynamic "ingress" {
-    for_each = var.alb_ingress_cidrs
+    for_each = var.enable_cloudfront ? [] : var.alb_ingress_cidrs
     content {
       description = "HTTP demo traffic"
       protocol    = "tcp"
@@ -169,7 +171,18 @@ resource "aws_security_group" "alb" {
   }
 
   dynamic "ingress" {
-    for_each = var.certificate_arn == null ? [] : var.alb_ingress_cidrs
+    for_each = var.enable_cloudfront ? [data.aws_ec2_managed_prefix_list.cloudfront_origin_facing[0].id] : []
+    content {
+      description     = "HTTP origin traffic from CloudFront"
+      protocol        = "tcp"
+      from_port       = 80
+      to_port         = 80
+      prefix_list_ids = [ingress.value]
+    }
+  }
+
+  dynamic "ingress" {
+    for_each = var.certificate_arn == null || var.enable_cloudfront ? [] : var.alb_ingress_cidrs
     content {
       description = "HTTPS demo traffic"
       protocol    = "tcp"
@@ -190,6 +203,12 @@ resource "aws_security_group" "alb" {
   lifecycle {
     create_before_destroy = true
   }
+}
+
+data "aws_ec2_managed_prefix_list" "cloudfront_origin_facing" {
+  count = var.enable_cloudfront ? 1 : 0
+
+  name = "com.amazonaws.global.cloudfront.origin-facing"
 }
 
 resource "aws_security_group" "service" {
@@ -260,14 +279,30 @@ resource "aws_lb_listener" "http" {
   port              = 80
   protocol          = "HTTP"
 
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.app.arn
+  dynamic "default_action" {
+    for_each = var.enable_cloudfront ? [] : [true]
+    content {
+      type             = "forward"
+      target_group_arn = aws_lb_target_group.app.arn
+    }
+  }
+
+  dynamic "default_action" {
+    for_each = var.enable_cloudfront ? [true] : []
+    content {
+      type = "fixed-response"
+
+      fixed_response {
+        content_type = "text/plain"
+        message_body = "Forbidden"
+        status_code  = "403"
+      }
+    }
   }
 }
 
 resource "aws_lb_listener" "http_redirect" {
-  count = var.certificate_arn == null ? 0 : 1
+  count = var.certificate_arn == null || var.enable_cloudfront ? 0 : 1
 
   load_balancer_arn = aws_lb.app.arn
   port              = 80
@@ -284,7 +319,7 @@ resource "aws_lb_listener" "http_redirect" {
 }
 
 resource "aws_lb_listener" "https" {
-  count = var.certificate_arn == null ? 0 : 1
+  count = var.certificate_arn == null || var.enable_cloudfront ? 0 : 1
 
   load_balancer_arn = aws_lb.app.arn
   port              = 443
@@ -303,6 +338,201 @@ resource "aws_lb_listener" "https" {
       error_message = "demo_hostname is required when certificate_arn is set; an ACM certificate normally does not cover the ALB's amazonaws.com hostname."
     }
   }
+}
+
+resource "random_password" "cloudfront_origin" {
+  count = var.enable_cloudfront ? 1 : 0
+
+  length  = 48
+  special = false
+}
+
+resource "aws_lb_listener_rule" "cloudfront_origin" {
+  count = var.enable_cloudfront ? 1 : 0
+
+  listener_arn = aws_lb_listener.http[0].arn
+  priority     = 1
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+
+  condition {
+    http_header {
+      http_header_name = local.cloudfront_origin_header_name
+      values           = [random_password.cloudfront_origin[0].result]
+    }
+  }
+}
+
+resource "aws_cloudfront_cache_policy" "disabled" {
+  count = var.enable_cloudfront ? 1 : 0
+
+  name        = "${var.name}-disabled"
+  comment     = "Disable caching and viewer request parameters for the read-only demo"
+  default_ttl = 0
+  max_ttl     = 0
+  min_ttl     = 0
+
+  parameters_in_cache_key_and_forwarded_to_origin {
+    enable_accept_encoding_brotli = false
+    enable_accept_encoding_gzip   = false
+
+    cookies_config {
+      cookie_behavior = "none"
+    }
+
+    headers_config {
+      header_behavior = "none"
+    }
+
+    query_strings_config {
+      query_string_behavior = "none"
+    }
+  }
+}
+
+resource "aws_cloudfront_origin_request_policy" "minimal" {
+  count = var.enable_cloudfront ? 1 : 0
+
+  name    = "${var.name}-minimal"
+  comment = "Forward request bodies and content type, but no cookies, query strings, or authorization"
+
+  cookies_config {
+    cookie_behavior = "none"
+  }
+
+  headers_config {
+    header_behavior = "whitelist"
+
+    headers {
+      items = ["Content-Type"]
+    }
+  }
+
+  query_strings_config {
+    query_string_behavior = "none"
+  }
+}
+
+resource "aws_cloudfront_response_headers_policy" "security" {
+  count = var.enable_cloudfront ? 1 : 0
+
+  name    = "${var.name}-security"
+  comment = "Browser security headers for the public demo"
+
+  custom_headers_config {
+    items {
+      header   = "Cache-Control"
+      override = true
+      value    = "no-store, max-age=0"
+    }
+  }
+
+  security_headers_config {
+    content_security_policy {
+      content_security_policy = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+      override                = true
+    }
+
+    content_type_options {
+      override = true
+    }
+
+    frame_options {
+      frame_option = "DENY"
+      override     = true
+    }
+
+    referrer_policy {
+      referrer_policy = "no-referrer"
+      override        = true
+    }
+
+    strict_transport_security {
+      access_control_max_age_sec = 63072000
+      include_subdomains         = false
+      preload                    = false
+      override                   = true
+    }
+
+    xss_protection {
+      mode_block = true
+      protection = true
+      override   = true
+    }
+  }
+}
+
+resource "aws_cloudfront_distribution" "app" {
+  count = var.enable_cloudfront ? 1 : 0
+
+  enabled         = true
+  is_ipv6_enabled = true
+  comment         = "HTTPS front door for ${var.name}"
+  price_class     = "PriceClass_100"
+
+  origin {
+    domain_name = aws_lb.app.dns_name
+    origin_id   = local.cloudfront_origin_id
+
+    custom_header {
+      name  = local.cloudfront_origin_header_name
+      value = random_password.cloudfront_origin[0].result
+    }
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  default_cache_behavior {
+    allowed_methods            = ["GET", "HEAD"]
+    cached_methods             = ["GET", "HEAD"]
+    target_origin_id           = local.cloudfront_origin_id
+    viewer_protocol_policy     = "https-only"
+    cache_policy_id            = aws_cloudfront_cache_policy.disabled[0].id
+    origin_request_policy_id   = aws_cloudfront_origin_request_policy.minimal[0].id
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.security[0].id
+    compress                   = true
+  }
+
+  ordered_cache_behavior {
+    path_pattern               = "/api/recall"
+    allowed_methods            = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods             = ["GET", "HEAD"]
+    target_origin_id           = local.cloudfront_origin_id
+    viewer_protocol_policy     = "https-only"
+    cache_policy_id            = aws_cloudfront_cache_policy.disabled[0].id
+    origin_request_policy_id   = aws_cloudfront_origin_request_policy.minimal[0].id
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.security[0].id
+    compress                   = true
+  }
+
+  dynamic "custom_error_response" {
+    for_each = toset([500, 502, 503, 504])
+    content {
+      error_code            = custom_error_response.value
+      error_caching_min_ttl = 0
+    }
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+    minimum_protocol_version       = "TLSv1"
+  }
+
+  depends_on = [aws_lb_listener_rule.cloudfront_origin]
 }
 
 resource "aws_ecs_task_definition" "app" {
