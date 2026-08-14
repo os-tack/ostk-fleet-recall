@@ -8,3 +8,4 @@ docs/AGENT_SKILLS_AUDIT.md|agent_skills
 docs/VIDEO_DEMO.md|video
 deploy/aws/README.md|aws
 deploy/localstack/README.md|localstack
+examples/README.md|examples

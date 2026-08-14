@@ -206,6 +206,117 @@ emit_document_chunks() {
     done < "$manifest"
 }
 
+extract_tools_excerpt() {
+    awk '
+        {
+            lines[NR] = $0
+            candidate = $0
+            sub(/^[[:space:]]*/, "", candidate)
+            sub(/[[:space:]]*$/, "", candidate)
+            if (candidate == "\"enum\": [\"record\"]") {
+                marker_count++
+                marker_line = NR
+            }
+        }
+        END {
+            if (marker_count != 1 || marker_line < 3 || marker_line + 1 > NR) {
+                exit 1
+            }
+            for (line = marker_line - 2; line <= marker_line + 1; line++) {
+                print lines[line]
+            }
+        }
+    ' "$1"
+}
+
+extract_application_excerpt() {
+    awk '
+        {
+            lines[NR] = $0
+            candidate = $0
+            sub(/^[[:space:]]*/, "", candidate)
+            sub(/[[:space:]]*$/, "", candidate)
+            if (candidate == "RememberAction::Record => self.remember_record(&scope, request).await,") {
+                record_count++
+                record_line = NR
+            }
+            if (candidate == "\"remember({}) is outside the hackathon vertical slice\",") {
+                marker_count++
+                marker_line = NR
+            }
+        }
+        END {
+            if (record_count != 1 || marker_count != 1 || record_line != marker_line - 2 ||
+                    marker_line < 4 || marker_line + 3 > NR) {
+                exit 1
+            }
+            for (line = marker_line - 3; line <= marker_line + 3; line++) {
+                print lines[line]
+            }
+        }
+    ' "$1"
+}
+
+emit_self_audit_sources() {
+    tools_path=src/mcp/tools.rs
+    application_path=src/application.rs
+    tools_file=$repo_root/$tools_path
+    application_file=$repo_root/$application_path
+
+    for source_file in "$tools_file" "$application_file"; do
+        if [ ! -f "$source_file" ] || [ -L "$source_file" ]; then
+            printf 'self-audit source must be a regular, non-symlink file: %s\n' "$source_file" >&2
+            exit 66
+        fi
+    done
+
+    if ! tools_excerpt=$(extract_tools_excerpt "$tools_file"); then
+        printf 'src/mcp/tools.rs must contain exactly one expected remember action marker\n' >&2
+        exit 65
+    fi
+    if ! application_excerpt=$(extract_application_excerpt "$application_file"); then
+        printf 'src/application.rs must contain exactly one adjacent remember dispatch and rejection marker pair\n' >&2
+        exit 65
+    fi
+
+    jq -cn \
+        --arg source_id "$tools_path" \
+        --arg text "$tools_excerpt" '
+            {
+                source: "code",
+                source_id: $source_id,
+                source_config_id: "rich-demo:self-audit:v1",
+                chunk_index: 0,
+                text: $text,
+                role: "usage",
+                facets: {
+                    dataset: ["rich-demo"],
+                    record_kind: ["source_code"],
+                    source_area: ["source_code"],
+                    tags: ["self_audit", "rust", "mcp_contract"]
+                }
+            }
+        '
+    jq -cn \
+        --arg source_id "$application_path" \
+        --arg text "$application_excerpt" '
+            {
+                source: "code",
+                source_id: $source_id,
+                source_config_id: "rich-demo:self-audit:v1",
+                chunk_index: 0,
+                text: $text,
+                role: "usage",
+                facets: {
+                    dataset: ["rich-demo"],
+                    record_kind: ["source_code"],
+                    source_area: ["source_code"],
+                    tags: ["self_audit", "rust", "service_dispatch"]
+                }
+            }
+        '
+}
+
 emit_operations_narrative() {
     jq -cn '
         def week_id($week):
@@ -384,4 +495,5 @@ emit_operations_narrative() {
 }
 
 emit_document_chunks
+emit_self_audit_sources
 emit_operations_narrative

@@ -20,9 +20,9 @@ identities and asserting hybrid recall, replay deduplication, scope isolation,
 a persisted recall-driven action, an open two-member conflict, and a persisted
 operator escalation.
 
-## Rich local fixture
+## Rich corpus
 
-[`rich-demo/`](rich-demo/) contains an optional deterministic generator for a
+[`rich-demo/`](rich-demo/) contains a deterministic generator for a
 larger publication-safe corpus. It chunks an explicit allowlist of checked-in
 documentation and adds a synthetic twelve-week operations narrative, producing
 500–1,000 useful records without network, Docker, or database access. Generated
@@ -41,4 +41,7 @@ The rich corpus describes decisions, supersessions, one retraction, and varied
 disagreement scenarios as searchable narrative text. It does **not** create
 claim-ledger state. Use MCP `remember` for deliberate claims, supersessions,
 retractions, and conflicts so their provenance and transaction semantics are
-actually exercised. Do not ingest this optional fixture into the live demo.
+actually exercised. The public demo seeds this verified corpus, then records
+typed claims with exact chunk coordinates and content hashes. Ordinary narrative
+remains search evidence; only those source-backed typed claims can carry a
+conflict signal into semantic recall.

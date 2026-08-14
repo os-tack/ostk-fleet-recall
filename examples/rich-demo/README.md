@@ -1,9 +1,10 @@
-# Rich local demo corpus
+# Rich demo corpus
 
 This package deterministically builds a publication-safe Fleet Recall corpus
 without contacting a network or database. It combines section-aware chunks
-from ten checked-in project, architecture, submission, migration, AWS, and
-LocalStack documents with a synthetic twelve-week fleet-operations narrative.
+from eleven checked-in project, architecture, submission, migration, AWS,
+LocalStack, and examples documents, two exact checked-in Rust excerpts, and a
+synthetic twelve-week fleet-operations narrative.
 
 The operations narrative includes accepted and contingency decisions,
 observations, changes, handoffs, 11 explicit supersessions, exactly one
@@ -35,16 +36,19 @@ Run the deterministic reproduction test with:
 ./examples/rich-demo/test.sh
 ```
 
-The verifier requires 500–1,000 unique chunks, ten documentation sources, 204
-operations records across twelve weeks, the expected decision and correction
-mix, zero-based document chunk indexes, bounded physical lines and text, only
-the public ingest allowlist, and no credential-, token-, private-key-, account
-ARN-, or credential-bearing database URL patterns.
+The verifier requires 500–1,000 unique chunks, eleven documentation sources,
+the two exact self-audit code excerpts, 204 operations records across twelve
+weeks, the expected decision and correction mix, zero-based source chunk
+indexes, bounded physical lines and text, only the public ingest allowlist, and
+no credential-, token-, private-key-, account ARN-, or credential-bearing
+database URL patterns.
 
-Documentation `source_id` values are the original repository-relative paths,
-so the demo UI can render them as source links. Synthetic operations records
-use stable `rich-demo/operations/week-NN/event-name` identifiers instead of
-pretending that their generated narratives are checked-in source files.
+Documentation and code `source_id` values are the original repository-relative
+paths. The code records are extracted fail-closed from the current
+`src/mcp/tools.rs` and `src/application.rs` contents; they are not duplicated
+fixtures. Synthetic operations records use stable
+`rich-demo/operations/week-NN/event-name` identifiers instead of pretending
+that their generated narratives are checked-in source files.
 
 To inspect the generated mix without ingesting it:
 

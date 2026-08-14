@@ -40,6 +40,14 @@ broken_supersession=$test_root/broken-supersession.ndjson
 blank_text=$test_root/blank-text.ndjson
 escaped_sensitive=$test_root/escaped-sensitive.ndjson
 dead_source=$test_root/dead-source.ndjson
+missing_self_audit=$test_root/missing-self-audit.ndjson
+wrong_self_audit_config=$test_root/wrong-self-audit-config.ndjson
+wrong_self_audit_path=$test_root/wrong-self-audit-path.ndjson
+wrong_self_audit_source=$test_root/wrong-self-audit-source.ndjson
+nonzero_self_audit_index=$test_root/nonzero-self-audit-index.ndjson
+mutated_tools_excerpt=$test_root/mutated-tools-excerpt.ndjson
+mutated_docs_marker=$test_root/mutated-docs-marker.ndjson
+nul_text=$test_root/nul-text.ndjson
 
 "$script_dir/generate.sh" > "$first"
 "$script_dir/generate.sh" > "$second"
@@ -140,6 +148,85 @@ jq -s -c '
 ' "$first" > "$dead_source"
 if "$script_dir/verify.sh" "$dead_source" >/dev/null 2>&1; then
     printf 'rich demo verification failed: verifier accepted a dead documentation source\n' >&2
+    exit 1
+fi
+
+jq -c 'select(.source_id != "src/application.rs")' "$first" > "$missing_self_audit"
+if "$script_dir/verify.sh" "$missing_self_audit" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a missing self-audit source\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "src/mcp/tools.rs"
+    then .source_config_id = "rich-demo:docs:v1"
+    else .
+    end
+' "$first" > "$wrong_self_audit_config"
+if "$script_dir/verify.sh" "$wrong_self_audit_config" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a misconfigured self-audit source\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "src/mcp/tools.rs"
+    then .source_id = "src/mcp/renamed-tools.rs"
+    else .
+    end
+' "$first" > "$wrong_self_audit_path"
+if "$script_dir/verify.sh" "$wrong_self_audit_path" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted an unexpected self-audit path\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "src/mcp/tools.rs"
+    then .source = "markdown"
+    else .
+    end
+' "$first" > "$wrong_self_audit_source"
+if "$script_dir/verify.sh" "$wrong_self_audit_source" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a non-code self-audit source\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "src/application.rs"
+    then .chunk_index = 1
+    else .
+    end
+' "$first" > "$nonzero_self_audit_index"
+if "$script_dir/verify.sh" "$nonzero_self_audit_index" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a noncontiguous self-audit index\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "src/mcp/tools.rs"
+    then .text += "\n// unverified drift"
+    else .
+    end
+' "$first" > "$mutated_tools_excerpt"
+if "$script_dir/verify.sh" "$mutated_tools_excerpt" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a mutated source excerpt\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "examples/README.md"
+    then .text |= gsub("Use MCP `remember` for deliberate claims"; "Use memory for deliberate claims")
+    else .
+    end
+' "$first" > "$mutated_docs_marker"
+if "$script_dir/verify.sh" "$mutated_docs_marker" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a missing documentation marker\n' >&2
+    exit 1
+fi
+
+jq -c 'if .source_id == "README.md" and .chunk_index == 0 then .text += "\u0000" else . end' \
+    "$first" > "$nul_text"
+if "$script_dir/verify.sh" "$nul_text" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a NUL in text\n' >&2
     exit 1
 fi
 

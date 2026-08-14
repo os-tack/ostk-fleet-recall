@@ -23,6 +23,7 @@ for command_name in awk grep jq wc; do
 done
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 manifest=$script_dir/documents.txt
 
 if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
@@ -31,6 +32,71 @@ fi
 
 if [ ! -f "$input" ] || [ -L "$input" ]; then
     fail "input must be a regular, non-symlink file"
+fi
+
+extract_tools_excerpt() {
+    awk '
+        {
+            lines[NR] = $0
+            candidate = $0
+            sub(/^[[:space:]]*/, "", candidate)
+            sub(/[[:space:]]*$/, "", candidate)
+            if (candidate == "\"enum\": [\"record\"]") {
+                marker_count++
+                marker_line = NR
+            }
+        }
+        END {
+            if (marker_count != 1 || marker_line < 3 || marker_line + 1 > NR) {
+                exit 1
+            }
+            for (line = marker_line - 2; line <= marker_line + 1; line++) {
+                print lines[line]
+            }
+        }
+    ' "$1"
+}
+
+extract_application_excerpt() {
+    awk '
+        {
+            lines[NR] = $0
+            candidate = $0
+            sub(/^[[:space:]]*/, "", candidate)
+            sub(/[[:space:]]*$/, "", candidate)
+            if (candidate == "RememberAction::Record => self.remember_record(&scope, request).await,") {
+                record_count++
+                record_line = NR
+            }
+            if (candidate == "\"remember({}) is outside the hackathon vertical slice\",") {
+                marker_count++
+                marker_line = NR
+            }
+        }
+        END {
+            if (record_count != 1 || marker_count != 1 || record_line != marker_line - 2 ||
+                    marker_line < 4 || marker_line + 3 > NR) {
+                exit 1
+            }
+            for (line = marker_line - 3; line <= marker_line + 3; line++) {
+                print lines[line]
+            }
+        }
+    ' "$1"
+}
+
+tools_file=$repo_root/src/mcp/tools.rs
+application_file=$repo_root/src/application.rs
+for source_file in "$tools_file" "$application_file"; do
+    if [ ! -f "$source_file" ] || [ -L "$source_file" ]; then
+        fail "self-audit source must be a regular, non-symlink file: $source_file"
+    fi
+done
+if ! tools_excerpt=$(extract_tools_excerpt "$tools_file"); then
+    fail "src/mcp/tools.rs must contain exactly one expected remember action marker"
+fi
+if ! application_excerpt=$(extract_application_excerpt "$application_file"); then
+    fail "src/application.rs must contain exactly one adjacent remember dispatch and rejection marker pair"
 fi
 
 line_count=$(wc -l < "$input" | tr -d '[:space:]')
@@ -68,66 +134,84 @@ if ! jq -s -e '
         or . == 5760 or (. >= 8192 and . <= 8202) or . == 8232 or . == 8233
         or . == 8239 or . == 8287 or . == 12288;
 
-    all(.[];
+    def valid_facet_value:
+        type == "string"
+        and length > 0
+        and length <= 256
+        and (explode as $points
+            | ($points[0] | ingest_trim_whitespace | not)
+            and ($points[-1] | ingest_trim_whitespace | not)
+            and all($points[]; ingest_control_codepoint | not));
+    def valid_facet_array:
+        type == "array"
+        and length > 0
+        and length <= 16
+        and (map(valid_facet_value) | all);
+    def valid_facets:
         type == "object"
+        and ((keys_unsorted - [
+            "dataset", "record_kind", "source_area", "event_type",
+            "week", "scenario", "status", "tags"
+        ]) | length) == 0
+        and ([.[] | valid_facet_array] | all);
+    def valid_record:
+        . as $record
+        | type == "object"
         and ((keys_unsorted - [
             "source", "source_id", "source_config_id", "chunk_index",
             "text", "role", "facets"
         ]) | length) == 0
-        and .source == "markdown"
-        and (.source_id | type == "string" and length <= 4096)
-        and (.source_config_id == "rich-demo:docs:v1" or .source_config_id == "rich-demo:operations:v1")
-        and (if .source_config_id == "rich-demo:docs:v1"
-            then ((.source_id | test("^(README[.]md|docs/[A-Za-z0-9._/-]+|deploy/[A-Za-z0-9._/-]+)$"))
-                and (.source_id | contains("//") | not)
-                and (.source_id | split("/") | all(.[]; . != "." and . != "..")))
-            else (.source_id | test("^rich-demo/operations/week-[0-9]{2}/[a-z0-9_-]+$"))
+        and (($record.source_config_id == "rich-demo:self-audit:v1"
+                and $record.source == "code")
+            or ($record.source_config_id != "rich-demo:self-audit:v1"
+                and $record.source == "markdown"))
+        and (($record.source_id | type) == "string" and ($record.source_id | length) <= 4096)
+        and ($record.source_config_id == "rich-demo:docs:v1"
+            or $record.source_config_id == "rich-demo:self-audit:v1"
+            or $record.source_config_id == "rich-demo:operations:v1")
+        and (if $record.source_config_id == "rich-demo:docs:v1"
+            then (($record.source_id | test("^(README[.]md|docs/[A-Za-z0-9._/-]+|deploy/[A-Za-z0-9._/-]+|examples/[A-Za-z0-9._/-]+)$"))
+                and ($record.source_id | contains("//") | not)
+                and ($record.source_id | split("/") | all(.[]; . != "." and . != "..")))
+            elif $record.source_config_id == "rich-demo:self-audit:v1"
+            then ($record.source_id == "src/mcp/tools.rs" or $record.source_id == "src/application.rs")
+            else ($record.source_id | test("^rich-demo/operations/week-[0-9]{2}/[a-z0-9_-]+$"))
             end)
-        and (.chunk_index | type == "number" and floor == . and . >= 0 and . < 10000)
-        and (.text
+        and ($record.chunk_index | type == "number" and floor == . and . >= 0 and . < 10000)
+        and ($record.text
             | type == "string"
             and length >= 40
             and length <= 2000
-            and (contains("\u0000") | not)
+            and (explode | index(0) | not)
             and (explode | any(.[]; ingest_trim_whitespace | not)))
-        and (.role == "primary" or .role == "evolution" or .role == "usage")
-        and (.facets | type == "object")
-        and ((.facets | keys_unsorted) - [
-            "dataset", "record_kind", "source_area", "event_type",
-            "week", "scenario", "status", "tags"
-        ] | length) == 0
-        and all(.facets[];
-            type == "array"
-            and length > 0
-            and length <= 16
-            and all(.[];
-                type == "string"
-                and length > 0
-                and length <= 256
-                and (explode as $points
-                    | ($points[0] | ingest_trim_whitespace | not)
-                    and ($points[-1] | ingest_trim_whitespace | not)
-                    and all($points[]; ingest_control_codepoint | not))
-            )
-        )
-        and .facets.dataset == ["rich-demo"]
-        and (if .source_config_id == "rich-demo:docs:v1"
-            then (.facets.record_kind == ["documentation"]
-                and (.facets.source_area | length) == 1
-                and (.facets.tags | index("documentation")) != null)
-            else (.facets.record_kind == ["operations_narrative"]
-                and .facets.source_area == ["fleet_operations"]
-                and (.facets.event_type | length) == 1
-                and (.facets.week | length) == 1
-                and (.facets.week[0] | test("^week-(0[1-9]|1[0-2])$"))
-                and (. as $record
-                    | $record.source_id
+        and ($record.role == "primary" or $record.role == "evolution" or $record.role == "usage")
+        and ($record.facets | valid_facets)
+        and $record.facets.dataset == ["rich-demo"]
+        and (if $record.source_config_id == "rich-demo:docs:v1"
+            then ($record.facets.record_kind == ["documentation"]
+                and ($record.facets.source_area | length) == 1
+                and ($record.facets.tags | index("documentation")) != null)
+            elif $record.source_config_id == "rich-demo:self-audit:v1"
+            then ($record.facets.record_kind == ["source_code"]
+                and $record.facets.source_area == ["source_code"]
+                and $record.facets.tags[0:2] == ["self_audit", "rust"]
+                and ($record.facets.tags | length) == 3)
+            else ($record.facets.record_kind == ["operations_narrative"]
+                and $record.facets.source_area == ["fleet_operations"]
+                and ($record.facets.event_type | length) == 1
+                and ($record.facets.week | length) == 1
+                and ($record.facets.week[0] | test("^week-(0[1-9]|1[0-2])$"))
+                and ($record.source_id
                     | startswith("rich-demo/operations/" + $record.facets.week[0] + "/"))
-                and (.facets.scenario | length) == 1
-                and (.facets.status | length) == 1
-                and (.facets.tags | length) >= 2)
-            end)
-    )
+                and ($record.facets.scenario | length) == 1
+                and ($record.facets.status | length) == 1
+                and ($record.facets.tags | length) >= 2)
+            end);
+
+    # `map` materializes one Boolean per record. This avoids the jq 1.6
+    # generator-context behavior of `all(.[]; complex | expressions)` while
+    # retaining the exact same bounded schema predicate.
+    map(valid_record) | all
 ' "$input" >/dev/null; then
     fail "records violate the bounded publication-safe ingest schema"
 fi
@@ -140,34 +224,63 @@ if ! jq -s -e '
 fi
 
 if ! jq -s -e '
-    [.[] | select(.source_config_id == "rich-demo:docs:v1")]
+    [.[] | select(.source_config_id != "rich-demo:operations:v1")]
     | group_by(.source_id)
     | all(.[];
         length as $count
         | (map(.chunk_index) | sort) == [range(0; $count)]
     )
 ' "$input" >/dev/null; then
-    fail "document chunk indexes are not contiguous and zero-based"
+    fail "repository source chunk indexes are not contiguous and zero-based"
 fi
 
-if ! jq -s -e --rawfile document_manifest "$manifest" '
+if ! jq -s -e \
+    --rawfile document_manifest "$manifest" \
+    --arg expected_tools_excerpt "$tools_excerpt" \
+    --arg expected_application_excerpt "$application_excerpt" '
     ($document_manifest
         | split("\n")
         | map(select(length > 0 and (startswith("#") | not)))
         | map(split("|")[0])
         | sort) as $expected_doc_sources
-    | ($expected_doc_sources | length) == 10
+    | ($expected_doc_sources | length) == 11
     and
     ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) >= 300
+    and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:docs:v1") | .source_id] | unique | sort)
         == $expected_doc_sources
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1") | .source_id] | unique | length) == 204
+    and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1") | .source_id] | sort)
+        == ["src/application.rs", "src/mcp/tools.rs"]
+    and all(.[] | select(.source_config_id == "rich-demo:self-audit:v1"); .chunk_index == 0)
     and all(.[] | select(.source_config_id == "rich-demo:operations:v1"); .chunk_index == 0)
-    and ([.[] | .facets.source_area[]] | unique | length) >= 11
+    and ([.[] | select(
+            .source_config_id == "rich-demo:docs:v1"
+            and .source_id == "examples/README.md"
+            and (.text | contains("Use MCP `remember` for deliberate claims"))
+            and (.text | contains("retractions, and conflicts"))
+            and (.text | contains("provenance and transaction semantics are actually exercised"))
+        )] | length) == 1
+    and ([.[] | select(
+            .source_config_id == "rich-demo:self-audit:v1"
+            and .source_id == "src/mcp/tools.rs"
+            and .text == $expected_tools_excerpt
+            and (.text | contains("\"enum\": [\"record\"]"))
+            and .facets.tags == ["self_audit", "rust", "mcp_contract"]
+        )] | length) == 1
+    and ([.[] | select(
+            .source_config_id == "rich-demo:self-audit:v1"
+            and .source_id == "src/application.rs"
+            and .text == $expected_application_excerpt
+            and (.text | contains("RememberAction::Record => self.remember_record"))
+            and (.text | contains("remember({}) is outside the hackathon vertical slice"))
+            and .facets.tags == ["self_audit", "rust", "service_dispatch"]
+        )] | length) == 1
+    and ([.[] | .facets.source_area[]] | unique | length) >= 13
     and ([.[] | .role] | unique | sort) == ["evolution", "primary", "usage"]
 ' "$input" >/dev/null; then
-    fail "documentation and operations content mix is incomplete"
+    fail "documentation, self-audit source, and operations content mix is incomplete"
 fi
 
 if ! jq -s -e '
@@ -237,6 +350,7 @@ fi
 
 jq -s -r '
     ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) as $docs
+    | ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) as $audit
     | ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) as $operations
-    | "verified rich demo: \(length) chunks (\($docs) documentation, \($operations) operations)"
+    | "verified rich demo: \(length) chunks (\($docs) documentation, \($audit) self-audit source, \($operations) operations)"
 ' "$input"
