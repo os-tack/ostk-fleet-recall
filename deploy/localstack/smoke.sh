@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_dir=$(CDPATH= cd -- "$script_dir/../.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 compose_file=$script_dir/compose.yaml
 model_bundle=${FLEET_RECALL_MODEL_BUNDLE:-${1:-}}
 demo_port=${FLEET_RECALL_DEMO_PORT:-8088}
@@ -36,11 +36,11 @@ if [ -z "${LOCALSTACK_AUTH_TOKEN:-}" ] && [ -f "$repo_dir/.env" ]; then
                 env_value=${env_line#export LOCALSTACK_AUTH_TOKEN=}
                 ;;
             LOCAL_STACK_API_KEY=*)
-                env_name=alias
+                env_name='alias'
                 env_value=${env_line#LOCAL_STACK_API_KEY=}
                 ;;
             'export LOCAL_STACK_API_KEY='*)
-                env_name=alias
+                env_name='alias'
                 env_value=${env_line#export LOCAL_STACK_API_KEY=}
                 ;;
         esac
@@ -109,10 +109,13 @@ if ! docker info >/dev/null 2>&1; then
     exit 69
 fi
 
-docker build --quiet --tag ostk-fleet-recall:localstack "$repo_dir" >/dev/null
+docker build --quiet --target localstack \
+    --tag ostk-fleet-recall:localstack "$repo_dir" >/dev/null
 docker run --rm --entrypoint /bin/sh ostk-fleet-recall:localstack -c '
     test -r /opt/ostk/demo/demo.ndjson &&
-    test "$(wc -l < /opt/ostk/demo/demo.ndjson)" -eq 3
+    test "$(wc -l < /opt/ostk/demo/demo.ndjson)" -eq 3 &&
+    aws --version >/dev/null &&
+    s5cmd version >/dev/null
 '
 embedding_digest=$(docker run --rm \
     --user "$(id -u):$(id -g)" \
@@ -120,10 +123,10 @@ embedding_digest=$(docker run --rm \
     --entrypoint /usr/local/bin/ostk-fleet-recall \
     ostk-fleet-recall:localstack model-digest /model)
 
-export FLEET_RECALL_MODEL_BUNDLE=$model_bundle
-export FLEET_RECALL_EMBEDDING_MODEL_SHA256=$embedding_digest
-export FLEET_RECALL_DEMO_PORT=$demo_port
-export LOCALSTACK_PORT=$localstack_port
+export FLEET_RECALL_MODEL_BUNDLE="$model_bundle"
+export FLEET_RECALL_EMBEDDING_MODEL_SHA256="$embedding_digest"
+export FLEET_RECALL_DEMO_PORT="$demo_port"
+export LOCALSTACK_PORT="$localstack_port"
 
 cleanup() {
     if [ "${KEEP_LOCALSTACK:-0}" != "1" ]; then

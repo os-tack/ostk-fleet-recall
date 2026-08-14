@@ -17,7 +17,7 @@ commands succeed and their redacted artifacts are reviewed.
 
 ## Prerequisites
 
-- Terraform 1.7 or newer, AWS CLI v2, Docker Buildx, and `jq`.
+- Terraform 1.10 or newer, AWS CLI v2, Docker Buildx, and `jq`.
 - An AWS account and an existing VPC. Supply public ALB subnets and private ECS
   subnets in at least two availability zones. Private subnets need NAT egress,
   or VPC endpoints for ECR, S3, Secrets Manager, and CloudWatch plus a route to
@@ -69,11 +69,18 @@ URL in the file.
 
 ```bash
 cd deploy/aws
+cp backend.hcl.example backend.hcl
 cp terraform.tfvars.example terraform.tfvars
-terraform init
+# Edit backend.hcl and terraform.tfvars.
+terraform init -backend-config=backend.hcl
 terraform test
 terraform apply -target=aws_ecr_repository.app
 ```
+
+The private, encrypted, versioned S3 object configured by `backend.hcl` is the
+authoritative state. Preserve its versions and access through the judging hold
+and until every managed resource has been intentionally destroyed. Native S3
+lock files require Terraform 1.10 or newer.
 
 The current Terraform suite contains eleven runs covering dormant bootstrap,
 TLS hostname binding, model-prefix/bucket validation, capacity ordering, and
@@ -87,10 +94,12 @@ tag. Run this from the repository root:
 AWS_REGION=us-east-1
 REPOSITORY_URL=$(terraform -chdir=deploy/aws output -raw ecr_repository_url)
 IMAGE_TAG=git-0123456789ab
+IMAGE_PLATFORM=linux/arm64 # Must match cpu_architecture = "ARM64".
 aws ecr get-login-password --region "$AWS_REGION" \
   | docker login --username AWS --password-stdin "${REPOSITORY_URL%%/*}"
 docker buildx build \
-  --platform linux/amd64 \
+  --platform "$IMAGE_PLATFORM" \
+  --target production \
   --build-arg VCS_REF=0123456789abcdef \
   --tag "$REPOSITORY_URL:$IMAGE_TAG" \
   --push .

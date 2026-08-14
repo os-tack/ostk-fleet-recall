@@ -14,14 +14,12 @@ provider "aws" {
 
   default_tags {
     tags = merge(
-      {
-        Application = "ostk-fleet-recall"
-        ManagedBy   = "terraform"
-      },
       var.tags,
+      {
+        Application = var.name
+        ManagedBy   = "terraform"
+        HoldUntil   = var.hold_until
+      },
     )
   }
 }
-
-data "aws_caller_identity" "current" {}
-data "aws_region" "current" {}

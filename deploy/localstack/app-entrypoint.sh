@@ -42,7 +42,7 @@ case "$database_url" in
         ;;
 esac
 
-export FLEET_RECALL_DATABASE_URL=$database_url
+export FLEET_RECALL_DATABASE_URL="$database_url"
 unset database_url
 
 exec /usr/local/bin/container-entrypoint "$@"

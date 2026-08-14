@@ -63,6 +63,38 @@ jobs:
           test -z "$(cargo tree --locked --target x86_64-unknown-linux-gnu -i rsa 2>/dev/null)"
           test -z "$(cargo tree --locked --target x86_64-unknown-linux-gnu -i sqlx-mysql 2>/dev/null)"
 
+  container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the production image
+        run: |
+          docker build \
+            --target production \
+            --build-arg VCS_REF="$GITHUB_SHA" \
+            --tag ostk-fleet-recall:ci .
+      - name: Verify runtime identity, tools, and notices
+        run: |
+          docker run --rm --entrypoint /bin/sh ostk-fleet-recall:ci -c '
+            test "$(id -u)" -eq 10001 &&
+            test "$(s5cmd version)" = "v2.3.0-991c9fb" &&
+            test ! -e /usr/local/bin/aws &&
+            test -x /usr/bin/curl &&
+            test -r /usr/share/licenses/s5cmd/s5cmd-LICENSE &&
+            test -r /usr/share/licenses/s5cmd/go-LICENSE &&
+            test -r /usr/share/licenses/s5cmd/vendor/github.com/aws/aws-sdk-go/LICENSE.txt &&
+            test -r /usr/share/licenses/s5cmd/vendor/github.com/aws/aws-sdk-go/NOTICE.txt
+          '
+      - name: Scan OS and Go packages
+        run: |
+          docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.72.0@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
+            image --skip-version-check --scanners vuln \
+            --severity CRITICAL,HIGH --exit-code 1 \
+            ostk-fleet-recall:ci
+
   deployment:
     runs-on: ubuntu-latest
     defaults:
@@ -77,6 +109,11 @@ jobs:
       - run: terraform init -backend=false -lockfile=readonly
       - run: terraform validate
       - run: terraform test
+      - name: Validate and test the private network stack
+        run: |
+          terraform -chdir=network init -backend=false -lockfile=readonly
+          terraform -chdir=network validate
+          terraform -chdir=network test
       - name: Validate deployment shell scripts
         working-directory: .
         run: find deploy demo -type f -name '*.sh' -exec sh -n {} +

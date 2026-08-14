@@ -48,6 +48,7 @@ if [ ! -d "$bundle_path" ]; then
     bundle_parent=$(dirname "$bundle_path")
     mkdir -p "$bundle_parent"
     staging=$(mktemp -d "$bundle_parent/.model-download.XXXXXX")
+    aws_region=${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}
     cleanup() {
         rm -rf -- "$staging"
     }
@@ -55,12 +56,12 @@ if [ ! -d "$bundle_path" ]; then
 
     for name in config.json model.safetensors tokenizer.json; do
         if [ -n "${FLEET_RECALL_AWS_ENDPOINT_URL:-}" ]; then
-            aws --endpoint-url "$FLEET_RECALL_AWS_ENDPOINT_URL" \
-                s3 cp "${model_s3_uri%/}/$name" "$staging/$name" \
-                --no-progress --only-show-errors
+            s5cmd --log error --endpoint-url "$FLEET_RECALL_AWS_ENDPOINT_URL" \
+                cp --raw --source-region "$aws_region" \
+                "${model_s3_uri%/}/$name" "$staging/$name"
         else
-            aws s3 cp "${model_s3_uri%/}/$name" "$staging/$name" \
-                --no-progress --only-show-errors
+            s5cmd --log error cp --raw --source-region "$aws_region" \
+                "${model_s3_uri%/}/$name" "$staging/$name"
         fi
     done
 

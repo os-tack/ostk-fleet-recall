@@ -15,5 +15,7 @@
 /deploy/aws/*.tfstate.*
 /deploy/aws/*.tfvars
 !/deploy/aws/terraform.tfvars.example
+/deploy/aws/backend.hcl
+**/.DS_Store
 *.pem
 *.key

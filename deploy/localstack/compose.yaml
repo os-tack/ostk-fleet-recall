@@ -27,6 +27,7 @@ x-fleet-base: &fleet-base
   build:
     context: ../..
     dockerfile: Dockerfile
+    target: localstack
   entrypoint: ["/bin/sh", "/localstack/app-entrypoint.sh"]
   environment:
     <<: [*aws-environment, *fleet-environment]

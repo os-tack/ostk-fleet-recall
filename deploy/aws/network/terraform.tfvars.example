@@ -1,0 +1,17 @@
+aws_region = "us-east-1"
+name       = "ostk-fleet-recall"
+
+vpc_id                 = "vpc-0123456789abcdef0"
+nat_public_subnet_id    = "subnet-0123456789abcdef0"
+hold_until              = "2026-09-15T21:00:00Z"
+
+private_subnets = {
+  a = {
+    availability_zone = "us-east-1a"
+    cidr_block        = "172.31.96.0/24"
+  }
+  b = {
+    availability_zone = "us-east-1b"
+    cidr_block        = "172.31.97.0/24"
+  }
+}
