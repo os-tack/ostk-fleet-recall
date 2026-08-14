@@ -187,7 +187,8 @@ curl --fail --silent --show-error \
 
 Choose exactly one HTTPS mode for the public submission:
 
-- Set `enable_cloudfront = true` and leave `certificate_arn = null` to use the
+- The fail-safe default is `enable_cloudfront = true`,
+  `alb_ingress_cidrs = []`, and `certificate_arn = null`. It uses the
   generated CloudFront hostname. Terraform outputs
   `https://<distribution>.cloudfront.net`, requires HTTPS from viewers, disables
   caching, and forwards request bodies and `Content-Type` but no viewer cookies,
@@ -196,8 +197,9 @@ Choose exactly one HTTPS mode for the public submission:
   so the bounded `POST` endpoint works. Security response headers and
   `Cache-Control: no-store, max-age=0` are applied at the edge, and transient
   500/502/503/504 responses have a zero error-cache TTL.
-- To use your own hostname, leave `enable_cloudfront = false`, point DNS at the
-  ALB, and set both a regional ACM `certificate_arn` and its covered
+- To use your own hostname, explicitly set `enable_cloudfront = false`, provide
+  a reviewed non-empty `alb_ingress_cidrs` allowlist, point DNS at the ALB, and
+  set both a regional ACM `certificate_arn` and its covered
   `demo_hostname`. Terraform changes port 80 into an HTTPS redirect and outputs
   the application hostname—not the ALB's `amazonaws.com` name, which normally
   does not match the certificate. DNS creation remains explicit because the
@@ -321,14 +323,20 @@ run/project names, the demo URL, cluster coordinate, task IDs, and model/version
 metadata before sharing it. Never supplement it with the database URL, account
 ID, task ARN, secret ARN, or raw CloudWatch log export.
 
-The final-image run `devpost-final-20260814T021819Z` satisfied these checks
-across four one-off Fargate tasks using reference-agent task definition
-revision 3. It correlated decision claim 5, action claim 6 citing it,
-incompatible claim 7, open conflict 2, and escalation claim 8 citing that
-conflict. Its public verification observed exact action/escalation claims 6 and
-8 through lexical/dense RRF, with CockroachDB 26.2.5, schema version 1, all
-three required index capability flags, working cosine distance, and embedding
-dimension 512.
+The verified pre-polish revision 3 cloud evidence run
+`devpost-final-20260814T021819Z` satisfied these checks across four one-off
+Fargate tasks using reference-agent task definition revision 3. It correlated
+decision claim 5, action claim 6 citing it, incompatible claim 7, open conflict
+2, and escalation claim 8 citing that conflict. Its public verification
+observed exact action/escalation claims 6 and 8 through lexical/dense RRF, with
+CockroachDB 26.2.5, schema version 1, all three required index capability flags,
+working cosine distance, and embedding dimension 512.
+
+The currently deployed revision 4 serving image adds the conflict-first public
+UI, consistent JSON API errors, and measured server timing from `97eba7d`. It
+passed CI and separate public health, status, and recall smoke checks. The
+four-agent and disjoint-replacement wrappers were not rerun on revision 4, so
+the receipts above remain explicitly revision 3 cloud evidence.
 
 ## 8. Replace the complete serving task set and prove persistence
 
@@ -366,11 +374,11 @@ secret-bearing keys, and raw log-stream fields. Its success output is marked
 `validation_only: true`; it validates live receipts but is not a substitute for
 running either live wrapper.
 
-For the same final-image run, the replacement wrapper exercised serving task
-definition revision 3 and changed the complete task set to a fully disjoint
-set. Desired count remained one, the service returned ready, and the
-before/after public checks observed the same exact claims 6 and 8 through
-lexical/dense RRF.
+For the same verified revision 3 cloud evidence run, the replacement wrapper
+exercised serving task definition revision 3 and changed the complete task set
+to a fully disjoint set. Desired count remained one, the service returned
+ready, and the before/after public checks observed the same exact claims 6 and
+8 through lexical/dense RRF.
 
 ## Cloud `EXPLAIN` evidence
 

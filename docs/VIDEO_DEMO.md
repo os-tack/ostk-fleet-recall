@@ -1,31 +1,208 @@
-# Reproducible terminal video
+# Final video plan and reproducible terminal footage
 
-The submission video can use a real four-pane tmux sequence instead of edited
-terminal screenshots. Agent A writes durable memory, Agent B retrieves it and
-takes a cited action, Agent C creates an incompatible decision, and the same B
-identity resumes to pause and escalate. A narrow fifth pane keeps CockroachDB,
-retrieval, provenance, and scenario state visible throughout.
+> **Agents are replaceable. Their memory shouldn't be—and when two disagree,
+> memory should say so.**
 
-Fleet Recall has two first-class recording modes that require no OSTK, agent
-orchestrator, LLM, model API, or cloud account. A third, explicitly optional
-mode can render an already verified OSTK adapter run.
+Build the final cut around three verbs: **ASK**, **DISAGREE**, and **SURVIVE**.
+ASK shows the current conflict-first public interface. DISAGREE proves the
+typed A → B → C → B decision, action, conflict, and cited-escalation chain.
+SURVIVE proves that the cited memory remained recallable after the complete
+Fargate serving-task set changed. End with a short local-first-to-fleet coda;
+OSTK is an optional adapter, not an install or runtime requirement.
 
 ## Submission eligibility boundary
 
 Neither the sanitized rehearsal nor a standalone-only local capture is the
 final hackathon video. The [official rules](https://cockroachdb-ai.devpost.com/rules)
-require footage of the project functioning as deployed on AWS and footage of
-the CockroachDB memory layer at work. Use the terminal sequence as one proof
-segment in the final cut, then add fresh cloud footage showing the public demo,
-the verified reference-agent receipt, CockroachDB-backed recall before and
-after ECS task replacement, and the representative query plans. Keep the
-local/cloud provenance labels visible so one segment cannot be mistaken for
-the other.
+require an AWS-deployed project; the video must show it functioning and the
+CockroachDB memory layer at work. Film the current public demo, then show
+reviewed excerpts of the verified reference-agent and replacement receipts and
+the representative query plans. Keep every local/cloud provenance label
+visible so one segment cannot be mistaken for another.
+
+The public conflict-first UI is the current revision 4 deployment. The
+correlated four-task agent and fully disjoint replacement receipts are verified
+**pre-polish revision 3** evidence from run
+`devpost-final-20260814T021819Z`; they were not rerun on revision 4. Do not cut
+the two sources together in a way that implies one revision or one continuous
+live take.
+
+## Final cut: ASK → DISAGREE → SURVIVE
+
+Target **2:40**, leaving a 20-second safety margin under the practical three-minute
+limit for transitions or platform encoding. Record at 1600×900 or better, keep
+the browser at a readable zoom, and hold every receipt view long enough to read
+the relevant `verified`, run, task-definition revision, citation, and
+persistence fields.
+
+Use these exact two-line provenance cards. Do not abbreviate away the revision
+or source boundary:
+
+```text
+LIVE PUBLIC DEMO · AWS + COCKROACHDB CLOUD · CURRENT REVISION 4 UI
+PUBLIC READ-ONLY ENDPOINT
+
+VERIFIED CLOUD AGENT RECEIPT · AWS FARGATE + COCKROACHDB CLOUD
+PRE-POLISH REVISION 3 · RUN devpost-final-20260814T021819Z
+
+VERIFIED CLOUD REPLACEMENT RECEIPT · AWS FARGATE + COCKROACHDB CLOUD
+PRE-POLISH REVISION 3 · RUN devpost-final-20260814T021819Z
+
+PUBLICATION-SAFE COCKROACHDB CLOUD EXPLAIN · DISPOSABLE FIXTURE
+PRODUCTION DATABASE UNTOUCHED
+
+DESIGN CODA · LOCAL-FIRST RECALL → COCKROACHDB FLEET RECALL
+ANY MCP CLIENT · OSTK OPTIONAL, NOT REQUIRED
+```
+
+### 0:00–0:10 — thesis
+
+Show the product name over the public URL, then say the thesis verbatim:
+“Agents are replaceable. Their memory shouldn't be—and when two disagree,
+memory should say so.” Cut directly to the live browser; do not spend the
+opening on architecture.
+
+### 0:10–0:52 — ASK
+
+Show <https://d13zrqfh66r7ub.cloudfront.net> with the live-public-demo label.
+Keep the `/api/status` chip in frame, submit the default conflict question, and
+pause on the rendered answer: the open-conflict callout first, then two or
+three readable memory cards with their claim or source coordinates. Follow a
+linked repository path only if that row is present in the deployed corpus; do
+not describe a plain claim ID as a file citation. Point out “fused in …ms” as
+server recall time and “round trip …ms” as browser-to-cloud time. These
+are different measurements. Do not call RRF rank artifacts confidence scores.
+
+Narrate: “This is the current read-only AWS deployment, backed by CockroachDB
+Cloud. I can ask in normal language and get readable, cited memories—not a wall
+of JSON. The memory also surfaces the open disagreement and its matching
+operator escalation instead of silently choosing a winner.” Leave “View raw
+evidence envelope” collapsed until the cards are understood; a brief expansion
+can establish the bounded raw evidence, but it must not become the interface.
+
+End the act with a short, legible cutaway to
+[`evidence/cockroach-cloud-explain.txt`](evidence/cockroach-cloud-explain.txt)
+under the publication-safe EXPLAIN label. Say only that the separately captured
+fixture plans selected the scoped vector and lexical indexes; index-ready
+status and RRF diagnostics alone do not prove physical plan selection.
+
+### 0:52–1:40 — DISAGREE
+
+Show the reviewed reference-agent receipt projection below with the verified
+cloud-agent label. Hold the `agents`, step sequence, `memory`, and `actions`
+fields in view. The exact chain is:
+
+1. Agent A records migration decision claim 5: “single dedicated migrator.”
+2. Agent B recalls it through lexical+dense RRF and records action claim 6,
+   citing claim 5.
+3. Agent C records “every worker migrates independently” as incompatible claim
+   7 under the same typed migration-strategy key, opening conflict 2.
+4. The same bound B identity records escalation claim 8, “pause rollout for
+   operator review,” citing conflict 2.
+
+Narrate: “These were four separately bound Fargate tasks over one CockroachDB
+memory plane. A and C made incompatible current claims under the same typed
+key. Fleet Recall preserved both, opened conflict 2, and B persisted an
+operator handoff that cites that conflict.” This is precise typed, same-key,
+current-interval conflict detection—not a claim of corpus-wide natural-language
+contradiction detection or LLM reasoning.
+
+### 1:40–2:12 — SURVIVE
+
+Switch to the reviewed replacement receipt projection under the verified cloud
+replacement label. Keep `task_definition`, `before`, `after`, and `persistence`
+visible. Narrate: “This pre-polish revision 3 proof forced a new ECS deployment.
+The before and after task sets were fully disjoint, while desired capacity
+stayed one. Exact action and escalation claims 6 and 8 were recalled both before
+and after through lexical+dense RRF. The workers were replaceable; CockroachDB
+remained the memory source of truth.” Explicitly say this receipt is revision 3
+evidence, separate from the current revision 4 UI.
+
+### 2:12–2:30 — local-first → fleet coda
+
+Show the storage boundary in [`ARCHITECTURE.md`](ARCHITECTURE.md) or the public
+repository landing page under the design-coda label. Narrate: “Recall stays
+local-first for one agent. When agents need to share memory across processes
+and hosts, the same small MCP contract can use CockroachDB as a durable fleet
+plane. It works with any MCP client; OSTK is optional, not required.” Do not
+show or imply an OSTK run unless separately authorized and labeled as described
+below.
+
+### 2:30–2:40 — close
+
+Return to the public endpoint and repository URL. Close with: “Local Recall for
+one agent; CockroachDB Fleet Recall when the whole fleet has to remember—and
+disagree—together.”
+
+## Publication-safe receipt views
+
+Validate the correlated operator-held receipts off camera before recording.
+The verifier's output is validation-only and is not a substitute for the two
+live-cloud receipts:
+
+```bash
+REFERENCE_RECEIPT=target/aws-evidence/reference-agent-devpost-final-20260814T021819Z.json
+REPLACEMENT_RECEIPT=target/aws-evidence/replacement-devpost-final-20260814T021819Z.json
+
+./deploy/aws/verify-publication-receipts.sh \
+  "$REFERENCE_RECEIPT" "$REPLACEMENT_RECEIPT" >/dev/null
+```
+
+For DISAGREE, project only the correlation fields. This deliberately omits
+task IDs and log-stream coordinates:
+
+```bash
+jq '{
+  schema, verified, deployment, run_id, agents,
+  task_definition: .aws.task_definition,
+  steps: [.aws.tasks[] | {step, agent}],
+  memory, actions,
+  public_verification: {
+    health: .public_demo.health,
+    exact_claim_ids_observed: .public_demo.exact_claim_ids_observed,
+    retrieval_lanes: .public_demo.retrieval_lanes,
+    fusion: .public_demo.fusion
+  }
+}' "$REFERENCE_RECEIPT"
+```
+
+For SURVIVE, show the bounded replacement and persistence fields without the
+before/after task identifiers:
+
+```bash
+jq '{
+  schema, verified, deployment, run_id,
+  task_definition: .aws.task_definition,
+  replacement_strategy: .aws.replacement_strategy,
+  desired_count_before: .aws.desired_count_before,
+  desired_count_after: .aws.desired_count_after,
+  before: .public_demo.before,
+  after: .public_demo.after,
+  persistence
+}' "$REPLACEMENT_RECEIPT"
+```
+
+Review even these projections frame by frame before publication. The chosen run
+ID, project/service names, public URL, and any visible terminal or browser chrome
+still require human approval.
+
+## Reproducible terminal source footage
+
+The final cut can use a real four-pane tmux sequence instead of edited terminal
+screenshots. Agent A writes durable memory, Agent B retrieves it and takes a
+cited action, Agent C creates an incompatible decision, and the same B identity
+resumes to pause and escalate. A narrow fifth pane keeps CockroachDB, retrieval,
+provenance, and scenario state visible throughout.
+
+Fleet Recall has two first-class recording modes that require no OSTK, agent
+orchestrator, LLM, model API, or cloud account. A third, explicitly optional
+mode can render an already verified OSTK adapter run. Local or rehearsal clips
+are supporting footage for DISAGREE; they never replace the live-cloud proof.
 
 ## Fresh standalone Fleet Recall recording
 
-This is the primary live evidence path. Start the local smoke environment and
-leave it running:
+This is the primary live **local** source-footage path. It is not AWS evidence.
+Start the local smoke environment and leave it running:
 
 ```bash
 KEEP_LOCALSTACK=1 ./deploy/localstack/smoke.sh
@@ -50,8 +227,9 @@ successful, or interrupted captures therefore cannot overwrite evidence.
 The contract proves the complete displayed story: Agent A's commit and exact
 idempotent replay, B's lexical+dense RRF hit and cross-project rejection, B's
 persisted action citing A, C's incompatible claim, the exact open two-member
-conflict, and B's persisted escalation citing that conflict. Live evidence is
-labeled **LOCAL LIVE MCP EVIDENCE · NO AWS/CLOUD · no OSTK/LLM** on screen.
+conflict, and B's persisted escalation citing that conflict. The generated
+footer reads **LOCAL LIVE MCP EVIDENCE · local CockroachDB run `<run-id>` · NO
+AWS/CLOUD · no OSTK/LLM**. Do not crop it.
 
 For an interactive preview instead of an MP4:
 
@@ -64,8 +242,8 @@ For an interactive preview instead of an MP4:
 The default tape reads checked-in, sanitized evidence from
 `docs/evidence/local-fleet-scenario.json`. It does not start services, launch
 OSTK agents, call a model, access cloud resources, read `.env`, or print
-credentials. The recording labels itself **REHEARSAL** and must not be
-described as a fresh run.
+credentials. The generated footer reads **REHEARSAL · sanitized evidence · no
+cloud/LLM calls** and must remain visible. Never describe it as a fresh run.
 
 ```bash
 ./demo/video/tests/run.sh
@@ -107,19 +285,24 @@ open demo/video/generated/ostk-live.mp4
 `--ostk-live` only renders existing JSON; it does not launch OSTK or make a
 model call. It rejects missing evidence, unsafe run IDs, the wrong OSTK
 version, unverified summaries, missing retrieval lanes, broken citations, and
-non-LocalStack action receipts. The on-screen provenance says **OPTIONAL OSTK
-EVIDENCE**. The ambiguous old `--live` spelling is intentionally unsupported,
-so an OSTK artifact cannot accidentally become the default live path.
+non-LocalStack action receipts. The generated footer reads **OPTIONAL OSTK
+EVIDENCE · verified 7.7.7 run `<run-id>`**. The ambiguous old `--live` spelling
+is intentionally unsupported, so an OSTK artifact cannot accidentally become
+the default live path.
 
 The optional OSTK summary proves the initial commit but does not include the
 deterministic retry receipt. Its Agent A pane therefore says replay is not
 asserted. It likewise labels scope injection as a separate deterministic gate
 instead of borrowing either claim from the standalone evidence.
 
-## Suggested narration
+## Standalone source-footage narration
+
+If the final DISAGREE act includes local terminal footage, keep its local or
+rehearsal provenance footer continuously visible and use this bounded
+narration. Do not imply that the clip came from AWS:
 
 1. “This is a fresh standalone Fleet Recall run—three independently bound MCP
-   identities, CockroachDB underneath, and no OSTK or LLM required.”
+   identities, local CockroachDB underneath, and no AWS, OSTK, or LLM required.”
 2. “Agent A commits a migration decision. An identical retry resolves to the
    same claim, so fleet retries do not duplicate memory.”
 3. “Agent B asks with different wording. CockroachDB combines lexical and

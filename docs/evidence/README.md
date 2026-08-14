@@ -23,8 +23,10 @@ For a new standalone run, `demo/video/capture-fleet.sh <run-id>` writes the
 same schema with `capture: "live"`, a UTC timestamp, and the requested run ID
 to ignored `target/fleet-demo/<run-id>/final.json`. The capture is published
 atomically only after `demo/video/verify.sh` confirms all displayed invariants
-and correlations. This is the primary live video path and does not use OSTK or
-an LLM.
+and correlations. This is optional local terminal footage, not the default
+final-cut path or cloud evidence, and it does not use OSTK or an LLM. The final
+cut instead leads with the live AWS UI and reviewed cloud receipts as specified
+in [`VIDEO_DEMO.md`](../VIDEO_DEMO.md).
 
 These are separately deployment-bound MCP processes, not evidence of an LLM
 making an autonomous choice. The opt-in adapter in `docs/OSTK_DEMO.md` is a
@@ -47,16 +49,23 @@ validate and cross-correlate them before publication. The verifier rejects
 common secret and AWS-account leaks, but chosen run/project/service names and
 the public hostname still require human review.
 
-The final-image submission run `devpost-final-20260814T021819Z` produced both
-verified receipts against <https://d13zrqfh66r7ub.cloudfront.net> and
-CockroachDB Cloud. Migration and the three-record seed had already succeeded.
-The reference receipt used task definition revision 3 and correlated four
-one-off Fargate tasks: decision claim 5, action claim 6 citing it, incompatible
-claim 7, open conflict 2, and escalation claim 8 citing that conflict. The
-public check observed exact action/escalation claims 6 and 8. The replacement
-receipt exercised serving task definition revision 3 and recorded a fully
-disjoint task-set change; both before and after observations returned those
-same exact claims through lexical/dense RRF.
+The verified pre-polish revision 3 submission evidence run
+`devpost-final-20260814T021819Z` produced both verified receipts against
+<https://d13zrqfh66r7ub.cloudfront.net> and CockroachDB Cloud. Migration and the
+three-record seed had already succeeded. The reference receipt used task
+definition revision 3 and correlated four one-off Fargate tasks: decision claim
+5, action claim 6 citing it, incompatible claim 7, open conflict 2, and
+escalation claim 8 citing that conflict. The public check observed exact
+action/escalation claims 6 and 8. The replacement receipt exercised serving
+task definition revision 3 and recorded a fully disjoint task-set change; both
+before and after observations returned those same exact claims through
+lexical/dense RRF.
+
+The currently deployed revision 4 serving image adds the conflict-first public
+UI, consistent JSON API errors, and measured server timing from `97eba7d`. It
+passed CI and separate public health, status, and recall smoke checks. No new
+four-agent or disjoint-replacement receipt was captured on revision 4; the
+operator-held receipts described above remain explicitly revision 3 evidence.
 
 The sanitized status proof reports CockroachDB 26.2.5, schema version 1,
 enabled vector, lexical, and conflict-membership indexes, working cosine
@@ -93,5 +102,5 @@ was dropped, and the temporary workstation network rule was removed after
 capture.
 
 The final public video and Devpost-controlled fields are still pending. CI is
-green at `19e626b`, including the CloudFront front door and the follow-up
-patched Go builder image.
+green at `97eba7d`, including the CloudFront front door, patched Go builder
+image, and conflict-first UI/API release.

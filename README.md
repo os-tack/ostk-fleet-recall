@@ -2,6 +2,9 @@
 
 ![OSTK Fleet Recall: distributed, conflict-aware agent memory](docs/assets/devpost-thumbnail-v2.png)
 
+> **Agents are replaceable. Their memory shouldn't be—and when two disagree,
+> memory should say so.**
+
 Shared, durable semantic memory for agent fleets, backed by CockroachDB while
 preserving Recall's local-first semantics and two-tool MCP contract. It works
 with any MCP client; OSTK orchestration is an optional integration, not an
@@ -42,16 +45,23 @@ The public status surface reports CockroachDB 26.2.5, schema version 1, enabled
 vector, lexical, and conflict-membership indexes, working cosine distance, and
 the pinned 512-dimension embedding model.
 
-The final-image reference run `devpost-final-20260814T021819Z`, using
-reference-agent task definition revision 3, verified the complete policy chain
-across four one-off Fargate tasks: decision claim 5, cited action claim 6,
-incompatible claim 7, and escalation claim 8 citing open conflict 2. Public
-hybrid lexical/dense RRF then observed the exact persisted action and
-escalation claims 6 and 8. A forced deployment of serving task definition
-revision 3 replaced the complete task set with a fully disjoint set, and the
-replacement observed those same exact claims through the same hybrid path. This
-is live AWS/CockroachDB Cloud evidence; LocalStack and local tests remain
-preflight evidence only.
+The verified pre-polish revision 3 cloud evidence run
+`devpost-final-20260814T021819Z`, using reference-agent task definition revision
+3, verified the complete policy chain across four one-off Fargate tasks:
+decision claim 5, cited action claim 6, incompatible claim 7, and escalation
+claim 8 citing open conflict 2. Public hybrid lexical/dense RRF then observed
+the exact persisted action and escalation claims 6 and 8. A forced deployment
+of serving task definition revision 3 replaced the complete task set with a
+fully disjoint set, and the replacement observed those same exact claims
+through the same hybrid path. This is live AWS/CockroachDB Cloud evidence;
+LocalStack and local tests remain preflight evidence only.
+
+The currently deployed revision 4 serving image adds the conflict-first public
+UI, consistent JSON API errors, and measured server timing from `97eba7d`. It
+passed CI and separate public health, status, and recall smoke checks. The
+four-agent and disjoint-replacement receipts were not rerun on revision 4, so
+they remain explicitly revision 3 evidence rather than evidence for the current
+image.
 
 HTTPS is provided by CloudFront's default certificate. AWS fixes that
 generated-hostname viewer policy at a TLSv1 minimum, although newer TLS can be
@@ -68,12 +78,14 @@ plans select `memory_chunks_semantic_idx`,
 production database was untouched, the fixture database was dropped, and the
 temporary workstation network rule was removed. The final public video and
 remaining entrant/Devpost fields are still release gates. CI is green at
-`19e626b`, including the CloudFront front door and the follow-up patched Go
-builder image.
+`97eba7d`, including the CloudFront front door, patched Go builder image, and
+conflict-first UI/API release.
 
-The default final video path is a fresh standalone Fleet Recall MCP capture and
-render. A verified OSTK render may be used only as an explicitly optional
-alternate; neither the core demo nor the cloud proof requires it.
+The final-cut plan leads with the live AWS UI and then shows the reviewed cloud
+agent and replacement receipts; see [`docs/VIDEO_DEMO.md`](docs/VIDEO_DEMO.md).
+A standalone Fleet Recall MCP capture is optional local terminal footage, and a
+verified OSTK render is an optional alternate. Neither substitutes for cloud
+proof.
 
 Keep the public judging deployment free and unrestricted
 through **September 15, 2026 at 5:00 PM EDT / 4:00 PM CDT**. Do not scale it to

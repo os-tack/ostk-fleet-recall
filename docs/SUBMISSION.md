@@ -22,7 +22,8 @@ OSTK Fleet Recall
 
 **Tagline**
 
-Durable, conflict-aware semantic memory for fleets of AI agents.
+Agents are replaceable. Their memory shouldn't be—and when two disagree,
+memory should say so.
 
 **Repository**
 
@@ -34,9 +35,12 @@ Durable, conflict-aware semantic memory for fleets of AI agents.
 
 **Testing instructions**
 
-Open the working-demo URL without signing in. Enter “How does fleet memory
-survive agent restarts?” in the recall form and submit; the result should show
-bounded CockroachDB-backed hits and their source metadata. Then open
+Open the working-demo URL without signing in. Its default question leads with
+the differentiator: “How are conflicting migration strategies represented and
+escalated?” Submit it and confirm the page visibly reports two agents
+disagreeing, the open typed conflict, the operator escalation, three readable
+supporting-memory cards, and measured server/round-trip time. Expand “View raw
+evidence envelope” to inspect the bounded CockroachDB-backed result. Then open
 <https://d13zrqfh66r7ub.cloudfront.net/healthz> and confirm
 `{"status":"ready"}`. The public
 surface is intentionally read-only: `/`, `/healthz`, `/api/status`, and bounded
@@ -163,11 +167,14 @@ authorized live run produces verified evidence. Its boundary is documented in
   dedicated one-off Fargate task definition runs the deterministic reference
   policy agent under A/B/C deployment identities;
   `deploy/aws/run-reference-agent.sh` verifies their correlated durable-memory
-  chain. Final-image run `devpost-final-20260814T021819Z`, using reference-agent
-  task definition revision 3, verified decision/action/incompatible/escalation
-  claims 5/6/7/8 and open conflict 2 across all four tasks. The replacement
-  wrapper verified exact claims 6 and 8 after a fully disjoint serving-task-set
-  change.
+  chain. Verified pre-polish revision 3 cloud evidence run
+  `devpost-final-20260814T021819Z`, using reference-agent task definition
+  revision 3, verified decision/action/incompatible/escalation claims 5/6/7/8
+  and open conflict 2 across all four tasks. The replacement wrapper verified
+  exact claims 6 and 8 after a fully disjoint serving-task-set change. The
+  current revision 4 serving image adds the conflict-first UI and bounded API
+  polish from `97eba7d`; it passed CI and separate public smoke checks, but the
+  four-task and replacement receipts were not rerun on revision 4.
 - Backend-neutral corpus traits extracted into upstream `ostk-recall`, pinned
   by immutable Git revision so the local and fleet stores share retrieval
   contracts without making local Recall depend on CockroachDB.
@@ -244,7 +251,7 @@ Git history and pinned revisions make that boundary inspectable.
 | AWS service | ECS/ALB/CloudFront/S3/Secrets/ECR/CloudWatch Terraform; one-off reference-agent task/wrapper; LocalStack contract harness | Live AWS migration/seed, healthy service, four reference-agent Fargate tasks, and complete serving-task replacement verified |
 | Public open source | Source, licenses, locked dependencies, setup and sample data | Published and anonymously verified at <https://github.com/os-tack/ostk-fleet-recall> |
 | Functional URL | HTTPS landing page, bounded recall, `/healthz` | Live at <https://d13zrqfh66r7ub.cloudfront.net>; health, status, and hybrid recall verified |
-| Public video <3 min | Fresh standalone Fleet Recall capture/render by default, cloud proof footage, then YouTube/Vimeo link and final duration; OSTK is an optional alternate | 46-second 1600×900 sanitized rehearsal rendered; `[RENDER_LIVE_NARRATE_AND_UPLOAD]` |
+| Public video <3 min | Live AWS UI plus reviewed cloud agent/replacement receipts by default, then YouTube/Vimeo link and final duration; standalone Fleet Recall is optional local footage and OSTK is an optional alternate | 46-second 1600×900 sanitized rehearsal rendered; `[RENDER_LIVE_NARRATE_AND_UPLOAD]` |
 
 ## Judging-criteria evidence map
 
@@ -254,86 +261,33 @@ treating successful vector search as the whole project.
 
 | Criterion | Strongest repository evidence | Final proof still to capture |
 |---|---|---|
-| Agentic Memory Design | Hybrid lexical/vector recall, typed claims, provenance, correction-aware conflict membership, and final-image run `devpost-final-20260814T021819Z` across four Fargate tasks | Show a reviewed, redacted excerpt of the correlated CockroachDB-backed result in the final video |
-| Technological Implementation | Prefix-scoped C-SPANN and inverted indexes, backend-neutral Recall extraction, short serializable retries, immutable model identity, conformance and adversarial tests, plus the publication-safe Cloud plan artifact | Show a reviewed excerpt of the three passing Cloud plans and final-image identity in the final video |
+| Agentic Memory Design | Hybrid lexical/vector recall, typed claims, provenance, correction-aware conflict membership, and verified revision 3 cloud evidence run `devpost-final-20260814T021819Z` across four Fargate tasks | Show a reviewed, redacted excerpt of the correlated CockroachDB-backed result in the final video |
+| Technological Implementation | Prefix-scoped C-SPANN and inverted indexes, backend-neutral Recall extraction, short serializable retries, immutable model identity, conformance and adversarial tests, plus the publication-safe Cloud plan artifact | Show a reviewed excerpt of the three passing Cloud plans and current revision 4 image identity in the final video; label the revision 3 receipts separately |
 | Real-World Impact | A recalled schema-migration decision changes the next agent's rollout action; an incompatible memory stops rollout and produces a cited operator handoff | Explain how the same pattern applies to long-running coding, operations, and research fleets |
 | Product Readiness | Trusted deployment scope, bounded input/output and hydration, least-privilege runtime/migrator separation, live HTTPS health, idempotent receipts, four-task proof, and exact recall after full task replacement | Capture final publication-safe footage without exposing identifiers or secrets; explain the CloudFront-to-ALB HTTP boundary accurately |
 | Creativity & Originality | Local Recall stays local-first while Fleet Recall adds a distributed memory plane; disagreement is durable first-class state rather than an overwrite or a hidden rank choice | Make the conflict-aware memory-to-action transition the visual center of the final video |
 
-## Video script (target 2:45)
+## Final video plan (target 2:40)
 
-The four-terminal memory/action/conflict sequence is reproducibly rendered by
-`demo/video/render.sh`; see `docs/VIDEO_DEMO.md`. Rehearsal mode is visibly
-labelled and uses sanitized checked-in evidence. The submitted cut should use
-a fresh verified standalone Fleet Recall MCP capture for the agent evidence
-and keep cloud proof as a separate captured gate. A verified OSTK render is an
-optional alternate take, not a submission dependency.
+[`VIDEO_DEMO.md`](VIDEO_DEMO.md) is the single authoritative recording plan.
+It opens on the live conflict-first interface and follows three acts: **ASK →
+DISAGREE → SURVIVE**, followed by a short local-first-to-fleet coda. Do not use
+an older architecture-first timeline or replace serving tasks manually while
+filming.
 
-The local standalone capture proves the displayed application chain but is not
-AWS evidence. The cloud segment must use the real public URL and the verified
-`fleet-reference-agent-run-v1` output from the Fargate wrapper. Both now exist
-for final-image run `devpost-final-20260814T021819Z`; only reviewed, redacted
-excerpts belong in the final cut. Do not describe the policy decisions as LLM
-output.
-The final export must also contain narration or another accessible audio track;
-the 46-second silent rehearsal is source footage, not a submission-ready video.
-
-**0:00-0:18 — problem and promise**
-
-Show three agent terminals and say: “A fleet needs more than similar text. It
-needs shared memory that survives workers, isolates projects, handles retries,
-and admits when agents disagree.”
-
-**0:18-0:38 — architecture**
-
-Show the architecture diagram. Point to ECS tasks, S3-pinned model, CockroachDB
-Cloud, scoped vector/lexical indexes, and the separate migration task.
-
-**0:38-1:10 — durable shared recall**
-
-The deterministic Agent A policy step records a typed deployment decision.
-Agent B recalls the idea using different wording through lexical+dense RRF,
-applies the explicit rollout-safety policy, and records the resulting execution
-plan: hold application workers until the dedicated migrator completes. Show the
-standalone video evidence, then the correlated AWS wrapper receipt and public
-read-only recall from the real deployment. Replace or stop the serving ECS
-task, let ECS restore it, then repeat recall to demonstrate that memory stayed
-in CockroachDB.
-
-**1:10-1:42 — conflict, not overwrite**
-
-The deterministic Agent C policy step records an incompatible typed value under
-the same claim key. Show both claims becoming disputed, the exact conflict
-membership, and complete coverage metadata. The same deployment-bound B
-identity then reads that conflict, applies the explicit pause-and-escalate
-policy, and persists an operator handoff citing it. Replay the same idempotency
-key and show that counts do not increase.
-
-**1:42-2:08 — isolation and execution evidence**
-
-Attempt to inject another project in an MCP request and show the request being
-rejected or remaining in the trusted deployment scope. Then show CockroachDB
-`EXPLAIN` selecting the scoped vector index and the lexical inverted index.
-
-**2:08-2:30 — qualifying technology**
-
-Show the pinned Agent Skills invocation-to-evidence trace beside the
-fresh-transaction retry code, its concurrency test, and schema constraints.
-Show the live ECS service and S3 model prefix without exposing
-account IDs, secret ARNs, URLs with credentials, or tenant-sensitive logs.
-
-**2:30-2:45 — close**
-
-“Local Recall for one agent; CockroachDB Fleet Recall when the whole fleet has
-to remember—and disagree—together.” End on the public demo URL and repository.
+The current revision 4 public UI and the verified pre-polish revision 3 cloud
+receipts are separate evidence sources and must stay visibly labeled. Local or
+rehearsal terminal footage is supporting material, never AWS evidence. The
+final export needs narration or another accessible audio track; the silent
+rehearsal is not submission-ready.
 
 ## Final release checklist
 
 - [x] Public repository URL works in a logged-out browser.
 - [x] Licenses, dependency lockfile, sample NDJSON, setup, architecture, and
       pre-existing-work disclosure are present.
-- [x] CI completed green for `19e626b` on Rust 1.94, including the CloudFront
-      front door and patched Go builder image.
+- [x] CI completed green for `97eba7d` on Rust 1.94, including the CloudFront
+      front door, patched Go builder image, and conflict-first UI/API release.
 - [x] CockroachDB Cloud uses TLS, a non-admin runtime user, backups, and an
       allowlist/private route.
 - [x] Run one migration task, then verify `health` and all required indexes.

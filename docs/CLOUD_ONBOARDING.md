@@ -381,13 +381,17 @@ jq -e '.schema == "fleet-reference-agent-run-v1" and .verified == true' \
 ```
 
 For the live deployment, migration and the three-record seed exited
-successfully. Final-image run `devpost-final-20260814T021819Z`, using
-reference-agent task definition revision 3, then verified four Fargate tasks
-and the correlated decision/action/incompatible/escalation claim IDs 5/6/7/8
-with open conflict ID 2. Public lexical/dense RRF observed the exact action and
-escalation claims 6 and 8. The replacement proof changed the complete serving
-task set to a fully disjoint set and observed those same exact claims afterward.
-The separate Cloud `EXPLAIN` proof then exercised the exact production
+successfully. Verified pre-polish revision 3 cloud evidence run
+`devpost-final-20260814T021819Z`, using reference-agent task definition revision
+3, then verified four Fargate tasks and the correlated
+decision/action/incompatible/escalation claim IDs 5/6/7/8 with open conflict ID
+2. Public lexical/dense RRF observed the exact action and escalation claims 6
+and 8. The replacement proof changed the complete serving task set to a fully
+disjoint set and observed those same exact claims afterward. The current
+revision 4 serving image adds the conflict-first UI and bounded API polish from
+`97eba7d`; it passed CI and separate public smoke checks, but the four-task and
+replacement receipts were not rerun on revision 4. The separate Cloud
+`EXPLAIN` proof then exercised the exact production
 project-vector, source-vector, and lexical SQL shapes on a 10,001-row disposable
 fixture. It selected `memory_chunks_semantic_idx`,
 `memory_chunks_source_semantic_idx`, and `memory_chunks_lexical_idx`; all
@@ -417,10 +421,10 @@ section with the ready state, exact observed action/escalation claim IDs, and
 lexical+dense RRF diagnostics. Protect the raw JSON artifact, local Terraform
 state, and `terraform.tfvars`; all are ignored but remain operationally
 sensitive. Redact AWS account/infrastructure identifiers before screenshots or
-publication. The final video should use the fresh standalone Fleet Recall
-capture/render as its default agent sequence and show a reviewed, redacted form
-of the correlated AWS result as cloud proof. An OSTK render is an explicitly
-optional alternate.
+publication. The final video should lead with the live AWS UI and show reviewed,
+redacted cloud agent and replacement receipts. A fresh standalone Fleet Recall
+capture is optional local terminal footage; an OSTK render is an explicitly
+optional alternate. Neither is cloud proof.
 
 ## Judging availability hold, then teardown
 
