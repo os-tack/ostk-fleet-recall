@@ -1168,6 +1168,47 @@ mod tests {
     }
 
     #[test]
+    fn public_document_and_code_categories_are_valid_exact_source_filters() {
+        for source in ["markdown", "code"] {
+            let args = from_arguments::<SearchArgs>(
+                Map::from_iter([
+                    ("query".into(), json!("where is this configured?")),
+                    ("kind".into(), json!("chunk")),
+                    ("source".into(), json!(source)),
+                    ("limit".into(), json!(8)),
+                    ("max_per_source_id".into(), json!(1)),
+                ]),
+                "recall search",
+            )
+            .unwrap();
+
+            validate_search_args(&args).unwrap();
+            assert_eq!(args.kind.as_deref(), Some("chunk"));
+            assert_eq!(args.source.as_deref(), Some(source));
+            assert_eq!(args.max_per_source_id, Some(1));
+        }
+    }
+
+    #[test]
+    fn public_claim_category_is_valid_only_without_chunk_filters() {
+        let args = from_arguments::<SearchArgs>(
+            Map::from_iter([
+                ("query".into(), json!("what did the agents decide?")),
+                ("kind".into(), json!("claim")),
+                ("limit".into(), json!(8)),
+            ]),
+            "recall search",
+        )
+        .unwrap();
+
+        validate_search_args(&args).unwrap();
+        reject_claim_only_unsupported_filters(&args).unwrap();
+        assert_eq!(args.kind.as_deref(), Some("claim"));
+        assert!(args.source.is_none());
+        assert!(args.max_per_source_id.is_none());
+    }
+
+    #[test]
     fn remember_domain_validation_errors_are_client_errors() {
         let input = ClaimInput {
             kind: crate::ledger::ClaimKind::Note,

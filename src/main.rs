@@ -548,9 +548,26 @@ impl DemoHealth for CockroachStore {
 struct DemoRecallInput {
     query: String,
     #[serde(default)]
+    category: Option<DemoRecallCategory>,
+    #[serde(default)]
     source: Option<String>,
     #[serde(default = "default_demo_limit")]
     limit: usize,
+}
+
+/// Bounded public-demo retrieval lanes.
+///
+/// `source` remains available for backward-compatible, exact chunk-source
+/// filtering. This higher-level category is what the UI uses: document and
+/// code searches are constrained inside hybrid retrieval before ranking,
+/// while claim searches use the ledger's dedicated claim passage index.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DemoRecallCategory {
+    All,
+    Document,
+    Code,
+    Claim,
 }
 
 const fn default_demo_limit() -> usize {
@@ -769,17 +786,47 @@ async fn demo_recall(
             }),
         );
     }
+    let arguments = match demo_search_arguments(input) {
+        Ok(arguments) => arguments,
+        Err(message) => return demo_json(StatusCode::BAD_REQUEST, json!({ "error": message })),
+    };
+    dispatch_demo_recall(state, RecallAction::Search, arguments).await
+}
+
+fn demo_search_arguments(input: DemoRecallInput) -> Result<Map<String, Value>, &'static str> {
+    let category = input.category.unwrap_or(DemoRecallCategory::All);
+    let source = match (category, input.source.as_deref()) {
+        (DemoRecallCategory::Document, None | Some("markdown")) => Some("markdown"),
+        (DemoRecallCategory::Code, None | Some("code")) => Some("code"),
+        (DemoRecallCategory::Document, Some(_)) => {
+            return Err("category=document accepts only source=markdown");
+        }
+        (DemoRecallCategory::Code, Some(_)) => {
+            return Err("category=code accepts only source=code");
+        }
+        (DemoRecallCategory::Claim, Some(_)) => {
+            return Err("category=claim cannot be combined with source");
+        }
+        (DemoRecallCategory::All, source) => source,
+        (DemoRecallCategory::Claim, None) => None,
+    };
+
     let mut arguments = Map::from_iter([
         ("query".into(), Value::String(input.query)),
         ("limit".into(), json!(input.limit)),
-        // Public cards should show distinct source coordinates rather than
-        // three neighboring chunks from one long document.
-        ("max_per_source_id".into(), json!(1)),
     ]);
-    if let Some(source) = input.source {
-        arguments.insert("source".into(), Value::String(source));
+    if category == DemoRecallCategory::Claim {
+        arguments.insert("kind".into(), Value::String("claim".into()));
+    } else {
+        arguments.insert("kind".into(), Value::String("chunk".into()));
+        // Public cards should show distinct source coordinates rather than
+        // neighboring chunks from one long document.
+        arguments.insert("max_per_source_id".into(), json!(1));
+        if let Some(source) = source {
+            arguments.insert("source".into(), Value::String(source.to_owned()));
+        }
     }
-    dispatch_demo_recall(state, RecallAction::Search, arguments).await
+    Ok(arguments)
 }
 
 async fn demo_api_not_found() -> Response {
@@ -1333,6 +1380,7 @@ mod tests {
     #[derive(Default)]
     struct DemoService {
         queries: Mutex<Vec<String>>,
+        searches: Mutex<Vec<(FleetScope, Map<String, Value>)>>,
         status_calls: AtomicUsize,
         status_failures_remaining: AtomicUsize,
         status_payload: Mutex<Option<Value>>,
@@ -1343,7 +1391,7 @@ mod tests {
     impl FleetMemoryService for DemoService {
         async fn recall(
             &self,
-            _scope: FleetScope,
+            scope: FleetScope,
             request: RecallRequest,
         ) -> ServiceResult<RecallResult> {
             if request.action == RecallAction::Status {
@@ -1379,8 +1427,18 @@ mod tests {
                 .and_then(Value::as_str)
                 .expect("demo query")
                 .to_owned();
-            assert_eq!(request.arguments.get("max_per_source_id"), Some(&json!(1)));
+            if request.arguments.get("kind") == Some(&json!("claim")) {
+                assert!(!request.arguments.contains_key("max_per_source_id"));
+                assert!(!request.arguments.contains_key("source"));
+            } else {
+                assert_eq!(request.arguments.get("kind"), Some(&json!("chunk")));
+                assert_eq!(request.arguments.get("max_per_source_id"), Some(&json!(1)));
+            }
             self.queries.lock().unwrap().push(query);
+            self.searches
+                .lock()
+                .unwrap()
+                .push((scope, request.arguments));
             Ok(RecallResult::new(json!({
                 "hits": [{
                     "chunk_id": "demo-1",
@@ -1561,14 +1619,16 @@ mod tests {
     }
 
     async fn demo_recall_request(router: &Router, query: &str) -> Response {
+        demo_recall_payload(router, json!({ "query": query, "limit": 8 })).await
+    }
+
+    async fn demo_recall_payload(router: &Router, payload: Value) -> Response {
         router
             .clone()
             .oneshot(
                 Request::post("/api/recall")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&json!({ "query": query, "limit": 8 })).unwrap(),
-                    ))
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
                     .unwrap(),
             )
             .await
@@ -1705,6 +1765,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mutation.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn demo_recall_categories_select_bounded_backend_lanes_before_ranking() {
+        let service = Arc::new(DemoService::default());
+        let router = test_demo_router(service.clone());
+
+        for (query, category) in [
+            ("all memory", "all"),
+            ("documentation", "document"),
+            ("implementation", "code"),
+            ("durable assertions", "claim"),
+        ] {
+            let response = demo_recall_payload(
+                &router,
+                json!({ "query": query, "limit": 8, "category": category }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "category {category}");
+        }
+
+        let searches = {
+            let searches = service.searches.lock().unwrap();
+            searches.clone()
+        };
+        assert_eq!(searches.len(), 4);
+        for (actual_scope, _) in &searches {
+            assert_eq!(actual_scope, &scope());
+        }
+        assert_eq!(searches[0].1.get("kind"), Some(&json!("chunk")));
+        assert!(!searches[0].1.contains_key("source"));
+        assert_eq!(searches[1].1.get("kind"), Some(&json!("chunk")));
+        assert_eq!(searches[1].1.get("source"), Some(&json!("markdown")));
+        assert_eq!(searches[2].1.get("kind"), Some(&json!("chunk")));
+        assert_eq!(searches[2].1.get("source"), Some(&json!("code")));
+        assert_eq!(searches[3].1.get("kind"), Some(&json!("claim")));
+        assert!(!searches[3].1.contains_key("source"));
+        assert!(!searches[3].1.contains_key("max_per_source_id"));
+    }
+
+    #[tokio::test]
+    async fn demo_recall_category_keeps_legacy_source_filter_and_rejects_ambiguity() {
+        let service = Arc::new(DemoService::default());
+        let router = test_demo_router(service.clone());
+
+        let legacy = demo_recall_payload(
+            &router,
+            json!({ "query": "legacy source", "limit": 8, "source": "file_glob" }),
+        )
+        .await;
+        assert_eq!(legacy.status(), StatusCode::OK);
+        assert_eq!(
+            service.searches.lock().unwrap()[0].1.get("source"),
+            Some(&json!("file_glob"))
+        );
+
+        for (payload, message) in [
+            (
+                json!({ "query": "ambiguous", "category": "document", "source": "code" }),
+                "category=document accepts only source=markdown",
+            ),
+            (
+                json!({ "query": "ambiguous", "category": "code", "source": "markdown" }),
+                "category=code accepts only source=code",
+            ),
+            (
+                json!({ "query": "ambiguous", "category": "claim", "source": "markdown" }),
+                "category=claim cannot be combined with source",
+            ),
+        ] {
+            let response = demo_recall_payload(&router, payload).await;
+            assert_demo_error(response, StatusCode::BAD_REQUEST, message).await;
+        }
+        assert_eq!(service.searches.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn demo_recall_category_is_closed_and_cannot_reroute_scope() {
+        let service = Arc::new(DemoService::default());
+        let router = test_demo_router(service.clone());
+
+        for payload in [
+            json!({ "query": "memory", "category": "documents" }),
+            json!({ "query": "memory", "category": "CODE" }),
+            json!({ "query": "memory", "category": "document", "project": "other-project" }),
+            json!({ "query": "memory", "category": "code", "tenant_id": Uuid::nil() }),
+        ] {
+            let response = demo_recall_payload(&router, payload).await;
+            assert_demo_error(
+                response,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "request JSON does not match the expected shape",
+            )
+            .await;
+        }
+        assert!(service.searches.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
