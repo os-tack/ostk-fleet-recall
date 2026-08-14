@@ -2078,7 +2078,7 @@ mod tests {
                  excerpt, relation, state\
              ) SELECT $1, $2, $3, '', 'pathological-test', g::STRING, \
                       'pathological-' || g::STRING, $4, 'supports', 'current' \
-               FROM generate_series(1, 32) AS g",
+               FROM generate_series(1, 31) AS g",
         )
         .bind(scope.tenant_id)
         .bind(&scope.project)
