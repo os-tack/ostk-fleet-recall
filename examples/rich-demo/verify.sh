@@ -427,8 +427,8 @@ while IFS='|' read -r relative_path _; do
             | gsub("[[:space:]]+"; " ")
             | sub("^ "; "")
             | sub(" $"; "");
-        def normalized_slice($lines; $start; $end):
-            $lines[($start - 1):$end] | join(" ") | clean_source;
+        def normalized_slice($lines; $start; $finish):
+            $lines[($start - 1):$finish] | join(" ") | clean_source;
         def section_at($lines; $start):
             reduce range(0; $start - 1) as $index (
                 {section: "Overview", in_fence: false};
@@ -448,22 +448,22 @@ while IFS='|' read -r relative_path _; do
         def exact_source_bounds($lines):
             . as $record
             | $record.extra.source_line_start as $start
-            | $record.extra.source_line_end as $end
+            | $record.extra.source_line_end as $finish
             | section_at($lines; $start) as $section
             | ("Source document " + $record.source_id
                 + "; section " + $section + ". ") as $prefix
             | ($record.text | startswith($prefix)) as $prefix_matches
             | $record.text[($prefix | length):] as $body
-            | normalized_slice($lines; $start; $end) as $slice
+            | normalized_slice($lines; $start; $finish) as $slice
             | $prefix_matches
-            and $end <= ($lines | length)
+            and $finish <= ($lines | length)
             and ($body | length) > 0
             and ($slice | contains($body))
-            and ($start == $end
-                or (normalized_slice($lines; $start + 1; $end)
+            and ($start == $finish
+                or (normalized_slice($lines; $start + 1; $finish)
                     | contains($body) | not))
-            and ($start == $end
-                or (normalized_slice($lines; $start; $end - 1)
+            and ($start == $finish
+                or (normalized_slice($lines; $start; $finish - 1)
                     | contains($body) | not));
 
         ($source_text | split("\n")) as $source_lines
