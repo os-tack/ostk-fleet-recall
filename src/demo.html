@@ -5,59 +5,413 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OSTK Fleet Recall</title>
   <style>
-    :root { color-scheme: dark; --ink:#f6f3ed; --muted:#a9b1bd; --panel:#121722; --line:#293243; --cyan:#61dafb; --amber:#ffbf69; }
-    * { box-sizing: border-box; }
-    body { margin:0; min-height:100vh; font:16px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--ink); background:radial-gradient(circle at 80% 10%,#172b3c 0,transparent 32rem),#090c12; }
-    main { width:min(980px,calc(100% - 2rem)); margin:auto; padding:5rem 0; }
-    .eyebrow { color:var(--cyan); letter-spacing:.18em; text-transform:uppercase; font-size:.78rem; }
-    h1 { font:700 clamp(2.5rem,8vw,6.5rem)/.9 system-ui,sans-serif; letter-spacing:-.07em; margin:.35em 0 .2em; max-width:850px; }
-    .lede { color:var(--muted); max-width:720px; font-size:1.05rem; }
-    .grid { display:grid; grid-template-columns:1.2fr .8fr; gap:1rem; margin-top:2.5rem; }
-    .panel { border:1px solid var(--line); background:color-mix(in srgb,var(--panel) 94%,transparent); border-radius:14px; padding:1.25rem; box-shadow:0 24px 80px #0007; }
-    label { display:block; color:var(--muted); margin-bottom:.5rem; }
+    :root {
+      color-scheme: dark;
+      --ink:#f7f4ee;
+      --muted:#aeb8c7;
+      --panel:#111722;
+      --panel-soft:#161e2b;
+      --line:#2a3547;
+      --cyan:#6fe5ff;
+      --cyan-soft:#102b36;
+      --amber:#ffc46b;
+      --amber-soft:#2d2113;
+      --red:#ff8f86;
+      --green:#79e4a8;
+      --shadow:#0008;
+    }
+    * { box-sizing:border-box; }
+    body {
+      margin:0;
+      min-height:100vh;
+      font:16px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+      color:var(--ink);
+      background:
+        radial-gradient(circle at 88% 2%,#173a4d 0,transparent 34rem),
+        radial-gradient(circle at 8% 72%,#2a2015 0,transparent 28rem),
+        #080b11;
+    }
+    main { width:min(1080px,calc(100% - 2rem)); margin:auto; padding:3.5rem 0 4rem; }
+    .topline { display:flex; align-items:center; justify-content:space-between; gap:1rem; }
+    .eyebrow { color:var(--cyan); letter-spacing:.16em; text-transform:uppercase; font-size:.76rem; }
+    .status-chip {
+      display:inline-flex;
+      align-items:center;
+      gap:.55rem;
+      max-width:100%;
+      border:1px solid var(--line);
+      border-radius:999px;
+      padding:.48rem .75rem;
+      color:var(--muted);
+      background:#0c111a;
+      font-size:.72rem;
+      line-height:1.35;
+    }
+    .status-dot { width:.55rem; height:.55rem; flex:0 0 auto; border-radius:50%; background:var(--amber); box-shadow:0 0 0 3px #ffc46b1f; }
+    .status-chip.ready { color:#d9f9e6; border-color:#275a40; background:#0d1c16; }
+    .status-chip.ready .status-dot { background:var(--green); box-shadow:0 0 0 3px #79e4a826; }
+    .status-chip.error .status-dot { background:var(--red); box-shadow:0 0 0 3px #ff8f8626; }
+    h1 { font:750 clamp(2.7rem,7.8vw,6rem)/.93 system-ui,-apple-system,sans-serif; letter-spacing:-.065em; margin:.34em 0 .22em; max-width:980px; }
+    h1 span { color:var(--amber); }
+    .lede { color:var(--muted); max-width:790px; font-size:clamp(1rem,2vw,1.12rem); margin:0; }
+    .lede strong { color:var(--ink); font-weight:600; }
+    .grid { display:grid; grid-template-columns:minmax(0,1.55fr) minmax(260px,.75fr); gap:1rem; margin-top:2.4rem; align-items:start; }
+    .panel { border:1px solid var(--line); background:color-mix(in srgb,var(--panel) 95%,transparent); border-radius:16px; padding:1.25rem; box-shadow:0 24px 80px var(--shadow); }
+    .story-label { display:flex; align-items:center; gap:.5rem; color:var(--amber); margin:0 0 .45rem; font-size:.76rem; font-weight:700; letter-spacing:.09em; text-transform:uppercase; }
+    .story-label::before { content:""; width:.45rem; height:.45rem; border-radius:50%; background:var(--amber); }
+    h2 { font:700 1.2rem/1.25 system-ui,-apple-system,sans-serif; margin:0; letter-spacing:-.02em; }
+    .form-copy { color:var(--muted); font-size:.85rem; margin:.25rem 0 .9rem; }
+    label { display:block; color:var(--muted); margin-bottom:.48rem; font-size:.84rem; }
     .query { display:flex; gap:.6rem; }
-    input { width:100%; border:1px solid var(--line); border-radius:9px; background:#090d15; color:var(--ink); padding:.85rem 1rem; font:inherit; }
-    button { border:0; border-radius:9px; padding:.85rem 1.1rem; background:var(--cyan); color:#071016; font:700 .9rem inherit; cursor:pointer; }
-    button:disabled { opacity:.55; cursor:wait; }
-    .samples { display:flex; gap:.45rem; flex-wrap:wrap; margin-top:.75rem; }
-    .samples button { color:var(--muted); background:#1a2230; font-weight:500; padding:.45rem .65rem; }
-    #result { min-height:250px; white-space:pre-wrap; word-break:break-word; color:#d6e0eb; font-size:.82rem; overflow:auto; max-height:520px; }
+    input { width:100%; min-width:0; border:1px solid var(--line); border-radius:10px; background:#080d15; color:var(--ink); padding:.82rem .95rem; font:inherit; }
+    button { min-height:44px; border:0; border-radius:10px; padding:.75rem 1.05rem; background:var(--cyan); color:#071016; font:700 .88rem inherit; cursor:pointer; }
+    button:hover { filter:brightness(1.08); }
+    button:disabled { opacity:.55; cursor:wait; filter:none; }
+    input:focus-visible,button:focus-visible,summary:focus-visible { outline:3px solid #6fe5ff59; outline-offset:2px; }
+    .samples { display:flex; gap:.48rem; flex-wrap:wrap; margin-top:.75rem; }
+    .samples button { color:#cbd5e2; background:#1a2432; border:1px solid #2b3a4e; font-weight:500; padding:.48rem .68rem; }
+    .samples button:first-child { color:#ffe1b2; background:var(--amber-soft); border-color:#684820; }
+    .answer-shell { margin-top:1.25rem; border-top:1px solid var(--line); padding-top:1.1rem; }
+    .query-meta { min-height:1.45rem; color:var(--muted); font-size:.76rem; margin-bottom:.65rem; }
+    .initial-answer { border:1px dashed #3b4656; border-radius:12px; padding:1rem; color:var(--muted); background:#0b1018; }
+    .initial-answer strong { display:block; color:var(--ink); margin-bottom:.25rem; }
+    .loading { color:var(--muted); padding:.6rem 0; }
+    .loading::before { content:""; display:inline-block; width:.66rem; height:.66rem; margin-right:.55rem; border:2px solid #314052; border-top-color:var(--cyan); border-radius:50%; animation:spin .8s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    .conflict-callout { border:1px solid #765222; border-left:4px solid var(--amber); border-radius:12px; padding:1rem; background:linear-gradient(110deg,var(--amber-soft),#171611); }
+    .conflict-title { font:700 1.02rem/1.35 system-ui,-apple-system,sans-serif; color:#ffe1b2; margin:0; }
+    .conflict-copy { color:#dfc6a3; margin:.35rem 0 0; font-size:.87rem; }
+    .coverage-note { color:#aa9579; margin:.5rem 0 0; font-size:.72rem; }
+    .results-heading { display:flex; align-items:baseline; justify-content:space-between; gap:1rem; margin:1.05rem 0 .65rem; }
+    .results-heading h3 { font:700 1.2rem/1.25 system-ui,-apple-system,sans-serif; margin:0; letter-spacing:-.02em; }
+    .results-heading span { color:var(--muted); font-size:.72rem; }
+    .hit-list { display:grid; gap:.6rem; }
+    .hit-card { border:1px solid var(--line); background:var(--panel-soft); border-radius:11px; padding:.9rem 1rem; overflow-wrap:anywhere; }
+    .hit-card p { margin:0; color:#edf2f7; font:500 .94rem/1.55 system-ui,-apple-system,sans-serif; }
+    .hit-meta { display:flex; gap:.45rem; align-items:center; flex-wrap:wrap; margin-top:.62rem; color:var(--muted); font-size:.69rem; }
+    .hit-rank { color:var(--cyan); }
+    .meta-separator { color:#536176; }
+    .empty-result,.error-result { border:1px solid var(--line); border-radius:11px; padding:1rem; color:var(--muted); background:#0c1119; }
+    .error-result { border-color:#6f3838; color:#ffc7c2; background:#211313; }
+    details { margin-top:.85rem; border-top:1px solid var(--line); padding-top:.65rem; }
+    summary { width:max-content; max-width:100%; min-height:44px; display:flex; align-items:center; cursor:pointer; color:var(--muted); font-size:.78rem; }
+    summary::before { content:"+"; margin-right:.45rem; color:var(--cyan); }
+    details[open] summary::before { content:"−"; }
+    #raw-result { white-space:pre-wrap; word-break:break-word; color:#b9c6d6; font-size:.72rem; overflow:auto; max-height:430px; background:#090d14; border:1px solid var(--line); border-radius:9px; padding:.85rem; margin:.25rem 0 0; }
     .facts { list-style:none; padding:0; margin:0; }
-    .facts li { padding:.75rem 0; border-bottom:1px solid var(--line); }
-    .facts strong { display:block; color:var(--amber); font-size:.8rem; text-transform:uppercase; letter-spacing:.08em; }
-    footer { color:var(--muted); font-size:.8rem; margin-top:2rem; }
-    @media (max-width:760px) { main{padding:3rem 0}.grid{grid-template-columns:1fr}.query{flex-direction:column} }
+    .facts li { padding:.78rem 0; border-bottom:1px solid var(--line); color:#dbe3ed; font-size:.86rem; }
+    .facts li:last-child { border-bottom:0; }
+    .facts strong { display:block; color:var(--amber); font-size:.7rem; text-transform:uppercase; letter-spacing:.09em; margin-bottom:.15rem; }
+    .read-only { display:flex; gap:.62rem; align-items:flex-start; margin-top:1rem; color:var(--muted); font-size:.76rem; }
+    .lock { color:var(--green); }
+    footer { color:var(--muted); font-size:.78rem; margin-top:1.6rem; }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+    [hidden] { display:none !important; }
+    @media (max-width:780px) {
+      main { padding:2.4rem 0 3rem; }
+      .topline { align-items:flex-start; flex-direction:column; }
+      .status-chip { border-radius:12px; }
+      .grid { grid-template-columns:1fr; }
+      .query { flex-direction:column; }
+      .query button { width:100%; }
+    }
+    @media (max-width:430px) {
+      main { width:min(100% - 1.15rem,1080px); }
+      h1 { font-size:2.65rem; }
+      .panel { padding:1rem; }
+      .samples { display:grid; grid-template-columns:1fr; }
+      .samples button { width:100%; text-align:left; }
+      .results-heading { align-items:flex-start; flex-direction:column; gap:.15rem; }
+    }
+    @media (prefers-reduced-motion:reduce) { .loading::before { animation:none; } }
   </style>
 </head>
 <body>
 <main>
-  <div class="eyebrow">Distributed memory · CockroachDB × AWS</div>
-  <h1>One memory plane for an agent fleet.</h1>
-  <p class="lede">Ask the live corpus. Every result is tenant- and project-scoped, fused from lexical and 512-dimensional vector lanes, and backed by conflict-aware durable claims.</p>
+  <div class="topline">
+    <div class="eyebrow">Distributed memory · CockroachDB × AWS</div>
+    <div id="status-chip" class="status-chip" role="status" aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="status-text">Checking the memory plane…</span>
+    </div>
+  </div>
+  <h1>When agents disagree, memory should <span>say so.</span></h1>
+  <p class="lede"><strong>Fleet Recall surfaces incompatible decisions instead of silently choosing one.</strong> Search the live, project-scoped memory plane to see hybrid retrieval and typed conflict detection working together.</p>
+
   <div class="grid">
-    <section class="panel">
+    <section class="panel" aria-labelledby="demo-heading">
+      <p class="story-label">Conflict-aware recall</p>
+      <h2 id="demo-heading">Ask the live agent memory</h2>
+      <p class="form-copy">Start with the conflict story, or try another question.</p>
       <form id="search">
         <label for="query">Recall from the fleet</label>
-        <div class="query"><input id="query" maxlength="2000" value="Why did the fleet choose CockroachDB?" required><button id="submit">Recall</button></div>
+        <div class="query">
+          <input id="query" maxlength="2000" value="How are conflicting migration strategies represented and escalated?" autocomplete="off" required>
+          <button id="submit" type="submit">Recall</button>
+        </div>
       </form>
-      <div class="samples"><button data-q="What database did the fleet choose?">database choice</button><button data-q="How are conflicting decisions represented?">conflicts</button><button data-q="What survives an agent restart?">durability</button></div>
-      <pre id="result" aria-live="polite">Ready.</pre>
+      <div class="samples" aria-label="Sample queries">
+        <button type="button" data-q="How are conflicting migration strategies represented and escalated?">⚠ conflicting agents</button>
+        <button type="button" data-q="Why did the fleet choose CockroachDB?">database choice</button>
+        <button type="button" data-q="What survives an agent restart?">durability</button>
+      </div>
+
+      <div class="answer-shell">
+        <div id="query-meta" class="query-meta" aria-live="polite"></div>
+        <div id="answer" aria-live="polite" aria-busy="false">
+          <div class="initial-answer">
+            <strong>The contradiction is the demo.</strong>
+            Recall will return the relevant memories, surface typed same-key disagreements, and show when a matching escalation was recorded.
+          </div>
+        </div>
+        <details id="raw" hidden>
+          <summary>View raw evidence envelope</summary>
+          <pre id="raw-result"></pre>
+        </details>
+      </div>
     </section>
-    <aside class="panel">
+
+    <aside class="panel" aria-label="How Fleet Recall works">
       <ul class="facts">
+        <li><strong>Conflict behavior</strong>Same-key typed contradictions surface as open conflicts until deliberately resolved</li>
         <li><strong>Retrieval</strong>Lexical + C-SPANN vector lanes, reciprocal-rank fused</li>
-        <li><strong>Isolation</strong>Trusted tenant/project boundary; callers cannot reroute it</li>
-        <li><strong>Writes</strong>Serializable, retry-safe, idempotent deliberate memory</li>
-        <li><strong>Runtime</strong>AWS ECS/Fargate with CockroachDB as the shared substrate</li>
+        <li><strong>Isolation</strong>Tenant and project scope is trusted server configuration</li>
+        <li><strong>Durability</strong>Shared memory survives individual agent and task replacement</li>
+        <li><strong>Runtime</strong>AWS ECS/Fargate backed by CockroachDB Cloud</li>
       </ul>
+      <div class="read-only"><span class="lock" aria-hidden="true">●</span><span>This public experience is bounded and read-only. Writes stay behind the canonical MCP <code>remember</code> tool.</span></div>
     </aside>
   </div>
-  <footer>This public endpoint is deliberately read-only. Fleet agents write through the canonical MCP <code>remember</code> tool.</footer>
+  <footer>Live hackathon deployment · raw API evidence remains available for inspection</footer>
 </main>
+
 <script>
-const form=document.querySelector('#search'),input=document.querySelector('#query'),out=document.querySelector('#result'),submit=document.querySelector('#submit');
-document.querySelectorAll('[data-q]').forEach(b=>b.addEventListener('click',()=>{input.value=b.dataset.q;form.requestSubmit()}));
-form.addEventListener('submit',async e=>{e.preventDefault();submit.disabled=true;out.textContent='Searching lexical + vector lanes…';try{const r=await fetch('/api/recall',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query:input.value,limit:8})});const body=await r.json();out.textContent=JSON.stringify(body,null,2)}catch(_){out.textContent='The demo could not reach its memory service.'}finally{submit.disabled=false}});
+const form=document.querySelector('#search');
+const input=document.querySelector('#query');
+const answer=document.querySelector('#answer');
+const queryMeta=document.querySelector('#query-meta');
+const submit=document.querySelector('#submit');
+const sampleButtons=[...document.querySelectorAll('[data-q]')];
+const raw=document.querySelector('#raw');
+const rawResult=document.querySelector('#raw-result');
+const statusChip=document.querySelector('#status-chip');
+const statusText=document.querySelector('#status-text');
+let searching=false;
+
+function element(tag,className,text){
+  const node=document.createElement(tag);
+  if(className)node.className=className;
+  if(text!==undefined)node.textContent=text;
+  return node;
+}
+
+function readable(value){
+  return String(value||'').replace(/[_-]+/g,' ').replace(/\s+/g,' ').trim();
+}
+
+function sourceLabel(hit){
+  if(String(hit.chunk_id||'').startsWith('claim:')||hit.source==='ostk_memory')return 'Durable agent claim';
+  if(hit.source==='markdown')return 'Documentation memory';
+  if(hit.source==='conversation')return 'Conversation memory';
+  return readable(hit.source)||'Fleet memory';
+}
+
+function shortDate(value){
+  if(!value)return '';
+  const date=new Date(value);
+  if(Number.isNaN(date.getTime()))return '';
+  return new Intl.DateTimeFormat(undefined,{month:'short',day:'numeric',year:'numeric'}).format(date);
+}
+
+function responseDuration(header){
+  if(!header)return null;
+  const metric=header.split(',').map(part=>part.trim()).find(part=>part.startsWith('fleet-recall'));
+  const match=metric&&metric.match(/(?:^|;)\s*dur=([0-9]+(?:\.[0-9]+)?)/);
+  if(!match)return null;
+  const value=Number(match[1]);
+  return Number.isFinite(value)&&value>=0?value:null;
+}
+
+function conflictSubject(conflict){
+  const members=Array.isArray(conflict.members)?conflict.members:[];
+  return members.find(member=>typeof member.subject==='string')?.subject||'';
+}
+
+function conflictLabel(conflict){
+  const members=Array.isArray(conflict.members)?conflict.members:[];
+  const predicate=members.find(member=>member.predicate)?.predicate;
+  const keyTail=typeof conflict.claim_key==='string'?conflict.claim_key.split('::').pop():'';
+  return readable(predicate||keyTail||'the same decision');
+}
+
+function chooseConflict(conflicts){
+  return conflicts
+    .filter(conflict=>conflict&&conflict.state==='open'&&Array.isArray(conflict.members)&&conflict.members.length>0&&!conflict.members_truncated&&!conflict.member_values_elided)
+    .sort((left,right)=>Date.parse(right.detected_at||right.last_seen_at||0)-Date.parse(left.detected_at||left.last_seen_at||0))[0]||null;
+}
+
+function uniqueHits(body){
+  const hits=Array.isArray(body?.data?.hits)?body.data.hits:[];
+  const seen=new Set();
+  return hits.filter(hit=>{
+    const text=String(hit?.snippet||hit?.text||'').trim();
+    const key=text.toLocaleLowerCase().replace(/\s+/g,' ');
+    if(!text||seen.has(key))return false;
+    seen.add(key);
+    return true;
+  }).slice(0,3);
+}
+
+function hasMatchingEscalation(conflict,hits){
+  const subject=conflictSubject(conflict);
+  if(!subject)return false;
+  return hits.some(hit=>{
+    const claimKey=hit?.extra?.claim_key;
+    const text=String(hit?.snippet||hit?.text||'');
+    return claimKey===`${subject}::escalation-status`&&/(escalat|operator review)/i.test(text);
+  });
+}
+
+function renderResult(body){
+  answer.replaceChildren();
+  const allHits=Array.isArray(body?.data?.hits)?body.data.hits:[];
+  const hits=uniqueHits(body);
+  const conflicts=Array.isArray(body?.conflicts)?body.conflicts:[];
+  const conflict=chooseConflict(conflicts);
+
+  if(conflict){
+    const members=Array.isArray(conflict.members)?conflict.members:[];
+    const actors=new Set(members.map(member=>member.actor).filter(actor=>typeof actor==='string'&&actor));
+    const fullyAttributed=members.length>0&&actors.size===members.length;
+    const count=fullyAttributed?actors.size:(Number.isInteger(conflict.member_count)?conflict.member_count:members.length);
+    const noun=fullyAttributed?`${count} agent${count===1?'':'s'}`:`${count} conflicting claim${count===1?'':'s'}`;
+    const callout=element('section','conflict-callout');
+    callout.setAttribute('aria-label','Open conflict');
+    callout.append(element('p','conflict-title',`⚠ ${noun} disagree on ${conflictLabel(conflict)}`));
+    const escalated=hasMatchingEscalation(conflict,allHits);
+    callout.append(element('p','conflict-copy',escalated?'The typed same-key conflict remains open → escalated for operator review.':'The typed same-key conflict remains open → operator review required.'));
+    const coverage=body?.conflict_coverage;
+    const scope=coverage?.scope==='tenant_project'?'tenant + project scoped':readable(coverage?.scope)||'project scoped';
+    callout.append(element('p','coverage-note',`Typed same-key detector · ${scope} · ${readable(coverage?.status)||'bounded'} coverage`));
+    answer.append(callout);
+  }
+
+  if(hits.length){
+    const heading=element('div','results-heading');
+    heading.append(element('h3','',conflict?'Supporting memories':'Top recalled memories'));
+    heading.append(element('span','',`${hits.length} unique result${hits.length===1?'':'s'} shown`));
+    answer.append(heading);
+    const list=element('div','hit-list');
+    hits.forEach((hit,index)=>{
+      const card=element('article','hit-card');
+      card.append(element('p','',String(hit.snippet||hit.text).trim()));
+      const meta=element('div','hit-meta');
+      meta.append(element('span','hit-rank',`Memory ${index+1}`));
+      meta.append(element('span','meta-separator','·'));
+      meta.append(element('span','',sourceLabel(hit)));
+      const date=shortDate(hit.ts);
+      if(date){
+        meta.append(element('span','meta-separator','·'));
+        const time=element('time','',date);
+        time.dateTime=hit.ts;
+        meta.append(time);
+      }
+      card.append(meta);
+      list.append(card);
+    });
+    answer.append(list);
+  }else{
+    answer.append(element('div','empty-result','No matching memories were returned. Try a broader question.'));
+  }
+}
+
+function renderError(message){
+  answer.replaceChildren(element('div','error-result',message));
+}
+
+function setBusy(busy){
+  searching=busy;
+  submit.disabled=busy;
+  sampleButtons.forEach(button=>button.disabled=busy);
+  answer.setAttribute('aria-busy',String(busy));
+}
+
+async function parseResponse(response){
+  const text=await response.text();
+  let body;
+  try{body=JSON.parse(text)}catch(_){throw new Error(response.ok?'The memory service returned an unreadable response.':'The memory service request failed.')}
+  if(!response.ok)throw new Error(typeof body?.error==='string'?body.error:`The memory service returned ${response.status}.`);
+  return body;
+}
+
+async function loadStatus(){
+  try{
+    const response=await fetch('/api/status',{headers:{accept:'application/json'}});
+    const body=await parseResponse(response);
+    const data=body?.data||{};
+    const database=data.database||{};
+    const version=String(database.version||'').match(/\b(?:v)?(\d+\.\d+\.\d+)\b/)?.[1]||'ready';
+    const indexes=[];
+    if(database.vector_index_enabled)indexes.push('vector');
+    if(database.lexical_index_enabled)indexes.push('lexical');
+    if(database.conflict_membership_index_enabled)indexes.push('conflict membership');
+    const indexText=indexes.length?`${indexes.join(' + ')} indexes`:'indexes checked';
+    const state=readable(data.status)||'status unknown';
+    statusText.textContent=`CockroachDB ${version} · ${indexText} · ${state}`;
+    statusChip.classList.toggle('ready',data.status==='ready');
+    statusChip.classList.toggle('error',data.status==='unavailable');
+  }catch(_){
+    statusText.textContent='Memory-plane status unavailable';
+    statusChip.classList.add('error');
+    statusChip.classList.remove('ready');
+  }
+}
+
+sampleButtons.forEach(button=>button.addEventListener('click',()=>{
+  if(searching)return;
+  input.value=button.dataset.q;
+  form.requestSubmit();
+}));
+
+form.addEventListener('submit',async event=>{
+  event.preventDefault();
+  if(searching)return;
+  const query=input.value.trim();
+  if(!query)return;
+  input.value=query;
+  setBusy(true);
+  queryMeta.textContent='Searching lexical + vector lanes…';
+  answer.replaceChildren(element('div','loading','Checking recalled memories and typed conflicts…'));
+  raw.hidden=true;
+  raw.open=false;
+  const started=performance.now();
+  try{
+    const response=await fetch('/api/recall',{
+      method:'POST',
+      headers:{'content-type':'application/json','accept':'application/json'},
+      body:JSON.stringify({query,limit:8})
+    });
+    const serverMs=responseDuration(response.headers.get('server-timing'));
+    const body=await parseResponse(response);
+    const roundTripMs=Math.max(0,performance.now()-started);
+    const lanes=Array.isArray(body?.diagnostics?.retrieval?.lanes)?body.diagnostics.retrieval.lanes:[];
+    const retrieval=lanes.length?`${lanes.map(lane=>lane==='dense'?'vector':readable(lane)).join(' + ')} · RRF · `:'';
+    queryMeta.textContent=serverMs===null
+      ?`${retrieval}${Math.round(roundTripMs)} ms round trip`
+      :`${retrieval}retrieved + fused in ${Math.round(serverMs)} ms server time · ${Math.round(roundTripMs)} ms round trip`;
+    renderResult(body);
+    rawResult.textContent=JSON.stringify(body,null,2);
+    raw.hidden=false;
+  }catch(error){
+    const roundTripMs=Math.max(0,performance.now()-started);
+    queryMeta.textContent=`Request ended after ${Math.round(roundTripMs)} ms`;
+    renderError(error instanceof Error?error.message:'The demo could not reach its memory service.');
+  }finally{
+    setBusy(false);
+  }
+});
+
+loadStatus();
 </script>
 </body>
 </html>

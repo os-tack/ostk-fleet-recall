@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, ensure};
 use async_trait::async_trait;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
@@ -387,11 +388,15 @@ async fn run_demo(config: FleetConfig, listen: SocketAddr) -> anyhow::Result<()>
 }
 
 fn demo_router(state: DemoState) -> Router {
+    let api = Router::new()
+        .route("/status", get(demo_status))
+        .route("/recall", post(demo_recall))
+        .fallback(demo_api_not_found)
+        .method_not_allowed_fallback(demo_api_method_not_allowed);
     Router::new()
         .route("/", get(demo_index))
         .route("/healthz", get(demo_health))
-        .route("/api/status", get(demo_status))
-        .route("/api/recall", post(demo_recall))
+        .nest("/api", api)
         .layer(DefaultBodyLimit::max(MAX_DEMO_BODY_BYTES))
         .with_state(state)
 }
@@ -454,8 +459,12 @@ async fn demo_status(State(state): State<DemoState>) -> Response {
 
 async fn demo_recall(
     State(state): State<DemoState>,
-    Json(input): Json<DemoRecallInput>,
+    input: Result<Json<DemoRecallInput>, JsonRejection>,
 ) -> Response {
+    let Json(input) = match input {
+        Ok(input) => input,
+        Err(rejection) => return demo_json_rejection(&rejection),
+    };
     if input.query.trim().is_empty()
         || input.query != input.query.trim()
         || input.query.len() > MAX_DEMO_QUERY_BYTES
@@ -482,6 +491,35 @@ async fn demo_recall(
     dispatch_demo_recall(state, RecallAction::Search, arguments).await
 }
 
+async fn demo_api_not_found() -> Response {
+    demo_json(
+        StatusCode::NOT_FOUND,
+        json!({ "error": "API route not found" }),
+    )
+}
+
+async fn demo_api_method_not_allowed() -> Response {
+    demo_json(
+        StatusCode::METHOD_NOT_ALLOWED,
+        json!({ "error": "method not allowed" }),
+    )
+}
+
+fn demo_json_rejection(rejection: &JsonRejection) -> Response {
+    let status = rejection.status();
+    let message = match status {
+        StatusCode::PAYLOAD_TOO_LARGE => "request body is too large",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => "content-type must be application/json",
+        StatusCode::UNPROCESSABLE_ENTITY => "request JSON does not match the expected shape",
+        StatusCode::BAD_REQUEST => "request body must contain valid JSON",
+        _ => {
+            tracing::warn!(%status, "demo request body extraction failed");
+            "request body could not be read"
+        }
+    };
+    demo_json(status, json!({ "error": message }))
+}
+
 async fn dispatch_demo_recall(
     state: DemoState,
     action: RecallAction,
@@ -494,24 +532,32 @@ async fn dispatch_demo_recall(
         );
     };
     let request = RecallRequest::new(action, arguments);
-    match tokio::time::timeout(DEMO_DEADLINE, state.service.recall(state.scope, request)).await {
-        Ok(Ok(result)) => bounded_demo_response(result),
-        Ok(Err(ServiceError::InvalidRequest(message))) => {
-            demo_json(StatusCode::BAD_REQUEST, json!({ "error": message }))
-        }
-        Ok(Err(ServiceError::Unavailable(_))) => demo_json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({ "error": "memory service temporarily unavailable" }),
-        ),
-        Ok(Err(ServiceError::Internal(_))) => demo_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": "memory operation failed" }),
-        ),
-        Err(_) => demo_json(
-            StatusCode::GATEWAY_TIMEOUT,
-            json!({ "error": "memory read deadline exceeded" }),
-        ),
+    let started = std::time::Instant::now();
+    let mut response =
+        match tokio::time::timeout(DEMO_DEADLINE, state.service.recall(state.scope, request)).await
+        {
+            Ok(Ok(result)) => bounded_demo_response(result),
+            Ok(Err(ServiceError::InvalidRequest(message))) => {
+                demo_json(StatusCode::BAD_REQUEST, json!({ "error": message }))
+            }
+            Ok(Err(ServiceError::Unavailable(_))) => demo_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": "memory service temporarily unavailable" }),
+            ),
+            Ok(Err(ServiceError::Internal(_))) => demo_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": "memory operation failed" }),
+            ),
+            Err(_) => demo_json(
+                StatusCode::GATEWAY_TIMEOUT,
+                json!({ "error": "memory read deadline exceeded" }),
+            ),
+        };
+    let duration_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    if let Ok(value) = HeaderValue::from_str(&format!("fleet-recall;dur={duration_ms:.1}")) {
+        response.headers_mut().insert("server-timing", value);
     }
+    response
 }
 
 fn bounded_demo_response(mut result: RecallResult) -> Response {
@@ -1021,6 +1067,21 @@ mod tests {
         })
     }
 
+    async fn assert_demo_error(
+        response: Response,
+        expected_status: StatusCode,
+        expected_message: &str,
+    ) {
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("demo error must be bounded");
+        let value: Value = serde_json::from_slice(&body).expect("demo error must be JSON");
+        assert_eq!(value, json!({ "error": expected_message }));
+    }
+
     #[test]
     fn ingest_cli_defaults_to_stdin() {
         let cli = Cli::try_parse_from(["ostk-fleet-recall", "ingest"]).expect("CLI");
@@ -1113,6 +1174,16 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let server_timing = response
+            .headers()
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+            .expect("recall response must expose server timing");
+        let duration = server_timing
+            .strip_prefix("fleet-recall;dur=")
+            .and_then(|value| value.parse::<f64>().ok())
+            .expect("server timing must use a numeric duration");
+        assert!(duration >= 0.0);
         let body = to_bytes(response.into_body(), MAX_DEMO_RESPONSE_BYTES)
             .await
             .unwrap();
@@ -1133,6 +1204,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mutation.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn demo_page_leads_with_conflict_story_and_keeps_raw_evidence_collapsed() {
+        let router = test_demo_router(Arc::new(DemoService::default()));
+        let response = router
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .is_some()
+        );
+        let body = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
+        let page = std::str::from_utf8(&body).expect("demo page must be UTF-8");
+        assert!(page.contains("When agents disagree, memory should"));
+        assert!(
+            page.contains("How are conflicting migration strategies represented and escalated?")
+        );
+        assert!(page.contains("<details id=\"raw\" hidden>"));
+        assert!(page.contains("View raw evidence envelope"));
+        assert!(page.contains("response.headers.get('server-timing')"));
+        assert!(page.contains("document.createElement(tag)"));
+        assert!(!page.contains("innerHTML"));
     }
 
     #[tokio::test]
@@ -1208,6 +1307,109 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(service.queries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn demo_api_json_rejections_are_bounded_json_without_serde_details() {
+        let service = Arc::new(DemoService::default());
+        let router = test_demo_router(service.clone());
+
+        let malformed = router
+            .clone()
+            .oneshot(
+                Request::post("/api/recall")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"query":"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_demo_error(
+            malformed,
+            StatusCode::BAD_REQUEST,
+            "request body must contain valid JSON",
+        )
+        .await;
+
+        let wrong_shape = router
+            .clone()
+            .oneshot(
+                Request::post("/api/recall")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"query":17}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_demo_error(
+            wrong_shape,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "request JSON does not match the expected shape",
+        )
+        .await;
+
+        let missing_content_type = router
+            .clone()
+            .oneshot(
+                Request::post("/api/recall")
+                    .body(Body::from(r#"{"query":"Why CockroachDB?"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_demo_error(
+            missing_content_type,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "content-type must be application/json",
+        )
+        .await;
+
+        let oversized = serde_json::to_vec(&json!({
+            "query": "Why CockroachDB?",
+            "unknown": "x".repeat(MAX_DEMO_BODY_BYTES),
+        }))
+        .unwrap();
+        let oversized = router
+            .oneshot(
+                Request::post("/api/recall")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(oversized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_demo_error(
+            oversized,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body is too large",
+        )
+        .await;
+
+        assert!(service.queries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn demo_api_route_and_method_errors_are_json() {
+        let service = Arc::new(DemoService::default());
+        let router = test_demo_router(service);
+
+        let method = router
+            .clone()
+            .oneshot(Request::get("/api/recall").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_demo_error(method, StatusCode::METHOD_NOT_ALLOWED, "method not allowed").await;
+
+        let route = router
+            .oneshot(
+                Request::post("/api/remember")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"must not run"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_demo_error(route, StatusCode::NOT_FOUND, "API route not found").await;
     }
 
     #[test]
