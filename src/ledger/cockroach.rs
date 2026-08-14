@@ -61,15 +61,22 @@ const CONFLICT_CLAIM_PROJECTION_SQL: &str = "SELECT id, project, kind, claim_key
 const CLAIM_CONFLICT_IDS_SQL: &str = "SELECT claim_id, conflict_id FROM memory_conflict_members@{NO_FULL_SCAN} \
      WHERE tenant_id = $1 AND project = $2 AND claim_id = ANY($3) \
      ORDER BY claim_id, conflict_id";
-const SUPPORTED_CLAIM_IDS_SQL: &str = "SELECT DISTINCT claim_id \
-     FROM memory_claim_support@{NO_FULL_SCAN} \
-     WHERE tenant_id = $1 AND project = $2 AND chunk_id = ANY($3) AND state = 'current' \
-     ORDER BY claim_id LIMIT $4";
+const SUPPORTED_CLAIM_IDS_SQL: &str = "SELECT DISTINCT support.claim_id \
+     FROM memory_claim_support@{NO_FULL_SCAN} AS support \
+     JOIN memory_chunks@{NO_FULL_SCAN} AS chunk \
+       ON chunk.tenant_id = support.tenant_id AND chunk.project = support.project \
+      AND chunk.source_config_id = support.source_config_id AND chunk.source = support.source \
+      AND chunk.source_id = support.source_id AND chunk.chunk_id = support.chunk_id \
+      AND chunk.content_sha256 = support.content_sha256 \
+     WHERE support.tenant_id = $1 AND support.project = $2 \
+       AND support.chunk_id = ANY($3) AND support.content_sha256 IS NOT NULL \
+       AND support.state = 'current' \
+     ORDER BY support.claim_id LIMIT $4";
 const SUPPORT_CHUNK_MATCH_SQL: &str = "SELECT EXISTS(\
          SELECT 1 FROM memory_chunks@{NO_FULL_SCAN} \
          WHERE tenant_id = $1 AND project = $2 AND chunk_id = $3 \
            AND source_config_id = $4 AND source = $5 AND source_id = $6 \
-           AND ($7::STRING IS NULL OR content_sha256 = $7)\
+           AND content_sha256 = $7\
      )";
 
 /// Claim repository bound to one trusted tenant/project and embedding space.
@@ -1538,9 +1545,23 @@ mod tests {
 
         assert!(CLAIM_CONFLICT_IDS_SQL.contains("@{NO_FULL_SCAN}"));
         assert!(SUPPORTED_CLAIM_IDS_SQL.contains("memory_claim_support@{NO_FULL_SCAN}"));
-        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("chunk_id = ANY($3)"));
-        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("state = 'current'"));
-        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("LIMIT $4"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("JOIN memory_chunks@{NO_FULL_SCAN}"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("chunk.tenant_id = support.tenant_id"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("chunk.project = support.project"));
+        assert!(
+            SUPPORTED_CLAIM_IDS_SQL.contains("chunk.source_config_id = support.source_config_id")
+        );
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("chunk.source = support.source"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("chunk.source_id = support.source_id"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("chunk.chunk_id = support.chunk_id"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("chunk.content_sha256 = support.content_sha256"));
+        assert!(
+            SUPPORTED_CLAIM_IDS_SQL.contains("support.tenant_id = $1 AND support.project = $2")
+        );
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("support.chunk_id = ANY($3)"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("support.content_sha256 IS NOT NULL"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("support.state = 'current'"));
+        assert!(SUPPORTED_CLAIM_IDS_SQL.contains("ORDER BY support.claim_id LIMIT $4"));
         assert!(SUPPORT_CHUNK_MATCH_SQL.contains("memory_chunks@{NO_FULL_SCAN}"));
         assert!(SUPPORT_CHUNK_MATCH_SQL.contains("content_sha256 = $7"));
     }
@@ -1695,7 +1716,7 @@ mod tests {
         store
             .upsert_chunk(&ScopedChunk {
                 scope: scope.clone(),
-                chunk: support_chunk,
+                chunk: support_chunk.clone(),
                 embedding_model: TestEmbedder.model_id().into(),
                 embedding: TestEmbedder
                     .encode_batch(&[support_text])
@@ -1823,11 +1844,59 @@ mod tests {
         assert_eq!(support_conflicts.len(), 1);
         assert_eq!(support_conflicts[0].id, conflicts[0].id);
         let bounded_supported = ledger
-            .supported_claim_ids_for_chunk_ids(&scope, &[support_chunk_id], 1)
+            .supported_claim_ids_for_chunk_ids(&scope, std::slice::from_ref(&support_chunk_id), 1)
             .await
             .unwrap();
         assert_eq!(bounded_supported.claim_ids.len(), 1);
         assert!(bounded_supported.truncated);
+
+        // A stable chunk ID may be replaced as its source evolves. Historical
+        // support must stop projecting claims until it is re-observed against
+        // the current content digest; otherwise stale spec/code conflicts can
+        // attach to an unrelated new revision of the same corpus coordinate.
+        let evolved_support_text =
+            "The implementation permits multiple migration owners before workers start.";
+        let mut evolved_support_chunk = support_chunk.clone();
+        evolved_support_chunk.text = evolved_support_text.into();
+        evolved_support_chunk.sha256 = Chunk::content_hash(evolved_support_text);
+        evolved_support_chunk.embedding_input_sha256 = "live-support-evolved-embedding".into();
+        store
+            .upsert_chunk(&ScopedChunk {
+                scope: scope.clone(),
+                chunk: evolved_support_chunk,
+                embedding_model: TestEmbedder.model_id().into(),
+                embedding: TestEmbedder
+                    .encode_batch(&[evolved_support_text])
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+                stale: false,
+            })
+            .await
+            .unwrap();
+        let stale_supported = ledger
+            .supported_claim_ids_for_chunk_ids(&scope, std::slice::from_ref(&support_chunk_id), 10)
+            .await
+            .unwrap();
+        assert!(stale_supported.claim_ids.is_empty());
+        assert!(!stale_supported.truncated);
+
+        // Restore the original source revision so the remainder of this
+        // lifecycle scenario can continue recording claims with exact support.
+        store
+            .upsert_chunk(&ScopedChunk {
+                scope: scope.clone(),
+                chunk: support_chunk,
+                embedding_model: TestEmbedder.model_id().into(),
+                embedding: TestEmbedder
+                    .encode_batch(&[support_text])
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+                stale: false,
+            })
+            .await
+            .unwrap();
         let semantic_hits = ledger
             .search_claims(&scope, &primary_passage, false, 10)
             .await

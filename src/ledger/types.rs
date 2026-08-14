@@ -256,8 +256,8 @@ impl ClaimInput {
                 ));
             }
             if support.chunk_id.is_some()
-                && support.content_sha256.as_ref().is_some_and(|digest| {
-                    digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !support.content_sha256.as_ref().is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
                 })
             {
                 return Err(FleetError::Memory(
@@ -540,6 +540,8 @@ mod tests {
         assert!(value.validate().is_err());
         value.support[0].chunk_id = Some("chunk-1".into());
         value.support[0].content_sha256 = Some("not-a-sha256".into());
+        assert!(value.validate().is_err());
+        value.support[0].content_sha256 = None;
         assert!(value.validate().is_err());
 
         // External citations remain compatible when no local chunk identity
