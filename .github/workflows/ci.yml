@@ -116,7 +116,10 @@ jobs:
           terraform -chdir=network test
       - name: Validate deployment shell scripts
         working-directory: .
-        run: find deploy demo -type f -name '*.sh' -exec sh -n {} +
+        run: find deploy demo examples/rich-demo -type f -name '*.sh' -exec sh -n {} +
+      - name: Test the deterministic rich demo corpus
+        working-directory: .
+        run: ./examples/rich-demo/test.sh
       - name: Test the AWS reference-agent evidence wrapper
         working-directory: .
         run: ./deploy/aws/tests/reference-agent-wrapper.sh
