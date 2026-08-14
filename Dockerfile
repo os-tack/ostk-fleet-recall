@@ -2,6 +2,8 @@
 
 FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS builder
 
+ARG VCS_REF=0000000000000000000000000000000000000000
+
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         build-essential \
@@ -28,8 +30,10 @@ COPY docs ./docs
 COPY deploy ./deploy
 COPY examples ./examples
 RUN install --directory /out \
-    && ./examples/rich-demo/generate.sh > /out/rich-demo.ndjson \
-    && ./examples/rich-demo/verify.sh /out/rich-demo.ndjson
+    && RICH_DEMO_SOURCE_REVISION="$VCS_REF" \
+       ./examples/rich-demo/generate.sh > /out/rich-demo.ndjson \
+    && RICH_DEMO_EXPECTED_SOURCE_REVISION="$VCS_REF" \
+       ./examples/rich-demo/verify.sh /out/rich-demo.ndjson
 
 FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS s5cmd-builder
 
@@ -53,7 +57,7 @@ FROM public.ecr.aws/aws-cli/aws-cli:2.36.23@sha256:c7b16ed4f08f8a61634d9c219dd23
 
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal@sha256:97daa826f6597bd39ab9dee373290b6ce8220f1686fce5e83b51294a45f7484d AS runtime
 
-ARG VCS_REF=unknown
+ARG VCS_REF=0000000000000000000000000000000000000000
 ARG BUILD_DATE=unknown
 
 LABEL org.opencontainers.image.title="ostk-fleet-recall" \

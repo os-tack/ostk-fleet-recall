@@ -9,6 +9,7 @@ if [ "$#" -ne 1 ]; then
 fi
 
 input=$1
+expected_source_revision=${RICH_DEMO_EXPECTED_SOURCE_REVISION:-}
 
 fail() {
     printf 'rich demo verification failed: %s\n' "$1" >&2
@@ -21,6 +22,19 @@ for command_name in awk grep jq wc; do
         exit 69
     fi
 done
+
+if [ -n "$expected_source_revision" ]; then
+    case $expected_source_revision in
+        *[!0-9a-f]*)
+            printf 'RICH_DEMO_EXPECTED_SOURCE_REVISION must be exactly 40 lowercase hexadecimal characters\n' >&2
+            exit 65
+            ;;
+    esac
+    if [ "${#expected_source_revision}" -ne 40 ]; then
+        printf 'RICH_DEMO_EXPECTED_SOURCE_REVISION must be exactly 40 lowercase hexadecimal characters\n' >&2
+        exit 65
+    fi
+fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
@@ -57,6 +71,26 @@ extract_tools_excerpt() {
     ' "$1"
 }
 
+extract_tools_coordinates() {
+    awk '
+        {
+            candidate = $0
+            sub(/^[[:space:]]*/, "", candidate)
+            sub(/[[:space:]]*$/, "", candidate)
+            if (candidate == "\"enum\": [\"record\"]") {
+                marker_count++
+                marker_line = NR
+            }
+        }
+        END {
+            if (marker_count != 1 || marker_line < 3 || marker_line + 1 > NR) {
+                exit 1
+            }
+            print marker_line - 2, marker_line + 1
+        }
+    ' "$1"
+}
+
 extract_application_excerpt() {
     awk '
         {
@@ -85,6 +119,31 @@ extract_application_excerpt() {
     ' "$1"
 }
 
+extract_application_coordinates() {
+    awk '
+        {
+            candidate = $0
+            sub(/^[[:space:]]*/, "", candidate)
+            sub(/[[:space:]]*$/, "", candidate)
+            if (candidate == "RememberAction::Record => self.remember_record(&scope, request).await,") {
+                record_count++
+                record_line = NR
+            }
+            if (candidate == "\"remember({}) is outside the hackathon vertical slice\",") {
+                marker_count++
+                marker_line = NR
+            }
+        }
+        END {
+            if (record_count != 1 || marker_count != 1 || record_line != marker_line - 2 ||
+                    marker_line < 4 || marker_line + 3 > NR) {
+                exit 1
+            }
+            print marker_line - 3, marker_line + 3
+        }
+    ' "$1"
+}
+
 tools_file=$repo_root/src/mcp/tools.rs
 application_file=$repo_root/src/application.rs
 for source_file in "$tools_file" "$application_file"; do
@@ -98,6 +157,16 @@ fi
 if ! application_excerpt=$(extract_application_excerpt "$application_file"); then
     fail "src/application.rs must contain exactly one adjacent remember dispatch and rejection marker pair"
 fi
+if ! tools_coordinates=$(extract_tools_coordinates "$tools_file"); then
+    fail "could not locate exact src/mcp/tools.rs source coordinates"
+fi
+if ! application_coordinates=$(extract_application_coordinates "$application_file"); then
+    fail "could not locate exact src/application.rs source coordinates"
+fi
+tools_line_start=${tools_coordinates%% *}
+tools_line_end=${tools_coordinates#* }
+application_line_start=${application_coordinates%% *}
+application_line_end=${application_coordinates#* }
 
 line_count=$(wc -l < "$input" | tr -d '[:space:]')
 case $line_count in
@@ -154,12 +223,25 @@ if ! jq -s -e '
             "week", "scenario", "status", "tags"
         ]) | length) == 0
         and ([.[] | valid_facet_array] | all);
+    def valid_source_coordinates:
+        type == "object"
+        and ((keys_unsorted - [
+            "source_revision", "source_line_start", "source_line_end"
+        ]) | length) == 0
+        and (.source_revision
+            | type == "string" and test("^[0-9a-f]{40}$"))
+        and (.source_line_start
+            | type == "number" and floor == . and . >= 1 and . <= 1000000)
+        and (.source_line_end
+            | type == "number" and floor == . and . >= 1 and . <= 1000000)
+        and .source_line_end >= .source_line_start
+        and (.source_line_end - .source_line_start) <= 10000;
     def valid_record:
         . as $record
         | type == "object"
         and ((keys_unsorted - [
             "source", "source_id", "source_config_id", "chunk_index",
-            "text", "role", "facets"
+            "text", "role", "facets", "extra"
         ]) | length) == 0
         and (($record.source_config_id == "rich-demo:self-audit:v1"
                 and $record.source == "code")
@@ -185,6 +267,10 @@ if ! jq -s -e '
             and (explode | index(0) | not)
             and (explode | any(.[]; ingest_trim_whitespace | not)))
         and ($record.role == "primary" or $record.role == "evolution" or $record.role == "usage")
+        and (if $record.source_config_id == "rich-demo:operations:v1"
+            then ($record | has("extra") | not)
+            else ($record.extra | valid_source_coordinates)
+            end)
         and ($record.facets | valid_facets)
         and $record.facets.dataset == ["rich-demo"]
         and (if $record.source_config_id == "rich-demo:docs:v1"
@@ -216,6 +302,14 @@ if ! jq -s -e '
     fail "records violate the bounded publication-safe ingest schema"
 fi
 
+if [ -n "$expected_source_revision" ] && ! jq -s -e \
+    --arg expected_source_revision "$expected_source_revision" '
+    all(.[] | select(.source_config_id != "rich-demo:operations:v1");
+        .extra.source_revision == $expected_source_revision)
+' "$input" >/dev/null; then
+    fail "repository source revisions do not match the expected build revision"
+fi
+
 if ! jq -s -e '
     [.[] | [.source, .source_id, .source_config_id, (.chunk_index | tostring)] | join("|")] as $coordinates
     | ($coordinates | length) == ($coordinates | unique | length)
@@ -237,7 +331,11 @@ fi
 if ! jq -s -e \
     --rawfile document_manifest "$manifest" \
     --arg expected_tools_excerpt "$tools_excerpt" \
-    --arg expected_application_excerpt "$application_excerpt" '
+    --arg expected_application_excerpt "$application_excerpt" \
+    --argjson expected_tools_line_start "$tools_line_start" \
+    --argjson expected_tools_line_end "$tools_line_end" \
+    --argjson expected_application_line_start "$application_line_start" \
+    --argjson expected_application_line_end "$application_line_end" '
     ($document_manifest
         | split("\n")
         | map(select(length > 0 and (startswith("#") | not)))
@@ -255,6 +353,8 @@ if ! jq -s -e \
         == ["src/application.rs", "src/mcp/tools.rs"]
     and all(.[] | select(.source_config_id == "rich-demo:self-audit:v1"); .chunk_index == 0)
     and all(.[] | select(.source_config_id == "rich-demo:operations:v1"); .chunk_index == 0)
+    and ([.[] | select(.source_config_id != "rich-demo:operations:v1") | .extra.source_revision]
+        | unique | length) == 1
     and ([.[] | select(
             .source_config_id == "rich-demo:docs:v1"
             and .source_id == "examples/README.md"
@@ -285,6 +385,8 @@ if ! jq -s -e \
             .source_config_id == "rich-demo:self-audit:v1"
             and .source_id == "src/mcp/tools.rs"
             and .text == $expected_tools_excerpt
+            and .extra.source_line_start == $expected_tools_line_start
+            and .extra.source_line_end == $expected_tools_line_end
             and (.text | contains("\"enum\": [\"record\"]"))
             and .facets.tags == ["self_audit", "rust", "mcp_contract"]
         )] | length) == 1
@@ -292,6 +394,8 @@ if ! jq -s -e \
             .source_config_id == "rich-demo:self-audit:v1"
             and .source_id == "src/application.rs"
             and .text == $expected_application_excerpt
+            and .extra.source_line_start == $expected_application_line_start
+            and .extra.source_line_end == $expected_application_line_end
             and (.text | contains("RememberAction::Record => self.remember_record"))
             and (.text | contains("remember({}) is outside the hackathon vertical slice"))
             and .facets.tags == ["self_audit", "rust", "service_dispatch"]
@@ -301,6 +405,77 @@ if ! jq -s -e \
 ' "$input" >/dev/null; then
     fail "documentation, self-audit source, and operations content mix is incomplete"
 fi
+
+# Every repository-document coordinate must be the minimal inclusive physical
+# line range containing the normalized chunk body. This checks the metadata
+# against the checked-in source itself: widening either edge, shifting the
+# range, or pointing past EOF fails even when the JSON shape remains valid.
+while IFS='|' read -r relative_path _; do
+    case $relative_path in
+        ''|'#'*) continue ;;
+    esac
+    document=$repo_root/$relative_path
+    if [ ! -f "$document" ] || [ -L "$document" ]; then
+        fail "manifest entry must be a regular, non-symlink file: $relative_path"
+    fi
+    if ! jq -s -e \
+        --arg source_id "$relative_path" \
+        --rawfile source_text "$document" '
+        def clean_source:
+            gsub("\r"; "")
+            | gsub("\t"; " ")
+            | gsub("[[:space:]]+"; " ")
+            | sub("^ "; "")
+            | sub(" $"; "");
+        def normalized_slice($lines; $start; $end):
+            $lines[($start - 1):$end] | join(" ") | clean_source;
+        def section_at($lines; $start):
+            reduce range(0; $start - 1) as $index (
+                {section: "Overview", in_fence: false};
+                ($lines[$index] | sub("\r$"; "")) as $line
+                | if ($line | test("^[[:space:]]*(```|~~~)")) then
+                    .in_fence = (.in_fence | not)
+                elif (.in_fence | not)
+                    and ($line | test("^#+[[:space:]]")) then
+                    .section = ($line
+                        | sub("^#+[[:space:]]+"; "")
+                        | clean_source)
+                else
+                    .
+                end
+            )
+            | .section;
+        def exact_source_bounds($lines):
+            . as $record
+            | $record.extra.source_line_start as $start
+            | $record.extra.source_line_end as $end
+            | section_at($lines; $start) as $section
+            | ("Source document " + $record.source_id
+                + "; section " + $section + ". ") as $prefix
+            | ($record.text | startswith($prefix)) as $prefix_matches
+            | $record.text[($prefix | length):] as $body
+            | normalized_slice($lines; $start; $end) as $slice
+            | $prefix_matches
+            and $end <= ($lines | length)
+            and ($body | length) > 0
+            and ($slice | contains($body))
+            and ($start == $end
+                or (normalized_slice($lines; $start + 1; $end)
+                    | contains($body) | not))
+            and ($start == $end
+                or (normalized_slice($lines; $start; $end - 1)
+                    | contains($body) | not));
+
+        ($source_text | split("\n")) as $source_lines
+        | [.[] | select(
+            .source_config_id == "rich-demo:docs:v1"
+            and .source_id == $source_id
+        ) | exact_source_bounds($source_lines)]
+        | length > 0 and all
+    ' "$input" >/dev/null; then
+        fail "documentation source coordinates do not exactly bound $relative_path"
+    fi
+done < "$manifest"
 
 if ! jq -s -e '
     def week_id($week):

@@ -95,8 +95,8 @@ corpus=$test_root/rich-demo.ndjson
 "$repo_root/examples/rich-demo/generate.sh" > "$corpus"
 "$repo_root/examples/rich-demo/verify.sh" "$corpus" >/dev/null
 corpus_rows=$(jq -s 'length' "$corpus")
-if [ "$corpus_rows" -ne 548 ]; then
-    printf 'expected 548 generated corpus rows, found %s\n' "$corpus_rows" >&2
+if [ "$corpus_rows" -ne 552 ]; then
+    printf 'expected 552 generated corpus rows, found %s\n' "$corpus_rows" >&2
     exit 1
 fi
 
@@ -145,7 +145,7 @@ export RUST_LOG=ostk_fleet_recall=warn
 
 "$fleet_bin" migrate > "$test_root/migrate.json"
 "$fleet_bin" ingest --input "$corpus" > "$test_root/ingest.json"
-jq -e '.upserted == 548' "$test_root/ingest.json" >/dev/null
+jq -e '.upserted == 552' "$test_root/ingest.json" >/dev/null
 
 run_id=seeded-relevance-v1
 FLEET_RECALL_AGENT=agent-a "$fleet_bin" reference-agent \

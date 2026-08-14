@@ -49,14 +49,40 @@ mutated_tools_excerpt=$test_root/mutated-tools-excerpt.ndjson
 mutated_docs_marker=$test_root/mutated-docs-marker.ndjson
 mutated_primer_marker=$test_root/mutated-primer-marker.ndjson
 mutated_architecture_marker=$test_root/mutated-architecture-marker.ndjson
+malformed_source_revision=$test_root/malformed-source-revision.ndjson
+widened_document_range=$test_root/widened-document-range.ndjson
+narrowed_document_range=$test_root/narrowed-document-range.ndjson
+shifted_code_range=$test_root/shifted-code-range.ndjson
 nul_text=$test_root/nul-text.ndjson
 
 "$script_dir/generate.sh" > "$first"
 "$script_dir/generate.sh" > "$second"
-"$script_dir/verify.sh" "$first"
+RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
+    "$script_dir/verify.sh" "$first"
+
+if ! jq -s -e '
+    length == 552
+    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 346
+    and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
+    and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
+' "$first" >/dev/null; then
+    printf 'rich demo verification failed: expected exactly 552 records (346 documentation, 2 self-audit source, 204 operations)\n' >&2
+    exit 1
+fi
 
 if ! cmp -s "$first" "$second"; then
     printf 'rich demo verification failed: generator output is not deterministic\n' >&2
+    exit 1
+fi
+
+if RICH_DEMO_SOURCE_REVISION=main "$script_dir/generate.sh" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: generator accepted a non-immutable source revision\n' >&2
+    exit 1
+fi
+
+if RICH_DEMO_EXPECTED_SOURCE_REVISION=1111111111111111111111111111111111111111 \
+    "$script_dir/verify.sh" "$first" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted the wrong expected source revision\n' >&2
     exit 1
 fi
 
@@ -244,6 +270,50 @@ jq -c '
 ' "$first" > "$mutated_architecture_marker"
 if "$script_dir/verify.sh" "$mutated_architecture_marker" >/dev/null 2>&1; then
     printf 'rich demo verification failed: verifier accepted a missing CockroachDB architecture marker\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "docs/PROJECT_PRIMER.md" and .chunk_index == 0
+    then .extra.source_revision = "main"
+    else .
+    end
+' "$first" > "$malformed_source_revision"
+if "$script_dir/verify.sh" "$malformed_source_revision" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a non-immutable source revision\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "docs/PROJECT_PRIMER.md" and .chunk_index == 0
+    then .extra.source_line_end += 1
+    else .
+    end
+' "$first" > "$widened_document_range"
+if "$script_dir/verify.sh" "$widened_document_range" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a widened document source range\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "README.md" and .chunk_index == 58
+    then .extra.source_line_start = 519
+    else .
+    end
+' "$first" > "$narrowed_document_range"
+if "$script_dir/verify.sh" "$narrowed_document_range" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a narrowed document source range\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "src/mcp/tools.rs"
+    then .extra.source_line_start += 1
+    else .
+    end
+' "$first" > "$shifted_code_range"
+if "$script_dir/verify.sh" "$shifted_code_range" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted a shifted code source range\n' >&2
     exit 1
 fi
 

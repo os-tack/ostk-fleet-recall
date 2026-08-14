@@ -44,7 +44,13 @@ no credential-, token-, private-key-, account ARN-, or credential-bearing
 database URL patterns.
 
 Documentation and code `source_id` values are the original repository-relative
-paths. The code records are extracted fail-closed from the current
+paths. Each repository-backed record also carries its immutable 40-hex source
+revision and the minimal inclusive physical line range containing that chunk in
+bounded `extra` metadata. Local generation uses an all-zero sentinel; release
+builds pass the full source commit through `RICH_DEMO_SOURCE_REVISION`, and the
+public UI only creates exact line links for a nonzero immutable revision. The
+verifier checks every range against the checked-in source. The code records are
+extracted fail-closed from the current
 `src/mcp/tools.rs` and `src/application.rs` contents; they are not duplicated
 fixtures. Synthetic operations records use stable
 `rich-demo/operations/week-NN/event-name` identifiers instead of pretending

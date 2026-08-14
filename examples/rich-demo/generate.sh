@@ -7,6 +7,8 @@ export TZ=UTC
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 manifest=$script_dir/documents.txt
+zero_revision=0000000000000000000000000000000000000000
+source_revision=${RICH_DEMO_SOURCE_REVISION:-$zero_revision}
 
 if [ "$#" -ne 0 ]; then
     printf 'usage: %s > rich-demo.ndjson\n' "$0" >&2
@@ -19,6 +21,17 @@ for command_name in awk jq; do
         exit 69
     fi
 done
+
+case $source_revision in
+    *[!0-9a-f]*|'')
+        printf 'RICH_DEMO_SOURCE_REVISION must be exactly 40 lowercase hexadecimal characters\n' >&2
+        exit 65
+        ;;
+esac
+if [ "${#source_revision}" -ne 40 ]; then
+    printf 'RICH_DEMO_SOURCE_REVISION must be exactly 40 lowercase hexadecimal characters\n' >&2
+    exit 65
+fi
 
 if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
     printf 'document manifest must be a regular, non-symlink file: %s\n' "$manifest" >&2
@@ -59,8 +72,24 @@ emit_document_chunks() {
                 return value
             }
 
-            function emit_paragraph(value, count, words, prefix, start, end, i, remaining, current) {
+            function track_line(value, source_line, count, words, i) {
                 value = clean(value)
+                if (value == "") {
+                    return
+                }
+                count = split(value, words, " ")
+                for (i = 1; i <= count; i++) {
+                    if (paragraph_lines == "") {
+                        paragraph_lines = source_line
+                    } else {
+                        paragraph_lines = paragraph_lines " " source_line
+                    }
+                }
+            }
+
+            function emit_paragraph(value, coordinates, count, coordinate_count, words, word_lines, prefix, start, end, i, remaining, current) {
+                value = clean(value)
+                coordinates = clean(coordinates)
                 if (value == "") {
                     return
                 }
@@ -71,6 +100,10 @@ emit_document_chunks() {
                 }
                 prefix = prefix ". "
                 count = split(value, words, " ")
+                coordinate_count = split(coordinates, word_lines, " ")
+                if (coordinate_count != count) {
+                    exit 2
+                }
 
                 start = 1
                 while (start <= count) {
@@ -105,7 +138,7 @@ emit_document_chunks() {
                         }
                     }
 
-                    print chunk_index "\t" current
+                    print chunk_index "\t" word_lines[start] "\t" word_lines[end] "\t" current
                     chunk_index++
                     start = end + 1
                 }
@@ -119,30 +152,38 @@ emit_document_chunks() {
                 if (length(paragraph) < 120) {
                     if (pending == "") {
                         pending = paragraph
+                        pending_lines = paragraph_lines
                     } else {
                         pending = pending " " paragraph
+                        pending_lines = pending_lines " " paragraph_lines
                     }
                 } else {
                     if (pending != "") {
                         paragraph = pending " " paragraph
+                        paragraph_lines = pending_lines " " paragraph_lines
                         pending = ""
+                        pending_lines = ""
                     }
-                    emit_paragraph(paragraph)
+                    emit_paragraph(paragraph, paragraph_lines)
                 }
                 paragraph = ""
+                paragraph_lines = ""
             }
 
             function flush_pending() {
                 if (pending != "") {
-                    emit_paragraph(pending)
+                    emit_paragraph(pending, pending_lines)
                     pending = ""
+                    pending_lines = ""
                 }
             }
 
             BEGIN {
                 chunk_index = 0
                 paragraph = ""
+                paragraph_lines = ""
                 pending = ""
+                pending_lines = ""
                 section = "Overview"
                 in_fence = 0
             }
@@ -151,6 +192,7 @@ emit_document_chunks() {
                 line = $0
                 sub(/\r$/, "", line)
                 if (line ~ /^[[:space:]]*```/ || line ~ /^[[:space:]]*~~~/) {
+                    track_line(line, NR)
                     if (paragraph == "") {
                         paragraph = line
                     } else {
@@ -172,6 +214,7 @@ emit_document_chunks() {
                     next
                 }
                 gsub(/\t/, " ", line)
+                track_line(line, NR)
                 if (paragraph == "") {
                     paragraph = line
                 } else {
@@ -186,15 +229,21 @@ emit_document_chunks() {
         ' "$document" |
             jq -Rc \
                 --arg source_id "$relative_path" \
-                --arg source_area "$source_area" '
+                --arg source_area "$source_area" \
+                --arg source_revision "$source_revision" '
                     split("\t") as $fields
                     | {
                         source: "markdown",
                         source_id: $source_id,
                         source_config_id: "rich-demo:docs:v1",
                         chunk_index: ($fields[0] | tonumber),
-                        text: $fields[1],
+                        text: ($fields[3:] | join("\t")),
                         role: "usage",
+                        extra: {
+                            source_revision: $source_revision,
+                            source_line_start: ($fields[1] | tonumber),
+                            source_line_end: ($fields[2] | tonumber)
+                        },
                         facets: {
                             dataset: ["rich-demo"],
                             record_kind: ["documentation"],
@@ -229,6 +278,26 @@ extract_tools_excerpt() {
     ' "$1"
 }
 
+extract_tools_coordinates() {
+    awk '
+        {
+            candidate = $0
+            sub(/^[[:space:]]*/, "", candidate)
+            sub(/[[:space:]]*$/, "", candidate)
+            if (candidate == "\"enum\": [\"record\"]") {
+                marker_count++
+                marker_line = NR
+            }
+        }
+        END {
+            if (marker_count != 1 || marker_line < 3 || marker_line + 1 > NR) {
+                exit 1
+            }
+            print marker_line - 2, marker_line + 1
+        }
+    ' "$1"
+}
+
 extract_application_excerpt() {
     awk '
         {
@@ -257,6 +326,31 @@ extract_application_excerpt() {
     ' "$1"
 }
 
+extract_application_coordinates() {
+    awk '
+        {
+            candidate = $0
+            sub(/^[[:space:]]*/, "", candidate)
+            sub(/[[:space:]]*$/, "", candidate)
+            if (candidate == "RememberAction::Record => self.remember_record(&scope, request).await,") {
+                record_count++
+                record_line = NR
+            }
+            if (candidate == "\"remember({}) is outside the hackathon vertical slice\",") {
+                marker_count++
+                marker_line = NR
+            }
+        }
+        END {
+            if (record_count != 1 || marker_count != 1 || record_line != marker_line - 2 ||
+                    marker_line < 4 || marker_line + 3 > NR) {
+                exit 1
+            }
+            print marker_line - 3, marker_line + 3
+        }
+    ' "$1"
+}
+
 emit_self_audit_sources() {
     tools_path=src/mcp/tools.rs
     application_path=src/application.rs
@@ -278,10 +372,25 @@ emit_self_audit_sources() {
         printf 'src/application.rs must contain exactly one adjacent remember dispatch and rejection marker pair\n' >&2
         exit 65
     fi
+    if ! tools_coordinates=$(extract_tools_coordinates "$tools_file"); then
+        printf 'could not locate exact src/mcp/tools.rs source coordinates\n' >&2
+        exit 65
+    fi
+    if ! application_coordinates=$(extract_application_coordinates "$application_file"); then
+        printf 'could not locate exact src/application.rs source coordinates\n' >&2
+        exit 65
+    fi
+    tools_line_start=${tools_coordinates%% *}
+    tools_line_end=${tools_coordinates#* }
+    application_line_start=${application_coordinates%% *}
+    application_line_end=${application_coordinates#* }
 
     jq -cn \
         --arg source_id "$tools_path" \
-        --arg text "$tools_excerpt" '
+        --arg text "$tools_excerpt" \
+        --arg source_revision "$source_revision" \
+        --argjson source_line_start "$tools_line_start" \
+        --argjson source_line_end "$tools_line_end" '
             {
                 source: "code",
                 source_id: $source_id,
@@ -289,6 +398,11 @@ emit_self_audit_sources() {
                 chunk_index: 0,
                 text: $text,
                 role: "usage",
+                extra: {
+                    source_revision: $source_revision,
+                    source_line_start: $source_line_start,
+                    source_line_end: $source_line_end
+                },
                 facets: {
                     dataset: ["rich-demo"],
                     record_kind: ["source_code"],
@@ -299,7 +413,10 @@ emit_self_audit_sources() {
         '
     jq -cn \
         --arg source_id "$application_path" \
-        --arg text "$application_excerpt" '
+        --arg text "$application_excerpt" \
+        --arg source_revision "$source_revision" \
+        --argjson source_line_start "$application_line_start" \
+        --argjson source_line_end "$application_line_end" '
             {
                 source: "code",
                 source_id: $source_id,
@@ -307,6 +424,11 @@ emit_self_audit_sources() {
                 chunk_index: 0,
                 text: $text,
                 role: "usage",
+                extra: {
+                    source_revision: $source_revision,
+                    source_line_start: $source_line_start,
+                    source_line_end: $source_line_end
+                },
                 facets: {
                     dataset: ["rich-demo"],
                     record_kind: ["source_code"],

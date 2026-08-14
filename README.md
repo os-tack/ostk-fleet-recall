@@ -510,3 +510,11 @@ because the volume contains the local memory corpus.
 Fleet Recall is available under either the Apache License 2.0 or MIT license.
 The pinned MinishLab model is separately published under MIT; see its linked
 model card for attribution and license metadata.
+
+## Source-linked demo evidence
+
+The public recall cards render the bounded inline Markdown retained by the
+corpus and link every repository-backed documentation or code chunk to the
+immutable source commit and exact inclusive line range recorded at ingestion.
+Synthetic operations narratives remain visibly unlinked because they are
+generated evidence, not checked-in source files.

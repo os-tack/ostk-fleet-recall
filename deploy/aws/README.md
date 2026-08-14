@@ -111,7 +111,7 @@ aws ecr get-login-password --region "$AWS_REGION" \
 docker buildx build \
   --platform "$IMAGE_PLATFORM" \
   --target production \
-  --build-arg VCS_REF=0123456789abcdef \
+  --build-arg VCS_REF=0123456789abcdef0123456789abcdef01234567 \
   --tag "$REPOSITORY_URL:$IMAGE_TAG" \
   --push .
 ```
