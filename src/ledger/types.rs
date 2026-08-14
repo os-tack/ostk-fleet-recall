@@ -443,6 +443,11 @@ pub struct Conflict {
     #[serde(default)]
     pub member_values_elided: bool,
     pub members: Vec<Claim>,
+    /// Query-local claim IDs that caused this conflict to be selected. This is
+    /// not durable conflict state and is projected separately in retrieval
+    /// diagnostics, so it never appears in the public conflict envelope.
+    #[serde(skip)]
+    pub(crate) trigger_claim_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

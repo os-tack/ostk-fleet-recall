@@ -5,14 +5,27 @@ use crate::{FleetScope, Result};
 
 /// Bounded claim coordinates resolved from exact source-chunk support rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportedClaimCoordinate {
+    pub claim_id: i64,
+    pub chunk_id: String,
+}
+
+/// Bounded claim coordinates resolved from exact source-chunk support rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupportedClaimIds {
     pub claim_ids: Vec<i64>,
     /// Surfaced corpus chunks that exactly support at least one projected
     /// claim. These are current, hash-bound coordinates rather than every
     /// chunk ever cited by the selected claims.
     pub supporting_chunk_ids: Vec<String>,
+    /// Exact current, content-hash-verified claim/chunk associations. At least
+    /// one coordinate is retained for every selected claim.
+    pub coordinates: Vec<SupportedClaimCoordinate>,
     /// True when more matching claims existed than the requested projection.
     pub truncated: bool,
+    /// True when additional exact claim/chunk associations existed beyond the
+    /// bounded diagnostic projection.
+    pub coordinates_truncated: bool,
 }
 
 /// Semantic claim operations implemented atomically by each durable backend.

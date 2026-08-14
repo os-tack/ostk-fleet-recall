@@ -51,6 +51,16 @@ const RETRIEVAL_TEXT_CHARS: usize = 401;
 const RETRIEVAL_JSON_BYTES: usize = 8 * 1024;
 const MAX_RETRIEVAL_METADATA_ROWS: usize = 100;
 
+/// Minimum native cosine similarity accepted by the fleet chunk-recall dense
+/// lane for the pinned `minishlab/potion-retrieval-32M` generation.
+///
+/// A deterministic sweep over the checked-in 548-row demo corpus placed the
+/// best clearly off-domain probes at 0.142 similarity, while broad in-domain
+/// questions started at 0.205 and the project-purpose query reached 0.290.
+/// The deliberately conservative 0.18 boundary removes nearest-neighbour
+/// padding without requiring lexical hits to clear a dense threshold.
+pub(crate) const RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY: f32 = 0.18;
+
 const INSERT_ACTIVE_MODEL_SQL: &str = r"
 INSERT INTO memory_corpus_models (tenant_id, project, embedding_model)
 VALUES ($1, $2, $3)
@@ -1089,10 +1099,21 @@ impl CorpusReader for CockroachRetrievalReader<'_> {
         filter: &CorpusFilter,
         limit: usize,
     ) -> std::result::Result<Vec<CorpusLaneHit>, CorpusReadError> {
-        self.store
+        // The portable engine uses zero to disable its optional stratified
+        // code prefetch. Treat that as an empty lane instead of forwarding an
+        // invalid physical limit to CockroachDB.
+        if limit == 0 {
+            enforce_filter_scope(filter, &self.store.scope)
+                .map_err(|error| corpus_error("dense_search", error))?;
+            return Ok(Vec::new());
+        }
+        let hits = self
+            .store
             .vector_search(embedding, filter, limit)
             .await
-            .map_err(|error| corpus_error("dense_search", error))
+            .map_err(|error| corpus_error("dense_search", error))?;
+        apply_retrieval_dense_floor(hits)
+            .map_err(|error| corpus_error("dense_relevance_floor", error))
     }
 
     async fn fetch_chunks(
@@ -1144,6 +1165,22 @@ fn lane_hits(rows: Vec<PgRow>) -> Result<Vec<CorpusLaneHit>> {
                 score: row.try_get("score")?,
                 rank,
             })
+        })
+        .collect()
+}
+
+fn apply_retrieval_dense_floor(hits: Vec<CorpusLaneHit>) -> Result<Vec<CorpusLaneHit>> {
+    let max_distance = 1.0 - RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY;
+    hits.into_iter()
+        .filter(|hit| hit.score.is_finite() && hit.score <= max_distance)
+        .enumerate()
+        .map(|(rank, mut hit)| {
+            // The input is nearest-first, so filtering normally removes only
+            // a tail. Re-stamping keeps the lane contract exact even if a
+            // backend ever returns a non-finite value in the middle.
+            hit.rank = u32::try_from(rank)
+                .map_err(|_| FleetError::Memory("result rank exceeded u32".into()))?;
+            Ok(hit)
         })
         .collect()
 }
@@ -1468,6 +1505,42 @@ mod tests {
     }
 
     #[test]
+    fn fleet_dense_floor_drops_weak_neighbors_and_restamps_rank() {
+        let hits = vec![
+            CorpusLaneHit {
+                chunk_id: "strong".into(),
+                score: 0.4,
+                rank: 4,
+            },
+            CorpusLaneHit {
+                chunk_id: "boundary".into(),
+                score: 0.819,
+                rank: 7,
+            },
+            CorpusLaneHit {
+                chunk_id: "weak".into(),
+                score: 0.821,
+                rank: 8,
+            },
+            CorpusLaneHit {
+                chunk_id: "invalid".into(),
+                score: f32::NAN,
+                rank: 9,
+            },
+        ];
+
+        let filtered = apply_retrieval_dense_floor(hits).unwrap();
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|hit| (hit.chunk_id.as_str(), hit.rank))
+                .collect::<Vec<_>>(),
+            [("strong", 0), ("boundary", 1)]
+        );
+        assert!((RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY - 0.18).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn retry_backoff_is_exponential_and_capped() {
         let policy = RetryPolicy {
             max_attempts: 8,
@@ -1721,6 +1794,38 @@ mod tests {
         let dense = store.vector_search(&embedding, &filter, 5).await.unwrap();
         assert_eq!(dense[0].chunk_id, "fleet-live-chunk");
         assert!(dense[0].score.abs() < f32::EPSILON);
+
+        let mut weak_chunk = chunk.clone();
+        weak_chunk.chunk_id = "fleet-live-weak-neighbor".into();
+        weak_chunk.source_id = "docs/weak-neighbor.md".into();
+        weak_chunk.text = "Unrelated nearest-neighbour padding.".into();
+        let mut opposite_embedding = vec![0.0; EMBEDDING_DIMENSION];
+        opposite_embedding[0] = -1.0;
+        store
+            .upsert_chunk(&ScopedChunk {
+                scope: scope.clone(),
+                chunk: weak_chunk,
+                embedding_model: "live-test".into(),
+                embedding: opposite_embedding,
+                stale: false,
+            })
+            .await
+            .unwrap();
+        let retrieval_dense = store
+            .retrieval_reader()
+            .dense_search(&embedding, &filter, 5)
+            .await
+            .unwrap();
+        assert_eq!(retrieval_dense.len(), 1);
+        assert_eq!(retrieval_dense[0].chunk_id, "fleet-live-chunk");
+        assert!(
+            store
+                .retrieval_reader()
+                .dense_search(&embedding, &filter, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let lexical = store
             .lexical_search_scoped("capybara semantic", &filter, 5)

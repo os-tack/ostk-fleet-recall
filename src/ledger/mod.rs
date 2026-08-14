@@ -9,7 +9,7 @@ pub use cockroach::CockroachClaimLedger;
 pub use conflict::{
     canonical_json, claims_are_incompatible, intervals_overlap, normalize_key_part,
 };
-pub use repository::{ClaimLedger, SupportedClaimIds};
+pub use repository::{ClaimLedger, SupportedClaimCoordinate, SupportedClaimIds};
 pub use types::{
     Claim, ClaimInput, ClaimKind, ClaimMutation, ClaimState, ClaimSupport, ClaimSupportInput,
     Conflict, ConflictCoverage, SemanticClaimHit,

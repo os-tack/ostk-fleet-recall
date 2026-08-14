@@ -1,19 +1,26 @@
 //! Cockroach-backed implementation of the backend-neutral memory service.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ostk_recall_core::{ChunkEmbedder, CorpusFilter, RecallHit, RecallIntent, RecallParams};
+use ostk_recall_core::{
+    ChunkEmbedder, CorpusFilter, RankingOverrides, RecallHit, RecallIntent, RecallParams,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::ledger::{ClaimInput, ClaimLedger, ClaimMutation, Conflict, SemanticClaimHit};
+use crate::ledger::{
+    ClaimInput, ClaimLedger, ClaimMutation, Conflict, SemanticClaimHit, SupportedClaimCoordinate,
+};
 use crate::service::{
     ConflictCoverage, FleetMemoryService, RecallAction, RecallRequest, RecallResult,
     RememberAction, RememberRequest, RememberResult, ServiceError, ServiceResult,
 };
-use crate::store::cockroach::{CockroachStore, RetrievalHitMetadata, active_embedding_model};
+use crate::store::cockroach::{
+    CockroachStore, RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY, RetrievalHitMetadata,
+    active_embedding_model,
+};
 use crate::{FleetError, FleetScope};
 
 const MAX_TOOL_RESULTS: usize = 100;
@@ -35,7 +42,9 @@ struct ChunkConflictProjection {
     conflicts: Vec<Conflict>,
     support_claim_count: usize,
     supporting_chunk_ids: Vec<String>,
+    support_coordinates: Vec<SupportedClaimCoordinate>,
     support_claims_truncated: bool,
+    support_coordinates_truncated: bool,
 }
 
 fn merge_supported_claim_ids(direct: &mut Vec<i64>, supported: Vec<i64>) -> bool {
@@ -52,6 +61,13 @@ fn merge_supported_claim_ids(direct: &mut Vec<i64>, supported: Vec<i64>) -> bool
         direct.insert(insertion, claim_id);
     }
     truncated
+}
+
+fn fleet_ranking_overrides() -> RankingOverrides {
+    RankingOverrides {
+        stratified_code_prefetch: Some(0),
+        ..RankingOverrides::default()
+    }
 }
 
 impl std::fmt::Debug for CockroachMemoryService {
@@ -162,7 +178,9 @@ impl CockroachMemoryService {
             crate::ledger::SupportedClaimIds {
                 claim_ids: Vec::new(),
                 supporting_chunk_ids: Vec::new(),
+                coordinates: Vec::new(),
                 truncated: false,
+                coordinates_truncated: false,
             }
         } else {
             self.ledger
@@ -173,7 +191,9 @@ impl CockroachMemoryService {
         let crate::ledger::SupportedClaimIds {
             claim_ids: supported_claim_ids,
             supporting_chunk_ids,
+            coordinates: support_coordinates,
             truncated,
+            coordinates_truncated: support_coordinates_truncated,
         } = support_matches;
         let support_claim_count = supported_claim_ids.len();
         let support_claims_truncated =
@@ -190,7 +210,9 @@ impl CockroachMemoryService {
             conflicts,
             support_claim_count,
             supporting_chunk_ids,
+            support_coordinates,
             support_claims_truncated,
+            support_coordinates_truncated,
         })
     }
 
@@ -218,7 +240,13 @@ impl CockroachMemoryService {
                     min_score: args.min_score,
                     intent: args.intent.unwrap_or_default(),
                     attention_bias: None,
-                    ranking_overrides: None,
+                    // The portable default's extra code-only dense lane is
+                    // useful for local symbol search, but in a small public
+                    // demo it grants weak code neighbours a fresh rank-zero
+                    // contribution. Fleet recall disables that prefetch; code
+                    // still participates in both primary lexical and dense
+                    // lanes under the same relevance contract as every source.
+                    ranking_overrides: Some(fleet_ranking_overrides()),
                 };
                 let retrieval_corpus = self.corpus.retrieval_reader();
                 let mut hits = ostk_recall_retrieval::recall(
@@ -231,6 +259,11 @@ impl CockroachMemoryService {
                 .map_err(|error| ServiceError::Internal(format!("hybrid recall: {error}")))?;
                 let metadata_elided = self.hydrate_retrieval_metadata(&mut hits).await?;
                 let projection = self.project_chunk_conflicts(scope, &hits).await?;
+                let conflict_matches = conflict_match_diagnostics(
+                    &projection.conflicts,
+                    &hits,
+                    &projection.support_coordinates,
+                )?;
                 let mut result = RecallResult::new(json!({ "hits": hits }));
                 result.conflicts = serialize_conflicts(&projection.conflicts)?;
                 // Ordinary corpus rows are not NLI-checked. Typed conflict
@@ -243,6 +276,12 @@ impl CockroachMemoryService {
                         "message": "more typed claims cite the surfaced evidence than fit in the bounded conflict projection"
                     }));
                 }
+                if projection.support_coordinates_truncated {
+                    result.warnings.push(json!({
+                        "code": "support_coordinate_projection_truncated",
+                        "message": "additional exact source-support associations exist beyond the bounded conflict-trigger diagnostic"
+                    }));
+                }
                 result.diagnostics.insert(
                     "retrieval".into(),
                     json!({
@@ -252,6 +291,10 @@ impl CockroachMemoryService {
                         "support_claims_matched": projection.support_claim_count,
                         "supporting_chunk_ids": projection.supporting_chunk_ids,
                         "support_claims_truncated": projection.support_claims_truncated,
+                        "support_coordinates_truncated": projection.support_coordinates_truncated,
+                        "conflict_matches": conflict_matches,
+                        "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
+                        "stratified_code_prefetch": 0,
                     }),
                 );
                 Ok(result)
@@ -532,6 +575,130 @@ fn apply_retrieval_metadata(hits: &mut [RecallHit], metadata: Vec<RetrievalHitMe
     elided
 }
 
+fn ranked_source_support(
+    trigger_claim_ids: &HashSet<i64>,
+    support_coordinates: &[SupportedClaimCoordinate],
+    chunk_ranks: &HashMap<&str, usize>,
+) -> ServiceResult<Vec<(i64, String, usize)>> {
+    let mut source_support = support_coordinates
+        .iter()
+        .filter(|coordinate| trigger_claim_ids.contains(&coordinate.claim_id))
+        .map(|coordinate| {
+            let fused_hit_rank =
+                chunk_ranks
+                    .get(coordinate.chunk_id.as_str())
+                    .ok_or_else(|| {
+                        ServiceError::Internal(
+                            "exact source-support coordinate was not present in fused hits".into(),
+                        )
+                    })?;
+            Ok((
+                coordinate.claim_id,
+                coordinate.chunk_id.clone(),
+                *fused_hit_rank,
+            ))
+        })
+        .collect::<ServiceResult<Vec<_>>>()?;
+    source_support.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    source_support.dedup();
+    Ok(source_support)
+}
+
+fn conflict_match_diagnostics(
+    conflicts: &[Conflict],
+    hits: &[RecallHit],
+    support_coordinates: &[SupportedClaimCoordinate],
+) -> ServiceResult<Vec<Value>> {
+    let chunk_ranks = hits
+        .iter()
+        .enumerate()
+        .map(|(rank, hit)| (hit.chunk_id.as_str(), rank + 1))
+        .collect::<HashMap<_, _>>();
+    let mut direct_claim_ranks = HashMap::new();
+    for (rank, hit) in hits.iter().enumerate() {
+        if let Some(claim_id) = hit
+            .extra
+            .get("claim_id")
+            .and_then(Value::as_i64)
+            .filter(|id| *id > 0)
+        {
+            direct_claim_ranks
+                .entry(claim_id)
+                .and_modify(|current: &mut usize| *current = (*current).min(rank + 1))
+                .or_insert(rank + 1);
+        }
+    }
+    let mut trigger_owner = HashMap::new();
+    let mut output = Vec::with_capacity(conflicts.len());
+    for conflict in conflicts {
+        if conflict.trigger_claim_ids.is_empty() {
+            return Err(ServiceError::Internal(
+                "returned conflict omitted its exact retrieval trigger".into(),
+            ));
+        }
+        for claim_id in &conflict.trigger_claim_ids {
+            if trigger_owner
+                .insert(*claim_id, conflict.id)
+                .is_some_and(|owner| owner != conflict.id)
+            {
+                return Err(ServiceError::Internal(
+                    "one retrieval claim selected multiple open conflicts".into(),
+                ));
+            }
+        }
+        let trigger_claim_ids = conflict
+            .trigger_claim_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut direct_claim_ids = trigger_claim_ids
+            .iter()
+            .filter(|claim_id| direct_claim_ranks.contains_key(claim_id))
+            .copied()
+            .collect::<Vec<_>>();
+        direct_claim_ids.sort_unstable();
+        let source_support =
+            ranked_source_support(&trigger_claim_ids, support_coordinates, &chunk_ranks)?;
+
+        let represented_claim_ids = direct_claim_ids
+            .iter()
+            .copied()
+            .chain(source_support.iter().map(|(claim_id, _, _)| *claim_id))
+            .collect::<HashSet<_>>();
+        if represented_claim_ids != trigger_claim_ids {
+            return Err(ServiceError::Internal(
+                "returned conflict could not be bound to an exact fused hit".into(),
+            ));
+        }
+        let best_fused_hit_rank = direct_claim_ids
+            .iter()
+            .filter_map(|claim_id| direct_claim_ranks.get(claim_id).copied())
+            .chain(source_support.iter().map(|(_, _, rank)| *rank))
+            .min()
+            .ok_or_else(|| {
+                ServiceError::Internal("returned conflict had no ranked trigger".into())
+            })?;
+        output.push(json!({
+            "conflict_id": conflict.id,
+            "best_fused_hit_rank": best_fused_hit_rank,
+            "direct_claim_ids": direct_claim_ids,
+            "source_support": source_support.into_iter().map(|(claim_id, chunk_id, fused_hit_rank)| {
+                json!({
+                    "claim_id": claim_id,
+                    "chunk_id": chunk_id,
+                    "fused_hit_rank": fused_hit_rank,
+                })
+            }).collect::<Vec<_>>(),
+        }));
+    }
+    Ok(output)
+}
+
 #[async_trait]
 impl FleetMemoryService for CockroachMemoryService {
     async fn recall(
@@ -796,6 +963,100 @@ mod tests {
         );
         assert!(bounded_limit(Some(0)).is_err());
         assert!(bounded_limit(Some(MAX_TOOL_RESULTS + 1)).is_err());
+    }
+
+    #[test]
+    fn fleet_ranking_disables_unscoped_code_prefetch() {
+        let overrides = fleet_ranking_overrides();
+        assert_eq!(overrides.stratified_code_prefetch, Some(0));
+        assert!(overrides.identifier_code_boost.is_none());
+        assert!(overrides.weights.is_none());
+    }
+
+    #[test]
+    fn conflict_match_diagnostics_distinguish_direct_and_source_triggers() {
+        let hits = [
+            ("claim-seven", Some(7)),
+            ("source-eight", None),
+            ("unrelated", None),
+        ]
+        .into_iter()
+        .map(|(chunk_id, claim_id)| {
+            serde_json::from_value::<RecallHit>(json!({
+                "chunk_id": chunk_id,
+                "source": "markdown",
+                "source_id": format!("docs/{chunk_id}.md"),
+                "snippet": chunk_id,
+                "score": 1.0,
+                "links": {},
+                "extra": claim_id.map_or_else(|| json!({}), |id| json!({ "claim_id": id })),
+            }))
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+        let mut conflict = serde_json::from_value::<Conflict>(json!({
+            "id": 3,
+            "project": "project",
+            "claim_key": "feature::enabled",
+            "kind": "contradiction",
+            "state": "open",
+            "detector": "same_key_typed_value",
+            "rationale": "typed values disagree",
+            "revision": 1,
+            "detected_at": "2026-08-14T00:00:00Z",
+            "last_seen_at": "2026-08-14T00:00:00Z",
+            "resolved_at": null,
+            "resolution_kind": null,
+            "resolution_reason": null,
+            "members": [],
+        }))
+        .unwrap();
+        conflict.trigger_claim_ids = vec![7, 8];
+        let matches = conflict_match_diagnostics(
+            &[conflict],
+            &hits,
+            &[SupportedClaimCoordinate {
+                claim_id: 8,
+                chunk_id: "source-eight".into(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(matches[0]["conflict_id"], 3);
+        assert_eq!(matches[0]["best_fused_hit_rank"], 1);
+        assert_eq!(matches[0]["direct_claim_ids"], json!([7]));
+        assert_eq!(
+            matches[0]["source_support"],
+            json!([{
+                "claim_id": 8,
+                "chunk_id": "source-eight",
+                "fused_hit_rank": 2,
+            }])
+        );
+    }
+
+    #[test]
+    fn conflict_match_diagnostics_fail_closed_without_exact_trigger() {
+        let mut conflict = serde_json::from_value::<Conflict>(json!({
+            "id": 3,
+            "project": "project",
+            "claim_key": "feature::enabled",
+            "kind": "contradiction",
+            "state": "open",
+            "detector": "same_key_typed_value",
+            "rationale": "typed values disagree",
+            "revision": 1,
+            "detected_at": "2026-08-14T00:00:00Z",
+            "last_seen_at": "2026-08-14T00:00:00Z",
+            "resolved_at": null,
+            "resolution_kind": null,
+            "resolution_reason": null,
+            "members": [],
+        }))
+        .unwrap();
+        conflict.trigger_claim_ids = vec![9];
+
+        assert!(conflict_match_diagnostics(&[conflict], &[], &[]).is_err());
     }
 
     #[test]
