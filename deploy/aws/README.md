@@ -318,6 +318,54 @@ sanitized status proof, alongside the URL, ready state, read-only verification
 flag, exact observed action/escalation claim IDs, and lexical+dense RRF
 diagnostics.
 
+### Prove a source-backed documentation/code conflict
+
+After schema 2 is migrated and `./deploy/aws/run-seed.sh --rich-demo` has
+completed, run the separate self-audit proof with a fresh ID. It does not alter
+the four-step publication receipt above:
+
+```bash
+SELF_AUDIT_RUN_ID=devpost-self-audit-YYYYMMDDTHHMMSSZ
+SELF_AUDIT_RECEIPT="target/aws-evidence/self-audit-$SELF_AUDIT_RUN_ID.json"
+
+./deploy/aws/run-self-audit-proof.sh "$SELF_AUDIT_RUN_ID" \
+  >"$SELF_AUDIT_RECEIPT"
+
+jq -e '
+  .schema == "fleet-source-conflict-self-audit-run-v1" and
+  .verified == true and
+  .run_id == $run and
+  .claims.spec.actor == "agent-a" and
+  .claims.spec.value == true and
+  .claims.implementation.actor == "agent-c" and
+  .claims.implementation.value == false and
+  .conflict.state == "open" and
+  .conflict.member_count == 2 and
+  .conflict.surfaced_by_semantic_recall == true and
+  .retrieval.support_claims_matched > 0 and
+  .retrieval.support_claims_truncated == false and
+  .cockroachdb_capabilities.schema_version == 2 and
+  .cockroachdb_capabilities.claim_support_chunk_index_enabled == true
+' --arg run "$SELF_AUDIT_RUN_ID" "$SELF_AUDIT_RECEIPT"
+```
+
+The wrapper launches `record-retraction-spec-claim` as `agent-a`, backed by the
+exact `examples/README.md` chunk, followed by
+`record-retraction-implementation-claim` as `agent-c`, backed by exact chunks
+from `src/mcp/tools.rs` and `src/application.rs`. It requires the exact Fargate
+overrides, two distinct exit-zero tasks, and exactly one structured evidence
+event per task with the expected schema, run ID, agent, project, and
+`source-backed-mcp-contract-self-audit-v1` policy. It then correlates the
+Boolean claims and their SHA-256 source coordinates before querying the public
+demo with `Does MCP remember support deliberate retractions?`.
+
+Success requires that semantic query to surface at least one of those exact
+source chunks and project its exact open, complete, two-member conflict through
+the source-support index. The receipt contains no task ARN, account ID, log
+group/stream coordinate, raw log event, database URL, or secret. As with the
+main receipt, mock success proves only the wrapper contract; only a real run
+against the submission stack is cloud evidence.
+
 Treat the file as cloud evidence only when the wrapper actually ran against the
 submission ECS cluster, public demo, and CockroachDB Cloud database. Unit tests,
 Terraform tests, LocalStack, or a handcrafted JSON object do not satisfy this

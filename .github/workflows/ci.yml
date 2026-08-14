@@ -126,6 +126,9 @@ jobs:
       - name: Test the AWS reference-agent evidence wrapper
         working-directory: .
         run: ./deploy/aws/tests/reference-agent-wrapper.sh
+      - name: Test the AWS source-conflict self-audit wrapper
+        working-directory: .
+        run: ./deploy/aws/tests/self-audit-wrapper.sh
       - name: Test the AWS corpus seed selector
         working-directory: .
         run: ./deploy/aws/tests/seed-wrapper.sh
