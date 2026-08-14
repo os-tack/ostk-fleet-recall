@@ -20,11 +20,13 @@ reviewed excerpts of the verified reference-agent and replacement receipts and
 the representative query plans. Keep every local/cloud provenance label
 visible so one segment cannot be mistaken for another.
 
-The public conflict-first UI is the current revision-7 deployment at source
-commit `efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f`, with the 548-row rich seed.
+The public conflict-first UI is the current revision-10 deployment at source
+commit `56b577c82b9c5a5c80d73103f7f6b56d51698872`, with the 552-row rich seed.
 The correlated four-task agent and fully disjoint replacement receipts are
 verified **historical revision-6** evidence from run
-`devpost-final6-20260814T143523Z`; they were not rerun on revision 7. Do not cut
+`devpost-final6-20260814T143523Z`; they were not rerun for revision 10. The
+seven-query public-relevance receipt is **historical revision-7** evidence and
+was not regenerated for revision 10. Do not cut
 the two sources together in a way that implies one revision or one continuous
 live take.
 
@@ -40,8 +42,8 @@ Use these exact two-line provenance cards. Do not abbreviate away the revision
 or source boundary:
 
 ```text
-LIVE PUBLIC DEMO · AWS + COCKROACHDB CLOUD · CURRENT REVISION 7 UI
-548-ROW RICH SEED · PUBLIC READ-ONLY ENDPOINT
+LIVE PUBLIC DEMO · AWS + COCKROACHDB CLOUD · CURRENT REVISION 10 UI
+552-ROW RICH SEED · PUBLIC READ-ONLY ENDPOINT
 
 VERIFIED CLOUD AGENT RECEIPT · AWS FARGATE + COCKROACHDB CLOUD
 HISTORICAL REVISION 6 · RUN devpost-final6-20260814T143523Z
@@ -73,11 +75,15 @@ linked repository path only if that row is present in the deployed corpus; do
 not describe a plain claim ID as a file citation. Point out “fused in …ms” as
 server recall time and “round trip …ms” as browser-to-cloud time. These
 are different measurements. Do not call RRF rank artifacts confidence scores.
-The checked-in
-[revision-7 public relevance receipt](evidence/public-relevance-efe6fbf-20260814.json)
+Final desktop and 390px mobile QA verified safe inline Markdown, immutable exact
+source-revision `#Lx-Ly` links, a relative repository link rendered as a
+code-styled anchor, and no horizontal overflow. The seven-query smoke gate also
+passed against the live endpoint. The
+checked-in
+[historical revision-7 public relevance receipt](evidence/public-relevance-efe6fbf-20260814.json)
 records the expected conflict and no-conflict query behavior for rehearsal;
 run the questions again immediately before recording rather than substituting
-the receipt for live footage.
+that prior-release receipt for live footage.
 
 Narrate: “This is the current read-only AWS deployment, backed by CockroachDB
 Cloud. I can ask in normal language and get readable, cited memories—not a wall
@@ -123,7 +129,7 @@ The before and after task sets were fully disjoint, while desired capacity
 stayed one. Exact action and escalation claims 16 and 18 were recalled both before
 and after through lexical+dense RRF. The workers were replaceable; CockroachDB
 remained the memory source of truth.” Explicitly say this receipt is historical
-revision-6 evidence, separate from the current revision-7 UI.
+revision-6 evidence, separate from the current revision-10 UI.
 
 ### 2:12–2:30 — local-first → fleet coda
 

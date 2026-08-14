@@ -2,11 +2,11 @@
 
 This is a working, copy-ready submission packet for the CockroachDB AI Agents
 Hackathon. Bracketed fields are release blockers, not claims. Replace them only
-after the linked artifact is public and verified. The revision-7
-AWS/CockroachDB Cloud deployment and public smoke check are verified; the
-reference-agent and replacement artifacts are historical revision-6 evidence,
-while the representative Cloud `EXPLAIN` is separately captured historical
-plan evidence. The final public video and entrant-controlled
+after the linked artifact is public and verified. The revision-10
+AWS/CockroachDB Cloud deployment is verified; the public-relevance receipt is
+historical revision-7 evidence, the reference-agent and replacement artifacts
+are historical revision-6 evidence, and the representative Cloud `EXPLAIN` is
+separately captured historical plan evidence. The final public video and entrant-controlled
 Devpost fields remain release blockers. The release-state table is authoritative.
 
 Submission deadline: **August 18, 2026 at 5:00 PM EDT / 4:00 PM CDT**.
@@ -36,14 +36,18 @@ memory should say so.
 
 **Testing instructions**
 
-Open the working-demo URL without signing in. Its default example leads with a
-real specification-versus-code disagreement. Submit it and confirm that the
-page visibly reports the exact open conflict, shows both sides and relevant
-evidence cards, and reports measured server/round-trip time. Try the migration
+Open the working-demo URL without signing in. Start with the
+specification-versus-code example. Confirm its exact open conflict, both sides,
+relevant evidence cards, and measured server/round-trip time. Try the migration
 example for the second exact conflict mapping. The CockroachDB, Rust,
 project-purpose, and datastore-library examples should return relevant evidence
 without a conflict; nonsense should return no results and no conflicts. Expand
 “View raw evidence envelope” to inspect the bounded CockroachDB-backed result.
+Open a repository-backed source card and confirm that its link targets commit
+`56b577c82b9c5a5c80d73103f7f6b56d51698872` with an exact `#Lx-Ly` anchor.
+Inline Markdown, code, and a relative repository link rendered as a code-styled
+anchor should remain bounded without horizontal overflow at desktop and 390px
+mobile sizes.
 Then open
 <https://d13zrqfh66r7ub.cloudfront.net/healthz> and confirm
 `{"status":"ready"}`. The public
@@ -133,7 +137,7 @@ CockroachDB Cloud as the memory source of truth after every task is replaced.
 A historical revision-6 forced deployment changed the complete serving task
 set to a fully disjoint set, while public lexical/dense RRF continued to return
 the exact action and escalation claims 16 and 18. That replacement proof was
-not rerun during the revision-7 cutover.
+not rerun for revision 10.
 
 The submission core does not depend on OSTK or an LLM. Its default AWS agent is
 a standalone deterministic reference policy implemented in Fleet Recall. Four
@@ -151,11 +155,11 @@ authorized live run produces verified evidence. Its boundary is documented in
 ## How we built it
 
 - **Rust 1.94** application and MCP protocol with bounded inputs/outputs,
-  running as immutable ARM64 image `git-efe6fbf4e2f1` at source commit
-  `efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f` on ECS/Fargate.
+  running as immutable ARM64 image `git-56b577c82b9c` at source commit
+  `56b577c82b9c5a5c80d73103f7f6b56d51698872` on ECS/Fargate.
 - **CockroachDB Cloud 26.2.5** is the live memory plane for corpus chunks,
   typed claims, passage vectors, conflicts, idempotency receipts, and events.
-  The revision-7 rich-seed task exited zero and upserted exactly 548 rows: 342
+  The revision-10 idempotent rich-seed task exited zero and upserted exactly 552 rows: 346
   documentation chunks, 2 code chunks, and 204 operations chunks.
   `/api/status` reports the vector, lexical, conflict-membership, and
   claim-support-chunk indexes, working cosine distance, and embedding dimension
@@ -189,8 +193,11 @@ authorized live run produces verified evidence. Its boundary is documented in
   [replacement](evidence/replacement-devpost-final6-20260814T143523Z.json), and
   [validation](evidence/publication-validation-devpost-final6-20260814T143523Z.json)
   receipts are checked in. These self-audit/agent/replacement receipts were not
-  rerun on revision 7. The live serving, migration, seed, and reference-agent
-  task-definition families are revision 7.
+  rerun for revision 10. The live serving, migration, seed, and
+  reference-agent task-definition families are revision 10, and the service is
+  1/1 healthy. The ECR Basic OS-package scan completed with an empty
+  finding-severity count; it does not claim language or application-dependency
+  coverage.
 - Backend-neutral corpus traits extracted into upstream `ostk-recall`, pinned
   by immutable Git revision so the local and fleet stores share retrieval
   contracts without making local Recall depend on CockroachDB.
@@ -262,12 +269,12 @@ Git history and pinned revisions make that boundary inspectable.
 
 | Requirement | Evidence to show judges | Release state |
 |---|---|---|
-| CockroachDB persistent memory | Local 26.2 schema/round-trip/conflict tests; live seed/status/smoke verification; historical cloud self-audit, reference-agent, and restart capture | Revision 7 deployed exactly 548 rich-corpus rows (342 documentation, 2 code, 204 operations). The public seven-query smoke check verified both exact conflict mappings, four relevant conflict-free answers, and zero results/zero conflicts for nonsense. The agent and replacement receipts remain historical revision-6 evidence and were not rerun on revision 7 |
+| CockroachDB persistent memory | Local 26.2 schema/round-trip/conflict tests; live seed/status/API verification; historical public relevance, cloud self-audit, reference-agent, and restart capture | Revision 10 deployed exactly 552 rich-corpus rows (346 documentation, 2 code, 204 operations). Current API results carry the exact release revision and source-line ranges, and the final seven-query smoke gate passed. The checked-in seven-query receipt remains historical revision-7 evidence; the agent and replacement receipts remain historical revision-6 evidence and were not rerun for revision 10 |
 | Distributed Vector Indexing | DDL and local representative `EXPLAIN`; cloud plan and reference-agent lexical+dense RRF capture | Live capability flags, cosine operation, dimension 512, and lexical/dense RRF verified. The [publication-safe Cloud `EXPLAIN`](evidence/cockroach-cloud-explain.txt) selects both C-SPANN indexes and the lexical inverted index for the exact production SQL shapes on 10,001 disposable rows; all assertions passed |
 | CockroachDB Agent Skills | Pinned coding-agent invocation audit mapping each skill to decisions, code/tests, and accepted deviations | Ready in repository |
-| AWS service | ECS/ALB/CloudFront/S3/Secrets/ECR/CloudWatch Terraform; one-off self-audit/reference-agent wrappers; LocalStack contract harness | Live revision-7 image and all four task-definition families are deployed; rich seed, healthy public service, browser UI, and seven-query smoke check verified. The two-task self-audit, four-task reference run, and disjoint serving-task replacement are historical revision-6 evidence |
+| AWS service | ECS/ALB/CloudFront/S3/Secrets/ECR/CloudWatch Terraform; one-off self-audit/reference-agent wrappers; LocalStack contract harness | Live revision-10 image and all four task-definition families are deployed; the service is 1/1 healthy, the 552-row rich seed succeeded, the ECR Basic OS-package scan completed with empty severity counts, and final desktop/390px mobile QA passed. The seven-query public-relevance receipt is historical revision-7 evidence; the two-task self-audit, four-task reference run, and disjoint serving-task replacement are historical revision-6 evidence |
 | Public open source | Source, licenses, locked dependencies, setup and sample data | Published and anonymously verified at <https://github.com/os-tack/ostk-fleet-recall> |
-| Functional URL | HTTPS landing page, bounded recall, `/healthz` | Live at <https://d13zrqfh66r7ub.cloudfront.net>; health, status, and hybrid recall verified |
+| Functional URL | HTTPS landing page, bounded recall, `/healthz` | Live at <https://d13zrqfh66r7ub.cloudfront.net>; health, status, and source-linked bounded recall verified |
 | Public video <3 min | Live AWS UI plus reviewed cloud agent/replacement receipts by default, then YouTube/Vimeo link and final duration; standalone Fleet Recall is optional local footage and OSTK is an optional alternate | 46-second 1600×900 sanitized rehearsal rendered; `[RENDER_LIVE_NARRATE_AND_UPLOAD]` |
 
 ## Judging-criteria evidence map
@@ -279,9 +286,9 @@ treating successful vector search as the whole project.
 | Criterion | Strongest repository evidence | Final proof still to capture |
 |---|---|---|
 | Agentic Memory Design | Hybrid lexical/vector recall, typed claims, hash-bound source support, correction-aware conflict membership, the checked-in revision-6 claims-9/10 source self-audit, and the historical revision-6 claims-15–18 four-task cloud run | Show the source cards carrying open conflict 3, then label the cited operator escalation from conflict 5 as historical revision-6 evidence |
-| Technological Implementation | Prefix-scoped C-SPANN and inverted indexes, schema-2 claim-support index, backend-neutral Recall extraction, short serializable retries, immutable model identity, conformance and adversarial tests, plus the publication-safe Cloud plan and live receipts | Show the live revision-7 image/task identity and label the separately captured historical plan and revision-6 receipts accurately in the final video |
+| Technological Implementation | Prefix-scoped C-SPANN and inverted indexes, schema-2 claim-support index, backend-neutral Recall extraction, short serializable retries, immutable model identity, conformance and adversarial tests, plus the publication-safe Cloud plan and live receipts | Show the live revision-10 image/task identity and label the historical revision-7 relevance and revision-6 agent/replacement receipts accurately in the final video |
 | Real-World Impact | A recalled schema-migration decision changes the next agent's rollout action; an incompatible memory stops rollout and produces a cited operator handoff | Explain how the same pattern applies to long-running coding, operations, and research fleets |
-| Product Readiness | Trusted deployment scope, bounded input/output and hydration, least-privilege runtime/migrator separation, live HTTPS health, idempotent receipts, four-task proof, and exact recall after full task replacement | Capture final publication-safe footage without exposing identifiers or secrets; explain the CloudFront-to-ALB HTTP boundary accurately |
+| Product Readiness | Trusted deployment scope, bounded input/output and hydration, least-privilege runtime/migrator separation, live HTTPS health, idempotent receipts, historical revision-6 four-task proof, and historical revision-6 exact recall after full task replacement | Capture final publication-safe footage without exposing identifiers or secrets; explain the CloudFront-to-ALB HTTP boundary accurately |
 | Creativity & Originality | Local Recall stays local-first while Fleet Recall adds a distributed memory plane; disagreement is durable first-class state rather than an overwrite or a hidden rank choice | Make the conflict-aware memory-to-action transition the visual center of the final video |
 
 ## Final video plan (target 2:40)
@@ -292,14 +299,16 @@ DISAGREE → SURVIVE**, followed by a short local-first-to-fleet coda. Do not us
 an older architecture-first timeline or replace serving tasks manually while
 filming.
 
-The current UI runs at the revision-7 release boundary and is browser-verified.
+The current UI runs at the revision-10 release boundary. Final desktop and
+390px mobile QA verified safe inline Markdown, immutable exact source-line
+links, a relative repository link rendered as a code-styled anchor, and no
+horizontal overflow. The final seven-query smoke gate passed.
 The checked-in self-audit, reference-agent, replacement, and validation
 artifacts remain historical revision-6 evidence; the Cloud plan is separately
-captured historical evidence. None was rerun during the revision-7 cutover. The
-current seven-query public smoke check verifies the
-two exact conflict mappings, four relevant conflict-free answers, and the
-zero-result/zero-conflict nonsense case, but it is not a replacement or
-reference-agent proof. Local or rehearsal terminal footage is supporting
+captured historical evidence. None was rerun during the revision-10 cutover. The
+checked-in seven-query public-relevance receipt is historical revision-7
+evidence for the prior 548-row release; it is not the revision-10 smoke receipt,
+replacement, or reference-agent proof. Local or rehearsal terminal footage is supporting
 material, never AWS evidence. The final export needs narration or another
 accessible audio track; the silent rehearsal is not submission-ready.
 
@@ -309,8 +318,8 @@ accessible audio track; the silent rehearsal is not submission-ready.
 - [x] Licenses, dependency lockfile, sample NDJSON, setup, architecture, and
       pre-existing-work disclosure are present.
 - [x] CI run
-      [`31821458425`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31821458425)
-      completed all five jobs green for the revision-7 release on Rust 1.94.
+      [`31832684235`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31832684235)
+      completed all five jobs green for the revision-10 release on Rust 1.94.
 - [x] CockroachDB Cloud uses TLS, a non-admin runtime user, backups, and an
       allowlist/private route.
 - [x] Run one migration task, then verify `health` and all required indexes.
@@ -319,18 +328,22 @@ accessible audio track; the silent rehearsal is not submission-ready.
       10,001-row disposable fixture; all three index assertions pass,
       production was untouched, the fixture database was dropped, and the
       temporary workstation network rule was removed.
-- [x] Push an immutable ECR image and run at least one healthy ECS task.
+- [x] Push immutable ECR image `git-56b577c82b9c`; its Basic OS-package scan
+      completed with empty severity counts, and the revision-10 service is 1/1
+      healthy. This does not claim language or application-dependency coverage.
 - [x] Public URL supports landing page, bounded recall, and `/healthz`; mutation
       remains unavailable or authenticated/rate-limited.
 - [x] CloudFront's default HTTPS certificate is valid; the TLSv1-minimum viewer
       policy and restricted HTTP origin hop are documented without overclaim.
 - [ ] Review every final screenshot, shell excerpt, and video frame for secrets
       and infrastructure identifiers before publication.
-- [x] Stop/replace the complete serving task set and verify the same exact
-      memory remains through lexical/dense RRF.
-- [x] Run `deploy/aws/run-reference-agent.sh` against the healthy submission
-      stack; preserve its verified correlated JSON and redacted public-demo
-      recall evidence. Do not substitute a local or handcrafted result.
+- [x] Historical revision-6 proof: stop/replace the complete serving task set
+      and verify the same exact memory remains through lexical/dense RRF. This
+      was not rerun for revision 10.
+- [x] Historical revision-6 proof: run `deploy/aws/run-reference-agent.sh`
+      against the healthy submission stack and preserve its verified correlated
+      JSON and redacted public-demo recall evidence. This was not rerun for
+      revision 10; do not substitute a local or handcrafted result.
 - [ ] Video is public, under three minutes, legible at 1080p, and explicitly
       names CockroachDB tools and AWS services.
 - [ ] `./docs/assets/verify-media.sh --final-video <final.mp4>` passes; captions

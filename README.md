@@ -40,28 +40,36 @@ hackathon slice. Additional canonical Recall actions are also future work.
 
 The submission candidate is live at
 [https://d13zrqfh66r7ub.cloudfront.net](https://d13zrqfh66r7ub.cloudfront.net).
-The live revision-7 cutover runs source commit
-`efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f` as immutable ARM64 image tag
-`git-efe6fbf4e2f1`. The serving, migration, seed, and reference-agent
-task-definition families are all revision 7. Its rich-seed task exited zero
-and upserted exactly 548 rows: 342 documentation chunks, 2 code chunks, and 204
-operations chunks. The public status surface reports CockroachDB 26.2.5,
-schema version 2, enabled vector, lexical, conflict-membership, and
-claim-support-chunk indexes, working cosine distance, and the pinned
-512-dimension embedding model. GitHub Actions run
-[`31821458425`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31821458425)
+The live revision-10 cutover runs source commit
+`56b577c82b9c5a5c80d73103f7f6b56d51698872` as immutable ARM64 image tag
+`git-56b577c82b9c`. The serving, migration, seed, and reference-agent
+task-definition families are all revision 10, and the service is healthy with
+one desired and one running task. Its idempotent rich-seed task exited zero and upserted
+exactly 552 rows: 346 documentation chunks, 2 code chunks, and 204 operations
+chunks. The public API returned repository-backed hits with the exact release
+`source_revision` and inclusive source-line ranges. Final desktop and 390px
+mobile QA verified safe inline Markdown, immutable exact `#Lx-Ly` links, a
+relative repository link rendered as a code-styled anchor, and no horizontal
+overflow. The final seven-query smoke gate passed. The public status surface
+reports CockroachDB 26.2.5, schema version 2, enabled vector, lexical,
+conflict-membership, and claim-support-chunk indexes, working cosine distance,
+and the pinned 512-dimension embedding model. The ECR Basic OS-package scan is
+`COMPLETE` with an empty finding-severity count; this does not claim Rust, Go,
+or application-dependency coverage. GitHub Actions run
+[`31832684235`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31832684235)
 completed all five jobs successfully for this release.
 
-A [seven-query public smoke check](docs/evidence/public-relevance-efe6fbf-20260814.json)
-verified exact conflict mappings for the
-specification-versus-code and migration examples, relevant conflict-free
-results for the CockroachDB, Rust, project-purpose, and datastore-library
-questions, and zero results with zero conflicts for a nonsense query. The live
-UI was also verified in a browser.
+The checked-in
+[seven-query public relevance receipt](docs/evidence/public-relevance-efe6fbf-20260814.json)
+is **historical revision-7 evidence** for the prior 548-row image boundary. It
+records exact conflict mappings for the specification-versus-code and migration
+examples, four relevant conflict-free answers, and zero results with zero
+conflicts for a nonsense query. It was not regenerated for revision 10 and must
+not be presented as the revision-10 smoke receipt.
 
 The checked-in receipts below are **historical revision-6 cloud evidence**;
-the reference-agent and replacement proofs were not rerun during the
-revision-7 cutover. The publication-safe
+the reference-agent and replacement proofs were not rerun for the current
+revision-10 release. The publication-safe
 [source-conflict self-audit receipt](docs/evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json)
 proves that semantic recall surfaced the exact documentation and code sources
 behind incompatible Boolean claims 9 and 10 and projected their exact open
@@ -74,7 +82,7 @@ records a fully disjoint serving-task-set replacement that preserved exact
 public claims 16 and 18 through lexical/dense RRF; the
 [publication verifier receipt](docs/evidence/publication-validation-devpost-final6-20260814T143523Z.json)
 cross-validates the pair. These were observed live in AWS/CockroachDB Cloud,
-but they describe the revision-6 boundary, not a revision-7 reference-agent or
+but they describe the revision-6 boundary, not a revision-10 reference-agent or
 replacement run. LocalStack and local tests remain preflight evidence only.
 
 HTTPS is provided by CloudFront's default certificate. AWS fixes that
@@ -92,7 +100,7 @@ plans select `memory_chunks_semantic_idx`,
 production database was untouched, the fixture database was dropped, and the
 temporary workstation network rule was removed. The final public video and
 remaining entrant/Devpost fields are still release gates. This separately
-captured plan evidence was not rerun as part of the revision-7 cutover.
+captured plan evidence was not rerun as part of the revision-10 cutover.
 
 The final-cut plan leads with the live AWS UI and then shows the reviewed cloud
 agent and replacement receipts; see [`docs/VIDEO_DEMO.md`](docs/VIDEO_DEMO.md).

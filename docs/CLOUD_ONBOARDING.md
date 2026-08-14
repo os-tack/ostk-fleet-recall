@@ -6,21 +6,26 @@ billing choices, DNS ownership, or database credentials. Do not place database
 URLs, passwords, AWS access keys, or secret values in this repository,
 Terraform variables, command-line arguments, screenshots, or shell history.
 
-Recorded revision-7 release state: the onboarding path was completed for the
+Recorded revision-10 release state: the onboarding path was completed for the
 live submission candidate at
-<https://d13zrqfh66r7ub.cloudfront.net>. Immutable image `git-efe6fbf4e2f1`
-at source commit `efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f` runs with all
-four task-definition families at revision 7. The rich-seed task exited zero and
-upserted exactly 548 rows: 342 documentation chunks, 2 code chunks, and 204
-operations chunks. A seven-query public smoke check verified both exact
-conflict mappings, four relevant conflict-free answers, and zero results/zero
-conflicts for nonsense; the live UI was also browser-verified. GitHub Actions
-run [`31821458425`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31821458425)
-completed all five jobs successfully. The checked-in self-audit,
+<https://d13zrqfh66r7ub.cloudfront.net>. Immutable image `git-56b577c82b9c`
+at source commit `56b577c82b9c5a5c80d73103f7f6b56d51698872` runs with all
+four task-definition families at revision 10; the service is 1/1 healthy. The
+idempotent rich-seed task exited zero and upserted exactly 552 rows: 346 documentation
+chunks, 2 code chunks, and 204 operations chunks. The public API returned the
+exact release revision and source-line ranges for repository-backed hits.
+Final desktop and 390px mobile QA verified safe inline Markdown, immutable exact
+`#Lx-Ly` links, a relative repository link rendered as a code-styled anchor,
+and no horizontal overflow. The final seven-query smoke gate passed.
+The ECR Basic OS-package scan is `COMPLETE` with an empty finding-severity
+count; this does not claim
+language or application-dependency coverage. GitHub Actions run
+[`31832684235`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31832684235)
+completed all five jobs successfully. The checked-in seven-query public
+relevance receipt remains historical revision-7 evidence. The self-audit,
 reference-agent, replacement, and validation artifacts remain historical
 revision-6 evidence; the Cloud `EXPLAIN` is separately captured historical plan
-evidence. None was rerun on revision 7. The final
-public video and the remaining Devpost fields are still pending.
+evidence. None was rerun for revision 10.
 
 The labels below are gates:
 
@@ -386,21 +391,27 @@ jq -e '.schema == "fleet-reference-agent-run-v1" and .verified == true' \
   "target/aws-evidence/reference-agent-$RUN_ID.json"
 ```
 
-For the current revision-7 deployment, immutable image `git-efe6fbf4e2f1` at
-source commit `efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f` runs with the
+For the current revision-10 deployment, immutable image `git-56b577c82b9c` at
+source commit `56b577c82b9c5a5c80d73103f7f6b56d51698872` runs with the
 serving, migration, seed, and reference-agent task-definition families all at
-revision 7. The rich-seed task exited zero and upserted exactly 548 rows: 342
-documentation chunks, 2 code chunks, and 204 operations chunks. The
-browser-verified live UI and seven-query public smoke check confirmed exact
-specification/code and migration conflict mappings, relevant conflict-free
-CockroachDB, Rust, project-purpose, and datastore-library results, and zero
-results/zero conflicts for nonsense. GitHub Actions run
-[`31821458425`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31821458425)
+revision 10; the service is 1/1 healthy. The idempotent rich-seed task exited zero and
+upserted exactly 552 rows: 346 documentation chunks, 2 code chunks, and 204
+operations chunks. Current public API results carry the exact release revision
+and source-line ranges. Final desktop and 390px mobile QA verified safe inline
+Markdown, immutable exact `#Lx-Ly` links, a relative repository link rendered
+as a code-styled anchor, and no horizontal overflow. The final seven-query
+smoke gate passed. The ECR Basic OS-package scan completed with an empty
+finding-severity count,
+and GitHub Actions run
+[`31832684235`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31832684235)
 completed all five jobs successfully.
+The checked-in
+[seven-query public relevance receipt](evidence/public-relevance-efe6fbf-20260814.json)
+is historical revision-7 evidence for the prior 548-row release, not the
+revision-10 smoke receipt.
 
 The checked-in artifacts that follow are historical revision-6 cloud evidence;
-the reference-agent and replacement proofs were not rerun during the
-revision-7 cutover. The
+the reference-agent and replacement proofs were not rerun for revision 10. The
 [source-conflict self-audit](evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json)
 verified documentation-backed claim 9, code-backed claim 10, and their exact
 open conflict 3 through semantic recall. Historical revision-6 run
@@ -420,7 +431,7 @@ production project-vector, source-vector, and lexical SQL shapes on a
 `memory_chunks_source_semantic_idx`, and `memory_chunks_lexical_idx`; all
 assertions passed. Production was untouched, the fixture database was dropped,
 and the temporary workstation network rule was removed. It was not rerun on
-revision 7. The first lexical plan ran immediately after `ANALYZE` and briefly
+revision 10. The first lexical plan ran immediately after `ANALYZE` and briefly
 saw stale statistics; the unchanged
 query selected the inverted index once fresh statistics became visible roughly
 two minutes later. No `FORCE_INDEX` hint was used or implied.

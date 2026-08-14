@@ -10,20 +10,26 @@ The module is intentionally safe to bootstrap: its default service and
 autoscaling minimum are zero. Run the one-off migration successfully before
 starting any application task.
 
-This remains the reproducible deployment runbook. At the recorded revision-7
+This remains the reproducible deployment runbook. At the recorded revision-10
 release boundary, its live submission candidate is available at
-<https://d13zrqfh66r7ub.cloudfront.net>. Immutable image `git-efe6fbf4e2f1`
-at source commit `efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f` runs with all
-four task-definition families at revision 7. The rich-seed task exited zero and
-upserted exactly 548 rows: 342 documentation chunks, 2 code chunks, and 204
-operations chunks. The seven-query public smoke check and a browser review of
-the live UI succeeded. GitHub Actions run
-[`31821458425`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31821458425)
-completed all five jobs successfully. The checked-in source-conflict
-self-audit, reference-agent, replacement, and validation artifacts are
-historical revision-6 evidence; Cloud `EXPLAIN` is separately captured
-historical plan evidence. None was rerun on revision 7.
-The final public video and entrant-controlled Devpost fields remain pending.
+<https://d13zrqfh66r7ub.cloudfront.net>. Immutable image `git-56b577c82b9c`
+at source commit `56b577c82b9c5a5c80d73103f7f6b56d51698872` runs with all
+four task-definition families at revision 10, and the service is 1/1 healthy.
+The idempotent rich-seed task exited zero and upserted exactly 552 rows: 346 documentation
+chunks, 2 code chunks, and 204 operations chunks. The public API returned the
+exact release revision and line ranges. Final desktop and 390px mobile QA
+verified safe inline Markdown, immutable exact `#Lx-Ly` links, a relative
+repository link rendered as a code-styled anchor, and no horizontal overflow.
+The final seven-query smoke gate passed. The ECR Basic OS-package scan is `COMPLETE`
+with an empty severity
+count, without claiming language or application-dependency coverage. GitHub
+Actions run
+[`31832684235`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31832684235)
+completed all five jobs successfully. The checked-in public-relevance receipt
+is historical revision-7 evidence. The source-conflict self-audit,
+reference-agent, replacement, and validation artifacts are historical
+revision-6 evidence; Cloud `EXPLAIN` is separately captured historical plan
+evidence. None was rerun for revision 10.
 
 ## Prerequisites
 
@@ -167,9 +173,9 @@ aws logs tail "$(terraform -chdir=deploy/aws output -raw log_group_name)" \
   --region us-east-1 --since 30m
 ```
 
-The recorded revision-7 production image `git-efe6fbf4e2f1` contains the
+The recorded revision-10 production image `git-56b577c82b9c` contains the
 repository's deterministic rich corpus. Its one-off rich-seed task exited zero
-and upserted exactly 548 rows: 342 documentation chunks, 2 code chunks, and 204
+and upserted exactly 552 rows: 346 documentation chunks, 2 code chunks, and 204
 operations chunks. The default and rich corpora contain no tenant authority or
 secrets. The default invocation ingests
 `/opt/ostk/demo/demo.ndjson`; `--rich-demo` selects
@@ -383,7 +389,8 @@ metadata before sharing it. Never supplement it with the database URL, account
 ID, task ARN, secret ARN, or raw CloudWatch log export.
 
 The following receipts are historical revision-6 cloud evidence. They were not
-rerun during the revision-7 cutover. The revision-6 self-audit produced the
+rerun for revision 10. The revision-6 self-audit
+produced the
 checked-in, publication-safe
 [receipt](../../docs/evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json).
 It correlated documentation-backed claim 9 and code-backed claim 10 with exact
@@ -406,15 +413,20 @@ Those historical receipts are bound to immutable ARM64 image tag
 and source commit `ba884f24858a58b09a915e0358e60e7fcc7e2c34`; serving,
 migration, seed, and reference-agent task definitions were all revision 6.
 
-The current live release uses immutable image tag `git-efe6fbf4e2f1` at source
-commit `efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f`, with all four
-task-definition families at revision 7. Its rich-seed task exited zero and
-upserted exactly 548 rows (342 documentation, 2 code, and 204 operations).
-The browser-verified UI and seven-query public smoke check confirmed both exact
-conflict mappings, four relevant conflict-free answers, and zero results/zero
-conflicts for nonsense. CI run
-[`31821458425`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31821458425)
+The current live release uses immutable image tag `git-56b577c82b9c` at source
+commit `56b577c82b9c5a5c80d73103f7f6b56d51698872`, with all four
+task-definition families at revision 10 and the service 1/1 healthy. Its
+idempotent rich-seed task exited zero and upserted exactly 552 rows (346 documentation, 2
+code, and 204 operations). The public API returned the exact release revision
+and inclusive source-line ranges. Final desktop and 390px mobile QA verified
+safe inline Markdown, immutable exact `#Lx-Ly` links, a relative repository
+link rendered as a code-styled anchor, and no horizontal overflow. The final
+seven-query smoke gate passed. The ECR Basic OS-package scan completed with an empty
+finding-severity count, and CI run
+[`31832684235`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31832684235)
 completed all five jobs successfully.
+The checked-in seven-query public-relevance receipt is historical revision-7
+evidence for the prior 548-row release and was not regenerated for revision 10.
 
 ## 8. Replace the complete serving task set and prove persistence
 
@@ -457,7 +469,7 @@ replacement wrapper exercised serving task definition revision 6 and changed
 the complete task set to a fully disjoint set. Desired count remained one, the
 service returned ready, and the before/after public checks observed the same
 exact claims 16 and 18 through lexical/dense RRF. This replacement proof was
-not rerun on revision 7.
+not rerun for revision 10.
 
 ## Cloud `EXPLAIN` evidence
 

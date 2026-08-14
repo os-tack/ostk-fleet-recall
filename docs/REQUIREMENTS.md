@@ -6,19 +6,20 @@ persistent memory layer, is deployed on AWS, uses at least two listed
 CockroachDB tools and one AWS service, and remains available free of charge and
 without restriction through the end of judging. Repository and local evidence
 do not by themselves prove deployment; the live results below combine the
-revision-7 cutover and public smoke verification with explicitly historical
-revision-6 AWS/CockroachDB Cloud receipts.
+revision-10 deployment observations with an explicitly historical revision-7
+public-relevance receipt and historical revision-6 AWS/CockroachDB Cloud
+receipts.
 
 | Requirement | Fleet Recall evidence | Status |
 |---|---|---|
 | New project created during the contest | This repository; Recall and OSTK are disclosed as pre-existing foundations | Public initial history published and boundary documented |
-| Agentic application | The standalone deterministic reference policy agent recalls fleet state, applies an explicit rollout-safety policy, and persists cited actions; separately deployment-bound A/B/C identities exercise the full memory/action/conflict chain | Historical revision-6 run `devpost-final6-20260814T143523Z` proved decision/action/incompatible/escalation claims 15/16/17/18 and open conflict 5 across four one-off Fargate tasks; the separate revision-6 self-audit proved source-backed claims 9/10 and open conflict 3. These agent proofs were not rerun on revision 7. OSTK is strictly optional, and no LLM decision or live model run is claimed |
-| CockroachDB persistent memory layer | Corpus, claim ledger, source support, conflicts, receipts, actions, and events in CockroachDB | The live revision-7 rich-seed task exited zero and upserted exactly 548 rows: 342 documentation, 2 code, and 204 operations chunks. Public smoke verification returned both exact conflict mappings, four relevant conflict-free answers, and zero results/zero conflicts for nonsense. The public status surface reports CockroachDB Cloud 26.2.5 with schema version 2 and the required capabilities |
+| Agentic application | The standalone deterministic reference policy agent recalls fleet state, applies an explicit rollout-safety policy, and persists cited actions; separately deployment-bound A/B/C identities exercise the full memory/action/conflict chain | Historical revision-6 run `devpost-final6-20260814T143523Z` proved decision/action/incompatible/escalation claims 15/16/17/18 and open conflict 5 across four one-off Fargate tasks; the separate revision-6 self-audit proved source-backed claims 9/10 and open conflict 3. These agent proofs were not rerun for revision 10. OSTK is strictly optional, and no LLM decision or live model run is claimed |
+| CockroachDB persistent memory layer | Corpus, claim ledger, source support, conflicts, receipts, actions, and events in CockroachDB | The live revision-10 idempotent rich-seed task exited zero and upserted exactly 552 rows: 346 documentation, 2 code, and 204 operations chunks. The public API returned repository-backed hits with the exact release revision and source-line ranges, and the final seven-query smoke gate passed. The public status surface reports CockroachDB Cloud 26.2.5 with schema version 2 and the required capabilities; the checked-in seven-query receipt remains historical revision-7 evidence |
 | Distributed Vector Indexing | Prefix-scoped `VECTOR(512)` indexes for chunks and claim passages | Live status confirms the vector, lexical, conflict-membership, and claim-support-chunk indexes plus cosine distance and dimension 512; lexical/dense RRF returned the expected claims and projected an exact source-backed conflict. The [publication-safe Cloud `EXPLAIN`](evidence/cockroach-cloud-explain.txt) verifies both C-SPANN indexes and the lexical inverted index with the exact production SQL shapes on 10,001 disposable rows; all assertions passed |
 | Second CockroachDB tool | The coding agent invoked the pinned official Agent Skills to review and shape transactions, SQL, tests, and runbooks; see `AGENT_SKILLS_AUDIT.md` | Implemented and audited with a skill-to-code/test trace |
-| AWS service | ECS/Fargate behind ALB and CloudFront, private S3 model delivery, immutable ECR image, Secrets Manager database URLs, CloudWatch evidence, plus the LocalStack contract harness | Serving, migration, seed, and reference-agent task-definition families are revision 7; the rich seed succeeded and the UI/public API were browser- and smoke-verified. The self-audit, four-task reference run, and full serving-task replacement remain historical revision-6 proofs and were not rerun on revision 7 |
+| AWS service | ECS/Fargate behind ALB and CloudFront, private S3 model delivery, immutable ECR image, Secrets Manager database URLs, CloudWatch evidence, plus the LocalStack contract harness | Serving, migration, seed, and reference-agent task-definition families are revision 10; the service is 1/1 healthy, the 552-row rich seed succeeded, and final desktop/390px mobile QA verified safe Markdown, immutable line links, a code-styled relative repository anchor, and no overflow. The self-audit, four-task reference run, and full serving-task replacement remain historical revision-6 proofs and were not rerun for revision 10 |
 | Public open-source repository | Public GitHub repository with explicit pre-existing-code disclosure | Published and anonymously verified |
-| Working demo URL | Public read-only status/demo surface at <https://d13zrqfh66r7ub.cloudfront.net> | Live and browser-verified through CloudFront; `/healthz`, `/api/status`, and the seven-query bounded hybrid-recall smoke check succeeded |
+| Working demo URL | Public read-only status/demo surface at <https://d13zrqfh66r7ub.cloudfront.net> | Live and browser-verified through CloudFront at desktop and 390px mobile sizes; the revision-10 service is 1/1 healthy, current API results carry exact immutable source coordinates, and the final seven-query smoke gate passed |
 | Public video under three minutes | Live AWS UI plus reviewed cloud agent/replacement receipts by default; standalone Fleet Recall is optional local terminal footage, and OSTK is an optional alternate | 46-second 1600×900 sanitized rehearsal rendered; final cloud footage, narration, and public upload pending |
 | Judging availability | Functional demo and testing access must remain free and unrestricted through **September 15, 2026 at 5:00 PM EDT / 4:00 PM CDT** | Live operational hold is now required; do not scale down, destroy, revoke access, or tear down the submission stack before judging ends |
 
@@ -61,15 +62,23 @@ Official references:
   LocalStack contracts, checked-in sanitized rehearsal JSON, and a fresh
   standalone MCP video capture. These prove application behavior but not AWS or
   CockroachDB Cloud operation.
-- **Current cloud release:** immutable ARM64 image tag `git-efe6fbf4e2f1` at
-  source commit `efe6fbf4e2f1c5b9daab2c5f4f65ebf38a49770f` runs with all four
-  task-definition families at revision 7. The rich-seed task exited zero and
-  upserted exactly 548 rows (342 documentation, 2 code, and 204 operations).
-  The browser-verified UI and seven-query public smoke check confirmed exact
-  specification/code and migration conflict mappings, relevant conflict-free
-  CockroachDB, Rust, project-purpose, and datastore-library results, and zero
-  results/zero conflicts for nonsense. All five CI jobs passed in run
-  [`31821458425`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31821458425).
+- **Current cloud release:** immutable ARM64 image tag `git-56b577c82b9c` at
+  source commit `56b577c82b9c5a5c80d73103f7f6b56d51698872` runs with all four
+  task-definition families at revision 10, and the service is 1/1 healthy. The
+  idempotent rich-seed task exited zero and upserted exactly 552 rows (346 documentation,
+  2 code, and 204 operations). Public API results exposed the exact release
+  revision and inclusive source-line ranges. Final desktop and 390px mobile QA
+  verified safe inline Markdown, immutable exact `#Lx-Ly` links, a relative
+  repository link rendered as a code-styled anchor, and no horizontal overflow.
+  The final seven-query smoke gate passed. The ECR Basic OS-package scan completed with an empty
+  finding-severity count; it does not cover Rust, Go, or application
+  dependencies. All five CI jobs passed in run
+  [`31832684235`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31832684235).
+- **Historical revision-7 public relevance evidence:** the checked-in
+  [seven-query receipt](evidence/public-relevance-efe6fbf-20260814.json) records
+  both exact conflict mappings, four relevant conflict-free answers, and zero
+  results/zero conflicts for nonsense against the prior 548-row release. It was
+  not regenerated for revision 10 and is not the revision-10 smoke receipt.
 - **Historical revision-6 cloud evidence:** the checked-in, publication-safe
   [self-audit receipt](evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json)
   proves semantic recall surfaced the exact documentation/code sources behind
@@ -83,15 +92,15 @@ Official references:
   prove a fully disjoint revision-6 serving-task replacement preserved exact
   public claims 16 and 18 through lexical/dense RRF. The public HTTPS surface
   reported CockroachDB 26.2.5/schema 2 and all required capabilities. These
-  reference-agent and replacement receipts were not rerun on revision 7 and
-  must not be presented as revision-7 proof. The publication-safe
+  reference-agent and replacement receipts were not rerun for revision 10 and
+  must not be presented as revision-10 proof. The publication-safe
   [Cloud `EXPLAIN`](evidence/cockroach-cloud-explain.txt) used the exact
   production SQL shapes against a separate 10,001-row database and selected
   `memory_chunks_semantic_idx`, `memory_chunks_source_semantic_idx`, and
   `memory_chunks_lexical_idx`; all assertions passed. Production data was
   untouched, the disposable database was dropped, and the temporary
   workstation network rule was removed; that plan capture was also not rerun
-  during the revision-7 cutover. Viewer HTTPS uses CloudFront's default
+  during the revision-10 cutover. Viewer HTTPS uses CloudFront's default
   certificate and
   TLSv1-minimum policy; the restricted CloudFront-to-ALB origin hop is HTTP, so
   this is neither end-to-end TLS nor a TLS 1.2 viewer-minimum claim.
