@@ -35,20 +35,47 @@ hackathon slice. Additional canonical Recall actions are also future work.
 
 ## Evidence status
 
-Local CockroachDB tests, the passing combined LocalStack contract smoke, and
-the sanitized video rehearsal are application evidence only; they are not
-proof of an AWS or CockroachDB Cloud deployment. The Terraform reference-agent
-task and `deploy/aws/run-reference-agent.sh` are implemented as the default
-cloud proof path, but the real AWS/CockroachDB Cloud run, post-replacement
-recall, and public HTTPS URL remain pending. Bracketed release placeholders in
-[`docs/SUBMISSION.md`](docs/SUBMISSION.md) stay unresolved until those live
-artifacts exist.
+The submission candidate is live at
+[https://d13zrqfh66r7ub.cloudfront.net](https://d13zrqfh66r7ub.cloudfront.net).
+The migration and three-record seed tasks completed against CockroachDB Cloud.
+The public status surface reports CockroachDB 26.2.5, schema version 1, enabled
+vector, lexical, and conflict-membership indexes, working cosine distance, and
+the pinned 512-dimension embedding model.
+
+The final-image reference run `devpost-final-20260814T021819Z`, using
+reference-agent task definition revision 3, verified the complete policy chain
+across four one-off Fargate tasks: decision claim 5, cited action claim 6,
+incompatible claim 7, and escalation claim 8 citing open conflict 2. Public
+hybrid lexical/dense RRF then observed the exact persisted action and
+escalation claims 6 and 8. A forced deployment of serving task definition
+revision 3 replaced the complete task set with a fully disjoint set, and the
+replacement observed those same exact claims through the same hybrid path. This
+is live AWS/CockroachDB Cloud evidence; LocalStack and local tests remain
+preflight evidence only.
+
+HTTPS is provided by CloudFront's default certificate. AWS fixes that
+generated-hostname viewer policy at a TLSv1 minimum, although newer TLS can be
+negotiated. CloudFront reaches the ALB over restricted HTTP, guarded by the
+CloudFront origin-facing prefix list and a secret origin header, so this is not
+an end-to-end-TLS or TLS-1.2-minimum claim.
+
+The publication-safe
+[CockroachDB Cloud `EXPLAIN` artifact](docs/evidence/cockroach-cloud-explain.txt)
+records all assertions passing for the exact production project-vector,
+source-vector, and lexical SQL shapes on a 10,001-row disposable fixture. The
+plans select `memory_chunks_semantic_idx`,
+`memory_chunks_source_semantic_idx`, and `memory_chunks_lexical_idx`. The
+production database was untouched, the fixture database was dropped, and the
+temporary workstation network rule was removed. The final public video and
+remaining entrant/Devpost fields are still release gates. CI is green at
+`19e626b`, including the CloudFront front door and the follow-up patched Go
+builder image.
 
 The default final video path is a fresh standalone Fleet Recall MCP capture and
 render. A verified OSTK render may be used only as an explicitly optional
 alternate; neither the core demo nor the cloud proof requires it.
 
-After the public judging deployment exists, keep it free and unrestricted
+Keep the public judging deployment free and unrestricted
 through **September 15, 2026 at 5:00 PM EDT / 4:00 PM CDT**. Do not scale it to
 zero or tear down its AWS, CockroachDB Cloud, DNS/TLS, model, secret, logging,
 or network dependencies before that hold expires.
@@ -429,10 +456,9 @@ only one-row functional behavior.
 - [Cloud onboarding](docs/CLOUD_ONBOARDING.md): explicit AWS/CockroachDB account,
   approval, cost, identity, TLS, model, and teardown gates.
 - [AWS Terraform runbook](deploy/aws/README.md): dormant-by-default ECS/Fargate,
-  ALB, ECR, S3, Secrets Manager, and CloudWatch infrastructure, including the
-  four-step deterministic reference-agent proof flow. It requires a real
-  staging gate; this repository does **not claim that AWS or CockroachDB Cloud
-  is deployed**.
+  ALB, CloudFront, ECR, S3, Secrets Manager, and CloudWatch infrastructure,
+  including the four-step deterministic reference-agent proof flow and the
+  sanitized record of the live submission deployment.
 - [Architecture](docs/ARCHITECTURE.md),
   [migration operations](docs/MIGRATIONS.md), and
   [security policy](docs/SECURITY.md).

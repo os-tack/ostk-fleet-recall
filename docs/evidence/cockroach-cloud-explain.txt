@@ -1,0 +1,141 @@
+CockroachDB Cloud EXPLAIN evidence
+==================================
+
+Captured (UTC): 2026-08-14T02:27:45Z
+Environment: CockroachDB Cloud Basic, AWS us-east-1
+Server: CockroachDB CCL v26.2.5
+Fixture: 10,001 synthetic rows in a disposable logical database
+Source revision: 19e626bd52822a6b880efd2af37272f92dd59fa8
+
+Isolation and cleanup
+---------------------
+
+The fixture database was separate from the production database. The production
+database was neither queried nor modified by this proof. After the plans were
+captured, the disposable database was dropped and the temporary workstation
+network rule was removed.
+
+Method
+------
+
+The proof used the exact project-scoped vector, source-scoped vector, and
+selective lexical SQL shapes defined in src/store/cockroach.rs. Parameters were
+bound with SQLx, as they are in the application. Database, tenant, and project
+identities below are publication-safe placeholders.
+
+Project-scoped vector query shape
+---------------------------------
+
+SELECT chunk_id, (embedding <=> $3::VECTOR(512))::FLOAT4 AS score
+FROM memory_chunks
+WHERE tenant_id = $1
+  AND project = $2
+ORDER BY embedding <=> $3::VECTOR(512)
+LIMIT $4
+
+Actual sanitized EXPLAIN plan:
+
+distribution: local
+
+• top-k
+│ estimated row count: 10
+│ order: +column27
+│ k: 10
+│
+└── • render
+    │
+    └── • lookup join
+        │ table: memory_chunks@memory_chunks_pkey
+        │ equality: (tenant_id, project, chunk_id) = (tenant_id, project, chunk_id)
+        │ equality cols are key
+        │
+        └── • vector search
+              table: memory_chunks@memory_chunks_semantic_idx
+              target count: 10
+              prefix spans: [/'<tenant-uuid>'/'<isolated-project>' - /'<tenant-uuid>'/'<isolated-project>']
+
+Assertion: PASS — C-SPANN vector search selected memory_chunks_semantic_idx.
+
+Source-scoped vector query shape
+--------------------------------
+
+SELECT chunk_id, (embedding <=> $4::VECTOR(512))::FLOAT4 AS score
+FROM memory_chunks
+WHERE tenant_id = $1
+  AND project = $2
+  AND source = $3
+ORDER BY embedding <=> $4::VECTOR(512)
+LIMIT $5
+
+Actual sanitized EXPLAIN plan:
+
+distribution: local
+
+• top-k
+│ estimated row count: 10
+│ order: +column27
+│ k: 10
+│
+└── • render
+    │
+    └── • lookup join
+        │ table: memory_chunks@memory_chunks_pkey
+        │ equality: (tenant_id, project, chunk_id) = (tenant_id, project, chunk_id)
+        │ equality cols are key
+        │
+        └── • vector search
+              table: memory_chunks@memory_chunks_source_semantic_idx
+              target count: 10
+              prefix spans: [/'<tenant-uuid>'/'<isolated-project>'/'markdown' - /'<tenant-uuid>'/'<isolated-project>'/'markdown']
+
+Assertion: PASS — C-SPANN vector search selected
+memory_chunks_source_semantic_idx.
+
+Selective lexical query shape
+-----------------------------
+
+SELECT chunk_id,
+       ts_rank(search_document, plainto_tsquery('english', $3))::FLOAT4 AS score
+FROM memory_chunks
+WHERE tenant_id = $1
+  AND project = $2
+  AND search_document @@ plainto_tsquery('english', $3)
+  AND ($4::STRING IS NULL OR source = $4)
+  AND ($5::TIMESTAMPTZ IS NULL OR source_timestamp >= $5)
+  AND ($6::TIMESTAMPTZ IS NULL OR source_timestamp < $6)
+ORDER BY score DESC, chunk_id
+LIMIT $7
+
+Actual sanitized EXPLAIN plan after fresh 10,001-row statistics became visible:
+
+distribution: local
+
+• top-k
+│ estimated row count: 10
+│ order: -score,+chunk_id
+│ k: 10
+│
+└── • render
+    │
+    └── • index join
+        │ estimated row count: 3,334
+        │ table: memory_chunks@memory_chunks_pkey
+        │
+        └── • scan
+              estimated row count: 1 (0.01% of the table; stats collected 2 minutes ago)
+              table: memory_chunks@memory_chunks_lexical_idx
+              spans: 1 span
+
+Assertion: PASS — selective lexical search selected
+memory_chunks_lexical_idx.
+
+Statistics visibility caveat
+----------------------------
+
+In the original long-lived test connection, the lexical EXPLAIN ran immediately
+after ANALYZE and briefly saw the pre-load zero-row automatic statistics; it
+selected the primary index. A fresh session then saw the completed 10,001-row
+statistics and selected memory_chunks_lexical_idx as shown above. Session-only
+checks with canary_stats_mode forced to both stable and canary also selected the
+same lexical index and passed all three assertions. The two vector plans used
+their intended C-SPANN indexes before and after the statistics refresh.

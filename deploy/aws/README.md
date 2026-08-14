@@ -10,11 +10,14 @@ The module is intentionally safe to bootstrap: its default service and
 autoscaling minimum are zero. Run the one-off migration successfully before
 starting any application task.
 
-This is a deployment runbook, not deployment evidence. As of the current
-repository state, the real AWS/CockroachDB Cloud run, public HTTPS URL, cloud
-query plans, reference-agent result, and post-replacement recall are pending.
-Keep those claims and their submission placeholders unresolved until the live
-commands succeed and their redacted artifacts are reviewed.
+This remains the reproducible deployment runbook. Its live submission candidate
+is available at <https://d13zrqfh66r7ub.cloudfront.net>. Migration and the
+three-record seed succeeded; CockroachDB Cloud status reports version
+26.2.5/schema 1 and all required capabilities; the four-task reference-agent
+run and a complete serving-task-set replacement both verified exact hybrid
+recall. Publication-safe Cloud `EXPLAIN` also verifies the exact production SQL
+shapes and all three intended indexes. The final public video and
+entrant-controlled Devpost fields remain pending.
 
 ## Prerequisites
 
@@ -218,6 +221,12 @@ least-privileged. The managed prefix list consumes 55 security-group rule quota
 entries; confirm the account's security-group quota before enabling this mode.
 Distribution creation and updates can take several minutes.
 
+The live candidate selected CloudFront mode and currently resolves at
+<https://d13zrqfh66r7ub.cloudfront.net>. This proves viewer HTTPS with the
+default CloudFront certificate; it does **not** prove end-to-end TLS or a TLS
+1.2 viewer minimum because the viewer policy has a TLSv1 minimum and the
+CloudFront-to-ALB hop is restricted HTTP.
+
 After the first successful recall, force one ECS task replacement and repeat
 the exact query. The replacement must return a hit from the unchanged
 CockroachDB corpus before the URL is used in Devpost.
@@ -312,6 +321,15 @@ run/project names, the demo URL, cluster coordinate, task IDs, and model/version
 metadata before sharing it. Never supplement it with the database URL, account
 ID, task ARN, secret ARN, or raw CloudWatch log export.
 
+The final-image run `devpost-final-20260814T021819Z` satisfied these checks
+across four one-off Fargate tasks using reference-agent task definition
+revision 3. It correlated decision claim 5, action claim 6 citing it,
+incompatible claim 7, open conflict 2, and escalation claim 8 citing that
+conflict. Its public verification observed exact action/escalation claims 6 and
+8 through lexical/dense RRF, with CockroachDB 26.2.5, schema version 1, all
+three required index capability flags, working cosine distance, and embedding
+dimension 512.
+
 ## 8. Replace the complete serving task set and prove persistence
 
 Preserve the verified reference-agent receipt, then use it to force a fresh ECS
@@ -348,17 +366,33 @@ secret-bearing keys, and raw log-stream fields. Its success output is marked
 `validation_only: true`; it validates live receipts but is not a substitute for
 running either live wrapper.
 
-## Cloud `EXPLAIN` boundary
+For the same final-image run, the replacement wrapper exercised serving task
+definition revision 3 and changed the complete task set to a fully disjoint
+set. Desired count remained one, the service returned ready, and the
+before/after public checks observed the same exact claims 6 and 8 through
+lexical/dense RRF.
+
+## Cloud `EXPLAIN` evidence
 
 Index presence from `/api/status` and observed lexical+dense RRF are not a
-substitute for the required representative Cloud `EXPLAIN`. The existing Rust
-plan test inserts more than 10,000 rows and is explicitly limited to a
-disposable database; do not point it at the submission corpus merely to fill
-the evidence checkbox. A publication-safe Cloud plan receipt remains pending
-until it can run the production query shapes against a separately approved
-disposable CockroachDB Cloud database (or through a bounded one-off diagnostic
-task) without exposing the database URL. Keep `[CAPTURE_CLOUD_PLAN]` unresolved
-until that real plan is captured and reviewed.
+substitute for physical plan evidence. The publication-safe
+[CockroachDB Cloud `EXPLAIN` artifact](../../docs/evidence/cockroach-cloud-explain.txt)
+records that evidence with SHA-256
+`0ec1fb873b2305adaf7f83a39c09e1132a7f1916d0c962a153823dd1bcff28f2`.
+
+The proof ran the exact production project-vector, source-vector, and selective
+lexical SQL shapes through SQLx against a 10,001-row disposable logical
+database on CockroachDB Cloud Basic, AWS `us-east-1`, version 26.2.5. The plans
+select `vector search` with `memory_chunks_semantic_idx`, `vector search` with
+`memory_chunks_source_semantic_idx`, and `scan` with
+`memory_chunks_lexical_idx`; all assertions pass.
+
+The lexical query initially ran immediately after `ANALYZE` on a long-lived
+connection and briefly saw stale zero-row statistics. The unchanged query
+selected the inverted index after fresh statistics became visible roughly two
+minutes later. No `FORCE_INDEX` hint was used or implied. The production
+database was neither queried nor modified, the disposable database was
+dropped, and the temporary workstation network rule was removed after capture.
 
 ## Runtime and least privilege
 
@@ -376,9 +410,10 @@ until that real plan is captured and reviewed.
 - Multiply `max_database_connections` by `autoscaling_max_capacity` before
   selecting the CockroachDB Cloud connection limit. The default is eight per
   task.
-- CloudWatch retains application logs for 60 days by default to preserve
-  judging evidence. Container Insights, ECR image scanning, deployment rollback,
-  ALB deletion protection, and ALB invalid-header dropping are enabled.
+- CloudWatch retains application logs for 60 days to preserve judging evidence.
+  ECR image scanning, deployment rollback, ALB deletion protection, and ALB
+  invalid-header dropping are enabled. Container Insights is configurable but
+  disabled on the cost-constrained live candidate.
 
 The broad service egress rule supports CockroachDB Cloud and all AWS control
 plane endpoints. For a long-lived production deployment, replace internet

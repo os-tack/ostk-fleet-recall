@@ -91,10 +91,12 @@ hide them.
 3. **The public demo has broad outbound network egress.** Terraform narrows
    inbound traffic and IAM resources, but a production VPC should use AWS
    service endpoints/prefix lists and private CockroachDB connectivity.
-4. **Operational monitoring is scaffolded, not yet baselined in AWS.** ECS
-   Container Insights and CloudWatch logs are enabled. Production promotion
-   still requires retry-rate, p99 latency, long-transaction, contention, and
-   hot-range alert thresholds measured under representative load.
+4. **Operational monitoring is scaffolded, not yet baselined in AWS.**
+   CloudWatch application logs are enabled with 60-day retention. Terraform
+   supports optional ECS Container Insights, but the cost-constrained live
+   candidate leaves it disabled. Production promotion still requires
+   retry-rate, p99 latency, long-transaction, contention, and hot-range alert
+   thresholds measured under representative load.
 
 ## Reproduction gate
 

@@ -2,9 +2,11 @@
 
 This is a working, copy-ready submission packet for the CockroachDB AI Agents
 Hackathon. Bracketed fields are release blockers, not claims. Replace them only
-after the linked artifact is public and verified. Until the cloud gates pass,
-deployment-specific narrative below describes the submission target rather
-than an already-running service; the release-state table is authoritative.
+after the linked artifact is public and verified. The AWS/CockroachDB Cloud
+deployment, reference-agent run, replacement proof, and representative Cloud
+`EXPLAIN` are now verified. The final public video and entrant-controlled
+Devpost fields remain release blockers. The release-state table is
+authoritative.
 
 Submission deadline: **August 18, 2026 at 5:00 PM EDT / 4:00 PM CDT**.
 The submitted project must remain available free of charge and without
@@ -28,17 +30,23 @@ Durable, conflict-aware semantic memory for fleets of AI agents.
 
 **Working demo**
 
-`[PUBLIC_HTTPS_DEMO_URL]`
+<https://d13zrqfh66r7ub.cloudfront.net>
 
 **Testing instructions**
 
 Open the working-demo URL without signing in. Enter “How does fleet memory
 survive agent restarts?” in the recall form and submit; the result should show
 bounded CockroachDB-backed hits and their source metadata. Then open
-`[PUBLIC_HTTPS_DEMO_URL]/healthz` and confirm `{"status":"ready"}`. The public
+<https://d13zrqfh66r7ub.cloudfront.net/healthz> and confirm
+`{"status":"ready"}`. The public
 surface is intentionally read-only: `/`, `/healthz`, `/api/status`, and bounded
-`POST /api/recall`; no mutation credential is needed or exposed. Replace the
-URL placeholder with the canonical origin before pasting these instructions.
+`POST /api/recall`; no mutation credential is needed or exposed.
+
+The public URL uses CloudFront's default certificate. Its generated-hostname
+viewer policy has a TLSv1 minimum and may negotiate newer TLS; CloudFront uses
+restricted HTTP to the ALB origin. The origin accepts only the CloudFront
+origin-facing prefix list plus a secret header. Do not describe this topology
+as end-to-end TLS or as enforcing TLS 1.2 at the viewer.
 
 **Demo video (under three minutes)**
 
@@ -51,15 +59,14 @@ URL placeholder with the canonical origin before pasting these instructions.
 **Built-with tags**
 
 `Rust`, `CockroachDB`, `Vector Search`, `Agent Skills`, `AWS`, `Amazon ECS`,
-`AWS Fargate`, `Amazon S3`, `Application Load Balancer`, `Amazon ECR`,
-`AWS Secrets Manager`, `Amazon CloudWatch`, `Terraform`, `MCP`, `model2vec`,
-`Axum`, `SQLx`. Add `OSTK` only if the optional adapter is actually used in a
-final captured artifact; it is not part of the default proof path.
+`AWS Fargate`, `Amazon S3`, `Application Load Balancer`, `Amazon CloudFront`,
+`Amazon ECR`, `AWS Secrets Manager`, `Amazon CloudWatch`, `Terraform`, `MCP`,
+`model2vec`, `Axum`, `SQLx`. Add `OSTK` only if the optional adapter is actually
+used in a final captured artifact; it is not part of the default proof path.
 
-This is the target tag list, not permission to claim a provisioned service.
-Before submission, remove any AWS service that was not exercised in the final
-deployment and evidence capture. “Configured in Terraform” is weaker than the
-rules' requirement that listed components be meaningfully integrated.
+The listed AWS services were exercised by the live deployment and evidence
+capture, not merely declared in Terraform. Remove a tag before submission if
+its live integration is later removed or cannot be shown safely.
 
 **Qualifying checkboxes**
 
@@ -113,10 +120,11 @@ Every Fleet Recall process is bound to a trusted tenant/project scope. Mutations
 serializable and idempotent: an identical canonical request retried with the
 same tenant-wide key produces at most one durable claim, receipt, and audit
 trail, while independent incompatible writes remain distinct and become an
-explicit conflict. ECS workers are disposable;
-the final deployment will keep CockroachDB Cloud as the memory source of truth
-after every task is replaced. That cloud persistence claim remains gated until
-the real deployment and replacement capture pass.
+explicit conflict. ECS workers are disposable; the live deployment keeps
+CockroachDB Cloud as the memory source of truth after every task is replaced.
+A forced deployment changed the complete serving task set to a fully disjoint
+set, while public lexical/dense RRF continued to return the exact action and
+escalation claims 6 and 8.
 
 The submission core does not depend on OSTK or an LLM. Its default AWS agent is
 a standalone deterministic reference policy implemented in Fleet Recall. Four
@@ -133,12 +141,12 @@ authorized live run produces verified evidence. Its boundary is documented in
 
 ## How we built it
 
-- **Rust 1.94** application and MCP protocol with bounded inputs/outputs. The
-  production Dockerfile's `rust:1.94-bookworm` release build has completed
-  locally; this is build evidence, not a hosted-deployment claim.
-- **CockroachDB Cloud** is the final deployment target for corpus chunks, typed
-  claims, passage vectors, conflicts, idempotency receipts, and events. The
-  corresponding live verification remains pending.
+- **Rust 1.94** application and MCP protocol with bounded inputs/outputs,
+  running as the immutable ARM64 production image on ECS/Fargate.
+- **CockroachDB Cloud 26.2.5** is the live memory plane for corpus chunks,
+  typed claims, passage vectors, conflicts, idempotency receipts, and events.
+  Migration and the three-record seed completed; `/api/status` reports schema
+  version 1 and the required database capabilities.
 - **Distributed Vector Indexing** with project- and source-prefixed
   `VECTOR(512)` cosine indexes, plus a stored `TSVECTOR` inverted index for
   hybrid recall.
@@ -147,14 +155,19 @@ authorized live run produces verified evidence. Its boundary is documented in
   fresh `40001` retry loop, embedding-outside-transaction boundary, SQL
   invariants, connection pooling, concurrency tests, and EXPLAIN plan gates.
   The full skill-to-code/test trace is in `docs/AGENT_SKILLS_AUDIT.md`.
-- The checked-in **AWS ECS/Fargate and Application Load Balancer** deployment
-  targets a replaceable public demo task, **S3** for private content-addressed
-  model delivery, **Secrets Manager** for Cockroach TLS URLs, **ECR** for
-  scanned immutable images, and **CloudWatch** for logs/Container Insights. A
+- The checked-in **AWS ECS/Fargate, Application Load Balancer, and CloudFront**
+  deployment targets a replaceable public demo task, **S3** for private
+  content-addressed model delivery, **Secrets Manager** for Cockroach TLS URLs,
+  **ECR** for scanned immutable images, and **CloudWatch** for logs/Container
+  Insights. A
   dedicated one-off Fargate task definition runs the deterministic reference
   policy agent under A/B/C deployment identities;
   `deploy/aws/run-reference-agent.sh` verifies their correlated durable-memory
-  chain. Real AWS execution remains a release gate.
+  chain. Final-image run `devpost-final-20260814T021819Z`, using reference-agent
+  task definition revision 3, verified decision/action/incompatible/escalation
+  claims 5/6/7/8 and open conflict 2 across all four tasks. The replacement
+  wrapper verified exact claims 6 and 8 after a fully disjoint serving-task-set
+  change.
 - Backend-neutral corpus traits extracted into upstream `ostk-recall`, pinned
   by immutable Git revision so the local and fleet stores share retrieval
   contracts without making local Recall depend on CockroachDB.
@@ -189,8 +202,8 @@ and makes contention a normal, tested path.
 - Real CockroachDB capability and query-plan tests, including representative
   C-SPANN and inverted-index evidence.
 - A dormant-by-default AWS Terraform deployment definition that separates
-  one-off DDL credentials from the least-privilege runtime secret; live AWS
-  deployment remains pending.
+  one-off DDL credentials from the least-privilege runtime secret, now proven
+  through live migration, seed, serving, four-task agent, and replacement runs.
 
 ## What we learned
 
@@ -225,12 +238,12 @@ Git history and pinned revisions make that boundary inspectable.
 
 | Requirement | Evidence to show judges | Release state |
 |---|---|---|
-| CockroachDB persistent memory | Local 26.2 schema/round-trip/conflict tests; cloud reference-agent, health, and restart capture | Local ready; `[VERIFY_ON_CLOUD]` |
-| Distributed Vector Indexing | DDL and local representative `EXPLAIN`; cloud plan and reference-agent lexical+dense RRF capture | Local ready; `[CAPTURE_CLOUD_PLAN]` |
+| CockroachDB persistent memory | Local 26.2 schema/round-trip/conflict tests; cloud reference-agent, health, and restart capture | Live Cloud 26.2.5/schema 1; migration, seed, four-task chain, and exact post-replacement recall verified |
+| Distributed Vector Indexing | DDL and local representative `EXPLAIN`; cloud plan and reference-agent lexical+dense RRF capture | Live capability flags, cosine operation, dimension 512, and lexical/dense RRF verified. The [publication-safe Cloud `EXPLAIN`](evidence/cockroach-cloud-explain.txt) selects both C-SPANN indexes and the lexical inverted index for the exact production SQL shapes on 10,001 disposable rows; all assertions passed |
 | CockroachDB Agent Skills | Pinned coding-agent invocation audit mapping each skill to decisions, code/tests, and accepted deviations | Ready in repository |
-| AWS service | ECS/ALB/S3/Secrets/ECR/CloudWatch Terraform; one-off reference-agent task/wrapper; LocalStack contract harness | Combined LocalStack migration/ingest/fleet/replacement smoke passed; `[DEPLOY_AND_CAPTURE]` in real AWS remains pending |
+| AWS service | ECS/ALB/CloudFront/S3/Secrets/ECR/CloudWatch Terraform; one-off reference-agent task/wrapper; LocalStack contract harness | Live AWS migration/seed, healthy service, four reference-agent Fargate tasks, and complete serving-task replacement verified |
 | Public open source | Source, licenses, locked dependencies, setup and sample data | Published and anonymously verified at <https://github.com/os-tack/ostk-fleet-recall> |
-| Functional URL | HTTPS landing page, bounded recall, `/healthz` | Local HTTP healthy with recall hits; `[DEPLOY_AND_SMOKE_TEST]` pending |
+| Functional URL | HTTPS landing page, bounded recall, `/healthz` | Live at <https://d13zrqfh66r7ub.cloudfront.net>; health, status, and hybrid recall verified |
 | Public video <3 min | Fresh standalone Fleet Recall capture/render by default, cloud proof footage, then YouTube/Vimeo link and final duration; OSTK is an optional alternate | 46-second 1600×900 sanitized rehearsal rendered; `[RENDER_LIVE_NARRATE_AND_UPLOAD]` |
 
 ## Judging-criteria evidence map
@@ -241,10 +254,10 @@ treating successful vector search as the whole project.
 
 | Criterion | Strongest repository evidence | Final proof still to capture |
 |---|---|---|
-| Agentic Memory Design | Hybrid lexical/vector recall, typed claims, provenance, correction-aware conflict membership, and the deterministic A → B → C policy-agent chain | Run `deploy/aws/run-reference-agent.sh` against the submission stack and show its correlated CockroachDB-backed result |
-| Technological Implementation | Prefix-scoped C-SPANN and inverted indexes, backend-neutral Recall extraction, short serializable retries, immutable model identity, conformance and adversarial tests | Capture representative Cloud `EXPLAIN` plans and the deployed image digest |
+| Agentic Memory Design | Hybrid lexical/vector recall, typed claims, provenance, correction-aware conflict membership, and final-image run `devpost-final-20260814T021819Z` across four Fargate tasks | Show a reviewed, redacted excerpt of the correlated CockroachDB-backed result in the final video |
+| Technological Implementation | Prefix-scoped C-SPANN and inverted indexes, backend-neutral Recall extraction, short serializable retries, immutable model identity, conformance and adversarial tests, plus the publication-safe Cloud plan artifact | Show a reviewed excerpt of the three passing Cloud plans and final-image identity in the final video |
 | Real-World Impact | A recalled schema-migration decision changes the next agent's rollout action; an incompatible memory stops rollout and produces a cited operator handoff | Explain how the same pattern applies to long-running coding, operations, and research fleets |
-| Product Readiness | Trusted deployment scope, bounded input/output and hydration, least-privilege runtime/migrator separation, health gates, idempotent receipts, redacted failures, Terraform and restart harness | Show TLS, healthy ECS tasks, CloudWatch, and recall after task replacement without exposing identifiers or secrets |
+| Product Readiness | Trusted deployment scope, bounded input/output and hydration, least-privilege runtime/migrator separation, live HTTPS health, idempotent receipts, four-task proof, and exact recall after full task replacement | Capture final publication-safe footage without exposing identifiers or secrets; explain the CloudFront-to-ALB HTTP boundary accurately |
 | Creativity & Originality | Local Recall stays local-first while Fleet Recall adds a distributed memory plane; disagreement is durable first-class state rather than an overwrite or a hidden rank choice | Make the conflict-aware memory-to-action transition the visual center of the final video |
 
 ## Video script (target 2:45)
@@ -258,8 +271,10 @@ optional alternate take, not a submission dependency.
 
 The local standalone capture proves the displayed application chain but is not
 AWS evidence. The cloud segment must use the real public URL and the verified
-`fleet-reference-agent-run-v1` output from the Fargate wrapper; both remain
-pending until deployment. Do not describe the policy decisions as LLM output.
+`fleet-reference-agent-run-v1` output from the Fargate wrapper. Both now exist
+for final-image run `devpost-final-20260814T021819Z`; only reviewed, redacted
+excerpts belong in the final cut. Do not describe the policy decisions as LLM
+output.
 The final export must also contain narration or another accessible audio track;
 the 46-second silent rehearsal is source footage, not a submission-ready video.
 
@@ -317,18 +332,26 @@ to remember—and disagree—together.” End on the public demo URL and reposit
 - [x] Public repository URL works in a logged-out browser.
 - [x] Licenses, dependency lockfile, sample NDJSON, setup, architecture, and
       pre-existing-work disclosure are present.
-- [x] CI passes from a clean clone on Rust 1.94.
-- [ ] CockroachDB Cloud uses TLS, a non-admin runtime user, backups, and an
+- [x] CI completed green for `19e626b` on Rust 1.94, including the CloudFront
+      front door and patched Go builder image.
+- [x] CockroachDB Cloud uses TLS, a non-admin runtime user, backups, and an
       allowlist/private route.
-- [ ] Run one migration task, then verify `health` and all required indexes.
-- [ ] Capture Cloud `EXPLAIN` evidence with a representative corpus.
-- [ ] Push an immutable ECR image and run at least one healthy ECS task.
-- [ ] Public URL supports landing page, bounded recall, and `/healthz`; mutation
+- [x] Run one migration task, then verify `health` and all required indexes.
+- [x] Capture publication-safe Cloud `EXPLAIN` evidence with the exact
+      production project-vector, source-vector, and lexical SQL shapes on a
+      10,001-row disposable fixture; all three index assertions pass,
+      production was untouched, the fixture database was dropped, and the
+      temporary workstation network rule was removed.
+- [x] Push an immutable ECR image and run at least one healthy ECS task.
+- [x] Public URL supports landing page, bounded recall, and `/healthz`; mutation
       remains unavailable or authenticated/rate-limited.
-- [ ] HTTPS certificate is valid and no secrets appear in HTML, API output,
-      CloudWatch screenshots, shell history, or video.
-- [ ] Stop/replace a task and verify the same memory remains.
-- [ ] Run `deploy/aws/run-reference-agent.sh` against the healthy submission
+- [x] CloudFront's default HTTPS certificate is valid; the TLSv1-minimum viewer
+      policy and restricted HTTP origin hop are documented without overclaim.
+- [ ] Review every final screenshot, shell excerpt, and video frame for secrets
+      and infrastructure identifiers before publication.
+- [x] Stop/replace the complete serving task set and verify the same exact
+      memory remains through lexical/dense RRF.
+- [x] Run `deploy/aws/run-reference-agent.sh` against the healthy submission
       stack; preserve its verified correlated JSON and redacted public-demo
       recall evidence. Do not substitute a local or handcrafted result.
 - [ ] Video is public, under three minutes, legible at 1080p, and explicitly

@@ -6,11 +6,15 @@ billing choices, DNS ownership, or database credentials. Do not place database
 URLs, passwords, AWS access keys, or secret values in this repository,
 Terraform variables, command-line arguments, screenshots, or shell history.
 
-Current release state: the local CockroachDB and LocalStack gates have produced
-local application evidence, while the real AWS deployment, CockroachDB Cloud
-verification, public HTTPS URL, and cloud reference-agent run are still
-pending. Do not present this runbook or its Terraform as proof that those live
-gates have already passed.
+Current release state: the onboarding path has been completed for the live
+submission candidate at
+<https://d13zrqfh66r7ub.cloudfront.net>. Migration and the three-record seed
+succeeded; CockroachDB Cloud reports version 26.2.5/schema 1 and all required
+capabilities; the four-task reference-agent chain and a complete serving-task
+replacement both verified exact hybrid recall. Publication-safe Cloud
+`EXPLAIN` verifies the exact production SQL shapes and all three intended
+indexes on a disposable 10,001-row fixture. The final public video and the
+remaining Devpost fields are still pending.
 
 The labels below are gates:
 
@@ -43,16 +47,17 @@ export AWS_PROFILE AWS_REGION
 aws sts get-caller-identity --query Arn --output text
 ```
 
-Current workstation gaps:
+Deployment-workstation notes:
 
-- AWS CLI, Docker, Buildx, and `jq` are installed.
-- No AWS profile or AWS authentication is configured. The LocalStack token in
-  `.env` is not an AWS credential.
-- Terraform is usable from the cached path above. `deploy/aws/run-migration.sh`
-  requires `terraform` to be on `PATH`.
-- `ccloud`, `cockroach`, `psql`, and `pgcli` are not installed. Install the
-  current CockroachDB CLI using the Cloud **Connect** dialog, or use another
-  supported SQL client, before grants and cloud `EXPLAIN` capture.
+- AWS CLI, Docker, Buildx, `jq`, and the cached Terraform binary were used for
+  the live deployment. AWS SSO sessions are temporary; authenticate again
+  before any follow-up operation.
+- `deploy/aws/run-migration.sh` and the other wrappers require `terraform` to
+  be on `PATH`.
+- The migration, runtime grants, and publication-safe Cloud `EXPLAIN` capture
+  were completed. The plan fixture used a separate logical database; production
+  data was untouched, the fixture database was dropped, and the temporary
+  workstation network rule was removed.
 - The tested bundle is preserved as regular files under the ignored
   `.models/potion-retrieval-32M/hf-6fc8051fab2a1e0ee76689cf08c853792ac285e7/`
   directory. Git does not track the 129 MB weights.
@@ -147,6 +152,18 @@ aws ec2 describe-nat-gateways \
 
 ## 4. Prepare the public HTTPS name
 
+The live submission candidate uses the Terraform CloudFront mode and generated
+hostname <https://d13zrqfh66r7ub.cloudfront.net>; it did not require a custom
+domain or ACM certificate. CloudFront's default certificate terminates viewer
+HTTPS, and AWS fixes the generated-hostname viewer policy at a TLSv1 minimum
+while permitting negotiation of newer TLS. CloudFront connects to the ALB over
+HTTP port 80. The origin is restricted to AWS's CloudFront origin-facing
+managed prefix list and a Terraform-generated secret header. This is not
+end-to-end TLS and must not be described as enforcing a TLS 1.2 viewer minimum.
+
+The following custom-domain path remains available as an alternative, but it
+was not used for this deployment.
+
 **APPROVAL REQUIRED — COST-BEARING:** Approve an existing domain and DNS
 provider, or explicitly approve purchase of a non-refundable domain. Route 53
 hosted zones and DNS queries are billable; domain registration is a separate
@@ -170,8 +187,8 @@ aws acm describe-certificate \
   --output json
 ```
 
-Do not enable the service until the certificate status is `ISSUED` and the
-hostname resolves to the ALB.
+For the custom-domain path only, do not enable the service until the certificate
+status is `ISSUED` and the hostname resolves to the ALB.
 
 ## 5. Create the CockroachDB Cloud memory plane
 
@@ -315,10 +332,10 @@ only those three object ARNs.
 
 **APPROVAL REQUIRED — COST-BEARING:** Approve the Terraform plan before every
 apply. The module creates an ECR repository, ALB, ECS/Fargate definitions,
-CloudWatch log group/Container Insights, IAM roles, security groups, and
-autoscaling resources. The dormant service still leaves the ALB and other
-resources billable. ALB is billed hourly/LCU and running Fargate tasks are
-billed by requested CPU, memory, and storage; see
+CloudWatch log group, IAM roles, security groups, and autoscaling resources;
+Container Insights is optional. The dormant service still leaves the ALB and
+other resources billable. ALB is billed hourly/LCU and running Fargate tasks
+are billed by requested CPU, memory, and storage; see
 [ALB pricing](https://aws.amazon.com/elasticloadbalancing/pricing/) and
 [Fargate pricing](https://aws.amazon.com/fargate/pricing/).
 
@@ -332,7 +349,9 @@ Continue with [the AWS deployment runbook](../deploy/aws/README.md), using:
 - `MODEL_DIGEST` as `embedding_model_sha256`;
 - a generated tenant UUID and the trusted project/agent names;
 - an immutable commit-derived ECR image tag; and
-- the certificate ARN plus exact demo hostname.
+- exactly one public HTTPS mode: `enable_cloudfront = true` with no certificate
+  ARN for the generated hostname (the selected live mode), or a covered ACM
+  certificate ARN plus exact custom demo hostname.
 
 Retain the safe judging defaults from `terraform.tfvars.example`:
 
@@ -343,10 +362,14 @@ enable_deletion_protection = true
 
 Keep `service_desired_count = 0` and `autoscaling_min_capacity = 0` through the
 first apply. Run exactly one migration task, grant the runtime user, run the
-one-off idempotent seed task, and capture cloud `EXPLAIN` evidence. Then approve
-scaling the public service to one, validate HTTPS and recall, force a task
-replacement, and prove recall again. Only after that public demo is running and
-healthy should you run the standalone deterministic reference policy fleet:
+one-off idempotent seed task, then approve scaling the public service to one.
+Validate HTTPS and recall, force a task replacement, and prove recall again.
+Capture representative Cloud `EXPLAIN` separately with the approved bounded
+method before final submission; capability flags and RRF observations are not
+a physical-plan substitute. The completed capture is documented in
+[`docs/evidence/cockroach-cloud-explain.txt`](evidence/cockroach-cloud-explain.txt).
+Only after the public demo is running and healthy should you run the standalone
+deterministic reference policy fleet:
 
 ```bash
 RUN_ID=devpost-cloud-YYYYMMDDTHHMMSSZ
@@ -356,6 +379,23 @@ mkdir -p target/aws-evidence
 jq -e '.schema == "fleet-reference-agent-run-v1" and .verified == true' \
   "target/aws-evidence/reference-agent-$RUN_ID.json"
 ```
+
+For the live deployment, migration and the three-record seed exited
+successfully. Final-image run `devpost-final-20260814T021819Z`, using
+reference-agent task definition revision 3, then verified four Fargate tasks
+and the correlated decision/action/incompatible/escalation claim IDs 5/6/7/8
+with open conflict ID 2. Public lexical/dense RRF observed the exact action and
+escalation claims 6 and 8. The replacement proof changed the complete serving
+task set to a fully disjoint set and observed those same exact claims afterward.
+The separate Cloud `EXPLAIN` proof then exercised the exact production
+project-vector, source-vector, and lexical SQL shapes on a 10,001-row disposable
+fixture. It selected `memory_chunks_semantic_idx`,
+`memory_chunks_source_semantic_idx`, and `memory_chunks_lexical_idx`; all
+assertions passed. Production was untouched, the fixture database was dropped,
+and the temporary workstation network rule was removed. The first lexical plan
+ran immediately after `ANALYZE` and briefly saw stale statistics; the unchanged
+query selected the inverted index once fresh statistics became visible roughly
+two minutes later. No `FORCE_INDEX` hint was used or implied.
 
 The wrapper requires `aws`, `curl`, `jq`, and `terraform`. It derives the real
 Terraform `demo_url`, fails unless `/healthz` succeeds, then starts four one-off
@@ -369,7 +409,7 @@ structured CloudWatch receipt, then uses the public read-only recall API to
 require the exact action and escalation claim IDs. It emits a final JSON object
 only when the AWS tasks, CockroachDB memory chain, and public demo all
 correlate. This is the default AWS agent proof and invokes neither OSTK nor an
-LLM. A local run or Terraform test is not a substitute for this pending
+LLM. A local run or Terraform test is not a substitute for the completed live
 Fargate/CockroachDB Cloud capture.
 
 The receipt includes four per-step task/log coordinates and a `public_demo`

@@ -10,11 +10,13 @@ using OSTK is optional.
 ## Deployment topology
 
 ```mermaid
-flowchart LR
+%%{init: {"flowchart": {"rankSpacing": 46.5}}}%%
+flowchart TB
     visitor["Hackathon judge / demo visitor"]
     operator["Operator"]
-    alb["AWS Application Load Balancer\nHTTPS + /healthz"]
-    demo["ECS/Fargate demo tasks\nread-only HTTP recall"]
+    cloudfront["Amazon CloudFront\nHTTPS viewer endpoint\ncache disabled"]
+    alb["Restricted AWS ALB origin\nCloudFront prefix-list ingress\n403 without secret origin header"]
+    demo["ECS/Fargate demo service\nprivate subnets; read-only recall"]
     seed["One-off ECS seed task\nimmutable sample corpus"]
     policy["Reference policy agents A/B/C\none-off ECS/Fargate tasks"]
     agents["Optional MCP clients\nlocal or separately deployed"]
@@ -24,9 +26,10 @@ flowchart LR
     inputs{"Task-specific inputs\nverified model + scoped TLS URL"}
     crdb[("CockroachDB Cloud\ndistributed SQL + C-SPANN")]
     migrator["One-off ECS migration task\nsingle writer"]
-    logs["CloudWatch Logs\nContainer Insights"]
+    logs["CloudWatch Logs\n60-day retention"]
 
-    visitor -->|HTTPS| alb
+    visitor -->|HTTPS viewer request| cloudfront
+    cloudfront -->|HTTP 80 + generated origin header| alb
     operator -.->|launch evidence run| policy
     alb -->|HTTP 8080| demo
     agents <-->|MCP stdio| mcp
@@ -47,9 +50,17 @@ flowchart LR
     migrator --> logs
 ```
 
-The operator launches the one-off reference-policy evidence run. A hackathon
-judge or other demo visitor reaches only the read-only HTTP demo through the
-public load balancer.
+The public path is deliberately asymmetric. A hackathon judge or demo visitor
+reaches CloudFront over HTTPS. CloudFront then reaches the internet-facing ALB
+over HTTP port 80 and adds a Terraform-generated, 48-character origin header.
+The ALB security group accepts port 80 only from AWS's managed CloudFront
+origin-facing prefix list, and its default listener action returns `403` unless
+that header matches. Accepted requests are forwarded over HTTP 8080 to the demo
+service in private subnets. HTTPS therefore terminates at CloudFront; this path
+is not described as TLS 1.2-minimum or end-to-end TLS.
+
+The operator is separate from that visitor path and uses authenticated AWS
+control-plane tooling to launch the one-off reference-policy evidence run.
 
 The checked-in Terraform provisions the HTTP demo, migration, seed, and
 reference-policy-agent task definitions. The evidence wrapper starts four

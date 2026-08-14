@@ -1,4 +1,4 @@
-# Local evidence
+# Local and cloud evidence
 
 `local-fleet-scenario.json` is the checked-in, sanitized rehearsal form of
 `deploy/localstack/fleet-demo.sh --json` output. The underlying scenario ran
@@ -37,9 +37,8 @@ Manager contracts plus stateless application replacement. LocalStack license
 activation is an external prerequisite, so failure to reach its licensing
 server must not be presented as application evidence.
 
-## Pending cloud receipts
+## Live cloud receipts
 
-After the real AWS/CockroachDB Cloud deployment exists,
 `deploy/aws/run-reference-agent.sh` produces the correlated agent receipt and
 `deploy/aws/run-replacement-proof.sh` produces the full-serving-task-set
 replacement/persistence receipt. Run
@@ -48,7 +47,51 @@ validate and cross-correlate them before publication. The verifier rejects
 common secret and AWS-account leaks, but chosen run/project/service names and
 the public hostname still require human review.
 
-These wrappers and their mock tests are capture tooling, not cloud evidence.
-No checked-in cloud receipt exists yet. Representative CockroachDB Cloud
-`EXPLAIN` evidence also remains a separate pending gate; index-presence status
-and RRF diagnostics do not prove physical plan selection.
+The final-image submission run `devpost-final-20260814T021819Z` produced both
+verified receipts against <https://d13zrqfh66r7ub.cloudfront.net> and
+CockroachDB Cloud. Migration and the three-record seed had already succeeded.
+The reference receipt used task definition revision 3 and correlated four
+one-off Fargate tasks: decision claim 5, action claim 6 citing it, incompatible
+claim 7, open conflict 2, and escalation claim 8 citing that conflict. The
+public check observed exact action/escalation claims 6 and 8. The replacement
+receipt exercised serving task definition revision 3 and recorded a fully
+disjoint task-set change; both before and after observations returned those
+same exact claims through lexical/dense RRF.
+
+The sanitized status proof reports CockroachDB 26.2.5, schema version 1,
+enabled vector, lexical, and conflict-membership indexes, working cosine
+distance, and embedding dimension 512. The receipts and operational logs are
+kept in the ignored operator evidence directory; no raw log, task ARN, account
+ID, secret ARN, credential, or database URL is checked in here.
+
+CloudFront's default certificate protects the viewer connection. Its generated
+hostname uses AWS's TLSv1-minimum viewer policy, and the origin hop to the ALB
+is restricted HTTP rather than end-to-end TLS. Do not claim a TLS 1.2 viewer
+minimum or end-to-end encryption for this topology.
+
+The wrappers' mock tests alone remain capture-tooling evidence, not cloud
+evidence. Index-presence status and RRF diagnostics likewise do not prove
+physical plan selection, so the separate publication-safe
+[CockroachDB Cloud `EXPLAIN` artifact](cockroach-cloud-explain.txt) records that
+proof. Its SHA-256 is
+`0ec1fb873b2305adaf7f83a39c09e1132a7f1916d0c962a153823dd1bcff28f2`.
+
+The capture ran the exact production project-vector, source-vector, and lexical
+SQL shapes through SQLx on CockroachDB Cloud Basic in AWS `us-east-1`, version
+26.2.5, using a disposable 10,001-row fixture. The sanitized plans select:
+
+- `vector search` with `memory_chunks_semantic_idx`;
+- `vector search` with `memory_chunks_source_semantic_idx`; and
+- `scan` with `memory_chunks_lexical_idx`.
+
+All three assertions passed. The first lexical plan ran immediately after
+`ANALYZE` and briefly saw stale zero-row statistics. The unchanged query
+selected the inverted index after the fresh statistics became visible roughly
+two minutes later; the evidence does not use or imply `FORCE_INDEX`. The
+production database was neither queried nor modified, the disposable database
+was dropped, and the temporary workstation network rule was removed after
+capture.
+
+The final public video and Devpost-controlled fields are still pending. CI is
+green at `19e626b`, including the CloudFront front door and the follow-up
+patched Go builder image.
