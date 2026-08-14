@@ -1,0 +1,387 @@
+#!/bin/sh
+set -eu
+
+export LC_ALL=C
+export TZ=UTC
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+manifest=$script_dir/documents.txt
+
+if [ "$#" -ne 0 ]; then
+    printf 'usage: %s > rich-demo.ndjson\n' "$0" >&2
+    exit 64
+fi
+
+for command_name in awk jq; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        printf 'required command not found: %s\n' "$command_name" >&2
+        exit 69
+    fi
+done
+
+if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
+    printf 'document manifest must be a regular, non-symlink file: %s\n' "$manifest" >&2
+    exit 66
+fi
+
+emit_document_chunks() {
+    while IFS='|' read -r relative_path source_area; do
+        case $relative_path in
+            ''|'#'*) continue ;;
+        esac
+        case $relative_path in
+            /*|*'..'*)
+                printf 'unsafe document path in manifest: %s\n' "$relative_path" >&2
+                exit 65
+                ;;
+        esac
+        case $source_area in
+            ''|*[!a-z0-9_]*)
+                printf 'invalid source area in manifest: %s\n' "$source_area" >&2
+                exit 65
+                ;;
+        esac
+
+        document=$repo_root/$relative_path
+        if [ ! -f "$document" ] || [ -L "$document" ]; then
+            printf 'manifest entry must be a regular, non-symlink file: %s\n' "$relative_path" >&2
+            exit 66
+        fi
+
+        awk -v source_path="$relative_path" -v max_chars=1500 '
+            function clean(value) {
+                gsub(/\r/, "", value)
+                gsub(/\t/, " ", value)
+                gsub(/[[:space:]]+/, " ", value)
+                sub(/^ /, "", value)
+                sub(/ $/, "", value)
+                return value
+            }
+
+            function emit_paragraph(value, count, words, prefix, start, end, i, remaining, current) {
+                value = clean(value)
+                if (value == "") {
+                    return
+                }
+
+                prefix = "Source document " source_path
+                if (section != "") {
+                    prefix = prefix "; section " section
+                }
+                prefix = prefix ". "
+                count = split(value, words, " ")
+
+                start = 1
+                while (start <= count) {
+                    current = prefix
+                    end = start - 1
+                    while (end < count && length(current) + length(words[end + 1]) + 1 <= max_chars) {
+                        end++
+                        if (current == prefix) {
+                            current = current words[end]
+                        } else {
+                            current = current " " words[end]
+                        }
+                    }
+
+                    if (end < start) {
+                        end = start
+                        current = prefix words[start]
+                    }
+
+                    if (end < count) {
+                        remaining = length(prefix)
+                        for (i = end + 1; i <= count; i++) {
+                            remaining += length(words[i]) + 1
+                        }
+                        while (remaining < 240 && end > start) {
+                            remaining += length(words[end]) + 1
+                            end--
+                        }
+                        current = prefix words[start]
+                        for (i = start + 1; i <= end; i++) {
+                            current = current " " words[i]
+                        }
+                    }
+
+                    print chunk_index "\t" current
+                    chunk_index++
+                    start = end + 1
+                }
+            }
+
+            function flush() {
+                paragraph = clean(paragraph)
+                if (paragraph == "") {
+                    return
+                }
+                if (length(paragraph) < 120) {
+                    if (pending == "") {
+                        pending = paragraph
+                    } else {
+                        pending = pending " " paragraph
+                    }
+                } else {
+                    if (pending != "") {
+                        paragraph = pending " " paragraph
+                        pending = ""
+                    }
+                    emit_paragraph(paragraph)
+                }
+                paragraph = ""
+            }
+
+            function flush_pending() {
+                if (pending != "") {
+                    emit_paragraph(pending)
+                    pending = ""
+                }
+            }
+
+            BEGIN {
+                chunk_index = 0
+                paragraph = ""
+                pending = ""
+                section = "Overview"
+                in_fence = 0
+            }
+
+            {
+                line = $0
+                sub(/\r$/, "", line)
+                if (line ~ /^[[:space:]]*```/ || line ~ /^[[:space:]]*~~~/) {
+                    if (paragraph == "") {
+                        paragraph = line
+                    } else {
+                        paragraph = paragraph " " line
+                    }
+                    in_fence = !in_fence
+                    next
+                }
+                if (!in_fence && line ~ /^#+[[:space:]]/) {
+                    flush()
+                    flush_pending()
+                    section = line
+                    sub(/^#+[[:space:]]+/, "", section)
+                    section = clean(section)
+                    next
+                }
+                if (line ~ /^[[:space:]]*$/) {
+                    flush()
+                    next
+                }
+                gsub(/\t/, " ", line)
+                if (paragraph == "") {
+                    paragraph = line
+                } else {
+                    paragraph = paragraph " " line
+                }
+            }
+
+            END {
+                flush()
+                flush_pending()
+            }
+        ' "$document" |
+            jq -Rc \
+                --arg source_id "$relative_path" \
+                --arg source_area "$source_area" '
+                    split("\t") as $fields
+                    | {
+                        source: "markdown",
+                        source_id: $source_id,
+                        source_config_id: "rich-demo:docs:v1",
+                        chunk_index: ($fields[0] | tonumber),
+                        text: $fields[1],
+                        role: "usage",
+                        facets: {
+                            dataset: ["rich-demo"],
+                            record_kind: ["documentation"],
+                            source_area: [$source_area],
+                            tags: ["documentation", $source_area]
+                        }
+                    }
+                '
+    done < "$manifest"
+}
+
+emit_operations_narrative() {
+    jq -cn '
+        def week_id($week):
+            "week-" + (if $week < 10 then "0" else "" end) + ($week | tostring);
+
+        def record($week; $slug; $event_type; $status; $role; $scenario; $text; $tags):
+            {
+                source: "markdown",
+                source_id: ("rich-demo/operations/" + week_id($week) + "/" + $slug),
+                source_config_id: "rich-demo:operations:v1",
+                chunk_index: 0,
+                text: ("Synthetic fleet operations narrative, " + week_id($week) + ". " + $text),
+                role: $role,
+                facets: {
+                    dataset: ["rich-demo"],
+                    record_kind: ["operations_narrative"],
+                    source_area: ["fleet_operations"],
+                    event_type: [$event_type],
+                    week: [week_id($week)],
+                    scenario: [$scenario],
+                    status: [$status],
+                    tags: $tags
+                }
+            };
+
+        (
+        [
+            "catalog-api", "checkout-worker", "identity-gateway", "search-indexer",
+            "billing-ledger", "notification-router", "inventory-sync", "audit-exporter",
+            "recommendation-api", "workflow-scheduler", "support-console", "metrics-pipeline"
+        ] as $services
+        | [
+            "us-east", "us-west", "eu-central", "ap-southeast"
+        ] as $regions
+        | [
+            {topic:"migration ownership", choice:"one dedicated migrator runs before workers", alternative:"each worker attempts migration at startup", reason:"separating DDL from serving traffic makes rollout order observable"},
+            {topic:"canary allocation", choice:"start at five percent and hold for two health windows", alternative:"start at twenty-five percent for faster signal", reason:"a smaller first step limits exposure while preserving useful telemetry"},
+            {topic:"cache policy", choice:"enable bounded caching only for immutable catalog reads", alternative:"disable all caching during the release", reason:"selective caching protects freshness-sensitive paths"},
+            {topic:"rollback trigger", choice:"rollback on sustained error-rate breach", alternative:"rollback on a single latency spike", reason:"a sustained window rejects transient noise"},
+            {topic:"schema compatibility gate", choice:"require dual-read compatibility before cutover", alternative:"drain all workers before applying schema", reason:"dual-read support permits replacement without a global pause"},
+            {topic:"regional rollout order", choice:"begin in us-east and follow measured demand", alternative:"begin in us-west where traffic is lower", reason:"starting near the operations team shortens response time"},
+            {topic:"queue scheduling", choice:"retain FIFO within each tenant partition", alternative:"use global priority scheduling", reason:"partition-local order prevents one tenant from starving another"},
+            {topic:"diagnostic retention", choice:"retain redacted diagnostics for seven days", alternative:"retain full diagnostics for thirty days", reason:"short redacted retention minimizes exposure"},
+            {topic:"feature activation", choice:"require an operator-approved feature flag", alternative:"enable automatically after deploy", reason:"approval keeps activation separate from artifact delivery"},
+            {topic:"failover authority", choice:"require operator confirmation for cross-region failover", alternative:"fail over automatically on one failed probe", reason:"multiple signals avoid a split-brain response"},
+            {topic:"model bundle selection", choice:"use the reviewed content-addressed bundle", alternative:"download the newest compatible model at startup", reason:"an immutable digest makes every task reproducible"},
+            {topic:"backfill pacing", choice:"cap backfill at one quarter of spare capacity", alternative:"consume all spare capacity until complete", reason:"a fixed reserve protects interactive traffic"}
+        ] as $decisions
+        | range(1; 13) as $week
+        | ($services[($week - 1) % ($services | length)]) as $service
+        | ($services[$week % ($services | length)]) as $peer
+        | ($regions[($week - 1) % ($regions | length)]) as $region
+        | ($decisions[($week - 1) % ($decisions | length)]) as $decision
+        | (
+          record($week; "decision-primary"; "decision"; "accepted"; "primary"; $decision.topic;
+            "The release coordinator decided that " + $service + " will " + $decision.choice + ". The recorded rationale is that " + $decision.reason + ". The decision is intended to guide the next independently started worker.";
+            ["decision", "rollout", $service]),
+          record($week; "decision-contingency"; "decision"; "contingency"; "primary"; $decision.topic;
+            "The reliability agent documented a contingency for " + $decision.topic + ": " + $decision.alternative + ". It is not the active choice and requires fresh operator approval before use; preserving it makes later disagreement explainable.";
+            ["decision", "contingency", $service]),
+          record($week; "evidence-review"; "evidence"; "observed"; "usage"; "health evidence";
+            "Agents reviewed error rate, saturation, queue age, and restart continuity for " + $service + " in " + $region + ". The evidence window contained two clean replacement cycles and no loss of durable rollout context.";
+            ["evidence", "health", $region]),
+          record($week; "change-window"; "change"; "completed"; "usage"; "bounded rollout";
+            "The deployment agent applied the approved bounded change to " + $service + " while " + $peer + " remained available. Progress advanced only after health, memory recall, and dependency checks agreed.";
+            ["change", "deployment", $service]),
+          record($week; "verification"; "verification"; "passed"; "usage"; "post-change verification";
+            "The verification agent recalled the current decision, checked its cited evidence, and confirmed that a replacement task for " + $service + " returned the same operational context. It recorded the verification result without changing the decision.";
+            ["verification", "durability", $service]),
+          record($week; "incident"; "incident"; "contained"; "usage"; "degraded dependency";
+            "A synthetic dependency slowdown increased queue age for " + $peer + " in " + $region + ". The incident agent bounded concurrency, preserved incoming work, and attached measurements instead of inferring a root cause.";
+            ["incident", "queue", $peer]),
+          record($week; "mitigation"; "mitigation"; "completed"; "usage"; "degraded dependency";
+            "The fleet reduced nonessential work for " + $peer + ", verified recovery over three windows, and left the durable decision untouched. The mitigation was reversible and cited the incident evidence that triggered it.";
+            ["mitigation", "recovery", $peer]),
+          record($week; "handoff"; "handoff"; "accepted"; "usage"; "operator handoff";
+            "The outgoing agent handed " + $service + " to the next shift with the active choice, contingency, observed risks, and exact follow-up checks. The receiving agent acknowledged the handoff before taking action.";
+            ["handoff", "operations", $service]),
+          record($week; "capacity"; "capacity_review"; "observed"; "usage"; "capacity reserve";
+            "Capacity review found enough reserve in " + $region + " for one overlapping task replacement and a bounded backfill. The plan kept an explicit reserve for interactive requests and database retries.";
+            ["capacity", "resilience", $region]),
+          record($week; "security"; "security_review"; "passed"; "usage"; "least privilege";
+            "The security agent confirmed that serving tasks for " + $service + " retained read and runtime-write privileges only, while schema changes remained isolated to the dedicated migration identity. No credential values entered the narrative.";
+            ["security", "least_privilege", $service]),
+          record($week; "retrospective"; "retrospective"; "completed"; "usage"; "learning loop";
+            "The weekly retrospective separated observed facts from operator choices for " + $service + ". It preserved superseded context for auditability and promoted only reproducible checks into the next runbook revision.";
+            ["retrospective", "learning", $service]),
+          record($week; "next-week-plan"; "plan"; "proposed"; "usage"; "next iteration";
+            "The next iteration will rehearse a task replacement for " + $peer + ", compare lexical and semantic recall, and require operator review for any incompatible same-key proposals before rollout continues.";
+            ["plan", "recall", $peer]),
+          record($week; "dependency-contract"; "dependency_review"; "confirmed"; "usage"; "dependency contract";
+            "The dependency review confirmed timeout, retry, and ownership expectations between " + $service + " and " + $peer + ". Operators recorded the contract separately from observed health so a later replacement can distinguish policy from evidence.";
+            ["dependency", "contract", $service, $peer]),
+          record($week; "replacement-rehearsal"; "resilience_drill"; "passed"; "usage"; "task replacement";
+            "A replacement rehearsal stopped one synthetic " + $service + " task in " + $region + " and started a clean successor. The successor recalled the current decision and cited the same evidence before the old task was considered drained.";
+            ["resilience", "replacement", $service]),
+          record($week; "runbook-review"; "runbook_review"; "approved"; "usage"; "operational procedure";
+            "Operators reviewed the " + $decision.topic + " procedure after the weekly evidence window. They kept the active choice explicit, marked the contingency as noncurrent, and assigned one owner for the next verification.";
+            ["runbook", "review", $service])
+          )
+        ),
+
+        (
+        [
+            "catalog-api", "checkout-worker", "identity-gateway", "search-indexer",
+            "billing-ledger", "notification-router", "inventory-sync", "audit-exporter",
+            "recommendation-api", "workflow-scheduler", "support-console", "metrics-pipeline"
+        ] as $services
+        | [
+            "migration ownership", "canary allocation", "cache policy", "rollback trigger",
+            "schema compatibility gate", "regional rollout order", "queue scheduling",
+            "diagnostic retention", "feature activation", "failover authority",
+            "model bundle selection", "backfill pacing"
+        ] as $topics
+        | [
+            {old:"one dedicated migrator runs before workers", new:"run one lease-elected migrator with a pre-authorized standby", reason:"lease ownership preserves one writer while adding a tested failover path"},
+            {old:"start at five percent and hold for two health windows", new:"start at ten percent and hold for three health windows", reason:"the longer observation window offsets the moderately larger first step"},
+            {old:"enable bounded caching only for immutable catalog reads", new:"bypass caching until invalidation lag stays below target", reason:"freshness telemetry no longer supports the earlier selective-cache assumption"},
+            {old:"rollback on sustained error-rate breach", new:"require a sustained error-rate breach plus saturation evidence", reason:"the added signal separates application faults from dependency pressure"},
+            {old:"require dual-read compatibility before cutover", new:"use expand-contract with an explicit version gate", reason:"the version gate made compatibility measurable across two release trains"},
+            {old:"begin in us-east and follow measured demand", new:"begin in us-west under the staffed response team", reason:"on-call coverage moved before the new change window"},
+            {old:"retain FIFO within each tenant partition", new:"use weighted tenant queues while preserving per-tenant order", reason:"measured starvation required bounded cross-tenant weighting"},
+            {old:"retain redacted diagnostics for seven days", new:"retain redacted diagnostics for three days", reason:"the shorter window still covers the incident review cycle"},
+            {old:"require an operator-approved feature flag", new:"require approval from both the operator and service owner", reason:"the feature now crosses a service ownership boundary"},
+            {old:"require operator confirmation for cross-region failover", new:"permit automatic failover after three independent health signals", reason:"the rehearsed signal quorum met the documented safety threshold"},
+            {old:"use the reviewed content-addressed bundle", new:"promote the newly reviewed content-addressed bundle", reason:"the replacement digest passed reproducibility and rollback checks"}
+        ] as $changes
+        | range(2; 13) as $week
+        | ($services[($week - 2) % ($services | length)]) as $service
+        | ($topics[($week - 2) % ($topics | length)]) as $topic
+        | ($changes[($week - 2) % ($changes | length)]) as $change
+        | record($week; "supersession"; "supersession"; "superseding"; "evolution"; $topic;
+            "For " + $topic + " on " + $service + ", the fleet superseded the prior-week instruction: " + $change.old + ". The replacement instruction is to " + $change.new + " because " + $change.reason + ". The old decision remains historical and discoverable.";
+            ["supersession", "decision_history", $service])
+        ),
+
+        record(6; "telemetry-assertion-latency"; "telemetry_assertion"; "provisional"; "evolution"; "checkout latency attribution";
+            "The observability agent provisionally attributed elevated checkout latency to database saturation after comparing host clocks and queue samples. The assertion is preserved as a specific evidence claim so any later correction can identify exactly what changed.";
+            ["telemetry_assertion", "latency", "checkout-worker"]),
+
+        record(7; "retraction-invalid-latency-assertion"; "retraction"; "retracted"; "evolution"; "checkout latency attribution";
+            "The observability agent retracts its week-06 assertion that checkout latency came from database saturation. A clock-skew defect invalidated that measurement, so the assertion must not guide action. This synthetic narrative contains exactly one retraction, and the correction preserves why the earlier statement was withdrawn.";
+            ["retraction", "correction", "telemetry"]),
+
+        (
+        [
+            {name:"migration_owner", left_actor:"release agent", left:"one dedicated migrator runs before workers", right_actor:"worker agent", right:"every worker migrates independently at startup", impact:"both instructions would contend for schema ownership"},
+            {name:"canary_percentage", left_actor:"safety agent", left:"begin at five percent", right_actor:"delivery agent", right:"begin at twenty-five percent", impact:"one rollout cannot begin at both allocations"},
+            {name:"maintenance_window", left_actor:"regional agent", left:"Tuesday at 02:00 UTC", right_actor:"dependency agent", right:"Thursday at 04:00 UTC", impact:"the dependency freeze permits only one window"},
+            {name:"cache_policy", left_actor:"performance agent", left:"enable immutable-read caching", right_actor:"freshness agent", right:"disable all caching", impact:"the same route cannot be both cached and uncached"},
+            {name:"rollback_trigger", left_actor:"reliability agent", left:"use sustained error rate", right_actor:"latency agent", right:"use one latency spike", impact:"the triggers produce incompatible rollback behavior"},
+            {name:"schema_gate", left_actor:"database agent", left:"require dual-read compatibility", right_actor:"operations agent", right:"drain every worker before schema change", impact:"the rollout order and availability guarantees differ"},
+            {name:"region_priority", left_actor:"traffic agent", left:"start in us-east", right_actor:"risk agent", right:"start in us-west", impact:"the first deployment region must be singular"},
+            {name:"queue_mode", left_actor:"fairness agent", left:"use tenant-partitioned FIFO", right_actor:"priority agent", right:"use one global priority queue", impact:"the schedulers impose different ordering"}
+        ] as $conflicts
+        | [
+            "compare migration logs and preserve the dedicated owner",
+            "review exposure limits and select the smaller canary",
+            "consult the dependency calendar and publish one window"
+        ] as $resolutions
+        | range(0; $conflicts | length) as $index
+        | ($index + 1) as $week
+        | ($conflicts[$index]) as $conflict
+        | (
+          record($week; "conflict-" + $conflict.name; "conflict_scenario"; "open"; "evolution"; $conflict.name;
+            "Synthetic disagreement: the " + $conflict.left_actor + " proposed " + $conflict.left + ", while the " + $conflict.right_actor + " proposed " + $conflict.right + ". The proposals require operator review because " + $conflict.impact + ". Importing this narrative does not create typed claims or conflict state.";
+            ["conflict_scenario", "operator_review", $conflict.name]),
+          (if $index < ($resolutions | length) then
+            record($week; "conflict-resolution-" + $conflict.name; "conflict_resolution"; "resolved"; "evolution"; $conflict.name;
+              "Synthetic resolution: operators chose to " + $resolutions[$index] + ". The resolution cites the disagreement and preserves both proposals for audit. Importing this narrative still does not resolve or mutate claim-ledger conflict state.";
+              ["conflict_resolution", "operator_review", $conflict.name])
+          else empty end)
+          )
+        )
+    '
+}
+
+emit_document_chunks
+emit_operations_narrative

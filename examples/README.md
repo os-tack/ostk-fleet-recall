@@ -19,3 +19,26 @@ The LocalStack harness does this automatically through
 identities and asserting hybrid recall, replay deduplication, scope isolation,
 a persisted recall-driven action, an open two-member conflict, and a persisted
 operator escalation.
+
+## Rich local fixture
+
+[`rich-demo/`](rich-demo/) contains an optional deterministic generator for a
+larger publication-safe corpus. It chunks an explicit allowlist of checked-in
+documentation and adds a synthetic twelve-week operations narrative, producing
+500–1,000 useful records without network, Docker, or database access. Generated
+NDJSON is ignored rather than committed.
+
+```bash
+mkdir -p examples/rich-demo/generated
+./examples/rich-demo/generate.sh \
+  > examples/rich-demo/generated/rich-demo.ndjson
+./examples/rich-demo/verify.sh \
+  examples/rich-demo/generated/rich-demo.ndjson
+./examples/rich-demo/test.sh
+```
+
+The rich corpus describes decisions, supersessions, one retraction, and varied
+disagreement scenarios as searchable narrative text. It does **not** create
+claim-ledger state. Use MCP `remember` for deliberate claims, supersessions,
+retractions, and conflicts so their provenance and transaction semantics are
+actually exercised. Do not ingest this optional fixture into the live demo.

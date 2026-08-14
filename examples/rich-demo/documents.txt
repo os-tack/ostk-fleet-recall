@@ -1,0 +1,10 @@
+README.md|project
+docs/ARCHITECTURE.md|architecture
+docs/REQUIREMENTS.md|requirements
+docs/SUBMISSION.md|submission
+docs/MIGRATIONS.md|migrations
+docs/CLOUD_ONBOARDING.md|cloud_onboarding
+docs/AGENT_SKILLS_AUDIT.md|agent_skills
+docs/VIDEO_DEMO.md|video
+deploy/aws/README.md|aws
+deploy/localstack/README.md|localstack
