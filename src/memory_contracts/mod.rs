@@ -11,6 +11,7 @@ pub mod control;
 pub mod digest;
 pub mod error;
 pub mod evidence;
+pub mod evidence_v2;
 pub mod genesis;
 pub mod genesis_activation;
 pub mod identity;

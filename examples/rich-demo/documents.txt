@@ -1,6 +1,7 @@
 README.md|project
 contracts/dynamic-memory/v1/README.md|memory_contracts
 contracts/dynamic-memory/v1/genesis-activation/README.md|genesis_activation
+contracts/dynamic-memory/v2/evidence/README.md|memory_contracts
 docs/ARCHITECTURE.md|architecture
 docs/CONTROL_BOOTSTRAP.md|control_bootstrap
 docs/DYNAMIC_MEMORY_ARCHITECTURE.md|dynamic_architecture

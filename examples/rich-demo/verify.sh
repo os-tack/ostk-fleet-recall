@@ -365,8 +365,8 @@ if ! jq -s -e \
         | map(select(length > 0 and (startswith("#") | not)))
         | map(split("|")[0])
         | sort) as $expected_repository_sources
-    | ($expected_doc_sources | length) == 24
-    and ($expected_repository_sources | length) == 137
+    | ($expected_doc_sources | length) == 25
+    and ($expected_repository_sources | length) == 146
     and
     ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) >= 400
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2

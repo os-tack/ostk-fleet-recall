@@ -24,6 +24,14 @@ contracts/dynamic-memory/v1/genesis-activation/vector-suite.jsonl|genesis_activa
 contracts/dynamic-memory/v1/genesis-registry-package.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v1/resource-locator.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v1/stage1-vector-suite.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/evidence/connector-schema-v2-entry.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/evidence/evidence-statement-v2.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/evidence/negative-connector-derivation.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/evidence/negative-connector-family.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/evidence/representation-origin-v2.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/evidence/representation-supersedes-v2.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/evidence/source-fact-v2.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/evidence/vector-suite.jsonl|memory_contracts|jsonl
 demo/ostk/bridge.sh|ostk_integration|shell
 demo/ostk/lib.sh|ostk_integration|shell
 demo/ostk/mcp-client.sh|ostk_integration|shell
@@ -124,6 +132,7 @@ src/memory_contracts/control.rs|memory_contracts|rust
 src/memory_contracts/digest.rs|memory_contracts|rust
 src/memory_contracts/error.rs|memory_contracts|rust
 src/memory_contracts/evidence.rs|memory_contracts|rust
+src/memory_contracts/evidence_v2.rs|memory_contracts|rust
 src/memory_contracts/genesis.rs|memory_contracts|rust
 src/memory_contracts/genesis_activation.rs|genesis_activation|rust
 src/memory_contracts/identity.rs|memory_contracts|rust
