@@ -111,11 +111,13 @@ must not disguise a semantic change.
 
 ### Evidence and identity
 
-- **EVID-01 — Immutable evidence.** Accepted evidence is append-only.
+- **EVID-01 — Immutable evidence.** The accepted ledger envelope is append-only.
   Correction, deletion, and provider mutation create new events or lifecycle
-  projections; they never rewrite the accepted event. A retention or erasure
-  policy may cryptographically remove separately stored private raw bytes while
-  preserving an immutable tombstone, digest, and lifecycle event.
+  projections; they never rewrite that envelope. Canonical or raw governed
+  payload bytes live behind typed content references unless their retention
+  class explicitly permits immutable inline retention. A retention or erasure
+  policy may cryptographically remove governed payloads while preserving only
+  the immutable tombstone, digest, and lifecycle metadata policy permits.
 - **EVID-02 — Exact coordinates.** Evidence retains a provider identity,
   immutable object version, payload digest, and bounded source coordinate or
   raw-artifact reference.
@@ -438,22 +440,25 @@ The transport-neutral envelope should contain:
 ```text
 credential-bound tenant and project
 source-fact identity: connector/provider logical identity + immutable revision
-representation key: source-fact identity + schema/canonicalization/redaction versions
+representation key: source-fact identity + identity-recipe closure + schema/canonicalization/redaction versions
 canonical payload digest: stored and verified separately from the representation key
 schema name and version
 authenticated connector principal and connector instance
 provider and provider-reported actor identity
 provider delivery ID: transport receipt only
 logical event key defined by the connector schema
-canonicalization version
+canonicalization profile ID and digest
 provider object/event ID and immutable revision
-entity kind and canonical resource ID
+entity kind, canonical resource ID, and identity-recipe ID/version/digest
 occurred_at, observed_at, received_at
-canonical redacted payload and payload digest
+canonical payload digest plus typed content reference
+optional inline canonical redacted bytes only when immutable retention is allowed
 optional private raw-artifact reference and digest
 redaction policy/version
 integrity/signature state
-server-derived publication classification and classifier policy version
+server-derived visibility/protection domain and classifier policy version
+server-derived retention class/policy and erasure-index scope references
+server-derived publication classification and publication-policy version
 ```
 
 The authenticated ingress principal does not authenticate the
@@ -462,8 +467,10 @@ envelope to a durable outbox before delivery. Transport delivery IDs deduplicate
 ingress attempts only. The semantic-effect key is the credential-bound
 connector/provider logical fact identity plus immutable provider revision; it
 excludes delivery, canonicalization, and redaction versions. Schema,
-canonicalization, and redaction-policy versions identify a representation of
-that source fact. Reprocessing under a new representation version creates an
+canonicalization, redaction-policy, and identity-recipe versions identify a
+representation of that source fact. The identity-recipe digest is the closure
+over its exact resource-kind schema and namespace-definition dependencies.
+Reprocessing under a new representation version creates an
 explicitly superseding representation and deterministic reprojection, not a
 second provider fact or duplicate lifecycle transition. Different canonical
 bytes for the same source-fact and representation identity are quarantined as
@@ -754,17 +761,22 @@ plane with a distinct database reader, a publication execution role authorized
 only for that reader secret, and a distinct task/service role where applicable;
 this does not require or authorize dynamic ingestion.
 
-1. Version the predicate, authority, applicability, and coverage registry.
-2. Freeze canonical entity IDs and the evidence envelope with replay fixtures.
-3. Add a local append-only accepted-evidence store and generic relation
-   attestations. Make synchronous `remember` atomically append its attestation
-   event and projection. Prove immutability, scope binding, replay, and
-   verified-versus-declared behavior.
-4. Project one local transcript connector and one Git history connector into
-   lexical evidence with local cursors and coverage receipts.
-5. Add content-addressed repository membership and lexical-first/dense-later
-   projections.
-6. Add one exhaustive code/spec observer and basic discrepancy derivation.
+1. Freeze offline canonicalization profiles, genesis package and signer policy,
+   identity recipes, normative-binding schemas, evidence envelope, and replay
+   fixtures. No runtime activation is implied by these checked-in bytes.
+2. Add the minimal append-only control-event ledger and accept exactly one
+   explicit bootstrap receipt that pins the genesis profile, registry digest,
+   signer set, and threshold.
+3. Activate the genesis registry and implement registry, identity, and normative-
+   binding projections, including compare-and-swap activation and contested
+   history behavior.
+4. Add general accepted-evidence and relation-attestation events. Make
+   synchronous `remember` atomically append its event and projection. Prove
+   immutability, scope binding, replay, and verified-versus-declared behavior.
+5. Project one local transcript connector and one Git history connector into
+   content-addressed repository membership and lexical-first/dense-later evidence
+   with local cursors and coverage receipts.
+6. Admit one exhaustive code/spec observer and add basic discrepancy derivation.
 7. Add authenticated private ingress, durable queueing, remote connector
    cursors, and dead-letter/quarantine behavior.
 8. Add provider-verified PR, CI, artifact, and deployment relations.
@@ -789,31 +801,627 @@ proposal, authorization, execution-attempt, stale-precondition,
 idempotency-collision, reconciliation, and verification vectors.
 
 - Canonical resource identifiers and normalization rules
+- Registry canonicalization, pinned genesis/bootstrap authority, prior-policy
+  authorization, concurrent activation, rollback, and contested-overlap behavior
+- Entity/version identity across rename, retry, force-push, mutable tags, digest
+  algorithms, provider reinstall, and canonicalizer upgrade
 - Predicate schemas and comparator behavior
 - Authority and applicability registry precedence/conflict behavior
+- Normative proposition activation, exact source binding, separation of duty,
+  supersession, contested overlap, and retroactive-correction behavior
 - Complete, partial, and missing coverage semantics
+- Observer admission modes, unsupported syntax/configuration, skipped input,
+  dependency drift, overlapping-observer disagreement, deterministic replay, and
+  resource-exhaustion behavior
 - Exact event replay and identity-collision quarantine
+- Per-shard atomic append/cursor advancement, epoch transition, verified
+  checkpoint-plus-tail replay, cross-shard reversed arrival/barriers, declared
+  history horizon, and late-event repair
 - Relation basis, verdict, and lifecycle projections, including refutation and
   supersession without history loss
 - Branch, PR, release, environment, and rolling-cohort applicability
 - Non-destructive discrepancy lifecycle and episode identity
+- Late evidence that appends, splits, or combines canonical episodes; alert
+  closure, waiver, rule change, deterministic opening, short/long observation
+  gaps, and recurrence
 - Redaction and publication classification before embedding
+- Exact body-byte encoding and collision behavior; parser determinism on same and
+  different sources; manifest collision, rechunking, stable source-span support,
+  old-generation completion, and protection-domain-limited deduplication
+- Erasure concurrent with projection/embedding, late redelivery, legal hold,
+  parent-versus-child scope races, no-retainable matcher, checkpoint/backup
+  restore, key destruction, and dependent-proposition re-evaluation
+- Telemetry selection caps, deterministic sampling, withheld fields,
+  canonical strata/restart replay, unavailable snapshots/identities,
+  irreproducible populations, public reclassification, exemplar-only causal
+  rejection, and exemplar erasure
 - Public reader versus private writer privilege separation
+- Causal support that remains open below intervention evidence, cause exposure
+  after outcome onset, required coverage gaps, ambiguous/confounded intervention
+  results, independent ratification, and later refutation
 - Action proposal, approval, execution-attempt, ambiguous-outcome
   reconciliation, stale-precondition, idempotency-collision, and verification
   semantics before stage 10
 
-## Open decisions
+## Foundational design decisions
 
-- Registry serialization and governance: checked-in declarative files, signed
-  operator records, or both
-- Canonical entity URI vocabulary across Git, CI, artifact, deployment, and
-  telemetry providers
-- Event-log and projection table partitioning and retention
-- Private raw-artifact archive policy and deletion semantics
-- Content-addressed chunk identity across parser-version changes
-- Normative document activation and ratification workflow
-- Which observers are exhaustive enough to auto-open verified discrepancies
-- Discrepancy episode boundaries across repeated deployments and alert windows
-- Telemetry provider integration and bounded exemplar policy
-- Minimum intervention evidence required for a ratified causal conclusion
+These decisions remove ambiguity from the contracts consumed by stages 1–10.
+They are target semantics, not claims about current implementation.
+
+### Registry serialization, governance, and activation
+
+The authoritative registry artifact is strict, schema-versioned canonical JSON
+under the named `ostk-canonical-json-v1` profile.
+Human commentary may live beside it, but YAML, Markdown, source-code defaults,
+and database rows are not independent registry authorities. A registry package
+contains its predicate schemas, authority rules, applicability evaluators,
+coverage proof methods, relation proof recipes, publication rules, activation
+policy, resource-kind schemas, provider/internal namespace definitions, identity
+recipes, and positive and negative test-vector digests. Its identity is the
+domain-separated digest
+`SHA-256("ostk-registry-package-v1" || 0x00 || canonical_package_bytes)`.
+
+The profile fixes schema validation, default expansion, NFC string handling,
+ASCII identifier syntax, timestamp and decimal-string forms, and canonical
+ordering. It rejects duplicate and unknown keys, floating-point values,
+ambiguous timestamps, non-NFC strings, unsorted set fields, remote includes,
+environment substitution, and executable policy. Defaults are materialized
+before hashing. A manifest lists every `(kind, ID, version, entry digest)` in
+canonical order. Every entry, package, activation statement, and resource locator
+uses its fixed profile-owned prefix under
+`SHA-256(prefix || 0x00 || canonical_bytes)`. Reordered object keys
+preserve the digest; any ordered semantic change does not.
+
+Checking a package into Git proposes it; merging it does not activate it. A
+canonical activation proposal binds the exact package digest, tenant/project
+scope, effective interval, predecessor, test-vector result, activation-policy
+digest, and expected currently active digest. Its statement ID hashes the
+unsigned canonical statement. Approval signatures are separate attestations and
+do not change that semantic ID.
+
+The currently active governance policy—not the proposed package—decides eligible
+principals and threshold, so a package cannot lower the threshold and authorize
+itself. The accepted activation receipt binds sorted approval-attestation IDs and
+the server-derived eligibility, threshold, and separation-of-duty verdict.
+Production authority, publication, and action-policy changes require an approver
+distinct from the package author. Activation compare-and-swaps the expected
+digest; exactly one concurrent successor can commit. Reverting means appending an
+activation event for an earlier digest; no prior interval is rewritten.
+
+A pinned bootstrap receipt supplies the genesis package digest, canonicalization
+profile, bootstrap signer set, and threshold. The genesis package cannot
+authorize its own activation. Every later transition is governed by its
+predecessor package; key revocation affects future attestations without erasing
+historical activation evidence.
+
+Deployment configuration pins the bootstrap-receipt digest out of band; no field
+or signature inside that receipt establishes its own authority. Ambiguity
+resolution is authorized only by the last common unambiguous predecessor policy
+or a separately deployment-pinned break-glass policy and compare-and-swaps the
+exact contested activation-ID set. Neither contested successor may authorize its
+own selection.
+
+If two activation events claim incompatible precedence for the same scope and
+effective interval, the registry projection becomes `ambiguous`, opens a
+governance discrepancy, and suspends affected automatic verification. Receipt
+time never breaks the tie. Every projector retains the last unambiguous closed
+watermark and reports that it is stale until an authorized contested-set
+resolution event commits under the rule above.
+
+### Canonical resource identity
+
+Resource identity is a typed canonical locator, not a user-facing provider URL.
+Each resource-kind schema defines required locator fields, normalization, and an
+identity recipe declaring whether the resource is a continuing entity or an
+immutable occurrence.
+The credential-bound opaque tenant/project namespace is included by the server;
+payloads cannot select it. Tenant and project remain mandatory authority columns
+and are never inferred from the URI. A connector-supplied OSTK URI is only an
+assertion; ingress reconstructs and verifies the locator. Canonical JSON locator
+bytes yield three URI forms:
+
+```text
+urn:ostk:entity:v1:<kind>:sha256:<locator-digest>
+urn:ostk:version:v1:<kind>:sha256:<version-locator-digest>
+urn:ostk:occurrence:v1:<kind>:sha256:<occurrence-locator-digest>
+```
+
+Every locator includes the exact activated identity-recipe ID, version, and
+digest. If the recipe is missing or its registry projection is contested,
+identity creation fails closed. A recipe upgrade therefore mints a different URI
+even when every provider field happens to normalize to the same bytes.
+
+An entity URI names a continuing provider resource, such as one repository,
+pull request, workflow, or service. A version URI includes exactly one
+registry-declared continuing parent entity URI and immutable version coordinates,
+such as a PR head SHA plus provider update version or telemetry rule version. An
+occurrence URI names an intrinsically immutable resource with no continuing
+parent, such as a content-addressed artifact or provider event. Each kind's
+identity recipe selects exactly one form. Mutable labels, branch names, image
+tags, display names, and URLs remain attributes or observations; they are never
+substitutes for immutable version identity.
+
+Deployment rollouts are immutable occurrences unless a provider supplies a
+verified stable, non-reused deployment-object identity. A recipe or
+canonicalizer upgrade mints new URIs and requires explicit verified equivalence
+edges; it never reinterprets existing graph endpoints.
+
+A provider instance is a stable authority namespace declared by its identity
+recipe and bound to provider-controlled immutable identifiers or an out-of-band
+pin—not credentials or connector-install IDs. Credential rotation and reinstall
+reuse the namespace only when the same authority identity is verified. Otherwise
+they mint a new namespace and may join it only through a verified equivalence
+edge. OSTK-native binding families, decisions, and policies use an explicit
+credential-bound internal authority namespace.
+
+Provider-specific locators use provider-instance identity and immutable
+provider IDs rather than owner/name strings when such IDs exist. Git object IDs
+retain their declared object format. Artifact identities retain digest algorithm
+and canonical digest bytes. A source path at a commit is a membership coordinate
+linking repository version, tree/blob identity, exact path bytes, and optional
+line range; identical text in two paths may share storage but not provenance.
+Normalization never guesses across case, Unicode, repository, provider, or
+tenant boundaries. Unknown locator versions remain opaque and non-comparable.
+
+### Normative source activation
+
+Normativity is an event-derived state, not a path convention. A candidate
+specification, ADR, policy, SLO, or decision is evidence. A document never becomes
+normative wholesale. A binding proposal enumerates exact typed proposition
+fingerprints and binds:
+
+```text
+stable binding-family ID and expected active binding revision/set
+exact repository, commit, blob, path, byte ranges, and selected-byte digests
+extractor/parser artifact and configuration digest
+enumerated proposition fingerprints and predicate-schema versions
+applicability selector and effective interval
+registry and currently active activation-policy digest
+explicit supersession, if any
+```
+
+An extractor or agent may propose a binding but cannot activate it. Independent
+approval attestations sign the canonical binding-statement digest under the
+currently active governance policy. The document author or affected agent cannot
+be the sole ratifier. The activation receipt binds the sorted approval-attestation
+IDs and server-derived eligibility, threshold, and separation-of-duty verdict.
+Only that derived verdict controls activation; a proposal cannot assert its own
+authorization result.
+
+Editing or merging the document creates new evidence but leaves the previously
+active version normative until a valid activation, retirement, or supersession
+event says otherwise. A supersession can change intent prospectively; it cannot
+rewrite a historical nonconformance. A known incompatible overlap fails unless
+the activation explicitly supersedes the active binding. `Contested` is reserved
+for late/corrective or independently accepted evidence whose ordering cannot be
+established; it makes dependent comparisons `unknown`. Waivers are separate,
+scoped, expiring policy events and do not deactivate the underlying expectation.
+
+Activation atomically compare-and-swaps the composite `(expected binding-family
+revision/set, active registry digest, active activation-policy digest)` and
+revalidates approval eligibility, expiry, revocation, threshold, and separation
+of duty in that transaction. A policy or key change makes the proposal stale and
+requires reauthorization. Retirement, retraction, and expiry are signed lifecycle
+events governed by the same active policy. Normal policy forbids effective time
+before accepted time; an exceptional retroactive correction requires a
+separately named higher-threshold policy, appends a new bitemporal
+interpretation, and preserves every prior as-known conclusion.
+
+### Evidence ledger, retention, archive, and erasure
+
+Accepted evidence enters a sharded append ledger with a transactional offset per
+shard. Offsets order projector work only; they never establish provider event
+order, authority, or causality. Semantic event identity never contains a shard
+or physical partition key. An append position is `(log epoch, shard, committed
+offset)`. Shards are selected from credential-bound tenant/project scope plus a
+stable hash. Changing the shard count creates a new log epoch and checkpoint;
+evidence IDs do not change. Offset assignment, accepted representation, and shard
+head advance commit in one transaction. Failed transactions publish neither row
+nor offset.
+
+The registry defines a consistency/partition key for each event kind, normally a
+canonical entity or source-fact family. Related facts that require shard-local
+ordering share that key. Each log epoch binds the domain-separated partition-hash
+recipe, seed, shard count, and predecessor epoch. Epoch activation atomically
+fences every old shard head at one closed vector and makes the new epoch active;
+a concurrent old-epoch append that loses the fence retries under the new epoch.
+The evidence-compaction checkpoint binds every closed old head, so shard-count
+changes and reversed arrival remain deterministic under replay.
+
+Every accepted event receives a server-derived retention and visibility class.
+The immutable envelope, governed canonical redacted payload, optional private
+raw payload, and large raw artifact may have different stores and retention
+periods. Redaction removes secrets but does not imply that the remaining bytes
+are non-personal or retainable forever. Every erasable canonical or raw payload
+uses a separately addressable, envelope-encrypted content object indexed for
+erasure. Mixed-scope archive segments and backups retain per-record/per-artifact
+DEKs or erasable references; a monolithic segment is never the erasure unit.
+
+Shard-local projectors advance one cursor atomically with complete local output.
+Graph, discrepancy, absence, and other cross-shard join projectors consume a
+closed input cursor-vector barrier and atomically publish one generation for that
+vector. Negative or completeness-dependent conclusions cannot advance beyond the
+closed vector. Processing the same facts in a different shard schedule must
+produce the same generation. Late evidence publishes a later recomputed
+generation and preserves the earlier as-known output.
+
+Two checkpoint kinds remain distinct:
+
+- an **evidence-compaction checkpoint** is a projector-neutral,
+  content-addressed manifest of retained immutable evidence, tombstones, closed
+  shard positions, append-chain/segment-manifest roots, and retained-evidence
+  snapshot digest and may anchor the declared evidence replay horizon only after
+  completeness is independently replay-verified;
+- a **projector checkpoint** is a performance cache valid only for one exact
+  projector and registry digest and can never justify pruning its evidence
+  inputs.
+
+A semantic replay begins from genesis or a verified evidence-compaction
+checkpoint plus its retained event tail. Independent replay verifies the
+checkpoint against the evidence authority. Projector checkpoints bind their
+projector, registry, cursor vector, output digest, and verification receipt, but
+never become a second authority. Projection tables remain disposable.
+
+Moving a closed event segment from CockroachDB to a private object archive is
+allowed only after a content-addressed segment manifest, durable-copy receipt,
+and replay verification are accepted. The combined hot ledger, retained archive,
+evidence-compaction checkpoints, and erasure tombstones satisfy the declared
+replay horizon;
+transport queues never do. A projection must state when its policy permits only
+bounded historical replay rather than silently claiming genesis replayability.
+It exposes `semantic_replay_from` separately from
+`historical_content_available_from`.
+
+Private raw payloads use separately scoped encryption keys and an erasure index
+that maps authorized privacy subjects and evidence IDs to every materialization.
+The private raw archive is optional supporting material, not a prerequisite for
+ordinary projection replay. Each archived artifact has a unique data-encryption
+key wrapped inside its protection domain; one shared bucket key is not sufficient
+for artifact-scoped cryptographic erasure.
+
+An erasure event has a typed scope (`representation`, `source_fact`, `resource`,
+or `privacy_subject`), effective interval, policy basis/version, and separately
+authorized prospective re-consent semantics. Acceptance atomically installs a
+retrieval-deny tombstone and increments every indexed target epoch plus a
+monotonic tenant/project erasure generation. Projection, embedding, cache, and
+archive commits compare-and-swap a composite fence covering representation,
+source-fact, resource, privacy-subject, and tenant/project scopes. Work begun
+before a parent, subject, or child tombstone cannot commit afterward.
+
+Cleanup then removes authorized raw bytes, searchable text, embeddings,
+exemplars, cached renderings, object versions, local outbox/quarantine copies,
+and keys. Receipts are `attempted` or `pending` while any residual remains and
+become `complete` only after every governed store verifies removal. Minimal
+digests or pseudonymous tombstones survive only where policy permits. A
+prospective re-consent event may authorize a new source fact; it never revives an
+erased representation or permits redelivery under its old identity.
+
+Restore and reprojection load the current policy and erasure tombstone set before
+making any reader available. Late or restored evidence covered by a tombstone is
+suppressed or quarantined rather than rematerialized. A legitimately new event
+may become visible only under a new policy/consent basis whose scope does not
+conflict with the tombstone. Key destruction is not sufficient evidence of
+erasure if plaintext or derived copies remain.
+
+Erasure dominates checkpoints, but content-addressed checkpoints remain
+immutable. An erasure appends an invalidation/tombstone, destroys governed
+payload keys, and mints a new checkpoint at the higher erasure epoch; it never
+redacts or advances the old object in place. No reader or restore may serve an
+older checkpoint until the tombstone tail is applied and its derivatives are
+purged. A checkpoint may retain only the digest/tombstone metadata policy
+permits; it is never a lawful reason to retain erasable body bytes.
+
+If policy forbids retaining even a pseudonymous matcher needed to suppress late
+redelivery, the system disables and purges that connector/resource scope. It
+does not promise replay-safe suppression while continuing to accept an event it
+can no longer recognize.
+
+If erased material was the only reproducible support for a proposition, its
+historical existence remains but its current verification becomes `unsupported`
+or `unverifiable`; dependent discrepancies are recomputed. If retained canonical
+redacted evidence remains sufficient under policy, support may remain verified.
+An erasure receipt distinguishes Fleet Recall deletion from deletion at the
+authoritative provider.
+
+Ordinary retention expiry of the sole reproducible support follows the same
+`unsupported`/`unverifiable` transition and dependent recomputation before bytes
+are pruned. Legal hold may defer removal but never makes held private content
+public or bypasses retrieval authorization.
+
+### Chunk and embedding identity across parser versions
+
+The immutable source-object version is distinct from every searchable
+representation. Exact canonical extracted bytes receive a reusable body-content
+ID. The parser contract declares whether newline, Unicode, or other normalization
+occurs; those rules are part of its configuration. The digest formula is
+`SHA-256("ostk-body-v1" || uint64_be(byte_length) || exact_output_bytes)`.
+Same digest with different retained bytes is an integrity collision. A chunk
+occurrence ID additionally binds:
+
+```text
+source-object version URI
+parser/extractor artifact digest, version, and configuration digest
+ordered half-open source-byte spans, span digests, and ordinal
+body-content ID
+redaction and publication-classifier versions
+```
+
+The same body may reuse byte storage and embedding work where every embedding
+input is identical, but occurrences in different sources or spans never collapse
+their provenance. A parser/configuration change creates a new parse manifest and
+occurrence set with explicit supersession links; it never silently reuses old
+occurrence identities. Re-running the same parser key on the same source
+representation and canonical inputs with a different manifest or occurrence set
+is an integrity collision. The active current-view parser comes from the
+registry. Source line numbers are display coordinates, not identity;
+non-contiguous derived passages retain an ordered span list. Parser-added source
+headers remain metadata rather than passage-body identity.
+
+A parse run atomically emits its source representation, parser key, ordered
+occurrences and spans, body digests, count/coverage receipt, and manifest digest.
+The manifest ID is computed afterward from canonical run metadata and the ordered
+occurrence IDs; occurrence identity never includes its manifest ID. The same
+parser key on the same source representation and canonical inputs must reproduce
+the same manifest. The same parser may legitimately produce a different manifest
+for a different source representation.
+Parser upgrades build a new generation in shadow and atomically change the
+current-generation pointer only after coverage and determinism verification.
+Late old-parser work remains historical and cannot reclaim that pointer.
+
+Historical claims cite stable source-object/span evidence coordinates plus the
+exact representation they observed, not a parser-local chunk ID alone. A verifier
+may rederive equivalent support under a new parse manifest and append that support
+without rewriting the original citation. Automatic equivalence requires the same
+immutable source object plus identical ordered source-byte spans and span digests;
+body similarity, shifted text, or semantic overlap is new support requiring fresh
+verification.
+
+An embedding identity additionally binds the body or occurrence input selected
+by policy, model digest, tokenization/preprocessing version, distance metric, and
+embedding dimensions. Embedding nondeterminism cannot alter lexical identity,
+proposition identity, or discrepancy correctness.
+
+Physical body deduplication for private data is limited to one protection domain
+and exposes/stores only a domain-keyed external storage identity so digest
+equality does not leak across tenants or visibility boundaries. Any unkeyed
+integrity digest is encrypted or access-controlled against cross-domain joins.
+Erasure removes an occurrence immediately and removes shared body/embedding
+storage when no lawful occurrence references it; a checkpoint cannot pin bytes
+that policy requires erased.
+
+### Exhaustive-observer admission
+
+Exhaustiveness is granted per observer version, predicate, input domain, and
+configuration context—not to an observer globally. Registry admission grants one
+mode:
+
+- `candidate_only`: may nominate propositions or discrepancies;
+- `positive_verified`: may verify an explicitly found value with exact proof but
+  may not prove absence, cardinality, or an exact set;
+- `closed_world_verified`: may additionally prove absence or an exact set inside
+  its admitted closed domain.
+
+LLM and semantic-search observers are always `candidate_only`. An observer may
+support a verified negative proposition only after its exact executable and
+dependency digests are independently admitted as `closed_world_verified` with an
+exhaustive-proof contract:
+
+```text
+predicate and supported source/resource kinds
+language, schema, compiler, or API versions
+closed input boundary and required applicability dimensions
+enumeration algorithm and unsupported-feature diagnostics
+success, partial, stale, parse-failure, and timeout outcomes
+coverage-receipt recipe
+positive, negative, mutation, and adversarial test vectors
+```
+
+At runtime the observer must bind an immutable source version, prove the complete
+registered input boundary was read, emit no unsupported or ambiguous construct,
+and produce complete/current coverage plus contiguous sequencing when sequencing
+applies. Otherwise its output is
+`indeterminate` or provisional and cannot auto-open a verified discrepancy. A
+search miss, truncated AST, generated code omitted from the closed boundary, or
+unresolved macro/configuration path never proves absence.
+
+Every run receipt enumerates included, excluded, skipped, and failed inputs,
+exact applicability/configuration, input and output digests, coverage/freshness/
+continuity, and exact evidence coordinates. Verified absence or exact-set output
+requires zero skipped, failed, unsupported, and unknown inputs. A partially
+covered run may still emit an individually proven positive only under a separate
+`positive_verified` admission.
+
+Observer upgrades create new derivations. Incompatible outputs constitute
+`observer_derivation_disagreement` only when admitted domains, predicate versions,
+and concrete applicability overlap. Every affected observation, negative
+proposition, and dependent automatic discrepancy becomes `indeterminate` until a
+rule narrows the domains or evidence resolves the disagreement. Registry-policy
+conflict is a governance discrepancy; disagreement between telemetry
+measurements is `telemetry_disagreement`. A `candidate_only` output remains
+opposing candidate evidence and does not by itself invalidate an otherwise
+complete verified proof. No ordering or authority score silently chooses a
+winner.
+
+Updating observer code, dependencies, parser, build features, admitted domain,
+or coverage method requires a new admission and activation; the observer cannot
+admit itself.
+
+### Discrepancy families and episodes
+
+A discrepancy-family fingerprint binds tenant/project, finding type, canonical
+subject, predicate/comparator lineage, expectation/policy identity, normalized
+applicability target, and episode-policy version. An episode is one continuous
+effective-time interval in which that exact family is incompatible or missing
+under its registered proof method.
+
+The episode fingerprint hashes the family fingerprint, normalized continuity-key
+values, deterministic opening-transition source-fact identity, and episode-policy
+version. The opening transition is ordered by effective time, registered provider
+order when available, and stable source-fact identity as the final tie-breaker;
+receipt order is never used. Late evidence that changes that transition creates a
+canonical replacement episode and supersedes the old projection without erasing
+it.
+
+Every discrepancy type registers its continuity-key dimensions, opening rule,
+allowed observation gap, closing/confirmation rule, rule-change behavior, and
+late-evidence behavior. Non-windowed state discrepancies open on the first
+verified incompatible state and close only on verified compatibility,
+supersession, or scope termination. A windowed runtime predicate without an
+episode policy produces standalone evaluations; it cannot be grouped or
+auto-resolved. Missing, stale, or unknown windows never prove recovery, and alert
+closure never closes a discrepancy.
+
+A missing/unknown interval no longer than the registered allowed gap may bridge
+two violating evaluations in one episode, but remains recorded as incomplete. A
+longer gap ends the known observed interval without asserting compatibility or
+resolution; the prior occurrence becomes observation-indeterminate, and a later
+violation opens a new episode linked by `possibly_continues`. Only verified
+compatibility, supersession, retirement, or scope exit records a resolved end.
+
+- Candidate-to-verified promotion, acknowledgment, waiver, member replacement,
+  and additional supporting/opposing evidence remain in the same episode while
+  the incompatible interval is continuous.
+- A verified compatible interval, expectation retirement, or applicability exit
+  ends the occurrence at its effective time. A later recurrence opens a new
+  episode linked to the same family.
+- A waiver changes workflow state but does not split or erase the underlying
+  incompatible interval. Expiry returns the same continuing episode to `open`.
+- Late evidence is inserted into the historical episode selected by effective
+  interval. If it bridges or splits previously projected intervals, replay creates
+  canonical replacement episodes and marks the earlier projections superseded,
+  retaining explicit `combined_from` or `continues` relations.
+- Material comparator or predicate-schema changes create a new family linked by
+  supersession; detector upgrades under the same contract append derivations.
+- Rolling cohorts and distinct environments have distinct applicability contexts.
+  An aggregate environment episode cannot be attributed to one revision without
+  cohort-aware evidence.
+- A deployment during an active SLO breach does not split that breach. It may open
+  a separate deployment-scoped regression candidate or causal hypothesis.
+
+Lifecycle state and verification state therefore never define episode identity.
+
+### Telemetry receipts and bounded exemplars
+
+Telemetry providers are authoritative for their retained records and query
+responses, not for completeness, correctness, or causal interpretation. A
+measurement collects no exemplars unless a registered query-specific policy
+permits them. The v1 private cap is eight structured exemplars, 1,024 UTF-8 bytes
+each and 8 KiB total. The public default is zero; a separately activated and
+independently approved public policy may expose at most three exemplars, 512 bytes
+each and 1.5 KiB total, after public visibility has already been established.
+
+The default selector is `deterministic_stratified_hash_v1`: define the exact
+provider snapshot/query population, apply authorization and visibility, redact
+and classify, and sort canonical normalized stratum keys. Inside each stratum,
+order immutable provider-record identities by
+`SHA-256(policy_digest || measurement_source_fact_id || provider_record_id)`,
+then select round-robin in canonical stratum order until the cap. The hash has no
+rotating secret or process-local seed. If the adapter cannot bind a bounded
+population or deterministic provider snapshot and immutable candidate IDs,
+selection returns none while preserving the aggregate receipt.
+The policy version, population boundary, candidate/eligible/withheld/selected
+counts, strata, selection inputs, omitted count, and truncation state are part of
+the measurement receipt. Extrema sampling is allowed only under an explicitly
+registered policy labeled as biased; it cannot support prevalence claims.
+
+Redaction, visibility classification, and retention assignment occur before an
+exemplar reaches an outbox, embedding worker, or searchable projection. Private
+provider links and trace/log bodies never enter the public projection. Exemplars
+illustrate an aggregate; their absence cannot prove an event did not occur. A
+metric query may support exhaustive aggregate coverage only when its provider
+contract and coverage receipt say so.
+
+When source telemetry expires, the bounded receipt remains evidence of the
+captured evaluation, not proof that the provider query can still be rerun. The
+receipt preserves query/rule version, digest, window, dimensions, aggregation,
+sample count, missingness, result, provider response digest, and durable link or
+expiration metadata.
+
+Default exemplar fields are bounded time, service/environment/region,
+workload/cohort, route template, status/error class, duration, sanitized code
+frames, and opaque trace coordinates. Headers, cookies, credentials, bodies,
+query strings, environment values, user identifiers, IP addresses, database
+values, stack locals, and arbitrary raw log lines are disallowed. Redaction or
+classification failure withholds the exemplar while preserving the aggregate
+receipt. An investigator cannot hand-pick a favored log line after viewing it;
+that creates, at most, separately labeled attested evidence.
+
+Exemplars alone establish neither prevalence nor exhaustive coverage and cannot
+upgrade a hypothesis to `mechanistically_corroborated`. Causal use requires a
+separately admitted verifier binding exact trace, workload, revision, and changed
+behavior identities to the proposed mechanism.
+
+### Causal support and ratification
+
+Epistemic support and human adjudication remain independent. A principal may
+ratify that root cause is still unknown or that a mitigation worked without
+ratifying a causal claim. The v1 policy does not ratify a positive `caused_by`
+conclusion below `intervention_supported`. Strong forensic or mechanistic
+evidence may remain `mechanistically_corroborated/open`; operational resolution
+does not require overstating causality.
+
+Qualifying interventions include an authorized rollback/roll-forward, bounded
+feature-flag or traffic-cohort isolation, controlled canary withdrawal, targeted
+corrective change, deterministic replay, or faithful isolated reproduction.
+Unsafe production reintroduction is never required. Intervention support binds:
+
+```text
+exact cause, outcome, workload, artifact, and environment identities
+verified cause exposure beginning before outcome onset and overlapping it
+verified outcome measurement or discrepancy
+complete provenance to the exposed cohort
+registered material-runtime-input delta inventory
+pre-recorded mechanism and predicted outcome direction
+exact authorized intervention/reproduction and provider receipt
+compatible exposed/control or before/after measurement receipts
+complete/current coverage and confirmation window
+supporting, opposing, and confounding evidence
+```
+
+If multiple material inputs changed and their effects cannot be separated, an
+execution outcome is ambiguous, coverage is partial/stale, cohorts are mixed, or
+the prediction was written after observing the result, support cannot reach
+`intervention_supported`. Recovery after rollback alone is insufficient.
+
+V1 may ratify `contributing_cause` after one qualifying intervention with no
+unresolved material confounder. `Primary_trigger` additionally requires an
+independent second confirmation, such as withdrawal plus faithful reproduction,
+controlled cohort isolation plus an exact mechanistic trace, or safe controlled
+reintroduction. Universal `necessary_cause`, `sufficient_cause`, and unqualified
+`root cause` claims remain unsupported until a predicate-specific methodology is
+registered.
+
+A second confirmation is independent only when it has distinct source-fact
+identities and a materially different evidentiary failure mode. Re-querying the
+same measurement, rerendering one trace, or deriving two propositions from one
+provider receipt remains one evidentiary line.
+
+Ratification records the exact hypothesis and evidence-bundle digests, causal
+role and bounded scope, achieved support level, supporting and opposing evidence,
+an explicit empty set of unresolved required coverage/material-input gaps, any
+remaining non-blocking residual unknowns, policy version and closure watermark,
+approver identity, and separation-of-duty result. All verified opposing evidence
+must be reconciled or the causal claim remains open. The ratifier is distinct
+from the proposing agent, action executor, and every author of the implicated
+change. A human-role exception requires a previously activated signed
+separation-of-duty policy; an agent never receives that exception.
+
+A failed predicted outcome refutes only that hypothesis/intervention version; it
+does not prove an alternative cause. Later evidence may append `refuted` or
+`superseded` without erasing what was ratified with the evidence then available.
+
+## Deferred provider and capacity choices
+
+The following remain deployment choices rather than epistemic ambiguities:
+
+- queue product, retry cadence, and dead-letter capacity;
+- hot-ledger physical ranges and archive object sizing;
+- private archive provider, key hierarchy, and retention durations;
+- Git/CI/deployment/telemetry connector order;
+- provider-specific query languages and lower operational exemplar caps within
+  the fixed v1 ceilings;
+- service sizing, autoscaling, and regional topology.
+
+Each choice must still satisfy the invariant registry and admission gates. None
+may alter semantic event identity, authority, applicability, replay, erasure,
+discrepancy, causal, or public-boundary behavior.

@@ -116,8 +116,8 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 1578
-    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 509
+    length == 1652
+    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 583
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 863
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
