@@ -39,10 +39,12 @@ The command checks the raw receipt digest against the deployment pin before it
 uses the receipt's profile reference. It then requires canonical bytes,
 manifest closure, all genesis entry kinds and dependencies, exact semantic
 scope, valid Ed25519 attestations, and the signer threshold before connecting
-to CockroachDB. After connecting it requires the exact SQLx migration 3 row to
-be successful before touching the control tables; a later successful migration
-cannot mask a failed or missing control-ledger migration. Neither artifact may
-override physical or semantic routing.
+to CockroachDB. After connecting it requires exactly three successful SQLx rows
+for the uninterrupted prefix 1 through 3 before touching the control tables;
+a later successful migration cannot mask a failed or missing prerequisite.
+This is deliberately a Stage-2 compatibility gate, not proof that the current
+post-v9 schema is ready for Stage-3 activation. Neither artifact may override
+physical or semantic routing.
 
 Apply once, then audit a replay using the same authority:
 
@@ -77,9 +79,9 @@ Use three distinct login principals and three distinct secret values:
 1. the migrator owns/applies schema and is dormant afterward;
 2. the runtime serves MCP and the read-only demo but has no control-table
    privilege;
-3. the control bootstrap login uses only the `fleet_control_bootstrap`
-   principal (or is a member only of that logical role), runs this command once,
-   and is disabled or its secret removed afterward.
+3. the control bootstrap login is a member only of the non-login
+   `fleet_control_bootstrap` logical role, runs this command once, and is
+   disabled or its secret removed afterward.
 
 The migration URL must never fall back to either the runtime URL or the
 bootstrap URL. Deployment validation should reject equal or missing secret
@@ -87,11 +89,19 @@ references. The migrator must not grant runtime access through `ALL TABLES` or
 an `ALTER DEFAULT PRIVILEGES ... ALL TABLES` rule, because that silently grants
 future control tables.
 
-After migration 0003, connect to the dedicated `fleet_recall` database as its
-owner and apply
+The policy can first be applied after migration 0003. Reapply it after every
+later migration creates objects; the current deployment target is the complete
+successful prefix through migration 0009. Connect to the dedicated
+`fleet_recall` database as a
+cluster admin, or as a dedicated security operator with `CREATEROLE`, the
+required role admin options and SYSTEM grant options, plus grant authority on
+every object in the policy, and apply
 [`deploy/cockroach/control-role-grants.sql`](../deploy/cockroach/control-role-grants.sql).
 If the database has another name, produce and review a copy with the database
 identifier changed; do not interpolate an unchecked identifier into SQL.
+Database ownership alone cannot perform the role-option, membership, and SYSTEM
+hardening; the checked-in proof requires those statements to fail for a
+database-owner-only user.
 
 The resulting bootstrap role has:
 
@@ -103,10 +113,28 @@ The resulting bootstrap role has:
 | `memory_control_events` | `SELECT`, `INSERT` |
 | `_sqlx_migrations` | `SELECT` (schema-version preflight only) |
 
-It has no `DELETE`, `CREATE`, `DROP`, role administration, system privilege,
-legacy-memory-table access, or grant option. The runtime and `public` roles
-have no privilege on any control table. The schema owner retains authority for
+The runtime and bootstrap logical roles are forced to `NOLOGIN`,
+`NOCREATEROLE`, and `NOCREATEDB`; the policy removes direct SYSTEM grants,
+inherited admin, and both runtime/bootstrap inheritance directions. Bootstrap
+has no `DELETE`, `CREATE`, `DROP`, role administration, system privilege,
+legacy-memory-table/sequence access, or grant option. Runtime and `public` have
+no privilege on any control table. The policy also re-revokes `public` grants
+on all current tables and sequences. The schema owner retains authority for
 forward migrations and audited repair procedures.
+
+The policy resets current objects and does not create a universal future-object
+default. Run `SHOW DEFAULT PRIVILEGES` as the actual migrator and require no
+table/sequence default granting `public` or either application logical role;
+reapply and re-audit after migrations create objects.
+
+The required raw `INSERT` surface is still powerful: direct SQL can occupy a
+scope singleton with invalid canonical bytes or plant a detached future event
+offset, permanently wedging that scope for this intentionally non-repair role.
+The scoped unique index
+`memory_control_events_predecessor_unique_idx` rejects duplicate forks from one
+digest but cannot compare a new event with the mutable head row. Keep the
+credential exclusive to the reviewed command and treat a wedge as corruption
+requiring an audited forward repair, never implicit deletion or healing.
 
 CockroachDB documents that grants are object-specific and do not automatically
 cover new tables. It also documents the default `public` database/schema
@@ -121,7 +149,11 @@ Run the disposable local proof before deployment:
 ./deploy/cockroach/tests/control-role-grants.sh
 ```
 
-The proof starts an isolated local CockroachDB, applies the control schema and
-role policy, exercises each allowed statement, asserts denied runtime/public,
-DDL, legacy-table, update, and delete paths, prints the effective grants, and
-removes the container. It does not contact AWS or need LocalStack.
+The proof starts an isolated local CockroachDB, applies the current migrations
+0003 through 0009, injects and repairs role-option,
+SYSTEM, admin/cross-role, direct-object, and `public` drift, asserts exact
+current/default privileges, proves a database owner cannot run cluster-security
+hardening, freezes the command's distinct successful-prefix-1-through-3 gate,
+exercises each allowed statement, and rejects authorization escapes and a
+duplicate predecessor. It prints the effective grants and removes the
+container. It does not contact AWS or need LocalStack.
