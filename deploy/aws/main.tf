@@ -8,13 +8,13 @@ locals {
   reference_agent_command = [
     "reference-agent", "--step", "record-decision", "--run-id", "terraform-placeholder"
   ]
-  model_bucket_name    = trimprefix(var.model_bucket_arn, "arn:aws:s3:::")
-  model_prefix         = trim(var.model_object_prefix, "/")
-  model_s3_uri         = "s3://${local.model_bucket_name}/${local.model_prefix}"
-  model_bundle_path    = "/opt/ostk/models/potion-retrieval-32M"
-  image_uri            = "${aws_ecr_repository.app.repository_url}:${var.image_tag}"
-  migration_secret_arn = coalesce(var.migration_database_url_secret_arn, var.database_url_secret_arn)
-  secret_arns          = distinct([var.database_url_secret_arn, local.migration_secret_arn])
+  model_bucket_name              = trimprefix(var.model_bucket_arn, "arn:aws:s3:::")
+  model_prefix                   = trim(var.model_object_prefix, "/")
+  model_s3_uri                   = "s3://${local.model_bucket_name}/${local.model_prefix}"
+  model_bundle_path              = "/opt/ostk/models/potion-retrieval-32M"
+  image_uri                      = "${aws_ecr_repository.app.repository_url}:${var.image_tag}"
+  runtime_database_secret_arns   = [var.database_url_secret_arn]
+  migration_database_secret_arns = [var.migration_database_url_secret_arn]
   model_object_arns = [
     for filename in ["config.json", "model.safetensors", "tokenizer.json"] :
     "${var.model_bucket_arn}/${local.model_prefix}/${filename}"
@@ -99,22 +99,22 @@ data "aws_iam_policy_document" "ecs_assume" {
   }
 }
 
-resource "aws_iam_role" "execution" {
+resource "aws_iam_role" "execution_runtime" {
   name               = "${var.name}-execution"
   assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
 }
 
-resource "aws_iam_role_policy_attachment" "execution" {
-  role       = aws_iam_role.execution.name
+resource "aws_iam_role_policy_attachment" "execution_runtime" {
+  role       = aws_iam_role.execution_runtime.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-data "aws_iam_policy_document" "database_secrets" {
+data "aws_iam_policy_document" "runtime_database_secret" {
   statement {
-    sid       = "ReadDatabaseUrls"
+    sid       = "ReadRuntimeDatabaseUrl"
     effect    = "Allow"
     actions   = ["secretsmanager:GetSecretValue"]
-    resources = local.secret_arns
+    resources = local.runtime_database_secret_arns
   }
 
   dynamic "statement" {
@@ -124,14 +124,88 @@ data "aws_iam_policy_document" "database_secrets" {
       effect    = "Allow"
       actions   = ["kms:Decrypt"]
       resources = statement.value
+
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["secretsmanager.${var.aws_region}.amazonaws.com"]
+      }
+
+      condition {
+        test     = "StringEquals"
+        variable = "kms:EncryptionContext:SecretARN"
+        values   = local.runtime_database_secret_arns
+      }
     }
   }
 }
 
-resource "aws_iam_role_policy" "database_secrets" {
+resource "aws_iam_role_policy" "runtime_database_secret" {
   name   = "database-secret-read"
-  role   = aws_iam_role.execution.id
-  policy = data.aws_iam_policy_document.database_secrets.json
+  role   = aws_iam_role.execution_runtime.id
+  policy = data.aws_iam_policy_document.runtime_database_secret.json
+}
+
+resource "aws_iam_role" "execution_migration" {
+  name               = "${var.name}-migration-execution"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "execution_migration" {
+  role       = aws_iam_role.execution_migration.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+data "aws_iam_policy_document" "migration_database_secret" {
+  statement {
+    sid       = "ReadMigrationDatabaseUrl"
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = local.migration_database_secret_arns
+  }
+
+  dynamic "statement" {
+    for_each = length(var.database_secret_kms_key_arns) == 0 ? [] : [var.database_secret_kms_key_arns]
+    content {
+      sid       = "DecryptDatabaseSecrets"
+      effect    = "Allow"
+      actions   = ["kms:Decrypt"]
+      resources = statement.value
+
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["secretsmanager.${var.aws_region}.amazonaws.com"]
+      }
+
+      condition {
+        test     = "StringEquals"
+        variable = "kms:EncryptionContext:SecretARN"
+        values   = local.migration_database_secret_arns
+      }
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "migration_database_secret" {
+  name   = "migration-database-secret-read"
+  role   = aws_iam_role.execution_migration.id
+  policy = data.aws_iam_policy_document.migration_database_secret.json
+}
+
+moved {
+  from = aws_iam_role.execution
+  to   = aws_iam_role.execution_runtime
+}
+
+moved {
+  from = aws_iam_role_policy_attachment.execution
+  to   = aws_iam_role_policy_attachment.execution_runtime
+}
+
+moved {
+  from = aws_iam_role_policy.database_secrets
+  to   = aws_iam_role_policy.runtime_database_secret
 }
 
 resource "aws_iam_role" "task" {
@@ -541,7 +615,7 @@ resource "aws_ecs_task_definition" "app" {
   network_mode             = "awsvpc"
   cpu                      = tostring(var.task_cpu)
   memory                   = tostring(var.task_memory)
-  execution_role_arn       = aws_iam_role.execution.arn
+  execution_role_arn       = aws_iam_role.execution_runtime.arn
   task_role_arn            = aws_iam_role.task.arn
 
   runtime_platform {
@@ -590,7 +664,8 @@ resource "aws_ecs_task_definition" "app" {
   }])
 
   depends_on = [
-    aws_iam_role_policy.database_secrets,
+    aws_iam_role_policy_attachment.execution_runtime,
+    aws_iam_role_policy.runtime_database_secret,
     aws_iam_role_policy.model_bundle,
   ]
 }
@@ -601,7 +676,7 @@ resource "aws_ecs_task_definition" "migration" {
   network_mode             = "awsvpc"
   cpu                      = tostring(var.task_cpu)
   memory                   = tostring(var.task_memory)
-  execution_role_arn       = aws_iam_role.execution.arn
+  execution_role_arn       = aws_iam_role.execution_migration.arn
   task_role_arn            = aws_iam_role.task.arn
 
   runtime_platform {
@@ -622,7 +697,7 @@ resource "aws_ecs_task_definition" "migration" {
     environment = local.common_environment
     secrets = [{
       name      = "FLEET_RECALL_DATABASE_URL"
-      valueFrom = local.migration_secret_arn
+      valueFrom = var.migration_database_url_secret_arn
     }]
     readonlyRootFilesystem = false
     stopTimeout            = 30
@@ -633,7 +708,8 @@ resource "aws_ecs_task_definition" "migration" {
   }])
 
   depends_on = [
-    aws_iam_role_policy.database_secrets,
+    aws_iam_role_policy_attachment.execution_migration,
+    aws_iam_role_policy.migration_database_secret,
     aws_iam_role_policy.model_bundle,
   ]
 }
@@ -644,7 +720,7 @@ resource "aws_ecs_task_definition" "seed" {
   network_mode             = "awsvpc"
   cpu                      = tostring(var.task_cpu)
   memory                   = tostring(var.task_memory)
-  execution_role_arn       = aws_iam_role.execution.arn
+  execution_role_arn       = aws_iam_role.execution_runtime.arn
   task_role_arn            = aws_iam_role.task.arn
 
   runtime_platform {
@@ -676,7 +752,8 @@ resource "aws_ecs_task_definition" "seed" {
   }])
 
   depends_on = [
-    aws_iam_role_policy.database_secrets,
+    aws_iam_role_policy_attachment.execution_runtime,
+    aws_iam_role_policy.runtime_database_secret,
     aws_iam_role_policy.model_bundle,
   ]
 }
@@ -692,7 +769,7 @@ resource "aws_ecs_task_definition" "reference_agent" {
   network_mode             = "awsvpc"
   cpu                      = tostring(var.task_cpu)
   memory                   = tostring(var.task_memory)
-  execution_role_arn       = aws_iam_role.execution.arn
+  execution_role_arn       = aws_iam_role.execution_runtime.arn
   task_role_arn            = aws_iam_role.task.arn
 
   runtime_platform {
@@ -724,7 +801,8 @@ resource "aws_ecs_task_definition" "reference_agent" {
   }])
 
   depends_on = [
-    aws_iam_role_policy.database_secrets,
+    aws_iam_role_policy_attachment.execution_runtime,
+    aws_iam_role_policy.runtime_database_secret,
     aws_iam_role_policy.model_bundle,
   ]
 }

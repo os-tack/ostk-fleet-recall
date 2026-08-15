@@ -61,6 +61,22 @@ variables {
 run "dormant_cloudfront_bootstrap" {
   command = plan
 
+  override_resource {
+    target          = aws_iam_role.execution_runtime
+    override_during = plan
+    values = {
+      arn = "arn:aws:iam::123456789012:role/runtime-execution"
+    }
+  }
+
+  override_resource {
+    target          = aws_iam_role.execution_migration
+    override_during = plan
+    values = {
+      arn = "arn:aws:iam::123456789012:role/migration-execution"
+    }
+  }
+
   assert {
     condition     = aws_ecs_service.app.desired_count == 0
     error_message = "the service must default to dormant before the first migration"
@@ -96,6 +112,25 @@ run "dormant_cloudfront_bootstrap" {
       var.database_url_secret_arn
     )
     error_message = "the reference agent must use the runtime DML credential"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ecs_task_definition.app.container_definitions)[0].secrets[0].valueFrom == var.database_url_secret_arn &&
+      jsondecode(aws_ecs_task_definition.migration.container_definitions)[0].secrets[0].valueFrom == var.migration_database_url_secret_arn &&
+      aws_iam_role.execution_runtime.name == "${var.name}-execution" &&
+      aws_iam_role.execution_migration.name == "${var.name}-migration-execution" &&
+      aws_iam_role.execution_runtime.name != aws_iam_role.execution_migration.name &&
+      aws_ecs_task_definition.app.execution_role_arn == aws_iam_role.execution_runtime.arn &&
+      aws_ecs_task_definition.seed.execution_role_arn == aws_iam_role.execution_runtime.arn &&
+      aws_ecs_task_definition.reference_agent.execution_role_arn == aws_iam_role.execution_runtime.arn &&
+      aws_ecs_task_definition.migration.execution_role_arn == aws_iam_role.execution_migration.arn &&
+      local.runtime_database_secret_arns == [var.database_url_secret_arn] &&
+      local.migration_database_secret_arns == [var.migration_database_url_secret_arn] &&
+      !contains(local.runtime_database_secret_arns, var.migration_database_url_secret_arn) &&
+      !contains(local.migration_database_secret_arns, var.database_url_secret_arn)
+    )
+    error_message = "runtime and migration tasks and policies must use distinct secrets and execution roles"
   }
 
   assert {
@@ -374,6 +409,16 @@ run "rejects_wildcard_migration_secret" {
 
   variables {
     migration_database_url_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:*"
+  }
+
+  expect_failures = [var.migration_database_url_secret_arn]
+}
+
+run "rejects_shared_runtime_and_migration_secret" {
+  command = plan
+
+  variables {
+    migration_database_url_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-runtime-AbCdEf"
   }
 
   expect_failures = [var.migration_database_url_secret_arn]

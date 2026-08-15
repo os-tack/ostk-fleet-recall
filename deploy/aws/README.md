@@ -41,9 +41,10 @@ evidence. None was rerun for revision 10.
 - A CockroachDB Cloud database and two SQL users in production: a
   DDL-capable migrator and a least-privilege runtime user. See
   [MIGRATIONS.md](../../docs/MIGRATIONS.md).
-- Two Secrets Manager secrets whose *raw values* are the corresponding
-  `postgresql://` URLs. Keep `sslmode=verify-full`. Terraform receives only
-  their ARNs, so credentials never enter Terraform configuration or state.
+- Two distinct Secrets Manager secrets whose *raw values* are the corresponding
+  `postgresql://` URLs. Keep `sslmode=verify-full`. Terraform requires both
+  concrete ARNs and rejects reuse, so credentials never enter Terraform
+  configuration or state.
 - A private, encrypted S3 bucket containing exactly the model files consumed
   at runtime under one immutable release prefix:
 
@@ -498,11 +499,13 @@ dropped, and the temporary workstation network rule was removed after capture.
 - The runtime container is UID/GID `10001`, with no shell login and no inbound
   port except ALB-to-task TCP/8080. The writable layer is required only because
   Fargate downloads a verified model into ephemeral storage on cold start.
-- The execution role reads the declared database secrets. The application task
-  role reads only three model objects. There is no wildcard bucket access.
+- Separate runtime and migration execution roles each read exactly one database
+  secret. Customer-managed KMS decrypt is restricted to Secrets Manager and
+  that role's exact secret encryption context. The application task role reads
+  only three model objects. There is no wildcard bucket access.
 - The runtime SQL user needs DML on the Fleet Recall tables and read access to
   `_sqlx_migrations`; it does not need schema creation. The separate migration
-  task definition can inject a different, DDL-capable secret.
+  task definition must inject the distinct DDL-capable secret.
 - Each task is permanently bound to one tenant, project, agent, privacy tier,
   embedding model, and bundle digest through deployment configuration. Public
   request data cannot select a different tenant or project.

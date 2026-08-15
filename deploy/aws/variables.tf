@@ -112,20 +112,20 @@ variable "database_url_secret_arn" {
 }
 
 variable "migration_database_url_secret_arn" {
-  description = "Optional ARN for a DDL-capable URL. Defaults to the runtime secret only for a demo."
+  description = "Required ARN for a DDL-capable URL that is distinct from the runtime secret."
   type        = string
-  default     = null
-  nullable    = true
   sensitive   = true
 
   validation {
-    condition = var.migration_database_url_secret_arn == null || (
+    condition = (
       can(regex(
         "^arn:aws:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$",
         var.migration_database_url_secret_arn,
-      )) && !strcontains(var.migration_database_url_secret_arn, "*")
+      )) &&
+      !strcontains(var.migration_database_url_secret_arn, "*") &&
+      var.migration_database_url_secret_arn != var.database_url_secret_arn
     )
-    error_message = "migration_database_url_secret_arn must be one concrete commercial-partition Secrets Manager ARN without wildcards."
+    error_message = "migration_database_url_secret_arn must be one concrete commercial-partition Secrets Manager ARN, without wildcards, and distinct from database_url_secret_arn."
   }
 }
 
