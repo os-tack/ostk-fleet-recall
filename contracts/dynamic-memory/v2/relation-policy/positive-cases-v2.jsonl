@@ -1,0 +1,1 @@
+{"cases":["authenticated_actor_required","declared_supports_only","exact_resource_identity_constraints","required_applicability_dimensions","server_routed_proof","support_event_bounds"],"entry_schema_id":"registry.relation_proof","expected_outcome":"accept","fixture_authority":"test_only_no_runtime_authority","schema_version":2,"suite_id":"relation.proof.v2.positive"}

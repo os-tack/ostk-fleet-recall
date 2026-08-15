@@ -18,6 +18,7 @@ pub mod identity;
 pub mod normative;
 pub mod registry;
 pub mod relation;
+pub mod relation_policy_v2;
 pub mod remember_v2;
 pub mod successor_package;
 pub mod successor_policy;
