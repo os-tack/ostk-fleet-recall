@@ -8,10 +8,13 @@
 //! transaction before it may append an event.
 //!
 //! Source-fact identity is deliberately independent of registry activation.
-//! Connector, evidence-schema, identity-recipe, policy, profile, or head
-//! changes instead mint an explicitly linked representation. Delivery IDs,
-//! receipt clocks, storage locations, and physical partition coordinates stay
-//! outside the accepted-event preimage.
+//! Head, connector, evidence-schema, policy, profile, or governance changes
+//! that preserve the exact resource identities instead mint an explicitly
+//! linked representation. An identity-recipe revision is different: the exact
+//! recipe reference participates in its resource-locator digest, so runtime
+//! admission must rederive the affected URI and therefore a distinct source
+//! fact. Delivery IDs, receipt clocks, storage locations, and physical
+//! partition coordinates stay outside the accepted-event preimage.
 
 use std::fmt;
 
@@ -30,7 +33,7 @@ use super::{
         AcceptedEventId, ErasureScopeReferenceV1, GovernedContentIdentityV1, IntegrityState,
         PublicationClass, RetentionClass, VisibilityClass,
     },
-    identity::ResourceUri,
+    identity::{IdentityForm, ResourceUri},
     registry::{RegistryEntryKind, RegistryEntryV1, RegistryHeadV1},
 };
 
@@ -190,7 +193,8 @@ pub struct ConnectorSchemaV2 {
     pub version: u32,
     pub provider_namespace: RegistryReferenceV1,
     pub evidence_schema: RegistryReferenceV1,
-    pub identity_recipe: RegistryReferenceV1,
+    pub provider_instance_identity_recipe: RegistryReferenceV1,
+    pub canonical_resource_identity_recipe: RegistryReferenceV1,
     pub consistency_partition_recipe: ConsistencyPartitionRecipeV1,
     pub authenticated_scope_required: bool,
     pub delivery_id_in_semantic_identity: bool,
@@ -201,7 +205,8 @@ impl ConnectorSchemaV2 {
     pub fn validate(&self) -> ContractResult<()> {
         self.provider_namespace.validate()?;
         self.evidence_schema.validate()?;
-        self.identity_recipe.validate()?;
+        self.provider_instance_identity_recipe.validate()?;
+        self.canonical_resource_identity_recipe.validate()?;
         self.consistency_partition_recipe.validate()?;
         if self.schema_version != CONNECTOR_SCHEMA_VERSION
             || self.version == 0
@@ -272,7 +277,7 @@ impl StructurallyResolvedConnectorSchemaV2 {
 /// Connector schema is absent on purpose. Provider namespace and immutable
 /// provider coordinates identify the fact; interpretation belongs to a
 /// representation. Structural validation does not authenticate caller-supplied
-/// resource URIs: runtime admission must rederive both URIs through the
+/// resource URIs: runtime admission must rederive each URI through its exact
 /// activated identity-recipe witness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -290,7 +295,9 @@ pub struct SourceFactIdentityV2 {
 impl SourceFactIdentityV2 {
     pub fn validate(&self) -> ContractResult<()> {
         self.provider_namespace.validate()?;
-        if self.schema_version != EVIDENCE_SCHEMA_VERSION {
+        if self.schema_version != EVIDENCE_SCHEMA_VERSION
+            || self.provider_instance_id.identity_form() != IdentityForm::Entity
+        {
             return Err(ContractError::Schema(
                 "invalid source-fact identity v2".into(),
             ));
@@ -320,7 +327,8 @@ pub struct RepresentationIdentityV2 {
     pub connector_schema: RegistryReferenceV1,
     pub evidence_schema: RegistryReferenceV1,
     pub canonicalization_profile: ProfileReferenceV1,
-    pub identity_recipe: RegistryReferenceV1,
+    pub provider_instance_identity_recipe: RegistryReferenceV1,
+    pub canonical_resource_identity_recipe: RegistryReferenceV1,
     pub redaction_policy: RegistryReferenceV1,
     pub classifier_policy: RegistryReferenceV1,
     pub retention_policy: RegistryReferenceV1,
@@ -339,7 +347,8 @@ impl RepresentationIdentityV2 {
         self.connector_schema.validate()?;
         self.evidence_schema.validate()?;
         self.canonicalization_profile.validate()?;
-        self.identity_recipe.validate()?;
+        self.provider_instance_identity_recipe.validate()?;
+        self.canonical_resource_identity_recipe.validate()?;
         self.redaction_policy.validate()?;
         self.classifier_policy.validate()?;
         self.retention_policy.validate()?;
@@ -449,7 +458,10 @@ impl EvidenceStatementV2 {
         if self.representation.connector_schema != *connector.registry_reference()
             || self.source_fact.provider_namespace != connector.schema().provider_namespace
             || self.representation.evidence_schema != connector.schema().evidence_schema
-            || self.representation.identity_recipe != connector.schema().identity_recipe
+            || self.representation.provider_instance_identity_recipe
+                != connector.schema().provider_instance_identity_recipe
+            || self.representation.canonical_resource_identity_recipe
+                != connector.schema().canonical_resource_identity_recipe
         {
             return Err(ContractError::ManifestMismatch);
         }
@@ -635,51 +647,47 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     const EXPECTED_SOURCE_FACT_ID: &str =
-        "e3a84783be2dbde0958cefa9861768e194cdcd2e3cbf07019826c47f2e01f885";
+        "1b85e827dbdb36627ba53dd336ac1ca42a811bfdbd0395631d1e60062ee3610c";
     const EXPECTED_REPRESENTATION_KEY: &str =
-        "af1ad4e3835a2b616eadef9fd9ed2e9b6a31df56c1841a19dab97ec19a1452a1";
+        "43524ede361ff9a5b797c45c301175bc4f20a33a1b2686675b9558f44703c239";
     const EXPECTED_EVENT_ID: &str =
-        "add915c395599859120b8db54ca3fdc5658df614fc394ae7c841d14c95ebeeb5";
+        "7eec4cae23bee151e5e12bd966f01b9bb3e0b3bc45e72de9214ba5fd2a284aa2";
     const EXPECTED_CONNECTOR_ENTRY_DIGEST: &str =
-        "bbdf3a252192b735e70314a859b9fb464d8b2788e70b39aaf1b0993419ae25b6";
+        "65adedae08d6f23fea387ad91e2bdf1de16ad9f2662fa392192b2d28693c03f6";
     const EXPECTED_SUCCESSOR_KEY: &str =
-        "a3005488de3622a52aad93b7eb90b037c39816068ef8bd75f6258e2430c0014d";
+        "62405e1dfeb3d286aa043272d63a0d53e74e638271334a101761b99c24cfc9a2";
     const EXPECTED_SUCCESSOR_EVENT_ID: &str =
-        "94fb24f28c56d00666f1ae6d3b6411d47239ba54ef46e2ad784963e6352c33cb";
+        "fa8a78763eca031b420b2b3602aaa5fe983087a072c40cd5f9f9827d4270a616";
     const EXPECTED_VECTOR_SUITE_DIGEST: &str =
-        "21ccff66309c522716ad31b6a4105d2011ff39ef2f29d09890f437c58e33329c";
+        "d0c485a45d9ba15eb5512c0ab8f40a7e5ce4c3bd774e39b8168424b9fafe9141";
     const EXPECTED_POLICY_KEY: &str =
-        "4357cd6d1297d5d62ae48bfb179f8a0a4b988dc67b94051e61d171cacadd0fc5";
+        "fb2e1566070e794b144a66e31de91f9fcdb462ee1b6b13e6edf6915235e6f808";
     const EXPECTED_POLICY_EVENT_ID: &str =
-        "6ffd3618de84c3a0fa439e0d7b31958bd10486a7260fac1092f9e6eae1bb153a";
+        "632b73e45afefd57e8296ef52635ae95f64c8818e896ac91a86261139fb0ebd1";
     const EXPECTED_PROFILE_KEY: &str =
-        "9e4c72f6e2b3130cd8aff111a8b22be08698e13e106f4e2de9aa61f32b42fb60";
+        "f1ce4d4fc0d332a2ce94e506972d3bcf3a44d4320a75112b441a764db08043ca";
     const EXPECTED_PROFILE_EVENT_ID: &str =
-        "ce95ee3900a4560cc4fa17c5806e309364f89d9cab6c44477c38d9258ca238aa";
-    const EXPECTED_RECIPE_KEY: &str =
-        "0a6f7ed0c6ea6e20d28d44016f139e9dda811a21a8ea19424afe4f531a97e319";
-    const EXPECTED_RECIPE_EVENT_ID: &str =
-        "0da3814fb0e3b761784721f394a735f64d75a3239adf7edbcf768bd53bcacb19";
+        "f84677e70fde5ae5a0b3583e038179d3cd0e756ca2bc24a91692bc42cdc90637";
     const EXPECTED_INTEGRITY_KEY: &str =
-        "19805ce180da0be57c94ec6423f8f7d5421f45925c52dabc4355d8074a19fd9a";
+        "422f0ae9d0f996661269f2c4ce4dedf6ac37edc8c650de67f076adfc176ec538";
     const EXPECTED_INTEGRITY_EVENT_ID: &str =
-        "d27b0e1133dd5d583e3114c0a8c53eb8f78b7b4f61a595a74fd6366db8f3d071";
+        "d6aebb962c0fc25811d0e4a870cbb3afb2376285dbdfb460da763a1bd69a389c";
     const EXPECTED_CONNECTOR_RAW_SHA256: &str =
-        "18f92641a54373b942c11d33794cdc07ce429101a962a37e9ff727f70072393e";
+        "2c7eed9d0a5b9107415b9f11551b6db5923aeb11e991e2b56c091038756f34f7";
     const EXPECTED_SOURCE_RAW_SHA256: &str =
-        "1b4dab69a207f6ec2ed26bcbe5c64806a6fe43f39b59953df45707a8c3075763";
+        "7771c8ede425cce12528ceca81d69662d05b4ba19811e1a2b90da89c18b46225";
     const EXPECTED_REPRESENTATION_RAW_SHA256: &str =
-        "c6ef55b811d72ccd304064067e06ac52d6e7c6c361491b2947ae7a17211574e4";
+        "abadfb76594e8001700c4b61ea2ae4dbfe26d1234129419ebb2f311ff14bb660";
     const EXPECTED_SUCCESSOR_RAW_SHA256: &str =
-        "fce7534fa945fe71fc5efe158b9e6ed4ef9323204524c60f0c18dfefdc0c6092";
+        "05053b36f4e3e7fda74c9b102a96bd23a3d0fd9deeb2f66888a4a39737cf0e7b";
     const EXPECTED_STATEMENT_RAW_SHA256: &str =
-        "5e2a6b727229da15a149f55c07374812720169bb9e81b0d970c0902efe8a4420";
+        "7c64432cc11c7f85c721ee3789343f4c22804fbe2ef34a946f7f8d652bfc199a";
     const EXPECTED_BAD_FAMILY_RAW_SHA256: &str =
-        "bce6d6f1bb8d347d15ccf8bde028d7301897aaf2be35819d39a0c2c6b2040255";
+        "6c9470b0760a3789d267d5416b9900cf0787c3b47ebda6a165eefab1176f9022";
     const EXPECTED_BAD_DERIVATION_RAW_SHA256: &str =
-        "001c53551a904d5c78c7dd4de474619ece287c16ec7f5720f4732d71d1aef2ff";
+        "587d239629963b92274382fcb4609c6d39515a2bee6e4e6288286c47511824a1";
     const EXPECTED_VECTOR_SUITE_RAW_SHA256: &str =
-        "e42e3326eafe428b280464682f761a5fc8b82623c7efbeb0d9e6ad45c3fda721";
+        "3bdd2c2112023772b33fe9e5479f823d6293350339686c250a431a034b2d9628";
 
     fn digest(domain: DigestDomain, label: &str) -> Sha256Digest {
         domain_separated_digest(domain, label.as_bytes())
@@ -693,9 +701,10 @@ mod tests {
         }
     }
 
-    fn resource(label: &str) -> ResourceUri {
+    fn resource(identity_form: IdentityForm, resource_kind: &str, label: &str) -> ResourceUri {
         format!(
-            "urn:ostk:occurrence:v1:provider_event:sha256:{}",
+            "urn:ostk:{}:v1:{resource_kind}:sha256:{}",
+            identity_form.as_str(),
             digest(DigestDomain::ResourceLocator, label)
         )
         .parse()
@@ -724,7 +733,8 @@ mod tests {
             version: 2,
             provider_namespace: reference("namespace.github", 1),
             evidence_schema: reference("evidence.github.push", 2),
-            identity_recipe: reference("identity.github.push", 2),
+            provider_instance_identity_recipe: reference("identity.github.provider_instance", 1),
+            canonical_resource_identity_recipe: reference("identity.github.push", 2),
             consistency_partition_recipe: ConsistencyPartitionRecipeV1 {
                 schema_version: 1,
                 recipe_id: ContractId::new(CONSISTENCY_RECIPE_ID).unwrap(),
@@ -766,11 +776,19 @@ mod tests {
                 ContractId::new("project.fixture").unwrap(),
             ),
             provider_namespace: reference("namespace.github", 1),
-            provider_instance_id: resource("provider-instance"),
+            provider_instance_id: resource(
+                IdentityForm::Entity,
+                "provider_instance",
+                "provider-instance",
+            ),
             logical_event_key: HexBytes::new(b"push:123".to_vec()).unwrap(),
             provider_object_id: HexBytes::new(b"123".to_vec()).unwrap(),
             immutable_revision: HexBytes::new(b"sha256:abc".to_vec()).unwrap(),
-            canonical_resource_id: resource("provider-event"),
+            canonical_resource_id: resource(
+                IdentityForm::Occurrence,
+                "provider_event",
+                "provider-event",
+            ),
         }
     }
 
@@ -783,7 +801,8 @@ mod tests {
             connector_schema: resolved_connector().registry_reference().clone(),
             evidence_schema: reference("evidence.github.push", 2),
             canonicalization_profile: frozen_profile_reference_v1(),
-            identity_recipe: reference("identity.github.push", 2),
+            provider_instance_identity_recipe: reference("identity.github.provider_instance", 1),
+            canonical_resource_identity_recipe: reference("identity.github.push", 2),
             redaction_policy: reference("redaction.default", 2),
             classifier_policy: reference("classifier.default", 2),
             retention_policy: reference("retention.default", 2),
@@ -1010,6 +1029,11 @@ mod tests {
     fn connector_entry_closes_over_frozen_source_fact_recipe() {
         let resolved = resolved_connector();
         assert_eq!(resolved.schema(), &connector_schema());
+        assert_ne!(
+            resolved.schema().provider_instance_identity_recipe,
+            resolved.schema().canonical_resource_identity_recipe,
+            "the Git push fixture uses distinct recipes for its two resource kinds"
+        );
         let statement = origin_statement();
         statement
             .validate_against_structural_connector(&resolved)
@@ -1032,6 +1056,96 @@ mod tests {
                 "physical/logical append field entered the semantic preimage"
             );
         }
+    }
+
+    #[test]
+    fn source_fact_requires_an_entity_provider_instance_without_freezing_its_kind() {
+        let source = source_fact();
+        source.validate().unwrap();
+        assert_eq!(
+            source.provider_instance_id.identity_form(),
+            IdentityForm::Entity
+        );
+        assert_eq!(
+            source.provider_instance_id.resource_kind().as_str(),
+            "provider_instance"
+        );
+
+        let mut occurrence = source.clone();
+        occurrence.provider_instance_id = resource(
+            IdentityForm::Occurrence,
+            "provider_instance",
+            "provider-instance",
+        );
+        assert!(occurrence.validate().is_err());
+
+        let mut provider_specific_kind = source;
+        provider_specific_kind.provider_instance_id = resource(
+            IdentityForm::Entity,
+            "installation",
+            "provider-installation",
+        );
+        provider_specific_kind.validate().unwrap();
+    }
+
+    #[test]
+    fn statement_copies_both_exact_connector_identity_recipes() {
+        let connector = resolved_connector();
+        let origin = origin_statement();
+        origin
+            .validate_against_structural_connector(&connector)
+            .unwrap();
+
+        for role in ["provider_instance", "canonical_resource"] {
+            let mut mismatched = origin.clone();
+            match role {
+                "provider_instance" => {
+                    mismatched.representation.provider_instance_identity_recipe =
+                        reference("identity.github.provider_instance", 2);
+                }
+                "canonical_resource" => {
+                    mismatched.representation.canonical_resource_identity_recipe =
+                        reference("identity.github.push", 3);
+                }
+                _ => unreachable!(),
+            }
+            mismatched.representation_key =
+                derive_representation_key_v2(&mismatched.representation).unwrap();
+            assert_eq!(mismatched.source_fact_id, origin.source_fact_id);
+            assert_ne!(mismatched.representation_key, origin.representation_key);
+            assert_ne!(
+                mismatched.accepted_event_id().unwrap(),
+                origin.accepted_event_id().unwrap()
+            );
+            assert_eq!(
+                mismatched.validate_against_structural_connector(&connector),
+                Err(ContractError::ManifestMismatch),
+                "accepted a mismatched {role} identity recipe"
+            );
+        }
+    }
+
+    #[test]
+    fn one_recipe_may_fill_both_explicit_roles_for_the_same_resource() {
+        let shared_recipe = reference("identity.github.provider_instance", 1);
+        let mut connector = connector_schema();
+        connector.provider_instance_identity_recipe = shared_recipe.clone();
+        connector.canonical_resource_identity_recipe = shared_recipe.clone();
+        connector.validate().unwrap();
+
+        let mut source = source_fact();
+        source.canonical_resource_id = source.provider_instance_id.clone();
+        let source_fact_id = derive_source_fact_id_v2(&source).unwrap();
+
+        let mut representation = origin_representation();
+        representation.source_fact_id = source_fact_id;
+        representation.provider_instance_identity_recipe = shared_recipe.clone();
+        representation.canonical_resource_identity_recipe = shared_recipe;
+        representation.erasure_scopes = vec![ErasureScopeReferenceV1 {
+            kind: super::super::evidence::ErasureScopeKind::SourceFact,
+            target_digest: source_fact_id.digest(),
+        }];
+        representation.validate().unwrap();
     }
 
     #[test]
@@ -1067,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_aba_and_every_interpretation_change_mint_successors() {
+    fn registry_aba_and_non_recipe_representation_changes_mint_successors() {
         let origin = origin_statement();
         let aba = head_successor_statement();
         assert_ne!(origin.representation_key, aba.representation_key);
@@ -1085,8 +1199,6 @@ mod tests {
         let mut profile = origin.representation.clone();
         profile.canonicalization_profile.profile_digest =
             digest(DigestDomain::CanonicalProfile, "profile-v2-successor");
-        let mut recipe = origin.representation.clone();
-        recipe.identity_recipe = reference("identity.github.push", 3);
         let mut integrity = origin.representation.clone();
         integrity.integrity_state = IntegrityState::SignatureVerified;
         let cases = [
@@ -1101,12 +1213,6 @@ mod tests {
                 profile,
                 EXPECTED_PROFILE_KEY,
                 EXPECTED_PROFILE_EVENT_ID,
-            ),
-            (
-                "identity_recipe",
-                recipe,
-                EXPECTED_RECIPE_KEY,
-                EXPECTED_RECIPE_EVENT_ID,
             ),
             (
                 "integrity",
@@ -1128,6 +1234,11 @@ mod tests {
             assert_ne!(
                 origin.accepted_event_id().unwrap(),
                 successor.accepted_event_id().unwrap(),
+                "{label}"
+            );
+            assert_eq!(
+                replay_disposition_v2(&origin, &successor).unwrap(),
+                ReplayDispositionV2::NewRepresentation,
                 "{label}"
             );
             assert_eq!(
@@ -1286,6 +1397,19 @@ mod tests {
         for (name, bytes) in records {
             println!("FIXTURE {name} {}", String::from_utf8(bytes).unwrap());
         }
+        let connector_bytes = encode_canonical(&connector_schema()).unwrap();
+        let connector_json = String::from_utf8(connector_bytes).unwrap();
+        println!(
+            "FIXTURE negative-connector-family.jsonl {}",
+            connector_json.replace("\"family\":\"source_fact\"", "\"family\":\"request\"")
+        );
+        println!(
+            "FIXTURE negative-connector-derivation.jsonl {}",
+            connector_json.replace(
+                "\"key_derivation\":\"source_fact_id\"",
+                "\"key_derivation\":\"delivery_id\""
+            )
+        );
         let origin = origin_statement();
         let successor = head_successor_statement();
         println!("SOURCE_FACT_ID {}", origin.source_fact_id);
@@ -1303,7 +1427,6 @@ mod tests {
         for (label, mut representation) in [
             ("policy", origin.representation.clone()),
             ("profile", origin.representation.clone()),
-            ("identity_recipe", origin.representation.clone()),
             ("integrity", origin.representation.clone()),
         ] {
             match label {
@@ -1313,9 +1436,6 @@ mod tests {
                 "profile" => {
                     representation.canonicalization_profile.profile_digest =
                         digest(DigestDomain::CanonicalProfile, "profile-v2-successor");
-                }
-                "identity_recipe" => {
-                    representation.identity_recipe = reference("identity.github.push", 3);
                 }
                 "integrity" => {
                     representation.integrity_state = IntegrityState::SignatureVerified;
