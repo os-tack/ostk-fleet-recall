@@ -98,7 +98,7 @@ docker exec "$container" cockroach sql \
         UPDATE _sqlx_migrations SET success = false WHERE version = 3;
         INSERT INTO _sqlx_migrations
             (version, description, installed_on, success, checksum, execution_time)
-        SELECT 4, 'synthetic later success', installed_on, true, checksum, execution_time
+        SELECT 9999, 'synthetic later success', installed_on, true, checksum, execution_time
         FROM _sqlx_migrations WHERE version = 3" >/dev/null
 if invalid_schema=$(run_cli inspect 2>&1); then
     fail "failed migration 3 was masked by successful migration 4"
@@ -111,7 +111,7 @@ docker exec "$container" cockroach sql \
     --user=proof_admin \
     --database=fleet_recall \
     --execute "
-        DELETE FROM _sqlx_migrations WHERE version = 4;
+        DELETE FROM _sqlx_migrations WHERE version = 9999;
         UPDATE _sqlx_migrations SET success = true WHERE version = 3" >/dev/null
 
 absent=$(run_cli inspect)
