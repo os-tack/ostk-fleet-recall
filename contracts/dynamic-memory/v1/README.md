@@ -24,6 +24,13 @@ reproducibility, their Ed25519 private seeds are respectively 32 repetitions of
 bytes `01`, `02`, and `03`. They MUST NOT appear in deployment configuration,
 authorize a live registry, or sign runtime data.
 
+`genesis-activation/` freezes the separate Stage-3 request ceremony that may
+propose the first active registry head after the Stage-2 bootstrap has been
+durably accepted. Its test result, statement, approvals, receipt, and event are
+deterministic non-authoritative fixtures. Runtime authority additionally
+requires the private repository to re-audit the persisted bootstrap, choose one
+database acceptance time, and atomically append the event and install the head.
+
 Changing any canonical JSON record, expected digest, signature, profile rule,
 or vector outcome is a contract-version change. Cosmetic prose in this README
 is not identity-bearing.

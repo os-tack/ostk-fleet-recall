@@ -12,6 +12,7 @@ pub mod digest;
 pub mod error;
 pub mod evidence;
 pub mod genesis;
+pub mod genesis_activation;
 pub mod identity;
 pub mod normative;
 pub mod registry;
