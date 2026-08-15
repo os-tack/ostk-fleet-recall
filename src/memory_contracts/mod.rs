@@ -15,4 +15,7 @@ pub mod identity;
 pub mod normative;
 pub mod registry;
 
+#[cfg(test)]
+mod vectors;
+
 pub use error::{ContractError, ContractResult};
