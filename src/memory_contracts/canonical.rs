@@ -635,6 +635,13 @@ mod tests {
         enabled: bool,
     }
 
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct DefaultedSchema {
+        #[serde(default)]
+        enabled: bool,
+    }
+
     #[test]
     fn typed_decode_rejects_unknown_fields_after_strict_parse() {
         assert_eq!(
@@ -648,13 +655,6 @@ mod tests {
     fn canonical_typed_requires_exact_bytes_and_explicit_defaults() {
         assert!(CanonicalTyped::<ClosedSchema>::decode(br#"{ "enabled": true }"#).is_err());
         assert!(CanonicalTyped::<ClosedSchema>::decode(br#"{"enabled":true}"#).is_ok());
-
-        #[derive(Debug, Deserialize, Serialize)]
-        #[serde(deny_unknown_fields)]
-        struct DefaultedSchema {
-            #[serde(default)]
-            enabled: bool,
-        }
 
         assert!(CanonicalTyped::<DefaultedSchema>::decode(b"{}").is_err());
         assert!(CanonicalTyped::<DefaultedSchema>::decode(br#"{"enabled":false}"#).is_ok());

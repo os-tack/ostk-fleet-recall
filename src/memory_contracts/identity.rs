@@ -753,7 +753,7 @@ mod tests {
         version_recipe.resource_kind = ContractId::new("repository_revision").unwrap();
         version_recipe.resource_kind_schema = reference("repository_revision", 1, "version-kind");
         let mut recipe = validated(version_recipe);
-        recipe.parent_entity_kind = Some(entity_recipe.recipe.resource_kind_schema.clone());
+        recipe.parent_entity_kind = Some(entity_recipe.recipe.resource_kind_schema);
         let mut locator = locator(&recipe, "12345");
         assert!(derive_resource_uri(&context(), &locator, &recipe, None).is_err());
 
