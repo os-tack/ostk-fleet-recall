@@ -13,6 +13,9 @@ use crate::control_log::TrustedControlScope;
 use crate::memory_contracts::bootstrap::{BootstrapPin, BootstrapReceiptDigest};
 use crate::memory_contracts::common::{AuthenticatedProjectScopeV1, ContractId};
 use crate::memory_contracts::digest::Sha256Digest;
+use crate::memory_contracts::genesis_activation::{
+    GenesisActivationPrincipalBinding, RegistryTestResultDigest, RegistryTestRunnerPin,
+};
 use crate::{FleetError, FleetScope, Result};
 
 /// Deployment-only authority needed by the private control-ledger bootstrap.
@@ -96,6 +99,140 @@ impl ControlBootstrapRuntimeConfig {
 
     #[must_use]
     pub const fn authority(&self) -> &ControlBootstrapConfig {
+        &self.authority
+    }
+}
+
+/// Deployment-only authority for the private genesis-registry activation.
+///
+/// The activation ceremony binds the same physical and semantic scope as its
+/// durable Stage-2 predecessor. Its bootstrap, conformance-runner, result, and
+/// principal identities all come from trusted process configuration rather
+/// than from CLI routing fields or the artifacts being verified.
+#[derive(Clone)]
+pub struct RegistryActivationConfig {
+    trusted_scope: TrustedControlScope,
+    bootstrap_receipt_digest: BootstrapReceiptDigest,
+    test_result_digest: RegistryTestResultDigest,
+    test_runner_artifact_digest: Sha256Digest,
+    test_runner_configuration_digest: Sha256Digest,
+    proposer_principal_id: ContractId,
+    package_author_principal_id: ContractId,
+}
+
+impl std::fmt::Debug for RegistryActivationConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegistryActivationConfig")
+            .field("trusted_scope", &self.trusted_scope)
+            .field("bootstrap_receipt_digest", &"<redacted>")
+            .field("test_result_digest", &"<redacted>")
+            .field("test_runner_artifact_digest", &"<redacted>")
+            .field("test_runner_configuration_digest", &"<redacted>")
+            .field("proposer_principal_id", &"<bound>")
+            .field("package_author_principal_id", &"<bound>")
+            .finish()
+    }
+}
+
+impl RegistryActivationConfig {
+    #[must_use]
+    pub const fn trusted_scope(&self) -> &TrustedControlScope {
+        &self.trusted_scope
+    }
+
+    #[must_use]
+    pub const fn bootstrap_receipt_digest(&self) -> BootstrapReceiptDigest {
+        self.bootstrap_receipt_digest
+    }
+
+    /// Reconstitute the bootstrap authority token only at verification.
+    #[must_use]
+    pub const fn bootstrap_pin(&self) -> BootstrapPin {
+        BootstrapPin::from_trusted_config(self.bootstrap_receipt_digest)
+    }
+
+    /// Reconstitute the exact conformance-runner authority at verification.
+    #[must_use]
+    pub const fn test_runner_pin(&self) -> RegistryTestRunnerPin {
+        RegistryTestRunnerPin::from_trusted_config(
+            self.test_runner_artifact_digest,
+            self.test_runner_configuration_digest,
+            self.test_result_digest,
+        )
+    }
+
+    /// Reconstitute the principal binding only at activation verification.
+    #[must_use]
+    pub fn principal_binding(&self) -> GenesisActivationPrincipalBinding {
+        GenesisActivationPrincipalBinding::from_trusted_config(
+            self.proposer_principal_id.clone(),
+            self.package_author_principal_id.clone(),
+        )
+    }
+}
+
+/// Minimal process configuration for the workstation-only activation binary.
+///
+/// This surface intentionally has its own database URL and no serving,
+/// bootstrap-database, embedding-model, HTTP, MCP, container, or cloud inputs.
+#[derive(Clone)]
+pub struct RegistryActivationRuntimeConfig {
+    database_url: String,
+    authority: RegistryActivationConfig,
+}
+
+impl std::fmt::Debug for RegistryActivationRuntimeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegistryActivationRuntimeConfig")
+            .field("database_url", &"<redacted>")
+            .field("authority", &self.authority)
+            .finish()
+    }
+}
+
+impl RegistryActivationRuntimeConfig {
+    /// Read only the dedicated database URL and exact activation authority.
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        registry_activation_runtime_config(
+            &required_from(&mut lookup, "FLEET_RECALL_REGISTRY_DATABASE_URL")?,
+            &required_from(&mut lookup, "FLEET_RECALL_REGISTRY_TENANT_ID")?,
+            &required_from(&mut lookup, "FLEET_RECALL_REGISTRY_PROJECT")?,
+            &required_from(&mut lookup, "FLEET_RECALL_REGISTRY_TENANT_NAMESPACE")?,
+            &required_from(&mut lookup, "FLEET_RECALL_REGISTRY_PROJECT_NAMESPACE")?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_REGISTRY_BOOTSTRAP_RECEIPT_DIGEST",
+            )?,
+            &required_from(&mut lookup, "FLEET_RECALL_REGISTRY_TEST_RESULT_DIGEST")?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_REGISTRY_TEST_RUNNER_ARTIFACT_DIGEST",
+            )?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_REGISTRY_TEST_RUNNER_CONFIGURATION_DIGEST",
+            )?,
+            &required_from(&mut lookup, "FLEET_RECALL_REGISTRY_PROPOSER_PRINCIPAL_ID")?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_REGISTRY_PACKAGE_AUTHOR_PRINCIPAL_ID",
+            )?,
+        )
+    }
+
+    #[must_use]
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    #[must_use]
+    pub const fn authority(&self) -> &RegistryActivationConfig {
         &self.authority
     }
 }
@@ -282,6 +419,95 @@ fn control_bootstrap_runtime_config(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn registry_activation_runtime_config(
+    database_url: &str,
+    tenant_id: &str,
+    project: &str,
+    tenant_namespace: &str,
+    project_namespace: &str,
+    bootstrap_receipt_digest: &str,
+    test_result_digest: &str,
+    test_runner_artifact_digest: &str,
+    test_runner_configuration_digest: &str,
+    proposer_principal_id: &str,
+    package_author_principal_id: &str,
+) -> Result<RegistryActivationRuntimeConfig> {
+    validate_database_url_with_local_escape(
+        database_url,
+        "FLEET_RECALL_REGISTRY_DATABASE_URL",
+        false,
+        false,
+    )?;
+    let tenant_id = tenant_id.parse::<Uuid>().map_err(|error| {
+        FleetError::Configuration(format!(
+            "FLEET_RECALL_REGISTRY_TENANT_ID must be a UUID: {error}"
+        ))
+    })?;
+    let deployment_scope = FleetScope::new(
+        tenant_id,
+        project,
+        "private-registry-activation",
+        None,
+        PrivacyTier::T1Project,
+    )?;
+    let semantic_scope = AuthenticatedProjectScopeV1::from_trusted_context(
+        parse_contract_id(tenant_namespace, "FLEET_RECALL_REGISTRY_TENANT_NAMESPACE")?,
+        parse_contract_id(project_namespace, "FLEET_RECALL_REGISTRY_PROJECT_NAMESPACE")?,
+    );
+    let trusted_scope =
+        TrustedControlScope::from_trusted_context(&deployment_scope, semantic_scope)?;
+    let bootstrap_receipt_digest = BootstrapReceiptDigest::from_digest(parse_digest(
+        bootstrap_receipt_digest,
+        "FLEET_RECALL_REGISTRY_BOOTSTRAP_RECEIPT_DIGEST",
+    )?);
+    let test_result_digest = parse_digest(
+        test_result_digest,
+        "FLEET_RECALL_REGISTRY_TEST_RESULT_DIGEST",
+    )?;
+    let test_runner_artifact_digest = parse_digest(
+        test_runner_artifact_digest,
+        "FLEET_RECALL_REGISTRY_TEST_RUNNER_ARTIFACT_DIGEST",
+    )?;
+    let test_runner_configuration_digest = parse_digest(
+        test_runner_configuration_digest,
+        "FLEET_RECALL_REGISTRY_TEST_RUNNER_CONFIGURATION_DIGEST",
+    )?;
+    let proposer_principal_id = parse_contract_id(
+        proposer_principal_id,
+        "FLEET_RECALL_REGISTRY_PROPOSER_PRINCIPAL_ID",
+    )?;
+    let package_author_principal_id = parse_contract_id(
+        package_author_principal_id,
+        "FLEET_RECALL_REGISTRY_PACKAGE_AUTHOR_PRINCIPAL_ID",
+    )?;
+    Ok(RegistryActivationRuntimeConfig {
+        database_url: database_url.to_owned(),
+        authority: RegistryActivationConfig {
+            trusted_scope,
+            bootstrap_receipt_digest,
+            test_result_digest: RegistryTestResultDigest::from_digest(test_result_digest),
+            test_runner_artifact_digest,
+            test_runner_configuration_digest,
+            proposer_principal_id,
+            package_author_principal_id,
+        },
+    })
+}
+
+fn parse_digest(value: &str, variable_name: &str) -> Result<Sha256Digest> {
+    Sha256Digest::from_str(value).map_err(|error| {
+        FleetError::Configuration(format!(
+            "{variable_name} must be lowercase SHA-256: {error}"
+        ))
+    })
+}
+
+fn parse_contract_id(value: &str, variable_name: &str) -> Result<ContractId> {
+    ContractId::new(value)
+        .map_err(|error| FleetError::Configuration(format!("{variable_name} is invalid: {error}")))
+}
+
 /// Compute the versioned digest for the three files consumed by model2vec.
 ///
 /// The path itself and unrelated directory entries are intentionally excluded,
@@ -364,7 +590,24 @@ fn required(name: &str) -> Result<String> {
         .ok_or_else(|| FleetError::Configuration(format!("{name} is required")))
 }
 
+fn required_from(lookup: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Result<String> {
+    lookup(name)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| FleetError::Configuration(format!("{name} is required")))
+}
+
 fn validate_database_url(database_url: &str, variable_name: &str) -> Result<()> {
+    let allow_insecure_local =
+        env::var("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE").is_ok_and(|value| value == "1");
+    validate_database_url_with_local_escape(database_url, variable_name, allow_insecure_local, true)
+}
+
+fn validate_database_url_with_local_escape(
+    database_url: &str,
+    variable_name: &str,
+    allow_insecure_local: bool,
+    local_escape_supported: bool,
+) -> Result<()> {
     let parsed = Url::parse(database_url).map_err(|error| {
         FleetError::Configuration(format!(
             "{variable_name} must be a valid PostgreSQL URL: {error}"
@@ -419,23 +662,27 @@ fn validate_database_url(database_url: &str, variable_name: &str) -> Result<()> 
         return Ok(());
     }
 
-    let local_escape =
-        env::var("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE").is_ok_and(|value| value == "1");
     let local_host = matches!(host, "localhost" | "127.0.0.1" | "::1" | "cockroach");
-    if local_escape
+    if allow_insecure_local
         && local_host
         && ssl_root_cert.is_none()
         && matches!(ssl_mode.as_deref(), None | Some("disable"))
     {
         return Ok(());
     }
+    let local_hint = if local_escape_supported {
+        "; local development may set FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1 only for a loopback or `cockroach` host"
+    } else {
+        ""
+    };
     Err(FleetError::Configuration(format!(
-        "{variable_name} must set exactly sslmode=verify-full; local development may set FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1 only for a loopback or `cockroach` host"
+        "{variable_name} must set exactly sslmode=verify-full{local_hint}"
     )))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
     use tempfile::TempDir;
@@ -444,6 +691,12 @@ mod tests {
 
     const FIXTURE_RECEIPT_DIGEST: &str =
         "084ee06ea7ebf3b1d592d6e5843584485144c0ee5720fcc2124a61a7fcde48f0";
+    const FIXTURE_TEST_RESULT_DIGEST: &str =
+        "e91e08070250a722446195b76ee685a9697298b9fdce9809027f120c829b679d";
+    const FIXTURE_RUNNER_ARTIFACT_DIGEST: &str =
+        "c2e5b0653471d35e54600a8d3fbe5613aff4c04e911787c09a25e2b327d4bbbd";
+    const FIXTURE_RUNNER_CONFIGURATION_DIGEST: &str =
+        "1d12aabe349fd0013389f93bf1917b0de6bbd5d2bd7156c85faff0b97360686d";
 
     fn deployment_scope() -> FleetScope {
         FleetScope::new(
@@ -724,5 +977,155 @@ mod tests {
         assert!(!debug.contains("bootstrap:secret"));
         assert!(!debug.contains(FIXTURE_RECEIPT_DIGEST));
         assert!(debug.contains("<redacted>"));
+    }
+
+    fn registry_activation_values() -> BTreeMap<&'static str, String> {
+        BTreeMap::from([
+            (
+                "FLEET_RECALL_REGISTRY_DATABASE_URL",
+                "postgresql://activation:registry-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+                    .into(),
+            ),
+            (
+                "FLEET_RECALL_REGISTRY_TENANT_ID",
+                "0198a849-f6ae-7d61-9800-000000000001".into(),
+            ),
+            ("FLEET_RECALL_REGISTRY_PROJECT", "physical-project".into()),
+            (
+                "FLEET_RECALL_REGISTRY_TENANT_NAMESPACE",
+                "tenant.authority".into(),
+            ),
+            (
+                "FLEET_RECALL_REGISTRY_PROJECT_NAMESPACE",
+                "project.authority".into(),
+            ),
+            (
+                "FLEET_RECALL_REGISTRY_BOOTSTRAP_RECEIPT_DIGEST",
+                FIXTURE_RECEIPT_DIGEST.into(),
+            ),
+            (
+                "FLEET_RECALL_REGISTRY_TEST_RESULT_DIGEST",
+                FIXTURE_TEST_RESULT_DIGEST.into(),
+            ),
+            (
+                "FLEET_RECALL_REGISTRY_TEST_RUNNER_ARTIFACT_DIGEST",
+                FIXTURE_RUNNER_ARTIFACT_DIGEST.into(),
+            ),
+            (
+                "FLEET_RECALL_REGISTRY_TEST_RUNNER_CONFIGURATION_DIGEST",
+                FIXTURE_RUNNER_CONFIGURATION_DIGEST.into(),
+            ),
+            (
+                "FLEET_RECALL_REGISTRY_PROPOSER_PRINCIPAL_ID",
+                "principal.operator".into(),
+            ),
+            (
+                "FLEET_RECALL_REGISTRY_PACKAGE_AUTHOR_PRINCIPAL_ID",
+                "principal.author".into(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn private_registry_activation_config_is_fully_bound_and_redacted() {
+        let values = registry_activation_values();
+        let config = RegistryActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+            .expect("private registry activation config");
+
+        assert_eq!(
+            config.authority().trusted_scope().tenant_id(),
+            Uuid::parse_str("0198a849-f6ae-7d61-9800-000000000001").unwrap()
+        );
+        assert_eq!(
+            config.authority().trusted_scope().project(),
+            "physical-project"
+        );
+        assert_eq!(
+            config
+                .authority()
+                .trusted_scope()
+                .semantic_scope()
+                .tenant_namespace
+                .as_str(),
+            "tenant.authority"
+        );
+        assert_eq!(
+            config.authority().bootstrap_receipt_digest().to_string(),
+            FIXTURE_RECEIPT_DIGEST
+        );
+
+        let debug = format!("{config:?}");
+        for secret in [
+            "registry-secret",
+            FIXTURE_RECEIPT_DIGEST,
+            FIXTURE_TEST_RESULT_DIGEST,
+            FIXTURE_RUNNER_ARTIFACT_DIGEST,
+            FIXTURE_RUNNER_CONFIGURATION_DIGEST,
+            "principal.operator",
+            "principal.author",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn registry_activation_database_has_no_serving_or_bootstrap_fallback() {
+        let mut values = registry_activation_values();
+        values.remove("FLEET_RECALL_REGISTRY_DATABASE_URL");
+        values.insert(
+            "FLEET_RECALL_DATABASE_URL",
+            "postgresql://serving:wrong@cluster.example/fleet?sslmode=verify-full".into(),
+        );
+        values.insert(
+            "FLEET_RECALL_CONTROL_DATABASE_URL",
+            "postgresql://bootstrap:wrong@cluster.example/fleet?sslmode=verify-full".into(),
+        );
+
+        let error = RegistryActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+            .expect_err("dedicated registry database URL must be required");
+        assert!(
+            error
+                .to_string()
+                .contains("FLEET_RECALL_REGISTRY_DATABASE_URL is required")
+        );
+    }
+
+    #[test]
+    fn registry_activation_database_never_inherits_the_serving_tls_escape() {
+        let mut values = registry_activation_values();
+        values.insert(
+            "FLEET_RECALL_REGISTRY_DATABASE_URL",
+            "postgresql://activation:secret@127.0.0.1:26257/fleet_recall?sslmode=disable".into(),
+        );
+
+        let error = RegistryActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+            .expect_err("private activation must require full TLS even on loopback");
+        assert!(
+            error.to_string().contains(
+                "FLEET_RECALL_REGISTRY_DATABASE_URL must set exactly sslmode=verify-full"
+            )
+        );
+    }
+
+    #[test]
+    fn registry_activation_authority_rejects_noncanonical_pins_and_ids() {
+        let mut values = registry_activation_values();
+        values.insert(
+            "FLEET_RECALL_REGISTRY_TEST_RESULT_DIGEST",
+            FIXTURE_TEST_RESULT_DIGEST.to_ascii_uppercase(),
+        );
+        assert!(
+            RegistryActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned()).is_err()
+        );
+
+        let mut values = registry_activation_values();
+        values.insert(
+            "FLEET_RECALL_REGISTRY_PROPOSER_PRINCIPAL_ID",
+            "Principal.Invalid".into(),
+        );
+        assert!(
+            RegistryActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned()).is_err()
+        );
     }
 }
