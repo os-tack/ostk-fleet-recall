@@ -32,6 +32,17 @@ contracts/dynamic-memory/v2/evidence/representation-origin-v2.jsonl|memory_contr
 contracts/dynamic-memory/v2/evidence/representation-supersedes-v2.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/evidence/source-fact-v2.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/evidence/vector-suite.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/relation-policy/negative-alternate-basis-entry.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/relation-policy/negative-cases-v2.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/relation-policy/negative-multiplicity-entry.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/relation-policy/negative-optional-dimension-entry.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/relation-policy/negative-payload-authority-entry.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/relation-policy/negative-refuting-declaration-entry.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/relation-policy/negative-support-bounds-entry.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/relation-policy/negative-temporal-overlap-entry.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/relation-policy/positive-cases-v2.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/relation-policy/relation-proof-v2-entry.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/relation-policy/vector-suite.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/relation/declared-attestation-event.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/relation/relation-edge.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/relation/vector-suite.jsonl|memory_contracts|jsonl
@@ -43,6 +54,7 @@ contracts/dynamic-memory/v2/remember/negative-admission-duplicate-basis-entry.js
 contracts/dynamic-memory/v2/remember/negative-admission-observer-open-entry.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/negative-admission-payload-authority-entry.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/negative-arbitrary-json-value.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/remember/negative-environment-identity-form.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/negative-floating-value.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/negative-ingress-authority-fields.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/negative-numeric-support-id.jsonl|memory_contracts|jsonl
@@ -50,6 +62,7 @@ contracts/dynamic-memory/v2/remember/negative-predicate-dimension-identity-entry
 contracts/dynamic-memory/v2/remember/negative-predicate-public-default-entry.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/negative-predicate-resource-value-entry.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/negative-statement-physical-fields.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/remember/negative-subject-identity-form.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/predicate-negative-cases-v2.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/predicate-positive-cases-v2.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/remember-accepted-statement-v2.jsonl|memory_contracts|jsonl
@@ -58,6 +71,12 @@ contracts/dynamic-memory/v2/remember/remember-ingress-candidate-v2.jsonl|memory_
 contracts/dynamic-memory/v2/remember/remember-predicate-schema-v2-entry.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/semantic-claim-v2.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/vector-suite.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/stage4-successor/entry-negative-vectors.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/stage4-successor/entry-positive-vectors.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/stage4-successor/negative-vectors.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/stage4-successor/positive-vectors.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/stage4-successor/registry-package.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/stage4-successor/vector-suite.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/successor-policy/activation-policy-v2.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/successor-policy/genesis-successor-key-bridge-v1.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/successor-policy/negative-vectors.jsonl|memory_contracts|jsonl
@@ -171,7 +190,10 @@ src/memory_contracts/mod.rs|memory_contracts|rust
 src/memory_contracts/normative.rs|memory_contracts|rust
 src/memory_contracts/registry.rs|memory_contracts|rust
 src/memory_contracts/relation.rs|memory_contracts|rust
+src/memory_contracts/relation_policy_v2.rs|memory_contracts|rust
 src/memory_contracts/remember_v2.rs|memory_contracts|rust
+src/memory_contracts/stage4_target_package.rs|memory_contracts|rust
+src/memory_contracts/successor_package.rs|memory_contracts|rust
 src/memory_contracts/successor_policy.rs|memory_contracts|rust
 src/memory_contracts/vectors.rs|memory_contracts|rust
 src/reference_agent.rs|reference_agent|rust
