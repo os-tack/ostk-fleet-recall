@@ -124,10 +124,10 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 3128
-    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 703
+    length == 3202
+    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 725
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 2219
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 2271
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
 ' "$first" >/dev/null; then
     printf 'rich demo verification failed: exact repository corpus composition changed\n' >&2

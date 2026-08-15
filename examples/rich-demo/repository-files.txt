@@ -137,6 +137,7 @@ deploy/aws/verify-publication-receipts.sh|aws_operations|shell
 deploy/aws/versions.tf|aws_infrastructure|terraform
 deploy/cockroach/control-role-grants.sql|database_security|sql
 deploy/cockroach/registry-activation-role-grants.sql|database_security|sql
+deploy/cockroach/successor-schema-quarantine-grants.sql|database_security|sql
 deploy/cockroach/tests/control-role-grants.sh|database_security|shell
 deploy/cockroach/tests/registry-activation-role-grants.sh|database_security|shell
 deploy/container-entrypoint.sh|container_runtime|shell
@@ -162,6 +163,11 @@ migrations/0006_control_bootstrap_explicit_acceptance_time.sql|database_schema|s
 migrations/0007_control_epoch_explicit_creation_time.sql|database_schema|sql
 migrations/0008_control_head_explicit_advance_time.sql|database_schema|sql
 migrations/0009_control_event_explicit_acceptance_time.sql|database_schema|sql
+migrations/0010_registry_genesis_head_root_index.sql|database_schema|sql
+migrations/0011_registry_genesis_activation_root_index.sql|database_schema|sql
+migrations/0012_registry_transition_history.sql|database_schema|sql
+migrations/0013_registry_genesis_bridge_consumption.sql|database_schema|sql
+migrations/0014_registry_current_head_v2.sql|database_schema|sql
 src/application.rs|application_code|rust
 src/bin/ostk-control-bootstrap.rs|control_bootstrap|rust
 src/bin/ostk-registry-activate.rs|registry_activation|rust
