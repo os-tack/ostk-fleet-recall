@@ -214,8 +214,10 @@ src/memory_contracts/successor_policy.rs|memory_contracts|rust
 src/memory_contracts/vectors.rs|memory_contracts|rust
 src/reference_agent.rs|reference_agent|rust
 src/registry_activation/cockroach.rs|registry_activation|rust
+src/registry_activation/genesis_audit.rs|registry_activation|rust
 src/registry_activation/mod.rs|registry_activation|rust
 src/registry_activation/repository.rs|registry_activation|rust
+src/registry_activation/successor_repository.rs|registry_activation|rust
 src/service.rs|application_code|rust
 src/store/cockroach.rs|cockroach_store|rust
 src/store/mod.rs|cockroach_store|rust
