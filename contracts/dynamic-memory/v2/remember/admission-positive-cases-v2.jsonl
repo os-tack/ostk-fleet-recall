@@ -1,0 +1,1 @@
+{"case_set_id":"remember.admission.v2.positive","cases":["actor_attested_or_intended","governance_server_derived","payload_authority_denied","text_limit_bounded"],"entry_schema_id":"registry.remember_admission_rule","expected_outcome":"accept","schema_version":2}

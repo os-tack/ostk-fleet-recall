@@ -18,6 +18,7 @@ pub mod identity;
 pub mod normative;
 pub mod registry;
 pub mod relation;
+pub mod remember_v2;
 
 #[cfg(test)]
 mod vectors;

@@ -1,0 +1,1 @@
+{"case_set_id":"remember.admission.v2.negative","cases":["actor_observed_modality","duplicate_actor_basis","observer_coverage_open","payload_selects_admission_rule"],"entry_schema_id":"registry.remember_admission_rule","expected_outcome":"reject","schema_version":2}

@@ -1,0 +1,1 @@
+{"case_set_id":"remember.predicate.v2.positive","cases":["closed_value_constraint","exact_resource_identity_closure","publication_sensitivity_defaults","required_applicability_dimensions"],"entry_schema_id":"registry.predicate_schema","expected_outcome":"accept","schema_version":2}

@@ -40,12 +40,13 @@ Run the deterministic reproduction test with:
 ./examples/rich-demo/test.sh
 ```
 
-The verifier requires 1,000–3,000 unique chunks, twenty-six documentation
-sources, 151 repository source/configuration files, the two exact self-audit code
-excerpts, 204 operations records across twelve weeks, the expected decision and
-correction mix, zero-based per-source chunk indexes, bounded physical lines and
-text, only the public ingest allowlist, and no credential-, token-, private-key-,
-account ARN-, or credential-bearing database URL patterns. `test.sh`
+The verifier requires exactly 2,721 unique chunks: 673 documentation chunks
+from 27 sources, 1,842 repository chunks from 174 source/configuration files,
+the two exact self-audit code excerpts, and 204 operations records across twelve
+weeks. It also requires the expected decision and correction mix, zero-based
+per-source chunk indexes, bounded physical lines and text, only the public
+ingest allowlist, and no credential-, token-, private-key-, account ARN-, or
+credential-bearing database URL patterns. `test.sh`
 independently derives the full allowlisted set from `git ls-files` and compares
 it with both checked-in manifests, so a new safe tracked file cannot silently
 remain absent from the demo corpus.
