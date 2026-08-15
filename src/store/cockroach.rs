@@ -35,6 +35,50 @@ pub const MINIMUM_RECALL_SCHEMA_VERSION: i64 = 2;
 const INITIAL_MIGRATION_SQL: &str = include_str!("../../migrations/0001_fleet_memory.sql");
 const CLAIM_SUPPORT_CHUNK_MIGRATION_SQL: &str =
     include_str!("../../migrations/0002_claim_support_chunk_lookup.sql");
+const CONTROL_EVENT_LEDGER_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0003_control_event_ledger.sql");
+
+fn embedded_migrator() -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(vec![
+            Migration::new(
+                1,
+                Cow::Borrowed("fleet memory substrate"),
+                MigrationType::Simple,
+                Cow::Borrowed(INITIAL_MIGRATION_SQL),
+                // CockroachDB 26.2 cannot build vector indexes through its
+                // legacy transactional schema changer (SQLSTATE 0A000).
+                // Execute this DDL migration outside one SQL transaction.
+                true,
+            ),
+            Migration::new(
+                2,
+                Cow::Borrowed("claim support chunk lookup"),
+                MigrationType::Simple,
+                Cow::Borrowed(CLAIM_SUPPORT_CHUNK_MIGRATION_SQL),
+                // Keep every CockroachDB schema change outside SQLx's
+                // PostgreSQL-oriented transaction wrapper.
+                true,
+            ),
+            Migration::new(
+                3,
+                Cow::Borrowed("append-only control event ledger"),
+                MigrationType::Simple,
+                Cow::Borrowed(CONTROL_EVENT_LEDGER_MIGRATION_SQL),
+                // Keep every CockroachDB schema change outside SQLx's
+                // PostgreSQL-oriented transaction wrapper.
+                true,
+            ),
+        ]),
+        ignore_missing: false,
+        // SQLx's PostgreSQL lock uses `pg_advisory_lock`, which CockroachDB
+        // intentionally does not implement. CockroachDB's schema changer
+        // serializes the DDL; deployment tooling must ensure only one migrator
+        // starts at a time.
+        locking: false,
+        no_tx: true,
+    }
+}
 
 /// Maximum ANN candidates examined before applying a time-range filter.
 ///
@@ -448,37 +492,7 @@ impl CockroachStore {
     pub async fn migrate(&self) -> Result<()> {
         // Constructing the migration from `include_str!` keeps deployment
         // single-binary without enabling SQLx's unrelated query macros.
-        let migrator = Migrator {
-            migrations: Cow::Owned(vec![
-                Migration::new(
-                    1,
-                    Cow::Borrowed("fleet memory substrate"),
-                    MigrationType::Simple,
-                    Cow::Borrowed(INITIAL_MIGRATION_SQL),
-                    // CockroachDB 26.2 cannot build vector indexes through its
-                    // legacy transactional schema changer (SQLSTATE 0A000).
-                    // Execute this DDL migration outside one SQL transaction.
-                    true,
-                ),
-                Migration::new(
-                    2,
-                    Cow::Borrowed("claim support chunk lookup"),
-                    MigrationType::Simple,
-                    Cow::Borrowed(CLAIM_SUPPORT_CHUNK_MIGRATION_SQL),
-                    // Keep every CockroachDB schema change outside SQLx's
-                    // PostgreSQL-oriented transaction wrapper.
-                    true,
-                ),
-            ]),
-            ignore_missing: false,
-            // SQLx's PostgreSQL lock uses `pg_advisory_lock`, which
-            // CockroachDB intentionally does not implement. CockroachDB's
-            // schema changer serializes the DDL; deployment tooling must
-            // ensure only one migrator starts at a time.
-            locking: false,
-            no_tx: true,
-        };
-        migrator.run(&self.pool).await?;
+        embedded_migrator().run(&self.pool).await?;
         Ok(())
     }
 
@@ -1751,6 +1765,92 @@ mod tests {
             )
         );
         assert!(!migration.contains("DROP "));
+    }
+
+    #[test]
+    fn control_event_ledger_migration_is_scoped_bounded_and_additive() {
+        let migration = CONTROL_EVENT_LEDGER_MIGRATION_SQL;
+        let tables = [
+            "memory_control_bootstraps",
+            "memory_control_log_epochs",
+            "memory_control_shard_heads",
+            "memory_control_events",
+        ];
+        assert_eq!(migration.matches("CREATE TABLE ").count(), tables.len());
+        for table in tables {
+            assert!(migration.contains(&format!("CREATE TABLE {table}")));
+            assert!(migration.contains(&format!("CREATE TABLE {table} (\n    tenant_id")));
+        }
+
+        for scope_leading_key in [
+            "PRIMARY KEY (tenant_id, project)",
+            "PRIMARY KEY (tenant_id, project, epoch_id)",
+            "PRIMARY KEY (tenant_id, project, epoch_id, shard)",
+            "PRIMARY KEY (tenant_id, project, epoch_id, shard, committed_offset)",
+            "UNIQUE (tenant_id, project, receipt_digest)",
+            "UNIQUE (tenant_id, project, bootstrap_event_id)",
+            "UNIQUE (tenant_id, project, event_id)",
+        ] {
+            assert!(migration.contains(scope_leading_key));
+        }
+
+        assert!(migration.contains("CHECK (bootstrap_offset = 1)"));
+        assert!(migration.contains("CHECK (committed_offset > 0)"));
+        assert!(migration.contains("CHECK (last_committed_offset >= 0)"));
+        assert!(migration.contains("CHECK (approval_threshold BETWEEN 1 AND signer_count)"));
+        assert_eq!(migration.matches("BETWEEN 1 AND 1048576").count(), 4);
+        assert!(migration.contains("CHECK (shard_count BETWEEN 1 AND 4096)"));
+        assert!(
+            migration
+                .contains("CHECK (partition_recipe_id = 'ostk.partition.sha256_prefix64_modulo')")
+        );
+        assert!(migration.contains("CHECK (partition_recipe_version = 1)"));
+        assert!(migration.contains("CHECK (octet_length(event_id) = 32)"));
+        assert!(migration.contains("CHECK (octet_length(chain_digest) = 32)"));
+        assert!(migration.contains("canonical_receipt                 BYTES NOT NULL"));
+        assert!(migration.contains("canonical_genesis_package         BYTES NOT NULL"));
+        assert!(migration.contains("canonical_event              BYTES NOT NULL"));
+        for scoped_foreign_key in [
+            "FOREIGN KEY (tenant_id, project, bootstrap_receipt_digest)",
+            "FOREIGN KEY (tenant_id, project, epoch_id, shard_count)",
+            "FOREIGN KEY (tenant_id, project, epoch_id, shard)",
+        ] {
+            assert!(migration.contains(scoped_foreign_key));
+        }
+        assert_eq!(migration.matches("CREATE INDEX ").count(), 0);
+        assert_eq!(migration.matches("CREATE SEQUENCE ").count(), 0);
+        assert!(!migration.contains("JSONB"));
+
+        let uppercase = migration.to_ascii_uppercase();
+        for forbidden in ["ALTER ", "DROP ", "UPDATE ", "DELETE "] {
+            assert!(!uppercase.contains(forbidden));
+        }
+        assert!(!migration.contains("memory_events"));
+    }
+
+    #[test]
+    fn embedded_migrator_registers_control_ledger_as_no_transaction_version_three() {
+        let migrator = embedded_migrator();
+        assert_eq!(
+            migrator
+                .migrations
+                .iter()
+                .map(|migration| migration.version)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let control_ledger = migrator
+            .migrations
+            .iter()
+            .find(|migration| migration.version == 3)
+            .unwrap();
+        assert_eq!(
+            control_ledger.sql.as_ref(),
+            CONTROL_EVENT_LEDGER_MIGRATION_SQL
+        );
+        assert!(control_ledger.no_tx);
+        assert!(migrator.no_tx);
+        assert!(!migrator.locking);
     }
 
     /// Set `FLEET_RECALL_TEST_DATABASE_URL` to a disposable `CockroachDB` 26.2
