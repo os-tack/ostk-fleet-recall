@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # This is the authoritative connected correctness proof. It uses the exact
-# official CockroachDB binary, runs both live repository suites, and exercises
+# official CockroachDB binary, runs all three live repository suites, and exercises
 # both private CLI state machines on one secure local server.
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../../.." && pwd)
@@ -138,13 +138,20 @@ root_url=$(printf '%s\n' "$root_default_url" | sed 's#/defaultdb?#/fleet_recall?
     --execute='CREATE DATABASE fleet_recall' >/dev/null
 
 # Apply the exact embedded migration chain under root certificate authority,
-# then run both connected repository matrices. Together they cover bootstrap
-# durability plus activation same/different-shard races, replays, timing,
-# scope isolation, corruption, and bounded query plans.
+# then run all three connected repository matrices. Together they cover
+# bootstrap durability plus genesis and successor activation races, replays,
+# timing, scope isolation, corruption, and bounded query plans.
 FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
     cargo test --locked --test control_log_live -- --nocapture
 FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
     cargo test --locked --test registry_activation_live -- --nocapture
+successor_live_test=live_first_successor_activation_when_configured
+successor_live_listing=$(cargo test --locked --test successor_activation_live -- --list)
+grep -Fxq "$successor_live_test: test" <<<"$successor_live_listing" \
+    || fail "successor live proof test was not discovered"
+FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+    cargo test --locked --test successor_activation_live \
+        "$successor_live_test" -- --exact --nocapture
 FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
     cargo test --locked --lib \
         store::cockroach::tests::live_transactional_migration_rolls_back_ddl_on_history_conflict_when_configured \
