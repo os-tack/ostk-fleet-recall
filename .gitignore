@@ -1,6 +1,10 @@
 /target/
 /upstream/
 /heap_profiler/
+/executiontrace_dump/
+/goroutine_dump/
+/inflight_trace_dump/
+/pprof_dump/
 /.env
 /.env.*
 !/.env.example
