@@ -19,6 +19,7 @@ pub mod normative;
 pub mod registry;
 pub mod relation;
 pub mod remember_v2;
+pub mod successor_package;
 pub mod successor_policy;
 
 #[cfg(test)]

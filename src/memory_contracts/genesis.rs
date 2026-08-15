@@ -348,6 +348,12 @@ pub struct EvidenceSchemaEntryV1 {
     private_raw_default_enabled: bool,
 }
 
+impl EvidenceSchemaEntryV1 {
+    pub(crate) const fn identity_recipe(&self) -> &RegistryReferenceV1 {
+        &self.identity_recipe
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExemplarPolicyEntryV1 {
@@ -696,7 +702,14 @@ impl TryFrom<ManifestVerifiedRegistryPackage> for SemanticallyClosedGenesisPacka
 }
 
 #[allow(clippy::too_many_lines)] // exhaustive closed-schema dispatch is intentional and auditable
-fn decode_entry(entry: &RegistryEntryV1) -> ContractResult<SemanticallyDecodedGenesisEntryV1> {
+/// Decode one exact legacy registry body through the closed v1 selector.
+///
+/// This crate-private seam is reusable by later offline package typestates. It
+/// proves body shape only; callers must also invoke the identity and semantic
+/// validators below against the same manifest-verified package.
+pub(crate) fn decode_entry(
+    entry: &RegistryEntryV1,
+) -> ContractResult<SemanticallyDecodedGenesisEntryV1> {
     validate_entry_schema_selector(entry)?;
     reject_dynamic_policy_constructs(&entry.body)?;
 
@@ -1130,7 +1143,8 @@ fn singleton_index(
     Ok(first)
 }
 
-fn validate_entry_identity(
+/// Require a decoded legacy v1 body's identity to match its full entry envelope.
+pub(crate) fn validate_entry_identity(
     raw: &RegistryEntryV1,
     decoded: &SemanticallyDecodedGenesisEntryV1,
 ) -> ContractResult<()> {
@@ -1149,7 +1163,8 @@ fn validate_entry_identity(
 }
 
 #[allow(clippy::too_many_lines)] // one exhaustive validator keeps kind coverage reviewable
-fn validate_entry_semantics(
+/// Close one legacy v1 body over exact full-entry dependencies in `package`.
+pub(crate) fn validate_entry_semantics(
     package: &ManifestVerifiedRegistryPackage,
     raw: &RegistryEntryV1,
     decoded: &SemanticallyDecodedGenesisEntryV1,
@@ -1761,7 +1776,8 @@ fn registry_reference(entry: &RegistryEntryV1) -> ContractResult<RegistryReferen
     })
 }
 
-fn resolve_reference<'a>(
+/// Resolve one exact full-entry dependency by kind, ID, revision, and digest.
+pub(crate) fn resolve_reference<'a>(
     package: &'a RegistryPackageV1,
     expected_kind: RegistryEntryKind,
     reference: &RegistryReferenceV1,
