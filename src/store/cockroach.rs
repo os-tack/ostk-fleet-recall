@@ -32,6 +32,19 @@ pub const MAX_PUBLIC_NUMERIC_ID: i64 = 9_007_199_254_740_991;
 /// ingestion, and public-demo paths.
 pub const MINIMUM_RECALL_SCHEMA_VERSION: i64 = 2;
 
+const CONTIGUOUS_SCHEMA_VERSION_SQL: &str = "SELECT COALESCE(MAX(CASE \
+         WHEN prefix_success AND version = ordinal THEN version \
+         ELSE 0 \
+       END), 0)::INT8 \
+     FROM (\
+       SELECT version, \
+              ROW_NUMBER() OVER (ORDER BY version) AS ordinal, \
+              BOOL_AND(success) OVER (\
+                ORDER BY version ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+              ) AS prefix_success \
+       FROM _sqlx_migrations\
+     ) AS ordered_migrations";
+
 const INITIAL_MIGRATION_SQL: &str = include_str!("../../migrations/0001_fleet_memory.sql");
 const CLAIM_SUPPORT_CHUNK_MIGRATION_SQL: &str =
     include_str!("../../migrations/0002_claim_support_chunk_lookup.sql");
@@ -581,11 +594,11 @@ impl CockroachStore {
             sqlx::query_scalar("SELECT ('[1,0]'::VECTOR(2) <=> '[1,0]'::VECTOR(2))::FLOAT8 = 0.0")
                 .fetch_one(&mut *connection)
                 .await?;
-        let schema_version: Option<i64> =
-            sqlx::query_scalar("SELECT MAX(version)::INT8 FROM _sqlx_migrations WHERE success")
-                .fetch_optional(&mut *connection)
-                .await?
-                .flatten();
+        // Report only the highest uninterrupted successful prefix. A failed or
+        // missing intermediate migration cannot be hidden by a later success.
+        let schema_version: i64 = sqlx::query_scalar(CONTIGUOUS_SCHEMA_VERSION_SQL)
+            .fetch_one(&mut *connection)
+            .await?;
 
         Ok(DatabaseCapabilities {
             version,
@@ -594,7 +607,7 @@ impl CockroachStore {
             conflict_membership_index_enabled,
             claim_support_chunk_index_enabled,
             cosine_distance_supported,
-            schema_version: schema_version.unwrap_or(0),
+            schema_version,
         })
     }
 
@@ -1613,6 +1626,14 @@ mod tests {
             };
             assert_eq!(capabilities.supports_schema_version(minimum), expected);
         }
+    }
+
+    #[test]
+    fn schema_capability_requires_an_uninterrupted_successful_prefix() {
+        assert!(CONTIGUOUS_SCHEMA_VERSION_SQL.contains("ROW_NUMBER() OVER (ORDER BY version)"));
+        assert!(CONTIGUOUS_SCHEMA_VERSION_SQL.contains("BOOL_AND(success) OVER"));
+        assert!(CONTIGUOUS_SCHEMA_VERSION_SQL.contains("version = ordinal"));
+        assert!(!CONTIGUOUS_SCHEMA_VERSION_SQL.contains("MAX(version)::INT8 WHERE success"));
     }
 
     #[test]
