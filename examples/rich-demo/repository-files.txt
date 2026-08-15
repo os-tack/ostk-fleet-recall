@@ -77,6 +77,15 @@ contracts/dynamic-memory/v2/stage4-successor/negative-vectors.jsonl|memory_contr
 contracts/dynamic-memory/v2/stage4-successor/positive-vectors.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/stage4-successor/registry-package.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/stage4-successor/vector-suite.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/successor-activation/activated-head.jsonl|successor_activation|jsonl
+contracts/dynamic-memory/v2/successor-activation/activation-approval-set.jsonl|successor_activation|jsonl
+contracts/dynamic-memory/v2/successor-activation/activation-event.jsonl|successor_activation|jsonl
+contracts/dynamic-memory/v2/successor-activation/activation-receipt.jsonl|successor_activation|jsonl
+contracts/dynamic-memory/v2/successor-activation/activation-statement.jsonl|successor_activation|jsonl
+contracts/dynamic-memory/v2/successor-activation/negative-vectors.jsonl|successor_activation|jsonl
+contracts/dynamic-memory/v2/successor-activation/positive-vectors.jsonl|successor_activation|jsonl
+contracts/dynamic-memory/v2/successor-activation/registry-test-result.jsonl|successor_activation|jsonl
+contracts/dynamic-memory/v2/successor-activation/vector-suite.jsonl|successor_activation|jsonl
 contracts/dynamic-memory/v2/successor-policy/activation-policy-v2.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/successor-policy/genesis-successor-key-bridge-v1.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/successor-policy/negative-vectors.jsonl|memory_contracts|jsonl
@@ -193,6 +202,7 @@ src/memory_contracts/relation.rs|memory_contracts|rust
 src/memory_contracts/relation_policy_v2.rs|memory_contracts|rust
 src/memory_contracts/remember_v2.rs|memory_contracts|rust
 src/memory_contracts/stage4_target_package.rs|memory_contracts|rust
+src/memory_contracts/successor_activation.rs|successor_activation|rust
 src/memory_contracts/successor_package.rs|memory_contracts|rust
 src/memory_contracts/successor_policy.rs|memory_contracts|rust
 src/memory_contracts/vectors.rs|memory_contracts|rust

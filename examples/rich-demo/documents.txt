@@ -6,6 +6,7 @@ contracts/dynamic-memory/v2/relation-policy/README.md|memory_contracts
 contracts/dynamic-memory/v2/relation/README.md|memory_contracts
 contracts/dynamic-memory/v2/remember/README.md|memory_contracts
 contracts/dynamic-memory/v2/stage4-successor/README.md|memory_contracts
+contracts/dynamic-memory/v2/successor-activation/README.md|successor_activation
 contracts/dynamic-memory/v2/successor-policy/README.md|memory_contracts
 docs/ARCHITECTURE.md|architecture
 docs/CONTROL_BOOTSTRAP.md|control_bootstrap
