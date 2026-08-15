@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Secondary Docker parity only: this preserves the image-level activation RBAC
+# proof, but cannot substitute for the official-binary correctness lane.
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../../.." && pwd)
 image=${FLEET_RECALL_CRDB_IMAGE:-cockroachdb/cockroach:v26.2.3}
+expected_crdb_build_tag=v26.2.3
 container="ostk-registry-activation-grants-$$"
 
 cleanup() {
@@ -158,6 +161,9 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 test "$ready" -eq 1 || fail "CockroachDB did not become ready"
+server_build_tag=$(docker exec "$container" cockroach version --build-tag)
+test "$server_build_tag" = "$expected_crdb_build_tag" \
+    || fail "Docker server must be exact CockroachDB $expected_crdb_build_tag (found $server_build_tag)"
 
 docker exec "$container" cockroach sql --insecure \
     --execute 'CREATE DATABASE fleet_recall' >/dev/null
@@ -770,4 +776,4 @@ root_sql "SHOW GRANTS ON TABLE
     memory_registry_activations,
     memory_registry_heads
     FOR fleet_registry_activation"
-echo "registry-activation grant proof passed"
+echo "secondary Docker registry-activation grant parity proof passed"

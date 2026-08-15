@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This is the authoritative connected correctness proof. It uses the exact
+# official CockroachDB binary, runs both live repository suites, and exercises
+# both private CLI state machines on one secure local server.
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../../.." && pwd)
+expected_crdb_build_tag=v26.2.3
 crdb=${FLEET_RECALL_CRDB_BINARY:-}
 if test -z "$crdb"; then
     crdb=$(command -v cockroach || true)
 fi
 test -n "$crdb" && test -x "$crdb" || {
-    echo "registry activation CLI proof requires CockroachDB v26.2.3 via FLEET_RECALL_CRDB_BINARY or PATH" >&2
+    echo "official-binary correctness proof requires CockroachDB $expected_crdb_build_tag via FLEET_RECALL_CRDB_BINARY or PATH" >&2
     exit 1
 }
-"$crdb" version | grep -Fq 'Build Tag:        v26.2.3' || {
-    echo "registry activation CLI proof requires exact CockroachDB v26.2.3" >&2
+actual_crdb_build_tag=$("$crdb" version --build-tag)
+test "$actual_crdb_build_tag" = "$expected_crdb_build_tag" || {
+    echo "official-binary correctness proof requires exact CockroachDB $expected_crdb_build_tag (found $actual_crdb_build_tag)" >&2
     exit 1
 }
 
@@ -28,6 +33,10 @@ activation_password='local-activation-member-proof-password'
 runtime_password='local-runtime-member-proof-password'
 
 cleanup() {
+    server_pid=''
+    if test -f "$pid_file"; then
+        server_pid=$(sed -n '1p' "$pid_file")
+    fi
     drained=0
     if test -n "$root_default_url"; then
         if "$crdb" node drain --self --shutdown --url="$root_default_url" \
@@ -35,19 +44,35 @@ cleanup() {
             drained=1
         fi
     fi
-    if test "$drained" -eq 0 && test -f "$pid_file"; then
-        server_pid=$(sed -n '1p' "$pid_file")
-        case "$server_pid" in
-            ''|*[!0-9]*) ;;
-            *)
-                if kill -0 "$server_pid" >/dev/null 2>&1; then
-                    kill -TERM "$server_pid" >/dev/null 2>&1 || true
+    case "$server_pid" in
+        ''|*[!0-9]*) ;;
+        *)
+            if test "$drained" -eq 0 && kill -0 "$server_pid" >/dev/null 2>&1; then
+                kill -TERM "$server_pid" >/dev/null 2>&1 || true
+            fi
+            for _ in $(seq 1 120); do
+                if ! kill -0 "$server_pid" >/dev/null 2>&1; then
+                    break
                 fi
-                ;;
-        esac
-    fi
+                sleep 0.25
+            done
+            if kill -0 "$server_pid" >/dev/null 2>&1; then
+                kill -KILL "$server_pid" >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
     case "$proof_dir" in
-        */ostk-registry-cli.*) rm -rf -- "$proof_dir" ;;
+        */ostk-registry-cli.*)
+            for _ in $(seq 1 20); do
+                rm -rf -- "$proof_dir" 2>/dev/null || true
+                test ! -e "$proof_dir" && break
+                sleep 0.1
+            done
+            if test -e "$proof_dir"; then
+                echo "could not remove registry proof directory: $proof_dir" >&2
+                return 1
+            fi
+            ;;
         *) echo "refusing to remove unexpected proof directory" >&2 ;;
     esac
 }
@@ -96,10 +121,13 @@ root_url=$(printf '%s\n' "$root_default_url" | sed 's#/defaultdb?#/fleet_recall?
     --execute='CREATE DATABASE fleet_recall' >/dev/null
 
 # Apply the exact embedded migration chain under root certificate authority,
-# then run the connected repository matrix (same/different-shard races,
-# replays, timing, scope isolation, corruption, and bounded query plans).
+# then run both connected repository matrices. Together they cover bootstrap
+# durability plus activation same/different-shard races, replays, timing,
+# scope isolation, corruption, and bounded query plans.
 FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
-    cargo test --locked --test registry_activation_live -- --nocapture >/dev/null
+    cargo test --locked --test control_log_live -- --nocapture
+FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+    cargo test --locked --test registry_activation_live -- --nocapture
 
 "$crdb" sql --url="$root_url" \
     < "$repo_root/deploy/cockroach/control-role-grants.sql" >/dev/null
@@ -146,13 +174,14 @@ package_digest='5a931fd5551bec47f83adb019f3e794d1b6a759f4501e7ea26a83076d9518177
 policy_digest='6f92f99ff35969845f08f9b64cee7d86fa42dc6165ebc617d950be8960b86968'
 
 run_bootstrap() {
+    local operation=$1
     FLEET_RECALL_CONTROL_DATABASE_URL="$control_url" \
     FLEET_RECALL_TENANT_ID="$tenant_id" \
     FLEET_RECALL_PROJECT="$physical_project" \
     FLEET_RECALL_CONTROL_TENANT_NAMESPACE='tenant.fixture' \
     FLEET_RECALL_CONTROL_PROJECT_NAMESPACE='project.fixture' \
     FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST="$receipt_digest" \
-        "$repo_root/target/debug/ostk-control-bootstrap" apply \
+        "$repo_root/target/debug/ostk-control-bootstrap" "$operation" \
         --receipt "$bootstrap_receipt" \
         --genesis-package "$genesis_package"
 }
@@ -219,11 +248,29 @@ fi
 grep -Fq 'requires a complete durable bootstrap' <<<"$not_ready" \
     || fail "missing bootstrap did not retain NotReady classification"
 
-bootstrap_inserted=$(run_bootstrap)
+bootstrap_absent=$(run_bootstrap inspect)
+jq -e --arg receipt "$receipt_digest" '
+    .operation == "inspect" and .state == "absent" and
+    .receipt_digest == $receipt
+' <<<"$bootstrap_absent" >/dev/null || fail "dedicated control login did not inspect absent state"
+
+bootstrap_inserted=$(run_bootstrap apply)
 jq -e --arg receipt "$receipt_digest" '
     .operation == "apply" and .state == "inserted" and
     .receipt_digest == $receipt and .committed_offset == "1"
 ' <<<"$bootstrap_inserted" >/dev/null || fail "dedicated control login did not bootstrap"
+
+bootstrap_complete=$(run_bootstrap inspect)
+jq -e --arg receipt "$receipt_digest" '
+    .operation == "inspect" and .state == "complete" and
+    .receipt_digest == $receipt and .committed_offset == "1"
+' <<<"$bootstrap_complete" >/dev/null || fail "dedicated control login did not inspect complete state"
+
+bootstrap_replay=$(run_bootstrap apply)
+jq -e --arg receipt "$receipt_digest" '
+    .operation == "apply" and .state == "exact_replay" and
+    .receipt_digest == $receipt and .committed_offset == "1"
+' <<<"$bootstrap_replay" >/dev/null || fail "dedicated control login did not exact-replay bootstrap"
 
 # The frozen vector is intentionally historical. It verifies offline but is
 # rejected against this fresh durable bootstrap with the closed Timing error.
@@ -396,7 +443,8 @@ grep -Eiq 'privilege|permission' <<<"$runtime_registry_read" \
 # Neither bounded JSON nor closed errors may disclose credentials, URLs,
 # signatures, or canonical ceremony bytes.
 for output in \
-    "$bad_pin" "$not_ready" "$bootstrap_inserted" "$timing" "$failed_prefix" \
+    "$bad_pin" "$not_ready" "$bootstrap_absent" "$bootstrap_inserted" \
+    "$bootstrap_complete" "$bootstrap_replay" "$timing" "$failed_prefix" \
     "$pinned" "$inserted" "$accepted" "$replay" "$conflict" "$stale" \
     "$control_registry_read" "$runtime_registry_read"
 do
@@ -427,9 +475,14 @@ if ! grep -Eq 'span(s)?:.*\[/1[^]]*-[[:space:]]*/9\]' <<<"$prefix_explain"; then
 fi
 
 printf '%s\n' \
+    "private control bootstrap receipts:" \
+    "$bootstrap_absent" \
+    "$bootstrap_inserted" \
+    "$bootstrap_complete" \
+    "$bootstrap_replay" \
     "private registry activation receipts:" \
     "$pinned" \
     "$inserted" \
     "$accepted" \
     "$replay" \
-    "registry activation CLI proof passed"
+    "official-binary connected correctness proof passed"

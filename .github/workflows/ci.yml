@@ -65,26 +65,10 @@ jobs:
           test -z "$(cargo tree --locked --target x86_64-unknown-linux-gnu -i rsa 2>/dev/null)"
           test -z "$(cargo tree --locked --target x86_64-unknown-linux-gnu -i sqlx-mysql 2>/dev/null)"
 
-  cockroachdb:
-    name: CockroachDB / ${{ matrix.name }}
+  cockroachdb-official:
+    name: CockroachDB / authoritative official-binary correctness
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: control RBAC
-            script: deploy/cockroach/tests/control-role-grants.sh
-            install_binary: false
-          - name: registry RBAC
-            script: deploy/cockroach/tests/registry-activation-role-grants.sh
-            install_binary: false
-          - name: control bootstrap
-            script: deploy/cockroach/tests/control-bootstrap-cli.sh
-            install_binary: false
-          - name: registry activation
-            script: deploy/cockroach/tests/registry-activation-cli.sh
-            install_binary: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -92,7 +76,6 @@ jobs:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
       - name: Install the pinned CockroachDB binary
-        if: matrix.install_binary
         env:
           COCKROACH_VERSION: v26.2.3
           COCKROACH_ARCHIVE_SHA256: 3eca6d7bc6fefa3ba0847e89733fc69f61226c80b8fab0af6578e1be672f27d3
@@ -107,7 +90,33 @@ jobs:
           binary_dir="$RUNNER_TEMP/cockroach-${COCKROACH_VERSION}.linux-amd64"
           test "$("$binary_dir/cockroach" version --build-tag)" = "$COCKROACH_VERSION"
           echo "$binary_dir" >> "$GITHUB_PATH"
-      - name: Run the connected proof
+      - name: Run both live repositories and both private CLIs
+        run: ./deploy/cockroach/tests/registry-activation-cli.sh
+
+  # Docker is a secondary packaging/RBAC parity substrate. These jobs assert
+  # the exact server build tag, but cannot substitute for the authoritative
+  # checksum-pinned official-binary correctness lane above.
+  cockroachdb-docker-parity:
+    name: CockroachDB / secondary Docker parity / ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: control RBAC
+            script: deploy/cockroach/tests/control-role-grants.sh
+          - name: registry RBAC
+            script: deploy/cockroach/tests/registry-activation-role-grants.sh
+          - name: control bootstrap CLI
+            script: deploy/cockroach/tests/control-bootstrap-cli.sh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the secondary Docker parity proof
         env:
           PROOF_SCRIPT: ${{ matrix.script }}
         run: ./"$PROOF_SCRIPT"

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Secondary Docker parity only: this preserves the container/TLS bootstrap
+# proof, but cannot substitute for the official-binary correctness lane.
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../../.." && pwd)
 image=${FLEET_RECALL_CRDB_IMAGE:-cockroachdb/cockroach:v26.2.3}
+expected_crdb_build_tag=v26.2.3
 container="ostk-control-cli-$$"
 cert_dir=$(mktemp -d "${TMPDIR:-/tmp}/ostk-control-cli.XXXXXX")
 admin_password='local-admin-proof-password'
@@ -47,6 +50,9 @@ for _ in $(seq 1 90); do
     sleep 1
 done
 test "$ready" -eq 1 || fail "CockroachDB did not become ready"
+server_build_tag=$(docker exec "$container" cockroach version --build-tag)
+test "$server_build_tag" = "$expected_crdb_build_tag" \
+    || fail "Docker server must be exact CockroachDB $expected_crdb_build_tag (found $server_build_tag)"
 
 mapping=$(docker port "$container" 26257/tcp)
 port=${mapping##*:}
@@ -174,4 +180,4 @@ printf '%s\n' \
     "$replay" \
     "schema-version EXPLAIN:" \
     "$explain" \
-    "control bootstrap CLI proof passed"
+    "secondary Docker control bootstrap CLI parity proof passed"
