@@ -16,6 +16,7 @@ pub mod ledger;
 pub mod mcp;
 pub mod memory_contracts;
 pub mod reference_agent;
+pub mod registry_activation;
 pub mod service;
 pub mod store;
 
