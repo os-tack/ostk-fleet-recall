@@ -289,6 +289,8 @@ where
 
 /// Emit deterministic RFC 8785/JCS bytes for an admitted value.
 pub fn canonical_bytes(value: &CanonicalValue) -> ContractResult<Vec<u8>> {
+    let mut state = ParseState::default();
+    validate_value(value, 0, &mut state)?;
     let mut output = Vec::new();
     write_value(value, &mut output)?;
     if output.len() > MAX_OUTPUT_BYTES {
@@ -297,6 +299,51 @@ pub fn canonical_bytes(value: &CanonicalValue) -> ContractResult<Vec<u8>> {
         });
     }
     Ok(output)
+}
+
+fn validate_value(
+    value: &CanonicalValue,
+    depth: usize,
+    state: &mut ParseState,
+) -> ContractResult<()> {
+    state.add_node()?;
+    if depth > MAX_DEPTH {
+        return Err(ContractError::DepthLimit { limit: MAX_DEPTH });
+    }
+    match value {
+        CanonicalValue::Integer(value)
+            if !(-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(value) =>
+        {
+            Err(ContractError::IntegerOutOfRange)
+        }
+        CanonicalValue::String(value) => validate_string(value),
+        CanonicalValue::Array(values) => {
+            if values.len() > MAX_COLLECTION_ELEMENTS {
+                return Err(ContractError::CollectionLimit {
+                    limit: MAX_COLLECTION_ELEMENTS,
+                });
+            }
+            let child_depth = checked_child_depth(depth)?;
+            for value in values {
+                validate_value(value, child_depth, state)?;
+            }
+            Ok(())
+        }
+        CanonicalValue::Object(values) => {
+            if values.len() > MAX_COLLECTION_ELEMENTS {
+                return Err(ContractError::CollectionLimit {
+                    limit: MAX_COLLECTION_ELEMENTS,
+                });
+            }
+            let child_depth = checked_child_depth(depth)?;
+            for (key, value) in values {
+                validate_string(key)?;
+                validate_value(value, child_depth, state)?;
+            }
+            Ok(())
+        }
+        CanonicalValue::Null | CanonicalValue::Bool(_) | CanonicalValue::Integer(_) => Ok(()),
+    }
 }
 
 fn write_value(value: &CanonicalValue, output: &mut Vec<u8>) -> ContractResult<()> {
@@ -469,15 +516,21 @@ pub type CanonicalBytes<T> = CanonicalTyped<T>;
 
 impl<T> CanonicalTyped<T>
 where
-    T: DeserializeOwned,
+    T: DeserializeOwned + Serialize,
 {
     pub fn decode(input: &[u8]) -> ContractResult<Self> {
-        let document = parse_strict(input)?;
+        let document = require_canonical(input)?;
         let value = serde_json::from_slice(document.bytes())
             .map_err(|error| ContractError::Schema(error.to_string()))?;
+        let bytes = encode_canonical(&value)?;
+        if bytes != input {
+            // Typed defaults must be explicit in identity-bearing artifacts;
+            // decoding cannot silently change their byte preimage.
+            return Err(ContractError::NotCanonical);
+        }
         Ok(Self {
             value,
-            bytes: document.bytes,
+            bytes,
             marker: PhantomData,
         })
     }
@@ -576,7 +629,7 @@ mod tests {
         assert!(require_canonical(b"{}").is_ok());
     }
 
-    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     struct ClosedSchema {
         enabled: bool,
@@ -589,5 +642,36 @@ mod tests {
             ClosedSchema { enabled: true }
         );
         assert!(decode_strict::<ClosedSchema>(br#"{"enabled":true,"other":false}"#).is_err());
+    }
+
+    #[test]
+    fn canonical_typed_requires_exact_bytes_and_explicit_defaults() {
+        assert!(CanonicalTyped::<ClosedSchema>::decode(br#"{ "enabled": true }"#).is_err());
+        assert!(CanonicalTyped::<ClosedSchema>::decode(br#"{"enabled":true}"#).is_ok());
+
+        #[derive(Debug, Deserialize, Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct DefaultedSchema {
+            #[serde(default)]
+            enabled: bool,
+        }
+
+        assert!(CanonicalTyped::<DefaultedSchema>::decode(b"{}").is_err());
+        assert!(CanonicalTyped::<DefaultedSchema>::decode(br#"{"enabled":false}"#).is_ok());
+    }
+
+    #[test]
+    fn programmatic_values_cannot_bypass_profile_validation() {
+        assert!(canonical_bytes(&CanonicalValue::Integer(MAX_SAFE_INTEGER + 1)).is_err());
+        assert!(canonical_bytes(&CanonicalValue::String("e\u{0301}".into())).is_err());
+
+        let mut nested = CanonicalValue::Null;
+        for _ in 0..=MAX_DEPTH {
+            nested = CanonicalValue::Array(vec![nested]);
+        }
+        assert!(matches!(
+            canonical_bytes(&nested),
+            Err(ContractError::DepthLimit { .. })
+        ));
     }
 }

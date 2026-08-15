@@ -123,6 +123,27 @@ pub struct CanonicalTimestamp(String);
 impl CanonicalTimestamp {
     pub fn parse(value: impl Into<String>) -> ContractResult<Self> {
         let value = value.into();
+        let bytes = value.as_bytes();
+        let separators_are_exact = bytes.len() == 30
+            && bytes.get(4) == Some(&b'-')
+            && bytes.get(7) == Some(&b'-')
+            && bytes.get(10) == Some(&b'T')
+            && bytes.get(13) == Some(&b':')
+            && bytes.get(16) == Some(&b':')
+            && bytes.get(19) == Some(&b'.')
+            && bytes.get(29) == Some(&b'Z');
+        let digits_are_exact = bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19 | 29) || byte.is_ascii_digit()
+        });
+        if !separators_are_exact
+            || !digits_are_exact
+            || &value[0..4] == "0000"
+            || &value[17..19] == "60"
+        {
+            return Err(ContractError::Schema(
+                "timestamp is not canonical UTC".into(),
+            ));
+        }
         let parsed = DateTime::parse_from_rfc3339(&value)
             .map_err(|_| ContractError::Schema("timestamp is not canonical UTC".into()))?
             .with_timezone(&Utc);
@@ -232,6 +253,58 @@ impl HexBytes {
     }
 }
 
+macro_rules! fixed_hex_type {
+    ($name:ident, $length:expr) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name([u8; $length]);
+
+        impl $name {
+            pub const fn from_bytes(bytes: [u8; $length]) -> Self {
+                Self(bytes)
+            }
+
+            pub const fn as_bytes(&self) -> &[u8; $length] {
+                &self.0
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(&hex::encode(self.0))
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                if value.len() != $length * 2
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(D::Error::custom(
+                        "fixed bytes require lowercase exact-length hex",
+                    ));
+                }
+                let decoded = hex::decode(value).map_err(D::Error::custom)?;
+                let bytes = decoded
+                    .try_into()
+                    .map_err(|_| D::Error::custom("fixed bytes have the wrong length"))?;
+                Ok(Self(bytes))
+            }
+        }
+    };
+}
+
+fixed_hex_type!(FixedHex32, 32);
+fixed_hex_type!(FixedHex64, 64);
+
 impl Serialize for HexBytes {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -321,6 +394,8 @@ mod tests {
             "2026-08-14T12:34:56.000Z",
             "2026-08-14T12:34:56.000000000+00:00",
             "2026-08-14t12:34:56.000000000z",
+            "2026-08-14T12:34:60.000000000Z",
+            "0000-08-14T12:34:56.000000000Z",
         ] {
             assert!(
                 CanonicalTimestamp::parse(invalid).is_err(),
