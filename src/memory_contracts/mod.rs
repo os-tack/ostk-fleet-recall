@@ -9,6 +9,7 @@ pub mod common;
 pub mod digest;
 pub mod error;
 pub mod evidence;
+pub mod genesis;
 pub mod identity;
 pub mod normative;
 pub mod registry;
