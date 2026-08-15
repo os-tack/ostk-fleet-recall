@@ -17,11 +17,14 @@ The contract has three deliberately separate authority layers:
    threshold, and existential package-author-independence rule. The target v2
    policy is installed in the resulting head and is used only for later
    transitions; it cannot reinterpret the `0 -> 1` ceremony retroactively.
-3. Verification returns an opaque but non-durable request. A repository must
-   lock and re-audit the exact predecessor head, active genesis package and
-   policy, persisted predecessor acceptance time, and unconsumed bridge in the
-   same transaction as its compare-and-swap. Only then may repository code call
-   the crate-private receipt, event, and resulting-head constructors.
+3. Verification returns an opaque but non-durable request. Immutable bridge
+   pin closure can be repeated when auditing an accepted historical request,
+   but grants no freshness. For a new insertion, a repository must lock and
+   re-audit the exact predecessor head, active genesis package and policy,
+   persisted predecessor acceptance time, current generation zero, and the
+   unconsumed bridge in the same transaction as its compare-and-swap. Only then
+   may repository code call the crate-private receipt, event, and resulting-
+   head constructors.
 
 The frozen target package digest is
 `16f98d5df93b74dab5b2188274cbd1da21d089ff7a64cd8fc29679946e7fe2c9`;

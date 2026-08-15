@@ -877,8 +877,8 @@ mod tests {
         registry::ManifestVerifiedRegistryPackage,
         successor_package::SemanticallyClosedSuccessorPackage,
         successor_policy::{
-            ActiveGenesisSuccessorWitness, GenesisSuccessorKeyBridgePin,
-            GenesisSuccessorKeyBridgeV1, verify_pinned_genesis_successor_key_bridge,
+            GenesisSuccessorKeyBridgePin, GenesisSuccessorKeyBridgeV1,
+            ImmutableGenesisSuccessorWitness, verify_pinned_genesis_successor_key_bridge,
         },
     };
 
@@ -1149,14 +1149,12 @@ mod tests {
         .unwrap();
         let genesis = SemanticallyClosedGenesisPackage::from_manifest_verified(genesis).unwrap();
         let bridge: GenesisSuccessorKeyBridgeV1 = decode_strict(record(BRIDGE_FIXTURE)).unwrap();
-        let witness = ActiveGenesisSuccessorWitness::from_test_fixture(
+        let witness = ImmutableGenesisSuccessorWitness::from_test_fixture(
             bridge.profile.clone(),
             bridge.scope.clone(),
             bridge.genesis_registry_head.clone(),
-            bridge.current_v1_activation_policy.clone(),
+            bridge.current_v1_activation_policy,
             &genesis,
-            bridge.from_generation,
-            false,
         )
         .unwrap();
         let pin = GenesisSuccessorKeyBridgePin::from_trusted_config(

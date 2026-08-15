@@ -25,13 +25,17 @@ trusted proposer is not excluded merely for being proposer. The stronger v2
 author/proposer-disjoint rule governs later transitions only after v2 is active.
 
 These public fixture bytes grant no authority. A later private repository seam
-must authenticate an opaque deployment pin, resolve the active genesis package
-and full head in the same transaction, prove that the bridge has never been
-consumed, verify fresh approvals under the v1 threshold, consume generation
-zero, and install the successor head atomically. Database bytes, artifact bytes,
-or a caller-constructed witness cannot replace that trusted path. The contract
-module therefore exposes no production constructor for its active-genesis
-witness; its fixture constructor exists only in tests.
+must authenticate an opaque deployment pin, resolve and fully re-audit the
+immutable genesis package and full root head in the same transaction, verify
+fresh approvals under the v1 threshold, and separately prove under its stable
+stream lock that generation zero is current and the bridge has never been
+consumed before it consumes generation zero and installs the successor head
+atomically. Immutable bridge closure deliberately remains re-verifiable after
+acceptance so exact replay can audit the historical request without pretending
+the bridge is still fresh. Database bytes, artifact bytes, or a caller-
+constructed witness cannot replace that trusted path. The contract module
+therefore exposes no production constructor for its immutable-genesis witness;
+its fixture constructor exists only in tests.
 
 The bridge uses the shared `DigestDomain::GenesisSuccessorKeyBridgeV1` domain,
 whose frozen prefix is:

@@ -333,16 +333,17 @@ impl GenesisSuccessorKeyBridgePin {
     }
 }
 
-/// Opaque active-genesis facts reserved for a later same-transaction repository
-/// audit.
+/// Opaque immutable-genesis facts reserved for a later same-transaction
+/// repository audit.
 ///
 /// There is intentionally no production constructor in this contract module:
 /// offline package closure and caller-supplied head fields cannot prove that a
-/// durable database head is current, locked, and uncontested or that the
-/// one-shot bridge remains unconsumed.
+/// durable database root was fully re-audited. Current generation and bridge
+/// consumption are deliberately absent: they are mutable repository state,
+/// not part of the bridge's immutable cryptographic closure.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // intentionally unwired until the successor repository exists
-pub(crate) struct ActiveGenesisSuccessorWitness {
+pub(crate) struct ImmutableGenesisSuccessorWitness {
     profile: ProfileReferenceV1,
     scope: AuthenticatedProjectScopeV1,
     genesis_registry_head: RegistryHeadBindingV1,
@@ -350,21 +351,16 @@ pub(crate) struct ActiveGenesisSuccessorWitness {
     eligible_v1_principal_ids: Vec<ContractId>,
     required_v1_threshold: u16,
     v1_separation_of_duty: GenesisTransitionSeparationOfDutyV1,
-    current_generation: u32,
-    bridge_already_consumed: bool,
 }
 
 #[cfg(test)]
-impl ActiveGenesisSuccessorWitness {
-    #[allow(clippy::too_many_arguments)]
+impl ImmutableGenesisSuccessorWitness {
     pub(crate) fn from_test_fixture(
         profile: ProfileReferenceV1,
         scope: AuthenticatedProjectScopeV1,
         genesis_registry_head: RegistryHeadBindingV1,
         current_v1_activation_policy: RegistryReferenceV1,
         genesis_package: &SemanticallyClosedGenesisPackage,
-        current_generation: u32,
-        bridge_already_consumed: bool,
     ) -> ContractResult<Self> {
         profile.require_frozen_runtime_profile()?;
         genesis_registry_head.validate_shape()?;
@@ -414,10 +410,30 @@ impl ActiveGenesisSuccessorWitness {
             eligible_v1_principal_ids,
             required_v1_threshold,
             v1_separation_of_duty,
-            current_generation,
-            bridge_already_consumed,
         })
     }
+}
+
+/// Fail closed unless a locked repository snapshot is the unused `0 -> 1`
+/// insertion point.
+///
+/// This is intentionally separate from immutable bridge-pin verification so a
+/// completed transition can re-verify its historical canonical request during
+/// exact replay. The successor repository must call this helper only with the
+/// current generation and bridge-consumption result read under its stable
+/// stream lock, immediately before minting new durable state.
+#[allow(dead_code)] // consumed by the successor repository in the next increment
+pub(crate) fn require_fresh_genesis_successor_insert(
+    current_generation: u32,
+    bridge_already_consumed: bool,
+) -> ContractResult<()> {
+    if current_generation != GENESIS_GENERATION || bridge_already_consumed {
+        return Err(ContractError::Schema(
+            "genesis successor key bridge was already consumed or generation zero is not current"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Canonical and deployment-pinned bridge candidate closed over the exact v1
@@ -502,13 +518,15 @@ impl PinnedGenesisSuccessorKeyBridge {
 }
 
 /// Check the exact canonical bridge against a deployment pin and a separately
-/// obtained active-genesis witness. Pin verification happens before typed
-/// decoding so caller-controlled bytes cannot select their own expected digest.
+/// obtained immutable-genesis witness. Pin verification happens before typed
+/// decoding so caller-controlled bytes cannot select their own expected
+/// digest. This closure is reusable for historical replay; it deliberately
+/// says nothing about the mutable current generation or consumption slot.
 #[allow(dead_code)] // intentionally unwired until the successor repository exists
 pub(crate) fn verify_pinned_genesis_successor_key_bridge(
     input: &[u8],
     pin: GenesisSuccessorKeyBridgePin,
-    witness: &ActiveGenesisSuccessorWitness,
+    witness: &ImmutableGenesisSuccessorWitness,
 ) -> ContractResult<PinnedGenesisSuccessorKeyBridge> {
     let bridge_digest = GenesisSuccessorKeyBridgeDigest::from_digest(domain_separated_digest(
         DigestDomain::GenesisSuccessorKeyBridgeV1,
@@ -533,16 +551,6 @@ pub(crate) fn verify_pinned_genesis_successor_key_bridge(
     {
         return Err(ContractError::ManifestMismatch);
     }
-    if witness.current_generation != GENESIS_GENERATION
-        || witness.bridge_already_consumed
-        || bridge.from_generation != witness.current_generation
-        || bridge.to_generation != witness.current_generation + 1
-    {
-        return Err(ContractError::Schema(
-            "genesis successor key bridge was reused or has the wrong generation".into(),
-        ));
-    }
-
     Ok(PinnedGenesisSuccessorKeyBridge {
         bridge,
         canonical_bytes: input.to_vec(),
@@ -907,17 +915,13 @@ mod tests {
     fn witness(
         expected_scope: AuthenticatedProjectScopeV1,
         expected_head: RegistryHeadBindingV1,
-        current_generation: u32,
-        already_consumed: bool,
-    ) -> ActiveGenesisSuccessorWitness {
-        ActiveGenesisSuccessorWitness::from_test_fixture(
+    ) -> ImmutableGenesisSuccessorWitness {
+        ImmutableGenesisSuccessorWitness::from_test_fixture(
             frozen_profile_reference_v1(),
             expected_scope,
             expected_head,
             current_v1_policy_reference(),
             &package(),
-            current_generation,
-            already_consumed,
         )
         .unwrap()
     }
@@ -1169,7 +1173,7 @@ mod tests {
         let verified = verify_pinned_genesis_successor_key_bridge(
             &bytes,
             pin_for_bytes(&bytes),
-            &witness(scope(), genesis_head(), 0, false),
+            &witness(scope(), genesis_head()),
         )
         .unwrap();
         assert_eq!(verified.bridge(), &bridge());
@@ -1189,7 +1193,7 @@ mod tests {
             verify_pinned_genesis_successor_key_bridge(
                 &bytes,
                 wrong_pin,
-                &witness(scope(), genesis_head(), 0, false),
+                &witness(scope(), genesis_head()),
             ),
             Err(ContractError::ManifestMismatch)
         ));
@@ -1200,7 +1204,7 @@ mod tests {
             verify_pinned_genesis_successor_key_bridge(
                 &noncanonical,
                 wrong_pin,
-                &witness(scope(), genesis_head(), 0, false),
+                &witness(scope(), genesis_head()),
             ),
             Err(ContractError::ManifestMismatch)
         ));
@@ -1208,7 +1212,7 @@ mod tests {
             verify_pinned_genesis_successor_key_bridge(
                 &noncanonical,
                 pin_for_bytes(&noncanonical),
-                &witness(scope(), genesis_head(), 0, false),
+                &witness(scope(), genesis_head()),
             ),
             Err(ContractError::NotCanonical)
         ));
@@ -1220,7 +1224,7 @@ mod tests {
         let verified = verify_pinned_genesis_successor_key_bridge(
             &bytes,
             pin_for_bytes(&bytes),
-            &witness(scope(), genesis_head(), 0, false),
+            &witness(scope(), genesis_head()),
         )
         .unwrap();
         let alice = ContractId::new("principal.alice").unwrap();
@@ -1283,7 +1287,7 @@ mod tests {
 
     #[test]
     fn bridge_rejects_missing_extra_duplicate_principals_and_keys() {
-        let active = witness(scope(), genesis_head(), 0, false);
+        let active = witness(scope(), genesis_head());
         let mut cases = Vec::new();
 
         let mut missing = bridge();
@@ -1319,7 +1323,7 @@ mod tests {
 
     #[test]
     fn bridge_rejects_profile_scope_head_and_policy_mismatches() {
-        let active = witness(scope(), genesis_head(), 0, false);
+        let active = witness(scope(), genesis_head());
 
         let mut wrong_profile = bridge();
         wrong_profile.profile.profile_digest =
@@ -1361,14 +1365,19 @@ mod tests {
     }
 
     #[test]
-    fn bridge_reuse_and_every_non_zero_to_one_generation_fail_closed() {
+    fn bridge_reuse_is_a_separate_new_insert_precondition() {
         let bytes = encode_canonical(&bridge()).unwrap();
-        for active in [
-            witness(scope(), genesis_head(), 1, false),
-            witness(scope(), genesis_head(), 0, true),
-        ] {
+        let immutable = witness(scope(), genesis_head());
+
+        // Immutable pin closure remains available after acceptance so replay
+        // can re-verify the historical statement and approvals exactly.
+        verify_pinned_genesis_successor_key_bridge(&bytes, pin_for_bytes(&bytes), &immutable)
+            .unwrap();
+
+        assert!(require_fresh_genesis_successor_insert(0, false).is_ok());
+        for (current_generation, already_consumed) in [(1, false), (0, true), (1, true)] {
             assert!(
-                verify_pinned_genesis_successor_key_bridge(&bytes, pin_for_bytes(&bytes), &active,)
+                require_fresh_genesis_successor_insert(current_generation, already_consumed)
                     .is_err()
             );
         }
