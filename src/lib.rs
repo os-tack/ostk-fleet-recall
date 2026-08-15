@@ -13,6 +13,7 @@ pub mod context;
 pub mod error;
 pub mod ledger;
 pub mod mcp;
+pub mod memory_contracts;
 pub mod reference_agent;
 pub mod service;
 pub mod store;

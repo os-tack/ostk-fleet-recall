@@ -1,0 +1,11 @@
+//! Pure, transport-neutral contracts for dynamic causal memory.
+//!
+//! This module is deliberately a leaf: it does not depend on the application,
+//! database, HTTP, or retrieval layers. Runtime acceptance and projection are
+//! later stages built on these byte-exact contracts.
+
+pub mod canonical;
+pub mod digest;
+pub mod error;
+
+pub use error::{ContractError, ContractResult};
