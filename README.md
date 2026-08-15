@@ -39,13 +39,19 @@ hackathon slice. Additional canonical Recall actions are also future work.
 ## Evidence status
 
 Source and deployment evidence are intentionally reported separately. The
-current checkout embeds migrations 1 through 9, including private Stage-2
-control and Stage-3 genesis-activation state. Normal serving health remains
-compatible with a complete successful migration prefix of at least version 2.
-The AWS module wires only distinct runtime and migrator database credential
-paths; the third Stage-2 and fourth Stage-3 SQL principals exist only when
-their local private ceremonies run. None of those source facts upgrades the
-historical cloud evidence below.
+current checkout embeds migrations 1 through 14, including private Stage-2
+control, genesis Stage-3 activation, and durable successor-schema state. Normal
+serving health remains compatible with a complete successful migration prefix
+of at least version 2. Stage 2 deliberately keeps its prefix-1-through-3 gate,
+and the genesis Stage-3 repository keeps its prefix-1-through-9 gate; current
+release completion is prefix 1 through 14. The successor contracts and three
+new tables do not yet have a successor writer repository, write-grant RBAC
+bundle, operator CLI, AWS task, or runtime authority. A separate deny-only
+quarantine policy keeps those tables migrator/schema-owner only. The AWS
+module wires only distinct runtime and migrator database credential paths; the
+third Stage-2 and fourth genesis Stage-3 SQL principals exist only when their
+local private ceremonies run.
+None of those source facts upgrades the historical cloud evidence below.
 
 The submission candidate is live at
 [https://d13zrqfh66r7ub.cloudfront.net](https://d13zrqfh66r7ub.cloudfront.net).
@@ -287,10 +293,13 @@ non-sensitive corpus and check readiness:
 "$FLEET_RECALL_BIN" health
 ```
 
-The current embedded migrator applies versions 1 through 9. Migration v1 builds
-vector indexes outside one SQL transaction because of the CockroachDB
-schema-changer constraint, and the later private schema changes are also
-forward-only. Never run multiple migrators concurrently. See
+The current embedded migrator applies versions 1 through 14. Versions 1 through
+11 execute without a wrapping SQL transaction because of CockroachDB
+schema-changer and schema-lock constraints; v10 and v11 are resumable only
+because they verify an exact committed index before SQLx records success.
+Versions 12 through 14 run transactionally on a dedicated migration session
+with `autocommit_before_ddl = false`. Never run multiple migrators concurrently
+or run the migration files manually as a substitute for that policy. See
 [migration and recovery rules](docs/MIGRATIONS.md) before recovering a failed
 migration.
 
@@ -452,6 +461,9 @@ the remaining rows.
   activation route. Do not expose a future mutation route publicly without
   workload identity, authorization, rate limiting, and production network
   controls.
+- Migrations 12 through 14 reserve durable successor state, but their three
+  tables remain migrator/schema-owner only under the deny-only quarantine
+  policy. Schema and contracts alone do not authorize runtime successor writes.
 
 See [security and supply-chain policy](docs/SECURITY.md) and the
 [architecture](docs/ARCHITECTURE.md) for the complete invariants.
@@ -489,6 +501,14 @@ cargo test --locked \
 The final test asserts that representative dense, source-prefixed dense, and
 lexical queries select their intended CockroachDB indexes rather than proving
 only one-row functional behavior.
+
+The migration correctness gate was run against the official CockroachDB
+v26.2.3 binary, including fresh, populated-upgrade, interruption, catalog-drift,
+and transactional rollback cases. That lane applies and schema-checks the
+deny-only quarantine, but the full role allow/deny/grant-option matrix belongs
+to separate Docker RBAC proofs. The recorded LocalStack application-image smoke
+predates migrations 10 through 14 and must be rerun before claiming current
+image parity. None of these local results is AWS deployment evidence.
 
 ## Deployment and project documentation
 

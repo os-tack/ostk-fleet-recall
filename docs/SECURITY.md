@@ -55,12 +55,22 @@ serializable transaction; only CockroachDB SQLSTATE `40001` retries the whole
 operation. Application claim, support, conflict, event, and receipt mutations
 follow the same bounded idempotent/serializable rule.
 
-Current source embeds migrations 1 through 9. Migrations 3 through 9 add and
-harden the private control and genesis-activation projections. Normal recall,
-ingest, MCP, and public-demo health intentionally retain an additive minimum
-schema requirement of version 2; that serving compatibility check is not a
-release-completion or private-ceremony authorization gate. Stage 2 requires
-the complete successful prefix 1 through 3, and Stage 3 requires 1 through 9.
+Current source embeds migrations 1 through 14. Migrations 3 through 9 add and
+harden the private control and genesis-activation projections; migrations 10
+through 14 add exact genesis-root indexes and three durable successor tables.
+Normal recall, ingest, MCP, and public-demo health intentionally retain an
+additive minimum schema requirement of version 2; that serving compatibility
+check is not a release-completion or private-ceremony authorization gate. The
+current release target is the complete successful prefix 1 through 14. Stage 2
+still requires prefix 1 through 3, and the genesis Stage-3 repository still
+requires 1 through 9.
+
+Versions 1 through 11 are nontransactional schema changes; v10 and v11 recover
+an interrupted exact index through `IF NOT EXISTS` plus a fail-closed catalog
+shape assertion. Versions 12 through 14 run with SQLx bookkeeping in one
+transaction on a dedicated session with `autocommit_before_ddl = false`. The
+session is closed rather than returned to the runtime pool. These migration
+mechanics establish durable shape, not an application authorization boundary.
 
 ## Identities, URLs, and secrets
 
@@ -72,6 +82,19 @@ actually run, Stage 2 uses a third SQL principal and dedicated control URL;
 Stage 3 uses a fourth SQL principal and dedicated registry URL. Those one-shot
 credentials are never fallbacks for runtime or migration credentials and
 should be disabled or removed after the ceremony.
+
+There is no successor writer principal, repository, write-grant RBAC bundle,
+CLI, AWS task, startup hook, or public route. The checked-in
+[quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql)
+is deny-only: after prefix 1 through 14 it revokes every successor-table
+privilege from `public`, runtime,
+bootstrap, and genesis activation and grants nothing. Until the writer surface
+is implemented and reviewed together,
+`memory_registry_transitions`,
+`memory_registry_genesis_bridge_consumptions`, and
+`memory_registry_current_heads_v2` remain migrator/schema-owner only. Neither
+the runtime user nor either existing one-shot role may receive access merely
+because the migrations and contracts exist.
 
 All database URL surfaces require `postgres`/`postgresql`, a hostname, and a
 closed parameter set. Serving and Stage-2 control require exactly
@@ -103,6 +126,11 @@ activation/head rows or misuse its table-level shard-head update. The unique
 predecessor index prevents one class of fork but cannot prove a new event is
 the head-authorized append. These credentials are therefore exclusive
 ceremony capabilities, not operator shells or general service accounts.
+
+The existing activation credential is genesis-only. It has no authority over
+the successor tables, and the presence of their foreign keys, singleton rows,
+and canonical contract definitions must not be interpreted as an enabled
+successor runtime.
 
 The one-shot roles intentionally lack delete and broad repair authority, so an
 invalid direct write can wedge a scope. Stop the writer, preserve rows and

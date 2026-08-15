@@ -43,8 +43,8 @@ to CockroachDB. After connecting it requires exactly three successful SQLx rows
 for the uninterrupted prefix 1 through 3 before touching the control tables;
 a later successful migration cannot mask a failed or missing prerequisite.
 This is deliberately a Stage-2 compatibility gate, not proof that the current
-post-v9 schema is ready for Stage-3 activation. Neither artifact may override
-physical or semantic routing.
+post-v14 release is complete or that genesis Stage-3 activation is authorized.
+Neither artifact may override physical or semantic routing.
 
 Apply once, then audit a replay using the same authority:
 
@@ -89,9 +89,14 @@ references. The migrator must not grant runtime access through `ALL TABLES` or
 an `ALTER DEFAULT PRIVILEGES ... ALL TABLES` rule, because that silently grants
 future control tables.
 
-The policy can first be applied after migration 0003. Reapply it after every
-later migration creates objects; the current deployment target is the complete
-successful prefix through migration 0009. Connect to the dedicated
+The base policy can first be applied after migration 0003 and must remain
+runnable at that original Stage-2 boundary. Reapply it after later migrations
+create objects. For the current complete prefix through migration 0014, also
+apply or reapply the genesis-activation base role policy and then the deny-only
+[quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql).
+The quarantine requires all fourteen successful migration rows before it
+revokes the three successor tables from every existing application role; it
+grants nothing. Connect to the dedicated
 `fleet_recall` database as a
 cluster admin, or as a dedicated security operator with `CREATEROLE`, the
 required role admin options and SYSTEM grant options, plus grant authority on
@@ -127,6 +132,14 @@ default. Run `SHOW DEFAULT PRIVILEGES` as the actual migrator and require no
 table/sequence default granting `public` or either application logical role;
 reapply and re-audit after migrations create objects.
 
+After migration 0014, that audit and quarantine proof must show no `public`,
+runtime, bootstrap, or genesis-activation grant on `memory_registry_transitions`,
+`memory_registry_genesis_bridge_consumptions`, or
+`memory_registry_current_heads_v2`. Those successor tables remain
+migrator/schema-owner only until a successor writer repository, write-grant
+RBAC bundle, and CLI are implemented and reviewed together. Their schema and
+contracts do not expand Stage-2 authority.
+
 The required raw `INSERT` surface is still powerful: direct SQL can occupy a
 scope singleton with invalid canonical bytes or plant a detached future event
 offset, permanently wedging that scope for this intentionally non-repair role.
@@ -149,11 +162,17 @@ Run the disposable local proof before deployment:
 ./deploy/cockroach/tests/control-role-grants.sh
 ```
 
-The proof starts an isolated local CockroachDB, applies the current migrations
-0003 through 0009, injects and repairs role-option,
-SYSTEM, admin/cross-role, direct-object, and `public` drift, asserts exact
+The proof starts an isolated local CockroachDB, applies the frozen
+Stage-2/genesis migration slice 0003 through 0009, injects and repairs
+role-option, SYSTEM, admin/cross-role, direct-object, and `public` drift,
+asserts exact
 current/default privileges, proves a database owner cannot run cluster-security
 hardening, freezes the command's distinct successful-prefix-1-through-3 gate,
 exercises each allowed statement, and rejects authorization escapes and a
 duplicate predecessor. It prints the effective grants and removes the
-container. It does not contact AWS or need LocalStack.
+container. This is the frozen Stage-2/genesis-role proof boundary, not a
+successor writer or current application-image migration-parity proof. The
+authoritative official CockroachDB v26.2.3 lane covers versions 1 through 14
+and applies/schema-checks the deny-only quarantine, but it does not exercise the
+full role allow/deny/grant-option drift matrix. That matrix remains the separate
+Docker RBAC proof. Neither substrate contacts AWS or needs LocalStack.

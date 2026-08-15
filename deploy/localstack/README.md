@@ -11,7 +11,8 @@ preflight tool, not evidence that an AWS deployment occurred.
   contract without printing the value.
 - The exact three-file model bundle can be delivered through S3 and passes the
   application's domain-separated digest before model loading.
-- The non-transactional schema migration completes once on CockroachDB 26.2.
+- The recorded then-current embedded schema migration completed once on
+  CockroachDB 26.2.
 - Synthetic NDJSON ingestion works with the pinned model.
 - Three deployment-bound MCP agent identities exercise record/replay, hybrid
   recall, a persisted claim-linked execution plan, scope rejection, conflict
@@ -27,12 +28,26 @@ does **not** claim to emulate Fargate scheduling, ALB TLS/health registration,
 ECR push/pull, AWS IAM enforcement, multi-AZ networking, ECS Secrets Manager
 injection, or CloudWatch delivery. Those remain real-AWS staging gates.
 
-On 2026-08-13 the combined current-source smoke passed with the production Rust
-1.94 image. One run verified the S3 and Secrets Manager contracts, migration,
-model delivery, ingestion, the full three-identity memory/action/conflict flow,
-forced application-container replacement, and recall from the unchanged
-CockroachDB 26.2.3 node afterward. This is local emulator/application evidence,
-not proof of Fargate, IAM, ALB, or CockroachDB Cloud behavior.
+The current checkout now embeds migrations 1 through 14. Versions 1 through 11
+are nontransactional, with resumable exact-catalog assertions in v10 and v11;
+v12 through v14 are transactional on a dedicated session with
+`autocommit_before_ddl = false`. Fresh, populated-upgrade, interruption,
+catalog-drift, and rollback correctness passed against the official
+CockroachDB v26.2.3 binary. The recorded Docker/Compose smoke below predates
+migrations 10 through 14 and has not been rerun for those bytes, so it is not
+current Docker-image parity evidence. The harness also provides no successor
+repository, RBAC, or CLI proof; the three successor tables remain
+migrator/schema-owner only. Full quarantine allow/deny/grant-option checks
+belong to the separate Docker RBAC scripts, not this application-image harness
+or the official-binary migration lane.
+
+On 2026-08-13 the combined then-current-source smoke (through migration 9)
+passed with the production Rust 1.94 image. One run verified the S3 and Secrets
+Manager contracts, migration, model delivery, ingestion, the full
+three-identity memory/action/conflict flow, forced application-container
+replacement, and recall from the unchanged CockroachDB 26.2.3 node afterward.
+This is historical local emulator/application evidence, not proof of current
+container parity, Fargate, IAM, ALB, or CockroachDB Cloud behavior.
 
 ## Requirements
 
@@ -140,3 +155,7 @@ of the following in AWS:
 6. replace an ECS task and prove the same CockroachDB memory remains;
 7. inspect real IAM role access and CockroachDB Cloud connection/allowlist
    behavior.
+
+This checklist is not authorization to take AWS action against the recorded
+live candidate. Any new image, migration, grant, plan, or apply requires its
+own operator approval and must preserve the historical evidence boundary.
