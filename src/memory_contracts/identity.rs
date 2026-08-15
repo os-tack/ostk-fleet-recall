@@ -13,11 +13,11 @@ use super::{
         RegistryReferenceV1,
     },
     digest::{DigestDomain, Sha256Digest, domain_separated_digest},
-    registry::{RegistryEntryKind, RegistryPackageV1, ValidatedRegistryPackage},
+    registry::{ManifestVerifiedRegistryPackage, RegistryEntryKind, RegistryPackageV1},
 };
 
 const IDENTITY_SCHEMA_VERSION: u32 = 1;
-const MAX_LOCATOR_COMPONENTS: usize = 64;
+pub(crate) const MAX_LOCATOR_COMPONENTS: usize = 64;
 const MAX_COMPONENT_VALUE_BYTES: usize = 4_096;
 
 /// Resource identity form selected by an activated kind recipe.
@@ -63,6 +63,7 @@ pub struct IdentityComponentRuleV1 {
 pub struct AuthorityNamespaceV1 {
     pub schema_version: u32,
     pub namespace_id: ContractId,
+    pub version: u32,
     pub immutable_coordinate_keys: Vec<ContractId>,
 }
 
@@ -72,8 +73,9 @@ pub struct AuthorityNamespaceV1 {
 pub struct ResourceKindSchemaV1 {
     pub schema_version: u32,
     pub resource_kind: ContractId,
+    pub version: u32,
     pub identity_form: IdentityForm,
-    pub parent_entity_kind: Option<ContractId>,
+    pub parent_entity_kind: Option<RegistryReferenceV1>,
     pub component_rules: Vec<IdentityComponentRuleV1>,
 }
 
@@ -110,16 +112,22 @@ impl IdentityRecipeV1 {
 }
 
 /// Identity recipe whose registry entry and exact namespace/kind dependencies
-/// were resolved from one verified package closure.
+/// were resolved from one manifest-verified offline package closure.
+///
+/// Runtime acceptance will additionally require an uncontested active-head
+/// witness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedIdentityRecipe {
     recipe: IdentityRecipeV1,
     registry_reference: RegistryReferenceV1,
+    profile: ProfileReferenceV1,
+    authority_namespace_id: ContractId,
+    parent_entity_kind: Option<RegistryReferenceV1>,
 }
 
 impl ValidatedIdentityRecipe {
     pub fn from_package(
-        package: &ValidatedRegistryPackage,
+        package: &ManifestVerifiedRegistryPackage,
         recipe_id: &ContractId,
         version: u32,
     ) -> ContractResult<Self> {
@@ -149,6 +157,13 @@ impl ValidatedIdentityRecipe {
             &super::canonical::encode_canonical(&namespace_entry.body)?,
         )?;
         validate_namespace(&namespace)?;
+        if (&namespace.namespace_id, namespace.version)
+            != (&namespace_entry.entry_id, namespace_entry.version)
+        {
+            return Err(ContractError::InvalidIdentityRecipe(
+                "namespace body ID does not match its registry entry".into(),
+            ));
+        }
 
         let kind_entry = exact_referenced_entry(
             package,
@@ -159,6 +174,30 @@ impl ValidatedIdentityRecipe {
             &super::canonical::encode_canonical(&kind_entry.body)?,
         )?;
         validate_kind_schema(&kind)?;
+        if (&kind.resource_kind, kind.version) != (&kind_entry.entry_id, kind_entry.version) {
+            return Err(ContractError::InvalidIdentityRecipe(
+                "resource-kind body ID does not match its registry entry".into(),
+            ));
+        }
+        if let Some(parent_reference) = &kind.parent_entity_kind {
+            let parent_entry = exact_referenced_entry(
+                package,
+                RegistryEntryKind::ResourceKindSchema,
+                parent_reference,
+            )?;
+            let parent: ResourceKindSchemaV1 = super::canonical::decode_strict(
+                &super::canonical::encode_canonical(&parent_entry.body)?,
+            )?;
+            validate_kind_schema(&parent)?;
+            if parent.identity_form != IdentityForm::Entity
+                || (&parent.resource_kind, parent.version)
+                    != (&parent_entry.entry_id, parent_entry.version)
+            {
+                return Err(ContractError::InvalidIdentityRecipe(
+                    "version parent must resolve to an exact entity-kind schema".into(),
+                ));
+            }
+        }
 
         if kind.resource_kind != recipe.resource_kind
             || kind.identity_form != recipe.identity_form
@@ -182,6 +221,9 @@ impl ValidatedIdentityRecipe {
                 version: recipe_entry.version,
                 entry_digest: recipe_entry.digest()?,
             },
+            profile: package.profile.clone(),
+            authority_namespace_id: namespace.namespace_id,
+            parent_entity_kind: kind.parent_entity_kind,
         })
     }
 
@@ -191,6 +233,29 @@ impl ValidatedIdentityRecipe {
 
     pub const fn registry_reference(&self) -> &RegistryReferenceV1 {
         &self.registry_reference
+    }
+}
+
+/// Trusted identity inputs supplied by authenticated ingress, never by the
+/// resource assertion being checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityDerivationContextV1 {
+    profile: ProfileReferenceV1,
+    scope: AuthenticatedProjectScopeV1,
+    provider_instance_namespace: ContractId,
+}
+
+impl IdentityDerivationContextV1 {
+    pub const fn from_trusted_context(
+        profile: ProfileReferenceV1,
+        scope: AuthenticatedProjectScopeV1,
+        provider_instance_namespace: ContractId,
+    ) -> Self {
+        Self {
+            profile,
+            scope,
+            provider_instance_namespace,
+        }
     }
 }
 
@@ -256,6 +321,26 @@ pub struct ResourceUri {
     digest: Sha256Digest,
 }
 
+/// URI returned only after recipe, trusted scope, provider namespace, and parent
+/// assertions have all been checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedResourceIdentityV1 {
+    uri: ResourceUri,
+    scope: AuthenticatedProjectScopeV1,
+    provider_instance_namespace: ContractId,
+    resource_kind_schema: RegistryReferenceV1,
+}
+
+impl DerivedResourceIdentityV1 {
+    pub const fn uri(&self) -> &ResourceUri {
+        &self.uri
+    }
+
+    pub fn into_uri(self) -> ResourceUri {
+        self.uri
+    }
+}
+
 impl ResourceUri {
     pub const fn identity_form(&self) -> IdentityForm {
         self.identity_form
@@ -286,24 +371,35 @@ impl FromStr for ResourceUri {
     type Err = ContractError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let parts = value.split(':').collect::<Vec<_>>();
-        if parts.len() != 7
-            || parts[0] != "urn"
-            || parts[1] != "ostk"
-            || parts[3] != "v1"
-            || parts[5] != "sha256"
+        if value.len() > 256 {
+            return Err(ContractError::InvalidResourceUri);
+        }
+        let mut parts = value.split(':');
+        let urn = parts.next();
+        let ostk = parts.next();
+        let form = parts.next();
+        let version = parts.next();
+        let kind = parts.next();
+        let algorithm = parts.next();
+        let digest_value = parts.next();
+        if parts.next().is_some()
+            || urn != Some("urn")
+            || ostk != Some("ostk")
+            || version != Some("v1")
+            || algorithm != Some("sha256")
         {
             return Err(ContractError::InvalidResourceUri);
         }
-        let identity_form = match parts[2] {
-            "entity" => IdentityForm::Entity,
-            "occurrence" => IdentityForm::Occurrence,
-            "version" => IdentityForm::Version,
+        let identity_form = match form {
+            Some("entity") => IdentityForm::Entity,
+            Some("occurrence") => IdentityForm::Occurrence,
+            Some("version") => IdentityForm::Version,
             _ => return Err(ContractError::InvalidResourceUri),
         };
-        let resource_kind =
-            ContractId::new(parts[4]).map_err(|_| ContractError::InvalidResourceUri)?;
-        let digest = parts[6]
+        let resource_kind = ContractId::new(kind.ok_or(ContractError::InvalidResourceUri)?)
+            .map_err(|_| ContractError::InvalidResourceUri)?;
+        let digest = digest_value
+            .ok_or(ContractError::InvalidResourceUri)?
             .parse()
             .map_err(|_| ContractError::InvalidResourceUri)?;
         Ok(Self {
@@ -333,24 +429,35 @@ impl<'de> Deserialize<'de> for ResourceUri {
     }
 }
 
-/// Validate a locator against the exact activated recipe, then derive its URN.
+/// Validate a locator against one manifest-verified offline recipe, then derive
+/// its URN. Runtime admission additionally requires an uncontested active-head
+/// witness and a distinct activated typestate.
 pub fn derive_resource_uri(
+    context: &IdentityDerivationContextV1,
     locator: &CanonicalLocatorV1,
     recipe: &ValidatedIdentityRecipe,
-) -> ContractResult<ResourceUri> {
-    validate_locator(locator, recipe)?;
+    parent: Option<&DerivedResourceIdentityV1>,
+) -> ContractResult<DerivedResourceIdentityV1> {
+    validate_locator(context, locator, recipe, parent)?;
     let bytes = encode_canonical(locator)?;
     let digest = domain_separated_digest(DigestDomain::ResourceLocator, &bytes);
-    Ok(ResourceUri {
-        identity_form: locator.identity_form,
-        resource_kind: locator.resource_kind.clone(),
-        digest,
+    Ok(DerivedResourceIdentityV1 {
+        uri: ResourceUri {
+            identity_form: locator.identity_form,
+            resource_kind: locator.resource_kind.clone(),
+            digest,
+        },
+        scope: context.scope.clone(),
+        provider_instance_namespace: context.provider_instance_namespace.clone(),
+        resource_kind_schema: recipe.recipe.resource_kind_schema.clone(),
     })
 }
 
 pub fn validate_locator(
+    context: &IdentityDerivationContextV1,
     locator: &CanonicalLocatorV1,
     validated_recipe: &ValidatedIdentityRecipe,
+    validated_parent: Option<&DerivedResourceIdentityV1>,
 ) -> ContractResult<()> {
     let recipe = validated_recipe.recipe();
     locator.profile.validate()?;
@@ -360,15 +467,36 @@ pub fn validate_locator(
         || locator.identity_form != recipe.identity_form
         || locator.resource_kind != recipe.resource_kind
         || locator.recipe != *validated_recipe.registry_reference()
+        || locator.profile != context.profile
+        || locator.profile != validated_recipe.profile
+        || locator.scope != context.scope
+        || locator.provider_instance_namespace != context.provider_instance_namespace
+        || locator.provider_instance_namespace != validated_recipe.authority_namespace_id
     {
         return Err(ContractError::InvalidResourceLocator(
             "locator does not match recipe identity".into(),
         ));
     }
-    match (locator.identity_form, locator.parent_entity.as_ref()) {
-        (IdentityForm::Version, Some(parent)) if parent.identity_form() == IdentityForm::Entity => {
-        }
-        (IdentityForm::Entity | IdentityForm::Occurrence, None) => {}
+    match (
+        locator.identity_form,
+        locator.parent_entity.as_ref(),
+        validated_parent,
+    ) {
+        (IdentityForm::Version, Some(parent), Some(validated_parent))
+            if parent == validated_parent.uri()
+                && parent.identity_form() == IdentityForm::Entity
+                && validated_recipe
+                    .parent_entity_kind
+                    .as_ref()
+                    .is_some_and(|kind| kind.entry_id == *parent.resource_kind())
+                && validated_recipe
+                    .parent_entity_kind
+                    .as_ref()
+                    .is_some_and(|kind| kind == &validated_parent.resource_kind_schema)
+                && validated_parent.scope == context.scope
+                && validated_parent.provider_instance_namespace
+                    == context.provider_instance_namespace => {}
+        (IdentityForm::Entity | IdentityForm::Occurrence, None, None) => {}
         _ => {
             return Err(ContractError::InvalidResourceLocator(
                 "identity form has invalid parent".into(),
@@ -429,6 +557,7 @@ fn exact_referenced_entry<'a>(
 
 fn validate_namespace(namespace: &AuthorityNamespaceV1) -> ContractResult<()> {
     if namespace.schema_version != IDENTITY_SCHEMA_VERSION
+        || namespace.version == 0
         || namespace.immutable_coordinate_keys.is_empty()
         || namespace.immutable_coordinate_keys.len() > MAX_LOCATOR_COMPONENTS
         || !strictly_sorted(&namespace.immutable_coordinate_keys)
@@ -441,13 +570,18 @@ fn validate_namespace(namespace: &AuthorityNamespaceV1) -> ContractResult<()> {
 }
 
 fn validate_kind_schema(kind: &ResourceKindSchemaV1) -> ContractResult<()> {
+    if let Some(parent) = &kind.parent_entity_kind {
+        parent.validate()?;
+    }
     let parent_is_valid = matches!(
         (kind.identity_form, kind.parent_entity_kind.as_ref()),
         (IdentityForm::Version, Some(_)) | (IdentityForm::Entity | IdentityForm::Occurrence, None)
     );
     if kind.schema_version != IDENTITY_SCHEMA_VERSION
+        || kind.version == 0
         || !parent_is_valid
         || kind.component_rules.is_empty()
+        || kind.component_rules.len() > MAX_LOCATOR_COMPONENTS
         || !strictly_sorted_by_key(&kind.component_rules)
     {
         return Err(ContractError::InvalidIdentityRecipe(
@@ -501,7 +635,7 @@ mod tests {
             resource_kind: ContractId::new("repository").unwrap(),
             identity_form: IdentityForm::Entity,
             authority_namespace: reference("github.namespace", 1, "namespace"),
-            resource_kind_schema: reference("github.repository", 1, "kind"),
+            resource_kind_schema: reference("repository", 1, "kind"),
             component_rules: vec![IdentityComponentRuleV1 {
                 key: ContractId::new("provider_repository_id").unwrap(),
                 encoding: LocatorEncoding::Decimal,
@@ -510,15 +644,31 @@ mod tests {
     }
 
     fn validated(recipe: IdentityRecipeV1) -> ValidatedIdentityRecipe {
+        let parent_entity_kind = (recipe.identity_form == IdentityForm::Version)
+            .then(|| recipe.resource_kind_schema.clone());
         let registry_reference = RegistryReferenceV1 {
             entry_id: recipe.recipe_id.clone(),
             version: recipe.version,
             entry_digest: digest(&format!("recipe-{}", recipe.version)),
         };
         ValidatedIdentityRecipe {
+            profile: profile(),
+            authority_namespace_id: ContractId::new("github.namespace").unwrap(),
+            parent_entity_kind,
             recipe,
             registry_reference,
         }
+    }
+
+    fn context() -> IdentityDerivationContextV1 {
+        IdentityDerivationContextV1::from_trusted_context(
+            profile(),
+            AuthenticatedProjectScopeV1::from_trusted_context(
+                ContractId::new("tenant.test").unwrap(),
+                ContractId::new("project.test").unwrap(),
+            ),
+            ContractId::new("github.namespace").unwrap(),
+        )
     }
 
     fn locator(recipe: &ValidatedIdentityRecipe, provider_id: &str) -> CanonicalLocatorV1 {
@@ -532,7 +682,7 @@ mod tests {
             identity_form: recipe.recipe.identity_form,
             resource_kind: recipe.recipe.resource_kind.clone(),
             recipe: recipe.registry_reference.clone(),
-            provider_instance_namespace: ContractId::new("github.public").unwrap(),
+            provider_instance_namespace: ContractId::new("github.namespace").unwrap(),
             parent_entity: None,
             components: vec![LocatorComponentV1 {
                 key: ContractId::new("provider_repository_id").unwrap(),
@@ -546,14 +696,23 @@ mod tests {
     fn rename_is_not_an_identity_component_but_scope_is() {
         let recipe = validated(recipe(1));
         let first = locator(&recipe, "12345");
-        let first_uri = derive_resource_uri(&first, &recipe).unwrap();
-        assert_eq!(first_uri, derive_resource_uri(&first, &recipe).unwrap());
+        let first_uri = derive_resource_uri(&context(), &first, &recipe, None).unwrap();
+        assert_eq!(
+            first_uri,
+            derive_resource_uri(&context(), &first, &recipe, None).unwrap()
+        );
 
         let mut other_scope = first;
         other_scope.scope.project_namespace = ContractId::new("project.other").unwrap();
+        assert!(derive_resource_uri(&context(), &other_scope, &recipe, None).is_err());
+        let other_context = IdentityDerivationContextV1::from_trusted_context(
+            profile(),
+            other_scope.scope.clone(),
+            ContractId::new("github.namespace").unwrap(),
+        );
         assert_ne!(
             first_uri,
-            derive_resource_uri(&other_scope, &recipe).unwrap()
+            derive_resource_uri(&other_context, &other_scope, &recipe, None).unwrap()
         );
     }
 
@@ -561,25 +720,58 @@ mod tests {
     fn recipe_upgrade_always_mints_a_new_uri() {
         let first_recipe = validated(recipe(1));
         let second_recipe = validated(recipe(2));
-        let first = derive_resource_uri(&locator(&first_recipe, "12345"), &first_recipe).unwrap();
-        let second =
-            derive_resource_uri(&locator(&second_recipe, "12345"), &second_recipe).unwrap();
+        let first = derive_resource_uri(
+            &context(),
+            &locator(&first_recipe, "12345"),
+            &first_recipe,
+            None,
+        )
+        .unwrap();
+        let second = derive_resource_uri(
+            &context(),
+            &locator(&second_recipe, "12345"),
+            &second_recipe,
+            None,
+        )
+        .unwrap();
         assert_ne!(first, second);
     }
 
     #[test]
     fn version_requires_exact_entity_parent() {
-        let mut recipe = recipe(1);
-        recipe.identity_form = IdentityForm::Version;
-        let recipe = validated(recipe);
-        let mut locator = locator(&recipe, "12345");
-        assert!(derive_resource_uri(&locator, &recipe).is_err());
-
         let entity_recipe = validated(self::recipe(1));
-        locator.parent_entity = Some(
-            derive_resource_uri(&self::locator(&entity_recipe, "12345"), &entity_recipe).unwrap(),
-        );
-        assert!(derive_resource_uri(&locator, &recipe).is_ok());
+        let parent = derive_resource_uri(
+            &context(),
+            &self::locator(&entity_recipe, "12345"),
+            &entity_recipe,
+            None,
+        )
+        .unwrap();
+
+        let mut version_recipe = self::recipe(1);
+        version_recipe.identity_form = IdentityForm::Version;
+        version_recipe.resource_kind = ContractId::new("repository_revision").unwrap();
+        version_recipe.resource_kind_schema = reference("repository_revision", 1, "version-kind");
+        let mut recipe = validated(version_recipe);
+        recipe.parent_entity_kind = Some(entity_recipe.recipe.resource_kind_schema.clone());
+        let mut locator = locator(&recipe, "12345");
+        assert!(derive_resource_uri(&context(), &locator, &recipe, None).is_err());
+
+        locator.parent_entity = Some(parent.uri().clone());
+        assert!(derive_resource_uri(&context(), &locator, &recipe, Some(&parent)).is_ok());
+
+        let mut wrong_parent_recipe = self::recipe(2);
+        wrong_parent_recipe.resource_kind_schema = reference("repository", 2, "other-kind");
+        let wrong_parent_recipe = validated(wrong_parent_recipe);
+        let wrong_parent = derive_resource_uri(
+            &context(),
+            &self::locator(&wrong_parent_recipe, "12345"),
+            &wrong_parent_recipe,
+            None,
+        )
+        .unwrap();
+        locator.parent_entity = Some(wrong_parent.uri().clone());
+        assert!(derive_resource_uri(&context(), &locator, &recipe, Some(&wrong_parent)).is_err());
     }
 
     #[test]

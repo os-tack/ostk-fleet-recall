@@ -1,12 +1,15 @@
 //! Content-addressed registry packages and ABA-safe activation statements.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use super::{
     ContractError, ContractResult,
-    canonical::{CanonicalBytes, CanonicalValue, decode_strict, encode_canonical},
+    canonical::{
+        CanonicalBytes, CanonicalValue, canonical_bytes, decode_strict, encode_canonical,
+        require_canonical,
+    },
     common::{AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId, ProfileReferenceV1},
     digest::{DigestDomain, Sha256Digest, domain_separated_digest},
 };
@@ -24,8 +27,11 @@ pub enum RegistryEntryKind {
     ApplicabilityEvaluator,
     AuthorityRule,
     CausalRatificationPolicy,
+    ClassifierPolicy,
+    ConnectorSchema,
     CoverageProof,
     EpisodePolicy,
+    EvidenceSchema,
     ExemplarPolicy,
     IdentityRecipe,
     NamespaceDefinition,
@@ -33,8 +39,10 @@ pub enum RegistryEntryKind {
     ObserverAdmission,
     PredicateSchema,
     PublicationRule,
+    RedactionPolicy,
     RelationProof,
     ResourceKindSchema,
+    RetentionPolicy,
 }
 
 impl RegistryEntryKind {
@@ -44,8 +52,11 @@ impl RegistryEntryKind {
             Self::ApplicabilityEvaluator => "applicability_evaluator",
             Self::AuthorityRule => "authority_rule",
             Self::CausalRatificationPolicy => "causal_ratification_policy",
+            Self::ClassifierPolicy => "classifier_policy",
+            Self::ConnectorSchema => "connector_schema",
             Self::CoverageProof => "coverage_proof",
             Self::EpisodePolicy => "episode_policy",
+            Self::EvidenceSchema => "evidence_schema",
             Self::ExemplarPolicy => "exemplar_policy",
             Self::IdentityRecipe => "identity_recipe",
             Self::NamespaceDefinition => "namespace_definition",
@@ -53,8 +64,10 @@ impl RegistryEntryKind {
             Self::ObserverAdmission => "observer_admission",
             Self::PredicateSchema => "predicate_schema",
             Self::PublicationRule => "publication_rule",
+            Self::RedactionPolicy => "redaction_policy",
             Self::RelationProof => "relation_proof",
             Self::ResourceKindSchema => "resource_kind_schema",
+            Self::RetentionPolicy => "retention_policy",
         }
     }
 }
@@ -83,6 +96,10 @@ impl RegistryEntryV1 {
         {
             return Err(ContractError::Schema("invalid registry entry".into()));
         }
+        // Validate the programmatically constructible body before serde walks
+        // it. A deep or inadmissible CanonicalValue must not bypass the bounded
+        // profile merely because it is nested inside a typed entry.
+        canonical_bytes(&self.body)?;
         Ok(())
     }
 
@@ -140,14 +157,15 @@ pub struct RegistryPackageV1 {
 /// Package that passed strict parsing, profile pinning, set ordering, and full
 /// manifest-to-entry digest verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidatedRegistryPackage {
+pub struct ManifestVerifiedRegistryPackage {
     package: RegistryPackageV1,
     canonical_bytes: Vec<u8>,
     package_digest: Sha256Digest,
 }
 
-impl ValidatedRegistryPackage {
+impl ManifestVerifiedRegistryPackage {
     pub fn decode(input: &[u8], expected_profile: &ProfileReferenceV1) -> ContractResult<Self> {
+        require_canonical(input)?;
         let package: RegistryPackageV1 = decode_strict(input)?;
         Self::new(package, expected_profile)
     }
@@ -290,8 +308,25 @@ impl RegistryActivationProposalV1 {
     }
 }
 
-/// Server-derived acceptance receipt. Approval rows remain separate signed
-/// attestations; this projection never accepts a caller-provided verdict.
+/// Structural approval binding included in a receipt preimage.
+///
+/// This public wire value does not prove signature verification or eligibility;
+/// Stage 3 must construct the published receipt from private verified-attestation
+/// and exact-current-head witnesses.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EligibleApprovalV1 {
+    pub attestation_id: Sha256Digest,
+    pub principal_id: ContractId,
+    pub signer_key_id: ContractId,
+}
+
+/// Canonical registry-activation receipt preimage.
+///
+/// `validate` establishes shape, unique principal/key bindings, threshold, and
+/// separation-of-duty fields only. It grants no activation authority by itself;
+/// Stage 3 must verify signatures, signer eligibility, proposal binding, and the
+/// exact active head before publishing this receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistryActivationReceiptV1 {
@@ -299,8 +334,7 @@ pub struct RegistryActivationReceiptV1 {
     pub statement_id: Sha256Digest,
     pub predecessor_head: RegistryHeadV1,
     pub activated_package_digest: Sha256Digest,
-    pub approval_attestation_ids: Vec<Sha256Digest>,
-    pub eligible_principal_ids: Vec<ContractId>,
+    pub eligible_approvals: Vec<EligibleApprovalV1>,
     pub required_threshold: u16,
     pub separation_of_duty_satisfied: bool,
     pub accepted_at: CanonicalTimestamp,
@@ -310,11 +344,11 @@ impl RegistryActivationReceiptV1 {
     pub fn validate(&self) -> ContractResult<()> {
         if self.schema_version != ACTIVATION_SCHEMA_VERSION
             || self.required_threshold == 0
-            || usize::from(self.required_threshold) > self.eligible_principal_ids.len()
-            || self.approval_attestation_ids.len() > MAX_APPROVALS
-            || self.eligible_principal_ids.len() > MAX_APPROVALS
-            || !strictly_sorted(&self.approval_attestation_ids)
-            || !strictly_sorted(&self.eligible_principal_ids)
+            || usize::from(self.required_threshold) > self.eligible_approvals.len()
+            || self.eligible_approvals.len() > MAX_APPROVALS
+            || !strictly_sorted(&self.eligible_approvals)
+            || !self.separation_of_duty_satisfied
+            || !approval_bindings_are_unique(&self.eligible_approvals)
         {
             return Err(ContractError::Schema(
                 "invalid registry activation receipt".into(),
@@ -334,6 +368,18 @@ impl RegistryActivationReceiptV1 {
 
 fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn approval_bindings_are_unique(values: &[EligibleApprovalV1]) -> bool {
+    let principals = values
+        .iter()
+        .map(|approval| &approval.principal_id)
+        .collect::<BTreeSet<_>>();
+    let keys = values
+        .iter()
+        .map(|approval| &approval.signer_key_id)
+        .collect::<BTreeSet<_>>();
+    principals.len() == values.len() && keys.len() == values.len()
 }
 
 /// Decode an already canonical package and retain its typed preimage.
@@ -414,7 +460,7 @@ mod tests {
     #[test]
     fn package_manifest_is_bijective_and_ordered() {
         let valid = package(vec![entry("a", 1), entry("b", 2)]);
-        assert!(ValidatedRegistryPackage::new(valid.clone(), &profile()).is_ok());
+        assert!(ManifestVerifiedRegistryPackage::new(valid.clone(), &profile()).is_ok());
 
         let mut reordered = valid.clone();
         reordered.entries.swap(0, 1);
@@ -429,6 +475,20 @@ mod tests {
             validate_package(&substituted, &profile()),
             Err(ContractError::ManifestMismatch)
         ));
+    }
+
+    #[test]
+    fn manifest_verified_decode_rejects_noncanonical_wire_bytes() {
+        let value = package(vec![entry("a", 1)]);
+        let canonical = encode_canonical(&value).unwrap();
+        assert!(ManifestVerifiedRegistryPackage::decode(&canonical, &profile()).is_ok());
+        assert!(decode_canonical_package(&canonical, &profile()).is_ok());
+
+        let mut noncanonical = Vec::with_capacity(canonical.len() + 1);
+        noncanonical.push(b' ');
+        noncanonical.extend_from_slice(&canonical);
+        assert!(ManifestVerifiedRegistryPackage::decode(&noncanonical, &profile()).is_err());
+        assert!(decode_canonical_package(&noncanonical, &profile()).is_err());
     }
 
     #[test]

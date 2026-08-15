@@ -34,8 +34,6 @@ pub enum ContractError {
     NonNfcString,
     #[error("string contains a forbidden Unicode scalar")]
     ForbiddenUnicode,
-    #[error("object key is outside the canonical ASCII identifier grammar: {0}")]
-    InvalidObjectKey(String),
     #[error("document is valid but is not already in canonical byte form")]
     NotCanonical,
     #[error("typed schema validation failed: {0}")]
@@ -62,4 +60,12 @@ pub enum ContractError {
     BootstrapPinMismatch,
     #[error("invalid bootstrap signer policy: {0}")]
     InvalidSignerPolicy(String),
+    #[error("bootstrap profile, scope, package, or epoch binding mismatch")]
+    BootstrapBindingMismatch,
+    #[error("bootstrap approval signature verification failed")]
+    SignatureVerification,
+    #[error("bootstrap approval threshold was not met")]
+    ApprovalThresholdNotMet,
+    #[error("same source fact and representation key produced a different accepted statement")]
+    RepresentationCollision,
 }

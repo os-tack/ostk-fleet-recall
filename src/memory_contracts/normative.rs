@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ContractError, ContractResult,
-    canonical::{CanonicalValue, encode_canonical},
+    canonical::{CanonicalValue, MAX_SAFE_INTEGER, canonical_bytes, encode_canonical},
     common::{
         AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId, HexBytes, ProfileReferenceV1,
         RegistryReferenceV1,
     },
     digest::{DigestDomain, Sha256Digest, domain_separated_digest},
-    identity::ResourceUri,
+    identity::{IdentityForm, ResourceUri},
+    registry::EligibleApprovalV1,
 };
 
 const BINDING_SCHEMA_VERSION: u32 = 1;
@@ -30,9 +31,9 @@ pub struct SourceByteSpanV1 {
 
 impl SourceByteSpanV1 {
     fn validate(&self) -> ContractResult<()> {
-        if self.start >= self.end {
+        if self.start >= self.end || self.end > MAX_SAFE_INTEGER as u64 {
             return Err(ContractError::Schema(
-                "source byte span is empty or reversed".into(),
+                "source byte span is empty, reversed, or outside canonical integer bounds".into(),
             ));
         }
         Ok(())
@@ -79,6 +80,7 @@ impl NormativeBindingProposalV1 {
     pub fn validate(&self) -> ContractResult<()> {
         self.profile.validate()?;
         self.applicability_evaluator.validate()?;
+        canonical_bytes(&self.applicability_selector)?;
         if self.schema_version != BINDING_SCHEMA_VERSION
             || self.source_spans.is_empty()
             || self.source_spans.len() > MAX_SPANS
@@ -87,6 +89,14 @@ impl NormativeBindingProposalV1 {
             || self.applicability_selector.as_object().is_none()
             || !strictly_sorted(&self.source_spans)
             || !strictly_sorted(&self.propositions)
+            || self
+                .source_spans
+                .windows(2)
+                .any(|pair| pair[0].end > pair[1].start)
+            || self.repository_entity_id.identity_form() != IdentityForm::Entity
+            || self.repository_version_id.identity_form() != IdentityForm::Version
+            || self.blob_id.identity_form() != IdentityForm::Occurrence
+            || self.parser_artifact_id.identity_form() != IdentityForm::Occurrence
             || self
                 .effective_until
                 .as_ref()
@@ -140,15 +150,17 @@ impl ApprovalAttestationV1 {
     }
 }
 
-/// Server-derived activation projection. Unique eligible principals—not keys or
-/// rows—satisfy threshold.
+/// Canonical normative-activation receipt preimage.
+///
+/// Structural validation grants no authority. The future activation boundary
+/// must derive these bindings from verified signatures and active policy, with
+/// unique eligible principals—not keys or rows—satisfying threshold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormativeBindingActivationReceiptV1 {
     pub schema_version: u32,
     pub statement_id: Sha256Digest,
-    pub approval_attestation_ids: Vec<Sha256Digest>,
-    pub eligible_principal_ids: Vec<ContractId>,
+    pub eligible_approvals: Vec<EligibleApprovalV1>,
     pub required_threshold: u16,
     pub separation_of_duty_satisfied: bool,
     pub accepted_at: CanonicalTimestamp,
@@ -158,11 +170,11 @@ impl NormativeBindingActivationReceiptV1 {
     pub fn validate(&self) -> ContractResult<()> {
         if self.schema_version != BINDING_SCHEMA_VERSION
             || self.required_threshold == 0
-            || usize::from(self.required_threshold) > self.eligible_principal_ids.len()
-            || self.approval_attestation_ids.len() > MAX_APPROVALS
-            || self.eligible_principal_ids.len() > MAX_APPROVALS
-            || !strictly_sorted(&self.approval_attestation_ids)
-            || !strictly_sorted(&self.eligible_principal_ids)
+            || usize::from(self.required_threshold) > self.eligible_approvals.len()
+            || self.eligible_approvals.len() > MAX_APPROVALS
+            || !strictly_sorted(&self.eligible_approvals)
+            || !self.separation_of_duty_satisfied
+            || !approval_bindings_are_unique(&self.eligible_approvals)
         {
             return Err(ContractError::Schema(
                 "invalid normative binding activation receipt".into(),
@@ -182,6 +194,20 @@ impl NormativeBindingActivationReceiptV1 {
 
 fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn approval_bindings_are_unique(values: &[EligibleApprovalV1]) -> bool {
+    use std::collections::BTreeSet;
+
+    let principals = values
+        .iter()
+        .map(|approval| &approval.principal_id)
+        .collect::<BTreeSet<_>>();
+    let keys = values
+        .iter()
+        .map(|approval| &approval.signer_key_id)
+        .collect::<BTreeSet<_>>();
+    principals.len() == values.len() && keys.len() == values.len()
 }
 
 #[cfg(test)]
@@ -282,5 +308,24 @@ mod tests {
             },
         ];
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn source_coordinates_and_resource_forms_fail_closed() {
+        let mut overlapping = proposal();
+        overlapping.source_spans.push(SourceByteSpanV1 {
+            start: 79,
+            end: 90,
+            selected_bytes_digest: digest("overlap"),
+        });
+        assert!(overlapping.validate().is_err());
+
+        let mut unsafe_offset = proposal();
+        unsafe_offset.source_spans[0].end = MAX_SAFE_INTEGER as u64 + 1;
+        assert!(unsafe_offset.validate().is_err());
+
+        let mut wrong_form = proposal();
+        wrong_form.repository_version_id = resource("entity", "repository", "not-a-version");
+        assert!(wrong_form.validate().is_err());
     }
 }
