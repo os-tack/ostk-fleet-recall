@@ -37,6 +37,8 @@ const CLAIM_SUPPORT_CHUNK_MIGRATION_SQL: &str =
     include_str!("../../migrations/0002_claim_support_chunk_lookup.sql");
 const CONTROL_EVENT_LEDGER_MIGRATION_SQL: &str =
     include_str!("../../migrations/0003_control_event_ledger.sql");
+const GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0004_genesis_registry_activation.sql");
 
 fn embedded_migrator() -> Migrator {
     Migrator {
@@ -65,6 +67,15 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed("append-only control event ledger"),
                 MigrationType::Simple,
                 Cow::Borrowed(CONTROL_EVENT_LEDGER_MIGRATION_SQL),
+                // Keep every CockroachDB schema change outside SQLx's
+                // PostgreSQL-oriented transaction wrapper.
+                true,
+            ),
+            Migration::new(
+                4,
+                Cow::Borrowed("genesis registry activation"),
+                MigrationType::Simple,
+                Cow::Borrowed(GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL),
                 // Keep every CockroachDB schema change outside SQLx's
                 // PostgreSQL-oriented transaction wrapper.
                 true,
@@ -1829,7 +1840,91 @@ mod tests {
     }
 
     #[test]
-    fn embedded_migrator_registers_control_ledger_as_no_transaction_version_three() {
+    fn genesis_registry_activation_migration_is_scoped_bounded_and_additive() {
+        let migration = GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL;
+        let tables = ["memory_registry_activations", "memory_registry_heads"];
+        assert_eq!(migration.matches("CREATE TABLE ").count(), tables.len());
+        for table in tables {
+            assert!(migration.contains(&format!("CREATE TABLE {table}")));
+            assert!(migration.contains(&format!("CREATE TABLE {table} (\n    tenant_id")));
+        }
+
+        assert!(migration.contains("PRIMARY KEY (tenant_id, project, activation_id)"));
+        assert!(migration.contains("PRIMARY KEY (tenant_id, project)"));
+        for scope_leading_key in [
+            "UNIQUE (tenant_id, project, statement_id)",
+            "UNIQUE (tenant_id, project, accepted_event_id)",
+        ] {
+            assert!(migration.contains(scope_leading_key));
+        }
+        for canonical_projection in [
+            "canonical_statement",
+            "canonical_approval_set",
+            "canonical_test_result",
+            "canonical_receipt",
+            "canonical_event",
+            "canonical_head",
+        ] {
+            assert!(migration.contains(canonical_projection));
+        }
+        for scoped_foreign_key in [
+            "memory_registry_activation_bootstrap_anchor_fk",
+            "FOREIGN KEY (tenant_id, project, genesis_epoch_id)",
+            "REFERENCES memory_registry_activations",
+            "REFERENCES memory_control_events",
+        ] {
+            assert!(migration.contains(scoped_foreign_key));
+        }
+
+        assert!(migration.contains("approval_ids_packed                BYTES NOT NULL"));
+        assert!(migration.contains("CHECK (approval_count BETWEEN 1 AND 64)"));
+        assert!(
+            migration.contains("CHECK (octet_length(approval_ids_packed) = approval_count * 32)")
+        );
+        assert!(migration.contains("CHECK (required_threshold BETWEEN 1 AND approval_count)"));
+        assert!(migration.contains("CHECK (separation_of_duty_satisfied)"));
+        assert!(migration.contains("CHECK (effective_until IS NULL)"));
+        assert!(migration.contains("CHECK (effective_from >= bootstrap_accepted_at)"));
+        assert!(migration.contains("CHECK (accepted_at >= effective_from)"));
+        assert!(migration.contains("CHECK (control_epoch_id = genesis_epoch_id)"));
+        assert!(migration.contains("CHECK (activated_package_digest = genesis_package_digest)"));
+        assert!(migration.contains("CHECK (head_state = 'active')"));
+        assert_eq!(migration.matches("BETWEEN 1 AND 1048576").count(), 6);
+        assert_eq!(migration.matches("CREATE UNIQUE INDEX ").count(), 2);
+        assert!(
+            migration.contains("CREATE UNIQUE INDEX memory_control_bootstraps_registry_anchor_idx")
+        );
+        assert!(
+            migration.contains("CREATE UNIQUE INDEX memory_control_events_registry_source_idx")
+        );
+        assert!(
+            migration
+                .contains("accepted_event_id,\n            control_epoch_id,\n            control_shard,\n            control_committed_offset,\n            activation_id,\n            accepted_at\n        )")
+        );
+        assert!(migration.contains("semantic_object_digest,"));
+        for normalized_event_field in [
+            "event_schema_version               INT4 NOT NULL",
+            "event_kind                         STRING NOT NULL",
+            "consistency_family                 STRING NOT NULL",
+            "consistency_key_digest             BYTES NOT NULL",
+            "previous_chain_digest              BYTES NOT NULL",
+            "append_chain_digest                BYTES NOT NULL",
+        ] {
+            assert!(!migration.contains(normalized_event_field));
+        }
+        assert!(!migration.contains("memory_registry_head_control_source_fk"));
+        assert_eq!(migration.matches("CREATE SEQUENCE ").count(), 0);
+        assert!(!migration.contains("JSONB"));
+
+        let uppercase = migration.to_ascii_uppercase();
+        for forbidden in ["ALTER ", "DROP ", "UPDATE ", "DELETE ", "GRANT ", "REVOKE "] {
+            assert!(!uppercase.contains(forbidden));
+        }
+        assert!(!migration.contains("memory_events"));
+    }
+
+    #[test]
+    fn embedded_migrator_registers_private_ledgers_as_no_transaction_versions_three_and_four() {
         let migrator = embedded_migrator();
         assert_eq!(
             migrator
@@ -1837,7 +1932,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![1, 2, 3, 4]
         );
         let control_ledger = migrator
             .migrations
@@ -1849,6 +1944,16 @@ mod tests {
             CONTROL_EVENT_LEDGER_MIGRATION_SQL
         );
         assert!(control_ledger.no_tx);
+        let registry_activation = migrator
+            .migrations
+            .iter()
+            .find(|migration| migration.version == 4)
+            .unwrap();
+        assert_eq!(
+            registry_activation.sql.as_ref(),
+            GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL
+        );
+        assert!(registry_activation.no_tx);
         assert!(migrator.no_tx);
         assert!(!migrator.locking);
     }
