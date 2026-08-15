@@ -1891,12 +1891,17 @@ mod tests {
         assert!(migration.contains("CHECK (head_state = 'active')"));
         assert_eq!(migration.matches("BETWEEN 1 AND 1048576").count(), 6);
         assert_eq!(migration.matches("CREATE UNIQUE INDEX ").count(), 2);
+        assert_eq!(migration.matches("CREATE INDEX ").count(), 1);
         assert!(
             migration.contains("CREATE UNIQUE INDEX memory_control_bootstraps_registry_anchor_idx")
         );
         assert!(
             migration.contains("CREATE UNIQUE INDEX memory_control_events_registry_source_idx")
         );
+        assert!(migration.contains("CREATE INDEX memory_control_events_consistency_stream_idx"));
+        assert!(migration.contains(
+            "consistency_key_digest,\n        shard,\n        committed_offset\n    ) STORING (event_id)"
+        ));
         assert!(
             migration
                 .contains("accepted_event_id,\n            control_epoch_id,\n            control_shard,\n            control_committed_offset,\n            activation_id,\n            accepted_at\n        )")

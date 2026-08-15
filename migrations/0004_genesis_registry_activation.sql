@@ -44,6 +44,21 @@ CREATE UNIQUE INDEX memory_control_events_registry_source_idx
         accepted_at
     );
 
+-- A stable registry stream may share an epoch and shard with unrelated
+-- control events. Keep the fail-closed orphan probe index-only and bounded as
+-- the control ledger grows; multiple transitions intentionally share this
+-- consistency key, so this index is not unique.
+CREATE INDEX memory_control_events_consistency_stream_idx
+    ON memory_control_events (
+        tenant_id,
+        project,
+        epoch_id,
+        consistency_family,
+        consistency_key_digest,
+        shard,
+        committed_offset
+    ) STORING (event_id);
+
 CREATE TABLE memory_registry_activations (
     tenant_id                          UUID NOT NULL,
     project                            STRING NOT NULL,
