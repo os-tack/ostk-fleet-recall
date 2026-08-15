@@ -493,6 +493,7 @@ only one-row functional behavior.
   including the four-step deterministic reference-agent proof flow and the
   sanitized record of the live submission deployment.
 - [Architecture](docs/ARCHITECTURE.md),
+  [draft dynamic corpus and causal runtime architecture](docs/DYNAMIC_MEMORY_ARCHITECTURE.md),
   [migration operations](docs/MIGRATIONS.md), and
   [security policy](docs/SECURITY.md).
 - [CockroachDB Agent Skills audit](docs/AGENT_SKILLS_AUDIT.md) and

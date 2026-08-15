@@ -225,7 +225,7 @@ if ! jq -s -e '
         type == "object"
         and ((keys_unsorted - [
             "dataset", "record_kind", "source_area", "event_type",
-            "week", "scenario", "status", "tags"
+            "week", "scenario", "status", "document_status", "tags"
         ]) | length) == 0
         and ([.[] | valid_facet_array] | all);
     def valid_source_coordinates:
@@ -365,7 +365,7 @@ if ! jq -s -e \
         | map(select(length > 0 and (startswith("#") | not)))
         | map(split("|")[0])
         | sort) as $expected_repository_sources
-    | ($expected_doc_sources | length) == 20
+    | ($expected_doc_sources | length) == 21
     and ($expected_repository_sources | length) == 85
     and
     ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) >= 400
@@ -419,6 +419,18 @@ if ! jq -s -e \
             and (.text | contains("C-SPANN indexes"))
             and (.text | contains("`TSVECTOR` lexical index"))
         )] | length) == 1
+    and ([.[] | select(
+            .source_config_id == "rich-demo:docs:v1"
+            and .source_id == "docs/DYNAMIC_MEMORY_ARCHITECTURE.md"
+        )] | length) > 0
+    and all(.[] | select(
+            .source_config_id == "rich-demo:docs:v1"
+            and .source_id == "docs/DYNAMIC_MEMORY_ARCHITECTURE.md"
+        );
+        (.text | startswith("Draft target architecture; not implemented. "))
+        and .facets.document_status == ["draft_target"]
+        and (.facets.tags | index("draft_target")) != null
+    )
     and ([.[] | select(
             .source_config_id == "rich-demo:self-audit:v1"
             and .source_id == "src/mcp/tools.rs"
@@ -488,7 +500,11 @@ while IFS='|' read -r relative_path _; do
             | $record.extra.source_line_start as $start
             | $record.extra.source_line_end as $finish
             | section_at($lines; $start) as $section
-            | ("Source document " + $record.source_id
+            | ((if $record.source_id == "docs/DYNAMIC_MEMORY_ARCHITECTURE.md"
+                then "Draft target architecture; not implemented. "
+                else ""
+                end)
+                + "Source document " + $record.source_id
                 + "; section " + $section + ". ") as $prefix
             | ($record.text | startswith($prefix)) as $prefix_matches
             | $record.text[($prefix | length):] as $body

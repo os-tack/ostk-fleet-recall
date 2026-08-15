@@ -7,6 +7,13 @@ The local `ostk-recall` corpus remains the workstation default.
 that must coordinate across process, host, and availability-zone boundaries;
 using OSTK is optional.
 
+This document describes the implemented hackathon system. The proposed
+event-driven corpus, provider-evidenced provenance graph, separately graded
+causal hypotheses, runtime observation model, and permanently separated
+public/private planes are specified in
+[Dynamic corpus and causal runtime architecture](DYNAMIC_MEMORY_ARCHITECTURE.md);
+they are not claims about the current deployment.
+
 ## Deployment topology
 
 ```mermaid

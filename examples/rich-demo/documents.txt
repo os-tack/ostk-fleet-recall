@@ -1,5 +1,6 @@
 README.md|project
 docs/ARCHITECTURE.md|architecture
+docs/DYNAMIC_MEMORY_ARCHITECTURE.md|dynamic_architecture
 docs/PROJECT_PRIMER.md|project_primer
 docs/REQUIREMENTS.md|requirements
 docs/SUBMISSION.md|submission

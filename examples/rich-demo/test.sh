@@ -50,6 +50,7 @@ mutated_tools_excerpt=$test_root/mutated-tools-excerpt.ndjson
 mutated_docs_marker=$test_root/mutated-docs-marker.ndjson
 mutated_primer_marker=$test_root/mutated-primer-marker.ndjson
 mutated_architecture_marker=$test_root/mutated-architecture-marker.ndjson
+missing_draft_status=$test_root/missing-draft-status.ndjson
 malformed_source_revision=$test_root/malformed-source-revision.ndjson
 widened_document_range=$test_root/widened-document-range.ndjson
 narrowed_document_range=$test_root/narrowed-document-range.ndjson
@@ -115,8 +116,8 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 1492
-    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 423
+    length == 1578
+    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 509
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 863
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
@@ -369,6 +370,19 @@ jq -c '
 ' "$first" > "$mutated_architecture_marker"
 if "$script_dir/verify.sh" "$mutated_architecture_marker" >/dev/null 2>&1; then
     printf 'rich demo verification failed: verifier accepted a missing CockroachDB architecture marker\n' >&2
+    exit 1
+fi
+
+jq -c '
+    if .source_id == "docs/DYNAMIC_MEMORY_ARCHITECTURE.md" then
+        .text |= sub("^Draft target architecture; not implemented[.] "; "")
+        | del(.facets.document_status)
+        | .facets.tags -= ["draft_target"]
+    else .
+    end
+' "$first" > "$missing_draft_status"
+if "$script_dir/verify.sh" "$missing_draft_status" >/dev/null 2>&1; then
+    printf 'rich demo verification failed: verifier accepted unlabeled draft target architecture\n' >&2
     exit 1
 fi
 

@@ -68,7 +68,14 @@ emit_document_chunks() {
             exit 66
         fi
 
-        awk -v source_path="$relative_path" -v max_chars=1500 '
+        document_status=
+        status_prefix=
+        if [ "$relative_path" = "docs/DYNAMIC_MEMORY_ARCHITECTURE.md" ]; then
+            document_status=draft_target
+            status_prefix='Draft target architecture; not implemented. '
+        fi
+
+        awk -v source_path="$relative_path" -v status_prefix="$status_prefix" -v max_chars=1500 '
             function clean(value) {
                 gsub(/\r/, "", value)
                 gsub(/\t/, " ", value)
@@ -100,7 +107,7 @@ emit_document_chunks() {
                     return
                 }
 
-                prefix = "Source document " source_path
+                prefix = status_prefix "Source document " source_path
                 if (section != "") {
                     prefix = prefix "; section " section
                 }
@@ -236,6 +243,7 @@ emit_document_chunks() {
             jq -Rc \
                 --arg source_id "$relative_path" \
                 --arg source_area "$source_area" \
+                --arg document_status "$document_status" \
                 --arg source_revision "$source_revision" '
                     split("\t") as $fields
                     | {
@@ -257,6 +265,10 @@ emit_document_chunks() {
                             tags: ["documentation", $source_area]
                         }
                     }
+                    | if $document_status == "" then . else
+                        .facets.document_status = [$document_status]
+                        | .facets.tags += [$document_status]
+                      end
                 '
     done < "$manifest"
 }
