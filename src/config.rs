@@ -2,13 +2,57 @@ use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use ostk_recall_core::PrivacyTier;
 use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
+use crate::control_log::TrustedControlScope;
+use crate::memory_contracts::bootstrap::{BootstrapPin, BootstrapReceiptDigest};
+use crate::memory_contracts::common::{AuthenticatedProjectScopeV1, ContractId};
+use crate::memory_contracts::digest::Sha256Digest;
 use crate::{FleetError, FleetScope, Result};
+
+/// Deployment-only authority needed by the private control-ledger bootstrap.
+///
+/// These values are deliberately absent from normal request and serving
+/// configuration. The `CloudFront` demo and MCP tools cannot select or override
+/// either scope representation or the out-of-band receipt pin.
+#[derive(Clone)]
+pub struct ControlBootstrapConfig {
+    trusted_scope: TrustedControlScope,
+    receipt_digest: BootstrapReceiptDigest,
+}
+
+impl std::fmt::Debug for ControlBootstrapConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlBootstrapConfig")
+            .field("trusted_scope", &self.trusted_scope)
+            .field("receipt_digest", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ControlBootstrapConfig {
+    #[must_use]
+    pub const fn trusted_scope(&self) -> &TrustedControlScope {
+        &self.trusted_scope
+    }
+
+    /// Reconstitute the authority token only at the bootstrap call boundary.
+    #[must_use]
+    pub const fn receipt_pin(&self) -> BootstrapPin {
+        BootstrapPin::from_trusted_config(self.receipt_digest)
+    }
+
+    #[must_use]
+    pub const fn receipt_digest(&self) -> BootstrapReceiptDigest {
+        self.receipt_digest
+    }
+}
 
 #[derive(Clone)]
 pub struct FleetConfig {
@@ -107,6 +151,20 @@ impl FleetConfig {
         })
     }
 
+    /// Read the private control-ledger authority mapping on explicit demand.
+    ///
+    /// Normal server, demo, recall, remember, ingest, and migration startup do
+    /// not call this method. A future private bootstrap command is the only
+    /// intended consumer.
+    pub fn control_bootstrap_config_from_env(&self) -> Result<ControlBootstrapConfig> {
+        control_bootstrap_config(
+            &self.default_scope,
+            &required("FLEET_RECALL_CONTROL_TENANT_NAMESPACE")?,
+            &required("FLEET_RECALL_CONTROL_PROJECT_NAMESPACE")?,
+            &required("FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST")?,
+        )
+    }
+
     /// Stable registry identity, independent of where the baked bundle is
     /// mounted on a particular deployment.
     #[must_use]
@@ -129,6 +187,37 @@ impl FleetConfig {
         }
         Ok(canonical)
     }
+}
+
+fn control_bootstrap_config(
+    deployment_scope: &FleetScope,
+    tenant_namespace: &str,
+    project_namespace: &str,
+    receipt_digest: &str,
+) -> Result<ControlBootstrapConfig> {
+    let semantic_scope = AuthenticatedProjectScopeV1::from_trusted_context(
+        ContractId::new(tenant_namespace).map_err(|error| {
+            FleetError::Configuration(format!(
+                "FLEET_RECALL_CONTROL_TENANT_NAMESPACE is invalid: {error}"
+            ))
+        })?,
+        ContractId::new(project_namespace).map_err(|error| {
+            FleetError::Configuration(format!(
+                "FLEET_RECALL_CONTROL_PROJECT_NAMESPACE is invalid: {error}"
+            ))
+        })?,
+    );
+    let receipt_digest = Sha256Digest::from_str(receipt_digest)
+        .map(BootstrapReceiptDigest::from_digest)
+        .map_err(|error| {
+            FleetError::Configuration(format!(
+                "FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST must be lowercase SHA-256: {error}"
+            ))
+        })?;
+    Ok(ControlBootstrapConfig {
+        trusted_scope: TrustedControlScope::from_trusted_context(deployment_scope, semantic_scope)?,
+        receipt_digest,
+    })
 }
 
 /// Compute the versioned digest for the three files consumed by model2vec.
@@ -256,6 +345,20 @@ mod tests {
 
     use super::*;
 
+    const FIXTURE_RECEIPT_DIGEST: &str =
+        "084ee06ea7ebf3b1d592d6e5843584485144c0ee5720fcc2124a61a7fcde48f0";
+
+    fn deployment_scope() -> FleetScope {
+        FleetScope::new(
+            Uuid::from_u128(1),
+            "physical-project",
+            "deployment-agent",
+            None,
+            PrivacyTier::T1Project,
+        )
+        .expect("scope")
+    }
+
     fn model_bundle() -> TempDir {
         let directory = tempfile::tempdir().expect("tempdir");
         fs::write(directory.path().join("config.json"), b"config").expect("config");
@@ -360,6 +463,76 @@ mod tests {
         assert!(
             validate_database_url(
                 "postgresql://user:secret@cluster.example:26257/defaultdb?sslmode=disable"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn control_bootstrap_authority_is_explicit_and_scope_bound() {
+        let config = control_bootstrap_config(
+            &deployment_scope(),
+            "tenant.authority",
+            "project.authority",
+            FIXTURE_RECEIPT_DIGEST,
+        )
+        .expect("control config");
+
+        assert_eq!(config.trusted_scope().project(), "physical-project");
+        assert_eq!(
+            config
+                .trusted_scope()
+                .semantic_scope()
+                .tenant_namespace
+                .as_str(),
+            "tenant.authority"
+        );
+        assert_eq!(
+            config
+                .trusted_scope()
+                .semantic_scope()
+                .project_namespace
+                .as_str(),
+            "project.authority"
+        );
+        assert_eq!(
+            config.receipt_digest().digest().to_string(),
+            FIXTURE_RECEIPT_DIGEST
+        );
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(FIXTURE_RECEIPT_DIGEST));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn control_bootstrap_authority_rejects_noncanonical_values() {
+        assert!(
+            control_bootstrap_config(
+                &deployment_scope(),
+                "Tenant.Invalid",
+                "project.authority",
+                FIXTURE_RECEIPT_DIGEST,
+            )
+            .is_err()
+        );
+        assert!(
+            control_bootstrap_config(
+                &deployment_scope(),
+                "tenant.authority",
+                "project.authority",
+                &FIXTURE_RECEIPT_DIGEST.to_ascii_uppercase(),
+            )
+            .is_err()
+        );
+
+        let mut invalid_physical = deployment_scope();
+        invalid_physical.project = " project ".into();
+        assert!(
+            control_bootstrap_config(
+                &invalid_physical,
+                "tenant.authority",
+                "project.authority",
+                FIXTURE_RECEIPT_DIGEST,
             )
             .is_err()
         );

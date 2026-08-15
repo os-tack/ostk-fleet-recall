@@ -20,7 +20,7 @@ pub mod service;
 pub mod store;
 
 pub use application::CockroachMemoryService;
-pub use config::FleetConfig;
+pub use config::{ControlBootstrapConfig, FleetConfig};
 pub use context::FleetScope;
 pub use control_log::TrustedControlScope;
 pub use error::{FleetError, Result};
