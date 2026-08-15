@@ -583,8 +583,11 @@ pub struct AppendPositionV1 {
 
 impl AppendPositionV1 {
     pub fn validate_for(&self, bootstrap: &VerifiedBootstrapReceipt) -> ContractResult<()> {
-        let epoch = &bootstrap.receipt.statement.genesis_epoch;
-        if self.epoch_id != bootstrap.epoch_id || self.shard >= epoch.partition_recipe.shard_count {
+        self.validate_for_epoch(&bootstrap.receipt.statement.genesis_epoch)
+    }
+
+    pub(crate) fn validate_for_epoch(&self, epoch: &GenesisLogEpochV1) -> ContractResult<()> {
+        if self.epoch_id != epoch.epoch_id()? || self.shard >= epoch.partition_recipe.shard_count {
             return Err(ContractError::Schema("invalid append position".into()));
         }
         Ok(())

@@ -269,6 +269,7 @@ impl GenesisRegistryActivationStatementV1 {
     pub fn validate_shape(&self) -> ContractResult<()> {
         self.profile.validate()?;
         if self.schema_version != GENESIS_ACTIVATION_SCHEMA_VERSION
+            || !self.effective_from.is_microsecond_aligned()
             || self
                 .effective_until
                 .as_ref()
@@ -392,6 +393,7 @@ pub struct VerifiedGenesisRegistryActivationRequest {
     canonical_statement: Vec<u8>,
     approval_set: GenesisRegistryActivationApprovalSetV1,
     canonical_approval_set: Vec<u8>,
+    test_result: VerifiedRegistryTestResult,
     eligible_approvals: Vec<EligibleApprovalV1>,
     required_threshold: u16,
 }
@@ -413,6 +415,10 @@ impl VerifiedGenesisRegistryActivationRequest {
         &self.canonical_approval_set
     }
 
+    pub const fn test_result(&self) -> &VerifiedRegistryTestResult {
+        &self.test_result
+    }
+
     pub fn eligible_approvals(&self) -> &[EligibleApprovalV1] {
         &self.eligible_approvals
     }
@@ -428,11 +434,15 @@ impl VerifiedGenesisRegistryActivationRequest {
     #[allow(dead_code)] // Stage 3 repository seam; not callable by external request code.
     pub(crate) fn receipt_at(
         &self,
+        bootstrap_accepted_at: &CanonicalTimestamp,
         accepted_at: CanonicalTimestamp,
     ) -> ContractResult<GenesisRegistryActivationReceiptV1> {
-        if self.statement.effective_until.is_some() || self.statement.effective_from > accepted_at {
+        if self.statement.effective_until.is_some()
+            || self.statement.effective_from < *bootstrap_accepted_at
+            || self.statement.effective_from > accepted_at
+        {
             return Err(ContractError::Schema(
-                "genesis activation is expiring or future-effective".into(),
+                "genesis activation is outside the bootstrap and acceptance interval".into(),
             ));
         }
         let receipt = GenesisRegistryActivationReceiptV1 {
@@ -553,6 +563,7 @@ pub fn verify_genesis_registry_activation(
         canonical_statement: canonical_statement.to_vec(),
         approval_set,
         canonical_approval_set: canonical_approval_set.to_vec(),
+        test_result: test_result.clone(),
         eligible_approvals,
         required_threshold,
     })
@@ -903,6 +914,10 @@ mod tests {
         )
     }
 
+    fn bootstrap_accepted_at() -> CanonicalTimestamp {
+        CanonicalTimestamp::parse("2026-08-15T02:30:00.000000000Z").unwrap()
+    }
+
     fn package() -> SemanticallyClosedGenesisPackage {
         let package =
             ManifestVerifiedRegistryPackage::decode(record(GENESIS_PACKAGE), &profile()).unwrap();
@@ -1063,7 +1078,10 @@ mod tests {
     fn exact_bindings_produce_one_head_and_stable_stream_key() {
         let (_, bootstrap, _, activation) = verified_activation();
         let receipt = activation
-            .receipt_at(CanonicalTimestamp::parse("2026-08-15T04:00:00.000000000Z").unwrap())
+            .receipt_at(
+                &bootstrap_accepted_at(),
+                CanonicalTimestamp::parse("2026-08-15T04:00:00.000000000Z").unwrap(),
+            )
             .unwrap();
         let event = GenesisRegistryActivatedEventV1::from_verified(&activation, &receipt).unwrap();
         assert_eq!(
@@ -1352,8 +1370,31 @@ mod tests {
     fn receipt_time_is_server_derived_and_future_effective_requests_fail() {
         let (_, _, _, activation) = verified_activation();
         assert!(matches!(
-            activation
-                .receipt_at(CanonicalTimestamp::parse("2026-08-15T02:59:59.999999999Z").unwrap()),
+            activation.receipt_at(
+                &bootstrap_accepted_at(),
+                CanonicalTimestamp::parse("2026-08-15T02:59:59.999999999Z").unwrap(),
+            ),
+            Err(ContractError::Schema(_))
+        ));
+        assert!(matches!(
+            activation.receipt_at(
+                &CanonicalTimestamp::parse("2026-08-15T03:00:00.000000001Z").unwrap(),
+                CanonicalTimestamp::parse("2026-08-15T04:00:00.000000000Z").unwrap(),
+            ),
+            Err(ContractError::Schema(_))
+        ));
+    }
+
+    #[test]
+    fn effective_time_must_round_trip_cockroach_timestamp_precision() {
+        let package = package();
+        let bootstrap = bootstrap(&package);
+        let test_result = verified_test_result(&package);
+        let mut statement = statement(&bootstrap, &package, &test_result);
+        statement.effective_from =
+            CanonicalTimestamp::parse("2026-08-15T03:00:00.000000001Z").unwrap();
+        assert!(matches!(
+            statement.statement_id(),
             Err(ContractError::Schema(_))
         ));
     }
@@ -1431,10 +1472,17 @@ mod tests {
     fn deterministic_material_matches_frozen_vectors() {
         let (package, _, test_result, activation) = verified_activation();
         let receipt = activation
-            .receipt_at(CanonicalTimestamp::parse("2026-08-15T04:00:00.000000000Z").unwrap())
+            .receipt_at(
+                &bootstrap_accepted_at(),
+                CanonicalTimestamp::parse("2026-08-15T04:00:00.000000000Z").unwrap(),
+            )
             .unwrap();
         let event = GenesisRegistryActivatedEventV1::from_verified(&activation, &receipt).unwrap();
         assert_eq!(test_result.canonical_bytes(), record(TEST_RESULT_FIXTURE));
+        assert_eq!(
+            activation.test_result().canonical_bytes(),
+            test_result.canonical_bytes()
+        );
         assert_eq!(
             activation.canonical_statement(),
             record(ACTIVATION_STATEMENT_FIXTURE)

@@ -159,6 +159,18 @@ impl CanonicalTimestamp {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether the exact nanosecond form can round-trip through `CockroachDB`'s
+    /// microsecond-precision `TIMESTAMPTZ` without changing identity bytes.
+    pub fn is_microsecond_aligned(&self) -> bool {
+        self.0.as_bytes()[26..29] == *b"000"
+    }
+
+    /// Convert one trusted database UTC timestamp into the exact contract wire
+    /// form. Callers must still choose and read the database time only once.
+    pub fn from_datetime(value: &DateTime<Utc>) -> ContractResult<Self> {
+        Self::parse(value.to_rfc3339_opts(SecondsFormat::Nanos, true))
+    }
 }
 
 impl fmt::Display for CanonicalTimestamp {
@@ -388,7 +400,27 @@ mod tests {
 
     #[test]
     fn timestamps_have_one_wire_form() {
-        assert!(CanonicalTimestamp::parse("2026-08-14T12:34:56.000000000Z").is_ok());
+        let canonical = "2026-08-14T12:34:56.000000000Z";
+        assert!(CanonicalTimestamp::parse(canonical).is_ok());
+        let database_time = DateTime::parse_from_rfc3339("2026-08-14T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            CanonicalTimestamp::from_datetime(&database_time)
+                .unwrap()
+                .as_str(),
+            canonical
+        );
+        assert!(
+            CanonicalTimestamp::parse(canonical)
+                .unwrap()
+                .is_microsecond_aligned()
+        );
+        assert!(
+            !CanonicalTimestamp::parse("2026-08-14T12:34:56.000000001Z")
+                .unwrap()
+                .is_microsecond_aligned()
+        );
         for invalid in [
             "2026-08-14T12:34:56Z",
             "2026-08-14T12:34:56.000Z",
