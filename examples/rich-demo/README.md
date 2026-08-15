@@ -40,8 +40,8 @@ Run the deterministic reproduction test with:
 ./examples/rich-demo/test.sh
 ```
 
-The verifier requires 1,000–3,000 unique chunks, twenty-five documentation
-sources, 146 repository source/configuration files, the two exact self-audit code
+The verifier requires 1,000–3,000 unique chunks, twenty-six documentation
+sources, 151 repository source/configuration files, the two exact self-audit code
 excerpts, 204 operations records across twelve weeks, the expected decision and
 correction mix, zero-based per-source chunk indexes, bounded physical lines and
 text, only the public ingest allowlist, and no credential-, token-, private-key-,

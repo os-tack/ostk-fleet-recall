@@ -17,6 +17,7 @@ pub mod genesis_activation;
 pub mod identity;
 pub mod normative;
 pub mod registry;
+pub mod relation;
 
 #[cfg(test)]
 mod vectors;
