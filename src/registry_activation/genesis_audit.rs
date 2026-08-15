@@ -15,8 +15,7 @@ use crate::memory_contracts::canonical::encode_canonical;
 use crate::memory_contracts::common::{ContractId, RegistryReferenceV1};
 use crate::memory_contracts::evidence_v2::RegistryHeadBindingV1;
 use crate::memory_contracts::genesis_activation::{
-    GenesisRegistryActivatedEventV1, GenesisRegistryActivationReceiptV1,
-    VerifiedGenesisRegistryActivationRequest,
+    GenesisRegistryActivationReceiptV1, VerifiedGenesisRegistryActivationRequest,
 };
 use crate::memory_contracts::successor_policy::{
     GenesisTransitionSeparationOfDutyV1, ImmutableGenesisSuccessorWitness,
@@ -24,12 +23,10 @@ use crate::memory_contracts::successor_policy::{
 
 /// Fully reconstructed immutable genesis authority and all of its canonical
 /// durable preimages.
-#[allow(dead_code)] // successor-only fields are consumed by the repository SQL slice
 pub(super) struct AuditedGenesisRoot {
     pub(super) inspection: AcceptedGenesisActivation,
     pub(super) verified: VerifiedGenesisRegistryActivationRequest,
     pub(super) receipt: GenesisRegistryActivationReceiptV1,
-    pub(super) event: GenesisRegistryActivatedEventV1,
     pub(super) current_v1_activation_policy: RegistryReferenceV1,
     pub(super) eligible_v1_principal_ids: Vec<ContractId>,
     pub(super) required_v1_threshold: u16,
@@ -41,7 +38,6 @@ pub(super) struct AuditedGenesisRoot {
 }
 
 impl AuditedGenesisRoot {
-    #[allow(dead_code)] // consumed by the repository SQL slice
     pub(super) fn head_binding(&self) -> Result<RegistryHeadBindingV1> {
         let binding = RegistryHeadBindingV1 {
             head: self.inspection.registry_head.clone(),
@@ -59,7 +55,6 @@ impl AuditedGenesisRoot {
 
     /// Mint the bridge verifier's opaque witness only after the durable root
     /// has passed the shared full audit.
-    #[allow(dead_code)] // consumed by the repository SQL slice
     pub(super) fn immutable_successor_witness(&self) -> Result<ImmutableGenesisSuccessorWitness> {
         Ok(ImmutableGenesisSuccessorWitness::from_durable_audit(
             self.verified.statement().profile.clone(),

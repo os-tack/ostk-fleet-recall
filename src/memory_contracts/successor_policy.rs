@@ -355,7 +355,7 @@ impl ImmutableGenesisSuccessorWitness {
     ///
     /// This constructor is crate-private so public callers cannot turn an
     /// offline package and caller-selected head into repository authority.
-    #[allow(dead_code, clippy::too_many_arguments)] // consumed by the repository SQL slice
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_durable_audit(
         profile: ProfileReferenceV1,
         scope: AuthenticatedProjectScopeV1,

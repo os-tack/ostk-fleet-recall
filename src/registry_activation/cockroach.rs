@@ -1316,7 +1316,6 @@ async fn audit_genesis_activation_prefix(
         inspection,
         verified,
         receipt,
-        event,
         current_v1_activation_policy,
         eligible_v1_principal_ids,
         required_v1_threshold,
