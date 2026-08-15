@@ -8,6 +8,16 @@ The positive predicate and admission artifacts are full `RegistryEntryV1` preima
 
 `RememberPredicateSchemaV2` closes the subject identity, every applicability dimension's resource identity, resource-valued claim identity, comparator, modalities, evaluator, absence/coverage semantics, and publication/sensitivity defaults. A URI resource-kind label matching a constraint entry ID is only a structural check. Runtime admission must resolve the exact active `ResourceKindSchema` and `IdentityRecipe` bodies, prove the recipe embeds the required kind and identity form, obtain a trusted canonical-locator witness, and rederive the subject, every applicability URI, and any resource-valued claim. Payload-selected recipes or URI labels are never identity proof.
 
+The first Stage-4 target fixes the repository subject as an `entity`, the
+`repository_commit` dimension as a `version`, and the `runtime_environment`
+dimension as an `entity`. The current positive claim and predicate are boolean,
+so there is no positive resource-URI value fixture. Any future resource-valued
+claim must use the form selected by its exact resolved constraint. A URI with
+the right kind label but the wrong form remains canonical public input; active
+recipe rederivation must reject it before admission. The authoritative subject-
+and environment-form negative records make that structural-versus-active
+boundary explicit.
+
 `RememberAdmissionRuleV2` closes assertion kinds, basis semantics, effective-time policy, text ceiling, and exact classifier, redaction, retention, and publication roots. Active closure must resolve those governance bodies and cross-check the predicate's publication/sensitivity defaults against them. All payload authority switches are false, including actor, scope, head, admission rule, and admission outcome; text limits may be stricter than, but never exceed, the 100,000-byte hard contract bound.
 
 The authored text field is named `assertion_text_utf8_hex_chunks` because the frozen canonical JSON profile rejects control scalars inside JSON strings and caps one string at 65,536 bytes. Its deterministic array of lowercase-hex chunks preserves up to 100,000 exact NFC UTF-8 bytes, including LF, TAB, leading indentation, trailing spaces, and a final LF, without trimming or newline normalization. Every non-final chunk represents exactly 32,768 raw bytes, so the same text has one wire form; whitespace-only text, CR, NUL, noncharacters, private-use scalars, BOM, and other controls are rejected. Predicate string values remain ordinary canonical, trimmed, control-free strings.
@@ -34,4 +44,4 @@ The public accepted statement is still only structural bytes. Future append code
 
 At the `event_first` cutover, the admitted accepted event must be durable before or atomically with its projections, and the legacy `ClaimInput` path must no longer write directly. Existing tenant-wide idempotency keys remain reserved: an exact imported receipt replay is read-only, while different canonical bytes under the same key collide. Legacy `memory_events` UUIDs are opaque imported audit provenance, never accepted-event IDs.
 
-The adversarial records prove that floating values, arbitrary JSON, numeric support IDs, ingress authority fields, statement physical fields, broken resource constraints, unknown publication defaults, open observer rules, duplicate logical basis keys, impossible basis modalities, and payload-selected admission authority fail closed. Rust tests raw-pin every positive, manifest, and negative artifact as well as ingress, semantic claim, accepted statement, and aggregate suite. The two remember prefixes are closed shared `DigestDomain` variants. Changing any canonical record, prefix, fixed event kind, expected digest, or ordering rule is a contract-version change.
+The adversarial records prove that floating values, arbitrary JSON, numeric support IDs, ingress authority fields, statement physical fields, wrong subject or applicability identity forms, broken resource constraints, unknown publication defaults, open observer rules, duplicate logical basis keys, impossible basis modalities, and payload-selected admission authority fail closed. Rust tests raw-pin every positive, manifest, and negative artifact as well as ingress, semantic claim, accepted statement, and aggregate suite. The two remember prefixes are closed shared `DigestDomain` variants. Changing any canonical record, prefix, fixed event kind, expected digest, or ordering rule is a contract-version change.

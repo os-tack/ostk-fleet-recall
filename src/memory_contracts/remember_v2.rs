@@ -1453,6 +1453,7 @@ mod tests {
         canonical::{CanonicalValue, decode_strict, encode_canonical, require_canonical},
         common::frozen_profile_reference_v1,
         digest::{DigestDomain, domain_separated_digest},
+        identity::IdentityForm,
         registry::RegistryHeadV1,
     };
 
@@ -1496,6 +1497,12 @@ mod tests {
     const NEGATIVE_PHYSICAL_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v2/remember/negative-statement-physical-fields.jsonl"
     );
+    const NEGATIVE_SUBJECT_IDENTITY_FORM_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v2/remember/negative-subject-identity-form.jsonl"
+    );
+    const NEGATIVE_ENVIRONMENT_IDENTITY_FORM_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v2/remember/negative-environment-identity-form.jsonl"
+    );
     const NEGATIVE_PREDICATE_DIMENSION_IDENTITY_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v2/remember/negative-predicate-dimension-identity-entry.jsonl"
     );
@@ -1521,31 +1528,35 @@ mod tests {
         include_bytes!("../../contracts/dynamic-memory/v2/remember/vector-suite.jsonl");
 
     const CLAIM_COORDINATE_ID: &str =
-        "41cd97814a57932bfd7867569f3f9db411c265fe3c4076d9292669d434725c9c";
+        "c964975c9d734cbf6e8d0c300f97b1b2374d0107565b3be8835bbda9b8b5cded";
     const CLAIM_FINGERPRINT: &str =
-        "a1dd48fb8dc3c7844a7bcc7fd6df479fb987f1e15e032c7795bdc17ad0d28cc2";
+        "6911f6090f66d4601651df777ad6e4bd765f595c97e795cd07b72095f9ebe0ee";
     const ACCEPTED_EVENT_ID: &str =
-        "6adb048a6de01cb840536a770f4281986e0a29e57ade237978399ab6b2174066";
+        "884c9becc53a6f2dc444df3728972c196cc52fd10184c600e8fbcb639a22e491";
     const VECTOR_SUITE_DIGEST: &str =
-        "4ee17dc866e7a162629c1ac0e6fa59e1b1f2346c6b0dfcb5eccd7742c32f3767";
+        "21bd8d133554af1e144e4e13798b5a521545aed407fe6980db6d0132629aa6a6";
     const INGRESS_RAW_SHA256: &str =
-        "a23832e23703a423c280aa6bc65528d62d9f77225e704739e5e9b9044dd2713c";
+        "98f70e8075f82fdd9243215e63a4d49fc7fd2bcf3ac9defe3edc13d39ae09a1b";
     const CLAIM_RAW_SHA256: &str =
-        "7659c87974591957feb8dffa86f7727f0b6e7d2e8b3476068da9268dbc9c714a";
+        "46046d108489b9736e8caa757bf2d4d1be24897d0e8917c4b8376579f865966c";
     const STATEMENT_RAW_SHA256: &str =
-        "417f4bb9c21dec88b0647bc2b1a699a9a06770dbd5b61fdc187c44e03df87dd4";
+        "203e72429a2a0f0d60af96b62af79415adcdff6a381e32c81568ea93267f38a6";
     const VECTOR_SUITE_RAW_SHA256: &str =
-        "ecd87049efa658469ddb04efa6189f789faf35ced387024d3e13eb846903d1fd";
+        "4b31addb79455c408e413803469f57b75c4769780373469c3ad54ae4b3db05dd";
     const NEGATIVE_ARBITRARY_JSON_RAW_SHA256: &str =
-        "a9f700a78866b534c4da57f7c1080e261124927cd99d2cac46a2c3cf32729904";
+        "2d1046da15c7a8b9860a5d1170506ab93b77683ea792550b280ee54ca09f79c8";
     const NEGATIVE_FLOAT_RAW_SHA256: &str =
-        "a54842da6b3257ee4c6414b418ff1bd4a92ed7842b2f54b7fec5326faad0808b";
+        "77b2d05d1a647dc037fdbe8d98e372df23f65ccdaf8483c0834f4c755cccafbd";
     const NEGATIVE_AUTHORITY_RAW_SHA256: &str =
-        "7e9a3a24b65fd3f429a095c47fa743dedae2c1be0356dd79bf00513376d87ce7";
+        "65c35b284ba9674eca366b740922ae583b9935c0841f99f5f503618c6a43d8f4";
     const NEGATIVE_NUMERIC_SUPPORT_RAW_SHA256: &str =
-        "ff96b7fb78a3dc433b74dd587788bec29a9b7f1d2799ec0a67d50f54489a75ec";
+        "b7a1ba95b54d27a5189eb5a1a8f6e5012bd38d18ce4e1cc5d0790208deb53a41";
     const NEGATIVE_PHYSICAL_RAW_SHA256: &str =
-        "27d74bcb68aa9e3266e6370f1187208141f9da1aaf89806de1d86719763621af";
+        "c5cc7337dde9e022f3981197d38f312d56d62127f3eb96f89f33262a431c9e74";
+    const NEGATIVE_SUBJECT_IDENTITY_FORM_RAW_SHA256: &str =
+        "e0870231e6241de9aba60bef799b652294ea79d4475d2b22e8438b120d8bd595";
+    const NEGATIVE_ENVIRONMENT_IDENTITY_FORM_RAW_SHA256: &str =
+        "cdd41ca80a7a0b061a2330adbba39b10588573a171dc92e22fd7f6d30e963992";
     const PREDICATE_ENTRY_RAW_SHA256: &str =
         "a74f9da62be272a6b99f539f691a413560f712daebd5c7cf1716dfe3d1a1ff0f";
     const ADMISSION_ENTRY_RAW_SHA256: &str =
@@ -1955,24 +1966,39 @@ mod tests {
         }
     }
 
-    fn resource(kind: &str, digit: char) -> ResourceUri {
+    fn resource(identity_form: IdentityForm, kind: &str, digit: char) -> ResourceUri {
         format!(
-            "urn:ostk:version:v1:{kind}:sha256:{}",
+            "urn:ostk:{}:v1:{kind}:sha256:{}",
+            identity_form.as_str(),
             digit.to_string().repeat(64)
         )
         .parse()
         .unwrap()
     }
 
+    fn first_stage4_resource_forms_match(candidate: &RememberIngressCandidateV2) -> bool {
+        let dimension_matches = |dimension_id: &str, kind: &str, form: IdentityForm| {
+            candidate.applicability.iter().any(|dimension| {
+                dimension.dimension_id.as_str() == dimension_id
+                    && dimension.resource.resource_kind().as_str() == kind
+                    && dimension.resource.identity_form() == form
+            })
+        };
+        candidate.asserted_subject.resource_kind().as_str() == "repository"
+            && candidate.asserted_subject.identity_form() == IdentityForm::Entity
+            && dimension_matches("repository_commit", "commit", IdentityForm::Version)
+            && dimension_matches("runtime_environment", "environment", IdentityForm::Entity)
+    }
+
     fn applicability() -> Vec<ConcreteApplicabilityDimensionV1> {
         vec![
             ConcreteApplicabilityDimensionV1 {
                 dimension_id: ContractId::new("repository_commit").unwrap(),
-                resource: resource("commit", '3'),
+                resource: resource(IdentityForm::Version, "commit", '3'),
             },
             ConcreteApplicabilityDimensionV1 {
                 dimension_id: ContractId::new("runtime_environment").unwrap(),
-                resource: resource("environment", '4'),
+                resource: resource(IdentityForm::Entity, "environment", '4'),
             },
         ]
     }
@@ -1991,7 +2017,7 @@ mod tests {
     fn candidate() -> RememberIngressCandidateV2 {
         RememberIngressCandidateV2 {
             schema_version: 2,
-            asserted_subject: resource("repository", '1'),
+            asserted_subject: resource(IdentityForm::Entity, "repository", '1'),
             subject_identity_recipe: reference("identity.github.repository"),
             predicate_schema: predicate_reference(),
             applicability_evaluator: reference("applicability.default"),
@@ -2088,6 +2114,14 @@ mod tests {
                 NEGATIVE_NUMERIC_SUPPORT_RAW_SHA256,
             ),
             (NEGATIVE_PHYSICAL_FIXTURE, NEGATIVE_PHYSICAL_RAW_SHA256),
+            (
+                NEGATIVE_SUBJECT_IDENTITY_FORM_FIXTURE,
+                NEGATIVE_SUBJECT_IDENTITY_FORM_RAW_SHA256,
+            ),
+            (
+                NEGATIVE_ENVIRONMENT_IDENTITY_FORM_FIXTURE,
+                NEGATIVE_ENVIRONMENT_IDENTITY_FORM_RAW_SHA256,
+            ),
             (
                 NEGATIVE_PREDICATE_DIMENSION_IDENTITY_FIXTURE,
                 NEGATIVE_PREDICATE_DIMENSION_IDENTITY_RAW_SHA256,
@@ -2350,8 +2384,8 @@ mod tests {
         assert!(normative_enabled.validate_shape().is_err());
 
         let constraint = resource_identity("repository", "identity.github.repository");
-        assert!(constraint.accepts_uri_shape(&resource("repository", 'a')));
-        assert!(!constraint.accepts_uri_shape(&resource("commit", 'a')));
+        assert!(constraint.accepts_uri_shape(&resource(IdentityForm::Entity, "repository", 'a')));
+        assert!(!constraint.accepts_uri_shape(&resource(IdentityForm::Version, "commit", 'a')));
 
         let mut strict_rule = admission_rule();
         strict_rule.maximum_assertion_text_utf8_bytes = 1;
@@ -2364,6 +2398,45 @@ mod tests {
         let mut too_long = candidate();
         too_long.admission_rule = registry_reference_for_entry(&strict_entry).unwrap();
         assert!(strict_resolved.validate_candidate_shape(&too_long).is_err());
+    }
+
+    #[test]
+    fn first_stage4_resource_forms_are_explicit_and_mismatches_fail_closed() {
+        let positive = candidate();
+        assert!(first_stage4_resource_forms_match(&positive));
+        assert_eq!(
+            positive.asserted_subject.identity_form(),
+            IdentityForm::Entity
+        );
+        assert_eq!(
+            positive.applicability[0].resource.identity_form(),
+            IdentityForm::Version
+        );
+        assert_eq!(
+            positive.applicability[1].resource.identity_form(),
+            IdentityForm::Entity
+        );
+        assert!(matches!(
+            &positive.value,
+            CanonicalClaimValueV2::Boolean { value: true }
+        ));
+        assert!(matches!(
+            predicate_schema().value_constraint,
+            RememberValueConstraintV2::Boolean { unit_id }
+                if unit_id.as_str() == "unit.none"
+        ));
+
+        for bytes in [
+            NEGATIVE_SUBJECT_IDENTITY_FORM_FIXTURE,
+            NEGATIVE_ENVIRONMENT_IDENTITY_FORM_FIXTURE,
+        ] {
+            require_canonical(record(bytes)).unwrap();
+            let negative: RememberIngressCandidateV2 = decode_strict(record(bytes)).unwrap();
+            // Public shape remains authority-free; exact active recipe
+            // rederivation is what rejects the incompatible URI form.
+            negative.validate_shape().unwrap();
+            assert!(!first_stage4_resource_forms_match(&negative));
+        }
     }
 
     #[test]
@@ -2546,7 +2619,7 @@ mod tests {
         let key = base.consistency_partition_key().unwrap();
 
         let mut subject = base.clone();
-        subject.subject = resource("repository", '2');
+        subject.subject = resource(IdentityForm::Entity, "repository", '2');
         assert_ne!(key, subject.consistency_partition_key().unwrap());
 
         let mut predicate = base.clone();
@@ -2554,7 +2627,7 @@ mod tests {
         assert_ne!(key, predicate.consistency_partition_key().unwrap());
 
         let mut context = base;
-        context.applicability[1].resource = resource("environment", '9');
+        context.applicability[1].resource = resource(IdentityForm::Entity, "environment", '9');
         assert_ne!(key, context.consistency_partition_key().unwrap());
     }
 
@@ -2799,6 +2872,11 @@ mod tests {
             object.insert("claim_id".into(), serde_json::Value::from(99));
             object.insert("shard".into(), serde_json::Value::from(3));
         });
+        let mut wrong_subject_form = candidate.clone();
+        wrong_subject_form.asserted_subject = resource(IdentityForm::Version, "repository", '1');
+        let mut wrong_environment_form = candidate;
+        wrong_environment_form.applicability[1].resource =
+            resource(IdentityForm::Version, "environment", '4');
         for bytes in [
             arbitrary_json.as_slice(),
             ingress_authority.as_slice(),
@@ -2827,6 +2905,16 @@ mod tests {
             &output,
             "negative-statement-physical-fields.jsonl",
             &physical_statement,
+        );
+        write(
+            &output,
+            "negative-subject-identity-form.jsonl",
+            &encode_canonical(&wrong_subject_form).unwrap(),
+        );
+        write(
+            &output,
+            "negative-environment-identity-form.jsonl",
+            &encode_canonical(&wrong_environment_form).unwrap(),
         );
 
         write(
@@ -2905,7 +2993,9 @@ mod tests {
                 "predicate_dimension_identity",
                 "predicate_public_default",
                 "predicate_resource_value",
+                "runtime_environment_identity_form",
                 "statement_physical_fields",
+                "subject_identity_form",
             ]
             .into_iter()
             .map(|value| ContractId::new(value).unwrap())
