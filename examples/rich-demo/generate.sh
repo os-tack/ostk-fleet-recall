@@ -330,7 +330,7 @@ emit_repository_chunks() {
                 }
             }
 
-            function emit_block(value, coordinates, count, coordinate_count, words, word_lines, prefix, start, end, i, remaining, current) {
+            function emit_block(value, coordinates, count, coordinate_count, words, word_lines, prefix, start, end, i, remaining, current, max_body, token, token_offset, token_end) {
                 value = clean(value)
                 coordinates = clean(coordinates)
                 if (value == "") {
@@ -358,8 +358,38 @@ emit_repository_chunks() {
                     }
 
                     if (end < start) {
-                        end = start
-                        current = prefix words[start]
+                        # A canonical JSON record can be one whitespace-free
+                        # token larger than a normal chunk. Split only this
+                        # fallback case, preserving the same physical source
+                        # line for every fragment. LC_ALL=C makes offsets byte
+                        # based; retreat from a UTF-8 continuation byte so a
+                        # fragment never cuts a code point.
+                        max_body = max_chars - length(prefix)
+                        if (max_body < 4) {
+                            exit 3
+                        }
+                        token = words[start]
+                        token_offset = 1
+                        while (token_offset <= length(token)) {
+                            token_end = token_offset + max_body - 1
+                            if (token_end > length(token)) {
+                                token_end = length(token)
+                            } else {
+                                while (token_end >= token_offset &&
+                                        substr(token, token_end + 1, 1) ~ /^[\200-\277]$/) {
+                                    token_end--
+                                }
+                            }
+                            if (token_end < token_offset) {
+                                exit 3
+                            }
+                            current = prefix substr(token, token_offset, token_end - token_offset + 1)
+                            print chunk_index "\t" word_lines[start] "\t" word_lines[start] "\t" current
+                            chunk_index++
+                            token_offset = token_end + 1
+                        }
+                        start++
+                        continue
                     }
 
                     if (end < count) {

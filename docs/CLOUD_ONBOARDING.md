@@ -27,6 +27,13 @@ reference-agent, replacement, and validation artifacts remain historical
 revision-6 evidence; the Cloud `EXPLAIN` is separately captured historical plan
 evidence. None was rerun for revision 10.
 
+The current checkout is newer than that recorded deployment. Its embedded
+migrator now contains versions 1 through 9, including private control-ledger
+and genesis-activation projections. Serving health deliberately remains
+compatible with a complete successful prefix of at least version 2. Do not
+reinterpret the live revision-10 schema-2 status or 552-row seed as evidence
+that the later private migrations or ceremonies were deployed.
+
 The labels below are gates:
 
 - **APPROVAL REQUIRED** means the account owner must approve the named choice
@@ -226,23 +233,21 @@ database name, approved RU/storage limits, and authorized NAT `/32`.
 
 ## 6. Create database identities and AWS secrets
 
-**APPROVAL REQUIRED — COST-BEARING:** Approve three CockroachDB SQL users and
-three AWS Secrets Manager secrets. Secrets Manager charges per secret and API
-use; use its AWS-managed encryption key unless a separately approved customer
-KMS key is required. See
+**APPROVAL REQUIRED — COST-BEARING:** For the current AWS module, approve two
+CockroachDB SQL users and two AWS Secrets Manager secrets. Secrets Manager
+charges per secret and API use; use its AWS-managed encryption key unless a
+separately approved customer KMS key is required. See
 [Secrets Manager pricing](https://aws.amazon.com/secrets-manager/pricing/).
 
 Create:
 
 - `fleet_migrator`: DDL-capable for the one-off schema migration;
 - `fleet_runtime`: no admin membership and only the runtime grants documented
-  in [MIGRATIONS.md](MIGRATIONS.md);
-- `fleet_control_bootstrap`: no admin membership and only the one-shot private
-  grants documented in [CONTROL_BOOTSTRAP.md](CONTROL_BOOTSTRAP.md).
+  in [MIGRATIONS.md](MIGRATIONS.md).
 
 CockroachDB Cloud UI-created SQL users initially receive `admin`. Revoke it
-from `fleet_runtime` and `fleet_control_bootstrap` before use. After migration,
-grant runtime DML only on `memory_corpus_models`, `memory_chunks`,
+from `fleet_runtime` before use. After migration, grant runtime DML only on
+`memory_corpus_models`, `memory_chunks`,
 `memory_chunk_history`, `memory_claims`, `memory_claim_support`,
 `memory_claim_embeddings`, `memory_claim_events`, `memory_conflicts`,
 `memory_conflict_members`, `memory_claim_links`, `memory_claim_link_events`,
@@ -251,9 +256,7 @@ the four legacy sequences and `_sqlx_migrations` access listed in
 [MIGRATIONS.md](MIGRATIONS.md). Never use `ON ALL TABLES`, and never grant the
 runtime or `public` role access to `memory_control_bootstraps`,
 `memory_control_log_epochs`, `memory_control_shard_heads`, or
-`memory_control_events`. Apply the exact bootstrap role policy and verify its
-normalized `SHOW GRANTS` proof as described in
-[CONTROL_BOOTSTRAP.md](CONTROL_BOOTSTRAP.md). See
+`memory_control_events`. See
 [CockroachDB access management](https://www.cockroachlabs.com/docs/cockroachcloud/managing-access).
 
 For each user, obtain a URL-encoded raw connection URL for `fleet_recall` with
@@ -269,7 +272,6 @@ secret value in the AWS console:
 
 - `ostk-fleet-recall/database/runtime-url`
 - `ostk-fleet-recall/database/migrator-url`
-- `ostk-fleet-recall/database/control-bootstrap-url`
 
 Do not use a JSON wrapper. Record only their ARNs. Verify metadata—not values:
 
@@ -281,13 +283,25 @@ aws secretsmanager describe-secret \
 aws secretsmanager describe-secret \
   --secret-id ostk-fleet-recall/database/migrator-url \
   --query '{arn:ARN,name:Name,kms:KmsKeyId}' --output json
-
-aws secretsmanager describe-secret \
-  --secret-id ostk-fleet-recall/database/control-bootstrap-url \
-  --query '{arn:ARN,name:Name,kms:KmsKeyId}' --output json
 ```
 
 Never run `get-secret-value` during a recorded session.
+
+Terraform accepts only these runtime and migrator secret ARNs. It has no
+control-bootstrap or registry-activation secret input, IAM execution role, ECS
+task, startup hook, or public route. Do not overload either AWS secret with a
+private ceremony credential.
+
+If the separately reviewed Stage-2 ceremony is actually run, create a third,
+private SQL principal with no admin membership and only the grants in
+[CONTROL_BOOTSTRAP.md](CONTROL_BOOTSTRAP.md). Supply its dedicated URL to the
+local operator process; disable the login or remove the secret afterward. If
+the Stage-3 genesis-activation ceremony is run, create a fourth, distinct
+principal with the exact activation grants in [MIGRATIONS.md](MIGRATIONS.md)
+and retire it after use. Both ceremonies remain local/private until a separate
+deployment increment adds and reviews explicit cloud wiring. Their artifacts,
+pins, profiles, and URL rules are summarized in
+[SECURITY.md](SECURITY.md).
 
 ## 7. Preserve and upload the pinned model
 
@@ -501,8 +515,10 @@ for every external deletion.
    a separate `terraform plan -destroy` before approving `terraform destroy`.
    The ECR repository may need its immutable images deleted first.
 4. Separately review resources Terraform does not own: NAT Gateway and Elastic
-   IP, S3 objects/versions and bucket, the three Secrets Manager secrets, DNS
-   and domain registration, ACM certificate, VPC/subnets, and CockroachDB Cloud.
+   IP, S3 objects/versions and bucket, the two database Secrets Manager secrets
+   used by Terraform, DNS and domain registration, ACM certificate,
+   VPC/subnets, and CockroachDB Cloud. Separately inventory any out-of-band
+   private-ceremony secret; it is not owned by this module.
 5. Delete or retain each external resource deliberately. NAT, ALB, Fargate,
    public IPv4, Secrets Manager, CloudWatch, S3/ECR, DNS, and CockroachDB can
    continue accruing charges until their resources are actually removed.

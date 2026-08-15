@@ -177,8 +177,8 @@ line_count=$(wc -l < "$input" | tr -d '[:space:]')
 case $line_count in
     ''|*[!0-9]*) fail "line count is not numeric" ;;
 esac
-if [ "$line_count" -lt 1000 ] || [ "$line_count" -gt 2000 ]; then
-    fail "record count must be between 1000 and 2000 (found $line_count)"
+if [ "$line_count" -lt 1000 ] || [ "$line_count" -gt 3000 ]; then
+    fail "record count must be between 1000 and 3000 (found $line_count)"
 fi
 
 if awk 'length($0) > 16384 { exit 1 }' "$input"; then
@@ -260,7 +260,7 @@ if ! jq -s -e '
             or $record.source_config_id == "rich-demo:repository:v1"
             or $record.source_config_id == "rich-demo:operations:v1")
         and (if $record.source_config_id == "rich-demo:docs:v1"
-            then (($record.source_id | test("^(README[.]md|docs/[A-Za-z0-9._/-]+|deploy/[A-Za-z0-9._/-]+|examples/[A-Za-z0-9._/-]+)$"))
+            then (($record.source_id | test("^(README[.]md|contracts/[A-Za-z0-9._/-]+|docs/[A-Za-z0-9._/-]+|deploy/[A-Za-z0-9._/-]+|examples/[A-Za-z0-9._/-]+)$"))
                 and ($record.source_id | contains("//") | not)
                 and ($record.source_id | split("/") | all(.[]; . != "." and . != "..")))
             elif $record.source_config_id == "rich-demo:self-audit:v1"
@@ -365,8 +365,8 @@ if ! jq -s -e \
         | map(select(length > 0 and (startswith("#") | not)))
         | map(split("|")[0])
         | sort) as $expected_repository_sources
-    | ($expected_doc_sources | length) == 21
-    and ($expected_repository_sources | length) == 85
+    | ($expected_doc_sources | length) == 24
+    and ($expected_repository_sources | length) == 137
     and
     ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) >= 400
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2

@@ -60,6 +60,9 @@ missing_repository_source=$test_root/missing-repository-source.ndjson
 wrong_repository_metadata=$test_root/wrong-repository-metadata.ndjson
 mutated_repository_excerpt=$test_root/mutated-repository-excerpt.ndjson
 widened_repository_range=$test_root/widened-repository-range.ndjson
+long_token_expected=$test_root/long-token-expected.txt
+long_token_actual=$test_root/long-token-actual.txt
+mutated_long_token=$test_root/mutated-long-token.ndjson
 expected_documents=$test_root/expected-documents.txt
 actual_documents=$test_root/actual-documents.txt
 expected_repository=$test_root/expected-repository.txt
@@ -98,6 +101,11 @@ git -C "$repo_root" ls-files |
             deploy/aws/tests/replacement-proof.sh) continue ;;
             deploy/aws/tests/seed-wrapper.sh) continue ;;
             deploy/aws/tests/self-audit-wrapper.sh) continue ;;
+            # These connected proof harnesses construct password-bearing TLS
+            # URLs. Keep them private just like the excluded AWS wrapper
+            # fixtures; the decoded sensitive-pattern gate remains unchanged.
+            deploy/cockroach/tests/control-bootstrap-cli.sh) continue ;;
+            deploy/cockroach/tests/registry-activation-cli.sh) continue ;;
             src/config.rs) continue ;;
         esac
         printf '%s\n' "$path"
@@ -116,13 +124,72 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 1652
-    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 583
+    length == 2438
+    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 649
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 863
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 1583
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
 ' "$first" >/dev/null; then
     printf 'rich demo verification failed: exact repository corpus composition changed\n' >&2
+    exit 1
+fi
+
+# Canonical JSON can be one long whitespace-free token. Require bounded,
+# same-line UTF-8 fragments and prove that ordered bodies reconstruct the exact
+# source bytes without loss, overlap, or duplication.
+long_token_source=contracts/dynamic-memory/v1/genesis-registry-package.jsonl
+long_token_prefix="Repository source $long_token_source; area memory_contracts; language jsonl. "
+if ! jq -s -e --arg source_id "$long_token_source" '
+    [.[] | select(
+        .source_config_id == "rich-demo:repository:v1"
+        and .source_id == $source_id
+    )] as $fragments
+    | ($fragments | length) > 1
+    and all($fragments[];
+        .extra.source_line_start == 1
+        and .extra.source_line_end == 1
+        and (.text | utf8bytelength) <= 1500)
+' "$first" >/dev/null; then
+    printf 'rich demo verification failed: long canonical token was not safely fragmented\n' >&2
+    exit 1
+fi
+awk '{ sub(/\r$/, ""); printf "%s", $0 }' \
+    "$repo_root/$long_token_source" > "$long_token_expected"
+jq -s -jr \
+    --arg source_id "$long_token_source" \
+    --arg prefix "$long_token_prefix" '
+    [.[] | select(
+        .source_config_id == "rich-demo:repository:v1"
+        and .source_id == $source_id
+    )]
+    | sort_by(.chunk_index)
+    | .[]
+    | .text
+    | ltrimstr($prefix)
+' "$first" > "$long_token_actual"
+if ! cmp -s "$long_token_expected" "$long_token_actual"; then
+    printf 'rich demo verification failed: long canonical token coverage changed\n' >&2
+    exit 1
+fi
+jq -c --arg source_id "$long_token_source" '
+    if .source_config_id == "rich-demo:repository:v1"
+        and .source_id == $source_id
+        and .chunk_index == 0
+    then .text += "x"
+    else .
+    end
+' "$first" > "$mutated_long_token"
+if mutated_long_token_error=$(
+    "$script_dir/verify.sh" "$mutated_long_token" 2>&1
+); then
+    printf 'rich demo verification failed: verifier accepted a mutated long-token fragment\n' >&2
+    exit 1
+fi
+if ! printf '%s\n' "$mutated_long_token_error" |
+    grep -Fq "repository source coordinates or metadata do not exactly bound $long_token_source"
+then
+    printf '%s\n' "$mutated_long_token_error" >&2
+    printf 'rich demo verification failed: mutated long token failed outside source containment\n' >&2
     exit 1
 fi
 

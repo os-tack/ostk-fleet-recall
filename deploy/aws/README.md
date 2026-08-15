@@ -31,6 +31,13 @@ reference-agent, replacement, and validation artifacts are historical
 revision-6 evidence; Cloud `EXPLAIN` is separately captured historical plan
 evidence. None was rerun for revision 10.
 
+The current checkout is newer than that recorded release. Its embedded
+migrator contains versions 1 through 9, including private control-ledger and
+genesis-activation schema. Serving health intentionally remains compatible
+with a complete successful prefix of at least version 2. The live schema-2
+status and 552-row seed above remain historical deployment facts; they are not
+evidence that the later private migrations or ceremonies ran in AWS.
+
 ## Prerequisites
 
 - Terraform 1.10 or newer, AWS CLI v2, Docker Buildx, and `jq`.
@@ -60,6 +67,25 @@ evidence. None was rerun for revision 10.
 CockroachDB Cloud must allow the tasks' stable egress address. A NAT gateway
 with an Elastic IP is the simplest demo arrangement; add that IP to the Cloud
 cluster allowlist. Private connectivity is preferable for a production fleet.
+
+**Upgrade gate before any plan or apply:**
+`migration_database_url_secret_arn` is now a required input and must differ
+from `database_url_secret_arn`. An older workspace or `terraform.tfvars` that
+provided only the runtime secret is not ready to plan this module. First create
+or identify a separate DDL-only migrator principal, store its TLS URL as a raw
+value in a distinct Secrets Manager secret, record only its concrete ARN, add
+that ARN to `terraform.tfvars`, and run the local Terraform tests. Then review
+a plan that shows the dedicated migration execution role, secret policy, and
+task definition using only that ARN. Do not apply merely because this runbook
+describes the upgrade; secret creation, plan approval, and apply remain
+separate operator-authorized actions.
+
+The module has no control-bootstrap or registry-activation secret variable,
+execution role, task definition, startup hook, or route. Stage 2 uses a third
+SQL principal only when its local private ceremony runs; Stage 3 similarly
+uses a fourth. Do not reuse either Terraform-managed secret for those
+credentials. See the [security policy](../../docs/SECURITY.md) and
+[migration privilege boundary](../../docs/MIGRATIONS.md).
 
 ## 1. Prepare and pin the model bundle
 
@@ -149,9 +175,14 @@ race the initial schema migration.
 
 ## 4. Run exactly one migration task
 
-The initial migration includes CockroachDB vector-index builds and is
-explicitly non-transactional. Keep the service at zero and do not run two
-migrators concurrently.
+The current source migrator applies versions 1 through 9. They include
+CockroachDB vector-index builds, the private control/activation projections,
+the scoped predecessor index, and four explicit-time hardening changes; all
+execute outside a wrapping SQL transaction. Keep the service at zero and do
+not run two migrators concurrently. Afterward, verify the complete successful
+prefix 1 through 9 separately. A serving health result of version 2 or newer is
+an additive compatibility check, not proof that the current migration target
+completed.
 
 ```bash
 ./deploy/aws/run-migration.sh
@@ -184,6 +215,16 @@ secrets. The default invocation ingests
 runtime database secret, load and verify the same pinned S3 model, and invoke
 the trusted `ingest` CLI. Stable source coordinates make rerunning either task
 safe. Do not start the public service until both tasks exit zero.
+
+The 552-row count is bound to the recorded revision-10 image. The current
+rich-demo generator is deterministic for a fixed source revision and manifest,
+but its repository/document corpus evolves with tracked files: documentation
+edits can change chunk text, line coordinates, and row count. For a new image,
+generate the corpus from the intended immutable tree, run
+`examples/rich-demo/test.sh`, record its newly verified breakdown, and treat
+the successful seed receipt—not an old count in this runbook—as the deployment
+fact. Never rewrite the historical revision-10 count to describe an unseeded
+checkout.
 
 ## 6. Start and verify the demo
 
@@ -506,6 +547,9 @@ dropped, and the temporary workstation network rule was removed after capture.
 - The runtime SQL user needs DML on the Fleet Recall tables and read access to
   `_sqlx_migrations`; it does not need schema creation. The separate migration
   task definition must inject the distinct DDL-capable secret.
+- No AWS role or task receives the private Stage-2 or Stage-3 ceremony
+  credential. Their least-privilege one-shot writers remain local/private until
+  a separately reviewed deployment increment explicitly wires them.
 - Each task is permanently bound to one tenant, project, agent, privacy tier,
   embedding model, and bundle digest through deployment configuration. Public
   request data cannot select a different tenant or project.

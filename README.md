@@ -38,6 +38,15 @@ hackathon slice. Additional canonical Recall actions are also future work.
 
 ## Evidence status
 
+Source and deployment evidence are intentionally reported separately. The
+current checkout embeds migrations 1 through 9, including private Stage-2
+control and Stage-3 genesis-activation state. Normal serving health remains
+compatible with a complete successful migration prefix of at least version 2.
+The AWS module wires only distinct runtime and migrator database credential
+paths; the third Stage-2 and fourth Stage-3 SQL principals exist only when
+their local private ceremonies run. None of those source facts upgrades the
+historical cloud evidence below.
+
 The submission candidate is live at
 [https://d13zrqfh66r7ub.cloudfront.net](https://d13zrqfh66r7ub.cloudfront.net).
 The live revision-10 cutover runs source commit
@@ -278,10 +287,12 @@ non-sensitive corpus and check readiness:
 "$FLEET_RECALL_BIN" health
 ```
 
-Migration v1 builds vector indexes outside one SQL transaction because of the
-CockroachDB schema-changer constraint. Never run multiple initial migrators
-concurrently. See [migration and recovery rules](docs/MIGRATIONS.md) before
-recovering a failed migration.
+The current embedded migrator applies versions 1 through 9. Migration v1 builds
+vector indexes outside one SQL transaction because of the CockroachDB
+schema-changer constraint, and the later private schema changes are also
+forward-only. Never run multiple migrators concurrently. See
+[migration and recovery rules](docs/MIGRATIONS.md) before recovering a failed
+migration.
 
 ### 4. Exercise the read-only HTTP demo
 
@@ -424,17 +435,23 @@ the remaining rows.
 - MCP frames, tool results, searches, conflict projections, claim passages,
   ingestion, and HTTP bodies/results are bounded. Backend details are redacted
   from protocol errors.
+- Recalled chunks, claims, transcripts, telemetry, and Markdown are untrusted
+  evidence, not instructions or authorization. Consumers must verify sources
+  and apply external agent/operator policy before acting on them.
 - Corpus rows use one registered 512-dimension embedding generation per
   tenant/project. A mismatched model path, digest, vector dimension, or active
   registry identity fails closed.
 - Claim, support, conflict, receipt, corpus projection, and audit-event changes
   commit in one serializable mutation. Only CockroachDB SQLSTATE `40001`
   automatically retries the complete transaction.
-- The local `--insecure` database escape is development-only. Cloud and other
-  non-loopback URLs must use TLS verification.
-- The current HTTP demo is read-only. Do not expose MCP mutation or a future
-  HTTP mutation route publicly without workload identity, authorization, rate
-  limiting, and production network controls.
+- The serving and Stage-2 local `--insecure` database escape is
+  development-only. Cloud and other non-loopback URLs must use TLS
+  verification; Stage-3 activation always requires `sslmode=verify-full`, even
+  on loopback.
+- The current HTTP demo is read-only and exposes no MCP, ingest, bootstrap, or
+  activation route. Do not expose a future mutation route publicly without
+  workload identity, authorization, rate limiting, and production network
+  controls.
 
 See [security and supply-chain policy](docs/SECURITY.md) and the
 [architecture](docs/ARCHITECTURE.md) for the complete invariants.
