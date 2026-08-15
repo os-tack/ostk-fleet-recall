@@ -775,7 +775,9 @@ this does not require or authorize dynamic ingestion.
    immutability, scope binding, replay, and verified-versus-declared behavior.
 5. Project one local transcript connector and one Git history connector into
    content-addressed repository membership and lexical-first/dense-later evidence
-   with local cursors and coverage receipts.
+   with local cursors and coverage receipts. Arrow IPC may carry bounded batches
+   between collectors, projectors, embedding workers, and replay scanners, but
+   canonical accepted-event bytes remain the identity and signature authority.
 6. Admit one exhaustive code/spec observer and add basic discrepancy derivation.
 7. Add authenticated private ingress, durable queueing, remote connector
    cursors, and dead-letter/quarantine behavior.
@@ -874,19 +876,21 @@ preserve the digest; any ordered semantic change does not.
 
 Checking a package into Git proposes it; merging it does not activate it. A
 canonical activation proposal binds the exact package digest, tenant/project
-scope, effective interval, predecessor, test-vector result, activation-policy
-digest, and expected currently active digest. Its statement ID hashes the
-unsigned canonical statement. Approval signatures are separate attestations and
-do not change that semantic ID.
+scope, effective interval, test-vector result, and the expected active head:
+predecessor activation ID, predecessor package digest, and activation-policy
+digest. Its statement ID hashes the unsigned canonical statement. Approval
+signatures are separate attestations and do not change that semantic ID.
 
 The currently active governance policy—not the proposed package—decides eligible
 principals and threshold, so a package cannot lower the threshold and authorize
 itself. The accepted activation receipt binds sorted approval-attestation IDs and
 the server-derived eligibility, threshold, and separation-of-duty verdict.
 Production authority, publication, and action-policy changes require an approver
-distinct from the package author. Activation compare-and-swaps the expected
-digest; exactly one concurrent successor can commit. Reverting means appending an
-activation event for an earlier digest; no prior interval is rewritten.
+distinct from the package author. Activation compare-and-swaps the exact expected
+head, not only its package digest; exactly one concurrent successor can commit.
+This activation-ID binding rejects a stale proposal after an `A → B → A` package
+sequence. Reverting means appending a new activation event for an earlier package
+digest; no prior interval or activation identity is rewritten.
 
 A pinned bootstrap receipt supplies the genesis package digest, canonicalization
 profile, bootstrap signer set, and threshold. The genesis package cannot
@@ -957,11 +961,12 @@ credential-bound internal authority namespace.
 Provider-specific locators use provider-instance identity and immutable
 provider IDs rather than owner/name strings when such IDs exist. Git object IDs
 retain their declared object format. Artifact identities retain digest algorithm
-and canonical digest bytes. A source path at a commit is a membership coordinate
-linking repository version, tree/blob identity, exact path bytes, and optional
-line range; identical text in two paths may share storage but not provenance.
-Normalization never guesses across case, Unicode, repository, provider, or
-tenant boundaries. Unknown locator versions remain opaque and non-comparable.
+and canonical digest bytes. A source span at a commit is a membership coordinate
+linking repository version, tree/blob identity, exact path bytes, exact byte
+span, and span digest; line numbers are display metadata only. Identical text in
+two paths may share storage but not provenance. Normalization never guesses
+across case, Unicode, repository, provider, or tenant boundaries. Unknown
+locator versions remain opaque and non-comparable.
 
 ### Normative source activation
 

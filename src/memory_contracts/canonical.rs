@@ -464,6 +464,9 @@ pub struct CanonicalTyped<T> {
     marker: PhantomData<T>,
 }
 
+/// Extraction-friendly name for a typed value and its verified canonical bytes.
+pub type CanonicalBytes<T> = CanonicalTyped<T>;
+
 impl<T> CanonicalTyped<T>
 where
     T: DeserializeOwned,

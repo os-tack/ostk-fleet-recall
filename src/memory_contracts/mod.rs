@@ -5,7 +5,10 @@
 //! later stages built on these byte-exact contracts.
 
 pub mod canonical;
+pub mod common;
 pub mod digest;
 pub mod error;
+pub mod identity;
+pub mod registry;
 
 pub use error::{ContractError, ContractResult};
