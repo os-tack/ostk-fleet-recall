@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use ostk_recall_core::PrivacyTier;
 use sha2::{Digest, Sha256};
-use url::Url;
+use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::control_log::TrustedControlScope;
@@ -15,6 +15,12 @@ use crate::memory_contracts::common::{AuthenticatedProjectScopeV1, ContractId};
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::genesis_activation::{
     GenesisActivationPrincipalBinding, RegistryTestResultDigest, RegistryTestRunnerPin,
+};
+use crate::memory_contracts::successor_activation::{
+    SuccessorActivationPrincipalBinding, SuccessorRegistryTestRunnerPin,
+};
+use crate::memory_contracts::successor_policy::{
+    GenesisSuccessorKeyBridgeDigest, GenesisSuccessorKeyBridgePin,
 };
 use crate::{FleetError, FleetScope, Result};
 
@@ -233,6 +239,201 @@ impl RegistryActivationRuntimeConfig {
 
     #[must_use]
     pub const fn authority(&self) -> &RegistryActivationConfig {
+        &self.authority
+    }
+}
+
+/// Deployment-only authority for the private generation `0 -> 1` activation.
+///
+/// Every value is bound by the dedicated successor process namespace. Neither
+/// serving, bootstrap, nor genesis-activation configuration can supply a
+/// fallback authority for this one-time transition.
+#[derive(Clone)]
+pub struct SuccessorActivationConfig {
+    trusted_scope: TrustedControlScope,
+    bootstrap_receipt_digest: BootstrapReceiptDigest,
+    genesis_test_result_digest: RegistryTestResultDigest,
+    genesis_test_runner_artifact_digest: Sha256Digest,
+    genesis_test_runner_configuration_digest: Sha256Digest,
+    target_test_result_digest: RegistryTestResultDigest,
+    target_test_runner_artifact_digest: Sha256Digest,
+    target_test_runner_configuration_digest: Sha256Digest,
+    genesis_key_bridge_digest: GenesisSuccessorKeyBridgeDigest,
+    genesis_proposer_principal_id: ContractId,
+    genesis_package_author_principal_id: ContractId,
+    proposer_principal_id: ContractId,
+    package_author_principal_id: ContractId,
+}
+
+impl std::fmt::Debug for SuccessorActivationConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SuccessorActivationConfig")
+            .field("trusted_scope", &self.trusted_scope)
+            .field("bootstrap_receipt_digest", &"<redacted>")
+            .field("genesis_test_result_digest", &"<redacted>")
+            .field("genesis_test_runner_artifact_digest", &"<redacted>")
+            .field("genesis_test_runner_configuration_digest", &"<redacted>")
+            .field("target_test_result_digest", &"<redacted>")
+            .field("target_test_runner_artifact_digest", &"<redacted>")
+            .field("target_test_runner_configuration_digest", &"<redacted>")
+            .field("genesis_key_bridge_digest", &"<redacted>")
+            .field("genesis_proposer_principal_id", &"<bound>")
+            .field("genesis_package_author_principal_id", &"<bound>")
+            .field("proposer_principal_id", &"<bound>")
+            .field("package_author_principal_id", &"<bound>")
+            .finish()
+    }
+}
+
+impl SuccessorActivationConfig {
+    #[must_use]
+    pub const fn trusted_scope(&self) -> &TrustedControlScope {
+        &self.trusted_scope
+    }
+
+    #[must_use]
+    pub const fn bootstrap_receipt_digest(&self) -> BootstrapReceiptDigest {
+        self.bootstrap_receipt_digest
+    }
+
+    #[must_use]
+    pub const fn bootstrap_pin(&self) -> BootstrapPin {
+        BootstrapPin::from_trusted_config(self.bootstrap_receipt_digest)
+    }
+
+    #[must_use]
+    pub const fn genesis_test_runner_pin(&self) -> RegistryTestRunnerPin {
+        RegistryTestRunnerPin::from_trusted_config(
+            self.genesis_test_runner_artifact_digest,
+            self.genesis_test_runner_configuration_digest,
+            self.genesis_test_result_digest,
+        )
+    }
+
+    #[must_use]
+    pub const fn target_test_runner_pin(&self) -> SuccessorRegistryTestRunnerPin {
+        SuccessorRegistryTestRunnerPin::from_trusted_config(
+            self.target_test_runner_artifact_digest,
+            self.target_test_runner_configuration_digest,
+            self.target_test_result_digest,
+        )
+    }
+
+    #[must_use]
+    pub const fn genesis_key_bridge_digest(&self) -> GenesisSuccessorKeyBridgeDigest {
+        self.genesis_key_bridge_digest
+    }
+
+    #[must_use]
+    pub const fn genesis_key_bridge_pin(&self) -> GenesisSuccessorKeyBridgePin {
+        GenesisSuccessorKeyBridgePin::from_trusted_config(self.genesis_key_bridge_digest)
+    }
+
+    #[must_use]
+    pub fn genesis_principal_binding(&self) -> GenesisActivationPrincipalBinding {
+        GenesisActivationPrincipalBinding::from_trusted_config(
+            self.genesis_proposer_principal_id.clone(),
+            self.genesis_package_author_principal_id.clone(),
+        )
+    }
+
+    #[must_use]
+    pub fn successor_principal_binding(&self) -> SuccessorActivationPrincipalBinding {
+        SuccessorActivationPrincipalBinding::from_trusted_config(
+            self.proposer_principal_id.clone(),
+            self.package_author_principal_id.clone(),
+        )
+    }
+}
+
+/// Minimal runtime configuration for the private first-successor process.
+///
+/// This process has a dedicated credential and receives no insecure-local
+/// database escape or unrelated serving configuration.
+#[derive(Clone)]
+pub struct SuccessorActivationRuntimeConfig {
+    database_url: String,
+    authority: SuccessorActivationConfig,
+}
+
+impl std::fmt::Debug for SuccessorActivationRuntimeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SuccessorActivationRuntimeConfig")
+            .field("database_url", &"<redacted>")
+            .field("authority", &self.authority)
+            .finish()
+    }
+}
+
+impl SuccessorActivationRuntimeConfig {
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        successor_activation_runtime_config(
+            &required_from(&mut lookup, "FLEET_RECALL_SUCCESSOR_DATABASE_URL")?,
+            &required_from(&mut lookup, "FLEET_RECALL_SUCCESSOR_TENANT_ID")?,
+            &required_from(&mut lookup, "FLEET_RECALL_SUCCESSOR_PROJECT")?,
+            &required_from(&mut lookup, "FLEET_RECALL_SUCCESSOR_TENANT_NAMESPACE")?,
+            &required_from(&mut lookup, "FLEET_RECALL_SUCCESSOR_PROJECT_NAMESPACE")?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_SUCCESSOR_BOOTSTRAP_RECEIPT_DIGEST",
+            )?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RESULT_DIGEST",
+            )?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RUNNER_ARTIFACT_DIGEST",
+            )?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RUNNER_CONFIGURATION_DIGEST",
+            )?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RESULT_DIGEST",
+            )?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RUNNER_ARTIFACT_DIGEST",
+            )?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RUNNER_CONFIGURATION_DIGEST",
+            )?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_SUCCESSOR_GENESIS_KEY_BRIDGE_DIGEST",
+            )?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_SUCCESSOR_GENESIS_PROPOSER_PRINCIPAL_ID",
+            )?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_SUCCESSOR_GENESIS_PACKAGE_AUTHOR_PRINCIPAL_ID",
+            )?,
+            &required_from(&mut lookup, "FLEET_RECALL_SUCCESSOR_PROPOSER_PRINCIPAL_ID")?,
+            &required_from(
+                &mut lookup,
+                "FLEET_RECALL_SUCCESSOR_PACKAGE_AUTHOR_PRINCIPAL_ID",
+            )?,
+        )
+    }
+
+    #[must_use]
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    #[must_use]
+    pub const fn authority(&self) -> &SuccessorActivationConfig {
         &self.authority
     }
 }
@@ -495,6 +696,139 @@ fn registry_activation_runtime_config(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn successor_activation_runtime_config(
+    database_url: &str,
+    tenant_id: &str,
+    project: &str,
+    tenant_namespace: &str,
+    project_namespace: &str,
+    bootstrap_receipt_digest: &str,
+    genesis_test_result_digest: &str,
+    genesis_test_runner_artifact_digest: &str,
+    genesis_test_runner_configuration_digest: &str,
+    target_test_result_digest: &str,
+    target_test_runner_artifact_digest: &str,
+    target_test_runner_configuration_digest: &str,
+    genesis_key_bridge_digest: &str,
+    genesis_proposer_principal_id: &str,
+    genesis_package_author_principal_id: &str,
+    proposer_principal_id: &str,
+    package_author_principal_id: &str,
+) -> Result<SuccessorActivationRuntimeConfig> {
+    validate_successor_database_url(database_url)?;
+    let trusted_scope =
+        successor_trusted_scope(tenant_id, project, tenant_namespace, project_namespace)?;
+    let bootstrap_receipt_digest = BootstrapReceiptDigest::from_digest(parse_digest(
+        bootstrap_receipt_digest,
+        "FLEET_RECALL_SUCCESSOR_BOOTSTRAP_RECEIPT_DIGEST",
+    )?);
+    let genesis_test_result_digest = RegistryTestResultDigest::from_digest(parse_digest(
+        genesis_test_result_digest,
+        "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RESULT_DIGEST",
+    )?);
+    let genesis_test_runner_artifact_digest = parse_digest(
+        genesis_test_runner_artifact_digest,
+        "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RUNNER_ARTIFACT_DIGEST",
+    )?;
+    let genesis_test_runner_configuration_digest = parse_digest(
+        genesis_test_runner_configuration_digest,
+        "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RUNNER_CONFIGURATION_DIGEST",
+    )?;
+    let target_test_result_digest = RegistryTestResultDigest::from_digest(parse_digest(
+        target_test_result_digest,
+        "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RESULT_DIGEST",
+    )?);
+    let target_test_runner_artifact_digest = parse_digest(
+        target_test_runner_artifact_digest,
+        "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RUNNER_ARTIFACT_DIGEST",
+    )?;
+    let target_test_runner_configuration_digest = parse_digest(
+        target_test_runner_configuration_digest,
+        "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RUNNER_CONFIGURATION_DIGEST",
+    )?;
+    let genesis_key_bridge_digest = GenesisSuccessorKeyBridgeDigest::from_digest(parse_digest(
+        genesis_key_bridge_digest,
+        "FLEET_RECALL_SUCCESSOR_GENESIS_KEY_BRIDGE_DIGEST",
+    )?);
+    let genesis_proposer_principal_id = parse_contract_id(
+        genesis_proposer_principal_id,
+        "FLEET_RECALL_SUCCESSOR_GENESIS_PROPOSER_PRINCIPAL_ID",
+    )?;
+    let genesis_package_author_principal_id = parse_contract_id(
+        genesis_package_author_principal_id,
+        "FLEET_RECALL_SUCCESSOR_GENESIS_PACKAGE_AUTHOR_PRINCIPAL_ID",
+    )?;
+    let proposer_principal_id = parse_contract_id(
+        proposer_principal_id,
+        "FLEET_RECALL_SUCCESSOR_PROPOSER_PRINCIPAL_ID",
+    )?;
+    let package_author_principal_id = parse_contract_id(
+        package_author_principal_id,
+        "FLEET_RECALL_SUCCESSOR_PACKAGE_AUTHOR_PRINCIPAL_ID",
+    )?;
+    Ok(SuccessorActivationRuntimeConfig {
+        database_url: database_url.to_owned(),
+        authority: SuccessorActivationConfig {
+            trusted_scope,
+            bootstrap_receipt_digest,
+            genesis_test_result_digest,
+            genesis_test_runner_artifact_digest,
+            genesis_test_runner_configuration_digest,
+            target_test_result_digest,
+            target_test_runner_artifact_digest,
+            target_test_runner_configuration_digest,
+            genesis_key_bridge_digest,
+            genesis_proposer_principal_id,
+            genesis_package_author_principal_id,
+            proposer_principal_id,
+            package_author_principal_id,
+        },
+    })
+}
+
+fn successor_trusted_scope(
+    tenant_id: &str,
+    project: &str,
+    tenant_namespace: &str,
+    project_namespace: &str,
+) -> Result<TrustedControlScope> {
+    let tenant_id = tenant_id.parse::<Uuid>().map_err(|error| {
+        FleetError::Configuration(format!(
+            "FLEET_RECALL_SUCCESSOR_TENANT_ID must be a UUID: {error}"
+        ))
+    })?;
+    if tenant_id.is_nil() {
+        return Err(FleetError::Configuration(
+            "FLEET_RECALL_SUCCESSOR_TENANT_ID must not be the nil UUID".into(),
+        ));
+    }
+    let deployment_scope = FleetScope::new(
+        tenant_id,
+        project,
+        "private-successor-activation",
+        None,
+        PrivacyTier::T1Project,
+    )
+    .map_err(|error| {
+        FleetError::Configuration(format!(
+            "FLEET_RECALL_SUCCESSOR_PROJECT is invalid: {error}"
+        ))
+    })?;
+    let semantic_scope = AuthenticatedProjectScopeV1::from_trusted_context(
+        parse_contract_id(tenant_namespace, "FLEET_RECALL_SUCCESSOR_TENANT_NAMESPACE")?,
+        parse_contract_id(
+            project_namespace,
+            "FLEET_RECALL_SUCCESSOR_PROJECT_NAMESPACE",
+        )?,
+    );
+    TrustedControlScope::from_trusted_context(&deployment_scope, semantic_scope).map_err(|error| {
+        FleetError::Configuration(format!(
+            "FLEET_RECALL_SUCCESSOR physical scope is invalid: {error}"
+        ))
+    })
+}
+
 fn parse_digest(value: &str, variable_name: &str) -> Result<Sha256Digest> {
     Sha256Digest::from_str(value).map_err(|error| {
         FleetError::Configuration(format!(
@@ -621,6 +955,11 @@ fn validate_database_url_with_local_escape(
     let host = parsed.host_str().ok_or_else(|| {
         FleetError::Configuration(format!("{variable_name} must include a hostname"))
     })?;
+    if host.contains('%') || host.starts_with(['/', '\\']) {
+        return Err(FleetError::Configuration(format!(
+            "{variable_name} must use a network hostname, not an encoded or Unix-socket host"
+        )));
+    }
 
     if parsed.fragment().is_some() {
         return Err(FleetError::Configuration(format!(
@@ -680,6 +1019,84 @@ fn validate_database_url_with_local_escape(
     )))
 }
 
+/// Apply the closed endpoint policy for the one-shot successor writer.
+///
+/// `sqlx-postgres` supports libpq-compatible environment and Unix-socket
+/// defaults. Requiring every routing and credential field in the URL keeps a
+/// later connection builder from filling those fields from ambient process
+/// state. Percent-encoded opaque hosts are rejected because the `PostgreSQL`
+/// parser decodes a leading slash as a Unix-socket directory, where TLS mode
+/// is not applied.
+fn validate_successor_database_url(database_url: &str) -> Result<()> {
+    const VARIABLE_NAME: &str = "FLEET_RECALL_SUCCESSOR_DATABASE_URL";
+
+    validate_database_url_with_local_escape(database_url, VARIABLE_NAME, false, false)?;
+    let parsed = Url::parse(database_url).map_err(|error| {
+        FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must be a valid PostgreSQL URL: {error}"
+        ))
+    })?;
+
+    let host = parsed.host_str().ok_or_else(|| {
+        FleetError::Configuration(format!("{VARIABLE_NAME} must include a hostname"))
+    })?;
+    let ordinary_network_host = match parsed.host() {
+        Some(Host::Ipv4(_) | Host::Ipv6(_)) => !host.contains('%'),
+        Some(Host::Domain(domain)) => is_ordinary_dns_host(domain),
+        None => false,
+    };
+    if !ordinary_network_host || host.starts_with(['/', '\\']) {
+        return Err(FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must use an ordinary DNS or IP hostname, not an encoded or Unix-socket host"
+        )));
+    }
+    if parsed.username().is_empty() {
+        return Err(FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must include an explicit username"
+        )));
+    }
+    if parsed.password().is_none_or(str::is_empty) {
+        return Err(FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must include a nonempty explicit password"
+        )));
+    }
+    if parsed.port().is_none_or(|port| port == 0) {
+        return Err(FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must include an explicit nonzero numeric port"
+        )));
+    }
+    if parsed.path().trim_start_matches('/').is_empty() {
+        return Err(FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must include a nonempty database path"
+        )));
+    }
+
+    Ok(())
+}
+
+fn is_ordinary_dns_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 || host.contains('%') || !host.is_ascii() {
+        return false;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -697,6 +1114,14 @@ mod tests {
         "c2e5b0653471d35e54600a8d3fbe5613aff4c04e911787c09a25e2b327d4bbbd";
     const FIXTURE_RUNNER_CONFIGURATION_DIGEST: &str =
         "1d12aabe349fd0013389f93bf1917b0de6bbd5d2bd7156c85faff0b97360686d";
+    const FIXTURE_TARGET_TEST_RESULT_DIGEST: &str =
+        "e6783b2a018957a5861fe4e0670f55613d1ace35e381a6a9f5190ea9d7fbff8d";
+    const FIXTURE_TARGET_RUNNER_ARTIFACT_DIGEST: &str =
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+    const FIXTURE_TARGET_RUNNER_CONFIGURATION_DIGEST: &str =
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2";
+    const FIXTURE_GENESIS_KEY_BRIDGE_DIGEST: &str =
+        "e15309eba5118e21996a7cee6b3780c1a237982bdf4f22460bca4da189ef6592";
 
     fn deployment_scope() -> FleetScope {
         FleetScope::new(
@@ -1109,6 +1534,24 @@ mod tests {
     }
 
     #[test]
+    fn registry_activation_rejects_encoded_unix_socket_host_before_tls_acceptance() {
+        let mut values = registry_activation_values();
+        values.insert(
+            "FLEET_RECALL_REGISTRY_DATABASE_URL",
+            "postgresql://activation:secret@%2Fvar%2Frun%2Fpostgres/fleet_recall?sslmode=verify-full"
+                .into(),
+        );
+
+        let error = RegistryActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+            .expect_err("encoded Unix-socket routing must not satisfy strict TLS policy");
+        assert!(matches!(&error, FleetError::Configuration(_)));
+        assert!(
+            error.to_string().contains("encoded or Unix-socket host"),
+            "wrong encoded-host error: {error}"
+        );
+    }
+
+    #[test]
     fn registry_activation_authority_rejects_noncanonical_pins_and_ids() {
         let mut values = registry_activation_values();
         values.insert(
@@ -1127,5 +1570,456 @@ mod tests {
         assert!(
             RegistryActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned()).is_err()
         );
+    }
+
+    const SUCCESSOR_VARIABLES: [&str; 17] = [
+        "FLEET_RECALL_SUCCESSOR_DATABASE_URL",
+        "FLEET_RECALL_SUCCESSOR_TENANT_ID",
+        "FLEET_RECALL_SUCCESSOR_PROJECT",
+        "FLEET_RECALL_SUCCESSOR_TENANT_NAMESPACE",
+        "FLEET_RECALL_SUCCESSOR_PROJECT_NAMESPACE",
+        "FLEET_RECALL_SUCCESSOR_BOOTSTRAP_RECEIPT_DIGEST",
+        "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RESULT_DIGEST",
+        "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RUNNER_ARTIFACT_DIGEST",
+        "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RUNNER_CONFIGURATION_DIGEST",
+        "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RESULT_DIGEST",
+        "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RUNNER_ARTIFACT_DIGEST",
+        "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RUNNER_CONFIGURATION_DIGEST",
+        "FLEET_RECALL_SUCCESSOR_GENESIS_KEY_BRIDGE_DIGEST",
+        "FLEET_RECALL_SUCCESSOR_GENESIS_PROPOSER_PRINCIPAL_ID",
+        "FLEET_RECALL_SUCCESSOR_GENESIS_PACKAGE_AUTHOR_PRINCIPAL_ID",
+        "FLEET_RECALL_SUCCESSOR_PROPOSER_PRINCIPAL_ID",
+        "FLEET_RECALL_SUCCESSOR_PACKAGE_AUTHOR_PRINCIPAL_ID",
+    ];
+
+    fn successor_activation_values() -> BTreeMap<&'static str, String> {
+        BTreeMap::from([
+            (
+                "FLEET_RECALL_SUCCESSOR_DATABASE_URL",
+                "postgresql://successor:successor-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+                    .into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_TENANT_ID",
+                "0198a849-f6ae-7d61-9800-000000000001".into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_PROJECT",
+                "physical-project".into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_TENANT_NAMESPACE",
+                "tenant.authority".into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_PROJECT_NAMESPACE",
+                "project.authority".into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_BOOTSTRAP_RECEIPT_DIGEST",
+                FIXTURE_RECEIPT_DIGEST.into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RESULT_DIGEST",
+                FIXTURE_TEST_RESULT_DIGEST.into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RUNNER_ARTIFACT_DIGEST",
+                FIXTURE_RUNNER_ARTIFACT_DIGEST.into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RUNNER_CONFIGURATION_DIGEST",
+                FIXTURE_RUNNER_CONFIGURATION_DIGEST.into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RESULT_DIGEST",
+                FIXTURE_TARGET_TEST_RESULT_DIGEST.into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RUNNER_ARTIFACT_DIGEST",
+                FIXTURE_TARGET_RUNNER_ARTIFACT_DIGEST.into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RUNNER_CONFIGURATION_DIGEST",
+                FIXTURE_TARGET_RUNNER_CONFIGURATION_DIGEST.into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_GENESIS_KEY_BRIDGE_DIGEST",
+                FIXTURE_GENESIS_KEY_BRIDGE_DIGEST.into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_GENESIS_PROPOSER_PRINCIPAL_ID",
+                "principal.genesis_operator".into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_GENESIS_PACKAGE_AUTHOR_PRINCIPAL_ID",
+                "principal.genesis_author".into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_PROPOSER_PRINCIPAL_ID",
+                "principal.successor_operator".into(),
+            ),
+            (
+                "FLEET_RECALL_SUCCESSOR_PACKAGE_AUTHOR_PRINCIPAL_ID",
+                "principal.successor_author".into(),
+            ),
+        ])
+    }
+
+    fn successor_configuration_error(
+        values: &BTreeMap<&'static str, String>,
+        context: &str,
+    ) -> FleetError {
+        let error = SuccessorActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+            .expect_err(context);
+        assert!(
+            matches!(&error, FleetError::Configuration(_)),
+            "successor environment ingestion returned a non-configuration error: {error:?}"
+        );
+        error
+    }
+
+    #[test]
+    fn private_successor_activation_config_is_fully_bound() {
+        let values = successor_activation_values();
+        let config =
+            SuccessorActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+                .expect("private successor activation config");
+        let authority = config.authority();
+
+        assert_eq!(
+            authority.trusted_scope().tenant_id(),
+            Uuid::parse_str("0198a849-f6ae-7d61-9800-000000000001").unwrap()
+        );
+        assert_eq!(authority.trusted_scope().project(), "physical-project");
+        assert_eq!(
+            authority
+                .trusted_scope()
+                .semantic_scope()
+                .tenant_namespace
+                .as_str(),
+            "tenant.authority"
+        );
+        assert_eq!(
+            authority
+                .trusted_scope()
+                .semantic_scope()
+                .project_namespace
+                .as_str(),
+            "project.authority"
+        );
+        assert_eq!(
+            authority.bootstrap_receipt_digest().to_string(),
+            FIXTURE_RECEIPT_DIGEST
+        );
+        assert_eq!(
+            authority.bootstrap_pin(),
+            BootstrapPin::from_trusted_config(BootstrapReceiptDigest::from_digest(
+                parse_digest(FIXTURE_RECEIPT_DIGEST, "fixture").unwrap(),
+            ))
+        );
+        assert_eq!(
+            authority.genesis_test_runner_pin(),
+            RegistryTestRunnerPin::from_trusted_config(
+                parse_digest(FIXTURE_RUNNER_ARTIFACT_DIGEST, "fixture").unwrap(),
+                parse_digest(FIXTURE_RUNNER_CONFIGURATION_DIGEST, "fixture").unwrap(),
+                RegistryTestResultDigest::from_digest(
+                    parse_digest(FIXTURE_TEST_RESULT_DIGEST, "fixture").unwrap(),
+                ),
+            )
+        );
+        assert_eq!(
+            authority.target_test_runner_pin(),
+            SuccessorRegistryTestRunnerPin::from_trusted_config(
+                parse_digest(FIXTURE_TARGET_RUNNER_ARTIFACT_DIGEST, "fixture").unwrap(),
+                parse_digest(FIXTURE_TARGET_RUNNER_CONFIGURATION_DIGEST, "fixture",).unwrap(),
+                RegistryTestResultDigest::from_digest(
+                    parse_digest(FIXTURE_TARGET_TEST_RESULT_DIGEST, "fixture").unwrap(),
+                ),
+            )
+        );
+        assert_eq!(
+            authority.genesis_key_bridge_digest().to_string(),
+            FIXTURE_GENESIS_KEY_BRIDGE_DIGEST
+        );
+        assert_eq!(
+            authority.genesis_key_bridge_pin(),
+            GenesisSuccessorKeyBridgePin::from_trusted_config(
+                GenesisSuccessorKeyBridgeDigest::from_digest(
+                    parse_digest(FIXTURE_GENESIS_KEY_BRIDGE_DIGEST, "fixture").unwrap(),
+                ),
+            )
+        );
+        assert_eq!(
+            authority.genesis_principal_binding(),
+            GenesisActivationPrincipalBinding::from_trusted_config(
+                ContractId::new("principal.genesis_operator").unwrap(),
+                ContractId::new("principal.genesis_author").unwrap(),
+            )
+        );
+        assert_eq!(
+            authority.successor_principal_binding(),
+            SuccessorActivationPrincipalBinding::from_trusted_config(
+                ContractId::new("principal.successor_operator").unwrap(),
+                ContractId::new("principal.successor_author").unwrap(),
+            )
+        );
+        assert!(config.database_url().contains("successor-secret"));
+    }
+
+    #[test]
+    fn successor_activation_debug_redacts_credentials_pins_and_principals() {
+        let values = successor_activation_values();
+        let config =
+            SuccessorActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+                .unwrap();
+        let debug = format!("{config:?}");
+        for secret in [
+            config.database_url(),
+            "successor",
+            "successor-secret",
+            "cluster.example",
+            "fleet_recall",
+            FIXTURE_RECEIPT_DIGEST,
+            FIXTURE_TEST_RESULT_DIGEST,
+            FIXTURE_RUNNER_ARTIFACT_DIGEST,
+            FIXTURE_RUNNER_CONFIGURATION_DIGEST,
+            FIXTURE_TARGET_TEST_RESULT_DIGEST,
+            FIXTURE_TARGET_RUNNER_ARTIFACT_DIGEST,
+            FIXTURE_TARGET_RUNNER_CONFIGURATION_DIGEST,
+            FIXTURE_GENESIS_KEY_BRIDGE_DIGEST,
+            "principal.genesis_operator",
+            "principal.genesis_author",
+            "principal.successor_operator",
+            "principal.successor_author",
+        ] {
+            assert!(!debug.contains(secret), "debug exposed {secret}");
+        }
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("<bound>"));
+    }
+
+    #[test]
+    fn successor_activation_requires_every_exact_namespaced_variable() {
+        for missing in SUCCESSOR_VARIABLES {
+            let mut values = successor_activation_values();
+            values.remove(missing);
+            let error = successor_configuration_error(
+                &values,
+                "every exact successor variable must be required",
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{missing} is required")),
+                "wrong error for {missing}: {error}"
+            );
+        }
+
+        let values = successor_activation_values();
+        let mut requested = Vec::new();
+        SuccessorActivationRuntimeConfig::from_lookup(|name| {
+            assert!(
+                SUCCESSOR_VARIABLES.contains(&name),
+                "looked up an unrelated or fallback variable {name}"
+            );
+            requested.push(name.to_owned());
+            values.get(name).cloned()
+        })
+        .unwrap();
+        assert_eq!(requested, SUCCESSOR_VARIABLES);
+        assert!(
+            requested
+                .iter()
+                .all(|name| name.starts_with("FLEET_RECALL_SUCCESSOR_"))
+        );
+    }
+
+    #[test]
+    fn successor_activation_has_no_legacy_or_generic_fallbacks() {
+        let mut values = successor_activation_values();
+        values.remove("FLEET_RECALL_SUCCESSOR_DATABASE_URL");
+        values.insert(
+            "FLEET_RECALL_DATABASE_URL",
+            "postgresql://serving:wrong@cluster.example/fleet?sslmode=verify-full".into(),
+        );
+        values.insert(
+            "FLEET_RECALL_CONTROL_DATABASE_URL",
+            "postgresql://bootstrap:wrong@cluster.example/fleet?sslmode=verify-full".into(),
+        );
+        values.insert(
+            "FLEET_RECALL_REGISTRY_DATABASE_URL",
+            "postgresql://genesis:wrong@cluster.example/fleet?sslmode=verify-full".into(),
+        );
+        let error =
+            successor_configuration_error(&values, "successor database must never fall back");
+        assert!(
+            error
+                .to_string()
+                .contains("FLEET_RECALL_SUCCESSOR_DATABASE_URL is required")
+        );
+
+        let mut values = successor_activation_values();
+        values.remove("FLEET_RECALL_SUCCESSOR_GENESIS_KEY_BRIDGE_DIGEST");
+        values.insert(
+            "FLEET_RECALL_SUCCESSOR_BRIDGE_DIGEST",
+            FIXTURE_GENESIS_KEY_BRIDGE_DIGEST.into(),
+        );
+        let error = successor_configuration_error(
+            &values,
+            "generic bridge alias must not supply authority",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("FLEET_RECALL_SUCCESSOR_GENESIS_KEY_BRIDGE_DIGEST is required")
+        );
+    }
+
+    #[test]
+    fn successor_activation_rejects_noncanonical_digests_ids_and_scope() {
+        for name in [
+            "FLEET_RECALL_SUCCESSOR_BOOTSTRAP_RECEIPT_DIGEST",
+            "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RESULT_DIGEST",
+            "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RUNNER_ARTIFACT_DIGEST",
+            "FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RUNNER_CONFIGURATION_DIGEST",
+            "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RESULT_DIGEST",
+            "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RUNNER_ARTIFACT_DIGEST",
+            "FLEET_RECALL_SUCCESSOR_TARGET_TEST_RUNNER_CONFIGURATION_DIGEST",
+            "FLEET_RECALL_SUCCESSOR_GENESIS_KEY_BRIDGE_DIGEST",
+        ] {
+            let mut values = successor_activation_values();
+            let noncanonical = values.get(name).unwrap().to_ascii_uppercase();
+            values.insert(name, noncanonical);
+            successor_configuration_error(&values, &format!("accepted noncanonical {name}"));
+        }
+
+        for name in [
+            "FLEET_RECALL_SUCCESSOR_TENANT_NAMESPACE",
+            "FLEET_RECALL_SUCCESSOR_PROJECT_NAMESPACE",
+            "FLEET_RECALL_SUCCESSOR_GENESIS_PROPOSER_PRINCIPAL_ID",
+            "FLEET_RECALL_SUCCESSOR_GENESIS_PACKAGE_AUTHOR_PRINCIPAL_ID",
+            "FLEET_RECALL_SUCCESSOR_PROPOSER_PRINCIPAL_ID",
+            "FLEET_RECALL_SUCCESSOR_PACKAGE_AUTHOR_PRINCIPAL_ID",
+        ] {
+            let mut values = successor_activation_values();
+            values.insert(name, "Principal.Invalid".into());
+            successor_configuration_error(&values, &format!("accepted noncanonical {name}"));
+        }
+
+        for (name, value) in [
+            ("FLEET_RECALL_SUCCESSOR_TENANT_ID", "not-a-uuid"),
+            (
+                "FLEET_RECALL_SUCCESSOR_TENANT_ID",
+                "00000000-0000-0000-0000-000000000000",
+            ),
+            ("FLEET_RECALL_SUCCESSOR_PROJECT", " physical-project "),
+        ] {
+            let mut values = successor_activation_values();
+            values.insert(name, value.into());
+            successor_configuration_error(
+                &values,
+                &format!("accepted invalid physical scope {name}"),
+            );
+        }
+    }
+
+    #[test]
+    fn successor_activation_database_url_accepts_only_strict_tls_parameters() {
+        let mut values = successor_activation_values();
+        values.insert(
+            "FLEET_RECALL_SUCCESSOR_DATABASE_URL",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&sslrootcert=%2Fetc%2Fssl%2Fcerts%2Fca.pem".into(),
+        );
+        assert!(
+            SuccessorActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned()).is_ok()
+        );
+
+        for url in [
+            "https://successor:secret@cluster.example:26257/fleet?sslmode=verify-full",
+            "cockroachdb://successor:secret@cluster.example:26257/fleet?sslmode=verify-full",
+            "postgresql:///fleet?sslmode=verify-full",
+            "postgresql://successor:secret@cluster.example:26257/fleet",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=require",
+            "postgresql://successor:secret@127.0.0.1:26257/fleet?sslmode=disable",
+            "postgresql://successor:secret@cluster.example:26257/fleet?ssl-mode=verify-full",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&ssl-root-cert=/tmp/ca.pem",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&sslmode=disable",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&sslrootcert=/tmp/one.pem&sslrootcert=/tmp/two.pem",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&sslrootcert=relative.pem",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&host=attacker.example",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&hostaddr=127.0.0.1",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&options=-csearch_path%3Dattacker",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&user=other",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&port=5432",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&application_name=other",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&unknown=value",
+            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full#ignored",
+        ] {
+            let mut values = successor_activation_values();
+            values.insert("FLEET_RECALL_SUCCESSOR_DATABASE_URL", url.into());
+            successor_configuration_error(&values, &format!("accepted unsafe successor URL {url}"));
+        }
+    }
+
+    #[test]
+    fn successor_activation_database_url_requires_explicit_connection_identity() {
+        for url in [
+            "postgresql://:secret@cluster.example:26257/fleet?sslmode=verify-full",
+            "postgresql://successor@cluster.example:26257/fleet?sslmode=verify-full",
+            "postgresql://successor:@cluster.example:26257/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@cluster.example/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@cluster.example:0/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@cluster.example:26257?sslmode=verify-full",
+            "postgresql://successor:secret@cluster.example:26257/?sslmode=verify-full",
+            "postgresql://successor:secret@cluster.example:26257//?sslmode=verify-full",
+            "postgresql://successor:secret@cluster.example:26257///?sslmode=verify-full",
+        ] {
+            let mut values = successor_activation_values();
+            values.insert("FLEET_RECALL_SUCCESSOR_DATABASE_URL", url.into());
+            successor_configuration_error(
+                &values,
+                &format!("accepted URL with implicit connection identity {url}"),
+            );
+        }
+    }
+
+    #[test]
+    fn successor_activation_rejects_encoded_unix_socket_and_non_dns_hosts() {
+        for url in [
+            "postgresql://successor:secret@%2Fvar%2Frun%2Fpostgres/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@%2Fvar%2Frun%2Fpostgres:26257/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@%2fvar%2frun%2fpostgres:26257/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@%252Fvar%252Frun%252Fpostgres:26257/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@%5C%5Cserver%5Csocket:26257/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@bad_host.example:26257/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@-bad.example:26257/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@bad..example:26257/fleet?sslmode=verify-full",
+        ] {
+            let mut values = successor_activation_values();
+            values.insert("FLEET_RECALL_SUCCESSOR_DATABASE_URL", url.into());
+            let error = successor_configuration_error(
+                &values,
+                &format!("accepted encoded, socket, or non-DNS host {url}"),
+            );
+            assert!(
+                error.to_string().contains("ordinary DNS or IP hostname")
+                    || error.to_string().contains("encoded or Unix-socket host"),
+                "wrong closed-host error for {url}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn successor_activation_allows_network_ips_only_with_verify_full() {
+        for url in [
+            "postgresql://successor:secret@127.0.0.1:26257/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@[::1]:26257/fleet?sslmode=verify-full",
+        ] {
+            let mut values = successor_activation_values();
+            values.insert("FLEET_RECALL_SUCCESSOR_DATABASE_URL", url.into());
+            SuccessorActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+                .unwrap_or_else(|error| panic!("rejected strict-TLS network IP {url}: {error}"));
+        }
     }
 }
