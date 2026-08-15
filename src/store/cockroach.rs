@@ -19,8 +19,8 @@ use ostk_recall_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::migrate::{Migration, MigrationType, Migrator};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
+use sqlx::migrate::{Migrate, MigrateError, Migration, MigrationType, Migrator};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions, PgRow};
 use sqlx::{ConnectOptions, PgPool, Postgres, Row, Transaction};
 
 /// Embedding width used by Recall's `minishlab/potion-retrieval-32M` model.
@@ -62,8 +62,58 @@ const CONTROL_HEAD_EXPLICIT_ADVANCE_TIME_MIGRATION_SQL: &str =
     include_str!("../../migrations/0008_control_head_explicit_advance_time.sql");
 const CONTROL_EVENT_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL: &str =
     include_str!("../../migrations/0009_control_event_explicit_acceptance_time.sql");
+const REGISTRY_GENESIS_HEAD_ROOT_INDEX_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0010_registry_genesis_head_root_index.sql");
+const REGISTRY_GENESIS_ACTIVATION_ROOT_INDEX_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0011_registry_genesis_activation_root_index.sql");
+const REGISTRY_TRANSITION_HISTORY_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0012_registry_transition_history.sql");
+const REGISTRY_GENESIS_BRIDGE_CONSUMPTION_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0013_registry_genesis_bridge_consumption.sql");
+const REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0014_registry_current_head_v2.sql");
 
-fn embedded_migrator() -> Migrator {
+fn successor_transition_migrations() -> [Migration; 5] {
+    [
+        Migration::new(
+            10,
+            Cow::Borrowed("exact genesis registry-head root index"),
+            MigrationType::Simple,
+            Cow::Borrowed(REGISTRY_GENESIS_HEAD_ROOT_INDEX_MIGRATION_SQL),
+            true,
+        ),
+        Migration::new(
+            11,
+            Cow::Borrowed("exact genesis registry-activation root index"),
+            MigrationType::Simple,
+            Cow::Borrowed(REGISTRY_GENESIS_ACTIVATION_ROOT_INDEX_MIGRATION_SQL),
+            true,
+        ),
+        Migration::new(
+            12,
+            Cow::Borrowed("append-only registry transition history"),
+            MigrationType::Simple,
+            Cow::Borrowed(REGISTRY_TRANSITION_HISTORY_MIGRATION_SQL),
+            false,
+        ),
+        Migration::new(
+            13,
+            Cow::Borrowed("one-shot genesis bridge consumption"),
+            MigrationType::Simple,
+            Cow::Borrowed(REGISTRY_GENESIS_BRIDGE_CONSUMPTION_MIGRATION_SQL),
+            false,
+        ),
+        Migration::new(
+            14,
+            Cow::Borrowed("successor registry current head"),
+            MigrationType::Simple,
+            Cow::Borrowed(REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL),
+            false,
+        ),
+    ]
+}
+
+fn base_embedded_migrator() -> Migrator {
     Migrator {
         migrations: Cow::Owned(vec![
             Migration::new(
@@ -149,6 +199,57 @@ fn embedded_migrator() -> Migrator {
         locking: false,
         no_tx: true,
     }
+}
+
+fn embedded_migrator() -> Migrator {
+    let mut migrator = base_embedded_migrator();
+    migrator
+        .migrations
+        .to_mut()
+        .extend(successor_transition_migrations());
+    migrator
+}
+
+fn pre_transactional_embedded_migrator() -> Migrator {
+    let mut migrator = base_embedded_migrator();
+    migrator.migrations.to_mut().extend(
+        successor_transition_migrations()
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut migration)| {
+                // Recognize applied versions 12-14 during fail-closed history
+                // validation, but leave them for the transactional phase.
+                if index >= 2 {
+                    migration.migration_type = MigrationType::ReversibleDown;
+                }
+                migration
+            }),
+    );
+    migrator
+}
+
+async fn validate_embedded_migration_history(connection: &mut PgConnection) -> Result<()> {
+    connection.ensure_migrations_table().await?;
+    if let Some(version) = connection.dirty_version().await? {
+        return Err(MigrateError::Dirty(version).into());
+    }
+
+    let applied = connection.list_applied_migrations().await?;
+    let embedded = embedded_migrator();
+    let expected = embedded
+        .migrations
+        .iter()
+        .map(|migration| (migration.version, migration))
+        .collect::<HashMap<_, _>>();
+    for applied_migration in applied {
+        let Some(expected_migration) = expected.get(&applied_migration.version) else {
+            return Err(MigrateError::VersionMissing(applied_migration.version).into());
+        };
+        if expected_migration.checksum.as_ref() != applied_migration.checksum.as_ref() {
+            return Err(MigrateError::VersionMismatch(applied_migration.version).into());
+        }
+    }
+    Ok(())
 }
 
 /// Maximum ANN candidates examined before applying a time-range filter.
@@ -563,8 +664,36 @@ impl CockroachStore {
     pub async fn migrate(&self) -> Result<()> {
         // Constructing the migration from `include_str!` keeps deployment
         // single-binary without enabling SQLx's unrelated query macros.
-        embedded_migrator().run(&self.pool).await?;
-        Ok(())
+        // CockroachDB defaults `autocommit_before_ddl` to true, which would
+        // commit a CREATE TABLE before SQLx inserts the matching migration
+        // history row even though SQLx opened a transaction. Versions 1-11
+        // require that default for online/legacy schema changes; versions 12+
+        // require it disabled for genuinely atomic DDL plus bookkeeping.
+        let mut connection = self.pool.acquire().await?;
+        let migration_result: Result<()> = async {
+            sqlx::query("SET autocommit_before_ddl = true")
+                .execute(connection.as_mut())
+                .await?;
+            validate_embedded_migration_history(connection.as_mut()).await?;
+            pre_transactional_embedded_migrator()
+                .run(connection.as_mut())
+                .await?;
+            sqlx::query("SET autocommit_before_ddl = false")
+                .execute(connection.as_mut())
+                .await?;
+            embedded_migrator().run(connection.as_mut()).await?;
+            Ok(())
+        }
+        .await;
+
+        // Do not return a session with the transactional-DDL override to the
+        // shared pool. If close itself fails, retain any primary migration
+        // failure because it carries the actionable schema/version evidence.
+        let close_result = connection.close().await.map_err(FleetError::from);
+        match migration_result {
+            Err(error) => Err(error),
+            Ok(()) => close_result,
+        }
     }
 
     /// Initialize or verify the immutable embedding generation for this
@@ -1848,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_migration_history_one_through_four_is_byte_immutable() {
+    fn committed_migration_history_one_through_fourteen_is_byte_immutable() {
         for (migration, expected_sha256) in [
             (
                 INITIAL_MIGRATION_SQL,
@@ -1865,6 +1994,46 @@ mod tests {
             (
                 GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL,
                 "631cfca494f9b16631738acd237b3990095641c04c6bfb4eaf922df5d6cae75c",
+            ),
+            (
+                CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL,
+                "edba0f35853283b2c1d8c0513afb41d7176270d9f61de12d6665adfb087fdd51",
+            ),
+            (
+                CONTROL_BOOTSTRAP_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
+                "7da6ee8bc1e32c0fce8773b4bec750f90a07ca24ae565d9a862a9563540358e6",
+            ),
+            (
+                CONTROL_EPOCH_EXPLICIT_CREATION_TIME_MIGRATION_SQL,
+                "1039393df1722688a14cb37814f3b0f4bf49829415ca929dff83a7e9ad74a71e",
+            ),
+            (
+                CONTROL_HEAD_EXPLICIT_ADVANCE_TIME_MIGRATION_SQL,
+                "904893672a282c2cb43ae2da1bbca3f536916f86326eea6814e6107ba8e44faa",
+            ),
+            (
+                CONTROL_EVENT_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
+                "c2188da4eb821a748e403def9178500f81e74098a9030c06e49b6e5c212107e8",
+            ),
+            (
+                REGISTRY_GENESIS_HEAD_ROOT_INDEX_MIGRATION_SQL,
+                "f7175b6ccbc53cb1c2464e272d9b9e737a3f12dddb5f1e9aa52f7f26fd82743d",
+            ),
+            (
+                REGISTRY_GENESIS_ACTIVATION_ROOT_INDEX_MIGRATION_SQL,
+                "7cc8007d9064e11a6f1c977b1cc64dfbe993107d8378676802e346fc5118e2bd",
+            ),
+            (
+                REGISTRY_TRANSITION_HISTORY_MIGRATION_SQL,
+                "a4355a1a0949a60722aa50a5cbb733cdcb7242d637d3f461e8195aca57dedf67",
+            ),
+            (
+                REGISTRY_GENESIS_BRIDGE_CONSUMPTION_MIGRATION_SQL,
+                "e18ad0e1ae1f068b39eabe198e359253fe4826f74929fe35daa4539e42e1f60f",
+            ),
+            (
+                REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL,
+                "87f92385b350352de665642c80a9e0008dc3e129c287718e346d3c525023357d",
             ),
         ] {
             assert_eq!(format!("{:x}", Sha256::digest(migration)), expected_sha256);
@@ -2081,8 +2250,198 @@ mod tests {
         }
     }
 
+    fn assert_transactional_single_additive_schema_change(migration: &str) {
+        assert!(!migration.starts_with("-- no-transaction\n"));
+        let sql = migration
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(sql.matches(';').count(), 1);
+        assert_eq!(sql.matches("CREATE ").count(), 1);
+        let uppercase = sql.to_ascii_uppercase();
+        for forbidden in [
+            "IF NOT EXISTS",
+            "INSERT ",
+            "UPDATE ",
+            "DELETE ",
+            "ALTER ",
+            "DROP ",
+            "GRANT ",
+            "REVOKE ",
+        ] {
+            assert!(!uppercase.contains(forbidden));
+        }
+    }
+
+    fn assert_resumable_exact_index_migration(migration: &str, table_name: &str, index_name: &str) {
+        assert!(migration.starts_with("-- no-transaction\n"));
+        let sql = migration
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let create = format!("CREATE UNIQUE INDEX IF NOT EXISTS {index_name}");
+        assert_eq!(
+            sql.lines().filter(|line| line.starts_with(&create)).count(),
+            1
+        );
+        assert_eq!(sql.matches("DO $$").count(), 1);
+        assert_eq!(sql.matches("COMMIT;").count(), 1);
+        assert_eq!(sql.matches("FROM pg_catalog.pg_indexes").count(), 1);
+        assert!(sql.find(&create).unwrap() < sql.find("DO $$").unwrap());
+        assert!(sql.find(&create).unwrap() < sql.find("COMMIT;").unwrap());
+        assert!(sql.find("COMMIT;").unwrap() < sql.find("DO $$").unwrap());
+        assert!(sql.contains("current_database()"));
+        assert!(sql.contains(&format!("tablename = '{table_name}'")));
+        assert!(sql.contains(&format!("indexname = '{index_name}'")));
+        assert!(sql.contains("IF exact_index IS DISTINCT FROM true THEN"));
+        assert!(sql.contains("ERRCODE = '55000'"));
+        assert!(sql.contains("catalog shape mismatch"));
+        let uppercase = sql.to_ascii_uppercase();
+        for forbidden in [
+            "INSERT ", "UPDATE ", "DELETE ", "ALTER ", "DROP ", "GRANT ", "REVOKE ",
+        ] {
+            assert!(!uppercase.contains(forbidden));
+        }
+    }
+
+    fn assert_exact_genesis_root_indexes() {
+        assert!(
+            REGISTRY_GENESIS_HEAD_ROOT_INDEX_MIGRATION_SQL.contains(
+                "CREATE UNIQUE INDEX IF NOT EXISTS memory_registry_heads_genesis_root_idx"
+            )
+        );
+        assert!(REGISTRY_GENESIS_HEAD_ROOT_INDEX_MIGRATION_SQL.contains(
+            "source_event_id,\n        source_epoch_id,\n        source_shard,\n        source_committed_offset,\n        activated_at"
+        ));
+        assert!(
+            REGISTRY_GENESIS_ACTIVATION_ROOT_INDEX_MIGRATION_SQL.contains(
+                "CREATE UNIQUE INDEX IF NOT EXISTS memory_registry_activations_genesis_root_idx"
+            )
+        );
+        assert!(REGISTRY_GENESIS_ACTIVATION_ROOT_INDEX_MIGRATION_SQL.contains(
+            "profile_id,\n        profile_digest,\n        vector_manifest_digest,\n        contract_tenant_namespace,\n        contract_project_namespace,\n        effective_from"
+        ));
+    }
+
+    fn assert_transition_history_schema() {
+        let transitions = REGISTRY_TRANSITION_HISTORY_MIGRATION_SQL;
+        assert_eq!(transitions.matches("CREATE TABLE ").count(), 1);
+        assert!(transitions.contains("CREATE TABLE memory_registry_transitions"));
+        assert!(transitions.contains("OPEN-HEAD-ONLY SCHEMA CONTRACT"));
+        assert!(transitions.contains("canonical RegistryHeadBindingV1 preimage"));
+        assert!(transitions.contains("never byte-copy the narrower legacy canonical_head"));
+        assert!(
+            GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL.contains("CHECK (effective_until IS NULL)")
+        );
+        let transition_sql = transitions
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!transition_sql.contains("effective_until"));
+        assert!(transitions.contains("PRIMARY KEY (tenant_id, project, generation)"));
+        for exact_anchor in [
+            "memory_registry_transition_genesis_head_fk",
+            "REFERENCES memory_registry_heads",
+            "memory_registry_transition_genesis_activation_fk",
+            "REFERENCES memory_registry_activations",
+            "memory_registry_transition_control_source_fk",
+            "REFERENCES memory_control_events",
+            "memory_registry_transition_predecessor_fk",
+            "REFERENCES memory_registry_transitions",
+        ] {
+            assert!(transitions.contains(exact_anchor));
+        }
+        assert!(transitions.contains("generation = 0"));
+        assert!(transitions.contains("package_digest = root_package_digest"));
+        assert!(transitions.contains("predecessor_generation IS NULL"));
+        assert!(transitions.contains("predecessor_generation = generation - 1"));
+        for required_predecessor in [
+            "predecessor_generation",
+            "predecessor_activation_id",
+            "predecessor_package_digest",
+            "predecessor_activation_policy_digest",
+            "predecessor_profile_id",
+            "predecessor_profile_digest",
+            "predecessor_vector_manifest_digest",
+            "predecessor_contract_tenant_namespace",
+            "predecessor_contract_project_namespace",
+            "predecessor_effective_from",
+            "predecessor_accepted_at",
+            "predecessor_source_event_id",
+            "predecessor_source_epoch_id",
+            "predecessor_source_shard",
+            "predecessor_source_committed_offset",
+        ] {
+            assert!(transitions.contains(&format!("{required_predecessor} IS NOT NULL")));
+        }
+        assert!(transitions.contains("predecessor_source_committed_offset > 0"));
+        assert!(transitions.contains("profile_digest = root_profile_digest"));
+        assert!(
+            transitions.contains("contract_project_namespace = root_contract_project_namespace")
+        );
+        assert_eq!(transitions.matches("BETWEEN 1 AND 1048576").count(), 7);
+        assert!(!transitions.contains(" DEFAULT "));
+    }
+
+    fn assert_bridge_and_current_head_schemas() {
+        let bridge = REGISTRY_GENESIS_BRIDGE_CONSUMPTION_MIGRATION_SQL;
+        assert_eq!(bridge.matches("CREATE TABLE ").count(), 1);
+        assert!(bridge.contains("PRIMARY KEY (tenant_id, project)"));
+        assert_eq!(
+            bridge
+                .matches("REFERENCES memory_registry_transitions")
+                .count(),
+            2
+        );
+        assert!(bridge.contains("CHECK (from_generation = 0 AND to_generation = 1)"));
+        assert!(bridge.contains("OPEN-HEAD-ONLY SCHEMA"));
+        assert!(bridge.contains("consumed_at = successor_accepted_at"));
+        assert!(bridge.contains("octet_length(canonical_bridge) BETWEEN 1 AND 1048576"));
+        assert!(!bridge.contains(" DEFAULT "));
+
+        let current_head = REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL;
+        assert_eq!(current_head.matches("CREATE TABLE ").count(), 1);
+        assert!(current_head.contains("CREATE TABLE memory_registry_current_heads_v2"));
+        assert!(current_head.contains("OPEN-HEAD-ONLY SCHEMA CONTRACT"));
+        assert!(current_head.contains("exact canonical RegistryHeadBindingV1 preimage"));
+        assert!(current_head.contains("never the narrower legacy RegistryHeadV1 bytes"));
+        assert!(current_head.contains("PRIMARY KEY (tenant_id, project)"));
+        assert!(current_head.contains("memory_registry_current_head_transition_fk"));
+        assert!(current_head.contains("REFERENCES memory_registry_transitions"));
+        assert!(current_head.contains("CHECK (head_state = 'active')"));
+        assert!(current_head.contains("octet_length(canonical_head) BETWEEN 1 AND 1048576"));
+        assert!(!current_head.contains(" DEFAULT "));
+    }
+
     #[test]
-    fn embedded_migrator_registers_private_ledgers_as_no_transaction_versions_three_through_nine() {
+    fn successor_transition_migrations_use_recoverable_transaction_policy() {
+        assert_resumable_exact_index_migration(
+            REGISTRY_GENESIS_HEAD_ROOT_INDEX_MIGRATION_SQL,
+            "memory_registry_heads",
+            "memory_registry_heads_genesis_root_idx",
+        );
+        assert_resumable_exact_index_migration(
+            REGISTRY_GENESIS_ACTIVATION_ROOT_INDEX_MIGRATION_SQL,
+            "memory_registry_activations",
+            "memory_registry_activations_genesis_root_idx",
+        );
+        for migration in [
+            REGISTRY_TRANSITION_HISTORY_MIGRATION_SQL,
+            REGISTRY_GENESIS_BRIDGE_CONSUMPTION_MIGRATION_SQL,
+            REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL,
+        ] {
+            assert_transactional_single_additive_schema_change(migration);
+        }
+        assert_exact_genesis_root_indexes();
+        assert_transition_history_schema();
+        assert_bridge_and_current_head_schemas();
+    }
+
+    #[test]
+    fn embedded_migrator_registers_mixed_transaction_policy_through_fourteen() {
         let migrator = embedded_migrator();
         assert_eq!(
             migrator
@@ -2090,7 +2449,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         );
         let control_ledger = migrator
             .migrations
@@ -2112,12 +2471,29 @@ mod tests {
             GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL
         );
         assert!(registry_activation.no_tx);
-        for (version, sql) in [
-            (5, CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL),
-            (6, CONTROL_BOOTSTRAP_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL),
-            (7, CONTROL_EPOCH_EXPLICIT_CREATION_TIME_MIGRATION_SQL),
-            (8, CONTROL_HEAD_EXPLICIT_ADVANCE_TIME_MIGRATION_SQL),
-            (9, CONTROL_EVENT_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL),
+        for (version, sql, expected_no_tx) in [
+            (5, CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL, true),
+            (
+                6,
+                CONTROL_BOOTSTRAP_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
+                true,
+            ),
+            (7, CONTROL_EPOCH_EXPLICIT_CREATION_TIME_MIGRATION_SQL, true),
+            (8, CONTROL_HEAD_EXPLICIT_ADVANCE_TIME_MIGRATION_SQL, true),
+            (
+                9,
+                CONTROL_EVENT_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
+                true,
+            ),
+            (10, REGISTRY_GENESIS_HEAD_ROOT_INDEX_MIGRATION_SQL, true),
+            (
+                11,
+                REGISTRY_GENESIS_ACTIVATION_ROOT_INDEX_MIGRATION_SQL,
+                true,
+            ),
+            (12, REGISTRY_TRANSITION_HISTORY_MIGRATION_SQL, false),
+            (13, REGISTRY_GENESIS_BRIDGE_CONSUMPTION_MIGRATION_SQL, false),
+            (14, REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL, false),
         ] {
             let migration = migrator
                 .migrations
@@ -2125,10 +2501,96 @@ mod tests {
                 .find(|migration| migration.version == version)
                 .unwrap();
             assert_eq!(migration.sql.as_ref(), sql);
-            assert!(migration.no_tx);
+            assert_eq!(migration.no_tx, expected_no_tx);
         }
         assert!(migrator.no_tx);
         assert!(!migrator.locking);
+
+        let pre_transactional = pre_transactional_embedded_migrator();
+        assert!(!pre_transactional.ignore_missing);
+        assert_eq!(
+            pre_transactional
+                .migrations
+                .iter()
+                .map(|migration| migration.version)
+                .collect::<Vec<_>>(),
+            (1..=14).collect::<Vec<_>>()
+        );
+        for version in 10..=14 {
+            let migration = pre_transactional
+                .migrations
+                .iter()
+                .find(|migration| migration.version == version)
+                .unwrap();
+            let expected_type = if version <= 11 {
+                MigrationType::Simple
+            } else {
+                MigrationType::ReversibleDown
+            };
+            assert_eq!(migration.migration_type, expected_type);
+        }
+    }
+
+    /// `SQLx` must commit each transactional successor table and its migration
+    /// history row together. Reusing version 14 forces the history insert to
+    /// fail after the probe DDL has executed and proves the DDL is rolled back.
+    #[tokio::test]
+    async fn live_transactional_migration_rolls_back_ddl_on_history_conflict_when_configured() {
+        let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _live_database_guard = LIVE_DATABASE_TEST_LOCK.lock().await;
+        let store = CockroachStore::connect(
+            &database_url,
+            scope("live-migration-atomicity-test"),
+            PoolConfig::default(),
+        )
+        .await
+        .unwrap();
+        store.migrate().await.unwrap();
+        let pooled_default: bool =
+            sqlx::query_scalar("SELECT current_setting('autocommit_before_ddl')::BOOL")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert!(pooled_default);
+
+        let probe_table = format!(
+            "successor_transaction_rollback_probe_{}",
+            Uuid::now_v7().to_string().replace('-', "")
+        );
+        let probe_sql = format!("CREATE TABLE {probe_table} (id INT8 PRIMARY KEY)");
+        let migration = Migration::new(
+            14,
+            Cow::Borrowed("forced successor history conflict"),
+            MigrationType::Simple,
+            Cow::Owned(probe_sql),
+            false,
+        );
+        let mut connection = store.pool().acquire().await.unwrap();
+        sqlx::query("SET autocommit_before_ddl = false")
+            .execute(connection.as_mut())
+            .await
+            .unwrap();
+        let error = connection.as_mut().apply(&migration).await.unwrap_err();
+        assert!(error.to_string().contains("duplicate key"));
+
+        let object_count: i64 = sqlx::query_scalar(
+            "SELECT count(*)::INT8 FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_name = $1",
+        )
+        .bind(&probe_table)
+        .fetch_one(connection.as_mut())
+        .await
+        .unwrap();
+        let history_count: i64 =
+            sqlx::query_scalar("SELECT count(*)::INT8 FROM _sqlx_migrations WHERE version = 14")
+                .fetch_one(connection.as_mut())
+                .await
+                .unwrap();
+        assert_eq!(object_count, 0);
+        assert_eq!(history_count, 1);
+        connection.close().await.unwrap();
     }
 
     /// Set `FLEET_RECALL_TEST_DATABASE_URL` to a disposable `CockroachDB` 26.2
