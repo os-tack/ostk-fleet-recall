@@ -7,6 +7,7 @@
 pub mod bootstrap;
 pub mod canonical;
 pub mod common;
+pub mod control;
 pub mod digest;
 pub mod error;
 pub mod evidence;
