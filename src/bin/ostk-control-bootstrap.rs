@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context as _, ensure};
+use anyhow::{Context as _, anyhow, ensure};
 use clap::{Args, Parser, Subcommand};
 use ostk_fleet_recall::config::ControlBootstrapRuntimeConfig;
 use ostk_fleet_recall::control_log::{
@@ -27,9 +27,10 @@ use ostk_fleet_recall::memory_contracts::common::frozen_profile_reference_v1;
 use ostk_fleet_recall::memory_contracts::digest::{DigestDomain, domain_separated_digest};
 use ostk_fleet_recall::memory_contracts::genesis::SemanticallyClosedGenesisPackage;
 use ostk_fleet_recall::memory_contracts::registry::ManifestVerifiedRegistryPackage;
+use ostk_fleet_recall::private_postgres::private_postgres_connect_options;
 use ostk_fleet_recall::store::cockroach::RetryPolicy;
 use serde_json::{Value, json};
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::postgres::{PgPool, PgPoolOptions};
 
 const MAX_CONNECTIONS: u32 = 2;
 const REQUIRED_SCHEMA_VERSION: i64 = 3;
@@ -105,23 +106,27 @@ async fn main() -> anyhow::Result<()> {
         &package,
     )?;
 
-    let options: PgConnectOptions = config
-        .database_url()
-        .parse()
-        .context("invalid bootstrap database URL")?;
+    let options = private_postgres_connect_options(
+        config.database_url(),
+        "ostk-control-bootstrap",
+        config.database_ssl_policy(),
+    )?;
     let pool = PgPoolOptions::new()
         .max_connections(MAX_CONNECTIONS)
         .min_connections(0)
         .acquire_timeout(Duration::from_secs(10))
-        .connect_with(options.application_name("ostk-control-bootstrap"))
-        .await
-        .context("connect private control bootstrap database")?;
-    require_control_schema(&pool).await?;
+        .connect_lazy_with(options);
     let repository = CockroachGenesisRepository::new(
-        pool,
+        pool.clone(),
         authority.trusted_scope().clone(),
         RetryPolicy::default(),
     );
+    let connection = pool
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("connect private control bootstrap database failed"))?;
+    drop(connection);
+    require_control_schema(&pool).await?;
 
     let output = match cli.command {
         Command::Apply(_) => match repository.bootstrap_genesis(&verified, &package).await? {

@@ -15,6 +15,7 @@ pub mod error;
 pub mod ledger;
 pub mod mcp;
 pub mod memory_contracts;
+pub mod private_postgres;
 pub mod reference_agent;
 pub mod registry_activation;
 pub mod service;

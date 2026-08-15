@@ -22,6 +22,7 @@ use crate::memory_contracts::successor_activation::{
 use crate::memory_contracts::successor_policy::{
     GenesisSuccessorKeyBridgeDigest, GenesisSuccessorKeyBridgePin,
 };
+use crate::private_postgres::PrivatePostgresSslPolicy;
 use crate::{FleetError, FleetScope, Result};
 
 /// Deployment-only authority needed by the private control-ledger bootstrap.
@@ -71,6 +72,7 @@ impl ControlBootstrapConfig {
 #[derive(Clone)]
 pub struct ControlBootstrapRuntimeConfig {
     database_url: String,
+    database_ssl_policy: PrivatePostgresSslPolicy,
     authority: ControlBootstrapConfig,
 }
 
@@ -79,6 +81,7 @@ impl std::fmt::Debug for ControlBootstrapRuntimeConfig {
         formatter
             .debug_struct("ControlBootstrapRuntimeConfig")
             .field("database_url", &"<redacted>")
+            .field("database_ssl_policy", &self.database_ssl_policy)
             .field("authority", &self.authority)
             .finish()
     }
@@ -101,6 +104,11 @@ impl ControlBootstrapRuntimeConfig {
     #[must_use]
     pub fn database_url(&self) -> &str {
         &self.database_url
+    }
+
+    #[must_use]
+    pub const fn database_ssl_policy(&self) -> PrivatePostgresSslPolicy {
+        self.database_ssl_policy
     }
 
     #[must_use]
@@ -598,7 +606,11 @@ fn control_bootstrap_runtime_config(
     project_namespace: &str,
     receipt_digest: &str,
 ) -> Result<ControlBootstrapRuntimeConfig> {
-    validate_database_url(database_url, "FLEET_RECALL_CONTROL_DATABASE_URL")?;
+    const DATABASE_VARIABLE: &str = "FLEET_RECALL_CONTROL_DATABASE_URL";
+    validate_database_url(database_url, DATABASE_VARIABLE)?;
+    validate_explicit_private_database_identity(database_url, DATABASE_VARIABLE)?;
+    let database_ssl_policy =
+        explicit_private_database_ssl_policy(database_url, DATABASE_VARIABLE)?;
     let tenant_id = tenant_id.parse::<Uuid>().map_err(|error| {
         FleetError::Configuration(format!("FLEET_RECALL_TENANT_ID must be a UUID: {error}"))
     })?;
@@ -611,6 +623,7 @@ fn control_bootstrap_runtime_config(
     )?;
     Ok(ControlBootstrapRuntimeConfig {
         database_url: database_url.to_owned(),
+        database_ssl_policy,
         authority: control_bootstrap_config(
             &deployment_scope,
             tenant_namespace,
@@ -634,12 +647,9 @@ fn registry_activation_runtime_config(
     proposer_principal_id: &str,
     package_author_principal_id: &str,
 ) -> Result<RegistryActivationRuntimeConfig> {
-    validate_database_url_with_local_escape(
-        database_url,
-        "FLEET_RECALL_REGISTRY_DATABASE_URL",
-        false,
-        false,
-    )?;
+    const DATABASE_VARIABLE: &str = "FLEET_RECALL_REGISTRY_DATABASE_URL";
+    validate_database_url_with_local_escape(database_url, DATABASE_VARIABLE, false, false)?;
+    validate_explicit_private_database_identity(database_url, DATABASE_VARIABLE)?;
     let tenant_id = tenant_id.parse::<Uuid>().map_err(|error| {
         FleetError::Configuration(format!(
             "FLEET_RECALL_REGISTRY_TENANT_ID must be a UUID: {error}"
@@ -1017,6 +1027,63 @@ fn validate_database_url_with_local_escape(
     Err(FleetError::Configuration(format!(
         "{variable_name} must set exactly sslmode=verify-full{local_hint}"
     )))
+}
+
+/// Require every identity field consumed by a private `PostgreSQL` writer to be
+/// present in its dedicated URL. In particular, a nonempty explicit password
+/// prevents `sqlx-postgres` from consulting `pgpass` after URL parsing.
+fn validate_explicit_private_database_identity(
+    database_url: &str,
+    variable_name: &str,
+) -> Result<()> {
+    let parsed = Url::parse(database_url).map_err(|error| {
+        FleetError::Configuration(format!(
+            "{variable_name} must be a valid PostgreSQL URL: {error}"
+        ))
+    })?;
+    if parsed.username().is_empty() {
+        return Err(FleetError::Configuration(format!(
+            "{variable_name} must include an explicit username"
+        )));
+    }
+    if parsed.password().is_none_or(str::is_empty) {
+        return Err(FleetError::Configuration(format!(
+            "{variable_name} must include a nonempty explicit password"
+        )));
+    }
+    if parsed.port().is_none_or(|port| port == 0) {
+        return Err(FleetError::Configuration(format!(
+            "{variable_name} must include an explicit nonzero numeric port"
+        )));
+    }
+    if parsed.path().trim_start_matches('/').is_empty() {
+        return Err(FleetError::Configuration(format!(
+            "{variable_name} must include a nonempty database path"
+        )));
+    }
+    Ok(())
+}
+
+fn explicit_private_database_ssl_policy(
+    database_url: &str,
+    variable_name: &str,
+) -> Result<PrivatePostgresSslPolicy> {
+    let parsed = Url::parse(database_url).map_err(|error| {
+        FleetError::Configuration(format!(
+            "{variable_name} must be a valid PostgreSQL URL: {error}"
+        ))
+    })?;
+    match parsed
+        .query_pairs()
+        .find_map(|(name, value)| (name == "sslmode").then_some(value))
+        .as_deref()
+    {
+        Some("verify-full") => Ok(PrivatePostgresSslPolicy::VerifyFull),
+        Some("disable") => Ok(PrivatePostgresSslPolicy::Disable),
+        _ => Err(FleetError::Configuration(format!(
+            "{variable_name} must include an explicit supported sslmode"
+        ))),
+    }
 }
 
 /// Apply the closed endpoint policy for the one-shot successor writer.
@@ -1398,10 +1465,40 @@ mod tests {
                 .as_str(),
             "project.authority"
         );
+        assert_eq!(
+            config.database_ssl_policy(),
+            PrivatePostgresSslPolicy::VerifyFull
+        );
         let debug = format!("{config:?}");
         assert!(!debug.contains("bootstrap:secret"));
         assert!(!debug.contains(FIXTURE_RECEIPT_DIGEST));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn private_control_database_requires_explicit_connection_identity() {
+        for database_url in [
+            "postgresql://:secret@cluster.example:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://bootstrap@cluster.example:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://bootstrap:@cluster.example:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://bootstrap:secret@cluster.example/fleet_recall?sslmode=verify-full",
+            "postgresql://bootstrap:secret@cluster.example:0/fleet_recall?sslmode=verify-full",
+            "postgresql://bootstrap:secret@cluster.example:26257?sslmode=verify-full",
+            "postgresql://bootstrap:secret@cluster.example:26257///?sslmode=verify-full",
+        ] {
+            assert!(
+                control_bootstrap_runtime_config(
+                    database_url,
+                    "0198a849-f6ae-7d61-9800-000000000001",
+                    "physical-project",
+                    "tenant.authority",
+                    "project.authority",
+                    FIXTURE_RECEIPT_DIGEST,
+                )
+                .is_err(),
+                "accepted incomplete control database identity"
+            );
+        }
     }
 
     fn registry_activation_values() -> BTreeMap<&'static str, String> {
@@ -1531,6 +1628,27 @@ mod tests {
                 "FLEET_RECALL_REGISTRY_DATABASE_URL must set exactly sslmode=verify-full"
             )
         );
+    }
+
+    #[test]
+    fn private_registry_database_requires_explicit_connection_identity() {
+        for database_url in [
+            "postgresql://:secret@cluster.example:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://activation@cluster.example:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://activation:@cluster.example:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://activation:secret@cluster.example/fleet_recall?sslmode=verify-full",
+            "postgresql://activation:secret@cluster.example:0/fleet_recall?sslmode=verify-full",
+            "postgresql://activation:secret@cluster.example:26257?sslmode=verify-full",
+            "postgresql://activation:secret@cluster.example:26257///?sslmode=verify-full",
+        ] {
+            let mut values = registry_activation_values();
+            values.insert("FLEET_RECALL_REGISTRY_DATABASE_URL", database_url.into());
+            assert!(
+                RegistryActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+                    .is_err(),
+                "accepted incomplete registry database identity"
+            );
+        }
     }
 
     #[test]

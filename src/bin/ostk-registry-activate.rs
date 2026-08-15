@@ -31,13 +31,16 @@ use ostk_fleet_recall::memory_contracts::genesis_activation::{
     verify_genesis_registry_activation, verify_registry_test_result,
 };
 use ostk_fleet_recall::memory_contracts::registry::ManifestVerifiedRegistryPackage;
+use ostk_fleet_recall::private_postgres::{
+    PrivatePostgresSslPolicy, private_postgres_connect_options,
+};
 use ostk_fleet_recall::registry_activation::{
     AcceptedGenesisActivation, CockroachGenesisActivationRepository, GenesisActivationInspection,
     GenesisActivationOutcome, GenesisActivationRepository, PinnedInactiveGenesis,
 };
 use ostk_fleet_recall::store::cockroach::RetryPolicy;
 use serde_json::{Value, json};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 
 const MAX_CONNECTIONS: u32 = 2;
 
@@ -115,22 +118,22 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // This is the trust boundary: all five files and every deployment pin are
-    // fully checked before driver options are constructed or a socket opens.
+    // fully checked before driver options are constructed. The lazy pool then
+    // lets repository authority close before the first socket opens.
     let artifacts = verify_artifacts(args, &ArtifactAuthority::from_config(config.authority()))?;
 
-    let options: PgConnectOptions = config
-        .database_url()
-        .parse()
-        .map_err(|_| anyhow!("invalid private registry activation database URL"))?;
+    let options = private_postgres_connect_options(
+        config.database_url(),
+        "ostk-registry-activate",
+        PrivatePostgresSslPolicy::VerifyFull,
+    )?;
     let pool = PgPoolOptions::new()
         .max_connections(MAX_CONNECTIONS)
         .min_connections(0)
         .acquire_timeout(Duration::from_secs(10))
-        .connect_with(options.application_name("ostk-registry-activate"))
-        .await
-        .map_err(|_| anyhow!("connect private registry activation database failed"))?;
+        .connect_lazy_with(options);
     let repository = CockroachGenesisActivationRepository::new(
-        pool,
+        pool.clone(),
         config.authority().trusted_scope().clone(),
         RetryPolicy::default(),
         artifacts.bootstrap,
@@ -138,6 +141,11 @@ async fn main() -> anyhow::Result<()> {
         artifacts.test_result,
         config.authority().principal_binding(),
     )?;
+    let connection = pool
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("connect private registry activation database failed"))?;
+    drop(connection);
 
     let output = match cli.command {
         Command::Apply(_) => match repository.activate_genesis(&artifacts.request).await? {
