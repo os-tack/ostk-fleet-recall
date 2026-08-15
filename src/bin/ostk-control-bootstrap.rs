@@ -33,8 +33,9 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
 const MAX_CONNECTIONS: u32 = 2;
 const REQUIRED_SCHEMA_VERSION: i64 = 3;
-const CONTROL_SCHEMA_READY_SQL: &str =
-    "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = $1 AND success)";
+const CONTROL_SCHEMA_READY_SQL: &str = "SELECT count(*) = $1 \
+     AND COALESCE(bool_and(success), false) \
+     FROM _sqlx_migrations WHERE version BETWEEN 1 AND $1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -270,5 +271,14 @@ mod tests {
         let value = output("inspect", "complete", &inspection);
         assert_eq!(value["committed_offset"], i64::MAX.to_string());
         assert!(value["committed_offset"].is_string());
+    }
+
+    #[test]
+    fn schema_gate_requires_the_complete_successful_prefix() {
+        assert!(CONTROL_SCHEMA_READY_SQL.contains("count(*) = $1"));
+        assert!(CONTROL_SCHEMA_READY_SQL.contains("bool_and(success)"));
+        assert!(CONTROL_SCHEMA_READY_SQL.contains("version BETWEEN 1 AND $1"));
+        assert!(!CONTROL_SCHEMA_READY_SQL.contains("EXISTS"));
+        assert!(!CONTROL_SCHEMA_READY_SQL.contains("MAX"));
     }
 }

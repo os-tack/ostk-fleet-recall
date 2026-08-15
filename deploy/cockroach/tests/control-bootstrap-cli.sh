@@ -62,13 +62,13 @@ FLEET_RECALL_TEST_DATABASE_URL="$admin_url" \
 docker exec -i "$container" cockroach sql \
     --certs-dir=/cockroach/certs \
     --host=127.0.0.1 \
-    --user=proof_admin \
+    --user=root \
     --database=fleet_recall \
     < "$repo_root/deploy/cockroach/control-role-grants.sql" >/dev/null
 docker exec "$container" cockroach sql \
     --certs-dir=/cockroach/certs \
     --host=127.0.0.1 \
-    --user=proof_admin \
+    --user=root \
     --database=fleet_recall \
     --execute "ALTER ROLE fleet_control_bootstrap WITH LOGIN PASSWORD '$bootstrap_password'" \
     >/dev/null
@@ -101,7 +101,7 @@ docker exec "$container" cockroach sql \
         SELECT 9999, 'synthetic later success', installed_on, true, checksum, execution_time
         FROM _sqlx_migrations WHERE version = 3" >/dev/null
 if invalid_schema=$(run_cli inspect 2>&1); then
-    fail "failed migration 3 was masked by successful migration 4"
+    fail "failed migration 3 was masked by a later successful row"
 fi
 grep -q 'requires successful database migration 3' <<<"$invalid_schema" \
     || fail "failed migration 3 did not produce the bounded preflight error"
@@ -113,6 +113,26 @@ docker exec "$container" cockroach sql \
     --execute "
         DELETE FROM _sqlx_migrations WHERE version = 9999;
         UPDATE _sqlx_migrations SET success = true WHERE version = 3" >/dev/null
+
+# Presence of the terminal row is insufficient: every required predecessor
+# migration must also be present and successful.
+docker exec "$container" cockroach sql \
+    --certs-dir=/cockroach/certs \
+    --host=127.0.0.1 \
+    --user=proof_admin \
+    --database=fleet_recall \
+    --execute 'UPDATE _sqlx_migrations SET success = false WHERE version = 2' >/dev/null
+if invalid_prefix=$(run_cli inspect 2>&1); then
+    fail "failed migration 2 was masked by successful migration 3"
+fi
+grep -q 'requires successful database migration 3' <<<"$invalid_prefix" \
+    || fail "failed migration prefix did not produce the bounded preflight error"
+docker exec "$container" cockroach sql \
+    --certs-dir=/cockroach/certs \
+    --host=127.0.0.1 \
+    --user=proof_admin \
+    --database=fleet_recall \
+    --execute 'UPDATE _sqlx_migrations SET success = true WHERE version = 2' >/dev/null
 
 absent=$(run_cli inspect)
 jq -e '
@@ -143,7 +163,7 @@ jq -e '.operation == "apply" and .state == "exact_replay" and .committed_offset 
 explain=$(docker exec "$container" cockroach sql \
     --url "postgresql://fleet_control_bootstrap:${bootstrap_password}@127.0.0.1:26257/fleet_recall?sslmode=verify-full&sslrootcert=/cockroach/certs/ca.crt" \
     --format=tsv \
-    --execute 'EXPLAIN SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 3 AND success)')
+    --execute 'EXPLAIN SELECT count(*) = 3 AND COALESCE(bool_and(success), false) FROM _sqlx_migrations WHERE version BETWEEN 1 AND 3')
 grep -q '_sqlx_migrations' <<<"$explain" || fail "schema-version EXPLAIN missed migration metadata"
 
 printf '%s\n' \
