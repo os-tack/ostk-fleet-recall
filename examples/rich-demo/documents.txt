@@ -25,6 +25,7 @@ docs/assets/README.md|media
 docs/evidence/README.md|evidence
 deploy/aws/README.md|aws
 deploy/aws/network/README.md|aws_network
+deploy/cockroach/tests/README.md|database_verification
 deploy/localstack/README.md|localstack
 examples/README.md|examples
 examples/rich-demo/README.md|corpus_pipeline
