@@ -54,6 +54,52 @@ impl ControlBootstrapConfig {
     }
 }
 
+/// Minimal process configuration for the private one-shot bootstrap binary.
+///
+/// Bootstrap neither loads nor identifies an embedding model. Keeping this
+/// separate from [`FleetConfig`] prevents unrelated serving and corpus
+/// variables from becoming accidental control-plane prerequisites.
+#[derive(Clone)]
+pub struct ControlBootstrapRuntimeConfig {
+    database_url: String,
+    authority: ControlBootstrapConfig,
+}
+
+impl std::fmt::Debug for ControlBootstrapRuntimeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlBootstrapRuntimeConfig")
+            .field("database_url", &"<redacted>")
+            .field("authority", &self.authority)
+            .finish()
+    }
+}
+
+impl ControlBootstrapRuntimeConfig {
+    /// Read only the database, physical scope, semantic scope, and receipt pin
+    /// needed by the private control bootstrap process.
+    pub fn from_env() -> Result<Self> {
+        control_bootstrap_runtime_config(
+            &required("FLEET_RECALL_DATABASE_URL")?,
+            &required("FLEET_RECALL_TENANT_ID")?,
+            &required("FLEET_RECALL_PROJECT")?,
+            &required("FLEET_RECALL_CONTROL_TENANT_NAMESPACE")?,
+            &required("FLEET_RECALL_CONTROL_PROJECT_NAMESPACE")?,
+            &required("FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST")?,
+        )
+    }
+
+    #[must_use]
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    #[must_use]
+    pub const fn authority(&self) -> &ControlBootstrapConfig {
+        &self.authority
+    }
+}
+
 #[derive(Clone)]
 pub struct FleetConfig {
     pub database_url: String,
@@ -151,20 +197,6 @@ impl FleetConfig {
         })
     }
 
-    /// Read the private control-ledger authority mapping on explicit demand.
-    ///
-    /// Normal server, demo, recall, remember, ingest, and migration startup do
-    /// not call this method. A future private bootstrap command is the only
-    /// intended consumer.
-    pub fn control_bootstrap_config_from_env(&self) -> Result<ControlBootstrapConfig> {
-        control_bootstrap_config(
-            &self.default_scope,
-            &required("FLEET_RECALL_CONTROL_TENANT_NAMESPACE")?,
-            &required("FLEET_RECALL_CONTROL_PROJECT_NAMESPACE")?,
-            &required("FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST")?,
-        )
-    }
-
     /// Stable registry identity, independent of where the baked bundle is
     /// mounted on a particular deployment.
     #[must_use]
@@ -217,6 +249,36 @@ fn control_bootstrap_config(
     Ok(ControlBootstrapConfig {
         trusted_scope: TrustedControlScope::from_trusted_context(deployment_scope, semantic_scope)?,
         receipt_digest,
+    })
+}
+
+fn control_bootstrap_runtime_config(
+    database_url: &str,
+    tenant_id: &str,
+    project: &str,
+    tenant_namespace: &str,
+    project_namespace: &str,
+    receipt_digest: &str,
+) -> Result<ControlBootstrapRuntimeConfig> {
+    validate_database_url(database_url)?;
+    let tenant_id = tenant_id.parse::<Uuid>().map_err(|error| {
+        FleetError::Configuration(format!("FLEET_RECALL_TENANT_ID must be a UUID: {error}"))
+    })?;
+    let deployment_scope = FleetScope::new(
+        tenant_id,
+        project,
+        "private-control-bootstrap",
+        None,
+        PrivacyTier::T1Project,
+    )?;
+    Ok(ControlBootstrapRuntimeConfig {
+        database_url: database_url.to_owned(),
+        authority: control_bootstrap_config(
+            &deployment_scope,
+            tenant_namespace,
+            project_namespace,
+            receipt_digest,
+        )?,
     })
 }
 
@@ -536,5 +598,36 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn private_bootstrap_runtime_config_has_no_model_or_agent_dependency() {
+        let config = control_bootstrap_runtime_config(
+            "postgresql://bootstrap:secret@cluster.example:26257/fleet_recall?sslmode=verify-full",
+            "0198a849-f6ae-7d61-9800-000000000001",
+            "physical-project",
+            "tenant.authority",
+            "project.authority",
+            FIXTURE_RECEIPT_DIGEST,
+        )
+        .expect("private bootstrap runtime config");
+
+        assert_eq!(
+            config.authority().trusted_scope().project(),
+            "physical-project"
+        );
+        assert_eq!(
+            config
+                .authority()
+                .trusted_scope()
+                .semantic_scope()
+                .project_namespace
+                .as_str(),
+            "project.authority"
+        );
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("bootstrap:secret"));
+        assert!(!debug.contains(FIXTURE_RECEIPT_DIGEST));
+        assert!(debug.contains("<redacted>"));
     }
 }

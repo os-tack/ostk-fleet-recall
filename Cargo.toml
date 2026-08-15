@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 description = "A shared, distributed semantic memory plane for agent fleets"
 repository = "https://github.com/os-tack/ostk-fleet-recall"
 publish = false
+default-run = "ostk-fleet-recall"
 
 [lib]
 name = "ostk_fleet_recall"
