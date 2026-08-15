@@ -58,6 +58,11 @@ contracts/dynamic-memory/v2/remember/remember-ingress-candidate-v2.jsonl|memory_
 contracts/dynamic-memory/v2/remember/remember-predicate-schema-v2-entry.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/semantic-claim-v2.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v2/remember/vector-suite.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/successor-policy/activation-policy-v2.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/successor-policy/genesis-successor-key-bridge-v1.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/successor-policy/negative-vectors.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/successor-policy/positive-vectors.jsonl|memory_contracts|jsonl
+contracts/dynamic-memory/v2/successor-policy/vector-suite.jsonl|memory_contracts|jsonl
 demo/ostk/bridge.sh|ostk_integration|shell
 demo/ostk/lib.sh|ostk_integration|shell
 demo/ostk/mcp-client.sh|ostk_integration|shell
@@ -167,6 +172,7 @@ src/memory_contracts/normative.rs|memory_contracts|rust
 src/memory_contracts/registry.rs|memory_contracts|rust
 src/memory_contracts/relation.rs|memory_contracts|rust
 src/memory_contracts/remember_v2.rs|memory_contracts|rust
+src/memory_contracts/successor_policy.rs|memory_contracts|rust
 src/memory_contracts/vectors.rs|memory_contracts|rust
 src/reference_agent.rs|reference_agent|rust
 src/registry_activation/cockroach.rs|registry_activation|rust

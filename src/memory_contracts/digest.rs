@@ -80,7 +80,7 @@ impl<'de> Deserialize<'de> for Sha256Digest {
     }
 }
 
-/// Closed set of v1 digest preimage domains.
+/// Closed set of versioned digest preimage domains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DigestDomain {
     CanonicalProfile,
@@ -92,6 +92,7 @@ pub enum DigestDomain {
     RegistryActivationReceipt,
     RegistryActivationStream,
     RegistryTestResult,
+    GenesisSuccessorKeyBridgeV1,
     ResourceLocator,
     EvidenceSourceFact,
     EvidenceSourceFactV2,
@@ -116,7 +117,7 @@ pub enum DigestDomain {
 }
 
 impl DigestDomain {
-    /// Immutable ASCII prefix included in every v1 digest preimage.
+    /// Immutable ASCII prefix included in every domain-separated preimage.
     pub const fn prefix(self) -> &'static str {
         match self {
             Self::CanonicalProfile => "ostk-canonical-profile-v1",
@@ -128,6 +129,7 @@ impl DigestDomain {
             Self::RegistryActivationReceipt => "ostk-registry-activation-receipt-v1",
             Self::RegistryActivationStream => "ostk-registry-activation-stream-v1",
             Self::RegistryTestResult => "ostk-registry-test-result-v1",
+            Self::GenesisSuccessorKeyBridgeV1 => "ostk-genesis-successor-key-bridge-v1",
             Self::ResourceLocator => "ostk-resource-locator-v1",
             Self::EvidenceSourceFact => "ostk-source-fact-v1",
             Self::EvidenceSourceFactV2 => "ostk-source-fact-v2",
