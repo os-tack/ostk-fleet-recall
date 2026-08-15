@@ -10,6 +10,7 @@
 pub mod application;
 pub mod config;
 pub mod context;
+pub mod control_log;
 pub mod error;
 pub mod ledger;
 pub mod mcp;
@@ -21,4 +22,5 @@ pub mod store;
 pub use application::CockroachMemoryService;
 pub use config::FleetConfig;
 pub use context::FleetScope;
+pub use control_log::TrustedControlScope;
 pub use error::{FleetError, Result};
