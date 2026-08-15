@@ -18,7 +18,7 @@ use crate::memory_contracts::bootstrap::{
     partition_for_epoch,
 };
 use crate::memory_contracts::canonical::{decode_strict, encode_canonical, require_canonical};
-use crate::memory_contracts::common::ContractId;
+use crate::memory_contracts::common::{ContractId, frozen_profile_reference_v1};
 use crate::memory_contracts::control::{
     GenesisBootstrapAppendV1, GenesisBootstrapEventV1, derive_append_chain_digest,
 };
@@ -39,16 +39,16 @@ const INSERT_BOOTSTRAP_RESERVATION_SQL: &str = "INSERT INTO memory_control_boots
          receipt_digest, statement_id, bootstrap_event_id, profile_id, profile_digest, \
          vector_manifest_digest, genesis_registry_package_digest, signer_policy_digest, \
          signer_count, approval_threshold, epoch_id, shard_count, bootstrap_shard, \
-         bootstrap_offset, canonical_receipt, canonical_genesis_package\
+         bootstrap_offset, canonical_receipt, canonical_genesis_package, accepted_at\
      ) VALUES (\
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-         $15, $16, $17, 1, $18, $19\
+         $15, $16, $17, 1, $18, $19, $20\
      ) ON CONFLICT (tenant_id, project) DO NOTHING RETURNING receipt_digest";
 const ADVANCE_SELECTED_HEAD_SQL: &str = "UPDATE memory_control_shard_heads \
-     SET last_committed_offset = 1, chain_digest = $5, advanced_at = now() \
+     SET last_committed_offset = 1, chain_digest = $5, advanced_at = $7 \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 \
        AND last_committed_offset = 0 AND chain_digest = $6";
-const BOUNDED_HEAD_SET_SQL: &str = "SELECT shard, shard_count, last_committed_offset, chain_digest \
+const BOUNDED_HEAD_SET_SQL: &str = "SELECT shard, shard_count, last_committed_offset, chain_digest, advanced_at \
      FROM memory_control_shard_heads \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
      ORDER BY shard LIMIT $4";
@@ -104,32 +104,31 @@ struct PreparedGenesis {
 ///
 /// This proves only the bootstrap prefix. Later repository stages own the
 /// validity of any suffix and may advance the current shard heads.
-pub(super) struct DurableGenesisWitness {
+pub struct DurableGenesisWitness {
     prepared: PreparedGenesis,
     bootstrap: IntegrityCheckedBootstrapReceipt,
     package: SemanticallyClosedGenesisPackage,
     bootstrap_accepted_at: DateTime<Utc>,
 }
 
-#[allow(dead_code)] // Consumed by the private Stage-3 repository seam.
 impl DurableGenesisWitness {
-    pub(super) const fn bootstrap(&self) -> &IntegrityCheckedBootstrapReceipt {
+    pub const fn bootstrap(&self) -> &IntegrityCheckedBootstrapReceipt {
         &self.bootstrap
     }
 
-    pub(super) const fn package(&self) -> &SemanticallyClosedGenesisPackage {
+    pub const fn package(&self) -> &SemanticallyClosedGenesisPackage {
         &self.package
     }
 
-    pub(super) const fn bootstrap_append(&self) -> &GenesisBootstrapAppendV1 {
+    pub const fn bootstrap_append(&self) -> &GenesisBootstrapAppendV1 {
         &self.prepared.append
     }
 
-    pub(super) fn genesis_heads(&self) -> &[(i32, Sha256Digest)] {
+    pub fn genesis_heads(&self) -> &[(i32, Sha256Digest)] {
         &self.prepared.genesis_heads
     }
 
-    pub(super) const fn bootstrap_accepted_at(&self) -> DateTime<Utc> {
+    pub const fn bootstrap_accepted_at(&self) -> DateTime<Utc> {
         self.bootstrap_accepted_at
     }
 
@@ -160,6 +159,7 @@ impl PreparedGenesis {
         package: &SemanticallyClosedGenesisPackage,
     ) -> Result<Self> {
         let statement = &bootstrap.receipt().statement;
+        statement.profile.require_frozen_runtime_profile()?;
         if &statement.scope != trusted_scope.semantic_scope() {
             return Err(FleetError::InvalidScope(
                 "bootstrap receipt scope does not match deployment-bound control scope".into(),
@@ -246,8 +246,13 @@ impl GenesisRepository for CockroachGenesisRepository {
                     return Ok(GenesisBootstrapOutcome::ExactReplay(inspection));
                 }
 
+                let accepted_at: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+                    .fetch_one(&mut **transaction)
+                    .await?;
+
                 let reservation =
-                    insert_bootstrap_reservation(transaction, &scope, &prepared).await?;
+                    insert_bootstrap_reservation(transaction, &scope, &prepared, accepted_at)
+                        .await?;
                 if !reservation {
                     let inspection = inspect_in_transaction(transaction, &scope, &prepared)
                         .await?
@@ -257,10 +262,10 @@ impl GenesisRepository for CockroachGenesisRepository {
                     return Ok(GenesisBootstrapOutcome::ExactReplay(inspection));
                 }
 
-                insert_epoch(transaction, &scope, &prepared).await?;
-                insert_genesis_heads(transaction, &scope, &prepared).await?;
-                insert_bootstrap_event(transaction, &scope, &prepared).await?;
-                advance_selected_head(transaction, &scope, &prepared).await?;
+                insert_epoch(transaction, &scope, &prepared, accepted_at).await?;
+                insert_genesis_heads(transaction, &scope, &prepared, accepted_at).await?;
+                insert_bootstrap_event(transaction, &scope, &prepared, accepted_at).await?;
+                advance_selected_head(transaction, &scope, &prepared, accepted_at).await?;
 
                 Ok(GenesisBootstrapOutcome::Inserted(prepared.inspection()?))
             })
@@ -298,6 +303,7 @@ async fn insert_bootstrap_reservation(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
     prepared: &PreparedGenesis,
+    accepted_at: DateTime<Utc>,
 ) -> Result<bool> {
     let event = &prepared.append.event;
     let row = sqlx::query_scalar::<_, Vec<u8>>(INSERT_BOOTSTRAP_RESERVATION_SQL)
@@ -320,6 +326,7 @@ async fn insert_bootstrap_reservation(
         .bind(i32::from(prepared.append.append_position.shard))
         .bind(&prepared.canonical_receipt)
         .bind(&prepared.canonical_package)
+        .bind(accepted_at)
         .fetch_optional(&mut **transaction)
         .await?;
     Ok(row.is_some())
@@ -329,14 +336,15 @@ async fn insert_epoch(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
     prepared: &PreparedGenesis,
+    accepted_at: DateTime<Utc>,
 ) -> Result<()> {
     let event = &prepared.append.event;
     let result = sqlx::query(
         "INSERT INTO memory_control_log_epochs (\
              tenant_id, project, epoch_id, bootstrap_receipt_digest, canonical_epoch, \
              partition_recipe_id, partition_recipe_version, partition_algorithm, \
-             partition_seed, shard_count\
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             partition_seed, shard_count, created_at\
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(scope.tenant_id())
     .bind(scope.project())
@@ -348,6 +356,7 @@ async fn insert_epoch(
     .bind(PARTITION_ALGORITHM)
     .bind(prepared.partition_seed.to_vec())
     .bind(prepared.shard_count)
+    .bind(accepted_at)
     .execute(&mut **transaction)
     .await?;
     if result.rows_affected() != 1 {
@@ -362,10 +371,11 @@ async fn insert_genesis_heads(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
     prepared: &PreparedGenesis,
+    accepted_at: DateTime<Utc>,
 ) -> Result<()> {
     let mut builder = QueryBuilder::<Postgres>::new(
         "INSERT INTO memory_control_shard_heads (\
-             tenant_id, project, epoch_id, shard, shard_count, last_committed_offset, chain_digest\
+             tenant_id, project, epoch_id, shard, shard_count, last_committed_offset, chain_digest, advanced_at\
          ) ",
     );
     builder.push_values(&prepared.genesis_heads, |mut row, (shard, digest)| {
@@ -375,7 +385,8 @@ async fn insert_genesis_heads(
             .push_bind(*shard)
             .push_bind(prepared.shard_count)
             .push_bind(0_i64)
-            .push_bind(bytes(*digest));
+            .push_bind(bytes(*digest))
+            .push_bind(accepted_at);
     });
     let result = builder.build().execute(&mut **transaction).await?;
     if result.rows_affected() != u64::try_from(prepared.genesis_heads.len()).unwrap_or(u64::MAX) {
@@ -390,6 +401,7 @@ async fn insert_bootstrap_event(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
     prepared: &PreparedGenesis,
+    accepted_at: DateTime<Utc>,
 ) -> Result<()> {
     let append = &prepared.append;
     let offset = i64::try_from(append.append_position.committed_offset.as_u64())
@@ -398,8 +410,8 @@ async fn insert_bootstrap_event(
         "INSERT INTO memory_control_events (\
              tenant_id, project, epoch_id, shard, committed_offset, event_id, \
              event_schema_version, event_kind, semantic_object_digest, consistency_family, \
-             consistency_key_digest, canonical_event, previous_chain_digest, chain_digest\
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+             consistency_key_digest, canonical_event, previous_chain_digest, chain_digest, accepted_at\
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(scope.tenant_id())
     .bind(scope.project())
@@ -415,6 +427,7 @@ async fn insert_bootstrap_event(
     .bind(&prepared.canonical_event)
     .bind(bytes(append.previous_chain_digest))
     .bind(bytes(append.append_chain_digest))
+    .bind(accepted_at)
     .execute(&mut **transaction)
     .await?;
     if result.rows_affected() != 1 {
@@ -429,6 +442,7 @@ async fn advance_selected_head(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
     prepared: &PreparedGenesis,
+    accepted_at: DateTime<Utc>,
 ) -> Result<()> {
     let append = &prepared.append;
     let result = sqlx::query(ADVANCE_SELECTED_HEAD_SQL)
@@ -438,6 +452,7 @@ async fn advance_selected_head(
         .bind(i32::from(append.append_position.shard))
         .bind(bytes(append.append_chain_digest))
         .bind(bytes(append.previous_chain_digest))
+        .bind(accepted_at)
         .execute(&mut **transaction)
         .await?;
     if result.rows_affected() != 1 {
@@ -468,7 +483,7 @@ async fn inspect_in_transaction(
 
 /// Load and audit the exact durable Stage-2 prefix inside the caller's
 /// transaction. This does not authenticate or interpret any later suffix.
-pub(super) async fn load_durable_genesis_witness(
+pub async fn load_durable_genesis_witness(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
 ) -> Result<Option<DurableGenesisWitness>> {
@@ -537,14 +552,19 @@ fn prepare_stored_genesis(
     })?;
     let receipt: BootstrapReceiptV1 = decode_strict(&canonical_receipt)
         .map_err(|error| corrupt(format!("stored bootstrap receipt is invalid: {error}")))?;
-    let profile = &receipt.statement.profile;
-    let manifest = ManifestVerifiedRegistryPackage::decode(&canonical_package, profile)
+    let profile = frozen_profile_reference_v1();
+    if receipt.statement.profile != profile {
+        return Err(corrupt(
+            "stored bootstrap names a profile this binary does not implement",
+        ));
+    }
+    let manifest = ManifestVerifiedRegistryPackage::decode(&canonical_package, &profile)
         .map_err(|error| corrupt(format!("stored genesis package is invalid: {error}")))?;
     let package = SemanticallyClosedGenesisPackage::from_manifest_verified(manifest)
         .map_err(|error| corrupt(format!("stored genesis package is not closed: {error}")))?;
     let checked = audit_untrusted_bootstrap_integrity(
         &canonical_receipt,
-        profile,
+        &profile,
         scope.semantic_scope(),
         &package,
     )
@@ -651,9 +671,9 @@ async fn ensure_complete_genesis_prefix(
 ) -> Result<()> {
     let prepared = &witness.prepared;
     ensure_bootstrap_matches(bootstrap, scope, prepared)?;
-    ensure_epoch_matches(transaction, scope, prepared).await?;
+    ensure_epoch_matches(transaction, scope, prepared, witness.bootstrap_accepted_at).await?;
     ensure_event_matches(transaction, scope, prepared, witness.bootstrap_accepted_at).await?;
-    ensure_heads_cover_prefix(transaction, scope, prepared).await
+    ensure_heads_cover_prefix(transaction, scope, prepared, witness.bootstrap_accepted_at).await
 }
 
 fn ensure_bootstrap_matches(
@@ -725,10 +745,12 @@ async fn ensure_epoch_matches(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
     prepared: &PreparedGenesis,
+    bootstrap_accepted_at: DateTime<Utc>,
 ) -> Result<()> {
     let row = sqlx::query(
         "SELECT bootstrap_receipt_digest, canonical_epoch, partition_recipe_id, \
-                partition_recipe_version, partition_algorithm, partition_seed, shard_count \
+                partition_recipe_version, partition_algorithm, partition_seed, shard_count, \
+                created_at \
          FROM memory_control_log_epochs \
          WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3",
     )
@@ -755,7 +777,14 @@ async fn ensure_epoch_matches(
     if seed != prepared.partition_seed {
         return Err(corrupt("stored partition seed does not match"));
     }
-    expect_i32(&row, "shard_count", prepared.shard_count)
+    expect_i32(&row, "shard_count", prepared.shard_count)?;
+    let created_at: DateTime<Utc> = row.try_get("created_at")?;
+    if created_at != bootstrap_accepted_at {
+        return Err(corrupt(
+            "genesis epoch timestamp differs from bootstrap acceptance",
+        ));
+    }
+    Ok(())
 }
 
 async fn ensure_event_matches(
@@ -817,6 +846,7 @@ async fn ensure_heads_cover_prefix(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
     prepared: &PreparedGenesis,
+    bootstrap_accepted_at: DateTime<Utc>,
 ) -> Result<()> {
     let row_limit = i64::from(prepared.shard_count)
         .checked_add(1)
@@ -859,6 +889,12 @@ async fn ensure_heads_cover_prefix(
                 prepared.genesis_heads[expected_shard].1
             };
             expect_bytes(row, "chain_digest", prefix_chain)?;
+            let advanced_at: DateTime<Utc> = row.try_get("advanced_at")?;
+            if advanced_at != bootstrap_accepted_at {
+                return Err(corrupt(format!(
+                    "stored shard {expected_shard} prefix timestamp does not match bootstrap acceptance"
+                )));
+            }
         } else {
             digest_from_stored_bytes(row.try_get("chain_digest")?, "advanced head chain")?;
         }
@@ -907,12 +943,14 @@ mod tests {
         assert!(INSERT_BOOTSTRAP_RESERVATION_SQL.contains("ON CONFLICT"));
         assert!(INSERT_BOOTSTRAP_RESERVATION_SQL.contains("DO NOTHING"));
         assert!(!INSERT_BOOTSTRAP_RESERVATION_SQL.contains("DO UPDATE"));
-        assert!(INSERT_BOOTSTRAP_RESERVATION_SQL.contains("$19"));
-        assert!(!INSERT_BOOTSTRAP_RESERVATION_SQL.contains("$20"));
+        assert!(INSERT_BOOTSTRAP_RESERVATION_SQL.contains("$20"));
+        assert!(!INSERT_BOOTSTRAP_RESERVATION_SQL.contains("$21"));
 
         assert!(ADVANCE_SELECTED_HEAD_SQL.starts_with("UPDATE memory_control_shard_heads"));
         assert!(ADVANCE_SELECTED_HEAD_SQL.contains("last_committed_offset = 0"));
         assert!(ADVANCE_SELECTED_HEAD_SQL.contains("chain_digest = $6"));
+        assert!(ADVANCE_SELECTED_HEAD_SQL.contains("advanced_at = $7"));
+        assert!(!ADVANCE_SELECTED_HEAD_SQL.contains("now()"));
         assert!(!ADVANCE_SELECTED_HEAD_SQL.contains("memory_control_events"));
     }
 

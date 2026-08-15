@@ -9,6 +9,7 @@ mod repository;
 mod types;
 
 pub use cockroach::CockroachGenesisRepository;
+pub(crate) use cockroach::{DurableGenesisWitness, load_durable_genesis_witness};
 pub use repository::{
     GenesisBootstrapInspection, GenesisBootstrapOutcome, GenesisInspection, GenesisRepository,
 };

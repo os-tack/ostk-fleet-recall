@@ -6,6 +6,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use ostk_fleet_recall::control_log::{
     CockroachGenesisRepository, GenesisBootstrapOutcome, GenesisInspection, GenesisRepository,
@@ -219,14 +220,20 @@ async fn append_synthetic_control_suffix(
         ],
     );
     let canonical_event = format!("{{\"marker\":\"{marker}\"}}").into_bytes();
+    let accepted_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT statement_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
 
     sqlx::query(
         "INSERT INTO memory_control_events (\
              tenant_id, project, epoch_id, shard, committed_offset, event_id, \
              event_schema_version, event_kind, semantic_object_digest, consistency_family, \
-             consistency_key_digest, canonical_event, previous_chain_digest, chain_digest\
+             consistency_key_digest, canonical_event, previous_chain_digest, chain_digest, \
+             accepted_at\
          ) VALUES ($1, $2, $3, $4, $5, $6, 1, 'test.control.suffix', $7, \
-                   'test.control.suffix', $8, $9, $10, $11)",
+                   'test.control.suffix', $8, $9, $10, $11, $12)",
     )
     .bind(scope.tenant_id)
     .bind(&scope.project)
@@ -243,14 +250,15 @@ async fn append_synthetic_control_suffix(
     .bind(canonical_event)
     .bind(previous_chain.as_bytes().to_vec())
     .bind(append_chain.as_bytes().to_vec())
+    .bind(accepted_at)
     .execute(&mut *transaction)
     .await
     .unwrap();
     let advanced = sqlx::query(
         "UPDATE memory_control_shard_heads \
-         SET last_committed_offset = $5, chain_digest = $6, advanced_at = now() \
+         SET last_committed_offset = $5, chain_digest = $6, advanced_at = $7 \
          WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 \
-           AND last_committed_offset = $7 AND chain_digest = $8",
+           AND last_committed_offset = $8 AND chain_digest = $9",
     )
     .bind(scope.tenant_id)
     .bind(&scope.project)
@@ -258,6 +266,7 @@ async fn append_synthetic_control_suffix(
     .bind(i32::from(shard))
     .bind(next_offset)
     .bind(append_chain.as_bytes().to_vec())
+    .bind(accepted_at)
     .bind(previous_offset)
     .bind(previous_chain.as_bytes().to_vec())
     .execute(&mut *transaction)
@@ -265,6 +274,94 @@ async fn append_synthetic_control_suffix(
     .unwrap();
     assert_eq!(advanced.rows_affected(), 1);
     transaction.commit().await.unwrap();
+}
+
+async fn assert_duplicate_predecessor_rejected(
+    pool: &PgPool,
+    scope: &FleetScope,
+    fixture: &GenesisFixture,
+) {
+    let shard = fixture.append.append_position.shard;
+    let mut transaction = pool.begin().await.unwrap();
+    let head = sqlx::query(
+        "SELECT last_committed_offset, chain_digest FROM memory_control_shard_heads \
+         WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 FOR UPDATE",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .bind(fixture.bootstrap.epoch_id().digest().as_bytes().to_vec())
+    .bind(i32::from(shard))
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    let previous_offset: i64 = head.get("last_committed_offset");
+    let previous_chain =
+        Sha256Digest::from_bytes(head.get::<Vec<u8>, _>("chain_digest").try_into().unwrap());
+    let accepted_at: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(&mut *transaction)
+        .await
+        .unwrap();
+
+    for index in 1_i64..=2 {
+        let offset = previous_offset + index;
+        let position = AppendPositionV1 {
+            epoch_id: fixture.bootstrap.epoch_id(),
+            shard,
+            committed_offset: CommittedOffsetV1::new(u64::try_from(offset).unwrap()).unwrap(),
+        };
+        let marker = format!("duplicate-predecessor-{index}");
+        let event_id = AcceptedEventId::from_digest(domain_separated_digest(
+            DigestDomain::AcceptedEvent,
+            marker.as_bytes(),
+        ));
+        let chain = framed_digest(
+            DigestDomain::AppendChain,
+            &[
+                previous_chain.as_bytes(),
+                &encode_canonical(&position).unwrap(),
+                event_id.digest().as_bytes(),
+            ],
+        );
+        let result = sqlx::query(
+            "INSERT INTO memory_control_events (\
+                 tenant_id, project, epoch_id, shard, committed_offset, event_id, \
+                 event_schema_version, event_kind, semantic_object_digest, consistency_family, \
+                 consistency_key_digest, canonical_event, previous_chain_digest, chain_digest, \
+                 accepted_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, 1, 'test.duplicate.predecessor', $7, \
+                       'test.duplicate.predecessor', $8, $9, $10, $11, $12)",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(fixture.bootstrap.epoch_id().digest().as_bytes().to_vec())
+        .bind(i32::from(shard))
+        .bind(offset)
+        .bind(event_id.digest().as_bytes().to_vec())
+        .bind(event_id.digest().as_bytes().to_vec())
+        .bind(
+            domain_separated_digest(DigestDomain::Partition, marker.as_bytes())
+                .as_bytes()
+                .to_vec(),
+        )
+        .bind(format!("{{\"marker\":\"{marker}\"}}").into_bytes())
+        .bind(previous_chain.as_bytes().to_vec())
+        .bind(chain.as_bytes().to_vec())
+        .bind(accepted_at)
+        .execute(&mut *transaction)
+        .await;
+        if index == 1 {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            let database = error.as_database_error().unwrap();
+            assert_eq!(database.code().as_deref(), Some("23505"));
+            assert_eq!(
+                database.constraint(),
+                Some("memory_control_events_predecessor_unique_idx")
+            );
+        }
+    }
+    transaction.rollback().await.unwrap();
 }
 
 #[allow(clippy::too_many_lines)] // one bounded helper independently audits every genesis row family
@@ -286,7 +383,8 @@ async fn assert_complete_database_shape(
     let statement = &fixture.bootstrap.receipt().statement;
     let bootstrap = sqlx::query(
         "SELECT receipt_digest, statement_id, bootstrap_event_id, epoch_id, shard_count, \
-                bootstrap_shard, bootstrap_offset, canonical_receipt, canonical_genesis_package \
+                bootstrap_shard, bootstrap_offset, canonical_receipt, canonical_genesis_package, \
+                accepted_at \
          FROM memory_control_bootstraps WHERE tenant_id = $1 AND project = $2",
     )
     .bind(scope.tenant_id)
@@ -327,9 +425,22 @@ async fn assert_complete_database_shape(
         bootstrap.get::<Vec<u8>, _>("canonical_genesis_package"),
         fixture.package.canonical_bytes()
     );
+    let accepted_at = bootstrap.get::<DateTime<Utc>, _>("accepted_at");
+
+    let epoch_created_at: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM memory_control_log_epochs \
+         WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .bind(fixture.bootstrap.epoch_id().digest().as_bytes().to_vec())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(epoch_created_at, accepted_at);
 
     let heads = sqlx::query(
-        "SELECT shard, shard_count, last_committed_offset, chain_digest \
+        "SELECT shard, shard_count, last_committed_offset, chain_digest, advanced_at \
          FROM memory_control_shard_heads \
          WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 ORDER BY shard",
     )
@@ -361,11 +472,12 @@ async fn assert_complete_database_shape(
             row.get::<Vec<u8>, _>("chain_digest"),
             expected_chain.as_bytes()
         );
+        assert_eq!(row.get::<DateTime<Utc>, _>("advanced_at"), accepted_at);
     }
 
     let event = sqlx::query(
         "SELECT shard, committed_offset, event_id, semantic_object_digest, canonical_event, \
-                previous_chain_digest, chain_digest \
+                previous_chain_digest, chain_digest, accepted_at \
          FROM memory_control_events WHERE tenant_id = $1 AND project = $2",
     )
     .bind(scope.tenant_id)
@@ -398,6 +510,7 @@ async fn assert_complete_database_shape(
         event.get::<Vec<u8>, _>("chain_digest"),
         fixture.append.append_chain_digest.as_bytes()
     );
+    assert_eq!(event.get::<DateTime<Utc>, _>("accepted_at"), accepted_at);
 }
 
 async fn cleanup_control_scope(pool: &PgPool, scope: &FleetScope) {
@@ -659,6 +772,24 @@ async fn live_stage2_genesis_repository_when_configured() {
         .unwrap_err();
     assert!(matches!(timestamp_error, FleetError::ControlLogCorrupt(_)));
 
+    // The schema independently rejects a fork that reuses one predecessor
+    // chain digest even when both event positions and IDs differ.
+    let duplicate_scope = physical_scope("duplicate-predecessor");
+    let duplicate_repository = repository(
+        pool.clone(),
+        &duplicate_scope,
+        fixture.semantic_scope.clone(),
+    );
+    duplicate_repository
+        .bootstrap_genesis(&fixture.bootstrap, &fixture.package)
+        .await
+        .unwrap();
+    assert_duplicate_predecessor_rejected(&pool, &duplicate_scope, &fixture).await;
+    assert_eq!(
+        scoped_count(&pool, "memory_control_events", &duplicate_scope).await,
+        1
+    );
+
     for scope in [
         &replay_scope,
         &concurrent_scope,
@@ -666,6 +797,7 @@ async fn live_stage2_genesis_repository_when_configured() {
         &corrupt_scope,
         &rewound_scope,
         &timestamp_scope,
+        &duplicate_scope,
     ] {
         cleanup_control_scope(&pool, scope).await;
     }
