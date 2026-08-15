@@ -902,6 +902,10 @@ the server-derived eligibility, threshold, and separation-of-duty verdict.
 Production authority, publication, and action-policy changes require an approver
 distinct from the package author. Activation compare-and-swaps the exact expected
 head, not only its package digest; exactly one concurrent successor can commit.
+For the frozen v1 rule this is existential: an otherwise eligible author
+approval may still count toward the threshold, and the trusted proposer is not
+automatically excluded from approving. A stronger disjoint-role requirement is
+a versioned activation-policy change, never an unstated verifier convention.
 This activation-ID binding rejects a stale proposal after an `A → B → A` package
 sequence. Reverting means appending a new activation event for an earlier package
 digest; no prior interval or activation identity is rewritten.
