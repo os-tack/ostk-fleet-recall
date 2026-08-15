@@ -23,6 +23,7 @@ use ostk_fleet_recall::memory_contracts::bootstrap::{
 use ostk_fleet_recall::memory_contracts::canonical::{
     MAX_INPUT_BYTES, decode_strict, require_canonical,
 };
+use ostk_fleet_recall::memory_contracts::common::frozen_profile_reference_v1;
 use ostk_fleet_recall::memory_contracts::digest::{DigestDomain, domain_separated_digest};
 use ostk_fleet_recall::memory_contracts::genesis::SemanticallyClosedGenesisPackage;
 use ostk_fleet_recall::memory_contracts::registry::ManifestVerifiedRegistryPackage;
@@ -85,15 +86,20 @@ async fn main() -> anyhow::Result<()> {
         "bootstrap receipt does not match the deployment pin"
     );
     let receipt: BootstrapReceiptV1 = decode_strict(&receipt_bytes)?;
+    let expected_profile = frozen_profile_reference_v1();
+    ensure!(
+        receipt.statement.profile == expected_profile,
+        "bootstrap receipt names a canonical profile this binary does not implement"
+    );
 
     let package_bytes = read_framed_canonical_record(&args.genesis_package)?;
     let manifest_verified =
-        ManifestVerifiedRegistryPackage::decode(&package_bytes, &receipt.statement.profile)?;
+        ManifestVerifiedRegistryPackage::decode(&package_bytes, &expected_profile)?;
     let package = SemanticallyClosedGenesisPackage::from_manifest_verified(manifest_verified)?;
     let verified = verify_pinned_bootstrap(
         &receipt_bytes,
         authority.receipt_pin(),
-        &receipt.statement.profile,
+        &expected_profile,
         authority.trusted_scope().semantic_scope(),
         &package,
     )?;

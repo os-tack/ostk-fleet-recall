@@ -1,12 +1,32 @@
 //! Shared scalar contracts used by registry, identity, and evidence artifacts.
 
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, sync::LazyLock};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use unicode_normalization::UnicodeNormalization;
 
 use super::{ContractError, ContractResult, canonical::PROFILE_ID, digest::Sha256Digest};
+
+/// Digest of the only canonicalization profile implemented by this binary.
+pub const FROZEN_PROFILE_DIGEST: Sha256Digest = Sha256Digest::from_bytes([
+    0xcf, 0x22, 0x99, 0x1a, 0x86, 0xbf, 0xc5, 0x60, 0x55, 0x6c, 0x7d, 0x04, 0xef, 0xa4, 0xee, 0x6b,
+    0x7b, 0x1e, 0xe0, 0xf4, 0x9c, 0x91, 0x9b, 0x25, 0x7e, 0xa7, 0xb4, 0xf3, 0x0f, 0x8e, 0x4a, 0x29,
+]);
+/// Digest of the authoritative positive/negative vectors for that profile.
+pub const FROZEN_VECTOR_MANIFEST_DIGEST: Sha256Digest = Sha256Digest::from_bytes([
+    0xf9, 0x84, 0xf6, 0x28, 0x66, 0xfc, 0x76, 0x9d, 0xf3, 0xa5, 0x61, 0x7a, 0x22, 0x47, 0xe3, 0xad,
+    0xe6, 0x94, 0x82, 0x7c, 0x1d, 0xe6, 0x9e, 0x61, 0x5a, 0x7b, 0xda, 0x68, 0x85, 0x8b, 0x41, 0x74,
+]);
+
+/// Exact canonicalization profile reference implemented by this binary.
+pub static FROZEN_PROFILE_REFERENCE_V1: LazyLock<ProfileReferenceV1> =
+    LazyLock::new(|| ProfileReferenceV1 {
+        profile_id: ContractId::new(PROFILE_ID)
+            .expect("the compile-time canonical profile ID must remain valid"),
+        profile_digest: FROZEN_PROFILE_DIGEST,
+        vector_manifest_digest: FROZEN_VECTOR_MANIFEST_DIGEST,
+    });
 
 /// Stable ASCII identifier used for registry-controlled names.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -73,6 +93,25 @@ impl ProfileReferenceV1 {
         }
         Ok(())
     }
+
+    /// Require the exact profile and vector suite compiled into this binary.
+    ///
+    /// A signed or pinned artifact authenticates its bytes; it cannot select a
+    /// different canonicalizer implementation merely by naming new digests.
+    pub fn require_frozen_runtime_profile(&self) -> ContractResult<()> {
+        self.validate()?;
+        if self.profile_digest != FROZEN_PROFILE_DIGEST
+            || self.vector_manifest_digest != FROZEN_VECTOR_MANIFEST_DIGEST
+        {
+            return Err(ContractError::ProfileMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Return the exact profile reference implemented by this binary.
+pub fn frozen_profile_reference_v1() -> ProfileReferenceV1 {
+    FROZEN_PROFILE_REFERENCE_V1.clone()
 }
 
 /// Immutable reference to one entry in an activated registry package.
@@ -396,6 +435,35 @@ mod tests {
         for invalid in ["", "Upper", "two words", "é"] {
             assert!(ContractId::new(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn runtime_profile_is_exactly_frozen() {
+        let frozen = frozen_profile_reference_v1();
+        assert_eq!(frozen.profile_id.as_str(), PROFILE_ID);
+        assert_eq!(
+            frozen.profile_digest.to_hex(),
+            "cf22991a86bfc560556c7d04efa4ee6b7b1ee0f49c919b257ea7b4f30f8e4a29"
+        );
+        assert_eq!(
+            frozen.vector_manifest_digest.to_hex(),
+            "f984f62866fc769df3a5617a2247e3ade694827c1de69e615a7bda68858b4174"
+        );
+        frozen.require_frozen_runtime_profile().unwrap();
+
+        let mut wrong_profile = frozen.clone();
+        wrong_profile.profile_digest = Sha256Digest::ZERO;
+        assert_eq!(
+            wrong_profile.require_frozen_runtime_profile(),
+            Err(ContractError::ProfileMismatch)
+        );
+
+        let mut wrong_vectors = frozen;
+        wrong_vectors.vector_manifest_digest = Sha256Digest::ZERO;
+        assert_eq!(
+            wrong_vectors.require_frozen_runtime_profile(),
+            Err(ContractError::ProfileMismatch)
+        );
     }
 
     #[test]
