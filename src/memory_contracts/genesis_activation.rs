@@ -431,7 +431,6 @@ impl VerifiedGenesisRegistryActivationRequest {
     /// The first seam rejects expiry and future-effective activation; the
     /// repository must additionally enforce that `effective_from` is not before
     /// the persisted bootstrap acceptance time.
-    #[allow(dead_code)] // Stage 3 repository seam; not callable by external request code.
     pub(crate) fn receipt_at(
         &self,
         bootstrap_accepted_at: &CanonicalTimestamp,
@@ -462,7 +461,6 @@ impl VerifiedGenesisRegistryActivationRequest {
 
     /// Derive the first active head only after revalidating the server-derived
     /// receipt against this authority token.
-    #[allow(dead_code)] // Stage 3 repository seam; not callable by external request code.
     pub(crate) fn registry_head(
         &self,
         receipt: &GenesisRegistryActivationReceiptV1,
