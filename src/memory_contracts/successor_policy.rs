@@ -357,7 +357,7 @@ pub(crate) struct ActiveGenesisSuccessorWitness {
 #[cfg(test)]
 impl ActiveGenesisSuccessorWitness {
     #[allow(clippy::too_many_arguments)]
-    fn from_test_fixture(
+    pub(crate) fn from_test_fixture(
         profile: ProfileReferenceV1,
         scope: AuthenticatedProjectScopeV1,
         genesis_registry_head: RegistryHeadBindingV1,

@@ -91,6 +91,9 @@ pub enum DigestDomain {
     RegistryActivationApproval,
     RegistryActivationReceipt,
     RegistryActivationStream,
+    RegistrySuccessorActivationStatementV1,
+    RegistrySuccessorActivationApprovalV1,
+    RegistrySuccessorActivationReceiptV1,
     RegistryTestResult,
     GenesisSuccessorKeyBridgeV1,
     ResourceLocator,
@@ -128,6 +131,15 @@ impl DigestDomain {
             Self::RegistryActivationApproval => "ostk-registry-activation-approval-v1",
             Self::RegistryActivationReceipt => "ostk-registry-activation-receipt-v1",
             Self::RegistryActivationStream => "ostk-registry-activation-stream-v1",
+            Self::RegistrySuccessorActivationStatementV1 => {
+                "ostk-registry-successor-activation-statement-v1"
+            }
+            Self::RegistrySuccessorActivationApprovalV1 => {
+                "ostk-registry-successor-activation-approval-v1"
+            }
+            Self::RegistrySuccessorActivationReceiptV1 => {
+                "ostk-registry-successor-activation-receipt-v1"
+            }
             Self::RegistryTestResult => "ostk-registry-test-result-v1",
             Self::GenesisSuccessorKeyBridgeV1 => "ostk-genesis-successor-key-bridge-v1",
             Self::ResourceLocator => "ostk-resource-locator-v1",

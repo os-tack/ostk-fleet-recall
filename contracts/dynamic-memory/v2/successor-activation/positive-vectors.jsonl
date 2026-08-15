@@ -1,0 +1,1 @@
+{"cases":["canonical_target_transition","current_v1_bridge_authority","opaque_request_is_non_durable","server_time_mints_receipt","stable_registry_activation_stream","target_v2_policy_is_future_authority"],"expected_outcome":"accept","schema_version":1,"suite_id":"registry.successor_activation.v1"}
