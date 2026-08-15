@@ -210,7 +210,7 @@ impl GenesisBootstrapAppendV1 {
 }
 
 /// H1 = framed AppendChain(H0, canonical append position, accepted-event ID).
-fn derive_append_chain_digest(
+pub(crate) fn derive_append_chain_digest(
     previous_chain_digest: Sha256Digest,
     accepted_event_id: AcceptedEventId,
     append_position: &AppendPositionV1,

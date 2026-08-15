@@ -4,6 +4,12 @@
 //! Control-log repositories bind their SQL coordinates and semantic authority
 //! scope once at construction rather than accepting routing fields per call.
 
+mod cockroach;
+mod repository;
 mod types;
 
+pub use cockroach::CockroachGenesisRepository;
+pub use repository::{
+    GenesisBootstrapInspection, GenesisBootstrapOutcome, GenesisInspection, GenesisRepository,
+};
 pub use types::TrustedControlScope;

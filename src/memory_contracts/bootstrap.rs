@@ -290,6 +290,39 @@ pub struct VerifiedBootstrapReceipt {
     epoch_id: EpochId,
 }
 
+/// Canonical, signature-checked bootstrap bytes that are still untrusted
+/// because no out-of-band deployment pin was supplied. This type exists only
+/// for auditing an already persisted singleton and cannot authorize appends.
+pub(crate) struct IntegrityCheckedBootstrapReceipt {
+    receipt: BootstrapReceiptV1,
+    canonical_bytes: Vec<u8>,
+    receipt_digest: BootstrapReceiptDigest,
+    statement_id: BootstrapStatementId,
+    epoch_id: EpochId,
+}
+
+impl IntegrityCheckedBootstrapReceipt {
+    pub(crate) const fn receipt(&self) -> &BootstrapReceiptV1 {
+        &self.receipt
+    }
+
+    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    pub(crate) const fn receipt_digest(&self) -> BootstrapReceiptDigest {
+        self.receipt_digest
+    }
+
+    pub(crate) const fn statement_id(&self) -> BootstrapStatementId {
+        self.statement_id
+    }
+
+    pub(crate) const fn epoch_id(&self) -> EpochId {
+        self.epoch_id
+    }
+}
+
 impl VerifiedBootstrapReceipt {
     pub const fn receipt(&self) -> &BootstrapReceiptV1 {
         &self.receipt
@@ -317,20 +350,36 @@ impl VerifiedBootstrapReceipt {
 
     pub fn genesis_chain_digest(&self, shard: u16) -> ContractResult<Sha256Digest> {
         let epoch = &self.receipt.statement.genesis_epoch;
-        if shard >= epoch.partition_recipe.shard_count {
-            return Err(ContractError::Schema(
-                "genesis chain shard is outside the epoch".into(),
-            ));
-        }
-        Ok(framed_digest(
-            DigestDomain::GenesisChain,
-            &[
-                self.receipt_digest.digest().as_bytes(),
-                self.epoch_id.digest().as_bytes(),
-                &shard.to_be_bytes(),
-            ],
-        ))
+        derive_genesis_chain_digest(
+            self.receipt_digest,
+            self.epoch_id,
+            shard,
+            epoch.partition_recipe.shard_count,
+        )
     }
+}
+
+/// Pure contract math for auditing a persisted genesis head. This does not
+/// authenticate a receipt or mint bootstrap authority.
+pub(crate) fn derive_genesis_chain_digest(
+    receipt_digest: BootstrapReceiptDigest,
+    epoch_id: EpochId,
+    shard: u16,
+    shard_count: u16,
+) -> ContractResult<Sha256Digest> {
+    if shard >= shard_count {
+        return Err(ContractError::Schema(
+            "genesis chain shard is outside the epoch".into(),
+        ));
+    }
+    Ok(framed_digest(
+        DigestDomain::GenesisChain,
+        &[
+            receipt_digest.digest().as_bytes(),
+            epoch_id.digest().as_bytes(),
+            &shard.to_be_bytes(),
+        ],
+    ))
 }
 
 /// Verify one exact canonical bootstrap artifact against the deployment pin.
@@ -341,7 +390,44 @@ pub fn verify_pinned_bootstrap(
     expected_scope: &AuthenticatedProjectScopeV1,
     genesis_package: &SemanticallyClosedGenesisPackage,
 ) -> ContractResult<VerifiedBootstrapReceipt> {
-    expected_profile.validate()?;
+    let parsed = parse_bootstrap_receipt(input)?;
+    if parsed.receipt_digest != pin.0 {
+        return Err(ContractError::BootstrapPinMismatch);
+    }
+    let checked =
+        validate_bootstrap_integrity(parsed, expected_profile, expected_scope, genesis_package)?;
+    Ok(VerifiedBootstrapReceipt {
+        receipt: checked.receipt,
+        canonical_bytes: checked.canonical_bytes,
+        receipt_digest: checked.receipt_digest,
+        statement_id: checked.statement_id,
+        epoch_id: checked.epoch_id,
+    })
+}
+
+/// Check canonical bytes, exact bindings, threshold, and signatures without
+/// treating a database-derived digest as deployment authority.
+pub(crate) fn audit_untrusted_bootstrap_integrity(
+    input: &[u8],
+    expected_profile: &ProfileReferenceV1,
+    expected_scope: &AuthenticatedProjectScopeV1,
+    genesis_package: &SemanticallyClosedGenesisPackage,
+) -> ContractResult<IntegrityCheckedBootstrapReceipt> {
+    validate_bootstrap_integrity(
+        parse_bootstrap_receipt(input)?,
+        expected_profile,
+        expected_scope,
+        genesis_package,
+    )
+}
+
+struct ParsedBootstrapReceipt {
+    receipt: BootstrapReceiptV1,
+    canonical_bytes: Vec<u8>,
+    receipt_digest: BootstrapReceiptDigest,
+}
+
+fn parse_bootstrap_receipt(input: &[u8]) -> ContractResult<ParsedBootstrapReceipt> {
     require_canonical(input)?;
     let receipt: BootstrapReceiptV1 = decode_strict(input)?;
     if receipt.schema_version != BOOTSTRAP_SCHEMA_VERSION {
@@ -355,10 +441,25 @@ pub fn verify_pinned_bootstrap(
         DigestDomain::BootstrapReceipt,
         &canonical_bytes,
     ));
-    if receipt_digest != pin.0 {
-        return Err(ContractError::BootstrapPinMismatch);
-    }
+    Ok(ParsedBootstrapReceipt {
+        receipt,
+        canonical_bytes,
+        receipt_digest,
+    })
+}
 
+fn validate_bootstrap_integrity(
+    parsed: ParsedBootstrapReceipt,
+    expected_profile: &ProfileReferenceV1,
+    expected_scope: &AuthenticatedProjectScopeV1,
+    genesis_package: &SemanticallyClosedGenesisPackage,
+) -> ContractResult<IntegrityCheckedBootstrapReceipt> {
+    expected_profile.validate()?;
+    let ParsedBootstrapReceipt {
+        receipt,
+        canonical_bytes,
+        receipt_digest,
+    } = parsed;
     receipt.statement.validate()?;
     let statement_id = receipt.statement.statement_id()?;
     let expected_package_digest = genesis_package.package_digest();
@@ -408,7 +509,7 @@ pub fn verify_pinned_bootstrap(
     }
 
     let epoch_id = receipt.statement.genesis_epoch.epoch_id()?;
-    Ok(VerifiedBootstrapReceipt {
+    Ok(IntegrityCheckedBootstrapReceipt {
         receipt,
         canonical_bytes,
         receipt_digest,
@@ -492,7 +593,7 @@ impl AppendPositionV1 {
 
 /// Derive a bounded shard number. Epoch, scope, family, and key are all framed;
 /// no physical position enters semantic event identity.
-fn partition_for_epoch(
+pub(crate) fn partition_for_epoch(
     epoch: &GenesisLogEpochV1,
     key: &ConsistencyPartitionKeyV1,
 ) -> ContractResult<u16> {
@@ -673,6 +774,29 @@ mod tests {
         assert!(
             verify_pinned_bootstrap(&bytes, wrong_pin, &profile(), &scope(), &package).is_err()
         );
+
+        let mut invalid_signature = signed_receipt(&package);
+        invalid_signature.attestations[0].signature = FixedHex64::from_bytes([0; 64]);
+        let invalid_signature_bytes = encode_canonical(&invalid_signature).unwrap();
+        assert!(matches!(
+            verify_pinned_bootstrap(
+                &invalid_signature_bytes,
+                wrong_pin,
+                &profile(),
+                &scope(),
+                &package,
+            ),
+            Err(ContractError::BootstrapPinMismatch)
+        ));
+        assert!(matches!(
+            audit_untrusted_bootstrap_integrity(
+                &invalid_signature_bytes,
+                &profile(),
+                &scope(),
+                &package,
+            ),
+            Err(ContractError::SignatureVerification)
+        ));
 
         receipt.attestations.truncate(1);
         let bytes = encode_canonical(&receipt).unwrap();

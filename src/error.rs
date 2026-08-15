@@ -1,3 +1,5 @@
+use crate::memory_contracts::ContractError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum FleetError {
     #[error("configuration error: {0}")]
@@ -12,6 +14,12 @@ pub enum FleetError {
     Protocol(String),
     #[error("idempotency conflict: {0}")]
     IdempotencyConflict(String),
+    #[error("control contract validation failed: {0}")]
+    ControlContract(#[from] ContractError),
+    #[error("genesis bootstrap conflicts with the existing control authority: {0}")]
+    GenesisBootstrapConflict(String),
+    #[error("control log is corrupt or incomplete: {0}")]
+    ControlLogCorrupt(String),
     #[error("memory operation failed: {0}")]
     Memory(String),
 }
