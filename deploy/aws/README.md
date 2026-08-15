@@ -334,7 +334,7 @@ diagnostics.
 
 ### Prove a source-backed documentation/code conflict
 
-After schema 2 is migrated and `./deploy/aws/run-seed.sh --rich-demo` has
+After schema 2 or newer is migrated and `./deploy/aws/run-seed.sh --rich-demo` has
 completed, run the separate self-audit proof with a fresh ID. It does not alter
 the four-step publication receipt above:
 
@@ -358,7 +358,7 @@ jq -e '
   .conflict.surfaced_by_semantic_recall == true and
   .retrieval.support_claims_matched > 0 and
   .retrieval.support_claims_truncated == false and
-  .cockroachdb_capabilities.schema_version == 2 and
+  .cockroachdb_capabilities.schema_version >= 2 and
   .cockroachdb_capabilities.claim_support_chunk_index_enabled == true
 ' --arg run "$SELF_AUDIT_RUN_ID" "$SELF_AUDIT_RECEIPT"
 ```

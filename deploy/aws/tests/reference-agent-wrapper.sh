@@ -86,12 +86,15 @@ mock_curl() {
             ;;
         https://fleet.example.test/api/status)
             claim_support_chunk_index_enabled=true
+            schema_version=2
             if [ "$mock_scenario" = claim-support-index-disabled ]; then
                 claim_support_chunk_index_enabled=false
             fi
+            [ "$mock_scenario" != schema-newer ] || schema_version=3
             jq -cn \
                 --argjson claim_support_chunk_index_enabled \
-                    "$claim_support_chunk_index_enabled" '{
+                    "$claim_support_chunk_index_enabled" \
+                --argjson schema_version "$schema_version" '{
                 data: {
                     status: "ready",
                     database: {
@@ -102,7 +105,7 @@ mock_curl() {
                         claim_support_chunk_index_enabled:
                             $claim_support_chunk_index_enabled,
                         cosine_distance_supported: true,
-                        schema_version: 2
+                        schema_version: $schema_version
                     },
                     embedding_model: "minishlab/potion-retrieval-32M",
                     embedding_dimension: 512
@@ -372,6 +375,16 @@ if grep -Eq 'arn:|[0-9]{12}' "$test_root/success.json"; then
 fi
 [ "$(sed -n '1p' "$success_state/run-count")" = 4 ]
 [ "$(sed -n '1p' "$success_state/curl-count")" = 4 ]
+
+newer_schema_state=$test_root/schema-newer
+run_mock "$newer_schema_state" schema-newer mock-run-schema-3 \
+    > "$test_root/schema-newer.json" 2> "$test_root/schema-newer.err"
+jq -e '.public_demo.cockroachdb_capabilities.schema_version == 3' \
+    "$test_root/schema-newer.json" >/dev/null
+"$publication_verifier" "$test_root/schema-newer.json" \
+    > "$test_root/schema-newer-validation.json"
+jq -e '.verified == true and .receipts == ["reference-agent"]' \
+    "$test_root/schema-newer-validation.json" >/dev/null
 
 if run_mock "$test_root/invalid-run" success -clap-option \
     > "$test_root/invalid-run.out" 2> "$test_root/invalid-run.err"; then

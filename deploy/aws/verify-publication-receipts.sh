@@ -143,7 +143,7 @@ if ! jq -e '
     .public_demo.cockroachdb_capabilities.conflict_membership_index_enabled == true and
     .public_demo.cockroachdb_capabilities.claim_support_chunk_index_enabled == true and
     .public_demo.cockroachdb_capabilities.cosine_distance_supported == true and
-    .public_demo.cockroachdb_capabilities.schema_version == 2 and
+    .public_demo.cockroachdb_capabilities.schema_version >= 2 and
     .public_demo.cockroachdb_capabilities.embedding_dimension == 512
 ' "$reference_receipt" >/dev/null; then
     fail "reference-agent receipt failed its complete schema and correlation contract"

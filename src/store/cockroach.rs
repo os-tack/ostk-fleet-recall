@@ -28,6 +28,9 @@ pub const EMBEDDING_DIMENSION: usize = 512;
 /// Largest integer every supported JavaScript/JSON client can represent
 /// without precision loss.
 pub const MAX_PUBLIC_NUMERIC_ID: i64 = 9_007_199_254_740_991;
+/// Oldest additive database schema supported by the existing recall, remember,
+/// ingestion, and public-demo paths.
+pub const MINIMUM_RECALL_SCHEMA_VERSION: i64 = 2;
 
 const INITIAL_MIGRATION_SQL: &str = include_str!("../../migrations/0001_fleet_memory.sql");
 const CLAIM_SUPPORT_CHUNK_MIGRATION_SQL: &str =
@@ -272,6 +275,17 @@ pub struct DatabaseCapabilities {
     pub claim_support_chunk_index_enabled: bool,
     pub cosine_distance_supported: bool,
     pub schema_version: i64,
+}
+
+impl DatabaseCapabilities {
+    /// Whether this database has reached a command's minimum additive schema.
+    ///
+    /// Callers that depend on newer tables must supply their own higher floor;
+    /// a later migration must not make the established schema-2 paths unhealthy.
+    #[must_use]
+    pub const fn supports_schema_version(&self, minimum: i64) -> bool {
+        self.schema_version >= minimum
+    }
 }
 
 /// The model coordinate registered for this trusted corpus, if ingestion has
@@ -570,7 +584,7 @@ impl CockroachStore {
         .fetch_one(&self.pool)
         .await?;
         let capabilities = self.capabilities().await?;
-        if capabilities.schema_version != 2
+        if !capabilities.supports_schema_version(MINIMUM_RECALL_SCHEMA_VERSION)
             || !capabilities.vector_index_enabled
             || !capabilities.lexical_index_enabled
             || !capabilities.conflict_membership_index_enabled
@@ -1555,6 +1569,28 @@ mod tests {
     }
 
     #[test]
+    fn database_schema_compatibility_is_a_minimum_floor() {
+        for (schema_version, minimum, expected) in [
+            (1, MINIMUM_RECALL_SCHEMA_VERSION, false),
+            (2, MINIMUM_RECALL_SCHEMA_VERSION, true),
+            (3, MINIMUM_RECALL_SCHEMA_VERSION, true),
+            (2, 3, false),
+            (3, 3, true),
+        ] {
+            let capabilities = DatabaseCapabilities {
+                version: "CockroachDB test".into(),
+                vector_index_enabled: true,
+                lexical_index_enabled: true,
+                conflict_membership_index_enabled: true,
+                claim_support_chunk_index_enabled: true,
+                cosine_distance_supported: true,
+                schema_version,
+            };
+            assert_eq!(capabilities.supports_schema_version(minimum), expected);
+        }
+    }
+
+    #[test]
     fn retries_only_cockroach_serialization_sqlstate() {
         assert!(is_retryable_sqlstate(Some("40001")));
         assert!(!is_retryable_sqlstate(Some("40P01")));
@@ -1740,7 +1776,7 @@ mod tests {
         assert!(capabilities.conflict_membership_index_enabled);
         assert!(capabilities.claim_support_chunk_index_enabled);
         assert!(capabilities.cosine_distance_supported);
-        assert_eq!(capabilities.schema_version, 2);
+        assert!(capabilities.supports_schema_version(MINIMUM_RECALL_SCHEMA_VERSION));
 
         let cleanup = sqlx::query(
             "WITH deleted_active AS (\

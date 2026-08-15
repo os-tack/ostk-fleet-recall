@@ -68,6 +68,7 @@ mock_curl() {
         https://fleet.example.test/api/status)
             schema_version=2
             [ "$mock_scenario" != schema-mismatch ] || schema_version=1
+            [ "$mock_scenario" != schema-newer ] || schema_version=3
             jq -cn --argjson schema_version "$schema_version" '{
                 data: {
                     status: "ready",
@@ -412,6 +413,12 @@ if grep -Eiq \
     exit 1
 fi
 
+newer_schema_state=$test_root/schema-newer
+run_mock "$newer_schema_state" schema-newer \
+    > "$test_root/schema-newer.json" 2> "$test_root/schema-newer.err"
+jq -e '.cockroachdb_capabilities.schema_version == 3' \
+    "$test_root/schema-newer.json" >/dev/null
+
 expect_failure() {
     scenario=$1
     message=$2
@@ -425,7 +432,7 @@ expect_failure() {
 }
 
 expect_failure schema-mismatch \
-    'status did not prove CockroachDB schema 2'
+    'status did not prove CockroachDB schema 2 or newer'
 expect_failure task-failure \
     'record-retraction-implementation-claim failed (exit=23)'
 expect_failure duplicate-evidence \

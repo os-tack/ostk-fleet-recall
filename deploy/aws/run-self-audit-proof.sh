@@ -113,7 +113,7 @@ if ! capabilities=$(printf '%s' "$status" | jq -ce '
         .data.database.conflict_membership_index_enabled == true and
         .data.database.claim_support_chunk_index_enabled == true and
         .data.database.cosine_distance_supported == true and
-        .data.database.schema_version == 2
+        .data.database.schema_version >= 2
     ) |
     {
         vector_index_enabled: .data.database.vector_index_enabled,
@@ -126,7 +126,7 @@ if ! capabilities=$(printf '%s' "$status" | jq -ce '
         schema_version: .data.database.schema_version
     }
 ' 2>/dev/null); then
-    fail "public demo status did not prove CockroachDB schema 2 and source-conflict projection capabilities"
+    fail "public demo status did not prove CockroachDB schema 2 or newer and source-conflict projection capabilities"
 fi
 unset status
 

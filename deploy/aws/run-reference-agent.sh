@@ -106,7 +106,7 @@ if ! status_receipt=$(printf '%s' "$status" | jq -ce '
         .data.database.conflict_membership_index_enabled == true and
         .data.database.claim_support_chunk_index_enabled == true and
         .data.database.cosine_distance_supported == true and
-        .data.database.schema_version == 2 and
+        .data.database.schema_version >= 2 and
         (.data.embedding_model | type == "string" and length > 0) and
         .data.embedding_dimension == 512
     ) |
