@@ -100,8 +100,27 @@ assert_exact() {
     fi
 }
 
+deny_table_dml() {
+    local user=$1
+    local table=$2
+    expect_denied "$user" "$table SELECT" \
+        "SELECT count(*) FROM $table"
+    expect_denied "$user" "$table INSERT" \
+        "INSERT INTO $table (tenant_id) VALUES ('0198a849-f6ae-7d61-9800-000000000099')"
+    expect_denied "$user" "$table UPDATE" \
+        "UPDATE $table SET project = project WHERE false"
+    expect_denied "$user" "$table DELETE" \
+        "DELETE FROM $table WHERE false"
+}
+
+apply_successor_quarantine() {
+    docker exec -i "$container" cockroach sql \
+        --insecure --database fleet_recall \
+        < "$repo_root/deploy/cockroach/successor-schema-quarantine-grants.sql"
+}
+
 # Freeze the Stage-2 command's deliberately older compatibility gate. The
-# current proof database reaches version 9, but bootstrap authority is complete
+# current proof database reaches version 14, but bootstrap authority is complete
 # at the uninterrupted successful prefix 1 through 3.
 control_required_schema_version=$(sed -n \
     's/^const REQUIRED_SCHEMA_VERSION: i64 = \([0-9][0-9]*\);$/\1/p' \
@@ -144,7 +163,12 @@ for migration in \
     0006_control_bootstrap_explicit_acceptance_time.sql \
     0007_control_epoch_explicit_creation_time.sql \
     0008_control_head_explicit_advance_time.sql \
-    0009_control_event_explicit_acceptance_time.sql
+    0009_control_event_explicit_acceptance_time.sql \
+    0010_registry_genesis_head_root_index.sql \
+    0011_registry_genesis_activation_root_index.sql \
+    0012_registry_transition_history.sql \
+    0013_registry_genesis_bridge_consumption.sql \
+    0014_registry_current_head_v2.sql
 do
     docker exec -i "$container" cockroach sql --insecure --database fleet_recall \
         < "$repo_root/migrations/$migration" >/dev/null
@@ -156,13 +180,15 @@ root_sql '
 CREATE TABLE memory_chunks (id INT8 PRIMARY KEY);
 CREATE SEQUENCE memory_claim_id_seq START 1 MINVALUE 1 MAXVALUE 9007199254740991;
 ' >/dev/null
-root_sql 'CREATE TABLE _sqlx_migrations (version INT8 PRIMARY KEY, success BOOL NOT NULL); INSERT INTO _sqlx_migrations SELECT version, true FROM generate_series(1, 9) AS version' \
+root_sql 'CREATE TABLE _sqlx_migrations (version INT8 PRIMARY KEY, success BOOL NOT NULL); INSERT INTO _sqlx_migrations SELECT version, true FROM generate_series(1, 14) AS version' \
     >/dev/null
 root_sql '
 CREATE USER proof_database_owner;
 CREATE USER proof_runtime;
 CREATE USER proof_bootstrap;
+CREATE USER proof_activation;
 CREATE USER proof_public;
+CREATE ROLE fleet_registry_activation;
 ALTER DATABASE fleet_recall OWNER TO proof_database_owner;
 ' \
     >/dev/null
@@ -193,9 +219,37 @@ GRANT SELECT ON TABLE memory_chunks TO public, fleet_control_bootstrap;
 GRANT ALL ON SEQUENCE memory_claim_id_seq TO public, fleet_control_bootstrap;
 GRANT DELETE ON TABLE memory_control_events
     TO public, fleet_runtime, fleet_control_bootstrap;
+GRANT ALL ON TABLE
+    memory_registry_transitions,
+    memory_registry_genesis_bridge_consumptions,
+    memory_registry_current_heads_v2
+TO public;
+GRANT ALL ON TABLE
+    memory_registry_transitions,
+    memory_registry_genesis_bridge_consumptions,
+    memory_registry_current_heads_v2
+TO
+    fleet_runtime,
+    fleet_control_bootstrap,
+    fleet_registry_activation
+WITH GRANT OPTION;
 ' >/dev/null
 docker exec -i "$container" cockroach sql --insecure --database fleet_recall \
     < "$repo_root/deploy/cockroach/control-role-grants.sql" >/dev/null
+
+# The dedicated post-14 policy refuses a failed intermediate even when version
+# 14 is successful. Restore the proof row, repair every successor-table grant
+# and grant option, then prove idempotent reapplication.
+root_sql 'UPDATE _sqlx_migrations SET success = false WHERE version = 12' >/dev/null
+if quarantine_failure=$(apply_successor_quarantine 2>&1); then
+    fail "successor quarantine accepted a failed migration 12"
+fi
+grep -Fq 'requires the complete successful migration prefix through 14' \
+    <<<"$quarantine_failure" \
+    || fail "successor quarantine did not retain its exact-prefix failure"
+root_sql 'UPDATE _sqlx_migrations SET success = true WHERE version = 12' >/dev/null
+apply_successor_quarantine >/dev/null
+apply_successor_quarantine >/dev/null
 
 # Exercise the reverse cross-role edge separately because CockroachDB rejects a
 # membership cycle before the policy can repair it.
@@ -203,8 +257,13 @@ root_sql 'GRANT fleet_control_bootstrap TO fleet_runtime' >/dev/null
 docker exec -i "$container" cockroach sql --insecure --database fleet_recall \
     < "$repo_root/deploy/cockroach/control-role-grants.sql" >/dev/null
 
-root_sql 'GRANT fleet_runtime TO proof_runtime; GRANT fleet_control_bootstrap TO proof_bootstrap' \
-    >/dev/null
+root_sql '
+GRANT fleet_runtime TO proof_runtime;
+GRANT fleet_control_bootstrap TO proof_bootstrap;
+GRANT fleet_registry_activation TO proof_activation;
+GRANT CONNECT ON DATABASE fleet_recall TO proof_activation;
+GRANT USAGE ON SCHEMA public TO proof_activation;
+' >/dev/null
 
 control_grants=$(root_sql "
 SELECT table_name || ':' || grantee || ':' || privilege_type || ':' ||
@@ -236,6 +295,22 @@ ORDER BY grantee, privilege_type" | tail -n +2)
 expected_migration_grants='_sqlx_migrations:fleet_control_bootstrap:SELECT:not_grantable
 _sqlx_migrations:fleet_runtime:SELECT:not_grantable'
 assert_exact "migration-table grants" "$migration_grants" "$expected_migration_grants"
+
+successor_grants=$(root_sql "
+SELECT table_name || ':' || grantee || ':' || privilege_type || ':' ||
+       CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END AS normalized
+FROM [SHOW GRANTS ON TABLE
+    memory_registry_transitions,
+    memory_registry_genesis_bridge_consumptions,
+    memory_registry_current_heads_v2]
+WHERE grantee IN (
+    'public',
+    'fleet_runtime',
+    'fleet_control_bootstrap',
+    'fleet_registry_activation'
+)
+ORDER BY table_name, grantee, privilege_type" | tail -n +2)
+assert_exact "successor-table quarantine grants" "$successor_grants" ''
 
 bootstrap_current_object_grants=$(root_sql "
 SELECT object_type || ':' || object_name || ':' || privilege_type || ':' ||
@@ -374,7 +449,7 @@ expect_denied proof_runtime "runtime control write" \
     "INSERT INTO memory_control_bootstraps (tenant_id) VALUES ('0198a849-f6ae-7d61-9800-000000000001')"
 expect_denied proof_public "public control read" \
     'SELECT count(*) FROM memory_control_events'
-expect_scalar proof_runtime "current successful migration prefix" \
+expect_scalar proof_runtime "successful Stage-3 migration prefix" \
     'SELECT count(*) = 9 AND COALESCE(bool_and(success), false)
      FROM _sqlx_migrations WHERE version BETWEEN 1 AND 9' \
     't'
@@ -511,11 +586,21 @@ expect_denied proof_bootstrap "grant delegation" \
 expect_denied proof_bootstrap "role-membership delegation" \
     'GRANT fleet_control_bootstrap TO proof_public'
 
+# No pre-successor principal has any DML path to the post-14 authority tables.
+for user in proof_runtime proof_bootstrap proof_activation proof_public; do
+    deny_table_dml "$user" memory_registry_transitions
+    deny_table_dml "$user" memory_registry_genesis_bridge_consumptions
+    deny_table_dml "$user" memory_registry_current_heads_v2
+done
+
 echo "verified effective bootstrap grants:"
 root_sql "SHOW GRANTS ON TABLE
     memory_control_bootstraps,
     memory_control_log_epochs,
     memory_control_shard_heads,
-    memory_control_events
+    memory_control_events,
+    memory_registry_transitions,
+    memory_registry_genesis_bridge_consumptions,
+    memory_registry_current_heads_v2
     FOR fleet_control_bootstrap"
 echo "secondary Docker control-role grant parity proof passed"

@@ -83,6 +83,23 @@ fail() {
     exit 1
 }
 
+root_scalar() {
+    "$crdb" sql --url="$root_url" --format=tsv --execute="$1" | tail -n +2
+}
+
+assert_root_scalar() {
+    local label=$1
+    local statement=$2
+    local expected=$3
+    local actual
+    actual=$(root_scalar "$statement")
+    if test "$actual" != "$expected"; then
+        printf '%s\n' "unexpected $label" \
+            "expected: $expected" "actual: $actual" >&2
+        fail "$label did not match the authoritative schema state"
+    fi
+}
+
 mkdir -p "$artifact_dir"
 "$crdb" cert create-ca --certs-dir="$cert_dir" \
     --ca-key="$proof_dir/ca.key" >/dev/null
@@ -128,11 +145,77 @@ FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
     cargo test --locked --test control_log_live -- --nocapture
 FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
     cargo test --locked --test registry_activation_live -- --nocapture
+FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+    cargo test --locked --lib \
+        store::cockroach::tests::live_transactional_migration_rolls_back_ddl_on_history_conflict_when_configured \
+        -- --exact --nocapture
+
+# Freeze the authoritative schema independently of the two Stage-2/Stage-3
+# command preflights. The database must have exactly the successful embedded
+# migration chain through 14 and all three successor authority tables.
+assert_root_scalar "exact successful migration prefix 1 through 14" '
+    SELECT CASE WHEN count(*) = 14
+                          AND min(version) = 1
+                          AND max(version) = 14
+                          AND COALESCE(bool_and(success), false)
+                     THEN '\''ready'\'' ELSE '\''not_ready'\'' END
+    FROM _sqlx_migrations' 'ready'
+assert_root_scalar "successor authority table set" '
+    SELECT string_agg(table_name, '\''|'\'' ORDER BY table_name)
+    FROM information_schema.tables
+    WHERE table_schema = '\''public'\''
+      AND table_name IN (
+          '\''memory_registry_transitions'\'',
+          '\''memory_registry_genesis_bridge_consumptions'\'',
+          '\''memory_registry_current_heads_v2'\''
+      )' 'memory_registry_current_heads_v2|memory_registry_genesis_bridge_consumptions|memory_registry_transitions'
+assert_root_scalar "exact successor root index set" '
+    SELECT string_agg(tablename || '\'':'\'' || indexname, '\''|'\'' ORDER BY tablename)
+    FROM pg_catalog.pg_indexes
+    WHERE schemaname = '\''public'\''
+      AND indexname IN (
+          '\''memory_registry_heads_genesis_root_idx'\'',
+          '\''memory_registry_activations_genesis_root_idx'\''
+      )' 'memory_registry_activations:memory_registry_activations_genesis_root_idx|memory_registry_heads:memory_registry_heads_genesis_root_idx'
+
+# Migrations 10 and 11 are the intentionally resumable online-index phase.
+# Replaying their exact bytes must accept the existing exact indexes without
+# changing SQLx history or silently accepting a same-name/different-shape index.
+"$crdb" sql --url="$root_url" \
+    < "$repo_root/migrations/0010_registry_genesis_head_root_index.sql" >/dev/null
+"$crdb" sql --url="$root_url" \
+    < "$repo_root/migrations/0011_registry_genesis_activation_root_index.sql" >/dev/null
+assert_root_scalar "migration history after exact index replay" \
+    'SELECT count(*)::STRING FROM _sqlx_migrations' '14'
+
+# Demonstrate why MAX(successful version) is not a readiness check: version 14
+# remains successful while a failed version 12 makes the complete-prefix gate
+# false. Restore the row before exercising either v9-compatible private CLI.
+"$crdb" sql --url="$root_url" \
+    --execute='UPDATE _sqlx_migrations SET success = false WHERE version = 12' >/dev/null
+assert_root_scalar "later success remains visible during failed migration 12" \
+    'SELECT max(version)::STRING FROM _sqlx_migrations WHERE success' '14'
+assert_root_scalar "failed migration 12 is not masked by version 14" '
+    SELECT CASE WHEN count(*) = 14
+                          AND min(version) = 1
+                          AND max(version) = 14
+                          AND COALESCE(bool_and(success), false)
+                     THEN '\''ready'\'' ELSE '\''not_ready'\'' END
+    FROM _sqlx_migrations' 'not_ready'
+"$crdb" sql --url="$root_url" \
+    --execute='UPDATE _sqlx_migrations SET success = true WHERE version = 12' >/dev/null
+assert_root_scalar "restored successful migration prefix 1 through 14" '
+    SELECT CASE WHEN count(*) = 14 AND COALESCE(bool_and(success), false)
+                     THEN '\''ready'\'' ELSE '\''not_ready'\'' END
+    FROM _sqlx_migrations
+    WHERE version BETWEEN 1 AND 14' 'ready'
 
 "$crdb" sql --url="$root_url" \
     < "$repo_root/deploy/cockroach/control-role-grants.sql" >/dev/null
 "$crdb" sql --url="$root_url" \
     < "$repo_root/deploy/cockroach/registry-activation-role-grants.sql" >/dev/null
+"$crdb" sql --url="$root_url" \
+    < "$repo_root/deploy/cockroach/successor-schema-quarantine-grants.sql" >/dev/null
 
 # Login identities are distinct from the non-login logical roles. Neither
 # private credential is the root/migrator or the serving credential.
@@ -209,10 +292,6 @@ run_activation() {
         --registry-test-result "$registry_test_result" \
         --activation-statement "$statement" \
         --activation-approval-set "$approvals"
-}
-
-root_scalar() {
-    "$crdb" sql --url="$root_url" --format=tsv --execute="$1" | tail -n +2
 }
 
 scope_shape() {

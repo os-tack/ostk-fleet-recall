@@ -2,12 +2,15 @@
 -- database.
 --
 -- Run only after the complete successful migration prefix 1 through 9 and the
--- Stage-2 control-role policy as a cluster admin, or as a dedicated security
--- operator that has CREATEROLE, the required role admin options and SYSTEM
--- grant options, plus grant authority on every object below. Database ownership
--- alone is insufficient. Login users and their passwords/identity-provider
--- bindings are intentionally provisioned outside this file. Give the private
--- activation login membership only in this logical role.
+-- Stage-2 control-role policy. This base policy intentionally remains runnable
+-- at version 9; after migration 0014, also apply the separately gated
+-- successor-schema-quarantine-grants.sql. Run as a cluster admin, or as a
+-- dedicated security operator that has CREATEROLE, the required role admin
+-- options and SYSTEM grant options, plus grant authority on every object below.
+-- Database ownership alone is insufficient. Login users and their
+-- passwords/identity-provider bindings are intentionally provisioned outside
+-- this file. Give the private activation login membership only in this logical
+-- role.
 
 CREATE ROLE IF NOT EXISTS fleet_registry_activation;
 

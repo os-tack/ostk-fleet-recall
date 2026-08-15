@@ -8,6 +8,11 @@ and requires `cockroach version --build-tag` to equal `v26.2.3` exactly.
 `registry-activation-cli.sh` repeats that build-tag check, starts one secure
 local server, runs both `control_log_live` and `registry_activation_live`, and
 then exercises the inspect/apply/replay state machines of both private CLIs.
+The same isolated process also runs the DB-backed transactional-DDL rollback
+library test, requires the exact successful migration prefix 1 through 14,
+checks the three successor tables and both exact genesis-root indexes, replays
+the resumable index migrations 10 and 11, and proves a failed migration 12 is
+not masked by a later successful row.
 
 Run the authoritative proof with an already checksum-verified binary:
 
@@ -29,3 +34,16 @@ checksum-pinned official-binary correctness proof. Report the authoritative
 result and each Docker parity result separately; do not summarize one substrate
 as evidence that another passed. Every script owns bounded temporary state and
 cleans it on success, failure, or interruption.
+
+Both RBAC proofs apply migrations 3 through 14 over explicit stand-ins for the
+legacy v1/v2 objects, then synthesize the complete successful SQLx history 1
+through 14. They retain the private commands' narrower semantic preflights
+(bootstrap through 3, genesis activation through 9), inject successor-table
+privilege and grant-option drift, then apply and reapply
+`successor-schema-quarantine-grants.sql`. That dedicated policy first requires
+all migration rows 1 through 14 to exist and be successful; only then does it
+statically revoke every privilege on the three new authority tables from
+`public`, runtime, bootstrap, and genesis activation. It is separate because
+CockroachDB v26.2 cannot conditionally execute privilege DDL inside PL/pgSQL,
+while the two base role policies must remain applicable at their original v3/v9
+deployment stages.

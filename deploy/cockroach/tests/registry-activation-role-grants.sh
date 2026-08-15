@@ -136,7 +136,7 @@ expected_activation_schema_preflight='const REQUIRE_ACTIVATION_SCHEMA_SQL: &str 
 assert_exact "activation repository complete migration prefix" \
     "$activation_schema_preflight" "$expected_activation_schema_preflight"
 
-deny_stage3_dml() {
+deny_table_dml() {
     local user=$1
     local table=$2
     expect_denied "$user" "$table SELECT" \
@@ -147,6 +147,12 @@ deny_stage3_dml() {
         "UPDATE $table SET project = project WHERE false"
     expect_denied "$user" "$table DELETE" \
         "DELETE FROM $table WHERE false"
+}
+
+apply_successor_quarantine() {
+    docker exec -i "$container" cockroach sql \
+        --insecure --database fleet_recall \
+        < "$repo_root/deploy/cockroach/successor-schema-quarantine-grants.sql"
 }
 
 docker run --detach --name "$container" "$image" \
@@ -174,7 +180,12 @@ for migration in \
     0006_control_bootstrap_explicit_acceptance_time.sql \
     0007_control_epoch_explicit_creation_time.sql \
     0008_control_head_explicit_advance_time.sql \
-    0009_control_event_explicit_acceptance_time.sql
+    0009_control_event_explicit_acceptance_time.sql \
+    0010_registry_genesis_head_root_index.sql \
+    0011_registry_genesis_activation_root_index.sql \
+    0012_registry_transition_history.sql \
+    0013_registry_genesis_bridge_consumption.sql \
+    0014_registry_current_head_v2.sql
 do
     docker exec -i "$container" cockroach sql --insecure --database fleet_recall \
         < "$repo_root/migrations/$migration" >/dev/null
@@ -189,7 +200,7 @@ CREATE TABLE _sqlx_migrations (
     success BOOL NOT NULL
 );
 INSERT INTO _sqlx_migrations
-SELECT version, true FROM generate_series(1, 9) AS version;
+SELECT version, true FROM generate_series(1, 14) AS version;
 CREATE TABLE memory_chunks (id INT8 PRIMARY KEY);
 INSERT INTO memory_chunks VALUES (1);
 CREATE SEQUENCE memory_claim_id_seq START 1 MINVALUE 1 MAXVALUE 9007199254740991;
@@ -206,6 +217,18 @@ docker exec -i "$container" cockroach sql --insecure --database fleet_recall \
     < "$repo_root/deploy/cockroach/control-role-grants.sql" >/dev/null
 docker exec -i "$container" cockroach sql --insecure --database fleet_recall \
     < "$repo_root/deploy/cockroach/registry-activation-role-grants.sql" >/dev/null
+
+# A later success cannot mask failed migration 12 at the dedicated post-14
+# quarantine boundary. Restore it only after the policy fails closed.
+root_sql 'UPDATE _sqlx_migrations SET success = false WHERE version = 12' >/dev/null
+if quarantine_failure=$(apply_successor_quarantine 2>&1); then
+    fail "successor quarantine accepted a failed migration 12"
+fi
+grep -Fq 'requires the complete successful migration prefix through 14' \
+    <<<"$quarantine_failure" \
+    || fail "successor quarantine did not retain its exact-prefix failure"
+root_sql 'UPDATE _sqlx_migrations SET success = true WHERE version = 12' >/dev/null
+apply_successor_quarantine >/dev/null
 
 # Owning the database does not authorize cluster role/options, membership, or
 # SYSTEM cleanup. The full policy must run under the stronger security operator
@@ -238,9 +261,25 @@ GRANT SELECT ON TABLE memory_chunks TO public;
 GRANT ALL ON SEQUENCE memory_claim_id_seq TO public;
 GRANT SELECT ON TABLE memory_registry_heads
     TO public, fleet_runtime, fleet_control_bootstrap;
+GRANT ALL ON TABLE
+    memory_registry_transitions,
+    memory_registry_genesis_bridge_consumptions,
+    memory_registry_current_heads_v2
+TO public;
+GRANT ALL ON TABLE
+    memory_registry_transitions,
+    memory_registry_genesis_bridge_consumptions,
+    memory_registry_current_heads_v2
+TO
+    fleet_runtime,
+    fleet_control_bootstrap,
+    fleet_registry_activation
+WITH GRANT OPTION;
 ' >/dev/null
 docker exec -i "$container" cockroach sql --insecure --database fleet_recall \
     < "$repo_root/deploy/cockroach/registry-activation-role-grants.sql" >/dev/null
+apply_successor_quarantine >/dev/null
+apply_successor_quarantine >/dev/null
 
 # The reverse membership direction is a separate acyclic drift case: older
 # application roles must not inherit the activation role's private surface.
@@ -305,6 +344,22 @@ memory_registry_activations:fleet_registry_activation:SELECT:not_grantable
 memory_registry_heads:fleet_registry_activation:INSERT:not_grantable
 memory_registry_heads:fleet_registry_activation:SELECT:not_grantable'
 assert_exact "registry-table grants" "$registry_grants" "$expected_registry_grants"
+
+successor_grants=$(root_sql "
+SELECT table_name || ':' || grantee || ':' || privilege_type || ':' ||
+       CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END AS normalized
+FROM [SHOW GRANTS ON TABLE
+    memory_registry_transitions,
+    memory_registry_genesis_bridge_consumptions,
+    memory_registry_current_heads_v2]
+WHERE grantee IN (
+    'public',
+    'fleet_runtime',
+    'fleet_control_bootstrap',
+    'fleet_registry_activation'
+)
+ORDER BY table_name, grantee, privilege_type" | tail -n +2)
+assert_exact "successor-table quarantine grants" "$successor_grants" ''
 
 migration_grants=$(root_sql "
 SELECT table_name || ':' || grantee || ':' || privilege_type || ':' ||
@@ -569,7 +624,7 @@ expect_allowed proof_activation "migration-prefix preflight plan" \
     'EXPLAIN SELECT count(*) = 9 AND COALESCE(bool_and(success), false)
      FROM _sqlx_migrations WHERE version BETWEEN 1 AND 9'
 expect_denied proof_activation "migration-history insert" \
-    'INSERT INTO _sqlx_migrations VALUES (10, true)'
+    'INSERT INTO _sqlx_migrations VALUES (9999, true)'
 expect_denied proof_activation "migration-history update" \
     'UPDATE _sqlx_migrations SET success = false WHERE version = 9'
 expect_denied proof_activation "migration-history delete" \
@@ -763,8 +818,16 @@ expect_denied proof_activation "role-membership delegation" \
 # Runtime, bootstrap, and an otherwise unprivileged login have no effective
 # DML path to either Stage-3 table.
 for user in proof_runtime proof_bootstrap proof_public; do
-    deny_stage3_dml "$user" memory_registry_activations
-    deny_stage3_dml "$user" memory_registry_heads
+    deny_table_dml "$user" memory_registry_activations
+    deny_table_dml "$user" memory_registry_heads
+done
+
+# New successor storage stays quarantined from every pre-successor principal,
+# including the genesis-only activation role.
+for user in proof_runtime proof_bootstrap proof_activation proof_public; do
+    deny_table_dml "$user" memory_registry_transitions
+    deny_table_dml "$user" memory_registry_genesis_bridge_consumptions
+    deny_table_dml "$user" memory_registry_current_heads_v2
 done
 
 echo "verified effective registry-activation grants:"
@@ -774,6 +837,9 @@ root_sql "SHOW GRANTS ON TABLE
     memory_control_shard_heads,
     memory_control_events,
     memory_registry_activations,
-    memory_registry_heads
+    memory_registry_heads,
+    memory_registry_transitions,
+    memory_registry_genesis_bridge_consumptions,
+    memory_registry_current_heads_v2
     FOR fleet_registry_activation"
 echo "secondary Docker registry-activation grant parity proof passed"

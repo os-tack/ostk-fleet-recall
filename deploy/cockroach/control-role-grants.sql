@@ -1,8 +1,9 @@
 -- Stage-2 control-ledger role boundary for the dedicated fleet_recall database.
 --
 -- This boundary can first be applied after migration 0003. Reapply it after
--- every later migration creates objects; the current deployment target is the
--- complete successful migration prefix 1 through 9. Run as a cluster admin,
+-- every later migration creates objects. This base policy remains valid from
+-- the complete successful prefix through 3 onward; after migration 0014, also
+-- apply successor-schema-quarantine-grants.sql. Run as a cluster admin,
 -- or as a dedicated security operator that has CREATEROLE, the required role
 -- admin options and SYSTEM grant options, plus grant authority on every object
 -- below. Database ownership alone is insufficient. Login users and their
