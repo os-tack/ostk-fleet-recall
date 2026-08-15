@@ -793,6 +793,20 @@ events or causal edges.
 
 No stage adds mutation to the public CloudFront router.
 
+### Arrow transport boundary
+
+Arrow is a transport and derived-data optimization, not a second evidence
+format. A batch schema is registry-versioned and carries the accepted-event ID,
+canonical statement bytes or their governed content reference and digest, plus
+non-semantic delivery and projection columns. Every consumer revalidates the
+canonical preimage and digest before committing work. Batch boundaries,
+dictionary encoding, compression, extension metadata, field ordering, and IPC
+container bytes never enter event, source-fact, representation, checkpoint, or
+signature identity. Embedding vectors and other disposable columnar projections
+may remain Arrow-native because they are reproducible and cite the exact source
+event and projector/model digests. Unknown schemas, duplicate event positions,
+oversized batches, or row/preimage disagreement fail closed into quarantine.
+
 ## Design admission gates
 
 No implementation stage begins until every contract consumed by that stage has
