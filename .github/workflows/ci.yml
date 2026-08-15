@@ -65,6 +65,53 @@ jobs:
           test -z "$(cargo tree --locked --target x86_64-unknown-linux-gnu -i rsa 2>/dev/null)"
           test -z "$(cargo tree --locked --target x86_64-unknown-linux-gnu -i sqlx-mysql 2>/dev/null)"
 
+  cockroachdb:
+    name: CockroachDB / ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: control RBAC
+            script: deploy/cockroach/tests/control-role-grants.sh
+            install_binary: false
+          - name: registry RBAC
+            script: deploy/cockroach/tests/registry-activation-role-grants.sh
+            install_binary: false
+          - name: control bootstrap
+            script: deploy/cockroach/tests/control-bootstrap-cli.sh
+            install_binary: false
+          - name: registry activation
+            script: deploy/cockroach/tests/registry-activation-cli.sh
+            install_binary: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the pinned CockroachDB binary
+        if: matrix.install_binary
+        env:
+          COCKROACH_VERSION: v26.2.3
+          COCKROACH_ARCHIVE_SHA256: 3eca6d7bc6fefa3ba0847e89733fc69f61226c80b8fab0af6578e1be672f27d3
+        run: |
+          archive="cockroach-${COCKROACH_VERSION}.linux-amd64.tgz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$RUNNER_TEMP/$archive" \
+            "https://binaries.cockroachdb.com/$archive"
+          printf '%s  %s\n' "$COCKROACH_ARCHIVE_SHA256" "$RUNNER_TEMP/$archive" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP"
+          binary_dir="$RUNNER_TEMP/cockroach-${COCKROACH_VERSION}.linux-amd64"
+          test "$("$binary_dir/cockroach" version --build-tag)" = "$COCKROACH_VERSION"
+          echo "$binary_dir" >> "$GITHUB_PATH"
+      - name: Run the connected proof
+        env:
+          PROOF_SCRIPT: ${{ matrix.script }}
+        run: ./"$PROOF_SCRIPT"
+
   container:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -82,6 +129,8 @@ jobs:
             test "$(id -u)" -eq 10001 &&
             test "$(s5cmd version)" = "v2.3.0-991c9fb" &&
             test ! -e /usr/local/bin/aws &&
+            test ! -e /usr/local/bin/ostk-control-bootstrap &&
+            test ! -e /usr/local/bin/ostk-registry-activate &&
             test -x /usr/bin/curl &&
             test -r /opt/ostk/demo/demo.ndjson &&
             test -r /opt/ostk/demo/rich-demo.ndjson &&
