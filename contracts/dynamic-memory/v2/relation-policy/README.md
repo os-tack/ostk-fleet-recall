@@ -35,10 +35,10 @@ checked-in full `RegistryEntryV1` preimages and resolve the complete transitive
 closure before activation.
 
 The legacy relation-proof v1 entry cannot authorize the frozen relation event
-vectors. It binds only endpoint kind references (the repository endpoint is an
-`entity` while the vectors use repository `version` URIs), carries no exact
-source/target identity recipes, and cannot bind the resource identity for both
-applicability dimensions.
+vectors. It carries no exact source/target identity recipes and cannot bind the
+resource kind and identity recipe closure for both applicability dimensions.
+Matching a URI's surface kind or form is insufficient; active admission must
+resolve every exact full-entry reference and rederive every URI.
 
 ## Frozen vector DAG
 

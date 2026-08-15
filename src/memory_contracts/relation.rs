@@ -538,12 +538,15 @@ fn strictly_sorted_by_dimension(values: &[ConcreteApplicabilityDimensionV1]) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{fs, path::Path, str::FromStr};
+
+    use sha2::{Digest as _, Sha256};
 
     use super::*;
     use crate::memory_contracts::{
         canonical::{decode_strict, encode_canonical, require_canonical},
         common::frozen_profile_reference_v1,
+        identity::IdentityForm,
         registry::RegistryHeadV1,
     };
 
@@ -559,13 +562,21 @@ mod tests {
         include_bytes!("../../contracts/dynamic-memory/v2/relation/vector-suite.jsonl");
 
     const RELATION_FINGERPRINT: &str =
-        "cf9c6b0a6e2b36523a69ad376a9f8ae77e73be53e2e42f7d240e7da67f38c2b2";
+        "287df2aacc359b946e766bf9c195ff178a237c46752bff3c4928f687f3de8e40";
     const DECLARED_EVENT_ID: &str =
-        "fa9782a4254a4f704e9f7f7966c08a81e847065a66811d412d95c3a85aae1f14";
+        "1c955e473addb823234a785c7251047e3506db2ecf9d597e6052ca04ac8f009a";
     const VERIFIED_SUPPORT_EVENT_ID: &str =
-        "75d1127fb64287fbd999e88442fbb76d54caaedab461787110b207472ae9d287";
+        "b3e13395d8f3a74d3e29dc8cd972c349b962cf4b088ac6ad2ccce226aeff0bc6";
     const VECTOR_SUITE_DIGEST: &str =
-        "533685efc9b239269a922b549b6edd501437e1d94e525106f392301bc19a9ed2";
+        "87e7f7c8df11dff099bc0e6ff66fbd97ea4bbcca815c85c9bac415c0faa22d6f";
+    const EDGE_RAW_SHA256: &str =
+        "7bc7d8f6737fd7450dfd7d7e40e53d2d22cf61299bb288b0b6344addb5a368d5";
+    const DECLARED_EVENT_RAW_SHA256: &str =
+        "cd9d6080a7280f0ee7e2a9ac3c64b4947252a882b9b324f9c490bcd10769d966";
+    const VERIFIED_EVENT_RAW_SHA256: &str =
+        "b663076dd30b40b64d7003f324e136b33c4939d5bd94bd3096bc05a3f3cf1437";
+    const VECTOR_SUITE_RAW_SHA256: &str =
+        "3752543c19c49d7f857d075abb698882ce9e00b63972fe45359476c4bb2d37fd";
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -573,12 +584,15 @@ mod tests {
         schema_version: u32,
         fixture_authority: String,
         relation_edge_path: String,
+        relation_edge_raw_sha256: String,
         relation_fingerprint: RelationFingerprint,
         declared_event_path: String,
+        declared_event_raw_sha256: String,
         declared_event_id: AcceptedEventId,
         consistency_key_digest: Sha256Digest,
         consistency_key_family: ContractId,
         verified_support_event_path: String,
+        verified_support_event_raw_sha256: String,
         verified_support_event_id: AcceptedEventId,
         negative_cases: Vec<String>,
     }
@@ -594,6 +608,16 @@ mod tests {
 
     fn digest(value: &str) -> Sha256Digest {
         Sha256Digest::from_str(value).unwrap()
+    }
+
+    fn raw_sha256(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn framed_raw_sha256(bytes: &[u8]) -> String {
+        let mut framed = bytes.to_vec();
+        framed.push(b'\n');
+        raw_sha256(&framed)
     }
 
     fn scope() -> AuthenticatedProjectScopeV1 {
@@ -629,9 +653,10 @@ mod tests {
         }
     }
 
-    fn resource(kind: &str, digit: char) -> ResourceUri {
+    fn resource(identity_form: IdentityForm, kind: &str, digit: char) -> ResourceUri {
         format!(
-            "urn:ostk:version:v1:{kind}:sha256:{}",
+            "urn:ostk:{}:v1:{kind}:sha256:{}",
+            identity_form.as_str(),
             digit.to_string().repeat(64)
         )
         .parse()
@@ -648,19 +673,39 @@ mod tests {
                 "relation.repository_parent",
                 "d0b7d4e7b630ce599389e50948541e21b4aa24d4d030860f6cfcaf7508d49df4",
             ),
-            source: resource("repository", '1'),
-            target: resource("repository", '2'),
+            source: resource(IdentityForm::Entity, "repository", '1'),
+            target: resource(IdentityForm::Entity, "repository", '2'),
             applicability: vec![
                 ConcreteApplicabilityDimensionV1 {
                     dimension_id: ContractId::new("repository_commit").unwrap(),
-                    resource: resource("commit", '3'),
+                    resource: resource(IdentityForm::Version, "commit", '3'),
                 },
                 ConcreteApplicabilityDimensionV1 {
                     dimension_id: ContractId::new("runtime_environment").unwrap(),
-                    resource: resource("environment", '4'),
+                    resource: resource(IdentityForm::Entity, "environment", '4'),
                 },
             ],
         }
+    }
+
+    fn require_first_stage4_identity_forms(edge: &RelationEdgeV1) -> ContractResult<()> {
+        let valid = edge.source.identity_form() == IdentityForm::Entity
+            && edge.source.resource_kind().as_str() == "repository"
+            && edge.target.identity_form() == IdentityForm::Entity
+            && edge.target.resource_kind().as_str() == "repository"
+            && edge.applicability.len() == 2
+            && edge.applicability[0].dimension_id.as_str() == "repository_commit"
+            && edge.applicability[0].resource.identity_form() == IdentityForm::Version
+            && edge.applicability[0].resource.resource_kind().as_str() == "commit"
+            && edge.applicability[1].dimension_id.as_str() == "runtime_environment"
+            && edge.applicability[1].resource.identity_form() == IdentityForm::Entity
+            && edge.applicability[1].resource.resource_kind().as_str() == "environment";
+        if !valid {
+            return Err(ContractError::Schema(
+                "relation vector identity forms differ from the first Stage-4 target".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn evidence_id(digit: char) -> AcceptedEventId {
@@ -706,6 +751,67 @@ mod tests {
         }
     }
 
+    fn negative_cases() -> Vec<String> {
+        [
+            "applicability_duplicate_or_unsorted",
+            "basis_attestor_mismatch",
+            "cross_edge_or_missing_supersession",
+            "empty_projection",
+            "evidence_ids_empty_duplicate_or_unsorted",
+            "forged_relation_fingerprint",
+            "identity_form_mismatch",
+            "mixed_projection_fingerprints",
+            "payload_verified_field",
+            "physical_append_fields_absent",
+            "registry_activation_aba",
+            "scope_mismatch",
+            "supersession_authority_downgrade",
+            "supersession_cycle",
+            "supersession_fork_preserves_successors",
+            "unadmitted_verifier_result",
+            "unknown_field",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    fn vector_suite(
+        edge_bytes: &[u8],
+        declared_bytes: &[u8],
+        verified_bytes: &[u8],
+    ) -> RelationVectorSuiteV1 {
+        let edge = edge();
+        let declared = event(
+            RelationAttestationBasisV1::Declared,
+            RelationAttestationVerdictV1::Supports,
+            '5',
+            None,
+        );
+        let verified = event(
+            RelationAttestationBasisV1::VerifierResult,
+            RelationAttestationVerdictV1::Supports,
+            '6',
+            None,
+        );
+        RelationVectorSuiteV1 {
+            schema_version: 1,
+            fixture_authority: "none; structural canonical fixture bytes never prove active registry, actor, verifier, evidence, or append authority".into(),
+            relation_edge_path: "relation-edge.jsonl".into(),
+            relation_edge_raw_sha256: framed_raw_sha256(edge_bytes),
+            relation_fingerprint: edge.fingerprint().unwrap(),
+            declared_event_path: "declared-attestation-event.jsonl".into(),
+            declared_event_raw_sha256: framed_raw_sha256(declared_bytes),
+            declared_event_id: declared.accepted_event_id().unwrap(),
+            consistency_key_digest: edge.fingerprint().unwrap().digest(),
+            consistency_key_family: ContractId::new(RELATION_CONSISTENCY_FAMILY).unwrap(),
+            verified_support_event_path: "verifier-support-attestation-event.jsonl".into(),
+            verified_support_event_raw_sha256: framed_raw_sha256(verified_bytes),
+            verified_support_event_id: verified.accepted_event_id().unwrap(),
+            negative_cases: negative_cases(),
+        }
+    }
+
     #[test]
     fn hard_coded_edge_and_events_match_canonical_vectors() {
         for bytes in [
@@ -718,6 +824,7 @@ mod tests {
         }
 
         let expected_edge = edge();
+        require_first_stage4_identity_forms(&expected_edge).unwrap();
         assert_eq!(
             encode_canonical(&expected_edge).unwrap(),
             record(EDGE_FIXTURE)
@@ -747,7 +854,17 @@ mod tests {
             record(VERIFIED_EVENT_FIXTURE)
         );
 
+        let expected_suite = vector_suite(
+            &encode_canonical(&expected_edge).unwrap(),
+            &encode_canonical(&declared).unwrap(),
+            &encode_canonical(&verified).unwrap(),
+        );
+        assert_eq!(
+            encode_canonical(&expected_suite).unwrap(),
+            record(VECTOR_SUITE_FIXTURE)
+        );
         let suite: RelationVectorSuiteV1 = decode_strict(record(VECTOR_SUITE_FIXTURE)).unwrap();
+        assert_eq!(suite, expected_suite);
         assert_eq!(suite.schema_version, 1);
         assert_eq!(
             domain_separated_digest(
@@ -784,6 +901,55 @@ mod tests {
         assert_eq!(suite.consistency_key_digest, digest(RELATION_FINGERPRINT));
         assert!(suite.fixture_authority.starts_with("none;"));
         assert!(strictly_sorted(&suite.negative_cases));
+        assert_eq!(raw_sha256(EDGE_FIXTURE), EDGE_RAW_SHA256);
+        assert_eq!(
+            raw_sha256(DECLARED_EVENT_FIXTURE),
+            DECLARED_EVENT_RAW_SHA256
+        );
+        assert_eq!(
+            raw_sha256(VERIFIED_EVENT_FIXTURE),
+            VERIFIED_EVENT_RAW_SHA256
+        );
+        assert_eq!(raw_sha256(VECTOR_SUITE_FIXTURE), VECTOR_SUITE_RAW_SHA256);
+        assert_eq!(suite.relation_edge_raw_sha256, EDGE_RAW_SHA256);
+        assert_eq!(suite.declared_event_raw_sha256, DECLARED_EVENT_RAW_SHA256);
+        assert_eq!(
+            suite.verified_support_event_raw_sha256,
+            VERIFIED_EVENT_RAW_SHA256
+        );
+    }
+
+    #[test]
+    fn first_stage4_vector_identity_forms_are_exact_and_fail_closed() {
+        let edge = edge();
+        require_first_stage4_identity_forms(&edge).unwrap();
+        assert_eq!(edge.source.identity_form(), IdentityForm::Entity);
+        assert_eq!(edge.target.identity_form(), IdentityForm::Entity);
+        assert_eq!(
+            edge.applicability[0].resource.identity_form(),
+            IdentityForm::Version
+        );
+        assert_eq!(
+            edge.applicability[1].resource.identity_form(),
+            IdentityForm::Entity
+        );
+
+        let mut wrong_repository = edge.clone();
+        wrong_repository.source = resource(IdentityForm::Version, "repository", '1');
+        assert!(require_first_stage4_identity_forms(&wrong_repository).is_err());
+
+        let mut wrong_target = edge.clone();
+        wrong_target.target = resource(IdentityForm::Version, "repository", '2');
+        assert!(require_first_stage4_identity_forms(&wrong_target).is_err());
+
+        let mut wrong_commit = edge.clone();
+        wrong_commit.applicability[0].resource = resource(IdentityForm::Entity, "commit", '3');
+        assert!(require_first_stage4_identity_forms(&wrong_commit).is_err());
+
+        let mut wrong_environment = edge;
+        wrong_environment.applicability[1].resource =
+            resource(IdentityForm::Version, "environment", '4');
+        assert!(require_first_stage4_identity_forms(&wrong_environment).is_err());
     }
 
     #[test]
@@ -1163,5 +1329,82 @@ mod tests {
         assert_eq!(projection.active_attestation_ids.len(), 1);
 
         assert!(project_relation(fingerprint, &[]).is_err());
+    }
+
+    #[test]
+    #[ignore = "maintainer-only canonical relation fixture regeneration"]
+    fn regenerate_relation_contract_artifacts() {
+        fn write(output: &Path, name: &str, bytes: &[u8]) {
+            let mut framed = bytes.to_vec();
+            framed.push(b'\n');
+            fs::write(output.join(name), framed).unwrap();
+        }
+
+        let output = std::env::var_os("RELATION_VECTOR_OUTPUT")
+            .map(std::path::PathBuf::from)
+            .expect("RELATION_VECTOR_OUTPUT is required");
+        fs::create_dir_all(&output).unwrap();
+
+        let edge = edge();
+        require_first_stage4_identity_forms(&edge).unwrap();
+        let declared = event(
+            RelationAttestationBasisV1::Declared,
+            RelationAttestationVerdictV1::Supports,
+            '5',
+            None,
+        );
+        let verified = event(
+            RelationAttestationBasisV1::VerifierResult,
+            RelationAttestationVerdictV1::Supports,
+            '6',
+            None,
+        );
+        let edge_bytes = encode_canonical(&edge).unwrap();
+        let declared_bytes = encode_canonical(&declared).unwrap();
+        let verified_bytes = encode_canonical(&verified).unwrap();
+        let suite = vector_suite(&edge_bytes, &declared_bytes, &verified_bytes);
+        let suite_bytes = encode_canonical(&suite).unwrap();
+
+        for (name, bytes) in [
+            ("relation-edge.jsonl", edge_bytes.as_slice()),
+            (
+                "declared-attestation-event.jsonl",
+                declared_bytes.as_slice(),
+            ),
+            (
+                "verifier-support-attestation-event.jsonl",
+                verified_bytes.as_slice(),
+            ),
+            ("vector-suite.jsonl", suite_bytes.as_slice()),
+        ] {
+            write(&output, name, bytes);
+        }
+
+        println!("RELATION_FINGERPRINT {}", edge.fingerprint().unwrap());
+        println!(
+            "DECLARED_EVENT_ID {}",
+            declared.accepted_event_id().unwrap()
+        );
+        println!(
+            "VERIFIED_SUPPORT_EVENT_ID {}",
+            verified.accepted_event_id().unwrap()
+        );
+        println!(
+            "VECTOR_SUITE_DIGEST {}",
+            domain_separated_digest(DigestDomain::TestVectorManifest, &suite_bytes)
+        );
+        println!("EDGE_RAW_SHA256 {}", framed_raw_sha256(&edge_bytes));
+        println!(
+            "DECLARED_EVENT_RAW_SHA256 {}",
+            framed_raw_sha256(&declared_bytes)
+        );
+        println!(
+            "VERIFIED_EVENT_RAW_SHA256 {}",
+            framed_raw_sha256(&verified_bytes)
+        );
+        println!(
+            "VECTOR_SUITE_RAW_SHA256 {}",
+            framed_raw_sha256(&suite_bytes)
+        );
     }
 }
