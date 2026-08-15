@@ -12,8 +12,8 @@ use ostk_fleet_recall::control_log::{
     TrustedControlScope,
 };
 use ostk_fleet_recall::memory_contracts::bootstrap::{
-    BootstrapAttestationV1, BootstrapPin, BootstrapReceiptDigest, BootstrapReceiptV1,
-    VerifiedBootstrapReceipt, verify_pinned_bootstrap,
+    AppendPositionV1, BootstrapAttestationV1, BootstrapPin, BootstrapReceiptDigest,
+    BootstrapReceiptV1, CommittedOffsetV1, VerifiedBootstrapReceipt, verify_pinned_bootstrap,
 };
 use ostk_fleet_recall::memory_contracts::canonical::{decode_strict, encode_canonical};
 use ostk_fleet_recall::memory_contracts::common::{
@@ -21,8 +21,9 @@ use ostk_fleet_recall::memory_contracts::common::{
 };
 use ostk_fleet_recall::memory_contracts::control::GenesisBootstrapAppendV1;
 use ostk_fleet_recall::memory_contracts::digest::{
-    DigestDomain, Sha256Digest, domain_separated_digest,
+    DigestDomain, Sha256Digest, domain_separated_digest, framed_digest,
 };
+use ostk_fleet_recall::memory_contracts::evidence::AcceptedEventId;
 use ostk_fleet_recall::memory_contracts::genesis::SemanticallyClosedGenesisPackage;
 use ostk_fleet_recall::memory_contracts::registry::ManifestVerifiedRegistryPackage;
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig, RetryPolicy};
@@ -170,6 +171,100 @@ async fn scoped_count(pool: &PgPool, table: &str, scope: &FleetScope) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+async fn append_synthetic_control_suffix(
+    pool: &PgPool,
+    scope: &FleetScope,
+    fixture: &GenesisFixture,
+    shard: u16,
+    marker: &str,
+) {
+    let mut transaction = pool.begin().await.unwrap();
+    let current = sqlx::query(
+        "SELECT last_committed_offset, chain_digest FROM memory_control_shard_heads \
+         WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 FOR UPDATE",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .bind(fixture.bootstrap.epoch_id().digest().as_bytes().to_vec())
+    .bind(i32::from(shard))
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    let previous_offset: i64 = current.get("last_committed_offset");
+    let previous_chain = Sha256Digest::from_bytes(
+        current
+            .get::<Vec<u8>, _>("chain_digest")
+            .try_into()
+            .unwrap(),
+    );
+    let next_offset = previous_offset.checked_add(1).unwrap();
+    let append_position = AppendPositionV1 {
+        epoch_id: fixture.bootstrap.epoch_id(),
+        shard,
+        committed_offset: CommittedOffsetV1::new(u64::try_from(next_offset).unwrap()).unwrap(),
+    };
+    let accepted_event_id = AcceptedEventId::from_digest(domain_separated_digest(
+        DigestDomain::AcceptedEvent,
+        marker.as_bytes(),
+    ));
+    let position_bytes = encode_canonical(&append_position).unwrap();
+    let append_chain = framed_digest(
+        DigestDomain::AppendChain,
+        &[
+            previous_chain.as_bytes(),
+            &position_bytes,
+            accepted_event_id.digest().as_bytes(),
+        ],
+    );
+    let canonical_event = format!("{{\"marker\":\"{marker}\"}}").into_bytes();
+
+    sqlx::query(
+        "INSERT INTO memory_control_events (\
+             tenant_id, project, epoch_id, shard, committed_offset, event_id, \
+             event_schema_version, event_kind, semantic_object_digest, consistency_family, \
+             consistency_key_digest, canonical_event, previous_chain_digest, chain_digest\
+         ) VALUES ($1, $2, $3, $4, $5, $6, 1, 'test.control.suffix', $7, \
+                   'test.control.suffix', $8, $9, $10, $11)",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .bind(fixture.bootstrap.epoch_id().digest().as_bytes().to_vec())
+    .bind(i32::from(shard))
+    .bind(next_offset)
+    .bind(accepted_event_id.digest().as_bytes().to_vec())
+    .bind(accepted_event_id.digest().as_bytes().to_vec())
+    .bind(
+        domain_separated_digest(DigestDomain::Body, marker.as_bytes())
+            .as_bytes()
+            .to_vec(),
+    )
+    .bind(canonical_event)
+    .bind(previous_chain.as_bytes().to_vec())
+    .bind(append_chain.as_bytes().to_vec())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let advanced = sqlx::query(
+        "UPDATE memory_control_shard_heads \
+         SET last_committed_offset = $5, chain_digest = $6, advanced_at = now() \
+         WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 \
+           AND last_committed_offset = $7 AND chain_digest = $8",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .bind(fixture.bootstrap.epoch_id().digest().as_bytes().to_vec())
+    .bind(i32::from(shard))
+    .bind(next_offset)
+    .bind(append_chain.as_bytes().to_vec())
+    .bind(previous_offset)
+    .bind(previous_chain.as_bytes().to_vec())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(advanced.rows_affected(), 1);
+    transaction.commit().await.unwrap();
 }
 
 #[allow(clippy::too_many_lines)] // one bounded helper independently audits every genesis row family
@@ -365,9 +460,56 @@ async fn live_stage2_genesis_repository_when_configured() {
             .inspect_genesis(&fixture.bootstrap, &fixture.package)
             .await
             .unwrap(),
-        GenesisInspection::Complete(first_inspection)
+        GenesisInspection::Complete(first_inspection.clone())
     );
     assert_complete_database_shape(&pool, &replay_scope, &fixture).await;
+
+    // Stage 2 remains a durable prefix after later repositories append valid
+    // events. Advance both the bootstrap shard and an independently initialized
+    // shard so H1/H2 and H0/H1 suffix shapes are covered.
+    let shard_count = fixture
+        .bootstrap
+        .receipt()
+        .statement
+        .genesis_epoch
+        .partition_recipe
+        .shard_count;
+    let bootstrap_shard = fixture.append.append_position.shard;
+    let other_shard = (bootstrap_shard + 1) % shard_count;
+    append_synthetic_control_suffix(
+        &pool,
+        &replay_scope,
+        &fixture,
+        bootstrap_shard,
+        "same-shard-suffix",
+    )
+    .await;
+    append_synthetic_control_suffix(
+        &pool,
+        &replay_scope,
+        &fixture,
+        other_shard,
+        "other-shard-suffix",
+    )
+    .await;
+    assert_eq!(
+        replay_repository
+            .bootstrap_genesis(&fixture.bootstrap, &fixture.package)
+            .await
+            .unwrap(),
+        GenesisBootstrapOutcome::ExactReplay(first_inspection.clone())
+    );
+    assert_eq!(
+        replay_repository
+            .inspect_genesis(&fixture.bootstrap, &fixture.package)
+            .await
+            .unwrap(),
+        GenesisInspection::Complete(first_inspection)
+    );
+    assert_eq!(
+        scoped_count(&pool, "memory_control_events", &replay_scope).await,
+        3
+    );
     assert_eq!(scoped_count(&pool, "memory_events", &replay_scope).await, 0);
 
     // Identical contenders converge on one atomic append rather than creating
@@ -456,11 +598,74 @@ async fn live_stage2_genesis_repository_when_configured() {
         0
     );
 
+    // Advancing beyond the prefix is valid, but a selected head that moves
+    // behind the immutable bootstrap event makes the prefix incomplete.
+    let rewound_scope = physical_scope("rewound-head");
+    let rewound_repository =
+        repository(pool.clone(), &rewound_scope, fixture.semantic_scope.clone());
+    rewound_repository
+        .bootstrap_genesis(&fixture.bootstrap, &fixture.package)
+        .await
+        .unwrap();
+    let bootstrap_shard = fixture.append.append_position.shard;
+    let genesis_chain = fixture
+        .bootstrap
+        .genesis_chain_digest(bootstrap_shard)
+        .unwrap();
+    sqlx::query(
+        "UPDATE memory_control_shard_heads \
+         SET last_committed_offset = 0, chain_digest = $5 \
+         WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4",
+    )
+    .bind(rewound_scope.tenant_id)
+    .bind(&rewound_scope.project)
+    .bind(fixture.bootstrap.epoch_id().digest().as_bytes().to_vec())
+    .bind(i32::from(bootstrap_shard))
+    .bind(genesis_chain.as_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let rewound_error = rewound_repository
+        .inspect_genesis(&fixture.bootstrap, &fixture.package)
+        .await
+        .unwrap_err();
+    assert!(matches!(rewound_error, FleetError::ControlLogCorrupt(_)));
+
+    // The immutable bootstrap row and its accepted event were committed by
+    // one transaction timestamp. Divergence is prefix corruption even when all
+    // canonical bytes and chain digests still match.
+    let timestamp_scope = physical_scope("timestamp-corrupt");
+    let timestamp_repository = repository(
+        pool.clone(),
+        &timestamp_scope,
+        fixture.semantic_scope.clone(),
+    );
+    timestamp_repository
+        .bootstrap_genesis(&fixture.bootstrap, &fixture.package)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE memory_control_events SET accepted_at = accepted_at + INTERVAL '1 microsecond' \
+         WHERE tenant_id = $1 AND project = $2",
+    )
+    .bind(timestamp_scope.tenant_id)
+    .bind(&timestamp_scope.project)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let timestamp_error = timestamp_repository
+        .inspect_genesis(&fixture.bootstrap, &fixture.package)
+        .await
+        .unwrap_err();
+    assert!(matches!(timestamp_error, FleetError::ControlLogCorrupt(_)));
+
     for scope in [
         &replay_scope,
         &concurrent_scope,
         &conflict_scope,
         &corrupt_scope,
+        &rewound_scope,
+        &timestamp_scope,
     ] {
         cleanup_control_scope(&pool, scope).await;
     }

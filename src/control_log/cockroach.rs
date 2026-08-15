@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Postgres, QueryBuilder, Row, Transaction};
 
@@ -12,8 +13,9 @@ use super::{
 };
 use crate::memory_contracts::ContractResult;
 use crate::memory_contracts::bootstrap::{
-    AppendPositionV1, BootstrapReceiptV1, CommittedOffsetV1, VerifiedBootstrapReceipt,
-    audit_untrusted_bootstrap_integrity, derive_genesis_chain_digest, partition_for_epoch,
+    AppendPositionV1, BootstrapReceiptV1, CommittedOffsetV1, IntegrityCheckedBootstrapReceipt,
+    VerifiedBootstrapReceipt, audit_untrusted_bootstrap_integrity, derive_genesis_chain_digest,
+    partition_for_epoch,
 };
 use crate::memory_contracts::canonical::{decode_strict, encode_canonical, require_canonical};
 use crate::memory_contracts::common::ContractId;
@@ -46,9 +48,10 @@ const ADVANCE_SELECTED_HEAD_SQL: &str = "UPDATE memory_control_shard_heads \
      SET last_committed_offset = 1, chain_digest = $5, advanced_at = now() \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 \
        AND last_committed_offset = 0 AND chain_digest = $6";
-const BOUNDED_EVENT_CARDINALITY_SQL: &str = "SELECT committed_offset FROM memory_control_events \
+const BOUNDED_HEAD_SET_SQL: &str = "SELECT shard, shard_count, last_committed_offset, chain_digest \
+     FROM memory_control_shard_heads \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
-     ORDER BY shard, committed_offset LIMIT 2";
+     ORDER BY shard LIMIT $4";
 
 /// Private control repository bound once to physical and semantic scope.
 #[derive(Clone)]
@@ -95,6 +98,59 @@ struct PreparedGenesis {
     approval_threshold: i32,
     shard_count: i32,
     partition_seed: [u8; 32],
+}
+
+/// Integrity-checked persisted Stage-2 authority and its immutable append.
+///
+/// This proves only the bootstrap prefix. Later repository stages own the
+/// validity of any suffix and may advance the current shard heads.
+pub(super) struct DurableGenesisWitness {
+    prepared: PreparedGenesis,
+    bootstrap: IntegrityCheckedBootstrapReceipt,
+    package: SemanticallyClosedGenesisPackage,
+    bootstrap_accepted_at: DateTime<Utc>,
+}
+
+#[allow(dead_code)] // Consumed by the private Stage-3 repository seam.
+impl DurableGenesisWitness {
+    pub(super) const fn bootstrap(&self) -> &IntegrityCheckedBootstrapReceipt {
+        &self.bootstrap
+    }
+
+    pub(super) const fn package(&self) -> &SemanticallyClosedGenesisPackage {
+        &self.package
+    }
+
+    pub(super) const fn bootstrap_append(&self) -> &GenesisBootstrapAppendV1 {
+        &self.prepared.append
+    }
+
+    pub(super) fn genesis_heads(&self) -> &[(i32, Sha256Digest)] {
+        &self.prepared.genesis_heads
+    }
+
+    pub(super) const fn bootstrap_accepted_at(&self) -> DateTime<Utc> {
+        self.bootstrap_accepted_at
+    }
+
+    fn inspection(&self) -> Result<GenesisBootstrapInspection> {
+        self.prepared.inspection()
+    }
+
+    fn ensure_exact_candidate(&self, candidate: &PreparedGenesis) -> Result<()> {
+        if self.prepared.canonical_receipt != candidate.canonical_receipt
+            || self.prepared.canonical_package != candidate.canonical_package
+            || self.prepared.append != candidate.append
+            || self.prepared.canonical_epoch != candidate.canonical_epoch
+            || self.prepared.canonical_event != candidate.canonical_event
+            || self.prepared.genesis_heads != candidate.genesis_heads
+        {
+            return Err(corrupt(
+                "stored bootstrap digest matches but canonical authority bytes differ",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl PreparedGenesis {
@@ -395,12 +451,33 @@ async fn inspect_in_transaction(
     scope: &TrustedControlScope,
     prepared: &PreparedGenesis,
 ) -> Result<Option<GenesisBootstrapInspection>> {
+    let Some(witness) = load_durable_genesis_witness(transaction, scope).await? else {
+        return Ok(None);
+    };
+
+    if witness.prepared.append.event.bootstrap_receipt_digest
+        != prepared.append.event.bootstrap_receipt_digest
+    {
+        return Err(conflict(
+            "the physical tenant/project already has another complete, integrity-checked bootstrap artifact",
+        ));
+    }
+    witness.ensure_exact_candidate(prepared)?;
+    Ok(Some(witness.inspection()?))
+}
+
+/// Load and audit the exact durable Stage-2 prefix inside the caller's
+/// transaction. This does not authenticate or interpret any later suffix.
+pub(super) async fn load_durable_genesis_witness(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &TrustedControlScope,
+) -> Result<Option<DurableGenesisWitness>> {
     let bootstrap = sqlx::query(
         "SELECT contract_tenant_namespace, contract_project_namespace, receipt_digest, \
                 statement_id, bootstrap_event_id, profile_id, profile_digest, \
                 vector_manifest_digest, genesis_registry_package_digest, signer_policy_digest, \
                 signer_count, approval_threshold, epoch_id, shard_count, bootstrap_shard, \
-                bootstrap_offset, canonical_receipt, canonical_genesis_package \
+                bootstrap_offset, canonical_receipt, canonical_genesis_package, accepted_at \
          FROM memory_control_bootstraps WHERE tenant_id = $1 AND project = $2",
     )
     .bind(scope.tenant_id())
@@ -412,17 +489,10 @@ async fn inspect_in_transaction(
         return Ok(None);
     };
 
-    let stored_receipt: Vec<u8> = bootstrap.try_get("receipt_digest")?;
-    if stored_receipt != bytes(prepared.append.event.bootstrap_receipt_digest.digest()) {
-        let stored = prepare_stored_genesis(&bootstrap, scope)?;
-        ensure_complete_genesis(transaction, scope, &bootstrap, &stored).await?;
-        return Err(conflict(
-            "the physical tenant/project already has another complete, integrity-checked bootstrap artifact",
-        ));
-    }
-
-    ensure_complete_genesis(transaction, scope, &bootstrap, prepared).await?;
-    Ok(Some(prepared.inspection()?))
+    let bootstrap_accepted_at: DateTime<Utc> = bootstrap.try_get("accepted_at")?;
+    let witness = prepare_stored_genesis(&bootstrap, scope, bootstrap_accepted_at)?;
+    ensure_complete_genesis_prefix(transaction, scope, &bootstrap, &witness).await?;
+    Ok(Some(witness))
 }
 
 async fn ensure_no_orphan_control_rows(
@@ -450,7 +520,12 @@ async fn ensure_no_orphan_control_rows(
     Ok(())
 }
 
-fn prepare_stored_genesis(row: &PgRow, scope: &TrustedControlScope) -> Result<PreparedGenesis> {
+#[allow(clippy::too_many_lines)] // One bounded reconstruction audits every stored authority field.
+fn prepare_stored_genesis(
+    row: &PgRow,
+    scope: &TrustedControlScope,
+    bootstrap_accepted_at: DateTime<Utc>,
+) -> Result<DurableGenesisWitness> {
     let canonical_receipt: Vec<u8> = row.try_get("canonical_receipt")?;
     let canonical_package: Vec<u8> = row.try_get("canonical_genesis_package")?;
     let receipt_digest = digest_from_stored_bytes(row.try_get("receipt_digest")?, "receipt")?;
@@ -536,7 +611,7 @@ fn prepare_stored_genesis(row: &PgRow, scope: &TrustedControlScope) -> Result<Pr
         ))?;
         genesis_heads.push((i32::from(head_shard), chain_digest));
     }
-    Ok(PreparedGenesis {
+    let prepared = PreparedGenesis {
         append,
         canonical_receipt: checked.canonical_bytes().to_vec(),
         canonical_package: package.canonical_bytes().to_vec(),
@@ -548,6 +623,12 @@ fn prepare_stored_genesis(row: &PgRow, scope: &TrustedControlScope) -> Result<Pr
         approval_threshold: i32::from(statement.signer_policy.threshold),
         shard_count: i32::from(epoch.partition_recipe.shard_count),
         partition_seed: *epoch.partition_recipe.seed.as_bytes(),
+    };
+    Ok(DurableGenesisWitness {
+        prepared,
+        bootstrap: checked,
+        package,
+        bootstrap_accepted_at,
     })
 }
 
@@ -562,16 +643,17 @@ fn digest_from_stored_bytes(bytes: Vec<u8>, field: &str) -> Result<Sha256Digest>
     Ok(Sha256Digest::from_bytes(bytes))
 }
 
-async fn ensure_complete_genesis(
+async fn ensure_complete_genesis_prefix(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
     bootstrap: &PgRow,
-    prepared: &PreparedGenesis,
+    witness: &DurableGenesisWitness,
 ) -> Result<()> {
+    let prepared = &witness.prepared;
     ensure_bootstrap_matches(bootstrap, scope, prepared)?;
     ensure_epoch_matches(transaction, scope, prepared).await?;
-    ensure_event_matches(transaction, scope, prepared).await?;
-    ensure_heads_match(transaction, scope, prepared).await
+    ensure_event_matches(transaction, scope, prepared, witness.bootstrap_accepted_at).await?;
+    ensure_heads_cover_prefix(transaction, scope, prepared).await
 }
 
 fn ensure_bootstrap_matches(
@@ -680,6 +762,7 @@ async fn ensure_event_matches(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
     prepared: &PreparedGenesis,
+    bootstrap_accepted_at: DateTime<Utc>,
 ) -> Result<()> {
     let append = &prepared.append;
     let offset = i64::try_from(append.append_position.committed_offset.as_u64())
@@ -687,7 +770,7 @@ async fn ensure_event_matches(
     let row = sqlx::query(
         "SELECT event_id, event_schema_version, event_kind, semantic_object_digest, \
                 consistency_family, consistency_key_digest, canonical_event, \
-                previous_chain_digest, chain_digest \
+                previous_chain_digest, chain_digest, accepted_at \
          FROM memory_control_events \
          WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
            AND shard = $4 AND committed_offset = $5",
@@ -701,15 +784,10 @@ async fn ensure_event_matches(
     .await?
     .ok_or_else(|| corrupt("bootstrap control event is missing"))?;
 
-    let event_offsets: Vec<i64> = sqlx::query_scalar(BOUNDED_EVENT_CARDINALITY_SQL)
-        .bind(scope.tenant_id())
-        .bind(scope.project())
-        .bind(bytes(append.append_position.epoch_id.digest()))
-        .fetch_all(&mut **transaction)
-        .await?;
-    if event_offsets.len() != 1 {
+    let event_accepted_at: DateTime<Utc> = row.try_get("accepted_at")?;
+    if event_accepted_at != bootstrap_accepted_at {
         return Err(corrupt(
-            "genesis epoch must contain exactly one accepted control event",
+            "bootstrap singleton and accepted control event timestamps differ",
         ));
     }
 
@@ -735,25 +813,27 @@ async fn ensure_event_matches(
     expect_bytes(&row, "chain_digest", append.append_chain_digest)
 }
 
-async fn ensure_heads_match(
+async fn ensure_heads_cover_prefix(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
     prepared: &PreparedGenesis,
 ) -> Result<()> {
-    let rows = sqlx::query(
-        "SELECT shard, shard_count, last_committed_offset, chain_digest \
-         FROM memory_control_shard_heads \
-         WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 ORDER BY shard",
-    )
-    .bind(scope.tenant_id())
-    .bind(scope.project())
-    .bind(bytes(prepared.append.event.genesis_epoch_id.digest()))
-    .fetch_all(&mut **transaction)
-    .await?;
+    let row_limit = i64::from(prepared.shard_count)
+        .checked_add(1)
+        .ok_or_else(|| corrupt("stored shard-head audit limit overflowed INT8"))?;
+    let rows = sqlx::query(BOUNDED_HEAD_SET_SQL)
+        .bind(scope.tenant_id())
+        .bind(scope.project())
+        .bind(bytes(prepared.append.event.genesis_epoch_id.digest()))
+        .bind(row_limit)
+        .fetch_all(&mut **transaction)
+        .await?;
     if rows.len() != prepared.genesis_heads.len() {
         return Err(corrupt("genesis shard-head set is incomplete"));
     }
     let selected = usize::from(prepared.append.append_position.shard);
+    let bootstrap_offset = i64::try_from(prepared.append.append_position.committed_offset.as_u64())
+        .map_err(|_| corrupt("bootstrap offset exceeds INT8"))?;
     for (expected_shard, row) in rows.iter().enumerate() {
         expect_i32(
             row,
@@ -761,16 +841,26 @@ async fn ensure_heads_match(
             i32::try_from(expected_shard).map_err(|_| corrupt("stored shard exceeds INT4"))?,
         )?;
         expect_i32(row, "shard_count", prepared.shard_count)?;
-        if expected_shard == selected {
-            expect_i64(row, "last_committed_offset", 1)?;
-            expect_bytes(row, "chain_digest", prepared.append.append_chain_digest)?;
+        let prefix_offset = if expected_shard == selected {
+            bootstrap_offset
         } else {
-            expect_i64(row, "last_committed_offset", 0)?;
-            expect_bytes(
-                row,
-                "chain_digest",
-                prepared.genesis_heads[expected_shard].1,
-            )?;
+            0
+        };
+        let current_offset: i64 = row.try_get("last_committed_offset")?;
+        if current_offset < prefix_offset {
+            return Err(corrupt(format!(
+                "stored shard {expected_shard} head precedes the durable bootstrap prefix"
+            )));
+        }
+        if current_offset == prefix_offset {
+            let prefix_chain = if expected_shard == selected {
+                prepared.append.append_chain_digest
+            } else {
+                prepared.genesis_heads[expected_shard].1
+            };
+            expect_bytes(row, "chain_digest", prefix_chain)?;
+        } else {
+            digest_from_stored_bytes(row.try_get("chain_digest")?, "advanced head chain")?;
         }
     }
     Ok(())
@@ -827,8 +917,8 @@ mod tests {
     }
 
     #[test]
-    fn replay_cardinality_probe_is_bounded_instead_of_counting_the_epoch() {
-        assert!(BOUNDED_EVENT_CARDINALITY_SQL.contains("LIMIT 2"));
-        assert!(!BOUNDED_EVENT_CARDINALITY_SQL.contains("count("));
+    fn durable_prefix_head_probe_is_bounded_by_the_persisted_shard_count() {
+        assert!(BOUNDED_HEAD_SET_SQL.contains("LIMIT $4"));
+        assert!(!BOUNDED_HEAD_SET_SQL.contains("count("));
     }
 }
