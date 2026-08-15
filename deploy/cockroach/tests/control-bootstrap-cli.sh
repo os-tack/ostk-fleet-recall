@@ -77,7 +77,7 @@ bootstrap_url="postgresql://fleet_control_bootstrap:${bootstrap_password}@127.0.
 cargo build --locked --bin ostk-control-bootstrap
 
 run_cli() {
-    FLEET_RECALL_DATABASE_URL="$bootstrap_url" \
+    FLEET_RECALL_CONTROL_DATABASE_URL="$bootstrap_url" \
     FLEET_RECALL_TENANT_ID='0198a849-f6ae-7d61-9800-000000000001' \
     FLEET_RECALL_PROJECT='private-cli-proof' \
     FLEET_RECALL_CONTROL_TENANT_NAMESPACE='tenant.fixture' \

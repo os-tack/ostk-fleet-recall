@@ -80,7 +80,7 @@ impl ControlBootstrapRuntimeConfig {
     /// needed by the private control bootstrap process.
     pub fn from_env() -> Result<Self> {
         control_bootstrap_runtime_config(
-            &required("FLEET_RECALL_DATABASE_URL")?,
+            &required("FLEET_RECALL_CONTROL_DATABASE_URL")?,
             &required("FLEET_RECALL_TENANT_ID")?,
             &required("FLEET_RECALL_PROJECT")?,
             &required("FLEET_RECALL_CONTROL_TENANT_NAMESPACE")?,
@@ -133,7 +133,7 @@ const MODEL_BUNDLE_FILES: [&str; 3] = ["config.json", "model.safetensors", "toke
 impl FleetConfig {
     pub fn from_env() -> Result<Self> {
         let database_url = required("FLEET_RECALL_DATABASE_URL")?;
-        validate_database_url(&database_url)?;
+        validate_database_url(&database_url, "FLEET_RECALL_DATABASE_URL")?;
         let tenant_id = required("FLEET_RECALL_TENANT_ID")?
             .parse::<Uuid>()
             .map_err(|error| {
@@ -260,7 +260,7 @@ fn control_bootstrap_runtime_config(
     project_namespace: &str,
     receipt_digest: &str,
 ) -> Result<ControlBootstrapRuntimeConfig> {
-    validate_database_url(database_url)?;
+    validate_database_url(database_url, "FLEET_RECALL_CONTROL_DATABASE_URL")?;
     let tenant_id = tenant_id.parse::<Uuid>().map_err(|error| {
         FleetError::Configuration(format!("FLEET_RECALL_TENANT_ID must be a UUID: {error}"))
     })?;
@@ -364,39 +364,74 @@ fn required(name: &str) -> Result<String> {
         .ok_or_else(|| FleetError::Configuration(format!("{name} is required")))
 }
 
-fn validate_database_url(database_url: &str) -> Result<()> {
+fn validate_database_url(database_url: &str, variable_name: &str) -> Result<()> {
     let parsed = Url::parse(database_url).map_err(|error| {
         FleetError::Configuration(format!(
-            "FLEET_RECALL_DATABASE_URL must be a valid PostgreSQL URL: {error}"
+            "{variable_name} must be a valid PostgreSQL URL: {error}"
         ))
     })?;
     if !matches!(parsed.scheme(), "postgres" | "postgresql") {
-        return Err(FleetError::Configuration(
-            "FLEET_RECALL_DATABASE_URL must use the postgres or postgresql scheme".into(),
-        ));
+        return Err(FleetError::Configuration(format!(
+            "{variable_name} must use the postgres or postgresql scheme"
+        )));
     }
     let host = parsed.host_str().ok_or_else(|| {
-        FleetError::Configuration("FLEET_RECALL_DATABASE_URL must include a hostname".into())
+        FleetError::Configuration(format!("{variable_name} must include a hostname"))
     })?;
-    let ssl_modes = parsed
-        .query_pairs()
-        .filter(|(name, _)| name == "sslmode")
-        .map(|(_, value)| value.into_owned())
-        .collect::<Vec<_>>();
-    if ssl_modes.as_slice() == ["verify-full"] {
+
+    if parsed.fragment().is_some() {
+        return Err(FleetError::Configuration(format!(
+            "{variable_name} must not contain a URL fragment"
+        )));
+    }
+
+    let mut ssl_mode = None;
+    let mut ssl_root_cert = None;
+    for (name, value) in parsed.query_pairs() {
+        match name.as_ref() {
+            "sslmode" if ssl_mode.is_none() => ssl_mode = Some(value.into_owned()),
+            "sslrootcert" if ssl_root_cert.is_none() => {
+                let value = value.into_owned();
+                if value.len() > 4_096
+                    || value.chars().any(char::is_control)
+                    || !Path::new(&value).is_absolute()
+                {
+                    return Err(FleetError::Configuration(format!(
+                        "{variable_name} sslrootcert must be a bounded absolute path"
+                    )));
+                }
+                ssl_root_cert = Some(value);
+            }
+            "sslmode" | "sslrootcert" => {
+                return Err(FleetError::Configuration(format!(
+                    "{variable_name} must not repeat connection parameter {name}"
+                )));
+            }
+            _ => {
+                return Err(FleetError::Configuration(format!(
+                    "{variable_name} contains unsupported connection parameter {name}"
+                )));
+            }
+        }
+    }
+
+    if ssl_mode.as_deref() == Some("verify-full") {
         return Ok(());
     }
 
     let local_escape =
         env::var("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE").is_ok_and(|value| value == "1");
     let local_host = matches!(host, "localhost" | "127.0.0.1" | "::1" | "cockroach");
-    if local_escape && local_host {
+    if local_escape
+        && local_host
+        && ssl_root_cert.is_none()
+        && matches!(ssl_mode.as_deref(), None | Some("disable"))
+    {
         return Ok(());
     }
-    Err(FleetError::Configuration(
-        "FLEET_RECALL_DATABASE_URL must set sslmode=verify-full; local development may set FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1 only for a loopback or `cockroach` host"
-            .into(),
-    ))
+    Err(FleetError::Configuration(format!(
+        "{variable_name} must set exactly sslmode=verify-full; local development may set FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1 only for a loopback or `cockroach` host"
+    )))
 }
 
 #[cfg(test)]
@@ -512,19 +547,79 @@ mod tests {
     fn cloud_database_urls_require_full_tls_verification() {
         assert!(
             validate_database_url(
-                "postgresql://user:secret@cluster.example:26257/defaultdb?sslmode=verify-full"
+                "postgresql://user:secret@cluster.example:26257/defaultdb?sslmode=verify-full",
+                "TEST_DATABASE_URL",
             )
             .is_ok()
         );
         assert!(
             validate_database_url(
-                "postgresql://user:secret@cluster.example:26257/defaultdb?sslmode=require"
+                "postgresql://user:secret@cluster.example:26257/defaultdb?sslmode=require",
+                "TEST_DATABASE_URL",
             )
             .is_err()
         );
         assert!(
             validate_database_url(
-                "postgresql://user:secret@cluster.example:26257/defaultdb?sslmode=disable"
+                "postgresql://user:secret@cluster.example:26257/defaultdb?sslmode=disable",
+                "TEST_DATABASE_URL",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn database_url_query_parameters_are_closed() {
+        assert!(
+            validate_database_url(
+                "postgresql://user:secret@cluster.example:26257/defaultdb?sslmode=verify-full&sslrootcert=%2Fetc%2Fssl%2Fcerts%2Fca.pem",
+                "TEST_DATABASE_URL",
+            )
+            .is_ok()
+        );
+
+        for parameter in [
+            "ssl-mode=disable",
+            "ssl-mode=verify-full",
+            "ssl-root-cert=/tmp/ca.pem",
+            "ssl-ca=/tmp/ca.pem",
+            "host=attacker.example",
+            "hostaddr=127.0.0.1",
+            "port=5432",
+            "dbname=other",
+            "user=other",
+            "password=other",
+            "options=-csearch_path%3Dattacker",
+            "options[search_path]=attacker",
+            "application_name=other",
+            "statement-cache-capacity=0",
+            "unknown=value",
+        ] {
+            let url = format!(
+                "postgresql://user:secret@cluster.example:26257/defaultdb?sslmode=verify-full&{parameter}"
+            );
+            assert!(
+                validate_database_url(&url, "TEST_DATABASE_URL").is_err(),
+                "accepted {parameter}"
+            );
+        }
+
+        for query in [
+            "sslmode=verify-full&sslmode=disable",
+            "sslrootcert=/tmp/one.pem&sslrootcert=/tmp/two.pem&sslmode=verify-full",
+            "sslmode=verify-full&sslrootcert=relative.pem",
+        ] {
+            let url = format!("postgresql://user:secret@cluster.example:26257/defaultdb?{query}");
+            assert!(
+                validate_database_url(&url, "TEST_DATABASE_URL").is_err(),
+                "accepted {query}"
+            );
+        }
+
+        assert!(
+            validate_database_url(
+                "postgresql://user:secret@cluster.example:26257/defaultdb?sslmode=verify-full#ignored",
+                "TEST_DATABASE_URL",
             )
             .is_err()
         );

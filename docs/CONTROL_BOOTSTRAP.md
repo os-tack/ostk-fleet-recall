@@ -5,6 +5,11 @@ out-of-band-pinned genesis receipt into the append-only control ledger. It is
 not an HTTP route, an MCP tool, an ingest option, or a serving startup hook.
 The CloudFront demo remains read-only.
 
+This command is currently a workstation/operator tool built with Cargo. The
+production image copies only `ostk-fleet-recall` and does not contain this
+binary or the canonical contract artifacts. No ECS bootstrap task or secret
+wiring exists yet; adding one is a separate reviewed deployment increment.
+
 ## Authority and artifact inputs
 
 The `ostk-control-bootstrap` binary accepts only two path arguments:
@@ -20,8 +25,15 @@ Routing and authority are available only through deployment environment:
 - semantic authority scope in `FLEET_RECALL_CONTROL_TENANT_NAMESPACE` and
   `FLEET_RECALL_CONTROL_PROJECT_NAMESPACE`;
 - the out-of-band root in `FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST`;
-- a private `FLEET_RECALL_DATABASE_URL` whose login has only the bootstrap
+- a private `FLEET_RECALL_CONTROL_DATABASE_URL` whose login has only the bootstrap
   grants below.
+
+The private command never falls back to `FLEET_RECALL_DATABASE_URL`. This
+prevents a stale exported runtime or migrator URL from silently becoming the
+bootstrap credential. The control URL permits only one `sslmode` parameter and
+an optional absolute `sslrootcert` path; SQLx aliases, routing overrides,
+session `options`, duplicate keys, unknown parameters, and URL fragments fail
+closed before any connection attempt.
 
 The command checks the raw receipt digest against the deployment pin before it
 uses the receipt's profile reference. It then requires canonical bytes,
