@@ -217,9 +217,11 @@ src/registry_activation/cockroach.rs|registry_activation|rust
 src/registry_activation/genesis_audit.rs|registry_activation|rust
 src/registry_activation/mod.rs|registry_activation|rust
 src/registry_activation/repository.rs|registry_activation|rust
+src/registry_activation/successor_cockroach.rs|registry_activation|rust
 src/registry_activation/successor_repository.rs|registry_activation|rust
 src/service.rs|application_code|rust
 src/store/cockroach.rs|cockroach_store|rust
 src/store/mod.rs|cockroach_store|rust
 tests/control_log_live.rs|database_verification|rust
 tests/registry_activation_live.rs|database_verification|rust
+tests/successor_activation_live.rs|database_verification|rust
