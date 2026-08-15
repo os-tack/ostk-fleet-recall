@@ -333,16 +333,12 @@ impl GenesisSuccessorKeyBridgePin {
     }
 }
 
-/// Opaque immutable-genesis facts reserved for a later same-transaction
-/// repository audit.
+/// Opaque immutable-genesis facts minted only from the private durable audit.
 ///
-/// There is intentionally no production constructor in this contract module:
-/// offline package closure and caller-supplied head fields cannot prove that a
-/// durable database root was fully re-audited. Current generation and bridge
-/// consumption are deliberately absent: they are mutable repository state,
-/// not part of the bridge's immutable cryptographic closure.
+/// Current generation and bridge consumption are deliberately absent: they
+/// are mutable repository state, not part of the bridge's immutable
+/// cryptographic closure.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // intentionally unwired until the successor repository exists
 pub(crate) struct ImmutableGenesisSuccessorWitness {
     profile: ProfileReferenceV1,
     scope: AuthenticatedProjectScopeV1,
@@ -351,6 +347,50 @@ pub(crate) struct ImmutableGenesisSuccessorWitness {
     eligible_v1_principal_ids: Vec<ContractId>,
     required_v1_threshold: u16,
     v1_separation_of_duty: GenesisTransitionSeparationOfDutyV1,
+}
+
+impl ImmutableGenesisSuccessorWitness {
+    /// Narrow a fully audited durable genesis root into the immutable facts
+    /// needed to authenticate the deployment-pinned one-time key bridge.
+    ///
+    /// This constructor is crate-private so public callers cannot turn an
+    /// offline package and caller-selected head into repository authority.
+    #[allow(dead_code, clippy::too_many_arguments)] // consumed by the repository SQL slice
+    pub(crate) fn from_durable_audit(
+        profile: ProfileReferenceV1,
+        scope: AuthenticatedProjectScopeV1,
+        genesis_registry_head: RegistryHeadBindingV1,
+        current_v1_activation_policy: RegistryReferenceV1,
+        eligible_v1_principal_ids: Vec<ContractId>,
+        required_v1_threshold: u16,
+        v1_separation_of_duty: GenesisTransitionSeparationOfDutyV1,
+    ) -> ContractResult<Self> {
+        profile.require_frozen_runtime_profile()?;
+        genesis_registry_head.validate_shape()?;
+        current_v1_activation_policy.validate()?;
+        if current_v1_activation_policy.version != 1
+            || current_v1_activation_policy.entry_digest
+                != genesis_registry_head.head.activation_policy_digest
+            || genesis_registry_head.effective_until.is_some()
+            || eligible_v1_principal_ids.is_empty()
+            || !strictly_sorted(&eligible_v1_principal_ids)
+            || required_v1_threshold == 0
+            || usize::from(required_v1_threshold) > eligible_v1_principal_ids.len()
+            || v1_separation_of_duty
+                != GenesisTransitionSeparationOfDutyV1::IndependentApprovalFromPackageAuthor
+        {
+            return Err(ContractError::ManifestMismatch);
+        }
+        Ok(Self {
+            profile,
+            scope,
+            genesis_registry_head,
+            current_v1_activation_policy,
+            eligible_v1_principal_ids,
+            required_v1_threshold,
+            v1_separation_of_duty,
+        })
+    }
 }
 
 #[cfg(test)]

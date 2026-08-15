@@ -20,6 +20,25 @@ pub enum GenesisActivationTimingKind {
     FutureEffective,
 }
 
+/// Closed semantic reasons a valid first-successor statement conflicts with
+/// construction-bound or already accepted authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SuccessorActivationConflictKind {
+    #[error("the same successor statement already has a different approval ceremony")]
+    ApprovalSet,
+    #[error("the candidate was verified against different construction-bound authority")]
+    BoundAuthority,
+}
+
+/// Closed timing failures for a first-successor statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SuccessorActivationTimingKind {
+    #[error("effective_from precedes durable predecessor acceptance")]
+    BeforePredecessorAcceptance,
+    #[error("effective_from is later than the one server acceptance timestamp")]
+    FutureEffective,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FleetError {
     #[error("configuration error: {0}")]
@@ -52,6 +71,20 @@ pub enum FleetError {
     GenesisActivationTiming(GenesisActivationTimingKind),
     #[error("registry activation state is corrupt or incomplete: {0}")]
     RegistryActivationCorrupt(String),
+    #[error("successor registry activation requires a complete audited genesis activation")]
+    SuccessorActivationNotReady,
+    #[error(
+        "successor registry activation requires the complete successful schema prefix through 14"
+    )]
+    SuccessorActivationSchemaUnavailable,
+    #[error("successor registry activation conflict: {0}")]
+    SuccessorActivationConflict(SuccessorActivationConflictKind),
+    #[error("successor registry activation is stale because another statement already won")]
+    SuccessorActivationStale,
+    #[error("successor registry activation timing failed: {0}")]
+    SuccessorActivationTiming(SuccessorActivationTimingKind),
+    #[error("successor registry state is corrupt or incomplete: {0}")]
+    SuccessorActivationCorrupt(String),
     #[error("memory operation failed: {0}")]
     Memory(String),
 }

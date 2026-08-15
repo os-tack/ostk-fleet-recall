@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Postgres, Row, Transaction};
 
+use super::genesis_audit::{self, AuditedGenesisRoot};
 use super::{
     AcceptedGenesisActivation, GenesisActivationInspection, GenesisActivationOutcome,
     GenesisActivationRepository, PinnedInactiveGenesis,
@@ -23,6 +24,7 @@ use crate::memory_contracts::canonical::{decode_strict, encode_canonical, requir
 use crate::memory_contracts::common::{CanonicalTimestamp, frozen_profile_reference_v1};
 use crate::memory_contracts::control::{GenesisBootstrapAppendV1, derive_append_chain_digest};
 use crate::memory_contracts::digest::Sha256Digest;
+use crate::memory_contracts::evidence_v2::RegistryHeadBindingV1;
 use crate::memory_contracts::genesis::SemanticallyClosedGenesisPackage;
 use crate::memory_contracts::genesis_activation::{
     GenesisActivationPrincipalBinding, GenesisRegistryActivatedEventV1,
@@ -31,7 +33,7 @@ use crate::memory_contracts::genesis_activation::{
     VerifiedRegistryTestResult, registry_activation_consistency_partition_key,
     verify_genesis_registry_activation,
 };
-use crate::memory_contracts::registry::RegistryHeadV1;
+use crate::memory_contracts::registry::{RegistryEntryKind, RegistryHeadV1};
 use crate::store::cockroach::{RetryPolicy, with_serializable_retry};
 use crate::{FleetError, Result};
 
@@ -144,19 +146,17 @@ impl std::fmt::Debug for CockroachGenesisActivationRepository {
     }
 }
 
-struct BoundActivationAuthority {
-    bootstrap: VerifiedBootstrapReceipt,
-    package: SemanticallyClosedGenesisPackage,
-    test_result: VerifiedRegistryTestResult,
-    principal_binding: GenesisActivationPrincipalBinding,
-    bootstrap_append: GenesisBootstrapAppendV1,
+pub(super) struct BoundActivationAuthority {
+    pub(super) bootstrap: VerifiedBootstrapReceipt,
+    pub(super) package: SemanticallyClosedGenesisPackage,
+    pub(super) test_result: VerifiedRegistryTestResult,
+    pub(super) principal_binding: GenesisActivationPrincipalBinding,
+    pub(super) bootstrap_append: GenesisBootstrapAppendV1,
 }
 
-impl CockroachGenesisActivationRepository {
-    pub fn new(
-        pool: PgPool,
-        trusted_scope: TrustedControlScope,
-        retry_policy: RetryPolicy,
+impl BoundActivationAuthority {
+    pub(super) fn from_trusted_config(
+        trusted_scope: &TrustedControlScope,
         bootstrap: VerifiedBootstrapReceipt,
         package: SemanticallyClosedGenesisPackage,
         test_result: VerifiedRegistryTestResult,
@@ -181,16 +181,37 @@ impl CockroachGenesisActivationRepository {
             ));
         }
         Ok(Self {
+            bootstrap,
+            package,
+            test_result,
+            principal_binding,
+            bootstrap_append,
+        })
+    }
+}
+
+impl CockroachGenesisActivationRepository {
+    pub fn new(
+        pool: PgPool,
+        trusted_scope: TrustedControlScope,
+        retry_policy: RetryPolicy,
+        bootstrap: VerifiedBootstrapReceipt,
+        package: SemanticallyClosedGenesisPackage,
+        test_result: VerifiedRegistryTestResult,
+        principal_binding: GenesisActivationPrincipalBinding,
+    ) -> Result<Self> {
+        let authority = BoundActivationAuthority::from_trusted_config(
+            &trusted_scope,
+            bootstrap,
+            package,
+            test_result,
+            principal_binding,
+        )?;
+        Ok(Self {
             pool,
             trusted_scope,
             retry_policy,
-            authority: Arc::new(BoundActivationAuthority {
-                bootstrap,
-                package,
-                test_result,
-                principal_binding,
-                bootstrap_append,
-            }),
+            authority: Arc::new(authority),
         })
     }
 
@@ -303,12 +324,6 @@ impl AcceptedActivation {
             accepted_at: self.receipt.accepted_at.clone(),
         }
     }
-}
-
-struct AuditedStoredActivation {
-    inspection: AcceptedGenesisActivation,
-    canonical_statement: Vec<u8>,
-    canonical_approval_set: Vec<u8>,
 }
 
 fn corrupt(message: impl Into<String>) -> FleetError {
@@ -481,7 +496,7 @@ async fn require_activation_schema(transaction: &mut Transaction<'_, Postgres>) 
 
 fn classify_same_statement(
     prepared: &PreparedActivation,
-    stored: AuditedStoredActivation,
+    stored: AuditedGenesisRoot,
 ) -> Result<AcceptedGenesisActivation> {
     if stored.canonical_statement != prepared.verified.canonical_statement() {
         return Err(corrupt(
@@ -967,10 +982,28 @@ async fn load_and_audit_head_activation(
     authority: &BoundActivationAuthority,
     witness: &DurableGenesisWitness,
     _head: &PgRow,
-) -> Result<AuditedStoredActivation> {
+) -> Result<AuditedGenesisRoot> {
+    let stored = genesis_audit::audit_immutable_genesis_root(transaction, scope, authority).await?;
+    audit_genesis_only_current_state(transaction, scope, authority, witness, &stored.inspection)
+        .await?;
+    Ok(stored)
+}
+
+/// Implementation behind the shared immutable-root audit boundary.
+///
+/// It deliberately does not assert that the genesis event is still the stream
+/// tip. The Stage-3 path adds that mutable-state assertion separately, while
+/// successor replay needs this same immutable proof after generation one is
+/// present.
+pub(super) async fn audit_immutable_genesis_root_impl(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &TrustedControlScope,
+    authority: &BoundActivationAuthority,
+) -> Result<AuditedGenesisRoot> {
+    let witness = require_bound_witness(transaction, scope, authority).await?;
     let prefix = select_registry_stream_prefix(transaction, scope, authority)
         .await?
-        .ok_or_else(|| corrupt("registry head exists without a genesis activation prefix"))?;
+        .ok_or_else(|| corrupt("registry root has no genesis activation prefix"))?;
     let prefix_position = stream_endpoint_position(&prefix, authority.bootstrap.epoch_id())?;
     let prefix_source = select_control_event(transaction, scope, &prefix_position)
         .await?
@@ -983,7 +1016,15 @@ async fn load_and_audit_head_activation(
     let row = select_by_activation_id(transaction, scope, activation_id)
         .await?
         .ok_or_else(|| corrupt("genesis registry event has no activation projection"))?;
-    audit_stored_activation(transaction, scope, authority, witness, &row).await
+    let stored =
+        audit_genesis_activation_prefix(transaction, scope, authority, &witness, &row).await?;
+    audit_genesis_activation_cardinality(transaction, scope, stored.inspection.activation_id)
+        .await?;
+    let head = select_registry_head(transaction, scope)
+        .await?
+        .ok_or_else(|| corrupt("accepted genesis activation has no legacy registry head"))?;
+    audit_legacy_genesis_head_root(transaction, scope, &witness, &head, &stored.inspection).await?;
+    Ok(stored)
 }
 
 async fn select_registry_stream_prefix(
@@ -1027,23 +1068,15 @@ async fn audit_stored_activation(
     authority: &BoundActivationAuthority,
     witness: &DurableGenesisWitness,
     row: &PgRow,
-) -> Result<AuditedStoredActivation> {
-    let stored =
-        audit_genesis_activation_prefix(transaction, scope, authority, witness, row).await?;
-    audit_genesis_activation_cardinality(transaction, scope, stored.inspection.activation_id)
+) -> Result<AuditedGenesisRoot> {
+    let stored = genesis_audit::audit_immutable_genesis_root(transaction, scope, authority).await?;
+    expect_digest(
+        row,
+        "activation_id",
+        stored.inspection.activation_id.digest(),
+    )?;
+    audit_genesis_only_current_state(transaction, scope, authority, witness, &stored.inspection)
         .await?;
-    let head = select_registry_head(transaction, scope)
-        .await?
-        .ok_or_else(|| corrupt("accepted genesis activation has no current registry head"))?;
-    audit_current_registry_head(
-        transaction,
-        scope,
-        authority,
-        witness,
-        &head,
-        &stored.inspection,
-    )
-    .await?;
     Ok(stored)
 }
 
@@ -1074,7 +1107,7 @@ async fn audit_genesis_activation_prefix(
     authority: &BoundActivationAuthority,
     witness: &DurableGenesisWitness,
     row: &PgRow,
-) -> Result<AuditedStoredActivation> {
+) -> Result<AuditedGenesisRoot> {
     let canonical_statement: Vec<u8> = row.try_get("canonical_statement")?;
     let canonical_approval_set: Vec<u8> = row.try_get("canonical_approval_set")?;
     let canonical_test_result: Vec<u8> = row.try_get("canonical_test_result")?;
@@ -1210,8 +1243,8 @@ async fn audit_genesis_activation_prefix(
         registry_head,
         append_position,
         bootstrap_receipt_digest: receipt.expected_anchor.bootstrap_receipt_digest,
-        effective_from: event.effective_from,
-        accepted_at: receipt.accepted_at,
+        effective_from: event.effective_from.clone(),
+        accepted_at: receipt.accepted_at.clone(),
     };
     let current = read_control_head(
         transaction,
@@ -1238,10 +1271,60 @@ async fn audit_genesis_activation_prefix(
     )
     .await?;
 
-    Ok(AuditedStoredActivation {
+    let head_binding = RegistryHeadBindingV1 {
+        head: inspection.registry_head.clone(),
+        effective_from: inspection.effective_from.clone(),
+        effective_until: None,
+    };
+    stored_contract(head_binding.validate_shape())?;
+    let canonical_head_binding = stored_contract(encode_canonical(&head_binding))?;
+    let mut policy_entries = authority
+        .package
+        .manifest_verified_package()
+        .package()
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == RegistryEntryKind::ActivationPolicy);
+    let policy_entry = policy_entries
+        .next()
+        .ok_or_else(|| corrupt("audited genesis package has no activation policy"))?;
+    if policy_entries.next().is_some() {
+        return Err(corrupt(
+            "audited genesis package has multiple activation policies",
+        ));
+    }
+    let current_v1_activation_policy = crate::memory_contracts::common::RegistryReferenceV1 {
+        entry_id: policy_entry.entry_id.clone(),
+        version: policy_entry.version,
+        entry_digest: stored_contract(policy_entry.digest())?,
+    };
+    if current_v1_activation_policy.entry_digest
+        != inspection.registry_head.activation_policy_digest
+    {
+        return Err(corrupt(
+            "audited genesis policy reference differs from the durable head",
+        ));
+    }
+    let eligible_v1_principal_ids = authority
+        .package
+        .activation_policy()
+        .eligible_principal_ids()
+        .to_vec();
+    let required_v1_threshold = authority.package.activation_policy().approval_threshold();
+
+    Ok(AuditedGenesisRoot {
         inspection,
+        verified,
+        receipt,
+        event,
+        current_v1_activation_policy,
+        eligible_v1_principal_ids,
+        required_v1_threshold,
         canonical_statement,
         canonical_approval_set,
+        canonical_receipt,
+        canonical_event,
+        canonical_head_binding,
     })
 }
 
@@ -1772,10 +1855,9 @@ fn audit_registry_head_row(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn audit_current_registry_head(
+async fn audit_legacy_genesis_head_root(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
-    authority: &BoundActivationAuthority,
     witness: &DurableGenesisWitness,
     head: &PgRow,
     genesis: &AcceptedGenesisActivation,
@@ -1888,8 +1970,29 @@ async fn audit_current_registry_head(
         previous_chain,
         activated_at,
     )
-    .await?;
+    .await
+}
 
+async fn audit_genesis_only_current_state(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &TrustedControlScope,
+    authority: &BoundActivationAuthority,
+    witness: &DurableGenesisWitness,
+    genesis: &AcceptedGenesisActivation,
+) -> Result<()> {
+    let source_position = genesis.append_position;
+    let source_offset = offset_as_i64(source_position.committed_offset)?;
+    let source_event_id = genesis.accepted_event_id;
+    let source = select_control_event(transaction, scope, &source_position)
+        .await?
+        .ok_or_else(|| corrupt("current registry source event is missing"))?;
+    let previous_chain = digest_from_row(&source, "previous_chain_digest")?;
+    let source_chain = stored_contract(derive_append_chain_digest(
+        previous_chain,
+        source_event_id,
+        &source_position,
+    ))?;
+    let activated_at = canonical_timestamp_to_database(&genesis.accepted_at)?;
     let stream_tip = select_registry_stream_tip(transaction, scope, authority)
         .await?
         .ok_or_else(|| corrupt("current registry stream has no tip"))?;
