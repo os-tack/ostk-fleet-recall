@@ -1,0 +1,1 @@
+{"cases":["dependency_digest_substitution","fail_open_governance","identity_kind_mismatch","unknown_selector","wrong_logical_revision"],"expected_outcome":"reject","fixture_authority":"test_only_no_runtime_authority","schema_version":1,"suite_id":"ostk.stage4.entry.negative.v1"}

@@ -1,0 +1,1 @@
+{"cases":["exact_body_identity","exact_dependency_digest","fail_closed_governance","frozen_logical_revision","typed_identity_closure"],"expected_outcome":"accept","fixture_authority":"test_only_no_runtime_authority","schema_version":1,"suite_id":"ostk.stage4.entry.positive.v1"}
