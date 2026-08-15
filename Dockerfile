@@ -28,10 +28,12 @@ RUN cargo build --locked --release --bin ostk-fleet-recall
 COPY README.md ./README.md
 COPY .dockerignore .gitignore Dockerfile deny.toml ./
 COPY .github ./.github
+COPY contracts ./contracts
 COPY demo ./demo
 COPY docs ./docs
 COPY deploy ./deploy
 COPY examples ./examples
+COPY tests ./tests
 RUN install --directory /out \
     && RICH_DEMO_SOURCE_REVISION="$VCS_REF" \
        ./examples/rich-demo/generate.sh > /out/rich-demo.ndjson \

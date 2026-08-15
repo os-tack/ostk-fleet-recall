@@ -95,7 +95,7 @@ case "$role" in
         ;;
     agent-b)
         line "${blue}${bold}\$ recall search${reset}    ${muted}identity: $agent_b_name${reset}"
-        line "${white}“How should workers coordinate schema changes?”${reset}"
+        line "${white}\"How should workers coordinate schema changes?\"${reset}"
         line ""
         line "$(label lanes "${lavender}lexical + dense${reset}")"
         line "$(label fusion "${lavender}reciprocal-rank (RRF)${reset}")"

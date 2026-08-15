@@ -20,7 +20,7 @@ case "${1:---rehearsal}" in
             printf 'usage: demo/video/render.sh --fleet-live RUN_ID\n' >&2
             exit 64
         }
-        export FLEET_VIDEO_RUN_ID=$2
+        export FLEET_VIDEO_RUN_ID="$2"
         tape=$script_dir/fleet-live.tape
         preflight_mode=fleet-live
         ;;
@@ -29,7 +29,7 @@ case "${1:---rehearsal}" in
             printf 'usage: demo/video/render.sh --ostk-live RUN_ID\n' >&2
             exit 64
         }
-        export FLEET_VIDEO_RUN_ID=$2
+        export FLEET_VIDEO_RUN_ID="$2"
         tape=$script_dir/ostk-live.tape
         preflight_mode=ostk-live
         ;;
