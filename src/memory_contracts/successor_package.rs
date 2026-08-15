@@ -28,6 +28,7 @@ use super::{
     },
     identity::{IdentityForm, IdentityRecipeV1, ResourceKindSchemaV1},
     registry::{ManifestVerifiedRegistryPackage, RegistryEntryKind, RegistryEntryV1},
+    relation_policy_v2::StructurallyResolvedRelationProofV2,
     remember_v2::{
         RememberAdmissionBasisRuleV2, RememberAdmissionRuleV2, RememberPredicateSchemaV2,
         RememberValueConstraintV2, ResourceIdentityConstraintV2,
@@ -39,6 +40,7 @@ use super::{
 const ACTIVATION_POLICY_SCHEMA_ID: &str = "registry.activation_policy";
 const CONNECTOR_SCHEMA_ID: &str = "registry.connector_schema";
 const PREDICATE_SCHEMA_ID: &str = "registry.predicate_schema";
+const RELATION_PROOF_SCHEMA_ID: &str = "registry.relation_proof";
 const REMEMBER_ADMISSION_SCHEMA_ID: &str = "registry.remember_admission_rule";
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const SUCCESSOR_SCHEMA_VERSION: u32 = 2;
@@ -48,6 +50,7 @@ enum DecodedSuccessorEntry {
     LegacyV1(SemanticallyDecodedGenesisEntryV1),
     ActivationPolicyV2(StructurallyResolvedActivationPolicyV2),
     ConnectorSchemaV2(StructurallyResolvedConnectorSchemaV2),
+    RelationProofV2(StructurallyResolvedRelationProofV2),
     RememberPredicateSchemaV2 {
         registry_reference: RegistryReferenceV1,
         schema: RememberPredicateSchemaV2,
@@ -61,12 +64,12 @@ enum DecodedSuccessorEntry {
 /// Manifest-verified successor package with individually body-closed,
 /// exact-schema entries and exactly one activation-policy v2 root.
 ///
-/// Legacy relation-proof v1 entries may remain as closed historical data, but
-/// this type deliberately exposes no active relation capability. A future
-/// relation-proof v2 selector and body must define that authority explicitly.
-/// Likewise, this generic layer does not reject unreachable historical entries;
-/// the frozen Stage-4 target wrapper must enumerate exact capability roots and
-/// reject inventory outside their permitted carry-forward set.
+/// Legacy relation-proof v1 entries may remain as closed historical data. A
+/// relation-proof v2 accessor exposes only its exact offline structural body;
+/// it does not create active relation or append authority. Likewise, this
+/// generic layer does not reject unreachable historical entries; the frozen
+/// Stage-4 target wrapper must enumerate exact capability roots and reject
+/// inventory outside their permitted carry-forward set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticallyClosedSuccessorPackage {
     manifest_verified: ManifestVerifiedRegistryPackage,
@@ -103,6 +106,9 @@ impl SemanticallyClosedSuccessorPackage {
                 }
                 DecodedSuccessorEntry::RememberPredicateSchemaV2 { schema, .. } => {
                     close_remember_predicate_v2(&manifest_verified, schema)?;
+                }
+                DecodedSuccessorEntry::RelationProofV2(relation) => {
+                    close_relation_v2(&manifest_verified, relation)?;
                 }
                 DecodedSuccessorEntry::LegacyV1(_)
                 | DecodedSuccessorEntry::ActivationPolicyV2(_)
@@ -190,6 +196,22 @@ impl SemanticallyClosedSuccessorPackage {
             _ => None,
         })
     }
+
+    /// Resolve one exact relation-proof v2 structural body from this offline
+    /// package closure. Active-head and append authority remain separate.
+    pub fn relation_proof(
+        &self,
+        reference: &RegistryReferenceV1,
+    ) -> Option<&StructurallyResolvedRelationProofV2> {
+        self.entries.iter().find_map(|entry| match entry {
+            DecodedSuccessorEntry::RelationProofV2(relation)
+                if relation.registry_reference() == reference =>
+            {
+                Some(relation)
+            }
+            _ => None,
+        })
+    }
 }
 
 impl TryFrom<ManifestVerifiedRegistryPackage> for SemanticallyClosedSuccessorPackage {
@@ -216,6 +238,11 @@ fn decode_successor_entry(entry: &RegistryEntryV1) -> ContractResult<DecodedSucc
             let connector = StructurallyResolvedConnectorSchemaV2::from_registry_entry(entry)?;
             require_exact_typed_body(entry, connector.schema())?;
             Ok(DecodedSuccessorEntry::ConnectorSchemaV2(connector))
+        }
+        (RegistryEntryKind::RelationProof, RELATION_PROOF_SCHEMA_ID, SUCCESSOR_SCHEMA_VERSION) => {
+            let relation = StructurallyResolvedRelationProofV2::from_registry_entry(entry)?;
+            require_exact_typed_body(entry, relation.proof())?;
+            Ok(DecodedSuccessorEntry::RelationProofV2(relation))
         }
         (RegistryEntryKind::PredicateSchema, PREDICATE_SCHEMA_ID, SUCCESSOR_SCHEMA_VERSION) => {
             let schema: RememberPredicateSchemaV2 = decode_body(entry)?;
@@ -369,6 +396,24 @@ fn close_remember_predicate_v2(
     Ok(())
 }
 
+fn close_relation_v2(
+    package: &ManifestVerifiedRegistryPackage,
+    relation: &StructurallyResolvedRelationProofV2,
+) -> ContractResult<()> {
+    let proof = relation.proof();
+    close_resource_identity(package, &proof.source_identity)?;
+    close_resource_identity(package, &proof.target_identity)?;
+    for dimension in &proof.applicability_dimensions {
+        close_resource_identity(package, &dimension.resource_identity)?;
+    }
+    resolve_reference(
+        package.package(),
+        RegistryEntryKind::ApplicabilityEvaluator,
+        &proof.applicability_evaluator,
+    )?;
+    Ok(())
+}
+
 fn close_resource_identity(
     package: &ManifestVerifiedRegistryPackage,
     constraint: &ResourceIdentityConstraintV2,
@@ -499,6 +544,7 @@ mod tests {
             AuthorityNamespaceV1, IdentityComponentRuleV1, LocatorEncoding, ResourceKindSchemaV1,
         },
         registry::{RegistryManifestEntryV1, RegistryPackageV1},
+        relation_policy_v2::RelationProofEntryV2,
     };
 
     const GENESIS_PACKAGE: &[u8] =
@@ -514,6 +560,9 @@ mod tests {
     );
     const REMEMBER_ADMISSION_V2: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v2/remember/remember-admission-rule-v2-entry.jsonl"
+    );
+    const RELATION_PROOF_V2: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v2/relation-policy/relation-proof-v2-entry.jsonl"
     );
 
     fn record(bytes: &[u8]) -> &[u8] {
@@ -708,6 +757,38 @@ mod tests {
         entry
     }
 
+    fn compatible_relation(package: &RegistryPackageV1) -> RegistryEntryV1 {
+        let mut entry = fixture_entry(RELATION_PROOF_V2);
+        let mut relation: RelationProofEntryV2 = decode_body(&entry).unwrap();
+        let identity = ResourceIdentityConstraintV2 {
+            resource_kind_schema: exact_reference(
+                package,
+                RegistryEntryKind::ResourceKindSchema,
+                "repository",
+                1,
+            ),
+            identity_recipe: exact_reference(
+                package,
+                RegistryEntryKind::IdentityRecipe,
+                "github.repository",
+                1,
+            ),
+        };
+        relation.source_identity = identity.clone();
+        relation.target_identity = identity.clone();
+        for dimension in &mut relation.applicability_dimensions {
+            dimension.resource_identity = identity.clone();
+        }
+        relation.applicability_evaluator = exact_reference(
+            package,
+            RegistryEntryKind::ApplicabilityEvaluator,
+            "applicability.default",
+            1,
+        );
+        replace_body(&mut entry, &relation);
+        entry
+    }
+
     #[test]
     fn exact_legacy_and_activation_v2_tuples_close_without_runtime_authority() {
         let verified = rebuild(package_with([]));
@@ -780,6 +861,76 @@ mod tests {
         assert!(closed.connector_schema(&orphan_reference).is_none());
         assert!(closed.remember_predicate(&orphan_reference).is_none());
         assert!(closed.remember_admission(&orphan_reference).is_none());
+        assert!(closed.relation_proof(&orphan_reference).is_none());
+    }
+
+    #[test]
+    fn exact_relation_v2_tuple_closes_without_active_authority() {
+        let relation = compatible_relation(&package_with([]));
+        let relation_reference = registry_reference(&relation).unwrap();
+        let closed =
+            SemanticallyClosedSuccessorPackage::from_manifest_verified(rebuild(package_with([
+                relation,
+            ])))
+            .unwrap();
+
+        let resolved = closed.relation_proof(&relation_reference).unwrap();
+        assert_eq!(resolved.registry_reference(), &relation_reference);
+        assert_eq!(
+            closed
+                .exact_entry(RegistryEntryKind::RelationProof, &relation_reference)
+                .unwrap()
+                .entry_schema_version,
+            SUCCESSOR_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn relation_v2_dependency_references_must_resolve_from_the_same_package() {
+        let error =
+            SemanticallyClosedSuccessorPackage::from_manifest_verified(rebuild(package_with([
+                fixture_entry(RELATION_PROOF_V2),
+            ])))
+            .unwrap_err();
+        assert!(
+            matches!(error, ContractError::Schema(message) if message.contains("missing exact"))
+        );
+    }
+
+    #[test]
+    fn relation_v2_selector_and_body_identity_fail_closed() {
+        let valid = fixture_entry(RELATION_PROOF_V2);
+        let mut wrong_kind = valid.clone();
+        wrong_kind.kind = RegistryEntryKind::AuthorityRule;
+        let mut wrong_schema_id = valid.clone();
+        wrong_schema_id.entry_schema_id = ContractId::new("registry.authority_rule").unwrap();
+        let mut wrong_schema_version = valid.clone();
+        wrong_schema_version.entry_schema_version = 3;
+
+        for entry in [wrong_kind, wrong_schema_id, wrong_schema_version] {
+            let error = decode_successor_entry(&entry).unwrap_err();
+            assert!(
+                matches!(error, ContractError::Schema(message) if message.contains("unsupported successor registry selector"))
+            );
+        }
+
+        let mut wrong_body_id = valid.clone();
+        let mut body: RelationProofEntryV2 = decode_body(&wrong_body_id).unwrap();
+        body.relation_id = ContractId::new("relation.other").unwrap();
+        replace_body(&mut wrong_body_id, &body);
+        assert_eq!(
+            decode_successor_entry(&wrong_body_id),
+            Err(ContractError::ManifestMismatch)
+        );
+
+        let mut wrong_body_version = valid;
+        let mut body: RelationProofEntryV2 = decode_body(&wrong_body_version).unwrap();
+        body.version += 1;
+        replace_body(&mut wrong_body_version, &body);
+        assert_eq!(
+            decode_successor_entry(&wrong_body_version),
+            Err(ContractError::ManifestMismatch)
+        );
     }
 
     #[test]
