@@ -819,7 +819,7 @@ async fn live_genesis_registry_activation_when_configured() {
         [1, 2],
     );
     assert_registry_endpoint_plans(&pool, &schema_scope, &fixture, &same_authority).await;
-    sqlx::query("UPDATE _sqlx_migrations SET version = 10 WHERE version = 9")
+    sqlx::query("UPDATE _sqlx_migrations SET version = 9999 WHERE version = 9")
         .execute(&pool)
         .await
         .unwrap();
@@ -835,7 +835,7 @@ async fn live_genesis_registry_activation_when_configured() {
         "INSERT INTO _sqlx_migrations \
              (version, description, installed_on, success, checksum, execution_time) \
          SELECT 9, description, installed_on, false, checksum, execution_time \
-         FROM _sqlx_migrations WHERE version = 10",
+         FROM _sqlx_migrations WHERE version = 9999",
     )
     .execute(&pool)
     .await
@@ -853,7 +853,7 @@ async fn live_genesis_registry_activation_when_configured() {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE _sqlx_migrations SET version = 9 WHERE version = 10")
+    sqlx::query("UPDATE _sqlx_migrations SET version = 9 WHERE version = 9999")
         .execute(&pool)
         .await
         .unwrap();
