@@ -52,6 +52,16 @@ const CONTROL_EVENT_LEDGER_MIGRATION_SQL: &str =
     include_str!("../../migrations/0003_control_event_ledger.sql");
 const GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL: &str =
     include_str!("../../migrations/0004_genesis_registry_activation.sql");
+const CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0005_control_ledger_invariants.sql");
+const CONTROL_BOOTSTRAP_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0006_control_bootstrap_explicit_acceptance_time.sql");
+const CONTROL_EPOCH_EXPLICIT_CREATION_TIME_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0007_control_epoch_explicit_creation_time.sql");
+const CONTROL_HEAD_EXPLICIT_ADVANCE_TIME_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0008_control_head_explicit_advance_time.sql");
+const CONTROL_EVENT_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0009_control_event_explicit_acceptance_time.sql");
 
 fn embedded_migrator() -> Migrator {
     Migrator {
@@ -91,6 +101,43 @@ fn embedded_migrator() -> Migrator {
                 Cow::Borrowed(GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL),
                 // Keep every CockroachDB schema change outside SQLx's
                 // PostgreSQL-oriented transaction wrapper.
+                true,
+            ),
+            Migration::new(
+                5,
+                Cow::Borrowed("unique control-event predecessors"),
+                MigrationType::Simple,
+                Cow::Borrowed(CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL),
+                // Keep each CockroachDB schema-change job in its own SQLx
+                // migration so success metadata cannot cover partial DDL.
+                true,
+            ),
+            Migration::new(
+                6,
+                Cow::Borrowed("explicit control-bootstrap acceptance time"),
+                MigrationType::Simple,
+                Cow::Borrowed(CONTROL_BOOTSTRAP_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL),
+                true,
+            ),
+            Migration::new(
+                7,
+                Cow::Borrowed("explicit control-epoch creation time"),
+                MigrationType::Simple,
+                Cow::Borrowed(CONTROL_EPOCH_EXPLICIT_CREATION_TIME_MIGRATION_SQL),
+                true,
+            ),
+            Migration::new(
+                8,
+                Cow::Borrowed("explicit control-head advance time"),
+                MigrationType::Simple,
+                Cow::Borrowed(CONTROL_HEAD_EXPLICIT_ADVANCE_TIME_MIGRATION_SQL),
+                true,
+            ),
+            Migration::new(
+                9,
+                Cow::Borrowed("explicit control-event acceptance time"),
+                MigrationType::Simple,
+                Cow::Borrowed(CONTROL_EVENT_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL),
                 true,
             ),
         ]),
@@ -1498,6 +1545,7 @@ where
 mod tests {
     use super::*;
     use ostk_recall_core::{ChunkEmbedder, PrivacyTier, RecallParams};
+    use sha2::{Digest, Sha256};
     use uuid::Uuid;
 
     static LIVE_DATABASE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1800,6 +1848,30 @@ mod tests {
     }
 
     #[test]
+    fn committed_migration_history_one_through_four_is_byte_immutable() {
+        for (migration, expected_sha256) in [
+            (
+                INITIAL_MIGRATION_SQL,
+                "3f9e52abeea37504b5c2d49f3924056985f5620767243f602cf8a2da90e759c0",
+            ),
+            (
+                CLAIM_SUPPORT_CHUNK_MIGRATION_SQL,
+                "ccd955e4baee671703ab5c60cd4bf9f64c3f6b7328843bbea9f124fc70b6e090",
+            ),
+            (
+                CONTROL_EVENT_LEDGER_MIGRATION_SQL,
+                "c81f282f0d5c19bfe6bec8891dc9662be8126a8ef6c7d9fe01517a0021f461bd",
+            ),
+            (
+                GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL,
+                "631cfca494f9b16631738acd237b3990095641c04c6bfb4eaf922df5d6cae75c",
+            ),
+        ] {
+            assert_eq!(format!("{:x}", Sha256::digest(migration)), expected_sha256);
+        }
+    }
+
+    #[test]
     fn control_event_ledger_migration_is_scoped_bounded_and_additive() {
         let migration = CONTROL_EVENT_LEDGER_MIGRATION_SQL;
         let tables = [
@@ -1950,7 +2022,67 @@ mod tests {
     }
 
     #[test]
-    fn embedded_migrator_registers_private_ledgers_as_no_transaction_versions_three_and_four() {
+    fn control_ledger_hardening_migrations_are_single_ordered_schema_changes() {
+        let migrations = [
+            CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL,
+            CONTROL_BOOTSTRAP_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
+            CONTROL_EPOCH_EXPLICIT_CREATION_TIME_MIGRATION_SQL,
+            CONTROL_HEAD_EXPLICIT_ADVANCE_TIME_MIGRATION_SQL,
+            CONTROL_EVENT_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
+        ];
+        for migration in migrations {
+            assert!(migration.starts_with("-- no-transaction\n"));
+            let sql = migration
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(sql.matches(';').count(), 1);
+            assert!(!sql.contains("IF NOT EXISTS"));
+            assert!(!sql.contains("UPDATE "));
+            assert!(!sql.contains("DELETE "));
+            assert!(!sql.contains("GRANT "));
+            assert!(!sql.contains("REVOKE "));
+        }
+
+        assert_eq!(
+            CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL
+                .matches("CREATE UNIQUE INDEX ")
+                .count(),
+            1
+        );
+        assert!(
+            CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL
+                .contains("CREATE UNIQUE INDEX memory_control_events_predecessor_unique_idx")
+        );
+        assert!(CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL.contains(
+            "ON memory_control_events (\n        tenant_id,\n        project,\n        epoch_id,\n        shard,\n        previous_chain_digest\n    )"
+        ));
+        for (migration, timestamp_change) in [
+            (
+                CONTROL_BOOTSTRAP_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
+                "ALTER TABLE memory_control_bootstraps\n    ALTER COLUMN accepted_at DROP DEFAULT",
+            ),
+            (
+                CONTROL_EPOCH_EXPLICIT_CREATION_TIME_MIGRATION_SQL,
+                "ALTER TABLE memory_control_log_epochs\n    ALTER COLUMN created_at DROP DEFAULT",
+            ),
+            (
+                CONTROL_HEAD_EXPLICIT_ADVANCE_TIME_MIGRATION_SQL,
+                "ALTER TABLE memory_control_shard_heads\n    ALTER COLUMN advanced_at DROP DEFAULT",
+            ),
+            (
+                CONTROL_EVENT_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
+                "ALTER TABLE memory_control_events\n    ALTER COLUMN accepted_at DROP DEFAULT",
+            ),
+        ] {
+            assert_eq!(migration.matches("ALTER COLUMN ").count(), 1);
+            assert!(migration.contains(timestamp_change));
+        }
+    }
+
+    #[test]
+    fn embedded_migrator_registers_private_ledgers_as_no_transaction_versions_three_through_nine() {
         let migrator = embedded_migrator();
         assert_eq!(
             migrator
@@ -1958,7 +2090,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
         );
         let control_ledger = migrator
             .migrations
@@ -1980,6 +2112,21 @@ mod tests {
             GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL
         );
         assert!(registry_activation.no_tx);
+        for (version, sql) in [
+            (5, CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL),
+            (6, CONTROL_BOOTSTRAP_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL),
+            (7, CONTROL_EPOCH_EXPLICIT_CREATION_TIME_MIGRATION_SQL),
+            (8, CONTROL_HEAD_EXPLICIT_ADVANCE_TIME_MIGRATION_SQL),
+            (9, CONTROL_EVENT_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL),
+        ] {
+            let migration = migrator
+                .migrations
+                .iter()
+                .find(|migration| migration.version == version)
+                .unwrap();
+            assert_eq!(migration.sql.as_ref(), sql);
+            assert!(migration.no_tx);
+        }
         assert!(migrator.no_tx);
         assert!(!migrator.locking);
     }
