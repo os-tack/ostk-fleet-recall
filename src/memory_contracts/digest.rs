@@ -183,6 +183,18 @@ pub enum DigestDomain {
     // --- W0-ERASE domains ---
 
     // --- W0-LOG domains ---
+    /// W0-LOG. `SuccessorLogEpochV1` identity.
+    LogEpochV2,
+    /// W0-LOG. `EvidenceCompactionCheckpointV1` identity.
+    EvidenceCompactionCheckpointV1,
+    /// W0-LOG. `ProjectorCheckpointV1` identity; never accepted as evidence authority.
+    ProjectorCheckpointV1,
+    /// W0-LOG. `ArchiveSegmentManifestV1` identity.
+    ArchiveSegmentManifestV1,
+    /// W0-LOG. `CursorVectorBarrierV1` identity for cross-shard join projectors.
+    CursorVectorV1,
+    /// W0-LOG. `ProjectionGenerationV1` identity: one generation per closed barrier.
+    ProjectionGenerationV1,
 
     // --- W0-NORM domains ---
     /// Unsigned `NormativeBindingProposalV2` statement preimage.
@@ -345,7 +357,12 @@ impl DigestDomain {
             // --- W0-ERASE prefixes ---
 
             // --- W0-LOG prefixes ---
-
+            Self::LogEpochV2 => "ostk-log-epoch-v2",
+            Self::EvidenceCompactionCheckpointV1 => "ostk-evidence-compaction-checkpoint-v1",
+            Self::ProjectorCheckpointV1 => "ostk-projector-checkpoint-v1",
+            Self::ArchiveSegmentManifestV1 => "ostk-archive-segment-manifest-v1",
+            Self::CursorVectorV1 => "ostk-cursor-vector-v1",
+            Self::ProjectionGenerationV1 => "ostk-projection-generation-v1",
             // --- W0-NORM prefixes ---
             Self::NormativeBindingStatementV2 => "ostk-normative-binding-statement-v2",
             Self::NormativeBindingReceiptV2 => "ostk-normative-binding-receipt-v2",
