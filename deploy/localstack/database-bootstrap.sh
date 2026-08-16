@@ -8,7 +8,6 @@ cockroach sql --insecure --host=cockroach:26257 --database=defaultdb \
     --execute="
 CREATE DATABASE IF NOT EXISTS fleet_recall;
 CREATE USER IF NOT EXISTS fleet_migrator;
-ALTER USER fleet_migrator WITH PASSWORD 'local-migrator-only';
 ALTER USER fleet_migrator WITH LOGIN NOCREATEDB NOCREATEROLE;
 GRANT admin TO fleet_migrator;
 " >/dev/null

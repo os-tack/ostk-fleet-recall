@@ -39,18 +39,17 @@ assert_zero() {
     fi
 }
 
-# Provision the long-lived writer and fixed publication principal with local,
-# deterministic test credentials. Retire the one-shot migrator before adding
-# either runtime privilege surface.
+# Provision the long-lived writer and fixed publication principal. CockroachDB
+# insecure mode does not store or authenticate passwords; the distinct URL
+# credential fields are application-boundary fixtures only. Retire the one-shot
+# migrator before adding either runtime privilege surface.
 root_sql fleet_recall --execute="
 CREATE USER IF NOT EXISTS fleet_writer;
-ALTER USER fleet_writer WITH PASSWORD 'local-writer-only';
 ALTER USER fleet_writer WITH LOGIN NOCREATEDB NOCREATEROLE;
 REVOKE admin FROM fleet_writer;
 REVOKE SYSTEM ALL FROM fleet_writer;
 
 CREATE USER IF NOT EXISTS fleet_publication;
-ALTER USER fleet_publication WITH PASSWORD 'local-publication-only';
 ALTER USER fleet_publication WITH NOLOGIN NOCREATEDB NOCREATEROLE;
 REVOKE admin FROM fleet_publication;
 REVOKE SYSTEM ALL FROM fleet_publication;

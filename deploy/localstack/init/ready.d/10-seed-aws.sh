@@ -18,7 +18,8 @@ for name in config.json model.safetensors tokenizer.json; do
 done
 
 # Create all raw URL secrets only after the model objects exist. Each URL has a
-# distinct fixed database user and an explicit nonempty local-only password.
+# distinct fixed database user. Its nonempty credential field closes the
+# application parser; insecure CockroachDB does not authenticate that field.
 awslocal secretsmanager create-secret \
     --name ostk-fleet-recall/local/migrator-database-url \
     --secret-string 'postgresql://fleet_migrator:local-migrator-only@cockroach:26257/fleet_recall?sslmode=disable' >/dev/null

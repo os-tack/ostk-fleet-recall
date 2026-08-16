@@ -89,10 +89,12 @@ A successful run emits one JSON receipt binding:
   publication-secret volume before the verified receipt is emitted.
 
 The receipt explicitly records `aws_apply_performed: false`,
-`iam_enforcement_proved: false`, `tls_proved: false`, and
-`fargate_proved: false`. This local database is deliberately insecure and the
-application escape hatch is accepted only for loopback/Compose `cockroach`
-hosts with explicit `sslmode=disable`.
+`iam_enforcement_proved: false`, `tls_proved: false`,
+`database_password_authentication_proved: false`, and `fargate_proved: false`.
+This local database is deliberately insecure: the three URL credential fields
+exercise application-side secret separation, but CockroachDB does not store or
+authenticate them. The application escape hatch is accepted only for
+loopback/Compose `cockroach` hosts with explicit `sslmode=disable`.
 
 ## Current evidence status
 

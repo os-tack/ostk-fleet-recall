@@ -772,6 +772,7 @@ receipt=$(jq -cn \
       limitations: {
         aws_apply_performed: false,
         tls_proved: false,
+        database_password_authentication_proved: false,
         iam_enforcement_proved: false,
         fargate_proved: false,
         iam_policy_body_gate: "separate deploy/aws Terraform tests; not executed by this harness"
