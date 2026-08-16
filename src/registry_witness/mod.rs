@@ -21,7 +21,20 @@
 //! - **D4** — no last-known-head fallback and no caching of authority state:
 //!   zero rows, two rows, a non-active head, a decode failure, or any mismatch
 //!   fails the call closed, and every call re-reads the view. Serializable
-//!   isolation is the fence; this module never issues a separate CAS.
+//!   isolation is the fence; this module never issues a separate CAS, and
+//!   [`verify_within`] asserts that fence instead of assuming it — it reads
+//!   `SHOW transaction_isolation` over the caller's own transaction and
+//!   refuses to mint a witness under anything weaker. Without that assertion
+//!   the whole fence would be an unchecked precondition owned by the caller
+//!   and by the cluster's `default_transaction_isolation`, and a single
+//!   `READ COMMITTED` transaction could observe two different heads and still
+//!   commit.
+//! - **Scope binding** — a witness names the exact physical
+//!   `(tenant_id, project)` its authority row was read for, so a caller that
+//!   appends into a different scope than it verified can assert the mismatch
+//!   instead of trusting argument order. Two physical scopes can share one
+//!   bootstrap receipt (the receipt binds the semantic namespaces, not the
+//!   physical scope), so nothing else in the token distinguishes them.
 //! - **REPLAY-01 / EVENT-03** — the witness carries the epoch, partition
 //!   recipe, and closed package a replayed append must reuse, so a rebuild
 //!   under the same head yields the same append coordinates and the same
@@ -43,6 +56,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPool;
 use sqlx::{Executor, Postgres, Row, Transaction};
+use uuid::Uuid;
 
 use crate::config::WriterAuthorityConfig;
 use crate::context::FleetScope;
@@ -91,6 +105,13 @@ const SELECT_WRITER_AUTHORITY_SQL: &str = "SELECT bootstrap_receipt_digest, \
      FROM public.memory_writer_authority_v1 \
      WHERE tenant_id = $1 AND project = $2 LIMIT 2";
 
+/// The fence [`verify_within`] asserts before it reads the view.
+const SHOW_TRANSACTION_ISOLATION_SQL: &str = "SHOW transaction_isolation";
+
+/// Only isolation level under which an in-transaction witness is meaningful.
+/// `CockroachDB` and `PostgreSQL` both report the active level in lower case.
+const REQUIRED_TRANSACTION_ISOLATION: &str = "serializable";
+
 /// Upper bound on the decode cache. The key is the exact canonical head, so a
 /// live deployment holds one entry per activation it has observed; the bound
 /// keeps a pathological sequence of forged heads from growing the process.
@@ -126,6 +147,8 @@ pub enum WriterAuthorityRejection {
     ExpectedActivationId,
     #[error("the writer authority row is not representable in the contract types")]
     Unrepresentable,
+    #[error("the calling transaction is not serializable, so the head read is not fenced")]
+    IsolationLevel,
 }
 
 /// Failure of one writer-authority verification attempt.
@@ -162,6 +185,8 @@ pub type WitnessResult<T> = std::result::Result<T, WriterAuthorityError>;
 /// on it (D4).
 #[derive(Debug, Clone)]
 pub struct WriterAuthorityWitness {
+    tenant_id: Uuid,
+    project: String,
     activation_id: Sha256Digest,
     generation: u64,
     package_digest: Sha256Digest,
@@ -181,6 +206,31 @@ pub struct WriterAuthorityWitness {
 }
 
 impl WriterAuthorityWitness {
+    /// Physical tenant whose authority row minted this witness.
+    ///
+    /// The bootstrap receipt binds the SEMANTIC namespaces, so two physical
+    /// scopes may legitimately share one receipt and one set of deployment
+    /// pins. Nothing else on the witness distinguishes them, which is why the
+    /// physical scope travels with the token: a caller that appends into a
+    /// scope other than the one it verified can compare identities instead of
+    /// trusting that it passed the same `FleetScope` twice.
+    #[must_use]
+    pub const fn tenant_id(&self) -> Uuid {
+        self.tenant_id
+    }
+
+    /// Physical project whose authority row minted this witness.
+    #[must_use]
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+
+    /// True when this witness certifies the head of exactly `scope`.
+    #[must_use]
+    pub fn certifies_scope(&self, scope: &FleetScope) -> bool {
+        self.tenant_id == scope.tenant_id && self.project == scope.project
+    }
+
     /// Exact activation identity of the active head. This, never the package
     /// digest, is the value a caller compares across reads (ABA safety).
     #[must_use]
@@ -291,12 +341,45 @@ pub async fn load_and_verify(
 /// This is the D4 per-transaction witness: it runs exactly the same code path
 /// as [`load_and_verify`], and serializable isolation — not a separate CAS —
 /// is what makes a concurrent activation abort the append.
+///
+/// Because that fence is the entire mechanism, this function establishes it
+/// as a fact rather than a hope: it first asks the caller's own transaction
+/// what isolation level it is running at and fails closed with
+/// [`WriterAuthorityRejection::IsolationLevel`] under anything other than
+/// serializable. A transaction that has issued
+/// `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` can otherwise read the
+/// head twice, observe two different activations, and still commit — the
+/// witness would then certify a head the append was never serialized under.
+/// The check cannot be replaced by setting the level here: `SET TRANSACTION`
+/// is only legal before the transaction's first statement, and a witness call
+/// generally is not the first statement.
 pub async fn verify_within(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &FleetScope,
     config: &WriterAuthorityConfig,
 ) -> WitnessResult<WriterAuthorityWitness> {
+    require_serializable_transaction(transaction).await?;
     verify_with_executor(&mut **transaction, scope, config).await
+}
+
+/// Ask the open transaction for its own isolation level (D4).
+///
+/// This is a session/transaction introspection statement, not a read of any
+/// relation, so it needs no privilege and cannot be redirected by a
+/// `search_path`.
+async fn require_serializable_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> WitnessResult<()> {
+    let isolation: String = sqlx::query_scalar(SHOW_TRANSACTION_ISOLATION_SQL)
+        .fetch_one(&mut **transaction)
+        .await?;
+    if !isolation
+        .trim()
+        .eq_ignore_ascii_case(REQUIRED_TRANSACTION_ISOLATION)
+    {
+        return Err(WriterAuthorityRejection::IsolationLevel.into());
+    }
+    Ok(())
 }
 
 async fn verify_with_executor<'executor, E>(
@@ -317,7 +400,7 @@ where
     if rows.next().is_some() {
         return Err(WriterAuthorityRejection::Ambiguous.into());
     }
-    verify_row(&AuthorityRow::read(&row)?, config)
+    verify_row(scope, &AuthorityRow::read(&row)?, config)
 }
 
 /// Exactly the columns the witness consumes, decoded once into contract types.
@@ -398,6 +481,7 @@ impl AuthorityRow {
 }
 
 fn verify_row(
+    scope: &FleetScope,
     row: &AuthorityRow,
     config: &WriterAuthorityConfig,
 ) -> WitnessResult<WriterAuthorityWitness> {
@@ -449,6 +533,8 @@ fn verify_row(
     let package = materialize_active_package(row.package_digest)?;
     let recipe = &bootstrap.receipt().statement.genesis_epoch.partition_recipe;
     Ok(WriterAuthorityWitness {
+        tenant_id: scope.tenant_id,
+        project: scope.project.clone(),
         activation_id: row.activation_id,
         generation,
         package_digest: row.package_digest,
@@ -712,6 +798,7 @@ mod tests {
     use crate::memory_contracts::common::{FixedHex32, FixedHex64};
     use crate::memory_contracts::digest::{DigestDomain, domain_separated_digest};
     use crate::memory_contracts::registry::RegistryHeadV1;
+    use ostk_recall_core::PrivacyTier;
     use ring::signature::Ed25519KeyPair;
 
     /// Exact canonical bytes of the frozen bootstrap receipt. The offline
@@ -736,10 +823,25 @@ mod tests {
     /// One fully consistent authority row, the receipt it descends from, and
     /// the pins that accept it.
     struct AuthorityFixture {
+        scope: FleetScope,
         bootstrap: VerifiedBootstrapReceipt,
         config: WriterAuthorityConfig,
         head_binding: RegistryHeadBindingV1,
         row: AuthorityRow,
+    }
+
+    /// The physical scope the offline vectors read the row for. It is not the
+    /// semantic scope the receipt pins: those are independent, which is
+    /// exactly why the witness carries the physical one.
+    fn offline_scope(label: &str) -> FleetScope {
+        FleetScope::new(
+            Uuid::from_u128(0x0198_a849_f6ae_7d61_9800_0000_0000_0001),
+            format!("physical-{label}"),
+            "witness-vector",
+            None,
+            PrivacyTier::T1Project,
+        )
+        .expect("offline physical scope")
     }
 
     /// Re-sign the frozen receipt over a caller-chosen partition seed so each
@@ -852,6 +954,7 @@ mod tests {
             predecessor_activation_policy_digest: Some(root_policy),
         };
         AuthorityFixture {
+            scope: offline_scope("vector"),
             bootstrap,
             config,
             head_binding,
@@ -869,7 +972,7 @@ mod tests {
     ) {
         let mut row = fixture.row.clone();
         mutate(&mut row);
-        match verify_row(&row, &fixture.config) {
+        match verify_row(&fixture.scope, &row, &fixture.config) {
             Err(WriterAuthorityError::Rejected(actual)) => {
                 assert_eq!(actual, expected, "{label}: wrong rejection");
             }
@@ -883,7 +986,7 @@ mod tests {
     fn expect_contract_error(fixture: &AuthorityFixture, label: &str, canonical_head: Vec<u8>) {
         let mut row = fixture.row.clone();
         row.canonical_head = canonical_head;
-        match verify_row(&row, &fixture.config) {
+        match verify_row(&fixture.scope, &row, &fixture.config) {
             Err(WriterAuthorityError::Contract(_)) => {}
             Err(other) => panic!("{label}: expected a contract error, got {other}"),
             Ok(_) => panic!("{label}: non-canonical head bytes minted a witness"),
@@ -971,7 +1074,7 @@ mod tests {
     #[test]
     fn a_consistent_authority_row_mints_a_witness() {
         let fixture = authority_fixture(0x51);
-        let witness = verify_row(&fixture.row, &fixture.config).expect("witness");
+        let witness = verify_row(&fixture.scope, &fixture.row, &fixture.config).expect("witness");
         assert_eq!(witness.generation(), 1);
         assert_eq!(witness.activation_id(), fixture.row.activation_id);
         assert_eq!(witness.partition_seed(), &[0x51_u8; 32]);
@@ -979,6 +1082,121 @@ mod tests {
         assert_eq!(
             witness.package().package_digest(),
             stage4_package().expect("Stage-4 package").package_digest()
+        );
+    }
+
+    /// AUTH-04. The head's package digest must materialize to a compiled-in
+    /// semantically closed package, and that gate must be reached through the
+    /// whole `verify_row` path, not only through the public helper. A head
+    /// carrying any other digest is exactly what W0-REG's generation-2
+    /// composition will produce, and the brief requires that path to fail
+    /// closed rather than to run admission rules whose bytes this process has
+    /// never verified. The canonical head is re-encoded to match, so the
+    /// binding check cannot mask the materialization check. The zero digest is
+    /// not a vector here because `RegistryHeadBindingV1::validate_shape`
+    /// refuses it two gates earlier;
+    /// `materialization_admits_only_the_compiled_in_stage4_package` covers it
+    /// against the helper directly.
+    #[test]
+    fn an_active_package_digest_that_is_not_compiled_in_fails_the_whole_path() {
+        let fixture = authority_fixture(0x57);
+        let genesis_digest = genesis_package().expect("genesis package").package_digest();
+        for (label, package_digest) in [
+            (
+                "foreign package digest",
+                Sha256Digest::from_bytes(FOREIGN_DIGEST),
+            ),
+            (
+                "the genesis package is not activatable at generation 1",
+                genesis_digest,
+            ),
+        ] {
+            let canonical_head = head_bytes(&fixture, |binding| {
+                binding.head.package_digest = package_digest;
+            });
+            expect_rejection(
+                &fixture,
+                label,
+                |row| {
+                    row.package_digest = package_digest;
+                    row.canonical_head = canonical_head;
+                },
+                WriterAuthorityRejection::UnknownActivePackage,
+            );
+        }
+    }
+
+    /// AUTH-04. Both namespace pairs are compared: the bootstrap columns the
+    /// receipt itself carries AND the head columns the activation carries.
+    /// Forging the deployment pins only exercises the bootstrap pair, because
+    /// `verify_pinned_bootstrap` rejects a pin the receipt disagrees with
+    /// before the head columns are ever reached, so the head pair needs its
+    /// own vectors. On a live database the head columns are held by
+    /// `memory_registry_activation_bootstrap_anchor_fk`, which ties an
+    /// activation's contract namespaces to `memory_control_bootstraps`.
+    #[test]
+    fn contract_namespace_pins_bind_the_head_columns_as_well_as_the_bootstrap_columns() {
+        let fixture = authority_fixture(0x58);
+        let mutations: [(&str, RowMutation); 4] = [
+            ("head contract_tenant_namespace", |row| {
+                row.contract_tenant_namespace = "tenant.evil".to_owned();
+            }),
+            ("head contract_project_namespace", |row| {
+                row.contract_project_namespace = "project.evil".to_owned();
+            }),
+            ("bootstrap_contract_tenant_namespace", |row| {
+                row.bootstrap_contract_tenant_namespace = "tenant.evil".to_owned();
+            }),
+            ("bootstrap_contract_project_namespace", |row| {
+                row.bootstrap_contract_project_namespace = "project.evil".to_owned();
+            }),
+        ];
+        for (label, mutate) in mutations {
+            expect_rejection(
+                &fixture,
+                label,
+                mutate,
+                WriterAuthorityRejection::ContractNamespace,
+            );
+        }
+    }
+
+    /// Scope binding. The receipt pins the SEMANTIC namespaces, so one set of
+    /// deployment pins can legitimately mint a witness for two different
+    /// physical scopes. The witness therefore names the physical scope its row
+    /// was read for, and nothing else on it does.
+    #[test]
+    fn a_witness_names_the_physical_scope_its_row_was_read_for() {
+        let fixture = authority_fixture(0x59);
+        let other = offline_scope("other");
+        let witness = verify_row(&fixture.scope, &fixture.row, &fixture.config).expect("witness");
+        let elsewhere = verify_row(&other, &fixture.row, &fixture.config).expect("witness");
+
+        assert!(witness.certifies_scope(&fixture.scope));
+        assert!(!witness.certifies_scope(&other));
+        assert!(elsewhere.certifies_scope(&other));
+        assert_eq!(witness.project(), fixture.scope.project);
+        assert_eq!(witness.tenant_id(), fixture.scope.tenant_id);
+        assert_eq!(
+            witness.activation_id(),
+            elsewhere.activation_id(),
+            "the two witnesses are otherwise indistinguishable, which is why \
+             the physical scope has to travel with the token"
+        );
+    }
+
+    /// D4. The in-transaction fence is asserted, not assumed: the statement
+    /// `verify_within` issues and the level it demands are pinned here so a
+    /// silent edit to either fails offline, and the live proof drives the
+    /// rejection itself.
+    #[test]
+    fn the_in_transaction_witness_demands_serializable_isolation() {
+        assert_eq!(SHOW_TRANSACTION_ISOLATION_SQL, "SHOW transaction_isolation");
+        assert_eq!(REQUIRED_TRANSACTION_ISOLATION, "serializable");
+        assert!(!"read committed".eq_ignore_ascii_case(REQUIRED_TRANSACTION_ISOLATION));
+        assert_eq!(
+            WriterAuthorityRejection::IsolationLevel.to_string(),
+            "the calling transaction is not serializable, so the head read is not fenced"
         );
     }
 
@@ -1176,7 +1394,7 @@ mod tests {
             fixture.config.bootstrap_receipt_digest(),
             Some(Sha256Digest::from_bytes(FOREIGN_DIGEST)),
         );
-        match verify_row(&fixture.row, &pinned) {
+        match verify_row(&fixture.scope, &fixture.row, &pinned) {
             Err(WriterAuthorityError::Rejected(WriterAuthorityRejection::ExpectedActivationId)) => {
             }
             other => panic!("a break-glass mismatch must fail closed, got {other:?}"),

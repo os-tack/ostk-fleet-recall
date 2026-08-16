@@ -1347,3 +1347,120 @@ async fn live_writer_authority_descent_columns_are_held_by_the_schema_when_confi
          this test should be tightened"
     );
 }
+
+/// D4. Serializable isolation is the ENTIRE fence: `verify_within` issues no
+/// CAS, takes no lock, and reads no base table, so a transaction running at a
+/// weaker level can read the head, watch another session activate a different
+/// one, read it again, and still commit — binding an append to a head it was
+/// never serialized under. The fence is therefore asserted rather than
+/// assumed. This test drives the exact downgrade: `SET TRANSACTION ISOLATION
+/// LEVEL READ COMMITTED` inside the caller's own transaction, which
+/// `CockroachDB` v26.2 accepts, and requires
+/// `WriterAuthorityRejection::IsolationLevel` from every subsequent
+/// `verify_within` — so no witness exists to bind an append with, and the
+/// two-heads-one-transaction hazard is unreachable through this module.
+#[tokio::test]
+async fn live_writer_authority_rejects_a_non_serializable_transaction_when_configured() {
+    let Some(pool) = migrated_pool().await else {
+        return;
+    };
+    let fixture = fixture();
+    let head = activate_first_successor(&pool, &fixture, "isolation", 75).await;
+
+    // The default transaction is serializable, and the assertion is not a
+    // blanket refusal: it mints a witness exactly as before.
+    let mut serializable = pool.begin().await.expect("begin");
+    let level: String = sqlx::query_scalar("SHOW transaction_isolation")
+        .fetch_one(&mut *serializable)
+        .await
+        .expect("the transaction reports its own isolation level");
+    assert_eq!(level, "serializable");
+    let witness = verify_within(&mut serializable, &head.physical_scope, &head.config)
+        .await
+        .expect("a serializable transaction must still mint a witness");
+    assert_eq!(witness.activation_id(), head.activation_id);
+    serializable.rollback().await.expect("rollback");
+
+    // Downgrading the same transaction removes the fence.
+    let mut unfenced = pool.begin().await.expect("begin");
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *unfenced)
+        .await
+        .expect("the cluster accepts a read committed transaction");
+    let level: String = sqlx::query_scalar("SHOW transaction_isolation")
+        .fetch_one(&mut *unfenced)
+        .await
+        .expect("the transaction reports its own isolation level");
+    assert_eq!(
+        level, "read committed",
+        "the downgrade must actually take effect, or this test proves nothing"
+    );
+
+    for attempt in 0..2 {
+        let error = verify_within(&mut unfenced, &head.physical_scope, &head.config)
+            .await
+            .expect_err("an unfenced transaction must never mint a witness");
+        assert_eq!(
+            rejection(&error),
+            Some(WriterAuthorityRejection::IsolationLevel),
+            "attempt {attempt}: unexpected rejection {error}"
+        );
+    }
+    unfenced.rollback().await.expect("rollback");
+
+    // The pool read is unchanged: an autocommit statement needs no fence, and
+    // the startup check must keep working.
+    load_and_verify(&pool, &head.physical_scope, &head.config)
+        .await
+        .expect("the out-of-transaction read is unaffected");
+}
+
+/// Scope binding. A bootstrap receipt binds the SEMANTIC namespaces, not the
+/// physical scope, so one receipt — and therefore one `WriterAuthorityConfig`
+/// — legitimately covers two different physical scopes. Every other field the
+/// witness carries is then identical between them: same log epoch, same
+/// partition recipe, same package. This test activates exactly that pair from
+/// one re-signed receipt and requires the witness to name the physical scope
+/// its row was read for, so a caller that appends into a scope it did not
+/// verify can assert the mismatch instead of trusting argument order.
+#[tokio::test]
+async fn live_writer_authority_binds_the_witness_to_the_physical_scope_it_read_when_configured() {
+    let Some(pool) = migrated_pool().await else {
+        return;
+    };
+    let fixture = fixture();
+    let first = activate_first_successor(&pool, &fixture, "scope-first", 76).await;
+    let second = activate_first_successor(&pool, &fixture, "scope-second", 76).await;
+    assert_eq!(
+        first.config.bootstrap_receipt_digest().digest(),
+        second.config.bootstrap_receipt_digest().digest(),
+        "the two physical scopes must share one bootstrap receipt for this to be a test"
+    );
+    assert_ne!(first.physical_scope.project, second.physical_scope.project);
+
+    // ONE config verifies BOTH scopes; nothing in the pins distinguishes them.
+    let witness = load_and_verify(&pool, &first.physical_scope, &first.config)
+        .await
+        .expect("first witness");
+    let elsewhere = load_and_verify(&pool, &second.physical_scope, &first.config)
+        .await
+        .expect("second witness under the same config");
+
+    assert_eq!(
+        witness.log_epoch_id().digest(),
+        elsewhere.log_epoch_id().digest(),
+        "the shared receipt means the epoch cannot distinguish the scopes"
+    );
+    assert_eq!(witness.package_digest(), elsewhere.package_digest());
+    assert_eq!(witness.partition_seed(), elsewhere.partition_seed());
+
+    assert_eq!(witness.tenant_id(), first.physical_scope.tenant_id);
+    assert_eq!(witness.project(), first.physical_scope.project);
+    assert!(witness.certifies_scope(&first.physical_scope));
+    assert!(
+        !witness.certifies_scope(&second.physical_scope),
+        "a witness must not certify a scope it was not read for"
+    );
+    assert!(elsewhere.certifies_scope(&second.physical_scope));
+    assert!(!elsewhere.certifies_scope(&first.physical_scope));
+}
