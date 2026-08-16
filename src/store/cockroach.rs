@@ -74,6 +74,10 @@ const REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL: &str =
     include_str!("../../migrations/0014_registry_current_head_v2.sql");
 const CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL: &str =
     include_str!("../../migrations/0015_conflict_detector_uniqueness.sql");
+const CLAIM_TRANSITION_PROVENANCE_INDEX_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0016_claim_transition_provenance_index.sql");
+const CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0017_conflict_detector_projection_index.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -111,6 +115,32 @@ fn successor_transition_migrations() -> [Migration; 5] {
             MigrationType::Simple,
             Cow::Borrowed(REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL),
             false,
+        ),
+    ]
+}
+
+fn post_transactional_online_migrations() -> [Migration; 3] {
+    [
+        Migration::new(
+            15,
+            Cow::Borrowed("detector-versioned conflict uniqueness"),
+            MigrationType::Simple,
+            Cow::Borrowed(CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL),
+            true,
+        ),
+        Migration::new(
+            16,
+            Cow::Borrowed("exact claim-transition provenance index"),
+            MigrationType::Simple,
+            Cow::Borrowed(CLAIM_TRANSITION_PROVENANCE_INDEX_MIGRATION_SQL),
+            true,
+        ),
+        Migration::new(
+            17,
+            Cow::Borrowed("exact conflict-detector projection index"),
+            MigrationType::Simple,
+            Cow::Borrowed(CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL),
+            true,
         ),
     ]
 }
@@ -209,20 +239,17 @@ fn embedded_migrator() -> Migrator {
         .migrations
         .to_mut()
         .extend(successor_transition_migrations());
-    migrator.migrations.to_mut().push(Migration::new(
-        15,
-        Cow::Borrowed("detector-versioned conflict uniqueness"),
-        MigrationType::Simple,
-        Cow::Borrowed(CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL),
-        true,
-    ));
+    migrator
+        .migrations
+        .to_mut()
+        .extend(post_transactional_online_migrations());
     migrator
 }
 
 fn pre_transactional_embedded_migrator() -> Migrator {
     let mut migrator = embedded_migrator();
     for migration in migrator.migrations.to_mut() {
-        // Recognize applied versions 12-15 during fail-closed history
+        // Recognize applied versions 12-17 during fail-closed history
         // validation, but leave them for their later transaction-policy phase.
         if migration.version >= 12 {
             migration.migration_type = MigrationType::ReversibleDown;
@@ -233,15 +260,13 @@ fn pre_transactional_embedded_migrator() -> Migrator {
 
 fn transactional_embedded_migrator() -> Migrator {
     let mut migrator = embedded_migrator();
-    let detector_index_migration = migrator
-        .migrations
-        .to_mut()
-        .iter_mut()
-        .find(|migration| migration.version == 15)
-        .expect("embedded conflict detector migration");
-    // Version 15 performs multiple resumable online schema changes and must
-    // wait for the post-transactional phase with CockroachDB's DDL autocommit.
-    detector_index_migration.migration_type = MigrationType::ReversibleDown;
+    for migration in migrator.migrations.to_mut() {
+        // Versions 15-17 are resumable online schema changes and must wait for
+        // the post-transactional phase with CockroachDB's DDL autocommit.
+        if migration.version >= 15 {
+            migration.migration_type = MigrationType::ReversibleDown;
+        }
+    }
     migrator
 }
 
@@ -686,8 +711,8 @@ impl CockroachStore {
         // history row even though SQLx opened a transaction. Versions 1-11
         // require that default for online/legacy schema changes; versions
         // 12-14 require it disabled for genuinely atomic DDL plus bookkeeping.
-        // Version 15 returns to CockroachDB's online-DDL autocommit policy in a
-        // third phase after the transactional successor tables are durable.
+        // Versions 15-17 return to CockroachDB's online-DDL autocommit policy
+        // in a third phase after the transactional successor tables are durable.
         let mut connection = self.pool.acquire().await?;
         let migration_result: Result<()> = async {
             sqlx::query("SET autocommit_before_ddl = true")
@@ -2002,7 +2027,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_migration_history_one_through_fifteen_is_byte_immutable() {
+    fn committed_migration_history_one_through_seventeen_is_byte_immutable() {
         for (migration, expected_sha256) in [
             (
                 INITIAL_MIGRATION_SQL,
@@ -2063,6 +2088,14 @@ mod tests {
             (
                 CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL,
                 "f2a9bf1e1b2a4a76f8138c29ea41d78a7571bffd9b7c9b90ed6fab68de4ad2af",
+            ),
+            (
+                CLAIM_TRANSITION_PROVENANCE_INDEX_MIGRATION_SQL,
+                "5f7367e6b42e5eaa834914ef724146694dfbb06541dfd1b67cc24a51dbcb9637",
+            ),
+            (
+                CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL,
+                "3fc6c7cbad7cb709238236672cde66870b42b580a0553dd14b375a5ee5bf9754",
             ),
         ] {
             assert_eq!(format!("{:x}", Sha256::digest(migration)), expected_sha256);
@@ -2335,6 +2368,45 @@ mod tests {
         }
     }
 
+    fn assert_resumable_exact_covering_index_migration(
+        migration: &str,
+        table_name: &str,
+        index_name: &str,
+        exact_catalog_definition: &str,
+    ) {
+        assert!(migration.starts_with("-- no-transaction\n"));
+        let sql = migration
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let create = format!("CREATE INDEX IF NOT EXISTS {index_name}");
+        assert_eq!(
+            sql.lines().filter(|line| line.starts_with(&create)).count(),
+            1
+        );
+        assert_eq!(sql.matches("DO $$").count(), 1);
+        assert_eq!(sql.matches("COMMIT;").count(), 1);
+        assert_eq!(sql.matches("FROM pg_catalog.pg_indexes").count(), 1);
+        assert_eq!(sql.matches("ERRCODE = '55000'").count(), 1);
+        assert!(sql.find(&create).unwrap() < sql.find("COMMIT;").unwrap());
+        assert!(sql.find("COMMIT;").unwrap() < sql.find("DO $$").unwrap());
+        assert!(sql.contains("current_database()"));
+        assert!(sql.contains(&format!("tablename = '{table_name}'")));
+        assert!(sql.contains(&format!("indexname = '{index_name}'")));
+        assert!(sql.contains(exact_catalog_definition));
+        assert!(sql.contains("IF exact_index IS DISTINCT FROM true THEN"));
+        assert!(sql.contains("catalog shape mismatch"));
+        assert!(sql.contains(" STORING ("));
+        assert!(!sql.contains("CREATE UNIQUE INDEX"));
+        let uppercase = sql.to_ascii_uppercase();
+        for forbidden in [
+            "INSERT ", "UPDATE ", "DELETE ", "ALTER ", "DROP ", "GRANT ", "REVOKE ",
+        ] {
+            assert!(!uppercase.contains(forbidden));
+        }
+    }
+
     fn assert_resumable_conflict_detector_uniqueness_migration() {
         let migration = CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL;
         assert!(migration.starts_with("-- no-transaction\n"));
@@ -2521,10 +2593,22 @@ mod tests {
         assert_transition_history_schema();
         assert_bridge_and_current_head_schemas();
         assert_resumable_conflict_detector_uniqueness_migration();
+        assert_resumable_exact_covering_index_migration(
+            CLAIM_TRANSITION_PROVENANCE_INDEX_MIGRATION_SQL,
+            "memory_claim_events",
+            "memory_claim_events_transition_provenance_idx",
+            "USING btree (tenant_id ASC, project ASC, claim_id ASC, event_kind ASC, created_at DESC, event_id DESC) STORING (reason, from_state, to_state, payload)",
+        );
+        assert_resumable_exact_covering_index_migration(
+            CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL,
+            "memory_conflicts",
+            "memory_conflicts_scope_detector_state_recency_idx",
+            "USING btree (tenant_id ASC, project ASC, detector ASC, state ASC, last_seen_at DESC, id ASC) STORING (claim_key, kind, rationale, revision, detected_at, resolved_at, resolution_kind, resolution_reason)",
+        );
     }
 
     #[test]
-    fn embedded_migrator_registers_mixed_transaction_policy_through_fifteen() {
+    fn embedded_migrator_registers_mixed_transaction_policy_through_seventeen() {
         let migrator = embedded_migrator();
         assert_eq!(
             migrator
@@ -2532,7 +2616,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=15).collect::<Vec<_>>()
+            (1..=17).collect::<Vec<_>>()
         );
         assert_eq!(
             migrator
@@ -2540,7 +2624,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.no_tx)
                 .collect::<Vec<_>>(),
-            [vec![true; 11], vec![false; 3], vec![true]].concat()
+            [vec![true; 11], vec![false; 3], vec![true; 3]].concat()
         );
         let control_ledger = migrator
             .migrations
@@ -2586,6 +2670,8 @@ mod tests {
             (13, REGISTRY_GENESIS_BRIDGE_CONSUMPTION_MIGRATION_SQL, false),
             (14, REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL, false),
             (15, CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL, true),
+            (16, CLAIM_TRANSITION_PROVENANCE_INDEX_MIGRATION_SQL, true),
+            (17, CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL, true),
         ] {
             let migration = migrator
                 .migrations
@@ -2609,9 +2695,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=15).collect::<Vec<_>>()
+            (1..=17).collect::<Vec<_>>()
         );
-        for version in 10..=15 {
+        for version in 10..=17 {
             let migration = pre_transactional
                 .migrations
                 .iter()
@@ -2633,16 +2719,244 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=15).collect::<Vec<_>>()
+            (1..=17).collect::<Vec<_>>()
         );
         for migration in transactional.migrations.iter() {
-            let expected_type = if migration.version == 15 {
+            let expected_type = if migration.version >= 15 {
                 MigrationType::ReversibleDown
             } else {
                 MigrationType::Simple
             };
             assert_eq!(migration.migration_type, expected_type);
         }
+    }
+
+    async fn assert_exact_successful_migration_prefix_through_seventeen(pool: &PgPool) {
+        let actual = sqlx::query_as::<_, (i64, bool, Vec<u8>)>(
+            "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let expected = embedded_migrator()
+            .migrations
+            .iter()
+            .map(|migration| {
+                (
+                    migration.version,
+                    true,
+                    migration.checksum.as_ref().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    async fn assert_online_projection_indexes_are_covering(pool: &PgPool) {
+        let provenance_plan = sqlx::query_scalar::<_, String>(
+            "EXPLAIN SELECT event_id, reason, from_state, to_state, payload, created_at \
+             FROM memory_claim_events@memory_claim_events_transition_provenance_idx \
+             WHERE tenant_id = $1 AND project = $2 AND claim_id = $3 \
+               AND event_kind = $4 \
+             ORDER BY created_at DESC, event_id DESC LIMIT 1",
+        )
+        .bind(Uuid::nil())
+        .bind("online-index-plan-proof")
+        .bind(1_i64)
+        .bind("claim_state_changed")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .join("\n");
+        assert!(provenance_plan.contains("memory_claim_events_transition_provenance_idx"));
+        assert!(!provenance_plan.contains("index join"));
+        assert!(provenance_plan.contains("limit: 1"));
+
+        let conflict_plan = sqlx::query_scalar::<_, String>(
+            "EXPLAIN SELECT id, claim_key, kind, state, detector, rationale, revision, \
+                    detected_at, last_seen_at, resolved_at, resolution_kind, resolution_reason \
+             FROM memory_conflicts@memory_conflicts_scope_detector_state_recency_idx \
+             WHERE tenant_id = $1 AND project = $2 AND detector = $3 AND state = $4 \
+             ORDER BY last_seen_at DESC, id LIMIT 257",
+        )
+        .bind(Uuid::nil())
+        .bind("online-index-plan-proof")
+        .bind("same_key_typed_value_v2")
+        .bind("open")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .join("\n");
+        assert!(conflict_plan.contains("memory_conflicts_scope_detector_state_recency_idx"));
+        assert!(!conflict_plan.contains("index join"));
+        assert!(conflict_plan.contains("limit: 257"));
+    }
+
+    /// The online index phase must recover from every catalog-only interruption,
+    /// reject history drift before DDL, and finish with one exact successful
+    /// migration prefix. The configured database must be disposable.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn live_online_index_migrations_recover_and_reject_drift_when_configured() {
+        let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _live_database_guard = LIVE_DATABASE_TEST_LOCK.lock().await;
+        let store = CockroachStore::connect(
+            &database_url,
+            scope("live-online-index-migration-test"),
+            PoolConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        store.migrate().await.unwrap();
+        assert_exact_successful_migration_prefix_through_seventeen(store.pool()).await;
+        assert_online_projection_indexes_are_covering(store.pool()).await;
+
+        // Process death after both backfills but before either SQLx history row.
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (16, 17)")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        assert_exact_successful_migration_prefix_through_seventeen(store.pool()).await;
+
+        // Missing version 16 must be repairable even when exact version 17 is
+        // already recorded, and an absent index must be rebuilt online.
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 16")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX memory_claim_events@memory_claim_events_transition_provenance_idx")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        assert_exact_successful_migration_prefix_through_seventeen(store.pool()).await;
+
+        // The same absent-index recovery applies to the tail migration.
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 17")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "DROP INDEX memory_conflicts@memory_conflicts_scope_detector_state_recency_idx",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        store.migrate().await.unwrap();
+        assert_exact_successful_migration_prefix_through_seventeen(store.pool()).await;
+
+        for (version, table_name, index_name) in [
+            (
+                16_i64,
+                "memory_claim_events",
+                "memory_claim_events_transition_provenance_idx",
+            ),
+            (
+                17_i64,
+                "memory_conflicts",
+                "memory_conflicts_scope_detector_state_recency_idx",
+            ),
+        ] {
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+                .bind(version)
+                .execute(store.pool())
+                .await
+                .unwrap();
+            sqlx::query(&format!("DROP INDEX {table_name}@{index_name}"))
+                .execute(store.pool())
+                .await
+                .unwrap();
+            sqlx::query(&format!(
+                "CREATE INDEX {index_name} ON {table_name} (tenant_id)"
+            ))
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+            let error = store.migrate().await.unwrap_err();
+            assert!(error.to_string().contains("catalog shape mismatch"));
+            assert!(error.to_string().contains(&format!("migration {version}")));
+            let history_count: i64 = sqlx::query_scalar(
+                "SELECT count(*)::INT8 FROM _sqlx_migrations WHERE version = $1",
+            )
+            .bind(version)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(history_count, 0);
+
+            sqlx::query(&format!("DROP INDEX {table_name}@{index_name}"))
+                .execute(store.pool())
+                .await
+                .unwrap();
+            store.migrate().await.unwrap();
+            assert_exact_successful_migration_prefix_through_seventeen(store.pool()).await;
+        }
+
+        sqlx::query("UPDATE _sqlx_migrations SET success = false WHERE version = 17")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let dirty_error = store.migrate().await.unwrap_err();
+        assert!(matches!(
+            dirty_error,
+            FleetError::Migration(MigrateError::Dirty(17))
+        ));
+        sqlx::query("UPDATE _sqlx_migrations SET success = true WHERE version = 17")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+                 (version, description, success, checksum, execution_time) \
+             VALUES (18, 'unknown migration', true, $1, 0)",
+        )
+        .bind(vec![0_u8])
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let unknown_error = store.migrate().await.unwrap_err();
+        assert!(matches!(
+            unknown_error,
+            FleetError::Migration(MigrateError::VersionMissing(18))
+        ));
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 18")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let correct_checksum = embedded_migrator()
+            .migrations
+            .iter()
+            .find(|migration| migration.version == 17)
+            .unwrap()
+            .checksum
+            .as_ref()
+            .to_vec();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 17")
+            .bind(vec![0_u8])
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let checksum_error = store.migrate().await.unwrap_err();
+        assert!(matches!(
+            checksum_error,
+            FleetError::Migration(MigrateError::VersionMismatch(17))
+        ));
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 17")
+            .bind(correct_checksum)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        store.migrate().await.unwrap();
+        assert_exact_successful_migration_prefix_through_seventeen(store.pool()).await;
+        assert_online_projection_indexes_are_covering(store.pool()).await;
     }
 
     /// `SQLx` must commit each transactional successor table and its migration
