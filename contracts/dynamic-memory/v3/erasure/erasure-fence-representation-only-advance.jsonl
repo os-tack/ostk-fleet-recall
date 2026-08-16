@@ -1,0 +1,1 @@
+{"entries":[{"epoch":0,"kind":"privacy_subject"},{"epoch":1,"kind":"representation"},{"epoch":0,"kind":"resource"},{"epoch":0,"kind":"source_fact"}],"generation":{"scope":{"project_namespace":"project.fixture","tenant_namespace":"tenant.fixture"},"value":0},"schema_version":1,"scope":{"project_namespace":"project.fixture","tenant_namespace":"tenant.fixture"}}

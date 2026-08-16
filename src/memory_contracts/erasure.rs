@@ -406,18 +406,28 @@ impl ErasureTombstoneV1 {
 /// caller must still confirm the candidate's scope does not conflict with
 /// any other active tombstone before treating this as a complete
 /// authorization decision.
+///
+/// This fails closed on the tombstone itself first: `tombstone.validate()`
+/// must succeed before any permissive answer is possible. A tombstone this
+/// module cannot validate (for example one carrying the zero sentinel as its
+/// `target.target_digest`) has coverage nobody can determine, so it must
+/// never be treated as "different from the candidate" and therefore
+/// permissive — that would be the same fail-open shape this module closes
+/// elsewhere (`RetainableMatcherPolicyV1::required_scope_action`,
+/// `RestoreGateV1::outcome`) for an unvalidated input.
 pub fn re_consent_permits_new_source_fact(
     tombstone: &ErasureTombstoneV1,
     re_consent: &ProspectiveReConsentV1,
     candidate_target: &ErasureScope,
-) -> bool {
-    match re_consent {
+) -> ContractResult<bool> {
+    tombstone.validate()?;
+    Ok(match re_consent {
         ProspectiveReConsentV1::AuthorizedForNewSourceFact { consent_policy } => {
             validate_policy_reference(consent_policy).is_ok()
                 && candidate_target.target_digest != tombstone.target.target_digest
         }
         ProspectiveReConsentV1::NotAuthorized => false,
-    }
+    })
 }
 
 /// The exact atomic effect of accepting one [`ErasureEventV1`]: the
@@ -824,6 +834,15 @@ mod tests {
         include_bytes!("../../contracts/dynamic-memory/v3/erasure/erasure-fence-genesis.jsonl");
     const FENCE_ADVANCED_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/erasure/erasure-fence-advanced.jsonl");
+    const FENCE_GENERATION_ONLY_ADVANCE_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/erasure/erasure-fence-generation-only-advance.jsonl"
+    );
+    const FENCE_PRIVACY_SUBJECT_ONLY_ADVANCE_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/erasure/erasure-fence-privacy-subject-only-advance.jsonl"
+    );
+    const FENCE_REPRESENTATION_ONLY_ADVANCE_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/erasure/erasure-fence-representation-only-advance.jsonl"
+    );
     const RECEIPT_PENDING_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/erasure/erasure-receipt-pending.jsonl");
     const RECEIPT_COMPLETE_FIXTURE: &[u8] =
@@ -848,6 +867,9 @@ mod tests {
     );
     const NEGATIVE_RECEIPT_COMPLETE_WITH_RESIDUAL_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/erasure/negative-receipt-complete-with-residual.jsonl"
+    );
+    const NEGATIVE_RECEIPT_COMPLETE_RESIDUAL_DESPITE_KEY_DESTROYED_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/erasure/negative-receipt-complete-residual-despite-key-destroyed.jsonl"
     );
     const NEGATIVE_FENCE_MISSING_SCOPE_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/erasure/negative-fence-missing-scope.jsonl"
@@ -877,6 +899,12 @@ mod tests {
         "c304c6dc2737fcd1e06ddc6b98575411e5bab964252584e74738de5f728de0b8";
     const FENCE_ADVANCED_RAW_SHA256: &str =
         "2a14a5116838ba3f2c36940386426b3ea76892e3eaf6a0145e4cc2dfa7c5e935";
+    const FENCE_GENERATION_ONLY_ADVANCE_RAW_SHA256: &str =
+        "41b1de5e55ba11e49728d8596111cd6894c1940aaff459c9804ace98cb7c3108";
+    const FENCE_PRIVACY_SUBJECT_ONLY_ADVANCE_RAW_SHA256: &str =
+        "c08ebbb1eaf85cbd221ba173b19f92178d94637eb5269704be0357c60771bdaf";
+    const FENCE_REPRESENTATION_ONLY_ADVANCE_RAW_SHA256: &str =
+        "e2408179f10ebf7b01bd3d3ed2f824e0c9d6f362a38fa56762cbe03e6132cde5";
     const RECEIPT_PENDING_RAW_SHA256: &str =
         "c555bc876c40b80d59a4097897d733cab27c93fb6e358a8ad3751e1931e08e34";
     const RECEIPT_COMPLETE_RAW_SHA256: &str =
@@ -892,12 +920,14 @@ mod tests {
     const CHECKPOINT_RULE_RAW_SHA256: &str =
         "209a78376cba81b37a84bf6e964bb1020689c58bf81df0b708b2fc866820b9a4";
     const VECTOR_SUITE_RAW_SHA256: &str =
-        "e80118a3b5247e7c97a78c6afc55475ad11b70a1b356043d1f6c0523d8ff6ae8";
+        "f4655abf09783f04a4291c08805dfdb5ecbe1ca96b99ee2bcf24820e47631673";
 
     const NEGATIVE_TOMBSTONE_PAYLOAD_BYTES_RAW_SHA256: &str =
         "73bc971338b53b4d9a4c2a367fa360afaba779c43590dc5010a0dc48a0f23dc1";
     const NEGATIVE_RECEIPT_COMPLETE_WITH_RESIDUAL_RAW_SHA256: &str =
         "606949c8ba313c2292ab566670887c04fb9371126d2e02cb9b7d51d725262518";
+    const NEGATIVE_RECEIPT_COMPLETE_RESIDUAL_DESPITE_KEY_DESTROYED_RAW_SHA256: &str =
+        "63a770367f7cb6ca769e4b5d1c5e459f3a0cc4253de2f476c85dd5685bbc49f7";
     const NEGATIVE_FENCE_MISSING_SCOPE_RAW_SHA256: &str =
         "e756d74843605c550000bbc70681ca660e7ff692c6f7610af1ccaa08c2ca91ab";
     const NEGATIVE_EVENT_EFFECTIVE_BEFORE_POLICY_RAW_SHA256: &str =
@@ -951,6 +981,7 @@ mod tests {
                 ContractId::new("event_effective_before_policy_basis").unwrap(),
                 ContractId::new("fence_missing_scope").unwrap(),
                 ContractId::new("legal_hold_publication_visibility").unwrap(),
+                ContractId::new("receipt_complete_residual_despite_key_destroyed").unwrap(),
                 ContractId::new("receipt_complete_with_residual").unwrap(),
                 ContractId::new("tombstone_payload_bytes").unwrap(),
             ],
@@ -1102,6 +1133,59 @@ mod tests {
         )
     }
 
+    /// Generation advanced, every per-kind epoch unchanged from genesis.
+    /// Isolates the `same_generation` conjunct of `may_commit`: no epoch
+    /// entry differs, so a CAS that only checked epochs would wrongly permit
+    /// this commit.
+    fn fence_generation_only_advance() -> ErasureFenceV1 {
+        fence(
+            REQUIRED_FENCE_KINDS
+                .iter()
+                .map(|kind| ErasureFenceEntryV1 {
+                    kind: *kind,
+                    epoch: 0,
+                })
+                .collect(),
+            1,
+        )
+    }
+
+    /// Only the `privacy_subject` epoch advanced; generation and every other
+    /// epoch unchanged from genesis. This is the parent-side half of the
+    /// parent-vs-child scope race: work captured the genesis fence, then a
+    /// `privacy_subject` tombstone landed. Isolates the `no_epoch_advanced`
+    /// conjunct of `may_commit` (generation alone would wrongly permit it).
+    fn fence_privacy_subject_only_advance() -> ErasureFenceV1 {
+        fence(
+            REQUIRED_FENCE_KINDS
+                .iter()
+                .map(|kind| ErasureFenceEntryV1 {
+                    kind: *kind,
+                    epoch: u64::from(*kind == ErasureScopeKind::PrivacySubject),
+                })
+                .collect(),
+            0,
+        )
+    }
+
+    /// Only the `representation` epoch advanced; generation and every other
+    /// epoch unchanged from genesis. The mirrored, child-side half of the
+    /// same race: a `representation` projection commit racing a
+    /// `representation`-kind tombstone, with no generation movement to lean
+    /// on. Also isolates the `no_epoch_advanced` conjunct of `may_commit`.
+    fn fence_representation_only_advance() -> ErasureFenceV1 {
+        fence(
+            REQUIRED_FENCE_KINDS
+                .iter()
+                .map(|kind| ErasureFenceEntryV1 {
+                    kind: *kind,
+                    epoch: u64::from(*kind == ErasureScopeKind::Representation),
+                })
+                .collect(),
+            0,
+        )
+    }
+
     fn receipt_pending() -> ErasureReceiptV1 {
         ErasureReceiptV1 {
             schema_version: 1,
@@ -1141,6 +1225,26 @@ mod tests {
             ],
             key_destroyed: true,
             ..receipt_pending()
+        }
+    }
+
+    /// `state: complete`, `key_destroyed: true`, and exactly one governed
+    /// store still showing a residual. Isolates the `any_residual_present`
+    /// half of the `complete` conjunction: key destruction alone, even when
+    /// it genuinely happened, is not sufficient evidence of erasure while
+    /// plaintext or a derived copy remains anywhere in the inventory.
+    fn receipt_complete_residual_despite_key_destroyed() -> ErasureReceiptV1 {
+        ErasureReceiptV1 {
+            schema_version: 1,
+            erasure_event_id: event_representation().accepted_event_id().unwrap(),
+            state: ErasureReceiptStateV1::Complete,
+            residual_inventory: vec![ErasureStoreResidualV1 {
+                store_id: ContractId::new("store.archive").unwrap(),
+                deletion_actor: ErasureDeletionActorV1::FleetRecall,
+                residual_present: true,
+            }],
+            key_destroyed: true,
+            issued_at: CanonicalTimestamp::parse("2026-08-16T00:00:03.000000000Z").unwrap(),
         }
     }
 
@@ -1261,7 +1365,8 @@ mod tests {
                 &tombstone_digest_only(),
                 &unverifiable_re_consent,
                 &different_target
-            ),
+            )
+            .unwrap(),
             "an unverifiable consent-policy reference must never permit a new source fact"
         );
     }
@@ -1317,6 +1422,53 @@ mod tests {
         missing_scope.entries.pop();
         assert!(missing_scope.validate().is_err());
 
+        // Isolate the `covers_every_required_kind` conjunct from the
+        // `entries.len() != 4` check: four entries, strictly sorted, but one
+        // kind duplicated and another kind entirely absent. The length check
+        // alone cannot catch this -- only the coverage check can.
+        let mut duplicate_kind_missing_scope = genesis_fence();
+        duplicate_kind_missing_scope.entries = vec![
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::PrivacySubject,
+                epoch: 0,
+            },
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::PrivacySubject,
+                epoch: 1,
+            },
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::Representation,
+                epoch: 0,
+            },
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::Resource,
+                epoch: 0,
+            },
+        ];
+        assert_eq!(
+            duplicate_kind_missing_scope.entries.len(),
+            REQUIRED_FENCE_KINDS.len()
+        );
+        assert!(strictly_sorted(&duplicate_kind_missing_scope.entries));
+        assert!(duplicate_kind_missing_scope.validate().is_err());
+
+        // Isolate `strictly_sorted(&self.entries)` from both of the above:
+        // four entries, one of each required kind, but out of order.
+        let mut unsorted_but_complete = genesis_fence();
+        unsorted_but_complete.entries.swap(0, 1);
+        assert_eq!(
+            unsorted_but_complete.entries.len(),
+            REQUIRED_FENCE_KINDS.len()
+        );
+        assert!(REQUIRED_FENCE_KINDS.iter().all(|kind| {
+            unsorted_but_complete
+                .entries
+                .iter()
+                .any(|entry| entry.kind == *kind)
+        }));
+        assert!(!strictly_sorted(&unsorted_but_complete.entries));
+        assert!(unsorted_but_complete.validate().is_err());
+
         let negative_fence: ErasureFenceV1 =
             decode_strict(record(NEGATIVE_FENCE_MISSING_SCOPE_FIXTURE)).unwrap();
         // Distinguishing property, not just the shared error string: this
@@ -1367,6 +1519,86 @@ mod tests {
             },
         };
         assert!(cross_scope.may_commit().is_err());
+
+        // Isolate the `same_generation` conjunct: the generation alone
+        // advances while every per-kind epoch stays at genesis. A CAS that
+        // dropped the epoch check entirely (kept only the generation check)
+        // would still catch this one -- the point is that dropping the
+        // *generation* check must not let it slip through, which the next
+        // two cases confirm from the other side.
+        let generation_only: ErasureFenceV1 =
+            decode_strict(record(FENCE_GENERATION_ONLY_ADVANCE_FIXTURE)).unwrap();
+        assert_eq!(generation_only.generation.value, 1);
+        assert!(generation_only.entries.iter().all(|entry| entry.epoch == 0));
+        assert_eq!(
+            ErasureFenceCasV1 {
+                expected: genesis_fence(),
+                current: generation_only,
+            }
+            .may_commit(),
+            Ok(false),
+            "a generation-only advance with every epoch unchanged must still fail closed"
+        );
+
+        // Isolate the `no_epoch_advanced` conjunct, parent side: only the
+        // `privacy_subject` epoch moves and the generation does not move at
+        // all. A CAS that dropped the epoch check (kept only the generation
+        // check) would wrongly permit this -- the mechanical form of "a
+        // privacy_subject tombstone racing representation-scoped work".
+        let privacy_subject_only: ErasureFenceV1 =
+            decode_strict(record(FENCE_PRIVACY_SUBJECT_ONLY_ADVANCE_FIXTURE)).unwrap();
+        assert_eq!(privacy_subject_only.generation.value, 0);
+        assert_eq!(
+            privacy_subject_only
+                .entries
+                .iter()
+                .find(|entry| entry.kind == ErasureScopeKind::PrivacySubject)
+                .unwrap()
+                .epoch,
+            1
+        );
+        assert_eq!(
+            ErasureFenceCasV1 {
+                expected: genesis_fence(),
+                current: privacy_subject_only.clone(),
+            }
+            .may_commit(),
+            Ok(false),
+            "a privacy_subject-only epoch advance must fail closed even with no generation move"
+        );
+
+        // Mirrored, child side of the same race: only `representation`
+        // moves, generation unchanged.
+        let representation_only: ErasureFenceV1 =
+            decode_strict(record(FENCE_REPRESENTATION_ONLY_ADVANCE_FIXTURE)).unwrap();
+        assert_eq!(representation_only.generation.value, 0);
+        assert_eq!(
+            representation_only
+                .entries
+                .iter()
+                .find(|entry| entry.kind == ErasureScopeKind::Representation)
+                .unwrap()
+                .epoch,
+            1
+        );
+        assert_eq!(
+            ErasureFenceCasV1 {
+                expected: genesis_fence(),
+                current: representation_only,
+            }
+            .may_commit(),
+            Ok(false),
+            "a representation-only epoch advance must fail closed even with no generation move"
+        );
+
+        // The two single-epoch-advance fences differ from each other only in
+        // which kind moved, and from genesis in exactly one entry -- proof
+        // that `may_commit` distinguishes per-kind epochs rather than
+        // reasoning about the fence as an undifferentiated blob.
+        assert_ne!(
+            privacy_subject_only.fence_id().unwrap(),
+            genesis_fence().fence_id().unwrap()
+        );
     }
 
     #[test]
@@ -1379,21 +1611,33 @@ mod tests {
             kind: ErasureScopeKind::Representation,
             target_digest: labelled_digest("representation.fixture.two"),
         };
-        assert!(re_consent_permits_new_source_fact(
-            &tombstone,
-            &authorized,
-            &different_target
-        ));
-        assert!(!re_consent_permits_new_source_fact(
-            &tombstone,
-            &authorized,
-            &tombstone.target
-        ));
-        assert!(!re_consent_permits_new_source_fact(
-            &tombstone,
-            &ProspectiveReConsentV1::NotAuthorized,
-            &different_target
-        ));
+        assert!(
+            re_consent_permits_new_source_fact(&tombstone, &authorized, &different_target).unwrap()
+        );
+        assert!(
+            !re_consent_permits_new_source_fact(&tombstone, &authorized, &tombstone.target)
+                .unwrap()
+        );
+        assert!(
+            !re_consent_permits_new_source_fact(
+                &tombstone,
+                &ProspectiveReConsentV1::NotAuthorized,
+                &different_target
+            )
+            .unwrap()
+        );
+
+        // A tombstone this module cannot validate must never yield a
+        // permissive answer, no matter how "different" the candidate target
+        // looks from its (unverifiable) target digest.
+        let mut invalid_tombstone = tombstone;
+        invalid_tombstone.target.target_digest = Sha256Digest::ZERO;
+        assert!(invalid_tombstone.validate().is_err());
+        assert!(
+            re_consent_permits_new_source_fact(&invalid_tombstone, &authorized, &different_target)
+                .is_err(),
+            "an invalid tombstone must fail closed, never report permitted"
+        );
     }
 
     #[test]
@@ -1457,6 +1701,17 @@ mod tests {
         key_not_destroyed.key_destroyed = false;
         assert!(key_not_destroyed.validate().is_err());
 
+        // Isolate `strictly_sorted(&self.residual_inventory)`: the same two
+        // rows as `receipt_pending()`, only reordered. Every other conjunct
+        // still passes (non-empty, within the size cap, `pending` so the
+        // `complete` conjunction never applies, `issued_at` aligned, a
+        // non-zero `erasure_event_id`) -- only the ordering is wrong.
+        let mut unsorted_residuals = receipt_pending();
+        unsorted_residuals.residual_inventory.reverse();
+        assert_eq!(unsorted_residuals.residual_inventory.len(), 2);
+        assert!(!strictly_sorted(&unsorted_residuals.residual_inventory));
+        assert!(unsorted_residuals.validate().is_err());
+
         // A receipt bound to no erasure event at all (the zero digest) must
         // never validate: it is the record that discharges EVID-08, and it
         // must name the event it discharges.
@@ -1467,9 +1722,14 @@ mod tests {
         let negative_receipt: ErasureReceiptV1 =
             decode_strict(record(NEGATIVE_RECEIPT_COMPLETE_WITH_RESIDUAL_FIXTURE)).unwrap();
         // Distinguishing property, not just the shared error string: this
-        // fixture claims `complete` while a governed store still shows a
-        // residual.
+        // fixture claims `complete` while `key_destroyed` is still `false`
+        // *and* a governed store still shows a residual -- it fails the
+        // `complete` conjunction for two independent reasons at once, so it
+        // alone cannot isolate the `any_residual_present` half of that
+        // conjunction (see `receipt_complete_residual_despite_key_destroyed`
+        // below for the fixture that does).
         assert_eq!(negative_receipt.state, ErasureReceiptStateV1::Complete);
+        assert!(!negative_receipt.key_destroyed);
         assert!(
             negative_receipt
                 .residual_inventory
@@ -1479,6 +1739,37 @@ mod tests {
         assert_eq!(
             negative_receipt.validate(),
             Err(ContractError::Schema("invalid erasure receipt".into()))
+        );
+
+        // Isolates the `any_residual_present` half specifically: the key
+        // genuinely was destroyed (`key_destroyed: true`), yet exactly one
+        // governed store still shows a residual. Key destruction alone, with
+        // plaintext or a derived copy still resident anywhere in the
+        // inventory, is not sufficient evidence of erasure -- this is the
+        // one case in the suite where `key_destroyed` cannot be blamed for
+        // the rejection.
+        let residual_despite_key_destroyed: ErasureReceiptV1 = decode_strict(record(
+            NEGATIVE_RECEIPT_COMPLETE_RESIDUAL_DESPITE_KEY_DESTROYED_FIXTURE,
+        ))
+        .unwrap();
+        assert_eq!(
+            residual_despite_key_destroyed.state,
+            ErasureReceiptStateV1::Complete
+        );
+        assert!(residual_despite_key_destroyed.key_destroyed);
+        assert!(
+            residual_despite_key_destroyed
+                .residual_inventory
+                .iter()
+                .any(|residual| residual.residual_present)
+        );
+        assert_eq!(
+            residual_despite_key_destroyed.validate(),
+            Err(ContractError::Schema("invalid erasure receipt".into()))
+        );
+        assert_eq!(
+            residual_despite_key_destroyed,
+            receipt_complete_residual_despite_key_destroyed()
         );
 
         assert_ne!(
@@ -1649,6 +1940,18 @@ mod tests {
             ),
             (FENCE_GENESIS_FIXTURE, FENCE_GENESIS_RAW_SHA256),
             (FENCE_ADVANCED_FIXTURE, FENCE_ADVANCED_RAW_SHA256),
+            (
+                FENCE_GENERATION_ONLY_ADVANCE_FIXTURE,
+                FENCE_GENERATION_ONLY_ADVANCE_RAW_SHA256,
+            ),
+            (
+                FENCE_PRIVACY_SUBJECT_ONLY_ADVANCE_FIXTURE,
+                FENCE_PRIVACY_SUBJECT_ONLY_ADVANCE_RAW_SHA256,
+            ),
+            (
+                FENCE_REPRESENTATION_ONLY_ADVANCE_FIXTURE,
+                FENCE_REPRESENTATION_ONLY_ADVANCE_RAW_SHA256,
+            ),
             (RECEIPT_PENDING_FIXTURE, RECEIPT_PENDING_RAW_SHA256),
             (RECEIPT_COMPLETE_FIXTURE, RECEIPT_COMPLETE_RAW_SHA256),
             (LEGAL_HOLD_ACTIVE_FIXTURE, LEGAL_HOLD_ACTIVE_RAW_SHA256),
@@ -1673,6 +1976,10 @@ mod tests {
             (
                 NEGATIVE_RECEIPT_COMPLETE_WITH_RESIDUAL_FIXTURE,
                 NEGATIVE_RECEIPT_COMPLETE_WITH_RESIDUAL_RAW_SHA256,
+            ),
+            (
+                NEGATIVE_RECEIPT_COMPLETE_RESIDUAL_DESPITE_KEY_DESTROYED_FIXTURE,
+                NEGATIVE_RECEIPT_COMPLETE_RESIDUAL_DESPITE_KEY_DESTROYED_RAW_SHA256,
             ),
             (
                 NEGATIVE_FENCE_MISSING_SCOPE_FIXTURE,
@@ -1705,6 +2012,9 @@ mod tests {
             TOMBSTONE_WITH_METADATA_FIXTURE,
             FENCE_GENESIS_FIXTURE,
             FENCE_ADVANCED_FIXTURE,
+            FENCE_GENERATION_ONLY_ADVANCE_FIXTURE,
+            FENCE_PRIVACY_SUBJECT_ONLY_ADVANCE_FIXTURE,
+            FENCE_REPRESENTATION_ONLY_ADVANCE_FIXTURE,
             RECEIPT_PENDING_FIXTURE,
             RECEIPT_COMPLETE_FIXTURE,
             LEGAL_HOLD_ACTIVE_FIXTURE,
@@ -1740,6 +2050,18 @@ mod tests {
         assert_eq!(
             encode_canonical(&advanced_fence()).unwrap(),
             record(FENCE_ADVANCED_FIXTURE)
+        );
+        assert_eq!(
+            encode_canonical(&fence_generation_only_advance()).unwrap(),
+            record(FENCE_GENERATION_ONLY_ADVANCE_FIXTURE)
+        );
+        assert_eq!(
+            encode_canonical(&fence_privacy_subject_only_advance()).unwrap(),
+            record(FENCE_PRIVACY_SUBJECT_ONLY_ADVANCE_FIXTURE)
+        );
+        assert_eq!(
+            encode_canonical(&fence_representation_only_advance()).unwrap(),
+            record(FENCE_REPRESENTATION_ONLY_ADVANCE_FIXTURE)
         );
         assert_eq!(
             encode_canonical(&receipt_pending()).unwrap(),

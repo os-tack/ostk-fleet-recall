@@ -1,0 +1,1 @@
+{"erasure_event_id":"3c3b6bd2d6f9ad4a1e66a74cf51ca3380e747dd7bd332aa2bb6169294c61e6af","issued_at":"2026-08-16T00:00:03.000000000Z","key_destroyed":true,"residual_inventory":[{"deletion_actor":"fleet_recall","residual_present":true,"store_id":"store.archive"}],"schema_version":1,"state":"complete"}
