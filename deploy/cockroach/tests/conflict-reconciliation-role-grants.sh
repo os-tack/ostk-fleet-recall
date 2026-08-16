@@ -882,6 +882,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
     memory_claim_events,
     memory_conflicts,
     memory_conflict_members,
+    memory_claim_links,
     memory_mutation_receipts,
     memory_events
 TO fleet_runtime;
@@ -919,6 +920,7 @@ WHERE database_name = 'fleet_recall'
       'memory_claim_events',
       'memory_conflicts',
       'memory_conflict_members',
+      'memory_claim_links',
       'memory_mutation_receipts',
       'memory_events',
       'memory_claim_id_seq',
@@ -2162,6 +2164,7 @@ WHERE database_name = 'fleet_recall'
       'memory_claim_events',
       'memory_conflicts',
       'memory_conflict_members',
+      'memory_claim_links',
       'memory_mutation_receipts',
       'memory_events',
       'memory_claim_id_seq',
