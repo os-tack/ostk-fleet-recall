@@ -1,0 +1,1 @@
+{"allowed_output_modalities":["attested","intended","observed"],"conflict_behavior":"derive_disputed","kind_rule":{"kind":"require_uniform"},"max_consolidation_depth":4,"max_sources":16,"policy_id":"consolidation.default","schema_version":1,"supersede_sources":true,"version":1}
