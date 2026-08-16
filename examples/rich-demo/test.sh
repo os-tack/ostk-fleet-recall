@@ -139,10 +139,10 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 4227
-    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 841
+    length == 4382
+    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 848
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 3180
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 3328
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "src/bin/ostk-control-bootstrap.rs")] | length) == 11
@@ -165,6 +165,10 @@ if ! jq -s -e '
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "deploy/cockroach/tests/publication-reader-role-grants.sh")] | length) == 130
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "deploy/cockroach/runtime-role-grants.sql")] | length) == 29
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "deploy/cockroach/tests/runtime-role-grants.sh")] | length) == 101
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "deploy/cockroach/tests/successor-activation-role-grants.sh")] | length) == 77
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "migrations/0015_conflict_detector_uniqueness.sql")] | length) == 5
@@ -173,7 +177,7 @@ if ! jq -s -e '
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "migrations/0017_conflict_detector_projection_index.sql")] | length) == 3
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "src/private_postgres.rs")] | length) == 15
+        and .source_id == "src/private_postgres.rs")] | length) == 24
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "tests/publication_reader_live.rs")] | length) == 16
     and ([.[] | select(.source_id == "src/config.rs")] | length) == 0

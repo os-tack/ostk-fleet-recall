@@ -139,12 +139,14 @@ deploy/cockroach/conflict-reconciliation-role-grants.sql|database_security|sql
 deploy/cockroach/control-role-grants.sql|database_security|sql
 deploy/cockroach/publication-reader-role-grants.sql|database_security|sql
 deploy/cockroach/registry-activation-role-grants.sql|database_security|sql
+deploy/cockroach/runtime-role-grants.sql|database_security|sql
 deploy/cockroach/successor-activation-role-grants.sql|database_security|sql
 deploy/cockroach/successor-schema-quarantine-grants.sql|database_security|sql
 deploy/cockroach/tests/conflict-reconciliation-role-grants.sh|database_security|shell
 deploy/cockroach/tests/control-role-grants.sh|database_security|shell
 deploy/cockroach/tests/publication-reader-role-grants.sh|database_security|shell
 deploy/cockroach/tests/registry-activation-role-grants.sh|database_security|shell
+deploy/cockroach/tests/runtime-role-grants.sh|database_security|shell
 deploy/cockroach/tests/successor-activation-role-grants.sh|database_security|shell
 deploy/container-entrypoint.sh|container_runtime|shell
 deploy/localstack/aws-config|local_development|aws_config
