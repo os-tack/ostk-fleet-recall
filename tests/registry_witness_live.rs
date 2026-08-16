@@ -1040,3 +1040,310 @@ fn writer_authority_materialization_rejects_an_unknown_package_digest() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Negative vectors for the three checks a root UPDATE can reach
+// ---------------------------------------------------------------------------
+
+/// One head-binding forgery: an edit of the decoded binding, re-encoded
+/// canonically and stored under an untouched projection.
+type HeadMutation = fn(&mut RegistryHeadBindingV1, Sha256Digest);
+
+const fn is_contract_error(error: &WriterAuthorityError) -> bool {
+    matches!(error, WriterAuthorityError::Contract(_))
+}
+
+/// Exact bytes the view currently projects as the active head.
+async fn canonical_head_bytes(pool: &PgPool, scope: &FleetScope) -> Vec<u8> {
+    sqlx::query_scalar(
+        "SELECT canonical_head FROM public.memory_writer_authority_v1 \
+         WHERE tenant_id = $1 AND project = $2",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .fetch_one(pool)
+    .await
+    .expect("projected canonical head")
+}
+
+/// Replace the stored canonical head as root. `canonical_head` is not one of
+/// the seventeen columns migration 0014's foreign key covers and is not a view
+/// join column, so the composite join still succeeds and the tampered head
+/// reaches the witness rather than disappearing from the projection.
+async fn store_canonical_head(pool: &PgPool, scope: &FleetScope, bytes: Vec<u8>) {
+    let updated = sqlx::query(
+        "UPDATE public.memory_registry_current_heads_v2 SET canonical_head = $3 \
+         WHERE tenant_id = $1 AND project = $2",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .bind(bytes)
+    .execute(pool)
+    .await
+    .expect("store the tampered canonical head");
+    assert_eq!(updated.rows_affected(), 1);
+}
+
+/// REPLAY-01. The durable log epoch must equal the pinned receipt's genesis
+/// epoch, because the evidence ledger's head rows carry no foreign key to the
+/// control epoch (ADR 0002 D1 amendment) and this comparison is what replaces
+/// it. `partition_seed` is the one epoch column a root UPDATE can reach —
+/// `shard_count` is held by `memory_control_head_epoch_fk` and
+/// `partition_recipe_version` by a CHECK — and it is precisely the value the
+/// shard recipe depends on. The remaining seven fields `verify_epoch` compares
+/// are covered offline by
+/// `registry_witness::tests::epoch_verification_binds_every_field_of_the_receipts_genesis_epoch`.
+#[tokio::test]
+async fn live_writer_authority_rejects_a_durable_log_epoch_drift_when_configured() {
+    let Some(pool) = migrated_pool().await else {
+        return;
+    };
+    let fixture = fixture();
+    let head = activate_first_successor(&pool, &fixture, "epoch-drift", 71).await;
+    load_and_verify(&pool, &head.physical_scope, &head.config)
+        .await
+        .expect("the untampered head must verify");
+
+    let updated = sqlx::query(
+        "UPDATE public.memory_control_log_epochs SET partition_seed = $3 \
+         WHERE tenant_id = $1 AND project = $2",
+    )
+    .bind(head.physical_scope.tenant_id)
+    .bind(&head.physical_scope.project)
+    .bind(vec![0x40_u8; 32])
+    .execute(&pool)
+    .await
+    .expect("a root UPDATE of the partition seed must be possible");
+    assert_eq!(updated.rows_affected(), 1);
+
+    let error = load_and_verify(&pool, &head.physical_scope, &head.config)
+        .await
+        .expect_err("a durable epoch that disagrees with the receipt must fail closed");
+    assert_eq!(
+        rejection(&error),
+        Some(WriterAuthorityRejection::LogEpoch),
+        "unexpected rejection: {error}"
+    );
+
+    // D4: the in-transaction re-check is the same code path, so it reaches the
+    // same verdict rather than trusting an earlier successful read.
+    let mut transaction = pool.begin().await.expect("begin");
+    let error = verify_within(&mut transaction, &head.physical_scope, &head.config)
+        .await
+        .expect_err("the in-transaction re-check must fail closed too");
+    assert_eq!(
+        rejection(&error),
+        Some(WriterAuthorityRejection::LogEpoch),
+        "unexpected in-transaction rejection: {error}"
+    );
+    transaction.rollback().await.expect("rollback");
+
+    // The two epoch columns the schema itself holds. Either verdict is
+    // acceptable; silently verifying is not.
+    for (column, value) in [("shard_count", "8"), ("partition_recipe_version", "2")] {
+        let attempt = sqlx::query(&format!(
+            "UPDATE public.memory_control_log_epochs SET {column} = {value} \
+             WHERE tenant_id = $1 AND project = $2"
+        ))
+        .bind(head.physical_scope.tenant_id)
+        .bind(&head.physical_scope.project)
+        .execute(&pool)
+        .await;
+        match attempt {
+            Ok(updated) => {
+                assert_eq!(updated.rows_affected(), 1, "column {column}");
+                let error = load_and_verify(&pool, &head.physical_scope, &head.config)
+                    .await
+                    .expect_err("a tampered epoch column must fail closed");
+                assert_eq!(
+                    rejection(&error),
+                    Some(WriterAuthorityRejection::LogEpoch),
+                    "column {column}: unexpected rejection {error}"
+                );
+            }
+            Err(error) => {
+                println!("epoch column {column} is held by the schema: {error}");
+            }
+        }
+    }
+}
+
+/// D4. The canonical head bytes are the preimage an appended statement binds,
+/// so they must agree with every projected column the head carries. Each case
+/// re-encodes a cleanly decodable binding, so nothing but `verify_head_binding`
+/// can catch it.
+#[tokio::test]
+async fn live_writer_authority_rejects_a_canonical_head_that_misbinds_the_projection_when_configured()
+ {
+    let Some(pool) = migrated_pool().await else {
+        return;
+    };
+    let fixture = fixture();
+    let head = activate_first_successor(&pool, &fixture, "head-binding", 72).await;
+    let original = canonical_head_bytes(&pool, &head.physical_scope).await;
+    load_and_verify(&pool, &head.physical_scope, &head.config)
+        .await
+        .expect("the untampered head must verify");
+
+    let foreign = Sha256Digest::from_bytes([0xab; 32]);
+    let mutations: [(&str, HeadMutation); 5] = [
+        ("activation_id", |binding, foreign| {
+            binding.head.activation_id = foreign;
+        }),
+        ("package_digest", |binding, foreign| {
+            binding.head.package_digest = foreign;
+        }),
+        ("activation_policy_digest", |binding, foreign| {
+            binding.head.activation_policy_digest = foreign;
+        }),
+        ("effective_from", |binding, _| {
+            binding.effective_from = CanonicalTimestamp::parse("2031-01-01T00:00:00.000000000Z")
+                .expect("canonical timestamp");
+        }),
+        ("effective_until", |binding, _| {
+            binding.effective_until = Some(
+                CanonicalTimestamp::parse("2031-01-01T00:00:00.000000000Z")
+                    .expect("canonical timestamp"),
+            );
+        }),
+    ];
+
+    for (label, mutate) in mutations {
+        let mut binding: RegistryHeadBindingV1 =
+            decode_strict(&original).expect("the projected head decodes");
+        mutate(&mut binding, foreign);
+        let forged = encode_canonical(&binding).expect("forged canonical head");
+        assert_ne!(forged, original, "{label}: the forgery must differ");
+        store_canonical_head(&pool, &head.physical_scope, forged).await;
+
+        let error = load_and_verify(&pool, &head.physical_scope, &head.config)
+            .await
+            .expect_err("a canonical head that misbinds the projection must fail closed");
+        assert_eq!(
+            rejection(&error),
+            Some(WriterAuthorityRejection::HeadBinding),
+            "{label}: unexpected rejection {error}"
+        );
+    }
+
+    // Restoring the exact bytes restores authority: the rejection is a verdict
+    // about this read, never a latched state.
+    store_canonical_head(&pool, &head.physical_scope, original).await;
+    let witness = load_and_verify(&pool, &head.physical_scope, &head.config)
+        .await
+        .expect("the restored head must verify again");
+    assert_eq!(witness.activation_id(), head.activation_id);
+}
+
+/// D4. A stored head that is valid JSON but not already in canonical byte form
+/// is a contract failure, not a rejection: the writer would otherwise bind a
+/// preimage no other participant can reproduce. Whitespace is caught by
+/// `require_canonical`; a dropped `effective_until` member is canonical JSON
+/// that decodes cleanly and is caught only by the re-encode comparison.
+#[tokio::test]
+async fn live_writer_authority_rejects_noncanonical_head_bytes_when_configured() {
+    let Some(pool) = migrated_pool().await else {
+        return;
+    };
+    let fixture = fixture();
+    let head = activate_first_successor(&pool, &fixture, "noncanonical", 73).await;
+    let original = canonical_head_bytes(&pool, &head.physical_scope).await;
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&original).expect("the projected head is JSON");
+    let pretty = serde_json::to_vec_pretty(&value).expect("pretty printed head");
+    assert_ne!(pretty, original);
+    store_canonical_head(&pool, &head.physical_scope, pretty).await;
+    let error = load_and_verify(&pool, &head.physical_scope, &head.config)
+        .await
+        .expect_err("a pretty printed head must fail closed");
+    assert!(
+        is_contract_error(&error),
+        "expected a canonicality contract error, got {error}"
+    );
+
+    let text = String::from_utf8(original.clone()).expect("canonical JSON is UTF-8");
+    let trimmed = text.replace("\"effective_until\":null,", "");
+    assert_ne!(
+        trimmed, text,
+        "the projected head must carry effective_until"
+    );
+    store_canonical_head(&pool, &head.physical_scope, trimmed.into_bytes()).await;
+    let error = load_and_verify(&pool, &head.physical_scope, &head.config)
+        .await
+        .expect_err("a head whose bytes do not re-encode must fail closed");
+    assert!(
+        is_contract_error(&error),
+        "expected a canonicality contract error, got {error}"
+    );
+
+    store_canonical_head(&pool, &head.physical_scope, original).await;
+    load_and_verify(&pool, &head.physical_scope, &head.config)
+        .await
+        .expect("the restored head must verify again");
+}
+
+/// AUTH-04 descent, and the reason its negative vectors are offline.
+///
+/// `verify_descent` requires the transition's root columns to be the genesis
+/// the pinned receipt names. This test establishes that no root UPDATE can
+/// produce a head that reaches that check with a foreign root: migration
+/// 0012's `memory_registry_transition_genesis_head_fk` and
+/// `memory_registry_transition_genesis_activation_fk` hold every root column,
+/// and its predecessor foreign key holds the predecessor columns. If a schema
+/// change ever makes one reachable, this test stops passing quietly and starts
+/// asserting the rejection instead. The negative vectors themselves live in
+/// `registry_witness::tests::descent_verification_requires_the_pinned_genesis_root`.
+#[tokio::test]
+async fn live_writer_authority_descent_columns_are_held_by_the_schema_when_configured() {
+    let Some(pool) = migrated_pool().await else {
+        return;
+    };
+    let fixture = fixture();
+    let head = activate_first_successor(&pool, &fixture, "descent", 74).await;
+    load_and_verify(&pool, &head.physical_scope, &head.config)
+        .await
+        .expect("the untampered head must verify");
+
+    let mut refusals = 0_u32;
+    for column in [
+        "root_package_digest",
+        "root_activation_policy_digest",
+        "root_activation_id",
+        "predecessor_activation_id",
+        "predecessor_package_digest",
+    ] {
+        let attempt = sqlx::query(&format!(
+            "UPDATE public.memory_registry_transitions SET {column} = $3 \
+             WHERE tenant_id = $1 AND project = $2 AND generation = 1"
+        ))
+        .bind(head.physical_scope.tenant_id)
+        .bind(&head.physical_scope.project)
+        .bind(vec![0xc7_u8; 32])
+        .execute(&pool)
+        .await;
+        match attempt {
+            Ok(updated) => {
+                assert_eq!(updated.rows_affected(), 1, "column {column}");
+                let error = load_and_verify(&pool, &head.physical_scope, &head.config)
+                    .await
+                    .expect_err("a forged descent must fail closed");
+                assert_eq!(
+                    rejection(&error),
+                    Some(WriterAuthorityRejection::Descent),
+                    "column {column}: unexpected rejection {error}"
+                );
+            }
+            Err(error) => {
+                refusals += 1;
+                println!("descent column {column} is held by the schema: {error}");
+            }
+        }
+    }
+    assert!(
+        refusals > 0,
+        "at least one descent column is expected to be held by a foreign key; \
+         if none are, the offline vectors are the only descent coverage and \
+         this test should be tightened"
+    );
+}
