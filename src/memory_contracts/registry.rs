@@ -25,6 +25,8 @@ const MAX_APPROVALS: usize = 64;
 pub enum RegistryEntryKind {
     ActivationPolicy,
     ApplicabilityEvaluator,
+    /// Generation-2 only: Arrow IPC batch schema for transport-plane batches.
+    ArrowBatchSchema,
     AuthorityRule,
     CausalRatificationPolicy,
     ClassifierPolicy,
@@ -34,9 +36,13 @@ pub enum RegistryEntryKind {
     EvidenceSchema,
     ExemplarPolicy,
     IdentityRecipe,
+    /// Generation-2 only: durable log epoch recipe for the append plane.
+    LogEpochRecipe,
     NamespaceDefinition,
     NormativeBindingSchema,
     ObserverAdmission,
+    /// Generation-2 only: deterministic parser contract for chunk identity.
+    ParserContract,
     PredicateSchema,
     PublicationRule,
     RedactionPolicy,
@@ -50,6 +56,7 @@ impl RegistryEntryKind {
         match self {
             Self::ActivationPolicy => "activation_policy",
             Self::ApplicabilityEvaluator => "applicability_evaluator",
+            Self::ArrowBatchSchema => "arrow_batch_schema",
             Self::AuthorityRule => "authority_rule",
             Self::CausalRatificationPolicy => "causal_ratification_policy",
             Self::ClassifierPolicy => "classifier_policy",
@@ -59,9 +66,11 @@ impl RegistryEntryKind {
             Self::EvidenceSchema => "evidence_schema",
             Self::ExemplarPolicy => "exemplar_policy",
             Self::IdentityRecipe => "identity_recipe",
+            Self::LogEpochRecipe => "log_epoch_recipe",
             Self::NamespaceDefinition => "namespace_definition",
             Self::NormativeBindingSchema => "normative_binding_schema",
             Self::ObserverAdmission => "observer_admission",
+            Self::ParserContract => "parser_contract",
             Self::PredicateSchema => "predicate_schema",
             Self::PublicationRule => "publication_rule",
             Self::RedactionPolicy => "redaction_policy",
@@ -70,6 +79,354 @@ impl RegistryEntryKind {
             Self::RetentionPolicy => "retention_policy",
         }
     }
+
+    /// Whether this kind was introduced after the frozen generation-1 registry.
+    ///
+    /// Generation-1 closures (genesis package, Stage-4 target package) must
+    /// reject these kinds outright: their typed bodies do not exist in this
+    /// binary, so admitting one would let a package name a contract that no
+    /// verifier can close.
+    pub const fn is_generation2_only(self) -> bool {
+        matches!(
+            self,
+            Self::ArrowBatchSchema | Self::LogEpochRecipe | Self::ParserContract
+        )
+    }
+
+    /// Position of this kind in [`ALL_REGISTRY_ENTRY_KINDS`].
+    ///
+    /// The exhaustive match is the guard that keeps that array honest: adding a
+    /// variant fails to compile here, and assigning it an index without listing
+    /// it in the array fails the round-trip test. Without this, a new kind could
+    /// stay invisible to every coverage assertion over the closed table.
+    pub const fn table_index(self) -> usize {
+        match self {
+            Self::ActivationPolicy => 0,
+            Self::ApplicabilityEvaluator => 1,
+            Self::ArrowBatchSchema => 2,
+            Self::AuthorityRule => 3,
+            Self::CausalRatificationPolicy => 4,
+            Self::ClassifierPolicy => 5,
+            Self::ConnectorSchema => 6,
+            Self::CoverageProof => 7,
+            Self::EpisodePolicy => 8,
+            Self::EvidenceSchema => 9,
+            Self::ExemplarPolicy => 10,
+            Self::IdentityRecipe => 11,
+            Self::LogEpochRecipe => 12,
+            Self::NamespaceDefinition => 13,
+            Self::NormativeBindingSchema => 14,
+            Self::ObserverAdmission => 15,
+            Self::ParserContract => 16,
+            Self::PredicateSchema => 17,
+            Self::PublicationRule => 18,
+            Self::RedactionPolicy => 19,
+            Self::RelationProof => 20,
+            Self::ResourceKindSchema => 21,
+            Self::RetentionPolicy => 22,
+        }
+    }
+}
+
+/// Every closed entry kind, in canonical `as_str` order.
+pub const ALL_REGISTRY_ENTRY_KINDS: [RegistryEntryKind; 23] = [
+    RegistryEntryKind::ActivationPolicy,
+    RegistryEntryKind::ApplicabilityEvaluator,
+    RegistryEntryKind::ArrowBatchSchema,
+    RegistryEntryKind::AuthorityRule,
+    RegistryEntryKind::CausalRatificationPolicy,
+    RegistryEntryKind::ClassifierPolicy,
+    RegistryEntryKind::ConnectorSchema,
+    RegistryEntryKind::CoverageProof,
+    RegistryEntryKind::EpisodePolicy,
+    RegistryEntryKind::EvidenceSchema,
+    RegistryEntryKind::ExemplarPolicy,
+    RegistryEntryKind::IdentityRecipe,
+    RegistryEntryKind::LogEpochRecipe,
+    RegistryEntryKind::NamespaceDefinition,
+    RegistryEntryKind::NormativeBindingSchema,
+    RegistryEntryKind::ObserverAdmission,
+    RegistryEntryKind::ParserContract,
+    RegistryEntryKind::PredicateSchema,
+    RegistryEntryKind::PublicationRule,
+    RegistryEntryKind::RedactionPolicy,
+    RegistryEntryKind::RelationProof,
+    RegistryEntryKind::ResourceKindSchema,
+    RegistryEntryKind::RetentionPolicy,
+];
+
+/// Dispatch class of one `(kind, entry schema ID, entry schema version)` triple.
+///
+/// The class is a statement about this binary's typed decoders, never about
+/// activation: a dispatched triple is one some closure can decode, not one any
+/// package is authorized to carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BodySchemaSlotClassV1 {
+    /// Typed generation-1 body dispatched by the genesis closure.
+    Generation1Dispatched,
+    /// Typed generation-2 body dispatched by the successor closure.
+    Generation2Dispatched,
+    /// Generation-2 slot reserved by contract whose typed body is not wired.
+    Generation2Reserved,
+    /// Not a member of the closed table; every consumer must fail closed.
+    Unknown,
+}
+
+impl BodySchemaSlotClassV1 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generation1Dispatched => "generation1_dispatched",
+            Self::Generation2Dispatched => "generation2_dispatched",
+            Self::Generation2Reserved => "generation2_reserved",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One closed body-schema slot a registry package is permitted to name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodySchemaSlotV1 {
+    pub kind: RegistryEntryKind,
+    pub entry_schema_id: &'static str,
+    pub entry_schema_version: u32,
+    pub class: BodySchemaSlotClassV1,
+}
+
+const fn slot(
+    kind: RegistryEntryKind,
+    entry_schema_id: &'static str,
+    entry_schema_version: u32,
+    class: BodySchemaSlotClassV1,
+) -> BodySchemaSlotV1 {
+    BodySchemaSlotV1 {
+        kind,
+        entry_schema_id,
+        entry_schema_version,
+        class,
+    }
+}
+
+/// Closed table of every `(kind, entry schema ID, entry schema version)` triple
+/// a generation-2 registry package may carry, in canonical sorted order.
+///
+/// The table is exhaustive by construction: any triple outside it classifies as
+/// [`BodySchemaSlotClassV1::Unknown`], and every consumer fails closed on both
+/// `Unknown` and `Generation2Reserved`.
+pub const BODY_SCHEMA_SLOTS: [BodySchemaSlotV1; 32] = [
+    slot(
+        RegistryEntryKind::ActivationPolicy,
+        "registry.activation_policy",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::ActivationPolicy,
+        "registry.activation_policy",
+        2,
+        BodySchemaSlotClassV1::Generation2Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::ApplicabilityEvaluator,
+        "registry.applicability_evaluator",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::ArrowBatchSchema,
+        "registry.arrow_batch_schema",
+        1,
+        BodySchemaSlotClassV1::Generation2Reserved,
+    ),
+    slot(
+        RegistryEntryKind::AuthorityRule,
+        "registry.authority_rule",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::AuthorityRule,
+        "registry.remember_admission_rule",
+        2,
+        BodySchemaSlotClassV1::Generation2Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::CausalRatificationPolicy,
+        "registry.causal_ratification_policy",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::ClassifierPolicy,
+        "registry.classifier_policy",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::ConnectorSchema,
+        "registry.connector_schema",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::ConnectorSchema,
+        "registry.connector_schema",
+        2,
+        BodySchemaSlotClassV1::Generation2Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::CoverageProof,
+        "registry.coverage_proof",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::CoverageProof,
+        "registry.coverage_proof",
+        2,
+        BodySchemaSlotClassV1::Generation2Reserved,
+    ),
+    slot(
+        RegistryEntryKind::EpisodePolicy,
+        "registry.episode_policy",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::EpisodePolicy,
+        "registry.episode_policy",
+        2,
+        BodySchemaSlotClassV1::Generation2Reserved,
+    ),
+    slot(
+        RegistryEntryKind::EvidenceSchema,
+        "registry.evidence_schema",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::ExemplarPolicy,
+        "registry.exemplar_policy",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::IdentityRecipe,
+        "registry.identity_recipe",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::LogEpochRecipe,
+        "registry.log_epoch_recipe",
+        1,
+        BodySchemaSlotClassV1::Generation2Reserved,
+    ),
+    slot(
+        RegistryEntryKind::NamespaceDefinition,
+        "registry.namespace_definition",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::NormativeBindingSchema,
+        "registry.normative_binding_schema",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::NormativeBindingSchema,
+        "registry.normative_binding_schema",
+        2,
+        BodySchemaSlotClassV1::Generation2Reserved,
+    ),
+    slot(
+        RegistryEntryKind::ObserverAdmission,
+        "registry.observer_admission",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::ObserverAdmission,
+        "registry.observer_admission",
+        2,
+        BodySchemaSlotClassV1::Generation2Reserved,
+    ),
+    slot(
+        RegistryEntryKind::ParserContract,
+        "registry.parser_contract",
+        1,
+        BodySchemaSlotClassV1::Generation2Reserved,
+    ),
+    slot(
+        RegistryEntryKind::PredicateSchema,
+        "registry.predicate_schema",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::PredicateSchema,
+        "registry.predicate_schema",
+        2,
+        BodySchemaSlotClassV1::Generation2Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::PublicationRule,
+        "registry.publication_rule",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::RedactionPolicy,
+        "registry.redaction_policy",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::RelationProof,
+        "registry.relation_proof",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::RelationProof,
+        "registry.relation_proof",
+        2,
+        BodySchemaSlotClassV1::Generation2Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::ResourceKindSchema,
+        "registry.resource_kind_schema",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::RetentionPolicy,
+        "registry.retention_policy",
+        1,
+        BodySchemaSlotClassV1::Generation1Dispatched,
+    ),
+];
+
+/// Classify one exact body-schema triple against the closed table.
+///
+/// This is a pure lookup. It proves neither package membership nor activation,
+/// and a `Generation2Dispatched` result never means the entry is admissible in
+/// a generation-1 package.
+#[must_use]
+pub fn classify_body_schema_triple(
+    kind: RegistryEntryKind,
+    entry_schema_id: &str,
+    entry_schema_version: u32,
+) -> BodySchemaSlotClassV1 {
+    BODY_SCHEMA_SLOTS
+        .iter()
+        .find(|slot| {
+            slot.kind == kind
+                && slot.entry_schema_id == entry_schema_id
+                && slot.entry_schema_version == entry_schema_version
+        })
+        .map_or(BodySchemaSlotClassV1::Unknown, |slot| slot.class)
 }
 
 /// One canonical, independently digestible registry entry.
@@ -454,6 +811,154 @@ mod tests {
                 DigestDomain::TestVectorManifest,
                 "suite-negative",
             ),
+        }
+    }
+
+    #[test]
+    fn every_kind_has_one_wire_name_and_a_stable_generation() {
+        assert_eq!(ALL_REGISTRY_ENTRY_KINDS.len(), 23);
+        for (index, kind) in ALL_REGISTRY_ENTRY_KINDS.into_iter().enumerate() {
+            let wire = serde_json::to_string(&kind).unwrap();
+            assert_eq!(wire, format!("\"{}\"", kind.as_str()));
+            let decoded: RegistryEntryKind = serde_json::from_str(&wire).unwrap();
+            assert_eq!(decoded, kind);
+            // A kind that was given a table index but never listed above would
+            // index past the end here instead of silently escaping coverage.
+            assert_eq!(kind.table_index(), index);
+            assert_eq!(ALL_REGISTRY_ENTRY_KINDS[kind.table_index()], kind);
+        }
+        assert!(
+            ALL_REGISTRY_ENTRY_KINDS
+                .windows(2)
+                .all(|pair| pair[0].as_str() < pair[1].as_str())
+        );
+        let generation2_only = ALL_REGISTRY_ENTRY_KINDS
+            .iter()
+            .filter(|kind| kind.is_generation2_only())
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generation2_only,
+            ["arrow_batch_schema", "log_epoch_recipe", "parser_contract"]
+        );
+        // A name outside the closed set can never decode into a kind.
+        assert!(serde_json::from_str::<RegistryEntryKind>("\"transcript_session\"").is_err());
+    }
+
+    #[test]
+    fn body_schema_slot_table_is_closed_sorted_and_exhaustive() {
+        let keys = BODY_SCHEMA_SLOTS
+            .iter()
+            .map(|slot| {
+                (
+                    slot.kind.as_str(),
+                    slot.entry_schema_id,
+                    slot.entry_schema_version,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            keys.windows(2).all(|pair| pair[0] < pair[1]),
+            "body-schema slots must be strictly sorted and unique"
+        );
+        assert!(
+            BODY_SCHEMA_SLOTS
+                .iter()
+                .all(|slot| slot.entry_schema_version > 0
+                    && slot.class != BodySchemaSlotClassV1::Unknown)
+        );
+        for kind in ALL_REGISTRY_ENTRY_KINDS {
+            let slots = BODY_SCHEMA_SLOTS
+                .iter()
+                .filter(|slot| slot.kind == kind)
+                .collect::<Vec<_>>();
+            assert!(!slots.is_empty(), "{} has no slot", kind.as_str());
+            // A generation-2-only kind may never claim a dispatched body.
+            assert_eq!(
+                kind.is_generation2_only(),
+                slots
+                    .iter()
+                    .all(|slot| slot.class == BodySchemaSlotClassV1::Generation2Reserved)
+            );
+        }
+        let counts = |class: BodySchemaSlotClassV1| {
+            BODY_SCHEMA_SLOTS
+                .iter()
+                .filter(|slot| slot.class == class)
+                .count()
+        };
+        assert_eq!(counts(BodySchemaSlotClassV1::Generation1Dispatched), 20);
+        assert_eq!(counts(BodySchemaSlotClassV1::Generation2Dispatched), 5);
+        assert_eq!(counts(BodySchemaSlotClassV1::Generation2Reserved), 7);
+    }
+
+    #[test]
+    fn triple_classification_vectors_fail_closed_outside_the_table() {
+        for (kind, schema_id, version, expected) in [
+            (
+                RegistryEntryKind::PredicateSchema,
+                "registry.predicate_schema",
+                1,
+                BodySchemaSlotClassV1::Generation1Dispatched,
+            ),
+            (
+                RegistryEntryKind::AuthorityRule,
+                "registry.remember_admission_rule",
+                2,
+                BodySchemaSlotClassV1::Generation2Dispatched,
+            ),
+            (
+                RegistryEntryKind::ConnectorSchema,
+                "registry.connector_schema",
+                2,
+                BodySchemaSlotClassV1::Generation2Dispatched,
+            ),
+            (
+                RegistryEntryKind::CoverageProof,
+                "registry.coverage_proof",
+                2,
+                BodySchemaSlotClassV1::Generation2Reserved,
+            ),
+            (
+                RegistryEntryKind::ParserContract,
+                "registry.parser_contract",
+                1,
+                BodySchemaSlotClassV1::Generation2Reserved,
+            ),
+            // A reserved triple at the wrong version is not the reserved slot.
+            (
+                RegistryEntryKind::ParserContract,
+                "registry.parser_contract",
+                2,
+                BodySchemaSlotClassV1::Unknown,
+            ),
+            // A v1-only kind claimed at v2 has no typed decoder.
+            (
+                RegistryEntryKind::RetentionPolicy,
+                "registry.retention_policy",
+                2,
+                BodySchemaSlotClassV1::Unknown,
+            ),
+            // The schema ID is part of the key, not a label.
+            (
+                RegistryEntryKind::AuthorityRule,
+                "registry.authority_rule",
+                2,
+                BodySchemaSlotClassV1::Unknown,
+            ),
+            (
+                RegistryEntryKind::ConnectorSchema,
+                "registry.transcript_session_connector",
+                2,
+                BodySchemaSlotClassV1::Unknown,
+            ),
+        ] {
+            assert_eq!(
+                classify_body_schema_triple(kind, schema_id, version),
+                expected,
+                "{} {schema_id}@{version}",
+                kind.as_str()
+            );
         }
     }
 

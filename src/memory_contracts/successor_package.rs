@@ -23,11 +23,15 @@ use super::{
     digest::Sha256Digest,
     evidence_v2::StructurallyResolvedConnectorSchemaV2,
     genesis::{
-        EvidenceSchemaEntryV1, SemanticallyDecodedGenesisEntryV1, decode_entry, resolve_reference,
-        validate_entry_identity, validate_entry_semantics,
+        EvidenceSchemaEntryV1, SemanticallyDecodedGenesisEntryV1, decode_entry,
+        generation2_only_kind_error, resolve_reference, validate_entry_identity,
+        validate_entry_semantics,
     },
     identity::{IdentityForm, IdentityRecipeV1, ResourceKindSchemaV1},
-    registry::{ManifestVerifiedRegistryPackage, RegistryEntryKind, RegistryEntryV1},
+    registry::{
+        BodySchemaSlotClassV1, ManifestVerifiedRegistryPackage, RegistryEntryKind, RegistryEntryV1,
+        classify_body_schema_triple,
+    },
     relation_policy_v2::StructurallyResolvedRelationProofV2,
     remember_v2::{
         RememberAdmissionBasisRuleV2, RememberAdmissionRuleV2, RememberPredicateSchemaV2,
@@ -224,6 +228,19 @@ impl TryFrom<ManifestVerifiedRegistryPackage> for SemanticallyClosedSuccessorPac
 
 fn decode_successor_entry(entry: &RegistryEntryV1) -> ContractResult<DecodedSuccessorEntry> {
     let schema_id = entry.entry_schema_id.as_str();
+    if entry.kind.is_generation2_only() {
+        return Err(generation2_only_kind_error(entry));
+    }
+    if classify_body_schema_triple(entry.kind, schema_id, entry.entry_schema_version)
+        == BodySchemaSlotClassV1::Generation2Reserved
+    {
+        return Err(ContractError::Schema(format!(
+            "reserved generation-2 body schema ({}, {}, {}) has no wired typed body",
+            entry.kind.as_str(),
+            entry.entry_schema_id,
+            entry.entry_schema_version
+        )));
+    }
     match (entry.kind, schema_id, entry.entry_schema_version) {
         (
             RegistryEntryKind::ActivationPolicy,
@@ -280,10 +297,18 @@ fn decode_successor_entry(entry: &RegistryEntryV1) -> ContractResult<DecodedSucc
     }
 }
 
+/// Legacy v1 body-schema ID for one kind.
+///
+/// Generation-2-only kinds return an ID that no v1 body schema claims, so the
+/// legacy fallback arm of [`decode_successor_entry`] can never match them even
+/// if the earlier explicit guard were removed.
 const fn legacy_schema_id(kind: RegistryEntryKind) -> &'static str {
     match kind {
         RegistryEntryKind::ActivationPolicy => "registry.activation_policy",
         RegistryEntryKind::ApplicabilityEvaluator => "registry.applicability_evaluator",
+        RegistryEntryKind::ArrowBatchSchema
+        | RegistryEntryKind::LogEpochRecipe
+        | RegistryEntryKind::ParserContract => "registry.generation2_only_kind_has_no_v1_schema",
         RegistryEntryKind::AuthorityRule => "registry.authority_rule",
         RegistryEntryKind::CausalRatificationPolicy => "registry.causal_ratification_policy",
         RegistryEntryKind::ClassifierPolicy => "registry.classifier_policy",
@@ -1130,6 +1155,80 @@ mod tests {
         package.entries.push(entry);
         assert!(
             ManifestVerifiedRegistryPackage::new(package, &frozen_profile_reference_v1()).is_err()
+        );
+    }
+
+    #[test]
+    fn generation2_only_kinds_and_reserved_triples_have_no_typed_body() {
+        let package = genesis_package();
+        let body = std::collections::BTreeMap::from([("schema_version".to_owned(), 1_u32)]);
+
+        // A generation-2-only kind is rejected on the kind alone, before any
+        // schema selector is consulted.
+        for kind in [
+            RegistryEntryKind::ArrowBatchSchema,
+            RegistryEntryKind::LogEpochRecipe,
+            RegistryEntryKind::ParserContract,
+        ] {
+            let entry = legacy_entry(&package, kind, "generation2.reserved", 1, &body);
+            let error = decode_successor_entry(&entry).unwrap_err();
+            assert!(
+                matches!(&error, ContractError::Schema(message)
+                    if message.contains("generation-2-only kind")),
+                "{error:?}"
+            );
+        }
+
+        // A reserved v2 triple names a kind that does exist at v1, so only the
+        // closed slot table can tell it apart from a dispatched selector.
+        for (kind, schema_id) in [
+            (RegistryEntryKind::CoverageProof, "registry.coverage_proof"),
+            (RegistryEntryKind::EpisodePolicy, "registry.episode_policy"),
+            (
+                RegistryEntryKind::NormativeBindingSchema,
+                "registry.normative_binding_schema",
+            ),
+            (
+                RegistryEntryKind::ObserverAdmission,
+                "registry.observer_admission",
+            ),
+        ] {
+            assert_eq!(
+                classify_body_schema_triple(kind, schema_id, SUCCESSOR_SCHEMA_VERSION),
+                BodySchemaSlotClassV1::Generation2Reserved
+            );
+            let mut entry = legacy_entry(&package, kind, "generation2.reserved", 1, &body);
+            entry.entry_schema_version = SUCCESSOR_SCHEMA_VERSION;
+            let error = decode_successor_entry(&entry).unwrap_err();
+            assert!(
+                matches!(&error, ContractError::Schema(message)
+                    if message.contains("reserved generation-2 body schema")),
+                "{error:?}"
+            );
+        }
+
+        // An unknown triple stays on the existing unsupported-selector path.
+        let mut unknown = legacy_entry(
+            &package,
+            RegistryEntryKind::RetentionPolicy,
+            "retention.default",
+            1,
+            &body,
+        );
+        unknown.entry_schema_version = SUCCESSOR_SCHEMA_VERSION;
+        assert_eq!(
+            classify_body_schema_triple(
+                RegistryEntryKind::RetentionPolicy,
+                "registry.retention_policy",
+                SUCCESSOR_SCHEMA_VERSION,
+            ),
+            BodySchemaSlotClassV1::Unknown
+        );
+        let error = decode_successor_entry(&unknown).unwrap_err();
+        assert!(
+            matches!(&error, ContractError::Schema(message)
+                if message.contains("unsupported successor registry selector")),
+            "{error:?}"
         );
     }
 }

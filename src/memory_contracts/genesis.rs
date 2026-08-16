@@ -710,6 +710,9 @@ impl TryFrom<ManifestVerifiedRegistryPackage> for SemanticallyClosedGenesisPacka
 pub(crate) fn decode_entry(
     entry: &RegistryEntryV1,
 ) -> ContractResult<SemanticallyDecodedGenesisEntryV1> {
+    if entry.kind.is_generation2_only() {
+        return Err(generation2_only_kind_error(entry));
+    }
     validate_entry_schema_selector(entry)?;
     reject_dynamic_policy_constructs(&entry.body)?;
 
@@ -1055,7 +1058,27 @@ pub(crate) fn decode_entry(
             )?;
             SemanticallyDecodedGenesisEntryV1::RetentionPolicy(decode_body(&entry.body)?)
         }
+        // Generation-2-only kinds have no v1 body schema. The closed dispatch
+        // keeps them visible here so a later typed body cannot be added by
+        // widening a wildcard arm.
+        RegistryEntryKind::ArrowBatchSchema
+        | RegistryEntryKind::LogEpochRecipe
+        | RegistryEntryKind::ParserContract => return Err(generation2_only_kind_error(entry)),
     })
+}
+
+/// Explicit fail-closed rejection for a kind that no generation-1 body schema
+/// covers.
+///
+/// Both the genesis closure and the generic successor closure return this exact
+/// error, so a package that names a generation-2-only kind is rejected with the
+/// same reason wherever it is offered.
+pub(crate) fn generation2_only_kind_error(entry: &RegistryEntryV1) -> ContractError {
+    ContractError::Schema(format!(
+        "registry entry {} names generation-2-only kind {}, which has no wired body schema",
+        entry.entry_id,
+        entry.kind.as_str()
+    ))
 }
 
 fn validate_entry_schema_selector(entry: &RegistryEntryV1) -> ContractResult<()> {
@@ -2494,5 +2517,30 @@ mod tests {
         ]));
         assert!(require_exact_fields(&value, &["a", "b"]).is_ok());
         assert!(require_exact_fields(&value, &["b", "a"]).is_err());
+    }
+
+    #[test]
+    fn generation2_only_kinds_have_no_v1_body_schema() {
+        // The selector these entries carry is exactly the one a v1 entry of
+        // this kind would carry, so only the kind itself can reject them.
+        let body = BTreeMap::from([("schema_version".to_owned(), 1_u32)]);
+        for kind in [
+            RegistryEntryKind::ArrowBatchSchema,
+            RegistryEntryKind::LogEpochRecipe,
+            RegistryEntryKind::ParserContract,
+        ] {
+            assert!(kind.is_generation2_only());
+            let candidate = entry(kind, "generation2.reserved", &body);
+            assert_eq!(
+                candidate.entry_schema_id.as_str(),
+                format!("registry.{}", kind.as_str())
+            );
+            let error = decode_entry(&candidate).unwrap_err();
+            assert!(
+                matches!(&error, ContractError::Schema(message)
+                    if message.contains("generation-2-only kind")),
+                "{error:?}"
+            );
+        }
     }
 }
