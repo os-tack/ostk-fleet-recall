@@ -150,7 +150,22 @@ pub enum DigestDomain {
     // --- W0-COVER domains ---
 
     // --- W0-CHUNK domains ---
-
+    /// W0-CHUNK. Chunk-occurrence identity preimage (source URI + parser key + spans).
+    ChunkOccurrenceV1,
+    /// W0-CHUNK. Parse-run manifest preimage (parser key + ordered occurrence IDs).
+    ParseManifestV1,
+    /// W0-CHUNK. Parser/extractor key preimage (artifact + version + configuration).
+    ParserKeyV1,
+    /// W0-CHUNK. Raw source-byte span preimage, distinct from extracted body identity.
+    SourceSpanV1,
+    /// W0-CHUNK. Supersession link between one predecessor and successor manifest.
+    ManifestSupersessionV1,
+    /// W0-CHUNK. Current-generation parser pointer, used in a CAS switch preimage.
+    GenerationPointerV1,
+    /// W0-CHUNK. Embedding identity preimage (input selector + model + tokenization).
+    EmbeddingIdentityV1,
+    /// W0-CHUNK. Protection-domain-keyed external storage identity preimage.
+    StorageIdentityV1,
     // --- W0-EPIS domains ---
 
     // --- W0-OBS domains ---
@@ -247,7 +262,14 @@ impl DigestDomain {
             // --- W0-COVER prefixes ---
 
             // --- W0-CHUNK prefixes ---
-
+            Self::ChunkOccurrenceV1 => "ostk-chunk-occurrence-v1",
+            Self::ParseManifestV1 => "ostk-parse-manifest-v1",
+            Self::ParserKeyV1 => "ostk-parser-key-v1",
+            Self::SourceSpanV1 => "ostk-source-span-v1",
+            Self::ManifestSupersessionV1 => "ostk-manifest-supersession-v1",
+            Self::GenerationPointerV1 => "ostk-generation-pointer-v1",
+            Self::EmbeddingIdentityV1 => "ostk-embedding-identity-v1",
+            Self::StorageIdentityV1 => "ostk-storage-identity-v1",
             // --- W0-EPIS prefixes ---
 
             // --- W0-OBS prefixes ---
