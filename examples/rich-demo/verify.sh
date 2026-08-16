@@ -177,8 +177,8 @@ line_count=$(wc -l < "$input" | tr -d '[:space:]')
 case $line_count in
     ''|*[!0-9]*) fail "line count is not numeric" ;;
 esac
-if [ "$line_count" -ne 3340 ]; then
-    fail "record count must be exactly 3340 (found $line_count)"
+if [ "$line_count" -ne 3389 ]; then
+    fail "record count must be exactly 3389 (found $line_count)"
 fi
 
 if awk 'length($0) > 16384 { exit 1 }' "$input"; then
@@ -366,16 +366,33 @@ if ! jq -s -e \
         | map(split("|")[0])
         | sort) as $expected_repository_sources
     | ($expected_doc_sources | length) == 32
-    and ($expected_repository_sources | length) == 222
+    and ($expected_repository_sources | length) == 224
     and
     ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 725
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 2409
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 2458
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:docs:v1") | .source_id] | unique | sort)
         == $expected_doc_sources
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1") | .source_id] | unique | sort)
         == $expected_repository_sources
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/bin/ostk-control-bootstrap.rs"
+        )] | length) == 11
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/bin/ostk-registry-activate.rs"
+        )] | length) == 22
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/bin/ostk-registry-successor-activate.rs"
+        )] | length) == 37
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/private_postgres.rs"
+        )] | length) == 10
+    and ([.[] | select(.source_id == "src/config.rs")] | length) == 0
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1") | .source_id] | unique | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1") | .source_id] | sort)
         == ["src/application.rs", "src/mcp/tools.rs"]
@@ -657,11 +674,45 @@ if ! jq -s -e '
     fail "multi-week decision, supersession, retraction, or conflict mix is incomplete"
 fi
 
+sensitive_projection() {
+    jq -c '
+        def scrub_public_postgres_fixtures:
+            [
+                ("postgresql://" + "writer:secret@" + "db.example:26257/fleet_recall?sslmode=verify-full"),
+                ("postgresql://" + "writer:secret@" + "127.0.0.1:26257/fleet_recall?sslmode=disable"),
+                ("postgresql://" + "writer:secret@" + "%2Fvar%2Frun%2Fpostgres:26257/fleet_recall?sslmode=verify-full"),
+                ("postgresql://" + "writer:secret@" + "db.example:26257/fleet_recall?sslmode=verify-full&options=-csearch_path%3Dattacker"),
+                ("postgresql://" + "writer:secret@" + "db.example/fleet_recall?sslmode=verify-full"),
+                ("postgresql://" + "writer:secret@" + "db.example:0/fleet_recall?sslmode=verify-full"),
+                ("postgresql://" + "writer:secret@" + "db.example:26257/?sslmode=verify-full")
+            ] as $fixtures
+            | reduce $fixtures[] as $fixture (
+                .;
+                split($fixture) | join("postgresql://public-test-fixture")
+            );
+        def scrub_public_successor_postgres_fixture:
+            split(
+                "postgresql://" + "successor:explicit-secret@"
+                + "cluster.example:26257/fleet_recall?sslmode=verify-full"
+            )
+            | join("postgresql://public-test-fixture");
+
+        if .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/private_postgres.rs"
+        then .text |= scrub_public_postgres_fixtures
+        elif .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/bin/ostk-registry-successor-activate.rs"
+        then .text |= scrub_public_successor_postgres_fixture
+        else .
+        end
+    ' "$input"
+}
+
 sensitive_pattern='(AKIA|ASIA)[A-Z0-9]{16}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|postgres(ql)?://[^[:space:]/:@]+:[^[:space:]@]+@|(sk|rk)-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|eyJ[A-Za-z0-9_-]{10,}[.]eyJ[A-Za-z0-9_-]{10,}|[Aa]uthorization:[[:space:]]*[Bb]earer[[:space:]]+[A-Za-z0-9._~-]{16,}|arn:aws:[^:[:space:]]*:[^:[:space:]]*:[0-9]{12}:'
-if grep -Eiq "$sensitive_pattern" "$input"; then
+if sensitive_projection | grep -Eiq "$sensitive_pattern"; then
     fail "input contains a credential, private-key, account-ARN, or token-like pattern"
 fi
-if jq -r '.. | strings' "$input" | grep -Eiq "$sensitive_pattern"; then
+if sensitive_projection | jq -r '.. | strings' | grep -Eiq "$sensitive_pattern"; then
     fail "input contains an encoded credential, account-ARN, or token-like string"
 fi
 

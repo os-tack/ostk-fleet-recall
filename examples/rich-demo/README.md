@@ -40,8 +40,8 @@ Run the deterministic reproduction test with:
 ./examples/rich-demo/test.sh
 ```
 
-The verifier requires exactly 3,340 unique chunks: 725 documentation chunks
-from 32 sources, 2,409 repository chunks from 222 source/configuration files,
+The verifier requires exactly 3,389 unique chunks: 725 documentation chunks
+from 32 sources, 2,458 repository chunks from 224 source/configuration files,
 the two exact self-audit code excerpts, and 204 operations records across twelve
 weeks. It also requires the expected decision and correction mix, zero-based
 per-source chunk indexes, bounded physical lines and text, only the public
@@ -54,10 +54,13 @@ remain absent from the demo corpus.
 The publication boundary excludes binary media, dependency and Terraform lock
 files, generated example corpora, evidence receipts, license/vendor text,
 ignored or private files, and a small explicit set of public test fixtures whose
-dummy URLs or AWS account IDs intentionally resemble credentials. Excluding
-those fixture-bearing files keeps the decoded-output sensitive scan fail-closed
-without redacting or weakening exact source evidence. The manifests enumerate
-what is admitted; they do not crawl the operator's worktree at image-build time.
+dummy URLs or AWS account IDs intentionally resemble credentials. The admitted
+`src/private_postgres.rs` connection-policy source and private successor CLI are
+the narrow exceptions: their closed sets of inert credential-shaped URL
+fixtures are removed only from the final sensitive-pattern projection after
+exact source-coordinate verification. Any different credential-bearing URL
+still fails the scan. The manifests enumerate what is admitted; they do not
+crawl the operator's worktree at image-build time.
 
 Documentation and code `source_id` values are the original repository-relative
 paths. Repository records use `source: "code"`,

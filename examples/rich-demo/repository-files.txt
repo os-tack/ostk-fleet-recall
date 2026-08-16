@@ -171,6 +171,7 @@ migrations/0014_registry_current_head_v2.sql|database_schema|sql
 src/application.rs|application_code|rust
 src/bin/ostk-control-bootstrap.rs|control_bootstrap|rust
 src/bin/ostk-registry-activate.rs|registry_activation|rust
+src/bin/ostk-registry-successor-activate.rs|successor_activation|rust
 src/context.rs|application_code|rust
 src/control_log/cockroach.rs|control_ledger|rust
 src/control_log/mod.rs|control_ledger|rust
@@ -212,6 +213,7 @@ src/memory_contracts/successor_activation.rs|successor_activation|rust
 src/memory_contracts/successor_package.rs|memory_contracts|rust
 src/memory_contracts/successor_policy.rs|memory_contracts|rust
 src/memory_contracts/vectors.rs|memory_contracts|rust
+src/private_postgres.rs|database_security|rust
 src/reference_agent.rs|reference_agent|rust
 src/registry_activation/cockroach.rs|registry_activation|rust
 src/registry_activation/genesis_audit.rs|registry_activation|rust

@@ -106,6 +106,10 @@ git -C "$repo_root" ls-files |
             # fixtures; the decoded sensitive-pattern gate remains unchanged.
             deploy/cockroach/tests/control-bootstrap-cli.sh) continue ;;
             deploy/cockroach/tests/registry-activation-cli.sh) continue ;;
+            deploy/cockroach/tests/successor-activation-cli.sh) continue ;;
+            # Runtime configuration contains deliberate credential-shaped
+            # negative fixtures. The connection-policy module is admitted via
+            # the verifier's exact closed fixture projection instead.
             src/config.rs) continue ;;
         esac
         printf '%s\n' "$path"
@@ -124,11 +128,20 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 3340
+    length == 3389
     and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 725
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 2409
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 2458
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "src/bin/ostk-control-bootstrap.rs")] | length) == 11
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "src/bin/ostk-registry-activate.rs")] | length) == 22
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "src/bin/ostk-registry-successor-activate.rs")] | length) == 37
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "src/private_postgres.rs")] | length) == 10
+    and ([.[] | select(.source_id == "src/config.rs")] | length) == 0
 ' "$first" >/dev/null; then
     printf 'rich demo verification failed: exact repository corpus composition changed\n' >&2
     exit 1
@@ -221,7 +234,10 @@ if "$script_dir/verify.sh" "$authority" >/dev/null 2>&1; then
     exit 1
 fi
 
-jq -s -c '.[0].text += (" AK" + "IA" + ("0" * 16)) | .[]' "$first" > "$sensitive"
+jq -s -c '
+    .[0].text += (" postgresql://" + "attacker:secret@" + "db.example:26257/fleet")
+    | .[]
+' "$first" > "$sensitive"
 if "$script_dir/verify.sh" "$sensitive" >/dev/null 2>&1; then
     printf 'rich demo verification failed: verifier accepted a credential-like pattern\n' >&2
     exit 1
