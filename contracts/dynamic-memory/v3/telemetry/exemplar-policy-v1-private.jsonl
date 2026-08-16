@@ -1,0 +1,1 @@
+{"biased_extrema":false,"policy_id":"telemetry.exemplar.default","policy_version":1,"public_activation":null,"schema_version":1,"selector":"deterministic_stratified_hash_v1","visibility":"private"}

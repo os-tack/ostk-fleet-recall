@@ -199,7 +199,13 @@ pub enum DigestDomain {
     /// Bounded dead-letter record for one rejected/quarantined delivery.
     QuarantineRecordV1,
     // --- W0-TELEM domains ---
-
+    /// Bounded telemetry measurement receipt identity (RUN-01..03).
+    MeasurementReceiptV1,
+    /// SLO/rule evaluation identity, distinct from its cited receipts.
+    SloEvaluationV1,
+    /// Exemplar content identity and `deterministic_stratified_hash_v1`
+    /// per-record ordering-key preimage.
+    ExemplarSelectionV1,
     // --- W0-CAUSE domains ---
 
     // --- W0-ACT domains ---
@@ -322,7 +328,9 @@ impl DigestDomain {
             // --- W0-QUAR prefixes ---
             Self::QuarantineRecordV1 => "ostk-quarantine-record-v1",
             // --- W0-TELEM prefixes ---
-
+            Self::MeasurementReceiptV1 => "ostk-measurement-receipt-v1",
+            Self::SloEvaluationV1 => "ostk-slo-evaluation-v1",
+            Self::ExemplarSelectionV1 => "ostk-exemplar-selection-v1",
             // --- W0-CAUSE prefixes ---
 
             // --- W0-ACT prefixes ---
