@@ -319,10 +319,14 @@ pub enum NormativeLifecycleKindV1 {
 /// `supersedes_statement_id` is required exactly when `kind` is
 /// [`NormativeLifecycleKindV1::Supersession`] and forbidden otherwise: a
 /// supersession without an explicit target, or a non-supersession event that
-/// names one, is invalid shape. `waiver_reference_digest` is a reference-only
-/// pointer into the separate, durable waiver system (`DISC-05`); a waiver
-/// scopes and expires policy exceptions but never deactivates the underlying
-/// expectation, so this module does not model waiver semantics itself.
+/// names one, is invalid shape. A supersession event may never name itself
+/// as its own supersession target (`supersedes_statement_id ==
+/// Some(statement_id)` is rejected), mirroring the identical self-reference
+/// guard on [`RetroactiveCorrectionV1`]. `waiver_reference_digest` is a
+/// reference-only pointer into the separate, durable waiver system
+/// (`DISC-05`); a waiver scopes and expires policy exceptions but never
+/// deactivates the underlying expectation, so this module does not model
+/// waiver semantics itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormativeLifecycleEventV1 {
@@ -349,6 +353,7 @@ impl NormativeLifecycleEventV1 {
         if self.schema_version != LIFECYCLE_SCHEMA_VERSION
             || !supersession_target_consistent
             || self.supersedes_statement_id == Some(Sha256Digest::ZERO)
+            || self.supersedes_statement_id == Some(self.statement_id)
         {
             return Err(ContractError::Schema(
                 "invalid normative lifecycle event v1".into(),
@@ -529,6 +534,9 @@ mod tests {
 
     const PROPOSAL_POSITIVE_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/normative/proposal-positive.jsonl");
+    const PROPOSAL_POSITIVE_BOUNDED_INTERVAL_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/normative/proposal-positive-bounded-interval.jsonl"
+    );
     const PROPOSAL_NEGATIVE_UNSORTED_PROPOSITIONS_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/normative/proposal-negative-unsorted-propositions.jsonl"
     );
@@ -544,12 +552,18 @@ mod tests {
     const RECEIPT_NEGATIVE_AUTHOR_ONLY_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/normative/receipt-negative-author-only.jsonl"
     );
+    const RECEIPT_NEGATIVE_AUTHOR_ONLY_HONEST_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/normative/receipt-negative-author-only-honest.jsonl"
+    );
     const LIFECYCLE_ACTIVATION_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/normative/lifecycle-activation.jsonl");
     const LIFECYCLE_SUPERSESSION_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/normative/lifecycle-supersession.jsonl");
     const LIFECYCLE_NEGATIVE_MISSING_SUPERSEDES_TARGET_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/normative/lifecycle-negative-missing-supersedes-target.jsonl"
+    );
+    const LIFECYCLE_NEGATIVE_SELF_SUPERSESSION_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/normative/lifecycle-negative-self-supersession.jsonl"
     );
     const CONTESTED_POSITIVE_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/normative/contested-positive.jsonl");
@@ -578,6 +592,8 @@ mod tests {
         "4a2b35d9bb149e8edae89ea8d9cc61c8d96075d56ba6299a882e602114c58ec7";
     const EXPECTED_CONTESTED_ID: &str =
         "103d1d2b73e0a6f29b60ae47247aa473c6faaee60b4d952d785bcaf60c245f57";
+    const EXPECTED_PROPOSAL_BOUNDED_INTERVAL_STATEMENT_ID: &str =
+        "e46f5ee01f2e5769c1e97a09b2839c5001ac6dfd876d306813d9326f7e3858ae";
 
     // Exact raw sha256 over every fixture file's full bytes (including its
     // trailing LF), pinned independently of any typed decode. This is the
@@ -593,6 +609,8 @@ mod tests {
     // decode and still happens to be rejected by `validate()`.
     const PROPOSAL_POSITIVE_RAW_SHA256: &str =
         "8f8576ac7b4480d467183abc0e892235c2b423154a008019e5c8409b006f3b3e";
+    const PROPOSAL_POSITIVE_BOUNDED_INTERVAL_RAW_SHA256: &str =
+        "2e99d00ed3d9aa3c9b9858f4316b0d15b08ca704937d63ed778a7ee939ac39dd";
     const PROPOSAL_NEGATIVE_UNSORTED_PROPOSITIONS_RAW_SHA256: &str =
         "c3d6d6b00b0037f6888297ac5ea98b388028d91e1f11e4c5b3198eacec64cf25";
     const PROPOSAL_NEGATIVE_OVERLAPPING_SPANS_RAW_SHA256: &str =
@@ -603,12 +621,16 @@ mod tests {
         "a953be98bae5dd78600cba231911a142e8f927b71410456cff234b64bf47f2a8";
     const RECEIPT_NEGATIVE_AUTHOR_ONLY_RAW_SHA256: &str =
         "c75d5ddcc775a7cf84c2e6c73ab1a2b4f8c1b2adb3054c0cf9cdead1eec590eb";
+    const RECEIPT_NEGATIVE_AUTHOR_ONLY_HONEST_RAW_SHA256: &str =
+        "596e4ed80bb5527a97d4f8fe0aaff8893b5358244802dddc581442a71b7b3b1a";
     const LIFECYCLE_ACTIVATION_RAW_SHA256: &str =
         "13e222e822903c06cee547b608a046498663b9ea387c1cc451a867a892f0c414";
     const LIFECYCLE_SUPERSESSION_RAW_SHA256: &str =
         "4ff7e019554d73aeca3a3e6daadf7a4fc5667504208005daf8ddd0f79b017249";
     const LIFECYCLE_NEGATIVE_MISSING_SUPERSEDES_TARGET_RAW_SHA256: &str =
         "29cd34788fdd8898a6404cc4f38107b5cadd680507d9efa0ca749576c3454874";
+    const LIFECYCLE_NEGATIVE_SELF_SUPERSESSION_RAW_SHA256: &str =
+        "47ef8010322f0bf79001cf277af65370557f695deef9bbc83d1b02c629cf912d";
     const CONTESTED_POSITIVE_RAW_SHA256: &str =
         "93e83ab63ca50f39143db6ba941c3090b8cf637a8ba2675f6b9666dcaff74183";
     const CONTESTED_NEGATIVE_SINGLE_STATEMENT_RAW_SHA256: &str =
@@ -620,7 +642,7 @@ mod tests {
     const RETROACTIVE_NEGATIVE_ORDINARY_POLICY_RAW_SHA256: &str =
         "5b37b425ca9b5a956ef29032d6a19eb739e304bd15f4dbd6baad3c86f84a75bb";
     const VECTOR_SUITE_RAW_SHA256: &str =
-        "96184b84a4496aa8ef1fe5d5ba288afb3cc46be03df5518783075b368848d3f5";
+        "ea3ee93f7ee91e097ed027d96148ede17181011cbd6c2484cae19f23ae9a0a45";
 
     fn raw_sha256(bytes: &[u8]) -> String {
         use sha2::{Digest as _, Sha256};
@@ -724,6 +746,19 @@ mod tests {
             proposer_principal_id: ContractId::new("principal.agent").unwrap(),
             source_author_principal_id: ContractId::new("principal.author").unwrap(),
         }
+    }
+
+    /// A proposal whose effective interval is bounded on both ends, unlike
+    /// `proposal()` (and every fixture generated from it), which always
+    /// leaves `effective_until: None`. This exercises the closed form of
+    /// `intervals_overlap`'s `b_before_a_end` term (the branch that consults
+    /// the *proposal's own* upper bound, not just the compared binding's),
+    /// which no other fixture or inline proposal in this module reaches.
+    fn bounded_proposal() -> NormativeBindingProposalV2 {
+        let mut proposal = proposal();
+        proposal.effective_until =
+            Some(CanonicalTimestamp::parse("2026-09-01T00:00:00.000000000Z").unwrap());
+        proposal
     }
 
     fn receipt(
@@ -840,6 +875,23 @@ mod tests {
         assert!(invalid.validate().is_err());
     }
 
+    /// AUTH-04: a bounded effective interval whose `effective_until` is at or
+    /// before its own `effective_from` is invalid shape, regardless of the
+    /// two-binding overlap check below. Every other proposal fixture and
+    /// inline value in this module leaves `effective_until: None`, so this
+    /// is the only vector that reaches this guard at all.
+    #[test]
+    fn effective_until_at_or_before_effective_from_is_rejected() {
+        let mut equal = bounded_proposal();
+        equal.effective_until = Some(equal.effective_from.clone());
+        assert!(equal.validate().is_err());
+
+        let mut before = bounded_proposal();
+        before.effective_until =
+            Some(CanonicalTimestamp::parse("2020-01-01T00:00:00.000000000Z").unwrap());
+        assert!(before.validate().is_err());
+    }
+
     // --- stale composite CAS ---
 
     #[test]
@@ -938,6 +990,51 @@ mod tests {
         );
     }
 
+    /// AUTH-04: `intervals_overlap`'s `b_before_a_end` term consults the
+    /// *proposal's own* upper bound (`until_a`, i.e. `effective_until`) when
+    /// deciding overlap. Every other overlap test in this module uses
+    /// `proposal()`, whose `effective_until` is always `None`, so
+    /// `b_before_a_end` is unconditionally `true` there and this term is
+    /// never actually exercised. Here the active binding starts strictly
+    /// after the bounded proposal's own `effective_until`, so the two
+    /// intervals do not overlap and no explicit supersession is required.
+    /// Replacing `b_before_a_end` with a hard-coded `true` would make this
+    /// (currently non-conflicting) pair register as an incompatible overlap.
+    #[test]
+    fn bounded_proposal_ending_before_active_binding_starts_does_not_conflict() {
+        let active_statement_id = label_digest("active-statement");
+        let successor = bounded_proposal();
+        assert!(
+            successor
+                .require_non_conflicting_activation(
+                    &successor.binding_family_id,
+                    active_statement_id,
+                    &CanonicalTimestamp::parse("2027-01-01T00:00:00.000000000Z").unwrap(),
+                    None,
+                )
+                .is_ok()
+        );
+    }
+
+    /// The same bounded proposal against an active binding that starts
+    /// *inside* its `[effective_from, effective_until)` window is a genuine
+    /// overlap and is rejected absent an explicit supersession target.
+    #[test]
+    fn bounded_proposal_overlapping_active_binding_without_explicit_supersession_is_rejected() {
+        let active_statement_id = label_digest("active-statement");
+        let successor = bounded_proposal();
+        assert!(
+            successor
+                .require_non_conflicting_activation(
+                    &successor.binding_family_id,
+                    active_statement_id,
+                    &CanonicalTimestamp::parse("2026-08-20T00:00:00.000000000Z").unwrap(),
+                    None,
+                )
+                .is_err()
+        );
+    }
+
     // --- separation of duty ---
 
     /// The shared message for every structural receipt guard (schema
@@ -972,6 +1069,37 @@ mod tests {
         );
         assert_eq!(
             author_only.validate(),
+            Err(ContractError::Schema(RECEIPT_SOD_MISMATCH_ERROR.into()))
+        );
+    }
+
+    /// AUTH-03: the honest (declared false, derived false) quadrant. The two
+    /// vectors above only ever cover a *disagreeing* declared flag —
+    /// `author_only_approval_is_rejected` declares `true` when the derived
+    /// verdict is `false`, and `declared_satisfied_flag_disagreeing_with_approvals_is_rejected`
+    /// declares `false` when the derived verdict is `true`. Neither exercises
+    /// an author-only receipt that honestly declares `separation_of_duty_satisfied:
+    /// false`. `validate()`'s guard is
+    /// `derived_verdict != self.separation_of_duty_satisfied || !self.separation_of_duty_satisfied`:
+    /// the second disjunct is what rejects *this* receipt (derived and
+    /// declared agree, both `false`), and it is the disjunct a reviewer's
+    /// mutation test deleted while every existing test kept passing.
+    /// Deleting `|| !self.separation_of_duty_satisfied` makes this test the
+    /// one that fails, because after that deletion the (false, false) pair
+    /// satisfies `derived_verdict != self.separation_of_duty_satisfied ==
+    /// false` and `validate()` would return `Ok(())`.
+    #[test]
+    fn honestly_declared_unsatisfied_sod_with_author_only_approval_is_still_rejected() {
+        let statement_id = label_digest("statement");
+        let honestly_declared_unsatisfied = receipt(
+            statement_id,
+            "principal.author",
+            &["principal.author"],
+            1,
+            false,
+        );
+        assert_eq!(
+            honestly_declared_unsatisfied.validate(),
             Err(ContractError::Schema(RECEIPT_SOD_MISMATCH_ERROR.into()))
         );
     }
@@ -1074,6 +1202,29 @@ mod tests {
             waiver_reference_digest: None,
         };
         assert!(event.validate().is_err());
+    }
+
+    /// AUTH-04: a supersession event may not name itself as its own
+    /// supersession target. Without this guard, a runtime applying this
+    /// event would retire the very statement it names as its own successor,
+    /// leaving the binding family with no active binding while appearing to
+    /// have executed a valid, policy-governed supersession. This mirrors the
+    /// self-reference guard already present on `RetroactiveCorrectionV1`
+    /// (`statement_id == superseded_as_known_statement_id`).
+    #[test]
+    fn a_supersession_event_naming_itself_as_its_own_target_is_rejected() {
+        let statement_id = label_digest("statement");
+        let self_referential = NormativeLifecycleEventV1 {
+            schema_version: 1,
+            kind: NormativeLifecycleKindV1::Supersession,
+            binding_family_id: ContractId::new("slo.home.errors").unwrap(),
+            statement_id,
+            registry_head: registry_head("2026-01-01T00:00:00.000000000Z"),
+            effective_at: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
+            supersedes_statement_id: Some(statement_id),
+            waiver_reference_digest: None,
+        };
+        assert!(self_referential.validate().is_err());
     }
 
     #[test]
@@ -1298,6 +1449,21 @@ mod tests {
     }
 
     #[test]
+    fn fixture_proposal_positive_bounded_interval_matches_expected_statement_id() {
+        let fixture: NormativeBindingProposalV2 =
+            decode_strict(record(PROPOSAL_POSITIVE_BOUNDED_INTERVAL_FIXTURE)).unwrap();
+        assert!(fixture.effective_until.is_some());
+        assert_eq!(
+            encode_canonical(&fixture).unwrap(),
+            record(PROPOSAL_POSITIVE_BOUNDED_INTERVAL_FIXTURE)
+        );
+        assert_eq!(
+            fixture.statement_id().unwrap(),
+            digest(EXPECTED_PROPOSAL_BOUNDED_INTERVAL_STATEMENT_ID)
+        );
+    }
+
+    #[test]
     fn fixture_proposal_negatives_fail_closed() {
         let unsorted: NormativeBindingProposalV2 =
             decode_strict(record(PROPOSAL_NEGATIVE_UNSORTED_PROPOSITIONS_FIXTURE)).unwrap();
@@ -1331,6 +1497,22 @@ mod tests {
         assert!(fixture.validate().is_err());
     }
 
+    /// The honest-declaration companion to the fixture above: this one
+    /// truthfully declares `separation_of_duty_satisfied: false` for the
+    /// same author-only, threshold-met shape. See
+    /// `honestly_declared_unsatisfied_sod_with_author_only_approval_is_still_rejected`
+    /// for why this quadrant matters independently of the falsely-declared
+    /// one.
+    #[test]
+    fn fixture_receipt_negative_author_only_honest_declaration_fails_closed() {
+        let fixture: NormativeActivationReceiptV2 =
+            decode_strict(record(RECEIPT_NEGATIVE_AUTHOR_ONLY_HONEST_FIXTURE)).unwrap();
+        assert_eq!(
+            fixture.validate(),
+            Err(ContractError::Schema(RECEIPT_SOD_MISMATCH_ERROR.into()))
+        );
+    }
+
     #[test]
     fn fixture_lifecycle_events_match_expected_ids() {
         let activation: NormativeLifecycleEventV1 =
@@ -1354,6 +1536,10 @@ mod tests {
         let negative: NormativeLifecycleEventV1 =
             decode_strict(record(LIFECYCLE_NEGATIVE_MISSING_SUPERSEDES_TARGET_FIXTURE)).unwrap();
         assert!(negative.validate().is_err());
+
+        let self_referential: NormativeLifecycleEventV1 =
+            decode_strict(record(LIFECYCLE_NEGATIVE_SELF_SUPERSESSION_FIXTURE)).unwrap();
+        assert!(self_referential.validate().is_err());
     }
 
     #[test]
@@ -1423,6 +1609,10 @@ mod tests {
         for (bytes, expected_raw_sha256) in [
             (PROPOSAL_POSITIVE_FIXTURE, PROPOSAL_POSITIVE_RAW_SHA256),
             (
+                PROPOSAL_POSITIVE_BOUNDED_INTERVAL_FIXTURE,
+                PROPOSAL_POSITIVE_BOUNDED_INTERVAL_RAW_SHA256,
+            ),
+            (
                 PROPOSAL_NEGATIVE_UNSORTED_PROPOSITIONS_FIXTURE,
                 PROPOSAL_NEGATIVE_UNSORTED_PROPOSITIONS_RAW_SHA256,
             ),
@@ -1443,6 +1633,10 @@ mod tests {
                 RECEIPT_NEGATIVE_AUTHOR_ONLY_RAW_SHA256,
             ),
             (
+                RECEIPT_NEGATIVE_AUTHOR_ONLY_HONEST_FIXTURE,
+                RECEIPT_NEGATIVE_AUTHOR_ONLY_HONEST_RAW_SHA256,
+            ),
+            (
                 LIFECYCLE_ACTIVATION_FIXTURE,
                 LIFECYCLE_ACTIVATION_RAW_SHA256,
             ),
@@ -1453,6 +1647,10 @@ mod tests {
             (
                 LIFECYCLE_NEGATIVE_MISSING_SUPERSEDES_TARGET_FIXTURE,
                 LIFECYCLE_NEGATIVE_MISSING_SUPERSEDES_TARGET_RAW_SHA256,
+            ),
+            (
+                LIFECYCLE_NEGATIVE_SELF_SUPERSESSION_FIXTURE,
+                LIFECYCLE_NEGATIVE_SELF_SUPERSESSION_RAW_SHA256,
             ),
             (CONTESTED_POSITIVE_FIXTURE, CONTESTED_POSITIVE_RAW_SHA256),
             (
@@ -1494,7 +1692,7 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(entries.len(), 19);
+        assert_eq!(entries.len(), 25);
         for entry in &entries {
             assert!(!entry.invariant_ids.is_empty());
             assert!(
@@ -1547,6 +1745,16 @@ mod tests {
             &output,
             "proposal-positive.jsonl",
             &encode_canonical(&base_proposal).unwrap(),
+        );
+
+        // AUTH-04: unlike `base_proposal`, this one has a bounded
+        // `effective_until`, exercising the closed form of the effective
+        // interval and `intervals_overlap`'s `b_before_a_end` term.
+        let bounded_interval = bounded_proposal();
+        write(
+            &output,
+            "proposal-positive-bounded-interval.jsonl",
+            &encode_canonical(&bounded_interval).unwrap(),
         );
 
         let mut unsorted_propositions = proposal();
@@ -1619,6 +1827,23 @@ mod tests {
             &encode_canonical(&receipt_negative).unwrap(),
         );
 
+        // AUTH-03: the honest companion to the fixture above — declares
+        // `separation_of_duty_satisfied: false` truthfully for the same
+        // author-only, threshold-met shape (the (declared false, derived
+        // false) quadrant no other fixture or inline vector reaches).
+        let receipt_negative_honest_declaration = receipt(
+            statement_id,
+            "principal.author",
+            &["principal.author"],
+            1,
+            false,
+        );
+        write(
+            &output,
+            "receipt-negative-author-only-honest.jsonl",
+            &encode_canonical(&receipt_negative_honest_declaration).unwrap(),
+        );
+
         let activation_event = NormativeLifecycleEventV1 {
             schema_version: 1,
             kind: NormativeLifecycleKindV1::Activation,
@@ -1665,6 +1890,24 @@ mod tests {
             &output,
             "lifecycle-negative-missing-supersedes-target.jsonl",
             &encode_canonical(&lifecycle_negative).unwrap(),
+        );
+
+        // AUTH-04: a supersession event may not name itself as its own
+        // target — see `a_supersession_event_naming_itself_as_its_own_target_is_rejected`.
+        let lifecycle_self_supersession = NormativeLifecycleEventV1 {
+            schema_version: 1,
+            kind: NormativeLifecycleKindV1::Supersession,
+            binding_family_id: ContractId::new("slo.home.errors").unwrap(),
+            statement_id,
+            registry_head: registry_head("2026-01-01T00:00:00.000000000Z"),
+            effective_at: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
+            supersedes_statement_id: Some(statement_id),
+            waiver_reference_digest: None,
+        };
+        write(
+            &output,
+            "lifecycle-negative-self-supersession.jsonl",
+            &encode_canonical(&lifecycle_self_supersession).unwrap(),
         );
 
         let contested_positive = ContestedBindingV1 {
@@ -1753,6 +1996,10 @@ mod tests {
         );
 
         eprintln!("proposal_statement_id={statement_id}");
+        eprintln!(
+            "proposal_bounded_interval_statement_id={}",
+            bounded_interval.statement_id().unwrap()
+        );
         eprintln!("receipt_id={}", receipt_positive.receipt_id().unwrap());
         eprintln!(
             "lifecycle_activation_event_id={}",
