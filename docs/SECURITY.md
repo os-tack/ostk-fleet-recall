@@ -47,6 +47,16 @@ by naming another digest. Replays re-read and revalidate the persisted
 canonical bytes and their database projections; partial, orphaned, or
 mismatched state is corruption, never an implicit repair opportunity.
 
+The implemented first-successor process preserves the same offline-authority
+shape. Its workstation CLI accepts only eight bounded canonical artifact paths;
+the dedicated `FLEET_RECALL_SUCCESSOR_*` environment binds its physical and
+semantic scopes, bootstrap/genesis/target/runner/bridge pins, principals, and
+strict-TLS database URL. It verifies the artifact graph before connecting, then
+the repository reauthenticates the one-time bridge and candidate against the
+locked durable genesis root inside the serializable generation-0-to-1
+transition. This repository/CLI is source capability, not deployed SQL
+authority: no successor writer role or grant bundle exists.
+
 Accepted control and activation events are append-only and source-positioned.
 Bootstrap/activation transactions use one database acceptance time, scoped
 head locking and compare-and-swap, exact event positions and chain digests, and
@@ -55,57 +65,83 @@ serializable transaction; only CockroachDB SQLSTATE `40001` retries the whole
 operation. Application claim, support, conflict, event, and receipt mutations
 follow the same bounded idempotent/serializable rule.
 
-Current source embeds migrations 1 through 14. Migrations 3 through 9 add and
+Current source embeds migrations 1 through 17. Migrations 3 through 9 add and
 harden the private control and genesis-activation projections; migrations 10
-through 14 add exact genesis-root indexes and three durable successor tables.
-Normal recall, ingest, MCP, and public-demo health intentionally retain an
-additive minimum schema requirement of version 2; that serving compatibility
-check is not a release-completion or private-ceremony authorization gate. The
-current release target is the complete successful prefix 1 through 14. Stage 2
-still requires prefix 1 through 3, and the genesis Stage-3 repository still
-requires 1 through 9.
+through 14 add exact genesis-root indexes and three durable successor tables;
+and migrations 15 through 17 version conflict uniqueness by detector and add
+the exact reconciliation/current-projection indexes. Current release completion
+requires exactly the seventeen successful rows 1 through 17. Normal recall,
+remember, ingest, MCP, health, and public-demo paths require an uninterrupted
+successful prefix of at least 17 and remain compatible with later additive
+migrations. The private compatibility gates remain control 3, genesis 9,
+successor repository 14, and conflict reconciliation 16. A later successful row
+cannot mask a missing or failed prerequisite in any gate.
 
 Versions 1 through 11 are nontransactional schema changes; v10 and v11 recover
 an interrupted exact index through `IF NOT EXISTS` plus a fail-closed catalog
 shape assertion. Versions 12 through 14 run with SQLx bookkeeping in one
-transaction on a dedicated session with `autocommit_before_ddl = false`. The
-session is closed rather than returned to the runtime pool. These migration
-mechanics establish durable shape, not an application authorization boundary.
+transaction on a dedicated session with `autocommit_before_ddl = false`.
+Versions 15 through 17 return to resumable nontransactional online DDL: v15
+admits only its exact detector-index transition states and rewrites no conflict
+data; v16/v17 commit one covering backfill and assert its exact catalog shape.
+The dedicated session is closed rather than returned to the runtime pool.
+These mechanics establish durable shape, not an application authorization
+boundary.
 
 ## Identities, URLs, and secrets
 
 The current AWS Terraform has exactly two database credential paths: a
 least-privilege runtime URL and a distinct DDL-capable migrator URL, each from
-its own secret input. It has no bootstrap or registry-activation secret, task
-definition, route, or startup hook. When a private local ceremony is
-actually run, Stage 2 uses a third SQL principal and dedicated control URL;
-Stage 3 uses a fourth SQL principal and dedicated registry URL. Those one-shot
-credentials are never fallbacks for runtime or migration credentials and
-should be disabled or removed after the ceremony.
+its own secret input. It has no control-bootstrap, genesis-activation,
+successor, or conflict-reconciliation secret, IAM role, task definition, route,
+or startup hook. When a private local ceremony is actually run, Stage 2 uses a
+third SQL principal and dedicated control URL; genesis Stage 3 uses a fourth
+SQL principal and dedicated registry URL. Those one-shot credentials are never
+fallbacks for runtime or migration credentials and should be disabled or
+removed after the ceremony.
 
-There is no successor writer principal, repository, write-grant RBAC bundle,
-CLI, AWS task, startup hook, or public route. The checked-in
+The successor repository and workstation apply/inspect CLI exist, but there is
+no successor SQL writer principal/logical role, write-grant RBAC bundle, AWS
+task, production-image binary, startup hook, or public/runtime route. The
+checked-in
 [quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql)
 is deny-only: after prefix 1 through 14 it revokes every successor-table
-privilege from `public`, runtime,
-bootstrap, and genesis activation and grants nothing. Until the writer surface
-is implemented and reviewed together,
+privilege from `public`, runtime, bootstrap, and genesis activation and grants
+nothing. Until the SQL authorization and deployment surface is implemented and
+reviewed together,
 `memory_registry_transitions`,
 `memory_registry_genesis_bridge_consumptions`, and
 `memory_registry_current_heads_v2` remain migrator/schema-owner only. Neither
 the runtime user nor either existing one-shot role may receive access merely
 because the migrations and contracts exist.
 
+Conflict reconciliation has a different, explicitly implemented one-shot
+boundary. Only a cluster admin may apply the database-local policy; database
+ownership alone is insufficient. Apply the
+[`fleet_conflict_reconciliation` policy](../deploy/cockroach/conflict-reconciliation-role-grants.sql)
+after successful prefix 1 through 16 and the three prior logical roles are
+hardened. A separately provisioned login may temporarily receive
+membership only in that `NOLOGIN` logical role for the apply-only workstation
+CLI. Before every apply and use, an external operator audit must enumerate all
+other databases for direct grants/ownership and account separately for
+inherited `public` authority under a role/grant/schema-DDL change freeze. The
+SQL file cannot perform that cross-database audit. Remove membership or disable
+the login afterward. No Terraform, runtime, image, ECS, MCP, or HTTP wiring
+exists.
+
 All database URL surfaces require `postgres`/`postgresql`, a hostname, and a
 closed parameter set. Serving and Stage-2 control require exactly
 `sslmode=verify-full` outside the explicit local escape; that escape requires
 `FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1` and a loopback or Compose-only
-`cockroach` host. Stage-3 activation ignores the escape and always requires
-exactly `sslmode=verify-full`. The only additional accepted query parameter is
-one bounded absolute `sslrootcert` path. Fragments, duplicate parameters,
-aliases such as `options`, routing overrides, relative certificate paths, and
-unknown parameters fail closed. Do not set the local escape in cloud or shared
-environments. Debug output redacts database URLs and authority pins.
+`cockroach` host. Genesis Stage-3, successor, and reconciliation URLs ignore the
+escape and always require exactly `sslmode=verify-full`. Each private process
+uses only its dedicated variable and never falls back to a serving, migrator,
+or other ceremony URL. The only additional accepted query parameter is one
+bounded absolute `sslrootcert` path. Fragments, duplicate parameters, aliases
+such as `options`, routing overrides, relative certificate paths, and unknown
+parameters fail closed. Do not set the local escape in cloud or shared
+environments. Debug output redacts database URLs, authority pins, and bound
+reconciliation scope.
 
 Apply the exact current-object/PUBLIC policies and normalized grant proofs in
 [MIGRATIONS.md](MIGRATIONS.md) and
@@ -115,6 +151,24 @@ privileges, and receive only the table operations required by their reviewed
 one-shot repositories. Re-audit actual migrator default privileges after every
 migration; broad `ALL TABLES` or future-object grants would defeat this
 boundary.
+
+## Conflict-detector lineage
+
+`same_key_functional_value_v2` is an immutable, proposition-aware contract for
+one functional `subject::predicate` key over overlapping half-open intervals.
+Different affirmative values conflict; affirmation and negation conflict only
+when they name the same exact JSONB value; two negations are compatible. This
+is typed proposition comparison, not natural-language inference or a general
+set-valued predicate rule.
+
+Rows written by the original `same_key_typed_value` detector keep their
+original meaning. Normal v2 writes fail closed on an unreconciled legacy
+lineage rather than append to it or relabel it. The reconciliation repository
+locks one exact legacy conflict revision, preserves the legacy row and
+memberships byte-for-byte, derives a complete bounded v2 pair graph, and
+appends a distinct v2 lineage, idempotency receipt, audit event, and any
+claim-state transitions atomically. A compatible graph produces a durable
+dismissed v2 lineage; it never deletes the legacy evidence.
 
 ## Residual SQL authority and recovery
 
@@ -127,10 +181,21 @@ predecessor index prevents one class of fork but cannot prove a new event is
 the head-authorized append. These credentials are therefore exclusive
 ceremony capabilities, not operator shells or general service accounts.
 
-The existing activation credential is genesis-only. It has no authority over
-the successor tables, and the presence of their foreign keys, singleton rows,
-and canonical contract definitions must not be interpreted as an enabled
-successor runtime.
+The existing genesis-activation credential is genesis-only. It has no authority
+over the successor tables. Although the successor repository and workstation
+CLI are implemented, the absence of a dedicated SQL writer role/grant policy
+means they are not an enabled production successor runtime. The migrator/schema
+owner retains technical authority and must not be repurposed as that missing
+application credential.
+
+The reconciliation role necessarily has a bounded mix of
+`SELECT`/`INSERT`/`UPDATE` on its exact legacy-ledger table set and `USAGE` on
+the conflict-ID sequence; CockroachDB also requires table-level `UPDATE` for
+its `FOR UPDATE` locks. RBAC cannot restrict a credential holder to the
+repository's prepared statements. Keep its login quiesced except for one
+reviewed apply, preserve the external cross-database audit/change freeze, and
+treat direct-SQL misuse or a partial projection as corruption requiring an
+audited forward repair.
 
 The one-shot roles intentionally lack delete and broad repair authority, so an
 invalid direct write can wedge a scope. Stop the writer, preserve rows and

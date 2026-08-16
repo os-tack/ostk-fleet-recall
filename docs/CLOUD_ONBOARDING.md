@@ -28,16 +28,18 @@ revision-6 evidence; the Cloud `EXPLAIN` is separately captured historical plan
 evidence. None was rerun for revision 10.
 
 The current checkout is newer than that recorded deployment. Its embedded
-migrator now contains versions 1 through 14, including private control-ledger,
-genesis-activation, and successor-schema projections. The current source
-release target is the complete successful prefix 1 through 14; Stage 2 remains
-compatible with prefix 1 through 3, and the genesis Stage-3 repository remains
-compatible with prefix 1 through 9. Serving health deliberately remains
-compatible with a complete successful prefix of at least version 2. Do not
+migrator now contains versions 1 through 17, including private control-ledger,
+genesis-activation and successor-schema projections, detector-versioned
+conflict uniqueness, and exact reconciliation/current-projection indexes.
+Current source release completion requires exactly the seventeen successful
+rows 1 through 17. Serving requires an uninterrupted successful prefix of at
+least 17 and remains compatible with later additive migrations. The private
+compatibility gates remain control 3, genesis 9, successor repository 14, and
+conflict reconciliation 16. Do not
 reinterpret the live revision-10 schema-2 status or 552-row seed as evidence
-that the later private migrations or ceremonies were deployed. This source and
-runbook update is not approval to rerun migration, change CockroachDB grants,
-or take any AWS action against the recorded live candidate.
+that the later migrations, roles, or private ceremonies were deployed. This
+source and runbook update is not approval to rerun migration, change
+CockroachDB grants, or take any AWS action against the recorded live candidate.
 
 The labels below are gates:
 
@@ -265,12 +267,14 @@ runtime or `public` role access to `memory_control_bootstraps`,
 access to `memory_registry_transitions`,
 `memory_registry_genesis_bridge_consumptions`, or
 `memory_registry_current_heads_v2`: those migration-12-through-14 tables remain
-migrator/schema-owner only until a successor writer repository, write-grant
-RBAC bundle, and CLI are implemented and reviewed. After the prefix reaches 14
-and the two frozen private logical-role policies have run, apply the deny-only
+migrator/schema-owner only. The successor repository and workstation CLI exist,
+but no successor SQL writer principal/logical role or write-grant RBAC bundle
+exists. After the prefix reaches 14 and the two frozen private logical-role
+policies have run, apply the deny-only
 [quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql);
 it gates on all fourteen successful rows, revokes every existing application
-role, and grants nothing. See
+role named by that policy, and grants nothing. Migrations 15 through 17 add or
+replace indexes and do not change the quarantine's table set. See
 [CockroachDB access management](https://www.cockroachlabs.com/docs/cockroachcloud/managing-access).
 
 For each user, obtain a URL-encoded raw connection URL for `fleet_recall` with
@@ -302,12 +306,24 @@ aws secretsmanager describe-secret \
 Never run `get-secret-value` during a recorded session.
 
 Terraform accepts only these runtime and migrator secret ARNs. It has no
-control-bootstrap or registry-activation secret input, IAM execution role, ECS
-task, startup hook, or public route. Do not overload either AWS secret with a
-private ceremony credential.
+control-bootstrap, genesis-activation, successor, or conflict-reconciliation
+secret input, IAM execution role, ECS task, startup hook, or public route. Do
+not overload either AWS secret with a private ceremony credential.
 
-It likewise has no successor writer secret, role, task, startup hook, or route.
-The successor schema and contracts are not deployed runtime authority.
+The successor repository and `ostk-registry-successor-activate` apply/inspect
+CLI are workstation source surfaces only. There is no successor SQL writer
+role/grant policy, AWS credential/task, production-image binary, startup hook,
+or runtime route; the migrator/schema owner retains technical authority but is
+not an application successor credential.
+
+Conflict reconciliation has an apply-only workstation CLI and a checked-in
+database-local one-shot role policy. Only a cluster admin may apply it;
+database ownership alone is insufficient. Apply it after its prefix-16 and
+prior-role gates. Before every apply/use, the operator must
+externally audit every other database for direct role grants/ownership and
+inherited `public` authority under a change freeze; the local SQL file cannot
+perform that cross-database audit. No Terraform, AWS, image, runtime, MCP, or
+HTTP wiring exists.
 
 If the separately reviewed Stage-2 ceremony is actually run, create a third,
 private SQL principal with no admin membership and only the grants in
@@ -316,8 +332,10 @@ local operator process; disable the login or remove the secret afterward. If
 the Stage-3 genesis-activation ceremony is run, create a fourth, distinct
 principal with the exact activation grants in [MIGRATIONS.md](MIGRATIONS.md)
 and retire it after use. That genesis repository keeps its prefix-1-through-9
-compatibility gate even when the current release prefix reaches 14; it has no
-successor-table authority. Both ceremonies remain local/private until a
+compatibility gate even when the current release prefix reaches 17; it has no
+successor-table authority. The successor repository keeps its prefix-14 gate,
+and reconciliation keeps prefix 16; neither is authorized by either AWS
+credential. All private ceremonies remain local until a
 separate deployment increment adds and reviews explicit cloud wiring. Their
 artifacts, pins, profiles, and URL rules are summarized in
 [SECURITY.md](SECURITY.md).
@@ -424,10 +442,13 @@ Keep `service_desired_count = 0` and `autoscaling_min_capacity = 0` through the
 first apply. Run exactly one migration task, grant the runtime user, run the
 one-off idempotent seed task, then approve scaling the public service to one.
 For a separately approved deployment of the current checkout, that migration
-task must finish the uninterrupted prefix 1 through 14: versions 1 through 11
-use the nontransactional policy (with resumable exact-catalog assertions in
-v10/v11), while v12 through v14 use the dedicated transactional session. Do not
-substitute manual SQL or a Docker-only smoke for that release gate.
+task must finish exactly the uninterrupted prefix 1 through 17: versions 1
+through 11 use the nontransactional policy (with resumable exact-catalog
+assertions in v10/v11), v12 through v14 use the dedicated transactional
+session, and v15 through v17 return to resumable nontransactional online DDL.
+Serving remains compatible with a later additive successful prefix, but the
+current release artifact contains exactly 1–17. Do not substitute manual SQL or
+a Docker-only smoke for that release gate.
 Validate HTTPS and recall, force a task replacement, and prove recall again.
 Capture representative Cloud `EXPLAIN` separately with the approved bounded
 method before final submission; capability flags and RRF observations are not

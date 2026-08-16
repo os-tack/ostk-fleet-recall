@@ -84,6 +84,16 @@ scenario. An optional OSTK bridge can coordinate those clients, but Terraform
 does not provision OSTK workers or MCP sidecars and the hosted submission does
 not depend on either one.
 
+Private authority processes remain outside this topology. The workstation-only
+successor CLI constructs the checked-in first-successor repository, and the
+apply-only conflict-reconciliation CLI constructs its separate repository.
+Neither binary is present in the production image or represented by an AWS
+secret, IAM role, task definition, startup hook, MCP method, or HTTP route. The
+reconciliation SQL role policy is applied locally inside `fleet_recall` by a
+cluster admin only and depends on a separate cross-database authority audit;
+database ownership alone is insufficient, and it is not Terraform or runtime
+wiring.
+
 ECS containers are stateless. Replacing or scaling a task does not move memory:
 the corpus, typed claims, idempotency receipts, conflict ledger, and events
 remain in CockroachDB Cloud. A private S3 prefix supplies the same
@@ -119,6 +129,28 @@ citation fails the task closed.
 | Fleet events | `memory_events` | Durable audit and future projection/CDC seam |
 | Reserved attention (future) | `memory_attention` | Schema seam only; not read or written by the current vertical slice |
 
+Current release completion requires exactly the seventeen successful migration
+rows 1 through 17. Serving accepts an uninterrupted successful prefix of at
+least 17, including later additive migrations. The private repositories retain
+their narrower, independently enforced compatibility floors:
+
+- Stage-2 control bootstrap requires successful prefix 1–3 and has a private
+  workstation repository/CLI plus one-shot role.
+- Genesis Stage-3 activation requires prefix 1–9 and has a private workstation
+  repository/CLI plus one-shot role.
+- The first-successor repository and workstation apply/inspect CLI require
+  prefix 1–14; no production SQL writer role or deployment wiring exists.
+- Legacy conflict reconciliation requires prefix 1–16 and has an apply-only
+  workstation CLI plus database-local one-shot role policy. Its cross-database
+  authority audit remains external.
+- Recall, remember, ingest, health, and the public demo require prefix 1–17 as
+  the normal runtime/serving release surface.
+
+Later additive rows cannot compensate for a missing or failed row inside a
+required prefix. Migrations 15 through 17 do not add successor tables: they
+version conflict uniqueness by detector and add the exact claim-transition and
+current-conflict projection indexes.
+
 The current conflict detector is the immutable contract
 `same_key_functional_value_v2`. A conflict-eligible legacy claim key is the
 normalized `subject::predicate` pair and is deliberately **functional** during
@@ -133,10 +165,16 @@ half-open interval overlap but does not independently expire claims against the
 wall clock. This rule performs no corpus-wide natural-language inference.
 
 Rows carrying the original `same_key_typed_value` detector retain their old
-meaning and are reported as unreconciled legacy projections. The v2 writer
-fails closed rather than appending to or relabelling them. A separate audited
-reconciliation must preserve their historical receipts and transitions before
-they can participate in the v2 current projection.
+meaning and are reported as unreconciled legacy projections. The steady-state
+v2 writer fails closed rather than appending to or relabelling them. The
+implemented reconciliation repository locks one exact legacy ID/revision,
+derives a bounded complete pair graph from current claims, preserves the legacy
+row and memberships byte-for-byte, and appends a distinct
+`same_key_functional_value_v2` lineage plus its receipt, audit event, and any
+claim-state transitions in one serializable transaction. A no-conflict v2
+projection is recorded as dismissed rather than rewriting or deleting legacy
+history. The workstation CLI exposes only `apply`; identical retries use the
+same bounded idempotency key and return the durable result.
 
 Active and historical chunks are physically separated. That is important for
 CockroachDB's vector execution: the hot ANN table needs only equality-bound

@@ -32,6 +32,14 @@ retrieves memory, applies an explicit deterministic policy, and records a cited
 action. It does not invoke OSTK, an LLM, or a model API. The OSTK adapter is a
 strictly optional interoperability path.
 
+Two additional binaries are private workstation tools, not product or hosted
+routes. `ostk-registry-successor-activate` applies or inspects the one-time
+genesis-to-first-successor transition through the checked-in successor
+repository. `ostk-conflict-reconcile` is apply-only and materializes a new v2
+conflict lineage for one immutable legacy conflict revision. Neither binary is
+copied into the production image or wired into Terraform, ECS, the public HTTP
+service, or normal MCP/runtime startup.
+
 Attention schema space is reserved for future compatibility, but attention
 actions and a runtime attention workflow are **not implemented** in this
 hackathon slice. Additional canonical Recall actions are also future work.
@@ -39,18 +47,28 @@ hackathon slice. Additional canonical Recall actions are also future work.
 ## Evidence status
 
 Source and deployment evidence are intentionally reported separately. The
-current checkout embeds migrations 1 through 14, including private Stage-2
-control, genesis Stage-3 activation, and durable successor-schema state. Normal
-serving health remains compatible with a complete successful migration prefix
-of at least version 2. Stage 2 deliberately keeps its prefix-1-through-3 gate,
-and the genesis Stage-3 repository keeps its prefix-1-through-9 gate; current
-release completion is prefix 1 through 14. The successor contracts and three
-new tables do not yet have a successor writer repository, write-grant RBAC
-bundle, operator CLI, AWS task, or runtime authority. A separate deny-only
-quarantine policy keeps those tables migrator/schema-owner only. The AWS
-module wires only distinct runtime and migrator database credential paths; the
-third Stage-2 and fourth genesis Stage-3 SQL principals exist only when their
-local private ceremonies run.
+current checkout embeds migrations 1 through 17. Current release completion
+requires exactly the seventeen successful rows 1 through 17. Serving requires
+an uninterrupted successful prefix of at least 17 and remains compatible with
+later additive migrations; a later successful row cannot hide a missing or
+failed prerequisite. The private compatibility gates deliberately remain
+narrower: Stage-2 control requires prefix 1 through 3, genesis Stage-3 requires
+1 through 9, the first-successor repository requires 1 through 14, and
+conflict-detector reconciliation requires 1 through 16.
+
+Migrations 12 through 14 supply the three successor tables, and the successor
+repository plus workstation CLI now exist. There is still no successor SQL
+writer principal/logical role, write-grant RBAC policy, AWS secret or task,
+production-image binary, startup hook, or public/runtime route. The deny-only
+quarantine continues to keep those tables away from the four prior application
+roles, and the reconciliation policy separately grants them no successor-table
+access. Conflict reconciliation has an apply-only workstation CLI and a
+database-local, cluster-admin-only one-shot role policy; database ownership is
+insufficient, and its mandatory cross-database grant/ownership audit remains an
+external operator step. It also has no Terraform secret, ECS task,
+production-image binary, serving credential, or runtime route. The AWS module
+still wires only the distinct runtime and migrator database credential paths.
+
 None of those source facts upgrades the historical cloud evidence below.
 
 The submission candidate is live at
@@ -293,13 +311,16 @@ non-sensitive corpus and check readiness:
 "$FLEET_RECALL_BIN" health
 ```
 
-The current embedded migrator applies versions 1 through 14. Versions 1 through
-11 execute without a wrapping SQL transaction because of CockroachDB
-schema-changer and schema-lock constraints; v10 and v11 are resumable only
-because they verify an exact committed index before SQLx records success.
-Versions 12 through 14 run transactionally on a dedicated migration session
-with `autocommit_before_ddl = false`. Never run multiple migrators concurrently
-or run the migration files manually as a substitute for that policy. See
+The current embedded migrator applies versions 1 through 17 in three phases.
+Versions 1 through 11 execute without a wrapping SQL transaction because of
+CockroachDB schema-changer and schema-lock constraints; v10 and v11 are
+resumable only because they verify an exact committed index before SQLx records
+success. Versions 12 through 14 run transactionally on a dedicated migration
+session with `autocommit_before_ddl = false`. Versions 15 through 17 return to
+the resumable online-DDL policy, version conflict identity by detector, and add
+the exact reconciliation/current-projection indexes. Never run multiple
+migrators concurrently or run the migration files manually as a substitute for
+that policy. See
 [migration and recovery rules](docs/MIGRATIONS.md) before recovering a failed
 migration.
 
@@ -461,9 +482,16 @@ the remaining rows.
   activation route. Do not expose a future mutation route publicly without
   workload identity, authorization, rate limiting, and production network
   controls.
-- Migrations 12 through 14 reserve durable successor state, but their three
-  tables remain migrator/schema-owner only under the deny-only quarantine
-  policy. Schema and contracts alone do not authorize runtime successor writes.
+- Migrations 12 through 14 reserve durable successor state, and a private
+  successor repository plus workstation CLI exist. Their three tables remain
+  migrator/schema-owner only under the deny-only quarantine because no
+  successor SQL writer role or reviewed grant bundle exists. Repository code
+  and contracts alone do not authorize a production write.
+- The v2 conflict detector is proposition-aware: different affirmative values
+  conflict; affirmation and negation conflict only for the same exact value;
+  two negations are compatible. Legacy detector rows are immutable. The
+  apply-only reconciliation CLI appends a separately versioned v2 lineage and
+  preserves the legacy row, memberships, receipts, and transition history.
 
 See [security and supply-chain policy](docs/SECURITY.md) and the
 [architecture](docs/ARCHITECTURE.md) for the complete invariants.
@@ -502,13 +530,14 @@ The final test asserts that representative dense, source-prefixed dense, and
 lexical queries select their intended CockroachDB indexes rather than proving
 only one-row functional behavior.
 
-The migration correctness gate was run against the official CockroachDB
-v26.2.3 binary, including fresh, populated-upgrade, interruption, catalog-drift,
-and transactional rollback cases. That lane applies and schema-checks the
-deny-only quarantine, but the full role allow/deny/grant-option matrix belongs
-to separate Docker RBAC proofs. The recorded LocalStack application-image smoke
-predates migrations 10 through 14 and must be rerun before claiming current
-image parity. None of these local results is AWS deployment evidence.
+The authoritative migration correctness lane targets the pinned official
+CockroachDB v26.2.3 binary and covers fresh, interruption, catalog-drift,
+transactional rollback, successor-repository,
+functional-polarity, and conflict-reconciliation cases through migration 17.
+The full role allow/deny/grant-option matrices remain separate Docker RBAC
+proofs. The recorded LocalStack application-image smoke predates migrations 10
+through 17 and must be rerun before claiming current image parity. None of these
+local results is AWS deployment evidence.
 
 ## Deployment and project documentation
 

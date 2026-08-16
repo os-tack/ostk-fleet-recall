@@ -43,8 +43,9 @@ to CockroachDB. After connecting it requires exactly three successful SQLx rows
 for the uninterrupted prefix 1 through 3 before touching the control tables;
 a later successful migration cannot mask a failed or missing prerequisite.
 This is deliberately a Stage-2 compatibility gate, not proof that the current
-post-v14 release is complete or that genesis Stage-3 activation is authorized.
-Neither artifact may override physical or semantic routing.
+release's exact prefix 1 through 17 is complete, that serving's minimum
+uninterrupted prefix of 17 is ready, or that genesis/successor/reconciliation
+authority exists. Neither artifact may override physical or semantic routing.
 
 Apply once, then audit a replay using the same authority:
 
@@ -74,7 +75,8 @@ before any non-test bootstrap.
 
 ## SQL principals
 
-Use three distinct login principals and three distinct secret values:
+For this Stage-2 boundary, use three distinct login principals and three
+distinct secret values:
 
 1. the migrator owns/applies schema and is dormant afterward;
 2. the runtime serves MCP and the read-only demo but has no control-table
@@ -91,16 +93,17 @@ future control tables.
 
 The base policy can first be applied after migration 0003 and must remain
 runnable at that original Stage-2 boundary. Reapply it after later migrations
-create objects. For the current complete prefix through migration 0014, also
-apply or reapply the genesis-activation base role policy and then the deny-only
+create objects. For the current complete release prefix through migration 0017,
+also apply or reapply the genesis-activation base role policy, followed by the
+deny-only
 [quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql).
-The quarantine requires all fourteen successful migration rows before it
-revokes the three successor tables from every existing application role; it
-grants nothing. Connect to the dedicated
-`fleet_recall` database as a
-cluster admin, or as a dedicated security operator with `CREATEROLE`, the
-required role admin options and SYSTEM grant options, plus grant authority on
-every object in the policy, and apply
+The quarantine deliberately retains its complete successful prefix 1 through
+14 gate because migrations 12 through 14 create its three successor tables and
+15 through 17 only add/replace indexes. It revokes those tables from the
+existing application roles and grants nothing. Connect to the dedicated
+`fleet_recall` database as a cluster admin, or as a dedicated security operator
+with `CREATEROLE`, the required role admin options and SYSTEM grant options,
+plus grant authority on every object in the policy, and apply
 [`deploy/cockroach/control-role-grants.sql`](../deploy/cockroach/control-role-grants.sql).
 If the database has another name, produce and review a copy with the database
 identifier changed; do not interpolate an unchecked identifier into SQL.
@@ -133,12 +136,27 @@ table/sequence default granting `public` or either application logical role;
 reapply and re-audit after migrations create objects.
 
 After migration 0014, that audit and quarantine proof must show no `public`,
-runtime, bootstrap, or genesis-activation grant on `memory_registry_transitions`,
+runtime, bootstrap, or genesis-activation grant on
+`memory_registry_transitions`,
 `memory_registry_genesis_bridge_consumptions`, or
-`memory_registry_current_heads_v2`. Those successor tables remain
-migrator/schema-owner only until a successor writer repository, write-grant
-RBAC bundle, and CLI are implemented and reviewed together. Their schema and
-contracts do not expand Stage-2 authority.
+`memory_registry_current_heads_v2`. A successor repository and workstation
+apply/inspect CLI now exist, but the tables remain migrator/schema-owner only
+because there is no dedicated successor SQL writer principal/logical role or
+write-grant RBAC policy. There is likewise no AWS secret/task,
+production-image binary, startup hook, or runtime/public route. These source
+capabilities do not expand Stage-2 authority.
+
+After the complete successful prefix 1 through 16, conflict reconciliation has
+its own separate database-local one-shot
+[role policy](../deploy/cockroach/conflict-reconciliation-role-grants.sql); a
+later successful migration 17 is compatible. Apply it only after the control
+and genesis policies are hardened, as a cluster admin only; database ownership
+alone is insufficient. Its required audit of
+direct grants/ownership in every other database and inherited `public`
+authority remains an external operator step under a role/grant/schema-DDL
+change freeze. The reconciliation role and apply-only workstation CLI have no
+Terraform, production-image, ECS, MCP, HTTP, or serving-runtime wiring and do
+not expand the Stage-2 role.
 
 The required raw `INSERT` surface is still powerful: direct SQL can occupy a
 scope singleton with invalid canonical bytes or plant a detached future event
@@ -172,7 +190,9 @@ exercises each allowed statement, and rejects authorization escapes and a
 duplicate predecessor. It prints the effective grants and removes the
 container. This is the frozen Stage-2/genesis-role proof boundary, not a
 successor writer or current application-image migration-parity proof. The
-authoritative official CockroachDB v26.2.3 lane covers versions 1 through 14
-and applies/schema-checks the deny-only quarantine, but it does not exercise the
-full role allow/deny/grant-option drift matrix. That matrix remains the separate
-Docker RBAC proof. Neither substrate contacts AWS or needs LocalStack.
+authoritative official CockroachDB v26.2.3 correctness lane covers versions 1
+through 17 and exercises the successor repository, functional-polarity matrix,
+and conflict-reconciliation repository/CLI. It does not supply successor RBAC,
+run the successor workstation CLI, or replace the separate Docker
+allow/deny/grant-option matrices. Neither substrate contacts AWS or needs
+LocalStack.
