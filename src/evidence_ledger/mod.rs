@@ -31,20 +31,32 @@
 //!    the log-epoch ID, the whole partition recipe, and the contract
 //!    namespaces — must equal it. Serializable isolation is the fence; there is
 //!    no separate compare-and-swap and no last-known-head fallback.
-//! 2. **Shard selection.** `partition_for_epoch` over
+//! 2. **Statement head binding (D4).** The head binding the accepted statement
+//!    itself carries — retained on the [`AppendableAcceptedEvent`] since its
+//!    construction — is compared field-by-field and then byte-for-byte against
+//!    the `canonical_head` that same view read returned. Step 1 alone would not
+//!    imply this: a caller can hold two witnesses, construct the appendable
+//!    under one and append under the other, so only a direct
+//!    statement-versus-view comparison proves the bytes about to be stored
+//!    assert the head that is active in this very transaction. A disagreement
+//!    is [`EvidenceAppendError::StatementAuthority`], and it is what stops an
+//!    admission stage that prepared under generation N from minting an event
+//!    asserting generation N after a successor moved the head to N+1
+//!    (EVENT-01, ADR 0002 D3).
+//! 3. **Shard selection.** `partition_for_epoch` over
 //!    `(epoch id, canonical scope, consistency family, key digest)` — the exact
 //!    function the control ledger uses for its own events.
-//! 3. **Lazy head seed.** `INSERT … ON CONFLICT DO NOTHING` at offset 0 with
+//! 4. **Lazy head seed.** `INSERT … ON CONFLICT DO NOTHING` at offset 0 with
 //!    the deterministic genesis chain digest below. The head table carries no
 //!    foreign key to any control table, precisely so this seed needs no
 //!    control-plane `SELECT` grant (ADR 0002 D1 amendment).
-//! 4. **`SELECT … FOR UPDATE`** on the head row.
-//! 5. **Replay and integrity classification, before any insert.** See below.
-//! 6. **Event insert** with `previous_chain_digest` = the locked chain and
+//! 5. **`SELECT … FOR UPDATE`** on the head row.
+//! 6. **Replay and integrity classification, before any insert.** See below.
+//! 7. **Event insert** with `previous_chain_digest` = the locked chain and
 //!    `chain_digest = derive_append_chain_digest(locked, event_id, position)`.
-//! 7. **The caller's projection**, in this same transaction (EVENT-03,
+//! 8. **The caller's projection**, in this same transaction (EVENT-03,
 //!    REPLAY-02).
-//! 8. **Head compare-and-swap** against the exact locked offset and chain.
+//! 9. **Head compare-and-swap** against the exact locked offset and chain.
 //!
 //! # Offset-zero framing
 //!

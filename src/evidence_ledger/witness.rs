@@ -29,7 +29,12 @@
 //! What *is* unforgeable is the accepted-event side: an
 //! [`crate::evidence_ledger::AppendableAcceptedEvent`] can only be built from a
 //! contract-validated admitted statement whose own registry-head binding equals
-//! this witness.
+//! this witness, and it RETAINS that binding. The append transaction compares
+//! the retained binding against the view's `canonical_head` directly, so the
+//! guarantee does not depend on the caller passing the same witness value
+//! twice: constructing under one witness and appending under another fails
+//! closed with
+//! [`crate::evidence_ledger::EvidenceAppendError::StatementAuthority`].
 
 use crate::memory_contracts::bootstrap::{
     EpochId, GenesisLogEpochV1, PartitionAlgorithm, PartitionRecipeV1,

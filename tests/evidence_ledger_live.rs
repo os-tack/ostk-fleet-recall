@@ -58,7 +58,7 @@ use ostk_fleet_recall::memory_contracts::genesis_activation::{
     verify_genesis_registry_activation, verify_registry_test_result,
 };
 use ostk_fleet_recall::memory_contracts::registry::{
-    ManifestVerifiedRegistryPackage, RegistryEntryKind, RegistryEntryV1,
+    ManifestVerifiedRegistryPackage, RegistryEntryKind, RegistryEntryV1, RegistryHeadV1,
 };
 use ostk_fleet_recall::memory_contracts::relation::RelationAttestationEventV1;
 use ostk_fleet_recall::memory_contracts::remember_v2::RememberAcceptedStatementV2;
@@ -1325,6 +1325,122 @@ async fn live_witness_mismatch_writes_nothing_when_configured() {
             WitnessMismatchKind::ActivationId
         ))
     ));
+}
+
+#[tokio::test]
+async fn live_statement_bound_to_a_never_active_head_writes_nothing_when_configured() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = live_pool(&database_url).await;
+    let fixture = fixture();
+    let scope = activate_stage4(&pool, &fixture, "phantom", 51).await;
+
+    // The attack the append must refuse: build the appendable under ONE witness
+    // and append under ANOTHER. The constructor gate only ever compares the
+    // statement to the witness IT was given, and the fence only ever compares
+    // the witness IT was given to the view; two different witness values would
+    // break the chain unless the transaction also compares the statement's own
+    // binding to the head it just read (ADR 0002 D4).
+    let phantom_activation = domain_separated_digest(DigestDomain::AcceptedEvent, b"phantom-head");
+    let phantom_head = RegistryHeadBindingV1 {
+        head: RegistryHeadV1 {
+            activation_id: phantom_activation,
+            ..scope.head.head.clone()
+        },
+        effective_from: scope.head.effective_from.clone(),
+        effective_until: scope.head.effective_until.clone(),
+    };
+    let mut snapshot = authority_snapshot(&scope).await;
+    snapshot.activation_id = phantom_activation;
+    let phantom_witness = WriterAuthorityWitness::from_authority_snapshot(snapshot).unwrap();
+
+    let statement = evidence_statement(&phantom_head);
+    let appendable = AppendableAcceptedEvent::evidence(
+        &statement,
+        &fixture.connector,
+        delivery(1),
+        &phantom_witness,
+    )
+    .expect("the constructor gate compares the statement to the witness it was given");
+
+    let failure = scope
+        .repository
+        .append(&scope.witness, &appendable, Arc::new(NoProjection))
+        .await;
+    assert!(
+        matches!(
+            failure,
+            Err(EvidenceAppendError::StatementAuthority(
+                WitnessMismatchKind::ActivationId
+            ))
+        ),
+        "a statement asserting a head that was never active must fail closed, got {failure:?}"
+    );
+    assert_eq!(
+        scoped_count(&pool, "memory_evidence_events", &scope.physical_scope).await,
+        0,
+        "no event may be minted under a head that never existed"
+    );
+    assert_eq!(
+        scoped_count(&pool, "memory_evidence_shard_heads", &scope.physical_scope).await,
+        0,
+        "the binding comparison runs before the lazy head seed"
+    );
+    assert_eq!(
+        scoped_count(&pool, "memory_evidence_quarantine", &scope.physical_scope).await,
+        0
+    );
+
+    // The same gap, in its realistic non-adversarial form: an admission stage
+    // that prepared under one binding and appends under another. Here the head
+    // triple is the REAL one and the witness is the REAL one, so only the
+    // binding's validity window differs — the append must still refuse rather
+    // than store bytes asserting a binding the registry never published.
+    let stale_window = RegistryHeadBindingV1 {
+        head: scope.head.head.clone(),
+        effective_from: CanonicalTimestamp::parse("2026-01-01T00:00:00.000000000Z").unwrap(),
+        effective_until: None,
+    };
+    let stale = evidence_statement(&stale_window);
+    let stale_appendable =
+        AppendableAcceptedEvent::evidence(&stale, &fixture.connector, delivery(1), &scope.witness)
+            .expect("the witness carries no validity window, so construction cannot catch this");
+    let failure = scope
+        .repository
+        .append(&scope.witness, &stale_appendable, Arc::new(NoProjection))
+        .await;
+    assert!(
+        matches!(
+            failure,
+            Err(EvidenceAppendError::StatementAuthority(
+                WitnessMismatchKind::HeadEffectiveInterval
+            ))
+        ),
+        "a binding whose window is not the active head's must fail closed, got {failure:?}"
+    );
+    assert_eq!(
+        scoped_count(&pool, "memory_evidence_events", &scope.physical_scope).await,
+        0
+    );
+
+    // And the same statement, bound to the genuinely active head, still
+    // appends: the new comparison refuses forgeries, not honest work.
+    let honest = evidence_statement(&scope.head);
+    let outcome = scope
+        .repository
+        .append(
+            &scope.witness,
+            &appendable_evidence(&fixture, &scope, &honest),
+            Arc::new(NoProjection),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, AppendOutcome::Appended { .. }));
+    assert_eq!(
+        scoped_count(&pool, "memory_evidence_events", &scope.physical_scope).await,
+        1
+    );
 }
 
 #[tokio::test]

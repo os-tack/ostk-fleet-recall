@@ -7,6 +7,20 @@
 //! caller can reach the ledger with a payload-selected kind, scope, shard key,
 //! or head (EVID-04, ADR 0002 D4).
 //!
+//! # The head binding travels with the event
+//!
+//! The construction gate above compares the statement against the witness the
+//! *constructor* was given. That alone would leave a gap: a caller holding two
+//! witnesses could construct under one and append under another, so the bytes
+//! finally stored could assert a head that was never the active one. The
+//! appendable therefore RETAINS the exact [`RegistryHeadBindingV1`] it was
+//! proven against, together with its canonical bytes, and the append
+//! transaction re-compares that retained binding against the `canonical_head`
+//! the authority view returns inside the transaction (ADR 0002 D4: *"compares
+//! … the `canonical_head` bytes against the `RegistryHeadBindingV1` the
+//! statement carries"*). The chain is therefore statement → stored head, with
+//! no witness value in the middle.
+//!
 //! # Governance kinds are unconstructible
 //!
 //! [`AcceptedEventKindV1`] is a closed three-variant enum and `event_kind` is
@@ -25,10 +39,9 @@ use crate::memory_contracts::common::{AuthenticatedProjectScopeV1, ContractId, H
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::memory_contracts::evidence_v2::{
-    EvidenceStatementV2, StructurallyResolvedConnectorSchemaV2,
+    EvidenceStatementV2, RegistryHeadBindingV1, StructurallyResolvedConnectorSchemaV2,
 };
 use crate::memory_contracts::quarantine::MAX_ATTEMPT_COUNT;
-use crate::memory_contracts::registry::RegistryHeadV1;
 use crate::memory_contracts::relation::{
     AdmittedRelationAttestation, RelationAttestationEventV1, VerifiedRelationBasis,
 };
@@ -138,8 +151,21 @@ pub struct AppendableAcceptedEvent {
     semantic_object_digest: Sha256Digest,
     consistency: ConsistencyPartitionKeyV1,
     scope: AuthenticatedProjectScopeV1,
+    /// The statement's own registry-head binding, retained verbatim so the
+    /// append transaction can compare it against the in-transaction head read.
+    head_binding: RegistryHeadBindingV1,
+    /// `encode_canonical(head_binding)`, computed once here so the comparison
+    /// inside the transaction is a pure byte equality against the view's
+    /// `canonical_head` column.
+    canonical_head_binding: Vec<u8>,
     evidence_identity: Option<EvidenceIdentityLinks>,
     delivery: Option<EvidenceDeliveryContextV1>,
+}
+
+/// One statement head binding proven equal to the constructor's witness.
+struct BoundRegistryHead {
+    binding: RegistryHeadBindingV1,
+    canonical: Vec<u8>,
 }
 
 impl AppendableAcceptedEvent {
@@ -157,7 +183,7 @@ impl AppendableAcceptedEvent {
         witness: &WriterAuthorityWitness,
     ) -> EvidenceAppendResult<Self> {
         statement.validate_against_structural_connector(connector)?;
-        require_bound(&statement.scope, &statement.registry_head.head, witness)?;
+        let bound = require_bound(&statement.scope, &statement.registry_head, witness)?;
         // Bound the delivery counter here rather than discovering it inside the
         // append transaction, where a quarantine record would fail to validate.
         if delivery.attempt_count == 0 || delivery.attempt_count > MAX_ATTEMPT_COUNT {
@@ -176,6 +202,8 @@ impl AppendableAcceptedEvent {
             semantic_object_digest: statement.representation_key.digest(),
             consistency: statement.consistency_partition_key(connector)?,
             scope: statement.scope.clone(),
+            head_binding: bound.binding,
+            canonical_head_binding: bound.canonical,
             evidence_identity: Some(EvidenceIdentityLinks {
                 source_fact_id: statement.source_fact_id.digest(),
                 representation_key: statement.representation_key.digest(),
@@ -195,12 +223,24 @@ impl AppendableAcceptedEvent {
     /// typestates currently expose only `#[cfg(test)]` constructors, so this
     /// event-plus-witness entry point is the production admission seam and is
     /// deliberately *not* a way to bypass one that exists.
+    ///
+    /// # Contract
+    ///
+    /// Hidden from the rendered API surface because it takes a plainly
+    /// deserializable contract struct: everything it can prove is structural
+    /// closure plus the head binding. The caller MUST already have run relation
+    /// admission (scope, actor, proof closure, referenced evidence,
+    /// supersession authorization). Reach for
+    /// [`Self::admitted_relation_attestation`] or
+    /// [`Self::verified_relation_basis`] the moment those capabilities gain
+    /// production constructors; this entry point then narrows to `pub(crate)`.
+    #[doc(hidden)]
     pub fn relation_attestation(
         event: &RelationAttestationEventV1,
         witness: &WriterAuthorityWitness,
     ) -> EvidenceAppendResult<Self> {
         event.validate_shape()?;
-        require_bound(&event.scope, &event.edge.registry.head, witness)?;
+        let bound = require_bound(&event.scope, &event.edge.registry, witness)?;
         Ok(Self {
             kind: AcceptedEventKindV1::RelationAttestation,
             event_kind: require_kind(&event.event_kind, AcceptedEventKindV1::RelationAttestation)?,
@@ -212,18 +252,30 @@ impl AppendableAcceptedEvent {
             semantic_object_digest: event.relation_fingerprint.digest(),
             consistency: event.edge.consistency_partition_key()?,
             scope: event.scope.clone(),
+            head_binding: bound.binding,
+            canonical_head_binding: bound.canonical,
             evidence_identity: None,
             delivery: None,
         })
     }
 
     /// Admit one `memory.claim.accepted` statement for append (ADR 0002 D3).
+    ///
+    /// # Contract
+    ///
+    /// Hidden for the same reason as [`Self::relation_attestation`]: the
+    /// caller MUST already have routed the assertion through the unique active
+    /// admission rule, rederived the subject from the activated identity
+    /// recipe, and re-audited applicability and support events (ADR 0002 D3).
+    /// Prefer [`Self::admitted_memory_claim`] once
+    /// `AdmittedRememberStatementV2` has a production constructor.
+    #[doc(hidden)]
     pub fn memory_claim(
         statement: &RememberAcceptedStatementV2,
         witness: &WriterAuthorityWitness,
     ) -> EvidenceAppendResult<Self> {
         statement.validate_shape()?;
-        require_bound(&statement.scope, &statement.registry.head, witness)?;
+        let bound = require_bound(&statement.scope, &statement.registry, witness)?;
         Ok(Self {
             kind: AcceptedEventKindV1::MemoryClaim,
             event_kind: require_kind(&statement.event_kind, AcceptedEventKindV1::MemoryClaim)?,
@@ -235,6 +287,8 @@ impl AppendableAcceptedEvent {
             semantic_object_digest: statement.claim_fingerprint.digest(),
             consistency: statement.consistency_partition_key()?,
             scope: statement.scope.clone(),
+            head_binding: bound.binding,
+            canonical_head_binding: bound.canonical,
             evidence_identity: None,
             delivery: None,
         })
@@ -319,6 +373,24 @@ impl AppendableAcceptedEvent {
         self.kind.semantic_identity_rule()
     }
 
+    /// The statement's own registry-head binding, retained from construction.
+    ///
+    /// The append transaction compares this against the `canonical_head` the
+    /// authority view returns inside that transaction, so the bytes the ledger
+    /// stores can only ever assert the head that was active when they were
+    /// committed (ADR 0002 D4, EVENT-01).
+    #[must_use]
+    pub const fn head_binding(&self) -> &RegistryHeadBindingV1 {
+        &self.head_binding
+    }
+
+    /// `encode_canonical` of [`Self::head_binding`], for the byte comparison
+    /// against `memory_writer_authority_v1.canonical_head`.
+    #[must_use]
+    pub fn canonical_head_binding(&self) -> &[u8] {
+        &self.canonical_head_binding
+    }
+
     pub(crate) const fn evidence_identity(&self) -> Option<EvidenceIdentityLinks> {
         self.evidence_identity
     }
@@ -328,12 +400,15 @@ impl AppendableAcceptedEvent {
     }
 }
 
-/// Require the statement's own head binding and scope to be the witnessed ones.
+/// Require the statement's own head binding and scope to be the witnessed ones,
+/// and hand the proven binding back so the appendable can retain it.
 fn require_bound(
     scope: &AuthenticatedProjectScopeV1,
-    head: &RegistryHeadV1,
+    binding: &RegistryHeadBindingV1,
     witness: &WriterAuthorityWitness,
-) -> EvidenceAppendResult<()> {
+) -> EvidenceAppendResult<BoundRegistryHead> {
+    binding.validate_shape()?;
+    let head = &binding.head;
     if scope != witness.semantic_scope() {
         return Err(EvidenceAppendError::StatementAuthority(
             WitnessMismatchKind::ContractNamespaces,
@@ -354,7 +429,10 @@ fn require_bound(
             WitnessMismatchKind::ActivationPolicyDigest,
         ));
     }
-    Ok(())
+    Ok(BoundRegistryHead {
+        binding: binding.clone(),
+        canonical: encode_canonical(binding)?,
+    })
 }
 
 /// Defensively re-derive the stored `event_kind` from the closed enum.

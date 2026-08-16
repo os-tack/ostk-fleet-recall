@@ -8,12 +8,21 @@
 use crate::FleetError;
 use crate::memory_contracts::ContractError;
 
-/// Exactly which authority field the in-transaction head read disagreed with.
+/// Exactly which authority field an in-transaction head read disagreed with.
 ///
-/// The witness carries the values the admission stage read; the append
-/// transaction re-reads `memory_writer_authority_v1` and compares. Serializable
-/// isolation is the fence, so a disagreement means the head genuinely moved (or
-/// the witness was never derived from this scope's authority at all).
+/// Two independent comparisons report through this enum, and both run inside
+/// the append transaction:
+///
+/// * [`EvidenceAppendError::WitnessMismatch`] — the caller's
+///   [`crate::evidence_ledger::WriterAuthorityWitness`] against the view.
+/// * [`EvidenceAppendError::StatementAuthority`] — the head binding the
+///   *accepted statement itself* carries against the view's `canonical_head`.
+///   This is the comparison ADR 0002 D4 names, and it is what makes the chain
+///   statement → stored head hold with no witness value in the middle.
+///
+/// Serializable isolation is the fence, so a disagreement means the head
+/// genuinely moved (or the value compared was never this scope's authority at
+/// all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WitnessMismatchKind {
     /// The exact ABA-safe activation ID differs. Never compared by package
@@ -32,6 +41,12 @@ pub enum WitnessMismatchKind {
     PartitionRecipe,
     /// The contract tenant/project namespaces differ from the witnessed scope.
     ContractNamespaces,
+    /// The head triple agrees but the binding's validity window
+    /// (`effective_from` / `effective_until`) is not the active head's.
+    HeadEffectiveInterval,
+    /// The decoded binding fields agree yet the canonical bytes differ, so the
+    /// statement's binding is not byte-identical to the stored `canonical_head`.
+    CanonicalHeadBytes,
 }
 
 impl WitnessMismatchKind {
@@ -46,6 +61,8 @@ impl WitnessMismatchKind {
             Self::LogEpochId => "log_epoch_id",
             Self::PartitionRecipe => "partition_recipe",
             Self::ContractNamespaces => "contract_namespaces",
+            Self::HeadEffectiveInterval => "head_effective_interval",
+            Self::CanonicalHeadBytes => "canonical_head",
         }
     }
 }
@@ -98,8 +115,10 @@ pub enum EvidenceAppendError {
     /// A memory contract refused the statement, the derived key, or the chain.
     #[error("accepted-event contract rejected the append: {0}")]
     Contract(#[from] ContractError),
-    /// The statement's own head binding is not the witnessed active head, or
-    /// its scope is not the witnessed scope (ADR 0002 D4, EVID-04).
+    /// The statement's own head binding is not the active head, or its scope
+    /// is not the witnessed scope (ADR 0002 D4, EVID-04). Raised both at
+    /// construction (statement vs. witness) and inside the append transaction
+    /// (statement vs. the view's `canonical_head`).
     #[error("accepted-event statement is not bound to the witnessed authority: {0}")]
     StatementAuthority(WitnessMismatchKind),
     /// The in-transaction head read disagreed with the witness token.

@@ -28,6 +28,7 @@ use crate::memory_contracts::digest::{
     DigestDomain, Sha256Digest, body_digest, domain_separated_digest,
 };
 use crate::memory_contracts::evidence::AcceptedEventId;
+use crate::memory_contracts::evidence_v2::RegistryHeadBindingV1;
 use crate::memory_contracts::quarantine::{
     BoundedDiagnosticV1, QuarantineReasonV1, QuarantineRecordId, QuarantineRecordV1,
 };
@@ -50,9 +51,9 @@ use super::witness::{
 
 /// Every authority column the per-transaction fence compares (ADR 0002 D4).
 const SELECT_AUTHORITY_FENCE_SQL: &str = "SELECT head_state, generation, activation_id, \
-     package_digest, activation_policy_digest, log_epoch_id, partition_recipe_id, \
-     partition_recipe_version, partition_algorithm, partition_seed, log_shard_count, \
-     contract_tenant_namespace, contract_project_namespace, \
+     package_digest, activation_policy_digest, canonical_head, log_epoch_id, \
+     partition_recipe_id, partition_recipe_version, partition_algorithm, partition_seed, \
+     log_shard_count, contract_tenant_namespace, contract_project_namespace, \
      bootstrap_contract_tenant_namespace, bootstrap_contract_project_namespace \
      FROM public.memory_writer_authority_v1 \
      WHERE tenant_id = $1 AND project = $2 LIMIT 2";
@@ -60,9 +61,9 @@ const SELECT_AUTHORITY_FENCE_SQL: &str = "SELECT head_state, generation, activat
 /// The fence columns plus the canonical bootstrap receipt the genesis epoch is
 /// decoded from. Used only when materializing a witness, never per append.
 const SELECT_AUTHORITY_WITNESS_SQL: &str = "SELECT head_state, generation, activation_id, \
-     package_digest, activation_policy_digest, log_epoch_id, partition_recipe_id, \
-     partition_recipe_version, partition_algorithm, partition_seed, log_shard_count, \
-     contract_tenant_namespace, contract_project_namespace, \
+     package_digest, activation_policy_digest, canonical_head, log_epoch_id, \
+     partition_recipe_id, partition_recipe_version, partition_algorithm, partition_seed, \
+     log_shard_count, contract_tenant_namespace, contract_project_namespace, \
      bootstrap_contract_tenant_namespace, bootstrap_contract_project_namespace, \
      bootstrap_receipt_digest, bootstrap_canonical_receipt \
      FROM public.memory_writer_authority_v1 \
@@ -228,6 +229,11 @@ struct AuthorityFence {
     activation_id: Sha256Digest,
     package_digest: Sha256Digest,
     activation_policy_digest: Sha256Digest,
+    /// The active head's own `RegistryHeadBindingV1`, decoded from
+    /// `canonical_head` and cross-checked against the view's scalar columns.
+    head_binding: RegistryHeadBindingV1,
+    /// The exact stored `canonical_head` bytes (ADR 0002 D4).
+    canonical_head: Vec<u8>,
     log_epoch_id: EpochId,
     partition_recipe_id: String,
     partition_recipe_version: u32,
@@ -317,6 +323,15 @@ async fn append_in_transaction(
     if let Some(mismatch) = fence_mismatch(&fence, witness) {
         return Ok(AppendAttempt::Rejected(
             EvidenceAppendError::WitnessMismatch(mismatch),
+        ));
+    }
+    // The statement's OWN head binding against the head this transaction just
+    // read. Without this the caller could construct under one witness and
+    // append under another, minting bytes that assert a head that was never
+    // active (ADR 0002 D4, EVENT-01).
+    if let Some(mismatch) = statement_head_mismatch(&fence, appendable) {
+        return Ok(AppendAttempt::Rejected(
+            EvidenceAppendError::StatementAuthority(mismatch),
         ));
     }
 
@@ -542,14 +557,26 @@ fn decode_authority_fence(row: &PgRow) -> EvidenceAppendResult<AuthorityFence> {
     let seed: [u8; 32] = seed.try_into().map_err(|_| {
         EvidenceAppendError::AuthorityUnavailable(AuthorityUnavailableKind::UndecodableRow)
     })?;
+    let activation_id = digest32(row.try_get("activation_id")?)?;
+    let package_digest = digest32(row.try_get("package_digest")?)?;
+    let activation_policy_digest = digest32(row.try_get("activation_policy_digest")?)?;
+    let canonical_head: Vec<u8> = row.try_get("canonical_head")?;
+    let head_binding = decode_head_binding(
+        &canonical_head,
+        activation_id,
+        package_digest,
+        activation_policy_digest,
+    )?;
     Ok(AuthorityFence {
         head_state,
         generation: u64::try_from(generation).map_err(|_| {
             EvidenceAppendError::AuthorityUnavailable(AuthorityUnavailableKind::UndecodableRow)
         })?,
-        activation_id: digest32(row.try_get("activation_id")?)?,
-        package_digest: digest32(row.try_get("package_digest")?)?,
-        activation_policy_digest: digest32(row.try_get("activation_policy_digest")?)?,
+        activation_id,
+        package_digest,
+        activation_policy_digest,
+        head_binding,
+        canonical_head,
         log_epoch_id: EpochId::from_digest(digest32(row.try_get("log_epoch_id")?)?),
         partition_recipe_id: row.try_get("partition_recipe_id")?,
         partition_recipe_version: u32::try_from(recipe_version).map_err(|_| {
@@ -584,6 +611,85 @@ fn namespaces(
         ContractId::new(tenant)?,
         ContractId::new(project)?,
     ))
+}
+
+/// Decode the view's `canonical_head` into the head binding the statements
+/// carry, refusing anything that is not a byte-exact canonical encoding of an
+/// internally consistent binding for THIS row.
+///
+/// The cross-check against the view's own scalar columns matters: it is what
+/// lets the statement-vs-`canonical_head` comparison below also stand for the
+/// scalar columns the rest of the fence compares.
+fn decode_head_binding(
+    canonical_head: &[u8],
+    activation_id: Sha256Digest,
+    package_digest: Sha256Digest,
+    activation_policy_digest: Sha256Digest,
+) -> EvidenceAppendResult<RegistryHeadBindingV1> {
+    let undecodable =
+        || EvidenceAppendError::AuthorityUnavailable(AuthorityUnavailableKind::UndecodableRow);
+    let binding: RegistryHeadBindingV1 =
+        decode_strict(canonical_head).map_err(|_| undecodable())?;
+    binding.validate_shape().map_err(|_| undecodable())?;
+    if encode_canonical(&binding).map_err(|_| undecodable())? != canonical_head
+        || binding.head.activation_id != activation_id
+        || binding.head.package_digest != package_digest
+        || binding.head.activation_policy_digest != activation_policy_digest
+    {
+        return Err(undecodable());
+    }
+    Ok(binding)
+}
+
+/// Compare the head binding the ACCEPTED STATEMENT carries against the head the
+/// in-transaction view read returned (ADR 0002 D4).
+///
+/// This is the comparison that closes the chain. The construction gate in
+/// [`AppendableAcceptedEvent`] proves statement == constructor witness, and
+/// [`fence_mismatch`] proves append witness == view; neither composes with the
+/// other, because the two witness values need not be the same value. Comparing
+/// the retained binding directly against the view removes the witness from the
+/// middle: the canonical bytes this transaction is about to store can only ever
+/// assert the head that is active in this very transaction.
+fn statement_head_mismatch(
+    fence: &AuthorityFence,
+    appendable: &AppendableAcceptedEvent,
+) -> Option<WitnessMismatchKind> {
+    head_binding_mismatch(
+        appendable.head_binding(),
+        appendable.canonical_head_binding(),
+        &fence.head_binding,
+        &fence.canonical_head,
+    )
+}
+
+/// Field-by-field, then byte-for-byte, comparison of two head bindings.
+fn head_binding_mismatch(
+    statement: &RegistryHeadBindingV1,
+    statement_canonical: &[u8],
+    active: &RegistryHeadBindingV1,
+    active_canonical: &[u8],
+) -> Option<WitnessMismatchKind> {
+    if statement.head.activation_id != active.head.activation_id {
+        return Some(WitnessMismatchKind::ActivationId);
+    }
+    if statement.head.package_digest != active.head.package_digest {
+        return Some(WitnessMismatchKind::PackageDigest);
+    }
+    if statement.head.activation_policy_digest != active.head.activation_policy_digest {
+        return Some(WitnessMismatchKind::ActivationPolicyDigest);
+    }
+    if statement.effective_from != active.effective_from
+        || statement.effective_until != active.effective_until
+    {
+        return Some(WitnessMismatchKind::HeadEffectiveInterval);
+    }
+    // Belt and braces over any binding field a later contract version adds:
+    // the two canonical encodings must be the same bytes.
+    if statement_canonical != active_canonical {
+        return Some(WitnessMismatchKind::CanonicalHeadBytes);
+    }
+    None
 }
 
 /// Compare every witnessed authority field against the in-transaction read.
@@ -1007,22 +1113,59 @@ fn digest32(value: Vec<u8>) -> EvidenceAppendResult<Sha256Digest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_contracts::registry::RegistryHeadV1;
+
+    /// Every SQL statement this module can execute, by name.
+    ///
+    /// The two boundary tests below iterate this one list, and
+    /// `the_sql_inventory_is_complete` proves the list names every `const …_SQL`
+    /// declared in this file, so a newly added statement cannot escape either
+    /// check by being forgotten in a hand-maintained array.
+    const ALL_SQL: [(&str, &str); 11] = [
+        ("SELECT_AUTHORITY_FENCE_SQL", SELECT_AUTHORITY_FENCE_SQL),
+        ("SELECT_AUTHORITY_WITNESS_SQL", SELECT_AUTHORITY_WITNESS_SQL),
+        ("SEED_SHARD_HEAD_SQL", SEED_SHARD_HEAD_SQL),
+        ("LOCK_SHARD_HEAD_SQL", LOCK_SHARD_HEAD_SQL),
+        ("READ_SHARD_HEAD_SQL", READ_SHARD_HEAD_SQL),
+        ("SELECT_EVENT_BY_ID_SQL", SELECT_EVENT_BY_ID_SQL),
+        (
+            "SELECT_EVENT_BY_SEMANTIC_OBJECT_SQL",
+            SELECT_EVENT_BY_SEMANTIC_OBJECT_SQL,
+        ),
+        ("INSERT_EVENT_SQL", INSERT_EVENT_SQL),
+        ("ADVANCE_SHARD_HEAD_SQL", ADVANCE_SHARD_HEAD_SQL),
+        ("INSERT_QUARANTINE_SQL", INSERT_QUARANTINE_SQL),
+        ("AUDIT_EVENT_PAGE_SQL", AUDIT_EVENT_PAGE_SQL),
+    ];
+
+    #[test]
+    fn the_sql_inventory_is_complete() {
+        // Self-audit of this source file: every `const …_SQL` declaration must
+        // be in ALL_SQL. Without this, adding `const UPDATE_EVENT_SQL` would
+        // silently escape both boundary tests below (reviewer observation).
+        let source = include_str!("cockroach.rs");
+        let declared: Vec<&str> = source
+            .lines()
+            .filter_map(|line| line.strip_prefix("const "))
+            .filter_map(|rest| rest.split(':').next())
+            .filter(|name| name.ends_with("_SQL"))
+            .collect();
+        assert_eq!(
+            declared.len(),
+            ALL_SQL.len(),
+            "declared SQL constants: {declared:?}"
+        );
+        for name in declared {
+            assert!(
+                ALL_SQL.iter().any(|(known, _)| *known == name),
+                "SQL constant {name} is not covered by the boundary tests"
+            );
+        }
+    }
 
     #[test]
     fn every_statement_stays_inside_the_runtime_grant_boundary() {
-        for statement in [
-            SELECT_AUTHORITY_FENCE_SQL,
-            SELECT_AUTHORITY_WITNESS_SQL,
-            SEED_SHARD_HEAD_SQL,
-            LOCK_SHARD_HEAD_SQL,
-            READ_SHARD_HEAD_SQL,
-            SELECT_EVENT_BY_ID_SQL,
-            SELECT_EVENT_BY_SEMANTIC_OBJECT_SQL,
-            INSERT_EVENT_SQL,
-            ADVANCE_SHARD_HEAD_SQL,
-            INSERT_QUARANTINE_SQL,
-            AUDIT_EVENT_PAGE_SQL,
-        ] {
+        for (_, statement) in ALL_SQL {
             for forbidden in ["memory_control_", "memory_registry_"] {
                 assert!(
                     !statement.contains(forbidden),
@@ -1034,18 +1177,13 @@ mod tests {
 
     #[test]
     fn the_accepted_envelope_is_never_updated_or_deleted() {
-        for statement in [
-            SEED_SHARD_HEAD_SQL,
-            LOCK_SHARD_HEAD_SQL,
-            READ_SHARD_HEAD_SQL,
-            SELECT_EVENT_BY_ID_SQL,
-            SELECT_EVENT_BY_SEMANTIC_OBJECT_SQL,
-            INSERT_EVENT_SQL,
-            ADVANCE_SHARD_HEAD_SQL,
-            INSERT_QUARANTINE_SQL,
-            AUDIT_EVENT_PAGE_SQL,
-        ] {
-            assert!(!statement.contains("DELETE"));
+        for (name, statement) in ALL_SQL {
+            assert!(!statement.contains("DELETE"), "{name} deletes rows");
+            assert!(
+                !(statement.contains("UPDATE public.memory_evidence_events")
+                    || statement.contains("DROP")),
+                "{name} mutates the accepted envelope"
+            );
         }
         assert!(!INSERT_EVENT_SQL.contains("UPDATE"));
         assert!(ADVANCE_SHARD_HEAD_SQL.contains("public.memory_evidence_shard_heads"));
@@ -1084,5 +1222,137 @@ mod tests {
         assert!(bounded.len() <= 512);
         assert!(long.starts_with(&bounded));
         assert_eq!(bounded_message("short"), "short");
+    }
+
+    fn timestamp(value: &str) -> CanonicalTimestamp {
+        CanonicalTimestamp::parse(value).unwrap()
+    }
+
+    fn binding(activation: u8, effective: &str) -> RegistryHeadBindingV1 {
+        RegistryHeadBindingV1 {
+            head: RegistryHeadV1 {
+                activation_id: Sha256Digest::from_bytes([activation; 32]),
+                package_digest: Sha256Digest::from_bytes([2; 32]),
+                activation_policy_digest: Sha256Digest::from_bytes([3; 32]),
+            },
+            effective_from: timestamp(effective),
+            effective_until: None,
+        }
+    }
+
+    fn compare(
+        statement: &RegistryHeadBindingV1,
+        active: &RegistryHeadBindingV1,
+    ) -> Option<WitnessMismatchKind> {
+        head_binding_mismatch(
+            statement,
+            &encode_canonical(statement).unwrap(),
+            active,
+            &encode_canonical(active).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_statement_bound_to_the_active_head_passes_the_binding_comparison() {
+        let active = binding(9, "2026-08-16T00:00:00.000000000Z");
+        assert_eq!(compare(&active.clone(), &active), None);
+    }
+
+    #[test]
+    fn a_statement_bound_to_another_head_is_refused_field_by_field() {
+        let active = binding(9, "2026-08-16T00:00:00.000000000Z");
+
+        // A head that was never activated at all: the exact ABA-safe ID is the
+        // first thing compared (ADR 0002 D4).
+        assert_eq!(
+            compare(&binding(0xAA, "2026-08-16T00:00:00.000000000Z"), &active),
+            Some(WitnessMismatchKind::ActivationId)
+        );
+
+        // Same activation, different package or policy digest.
+        let mut wrong_package = active.clone();
+        wrong_package.head.package_digest = Sha256Digest::from_bytes([0xBB; 32]);
+        assert_eq!(
+            compare(&wrong_package, &active),
+            Some(WitnessMismatchKind::PackageDigest)
+        );
+        let mut wrong_policy = active.clone();
+        wrong_policy.head.activation_policy_digest = Sha256Digest::from_bytes([0xCC; 32]);
+        assert_eq!(
+            compare(&wrong_policy, &active),
+            Some(WitnessMismatchKind::ActivationPolicyDigest)
+        );
+
+        // The same head triple under a different validity window is a
+        // different binding, and the stored bytes would say so.
+        assert_eq!(
+            compare(&binding(9, "2026-08-15T00:00:00.000000000Z"), &active),
+            Some(WitnessMismatchKind::HeadEffectiveInterval)
+        );
+        let mut bounded = active.clone();
+        bounded.effective_until = Some(timestamp("2026-08-17T00:00:00.000000000Z"));
+        assert_eq!(
+            compare(&bounded, &active),
+            Some(WitnessMismatchKind::HeadEffectiveInterval)
+        );
+    }
+
+    #[test]
+    fn the_canonical_bytes_are_the_final_word_on_the_binding() {
+        // Every decoded field agrees, so only the byte comparison can catch a
+        // binding field a later contract version adds.
+        let active = binding(9, "2026-08-16T00:00:00.000000000Z");
+        let canonical = encode_canonical(&active).unwrap();
+        let mut divergent = canonical.clone();
+        divergent.push(b' ');
+        assert_eq!(
+            head_binding_mismatch(&active, &divergent, &active, &canonical),
+            Some(WitnessMismatchKind::CanonicalHeadBytes)
+        );
+    }
+
+    #[test]
+    fn the_stored_canonical_head_must_reproduce_the_views_own_columns() {
+        let active = binding(9, "2026-08-16T00:00:00.000000000Z");
+        let canonical = encode_canonical(&active).unwrap();
+        assert!(
+            decode_head_binding(
+                &canonical,
+                active.head.activation_id,
+                active.head.package_digest,
+                active.head.activation_policy_digest,
+            )
+            .is_ok()
+        );
+        // A canonical_head that disagrees with the row's own scalar columns is
+        // an unusable authority row, never a silently preferred value.
+        for wrong in [
+            Sha256Digest::from_bytes([0xEE; 32]),
+            Sha256Digest::from_bytes([0; 32]),
+        ] {
+            assert!(matches!(
+                decode_head_binding(
+                    &canonical,
+                    wrong,
+                    active.head.package_digest,
+                    active.head.activation_policy_digest,
+                ),
+                Err(EvidenceAppendError::AuthorityUnavailable(
+                    AuthorityUnavailableKind::UndecodableRow
+                ))
+            ));
+        }
+        // Non-canonical or undecodable bytes fail closed the same way.
+        assert!(matches!(
+            decode_head_binding(
+                b"{}",
+                active.head.activation_id,
+                active.head.package_digest,
+                active.head.activation_policy_digest,
+            ),
+            Err(EvidenceAppendError::AuthorityUnavailable(
+                AuthorityUnavailableKind::UndecodableRow
+            ))
+        ));
     }
 }
