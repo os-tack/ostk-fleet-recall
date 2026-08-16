@@ -119,17 +119,19 @@ local/private operator gates.
 
 Migrations 12 through 14 and the versioned successor contracts install the
 durable schema. A first-successor repository and workstation apply/inspect CLI
-are implemented, but there is no successor SQL writer principal or logical
-role, write-grant RBAC policy, AWS secret or task, production-image binary,
-startup hook, or runtime route. Consequently no dedicated/application
-production credential is authorized to populate or advance
+are implemented with a database-local, cluster-admin-only one-shot logical-role
+policy. The policy creates no login, AWS secret or task, production-image
+binary, startup hook, or runtime route. Consequently no production credential
+is authorized to populate or advance
 `memory_registry_transitions`,
 `memory_registry_genesis_bridge_consumptions`, or
 `memory_registry_current_heads_v2`; the migrator/schema owner retains technical
-authority, and all three tables remain quarantined from application roles.
+authority, and all three tables remain quarantined from normal application
+roles. Only a separately provisioned, exclusive local ceremony login may
+temporarily inherit the reviewed successor role.
 
-Conflict reconciliation is further along operationally but is still private:
-it has an apply-only workstation CLI and a database-local one-shot role policy
+Conflict reconciliation is likewise private: it has an apply-only workstation
+CLI and a database-local one-shot role policy
 applied by a cluster admin only; database ownership alone is insufficient. That
 policy requires its external cross-database grant/ownership audit; neither the
 policy nor its credential/CLI is wired into Terraform, the runtime role, an AWS
@@ -212,8 +214,9 @@ TO fleet_runtime;
 ```
 
 Do not add the three successor tables from migrations 12 through 14 to this
-runtime grant. They remain migrator/schema-owner only. The existence of their
-schema and canonical contracts does not create runtime successor authority.
+runtime grant. They remain unavailable to runtime and the earlier application
+roles. The existence of their schema, canonical contracts, and one-shot
+successor role does not create runtime or cloud successor authority.
 
 Then apply and verify the exact control-plane exclusions and one-shot bootstrap
 grants in [the private control bootstrap policy](CONTROL_BOOTSTRAP.md). The
@@ -279,7 +282,9 @@ is:
 After that base role exists on a database containing the successful prefix
 through 14, apply the successor-schema quarantine policy linked above. The
 quarantine is mandatory even when no activation login is enabled and must
-remain exact until a separately reviewed successor SQL writer role replaces it.
+remain exact after the separately reviewed successor logical-role policy is
+applied: quarantine excludes the prior roles, while the successor policy owns
+its distinct one-shot grant surface.
 
 The logical role is forced to `NOLOGIN`, `NOCREATEROLE`, and `NOCREATEDB`. Its
 database/schema surface is only `CONNECT` on the database and `USAGE` on
@@ -321,6 +326,8 @@ Keep both login secrets exclusive to their reviewed commands, disable them
 outside the ceremony, and treat a wedge as corruption requiring an audited
 forward repair.
 
+### First-successor activation gate
+
 Migration 4 and the checked-in genesis-activation role install only the genesis
 head. That role has no `UPDATE` on `memory_registry_heads`. Migrations 12
 through 14, the separately versioned contracts, the
@@ -330,16 +337,53 @@ first transition from generation 0 to 1. The repository requires the complete
 successful prefix through 14 and revalidates its bound canonical artifacts and
 durable roots inside the serializable transition.
 
-Implementation is not deployment authority. There is still no successor SQL
-writer principal/logical role, write-grant RBAC policy, AWS secret or task,
-production-image binary, startup hook, or runtime/public route. The checked-in
-quarantine policy only revokes existing-role access. Never overwrite the
-genesis row, grant the genesis-activation credential access to the three
-successor tables, or operate the successor CLI with migrator/runtime authority.
-A production successor ceremony requires a separately reviewed least-privilege
-role and credential path matching the repository's exact SQL surface.
+The checked-in
+[`successor-activation-role-grants.sql`](../deploy/cockroach/successor-activation-role-grants.sql)
+creates and hardens the database-local
+`fleet_registry_successor_activation` `NOLOGIN` logical role. It requires the
+exact successful prefix 1 through 14 and the runtime, control-bootstrap, and
+genesis-activation roles already hardened to exact `NOLOGIN`; later migration
+rows are compatible. The reconciliation role is optional, not a fourth
+prerequisite. The successor role receives only database `CONNECT`, public
+schema `USAGE`, and 16 non-grantable table rows: migration-history and
+read-only witness access plus the exact `SELECT`/`INSERT`/`UPDATE` operations
+reachable from the repository. It receives no sequence, `DELETE`, DDL, SYSTEM,
+ownership, grant-option, or unrelated-object authority.
 
-Run the pinned disposable-cluster proof before deployment:
+This policy is intentionally database-local and cluster-admin-only; database
+ownership alone is insufficient. Before every apply/reapply and use, quiesce
+all member credentials and freeze role, grant, default, ownership, and
+schema-DDL changes. Clean every forbidden non-target PUBLIC routine default,
+including the reconciliation role's creator-scoped row if that optional role
+exists, and remove either direction of successor/reconciliation membership.
+Then audit every other database for direct successor-role grants and ownership
+and separately inventory inherited PUBLIC authority. Those conditions fail
+closed and require explicit operator cleanup; neither SQL policy is a
+self-contained composition mechanism. Reapply the successor policy immediately
+before giving one externally provisioned workstation login exclusive
+membership, run the reviewed CLI, then revoke membership and restore
+`NOLOGIN`/clear the login credential. The SQL file cannot perform the
+cross-database audit or provision that login.
+
+Implementation is not deployment authority. There is no successor AWS secret
+or task, production-image binary, startup hook, or runtime/public route. Never
+overwrite the genesis row, grant the genesis-activation credential access to
+the three successor tables, or operate the successor CLI with
+migrator/runtime authority.
+
+Run the dedicated secondary Docker RBAC proof before a ceremony:
+
+```bash
+./deploy/cockroach/tests/successor-activation-role-grants.sh
+```
+
+It freezes the exact policy/grant matrix, fail-closed preconditions, allowed and
+denied SQL operations, drift repair, external-audit shape, and reapplication on
+CockroachDB v26.2.3. It is packaging/RBAC parity, not the authoritative
+connected correctness result and not AWS evidence.
+
+Separately, run the pinned genesis-activation Docker RBAC proof before
+deployment:
 
 ```bash
 ./deploy/cockroach/tests/registry-activation-role-grants.sh
@@ -360,9 +404,10 @@ default and removes its isolated container afterward. This Docker RBAC lane
 owns the complete allow/deny/grant-option drift matrix, including successor
 quarantine. The authoritative official-binary correctness lane separately
 applies the complete migration chain through 17 and exercises the successor
-repository live test. It does not exercise the successor workstation CLI,
-supply a production successor SQL role, or prove RBAC, image, AWS, or deployment
-authority.
+repository plus the successor workstation CLI's offline binding, readiness,
+inserted, accepted, exact-replay, and stale matrix under two bounded membership
+windows. It does not replace the separate Docker RBAC matrix or prove image,
+AWS, or deployment authority.
 
 ### Conflict-detector reconciliation gate
 
@@ -385,15 +430,21 @@ missing or failed prerequisite. Before applying
 apply the control and genesis-activation role policies and confirm their three
 logical roles are hardened. Run the reconciliation policy in the dedicated
 `fleet_recall` database as a cluster admin only; database ownership alone is
-insufficient.
+insufficient. The successor role is optional and is not a fourth reconciliation
+prerequisite.
 
 That SQL policy intentionally audits and repairs only the current
 `fleet_recall.public` boundary. Before every apply and use, the operator must
-enumerate every other database and reject or revoke all direct grants and
-ownership held there by `fleet_conflict_reconciliation`, separately inventory
-inherited `public` authority, and freeze concurrent role, grant, default,
-ownership, and schema-DDL changes through member enable/use/disable. The
-cross-database audit cannot be delegated to the database-local SQL file.
+quiesce members and freeze concurrent role, grant, default, ownership, and
+schema-DDL changes through member enable/use/disable. Clean every forbidden
+non-target PUBLIC routine default (including the successor role's
+creator-scoped row when that role exists) and reject either direction of
+successor/reconciliation membership. Then enumerate every other database and
+reject or revoke all direct grants and ownership held there by
+`fleet_conflict_reconciliation` and separately inventory inherited `public`
+authority. The cross-database audit and conditional cleanup cannot be delegated
+to the database-local SQL file; the two policies do not compose without this
+explicit operator preflight.
 
 Provision a separate login externally and grant it membership only in the
 `NOLOGIN` `fleet_conflict_reconciliation` role while every other member
@@ -420,6 +471,11 @@ Docker RBAC proof before use:
 ```bash
 ./deploy/cockroach/tests/conflict-reconciliation-role-grants.sh
 ```
+
+That proof also exercises the optional-successor creator-default cleanup and
+exact role-edge preflights. It must not be cited as proof that the two policies
+self-compose: the cluster admin still performs the conditional cleanup and
+cross-database/PUBLIC audit before the policy and exclusive member window.
 
 ## Failure and interruption recovery
 

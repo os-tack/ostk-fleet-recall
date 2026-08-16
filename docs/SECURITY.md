@@ -55,7 +55,10 @@ strict-TLS database URL. It verifies the artifact graph before connecting, then
 the repository reauthenticates the one-time bridge and candidate against the
 locked durable genesis root inside the serializable generation-0-to-1
 transition. This repository/CLI is source capability, not deployed SQL
-authority: no successor writer role or grant bundle exists.
+authority. Its checked-in `fleet_registry_successor_activation` policy creates
+only a hardened, database-local `NOLOGIN` logical role; an exclusive login,
+temporary membership, and the complete operator audit/enable/use/disable
+ceremony remain external and have no AWS or serving path.
 
 Accepted control and activation events are append-only and source-positioned.
 Bootstrap/activation transactions use one database acceptance time, scoped
@@ -100,20 +103,33 @@ SQL principal and dedicated registry URL. Those one-shot credentials are never
 fallbacks for runtime or migration credentials and should be disabled or
 removed after the ceremony.
 
-The successor repository and workstation apply/inspect CLI exist, but there is
-no successor SQL writer principal/logical role, write-grant RBAC bundle, AWS
-task, production-image binary, startup hook, or public/runtime route. The
-checked-in
+The successor repository and workstation apply/inspect CLI have a separately
+checked-in one-shot
+[`fleet_registry_successor_activation` policy](../deploy/cockroach/successor-activation-role-grants.sql).
+Only a cluster admin may apply it in the exact `fleet_recall` database after
+successful prefix 1 through 14 and after the runtime, control-bootstrap, and
+genesis-activation roles are hardened to exact `NOLOGIN`; database ownership
+alone is insufficient. The policy creates a `NOLOGIN` logical role with only
+`CONNECT`, public-schema `USAGE`, and the exact read/write table surface used by
+the successor repository. It grants no sequence, `DELETE`, DDL, SYSTEM,
+ownership, grant-option, or unrelated-object authority.
+
+The companion
 [quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql)
-is deny-only: after prefix 1 through 14 it revokes every successor-table
+remains deny-only: after prefix 1 through 14 it revokes every successor-table
 privilege from `public`, runtime, bootstrap, and genesis activation and grants
-nothing. Until the SQL authorization and deployment surface is implemented and
-reviewed together,
-`memory_registry_transitions`,
-`memory_registry_genesis_bridge_consumptions`, and
-`memory_registry_current_heads_v2` remain migrator/schema-owner only. Neither
-the runtime user nor either existing one-shot role may receive access merely
-because the migrations and contracts exist.
+nothing. It does not conflict with the separate successor boundary. Before
+every successor-policy apply and use, a cluster admin must drain members and
+freeze role, grant, default, ownership, and schema-DDL changes. Clean forbidden
+future defaults, including an optional reconciliation role's creator-scoped
+PUBLIC routine default, and remove either-direction successor/reconciliation
+membership edges. Then enumerate every other database for direct successor-role
+grants and ownership and separately inventory inherited PUBLIC authority.
+Reapply the successor policy immediately before granting an externally
+provisioned login exclusive membership, run the reviewed CLI ceremony, then
+revoke membership and disable the login. The SQL file cannot perform the
+cross-database audit or provision the login. No AWS task, production-image
+binary, startup hook, or public/runtime route exists.
 
 Conflict reconciliation has a different, explicitly implemented one-shot
 boundary. Only a cluster admin may apply the database-local policy; database
@@ -122,12 +138,18 @@ ownership alone is insufficient. Apply the
 after successful prefix 1 through 16 and the three prior logical roles are
 hardened. A separately provisioned login may temporarily receive
 membership only in that `NOLOGIN` logical role for the apply-only workstation
-CLI. Before every apply and use, an external operator audit must enumerate all
-other databases for direct grants/ownership and account separately for
-inherited `public` authority under a role/grant/schema-DDL change freeze. The
-SQL file cannot perform that cross-database audit. Remove membership or disable
-the login afterward. No Terraform, runtime, image, ECS, MCP, or HTTP wiring
-exists.
+CLI. The successor role is optional, not a fourth prerequisite. Before every
+reconciliation apply and use, quiesce members and freeze authority changes. If
+the successor role exists, explicitly remove its creator-scoped PUBLIC routine
+default and either direction of successor/reconciliation membership. Then
+enumerate all other databases for direct reconciliation grants/ownership and
+account separately for inherited PUBLIC authority before applying the
+reconciliation policy. The reciprocal cleanup-before-audit order is required
+before a successor policy apply when reconciliation exists. Both edge shapes
+fail closed before policy mutation, but neither SQL file can perform the other
+role's conditional default cleanup or the cross-database audit. Remove
+membership and disable the login afterward. No Terraform, runtime, image, ECS,
+MCP, or HTTP wiring exists.
 
 All database URL surfaces require `postgres`/`postgresql`, a hostname, and a
 closed parameter set. Serving and Stage-2 control require exactly
@@ -182,11 +204,19 @@ the head-authorized append. These credentials are therefore exclusive
 ceremony capabilities, not operator shells or general service accounts.
 
 The existing genesis-activation credential is genesis-only. It has no authority
-over the successor tables. Although the successor repository and workstation
-CLI are implemented, the absence of a dedicated SQL writer role/grant policy
-means they are not an enabled production successor runtime. The migrator/schema
-owner retains technical authority and must not be repurposed as that missing
-application credential.
+over the successor tables. The successor repository, workstation CLI, and
+dedicated logical-role policy are implemented, but they are not an enabled
+production successor runtime: there is no deployed login, AWS secret or task,
+image binary, startup hook, or route. The migrator/schema owner retains
+technical authority and must not be repurposed as the ceremony credential.
+
+The successor role necessarily has raw `INSERT` and `UPDATE` table authority,
+including table-level `UPDATE` for its `FOR UPDATE`/compare-and-swap paths.
+CockroachDB RBAC cannot limit that credential to the repository's prepared
+statements. Keep its login quiesced outside the exclusive ceremony, repeat the
+external audit and policy immediately before membership/use, and treat direct
+SQL misuse or a partial projection as corruption requiring an audited forward
+repair.
 
 The reconciliation role necessarily has a bounded mix of
 `SELECT`/`INSERT`/`UPDATE` on its exact legacy-ledger table set and `USAGE` on

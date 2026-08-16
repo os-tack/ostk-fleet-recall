@@ -139,10 +139,17 @@ After migration 0014, that audit and quarantine proof must show no `public`,
 runtime, bootstrap, or genesis-activation grant on
 `memory_registry_transitions`,
 `memory_registry_genesis_bridge_consumptions`, or
-`memory_registry_current_heads_v2`. A successor repository and workstation
-apply/inspect CLI now exist, but the tables remain migrator/schema-owner only
-because there is no dedicated successor SQL writer principal/logical role or
-write-grant RBAC policy. There is likewise no AWS secret/task,
+`memory_registry_current_heads_v2`. A successor repository, workstation
+apply/inspect CLI, and separate cluster-admin-only
+[`fleet_registry_successor_activation` policy](../deploy/cockroach/successor-activation-role-grants.sql)
+now exist. That policy creates a hardened `NOLOGIN` logical role with the
+repository's exact bounded grant matrix, but no login or deployment surface.
+Before a separately authorized local ceremony, freeze authority changes, clean
+forbidden defaults and either-direction successor/reconciliation membership
+edges, audit every other database for direct successor-role grants/ownership
+and inherited PUBLIC authority, and reapply the policy immediately before
+giving one quiesced external login temporary exclusive membership. Revoke
+membership and disable the login afterward. There is no AWS secret/task,
 production-image binary, startup hook, or runtime/public route. These source
 capabilities do not expand Stage-2 authority.
 
@@ -154,9 +161,15 @@ and genesis policies are hardened, as a cluster admin only; database ownership
 alone is insufficient. Its required audit of
 direct grants/ownership in every other database and inherited `public`
 authority remains an external operator step under a role/grant/schema-DDL
-change freeze. The reconciliation role and apply-only workstation CLI have no
-Terraform, production-image, ECS, MCP, HTTP, or serving-runtime wiring and do
-not expand the Stage-2 role.
+change freeze. The successor role is optional, not an additional prerequisite;
+when it exists, the operator must explicitly remove its creator-scoped PUBLIC
+routine default and either-direction successor/reconciliation membership before
+reconciliation apply/reapply. The reciprocal cleanup applies before successor
+policy reapply. The role edges fail closed before mutation, and neither SQL
+file performs the cross-database or conditional-default cleanup for the other.
+The reconciliation role and apply-only workstation CLI have no Terraform,
+production-image, ECS, MCP, HTTP, or serving-runtime wiring and do not expand
+the Stage-2 role.
 
 The required raw `INSERT` surface is still powerful: direct SQL can occupy a
 scope singleton with invalid canonical bytes or plant a detached future event
@@ -192,7 +205,8 @@ container. This is the frozen Stage-2/genesis-role proof boundary, not a
 successor writer or current application-image migration-parity proof. The
 authoritative official CockroachDB v26.2.3 correctness lane covers versions 1
 through 17 and exercises the successor repository, functional-polarity matrix,
-and conflict-reconciliation repository/CLI. It does not supply successor RBAC,
-run the successor workstation CLI, or replace the separate Docker
-allow/deny/grant-option matrices. Neither substrate contacts AWS or needs
-LocalStack.
+conflict-reconciliation repository/CLI, and the complete successor-CLI state
+matrix under temporary role-membership windows. The successor and
+reconciliation allow/deny/grant-option matrices remain separate secondary
+Docker RBAC results and do not become authoritative merely because their build
+tag matches. Neither substrate contacts AWS or needs LocalStack.

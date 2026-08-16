@@ -267,10 +267,11 @@ runtime or `public` role access to `memory_control_bootstraps`,
 access to `memory_registry_transitions`,
 `memory_registry_genesis_bridge_consumptions`, or
 `memory_registry_current_heads_v2`: those migration-12-through-14 tables remain
-migrator/schema-owner only. The successor repository and workstation CLI exist,
-but no successor SQL writer principal/logical role or write-grant RBAC bundle
-exists. After the prefix reaches 14 and the two frozen private logical-role
-policies have run, apply the deny-only
+unavailable to normal production application credentials. The successor
+repository, workstation CLI, and cluster-admin-only one-shot logical-role
+policy exist, but no successor login, AWS credential, task, image binary, or
+runtime path exists. After the prefix reaches 14 and the two earlier frozen
+private logical-role policies have run, apply the deny-only
 [quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql);
 it gates on all fourteen successful rows, revokes every existing application
 role named by that policy, and grants nothing. Migrations 15 through 17 add or
@@ -311,19 +312,31 @@ secret input, IAM execution role, ECS task, startup hook, or public route. Do
 not overload either AWS secret with a private ceremony credential.
 
 The successor repository and `ostk-registry-successor-activate` apply/inspect
-CLI are workstation source surfaces only. There is no successor SQL writer
-role/grant policy, AWS credential/task, production-image binary, startup hook,
-or runtime route; the migrator/schema owner retains technical authority but is
-not an application successor credential.
+CLI are workstation source surfaces only. The checked-in
+[`fleet_registry_successor_activation` policy](../deploy/cockroach/successor-activation-role-grants.sql)
+creates a hardened database-local `NOLOGIN` logical role, not a login or cloud
+route. Before a separately approved local use, a cluster admin must freeze
+authority changes, clean every forbidden non-target PUBLIC routine default
+(including the reconciliation role's creator-scoped row when that optional role
+exists), remove either-direction successor/reconciliation role edges, audit
+every other database for direct role grants/ownership and inherited PUBLIC
+authority, and reapply the policy.
+Only then may one external login receive exclusive temporary membership; revoke
+membership and disable the login afterward. There is no AWS credential/task,
+production-image binary, startup hook, or runtime route; the migrator/schema
+owner is not a ceremony credential.
 
 Conflict reconciliation has an apply-only workstation CLI and a checked-in
 database-local one-shot role policy. Only a cluster admin may apply it;
 database ownership alone is insufficient. Apply it after its prefix-16 and
-prior-role gates. Before every apply/use, the operator must
-externally audit every other database for direct role grants/ownership and
-inherited `public` authority under a change freeze; the local SQL file cannot
-perform that cross-database audit. No Terraform, AWS, image, runtime, MCP, or
-HTTP wiring exists.
+prior-role gates; successor remains optional. Before every apply/use, freeze
+authority changes and clean every forbidden non-target PUBLIC routine default,
+including successor's creator-scoped row when that optional role exists, plus
+either-direction role edges. Then externally audit every other database for
+direct reconciliation grants/ownership and inherited PUBLIC authority before
+applying the policy. The local SQL file cannot perform that conditional cleanup
+or cross-database audit. No Terraform, AWS, image, runtime, MCP, or HTTP wiring
+exists.
 
 If the separately reviewed Stage-2 ceremony is actually run, create a third,
 private SQL principal with no admin membership and only the grants in
@@ -334,10 +347,10 @@ principal with the exact activation grants in [MIGRATIONS.md](MIGRATIONS.md)
 and retire it after use. That genesis repository keeps its prefix-1-through-9
 compatibility gate even when the current release prefix reaches 17; it has no
 successor-table authority. The successor repository keeps its prefix-14 gate,
-and reconciliation keeps prefix 16; neither is authorized by either AWS
-credential. All private ceremonies remain local until a
-separate deployment increment adds and reviews explicit cloud wiring. Their
-artifacts, pins, profiles, and URL rules are summarized in
+and reconciliation keeps prefix 16; neither one-shot logical role nor any
+member is authorized by either AWS credential. All private ceremonies remain
+local until a separate deployment increment adds and reviews explicit cloud
+wiring. Their artifacts, pins, profiles, and URL rules are summarized in
 [SECURITY.md](SECURITY.md).
 
 ## 7. Preserve and upload the pinned model

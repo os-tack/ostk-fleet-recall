@@ -28,17 +28,31 @@ cannot count as connected success.
 | Online-index interruption recovery and drift rejection | `--lib` / `store::cockroach::tests::live_online_index_migrations_recover_and_reject_drift_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Transactional-DDL rollback | `--lib` / `store::cockroach::tests::live_transactional_migration_rolls_back_ddl_on_history_conflict_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 
-The same isolated server also exercises inspect/apply/replay for the control and
-genesis-activation CLIs, plus materialize/exact replay for the apply-only
-conflict-reconciliation CLI. It requires exactly 17 successful SQLx
-rows with versions 1 through 17, the three successor authority tables, the two
-genesis-root indexes, and the exact indexes introduced by migrations 15, 16,
-and 17. The retired pre-v15 conflict uniqueness index must be absent. The proof
-replays the resumable index-transition bytes, exercises online recovery, and
-shows that failed migration 12 is not masked by successful migration 17.
+The same isolated server also exercises all four private workstation CLIs:
+inspect/apply/replay for control and genesis activation; offline artifact
+binding, pre-genesis and failed-prefix rejection, then
+`Ready`/`Inserted`/`Accepted`/`ExactReplay`/`Stale` for successor activation;
+and materialize/exact replay for apply-only conflict reconciliation. It
+requires exactly 17 successful SQLx rows with versions 1 through 17, the three
+successor authority tables, the two genesis-root indexes, and the exact indexes
+introduced by migrations 15, 16, and 17. The retired pre-v15 conflict
+uniqueness index must be absent. The proof replays the resumable
+index-transition bytes, exercises online recovery, and shows that failed
+migration 12 is not masked by successful migration 17.
 Migrations 15 through 17 add or replace indexes rather than successor tables,
 so the exact successor table set remains the three tables introduced by
 migrations 12 through 14.
+
+The successor CLI portion first cross-wires the approval set's top-level
+statement ID and every approval statement ID to prove exact artifact binding
+fails before an unreachable database URL is used. It then opens two bounded
+role-membership windows separated by genesis activation and fresh fixture
+emission: the first proves pre-genesis `NotReady` and migration-14 failure
+without changing the seven-table successor-state fingerprint set; the second
+proves the current state matrix and timestamp/control/legacy invariants. Membership is
+absent between and after those windows. Final cleanup revokes it, restores
+`NOLOGIN`, clears the login password, proves authentication fails, and requires
+no successor membership residue.
 
 That exact 1-through-17 assertion freezes the current HEAD release; it is
 distinct from the serving compatibility floor, which accepts a complete
@@ -49,16 +63,14 @@ Stage 2 still requires the complete successful prefix through 3, genesis Stage
 3 through 9, the successor repository through 14, and conflict reconciliation
 through 16.
 
-Do not count the live successor-repository row as a successor-CLI result. The
-three private CLIs in this authoritative wrapper are control bootstrap, genesis
-activation, and conflict reconciliation. The source-present
-`ostk-registry-successor-activate` command is workstation-only. Its checked-in
-`fleet_registry_successor_activation` role policy is a short-lived, exclusive
-credential boundary, not a deployment route or an additional official-CLI
-result. Conflict reconciliation and its logical role are likewise one-shot
-workstation surfaces. None of the four private CLIs has an AWS, Terraform,
-task, production image, runtime, startup, or server-route surface; the
-production image excludes all four.
+The successor repository test and successor CLI matrix are distinct checks
+inside the same one-server result; do not report either as a separate server
+result. The checked-in `fleet_registry_successor_activation` role policy is a
+short-lived, exclusive credential boundary, not a deployment route. Conflict
+reconciliation and its logical role are likewise one-shot workstation
+surfaces. None of the four private CLIs has an AWS, Terraform, task, production
+image, runtime, startup, or server-route surface; the production image excludes
+all four.
 
 Run the authoritative proof with an already checksum-verified binary:
 
@@ -76,7 +88,7 @@ counted as Docker evidence.
 
 | Reported result | Substrate and scope | Relationship to authority |
 | --- | --- | --- |
-| Official-binary correctness | One checksum-pinned, build-tag-pinned TLS `v26.2.3` server running the complete matrix and the control, genesis-activation, and conflict-reconciliation CLIs | The single authoritative connected result |
+| Official-binary correctness | One checksum-pinned, build-tag-pinned TLS `v26.2.3` server running the complete matrix and all four private CLIs | The single authoritative connected result |
 | Control RBAC parity | `control-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Activation RBAC parity | `registry-activation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Successor-activation RBAC parity | `successor-activation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
@@ -172,6 +184,15 @@ creating its role, admits the exact successful prefix through 16 with or
 without later migration 17, and reapplies the policy after
 privilege, grant-option, role-option, PUBLIC, and named bidirectional membership
 drift.
+The successor role remains optional rather than becoming a fourth prerequisite.
+When it exists, the proof shows its creator-scoped PUBLIC routine default blocks
+reconciliation before unrelated drift is normalized, performs the required
+cluster-admin cleanup explicitly, freezes both exact successor/reconciliation
+edge predicates, and dynamically proves both edge directions fail before
+mutation even with a LOGIN successor and no admin option. The reconciliation
+policy neither creates nor normalizes the successor role; passing these vectors
+does not remove the documented cleanup, cross-database audit, and exclusive
+member ceremony.
 Two same-session temporary-schema adversaries freeze the name-resolution
 boundary: a valid temporary 1-through-16 history cannot mask a missing or
 failed real `public._sqlx_migrations` prefix, while a deliberately failed

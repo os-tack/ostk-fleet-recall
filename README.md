@@ -32,13 +32,14 @@ retrieves memory, applies an explicit deterministic policy, and records a cited
 action. It does not invoke OSTK, an LLM, or a model API. The OSTK adapter is a
 strictly optional interoperability path.
 
-Two additional binaries are private workstation tools, not product or hosted
-routes. `ostk-registry-successor-activate` applies or inspects the one-time
-genesis-to-first-successor transition through the checked-in successor
-repository. `ostk-conflict-reconcile` is apply-only and materializes a new v2
-conflict lineage for one immutable legacy conflict revision. Neither binary is
-copied into the production image or wired into Terraform, ECS, the public HTTP
-service, or normal MCP/runtime startup.
+Four operational binaries are private workstation tools, not product or hosted
+routes. `ostk-control-bootstrap` and `ostk-registry-activate` implement the
+Stage-2 and genesis Stage-3 ceremonies. `ostk-registry-successor-activate`
+applies or inspects the one-time genesis-to-first-successor transition through
+the checked-in successor repository. `ostk-conflict-reconcile` is apply-only
+and materializes a new v2 conflict lineage for one immutable legacy conflict
+revision. None is copied into the production image or wired into Terraform,
+ECS, the public HTTP service, or normal MCP/runtime startup.
 
 Attention schema space is reserved for future compatibility, but attention
 actions and a runtime attention workflow are **not implemented** in this
@@ -56,18 +57,26 @@ narrower: Stage-2 control requires prefix 1 through 3, genesis Stage-3 requires
 1 through 9, the first-successor repository requires 1 through 14, and
 conflict-detector reconciliation requires 1 through 16.
 
-Migrations 12 through 14 supply the three successor tables, and the successor
-repository plus workstation CLI now exist. There is still no successor SQL
-writer principal/logical role, write-grant RBAC policy, AWS secret or task,
-production-image binary, startup hook, or public/runtime route. The deny-only
-quarantine continues to keep those tables away from the four prior application
+Migrations 12 through 14 supply the three successor tables. The successor
+repository, apply/inspect workstation CLI, and database-local
+`fleet_registry_successor_activation` one-shot role policy now exist. The
+policy is cluster-admin-only and creates a hardened `NOLOGIN` logical role; it
+does not provision a login or add an AWS secret, task, production-image binary,
+startup hook, or public/runtime route. The deny-only quarantine continues to
+keep those tables away from PUBLIC and the three prior application logical
 roles, and the reconciliation policy separately grants them no successor-table
-access. Conflict reconciliation has an apply-only workstation CLI and a
-database-local, cluster-admin-only one-shot role policy; database ownership is
-insufficient, and its mandatory cross-database grant/ownership audit remains an
-external operator step. It also has no Terraform secret, ECS task,
-production-image binary, serving credential, or runtime route. The AWS module
-still wires only the distinct runtime and migrator database credential paths.
+access. A
+separately provisioned successor login may receive role membership only for an
+exclusive local ceremony after cleanup of the other optional role's
+creator-scoped PUBLIC routine default and either-direction membership edges,
+the required external cross-database and PUBLIC-authority audit, and immediate
+policy reapply. It must lose that membership and login capability afterward.
+Conflict reconciliation likewise has an apply-only workstation CLI and a
+database-local, cluster-admin-only one-shot role policy. Database ownership is
+insufficient for either policy, and their mandatory cross-database audits
+remain external operator steps. Neither has Terraform, ECS, production-image,
+serving, or runtime wiring. The AWS module still wires only the distinct
+runtime and migrator database credential paths.
 
 None of those source facts upgrades the historical cloud evidence below.
 
@@ -483,10 +492,13 @@ the remaining rows.
   workload identity, authorization, rate limiting, and production network
   controls.
 - Migrations 12 through 14 reserve durable successor state, and a private
-  successor repository plus workstation CLI exist. Their three tables remain
-  migrator/schema-owner only under the deny-only quarantine because no
-  successor SQL writer role or reviewed grant bundle exists. Repository code
-  and contracts alone do not authorize a production write.
+  successor repository, workstation CLI, and reviewed one-shot logical-role
+  policy exist. The deny-only quarantine keeps their three tables away from
+  runtime and the prior private roles. Only a separately provisioned login in
+  the hardened `fleet_registry_successor_activation` role may receive the
+  policy's exact table surface during an exclusive local ceremony; no AWS,
+  image, startup, or serving credential is authorized. Repository code and
+  contracts alone do not authorize a production write.
 - The v2 conflict detector is proposition-aware: different affirmative values
   conflict; affirmation and negation conflict only for the same exact value;
   two negations are compatible. Legacy detector rows are immutable. The
@@ -532,8 +544,9 @@ only one-row functional behavior.
 
 The authoritative migration correctness lane targets the pinned official
 CockroachDB v26.2.3 binary and covers fresh, interruption, catalog-drift,
-transactional rollback, successor-repository,
-functional-polarity, and conflict-reconciliation cases through migration 17.
+transactional rollback, successor-repository and successor-CLI state matrices,
+functional-polarity, conflict reconciliation, and all four private CLIs through
+migration 17 on one checksum-pinned TLS server.
 The full role allow/deny/grant-option matrices remain separate Docker RBAC
 proofs. The recorded LocalStack application-image smoke predates migrations 10
 through 17 and must be rerun before claiming current image parity. None of these

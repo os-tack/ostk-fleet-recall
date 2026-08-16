@@ -96,11 +96,25 @@ reuse either Terraform-managed secret for those credentials. See the
 [security policy](../../docs/SECURITY.md) and
 [migration privilege boundary](../../docs/MIGRATIONS.md).
 
-The successor repository and workstation CLI exist in source, and conflict
-reconciliation has a workstation-applied logical-role policy. Neither is
-deployed runtime authority. There is no checked-in successor write-grant role
-policy, and the migration-12-through-14 tables remain quarantined in
-production until a separately reviewed deployment increment supplies one.
+The successor repository and workstation CLI exist in source, and both
+successor activation and conflict reconciliation have cluster-admin-applied,
+database-local one-shot logical-role policies. Neither is deployed runtime
+authority. The successor policy does not provision a login or any cloud
+credential; the migration-12-through-14 tables remain quarantined from every
+production application role. Only a separately authorized local ceremony may
+temporarily enable an externally provisioned successor-role member.
+
+That local ceremony is outside this module. Apply the control and genesis
+policies and successor quarantine first. Then quiesce private members, freeze
+role/grant/default/ownership/schema-DDL changes, explicitly clean forbidden
+non-target PUBLIC routine defaults (including reconciliation's creator row if
+that optional role exists) and either-direction successor/reconciliation
+edges, audit the successor role and PUBLIC authority across every database,
+then reapply the successor policy immediately before the exclusive member's
+enable/use/disable window. A later reconciliation ceremony performs the
+symmetric cleanup and audit, including the successor creator row; successor is
+optional, not a reconciliation prerequisite. Neither database-local policy can
+perform those cross-database and conditional cleanup steps by itself.
 
 ## 1. Prepare and pin the model bundle
 
@@ -232,9 +246,9 @@ are a separate, explicitly authorized workstation operation.
 The authoritative official-binary lane uses one checksum-pinned,
 build-tag-pinned TLS CockroachDB v26.2.3 server and reports one connected
 result. It proves the v1–v17 migration behavior, three live repositories, the
-named ledger/store proofs, and the control-bootstrap, genesis-activation, and
-conflict-reconciliation CLIs. The reconciliation RBAC Docker proof and the
-other Docker role/CLI proofs remain secondary parity results; they cannot be
+named ledger/store proofs, and all four private CLIs, including the successor
+state matrix. The successor/reconciliation RBAC Docker proofs and the other
+Docker role/CLI proofs remain secondary parity results; they cannot be
 substituted for that official result. The recorded LocalStack application
 image smoke predates migrations 10 through 17, so it is not current image
 parity. None of these local proofs says the migrations ran in the historical
@@ -593,14 +607,14 @@ dropped, and the temporary workstation network rule was removed after capture.
 - The runtime SQL user needs DML on the Fleet Recall tables and read access to
   `_sqlx_migrations`; it does not need schema creation. The separate migration
   task definition must inject the distinct DDL-capable secret.
-- Do not grant runtime or either existing one-shot role access to
+- Do not grant runtime or any prior one-shot role access to
   `memory_registry_transitions`,
   `memory_registry_genesis_bridge_consumptions`, or
-  `memory_registry_current_heads_v2`. Those successor tables remain
-  migrator/schema-owner only under the production quarantine. The successor
-  repository and workstation CLI do not grant production authority; keep the
-  quarantine until a write-grant RBAC policy and deployment increment are
-  reviewed together.
+  `memory_registry_current_heads_v2`. Those successor tables remain unavailable
+  to the production application roles under the quarantine. The private
+  successor policy may grant only its exact bounded surface to a temporary,
+  externally provisioned member during an exclusive local ceremony; it does
+  not grant production authority or create AWS wiring.
 - No AWS role or task receives a private control, genesis-activation,
   successor-activation, or conflict-reconciliation credential. Their one-shot
   commands remain workstation-only until a separately reviewed deployment

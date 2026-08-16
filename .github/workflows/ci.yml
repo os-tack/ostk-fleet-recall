@@ -90,7 +90,7 @@ jobs:
           binary_dir="$RUNNER_TEMP/cockroach-${COCKROACH_VERSION}.linux-amd64"
           test "$("$binary_dir/cockroach" version --build-tag)" = "$COCKROACH_VERSION"
           echo "$binary_dir" >> "$GITHUB_PATH"
-      - name: Run three live repositories, named ledger/store proofs, and three private CLIs
+      - name: Run three live repositories, named ledger/store proofs, and four private CLIs
         run: ./deploy/cockroach/tests/registry-activation-cli.sh
 
   # Docker is a secondary packaging/RBAC parity substrate. These jobs assert

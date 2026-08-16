@@ -32,15 +32,16 @@ The current checkout now embeds migrations 1 through 17. Versions 1 through 11
 and 15 through 17 are nontransactional, with resumable exact-catalog
 assertions for the online index transitions; v12 through v14 are transactional
 on a dedicated session with `autocommit_before_ddl = false`. The repository's
-current authoritative CockroachDB v26.2.3 lane covers fresh and populated
-upgrades, interruption, catalog drift, and rollback. The exact current release
-chain is 1 through 17, while serving compatibility requires a complete
-successful prefix of at least 17; the private control, genesis, successor
-repository, and reconciliation gates remain 3, 9, 14, and 16 respectively.
+current authoritative CockroachDB v26.2.3 lane covers fresh migration,
+online-index interruption/recovery and drift rejection, transactional rollback,
+the three live repositories, the named ledger/store proofs, and all four
+private CLIs. The exact current release chain is 1 through 17, while serving
+compatibility requires a complete successful prefix of at least 17; the private
+control, genesis, successor repository, and reconciliation gates remain 3, 9,
+14, and 16 respectively.
 That authoritative connected lane is one checksum-pinned TLS server and one
-result covering three live repositories, the named ledger/store proofs, and
-three private CLIs. Docker RBAC jobs, including reconciliation RBAC, are
-secondary parity only.
+result; its individual rows are not separate server results. Docker RBAC jobs,
+including successor and reconciliation RBAC, are secondary parity only.
 
 The recorded Docker/Compose smoke below predates migrations 10 through 17 and
 has not been rerun for those bytes, so it is not current Docker-image parity

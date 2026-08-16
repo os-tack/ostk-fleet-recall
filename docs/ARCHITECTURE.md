@@ -88,11 +88,12 @@ Private authority processes remain outside this topology. The workstation-only
 successor CLI constructs the checked-in first-successor repository, and the
 apply-only conflict-reconciliation CLI constructs its separate repository.
 Neither binary is present in the production image or represented by an AWS
-secret, IAM role, task definition, startup hook, MCP method, or HTTP route. The
-reconciliation SQL role policy is applied locally inside `fleet_recall` by a
-cluster admin only and depends on a separate cross-database authority audit;
-database ownership alone is insufficient, and it is not Terraform or runtime
-wiring.
+secret, IAM role, task definition, startup hook, MCP method, or HTTP route.
+Successor activation and reconciliation each have a database-local one-shot
+logical-role policy applied inside `fleet_recall` by a cluster admin only.
+Both depend on a separate cross-database/PUBLIC-authority audit and an exclusive
+temporary member window; database ownership alone is insufficient, and neither
+policy is Terraform or runtime wiring.
 
 ECS containers are stateless. Replacing or scaling a task does not move memory:
 the corpus, typed claims, idempotency receipts, conflict ledger, and events
@@ -139,7 +140,8 @@ their narrower, independently enforced compatibility floors:
 - Genesis Stage-3 activation requires prefix 1–9 and has a private workstation
   repository/CLI plus one-shot role.
 - The first-successor repository and workstation apply/inspect CLI require
-  prefix 1–14; no production SQL writer role or deployment wiring exists.
+  prefix 1–14 and have a database-local one-shot logical-role policy; no
+  deployed login, production credential, or cloud/runtime wiring exists.
 - Legacy conflict reconciliation requires prefix 1–16 and has an apply-only
   workstation CLI plus database-local one-shot role policy. Its cross-database
   authority audit remains external.
