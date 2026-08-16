@@ -94,17 +94,39 @@ entry's own frozen vector roots.
    set — the last common unambiguous head, and that head's policy. That file is
    a **projection**, not an input: `AuditedContestedSetV1::from_durable_audit`
    (crate-private) computes every one of those fields from the contenders'
-   persisted statement, receipt, and accepted event, and
-   `verify_contested_set_resolution` accepts nothing else. A contender's
-   activated head is reproduced from its own receipt digest, its proposer and
-   author come from the statement that hashes to `receipt.statement_id`, its
-   approver set from the receipt's `eligible_approvals`, and its
-   `contested_generation` from the authorizing policy's generation plus one. A
-   contender that never activated has no receipt whose digest is its activation
-   ID, so it cannot appear at all. While such a record stands the projection is
-   `ambiguous`.
+   audited activations, and `verify_contested_set_resolution` accepts nothing
+   else.
+
+   What makes a contender an activation rather than a claim is *not* that its
+   statement, receipt, and event agree with each other. The activation ID is a
+   digest over the receipt itself, so that agreement is self-anchoring: a wholly
+   synthetic triple reproduces exactly as well as a real one.
+   `AuditedContenderActivationV2::from_durable_audit` therefore re-runs the full
+   `verify_generic_successor_activation` over the persisted request bytes,
+   against three pieces of evidence that live outside those artifacts — the
+   authorizing `InstalledSuccessorPolicyV2` (whose installed keys every approval
+   signature must verify under, at that policy's threshold and under its
+   separation-of-duty rule), the `StructurallyClosedSuccessorTargetV2` built
+   from the target package's real manifest-verified bytes, and the
+   runner-pinned `VerifiedGenericSuccessorTestResult`. Only then are the receipt
+   and event admitted, and only by full re-derivation: the receipt must be the
+   one that verified request produces (approval attestations, threshold and
+   separation-of-duty verdict included) and the event must be the one the
+   receipt and the request produce. A package that never passed conformance, a
+   policy that was never installed, and an approver set that never signed cannot
+   enter a contender at all. `contested_generation` comes from the authorizing
+   policy's generation plus one, and `AuditedContestedSetV1::from_durable_audit`
+   re-applies that policy to every contender's receipt so a witness minted under
+   another policy cannot be carried into this contest. While such a record
+   stands the projection is `ambiguous`.
 4. **Resolution.** `contested-resolution-statement.jsonl` compare-and-swaps the
-   exact contested activation-ID set and selects one member.
+   exact contested activation-ID set and selects one member. Its
+   `proposer_principal_id` is not taken on the payload's word: verification
+   requires it to equal a `ContestedResolutionPrincipalBinding` supplied by
+   authenticated configuration, exactly as an activation's proposer must equal
+   its `GenericSuccessorPrincipalBinding`. Without that, the no-self-selection
+   bar would test a string the requester chose, and a barred contestant could
+   drive the resolution by writing a different name.
    `contested-resolution-approval-set.jsonl` is approved under the last common
    unambiguous predecessor policy, and
    `contested-resolution-receipt.jsonl` binds the sorted approval attestations,
@@ -134,9 +156,9 @@ version change, never a fixture refresh.
 | resolution statement | `97665d1abeb5c33e517d2be2cc4e5ca3d54d39f9700dcc0e80adeb7a268b1410` |
 | resolution receipt | `0f42d0373321e061ba3dfb286bc391fbc6fb66726a0afd7fc44fe93b80f01187` |
 | positive case manifest | `77e02c9c9565ac6b25c1dc1084a58ae1e8c8b07b62180a8d23bafa9310d8eedb` |
-| negative case manifest | `e3081ae83a43a96f690409fb11a51416b147cd300e4c3bef2680e8add15fef14` |
-| `vector-suite.jsonl` raw SHA-256 | `df6b3db1cb46715c2ea880413604e3c92b168c2892f54f6f82253fb431458bd9` |
-| `vector-suite.jsonl` manifest digest | `44fa9d2831d1084146a6ff972db2d0aeebe3824f9d9ff9c6c41f687077632467` |
+| negative case manifest | `04b82a8819842356925ca00ff032bb86ffecf9708207058ced8fb48fd1a45614` |
+| `vector-suite.jsonl` raw SHA-256 | `52de3abd84b961c6c654bfe6d06d39b967533f747420c716a1337a45c1c886f7` |
+| `vector-suite.jsonl` manifest digest | `101342044d9080270267c58b7790dc264d8f67d6d8e2d144d03e3afcbbc88519` |
 
 The activation consistency key is
 `9921b7e572be77d3e100eb3d3093fb0d8ff4b3b5965f75110c18bfd34479b5ec` under family
@@ -156,12 +178,29 @@ one scope-local ordering stream.
   and re-checks the whole expected head, generation, scope, and governing policy
   against it, so the accepted form cannot exist unless the head presented at
   mint time is still the exact head the statement named. The
-  proposed package never authorizes itself, the author and proposer cannot
-  approve, and no contested successor may authorize its own selection. The
-  principals barred from driving a resolution are read out of
+  proposed package never authorizes itself, and the author and proposer cannot
+  approve.
+
+  For a contest, **both sides** of the no-self-selection comparison are
+  authenticated. The barred principal sets are read out of
   `AuditedContestedSetV1`, whose constructor is crate-private for the same
   reason, so nobody can bar a legitimate arbiter by inventing a contender that
-  names them, or un-bar a real party by omitting one.
+  names them, or un-bar a real party by omitting one — naming any principal in a
+  contender costs a real threshold-satisfying ceremony under the authorizing
+  policy's own keys. The subject being tested is the
+  `ContestedResolutionPrincipalBinding`, which comes from authenticated
+  configuration rather than from the request payload, so relabelling the
+  proposer no longer escapes the bar.
+
+  The rule is exactly this, and is deliberately asymmetric: no contender's
+  proposer, package author, **or approver** may *propose* a resolution, and no
+  contender's proposer or package author may be counted among its *approvers*. A
+  contender's approvers may still approve a resolution. They are eligible
+  signers of the last common unambiguous predecessor policy — the authority the
+  contest falls back to — and barring them would make a contest between two
+  quorum-approved contenders structurally unresolvable whenever that policy's
+  signer set is no larger than its threshold, which is precisely the frozen
+  fixture's shape.
   `VerifiedContestedSetResolution::receipt_at` likewise takes the re-audited
   policy *and* the re-audited contested set.
   *To break it:* make `InstalledSuccessorPolicyV2::from_durable_audit`,
@@ -169,17 +208,24 @@ one scope-local ordering stream.
   `AuditedContestedSetV1::from_durable_audit`, `receipt_at`,
   `resulting_registry_head`, or `from_verified` public; drop the
   re-audited head argument from either `receipt_at`; let
-  `verify_contested_set_resolution` take a bare `RegistryContestedSetV1` again;
-  verify approvals against `target.activation_policy()` instead of the installed
-  predecessor policy; drop the
-  `ActivationPolicyEntryV2::validate_approval_principal_set` call; or let a
-  contender's proposer drive `verify_contested_set_resolution`.
+  `verify_contested_set_resolution` take a bare `RegistryContestedSetV1` again,
+  or drop its `ContestedResolutionPrincipalBinding` parameter and read the
+  proposer out of the payload; verify approvals against
+  `target.activation_policy()` instead of the installed predecessor policy; drop
+  either `ActivationPolicyEntryV2::validate_approval_principal_set` call — the
+  activation one or the contender re-application in
+  `AuditedContestedSetV1::from_durable_audit`.
 - **AUTH-04 — normativity is designated.** Only a verified activation produces
   a head, and only a package a registry activation designates is normative. An
   activation event moves the head forward. A contested resolution does not mint
   a head of its own: it selects among heads that activations already produced,
-  and it can install no other, because every contender's head is recomputed from
-  that contender's receipt digest before the contest exists as a value. The
+  and it can install no other, because every member of the contest is an
+  `AuditedContenderActivationV2` — a persisted request whose approval
+  signatures, target package bytes, and runner-pinned conformance result were
+  all re-verified under the authorizing policy before the contest existed as a
+  value. Mutual consistency among a statement, a receipt, and an event is *not*
+  accepted as that proof: the activation ID is a digest over the receipt, so a
+  synthetic triple reproduces just as well as a real one. The
   statement binds the exact package digest, the policy that governs it, the
   policy it installs, and the conformance result. A contest is resolvable only
   under the policy of the generation it forks from: `contested_generation` is
@@ -191,9 +237,12 @@ one scope-local ordering stream.
   *To break it:* let `validate_shape` accept a zero or unbound
   `target_package_digest`; stop requiring
   `statement.target_activation_policy == target.activation_policy()`; let the
-  event's `activated_head` name a policy digest other than the target's; stop
-  reproducing a contender's activated head from its receipt in
-  `AuditedContenderActivationV2::from_durable_audit`; or drop the
+  event's `activated_head` name a policy digest other than the target's; let
+  `AuditedContenderActivationV2::from_durable_audit` accept a contender on the
+  strength of its own three artifacts — drop the
+  `verify_generic_successor_activation` re-run, or its
+  `StructurallyClosedSuccessorTargetV2` or `VerifiedGenericSuccessorTestResult`
+  argument, or either `validate_against` re-derivation; or drop the
   `contested_generation == authorizing_policy.generation() + 1` comparison.
 - **REPLAY-01 — semantic projections are rebuildable.** Every identity is a
   domain-separated digest over canonical bytes: replaying the same statement and
@@ -243,10 +292,13 @@ artifacts they describe. Regenerate with:
 | `wrong-generation-step` | `to_generation` must be exactly `from_generation + 1`, and generation zero belongs to the frozen contract |
 | `genesis-generation-statement` | `from_generation = 0` is rejected outright |
 | `reactivating-the-current-package` | re-activating the exact current package is a no-op, not a transition |
-| `contested-resolution-by-a-contestant` | neither contested successor's proposer, author, or approver may drive the resolution |
+| `contested-resolution-by-a-contestant` | no contested successor's proposer, author, or approver may *propose* the resolution, and no contender's proposer or author may be counted among its approvers (a contender's approvers may still approve — they are the fallback authority) |
+| `contested-resolution-proposer-disagrees-with-trusted-binding` | the resolution proposer is an authenticated identity, not a payload label: the same ceremony with the proposer relabelled is rejected before the barred sets are consulted |
 | `contested-resolution-set-drift` | resolution compare-and-swaps the exact contested activation-ID set, so a later contender cannot be silently excluded — at verification and again at receipt mint |
 | `proposer-counted-as-approver` | the installed v2 rule bars the trusted proposer from approving, symmetrically with the author |
 | `fabricated-contested-contender` | a contender naming an arbitrary head, proposer, author, or approver set has no activation to audit and cannot enter a contested set |
+| `contested-contender-package-never-passed-conformance` | three artifacts forged *coherently* — statement, receipt, and an event whose head reproduces from that receipt's own digest, signed for by the two really installed keys — still cannot mint a contender, because the audit binds the statement to real package bytes and to a runner-pinned conformance result |
+| `contested-contender-approvals-not-derived-from-the-verified-request` | a receipt rewritten to a lower threshold, or naming an approver who never signed, is rejected: the receipt is admitted only if it is the one the re-run verifier derives, and an approval by a principal the installed policy does not list has no key to verify against |
 | `contested-contender-head-does-not-reproduce-from-its-activation` | a contender whose activated head, activation ID, or statement does not reproduce from its own receipt is rejected |
 | `contested-contender-of-another-predecessor-head` | a genuine activation of a different predecessor head is not a contender of this contest |
 | `contested-generation-does-not-follow-the-authorizing-policy` | `contested_generation` must be exactly the authorizing policy's generation plus one |

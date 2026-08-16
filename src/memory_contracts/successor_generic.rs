@@ -25,19 +25,26 @@
 //!   separation of duty come from [`InstalledSuccessorPolicyV2`], whose
 //!   constructor is crate-private and fed only by a durable head audit. The
 //!   proposed package's own policy is committed to the resulting head but never
-//!   authorizes its own activation, the author and proposer must be distinct
-//!   and neither may be counted as an approver, and no party that proposed,
-//!   authored, or approved a contested successor may drive that contest's
-//!   resolution. Those barred principal sets are read out of
-//!   [`AuditedContestedSetV1`], never out of caller-supplied bytes, so nobody
-//!   can bar a legitimate arbiter by inventing a contender that names them.
+//!   authorizes its own activation, and the author and proposer must be
+//!   distinct with neither counted as an approver. For a contest, no party that
+//!   proposed, authored, or approved a contender may *propose* that contest's
+//!   resolution, and no contender's proposer or author may be counted among its
+//!   approvers. Both sides of that comparison are authenticated: the barred
+//!   principal sets are read out of [`AuditedContestedSetV1`], and the subject
+//!   being tested is [`ContestedResolutionPrincipalBinding`], supplied by
+//!   trusted configuration rather than by the request payload. A contender's
+//!   *approvers* may still approve a resolution: they are eligible signers of
+//!   the fallback authority, and barring them would leave a contest between two
+//!   quorum-approved contenders structurally unresolvable.
 //! - **AUTH-04 - normativity is designated.** Only a verified activation
 //!   produces a head. An activation event moves the head forward; a contested
 //!   resolution selects among heads that activations already produced and can
-//!   install no other, because [`AuditedContestedSetV1`] recomputes every
-//!   contender's head from that contender's own receipt digest. Every statement
-//!   binds the exact target package digest, the policy that governs the
-//!   transition, the policy the target installs, and a conformance result
+//!   install no other, because every member of an [`AuditedContestedSetV1`] is
+//!   an [`AuditedContenderActivationV2`] - a persisted request whose signatures,
+//!   package, and conformance result were re-verified under the authorizing
+//!   policy, not merely a self-consistent statement/receipt/event triple. Every
+//!   statement binds the exact target package digest, the policy that governs
+//!   the transition, the policy the target installs, and a conformance result
 //!   pinned to an out-of-band runner identity. A contest is resolvable only
 //!   under the policy of the generation it forks from: its contested generation
 //!   is the audited policy's generation plus one, checked at audit time and
@@ -1206,31 +1213,68 @@ impl RegistryContestedSetV1 {
     }
 }
 
-/// One contender's durable activation artifacts, re-read under the repository's
-/// stream lock.
+/// The durable bytes and out-of-band evidence one contender audit consumes.
+///
+/// Every field is something a repository must genuinely possess: the two
+/// canonical request records it persisted, the *real package bytes* the
+/// activation targeted, and the conformance result that package passed under a
+/// deployment-pinned runner. None of it can be conjured from the activation's
+/// own three artifacts, which is exactly the point.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // consumed by the successor repository in the next increment
+pub(crate) struct ContenderActivationAuditV2<'a> {
+    /// The canonical statement bytes, as persisted.
+    pub canonical_statement: &'a [u8],
+    /// The canonical approval-set bytes, as persisted. Their signatures are
+    /// re-verified against the authorizing policy's installed keys.
+    pub canonical_approval_set: &'a [u8],
+    /// The activated package, narrowed from its manifest-verified bytes.
+    pub target: &'a StructurallyClosedSuccessorTargetV2,
+    /// That package's passing conformance result under the runner pin.
+    pub test_result: &'a VerifiedGenericSuccessorTestResult,
+    /// The persisted server-derived receipt.
+    pub receipt: &'a GenericSuccessorActivationReceiptV2,
+    /// The persisted accepted event.
+    pub event: &'a GenericSuccessorActivatedEventV2,
+}
+
+/// One contender's durable activation, re-verified under the authorizing policy.
 ///
 /// A contested set is only as trustworthy as its members, and a bare
 /// [`ContestedSuccessorV1`] is a claim: it *names* an activation ID, a statement
 /// ID, an activated head, a proposer, an author, and an approver set, and
 /// nothing in those wire bytes proves any of them ever happened. This typestate
 /// is the proof, and its constructor is crate-private for the same reason
-/// [`InstalledSuccessorPolicyV2::from_durable_audit`] is. It reproduces every
-/// claimed value from the persisted statement, receipt, and accepted event:
+/// [`InstalledSuccessorPolicyV2::from_durable_audit`] is.
 ///
-/// - the statement's canonical bytes must hash to `receipt.statement_id`, which
-///   is what binds the proposer and package-author identities to the activation;
-/// - [`GenericSuccessorActivationReceiptV2::activation_id`] must reproduce the
-///   event's activation ID, and it commits the approver set;
-/// - the activated head must be exactly the head
-///   [`VerifiedGenericSuccessorActivation::resulting_registry_head`] derives
-///   from that receipt - activation ID, package digest, and activation-policy
-///   digest alike.
+/// Mutual consistency among a statement, a receipt, and an event is *not* that
+/// proof. [`GenericSuccessorActivationReceiptV2::activation_id`] is a digest
+/// over the receipt itself, so reproducing the activated head from it is
+/// self-anchoring: a wholly synthetic triple reproduces just as well as a real
+/// one. The audit therefore re-runs the full verifier
+/// ([`verify_generic_successor_activation`]) over the persisted request bytes
+/// against evidence that lives outside those three artifacts:
 ///
-/// A contender that never activated has no receipt whose own digest is its
-/// activation ID, so it cannot be minted here at all.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// - the **authorizing policy**, whose crate-private witness is fed by a durable
+///   head audit, supplies the eligible keys, the threshold, and the
+///   separation-of-duty rule, and every approval signature must verify under it;
+/// - the **target package**, built from real manifest-verified bytes, must be
+///   exactly the package the statement names, and it fixes the activation
+///   policy the resulting head installs;
+/// - the **conformance result**, pinned to an out-of-band runner identity, must
+///   be exactly the result the statement names.
+///
+/// Only then are the receipt and the event admitted, and only by full
+/// re-derivation: [`GenericSuccessorActivationReceiptV2::validate_against`]
+/// requires the receipt's approval attestations, threshold, and
+/// separation-of-duty verdict to be the ones the verifier just derived, and
+/// [`GenericSuccessorActivatedEventV2::validate_against`] requires the event to
+/// equal the event those two produce. A package that never passed conformance
+/// and a policy that was never installed cannot enter a contender at all, and
+/// an approver set that never signed cannot either.
+#[derive(Debug, Clone)]
 pub struct AuditedContenderActivationV2 {
-    statement: GenericSuccessorActivationStatementV2,
+    activation: VerifiedGenericSuccessorActivation,
     receipt: GenericSuccessorActivationReceiptV2,
     event: GenericSuccessorActivatedEventV2,
     activation_id: GenericSuccessorActivationId,
@@ -1239,66 +1283,61 @@ pub struct AuditedContenderActivationV2 {
 impl AuditedContenderActivationV2 {
     /// Mint the contender witness from durable bytes read under one stream lock.
     ///
-    /// The caller must have read all three artifacts from the accepted event
-    /// history of the same scope in the same transaction. Nothing here is taken
-    /// on trust: every field of the contested-set record this witness later
-    /// yields is recomputed from these bytes.
+    /// The caller must have read the request bytes, the receipt, and the event
+    /// from the accepted event history of the same scope in the same
+    /// transaction, and must supply the authorizing policy, the target package,
+    /// and the conformance result as the out-of-band evidence they are.
+    ///
+    /// The proposer and package author are the one pair the audit cannot
+    /// re-derive from policy: no receipt or event carries them. They are bound
+    /// instead by hashing - the statement must hash to `receipt.statement_id` -
+    /// so the ceremony-time [`GenericSuccessorPrincipalBinding`] is rebuilt from
+    /// the audited statement rather than re-imposed here. Naming a principal in
+    /// a contender therefore costs a real threshold-satisfying ceremony under
+    /// the authorizing policy's own keys.
     #[allow(dead_code)] // consumed by the successor repository in the next increment
     pub(crate) fn from_durable_audit(
-        canonical_statement: &[u8],
-        receipt: GenericSuccessorActivationReceiptV2,
-        event: GenericSuccessorActivatedEventV2,
+        authorizing_policy: &InstalledSuccessorPolicyV2,
+        audit: &ContenderActivationAuditV2<'_>,
     ) -> ContractResult<Self> {
-        require_canonical(canonical_statement)?;
-        let statement: GenericSuccessorActivationStatementV2 = decode_strict(canonical_statement)?;
+        require_canonical(audit.canonical_statement)?;
+        let statement: GenericSuccessorActivationStatementV2 =
+            decode_strict(audit.canonical_statement)?;
         statement.validate_shape()?;
-        if encode_canonical(&statement)? != canonical_statement {
-            return Err(ContractError::NotCanonical);
-        }
-        receipt.validate_shape()?;
-        event.validate_shape()?;
-        let activation_id = receipt.activation_id()?;
-        // Exactly what `resulting_registry_head` derives from this receipt.
-        let reproduced_head = RegistryHeadV1 {
-            activation_id: activation_id.digest(),
-            package_digest: receipt.target_package_digest,
-            activation_policy_digest: receipt.target_activation_policy.entry_digest,
-        };
-        if receipt.statement_id != statement.statement_id()?
-            || receipt.predecessor_head != statement.expected_predecessor_head
-            || receipt.current_activation_policy != statement.current_activation_policy
-            || receipt.target_package_digest != statement.target_package_digest
-            || receipt.target_activation_policy != statement.target_activation_policy
-            || receipt.test_vector_result_digest != statement.test_vector_result_digest
-            || receipt.from_generation != statement.from_generation
-            || receipt.to_generation != statement.to_generation
-            || receipt.accepted_at < statement.effective_from
-            || event.activation_id != activation_id
-            || event.statement_id != receipt.statement_id
-            || event.profile != statement.profile
-            || event.scope != statement.scope
-            || event.predecessor_head != receipt.predecessor_head
-            || event.current_activation_policy != receipt.current_activation_policy
-            || event.target_activation_policy != receipt.target_activation_policy
-            || event.test_vector_result_digest != receipt.test_vector_result_digest
-            || event.from_generation != receipt.from_generation
-            || event.to_generation != receipt.to_generation
-            || event.activated_head.head != reproduced_head
-            || event.activated_head.effective_from != statement.effective_from
-            || event.activated_head.effective_until != statement.effective_until
-        {
-            return Err(ContractError::ManifestMismatch);
-        }
+        let principal_binding = GenericSuccessorPrincipalBinding::from_trusted_config(
+            statement.proposer_principal_id,
+            statement.package_author_principal_id,
+        );
+        // The full ceremony verifier, re-run over persisted bytes: canonical
+        // form, package and conformance binding, signature verification under
+        // the installed keys, eligibility, threshold, and separation of duty.
+        let activation = verify_generic_successor_activation(
+            audit.canonical_statement,
+            audit.canonical_approval_set,
+            authorizing_policy,
+            audit.target,
+            audit.test_result,
+            &principal_binding,
+        )?;
+        // The persisted receipt and event are admitted only if they are exactly
+        // the ones that verified request produces.
+        audit.receipt.validate_against(&activation)?;
+        audit.event.validate_against(&activation, audit.receipt)?;
+        let activation_id = audit.receipt.activation_id()?;
         Ok(Self {
-            statement,
-            receipt,
-            event,
+            activation,
+            receipt: audit.receipt.clone(),
+            event: audit.event.clone(),
             activation_id,
         })
     }
 
+    pub const fn activation(&self) -> &VerifiedGenericSuccessorActivation {
+        &self.activation
+    }
+
     pub const fn statement(&self) -> &GenericSuccessorActivationStatementV2 {
-        &self.statement
+        self.activation.statement()
     }
 
     pub const fn receipt(&self) -> &GenericSuccessorActivationReceiptV2 {
@@ -1325,13 +1364,14 @@ impl AuditedContenderActivationV2 {
             .map(|approval| approval.principal_id.clone())
             .collect::<Vec<_>>();
         approving_principal_ids.sort_unstable();
+        let statement = self.statement();
         let contender = ContestedSuccessorV1 {
             activation_id: self.activation_id,
             statement_id: self.receipt.statement_id,
             to_generation: self.receipt.to_generation,
             activated_head: self.event.activated_head.clone(),
-            proposer_principal_id: self.statement.proposer_principal_id.clone(),
-            package_author_principal_id: self.statement.package_author_principal_id.clone(),
+            proposer_principal_id: statement.proposer_principal_id.clone(),
+            package_author_principal_id: statement.package_author_principal_id.clone(),
             approving_principal_ids,
         };
         contender.validate_shape()?;
@@ -1349,11 +1389,13 @@ impl AuditedContenderActivationV2 {
 /// audited authority. Two consequences a plain wire struct cannot give:
 ///
 /// - a fabricated contender cannot install an arbitrary head through the
-///   resolution receipt, because no head enters this type that a receipt digest
-///   did not produce;
+///   resolution receipt, because every head here comes from a request whose
+///   approvals verified under the authorizing policy's installed keys, against
+///   real package bytes and a runner-pinned conformance result;
 /// - whoever supplies the set cannot choose who is barred from driving the
 ///   resolution, because the barred principal sets are read out of the same
-///   audited statements.
+///   audited statements - and naming a principal in one costs a real
+///   threshold-satisfying ceremony under those same keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditedContestedSetV1 {
     set: RegistryContestedSetV1,
@@ -1368,11 +1410,18 @@ impl AuditedContestedSetV1 {
     /// contested generation is that policy's generation plus one and is never a
     /// caller claim, so a contest can only be resolved by the policy of the
     /// generation it actually forks from.
+    ///
+    /// Each contender was already re-verified under *an* authorizing policy when
+    /// its [`AuditedContenderActivationV2`] was minted. This constructor re-runs
+    /// the governance half against *this* policy, so a witness minted elsewhere
+    /// cannot be carried into a contest the policy does not govern.
     #[allow(dead_code)] // consumed by the successor repository in the next increment
     pub(crate) fn from_durable_audit(
         authorizing_policy: &InstalledSuccessorPolicyV2,
         contenders: &[AuditedContenderActivationV2],
     ) -> ContractResult<Self> {
+        let policy = authorizing_policy.policy();
+        policy.validate()?;
         let contested_generation = authorizing_policy
             .generation()
             .checked_add(1)
@@ -1380,15 +1429,21 @@ impl AuditedContestedSetV1 {
         let mut records = Vec::with_capacity(contenders.len());
         for audited in contenders {
             let statement = audited.statement();
+            let receipt = audited.receipt();
             if statement.profile != *authorizing_policy.profile()
                 || statement.scope != *authorizing_policy.scope()
                 || statement.expected_predecessor_head != *authorizing_policy.head()
                 || statement.current_activation_policy != *authorizing_policy.policy_reference()
                 || statement.from_generation != authorizing_policy.generation()
                 || statement.to_generation != contested_generation
+                // The receipt's server-derived verdict must be this policy's,
+                // not one the contender chose for itself.
+                || receipt.required_threshold != policy.approval_threshold
+                || receipt.applied_separation_of_duty != policy.separation_of_duty
             {
                 return Err(ContractError::ManifestMismatch);
             }
+            require_contender_approvals_under_policy(policy, statement, receipt)?;
             records.push(audited.contender()?);
         }
         records.sort_by(|left, right| left.activation_id.cmp(&right.activation_id));
@@ -1423,6 +1478,33 @@ impl AuditedContestedSetV1 {
             return Err(ContractError::ManifestMismatch);
         }
         Ok(())
+    }
+}
+
+/// Trusted identity of the principal actually driving one contested-set
+/// resolution ceremony.
+///
+/// The resolution statement repeats the proposer so the approvals commit to it,
+/// but it cannot *choose* it: [`verify_contested_set_resolution`] requires exact
+/// equality to this non-serializable binding, which comes from authenticated
+/// configuration exactly as [`GenericSuccessorPrincipalBinding`] does for an
+/// activation.
+///
+/// Without it the no-self-selection bar would test a string the requester picked
+/// out of the payload: a barred contestant could drive the resolution simply by
+/// writing a different name. Authenticating the barred sets (they are read out
+/// of [`AuditedContestedSetV1`]) is only half the comparison; this is the other
+/// half - the subject being tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContestedResolutionPrincipalBinding {
+    proposer_principal_id: ContractId,
+}
+
+impl ContestedResolutionPrincipalBinding {
+    pub const fn from_trusted_config(proposer_principal_id: ContractId) -> Self {
+        Self {
+            proposer_principal_id,
+        }
     }
 }
 
@@ -1651,14 +1733,28 @@ impl VerifiedContestedSetResolution {
 /// typestate. `audited_set` must be the matching [`AuditedContestedSetV1`]: no
 /// contender may be a claim, so no receipt can install a head that no activation
 /// produced. The contested generation must be exactly the authorizing policy's
-/// generation plus one. No contender's proposer, package author, or approver may
-/// propose or approve the resolution, so neither contested successor can
-/// authorize its own selection.
+/// generation plus one.
+///
+/// `principal_binding` is the authenticated identity of the party driving the
+/// ceremony. The payload's `proposer_principal_id` must equal it exactly, which
+/// is what makes the bar below meaningful: no contender's proposer, package
+/// author, or approver may *propose* the resolution, and no contender's proposer
+/// or package author may be counted among its approvers, so neither contested
+/// successor can authorize its own selection by relabelling itself.
+///
+/// The approver half of that bar is deliberately narrower than the proposer
+/// half: an eligible signer of the last common unambiguous predecessor policy
+/// who merely approved a contender may still approve the resolution. Those
+/// signers are the authority the contest falls back to; barring them outright
+/// would make a contest between two quorum-approved contenders structurally
+/// unresolvable whenever the predecessor policy's signer set is exactly its
+/// threshold.
 pub fn verify_contested_set_resolution(
     canonical_statement: &[u8],
     canonical_approval_set: &[u8],
     audited_set: &AuditedContestedSetV1,
     authorizing_policy: &InstalledSuccessorPolicyV2,
+    principal_binding: &ContestedResolutionPrincipalBinding,
 ) -> ContractResult<VerifiedContestedSetResolution> {
     let contested_set = audited_set.set();
     require_canonical(canonical_statement)?;
@@ -1666,6 +1762,12 @@ pub fn verify_contested_set_resolution(
     statement.validate_shape()?;
     if encode_canonical(&statement)? != canonical_statement {
         return Err(ContractError::NotCanonical);
+    }
+    // The proposer is authenticated before anything is decided about it. A
+    // payload label the requester chose would make the no-self-selection bar a
+    // test of a string the requester also chose.
+    if statement.proposer_principal_id != principal_binding.proposer_principal_id {
+        return Err(ContractError::ManifestMismatch);
     }
 
     // Compare-and-swap on the exact contested activation-ID set, first and on
@@ -1870,6 +1972,49 @@ fn require_resolution_binding(
         ));
     }
     Ok(())
+}
+
+/// Re-apply one authorizing policy to a contender's persisted receipt.
+///
+/// The contender audit already verified these approvals cryptographically; this
+/// re-states the governance verdict against the policy that is about to govern
+/// the contest, so an audited witness cannot be carried across policies. Every
+/// attestation must name a principal the policy still lists, under that
+/// principal's currently installed key ID, and the whole set must satisfy
+/// [`ActivationPolicyEntryV2::validate_approval_principal_set`] - eligibility,
+/// canonical order, threshold, and strong separation of duty alike.
+fn require_contender_approvals_under_policy(
+    policy: &ActivationPolicyEntryV2,
+    statement: &GenericSuccessorActivationStatementV2,
+    receipt: &GenericSuccessorActivationReceiptV2,
+) -> ContractResult<()> {
+    for approval in &receipt.eligible_approvals {
+        let signer = policy
+            .eligible_signers
+            .iter()
+            .find(|binding| binding.principal_id == approval.principal_id)
+            .ok_or_else(|| {
+                ContractError::InvalidSignerPolicy(
+                    "contested contender approval principal is not eligible".into(),
+                )
+            })?;
+        if signer.signer_key_id()? != approval.signer_key_id {
+            return Err(ContractError::InvalidSignerPolicy(
+                "contested contender approval names an uninstalled signer key".into(),
+            ));
+        }
+    }
+    let mut approving_principal_ids = receipt
+        .eligible_approvals
+        .iter()
+        .map(|approval| approval.principal_id.clone())
+        .collect::<Vec<_>>();
+    approving_principal_ids.sort_unstable();
+    policy.validate_approval_principal_set(
+        &statement.package_author_principal_id,
+        &statement.proposer_principal_id,
+        &approving_principal_ids,
+    )
 }
 
 /// Apply eligibility, threshold, canonical ordering, and the no-self-selection
@@ -2151,11 +2296,11 @@ mod tests {
     const POSITIVE_CASES_DIGEST: &str =
         "77e02c9c9565ac6b25c1dc1084a58ae1e8c8b07b62180a8d23bafa9310d8eedb";
     const NEGATIVE_CASES_DIGEST: &str =
-        "e3081ae83a43a96f690409fb11a51416b147cd300e4c3bef2680e8add15fef14";
+        "04b82a8819842356925ca00ff032bb86ffecf9708207058ced8fb48fd1a45614";
     const VECTOR_SUITE_RAW_SHA256: &str =
-        "df6b3db1cb46715c2ea880413604e3c92b168c2892f54f6f82253fb431458bd9";
+        "52de3abd84b961c6c654bfe6d06d39b967533f747420c716a1337a45c1c886f7";
     const VECTOR_SUITE_DIGEST: &str =
-        "44fa9d2831d1084146a6ff972db2d0aeebe3824f9d9ff9c6c41f687077632467";
+        "101342044d9080270267c58b7790dc264d8f67d6d8e2d144d03e3afcbbc88519";
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
@@ -2463,28 +2608,41 @@ mod tests {
     }
 
     struct ActivationArtifacts {
+        /// The policy that authorized this activation - the same one a
+        /// contender audit must present.
+        installed: InstalledSuccessorPolicyV2,
+        target: StructurallyClosedSuccessorTargetV2,
+        test_result: VerifiedGenericSuccessorTestResult,
         activation: VerifiedGenericSuccessorActivation,
         receipt: GenericSuccessorActivationReceiptV2,
         head: RegistryHeadBindingV1,
         event: GenericSuccessorActivatedEventV2,
     }
 
-    fn activation_artifacts(
+    struct ArtifactSpec<'a> {
         activation: VerifiedGenericSuccessorActivation,
-        reaudited: &InstalledSuccessorPolicyV2,
-        predecessor_accepted_at: &str,
-        accepted_at: &str,
-    ) -> ActivationArtifacts {
+        installed: &'a InstalledSuccessorPolicyV2,
+        target: &'a StructurallyClosedSuccessorTargetV2,
+        test_result: &'a VerifiedGenericSuccessorTestResult,
+        predecessor_accepted_at: &'a str,
+        accepted_at: &'a str,
+    }
+
+    fn activation_artifacts(spec: ArtifactSpec<'_>) -> ActivationArtifacts {
+        let activation = spec.activation;
         let receipt = activation
             .receipt_at(
-                reaudited,
-                &timestamp(predecessor_accepted_at),
-                timestamp(accepted_at),
+                spec.installed,
+                &timestamp(spec.predecessor_accepted_at),
+                timestamp(spec.accepted_at),
             )
             .unwrap();
         let head = activation.resulting_registry_head(&receipt).unwrap();
         let event = GenericSuccessorActivatedEventV2::from_verified(&activation, &receipt).unwrap();
         ActivationArtifacts {
+            installed: spec.installed.clone(),
+            target: spec.target.clone(),
+            test_result: spec.test_result.clone(),
             activation,
             receipt,
             head,
@@ -2522,12 +2680,14 @@ mod tests {
         let activation =
             verify_activation(&statement, &approval_set, &installed, &target, &test_result)
                 .unwrap();
-        activation_artifacts(
+        activation_artifacts(ArtifactSpec {
             activation,
-            &installed,
-            PREDECESSOR_ACCEPTED_AT,
-            GENERATION_TWO_EFFECTIVE_FROM,
-        )
+            installed: &installed,
+            target: &target,
+            test_result: &test_result,
+            predecessor_accepted_at: PREDECESSOR_ACCEPTED_AT,
+            accepted_at: GENERATION_TWO_EFFECTIVE_FROM,
+        })
     }
 
     fn generation_two_activation() -> ActivationArtifacts {
@@ -2558,21 +2718,33 @@ mod tests {
         let activation =
             verify_activation(&statement, &approval_set, &installed, &target, &test_result)
                 .unwrap();
-        activation_artifacts(
+        activation_artifacts(ArtifactSpec {
             activation,
-            &installed,
-            GENERATION_TWO_EFFECTIVE_FROM,
-            GENERATION_THREE_EFFECTIVE_FROM,
-        )
+            installed: &installed,
+            target: &target,
+            test_result: &test_result,
+            predecessor_accepted_at: GENERATION_TWO_EFFECTIVE_FROM,
+            accepted_at: GENERATION_THREE_EFFECTIVE_FROM,
+        })
     }
 
-    /// The statement, receipt, and event a repository would re-read for one
-    /// contender under its stream lock.
+    /// The durable bytes and out-of-band evidence a repository would re-read for
+    /// one contender under its stream lock.
+    fn contender_audit(artifacts: &ActivationArtifacts) -> ContenderActivationAuditV2<'_> {
+        ContenderActivationAuditV2 {
+            canonical_statement: artifacts.activation.canonical_statement(),
+            canonical_approval_set: artifacts.activation.canonical_approval_set(),
+            target: &artifacts.target,
+            test_result: &artifacts.test_result,
+            receipt: &artifacts.receipt,
+            event: &artifacts.event,
+        }
+    }
+
     fn audited_contender(artifacts: &ActivationArtifacts) -> AuditedContenderActivationV2 {
         AuditedContenderActivationV2::from_durable_audit(
-            &encode_canonical(artifacts.activation.statement()).unwrap(),
-            artifacts.receipt.clone(),
-            artifacts.event.clone(),
+            &artifacts.installed,
+            &contender_audit(artifacts),
         )
         .unwrap()
     }
@@ -2638,6 +2810,9 @@ mod tests {
         }
     }
 
+    /// The honest ceremony: the authenticated driver is exactly the principal
+    /// the statement names. Attacks that disagree with the trusted binding call
+    /// `verify_contested_set_resolution` directly.
     fn verify_resolution(
         statement: &ContestedSetResolutionStatementV1,
         approval_set: &ContestedSetResolutionApprovalSetV1,
@@ -2648,6 +2823,9 @@ mod tests {
             &encode_canonical(approval_set)?,
             set,
             &generation_one_policy(),
+            &ContestedResolutionPrincipalBinding::from_trusted_config(
+                statement.proposer_principal_id.clone(),
+            ),
         )
     }
 
@@ -2711,11 +2889,14 @@ mod tests {
                 "approval-under-key-bridge-prefix",
                 "approval-under-uninstalled-principal",
                 "author-counted-as-approver",
+                "contested-contender-approvals-not-derived-from-the-verified-request",
                 "contested-contender-head-does-not-reproduce-from-its-activation",
                 "contested-contender-of-another-predecessor-head",
+                "contested-contender-package-never-passed-conformance",
                 "contested-generation-does-not-follow-the-authorizing-policy",
                 "contested-resolution-before-its-contenders",
                 "contested-resolution-by-a-contestant",
+                "contested-resolution-proposer-disagrees-with-trusted-binding",
                 "contested-resolution-set-drift",
                 "fabricated-contested-contender",
                 "genesis-generation-statement",
@@ -3638,46 +3819,254 @@ mod tests {
         );
     }
 
+    /// A wholly synthetic contender: three artifacts that agree with each other
+    /// perfectly and correspond to no activation that ever happened.
+    struct GhostContender {
+        statement: GenericSuccessorActivationStatementV2,
+        approval_set: GenericSuccessorActivationApprovalSetV2,
+        receipt: GenericSuccessorActivationReceiptV2,
+        event: GenericSuccessorActivatedEventV2,
+    }
+
+    /// Build the coherent forgery the mutual-consistency audit used to accept:
+    /// a package digest that never passed conformance, an activation policy that
+    /// was never installed, and a receipt whose own digest anchors the head the
+    /// event announces.
+    fn ghost_contender(approvals: Vec<GenericSuccessorActivationApprovalV2>) -> GhostContender {
+        let head = generation_one_head();
+        let installed = generation_one_policy();
+        let ghost_package = Sha256Digest::from_bytes([0xbe; 32]);
+        let ghost_policy = RegistryReferenceV1 {
+            entry_id: case_id("activation.ghost"),
+            version: 7,
+            entry_digest: Sha256Digest::from_bytes([0xca; 32]),
+        };
+        let statement = GenericSuccessorActivationStatementV2 {
+            schema_version: SUCCESSOR_GENERIC_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            expected_predecessor_head: head.clone(),
+            current_activation_policy: installed.policy_reference().clone(),
+            target_package_digest: ghost_package,
+            target_activation_policy: ghost_policy.clone(),
+            test_vector_result_digest: RegistryTestResultDigest::from_digest(
+                Sha256Digest::from_bytes([0x77; 32]),
+            ),
+            from_generation: 1,
+            to_generation: 2,
+            effective_from: timestamp(GENERATION_TWO_EFFECTIVE_FROM),
+            effective_until: None,
+            proposer_principal_id: case_id("principal.mallory"),
+            package_author_principal_id: case_id("principal.mallory-author"),
+        };
+        let statement_id = statement.statement_id().unwrap();
+        let approval_set = GenericSuccessorActivationApprovalSetV2 {
+            schema_version: SUCCESSOR_GENERIC_SCHEMA_VERSION,
+            statement_id,
+            approvals,
+        };
+        let receipt = GenericSuccessorActivationReceiptV2 {
+            schema_version: SUCCESSOR_GENERIC_SCHEMA_VERSION,
+            statement_id,
+            predecessor_head: head.clone(),
+            current_activation_policy: installed.policy_reference().clone(),
+            target_package_digest: ghost_package,
+            target_activation_policy: ghost_policy.clone(),
+            test_vector_result_digest: statement.test_vector_result_digest,
+            from_generation: 1,
+            to_generation: 2,
+            eligible_approvals: vec![EligibleApprovalV1 {
+                attestation_id: Sha256Digest::from_bytes([0x99; 32]),
+                principal_id: case_id("principal.mallory-approver"),
+                signer_key_id: case_id("key.mallory"),
+            }],
+            required_threshold: 1,
+            applied_separation_of_duty:
+                ActivationSeparationOfDutyV2::AuthorAndProposerDistinctNeitherMayApprove,
+            separation_of_duty_satisfied: true,
+            accepted_at: timestamp(GENERATION_TWO_EFFECTIVE_FROM),
+        };
+        let activation_id = receipt.activation_id().unwrap();
+        let event = GenericSuccessorActivatedEventV2 {
+            schema_version: SUCCESSOR_GENERIC_SCHEMA_VERSION,
+            event_kind: case_id(SUCCESSOR_GENERIC_EVENT_KIND),
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            activation_id,
+            statement_id,
+            predecessor_head: head,
+            activated_head: RegistryHeadBindingV1 {
+                head: RegistryHeadV1 {
+                    activation_id: activation_id.digest(),
+                    package_digest: ghost_package,
+                    activation_policy_digest: ghost_policy.entry_digest,
+                },
+                effective_from: timestamp(GENERATION_TWO_EFFECTIVE_FROM),
+                effective_until: None,
+            },
+            current_activation_policy: installed.policy_reference().clone(),
+            target_activation_policy: ghost_policy,
+            test_vector_result_digest: statement.test_vector_result_digest,
+            from_generation: 1,
+            to_generation: 2,
+        };
+        GhostContender {
+            statement,
+            approval_set,
+            receipt,
+            event,
+        }
+    }
+
     #[test]
+    #[allow(clippy::too_many_lines)] // one adversary, many coherent forgeries
     fn contested_contenders_must_reproduce_from_their_own_activations() {
         let generation_two = generation_two_activation();
         let rival = rival_activation();
-        let statement_bytes = encode_canonical(generation_two.activation.statement()).unwrap();
+        let policy = generation_one_policy();
+        let target = generation_two_target();
+        let test_result = conformance_result(&target, GENERATION_TWO_TEST_COMPLETED_AT);
 
-        // ATTACK: a head naming a package digest that never passed conformance
-        // and an activation-policy digest that was never installed. It cannot
-        // enter a contender at all: the head is recomputed from the receipt.
+        // ATTACK: three artifacts forged *coherently*, not one at a time. The
+        // statement names a package digest that never passed conformance and an
+        // activation policy that was never installed; the receipt agrees with
+        // the statement field for field; the event's activated head is derived
+        // from the receipt's own digest exactly as `resulting_registry_head`
+        // would derive it, and it is signed for by the two really installed
+        // keys. Mutual consistency is therefore complete - and worthless.
+        let ghost_statement_id = ghost_contender(Vec::new())
+            .statement
+            .statement_id()
+            .unwrap();
+        let ghost = ghost_contender(vec![
+            activation_approval(ghost_statement_id, "principal.alice", [1; 32]),
+            activation_approval(ghost_statement_id, "principal.bob", [2; 32]),
+        ]);
+        assert_eq!(
+            ghost.event.activated_head.head.activation_id,
+            ghost.receipt.activation_id().unwrap().digest(),
+            "the forgery is internally consistent: the head reproduces from the receipt"
+        );
+        let ghost_statement_bytes = encode_canonical(&ghost.statement).unwrap();
+        let ghost_approval_bytes = encode_canonical(&ghost.approval_set).unwrap();
+        assert_eq!(
+            rejection(AuditedContenderActivationV2::from_durable_audit(
+                &policy,
+                &ContenderActivationAuditV2 {
+                    canonical_statement: &ghost_statement_bytes,
+                    canonical_approval_set: &ghost_approval_bytes,
+                    target: &target,
+                    test_result: &test_result,
+                    receipt: &ghost.receipt,
+                    event: &ghost.event,
+                },
+            )),
+            ContractError::ManifestMismatch,
+            "a contender must bind real package bytes and a runner-pinned conformance result"
+        );
+
+        // ATTACK: the real generation-2 statement, approved by a principal the
+        // installed policy does not list. There is no key to verify against, so
+        // an approver set nobody eligible signed cannot enter a contender.
+        let statement_bytes = generation_two.activation.canonical_statement().to_vec();
+        let approval_bytes = generation_two.activation.canonical_approval_set().to_vec();
+        let real_statement_id = generation_two.activation.statement_id().unwrap();
+        let mallory_approvals = encode_canonical(&GenericSuccessorActivationApprovalSetV2 {
+            schema_version: SUCCESSOR_GENERIC_SCHEMA_VERSION,
+            statement_id: real_statement_id,
+            approvals: vec![activation_approval(
+                real_statement_id,
+                "principal.mallory-approver",
+                [9; 32],
+            )],
+        })
+        .unwrap();
+        assert_eq!(
+            rejection(AuditedContenderActivationV2::from_durable_audit(
+                &policy,
+                &ContenderActivationAuditV2 {
+                    canonical_statement: &statement_bytes,
+                    canonical_approval_set: &mallory_approvals,
+                    target: &target,
+                    test_result: &test_result,
+                    receipt: &generation_two.receipt,
+                    event: &generation_two.event,
+                },
+            )),
+            ContractError::SignatureVerification
+        );
+
+        // ATTACK: a real statement and real approvals, with the receipt
+        // rewritten to a threshold of one and an approver who never signed. The
+        // receipt is admitted only if it is the one the verifier derives.
+        let mut downgraded = generation_two.receipt.clone();
+        downgraded.required_threshold = 1;
+        downgraded.eligible_approvals = vec![EligibleApprovalV1 {
+            attestation_id: Sha256Digest::from_bytes([0x99; 32]),
+            principal_id: case_id("principal.mallory-approver"),
+            signer_key_id: case_id("key.mallory"),
+        }];
+        assert_eq!(
+            rejection(AuditedContenderActivationV2::from_durable_audit(
+                &policy,
+                &ContenderActivationAuditV2 {
+                    canonical_statement: &statement_bytes,
+                    canonical_approval_set: &approval_bytes,
+                    target: &target,
+                    test_result: &test_result,
+                    receipt: &downgraded,
+                    event: &generation_two.event,
+                },
+            )),
+            ContractError::ManifestMismatch,
+            "the receipt's threshold and approver set are server-derived, not claimed"
+        );
+
+        // A head naming a package digest that never passed conformance cannot be
+        // slipped into the event either: the event must equal the one the
+        // verified request and its receipt produce.
         let mut forged_head = generation_two.event.clone();
         forged_head.activated_head.head.package_digest = Sha256Digest::from_bytes([0xde; 32]);
         assert_eq!(
             rejection(AuditedContenderActivationV2::from_durable_audit(
-                &statement_bytes,
-                generation_two.receipt.clone(),
-                forged_head,
+                &policy,
+                &ContenderActivationAuditV2 {
+                    canonical_statement: &statement_bytes,
+                    canonical_approval_set: &approval_bytes,
+                    target: &target,
+                    test_result: &test_result,
+                    receipt: &generation_two.receipt,
+                    event: &forged_head,
+                },
             )),
             ContractError::ManifestMismatch
         );
-        let mut forged_policy = generation_two.event.clone();
-        forged_policy.activated_head.head.activation_policy_digest =
-            Sha256Digest::from_bytes([0xad; 32]);
-        assert!(
-            AuditedContenderActivationV2::from_durable_audit(
-                &statement_bytes,
-                generation_two.receipt.clone(),
-                forged_policy,
-            )
-            .is_err()
-        );
-        let mut forged_id = generation_two.event.clone();
-        forged_id.activated_head.head.activation_id = Sha256Digest::from_bytes([0x11; 32]);
-        assert!(
-            AuditedContenderActivationV2::from_durable_audit(
-                &statement_bytes,
-                generation_two.receipt.clone(),
-                forged_id,
-            )
-            .is_err()
-        );
+        for mutate in [
+            (|event: &mut GenericSuccessorActivatedEventV2| {
+                event.activated_head.head.activation_policy_digest =
+                    Sha256Digest::from_bytes([0xad; 32]);
+            }) as fn(&mut GenericSuccessorActivatedEventV2),
+            |event: &mut GenericSuccessorActivatedEventV2| {
+                event.activated_head.head.activation_id = Sha256Digest::from_bytes([0x11; 32]);
+            },
+        ] {
+            let mut forged = generation_two.event.clone();
+            mutate(&mut forged);
+            assert!(
+                AuditedContenderActivationV2::from_durable_audit(
+                    &policy,
+                    &ContenderActivationAuditV2 {
+                        canonical_statement: &statement_bytes,
+                        canonical_approval_set: &approval_bytes,
+                        target: &target,
+                        test_result: &test_result,
+                        receipt: &generation_two.receipt,
+                        event: &forged,
+                    },
+                )
+                .is_err()
+            );
+        }
 
         // Rewriting the receipt instead moves the activation ID, so the event
         // no longer reproduces from it either.
@@ -3685,31 +4074,53 @@ mod tests {
         rewritten.target_package_digest = Sha256Digest::from_bytes([0xde; 32]);
         assert_eq!(
             rejection(AuditedContenderActivationV2::from_durable_audit(
-                &statement_bytes,
-                rewritten,
-                generation_two.event.clone(),
+                &policy,
+                &ContenderActivationAuditV2 {
+                    canonical_statement: &statement_bytes,
+                    canonical_approval_set: &approval_bytes,
+                    target: &target,
+                    test_result: &test_result,
+                    receipt: &rewritten,
+                    event: &generation_two.event,
+                },
             )),
             ContractError::ManifestMismatch
         );
 
-        // The proposer and author are bound by the statement digest, so a
-        // substituted statement cannot rename who proposed the contender - and
-        // therefore cannot bar a legitimate arbiter from resolving the contest.
+        // The proposer and author are bound by the statement digest, so another
+        // genuine activation's receipt cannot be transplanted onto this request
+        // to rename who proposed the contender - and therefore cannot bar a
+        // legitimate arbiter from resolving the contest.
         assert_eq!(
             rejection(AuditedContenderActivationV2::from_durable_audit(
-                &encode_canonical(rival.activation.statement()).unwrap(),
-                generation_two.receipt.clone(),
-                generation_two.event.clone(),
+                &policy,
+                &ContenderActivationAuditV2 {
+                    canonical_statement: rival.activation.canonical_statement(),
+                    canonical_approval_set: rival.activation.canonical_approval_set(),
+                    target: &target,
+                    test_result: &test_result,
+                    receipt: &generation_two.receipt,
+                    event: &generation_two.event,
+                },
             )),
             ContractError::ManifestMismatch
         );
 
         // A genuine activation of a different predecessor head is not a
-        // contender of this contest.
+        // contender of this contest, and the authorizing policy says so before
+        // the contested set is ever assembled.
         let rollback = rollback_activation(&generation_two);
         assert_eq!(
+            rejection(AuditedContenderActivationV2::from_durable_audit(
+                &policy,
+                &contender_audit(&rollback),
+            )),
+            ContractError::ManifestMismatch,
+            "generation 2 -> 3 is not a step the generation-1 policy governs"
+        );
+        assert_eq!(
             rejection(AuditedContestedSetV1::from_durable_audit(
-                &generation_one_policy(),
+                &policy,
                 &[
                     audited_contender(&generation_two),
                     audited_contender(&rollback),
@@ -3744,6 +4155,9 @@ mod tests {
                 &encode_canonical(&approvals).unwrap(),
                 &chain.contested_set,
                 &mismatched,
+                &ContestedResolutionPrincipalBinding::from_trusted_config(case_id(
+                    "principal.arbiter",
+                )),
             )),
             ContractError::ManifestMismatch
         );
@@ -3853,6 +4267,54 @@ mod tests {
         let mut foreign = stale;
         foreign.selected_activation_id = chain.rollback.receipt.activation_id().unwrap();
         assert!(foreign.validate_shape().is_err());
+    }
+
+    #[test]
+    fn the_contested_resolution_proposer_is_authenticated_not_labelled() {
+        let chain = successor_chain();
+        let selected = chain.generation_two.receipt.activation_id().unwrap();
+        // The party actually driving the ceremony, from authenticated
+        // configuration rather than from the request payload.
+        let driver =
+            ContestedResolutionPrincipalBinding::from_trusted_config(case_id("principal.proposer"));
+
+        // Truthfully named, contender A's own proposer is barred.
+        let honest = resolution_statement(&chain.contested_set, selected, "principal.proposer");
+        let honest_approvals = resolution_approval_set(&honest);
+        assert!(matches!(
+            verify_contested_set_resolution(
+                &encode_canonical(&honest).unwrap(),
+                &encode_canonical(&honest_approvals).unwrap(),
+                &chain.contested_set,
+                &generation_one_policy(),
+                &driver,
+            ),
+            Err(ContractError::Schema(_))
+        ));
+
+        // The same party writing a different name in the payload no longer
+        // escapes the bar. The proposer is compared against trusted
+        // configuration before the barred sets are consulted at all, so the
+        // rule tests an authenticated identity rather than a chosen string.
+        for alias in [
+            "principal.proposer-but-spelled-differently",
+            "principal.zzz",
+            "principal.arbiter",
+        ] {
+            let aliased = resolution_statement(&chain.contested_set, selected, alias);
+            let approvals = resolution_approval_set(&aliased);
+            assert_eq!(
+                rejection(verify_contested_set_resolution(
+                    &encode_canonical(&aliased).unwrap(),
+                    &encode_canonical(&approvals).unwrap(),
+                    &chain.contested_set,
+                    &generation_one_policy(),
+                    &driver,
+                )),
+                ContractError::ManifestMismatch,
+                "{alias} disagrees with the authenticated driver"
+            );
+        }
     }
 
     #[test]
