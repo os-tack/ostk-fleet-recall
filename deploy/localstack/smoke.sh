@@ -223,10 +223,16 @@ for digest in \
     "$production_manifest_digest" "$private_manifest_digest" \
     "$production_config_digest" "$private_config_digest"; do
     case "$digest" in
-        sha256:[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+        sha256:*) hex_digest=${digest#sha256:} ;;
         *) fail "image build omitted a canonical sha256 digest" ;;
     esac
+    case "$hex_digest" in
+        ''|*[!0-9a-f]*) fail "image build omitted a canonical sha256 digest" ;;
+    esac
+    [ "${#hex_digest}" -eq 64 ] || \
+        fail "image build omitted a canonical sha256 digest"
 done
+unset digest hex_digest
 
 production_inspect=$proof_tmp/production-inspect.json
 private_inspect=$proof_tmp/private-inspect.json
