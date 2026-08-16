@@ -2683,87 +2683,212 @@ mod tests {
             .unwrap();
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn run_live_reconciliation_contract(database_url: &str) -> Result<()> {
         use crate::store::cockroach::{CockroachStore, PoolConfig};
-        use ostk_recall_core::PrivacyTier;
-
-        let tenant_id = Uuid::now_v7();
-        let project = format!("live-conflict-reconciliation-{}", Uuid::now_v7());
-        let scope = FleetScope::new(
-            tenant_id,
-            project,
-            "reconciliation-test",
-            Some("isolated-official-binary-proof".into()),
-            PrivacyTier::T1Project,
-        )?;
+        let scopes = LiveReconciliationScopes::new()?;
         let store = CockroachStore::connect(
             database_url,
-            scope.clone(),
+            scopes.dismissed.clone(),
             PoolConfig {
-                max_connections: 4,
+                max_connections: 12,
                 ..PoolConfig::default()
             },
         )
         .await?;
         store.migrate().await?;
         let pool = store.pool().clone();
-        let claim_key = "fleet-store::database-choice";
-        let left_id = seed_live_claim(
-            &pool,
-            &scope,
-            claim_key,
-            Value::String("cockroachdb".into()),
-            1,
-        )
-        .await?;
-        let right_id = seed_live_claim(
-            &pool,
-            &scope,
-            claim_key,
-            Value::String("postgresql".into()),
-            -1,
-        )
-        .await?;
-        let legacy_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO memory_conflicts (\
-                 tenant_id, project, claim_key, state, detector, rationale, revision\
-             ) VALUES ($1, $2, $3, 'open', $4, 'legacy fixture', 7) \
-             RETURNING id",
-        )
-        .bind(scope.tenant_id)
-        .bind(&scope.project)
-        .bind(claim_key)
-        .bind(LEGACY_TYPED_VALUE_CONFLICT_DETECTOR)
-        .fetch_one(&pool)
-        .await?;
-        for claim_id in [left_id, right_id] {
-            sqlx::query(
-                "INSERT INTO memory_conflict_members (\
-                     tenant_id, project, conflict_id, claim_id\
-                 ) VALUES ($1, $2, $3, $4)",
-            )
-            .bind(scope.tenant_id)
-            .bind(&scope.project)
-            .bind(legacy_id)
-            .bind(claim_id)
-            .execute(&pool)
-            .await?;
-            sqlx::query(
-                "INSERT INTO memory_claim_events (\
-                     tenant_id, project, claim_id, event_kind, actor, reason, \
-                     from_state, to_state, payload\
-                 ) VALUES ($1, $2, $3, 'state_transition', $4, \
-                     'conflict_detected', 'active', 'disputed', $5)",
-            )
-            .bind(scope.tenant_id)
-            .bind(&scope.project)
-            .bind(claim_id)
-            .bind(&scope.agent)
-            .bind(serde_json::json!({"conflict_id": legacy_id}))
-            .execute(&pool)
-            .await?;
+        let schema_history = live_schema_history_row(&pool).await?;
+        let matrix_result = run_live_reconciliation_matrix(&pool, &scopes, &schema_history).await;
+        let restore_result = restore_live_schema_history_row(&pool, &schema_history).await;
+        let cleanup_result = cleanup_live_scopes(&pool, &scopes).await;
+        pool.close().await;
+
+        let mut failures = Vec::new();
+        if let Err(error) = matrix_result {
+            failures.push(format!("live reconciliation matrix: {error}"));
         }
+        if let Err(error) = restore_result {
+            failures.push(format!("restore migration history: {error}"));
+        }
+        if let Err(error) = cleanup_result {
+            failures.push(format!("bounded residue cleanup: {error}"));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(protocol_error(failures.join("; ")))
+        }
+    }
+
+    #[derive(Debug)]
+    struct LiveReconciliationScopes {
+        dismissed: FleetScope,
+        open: FleetScope,
+        stale: FleetScope,
+        malformed_role: FleetScope,
+        malformed_cross_key: FleetScope,
+        malformed_bound: FleetScope,
+        malformed_inverse: FleetScope,
+        schema_prefix: FleetScope,
+        concurrency: FleetScope,
+    }
+
+    impl LiveReconciliationScopes {
+        fn new() -> Result<Self> {
+            let run_id = Uuid::now_v7();
+            Ok(Self {
+                dismissed: live_scope(run_id, "dismissed")?,
+                open: live_scope(run_id, "open")?,
+                stale: live_scope(run_id, "stale")?,
+                malformed_role: live_scope(run_id, "malformed-role")?,
+                malformed_cross_key: live_scope(run_id, "malformed-cross-key")?,
+                malformed_bound: live_scope(run_id, "malformed-bound")?,
+                malformed_inverse: live_scope(run_id, "malformed-inverse")?,
+                schema_prefix: live_scope(run_id, "schema-prefix")?,
+                concurrency: live_scope(run_id, "concurrency")?,
+            })
+        }
+
+        fn all(&self) -> [&FleetScope; 9] {
+            [
+                &self.dismissed,
+                &self.open,
+                &self.stale,
+                &self.malformed_role,
+                &self.malformed_cross_key,
+                &self.malformed_bound,
+                &self.malformed_inverse,
+                &self.schema_prefix,
+                &self.concurrency,
+            ]
+        }
+    }
+
+    fn live_scope(run_id: Uuid, case: &str) -> Result<FleetScope> {
+        use ostk_recall_core::PrivacyTier;
+
+        FleetScope::new(
+            Uuid::now_v7(),
+            format!("live-reconciliation-{run_id}-{case}"),
+            "reconciliation-test",
+            Some("isolated-official-binary-proof".into()),
+            PrivacyTier::T1Project,
+        )
+    }
+
+    async fn run_live_reconciliation_matrix(
+        pool: &PgPool,
+        scopes: &LiveReconciliationScopes,
+        schema_history: &LiveSchemaHistoryRow,
+    ) -> Result<()> {
+        prove_live_dismissed_reconciliation_and_replay(pool, &scopes.dismissed).await?;
+        prove_live_open_endpoint_graph(pool, &scopes.open).await?;
+        prove_live_stale_revision_is_atomic(pool, &scopes.stale).await?;
+        prove_live_malformed_memberships_are_atomic(pool, scopes).await?;
+        prove_live_schema_prefix_precedes_writes(pool, &scopes.schema_prefix, schema_history)
+            .await?;
+        prove_live_identical_concurrency(pool, &scopes.concurrency).await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn prove_live_dismissed_reconciliation_and_replay(
+        pool: &PgPool,
+        scope: &FleetScope,
+    ) -> Result<()> {
+        let claim_key = "fleet-store::dismissed-database-choice";
+        let value = Value::String("cockroachdb".into());
+        let restored_id =
+            seed_live_claim(pool, scope, claim_key, value.clone(), 1, "disputed").await?;
+        let no_evidence_id =
+            seed_live_claim(pool, scope, claim_key, value.clone(), 1, "disputed").await?;
+        let nonmatching_id =
+            seed_live_claim(pool, scope, claim_key, value.clone(), 1, "disputed").await?;
+        let tied_id = seed_live_claim(pool, scope, claim_key, value.clone(), 1, "disputed").await?;
+        let claim_ids = vec![restored_id, no_evidence_id, nonmatching_id, tied_id];
+        let legacy_id = seed_live_legacy_conflict(
+            pool,
+            scope,
+            claim_key,
+            "dismissed",
+            7,
+            "preserved dismissed legacy fixture",
+        )
+        .await?;
+        for claim_id in &claim_ids {
+            seed_live_legacy_member(pool, scope, legacy_id, *claim_id, "claim").await?;
+        }
+
+        let restored_older_event = Uuid::from_u128(0x101);
+        let restored_authorizing_event = Uuid::from_u128(0x102);
+        let nonmatching_event = Uuid::from_u128(0x201);
+        let tied_exact_event = Uuid::from_u128(0x301);
+        let tied_nonmatching_event = Uuid::from_u128(0x302);
+        let restored_older_at = live_timestamp("2026-08-15T10:00:00Z")?;
+        let restored_authorizing_at = live_timestamp("2026-08-15T12:00:00Z")?;
+        let nonmatching_at = live_timestamp("2026-08-15T12:01:00Z")?;
+        let tied_at = live_timestamp("2026-08-15T12:02:00Z")?;
+        seed_live_transition_evidence(
+            pool,
+            scope,
+            restored_id,
+            restored_older_event,
+            "manual_dispute",
+            "active",
+            "disputed",
+            &serde_json::json!({"operator": "older"}),
+            restored_older_at,
+        )
+        .await?;
+        seed_live_transition_evidence(
+            pool,
+            scope,
+            restored_id,
+            restored_authorizing_event,
+            "conflict_detected",
+            "active",
+            "disputed",
+            &serde_json::json!({"conflict_id": legacy_id}),
+            restored_authorizing_at,
+        )
+        .await?;
+        seed_live_transition_evidence(
+            pool,
+            scope,
+            nonmatching_id,
+            nonmatching_event,
+            "manual_dispute",
+            "active",
+            "disputed",
+            &serde_json::json!({"conflict_id": legacy_id}),
+            nonmatching_at,
+        )
+        .await?;
+        seed_live_transition_evidence(
+            pool,
+            scope,
+            tied_id,
+            tied_exact_event,
+            "conflict_detected",
+            "active",
+            "disputed",
+            &serde_json::json!({"conflict_id": legacy_id}),
+            tied_at,
+        )
+        .await?;
+        seed_live_transition_evidence(
+            pool,
+            scope,
+            tied_id,
+            tied_nonmatching_event,
+            "manual_dispute",
+            "active",
+            "disputed",
+            &serde_json::json!({"conflict_id": legacy_id}),
+            tied_at,
+        )
+        .await?;
+
         let legacy_receipt_key = format!("legacy-fixture-{legacy_id}");
         sqlx::query(
             "INSERT INTO memory_mutation_receipts (\
@@ -2776,146 +2901,1433 @@ mod tests {
         .bind(serde_json::json!({"legacy": true}))
         .bind(legacy_id)
         .bind(serde_json::json!({"preserve": true}))
-        .execute(&pool)
+        .execute(pool)
         .await?;
+        let legacy_before = live_legacy_snapshot(pool, scope, legacy_id).await?;
+        let members_before = live_member_snapshot(pool, scope, legacy_id).await?;
+        let receipt_before = live_receipt_snapshot(pool, scope, &legacy_receipt_key).await?;
 
-        let legacy_before = live_legacy_snapshot(&pool, &scope, legacy_id).await?;
-        let members_before = live_member_snapshot(&pool, &scope, legacy_id).await?;
-        let receipt_before = live_receipt_snapshot(&pool, &scope, &legacy_receipt_key).await?;
+        let repository = live_repository(pool, scope)?;
+        let replay_key = format!("reconcile-dismissed-{legacy_id}");
+        let first = repository
+            .reconcile_legacy_conflict(scope, legacy_id, 7, &replay_key)
+            .await?;
+        let expected_first = ConflictDetectorReconciliation {
+            operation: CONFLICT_RECONCILIATION_OPERATION.into(),
+            request_version: RECONCILIATION_REQUEST_VERSION,
+            legacy_conflict_id: legacy_id,
+            legacy_conflict_revision: 7,
+            conflict_id: first.conflict_id,
+            reconciliation_event_id: first.reconciliation_event_id,
+            v2_state: "dismissed".into(),
+            candidate_count: 4,
+            incompatibility_pair_count: 0,
+            v2_member_ids: Vec::new(),
+            newly_disputed_claim_ids: Vec::new(),
+            restored_claim_ids: vec![restored_id],
+            retained_disputed_claim_ids: vec![no_evidence_id, nonmatching_id, tied_id],
+            provenance_ambiguous_claim_ids: vec![no_evidence_id, nonmatching_id, tied_id],
+            idempotent_replay: false,
+        };
+        live_expect_eq(&first, &expected_first, "dismissed reconciliation response")?;
 
-        let repository = CockroachConflictReconciliationRepository::new(
+        let digest = live_value_sha256(&value)?;
+        let expected_audit = serde_json::json!({
+            "version": RECONCILIATION_AUDIT_VERSION,
+            "legacy": {
+                "conflict_id": legacy_id,
+                "detector": LEGACY_TYPED_VALUE_CONFLICT_DETECTOR,
+                "revision": 7,
+                "state": "dismissed",
+                "members": claim_ids.iter().map(|claim_id| serde_json::json!({
+                    "claim_id": claim_id,
+                    "role": "claim",
+                    "state": "disputed",
+                    "classification": "current_candidate",
+                })).collect::<Vec<_>>(),
+            },
+            "v2": {
+                "conflict_id": first.conflict_id,
+                "detector": FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+                "state": "dismissed",
+            },
+            "candidates": claim_ids.iter().map(|claim_id| live_candidate_audit_value(
+                *claim_id,
+                1,
+                "disputed",
+                true,
+                Some(&digest),
+            )).collect::<Vec<_>>(),
+            "incompatibility_pairs": [],
+            "v2_member_ids": [],
+            "newly_disputed": [],
+            "restored": [restored_id],
+            "retained_disputed": [no_evidence_id, nonmatching_id, tied_id],
+            "provenance_ambiguous": [no_evidence_id, nonmatching_id, tied_id],
+            "restoration_provenance": [
+                {
+                    "claim_id": restored_id,
+                    "decision": "restore_exact_unique_latest",
+                    "authorizing_event": {
+                        "event_id": restored_authorizing_event,
+                        "created_at": restored_authorizing_at,
+                    },
+                    "evidence": [
+                        {
+                            "event_id": restored_authorizing_event,
+                            "created_at": restored_authorizing_at,
+                            "classification": "exact_legacy_conflict",
+                        },
+                        {
+                            "event_id": restored_older_event,
+                            "created_at": restored_older_at,
+                            "classification": "nonmatching_transition",
+                        },
+                    ],
+                },
+                {
+                    "claim_id": no_evidence_id,
+                    "decision": "retain_no_evidence",
+                    "authorizing_event": null,
+                    "evidence": [],
+                },
+                {
+                    "claim_id": nonmatching_id,
+                    "decision": "retain_latest_nonmatching",
+                    "authorizing_event": null,
+                    "evidence": [{
+                        "event_id": nonmatching_event,
+                        "created_at": nonmatching_at,
+                        "classification": "nonmatching_transition",
+                    }],
+                },
+                {
+                    "claim_id": tied_id,
+                    "decision": "retain_latest_timestamp_tie",
+                    "authorizing_event": null,
+                    "evidence": [
+                        {
+                            "event_id": tied_nonmatching_event,
+                            "created_at": tied_at,
+                            "classification": "nonmatching_transition",
+                        },
+                        {
+                            "event_id": tied_exact_event,
+                            "created_at": tied_at,
+                            "classification": "exact_legacy_conflict",
+                        },
+                    ],
+                },
+            ],
+            "bounds": live_audit_bounds(4, 0, 4, 4, 5),
+        });
+        let aggregate =
+            live_aggregate_event_snapshot(pool, scope, first.reconciliation_event_id).await?;
+        let expected_aggregate = (
+            scope.agent.clone(),
+            scope.session_id.clone(),
+            "conflict_detector_reconciled".to_string(),
+            "conflict".to_string(),
+            first.conflict_id.to_string(),
+            Some(replay_key.clone()),
+            expected_audit,
+        );
+        live_expect_eq(
+            &aggregate,
+            &expected_aggregate,
+            "dismissed structured aggregate audit",
+        )?;
+
+        let v2_row: (
+            String,
+            String,
+            String,
+            bool,
+            Option<String>,
+            Option<String>,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT state, detector, rationale, resolved_at IS NOT NULL, \
+                     resolution_kind, resolution_reason, revision \
+                 FROM memory_conflicts \
+                 WHERE tenant_id = $1 AND project = $2 AND id = $3",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(first.conflict_id)
+        .fetch_one(pool)
+        .await?;
+        live_expect_eq(
+            &v2_row,
+            &(
+                "dismissed".into(),
+                FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2.into(),
+                FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2.into(),
+                true,
+                Some(NO_V2_INCOMPATIBILITY_RESOLUTION_KIND.into()),
+                Some("the complete bounded current-claim graph has no v2 incompatibility".into()),
+                1,
+            ),
+            "dismissed v2 marker",
+        )?;
+        live_expect_eq(
+            &live_member_snapshot(pool, scope, first.conflict_id).await?,
+            &Vec::new(),
+            "dismissed v2 marker has no graph endpoints",
+        )?;
+        live_expect_eq(
+            &live_claim_snapshot(pool, scope, &claim_ids).await?,
+            &vec![
+                (restored_id, "active".into(), 2),
+                (no_evidence_id, "disputed".into(), 1),
+                (nonmatching_id, "disputed".into(), 1),
+                (tied_id, "disputed".into(), 1),
+            ],
+            "dismissed restoration state changes",
+        )?;
+        let transition_rows = live_reconciliation_transition_snapshot(pool, scope).await?;
+        live_expect_eq(
+            &transition_rows,
+            &vec![(
+                restored_id,
+                Some(scope.agent.clone()),
+                Some("legacy_false_positive_reconciled".into()),
+                Some("disputed".into()),
+                Some("active".into()),
+                serde_json::json!({
+                    "reconciliation_event_id": first.reconciliation_event_id,
+                    "legacy_conflict": {
+                        "id": legacy_id,
+                        "detector": LEGACY_TYPED_VALUE_CONFLICT_DETECTOR,
+                    },
+                    "v2_conflict": {
+                        "id": first.conflict_id,
+                        "detector": FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+                    },
+                }),
+            )],
+            "dismissed claim-transition audit",
+        )?;
+
+        live_expect_eq(
+            &live_legacy_snapshot(pool, scope, legacy_id).await?,
+            &legacy_before,
+            "dismissed legacy row preservation",
+        )?;
+        live_expect_eq(
+            &live_member_snapshot(pool, scope, legacy_id).await?,
+            &members_before,
+            "dismissed legacy membership preservation",
+        )?;
+        live_expect_eq(
+            &live_receipt_snapshot(pool, scope, &legacy_receipt_key).await?,
+            &receipt_before,
+            "dismissed legacy receipt preservation",
+        )?;
+
+        let footprint_after_first = live_reconciliation_footprint(pool, scope).await?;
+        let mut replacement_scope = scope.clone();
+        replacement_scope.session_id = Some("replacement-session".into());
+        let replay = repository
+            .reconcile_legacy_conflict(&replacement_scope, legacy_id, 7, &replay_key)
+            .await?;
+        live_expect(
+            replay.idempotent_replay,
+            "exact retry was not marked as replay",
+        )?;
+        let mut normalized_replay = replay;
+        normalized_replay.idempotent_replay = false;
+        live_expect_eq(&normalized_replay, &first, "exact replay payload")?;
+
+        let collision_legacy_id = seed_live_legacy_conflict(
+            pool,
+            scope,
+            "fleet-store::idempotency-collision",
+            "open",
+            9,
+            "collision coordinate",
+        )
+        .await?;
+        live_expect_idempotency_conflict(
+            repository
+                .reconcile_legacy_conflict(scope, collision_legacy_id, 9, &replay_key)
+                .await,
+            "same idempotency key with another legacy id",
+        )?;
+        live_expect_idempotency_conflict(
+            repository
+                .reconcile_legacy_conflict(scope, legacy_id, 8, &replay_key)
+                .await,
+            "same idempotency key with another legacy revision",
+        )?;
+        let different_key = format!("different-key-same-request-{legacy_id}");
+        live_expect_memory_error(
+            repository
+                .reconcile_legacy_conflict(scope, legacy_id, 7, &different_key)
+                .await,
+            "already has a v2 reconciliation lineage",
+            "different idempotency key with the materialized request",
+        )?;
+        live_expect_eq(
+            &live_reconciliation_footprint(pool, scope).await?,
+            &footprint_after_first,
+            "replay and idempotency collision footprint",
+        )?;
+        live_expect(
+            live_receipt_optional(pool, scope, &different_key)
+                .await?
+                .is_none(),
+            "different-key rejection left a receipt",
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn prove_live_open_endpoint_graph(pool: &PgPool, scope: &FleetScope) -> Result<()> {
+        let claim_key = "fleet-store::open-database-choice";
+        let left_value = Value::String("cockroachdb".into());
+        let right_value = Value::String("postgresql".into());
+        let compatible_value = Value::String("mysql".into());
+        let left_id =
+            seed_live_claim(pool, scope, claim_key, left_value.clone(), 1, "active").await?;
+        let right_id =
+            seed_live_claim(pool, scope, claim_key, right_value.clone(), 1, "active").await?;
+        let compatible_id = seed_live_claim(
+            pool,
+            scope,
+            claim_key,
+            compatible_value.clone(),
+            -1,
+            "active",
+        )
+        .await?;
+        let candidate_ids = vec![left_id, right_id, compatible_id];
+        let legacy_id = seed_live_legacy_conflict(
+            pool,
+            scope,
+            claim_key,
+            "open",
+            7,
+            "preserved open legacy fixture",
+        )
+        .await?;
+        for claim_id in [left_id, right_id] {
+            seed_live_legacy_member(pool, scope, legacy_id, claim_id, "claim").await?;
+        }
+        let legacy_before = live_legacy_snapshot(pool, scope, legacy_id).await?;
+        let members_before = live_member_snapshot(pool, scope, legacy_id).await?;
+
+        let repository = live_repository(pool, scope)?;
+        let idempotency_key = format!("reconcile-open-{legacy_id}");
+        let response = repository
+            .reconcile_legacy_conflict(scope, legacy_id, 7, &idempotency_key)
+            .await?;
+        let expected_response = ConflictDetectorReconciliation {
+            operation: CONFLICT_RECONCILIATION_OPERATION.into(),
+            request_version: RECONCILIATION_REQUEST_VERSION,
+            legacy_conflict_id: legacy_id,
+            legacy_conflict_revision: 7,
+            conflict_id: response.conflict_id,
+            reconciliation_event_id: response.reconciliation_event_id,
+            v2_state: "open".into(),
+            candidate_count: 3,
+            incompatibility_pair_count: 1,
+            v2_member_ids: vec![left_id, right_id],
+            newly_disputed_claim_ids: vec![left_id, right_id],
+            restored_claim_ids: Vec::new(),
+            retained_disputed_claim_ids: Vec::new(),
+            provenance_ambiguous_claim_ids: Vec::new(),
+            idempotent_replay: false,
+        };
+        live_expect_eq(
+            &response,
+            &expected_response,
+            "open reconciliation response",
+        )?;
+
+        let left_digest = live_value_sha256(&left_value)?;
+        let right_digest = live_value_sha256(&right_value)?;
+        let compatible_digest = live_value_sha256(&compatible_value)?;
+        let expected_audit = serde_json::json!({
+            "version": RECONCILIATION_AUDIT_VERSION,
+            "legacy": {
+                "conflict_id": legacy_id,
+                "detector": LEGACY_TYPED_VALUE_CONFLICT_DETECTOR,
+                "revision": 7,
+                "state": "open",
+                "members": [
+                    {
+                        "claim_id": left_id,
+                        "role": "claim",
+                        "state": "active",
+                        "classification": "current_candidate",
+                    },
+                    {
+                        "claim_id": right_id,
+                        "role": "claim",
+                        "state": "active",
+                        "classification": "current_candidate",
+                    },
+                ],
+            },
+            "v2": {
+                "conflict_id": response.conflict_id,
+                "detector": FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+                "state": "open",
+            },
+            "candidates": [
+                live_candidate_audit_value(
+                    left_id,
+                    1,
+                    "active",
+                    true,
+                    Some(&left_digest),
+                ),
+                live_candidate_audit_value(
+                    right_id,
+                    1,
+                    "active",
+                    true,
+                    Some(&right_digest),
+                ),
+                live_candidate_audit_value(
+                    compatible_id,
+                    -1,
+                    "active",
+                    false,
+                    Some(&compatible_digest),
+                ),
+            ],
+            "incompatibility_pairs": [{
+                "left_claim_id": left_id,
+                "right_claim_id": right_id,
+            }],
+            "v2_member_ids": [left_id, right_id],
+            "newly_disputed": [left_id, right_id],
+            "restored": [],
+            "retained_disputed": [],
+            "provenance_ambiguous": [],
+            "restoration_provenance": [],
+            "bounds": live_audit_bounds(3, 1, 2, 0, 0),
+        });
+        let aggregate =
+            live_aggregate_event_snapshot(pool, scope, response.reconciliation_event_id).await?;
+        live_expect_eq(
+            &aggregate,
+            &(
+                scope.agent.clone(),
+                scope.session_id.clone(),
+                "conflict_detector_reconciled".to_string(),
+                "conflict".to_string(),
+                response.conflict_id.to_string(),
+                Some(idempotency_key),
+                expected_audit,
+            ),
+            "open structured aggregate audit",
+        )?;
+
+        let v2_row: (
+            String,
+            String,
+            String,
+            bool,
+            Option<String>,
+            Option<String>,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT state, detector, rationale, resolved_at IS NOT NULL, \
+                     resolution_kind, resolution_reason, revision \
+                 FROM memory_conflicts \
+                 WHERE tenant_id = $1 AND project = $2 AND id = $3",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(response.conflict_id)
+        .fetch_one(pool)
+        .await?;
+        live_expect_eq(
+            &v2_row,
+            &(
+                "open".into(),
+                FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2.into(),
+                FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2.into(),
+                false,
+                None,
+                None,
+                1,
+            ),
+            "open v2 lineage",
+        )?;
+        live_expect_eq(
+            &live_member_snapshot(pool, scope, response.conflict_id).await?,
+            &vec![(left_id, "claim".into()), (right_id, "claim".into())],
+            "open exact endpoint graph",
+        )?;
+        live_expect_eq(
+            &live_claim_snapshot(pool, scope, &candidate_ids).await?,
+            &vec![
+                (left_id, "disputed".into(), 2),
+                (right_id, "disputed".into(), 2),
+                (compatible_id, "active".into(), 1),
+            ],
+            "open endpoint-only transitions",
+        )?;
+        let transition_payload = serde_json::json!({
+            "reconciliation_event_id": response.reconciliation_event_id,
+            "legacy_conflict": {
+                "id": legacy_id,
+                "detector": LEGACY_TYPED_VALUE_CONFLICT_DETECTOR,
+            },
+            "v2_conflict": {
+                "id": response.conflict_id,
+                "detector": FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+            },
+        });
+        live_expect_eq(
+            &live_reconciliation_transition_snapshot(pool, scope).await?,
+            &vec![
+                (
+                    left_id,
+                    Some(scope.agent.clone()),
+                    Some("conflict_detector_reconciled_v2".into()),
+                    Some("active".into()),
+                    Some("disputed".into()),
+                    transition_payload.clone(),
+                ),
+                (
+                    right_id,
+                    Some(scope.agent.clone()),
+                    Some("conflict_detector_reconciled_v2".into()),
+                    Some("active".into()),
+                    Some("disputed".into()),
+                    transition_payload,
+                ),
+            ],
+            "open claim-transition audit",
+        )?;
+        live_expect_eq(
+            &live_legacy_snapshot(pool, scope, legacy_id).await?,
+            &legacy_before,
+            "open legacy row preservation",
+        )?;
+        live_expect_eq(
+            &live_member_snapshot(pool, scope, legacy_id).await?,
+            &members_before,
+            "open legacy membership preservation",
+        )?;
+        Ok(())
+    }
+
+    async fn prove_live_stale_revision_is_atomic(pool: &PgPool, scope: &FleetScope) -> Result<()> {
+        let claim_key = "fleet-store::stale-revision";
+        let claim_id = seed_live_claim(
+            pool,
+            scope,
+            claim_key,
+            Value::String("cockroachdb".into()),
+            1,
+            "disputed",
+        )
+        .await?;
+        let legacy_id =
+            seed_live_legacy_conflict(pool, scope, claim_key, "open", 7, "stale revision fixture")
+                .await?;
+        seed_live_legacy_member(pool, scope, legacy_id, claim_id, "claim").await?;
+        let legacy_before = live_legacy_snapshot(pool, scope, legacy_id).await?;
+        let claims_before = live_claim_snapshot(pool, scope, &[claim_id]).await?;
+        let idempotency_key = format!("stale-revision-{legacy_id}");
+        live_expect_memory_error(
+            live_repository(pool, scope)?
+                .reconcile_legacy_conflict(scope, legacy_id, 8, &idempotency_key)
+                .await,
+            "legacy conflict revision changed: expected 8, found 7",
+            "stale expected legacy revision",
+        )?;
+        live_expect_no_reconciliation_writes(pool, scope, "stale expected legacy revision").await?;
+        live_expect_eq(
+            &live_legacy_snapshot(pool, scope, legacy_id).await?,
+            &legacy_before,
+            "stale revision legacy preservation",
+        )?;
+        live_expect_eq(
+            &live_claim_snapshot(pool, scope, &[claim_id]).await?,
+            &claims_before,
+            "stale revision claim preservation",
+        )?;
+        live_expect(
+            live_receipt_optional(pool, scope, &idempotency_key)
+                .await?
+                .is_none(),
+            "stale revision left an idempotency receipt",
+        )?;
+        Ok(())
+    }
+
+    async fn prove_live_malformed_memberships_are_atomic(
+        pool: &PgPool,
+        scopes: &LiveReconciliationScopes,
+    ) -> Result<()> {
+        prove_live_malformed_role(pool, &scopes.malformed_role).await?;
+        prove_live_malformed_cross_key(pool, &scopes.malformed_cross_key).await?;
+        prove_live_malformed_member_bound(pool, &scopes.malformed_bound).await?;
+        prove_live_malformed_inverse_lineage(pool, &scopes.malformed_inverse).await?;
+        Ok(())
+    }
+
+    async fn prove_live_malformed_role(pool: &PgPool, scope: &FleetScope) -> Result<()> {
+        let claim_key = "fleet-store::malformed-role";
+        let claim_id = seed_live_claim(
+            pool,
+            scope,
+            claim_key,
+            Value::String("cockroachdb".into()),
+            1,
+            "disputed",
+        )
+        .await?;
+        let legacy_id =
+            seed_live_legacy_conflict(pool, scope, claim_key, "open", 7, "malformed role fixture")
+                .await?;
+        seed_live_legacy_member(pool, scope, legacy_id, claim_id, "witness").await?;
+        let before = live_claim_snapshot(pool, scope, &[claim_id]).await?;
+        live_expect_protocol_error(
+            live_repository(pool, scope)?
+                .reconcile_legacy_conflict(
+                    scope,
+                    legacy_id,
+                    7,
+                    &format!("malformed-role-{legacy_id}"),
+                )
+                .await,
+            "role outside the exact claim contract",
+            "malformed legacy membership role",
+        )?;
+        live_expect_no_reconciliation_writes(pool, scope, "malformed membership role").await?;
+        live_expect_eq(
+            &live_claim_snapshot(pool, scope, &[claim_id]).await?,
+            &before,
+            "malformed role claim preservation",
+        )?;
+        Ok(())
+    }
+
+    async fn prove_live_malformed_cross_key(pool: &PgPool, scope: &FleetScope) -> Result<()> {
+        let legacy_key = "fleet-store::malformed-cross-key";
+        let claim_id = seed_live_claim(
+            pool,
+            scope,
+            "fleet-store::foreign-claim-key",
+            Value::String("cockroachdb".into()),
+            1,
+            "disputed",
+        )
+        .await?;
+        let legacy_id =
+            seed_live_legacy_conflict(pool, scope, legacy_key, "open", 7, "cross-key fixture")
+                .await?;
+        seed_live_legacy_member(pool, scope, legacy_id, claim_id, "claim").await?;
+        let before = live_claim_snapshot(pool, scope, &[claim_id]).await?;
+        live_expect_protocol_error(
+            live_repository(pool, scope)?
+                .reconcile_legacy_conflict(
+                    scope,
+                    legacy_id,
+                    7,
+                    &format!("malformed-cross-key-{legacy_id}"),
+                )
+                .await,
+            "claim outside its exact claim key",
+            "cross-key legacy membership",
+        )?;
+        live_expect_no_reconciliation_writes(pool, scope, "cross-key legacy membership").await?;
+        live_expect_eq(
+            &live_claim_snapshot(pool, scope, &[claim_id]).await?,
+            &before,
+            "cross-key claim preservation",
+        )?;
+        Ok(())
+    }
+
+    async fn prove_live_malformed_member_bound(pool: &PgPool, scope: &FleetScope) -> Result<()> {
+        let claim_key = "fleet-store::malformed-257th-member";
+        let claim_ids =
+            seed_live_historical_claim_batch(pool, scope, claim_key, LEGACY_MEMBER_SENTINEL_LIMIT)
+                .await?;
+        live_expect_eq(
+            &claim_ids.len(),
+            &LEGACY_MEMBER_SENTINEL_LIMIT,
+            "257th member fixture size",
+        )?;
+        let legacy_id = seed_live_legacy_conflict(
+            pool,
+            scope,
+            claim_key,
+            "open",
+            7,
+            "257th membership fixture",
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO memory_conflict_members (\
+                 tenant_id, project, conflict_id, claim_id, role\
+             ) \
+             SELECT $1, $2, $3, claim_id, 'claim' \
+             FROM unnest($4::INT8[]) AS members(claim_id)",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(legacy_id)
+        .bind(&claim_ids)
+        .execute(pool)
+        .await?;
+        live_expect_memory_error(
+            live_repository(pool, scope)?
+                .reconcile_legacy_conflict(
+                    scope,
+                    legacy_id,
+                    7,
+                    &format!("malformed-bound-{legacy_id}"),
+                )
+                .await,
+            "legacy conflict membership exceeds the bounded limit of 256 claims",
+            "257th legacy membership sentinel",
+        )?;
+        live_expect_no_reconciliation_writes(pool, scope, "257th membership sentinel").await?;
+        live_expect_eq(
+            &live_member_snapshot(pool, scope, legacy_id).await?.len(),
+            &LEGACY_MEMBER_SENTINEL_LIMIT,
+            "257th member history preservation",
+        )?;
+        Ok(())
+    }
+
+    async fn prove_live_malformed_inverse_lineage(pool: &PgPool, scope: &FleetScope) -> Result<()> {
+        let claim_key = "fleet-store::malformed-inverse";
+        let claim_id = seed_live_claim(
+            pool,
+            scope,
+            claim_key,
+            Value::String("cockroachdb".into()),
+            1,
+            "disputed",
+        )
+        .await?;
+        let legacy_id =
+            seed_live_legacy_conflict(pool, scope, claim_key, "open", 7, "inverse fixture").await?;
+        let extra_lineage_id = seed_live_legacy_conflict(
+            pool,
+            scope,
+            "fleet-store::extra-inverse-lineage",
+            "open",
+            1,
+            "extra inverse lineage fixture",
+        )
+        .await?;
+        seed_live_legacy_member(pool, scope, legacy_id, claim_id, "claim").await?;
+        seed_live_legacy_member(pool, scope, extra_lineage_id, claim_id, "claim").await?;
+        let before = live_claim_snapshot(pool, scope, &[claim_id]).await?;
+        live_expect_protocol_error(
+            live_repository(pool, scope)?
+                .reconcile_legacy_conflict(
+                    scope,
+                    legacy_id,
+                    7,
+                    &format!("malformed-inverse-{legacy_id}"),
+                )
+                .await,
+            "inverse membership references a cross-key or unknown conflict lineage",
+            "legacy member extra inverse lineage",
+        )?;
+        live_expect_no_reconciliation_writes(pool, scope, "extra inverse lineage").await?;
+        live_expect_eq(
+            &live_claim_snapshot(pool, scope, &[claim_id]).await?,
+            &before,
+            "inverse-lineage claim preservation",
+        )?;
+        live_expect_eq(
+            &live_member_snapshot(pool, scope, legacy_id).await?,
+            &vec![(claim_id, "claim".into())],
+            "inverse-lineage legacy membership preservation",
+        )?;
+        live_expect_eq(
+            &live_member_snapshot(pool, scope, extra_lineage_id).await?,
+            &vec![(claim_id, "claim".into())],
+            "inverse-lineage extra membership preservation",
+        )?;
+        Ok(())
+    }
+
+    async fn prove_live_schema_prefix_precedes_writes(
+        pool: &PgPool,
+        scope: &FleetScope,
+        schema_history: &LiveSchemaHistoryRow,
+    ) -> Result<()> {
+        let claim_key = "fleet-store::schema-prefix";
+        let claim_id = seed_live_claim(
+            pool,
+            scope,
+            claim_key,
+            Value::String("cockroachdb".into()),
+            1,
+            "disputed",
+        )
+        .await?;
+        let legacy_id =
+            seed_live_legacy_conflict(pool, scope, claim_key, "open", 7, "schema prefix fixture")
+                .await?;
+        seed_live_legacy_member(pool, scope, legacy_id, claim_id, "claim").await?;
+        let legacy_before = live_legacy_snapshot(pool, scope, legacy_id).await?;
+        let members_before = live_member_snapshot(pool, scope, legacy_id).await?;
+        let claims_before = live_claim_snapshot(pool, scope, &[claim_id]).await?;
+        let repository = live_repository(pool, scope)?;
+
+        let deleted = sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+            .bind(REQUIRED_SCHEMA_VERSION)
+            .execute(pool)
+            .await?;
+        let missing_key = format!("schema-prefix-missing-{legacy_id}");
+        let missing_probe = repository
+            .reconcile_legacy_conflict(scope, legacy_id, 7, &missing_key)
+            .await;
+        restore_live_schema_history_row(pool, schema_history).await?;
+        live_expect_eq(
+            &deleted.rows_affected(),
+            &1,
+            "schema-prefix missing-row setup",
+        )?;
+        live_expect_memory_error(
+            missing_probe,
+            "requires the complete successful schema prefix through 16",
+            "missing schema-prefix version 16",
+        )?;
+        live_expect_eq(
+            &live_schema_history_row(pool).await?,
+            schema_history,
+            "migration history after missing-prefix probe",
+        )?;
+
+        let failed = sqlx::query("UPDATE _sqlx_migrations SET success = false WHERE version = $1")
+            .bind(REQUIRED_SCHEMA_VERSION)
+            .execute(pool)
+            .await?;
+        let failed_key = format!("schema-prefix-failed-{legacy_id}");
+        let failed_probe = repository
+            .reconcile_legacy_conflict(scope, legacy_id, 7, &failed_key)
+            .await;
+        restore_live_schema_history_row(pool, schema_history).await?;
+        live_expect_eq(
+            &failed.rows_affected(),
+            &1,
+            "schema-prefix failed-row setup",
+        )?;
+        live_expect_memory_error(
+            failed_probe,
+            "requires the complete successful schema prefix through 16",
+            "failed schema-prefix version 16",
+        )?;
+        live_expect_eq(
+            &live_schema_history_row(pool).await?,
+            schema_history,
+            "migration history after failed-prefix probe",
+        )?;
+
+        live_expect_no_reconciliation_writes(pool, scope, "schema-prefix readiness failures")
+            .await?;
+        live_expect(
+            live_receipt_optional(pool, scope, &missing_key)
+                .await?
+                .is_none()
+                && live_receipt_optional(pool, scope, &failed_key)
+                    .await?
+                    .is_none(),
+            "schema-prefix readiness failure left a receipt",
+        )?;
+        live_expect_eq(
+            &live_legacy_snapshot(pool, scope, legacy_id).await?,
+            &legacy_before,
+            "schema-prefix legacy preservation",
+        )?;
+        live_expect_eq(
+            &live_member_snapshot(pool, scope, legacy_id).await?,
+            &members_before,
+            "schema-prefix membership preservation",
+        )?;
+        live_expect_eq(
+            &live_claim_snapshot(pool, scope, &[claim_id]).await?,
+            &claims_before,
+            "schema-prefix claim preservation",
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn prove_live_identical_concurrency(pool: &PgPool, scope: &FleetScope) -> Result<()> {
+        use std::sync::Arc;
+
+        const CALLER_COUNT: usize = 8;
+        let claim_key = "fleet-store::concurrent-reconciliation";
+        let value = Value::String("cockroachdb".into());
+        let left_id = seed_live_claim(pool, scope, claim_key, value.clone(), 1, "disputed").await?;
+        let right_id =
+            seed_live_claim(pool, scope, claim_key, value.clone(), 1, "disputed").await?;
+        let claim_ids = vec![left_id, right_id];
+        let legacy_id = seed_live_legacy_conflict(
+            pool,
+            scope,
+            claim_key,
+            "dismissed",
+            7,
+            "concurrency fixture",
+        )
+        .await?;
+        let left_event = Uuid::from_u128(0x801);
+        let right_event = Uuid::from_u128(0x802);
+        let left_at = live_timestamp("2026-08-15T13:00:00Z")?;
+        let right_at = live_timestamp("2026-08-15T13:01:00Z")?;
+        for (claim_id, event_id, created_at) in [
+            (left_id, left_event, left_at),
+            (right_id, right_event, right_at),
+        ] {
+            seed_live_legacy_member(pool, scope, legacy_id, claim_id, "claim").await?;
+            seed_live_transition_evidence(
+                pool,
+                scope,
+                claim_id,
+                event_id,
+                "conflict_detected",
+                "active",
+                "disputed",
+                &serde_json::json!({"conflict_id": legacy_id}),
+                created_at,
+            )
+            .await?;
+        }
+
+        let repository = live_repository(pool, scope)?;
+        let idempotency_key = format!("concurrent-reconciliation-{legacy_id}");
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLER_COUNT));
+        let outcomes = futures::future::join_all((0..CALLER_COUNT).map(|_| {
+            let repository = repository.clone();
+            let scope = scope.clone();
+            let barrier = Arc::clone(&barrier);
+            let idempotency_key = idempotency_key.clone();
+            async move {
+                barrier.wait().await;
+                repository
+                    .reconcile_legacy_conflict(&scope, legacy_id, 7, &idempotency_key)
+                    .await
+            }
+        }))
+        .await;
+        let responses = outcomes.into_iter().collect::<Result<Vec<_>>>()?;
+        live_expect_eq(&responses.len(), &CALLER_COUNT, "concurrent response count")?;
+        let fresh_count = responses
+            .iter()
+            .filter(|response| !response.idempotent_replay)
+            .count();
+        live_expect_eq(&fresh_count, &1, "concurrent materialization count")?;
+        let replay_count = responses
+            .iter()
+            .filter(|response| response.idempotent_replay)
+            .count();
+        live_expect_eq(
+            &replay_count,
+            &(CALLER_COUNT - 1),
+            "concurrent replay count",
+        )?;
+        let materialized = responses
+            .iter()
+            .find(|response| !response.idempotent_replay)
+            .cloned()
+            .ok_or_else(|| protocol_error("concurrent reconciliation had no materializer"))?;
+        for response in responses {
+            let mut normalized = response;
+            normalized.idempotent_replay = false;
+            live_expect_eq(
+                &normalized,
+                &materialized,
+                "concurrent callers returned one durable response",
+            )?;
+        }
+        live_expect_eq(
+            &materialized,
+            &ConflictDetectorReconciliation {
+                operation: CONFLICT_RECONCILIATION_OPERATION.into(),
+                request_version: RECONCILIATION_REQUEST_VERSION,
+                legacy_conflict_id: legacy_id,
+                legacy_conflict_revision: 7,
+                conflict_id: materialized.conflict_id,
+                reconciliation_event_id: materialized.reconciliation_event_id,
+                v2_state: "dismissed".into(),
+                candidate_count: 2,
+                incompatibility_pair_count: 0,
+                v2_member_ids: Vec::new(),
+                newly_disputed_claim_ids: Vec::new(),
+                restored_claim_ids: claim_ids.clone(),
+                retained_disputed_claim_ids: Vec::new(),
+                provenance_ambiguous_claim_ids: Vec::new(),
+                idempotent_replay: false,
+            },
+            "concurrent materialized response",
+        )?;
+        live_expect_eq(
+            &live_reconciliation_footprint(pool, scope).await?,
+            &LiveReconciliationFootprint {
+                v2_conflicts: 1,
+                aggregate_events: 1,
+                receipts: 1,
+                newly_disputed_events: 0,
+                restored_events: 2,
+            },
+            "concurrent single materialization footprint",
+        )?;
+        live_expect_eq(
+            &live_claim_snapshot(pool, scope, &claim_ids).await?,
+            &vec![
+                (left_id, "active".into(), 2),
+                (right_id, "active".into(), 2),
+            ],
+            "concurrent restoration applied once",
+        )?;
+
+        let digest = live_value_sha256(&value)?;
+        let expected_audit = serde_json::json!({
+            "version": RECONCILIATION_AUDIT_VERSION,
+            "legacy": {
+                "conflict_id": legacy_id,
+                "detector": LEGACY_TYPED_VALUE_CONFLICT_DETECTOR,
+                "revision": 7,
+                "state": "dismissed",
+                "members": [
+                    {
+                        "claim_id": left_id,
+                        "role": "claim",
+                        "state": "disputed",
+                        "classification": "current_candidate",
+                    },
+                    {
+                        "claim_id": right_id,
+                        "role": "claim",
+                        "state": "disputed",
+                        "classification": "current_candidate",
+                    },
+                ],
+            },
+            "v2": {
+                "conflict_id": materialized.conflict_id,
+                "detector": FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+                "state": "dismissed",
+            },
+            "candidates": [
+                live_candidate_audit_value(left_id, 1, "disputed", true, Some(&digest)),
+                live_candidate_audit_value(right_id, 1, "disputed", true, Some(&digest)),
+            ],
+            "incompatibility_pairs": [],
+            "v2_member_ids": [],
+            "newly_disputed": [],
+            "restored": [left_id, right_id],
+            "retained_disputed": [],
+            "provenance_ambiguous": [],
+            "restoration_provenance": [
+                {
+                    "claim_id": left_id,
+                    "decision": "restore_exact_unique_latest",
+                    "authorizing_event": {"event_id": left_event, "created_at": left_at},
+                    "evidence": [{
+                        "event_id": left_event,
+                        "created_at": left_at,
+                        "classification": "exact_legacy_conflict",
+                    }],
+                },
+                {
+                    "claim_id": right_id,
+                    "decision": "restore_exact_unique_latest",
+                    "authorizing_event": {"event_id": right_event, "created_at": right_at},
+                    "evidence": [{
+                        "event_id": right_event,
+                        "created_at": right_at,
+                        "classification": "exact_legacy_conflict",
+                    }],
+                },
+            ],
+            "bounds": live_audit_bounds(2, 0, 2, 2, 2),
+        });
+        let aggregate =
+            live_aggregate_event_snapshot(pool, scope, materialized.reconciliation_event_id)
+                .await?;
+        live_expect_eq(
+            &aggregate.6,
+            &expected_audit,
+            "concurrent deterministic structured audit",
+        )?;
+        Ok(())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LiveSchemaHistoryRow {
+        version: i64,
+        description: String,
+        installed_on: DateTime<Utc>,
+        success: bool,
+        checksum: Vec<u8>,
+        execution_time: i64,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct LiveReconciliationFootprint {
+        v2_conflicts: i64,
+        aggregate_events: i64,
+        receipts: i64,
+        newly_disputed_events: i64,
+        restored_events: i64,
+    }
+
+    type LiveAggregateEvent = (
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        Option<String>,
+        Value,
+    );
+    type LiveTransitionRow = (
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Value,
+    );
+
+    fn live_repository(
+        pool: &PgPool,
+        scope: &FleetScope,
+    ) -> Result<CockroachConflictReconciliationRepository> {
+        CockroachConflictReconciliationRepository::new(
             pool.clone(),
             scope.clone(),
             RetryPolicy::default(),
-        )?;
-        let replay_key = format!("reconcile-{legacy_id}");
-        let first = repository
-            .reconcile_legacy_conflict(&scope, legacy_id, 7, &replay_key)
-            .await?;
-        assert!(!first.idempotent_replay);
-        assert_eq!(first.request_version, RECONCILIATION_REQUEST_VERSION);
-        assert_eq!(first.legacy_conflict_id, legacy_id);
-        assert_eq!(first.legacy_conflict_revision, 7);
-        assert_eq!(first.v2_state, "dismissed");
-        assert_eq!(first.candidate_count, 2);
-        assert_eq!(first.incompatibility_pair_count, 0);
-        assert!(first.v2_member_ids.is_empty());
-        assert_eq!(first.restored_claim_ids, vec![left_id, right_id]);
-        assert!(first.retained_disputed_claim_ids.is_empty());
+        )
+    }
 
-        let mut replacement_session_scope = scope.clone();
-        replacement_session_scope.session_id = Some("replacement-session".into());
-        let replay = repository
-            .reconcile_legacy_conflict(&replacement_session_scope, legacy_id, 7, &replay_key)
-            .await?;
-        assert!(replay.idempotent_replay);
-        let mut normalized_replay = replay.clone();
-        normalized_replay.idempotent_replay = false;
-        assert_eq!(normalized_replay, first);
+    fn live_timestamp(value: &str) -> Result<DateTime<Utc>> {
+        value
+            .parse()
+            .map_err(|error| protocol_error(format!("parse live fixture timestamp: {error}")))
+    }
 
-        assert_eq!(
-            live_legacy_snapshot(&pool, &scope, legacy_id).await?,
-            legacy_before
-        );
-        assert_eq!(
-            live_member_snapshot(&pool, &scope, legacy_id).await?,
-            members_before
-        );
-        assert_eq!(
-            live_receipt_snapshot(&pool, &scope, &legacy_receipt_key).await?,
-            receipt_before
-        );
+    fn live_value_sha256(value: &Value) -> Result<String> {
+        let encoded = serde_json::to_vec(&canonical_json(value))
+            .map_err(|error| protocol_error(format!("encode live fixture value: {error}")))?;
+        Ok(hex::encode(Sha256::digest(encoded)))
+    }
 
-        let v2_row: (String, String, Option<String>, i64) = sqlx::query_as(
-            "SELECT state, detector, resolution_kind, revision \
-             FROM memory_conflicts \
-             WHERE tenant_id = $1 AND project = $2 AND id = $3",
+    fn live_candidate_audit_value(
+        id: i64,
+        polarity: i16,
+        state: &str,
+        legacy_member: bool,
+        value_sha256: Option<&str>,
+    ) -> Value {
+        serde_json::json!({
+            "id": id,
+            "revision": 1,
+            "state": state,
+            "polarity": polarity,
+            "valid_from": null,
+            "valid_to": null,
+            "conflict_eligible": true,
+            "legacy_member": legacy_member,
+            "value_sha256": value_sha256,
+        })
+    }
+
+    fn live_audit_bounds(
+        candidate_count: usize,
+        pair_count: usize,
+        legacy_member_count: usize,
+        restoration_candidate_count: usize,
+        transition_evidence_count: usize,
+    ) -> Value {
+        serde_json::json!({
+            "max_current_claims": MAX_CURRENT_CLAIMS_PER_KEY,
+            "candidate_query_limit": CURRENT_CLAIM_SENTINEL_LIMIT,
+            "max_legacy_members": MAX_LEGACY_MEMBERS_PER_CONFLICT,
+            "legacy_member_query_limit": LEGACY_MEMBER_SENTINEL_LIMIT,
+            "legacy_member_count": legacy_member_count,
+            "max_pre_v2_memberships_per_legacy_member":
+                MAX_PRE_V2_MEMBERSHIPS_PER_LEGACY_MEMBER,
+            "legacy_member_inverse_query_limit_per_claim":
+                LEGACY_MEMBER_INVERSE_SENTINEL_LIMIT,
+            "max_legacy_member_inverse_rows": MAX_LEGACY_MEMBER_INVERSE_ROWS,
+            "max_unordered_pairs": MAX_UNORDERED_PAIRS,
+            "candidate_count": candidate_count,
+            "pair_count": pair_count,
+            "max_transition_evidence_per_restoration_candidate": 2,
+            "max_transition_provenance_rows": MAX_TRANSITION_PROVENANCE_ROWS,
+            "restoration_candidate_count": restoration_candidate_count,
+            "transition_evidence_count": transition_evidence_count,
+        })
+    }
+
+    fn live_expect(condition: bool, context: &str) -> Result<()> {
+        if condition {
+            Ok(())
+        } else {
+            Err(protocol_error(format!("live proof failed: {context}")))
+        }
+    }
+
+    fn live_expect_eq<T>(actual: &T, expected: &T, context: &str) -> Result<()>
+    where
+        T: std::fmt::Debug + PartialEq + ?Sized,
+    {
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(protocol_error(format!(
+                "live proof failed ({context}): actual {actual:?}, expected {expected:?}"
+            )))
+        }
+    }
+
+    fn live_expect_memory_error(
+        result: Result<ConflictDetectorReconciliation>,
+        expected_fragment: &str,
+        context: &str,
+    ) -> Result<()> {
+        match result {
+            Err(FleetError::Memory(message)) if message.contains(expected_fragment) => Ok(()),
+            other => Err(protocol_error(format!(
+                "live proof failed ({context}): expected memory error containing \
+                 {expected_fragment:?}, got {other:?}"
+            ))),
+        }
+    }
+
+    fn live_expect_protocol_error(
+        result: Result<ConflictDetectorReconciliation>,
+        expected_fragment: &str,
+        context: &str,
+    ) -> Result<()> {
+        match result {
+            Err(FleetError::Protocol(message)) if message.contains(expected_fragment) => Ok(()),
+            other => Err(protocol_error(format!(
+                "live proof failed ({context}): expected protocol error containing \
+                 {expected_fragment:?}, got {other:?}"
+            ))),
+        }
+    }
+
+    fn live_expect_idempotency_conflict(
+        result: Result<ConflictDetectorReconciliation>,
+        context: &str,
+    ) -> Result<()> {
+        match result {
+            Err(FleetError::IdempotencyConflict(message))
+                if message == "idempotency key was already used for a different mutation" =>
+            {
+                Ok(())
+            }
+            other => Err(protocol_error(format!(
+                "live proof failed ({context}): expected exact idempotency conflict, got {other:?}"
+            ))),
+        }
+    }
+
+    async fn live_aggregate_event_snapshot(
+        pool: &PgPool,
+        scope: &FleetScope,
+        event_id: Uuid,
+    ) -> Result<LiveAggregateEvent> {
+        Ok(sqlx::query_as(
+            "SELECT agent, session_id, event_kind, entity_kind, entity_id, \
+                 idempotency_key, payload \
+             FROM memory_events \
+             WHERE tenant_id = $1 AND project = $2 AND event_id = $3",
         )
         .bind(scope.tenant_id)
         .bind(&scope.project)
-        .bind(first.conflict_id)
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(v2_row.0, "dismissed");
-        assert_eq!(v2_row.1, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2);
-        assert_eq!(
-            v2_row.2.as_deref(),
-            Some(NO_V2_INCOMPATIBILITY_RESOLUTION_KIND)
-        );
-        assert_eq!(v2_row.3, 1);
+        .bind(event_id)
+        .fetch_one(pool)
+        .await?)
+    }
 
-        let v2_members: i64 = sqlx::query_scalar(
-            "SELECT count(*)::INT8 FROM memory_conflict_members \
-             WHERE tenant_id = $1 AND project = $2 AND conflict_id = $3",
-        )
-        .bind(scope.tenant_id)
-        .bind(&scope.project)
-        .bind(first.conflict_id)
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(v2_members, 0);
-        let states: Vec<(i64, String, i64)> = sqlx::query_as(
+    async fn live_claim_snapshot(
+        pool: &PgPool,
+        scope: &FleetScope,
+        claim_ids: &[i64],
+    ) -> Result<Vec<(i64, String, i64)>> {
+        Ok(sqlx::query_as(
             "SELECT id, state, revision FROM memory_claims \
              WHERE tenant_id = $1 AND project = $2 AND id = ANY($3) ORDER BY id",
         )
         .bind(scope.tenant_id)
         .bind(&scope.project)
-        .bind([left_id, right_id])
-        .fetch_all(&pool)
-        .await?;
-        assert_eq!(
-            states,
-            vec![
-                (left_id, "active".into(), 2),
-                (right_id, "active".into(), 2)
-            ]
-        );
+        .bind(claim_ids)
+        .fetch_all(pool)
+        .await?)
+    }
 
-        let audit: Value = sqlx::query_scalar(
-            "SELECT payload FROM memory_events \
-             WHERE tenant_id = $1 AND project = $2 AND event_id = $3 \
-               AND event_kind = 'conflict_detector_reconciled'",
+    async fn live_reconciliation_transition_snapshot(
+        pool: &PgPool,
+        scope: &FleetScope,
+    ) -> Result<Vec<LiveTransitionRow>> {
+        Ok(sqlx::query_as(
+            "SELECT claim_id, actor, reason, from_state, to_state, payload \
+             FROM memory_claim_events \
+             WHERE tenant_id = $1 AND project = $2 \
+               AND reason IN (\
+                   'conflict_detector_reconciled_v2', \
+                   'legacy_false_positive_reconciled'\
+               ) \
+             ORDER BY claim_id, event_id",
         )
         .bind(scope.tenant_id)
         .bind(&scope.project)
-        .bind(first.reconciliation_event_id)
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(audit["legacy"]["conflict_id"], legacy_id);
-        assert_eq!(audit["legacy"]["members"].as_array().unwrap().len(), 2);
-        assert!(
-            audit["legacy"]["members"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|member| {
-                    member["role"] == "claim" && member["classification"] == "current_candidate"
-                })
-        );
-        assert_eq!(audit["v2"]["conflict_id"], first.conflict_id);
-        assert_eq!(audit["bounds"]["candidate_count"], 2);
-        assert_eq!(audit["bounds"]["pair_count"], 0);
-        assert_eq!(audit["bounds"]["legacy_member_count"], 2);
-        assert_eq!(audit["bounds"]["transition_evidence_count"], 2);
-        assert_eq!(audit["restored"], serde_json::json!([left_id, right_id]));
-        assert!(
-            audit["restoration_provenance"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|entry| {
-                    entry["decision"] == "restore_exact_unique_latest"
-                        && !entry["authorizing_event"].is_null()
-                        && entry["evidence"].as_array().is_some_and(|events| {
-                            events.len() == 1
-                                && events[0]["classification"] == "exact_legacy_conflict"
-                        })
-                })
-        );
+        .fetch_all(pool)
+        .await?)
+    }
 
-        cleanup_live_scope(&pool, &scope).await?;
-        pool.close().await;
-        Ok(())
+    async fn live_reconciliation_footprint(
+        pool: &PgPool,
+        scope: &FleetScope,
+    ) -> Result<LiveReconciliationFootprint> {
+        let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+                 (SELECT count(*)::INT8 FROM memory_conflicts \
+                  WHERE tenant_id = $1 AND project = $2 AND detector = $3), \
+                 (SELECT count(*)::INT8 FROM memory_events \
+                  WHERE tenant_id = $1 AND project = $2 \
+                    AND event_kind = 'conflict_detector_reconciled'), \
+                 (SELECT count(*)::INT8 FROM memory_mutation_receipts \
+                  WHERE tenant_id = $1 AND project = $2 AND operation = $4), \
+                 (SELECT count(*)::INT8 FROM memory_claim_events \
+                  WHERE tenant_id = $1 AND project = $2 \
+                    AND reason = 'conflict_detector_reconciled_v2'), \
+                 (SELECT count(*)::INT8 FROM memory_claim_events \
+                  WHERE tenant_id = $1 AND project = $2 \
+                    AND reason = 'legacy_false_positive_reconciled')",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2)
+        .bind(CONFLICT_RECONCILIATION_OPERATION)
+        .fetch_one(pool)
+        .await?;
+        Ok(LiveReconciliationFootprint {
+            v2_conflicts: row.0,
+            aggregate_events: row.1,
+            receipts: row.2,
+            newly_disputed_events: row.3,
+            restored_events: row.4,
+        })
+    }
+
+    async fn live_expect_no_reconciliation_writes(
+        pool: &PgPool,
+        scope: &FleetScope,
+        context: &str,
+    ) -> Result<()> {
+        live_expect_eq(
+            &live_reconciliation_footprint(pool, scope).await?,
+            &LiveReconciliationFootprint::default(),
+            context,
+        )
+    }
+
+    async fn live_receipt_optional(
+        pool: &PgPool,
+        scope: &FleetScope,
+        idempotency_key: &str,
+    ) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT 1::INT8 FROM memory_mutation_receipts \
+             WHERE tenant_id = $1 AND project = $2 AND idempotency_key = $3",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(idempotency_key)
+        .fetch_optional(pool)
+        .await?)
+    }
+
+    async fn live_schema_history_row(pool: &PgPool) -> Result<LiveSchemaHistoryRow> {
+        let row: (i64, String, DateTime<Utc>, bool, Vec<u8>, i64) = sqlx::query_as(
+            "SELECT version, description, installed_on, success, checksum, execution_time \
+             FROM _sqlx_migrations WHERE version = $1",
+        )
+        .bind(REQUIRED_SCHEMA_VERSION)
+        .fetch_one(pool)
+        .await?;
+        Ok(LiveSchemaHistoryRow {
+            version: row.0,
+            description: row.1,
+            installed_on: row.2,
+            success: row.3,
+            checksum: row.4,
+            execution_time: row.5,
+        })
+    }
+
+    async fn restore_live_schema_history_row(
+        pool: &PgPool,
+        row: &LiveSchemaHistoryRow,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (\
+                 version, description, installed_on, success, checksum, execution_time\
+             ) VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (version) DO UPDATE SET \
+                 description = excluded.description, \
+                 installed_on = excluded.installed_on, \
+                 success = excluded.success, \
+                 checksum = excluded.checksum, \
+                 execution_time = excluded.execution_time",
+        )
+        .bind(row.version)
+        .bind(&row.description)
+        .bind(row.installed_on)
+        .bind(row.success)
+        .bind(&row.checksum)
+        .bind(row.execution_time)
+        .execute(pool)
+        .await?;
+        live_expect_eq(
+            &live_schema_history_row(pool).await?,
+            row,
+            "exact migration-history restoration",
+        )
+    }
+
+    async fn seed_live_historical_claim_batch(
+        pool: &PgPool,
+        scope: &FleetScope,
+        claim_key: &str,
+        count: usize,
+    ) -> Result<Vec<i64>> {
+        let count = i64::try_from(count)
+            .map_err(|_| protocol_error("live historical claim count exceeds INT8"))?;
+        let mut ids = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO memory_claims (\
+                 tenant_id, project, kind, claim_key, subject, predicate, value, text, \
+                 polarity, state, conflict_eligible\
+             ) \
+             SELECT $1, $2, 'decision', $3, 'fleet-store', 'database-choice', \
+                    jsonb_build_object('ordinal', ordinal), \
+                    'historical-' || ordinal::STRING, 1, 'retracted', true \
+             FROM generate_series(1, $4::INT8) AS generated(ordinal) \
+             RETURNING id",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(claim_key)
+        .bind(count)
+        .fetch_all(pool)
+        .await?;
+        ids.sort_unstable();
+        Ok(ids)
     }
 
     async fn seed_live_claim(
@@ -2924,13 +4336,14 @@ mod tests {
         claim_key: &str,
         value: Value,
         polarity: i16,
+        state: &str,
     ) -> Result<i64> {
         Ok(sqlx::query_scalar::<_, i64>(
             "INSERT INTO memory_claims (\
                  tenant_id, project, kind, claim_key, subject, predicate, value, text, \
                  polarity, state, conflict_eligible\
              ) VALUES ($1, $2, 'decision', $3, 'fleet-store', 'database-choice', \
-                 $4, $5, $6, 'disputed', true) \
+                 $4, $5, $6, $7, true) \
              RETURNING id",
         )
         .bind(scope.tenant_id)
@@ -2939,8 +4352,93 @@ mod tests {
         .bind(&value)
         .bind(value.to_string())
         .bind(polarity)
+        .bind(state)
         .fetch_one(pool)
         .await?)
+    }
+
+    async fn seed_live_legacy_conflict(
+        pool: &PgPool,
+        scope: &FleetScope,
+        claim_key: &str,
+        state: &str,
+        revision: i64,
+        rationale: &str,
+    ) -> Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "INSERT INTO memory_conflicts (\
+                 tenant_id, project, claim_key, state, detector, rationale, revision, \
+                 resolved_at, resolution_kind, resolution_reason\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                 CASE WHEN $4 = 'dismissed' THEN '2026-08-15T09:00:00Z'::TIMESTAMPTZ END, \
+                 CASE WHEN $4 = 'dismissed' THEN 'legacy_false_positive' END, \
+                 CASE WHEN $4 = 'dismissed' THEN 'preserved legacy fixture' END) \
+             RETURNING id",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(claim_key)
+        .bind(state)
+        .bind(LEGACY_TYPED_VALUE_CONFLICT_DETECTOR)
+        .bind(rationale)
+        .bind(revision)
+        .fetch_one(pool)
+        .await?)
+    }
+
+    async fn seed_live_legacy_member(
+        pool: &PgPool,
+        scope: &FleetScope,
+        legacy_id: i64,
+        claim_id: i64,
+        role: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO memory_conflict_members (\
+                 tenant_id, project, conflict_id, claim_id, role\
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(legacy_id)
+        .bind(claim_id)
+        .bind(role)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_live_transition_evidence(
+        pool: &PgPool,
+        scope: &FleetScope,
+        claim_id: i64,
+        event_id: Uuid,
+        reason: &str,
+        from_state: &str,
+        to_state: &str,
+        payload: &Value,
+        created_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO memory_claim_events (\
+                 tenant_id, project, event_id, claim_id, event_kind, actor, reason, \
+                 from_state, to_state, payload, created_at\
+             ) VALUES ($1, $2, $3, $4, 'state_transition', $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(event_id)
+        .bind(claim_id)
+        .bind(&scope.agent)
+        .bind(reason)
+        .bind(from_state)
+        .bind(to_state)
+        .bind(payload)
+        .bind(created_at)
+        .execute(pool)
+        .await?;
+        Ok(())
     }
 
     async fn live_legacy_snapshot(
@@ -2999,7 +4497,31 @@ mod tests {
         .await?)
     }
 
+    async fn cleanup_live_scopes(pool: &PgPool, scopes: &LiveReconciliationScopes) -> Result<()> {
+        let mut failures = Vec::new();
+        for scope in scopes.all() {
+            if let Err(error) = cleanup_live_scope(pool, scope).await {
+                failures.push(format!("{} cleanup: {error}", scope.project));
+                continue;
+            }
+            match live_scope_residue(pool, scope).await {
+                Ok(0) => {}
+                Ok(count) => failures.push(format!(
+                    "{} retained {count} scoped rows after cleanup",
+                    scope.project
+                )),
+                Err(error) => failures.push(format!("{} residue proof: {error}", scope.project)),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(protocol_error(failures.join("; ")))
+        }
+    }
+
     async fn cleanup_live_scope(pool: &PgPool, scope: &FleetScope) -> Result<()> {
+        let mut transaction = pool.begin().await?;
         for table in [
             "memory_mutation_receipts",
             "memory_events",
@@ -3012,9 +4534,33 @@ mod tests {
             sqlx::query(&statement)
                 .bind(scope.tenant_id)
                 .bind(&scope.project)
-                .execute(pool)
+                .execute(&mut *transaction)
                 .await?;
         }
+        transaction.commit().await?;
         Ok(())
+    }
+
+    async fn live_scope_residue(pool: &PgPool, scope: &FleetScope) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT (\
+                 (SELECT count(*) FROM memory_mutation_receipts \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_events \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_claim_events \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_conflict_members \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_conflicts \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_claims \
+                  WHERE tenant_id = $1 AND project = $2)\
+             )::INT8",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .fetch_one(pool)
+        .await?)
     }
 }
