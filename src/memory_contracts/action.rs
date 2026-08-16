@@ -20,6 +20,7 @@
 
 use std::fmt;
 
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::{
@@ -39,6 +40,23 @@ const ACTION_ATTEMPT_SCHEMA_VERSION: u32 = 1;
 const ACTION_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const ACTION_VERIFICATION_SCHEMA_VERSION: u32 = 1;
 const MAX_PRECONDITIONS: usize = 64;
+/// ACT-03: the declared freshness window a revalidation must fall within,
+/// measured backward from `started_at`. Bounds "immediately before
+/// execution" structurally rather than narrative: a revalidation timestamp
+/// more than five minutes older than the moment execution started is no
+/// longer a revalidation of *this* dispatch.
+const MAX_REVALIDATION_TO_START_GAP: Duration = Duration::seconds(300);
+
+/// Parse an already-canonical [`CanonicalTimestamp`] into a UTC instant for
+/// duration arithmetic. [`CanonicalTimestamp::parse`] already proves the
+/// exact RFC-3339 nanosecond form at construction, so this can fail only if
+/// that invariant were ever violated.
+fn parse_canonical_timestamp(value: &CanonicalTimestamp) -> ContractResult<DateTime<Utc>> {
+    value
+        .as_str()
+        .parse::<DateTime<Utc>>()
+        .map_err(|_| ContractError::Schema("canonical timestamp is not parseable RFC-3339".into()))
+}
 
 macro_rules! digest_newtype {
     ($name:ident) => {
@@ -234,8 +252,16 @@ impl AuthorizedActionV1 {
     }
 
     /// Open the canonical execution request this authorized pair permits.
-    /// This is the only production path to a valid [`ExecutionRequestV1`]:
-    /// its digests cannot be hand-assembled to skip proposal or approval.
+    /// `proposal_digest`/`authorization_digest` here are copied from a
+    /// successful [`authorize`] call, so an `ExecutionRequestV1` opened this
+    /// way always names a proposal its authorization actually approved.
+    /// A caller may still hand-assemble an [`ExecutionRequestV1`] directly
+    /// (it derives `Deserialize`); [`revalidate_authorization`] is what
+    /// closes that gap by independently re-checking
+    /// `attempt.request.proposal_digest == authorization.proposal_digest`
+    /// against the authorization actually supplied at revalidation time,
+    /// so a hand-assembled request naming an unapproved proposal is
+    /// rejected there rather than trusted because it was well-formed.
     pub fn open_execution_request(
         &self,
         idempotency_key: FixedHex32,
@@ -272,6 +298,15 @@ pub fn authorize(
     if authorization.decision_maker_principal_id == proposal.proposer_principal_id {
         return Err(ContractError::Schema(
             "a decision-maker cannot authorize its own proposal (AUTH-03)".into(),
+        ));
+    }
+    // ACT-02: an approval cannot outlive the intent it approves — an
+    // authorization expiring after its own proposal would let execution
+    // proceed against a proposal the proposer's own stated expiry had
+    // already retired.
+    if authorization.expiry > proposal.expiry {
+        return Err(ContractError::Schema(
+            "authorization expiry outlives its proposal's expiry (ACT-02)".into(),
         ));
     }
     Ok(AuthorizedActionV1 {
@@ -359,12 +394,26 @@ impl ExecutionAttemptV1 {
     pub fn validate_shape(&self) -> ContractResult<()> {
         self.profile.validate()?;
         self.request.validate_shape()?;
+        // ACT-03: "authorization expiry, remaining uses, and preconditions
+        // are revalidated immediately before execution." Revalidation must
+        // precede or coincide with execution start (never follow it — a
+        // revalidation recorded after dispatch already began revalidates
+        // nothing), and the gap between them is structurally bounded so
+        // "immediately before" cannot mean an arbitrarily stale revalidation
+        // that merely happens to predate `started_at`.
         if self.schema_version != ACTION_ATTEMPT_SCHEMA_VERSION
             || self.revalidated_preconditions.len() > MAX_PRECONDITIONS
             || !strictly_sorted(&self.revalidated_preconditions)
-            || self.started_at > self.revalidated_at
+            || self.revalidated_at > self.started_at
         {
             return Err(ContractError::Schema("invalid execution attempt".into()));
+        }
+        let revalidated_at = parse_canonical_timestamp(&self.revalidated_at)?;
+        let started_at = parse_canonical_timestamp(&self.started_at)?;
+        if started_at - revalidated_at > MAX_REVALIDATION_TO_START_GAP {
+            return Err(ContractError::Schema(
+                "revalidation is not immediately before execution start (ACT-03)".into(),
+            ));
         }
         Ok(())
     }
@@ -411,6 +460,24 @@ pub fn revalidate_authorization(
     if attempt.request.authorization_digest != authorization_digest {
         return Err(ContractError::Schema(
             "execution attempt does not bind the exact authorization digest".into(),
+        ));
+    }
+    // ACT-02/ACT-03: an authorization revalidates only the exact proposal it
+    // was granted for. Without this, `attempt.request.proposal_digest` is a
+    // wire-decoded field a caller controls; nothing else in this function
+    // (or `reconcile_receipt`/`check_idempotency_reuse`) compares it against
+    // `authorization.proposal_digest`, so a single authorization could
+    // otherwise revalidate attempts declaring arbitrary, unauthorized
+    // proposals.
+    if attempt.request.proposal_digest != authorization.proposal_digest {
+        return Err(ContractError::Schema(
+            "execution attempt declares a proposal digest the authorization did not approve (ACT-02)"
+                .into(),
+        ));
+    }
+    if attempt.scope != authorization.scope || attempt.profile != authorization.profile {
+        return Err(ContractError::Schema(
+            "execution attempt scope or profile does not match its authorization".into(),
         ));
     }
     if attempt.revalidated_at >= authorization.expiry {
@@ -569,6 +636,21 @@ pub fn reconcile_receipt(
             "receipt is not reconciled by the exact provider request ID (ACT-03)".into(),
         ));
     }
+    // ACT-03/APPL-01: the receipt that closes an attempt must assert the
+    // exact pre-state the CAS was performed against, and the exact tenant
+    // scope the attempt was authorized under — never an arbitrary pre-state
+    // or a cross-tenant scope smuggled in on the closing receipt.
+    if receipt.before_state != attempt.revalidated_current_state {
+        return Err(ContractError::Schema(
+            "receipt before-state does not match the attempt's revalidated current state (ACT-03)"
+                .into(),
+        ));
+    }
+    if receipt.scope != attempt.scope || receipt.profile != attempt.profile {
+        return Err(ContractError::Schema(
+            "receipt scope or profile does not match its attempt".into(),
+        ));
+    }
     if receipt.recorded_at < attempt.started_at {
         return Err(ContractError::Schema(
             "receipt predates the attempt it reconciles".into(),
@@ -677,7 +759,7 @@ mod tests {
     const VERIFICATION_ID: &str =
         "52acc011337f5ca3dde28b3c298fc6f3008ad9b0dda25bc732d1396a2b3d29d6";
     const VECTOR_SUITE_DIGEST: &str =
-        "5d9245792b3175304c48258ed608411ec9b8ce399341455cd4989551ead89863";
+        "21b2f0ef7e7e450622e55266b9cc04d40e9f82f91dafec69676e209dc998929a";
 
     fn record(bytes: &[u8]) -> &[u8] {
         let body = bytes
@@ -841,14 +923,21 @@ mod tests {
     fn negative_cases() -> Vec<String> {
         [
             "ambiguous_provider_result_requires_indeterminate",
+            "attempt_declares_unauthorized_proposal_digest",
+            "attempt_scope_or_profile_mismatch_rejected",
+            "authorization_expiry_outlives_proposal_rejected",
             "authorization_expiry_reached",
             "idempotency_reuse_different_authorization",
             "idempotency_reuse_different_proposal",
             "mitigation_independent_of_verification_result",
+            "receipt_before_state_mismatch",
             "receipt_predates_attempt",
             "receipt_provider_request_id_mismatch",
+            "receipt_scope_mismatch",
             "receipt_wrong_attempt_binding",
             "reconciliation_state_result_mismatch",
+            "revalidated_at_after_started_at_rejected",
+            "revalidation_gap_exceeds_freshness_window_rejected",
             "self_authorized_proposal_rejected",
             "stale_current_state_fails_closed",
             "stale_preconditions_fail_closed",
@@ -1028,6 +1117,19 @@ mod tests {
     }
 
     #[test]
+    fn authorization_expiry_outlives_proposal_rejected() {
+        let mut later_expiry = authorization();
+        later_expiry.expiry = CanonicalTimestamp::parse("2026-08-16T02:00:00.000000000Z").unwrap();
+        assert!(authorize(&proposal(), &later_expiry).is_err());
+
+        // Exactly equal to the proposal's own expiry is still acceptable:
+        // the approval does not outlive the intent it approves.
+        let mut equal_expiry = authorization();
+        equal_expiry.expiry = proposal().expiry;
+        authorize(&proposal(), &equal_expiry).unwrap();
+    }
+
+    #[test]
     fn idempotency_reuse_is_exact_or_rejected() {
         let request = execution_request();
         assert!(check_idempotency_reuse(&request, &request).is_ok());
@@ -1085,6 +1187,65 @@ mod tests {
     }
 
     #[test]
+    fn revalidated_at_after_started_at_rejected() {
+        // Positive: revalidated strictly before execution start, within the
+        // declared freshness window.
+        let mut on_time = attempt();
+        on_time.started_at = CanonicalTimestamp::parse("2026-08-16T00:05:00.000000000Z").unwrap();
+        on_time.revalidated_at =
+            CanonicalTimestamp::parse("2026-08-16T00:04:30.000000000Z").unwrap();
+        on_time.validate_shape().unwrap();
+        revalidate_authorization(&authorization(), &on_time, 1).unwrap();
+
+        // Negative: a revalidation recorded *after* dispatch already began
+        // revalidates nothing and must be rejected, not accepted as if a
+        // later timestamp were merely "fresher."
+        let mut revalidated_after_start = attempt();
+        revalidated_after_start.started_at =
+            CanonicalTimestamp::parse("2026-08-16T00:05:00.000000000Z").unwrap();
+        revalidated_after_start.revalidated_at =
+            CanonicalTimestamp::parse("2026-08-16T00:20:00.000000000Z").unwrap();
+        assert!(revalidated_after_start.validate_shape().is_err());
+    }
+
+    #[test]
+    fn revalidation_gap_exceeds_freshness_window_rejected() {
+        // Revalidated strictly before start, but far enough before it that
+        // it no longer counts as "immediately before execution."
+        let mut stale_gap = attempt();
+        stale_gap.started_at = CanonicalTimestamp::parse("2026-08-16T00:20:00.000000000Z").unwrap();
+        stale_gap.revalidated_at =
+            CanonicalTimestamp::parse("2026-08-16T00:05:00.000000000Z").unwrap();
+        assert!(stale_gap.validate_shape().is_err());
+    }
+
+    #[test]
+    fn attempt_declares_unauthorized_proposal_digest() {
+        // ACT-02/ACT-03 PROV finding: an attempt whose request names a
+        // proposal digest the authorization never approved must not
+        // revalidate, even though the attempt still binds the correct
+        // authorization digest.
+        let mut unauthorized_proposal = attempt();
+        unauthorized_proposal.request.proposal_digest =
+            ActionProposalDigestV1::from_digest(digest(&"c".repeat(64)));
+        assert_ne!(
+            unauthorized_proposal.request.proposal_digest,
+            authorization().proposal_digest
+        );
+        assert!(revalidate_authorization(&authorization(), &unauthorized_proposal, 1).is_err());
+    }
+
+    #[test]
+    fn attempt_scope_or_profile_mismatch_rejected() {
+        let mut mismatched_scope = attempt();
+        mismatched_scope.scope = AuthenticatedProjectScopeV1::from_trusted_context(
+            ContractId::new("tenant.attacker").unwrap(),
+            ContractId::new("project.attacker").unwrap(),
+        );
+        assert!(revalidate_authorization(&authorization(), &mismatched_scope, 1).is_err());
+    }
+
+    #[test]
     fn ambiguous_provider_outcome_is_indeterminate_not_failure() {
         let mut ambiguous = receipt();
         ambiguous.provider_result = ProviderResultV1::Ambiguous;
@@ -1095,6 +1256,25 @@ mod tests {
         let mut coerced_to_failure = ambiguous;
         coerced_to_failure.reconciliation_state = ReconciliationStateV1::Failed;
         assert!(coerced_to_failure.validate_shape().is_err());
+    }
+
+    #[test]
+    fn reconciliation_state_result_mismatch() {
+        // Every (provider_result, reconciliation_state, after_state) triple
+        // outside the three closed combinations fails closed, not only the
+        // Ambiguous-coerced-to-Failed case above.
+        let mut success_marked_failed = receipt();
+        success_marked_failed.reconciliation_state = ReconciliationStateV1::Failed;
+        assert!(success_marked_failed.validate_shape().is_err());
+
+        let mut failure_marked_reconciled = receipt();
+        failure_marked_reconciled.provider_result = ProviderResultV1::Failure;
+        failure_marked_reconciled.after_state = None;
+        assert!(failure_marked_reconciled.validate_shape().is_err());
+
+        let mut success_missing_after_state = receipt();
+        success_missing_after_state.after_state = None;
+        assert!(success_missing_after_state.validate_shape().is_err());
     }
 
     #[test]
@@ -1119,6 +1299,32 @@ mod tests {
         before_attempt.recorded_at =
             CanonicalTimestamp::parse("2026-08-15T00:00:00.000000000Z").unwrap();
         assert!(reconcile_receipt(&attempt(), &before_attempt).is_err());
+    }
+
+    #[test]
+    fn receipt_before_state_mismatch() {
+        // ACT-03: the receipt closing an attempt must assert the exact
+        // pre-state the compare-and-swap was performed against, never an
+        // arbitrary before-state.
+        let mut wrong_before_state = receipt();
+        wrong_before_state.before_state = state('9');
+        assert_ne!(
+            wrong_before_state.before_state,
+            attempt().revalidated_current_state
+        );
+        assert!(reconcile_receipt(&attempt(), &wrong_before_state).is_err());
+    }
+
+    #[test]
+    fn receipt_scope_mismatch() {
+        // APPL-01/ACT-03: a receipt from a different tenant/project scope
+        // must never close another tenant's attempt.
+        let mut wrong_scope = receipt();
+        wrong_scope.scope = AuthenticatedProjectScopeV1::from_trusted_context(
+            ContractId::new("tenant.attacker").unwrap(),
+            ContractId::new("project.attacker").unwrap(),
+        );
+        assert!(reconcile_receipt(&attempt(), &wrong_scope).is_err());
     }
 
     #[test]
