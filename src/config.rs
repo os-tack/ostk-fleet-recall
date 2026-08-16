@@ -527,6 +527,155 @@ impl ConflictReconciliationRuntimeConfig {
     }
 }
 
+/// Deployment-only pins that enable the event-first writer path (ADR 0002 D4).
+///
+/// The three primary pins are optional as one group. Either all three are
+/// present, and the per-transaction head witness plus the `assert` route are
+/// enabled, or all three are absent, the event-first path stays disabled, and
+/// every legacy behaviour remains byte-stable. A partial set is a
+/// configuration error rather than a silently disabled authority path, so a
+/// half-applied task definition can never downgrade a deployment that was
+/// meant to run event-first.
+///
+/// These values are deployment authority, never request or payload fields:
+/// the semantic namespaces come from process configuration and the receipt pin
+/// arrives out of band, exactly as they do for the control bootstrap (AUTH-04,
+/// EVID-04).
+#[derive(Clone)]
+pub struct WriterAuthorityConfig {
+    semantic_scope: AuthenticatedProjectScopeV1,
+    bootstrap_receipt_digest: BootstrapReceiptDigest,
+    expected_activation_id: Option<Sha256Digest>,
+}
+
+impl std::fmt::Debug for WriterAuthorityConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WriterAuthorityConfig")
+            .field("semantic_scope", &self.semantic_scope)
+            .field("bootstrap_receipt_digest", &"<redacted>")
+            .field(
+                "expected_activation_id",
+                &self.expected_activation_id.map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Exact variables that enable the event-first writer path, as one group.
+const WRITER_AUTHORITY_PIN_ENV_NAMES: [&str; 3] = [
+    "FLEET_RECALL_CONTRACT_TENANT_NAMESPACE",
+    "FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE",
+    "FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST",
+];
+
+/// Optional break-glass pin, meaningless without the group above.
+const WRITER_AUTHORITY_ACTIVATION_ID_ENV_NAME: &str = "FLEET_RECALL_EXPECTED_ACTIVATION_ID";
+
+impl WriterAuthorityConfig {
+    /// Read the optional writer-authority pin group from the process
+    /// environment. `Ok(None)` means the event-first path stays disabled.
+    pub fn from_env() -> Result<Option<Self>> {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Option<Self>> {
+        let tenant_namespace = lookup(WRITER_AUTHORITY_PIN_ENV_NAMES[0]);
+        let project_namespace = lookup(WRITER_AUTHORITY_PIN_ENV_NAMES[1]);
+        let receipt_digest = lookup(WRITER_AUTHORITY_PIN_ENV_NAMES[2]);
+        let expected_activation_id = lookup(WRITER_AUTHORITY_ACTIVATION_ID_ENV_NAME);
+        match (tenant_namespace, project_namespace, receipt_digest) {
+            (None, None, None) => {
+                if expected_activation_id.is_some() {
+                    return Err(FleetError::Configuration(format!(
+                        "{WRITER_AUTHORITY_ACTIVATION_ID_ENV_NAME} has no effect without the complete writer authority pin set {}",
+                        WRITER_AUTHORITY_PIN_ENV_NAMES.join(", ")
+                    )));
+                }
+                Ok(None)
+            }
+            (Some(tenant_namespace), Some(project_namespace), Some(receipt_digest)) => {
+                Ok(Some(Self {
+                    semantic_scope: AuthenticatedProjectScopeV1::from_trusted_context(
+                        parse_contract_id(&tenant_namespace, WRITER_AUTHORITY_PIN_ENV_NAMES[0])?,
+                        parse_contract_id(&project_namespace, WRITER_AUTHORITY_PIN_ENV_NAMES[1])?,
+                    ),
+                    bootstrap_receipt_digest: BootstrapReceiptDigest::from_digest(parse_digest(
+                        &receipt_digest,
+                        WRITER_AUTHORITY_PIN_ENV_NAMES[2],
+                    )?),
+                    expected_activation_id: expected_activation_id
+                        .map(|value| parse_digest(&value, WRITER_AUTHORITY_ACTIVATION_ID_ENV_NAME))
+                        .transpose()?,
+                }))
+            }
+            (tenant_namespace, project_namespace, receipt_digest) => {
+                let missing = [
+                    (
+                        WRITER_AUTHORITY_PIN_ENV_NAMES[0],
+                        tenant_namespace.is_none(),
+                    ),
+                    (
+                        WRITER_AUTHORITY_PIN_ENV_NAMES[1],
+                        project_namespace.is_none(),
+                    ),
+                    (WRITER_AUTHORITY_PIN_ENV_NAMES[2], receipt_digest.is_none()),
+                ]
+                .into_iter()
+                .filter_map(|(name, absent)| absent.then_some(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+                Err(FleetError::Configuration(format!(
+                    "the event-first writer path requires all of {} or none of them; missing {missing}",
+                    WRITER_AUTHORITY_PIN_ENV_NAMES.join(", ")
+                )))
+            }
+        }
+    }
+
+    /// Assemble the pin group from already trusted process context.
+    ///
+    /// Deployment code that resolves these values somewhere other than the
+    /// process environment uses this; nothing here is caller-selectable at a
+    /// protocol boundary (EVID-04).
+    #[must_use]
+    pub const fn from_trusted_context(
+        semantic_scope: AuthenticatedProjectScopeV1,
+        bootstrap_receipt_digest: BootstrapReceiptDigest,
+        expected_activation_id: Option<Sha256Digest>,
+    ) -> Self {
+        Self {
+            semantic_scope,
+            bootstrap_receipt_digest,
+            expected_activation_id,
+        }
+    }
+
+    /// Pinned contract tenant/project namespaces the active head must carry.
+    #[must_use]
+    pub const fn semantic_scope(&self) -> &AuthenticatedProjectScopeV1 {
+        &self.semantic_scope
+    }
+
+    /// Reconstitute the bootstrap authority token only at the verification
+    /// boundary, exactly as the control bootstrap does.
+    #[must_use]
+    pub const fn receipt_pin(&self) -> BootstrapPin {
+        BootstrapPin::from_trusted_config(self.bootstrap_receipt_digest)
+    }
+
+    #[must_use]
+    pub const fn bootstrap_receipt_digest(&self) -> BootstrapReceiptDigest {
+        self.bootstrap_receipt_digest
+    }
+
+    /// Break-glass exact activation ID, compared with equality when present.
+    #[must_use]
+    pub const fn expected_activation_id(&self) -> Option<Sha256Digest> {
+        self.expected_activation_id
+    }
+}
+
 #[derive(Clone)]
 pub struct FleetConfig {
     pub database_url: String,
@@ -2991,6 +3140,114 @@ mod tests {
                 ConflictReconciliationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
                     .is_err(),
                 "accepted unsafe reconciliation URL {url}"
+            );
+        }
+    }
+
+    fn writer_authority_values() -> BTreeMap<&'static str, String> {
+        BTreeMap::from([
+            (
+                "FLEET_RECALL_CONTRACT_TENANT_NAMESPACE",
+                "tenant.acme".into(),
+            ),
+            (
+                "FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE",
+                "project.recall".into(),
+            ),
+            (
+                "FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST",
+                FIXTURE_RECEIPT_DIGEST.into(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn writer_authority_pins_are_bound_and_redacted() {
+        let values = writer_authority_values();
+        let config = WriterAuthorityConfig::from_lookup(|name| values.get(name).cloned())
+            .expect("writer authority config")
+            .expect("writer authority pins are present");
+
+        assert_eq!(
+            config.semantic_scope().tenant_namespace.as_str(),
+            "tenant.acme"
+        );
+        assert_eq!(
+            config.semantic_scope().project_namespace.as_str(),
+            "project.recall"
+        );
+        assert_eq!(
+            config.bootstrap_receipt_digest().digest(),
+            parse_digest(FIXTURE_RECEIPT_DIGEST, "fixture").expect("fixture digest")
+        );
+        assert_eq!(config.expected_activation_id(), None);
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(FIXTURE_RECEIPT_DIGEST));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn writer_authority_pins_are_absent_or_complete_but_never_partial() {
+        assert!(
+            WriterAuthorityConfig::from_lookup(|_| None)
+                .expect("absent pin group")
+                .is_none()
+        );
+
+        for omitted in WRITER_AUTHORITY_PIN_ENV_NAMES {
+            let mut values = writer_authority_values();
+            values.remove(omitted);
+            let error = WriterAuthorityConfig::from_lookup(|name| values.get(name).cloned())
+                .expect_err("partial writer authority pin set must fail closed");
+            assert!(
+                format!("{error}").contains(omitted),
+                "partial pin error must name the missing variable {omitted}"
+            );
+        }
+    }
+
+    #[test]
+    fn writer_authority_break_glass_requires_the_complete_pin_set() {
+        let mut values = writer_authority_values();
+        values.insert(
+            "FLEET_RECALL_EXPECTED_ACTIVATION_ID",
+            FIXTURE_TEST_RESULT_DIGEST.into(),
+        );
+        let config = WriterAuthorityConfig::from_lookup(|name| values.get(name).cloned())
+            .expect("writer authority config")
+            .expect("writer authority pins are present");
+        assert_eq!(
+            config.expected_activation_id(),
+            Some(parse_digest(FIXTURE_TEST_RESULT_DIGEST, "fixture").expect("fixture digest"))
+        );
+
+        let orphan = BTreeMap::from([(
+            "FLEET_RECALL_EXPECTED_ACTIVATION_ID",
+            FIXTURE_TEST_RESULT_DIGEST.to_owned(),
+        )]);
+        assert!(
+            WriterAuthorityConfig::from_lookup(|name| orphan.get(name).cloned()).is_err(),
+            "a break-glass activation ID without the pin group must fail closed"
+        );
+    }
+
+    #[test]
+    fn writer_authority_rejects_noncanonical_pins() {
+        for (name, value) in [
+            ("FLEET_RECALL_CONTRACT_TENANT_NAMESPACE", " tenant.acme"),
+            ("FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE", "Project.Recall"),
+            ("FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST", "not-a-digest"),
+            (
+                "FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST",
+                &FIXTURE_RECEIPT_DIGEST.to_ascii_uppercase(),
+            ),
+            ("FLEET_RECALL_EXPECTED_ACTIVATION_ID", "0123"),
+        ] {
+            let mut values = writer_authority_values();
+            values.insert(name, value.into());
+            assert!(
+                WriterAuthorityConfig::from_lookup(|name| values.get(name).cloned()).is_err(),
+                "accepted non-canonical writer authority pin {name}"
             );
         }
     }
