@@ -2468,6 +2468,59 @@ mod tests {
         .unwrap()
     }
 
+    fn explain_plan_line(line: &str) -> (usize, &str) {
+        let content_offset = line
+            .char_indices()
+            .find(|(_, character)| !matches!(character, ' ' | '│' | '├' | '└' | '─'))
+            .map_or(line.len(), |(offset, _)| offset);
+        (
+            line[..content_offset].chars().count(),
+            line[content_offset..].trim_end(),
+        )
+    }
+
+    fn legacy_v2_presence_plan_is_per_key_bounded(plan: &str) -> bool {
+        const UNIQUE_LOOKUP: &str =
+            "left-join (lookup memory_conflicts@memory_conflicts_scope_key_detector_unique_idx)";
+
+        let has_explicit_point_limit = plan.lines().any(|line| {
+            line.trim_end().ends_with("limit hint: 1.00") || line.trim_end().ends_with("limit: 1")
+        });
+        if has_explicit_point_limit {
+            return true;
+        }
+
+        let lines = plan
+            .lines()
+            .map(explain_plan_line)
+            .filter(|(_, content)| !content.is_empty())
+            .collect::<Vec<_>>();
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, content))| *content == UNIQUE_LOOKUP)
+            .any(|(lookup_index, (lookup_indent, _))| {
+                let descendants = &lines[lookup_index + 1..];
+                let subtree_len = descendants
+                    .iter()
+                    .position(|(indent, _)| indent <= lookup_indent)
+                    .unwrap_or(descendants.len());
+                let subtree = &descendants[..subtree_len];
+                let Some(direct_child_indent) = subtree.iter().map(|(indent, _)| *indent).min()
+                else {
+                    return false;
+                };
+
+                let has_key_proof = subtree.iter().any(|(indent, content)| {
+                    *indent == direct_child_indent && *content == "lookup columns are key"
+                });
+                let has_two_key_cardinality = subtree.iter().any(|(indent, content)| {
+                    *indent == direct_child_indent && *content == "cardinality: [2 - 2]"
+                });
+                has_key_proof && has_two_key_cardinality
+            })
+    }
+
     async fn transition_event_count(pool: &PgPool, scope: &FleetScope, claim_id: i64) -> i64 {
         sqlx::query_scalar(
             "SELECT count(*)::INT8 FROM memory_claim_events \
@@ -2566,6 +2619,50 @@ mod tests {
         assert!(validate_result_limit(MAX_LEDGER_RESULTS).is_ok());
         assert!(validate_result_limit(0).is_err());
         assert!(validate_result_limit(MAX_LEDGER_RESULTS + 1).is_err());
+    }
+
+    #[test]
+    fn legacy_v2_presence_plan_requires_a_limit_or_unique_two_key_lookup() {
+        assert!(legacy_v2_presence_plan_is_per_key_bounded(
+            "limit hint: 1.00"
+        ));
+        assert!(legacy_v2_presence_plan_is_per_key_bounded("limit: 1"));
+
+        let optimized_unique_lookup = "left-join (lookup \
+            memory_conflicts@memory_conflicts_scope_key_detector_unique_idx)\n\
+             ├── lookup columns are key\n\
+             └── cardinality: [2 - 2]";
+        assert!(legacy_v2_presence_plan_is_per_key_bounded(
+            optimized_unique_lookup
+        ));
+        assert!(!legacy_v2_presence_plan_is_per_key_bounded(
+            "left-join (lookup \
+             memory_conflicts@memory_conflicts_scope_key_detector_unique_idx)\n\
+             └── cardinality: [2 - 2]"
+        ));
+        assert!(!legacy_v2_presence_plan_is_per_key_bounded(
+            "left-join (lookup memory_conflicts@primary)\n\
+             ├── lookup columns are key\n\
+             └── cardinality: [2 - 2]"
+        ));
+        assert!(!legacy_v2_presence_plan_is_per_key_bounded(
+            "left-join (lookup \
+             memory_conflicts@memory_conflicts_scope_key_detector_unique_idx)\n\
+             ├── lookup columns are key\n\
+             └── cardinality: [0 - 2]"
+        ));
+
+        let unrelated_lookup_proofs = "root\n\
+             ├── left-join (lookup \
+             memory_conflicts@memory_conflicts_scope_key_detector_unique_idx)\n\
+             │    ├── cardinality: [0 - 1000000]\n\
+             │    └── lookup columns are key\n\
+             └── left-join (lookup memory_conflicts@primary)\n\
+                  ├── cardinality: [2 - 2]\n\
+                  └── lookup columns are key";
+        assert!(!legacy_v2_presence_plan_is_per_key_bounded(
+            unrelated_lookup_proofs
+        ));
     }
 
     #[test]
@@ -3507,8 +3604,9 @@ mod tests {
             "legacy preference missed its v15 point index:\n{preference_plan}"
         );
         assert!(
-            preference_plan.contains("limit hint: 1.00") || preference_plan.contains("limit: 1"),
-            "legacy preference lost its per-key point limit:\n{preference_plan}"
+            legacy_v2_presence_plan_is_per_key_bounded(&preference_plan),
+            "legacy preference lost both its per-key point limit and exact bounded unique lookup:\n\
+             {preference_plan}"
         );
 
         let lineage_plan = sqlx::query_scalar::<_, String>(&format!(
