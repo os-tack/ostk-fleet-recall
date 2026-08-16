@@ -5,7 +5,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 compose_file=$script_dir/compose.yaml
 runtime_policy=$repo_dir/deploy/cockroach/runtime-role-grants.sql
-expected_runtime_policy_sha256=a224b6c247bf162359efb936d69ebd0f1ca5f2ea1823e14a517eb511b15e15e3
+expected_runtime_policy_sha256=f9fcf11f8b9cb6df83a245b2843f099bdd00352c274d1e37f6983992847b06cf
 publication_policy=$repo_dir/deploy/cockroach/publication-reader-role-grants.sql
 expected_publication_policy_sha256=ff3ada75aba9443875efb1f430a14829ef864b3f7409ae5d23f7bd381cb65226
 model_bundle=${FLEET_RECALL_MODEL_BUNDLE:-${1:-}}
@@ -496,14 +496,30 @@ table|fleet_recall|public|memory_conflict_members|SELECT|not_grantable
 table|fleet_recall|public|memory_conflicts|INSERT|not_grantable
 table|fleet_recall|public|memory_conflicts|SELECT|not_grantable
 table|fleet_recall|public|memory_conflicts|UPDATE|not_grantable
+table|fleet_recall|public|memory_content_objects|INSERT|not_grantable
+table|fleet_recall|public|memory_content_objects|SELECT|not_grantable
 table|fleet_recall|public|memory_corpus_models|INSERT|not_grantable
 table|fleet_recall|public|memory_corpus_models|SELECT|not_grantable
 table|fleet_recall|public|memory_events|INSERT|not_grantable
+table|fleet_recall|public|memory_evidence_events|INSERT|not_grantable
+table|fleet_recall|public|memory_evidence_events|SELECT|not_grantable
+table|fleet_recall|public|memory_evidence_quarantine|INSERT|not_grantable
+table|fleet_recall|public|memory_evidence_quarantine|SELECT|not_grantable
+table|fleet_recall|public|memory_evidence_shard_heads|INSERT|not_grantable
+table|fleet_recall|public|memory_evidence_shard_heads|SELECT|not_grantable
+table|fleet_recall|public|memory_evidence_shard_heads|UPDATE|not_grantable
 table|fleet_recall|public|memory_mutation_receipts|INSERT|not_grantable
 table|fleet_recall|public|memory_mutation_receipts|SELECT|not_grantable
-table|fleet_recall|public|memory_mutation_receipts|UPDATE|not_grantable'
+table|fleet_recall|public|memory_mutation_receipts|UPDATE|not_grantable
+table|fleet_recall|public|memory_relation_projection_v1|INSERT|not_grantable
+table|fleet_recall|public|memory_relation_projection_v1|SELECT|not_grantable
+table|fleet_recall|public|memory_relation_projection_v1|UPDATE|not_grantable
+table|fleet_recall|public|memory_relation_projection_watermarks_v1|INSERT|not_grantable
+table|fleet_recall|public|memory_relation_projection_watermarks_v1|SELECT|not_grantable
+table|fleet_recall|public|memory_relation_projection_watermarks_v1|UPDATE|not_grantable
+table|fleet_recall|public|memory_writer_authority_v1|SELECT|not_grantable'
 [ "$runtime_grant_rows" = "$expected_runtime_grant_rows" ] || \
-    fail "runtime grant rows differ from the exact thirty-one-row contract"
+    fail "runtime grant rows differ from the exact forty-seven-row contract"
 runtime_grant_fingerprint=$(sha256_text "$runtime_grant_rows")
 
 runtime_terminal=$(root_scalar "

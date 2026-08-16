@@ -2,7 +2,7 @@
 set -eu
 
 runtime_policy=/localstack/runtime-role-grants.sql
-expected_runtime_policy_sha256=a224b6c247bf162359efb936d69ebd0f1ca5f2ea1823e14a517eb511b15e15e3
+expected_runtime_policy_sha256=f9fcf11f8b9cb6df83a245b2843f099bdd00352c274d1e37f6983992847b06cf
 publication_policy=/localstack/publication-reader-role-grants.sql
 expected_publication_policy_sha256=ff3ada75aba9443875efb1f430a14829ef864b3f7409ae5d23f7bd381cb65226
 
@@ -165,7 +165,7 @@ REVOKE fleet_migrator, fleet_writer, fleet_publication FROM root;
 " >/dev/null
 
 # The runtime policy creates and normalizes fleet_runtime, installs its exact
-# thirty-one-row grant matrix, and adds only fleet_runtime -> fleet_writer. The
+# forty-seven-row grant matrix, and adds only fleet_runtime -> fleet_writer. The
 # principal stays NOLOGIN throughout the policy and the following cleanup.
 apply_runtime_policy
 
@@ -612,7 +612,7 @@ SELECT
 fi
 terminal_state=$(printf '%s\n' "$terminal_output" | tail -n 1)
 assert_value 'terminal runtime/publication state' \
-    '17:1:0:0:0:1:31:0:1:10:0:1:2:2:0' "$terminal_state"
+    '17:1:0:0:0:1:47:0:1:10:0:1:2:2:0' "$terminal_state"
 
 printf '%s\n' \
     'Migration prefix 17 and exact runtime/publication database boundaries are ready.'

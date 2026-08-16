@@ -116,6 +116,24 @@ expect_denied() {
     fi
 }
 
+expect_foreign_key_rejection() {
+    local label=$1
+    local statement=$2
+    local constraint=$3
+    local output
+    if output=$(sql_as_writer "$statement" 2>&1); then
+        fail "$label unexpectedly succeeded for fleet_writer"
+    fi
+    if ! grep -Fq "$constraint" <<<"$output"; then
+        echo "$output" >&2
+        fail "$label failed for a reason other than $constraint"
+    fi
+    if ! grep -Fq 'foreign key' <<<"$output"; then
+        echo "$output" >&2
+        fail "$label was not rejected by a foreign key check"
+    fi
+}
+
 expect_claim_link_parent_denied() {
     local label=$1
     local statement=$2
@@ -851,8 +869,8 @@ GRANT SELECT ON TABLE public._sqlx_migrations, public.memory_corpus_models, publ
 GRANT INSERT ON TABLE public.memory_corpus_models, public.memory_chunks, public.memory_claims, public.memory_claim_embeddings, public.memory_claim_support, public.memory_claim_events, public.memory_conflict_members, public.memory_conflicts, public.memory_mutation_receipts, public.memory_events TO fleet_runtime;
 GRANT UPDATE ON TABLE public.memory_chunks, public.memory_claims, public.memory_conflicts, public.memory_mutation_receipts TO fleet_runtime;
 GRANT DELETE ON TABLE public.memory_chunk_history TO fleet_runtime;
-GRANT SELECT, INSERT ON TABLE public.memory_evidence_events, public.memory_content_objects TO fleet_runtime;
-GRANT SELECT, INSERT, UPDATE ON TABLE public.memory_evidence_shard_heads TO fleet_runtime;
+GRANT SELECT, INSERT ON TABLE public.memory_evidence_events, public.memory_evidence_quarantine, public.memory_content_objects TO fleet_runtime;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.memory_evidence_shard_heads, public.memory_relation_projection_v1, public.memory_relation_projection_watermarks_v1 TO fleet_runtime;
 GRANT SELECT ON TABLE public.memory_writer_authority_v1 TO fleet_runtime;
 GRANT USAGE ON SEQUENCE public.memory_claim_id_seq, public.memory_claim_support_id_seq, public.memory_conflict_id_seq TO fleet_runtime;
 GRANT fleet_runtime TO fleet_writer;'
@@ -894,7 +912,7 @@ for required_policy_shape in \
     'REVOKE SYSTEM ALL FROM fleet_runtime' \
     'REVOKE ALL ON ALL TABLES IN SCHEMA public' \
     'REVOKE ALL ON ALL SEQUENCES IN SCHEMA public' \
-    'count(*) = 39'
+    'count(*) = 47'
 do
     grep -Fq "$required_policy_shape" "$policy" \
         || fail "runtime policy lost required shape: $required_policy_shape"
@@ -930,7 +948,7 @@ reviewed_source_manifest=$(shasum -a 256 \
 expected_reviewed_source_manifest="66e14beaa4faf10d26e9ebfdc3e079cdfc7dcf2f7c777eb04b9b48676747f33a  $repo_root/src/config.rs
 7084682294585060cf1350e5c74ba2c5676c6d06c7eb39929aa7878b5a37f983  $repo_root/src/main.rs
 7718c15393872a139956732629c472d813a2a014395f943a5382191966162745  $repo_root/src/private_postgres.rs
-1579730319293f1b300023f9182b271072ac380c894915c515539031c5043c09  $repo_root/src/store/cockroach.rs
+3e0085da62d839d84c9987a14fb7114918a324e33b033690f87fa0bdad01ed5e  $repo_root/src/store/cockroach.rs
 b8c3ffbd3dfe7a74f76a06815f317db3e79b3129adaa14e2da5bea43f60b069f  $repo_root/src/ledger/cockroach.rs
 6f0c6874072baed1070204063ac65df0761eda2da862e51775ba85cc5a34b522  $repo_root/src/service.rs
 5c1707702371016d7d35a58ffe8179e6015d48564e12e36df81cfc8b2c5f5e70  $repo_root/src/application.rs
@@ -1217,14 +1235,6 @@ CREATE TABLE public.memory_registry_current_heads_v2 (id INT8 PRIMARY KEY);
 CREATE TABLE public.memory_registry_genesis_bridge_consumptions (id INT8 PRIMARY KEY);
 CREATE TABLE public.memory_registry_heads (id INT8 PRIMARY KEY);
 CREATE TABLE public.memory_registry_transitions (id INT8 PRIMARY KEY);
-CREATE TABLE public.memory_evidence_shard_heads (
-    id INT8 PRIMARY KEY,
-    value INT8 NOT NULL DEFAULT 0
-);
-CREATE TABLE public.memory_evidence_events (
-    id INT8 PRIMARY KEY,
-    value INT8 NOT NULL DEFAULT 0
-);
 CREATE TABLE public.memory_evidence_quarantine (
     id INT8 PRIMARY KEY,
     value INT8 NOT NULL DEFAULT 0
@@ -1244,6 +1254,41 @@ CREATE TABLE public.memory_relation_projection_watermarks_v1 (
 CREATE VIEW public.memory_writer_authority_v1 AS
     SELECT id FROM public.memory_control_bootstraps;
 '
+
+# The evidence ledger's three appendable relations are created from the REAL
+# migration-0018 text, not from a stand-in. A stand-in without the epoch and
+# head foreign keys cannot express the failure this proof exists to catch: on
+# CockroachDB v26.2.3 a foreign-key check is evaluated with the INSERTING
+# role's privileges, so a head whose FK points at a control-plane parent is
+# unappendable by a role that ADR 0002 D2 denies every memory_control_* grant
+# (SQLSTATE 42501). Extracting the definitions keeps this fixture from drifting
+# away from the migration it claims to model.
+migration_0018="$repo_root/migrations/0018_stage4_evidence_ledger.sql"
+extract_migration_table() {
+    local table=$1
+    local definition
+    definition=$(awk -v table="$table" '
+        $0 == "CREATE TABLE IF NOT EXISTS " table " (" { capturing = 1 }
+        capturing { print }
+        capturing && $0 == ");" { exit }
+    ' "$migration_0018") || return 1
+    test -n "$definition" || return 1
+    printf '%s\n' "$definition"
+}
+if grep -Fq 'REFERENCES memory_control_' "$migration_0018"; then
+    fail "migration 0018 points an evidence foreign key at a control-plane table"
+fi
+evidence_plane_fixture=''
+for evidence_plane_table in \
+    memory_evidence_shard_heads \
+    memory_evidence_events
+do
+    evidence_plane_definition=$(extract_migration_table "$evidence_plane_table") \
+        || fail "could not extract $evidence_plane_table from migration 0018"
+    evidence_plane_fixture="$evidence_plane_fixture$evidence_plane_definition
+"
+done
+root_sql "$evidence_plane_fixture" >/dev/null
 
 # Wrong database and incomplete/failed real prefix gates precede target creation.
 wrong_database_output=''
@@ -1556,12 +1601,20 @@ table:fleet_recall:public:memory_corpus_models:SELECT:not_grantable
 table:fleet_recall:public:memory_events:INSERT:not_grantable
 table:fleet_recall:public:memory_evidence_events:INSERT:not_grantable
 table:fleet_recall:public:memory_evidence_events:SELECT:not_grantable
+table:fleet_recall:public:memory_evidence_quarantine:INSERT:not_grantable
+table:fleet_recall:public:memory_evidence_quarantine:SELECT:not_grantable
 table:fleet_recall:public:memory_evidence_shard_heads:INSERT:not_grantable
 table:fleet_recall:public:memory_evidence_shard_heads:SELECT:not_grantable
 table:fleet_recall:public:memory_evidence_shard_heads:UPDATE:not_grantable
 table:fleet_recall:public:memory_mutation_receipts:INSERT:not_grantable
 table:fleet_recall:public:memory_mutation_receipts:SELECT:not_grantable
 table:fleet_recall:public:memory_mutation_receipts:UPDATE:not_grantable
+table:fleet_recall:public:memory_relation_projection_v1:INSERT:not_grantable
+table:fleet_recall:public:memory_relation_projection_v1:SELECT:not_grantable
+table:fleet_recall:public:memory_relation_projection_v1:UPDATE:not_grantable
+table:fleet_recall:public:memory_relation_projection_watermarks_v1:INSERT:not_grantable
+table:fleet_recall:public:memory_relation_projection_watermarks_v1:SELECT:not_grantable
+table:fleet_recall:public:memory_relation_projection_watermarks_v1:UPDATE:not_grantable
 table:fleet_recall:public:memory_writer_authority_v1:SELECT:not_grantable'
 assert_exact "connected runtime direct grant matrix" \
     "$actual_runtime_grants" "$expected_runtime_grants"
@@ -2186,23 +2239,80 @@ expect_denied "receipt DELETE" \
 # ADR 0002 D2/D4 and EVID-01: the writer appends to the general ledger,
 # advances only its own heads, and reads registry authority ONLY through the
 # migrator-owned view. No UPDATE or DELETE on the accepted envelope.
-expect_allowed "evidence event INSERT" \
-    'INSERT INTO public.memory_evidence_events VALUES (1, 0)'
-expect_allowed "evidence event SELECT" \
-    'SELECT value FROM public.memory_evidence_events WHERE id = 1'
-expect_denied "evidence event UPDATE" \
-    'UPDATE public.memory_evidence_events SET value = 1 WHERE id = 1'
-expect_denied "evidence event DELETE" \
-    'DELETE FROM public.memory_evidence_events WHERE id = 1'
-
-expect_allowed "evidence shard head INSERT" \
-    'INSERT INTO public.memory_evidence_shard_heads VALUES (1, 0)'
+# The whole append seam, executed against the REAL migration-0018 relations
+# and their real foreign keys: bind the epoch, seed the head lazily at offset
+# 0 exactly as ADR 0002 D1 prescribes, append one accepted event, then advance
+# the head by CAS. Every one of these statements authorizes a foreign-key
+# check, and every referenced parent lives in the evidence plane, so the role
+# ADR 0002 D2 describes can execute all of them with zero control-plane grants.
+evidence_scope_epoch="decode(sha256('runtime-proof-epoch'), 'hex')"
+evidence_scope_tenant="'0198a849-f6ae-7d61-9800-000000000001'"
+expect_allowed "evidence shard head lazy seed" \
+    "INSERT INTO public.memory_evidence_shard_heads (
+        tenant_id, project, epoch_id, shard, shard_count,
+        last_committed_offset, chain_digest, advanced_at
+    ) VALUES (
+        $evidence_scope_tenant, 'runtime-proof', $evidence_scope_epoch, 3, 16,
+        0, decode(sha256('runtime-proof-genesis'), 'hex'), now()
+    ) ON CONFLICT DO NOTHING"
 expect_allowed "evidence shard head SELECT" \
-    'SELECT value FROM public.memory_evidence_shard_heads WHERE id = 1'
-expect_allowed "evidence shard head UPDATE" \
-    'UPDATE public.memory_evidence_shard_heads SET value = 1 WHERE id = 1'
+    'SELECT last_committed_offset FROM public.memory_evidence_shard_heads'
+expect_allowed "evidence event INSERT" \
+    "INSERT INTO public.memory_evidence_events (
+        tenant_id, project, epoch_id, shard, committed_offset, event_id,
+        event_schema_version, event_kind, semantic_object_digest,
+        consistency_family, consistency_key_digest, canonical_event,
+        previous_chain_digest, chain_digest, accepted_at
+    ) VALUES (
+        $evidence_scope_tenant, 'runtime-proof', $evidence_scope_epoch, 3, 1,
+        decode(sha256('runtime-proof-event'), 'hex'), 1, 'evidence.accepted',
+        decode(sha256('runtime-proof-semantic'), 'hex'), 'evidence',
+        decode(sha256('runtime-proof-consistency'), 'hex'), b'{}',
+        decode(sha256('runtime-proof-genesis'), 'hex'),
+        decode(sha256('runtime-proof-chain'), 'hex'), now()
+    )"
+expect_allowed "evidence event SELECT" \
+    'SELECT committed_offset FROM public.memory_evidence_events'
+expect_denied "evidence event UPDATE" \
+    'UPDATE public.memory_evidence_events SET shard = shard WHERE false'
+expect_denied "evidence event DELETE" \
+    'DELETE FROM public.memory_evidence_events WHERE false'
+
+# The events -> heads foreign key is the evidence plane's only foreign key and
+# it is real: an event under an unseeded head is rejected by the engine, not by
+# a stand-in. ADR 0002 D1's amendment forbids any foreign key from this plane to
+# a control/registry table precisely because CockroachDB v26.2.3 would then
+# require a control-table SELECT grant for the append above.
+expect_foreign_key_rejection "event under an unseeded evidence head" \
+    "INSERT INTO public.memory_evidence_events (
+        tenant_id, project, epoch_id, shard, committed_offset, event_id,
+        event_schema_version, event_kind, semantic_object_digest,
+        consistency_family, consistency_key_digest, canonical_event,
+        previous_chain_digest, chain_digest, accepted_at
+    ) VALUES (
+        $evidence_scope_tenant, 'runtime-proof', $evidence_scope_epoch, 9, 1,
+        decode(sha256('runtime-proof-unseeded'), 'hex'), 1,
+        'evidence.accepted', decode(sha256('runtime-proof-semantic'), 'hex'),
+        'evidence', decode(sha256('runtime-proof-consistency'), 'hex'), b'{}',
+        decode(sha256('runtime-proof-genesis'), 'hex'),
+        decode(sha256('runtime-proof-chain'), 'hex'), now()
+    )" 'memory_evidence_event_head_fk'
+
+expect_allowed "evidence shard head CAS advance" \
+    "UPDATE public.memory_evidence_shard_heads
+     SET last_committed_offset = 1,
+         chain_digest = decode(sha256('runtime-proof-chain'), 'hex'),
+         advanced_at = now()
+     WHERE tenant_id = $evidence_scope_tenant
+       AND project = 'runtime-proof'
+       AND epoch_id = $evidence_scope_epoch
+       AND shard = 3
+       AND last_committed_offset = 0"
+assert_root_scalar "evidence head CAS effect" \
+    "SELECT COALESCE(max(last_committed_offset), -1)::STRING
+     FROM public.memory_evidence_shard_heads" '1'
 expect_denied "evidence shard head DELETE" \
-    'DELETE FROM public.memory_evidence_shard_heads WHERE id = 1'
+    'DELETE FROM public.memory_evidence_shard_heads WHERE false'
 
 expect_allowed "content object INSERT" \
     'INSERT INTO public.memory_content_objects VALUES (1, 0)'
@@ -2220,19 +2330,33 @@ assert_root_scalar "writer authority view grant set" \
      FROM [SHOW GRANTS ON TABLE public.memory_writer_authority_v1]
      WHERE grantee IN ('fleet_runtime', 'fleet_writer', 'public')" 'SELECT'
 
-for evidence_private_table in \
-    memory_evidence_quarantine \
+# ADR 0002 D2 amendment: the ingress quarantine writer and the relation
+# projector run in the same runtime process and the same serializable
+# transaction as the append, so they are the same identity. Both projection
+# relations are rebuildable from memory_evidence_events (REPLAY-01), so UPDATE
+# there advances a disposable projection; nothing here can rewrite an accepted
+# envelope, and DELETE stays denied everywhere.
+expect_allowed "evidence quarantine INSERT" \
+    'INSERT INTO public.memory_evidence_quarantine VALUES (1, 0)'
+expect_allowed "evidence quarantine SELECT" \
+    'SELECT value FROM public.memory_evidence_quarantine WHERE id = 1'
+expect_denied "evidence quarantine UPDATE" \
+    'UPDATE public.memory_evidence_quarantine SET value = 1 WHERE id = 1'
+expect_denied "evidence quarantine DELETE" \
+    'DELETE FROM public.memory_evidence_quarantine WHERE id = 1'
+
+for relation_projection_table in \
     memory_relation_projection_v1 \
     memory_relation_projection_watermarks_v1
 do
-    expect_denied "$evidence_private_table SELECT" \
-        "SELECT count(*) FROM public.$evidence_private_table"
-    expect_denied "$evidence_private_table INSERT" \
-        "INSERT INTO public.$evidence_private_table VALUES (9999, 0)"
-    expect_denied "$evidence_private_table UPDATE" \
-        "UPDATE public.$evidence_private_table SET value = value WHERE false"
-    expect_denied "$evidence_private_table DELETE" \
-        "DELETE FROM public.$evidence_private_table WHERE false"
+    expect_allowed "$relation_projection_table INSERT" \
+        "INSERT INTO public.$relation_projection_table VALUES (1, 0)"
+    expect_allowed "$relation_projection_table SELECT" \
+        "SELECT value FROM public.$relation_projection_table WHERE id = 1"
+    expect_allowed "$relation_projection_table UPDATE" \
+        "UPDATE public.$relation_projection_table SET value = 1 WHERE id = 1"
+    expect_denied "$relation_projection_table DELETE" \
+        "DELETE FROM public.$relation_projection_table WHERE id = 1"
 done
 
 expect_allowed "event INSERT" \
@@ -2341,7 +2465,7 @@ apply_policy >/dev/null
 apply_policy >/dev/null
 assert_root_scalar "normalized exact direct grant count" \
     "SELECT count(*)::STRING FROM [SHOW GRANTS FOR fleet_runtime]
-     WHERE grantee = 'fleet_runtime'" '39'
+     WHERE grantee = 'fleet_runtime'" '47'
 assert_root_scalar "normalized forbidden adjacent grants" \
     "SELECT count(*)::STRING FROM [SHOW GRANTS FOR fleet_runtime]
      WHERE grantee = 'fleet_runtime'
@@ -2488,10 +2612,10 @@ assert_exact "terminal exact sorted runtime matrix" \
 
 # Terminal residue: the only incident edge is runtime -> fixed writer, both
 # subjects are NOLOGIN, the writer is direct-authority-free, and the runtime
-# surface is still exactly thirty-nine rows after every adversary and reapply.
+# surface is still exactly forty-seven rows after every adversary and reapply.
 assert_root_scalar "terminal direct grant count" \
     "SELECT count(*)::STRING FROM [SHOW GRANTS FOR fleet_runtime]
-     WHERE grantee = 'fleet_runtime'" '39'
+     WHERE grantee = 'fleet_runtime'" '47'
 assert_root_scalar "terminal direct writer grants" \
     "SELECT count(*)::STRING FROM [SHOW GRANTS FOR fleet_writer]
      WHERE grantee = 'fleet_writer'" '0'

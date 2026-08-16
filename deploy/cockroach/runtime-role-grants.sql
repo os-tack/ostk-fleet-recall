@@ -739,13 +739,32 @@ GRANT DELETE ON TABLE public.memory_chunk_history TO fleet_runtime;
 -- CHECK forbids a governance kind or the registry.activation family from ever
 -- entering this ledger. No DELETE and no UPDATE on events: the accepted
 -- envelope is append-only (EVID-01).
+--
+-- memory_evidence_shard_heads deliberately has no foreign key to any
+-- memory_control_* table (ADR 0002 D1 amendment): CockroachDB v26.2.3 runs a
+-- foreign-key check with the INSERTING role's privileges, so such a parent
+-- would force a control-table SELECT grant here (observed SQLSTATE 42501 on
+-- the lazy head seed) and would reopen the boundary this policy closes. The
+-- epoch binding is enforced by the appender against memory_writer_authority_v1
+-- inside the append transaction.
+--
+-- The quarantine and relation-projection grants are the same amendment's
+-- remaining three relations: the appender, the ingress quarantine writer, and
+-- the relation projector run in one runtime process and must commit inside the
+-- one serializable transaction EVENT-03 requires. The projection and its
+-- watermark are rebuildable from memory_evidence_events alone (REPLAY-01), so
+-- UPDATE there advances a disposable projection, never an accepted envelope.
 GRANT SELECT, INSERT ON TABLE
     public.memory_evidence_events,
+    public.memory_evidence_quarantine,
     public.memory_content_objects
 TO fleet_runtime;
 
-GRANT SELECT, INSERT, UPDATE ON TABLE public.memory_evidence_shard_heads
-    TO fleet_runtime;
+GRANT SELECT, INSERT, UPDATE ON TABLE
+    public.memory_evidence_shard_heads,
+    public.memory_relation_projection_v1,
+    public.memory_relation_projection_watermarks_v1
+TO fleet_runtime;
 
 -- The head witness reads registry authority only through this migrator-owned
 -- view. CockroachDB v26.2.3 resolves the view's base-table reads with the
@@ -766,11 +785,11 @@ TO fleet_runtime;
 GRANT fleet_runtime TO fleet_writer;
 
 -- Exact direct logical-role surface: database CONNECT, public-schema USAGE,
--- thirty-four table-privilege rows, and three sequence-USAGE rows. Because
+-- forty-two table-privilege rows, and three sequence-USAGE rows. Because
 -- SHOW GRANTS FOR also exposes cluster-global external connections, the exact
 -- count rejects those and every function/type/differently privileged row.
 SELECT IF(
-    count(*) = 39
+    count(*) = 47
         AND COALESCE(bool_and(
             NOT is_grantable
             AND (
@@ -799,8 +818,11 @@ SELECT IF(
                                 'memory_claim_links',
                                 'memory_mutation_receipts',
                                 'memory_evidence_events',
+                                'memory_evidence_quarantine',
                                 'memory_evidence_shard_heads',
                                 'memory_content_objects',
+                                'memory_relation_projection_v1',
+                                'memory_relation_projection_watermarks_v1',
                                 'memory_writer_authority_v1'
                             ))
                         OR (privilege_type = 'INSERT'
@@ -816,8 +838,11 @@ SELECT IF(
                                 'memory_mutation_receipts',
                                 'memory_events',
                                 'memory_evidence_events',
+                                'memory_evidence_quarantine',
                                 'memory_evidence_shard_heads',
-                                'memory_content_objects'
+                                'memory_content_objects',
+                                'memory_relation_projection_v1',
+                                'memory_relation_projection_watermarks_v1'
                             ))
                         OR (privilege_type = 'UPDATE'
                             AND object_name IN (
@@ -825,7 +850,9 @@ SELECT IF(
                                 'memory_claims',
                                 'memory_conflicts',
                                 'memory_mutation_receipts',
-                                'memory_evidence_shard_heads'
+                                'memory_evidence_shard_heads',
+                                'memory_relation_projection_v1',
+                                'memory_relation_projection_watermarks_v1'
                             ))
                         OR (privilege_type = 'DELETE'
                             AND object_name = 'memory_chunk_history')
@@ -844,7 +871,7 @@ SELECT IF(
     1:::INT8,
     CAST(
         concat(
-            'runtime writer direct-grant postcondition differs from exact thirty-nine-row matrix: observed=',
+            'runtime writer direct-grant postcondition differs from exact forty-seven-row matrix: observed=',
             count(*)::STRING
         )
         AS INT8
