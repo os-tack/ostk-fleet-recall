@@ -132,7 +132,27 @@ pub enum DigestDomain {
     /// consolidation receipt; enrichment never enters statement identity.
     ConsolidationSummaryEnrichmentV1,
     // --- W0-SUCC domains ---
-
+    // W0-SUCC
+    /// Unsigned generic generation `N -> N+1` activation statement.
+    RegistrySuccessorActivationStatementV2,
+    // W0-SUCC
+    /// One detached generic successor activation approval attestation.
+    RegistrySuccessorActivationApprovalV2,
+    // W0-SUCC
+    /// Server-derived generic successor activation receipt and identity.
+    RegistrySuccessorActivationReceiptV2,
+    // W0-SUCC
+    /// Unsigned statement selecting one member of an exact contested set.
+    RegistryContestedResolutionStatementV1,
+    // W0-SUCC
+    /// One detached contested-set resolution approval attestation.
+    RegistryContestedResolutionApprovalV1,
+    // W0-SUCC
+    /// Server-derived contested-set resolution receipt and identity.
+    RegistryContestedResolutionReceiptV1,
+    // W0-SUCC
+    /// Immutable record of two or more incompatible successors of one head.
+    RegistryContestedSetV1,
     // --- W0-COVER domains ---
 
     // --- W0-CHUNK domains ---
@@ -208,7 +228,32 @@ impl DigestDomain {
             Self::ConsolidationPolicyV1 => "ostk-consolidation-policy-v1",
             Self::ConsolidationSummaryEnrichmentV1 => "ostk-consolidation-summary-enrichment-v1",
             // --- W0-SUCC prefixes ---
-
+            // W0-SUCC
+            Self::RegistrySuccessorActivationStatementV2 => {
+                "ostk-registry-successor-activation-statement-v2"
+            }
+            // W0-SUCC
+            Self::RegistrySuccessorActivationApprovalV2 => {
+                "ostk-registry-successor-activation-approval-v2"
+            }
+            // W0-SUCC
+            Self::RegistrySuccessorActivationReceiptV2 => {
+                "ostk-registry-successor-activation-receipt-v2"
+            }
+            // W0-SUCC
+            Self::RegistryContestedResolutionStatementV1 => {
+                "ostk-registry-contested-resolution-statement-v1"
+            }
+            // W0-SUCC
+            Self::RegistryContestedResolutionApprovalV1 => {
+                "ostk-registry-contested-resolution-approval-v1"
+            }
+            // W0-SUCC
+            Self::RegistryContestedResolutionReceiptV1 => {
+                "ostk-registry-contested-resolution-receipt-v1"
+            }
+            // W0-SUCC
+            Self::RegistryContestedSetV1 => "ostk-registry-contested-set-v1",
             // --- W0-COVER prefixes ---
 
             // --- W0-CHUNK prefixes ---
