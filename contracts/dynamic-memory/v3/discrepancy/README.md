@@ -49,10 +49,18 @@ DISCREPANCY_VECTOR_OUTPUT=contracts/dynamic-memory/v3/discrepancy \
 - `episode-relation-combined-from.jsonl` — one `DiscrepancyEpisodeRelationV1` of
   kind `combined_from` with two strictly sorted, unique source episodes merged into
   one, proving the `>= 2` sources arity rule.
-- `vector-suite.jsonl` — one manifest binding every fixture's path, raw SHA-256, and
-  every fingerprint/identity pinned in `discrepancy.rs::tests`, plus the sorted list
-  of negative-case names exercised only in Rust (no separate JSON fixture per
-  negative case, matching `relation.rs`'s pattern).
+- `vector-suite.jsonl` — one manifest binding every fixture's path and every
+  fingerprint/identity pinned in `discrepancy.rs::tests`, plus the sorted list of
+  negative-case names exercised only in Rust (no separate JSON fixture per negative
+  case, matching `relation.rs`'s pattern). It does not itself carry a raw-SHA-256
+  field per fixture (unlike `contracts/dynamic-memory/v2/relation/vector-suite.jsonl`,
+  which does); byte integrity here is instead enforced directly by
+  `hard_coded_fixtures_match_canonical_vectors`'s `assert_eq!` against
+  `encode_canonical` of the same Rust-constructed value for every fixture, which is
+  an equivalent guarantee, not a weaker one. The module's `raw_sha256` test helper
+  exists only to print values into `regenerate_discrepancy_contract_artifacts`'s
+  (maintainer-only, `#[ignore]`) stdout for cross-checking during a manual refreeze;
+  it is not consumed by any committed assertion.
 
 ## Invariant IDs covered here, and how a reviewer could try to break each one
 
@@ -104,11 +112,45 @@ DISCREPANCY_VECTOR_OUTPUT=contracts/dynamic-memory/v3/discrepancy \
   `detector`, `extractor`, and `registry` as exact `RegistryReferenceV1`/
   `RegistryHeadBindingV1` identities, plus `member_evidence_ids` and
   `supporting_evidence_ids` (non-empty, strictly sorted, deduplicated).
-- **AUTH-03** (agents cannot self-promote) — `authorize_lifecycle_transition`
-  rejects a `Dismiss` whose actor is in `implicated_actor_ids`
-  (`auth_03_rejects_self_implicated_dismiss`) and rejects a `claim_conflict`
-  waiver whose actor is implicated
-  (`separation_of_duty_rejects_a_claim_conflict_waiver_from_a_conflicted_author`).
+- **AUTH-03** (agents cannot self-promote; "cannot ... silently resolve its own
+  discrepancy") — `authorize_lifecycle_transition` rejects `Dismiss`
+  (`auth_03_rejects_self_implicated_dismiss`), `Resolve`
+  (`auth_03_rejects_self_implicated_resolve`), and `Waive`
+  (`auth_03_rejects_self_implicated_waiver_regardless_of_finding_type`) whenever
+  the transition's actor is in `implicated_actor_ids`. The check is uniform across
+  every `FindingType`, not narrowed to `claim_conflict`: the doc's wording is not
+  scoped to claim authorship, and `implicated_actor_ids` is a generic field any
+  finding type may populate. `Acknowledge` is exempt (acknowledging a discrepancy
+  one is implicated in does not resolve or suppress it). The same function also
+  rejects a lifecycle event whose `scope`/`profile` diverges from its envelope's —
+  an episode fingerprint is a public identifier, not a secret, so knowledge of it
+  alone must never authorize a cross-tenant transition
+  (`lifecycle_event_scope_must_match_the_envelope_scope`), matching the
+  `self.scope != other.scope` convention every sibling contract in this crate
+  already enforces.
+- **DISC-03** (resolution accumulation) — `project_discrepancy_episode` accumulates
+  `resolution_evidence_ids` across every `Resolve` transition in the replay
+  (sorted, deduplicated, order-independent) instead of overwriting them, so a later
+  resolution (e.g. after a reopen) can never drop evidence an earlier one cited
+  (`a_later_resolution_never_drops_an_earlier_resolutions_cited_evidence`).
+- **Episode-identity determinism** (doc:1329-1331, "every discrepancy type
+  registers its continuity-key dimensions") —
+  `DiscrepancyEnvelopeV1::validate_against_episode_policy` binds the envelope's
+  `episode_policy` reference and `continuity_key_dimension_ids` to the exact
+  structurally resolved `EpisodePolicyV2` (`StructurallyResolvedEpisodePolicyV2`,
+  mirroring `evidence_v2.rs`'s `StructurallyResolvedConnectorSchemaV2` pattern and
+  reusing the existing `DigestDomain::RegistryEntry`-keyed `RegistryEntryV1::digest`
+  as the policy fingerprint). `validate_shape` alone only proves the declared
+  continuity key is a sorted subset of `applicability`; it cannot prove that subset
+  matches what the named policy registers, so a producer could otherwise select any
+  continuity-key subset — including the empty set — while citing the same policy
+  reference. `validate_against_episode_policy` closes that gap
+  (`envelope_continuity_key_divergent_from_registered_policy_is_rejected`,
+  `envelope_episode_policy_reference_divergent_from_registry_entry_digest_is_rejected`).
+  A runtime admitting an envelope as an accepted event must call this in addition
+  to `validate_shape`; it is a separate seam (like
+  `validate_against_structural_connector` in `evidence_v2.rs`) because
+  `validate_shape` has no access to the resolved policy body.
 
 ## Fingerprint domain separation from `memory_conflicts`
 

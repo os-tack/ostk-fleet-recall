@@ -31,7 +31,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::{
     ContractError, ContractResult,
-    canonical::encode_canonical,
+    canonical::{decode_strict, encode_canonical},
     common::{
         AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId, ProfileReferenceV1,
         RegistryReferenceV1,
@@ -41,6 +41,7 @@ use super::{
     evidence_v2::RegistryHeadBindingV1,
     genesis::PropositionModalityV1,
     identity::ResourceUri,
+    registry::{RegistryEntryKind, RegistryEntryV1},
 };
 
 const DISCREPANCY_SCHEMA_VERSION: u32 = 1;
@@ -48,6 +49,7 @@ const COMPARATOR_LINEAGE_SCHEMA_VERSION: u32 = 1;
 const EPISODE_POLICY_SCHEMA_VERSION: u32 = 1;
 const DISCREPANCY_ENVELOPE_EVENT_KIND: &str = "discrepancy.envelope.accepted";
 const DISCREPANCY_LIFECYCLE_EVENT_KIND: &str = "discrepancy.lifecycle.accepted";
+const EPISODE_POLICY_ENTRY_SCHEMA_ID: &str = "registry.episode_policy";
 const MAX_APPLICABILITY_DIMENSIONS: usize = 64;
 const MAX_CONTINUITY_KEY_DIMENSIONS: usize = 32;
 const MAX_EVIDENCE_EVENT_IDS: usize = 256;
@@ -158,17 +160,6 @@ pub enum FindingType {
     ReleaseIntegrityConflict,
     RegressionCandidate,
     TelemetryDisagreement,
-}
-
-impl FindingType {
-    /// AUTH-03/DISC-05 separation-of-duty: a claim-conflict waiver's actor may
-    /// not be one of the conflicting claims' own authors. Other finding types
-    /// are not authored propositions in the same sense, so this contract layer
-    /// does not impose the same rule on them.
-    #[must_use]
-    pub const fn requires_waiver_separation_of_duty(self) -> bool {
-        matches!(self, Self::ClaimConflict)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -422,6 +413,62 @@ impl EpisodePolicyV2 {
             return Err(ContractError::Schema("invalid episode policy".into()));
         }
         Ok(())
+    }
+}
+
+/// One exact episode-policy registry entry whose reference and body agree.
+///
+/// Named `StructurallyResolved`, not `Verified` or `Active`, matching the
+/// identical convention in `evidence_v2.rs`'s
+/// `StructurallyResolvedConnectorSchemaV2`: any caller can construct
+/// registry-entry bytes. Runtime admission must additionally prove membership
+/// in the exact active package/head before trusting this as the effective
+/// policy. `registry_reference().entry_digest` is `RegistryEntryV1::digest()`
+/// -- the same generic, already-existing digest domain every registry entry in
+/// this crate is checked against -- so a `DiscrepancyEnvelopeV1.episode_policy`
+/// reference can be proven to name this exact policy body, not merely a
+/// same-shaped one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructurallyResolvedEpisodePolicyV2 {
+    registry_reference: RegistryReferenceV1,
+    policy: EpisodePolicyV2,
+}
+
+impl StructurallyResolvedEpisodePolicyV2 {
+    pub fn from_registry_entry(entry: &RegistryEntryV1) -> ContractResult<Self> {
+        entry.validate()?;
+        if entry.kind != RegistryEntryKind::EpisodePolicy
+            || entry.entry_schema_id.as_str() != EPISODE_POLICY_ENTRY_SCHEMA_ID
+            || entry.entry_schema_version != EPISODE_POLICY_SCHEMA_VERSION
+        {
+            return Err(ContractError::Schema(
+                "registry entry is not an episode policy v2 body".into(),
+            ));
+        }
+        let body_bytes = encode_canonical(&entry.body)?;
+        let policy: EpisodePolicyV2 = decode_strict(&body_bytes)?;
+        policy.validate_shape()?;
+        let identity_matches = policy.policy_id == entry.entry_id;
+        let version_matches = policy.version == entry.version;
+        if !identity_matches || !version_matches {
+            return Err(ContractError::ManifestMismatch);
+        }
+        Ok(Self {
+            registry_reference: RegistryReferenceV1 {
+                entry_id: entry.entry_id.clone(),
+                version: entry.version,
+                entry_digest: entry.digest()?,
+            },
+            policy,
+        })
+    }
+
+    pub const fn policy(&self) -> &EpisodePolicyV2 {
+        &self.policy
+    }
+
+    pub const fn registry_reference(&self) -> &RegistryReferenceV1 {
+        &self.registry_reference
     }
 }
 
@@ -692,6 +739,35 @@ impl DiscrepancyEnvelopeV1 {
             &encode_canonical(self)?,
         )))
     }
+
+    /// Bind this envelope's `episode_policy` reference and
+    /// `continuity_key_dimension_ids` to the exact registered
+    /// [`EpisodePolicyV2`], closing the payload-selected-authority gap left by
+    /// `validate_shape` alone: `validate_shape` only proves the declared
+    /// continuity key is a subset of `applicability` and sorted, never that it
+    /// matches what the named policy actually registers. Without this seam a
+    /// producer could cite the same `episode_policy` reference while declaring
+    /// any continuity-key subset it likes -- including the empty set -- making
+    /// episode identity producer-selected rather than policy-derived. A caller
+    /// that skips this check when accepting an envelope re-opens exactly that
+    /// gap; it is not folded into `validate_shape` because that method has no
+    /// access to the resolved policy body.
+    pub fn validate_against_episode_policy(
+        &self,
+        policy: &StructurallyResolvedEpisodePolicyV2,
+    ) -> ContractResult<()> {
+        self.validate_shape()?;
+        if self.episode_policy != *policy.registry_reference() {
+            return Err(ContractError::ManifestMismatch);
+        }
+        if self.continuity_key_dimension_ids != policy.policy().continuity_key_dimension_ids {
+            return Err(ContractError::Schema(
+                "envelope continuity-key dimensions diverge from the registered episode policy"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -876,19 +952,47 @@ impl DiscrepancyLifecycleEventV1 {
     }
 }
 
+/// True when `principal_id` is one of the envelope's implicated actors.
+///
+/// Requires `envelope.implicated_actor_ids` to already be proven sorted
+/// (`DiscrepancyEnvelopeV1::validate_shape`) before this `binary_search` can be
+/// trusted.
+fn is_self_implicated(envelope: &DiscrepancyEnvelopeV1, principal_id: &ContractId) -> bool {
+    envelope
+        .implicated_actor_ids
+        .binary_search(principal_id)
+        .is_ok()
+}
+
 /// Authorize one lifecycle event against its target envelope.
 ///
-/// The episode must match, a dismiss actor may not be self-implicated
-/// (AUTH-03), and a claim-conflict waiver actor may not be the conflicted
-/// claim author (DISC-05 separation of duty).
+/// The event's authenticated `scope`/`profile` must match the envelope's own
+/// (a lifecycle event's episode fingerprint is a public identifier, not a
+/// secret, so knowledge of it alone must never authorize a cross-tenant
+/// transition -- matching the `self.scope != other.scope` convention used by
+/// every sibling contract in this crate: relation.rs, `remember_v2.rs`,
+/// `evidence_v2.rs`, evidence.rs, control.rs, bootstrap.rs, `genesis_activation.rs`,
+/// `successor_activation.rs`, `successor_policy.rs`). The episode must also match.
+///
+/// AUTH-03 ("an agent ... cannot ... silently resolve its own discrepancy")
+/// applies to every transition that clears or suppresses active surfacing of a
+/// discrepancy an actor is implicated in: `Dismiss`, `Resolve`, and `Waive`
+/// alike. It is enforced uniformly across every [`FindingType`], not narrowed
+/// to `claim_conflict` -- the doc's wording is not scoped to claim authorship,
+/// and `implicated_actor_ids` is itself a generic field any finding type may
+/// populate. `Acknowledge` is deliberately exempt: acknowledging a discrepancy
+/// one is implicated in does not resolve or suppress it.
 pub fn authorize_lifecycle_transition(
     envelope: &DiscrepancyEnvelopeV1,
     event: &DiscrepancyLifecycleEventV1,
 ) -> ContractResult<()> {
-    // `implicated_actor_ids` must be proven sorted before `binary_search` below
-    // can be trusted.
     envelope.validate_shape()?;
     event.validate_shape()?;
+    if event.scope != envelope.scope || event.profile != envelope.profile {
+        return Err(ContractError::Schema(
+            "lifecycle event scope/profile does not match its envelope".into(),
+        ));
+    }
     if event.episode_fingerprint != envelope.episode_fingerprint {
         return Err(ContractError::Schema(
             "lifecycle event targets a different episode than its envelope".into(),
@@ -897,29 +1001,27 @@ pub fn authorize_lifecycle_transition(
     if let Some(transition) = &event.lifecycle_transition {
         match transition {
             LifecycleTransitionV1::Dismiss { actor, .. } => {
-                if envelope
-                    .implicated_actor_ids
-                    .binary_search(&actor.principal_id)
-                    .is_ok()
-                {
+                if is_self_implicated(envelope, &actor.principal_id) {
                     return Err(ContractError::Schema(
                         "AUTH-03: an implicated actor cannot dismiss their own discrepancy".into(),
                     ));
                 }
             }
-            LifecycleTransitionV1::Waive { waiver } => {
-                if envelope.finding_type.requires_waiver_separation_of_duty()
-                    && envelope
-                        .implicated_actor_ids
-                        .binary_search(&waiver.actor.principal_id)
-                        .is_ok()
-                {
+            LifecycleTransitionV1::Resolve { actor, .. } => {
+                if is_self_implicated(envelope, &actor.principal_id) {
                     return Err(ContractError::Schema(
-                        "separation of duty: waiver actor is a conflicted claim author".into(),
+                        "AUTH-03: an implicated actor cannot resolve their own discrepancy".into(),
                     ));
                 }
             }
-            LifecycleTransitionV1::Acknowledge { .. } | LifecycleTransitionV1::Resolve { .. } => {}
+            LifecycleTransitionV1::Waive { waiver } => {
+                if is_self_implicated(envelope, &waiver.actor.principal_id) {
+                    return Err(ContractError::Schema(
+                        "AUTH-03: an implicated actor cannot waive their own discrepancy".into(),
+                    ));
+                }
+            }
+            LifecycleTransitionV1::Acknowledge { .. } => {}
         }
     }
     Ok(())
@@ -1061,9 +1163,16 @@ pub fn project_discrepancy_episode(
             }) => {
                 state.lifecycle_state = LifecycleState::Resolved;
                 state.resolved_at = Some(event.effective_at.clone());
+                // DISC-03: "prior finding and resolution history remains
+                // immutable" -- a later resolution (e.g. after a reopen) must
+                // never drop evidence cited by an earlier one. Accumulate,
+                // then sort and dedup so the result is order-independent
+                // regardless of how many Resolve transitions replay applies.
                 state
                     .resolution_evidence_ids
-                    .clone_from(resolution_evidence_ids);
+                    .extend(resolution_evidence_ids.iter().copied());
+                state.resolution_evidence_ids.sort_unstable();
+                state.resolution_evidence_ids.dedup();
             }
             Some(LifecycleTransitionV1::Dismiss { .. }) => {
                 state.lifecycle_state = LifecycleState::Dismissed;
@@ -1113,7 +1222,7 @@ mod tests {
 
     use super::*;
     use crate::memory_contracts::{
-        canonical::{decode_strict, require_canonical},
+        canonical::{CanonicalValue, decode_strict, require_canonical},
         common::frozen_profile_reference_v1,
         identity::IdentityForm,
         registry::RegistryHeadV1,
@@ -1153,7 +1262,7 @@ mod tests {
     const COMPARATOR_LINEAGE_FINGERPRINT: &str =
         "11589b382071ef9df593ef7efe4df898f2ad4ed8e1775a011d4ec3912a5116d2";
     const VECTOR_SUITE_DIGEST: &str =
-        "22ad2ee2c68b237de122311187905b9a57d28c7116c9d31c07e786269b72521f";
+        "069827cc724d8376484ba9550fcc20984402635c175cb6ee67b5074d451b3cf5";
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -1274,6 +1383,46 @@ mod tests {
             rule_change_behavior: RuleChangeBehaviorV1::NewFamilyLinkedBySupersession,
             late_evidence_behavior: LateEvidenceBehaviorV1::EffectiveIntervalReplayWithSupersession,
         }
+    }
+
+    /// The registry entry that structurally resolves to [`episode_policy`],
+    /// matching the `connector_entry()` pattern in `evidence_v2.rs`'s tests: a
+    /// registry entry is test-constructed data, never a byte-frozen fixture
+    /// file, because it only proves structural closure, not active-package
+    /// membership.
+    fn episode_policy_entry() -> RegistryEntryV1 {
+        let policy = episode_policy();
+        let body_bytes = encode_canonical(&policy).unwrap();
+        let body: CanonicalValue = decode_strict(&body_bytes).unwrap();
+        RegistryEntryV1 {
+            schema_version: 1,
+            kind: RegistryEntryKind::EpisodePolicy,
+            entry_id: policy.policy_id.clone(),
+            version: policy.version,
+            entry_schema_id: ContractId::new(EPISODE_POLICY_ENTRY_SCHEMA_ID).unwrap(),
+            entry_schema_version: EPISODE_POLICY_SCHEMA_VERSION,
+            body,
+            positive_vector_digest: digest(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            negative_vector_digest: digest(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+        }
+    }
+
+    fn resolved_episode_policy() -> StructurallyResolvedEpisodePolicyV2 {
+        StructurallyResolvedEpisodePolicyV2::from_registry_entry(&episode_policy_entry()).unwrap()
+    }
+
+    /// An envelope whose `episode_policy` reference names the exact structurally
+    /// resolved policy entry (unlike the shared `envelope()` fixture, whose
+    /// `episode_policy.entry_digest` is a placeholder hex literal never meant to
+    /// be checked against a resolved policy body).
+    fn envelope_bound_to_resolved_policy() -> DiscrepancyEnvelopeV1 {
+        let mut bound = envelope();
+        bound.episode_policy = resolved_episode_policy().registry_reference().clone();
+        bound
     }
 
     fn applicability() -> Vec<ApplicabilityDimensionV1> {
@@ -1515,9 +1664,13 @@ mod tests {
             "comparator_lineage_version_bump_changes_lineage_fingerprint",
             "continuity_key_dimension_missing_from_applicability",
             "dismiss_missing_or_empty_rationale",
+            "envelope_continuity_key_diverges_from_registered_episode_policy",
             "envelope_episode_fingerprint_mismatch",
+            "envelope_episode_policy_reference_diverges_from_registry_entry_digest",
             "envelope_family_fingerprint_mismatch",
             "implicated_actor_cannot_dismiss_own_finding",
+            "implicated_actor_cannot_resolve_own_finding",
+            "lifecycle_event_scope_or_profile_diverges_from_envelope",
             "lifecycle_event_targets_wrong_episode",
             "lifecycle_event_with_no_transition_or_verification_update",
             "physical_append_fields_absent",
@@ -1889,6 +2042,64 @@ mod tests {
     }
 
     #[test]
+    fn a_later_resolution_never_drops_an_earlier_resolutions_cited_evidence() {
+        // DISC-03: "prior finding and resolution history remains immutable";
+        // "reopening ... does not clear prior resolution evidence."
+        let envelope = envelope();
+        let first_resolve = resolve_event(envelope.episode_fingerprint); // cites evidence_id('b') at 06:00
+        let second_resolve = lifecycle_event(
+            envelope.episode_fingerprint,
+            "2026-08-15T08:00:00.000000000Z",
+            Some(LifecycleTransitionV1::Resolve {
+                actor: DiscrepancyActorV1 {
+                    principal_id: ContractId::new("principal.on_call").unwrap(),
+                },
+                resolution_evidence_ids: vec![evidence_id('d')],
+            }),
+            None,
+            'd',
+        );
+        // A third re-resolve that cites one already-seen id plus a new one:
+        // proves accumulation dedups rather than blindly appending.
+        let third_resolve = lifecycle_event(
+            envelope.episode_fingerprint,
+            "2026-08-15T10:00:00.000000000Z",
+            Some(LifecycleTransitionV1::Resolve {
+                actor: DiscrepancyActorV1 {
+                    principal_id: ContractId::new("principal.on_call").unwrap(),
+                },
+                resolution_evidence_ids: vec![evidence_id('b'), evidence_id('f')],
+            }),
+            None,
+            'e',
+        );
+        let expected = vec![evidence_id('b'), evidence_id('d'), evidence_id('f')];
+
+        let forward = project_discrepancy_episode(
+            &envelope,
+            &[
+                first_resolve.clone(),
+                second_resolve.clone(),
+                third_resolve.clone(),
+            ],
+            &CanonicalTimestamp::parse("2026-08-15T11:00:00.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(forward.lifecycle_state, LifecycleState::Resolved);
+        assert_eq!(forward.resolution_evidence_ids, expected);
+
+        // Order-independent: replaying in a different input order yields the
+        // identical accumulated, sorted, deduplicated set (REPLAY-01).
+        let reordered = project_discrepancy_episode(
+            &envelope,
+            &[third_resolve, first_resolve, second_resolve],
+            &CanonicalTimestamp::parse("2026-08-15T11:00:00.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reordered.resolution_evidence_ids, expected);
+    }
+
+    #[test]
     fn rule_change_creates_a_new_family_linked_by_supersession() {
         let original = envelope();
         let mut new_comparator = comparator_lineage();
@@ -1944,7 +2155,8 @@ mod tests {
     }
 
     #[test]
-    fn deployment_during_active_breach_does_not_split_it() {
+    fn an_unrelated_concurrent_finding_shares_no_family_or_episode_identity_with_an_active_breach()
+    {
         let breach = envelope();
         // A concurrent, unrelated finding shares no family/episode identity with
         // the active breach: it cannot split it merely by effective-time overlap.
@@ -1981,6 +2193,96 @@ mod tests {
         unrelated.validate_shape().unwrap();
         assert_ne!(breach.family_fingerprint, unrelated.family_fingerprint);
         assert_ne!(breach.episode_fingerprint, unrelated.episode_fingerprint);
+    }
+
+    #[test]
+    fn deployment_during_active_breach_does_not_split_it() {
+        // slo_breach's registered applicability set carries no revision/commit
+        // dimension -- only `runtime_environment` -- so a redeploy (which
+        // changes the deployed commit, never the runtime environment) cannot
+        // appear anywhere in the family/episode preimage: there is no field for
+        // it to change. Two independently constructed preimages for the same
+        // ongoing breach, one representing pre-deploy and one post-deploy, are
+        // identical.
+        let slo_breach_predicate = reference(
+            "predicate.latency_slo_v1",
+            "9a12f99ff35969845f08f9b64cee7d86fa42dc6165ebc617d950be8960b86333",
+        );
+        let slo_breach_expectation = reference(
+            "policy.latency_slo_v1",
+            "9a12f99ff35969845f08f9b64cee7d86fa42dc6165ebc617d950be8960b86444",
+        );
+        let pre_deploy = DiscrepancyFamilyPreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            finding_type: FindingType::RuntimeNonconformance {
+                subtype: RuntimeNonconformanceSubtypeV1::SloBreach,
+            },
+            canonical_subject: resource(IdentityForm::Entity, "service", '2'),
+            predicate: slo_breach_predicate.clone(),
+            comparator_lineage_fingerprint: comparator_lineage().fingerprint().unwrap(),
+            expectation_policy: slo_breach_expectation.clone(),
+            required_applicability_dimension_ids: vec![
+                ContractId::new("runtime_environment").unwrap(),
+            ],
+            applicability: vec![applicability()[1].clone()],
+            episode_policy_version: episode_policy().version,
+        }
+        .fingerprint()
+        .unwrap();
+        let post_deploy = DiscrepancyFamilyPreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            finding_type: FindingType::RuntimeNonconformance {
+                subtype: RuntimeNonconformanceSubtypeV1::SloBreach,
+            },
+            canonical_subject: resource(IdentityForm::Entity, "service", '2'),
+            predicate: slo_breach_predicate,
+            comparator_lineage_fingerprint: comparator_lineage().fingerprint().unwrap(),
+            expectation_policy: slo_breach_expectation,
+            required_applicability_dimension_ids: vec![
+                ContractId::new("runtime_environment").unwrap(),
+            ],
+            applicability: vec![applicability()[1].clone()],
+            episode_policy_version: episode_policy().version,
+        }
+        .fingerprint()
+        .unwrap();
+        assert_eq!(pre_deploy, post_deploy);
+
+        // Contrast: `claim_conflict`'s applicability legitimately DOES bind
+        // `repository_commit`, so changing only that dimension does mint a new
+        // family -- proving the invariance above is a real consequence of
+        // slo_breach's applicability set, not the fingerprint ignoring
+        // applicability altogether.
+        let original = envelope();
+        let mut revision_bound_applicability = applicability();
+        revision_bound_applicability[0] = ApplicabilityDimensionV1 {
+            dimension_id: ContractId::new("repository_commit").unwrap(),
+            value: ApplicabilityDimensionValueV1::Concrete {
+                resource: resource(IdentityForm::Version, "commit", '9'),
+            },
+        };
+        let redeployed_family_fingerprint = DiscrepancyFamilyPreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: original.profile.clone(),
+            scope: original.scope.clone(),
+            finding_type: original.finding_type,
+            canonical_subject: original.canonical_subject.clone(),
+            predicate: original.predicate.clone(),
+            comparator_lineage_fingerprint: original.comparator_lineage_fingerprint,
+            expectation_policy: original.expectation_policy.clone(),
+            required_applicability_dimension_ids: original
+                .required_applicability_dimension_ids
+                .clone(),
+            applicability: revision_bound_applicability,
+            episode_policy_version: original.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        assert_ne!(original.family_fingerprint, redeployed_family_fingerprint);
     }
 
     #[test]
@@ -2151,6 +2453,25 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_event_scope_must_match_the_envelope_scope() {
+        let envelope = envelope();
+        let mut foreign_tenant = acknowledge_event(envelope.episode_fingerprint);
+        foreign_tenant.scope = AuthenticatedProjectScopeV1::from_trusted_context(
+            ContractId::new("tenant.attacker").unwrap(),
+            ContractId::new("project.attacker").unwrap(),
+        );
+        // The episode fingerprint is a public identifier, not a secret:
+        // knowing it must not be sufficient to authorize a cross-tenant
+        // transition merely because the fingerprint field matches.
+        assert!(authorize_lifecycle_transition(&envelope, &foreign_tenant).is_err());
+
+        let mut foreign_profile = acknowledge_event(envelope.episode_fingerprint);
+        foreign_profile.profile.profile_digest =
+            digest("9999999999999999999999999999999999999999999999999999999999999999");
+        assert!(authorize_lifecycle_transition(&envelope, &foreign_profile).is_err());
+    }
+
+    #[test]
     fn auth_03_rejects_self_implicated_dismiss() {
         let envelope = envelope();
         let self_implicated = dismiss_event(envelope.episode_fingerprint, "principal.author_a");
@@ -2161,9 +2482,29 @@ mod tests {
     }
 
     #[test]
-    fn separation_of_duty_rejects_a_claim_conflict_waiver_from_a_conflicted_author() {
+    fn auth_03_rejects_self_implicated_resolve() {
         let envelope = envelope();
-        assert!(envelope.finding_type.requires_waiver_separation_of_duty());
+        let self_implicated = lifecycle_event(
+            envelope.episode_fingerprint,
+            "2026-08-15T06:00:00.000000000Z",
+            Some(LifecycleTransitionV1::Resolve {
+                actor: DiscrepancyActorV1 {
+                    principal_id: ContractId::new("principal.author_a").unwrap(),
+                },
+                resolution_evidence_ids: vec![evidence_id('b')],
+            }),
+            None,
+            'b',
+        );
+        assert!(authorize_lifecycle_transition(&envelope, &self_implicated).is_err());
+
+        let independent = resolve_event(envelope.episode_fingerprint);
+        authorize_lifecycle_transition(&envelope, &independent).unwrap();
+    }
+
+    #[test]
+    fn auth_03_rejects_self_implicated_waiver_regardless_of_finding_type() {
+        let envelope = envelope();
         let conflicted_waiver = waive_event(
             envelope.episode_fingerprint,
             "principal.author_a",
@@ -2178,13 +2519,47 @@ mod tests {
         );
         authorize_lifecycle_transition(&envelope, &independent_waiver).unwrap();
 
-        // The same rule does not apply outside claim_conflict findings.
+        // AUTH-03's "silently resolve its own discrepancy" is not scoped to
+        // claim-authorship: a self-implicated waiver on a non-claim_conflict
+        // finding type is rejected too, because `implicated_actor_ids` is a
+        // generic field any finding type may populate.
         let mut non_conflict = envelope;
-        non_conflict.finding_type = FindingType::DocumentationDrift;
+        non_conflict.finding_type = FindingType::SpecNonconformance;
+        non_conflict.family_fingerprint = DiscrepancyFamilyPreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: non_conflict.profile.clone(),
+            scope: non_conflict.scope.clone(),
+            finding_type: non_conflict.finding_type,
+            canonical_subject: non_conflict.canonical_subject.clone(),
+            predicate: non_conflict.predicate.clone(),
+            comparator_lineage_fingerprint: non_conflict.comparator_lineage_fingerprint,
+            expectation_policy: non_conflict.expectation_policy.clone(),
+            required_applicability_dimension_ids: non_conflict
+                .required_applicability_dimension_ids
+                .clone(),
+            applicability: non_conflict.applicability.clone(),
+            episode_policy_version: non_conflict.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        non_conflict.episode_fingerprint = DiscrepancyEpisodePreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            family_fingerprint: non_conflict.family_fingerprint,
+            continuity_key: vec![applicability()[1].clone()],
+            opening_transition_source_fact_id: non_conflict.opening_transition.source_fact_id,
+            episode_policy_version: non_conflict.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        non_conflict.validate_shape().unwrap();
+        let spec_nonconformance_self_waiver = waive_event(
+            non_conflict.episode_fingerprint,
+            "principal.author_a",
+            "2026-09-01T00:00:00.000000000Z",
+        );
         assert!(
-            !non_conflict
-                .finding_type
-                .requires_waiver_separation_of_duty()
+            authorize_lifecycle_transition(&non_conflict, &spec_nonconformance_self_waiver)
+                .is_err()
         );
     }
 
@@ -2253,6 +2628,75 @@ mod tests {
             digest("6666666666666666666666666666666666666666666666666666666666666666"),
         );
         assert!(tampered_episode.validate_shape().is_err());
+    }
+
+    #[test]
+    fn envelope_validates_against_its_exact_registered_episode_policy() {
+        let bound = envelope_bound_to_resolved_policy();
+        bound
+            .validate_against_episode_policy(&resolved_episode_policy())
+            .unwrap();
+    }
+
+    #[test]
+    fn envelope_continuity_key_divergent_from_registered_policy_is_rejected() {
+        // `validate_shape` alone accepts a continuity key that is any sorted
+        // subset of `applicability`, regardless of what the named
+        // `episode_policy` actually registers -- that is exactly the gap this
+        // seam closes. The registered policy's continuity key is
+        // `[runtime_environment]`.
+        let mut divergent = envelope_bound_to_resolved_policy();
+        divergent.continuity_key_dimension_ids =
+            vec![ContractId::new("repository_commit").unwrap()];
+        divergent.episode_fingerprint = DiscrepancyEpisodePreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            family_fingerprint: divergent.family_fingerprint,
+            continuity_key: vec![applicability()[0].clone()],
+            opening_transition_source_fact_id: divergent.opening_transition.source_fact_id,
+            episode_policy_version: divergent.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        divergent.validate_shape().unwrap();
+        assert!(
+            divergent
+                .validate_against_episode_policy(&resolved_episode_policy())
+                .is_err()
+        );
+
+        // The empty continuity key is likewise structurally valid on its own
+        // (vacuously a sorted subset of applicability) but still diverges from
+        // the registered non-empty continuity key.
+        let mut empty_key = envelope_bound_to_resolved_policy();
+        empty_key.continuity_key_dimension_ids = vec![];
+        empty_key.episode_fingerprint = DiscrepancyEpisodePreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            family_fingerprint: empty_key.family_fingerprint,
+            continuity_key: vec![],
+            opening_transition_source_fact_id: empty_key.opening_transition.source_fact_id,
+            episode_policy_version: empty_key.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        empty_key.validate_shape().unwrap();
+        assert!(
+            empty_key
+                .validate_against_episode_policy(&resolved_episode_policy())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn envelope_episode_policy_reference_divergent_from_registry_entry_digest_is_rejected() {
+        let mut wrong_digest = envelope_bound_to_resolved_policy();
+        wrong_digest.episode_policy.entry_digest =
+            digest("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+        wrong_digest.validate_shape().unwrap();
+        assert!(
+            wrong_digest
+                .validate_against_episode_policy(&resolved_episode_policy())
+                .is_err()
+        );
     }
 
     #[test]
