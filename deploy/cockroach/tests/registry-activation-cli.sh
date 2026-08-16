@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # This is the authoritative connected correctness proof. It uses the exact
-# official CockroachDB binary, runs all three live repository suites plus the
-# conflict-contract matrix, and exercises both currently wired private CLI
-# state machines on one secure local server.
+# official CockroachDB binary, discovers and runs every named opt-in live test,
+# and exercises both currently wired private CLI state machines on one secure
+# local server. The one server and its result are never Docker parity evidence.
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../../.." && pwd)
 expected_crdb_build_tag=v26.2.3
@@ -84,6 +84,13 @@ fail() {
     exit 1
 }
 
+require_discovered_test() {
+    local listing=$1
+    local exact_test=$2
+    grep -Fxq "$exact_test: test" <<<"$listing" \
+        || fail "$exact_test was not discovered"
+}
+
 root_scalar() {
     "$crdb" sql --url="$root_url" --format=tsv --execute="$1" | tail -n +2
 }
@@ -139,90 +146,139 @@ root_url=$(printf '%s\n' "$root_default_url" | sed 's#/defaultdb?#/fleet_recall?
     --execute='CREATE DATABASE fleet_recall' >/dev/null
 
 # Apply the exact embedded migration chain under root certificate authority,
-# then run all three connected repository matrices. Together they cover
-# bootstrap durability plus genesis and successor activation races, replays,
-# timing, scope isolation, corruption, and bounded query plans.
+# then run every connected proof by its discovered exact harness name. Setting
+# the URL on every invocation makes an environment-skipped zero-test run
+# impossible to report as connected success.
+control_live_test=live_stage2_genesis_repository_when_configured
+control_live_listing=$(cargo test --locked --test control_log_live -- --list)
+require_discovered_test "$control_live_listing" "$control_live_test"
 FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
-    cargo test --locked --test control_log_live -- --nocapture
+    cargo test --locked --test control_log_live "$control_live_test" \
+        -- --exact --nocapture
+
+genesis_live_test=live_genesis_registry_activation_when_configured
+genesis_live_listing=$(cargo test --locked --test registry_activation_live -- --list)
+require_discovered_test "$genesis_live_listing" "$genesis_live_test"
 FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
-    cargo test --locked --test registry_activation_live -- --nocapture
+    cargo test --locked --test registry_activation_live "$genesis_live_test" \
+        -- --exact --nocapture
+
 successor_live_test=live_first_successor_activation_when_configured
 successor_live_listing=$(cargo test --locked --test successor_activation_live -- --list)
-grep -Fxq "$successor_live_test: test" <<<"$successor_live_listing" \
-    || fail "successor live proof test was not discovered"
+require_discovered_test "$successor_live_listing" "$successor_live_test"
 FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
-    cargo test --locked --test successor_activation_live \
-        "$successor_live_test" -- --exact --nocapture
+    cargo test --locked --test successor_activation_live "$successor_live_test" \
+        -- --exact --nocapture
+
+current_retry_live_test=ledger::cockroach::tests::live_current_projection_whole_unit_retry_when_configured
+current_snapshot_live_test=ledger::cockroach::tests::live_current_projection_snapshot_race_when_configured
 conflict_live_test=ledger::cockroach::tests::live_conflict_polarity_matrix_when_configured
-conflict_live_listing=$(cargo test --locked --lib -- --list)
-grep -Fxq "$conflict_live_test: test" <<<"$conflict_live_listing" \
-    || fail "conflict polarity live proof test was not discovered"
-FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
-    cargo test --locked --lib "$conflict_live_test" -- --exact --nocapture
-FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
-    cargo test --locked --lib \
-        store::cockroach::tests::live_transactional_migration_rolls_back_ddl_on_history_conflict_when_configured \
+reconciliation_live_test=ledger::reconciliation::tests::live_reconciliation_is_inert_without_its_exact_database_url
+online_index_live_test=store::cockroach::tests::live_online_index_migrations_recover_and_reject_drift_when_configured
+rollback_live_test=store::cockroach::tests::live_transactional_migration_rolls_back_ddl_on_history_conflict_when_configured
+library_live_listing=$(cargo test --locked --lib -- --list)
+for exact_test in \
+    "$current_retry_live_test" \
+    "$current_snapshot_live_test" \
+    "$conflict_live_test" \
+    "$reconciliation_live_test" \
+    "$online_index_live_test" \
+    "$rollback_live_test"
+do
+    require_discovered_test "$library_live_listing" "$exact_test"
+done
+
+for exact_test in \
+    "$current_retry_live_test" \
+    "$current_snapshot_live_test" \
+    "$conflict_live_test" \
+    "$online_index_live_test" \
+    "$rollback_live_test"
+do
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --lib "$exact_test" -- --exact --nocapture
+done
+FLEET_RECONCILIATION_TEST_DATABASE_URL="$root_url" \
+    cargo test --locked --lib "$reconciliation_live_test" \
         -- --exact --nocapture
 
 # Freeze the authoritative schema independently of the two Stage-2/Stage-3
 # command preflights. The database must have exactly the successful embedded
-# migration chain through 14 and all three successor authority tables.
-assert_root_scalar "exact successful migration prefix 1 through 14" '
-    SELECT CASE WHEN count(*) = 14
+# migration chain through 17 and all three successor authority tables.
+assert_root_scalar "exact successful migration prefix 1 through 17" '
+    SELECT CASE WHEN count(*) = 17
                           AND min(version) = 1
-                          AND max(version) = 14
+                          AND max(version) = 17
                           AND COALESCE(bool_and(success), false)
                      THEN '\''ready'\'' ELSE '\''not_ready'\'' END
     FROM _sqlx_migrations' 'ready'
-assert_root_scalar "successor authority table set" '
+assert_root_scalar "exact current successor authority table set" '
     SELECT string_agg(table_name, '\''|'\'' ORDER BY table_name)
     FROM information_schema.tables
     WHERE table_schema = '\''public'\''
+      AND table_type = '\''BASE TABLE'\''
       AND table_name IN (
           '\''memory_registry_transitions'\'',
           '\''memory_registry_genesis_bridge_consumptions'\'',
           '\''memory_registry_current_heads_v2'\''
       )' 'memory_registry_current_heads_v2|memory_registry_genesis_bridge_consumptions|memory_registry_transitions'
-assert_root_scalar "exact successor root index set" '
-    SELECT string_agg(tablename || '\'':'\'' || indexname, '\''|'\'' ORDER BY tablename)
+assert_root_scalar "exact current release index set" '
+    SELECT string_agg(
+        tablename || '\'':'\'' || indexname,
+        '\''|'\'' ORDER BY tablename, indexname
+    )
     FROM pg_catalog.pg_indexes
     WHERE schemaname = '\''public'\''
       AND indexname IN (
+          '\''memory_claim_events_transition_provenance_idx'\'',
+          '\''memory_conflicts_scope_detector_state_recency_idx'\'',
+          '\''memory_conflicts_scope_key_detector_unique_idx'\'',
           '\''memory_registry_heads_genesis_root_idx'\'',
           '\''memory_registry_activations_genesis_root_idx'\''
-      )' 'memory_registry_activations:memory_registry_activations_genesis_root_idx|memory_registry_heads:memory_registry_heads_genesis_root_idx'
+      )' 'memory_claim_events:memory_claim_events_transition_provenance_idx|memory_conflicts:memory_conflicts_scope_detector_state_recency_idx|memory_conflicts:memory_conflicts_scope_key_detector_unique_idx|memory_registry_activations:memory_registry_activations_genesis_root_idx|memory_registry_heads:memory_registry_heads_genesis_root_idx'
+assert_root_scalar "retired conflict uniqueness index is absent" '
+    SELECT count(*)::STRING
+    FROM pg_catalog.pg_indexes
+    WHERE schemaname = '\''public'\''
+      AND tablename = '\''memory_conflicts'\''
+      AND indexname = '\''memory_conflicts_tenant_id_project_claim_key_key'\''' '0'
 
-# Migrations 10 and 11 are the intentionally resumable online-index phase.
-# Replaying their exact bytes must accept the existing exact indexes without
-# changing SQLx history or silently accepting a same-name/different-shape index.
-"$crdb" sql --url="$root_url" \
-    < "$repo_root/migrations/0010_registry_genesis_head_root_index.sql" >/dev/null
-"$crdb" sql --url="$root_url" \
-    < "$repo_root/migrations/0011_registry_genesis_activation_root_index.sql" >/dev/null
+# Migrations 10, 11, and 15 through 17 are intentionally resumable online
+# index transitions. Replaying their exact bytes must accept the existing exact
+# indexes without changing SQLx history or silently accepting catalog drift.
+for migration_path in \
+    "$repo_root/migrations/0010_registry_genesis_head_root_index.sql" \
+    "$repo_root/migrations/0011_registry_genesis_activation_root_index.sql" \
+    "$repo_root/migrations/0015_conflict_detector_uniqueness.sql" \
+    "$repo_root/migrations/0016_claim_transition_provenance_index.sql" \
+    "$repo_root/migrations/0017_conflict_detector_projection_index.sql"
+do
+    "$crdb" sql --url="$root_url" < "$migration_path" >/dev/null
+done
 assert_root_scalar "migration history after exact index replay" \
-    'SELECT count(*)::STRING FROM _sqlx_migrations' '14'
+    'SELECT count(*)::STRING FROM _sqlx_migrations' '17'
 
-# Demonstrate why MAX(successful version) is not a readiness check: version 14
+# Demonstrate why MAX(successful version) is not a readiness check: version 17
 # remains successful while a failed version 12 makes the complete-prefix gate
-# false. Restore the row before exercising either v9-compatible private CLI.
+# false. Restore the row before exercising the v3/v9-compatible private CLIs.
 "$crdb" sql --url="$root_url" \
     --execute='UPDATE _sqlx_migrations SET success = false WHERE version = 12' >/dev/null
 assert_root_scalar "later success remains visible during failed migration 12" \
-    'SELECT max(version)::STRING FROM _sqlx_migrations WHERE success' '14'
-assert_root_scalar "failed migration 12 is not masked by version 14" '
-    SELECT CASE WHEN count(*) = 14
+    'SELECT max(version)::STRING FROM _sqlx_migrations WHERE success' '17'
+assert_root_scalar "failed migration 12 is not masked by version 17" '
+    SELECT CASE WHEN count(*) = 17
                           AND min(version) = 1
-                          AND max(version) = 14
+                          AND max(version) = 17
                           AND COALESCE(bool_and(success), false)
                      THEN '\''ready'\'' ELSE '\''not_ready'\'' END
     FROM _sqlx_migrations' 'not_ready'
 "$crdb" sql --url="$root_url" \
     --execute='UPDATE _sqlx_migrations SET success = true WHERE version = 12' >/dev/null
-assert_root_scalar "restored successful migration prefix 1 through 14" '
-    SELECT CASE WHEN count(*) = 14 AND COALESCE(bool_and(success), false)
+assert_root_scalar "restored successful migration prefix 1 through 17" '
+    SELECT CASE WHEN count(*) = 17 AND COALESCE(bool_and(success), false)
                      THEN '\''ready'\'' ELSE '\''not_ready'\'' END
     FROM _sqlx_migrations
-    WHERE version BETWEEN 1 AND 14' 'ready'
+    WHERE version BETWEEN 1 AND 17' 'ready'
 
 "$crdb" sql --url="$root_url" \
     < "$repo_root/deploy/cockroach/control-role-grants.sql" >/dev/null
