@@ -576,6 +576,21 @@ impl ExemplarPolicyV1 {
                 "invalid exemplar policy version".into(),
             ));
         }
+        // The only selector this module implements never runs under a
+        // biased-extrema label (`select_exemplars_deterministic_stratified_hash_v1`
+        // refuses at call time). Rejecting the combination here too means a
+        // reader can trust a decoded `biased_extrema: true` policy actually
+        // came from a selector family that supports it -- written as an
+        // exhaustive match so a future biased selector variant forces this
+        // decision to be revisited rather than silently staying permissive.
+        match self.selector {
+            ExemplarSelectorV1::DeterministicStratifiedHashV1 if self.biased_extrema => {
+                return Err(ContractError::Schema(
+                    "deterministic_stratified_hash_v1 cannot be labelled biased_extrema".into(),
+                ));
+            }
+            ExemplarSelectorV1::DeterministicStratifiedHashV1 => {}
+        }
         match (self.visibility, &self.public_activation) {
             (ExemplarVisibilityV1::Private, Some(_)) => Err(ContractError::Schema(
                 "a private exemplar policy cannot carry a public activation".into(),
@@ -777,10 +792,19 @@ pub struct StratumSelectionV1 {
 /// Immutable erasure record for one previously selected exemplar (EVID-08,
 /// EVID-09). The receipt's counts are unchanged by erasure; only the exemplar
 /// payload is removed and replaced by this tombstone.
+///
+/// `selection_index` is the erased record's stable 0-based position in the
+/// original round-robin selection order (out of `selected_count` slots),
+/// not a derivative of `erased_exemplar_digest`. Erasure is total even when
+/// two selected exemplars are byte-identical in content: each occupies a
+/// distinct `selection_index`, so tombstoning one never blocks tombstoning
+/// the other, and canonical order and cap/consistency checks key off this
+/// index rather than off content-digest set membership.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErasedExemplarTombstoneV1 {
     pub schema_version: u32,
+    pub selection_index: u32,
     pub erased_exemplar_digest: Sha256Digest,
     pub erased_at: CanonicalTimestamp,
     pub erasure_policy: RegistryReferenceV1,
@@ -916,13 +940,27 @@ impl ExemplarSelectionReceiptV1 {
     /// [`Self::validate_counts_and_strata`] for why.
     fn validate_caps_and_tombstones(&self) -> ContractResult<()> {
         let caps = self.policy.effective_caps();
-        if self.exemplars.len() > caps.max_count {
+        // `selected_count` is the true count the policy cap bounds: present
+        // plus tombstoned. Checking only `self.exemplars.len()` (as a prior
+        // version of this function did) let a payload fabricate tombstones
+        // to carry `selected_count` arbitrarily far past the cap while
+        // keeping the *present* exemplar count under it -- a genuine
+        // selection can never produce `selected_count > cap` (selection
+        // stops at the cap and erasure never raises `selected_count`), so
+        // nothing legitimate is rejected by enforcing it here too.
+        let max_count = u32::try_from(caps.max_count)
+            .map_err(|_| ContractError::Schema("policy cap exceeds u32".into()))?;
+        if self.selected_count > max_count {
             return Err(ContractError::Schema(
                 "selected exemplar count exceeds the policy cap".into(),
             ));
         }
+        if self.exemplars.len() > caps.max_count {
+            return Err(ContractError::Schema(
+                "present exemplar count exceeds the policy cap".into(),
+            ));
+        }
         let mut total_bytes: usize = 0;
-        let mut present_digests = BTreeSet::new();
         for exemplar in &self.exemplars {
             let wire_len = exemplar.wire_len()?;
             if wire_len > caps.max_bytes_each {
@@ -933,7 +971,6 @@ impl ExemplarSelectionReceiptV1 {
             total_bytes = total_bytes.checked_add(wire_len).ok_or_else(|| {
                 ContractError::Schema("exemplar total byte count overflows".into())
             })?;
-            present_digests.insert(exemplar.exemplar_digest()?);
         }
         if total_bytes > caps.max_total_bytes {
             return Err(ContractError::Schema(
@@ -946,10 +983,36 @@ impl ExemplarSelectionReceiptV1 {
                 "exemplar tombstones are not in canonical order".into(),
             ));
         }
+        // Every tombstone must itself be a shape this module could have
+        // produced: a current schema version, and an
+        // `erasure_policy` that passes the same `RegistryReferenceV1`
+        // validation every other registry reference on this module's types
+        // is subject to (an unknown schema version or a zero-version policy
+        // reference must fail closed, not decode successfully as evidence).
+        //
+        // `selection_index` values must be distinct and each address one of
+        // the `selected_count` original selection slots. This -- not
+        // content-digest set membership against `self.exemplars` -- is what
+        // proves the tombstones are a coherent subset of the original
+        // selection: two selected exemplars with byte-identical content
+        // occupy different `selection_index` values, so tombstoning one
+        // never collides with the other still being present.
+        let mut tombstoned_indices: BTreeSet<u32> = BTreeSet::new();
         for tombstone in &self.tombstones {
-            if present_digests.contains(&tombstone.erased_exemplar_digest) {
+            if tombstone.schema_version != TELEMETRY_SCHEMA_VERSION {
                 return Err(ContractError::Schema(
-                    "a tombstone names an exemplar that is still present".into(),
+                    "invalid exemplar tombstone schema version".into(),
+                ));
+            }
+            tombstone.erasure_policy.validate()?;
+            if tombstone.selection_index >= self.selected_count {
+                return Err(ContractError::Schema(
+                    "tombstone selection index is out of range".into(),
+                ));
+            }
+            if !tombstoned_indices.insert(tombstone.selection_index) {
+                return Err(ContractError::Schema(
+                    "duplicate tombstone selection index".into(),
                 ));
             }
         }
@@ -982,6 +1045,14 @@ impl ExemplarSelectionReceiptV1 {
     /// Replace one currently present exemplar with an immutable tombstone.
     /// The selected count, strata, and every other receipt field are
     /// unchanged; only that one exemplar's payload is gone (EVID-08, EVID-09).
+    ///
+    /// `index` addresses `self.exemplars` (the current, already-shrunk
+    /// list), exactly as before. Erasure is total even for content-identical
+    /// exemplars: the new tombstone's `selection_index` names this record's
+    /// stable position in the *original* selection order, computed by
+    /// [`Self::selection_index_for_present_exemplar`], so erasing one of
+    /// several duplicate-content exemplars never collides with the others
+    /// still being present.
     pub fn erase_exemplar_at(
         &self,
         index: usize,
@@ -993,8 +1064,10 @@ impl ExemplarSelectionReceiptV1 {
             .exemplars
             .get(index)
             .ok_or_else(|| ContractError::Schema("erasure index out of range".into()))?;
+        let selection_index = self.selection_index_for_present_exemplar(index)?;
         let tombstone = ErasedExemplarTombstoneV1 {
             schema_version: TELEMETRY_SCHEMA_VERSION,
+            selection_index,
             erased_exemplar_digest: exemplar.exemplar_digest()?,
             erased_at,
             erasure_policy,
@@ -1002,12 +1075,33 @@ impl ExemplarSelectionReceiptV1 {
         let mut next = self.clone();
         next.exemplars.remove(index);
         next.tombstones.push(tombstone);
-        next.tombstones.sort_by(|left, right| {
-            left.erased_exemplar_digest
-                .cmp(&right.erased_exemplar_digest)
-        });
+        next.tombstones
+            .sort_by(|left, right| left.selection_index.cmp(&right.selection_index));
         next.validate_shape()?;
         Ok(next)
+    }
+
+    /// Map a position in the current `self.exemplars` list back to its
+    /// stable 0-based position in the original round-robin selection order
+    /// (out of `self.selected_count` slots). `self.exemplars` always keeps
+    /// the relative order the selector produced (erasure only ever removes
+    /// entries, never reorders survivors), so the mapping is: walk every
+    /// original slot in order, skip the slots already named by an existing
+    /// tombstone, and the `local_index`-th slot that is not skipped is the
+    /// original position of `self.exemplars[local_index]`.
+    fn selection_index_for_present_exemplar(&self, local_index: usize) -> ContractResult<u32> {
+        let tombstoned: BTreeSet<u32> = self.tombstones.iter().map(|t| t.selection_index).collect();
+        let mut remaining = local_index;
+        for original in 0..self.selected_count {
+            if tombstoned.contains(&original) {
+                continue;
+            }
+            if remaining == 0 {
+                return Ok(original);
+            }
+            remaining -= 1;
+        }
+        Err(ContractError::Schema("erasure index out of range".into()))
     }
 }
 
@@ -1017,10 +1111,13 @@ impl PartialOrd for ErasedExemplarTombstoneV1 {
     }
 }
 
+/// Canonical order is by `selection_index`, not by content digest: two
+/// content-identical erased exemplars must still sort deterministically
+/// against each other, and `selection_index` (unlike the digest) is unique
+/// per tombstone by construction.
 impl Ord for ErasedExemplarTombstoneV1 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.erased_exemplar_digest
-            .cmp(&other.erased_exemplar_digest)
+        self.selection_index.cmp(&other.selection_index)
     }
 }
 
@@ -1273,7 +1370,9 @@ mod tests {
     const EXPECTED_EXEMPLAR_RAW_SHA256: &str =
         "0e7a6b613281957e7b2be5f46e759368f376d39f88b3d6f35a89b3c2bc8aa406";
     const EXPECTED_SELECTION_ERASED_RAW_SHA256: &str =
-        "62c144057c0aaade20296ca6837587e25e5e848875b45dece281a28105027d5d";
+        "52268bfdcbb1f2e77f69239ceb3198006aa70efe486dc86540dcc26ffd9227c7";
+    const EXPECTED_SELECTION_CAP_TRUNCATED_RAW_SHA256: &str =
+        "514d02715f0e688d12dcb48de8188248fa070e0a0152fd0aa152df21a66532bc";
     const EXPECTED_NEGATIVE_FLOAT_RAW_SHA256: &str =
         "deb7bbba3996c8a8e2169a895ce948ffd4e8af742847d24df88b74e1bee4e66f";
     const EXPECTED_NEGATIVE_CAP_EXCEEDED_RAW_SHA256: &str =
@@ -1282,8 +1381,14 @@ mod tests {
         "9377fe56379612bc143d917d407a832e21b4d9c9563fad49d986aae856b2bdc0";
     const EXPECTED_NEGATIVE_RAW_LOG_LINE_RAW_SHA256: &str =
         "0253f931594d74fb17a6285e42fb8ae92caad2f09c6b18a10867f40dd135e22f";
+    const EXPECTED_NEGATIVE_SELECTED_COUNT_EXCEEDS_CAP_RAW_SHA256: &str =
+        "234ae09541413f2c7cc8da81bd4d17d32f55ce4b5e49e77e7f786f4f6d71a2da";
+    const EXPECTED_NEGATIVE_TOMBSTONE_INVALID_SCHEMA_VERSION_RAW_SHA256: &str =
+        "804adcdaff390a07da0e50bdd2ded6a4540abea9830bcc281c9207d081a30577";
+    const EXPECTED_NEGATIVE_TOMBSTONE_INVALID_ERASURE_POLICY_RAW_SHA256: &str =
+        "59b0465eff2baf9d4caf0a221d79a103c4dc31047c22cbaba94f703d3ea8ee8d";
     const EXPECTED_VECTOR_SUITE_RAW_SHA256: &str =
-        "5eb25388cc66eafee76997d8d9cf4eb6f19f13dc113dfe28661f22eb839e9d82";
+        "c2c0769b67994f77ebedb2f5c6eaf80e31891cc181f30fb1ab9a71f6b966e897";
 
     // Semantic identities, recomputed from the decoded fixtures below and
     // asserted against these hard-coded constants -- not merely
@@ -1357,6 +1462,9 @@ mod tests {
         let selection_erased_framed = include_bytes!(
             "../../contracts/dynamic-memory/v3/telemetry/exemplar-selection-receipt-v1-erased.jsonl"
         );
+        let selection_cap_truncated_framed = include_bytes!(
+            "../../contracts/dynamic-memory/v3/telemetry/exemplar-selection-receipt-v1-cap-truncated.jsonl"
+        );
         let negative_float_framed = include_bytes!(
             "../../contracts/dynamic-memory/v3/telemetry/negative-float-result.jsonl"
         );
@@ -1371,6 +1479,15 @@ mod tests {
         );
         let negative_compliant_partial_coverage_framed = include_bytes!(
             "../../contracts/dynamic-memory/v3/telemetry/negative-compliant-partial-coverage.jsonl"
+        );
+        let negative_selected_count_exceeds_cap_framed = include_bytes!(
+            "../../contracts/dynamic-memory/v3/telemetry/negative-selected-count-exceeds-cap.jsonl"
+        );
+        let negative_tombstone_invalid_schema_version_framed = include_bytes!(
+            "../../contracts/dynamic-memory/v3/telemetry/negative-tombstone-invalid-schema-version.jsonl"
+        );
+        let negative_tombstone_invalid_erasure_policy_framed = include_bytes!(
+            "../../contracts/dynamic-memory/v3/telemetry/negative-tombstone-invalid-erasure-policy.jsonl"
         );
         let vector_suite_framed =
             include_bytes!("../../contracts/dynamic-memory/v3/telemetry/vector-suite.jsonl");
@@ -1406,6 +1523,10 @@ mod tests {
                 EXPECTED_SELECTION_ERASED_RAW_SHA256,
             ),
             (
+                selection_cap_truncated_framed.as_slice(),
+                EXPECTED_SELECTION_CAP_TRUNCATED_RAW_SHA256,
+            ),
+            (
                 negative_float_framed.as_slice(),
                 EXPECTED_NEGATIVE_FLOAT_RAW_SHA256,
             ),
@@ -1424,6 +1545,18 @@ mod tests {
             (
                 negative_compliant_partial_coverage_framed.as_slice(),
                 EXPECTED_NEGATIVE_COMPLIANT_PARTIAL_COVERAGE_RAW_SHA256,
+            ),
+            (
+                negative_selected_count_exceeds_cap_framed.as_slice(),
+                EXPECTED_NEGATIVE_SELECTED_COUNT_EXCEEDS_CAP_RAW_SHA256,
+            ),
+            (
+                negative_tombstone_invalid_schema_version_framed.as_slice(),
+                EXPECTED_NEGATIVE_TOMBSTONE_INVALID_SCHEMA_VERSION_RAW_SHA256,
+            ),
+            (
+                negative_tombstone_invalid_erasure_policy_framed.as_slice(),
+                EXPECTED_NEGATIVE_TOMBSTONE_INVALID_ERASURE_POLICY_RAW_SHA256,
             ),
             (
                 vector_suite_framed.as_slice(),
@@ -1449,6 +1582,30 @@ mod tests {
         assert_eq!(
             private_receipt.receipt_id().unwrap().to_string(),
             EXPECTED_PRIVATE_RECEIPT_ID
+        );
+        // Blocker fix (ordering-rule pinning): re-run the selector over the
+        // exact (uncapped) population `write_fixture_corpus` generated this
+        // fixture from and require byte-for-byte equality of the embedded
+        // selection receipt with the frozen record. Neither the raw fixture
+        // SHA-256 above, nor the per-stratum count/permutation-equality
+        // checks in `selection_is_deterministic_and_input_order_is_irrelevant`,
+        // detect an inverted ordering-key comparator; recomputing and
+        // comparing canonical bytes against this exact population does.
+        let private_with_exemplars_candidates = two_stratum_candidates();
+        let private_with_exemplars_population = PopulationInputV1::Bound {
+            snapshot_digest: Sha256Digest::from_bytes([200; 32]),
+            query_population_digest: Sha256Digest::from_bytes([201; 32]),
+            candidates: &private_with_exemplars_candidates,
+        };
+        let recomputed_private_selection = select_exemplars_deterministic_stratified_hash_v1(
+            &private_policy(),
+            &private_with_exemplars_population,
+        )
+        .unwrap();
+        assert_eq!(
+            encode_canonical(&recomputed_private_selection).unwrap(),
+            encode_canonical(&private_receipt.exemplars).unwrap(),
+            "recomputed selection must byte-match the frozen private-with-exemplars fixture"
         );
 
         let unavailable_receipt_bytes = fixture_record(unavailable_receipt_framed);
@@ -1551,6 +1708,41 @@ mod tests {
             selection_erased_bytes
         );
 
+        let selection_cap_truncated_bytes = fixture_record(selection_cap_truncated_framed);
+        let selection_cap_truncated: ExemplarSelectionReceiptV1 =
+            decode_strict(selection_cap_truncated_bytes).unwrap();
+        selection_cap_truncated.validate_shape().unwrap();
+        assert_eq!(selection_cap_truncated.candidate_count, 9);
+        assert_eq!(selection_cap_truncated.selected_count, 8);
+        assert_eq!(selection_cap_truncated.omitted_count, 1);
+        assert!(selection_cap_truncated.truncated);
+        assert_eq!(
+            encode_canonical(&selection_cap_truncated).unwrap(),
+            selection_cap_truncated_bytes
+        );
+        // Blocker fix (ordering-rule pinning): re-run the selector over the
+        // exact population this fixture was generated from and require
+        // byte-for-byte equality with the frozen record. Asserting only
+        // counts (above) or permutation-equality survives an inverted
+        // ordering key or comparator; recomputing and comparing canonical
+        // bytes does not.
+        let cap_truncated_candidates = cap_truncating_candidates();
+        let cap_truncated_population = PopulationInputV1::Bound {
+            snapshot_digest: Sha256Digest::from_bytes([210; 32]),
+            query_population_digest: Sha256Digest::from_bytes([211; 32]),
+            candidates: &cap_truncated_candidates,
+        };
+        let recomputed_cap_truncated = select_exemplars_deterministic_stratified_hash_v1(
+            &private_policy(),
+            &cap_truncated_population,
+        )
+        .unwrap();
+        assert_eq!(
+            encode_canonical(&recomputed_cap_truncated).unwrap(),
+            selection_cap_truncated_bytes,
+            "recomputed cap-truncating selection must byte-match the frozen fixture"
+        );
+
         // Negative fixtures are syntactically framed the same way but each
         // fails either canonical-JSON decoding or typed shape validation.
         // `negative-float-result.jsonl` is deliberately NOT canonical (it
@@ -1591,6 +1783,62 @@ mod tests {
         );
         assert!(
             negative_compliant_partial_coverage
+                .validate_shape()
+                .is_err()
+        );
+
+        // Blocker fix (cap-bypass guard): `selected_count = 9` under the
+        // private policy's cap of 8, with 1 present exemplar plus 8
+        // fabricated tombstones making every other count arithmetically
+        // self-consistent. Only the explicit `selected_count > caps.max_count`
+        // check in `validate_caps_and_tombstones` rejects it.
+        let negative_selected_count_exceeds_cap_bytes =
+            fixture_record(negative_selected_count_exceeds_cap_framed);
+        let negative_selected_count_exceeds_cap: ExemplarSelectionReceiptV1 =
+            decode_strict(negative_selected_count_exceeds_cap_bytes).unwrap();
+        assert_eq!(negative_selected_count_exceeds_cap.selected_count, 9);
+        assert_eq!(negative_selected_count_exceeds_cap.exemplars.len(), 1);
+        assert_eq!(negative_selected_count_exceeds_cap.tombstones.len(), 8);
+        assert!(
+            negative_selected_count_exceeds_cap
+                .validate_shape()
+                .is_err()
+        );
+
+        // Blocker fix (tombstone-shape guard): the erased fixture with its
+        // one tombstone's `schema_version` bumped to an unknown value.
+        // Decodes structurally; `validate_shape` must reject it rather than
+        // trust a tombstone this module could never have produced.
+        let negative_tombstone_invalid_schema_version_bytes =
+            fixture_record(negative_tombstone_invalid_schema_version_framed);
+        let negative_tombstone_invalid_schema_version: ExemplarSelectionReceiptV1 =
+            decode_strict(negative_tombstone_invalid_schema_version_bytes).unwrap();
+        assert_eq!(
+            negative_tombstone_invalid_schema_version.tombstones[0].schema_version,
+            9999
+        );
+        assert!(
+            negative_tombstone_invalid_schema_version
+                .validate_shape()
+                .is_err()
+        );
+
+        // Blocker fix (tombstone-shape guard): the erased fixture with its
+        // tombstone's `erasure_policy.version` rewritten to 0.
+        // `RegistryReferenceV1::validate` rejects a zero version; this pins
+        // that every tombstone's `erasure_policy` is actually validated.
+        let negative_tombstone_invalid_erasure_policy_bytes =
+            fixture_record(negative_tombstone_invalid_erasure_policy_framed);
+        let negative_tombstone_invalid_erasure_policy: ExemplarSelectionReceiptV1 =
+            decode_strict(negative_tombstone_invalid_erasure_policy_bytes).unwrap();
+        assert_eq!(
+            negative_tombstone_invalid_erasure_policy.tombstones[0]
+                .erasure_policy
+                .version,
+            0
+        );
+        assert!(
+            negative_tombstone_invalid_erasure_policy
                 .validate_shape()
                 .is_err()
         );
@@ -1954,6 +2202,21 @@ mod tests {
         assert!(policy.validate().is_err());
     }
 
+    /// A reader must be able to trust a decoded `biased_extrema: true`
+    /// policy: `deterministic_stratified_hash_v1` (the only selector this
+    /// module implements) already refuses to *run* under that label
+    /// (`biased_extrema_policy_is_refused_by_the_hash_selector`), but
+    /// nothing previously stopped such a policy from decoding and passing
+    /// `ExemplarPolicyV1::validate` on its own -- a receipt could be
+    /// hand-assembled naming the hash selector under a biased label without
+    /// ever going through the selector function that refuses it.
+    #[test]
+    fn biased_extrema_policy_fails_validation_for_the_hash_selector() {
+        let mut policy = private_policy();
+        policy.biased_extrema = true;
+        assert!(policy.validate().is_err());
+    }
+
     fn two_stratum_candidates() -> Vec<SelectionCandidateV1> {
         vec![
             candidate(
@@ -1982,6 +2245,38 @@ mod tests {
                 CandidateOutcomeV1::Eligible(Box::new(exemplar(5, 0))),
             ),
         ]
+    }
+
+    /// Three strata, three eligible candidates each (9 eligible total),
+    /// against the private policy's cap of 8: round-robin fills every
+    /// stratum's first two slots (6 selected), then has exactly two of the
+    /// three cap-remaining slots left, so the third stratum's (canonically
+    /// last) third-ranked candidate is omitted while the first two strata's
+    /// third-ranked candidates are selected. The cap therefore forces a
+    /// real choice between eligible records, unlike [`two_stratum_candidates`]
+    /// (4 eligible, cap 8: never truncates). Used to pin
+    /// `deterministic_stratified_hash_v1` against a population where an
+    /// inverted ordering key or comparator would change which record is
+    /// omitted, not merely their order.
+    fn cap_truncating_candidates() -> Vec<SelectionCandidateV1> {
+        let mut candidates = Vec::with_capacity(9);
+        let mut record_id = 1u8;
+        for (stratum, base_seed) in [
+            ("route.checkout", 60u8),
+            ("route.orders", 70u8),
+            ("route.refund", 80u8),
+        ] {
+            for offset in 0..3u8 {
+                candidates.push(candidate(
+                    stratum,
+                    base_seed + offset,
+                    record_id,
+                    CandidateOutcomeV1::Eligible(Box::new(exemplar(record_id, 0))),
+                ));
+                record_id += 1;
+            }
+        }
+        candidates
     }
 
     #[test]
@@ -2236,6 +2531,69 @@ mod tests {
         assert_eq!(erased.exemplars.len(), 3);
         assert_eq!(erased.tombstones.len(), 1);
         erased.validate_shape().unwrap();
+    }
+
+    /// Blocker fix (erasure-deadlock guard): two selected exemplars whose
+    /// content is byte-identical must both be individually erasable. The
+    /// prior `validate_caps_and_tombstones` rejected a tombstone whose
+    /// digest was still present anywhere in `exemplars`, which permanently
+    /// blocked erasing the second of two content-duplicate records; erasure
+    /// now keys off each tombstone's stable `selection_index` instead.
+    #[test]
+    fn erasure_is_total_for_content_identical_selected_exemplars() {
+        let duplicate = exemplar(1, 0);
+        let candidates = vec![
+            candidate(
+                "route.only",
+                120,
+                1,
+                CandidateOutcomeV1::Eligible(Box::new(duplicate.clone())),
+            ),
+            candidate(
+                "route.only",
+                121,
+                2,
+                CandidateOutcomeV1::Eligible(Box::new(duplicate)),
+            ),
+        ];
+        let population = PopulationInputV1::Bound {
+            snapshot_digest: Sha256Digest::from_bytes([130; 32]),
+            query_population_digest: Sha256Digest::from_bytes([131; 32]),
+            candidates: &candidates,
+        };
+        let selection =
+            select_exemplars_deterministic_stratified_hash_v1(&private_policy(), &population)
+                .unwrap();
+        assert_eq!(selection.selected_count, 2);
+        assert_eq!(selection.exemplars.len(), 2);
+        assert_eq!(
+            selection.exemplars[0].exemplar_digest().unwrap(),
+            selection.exemplars[1].exemplar_digest().unwrap(),
+            "both candidates carry byte-identical exemplar content by construction"
+        );
+
+        let erased_at = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap();
+        let one_erased = selection
+            .erase_exemplar_at(
+                0,
+                erased_at.clone(),
+                registry_ref("erasure.policy.default", 40),
+            )
+            .unwrap();
+        assert_eq!(one_erased.exemplars.len(), 1);
+        assert_eq!(one_erased.tombstones.len(), 1);
+        one_erased.validate_shape().unwrap();
+
+        // The second content-identical exemplar must also be erasable: a
+        // digest-set-membership check would deadlock here even though it
+        // names a distinct originally-selected record.
+        let both_erased = one_erased
+            .erase_exemplar_at(0, erased_at, registry_ref("erasure.policy.default", 40))
+            .unwrap();
+        assert_eq!(both_erased.exemplars.len(), 0);
+        assert_eq!(both_erased.tombstones.len(), 2);
+        assert_eq!(both_erased.selected_count, 2);
+        both_erased.validate_shape().unwrap();
     }
 
     #[test]
@@ -2494,6 +2852,148 @@ mod tests {
             sha,
         );
 
+        // A cap-truncating selection: 9 eligible candidates across 3 strata
+        // against the private policy's cap of 8, so `omitted_count == 1` and
+        // exactly which candidate is left out depends on the ordering key
+        // and comparator, not just on per-stratum counts. Pinned separately
+        // from `measurement-receipt-v1-private-with-exemplars.jsonl` (whose
+        // 4-candidate population never reaches the cap) so the replay test
+        // below actually exercises the cap-forces-a-choice path.
+        let cap_truncating_candidates = cap_truncating_candidates();
+        let cap_truncated_population = PopulationInputV1::Bound {
+            snapshot_digest: Sha256Digest::from_bytes([210; 32]),
+            query_population_digest: Sha256Digest::from_bytes([211; 32]),
+            candidates: &cap_truncating_candidates,
+        };
+        let cap_truncated = select_exemplars_deterministic_stratified_hash_v1(
+            &private_policy(),
+            &cap_truncated_population,
+        )
+        .unwrap();
+        assert_eq!(cap_truncated.candidate_count, 9);
+        assert_eq!(cap_truncated.selected_count, 8);
+        assert_eq!(cap_truncated.omitted_count, 1);
+        assert!(cap_truncated.truncated);
+        let sha = write(
+            "exemplar-selection-receipt-v1-cap-truncated.jsonl",
+            encode_canonical(&cap_truncated).unwrap(),
+        );
+        record(
+            &mut manifest,
+            "exemplar-selection-receipt-v1-cap-truncated.jsonl",
+            sha,
+        );
+
+        // Negative (cap-bypass guard): a hand-fabricated receipt naming
+        // `selected_count = 9` under the private policy's cap of 8 --
+        // 1 present exemplar plus 8 tombstones, arithmetically self-
+        // consistent everywhere else (`validate_counts_and_strata` alone
+        // would accept it). Only `validate_caps_and_tombstones`'s explicit
+        // `selected_count > caps.max_count` check rejects it; a genuine
+        // selection can never produce this shape because selection stops at
+        // the cap and erasure never raises `selected_count`.
+        let cap_bypass_tombstones: Vec<ErasedExemplarTombstoneV1> = (0..8u8)
+            .map(|seed| ErasedExemplarTombstoneV1 {
+                schema_version: TELEMETRY_SCHEMA_VERSION,
+                selection_index: u32::from(seed),
+                erased_exemplar_digest: exemplar(seed + 1, 0).exemplar_digest().unwrap(),
+                erased_at: CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap(),
+                erasure_policy: registry_ref("erasure.policy.default", 40),
+            })
+            .collect();
+        let cap_bypass = ExemplarSelectionReceiptV1 {
+            schema_version: TELEMETRY_SCHEMA_VERSION,
+            policy: private_policy(),
+            policy_digest: private_policy_digest,
+            population: PopulationBoundaryV1::Bound {
+                snapshot_digest: Sha256Digest::from_bytes([220; 32]),
+                query_population_digest: Sha256Digest::from_bytes([221; 32]),
+            },
+            strata: vec![StratumSelectionV1 {
+                stratum_key: ExemplarTextV1::parse("route.only").unwrap(),
+                eligible_count: 9,
+                selected_count: 9,
+            }],
+            candidate_count: 9,
+            eligible_count: 9,
+            withheld_count: 0,
+            selected_count: 9,
+            omitted_count: 0,
+            truncated: false,
+            exemplars: vec![exemplar(9, 0)],
+            tombstones: cap_bypass_tombstones,
+        };
+        assert!(cap_bypass.validate_shape().is_err());
+        let sha = write(
+            "negative-selected-count-exceeds-cap.jsonl",
+            encode_canonical(&cap_bypass).unwrap(),
+        );
+        record(
+            &mut manifest,
+            "negative-selected-count-exceeds-cap.jsonl",
+            sha,
+        );
+
+        // Negative (tombstone-shape guard): the erased fixture with its one
+        // tombstone's `schema_version` bumped to an unknown value. Decodes
+        // structurally (schema_version is just a u32 field); `validate_shape`
+        // must reject it rather than trust a tombstone this module could
+        // never have produced.
+        let erased_bytes = encode_canonical(&erased).unwrap();
+        let erased_text = String::from_utf8(erased_bytes).unwrap();
+        let bad_tombstone_schema_text = erased_text.replacen(
+            "\"schema_version\":1,\"selection_index\"",
+            "\"schema_version\":9999,\"selection_index\"",
+            1,
+        );
+        assert_ne!(erased_text, bad_tombstone_schema_text);
+        let bad_tombstone_schema_bytes =
+            crate::memory_contracts::canonical::parse_strict(bad_tombstone_schema_text.as_bytes())
+                .unwrap()
+                .bytes()
+                .to_vec();
+        let bad_tombstone_schema: ExemplarSelectionReceiptV1 =
+            decode_strict(&bad_tombstone_schema_bytes).unwrap();
+        assert!(bad_tombstone_schema.validate_shape().is_err());
+        let sha = write(
+            "negative-tombstone-invalid-schema-version.jsonl",
+            bad_tombstone_schema_bytes,
+        );
+        record(
+            &mut manifest,
+            "negative-tombstone-invalid-schema-version.jsonl",
+            sha,
+        );
+
+        // Negative (tombstone-shape guard): the erased fixture with its
+        // tombstone's `erasure_policy.version` rewritten to 0.
+        // `RegistryReferenceV1::validate` rejects a zero version; this pins
+        // that `validate_caps_and_tombstones` actually calls it for every
+        // tombstone rather than trusting the nested record's shape.
+        let bad_erasure_policy_text = erased_text.replacen(
+            "\"erasure.policy.default\",\"version\":1",
+            "\"erasure.policy.default\",\"version\":0",
+            1,
+        );
+        assert_ne!(erased_text, bad_erasure_policy_text);
+        let bad_erasure_policy_bytes =
+            crate::memory_contracts::canonical::parse_strict(bad_erasure_policy_text.as_bytes())
+                .unwrap()
+                .bytes()
+                .to_vec();
+        let bad_erasure_policy: ExemplarSelectionReceiptV1 =
+            decode_strict(&bad_erasure_policy_bytes).unwrap();
+        assert!(bad_erasure_policy.validate_shape().is_err());
+        let sha = write(
+            "negative-tombstone-invalid-erasure-policy.jsonl",
+            bad_erasure_policy_bytes,
+        );
+        record(
+            &mut manifest,
+            "negative-tombstone-invalid-erasure-policy.jsonl",
+            sha,
+        );
+
         // Negative: a syntactically well-formed receipt with a raw JSON float
         // result instead of a canonical decimal string. Deliberately NOT run
         // through `parse_strict`/`require_canonical`: the whole point is
@@ -2622,6 +3122,9 @@ mod tests {
                 "secret_shaped_field": "negative-secret-shaped-field.jsonl",
                 "raw_log_line_field": "negative-raw-log-line-field.jsonl",
                 "compliant_partial_coverage": "negative-compliant-partial-coverage.jsonl",
+                "selected_count_exceeds_cap": "negative-selected-count-exceeds-cap.jsonl",
+                "tombstone_invalid_schema_version": "negative-tombstone-invalid-schema-version.jsonl",
+                "tombstone_invalid_erasure_policy": "negative-tombstone-invalid-erasure-policy.jsonl",
             },
             "artifacts": manifest,
         });

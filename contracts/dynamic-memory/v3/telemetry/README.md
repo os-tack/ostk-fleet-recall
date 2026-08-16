@@ -58,9 +58,27 @@ the architecture doc's deny list is enforced structurally by
 **`exemplar-selection-receipt-v1-erased.jsonl`** — the private-with-exemplars
 selection after `erase_exemplar_at(0, ...)`: `selected_count` is unchanged,
 `exemplars.len()` drops by one, and one `ErasedExemplarTombstoneV1` appears
-in canonical (digest-ascending) order. Proves exemplar erasure removes the
-payload while the receipt's counts and identity-bearing history remain
-(EVID-08, EVID-09).
+in canonical (`selection_index`-ascending) order. Proves exemplar erasure
+removes the payload while the receipt's counts and identity-bearing history
+remain (EVID-08, EVID-09). `selection_index` -- the tombstone's stable 0-based
+position in the original round-robin selection order, not derived from
+`erased_exemplar_digest` -- is what canonical order and cap/consistency
+checks key off; see `erasure-is-total-for-duplicates` below for why content
+digest alone cannot be the key.
+
+**`exemplar-selection-receipt-v1-cap-truncated.jsonl`** — a real
+`deterministic_stratified_hash_v1` run against a three-stratum, 9-eligible-
+candidate population under the private policy's cap of 8 (`route.checkout`,
+`route.orders`, `route.refund`, three candidates each): `omitted_count == 1`
+and `truncated == true`. Unlike `measurement-receipt-v1-private-with-
+exemplars.jsonl` (4 eligible candidates, never reaches the cap of 8), the
+cap here forces a real choice between eligible records within the last
+round-robin round. `authoritative_fixture_corpus_is_frozen` re-runs the
+selector over this exact population and asserts canonical-byte equality with
+the frozen record, so a changed ordering-key preimage, within-stratum
+comparator, canonical stratum order, or round-robin walk fails a gate
+instead of passing silently (the class of defect the count-only and
+permutation-equality checks below cannot catch).
 
 ## Negative vectors
 
@@ -101,6 +119,33 @@ rejects it. RUN-01 requires full coverage before ANY verified outcome --
 the `nonconformant` arm would fail open: a `compliant` outcome could then be
 asserted at full verification rank under partial or unknown coverage.
 
+**`negative-selected-count-exceeds-cap.jsonl`** — a hand-fabricated selection
+receipt naming `selected_count = 9` under the private policy's cap of 8: one
+present exemplar plus eight tombstones, with every other count
+(`candidate_count`/`eligible_count`/strata totals/`present_and_tombstoned`)
+arithmetically self-consistent so `validate_counts_and_strata` alone would
+accept it. Only `validate_caps_and_tombstones`'s explicit `selected_count >
+caps.max_count` check rejects it. A genuine selection can never produce this
+shape: selection stops at the cap, and erasure never raises `selected_count`
+(it only moves an already-selected exemplar to a tombstone). Prior to this
+fixture, the count cap was checked only against `exemplars.len()`, which a
+payload could keep under the cap indefinitely by naming enough fabricated
+tombstones instead.
+
+**`negative-tombstone-invalid-schema-version.jsonl`** — the erased fixture
+with its one tombstone's `schema_version` rewritten from `1` to `9999`.
+Decodes structurally (schema_version is just a `u32` field); `validate_shape`
+must reject a tombstone this module could never have produced rather than
+trust it as evidence.
+
+**`negative-tombstone-invalid-erasure-policy.jsonl`** — the erased fixture
+with its tombstone's `erasure_policy.version` rewritten from `1` to `0`.
+`RegistryReferenceV1::validate` rejects a zero version; this pins that
+`validate_caps_and_tombstones` actually calls it for every tombstone's
+`erasure_policy`, matching the validation every other nested registry
+reference in this module already receives, rather than trusting the nested
+record's shape unchecked.
+
 ## Digests
 
 `vector-suite.jsonl` pins one manifest record with the raw SHA-256 of every
@@ -124,8 +169,29 @@ round-robin-across-strata-until-the-cap, canonical strata order plus
 restart-replay identity, the withheld-vs-eligible split, public
 reclassification (a private-only selection is never visible through
 `public_exemplars()`), the exemplar-only causal-rejection predicate
-(`exemplars_do_not_upgrade_outcome`), and the biased-extrema refusal are all
+(`exemplars_do_not_upgrade_outcome`), and the biased-extrema refusal (both at
+selector-run time and, since the review that found a decoded receipt could
+still claim the combination, at `ExemplarPolicyV1::validate` time) are all
 properties of the pure selection function and predicates, not of one static
 JSON shape — they are proven by constructing several populations in Rust and
 asserting the algorithm's behavior directly, matching how this crate already
 tests its other pure algorithms.
+
+**Ordering-rule replay pinning.** `authoritative_fixture_corpus_is_frozen`
+does not only decode the frozen fixtures -- for
+`measurement-receipt-v1-private-with-exemplars.jsonl` and
+`exemplar-selection-receipt-v1-cap-truncated.jsonl` it also re-runs
+`select_exemplars_deterministic_stratified_hash_v1` over the exact population
+each fixture was generated from and asserts canonical-byte equality with the
+frozen record. Raw fixture SHA-256s, per-stratum counts, and
+permutation-equality checks all survive an inverted ordering-key comparator;
+this replay does not.
+
+**`erasure-is-total-for-duplicates`.** `erasure_is_total_for_content_identical_selected_exemplars`
+constructs two selected exemplars with byte-identical content and erases both
+in sequence. `ErasedExemplarTombstoneV1::selection_index` -- the erased
+record's stable 0-based position in the original round-robin selection
+order, computed by `ExemplarSelectionReceiptV1::selection_index_for_present_exemplar`
+-- is what makes this possible: cap/consistency validation keys off that
+index rather than off content-digest set membership, so tombstoning one
+content-duplicate exemplar never blocks tombstoning the other.
