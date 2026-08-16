@@ -169,6 +169,7 @@ pub enum DigestDomain {
     // --- W0-CAUSE domains ---
 
     // --- W0-ACT domains ---
+    // --- W1 domains (evidence ledger, head witness, remember/evidence/relation runtime) ---
 }
 
 impl DigestDomain {
@@ -264,6 +265,7 @@ impl DigestDomain {
             // --- W0-CAUSE prefixes ---
 
             // --- W0-ACT prefixes ---
+            // --- W1 prefixes ---
         }
     }
 }
