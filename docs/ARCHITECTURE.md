@@ -208,8 +208,11 @@ and `memory_mutation_receipts`, and the read-only `memory_writer_authority_v1`
 head-witness view. It grants the runtime role nothing on any `memory_control_*`
 or `memory_registry_*` base table. Every object is created with `IF NOT
 EXISTS` for resumability and then asserted against the committed public
-catalog, so a same-name object with another shape fails closed with SQLSTATE
-`55000` instead of being adopted as a successful version 18.
+catalog -- exact ordered column shape, the view's owner and definition, and the
+complete committed constraint set of every new table (every CHECK, the primary
+key, every UNIQUE, every foreign key) -- so a same-name object with another
+shape, or with the D1 governance-exclusion CHECK missing, fails closed with
+SQLSTATE `55000` instead of being adopted as a successful version 18.
 
 The current conflict detector is the immutable contract
 `same_key_functional_value_v2`. A conflict-eligible legacy claim key is the

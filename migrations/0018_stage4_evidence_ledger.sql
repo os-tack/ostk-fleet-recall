@@ -605,3 +605,112 @@ BEGIN
     END IF;
 END
 $$;
+
+-- Fail closed on constraint-level drift (blocking review finding, 2026-08-16).
+-- The column-shape assertion above rejects a same-name forgery only when the
+-- forgery changes a column. An adopted table with the exact 15 columns of
+-- memory_evidence_events and the exact events -> heads foreign key, but WITHOUT
+-- CONSTRAINT memory_evidence_event_governance_exclusion and WITHOUT
+-- UNIQUE (tenant_id, project, event_id), passed every earlier check -- and the
+-- runtime policy then granted fleet_runtime INSERT on it, so a
+-- 'registry.successor.activated' / 'registry.activation' row landed in the
+-- evidence ledger. The D1 governance boundary this file calls non-negotiable
+-- was silently adopted away.
+--
+-- The fingerprint below therefore pins the COMPLETE committed constraint set of
+-- every relation this migration creates: every CHECK, the PRIMARY KEY, every
+-- UNIQUE (both the inline UNIQUE (tenant_id, project, event_id) and the
+-- separately created memory_evidence_events_predecessor_unique_idx, which
+-- CockroachDB records in pg_constraint as contype 'u'), and every FOREIGN KEY,
+-- each as contype:name:pg_get_constraintdef ordered by (contype, name). No
+-- contype is filtered out, so an ADDED constraint drifts as loudly as a missing
+-- one. The literals are the exact pg_get_constraintdef renderings measured on
+-- official CockroachDB v26.2.3; if a future engine renders them differently the
+-- migration fails closed rather than silently weakening, which is the correct
+-- direction for a privilege boundary.
+DO $$
+DECLARE
+    drifted STRING;
+BEGIN
+    SELECT string_agg(expected.relation_name, ', ' ORDER BY expected.relation_name)
+    INTO drifted
+    FROM (VALUES
+        ('memory_evidence_shard_heads',
+            'c:memory_evidence_head_chain_digest_shape:CHECK ((octet_length(chain_digest) = 32));c:memory_evidence_head_epoch_id_shape:CHECK ((octet_length(epoch_id) = 32));c:memory_evidence_head_offset_bound:CHECK ((last_committed_offset >= 0));c:memory_evidence_head_project_bound:CHECK ((octet_length(project) BETWEEN 1 AND 256));c:memory_evidence_head_shard_bound:CHECK (((shard >= 0) AND (shard < shard_count)));c:memory_evidence_head_shard_count_bound:CHECK ((shard_count BETWEEN 1 AND 4096));p:memory_evidence_shard_heads_pkey:PRIMARY KEY (tenant_id ASC, project ASC, epoch_id ASC, shard ASC)'),
+        ('memory_evidence_events',
+            'c:memory_evidence_event_canonical_bound:CHECK ((octet_length(canonical_event) BETWEEN 1 AND 1048576));c:memory_evidence_event_chain_shape:CHECK ((octet_length(chain_digest) = 32));c:memory_evidence_event_consistency_family_bound:CHECK ((octet_length(consistency_family) BETWEEN 1 AND 128));c:memory_evidence_event_consistency_key_shape:CHECK ((octet_length(consistency_key_digest) = 32));c:memory_evidence_event_epoch_id_shape:CHECK ((octet_length(epoch_id) = 32));c:memory_evidence_event_governance_exclusion:CHECK (((event_kind NOT IN (''control.bootstrap.accepted''::STRING, ''registry.genesis.activated''::STRING, ''registry.successor.activated''::STRING)) AND (consistency_family != ''registry.activation''::STRING)));c:memory_evidence_event_id_shape:CHECK ((octet_length(event_id) = 32));c:memory_evidence_event_kind_bound:CHECK ((octet_length(event_kind) BETWEEN 1 AND 128));c:memory_evidence_event_offset_bound:CHECK ((committed_offset > 0));c:memory_evidence_event_previous_chain_shape:CHECK ((octet_length(previous_chain_digest) = 32));c:memory_evidence_event_project_bound:CHECK ((octet_length(project) BETWEEN 1 AND 256));c:memory_evidence_event_schema_version_bound:CHECK ((event_schema_version > 0));c:memory_evidence_event_semantic_digest_shape:CHECK ((octet_length(semantic_object_digest) = 32));c:memory_evidence_event_shard_bound:CHECK ((shard BETWEEN 0 AND 4095));f:memory_evidence_event_head_fk:FOREIGN KEY (tenant_id, project, epoch_id, shard) REFERENCES memory_evidence_shard_heads(tenant_id, project, epoch_id, shard);p:memory_evidence_events_pkey:PRIMARY KEY (tenant_id ASC, project ASC, epoch_id ASC, shard ASC, committed_offset ASC);u:memory_evidence_events_predecessor_unique_idx:UNIQUE (tenant_id ASC, project ASC, epoch_id ASC, shard ASC, previous_chain_digest ASC);u:memory_evidence_events_tenant_id_project_event_id_key:UNIQUE (tenant_id ASC, project ASC, event_id ASC)'),
+        ('memory_evidence_quarantine',
+            'c:memory_evidence_quarantine_attempt_bound:CHECK ((attempt_count BETWEEN 1 AND 1048576));c:memory_evidence_quarantine_connector_bounds:CHECK (((octet_length(connector_principal_id) BETWEEN 1 AND 128) AND (octet_length(connector_instance_id) BETWEEN 1 AND 128)));c:memory_evidence_quarantine_delivery_bound:CHECK ((octet_length(delivery_id) BETWEEN 1 AND 256));c:memory_evidence_quarantine_diagnostic_bound:CHECK ((octet_length(diagnostic) BETWEEN 1 AND 4096));c:memory_evidence_quarantine_id_shape:CHECK ((octet_length(quarantine_id) = 32));c:memory_evidence_quarantine_payload_digest_shape:CHECK ((octet_length(canonical_payload_digest) = 32));c:memory_evidence_quarantine_project_bound:CHECK ((octet_length(project) BETWEEN 1 AND 256));c:memory_evidence_quarantine_reason_bound:CHECK ((octet_length(reason) BETWEEN 1 AND 512));c:memory_evidence_quarantine_representation_shape:CHECK (((representation_key_digest IS NULL) OR (octet_length(representation_key_digest) = 32)));c:memory_evidence_quarantine_source_fact_shape:CHECK (((source_fact_id IS NULL) OR (octet_length(source_fact_id) = 32)));p:memory_evidence_quarantine_pkey:PRIMARY KEY (tenant_id ASC, project ASC, quarantine_id ASC)'),
+        ('memory_content_objects',
+            'c:memory_content_object_byte_length_bound:CHECK ((byte_length > 0));c:memory_content_object_content_digest_shape:CHECK ((octet_length(content_digest) = 32));c:memory_content_object_encrypted_bytes_bound:CHECK ((octet_length(encrypted_bytes) BETWEEN 1 AND 1048576));c:memory_content_object_erasure_index_shapes:CHECK ((((((erasure_representation_digest IS NULL) OR (octet_length(erasure_representation_digest) = 32)) AND ((erasure_source_fact_digest IS NULL) OR (octet_length(erasure_source_fact_digest) = 32))) AND ((erasure_resource_digest IS NULL) OR (octet_length(erasure_resource_digest) = 32))) AND ((erasure_privacy_subject_digest IS NULL) OR (octet_length(erasure_privacy_subject_digest) = 32))));c:memory_content_object_identity_bounds:CHECK (((octet_length(protection_domain_id) BETWEEN 1 AND 128) AND (octet_length(media_type) BETWEEN 1 AND 128)));c:memory_content_object_project_bound:CHECK ((octet_length(project) BETWEEN 1 AND 256));c:memory_content_object_retention_class:CHECK ((retention_class IN (''ephemeral''::STRING, ''governed''::STRING, ''immutable''::STRING)));c:memory_content_object_retention_policy_bounds:CHECK ((((octet_length(retention_policy_entry_id) BETWEEN 1 AND 128) AND (retention_policy_entry_version > 0)) AND (octet_length(retention_policy_digest) = 32)));c:memory_content_object_storage_identity_shape:CHECK ((octet_length(storage_identity) = 32));c:memory_content_object_wrapped_dek_bound:CHECK ((octet_length(wrapped_dek) BETWEEN 1 AND 4096));p:memory_content_objects_pkey:PRIMARY KEY (tenant_id ASC, project ASC, storage_identity ASC)'),
+        ('memory_relation_projection_v1',
+            'c:memory_relation_projection_basis:CHECK ((last_basis IN (''declared''::STRING, ''inferred''::STRING, ''provider_attested''::STRING, ''verifier_result''::STRING)));c:memory_relation_projection_fingerprint_shape:CHECK ((octet_length(relation_fingerprint) = 32));c:memory_relation_projection_generation_bound:CHECK ((generation > 0));c:memory_relation_projection_last_event_shape:CHECK ((octet_length(last_event_id) = 32));c:memory_relation_projection_project_bound:CHECK ((octet_length(project) BETWEEN 1 AND 256));c:memory_relation_projection_state:CHECK ((projection_state IN (''declared''::STRING, ''verified''::STRING, ''refuted''::STRING, ''contested''::STRING)));c:memory_relation_projection_verdict:CHECK ((last_verdict IN (''supports''::STRING, ''refutes''::STRING)));p:memory_relation_projection_v1_pkey:PRIMARY KEY (tenant_id ASC, project ASC, relation_fingerprint ASC)'),
+        ('memory_relation_projection_watermarks_v1',
+            'c:memory_relation_watermark_ledger_family:CHECK ((ledger_family IN (''control''::STRING, ''evidence''::STRING)));c:memory_relation_watermark_offset_bound:CHECK ((last_committed_offset >= 0));c:memory_relation_watermark_project_bound:CHECK ((octet_length(project) BETWEEN 1 AND 256));c:memory_relation_watermark_shard_bound:CHECK ((shard BETWEEN 0 AND 4095));p:memory_relation_projection_watermarks_v1_pkey:PRIMARY KEY (tenant_id ASC, project ASC, ledger_family ASC, shard ASC)')
+    ) AS expected (relation_name, constraint_shape)
+    WHERE expected.constraint_shape IS DISTINCT FROM (
+        SELECT string_agg(
+            constraint_object.contype::STRING || ':'
+                || constraint_object.conname || ':'
+                || pg_catalog.pg_get_constraintdef(constraint_object.oid),
+            ';'
+            ORDER BY constraint_object.contype::STRING, constraint_object.conname
+        )
+        FROM pg_catalog.pg_constraint AS constraint_object
+        JOIN pg_catalog.pg_class AS relation_object
+            ON relation_object.oid = constraint_object.conrelid
+        JOIN pg_catalog.pg_namespace AS schema_object
+            ON schema_object.oid = relation_object.relnamespace
+        WHERE schema_object.nspname = 'public'
+          AND relation_object.relname = expected.relation_name
+    );
+
+    IF drifted IS NOT NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'migration 0018 relation constraint drift: ' || drifted;
+    END IF;
+END
+$$;
+
+-- The two idempotent accepted-event constraint additions above are equally
+-- adoptable: an existing constraint of the same name is skipped whatever it
+-- checks. memory_claims and memory_mutation_receipts are pre-existing tables
+-- owned by migration 0001, so only the two constraints this migration adds are
+-- pinned here; the rest of their constraint sets belong to their own
+-- migrations.
+DO $$
+DECLARE
+    drifted STRING;
+BEGIN
+    SELECT string_agg(
+        expected.table_name || '.' || expected.constraint_name,
+        ', '
+        ORDER BY expected.table_name, expected.constraint_name
+    )
+    INTO drifted
+    FROM (VALUES
+        ('memory_claims', 'memory_claim_accepted_event_id_shape',
+            'CHECK (((accepted_event_id IS NULL) OR (octet_length(accepted_event_id) = 32)))'),
+        ('memory_mutation_receipts', 'memory_mutation_receipt_accepted_event_id_shape',
+            'CHECK (((accepted_event_id IS NULL) OR (octet_length(accepted_event_id) = 32)))')
+    ) AS expected (table_name, constraint_name, constraint_definition)
+    WHERE expected.constraint_definition IS DISTINCT FROM (
+        SELECT pg_catalog.pg_get_constraintdef(constraint_object.oid)
+        FROM pg_catalog.pg_constraint AS constraint_object
+        JOIN pg_catalog.pg_class AS relation_object
+            ON relation_object.oid = constraint_object.conrelid
+        JOIN pg_catalog.pg_namespace AS schema_object
+            ON schema_object.oid = relation_object.relnamespace
+        WHERE schema_object.nspname = 'public'
+          AND relation_object.relname = expected.table_name
+          AND constraint_object.conname = expected.constraint_name
+    );
+
+    IF drifted IS NOT NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'migration 0018 accepted-event column constraint drift: ' || drifted;
+    END IF;
+END
+$$;

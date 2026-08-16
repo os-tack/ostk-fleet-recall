@@ -74,13 +74,23 @@ resumable, because a re-run skips the existing column and still rejects the
 duplicate constraint name with SQLSTATE `42710`. Migration 18 then commits and
 asserts the committed public catalog exactly like v15 through v17: the exact
 ordered column shape of all six new tables and the view, the authority view's
-kind, owner, and complete `pg_get_viewdef` definition, the absence of any
-foreign key on the evidence head table, and the exact events-to-heads
-foreign-key definition. `IF NOT EXISTS` alone would silently ADOPT an unrelated object
-that merely shares a name -- a forged `memory_writer_authority_v1`, or a
-`memory_evidence_quarantine` carrying a payload column -- and record it as a
-successful version 18; every one of those cases now fails with SQLSTATE
-`55000` before SQLx can write its history row.
+kind, owner, and complete `pg_get_viewdef` definition, the complete committed
+constraint set of every table it creates -- every CHECK, the primary key, every
+UNIQUE (including `UNIQUE (tenant_id, project, event_id)` and
+`memory_evidence_events_predecessor_unique_idx`, which CockroachDB records as
+`pg_constraint.contype = 'u'`) and every foreign key, as an exact ordered
+`contype:name:pg_get_constraintdef` fingerprint -- the exact definition of both
+`accepted_event_id` CHECK constraints it adds to pre-existing tables, the
+absence of any foreign key on the evidence head table, and the exact
+events-to-heads foreign-key definition. `IF NOT EXISTS` alone would silently
+ADOPT an unrelated object that merely shares a name -- a forged
+`memory_writer_authority_v1`, a `memory_evidence_quarantine` carrying a payload
+column, or a `memory_evidence_events` with the exact fifteen columns and the
+exact head foreign key but WITHOUT the governance-exclusion CHECK and without
+the event-id UNIQUE -- and record it as a successful version 18; every one of
+those cases now fails with SQLSTATE `55000` before SQLx can write its history
+row. The constraint fingerprint filters no `contype`, so an ADDED constraint
+drifts as loudly as a missing one.
 
 Those are database correctness guarantees. The original recorded LocalStack
 Docker/Compose application-image smoke stopped at migration 9 and remains only
@@ -585,7 +595,8 @@ exact failed version:
   rebuilt; a same-name wrong-shape index fails closed.
 - v18 creates six tables, one unique index, one view, two nullable columns,
   and two named CHECK constraints, every one of them with `IF NOT EXISTS`, and
-  then proves each object's committed catalog shape. Any
+  then proves each object's committed catalog shape and complete committed
+  constraint set. Any
   prefix of that file may already be committed after an interruption; the
   reviewed recovery is the normal migrator retry, which is a no-op for every
   object that already exists. It rewrites no existing row and drops nothing.
@@ -611,9 +622,11 @@ exact failed version:
    `memory_conflicts_scope_key_detector_unique_idx`. For v16 and v17, compare
    the complete covering index definition and job state. For v18, compare the
    six new tables, `memory_evidence_events_predecessor_unique_idx`, the
-   `memory_writer_authority_v1` view and its owner, and both
-   `accepted_event_id` columns with their named CHECK constraints. The
-   migration's own closing assertions report the drifted relation by name.
+   `memory_writer_authority_v1` view and its owner, the complete constraint set
+   of each new table (`SHOW CONSTRAINTS` plus `pg_get_constraintdef`, not the
+   relation names alone), and both `accepted_event_id` columns with their named
+   CHECK constraints. The migration's own closing assertions report the drifted
+   relation by name.
 5. If this is a brand-new empty demo database, the safest recovery is to create
    another empty database and run the complete migrator once against that
    replacement. Deleting the partial database is a separate destructive

@@ -97,8 +97,11 @@ admits only its exact detector-index transition states and rewrites no conflict
 data; v16/v17 commit one covering backfill and assert its exact catalog shape;
 v18 creates every new relation with `IF NOT EXISTS`, commits, and then fails
 closed with SQLSTATE `55000` unless each one -- including the authority view's
-owner and exact definition -- has the shape this migration defines, so a
-same-name object is never silently adopted as a successful version 18.
+owner and exact definition, and the complete committed constraint set of every
+table it creates, so the D1 governance-exclusion CHECK and the event-id UNIQUE
+cannot be dropped by an adopted same-name table -- has the shape this migration
+defines, so a same-name object is never silently adopted as a successful
+version 18.
 The dedicated session is closed rather than returned to the runtime pool.
 These mechanics establish durable shape, not an application authorization
 boundary.

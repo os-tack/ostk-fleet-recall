@@ -234,7 +234,11 @@ The current source migrator applies versions 1 through 18. Versions 1 through
 CockroachDB schema-changer and schema-lock constraints. Versions 10, 11, and
 15 through 17 are resumable online index transitions that fail closed unless
 the committed public catalog has the exact expected definition. Version 18 is
-resumable for the same reason: every object it creates uses `IF NOT EXISTS`. Versions 12
+resumable for the same reason: every object it creates uses `IF NOT EXISTS`,
+and its closing catalog assertions pin the exact column shape, the complete
+committed constraint set, and the authority view's owner and definition, so a
+same-name object it did not create fails with SQLSTATE `55000` instead of being
+adopted. Versions 12
 through 14 run with SQLx bookkeeping in one transaction on a dedicated session
 with `autocommit_before_ddl = false`; that session is closed rather than
 returned to the runtime pool.

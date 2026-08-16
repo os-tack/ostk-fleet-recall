@@ -2520,7 +2520,7 @@ mod tests {
             ),
             (
                 STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL,
-                "9e5c0c2dba9fb4c0baedae1ee481894dffbb1df0d7949c0b41759475a541b7f6",
+                "69110b020468aae79a4bdce21ece9a9d8c66cce7bfd5ed39288af464a1e4960b",
             ),
         ] {
             assert_eq!(format!("{:x}", Sha256::digest(migration)), expected_sha256);
@@ -3080,9 +3080,10 @@ mod tests {
             !migration.contains("REFERENCES memory_registry_"),
             "no evidence-plane foreign key may target a registry table"
         );
-        // One declared foreign key (events -> heads) plus the closing catalog
-        // assertion that pins its exact definition.
-        assert_eq!(migration.matches("FOREIGN KEY ").count(), 2);
+        // One declared foreign key (events -> heads), the closing catalog
+        // assertion that pins its exact definition, and the same edge inside
+        // the complete constraint-set fingerprint of memory_evidence_events.
+        assert_eq!(migration.matches("FOREIGN KEY ").count(), 3);
         assert_eq!(
             migration
                 .matches("        FOREIGN KEY (tenant_id, project, epoch_id, shard)\n")
@@ -3163,7 +3164,7 @@ mod tests {
         // Same-name drift must fail closed rather than be adopted. IF NOT
         // EXISTS alone would record a forged authority view or a quarantine
         // table carrying a payload column as a successful version 18.
-        assert_eq!(migration.matches("ERRCODE = '55000'").count(), 6);
+        assert_eq!(migration.matches("ERRCODE = '55000'").count(), 8);
         for drift_assertion in [
             "migration 0018 same-name relation drift: ",
             "memory_writer_authority_v1 is not a view",
@@ -3171,6 +3172,8 @@ mod tests {
             "memory_writer_authority_v1 catalog definition mismatch",
             "memory_evidence_shard_heads must carry no foreign key",
             "memory_evidence_event_head_fk does not bind the evidence shard head",
+            "migration 0018 relation constraint drift: ",
+            "migration 0018 accepted-event column constraint drift: ",
         ] {
             assert!(
                 migration.contains(drift_assertion),
@@ -3184,6 +3187,54 @@ mod tests {
             assert!(
                 migration.contains(&format!("        ('{relation}',")),
                 "{relation} must be covered by the same-name drift assertion"
+            );
+        }
+
+        // A column-shape-only assertion is not enough: an adopted
+        // memory_evidence_events with the exact fifteen columns and the exact
+        // events -> heads foreign key, but WITHOUT the governance CHECK and
+        // WITHOUT UNIQUE (tenant_id, project, event_id), was recorded as a
+        // successful version 18 and then accepted a
+        // 'registry.successor.activated' row (blocking review finding,
+        // 2026-08-16). Every created relation therefore pins its COMPLETE
+        // committed constraint set, ordered by (contype, name).
+        assert_eq!(
+            migration
+                .matches("|| constraint_object.conname || ':'")
+                .count(),
+            1
+        );
+        for relation in tables {
+            assert!(
+                migration.contains(&format!("p:{relation}_pkey:PRIMARY KEY (")),
+                "{relation} must pin its primary key in the constraint fingerprint"
+            );
+        }
+        for constraint_fingerprint in [
+            "c:memory_evidence_event_governance_exclusion:CHECK (((event_kind NOT IN (",
+            "u:memory_evidence_events_tenant_id_project_event_id_key:UNIQUE (tenant_id ASC, \
+             project ASC, event_id ASC)",
+            "u:memory_evidence_events_predecessor_unique_idx:UNIQUE (tenant_id ASC, project ASC, \
+             epoch_id ASC, shard ASC, previous_chain_digest ASC)",
+            "f:memory_evidence_event_head_fk:FOREIGN KEY (tenant_id, project, epoch_id, shard)",
+            "c:memory_evidence_quarantine_diagnostic_bound:",
+            "c:memory_content_object_retention_class:",
+            "c:memory_relation_projection_state:",
+            "c:memory_relation_watermark_ledger_family:",
+        ] {
+            assert!(
+                migration.contains(constraint_fingerprint),
+                "the constraint fingerprint must pin {constraint_fingerprint}"
+            );
+        }
+        for accepted_event_constraint in [
+            "('memory_claims', 'memory_claim_accepted_event_id_shape',",
+            "('memory_mutation_receipts', 'memory_mutation_receipt_accepted_event_id_shape',",
+        ] {
+            assert!(
+                migration.contains(accepted_event_constraint),
+                "the accepted-event constraint assertion must pin \
+                 {accepted_event_constraint}"
             );
         }
     }
