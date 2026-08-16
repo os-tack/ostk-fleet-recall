@@ -8,17 +8,50 @@ locals {
   reference_agent_command = [
     "reference-agent", "--step", "record-decision", "--run-id", "terraform-placeholder"
   ]
-  model_bucket_name              = trimprefix(var.model_bucket_arn, "arn:aws:s3:::")
-  model_prefix                   = trim(var.model_object_prefix, "/")
-  model_s3_uri                   = "s3://${local.model_bucket_name}/${local.model_prefix}"
-  model_bundle_path              = "/opt/ostk/models/potion-retrieval-32M"
-  image_uri                      = "${aws_ecr_repository.app.repository_url}:${var.image_tag}"
-  runtime_database_secret_arns   = [var.database_url_secret_arn]
-  migration_database_secret_arns = [var.migration_database_url_secret_arn]
+  model_bucket_name                = trimprefix(var.model_bucket_arn, "arn:aws:s3:::")
+  model_prefix                     = trim(var.model_object_prefix, "/")
+  model_s3_uri                     = "s3://${local.model_bucket_name}/${local.model_prefix}"
+  model_bundle_path                = "/opt/ostk/models/potion-retrieval-32M"
+  image_uri                        = "${aws_ecr_repository.app.repository_url}:${var.image_tag}"
+  publication_database_secret_arns = [var.publication_database_url_secret_arn]
+  runtime_database_secret_arns     = [var.database_url_secret_arn]
+  migration_database_secret_arns   = [var.migration_database_url_secret_arn]
   model_object_arns = [
     for filename in ["config.json", "model.safetensors", "tokenizer.json"] :
     "${var.model_bucket_arn}/${local.model_prefix}/${filename}"
   ]
+  publication_database_secret_policy = {
+    Version = "2012-10-17"
+    Statement = concat(
+      [{
+        Sid      = "ReadPublicationDatabaseUrl"
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = var.publication_database_url_secret_arn
+      }],
+      length(var.publication_database_secret_kms_key_arns) == 0 ? [] : [{
+        Sid      = "DecryptPublicationDatabaseSecret"
+        Effect   = "Allow"
+        Action   = "kms:Decrypt"
+        Resource = var.publication_database_secret_kms_key_arns
+        Condition = {
+          StringEquals = {
+            "kms:ViaService"                  = "secretsmanager.${var.aws_region}.amazonaws.com"
+            "kms:EncryptionContext:SecretARN" = var.publication_database_url_secret_arn
+          }
+        }
+      }],
+    )
+  }
+  model_bundle_policy = {
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "ReadPinnedModelBundle"
+      Effect   = "Allow"
+      Action   = ["s3:GetObject", "s3:GetObjectVersion"]
+      Resource = local.model_object_arns
+    }]
+  }
   common_environment = [
     { name = "FLEET_RECALL_TENANT_ID", value = var.tenant_id },
     { name = "FLEET_RECALL_PROJECT", value = var.project },
@@ -102,6 +135,22 @@ data "aws_iam_policy_document" "ecs_assume" {
 resource "aws_iam_role" "execution_runtime" {
   name               = "${var.name}-execution"
   assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+}
+
+resource "aws_iam_role" "execution_publication" {
+  name               = "${var.name}-publication-execution"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "execution_publication" {
+  role       = aws_iam_role.execution_publication.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_iam_role_policy" "publication_database_secret" {
+  name   = "publication-database-secret-read"
+  role   = aws_iam_role.execution_publication.id
+  policy = jsonencode(local.publication_database_secret_policy)
 }
 
 resource "aws_iam_role_policy_attachment" "execution_runtime" {
@@ -213,19 +262,21 @@ resource "aws_iam_role" "task" {
   assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
 }
 
-data "aws_iam_policy_document" "model_bundle" {
-  statement {
-    sid       = "ReadPinnedModelBundle"
-    effect    = "Allow"
-    actions   = ["s3:GetObject", "s3:GetObjectVersion"]
-    resources = local.model_object_arns
-  }
+resource "aws_iam_role" "task_publication" {
+  name               = "${var.name}-publication-task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
 }
 
 resource "aws_iam_role_policy" "model_bundle" {
   name   = "model-bundle-read"
   role   = aws_iam_role.task.id
-  policy = data.aws_iam_policy_document.model_bundle.json
+  policy = jsonencode(local.model_bundle_policy)
+}
+
+resource "aws_iam_role_policy" "model_bundle_publication" {
+  name   = "model-bundle-read"
+  role   = aws_iam_role.task_publication.id
+  policy = jsonencode(local.model_bundle_policy)
 }
 
 resource "aws_security_group" "alb" {
@@ -615,8 +666,8 @@ resource "aws_ecs_task_definition" "app" {
   network_mode             = "awsvpc"
   cpu                      = tostring(var.task_cpu)
   memory                   = tostring(var.task_memory)
-  execution_role_arn       = aws_iam_role.execution_runtime.arn
-  task_role_arn            = aws_iam_role.task.arn
+  execution_role_arn       = aws_iam_role.execution_publication.arn
+  task_role_arn            = aws_iam_role.task_publication.arn
 
   runtime_platform {
     operating_system_family = "LINUX"
@@ -644,8 +695,8 @@ resource "aws_ecs_task_definition" "app" {
 
     environment = local.common_environment
     secrets = [{
-      name      = "FLEET_RECALL_DATABASE_URL"
-      valueFrom = var.database_url_secret_arn
+      name      = "FLEET_RECALL_PUBLICATION_DATABASE_URL"
+      valueFrom = var.publication_database_url_secret_arn
     }]
 
     readonlyRootFilesystem = false
@@ -664,9 +715,9 @@ resource "aws_ecs_task_definition" "app" {
   }])
 
   depends_on = [
-    aws_iam_role_policy_attachment.execution_runtime,
-    aws_iam_role_policy.runtime_database_secret,
-    aws_iam_role_policy.model_bundle,
+    aws_iam_role_policy_attachment.execution_publication,
+    aws_iam_role_policy.publication_database_secret,
+    aws_iam_role_policy.model_bundle_publication,
   ]
 }
 

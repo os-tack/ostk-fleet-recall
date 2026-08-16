@@ -93,6 +93,7 @@ counted as Docker evidence.
 | Activation RBAC parity | `registry-activation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Successor-activation RBAC parity | `successor-activation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Conflict-reconciliation RBAC parity | `conflict-reconciliation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
+| Publication-reader RBAC parity | `publication-reader-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Control bootstrap CLI parity | `control-bootstrap-cli.sh` in its own Docker container | Secondary packaging/CLI result only |
 
 Each Docker proof requires the running server's build tag to equal `v26.2.3`.
@@ -326,3 +327,96 @@ reconciliation role is the supported least-privilege one-shot credential, not
 an engine claim that a misused raw runtime credential cannot issue equivalent
 table mutations; the parity proof snapshots and preserves that overlap while
 proving there is no inheritance edge between the roles.
+
+The publication-reader RBAC proof is a separate secondary Docker result for
+the long-lived `fleet_publication_reader` logical role and one exact externally
+provisioned principal, `fleet_publication`. The principal's password or
+identity-provider binding remains outside the SQL policy. Before every apply,
+the operator must drain its sessions and present it with exact `{NOLOGIN}`;
+the policy never changes that authentication material or enables the login.
+It rejects any direct/system/default/ownership authority on the principal and
+any incident role edge other than the exact non-admin
+`fleet_publication_reader -> fleet_publication` leaf edge. A missing expected
+edge is installed only after every gate and logical-role grant succeeds.
+
+The static phase runs before the first Docker command and can be selected
+independently with `FLEET_RECALL_RBAC_STATIC_ONLY=1`. It freezes a complete SQL
+`GRANT` allowlist: database `CONNECT`, public-schema `USAGE`, `SELECT` on the
+exact eight tables used by public startup, status, chunk recall, claim recall,
+support projection, and conflict hydration, plus the one fixed role edge. No
+sequence, DML, DDL, function/type/external, system, grant-option, private-table,
+or future-object authority is admitted. Static negative scans use status-safe
+`awk` checks rather than treating every nonzero search status as success. They
+also freeze all three system-default audit skips and reject any system database
+target in the default-privilege normalization path. The exact eight-grantor,
+four-mutable-database cleanup sets and their temporary-membership-to-empty-audit
+lifecycle are frozen there as well.
+
+The connected parity phase requires exact build tag `v26.2.3`, rejects the
+wrong database, incomplete or failed prefix 17, a missing/non-quiesced
+principal, and unsafe PUBLIC state before target creation. Pre-create PUBLIC
+function, type, system, default, and cluster-global external-connection grants
+leave the target absent. The proof injects the full v26.2 logical-role option
+surface including replication, a nonportable `VALID UNTIL` identity option,
+system/object/grant-option drift, target/principal/PUBLIC function/type/external
+authority, ownership, extra schemas, FOR-ALL-ROLES and named-grantor defaults,
+and mixed/transitive/admin role graphs. `SUBJECT` and system-managed
+`PROVISIONSRC` remain statically frozen because the insecure fixture cannot
+provision those identities portably.
+
+For the late logical-role type adversary, the proof temporarily removes root's
+database-scoped PUBLIC type default before creating the enum, because v26.2.3
+also creates a separately granted `_reader_private_type` array alias that
+cannot be revoked directly. It immediately restores and verifies the default,
+requires zero PUBLIC grants across both descriptors, and then freezes the exact
+single non-grantable reader grant on the base type. The subsequent PUBLIC type
+gate likewise receives exactly one base-type row, followed by complete type and
+default-state cleanup.
+
+The read-only external inventory enumerates every other database and every
+non-virtual application schema. It reports direct grants, ownership, and
+database- or schema-scoped future defaults for both the logical role and fixed
+principal, and separately reports PUBLIC current/future application authority;
+only the documented v26.2 intrinsic default and virtual/system visibility rows
+are excluded. The `system` database remains read-only: all three helpers audit
+its current grants first, the subject helpers also audit ownership, and the
+PUBLIC scan keeps its existing exact current-system exceptions. They then skip
+only default/schema enumeration. CockroachDB v26.2.3 rejects both `ALTER DEFAULT
+PRIVILEGES` and user `CREATE SCHEMA` there, while
+`crdb_internal.default_privileges` synthesizes exact self-owner `ALL` and
+non-grantable PUBLIC type `USAGE`/routine `EXECUTE` rows for each role, plus the
+PUBLIC type/routine pair for the all-roles pseudo-role. Every differently shaped
+current system grant still surfaces. Cross-database target, principal, and
+PUBLIC defaults are injected at database and custom-schema scope, explicitly
+removed, and followed by future object creation proving that none receives
+authority. The stock cross-database PUBLIC schema `CREATE` remains installed
+through its detection and read-only preservation assertions, then is revoked in
+the explicit cleanup before the expected-empty inventory. Audit output is
+captured in a status-checked assignment before an expected-empty comparison, so
+a failed helper cannot masquerade as a clean inventory.
+Bootstrap uses a principal-only inventory while the logical role is absent,
+plus the full PUBLIC inventory, before the first role-creating apply; immediately
+after creation it reruns the full two-subject and PUBLIC inventories under the
+same single-threaded change freeze.
+Creating the eight later fixture identities (`proof_external`, `proof_public`,
+`proof_nologin`, `fleet_runtime`, `fleet_control_bootstrap`,
+`fleet_registry_activation`, `fleet_registry_successor_activation`, and
+`fleet_conflict_reconciliation`) synthesizes new creator-scoped PUBLIC routine
+defaults in every database. Under temporary exact root membership, the proof
+first requires the external inventory to return exactly 24 rows (eight grantors
+across three non-system external databases). It then explicitly revokes those
+defaults in `fleet_recall`, `defaultdb`, `postgres`, and
+`proof_reader_other_database`, requiring exactly eight matching rows before and
+zero after each revoke. It never mutates `system`, removes the memberships, and
+requires both current and external PUBLIC audits to be empty before any later
+policy apply or member use.
+
+After the exact pre-use audit, the fixture externally enables
+`fleet_publication`, exercises representative reads over all eight tables, and
+rejects `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, DDL, sequence use, temporary
+shadows, delegation, and private control/registry/reconciliation reads. It then
+returns the principal to exact `{NOLOGIN}` before any reapply. A future table is
+created before its denial probe. The sole connected PASS is emitted only after
+the final two clean reapplies and a complete terminal audit of exact direct
+grants, principal state, system/default/ownership/edge/PUBLIC/external surfaces,
+dedicated schemas, future objects, and every other database.

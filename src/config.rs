@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use ostk_recall_core::PrivacyTier;
 use sha2::{Digest, Sha256};
+use sqlx::postgres::PgConnectOptions;
 use url::{Host, Url};
 use uuid::Uuid;
 
@@ -22,7 +23,7 @@ use crate::memory_contracts::successor_activation::{
 use crate::memory_contracts::successor_policy::{
     GenesisSuccessorKeyBridgeDigest, GenesisSuccessorKeyBridgePin,
 };
-use crate::private_postgres::PrivatePostgresSslPolicy;
+use crate::private_postgres::{PUBLICATION_POSTGRES_USER, PrivatePostgresSslPolicy};
 use crate::{FleetError, FleetScope, Result};
 
 /// Deployment-only authority needed by the private control-ledger bootstrap.
@@ -523,72 +524,125 @@ impl std::fmt::Debug for FleetConfig {
 
 const MODEL_BUNDLE_DIGEST_DOMAIN: &[u8] = b"ostk-fleet-recall-model-bundle-v1\0";
 const MODEL_BUNDLE_FILES: [&str; 3] = ["config.json", "model.safetensors", "tokenizer.json"];
+const PUBLICATION_FORBIDDEN_DATABASE_URL_ENV_NAMES: [&str; 8] = [
+    "FLEET_RECALL_DATABASE_URL",
+    "FLEET_RECALL_CONTROL_DATABASE_URL",
+    "FLEET_RECALL_REGISTRY_DATABASE_URL",
+    "FLEET_RECALL_SUCCESSOR_DATABASE_URL",
+    "FLEET_RECALL_RECONCILIATION_DATABASE_URL",
+    "FLEET_RECALL_TEST_DATABASE_URL",
+    "FLEET_RECONCILIATION_TEST_DATABASE_URL",
+    "FLEET_RECALL_PUBLICATION_TEST_ADMIN_DATABASE_URL",
+];
 
-impl FleetConfig {
+/// Runtime configuration admitted only for the bounded public recall process.
+///
+/// The publication process has a dedicated database identity. It fails closed
+/// if the private writer URL is present, so a task definition cannot silently
+/// cross-wire the existing DML-capable credential into the public process.
+#[derive(Clone)]
+pub struct PublicationConfig {
+    database_url: String,
+    database_ssl_policy: PrivatePostgresSslPolicy,
+    runtime: FleetConfig,
+}
+
+impl std::fmt::Debug for PublicationConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublicationConfig")
+            .field("database_url", &"<redacted>")
+            .field("database_ssl_policy", &self.database_ssl_policy)
+            .field("runtime", &self.runtime)
+            .finish()
+    }
+}
+
+impl PublicationConfig {
+    /// Load only the dedicated publication database identity plus the common
+    /// immutable scope/model inputs required to execute recall.
     pub fn from_env() -> Result<Self> {
-        let database_url = required("FLEET_RECALL_DATABASE_URL")?;
-        validate_database_url(&database_url, "FLEET_RECALL_DATABASE_URL")?;
-        let tenant_id = required("FLEET_RECALL_TENANT_ID")?
-            .parse::<Uuid>()
-            .map_err(|error| {
-                FleetError::Configuration(format!("FLEET_RECALL_TENANT_ID must be a UUID: {error}"))
-            })?;
-        let project = required("FLEET_RECALL_PROJECT")?;
-        let agent = required("FLEET_RECALL_AGENT")?;
-        let max_connections = env::var("FLEET_RECALL_MAX_CONNECTIONS")
-            .unwrap_or_else(|_| "16".into())
-            .parse::<u32>()
-            .map_err(|error| {
-                FleetError::Configuration(format!(
-                    "FLEET_RECALL_MAX_CONNECTIONS must be an integer: {error}"
-                ))
-            })?;
-        let embedding_model = env::var("FLEET_RECALL_EMBEDDING_MODEL")
-            .unwrap_or_else(|_| "minishlab/potion-retrieval-32M".into());
-        let embedding_model_path = PathBuf::from(required("FLEET_RECALL_EMBEDDING_MODEL_PATH")?);
-        let embedding_model_sha256 = required("FLEET_RECALL_EMBEDDING_MODEL_SHA256")?;
+        reject_publication_private_database_urls(|name| env::var_os(name).is_some())?;
+        Self::from_lookup(|name| env::var(name).ok())
+    }
 
-        if max_connections == 0 {
-            return Err(FleetError::Configuration(
-                "FLEET_RECALL_MAX_CONNECTIONS must be greater than zero".into(),
-            ));
-        }
-        let embedding_model = embedding_model.trim();
-        if embedding_model.is_empty() {
-            return Err(FleetError::Configuration(
-                "FLEET_RECALL_EMBEDDING_MODEL must not be empty".into(),
-            ));
-        }
-        if embedding_model.len() > 256 || embedding_model.chars().any(char::is_control) {
-            return Err(FleetError::Configuration(
-                "FLEET_RECALL_EMBEDDING_MODEL must be at most 256 characters and contain no control characters"
-                    .into(),
-            ));
-        }
-        if embedding_model_sha256.len() != 64
-            || !embedding_model_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(FleetError::Configuration(
-                "FLEET_RECALL_EMBEDDING_MODEL_SHA256 must be a 64-character hex digest".into(),
-            ));
-        }
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        reject_publication_private_database_urls(|name| lookup(name).is_some())?;
+        let database_url = required_from(&mut lookup, "FLEET_RECALL_PUBLICATION_DATABASE_URL")?;
+        let allow_insecure_local =
+            lookup("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE").is_some_and(|value| value == "1");
+        let database_ssl_policy =
+            validate_publication_database_url(&database_url, allow_insecure_local)?;
+        let runtime = fleet_config_from_lookup(database_url.clone(), &mut lookup)?;
 
         Ok(Self {
             database_url,
-            default_scope: FleetScope::new(
-                tenant_id,
-                project,
-                agent,
-                None,
-                PrivacyTier::T1Project,
-            )?,
-            max_connections,
-            embedding_model: embedding_model.to_owned(),
-            embedding_model_path,
-            embedding_model_sha256: embedding_model_sha256.to_ascii_lowercase(),
+            database_ssl_policy,
+            runtime,
         })
+    }
+
+    #[must_use]
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    #[must_use]
+    pub const fn database_ssl_policy(&self) -> PrivatePostgresSslPolicy {
+        self.database_ssl_policy
+    }
+
+    #[must_use]
+    pub const fn default_scope(&self) -> &FleetScope {
+        &self.runtime.default_scope
+    }
+
+    #[must_use]
+    pub const fn max_connections(&self) -> u32 {
+        self.runtime.max_connections
+    }
+
+    #[must_use]
+    pub fn embedding_model_identity(&self) -> String {
+        self.runtime.embedding_model_identity()
+    }
+
+    pub fn verify_embedding_model_bundle(&self) -> Result<PathBuf> {
+        self.runtime.verify_embedding_model_bundle()
+    }
+}
+
+fn reject_publication_private_database_urls(
+    mut is_present: impl FnMut(&str) -> bool,
+) -> Result<()> {
+    if let Some(name) = PUBLICATION_FORBIDDEN_DATABASE_URL_ENV_NAMES
+        .iter()
+        .copied()
+        .find(|name| is_present(name))
+    {
+        return Err(FleetError::Configuration(format!(
+            "the public demo forbids private database variable {name}; configure only FLEET_RECALL_PUBLICATION_DATABASE_URL; value is redacted"
+        )));
+    }
+    Ok(())
+}
+
+impl FleetConfig {
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        let database_url = required_from(&mut lookup, "FLEET_RECALL_DATABASE_URL")?;
+        let allow_insecure_local =
+            lookup("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE").is_some_and(|value| value == "1");
+        validate_database_url_with_local_escape(
+            &database_url,
+            "FLEET_RECALL_DATABASE_URL",
+            allow_insecure_local,
+            true,
+        )?;
+        fleet_config_from_lookup(database_url, &mut lookup)
     }
 
     /// Stable registry identity, independent of where the baked bundle is
@@ -613,6 +667,70 @@ impl FleetConfig {
         }
         Ok(canonical)
     }
+}
+
+fn fleet_config_from_lookup(
+    database_url: String,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<FleetConfig> {
+    let tenant_id = required_from(&mut lookup, "FLEET_RECALL_TENANT_ID")?
+        .parse::<Uuid>()
+        .map_err(|error| {
+            FleetError::Configuration(format!("FLEET_RECALL_TENANT_ID must be a UUID: {error}"))
+        })?;
+    let project = required_from(&mut lookup, "FLEET_RECALL_PROJECT")?;
+    let agent = required_from(&mut lookup, "FLEET_RECALL_AGENT")?;
+    let max_connections = lookup("FLEET_RECALL_MAX_CONNECTIONS")
+        .unwrap_or_else(|| "16".into())
+        .parse::<u32>()
+        .map_err(|error| {
+            FleetError::Configuration(format!(
+                "FLEET_RECALL_MAX_CONNECTIONS must be an integer: {error}"
+            ))
+        })?;
+    let embedding_model = lookup("FLEET_RECALL_EMBEDDING_MODEL")
+        .unwrap_or_else(|| "minishlab/potion-retrieval-32M".into());
+    let embedding_model_path = PathBuf::from(required_from(
+        &mut lookup,
+        "FLEET_RECALL_EMBEDDING_MODEL_PATH",
+    )?);
+    let embedding_model_sha256 = required_from(&mut lookup, "FLEET_RECALL_EMBEDDING_MODEL_SHA256")?;
+
+    if max_connections == 0 {
+        return Err(FleetError::Configuration(
+            "FLEET_RECALL_MAX_CONNECTIONS must be greater than zero".into(),
+        ));
+    }
+    let embedding_model = embedding_model.trim();
+    if embedding_model.is_empty() {
+        return Err(FleetError::Configuration(
+            "FLEET_RECALL_EMBEDDING_MODEL must not be empty".into(),
+        ));
+    }
+    if embedding_model.len() > 256 || embedding_model.chars().any(char::is_control) {
+        return Err(FleetError::Configuration(
+                "FLEET_RECALL_EMBEDDING_MODEL must be at most 256 characters and contain no control characters"
+                    .into(),
+            ));
+    }
+    if embedding_model_sha256.len() != 64
+        || !embedding_model_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(FleetError::Configuration(
+            "FLEET_RECALL_EMBEDDING_MODEL_SHA256 must be a 64-character hex digest".into(),
+        ));
+    }
+
+    Ok(FleetConfig {
+        database_url,
+        default_scope: FleetScope::new(tenant_id, project, agent, None, PrivacyTier::T1Project)?,
+        max_connections,
+        embedding_model: embedding_model.to_owned(),
+        embedding_model_path,
+        embedding_model_sha256: embedding_model_sha256.to_ascii_lowercase(),
+    })
 }
 
 fn control_bootstrap_config(
@@ -1251,6 +1369,62 @@ fn validate_successor_database_url(database_url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Apply the closed endpoint policy for the public recall reader.
+///
+/// Unlike the general private runtime URL, publication is bound to the one
+/// canonical application database and requires an explicit credential and TLS
+/// mode. The sole exception is the existing opt-in loopback development escape,
+/// which still requires the URL to say `sslmode=disable` explicitly.
+fn validate_publication_database_url(
+    database_url: &str,
+    allow_insecure_local: bool,
+) -> Result<PrivatePostgresSslPolicy> {
+    const VARIABLE_NAME: &str = "FLEET_RECALL_PUBLICATION_DATABASE_URL";
+
+    validate_database_url_with_local_escape(
+        database_url,
+        VARIABLE_NAME,
+        allow_insecure_local,
+        true,
+    )?;
+    validate_explicit_private_database_identity(database_url, VARIABLE_NAME)?;
+    let parsed = Url::parse(database_url).map_err(|_| {
+        FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must be a valid PostgreSQL URL; value is redacted"
+        ))
+    })?;
+    let decoded_options = database_url.parse::<PgConnectOptions>().map_err(|_| {
+        FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must be a valid PostgreSQL URL; value is redacted"
+        ))
+    })?;
+    if decoded_options.get_username() != PUBLICATION_POSTGRES_USER {
+        return Err(FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must authenticate exactly as {PUBLICATION_POSTGRES_USER}; value is redacted"
+        )));
+    }
+    let host = parsed.host_str().ok_or_else(|| {
+        FleetError::Configuration(format!("{VARIABLE_NAME} must include a hostname"))
+    })?;
+    let ordinary_network_host = match parsed.host() {
+        Some(Host::Ipv4(_) | Host::Ipv6(_)) => !host.contains('%'),
+        Some(Host::Domain(domain)) => is_ordinary_dns_host(domain),
+        None => false,
+    };
+    if !ordinary_network_host || host.starts_with(['/', '\\']) {
+        return Err(FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must use an ordinary DNS or IP hostname, not an encoded or Unix-socket host"
+        )));
+    }
+    if parsed.path() != "/fleet_recall" {
+        return Err(FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must select exactly the fleet_recall database"
+        )));
+    }
+
+    explicit_private_database_ssl_policy(database_url, VARIABLE_NAME)
+}
+
 fn is_ordinary_dns_host(host: &str) -> bool {
     if host.is_empty() || host.len() > 253 || host.contains('%') || !host.is_ascii() {
         return false;
@@ -1396,6 +1570,181 @@ mod tests {
         assert!(!debug.contains("super-secret"));
         assert!(!debug.contains("operator:"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    fn serving_values() -> BTreeMap<&'static str, String> {
+        BTreeMap::from([
+            (
+                "FLEET_RECALL_TENANT_ID",
+                "0198a849-f6ae-7d61-9800-000000000001".into(),
+            ),
+            ("FLEET_RECALL_PROJECT", "physical-project".into()),
+            ("FLEET_RECALL_AGENT", "deployment-agent".into()),
+            ("FLEET_RECALL_MAX_CONNECTIONS", "4".into()),
+            (
+                "FLEET_RECALL_EMBEDDING_MODEL",
+                "logical/publication-model".into(),
+            ),
+            (
+                "FLEET_RECALL_EMBEDDING_MODEL_PATH",
+                "/opt/fleet-recall/model".into(),
+            ),
+            ("FLEET_RECALL_EMBEDDING_MODEL_SHA256", "a".repeat(64)),
+        ])
+    }
+
+    #[test]
+    fn publication_config_uses_only_its_dedicated_database_identity() {
+        let mut values = serving_values();
+        values.insert(
+            "FLEET_RECALL_PUBLICATION_DATABASE_URL",
+            "postgresql://fleet_publication:reader-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+                .into(),
+        );
+
+        let config = PublicationConfig::from_lookup(|name| values.get(name).cloned())
+            .expect("publication config");
+
+        assert_eq!(
+            config.database_url(),
+            "postgresql://fleet_publication:reader-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+        );
+        assert_eq!(
+            config.database_ssl_policy(),
+            PrivatePostgresSslPolicy::VerifyFull
+        );
+        assert_eq!(config.runtime.database_url, config.database_url);
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("reader-secret"));
+        assert!(!debug.contains("fleet_publication:"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn publication_config_rejects_writer_cross_wiring_without_reflection() {
+        for forbidden_name in PUBLICATION_FORBIDDEN_DATABASE_URL_ENV_NAMES {
+            let mut values = serving_values();
+            values.insert(
+                "FLEET_RECALL_PUBLICATION_DATABASE_URL",
+                "postgresql://fleet_publication:reader-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+                    .into(),
+            );
+            values.insert(
+                forbidden_name,
+                "postgresql://private:private-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+                    .into(),
+            );
+
+            let error = PublicationConfig::from_lookup(|name| values.get(name).cloned())
+                .expect_err("private URL presence must fail closed")
+                .to_string();
+
+            assert!(error.contains(forbidden_name));
+            assert!(error.contains("value is redacted"));
+            for secret in ["private-secret", "reader-secret"] {
+                assert!(!error.contains(secret));
+            }
+        }
+    }
+
+    #[test]
+    fn writer_config_never_falls_back_to_publication_url() {
+        let mut values = serving_values();
+        values.insert(
+            "FLEET_RECALL_PUBLICATION_DATABASE_URL",
+            "postgresql://fleet_publication:reader-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+                .into(),
+        );
+
+        let error = FleetConfig::from_lookup(|name| values.get(name).cloned())
+            .expect_err("private runtime must require the writer URL")
+            .to_string();
+        assert_eq!(
+            error,
+            "configuration error: FLEET_RECALL_DATABASE_URL is required"
+        );
+
+        values.insert(
+            "FLEET_RECALL_DATABASE_URL",
+            "postgresql://writer:writer-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+                .into(),
+        );
+        let config =
+            FleetConfig::from_lookup(|name| values.get(name).cloned()).expect("writer config");
+        assert!(config.database_url.contains("writer:writer-secret"));
+        assert!(!config.database_url.contains("reader-secret"));
+    }
+
+    #[test]
+    fn publication_url_is_canonical_explicit_and_redacted() {
+        let accepted = "postgresql://fleet_publication:secret@cluster.example:26257/fleet_recall?sslmode=verify-full";
+        assert_eq!(
+            validate_publication_database_url(accepted, false).expect("cloud publication URL"),
+            PrivatePostgresSslPolicy::VerifyFull
+        );
+        assert_eq!(
+            validate_publication_database_url(
+                "postgresql://%66leet_publication:secret@cluster.example:26257/fleet_recall?sslmode=verify-full",
+                false,
+            )
+            .expect("decoded canonical publication user"),
+            PrivatePostgresSslPolicy::VerifyFull
+        );
+
+        for rejected in [
+            "postgresql://fleet_publication:secret@cluster.example:26257/other?sslmode=verify-full",
+            "postgresql://fleet_publication:secret@cluster.example:26257/fleet_recall",
+            "postgresql://fleet_publication:secret@cluster.example:26257/fleet_recall?sslmode=require",
+            "postgresql://fleet_publication:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&options=-csearch_path%3Dattacker",
+            "postgresql://fleet_publication:secret@%2Fvar%2Frun%2Fpostgres:26257/fleet_recall?sslmode=verify-full",
+        ] {
+            let error = validate_publication_database_url(rejected, false)
+                .expect_err("closed publication URL must reject alternate authority")
+                .to_string();
+            assert!(!error.contains("fleet_publication:secret"));
+        }
+
+        let local =
+            "postgresql://fleet_publication:secret@127.0.0.1:26257/fleet_recall?sslmode=disable";
+        assert!(validate_publication_database_url(local, false).is_err());
+        assert_eq!(
+            validate_publication_database_url(local, true).expect("explicit local escape"),
+            PrivatePostgresSslPolicy::Disable
+        );
+        assert!(
+            validate_publication_database_url(
+                "postgresql://fleet_publication:secret@127.0.0.1:26257/fleet_recall",
+                true,
+            )
+            .is_err(),
+            "even the local escape must state sslmode explicitly"
+        );
+    }
+
+    #[test]
+    fn publication_url_rejects_wrong_decoded_user_without_reflection() {
+        for (database_url, supplied_user, supplied_password) in [
+            (
+                "postgresql://writer_identity_42:wrong-user-secret-42@cluster.example:26257/fleet_recall?sslmode=verify-full",
+                "writer_identity_42",
+                "wrong-user-secret-42",
+            ),
+            (
+                "postgresql://%66leet_writer_43:encoded-wrong-secret-43@cluster.example:26257/fleet_recall?sslmode=verify-full",
+                "fleet_writer_43",
+                "encoded-wrong-secret-43",
+            ),
+        ] {
+            let error = validate_publication_database_url(database_url, false)
+                .expect_err("wrong decoded publication user must fail closed")
+                .to_string();
+
+            assert!(error.contains(PUBLICATION_POSTGRES_USER));
+            assert!(error.contains("value is redacted"));
+            assert!(!error.contains(database_url));
+            assert!(!error.contains(supplied_user));
+            assert!(!error.contains(supplied_password));
+        }
     }
 
     #[test]

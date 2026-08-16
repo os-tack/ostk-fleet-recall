@@ -13,6 +13,13 @@ use url::Url;
 
 use crate::{FleetError, Result};
 
+/// Fixed database identity reported by every public recall connection.
+pub const PUBLICATION_POSTGRES_APPLICATION_NAME: &str = "ostk-fleet-recall-publication";
+/// The sole database admitted by the public recall connection boundary.
+pub const PUBLICATION_POSTGRES_DATABASE: &str = "fleet_recall";
+/// The sole external principal admitted by the public recall connection boundary.
+pub const PUBLICATION_POSTGRES_USER: &str = "fleet_publication";
+
 /// Exact TLS mode expected from a deployment-validated private database URL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrivatePostgresSslPolicy {
@@ -50,6 +57,48 @@ pub fn private_postgres_connect_options(
         expected_ssl_policy,
         env::vars_os(),
     )
+}
+
+/// Build closed driver options for the dedicated public recall reader.
+///
+/// The application name and canonical database are not caller-selected. The
+/// common closed builder also rejects every case-insensitive ambient `PG*`
+/// variable before `sqlx-postgres` can consult libpq-compatible defaults.
+pub fn publication_postgres_connect_options(
+    database_url: &str,
+    expected_ssl_policy: PrivatePostgresSslPolicy,
+) -> Result<PgConnectOptions> {
+    publication_postgres_connect_options_from_variables(
+        database_url,
+        expected_ssl_policy,
+        env::vars_os(),
+    )
+}
+
+fn publication_postgres_connect_options_from_variables<I>(
+    database_url: &str,
+    expected_ssl_policy: PrivatePostgresSslPolicy,
+    variables: I,
+) -> Result<PgConnectOptions>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let options = private_postgres_connect_options_from_variables(
+        database_url,
+        PUBLICATION_POSTGRES_APPLICATION_NAME,
+        expected_ssl_policy,
+        variables,
+    )?;
+    if options.get_username() != PUBLICATION_POSTGRES_USER
+        || options.get_database() != Some(PUBLICATION_POSTGRES_DATABASE)
+        || options.get_application_name() != Some(PUBLICATION_POSTGRES_APPLICATION_NAME)
+    {
+        return Err(FleetError::Configuration(
+            "public PostgreSQL driver options violate the canonical publication identity; URL is redacted"
+                .into(),
+        ));
+    }
+    Ok(options)
 }
 
 fn private_postgres_connect_options_from_variables<I>(
@@ -155,6 +204,8 @@ mod tests {
 
     const VERIFY_FULL_URL: &str =
         "postgresql://writer:secret@db.example:26257/fleet_recall?sslmode=verify-full";
+    const PUBLICATION_VERIFY_FULL_URL: &str =
+        "postgresql://fleet_publication:secret@db.example:26257/fleet_recall?sslmode=verify-full";
 
     fn variable(name: &str, value: &str) -> (OsString, OsString) {
         (OsString::from(name), OsString::from(value))
@@ -311,6 +362,87 @@ mod tests {
                 .is_err(),
                 "accepted incomplete identity"
             );
+        }
+    }
+
+    #[test]
+    fn publication_options_pin_database_application_and_tls() {
+        let options = publication_postgres_connect_options_from_variables(
+            PUBLICATION_VERIFY_FULL_URL,
+            PrivatePostgresSslPolicy::VerifyFull,
+            [],
+        )
+        .expect("publication options");
+
+        assert_eq!(options.get_username(), PUBLICATION_POSTGRES_USER);
+        assert_eq!(options.get_database(), Some(PUBLICATION_POSTGRES_DATABASE));
+        assert_eq!(
+            options.get_application_name(),
+            Some(PUBLICATION_POSTGRES_APPLICATION_NAME)
+        );
+        assert!(matches!(options.get_ssl_mode(), PgSslMode::VerifyFull));
+
+        let encoded_options = publication_postgres_connect_options_from_variables(
+            "postgresql://%66leet_publication:secret@db.example:26257/fleet_recall?sslmode=verify-full",
+            PrivatePostgresSslPolicy::VerifyFull,
+            [],
+        )
+        .expect("decoded canonical publication user");
+        assert_eq!(encoded_options.get_username(), PUBLICATION_POSTGRES_USER);
+    }
+
+    #[test]
+    fn publication_options_reject_cross_database_and_case_insensitive_pg_ambient_input() {
+        let wrong_database = "postgresql://fleet_publication:do-not-print@db.example:26257/other?sslmode=verify-full";
+        let error = publication_postgres_connect_options_from_variables(
+            wrong_database,
+            PrivatePostgresSslPolicy::VerifyFull,
+            [],
+        )
+        .expect_err("alternate database must fail closed")
+        .to_string();
+        assert!(!error.contains("do-not-print"));
+
+        let error = publication_postgres_connect_options_from_variables(
+            PUBLICATION_VERIFY_FULL_URL,
+            PrivatePostgresSslPolicy::VerifyFull,
+            [variable("pGhOsT", "do-not-print-host")],
+        )
+        .expect_err("ambient PG input must fail closed")
+        .to_string();
+        assert!(error.contains("\"pGhOsT\""));
+        assert!(!error.contains("do-not-print-host"));
+        assert!(!error.contains("fleet_publication:secret"));
+    }
+
+    #[test]
+    fn publication_options_reject_wrong_decoded_user_without_reflection() {
+        for (database_url, supplied_user, supplied_password) in [
+            (
+                "postgresql://writer_identity_42:wrong-user-secret-42@db.example:26257/fleet_recall?sslmode=verify-full",
+                "writer_identity_42",
+                "wrong-user-secret-42",
+            ),
+            (
+                "postgresql://%66leet_writer_43:encoded-wrong-secret-43@db.example:26257/fleet_recall?sslmode=verify-full",
+                "fleet_writer_43",
+                "encoded-wrong-secret-43",
+            ),
+        ] {
+            let result = publication_postgres_connect_options_from_variables(
+                database_url,
+                PrivatePostgresSslPolicy::VerifyFull,
+                [],
+            );
+            let error = match result {
+                Ok(_) => panic!("wrong decoded publication user must fail closed"),
+                Err(error) => error.to_string(),
+            };
+
+            assert!(error.contains("URL is redacted"));
+            assert!(!error.contains(database_url));
+            assert!(!error.contains(supplied_user));
+            assert!(!error.contains(supplied_password));
         }
     }
 }

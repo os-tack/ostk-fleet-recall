@@ -47,6 +47,8 @@ activation_password='local-activation-member-proof-password'
 runtime_password='local-runtime-member-proof-password'
 reconciliation_password='local-conflict-reconciliation-member-proof-password'
 successor_password='local-successor-activation-member-proof-password'
+publication_password='local-publication-reader-proof-password'
+publication_admin_secret_file="$proof_dir/publication-admin-url"
 
 server_pid_exists() {
     local pid=$1
@@ -101,6 +103,13 @@ cleanup() {
     trap - EXIT
     trap '' INT TERM
     set +e
+    if test -e "$publication_admin_secret_file"; then
+        rm -f -- "$publication_admin_secret_file" 2>/dev/null || true
+        if test -e "$publication_admin_secret_file"; then
+            echo "could not remove publication admin secret file" >&2
+            cleanup_failed=1
+        fi
+    fi
     if test "$server_was_spawned" -eq 1 \
         && test "$server_pid_was_validated" -ne 1; then
         echo "spawned CockroachDB did not publish its exact shell-owned PID" >&2
@@ -293,12 +302,96 @@ assert_public_routine_defaults() {
           AND grantee = 'public'" "$expected"
 }
 
+publication_scalar() {
+    "$crdb" sql --url="$publication_url" --format=tsv --execute="$1" \
+        | tail -n +2
+}
+
+expect_publication_denied() {
+    local label=$1
+    local statement=$2
+    local output
+    if output=$("$crdb" sql --url="$publication_url" \
+        --execute="$statement" 2>&1); then
+        fail "$label unexpectedly succeeded for fleet_publication"
+    fi
+    if grep -Fq "$publication_password" <<<"$output"; then
+        fail "$label disclosed the publication credential"
+    fi
+    if grep -Eiq 'postgres(ql)?://' <<<"$output"; then
+        fail "$label disclosed a database URL"
+    fi
+    if ! grep -Eiq \
+        'privilege|permission|not have.*grant|must have.*(CREATEROLE|admin option)|must be owner' \
+        <<<"$output"; then
+        echo "$output" >&2
+        fail "$label failed for a reason other than authorization"
+    fi
+}
+
 apply_reconciliation_policy() {
     "$crdb" sql --url="$root_url" < "$reconciliation_policy"
 }
 
 apply_successor_policy() {
     "$crdb" sql --url="$root_url" < "$successor_policy"
+}
+
+apply_publication_policy() {
+    "$crdb" sql --url="$root_url" < "$publication_policy"
+}
+
+# Reapply the publication policy while malformed temporary names shadow its
+# migration history and every reader grant target. The policy must remain
+# pinned to public relations and must not grant on the temporary namespace.
+apply_publication_policy_with_temp_shadows() {
+    {
+        printf '%s\n' '
+SET experimental_enable_temp_tables = on;
+CREATE TEMP TABLE _sqlx_migrations (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_corpus_models (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_chunks (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_claim_embeddings (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_claim_support (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_claims (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_conflict_members (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_conflicts (id INT8 PRIMARY KEY);
+'
+        sed -n '1,$p' "$publication_policy"
+        printf '%s\n' '
+SELECT IF(
+    count(*) = 2
+        AND count(DISTINCT privilege_type) = 2
+        AND COALESCE(bool_and(
+            database_name = '\''fleet_recall'\''
+            AND object_type = '\''schema'\''
+            AND object_name IS NULL
+            AND privilege_type IN ('\''CREATE'\'', '\''USAGE'\'')
+            AND NOT is_grantable
+        ), false),
+    1:::INT8,
+    CAST(concat(
+        '\''temporary PUBLIC schema baseline differs: observed='\'',
+        count(*)::STRING
+    ) AS INT8)
+) AS publication_reader_temp_public_baseline_postcondition
+FROM [SHOW GRANTS FOR public]
+WHERE grantee = '\''public'\''
+  AND schema_name LIKE '\''pg_temp_%'\'';
+
+SELECT IF(
+    count(*) = 0,
+    1:::INT8,
+    CAST(concat(
+        '\''temporary publication shadow received grants: observed='\'',
+        count(*)::STRING
+    ) AS INT8)
+) AS publication_reader_temp_shadow_postcondition
+FROM [SHOW GRANTS FOR fleet_publication_reader]
+WHERE grantee = '\''fleet_publication_reader'\''
+  AND schema_name LIKE '\''pg_temp_%'\'';
+'
+    } | "$crdb" sql --url="$root_url"
 }
 
 apply_successor_policy_in_database() {
@@ -692,6 +785,458 @@ inventory_other_database_public_application_authority() {
     done <<<"$databases"
 }
 
+# The publication SQL policy is intentionally database-local. This read-only
+# deployment audit expands the boundary to every other database and every
+# application schema. Before the logical reader exists, mode=principal audits
+# only the fixed login; mode=full audits both fixed subjects after first apply.
+audit_other_database_publication_subject_authority() {
+    local mode=$1
+    local subject_grants
+    local subject_defaults
+    local subject_names
+    local databases
+    local database
+    local schemas
+    local schema_name
+    local schema_identifier
+    local schema_reader_default
+    local rows
+    local row
+    case "$mode" in
+        principal)
+            subject_names="'fleet_publication'"
+            subject_grants="
+                SELECT 'fleet_publication' AS subject,
+                       database_name, schema_name, object_name, object_type,
+                       grantee, privilege_type, is_grantable
+                FROM [SHOW GRANTS FOR fleet_publication]
+            "
+            subject_defaults="
+                SELECT 'fleet_publication' AS subject,
+                       role, for_all_roles, object_type, grantee,
+                       privilege_type, is_grantable
+                FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE fleet_publication]
+            "
+            ;;
+        full)
+            subject_names="'fleet_publication_reader', 'fleet_publication'"
+            subject_grants="
+                SELECT 'fleet_publication_reader' AS subject,
+                       database_name, schema_name, object_name, object_type,
+                       grantee, privilege_type, is_grantable
+                FROM [SHOW GRANTS FOR fleet_publication_reader]
+                UNION ALL
+                SELECT 'fleet_publication' AS subject,
+                       database_name, schema_name, object_name, object_type,
+                       grantee, privilege_type, is_grantable
+                FROM [SHOW GRANTS FOR fleet_publication]
+            "
+            subject_defaults="
+                SELECT 'fleet_publication_reader' AS subject,
+                       role, for_all_roles, object_type, grantee,
+                       privilege_type, is_grantable
+                FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE
+                      fleet_publication_reader]
+                UNION ALL
+                SELECT 'fleet_publication' AS subject,
+                       role, for_all_roles, object_type, grantee,
+                       privilege_type, is_grantable
+                FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE fleet_publication]
+            "
+            ;;
+        *) fail "unknown publication external-audit mode: $mode" ;;
+    esac
+
+    if ! rows=$(root_sql_in_database fleet_recall "
+        WITH subject_grant AS ($subject_grants)
+        SELECT 'cluster_grant:' || subject || ':' || grantee || ':' ||
+               object_type || ':' || COALESCE(object_name, '') || ':' ||
+               privilege_type || ':' ||
+               CASE WHEN is_grantable THEN 'grantable'
+                    ELSE 'not_grantable' END
+        FROM subject_grant
+        WHERE grantee = subject
+          AND database_name IS NULL
+        ORDER BY 1
+    " | tail -n +2); then
+        fail "external publication subject audit could not inspect cluster grants"
+    fi
+    while IFS= read -r row; do
+        test -n "$row" || continue
+        printf '%s\n' "$row"
+    done <<<"$rows"
+
+    if ! databases=$(root_sql_in_database fleet_recall \
+        'SELECT database_name FROM [SHOW DATABASES] ORDER BY database_name' \
+        | tail -n +2); then
+        fail "external publication subject audit could not enumerate databases"
+    fi
+    while IFS= read -r database; do
+        test -n "$database" || continue
+        test "$database" != 'fleet_recall' || continue
+        if ! rows=$(root_sql_in_database "$database" "
+            WITH subject_grant AS ($subject_grants)
+            SELECT 'grant:' || subject || ':' || object_type || ':' ||
+                   COALESCE(schema_name, '') || ':' ||
+                   COALESCE(object_name, '') || ':' || privilege_type || ':' ||
+                   CASE WHEN is_grantable THEN 'grantable'
+                        ELSE 'not_grantable' END
+            FROM subject_grant
+            WHERE grantee = subject
+              AND database_name = pg_catalog.current_database()
+            UNION ALL
+            SELECT 'database_owner:' || owner_role.rolname || '::' ||
+                   database_object.datname || ':OWNER:owner'
+            FROM pg_catalog.pg_database AS database_object
+            JOIN pg_catalog.pg_roles AS owner_role
+              ON owner_role.oid = database_object.datdba
+            WHERE database_object.datname = pg_catalog.current_database()
+              AND owner_role.rolname IN ($subject_names)
+            UNION ALL
+            SELECT 'schema_owner:' || owner_role.rolname || ':' ||
+                   schema_object.nspname || '::OWNER:owner'
+            FROM pg_catalog.pg_namespace AS schema_object
+            JOIN pg_catalog.pg_roles AS owner_role
+              ON owner_role.oid = schema_object.nspowner
+            WHERE owner_role.rolname IN ($subject_names)
+            UNION ALL
+            SELECT 'relation_owner:' || owner_role.rolname || ':' ||
+                   relation_schema.nspname || ':' || relation_object.relname ||
+                   ':OWNER:owner'
+            FROM pg_catalog.pg_class AS relation_object
+            JOIN pg_catalog.pg_namespace AS relation_schema
+              ON relation_schema.oid = relation_object.relnamespace
+            JOIN pg_catalog.pg_roles AS owner_role
+              ON owner_role.oid = relation_object.relowner
+            WHERE relation_object.relkind IN ('r', 'S', 'v', 'm', 'p')
+              AND owner_role.rolname IN ($subject_names)
+            UNION ALL
+            SELECT 'function_owner:' || owner_role.rolname || ':' ||
+                   function_schema.nspname || ':' || function_object.proname ||
+                   ':OWNER:owner'
+            FROM pg_catalog.pg_proc AS function_object
+            JOIN pg_catalog.pg_namespace AS function_schema
+              ON function_schema.oid = function_object.pronamespace
+            JOIN pg_catalog.pg_roles AS owner_role
+              ON owner_role.oid = function_object.proowner
+            WHERE owner_role.rolname IN ($subject_names)
+            UNION ALL
+            SELECT 'type_owner:' || owner_role.rolname || ':' ||
+                   type_schema.nspname || ':' || type_object.typname ||
+                   ':OWNER:owner'
+            FROM pg_catalog.pg_type AS type_object
+            JOIN pg_catalog.pg_namespace AS type_schema
+              ON type_schema.oid = type_object.typnamespace
+            JOIN pg_catalog.pg_roles AS owner_role
+              ON owner_role.oid = type_object.typowner
+            WHERE owner_role.rolname IN ($subject_names)
+            ORDER BY 1
+        " | tail -n +2); then
+            fail "external publication subject audit could not inspect $database"
+        fi
+        while IFS= read -r row; do
+            test -n "$row" || continue
+            printf '%s:%s\n' "$database" "$row"
+        done <<<"$rows"
+
+        # v26.2.3 rejects ALTER DEFAULT PRIVILEGES and user schema DDL in the
+        # system database. Current grants and ownership there remain audited.
+        test "$database" != 'system' || continue
+
+        if ! rows=$(root_sql_in_database "$database" "
+            WITH subject_default AS ($subject_defaults)
+            SELECT 'default:database:' || subject || ':' ||
+                   COALESCE(role, '') || ':' || for_all_roles::STRING || ':' ||
+                   object_type || ':' || grantee || ':' || privilege_type || ':' ||
+                   CASE WHEN is_grantable THEN 'grantable'
+                        ELSE 'not_grantable' END
+            FROM subject_default
+            WHERE object_type IN (
+                'schemas', 'routines', 'tables', 'sequences', 'types'
+            )
+              AND (
+                  role = subject
+                  AND NOT for_all_roles
+                  AND grantee = subject
+                  AND privilege_type = 'ALL'
+                  AND is_grantable
+              ) IS NOT TRUE
+            ORDER BY 1
+        " | tail -n +2); then
+            fail "external publication subject audit could not inspect defaults in $database"
+        fi
+        while IFS= read -r row; do
+            test -n "$row" || continue
+            printf '%s:%s\n' "$database" "$row"
+        done <<<"$rows"
+
+        if ! schemas=$(root_sql_in_database "$database" "
+            SELECT nspname, quote_ident(nspname)
+            FROM pg_catalog.pg_namespace
+            WHERE nspname NOT IN (
+                'pg_catalog', 'information_schema',
+                'crdb_internal', 'pg_extension'
+            )
+              AND nspname NOT LIKE 'pg_temp_%'
+            ORDER BY nspname
+        " | tail -n +2); then
+            fail "external publication subject audit could not enumerate schemas in $database"
+        fi
+        while IFS=$'\t' read -r schema_name schema_identifier; do
+            test -n "$schema_name" || continue
+            test -n "$schema_identifier" \
+                || fail "external publication subject audit found an unquotable schema in $database"
+            schema_reader_default=''
+            if test "$mode" = full; then
+                schema_reader_default="
+                    UNION ALL
+                    SELECT 'fleet_publication_reader' AS subject,
+                           role, for_all_roles, object_type, grantee,
+                           privilege_type, is_grantable
+                    FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE
+                          fleet_publication_reader IN SCHEMA $schema_identifier]
+                "
+            fi
+            if ! rows=$(root_sql_in_database "$database" "
+                WITH subject_default AS (
+                    SELECT 'fleet_publication' AS subject,
+                           role, for_all_roles, object_type, grantee,
+                           privilege_type, is_grantable
+                    FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE
+                          fleet_publication IN SCHEMA $schema_identifier]
+                    $schema_reader_default
+                )
+                SELECT subject || ':' || COALESCE(role, '') || ':' ||
+                       for_all_roles::STRING || ':' || object_type || ':' ||
+                       grantee || ':' || privilege_type || ':' ||
+                       CASE WHEN is_grantable THEN 'grantable'
+                            ELSE 'not_grantable' END
+                FROM subject_default
+                WHERE object_type IN (
+                    'schemas', 'routines', 'tables', 'sequences', 'types'
+                )
+                  AND (
+                      role = subject
+                      AND NOT for_all_roles
+                      AND grantee = subject
+                      AND privilege_type = 'ALL'
+                      AND is_grantable
+                  ) IS NOT TRUE
+                ORDER BY 1
+            " | tail -n +2); then
+                fail "external publication subject audit could not inspect $database.$schema_name defaults"
+            fi
+            while IFS= read -r row; do
+                test -n "$row" || continue
+                printf '%s:default:schema:%s:%s\n' \
+                    "$database" "$schema_name" "$row"
+            done <<<"$rows"
+        done <<<"$schemas"
+    done <<<"$databases"
+}
+
+# PUBLIC is inherited by both publication subjects. Inventory every other
+# database's application grants plus every non-intrinsic database- or schema-
+# scoped future default. Only ordinary CONNECT/TEMPORARY/public USAGE and exact
+# virtual/system fallbacks are ambient exceptions.
+inventory_other_database_publication_public_authority() {
+    local databases
+    local database
+    local schemas
+    local schema_name
+    local schema_identifier
+    local rows
+    local row
+    if ! rows=$(root_sql_in_database fleet_recall "
+        SELECT 'cluster_grant:' || object_type || ':' ||
+               COALESCE(object_name, '') || ':' || privilege_type || ':' ||
+               CASE WHEN is_grantable THEN 'grantable'
+                    ELSE 'not_grantable' END
+        FROM [SHOW GRANTS FOR public]
+        WHERE grantee = 'public'
+          AND database_name IS NULL
+        ORDER BY 1
+    " | tail -n +2); then
+        fail "external publication PUBLIC audit could not inspect cluster grants"
+    fi
+    while IFS= read -r row; do
+        test -n "$row" || continue
+        printf '%s\n' "$row"
+    done <<<"$rows"
+    if ! databases=$(root_sql_in_database fleet_recall \
+        'SELECT database_name FROM [SHOW DATABASES] ORDER BY database_name' \
+        | tail -n +2); then
+        fail "external publication PUBLIC audit could not enumerate databases"
+    fi
+    while IFS= read -r database; do
+        test -n "$database" || continue
+        test "$database" != 'fleet_recall' || continue
+        if ! rows=$(root_sql_in_database "$database" "
+            SELECT object_type || ':' || COALESCE(schema_name, '') || ':' ||
+                   COALESCE(object_name, '') || ':' || privilege_type || ':' ||
+                   CASE WHEN is_grantable THEN 'grantable'
+                        ELSE 'not_grantable' END
+            FROM [SHOW GRANTS FOR public]
+            WHERE grantee = 'public'
+              AND database_name = pg_catalog.current_database()
+              AND NOT (
+                  (object_type = 'database'
+                      AND privilege_type IN ('CONNECT', 'TEMPORARY')
+                      AND NOT is_grantable)
+                  OR (object_type = 'schema'
+                      AND schema_name = 'public'
+                      AND object_name IS NULL
+                      AND privilege_type = 'USAGE'
+                      AND NOT is_grantable)
+                  OR (
+                      schema_name IN (
+                          'crdb_internal', 'information_schema',
+                          'pg_catalog', 'pg_extension'
+                      )
+                      AND NOT is_grantable
+                      AND (
+                          (object_type = 'schema'
+                              AND object_name IS NULL
+                              AND privilege_type = 'USAGE')
+                          OR (object_type = 'table'
+                              AND object_name IS NOT NULL
+                              AND privilege_type = 'SELECT')
+                          OR (object_type = 'type'
+                              AND schema_name = 'pg_catalog'
+                              AND object_name IS NOT NULL
+                              AND privilege_type = 'USAGE')
+                      )
+                  )
+                  OR (
+                      pg_catalog.current_database() = 'system'
+                      AND NOT is_grantable
+                      AND (
+                          (object_type = 'schema'
+                              AND schema_name = 'public'
+                              AND object_name IS NULL
+                              AND privilege_type = 'CREATE')
+                          OR (object_type = 'table'
+                              AND schema_name = 'public'
+                              AND object_name = 'comments'
+                              AND privilege_type = 'SELECT')
+                      )
+                  )
+              )
+            ORDER BY object_type, schema_name, object_name, privilege_type
+        " | tail -n +2); then
+            fail "external publication PUBLIC audit could not inspect $database"
+        fi
+        while IFS= read -r row; do
+            test -n "$row" || continue
+            printf '%s:%s\n' "$database" "$row"
+        done <<<"$rows"
+
+        # System current grants are audited above, but v26.2.3 does not admit
+        # user default-privilege or schema mutations in the system database.
+        test "$database" != 'system' || continue
+
+        if ! rows=$(root_sql_in_database "$database" "
+            SELECT 'default:database:' || COALESCE(role, '') || ':' ||
+                   for_all_roles::STRING || ':' || object_type || ':' ||
+                   grantee || ':' || privilege_type || ':' ||
+                   CASE WHEN is_grantable THEN 'grantable'
+                        ELSE 'not_grantable' END
+            FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public]
+            WHERE object_type IN (
+                'schemas', 'routines', 'tables', 'sequences', 'types'
+            )
+              AND (
+                  grantee = 'public'
+                  AND NOT is_grantable
+                  AND object_type = 'types'
+                  AND privilege_type = 'USAGE'
+              ) IS NOT TRUE
+              AND (
+                  role IS NULL
+                  AND for_all_roles
+                  AND grantee = 'public'
+                  AND object_type = 'routines'
+                  AND privilege_type = 'EXECUTE'
+                  AND NOT is_grantable
+              ) IS NOT TRUE
+              AND (
+                  role = 'fleet_publication_reader'
+                  AND NOT for_all_roles
+                  AND grantee = 'public'
+                  AND object_type = 'routines'
+                  AND privilege_type = 'EXECUTE'
+                  AND NOT is_grantable
+              ) IS NOT TRUE
+            ORDER BY 1
+        " | tail -n +2); then
+            fail "external publication PUBLIC audit could not inspect defaults in $database"
+        fi
+        while IFS= read -r row; do
+            test -n "$row" || continue
+            printf '%s:%s\n' "$database" "$row"
+        done <<<"$rows"
+
+        if ! schemas=$(root_sql_in_database "$database" "
+            SELECT nspname, quote_ident(nspname)
+            FROM pg_catalog.pg_namespace
+            WHERE nspname NOT IN (
+                'pg_catalog', 'information_schema',
+                'crdb_internal', 'pg_extension'
+            )
+              AND nspname NOT LIKE 'pg_temp_%'
+            ORDER BY nspname
+        " | tail -n +2); then
+            fail "external publication PUBLIC audit could not enumerate schemas in $database"
+        fi
+        while IFS=$'\t' read -r schema_name schema_identifier; do
+            test -n "$schema_name" || continue
+            test -n "$schema_identifier" \
+                || fail "external publication PUBLIC audit found an unquotable schema in $database"
+            if ! rows=$(root_sql_in_database "$database" "
+                SELECT COALESCE(role, '') || ':' || for_all_roles::STRING || ':' ||
+                       object_type || ':' || grantee || ':' || privilege_type || ':' ||
+                       CASE WHEN is_grantable THEN 'grantable'
+                            ELSE 'not_grantable' END
+                FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public
+                      IN SCHEMA $schema_identifier]
+                WHERE object_type IN (
+                    'schemas', 'routines', 'tables', 'sequences', 'types'
+                )
+                  AND (
+                      grantee = 'public'
+                      AND NOT is_grantable
+                      AND object_type = 'types'
+                      AND privilege_type = 'USAGE'
+                  ) IS NOT TRUE
+                  AND (
+                      role IS NULL
+                      AND for_all_roles
+                      AND grantee = 'public'
+                      AND object_type = 'routines'
+                      AND privilege_type = 'EXECUTE'
+                      AND NOT is_grantable
+                  ) IS NOT TRUE
+                  AND (
+                      role = 'fleet_publication_reader'
+                      AND NOT for_all_roles
+                      AND grantee = 'public'
+                      AND object_type = 'routines'
+                      AND privilege_type = 'EXECUTE'
+                      AND NOT is_grantable
+                  ) IS NOT TRUE
+                ORDER BY 1
+            " | tail -n +2); then
+                fail "external publication PUBLIC audit could not inspect $database.$schema_name defaults"
+            fi
+            while IFS= read -r row; do
+                test -n "$row" || continue
+                printf '%s:default:schema:%s:%s\n' \
+                    "$database" "$schema_name" "$row"
+            done <<<"$rows"
+        done <<<"$schemas"
+    done <<<"$databases"
+}
+
 # Both one-shot policies are safe in a reused administrator session only if
 # they pin built-in resolution first, bind themselves to fleet_recall, fully
 # qualify every application relation, and clear the complete v26.2 role-option
@@ -865,11 +1410,73 @@ unsupported_query_in_function_body=$(awk '
 assert_exact "SHOW/virtual-table-free reconciliation policy function bodies" \
     "$unsupported_query_in_function_body" ''
 
+# The official publication phase is credited only to the independently frozen
+# SQL policy, session-pinning source, and connected product test reviewed for
+# PUBLIC-03.
+publication_policy="$repo_root/deploy/cockroach/publication-reader-role-grants.sql"
+publication_store_source="$repo_root/src/store/cockroach.rs"
+publication_live_test_source="$repo_root/tests/publication_reader_live.rs"
+if ! publication_policy_digest=$(shasum -a 256 "$publication_policy" \
+    | awk 'NR == 1 { print $1 }'); then
+    fail "could not hash the publication-reader policy"
+fi
+assert_exact "frozen publication-reader policy digest" \
+    "$publication_policy_digest" \
+    'ff3ada75aba9443875efb1f430a14829ef864b3f7409ae5d23f7bd381cb65226'
+if ! publication_store_digest=$(shasum -a 256 "$publication_store_source" \
+    | awk 'NR == 1 { print $1 }'); then
+    fail "could not hash the publication-reader session-pinning source"
+fi
+assert_exact "frozen publication-reader session-pinning source digest" \
+    "$publication_store_digest" \
+    'b7b21ea151219f518c926e22e56c896c3a9dd09ea99bd08599d09b3f01c4af3e'
+if ! publication_live_test_digest=$(shasum -a 256 "$publication_live_test_source" \
+    | awk 'NR == 1 { print $1 }'); then
+    fail "could not hash the publication-reader connected test"
+fi
+assert_exact "frozen publication-reader connected-test digest" \
+    "$publication_live_test_digest" \
+    'cad2d1e970c4639c1c2d783e65097dee89845088c773310dc03700d200220888'
+publication_policy_first_statement=$(awk '
+    /^[[:space:]]*--/ || /^[[:space:]]*$/ { next }
+    { print; exit }
+' "$publication_policy")
+assert_exact "publication policy first statement" \
+    "$publication_policy_first_statement" \
+    'SET search_path = pg_catalog, public, pg_temp;'
+publication_current_database_preflight=$(grep -F \
+    "IF pg_catalog.current_database() <> 'fleet_recall' THEN" \
+    "$publication_policy")
+assert_exact "publication fleet_recall current-database preflight" \
+    "$publication_current_database_preflight" \
+    "    IF pg_catalog.current_database() <> 'fleet_recall' THEN"
+publication_role_option_hardening=$(sed -n \
+    '/^ALTER ROLE fleet_publication_reader WITH$/,/^    NOVIEWCLUSTERSETTING;$/p' \
+    "$publication_policy")
+expected_publication_role_option_hardening='ALTER ROLE fleet_publication_reader WITH
+    NOBYPASSRLS
+    NOCANCELQUERY
+    NOCONTROLCHANGEFEED
+    NOCONTROLJOB
+    NOCREATEDB
+    NOCREATELOGIN
+    NOCREATEROLE
+    NOLOGIN
+    NOMODIFYCLUSTERSETTING
+    NOREPLICATION
+    SQLLOGIN
+    NOVIEWACTIVITY
+    NOVIEWACTIVITYREDACTED
+    NOVIEWCLUSTERSETTING;'
+assert_exact "complete publication v26.2 direct role-option hardening" \
+    "$publication_role_option_hardening" \
+    "$expected_publication_role_option_hardening"
+
 # Helpers whose output is evidence must finish in a standalone assignment.
 # Passing a substitution directly to assert_exact can mask a failed helper when
 # its expected value is empty, so freeze that source-level fail-closed seam.
 masked_evidence_helper_assertions=$(grep -En \
-    '^[[:space:]]*"[$][(](audit_other_database_successor_authority|inventory_other_database_public_application_authority|reconciliation_table_fingerprints|successor_table_fingerprints|legacy_registry_fingerprints)[)]"' \
+    '^[[:space:]]*"[$][(](audit_other_database_successor_authority|inventory_other_database_public_application_authority|audit_other_database_publication_subject_authority|inventory_other_database_publication_public_authority|reconciliation_table_fingerprints|successor_table_fingerprints|legacy_registry_fingerprints)([[:space:]][^)]*)?[)]"' \
     "$script_dir/registry-activation-cli.sh" || true)
 assert_exact "standalone evidence helper assignments" \
     "$masked_evidence_helper_assertions" ''
@@ -891,6 +1498,30 @@ qualified_external_audit_current_database_count=$(grep -Eo \
     <<<"$external_authority_helper_source" | wc -l | tr -d ' ')
 assert_exact "complete external-audit current_database qualification" \
     "$qualified_external_audit_current_database_count" '6'
+
+publication_external_helper_source=$(awk '
+    /^(audit_other_database_publication_subject_authority|inventory_other_database_publication_public_authority)\(\) \{/ {
+        capture = 1
+    }
+    capture { print }
+    capture && /^}$/ { capture = 0 }
+' "$script_dir/registry-activation-cli.sh")
+unqualified_publication_audit_current_database=$(awk '
+    {
+        scan = $0
+        gsub(/pg_catalog[.]current_database[(][)]/, "", scan)
+        if (scan ~ /current_database[(][)]/) {
+            print NR ":" $0
+        }
+    }
+' <<<"$publication_external_helper_source")
+assert_exact "qualified publication external-audit current_database calls" \
+    "$unqualified_publication_audit_current_database" ''
+qualified_publication_audit_current_database_count=$(grep -Eo \
+    'pg_catalog[.]current_database[(][)]' \
+    <<<"$publication_external_helper_source" | wc -l | tr -d ' ')
+assert_exact "complete publication external-audit current_database qualification" \
+    "$qualified_publication_audit_current_database_count" '4'
 
 mkdir -p "$artifact_dir"
 "$crdb" cert create-ca --certs-dir="$cert_dir" \
@@ -3695,6 +4326,657 @@ if ! grep -Eq 'span(s)?:.*\[/1[^]]*-[[:space:]]*/9\]' <<<"$prefix_explain"; then
     printf '%s\n' "$prefix_explain" >&2
     fail "migration-prefix preflight did not retain the bounded 1..9 span"
 fi
+
+# PUBLIC-03 is the absolute final database phase. Earlier private workflows are
+# complete before this point because the reader policy resets inherited PUBLIC
+# application authority. Build and discover the exact ignored product test in
+# the normal Cargo environment, then later execute that binary directly under
+# an empty environment containing only the publication contract.
+publication_live_test_name=publication_reader_executes_the_real_recall_surface
+publication_live_build=$(cargo test --locked --test publication_reader_live \
+    --no-run --message-format=json)
+publication_live_test_binary=$(jq -rsc \
+    --arg target_name 'publication_reader_live' '
+    [
+        .[]
+        | select(
+            .reason == "compiler-artifact"
+            and .target.name == $target_name
+            and .target.kind == ["test"]
+            and .profile.test == true
+            and (.executable | type) == "string"
+        )
+        | .executable
+    ]
+    | if length == 1 then .[0] else empty end
+' <<<"$publication_live_build")
+test -n "$publication_live_test_binary" \
+    || fail "locked publication build did not expose exactly one test executable"
+publication_live_test_binary_dir=$(CDPATH='' cd -- \
+    "$(dirname -- "$publication_live_test_binary")" && pwd)
+publication_live_test_binary="$publication_live_test_binary_dir/$(
+    basename -- "$publication_live_test_binary"
+)"
+test -x "$publication_live_test_binary" \
+    || fail "locked publication test executable is unavailable"
+publication_live_listing=$("$publication_live_test_binary" --list)
+require_discovered_test "$publication_live_listing" "$publication_live_test_name"
+
+# The fixed principal is externally managed and starts without authentication.
+# Role creation synthesizes a creator-scoped PUBLIC routine default in every
+# mutable database, including proof databases left by earlier phases. Freeze
+# SHOW DATABASES, skip only system, and clean every known existing grantor plus
+# the new principal under temporary root membership before first policy apply.
+assert_root_scalar "publication target absent before bootstrap" \
+    "SELECT count(*)::STRING FROM [SHOW USERS]
+     WHERE username = 'fleet_publication_reader'" '0'
+"$crdb" sql --url="$root_url" --execute="
+    CREATE USER fleet_publication;
+    ALTER USER fleet_publication WITH NOLOGIN PASSWORD NULL;
+    GRANT
+        fleet_runtime,
+        fleet_control_bootstrap,
+        fleet_registry_activation,
+        fleet_registry_successor_activation,
+        fleet_conflict_reconciliation,
+        proof_control_cli,
+        proof_activation_cli,
+        proof_runtime_cli,
+        proof_successor,
+        proof_reconciliation_cli,
+        fleet_publication
+    TO root;
+" >/dev/null
+assert_root_scalar "publication principal exact bootstrap options" \
+    "SELECT count(*)::STRING FROM [SHOW USERS]
+     WHERE username = 'fleet_publication'
+       AND options::STRING = '{NOLOGIN}'" '1'
+if ! publication_mutable_databases=$(root_sql_in_database fleet_recall \
+    "SELECT database_name FROM [SHOW DATABASES]
+     WHERE database_name <> 'system'
+     ORDER BY database_name" | tail -n +2); then
+    fail "publication default cleanup could not enumerate mutable databases"
+fi
+test -n "$publication_mutable_databases" \
+    || fail "publication default cleanup enumerated no mutable database"
+grep -Fxq 'fleet_recall' <<<"$publication_mutable_databases" \
+    || fail "publication default cleanup omitted fleet_recall"
+if grep -Fxq 'system' <<<"$publication_mutable_databases"; then
+    fail "publication default cleanup admitted the immutable system database"
+fi
+publication_known_grantors="
+        'fleet_runtime',
+        'fleet_control_bootstrap',
+        'fleet_registry_activation',
+        'fleet_registry_successor_activation',
+        'fleet_conflict_reconciliation',
+        'proof_control_cli',
+        'proof_activation_cli',
+        'proof_runtime_cli',
+        'proof_successor',
+        'proof_reconciliation_cli',
+        'fleet_publication'
+"
+while IFS= read -r database; do
+    test -n "$database" || continue
+    principal_public_default_before=$(root_sql_in_database "$database" "
+        SELECT count(*)::STRING
+        FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public]
+        WHERE role = 'fleet_publication'
+          AND NOT for_all_roles
+          AND grantee = 'public'
+          AND object_type = 'routines'
+          AND privilege_type = 'EXECUTE'
+          AND NOT is_grantable
+    " | tail -n +2) \
+        || fail "publication principal pre-clean default audit failed in $database"
+    assert_exact "publication principal pre-clean routine default in $database" \
+        "$principal_public_default_before" '1'
+    root_sql_in_database "$database" '
+ALTER DEFAULT PRIVILEGES FOR ROLE
+    root,
+    admin,
+    fleet_runtime,
+    fleet_control_bootstrap,
+    fleet_registry_activation,
+    fleet_registry_successor_activation,
+    fleet_conflict_reconciliation,
+    proof_control_cli,
+    proof_activation_cli,
+    proof_runtime_cli,
+    proof_successor,
+    proof_reconciliation_cli,
+    fleet_publication
+REVOKE EXECUTE ON ROUTINES FROM public;
+ALTER DEFAULT PRIVILEGES FOR ALL ROLES
+REVOKE EXECUTE ON ROUTINES FROM public;
+REVOKE CREATE ON SCHEMA public FROM public;
+' >/dev/null \
+        || fail "publication default cleanup failed in $database"
+    principal_public_default_after=$(root_sql_in_database "$database" "
+        SELECT count(*)::STRING
+        FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public]
+        WHERE role = 'fleet_publication'
+          AND NOT for_all_roles
+          AND grantee = 'public'
+          AND object_type = 'routines'
+          AND privilege_type = 'EXECUTE'
+          AND NOT is_grantable
+    " | tail -n +2) \
+        || fail "publication principal post-clean default audit failed in $database"
+    assert_exact "publication principal post-clean routine default in $database" \
+        "$principal_public_default_after" '0'
+    known_public_defaults_after=$(root_sql_in_database "$database" "
+        SELECT count(*)::STRING
+        FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public]
+        WHERE role IN ($publication_known_grantors)
+          AND NOT for_all_roles
+          AND grantee = 'public'
+          AND object_type = 'routines'
+          AND privilege_type = 'EXECUTE'
+          AND NOT is_grantable
+    " | tail -n +2) \
+        || fail "publication known-grantor post-clean audit failed in $database"
+    assert_exact "publication known-grantor routine defaults in $database" \
+        "$known_public_defaults_after" '0'
+done <<<"$publication_mutable_databases"
+"$crdb" sql --url="$root_url" --execute='
+    REVOKE
+        fleet_runtime,
+        fleet_control_bootstrap,
+        fleet_registry_activation,
+        fleet_registry_successor_activation,
+        fleet_conflict_reconciliation,
+        proof_control_cli,
+        proof_activation_cli,
+        proof_runtime_cli,
+        proof_successor,
+        proof_reconciliation_cli,
+        fleet_publication
+    FROM root;
+' >/dev/null
+assert_root_scalar "publication temporary default-cleanup memberships removed" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+     WHERE member = 'root'
+       AND role_name IN ($publication_known_grantors)" '0'
+if ! publication_mutable_databases_after_cleanup=$(
+    root_sql_in_database fleet_recall \
+        "SELECT database_name FROM [SHOW DATABASES]
+         WHERE database_name <> 'system'
+         ORDER BY database_name" | tail -n +2
+); then
+    fail "publication post-cleanup database inventory failed"
+fi
+assert_exact "publication frozen mutable-database inventory" \
+    "$publication_mutable_databases_after_cleanup" \
+    "$publication_mutable_databases"
+assert_root_scalar "publication immutable system database exclusion" \
+    "SELECT count(*)::STRING FROM [SHOW DATABASES]
+     WHERE database_name = 'system'" '1'
+assert_public_routine_defaults "publication bootstrap cleanup" \
+    'role=ALL,true,routines,public,EXECUTE,false'
+
+if ! bootstrap_publication_subject_authority=$(
+    audit_other_database_publication_subject_authority principal
+); then
+    fail "bootstrap external publication-principal audit failed"
+fi
+assert_exact "bootstrap external publication-principal authority" \
+    "$bootstrap_publication_subject_authority" ''
+if ! bootstrap_publication_public_authority=$(
+    inventory_other_database_publication_public_authority
+); then
+    fail "bootstrap external publication PUBLIC audit failed"
+fi
+assert_exact "bootstrap external publication PUBLIC authority" \
+    "$bootstrap_publication_public_authority" ''
+
+# First clean apply creates the NOLOGIN logical reader and installs only
+# CONNECT, public USAGE, and SELECT on the exact eight publication relations.
+apply_publication_policy >/dev/null
+assert_root_scalar "publication first-apply target creation" \
+    "SELECT count(*)::STRING FROM [SHOW USERS]
+     WHERE username = 'fleet_publication_reader'
+       AND options::STRING = '{NOLOGIN}'" '1'
+if ! first_publication_subject_authority=$(
+    audit_other_database_publication_subject_authority full
+); then
+    fail "first-apply external publication-subject audit failed"
+fi
+assert_exact "first-apply external publication-subject authority" \
+    "$first_publication_subject_authority" ''
+if ! first_publication_public_authority=$(
+    inventory_other_database_publication_public_authority
+); then
+    fail "first-apply external publication PUBLIC audit failed"
+fi
+assert_exact "first-apply external publication PUBLIC authority" \
+    "$first_publication_public_authority" ''
+
+# Malformed temporary shadows cannot redirect the migration gate or any grant.
+# Reapply once more in an ordinary session before opening authentication.
+apply_publication_policy_with_temp_shadows >/dev/null
+apply_publication_policy >/dev/null
+assert_root_scalar "publication temp-shadow public grant count" \
+    "SELECT count(*)::STRING
+     FROM [SHOW GRANTS FOR fleet_publication_reader]
+     WHERE grantee = 'fleet_publication_reader'
+       AND database_name = 'fleet_recall'
+       AND schema_name = 'public'
+       AND object_type = 'table'
+       AND privilege_type = 'SELECT'" '8'
+
+assert_publication_terminal_state() {
+    assert_root_scalar "publication exact reader grant count" \
+        "SELECT count(*)::STRING
+         FROM [SHOW GRANTS FOR fleet_publication_reader]
+         WHERE grantee = 'fleet_publication_reader'" '10'
+    assert_root_scalar "publication forbidden reader grants" \
+        "SELECT count(*)::STRING
+         FROM [SHOW GRANTS FOR fleet_publication_reader]
+         WHERE grantee = 'fleet_publication_reader'
+           AND NOT (
+               (object_type = 'database'
+                   AND database_name = 'fleet_recall'
+                   AND privilege_type = 'CONNECT'
+                   AND NOT is_grantable)
+               OR (object_type = 'schema'
+                   AND database_name = 'fleet_recall'
+                   AND schema_name = 'public'
+                   AND privilege_type = 'USAGE'
+                   AND NOT is_grantable)
+               OR (object_type = 'table'
+                   AND database_name = 'fleet_recall'
+                   AND schema_name = 'public'
+                   AND object_name IN (
+                       '_sqlx_migrations',
+                       'memory_corpus_models',
+                       'memory_chunks',
+                       'memory_claim_embeddings',
+                       'memory_claim_support',
+                       'memory_claims',
+                       'memory_conflict_members',
+                       'memory_conflicts'
+                   )
+                   AND privilege_type = 'SELECT'
+                   AND NOT is_grantable)
+           )" '0'
+    assert_root_scalar "publication principal direct grants" \
+        "SELECT count(*)::STRING
+         FROM [SHOW GRANTS FOR fleet_publication]
+         WHERE grantee = 'fleet_publication'" '0'
+    assert_root_scalar "publication PUBLIC application and external grants" \
+        "SELECT count(*)::STRING
+         FROM [SHOW GRANTS FOR public]
+         WHERE grantee = 'public'
+           AND (
+               object_type = 'external_connection'
+               OR (
+                   database_name = 'fleet_recall'
+                   AND NOT (
+                       (object_type = 'schema'
+                           AND schema_name LIKE 'pg_temp_%'
+                           AND object_name IS NULL
+                           AND privilege_type IN ('CREATE', 'USAGE')
+                           AND NOT is_grantable)
+                       OR (schema_name IN (
+                               'crdb_internal', 'information_schema',
+                               'pg_catalog', 'pg_extension'
+                           )
+                           AND NOT is_grantable
+                           AND (
+                               (object_type = 'schema'
+                                   AND object_name IS NULL
+                                   AND privilege_type = 'USAGE')
+                               OR (object_type = 'table'
+                                   AND object_name IS NOT NULL
+                                   AND privilege_type = 'SELECT')
+                               OR (object_type = 'type'
+                                   AND schema_name = 'pg_catalog'
+                                   AND object_name IS NOT NULL
+                                   AND privilege_type = 'USAGE')
+                           ))
+                   )
+               )
+           )" '0'
+    assert_root_scalar "publication subject and PUBLIC system grants" \
+        "SELECT count(*)::STRING FROM [SHOW SYSTEM GRANTS]
+         WHERE grantee IN (
+             'fleet_publication_reader', 'fleet_publication', 'public'
+         )" '0'
+    assert_root_scalar "publication exact NOLOGIN subjects" \
+        "SELECT count(*)::STRING FROM [SHOW USERS]
+         WHERE username IN ('fleet_publication_reader', 'fleet_publication')
+           AND options::STRING = '{NOLOGIN}'" '2'
+    assert_root_scalar "publication exact leaf role graph" \
+        "SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+         WHERE (
+             role_name IN ('fleet_publication_reader', 'fleet_publication')
+             OR member IN ('fleet_publication_reader', 'fleet_publication')
+         )
+           AND role_name = 'fleet_publication_reader'
+           AND member = 'fleet_publication'
+           AND NOT is_admin" '1'
+    assert_root_scalar "publication incident role-edge count" \
+        "SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+         WHERE role_name IN ('fleet_publication_reader', 'fleet_publication')
+            OR member IN ('fleet_publication_reader', 'fleet_publication')" '1'
+    assert_root_scalar "publication current-database ownership" \
+        "SELECT count(*)::STRING
+         FROM (
+             SELECT 1
+             FROM pg_catalog.pg_database AS database_object
+             JOIN pg_catalog.pg_roles AS owner_role
+               ON owner_role.oid = database_object.datdba
+             WHERE database_object.datname = 'fleet_recall'
+               AND owner_role.rolname IN (
+                   'fleet_publication_reader', 'fleet_publication'
+               )
+             UNION ALL
+             SELECT 1
+             FROM pg_catalog.pg_namespace AS schema_object
+             JOIN pg_catalog.pg_roles AS owner_role
+               ON owner_role.oid = schema_object.nspowner
+             WHERE owner_role.rolname IN (
+                 'fleet_publication_reader', 'fleet_publication'
+             )
+             UNION ALL
+             SELECT 1
+             FROM pg_catalog.pg_class AS relation_object
+             JOIN pg_catalog.pg_roles AS owner_role
+               ON owner_role.oid = relation_object.relowner
+             WHERE relation_object.relkind IN ('r', 'S', 'v', 'm', 'p')
+               AND owner_role.rolname IN (
+                   'fleet_publication_reader', 'fleet_publication'
+               )
+             UNION ALL
+             SELECT 1
+             FROM pg_catalog.pg_proc AS function_object
+             JOIN pg_catalog.pg_roles AS owner_role
+               ON owner_role.oid = function_object.proowner
+             WHERE owner_role.rolname IN (
+                 'fleet_publication_reader', 'fleet_publication'
+             )
+             UNION ALL
+             SELECT 1
+             FROM pg_catalog.pg_type AS type_object
+             JOIN pg_catalog.pg_roles AS owner_role
+               ON owner_role.oid = type_object.typowner
+             WHERE owner_role.rolname IN (
+                 'fleet_publication_reader', 'fleet_publication'
+             )
+         ) AS owned" '0'
+    assert_root_scalar "publication subject future defaults" \
+        "SELECT count(*)::STRING
+         FROM (
+             SELECT 'fleet_publication_reader' AS subject,
+                    role, for_all_roles, object_type, grantee,
+                    privilege_type, is_grantable
+             FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE
+                   fleet_publication_reader]
+             UNION ALL
+             SELECT 'fleet_publication_reader' AS subject,
+                    role, for_all_roles, object_type, grantee,
+                    privilege_type, is_grantable
+             FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE
+                   fleet_publication_reader IN SCHEMA public]
+             UNION ALL
+             SELECT 'fleet_publication' AS subject,
+                    role, for_all_roles, object_type, grantee,
+                    privilege_type, is_grantable
+             FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE fleet_publication]
+             UNION ALL
+             SELECT 'fleet_publication' AS subject,
+                    role, for_all_roles, object_type, grantee,
+                    privilege_type, is_grantable
+             FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE
+                   fleet_publication IN SCHEMA public]
+         ) AS subject_default
+         WHERE object_type IN (
+             'schemas', 'routines', 'tables', 'sequences', 'types'
+         )
+           AND (
+               role = subject
+               AND NOT for_all_roles
+               AND grantee = subject
+               AND privilege_type = 'ALL'
+               AND is_grantable
+           ) IS NOT TRUE" '0'
+    assert_root_scalar "publication PUBLIC future defaults" \
+        "SELECT count(*)::STRING
+         FROM (
+             SELECT role, for_all_roles, object_type, grantee,
+                    privilege_type, is_grantable
+             FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public]
+             UNION
+             SELECT role, for_all_roles, object_type, grantee,
+                    privilege_type, is_grantable
+             FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public IN SCHEMA public]
+         ) AS public_default
+         WHERE object_type IN (
+             'schemas', 'routines', 'tables', 'sequences', 'types'
+         )
+           AND (
+               grantee = 'public'
+               AND NOT is_grantable
+               AND object_type = 'types'
+               AND privilege_type = 'USAGE'
+           ) IS NOT TRUE
+           AND (
+               role IS NULL
+               AND for_all_roles
+               AND grantee = 'public'
+               AND object_type = 'routines'
+               AND privilege_type = 'EXECUTE'
+               AND NOT is_grantable
+           ) IS NOT TRUE
+           AND (
+               role = 'fleet_publication_reader'
+               AND NOT for_all_roles
+               AND grantee = 'public'
+               AND object_type = 'routines'
+               AND privilege_type = 'EXECUTE'
+               AND NOT is_grantable
+           ) IS NOT TRUE" '0'
+    assert_root_scalar "publication dedicated schema boundary" \
+        "SELECT count(*)::STRING
+         FROM pg_catalog.pg_namespace
+         WHERE nspname NOT IN (
+             'public', 'pg_catalog', 'information_schema',
+             'crdb_internal', 'pg_extension'
+         )
+           AND nspname NOT LIKE 'pg_temp_%'" '0'
+    if ! terminal_publication_subject_authority=$(
+        audit_other_database_publication_subject_authority full
+    ); then
+        fail "terminal external publication-subject audit failed"
+    fi
+    assert_exact "terminal external publication-subject authority" \
+        "$terminal_publication_subject_authority" ''
+    if ! terminal_publication_public_authority=$(
+        inventory_other_database_publication_public_authority
+    ); then
+        fail "terminal external publication PUBLIC audit failed"
+    fi
+    assert_exact "terminal external publication PUBLIC authority" \
+        "$terminal_publication_public_authority" ''
+}
+
+# Freeze the complete quiesced state before creating any authentication
+# material. The test-only admin URL is file-backed, mode 0600, and never enters
+# the product process environment as a raw private URL.
+assert_publication_terminal_state
+( umask 077 && printf '%s\n' "$root_url" > "$publication_admin_secret_file" )
+chmod 600 "$publication_admin_secret_file"
+if ! publication_admin_secret_mode=$(stat -f '%Lp' \
+    "$publication_admin_secret_file" 2>/dev/null); then
+    publication_admin_secret_mode=$(stat -c '%a' \
+        "$publication_admin_secret_file") \
+        || fail "could not inspect publication admin secret mode"
+fi
+assert_exact "publication admin secret file mode" \
+    "$publication_admin_secret_mode" '600'
+
+publication_model_dir="$proof_dir/publication-model"
+mkdir -p "$publication_model_dir"
+: > "$publication_model_dir/config.json"
+: > "$publication_model_dir/model.safetensors"
+: > "$publication_model_dir/tokenizer.json"
+publication_model_digest=8e9c981496a810408369ae21c5a4ea4fa46933aa2b519e34ea780c2aaf96496d
+publication_tenant_id=$(root_scalar 'SELECT gen_random_uuid()::STRING')
+case "$publication_tenant_id" in
+    ????????-????-????-????-????????????) ;;
+    *) fail "database did not return a canonical publication tenant UUID" ;;
+esac
+publication_project="publication-live-$publication_tenant_id"
+publication_url="postgresql://fleet_publication:${publication_password}@${host_port}/fleet_recall?sslmode=verify-full&sslrootcert=${ca_path}"
+"$crdb" sql --url="$root_url" --execute="
+    ALTER USER fleet_publication WITH LOGIN PASSWORD '$publication_password';
+" >/dev/null
+assert_root_scalar "publication login enabled only for product window" \
+    "SELECT ('NOLOGIN' = ANY(options))::STRING FROM [SHOW USERS]
+     WHERE username = 'fleet_publication'" 'false'
+
+if ! publication_live_output=$(
+    cd "$repo_root"
+    env -i \
+        FLEET_RECALL_PUBLICATION_DATABASE_URL="$publication_url" \
+        FLEET_RECALL_TENANT_ID="$publication_tenant_id" \
+        FLEET_RECALL_PROJECT="$publication_project" \
+        FLEET_RECALL_AGENT=official-publication-proof \
+        FLEET_RECALL_MAX_CONNECTIONS=2 \
+        FLEET_RECALL_EMBEDDING_MODEL=publication-proof-fixed-embedder \
+        FLEET_RECALL_EMBEDDING_MODEL_PATH="$publication_model_dir" \
+        FLEET_RECALL_EMBEDDING_MODEL_SHA256="$publication_model_digest" \
+        FLEET_RECALL_PUBLICATION_TEST_ADMIN_SECRET_FILE="$publication_admin_secret_file" \
+        "$publication_live_test_binary" \
+            "$publication_live_test_name" --exact --ignored --nocapture 2>&1
+); then
+    if grep -Fq "$publication_password" <<<"$publication_live_output" \
+        || grep -Eiq 'postgres(ql)?://' <<<"$publication_live_output"; then
+        fail "publication connected test failed and disclosed database authority"
+    fi
+    printf '%s\n' "$publication_live_output" >&2
+    fail "publication connected product test failed"
+fi
+if grep -Fq "$publication_password" <<<"$publication_live_output"; then
+    fail "publication connected test output disclosed its credential"
+fi
+if grep -Eiq 'postgres(ql)?://' <<<"$publication_live_output"; then
+    fail "publication connected test output disclosed a database URL"
+fi
+rm -f -- "$publication_admin_secret_file"
+test ! -e "$publication_admin_secret_file" \
+    || fail "publication admin secret file survived its use window"
+
+publication_identity=$(publication_scalar \
+    "SELECT pg_catalog.current_user() || ':' || pg_catalog.current_database()")
+assert_exact "publication direct authenticated identity" \
+    "$publication_identity" 'fleet_publication:fleet_recall'
+publication_prefix_read=$(publication_scalar \
+    "SELECT (count(*) = 17
+             AND min(version) = 1
+             AND max(version) = 17
+             AND COALESCE(bool_and(success), false))::STRING
+     FROM public._sqlx_migrations
+     WHERE version BETWEEN 1 AND 17")
+assert_exact "publication direct prefix read" "$publication_prefix_read" 'true'
+
+# Product recall has exercised every allowed table. Direct SQL proves the same
+# principal cannot mutate an allowed relation, consume a sequence, perform DDL
+# or grant delegation, or read a private control/reconciliation relation.
+expect_publication_denied "publication model insert" \
+    "INSERT INTO public.memory_corpus_models
+         (tenant_id, project, embedding_model)
+     VALUES ('$publication_tenant_id', 'forbidden-write', 'forbidden')"
+expect_publication_denied "publication model update" \
+    "UPDATE public.memory_corpus_models
+     SET embedding_model = 'forbidden'
+     WHERE tenant_id = '$publication_tenant_id'"
+expect_publication_denied "publication model delete" \
+    "DELETE FROM public.memory_corpus_models
+     WHERE tenant_id = '$publication_tenant_id'"
+expect_publication_denied "publication claim sequence use" \
+    "SELECT nextval('public.memory_claim_id_seq')"
+expect_publication_denied "publication application table creation" \
+    'CREATE TABLE public.publication_forbidden (id UUID PRIMARY KEY)'
+expect_publication_denied "publication database creation" \
+    'CREATE DATABASE publication_forbidden'
+expect_publication_denied "publication role creation" \
+    'CREATE ROLE publication_forbidden'
+expect_publication_denied "publication temporary table creation" \
+    'SET experimental_enable_temp_tables = on; CREATE TEMP TABLE memory_chunks (id UUID PRIMARY KEY)'
+expect_publication_denied "publication control table read" \
+    'SELECT id FROM public.memory_control_events LIMIT 1'
+expect_publication_denied "publication reconciliation receipt read" \
+    'SELECT id FROM public.memory_mutation_receipts LIMIT 1'
+expect_publication_denied "publication table grant delegation" \
+    'GRANT SELECT ON TABLE public.memory_chunks TO proof_runtime_cli'
+
+# The product binary and direct probes must close every reader session before
+# authentication is removed. Poll the exact one-node SHOW SESSIONS inventory,
+# then clear both login and password and prove the old TLS URL cannot reconnect.
+publication_sessions_drained=0
+for _ in $(seq 1 120); do
+    publication_session_count=$(root_scalar \
+        "SELECT count(*)::STRING FROM [SHOW SESSIONS]
+         WHERE user_name = 'fleet_publication'")
+    if test "$publication_session_count" = '0'; then
+        publication_sessions_drained=1
+        break
+    fi
+    sleep 0.25
+done
+test "$publication_sessions_drained" -eq 1 \
+    || fail "publication sessions did not drain before credential removal"
+"$crdb" sql --url="$root_url" --execute='
+    ALTER USER fleet_publication WITH NOLOGIN PASSWORD NULL;
+' >/dev/null
+assert_root_scalar "publication principal requiesced" \
+    "SELECT count(*)::STRING FROM [SHOW USERS]
+     WHERE username = 'fleet_publication'
+       AND options::STRING = '{NOLOGIN}'" '1'
+if publication_disabled_auth=$("$crdb" sql --url="$publication_url" \
+    --execute='SELECT pg_catalog.current_user()' 2>&1); then
+    fail "disabled publication login unexpectedly authenticated"
+fi
+grep -Eiq 'authentication|password|nologin|login' \
+    <<<"$publication_disabled_auth" \
+    || fail "disabled publication login failed for an unexpected reason"
+if grep -Fq "$publication_password" <<<"$publication_disabled_auth"; then
+    fail "disabled publication authentication disclosed the old credential"
+fi
+if grep -Eiq 'postgres(ql)?://' <<<"$publication_disabled_auth"; then
+    fail "disabled publication authentication disclosed a database URL"
+fi
+
+if ! post_use_publication_subject_authority=$(
+    audit_other_database_publication_subject_authority full
+); then
+    fail "post-use external publication-subject audit failed"
+fi
+assert_exact "post-use external publication-subject authority" \
+    "$post_use_publication_subject_authority" ''
+if ! post_use_publication_public_authority=$(
+    inventory_other_database_publication_public_authority
+); then
+    fail "post-use external publication PUBLIC audit failed"
+fi
+assert_exact "post-use external publication PUBLIC authority" \
+    "$post_use_publication_public_authority" ''
+
+# Two clean quiesced reapplies prove idempotence after real product use. The
+# terminal audit is the only PUBLIC-03 success boundary and leaves no secret
+# file, login, session, direct principal grant, or authority outside the exact
+# logical reader surface.
+apply_publication_policy >/dev/null
+apply_publication_policy >/dev/null
+assert_publication_terminal_state
+assert_root_scalar "terminal publication session residue" \
+    "SELECT count(*)::STRING FROM [SHOW SESSIONS]
+     WHERE user_name = 'fleet_publication'" '0'
+test ! -e "$publication_admin_secret_file" \
+    || fail "terminal publication admin secret file residue"
 
 printf '%s\n' \
     "private control bootstrap receipts:" \

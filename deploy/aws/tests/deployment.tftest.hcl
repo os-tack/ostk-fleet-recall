@@ -45,27 +45,68 @@ variables {
   alb_subnet_ids  = ["subnet-aaaaaaaaaaaaaaaaa", "subnet-bbbbbbbbbbbbbbbbb"]
   task_subnet_ids = ["subnet-ccccccccccccccccc", "subnet-ddddddddddddddddd"]
 
-  database_url_secret_arn           = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-runtime-AbCdEf"
-  migration_database_url_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-migrator-GhIjKl"
+  assign_public_ip  = false
+  alb_ingress_cidrs = []
+  enable_cloudfront = true
+  certificate_arn   = null
+  demo_hostname     = null
 
-  tenant_id = "0198a849-f6ae-7d61-9800-000000000001"
-  project   = "terraform-test"
-  agent     = "terraform-test"
+  publication_database_url_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-publication-MnOpQr"
+  database_url_secret_arn             = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-writer-AbCdEf"
+  migration_database_url_secret_arn   = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-migrator-GhIjKl"
+  publication_database_secret_kms_key_arns = [
+    "arn:aws:kms:us-east-1:123456789012:key/11111111-1111-4111-8111-111111111111",
+    "arn:aws:kms:us-east-1:123456789012:key/22222222-2222-4222-8222-222222222222",
+  ]
+  database_secret_kms_key_arns = [
+    "arn:aws:kms:us-east-1:123456789012:key/33333333-3333-4333-8333-333333333333",
+    "arn:aws:kms:us-east-1:123456789012:key/44444444-4444-4444-8444-444444444444",
+  ]
 
+  tenant_id                = "0198a849-f6ae-7d61-9800-000000000001"
+  project                  = "terraform-test"
+  agent                    = "terraform-test"
+  max_database_connections = 8
+
+  embedding_model        = "minishlab/potion-retrieval-32M"
   embedding_model_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   model_bucket_arn       = "arn:aws:s3:::fleet-recall-test-models"
   model_object_prefix    = "models/potion-retrieval-32M/release-1"
   image_tag              = "git-0123456789ab"
+
+  cpu_architecture      = "X86_64"
+  task_cpu              = 1024
+  task_memory           = 4096
+  ephemeral_storage_gib = 21
+
+  service_desired_count      = 0
+  autoscaling_min_capacity   = 0
+  autoscaling_max_capacity   = 2
+  autoscaling_cpu_target     = 65
+  log_retention_days         = 60
+  enable_container_insights  = true
+  enable_deletion_protection = true
+  tags                       = {}
 }
 
 run "dormant_cloudfront_bootstrap" {
   command = plan
 
   override_resource {
+    target          = aws_iam_role.execution_publication
+    override_during = plan
+    values = {
+      arn = "arn:aws:iam::123456789012:role/publication-execution"
+      id  = "publication-execution"
+    }
+  }
+
+  override_resource {
     target          = aws_iam_role.execution_runtime
     override_during = plan
     values = {
       arn = "arn:aws:iam::123456789012:role/runtime-execution"
+      id  = "runtime-execution"
     }
   }
 
@@ -74,6 +115,25 @@ run "dormant_cloudfront_bootstrap" {
     override_during = plan
     values = {
       arn = "arn:aws:iam::123456789012:role/migration-execution"
+      id  = "migration-execution"
+    }
+  }
+
+  override_resource {
+    target          = aws_iam_role.task_publication
+    override_during = plan
+    values = {
+      arn = "arn:aws:iam::123456789012:role/publication-task"
+      id  = "publication-task"
+    }
+  }
+
+  override_resource {
+    target          = aws_iam_role.task
+    override_during = plan
+    values = {
+      arn = "arn:aws:iam::123456789012:role/private-task"
+      id  = "private-task"
     }
   }
 
@@ -108,29 +168,138 @@ run "dormant_cloudfront_bootstrap" {
 
   assert {
     condition = (
-      jsondecode(aws_ecs_task_definition.reference_agent.container_definitions)[0].secrets[0].valueFrom ==
-      var.database_url_secret_arn
+      jsondecode(aws_ecs_task_definition.app.container_definitions)[0].secrets == [{
+        name      = "FLEET_RECALL_PUBLICATION_DATABASE_URL"
+        valueFrom = var.publication_database_url_secret_arn
+      }] &&
+      jsondecode(aws_ecs_task_definition.seed.container_definitions)[0].secrets == [{
+        name      = "FLEET_RECALL_DATABASE_URL"
+        valueFrom = var.database_url_secret_arn
+      }] &&
+      jsondecode(aws_ecs_task_definition.reference_agent.container_definitions)[0].secrets == [{
+        name      = "FLEET_RECALL_DATABASE_URL"
+        valueFrom = var.database_url_secret_arn
+      }] &&
+      jsondecode(aws_ecs_task_definition.migration.container_definitions)[0].secrets == [{
+        name      = "FLEET_RECALL_DATABASE_URL"
+        valueFrom = var.migration_database_url_secret_arn
+      }]
     )
-    error_message = "the reference agent must use the runtime DML credential"
+    error_message = "each task class must receive exactly its own database URL environment binding"
   }
 
   assert {
     condition = (
-      jsondecode(aws_ecs_task_definition.app.container_definitions)[0].secrets[0].valueFrom == var.database_url_secret_arn &&
-      jsondecode(aws_ecs_task_definition.migration.container_definitions)[0].secrets[0].valueFrom == var.migration_database_url_secret_arn &&
+      aws_iam_role.execution_publication.name == "${var.name}-publication-execution" &&
       aws_iam_role.execution_runtime.name == "${var.name}-execution" &&
       aws_iam_role.execution_migration.name == "${var.name}-migration-execution" &&
-      aws_iam_role.execution_runtime.name != aws_iam_role.execution_migration.name &&
-      aws_ecs_task_definition.app.execution_role_arn == aws_iam_role.execution_runtime.arn &&
+      length(toset([
+        aws_iam_role.execution_publication.name,
+        aws_iam_role.execution_runtime.name,
+        aws_iam_role.execution_migration.name,
+      ])) == 3 &&
+      aws_ecs_task_definition.app.execution_role_arn == aws_iam_role.execution_publication.arn &&
       aws_ecs_task_definition.seed.execution_role_arn == aws_iam_role.execution_runtime.arn &&
       aws_ecs_task_definition.reference_agent.execution_role_arn == aws_iam_role.execution_runtime.arn &&
-      aws_ecs_task_definition.migration.execution_role_arn == aws_iam_role.execution_migration.arn &&
+      aws_ecs_task_definition.migration.execution_role_arn == aws_iam_role.execution_migration.arn
+    )
+    error_message = "publication, writer, and migration tasks must use isolated execution roles"
+  }
+
+  assert {
+    condition = (
+      aws_iam_role.task_publication.name == "${var.name}-publication-task" &&
+      aws_iam_role.task.name == "${var.name}-task" &&
+      aws_iam_role.task_publication.name != aws_iam_role.task.name &&
+      aws_ecs_task_definition.app.task_role_arn == aws_iam_role.task_publication.arn &&
+      aws_ecs_task_definition.seed.task_role_arn == aws_iam_role.task.arn &&
+      aws_ecs_task_definition.reference_agent.task_role_arn == aws_iam_role.task.arn &&
+      aws_ecs_task_definition.migration.task_role_arn == aws_iam_role.task.arn
+    )
+    error_message = "the publication app must have a distinct task role while private task-role flows remain unchanged"
+  }
+
+  assert {
+    condition = (
+      local.publication_database_secret_arns == [var.publication_database_url_secret_arn] &&
       local.runtime_database_secret_arns == [var.database_url_secret_arn] &&
       local.migration_database_secret_arns == [var.migration_database_url_secret_arn] &&
-      !contains(local.runtime_database_secret_arns, var.migration_database_url_secret_arn) &&
-      !contains(local.migration_database_secret_arns, var.database_url_secret_arn)
+      length(toset(concat(
+        local.publication_database_secret_arns,
+        local.runtime_database_secret_arns,
+        local.migration_database_secret_arns,
+      ))) == 3 &&
+      aws_iam_role_policy.publication_database_secret.role == aws_iam_role.execution_publication.id &&
+      aws_iam_role_policy.runtime_database_secret.role == aws_iam_role.execution_runtime.id &&
+      aws_iam_role_policy.migration_database_secret.role == aws_iam_role.execution_migration.id &&
+      aws_iam_role_policy_attachment.execution_publication.role == aws_iam_role.execution_publication.name &&
+      aws_iam_role_policy_attachment.execution_runtime.role == aws_iam_role.execution_runtime.name &&
+      aws_iam_role_policy_attachment.execution_migration.role == aws_iam_role.execution_migration.name
     )
-    error_message = "runtime and migration tasks and policies must use distinct secrets and execution roles"
+    error_message = "database-secret policies and ECS managed policies must have one exact execution-role edge each"
+  }
+
+  assert {
+    condition = (
+      jsondecode(nonsensitive(aws_iam_role_policy.publication_database_secret.policy)) == {
+        Version = "2012-10-17"
+        Statement = [
+          {
+            Sid      = "ReadPublicationDatabaseUrl"
+            Effect   = "Allow"
+            Action   = "secretsmanager:GetSecretValue"
+            Resource = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-publication-MnOpQr"
+          },
+          {
+            Sid    = "DecryptPublicationDatabaseSecret"
+            Effect = "Allow"
+            Action = "kms:Decrypt"
+            Resource = [
+              "arn:aws:kms:us-east-1:123456789012:key/11111111-1111-4111-8111-111111111111",
+              "arn:aws:kms:us-east-1:123456789012:key/22222222-2222-4222-8222-222222222222",
+            ]
+            Condition = {
+              StringEquals = {
+                "kms:ViaService"                  = "secretsmanager.us-east-1.amazonaws.com"
+                "kms:EncryptionContext:SecretARN" = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-publication-MnOpQr"
+              }
+            }
+          },
+        ]
+      }
+    )
+    error_message = "the KMS-enabled publication policy must exactly bind its secret read and encryption-context-scoped decrypt"
+  }
+
+  assert {
+    condition = (
+      var.publication_database_secret_kms_key_arns == tolist([
+        "arn:aws:kms:us-east-1:123456789012:key/11111111-1111-4111-8111-111111111111",
+        "arn:aws:kms:us-east-1:123456789012:key/22222222-2222-4222-8222-222222222222",
+      ]) &&
+      var.database_secret_kms_key_arns == tolist([
+        "arn:aws:kms:us-east-1:123456789012:key/33333333-3333-4333-8333-333333333333",
+        "arn:aws:kms:us-east-1:123456789012:key/44444444-4444-4444-8444-444444444444",
+      ]) &&
+      alltrue([
+        for arn in var.database_secret_kms_key_arns :
+        !strcontains(nonsensitive(aws_iam_role_policy.publication_database_secret.policy), arn)
+      ]) &&
+      !strcontains(nonsensitive(aws_iam_role_policy.publication_database_secret.policy), nonsensitive(var.database_url_secret_arn)) &&
+      !strcontains(nonsensitive(aws_iam_role_policy.publication_database_secret.policy), nonsensitive(var.migration_database_url_secret_arn)) &&
+      !strcontains(nonsensitive(aws_iam_role_policy.publication_database_secret.policy), "*")
+    )
+    error_message = "the KMS-enabled publication policy must exclude writer, migrator, wildcard, and unconfigured KMS resources"
+  }
+
+  assert {
+    condition = (
+      aws_iam_role_policy.model_bundle_publication.role == aws_iam_role.task_publication.id &&
+      aws_iam_role_policy.model_bundle.role == aws_iam_role.task.id &&
+      aws_iam_role_policy.model_bundle_publication.role != aws_iam_role.task.id &&
+      aws_iam_role_policy.model_bundle.role != aws_iam_role.task_publication.id
+    )
+    error_message = "model-object reads must be attached to the publication and private task roles without a cross-role edge"
   }
 
   assert {
@@ -153,19 +322,28 @@ run "dormant_cloudfront_bootstrap" {
 
   assert {
     condition = (
-      jsondecode(aws_ecs_task_definition.seed.container_definitions)[0].secrets[0].valueFrom ==
-      var.database_url_secret_arn
+      local.model_object_arns == [
+        "arn:aws:s3:::fleet-recall-test-models/models/potion-retrieval-32M/release-1/config.json",
+        "arn:aws:s3:::fleet-recall-test-models/models/potion-retrieval-32M/release-1/model.safetensors",
+        "arn:aws:s3:::fleet-recall-test-models/models/potion-retrieval-32M/release-1/tokenizer.json",
+      ] &&
+      jsondecode(aws_iam_role_policy.model_bundle_publication.policy) == {
+        Version = "2012-10-17"
+        Statement = [{
+          Sid    = "ReadPinnedModelBundle"
+          Effect = "Allow"
+          Action = ["s3:GetObject", "s3:GetObjectVersion"]
+          Resource = [
+            "arn:aws:s3:::fleet-recall-test-models/models/potion-retrieval-32M/release-1/config.json",
+            "arn:aws:s3:::fleet-recall-test-models/models/potion-retrieval-32M/release-1/model.safetensors",
+            "arn:aws:s3:::fleet-recall-test-models/models/potion-retrieval-32M/release-1/tokenizer.json",
+          ]
+        }]
+      } &&
+      jsondecode(aws_iam_role_policy.model_bundle.policy) ==
+      jsondecode(aws_iam_role_policy.model_bundle_publication.policy)
     )
-    error_message = "the seed task must use the runtime DML credential, never the migration credential"
-  }
-
-  assert {
-    condition = local.model_object_arns == [
-      "arn:aws:s3:::fleet-recall-test-models/models/potion-retrieval-32M/release-1/config.json",
-      "arn:aws:s3:::fleet-recall-test-models/models/potion-retrieval-32M/release-1/model.safetensors",
-      "arn:aws:s3:::fleet-recall-test-models/models/potion-retrieval-32M/release-1/tokenizer.json",
-    ]
-    error_message = "the task role must target exactly the three runtime model files"
+    error_message = "both task roles must share only exact versioned reads of the three pinned model files"
   }
 
   assert {
@@ -188,6 +366,46 @@ run "dormant_cloudfront_bootstrap" {
       aws_lb_listener.http[0].default_action[0].fixed_response[0].status_code == "403"
     )
     error_message = "omitting front-door variables must never expose direct CIDR ingress or a forwarding ALB listener"
+  }
+}
+
+run "publication_secret_without_customer_kms_keys" {
+  command = plan
+
+  variables {
+    publication_database_secret_kms_key_arns = []
+  }
+
+  override_resource {
+    target          = aws_iam_role.execution_publication
+    override_during = plan
+    values = {
+      arn = "arn:aws:iam::123456789012:role/publication-execution-without-kms"
+      id  = "publication-execution-without-kms"
+    }
+  }
+
+  assert {
+    condition = (
+      jsondecode(nonsensitive(aws_iam_role_policy.publication_database_secret.policy)) == {
+        Version = "2012-10-17"
+        Statement = [{
+          Sid      = "ReadPublicationDatabaseUrl"
+          Effect   = "Allow"
+          Action   = "secretsmanager:GetSecretValue"
+          Resource = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-publication-MnOpQr"
+        }]
+      } &&
+      !strcontains(nonsensitive(aws_iam_role_policy.publication_database_secret.policy), "kms:Decrypt") &&
+      alltrue([
+        for arn in var.database_secret_kms_key_arns :
+        !strcontains(nonsensitive(aws_iam_role_policy.publication_database_secret.policy), arn)
+      ]) &&
+      !strcontains(nonsensitive(aws_iam_role_policy.publication_database_secret.policy), nonsensitive(var.database_url_secret_arn)) &&
+      !strcontains(nonsensitive(aws_iam_role_policy.publication_database_secret.policy), nonsensitive(var.migration_database_url_secret_arn)) &&
+      !strcontains(nonsensitive(aws_iam_role_policy.publication_database_secret.policy), "*")
+    )
+    error_message = "without customer KMS keys, the publication policy must contain only its exact secret read"
   }
 }
 
@@ -394,7 +612,17 @@ run "rejects_unsupported_log_retention" {
   expect_failures = [var.log_retention_days]
 }
 
-run "rejects_wildcard_database_secret" {
+run "rejects_wildcard_publication_database_secret" {
+  command = plan
+
+  variables {
+    publication_database_url_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:*"
+  }
+
+  expect_failures = [var.publication_database_url_secret_arn]
+}
+
+run "rejects_wildcard_writer_database_secret" {
   command = plan
 
   variables {
@@ -414,11 +642,31 @@ run "rejects_wildcard_migration_secret" {
   expect_failures = [var.migration_database_url_secret_arn]
 }
 
-run "rejects_shared_runtime_and_migration_secret" {
+run "rejects_shared_publication_and_writer_secret" {
   command = plan
 
   variables {
-    migration_database_url_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-runtime-AbCdEf"
+    database_url_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-publication-MnOpQr"
+  }
+
+  expect_failures = [var.database_url_secret_arn]
+}
+
+run "rejects_shared_publication_and_migration_secret" {
+  command = plan
+
+  variables {
+    migration_database_url_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-publication-MnOpQr"
+  }
+
+  expect_failures = [var.migration_database_url_secret_arn]
+}
+
+run "rejects_shared_writer_and_migration_secret" {
+  command = plan
+
+  variables {
+    migration_database_url_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:fleet-writer-AbCdEf"
   }
 
   expect_failures = [var.migration_database_url_secret_arn]
@@ -432,4 +680,26 @@ run "rejects_wildcard_database_kms_key" {
   }
 
   expect_failures = [var.database_secret_kms_key_arns]
+}
+
+run "rejects_wildcard_publication_database_kms_key" {
+  command = plan
+
+  variables {
+    publication_database_secret_kms_key_arns = ["arn:aws:kms:us-east-1:123456789012:key/*"]
+  }
+
+  expect_failures = [var.publication_database_secret_kms_key_arns]
+}
+
+run "rejects_shared_publication_and_private_database_kms_key" {
+  command = plan
+
+  variables {
+    publication_database_secret_kms_key_arns = [
+      "arn:aws:kms:us-east-1:123456789012:key/33333333-3333-4333-8333-333333333333",
+    ]
+  }
+
+  expect_failures = [var.publication_database_secret_kms_key_arns]
 }

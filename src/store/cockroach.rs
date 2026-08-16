@@ -9,6 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use crate::private_postgres::{
+    PUBLICATION_POSTGRES_APPLICATION_NAME, PUBLICATION_POSTGRES_DATABASE,
+    PUBLICATION_POSTGRES_USER, PrivatePostgresSslPolicy, publication_postgres_connect_options,
+};
 use crate::{FleetError, FleetScope, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -31,6 +35,73 @@ pub const MAX_PUBLIC_NUMERIC_ID: i64 = 9_007_199_254_740_991;
 /// Oldest complete additive database schema supported by the current recall,
 /// remember, conflict-projection, ingestion, and public-demo paths.
 pub const MINIMUM_RECALL_SCHEMA_VERSION: i64 = 17;
+
+/// Exact application tables reachable from public health/status/recall SQL.
+///
+/// This is a fixed publication contract, not a schema-wide grant request. In
+/// particular it intentionally excludes every sequence, mutation/event table,
+/// historical corpus table, and dynamic-control table.
+pub const PUBLICATION_READ_TABLES: [&str; 8] = [
+    "_sqlx_migrations",
+    "memory_corpus_models",
+    "memory_chunks",
+    "memory_claim_embeddings",
+    "memory_claim_support",
+    "memory_claims",
+    "memory_conflict_members",
+    "memory_conflicts",
+];
+
+/// Deterministic schema resolution for all publication sessions.
+///
+/// `CockroachDB` renders `search_path` with a space after each comma. Keeping
+/// the expected value in that canonical form makes the set-and-witness query
+/// exact instead of rejecting every otherwise-correct pooled connection.
+pub const PUBLICATION_SEARCH_PATH: &str = "pg_catalog, public, pg_temp";
+const PUBLICATION_CURRENT_USER_SQL: &str = "SELECT pg_catalog.current_user()";
+const PUBLICATION_CURRENT_DATABASE_SQL: &str = "SELECT pg_catalog.current_database()";
+const PUBLICATION_CURRENT_APPLICATION_NAME_SQL: &str =
+    "SELECT pg_catalog.current_setting('application_name')";
+const PUBLICATION_SET_SEARCH_PATH_SQL: &str =
+    "SELECT pg_catalog.set_config('search_path', $1, false)";
+
+async fn pin_publication_session(connection: &mut PgConnection) -> sqlx::Result<()> {
+    let current_user = sqlx::query_scalar::<_, String>(PUBLICATION_CURRENT_USER_SQL)
+        .fetch_one(&mut *connection)
+        .await?;
+    if current_user != PUBLICATION_POSTGRES_USER {
+        return Err(sqlx::Error::Protocol(
+            "public PostgreSQL connection authenticated an unexpected principal".into(),
+        ));
+    }
+    let current_database = sqlx::query_scalar::<_, String>(PUBLICATION_CURRENT_DATABASE_SQL)
+        .fetch_one(&mut *connection)
+        .await?;
+    if current_database != PUBLICATION_POSTGRES_DATABASE {
+        return Err(sqlx::Error::Protocol(
+            "public PostgreSQL connection selected an unexpected database".into(),
+        ));
+    }
+    let application_name =
+        sqlx::query_scalar::<_, String>(PUBLICATION_CURRENT_APPLICATION_NAME_SQL)
+            .fetch_one(&mut *connection)
+            .await?;
+    if application_name != PUBLICATION_POSTGRES_APPLICATION_NAME {
+        return Err(sqlx::Error::Protocol(
+            "public PostgreSQL connection did not retain its fixed application name".into(),
+        ));
+    }
+    let search_path = sqlx::query_scalar::<_, String>(PUBLICATION_SET_SEARCH_PATH_SQL)
+        .bind(PUBLICATION_SEARCH_PATH)
+        .fetch_one(&mut *connection)
+        .await?;
+    if search_path != PUBLICATION_SEARCH_PATH {
+        return Err(sqlx::Error::Protocol(
+            "public PostgreSQL connection did not retain its fixed search path".into(),
+        ));
+    }
+    Ok(())
+}
 
 const CONTIGUOUS_SCHEMA_VERSION_SQL: &str = "SELECT COALESCE(MAX(CASE \
          WHEN prefix_success AND version = ordinal THEN version \
@@ -676,6 +747,47 @@ impl CockroachStore {
             .acquire_timeout(config.acquire_timeout)
             .idle_timeout(config.idle_timeout)
             .max_lifetime(config.max_lifetime)
+            .connect_with(options)
+            .await?;
+        Ok(Self { pool, scope })
+    }
+
+    /// Connect the bounded publication reader without applying migrations.
+    ///
+    /// Driver options are closed before the pool is constructed. Every new
+    /// pooled connection then proves the authenticated principal and selected
+    /// database, and pins the only admitted schema resolution order before
+    /// application SQL can run.
+    pub async fn connect_publication(
+        database_url: &str,
+        database_ssl_policy: PrivatePostgresSslPolicy,
+        scope: FleetScope,
+        config: PoolConfig,
+    ) -> Result<Self> {
+        scope.validate()?;
+        if config.max_connections == 0 {
+            return Err(FleetError::Configuration(
+                "database pool max_connections must be greater than zero".into(),
+            ));
+        }
+        let options = publication_postgres_connect_options(database_url, database_ssl_policy)?
+            .log_statements(tracing::log::LevelFilter::Debug)
+            .log_slow_statements(tracing::log::LevelFilter::Warn, Duration::from_secs(1));
+        let pool = PgPoolOptions::new()
+            .max_connections(config.max_connections)
+            .min_connections(config.min_connections.min(config.max_connections))
+            .acquire_timeout(config.acquire_timeout)
+            .idle_timeout(config.idle_timeout)
+            .max_lifetime(config.max_lifetime)
+            .after_connect(|connection, _metadata| {
+                Box::pin(async move { pin_publication_session(connection).await })
+            })
+            .before_acquire(|connection, _metadata| {
+                Box::pin(async move {
+                    pin_publication_session(connection).await?;
+                    Ok(true)
+                })
+            })
             .connect_with(options)
             .await?;
         Ok(Self { pool, scope })
@@ -1762,6 +1874,74 @@ mod tests {
             PrivacyTier::T1Project,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn publication_read_inventory_and_session_authority_are_exact() {
+        let source = include_str!("cockroach.rs");
+
+        assert_eq!(
+            PUBLICATION_READ_TABLES,
+            [
+                "_sqlx_migrations",
+                "memory_corpus_models",
+                "memory_chunks",
+                "memory_claim_embeddings",
+                "memory_claim_support",
+                "memory_claims",
+                "memory_conflict_members",
+                "memory_conflicts",
+            ]
+        );
+        assert!(
+            PUBLICATION_READ_TABLES
+                .iter()
+                .all(|table| !table.ends_with("_seq"))
+        );
+        assert_eq!(PUBLICATION_POSTGRES_USER, "fleet_publication");
+        assert_eq!(
+            PUBLICATION_CURRENT_USER_SQL,
+            "SELECT pg_catalog.current_user()"
+        );
+        assert_eq!(
+            PUBLICATION_CURRENT_DATABASE_SQL,
+            "SELECT pg_catalog.current_database()"
+        );
+        assert_eq!(
+            PUBLICATION_CURRENT_APPLICATION_NAME_SQL,
+            "SELECT pg_catalog.current_setting('application_name')"
+        );
+        assert_eq!(
+            PUBLICATION_SET_SEARCH_PATH_SQL,
+            "SELECT pg_catalog.set_config('search_path', $1, false)"
+        );
+        assert_eq!(PUBLICATION_SEARCH_PATH, "pg_catalog, public, pg_temp");
+        for hook in [
+            ".after_connect(|connection, _metadata| {",
+            ".before_acquire(|connection, _metadata| {",
+        ] {
+            assert!(
+                source.contains(hook),
+                "publication pool must retain session hook {hook}"
+            );
+        }
+        let witness_call = ["pin_publication_session(connection)", ".await"].concat();
+        assert_eq!(
+            source.matches(&witness_call).count(),
+            2,
+            "new and reused publication connections must share the authority witness"
+        );
+        for authority_guard in [
+            "current_user != PUBLICATION_POSTGRES_USER",
+            "current_database != PUBLICATION_POSTGRES_DATABASE",
+            "application_name != PUBLICATION_POSTGRES_APPLICATION_NAME",
+            "search_path != PUBLICATION_SEARCH_PATH",
+        ] {
+            assert!(
+                source.contains(authority_guard),
+                "publication authority witness must retain guard {authority_guard}"
+            );
+        }
     }
 
     #[test]

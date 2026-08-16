@@ -228,6 +228,21 @@ pub enum ServiceError {
 
 pub type ServiceResult<T> = std::result::Result<T, ServiceError>;
 
+/// Recall-only capability used by publication adapters.
+///
+/// A public router holding this trait object has no method through which it can
+/// invoke `remember`, even when the underlying private implementation also
+/// serves MCP writers. The blanket adapter preserves the existing writer trait
+/// and its protocol consumers without widening this capability.
+#[async_trait]
+pub trait FleetRecallService: Send + Sync {
+    async fn recall(
+        &self,
+        scope: FleetScope,
+        request: RecallRequest,
+    ) -> ServiceResult<RecallResult>;
+}
+
 /// Semantic service boundary used by protocol adapters.
 ///
 /// Separate read and write methods make it impossible for `recall` dispatch to
@@ -247,6 +262,20 @@ pub trait FleetMemoryService: Send + Sync {
         scope: FleetScope,
         request: RememberRequest,
     ) -> ServiceResult<RememberResult>;
+}
+
+#[async_trait]
+impl<T> FleetRecallService for T
+where
+    T: FleetMemoryService + ?Sized,
+{
+    async fn recall(
+        &self,
+        scope: FleetScope,
+        request: RecallRequest,
+    ) -> ServiceResult<RecallResult> {
+        FleetMemoryService::recall(self, scope, request).await
+    }
 }
 
 #[cfg(test)]

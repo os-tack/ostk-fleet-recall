@@ -97,22 +97,40 @@ variable "demo_hostname" {
   }
 }
 
-variable "database_url_secret_arn" {
-  description = "Secrets Manager ARN whose raw value is the TLS CockroachDB runtime URL."
+variable "publication_database_url_secret_arn" {
+  description = "Required ARN whose raw value is the TLS CockroachDB read-only publication URL."
   type        = string
   sensitive   = true
 
   validation {
     condition = can(regex(
       "^arn:aws:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$",
-      var.database_url_secret_arn,
-    )) && !strcontains(var.database_url_secret_arn, "*")
-    error_message = "database_url_secret_arn must be one concrete commercial-partition Secrets Manager ARN without wildcards."
+      var.publication_database_url_secret_arn,
+    )) && !strcontains(var.publication_database_url_secret_arn, "*")
+    error_message = "publication_database_url_secret_arn must be one concrete commercial-partition Secrets Manager ARN without wildcards."
+  }
+}
+
+variable "database_url_secret_arn" {
+  description = "Required ARN whose raw value is the TLS CockroachDB writer URL used by seed and reference-agent tasks."
+  type        = string
+  sensitive   = true
+
+  validation {
+    condition = (
+      can(regex(
+        "^arn:aws:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$",
+        var.database_url_secret_arn,
+      )) &&
+      !strcontains(var.database_url_secret_arn, "*") &&
+      var.database_url_secret_arn != var.publication_database_url_secret_arn
+    )
+    error_message = "database_url_secret_arn must be one concrete commercial-partition Secrets Manager ARN, without wildcards, and distinct from publication_database_url_secret_arn."
   }
 }
 
 variable "migration_database_url_secret_arn" {
-  description = "Required ARN for a DDL-capable URL that is distinct from the runtime secret."
+  description = "Required ARN for a DDL-capable URL that is distinct from the publication and writer secrets."
   type        = string
   sensitive   = true
 
@@ -123,14 +141,38 @@ variable "migration_database_url_secret_arn" {
         var.migration_database_url_secret_arn,
       )) &&
       !strcontains(var.migration_database_url_secret_arn, "*") &&
-      var.migration_database_url_secret_arn != var.database_url_secret_arn
+      var.migration_database_url_secret_arn != var.database_url_secret_arn &&
+      var.migration_database_url_secret_arn != var.publication_database_url_secret_arn
     )
-    error_message = "migration_database_url_secret_arn must be one concrete commercial-partition Secrets Manager ARN, without wildcards, and distinct from database_url_secret_arn."
+    error_message = "migration_database_url_secret_arn must be one concrete commercial-partition Secrets Manager ARN, without wildcards, and distinct from publication_database_url_secret_arn and database_url_secret_arn."
+  }
+}
+
+variable "publication_database_secret_kms_key_arns" {
+  description = "Customer-managed KMS key ARNs used only by the publication database secret."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for arn in var.publication_database_secret_kms_key_arns :
+      can(regex("^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key/[0-9a-fA-F-]{36}$", arn)) &&
+      !strcontains(arn, "*")
+    ])
+    error_message = "publication_database_secret_kms_key_arns must contain only concrete commercial-partition KMS key ARNs without aliases or wildcards."
+  }
+
+  validation {
+    condition = length(setintersection(
+      toset(var.publication_database_secret_kms_key_arns),
+      toset(var.database_secret_kms_key_arns),
+    )) == 0
+    error_message = "publication_database_secret_kms_key_arns must not overlap database_secret_kms_key_arns."
   }
 }
 
 variable "database_secret_kms_key_arns" {
-  description = "Customer-managed KMS key ARNs used by either database secret."
+  description = "Customer-managed KMS key ARNs used only by writer or migration database secrets."
   type        = list(string)
   default     = []
 

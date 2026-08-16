@@ -17,12 +17,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use ostk_fleet_recall::config::model_bundle_sha256;
+use ostk_fleet_recall::config::{PublicationConfig, model_bundle_sha256};
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::McpServer;
 use ostk_fleet_recall::reference_agent::{ReferenceAgentStep, run_reference_agent};
 use ostk_fleet_recall::service::{
-    FleetMemoryService, RecallAction, RecallRequest, RecallResult, ServiceError,
+    FleetRecallService, RecallAction, RecallRequest, RecallResult, ServiceError,
 };
 use ostk_fleet_recall::store::cockroach::{
     CockroachStore, EMBEDDING_DIMENSION, PoolConfig, RetryPolicy, ScopedChunk,
@@ -162,6 +162,27 @@ enum Command {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeDatabaseIdentity {
+    Writer,
+    Publication,
+    None,
+}
+
+impl Command {
+    const fn runtime_database_identity(&self) -> RuntimeDatabaseIdentity {
+        match self {
+            Self::Demo { .. } => RuntimeDatabaseIdentity::Publication,
+            Self::ModelDigest { .. } => RuntimeDatabaseIdentity::None,
+            Self::Serve
+            | Self::Migrate
+            | Self::Health
+            | Self::Ingest { .. }
+            | Self::ReferenceAgent { .. } => RuntimeDatabaseIdentity::Writer,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IngestRecord {
@@ -213,22 +234,35 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    if let Command::ModelDigest { ref bundle } = cli.command {
-        println!("{}", model_bundle_sha256(bundle)?);
-        return Ok(());
-    }
-
-    let config = FleetConfig::from_env()?;
-    match cli.command {
-        Command::Migrate => run_migrate(&config).await?,
-        Command::Health => run_health(&config).await?,
-        Command::Serve => run_serve(config).await?,
-        Command::Demo { listen } => run_demo(config, listen).await?,
-        Command::Ingest { input } => run_ingest(&config, &input).await?,
-        Command::ReferenceAgent { step, run_id } => {
-            run_reference_agent_step(&config, step, &run_id).await?;
+    match cli.command.runtime_database_identity() {
+        RuntimeDatabaseIdentity::None => {
+            let Command::ModelDigest { bundle } = cli.command else {
+                unreachable!("only model-digest is configuration-free")
+            };
+            println!("{}", model_bundle_sha256(&bundle)?);
         }
-        Command::ModelDigest { .. } => unreachable!("handled without deployment configuration"),
+        RuntimeDatabaseIdentity::Publication => {
+            let config = PublicationConfig::from_env()?;
+            let Command::Demo { listen } = cli.command else {
+                unreachable!("only demo uses the publication identity")
+            };
+            run_demo(config, listen).await?;
+        }
+        RuntimeDatabaseIdentity::Writer => {
+            let config = FleetConfig::from_env()?;
+            match cli.command {
+                Command::Migrate => run_migrate(&config).await?,
+                Command::Health => run_health(&config).await?,
+                Command::Serve => run_serve(config).await?,
+                Command::Ingest { input } => run_ingest(&config, &input).await?,
+                Command::ReferenceAgent { step, run_id } => {
+                    run_reference_agent_step(&config, step, &run_id).await?;
+                }
+                Command::Demo { .. } | Command::ModelDigest { .. } => {
+                    unreachable!("command identity was classified before configuration load")
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -255,6 +289,21 @@ async fn connect_store(config: &FleetConfig) -> anyhow::Result<CockroachStore> {
     CockroachStore::connect(
         &config.database_url,
         config.default_scope.clone(),
+        pool_config,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn connect_publication_store(config: &PublicationConfig) -> anyhow::Result<CockroachStore> {
+    let pool_config = PoolConfig {
+        max_connections: config.max_connections(),
+        ..PoolConfig::default()
+    };
+    CockroachStore::connect_publication(
+        config.database_url(),
+        config.database_ssl_policy(),
+        config.default_scope().clone(),
         pool_config,
     )
     .await
@@ -335,9 +384,31 @@ async fn build_memory_service(
     Ok((service, store))
 }
 
+async fn build_publication_service(
+    config: &PublicationConfig,
+) -> anyhow::Result<(Arc<CockroachMemoryService>, Arc<CockroachStore>)> {
+    let embedder: Arc<dyn ChunkEmbedder> = Arc::new(load_pinned_embedder(config)?);
+    let store = Arc::new(connect_publication_store(config).await?);
+    store.health_check().await?;
+    let ledger = Arc::new(CockroachClaimLedger::new(
+        store.pool().clone(),
+        config.default_scope().clone(),
+        embedder.clone(),
+        RetryPolicy::default(),
+    )?);
+    let service = Arc::new(CockroachMemoryService::new(
+        config.default_scope().clone(),
+        store.clone(),
+        ledger,
+        embedder,
+    )?);
+    service.verify_embedding_generation().await?;
+    Ok((service, store))
+}
+
 #[derive(Clone)]
 struct DemoState {
-    service: Arc<dyn FleetMemoryService>,
+    service: Arc<dyn FleetRecallService>,
     health: Arc<dyn DemoHealth>,
     scope: FleetScope,
     capacity: Arc<tokio::sync::Semaphore>,
@@ -574,13 +645,13 @@ const fn default_demo_limit() -> usize {
     8
 }
 
-async fn run_demo(config: FleetConfig, listen: SocketAddr) -> anyhow::Result<()> {
-    let (service, store) = build_memory_service(&config).await?;
+async fn run_demo(config: PublicationConfig, listen: SocketAddr) -> anyhow::Result<()> {
+    let (service, store) = build_publication_service(&config).await?;
     let clock: Arc<dyn DemoClock> = Arc::new(SystemDemoClock);
     let state = DemoState {
         service,
         health: store,
-        scope: config.default_scope,
+        scope: config.default_scope().clone(),
         capacity: Arc::new(tokio::sync::Semaphore::new(16)),
         // ALB and ECS can probe concurrently. Keep readiness isolated from
         // public API capacity while bounding overlapping database checks.
@@ -1017,13 +1088,38 @@ async fn run_ingest(config: &FleetConfig, input: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_pinned_embedder(config: &FleetConfig) -> anyhow::Result<PinnedEmbedder> {
-    let canonical_before = config.verify_embedding_model_bundle()?;
+trait PinnedEmbeddingConfig {
+    fn verified_bundle_path(&self) -> ostk_fleet_recall::Result<PathBuf>;
+    fn pinned_model_identity(&self) -> String;
+}
+
+impl PinnedEmbeddingConfig for FleetConfig {
+    fn verified_bundle_path(&self) -> ostk_fleet_recall::Result<PathBuf> {
+        Self::verify_embedding_model_bundle(self)
+    }
+
+    fn pinned_model_identity(&self) -> String {
+        Self::embedding_model_identity(self)
+    }
+}
+
+impl PinnedEmbeddingConfig for PublicationConfig {
+    fn verified_bundle_path(&self) -> ostk_fleet_recall::Result<PathBuf> {
+        Self::verify_embedding_model_bundle(self)
+    }
+
+    fn pinned_model_identity(&self) -> String {
+        Self::embedding_model_identity(self)
+    }
+}
+
+fn load_pinned_embedder(config: &impl PinnedEmbeddingConfig) -> anyhow::Result<PinnedEmbedder> {
+    let canonical_before = config.verified_bundle_path()?;
     let local_path = canonical_before.to_str().ok_or_else(|| {
         anyhow::anyhow!("embedding model bundle path must be valid UTF-8 for model2vec")
     })?;
     let inner = Embedder::load(local_path).context("load verified local embedding model bundle")?;
-    let canonical_after = config.verify_embedding_model_bundle()?;
+    let canonical_after = config.verified_bundle_path()?;
     ensure!(
         canonical_before == canonical_after,
         "embedding model bundle path changed while the model was loading"
@@ -1035,7 +1131,7 @@ fn load_pinned_embedder(config: &FleetConfig) -> anyhow::Result<PinnedEmbedder> 
     );
     Ok(PinnedEmbedder {
         inner,
-        identity: config.embedding_model_identity(),
+        identity: config.pinned_model_identity(),
     })
 }
 
@@ -1359,7 +1455,7 @@ mod tests {
 
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
-    use ostk_fleet_recall::service::{RememberRequest, RememberResult, ServiceResult};
+    use ostk_fleet_recall::service::ServiceResult;
     use ostk_recall_core::PrivacyTier;
     use tower::ServiceExt as _;
     use uuid::Uuid;
@@ -1377,6 +1473,39 @@ mod tests {
         .expect("scope")
     }
 
+    #[test]
+    fn commands_select_only_their_dedicated_database_identity() {
+        assert_eq!(
+            Command::Demo {
+                listen: "127.0.0.1:8080".parse().expect("listen address"),
+            }
+            .runtime_database_identity(),
+            RuntimeDatabaseIdentity::Publication
+        );
+        for command in [
+            Command::Serve,
+            Command::Migrate,
+            Command::Health,
+            Command::Ingest { input: "-".into() },
+            Command::ReferenceAgent {
+                step: ReferenceAgentStep::RecordDecision,
+                run_id: "run-1".into(),
+            },
+        ] {
+            assert_eq!(
+                command.runtime_database_identity(),
+                RuntimeDatabaseIdentity::Writer
+            );
+        }
+        assert_eq!(
+            Command::ModelDigest {
+                bundle: PathBuf::from("model"),
+            }
+            .runtime_database_identity(),
+            RuntimeDatabaseIdentity::None
+        );
+    }
+
     #[derive(Default)]
     struct DemoService {
         queries: Mutex<Vec<String>>,
@@ -1388,7 +1517,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl FleetMemoryService for DemoService {
+    impl FleetRecallService for DemoService {
         async fn recall(
             &self,
             scope: FleetScope,
@@ -1446,14 +1575,6 @@ mod tests {
                     "score": 0.97
                 }]
             })))
-        }
-
-        async fn remember(
-            &self,
-            _scope: FleetScope,
-            _request: RememberRequest,
-        ) -> ServiceResult<RememberResult> {
-            panic!("the public demo router must never expose remember")
         }
     }
 
@@ -1536,7 +1657,7 @@ mod tests {
     }
 
     fn controlled_demo_state(
-        service: Arc<dyn FleetMemoryService>,
+        service: Arc<dyn FleetRecallService>,
         clock: Arc<ManualDemoClock>,
         status_policy: DemoRatePolicy,
         recall_policy: DemoRatePolicy,
@@ -1562,7 +1683,7 @@ mod tests {
     }
 
     fn controlled_demo_router(
-        service: Arc<dyn FleetMemoryService>,
+        service: Arc<dyn FleetRecallService>,
         clock: Arc<ManualDemoClock>,
         status_policy: DemoRatePolicy,
         recall_policy: DemoRatePolicy,
