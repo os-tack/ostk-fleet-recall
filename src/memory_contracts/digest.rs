@@ -187,6 +187,18 @@ pub enum DigestDomain {
 
     // --- W0-ACT domains ---
     // --- W1 domains (evidence ledger, head witness, remember/evidence/relation runtime) ---
+    /// W1-APPEND. Offset-zero chain digest of one lazily seeded evidence shard
+    /// head, framed over the genesis log-epoch ID and the shard number.
+    ///
+    /// This domain is deliberately NOT [`DigestDomain::GenesisChain`]: the
+    /// control ledger's genesis chain frames the bootstrap receipt digest, the
+    /// epoch ID, and a `u16` shard, and its heads are seeded eagerly by the
+    /// bootstrap ceremony. The evidence ledger's heads are seeded lazily by the
+    /// appender inside the append transaction (ADR 0002 D1), so a head row is
+    /// fully determined by `(epoch, shard)` and can grant no forgeable
+    /// authority. Sharing one domain across the two ledgers would make an
+    /// evidence offset-zero digest replayable as a control one.
+    EvidenceGenesisChainV1, // W1-APPEND
 }
 
 impl DigestDomain {
@@ -291,6 +303,7 @@ impl DigestDomain {
 
             // --- W0-ACT prefixes ---
             // --- W1 prefixes ---
+            Self::EvidenceGenesisChainV1 => "ostk-evidence-genesis-chain-v1", // W1-APPEND
         }
     }
 }
