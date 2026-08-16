@@ -11,8 +11,8 @@ A receipt binds, as independently typed witnesses:
 - `watermark`: a typed union — a `cursor` (opaque provider-specific bytes) or a `provider_sequence` (an ordered integer) — never both, never neither.
 - `completeness`: `complete`, `partial`, or `unknown`.
 - `freshness`: `current` or `stale`, always paired with the exact `freshness_rule` it was evaluated under.
-- `continuity`: `contiguous`, or `gap_detected` with an optional bounded `gap` description (`gap_after`/`gap_before`, same watermark kind, strictly ordered so the gap has a provable, non-empty extent).
-- `observed_through`: the exact time the producer's reading extends to. It is a required field: a receipt that omits it fails to decode at all rather than defaulting to "now" or "unbounded".
+- `continuity`: `contiguous` (wire form `{"state":"contiguous"}`, encoded as a fieldless *struct* variant — `Contiguous {}` in Rust — specifically so `#[serde(deny_unknown_fields)]` rejects any other key placed beside `state`; see "Digests and decode strictness" below), or `gap_detected` with an optional bounded `gap` description (`gap_after`/`gap_before`, same watermark kind, strictly ordered so the gap has a provable, non-empty extent).
+- `observed_through`: the exact time the producer's reading extends to. It is a required field: a receipt that omits it fails to decode at all rather than defaulting to "now" or "unbounded". `CoverageReceiptV1::validate()` additionally rejects any receipt where `observed_through < scope.window.window_end` (COVER-02): a receipt may claim coverage of its window only if reading actually reached the end of that half-open interval.
 - `proof_basis`: a closed `method` (`enumerated_snapshot`, `closed_cursor_interval`, `exhaustive_ast_walk`, `closed_provider_query`) plus the exact `proof_method_registration` it was admitted under.
 - `source_digest`/`source_count`/`evidence_id`: the exact source material and accepted-event identity the receipt is attesting to.
 
@@ -25,7 +25,7 @@ Completeness, freshness, and sequence continuity are recorded as three separate 
 `negative_support_admissible(receipt, condition) -> bool` is the one place this module lets a caller move from "here is a coverage receipt and a finding" to "that finding may back a negative proposition or a verified provenance gap." It returns `true` only when *every* one of the following holds, with no default and no fallback (PRED-03):
 
 - `condition` is exactly `EvaluatedConditionV1::Absent` — `present` and `indeterminate` are never negatively supported, regardless of receipt quality;
-- `receipt.validate()` succeeds (well-formed shape, ordered window, registered non-zero freshness rule and proof method, and a structurally valid bounded gap when one is present);
+- `receipt.validate()` succeeds (well-formed shape, ordered window, `observed_through` reaching the window's end, registered non-zero freshness rule and proof method, and a structurally valid bounded gap when one is present);
 - `completeness` is exactly `Complete` — `Partial` and `Unknown` never qualify;
 - `freshness.state` is exactly `Current` — `Stale` never qualifies;
 - `continuity` is exactly `Contiguous` — `GapDetected` never qualifies, with or without a bounded `gap` description, and even when `completeness` independently claims `Complete`.
@@ -53,15 +53,19 @@ Negative vectors (each decodes to the same canonical positive shape with exactly
 - `negative-unregistered-proof-method.jsonl` — `proof_basis.proof_method_registration.entry_digest` is the all-zero digest (COVER-03: only a *registered* proof method counts).
 - `negative-unregistered-freshness-rule.jsonl` — `freshness.freshness_rule.entry_digest` is the all-zero digest (freshness must be stated under a named, registered rule, never a bare boolean).
 - `negative-floating-value.jsonl` — `source_count` is `1.5` (the strict canonical JSON profile forbids floats outright; decode fails before any typed validation runs).
-- `negative-unknown-field.jsonl` — an extra top-level `unexpected` key (`#[serde(deny_unknown_fields)]` on every type in this module).
+- `negative-unknown-field.jsonl` — an extra top-level `unexpected` key (`#[serde(deny_unknown_fields)]` on every type in this module — see the caveat about fieldless enum variants under "Digests and decode strictness" below, and `negative-nested-unknown-field-continuity.jsonl` for the nested case).
 - `negative-zero-schema-version.jsonl` — `schema_version: 0` (schema version pinning).
 - `negative-gap-mismatched-watermark-kinds.jsonl` — `continuity.gap.gap_after` is a `cursor` watermark while `gap_before` is a `provider_sequence` watermark (a gap's endpoints must share one watermark kind).
 - `negative-gap-unordered-sequence.jsonl` — `continuity.gap.gap_after.sequence` (9) is not strictly less than `gap_before.sequence` (5) (a gap must have a provable, non-empty, ordered extent).
 - `negative-arbitrary-json-value.jsonl` — the entire record is a bare JSON array (`[1,2,3]`) instead of an object; proves the type rejects arbitrary JSON shapes, not just malformed objects.
+- `negative-nested-unknown-field-continuity.jsonl` — `continuity` is `{"gap":{...},"state":"contiguous"}`: a structurally well-formed gap description smuggled beside a `contiguous` state (a NESTED, non-top-level unknown key). Fails `decode_strict` because `SequenceContinuityV1::Contiguous` is a fieldless *struct* variant, so `deny_unknown_fields` rejects the extra `gap` key; before that fix this byte string decoded to the same `Contiguous` value as the clean fixture and produced the identical `receipt_id()`, defeating same-ID-different-bytes protection for the one field COVER-03 makes load-bearing.
+- `negative-observed-through-before-window-end.jsonl` — `observed_through` equals `scope.window.window_start` instead of `window_end`, on an otherwise-clean `complete`+`current`+`contiguous` receipt (COVER-02: a receipt cannot claim complete coverage of an interval it never read through to the end). Decodes cleanly; fails only at `CoverageReceiptV1::validate()`.
 
 `matrix-complete-current-gap_detected.jsonl` additionally stands in for "receipt claims `complete` completeness while `continuity` is `gap_detected`, evaluated against a negative (`absent`) condition": the fixture decodes and validates cleanly (COVER-03 makes that combination structurally legal), and the Rust suite asserts `negative_support_admissible` returns `false` for it regardless of `condition`, because `gap_detected` continuity always fails admission for negative support independent of the completeness field (COVER-03).
 
-## Digests
+## Digests and decode strictness
+
+serde's `#[serde(tag = "...", deny_unknown_fields)]` on an internally-tagged enum enforces `deny_unknown_fields` for STRUCT variants (`GapDetected { gap }`) but, prior to a fix in this module, did NOT enforce it for a bare UNIT variant (a plain `Contiguous` with no braces): an object carrying the tag key plus any other key still decoded to the unit variant, silently dropping the extra key. Because `receipt_id()` binds the full canonical receipt and two different canonical byte strings that decode to an `==` value produce the identical digest, that gap meant a receipt carrying a smuggled `gap` description could decode as plain `contiguous` under the same `receipt_id()` as a receipt with no such description — defeating the one witness COVER-03 makes load-bearing for negative support. The fix is to declare every otherwise-fieldless enum variant as a struct variant with explicit empty braces (`Contiguous {}` rather than `Contiguous`); the wire form is unchanged (still `{"state":"contiguous"}`) but the pattern now goes through serde's map-visitor path, which does enforce `deny_unknown_fields`. `negative-nested-unknown-field-continuity.jsonl` is the vector that proves this. Any future fieldless enum variant added to this module must use the same `{}` form, not a bare unit variant.
 
 `CoverageReceiptV1::receipt_id()` is:
 
@@ -69,7 +73,7 @@ Negative vectors (each decodes to the same canonical positive shape with exactly
 
 using the shared `ostk-canonical-json-v1` profile and the project's `domain_separated_digest` framing (the fixed domain prefix, one `0x00` separator byte, then the canonical JSON bytes with no other framing). The preimage is the *entire* canonical receipt: every field in this module, including ones `negative_support_admissible` never inspects (such as `source_count` or `producer`), changes the bound identity. W0-OBS and connector call sites are expected to cite a coverage receipt by this exact digest, so any field change is a contract-version change for anything that already cited the old digest.
 
-`vector-suite.jsonl` aggregates: `schema_version`, a `fixture_authority` disclaimer (structural fixtures only, no active-registry or runtime witness), the `canonical_receipt_id` of the sole admissible matrix cell, `matrix_case_count` (12), `negative_case_count` (10), and the strictly sorted, unique `negative_cases` label set. Its own pin is `domain_separated_digest(DigestDomain::TestVectorManifest, <raw file bytes minus the framing LF>)`, following the existing `TestVectorManifest` domain rather than introducing a new one — the suite manifest is not itself an identity-bearing wire artifact.
+`vector-suite.jsonl` aggregates: `schema_version`, a `fixture_authority` disclaimer (structural fixtures only, no active-registry or runtime witness), the `canonical_receipt_id` of the sole admissible matrix cell, `matrix_case_count` (12), `negative_case_count` (12), and the strictly sorted, unique `negative_cases` label set. Its own pin is `domain_separated_digest(DigestDomain::TestVectorManifest, <raw file bytes minus the framing LF>)`, following the existing `TestVectorManifest` domain rather than introducing a new one — the suite manifest is not itself an identity-bearing wire artifact.
 
 Every fixture's raw file bytes (including the framing LF) are additionally pinned by a plain, non-domain-separated SHA-256 in the Rust test suite, so an accidental byte change to any fixture — even one that still parses and validates — is caught.
 

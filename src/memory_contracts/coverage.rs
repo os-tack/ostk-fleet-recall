@@ -238,7 +238,7 @@ impl SequenceGapV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SequenceContinuityV1 {
-    Contiguous,
+    Contiguous {},
     GapDetected { gap: Option<SequenceGapV1> },
 }
 
@@ -251,7 +251,7 @@ impl SequenceContinuityV1 {
     }
 
     const fn is_contiguous(&self) -> bool {
-        matches!(self, Self::Contiguous)
+        matches!(self, Self::Contiguous {})
     }
 }
 
@@ -316,6 +316,15 @@ impl CoverageReceiptV1 {
         self.proof_basis.validate()?;
         if self.schema_version != COVERAGE_SCHEMA_VERSION {
             return Err(ContractError::Schema("invalid coverage receipt".into()));
+        }
+        // COVER-02: a receipt may claim coverage of its scope's window only
+        // if reading actually reached the end of that half-open interval.
+        // `observed_through` short of `window_end` means the receipt asserts
+        // completeness over ground it never read.
+        if self.observed_through < self.scope.window.window_end {
+            return Err(ContractError::Schema(
+                "observed_through must reach the end of the covered window".into(),
+            ));
         }
         // Reject a programmatically constructed value that the strict
         // canonical profile itself would refuse to emit (for example an
@@ -493,6 +502,12 @@ mod tests {
     const NEGATIVE_ARBITRARY_JSON_VALUE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/coverage/negative-arbitrary-json-value.jsonl"
     );
+    const NEGATIVE_NESTED_UNKNOWN_FIELD_CONTINUITY: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/coverage/negative-nested-unknown-field-continuity.jsonl"
+    );
+    const NEGATIVE_OBSERVED_THROUGH_BEFORE_WINDOW_END: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/coverage/negative-observed-through-before-window-end.jsonl"
+    );
     const EVALUATED_CONDITION_PRESENT: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/coverage/evaluated-condition-present.jsonl"
     );
@@ -563,6 +578,10 @@ mod tests {
         "6ed51a9e6b6b32cc9329d59476d00fc866290e98834cc16d0f5d09c639868f8c";
     const NEGATIVE_ARBITRARY_JSON_VALUE_RAW_SHA256: &str =
         "9c6bc7ac937d2daffe5ecdbe7eb3a59aba4f43e96a58a99f08838d4ce48c92ba";
+    const NEGATIVE_NESTED_UNKNOWN_FIELD_CONTINUITY_RAW_SHA256: &str =
+        "25e2adf454aa5a063e78fecdb1bb5acc78dbae7879ad630b4a6733a08db7987c";
+    const NEGATIVE_OBSERVED_THROUGH_BEFORE_WINDOW_END_RAW_SHA256: &str =
+        "29373cfecb2d06f94888d6d5ae8e59416d57b9d39190d3f30f85d85ee5483c5b";
     const EVALUATED_CONDITION_PRESENT_RAW_SHA256: &str =
         "87f7439876e4033adb5735dd9e8a4031ef2be2239574b1a83398efca11784151";
     const EVALUATED_CONDITION_ABSENT_RAW_SHA256: &str =
@@ -570,7 +589,7 @@ mod tests {
     const EVALUATED_CONDITION_INDETERMINATE_RAW_SHA256: &str =
         "e2a4db258cdc6e923416ddf6f071c079c1ad524c35ff11ce24facbad55cd1859";
     const VECTOR_SUITE_RAW_SHA256: &str =
-        "4aa9e06373ea013cd2fc9449d30abb57947cbab9c4d4d90724e2316b255dfb94";
+        "86de32d0be0bd4d03eca1c19b9bf305adeace17fa28791558d22d0d86400dc06";
 
     const SCOPE_URI: &str = "urn:ostk:entity:v1:repository:sha256:1111111111111111111111111111111111111111111111111111111111111111";
     const REVISION_HEX: &str = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -609,7 +628,7 @@ mod tests {
         "3cee8a812644b227eff1da851263f4729a60a572f2e41bcf50587dba06609353";
 
     const VECTOR_SUITE_DIGEST: &str =
-        "d8c667f4456306cca01ab8e70b512377e142ffeb96c22d8266df7fbb7e750e25";
+        "70512bca5e4323a1c050b05c16ea997f4e66f7f7fd78536bf28ed016686e749d";
 
     fn digest(value: &str) -> Sha256Digest {
         Sha256Digest::from_str(value).expect("hard-coded digest must be lowercase SHA-256")
@@ -803,7 +822,7 @@ mod tests {
         ];
         let freshness_values = [freshness_current(), freshness_stale()];
         let continuity_values = [
-            SequenceContinuityV1::Contiguous,
+            SequenceContinuityV1::Contiguous {},
             SequenceContinuityV1::GapDetected { gap: None },
             SequenceContinuityV1::GapDetected {
                 gap: Some(SequenceGapV1 {
@@ -828,7 +847,7 @@ mod tests {
                         let expected = condition == EvaluatedConditionV1::Absent
                             && completeness == CoverageCompletenessV1::Complete
                             && freshness.state == FreshnessStateV1::Current
-                            && matches!(continuity, SequenceContinuityV1::Contiguous);
+                            && matches!(continuity, SequenceContinuityV1::Contiguous {});
                         assert_eq!(
                             admissible, expected,
                             "completeness={completeness:?} freshness={:?} continuity={continuity:?} condition={condition:?}",
@@ -859,7 +878,7 @@ mod tests {
         let receipt = base_receipt(
             CoverageCompletenessV1::Complete,
             freshness_current(),
-            SequenceContinuityV1::Contiguous,
+            SequenceContinuityV1::Contiguous {},
         );
         assert!(negative_support_admissible(
             &receipt,
@@ -880,7 +899,7 @@ mod tests {
         let mut receipt = base_receipt(
             CoverageCompletenessV1::Complete,
             freshness_current(),
-            SequenceContinuityV1::Contiguous,
+            SequenceContinuityV1::Contiguous {},
         );
         receipt.scope.window.window_end = receipt.scope.window.window_start.clone();
         assert!(receipt.validate().is_err());
@@ -892,7 +911,7 @@ mod tests {
         let mut unregistered = base_receipt(
             CoverageCompletenessV1::Complete,
             freshness_current(),
-            SequenceContinuityV1::Contiguous,
+            SequenceContinuityV1::Contiguous {},
         );
         unregistered
             .proof_basis
@@ -909,7 +928,7 @@ mod tests {
         let receipt = base_receipt(
             CoverageCompletenessV1::Complete,
             freshness_current(),
-            SequenceContinuityV1::Contiguous,
+            SequenceContinuityV1::Contiguous {},
         );
         let id_once = receipt.receipt_id().unwrap();
         let id_again = receipt.receipt_id().unwrap();
@@ -993,7 +1012,7 @@ mod tests {
                 MATRIX_COMPLETE_CURRENT_CONTIGUOUS,
                 CoverageCompletenessV1::Complete,
                 freshness_current(),
-                SequenceContinuityV1::Contiguous,
+                SequenceContinuityV1::Contiguous {},
                 MATRIX_COMPLETE_CURRENT_CONTIGUOUS_RECEIPT_ID,
             ),
             (
@@ -1012,7 +1031,7 @@ mod tests {
                 MATRIX_COMPLETE_STALE_CONTIGUOUS,
                 CoverageCompletenessV1::Complete,
                 freshness_stale(),
-                SequenceContinuityV1::Contiguous,
+                SequenceContinuityV1::Contiguous {},
                 MATRIX_COMPLETE_STALE_CONTIGUOUS_RECEIPT_ID,
             ),
             (
@@ -1031,7 +1050,7 @@ mod tests {
                 MATRIX_PARTIAL_CURRENT_CONTIGUOUS,
                 CoverageCompletenessV1::Partial,
                 freshness_current(),
-                SequenceContinuityV1::Contiguous,
+                SequenceContinuityV1::Contiguous {},
                 MATRIX_PARTIAL_CURRENT_CONTIGUOUS_RECEIPT_ID,
             ),
             (
@@ -1045,7 +1064,7 @@ mod tests {
                 MATRIX_PARTIAL_STALE_CONTIGUOUS,
                 CoverageCompletenessV1::Partial,
                 freshness_stale(),
-                SequenceContinuityV1::Contiguous,
+                SequenceContinuityV1::Contiguous {},
                 MATRIX_PARTIAL_STALE_CONTIGUOUS_RECEIPT_ID,
             ),
             (
@@ -1059,7 +1078,7 @@ mod tests {
                 MATRIX_UNKNOWN_CURRENT_CONTIGUOUS,
                 CoverageCompletenessV1::Unknown,
                 freshness_current(),
-                SequenceContinuityV1::Contiguous,
+                SequenceContinuityV1::Contiguous {},
                 MATRIX_UNKNOWN_CURRENT_CONTIGUOUS_RECEIPT_ID,
             ),
             (
@@ -1073,7 +1092,7 @@ mod tests {
                 MATRIX_UNKNOWN_STALE_CONTIGUOUS,
                 CoverageCompletenessV1::Unknown,
                 freshness_stale(),
-                SequenceContinuityV1::Contiguous,
+                SequenceContinuityV1::Contiguous {},
                 MATRIX_UNKNOWN_STALE_CONTIGUOUS_RECEIPT_ID,
             ),
             (
@@ -1103,7 +1122,7 @@ mod tests {
             );
             let expected_admissible = *completeness == CoverageCompletenessV1::Complete
                 && freshness.state == FreshnessStateV1::Current
-                && matches!(continuity, SequenceContinuityV1::Contiguous);
+                && matches!(continuity, SequenceContinuityV1::Contiguous {});
             assert_eq!(
                 negative_support_admissible(&decoded, EvaluatedConditionV1::Absent),
                 expected_admissible
@@ -1134,11 +1153,42 @@ mod tests {
             NEGATIVE_GAP_MISMATCHED_WATERMARK_KINDS,
             NEGATIVE_GAP_UNORDERED_SEQUENCE,
             NEGATIVE_ARBITRARY_JSON_VALUE,
+            NEGATIVE_NESTED_UNKNOWN_FIELD_CONTINUITY,
+            NEGATIVE_OBSERVED_THROUGH_BEFORE_WINDOW_END,
         ] {
             let outcome = decode_strict::<CoverageReceiptV1>(record(bytes))
                 .and_then(|receipt| receipt.validate());
             assert!(outcome.is_err(), "fixture unexpectedly accepted");
         }
+    }
+
+    /// A `Contiguous` continuity value with a smuggled `gap` key must be
+    /// rejected at DECODE (not merely at validate), because
+    /// `#[serde(deny_unknown_fields)]` on an internally-tagged enum does not
+    /// by itself reject extra keys on a fieldless variant — see the
+    /// `Contiguous {}` fix. Two distinct canonical byte strings must never
+    /// decode to the same `CoverageReceiptV1`.
+    #[test]
+    fn contiguous_with_smuggled_gap_key_is_rejected_at_decode() {
+        let outcome =
+            decode_strict::<CoverageReceiptV1>(record(NEGATIVE_NESTED_UNKNOWN_FIELD_CONTINUITY));
+        assert!(
+            outcome.is_err(),
+            "a gap key nested under a contiguous continuity value must not decode"
+        );
+    }
+
+    /// COVER-02: a receipt cannot claim coverage of a window it never read
+    /// through to the end.
+    #[test]
+    fn observed_through_short_of_window_end_is_rejected_at_validate() {
+        let decoded: CoverageReceiptV1 =
+            decode_strict(record(NEGATIVE_OBSERVED_THROUGH_BEFORE_WINDOW_END)).unwrap();
+        assert!(decoded.validate().is_err());
+        assert!(!negative_support_admissible(
+            &decoded,
+            EvaluatedConditionV1::Absent
+        ));
     }
 
     #[test]
@@ -1249,6 +1299,14 @@ mod tests {
                 NEGATIVE_ARBITRARY_JSON_VALUE,
                 NEGATIVE_ARBITRARY_JSON_VALUE_RAW_SHA256,
             ),
+            (
+                NEGATIVE_NESTED_UNKNOWN_FIELD_CONTINUITY,
+                NEGATIVE_NESTED_UNKNOWN_FIELD_CONTINUITY_RAW_SHA256,
+            ),
+            (
+                NEGATIVE_OBSERVED_THROUGH_BEFORE_WINDOW_END,
+                NEGATIVE_OBSERVED_THROUGH_BEFORE_WINDOW_END_RAW_SHA256,
+            ),
             (VECTOR_SUITE_FIXTURE, VECTOR_SUITE_RAW_SHA256),
         ] {
             assert_eq!(raw_sha256(bytes), expected);
@@ -1278,8 +1336,8 @@ mod tests {
             canonical_receipt.receipt_id().unwrap()
         );
         assert_eq!(suite.matrix_case_count, 12);
-        assert_eq!(suite.negative_case_count, 10);
-        assert_eq!(suite.negative_cases.len(), 10);
+        assert_eq!(suite.negative_case_count, 12);
+        assert_eq!(suite.negative_cases.len(), 12);
         let mut sorted = suite.negative_cases.clone();
         sorted.sort();
         sorted.dedup();
