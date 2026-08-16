@@ -1,0 +1,117 @@
+{
+  "schema": "fleet-localstack-publication-proof-v1",
+  "verified": true,
+  "capture": "live-local-emulator",
+  "generated_at": "2026-08-16T13:17:02Z",
+  "source": {
+    "vcs_ref": "cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4",
+    "tracked_tree_clean": true
+  },
+  "cleanup": {
+    "mode": "release",
+    "fixed_project_containers_absent": true,
+    "publication_secret_volume_absent": true
+  },
+  "images": {
+    "public_production": {
+      "target": "production",
+      "config_digest": "sha256:4a855304aeb9d8fd6d5d817ff39c258204569492ab09438838c5d9b7ebb83a23",
+      "manifest_digest": "sha256:4a855304aeb9d8fd6d5d817ff39c258204569492ab09438838c5d9b7ebb83a23",
+      "uid_gid": "10001:10001",
+      "aws_cli_absent": true
+    },
+    "private_helper": {
+      "target": "localstack",
+      "config_digest": "sha256:a3f6dcb6a38c5b7a080c896d68bb7b4248fd05b5faad0ec6bdd1c58dce06e29b",
+      "manifest_digest": "sha256:a3f6dcb6a38c5b7a080c896d68bb7b4248fd05b5faad0ec6bdd1c58dce06e29b",
+      "externally_reachable": false
+    }
+  },
+  "database": {
+    "engine": "CockroachDB v26.2.3",
+    "transport": "insecure-local-only",
+    "migration_prefix": {
+      "first": 1,
+      "last": 17,
+      "successful_rows": 17,
+      "fingerprint_sha256": "6fabd0caf623133da20c73e1dbf79106f372330c2c6a1c58aab1ad14b2505194"
+    },
+    "publication_policy_sha256": "ff3ada75aba9443875efb1f430a14829ef864b3f7409ae5d23f7bd381cb65226",
+    "publication_grant_fingerprint_sha256": "83a05c48966c1174a4855780389c8cf4e5465d59c54d843557100a4872707f57",
+    "publication_principal": "fleet_publication",
+    "publication_role": "fleet_publication_reader",
+    "direct_read_succeeded": true,
+    "direct_dml_ddl_delegation_denied": true
+  },
+  "model_bundle_sha256": "2b0a528493d642b36bbc193c74bf657cf8034e0e995f205cc04b315174e05fa1",
+  "public_app": {
+    "database_input": "FLEET_RECALL_PUBLICATION_DATABASE_URL",
+    "private_database_inputs_absent": true,
+    "status_and_recall_succeeded": true,
+    "writer_command_denied": true,
+    "replacement_preserved_recall": true
+  },
+  "writer_scenario": {
+    "schema_version": 1,
+    "verified": true,
+    "evidence_kind": "fleet-recall-mcp-scenario",
+    "capture": "live",
+    "run_id": "20260816T131628Z-2736",
+    "generated_at": "2026-08-16T13:16:35Z",
+    "scenario": "20260816T131628Z-2736",
+    "provenance": {
+      "generator": "deploy/localstack/fleet-demo.sh",
+      "backend": "cockroachdb",
+      "transport": "mcp-stdio",
+      "ostk_used": false,
+      "llm_used": false,
+      "cloud_used": false
+    },
+    "identities": {
+      "writer": "agent-a",
+      "retriever": "agent-b",
+      "conflicting_writer": "agent-c",
+      "resumed": "agent-b"
+    },
+    "agent_a": {
+      "claim_id": 1,
+      "committed": true,
+      "replay_deduplicated": true
+    },
+    "agent_b": {
+      "recalled_claim_id": 1,
+      "retrieval_lanes": [
+        "lexical",
+        "dense"
+      ],
+      "fusion": "rrf",
+      "cross_project_request_rejected": true,
+      "action_claim_id": 2,
+      "action": "hold workers until migration completes",
+      "action_based_on_claim_id": 1,
+      "escalation_claim_id": 4,
+      "escalation": "pause rollout for operator review",
+      "escalation_conflict_id": 1
+    },
+    "agent_c": {
+      "claim_id": 3,
+      "incompatible_value_recorded": true
+    },
+    "conflict": {
+      "id": 1,
+      "state": "open",
+      "member_claim_ids": [
+        1,
+        3
+      ]
+    }
+  },
+  "limitations": {
+    "aws_apply_performed": false,
+    "tls_proved": false,
+    "database_password_authentication_proved": false,
+    "iam_enforcement_proved": false,
+    "fargate_proved": false,
+    "iam_policy_body_gate": "separate deploy/aws Terraform tests; not executed by this harness"
+  }
+}

@@ -177,8 +177,8 @@ line_count=$(wc -l < "$input" | tr -d '[:space:]')
 case $line_count in
     ''|*[!0-9]*) fail "line count is not numeric" ;;
 esac
-if [ "$line_count" -ne 4181 ]; then
-    fail "record count must be exactly 4181 (found $line_count)"
+if [ "$line_count" -ne 4227 ]; then
+    fail "record count must be exactly 4227 (found $line_count)"
 fi
 
 if awk 'length($0) > 16384 { exit 1 }' "$input"; then
@@ -368,9 +368,9 @@ if ! jq -s -e \
     | ($expected_doc_sources | length) == 32
     and ($expected_repository_sources | length) == 233
     and
-    ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 800
+    ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 841
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 3175
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 3180
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:docs:v1") | .source_id] | unique | sort)
         == $expected_doc_sources

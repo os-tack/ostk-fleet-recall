@@ -44,6 +44,18 @@ private migrations or ceremonies ran in AWS. Updating this runbook is not
 authorization to rerun the live migration task, alter grants, or apply
 Terraform.
 
+The older LocalStack receipt remains historical application-image evidence only
+through migration 9. Separately, a clean-checkout PUBLIC-03 LocalStack run at
+commit `cd6ecfc` passed the current prefix-17 migration, three-secret
+publication boundary, denial probes, and task replacement. Its
+[durable receipt](../../docs/evidence/localstack-publication-cd6ecfc-20260816.json)
+records an insecure local CockroachDB lane and explicitly marks AWS apply, IAM
+enforcement, TLS, database-password authentication, and Fargate as unproved.
+The official local CockroachDB v26.2.3 TLS wrapper passes the connected
+publication proof, and all 21 Terraform configuration tests pass. Current
+Terraform remains unapplied: these results do not claim an AWS deployment or
+activation and do not change the historical revision-10 facts above.
+
 ## Prerequisites
 
 - Terraform 1.10 or newer, AWS CLI v2, Docker Buildx, and `jq`.
@@ -51,13 +63,14 @@ Terraform.
   subnets in at least two availability zones. Private subnets need NAT egress,
   or VPC endpoints for ECR, S3, Secrets Manager, and CloudWatch plus a route to
   CockroachDB Cloud.
-- A CockroachDB Cloud database and two SQL users in production: a
-  DDL-capable migrator and a least-privilege runtime user. See
+- A CockroachDB Cloud database and three externally provisioned SQL logins: a
+  DDL-capable migrator, a private writer for seed/reference/MCP DML, and the
+  fixed `fleet_publication` login for the public demo. See
   [MIGRATIONS.md](../../docs/MIGRATIONS.md).
-- Two distinct Secrets Manager secrets whose *raw values* are the corresponding
-  `postgresql://` URLs. Keep `sslmode=verify-full`. Terraform requires both
-  concrete ARNs and rejects reuse, so credentials never enter Terraform
-  configuration or state.
+- Three distinct Secrets Manager secrets whose *raw values* are the
+  corresponding `postgresql://` URLs. Keep `sslmode=verify-full`. Terraform
+  requires all three concrete ARNs and rejects missing, wildcard, or colliding
+  references, so credentials never enter Terraform configuration or state.
 - A private, encrypted S3 bucket containing exactly the model files consumed
   at runtime under one immutable release prefix:
 
@@ -75,16 +88,25 @@ with an Elastic IP is the simplest demo arrangement; add that IP to the Cloud
 cluster allowlist. Private connectivity is preferable for a production fleet.
 
 **Upgrade gate before any plan or apply:**
-`migration_database_url_secret_arn` is now a required input and must differ
-from `database_url_secret_arn`. An older workspace or `terraform.tfvars` that
-provided only the runtime secret is not ready to plan this module. First create
-or identify a separate DDL-only migrator principal, store its TLS URL as a raw
-value in a distinct Secrets Manager secret, record only its concrete ARN, add
-that ARN to `terraform.tfvars`, and run the local Terraform tests. Then review
-a plan that shows the dedicated migration execution role, secret policy, and
-task definition using only that ARN. Do not apply merely because this runbook
-describes the upgrade; secret creation, plan approval, and apply remain
-separate operator-authorized actions.
+`publication_database_url_secret_arn`, `database_url_secret_arn`, and
+`migration_database_url_secret_arn` are required pairwise-distinct concrete
+inputs for the publication reader, private writer, and DDL-only migrator. An
+older workspace or `terraform.tfvars` with only one or two database secrets is
+not ready to plan this module. Provision the fixed `fleet_publication` login
+outside Terraform in exact quiesced `NOLOGIN` state; Terraform does not create
+CockroachDB identities, memberships, grants, or authentication material. Store
+each strict-TLS URL as one raw value in its own secret and record only its ARN.
+
+If customer-managed secret encryption is used, supply concrete
+`publication_database_secret_kms_key_arns` that are disjoint from the
+writer/migrator `database_secret_kms_key_arns`. Review a plan showing distinct
+publication execution and task roles, the public task consuming only the
+publication secret, and publication decrypt restricted to those
+publication-specific CMKs through the exact Secrets Manager service and secret
+encryption context. The 21 local Terraform configuration tests cover enabled,
+empty, collision, wildcard, and isolation cases and pass. They do not apply
+AWS resources. Secret creation, plan approval, and any apply remain separate
+operator-authorized actions.
 
 The four private commands are workstation-only: `ostk-control-bootstrap`,
 `ostk-registry-activate`, `ostk-registry-successor-activate`, and
@@ -92,7 +114,7 @@ The four private commands are workstation-only: `ostk-control-bootstrap`,
 execution role, SQL-role provisioning, task definition, startup hook, image
 binary, runtime invocation, or route for any of them. Stage 2 and genesis Stage
 3 use dedicated SQL principals only when their private ceremonies run; do not
-reuse either Terraform-managed secret for those credentials. See the
+reuse any current-module Terraform secret for those credentials. See the
 [security policy](../../docs/SECURITY.md) and
 [migration privilege boundary](../../docs/MIGRATIONS.md).
 
@@ -154,11 +176,13 @@ authoritative state. Preserve its versions and access through the judging hold
 and until every managed resource has been intentionally destroyed. Native S3
 lock files require Terraform 1.10 or newer.
 
-The current Terraform suite contains thirteen runs covering dormant bootstrap,
-direct TLS hostname binding, the isolated CloudFront front door,
-mutually-exclusive TLS modes, model-prefix/bucket validation, capacity
-ordering, and supported CloudWatch retention. Passing it validates
-configuration logic; it does not prove that AWS resources have been deployed.
+The current Terraform suite contains 21 passing runs covering dormant
+bootstrap, publication enable/empty/collision isolation, three-secret and KMS
+separation, IAM wildcard rejection, direct TLS hostname binding, the isolated
+CloudFront front door, mutually exclusive TLS modes, model-prefix/bucket
+validation, capacity ordering, and supported CloudWatch retention. Passing it
+validates configuration logic; it does not apply AWS resources or prove that
+anything has been deployed.
 
 Log in to the output repository and push one immutable, architecture-matched
 tag. Run this from the repository root:
@@ -243,20 +267,28 @@ serving startup. Its prefix-16 logical-role policy must be applied by a cluster
 admin; database ownership alone is insufficient. The policy and one-shot CLI
 are a separate, explicitly authorized workstation operation.
 
-The authoritative official-binary lane uses one checksum-pinned,
-build-tag-pinned TLS CockroachDB v26.2.3 server and reports one connected
-result. It proves the v1–v17 migration behavior, three live repositories, the
-named ledger/store proofs, and all four private CLIs, including the successor
-state matrix. The successor/reconciliation RBAC Docker proofs and the other
-Docker role/CLI proofs remain secondary parity results; they cannot be
-substituted for that official result. The recorded LocalStack application
-image smoke predates migrations 10 through 17, so it is not current image
-parity. None of these local proofs says the migrations ran in the historical
-AWS database.
+The fixed external `fleet_publication` login must remain drained and exact
+`NOLOGIN` while a cluster admin audits both publication principals and
+inherited PUBLIC authority across every database and applies
+[`publication-reader-role-grants.sql`](../cockroach/publication-reader-role-grants.sql).
+Freeze role, grant, default, ownership, and schema-DDL changes; repeat the
+external audit if necessary and reapply the policy immediately before the
+separate exact authentication-enable operation. Quiesce/drain the login and
+repeat the sequence after every migration or grant change. Terraform does not
+perform any of these CockroachDB identity or grant operations.
+
+The official local CockroachDB v26.2.3 TLS PUBLIC-03 wrapper passes the
+connected fixed-principal, session, and exact reader-policy proof. Other
+official-binary lanes retain their recorded migration/repository/private-CLI
+scope. The original LocalStack application-image smoke remains historical
+through-migration-9 evidence; the distinct clean `cd6ecfc` PUBLIC-03 run and
+its explicit insecure-local limitations are recorded in the durable receipt
+linked above. None of these local proofs says that current migrations, grants,
+Terraform, or publication activation ran in AWS.
 
 ## 5. Seed the immutable demo corpus
 
-After migration and runtime-user grants, run the idempotent one-off seed task:
+After migration and private-writer grants, run the idempotent one-off seed task:
 
 ```bash
 ./deploy/aws/run-seed.sh
@@ -272,9 +304,10 @@ operations chunks. The default and rich corpora contain no tenant authority or
 secrets. The default invocation ingests
 `/opt/ostk/demo/demo.ndjson`; `--rich-demo` selects
 `/opt/ostk/demo/rich-demo.ndjson`. Both one-off tasks use the least-privilege
-runtime database secret, load and verify the same pinned S3 model, and invoke
-the trusted `ingest` CLI. Stable source coordinates make rerunning either task
-safe. Do not start the public service until both tasks exit zero.
+private-writer database secret, load and verify the same pinned S3 model, and
+invoke the trusted `ingest` CLI. Stable source coordinates make rerunning
+either task safe. Do not start the public service until each selected task exits
+zero.
 
 The 552-row count is bound to the recorded revision-10 image. The current
 rich-demo generator is deterministic for a fixed source revision and manifest,
@@ -420,8 +453,8 @@ action, conflict, and escalation identifiers—including the exact A decision an
 C incompatible claim IDs in both conflict-producing steps—then queries the
 public read-only recall API and requires the exact persisted action and
 escalation claim IDs. Only that fully correlated path emits one `verified: true`
-summary. Each task uses the least-privilege runtime database secret and the
-pinned S3 model bundle.
+summary. Each task uses the least-privilege private-writer database secret and
+the pinned S3 model bundle.
 
 The successful JSON is intentionally publication-sanitized. `aws.task_definition`
 is a `family:revision` coordinate, `aws.log_stream_prefix` is
@@ -600,13 +633,28 @@ dropped, and the temporary workstation network rule was removed after capture.
 - The runtime container is UID/GID `10001`, with no shell login and no inbound
   port except ALB-to-task TCP/8080. The writable layer is required only because
   Fargate downloads a verified model into ephemeral storage on cold start.
-- Separate runtime and migration execution roles each read exactly one database
-  secret. Customer-managed KMS decrypt is restricted to Secrets Manager and
-  that role's exact secret encryption context. The application task role reads
-  only three model objects. There is no wildcard bucket access.
-- The runtime SQL user needs DML on the Fleet Recall tables and read access to
-  `_sqlx_migrations`; it does not need schema creation. The separate migration
-  task definition must inject the distinct DDL-capable secret.
+- The publication, private-writer, and migration execution paths each read only
+  their own database secret. The public application has distinct publication
+  execution and task roles and receives only the publication-reader secret.
+  Its secret policy allows exactly `secretsmanager:GetSecretValue` on that ARN;
+  optional `kms:Decrypt` is limited to concrete publication-specific CMKs with
+  `kms:ViaService` bound to regional Secrets Manager and
+  `kms:EncryptionContext:SecretARN` bound to that exact secret. Those CMKs are
+  disjoint from the writer/migrator list. The publication task role reads only
+  the three exact model object ARNs, with no list, write, or wildcard access.
+- The private writer needs the documented DML and legacy-sequence surface for
+  seed/reference/MCP work; it does not need schema creation. The migration task
+  injects only its distinct DDL-capable secret. Neither secret reaches the
+  public application environment.
+- The fixed external `fleet_publication` login is a member only of the logical
+  `fleet_publication_reader` role, which is forced to `NOLOGIN`. Its entire
+  positive surface is `CONNECT` on `fleet_recall`, `USAGE` on schema `public`,
+  and `SELECT` on exactly `_sqlx_migrations`, `memory_corpus_models`,
+  `memory_chunks`, `memory_claim_embeddings`, `memory_claim_support`,
+  `memory_claims`, `memory_conflict_members`, and `memory_conflicts`. It has no
+  DML, DDL, sequence, system, private-table, ownership, grant-option, or
+  future-default authority. The process also verifies both the decoded URL
+  username and connected `current_user` are exactly `fleet_publication`.
 - Do not grant runtime or any prior one-shot role access to
   `memory_registry_transitions`,
   `memory_registry_genesis_bridge_consumptions`, or
@@ -645,7 +693,9 @@ The [official rules](https://cockroachdb-ai.devpost.com/rules) require the
 working project to remain available free of charge and without restriction
 through the end of judging. Once submitted, keep the ECS service, ALB,
 CloudFront distribution when enabled, HTTPS/DNS route, CockroachDB Cloud
-database, S3 model bundle, runtime secret, network egress, and required logs
+database, S3 model bundle, the database secrets actually used by the historical
+revision-10 deployment, network egress,
+and required logs
 available through **September 15, 2026 at 5:00 PM EDT / 4:00 PM CDT**. Monitor
 `/healthz` and a bounded recall query, and repair failures without revoking judge
 access.

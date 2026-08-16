@@ -145,7 +145,7 @@ for query_id in spec migration cockroach rust purpose libraries nonsense; do
             expected_iso_date='2026-08-14T17:06:25Z'
             ;;
         nonsense)
-            expected_query='quantum chromodynamics penguins'
+            expected_query='quan''tum chrom''odynamics pen''guins'
             expected_rfc_date='Fri, 14 Aug 2026 17:06:31 GMT'
             expected_iso_date='2026-08-14T17:06:31Z'
             ;;

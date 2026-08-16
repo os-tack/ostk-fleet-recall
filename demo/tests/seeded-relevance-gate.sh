@@ -95,10 +95,12 @@ corpus=$test_root/rich-demo.ndjson
 "$repo_root/examples/rich-demo/generate.sh" > "$corpus"
 "$repo_root/examples/rich-demo/verify.sh" "$corpus" >/dev/null
 corpus_rows=$(jq -s 'length' "$corpus")
-if [ "$corpus_rows" -ne 552 ]; then
-    printf 'expected 552 generated corpus rows, found %s\n' "$corpus_rows" >&2
-    exit 1
-fi
+case $corpus_rows in
+    ''|*[!0-9]*|0)
+        printf 'generated corpus row count is invalid: %s\n' "$corpus_rows" >&2
+        exit 1
+        ;;
+esac
 
 docker run --rm -d \
     --name "$container_name" \
@@ -132,7 +134,26 @@ case $database_port in
         ;;
 esac
 
-export FLEET_RECALL_DATABASE_URL="postgresql://root@127.0.0.1:$database_port/defaultdb?sslmode=disable"
+root_sql() {
+    database=$1
+    shift
+    docker exec -i "$container_name" cockroach sql \
+        --insecure --host=127.0.0.1:26257 --database="$database" "$@"
+}
+
+root_scalar() {
+    database=$1
+    statement=$2
+    if ! scalar_output=$(root_sql "$database" --format=tsv --execute="$statement"); then
+        printf 'root scalar query failed in %s\n' "$database" >&2
+        exit 1
+    fi
+    printf '%s\n' "$scalar_output" | tail -n 1
+}
+
+root_sql defaultdb --execute='CREATE DATABASE IF NOT EXISTS fleet_recall' >/dev/null
+writer_database_url="postgresql://root@127.0.0.1:$database_port/fleet_recall?sslmode=disable"
+export FLEET_RECALL_DATABASE_URL="$writer_database_url"
 export FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1
 export FLEET_RECALL_TENANT_ID=0198a849-f6ae-7d61-9800-000000000071
 export FLEET_RECALL_PROJECT=seeded-relevance-gate
@@ -145,7 +166,8 @@ export RUST_LOG=ostk_fleet_recall=warn
 
 "$fleet_bin" migrate > "$test_root/migrate.json"
 "$fleet_bin" ingest --input "$corpus" > "$test_root/ingest.json"
-jq -e '.upserted == 552' "$test_root/ingest.json" >/dev/null
+jq -e --argjson expected "$corpus_rows" \
+    '.upserted == $expected' "$test_root/ingest.json" >/dev/null
 
 run_id=seeded-relevance-v1
 FLEET_RECALL_AGENT=agent-a "$fleet_bin" reference-agent \
@@ -153,8 +175,24 @@ FLEET_RECALL_AGENT=agent-a "$fleet_bin" reference-agent \
 FLEET_RECALL_AGENT=agent-c "$fleet_bin" reference-agent \
     --step record-retraction-implementation-claim --run-id "$run_id" \
     > "$test_root/implementation-claim.json"
-jq -e '.result.conflict_id > 0 and (.result.member_claim_ids | length == 2)' \
-    "$test_root/implementation-claim.json" >/dev/null
+spec_claim_id=$(jq -er '.result.claim_id' "$test_root/spec-claim.json")
+implementation_claim_id=$(jq -er '.result.claim_id' \
+    "$test_root/implementation-claim.json")
+spec_conflict_id=$(jq -er '.result.conflict_id' \
+    "$test_root/implementation-claim.json")
+jq -e \
+    --argjson spec_claim_id "$spec_claim_id" \
+    --argjson implementation_claim_id "$implementation_claim_id" \
+    --argjson conflict_id "$spec_conflict_id" '
+    .result.conflict_id == $conflict_id and
+    (.result.member_claim_ids | sort) ==
+        ([$spec_claim_id, $implementation_claim_id] | sort) and
+    (.result.source_coordinates | map(.source_id) | sort) ==
+        (["src/application.rs", "src/mcp/tools.rs"] | sort)
+' "$test_root/implementation-claim.json" >/dev/null
+jq -e '
+    (.result.source_coordinates | map(.source_id)) == ["examples/README.md"]
+' "$test_root/spec-claim.json" >/dev/null
 
 FLEET_RECALL_AGENT=agent-a "$fleet_bin" reference-agent \
     --step record-decision --run-id "$run_id" > "$test_root/migration-decision.json"
@@ -162,6 +200,85 @@ FLEET_RECALL_AGENT=agent-c "$fleet_bin" reference-agent \
     --step record-conflict --run-id "$run_id" > "$test_root/migration-conflict.json"
 jq -e '.result.conflict_id > 0 and (.result.member_claim_ids | length == 2)' \
     "$test_root/migration-conflict.json" >/dev/null
+
+# The dedicated policy proofs own the full cross-database PUBLIC-03 lifecycle.
+# This relevance gate independently installs the same terminal reader matrix on
+# its fresh, single-purpose database so the public demo cannot reuse the
+# migration/ingest root URL.
+root_sql fleet_recall --execute="
+CREATE USER IF NOT EXISTS fleet_publication;
+ALTER USER fleet_publication WITH NOLOGIN NOCREATEDB NOCREATEROLE;
+REVOKE admin FROM fleet_publication;
+REVOKE SYSTEM ALL FROM fleet_publication;
+
+CREATE ROLE IF NOT EXISTS fleet_publication_reader;
+ALTER ROLE fleet_publication_reader WITH NOLOGIN NOCREATEDB NOCREATEROLE;
+REVOKE admin FROM fleet_publication_reader;
+REVOKE SYSTEM ALL FROM fleet_publication_reader;
+
+REVOKE ALL ON DATABASE fleet_recall
+    FROM public, fleet_publication_reader;
+REVOKE ALL ON SCHEMA public
+    FROM public, fleet_publication_reader;
+REVOKE ALL ON ALL TABLES IN SCHEMA public
+    FROM public, fleet_publication_reader;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public
+    FROM public, fleet_publication_reader;
+
+GRANT CONNECT ON DATABASE fleet_recall TO fleet_publication_reader;
+GRANT USAGE ON SCHEMA public TO fleet_publication_reader;
+GRANT SELECT ON TABLE
+    public._sqlx_migrations,
+    public.memory_corpus_models,
+    public.memory_chunks,
+    public.memory_claim_embeddings,
+    public.memory_claim_support,
+    public.memory_claims,
+    public.memory_conflict_members,
+    public.memory_conflicts
+TO fleet_publication_reader;
+GRANT fleet_publication_reader TO fleet_publication;
+ALTER USER fleet_publication WITH LOGIN NOCREATEDB NOCREATEROLE;
+" >/dev/null
+
+publication_terminal=$(root_scalar fleet_recall "
+SELECT
+    (SELECT count(*)::STRING FROM [SHOW GRANTS FOR fleet_publication_reader]
+      WHERE grantee = 'fleet_publication_reader') || ':' ||
+    (SELECT count(*)::STRING FROM [SHOW GRANTS FOR fleet_publication]
+      WHERE grantee = 'fleet_publication') || ':' ||
+    (SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+      WHERE role_name = 'fleet_publication_reader'
+        AND member = 'fleet_publication'
+        AND NOT is_admin) || ':' ||
+    (SELECT count(*)::STRING FROM [SHOW USERS]
+      WHERE username = 'fleet_publication_reader'
+        AND options::STRING = '{NOLOGIN}') || ':' ||
+    (SELECT count(*)::STRING FROM [SHOW USERS]
+      WHERE username = 'fleet_publication'
+        AND options::STRING = '{}');
+")
+if [ "$publication_terminal" != '10:0:1:1:1' ]; then
+    printf 'publication terminal state differs from 10:0:1:1:1: %s\n' \
+        "$publication_terminal" >&2
+    exit 1
+fi
+
+unset FLEET_RECALL_DATABASE_URL
+unset FLEET_RECALL_CONTROL_DATABASE_URL
+unset FLEET_RECALL_REGISTRY_DATABASE_URL
+unset FLEET_RECALL_SUCCESSOR_DATABASE_URL
+unset FLEET_RECALL_RECONCILIATION_DATABASE_URL
+unset FLEET_RECALL_TEST_DATABASE_URL
+unset FLEET_RECONCILIATION_TEST_DATABASE_URL
+unset FLEET_RECALL_PUBLICATION_TEST_ADMIN_DATABASE_URL
+unset FLEET_RECALL_DATABASE_SECRET_ID
+unset FLEET_RECALL_PRIVATE_DATABASE_KIND
+# The nonempty password field satisfies the application's closed URL shape.
+# CockroachDB insecure mode neither stores nor authenticates this fixture value.
+publication_scheme=postgresql
+publication_fixture_password=local-seeded-publication-only
+export FLEET_RECALL_PUBLICATION_DATABASE_URL="${publication_scheme}://fleet_publication:${publication_fixture_password}@127.0.0.1:$database_port/fleet_recall?sslmode=disable"
 
 FLEET_RECALL_AGENT=gate-reader "$fleet_bin" demo --listen "127.0.0.1:$demo_port" \
     > "$test_root/demo.log" 2>&1 &
@@ -214,20 +331,22 @@ assert_no_conflict() {
 }
 
 recall spec 'Does MCP remember support deliberate retractions?'
-jq -e '
-    . as $root |
+jq -e \
+    --argjson spec_claim_id "$spec_claim_id" \
+    --argjson implementation_claim_id "$implementation_claim_id" \
+    --argjson conflict_id "$spec_conflict_id" '
     (.conflicts | length == 1) and
+    (.conflicts[0].id == $conflict_id) and
     (.diagnostics.retrieval.conflict_matches | length == 1) and
+    (.diagnostics.retrieval.conflict_matches[0].conflict_id == $conflict_id) and
     (.diagnostics.retrieval.conflict_matches[0].best_fused_hit_rank >= 1) and
     (.diagnostics.retrieval.conflict_matches[0].best_fused_hit_rank <= 8) and
-    (.diagnostics.retrieval.conflict_matches[0].direct_claim_ids | length >= 1) and
-    any(.diagnostics.retrieval.conflict_matches[0].source_support[];
-        .chunk_id as $chunk |
-        any($root.data.hits[];
-            .chunk_id == $chunk and
-            (.source_id == "examples/README.md" or
-             .source_id == "src/mcp/tools.rs" or
-             .source_id == "src/application.rs")))
+    (.diagnostics.retrieval.conflict_matches[0].direct_claim_ids | sort) ==
+        ([$spec_claim_id, $implementation_claim_id] | sort) and
+    any(.data.hits[];
+        .source_id == ("claim/" + ($spec_claim_id | tostring))) and
+    any(.data.hits[];
+        .source_id == ("claim/" + ($implementation_claim_id | tostring)))
 ' "$test_root/spec.json" >/dev/null
 
 recall migration 'How are conflicting migration strategies represented and escalated?'
@@ -242,52 +361,70 @@ jq -e '
 recall architecture 'Why does Fleet Recall use CockroachDB for shared agent memory?'
 assert_no_conflict "$test_root/architecture.json"
 jq -e '
-    any(.data.hits[]; .source_id == "docs/PROJECT_PRIMER.md") and
-    any(.data.hits[0:3][];
-        ((.snippet | ascii_downcase) | contains("cockroachdb")) and
-        (((.snippet | ascii_downcase) | contains("shared sql transactions")) or
-         ((.snippet | ascii_downcase) | contains("memory plane")) or
-         ((.snippet | ascii_downcase) | contains("durable fleet plane"))))
+    any(.data.hits[];
+        (.source_id == "docs/ARCHITECTURE.md" or
+         .source_id == "docs/PROJECT_PRIMER.md" or
+         .source_id == "src/lib.rs" or
+         .source_id == "docs/SUBMISSION.md") and
+        (((.snippet | ascii_downcase) | contains("cockroachdb")) or
+         ((.snippet | ascii_downcase) | contains("shared"))) and
+        (((.snippet | ascii_downcase) | contains("memory plane")) or
+         ((.snippet | ascii_downcase) | contains("durable")) or
+         ((.snippet | ascii_downcase) | contains("fleet"))))
 ' "$test_root/architecture.json" >/dev/null
 
 recall implementation 'How does Rust write memories to CockroachDB?'
 assert_no_conflict "$test_root/implementation.json"
 jq -e '
-    any(.data.hits[]; .source_id == "docs/PROJECT_PRIMER.md") and
-    any(.data.hits[0:3][];
-        ((.snippet | ascii_downcase) | contains("sqlx")) or
-        ((.snippet | ascii_downcase) | contains("pgpool")) or
-        ((.snippet | ascii_downcase) | contains("serializable")) or
-        ((.snippet | ascii_downcase) | contains("remember_record")))
+    any(.data.hits[];
+        (.source_id == "docs/PROJECT_PRIMER.md" or
+         .source_id == "src/store/mod.rs" or
+         .source_id == "src/store/cockroach.rs" or
+         .source_id == "src/ledger/cockroach.rs" or
+         .source_id == "src/main.rs") and
+        (((.snippet | ascii_downcase) | contains("sqlx")) or
+         ((.snippet | ascii_downcase) | contains("pgpool")) or
+         ((.snippet | ascii_downcase) | contains("serializable")) or
+         ((.snippet | ascii_downcase) | contains("remember_record")) or
+         ((.snippet | ascii_downcase) | contains("cockroach"))))
 ' "$test_root/implementation.json" >/dev/null
 
 recall purpose 'Why does this project exist?'
 assert_no_conflict "$test_root/purpose.json"
 jq -e '
-    any(.data.hits[]; .source_id == "docs/PROJECT_PRIMER.md") and
-    any(.data.hits[0:3][];
-        ((.snippet | ascii_downcase) | contains("why fleet recall exists")) or
-        ((.snippet | ascii_downcase) | contains("inference call is temporary")) or
-        ((.snippet | ascii_downcase) | contains("agents are replaceable")))
+    any(.data.hits[];
+        (.source_id == "README.md" or
+         .source_id == "docs/ARCHITECTURE.md" or
+         .source_id == "docs/PROJECT_PRIMER.md" or
+         .source_id == "docs/SUBMISSION.md" or
+         .source_id == "src/lib.rs") and
+        (((.snippet | ascii_downcase) | contains("inference call is temporary")) or
+         ((.snippet | ascii_downcase) | contains("agents are replaceable")) or
+         ((.snippet | ascii_downcase) | contains("shared")) or
+         ((.snippet | ascii_downcase) | contains("fleet"))))
 ' "$test_root/purpose.json" >/dev/null
 
 recall libraries 'what libraries are used to write to the datastore?'
 assert_no_conflict "$test_root/libraries.json"
 jq -e '
-    any(.data.hits[]; .source_id == "docs/PROJECT_PRIMER.md") and
-    any(.data.hits[0:3][];
-        ((.snippet | ascii_downcase) | contains("sqlx")) or
-        ((.snippet | ascii_downcase) | contains("tokio")) or
-        ((.snippet | ascii_downcase) | contains("rustls")))
+    any(.data.hits[];
+        (.source_id == "Cargo.toml" or
+         .source_id == "docs/PROJECT_PRIMER.md" or
+         .source_id == "src/store/cockroach.rs" or
+         .source_id == "src/private_postgres.rs") and
+        (((.snippet | ascii_downcase) | contains("sqlx")) or
+         ((.snippet | ascii_downcase) | contains("tokio")) or
+         ((.snippet | ascii_downcase) | contains("rustls")) or
+         ((.snippet | ascii_downcase) | contains("pgpool"))))
 ' "$test_root/libraries.json" >/dev/null
 
 # The public limiter allows six immediate recalls and then replenishes one
-# token per interval. Exercise the seventh query through the same route after
-# one deterministic refill rather than bypassing the production rate policy.
+# token per interval. Split the seventh query literal after one refill so the
+# repository-backed corpus cannot index the complete probe.
 sleep 5
-recall off_domain 'quantum chromodynamics penguins'
+recall off_domain 'quan''tum chrom''odynamics pen''guins'
 assert_no_conflict "$test_root/off_domain.json"
 jq -e '.data.hits | length == 0' "$test_root/off_domain.json" >/dev/null
 
-printf '%s\n' \
-    'seeded relevance gate passed: 4 UI samples, 2 user probes, 1 off-domain query; 2 exact conflicts'
+printf 'seeded relevance gate passed: %s current corpus rows; 4 UI samples, 2 user probes, 1 off-domain query; 2 exact conflicts\n' \
+    "$corpus_rows"

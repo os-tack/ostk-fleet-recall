@@ -23,8 +23,14 @@ The public HTTP router exposes only `/`, `/healthz`, `/api/status`, and the
 non-mutating `POST /api/recall`. It has no MCP, ingest, remember, control
 bootstrap, registry activation, or other mutation route. The submitted
 CloudFront distribution is therefore a read-only recall surface, even though
-recall uses POST. CloudFront-to-ALB transport and viewer-TLS limitations are
-documented without stronger claims in the
+recall uses POST. That historical live observation does not attest its database
+principal or grant matrix. In the current checked-in source, the public process
+instead authenticates as exactly the fixed external `fleet_publication` login,
+whose only membership is the logical `fleet_publication_reader` role; router
+shape is not treated as the database authorization boundary. That current
+boundary is locally proved but unapplied to the historical AWS stack.
+CloudFront-to-ALB transport and viewer-TLS limitations are documented without
+stronger claims in the
 [AWS runbook](../deploy/aws/README.md).
 
 ## Offline authority and append-only control state
@@ -93,15 +99,45 @@ boundary.
 
 ## Identities, URLs, and secrets
 
-The current AWS Terraform has exactly two database credential paths: a
-least-privilege runtime URL and a distinct DDL-capable migrator URL, each from
-its own secret input. It has no control-bootstrap, genesis-activation,
-successor, or conflict-reconciliation secret, IAM role, task definition, route,
-or startup hook. When a private local ceremony is actually run, Stage 2 uses a
-third SQL principal and dedicated control URL; genesis Stage 3 uses a fourth
-SQL principal and dedicated registry URL. Those one-shot credentials are never
-fallbacks for runtime or migration credentials and should be disabled or
-removed after the ceremony.
+The current AWS Terraform defines exactly three planned database credential
+paths: a publication-reader URL for the public application task, a private
+writer URL for seed/reference/MCP DML, and a distinct DDL-capable migrator URL.
+Their three concrete secret ARNs must be pairwise distinct. The public task has
+distinct publication execution and task roles and receives only the
+publication secret. Its execution policy permits exactly
+`secretsmanager:GetSecretValue` on that ARN. When customer-managed encryption
+is configured, `kms:Decrypt` is limited to concrete publication-specific CMK
+ARNs, `kms:ViaService` is bound to Secrets Manager in the deployment region,
+and `kms:EncryptionContext:SecretARN` is bound to the exact publication secret;
+those CMKs must be disjoint from the writer/migrator CMK list. The publication
+task role can read only the three exact model object ARNs, with no bucket list,
+write, or wildcard access.
+
+Terraform does not create CockroachDB identities, memberships, grants, or
+authentication material. The externally provisioned `fleet_publication` login
+is a member only of the logical `fleet_publication_reader` role, which is
+forced to `NOLOGIN`. Its complete positive SQL grant surface is `CONNECT` on
+`fleet_recall`, `USAGE` on schema `public`, and `SELECT` on exactly these eight
+objects: `_sqlx_migrations`, `memory_corpus_models`, `memory_chunks`,
+`memory_claim_embeddings`, `memory_claim_support`, `memory_claims`,
+`memory_conflict_members`, and `memory_conflicts`. It has no DML, DDL,
+sequence, SYSTEM, private-table, ownership, grant-option, or future-default
+authority.
+
+Before every publication-policy apply or reapply, drain the external login and
+set it to exact `NOLOGIN`. A cluster admin must audit both publication
+principals and inherited PUBLIC authority across every database, freeze role,
+grant, default, ownership, and schema-DDL changes, apply
+[`publication-reader-role-grants.sql`](../deploy/cockroach/publication-reader-role-grants.sql),
+repeat the external audit if the freeze was not continuous, and reapply the
+policy immediately before the separate exact authentication-enable operation.
+Quiesce and repeat that sequence after every migration or grant change.
+
+The Terraform module has no control-bootstrap, genesis-activation, successor,
+or conflict-reconciliation secret, IAM role, task definition, route, or startup
+hook. When a private local ceremony runs, each uses a separate SQL login and
+dedicated URL; those one-shot credentials are never fallbacks for any deployed
+credential and should be disabled or removed afterward.
 
 The successor repository and workstation apply/inspect CLI have a separately
 checked-in one-shot
@@ -138,7 +174,7 @@ ownership alone is insufficient. Apply the
 after successful prefix 1 through 16 and the three prior logical roles are
 hardened. A separately provisioned login may temporarily receive
 membership only in that `NOLOGIN` logical role for the apply-only workstation
-CLI. The successor role is optional, not a fourth prerequisite. Before every
+CLI. The successor role is optional, not an additional prerequisite. Before every
 reconciliation apply and use, quiesce members and freeze authority changes. If
 the successor role exists, explicitly remove its creator-scoped PUBLIC routine
 default and either direction of successor/reconciliation membership. Then
@@ -164,6 +200,18 @@ such as `options`, routing overrides, relative certificate paths, and unknown
 parameters fail closed. Do not set the local escape in cloud or shared
 environments. Debug output redacts database URLs, authority pins, and bound
 reconciliation scope.
+
+The publication process additionally requires the decoded URL username and
+the connected CockroachDB `current_user` to be exactly `fleet_publication`;
+private database URL variables are rejected from its environment. The official
+local CockroachDB v26.2.3 TLS wrapper passes that connected PUBLIC-03 boundary.
+A separate clean-checkout LocalStack run at commit `cd6ecfc` passes the current
+three-secret image/config/database denial and replacement lane, with its
+[receipt](evidence/localstack-publication-cd6ecfc-20260816.json) explicitly
+marking AWS apply, IAM enforcement, TLS, database-password authentication, and
+Fargate as unproved. Terraform's 21 configuration tests pass, but the current
+Terraform remains unapplied; none of these local results is an AWS deployment
+or activation claim.
 
 Apply the exact current-object/PUBLIC policies and normalized grant proofs in
 [MIGRATIONS.md](MIGRATIONS.md) and
@@ -196,6 +244,7 @@ dismissed v2 lineage; it never deletes the legacy evidence.
 
 CockroachDB grants table operations, not prepared-statement identities. A
 holder of a private writer URL can issue SQL outside the reviewed binary. The
+publication reader has no write table operation or sequence authority. The
 bootstrap role's required raw inserts can occupy an immutable singleton or
 plant a detached future offset. The activation role can occupy immutable
 activation/head rows or misuse its table-level shard-head update. The unique

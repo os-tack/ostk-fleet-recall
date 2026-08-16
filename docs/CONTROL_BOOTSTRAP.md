@@ -3,7 +3,9 @@
 Stage 2 has one mutation boundary: a one-shot private process may accept the
 out-of-band-pinned genesis receipt into the append-only control ledger. It is
 not an HTTP route, an MCP tool, an ingest option, or a serving startup hook.
-The CloudFront demo remains read-only.
+The CloudFront demo remains read-only and the current public process
+authenticates only as the fixed `fleet_publication` login through the
+`fleet_publication_reader` logical role.
 
 This command is currently a workstation/operator tool built with Cargo. The
 production image copies only `ostk-fleet-recall` and does not contain this
@@ -75,21 +77,39 @@ before any non-test bootstrap.
 
 ## SQL principals
 
-For this Stage-2 boundary, use three distinct login principals and three
-distinct secret values:
+The current checked-in application/Terraform design has three distinct database
+capability paths and raw secret values:
 
 1. the migrator owns/applies schema and is dormant afterward;
-2. the runtime serves MCP and the read-only demo but has no control-table
-   privilege;
-3. the control bootstrap login is a member only of the non-login
-   `fleet_control_bootstrap` logical role, runs this command once, and is
-   disabled or its secret removed afterward.
+2. the private writer performs seed/reference/MCP DML through only the
+   hardened `NOLOGIN` `fleet_runtime` logical role; and
+3. the fixed external `fleet_publication` login serves only the read-only demo
+   through the non-login `fleet_publication_reader` logical role.
 
-The migration URL must never fall back to either the runtime URL or the
-bootstrap URL. Deployment validation should reject equal or missing secret
-references. The migrator must not grant runtime access through `ALL TABLES` or
-an `ALTER DEFAULT PRIVILEGES ... ALL TABLES` rule, because that silently grants
-future control tables.
+The publication reader receives only `CONNECT` on `fleet_recall`, `USAGE` on
+schema `public`, and `SELECT` on exactly `_sqlx_migrations`,
+`memory_corpus_models`, `memory_chunks`, `memory_claim_embeddings`,
+`memory_claim_support`, `memory_claims`, `memory_conflict_members`, and
+`memory_conflicts`. It receives no DML, DDL, sequence, system, private-table,
+ownership, grant-option, or future-default authority. The external login must
+remain drained and exact `NOLOGIN` while a cluster admin performs the external
+cross-database/PUBLIC/default/ownership audit and applies the
+[`publication-reader-role-grants.sql`](../deploy/cockroach/publication-reader-role-grants.sql)
+policy. Freeze role, grant, default, ownership, and schema-DDL changes, reapply
+immediately before enabling that exact login, and repeat the ceremony after
+each migration or grant change.
+
+Stage-2 control bootstrap is a separate out-of-band capability. When the
+ceremony runs, its login is a member only of the non-login
+`fleet_control_bootstrap` logical role, uses a dedicated private URL, runs this
+command once, and is disabled or its secret is removed afterward. The
+migration URL must never fall back to the writer, publication, or bootstrap
+URL; none of those URLs may be reused for another capability. The migrator
+must not grant writer or publication access through `ALL TABLES` or an
+`ALTER DEFAULT PRIVILEGES ... ALL TABLES` rule, because that silently grants
+future control tables. Terraform wires the three planned secret paths but
+does not provision CockroachDB identities, memberships, or grants; it has no
+Stage-2 control secret or task.
 
 The base policy can first be applied after migration 0003 and must remain
 runnable at that original Stage-2 boundary. Reapply it after later migrations

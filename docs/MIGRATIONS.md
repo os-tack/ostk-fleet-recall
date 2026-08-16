@@ -61,9 +61,14 @@ backfill, and assert the complete public catalog definition including stored
 columns. Same-name drift fails with SQLSTATE `55000` before SQLx can record
 success.
 
-Those are database correctness guarantees. The recorded LocalStack
-Docker/Compose application-image smoke predates migrations 10 through 17 and
-must be rerun before claiming current container parity.
+Those are database correctness guarantees. The original recorded LocalStack
+Docker/Compose application-image smoke stopped at migration 9 and remains only
+historical through-9 evidence. A separate clean-checkout PUBLIC-03 LocalStack
+run at commit `cd6ecfc` subsequently passed the current prefix-17 migration,
+three-secret publication boundary, replacement, and denial probes. Its
+[durable receipt](evidence/localstack-publication-cd6ecfc-20260816.json)
+explicitly records that this insecure local lane proves neither AWS apply/IAM
+enforcement nor TLS, database-password authentication, or Fargate.
 
 That is an operational constraint, not permission to run migration casually:
 
@@ -79,34 +84,46 @@ That is an operational constraint, not permission to run migration casually:
 - follow the version-specific recovery rules below instead of editing SQLx
   history.
 
-The Terraform deployment provides a separate
-`ostk-fleet-recall-migration` task definition and defaults the application
-service and autoscaling minimum to zero.
+The Terraform deployment provides separate migration, private-writer
+seed/reference, and publication-reader task capability paths and defaults the
+application service and autoscaling minimum to zero.
 
 ## Cloud bootstrap
 
-1. Create a dedicated, empty CockroachDB database for Fleet Recall.
-2. Create separate migrator and runtime SQL principals. Store their TLS URLs as
-   raw values in the two distinct AWS Secrets Manager secrets accepted by the
-   current Terraform; neither may fall back to the other principal's secret.
+1. Create a dedicated, empty CockroachDB database named `fleet_recall`.
+2. Create three separate database capability paths: a DDL-capable migrator, a
+   private writer for seed/reference/MCP DML, and the fixed external
+   `fleet_publication` login for the public demo. Store their strict-TLS URLs as
+   three distinct raw AWS Secrets Manager values. Provision
+   `fleet_publication` outside Terraform in the exact quiesced `NOLOGIN` state;
+   Terraform does not create CockroachDB identities, memberships, or grants.
 3. Apply `deploy/aws` with `service_desired_count = 0` and
    `autoscaling_min_capacity = 0`.
 4. Confirm no other migration task is running in ECS.
 5. Run `./deploy/aws/run-migration.sh` once.
 6. Inspect the task's CloudWatch logs and confirm exit code zero.
-7. Run the application's `health` command with the runtime credential. Current
-   recall, remember, ingest, health, and public-demo paths require an
-   uninterrupted successful prefix of at least 17, including the exact current
-   indexes, cosine support, and configured model identity. Later additive rows
-   remain compatible, but cannot mask a missing or failed row in 1–17.
-8. Separately, with the migrator/security-operator procedure, verify the exact
+7. Separately, with the migrator/security-operator procedure, verify the exact
    seventeen successful rows for prefix 1 through 17 and inspect all
    schema-change jobs. The private compatibility gates remain intentionally
    distinct: Stage-2 control requires prefix 1 through 3, genesis Stage-3
    requires 1 through 9, the first-successor repository requires 1 through 14,
    and conflict-detector reconciliation requires 1 through 16. None is a
    substitute for the current release gate or serving floor.
-9. Set the desired/minimum service count to at least one and apply again.
+8. While `fleet_publication` remains quiesced, perform the required
+   cross-database/default/ownership/PUBLIC audit and apply
+   [`publication-reader-role-grants.sql`](../deploy/cockroach/publication-reader-role-grants.sql).
+   Freeze role, grant, default, ownership, and schema-DDL changes; repeat the
+   external audit if necessary and reapply the policy immediately before the
+   exact login-enable operation described below.
+9. Run `health` and the one-off seed/reference work with the private writer
+   credential. Current recall, remember, ingest, MCP, health, and public-demo
+   paths require an uninterrupted successful prefix of at least 17, including
+   the exact current indexes, cosine support, and configured model identity.
+   Later additive rows remain compatible, but cannot mask a missing or failed
+   row in 1–17.
+10. Enable only the externally managed `fleet_publication` authentication,
+    then set the desired/minimum service count to at least one and apply again.
+    The public task receives only its publication-reader secret.
 
 The migration command also initializes the immutable project/model registry.
 Use the same logical model name and bundle digest for migration, ingestion,
@@ -168,8 +185,10 @@ disposable proofs create a database-owner-only user and require those hardening
 statements to be denied.
 
 The migration principal needs database/schema creation privileges for tables,
-sequences, secondary indexes, and SQLx's migration bookkeeping table. The
-runtime principal needs:
+sequences, secondary indexes, and SQLx's migration bookkeeping table. A
+separately provisioned private-writer login is a member only of the hardened
+`NOLOGIN` `fleet_runtime` logical role. That seed/reference/MCP grant bundle
+needs:
 
 - `CONNECT` on the Fleet Recall database;
 - `USAGE` on its schema and sequences;
@@ -179,7 +198,7 @@ runtime principal needs:
 - no `CREATE`, `DROP`, role-management, cluster-setting, or external-connection
   privileges.
 
-Never grant runtime privileges with `ON ALL TABLES IN SCHEMA public`: migration
+Never grant private-writer privileges with `ON ALL TABLES IN SCHEMA public`: migration
 3 deliberately puts control tables in that schema, and future private tables
 must not become reachable through defaults. For example, after connecting as
 an authorized administrator and substituting the actual database/role names,
@@ -213,10 +232,40 @@ GRANT USAGE, SELECT ON SEQUENCE
 TO fleet_runtime;
 ```
 
+Grant the external private-writer login only membership in `fleet_runtime`; do
+not copy these DML/sequence grants onto the fixed publication login.
+
 Do not add the three successor tables from migrations 12 through 14 to this
 runtime grant. They remain unavailable to runtime and the earlier application
 roles. The existence of their schema, canonical contracts, and one-shot
 successor role does not create runtime or cloud successor authority.
+
+The public service has a narrower and independently enforced SQL boundary.
+The fixed externally provisioned login `fleet_publication` is a member only of
+the logical `fleet_publication_reader` role, which is forced to `NOLOGIN`. Its
+entire positive grant surface is `CONNECT` on `fleet_recall`, `USAGE` on schema
+`public`, and `SELECT` on exactly these eight objects:
+
+- `_sqlx_migrations`;
+- `memory_corpus_models`;
+- `memory_chunks`;
+- `memory_claim_embeddings`;
+- `memory_claim_support`;
+- `memory_claims`;
+- `memory_conflict_members`; and
+- `memory_conflicts`.
+
+It has zero DML, DDL, sequence, system, private-table, ownership, grant-option,
+or future-default authority. Apply
+[`publication-reader-role-grants.sql`](../deploy/cockroach/publication-reader-role-grants.sql)
+only as a cluster admin after prefix 1 through 17, with
+`fleet_publication` already drained and set to exact `NOLOGIN`. Audit both
+principals and inherited PUBLIC authority across every database, freeze role,
+grant, default, ownership, and schema-DDL dependencies, reapply the policy
+under that freeze, and only then perform the separate exact authentication
+enable. Quiesce/drain the login and repeat the audit/reapply sequence after
+every migration or grant change. The SQL policy intentionally does not create
+the external login or its password/identity-provider binding.
 
 Then apply and verify the exact control-plane exclusions and one-shot bootstrap
 grants in [the private control bootstrap policy](CONTROL_BOOTSTRAP.md). The
@@ -246,15 +295,19 @@ empty result for their schema creator. Re-audit defaults and reapply both
 current-object policies after every migration. Review all expanded grants and
 revoke unnecessary defaults.
 
-The runtime URL must use TLS verification. Keep credentials out of Terraform
-state, image layers, ECS environment literals, logs, and demo responses.
+All three planned database URLs must use TLS verification. Keep credentials
+out of Terraform state, image layers, ECS environment literals, logs, and demo
+responses. The official local CockroachDB v26.2.3 TLS wrapper passes the
+PUBLIC-03 connected publication proof. Terraform's 21 configuration tests also
+pass, but the current Terraform has not been applied and neither local result
+proves an AWS deployment.
 
 ### Stage-3 pre-activation gate
 
 The current `deploy/aws` Terraform does not accept a registry-activation secret
 or define a registry-activation task. The following is therefore a local/private
 pre-activation gate, not an executable step in the cloud-bootstrap sequence
-above. Before enabling a cloud activation path, provision a fourth, distinct
+above. Before enabling a cloud activation path, provision a separate
 registry-activation SQL principal and TLS secret out of band, or add separately
 reviewed Terraform/task wiring that preserves the same isolation.
 
@@ -343,7 +396,7 @@ creates and hardens the database-local
 `fleet_registry_successor_activation` `NOLOGIN` logical role. It requires the
 exact successful prefix 1 through 14 and the runtime, control-bootstrap, and
 genesis-activation roles already hardened to exact `NOLOGIN`; later migration
-rows are compatible. The reconciliation role is optional, not a fourth
+rows are compatible. The reconciliation role is optional, not an additional
 prerequisite. The successor role receives only database `CONNECT`, public
 schema `USAGE`, and 16 non-grantable table rows: migration-history and
 read-only witness access plus the exact `SELECT`/`INSERT`/`UPDATE` operations
@@ -430,7 +483,7 @@ missing or failed prerequisite. Before applying
 apply the control and genesis-activation role policies and confirm their three
 logical roles are hardened. Run the reconciliation policy in the dedicated
 `fleet_recall` database as a cluster admin only; database ownership alone is
-insufficient. The successor role is optional and is not a fourth reconciliation
+insufficient. The successor role is optional and is not an additional reconciliation
 prerequisite.
 
 That SQL policy intentionally audits and repairs only the current

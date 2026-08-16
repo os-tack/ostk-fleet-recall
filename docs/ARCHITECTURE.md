@@ -7,14 +7,15 @@ The local `ostk-recall` corpus remains the workstation default.
 that must coordinate across process, host, and availability-zone boundaries;
 using OSTK is optional.
 
-This document describes the implemented hackathon system. The proposed
-event-driven corpus, provider-evidenced provenance graph, separately graded
-causal hypotheses, runtime observation model, and permanently separated
-public/private planes are specified in
+This document describes the implemented hackathon system. The current source
+includes the bounded PUBLIC-03 database and task-input separation described
+below. The broader proposed event-driven corpus, provider-evidenced provenance
+graph, separately graded causal hypotheses, runtime observation model, and
+private control plane are specified in
 [Dynamic corpus and causal runtime architecture](DYNAMIC_MEMORY_ARCHITECTURE.md);
 they are not claims about the current deployment.
 
-## Deployment topology
+## Current checked-in topology
 
 ```mermaid
 %%{init: {"flowchart": {"rankSpacing": 46.5}}}%%
@@ -23,14 +24,18 @@ flowchart TB
     operator["Operator"]
     cloudfront["Amazon CloudFront\nHTTPS viewer endpoint\ncache disabled"]
     alb["Restricted AWS ALB origin\nCloudFront prefix-list ingress\n403 without secret origin header"]
-    demo["ECS/Fargate demo service\nprivate subnets; read-only recall"]
+    demo["ECS/Fargate demo service\nprivate subnets; publication recall"]
     seed["One-off ECS seed task\nimmutable sample corpus"]
     policy["Reference policy agents A/B/C\none-off ECS/Fargate tasks"]
     agents["Optional MCP clients\nlocal or separately deployed"]
     mcp["Fleet Recall MCP\nlocal stdio per trusted scope"]
     s3[("Amazon S3\npinned model bundle")]
-    secrets["AWS Secrets Manager\nCockroach TLS URLs"]
-    inputs{"Task-specific inputs\nverified model + scoped TLS URL"}
+    publication_secret["AWS Secrets Manager\npublication TLS URL only"]
+    private_secrets["AWS Secrets Manager\nwriter + migrator TLS URLs"]
+    publication_iam["Publication execution/task roles\ndistinct KMS scope"]
+    private_iam["Private execution/task roles"]
+    public_inputs{"Public task inputs\nmodel + fleet_publication URL"}
+    private_inputs{"Private task inputs\nmodel + writer/migrator URL"}
     crdb[("CockroachDB Cloud\ndistributed SQL + C-SPANN")]
     migrator["One-off ECS migration task\nsingle writer"]
     logs["CloudWatch Logs\n60-day retention"]
@@ -40,12 +45,16 @@ flowchart TB
     operator -.->|launch evidence run| policy
     alb -->|HTTP 8080| demo
     agents <-->|MCP stdio| mcp
-    s3 -.-> inputs
-    secrets -.-> inputs
-    inputs -.-> demo
-    inputs -.-> seed
-    inputs -.-> migrator
-    inputs -.-> policy
+    s3 -.-> public_inputs
+    s3 -.-> private_inputs
+    publication_secret -.-> public_inputs
+    private_secrets -.-> private_inputs
+    publication_iam -.-> public_inputs
+    private_iam -.-> private_inputs
+    public_inputs -.-> demo
+    private_inputs -.-> seed
+    private_inputs -.-> migrator
+    private_inputs -.-> policy
     demo --> crdb
     seed --> crdb
     policy --> crdb
@@ -69,9 +78,18 @@ is not described as TLS 1.2-minimum or end-to-end TLS.
 The operator is separate from that visitor path and uses authenticated AWS
 control-plane tooling to launch the one-off reference-policy evidence run.
 
+The diagram describes the current checked-in Terraform plan. Its publication
+secret, publication execution role, publication task role, and distinct
+customer-managed KMS key scope have been statically validated but not applied.
+The historical live revision-10 deployment described in the README predates
+PUBLIC-03 and establishes only the read-only HTTP route; it is not evidence that
+the new database or IAM boundary is live in AWS.
+
 The checked-in Terraform provisions the HTTP demo, migration, seed, and
-reference-policy-agent task definitions. The evidence wrapper starts four
-independent Fargate tasks bound to agents A, B, C, and B: they record a
+reference-policy-agent task definitions. The demo task receives only
+`FLEET_RECALL_PUBLICATION_DATABASE_URL`; migration and writer-capable tasks use
+their separate private credentials. The historical evidence wrapper starts
+four independent Fargate tasks bound to agents A, B, C, and B: they record a
 decision, retrieve it through lexical+dense RRF, persist a cited rollout
 action, surface an incompatible decision, and persist a cited escalation. Each
 task receives only its trusted identity and run coordinate; CockroachDB is the
@@ -104,9 +122,22 @@ a future agent/session focus feature; the current vertical slice neither reads
 nor writes that table.
 
 The public demo exposes a bounded recall request and health endpoint, not a
-general mutation API. Reference agents mutate through the same trusted service
-facade inside one-off tasks; general fleet clients mutate over MCP. In both
-paths tenant/project/agent coordinates come from deployment rather than
+general mutation API. Its configuration rejects every private writer, control,
+activation, reconciliation, and test database variable. The fixed
+`fleet_publication` login inherits only the `NOLOGIN`
+`fleet_publication_reader` role: `CONNECT` on `fleet_recall`, `USAGE` on
+`public`, and `SELECT` on exactly `_sqlx_migrations`, `memory_corpus_models`,
+`memory_chunks`, `memory_claim_embeddings`, `memory_claim_support`,
+`memory_claims`, `memory_conflict_members`, and `memory_conflicts`. No
+sequence, DML, DDL, system, delegation, or private-table authority is granted.
+
+Driver construction fixes the username, database, and
+`ostk-fleet-recall-publication` application name. Every new connection and
+every pool reuse re-witnesses those values and sets and verifies canonical
+`search_path = pg_catalog, public, pg_temp` before application SQL runs.
+Reference agents mutate through the same trusted service facade inside one-off
+tasks; general fleet clients mutate over MCP. In both paths
+tenant/project/agent coordinates come from deployment rather than
 caller-controlled JSON.
 
 The reference policy never executes recalled text. It accepts only one exact,
@@ -116,6 +147,15 @@ then records the deliberately incompatible value; the final agent-B task
 requires the exact two-member disputed conflict before it records a cited
 pause-and-escalate action. Any missing lane, actor, value, state, member, or
 citation fails the task closed.
+
+The source boundary has two accepted local connected proofs. The authoritative
+wrapper passed against the exact official CockroachDB v26.2.3 binary over TLS,
+including the live publication reader and the existing repository/private-CLI
+matrix. The production-image LocalStack smoke passed at source commit
+`cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4` and preserved recall after replacing
+the public container. LocalStack deliberately used insecure CockroachDB and no
+AWS apply, so it proves neither database TLS/password authentication nor real
+IAM, Fargate, or AWS deployment.
 
 ## Memory planes
 

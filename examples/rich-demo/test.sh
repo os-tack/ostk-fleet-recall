@@ -139,10 +139,10 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 4181
-    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 800
+    length == 4227
+    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 841
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 3175
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 3180
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "src/bin/ostk-control-bootstrap.rs")] | length) == 11

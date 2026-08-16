@@ -66,9 +66,10 @@ The production app does receive LocalStack's test AWS credentials and endpoint
 so its baked S3 client can download the three-file model bundle. That is
 expected and is not database-secret leakage or IAM evidence. The smoke checks
 that the app has no database secret ID/private database URL and that it runs the
-exact production image config. The separate AWS Terraform suite's 21/21 tests
-prove the planned publication execution/task-role policy bodies; neither those
-static tests nor this emulator exercise proves real AWS IAM enforcement.
+exact production image config. The separate AWS Terraform suite's 21/21 static
+tests passed for the planned publication execution/task-role policy bodies, but
+that configuration remains unapplied. Neither those tests nor this emulator
+exercise proves real AWS IAM enforcement.
 
 ## What a current run proves
 
@@ -100,16 +101,27 @@ loopback/Compose `cockroach` hosts with explicit `sslmode=disable`.
 
 The historical Docker/Compose run from 2026-08-13 covered then-current source
 through migration 9. It did not prove migrations 10 through 17 or this
-publication boundary. The PUBLIC-03 harness bytes in the current checkout must
-therefore remain labeled **pending** until `smoke.sh` runs from a coherent clean
-commit and emits its new receipt. Do not reinterpret the historical through-9
-run as current image parity.
+publication boundary. Do not reinterpret that historical through-9 run as
+current image parity.
 
-The authoritative connected CockroachDB lane separately covers the complete
-prefix through 17, rollback/interruption/drift behavior, live repositories, and
-private CLIs. Docker RBAC jobs are secondary policy-packaging parity. This
+The full current `smoke.sh` subsequently passed from clean source commit
+`cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4`. The accepted
+[PUBLIC-03 local-emulator receipt](../../docs/evidence/localstack-publication-cd6ecfc-20260816.json)
+binds prefix 1 through 17, the exact production/private image digests, policy
+and ten-row grant fingerprints, reader-only status/recall, writer-command
+denial, application replacement with durable recall, and zero fixed-project
+container or publication-secret-volume residue. This supersedes only the
+current harness's former pending label; it does not turn the historical
+through-9 run into current evidence.
+
+The accepted exact-v26.2.3 TLS local wrapper separately covers the complete
+prefix through 17, rollback/interruption/drift behavior, live repositories,
+private CLIs, and the publication product boundary. The publication-reader
+Docker RBAC proof also passed as secondary policy-packaging parity. This
 LocalStack lane is the production-image/publication integration layer after
-those database proofs.
+those database proofs. All three results are local: the accepted receipt
+explicitly records no TLS, database-password authentication, IAM enforcement,
+Fargate, or AWS apply for the LocalStack run.
 
 ## Requirements
 

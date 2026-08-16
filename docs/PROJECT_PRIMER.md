@@ -6,7 +6,7 @@ An inference call is temporary, but the decisions made around it can govern work
 
 ## What survives replacement
 
-The ECS/Fargate application tasks are deliberately stateless. Corpus chunks, typed claims, support records, idempotency receipts, conflicts, and action history live in CockroachDB Cloud, so a complete serving-task replacement does not erase memory. The release verifier replaces the whole running task set and then recalls the exact same action and escalation claim IDs through lexical and vector retrieval.
+The ECS/Fargate application tasks are deliberately stateless. Corpus chunks, typed claims, support records, idempotency receipts, conflicts, and action history live in CockroachDB Cloud, so a complete serving-task replacement does not erase memory. The historical revision-6 AWS verifier replaced the whole running task set and then recalled the exact same action and escalation claim IDs through lexical and vector retrieval. Separately, the current production-image LocalStack proof replaced the publication container and preserved recall at source commit `cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4`; that local result is not AWS evidence.
 
 ## Why CockroachDB is the memory plane
 
@@ -14,7 +14,7 @@ Fleet Recall needs shared SQL transactions for concurrent writers, durable prove
 
 ## Which libraries write to the datastore
 
-The Rust libraries used to write to the CockroachDB datastore are SQLx 0.8 with its PostgreSQL driver, the Tokio async runtime, and Rustls TLS support. `PgPool` manages bounded connections; all runtime values are bound as SQL parameters. Mutations run in fresh serializable transactions and retry only CockroachDB serialization failures with SQLSTATE `40001`. Embedded SQLx migrations are executed by a separate one-off migrator task before serving begins.
+The Rust libraries used to write to the CockroachDB datastore are SQLx 0.8 with its PostgreSQL driver, the Tokio async runtime, and Rustls TLS support. `PgPool` manages bounded connections; all runtime values are bound as SQL parameters. Mutations run in fresh serializable transactions and retry only CockroachDB serialization failures with SQLSTATE `40001`. Embedded SQLx migrations are executed by a separate one-off migrator task before serving begins. The public pool is constructed separately and witnesses its fixed login, database, application name, and canonical search path on both connection creation and reuse.
 
 ## How recall finds an answer
 
@@ -26,8 +26,8 @@ A typed claim can cite an exact corpus chunk using its source coordinate and con
 
 ## What runs on AWS
 
-CloudFront provides the public HTTPS viewer endpoint and forwards uncached read-only requests to a restricted Application Load Balancer. Private-subnet ECS/Fargate tasks run the Rust service, pull the immutable image from ECR, load the pinned embedding model from a private S3 prefix, read database URLs from Secrets Manager, and send bounded operational evidence to CloudWatch Logs. CockroachDB Cloud remains the durable data plane when any individual AWS task stops.
+CloudFront provides the public HTTPS viewer endpoint and forwards uncached read-only requests to a restricted Application Load Balancer. Private-subnet ECS/Fargate tasks run the Rust service, pull the immutable image from ECR, load the pinned embedding model from a private S3 prefix, and send bounded operational evidence to CloudWatch Logs. The current checked-in Terraform gives the public task a distinct publication secret, execution role, task role, and customer-managed KMS key scope; writer and migrator credentials remain on private task paths. That plan is validated but unapplied. The historical live revision-10 deployment predates this PUBLIC-03 source change and proves the public route, not the new IAM/database separation. CockroachDB Cloud remains the durable data plane when any individual AWS task stops.
 
 ## What the public demo can and cannot do
 
-The public surface exposes health, capability status, and bounded recall only. Tenant, project, agent identity, and privacy tier come from trusted deployment configuration rather than request JSON. Writes and the canonical `remember` tool remain behind deployment-bound MCP processes, so a visitor can inspect real fleet memory without acquiring mutation authority.
+The public surface exposes health, capability status, and bounded recall only. It accepts only `FLEET_RECALL_PUBLICATION_DATABASE_URL` and rejects private writer/control/test database variables. That URL must authenticate the fixed `fleet_publication` login to `fleet_recall`; the login inherits the `NOLOGIN` logical role `fleet_publication_reader`. Its complete grant is database `CONNECT`, public-schema `USAGE`, and `SELECT` on exactly `_sqlx_migrations`, `memory_corpus_models`, `memory_chunks`, `memory_claim_embeddings`, `memory_claim_support`, `memory_claims`, `memory_conflict_members`, and `memory_conflicts`, with no sequence, DML, DDL, system, delegation, or private-table authority. Tenant, project, agent identity, and privacy tier come from trusted deployment configuration rather than request JSON. Writes and the canonical `remember` tool remain behind deployment-bound MCP processes, so a visitor can inspect real fleet memory without acquiring mutation authority.

@@ -1,6 +1,6 @@
 # Dynamic corpus and causal runtime architecture
 
-Status: **draft target architecture; not implemented**
+Status: **draft target architecture; selected bounded foundations implemented**
 
 Fleet Recall currently serves a statically generated, revision-linked corpus
 and a deliberate typed-claim ledger. This document defines the target model in
@@ -13,7 +13,9 @@ documented in [ARCHITECTURE.md](ARCHITECTURE.md), its security boundary in
 [ADR 0001](adr/0001-product-and-backend-boundary.md).
 
 No connector, webhook, queue, incident controller, asynchronous embedding
-worker, or public mutation route is implied to exist today.
+worker, or public mutation route is implied to exist today. The current source
+does implement the bounded PUBLIC-03 publication identity and planned AWS task
+input separation; those Terraform changes have not been applied.
 
 ## Purpose
 
@@ -52,7 +54,7 @@ specification.
 | Events | Claim mutation audit events | Authenticated, versioned, replayable evidence inbox and outbox |
 | Availability | Embedding completes before a corpus row is searchable | Lexical availability first; dense projection asynchronously follows |
 | Runtime | CloudWatch application logs and deployment receipts outside memory | Bounded observation, alert, incident, action, and verification receipts |
-| Public surface | Read-only application routes | Permanently isolated, least-privilege publication plane |
+| Public surface | Read-only routes plus a source-enforced publication database/IAM input boundary | Permanently isolated, least-privilege publication plane across the broader dynamic system |
 
 The existing tables remain useful projections. They are not silently redefined
 as the immutable source of truth.
@@ -313,6 +315,17 @@ must not disguise a semantic change.
 - **PUBLIC-04 — Public scope is fixed.** The publication projection contains
   only approved evidence under a server-bound tenant/project and exposes no
   caller-selected authority, actor, or private source coordinate.
+
+The checked-in PUBLIC-03 implementation fixes the external login as
+`fleet_publication` and its logical `NOLOGIN` role as
+`fleet_publication_reader`. The role has only `CONNECT` on `fleet_recall`,
+`USAGE` on `public`, and `SELECT` on the eight startup/status/recall tables; it
+has no sequence, DML, DDL, system, delegation, or private-table authority. The
+public process admits only `FLEET_RECALL_PUBLICATION_DATABASE_URL`, while its
+pool witnesses the login, database, fixed application name, and canonical
+search path on both new and reused connections. Checked-in Terraform supplies a
+distinct publication secret, execution role, task role, and KMS scope, but that
+plan remains unapplied.
 
 ## Epistemic contract registry
 
@@ -743,13 +756,25 @@ The target is physically asymmetric:
 | Reader-only ECS execution/task roles and CockroachDB principal | Least-privilege writer/executor identities by role |
 | No action credentials | Short-lived scoped action credentials |
 
-The current public application router already omits mutation routes. The
-checked-in Terraform injects the same runtime database secret into the public
-demo and writer task definitions, and the documented runtime role is
-DML-capable. Thus the current deployment design does not enforce database-level
-read-only access for the demo; live grants require their own direct audit. The
-target requires a distinct reader even though application tests already prove
-that `/api/remember` is absent.
+The current source enforces the first bounded version of that asymmetry below
+the router. `demo` rejects every private writer/control/test database variable
+and accepts only the fixed `fleet_publication` URL for `fleet_recall`. Its
+`fleet_publication_reader` role has database `CONNECT`, public-schema `USAGE`,
+and `SELECT` on exactly `_sqlx_migrations`, `memory_corpus_models`,
+`memory_chunks`, `memory_claim_embeddings`, `memory_claim_support`,
+`memory_claims`, `memory_conflict_members`, and `memory_conflicts`. It has no
+sequence or mutation/DDL authority. Every new and reused pooled connection
+re-witnesses the fixed login, database, application name, and canonical search
+path. Terraform now separates the publication secret, execution role, task
+role, and customer-managed KMS key scope from writer paths.
+
+That is source evidence, not a claim about the historical judging deployment.
+The official CockroachDB v26.2.3 TLS wrapper and the full production-image
+LocalStack smoke passed locally; LocalStack used an insecure database and no
+real IAM or Fargate. Terraform remains unapplied, and the historical live
+revision-10 route predates this boundary. A production activation must still
+repeat the external cross-database/PUBLIC audit and directly verify live grants
+and task inputs before serving.
 
 ## Failure, convergence, and history
 
@@ -768,20 +793,24 @@ that `/api/remember` is absent.
 
 ## Staged implementation after the invariants stabilize
 
-Before the next deployment, independently harden the existing publication
-plane with a distinct database reader, a publication execution role authorized
-only for that reader secret, and a distinct task/service role where applicable;
-this does not require or authorize dynamic ingestion.
+The PUBLIC-03 source hardening is complete: the fixed database reader and the
+distinct publication secret, execution role, task role, and KMS scope are
+checked in. Before the next deployment, apply those bytes only after the
+external cross-database/PUBLIC audit and then verify the live database grants,
+secret injection, execution policy, task policy, and TLS identity directly.
+This does not require or authorize dynamic ingestion.
 
-1. Freeze offline canonicalization profiles, genesis package and signer policy,
-   identity recipes, normative-binding schemas, evidence envelope, and replay
-   fixtures. No runtime activation is implied by these checked-in bytes.
-2. Add the minimal append-only control-event ledger and accept exactly one
-   explicit bootstrap receipt that pins the genesis profile, registry digest,
+1. **Checked in, offline/private only:** canonicalization profiles, genesis and
+   successor packages/policies, identity recipes, normative-binding schemas,
+   evidence envelopes, and replay fixtures. These bytes do not activate a
+   serving runtime.
+2. **Checked in, private only:** the append-only control-event ledger and exact
+   one-time bootstrap receipt that pin the genesis profile, registry digest,
    signer set, and threshold.
-3. Activate the genesis registry and implement registry, identity, and normative-
-   binding projections, including compare-and-swap activation and contested
-   history behavior.
+3. **Checked in, private only:** genesis and first-successor activation
+   repositories with compare-and-swap heads, replay, stale-candidate, and
+   contested-history proofs. No deployment or serving path consumes those
+   accepted heads yet.
 4. Add general accepted-evidence and relation-attestation events. Make
    synchronous `remember` atomically append its event and projection. Prove
    immutability, scope binding, replay, and verified-versus-declared behavior.

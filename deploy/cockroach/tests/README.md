@@ -3,10 +3,10 @@
 ## Authoritative official process
 
 Connected correctness is authoritative only when it runs against the official
-CockroachDB `v26.2.3` binary. CI downloads the Linux AMD64 archive, verifies the
-frozen SHA-256
+CockroachDB `v26.2.3` binary. The official process accepts only an already
+verified binary; the Linux AMD64 release archive has frozen SHA-256
 `3eca6d7bc6fefa3ba0847e89733fc69f61226c80b8fab0af6578e1be672f27d3`,
-and requires `cockroach version --build-tag` to equal `v26.2.3` exactly.
+and `cockroach version --build-tag` must equal `v26.2.3` exactly.
 `registry-activation-cli.sh` repeats the build-tag check and owns one secure
 local CockroachDB server process for the complete proof.
 
@@ -27,6 +27,7 @@ cannot count as connected success.
 | Conflict-detector reconciliation | `--lib` / `ledger::reconciliation::tests::live_reconciliation_is_inert_without_its_exact_database_url` | `FLEET_RECONCILIATION_TEST_DATABASE_URL` |
 | Online-index interruption recovery and drift rejection | `--lib` / `store::cockroach::tests::live_online_index_migrations_recover_and_reject_drift_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Transactional-DDL rollback | `--lib` / `store::cockroach::tests::live_transactional_migration_rolls_back_ddl_on_history_conflict_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Publication reader recall/deny boundary | `--test publication_reader_live` / `publication_reader_executes_the_real_recall_surface` | `FLEET_RECALL_PUBLICATION_DATABASE_URL` plus the mode-0600 test-only admin secret-file path |
 
 The same isolated server also exercises all four private workstation CLIs:
 inspect/apply/replay for control and genesis activation; offline artifact
@@ -78,6 +79,17 @@ Run the authoritative proof with an already checksum-verified binary:
 FLEET_RECALL_CRDB_BINARY=/absolute/path/to/cockroach \
   ./deploy/cockroach/tests/registry-activation-cli.sh
 ```
+
+At clean source commit
+`cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4`, this exact TLS wrapper passed
+against official `v26.2.3`, including its absolute-final PUBLIC-03 phase and
+the real publication recall/deny product test. The independently packaged
+`publication-reader-role-grants.sh` Docker RBAC proof also passed. These are
+local official-binary and Docker results, respectively, not evidence that the
+current publication role, principal, grants, or Terraform changes were deployed
+to AWS. The separate accepted
+[LocalStack production-image receipt](../../../docs/evidence/localstack-publication-cd6ecfc-20260816.json)
+is likewise explicitly local and insecure.
 
 ## Result accounting and Docker parity
 

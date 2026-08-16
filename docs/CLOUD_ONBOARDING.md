@@ -41,6 +41,18 @@ that the later migrations, roles, or private ceremonies were deployed. This
 source and runbook update is not approval to rerun migration, change
 CockroachDB grants, or take any AWS action against the recorded live candidate.
 
+The older LocalStack receipt remains historical application-image evidence only
+through migration 9. Separately, a clean-checkout PUBLIC-03 LocalStack run at
+commit `cd6ecfc` passed the current prefix-17 migration, three-secret
+publication boundary, denial probes, and replacement check. Its
+[durable receipt](evidence/localstack-publication-cd6ecfc-20260816.json) records
+an insecure local CockroachDB lane and explicitly marks AWS apply, IAM
+enforcement, TLS, database-password authentication, and Fargate as unproved.
+The official local CockroachDB v26.2.3 TLS wrapper also passes the connected
+publication-reader proof, and Terraform's 21 configuration tests pass. None of
+those local results changes the historical AWS facts above: current Terraform
+is unapplied and no PUBLIC-03 AWS deployment or activation has occurred.
+
 The labels below are gates:
 
 - **APPROVAL REQUIRED** means the account owner must approve the named choice
@@ -240,8 +252,8 @@ database name, approved RU/storage limits, and authorized NAT `/32`.
 
 ## 6. Create database identities and AWS secrets
 
-**APPROVAL REQUIRED — COST-BEARING:** For the current AWS module, approve two
-CockroachDB SQL users and two AWS Secrets Manager secrets. Secrets Manager
+**APPROVAL REQUIRED — COST-BEARING:** For the current AWS module, approve three
+CockroachDB SQL users and three AWS Secrets Manager secrets. Secrets Manager
 charges per secret and API use; use its AWS-managed encryption key unless a
 separately approved customer KMS key is required. See
 [Secrets Manager pricing](https://aws.amazon.com/secrets-manager/pricing/).
@@ -249,19 +261,27 @@ separately approved customer KMS key is required. See
 Create:
 
 - `fleet_migrator`: DDL-capable for the one-off schema migration;
-- `fleet_runtime`: no admin membership and only the runtime grants documented
-  in [MIGRATIONS.md](MIGRATIONS.md).
+- `fleet_writer`: no admin membership; after policy application it receives
+  membership only in the hardened `NOLOGIN` `fleet_runtime` logical role for
+  the private seed/reference/MCP DML grants documented in
+  [MIGRATIONS.md](MIGRATIONS.md); and
+- `fleet_publication`: the fixed public-application login, provisioned outside
+  Terraform and kept in exact `NOLOGIN` state until its policy ceremony is
+  complete.
 
 CockroachDB Cloud UI-created SQL users initially receive `admin`. Revoke it
-from `fleet_runtime` before use. After migration, grant runtime DML only on
+from `fleet_writer` and `fleet_publication` before use; immediately quiesce
+`fleet_publication` with exact `NOLOGIN`. After migration, grant the
+`fleet_runtime` logical role private-writer DML only on
 `memory_corpus_models`, `memory_chunks`,
 `memory_chunk_history`, `memory_claims`, `memory_claim_support`,
 `memory_claim_embeddings`, `memory_claim_events`, `memory_conflicts`,
 `memory_conflict_members`, `memory_claim_links`, `memory_claim_link_events`,
 `memory_mutation_receipts`, `memory_events`, and `memory_attention`; grant only
 the four legacy sequences and `_sqlx_migrations` access listed in
-[MIGRATIONS.md](MIGRATIONS.md). Never use `ON ALL TABLES`, and never grant the
-runtime or `public` role access to `memory_control_bootstraps`,
+[MIGRATIONS.md](MIGRATIONS.md), then grant `fleet_writer` only membership in
+that logical role. Never use `ON ALL TABLES`, and never grant the
+writer, publication reader, or `public` role access to `memory_control_bootstraps`,
 `memory_control_log_epochs`, `memory_control_shard_heads`, or
 `memory_control_events`. Also grant no runtime, bootstrap, or genesis-activation
 access to `memory_registry_transitions`,
@@ -278,6 +298,27 @@ role named by that policy, and grants nothing. Migrations 15 through 17 add or
 replace indexes and do not change the quarantine's table set. See
 [CockroachDB access management](https://www.cockroachlabs.com/docs/cockroachcloud/managing-access).
 
+The publication login never receives those writer grants directly. After the
+complete successful prefix 1 through 17, a cluster admin applies
+[`publication-reader-role-grants.sql`](../deploy/cockroach/publication-reader-role-grants.sql)
+while `fleet_publication` is drained and exact `NOLOGIN`. The policy creates
+and hardens the logical `fleet_publication_reader` role to `NOLOGIN`, then
+grants only `CONNECT` on `fleet_recall`, `USAGE` on schema `public`, and
+`SELECT` on exactly `_sqlx_migrations`, `memory_corpus_models`,
+`memory_chunks`, `memory_claim_embeddings`, `memory_claim_support`,
+`memory_claims`, `memory_conflict_members`, and `memory_conflicts`. It grants
+no DML, DDL, sequence, system, private-table, ownership, grant-option, or
+future-default authority.
+
+Before that apply, audit direct grants, ownership, future defaults, role edges,
+and inherited PUBLIC authority for both publication principals across every
+database. Freeze role, grant, default, ownership, and schema-DDL changes,
+repeat the audit if necessary, and reapply the policy immediately before the
+separate exact authentication-enable operation. Quiesce/drain the login and
+repeat that audit/reapply sequence after each migration or grant change.
+Terraform does not provision CockroachDB identities, memberships, grants, or
+authentication material.
+
 For each user, obtain a URL-encoded raw connection URL for `fleet_recall` with
 exactly one `sslmode=verify-full`. Do not copy a workstation-only
 `sslrootcert=/Users/...` path into ECS. CockroachDB Basic's Let's Encrypt CA may
@@ -289,27 +330,38 @@ correct CA instead of weakening `sslmode`. See
 Create these Secrets Manager entries by pasting their raw URL as the entire
 secret value in the AWS console:
 
-- `ostk-fleet-recall/database/runtime-url`
+- `ostk-fleet-recall/database/writer-url`
 - `ostk-fleet-recall/database/migrator-url`
+- `ostk-fleet-recall/database/publication-url`
 
 Do not use a JSON wrapper. Record only their ARNs. Verify metadata—not values:
 
 ```bash
 aws secretsmanager describe-secret \
-  --secret-id ostk-fleet-recall/database/runtime-url \
+  --secret-id ostk-fleet-recall/database/writer-url \
   --query '{arn:ARN,name:Name,kms:KmsKeyId}' --output json
 
 aws secretsmanager describe-secret \
   --secret-id ostk-fleet-recall/database/migrator-url \
   --query '{arn:ARN,name:Name,kms:KmsKeyId}' --output json
+
+aws secretsmanager describe-secret \
+  --secret-id ostk-fleet-recall/database/publication-url \
+  --query '{arn:ARN,name:Name,kms:KmsKeyId}' --output json
 ```
 
 Never run `get-secret-value` during a recorded session.
 
-Terraform accepts only these runtime and migrator secret ARNs. It has no
+Terraform accepts only these writer, migrator, and publication secret ARNs and
+rejects missing, wildcard, or colliding references. The public application has
+distinct publication execution and task roles, consumes only the publication
+secret, and uses only its concrete publication-specific CMKs for conditional
+decrypt. The publication CMK list must be disjoint from the writer/migrator
+list. The 21 Terraform configuration tests cover these boundaries and pass,
+but the current configuration remains unapplied. The module has no
 control-bootstrap, genesis-activation, successor, or conflict-reconciliation
 secret input, IAM execution role, ECS task, startup hook, or public route. Do
-not overload either AWS secret with a private ceremony credential.
+not overload any deployed AWS secret with a private ceremony credential.
 
 The successor repository and `ostk-registry-successor-activate` apply/inspect
 CLI are workstation source surfaces only. The checked-in
@@ -338,20 +390,20 @@ applying the policy. The local SQL file cannot perform that conditional cleanup
 or cross-database audit. No Terraform, AWS, image, runtime, MCP, or HTTP wiring
 exists.
 
-If the separately reviewed Stage-2 ceremony is actually run, create a third,
+If the separately reviewed Stage-2 ceremony is actually run, create a separate
 private SQL principal with no admin membership and only the grants in
 [CONTROL_BOOTSTRAP.md](CONTROL_BOOTSTRAP.md). Supply its dedicated URL to the
 local operator process; disable the login or remove the secret afterward. If
-the Stage-3 genesis-activation ceremony is run, create a fourth, distinct
+the Stage-3 genesis-activation ceremony is run, create another distinct
 principal with the exact activation grants in [MIGRATIONS.md](MIGRATIONS.md)
 and retire it after use. That genesis repository keeps its prefix-1-through-9
 compatibility gate even when the current release prefix reaches 17; it has no
 successor-table authority. The successor repository keeps its prefix-14 gate,
 and reconciliation keeps prefix 16; neither one-shot logical role nor any
-member is authorized by either AWS credential. All private ceremonies remain
-local until a separate deployment increment adds and reviews explicit cloud
-wiring. Their artifacts, pins, profiles, and URL rules are summarized in
-[SECURITY.md](SECURITY.md).
+member is authorized by any of the three planned AWS credentials. All private
+ceremonies remain local until a separate deployment increment adds and reviews
+explicit cloud wiring. Their artifacts, pins, profiles, and URL rules are
+summarized in [SECURITY.md](SECURITY.md).
 
 ## 7. Preserve and upload the pinned model
 
@@ -434,7 +486,7 @@ Continue with [the AWS deployment runbook](../deploy/aws/README.md), using:
 
 - the approved region, VPC ID, and four subnet IDs;
 - `assign_public_ip = false`;
-- both database secret ARNs, never their values;
+- all three database secret ARNs, never their values;
 - `arn:aws:s3:::${MODEL_BUCKET}` and
   `models/potion-retrieval-32M/${MODEL_RELEASE}`;
 - `MODEL_DIGEST` as `embedding_model_sha256`;
@@ -452,8 +504,12 @@ enable_deletion_protection = true
 ```
 
 Keep `service_desired_count = 0` and `autoscaling_min_capacity = 0` through the
-first apply. Run exactly one migration task, grant the runtime user, run the
-one-off idempotent seed task, then approve scaling the public service to one.
+first apply. Run exactly one migration task, grant only the private writer,
+then apply/audit the publication policy while `fleet_publication` remains
+quiesced. Under a dependency freeze, repeat the external audit and reapply the
+policy immediately before enabling that exact login. Run the one-off
+idempotent seed task with the writer secret, then approve scaling the public
+service, which receives only the publication secret, to one.
 For a separately approved deployment of the current checkout, that migration
 task must finish exactly the uninterrupted prefix 1 through 17: versions 1
 through 11 use the nontransactional policy (with resumable exact-catalog
@@ -493,6 +549,14 @@ finding-severity count,
 and GitHub Actions run
 [`31832684235`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31832684235)
 completed all five jobs successfully.
+
+That 552-row count is bound only to the recorded revision-10 image. The
+rich-demo generator is deterministic for a fixed source revision and manifest,
+but documentation changes alter chunk bytes, source lines, and potentially the
+row count. Before any new image is seeded, generate and test the rich corpus
+from that exact immutable tree and record its new verified manifest/breakdown;
+never carry the historical 552 count forward as a current-source claim.
+
 The checked-in
 [seven-query public relevance receipt](evidence/public-relevance-efe6fbf-20260814.json)
 is historical revision-7 evidence for the prior 548-row release, not the
@@ -554,7 +618,8 @@ optional alternate. Neither is cloud proof.
 The [official rules](https://cockroachdb-ai.devpost.com/rules) require the
 working project to remain available free of charge and without restriction
 until the judging period ends. Once the URL is submitted, keep the public ECS
-service, CockroachDB Cloud data plane, S3 model objects, runtime secrets,
+service, CockroachDB Cloud data plane, S3 model objects, the database secrets
+actually used by that historical revision-10 deployment,
 networking, DNS/TLS, and required logs operational through **September 15, 2026
 at 5:00 PM EDT / 4:00 PM CDT**. Monitor and repair the deployment during that
 hold; do not scale it to zero, revoke judging access, destroy it, or begin the
@@ -573,7 +638,7 @@ for every external deletion.
    a separate `terraform plan -destroy` before approving `terraform destroy`.
    The ECR repository may need its immutable images deleted first.
 4. Separately review resources Terraform does not own: NAT Gateway and Elastic
-   IP, S3 objects/versions and bucket, the two database Secrets Manager secrets
+   IP, S3 objects/versions and bucket, the three database Secrets Manager secrets
    used by Terraform, DNS and domain registration, ACM certificate,
    VPC/subnets, and CockroachDB Cloud. Separately inventory any out-of-band
    private-ceremony secret; it is not owned by this module.

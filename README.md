@@ -75,10 +75,40 @@ Conflict reconciliation likewise has an apply-only workstation CLI and a
 database-local, cluster-admin-only one-shot role policy. Database ownership is
 insufficient for either policy, and their mandatory cross-database audits
 remain external operator steps. Neither has Terraform, ECS, production-image,
-serving, or runtime wiring. The AWS module still wires only the distinct
-runtime and migrator database credential paths.
+serving, or runtime wiring.
 
-None of those source facts upgrades the historical cloud evidence below.
+The current source separately implements the PUBLIC-03 publication boundary.
+The only admitted public login is `fleet_publication`, which inherits one
+`NOLOGIN` logical role, `fleet_publication_reader`. That role has `CONNECT` on
+`fleet_recall`, `USAGE` on `public`, and `SELECT` on exactly
+`_sqlx_migrations`, `memory_corpus_models`, `memory_chunks`,
+`memory_claim_embeddings`, `memory_claim_support`, `memory_claims`,
+`memory_conflict_members`, and `memory_conflicts`. It has no sequence, DML,
+DDL, system, delegation, or private-table authority. `demo` accepts only
+`FLEET_RECALL_PUBLICATION_DATABASE_URL` and rejects writer, control, activation,
+reconciliation, and test database variables. Its pool witnesses
+`current_user = fleet_publication`, `current_database = fleet_recall`, the fixed
+`ostk-fleet-recall-publication` application name, and canonical `search_path =
+pg_catalog, public, pg_temp` both when a connection is created and before it is
+reused.
+
+The checked-in Terraform now plans a distinct publication secret, execution
+role, task role, and publication-only customer-managed KMS key set. Those
+Terraform changes are validated but **unapplied**. A local authoritative TLS
+run against the exact official CockroachDB v26.2.3 binary passed the publication
+reader and existing repository/private-CLI matrix. The full LocalStack
+production-image PUBLIC-03 smoke also passed at source commit
+`cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4`, including direct read, denied DML,
+DDL, and role delegation, writer-protocol denial in the public container, and
+recall after replacing that container; its
+[source-bound receipt](docs/evidence/localstack-publication-cd6ecfc-20260816.json)
+records the exact limits. Its database is deliberately insecure, so this does
+not prove database TLS, password authentication, real IAM, Fargate, or any AWS
+apply.
+
+None of those source facts upgrades the historical cloud evidence below. The
+live revision-10 deployment predates this source boundary and proves a
+read-only HTTP route, not the new publication database or IAM separation.
 
 The submission candidate is live at
 [https://d13zrqfh66r7ub.cloudfront.net](https://d13zrqfh66r7ub.cloudfront.net).
@@ -250,9 +280,11 @@ development flow:
 docker volume create ostk-fleet-recall-crdb
 docker run --detach \
   --name ostk-fleet-recall-crdb \
+  --add-host cockroach:127.0.0.1 \
   --publish 127.0.0.1:26257:26257 \
   --publish 127.0.0.1:8081:8080 \
   --volume ostk-fleet-recall-crdb:/cockroach/cockroach-data \
+  --volume "$PWD/deploy/cockroach:/localstack:ro" \
   cockroachdb/cockroach:v26.2.3 \
   start-single-node \
   --insecure \
@@ -280,7 +312,12 @@ fi
 
 docker exec ostk-fleet-recall-crdb \
   cockroach sql --insecure --host=127.0.0.1:26257 \
-  --execute='CREATE DATABASE IF NOT EXISTS fleet_recall'
+  --execute='
+    CREATE DATABASE IF NOT EXISTS fleet_recall;
+    CREATE USER IF NOT EXISTS fleet_migrator;
+    ALTER USER fleet_migrator WITH LOGIN NOCREATEDB NOCREATEROLE;
+    GRANT admin TO fleet_migrator;
+  '
 ```
 
 The SQL endpoint is `127.0.0.1:26257`; the local DB Console is
@@ -293,14 +330,16 @@ Fleet Recall accepts an insecure database URL only when
 Compose-only `cockroach` hostname). Production configuration must omit that
 escape hatch and use `sslmode=verify-full`.
 
-### 3. Bind one trusted deployment scope
+### 3. Migrate and ingest through the private capability
 
 Set every required runtime coordinate. Tenant, project, and agent are
 deployment authority, not request routing fields. The sample tenant is non-nil;
 generate a different stable UUID for every real fleet.
 
 ```bash
-export FLEET_RECALL_DATABASE_URL='postgresql://root@127.0.0.1:26257/fleet_recall?sslmode=disable'
+local_pg_scheme=postgresql
+local_migrator_password=local-migrator-only
+export FLEET_RECALL_DATABASE_URL="${local_pg_scheme}://fleet_migrator:${local_migrator_password}@127.0.0.1:26257/fleet_recall?sslmode=disable"
 export FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1
 export FLEET_RECALL_TENANT_ID=0198a849-f6ae-7d61-9800-000000000001
 export FLEET_RECALL_PROJECT=quickstart
@@ -311,8 +350,9 @@ export FLEET_RECALL_EMBEDDING_MODEL_PATH="$FLEET_RECALL_MODEL_DIR"
 export RUST_LOG=ostk_fleet_recall=info
 ```
 
-Apply the embedded schema from exactly one migrator, then load the included
-non-sensitive corpus and check readiness:
+This private URL is the only database capability in the process while it
+applies the embedded schema and loads the included non-sensitive corpus. Do not
+start the public demo yet:
 
 ```bash
 "$FLEET_RECALL_BIN" migrate
@@ -333,10 +373,27 @@ that policy. See
 [migration and recovery rules](docs/MIGRATIONS.md) before recovering a failed
 migration.
 
-### 4. Exercise the read-only HTTP demo
+### 4. Establish the publication boundary and exercise the HTTP demo
 
-Start the local server, wait for readiness, recall the ingested idea, and stop
-it:
+Quiesce the private migrator, provision the fixed publication principal, run
+the complete cross-database/PUBLIC audit, apply and reapply the reviewed reader
+policy under the same change freeze, and only then enable the publication
+login. The checked-in boundary helper fails closed on an unexpected database,
+grant, owner, future default, role edge, or policy digest:
+
+```bash
+docker exec --interactive ostk-fleet-recall-crdb \
+  /bin/sh -s < deploy/localstack/database-boundary.sh
+
+unset FLEET_RECALL_DATABASE_URL
+local_publication_password=local-publication-only
+export FLEET_RECALL_PUBLICATION_DATABASE_URL="${local_pg_scheme}://fleet_publication:${local_publication_password}@127.0.0.1:26257/fleet_recall?sslmode=disable"
+```
+
+The demo now has only its publication URL. On every new and reused pooled
+connection it re-witnesses the fixed login, database, application name, and
+canonical search path before any recall SQL runs. Start the local server, wait
+for readiness, recall the ingested idea, and stop it:
 
 ```bash
 "$FLEET_RECALL_BIN" demo --listen 127.0.0.1:8088 &
@@ -378,9 +435,15 @@ multi-tenant control plane.
 
 `serve` speaks newline-delimited JSON-RPC/MCP on stdin/stdout. The following is
 a complete direct smoke exchange. Keep each JSON request on one physical line;
-the initialized notification intentionally has no response.
+the initialized notification intentionally has no response. The public
+capability is removed first because MCP includes the private `remember` tool;
+the boundary helper provisioned this DML-only writer without DDL authority.
 
 ```bash
+unset FLEET_RECALL_PUBLICATION_DATABASE_URL
+local_writer_password=local-writer-only
+export FLEET_RECALL_DATABASE_URL="${local_pg_scheme}://fleet_writer:${local_writer_password}@127.0.0.1:26257/fleet_recall?sslmode=disable"
+
 "$FLEET_RECALL_BIN" serve <<'JSONRPC'
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"readme-smoke","version":"1.0.0"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
@@ -409,7 +472,7 @@ top-level keys vary.
       "command": "/absolute/path/to/ostk-fleet-recall/target/debug/ostk-fleet-recall",
       "args": ["serve"],
       "env": {
-        "FLEET_RECALL_DATABASE_URL": "postgresql://root@127.0.0.1:26257/fleet_recall?sslmode=disable",
+        "FLEET_RECALL_DATABASE_URL": "REPLACE_WITH_PRIVATE_WRITER_URL",
         "FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE": "1",
         "FLEET_RECALL_TENANT_ID": "0198a849-f6ae-7d61-9800-000000000001",
         "FLEET_RECALL_PROJECT": "quickstart",
@@ -487,10 +550,16 @@ the remaining rows.
   development-only. Cloud and other non-loopback URLs must use TLS
   verification; Stage-3 activation always requires `sslmode=verify-full`, even
   on loopback.
-- The current HTTP demo is read-only and exposes no MCP, ingest, bootstrap, or
-  activation route. Do not expose a future mutation route publicly without
-  workload identity, authorization, rate limiting, and production network
-  controls.
+- The HTTP demo exposes no MCP, ingest, bootstrap, activation, or mutation
+  route. It also accepts only `FLEET_RECALL_PUBLICATION_DATABASE_URL` and
+  rejects every private writer/control/test database variable. Its exact
+  `fleet_publication_reader` role can read only the eight status/recall tables;
+  it has no sequences, DML, DDL, system, delegation, or private-table
+  authority. New and reused pool connections re-witness the fixed
+  `fleet_publication` login, `fleet_recall` database,
+  `ostk-fleet-recall-publication` application name, and canonical search path.
+  Do not expose a future mutation route publicly without workload identity,
+  authorization, rate limiting, and production network controls.
 - Migrations 12 through 14 reserve durable successor state, and a private
   successor repository, workstation CLI, and reviewed one-shot logical-role
   policy exist. The deny-only quarantine keeps their three tables away from
@@ -545,12 +614,13 @@ only one-row functional behavior.
 The authoritative migration correctness lane targets the pinned official
 CockroachDB v26.2.3 binary and covers fresh, interruption, catalog-drift,
 transactional rollback, successor-repository and successor-CLI state matrices,
-functional-polarity, conflict reconciliation, and all four private CLIs through
-migration 17 on one checksum-pinned TLS server.
-The full role allow/deny/grant-option matrices remain separate Docker RBAC
-proofs. The recorded LocalStack application-image smoke predates migrations 10
-through 17 and must be rerun before claiming current image parity. None of these
-local results is AWS deployment evidence.
+functional-polarity, conflict reconciliation, the publication reader, and all
+four private CLIs through migration 17 on one checksum-pinned TLS server. That
+complete local wrapper passed. The full role allow/deny/grant-option matrices
+remain separate Docker RBAC proofs. The current LocalStack production-image
+PUBLIC-03 smoke passed at commit `cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4`;
+the older through-migration-9 run remains historical evidence only. None of
+these local results is AWS deployment evidence.
 
 ## Deployment and project documentation
 

@@ -22,6 +22,10 @@ visible so one segment cannot be mistaken for another.
 
 The public conflict-first UI is the current revision-10 deployment at source
 commit `56b577c82b9c5a5c80d73103f7f6b56d51698872`, with the 552-row rich seed.
+Its accepted observations are route-level read-only only: neither the browser
+capture nor the historical status response attests the deployed database
+principal or grants. Do not call the current checked-in PUBLIC-03 role matrix
+deployed.
 The correlated four-task agent and fully disjoint replacement receipts are
 verified **historical revision-6** evidence from run
 `devpost-final6-20260814T143523Z`; they were not rerun for revision 10. The
@@ -43,7 +47,7 @@ or source boundary:
 
 ```text
 LIVE PUBLIC DEMO · AWS + COCKROACHDB CLOUD · CURRENT REVISION 10 UI
-552-ROW RICH SEED · PUBLIC READ-ONLY ENDPOINT
+552-ROW RICH SEED · READ-ONLY ROUTES · DB GRANTS NOT ATTESTED
 
 VERIFIED CLOUD AGENT RECEIPT · AWS FARGATE + COCKROACHDB CLOUD
 HISTORICAL REVISION 6 · RUN devpost-final6-20260814T143523Z
@@ -85,9 +89,10 @@ records the expected conflict and no-conflict query behavior for rehearsal;
 run the questions again immediately before recording rather than substituting
 that prior-release receipt for live footage.
 
-Narrate: “This is the current read-only AWS deployment, backed by CockroachDB
-Cloud. I can ask in normal language and get readable, cited memories—not a wall
-of JSON. When retrieved evidence leads to an open typed disagreement, the
+Narrate: “This current AWS demo exposes only read routes and is backed by
+CockroachDB Cloud. I can ask in normal language and get readable, cited
+memories—not a wall of JSON. This browser evidence does not attest its database
+grant matrix. When retrieved evidence leads to an open typed disagreement, the
 memory shows both sides and requires operator review instead of silently
 choosing a winner.” Leave “View raw
 evidence envelope” collapsed until the cards are understood; a brief expansion
@@ -215,7 +220,14 @@ are supporting footage for DISAGREE; they never replace the live-cloud proof.
 ## Fresh standalone Fleet Recall recording
 
 This is the primary live **local** source-footage path. It is not AWS evidence.
-Start the local smoke environment and leave it running:
+The full current LocalStack PUBLIC-03 smoke already passed from clean commit
+`cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4`; its accepted
+[receipt](evidence/localstack-publication-cd6ecfc-20260816.json) binds prefix
+1–17, the exact production image, reader-only status/recall, writer denial,
+replacement persistence, and zero residue. It also explicitly proves no TLS,
+database-password authentication, IAM enforcement, Fargate, or AWS apply.
+
+For a fresh recording, start the local smoke environment and leave it running:
 
 ```bash
 KEEP_LOCALSTACK=1 ./deploy/localstack/smoke.sh
@@ -330,7 +342,9 @@ narration. Do not imply that the clip came from AWS:
 The footer calls stateless application replacement a **separate smoke gate**.
 Scenario evidence proves the memory/action/conflict chain;
 `deploy/localstack/smoke.sh` separately checks S3 model delivery, Secrets
-Manager, and recall after replacing the application container.
+Manager, the production image's reader/writer boundary, and recall after
+replacing the application container. That local result must retain its
+no-TLS/password/IAM/Fargate/AWS limitations in any caption or narration.
 
 ## Recording gates
 

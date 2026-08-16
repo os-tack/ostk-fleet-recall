@@ -39,6 +39,19 @@ Manager contracts plus stateless application replacement. LocalStack license
 activation is an external prerequisite, so failure to reach its licensing
 server must not be presented as application evidence.
 
+The checked-in
+[`localstack-publication-cd6ecfc-20260816.json`](localstack-publication-cd6ecfc-20260816.json)
+is the accepted PUBLIC-03 local-emulator receipt from clean source commit
+`cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4`. It binds the production and
+private-helper image digests, exact successful migration prefix 1 through 17,
+publication policy and grant fingerprints, reader-only status/recall success,
+writer-command denial, persistence after application replacement, and
+post-teardown container/secret-volume absence. Its negative claims are part of
+the contract: this was an insecure local CockroachDB/LocalStack run and did not
+prove TLS, database password authentication, IAM enforcement, Fargate, or any
+AWS apply. The separately accepted official-binary TLS proof covers the local
+TLS/RBAC/product boundary; neither result is evidence of an AWS deployment.
+
 ## Cloud release evidence
 
 The current live release runs immutable image tag `git-56b577c82b9c` at source
