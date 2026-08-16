@@ -207,6 +207,10 @@ pub enum DigestDomain {
     /// per-record ordering-key preimage.
     ExemplarSelectionV1,
     // --- W0-CAUSE domains ---
+    CausalHypothesisV1,          // W0-CAUSE
+    CausalMechanismCommitmentV1, // W0-CAUSE
+    InterventionSupportV1,       // W0-CAUSE
+    CausalRatificationV1,        // W0-CAUSE
 
     // --- W0-ACT domains ---
     /// `ActionProposalV1` immutable proposal digest (ACT-02).
@@ -354,7 +358,10 @@ impl DigestDomain {
             Self::SloEvaluationV1 => "ostk-slo-evaluation-v1",
             Self::ExemplarSelectionV1 => "ostk-exemplar-selection-v1",
             // --- W0-CAUSE prefixes ---
-
+            Self::CausalHypothesisV1 => "ostk-causal-hypothesis-v1",
+            Self::CausalMechanismCommitmentV1 => "ostk-causal-mechanism-commitment-v1",
+            Self::InterventionSupportV1 => "ostk-intervention-support-v1",
+            Self::CausalRatificationV1 => "ostk-causal-ratification-v1",
             // --- W0-ACT prefixes ---
             Self::ActionProposalV1 => "ostk-action-proposal-v1",
             Self::ActionAuthorizationV1 => "ostk-action-authorization-v1",
