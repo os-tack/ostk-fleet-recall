@@ -612,8 +612,15 @@ GRANT SELECT, INSERT ON TABLE public.memory_claim_events
     TO fleet_conflict_reconciliation;
 
 -- A tenant-wide idempotency receipt is reserved and completed around the
--- mutation. The aggregate audit row is append-only and intentionally has no
+-- mutation. CockroachDB v26.2.3 initializes SELECT authorization for all three
+-- outbound receipt-FK parents before it short-circuits an omitted/default-NULL
+-- key. Claims and conflicts are already direct repository reads; link_id stays
+-- NULL on this path, so memory_claim_links receives only the indirect SELECT
+-- required to reserve the receipt. No link DML or link-ID sequence use is
+-- admitted. The aggregate audit row is append-only and intentionally has no
 -- read grant under this credential.
+GRANT SELECT ON TABLE public.memory_claim_links
+    TO fleet_conflict_reconciliation;
 GRANT SELECT, INSERT, UPDATE ON TABLE public.memory_mutation_receipts
     TO fleet_conflict_reconciliation;
 GRANT INSERT ON TABLE public.memory_events

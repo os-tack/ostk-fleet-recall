@@ -290,6 +290,7 @@ CREATE TEMP TABLE memory_conflicts (id INT8 PRIMARY KEY);
 CREATE TEMP TABLE memory_conflict_members (id INT8 PRIMARY KEY);
 CREATE TEMP TABLE memory_claims (id INT8 PRIMARY KEY);
 CREATE TEMP TABLE memory_claim_events (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_claim_links (id INT8 PRIMARY KEY);
 CREATE TEMP TABLE memory_mutation_receipts (id INT8 PRIMARY KEY);
 CREATE TEMP TABLE memory_events (id INT8 PRIMARY KEY);
 CREATE TEMP SEQUENCE memory_conflict_id_seq;
@@ -529,7 +530,7 @@ assert_exact "fleet_recall current-database preflight" \
 unqualified_policy_application_references=$(sed -E 's/--.*$//' \
     "$reconciliation_policy" \
     | grep -En \
-        '(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+(_sqlx_migrations|memory_(claims|claim_events|conflicts|conflict_members|mutation_receipts|events|conflict_id_seq))([^[:alnum:]_]|$)' \
+        '(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+(_sqlx_migrations|memory_(claims|claim_events|claim_links|conflicts|conflict_members|mutation_receipts|events|conflict_id_seq))([^[:alnum:]_]|$)' \
         || true)
 assert_exact "unqualified reconciliation policy application references" \
     "$unqualified_policy_application_references" ''
@@ -537,12 +538,13 @@ assert_exact "unqualified reconciliation policy application references" \
 qualified_policy_application_references=$(sed -E 's/--.*$//' \
     "$reconciliation_policy" \
     | grep -Eo \
-        '(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+public\.(_sqlx_migrations|memory_(claims|claim_events|conflicts|conflict_members|mutation_receipts|events|conflict_id_seq))' \
+        '(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+public\.(_sqlx_migrations|memory_(claims|claim_events|claim_links|conflicts|conflict_members|mutation_receipts|events|conflict_id_seq))' \
     | sed -E 's/^(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+//' \
     | sort)
 expected_qualified_policy_application_references='public._sqlx_migrations
 public._sqlx_migrations
 public.memory_claim_events
+public.memory_claim_links
 public.memory_claims
 public.memory_conflict_id_seq
 public.memory_conflict_members
@@ -1066,10 +1068,16 @@ assert_root_scalar "non-intrinsic reconciliation/PUBLIC future-object defaults" 
        )
      ORDER BY role, object_type, grantee, privilege_type" ''
 
-# Freeze the complete direct repository surface before provisioning the
-# one-shot membership: sixteen table/sequence rows, sole database CONNECT, sole
-# schema USAGE, no inherited PUBLIC application grants, and no target/PUBLIC
-# system authority.
+# Freeze the complete six-table direct repository surface plus the one
+# read-only receipt-FK parent before provisioning the one-shot membership:
+# seventeen table/sequence rows, sole database CONNECT, sole schema USAGE, no
+# inherited PUBLIC application grants, and no target/PUBLIC system authority.
+assert_root_scalar "reconciliation table/sequence grant row count" \
+    "SELECT count(*)::STRING
+     FROM [SHOW GRANTS FOR fleet_conflict_reconciliation]
+     WHERE grantee = 'fleet_conflict_reconciliation'
+       AND database_name = 'fleet_recall'
+       AND object_type IN ('table', 'sequence')" '17'
 assert_root_scalar "reconciliation full current table/sequence grants" \
     "SELECT schema_name || ':' || object_type || ':' || object_name || ':' ||
             privilege_type || ':' ||
@@ -1083,6 +1091,7 @@ assert_root_scalar "reconciliation full current table/sequence grants" \
 public:table:_sqlx_migrations:SELECT:not_grantable
 public:table:memory_claim_events:INSERT:not_grantable
 public:table:memory_claim_events:SELECT:not_grantable
+public:table:memory_claim_links:SELECT:not_grantable
 public:table:memory_claims:SELECT:not_grantable
 public:table:memory_claims:UPDATE:not_grantable
 public:table:memory_conflict_members:INSERT:not_grantable
@@ -1584,6 +1593,40 @@ fi
 grep -Eiq 'privilege|permission' <<<"$reconciliation_registry_read" \
     || fail "reconciliation registry denial was not authorization"
 
+# The seventh application table is an FK-planning dependency, not a mutation
+# target. Prove its one allowed operation and all three denied DML operations
+# against the real migration schema before the CLI reserves its receipt.
+if ! "$crdb" sql --url="$reconciliation_url" \
+    --execute='SELECT count(*) FROM memory_claim_links' >/dev/null; then
+    fail "reconciliation member could not read the receipt-FK link parent"
+fi
+if reconciliation_claim_link_insert=$("$crdb" sql --url="$reconciliation_url" \
+    --execute="
+        INSERT INTO memory_claim_links (
+            tenant_id, project, id, from_claim_id, to_claim_id, relation
+        )
+        SELECT
+            '$reconciliation_tenant_id'::UUID,
+            '$reconciliation_project', 1, 2, 3, 'supports'
+        WHERE false
+    " 2>&1); then
+    fail "reconciliation member unexpectedly received claim-link INSERT"
+fi
+grep -Eiq 'privilege|permission' <<<"$reconciliation_claim_link_insert" \
+    || fail "reconciliation claim-link INSERT denial was not authorization"
+if reconciliation_claim_link_update=$("$crdb" sql --url="$reconciliation_url" \
+    --execute='UPDATE memory_claim_links SET state = state WHERE false' 2>&1); then
+    fail "reconciliation member unexpectedly received claim-link UPDATE"
+fi
+grep -Eiq 'privilege|permission' <<<"$reconciliation_claim_link_update" \
+    || fail "reconciliation claim-link UPDATE denial was not authorization"
+if reconciliation_claim_link_delete=$("$crdb" sql --url="$reconciliation_url" \
+    --execute='DELETE FROM memory_claim_links WHERE false' 2>&1); then
+    fail "reconciliation member unexpectedly received claim-link DELETE"
+fi
+grep -Eiq 'privilege|permission' <<<"$reconciliation_claim_link_delete" \
+    || fail "reconciliation claim-link DELETE denial was not authorization"
+
 # Seed the exact three-candidate open graph as root. Two positive decisions
 # disagree and are the immutable legacy endpoints; the negative MySQL claim is
 # proposition-compatible with both and therefore remains outside the v2 graph.
@@ -1996,8 +2039,9 @@ assert_root_scalar "exact reconciliation claim transition events" \
      WHERE tenant_id = '$reconciliation_tenant_id'
        AND project = '$reconciliation_project'" 'match'
 
-# A replay reads the one tenant-wide receipt and changes none of the six
-# reconciliation tables. CockroachDB fingerprints cover every index in each
+# A replay reads the one tenant-wide receipt and changes none of the six direct
+# writable reconciliation tables. The SELECT-only receipt-FK link parent is not
+# a mutation target. CockroachDB fingerprints cover every index in each direct
 # table, so equality freezes more than the scoped row-count footprint.
 reconciliation_snapshot_before_replay=$(reconciliation_table_fingerprints)
 reconciliation_replay=$(run_reconciliation)
@@ -2103,7 +2147,9 @@ for output in \
     "$pinned" "$inserted" "$accepted" "$replay" "$conflict" "$stale" \
     "$invalid_reconciliation" "$reconciliation_materialized" \
     "$reconciliation_replay" "$reconciliation_event_read" \
-    "$reconciliation_registry_read" "$reconciliation_disabled_auth" \
+    "$reconciliation_registry_read" "$reconciliation_claim_link_insert" \
+    "$reconciliation_claim_link_update" "$reconciliation_claim_link_delete" \
+    "$reconciliation_disabled_auth" \
     "$control_registry_read" "$runtime_registry_read"
 do
     for secret in \

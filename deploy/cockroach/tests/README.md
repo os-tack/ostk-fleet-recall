@@ -28,8 +28,9 @@ cannot count as connected success.
 | Online-index interruption recovery and drift rejection | `--lib` / `store::cockroach::tests::live_online_index_migrations_recover_and_reject_drift_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Transactional-DDL rollback | `--lib` / `store::cockroach::tests::live_transactional_migration_rolls_back_ddl_on_history_conflict_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 
-The same isolated server also exercises the inspect/apply/replay state machines
-of both currently wired private CLIs. It requires exactly 17 successful SQLx
+The same isolated server also exercises inspect/apply/replay for the control and
+genesis-activation CLIs, plus materialize/exact replay for the apply-only
+conflict-reconciliation CLI. It requires exactly 17 successful SQLx
 rows with versions 1 through 17, the three successor authority tables, the two
 genesis-root indexes, and the exact indexes introduced by migrations 15, 16,
 and 17. The retired pre-v15 conflict uniqueness index must be absent. The proof
@@ -41,7 +42,8 @@ migrations 12 through 14.
 
 These current-release assertions do not widen the private compatibility gates:
 Stage 2 still requires the complete successful prefix through 3, genesis Stage
-3 through 9, and the successor repository through 14.
+3 through 9, the successor repository through 14, and conflict reconciliation
+through 16.
 
 Run the authoritative proof with an already checksum-verified binary:
 
@@ -59,7 +61,7 @@ counted as Docker evidence.
 
 | Reported result | Substrate and scope | Relationship to authority |
 | --- | --- | --- |
-| Official-binary correctness | One checksum-pinned, build-tag-pinned TLS `v26.2.3` server running the complete matrix and both private CLIs | The single authoritative connected result |
+| Official-binary correctness | One checksum-pinned, build-tag-pinned TLS `v26.2.3` server running the complete matrix and the control, genesis-activation, and conflict-reconciliation CLIs | The single authoritative connected result |
 | Control RBAC parity | `control-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Activation RBAC parity | `registry-activation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Conflict-reconciliation RBAC parity | `conflict-reconciliation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
@@ -87,8 +89,9 @@ deployment stages. These Docker policy-compatibility proofs do not claim the
 current exact prefix through 17.
 
 The conflict-reconciliation RBAC proof uses privilege-shaped minimal stand-ins
-for the six repository tables, the conflict-ID sequence, and unrelated corpus/
-control/registry/successor surfaces; repository correctness remains in the
+for the six direct repository tables, the read-only `memory_claim_links`
+receipt-FK parent, the conflict-ID sequence, and unrelated corpus/control/
+registry/successor surfaces; repository correctness remains in the
 official-binary Rust test. The policy pins `search_path` to
 `pg_catalog, public, pg_temp`, explicitly qualifies every application object,
 and first rejects any current database other than `fleet_recall`. The proof
@@ -196,7 +199,8 @@ preserves a PUBLIC `CREATEROLE` system grant, removes it explicitly, and include
 PUBLIC in the final exact system-grant audit; the policy never silently revokes
 cluster-wide PUBLIC authority.
 Externally provisioned LOGIN members without ADMIN OPTION remain visible in the
-complete membership audit. Exact `SHOW` output plus allowed/denied operations
+complete membership audit. Exact `SHOW` output plus allowed/denied operations,
+including allowed link reads and denied link `INSERT`, `UPDATE`, and `DELETE`,
 freezes the one-shot logical role.
 
 The role policy independently clears the complete CockroachDB v26.2 direct
@@ -212,11 +216,21 @@ substrate; exact `NOLOGIN` is the portable denial even if a stale hash exists,
 while a secure-cluster operator can additionally clear a non-provisioned role's
 password.
 
-CockroachDB v26.2 requires table-level `UPDATE` for the repository's `FOR
-UPDATE` locks on conflict rows and memberships; the proof therefore also
-freezes the repository's actual `UPDATE` targets so that residual capability
-cannot silently become an application write path. The serving runtime retains
-its broader direct legacy-ledger DML because remember depends on it. The
+Static extraction freezes the six direct SQL tables, their exact
+`SELECT`/`INSERT`/`UPDATE` targets, and the absence of `DELETE`; migration
+extraction freezes the receipt's three outbound FK parents. CockroachDB
+v26.2.3 initializes parent `SELECT` authorization while planning the receipt
+reservation `INSERT`, before short-circuiting its omitted nullable `claim_id`,
+`conflict_id`, and `link_id`.
+Claims and conflicts are already direct reads, so the one indirect addition is
+`SELECT` on `memory_claim_links`; the role receives neither link DML nor the
+link-ID sequence. The exact table/sequence grant matrix is therefore 17 rows.
+
+CockroachDB v26.2 also requires table-level `UPDATE` for the repository's `FOR
+UPDATE` locks on conflict rows and memberships; the proof therefore freezes the
+repository's actual `UPDATE` targets so that residual capability cannot
+silently become an application write path. The serving runtime retains its
+broader direct legacy-ledger DML because remember depends on it. The
 reconciliation role is the supported least-privilege one-shot credential, not
 an engine claim that a misused raw runtime credential cannot issue equivalent
 table mutations; the parity proof snapshots and preserves that overlap while

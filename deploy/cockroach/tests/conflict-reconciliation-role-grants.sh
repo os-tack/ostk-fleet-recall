@@ -262,6 +262,7 @@ CREATE TEMP TABLE memory_conflicts (id INT8 PRIMARY KEY);
 CREATE TEMP TABLE memory_conflict_members (id INT8 PRIMARY KEY);
 CREATE TEMP TABLE memory_claims (id INT8 PRIMARY KEY);
 CREATE TEMP TABLE memory_claim_events (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_claim_links (id INT8 PRIMARY KEY);
 CREATE TEMP TABLE memory_mutation_receipts (id INT8 PRIMARY KEY);
 CREATE TEMP TABLE memory_events (id INT8 PRIMARY KEY);
 CREATE TEMP SEQUENCE memory_conflict_id_seq;
@@ -568,6 +569,49 @@ memory_mutation_receipts'
 assert_exact "reconciliation repository SQL table surface" \
     "$repository_sql_tables" "$expected_repository_sql_tables"
 
+# CockroachDB v26.2.3 initializes every outbound-FK parent authorization while
+# planning the receipt reservation INSERT, before it short-circuits omitted
+# nullable keys. Freeze all three migration-defined parents: claims and
+# conflicts are already direct repository reads, while links is the one exact
+# indirect SELECT dependency.
+receipt_fk_tables=$(sed -n \
+    '/^CREATE TABLE memory_mutation_receipts (/,/^);$/p' \
+    "$repo_root/migrations/0001_fleet_memory.sql" \
+    | grep -Eo 'REFERENCES[[:space:]]+memory_[a-z_]+' \
+    | sed -E 's/^REFERENCES[[:space:]]+//' \
+    | sort -u)
+expected_receipt_fk_tables='memory_claim_links
+memory_claims
+memory_conflicts'
+assert_exact "reconciliation receipt outbound-FK SELECT dependencies" \
+    "$receipt_fk_tables" "$expected_receipt_fk_tables"
+
+repository_select_targets=$(sed '/^#\[cfg(test)\]/,$d' \
+    "$repo_root/src/ledger/reconciliation.rs" \
+    | grep -Eio '(FROM|JOIN)[[:space:]\\]+memory_[a-z_]+' \
+    | sed -E 's/.*[[:space:]\\]+(memory_[a-z_]+)$/\1/' \
+    | sort -u)
+expected_repository_select_targets='memory_claim_events
+memory_claims
+memory_conflict_members
+memory_conflicts
+memory_mutation_receipts'
+assert_exact "reconciliation repository direct SELECT targets" \
+    "$repository_select_targets" "$expected_repository_select_targets"
+
+repository_insert_targets=$(sed '/^#\[cfg(test)\]/,$d' \
+    "$repo_root/src/ledger/reconciliation.rs" \
+    | grep -Eio 'INTO[[:space:]\\]+memory_[a-z_]+' \
+    | sed -E 's/.*[[:space:]\\]+(memory_[a-z_]+)$/\1/' \
+    | sort -u)
+expected_repository_insert_targets='memory_claim_events
+memory_conflict_members
+memory_conflicts
+memory_events
+memory_mutation_receipts'
+assert_exact "reconciliation repository INSERT targets" \
+    "$repository_insert_targets" "$expected_repository_insert_targets"
+
 repository_update_targets=$(sed '/^#\[cfg(test)\]/,$d' \
     "$repo_root/src/ledger/reconciliation.rs" \
     | grep -Eio 'UPDATE[[:space:]\\]+memory_[a-z_]+' \
@@ -577,6 +621,14 @@ expected_repository_update_targets='memory_claims
 memory_mutation_receipts'
 assert_exact "reconciliation repository UPDATE targets" \
     "$repository_update_targets" "$expected_repository_update_targets"
+
+repository_delete_targets=$(sed '/^#\[cfg(test)\]/,$d' \
+    "$repo_root/src/ledger/reconciliation.rs" \
+    | { grep -Eio 'DELETE[[:space:]\\]+FROM[[:space:]\\]+memory_[a-z_]+' || true; } \
+    | sed -E 's/.*[[:space:]\\]+(memory_[a-z_]+)$/\1/' \
+    | sort -u)
+assert_exact "reconciliation repository DELETE targets" \
+    "$repository_delete_targets" ''
 
 role_option_hardening=$(sed -n \
     '/^ALTER ROLE fleet_conflict_reconciliation WITH$/,/^    NOVIEWCLUSTERSETTING;$/p' \
@@ -613,7 +665,7 @@ assert_exact "reconciliation policy first statement" \
 unqualified_policy_application_references=$(sed -E 's/--.*$//' \
     "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql" \
     | grep -En \
-        '(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+(_sqlx_migrations|memory_(claims|claim_events|conflicts|conflict_members|mutation_receipts|events|conflict_id_seq))([^[:alnum:]_]|$)' \
+        '(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+(_sqlx_migrations|memory_(claims|claim_events|claim_links|conflicts|conflict_members|mutation_receipts|events|conflict_id_seq))([^[:alnum:]_]|$)' \
         || true)
 assert_exact "unqualified reconciliation policy application references" \
     "$unqualified_policy_application_references" ''
@@ -621,12 +673,13 @@ assert_exact "unqualified reconciliation policy application references" \
 qualified_policy_application_references=$(sed -E 's/--.*$//' \
     "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql" \
     | grep -Eo \
-        '(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+public\.(_sqlx_migrations|memory_(claims|claim_events|conflicts|conflict_members|mutation_receipts|events|conflict_id_seq))' \
+        '(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+public\.(_sqlx_migrations|memory_(claims|claim_events|claim_links|conflicts|conflict_members|mutation_receipts|events|conflict_id_seq))' \
     | sed -E 's/^(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+//' \
     | sort)
 expected_qualified_policy_application_references='public._sqlx_migrations
 public._sqlx_migrations
 public.memory_claim_events
+public.memory_claim_links
 public.memory_claims
 public.memory_conflict_id_seq
 public.memory_conflict_members
@@ -758,17 +811,30 @@ CREATE INDEX memory_claim_events_transition_provenance_idx
         tenant_id, project, claim_id, event_kind, created_at DESC, event_id DESC
     ) STORING (reason, from_state, to_state, payload);
 
+CREATE TABLE memory_claim_links (
+    tenant_id UUID NOT NULL,
+    project STRING NOT NULL,
+    id INT8 NOT NULL,
+    PRIMARY KEY (tenant_id, project, id)
+);
+
 CREATE TABLE memory_mutation_receipts (
     tenant_id UUID NOT NULL,
     idempotency_key STRING NOT NULL,
     project STRING NOT NULL,
     request JSONB NOT NULL,
     operation STRING NOT NULL,
+    claim_id INT8,
     conflict_id INT8,
+    link_id INT8,
     response JSONB,
     PRIMARY KEY (tenant_id, idempotency_key),
+    FOREIGN KEY (tenant_id, project, claim_id)
+        REFERENCES memory_claims (tenant_id, project, id),
     FOREIGN KEY (tenant_id, project, conflict_id)
-        REFERENCES memory_conflicts (tenant_id, project, id)
+        REFERENCES memory_conflicts (tenant_id, project, id),
+    FOREIGN KEY (tenant_id, project, link_id)
+        REFERENCES memory_claim_links (tenant_id, project, id)
 );
 
 CREATE TABLE memory_events (
@@ -1570,6 +1636,7 @@ expected_reconciliation_object_grants='public:sequence:memory_conflict_id_seq:US
 public:table:_sqlx_migrations:SELECT:not_grantable
 public:table:memory_claim_events:INSERT:not_grantable
 public:table:memory_claim_events:SELECT:not_grantable
+public:table:memory_claim_links:SELECT:not_grantable
 public:table:memory_claims:SELECT:not_grantable
 public:table:memory_claims:UPDATE:not_grantable
 public:table:memory_conflict_members:INSERT:not_grantable
@@ -1584,6 +1651,8 @@ public:table:memory_mutation_receipts:SELECT:not_grantable
 public:table:memory_mutation_receipts:UPDATE:not_grantable'
 assert_exact "reconciliation full current table/sequence grants" \
     "$reconciliation_object_grants" "$expected_reconciliation_object_grants"
+assert_exact "reconciliation table/sequence grant row count" \
+    "$(printf '%s\n' "$reconciliation_object_grants" | wc -l | tr -d ' ')" '17'
 
 database_grants=$(root_sql "
 SELECT database_name || ':' || grantee || ':' || privilege_type || ':' ||
@@ -1972,6 +2041,8 @@ INSERT INTO memory_claim_events (
 )"
 expect_allowed proof_reconciliation "claim transition read" \
     'SELECT count(*) FROM memory_claim_events'
+expect_allowed proof_reconciliation "receipt-FK link parent read" \
+    'SELECT count(*) FROM memory_claim_links'
 expect_allowed proof_reconciliation "receipt reserve" "
 INSERT INTO memory_mutation_receipts (
     tenant_id, idempotency_key, project, request, operation
@@ -2025,6 +2096,16 @@ expect_denied proof_reconciliation "claim-event update" \
     'UPDATE memory_claim_events SET reason = reason WHERE false'
 expect_denied proof_reconciliation "claim-event delete" \
     'DELETE FROM memory_claim_events WHERE false'
+expect_denied proof_reconciliation "claim-link insert" "
+INSERT INTO memory_claim_links (tenant_id, project, id)
+VALUES (
+    '0198a849-f6ae-7d61-9800-000000000001',
+    'reconciliation-grant-proof', 1
+)"
+expect_denied proof_reconciliation "claim-link update" \
+    'UPDATE memory_claim_links SET id = id WHERE false'
+expect_denied proof_reconciliation "claim-link delete" \
+    'DELETE FROM memory_claim_links WHERE false'
 expect_denied proof_reconciliation "receipt delete" \
     'DELETE FROM memory_mutation_receipts WHERE false'
 expect_denied proof_reconciliation "aggregate audit read" \
