@@ -41,9 +41,11 @@
 //!
 //! [`BodyReferenceStateV1::may_reclaim_shared_storage`] and
 //! [`apply_occurrence_erasure`] model EVID-08's reference-counted erasure
-//! rule as a pure predicate and a pure state transition: erasure removes an
-//! occurrence from the lawful-reference set immediately, and shared body or
-//! embedding storage may be reclaimed only once that set is empty.
+//! rule as a validated predicate and a pure state transition: erasure
+//! removes an occurrence from the lawful-reference set immediately, and
+//! shared body or embedding storage may be reclaimed only once that set is
+//! empty. `may_reclaim_shared_storage` validates its receiver first, so an
+//! unknown-schema or otherwise-invalid state can never answer `Ok(true)`.
 //!
 //! [`StorageIdentityPreimageV1::storage_identity`] hashes the
 //! protection-domain identifier into the same preimage as the body-content
@@ -440,13 +442,25 @@ pub fn classify_body_reuse(
 /// Body similarity, shifted text (even if the shifted bytes are identical),
 /// or semantic overlap is new support requiring fresh verification, never
 /// automatic equivalence.
+///
+/// Both span lists are validated with the same [`validate_span_list`] rule
+/// an admitted [`ChunkOccurrencePreimageV1`] must pass (non-empty,
+/// individually valid, strictly ordered, non-overlapping) before any
+/// comparison happens. An empty, backwards, zero-digest, or
+/// unknown-schema-version span list can therefore never be reported
+/// equivalent to anything, including itself: this returns `Err`, not
+/// `false`, on invalid input, because a bare `false` would be
+/// indistinguishable from "verified different" when it actually means
+/// "unverifiable".
 pub fn citations_are_automatically_equivalent(
     left_source: &ResourceUri,
     left_spans: &[SourceSpanV1],
     right_source: &ResourceUri,
     right_spans: &[SourceSpanV1],
-) -> bool {
-    left_source == right_source && left_spans == right_spans
+) -> ContractResult<bool> {
+    validate_span_list(left_spans)?;
+    validate_span_list(right_spans)?;
+    Ok(left_source == right_source && left_spans == right_spans)
 }
 
 /// Closed set of reasons one parse manifest may supersede another.
@@ -755,10 +769,20 @@ impl BodyReferenceStateV1 {
 
     /// EVID-08: shared body/embedding storage may be reclaimed only once no
     /// lawful occurrence references it. A checkpoint cannot pin bytes that
-    /// policy requires erased, so this predicate is the pure fact a runtime
+    /// policy requires erased, so this predicate is the fact a runtime
     /// reclamation decision must be gated on.
-    pub const fn may_reclaim_shared_storage(&self) -> bool {
-        self.lawful_referencing_occurrences.is_empty()
+    ///
+    /// Validates `self` first, so a state with an unknown/future
+    /// `schema_version`, a zero `body_content_id`, an oversized or
+    /// non-canonically-sorted reference set — anything [`Self::validate`]
+    /// rejects — can never yield a reclaim-permitted answer. In particular a
+    /// record written under a schema this contract cannot interpret always
+    /// answers `Err`, never `Ok(true)`: fail-closed on unknown input, per
+    /// the fleet criterion, rather than granting the exact permission
+    /// EVID-08 gates on a state this code does not understand.
+    pub fn may_reclaim_shared_storage(&self) -> ContractResult<bool> {
+        self.validate()?;
+        Ok(self.lawful_referencing_occurrences.is_empty())
     }
 }
 
@@ -1147,17 +1171,50 @@ mod tests {
         let uri = source_uri(0x01);
         let spans_a = vec![span(0, 100, 140, 0xaa)];
         let spans_b = vec![span(0, 100, 140, 0xaa)];
-        assert!(citations_are_automatically_equivalent(
-            &uri, &spans_a, &uri, &spans_b
-        ));
+        assert!(citations_are_automatically_equivalent(&uri, &spans_a, &uri, &spans_b).unwrap());
 
         // Shifted text: same-length span at a different offset is not
         // automatically equivalent, even if the underlying bytes are the
         // same content that moved.
         let shifted = vec![span(0, 105, 145, 0xaa)];
-        assert!(!citations_are_automatically_equivalent(
-            &uri, &spans_a, &uri, &shifted
-        ));
+        assert!(!citations_are_automatically_equivalent(&uri, &spans_a, &uri, &shifted).unwrap());
+    }
+
+    /// Reviewer ATTACK1: an empty span list is exactly what
+    /// `validate_span_list` rejects, and is the case
+    /// `negative-empty-span.jsonl` exhibits as a negative vector. Two
+    /// citations with no spans and no span digests must never be reported
+    /// automatically equivalent — that would vacuously satisfy a
+    /// requirement meant to be a positive, exhibited proof of identical
+    /// evidence coordinates.
+    #[test]
+    fn empty_span_lists_are_never_automatically_equivalent() {
+        let uri = source_uri(0x01);
+        let empty: Vec<SourceSpanV1> = vec![];
+        assert!(citations_are_automatically_equivalent(&uri, &empty, &uri, &empty).is_err());
+    }
+
+    /// Reviewer ATTACK2: a span that fails `SourceSpanV1::validate` (here:
+    /// unknown `schema_version`, a backwards byte range, and a zero span
+    /// digest, all three at once) must never be reported automatically
+    /// equivalent to an identical copy of itself. `decode_strict` alone
+    /// does not call `validate`, so an unvalidated span list hydrated from
+    /// a historical citation record must not be able to reach a `true`
+    /// answer through this predicate.
+    #[test]
+    fn invalid_spans_are_never_automatically_equivalent_even_to_themselves() {
+        let uri = source_uri(0x01);
+        let invalid = vec![SourceSpanV1 {
+            schema_version: 99,
+            byte_start: 100,
+            byte_end: 5,
+            span_digest: Sha256Digest::ZERO,
+            ordinal: 7,
+        }];
+        assert!(invalid[0].validate().is_err());
+        assert!(
+            citations_are_automatically_equivalent(&uri, &invalid, &uri, &invalid.clone()).is_err()
+        );
     }
 
     #[test]
@@ -1329,14 +1386,14 @@ mod tests {
             body_content_id: body_digest(b"extracted body text"),
             lawful_referencing_occurrences: references,
         };
-        assert!(!state.may_reclaim_shared_storage());
+        assert!(!state.may_reclaim_shared_storage().unwrap());
 
         let after_first_erasure = apply_occurrence_erasure(&state, occurrence_a).unwrap();
         assert_eq!(
             after_first_erasure.lawful_referencing_occurrences,
             vec![occurrence_b]
         );
-        assert!(!after_first_erasure.may_reclaim_shared_storage());
+        assert!(!after_first_erasure.may_reclaim_shared_storage().unwrap());
 
         let after_second_erasure =
             apply_occurrence_erasure(&after_first_erasure, occurrence_b).unwrap();
@@ -1345,7 +1402,28 @@ mod tests {
                 .lawful_referencing_occurrences
                 .is_empty()
         );
-        assert!(after_second_erasure.may_reclaim_shared_storage());
+        assert!(after_second_erasure.may_reclaim_shared_storage().unwrap());
+    }
+
+    /// Reviewer ATTACK6: a state with an unknown/future `schema_version`
+    /// fails `validate`, but before this fix `may_reclaim_shared_storage`
+    /// ignored that and answered purely from `lawful_referencing_occurrences
+    /// .is_empty()`. A record written under a schema this contract cannot
+    /// interpret (e.g. a future version with a second reference class this
+    /// v1 struct does not deserialize) must never be able to grant
+    /// reclamation permission through this predicate: `true` is the unsafe
+    /// direction, since reclaiming shared body/embedding bytes while a
+    /// lawful reference this code failed to parse still exists destroys
+    /// evidence irrecoverably.
+    #[test]
+    fn unknown_schema_version_body_reference_state_cannot_yield_a_reclaim_permitted_answer() {
+        let future_schema_state = BodyReferenceStateV1 {
+            schema_version: 99,
+            body_content_id: Sha256Digest::ZERO,
+            lawful_referencing_occurrences: vec![],
+        };
+        assert!(future_schema_state.validate().is_err());
+        assert!(future_schema_state.may_reclaim_shared_storage().is_err());
     }
 
     #[test]
@@ -1649,7 +1727,7 @@ mod tests {
                 decode_strict(record(BODY_REFERENCE_STATE_FIXTURE)).unwrap();
             decoded.validate().unwrap();
             assert_eq!(decoded.lawful_referencing_occurrences.len(), 2);
-            assert!(!decoded.may_reclaim_shared_storage());
+            assert!(!decoded.may_reclaim_shared_storage().unwrap());
         }
 
         /// `vector-suite.jsonl` is a restatement, not an independent source
