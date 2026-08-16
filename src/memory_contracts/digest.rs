@@ -118,7 +118,16 @@ pub enum DigestDomain {
     AppendChain,
     Body,
     // --- W0-REG domains ---
-
+    /// W0-REG. Generation-2 registry composition manifest preimage.
+    Generation2CompositionManifestV1,
+    /// W0-REG. One closed `(kind, entry schema ID, entry schema version)` slot.
+    RegistryBodySchemaSlotV1,
+    /// W0-REG. Consolidation statement preimage for the consolidation lane.
+    ConsolidationStatementV1,
+    /// W0-REG. Consolidation receipt preimage for the consolidation lane.
+    ConsolidationReceiptV1,
+    /// W0-REG. Consolidation policy preimage for the consolidation lane.
+    ConsolidationPolicyV1,
     // --- W0-SUCC domains ---
 
     // --- W0-COVER domains ---
@@ -189,7 +198,11 @@ impl DigestDomain {
             Self::AppendChain => "ostk-append-chain-v1",
             Self::Body => "ostk-body-v1",
             // --- W0-REG prefixes ---
-
+            Self::Generation2CompositionManifestV1 => "ostk-generation2-composition-manifest-v1",
+            Self::RegistryBodySchemaSlotV1 => "ostk-registry-body-schema-slot-v1",
+            Self::ConsolidationStatementV1 => "ostk-consolidation-statement-v1",
+            Self::ConsolidationReceiptV1 => "ostk-consolidation-receipt-v1",
+            Self::ConsolidationPolicyV1 => "ostk-consolidation-policy-v1",
             // --- W0-SUCC prefixes ---
 
             // --- W0-COVER prefixes ---
