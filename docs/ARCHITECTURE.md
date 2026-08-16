@@ -119,6 +119,25 @@ citation fails the task closed.
 | Fleet events | `memory_events` | Durable audit and future projection/CDC seam |
 | Reserved attention (future) | `memory_attention` | Schema seam only; not read or written by the current vertical slice |
 
+The current conflict detector is the immutable contract
+`same_key_functional_value_v2`. A conflict-eligible legacy claim key is the
+normalized `subject::predicate` pair and is deliberately **functional** during
+an overlapping half-open effective interval: it represents one exact typed
+value, not an independently addable member of a multi-valued set. Two positive
+claims conflict when their canonical values differ. A positive and a negative
+claim conflict only when they name the same canonical value; two negative
+claims do not conflict. Multi-valued facts must use one canonical collection
+value or distinct predicates rather than relying on repeated scalar claims.
+“Current” here means lifecycle state `active` or `disputed`; the detector checks
+half-open interval overlap but does not independently expire claims against the
+wall clock. This rule performs no corpus-wide natural-language inference.
+
+Rows carrying the original `same_key_typed_value` detector retain their old
+meaning and are reported as unreconciled legacy projections. The v2 writer
+fails closed rather than appending to or relabelling them. A separate audited
+reconciliation must preserve their historical receipts and transitions before
+they can participate in the v2 current projection.
+
 Active and historical chunks are physically separated. That is important for
 CockroachDB's vector execution: the hot ANN table needs only equality-bound
 tenant/project (and optional source) prefixes plus the vector order. Time range

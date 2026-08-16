@@ -7,7 +7,9 @@ mod types;
 
 pub use cockroach::CockroachClaimLedger;
 pub use conflict::{
-    canonical_json, claims_are_incompatible, intervals_overlap, normalize_key_part,
+    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2, canonical_json,
+    claims_are_incompatible, functional_values_are_incompatible, intervals_overlap,
+    normalize_key_part,
 };
 pub use repository::{ClaimLedger, SupportedClaimCoordinate, SupportedClaimIds};
 pub use types::{

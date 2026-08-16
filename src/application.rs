@@ -11,7 +11,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::ledger::{
-    ClaimInput, ClaimLedger, ClaimMutation, Conflict, SemanticClaimHit, SupportedClaimCoordinate,
+    ClaimInput, ClaimLedger, ClaimMutation, Conflict, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+    SemanticClaimHit, SupportedClaimCoordinate,
 };
 use crate::service::{
     ConflictCoverage, FleetMemoryService, RecallAction, RecallRequest, RecallResult,
@@ -266,10 +267,7 @@ impl CockroachMemoryService {
                 )?;
                 let mut result = RecallResult::new(json!({ "hits": hits }));
                 result.conflicts = serialize_conflicts(&projection.conflicts)?;
-                // Ordinary corpus rows are not NLI-checked. Typed conflict
-                // coverage applies only to synthetic claim projections, so
-                // the aggregate response is deliberately never "complete".
-                result.conflict_coverage = structured_conflict_coverage(false);
+                result.conflict_coverage = conflict_coverage(false, &projection.conflicts);
                 if projection.support_claims_truncated {
                     result.warnings.push(json!({
                         "code": "support_claim_projection_truncated",
@@ -317,7 +315,7 @@ impl CockroachMemoryService {
                 let hits = compact_claim_hits(hits);
                 let mut result = RecallResult::new(json!({ "hits": hits }));
                 result.conflicts = serialize_conflicts(&conflicts)?;
-                result.conflict_coverage = structured_conflict_coverage(coverage_complete);
+                result.conflict_coverage = conflict_coverage(coverage_complete, &conflicts);
                 result.diagnostics.insert(
                     "retrieval".into(),
                     json!({ "lane": "claim_passage_dense", "model": self.embedder.model_id() }),
@@ -353,7 +351,7 @@ impl CockroachMemoryService {
                 let coverage_complete = conflicts.len() < MAX_TOOL_RESULTS
                     && conflicts.iter().all(conflict_projection_complete);
                 result.conflicts = serialize_conflicts(&conflicts)?;
-                result.conflict_coverage = structured_conflict_coverage(coverage_complete);
+                result.conflict_coverage = conflict_coverage(coverage_complete, &conflicts);
                 Ok(result)
             }
             "chunk" => {
@@ -402,7 +400,7 @@ impl CockroachMemoryService {
         let serialized = serialize_conflicts(&conflicts)?;
         let mut result = RecallResult::new(json!({ "conflicts": serialized }));
         result.conflicts = serialized;
-        result.conflict_coverage = structured_conflict_coverage(coverage_complete);
+        result.conflict_coverage = conflict_coverage(coverage_complete, &conflicts);
         Ok(result)
     }
 
@@ -505,9 +503,10 @@ fn committed_remember_result(
         Ok(conflicts) => match serialize_conflicts(&conflicts) {
             Ok(serialized) => {
                 result.conflicts = serialized;
-                result.conflict_coverage = structured_conflict_coverage(
+                result.conflict_coverage = conflict_coverage(
                     conflicts.len() == expected_conflicts
                         && conflicts.iter().all(conflict_projection_complete),
+                    &conflicts,
                 );
             }
             Err(error) => mark_post_commit_projection_unavailable(&mut result, claim_id, &error),
@@ -539,7 +538,7 @@ fn mark_post_commit_projection_unavailable(
 
 fn mark_post_commit_projection_unavailable_without_error(result: &mut RememberResult) {
     result.conflicts.clear();
-    result.conflict_coverage = structured_conflict_coverage(false);
+    result.conflict_coverage = conflict_coverage(false, &[]);
     result.conflict_coverage.details.insert(
         "reason".into(),
         Value::String("post_commit_projection_unavailable".into()),
@@ -888,11 +887,18 @@ const fn conflict_projection_complete(conflict: &Conflict) -> bool {
     !conflict.members_truncated && !conflict.member_values_elided
 }
 
-fn structured_conflict_coverage(complete: bool) -> ConflictCoverage {
-    let mut coverage = ConflictCoverage::new(if complete { "complete" } else { "partial" });
+fn conflict_coverage(complete: bool, conflicts: &[Conflict]) -> ConflictCoverage {
+    let has_unreconciled_detector = conflicts
+        .iter()
+        .any(|conflict| conflict.detector != FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2);
+    let mut coverage = ConflictCoverage::new(if complete && !has_unreconciled_detector {
+        "complete"
+    } else {
+        "partial"
+    });
     coverage.details.insert(
         "detector".into(),
-        Value::String("same_key_typed_value".into()),
+        Value::String(FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2.into()),
     );
     coverage
         .details
@@ -900,12 +906,19 @@ fn structured_conflict_coverage(complete: bool) -> ConflictCoverage {
     coverage.details.insert(
         "contract".into(),
         Value::String(
-            "typed same-key current-interval contradictions only; no corpus-wide NLI".into(),
+            "functional typed same-key lifecycle-current interval contradictions only: different affirmed values or affirmation and negation of the same exact value; no corpus-wide NLI".into(),
         ),
     );
-    coverage
-        .details
-        .insert("complete".into(), Value::Bool(complete));
+    coverage.details.insert(
+        "complete".into(),
+        Value::Bool(complete && !has_unreconciled_detector),
+    );
+    if has_unreconciled_detector {
+        coverage.details.insert(
+            "reason".into(),
+            Value::String("legacy_conflict_detector_unreconciled".into()),
+        );
+    }
     coverage
 }
 
@@ -963,6 +976,41 @@ mod tests {
         );
         assert!(bounded_limit(Some(0)).is_err());
         assert!(bounded_limit(Some(MAX_TOOL_RESULTS + 1)).is_err());
+    }
+
+    #[test]
+    fn conflict_coverage_versions_the_active_detector_and_flags_legacy_rows() {
+        let current = conflict_coverage(true, &[]);
+        assert_eq!(current.status, "complete");
+        assert_eq!(
+            current.details["detector"],
+            FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2
+        );
+
+        let legacy = serde_json::from_value::<Conflict>(json!({
+            "id": 3,
+            "project": "project",
+            "claim_key": "feature::enabled",
+            "kind": "contradiction",
+            "state": "open",
+            "detector": "same_key_typed_value",
+            "rationale": "legacy values or polarity differ",
+            "revision": 1,
+            "detected_at": "2026-08-14T00:00:00Z",
+            "last_seen_at": "2026-08-14T00:00:00Z",
+            "resolved_at": null,
+            "resolution_kind": null,
+            "resolution_reason": null,
+            "members": [],
+        }))
+        .unwrap();
+        let coverage = conflict_coverage(true, &[legacy]);
+        assert_eq!(coverage.status, "partial");
+        assert_eq!(coverage.details["complete"], false);
+        assert_eq!(
+            coverage.details["reason"],
+            "legacy_conflict_detector_unreconciled"
+        );
     }
 
     #[test]

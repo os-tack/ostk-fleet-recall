@@ -13,6 +13,7 @@ use sqlx::{Row, Transaction};
 
 use crate::ledger::{
     Claim, ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimSupport, Conflict,
+    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2,
     SemanticClaimHit, SupportedClaimCoordinate, SupportedClaimIds,
 };
 use crate::store::cockroach::{
@@ -26,19 +27,16 @@ const CLAIM_CANDIDATE_MULTIPLIER: usize = 8;
 const MAX_CLAIM_CANDIDATES: usize = 1_000;
 const MAX_CLAIM_SEARCH_TEXT_CHARS: usize = 2_000;
 const MAX_CLAIM_SEARCH_PASSAGE_CHARS: usize = 2_000;
-/// Maximum number of existing, incompatible current claims one record
-/// mutation may attach to a same-key conflict. The query reads one sentinel
-/// row beyond this bound and aborts the entire serializable transaction rather
-/// than performing an open-ended membership/event fan-out.
-const MAX_INCOMPATIBLE_CLAIMS_PER_MUTATION: usize = 256;
+/// Maximum lifecycle-current rows one record mutation may compare for an exact
+/// functional claim key. The query materializes one sentinel row beyond this
+/// bound using only indexed dimensions, then aborts the complete serializable
+/// transaction rather than scanning or fanning out without a hard ceiling.
+const MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON: usize = 256;
 const MAX_MEMBERS_PER_CONFLICT: usize = 32;
 const MAX_CONFLICT_MEMBER_TEXT_CHARS: usize = 1_000;
 const MAX_CONFLICT_MEMBER_VALUE_BYTES: usize = 2_000;
 const MAX_SUPPORT_TRIGGER_COORDINATES: usize = 400;
 const SUPPORT_TRIGGER_COORDINATE_MULTIPLIER: usize = 4;
-const CONFLICT_RATIONALE: &str =
-    "overlapping current typed claims have incompatible values or polarity";
-
 // These projections intentionally omit fields that their public list/search
 // responses discard. Keeping them as constants also lets tests guard against a
 // future refactor accidentally restoring full-row/support amplification.
@@ -63,6 +61,22 @@ const CONFLICT_CLAIM_PROJECTION_SQL: &str = "SELECT id, project, kind, claim_key
 const CLAIM_CONFLICT_IDS_SQL: &str = "SELECT claim_id, conflict_id FROM memory_conflict_members@{NO_FULL_SCAN} \
      WHERE tenant_id = $1 AND project = $2 AND claim_id = ANY($3) \
      ORDER BY claim_id, conflict_id";
+const INCOMPATIBLE_CURRENT_CLAIMS_SQL: &str = "WITH candidates AS MATERIALIZED (\
+       SELECT id, value, polarity, valid_from, valid_to, conflict_eligible \
+       FROM memory_claims@memory_claims_scope_key_idx \
+       WHERE tenant_id = $1 AND project = $2 AND id <> $3 \
+         AND claim_key = $4 AND state IN ('active', 'disputed') \
+       ORDER BY state, id LIMIT $9\
+     ) \
+     SELECT id, \
+            (conflict_eligible \
+             AND ((polarity = 1 AND $6 = 1 AND value IS DISTINCT FROM $5) \
+                  OR (polarity <> $6 AND value IS NOT DISTINCT FROM $5)) \
+             AND (valid_to IS NULL OR $7::TIMESTAMPTZ IS NULL OR $7 < valid_to) \
+             AND ($8::TIMESTAMPTZ IS NULL OR valid_from IS NULL OR valid_from < $8)) \
+                AS incompatible, \
+            count(*) OVER ()::INT8 AS candidate_count \
+     FROM candidates ORDER BY id";
 const SUPPORTED_CLAIM_IDS_SQL: &str = "WITH matched_support AS (\
        SELECT DISTINCT support.claim_id, support.chunk_id \
        FROM memory_claim_support@{NO_FULL_SCAN} AS support \
@@ -419,15 +433,13 @@ impl ClaimLedger for CockroachClaimLedger {
                     prepared.claim_key.as_deref(),
                     prepared.value.as_ref(),
                 ) {
-                    let incompatible_ids = sqlx::query_scalar::<_, i64>(
-                        "SELECT id FROM memory_claims \
-                         WHERE tenant_id = $1 AND project = $2 AND id <> $3 \
-                           AND claim_key = $4 AND conflict_eligible \
-                           AND state IN ('active', 'disputed') \
-                           AND (value IS DISTINCT FROM $5 OR polarity <> $6) \
-                           AND (valid_to IS NULL OR $7::TIMESTAMPTZ IS NULL OR $7 < valid_to) \
-                           AND ($8::TIMESTAMPTZ IS NULL OR valid_from IS NULL OR valid_from < $8) \
-                         ORDER BY id LIMIT $9",
+                    require_current_conflict_detector(transaction, &scope, claim_key).await?;
+                    let comparison_bound = i64::try_from(
+                        MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON,
+                    )
+                    .map_err(|_| protocol_error("conflict mutation bound is outside INT8 range"))?;
+                    let candidate_rows = sqlx::query_as::<_, (i64, bool, i64)>(
+                        INCOMPATIBLE_CURRENT_CLAIMS_SQL,
                     )
                     .bind(scope.tenant_id)
                     .bind(&scope.project)
@@ -437,18 +449,22 @@ impl ClaimLedger for CockroachClaimLedger {
                     .bind(input.polarity)
                     .bind(input.valid_from)
                     .bind(input.valid_to)
-                    .bind(i64::try_from(
-                        MAX_INCOMPATIBLE_CLAIMS_PER_MUTATION.saturating_add(1),
-                    )
-                    .map_err(|_| protocol_error("conflict mutation bound is outside INT8 range"))?)
+                    .bind(comparison_bound + 1)
                     .fetch_all(&mut **transaction)
                     .await?;
 
-                    if incompatible_ids.len() > MAX_INCOMPATIBLE_CLAIMS_PER_MUTATION {
+                    if candidate_rows
+                        .first()
+                        .is_some_and(|row| row.2 > comparison_bound)
+                    {
                         return Err(FleetError::Memory(format!(
-                            "same-key conflict exceeds the bounded mutation limit of {MAX_INCOMPATIBLE_CLAIMS_PER_MUTATION} existing claims"
+                            "same-key comparison exceeds the bounded mutation limit of {MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON} lifecycle-current claims"
                         )));
                     }
+                    let incompatible_ids = candidate_rows
+                        .into_iter()
+                        .filter_map(|(id, incompatible, _)| incompatible.then_some(id))
+                        .collect::<Vec<_>>();
 
                     if !incompatible_ids.is_empty() {
                         let observation =
@@ -932,21 +948,67 @@ fn deduplicate_claim_candidates(candidates: Vec<ClaimCandidate>) -> Vec<ClaimCan
         .collect()
 }
 
+/// Refuse to mix durable observations from different conflict contracts.
+///
+/// Migration 0001's immutable default identifies the original detector as
+/// `same_key_typed_value`. A v2 writer may encounter such a row after an
+/// upgrade, but it must not append members, reopen it, or relabel it without
+/// the explicit history-preserving reconciliation increment.
+async fn require_current_conflict_detector(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    claim_key: &str,
+) -> Result<()> {
+    let detectors = sqlx::query_scalar::<_, String>(
+        "SELECT detector FROM memory_conflicts \
+         WHERE tenant_id = $1 AND project = $2 AND claim_key = $3 \
+         ORDER BY detector LIMIT 3 FOR UPDATE",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .bind(claim_key)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let has_v2 = detectors
+        .iter()
+        .any(|detector| detector == FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2);
+    let legacy_count = detectors
+        .iter()
+        .filter(|detector| detector.as_str() == "same_key_typed_value")
+        .count();
+    if detectors.iter().any(|detector| {
+        detector != FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2 && detector != "same_key_typed_value"
+    }) || legacy_count > 1
+        || detectors.len() > usize::from(has_v2) + legacy_count
+    {
+        return Err(protocol_error(
+            "claim key has an unknown or duplicate conflict detector lineage",
+        ));
+    }
+    if legacy_count == 1 && !has_v2 {
+        return Err(FleetError::Memory(
+            "claim key has an unreconciled legacy conflict detector row".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn observe_conflict(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     claim_key: &str,
 ) -> Result<ConflictObservation> {
     let inserted = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO memory_conflicts (tenant_id, project, claim_key, rationale) \
-         VALUES ($1, $2, $3, $4) \
-         ON CONFLICT (tenant_id, project, claim_key) DO NOTHING \
+        "INSERT INTO memory_conflicts (tenant_id, project, claim_key, detector, rationale) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT DO NOTHING \
          RETURNING id",
     )
     .bind(scope.tenant_id)
     .bind(&scope.project)
     .bind(claim_key)
-    .bind(CONFLICT_RATIONALE)
+    .bind(FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2)
+    .bind(FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2)
     .fetch_optional(&mut **transaction)
     .await?;
     if let Some(id) = inserted {
@@ -955,24 +1017,30 @@ async fn observe_conflict(
 
     let row = sqlx::query(
         "SELECT id, state FROM memory_conflicts \
-         WHERE tenant_id = $1 AND project = $2 AND claim_key = $3",
+         WHERE tenant_id = $1 AND project = $2 AND claim_key = $3 AND detector = $4",
     )
     .bind(scope.tenant_id)
     .bind(&scope.project)
     .bind(claim_key)
-    .fetch_one(&mut **transaction)
-    .await?;
+    .bind(FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| {
+        protocol_error("v2 conflict row was unavailable after its compatibility audit")
+    })?;
     let id: i64 = row.try_get("id")?;
     let state: String = row.try_get("state")?;
     match state.as_str() {
         "open" => {
             let update = sqlx::query(
                 "UPDATE memory_conflicts SET last_seen_at = now() \
-                 WHERE tenant_id = $1 AND project = $2 AND id = $3 AND state = 'open'",
+                 WHERE tenant_id = $1 AND project = $2 AND id = $3 \
+                   AND detector = $4 AND state = 'open'",
             )
             .bind(scope.tenant_id)
             .bind(&scope.project)
             .bind(id)
+            .bind(FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2)
             .execute(&mut **transaction)
             .await?;
             if update.rows_affected() != 1 {
@@ -988,13 +1056,15 @@ async fn observe_conflict(
                      state = 'open', rationale = $4, last_seen_at = now(), \
                      resolved_at = NULL, resolution_kind = NULL, resolution_reason = NULL, \
                      revision = revision + 1 \
-                 WHERE tenant_id = $1 AND project = $2 AND id = $3 AND state = $5 \
+                 WHERE tenant_id = $1 AND project = $2 AND id = $3 \
+                   AND detector = $5 AND state = $6 \
                  RETURNING id",
             )
             .bind(scope.tenant_id)
             .bind(&scope.project)
             .bind(id)
-            .bind(CONFLICT_RATIONALE)
+            .bind(FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2)
+            .bind(FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2)
             .bind(&state)
             .fetch_optional(&mut **transaction)
             .await?;
@@ -1667,6 +1737,31 @@ mod tests {
     }
 
     #[test]
+    fn conflict_query_freezes_the_functional_polarity_truth_table() {
+        assert!(
+            INCOMPATIBLE_CURRENT_CLAIMS_SQL
+                .contains("polarity = 1 AND $6 = 1 AND value IS DISTINCT FROM $5")
+        );
+        assert!(
+            INCOMPATIBLE_CURRENT_CLAIMS_SQL
+                .contains("polarity <> $6 AND value IS NOT DISTINCT FROM $5")
+        );
+        assert!(
+            !INCOMPATIBLE_CURRENT_CLAIMS_SQL
+                .contains("value IS DISTINCT FROM $5 OR polarity <> $6")
+        );
+        assert!(
+            INCOMPATIBLE_CURRENT_CLAIMS_SQL
+                .contains("FROM memory_claims@memory_claims_scope_key_idx")
+        );
+        assert!(INCOMPATIBLE_CURRENT_CLAIMS_SQL.contains("ORDER BY state, id LIMIT $9"));
+        assert!(INCOMPATIBLE_CURRENT_CLAIMS_SQL.contains("candidates AS MATERIALIZED"));
+        assert!(
+            INCOMPATIBLE_CURRENT_CLAIMS_SQL.contains("count(*) OVER ()::INT8 AS candidate_count")
+        );
+    }
+
+    #[test]
     fn claim_candidates_keep_first_ann_passage_and_order() {
         let candidate = |claim_id, passage_index, matched_passage: &str| ClaimCandidate {
             claim_id,
@@ -1806,6 +1901,381 @@ mod tests {
         let compact = compact_text(&text, MAX_CONFLICT_MEMBER_TEXT_CHARS);
         assert_eq!(compact.chars().count(), MAX_CONFLICT_MEMBER_TEXT_CHARS + 1);
         assert!(compact.ends_with('…'));
+    }
+
+    fn polarity_claim(subject: &str, value: Value, polarity: i16) -> ClaimInput {
+        ClaimInput {
+            kind: ClaimKind::Decision,
+            text: format!("functional polarity fixture {subject} {polarity} {value}"),
+            subject: Some(subject.into()),
+            predicate: Some("database-choice".into()),
+            value: Some(value),
+            polarity,
+            origin: "operator_asserted".into(),
+            actor: None,
+            confidence: 1.0,
+            valid_from: None,
+            valid_to: None,
+            support: Vec::new(),
+        }
+    }
+
+    async fn assert_live_polarity_pair(
+        ledger: &CockroachClaimLedger,
+        scope: &FleetScope,
+        label: &str,
+        left: (Value, i16),
+        right: (Value, i16),
+        expected_conflict: bool,
+    ) {
+        let subject = format!("polarity-{label}");
+        let left = ledger
+            .record_claim(
+                scope,
+                &polarity_claim(&subject, left.0, left.1),
+                &format!("live-ledger/polarity/{label}/left"),
+            )
+            .await
+            .unwrap();
+        let right = ledger
+            .record_claim(
+                scope,
+                &polarity_claim(&subject, right.0, right.1),
+                &format!("live-ledger/polarity/{label}/right"),
+            )
+            .await
+            .unwrap();
+        let left = ledger
+            .get_claim(scope, left.claim.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let right = ledger
+            .get_claim(scope, right.claim.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        if expected_conflict {
+            assert_eq!(left.state, ClaimState::Disputed);
+            assert_eq!(right.state, ClaimState::Disputed);
+            assert_eq!(left.conflict_ids.len(), 1);
+            assert_eq!(left.conflict_ids, right.conflict_ids);
+            let conflicts = ledger
+                .conflicts_for_claim_ids(scope, &[left.id, right.id], 2)
+                .await
+                .unwrap();
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].detector, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2);
+            assert_eq!(
+                conflicts[0].rationale,
+                FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2
+            );
+        } else {
+            assert_eq!(left.state, ClaimState::Active);
+            assert_eq!(right.state, ClaimState::Active);
+            assert!(left.conflict_ids.is_empty());
+            assert!(right.conflict_ids.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one connected matrix freezes SQL/Rust parity and cleanup
+    async fn live_conflict_polarity_matrix_when_configured() {
+        let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+            return;
+        };
+        let project = format!("live-conflict-polarity-{}", Uuid::now_v7());
+        let scope = scope(&project);
+        let store = crate::store::cockroach::CockroachStore::connect(
+            &database_url,
+            scope.clone(),
+            crate::store::cockroach::PoolConfig::default(),
+        )
+        .await
+        .unwrap();
+        store.migrate().await.unwrap();
+        store
+            .initialize_embedding_model(TestEmbedder.model_id())
+            .await
+            .unwrap();
+        let ledger = CockroachClaimLedger::new(
+            store.pool().clone(),
+            scope.clone(),
+            Arc::new(TestEmbedder),
+            RetryPolicy::default(),
+        )
+        .unwrap();
+
+        let explain_sql = format!("EXPLAIN (OPT, VERBOSE) {INCOMPATIBLE_CURRENT_CLAIMS_SQL}");
+        let plan = sqlx::query_scalar::<_, String>(&explain_sql)
+            .bind(scope.tenant_id)
+            .bind(&scope.project)
+            .bind(0_i64)
+            .bind("polarity-plan::database-choice")
+            .bind(serde_json::json!("cockroachdb"))
+            .bind(1_i16)
+            .bind(Option::<chrono::DateTime<Utc>>::None)
+            .bind(Option::<chrono::DateTime<Utc>>::None)
+            .bind(i64::try_from(MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON + 1).unwrap())
+            .fetch_all(store.pool())
+            .await
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("scan memory_claims"),
+            "wrong conflict plan:\n{plan}"
+        );
+        assert!(
+            plan.contains("memory_claims_scope_key_idx"),
+            "conflict plan missed the scoped key index:\n{plan}"
+        );
+        assert!(
+            plan.contains("constraint:"),
+            "unscoped conflict plan:\n{plan}"
+        );
+        assert!(
+            plan.contains("limit hint: 257.00") || plan.contains("limit: 257"),
+            "unbounded conflict plan:\n{plan}"
+        );
+
+        let vectors = [
+            (
+                "ce1",
+                (serde_json::json!("cockroachdb"), 1),
+                (serde_json::json!("postgresql"), -1),
+                false,
+            ),
+            (
+                "ce2",
+                (serde_json::json!("postgresql"), -1),
+                (serde_json::json!("mysql"), -1),
+                false,
+            ),
+            (
+                "ce3",
+                (serde_json::json!("cockroachdb"), 1),
+                (serde_json::json!("cockroachdb"), -1),
+                true,
+            ),
+            (
+                "ce4",
+                (serde_json::json!("cockroachdb"), 1),
+                (serde_json::json!("postgresql"), 1),
+                true,
+            ),
+        ];
+        for (label, left, right, expected) in vectors {
+            assert_live_polarity_pair(
+                &ledger,
+                &scope,
+                &format!("{label}-forward"),
+                left.clone(),
+                right.clone(),
+                expected,
+            )
+            .await;
+            assert_live_polarity_pair(
+                &ledger,
+                &scope,
+                &format!("{label}-reverse"),
+                right,
+                left,
+                expected,
+            )
+            .await;
+        }
+
+        // Freeze JSON/JSONB equality at the application/database boundary.
+        let value_vectors = [
+            (
+                "object-order",
+                serde_json::json!({"a": 1, "b": 2}),
+                serde_json::json!({"b": 2, "a": 1}),
+                false,
+            ),
+            (
+                "integral-number",
+                serde_json::json!(1),
+                serde_json::json!(1.0),
+                false,
+            ),
+            (
+                "large-integral-number",
+                serde_json::json!(10_000_000_000_000_000_000_u64),
+                serde_json::json!(1e19_f64),
+                false,
+            ),
+            (
+                "scalar-type",
+                serde_json::json!(1),
+                serde_json::json!("1"),
+                true,
+            ),
+            (
+                "array-order",
+                serde_json::json!([1, 2]),
+                serde_json::json!([2, 1]),
+                true,
+            ),
+            ("json-null", Value::Null, Value::Null, false),
+            ("null-boolean", Value::Null, serde_json::json!(false), true),
+        ];
+        for (label, left, right, expected) in value_vectors {
+            assert_live_polarity_pair(&ledger, &scope, label, (left, 1), (right, 1), expected)
+                .await;
+        }
+
+        // A compatible negative must not be swept into the key-level conflict
+        // opened by two incompatible affirmative values.
+        let subject = "polarity-three-member";
+        let affirmed = ledger
+            .record_claim(
+                &scope,
+                &polarity_claim(subject, serde_json::json!("cockroachdb"), 1),
+                "live-ledger/polarity/three-member/affirmed",
+            )
+            .await
+            .unwrap();
+        let compatible_negative = ledger
+            .record_claim(
+                &scope,
+                &polarity_claim(subject, serde_json::json!("postgresql"), -1),
+                "live-ledger/polarity/three-member/negative",
+            )
+            .await
+            .unwrap();
+        let competing_affirmation = ledger
+            .record_claim(
+                &scope,
+                &polarity_claim(subject, serde_json::json!("mysql"), 1),
+                "live-ledger/polarity/three-member/competing",
+            )
+            .await
+            .unwrap();
+        let affirmed = ledger
+            .get_claim(&scope, affirmed.claim.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let compatible_negative = ledger
+            .get_claim(&scope, compatible_negative.claim.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let competing_affirmation = ledger
+            .get_claim(&scope, competing_affirmation.claim.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(affirmed.state, ClaimState::Disputed);
+        assert_eq!(competing_affirmation.state, ClaimState::Disputed);
+        assert_eq!(affirmed.conflict_ids, competing_affirmation.conflict_ids);
+        assert_eq!(compatible_negative.state, ClaimState::Active);
+        assert!(compatible_negative.conflict_ids.is_empty());
+
+        // The v2 writer must never append to or relabel a durable v1 row. A
+        // compatible candidate still fails before commit until the explicit
+        // reconciliation increment has audited that key.
+        sqlx::query(
+            "INSERT INTO memory_conflicts (\
+                 tenant_id, project, claim_key, detector, rationale\
+             ) VALUES ($1, $2, $3, 'same_key_typed_value', 'legacy fixture')",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind("polarity-legacy-guard::database-choice")
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let legacy_error = ledger
+            .record_claim(
+                &scope,
+                &polarity_claim("polarity-legacy-guard", serde_json::json!("cockroachdb"), 1),
+                "live-ledger/polarity/legacy-guard",
+            )
+            .await
+            .expect_err("a v2 writer must reject an unreconciled v1 conflict row");
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("unreconciled legacy conflict detector row")
+        );
+        let legacy_claim_count: i64 = sqlx::query_scalar(
+            "SELECT count(*)::INT8 FROM memory_claims \
+             WHERE tenant_id = $1 AND project = $2 \
+               AND claim_key = 'polarity-legacy-guard::database-choice'",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(legacy_claim_count, 0);
+
+        sqlx::query("DELETE FROM memory_mutation_receipts WHERE tenant_id = $1 AND project = $2")
+            .bind(scope.tenant_id)
+            .bind(&scope.project)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM memory_events WHERE tenant_id = $1 AND project = $2")
+            .bind(scope.tenant_id)
+            .bind(&scope.project)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM memory_conflicts WHERE tenant_id = $1 AND project = $2")
+            .bind(scope.tenant_id)
+            .bind(&scope.project)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM memory_claims WHERE tenant_id = $1 AND project = $2")
+            .bind(scope.tenant_id)
+            .bind(&scope.project)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM memory_chunks WHERE tenant_id = $1 AND project = $2")
+            .bind(scope.tenant_id)
+            .bind(&scope.project)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM memory_corpus_models WHERE tenant_id = $1 AND project = $2")
+            .bind(scope.tenant_id)
+            .bind(&scope.project)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let residue: i64 = sqlx::query_scalar(
+            "SELECT \
+                 (SELECT count(*) FROM memory_mutation_receipts \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_events \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_claim_events \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_claim_embeddings \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_conflict_members \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_conflicts \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_claims \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_chunks \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_corpus_models \
+                  WHERE tenant_id = $1 AND project = $2)",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(residue, 0, "connected conflict matrix leaked scoped rows");
     }
 
     #[tokio::test]
@@ -2450,7 +2920,7 @@ mod tests {
         .bind(serde_json::json!("existing"))
         .bind(&scope.agent)
         .bind(
-            i64::try_from(MAX_INCOMPATIBLE_CLAIMS_PER_MUTATION + 1).expect("test bound fits INT8"),
+            i64::try_from(MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON + 1).expect("test bound fits INT8"),
         )
         .execute(store.pool())
         .await

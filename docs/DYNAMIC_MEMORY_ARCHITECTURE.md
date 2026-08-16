@@ -47,7 +47,7 @@ specification.
 | Repository | Current coordinate-addressed chunks with exact source links | Content-addressed versions plus commit/ref membership |
 | Evidence | Searchable chunks and exact hash-bound claim support | First-class immutable provider and collector evidence |
 | Claims | Deliberate typed claims with validity and source support | Propositions with modality, authority, applicability, and derivation |
-| Conflicts | Current same-key typed-value claim conflicts | A generalized, non-destructive discrepancy ledger |
+| Conflicts | Versioned functional-key exact-value/polarity conflicts | A generalized, non-destructive discrepancy ledger |
 | Links | Claim-to-claim relationships are reserved in the schema | Heterogeneous provenance links and separately graded causal hypotheses |
 | Events | Claim mutation audit events | Authenticated, versioned, replayable evidence inbox and outbox |
 | Availability | Embedding completes before a corpus row is searchable | Lexical availability first; dense projection asynchronously follows |
@@ -333,6 +333,7 @@ Each automatically evaluated predicate needs:
 schema ID and version
 subject kind and canonical predicate
 value schema and unit
+cardinality: functional, set-valued, or another closed registered algebra
 allowed modalities
 comparator and incompatibility algorithm version
 required applicability dimensions
@@ -342,6 +343,17 @@ publication and sensitivity default
 
 Unknown predicates remain searchable evidence but cannot automatically open a
 verified discrepancy. Negative propositions require a coverage receipt.
+
+The legacy `same_key_functional_value_v2` detector is intentionally narrower
+than this target registry. It treats each conflict-eligible
+`subject::predicate` key as functional: distinct affirmative values conflict,
+affirmation and negation conflict only for the same exact value, and two
+negations remain compatible. That rule must not be generalized to set-valued,
+open-world, threshold, or finite-domain predicates. A target comparator must
+bind cardinality together with polarity, modality compatibility, concrete
+applicability, effective interval, and any coverage proof. Changing any of
+those inputs creates a new comparator lineage and discrepancy family rather
+than silently reinterpreting an earlier occurrence.
 
 Examples include:
 

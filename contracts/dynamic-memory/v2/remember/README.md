@@ -24,6 +24,8 @@ The authored text field is named `assertion_text_utf8_hex_chunks` because the fr
 
 `SemanticClaimV2` binds the frozen runtime profile, trusted scope, ABA-safe active-head coordinates, canonical subject, exact interpretation references, closed assertion kind, modality, polarity, typed value, concrete applicability, and exact effective interval. It accepts only `decision`, `fact`, `constraint`, `preference`, and `procedure`. Legacy `observation` belongs in evidence v2; free-form `note` and `open_question` require distinct contracts and are not silently coerced.
 
+Polarity is proposition direction, not another value dimension: `affirms` asserts the exact typed value and `negates` denies that exact typed value. The legacy functional-key detector therefore conflicts two different affirmations or an affirmation and negation of the same value, while two negations remain compatible. This is not a universal v2 discrepancy rule. Active predicate closure must additionally bind cardinality/functionality, comparator lineage, modality pairing, exact applicability, effective interval, and any coverage semantics before it can derive a discrepancy. The present `PredicateComparatorV1` selector alone does not authorize carrying the legacy functional assumption into the target architecture.
+
 There is no float, null, arbitrary JSON, generic array/object, numeric actor ID, numeric claim ID, or numeric support ID. Values are explicitly tagged as boolean, canonical decimal, contract ID, resource URI, SHA-256 digest, canonical string, or a canonical string set strictly sorted and unique by NFC UTF-8 bytes.
 
 The claim fingerprint is:
