@@ -1429,7 +1429,7 @@ if ! publication_store_digest=$(shasum -a 256 "$publication_store_source" \
 fi
 assert_exact "frozen publication-reader session-pinning source digest" \
     "$publication_store_digest" \
-    'b7b21ea151219f518c926e22e56c896c3a9dd09ea99bd08599d09b3f01c4af3e'
+    '284819aa6c367f27c7c614351a9127a7686672ad6fc7ae81fd23544c4b2863e5'
 if ! publication_live_test_digest=$(shasum -a 256 "$publication_live_test_source" \
     | awk 'NR == 1 { print $1 }'); then
     fail "could not hash the publication-reader connected test"
@@ -1639,6 +1639,9 @@ conflict_live_test=ledger::cockroach::tests::live_conflict_polarity_matrix_when_
 reconciliation_live_test=ledger::reconciliation::tests::live_reconciliation_is_inert_without_its_exact_database_url
 online_index_live_test=store::cockroach::tests::live_online_index_migrations_recover_and_reject_drift_when_configured
 rollback_live_test=store::cockroach::tests::live_transactional_migration_rolls_back_ddl_on_history_conflict_when_configured
+claim_replay_live_test=ledger::cockroach::tests::live_claim_conflict_and_replay_when_configured
+store_round_trip_live_test=store::cockroach::tests::live_cockroach_round_trip_when_configured
+dense_plan_live_test=store::cockroach::tests::live_cockroach_dense_plan_uses_vector_index_when_configured
 library_live_listing=$(cargo test --locked --lib -- --list)
 for exact_test in \
     "$current_retry_live_test" \
@@ -1646,7 +1649,10 @@ for exact_test in \
     "$conflict_live_test" \
     "$reconciliation_live_test" \
     "$online_index_live_test" \
-    "$rollback_live_test"
+    "$rollback_live_test" \
+    "$claim_replay_live_test" \
+    "$store_round_trip_live_test" \
+    "$dense_plan_live_test"
 do
     require_discovered_test "$library_live_listing" "$exact_test"
 done
@@ -1656,7 +1662,10 @@ for exact_test in \
     "$current_snapshot_live_test" \
     "$conflict_live_test" \
     "$online_index_live_test" \
-    "$rollback_live_test"
+    "$rollback_live_test" \
+    "$claim_replay_live_test" \
+    "$store_round_trip_live_test" \
+    "$dense_plan_live_test"
 do
     FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
         cargo test --locked --lib "$exact_test" -- --exact --nocapture

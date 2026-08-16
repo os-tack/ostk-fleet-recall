@@ -27,6 +27,9 @@ cannot count as connected success.
 | Conflict-detector reconciliation | `--lib` / `ledger::reconciliation::tests::live_reconciliation_is_inert_without_its_exact_database_url` | `FLEET_RECONCILIATION_TEST_DATABASE_URL` |
 | Online-index interruption recovery and drift rejection | `--lib` / `store::cockroach::tests::live_online_index_migrations_recover_and_reject_drift_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Transactional-DDL rollback | `--lib` / `store::cockroach::tests::live_transactional_migration_rolls_back_ddl_on_history_conflict_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Claim ledger conflict, replay, and transaction lifecycle | `--lib` / `ledger::cockroach::tests::live_claim_conflict_and_replay_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Store migration, cast, and index-lane round trip | `--lib` / `store::cockroach::tests::live_cockroach_round_trip_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Dense retrieval uses the C-SPANN vector index | `--lib` / `store::cockroach::tests::live_cockroach_dense_plan_uses_vector_index_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Publication reader recall/deny boundary | `--test publication_reader_live` / `publication_reader_executes_the_real_recall_surface` | `FLEET_RECALL_PUBLICATION_DATABASE_URL` plus the mode-0600 test-only admin secret-file path |
 
 The same isolated server also exercises all four private workstation CLIs:
