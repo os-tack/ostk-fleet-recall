@@ -23,7 +23,10 @@ use crate::memory_contracts::successor_activation::{
 use crate::memory_contracts::successor_policy::{
     GenesisSuccessorKeyBridgeDigest, GenesisSuccessorKeyBridgePin,
 };
-use crate::private_postgres::{PUBLICATION_POSTGRES_USER, PrivatePostgresSslPolicy};
+use crate::private_postgres::{
+    MIGRATOR_POSTGRES_USER, PRIVATE_RUNTIME_POSTGRES_DATABASE, PUBLICATION_POSTGRES_USER,
+    PrivatePostgresSslPolicy, WRITER_POSTGRES_USER,
+};
 use crate::{FleetError, FleetScope, Result};
 
 /// Deployment-only authority needed by the private control-ledger bootstrap.
@@ -498,6 +501,7 @@ impl ConflictReconciliationRuntimeConfig {
 #[derive(Clone)]
 pub struct FleetConfig {
     pub database_url: String,
+    pub database_ssl_policy: PrivatePostgresSslPolicy,
     pub default_scope: FleetScope,
     pub max_connections: u32,
     /// Stable logical model name used in the embedding registry.
@@ -513,6 +517,7 @@ impl std::fmt::Debug for FleetConfig {
         formatter
             .debug_struct("FleetConfig")
             .field("database_url", &"<redacted>")
+            .field("database_ssl_policy", &self.database_ssl_policy)
             .field("default_scope", &self.default_scope)
             .field("max_connections", &self.max_connections)
             .field("embedding_model", &self.embedding_model)
@@ -573,7 +578,8 @@ impl PublicationConfig {
             lookup("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE").is_some_and(|value| value == "1");
         let database_ssl_policy =
             validate_publication_database_url(&database_url, allow_insecure_local)?;
-        let runtime = fleet_config_from_lookup(database_url.clone(), &mut lookup)?;
+        let runtime =
+            fleet_config_from_lookup(database_url.clone(), database_ssl_policy, &mut lookup)?;
 
         Ok(Self {
             database_url,
@@ -628,21 +634,42 @@ fn reject_publication_private_database_urls(
 }
 
 impl FleetConfig {
+    /// Load the long-lived private runtime writer configuration.
     pub fn from_env() -> Result<Self> {
+        Self::from_writer_env()
+    }
+
+    /// Load the long-lived private runtime writer configuration.
+    pub fn from_writer_env() -> Result<Self> {
         Self::from_lookup(|name| env::var(name).ok())
     }
 
+    /// Load the one-shot schema migrator configuration.
+    pub fn from_migrator_env() -> Result<Self> {
+        Self::from_migrator_lookup(|name| env::var(name).ok())
+    }
+
     fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        Self::from_lookup_for_database_user(&mut lookup, WRITER_POSTGRES_USER)
+    }
+
+    fn from_migrator_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        Self::from_lookup_for_database_user(&mut lookup, MIGRATOR_POSTGRES_USER)
+    }
+
+    fn from_lookup_for_database_user(
+        mut lookup: impl FnMut(&str) -> Option<String>,
+        expected_user: &str,
+    ) -> Result<Self> {
         let database_url = required_from(&mut lookup, "FLEET_RECALL_DATABASE_URL")?;
         let allow_insecure_local =
             lookup("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE").is_some_and(|value| value == "1");
-        validate_database_url_with_local_escape(
+        let database_ssl_policy = validate_private_runtime_database_url(
             &database_url,
-            "FLEET_RECALL_DATABASE_URL",
             allow_insecure_local,
-            true,
+            expected_user,
         )?;
-        fleet_config_from_lookup(database_url, &mut lookup)
+        fleet_config_from_lookup(database_url, database_ssl_policy, &mut lookup)
     }
 
     /// Stable registry identity, independent of where the baked bundle is
@@ -671,6 +698,7 @@ impl FleetConfig {
 
 fn fleet_config_from_lookup(
     database_url: String,
+    database_ssl_policy: PrivatePostgresSslPolicy,
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<FleetConfig> {
     let tenant_id = required_from(&mut lookup, "FLEET_RECALL_TENANT_ID")?
@@ -725,6 +753,7 @@ fn fleet_config_from_lookup(
 
     Ok(FleetConfig {
         database_url,
+        database_ssl_policy,
         default_scope: FleetScope::new(tenant_id, project, agent, None, PrivacyTier::T1Project)?,
         max_connections,
         embedding_model: embedding_model.to_owned(),
@@ -1314,6 +1343,49 @@ fn explicit_private_database_ssl_policy(
     }
 }
 
+/// Apply the closed endpoint policy for the private runtime or schema migrator.
+///
+/// The URL variable remains shared by deployment convention, but each command
+/// class supplies one fixed expected principal. Comparing decoded driver
+/// options prevents percent encoding from bypassing the identity boundary.
+fn validate_private_runtime_database_url(
+    database_url: &str,
+    allow_insecure_local: bool,
+    expected_user: &str,
+) -> Result<PrivatePostgresSslPolicy> {
+    const VARIABLE_NAME: &str = "FLEET_RECALL_DATABASE_URL";
+
+    Url::parse(database_url).map_err(|_| {
+        FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must be a valid PostgreSQL URL; value is redacted"
+        ))
+    })?;
+    validate_database_url_with_local_escape(
+        database_url,
+        VARIABLE_NAME,
+        allow_insecure_local,
+        true,
+    )?;
+    validate_explicit_private_database_identity(database_url, VARIABLE_NAME)?;
+    let decoded_options = database_url.parse::<PgConnectOptions>().map_err(|_| {
+        FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must be a valid PostgreSQL URL; value is redacted"
+        ))
+    })?;
+    if decoded_options.get_username() != expected_user {
+        return Err(FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must authenticate exactly as {expected_user}; value is redacted"
+        )));
+    }
+    if decoded_options.get_database() != Some(PRIVATE_RUNTIME_POSTGRES_DATABASE) {
+        return Err(FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must select exactly the {PRIVATE_RUNTIME_POSTGRES_DATABASE} database; value is redacted"
+        )));
+    }
+
+    explicit_private_database_ssl_policy(database_url, VARIABLE_NAME)
+}
+
 /// Apply the closed endpoint policy for the one-shot successor writer.
 ///
 /// `sqlx-postgres` supports libpq-compatible environment and Unix-socket
@@ -1512,6 +1584,7 @@ mod tests {
         let digest = model_bundle_sha256(bundle.path()).expect("digest");
         let config = FleetConfig {
             database_url: "postgresql://example.invalid/defaultdb".into(),
+            database_ssl_policy: PrivatePostgresSslPolicy::VerifyFull,
             default_scope: FleetScope::new(
                 Uuid::from_u128(1),
                 "project",
@@ -1553,6 +1626,7 @@ mod tests {
             database_url:
                 "postgresql://operator:super-secret@example.invalid/defaultdb?sslmode=verify-full"
                     .into(),
+            database_ssl_policy: PrivatePostgresSslPolicy::VerifyFull,
             default_scope: FleetScope::new(
                 Uuid::from_u128(1),
                 "project",
@@ -1666,13 +1740,127 @@ mod tests {
 
         values.insert(
             "FLEET_RECALL_DATABASE_URL",
-            "postgresql://writer:writer-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+            "postgresql://fleet_writer:writer-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
                 .into(),
         );
         let config =
             FleetConfig::from_lookup(|name| values.get(name).cloned()).expect("writer config");
-        assert!(config.database_url.contains("writer:writer-secret"));
+        assert!(config.database_url.contains("fleet_writer:writer-secret"));
         assert!(!config.database_url.contains("reader-secret"));
+        assert_eq!(
+            config.database_ssl_policy,
+            PrivatePostgresSslPolicy::VerifyFull
+        );
+    }
+
+    #[test]
+    fn writer_and_migrator_configs_require_distinct_decoded_users() {
+        let mut writer_values = serving_values();
+        writer_values.insert(
+            "FLEET_RECALL_DATABASE_URL",
+            "postgresql://%66leet_writer:writer-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+                .into(),
+        );
+        let writer = FleetConfig::from_lookup(|name| writer_values.get(name).cloned())
+            .expect("decoded canonical writer config");
+        assert_eq!(
+            writer.database_ssl_policy,
+            PrivatePostgresSslPolicy::VerifyFull
+        );
+
+        let mut migrator_values = serving_values();
+        migrator_values.insert(
+            "FLEET_RECALL_DATABASE_URL",
+            "postgresql://%66leet_migrator:migrator-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+                .into(),
+        );
+        let migrator = FleetConfig::from_migrator_lookup(|name| migrator_values.get(name).cloned())
+            .expect("decoded canonical migrator config");
+        assert_eq!(
+            migrator.database_ssl_policy,
+            PrivatePostgresSslPolicy::VerifyFull
+        );
+
+        for (database_url, expected_user, supplied_user, supplied_password, migrator_mode) in [
+            (
+                "postgresql://fleet_migrator:cross-secret-1@cluster.example:26257/fleet_recall?sslmode=verify-full",
+                WRITER_POSTGRES_USER,
+                MIGRATOR_POSTGRES_USER,
+                "cross-secret-1",
+                false,
+            ),
+            (
+                "postgresql://fleet_writer:cross-secret-2@cluster.example:26257/fleet_recall?sslmode=verify-full",
+                MIGRATOR_POSTGRES_USER,
+                WRITER_POSTGRES_USER,
+                "cross-secret-2",
+                true,
+            ),
+        ] {
+            let mut values = serving_values();
+            values.insert("FLEET_RECALL_DATABASE_URL", database_url.into());
+            let result = if migrator_mode {
+                FleetConfig::from_migrator_lookup(|name| values.get(name).cloned())
+            } else {
+                FleetConfig::from_lookup(|name| values.get(name).cloned())
+            };
+            let error = result
+                .expect_err("cross-wired runtime identity must fail closed")
+                .to_string();
+            assert!(error.contains(expected_user));
+            assert!(error.contains("value is redacted"));
+            assert!(!error.contains(database_url));
+            assert!(!error.contains(supplied_user));
+            assert!(!error.contains(supplied_password));
+        }
+    }
+
+    #[test]
+    fn private_runtime_config_rejects_alternate_database_and_implicit_local_tls() {
+        let mut values = serving_values();
+        values.insert(
+            "FLEET_RECALL_DATABASE_URL",
+            "postgresql://fleet_writer:database-secret-42@cluster.example:26257/other?sslmode=verify-full"
+                .into(),
+        );
+        let error = FleetConfig::from_lookup(|name| values.get(name).cloned())
+            .expect_err("alternate database must fail closed")
+            .to_string();
+        assert!(error.contains(PRIVATE_RUNTIME_POSTGRES_DATABASE));
+        assert!(error.contains("value is redacted"));
+        assert!(!error.contains("database-secret-42"));
+
+        values.insert(
+            "FLEET_RECALL_DATABASE_URL",
+            "postgresql://fleet_writer:local-secret@127.0.0.1:26257/fleet_recall".into(),
+        );
+        values.insert("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE", "1".into());
+        let error = FleetConfig::from_lookup(|name| values.get(name).cloned())
+            .expect_err("local escape must state sslmode explicitly")
+            .to_string();
+        assert!(error.contains("explicit supported sslmode"));
+        assert!(!error.contains("local-secret"));
+
+        values.insert(
+            "FLEET_RECALL_DATABASE_URL",
+            "postgresql://fleet_writer:local-secret@127.0.0.1:26257/fleet_recall?sslmode=disable"
+                .into(),
+        );
+        let config = FleetConfig::from_lookup(|name| values.get(name).cloned())
+            .expect("explicit local writer config");
+        assert_eq!(
+            config.database_ssl_policy,
+            PrivatePostgresSslPolicy::Disable
+        );
+
+        let malformed = "postgresql://fleet_writer:malformed-secret-42@cluster.example:notaport/fleet_recall?sslmode=verify-full";
+        values.insert("FLEET_RECALL_DATABASE_URL", malformed.into());
+        let error = FleetConfig::from_lookup(|name| values.get(name).cloned())
+            .expect_err("malformed private URL must fail closed")
+            .to_string();
+        assert!(error.contains("value is redacted"));
+        assert!(!error.contains(malformed));
+        assert!(!error.contains("malformed-secret-42"));
     }
 
     #[test]

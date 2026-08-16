@@ -165,6 +165,7 @@ enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeDatabaseIdentity {
     Writer,
+    Migrator,
     Publication,
     None,
 }
@@ -173,12 +174,11 @@ impl Command {
     const fn runtime_database_identity(&self) -> RuntimeDatabaseIdentity {
         match self {
             Self::Demo { .. } => RuntimeDatabaseIdentity::Publication,
+            Self::Migrate => RuntimeDatabaseIdentity::Migrator,
             Self::ModelDigest { .. } => RuntimeDatabaseIdentity::None,
-            Self::Serve
-            | Self::Migrate
-            | Self::Health
-            | Self::Ingest { .. }
-            | Self::ReferenceAgent { .. } => RuntimeDatabaseIdentity::Writer,
+            Self::Serve | Self::Health | Self::Ingest { .. } | Self::ReferenceAgent { .. } => {
+                RuntimeDatabaseIdentity::Writer
+            }
         }
     }
 }
@@ -248,17 +248,23 @@ async fn main() -> anyhow::Result<()> {
             };
             run_demo(config, listen).await?;
         }
+        RuntimeDatabaseIdentity::Migrator => {
+            let config = FleetConfig::from_migrator_env()?;
+            let Command::Migrate = cli.command else {
+                unreachable!("only migrate uses the schema-migrator identity")
+            };
+            run_migrate(&config).await?;
+        }
         RuntimeDatabaseIdentity::Writer => {
-            let config = FleetConfig::from_env()?;
+            let config = FleetConfig::from_writer_env()?;
             match cli.command {
-                Command::Migrate => run_migrate(&config).await?,
                 Command::Health => run_health(&config).await?,
                 Command::Serve => run_serve(config).await?,
                 Command::Ingest { input } => run_ingest(&config, &input).await?,
                 Command::ReferenceAgent { step, run_id } => {
                     run_reference_agent_step(&config, step, &run_id).await?;
                 }
-                Command::Demo { .. } | Command::ModelDigest { .. } => {
+                Command::Demo { .. } | Command::Migrate | Command::ModelDigest { .. } => {
                     unreachable!("command identity was classified before configuration load")
                 }
             }
@@ -286,8 +292,24 @@ async fn connect_store(config: &FleetConfig) -> anyhow::Result<CockroachStore> {
         max_connections: config.max_connections,
         ..PoolConfig::default()
     };
-    CockroachStore::connect(
+    CockroachStore::connect_writer(
         &config.database_url,
+        config.database_ssl_policy,
+        config.default_scope.clone(),
+        pool_config,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn connect_migrator_store(config: &FleetConfig) -> anyhow::Result<CockroachStore> {
+    let pool_config = PoolConfig {
+        max_connections: config.max_connections,
+        ..PoolConfig::default()
+    };
+    CockroachStore::connect_migrator(
+        &config.database_url,
+        config.database_ssl_policy,
         config.default_scope.clone(),
         pool_config,
     )
@@ -312,7 +334,7 @@ async fn connect_publication_store(config: &PublicationConfig) -> anyhow::Result
 
 async fn run_migrate(config: &FleetConfig) -> anyhow::Result<()> {
     let model_identity = validated_migration_model_identity(config)?;
-    let store = connect_store(config).await?;
+    let store = connect_migrator_store(config).await?;
     store.migrate().await?;
     store.initialize_embedding_model(&model_identity).await?;
     let capabilities = store.capabilities().await?;
@@ -1482,9 +1504,12 @@ mod tests {
             .runtime_database_identity(),
             RuntimeDatabaseIdentity::Publication
         );
+        assert_eq!(
+            Command::Migrate.runtime_database_identity(),
+            RuntimeDatabaseIdentity::Migrator
+        );
         for command in [
             Command::Serve,
-            Command::Migrate,
             Command::Health,
             Command::Ingest { input: "-".into() },
             Command::ReferenceAgent {
@@ -1504,6 +1529,34 @@ mod tests {
             .runtime_database_identity(),
             RuntimeDatabaseIdentity::None
         );
+    }
+
+    #[test]
+    fn production_commands_route_only_through_fixed_private_connectors() {
+        let source = include_str!("main.rs");
+        let writer_connector = ["CockroachStore::connect_", "writer("].concat();
+        let migrator_connector = ["CockroachStore::connect_", "migrator("].concat();
+        let migrate_store_call = ["connect_migrator_", "store(config).await?"].concat();
+        let writer_store_call = ["connect_", "store(config).await?"].concat();
+        let raw_connector = ["CockroachStore::", "connect("].concat();
+        let migrator_config = ["FleetConfig::from_", "migrator_env()?"].concat();
+        let writer_config = ["FleetConfig::from_", "writer_env()?"].concat();
+
+        assert_eq!(source.matches(&writer_connector).count(), 1);
+        assert_eq!(source.matches(&migrator_connector).count(), 1);
+        assert_eq!(
+            source.matches(&raw_connector).count(),
+            0,
+            "production main must not reach the generic admin/test connector"
+        );
+        assert_eq!(source.matches(&migrate_store_call).count(), 1);
+        assert_eq!(
+            source.matches(&writer_store_call).count(),
+            3,
+            "health, service construction, and ingestion must use the writer boundary"
+        );
+        assert_eq!(source.matches(&migrator_config).count(), 1);
+        assert_eq!(source.matches(&writer_config).count(), 1);
     }
 
     #[derive(Default)]
@@ -1812,6 +1865,8 @@ mod tests {
         let digest = model_bundle_sha256(bundle.path()).expect("hash-valid bundle");
         let config = FleetConfig {
             database_url: "postgresql://example.invalid/defaultdb".into(),
+            database_ssl_policy:
+                ostk_fleet_recall::private_postgres::PrivatePostgresSslPolicy::VerifyFull,
             default_scope: scope(),
             max_connections: 1,
             embedding_model: "logical/model".into(),

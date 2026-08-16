@@ -1,4 +1,4 @@
-//! Closed `PostgreSQL` connection construction for private one-shot writers.
+//! Closed `PostgreSQL` connection construction for application identities.
 //!
 //! These writers accept a deployment-validated URL, but `sqlx-postgres`
 //! otherwise also consults `libpq`-compatible process variables and `pgpass`.
@@ -19,6 +19,16 @@ pub const PUBLICATION_POSTGRES_APPLICATION_NAME: &str = "ostk-fleet-recall-publi
 pub const PUBLICATION_POSTGRES_DATABASE: &str = "fleet_recall";
 /// The sole external principal admitted by the public recall connection boundary.
 pub const PUBLICATION_POSTGRES_USER: &str = "fleet_publication";
+/// Fixed database identity reported by every private runtime writer connection.
+pub const WRITER_POSTGRES_APPLICATION_NAME: &str = "ostk-fleet-recall-writer";
+/// The sole database admitted by the private runtime connection boundaries.
+pub const PRIVATE_RUNTIME_POSTGRES_DATABASE: &str = "fleet_recall";
+/// The sole external principal admitted by the private runtime writer boundary.
+pub const WRITER_POSTGRES_USER: &str = "fleet_writer";
+/// Fixed database identity reported by every schema migrator connection.
+pub const MIGRATOR_POSTGRES_APPLICATION_NAME: &str = "ostk-fleet-recall-migrator";
+/// The sole external principal admitted by the schema migrator boundary.
+pub const MIGRATOR_POSTGRES_USER: &str = "fleet_migrator";
 
 /// Exact TLS mode expected from a deployment-validated private database URL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +85,38 @@ pub fn publication_postgres_connect_options(
     )
 }
 
+/// Build closed driver options for the long-lived private runtime writer.
+///
+/// Neither the authenticated principal, selected database, nor application
+/// name is caller-selected. The final decoded driver options must match the
+/// canonical runtime identity exactly.
+pub fn writer_postgres_connect_options(
+    database_url: &str,
+    expected_ssl_policy: PrivatePostgresSslPolicy,
+) -> Result<PgConnectOptions> {
+    writer_postgres_connect_options_from_variables(
+        database_url,
+        expected_ssl_policy,
+        env::vars_os(),
+    )
+}
+
+/// Build closed driver options for the one-shot schema migrator.
+///
+/// This boundary is deliberately distinct from the runtime writer so the
+/// DDL-capable credential cannot be accepted by serving, health, ingestion,
+/// or reference-agent processes.
+pub fn migrator_postgres_connect_options(
+    database_url: &str,
+    expected_ssl_policy: PrivatePostgresSslPolicy,
+) -> Result<PgConnectOptions> {
+    migrator_postgres_connect_options_from_variables(
+        database_url,
+        expected_ssl_policy,
+        env::vars_os(),
+    )
+}
+
 fn publication_postgres_connect_options_from_variables<I>(
     database_url: &str,
     expected_ssl_policy: PrivatePostgresSslPolicy,
@@ -95,6 +137,68 @@ where
     {
         return Err(FleetError::Configuration(
             "public PostgreSQL driver options violate the canonical publication identity; URL is redacted"
+                .into(),
+        ));
+    }
+    Ok(options)
+}
+
+fn writer_postgres_connect_options_from_variables<I>(
+    database_url: &str,
+    expected_ssl_policy: PrivatePostgresSslPolicy,
+    variables: I,
+) -> Result<PgConnectOptions>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    canonical_private_runtime_connect_options_from_variables(
+        database_url,
+        WRITER_POSTGRES_USER,
+        WRITER_POSTGRES_APPLICATION_NAME,
+        expected_ssl_policy,
+        variables,
+    )
+}
+
+fn migrator_postgres_connect_options_from_variables<I>(
+    database_url: &str,
+    expected_ssl_policy: PrivatePostgresSslPolicy,
+    variables: I,
+) -> Result<PgConnectOptions>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    canonical_private_runtime_connect_options_from_variables(
+        database_url,
+        MIGRATOR_POSTGRES_USER,
+        MIGRATOR_POSTGRES_APPLICATION_NAME,
+        expected_ssl_policy,
+        variables,
+    )
+}
+
+fn canonical_private_runtime_connect_options_from_variables<I>(
+    database_url: &str,
+    expected_user: &str,
+    expected_application_name: &str,
+    expected_ssl_policy: PrivatePostgresSslPolicy,
+    variables: I,
+) -> Result<PgConnectOptions>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let options = private_postgres_connect_options_from_variables(
+        database_url,
+        expected_application_name,
+        expected_ssl_policy,
+        variables,
+    )?;
+    if options.get_username() != expected_user
+        || options.get_database() != Some(PRIVATE_RUNTIME_POSTGRES_DATABASE)
+        || options.get_application_name() != Some(expected_application_name)
+    {
+        return Err(FleetError::Configuration(
+            "private PostgreSQL driver options violate the canonical runtime identity; URL is redacted"
                 .into(),
         ));
     }
@@ -206,6 +310,10 @@ mod tests {
         "postgresql://writer:secret@db.example:26257/fleet_recall?sslmode=verify-full";
     const PUBLICATION_VERIFY_FULL_URL: &str =
         "postgresql://fleet_publication:secret@db.example:26257/fleet_recall?sslmode=verify-full";
+    const WRITER_VERIFY_FULL_URL: &str =
+        "postgresql://fleet_writer:secret@db.example:26257/fleet_recall?sslmode=verify-full";
+    const MIGRATOR_VERIFY_FULL_URL: &str =
+        "postgresql://fleet_migrator:secret@db.example:26257/fleet_recall?sslmode=verify-full";
 
     fn variable(name: &str, value: &str) -> (OsString, OsString) {
         (OsString::from(name), OsString::from(value))
@@ -443,6 +551,125 @@ mod tests {
             assert!(!error.contains(database_url));
             assert!(!error.contains(supplied_user));
             assert!(!error.contains(supplied_password));
+        }
+    }
+
+    #[test]
+    fn writer_and_migrator_options_pin_distinct_canonical_identities() {
+        let writer = writer_postgres_connect_options_from_variables(
+            WRITER_VERIFY_FULL_URL,
+            PrivatePostgresSslPolicy::VerifyFull,
+            [],
+        )
+        .expect("writer options");
+        assert_eq!(writer.get_username(), WRITER_POSTGRES_USER);
+        assert_eq!(
+            writer.get_database(),
+            Some(PRIVATE_RUNTIME_POSTGRES_DATABASE)
+        );
+        assert_eq!(
+            writer.get_application_name(),
+            Some(WRITER_POSTGRES_APPLICATION_NAME)
+        );
+
+        let migrator = migrator_postgres_connect_options_from_variables(
+            "postgresql://%66leet_migrator:secret@db.example:26257/fleet_recall?sslmode=verify-full",
+            PrivatePostgresSslPolicy::VerifyFull,
+            [],
+        )
+        .expect("decoded canonical migrator options");
+        assert_eq!(migrator.get_username(), MIGRATOR_POSTGRES_USER);
+        assert_eq!(
+            migrator.get_database(),
+            Some(PRIVATE_RUNTIME_POSTGRES_DATABASE)
+        );
+        assert_eq!(
+            migrator.get_application_name(),
+            Some(MIGRATOR_POSTGRES_APPLICATION_NAME)
+        );
+    }
+
+    #[test]
+    fn writer_and_migrator_options_reject_cross_wiring_without_reflection() {
+        for (database_url, writer_boundary, supplied_secret) in [
+            (MIGRATOR_VERIFY_FULL_URL, true, "secret"),
+            (WRITER_VERIFY_FULL_URL, false, "secret"),
+        ] {
+            let result = if writer_boundary {
+                writer_postgres_connect_options_from_variables(
+                    database_url,
+                    PrivatePostgresSslPolicy::VerifyFull,
+                    [],
+                )
+            } else {
+                migrator_postgres_connect_options_from_variables(
+                    database_url,
+                    PrivatePostgresSslPolicy::VerifyFull,
+                    [],
+                )
+            };
+            let error = result
+                .expect_err("cross-wired private identity must fail closed")
+                .to_string();
+            assert!(error.contains("URL is redacted"));
+            assert!(!error.contains(database_url));
+            assert!(!error.contains(supplied_secret));
+        }
+
+        let wrong_database = "postgresql://fleet_writer:runtime-secret-42@db.example:26257/other?sslmode=verify-full";
+        let error = writer_postgres_connect_options_from_variables(
+            wrong_database,
+            PrivatePostgresSslPolicy::VerifyFull,
+            [],
+        )
+        .expect_err("alternate private database must fail closed")
+        .to_string();
+        assert!(error.contains("URL is redacted"));
+        assert!(!error.contains(wrong_database));
+        assert!(!error.contains("runtime-secret-42"));
+    }
+
+    #[test]
+    fn canonical_runtime_options_reject_ambient_socket_and_options_inputs() {
+        let ambient_error = writer_postgres_connect_options_from_variables(
+            WRITER_VERIFY_FULL_URL,
+            PrivatePostgresSslPolicy::VerifyFull,
+            [variable("pGpAsSwOrD", "ambient-secret-42")],
+        )
+        .expect_err("case-insensitive ambient PG input must fail closed")
+        .to_string();
+        assert!(ambient_error.contains("\"pGpAsSwOrD\""));
+        assert!(ambient_error.contains("values are redacted"));
+        assert!(!ambient_error.contains("ambient-secret-42"));
+
+        for (database_url, supplied_secret) in [
+            (
+                "postgresql://fleet_writer:socket-secret-42@%2Fvar%2Frun%2Fpostgres:26257/fleet_recall?sslmode=verify-full",
+                "socket-secret-42",
+            ),
+            (
+                "postgresql://fleet_migrator:options-secret-43@db.example:26257/fleet_recall?sslmode=verify-full&options=-csearch_path%3Dattacker",
+                "options-secret-43",
+            ),
+        ] {
+            let result = if database_url.contains("fleet_writer") {
+                writer_postgres_connect_options_from_variables(
+                    database_url,
+                    PrivatePostgresSslPolicy::VerifyFull,
+                    [],
+                )
+            } else {
+                migrator_postgres_connect_options_from_variables(
+                    database_url,
+                    PrivatePostgresSslPolicy::VerifyFull,
+                    [],
+                )
+            };
+            let error = result
+                .expect_err("socket and options authority must fail closed")
+                .to_string();
+            assert!(!error.contains(database_url));
+            assert!(!error.contains(supplied_secret));
         }
     }
 }

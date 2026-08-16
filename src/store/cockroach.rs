@@ -10,8 +10,11 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::private_postgres::{
+    MIGRATOR_POSTGRES_APPLICATION_NAME, MIGRATOR_POSTGRES_USER, PRIVATE_RUNTIME_POSTGRES_DATABASE,
     PUBLICATION_POSTGRES_APPLICATION_NAME, PUBLICATION_POSTGRES_DATABASE,
-    PUBLICATION_POSTGRES_USER, PrivatePostgresSslPolicy, publication_postgres_connect_options,
+    PUBLICATION_POSTGRES_USER, PrivatePostgresSslPolicy, WRITER_POSTGRES_APPLICATION_NAME,
+    WRITER_POSTGRES_USER, migrator_postgres_connect_options, publication_postgres_connect_options,
+    writer_postgres_connect_options,
 };
 use crate::{FleetError, FleetScope, Result};
 use async_trait::async_trait;
@@ -98,6 +101,87 @@ async fn pin_publication_session(connection: &mut PgConnection) -> sqlx::Result<
     if search_path != PUBLICATION_SEARCH_PATH {
         return Err(sqlx::Error::Protocol(
             "public PostgreSQL connection did not retain its fixed search path".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Deterministic schema resolution for writer and migrator sessions.
+pub const PRIVATE_RUNTIME_SEARCH_PATH: &str = "pg_catalog, public, pg_temp";
+const PRIVATE_RUNTIME_CURRENT_USER_SQL: &str = "SELECT pg_catalog.current_user()";
+const PRIVATE_RUNTIME_CURRENT_DATABASE_SQL: &str = "SELECT pg_catalog.current_database()";
+const PRIVATE_RUNTIME_CURRENT_APPLICATION_NAME_SQL: &str =
+    "SELECT pg_catalog.current_setting('application_name')";
+const PRIVATE_RUNTIME_SET_SEARCH_PATH_SQL: &str =
+    "SELECT pg_catalog.set_config('search_path', $1, false)";
+const PRIVATE_RUNTIME_CURRENT_SEARCH_PATH_SQL: &str =
+    "SELECT pg_catalog.current_setting('search_path')";
+
+#[derive(Clone, Copy)]
+enum PrivateRuntimeSessionIdentity {
+    Writer,
+    Migrator,
+}
+
+impl PrivateRuntimeSessionIdentity {
+    const fn expected_user(self) -> &'static str {
+        match self {
+            Self::Writer => WRITER_POSTGRES_USER,
+            Self::Migrator => MIGRATOR_POSTGRES_USER,
+        }
+    }
+
+    const fn expected_application_name(self) -> &'static str {
+        match self {
+            Self::Writer => WRITER_POSTGRES_APPLICATION_NAME,
+            Self::Migrator => MIGRATOR_POSTGRES_APPLICATION_NAME,
+        }
+    }
+}
+
+async fn pin_private_runtime_session(
+    connection: &mut PgConnection,
+    identity: PrivateRuntimeSessionIdentity,
+) -> sqlx::Result<()> {
+    let current_user = sqlx::query_scalar::<_, String>(PRIVATE_RUNTIME_CURRENT_USER_SQL)
+        .fetch_one(&mut *connection)
+        .await?;
+    if current_user != identity.expected_user() {
+        return Err(sqlx::Error::Protocol(
+            "private PostgreSQL session authenticated an unexpected principal; connection details are redacted"
+                .into(),
+        ));
+    }
+    let current_database = sqlx::query_scalar::<_, String>(PRIVATE_RUNTIME_CURRENT_DATABASE_SQL)
+        .fetch_one(&mut *connection)
+        .await?;
+    if current_database != PRIVATE_RUNTIME_POSTGRES_DATABASE {
+        return Err(sqlx::Error::Protocol(
+            "private PostgreSQL session selected an unexpected database; connection details are redacted"
+                .into(),
+        ));
+    }
+    let application_name =
+        sqlx::query_scalar::<_, String>(PRIVATE_RUNTIME_CURRENT_APPLICATION_NAME_SQL)
+            .fetch_one(&mut *connection)
+            .await?;
+    if application_name != identity.expected_application_name() {
+        return Err(sqlx::Error::Protocol(
+            "private PostgreSQL session did not retain its fixed application name; connection details are redacted"
+                .into(),
+        ));
+    }
+    sqlx::query_scalar::<_, String>(PRIVATE_RUNTIME_SET_SEARCH_PATH_SQL)
+        .bind(PRIVATE_RUNTIME_SEARCH_PATH)
+        .fetch_one(&mut *connection)
+        .await?;
+    let search_path = sqlx::query_scalar::<_, String>(PRIVATE_RUNTIME_CURRENT_SEARCH_PATH_SQL)
+        .fetch_one(&mut *connection)
+        .await?;
+    if search_path != PRIVATE_RUNTIME_SEARCH_PATH {
+        return Err(sqlx::Error::Protocol(
+            "private PostgreSQL session did not retain its fixed search path; connection details are redacted"
+                .into(),
         ));
     }
     Ok(())
@@ -749,6 +833,88 @@ impl CockroachStore {
             .max_lifetime(config.max_lifetime)
             .connect_with(options)
             .await?;
+        Ok(Self { pool, scope })
+    }
+
+    /// Connect the long-lived DML runtime as exactly `fleet_writer`.
+    pub async fn connect_writer(
+        database_url: &str,
+        database_ssl_policy: PrivatePostgresSslPolicy,
+        scope: FleetScope,
+        config: PoolConfig,
+    ) -> Result<Self> {
+        Self::connect_private_runtime(
+            database_url,
+            database_ssl_policy,
+            scope,
+            config,
+            PrivateRuntimeSessionIdentity::Writer,
+        )
+        .await
+    }
+
+    /// Connect the one-shot schema path as exactly `fleet_migrator`.
+    pub async fn connect_migrator(
+        database_url: &str,
+        database_ssl_policy: PrivatePostgresSslPolicy,
+        scope: FleetScope,
+        config: PoolConfig,
+    ) -> Result<Self> {
+        Self::connect_private_runtime(
+            database_url,
+            database_ssl_policy,
+            scope,
+            config,
+            PrivateRuntimeSessionIdentity::Migrator,
+        )
+        .await
+    }
+
+    async fn connect_private_runtime(
+        database_url: &str,
+        database_ssl_policy: PrivatePostgresSslPolicy,
+        scope: FleetScope,
+        config: PoolConfig,
+        identity: PrivateRuntimeSessionIdentity,
+    ) -> Result<Self> {
+        scope.validate()?;
+        if config.max_connections == 0 {
+            return Err(FleetError::Configuration(
+                "database pool max_connections must be greater than zero".into(),
+            ));
+        }
+        let options = match identity {
+            PrivateRuntimeSessionIdentity::Writer => {
+                writer_postgres_connect_options(database_url, database_ssl_policy)?
+            }
+            PrivateRuntimeSessionIdentity::Migrator => {
+                migrator_postgres_connect_options(database_url, database_ssl_policy)?
+            }
+        }
+        .log_statements(tracing::log::LevelFilter::Debug)
+        .log_slow_statements(tracing::log::LevelFilter::Warn, Duration::from_secs(1));
+        let pool = PgPoolOptions::new()
+            .max_connections(config.max_connections)
+            .min_connections(config.min_connections.min(config.max_connections))
+            .acquire_timeout(config.acquire_timeout)
+            .idle_timeout(config.idle_timeout)
+            .max_lifetime(config.max_lifetime)
+            .after_connect(move |connection, _metadata| {
+                Box::pin(async move { pin_private_runtime_session(connection, identity).await })
+            })
+            .before_acquire(move |connection, _metadata| {
+                Box::pin(async move {
+                    pin_private_runtime_session(connection, identity).await?;
+                    Ok(true)
+                })
+            })
+            .connect_with(options)
+            .await
+            .map_err(|_| {
+                FleetError::Database(sqlx::Error::Protocol(
+                    "private PostgreSQL connection failed; connection details are redacted".into(),
+                ))
+            })?;
         Ok(Self { pool, scope })
     }
 
@@ -1941,6 +2107,69 @@ mod tests {
                 source.contains(authority_guard),
                 "publication authority witness must retain guard {authority_guard}"
             );
+        }
+    }
+
+    #[test]
+    fn private_writer_and_migrator_pool_authority_is_exact() {
+        let source = include_str!("cockroach.rs");
+
+        assert_eq!(WRITER_POSTGRES_USER, "fleet_writer");
+        assert_eq!(MIGRATOR_POSTGRES_USER, "fleet_migrator");
+        assert_ne!(WRITER_POSTGRES_USER, MIGRATOR_POSTGRES_USER);
+        assert_eq!(PRIVATE_RUNTIME_POSTGRES_DATABASE, "fleet_recall");
+        assert_eq!(
+            PRIVATE_RUNTIME_CURRENT_USER_SQL,
+            "SELECT pg_catalog.current_user()"
+        );
+        assert_eq!(
+            PRIVATE_RUNTIME_CURRENT_DATABASE_SQL,
+            "SELECT pg_catalog.current_database()"
+        );
+        assert_eq!(
+            PRIVATE_RUNTIME_CURRENT_APPLICATION_NAME_SQL,
+            "SELECT pg_catalog.current_setting('application_name')"
+        );
+        assert_eq!(
+            PRIVATE_RUNTIME_SET_SEARCH_PATH_SQL,
+            "SELECT pg_catalog.set_config('search_path', $1, false)"
+        );
+        assert_eq!(
+            PRIVATE_RUNTIME_CURRENT_SEARCH_PATH_SQL,
+            "SELECT pg_catalog.current_setting('search_path')"
+        );
+        assert_eq!(PRIVATE_RUNTIME_SEARCH_PATH, "pg_catalog, public, pg_temp");
+        assert!(source.contains("pub async fn connect_writer("));
+        assert!(source.contains("pub async fn connect_migrator("));
+        let witness_call = [
+            "pin_private_runtime_session(connection, identity)",
+            ".await",
+        ]
+        .concat();
+        assert_eq!(
+            source.matches(&witness_call).count(),
+            2,
+            "new and reused private connections must share the authority witness"
+        );
+        for authority_guard in [
+            "current_user != identity.expected_user()",
+            "current_database != PRIVATE_RUNTIME_POSTGRES_DATABASE",
+            "application_name != identity.expected_application_name()",
+            "search_path != PRIVATE_RUNTIME_SEARCH_PATH",
+        ] {
+            assert!(
+                source.contains(authority_guard),
+                "private authority witness must retain guard {authority_guard}"
+            );
+        }
+        for generic_error in [
+            "unexpected principal; connection details are redacted",
+            "unexpected database; connection details are redacted",
+            "fixed application name; connection details are redacted",
+            "fixed search path; connection details are redacted",
+            "private PostgreSQL connection failed; connection details are redacted",
+        ] {
+            assert!(source.contains(generic_error));
         }
     }
 
