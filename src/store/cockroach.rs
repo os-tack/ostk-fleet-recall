@@ -72,6 +72,8 @@ const REGISTRY_GENESIS_BRIDGE_CONSUMPTION_MIGRATION_SQL: &str =
     include_str!("../../migrations/0013_registry_genesis_bridge_consumption.sql");
 const REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL: &str =
     include_str!("../../migrations/0014_registry_current_head_v2.sql");
+const CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0015_conflict_detector_uniqueness.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -207,24 +209,39 @@ fn embedded_migrator() -> Migrator {
         .migrations
         .to_mut()
         .extend(successor_transition_migrations());
+    migrator.migrations.to_mut().push(Migration::new(
+        15,
+        Cow::Borrowed("detector-versioned conflict uniqueness"),
+        MigrationType::Simple,
+        Cow::Borrowed(CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL),
+        true,
+    ));
     migrator
 }
 
 fn pre_transactional_embedded_migrator() -> Migrator {
-    let mut migrator = base_embedded_migrator();
-    migrator.migrations.to_mut().extend(
-        successor_transition_migrations()
-            .into_iter()
-            .enumerate()
-            .map(|(index, mut migration)| {
-                // Recognize applied versions 12-14 during fail-closed history
-                // validation, but leave them for the transactional phase.
-                if index >= 2 {
-                    migration.migration_type = MigrationType::ReversibleDown;
-                }
-                migration
-            }),
-    );
+    let mut migrator = embedded_migrator();
+    for migration in migrator.migrations.to_mut() {
+        // Recognize applied versions 12-15 during fail-closed history
+        // validation, but leave them for their later transaction-policy phase.
+        if migration.version >= 12 {
+            migration.migration_type = MigrationType::ReversibleDown;
+        }
+    }
+    migrator
+}
+
+fn transactional_embedded_migrator() -> Migrator {
+    let mut migrator = embedded_migrator();
+    let detector_index_migration = migrator
+        .migrations
+        .to_mut()
+        .iter_mut()
+        .find(|migration| migration.version == 15)
+        .expect("embedded conflict detector migration");
+    // Version 15 performs multiple resumable online schema changes and must
+    // wait for the post-transactional phase with CockroachDB's DDL autocommit.
+    detector_index_migration.migration_type = MigrationType::ReversibleDown;
     migrator
 }
 
@@ -667,8 +684,10 @@ impl CockroachStore {
         // CockroachDB defaults `autocommit_before_ddl` to true, which would
         // commit a CREATE TABLE before SQLx inserts the matching migration
         // history row even though SQLx opened a transaction. Versions 1-11
-        // require that default for online/legacy schema changes; versions 12+
-        // require it disabled for genuinely atomic DDL plus bookkeeping.
+        // require that default for online/legacy schema changes; versions
+        // 12-14 require it disabled for genuinely atomic DDL plus bookkeeping.
+        // Version 15 returns to CockroachDB's online-DDL autocommit policy in a
+        // third phase after the transactional successor tables are durable.
         let mut connection = self.pool.acquire().await?;
         let migration_result: Result<()> = async {
             sqlx::query("SET autocommit_before_ddl = true")
@@ -679,6 +698,12 @@ impl CockroachStore {
                 .run(connection.as_mut())
                 .await?;
             sqlx::query("SET autocommit_before_ddl = false")
+                .execute(connection.as_mut())
+                .await?;
+            transactional_embedded_migrator()
+                .run(connection.as_mut())
+                .await?;
+            sqlx::query("SET autocommit_before_ddl = true")
                 .execute(connection.as_mut())
                 .await?;
             embedded_migrator().run(connection.as_mut()).await?;
@@ -1977,7 +2002,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_migration_history_one_through_fourteen_is_byte_immutable() {
+    fn committed_migration_history_one_through_fifteen_is_byte_immutable() {
         for (migration, expected_sha256) in [
             (
                 INITIAL_MIGRATION_SQL,
@@ -2034,6 +2059,10 @@ mod tests {
             (
                 REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL,
                 "87f92385b350352de665642c80a9e0008dc3e129c287718e346d3c525023357d",
+            ),
+            (
+                CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL,
+                "f2a9bf1e1b2a4a76f8138c29ea41d78a7571bffd9b7c9b90ed6fab68de4ad2af",
             ),
         ] {
             assert_eq!(format!("{:x}", Sha256::digest(migration)), expected_sha256);
@@ -2306,6 +2335,59 @@ mod tests {
         }
     }
 
+    fn assert_resumable_conflict_detector_uniqueness_migration() {
+        let migration = CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL;
+        assert!(migration.starts_with("-- no-transaction\n"));
+        let sql = migration
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(sql.matches("DO $$").count(), 3);
+        assert_eq!(sql.matches("COMMIT;").count(), 2);
+        assert_eq!(
+            sql.matches(
+                "CREATE UNIQUE INDEX IF NOT EXISTS memory_conflicts_scope_key_detector_unique_idx"
+            )
+            .count(),
+            1
+        );
+        assert_eq!(
+            sql.matches(
+                "DROP INDEX IF EXISTS memory_conflicts@memory_conflicts_tenant_id_project_claim_key_key CASCADE;"
+            )
+            .count(),
+            1
+        );
+        assert!(sql.contains("(tenant_id ASC, project ASC, claim_key ASC, detector ASC)'"));
+        assert!(sql.contains("(tenant_id ASC, project ASC, claim_key ASC)'"));
+        assert!(sql.contains(
+            "(old_present AND old_exact AND NOT new_present)\n        OR (old_present AND old_exact AND new_present AND new_exact)\n        OR (NOT old_present AND new_present AND new_exact)"
+        ));
+        assert!(sql.contains("catalog shape mismatch before legacy drop"));
+        assert!(sql.contains("detector unique index final catalog state mismatch"));
+        assert_eq!(sql.matches("ERRCODE = '55000'").count(), 6);
+        assert!(
+            sql.find("CREATE UNIQUE INDEX IF NOT EXISTS")
+                .expect("detector index creation")
+                < sql
+                    .find("DROP INDEX IF EXISTS")
+                    .expect("legacy index removal")
+        );
+        let uppercase = sql.to_ascii_uppercase();
+        for forbidden in [
+            "INSERT ",
+            "UPDATE ",
+            "DELETE ",
+            "ALTER ",
+            "CREATE TABLE ",
+            "GRANT ",
+            "REVOKE ",
+        ] {
+            assert!(!uppercase.contains(forbidden));
+        }
+    }
+
     fn assert_exact_genesis_root_indexes() {
         assert!(
             REGISTRY_GENESIS_HEAD_ROOT_INDEX_MIGRATION_SQL.contains(
@@ -2438,10 +2520,11 @@ mod tests {
         assert_exact_genesis_root_indexes();
         assert_transition_history_schema();
         assert_bridge_and_current_head_schemas();
+        assert_resumable_conflict_detector_uniqueness_migration();
     }
 
     #[test]
-    fn embedded_migrator_registers_mixed_transaction_policy_through_fourteen() {
+    fn embedded_migrator_registers_mixed_transaction_policy_through_fifteen() {
         let migrator = embedded_migrator();
         assert_eq!(
             migrator
@@ -2449,7 +2532,15 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            (1..=15).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            migrator
+                .migrations
+                .iter()
+                .map(|migration| migration.no_tx)
+                .collect::<Vec<_>>(),
+            [vec![true; 11], vec![false; 3], vec![true]].concat()
         );
         let control_ledger = migrator
             .migrations
@@ -2494,6 +2585,7 @@ mod tests {
             (12, REGISTRY_TRANSITION_HISTORY_MIGRATION_SQL, false),
             (13, REGISTRY_GENESIS_BRIDGE_CONSUMPTION_MIGRATION_SQL, false),
             (14, REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL, false),
+            (15, CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL, true),
         ] {
             let migration = migrator
                 .migrations
@@ -2505,7 +2597,10 @@ mod tests {
         }
         assert!(migrator.no_tx);
         assert!(!migrator.locking);
+    }
 
+    #[test]
+    fn embedded_migrator_registers_three_execution_phases() {
         let pre_transactional = pre_transactional_embedded_migrator();
         assert!(!pre_transactional.ignore_missing);
         assert_eq!(
@@ -2514,9 +2609,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=14).collect::<Vec<_>>()
+            (1..=15).collect::<Vec<_>>()
         );
-        for version in 10..=14 {
+        for version in 10..=15 {
             let migration = pre_transactional
                 .migrations
                 .iter()
@@ -2526,6 +2621,25 @@ mod tests {
                 MigrationType::Simple
             } else {
                 MigrationType::ReversibleDown
+            };
+            assert_eq!(migration.migration_type, expected_type);
+        }
+
+        let transactional = transactional_embedded_migrator();
+        assert!(!transactional.ignore_missing);
+        assert_eq!(
+            transactional
+                .migrations
+                .iter()
+                .map(|migration| migration.version)
+                .collect::<Vec<_>>(),
+            (1..=15).collect::<Vec<_>>()
+        );
+        for migration in transactional.migrations.iter() {
+            let expected_type = if migration.version == 15 {
+                MigrationType::ReversibleDown
+            } else {
+                MigrationType::Simple
             };
             assert_eq!(migration.migration_type, expected_type);
         }
