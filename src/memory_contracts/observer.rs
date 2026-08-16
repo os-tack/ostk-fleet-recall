@@ -45,20 +45,30 @@
 //! admitted-for-P observer can never emit a verified finding about an
 //! unrelated predicate or an applicability its run never read.
 //!
-//! [`detect_disagreement`] implements `observer_derivation_disagreement`: it
-//! first requires each result's `admission_digest` to equal
-//! `ObserverAdmissionV2::digest()` of the admission passed alongside it, so a
-//! hand-built public [`ObserverResultV1`] cannot borrow a genuine admission's
-//! authority merely by being passed next to it. Incompatible outputs from two
-//! admitted observers with overlapping admitted domains, predicate
-//! references, and concrete applicability then make every affected
-//! observation indeterminate, while an admission whose `mode` is
-//! `candidate_only` on either side never yields a disagreement: its output
-//! remains only opposing candidate evidence and never by itself invalidates a
-//! complete verified proof. That suppression is keyed on the admission's
-//! `mode`, never on a result's self-reported `verification_outcome`, so a
-//! forged verified-shaped result cannot claim disagreement authority a
-//! genuinely `candidate_only` admission was never granted.
+//! [`detect_disagreement`] implements `observer_derivation_disagreement`. Each
+//! side must supply its governance-activated [`AdmittedObserverV1`]
+//! capability -- never a bare, freely constructible `ObserverAdmissionV2` --
+//! together with the exact [`ObserverRunReceiptV1`] it claims to have
+//! produced. [`require_result_matches_admitted_run`] then requires the
+//! result's `admission_digest` to equal that admission's real digest, its
+//! `run_receipt_digest` to equal that run receipt's real digest (naming a
+//! receipt that was never actually supplied is rejected, not merely
+//! unverified), and its self-reported `verification_outcome` to equal what
+//! [`derive_verification_outcome`] independently recomputes from the supplied
+//! admission and run receipt -- so a hand-built public [`ObserverResultV1`]
+//! can neither borrow a genuine admission's authority nor relabel its outcome
+//! away from its honest derivation (for example, forging `verified_positive`
+//! over a run that timed out, whose honest derivation is `indeterminate`)
+//! merely by being passed next to public bytes that happen to match. Only
+//! after both sides pass that check do incompatible outputs from two admitted
+//! observers with overlapping admitted domains, predicate references, and
+//! concrete applicability make every affected observation indeterminate,
+//! while an admission whose `mode` is `candidate_only` on either side never
+//! yields a disagreement: its output remains only opposing candidate evidence
+//! and never by itself invalidates a complete verified proof. That
+//! suppression is keyed on the admission's `mode`, not on the result's
+//! `verification_outcome` (which is in any case already proven above to
+//! match its honest derivation).
 
 use std::fmt;
 
@@ -963,54 +973,101 @@ impl ObserverDerivationDisagreementV1 {
     }
 }
 
+/// Reject unless `result` is exactly the pure derivation `admitted`'s own
+/// `run` supports.
+///
+/// Every field of [`ObserverResultV1`] and [`ObserverRunReceiptV1`] is
+/// public, so none of these three bindings may be trusted from the payload
+/// alone (AUTH-03): `result.admission_digest` must equal
+/// `admitted.admission().digest()`; `result.run_receipt_digest` must equal
+/// `run.digest()` (naming a run receipt that was never actually supplied is
+/// rejected, not merely unverified); and `result.verification_outcome` must
+/// equal what [`derive_verification_outcome`] independently recomputes from
+/// `admitted`, `run`, and the result's own `claim_shape`/
+/// `evaluated_condition` -- a self-reported outcome relabelled away from its
+/// cited run receipt's honest derivation (for example, forging
+/// `verified_positive` over a run whose honest derivation is `indeterminate`
+/// because it timed out) is rejected outright, never silently accepted and
+/// merely ignored downstream.
+fn require_result_matches_admitted_run(
+    admitted: &AdmittedObserverV1,
+    run: &ObserverRunReceiptV1,
+    result: &ObserverResultV1,
+) -> ContractResult<()> {
+    result.validate_shape()?;
+    if result.admission_digest != admitted.admission().digest()? {
+        return Err(ContractError::Schema(
+            "result admission_digest does not match the supplied admission".into(),
+        ));
+    }
+    if result.run_receipt_digest != run.digest()? {
+        return Err(ContractError::Schema(
+            "result run_receipt_digest does not match the supplied run receipt".into(),
+        ));
+    }
+    let expected_outcome = derive_verification_outcome(
+        admitted,
+        run,
+        result.claim_shape,
+        result.evaluated_condition,
+    )?;
+    if result.verification_outcome != expected_outcome {
+        return Err(ContractError::Schema(
+            "result verification_outcome does not match its derivation from the supplied \
+             admission and run receipt"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Pure `observer_derivation_disagreement` detector.
 ///
-/// Rejects with [`ContractError::Schema`] unless each result's
-/// `admission_digest` equals `ObserverAdmissionV2::digest()` of the admission
-/// passed alongside it: a hand-built `ObserverResultV1` (its fields are all
-/// public) must not be able to borrow a genuine admission's authority merely
-/// by being passed next to it in this call.
+/// Each side supplies its governance-activated [`AdmittedObserverV1`]
+/// capability (never a bare, freely constructible `ObserverAdmissionV2`)
+/// together with the exact [`ObserverRunReceiptV1`] and [`ObserverResultV1`]
+/// it claims to have produced. [`require_result_matches_admitted_run`]
+/// rejects with [`ContractError::Schema`] unless the result's
+/// `admission_digest`, `run_receipt_digest`, and self-reported
+/// `verification_outcome` all independently reproduce from the supplied
+/// admission and run receipt: a hand-built `ObserverResultV1` cannot borrow a
+/// genuine admission's authority, cite a run receipt that was never actually
+/// supplied, or relabel its outcome away from its honest derivation merely by
+/// being passed next to public bytes that happen to match.
 ///
 /// Returns `Ok(None)` when the two admissions' domains do not overlap, when
 /// the predicate or concrete applicability differ, or when either
 /// *admission's* `mode` is `candidate_only`: a `candidate_only` output
 /// remains opposing candidate evidence and never by itself invalidates an
 /// otherwise complete verified proof. This is keyed on the admission's mode,
-/// not on a result's self-reported `verification_outcome`, so a forged
-/// verified-shaped result cannot claim disagreement authority a genuinely
-/// `candidate_only` admission was never granted. Returns `Ok(None)` when
-/// either result is already `indeterminate`, since there is nothing further
-/// to disagree about. Returns `Ok(Some(..))` only when both sides reached a
-/// real, differing determination over the same overlapping domain.
+/// not on a result's self-reported `verification_outcome` (which is now
+/// independently proven above in any case), so a `candidate_only`-admitted
+/// side can never claim disagreement authority it was never granted. Returns
+/// `Ok(None)` when either result is already `indeterminate`, since there is
+/// nothing further to disagree about. Returns `Ok(Some(..))` only when both
+/// sides reached a real, differing determination over the same overlapping
+/// domain.
 pub fn detect_disagreement(
-    left_admission: &ObserverAdmissionV2,
+    left_admission: &AdmittedObserverV1,
+    left_run: &ObserverRunReceiptV1,
     left_result: &ObserverResultV1,
-    right_admission: &ObserverAdmissionV2,
+    right_admission: &AdmittedObserverV1,
+    right_run: &ObserverRunReceiptV1,
     right_result: &ObserverResultV1,
     detected_at: CanonicalTimestamp,
 ) -> ContractResult<Option<ObserverDerivationDisagreementV1>> {
-    left_admission.validate_shape()?;
-    right_admission.validate_shape()?;
-    left_result.validate_shape()?;
-    right_result.validate_shape()?;
+    require_result_matches_admitted_run(left_admission, left_run, left_result)?;
+    require_result_matches_admitted_run(right_admission, right_run, right_result)?;
 
-    if left_result.admission_digest != left_admission.digest()? {
-        return Err(ContractError::Schema(
-            "left result admission_digest does not match the left admission".into(),
-        ));
-    }
-    if right_result.admission_digest != right_admission.digest()? {
-        return Err(ContractError::Schema(
-            "right result admission_digest does not match the right admission".into(),
-        ));
-    }
+    let left_admission_body = left_admission.admission();
+    let right_admission_body = right_admission.admission();
 
     let domains_overlap = kinds_overlap(
-        &left_admission.input_domain.supported_resource_kinds,
-        &right_admission.input_domain.supported_resource_kinds,
+        &left_admission_body.input_domain.supported_resource_kinds,
+        &right_admission_body.input_domain.supported_resource_kinds,
     ) && kinds_overlap(
-        &left_admission.input_domain.supported_source_kinds,
-        &right_admission.input_domain.supported_source_kinds,
+        &left_admission_body.input_domain.supported_source_kinds,
+        &right_admission_body.input_domain.supported_source_kinds,
     );
     let same_predicate = left_result.predicate == right_result.predicate;
     let same_applicability = left_result.applicability == right_result.applicability;
@@ -1020,13 +1077,14 @@ pub fn detect_disagreement(
     }
 
     // The suppression is keyed on the *admission's* mode, not on whatever
-    // `verification_outcome` a (potentially forged) result payload happens to
-    // carry: a `candidate_only` admission can never produce anything but
-    // candidate evidence, and no self-reported result field may override
-    // that governance fact.
-    let neither_admission_is_candidate_only = left_admission.mode
+    // `verification_outcome` the result payload carries: a `candidate_only`
+    // admission can never produce anything but candidate evidence, and no
+    // result field may override that governance fact. (The result's outcome
+    // is in any case now proven above to equal its honest derivation, so
+    // there is no forgery left to key off of either way.)
+    let neither_admission_is_candidate_only = left_admission_body.mode
         != ObserverAdmissionModeV1::CandidateOnly
-        && right_admission.mode != ObserverAdmissionModeV1::CandidateOnly;
+        && right_admission_body.mode != ObserverAdmissionModeV1::CandidateOnly;
     let both_reached_a_determination = left_result.verification_outcome
         != VerificationOutcomeV1::Indeterminate
         && right_result.verification_outcome != VerificationOutcomeV1::Indeterminate;
@@ -1046,8 +1104,8 @@ pub fn detect_disagreement(
         scope: left_result.scope.clone(),
         predicate: left_result.predicate.clone(),
         applicability: left_result.applicability.clone(),
-        left_admission_digest: left_admission.digest()?,
-        right_admission_digest: right_admission.digest()?,
+        left_admission_digest: left_admission_body.digest()?,
+        right_admission_digest: right_admission_body.digest()?,
         left_result_fingerprint: left_result.result_fingerprint()?,
         right_result_fingerprint: right_result.result_fingerprint()?,
         detected_at,
@@ -1819,9 +1877,11 @@ mod tests {
         .unwrap();
 
         let disagreement = detect_disagreement(
-            &closed_admission,
+            &closed_admitted,
+            &closed_run,
             &negative_result,
-            &other_admission,
+            &other_admitted,
+            &other_run,
             &positive_result,
             timestamp("2026-08-14T13:00:00.000000000Z"),
         )
@@ -1880,9 +1940,11 @@ mod tests {
         .unwrap();
 
         let disagreement = detect_disagreement(
-            &closed_admission,
+            &closed_admitted,
+            &closed_run,
             &negative_result,
-            &disjoint_admission,
+            &disjoint_admitted,
+            &disjoint_run,
             &positive_result,
             timestamp("2026-08-14T13:00:00.000000000Z"),
         )
@@ -1936,9 +1998,11 @@ mod tests {
         .unwrap();
 
         let disagreement = detect_disagreement(
-            &closed_admission,
+            &closed_admitted,
+            &closed_run,
             &negative_result,
-            &llm_admission,
+            &llm_admitted,
+            &llm_run,
             &candidate_result,
             timestamp("2026-08-14T13:00:00.000000000Z"),
         )
@@ -1998,9 +2062,11 @@ mod tests {
         .unwrap();
 
         let outcome = detect_disagreement(
-            &closed_admission,
+            &closed_admitted,
+            &closed_run,
             &negative_result,
-            &llm_admission,
+            &llm_admitted,
+            &llm_run,
             &candidate_result,
             timestamp("2026-08-14T13:00:00.000000000Z"),
         );
@@ -2008,13 +2074,12 @@ mod tests {
     }
 
     #[test]
-    fn detect_disagreement_ignores_a_forged_verified_outcome_under_a_candidate_only_admission() {
-        // Even when a hand-built public `ObserverResultV1` correctly cites its
-        // candidate_only admission's real digest, forging
-        // `verification_outcome` to `verified_positive` must not defeat
-        // "candidate_only never invalidates a verified proof": suppression is
-        // keyed on the admission's `mode`, not on whatever outcome the result
-        // payload happens to self-report.
+    fn detect_disagreement_rejects_a_result_whose_run_receipt_digest_names_no_supplied_receipt() {
+        // `run_receipt_digest` is public and freely settable. Citing a digest
+        // that does not equal `ObserverRunReceiptV1::digest()` of the run
+        // receipt actually supplied alongside it -- naming a receipt that was
+        // never actually produced -- must be rejected outright, not merely
+        // left unverified downstream.
         let closed_admission =
             admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
         let closed_admitted = admit(closed_admission.clone());
@@ -2024,7 +2089,7 @@ mod tests {
             full_coverage_witness(),
             ObserverOutcomeKindV1::Success,
         );
-        let negative_result = build_observer_result(
+        let mut negative_result = build_observer_result(
             &closed_admitted,
             &closed_run,
             frozen_profile_reference_v1(),
@@ -2036,33 +2101,114 @@ mod tests {
             timestamp("2026-08-14T12:00:00.000000000Z"),
         )
         .unwrap();
+        negative_result.run_receipt_digest = digest_from_label("attacker.invented.receipt");
 
         let llm_admission = admission("llm", ObserverAdmissionModeV1::CandidateOnly);
-        let forged_result = ObserverResultV1 {
-            schema_version: OBSERVER_SCHEMA_VERSION,
-            event_kind: ContractId::new(OBSERVER_RESULT_EVENT_KIND).unwrap(),
-            profile: frozen_profile_reference_v1(),
-            scope: scope(),
-            predicate: reference("predicate.mcp.remember.allowed_actions"),
-            applicability: applicability(),
-            admission_digest: llm_admission.digest().unwrap(),
-            run_receipt_digest: digest_from_label("forged.run_receipt"),
-            claim_shape: ObserverClaimShapeV1::Presence,
-            evaluated_condition: EvaluatedConditionV1::Present,
-            verification_outcome: VerificationOutcomeV1::VerifiedPositive,
-            effective_at: timestamp("2026-08-14T12:00:00.000000000Z"),
-        };
-        forged_result.validate_shape().unwrap();
-
-        let disagreement = detect_disagreement(
-            &closed_admission,
-            &negative_result,
-            &llm_admission,
-            &forged_result,
-            timestamp("2026-08-14T13:00:00.000000000Z"),
+        let llm_admitted = admit(llm_admission.clone());
+        let llm_run = run_receipt(
+            matching_runtime_identity(&llm_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let candidate_result = build_observer_result(
+            &llm_admitted,
+            &llm_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Present,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
         )
         .unwrap();
-        assert!(disagreement.is_none());
+
+        let outcome = detect_disagreement(
+            &closed_admitted,
+            &closed_run,
+            &negative_result,
+            &llm_admitted,
+            &llm_run,
+            &candidate_result,
+            timestamp("2026-08-14T13:00:00.000000000Z"),
+        );
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn detect_disagreement_rejects_a_verification_outcome_relabelled_away_from_a_timed_out_run() {
+        // A genuinely admitted observer whose run receipt reports `timeout`
+        // honestly derives `indeterminate` (never a verified negative, never
+        // a silent failure). Relabelling only `verification_outcome` on the
+        // public result -- while still citing the real admission and the
+        // real (timed-out) run receipt by digest -- must be rejected, not
+        // silently accepted as a disagreement input. This is the fix for the
+        // reviewer's `zz2_public_bytes_only_forgery_invalidates_a_verified_proof`
+        // and `zz2_forged_indeterminate_cannot_be_detected_from_the_result_alone`
+        // reproductions.
+        let closed_admission =
+            admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let closed_admitted = admit(closed_admission.clone());
+        let timed_out_run = run_receipt(
+            matching_runtime_identity(&closed_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Timeout,
+        );
+        let mut relabelled_result = build_observer_result(
+            &closed_admitted,
+            &timed_out_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Present,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+        assert_eq!(
+            relabelled_result.verification_outcome,
+            VerificationOutcomeV1::Indeterminate
+        );
+        relabelled_result.verification_outcome = VerificationOutcomeV1::VerifiedPositive;
+        // The relabelled shape is still structurally admissible in isolation
+        // (`presence`/`present`/`verified_positive` is a valid combination),
+        // so only the cross-check against the honest derivation can catch it.
+        relabelled_result.validate_shape().unwrap();
+
+        let llm_admission = admission("llm", ObserverAdmissionModeV1::CandidateOnly);
+        let llm_admitted = admit(llm_admission.clone());
+        let llm_run = run_receipt(
+            matching_runtime_identity(&llm_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let candidate_result = build_observer_result(
+            &llm_admitted,
+            &llm_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Present,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+
+        let outcome = detect_disagreement(
+            &closed_admitted,
+            &timed_out_run,
+            &relabelled_result,
+            &llm_admitted,
+            &llm_run,
+            &candidate_result,
+            timestamp("2026-08-14T13:00:00.000000000Z"),
+        );
+        assert!(outcome.is_err());
     }
 
     #[test]

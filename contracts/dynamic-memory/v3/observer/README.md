@@ -75,13 +75,22 @@ itself (AUTH-03, EVENT-03).
   `AdmittedObserverV1` and one `ObserverRunReceiptV1` with no hidden state, so
   identical inputs reproduce an identical outcome and an identical
   `ObserverRunReceiptV1::digest()`.
-- **AUTH-03** — `ObserverAdmissionV2` and `ObserverResultV1` are both public,
-  freely constructible candidate shapes; only [`AdmittedObserverV1`] and
-  [`AdmittedObserverResultV1`], each with a `#[cfg(test)]`-only constructor,
-  represent the governance-activated and append-eligible capabilities.
-  `derive_verification_outcome` requires an `AdmittedObserverV1`, never a
-  bare `ObserverAdmissionV2`, so no payload can grant itself verification
-  authority merely by asserting a matching admission ID.
+- **AUTH-03** — `ObserverAdmissionV2`, `ObserverRunReceiptV1`, and
+  `ObserverResultV1` are all public, freely constructible candidate shapes;
+  only [`AdmittedObserverV1`] and [`AdmittedObserverResultV1`], each with a
+  `#[cfg(test)]`-only constructor, represent the governance-activated and
+  append-eligible capabilities. `derive_verification_outcome` and
+  `detect_disagreement` both require an `AdmittedObserverV1`, never a bare
+  `ObserverAdmissionV2`, so no payload can grant itself verification
+  authority merely by asserting a matching admission ID. `detect_disagreement`
+  additionally requires each side's exact `ObserverRunReceiptV1` and rejects
+  unless the accompanying `ObserverResultV1`'s `admission_digest` and
+  `run_receipt_digest` equal the real digests of the admission/run receipt
+  supplied alongside it *and* its self-reported `verification_outcome`
+  equals what `derive_verification_outcome` independently recomputes from
+  that admission and run receipt — closing the seam where a self-reported
+  `verification_outcome` could otherwise be relabelled (e.g. away from a
+  timed-out run's honest `indeterminate`) using only public bytes.
 
 ## How digests are pinned
 
