@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Secondary Docker parity only: this preserves the image-level reconciliation
 # RBAC proof, but cannot substitute for the checksum-pinned official-binary
-# correctness lane.
+# correctness lane. Policy applications run as root, matching its cluster-admin-
+# only operator contract.
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../../.." && pwd)
 image=${FLEET_RECALL_CRDB_IMAGE:-cockroachdb/cockroach:v26.2.3}
@@ -28,6 +29,185 @@ root_sql() {
         --execute "$1"
 }
 
+root_sql_in_database() {
+    local database=$1
+    local statement=$2
+    docker exec "$container" cockroach sql \
+        --insecure \
+        --database "$database" \
+        --format tsv \
+        --execute "$statement"
+}
+
+# The SQL policy is intentionally database-local. This read-only deployment
+# preflight iterates every other database for direct target grants and ownership
+# that an admin must clean before applying or using the role. Production must
+# freeze concurrent security/DDL changes across this snapshot and policy/use;
+# this disposable proof is single-threaded.
+audit_other_database_target_authority() {
+    local databases
+    local database
+    local grant_rows
+    local ownership_rows
+    local row
+    if ! databases=$(root_sql \
+        'SELECT database_name FROM [SHOW DATABASES] ORDER BY database_name' \
+        | tail -n +2); then
+        fail "external target audit could not enumerate databases"
+    fi
+    while IFS= read -r database; do
+        test -n "$database" || continue
+        test "$database" != 'fleet_recall' || continue
+        if ! grant_rows=$(root_sql_in_database "$database" "
+            SELECT 'grant:' || object_type || ':' ||
+                   COALESCE(schema_name, '') || ':' ||
+                   COALESCE(object_name, '') || ':' || privilege_type || ':' ||
+                   CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END
+            FROM [SHOW GRANTS FOR fleet_conflict_reconciliation]
+            WHERE grantee = 'fleet_conflict_reconciliation'
+              AND database_name = current_database()
+            ORDER BY object_type, schema_name, object_name, privilege_type
+        " | tail -n +2); then
+            fail "external target audit could not inspect grants in $database"
+        fi
+        while IFS= read -r row; do
+            test -n "$row" || continue
+            printf '%s:%s\n' "$database" "$row"
+        done <<<"$grant_rows"
+        if ! ownership_rows=$(root_sql_in_database "$database" "
+            SELECT object_kind || ':' || schema_name || ':' || object_name
+            FROM (
+                SELECT 'database_owner' AS object_kind,
+                       '' AS schema_name,
+                       database_object.datname AS object_name
+                FROM pg_catalog.pg_database AS database_object
+                JOIN pg_catalog.pg_roles AS owner_role
+                  ON owner_role.oid = database_object.datdba
+                WHERE database_object.datname = current_database()
+                  AND owner_role.rolname = 'fleet_conflict_reconciliation'
+                UNION ALL
+                SELECT 'schema_owner', schema_object.nspname, ''
+                FROM pg_catalog.pg_namespace AS schema_object
+                JOIN pg_catalog.pg_roles AS owner_role
+                  ON owner_role.oid = schema_object.nspowner
+                WHERE owner_role.rolname = 'fleet_conflict_reconciliation'
+                UNION ALL
+                SELECT 'relation_owner', relation_schema.nspname,
+                       relation_object.relname
+                FROM pg_catalog.pg_class AS relation_object
+                JOIN pg_catalog.pg_namespace AS relation_schema
+                  ON relation_schema.oid = relation_object.relnamespace
+                JOIN pg_catalog.pg_roles AS owner_role
+                  ON owner_role.oid = relation_object.relowner
+                WHERE relation_object.relkind IN ('r', 'S', 'v', 'm', 'p')
+                  AND owner_role.rolname = 'fleet_conflict_reconciliation'
+                UNION ALL
+                SELECT 'function_owner', function_schema.nspname,
+                       function_object.proname
+                FROM pg_catalog.pg_proc AS function_object
+                JOIN pg_catalog.pg_namespace AS function_schema
+                  ON function_schema.oid = function_object.pronamespace
+                JOIN pg_catalog.pg_roles AS owner_role
+                  ON owner_role.oid = function_object.proowner
+                WHERE owner_role.rolname = 'fleet_conflict_reconciliation'
+                UNION ALL
+                SELECT 'type_owner', type_schema.nspname, type_object.typname
+                FROM pg_catalog.pg_type AS type_object
+                JOIN pg_catalog.pg_namespace AS type_schema
+                  ON type_schema.oid = type_object.typnamespace
+                JOIN pg_catalog.pg_roles AS owner_role
+                  ON owner_role.oid = type_object.typowner
+                WHERE owner_role.rolname = 'fleet_conflict_reconciliation'
+            ) AS owned_object
+            ORDER BY object_kind, schema_name, object_name
+        " | tail -n +2); then
+            fail "external target audit could not inspect ownership in $database"
+        fi
+        while IFS= read -r row; do
+            test -n "$row" || continue
+            printf '%s:%s\n' "$database" "$row"
+        done <<<"$ownership_rows"
+    done <<<"$databases"
+}
+
+# PUBLIC is inherited by every role. This inventory intentionally ignores the
+# ordinary other-database CONNECT/TEMPORARY/schema-USAGE and virtual-schema
+# fallback surface, but exposes application-object/DDL authority that a cluster
+# admin must assess for exclusive database confinement.
+inventory_other_database_public_application_authority() {
+    local databases
+    local database
+    local public_rows
+    local row
+    if ! databases=$(root_sql \
+        'SELECT database_name FROM [SHOW DATABASES] ORDER BY database_name' \
+        | tail -n +2); then
+        fail "external PUBLIC inventory could not enumerate databases"
+    fi
+    while IFS= read -r database; do
+        test -n "$database" || continue
+        test "$database" != 'fleet_recall' || continue
+        if ! public_rows=$(root_sql_in_database "$database" "
+            SELECT object_type || ':' || COALESCE(schema_name, '') || ':' ||
+                   COALESCE(object_name, '') || ':' || privilege_type || ':' ||
+                   CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END
+            FROM [SHOW GRANTS FOR public]
+            WHERE grantee = 'public'
+              AND database_name = current_database()
+              AND NOT (
+                  (object_type = 'database'
+                      AND privilege_type IN ('CONNECT', 'TEMPORARY')
+                      AND NOT is_grantable)
+                  OR (object_type = 'schema'
+                      AND schema_name = 'public'
+                      AND object_name IS NULL
+                      AND privilege_type = 'USAGE'
+                      AND NOT is_grantable)
+                  OR (
+                      schema_name IN (
+                          'crdb_internal', 'information_schema',
+                          'pg_catalog', 'pg_extension'
+                      )
+                      AND NOT is_grantable
+                      AND (
+                          (object_type = 'schema'
+                              AND object_name IS NULL
+                              AND privilege_type = 'USAGE')
+                          OR (object_type = 'table'
+                              AND object_name IS NOT NULL
+                              AND privilege_type = 'SELECT')
+                          OR (object_type = 'type'
+                              AND schema_name = 'pg_catalog'
+                              AND object_name IS NOT NULL
+                              AND privilege_type = 'USAGE')
+                      )
+                  )
+                  OR (
+                      current_database() = 'system'
+                      AND NOT is_grantable
+                      AND (
+                          (object_type = 'schema'
+                              AND schema_name = 'public'
+                              AND object_name IS NULL
+                              AND privilege_type = 'CREATE')
+                          OR (object_type = 'table'
+                              AND schema_name = 'public'
+                              AND object_name = 'comments'
+                              AND privilege_type = 'SELECT')
+                      )
+                  )
+              )
+            ORDER BY object_type, schema_name, object_name, privilege_type
+        " | tail -n +2); then
+            fail "external PUBLIC inventory could not inspect $database"
+        fi
+        while IFS= read -r row; do
+            test -n "$row" || continue
+            printf '%s:%s\n' "$database" "$row"
+        done <<<"$public_rows"
+    done <<<"$databases"
+}
+
 sql_as() {
     local user=$1
     local statement=$2
@@ -43,6 +223,92 @@ apply_reconciliation_policy() {
     docker exec -i "$container" cockroach sql \
         --insecure --database fleet_recall \
         < "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql"
+}
+
+apply_reconciliation_policy_in_database() {
+    local database=$1
+    docker exec -i "$container" cockroach sql \
+        --insecure --database "$database" \
+        < "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql"
+}
+
+apply_reconciliation_policy_with_valid_temp_prefix() {
+    {
+        printf '%s\n' '
+SET experimental_enable_temp_tables = on;
+CREATE TEMP TABLE _sqlx_migrations (
+    version INT8 PRIMARY KEY,
+    success BOOL NOT NULL
+);
+INSERT INTO _sqlx_migrations
+SELECT version, true FROM generate_series(1, 16) AS version;
+'
+        sed -n '1,$p' \
+            "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql"
+    } | docker exec -i "$container" cockroach sql \
+        --insecure --database fleet_recall
+}
+
+apply_reconciliation_policy_with_temp_shadows() {
+    {
+        printf '%s\n' '
+SET experimental_enable_temp_tables = on;
+CREATE TEMP TABLE _sqlx_migrations (
+    version INT8 PRIMARY KEY,
+    success BOOL NOT NULL
+);
+INSERT INTO _sqlx_migrations VALUES (1, false);
+CREATE TEMP TABLE memory_conflicts (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_conflict_members (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_claims (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_claim_events (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_mutation_receipts (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_events (id INT8 PRIMARY KEY);
+CREATE TEMP SEQUENCE memory_conflict_id_seq;
+'
+        sed -n '1,$p' \
+            "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql"
+        printf '%s\n' '
+SELECT IF(
+    count(*) = 2
+        AND count(DISTINCT privilege_type) = 2
+        AND COALESCE(bool_and(
+            database_name = '\''fleet_recall'\''
+            AND object_type = '\''schema'\''
+            AND object_name IS NULL
+            AND privilege_type IN ('\''CREATE'\'', '\''USAGE'\'')
+            AND NOT is_grantable
+        ), false),
+    1:::INT8,
+    CAST(
+        concat(
+            '\''temporary PUBLIC schema baseline differs from exact CREATE/USAGE: observed='\'',
+            count(*)::STRING
+        )
+        AS INT8
+    )
+) AS conflict_reconciliation_temp_public_baseline_postcondition
+FROM [SHOW GRANTS FOR public]
+WHERE grantee = '\''public'\''
+  AND schema_name LIKE '\''pg_temp_%'\'';
+
+SELECT IF(
+    count(*) = 0,
+    1:::INT8,
+    CAST(
+        concat(
+            '\''temporary repository shadow received reconciliation grants: observed='\'',
+            count(*)::STRING
+        )
+        AS INT8
+    )
+) AS conflict_reconciliation_temp_shadow_postcondition
+FROM [SHOW GRANTS FOR fleet_conflict_reconciliation]
+WHERE grantee = '\''fleet_conflict_reconciliation'\''
+  AND schema_name LIKE '\''pg_temp_%'\'';
+'
+    } | docker exec -i "$container" cockroach sql \
+        --insecure --database fleet_recall
 }
 
 assert_exact() {
@@ -88,6 +354,15 @@ expect_denied() {
     fi
 }
 
+assert_show_gate_sqlstate() {
+    local label=$1
+    local output=$2
+    if ! grep -Fq 'SQLSTATE: 22P02' <<<"$output"; then
+        echo "$output" >&2
+        fail "$label did not use the supported top-level SHOW assertion failure"
+    fi
+}
+
 expect_policy_gate_failure() {
     local label=$1
     local output
@@ -99,6 +374,42 @@ expect_policy_gate_failure() {
         <<<"$output"; then
         echo "$output" >&2
         fail "$label did not retain the exact prefix-16 failure"
+    fi
+}
+
+expect_policy_gate_failure_with_valid_temp_prefix() {
+    local label=$1
+    local output
+    if output=$(apply_reconciliation_policy_with_valid_temp_prefix 2>&1); then
+        fail "$label unexpectedly admitted a valid temporary migration prefix"
+    fi
+    if ! grep -Fq \
+        'conflict reconciliation role requires the complete successful migration prefix through 16' \
+        <<<"$output"; then
+        echo "$output" >&2
+        fail "$label did not retain the exact public prefix-16 failure"
+    fi
+    if ! grep -Fq 'SQLSTATE: 55000' <<<"$output"; then
+        echo "$output" >&2
+        fail "$label did not retain the public prefix-gate SQLSTATE"
+    fi
+}
+
+expect_policy_database_failure() {
+    local label=$1
+    local output
+    if output=$(apply_reconciliation_policy_in_database defaultdb 2>&1); then
+        fail "$label unexpectedly admitted the policy in the wrong database"
+    fi
+    if ! grep -Fq \
+        'conflict reconciliation policy must run in fleet_recall' \
+        <<<"$output"; then
+        echo "$output" >&2
+        fail "$label did not fail on the exact current-database preflight"
+    fi
+    if ! grep -Fq 'SQLSTATE: 55000' <<<"$output"; then
+        echo "$output" >&2
+        fail "$label did not retain the database-preflight SQLSTATE"
     fi
 }
 
@@ -114,6 +425,7 @@ expect_policy_prerequisite_failure() {
         echo "$output" >&2
         fail "$label did not fail on the exact prior-role preflight"
     fi
+    assert_show_gate_sqlstate "$label" "$output"
 }
 
 expect_policy_default_privilege_failure() {
@@ -123,11 +435,12 @@ expect_policy_default_privilege_failure() {
         fail "$label unexpectedly admitted future-object privilege drift"
     fi
     if ! grep -Fq \
-        'conflict reconciliation policy permits only PUBLIC type USAGE, target PUBLIC routine EXECUTE, and target self-owner ALL future defaults' \
+        'conflict reconciliation policy permits only intrinsic PUBLIC type USAGE/all-roles routine EXECUTE, target PUBLIC routine EXECUTE, and target self-owner ALL future defaults' \
         <<<"$output"; then
         echo "$output" >&2
         fail "$label did not fail on the exact default-privilege preflight"
     fi
+    assert_show_gate_sqlstate "$label" "$output"
 }
 
 expect_policy_public_system_failure() {
@@ -142,6 +455,7 @@ expect_policy_public_system_failure() {
         echo "$output" >&2
         fail "$label did not fail on the exact PUBLIC system-grant preflight"
     fi
+    assert_show_gate_sqlstate "$label" "$output"
 }
 
 expect_policy_schema_boundary_failure() {
@@ -170,6 +484,7 @@ expect_policy_grant_boundary_failure() {
         echo "$output" >&2
         fail "$label did not fail on the exact object-grant boundary preflight"
     fi
+    assert_show_gate_sqlstate "$label" "$output"
 }
 
 expect_policy_role_edge_failure() {
@@ -184,6 +499,7 @@ expect_policy_role_edge_failure() {
         echo "$output" >&2
         fail "$label did not fail on the exact role-edge preflight"
     fi
+    assert_show_gate_sqlstate "$label" "$output"
 }
 
 expect_policy_ownership_failure() {
@@ -212,6 +528,7 @@ expect_policy_identity_option_failure() {
         echo "$output" >&2
         fail "$label did not fail on the exact identity-option preflight"
     fi
+    assert_show_gate_sqlstate "$label" "$output"
 }
 
 # Freeze the repository's schema dependency and SQL table surface beside the
@@ -274,12 +591,69 @@ expected_role_option_hardening='ALTER ROLE fleet_conflict_reconciliation WITH
     NOCREATEROLE
     NOLOGIN
     NOMODIFYCLUSTERSETTING
+    NOREPLICATION
     SQLLOGIN
     NOVIEWACTIVITY
     NOVIEWACTIVITYREDACTED
     NOVIEWCLUSTERSETTING;'
 assert_exact "complete v26.2 direct role-option hardening" \
     "$role_option_hardening" "$expected_role_option_hardening"
+
+# The policy must pin built-in resolution before any gate, and every
+# repository relation reference must remain schema-qualified even though
+# pg_temp is explicitly placed last. This freezes both defenses against a
+# reused administrator session with temporary shadow objects.
+policy_first_statement=$(awk '
+    /^[[:space:]]*--/ || /^[[:space:]]*$/ { next }
+    { print; exit }
+' "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql")
+assert_exact "reconciliation policy first statement" \
+    "$policy_first_statement" 'SET search_path = pg_catalog, public, pg_temp;'
+
+unqualified_policy_application_references=$(sed -E 's/--.*$//' \
+    "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql" \
+    | grep -En \
+        '(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+(_sqlx_migrations|memory_(claims|claim_events|conflicts|conflict_members|mutation_receipts|events|conflict_id_seq))([^[:alnum:]_]|$)' \
+        || true)
+assert_exact "unqualified reconciliation policy application references" \
+    "$unqualified_policy_application_references" ''
+
+qualified_policy_application_references=$(sed -E 's/--.*$//' \
+    "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql" \
+    | grep -Eo \
+        '(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+public\.(_sqlx_migrations|memory_(claims|claim_events|conflicts|conflict_members|mutation_receipts|events|conflict_id_seq))' \
+    | sed -E 's/^(FROM|ON TABLE|ON SEQUENCE)[[:space:]]+//' \
+    | sort)
+expected_qualified_policy_application_references='public._sqlx_migrations
+public._sqlx_migrations
+public.memory_claim_events
+public.memory_claims
+public.memory_conflict_id_seq
+public.memory_conflict_members
+public.memory_conflicts
+public.memory_events
+public.memory_mutation_receipts'
+assert_exact "fully qualified reconciliation policy application references" \
+    "$qualified_policy_application_references" \
+    "$expected_qualified_policy_application_references"
+
+current_database_preflight=$(grep -F \
+    "IF pg_catalog.current_database() <> 'fleet_recall' THEN" \
+    "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql")
+assert_exact "fleet_recall current-database preflight" \
+    "$current_database_preflight" \
+    "    IF pg_catalog.current_database() <> 'fleet_recall' THEN"
+
+# CockroachDB v26.2 rejects delegated SHOW statements inside PL/pgSQL function
+# bodies. Keep every SHOW-backed gate at statement scope; catalog-only DO
+# blocks remain valid and retain their explicit SQLSTATE 55000 failures.
+unsupported_query_in_function_body=$(awk '
+    /^DO \$\$/ { in_function_body = 1 }
+    in_function_body && ($0 ~ /\[SHOW[[:space:]]/ || $0 ~ /^[[:space:]]*SHOW[[:space:]]/ || $0 ~ /crdb_internal\./ || $0 ~ /information_schema\./) { print NR ":" $0 }
+    in_function_body && /^\$\$;$/ { in_function_body = 0 }
+' "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql")
+assert_exact "SHOW/virtual-table-free reconciliation policy function bodies" \
+    "$unsupported_query_in_function_body" ''
 
 docker run --detach --name "$container" "$image" \
     start-single-node --insecure --listen-addr=localhost:26257 >/dev/null
@@ -486,9 +860,30 @@ WHERE database_name = 'fleet_recall'
   )
 ORDER BY object_type, object_name, privilege_type" | tail -n +2)
 
+# The policy's first persistent gate binds every catalog/default/reset query to
+# fleet_recall. Running it in another database may change only that SQL
+# session's search_path; it must neither create the target role nor touch the
+# pre-existing database-local PUBLIC grant.
+expect_policy_database_failure "wrong current database"
+assert_root_scalar "wrong-database target role creation" \
+    "SELECT count(*)::STRING FROM [SHOW USERS]
+     WHERE username = 'fleet_conflict_reconciliation'" '0'
+wrong_database_public_grant_after_failure=$(
+    root_sql_in_database defaultdb \
+        "SELECT count(*)::STRING FROM [SHOW GRANTS ON SCHEMA public]
+         WHERE grantee = 'public'
+           AND privilege_type = 'CREATE'" \
+        | tail -n +2
+)
+assert_exact "wrong-database PUBLIC grant preservation" \
+    "$wrong_database_public_grant_after_failure" '1'
+
 # Prefix 15 and a present-but-failed migration 16 both fail before the role is
-# created or the pre-existing PUBLIC drift is touched.
+# created or the pre-existing PUBLIC drift is touched. A valid temporary
+# migration-history shadow cannot mask either bad real public prefix.
 expect_policy_gate_failure "prefix 15"
+expect_policy_gate_failure_with_valid_temp_prefix \
+    "prefix 15 with valid temporary prefix"
 assert_root_scalar "prefix-15 role creation" \
     "SELECT count(*)::STRING FROM [SHOW USERS]
      WHERE username = 'fleet_conflict_reconciliation'" '0'
@@ -498,6 +893,8 @@ assert_root_scalar "prefix-15 PUBLIC grant preservation" \
 
 root_sql 'INSERT INTO _sqlx_migrations VALUES (16, false)' >/dev/null
 expect_policy_gate_failure "failed migration 16"
+expect_policy_gate_failure_with_valid_temp_prefix \
+    "failed migration 16 with valid temporary prefix"
 assert_root_scalar "failed-16 role creation" \
     "SELECT count(*)::STRING FROM [SHOW USERS]
      WHERE username = 'fleet_conflict_reconciliation'" '0'
@@ -532,10 +929,12 @@ ALTER ROLE fleet_registry_activation WITH NOLOGIN NOCREATEROLE NOCREATEDB;
 ' >/dev/null
 
 # CockroachDB release-26.2 synthesizes PUBLIC routine EXECUTE for every role
-# and FOR ALL ROLES. This policy deliberately forbids that default. Enumerate
-# every pre-existing fixture role as the operator precondition; temporary root
-# membership supplies the authority to alter each role's defaults and is
-# removed before any reconciliation policy call.
+# and FOR ALL ROLES. Enumerate every pre-existing fixture role as the operator
+# precondition; temporary root membership supplies the authority to alter each
+# role's defaults and is removed before any reconciliation policy call. The
+# attempted all-roles revoke is intentionally retained: with the clean fixture
+# descriptor, v26.2.3 accepts it and synthesizes one exact non-grantable row,
+# which is frozen below.
 root_sql '
 GRANT
     fleet_runtime,
@@ -590,18 +989,24 @@ assert_root_scalar "temporary default-cleanup memberships" \
            'proof_reconciliation',
            'proof_public'
        )" '0'
-assert_root_scalar "fixture PUBLIC routine-default prerequisite" \
-    "SELECT count(*)::STRING
+assert_root_scalar "fixture intrinsic all-roles routine default" \
+    "SELECT COALESCE(role, '<all_roles>') || ':' ||
+            CASE WHEN for_all_roles THEN 'all_roles' ELSE 'single_role' END || ':' ||
+            object_type || ':' || grantee || ':' || privilege_type || ':' ||
+            CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END
      FROM (
-         SELECT object_type, grantee, privilege_type
+         SELECT role, for_all_roles, object_type, grantee, privilege_type,
+                is_grantable
          FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public]
          UNION
-         SELECT object_type, grantee, privilege_type
+         SELECT role, for_all_roles, object_type, grantee, privilege_type,
+                is_grantable
          FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public IN SCHEMA public]
      ) AS public_default
      WHERE object_type = 'routines'
        AND grantee = 'public'
-       AND privilege_type = 'EXECUTE'" '0'
+       AND privilege_type = 'EXECUTE'" \
+    '<all_roles>:all_roles:routines:public:EXECUTE:not_grantable'
 
 root_sql 'GRANT SYSTEM CREATEROLE TO public' >/dev/null
 expect_policy_public_system_failure "PUBLIC CREATEROLE system grant"
@@ -618,12 +1023,10 @@ sql_as proof_database_owner '
 ALTER DEFAULT PRIVILEGES FOR ROLE proof_database_owner
     GRANT SELECT ON TABLES TO public;
 ALTER DEFAULT PRIVILEGES FOR ROLE proof_database_owner
-    GRANT ALL ON TYPES TO public;
-ALTER DEFAULT PRIVILEGES FOR ROLE proof_database_owner
     GRANT EXECUTE ON ROUTINES TO public;
 ' >/dev/null
 expect_policy_default_privilege_failure \
-    "grantor-specific PUBLIC table, type, and routine defaults"
+    "grantor-specific PUBLIC table and routine defaults"
 assert_root_scalar "default-privilege target role creation" \
     "SELECT count(*)::STRING FROM [SHOW USERS]
      WHERE username = 'fleet_conflict_reconciliation'" '0'
@@ -635,15 +1038,6 @@ assert_root_scalar "failed default-privilege preflight preservation" \
        AND object_type = 'tables'
        AND grantee = 'public'
        AND privilege_type = 'SELECT'" '1'
-assert_root_scalar "failed PUBLIC type-default preservation" \
-    "SELECT count(*)::STRING
-     FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public]
-     WHERE role = 'proof_database_owner'
-       AND NOT for_all_roles
-       AND object_type = 'types'
-       AND grantee = 'public'
-       AND privilege_type = 'ALL'
-       AND NOT is_grantable" '1'
 assert_root_scalar "failed PUBLIC routine-default preservation" \
     "SELECT count(*)::STRING
      FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public]
@@ -657,15 +1051,126 @@ sql_as proof_database_owner '
 ALTER DEFAULT PRIVILEGES FOR ROLE proof_database_owner
     REVOKE SELECT ON TABLES FROM public;
 ALTER DEFAULT PRIVILEGES FOR ROLE proof_database_owner
-    REVOKE ALL ON TYPES FROM public;
-ALTER DEFAULT PRIVILEGES FOR ROLE proof_database_owner
     REVOKE EXECUTE ON ROUTINES FROM public;
 ' >/dev/null
+
+# The SQL file can normalize object authority only in fleet_recall. Before its
+# first successful apply, freeze and remove the stock cluster's out-of-contract
+# PUBLIC DDL/data authority so the fixture does not silently filter ambient
+# rows. Direct target authority is vacuous while the target role is absent.
+assert_root_scalar "external-audit bootstrap target absence" \
+    "SELECT count(*)::STRING FROM [SHOW USERS]
+     WHERE username = 'fleet_conflict_reconciliation'" '0'
+initial_outside_public_application_authority=$(
+    inventory_other_database_public_application_authority
+)
+expected_initial_outside_public_application_authority='defaultdb:schema:public::CREATE:not_grantable
+postgres:schema:public::CREATE:not_grantable'
+assert_exact "initial external PUBLIC application-authority inventory" \
+    "$initial_outside_public_application_authority" \
+    "$expected_initial_outside_public_application_authority"
+root_sql_in_database defaultdb \
+    'REVOKE CREATE ON SCHEMA public FROM public' >/dev/null
+root_sql_in_database postgres \
+    'REVOKE CREATE ON SCHEMA public FROM public' >/dev/null
+hardened_initial_outside_public_application_authority=$(
+    inventory_other_database_public_application_authority
+)
+assert_exact "hardened initial external PUBLIC application inventory" \
+    "$hardened_initial_outside_public_application_authority" ''
+
 apply_reconciliation_policy >/dev/null
 assert_root_scalar "clean first-apply target creation" \
     "SELECT count(*)::STRING FROM [SHOW USERS]
      WHERE username = 'fleet_conflict_reconciliation'
        AND options::STRING = '{NOLOGIN}'" '1'
+bootstrap_outside_target_authority=$(audit_other_database_target_authority)
+assert_exact "post-create external target-authority audit" \
+    "$bootstrap_outside_target_authority" ''
+bootstrap_outside_public_application_authority=$(
+    inventory_other_database_public_application_authority
+)
+assert_exact "post-create external PUBLIC application inventory" \
+    "$bootstrap_outside_public_application_authority" ''
+
+# The SQL file can normalize object authority only in fleet_recall. Model the
+# required cluster-admin deployment preflight against a second database: direct
+# target and inherited PUBLIC application grants are both inventoried without
+# mutation, then explicitly cleaned before policy reapplication or role use.
+root_sql 'CREATE DATABASE proof_other_database' >/dev/null
+root_sql_in_database proof_other_database '
+CREATE TABLE proof_other_ledger (id INT8 PRIMARY KEY);
+CREATE TABLE proof_other_owned (id INT8 PRIMARY KEY);
+GRANT SELECT ON TABLE proof_other_ledger
+    TO fleet_conflict_reconciliation, public;
+GRANT CREATE ON SCHEMA public TO fleet_conflict_reconciliation;
+ALTER TABLE proof_other_owned OWNER TO fleet_conflict_reconciliation;
+REVOKE CREATE ON SCHEMA public FROM fleet_conflict_reconciliation;
+' >/dev/null
+outside_target_authority=$(audit_other_database_target_authority)
+assert_exact "external target-authority audit" \
+    "$outside_target_authority" \
+    'proof_other_database:grant:table:public:proof_other_ledger:SELECT:not_grantable
+proof_other_database:grant:table:public:proof_other_owned:ALL:grantable
+proof_other_database:relation_owner:public:proof_other_owned
+proof_other_database:type_owner:public:proof_other_owned'
+outside_public_application_authority=$(
+    inventory_other_database_public_application_authority
+)
+assert_exact "external PUBLIC application-authority inventory" \
+    "$outside_public_application_authority" \
+    'proof_other_database:schema:public::CREATE:not_grantable
+proof_other_database:table:public:proof_other_ledger:SELECT:not_grantable'
+other_database_drift_after_audit=$(root_sql_in_database proof_other_database "
+SELECT grantee || ':' || privilege_type
+FROM [SHOW GRANTS ON TABLE proof_other_ledger]
+WHERE grantee IN ('fleet_conflict_reconciliation', 'public')
+  AND privilege_type = 'SELECT'
+ORDER BY grantee" | tail -n +2)
+assert_exact "read-only external audit preservation" \
+    "$other_database_drift_after_audit" \
+    'fleet_conflict_reconciliation:SELECT
+public:SELECT'
+other_database_ownership_after_audit=$(root_sql_in_database proof_other_database "
+SELECT count(*)::STRING
+FROM pg_catalog.pg_class AS relation_object
+JOIN pg_catalog.pg_namespace AS relation_schema
+  ON relation_schema.oid = relation_object.relnamespace
+JOIN pg_catalog.pg_roles AS owner_role
+  ON owner_role.oid = relation_object.relowner
+WHERE relation_object.relkind = 'r'
+  AND relation_schema.nspname = 'public'
+  AND relation_object.relname = 'proof_other_owned'
+  AND owner_role.rolname = 'fleet_conflict_reconciliation'" | tail -n +2)
+assert_exact "read-only external ownership audit preservation" \
+    "$other_database_ownership_after_audit" '1'
+root_sql_in_database proof_other_database '
+ALTER TABLE proof_other_owned OWNER TO root;
+REVOKE SELECT ON TABLE proof_other_ledger
+    FROM fleet_conflict_reconciliation, public;
+REVOKE CREATE ON SCHEMA public FROM public;
+' >/dev/null
+clean_outside_target_authority=$(audit_other_database_target_authority)
+assert_exact "clean external target-authority precondition" \
+    "$clean_outside_target_authority" ''
+clean_outside_public_application_authority=$(
+    inventory_other_database_public_application_authority
+)
+assert_exact "clean external PUBLIC application inventory" \
+    "$clean_outside_public_application_authority" ''
+apply_reconciliation_policy >/dev/null
+
+# Reapply in one reused session whose temporary schema shadows migration
+# history and every repository grant target. The deliberately failed temporary
+# history must not reject the valid public prefix, no grant may land on a temp
+# object, and the real public migration table must retain its exact grant.
+apply_reconciliation_policy_with_temp_shadows >/dev/null
+assert_root_scalar "temp-shadow public migration-history grant" \
+    "SELECT count(*)::STRING
+     FROM [SHOW GRANTS ON TABLE public._sqlx_migrations]
+     WHERE grantee = 'fleet_conflict_reconciliation'
+       AND privilege_type = 'SELECT'
+       AND NOT is_grantable" '1'
 
 # Database ownership alone cannot modify the cluster role boundary.
 expect_denied proof_database_owner "database owner role-option hardening" \
@@ -719,6 +1224,7 @@ ALTER ROLE fleet_conflict_reconciliation WITH
     CREATELOGIN
     CREATEROLE
     MODIFYCLUSTERSETTING
+    REPLICATION
     NOSQLLOGIN
     VIEWACTIVITY
     VIEWACTIVITYREDACTED
@@ -759,11 +1265,12 @@ assert_root_scalar "failed-gate direct role-option preservation" \
            'CREATELOGIN',
            'CREATEROLE',
            'MODIFYCLUSTERSETTING',
+           'REPLICATION',
            'NOSQLLOGIN',
            'VIEWACTIVITY',
            'VIEWACTIVITYREDACTED',
            'VIEWCLUSTERSETTING'
-       )" '12'
+       )" '13'
 assert_root_scalar "failed-gate grant-option preservation" \
     "SELECT count(*)::STRING
      FROM [SHOW GRANTS ON TABLE memory_conflicts]
@@ -883,8 +1390,9 @@ apply_reconciliation_policy >/dev/null
 # Unknown NOLOGIN edges fail closed in both directions. The policy cannot
 # safely construct arbitrary role or object identifiers for dynamic REVOKE in
 # v26.2, so an operator must remove each exact edge/grant and reapply. Direct
-# target-role and PUBLIC authority outside fleet_recall.public, and ownership
-# drift anywhere, are equivalent fail-closed preconditions.
+# target-role and PUBLIC authority elsewhere in the current fleet_recall
+# database, and current-database ownership drift, are equivalent fail-closed
+# preconditions. Other databases are covered by the external audit above.
 root_sql '
 CREATE ROLE proof_unexpected_authority;
 GRANT proof_unexpected_authority TO root;
@@ -1018,8 +1526,10 @@ DROP EXTERNAL CONNECTION proof_reconciliation_external;
 apply_reconciliation_policy >/dev/null
 root_sql '
 CREATE TABLE proof_owned_by_reconciliation (id INT8 PRIMARY KEY);
+GRANT CREATE ON SCHEMA public TO fleet_conflict_reconciliation;
 ALTER TABLE proof_owned_by_reconciliation
     OWNER TO fleet_conflict_reconciliation;
+REVOKE CREATE ON SCHEMA public FROM fleet_conflict_reconciliation;
 ' >/dev/null
 expect_policy_ownership_failure "unexpected public table ownership"
 assert_root_scalar "failed ownership preflight preservation" \
@@ -1107,6 +1617,33 @@ ORDER BY object_type, object_name, privilege_type" | tail -n +2)
 assert_exact "PUBLIC application table/sequence grants" \
     "$public_application_object_grants" ''
 
+# Freeze the exact v26.2.3 PUBLIC fallback on its four unmodifiable virtual
+# schemas. These rows are not application authority: Cockroach rejects object
+# creation/shadowing there, and the policy admits no grantable/different shape.
+public_virtual_schema_grants=$(root_sql "
+SELECT schema_name || ':' || object_type || ':' || privilege_type || ':' ||
+       CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END || ':' ||
+       count(*)::STRING AS normalized
+FROM [SHOW GRANTS FOR public]
+WHERE grantee = 'public'
+  AND database_name = 'fleet_recall'
+  AND schema_name IN (
+      'crdb_internal', 'information_schema', 'pg_catalog', 'pg_extension'
+  )
+GROUP BY schema_name, object_type, privilege_type, is_grantable
+ORDER BY schema_name, object_type, privilege_type, is_grantable" | tail -n +2)
+expected_public_virtual_schema_grants='crdb_internal:schema:USAGE:not_grantable:1
+crdb_internal:table:SELECT:not_grantable:116
+information_schema:schema:USAGE:not_grantable:1
+information_schema:table:SELECT:not_grantable:89
+pg_catalog:schema:USAGE:not_grantable:1
+pg_catalog:table:SELECT:not_grantable:129
+pg_catalog:type:USAGE:not_grantable:98
+pg_extension:schema:USAGE:not_grantable:1
+pg_extension:table:SELECT:not_grantable:3'
+assert_exact "v26.2.3 PUBLIC virtual-schema fallback grants" \
+    "$public_virtual_schema_grants" "$expected_public_virtual_schema_grants"
+
 out_of_boundary_grants=$(root_sql "
 SELECT grantee || ':' || COALESCE(database_name, '') || ':' ||
        COALESCE(schema_name, '') || ':' || object_type || ':' || object_name || ':' ||
@@ -1138,6 +1675,34 @@ FROM (
                   OR (object_type = 'schema' AND schema_name = 'public')
                   OR (object_type IN ('table', 'sequence')
                       AND schema_name = 'public')
+                  OR (
+                      object_type = 'schema'
+                      AND schema_name LIKE 'pg_temp_%'
+                      AND object_name IS NULL
+                      AND privilege_type IN ('CREATE', 'USAGE')
+                      AND NOT is_grantable
+                  )
+                  OR (
+                      schema_name IN (
+                          'crdb_internal',
+                          'information_schema',
+                          'pg_catalog',
+                          'pg_extension'
+                      )
+                      AND NOT is_grantable
+                      AND (
+                          (object_type = 'schema'
+                              AND object_name IS NULL
+                              AND privilege_type = 'USAGE')
+                          OR (object_type = 'table'
+                              AND object_name IS NOT NULL
+                              AND privilege_type = 'SELECT')
+                          OR (object_type = 'type'
+                              AND schema_name = 'pg_catalog'
+                              AND object_name IS NOT NULL
+                              AND privilege_type = 'USAGE')
+                      )
+                  )
               )
           )
       )
@@ -1151,7 +1716,6 @@ application_schemas=$(root_sql "
 SELECT nspname
 FROM pg_catalog.pg_namespace
 WHERE nspname NOT LIKE 'pg_temp_%'
-  AND nspname NOT LIKE 'pg_toast_temp_%'
 ORDER BY nspname" | tail -n +2)
 expected_application_schemas='crdb_internal
 information_schema
@@ -1232,9 +1796,9 @@ assert_exact "complete reconciliation role edges" \
     "$reconciliation_role_edges" "$expected_reconciliation_role_edges"
 
 # The release-26.2 engine source synthesizes non-grantable PUBLIC routine
-# EXECUTE and type USAGE rows. All pre-existing/global routine rows are an
-# operator-cleanup prerequisite; CREATE ROLE contributes exactly the inert
-# target-grantor row frozen here.
+# EXECUTE and type USAGE rows. All named pre-existing routine rows are an
+# operator-cleanup prerequisite; the exact clean-engine all-roles row was frozen
+# above, and CREATE ROLE contributes exactly the inert target-grantor row here.
 # https://github.com/cockroachdb/cockroach/blob/v26.2.3/pkg/sql/logictest/testdata/logic_test/show_default_privileges
 target_public_routine_defaults=$(root_sql "
 SELECT role || ':' || object_type || ':' || grantee || ':' || privilege_type || ':' ||
@@ -1258,8 +1822,9 @@ assert_exact "target creator-scoped PUBLIC routine default" \
     "$target_public_routine_defaults" \
     "$expected_target_public_routine_defaults"
 
-# The final supported four-SHOW audit excludes only that exact target row,
-# PUBLIC's intrinsic type USAGE, and target self-owner ALL.
+# The final supported four-SHOW audit excludes only the exact clean-engine
+# all-roles routine row, the exact target routine row, PUBLIC's intrinsic type
+# USAGE, and target self-owner ALL.
 default_privileges=$(root_sql "
 SELECT COALESCE(role, 'ALL') || ':' || object_type || ':' || grantee || ':' ||
        privilege_type || ':' ||
@@ -1294,6 +1859,14 @@ WHERE object_type IN ('schemas', 'routines', 'tables', 'sequences', 'types')
       AND NOT is_grantable
   )
   AND NOT (
+      role IS NULL
+      AND for_all_roles
+      AND grantee = 'public'
+      AND object_type = 'routines'
+      AND privilege_type = 'EXECUTE'
+      AND NOT is_grantable
+  )
+  AND NOT (
       role = 'fleet_conflict_reconciliation'
       AND NOT for_all_roles
       AND grantee = 'public'
@@ -1304,6 +1877,23 @@ WHERE object_type IN ('schemas', 'routines', 'tables', 'sequences', 'types')
 ORDER BY role, object_type, grantee, privilege_type" | tail -n +2)
 assert_exact "non-intrinsic reconciliation/PUBLIC future-object defaults" \
     "$default_privileges" ''
+
+# Re-run the external admin audit after all policy/drift cycles. The helper
+# enumerates every SHOW DATABASES row; direct target grants/ownership must be
+# absent outside fleet_recall. PUBLIC's ordinary other-database ambient baseline
+# remains outside this local policy, while application-object drift is empty in
+# the parity fixture.
+final_outside_target_authority=$(audit_other_database_target_authority)
+assert_exact "final external target-authority audit" \
+    "$final_outside_target_authority" ''
+final_outside_public_application_authority=$(
+    inventory_other_database_public_application_authority
+)
+assert_exact "final external PUBLIC application-authority inventory" \
+    "$final_outside_public_application_authority" ''
+assert_exact "secondary database retained for final external audit" \
+    "$(root_sql "SELECT count(*)::STRING FROM [SHOW DATABASES]
+                  WHERE database_name = 'proof_other_database'" | tail -n +2)" '1'
 
 # The repository principal can evaluate only the prefix-16 gate, even with a
 # later row 17 present, and cannot mutate SQLx history.
