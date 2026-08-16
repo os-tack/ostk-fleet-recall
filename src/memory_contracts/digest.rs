@@ -209,6 +209,18 @@ pub enum DigestDomain {
     // --- W0-CAUSE domains ---
 
     // --- W0-ACT domains ---
+    /// `ActionProposalV1` immutable proposal digest (ACT-02).
+    ActionProposalV1,
+    /// `AuthorizationV1` authorization digest bound by an execution request (ACT-02).
+    ActionAuthorizationV1,
+    /// `ExecutionRequestV1` attempt identity: proposal + authorization + idempotency key (ACT-03).
+    ActionAttemptV1,
+    /// `ExecutionReceiptV1` receipt identity (ACT-03).
+    ActionReceiptV1,
+    /// `VerificationV1` verification identity (ACT-04).
+    ActionVerificationV1,
+    /// `ProviderAttestedRelationCandidateV2` admission-candidate identity (PROV-01, REL-01).
+    RelationAdmissionV2,
     // --- W1 domains (evidence ledger, head witness, remember/evidence/relation runtime) ---
     /// W1-APPEND. Offset-zero chain digest of one lazily seeded evidence shard
     /// head, framed over the genesis log-epoch ID and the shard number.
@@ -221,7 +233,7 @@ pub enum DigestDomain {
     /// fully determined by `(epoch, shard)` and can grant no forgeable
     /// authority. Sharing one domain across the two ledgers would make an
     /// evidence offset-zero digest replayable as a control one.
-    EvidenceGenesisChainV1, // W1-APPEND
+    EvidenceGenesisChainV1,
 }
 
 impl DigestDomain {
@@ -334,8 +346,14 @@ impl DigestDomain {
             // --- W0-CAUSE prefixes ---
 
             // --- W0-ACT prefixes ---
+            Self::ActionProposalV1 => "ostk-action-proposal-v1",
+            Self::ActionAuthorizationV1 => "ostk-action-authorization-v1",
+            Self::ActionAttemptV1 => "ostk-action-attempt-v1",
+            Self::ActionReceiptV1 => "ostk-action-receipt-v1",
+            Self::ActionVerificationV1 => "ostk-action-verification-v1",
+            Self::RelationAdmissionV2 => "ostk-relation-admission-v2",
             // --- W1 prefixes ---
-            Self::EvidenceGenesisChainV1 => "ostk-evidence-genesis-chain-v1", // W1-APPEND
+            Self::EvidenceGenesisChainV1 => "ostk-evidence-genesis-chain-v1",
         }
     }
 }
