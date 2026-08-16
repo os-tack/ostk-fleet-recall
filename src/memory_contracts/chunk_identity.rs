@@ -336,6 +336,29 @@ pub struct ParseRunManifestPreimageV1 {
 }
 
 impl ParseRunManifestPreimageV1 {
+    /// Structural-only binding, not a defect: this validates each
+    /// `occurrence_ids` element as a well-formed, non-`ZERO`
+    /// [`ChunkOccurrenceId`] digest, but a `ChunkOccurrenceId` is one-way —
+    /// this preimage cannot recover the `parser_key`/
+    /// `source_object_version_uri` an occurrence ID was actually computed
+    /// under, so it cannot itself detect an occurrence ID cited here that
+    /// was computed under a different parser key or source-object version
+    /// than this manifest declares. A runtime built on this contract must
+    /// bind that cross-check separately: load each cited occurrence's own
+    /// stored [`ChunkOccurrencePreimageV1`], recompute its
+    /// [`ChunkOccurrencePreimageV1::occurrence_id`] to confirm it matches
+    /// the ID cited here, and additionally assert its `parser_key` and
+    /// `source_object_version_uri` equal this manifest's own `parser_key`
+    /// and `source_representation_uri` — before trusting `occurrence_ids`
+    /// as evidence of what this parser key actually parsed from this
+    /// source.
+    ///
+    /// Rejects a `Sha256Digest::ZERO` element inside `occurrence_ids` or
+    /// `body_digests`, in addition to the already-checked `ZERO` coverage
+    /// receipt: `ZERO` is this module's sentinel for missing/uninitialised,
+    /// never a real occurrence or body identity, so admitting it here would
+    /// mint a real, addressable `ParseManifestId` that cites a reference to
+    /// nothing (REPLAY-01, fail-closed on missing).
     pub fn validate(&self) -> ContractResult<()> {
         if self.schema_version != CHUNK_IDENTITY_SCHEMA_VERSION
             || self.source_representation_uri.identity_form() != IdentityForm::Version
@@ -344,6 +367,11 @@ impl ParseRunManifestPreimageV1 {
             || self.occurrence_ids.len() > MAX_OCCURRENCES_PER_MANIFEST
             || self.body_digests.is_empty()
             || self.body_digests.len() > MAX_BODY_DIGESTS_PER_MANIFEST
+            || self
+                .occurrence_ids
+                .iter()
+                .any(|id| id.digest() == Sha256Digest::ZERO)
+            || self.body_digests.contains(&Sha256Digest::ZERO)
         {
             return Err(ContractError::Schema(
                 "invalid parse-run manifest preimage".into(),
@@ -423,17 +451,31 @@ pub fn classify_manifest_reissue(
 /// body-content digest is a legitimate match or a digest/bytes collision.
 ///
 /// Mirrors the doc comment already pinned on [`body_digest`]: "same digest
-/// with different retained bytes is an integrity collision."
+/// with different retained bytes is an integrity collision." That doc names
+/// exactly one more shape of the same collision: a *retained* pair that is
+/// already inconsistent (`retained_digest` does not actually reproduce from
+/// `retained_bytes`). This function verifies that precondition itself,
+/// before comparing anything against `candidate_bytes` — a caller-supplied
+/// `retained_digest` is trusted input, not a value this function computed,
+/// so an unverifiable retained pair must return `Err`, never a silent
+/// `Ok(ChunkIntegrityCollisionV1::None)` that reads as "no collision found".
 pub fn classify_body_reuse(
     retained_digest: Sha256Digest,
     retained_bytes: &[u8],
     candidate_bytes: &[u8],
-) -> ChunkIntegrityCollisionV1 {
-    if body_digest(candidate_bytes) == retained_digest && candidate_bytes != retained_bytes {
-        ChunkIntegrityCollisionV1::BodyDigestBytesCollision
-    } else {
-        ChunkIntegrityCollisionV1::None
+) -> ContractResult<ChunkIntegrityCollisionV1> {
+    if body_digest(retained_bytes) != retained_digest {
+        return Err(ContractError::Schema(
+            "retained body bytes do not reproduce the retained digest".into(),
+        ));
     }
+    Ok(
+        if body_digest(candidate_bytes) == retained_digest && candidate_bytes != retained_bytes {
+            ChunkIntegrityCollisionV1::BodyDigestBytesCollision
+        } else {
+            ChunkIntegrityCollisionV1::None
+        },
+    )
 }
 
 /// Automatic historical-citation equivalence requires the same immutable
@@ -488,9 +530,20 @@ pub struct ManifestSupersessionV1 {
 }
 
 impl ManifestSupersessionV1 {
+    /// Rejects a `Sha256Digest::ZERO` predecessor or successor: unlike a
+    /// genuine `ParseManifestId`, `ZERO` names no manifest that was ever
+    /// minted, so a supersession link naming it would either retire a real,
+    /// live manifest into nothing, or mint a link superseding nothing with
+    /// something — both are missing/uninitialised references, not
+    /// legitimate supersession, and REPLAY-01 (and the fail-closed-on-missing
+    /// discipline `GenerationPointerV1::validate` already applies) require
+    /// this to fail closed rather than mint an addressable
+    /// `ManifestSupersessionId` for a link to nothing.
     pub fn validate(&self) -> ContractResult<()> {
         if self.schema_version != CHUNK_IDENTITY_SCHEMA_VERSION
             || self.predecessor_manifest_id == self.successor_manifest_id
+            || self.predecessor_manifest_id.digest() == Sha256Digest::ZERO
+            || self.successor_manifest_id.digest() == Sha256Digest::ZERO
         {
             return Err(ContractError::Schema(
                 "invalid manifest supersession link".into(),
@@ -590,6 +643,17 @@ impl GenerationPointerSwitchProposalV1 {
     /// trusted registry witness, never from this proposal's own payload:
     /// this method proves the proposal names the exact current pointer and
     /// advances exactly one generation, nothing more.
+    ///
+    /// By design, not a gap: a `proposed_pointer` may legitimately name an
+    /// *older* parser key or manifest than `current.active_parser_key` /
+    /// `current.active_manifest_id` (an authorized rollback), and this still
+    /// passes as long as `expected_prior_pointer == current` and
+    /// `generation_sequence` advances by exactly one — the CAS anchor is the
+    /// generation sequence and the exact prior-pointer witness, never a
+    /// monotonicity claim about which parser key is "newer". Whether a given
+    /// rollback proposal is *authorized* is a policy decision outside this
+    /// structural check, exactly like the coverage/determinism receipts
+    /// noted above.
     pub fn checked_against(&self, current: &GenerationPointerV1) -> ContractResult<()> {
         self.validate()?;
         current.validate()?;
@@ -743,6 +807,15 @@ impl StorageIdentityPreimageV1 {
 /// Which lawful (non-erased) occurrences currently reference one shared
 /// body-content ID. This is the state EVID-08's reference-count rule is
 /// checked against.
+///
+/// Model gap, not a defect: unlike [`StorageIdentityPreimageV1`], this state
+/// has no `protection_domain_id`. It is keyed only by `body_content_id`, so
+/// a runtime that shares one `BodyReferenceStateV1` table across protection
+/// domains would let a reference in domain A hold open storage that domain
+/// B's identity also maps to. Any runtime built on this contract must key
+/// its reference-state table by `(protection_domain_id, body_content_id)`,
+/// exactly as [`StorageIdentityPreimageV1::storage_identity`] does; this
+/// contract-only stage does not enforce that keying itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BodyReferenceStateV1 {
@@ -1068,6 +1141,59 @@ mod tests {
     }
 
     #[test]
+    fn supersession_rejects_a_zero_predecessor() {
+        // `Sha256Digest::ZERO` names no manifest that was ever minted: a
+        // link claiming to supersede it would mint a real, addressable
+        // `ManifestSupersessionId` for a predecessor that names nothing.
+        let successor = manifest(0x22).manifest_id().unwrap();
+        let supersession = ManifestSupersessionV1 {
+            schema_version: CHUNK_IDENTITY_SCHEMA_VERSION,
+            predecessor_manifest_id: ParseManifestId::from_digest(Sha256Digest::ZERO),
+            successor_manifest_id: successor,
+            reason: SupersessionReasonV1::ParserConfigurationUpgrade,
+            effective_at: CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap(),
+        };
+        assert!(supersession.validate().is_err());
+        assert!(supersession.supersession_id().is_err());
+    }
+
+    #[test]
+    fn supersession_rejects_a_zero_successor() {
+        // The mirror shape: a live manifest recorded as superseded by
+        // nothing must be rejected exactly like the zero-predecessor case,
+        // not admitted as a real retire-to-nothing link.
+        let predecessor = manifest(0x22).manifest_id().unwrap();
+        let supersession = ManifestSupersessionV1 {
+            schema_version: CHUNK_IDENTITY_SCHEMA_VERSION,
+            predecessor_manifest_id: predecessor,
+            successor_manifest_id: ParseManifestId::from_digest(Sha256Digest::ZERO),
+            reason: SupersessionReasonV1::ParserConfigurationUpgrade,
+            effective_at: CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap(),
+        };
+        assert!(supersession.validate().is_err());
+        assert!(supersession.supersession_id().is_err());
+    }
+
+    #[test]
+    fn manifest_preimage_rejects_a_zero_occurrence_id() {
+        // `ZERO` inside `occurrence_ids` is the same missing/uninitialised
+        // sentinel as a `ZERO` coverage receipt (already rejected): admitting
+        // it here would mint a manifest ID citing a reference to nothing.
+        let mut invalid = manifest(0x22);
+        invalid.occurrence_ids = vec![ChunkOccurrenceId::from_digest(Sha256Digest::ZERO)];
+        assert!(invalid.validate().is_err());
+        assert!(invalid.manifest_id().is_err());
+    }
+
+    #[test]
+    fn manifest_preimage_rejects_a_zero_body_digest() {
+        let mut invalid = manifest(0x22);
+        invalid.body_digests = vec![Sha256Digest::ZERO];
+        assert!(invalid.validate().is_err());
+        assert!(invalid.manifest_id().is_err());
+    }
+
+    #[test]
     fn manifest_reissue_with_same_key_and_source_but_different_occurrences_is_a_collision() {
         let prior = manifest(0x22);
         let mut candidate = manifest(0x22);
@@ -1099,20 +1225,29 @@ mod tests {
     }
 
     #[test]
-    fn body_reuse_with_different_bytes_under_same_digest_is_a_collision() {
-        // Two byte strings colliding under SHA-256 cannot be constructed, so
-        // this proves the predicate's logic by directly forging a retained
-        // digest that does not match the retained bytes' real digest.
-        let retained_bytes = b"first body";
+    fn body_reuse_rejects_an_inconsistent_retained_pair_even_when_candidate_matches_bytes() {
+        // EVID-02's own collision shape, reproduced directly: a retained
+        // digest that does not actually reproduce from the retained bytes is
+        // itself the integrity collision the doc names, and must never be
+        // reported as ::None just because the *candidate* happens to equal
+        // the (already-inconsistent) retained bytes.
+        let retained_bytes: &[u8] = b"the real retained body";
+        let retained_digest = body_digest(b"completely different bytes");
+        let result = classify_body_reuse(retained_digest, retained_bytes, retained_bytes);
+        assert!(result.is_err());
+        assert_ne!(result.ok(), Some(ChunkIntegrityCollisionV1::None));
+    }
+
+    #[test]
+    fn body_reuse_rejects_an_inconsistent_retained_pair_against_any_candidate() {
+        // Same shape as above, but with a candidate that also differs from
+        // the retained bytes: the retained-pair check must fire before the
+        // candidate is even compared.
+        let retained_bytes: &[u8] = b"first body";
         let retained_digest = body_digest(b"a different body entirely");
-        assert_eq!(
-            classify_body_reuse(
-                retained_digest,
-                retained_bytes,
-                b"a different body entirely"
-            ),
-            ChunkIntegrityCollisionV1::BodyDigestBytesCollision
-        );
+        let result = classify_body_reuse(retained_digest, retained_bytes, b"yet another body");
+        assert!(result.is_err());
+        assert_ne!(result.ok(), Some(ChunkIntegrityCollisionV1::None));
     }
 
     #[test]
@@ -1120,7 +1255,7 @@ mod tests {
         let bytes = b"same body";
         let digest = body_digest(bytes);
         assert_eq!(
-            classify_body_reuse(digest, bytes, bytes),
+            classify_body_reuse(digest, bytes, bytes).unwrap(),
             ChunkIntegrityCollisionV1::None
         );
     }
@@ -1448,7 +1583,9 @@ mod tests {
     /// directory's README.md for what each vector proves.
     mod fixture_pinning {
         use super::*;
-        use crate::memory_contracts::canonical::{decode_strict, require_canonical};
+        use crate::memory_contracts::canonical::{
+            decode_strict, decode_typed_canonical, require_canonical,
+        };
 
         const PARSER_KEY_FIXTURE: &[u8] =
             include_bytes!("../../contracts/dynamic-memory/v3/chunk-identity/parser-key-v1.jsonl");
@@ -1503,6 +1640,9 @@ mod tests {
         const NEGATIVE_DEGENERATE_POINTER_FIXTURE: &[u8] = include_bytes!(
             "../../contracts/dynamic-memory/v3/chunk-identity/negative-degenerate-generation-pointer.jsonl"
         );
+        const NEGATIVE_ZERO_SUCCESSOR_SUPERSESSION_FIXTURE: &[u8] = include_bytes!(
+            "../../contracts/dynamic-memory/v3/chunk-identity/negative-zero-successor-supersession.jsonl"
+        );
         const VECTOR_SUITE_FIXTURE: &[u8] =
             include_bytes!("../../contracts/dynamic-memory/v3/chunk-identity/vector-suite.jsonl");
 
@@ -1542,8 +1682,10 @@ mod tests {
             "88a031718b3daa83dc3993966e4e86f2b3616a81f2baa9736427f2574a0e3daa";
         const NEGATIVE_DEGENERATE_POINTER_RAW_SHA256: &str =
             "05da6417540a485eebd6ff2503ee2b8c2bfb78802b2e66a12ca01cdba8bde9ee";
+        const NEGATIVE_ZERO_SUCCESSOR_SUPERSESSION_RAW_SHA256: &str =
+            "6efe68aefa45f7e6e36b4bfc15eb5d630f07ba50a93f789a1107f47739c3d39f";
         const VECTOR_SUITE_RAW_SHA256: &str =
-            "b6b0c341b74f1648c6583b812b637220f497a4c26292ae0ae24af624a0d67d53";
+            "07aae4e848bf031fb7b790e758774cf981a47183cd81f65f8950054ef878118c";
 
         const PARSER_KEY_ID: &str =
             "dabca33866e026b582a8e58a7721b5e5ae222bbef2ba7f72b77f8621df79ffd1";
@@ -1617,6 +1759,10 @@ mod tests {
                     NEGATIVE_DEGENERATE_POINTER_FIXTURE,
                     NEGATIVE_DEGENERATE_POINTER_RAW_SHA256,
                 ),
+                (
+                    NEGATIVE_ZERO_SUCCESSOR_SUPERSESSION_FIXTURE,
+                    NEGATIVE_ZERO_SUCCESSOR_SUPERSESSION_RAW_SHA256,
+                ),
                 (VECTOR_SUITE_FIXTURE, VECTOR_SUITE_RAW_SHA256),
             ] {
                 assert_eq!(raw_sha256(bytes), expected);
@@ -1644,21 +1790,21 @@ mod tests {
 
         #[test]
         fn parser_key_fixture_identity_is_pinned() {
-            let decoded: ParserKeyV1 = decode_strict(record(PARSER_KEY_FIXTURE)).unwrap();
+            let decoded: ParserKeyV1 = decode_typed_canonical(record(PARSER_KEY_FIXTURE)).unwrap();
             assert_eq!(decoded.key_digest().unwrap().to_string(), PARSER_KEY_ID);
         }
 
         #[test]
         fn occurrence_fixture_identity_is_pinned() {
             let decoded: ChunkOccurrencePreimageV1 =
-                decode_strict(record(OCCURRENCE_FIXTURE)).unwrap();
+                decode_typed_canonical(record(OCCURRENCE_FIXTURE)).unwrap();
             assert_eq!(decoded.occurrence_id().unwrap().to_string(), OCCURRENCE_ID);
         }
 
         #[test]
         fn manifest_fixture_identity_is_pinned() {
             let decoded: ParseRunManifestPreimageV1 =
-                decode_strict(record(MANIFEST_FIXTURE)).unwrap();
+                decode_typed_canonical(record(MANIFEST_FIXTURE)).unwrap();
             assert_eq!(decoded.manifest_id().unwrap().to_string(), MANIFEST_ID);
             assert_eq!(
                 decoded.occurrence_ids[0].to_string(),
@@ -1670,7 +1816,7 @@ mod tests {
         #[test]
         fn supersession_fixture_identity_is_pinned() {
             let decoded: ManifestSupersessionV1 =
-                decode_strict(record(SUPERSESSION_FIXTURE)).unwrap();
+                decode_typed_canonical(record(SUPERSESSION_FIXTURE)).unwrap();
             assert_eq!(
                 decoded.supersession_id().unwrap().to_string(),
                 SUPERSESSION_ID
@@ -1681,25 +1827,25 @@ mod tests {
         #[test]
         fn generation_pointer_fixture_identity_is_pinned() {
             let decoded: GenerationPointerV1 =
-                decode_strict(record(GENERATION_POINTER_FIXTURE)).unwrap();
+                decode_typed_canonical(record(GENERATION_POINTER_FIXTURE)).unwrap();
             assert_eq!(decoded.pointer_id().unwrap().to_string(), GENERATION_1_ID);
         }
 
         #[test]
         fn switch_proposal_fixture_is_internally_consistent_with_the_pointer_fixture() {
             let current: GenerationPointerV1 =
-                decode_strict(record(GENERATION_POINTER_FIXTURE)).unwrap();
+                decode_typed_canonical(record(GENERATION_POINTER_FIXTURE)).unwrap();
             let proposal: GenerationPointerSwitchProposalV1 =
-                decode_strict(record(SWITCH_PROPOSAL_FIXTURE)).unwrap();
+                decode_typed_canonical(record(SWITCH_PROPOSAL_FIXTURE)).unwrap();
             proposal.checked_against(&current).unwrap();
         }
 
         #[test]
         fn embedding_identity_fixtures_are_pinned_and_selector_distinct() {
             let body: EmbeddingIdentityPreimageV1 =
-                decode_strict(record(EMBEDDING_BODY_FIXTURE)).unwrap();
+                decode_typed_canonical(record(EMBEDDING_BODY_FIXTURE)).unwrap();
             let occurrence: EmbeddingIdentityPreimageV1 =
-                decode_strict(record(EMBEDDING_OCCURRENCE_FIXTURE)).unwrap();
+                decode_typed_canonical(record(EMBEDDING_OCCURRENCE_FIXTURE)).unwrap();
             assert_eq!(
                 body.embedding_identity_id().unwrap().to_string(),
                 EMBEDDING_BODY_ID
@@ -1714,7 +1860,7 @@ mod tests {
         #[test]
         fn storage_identity_fixture_is_pinned() {
             let decoded: StorageIdentityPreimageV1 =
-                decode_strict(record(STORAGE_IDENTITY_FIXTURE)).unwrap();
+                decode_typed_canonical(record(STORAGE_IDENTITY_FIXTURE)).unwrap();
             assert_eq!(
                 decoded.storage_identity().unwrap().to_string(),
                 STORAGE_IDENTITY_ID
@@ -1724,7 +1870,7 @@ mod tests {
         #[test]
         fn body_reference_state_fixture_has_two_lawful_references() {
             let decoded: BodyReferenceStateV1 =
-                decode_strict(record(BODY_REFERENCE_STATE_FIXTURE)).unwrap();
+                decode_typed_canonical(record(BODY_REFERENCE_STATE_FIXTURE)).unwrap();
             decoded.validate().unwrap();
             assert_eq!(decoded.lawful_referencing_occurrences.len(), 2);
             assert!(!decoded.may_reclaim_shared_storage().unwrap());
@@ -1757,7 +1903,7 @@ mod tests {
             // fixture's own field, independently decoded here rather than
             // trusted from vector-suite.jsonl alone.
             let occurrence: ChunkOccurrencePreimageV1 =
-                decode_strict(record(OCCURRENCE_FIXTURE)).unwrap();
+                decode_typed_canonical(record(OCCURRENCE_FIXTURE)).unwrap();
             assert_eq!(
                 get("body_content_id"),
                 occurrence.body_content_id.to_string()
@@ -1766,7 +1912,7 @@ mod tests {
             // generation_2_id is recomputable: it is pointer_id() of the
             // switch-proposal fixture's own proposed_pointer.
             let proposal: GenerationPointerSwitchProposalV1 =
-                decode_strict(record(SWITCH_PROPOSAL_FIXTURE)).unwrap();
+                decode_typed_canonical(record(SWITCH_PROPOSAL_FIXTURE)).unwrap();
             let recomputed_generation_2_id =
                 proposal.proposed_pointer.pointer_id().unwrap().to_string();
             assert_eq!(recomputed_generation_2_id, GENERATION_2_ID);
@@ -1790,6 +1936,7 @@ mod tests {
                     "overlapping_spans",
                     "unknown_normalization_flag",
                     "unsorted_spans",
+                    "zero_successor_supersession",
                 ]
             );
 
@@ -1835,8 +1982,9 @@ mod tests {
             );
         }
 
-        /// This fixture is a structurally well-formed `GenerationPointerV1`
-        /// (no unrecognized field), so `decode_strict` succeeds; it is the
+        /// This fixture is a structurally well-formed, already-canonical
+        /// `GenerationPointerV1` (no unrecognized field), so
+        /// `decode_typed_canonical` succeeds; it is the
         /// all-zero, sequence-0 degenerate pointer that
         /// `GenerationPointerV1::validate` must reject, unlike a decode-only
         /// check. A degenerate pointer must never be admissible as either
@@ -1845,9 +1993,26 @@ mod tests {
         #[test]
         fn negative_fixture_rejects_the_degenerate_all_zero_generation_pointer() {
             let decoded: GenerationPointerV1 =
-                decode_strict(record(NEGATIVE_DEGENERATE_POINTER_FIXTURE)).unwrap();
+                decode_typed_canonical(record(NEGATIVE_DEGENERATE_POINTER_FIXTURE)).unwrap();
             assert!(decoded.validate().is_err());
             assert!(decoded.pointer_id().is_err());
+        }
+
+        /// This fixture is a structurally well-formed, already-canonical
+        /// `ManifestSupersessionV1` record (a real, pinned predecessor
+        /// manifest ID retired by a `Sha256Digest::ZERO` successor), so
+        /// `decode_typed_canonical` succeeds; it is the retire-to-nothing
+        /// shape `ManifestSupersessionV1::validate` must reject — a live
+        /// manifest must never be recorded as superseded by nothing.
+        #[test]
+        fn negative_fixture_rejects_a_manifest_retired_by_a_zero_successor() {
+            let decoded: ManifestSupersessionV1 =
+                decode_typed_canonical(record(NEGATIVE_ZERO_SUCCESSOR_SUPERSESSION_FIXTURE))
+                    .unwrap();
+            assert_eq!(decoded.predecessor_manifest_id.to_string(), MANIFEST_ID);
+            assert_eq!(decoded.successor_manifest_id.digest(), Sha256Digest::ZERO);
+            assert!(decoded.validate().is_err());
+            assert!(decoded.supersession_id().is_err());
         }
 
         #[test]
@@ -1860,17 +2025,19 @@ mod tests {
 
         #[test]
         fn negative_fixtures_decode_structurally_but_fail_span_validation() {
-            // These three fixtures are structurally well-formed
-            // `ChunkOccurrencePreimageV1` records (no unrecognized field, no
-            // unrecognized enum variant), so `decode_strict` succeeds; the
-            // defect is semantic and is caught only by
-            // `validate_span_list` inside `ChunkOccurrencePreimageV1::validate`.
+            // These three fixtures are structurally well-formed,
+            // already-canonical `ChunkOccurrencePreimageV1` records (no
+            // unrecognized field, no unrecognized enum variant), so
+            // `decode_typed_canonical` succeeds; the defect is semantic and
+            // is caught only by `validate_span_list` inside
+            // `ChunkOccurrencePreimageV1::validate`.
             for bytes in [
                 NEGATIVE_EMPTY_SPAN_FIXTURE,
                 NEGATIVE_OVERLAP_FIXTURE,
                 NEGATIVE_UNSORTED_FIXTURE,
             ] {
-                let decoded: ChunkOccurrencePreimageV1 = decode_strict(record(bytes)).unwrap();
+                let decoded: ChunkOccurrencePreimageV1 =
+                    decode_typed_canonical(record(bytes)).unwrap();
                 assert!(decoded.validate().is_err());
                 assert!(decoded.occurrence_id().is_err());
             }

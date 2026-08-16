@@ -13,10 +13,14 @@ with that LF included; the record's own identity digest (computed after
 stripping the LF and decoding) necessarily excludes it, since the LF is
 framing, not part of the canonical JSON record. Every record is byte-frozen:
 the Rust test suite `include_bytes!`s each file, asserts the raw file SHA-256
-against a hardcoded constant, decodes it with
-`canonical::require_canonical`/`decode_strict`, and recomputes the record's
-identity digest against a second hardcoded constant. Changing any field,
-byte, or digest below is a contract-version change, not a fixture update.
+against a hardcoded constant, decodes it with `canonical::require_canonical`
+and `canonical::decode_typed_canonical` (duplicate-safe strict parsing, plus
+requiring the checked-in bytes to be exactly the typed value's own canonical
+re-encoding — closing the positional-array/omitted-optional-key class for
+every fixture, not just document-level canonicality), and recomputes the
+record's identity digest against a second hardcoded constant. Changing any
+field, byte, or digest below is a contract-version change, not a fixture
+update.
 
 ## What each positive vector proves
 
@@ -107,6 +111,18 @@ byte, or digest below is a contract-version change, not a fixture update.
   `schema_version`, so this all-zero, uninitialised pointer would validate
   and receive a real `GenerationPointerId` — making a degenerate pointer a
   legal CAS witness for the registry's active-parser-generation anchor.
+- `negative-zero-successor-supersession.jsonl` — a `ManifestSupersessionV1`
+  record whose `predecessor_manifest_id` is the real, pinned
+  `parse-run-manifest-v1.jsonl` manifest ID and whose `successor_manifest_id`
+  is `Sha256Digest::ZERO`. It decodes structurally, but
+  `ManifestSupersessionV1::validate` now rejects it: `ZERO` is this module's
+  sentinel for missing/uninitialised, not a real manifest, so this shape
+  would otherwise record a live manifest as superseded by nothing and mint a
+  real, addressable `ManifestSupersessionId` for a link to nothing
+  (REPLAY-01, fail-closed on missing). The mirror shape (a `ZERO`
+  *predecessor*, i.e. minting a link that claims to supersede nothing) is
+  covered only in Rust (`supersession_rejects_a_zero_predecessor`), since it
+  is the same validation branch and does not need a second frozen fixture.
 
 ## Vectors proved only in Rust (not separately fixture-frozen)
 
@@ -126,9 +142,28 @@ supersession, dedup) rather than about one record's own byte shape:
   (`manifest_reissue_with_same_key_and_source_but_different_occurrences_is_a_collision`);
   a different parser key or source is *not* a collision — it is a new,
   unrelated manifest (`manifest_reissue_with_different_parser_key_is_a_new_generation_not_a_collision`);
-- body digest/bytes collision: the same retained digest over different
-  retained bytes classifies as `ChunkIntegrityCollisionV1::BodyDigestBytesCollision`
-  (`body_reuse_with_different_bytes_under_same_digest_is_a_collision`);
+- body digest/bytes collision: `classify_body_reuse` first verifies its own
+  precondition — that the caller-supplied `retained_digest` actually
+  reproduces from `retained_bytes` — and returns `Err`, never a silent
+  `Ok(ChunkIntegrityCollisionV1::None)`, for a retained pair it cannot verify,
+  even when the candidate happens to equal the (already-inconsistent)
+  retained bytes
+  (`body_reuse_rejects_an_inconsistent_retained_pair_even_when_candidate_matches_bytes`,
+  `body_reuse_rejects_an_inconsistent_retained_pair_against_any_candidate`);
+  a verified retained pair with matching candidate bytes is not a collision
+  (`body_reuse_with_matching_bytes_is_not_a_collision`). A genuine
+  same-digest-different-bytes SHA-256 collision cannot be constructed to
+  exercise the `BodyDigestBytesCollision` arm itself — that arm's soundness
+  rests on SHA-256 collision resistance, not on a test fixture;
+- manifest and supersession `ZERO`-element rejection: `Sha256Digest::ZERO` is
+  this module's sentinel for missing/uninitialised, never a real identity, so
+  it must never be admitted anywhere an ID gets minted from it.
+  `ManifestSupersessionV1::validate` rejects a `ZERO` predecessor
+  (`supersession_rejects_a_zero_predecessor`) and — frozen in
+  `negative-zero-successor-supersession.jsonl` above — a `ZERO` successor.
+  `ParseRunManifestPreimageV1::validate` rejects a `ZERO` element inside
+  `occurrence_ids` (`manifest_preimage_rejects_a_zero_occurrence_id`) or
+  `body_digests` (`manifest_preimage_rejects_a_zero_body_digest`);
 - rechunking: a new parser configuration yields a different manifest and
   occurrence set, linked by an explicit `ManifestSupersessionV1`, while the
   predecessor manifest remains valid, unmutated, historical evidence
@@ -194,3 +229,9 @@ directory has no checked-in preimage for, so no test could ever have caught
 those three digests going stale or simply being wrong. They were removed
 rather than left as unfalsifiable claims; a real second generation belongs
 in its own fixture set once one actually exists.
+
+`vector-suite.jsonl` was refrozen once, honestly, in a closeout fix: only its
+`negative_cases` array gained the `"zero_successor_supersession"` entry
+(alphabetically ordered, matching the new frozen negative fixture above); no
+other field changed. `VECTOR_SUITE_RAW_SHA256` in `chunk_identity.rs` was
+recomputed from the new checked-in bytes, not hand-edited.
