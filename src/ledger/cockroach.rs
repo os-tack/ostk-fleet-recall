@@ -3280,6 +3280,9 @@ mod tests {
                     let claim = fetch_claim(transaction, &retry_scope, claim_id).await?;
                     let attempt = retry_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if attempt == 0 {
+                        sqlx::query("SET LOCAL allow_unsafe_internals = true")
+                            .execute(&mut **transaction)
+                            .await?;
                         sqlx::query("SELECT crdb_internal.force_retry('1s':::INTERVAL)")
                             .execute(&mut **transaction)
                             .await?;
