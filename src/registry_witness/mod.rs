@@ -321,6 +321,11 @@ where
 }
 
 /// Exactly the columns the witness consumes, decoded once into contract types.
+///
+/// `Clone` exists only under `cfg(test)`, where the offline negative vectors
+/// mutate one field of an otherwise valid row to prove that each verification
+/// step is load bearing.
+#[cfg_attr(test, derive(Clone))]
 struct AuthorityRow {
     bootstrap_receipt_digest: Sha256Digest,
     bootstrap_canonical_receipt: Vec<u8>,
@@ -536,6 +541,15 @@ fn verify_descent(row: &AuthorityRow, generation: u64) -> WitnessResult<()> {
 }
 
 /// The canonical head bytes must bind exactly the projected head columns.
+///
+/// `RegistryHeadBindingV1::validate_shape` admits `Some(effective_until)`, and
+/// `memory_registry_current_heads_v2` has no `effective_until` column to
+/// contradict it, so an active head whose own canonical bytes declare
+/// themselves already expired would otherwise be accepted. No supported write
+/// path can produce one (every activation ceremony rejects a bounded interval
+/// on both the predecessor and the activated head), which is exactly why this
+/// is asserted here rather than assumed: an open interval is what the
+/// projection means, so a closed one is not a head this writer may act under.
 fn verify_head_binding(
     row: &AuthorityRow,
     head_binding: &RegistryHeadBindingV1,
@@ -545,6 +559,7 @@ fn verify_head_binding(
         || head_binding.head.package_digest != row.package_digest
         || head_binding.head.activation_policy_digest != row.activation_policy_digest
         || effective_from != row.effective_from
+        || head_binding.effective_until.is_some()
     {
         return Err(WriterAuthorityRejection::HeadBinding.into());
     }
@@ -691,6 +706,201 @@ fn fixed_digest(bytes: Vec<u8>) -> WitnessResult<Sha256Digest> {
 mod tests {
     use super::*;
 
+    use crate::memory_contracts::bootstrap::{
+        BootstrapAttestationV1, BootstrapPin, BootstrapReceiptDigest, BootstrapReceiptV1,
+    };
+    use crate::memory_contracts::common::{FixedHex32, FixedHex64};
+    use crate::memory_contracts::digest::{DigestDomain, domain_separated_digest};
+    use crate::memory_contracts::registry::RegistryHeadV1;
+    use ring::signature::Ed25519KeyPair;
+
+    /// Exact canonical bytes of the frozen bootstrap receipt. The offline
+    /// vectors below re-sign a copy of it, which is what lets a complete
+    /// authority row exist without a database: every negative vector here runs
+    /// the same [`verify_row`] the connected proof runs, so weakening any
+    /// verification step fails `cargo test` even with no `CockroachDB` in
+    /// reach.
+    const BOOTSTRAP_RECEIPT: &[u8] =
+        include_bytes!("../../contracts/dynamic-memory/v1/bootstrap-receipt.jsonl");
+
+    /// Head interval start used by the offline row. Microsecond aligned, so
+    /// `RegistryHeadBindingV1::validate_shape` admits it.
+    const EFFECTIVE_FROM: &str = "2026-08-16T00:00:00.000000000Z";
+
+    /// One negative vector: a single-field edit of an otherwise valid row.
+    type RowMutation = fn(&mut AuthorityRow);
+
+    /// A digest no compiled-in artifact and no fixture column carries.
+    const FOREIGN_DIGEST: [u8; 32] = [0x66; 32];
+
+    /// One fully consistent authority row, the receipt it descends from, and
+    /// the pins that accept it.
+    struct AuthorityFixture {
+        bootstrap: VerifiedBootstrapReceipt,
+        config: WriterAuthorityConfig,
+        head_binding: RegistryHeadBindingV1,
+        row: AuthorityRow,
+    }
+
+    /// Re-sign the frozen receipt over a caller-chosen partition seed so each
+    /// vector gets a distinct but genuinely verifiable genesis epoch.
+    fn signed_bootstrap(seed_byte: u8) -> VerifiedBootstrapReceipt {
+        let mut receipt: BootstrapReceiptV1 =
+            decode_strict(framed_record(BOOTSTRAP_RECEIPT).expect("receipt framing"))
+                .expect("bootstrap fixture decodes");
+        receipt.statement.genesis_epoch.partition_recipe.seed =
+            FixedHex32::from_bytes([seed_byte; 32]);
+        let statement_id = receipt.statement.statement_id().expect("statement id");
+        let mut message = b"ostk-bootstrap-approval-v1\0".to_vec();
+        message.extend_from_slice(statement_id.digest().as_bytes());
+        receipt.attestations = [1_u8, 2]
+            .into_iter()
+            .enumerate()
+            .map(|(index, signer_seed)| BootstrapAttestationV1 {
+                schema_version: 1,
+                statement_id,
+                signer_principal_id: ContractId::new(format!("principal.{}", index + 1))
+                    .expect("principal"),
+                signature: FixedHex64::from_bytes(
+                    Ed25519KeyPair::from_seed_unchecked(&[signer_seed; 32])
+                        .expect("signing key")
+                        .sign(&message)
+                        .as_ref()
+                        .try_into()
+                        .expect("signature width"),
+                ),
+            })
+            .collect();
+        let canonical = encode_canonical(&receipt).expect("canonical receipt");
+        let receipt_digest = BootstrapReceiptDigest::from_digest(domain_separated_digest(
+            DigestDomain::BootstrapReceipt,
+            &canonical,
+        ));
+        verify_pinned_bootstrap(
+            &canonical,
+            BootstrapPin::from_trusted_config(receipt_digest),
+            &frozen_profile_reference_v1(),
+            &receipt.statement.scope,
+            genesis_package().expect("genesis package"),
+        )
+        .expect("the re-signed receipt must verify against its own digest")
+    }
+
+    /// Build the exact row shape `memory_writer_authority_v1` projects for a
+    /// generation-1 head that activated the frozen Stage-4 package.
+    fn authority_fixture(seed_byte: u8) -> AuthorityFixture {
+        let bootstrap = signed_bootstrap(seed_byte);
+        let semantic_scope = bootstrap.receipt().statement.scope.clone();
+        let config = WriterAuthorityConfig::from_trusted_context(
+            semantic_scope.clone(),
+            bootstrap.receipt_digest(),
+            None,
+        );
+        let genesis = genesis_package().expect("genesis package");
+        let stage4 = stage4_package().expect("Stage-4 package");
+        let root_activation_id = Sha256Digest::from_bytes([0x11; 32]);
+        let root_policy = genesis_activation_policy_digest(genesis).expect("genesis policy digest");
+        let activation_id = Sha256Digest::from_bytes([0x22; 32]);
+        let activation_policy_digest = Sha256Digest::from_bytes([0x33; 32]);
+        let head_binding = RegistryHeadBindingV1 {
+            head: RegistryHeadV1 {
+                activation_id,
+                package_digest: stage4.package_digest(),
+                activation_policy_digest,
+            },
+            effective_from: CanonicalTimestamp::parse(EFFECTIVE_FROM).expect("canonical time"),
+            effective_until: None,
+        };
+        let recipe = &bootstrap.receipt().statement.genesis_epoch.partition_recipe;
+        let shard_count = i32::from(recipe.shard_count);
+        let row = AuthorityRow {
+            bootstrap_receipt_digest: bootstrap.receipt_digest().digest(),
+            bootstrap_canonical_receipt: bootstrap.canonical_bytes().to_vec(),
+            bootstrap_epoch_id: bootstrap.epoch_id().digest(),
+            bootstrap_shard_count: shard_count,
+            bootstrap_contract_tenant_namespace: semantic_scope
+                .tenant_namespace
+                .as_str()
+                .to_owned(),
+            bootstrap_contract_project_namespace: semantic_scope
+                .project_namespace
+                .as_str()
+                .to_owned(),
+            log_epoch_id: bootstrap.epoch_id().digest(),
+            partition_recipe_id: recipe.recipe_id.as_str().to_owned(),
+            partition_recipe_version: i32::try_from(recipe.recipe_version).expect("recipe version"),
+            partition_algorithm: partition_algorithm_column(recipe.algorithm).to_owned(),
+            partition_seed: recipe.seed.as_bytes().to_vec(),
+            log_shard_count: shard_count,
+            head_state: ACTIVE_HEAD_STATE.to_owned(),
+            generation: 1,
+            activation_id,
+            package_digest: stage4.package_digest(),
+            activation_policy_digest,
+            contract_tenant_namespace: semantic_scope.tenant_namespace.as_str().to_owned(),
+            contract_project_namespace: semantic_scope.project_namespace.as_str().to_owned(),
+            effective_from: DateTime::parse_from_rfc3339(EFFECTIVE_FROM)
+                .expect("rfc3339 head interval start")
+                .with_timezone(&Utc),
+            canonical_head: encode_canonical(&head_binding).expect("canonical head"),
+            root_activation_id,
+            root_package_digest: genesis.package_digest(),
+            root_activation_policy_digest: root_policy,
+            predecessor_generation: Some(0),
+            predecessor_activation_id: Some(root_activation_id),
+            predecessor_package_digest: Some(genesis.package_digest()),
+            predecessor_activation_policy_digest: Some(root_policy),
+        };
+        AuthorityFixture {
+            bootstrap,
+            config,
+            head_binding,
+            row,
+        }
+    }
+
+    /// Mutate one field of an otherwise valid row and require the exact
+    /// fail-closed verdict from the whole verification path.
+    fn expect_rejection(
+        fixture: &AuthorityFixture,
+        label: &str,
+        mutate: impl FnOnce(&mut AuthorityRow),
+        expected: WriterAuthorityRejection,
+    ) {
+        let mut row = fixture.row.clone();
+        mutate(&mut row);
+        match verify_row(&row, &fixture.config) {
+            Err(WriterAuthorityError::Rejected(actual)) => {
+                assert_eq!(actual, expected, "{label}: wrong rejection");
+            }
+            Err(other) => panic!("{label}: expected {expected:?}, got {other}"),
+            Ok(_) => panic!("{label}: a tampered authority row minted a witness"),
+        }
+    }
+
+    /// Replace only the canonical head bytes and require a contract-level
+    /// failure: a canonicality verdict is never a rejection verdict.
+    fn expect_contract_error(fixture: &AuthorityFixture, label: &str, canonical_head: Vec<u8>) {
+        let mut row = fixture.row.clone();
+        row.canonical_head = canonical_head;
+        match verify_row(&row, &fixture.config) {
+            Err(WriterAuthorityError::Contract(_)) => {}
+            Err(other) => panic!("{label}: expected a contract error, got {other}"),
+            Ok(_) => panic!("{label}: non-canonical head bytes minted a witness"),
+        }
+    }
+
+    /// Re-encode the head binding after mutating it, leaving every projected
+    /// column untouched.
+    fn head_bytes(
+        fixture: &AuthorityFixture,
+        mutate: impl FnOnce(&mut RegistryHeadBindingV1),
+    ) -> Vec<u8> {
+        let mut binding = fixture.head_binding.clone();
+        mutate(&mut binding);
+        encode_canonical(&binding).expect("canonical head")
+    }
+
     #[test]
     fn compiled_in_packages_are_semantically_closed() {
         let genesis = genesis_package().expect("genesis package closure");
@@ -755,6 +965,234 @@ mod tests {
             decode_cache().lock().expect("cache").len(),
             first,
             "a rejected head must never enter the decode cache"
+        );
+    }
+
+    #[test]
+    fn a_consistent_authority_row_mints_a_witness() {
+        let fixture = authority_fixture(0x51);
+        let witness = verify_row(&fixture.row, &fixture.config).expect("witness");
+        assert_eq!(witness.generation(), 1);
+        assert_eq!(witness.activation_id(), fixture.row.activation_id);
+        assert_eq!(witness.partition_seed(), &[0x51_u8; 32]);
+        assert_eq!(witness.canonical_head(), fixture.row.canonical_head);
+        assert_eq!(
+            witness.package().package_digest(),
+            stage4_package().expect("Stage-4 package").package_digest()
+        );
+    }
+
+    /// REPLAY-01. `verify_epoch` is the only thing binding the durable log
+    /// epoch, partition recipe, seed, and shard count to the verified receipt,
+    /// so every field it compares gets a negative vector. On a live database
+    /// only `partition_seed` is reachable — migration 0014's
+    /// `memory_control_head_epoch_fk` holds `shard_count` and a CHECK holds
+    /// `partition_recipe_version` — so the connected proof attacks that one and
+    /// the remaining seven are established here.
+    #[test]
+    fn epoch_verification_binds_every_field_of_the_receipts_genesis_epoch() {
+        let fixture = authority_fixture(0x52);
+        verify_epoch(&fixture.row, &fixture.bootstrap).expect("the fixture epoch must verify");
+        let mutations: [(&str, RowMutation); 8] = [
+            ("partition_seed", |row| row.partition_seed = vec![0x40; 32]),
+            ("log_epoch_id", |row| {
+                row.log_epoch_id = Sha256Digest::from_bytes(FOREIGN_DIGEST);
+            }),
+            ("bootstrap_epoch_id", |row| {
+                row.bootstrap_epoch_id = Sha256Digest::from_bytes(FOREIGN_DIGEST);
+            }),
+            ("log_shard_count", |row| row.log_shard_count = 8),
+            ("bootstrap_shard_count", |row| row.bootstrap_shard_count = 8),
+            ("partition_recipe_id", |row| {
+                row.partition_recipe_id = "ostk.partition.other".to_owned();
+            }),
+            ("partition_recipe_version", |row| {
+                row.partition_recipe_version = 2;
+            }),
+            ("partition_algorithm", |row| {
+                row.partition_algorithm = "sha256_prefix64_modulo_v2".to_owned();
+            }),
+        ];
+        for (label, mutate) in mutations {
+            expect_rejection(&fixture, label, mutate, WriterAuthorityRejection::LogEpoch);
+        }
+    }
+
+    /// AUTH-04 descent. A root UPDATE cannot reach these columns on a live
+    /// database: `memory_registry_transitions` holds every root column under
+    /// `memory_registry_transition_genesis_head_fk` and
+    /// `memory_registry_transition_genesis_activation_fk` (migration 0012), and
+    /// `memory_registry_current_head_transition_fk` (migration 0014) holds the
+    /// projected columns, so the connected proof asserts that refusal and the
+    /// negative vectors for `verify_descent` live here, over a hand-built row.
+    #[test]
+    fn descent_verification_requires_the_pinned_genesis_root() {
+        let fixture = authority_fixture(0x53);
+        verify_descent(&fixture.row, 1).expect("the fixture descent must verify");
+        let mutations: [(&str, RowMutation); 11] = [
+            ("root_package_digest", |row| {
+                row.root_package_digest = Sha256Digest::from_bytes(FOREIGN_DIGEST);
+            }),
+            ("root_activation_policy_digest", |row| {
+                row.root_activation_policy_digest = Sha256Digest::from_bytes(FOREIGN_DIGEST);
+            }),
+            ("zero root_activation_id", |row| {
+                row.root_activation_id = Sha256Digest::ZERO;
+                row.predecessor_activation_id = Some(Sha256Digest::ZERO);
+            }),
+            ("absent predecessor_generation", |row| {
+                row.predecessor_generation = None;
+            }),
+            ("misordered predecessor_generation", |row| {
+                row.predecessor_generation = Some(1);
+            }),
+            ("absent predecessor_package_digest", |row| {
+                row.predecessor_package_digest = None;
+            }),
+            ("absent predecessor_activation_policy_digest", |row| {
+                row.predecessor_activation_policy_digest = None;
+            }),
+            ("generation-1 predecessor is not the root", |row| {
+                row.predecessor_activation_id = Some(Sha256Digest::from_bytes(FOREIGN_DIGEST));
+            }),
+            ("generation-1 predecessor package is not the root", |row| {
+                row.predecessor_package_digest = Some(Sha256Digest::from_bytes(FOREIGN_DIGEST));
+            }),
+            ("generation-1 predecessor policy is not the root", |row| {
+                row.predecessor_activation_policy_digest =
+                    Some(Sha256Digest::from_bytes(FOREIGN_DIGEST));
+            }),
+            ("ABA: the head is its own predecessor", |row| {
+                row.activation_id = row.root_activation_id;
+            }),
+        ];
+        for (label, mutate) in mutations {
+            expect_rejection(&fixture, label, mutate, WriterAuthorityRejection::Descent);
+        }
+    }
+
+    /// D4. The canonical head must bind the projected columns exactly. Each
+    /// column the binding carries gets a vector, plus the closed-interval case
+    /// the projection has no column to contradict.
+    #[test]
+    fn head_binding_verification_requires_every_projected_column() {
+        let fixture = authority_fixture(0x54);
+        verify_head_binding(&fixture.row, &fixture.head_binding)
+            .expect("the fixture head binding must verify");
+
+        for (label, canonical_head) in [
+            (
+                "activation_id",
+                head_bytes(&fixture, |binding| {
+                    binding.head.activation_id = Sha256Digest::from_bytes(FOREIGN_DIGEST);
+                }),
+            ),
+            (
+                "package_digest",
+                head_bytes(&fixture, |binding| {
+                    binding.head.package_digest = Sha256Digest::from_bytes(FOREIGN_DIGEST);
+                }),
+            ),
+            (
+                "activation_policy_digest",
+                head_bytes(&fixture, |binding| {
+                    binding.head.activation_policy_digest =
+                        Sha256Digest::from_bytes(FOREIGN_DIGEST);
+                }),
+            ),
+            (
+                "effective_from",
+                head_bytes(&fixture, |binding| {
+                    binding.effective_from =
+                        CanonicalTimestamp::parse("2026-08-17T00:00:00.000000000Z")
+                            .expect("canonical time");
+                }),
+            ),
+            (
+                "effective_until",
+                head_bytes(&fixture, |binding| {
+                    binding.effective_until = Some(
+                        CanonicalTimestamp::parse("2026-08-17T00:00:00.000000000Z")
+                            .expect("canonical time"),
+                    );
+                }),
+            ),
+        ] {
+            expect_rejection(
+                &fixture,
+                label,
+                |row| row.canonical_head = canonical_head,
+                WriterAuthorityRejection::HeadBinding,
+            );
+        }
+    }
+
+    /// D4. The stored head must already be in canonical byte form. Whitespace
+    /// is caught by `require_canonical`; a dropped `effective_until` member is
+    /// valid canonical JSON that decodes cleanly and is caught only by the
+    /// re-encode comparison, so both gates are load bearing.
+    #[test]
+    fn canonical_head_bytes_must_already_be_canonical() {
+        let fixture = authority_fixture(0x55);
+        let canonical = fixture.row.canonical_head.clone();
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&canonical).expect("the fixture head is JSON");
+        let pretty = serde_json::to_vec_pretty(&value).expect("pretty printed head");
+        assert_ne!(pretty, canonical);
+        expect_contract_error(&fixture, "pretty printed head", pretty);
+
+        let text = String::from_utf8(canonical).expect("canonical JSON is UTF-8");
+        let trimmed = text.replace("\"effective_until\":null,", "");
+        assert_ne!(
+            trimmed, text,
+            "the canonical head must carry effective_until"
+        );
+        assert!(
+            require_canonical(trimmed.as_bytes()).is_ok(),
+            "the trimmed head must still be canonical JSON, so only the \
+             re-encode comparison can catch it"
+        );
+        assert!(
+            decode_strict::<RegistryHeadBindingV1>(trimmed.as_bytes()).is_ok(),
+            "the trimmed head must still decode, so only the re-encode \
+             comparison can catch it"
+        );
+        expect_contract_error(
+            &fixture,
+            "dropped effective_until member",
+            trimmed.into_bytes(),
+        );
+    }
+
+    /// AUTH-04. The break-glass pin and the head-state and namespace gates are
+    /// asserted live; these two are asserted here as well because they are the
+    /// cheapest to weaken and the hardest to notice.
+    #[test]
+    fn the_break_glass_pin_and_head_state_are_load_bearing() {
+        let fixture = authority_fixture(0x56);
+        let pinned = WriterAuthorityConfig::from_trusted_context(
+            fixture.config.semantic_scope().clone(),
+            fixture.config.bootstrap_receipt_digest(),
+            Some(Sha256Digest::from_bytes(FOREIGN_DIGEST)),
+        );
+        match verify_row(&fixture.row, &pinned) {
+            Err(WriterAuthorityError::Rejected(WriterAuthorityRejection::ExpectedActivationId)) => {
+            }
+            other => panic!("a break-glass mismatch must fail closed, got {other:?}"),
+        }
+
+        expect_rejection(
+            &fixture,
+            "head_state",
+            |row| row.head_state = "retired".to_owned(),
+            WriterAuthorityRejection::HeadNotActive,
+        );
+        expect_rejection(
+            &fixture,
+            "generation 0",
+            |row| row.generation = 0,
+            WriterAuthorityRejection::Generation,
         );
     }
 }
