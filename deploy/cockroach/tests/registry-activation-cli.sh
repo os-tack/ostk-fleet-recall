@@ -3,10 +3,10 @@ set -euo pipefail
 
 # This is the authoritative connected correctness proof. It uses the exact
 # official CockroachDB binary, discovers and runs every named opt-in live test
-# in this authoritative matrix, and exercises the three private CLIs included
-# in this proof (control bootstrap, genesis activation, and conflict
-# reconciliation) on one secure local server. The one server and its result are
-# never Docker parity evidence.
+# in this authoritative matrix, and exercises the four private CLIs included
+# in this proof (control bootstrap, genesis activation, successor activation,
+# and conflict reconciliation) on one secure local server. The one server and
+# its result are never Docker parity evidence.
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../../.." && pwd)
 expected_crdb_build_tag=v26.2.3
@@ -46,6 +46,7 @@ control_password='local-control-member-proof-password'
 activation_password='local-activation-member-proof-password'
 runtime_password='local-runtime-member-proof-password'
 reconciliation_password='local-conflict-reconciliation-member-proof-password'
+successor_password='local-successor-activation-member-proof-password'
 
 server_pid_exists() {
     local pid=$1
@@ -296,6 +297,77 @@ apply_reconciliation_policy() {
     "$crdb" sql --url="$root_url" < "$reconciliation_policy"
 }
 
+apply_successor_policy() {
+    "$crdb" sql --url="$root_url" < "$successor_policy"
+}
+
+apply_successor_policy_in_database() {
+    local database=$1
+    "$crdb" sql --url="$root_default_url" --database="$database" \
+        < "$successor_policy"
+}
+
+# Reapply the successor policy in a session where a failed temporary migration
+# history and every grant target shadow the real public relations. The policy
+# must pin its search path, read public history, and grant only on public
+# objects. The two exact non-grantable temporary-schema PUBLIC grants are the
+# CockroachDB v26.2.3 session baseline, not application authority.
+apply_successor_policy_with_temp_shadows() {
+    {
+        printf '%s\n' '
+SET experimental_enable_temp_tables = on;
+CREATE TEMP TABLE _sqlx_migrations (
+    version INT8 PRIMARY KEY,
+    success BOOL NOT NULL
+);
+INSERT INTO _sqlx_migrations VALUES (1, false);
+CREATE TEMP TABLE memory_control_bootstraps (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_control_events (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_control_log_epochs (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_control_shard_heads (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_registry_activations (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_registry_current_heads_v2 (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_registry_genesis_bridge_consumptions (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_registry_heads (id INT8 PRIMARY KEY);
+CREATE TEMP TABLE memory_registry_transitions (id INT8 PRIMARY KEY);
+'
+        sed -n '1,$p' "$successor_policy"
+        printf '%s\n' '
+SELECT IF(
+    count(*) = 2
+        AND count(DISTINCT privilege_type) = 2
+        AND COALESCE(bool_and(
+            database_name = '\''fleet_recall'\''
+            AND object_type = '\''schema'\''
+            AND object_name IS NULL
+            AND privilege_type IN ('\''CREATE'\'', '\''USAGE'\'')
+            AND NOT is_grantable
+        ), false),
+    1:::INT8,
+    CAST(concat(
+        '\''temporary PUBLIC schema baseline differs from exact CREATE/USAGE: observed='\'',
+        count(*)::STRING
+    ) AS INT8)
+) AS successor_activation_temp_public_baseline_postcondition
+FROM [SHOW GRANTS FOR public]
+WHERE grantee = '\''public'\''
+  AND schema_name LIKE '\''pg_temp_%'\'';
+
+SELECT IF(
+    count(*) = 0,
+    1:::INT8,
+    CAST(concat(
+        '\''temporary repository shadow received successor grants: observed='\'',
+        count(*)::STRING
+    ) AS INT8)
+) AS successor_activation_temp_shadow_postcondition
+FROM [SHOW GRANTS FOR fleet_registry_successor_activation]
+WHERE grantee = '\''fleet_registry_successor_activation'\''
+  AND schema_name LIKE '\''pg_temp_%'\'';
+'
+    } | "$crdb" sql --url="$root_url"
+}
+
 # Reapply the policy in one session whose temporary schema shadows migration
 # history and every repository grant target. The policy must read the real
 # public history, grant only on fully qualified public objects, and admit only
@@ -361,6 +433,96 @@ WHERE grantee = '\''fleet_conflict_reconciliation'\''
     } | "$crdb" sql --url="$root_url"
 }
 
+# The successor policy is intentionally fleet_recall-local. This read-only
+# deployment audit enumerates every other database for direct target grants and
+# ownership. The proof is single-threaded, so its audit/reapply/use interval is
+# the runbook's required role/grant/default/ownership and schema-DDL freeze.
+audit_other_database_successor_authority() {
+    local databases
+    local database
+    local grant_rows
+    local ownership_rows
+    local row
+    if ! databases=$(root_sql_in_database fleet_recall \
+        'SELECT database_name FROM [SHOW DATABASES] ORDER BY database_name' \
+        | tail -n +2); then
+        fail "external successor target audit could not enumerate databases"
+    fi
+    while IFS= read -r database; do
+        test -n "$database" || continue
+        test "$database" != 'fleet_recall' || continue
+        if ! grant_rows=$(root_sql_in_database "$database" "
+            SELECT 'grant:' || object_type || ':' ||
+                   COALESCE(schema_name, '') || ':' ||
+                   COALESCE(object_name, '') || ':' || privilege_type || ':' ||
+                   CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END
+            FROM [SHOW GRANTS FOR fleet_registry_successor_activation]
+            WHERE grantee = 'fleet_registry_successor_activation'
+              AND database_name = pg_catalog.current_database()
+            ORDER BY object_type, schema_name, object_name, privilege_type
+        " | tail -n +2); then
+            fail "external successor target audit could not inspect grants in $database"
+        fi
+        while IFS= read -r row; do
+            test -n "$row" || continue
+            printf '%s:%s\n' "$database" "$row"
+        done <<<"$grant_rows"
+        if ! ownership_rows=$(root_sql_in_database "$database" "
+            SELECT object_kind || ':' || schema_name || ':' || object_name
+            FROM (
+                SELECT 'database_owner' AS object_kind,
+                       '' AS schema_name,
+                       database_object.datname AS object_name
+                FROM pg_catalog.pg_database AS database_object
+                JOIN pg_catalog.pg_roles AS owner_role
+                  ON owner_role.oid = database_object.datdba
+                WHERE database_object.datname = pg_catalog.current_database()
+                  AND owner_role.rolname = 'fleet_registry_successor_activation'
+                UNION ALL
+                SELECT 'schema_owner', schema_object.nspname, ''
+                FROM pg_catalog.pg_namespace AS schema_object
+                JOIN pg_catalog.pg_roles AS owner_role
+                  ON owner_role.oid = schema_object.nspowner
+                WHERE owner_role.rolname = 'fleet_registry_successor_activation'
+                UNION ALL
+                SELECT 'relation_owner', relation_schema.nspname,
+                       relation_object.relname
+                FROM pg_catalog.pg_class AS relation_object
+                JOIN pg_catalog.pg_namespace AS relation_schema
+                  ON relation_schema.oid = relation_object.relnamespace
+                JOIN pg_catalog.pg_roles AS owner_role
+                  ON owner_role.oid = relation_object.relowner
+                WHERE relation_object.relkind IN ('r', 'S', 'v', 'm', 'p')
+                  AND owner_role.rolname = 'fleet_registry_successor_activation'
+                UNION ALL
+                SELECT 'function_owner', function_schema.nspname,
+                       function_object.proname
+                FROM pg_catalog.pg_proc AS function_object
+                JOIN pg_catalog.pg_namespace AS function_schema
+                  ON function_schema.oid = function_object.pronamespace
+                JOIN pg_catalog.pg_roles AS owner_role
+                  ON owner_role.oid = function_object.proowner
+                WHERE owner_role.rolname = 'fleet_registry_successor_activation'
+                UNION ALL
+                SELECT 'type_owner', type_schema.nspname, type_object.typname
+                FROM pg_catalog.pg_type AS type_object
+                JOIN pg_catalog.pg_namespace AS type_schema
+                  ON type_schema.oid = type_object.typnamespace
+                JOIN pg_catalog.pg_roles AS owner_role
+                  ON owner_role.oid = type_object.typowner
+                WHERE owner_role.rolname = 'fleet_registry_successor_activation'
+            ) AS owned_object
+            ORDER BY object_kind, schema_name, object_name
+        " | tail -n +2); then
+            fail "external successor target audit could not inspect ownership in $database"
+        fi
+        while IFS= read -r row; do
+            test -n "$row" || continue
+            printf '%s:%s\n' "$database" "$row"
+        done <<<"$ownership_rows"
+    done <<<"$databases"
+}
+
 # The reconciliation policy is intentionally fleet_recall-local. This read-only
 # deployment audit enumerates every other database for direct target grants and
 # ownership. It is called only after the first policy apply has created the
@@ -387,7 +549,7 @@ audit_other_database_target_authority() {
                    CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END
             FROM [SHOW GRANTS FOR fleet_conflict_reconciliation]
             WHERE grantee = 'fleet_conflict_reconciliation'
-              AND database_name = current_database()
+              AND database_name = pg_catalog.current_database()
             ORDER BY object_type, schema_name, object_name, privilege_type
         " | tail -n +2); then
             fail "external target audit could not inspect grants in $database"
@@ -405,7 +567,7 @@ audit_other_database_target_authority() {
                 FROM pg_catalog.pg_database AS database_object
                 JOIN pg_catalog.pg_roles AS owner_role
                   ON owner_role.oid = database_object.datdba
-                WHERE database_object.datname = current_database()
+                WHERE database_object.datname = pg_catalog.current_database()
                   AND owner_role.rolname = 'fleet_conflict_reconciliation'
                 UNION ALL
                 SELECT 'schema_owner', schema_object.nspname, ''
@@ -475,7 +637,7 @@ inventory_other_database_public_application_authority() {
                    CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END
             FROM [SHOW GRANTS FOR public]
             WHERE grantee = 'public'
-              AND database_name = current_database()
+              AND database_name = pg_catalog.current_database()
               AND NOT (
                   (object_type = 'database'
                       AND privilege_type IN ('CONNECT', 'TEMPORARY')
@@ -505,7 +667,7 @@ inventory_other_database_public_application_authority() {
                       )
                   )
                   OR (
-                      current_database() = 'system'
+                      pg_catalog.current_database() = 'system'
                       AND NOT is_grantable
                       AND (
                           (object_type = 'schema'
@@ -530,8 +692,100 @@ inventory_other_database_public_application_authority() {
     done <<<"$databases"
 }
 
-# The policy is safe in a reused administrator session only if it pins built-in
-# resolution first, binds itself to fleet_recall, fully qualifies every
+# Both one-shot policies are safe in a reused administrator session only if
+# they pin built-in resolution first, bind themselves to fleet_recall, fully
+# qualify every application relation, and clear the complete v26.2 role-option
+# surface. Keep these static gates in the official wrapper so its connected
+# result cannot be credited to a weakened policy file.
+successor_policy="$repo_root/deploy/cockroach/successor-activation-role-grants.sql"
+successor_policy_first_statement=$(awk '
+    /^[[:space:]]*--/ || /^[[:space:]]*$/ { next }
+    { print; exit }
+' "$successor_policy")
+assert_exact "successor policy first statement" \
+    "$successor_policy_first_statement" \
+    'SET search_path = pg_catalog, public, pg_temp;'
+
+successor_current_database_preflight=$(grep -F \
+    "IF pg_catalog.current_database() <> 'fleet_recall' THEN" \
+    "$successor_policy")
+assert_exact "successor fleet_recall current-database preflight" \
+    "$successor_current_database_preflight" \
+    "    IF pg_catalog.current_database() <> 'fleet_recall' THEN"
+
+unqualified_successor_policy_references=$(sed -E 's/--.*$//' \
+    "$successor_policy" \
+    | grep -En \
+        '(FROM|ON TABLE)[[:space:]]+(_sqlx_migrations|memory_(control|registry)_[a-z0-9_]+)([^[:alnum:]_]|$)' \
+        || true)
+assert_exact "unqualified successor policy application references" \
+    "$unqualified_successor_policy_references" ''
+
+qualified_successor_policy_references=$(sed -E 's/--.*$//' \
+    "$successor_policy" \
+    | grep -Eo \
+        'public\.(_sqlx_migrations|memory_(control_(bootstraps|events|log_epochs|shard_heads)|registry_(activations|current_heads_v2|genesis_bridge_consumptions|heads|transitions)))' \
+    | sort \
+    | uniq -c \
+    | awk '{ print $1 ":" $2 }')
+expected_qualified_successor_policy_references='2:public._sqlx_migrations
+1:public.memory_control_bootstraps
+1:public.memory_control_events
+1:public.memory_control_log_epochs
+1:public.memory_control_shard_heads
+1:public.memory_registry_activations
+2:public.memory_registry_current_heads_v2
+2:public.memory_registry_genesis_bridge_consumptions
+1:public.memory_registry_heads
+2:public.memory_registry_transitions'
+assert_exact "fully qualified successor policy application references" \
+    "$qualified_successor_policy_references" \
+    "$expected_qualified_successor_policy_references"
+
+successor_role_option_hardening=$(sed -n \
+    '/^ALTER ROLE fleet_registry_successor_activation WITH$/,/^    NOVIEWCLUSTERSETTING;$/p' \
+    "$successor_policy")
+expected_successor_role_option_hardening='ALTER ROLE fleet_registry_successor_activation WITH
+    NOBYPASSRLS
+    NOCANCELQUERY
+    NOCONTROLCHANGEFEED
+    NOCONTROLJOB
+    NOCREATEDB
+    NOCREATELOGIN
+    NOCREATEROLE
+    NOLOGIN
+    NOMODIFYCLUSTERSETTING
+    NOREPLICATION
+    SQLLOGIN
+    NOVIEWACTIVITY
+    NOVIEWACTIVITYREDACTED
+    NOVIEWCLUSTERSETTING;'
+assert_exact "complete successor v26.2 direct role-option hardening" \
+    "$successor_role_option_hardening" \
+    "$expected_successor_role_option_hardening"
+
+forbidden_successor_policy_grants=$(sed -E 's/--.*$//' \
+    "$successor_policy" \
+    | grep -Ein \
+        'GRANT[[:space:]]+.*(DELETE|CREATE|DROP|MAINTAIN)|GRANT[[:space:]]+.*ON[[:space:]]+SEQUENCE|GRANT[[:space:]]+SYSTEM' \
+        || true)
+assert_exact "forbidden successor policy grants" \
+    "$forbidden_successor_policy_grants" ''
+
+unsupported_successor_query_in_function_body=$(awk '
+    /^DO \$\$/ { in_function_body = 1 }
+    in_function_body && ($0 ~ /\[SHOW[[:space:]]/ ||
+        $0 ~ /^[[:space:]]*SHOW[[:space:]]/ ||
+        $0 ~ /crdb_internal\./ || $0 ~ /information_schema\./) {
+        print NR ":" $0
+    }
+    in_function_body && /^\$\$;$/ { in_function_body = 0 }
+' "$successor_policy")
+assert_exact "SHOW/virtual-table-free successor policy function bodies" \
+    "$unsupported_successor_query_in_function_body" ''
+
+# The reconciliation policy has the same safe-session requirements: it pins
+# built-in resolution first, binds itself to fleet_recall, fully qualifies every
 # repository relation, and clears the complete v26.2 role-option surface. Keep
 # these static gates in the official wrapper so its connected result cannot be
 # credited to a weakened policy file.
@@ -610,6 +864,33 @@ unsupported_query_in_function_body=$(awk '
 ' "$reconciliation_policy")
 assert_exact "SHOW/virtual-table-free reconciliation policy function bodies" \
     "$unsupported_query_in_function_body" ''
+
+# Helpers whose output is evidence must finish in a standalone assignment.
+# Passing a substitution directly to assert_exact can mask a failed helper when
+# its expected value is empty, so freeze that source-level fail-closed seam.
+masked_evidence_helper_assertions=$(grep -En \
+    '^[[:space:]]*"[$][(](audit_other_database_successor_authority|inventory_other_database_public_application_authority|reconciliation_table_fingerprints|successor_table_fingerprints|legacy_registry_fingerprints)[)]"' \
+    "$script_dir/registry-activation-cli.sh" || true)
+assert_exact "standalone evidence helper assignments" \
+    "$masked_evidence_helper_assertions" ''
+
+external_authority_helper_source=$(awk '
+    /^(audit_other_database_successor_authority|audit_other_database_target_authority|inventory_other_database_public_application_authority)\(\) \{/ {
+        capture = 1
+    }
+    capture { print }
+    capture && /^}$/ { capture = 0 }
+' "$script_dir/registry-activation-cli.sh")
+unqualified_external_audit_current_database=$(grep -En \
+    '(^|[^[:alnum:]_.])current_database[(][)]' \
+    <<<"$external_authority_helper_source" || true)
+assert_exact "qualified external-audit current_database calls" \
+    "$unqualified_external_audit_current_database" ''
+qualified_external_audit_current_database_count=$(grep -Eo \
+    'pg_catalog[.]current_database[(][)]' \
+    <<<"$external_authority_helper_source" | wc -l | tr -d ' ')
+assert_exact "complete external-audit current_database qualification" \
+    "$qualified_external_audit_current_database_count" '6'
 
 mkdir -p "$artifact_dir"
 "$crdb" cert create-ca --certs-dir="$cert_dir" \
@@ -845,13 +1126,14 @@ assert_root_scalar "restored successful migration prefix 1 through 17" '
     CREATE USER proof_control_cli WITH PASSWORD '$control_password';
     CREATE USER proof_activation_cli WITH PASSWORD '$activation_password';
     CREATE USER proof_runtime_cli WITH PASSWORD '$runtime_password';
+    CREATE USER proof_successor WITH PASSWORD '$successor_password';
     CREATE USER proof_reconciliation_cli WITH PASSWORD '$reconciliation_password';
 " >/dev/null
 
 # CockroachDB v26.2 seeds database-level PUBLIC EXECUTE defaults for routines
 # under every role, and role-specific cleanup requires membership in the
-# grantor. Root and admin are cleaned directly; temporarily inherit the seven
-# custom grantors while removing all nine named-grantor rows, then attempt the
+# grantor. Root and admin are cleaned directly; temporarily inherit the eight
+# custom grantors while removing all ten named-grantor rows, then attempt the
 # ALL-ROLES revoke whose exact intrinsic row v26.2.3 synthesizes back. Revoke and
 # audit those edges before the reconciliation policy creates its target role.
 # Its one creator-scoped PUBLIC row is harmless because the target cannot CREATE
@@ -864,6 +1146,7 @@ assert_root_scalar "restored successful migration prefix 1 through 17" '
         proof_control_cli,
         proof_activation_cli,
         proof_runtime_cli,
+        proof_successor,
         proof_reconciliation_cli
     TO root;
     ALTER DEFAULT PRIVILEGES FOR ROLE
@@ -875,6 +1158,7 @@ assert_root_scalar "restored successful migration prefix 1 through 17" '
         proof_control_cli,
         proof_activation_cli,
         proof_runtime_cli,
+        proof_successor,
         proof_reconciliation_cli
         REVOKE EXECUTE ON ROUTINES FROM public;
     ALTER DEFAULT PRIVILEGES FOR ALL ROLES
@@ -886,6 +1170,7 @@ assert_root_scalar "restored successful migration prefix 1 through 17" '
         proof_control_cli,
         proof_activation_cli,
         proof_runtime_cli,
+        proof_successor,
         proof_reconciliation_cli
     FROM root;
 ' >/dev/null
@@ -900,12 +1185,34 @@ assert_root_scalar "removed temporary default-privilege cleanup role edges" \
            'proof_control_cli',
            'proof_activation_cli',
            'proof_runtime_cli',
+           'proof_successor',
            'proof_reconciliation_cli'
        )" '0'
-assert_public_routine_defaults "before conflict reconciliation policy" \
+assert_public_routine_defaults "before one-shot policies" \
     'role=ALL,true,routines,public,EXECUTE,false'
 
-# The target must be absent during bootstrap. Before the first apply, inventory
+# Neither one-shot target exists during bootstrap. Prove that the successor
+# policy's first persistent gate rejects the wrong database before it can create
+# its role or mutate an object grant. Then inventory inherited PUBLIC authority
+# in every other database and explicitly remove the two stock application-
+# schema CREATE rows before either successful policy application.
+assert_root_scalar "successor external-audit bootstrap target absence" \
+    "SELECT count(*)::STRING FROM [SHOW USERS]
+     WHERE username = 'fleet_registry_successor_activation'" '0'
+if wrong_database_successor_policy=$(
+    apply_successor_policy_in_database defaultdb 2>&1
+); then
+    fail "wrong database unexpectedly admitted the successor policy"
+fi
+grep -Fq 'successor activation policy must run in fleet_recall' \
+    <<<"$wrong_database_successor_policy" \
+    || fail "wrong-database successor policy did not retain its closed error"
+assert_root_scalar "wrong-database successor target creation" \
+    "SELECT count(*)::STRING FROM [SHOW USERS]
+     WHERE username = 'fleet_registry_successor_activation'" '0'
+
+# The reconciliation target must also be absent during bootstrap. Before the
+# first apply, inventory
 # inherited PUBLIC authority in every other database and explicitly remove the
 # two stock application-schema CREATE rows. Ordinary CONNECT, TEMPORARY,
 # public-schema USAGE, and the engine's system/virtual fallbacks remain truthful
@@ -930,6 +1237,298 @@ hardened_initial_outside_public_application_authority=$(
 )
 assert_exact "hardened initial external PUBLIC application inventory" \
     "$hardened_initial_outside_public_application_authority" ''
+
+# Create and normalize the successor role only after the complete external
+# PUBLIC inventory is clean. Reapply for idempotence, then prove a failed
+# temporary migration table and temporary namesakes cannot redirect its prefix
+# gate or any grant away from fleet_recall.public.
+apply_successor_policy >/dev/null
+apply_successor_policy >/dev/null
+assert_root_scalar "clean successor target creation" \
+    "SELECT count(*)::STRING FROM [SHOW USERS]
+     WHERE username = 'fleet_registry_successor_activation'
+       AND options::STRING = '{NOLOGIN}'" '1'
+assert_root_scalar "initial successor target remains memberless" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name = 'fleet_registry_successor_activation'
+        OR member = 'fleet_registry_successor_activation'" '0'
+post_create_outside_successor_target_authority=$(
+    audit_other_database_successor_authority
+)
+assert_exact "post-create external successor target-authority audit" \
+    "$post_create_outside_successor_target_authority" ''
+apply_successor_policy_with_temp_shadows >/dev/null
+assert_root_scalar "successor temp-shadow public migration-history grant" \
+    "SELECT count(*)::STRING
+     FROM [SHOW GRANTS ON TABLE public._sqlx_migrations]
+     WHERE grantee = 'fleet_registry_successor_activation'
+       AND privilege_type = 'SELECT'
+       AND NOT is_grantable" '1'
+
+# Prove the successor external audit detects direct grants and ownership while
+# the independent PUBLIC inventory exposes inherited application authority.
+# Both helpers are read-only: the adversarial rows survive until the operator
+# explicitly cleans them, after which a normal policy reapply succeeds.
+"$crdb" sql --url="$root_url" \
+    --execute='CREATE DATABASE proof_successor_other_database' >/dev/null
+root_sql_in_database proof_successor_other_database '
+CREATE TABLE proof_successor_other_ledger (id INT8 PRIMARY KEY);
+CREATE TABLE proof_successor_other_owned (id INT8 PRIMARY KEY);
+GRANT SELECT ON TABLE proof_successor_other_ledger
+    TO fleet_registry_successor_activation, public;
+GRANT CREATE ON SCHEMA public TO fleet_registry_successor_activation;
+ALTER TABLE proof_successor_other_owned
+    OWNER TO fleet_registry_successor_activation;
+REVOKE CREATE ON SCHEMA public FROM fleet_registry_successor_activation;
+' >/dev/null
+outside_successor_target_authority=$(audit_other_database_successor_authority)
+assert_exact "external successor target-authority audit" \
+    "$outside_successor_target_authority" \
+    'proof_successor_other_database:grant:table:public:proof_successor_other_ledger:SELECT:not_grantable
+proof_successor_other_database:grant:table:public:proof_successor_other_owned:ALL:grantable
+proof_successor_other_database:relation_owner:public:proof_successor_other_owned
+proof_successor_other_database:type_owner:public:proof_successor_other_owned'
+outside_successor_public_authority=$(
+    inventory_other_database_public_application_authority
+)
+assert_exact "external successor PUBLIC application-authority inventory" \
+    "$outside_successor_public_authority" \
+    'proof_successor_other_database:schema:public::CREATE:not_grantable
+proof_successor_other_database:table:public:proof_successor_other_ledger:SELECT:not_grantable'
+successor_external_grants_after_audit=$(
+    root_sql_in_database proof_successor_other_database "
+        SELECT grantee || ':' || privilege_type
+        FROM [SHOW GRANTS ON TABLE proof_successor_other_ledger]
+        WHERE grantee IN ('fleet_registry_successor_activation', 'public')
+          AND privilege_type = 'SELECT'
+        ORDER BY grantee" | tail -n +2
+)
+assert_exact "read-only successor external grant audit preservation" \
+    "$successor_external_grants_after_audit" \
+    'fleet_registry_successor_activation:SELECT
+public:SELECT'
+root_sql_in_database proof_successor_other_database '
+ALTER TABLE proof_successor_other_owned OWNER TO root;
+REVOKE SELECT ON TABLE proof_successor_other_ledger
+    FROM fleet_registry_successor_activation, public;
+REVOKE CREATE ON SCHEMA public FROM public;
+' >/dev/null
+clean_outside_successor_target_authority=$(
+    audit_other_database_successor_authority
+)
+assert_exact "clean external successor target precondition" \
+    "$clean_outside_successor_target_authority" ''
+clean_outside_successor_public_authority=$(
+    inventory_other_database_public_application_authority
+)
+assert_exact "clean external successor PUBLIC precondition" \
+    "$clean_outside_successor_public_authority" ''
+apply_successor_policy >/dev/null
+
+# Freeze the complete successor current-object surface before any membership:
+# sixteen non-grantable table rows, zero sequences, sole database CONNECT, sole
+# public-schema USAGE, no PUBLIC application object or system authority, and no
+# lingering grant on the three successor tables for any older application role.
+successor_object_grants=$(root_scalar "
+    SELECT schema_name || ':' || object_type || ':' || object_name || ':' ||
+           privilege_type || ':' ||
+           CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END
+    FROM [SHOW GRANTS FOR fleet_registry_successor_activation]
+    WHERE grantee = 'fleet_registry_successor_activation'
+      AND database_name = 'fleet_recall'
+      AND object_type IN ('table', 'sequence')
+    ORDER BY schema_name, object_type, object_name, privilege_type")
+expected_successor_object_grants='public:table:_sqlx_migrations:SELECT:not_grantable
+public:table:memory_control_bootstraps:SELECT:not_grantable
+public:table:memory_control_events:INSERT:not_grantable
+public:table:memory_control_events:SELECT:not_grantable
+public:table:memory_control_log_epochs:SELECT:not_grantable
+public:table:memory_control_shard_heads:SELECT:not_grantable
+public:table:memory_control_shard_heads:UPDATE:not_grantable
+public:table:memory_registry_activations:SELECT:not_grantable
+public:table:memory_registry_current_heads_v2:INSERT:not_grantable
+public:table:memory_registry_current_heads_v2:SELECT:not_grantable
+public:table:memory_registry_current_heads_v2:UPDATE:not_grantable
+public:table:memory_registry_genesis_bridge_consumptions:INSERT:not_grantable
+public:table:memory_registry_genesis_bridge_consumptions:SELECT:not_grantable
+public:table:memory_registry_heads:SELECT:not_grantable
+public:table:memory_registry_transitions:INSERT:not_grantable
+public:table:memory_registry_transitions:SELECT:not_grantable'
+assert_exact "successor full table/sequence grants" \
+    "$successor_object_grants" "$expected_successor_object_grants"
+assert_root_scalar "successor zero sequence grants" \
+    "SELECT count(*)::STRING
+     FROM [SHOW GRANTS FOR fleet_registry_successor_activation]
+     WHERE grantee = 'fleet_registry_successor_activation'
+       AND object_type = 'sequence'" '0'
+assert_root_scalar "successor database grants" \
+    "SELECT database_name || ':' || grantee || ':' || privilege_type || ':' ||
+            CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END
+     FROM [SHOW GRANTS ON DATABASE fleet_recall]
+     WHERE grantee IN ('public', 'fleet_registry_successor_activation')
+     ORDER BY grantee, privilege_type" \
+    'fleet_recall:fleet_registry_successor_activation:CONNECT:not_grantable'
+assert_root_scalar "successor schema grants" \
+    "SELECT schema_name || ':' || grantee || ':' || privilege_type || ':' ||
+            CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END
+     FROM [SHOW GRANTS ON SCHEMA public]
+     WHERE grantee IN ('public', 'fleet_registry_successor_activation')
+     ORDER BY grantee, privilege_type" \
+    'public:fleet_registry_successor_activation:USAGE:not_grantable'
+assert_root_scalar "successor PUBLIC application table/sequence grants" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS FOR public]
+     WHERE grantee = 'public'
+       AND database_name = 'fleet_recall'
+       AND schema_name = 'public'
+       AND object_type IN ('table', 'sequence')" '0'
+assert_root_scalar "prior roles denied successor authority tables" \
+    "SELECT count(*)::STRING
+     FROM [SHOW GRANTS FOR
+         fleet_runtime, fleet_control_bootstrap, fleet_registry_activation]
+     WHERE grantee IN (
+         'fleet_runtime', 'fleet_control_bootstrap', 'fleet_registry_activation'
+     )
+       AND database_name = 'fleet_recall'
+       AND schema_name = 'public'
+       AND object_name IN (
+           'memory_registry_transitions',
+           'memory_registry_genesis_bridge_consumptions',
+           'memory_registry_current_heads_v2'
+       )" '0'
+assert_root_scalar "successor role and inherited PUBLIC system grants" \
+    "SELECT count(*)::STRING FROM [SHOW SYSTEM GRANTS]
+     WHERE grantee IN ('fleet_registry_successor_activation', 'public')" '0'
+assert_root_scalar "successor and prior logical role options" \
+    "SELECT username || ':' || options::STRING
+     FROM [SHOW USERS]
+     WHERE username IN (
+         'fleet_runtime',
+         'fleet_control_bootstrap',
+         'fleet_registry_activation',
+         'fleet_registry_successor_activation'
+     )
+     ORDER BY username" \
+    'fleet_control_bootstrap:{NOLOGIN}
+fleet_registry_activation:{NOLOGIN}
+fleet_registry_successor_activation:{NOLOGIN}
+fleet_runtime:{NOLOGIN}'
+assert_root_scalar "local successor ownership" \
+    "SELECT count(*)::STRING
+     FROM (
+         SELECT 1
+         FROM pg_catalog.pg_database AS database_object
+         JOIN pg_catalog.pg_roles AS owner_role
+           ON owner_role.oid = database_object.datdba
+         WHERE database_object.datname = 'fleet_recall'
+           AND owner_role.rolname = 'fleet_registry_successor_activation'
+         UNION ALL
+         SELECT 1 FROM pg_catalog.pg_namespace AS object
+         JOIN pg_catalog.pg_roles AS owner_role ON owner_role.oid = object.nspowner
+         WHERE owner_role.rolname = 'fleet_registry_successor_activation'
+         UNION ALL
+         SELECT 1 FROM pg_catalog.pg_class AS object
+         JOIN pg_catalog.pg_roles AS owner_role ON owner_role.oid = object.relowner
+         WHERE object.relkind IN ('r', 'S', 'v', 'm', 'p')
+           AND owner_role.rolname = 'fleet_registry_successor_activation'
+         UNION ALL
+         SELECT 1 FROM pg_catalog.pg_proc AS object
+         JOIN pg_catalog.pg_roles AS owner_role ON owner_role.oid = object.proowner
+         WHERE owner_role.rolname = 'fleet_registry_successor_activation'
+         UNION ALL
+         SELECT 1 FROM pg_catalog.pg_type AS object
+         JOIN pg_catalog.pg_roles AS owner_role ON owner_role.oid = object.typowner
+         WHERE owner_role.rolname = 'fleet_registry_successor_activation'
+     ) AS owned_object" '0'
+
+# A target role created by v26.2.3 receives one creator-scoped non-grantable
+# PUBLIC routine default. Audit its exact shape, then remove it explicitly so
+# the later reconciliation policy sees its own documented clean baseline.
+assert_root_scalar "successor creator-scoped PUBLIC routine default" \
+    "SELECT role || ':' || object_type || ':' || grantee || ':' ||
+            privilege_type || ':' ||
+            CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END
+     FROM (
+         SELECT role, for_all_roles, object_type, grantee, privilege_type,
+                is_grantable
+         FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public]
+         UNION
+         SELECT role, for_all_roles, object_type, grantee, privilege_type,
+                is_grantable
+         FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public IN SCHEMA public]
+     ) AS public_default
+     WHERE role = 'fleet_registry_successor_activation'
+       AND NOT for_all_roles
+       AND object_type = 'routines'
+       AND grantee = 'public'
+       AND privilege_type = 'EXECUTE'
+       AND NOT is_grantable" \
+    'fleet_registry_successor_activation:routines:public:EXECUTE:not_grantable'
+assert_root_scalar "non-intrinsic successor/PUBLIC future-object defaults" \
+    "SELECT COALESCE(role, 'ALL') || ':' || object_type || ':' || grantee || ':' ||
+            privilege_type || ':' ||
+            CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END
+     FROM (
+         SELECT role, for_all_roles, object_type, grantee, privilege_type,
+                is_grantable
+         FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public]
+         UNION
+         SELECT role, for_all_roles, object_type, grantee, privilege_type,
+                is_grantable
+         FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public IN SCHEMA public]
+         UNION
+         SELECT role, for_all_roles, object_type, grantee, privilege_type,
+                is_grantable
+         FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE fleet_registry_successor_activation]
+         UNION
+         SELECT role, for_all_roles, object_type, grantee, privilege_type,
+                is_grantable
+         FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE fleet_registry_successor_activation
+               IN SCHEMA public]
+     ) AS default_privilege
+     WHERE object_type IN ('schemas', 'routines', 'tables', 'sequences', 'types')
+       AND grantee IN ('public', 'fleet_registry_successor_activation')
+       AND NOT (
+           role = 'fleet_registry_successor_activation'
+           AND NOT for_all_roles
+           AND grantee = 'fleet_registry_successor_activation'
+           AND privilege_type = 'ALL'
+           AND is_grantable
+       )
+       AND NOT (
+           grantee = 'public'
+           AND object_type = 'types'
+           AND privilege_type = 'USAGE'
+           AND NOT is_grantable
+       )
+       AND NOT (
+           role IS NULL
+           AND for_all_roles
+           AND grantee = 'public'
+           AND object_type = 'routines'
+           AND privilege_type = 'EXECUTE'
+           AND NOT is_grantable
+       )
+       AND NOT (
+           role = 'fleet_registry_successor_activation'
+           AND NOT for_all_roles
+           AND grantee = 'public'
+           AND object_type = 'routines'
+           AND privilege_type = 'EXECUTE'
+           AND NOT is_grantable
+       )
+     ORDER BY role, object_type, grantee, privilege_type" ''
+"$crdb" sql --url="$root_url" --execute='
+    GRANT fleet_registry_successor_activation TO root;
+    ALTER DEFAULT PRIVILEGES FOR ROLE fleet_registry_successor_activation
+        REVOKE EXECUTE ON ROUTINES FROM public;
+    REVOKE fleet_registry_successor_activation FROM root;
+' >/dev/null
+assert_root_scalar "successor default-cleanup membership removal" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name = 'fleet_registry_successor_activation'
+        OR member = 'fleet_registry_successor_activation'" '0'
+assert_public_routine_defaults "before conflict reconciliation policy" \
+    'role=ALL,true,routines,public,EXECUTE,false'
 
 apply_reconciliation_policy >/dev/null
 assert_root_scalar "clean first-apply target creation" \
@@ -1033,7 +1632,7 @@ assert_exact "final external PUBLIC application inventory" \
 apply_reconciliation_policy >/dev/null
 
 assert_root_scalar "conflict policy current database" \
-    'SELECT current_database()' 'fleet_recall'
+    'SELECT pg_catalog.current_database()' 'fleet_recall'
 assert_public_routine_defaults "after conflict reconciliation policy" \
     'role=ALL,true,routines,public,EXECUTE,false|role=fleet_conflict_reconciliation,false,routines,public,EXECUTE,false'
 assert_root_scalar "non-intrinsic reconciliation/PUBLIC future-object defaults" \
@@ -1229,12 +1828,51 @@ ca_path="$cert_dir/ca.crt"
 control_url="postgresql://proof_control_cli:${control_password}@${host_port}/fleet_recall?sslmode=verify-full&sslrootcert=${ca_path}"
 activation_url="postgresql://proof_activation_cli:${activation_password}@${host_port}/fleet_recall?sslmode=verify-full&sslrootcert=${ca_path}"
 runtime_url="postgresql://proof_runtime_cli:${runtime_password}@${host_port}/fleet_recall?sslmode=verify-full&sslrootcert=${ca_path}"
+successor_url="postgresql://proof_successor:${successor_password}@${host_port}/fleet_recall?sslmode=verify-full&sslrootcert=${ca_path}"
 reconciliation_url="postgresql://proof_reconciliation_cli:${reconciliation_password}@${host_port}/fleet_recall?sslmode=verify-full&sslrootcert=${ca_path}"
 
 cargo build --locked \
     --bin ostk-control-bootstrap \
     --bin ostk-registry-activate \
+    --bin ostk-registry-successor-activate \
     --bin ostk-conflict-reconcile >/dev/null
+successor_binary="$repo_root/target/debug/ostk-registry-successor-activate"
+test -x "$successor_binary" \
+    || fail "locked build did not produce the successor activation CLI"
+successor_emitter_test_name='tests::emit_dynamic_successor_fixture_for_connected_proof'
+successor_emitter_listing=$(cargo test --locked \
+    --bin ostk-registry-successor-activate -- --list)
+successor_emitter_discovery=$(grep -Fx \
+    "$successor_emitter_test_name: test" \
+    <<<"$successor_emitter_listing" || true)
+assert_exact "exact successor fixture emitter test discovery" \
+    "$successor_emitter_discovery" "$successor_emitter_test_name: test"
+successor_emitter_build=$(cargo test --locked \
+    --bin ostk-registry-successor-activate --no-run --message-format=json)
+successor_emitter_test_binary=$(jq -rsc \
+    --arg target_name 'ostk-registry-successor-activate' '
+    [
+        .[]
+        | select(
+            .reason == "compiler-artifact"
+            and .target.name == $target_name
+            and .target.kind == ["bin"]
+            and .profile.test == true
+            and (.executable | type) == "string"
+        )
+        | .executable
+    ]
+    | if length == 1 then .[0] else empty end
+' <<<"$successor_emitter_build")
+test -n "$successor_emitter_test_binary" \
+    || fail "locked successor emitter build did not expose exactly one test executable"
+successor_emitter_test_binary_dir=$(CDPATH='' cd -- \
+    "$(dirname -- "$successor_emitter_test_binary")" && pwd)
+successor_emitter_test_binary="$successor_emitter_test_binary_dir/$(
+    basename -- "$successor_emitter_test_binary"
+)"
+test -x "$successor_emitter_test_binary" \
+    || fail "locked successor emitter test executable is unavailable"
 reconciliation_binary="$repo_root/target/debug/ostk-conflict-reconcile"
 test -x "$reconciliation_binary" \
     || fail "locked build did not produce the conflict reconciliation CLI"
@@ -1244,6 +1882,12 @@ genesis_package="$repo_root/contracts/dynamic-memory/v1/genesis-registry-package
 registry_test_result="$repo_root/contracts/dynamic-memory/v1/genesis-activation/registry-test-result.jsonl"
 frozen_statement="$repo_root/contracts/dynamic-memory/v1/genesis-activation/activation-statement.jsonl"
 frozen_approvals="$repo_root/contracts/dynamic-memory/v1/genesis-activation/activation-approval-set.jsonl"
+successor_genesis_test_result="$registry_test_result"
+successor_target_package="$repo_root/contracts/dynamic-memory/v2/stage4-successor/registry-package.jsonl"
+successor_target_test_result="$repo_root/contracts/dynamic-memory/v2/successor-activation/registry-test-result.jsonl"
+successor_bridge="$repo_root/contracts/dynamic-memory/v2/successor-policy/genesis-successor-key-bridge-v1.jsonl"
+successor_statement="$repo_root/contracts/dynamic-memory/v2/successor-activation/activation-statement.jsonl"
+successor_approvals="$repo_root/contracts/dynamic-memory/v2/successor-activation/activation-approval-set.jsonl"
 statement_path="$frozen_statement"
 approval_path="$frozen_approvals"
 tenant_id='0198a849-f6ae-7d61-9800-000000000001'
@@ -1254,6 +1898,12 @@ runner_artifact_digest='c2e5b0653471d35e54600a8d3fbe5613aff4c04e911787c09a25e2b3
 runner_configuration_digest='1d12aabe349fd0013389f93bf1917b0de6bbd5d2bd7156c85faff0b97360686d'
 package_digest='5a931fd5551bec47f83adb019f3e794d1b6a759f4501e7ea26a83076d9518177'
 policy_digest='6f92f99ff35969845f08f9b64cee7d86fa42dc6165ebc617d950be8960b86968'
+successor_target_test_result_digest='e6783b2a018957a5861fe4e0670f55613d1ace35e381a6a9f5190ea9d7fbff8d'
+successor_target_runner_artifact_digest='a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1'
+successor_target_runner_configuration_digest='a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2'
+successor_bridge_digest='e15309eba5118e21996a7cee6b3780c1a237982bdf4f22460bca4da189ef6592'
+successor_target_package_digest='16f98d5df93b74dab5b2188274cbd1da21d089ff7a64cd8fc29679946e7fe2c9'
+successor_target_policy_digest='5611a4fea75d0a8132395bf6e3040ce97638a3447e290f5cabc183c1bb9faa6c'
 reconciliation_tenant_id='0198a849-f6ae-7d61-9800-0000000000c1'
 reconciliation_project='private-conflict-reconciliation-cli-proof'
 reconciliation_claim_key='fleet-store::official-tls-reconciliation-open'
@@ -1301,6 +1951,42 @@ run_activation() {
         --activation-approval-set "$approvals"
 }
 
+run_successor() {
+    local operation=$1
+    local database_url=${PROOF_SUCCESSOR_DATABASE_URL:-$successor_url}
+    local bridge=${PROOF_SUCCESSOR_BRIDGE:-$successor_bridge}
+    local bridge_digest=${PROOF_SUCCESSOR_BRIDGE_DIGEST:-$successor_bridge_digest}
+    local statement=${PROOF_SUCCESSOR_STATEMENT:-$successor_statement}
+    local approvals=${PROOF_SUCCESSOR_APPROVAL_SET:-$successor_approvals}
+    env -i \
+        FLEET_RECALL_SUCCESSOR_DATABASE_URL="$database_url" \
+        FLEET_RECALL_SUCCESSOR_TENANT_ID="$tenant_id" \
+        FLEET_RECALL_SUCCESSOR_PROJECT="$physical_project" \
+        FLEET_RECALL_SUCCESSOR_TENANT_NAMESPACE='tenant.fixture' \
+        FLEET_RECALL_SUCCESSOR_PROJECT_NAMESPACE='project.fixture' \
+        FLEET_RECALL_SUCCESSOR_BOOTSTRAP_RECEIPT_DIGEST="$receipt_digest" \
+        FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RESULT_DIGEST="$test_result_digest" \
+        FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RUNNER_ARTIFACT_DIGEST="$runner_artifact_digest" \
+        FLEET_RECALL_SUCCESSOR_GENESIS_TEST_RUNNER_CONFIGURATION_DIGEST="$runner_configuration_digest" \
+        FLEET_RECALL_SUCCESSOR_TARGET_TEST_RESULT_DIGEST="$successor_target_test_result_digest" \
+        FLEET_RECALL_SUCCESSOR_TARGET_TEST_RUNNER_ARTIFACT_DIGEST="$successor_target_runner_artifact_digest" \
+        FLEET_RECALL_SUCCESSOR_TARGET_TEST_RUNNER_CONFIGURATION_DIGEST="$successor_target_runner_configuration_digest" \
+        FLEET_RECALL_SUCCESSOR_GENESIS_KEY_BRIDGE_DIGEST="$bridge_digest" \
+        FLEET_RECALL_SUCCESSOR_GENESIS_PROPOSER_PRINCIPAL_ID='principal.operator' \
+        FLEET_RECALL_SUCCESSOR_GENESIS_PACKAGE_AUTHOR_PRINCIPAL_ID='principal.author' \
+        FLEET_RECALL_SUCCESSOR_PROPOSER_PRINCIPAL_ID='principal.proposer' \
+        FLEET_RECALL_SUCCESSOR_PACKAGE_AUTHOR_PRINCIPAL_ID='principal.author' \
+        "$successor_binary" "$operation" \
+            --bootstrap-receipt "$bootstrap_receipt" \
+            --genesis-package "$genesis_package" \
+            --genesis-test-result "$successor_genesis_test_result" \
+            --target-package "$successor_target_package" \
+            --target-test-result "$successor_target_test_result" \
+            --genesis-key-bridge "$bridge" \
+            --activation-statement "$statement" \
+            --activation-approval-set "$approvals"
+}
+
 run_reconciliation() {
     env -i \
         FLEET_RECALL_RECONCILIATION_DATABASE_URL="$reconciliation_url" \
@@ -1313,6 +1999,7 @@ run_reconciliation() {
 }
 
 reconciliation_table_fingerprints() {
+    local fingerprint
     local table_name
     for table_name in \
         memory_claims \
@@ -1322,11 +2009,56 @@ reconciliation_table_fingerprints() {
         memory_mutation_receipts \
         memory_events
     do
-        printf '%s\n' "$table_name"
-        root_scalar "
+        if ! fingerprint=$(root_scalar "
             SELECT *
             FROM [SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE $table_name]
-            ORDER BY 1, 2"
+            ORDER BY 1, 2"); then
+            fail "could not fingerprint reconciliation table $table_name"
+        fi
+        printf '%s\n' "$table_name"
+        printf '%s\n' "$fingerprint"
+    done
+}
+
+# These seven tables are the successor repository's direct SQL surface. Whole-
+# table CockroachDB fingerprints cover every index and make failed preflights,
+# stale requests, and exact replays prove their no-write claim independently of
+# scoped row counts.
+successor_table_fingerprints() {
+    local fingerprint
+    local table_name
+    for table_name in \
+        memory_control_events \
+        memory_control_shard_heads \
+        memory_registry_activations \
+        memory_registry_current_heads_v2 \
+        memory_registry_genesis_bridge_consumptions \
+        memory_registry_heads \
+        memory_registry_transitions
+    do
+        if ! fingerprint=$(root_scalar "
+            SELECT *
+            FROM [SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE $table_name]
+            ORDER BY 1, 2"); then
+            fail "could not fingerprint successor table $table_name"
+        fi
+        printf '%s\n' "$table_name"
+        printf '%s\n' "$fingerprint"
+    done
+}
+
+legacy_registry_fingerprints() {
+    local fingerprint
+    local table_name
+    for table_name in memory_registry_activations memory_registry_heads; do
+        if ! fingerprint=$(root_scalar "
+            SELECT *
+            FROM [SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE $table_name]
+            ORDER BY 1, 2"); then
+            fail "could not fingerprint legacy registry table $table_name"
+        fi
+        printf '%s\n' "$table_name"
+        printf '%s\n' "$fingerprint"
     done
 }
 
@@ -1340,6 +2072,195 @@ scope_shape() {
           (SELECT count(*) FROM memory_registry_heads
              WHERE tenant_id = '$tenant_id' AND project = '$physical_project')::STRING"
 }
+
+# The conflict role was created after the first successor policy application,
+# so remove its exact creator-scoped PUBLIC routine default before the first
+# pre-genesis audit/reapply/use interval. Neither one-shot role has a member
+# while this cluster-wide default and external-authority cleanup is performed.
+"$crdb" sql --url="$root_url" --execute='
+    GRANT fleet_conflict_reconciliation TO root;
+    ALTER DEFAULT PRIVILEGES FOR ROLE fleet_conflict_reconciliation
+        REVOKE EXECUTE ON ROUTINES FROM public;
+    REVOKE fleet_conflict_reconciliation FROM root;
+' >/dev/null
+assert_root_scalar "one-shot roles remain memberless after default cleanup" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name IN (
+         'fleet_registry_successor_activation',
+         'fleet_conflict_reconciliation'
+     )
+        OR member IN (
+            'fleet_registry_successor_activation',
+            'fleet_conflict_reconciliation'
+        )" '0'
+assert_public_routine_defaults "pre-genesis one-shot cleanup" \
+    'role=ALL,true,routines,public,EXECUTE,false'
+pre_genesis_outside_successor_target_authority=$(
+    audit_other_database_successor_authority
+)
+assert_exact "pre-genesis external successor target audit" \
+    "$pre_genesis_outside_successor_target_authority" ''
+pre_genesis_outside_successor_public_authority=$(
+    inventory_other_database_public_application_authority
+)
+assert_exact "pre-genesis external PUBLIC inventory" \
+    "$pre_genesis_outside_successor_public_authority" ''
+apply_successor_policy >/dev/null
+assert_root_scalar "pre-genesis successor policy current database" \
+    'SELECT pg_catalog.current_database()' 'fleet_recall'
+assert_root_scalar "pre-genesis one-shot role option set" \
+    "SELECT username || ':' || options::STRING
+     FROM [SHOW USERS]
+     WHERE username IN (
+         'fleet_registry_successor_activation',
+         'fleet_conflict_reconciliation'
+     )
+     ORDER BY username" \
+    'fleet_conflict_reconciliation:{NOLOGIN}
+fleet_registry_successor_activation:{NOLOGIN}'
+assert_root_scalar "pre-genesis successor role remains memberless" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name = 'fleet_registry_successor_activation'
+        OR member = 'fleet_registry_successor_activation'" '0'
+# Offline approval binding must win before membership and transport. Cross-wire
+# the set-level statement ID and every embedded approval ID to the same other
+# canonical digest, exactly as the bin's unit seam does. An otherwise complete
+# environment uses an unreachable verify-full URL and must never connect.
+altered_successor_approvals="$artifact_dir/altered-successor-approval-set.jsonl"
+other_successor_statement_id=$(printf 'aa%.0s' {1..32})
+jq -c --arg statement_id "$other_successor_statement_id" '
+    .statement_id = $statement_id
+    | .approvals = [.approvals[] | .statement_id = $statement_id]
+' \
+    "$successor_approvals" > "$altered_successor_approvals"
+unreachable_successor_url="postgresql://proof_successor:${successor_password}@127.0.0.1:1/fleet_recall?sslmode=verify-full&sslrootcert=${ca_path}"
+if altered_successor_approval=$( \
+    PROOF_SUCCESSOR_DATABASE_URL="$unreachable_successor_url" \
+    PROOF_SUCCESSOR_APPROVAL_SET="$altered_successor_approvals" \
+        run_successor inspect 2>&1
+); then
+    fail "altered successor approval unexpectedly reached transport"
+fi
+grep -Fq 'successor approval set does not bind the exact statement and bridge' \
+    <<<"$altered_successor_approval" \
+    || fail "cross-wired successor approval did not fail in offline binding"
+if grep -Fqi 'connect private successor activation database' \
+    <<<"$altered_successor_approval"; then
+    fail "altered successor approval attempted a database connection"
+fi
+
+# Open the first narrow role window only for the two pre-genesis repository
+# classifications. The external identity has no direct or system grant, its
+# only edge is non-admin membership in the exact logical role, and its URL is
+# bound to fleet_recall.
+"$crdb" sql --url="$root_url" --execute='
+    ALTER USER proof_successor WITH LOGIN;
+    GRANT fleet_registry_successor_activation TO proof_successor;
+' >/dev/null
+assert_root_scalar "first-window successor login enabled" \
+    "SELECT ('NOLOGIN' = ANY(options))::STRING FROM [SHOW USERS]
+     WHERE username = 'proof_successor'" 'false'
+first_window_successor_identity=$("$crdb" sql --url="$successor_url" --format=tsv \
+    --execute="SELECT pg_catalog.current_database() || ':' || current_user" \
+    | tail -n +2)
+assert_exact "first-window successor authenticated identity" \
+    "$first_window_successor_identity" 'fleet_recall:proof_successor'
+assert_root_scalar "complete first-window successor role edges" \
+    "SELECT role_name || ':' || member || ':' ||
+            CASE WHEN is_admin THEN 'admin_option' ELSE 'no_admin_option' END
+     FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name IN (
+         'fleet_registry_successor_activation',
+         'proof_successor'
+     )
+        OR member IN (
+            'fleet_registry_successor_activation',
+            'proof_successor'
+        )
+     ORDER BY role_name, member" \
+    'fleet_registry_successor_activation:proof_successor:no_admin_option'
+assert_root_scalar "first-window successor member direct grants" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS FOR proof_successor]
+     WHERE grantee = 'proof_successor'" '0'
+assert_root_scalar "first-window successor member direct system grants" \
+    "SELECT count(*)::STRING FROM [SHOW SYSTEM GRANTS]
+     WHERE grantee = 'proof_successor'" '0'
+
+# Before the genesis ceremony, the fully verified checked-in successor
+# authority reaches the repository and retains the exact closed NotReady state.
+successor_before_not_ready=$(successor_table_fingerprints)
+if successor_not_ready=$(run_successor inspect 2>&1); then
+    fail "successor inspect unexpectedly succeeded before genesis"
+fi
+grep -Fq 'requires a complete audited genesis activation' \
+    <<<"$successor_not_ready" \
+    || fail "pre-genesis successor inspect did not retain NotReady"
+successor_after_not_ready=$(successor_table_fingerprints)
+assert_exact "NotReady successor inspect seven-table fingerprints" \
+    "$successor_after_not_ready" "$successor_before_not_ready"
+
+# A failed migration 14 cannot be masked by successful rows 15 through 17. The
+# database/schema preflight must happen before any write to all seven tables in
+# the successor repository's direct SQL surface.
+successor_before_failed_prefix=$(successor_table_fingerprints)
+"$crdb" sql --url="$root_url" \
+    --execute='UPDATE _sqlx_migrations SET success = false WHERE version = 14' \
+    >/dev/null
+assert_root_scalar "successor later successful migrations remain visible" \
+    "SELECT string_agg(version::STRING, '|' ORDER BY version)
+     FROM _sqlx_migrations
+     WHERE version BETWEEN 15 AND 17 AND success" '15|16|17'
+successor_failed_prefix_succeeded=0
+if successor_failed_prefix=$(run_successor inspect 2>&1); then
+    successor_failed_prefix_succeeded=1
+fi
+"$crdb" sql --url="$root_url" \
+    --execute='UPDATE _sqlx_migrations SET success = true WHERE version = 14' \
+    >/dev/null
+test "$successor_failed_prefix_succeeded" -eq 0 \
+    || fail "failed migration 14 was masked by later successful rows"
+grep -Fq 'requires the complete successful schema prefix through 14' \
+    <<<"$successor_failed_prefix" \
+    || fail "failed migration 14 did not retain SchemaUnavailable"
+successor_after_failed_prefix=$(successor_table_fingerprints)
+assert_exact "failed successor prefix seven-table fingerprints" \
+    "$successor_after_failed_prefix" "$successor_before_failed_prefix"
+assert_root_scalar "restored successful successor prefix 1 through 14" \
+    "SELECT CASE WHEN count(*) = 14
+                          AND min(version) = 1
+                          AND max(version) = 14
+                          AND COALESCE(bool_and(success), false)
+                     THEN 'ready' ELSE 'not_ready' END
+     FROM _sqlx_migrations
+     WHERE version BETWEEN 1 AND 14" 'ready'
+
+# Close the first role window before any control/bootstrap/genesis work. The
+# LOGIN identity retains no direct grant and has no usable application role
+# during the complete genesis ceremony or dynamic fixture generation.
+"$crdb" sql --url="$root_url" --execute='
+    REVOKE fleet_registry_successor_activation FROM proof_successor;
+    ALTER USER proof_successor WITH NOLOGIN;
+' >/dev/null
+assert_root_scalar "closed first-window successor role edges" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name IN (
+         'fleet_registry_successor_activation',
+         'proof_successor'
+     )
+        OR member IN (
+            'fleet_registry_successor_activation',
+            'proof_successor'
+        )" '0'
+assert_root_scalar "inter-window successor login disabled" \
+    "SELECT options::STRING FROM [SHOW USERS]
+     WHERE username = 'proof_successor'" '{NOLOGIN}'
+if successor_interwindow_auth=$("$crdb" sql --url="$successor_url" \
+    --execute='SELECT current_user' 2>&1); then
+    fail "inter-window successor login unexpectedly authenticated"
+fi
+grep -Eiq 'authentication|password|nologin|login' \
+    <<<"$successor_interwindow_auth" \
+    || fail "inter-window successor login failed for an unexpected reason"
 
 # Offline authority must win over transport: a bad pin and a syntactically
 # valid but unreachable URL reports only the pin mismatch, never connect.
@@ -1536,6 +2457,569 @@ single_time=$(root_scalar "
       AND s.epoch_id = a.control_epoch_id AND s.shard = a.control_shard
     WHERE a.tenant_id = '$tenant_id' AND a.project = '$physical_project'")
 test "$single_time" = 'match' || fail "activation projections did not share one database time"
+
+# Emit a fresh successor bridge plus current/stale ceremonies from the durable
+# genesis head. The ignored test harness is the only emitter surface: its empty
+# environment contains exactly the seven reviewed inputs and must create the
+# exact six-file closed output set in a new disposable directory.
+successor_artifact_dir="$artifact_dir/successor"
+mkdir "$successor_artifact_dir"
+successor_artifact_dir=$(CDPATH='' cd -- "$successor_artifact_dir" && pwd)
+genesis_effective_from=$(jq -r '.effective_from' <<<"$inserted")
+successor_effective_from=$(root_scalar \
+    "SELECT to_char(statement_timestamp(), 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"000Z\"')")
+successor_stale_effective_from=$(root_scalar \
+    "SELECT to_char(statement_timestamp() + INTERVAL '1 microsecond', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"000Z\"')")
+case "$genesis_effective_from:$successor_effective_from:$successor_stale_effective_from" in
+    ????-??-??T??:??:??.?????????Z:????-??-??T??:??:??.?????????Z:????-??-??T??:??:??.?????????Z) ;;
+    *) fail "database did not return canonical successor ceremony timestamps" ;;
+esac
+(
+    cd "$repo_root"
+    env -i \
+        FLEET_RECALL_SUCCESSOR_CLI_FIXTURE_DIR="$successor_artifact_dir" \
+        FLEET_RECALL_SUCCESSOR_CLI_GENESIS_ACTIVATION_ID="$activation_id" \
+        FLEET_RECALL_SUCCESSOR_CLI_GENESIS_PACKAGE_DIGEST="$package_digest" \
+        FLEET_RECALL_SUCCESSOR_CLI_GENESIS_ACTIVATION_POLICY_DIGEST="$policy_digest" \
+        FLEET_RECALL_SUCCESSOR_CLI_GENESIS_EFFECTIVE_FROM="$genesis_effective_from" \
+        FLEET_RECALL_SUCCESSOR_CLI_EFFECTIVE_FROM="$successor_effective_from" \
+        FLEET_RECALL_SUCCESSOR_CLI_STALE_EFFECTIVE_FROM="$successor_stale_effective_from" \
+        "$successor_emitter_test_binary" \
+            "$successor_emitter_test_name" --exact --ignored >/dev/null
+)
+successor_emitted_files=$(
+    for emitted_path in "$successor_artifact_dir"/*; do
+        test -f "$emitted_path" || fail "successor emitter created a non-file output"
+        basename "$emitted_path"
+    done | sort
+)
+expected_successor_emitted_files='activation-approval-set-stale.jsonl
+activation-approval-set.jsonl
+activation-statement-stale.jsonl
+activation-statement.jsonl
+genesis-successor-key-bridge-digest.txt
+genesis-successor-key-bridge.jsonl'
+assert_exact "dynamic successor emitter six-file output set" \
+    "$successor_emitted_files" "$expected_successor_emitted_files"
+successor_emitted_entry_count=$(find "$successor_artifact_dir" -print \
+    | wc -l | tr -d ' ')
+assert_exact "dynamic successor emitter total entry count" \
+    "$successor_emitted_entry_count" '7'
+successor_bridge="$successor_artifact_dir/genesis-successor-key-bridge.jsonl"
+successor_statement="$successor_artifact_dir/activation-statement.jsonl"
+successor_approvals="$successor_artifact_dir/activation-approval-set.jsonl"
+successor_stale_statement="$successor_artifact_dir/activation-statement-stale.jsonl"
+successor_stale_approvals="$successor_artifact_dir/activation-approval-set-stale.jsonl"
+successor_bridge_digest_file="$successor_artifact_dir/genesis-successor-key-bridge-digest.txt"
+successor_bridge_digest=$(awk '
+    NR == 1 && length($0) == 64 && $0 ~ /^[0-9a-f]+$/ {
+        digest = $0
+        next
+    }
+    { invalid = 1 }
+    END {
+        if (NR != 1 || invalid || digest == "") exit 1
+        print digest
+    }
+' "$successor_bridge_digest_file") \
+    || fail "successor emitter did not publish exactly one canonical bridge digest"
+
+# Re-establish the full one-shot deployment boundary after genesis and fixture
+# generation, while both logical roles remain memberless. Re-clean the optional
+# reconciliation role's creator default, repeat both cross-database audits,
+# reapply the frozen successor policy, and only then open the second narrow
+# member window for Ready/Inserted/Accepted/ExactReplay/Stale.
+"$crdb" sql --url="$root_url" --execute='
+    GRANT fleet_conflict_reconciliation TO root;
+    ALTER DEFAULT PRIVILEGES FOR ROLE fleet_conflict_reconciliation
+        REVOKE EXECUTE ON ROUTINES FROM public;
+    REVOKE fleet_conflict_reconciliation FROM root;
+' >/dev/null
+assert_root_scalar "post-emitter one-shot roles remain memberless" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name IN (
+         'fleet_registry_successor_activation',
+         'fleet_conflict_reconciliation'
+     )
+        OR member IN (
+            'fleet_registry_successor_activation',
+            'fleet_conflict_reconciliation'
+        )" '0'
+assert_public_routine_defaults "post-emitter one-shot default cleanup" \
+    'role=ALL,true,routines,public,EXECUTE,false'
+final_outside_successor_target_authority=$(
+    audit_other_database_successor_authority
+)
+assert_exact "post-emitter external successor target audit" \
+    "$final_outside_successor_target_authority" ''
+final_outside_successor_public_authority=$(
+    inventory_other_database_public_application_authority
+)
+assert_exact "post-emitter external PUBLIC inventory" \
+    "$final_outside_successor_public_authority" ''
+apply_successor_policy >/dev/null
+assert_root_scalar "post-emitter successor policy current database" \
+    'SELECT pg_catalog.current_database()' 'fleet_recall'
+assert_root_scalar "post-emitter one-shot role option set" \
+    "SELECT username || ':' || options::STRING
+     FROM [SHOW USERS]
+     WHERE username IN (
+         'fleet_registry_successor_activation',
+         'fleet_conflict_reconciliation'
+     )
+     ORDER BY username" \
+    'fleet_conflict_reconciliation:{NOLOGIN}
+fleet_registry_successor_activation:{NOLOGIN}'
+assert_root_scalar "post-emitter successor role remains memberless" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name = 'fleet_registry_successor_activation'
+        OR member = 'fleet_registry_successor_activation'" '0'
+"$crdb" sql --url="$root_url" --execute='
+    ALTER USER proof_successor WITH LOGIN;
+    GRANT fleet_registry_successor_activation TO proof_successor;
+' >/dev/null
+assert_root_scalar "second-window successor login enabled" \
+    "SELECT ('NOLOGIN' = ANY(options))::STRING FROM [SHOW USERS]
+     WHERE username = 'proof_successor'" 'false'
+second_window_successor_identity=$("$crdb" sql --url="$successor_url" --format=tsv \
+    --execute="SELECT pg_catalog.current_database() || ':' || current_user" \
+    | tail -n +2)
+assert_exact "second-window successor authenticated identity" \
+    "$second_window_successor_identity" 'fleet_recall:proof_successor'
+assert_root_scalar "complete second-window successor role edges" \
+    "SELECT role_name || ':' || member || ':' ||
+            CASE WHEN is_admin THEN 'admin_option' ELSE 'no_admin_option' END
+     FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name IN (
+         'fleet_registry_successor_activation',
+         'proof_successor'
+     )
+        OR member IN (
+            'fleet_registry_successor_activation',
+            'proof_successor'
+        )
+     ORDER BY role_name, member" \
+    'fleet_registry_successor_activation:proof_successor:no_admin_option'
+assert_root_scalar "second-window successor member direct grants" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS FOR proof_successor]
+     WHERE grantee = 'proof_successor'" '0'
+assert_root_scalar "second-window successor member direct system grants" \
+    "SELECT count(*)::STRING FROM [SHOW SYSTEM GRANTS]
+     WHERE grantee = 'proof_successor'" '0'
+
+# The emitted authority is closed over the actual genesis head. Inspect is
+# Ready without writing either the mutable successor projection or immutable
+# legacy registry tables; apply then returns the exact bounded Inserted receipt.
+legacy_registry_before_successor=$(legacy_registry_fingerprints)
+successor_before_ready_inspect=$(successor_table_fingerprints)
+successor_ready=$(run_successor inspect)
+jq -e --argjson genesis "$inserted" --arg bridge "$successor_bridge_digest" '
+    (keys | sort) == [
+        "genesis_head",
+        "genesis_key_bridge_digest",
+        "operation",
+        "state"
+    ] and
+    (.genesis_head | keys | sort) == [
+        "activation_id",
+        "activation_policy_digest",
+        "effective_from",
+        "effective_until",
+        "package_digest"
+    ] and
+    .operation == "inspect" and .state == "ready" and
+    .genesis_head.activation_id == $genesis.registry_head.activation_id and
+    .genesis_head.package_digest == $genesis.registry_head.package_digest and
+    .genesis_head.activation_policy_digest ==
+        $genesis.registry_head.activation_policy_digest and
+    .genesis_head.effective_from == $genesis.effective_from and
+    .genesis_head.effective_until == null and
+    .genesis_key_bridge_digest == $bridge
+' <<<"$successor_ready" >/dev/null \
+    || fail "fresh successor inspect did not return exact Ready output"
+successor_after_ready_inspect=$(successor_table_fingerprints)
+assert_exact "Ready successor inspect seven-table fingerprints" \
+    "$successor_after_ready_inspect" "$successor_before_ready_inspect"
+
+successor_inserted=$(run_successor apply)
+jq -e \
+    --arg package "$successor_target_package_digest" \
+    --arg policy "$successor_target_policy_digest" \
+    --arg effective "$successor_effective_from" \
+    --arg bridge "$successor_bridge_digest" '
+    (keys | sort) == [
+        "accepted_at",
+        "accepted_event_id",
+        "activation_id",
+        "committed_offset",
+        "control_shard",
+        "epoch_id",
+        "genesis_key_bridge_digest",
+        "operation",
+        "registry_head",
+        "state",
+        "statement_id"
+    ] and
+    (.registry_head | keys | sort) == [
+        "activation_id",
+        "activation_policy_digest",
+        "effective_from",
+        "effective_until",
+        "package_digest"
+    ] and
+    .operation == "apply" and .state == "inserted" and
+    .registry_head.activation_id == .activation_id and
+    .registry_head.package_digest == $package and
+    .registry_head.activation_policy_digest == $policy and
+    .registry_head.effective_from == $effective and
+    .registry_head.effective_until == null and
+    .genesis_key_bridge_digest == $bridge and
+    (.control_shard | type) == "number" and
+    (.committed_offset | type) == "string" and
+    (.committed_offset | test("^[1-9][0-9]*$"))
+' <<<"$successor_inserted" >/dev/null \
+    || fail "first successor apply did not return exact Inserted output"
+
+# Accepted inspection and identical apply replay normalize to the exact same
+# durable receipt. Whole-table fingerprints prove both read/replay paths write
+# nothing.
+successor_before_accepted_inspect=$(successor_table_fingerprints)
+successor_accepted=$(run_successor inspect)
+jq -e --argjson inserted "$successor_inserted" '
+    .operation == "inspect" and .state == "accepted" and
+    (del(.operation, .state) == ($inserted | del(.operation, .state)))
+' <<<"$successor_accepted" >/dev/null \
+    || fail "post-successor inspect did not return exact Accepted output"
+successor_after_accepted_inspect=$(successor_table_fingerprints)
+assert_exact "Accepted successor inspect seven-table fingerprints" \
+    "$successor_after_accepted_inspect" "$successor_before_accepted_inspect"
+successor_before_replay=$(successor_table_fingerprints)
+successor_replay=$(run_successor apply)
+jq -e --argjson inserted "$successor_inserted" '
+    .operation == "apply" and .state == "exact_replay" and
+    (del(.operation, .state) == ($inserted | del(.operation, .state)))
+' <<<"$successor_replay" >/dev/null \
+    || fail "identical successor apply was not an exact normalized replay"
+successor_after_replay=$(successor_table_fingerprints)
+assert_exact "ExactReplay successor seven-table fingerprints" \
+    "$successor_after_replay" "$successor_before_replay"
+
+# The emitter's second ceremony is a distinct, freshly signed valid statement,
+# not an alternate approval set for the winning statement. It must classify
+# exactly Stale, never Conflict, and make no durable write.
+successor_before_stale=$(successor_table_fingerprints)
+if successor_stale=$( \
+    PROOF_SUCCESSOR_STATEMENT="$successor_stale_statement" \
+    PROOF_SUCCESSOR_APPROVAL_SET="$successor_stale_approvals" \
+        run_successor apply 2>&1
+); then
+    fail "distinct fresh successor statement unexpectedly replaced the winner"
+fi
+grep -Fq 'successor registry activation is stale because another statement already won' \
+    <<<"$successor_stale" \
+    || fail "distinct fresh successor statement did not classify exactly Stale"
+if grep -Fqi 'conflict' <<<"$successor_stale"; then
+    fail "distinct fresh successor statement was incorrectly described as Conflict"
+fi
+successor_after_stale=$(successor_table_fingerprints)
+assert_exact "Stale successor seven-table fingerprints" \
+    "$successor_after_stale" "$successor_before_stale"
+
+# Freeze the exact accepted graph independently of the CLI's own transactional
+# audit: generations are exactly 0/1, the one bridge consumes 0 -> 1, current
+# points only at generation 1, the successor control event and shard head carry
+# the CLI coordinate, all six projections share one database timestamp, and
+# the two legacy generation-zero tables remain byte-for-byte unchanged.
+successor_statement_id=$(jq -r '.statement_id' <<<"$successor_inserted")
+successor_activation_id=$(jq -r '.activation_id' <<<"$successor_inserted")
+successor_event_id=$(jq -r '.accepted_event_id' <<<"$successor_inserted")
+successor_epoch_id=$(jq -r '.epoch_id' <<<"$successor_inserted")
+successor_control_shard=$(jq -r '.control_shard' <<<"$successor_inserted")
+successor_committed_offset=$(jq -r '.committed_offset' <<<"$successor_inserted")
+successor_accepted_at=$(jq -r '.accepted_at' <<<"$successor_inserted")
+assert_root_scalar "exact successor transition generations" \
+    "SELECT string_agg(generation::STRING, '|' ORDER BY generation)
+     FROM memory_registry_transitions
+     WHERE tenant_id = '$tenant_id' AND project = '$physical_project'" '0|1'
+assert_root_scalar "exact successor bridge/current cardinalities" \
+    "SELECT
+         (SELECT count(*) FROM memory_registry_genesis_bridge_consumptions
+          WHERE tenant_id = '$tenant_id' AND project = '$physical_project')::STRING
+         || '|' ||
+         (SELECT count(*) FROM memory_registry_current_heads_v2
+          WHERE tenant_id = '$tenant_id' AND project = '$physical_project')::STRING" \
+    '1|1'
+assert_root_scalar "successor preserves legacy registry cardinalities" \
+    "SELECT
+         (SELECT count(*) FROM memory_registry_activations
+          WHERE tenant_id = '$tenant_id' AND project = '$physical_project')::STRING
+         || '|' ||
+         (SELECT count(*) FROM memory_registry_heads
+          WHERE tenant_id = '$tenant_id' AND project = '$physical_project')::STRING" \
+    '1|1'
+assert_root_scalar "exact successor generation/bridge/current/control graph" \
+    "SELECT CASE WHEN count(*) = 1
+                       AND COALESCE(bool_and(
+                           g.generation = 0
+                           AND encode(g.activation_id, 'hex') = '$activation_id'
+                           AND g.activation_id = a.activation_id
+                           AND g.statement_id = a.statement_id
+                           AND g.package_digest = a.activated_package_digest
+                           AND g.activation_policy_digest = a.activated_policy_digest
+                           AND g.test_result_digest = a.test_result_digest
+                           AND g.profile_id = a.profile_id
+                           AND g.profile_digest = a.profile_digest
+                           AND g.vector_manifest_digest = a.vector_manifest_digest
+                           AND g.contract_tenant_namespace = a.contract_tenant_namespace
+                           AND g.contract_project_namespace = a.contract_project_namespace
+                           AND g.effective_from = a.effective_from
+                           AND g.accepted_at = a.accepted_at
+                           AND g.source_event_id = a.accepted_event_id
+                           AND g.source_epoch_id = a.control_epoch_id
+                           AND g.source_shard = a.control_shard
+                           AND g.source_committed_offset = a.control_committed_offset
+                           AND g.root_activation_id = g.activation_id
+                           AND g.root_package_digest = g.package_digest
+                           AND g.root_activation_policy_digest = g.activation_policy_digest
+                           AND g.root_profile_id = g.profile_id
+                           AND g.root_profile_digest = g.profile_digest
+                           AND g.root_vector_manifest_digest = g.vector_manifest_digest
+                           AND g.root_contract_tenant_namespace = g.contract_tenant_namespace
+                           AND g.root_contract_project_namespace = g.contract_project_namespace
+                           AND g.root_effective_from = g.effective_from
+                           AND g.root_accepted_at = g.accepted_at
+                           AND g.root_source_event_id = g.source_event_id
+                           AND g.root_source_epoch_id = g.source_epoch_id
+                           AND g.root_source_shard = g.source_shard
+                           AND g.root_source_committed_offset = g.source_committed_offset
+                           AND g.predecessor_generation IS NULL
+                           AND g.predecessor_activation_id IS NULL
+                           AND g.predecessor_package_digest IS NULL
+                           AND g.predecessor_activation_policy_digest IS NULL
+                           AND g.predecessor_profile_id IS NULL
+                           AND g.predecessor_profile_digest IS NULL
+                           AND g.predecessor_vector_manifest_digest IS NULL
+                           AND g.predecessor_contract_tenant_namespace IS NULL
+                           AND g.predecessor_contract_project_namespace IS NULL
+                           AND g.predecessor_effective_from IS NULL
+                           AND g.predecessor_accepted_at IS NULL
+                           AND g.predecessor_source_event_id IS NULL
+                           AND g.predecessor_source_epoch_id IS NULL
+                           AND g.predecessor_source_shard IS NULL
+                           AND g.predecessor_source_committed_offset IS NULL
+                           AND h.activation_id = g.activation_id
+                           AND h.package_digest = g.package_digest
+                           AND h.activation_policy_digest = g.activation_policy_digest
+                           AND h.source_event_id = g.source_event_id
+                           AND h.source_epoch_id = g.source_epoch_id
+                           AND h.source_shard = g.source_shard
+                           AND h.source_committed_offset = g.source_committed_offset
+                           AND h.activated_at = g.accepted_at
+                           AND s.generation = 1
+                           AND encode(s.statement_id, 'hex') = '$successor_statement_id'
+                           AND encode(s.activation_id, 'hex') = '$successor_activation_id'
+                           AND encode(s.package_digest, 'hex') = '$successor_target_package_digest'
+                           AND encode(s.activation_policy_digest, 'hex') = '$successor_target_policy_digest'
+                           AND encode(s.test_result_digest, 'hex') = '$successor_target_test_result_digest'
+                           AND to_char(
+                               s.effective_from,
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.US\"000Z\"'
+                           ) = '$successor_effective_from'
+                           AND encode(s.source_event_id, 'hex') = '$successor_event_id'
+                           AND encode(s.source_epoch_id, 'hex') = '$successor_epoch_id'
+                           AND s.source_shard = $successor_control_shard
+                           AND s.source_committed_offset = $successor_committed_offset
+                           AND s.source_committed_offset = g.source_committed_offset + 1
+                           AND s.root_activation_id = g.root_activation_id
+                           AND s.root_package_digest = g.root_package_digest
+                           AND s.root_activation_policy_digest = g.root_activation_policy_digest
+                           AND s.root_profile_id = g.root_profile_id
+                           AND s.root_profile_digest = g.root_profile_digest
+                           AND s.root_vector_manifest_digest = g.root_vector_manifest_digest
+                           AND s.root_contract_tenant_namespace = g.root_contract_tenant_namespace
+                           AND s.root_contract_project_namespace = g.root_contract_project_namespace
+                           AND s.root_effective_from = g.root_effective_from
+                           AND s.root_accepted_at = g.root_accepted_at
+                           AND s.root_source_event_id = g.root_source_event_id
+                           AND s.root_source_epoch_id = g.root_source_epoch_id
+                           AND s.root_source_shard = g.root_source_shard
+                           AND s.root_source_committed_offset = g.root_source_committed_offset
+                           AND s.predecessor_generation = g.generation
+                           AND s.predecessor_activation_id = g.activation_id
+                           AND s.predecessor_package_digest = g.package_digest
+                           AND s.predecessor_activation_policy_digest = g.activation_policy_digest
+                           AND s.predecessor_profile_id = g.profile_id
+                           AND s.predecessor_profile_digest = g.profile_digest
+                           AND s.predecessor_vector_manifest_digest = g.vector_manifest_digest
+                           AND s.predecessor_contract_tenant_namespace = g.contract_tenant_namespace
+                           AND s.predecessor_contract_project_namespace = g.contract_project_namespace
+                           AND s.predecessor_effective_from = g.effective_from
+                           AND s.predecessor_accepted_at = g.accepted_at
+                           AND s.predecessor_source_event_id = g.source_event_id
+                           AND s.predecessor_source_epoch_id = g.source_epoch_id
+                           AND s.predecessor_source_shard = g.source_shard
+                           AND s.predecessor_source_committed_offset = g.source_committed_offset
+                           AND b.from_generation = 0
+                           AND b.to_generation = 1
+                           AND encode(b.bridge_digest, 'hex') = '$successor_bridge_digest'
+                           AND b.genesis_activation_id = g.activation_id
+                           AND b.genesis_package_digest = g.package_digest
+                           AND b.genesis_activation_policy_digest = g.activation_policy_digest
+                           AND b.genesis_profile_id = g.profile_id
+                           AND b.genesis_profile_digest = g.profile_digest
+                           AND b.genesis_vector_manifest_digest = g.vector_manifest_digest
+                           AND b.genesis_contract_tenant_namespace = g.contract_tenant_namespace
+                           AND b.genesis_contract_project_namespace = g.contract_project_namespace
+                           AND b.genesis_effective_from = g.effective_from
+                           AND b.genesis_accepted_at = g.accepted_at
+                           AND b.genesis_source_event_id = g.source_event_id
+                           AND b.genesis_source_epoch_id = g.source_epoch_id
+                           AND b.genesis_source_shard = g.source_shard
+                           AND b.genesis_source_committed_offset = g.source_committed_offset
+                           AND b.successor_activation_id = s.activation_id
+                           AND b.successor_package_digest = s.package_digest
+                           AND b.successor_activation_policy_digest = s.activation_policy_digest
+                           AND b.successor_profile_id = s.profile_id
+                           AND b.successor_profile_digest = s.profile_digest
+                           AND b.successor_vector_manifest_digest = s.vector_manifest_digest
+                           AND b.successor_contract_tenant_namespace = s.contract_tenant_namespace
+                           AND b.successor_contract_project_namespace = s.contract_project_namespace
+                           AND b.successor_effective_from = s.effective_from
+                           AND b.successor_source_event_id = s.source_event_id
+                           AND b.successor_source_epoch_id = s.source_epoch_id
+                           AND b.successor_source_shard = s.source_shard
+                           AND b.successor_source_committed_offset = s.source_committed_offset
+                           AND c.head_state = 'active'
+                           AND c.generation = 1
+                           AND c.activation_id = s.activation_id
+                           AND c.package_digest = s.package_digest
+                           AND c.activation_policy_digest = s.activation_policy_digest
+                           AND c.profile_id = s.profile_id
+                           AND c.profile_digest = s.profile_digest
+                           AND c.vector_manifest_digest = s.vector_manifest_digest
+                           AND c.contract_tenant_namespace = s.contract_tenant_namespace
+                           AND c.contract_project_namespace = s.contract_project_namespace
+                           AND c.effective_from = s.effective_from
+                           AND c.source_event_id = s.source_event_id
+                           AND c.source_epoch_id = s.source_epoch_id
+                           AND c.source_shard = s.source_shard
+                           AND c.source_committed_offset = s.source_committed_offset
+                           AND c.canonical_head = s.canonical_head
+                           AND e.event_schema_version = 1
+                           AND e.event_kind = 'registry.successor.activated'
+                           AND e.event_id = s.source_event_id
+                           AND e.epoch_id = s.source_epoch_id
+                           AND e.shard = s.source_shard
+                           AND e.committed_offset = s.source_committed_offset
+                           AND e.semantic_object_digest = s.activation_id
+                           AND e.consistency_family = 'registry.activation'
+                           AND e.canonical_event = s.canonical_event
+                           AND sh.last_committed_offset = s.source_committed_offset
+                           AND sh.chain_digest = e.chain_digest
+                           AND s.accepted_at = b.successor_accepted_at
+                           AND s.accepted_at = b.consumed_at
+                           AND s.accepted_at = c.accepted_at
+                           AND s.accepted_at = e.accepted_at
+                           AND s.accepted_at = sh.advanced_at
+                           AND to_char(
+                               s.accepted_at,
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.US\"000Z\"'
+                           ) = '$successor_accepted_at'
+                       ), false)
+                 THEN 'match' ELSE 'mismatch' END
+     FROM memory_registry_transitions AS g
+     JOIN memory_registry_transitions AS s
+       ON s.tenant_id = g.tenant_id
+      AND s.project = g.project
+      AND s.generation = 1
+     JOIN memory_registry_genesis_bridge_consumptions AS b
+       ON b.tenant_id = g.tenant_id AND b.project = g.project
+     JOIN memory_registry_current_heads_v2 AS c
+       ON c.tenant_id = g.tenant_id AND c.project = g.project
+     JOIN memory_registry_activations AS a
+       ON a.tenant_id = g.tenant_id AND a.project = g.project
+     JOIN memory_registry_heads AS h
+       ON h.tenant_id = g.tenant_id AND h.project = g.project
+     JOIN memory_control_events AS e
+       ON e.tenant_id = g.tenant_id
+      AND e.project = g.project
+      AND e.event_id = s.source_event_id
+     JOIN memory_control_shard_heads AS sh
+       ON sh.tenant_id = g.tenant_id
+      AND sh.project = g.project
+      AND sh.epoch_id = s.source_epoch_id
+      AND sh.shard = s.source_shard
+     WHERE g.tenant_id = '$tenant_id'
+       AND g.project = '$physical_project'
+       AND g.generation = 0" 'match'
+assert_root_scalar "exact genesis/successor registry control stream" \
+    "SELECT string_agg(
+         encode(event_id, 'hex') || ':' || committed_offset::STRING,
+         '|' ORDER BY committed_offset
+     )
+     FROM memory_control_events
+     WHERE tenant_id = '$tenant_id'
+       AND project = '$physical_project'
+       AND epoch_id = decode('$successor_epoch_id', 'hex')
+       AND shard = $successor_control_shard
+       AND consistency_family = 'registry.activation'" \
+    "$accepted_event_id:$committed_offset|$successor_event_id:$successor_committed_offset"
+legacy_registry_after_successor=$(legacy_registry_fingerprints)
+assert_exact "successor preserved legacy table fingerprints" \
+    "$legacy_registry_after_successor" "$legacy_registry_before_successor"
+
+# The member's query plan must retain the repository's bounded primary-key span
+# over exactly migration versions 1 through 14 even though 15 through 17 exist.
+successor_prefix_explain=$("$crdb" sql --url="$successor_url" \
+    --format=tsv --execute="
+    EXPLAIN SELECT pg_catalog.current_database() = 'fleet_recall'
+               AND count(*) = 14
+               AND COALESCE(bool_and(success), false)
+    FROM public._sqlx_migrations
+    WHERE version BETWEEN 1 AND 14")
+if ! grep -Eq '_sqlx_migrations@(_sqlx_migrations_pkey|primary)' \
+    <<<"$successor_prefix_explain"; then
+    printf '%s\n' "$successor_prefix_explain" >&2
+    fail "successor migration-prefix preflight did not use the primary index"
+fi
+if ! grep -Eq 'span(s)?:.*\[/1[^]]*-[[:space:]]*/14\]' \
+    <<<"$successor_prefix_explain"; then
+    printf '%s\n' "$successor_prefix_explain" >&2
+    fail "successor migration-prefix preflight did not retain bounded 1..14"
+fi
+
+# End the successor's one-shot lifecycle immediately after its exact replay,
+# stale loser, graph audit, and plan proof. Remove the sole edge, disable LOGIN,
+# clear the password, prove a fresh TLS authentication fails, and leave no edge
+# or member option other than exact NOLOGIN behind.
+"$crdb" sql --url="$root_url" --execute="
+    REVOKE fleet_registry_successor_activation FROM proof_successor;
+    ALTER USER proof_successor WITH NOLOGIN PASSWORD NULL;
+" >/dev/null
+assert_root_scalar "removed successor member edge" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name = 'fleet_registry_successor_activation'
+        OR member = 'fleet_registry_successor_activation'" '0'
+assert_root_scalar "disabled successor login options" \
+    "SELECT options::STRING FROM [SHOW USERS]
+     WHERE username = 'proof_successor'" '{NOLOGIN}'
+if successor_disabled_auth=$("$crdb" sql --url="$successor_url" \
+    --execute='SELECT current_user' 2>&1); then
+    fail "disabled successor login unexpectedly authenticated"
+fi
+grep -Eiq 'authentication|password|nologin|login' \
+    <<<"$successor_disabled_auth" \
+    || fail "disabled successor login failed for an unexpected reason"
+assert_root_scalar "post-lifecycle successor role residue" \
+    "SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name IN (
+         'fleet_registry_successor_activation',
+         'proof_successor'
+     )
+        OR member IN (
+            'fleet_registry_successor_activation',
+            'proof_successor'
+        )" '0'
 
 # The apply-only reconciliation CLI validates its durable coordinate before it
 # parses deployment configuration or can open a socket. Exercise that ordering
@@ -2169,6 +3653,10 @@ for output in \
     "$bad_pin" "$not_ready" "$bootstrap_absent" "$bootstrap_inserted" \
     "$bootstrap_complete" "$bootstrap_replay" "$timing" "$failed_prefix" \
     "$pinned" "$inserted" "$accepted" "$replay" "$conflict" "$stale" \
+    "$altered_successor_approval" "$successor_not_ready" \
+    "$successor_failed_prefix" "$successor_ready" "$successor_inserted" \
+    "$successor_accepted" "$successor_replay" "$successor_stale" \
+    "$successor_interwindow_auth" "$successor_disabled_auth" \
     "$invalid_reconciliation" "$reconciliation_materialized" \
     "$reconciliation_replay" "$reconciliation_event_read" \
     "$reconciliation_registry_read" "$reconciliation_claim_link_insert" \
@@ -2180,6 +3668,7 @@ do
         "$control_password" \
         "$activation_password" \
         "$runtime_password" \
+        "$successor_password" \
         "$reconciliation_password"
     do
         if grep -Fq "$secret" <<<"$output"; then
@@ -2218,6 +3707,11 @@ printf '%s\n' \
     "$inserted" \
     "$accepted" \
     "$replay" \
+    "private successor registry activation receipts:" \
+    "$successor_ready" \
+    "$successor_inserted" \
+    "$successor_accepted" \
+    "$successor_replay" \
     "private conflict reconciliation receipts:" \
     "$reconciliation_materialized" \
     "$reconciliation_replay"
