@@ -2479,6 +2479,40 @@ mod tests {
         )
     }
 
+    fn explain_plan_has_node_with_direct_attributes(
+        plan: &str,
+        exact_node_lines: &[&str],
+        required_attributes: &[&str],
+    ) -> bool {
+        let lines = plan
+            .lines()
+            .map(explain_plan_line)
+            .filter(|(_, content)| !content.is_empty())
+            .collect::<Vec<_>>();
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, content))| exact_node_lines.contains(content))
+            .any(|(node_index, (node_indent, _))| {
+                let descendants = &lines[node_index + 1..];
+                let subtree_len = descendants
+                    .iter()
+                    .position(|(indent, _)| indent <= node_indent)
+                    .unwrap_or(descendants.len());
+                let subtree = &descendants[..subtree_len];
+                let Some(direct_child_indent) = subtree.iter().map(|(indent, _)| *indent).min()
+                else {
+                    return false;
+                };
+
+                required_attributes.iter().all(|required_attribute| {
+                    subtree.iter().any(|(indent, content)| {
+                        *indent == direct_child_indent && content == required_attribute
+                    })
+                })
+            })
+    }
+
     fn legacy_v2_presence_plan_is_per_key_bounded(plan: &str) -> bool {
         const UNIQUE_LOOKUP: &str =
             "left-join (lookup memory_conflicts@memory_conflicts_scope_key_detector_unique_idx)";
@@ -2490,35 +2524,24 @@ mod tests {
             return true;
         }
 
-        let lines = plan
-            .lines()
-            .map(explain_plan_line)
-            .filter(|(_, content)| !content.is_empty())
-            .collect::<Vec<_>>();
-        lines
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, content))| *content == UNIQUE_LOOKUP)
-            .any(|(lookup_index, (lookup_indent, _))| {
-                let descendants = &lines[lookup_index + 1..];
-                let subtree_len = descendants
-                    .iter()
-                    .position(|(indent, _)| indent <= lookup_indent)
-                    .unwrap_or(descendants.len());
-                let subtree = &descendants[..subtree_len];
-                let Some(direct_child_indent) = subtree.iter().map(|(indent, _)| *indent).min()
-                else {
-                    return false;
-                };
+        explain_plan_has_node_with_direct_attributes(
+            plan,
+            &[UNIQUE_LOOKUP],
+            &["lookup columns are key", "cardinality: [2 - 2]"],
+        )
+    }
 
-                let has_key_proof = subtree.iter().any(|(indent, content)| {
-                    *indent == direct_child_indent && *content == "lookup columns are key"
-                });
-                let has_two_key_cardinality = subtree.iter().any(|(indent, content)| {
-                    *indent == direct_child_indent && *content == "cardinality: [2 - 2]"
-                });
-                has_key_proof && has_two_key_cardinality
-            })
+    fn membership_hydration_plan_is_bounded(plan: &str) -> bool {
+        const HYDRATION_LOOKUPS: &[&str] = &[
+            "left-join (lookup memory_conflicts [as=conflict])",
+            "left-join (lookup memory_conflicts@primary [as=conflict])",
+        ];
+
+        explain_plan_has_node_with_direct_attributes(
+            plan,
+            HYDRATION_LOOKUPS,
+            &["lookup columns are key", "cardinality: [0 - 3]"],
+        )
     }
 
     async fn transition_event_count(pool: &PgPool, scope: &FleetScope, claim_id: i64) -> i64 {
@@ -2661,6 +2684,38 @@ mod tests {
                   ├── cardinality: [2 - 2]\n\
                   └── lookup columns are key";
         assert!(!legacy_v2_presence_plan_is_per_key_bounded(
+            unrelated_lookup_proofs
+        ));
+    }
+
+    #[test]
+    fn membership_hydration_plan_requires_an_exact_bounded_primary_lookup() {
+        for lookup in [
+            "left-join (lookup memory_conflicts [as=conflict])",
+            "left-join (lookup memory_conflicts@primary [as=conflict])",
+        ] {
+            let plan = format!("{lookup}\n ├── lookup columns are key\n └── cardinality: [0 - 3]");
+            assert!(membership_hydration_plan_is_bounded(&plan));
+        }
+
+        assert!(!membership_hydration_plan_is_bounded(
+            "left-join (lookup memory_conflicts [as=other])\n\
+             ├── lookup columns are key\n\
+             └── cardinality: [0 - 3]"
+        ));
+        assert!(!membership_hydration_plan_is_bounded(
+            "left-join (lookup memory_conflicts [as=conflict])\n\
+             └── cardinality: [0 - 3]"
+        ));
+
+        let unrelated_lookup_proofs = "root\n\
+             ├── left-join (lookup memory_conflicts [as=conflict])\n\
+             │    ├── lookup columns are key\n\
+             │    └── cardinality: [0 - 1000000]\n\
+             └── left-join (lookup memory_conflicts@primary [as=other])\n\
+                  ├── lookup columns are key\n\
+                  └── cardinality: [0 - 3]";
+        assert!(!membership_hydration_plan_is_bounded(
             unrelated_lookup_proofs
         ));
     }
@@ -3650,7 +3705,7 @@ mod tests {
             "actual memberships missed the inverse member index:\n{membership_plan}"
         );
         assert!(
-            membership_plan.contains("primary"),
+            membership_hydration_plan_is_bounded(&membership_plan),
             "actual memberships missed bounded conflict hydration:\n{membership_plan}"
         );
         assert!(
