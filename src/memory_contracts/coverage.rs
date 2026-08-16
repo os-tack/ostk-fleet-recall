@@ -234,12 +234,22 @@ impl SequenceGapV1 {
 ///
 /// `gap_detected` always means the observed provider sequence has a known
 /// acquisition or ordering gap; the bounded description is optional because a
-/// gap can be known to exist without its exact extent being provable.
+/// gap can be known to exist without its exact extent being provable. The
+/// `gap` key itself is REQUIRED on the wire (its value may be `null`): a bare
+/// `Option<T>` field is optional-by-default under serde, which would let
+/// `{"state":"gap_detected"}` and `{"gap":null,"state":"gap_detected"}` both
+/// decode to the same value, so two distinct canonical byte strings would
+/// decode to one `CoverageReceiptV1` (violating the invariant asserted below).
+/// `#[serde(deserialize_with = "Option::deserialize")]` makes the *field*
+/// mandatory while still allowing an explicit `null`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SequenceContinuityV1 {
     Contiguous {},
-    GapDetected { gap: Option<SequenceGapV1> },
+    GapDetected {
+        #[serde(deserialize_with = "Option::deserialize")]
+        gap: Option<SequenceGapV1>,
+    },
 }
 
 impl SequenceContinuityV1 {
@@ -290,8 +300,16 @@ impl CoverageProofBasisV1 {
 /// independent witnesses. Nothing in this type collapses them into one
 /// another; only [`negative_support_admissible`] combines them into an
 /// admission decision, and it does so without any default.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// `Deserialize` is hand-written (not derived) so that a well-typed
+/// *positional* JSON array root — the form serde's derived struct
+/// `Deserialize` accepts for any non-tagged struct via `visit_seq`, in
+/// addition to the intended `visit_map` object form — is rejected outright
+/// rather than silently decoding to the identical value and thus the
+/// identical `receipt_id()`. See "Digests and decode strictness" in this
+/// crate's `contracts/dynamic-memory/v3/coverage/README.md` for the review
+/// finding this closes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CoverageReceiptV1 {
     pub schema_version: u32,
     pub producer: ProducerIdentityV1,
@@ -305,6 +323,79 @@ pub struct CoverageReceiptV1 {
     pub source_digest: Sha256Digest,
     pub source_count: u32,
     pub evidence_id: AcceptedEventId,
+}
+
+/// Field-for-field mirror of [`CoverageReceiptV1`] used only to obtain a
+/// derived, `deny_unknown_fields` map-shaped `Deserialize` implementation
+/// that [`CoverageReceiptV1`]'s hand-written `Deserialize` forwards to after
+/// first forcing a JSON-object root (see the type-level doc comment above).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoverageReceiptV1Shadow {
+    schema_version: u32,
+    producer: ProducerIdentityV1,
+    scope: CoverageScopeV1,
+    watermark: CoverageWatermarkV1,
+    completeness: CoverageCompletenessV1,
+    freshness: CoverageFreshnessV1,
+    continuity: SequenceContinuityV1,
+    observed_through: CanonicalTimestamp,
+    proof_basis: CoverageProofBasisV1,
+    source_digest: Sha256Digest,
+    source_count: u32,
+    evidence_id: AcceptedEventId,
+}
+
+impl From<CoverageReceiptV1Shadow> for CoverageReceiptV1 {
+    fn from(shadow: CoverageReceiptV1Shadow) -> Self {
+        Self {
+            schema_version: shadow.schema_version,
+            producer: shadow.producer,
+            scope: shadow.scope,
+            watermark: shadow.watermark,
+            completeness: shadow.completeness,
+            freshness: shadow.freshness,
+            continuity: shadow.continuity,
+            observed_through: shadow.observed_through,
+            proof_basis: shadow.proof_basis,
+            source_digest: shadow.source_digest,
+            source_count: shadow.source_count,
+            evidence_id: shadow.evidence_id,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CoverageReceiptV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ObjectRootOnly;
+
+        impl<'de> serde::de::Visitor<'de> for ObjectRootOnly {
+            type Value = CoverageReceiptV1Shadow;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a coverage receipt encoded as a JSON object")
+            }
+
+            // Explicitly NOT implementing `visit_seq`: a positional JSON
+            // array root must fall through to serde's default "invalid
+            // type: sequence" error rather than being accepted field-by-
+            // field, which is what `#[derive(Deserialize)]` on a plain
+            // struct would otherwise do.
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+
+        deserializer
+            .deserialize_map(ObjectRootOnly)
+            .map(CoverageReceiptV1Shadow::into)
+    }
 }
 
 impl CoverageReceiptV1 {
@@ -508,6 +599,11 @@ mod tests {
     const NEGATIVE_OBSERVED_THROUGH_BEFORE_WINDOW_END: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/coverage/negative-observed-through-before-window-end.jsonl"
     );
+    const NEGATIVE_GAP_OMITTED_KEY: &[u8] =
+        include_bytes!("../../contracts/dynamic-memory/v3/coverage/negative-gap-omitted-key.jsonl");
+    const NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/coverage/negative-well-typed-positional-array.jsonl"
+    );
     const EVALUATED_CONDITION_PRESENT: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/coverage/evaluated-condition-present.jsonl"
     );
@@ -582,6 +678,10 @@ mod tests {
         "25e2adf454aa5a063e78fecdb1bb5acc78dbae7879ad630b4a6733a08db7987c";
     const NEGATIVE_OBSERVED_THROUGH_BEFORE_WINDOW_END_RAW_SHA256: &str =
         "29373cfecb2d06f94888d6d5ae8e59416d57b9d39190d3f30f85d85ee5483c5b";
+    const NEGATIVE_GAP_OMITTED_KEY_RAW_SHA256: &str =
+        "68c1edcfd74f5e885302388e123c251ec7eae94351d209b61e13a463e1962410";
+    const NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY_RAW_SHA256: &str =
+        "3519ccc8b9e7cd1dd69e3df5d5c531ea08a41af3da15aa10813a1ab11e105080";
     const EVALUATED_CONDITION_PRESENT_RAW_SHA256: &str =
         "87f7439876e4033adb5735dd9e8a4031ef2be2239574b1a83398efca11784151";
     const EVALUATED_CONDITION_ABSENT_RAW_SHA256: &str =
@@ -589,7 +689,7 @@ mod tests {
     const EVALUATED_CONDITION_INDETERMINATE_RAW_SHA256: &str =
         "e2a4db258cdc6e923416ddf6f071c079c1ad524c35ff11ce24facbad55cd1859";
     const VECTOR_SUITE_RAW_SHA256: &str =
-        "86de32d0be0bd4d03eca1c19b9bf305adeace17fa28791558d22d0d86400dc06";
+        "2fad727c50ecbfdc344c193a2cae874b6a8a0a30d9604c945c006a03ca193e4c";
 
     const SCOPE_URI: &str = "urn:ostk:entity:v1:repository:sha256:1111111111111111111111111111111111111111111111111111111111111111";
     const REVISION_HEX: &str = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -628,7 +728,7 @@ mod tests {
         "3cee8a812644b227eff1da851263f4729a60a572f2e41bcf50587dba06609353";
 
     const VECTOR_SUITE_DIGEST: &str =
-        "70512bca5e4323a1c050b05c16ea997f4e66f7f7fd78536bf28ed016686e749d";
+        "f5473846fcaf65e6845bbd83b668af85b1c3f4bdd5f3c290e2f8e5b62e02b5cf";
 
     fn digest(value: &str) -> Sha256Digest {
         Sha256Digest::from_str(value).expect("hard-coded digest must be lowercase SHA-256")
@@ -1155,11 +1255,62 @@ mod tests {
             NEGATIVE_ARBITRARY_JSON_VALUE,
             NEGATIVE_NESTED_UNKNOWN_FIELD_CONTINUITY,
             NEGATIVE_OBSERVED_THROUGH_BEFORE_WINDOW_END,
+            NEGATIVE_GAP_OMITTED_KEY,
+            NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY,
         ] {
             let outcome = decode_strict::<CoverageReceiptV1>(record(bytes))
                 .and_then(|receipt| receipt.validate());
             assert!(outcome.is_err(), "fixture unexpectedly accepted");
         }
+    }
+
+    /// COVER-03 (review-blocker fix): omitting the `gap` key entirely on a
+    /// `gap_detected` continuity value must be rejected at DECODE, not merely
+    /// accepted with `gap: None`. Before this fix a bare `Option<T>` field
+    /// made `gap` optional-by-default, so `{"state":"gap_detected"}` and
+    /// `{"gap":null,"state":"gap_detected"}` decoded to the identical value
+    /// and thus the identical `receipt_id()` -- two distinct canonical byte
+    /// strings decoding to one value, and `require_canonical` returning `Ok`
+    /// on a byte string `encode_canonical` could never itself produce.
+    #[test]
+    fn gap_detected_with_omitted_gap_key_is_rejected_at_decode() {
+        let outcome = decode_strict::<CoverageReceiptV1>(record(NEGATIVE_GAP_OMITTED_KEY));
+        let err = outcome.expect_err("omitted `gap` key must not decode");
+        let message = err.to_string();
+        assert!(
+            message.contains("gap"),
+            "expected a missing-field error naming `gap`, got: {message}"
+        );
+
+        // And the explicit-null form must still decode fine, with the two
+        // forms no longer able to collide: only one of the two canonical
+        // byte strings for this continuity value now exists.
+        let explicit_null = MATRIX_PARTIAL_CURRENT_GAP_DETECTED;
+        decode_strict::<CoverageReceiptV1>(record(explicit_null))
+            .expect("gap:null form must still decode");
+    }
+
+    /// Review-blocker fix: a well-typed *positional* JSON array carrying
+    /// exactly the canonical receipt's 12 field values in declaration order
+    /// must be rejected at decode, not silently accepted as an alternate
+    /// encoding of the identical value (and thus the identical
+    /// `receipt_id()`). `#[derive(Deserialize)]` on a plain struct accepts
+    /// both a map root AND a positional-sequence root by default; only an
+    /// object root is the receipt's one canonical wire shape.
+    #[test]
+    fn well_typed_positional_array_root_is_rejected_at_decode() {
+        let outcome =
+            decode_strict::<CoverageReceiptV1>(record(NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY));
+        let err = outcome.expect_err("a positional array root must not decode");
+        let message = err.to_string();
+        assert!(
+            message.contains("sequence") || message.contains("object"),
+            "expected an invalid-root-shape error, got: {message}"
+        );
+
+        // The map-shaped form of the exact same values must still decode.
+        decode_strict::<CoverageReceiptV1>(record(MATRIX_COMPLETE_CURRENT_CONTIGUOUS))
+            .expect("the object-root form of the identical values must still decode");
     }
 
     /// A `Contiguous` continuity value with a smuggled `gap` key must be
@@ -1307,6 +1458,14 @@ mod tests {
                 NEGATIVE_OBSERVED_THROUGH_BEFORE_WINDOW_END,
                 NEGATIVE_OBSERVED_THROUGH_BEFORE_WINDOW_END_RAW_SHA256,
             ),
+            (
+                NEGATIVE_GAP_OMITTED_KEY,
+                NEGATIVE_GAP_OMITTED_KEY_RAW_SHA256,
+            ),
+            (
+                NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY,
+                NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY_RAW_SHA256,
+            ),
             (VECTOR_SUITE_FIXTURE, VECTOR_SUITE_RAW_SHA256),
         ] {
             assert_eq!(raw_sha256(bytes), expected);
@@ -1336,8 +1495,8 @@ mod tests {
             canonical_receipt.receipt_id().unwrap()
         );
         assert_eq!(suite.matrix_case_count, 12);
-        assert_eq!(suite.negative_case_count, 12);
-        assert_eq!(suite.negative_cases.len(), 12);
+        assert_eq!(suite.negative_case_count, 14);
+        assert_eq!(suite.negative_cases.len(), 14);
         let mut sorted = suite.negative_cases.clone();
         sorted.sort();
         sorted.dedup();
