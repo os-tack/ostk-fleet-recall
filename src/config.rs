@@ -20,6 +20,9 @@ use crate::memory_contracts::genesis_activation::{
 use crate::memory_contracts::successor_activation::{
     SuccessorActivationPrincipalBinding, SuccessorRegistryTestRunnerPin,
 };
+use crate::memory_contracts::successor_generic::{
+    GenericSuccessorPrincipalBinding, GenericSuccessorTestRunnerPin,
+};
 use crate::memory_contracts::successor_policy::{
     GenesisSuccessorKeyBridgeDigest, GenesisSuccessorKeyBridgePin,
 };
@@ -353,6 +356,32 @@ impl SuccessorActivationConfig {
     #[must_use]
     pub fn successor_principal_binding(&self) -> SuccessorActivationPrincipalBinding {
         SuccessorActivationPrincipalBinding::from_trusted_config(
+            self.proposer_principal_id.clone(),
+            self.package_author_principal_id.clone(),
+        )
+    }
+
+    /// The same trusted target-runner pin, typed for the repeatable generic
+    /// `N -> N+1` ceremony.
+    ///
+    /// The generic ceremony reuses this closed process namespace rather than
+    /// opening a second one: the target runner artifact/configuration/result
+    /// pins name whichever successor package that invocation activates, and no
+    /// new environment variable can widen the authority.
+    #[must_use]
+    pub const fn generic_target_test_runner_pin(&self) -> GenericSuccessorTestRunnerPin {
+        GenericSuccessorTestRunnerPin::from_trusted_config(
+            self.target_test_runner_artifact_digest,
+            self.target_test_runner_configuration_digest,
+            self.target_test_result_digest,
+        )
+    }
+
+    /// The same trusted proposer/author identities, typed for the generic
+    /// `N -> N+1` ceremony.
+    #[must_use]
+    pub fn generic_principal_binding(&self) -> GenericSuccessorPrincipalBinding {
+        GenericSuccessorPrincipalBinding::from_trusted_config(
             self.proposer_principal_id.clone(),
             self.package_author_principal_id.clone(),
         )
