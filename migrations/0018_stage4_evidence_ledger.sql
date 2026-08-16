@@ -19,11 +19,27 @@
 -- Ownership: created and owned by fleet_migrator (the single-migrator
 -- deployment job). ADR 0002 D1. Physical companion of
 -- memory_control_shard_heads (0003) for the general accepted-event ledger.
--- The composite FK targets memory_control_log_epochs (tenant_id, project,
--- epoch_id, shard_count), so both physical ledgers share ONE genesis log epoch,
--- one partition recipe, one seed, and one shard count. UNIQUE (tenant_id,
--- project) on memory_control_log_epochs is untouched: the single-epoch
--- invariant stays literal. advanced_at carries no DEFAULT, mirroring migration
+--
+-- This table deliberately carries NO foreign key to memory_control_log_epochs
+-- or to any other memory_control_* / memory_registry_* table (ADR 0002 D1
+-- amendment, 2026-08-16). On CockroachDB v26.2.3 a foreign-key check runs with
+-- the INSERTING role's privileges and requires SELECT on the referenced table,
+-- so a control-plane parent would force a control-table SELECT grant on
+-- fleet_runtime -- observed as SQLSTATE 42501, 'user does not have SELECT
+-- privilege on relation memory_control_log_epochs', on D1's lazy head seed --
+-- and would reopen exactly the privilege boundary D2 closes. That grant would
+-- not even be durable: control-role-grants.sql REVOKEs ALL on that table FROM
+-- fleet_runtime every time the operator reapplies it after a migration.
+--
+-- epoch_id and shard_count are kept with the same shape CHECKs as the control
+-- head table (0003). Their binding to the single genesis log epoch is enforced
+-- by the appender: inside the same serializable transaction it reads
+-- memory_writer_authority_v1 (D4) and requires the head's epoch_id and
+-- shard_count to equal that authority row's genesis epoch. W1-APPEND's live
+-- tests and the runtime proof own that check. Do not reintroduce a CockroachDB
+-- foreign key to a control table here without amending D2.
+--
+-- advanced_at carries no DEFAULT, mirroring migration
 -- 0008: every audited head advance binds its acceptance clock explicitly.
 CREATE TABLE IF NOT EXISTS memory_evidence_shard_heads (
     tenant_id                   UUID NOT NULL,
@@ -35,9 +51,6 @@ CREATE TABLE IF NOT EXISTS memory_evidence_shard_heads (
     chain_digest                BYTES NOT NULL,
     advanced_at                 TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (tenant_id, project, epoch_id, shard),
-    CONSTRAINT memory_evidence_head_epoch_fk
-        FOREIGN KEY (tenant_id, project, epoch_id, shard_count)
-        REFERENCES memory_control_log_epochs (tenant_id, project, epoch_id, shard_count),
     CONSTRAINT memory_evidence_head_project_bound
         CHECK (octet_length(project) BETWEEN 1 AND 256),
     CONSTRAINT memory_evidence_head_epoch_id_shape
@@ -449,3 +462,146 @@ JOIN memory_control_log_epochs AS epoch
     ON epoch.tenant_id = head.tenant_id
     AND epoch.project = head.project
     AND epoch.bootstrap_receipt_digest = bootstrap.receipt_digest;
+
+-- SQLx sends a multi-statement migration as one implicit transaction, and
+-- this migration is registered no_tx, so there is no enclosing application
+-- transaction. Commit every object above before inspecting the public
+-- catalog.
+COMMIT;
+
+-- Fail closed on same-name drift (blocking review finding, 2026-08-16).
+-- Every object above is created with IF NOT EXISTS so that a process death
+-- between a committed schema change and SQLx's history row is resumable.
+-- IF NOT EXISTS alone would also ADOPT an unrelated object that merely
+-- shares the name: a forged memory_writer_authority_v1 returning a constant
+-- head_state, or a memory_evidence_quarantine carrying a payload column,
+-- would be recorded as a successful version 18. Migrations 0015 through
+-- 0017 pair IF NOT EXISTS with an exact catalog assertion for exactly this
+-- reason; these three blocks do the same for every relation this migration
+-- claims to create. Stop on 55000: the named object is not the object this
+-- migration defines, and no later privilege or append decision may rest on
+-- it.
+DO $$
+DECLARE
+    drifted STRING;
+BEGIN
+    SELECT string_agg(expected.relation_name, ', ' ORDER BY expected.relation_name)
+    INTO drifted
+    FROM (VALUES
+        ('memory_evidence_shard_heads',
+            'tenant_id:uuid:NO,project:text:NO,epoch_id:bytea:NO,shard:integer:NO,shard_count:integer:NO,last_committed_offset:bigint:NO,chain_digest:bytea:NO,advanced_at:timestamp with time zone:NO'),
+        ('memory_evidence_events',
+            'tenant_id:uuid:NO,project:text:NO,epoch_id:bytea:NO,shard:integer:NO,committed_offset:bigint:NO,event_id:bytea:NO,event_schema_version:integer:NO,event_kind:text:NO,semantic_object_digest:bytea:NO,consistency_family:text:NO,consistency_key_digest:bytea:NO,canonical_event:bytea:NO,previous_chain_digest:bytea:NO,chain_digest:bytea:NO,accepted_at:timestamp with time zone:NO'),
+        ('memory_evidence_quarantine',
+            'tenant_id:uuid:NO,project:text:NO,quarantine_id:bytea:NO,connector_principal_id:text:NO,connector_instance_id:text:NO,delivery_id:text:NO,attempt_count:integer:NO,source_fact_id:bytea:YES,representation_key_digest:bytea:YES,canonical_payload_digest:bytea:NO,diagnostic:bytea:NO,reason:text:NO,received_at:timestamp with time zone:NO'),
+        ('memory_content_objects',
+            'tenant_id:uuid:NO,project:text:NO,storage_identity:bytea:NO,protection_domain_id:text:NO,media_type:text:NO,byte_length:bigint:NO,content_digest:bytea:NO,retention_class:text:NO,retention_policy_entry_id:text:NO,retention_policy_entry_version:integer:NO,retention_policy_digest:bytea:NO,wrapped_dek:bytea:NO,encrypted_bytes:bytea:NO,erasure_representation_digest:bytea:YES,erasure_source_fact_digest:bytea:YES,erasure_resource_digest:bytea:YES,erasure_privacy_subject_digest:bytea:YES,created_at:timestamp with time zone:NO'),
+        ('memory_relation_projection_v1',
+            'tenant_id:uuid:NO,project:text:NO,relation_fingerprint:bytea:NO,projection_state:text:NO,last_verdict:text:NO,last_basis:text:NO,last_event_id:bytea:NO,generation:bigint:NO,updated_at:timestamp with time zone:NO'),
+        ('memory_relation_projection_watermarks_v1',
+            'tenant_id:uuid:NO,project:text:NO,ledger_family:text:NO,shard:integer:NO,last_committed_offset:bigint:NO,updated_at:timestamp with time zone:NO'),
+        ('memory_writer_authority_v1',
+            'tenant_id:uuid:YES,project:text:YES,bootstrap_receipt_digest:bytea:YES,bootstrap_canonical_receipt:bytea:YES,bootstrap_epoch_id:bytea:YES,bootstrap_shard_count:integer:YES,bootstrap_contract_tenant_namespace:text:YES,bootstrap_contract_project_namespace:text:YES,log_epoch_id:bytea:YES,partition_recipe_id:text:YES,partition_recipe_version:integer:YES,partition_algorithm:text:YES,partition_seed:bytea:YES,log_shard_count:integer:YES,head_state:text:YES,generation:bigint:YES,activation_id:bytea:YES,package_digest:bytea:YES,activation_policy_digest:bytea:YES,profile_id:text:YES,profile_digest:bytea:YES,vector_manifest_digest:bytea:YES,contract_tenant_namespace:text:YES,contract_project_namespace:text:YES,effective_from:timestamp with time zone:YES,accepted_at:timestamp with time zone:YES,canonical_head:bytea:YES,root_activation_id:bytea:YES,root_package_digest:bytea:YES,root_activation_policy_digest:bytea:YES,predecessor_generation:bigint:YES,predecessor_activation_id:bytea:YES,predecessor_package_digest:bytea:YES,predecessor_activation_policy_digest:bytea:YES')
+    ) AS expected (relation_name, column_shape)
+    WHERE expected.column_shape IS DISTINCT FROM (
+        SELECT string_agg(
+            column_object.column_name || ':' || column_object.data_type
+                || ':' || column_object.is_nullable,
+            ','
+            ORDER BY column_object.ordinal_position
+        )
+        FROM information_schema.columns AS column_object
+        WHERE column_object.table_schema = 'public'
+          AND column_object.table_name = expected.relation_name
+    );
+
+    IF drifted IS NOT NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'migration 0018 same-name relation drift: ' || drifted;
+    END IF;
+END
+$$;
+
+-- The authority view is the writer's only registry/bootstrap read path
+-- (ADR 0002 D4) and it resolves its base-table reads with its OWNER's
+-- privileges, so an adopted same-name view is a direct authority forgery:
+-- its columns, its owner, and its exact definition are all pinned.
+DO $$
+DECLARE
+    view_kind       STRING;
+    view_owner      STRING;
+    view_definition STRING;
+BEGIN
+    SELECT
+        relation_object.relkind::STRING,
+        owner_role.rolname,
+        pg_catalog.pg_get_viewdef(relation_object.oid)
+    INTO view_kind, view_owner, view_definition
+    FROM pg_catalog.pg_class AS relation_object
+    JOIN pg_catalog.pg_namespace AS schema_object
+        ON schema_object.oid = relation_object.relnamespace
+    JOIN pg_catalog.pg_roles AS owner_role
+        ON owner_role.oid = relation_object.relowner
+    WHERE schema_object.nspname = 'public'
+      AND relation_object.relname = 'memory_writer_authority_v1';
+
+    IF view_kind IS DISTINCT FROM 'v' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'memory_writer_authority_v1 is not a view';
+    END IF;
+    IF view_owner IS DISTINCT FROM pg_catalog.current_user() THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'memory_writer_authority_v1 is not owned by this migrator';
+    END IF;
+    IF view_definition IS DISTINCT FROM format(
+        'SELECT head.tenant_id AS tenant_id, head.project AS project, bootstrap.receipt_digest AS bootstrap_receipt_digest, bootstrap.canonical_receipt AS bootstrap_canonical_receipt, bootstrap.epoch_id AS bootstrap_epoch_id, bootstrap.shard_count AS bootstrap_shard_count, bootstrap.contract_tenant_namespace AS bootstrap_contract_tenant_namespace, bootstrap.contract_project_namespace AS bootstrap_contract_project_namespace, epoch.epoch_id AS log_epoch_id, epoch.partition_recipe_id AS partition_recipe_id, epoch.partition_recipe_version AS partition_recipe_version, epoch.partition_algorithm AS partition_algorithm, epoch.partition_seed AS partition_seed, epoch.shard_count AS log_shard_count, head.head_state AS head_state, head.generation AS generation, head.activation_id AS activation_id, head.package_digest AS package_digest, head.activation_policy_digest AS activation_policy_digest, head.profile_id AS profile_id, head.profile_digest AS profile_digest, head.vector_manifest_digest AS vector_manifest_digest, head.contract_tenant_namespace AS contract_tenant_namespace, head.contract_project_namespace AS contract_project_namespace, head.effective_from AS effective_from, head.accepted_at AS accepted_at, head.canonical_head AS canonical_head, transition.root_activation_id AS root_activation_id, transition.root_package_digest AS root_package_digest, transition.root_activation_policy_digest AS root_activation_policy_digest, transition.predecessor_generation AS predecessor_generation, transition.predecessor_activation_id AS predecessor_activation_id, transition.predecessor_package_digest AS predecessor_package_digest, transition.predecessor_activation_policy_digest AS predecessor_activation_policy_digest FROM %I.public.memory_registry_current_heads_v2 AS head JOIN %I.public.memory_registry_transitions AS transition ON ((((((((((((((((transition.tenant_id = head.tenant_id) AND (transition.project = head.project)) AND (transition.generation = head.generation)) AND (transition.activation_id = head.activation_id)) AND (transition.package_digest = head.package_digest)) AND (transition.activation_policy_digest = head.activation_policy_digest)) AND (transition.profile_id = head.profile_id)) AND (transition.profile_digest = head.profile_digest)) AND (transition.vector_manifest_digest = head.vector_manifest_digest)) AND (transition.contract_tenant_namespace = head.contract_tenant_namespace)) AND (transition.contract_project_namespace = head.contract_project_namespace)) AND (transition.effective_from = head.effective_from)) AND (transition.accepted_at = head.accepted_at)) AND (transition.source_event_id = head.source_event_id)) AND (transition.source_epoch_id = head.source_epoch_id)) AND (transition.source_shard = head.source_shard)) AND (transition.source_committed_offset = head.source_committed_offset) JOIN %I.public.memory_control_bootstraps AS bootstrap ON (bootstrap.tenant_id = head.tenant_id) AND (bootstrap.project = head.project) JOIN %I.public.memory_control_log_epochs AS epoch ON ((epoch.tenant_id = head.tenant_id) AND (epoch.project = head.project)) AND (epoch.bootstrap_receipt_digest = bootstrap.receipt_digest)',
+        current_database(), current_database(), current_database(), current_database()
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'memory_writer_authority_v1 catalog definition mismatch';
+    END IF;
+END
+$$;
+
+-- The evidence ledger has exactly ONE foreign key: events -> heads, inside the
+-- evidence plane. The head table must have NO foreign key at all (ADR 0002 D1
+-- amendment): a head FK aimed at memory_control_log_epochs would make the
+-- appender's lazy seed impossible without a control-plane SELECT grant and
+-- would reopen the boundary D2 closes.
+DO $$
+DECLARE
+    head_foreign_keys INT8;
+    event_head_fk     STRING;
+BEGIN
+    SELECT count(*)
+    INTO head_foreign_keys
+    FROM pg_catalog.pg_constraint AS constraint_object
+    WHERE constraint_object.conrelid
+            = 'public.memory_evidence_shard_heads'::REGCLASS
+      AND constraint_object.contype = 'f';
+
+    SELECT pg_catalog.pg_get_constraintdef(constraint_object.oid)
+    INTO event_head_fk
+    FROM pg_catalog.pg_constraint AS constraint_object
+    WHERE constraint_object.conrelid
+            = 'public.memory_evidence_events'::REGCLASS
+      AND constraint_object.conname = 'memory_evidence_event_head_fk';
+
+    IF head_foreign_keys IS DISTINCT FROM 0 THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'memory_evidence_shard_heads must carry no foreign key';
+    END IF;
+    IF event_head_fk IS DISTINCT FROM
+        'FOREIGN KEY (tenant_id, project, epoch_id, shard) REFERENCES memory_evidence_shard_heads(tenant_id, project, epoch_id, shard)'
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'memory_evidence_event_head_fk does not bind the evidence shard head';
+    END IF;
+END
+$$;

@@ -2520,7 +2520,7 @@ mod tests {
             ),
             (
                 STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL,
-                "40305fa4239c446b894ba9ec5b513a19905dc930628749b34904a4b6846fec49",
+                "9e5c0c2dba9fb4c0baedae1ee481894dffbb1df0d7949c0b41759475a541b7f6",
             ),
         ] {
             assert_eq!(format!("{:x}", Sha256::digest(migration)), expected_sha256);
@@ -3036,6 +3036,7 @@ mod tests {
     /// evidence ledger must mirror the control ledger without inheriting its
     /// governance kinds, and it must never become a second log epoch.
     #[test]
+    #[allow(clippy::too_many_lines)] // one shape contract, asserted in one place
     fn stage4_evidence_ledger_migration_is_additive_bounded_and_governance_free() {
         let migration = STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL;
         let tables = [
@@ -3062,12 +3063,35 @@ mod tests {
         assert_eq!(migration.matches("CREATE VIEW ").count(), 1);
         assert!(migration.contains("CREATE VIEW IF NOT EXISTS memory_writer_authority_v1 AS"));
 
-        // The evidence head shares the control ledger's single genesis epoch
-        // instead of minting its own, so UNIQUE (tenant_id, project) on
-        // memory_control_log_epochs keeps the single-epoch invariant literal.
-        assert!(migration.contains(
-            "REFERENCES memory_control_log_epochs (tenant_id, project, epoch_id, shard_count)"
-        ));
+        // ADR 0002 D1 amendment (2026-08-16): the evidence head table carries
+        // NO foreign key at all, and no relation in this migration may target a
+        // control or registry parent. CockroachDB v26.2.3 evaluates a
+        // foreign-key check with the INSERTING role's privileges, so a
+        // control-plane parent would make D1's lazy head seed impossible for a
+        // role that D2 denies every control grant (observed SQLSTATE 42501),
+        // and that grant is not durable either: control-role-grants.sql REVOKEs
+        // ALL on memory_control_log_epochs FROM fleet_runtime on every reapply.
+        // The events -> heads edge stays, inside the evidence plane.
+        assert!(
+            !migration.contains("REFERENCES memory_control_"),
+            "no evidence-plane foreign key may target a control-plane table"
+        );
+        assert!(
+            !migration.contains("REFERENCES memory_registry_"),
+            "no evidence-plane foreign key may target a registry table"
+        );
+        // One declared foreign key (events -> heads) plus the closing catalog
+        // assertion that pins its exact definition.
+        assert_eq!(migration.matches("FOREIGN KEY ").count(), 2);
+        assert_eq!(
+            migration
+                .matches("        FOREIGN KEY (tenant_id, project, epoch_id, shard)\n")
+                .count(),
+            1
+        );
+        assert!(migration.contains("epoch_id                    BYTES NOT NULL"));
+        assert!(migration.contains("CONSTRAINT memory_evidence_head_epoch_id_shape"));
+        assert!(migration.contains("CONSTRAINT memory_evidence_head_shard_count_bound"));
         assert!(migration.contains(
             "REFERENCES memory_evidence_shard_heads (tenant_id, project, epoch_id, shard)"
         ));
@@ -3135,6 +3159,33 @@ mod tests {
             );
         }
         assert!(!migration.contains(" DEFAULT "));
+
+        // Same-name drift must fail closed rather than be adopted. IF NOT
+        // EXISTS alone would record a forged authority view or a quarantine
+        // table carrying a payload column as a successful version 18.
+        assert_eq!(migration.matches("ERRCODE = '55000'").count(), 6);
+        for drift_assertion in [
+            "migration 0018 same-name relation drift: ",
+            "memory_writer_authority_v1 is not a view",
+            "memory_writer_authority_v1 is not owned by this migrator",
+            "memory_writer_authority_v1 catalog definition mismatch",
+            "memory_evidence_shard_heads must carry no foreign key",
+            "memory_evidence_event_head_fk does not bind the evidence shard head",
+        ] {
+            assert!(
+                migration.contains(drift_assertion),
+                "migration 0018 must fail closed with {drift_assertion}"
+            );
+        }
+        for relation in tables
+            .iter()
+            .chain(std::iter::once(&"memory_writer_authority_v1"))
+        {
+            assert!(
+                migration.contains(&format!("        ('{relation}',")),
+                "{relation} must be covered by the same-name drift assertion"
+            );
+        }
     }
 
     #[test]

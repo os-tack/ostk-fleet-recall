@@ -14,9 +14,10 @@
 physical pair `memory_evidence_events` + `memory_evidence_shard_heads` that structurally mirrors
 `memory_control_events` + `memory_control_shard_heads` (every 0003 CHECK, the events→heads FK,
 `UNIQUE (tenant_id, project, event_id)`, and the 0005 predecessor-unique index). They share ONE
-semantic ledger contract with the control ledger: the same genesis log-epoch row (the evidence
-head table's composite FK targets `memory_control_log_epochs (tenant_id, project, epoch_id,
-shard_count)`; `UNIQUE (tenant_id, project)` on epochs is untouched, so the single-epoch invariant
+semantic ledger contract with the control ledger: the same genesis log-epoch row (the evidence head table carries
+`epoch_id` and `shard_count` with the same shape CHECKs as the control head table, and the appender
+binds them to the single epoch row through `memory_writer_authority_v1` inside the append
+transaction; `UNIQUE (tenant_id, project)` on epochs is untouched, so the single-epoch invariant
 stays literal), the same partition recipe/seed/shard count (16), the same `AppendPositionV1`
 algebra, the same `derive_append_chain_digest` chain recipe, the same FOR UPDATE head lock plus
 CAS advance, and one `event_kind` / `consistency_family` namespace across both ledgers.
@@ -35,6 +36,16 @@ NEW domain `ostk-evidence-genesis-chain-v1` (framed over `epoch_id`, `shard`), n
 grants no forgeable authority; a CHECK pinning the offset-0 digest shape is recommended where the
 SQL is expressible.
 
+**Amendment (2026-08-16, after review of migration 0018).** The evidence head table deliberately
+has NO foreign key to `memory_control_log_epochs`: on CockroachDB v26.2.3 a foreign-key check runs
+with the writer's privileges, so such an FK would force a `SELECT` grant on a control table for
+`fleet_runtime` (SQLSTATE 42501 on lazy head seeding otherwise) and would reopen the
+control/runtime privilege boundary that D2 closes. Epoch binding is enforced by the appender (the
+head's `epoch_id`/`shard_count` must equal the authority view's genesis epoch inside the same
+serializable transaction) and proven by W1-APPEND live tests and the runtime proof; the
+events→heads FK inside the evidence plane remains. A CockroachDB FK to control tables is not to be
+reintroduced without amending D2.
+
 **Why.** Table-level grants are the only privilege primitive this schema relies on. Sharing
 `memory_control_events` would hand the serving process raw INSERT into the governance ledger —
 exactly the wedge that migration 0005's comment names — and would force re-audit of every bounded
@@ -48,7 +59,12 @@ not a relaxation of any invariant (EVENT-03, REPLAY-01/02, EVID-01).
 transaction (EVENT-03); one transaction is one connection is one role, so the appending identity is
 `fleet_runtime`. It gains exactly: `SELECT, INSERT` on `memory_evidence_events`; `SELECT, INSERT,
 UPDATE` on `memory_evidence_shard_heads`; `SELECT, INSERT` on `memory_content_objects` (D5);
-`SELECT` on the read-only view `memory_writer_authority_v1` (D4). It gains NO privilege on any
+`SELECT` on the read-only view `memory_writer_authority_v1` (D4); and, because the appender and the
+relation projector run inside the same runtime process and transaction, `SELECT, INSERT` on
+`memory_evidence_quarantine` and `SELECT, INSERT, UPDATE` on `memory_relation_projection_v1` and
+`memory_relation_projection_watermarks_v1` (amendment 2026-08-16: the initial 0018 policy commit may
+carry only the first four relations; the remaining three are added in the same wave before W1-APPEND
+and W1-REL merge). It gains NO privilege on any
 `memory_control_*` or `memory_registry_*` base table; the control and successor policies' REVOKE
 lists stay byte-identical. The runtime-role proof's exact matrix count is recomputed from the
 final grant list, and every source-manifest / policy-digest / LocalStack refreeze for D2+D3+D4
@@ -120,8 +136,8 @@ third-party dependencies from Wave 1 and Wave 2: zero.
 
 ## Migration 0018 shape (single additive migration for Wave 1)
 
-`memory_evidence_shard_heads`, `memory_evidence_events` (D1, with the governance-kind CHECK and
-0005-style predecessor-unique index); `memory_evidence_quarantine` (W0-QUAR record: quarantine ID,
+`memory_evidence_shard_heads` (no FK to control tables — see the D1 amendment), `memory_evidence_events`
+(D1, with the governance-kind CHECK and 0005-style predecessor-unique index; the events→heads FK stays); `memory_evidence_quarantine` (W0-QUAR record: quarantine ID,
 scope, connector principal/instance, delivery ID + attempt count, optional source-fact ID /
 representation key, canonical payload DIGEST only, bounded diagnostic BYTES ≤ 4096, reason,
 received_at; no payload bytes column); `memory_content_objects` (D5);
