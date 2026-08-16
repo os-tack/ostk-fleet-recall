@@ -24,18 +24,15 @@
 //! bound server-side by the receipt; it never enters statement identity,
 //! exactly like an embedding vector under REPLAY-01. The receipt's
 //! `summary_enrichment_digest` commits to the exact authored bytes under the
-//! dedicated `ostk-consolidation-summary-enrichment-v1` domain, filed with
-//! the REG lane for the W0-REG slot (`.fleet-recall/coordination/requests/
+//! dedicated `ostk-consolidation-summary-enrichment-v1` domain
+//! (`.fleet-recall/coordination/requests/
 //! 2026-08-16-kimi-reg-summary-enrichment-domain.md`). The statement, policy,
 //! receipt, and summary-enrichment digest constructors use the consolidation
 //! `DigestDomain` variants accepted by the REG lane (`.fleet-recall/
 //! coordination/requests/2026-08-16-fable-re-consolidation-digest-domains.md`)
-//! and landing with W0-REG. Until the variants merge, `validate_derivation`
-//! recomputes the policy body digest through a private prefix constant whose
-//! framing is byte-identical to `domain_separated_digest` (reconciliation
-//! option (b)), and the frozen fixtures carry the exact values computed under
-//! the frozen formula, so the follow-up swap to the typed variants changes no
-//! fixture bytes.
+//! and landed with W0-REG. `validate_derivation` recomputes the policy body
+//! digest through `domain_separated_digest`, and the frozen fixtures carry
+//! the exact values computed under the frozen formula.
 //!
 //! Scope containment (CONS-06) is a repository seam duty in the same pattern
 //! as `remember_v2`: the statement's single `scope` is server-derived, and
@@ -60,13 +57,12 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use super::{
     ContractError, ContractResult,
     canonical::encode_canonical,
     common::{AuthenticatedProjectScopeV1, ContractId, ProfileReferenceV1, RegistryReferenceV1},
-    digest::Sha256Digest,
+    digest::{DigestDomain, Sha256Digest, domain_separated_digest},
     evidence::AcceptedEventId,
     genesis::PropositionModalityV1,
     remember_v2::{
@@ -81,24 +77,6 @@ const MAX_CONSOLIDATION_SOURCES: u32 = 64;
 const MAX_CONFLICT_REFERENCES: usize = 64;
 const MAX_CONSOLIDATION_DEPTH: u32 = 8;
 const MAX_ACCEPTED_EVENT_IDS: usize = 256;
-
-/// Policy body digest prefix accepted by the REG lane
-/// (`.fleet-recall/coordination/requests/2026-08-16-fable-re-consolidation-digest-domains.md`)
-/// and landing as a `DigestDomain` variant with W0-REG. Until then the
-/// recompute below frames through this private constant exactly like
-/// `digest::domain_separated_digest` (reconciliation option (b)); the swap to
-/// the variant changes no digest values and no fixture bytes.
-const CONSOLIDATION_POLICY_V1_DIGEST_PREFIX: &str = "ostk-consolidation-policy-v1";
-
-/// `SHA-256(prefix || 0x00 || bytes)`, byte-identical to
-/// `digest::domain_separated_digest` under the accepted prefixes.
-fn consolidation_domain_digest(prefix: &str, bytes: &[u8]) -> Sha256Digest {
-    let mut hash = Sha256::new();
-    hash.update(prefix.as_bytes());
-    hash.update([0]);
-    hash.update(bytes);
-    Sha256Digest::from_bytes(hash.finalize().into())
-}
 
 macro_rules! digest_newtype {
     ($name:ident) => {
@@ -165,6 +143,12 @@ const fn modality_strength(modality: PropositionModalityV1) -> u8 {
 /// discrepancy-family fingerprint contract owned by the episode workstream;
 /// it remains an opaque digest here so this module does not depend on that
 /// unlanded contract.
+///
+/// The seam's mapping from the six-state conflict lifecycle is total and
+/// conservative: `open` and `acknowledged` map to `Open` (an unresolved
+/// incompatibility is never launderable), `waived` maps to `Waived`, and
+/// `resolved`, `dismissed`, and `superseded` map to `Clear` (no live
+/// incompatibility remains).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConsolidationSourceConflictStateV1 {
@@ -539,8 +523,8 @@ impl ConsolidationStatementV1 {
                 "consolidation policy does not match its registry reference".into(),
             ));
         }
-        let recomputed_policy_digest = consolidation_domain_digest(
-            CONSOLIDATION_POLICY_V1_DIGEST_PREFIX,
+        let recomputed_policy_digest = domain_separated_digest(
+            DigestDomain::ConsolidationPolicyV1,
             &encode_canonical(policy)?,
         );
         if recomputed_policy_digest != self.policy_digest {
@@ -629,8 +613,8 @@ pub enum ConsolidationOutcomeV1 {
 /// is verified against the accepted event, and the summary enrichment digest
 /// is bound here, server-side, precisely so that narrative bytes stay out of
 /// derivation identity (CONS-05). The enrichment digest commits to the exact
-/// authored summary bytes under the existing `ostk-body-v1` body domain; see
-/// the module docs.
+/// authored summary bytes under the dedicated
+/// `ostk-consolidation-summary-enrichment-v1` domain; see the module docs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsolidationReceiptV1 {
@@ -740,6 +724,7 @@ mod tests {
         canonical::{decode_strict, require_canonical},
         common::{CanonicalTimestamp, frozen_profile_reference_v1},
     };
+    use sha2::{Digest as _, Sha256};
 
     const POLICY_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/consolidation/consolidation-policy-v1.jsonl"
@@ -855,12 +840,6 @@ mod tests {
         "7138f4ace88e25750277b762b22630d7c56b4894441a8d85fcf3394c15e6b366";
     const VECTOR_SUITE_RAW_SHA256: &str =
         "b1a33cdb6c1e3c8543ebd077e0cce0abe536357f35cee7c84be337a67f427773";
-
-    /// Statement identity and summary enrichment prefixes, accepted by / filed
-    /// with the REG lane and landing as `DigestDomain` variants with W0-REG.
-    const CONSOLIDATION_STATEMENT_V1_DIGEST_PREFIX: &str = "ostk-consolidation-statement-v1";
-    const CONSOLIDATION_SUMMARY_ENRICHMENT_V1_DIGEST_PREFIX: &str =
-        "ostk-consolidation-summary-enrichment-v1";
 
     /// Statement identity minted over the canonical statement bytes under the
     /// accepted W0-REG `ostk-consolidation-statement-v1` domain prefix. The
@@ -1002,8 +981,8 @@ mod tests {
         statement: &mut ConsolidationStatementV1,
         policy: &ConsolidationPolicyV1,
     ) {
-        statement.policy_digest = consolidation_domain_digest(
-            CONSOLIDATION_POLICY_V1_DIGEST_PREFIX,
+        statement.policy_digest = domain_separated_digest(
+            DigestDomain::ConsolidationPolicyV1,
             &encode_canonical(policy).expect("encode policy"),
         );
     }
@@ -1595,8 +1574,8 @@ mod tests {
                 .parse()
                 .expect("statement identity hex");
         assert_eq!(receipt.statement_id.digest(), expected_identity);
-        let recomputed_identity = consolidation_domain_digest(
-            CONSOLIDATION_STATEMENT_V1_DIGEST_PREFIX,
+        let recomputed_identity = domain_separated_digest(
+            DigestDomain::ConsolidationStatementV1,
             &encode_canonical(&statement).expect("encode statement"),
         );
         assert_eq!(recomputed_identity, expected_identity);
@@ -1604,8 +1583,8 @@ mod tests {
         // The receipt's summary enrichment digest commits to the exact
         // authored summary bytes carried by the request fixture under the
         // dedicated summary-enrichment prefix.
-        let recomputed_summary = consolidation_domain_digest(
-            CONSOLIDATION_SUMMARY_ENRICHMENT_V1_DIGEST_PREFIX,
+        let recomputed_summary = domain_separated_digest(
+            DigestDomain::ConsolidationSummaryEnrichmentV1,
             request.summary_text.as_str().as_bytes(),
         );
         assert_eq!(receipt.summary_enrichment_digest, recomputed_summary);
