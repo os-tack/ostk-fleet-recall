@@ -33,13 +33,17 @@
 //! collapsing them into one opaque rejection, so a reviewer can see exactly
 //! which requirement was not met.
 //!
-//! [`evaluate_ratification`] is the pure v1 ratification policy (AUTH-03,
-//! ACT-04): no positive `caused_by` conclusion is admissible below
-//! `intervention_supported`; `primary_trigger` additionally requires an
-//! independent second confirmation; and the ratifier can never be the
-//! proposing agent, the executor, or an author of the implicated change,
-//! except under a previously activated signed separation-of-duty policy that
-//! an agent ratifier can never invoke.
+//! [`evaluate_ratification`] is the pure v1 ratification policy (CAUS-01,
+//! AUTH-03, ACT-04): it requires the exact [`CausalHypothesisV1`] (and, when
+//! claimed, the exact [`InterventionSupportV1`]) the record binds to, both
+//! checked for scope and identity equality; no positive `caused_by`
+//! conclusion is admissible below `intervention_supported`; `primary_trigger`
+//! additionally requires an independent second confirmation; a `refuted` or
+//! `superseded` conclusion can never carry a causal role; unreconciled
+//! opposing evidence blocks a `ratified` conclusion; and the ratifier can
+//! never be the proposing agent, the executor, or an author of the
+//! implicated change, except under a previously activated signed
+//! separation-of-duty policy that an agent ratifier can never invoke.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use unicode_normalization::UnicodeNormalization;
@@ -310,6 +314,14 @@ impl MaterialInputObservationV1 {
     const fn is_changed(&self) -> bool {
         matches!(self, Self::Changed { .. })
     }
+
+    /// Whether this registered component was left unobserved (RUN-03,
+    /// PRED-03). An unobserved entry never implies "unchanged" — a caller
+    /// checking coverage must inspect this directly rather than treating an
+    /// absent `Changed` as a negative result.
+    const fn is_unobserved(&self) -> bool {
+        matches!(self, Self::Unobserved)
+    }
 }
 
 /// One registered material input and what was observed for it.
@@ -353,6 +365,16 @@ fn changed_delta_count(deltas: &[MaterialInputDeltaV1]) -> usize {
         .iter()
         .filter(|delta| delta.observation.is_changed())
         .count()
+}
+
+/// Whether any registered material input in this inventory was left
+/// unobserved. An intervention record built on an inventory with even one
+/// unobserved entry cannot prove the material inputs it did not look at
+/// stayed constant, so it can never justify `intervention_supported`
+/// (RUN-03: "explicitly reports every unknown or unobserved dimension" is
+/// not satisfied by silently reading a gap as "unchanged").
+fn has_unobserved_delta(deltas: &[MaterialInputDeltaV1]) -> bool {
+    deltas.iter().any(|delta| delta.observation.is_unobserved())
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +736,11 @@ impl InterventionSupportV1 {
         validate_material_input_deltas(&self.material_input_deltas)?;
         let changed = changed_delta_count(&self.material_input_deltas);
         let separation_is_consistent = match &self.material_input_separation {
-            MaterialInputSeparationV1::SingleInputChanged => changed <= 1,
+            // Exactly one changed input, not merely "at most one": a record
+            // that declares `single_input_changed` while its own inventory
+            // shows zero changed inputs is internally inconsistent and must
+            // be rejected at the shape level, not silently accepted.
+            MaterialInputSeparationV1::SingleInputChanged => changed == 1,
             MaterialInputSeparationV1::MultipleInputsInseparable
             | MaterialInputSeparationV1::MultipleInputsIsolated { .. } => changed >= 2,
         };
@@ -742,6 +768,13 @@ impl InterventionSupportV1 {
     /// Whether this intervention is bound to the exact hypothesis: same
     /// causal identities and the exact same pre-recorded mechanism
     /// commitment (not merely an equal-looking narrative).
+    ///
+    /// This deliberately does *not* check `self.scope == hypothesis.scope`
+    /// (CAUS-01 scope binding) — that is checked separately by
+    /// [`derive_intervention_support_level`] under the distinct
+    /// [`InterventionUnreachableReasonV1::ScopeMismatch`] reason, so a
+    /// reviewer can tell a cross-tenant/cross-project binding attempt apart
+    /// from an identity/mechanism mismatch.
     pub fn binds_hypothesis(&self, hypothesis: &CausalHypothesisV1) -> ContractResult<bool> {
         self.validate_shape()?;
         hypothesis.validate_shape()?;
@@ -766,14 +799,26 @@ impl InterventionSupportV1 {
     }
 }
 
+/// Whether every component the hypothesis registered is present in what the
+/// intervention actually observed, *and* agrees with it.
+///
+/// A registered component the hypothesis left `Unobserved` may be covered by
+/// any observation for that component (the intervention is free to be the
+/// first to actually look). A registered component the hypothesis already
+/// characterized as `Changed` or `Unchanged` must be covered by the exact
+/// same observation: an intervention that reports `Unobserved`, or a
+/// different before/after digest, for a component the hypothesis already
+/// pinned is a contradiction, not corroboration, and must not bind.
 fn registered_components_are_covered(
     registered: &[MaterialInputDeltaV1],
     observed: &[MaterialInputDeltaV1],
 ) -> bool {
     registered.iter().all(|component| {
-        observed
-            .iter()
-            .any(|candidate| candidate.component == component.component)
+        observed.iter().any(|candidate| {
+            candidate.component == component.component
+                && (component.observation.is_unobserved()
+                    || candidate.observation == component.observation)
+        })
     })
 }
 
@@ -787,9 +832,20 @@ fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterventionUnreachableReasonV1 {
+    /// The intervention's authenticated tenant/project scope does not
+    /// exactly match the hypothesis's (CAUS-01 scope binding). Distinct from
+    /// [`Self::HypothesisMechanismMismatch`] so a cross-tenant or
+    /// cross-project binding attempt is never confused with an ordinary
+    /// identity mismatch inside one scope.
+    ScopeMismatch,
     HypothesisMechanismMismatch,
     ExposureDoesNotPrecedeAndOverlapOnset,
     MaterialInputsChangedInseparably,
+    /// At least one registered material input the intervention reports on
+    /// was left `Unobserved` (RUN-03). A gap in coverage can never be
+    /// silently read as "unchanged" for the purpose of reaching the
+    /// strongest support level.
+    UnobservedMaterialInput,
     PredictionRecordedAfterObservation,
     AmbiguousExecutionOutcome,
     MixedCohorts,
@@ -813,6 +869,12 @@ pub fn derive_intervention_support_level(
     intervention.validate_shape()?;
 
     let mut reasons = Vec::new();
+    // CAUS-01 scope binding: an intervention authenticated under a different
+    // tenant or project can never support a hypothesis outside its own
+    // scope, regardless of how well every other identity lines up.
+    if intervention.scope != hypothesis.scope {
+        reasons.push(InterventionUnreachableReasonV1::ScopeMismatch);
+    }
     if !intervention.binds_hypothesis(hypothesis)? {
         reasons.push(InterventionUnreachableReasonV1::HypothesisMechanismMismatch);
     }
@@ -824,6 +886,9 @@ pub fn derive_intervention_support_level(
         MaterialInputSeparationV1::MultipleInputsInseparable
     ) {
         reasons.push(InterventionUnreachableReasonV1::MaterialInputsChangedInseparably);
+    }
+    if has_unobserved_delta(&intervention.material_input_deltas) {
+        reasons.push(InterventionUnreachableReasonV1::UnobservedMaterialInput);
     }
     if !hypothesis
         .mechanism
@@ -1052,27 +1117,68 @@ impl CausalConclusionV1 {
     }
 }
 
+/// A reconciliation of one item of opposing evidence: who reconciled it,
+/// when, and its disposition.
+///
+/// Its presence is what lets
+/// [`evaluate_ratification`] admit a `Ratified` conclusion despite the
+/// opposing evidence still being cited (doc line 1467: "All verified
+/// opposing evidence must be reconciled or the causal claim remains open").
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpposingEvidenceReconciliationV1 {
+    pub reconciled_by_principal_id: ContractId,
+    pub reconciled_at: CanonicalTimestamp,
+    pub disposition: ContractId,
+}
+
+/// One item of opposing evidence cited by a ratification, and — if it no
+/// longer blocks that ratification — the exact reconciliation that resolved
+/// it.
+///
+/// `reconciliation: None` means unreconciled:
+/// [`evaluate_ratification`] blocks any `Ratified` conclusion that cites an
+/// unreconciled item.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpposingEvidenceEntryV1 {
+    pub event: AcceptedEventId,
+    pub reconciliation: Option<OpposingEvidenceReconciliationV1>,
+}
+
 /// The exact ratification record (lines 1418-1476).
 ///
-/// Hypothesis and
-/// evidence-bundle digests, causal role and bounded scope, achieved support,
-/// supporting/opposing evidence, an explicit empty set of unresolved
-/// required gaps, non-blocking residual unknowns, policy version, closure
-/// watermark, and the separation-of-duty result.
+/// The exact hypothesis
+/// fingerprint and, when it rests on one, the exact intervention-support
+/// digest, evidence-bundle digests, causal role and bounded scope, achieved
+/// support, supporting/opposing evidence, an explicit empty set of
+/// unresolved required gaps, non-blocking residual unknowns, policy
+/// version, closure watermark, and the separation-of-duty result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CausalRatificationV1 {
     pub schema_version: u32,
     pub profile: ProfileReferenceV1,
     pub scope: AuthenticatedProjectScopeV1,
-    pub hypothesis_commitment_digest: Sha256Digest,
+    /// The exact [`CausalHypothesisV1::fingerprint`] this record ratifies —
+    /// not merely the mechanism's own commitment digest, which two
+    /// hypotheses with different cause/outcome/workload/artifact/environment
+    /// identities can share (they differ only in narrative, direction, and
+    /// timestamp). See [`Self::binds_hypothesis`].
+    pub hypothesis_fingerprint: Sha256Digest,
+    /// The exact [`InterventionSupportV1::digest`] this record's
+    /// `achieved_support` rests on, when it rests on one. `None` is only
+    /// consistent with a conclusion that does not claim
+    /// `intervention_supported` for a positive causal role — see
+    /// [`Self::binds_intervention`].
+    pub intervention_support_digest: Option<Sha256Digest>,
     pub evidence_bundle_digests: Vec<Sha256Digest>,
     pub conclusion: CausalConclusionV1,
     pub causal_role: Option<CausalRoleV1>,
     pub bounded_scope: ResourceUri,
     pub achieved_support: SupportLevel,
     pub supporting_evidence: Vec<AcceptedEventId>,
-    pub opposing_evidence: Vec<AcceptedEventId>,
+    pub opposing_evidence: Vec<OpposingEvidenceEntryV1>,
     pub unresolved_required_gaps: Vec<ContractId>,
     pub residual_unknowns: Vec<ContractId>,
     pub policy_version: u32,
@@ -1091,7 +1197,10 @@ impl CausalRatificationV1 {
         self.separation_of_duty.validate_shape()?;
         if self.schema_version != CAUSAL_SCHEMA_VERSION
             || self.policy_version == 0
-            || self.hypothesis_commitment_digest == Sha256Digest::ZERO
+            || self.hypothesis_fingerprint == Sha256Digest::ZERO
+            || self
+                .intervention_support_digest
+                .is_some_and(|digest| digest == Sha256Digest::ZERO)
             || self.evidence_bundle_digests.is_empty()
             || self.evidence_bundle_digests.len() > MAX_EVIDENCE_BUNDLE_DIGESTS
             || !strictly_sorted(&self.evidence_bundle_digests)
@@ -1099,13 +1208,19 @@ impl CausalRatificationV1 {
         {
             return Err(ContractError::Schema("invalid causal ratification".into()));
         }
-        for (field, values) in [
-            ("supporting_evidence", &self.supporting_evidence),
-            ("opposing_evidence", &self.opposing_evidence),
-        ] {
-            if values.len() > MAX_EVIDENCE_EVENT_IDS || !strictly_sorted(values) {
-                return Err(ContractError::NonCanonicalSet { field });
-            }
+        if self.supporting_evidence.len() > MAX_EVIDENCE_EVENT_IDS
+            || !strictly_sorted(&self.supporting_evidence)
+        {
+            return Err(ContractError::NonCanonicalSet {
+                field: "supporting_evidence",
+            });
+        }
+        if self.opposing_evidence.len() > MAX_EVIDENCE_EVENT_IDS
+            || !strictly_sorted(&self.opposing_evidence)
+        {
+            return Err(ContractError::NonCanonicalSet {
+                field: "opposing_evidence",
+            });
         }
         if self.unresolved_required_gaps.len() > MAX_UNRESOLVED_GAP_IDS
             || !strictly_sorted(&self.unresolved_required_gaps)
@@ -1132,6 +1247,31 @@ impl CausalRatificationV1 {
         Ok(())
     }
 
+    /// Whether this ratification is bound to the exact hypothesis it claims
+    /// to ratify: same authenticated tenant/project scope (CAUS-01) and the
+    /// exact [`CausalHypothesisV1::fingerprint`] — not merely a mechanism
+    /// commitment that a differently-identified hypothesis could share.
+    ///
+    /// This module never resolves a hypothesis from a digest itself (that is
+    /// a later runtime seam's job); this pure check lets that seam prove one
+    /// ratification record can never be replayed against a hypothesis other
+    /// than the one it names.
+    pub fn binds_hypothesis(&self, hypothesis: &CausalHypothesisV1) -> ContractResult<bool> {
+        self.validate_shape()?;
+        Ok(self.scope == hypothesis.scope
+            && self.hypothesis_fingerprint == hypothesis.fingerprint()?)
+    }
+
+    /// Whether this ratification is bound to the exact
+    /// [`InterventionSupportV1`] it claims `achieved_support` rests on: same
+    /// authenticated tenant/project scope (CAUS-01) and the exact
+    /// [`InterventionSupportV1::digest`].
+    pub fn binds_intervention(&self, intervention: &InterventionSupportV1) -> ContractResult<bool> {
+        self.validate_shape()?;
+        Ok(self.scope == intervention.scope
+            && self.intervention_support_digest == Some(intervention.digest()?))
+    }
+
     pub fn digest(&self) -> ContractResult<Sha256Digest> {
         self.validate_shape()?;
         Ok(domain_separated_digest(
@@ -1147,31 +1287,76 @@ impl CausalRatificationV1 {
 #[serde(rename_all = "snake_case")]
 pub enum RatificationBlockedReasonV1 {
     UnresolvedGapsPresent,
+    /// This record does not bind to the hypothesis it was checked against —
+    /// wrong scope or a fingerprint that does not match
+    /// [`CausalHypothesisV1::fingerprint`] (see
+    /// [`CausalRatificationV1::binds_hypothesis`]).
+    HypothesisBindingMismatch,
+    /// A `Ratified` conclusion with a positive causal role was checked
+    /// without an intervention-support record to bind to at all.
+    MissingInterventionBinding,
+    /// An intervention-support record was supplied but does not bind — wrong
+    /// scope or a digest that does not match
+    /// [`CausalRatificationV1::binds_intervention`].
+    InterventionBindingMismatch,
     CausalRoleRequiredForRatifiedConclusion,
     CausalRoleForbiddenForNonRatifiedConclusion,
     PositiveCauseBelowInterventionSupport,
     PrimaryTriggerRequiresIndependentSecondConfirmation,
+    /// A `Ratified` conclusion cites at least one item of opposing evidence
+    /// with no [`OpposingEvidenceReconciliationV1`] attached (doc line 1467:
+    /// "All verified opposing evidence must be reconciled or the causal
+    /// claim remains open").
+    UnreconciledOpposingEvidencePresent,
+    /// A `Ratified` conclusion with a positive causal role cites no
+    /// supporting evidence at all.
+    SupportingEvidenceRequiredForPositiveCausalRole,
     SeparationOfDutyFailed,
 }
 
 /// Pure v1 ratification admissibility policy (lines 1418-1476, AUTH-03,
 /// ACT-04).
 ///
-/// `unresolved_required_gaps` must be empty for every conclusion.
+/// `unresolved_required_gaps` must be empty for every conclusion, and the
+/// record must bind to the exact `hypothesis` supplied (and, when supplied,
+/// the exact `intervention`) — see
+/// [`CausalRatificationV1::binds_hypothesis`]/[`CausalRatificationV1::binds_intervention`].
 /// A `ratified` conclusion requires a causal role, `achieved_support ==
-/// intervention_supported`, and — for `primary_trigger` — an independent
-/// second confirmation. A `refuted` conclusion may not carry a causal role.
-/// A `superseded` conclusion must cite what it supersedes (checked by
+/// intervention_supported` backed by a bound intervention record, non-empty
+/// supporting evidence, every cited opposing-evidence item reconciled, and —
+/// for `primary_trigger` — an independent second confirmation. A `refuted`
+/// or `superseded` conclusion may not carry a causal role. A `superseded`
+/// conclusion must cite what it supersedes (checked by
 /// [`CausalRatificationV1::validate_shape`]). Every conclusion requires the
 /// separation-of-duty result to pass.
 pub fn evaluate_ratification(
     ratification: &CausalRatificationV1,
+    hypothesis: &CausalHypothesisV1,
+    intervention: Option<&InterventionSupportV1>,
 ) -> ContractResult<Result<(), Vec<RatificationBlockedReasonV1>>> {
     ratification.validate_shape()?;
     let mut reasons = Vec::new();
 
     if !ratification.unresolved_required_gaps.is_empty() {
         reasons.push(RatificationBlockedReasonV1::UnresolvedGapsPresent);
+    }
+
+    if !ratification.binds_hypothesis(hypothesis)? {
+        reasons.push(RatificationBlockedReasonV1::HypothesisBindingMismatch);
+    }
+    match intervention {
+        Some(intervention) => {
+            if !ratification.binds_intervention(intervention)? {
+                reasons.push(RatificationBlockedReasonV1::InterventionBindingMismatch);
+            }
+        }
+        None => {
+            if ratification.conclusion == CausalConclusionV1::Ratified
+                && ratification.causal_role.is_some()
+            {
+                reasons.push(RatificationBlockedReasonV1::MissingInterventionBinding);
+            }
+        }
     }
 
     match ratification.conclusion {
@@ -1189,14 +1374,30 @@ pub fn evaluate_ratification(
                     RatificationBlockedReasonV1::PrimaryTriggerRequiresIndependentSecondConfirmation,
                 );
             }
+            if ratification
+                .opposing_evidence
+                .iter()
+                .any(|entry| entry.reconciliation.is_none())
+            {
+                reasons.push(RatificationBlockedReasonV1::UnreconciledOpposingEvidencePresent);
+            }
+            if ratification.causal_role.is_some() && ratification.supporting_evidence.is_empty() {
+                reasons.push(
+                    RatificationBlockedReasonV1::SupportingEvidenceRequiredForPositiveCausalRole,
+                );
+            }
         }
-        CausalConclusionV1::Refuted => {
+        // A refuted or superseded conclusion may never carry a causal role:
+        // without that, both the achieved-support floor and the
+        // independent-second-confirmation requirement above are moot, so
+        // neither arm can be used to smuggle a positive causal claim past
+        // them at any support level.
+        CausalConclusionV1::Refuted | CausalConclusionV1::Superseded => {
             if ratification.causal_role.is_some() {
                 reasons
                     .push(RatificationBlockedReasonV1::CausalRoleForbiddenForNonRatifiedConclusion);
             }
         }
-        CausalConclusionV1::Superseded => {}
     }
 
     if !evaluate_separation_of_duty(&ratification.separation_of_duty)? {
@@ -1227,8 +1428,12 @@ impl AdmittedCausalRatificationV1 {
     }
 
     #[cfg(test)]
-    fn from_test_witness(ratification: CausalRatificationV1) -> ContractResult<Self> {
-        match evaluate_ratification(&ratification)? {
+    fn from_test_witness(
+        ratification: CausalRatificationV1,
+        hypothesis: &CausalHypothesisV1,
+        intervention: Option<&InterventionSupportV1>,
+    ) -> ContractResult<Self> {
+        match evaluate_ratification(&ratification, hypothesis, intervention)? {
             Ok(()) => Ok(Self { ratification }),
             Err(reasons) => Err(ContractError::Schema(format!(
                 "ratification blocked: {reasons:?}"
@@ -1392,7 +1597,8 @@ mod tests {
             schema_version: CAUSAL_SCHEMA_VERSION,
             profile: frozen_profile_reference_v1(),
             scope: scope(),
-            hypothesis_commitment_digest: hypothesis.mechanism.commitment_digest().unwrap(),
+            hypothesis_fingerprint: hypothesis.fingerprint().unwrap(),
+            intervention_support_digest: Some(base_intervention(hypothesis).digest().unwrap()),
             evidence_bundle_digests: vec![digest(0xa1)],
             conclusion: CausalConclusionV1::Ratified,
             causal_role: Some(CausalRoleV1::ContributingCause),
@@ -1408,6 +1614,17 @@ mod tests {
             confirmation_lines: vec![],
             supersedes: None,
         }
+    }
+
+    /// `evaluate_ratification` against the exact hypothesis and intervention
+    /// `base_ratification` bound the record to, for tests that are not
+    /// themselves exercising the binding checks.
+    fn evaluate_base_ratification(
+        ratification: &CausalRatificationV1,
+        hypothesis: &CausalHypothesisV1,
+    ) -> ContractResult<Result<(), Vec<RatificationBlockedReasonV1>>> {
+        let intervention = base_intervention(hypothesis);
+        evaluate_ratification(ratification, hypothesis, Some(&intervention))
     }
 
     // -- SupportLevel / AdjudicationState -----------------------------------
@@ -1704,7 +1921,7 @@ mod tests {
         let hyp = hypothesis();
         let mut ratification = base_ratification(&hyp);
         ratification.achieved_support = SupportLevel::MechanisticallyCorroborated;
-        let result = evaluate_ratification(&ratification).unwrap();
+        let result = evaluate_base_ratification(&ratification, &hyp).unwrap();
         assert_eq!(
             result,
             Err(vec![
@@ -1721,7 +1938,7 @@ mod tests {
 
         // No confirmation lines at all.
         assert_eq!(
-            evaluate_ratification(&ratification).unwrap(),
+            evaluate_base_ratification(&ratification, &hyp).unwrap(),
             Err(vec![
                 RatificationBlockedReasonV1::PrimaryTriggerRequiresIndependentSecondConfirmation
             ])
@@ -1740,7 +1957,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            evaluate_ratification(&ratification).unwrap(),
+            evaluate_base_ratification(&ratification, &hyp).unwrap(),
             Err(vec![
                 RatificationBlockedReasonV1::PrimaryTriggerRequiresIndependentSecondConfirmation
             ])
@@ -1757,8 +1974,19 @@ mod tests {
                 failure_mode: ContractId::new("faithful_reproduction").unwrap(),
             },
         ];
-        assert_eq!(evaluate_ratification(&ratification).unwrap(), Ok(()));
-        assert!(AdmittedCausalRatificationV1::from_test_witness(ratification).is_ok());
+        assert_eq!(
+            evaluate_base_ratification(&ratification, &hyp).unwrap(),
+            Ok(())
+        );
+        let intervention = base_intervention(&hyp);
+        assert!(
+            AdmittedCausalRatificationV1::from_test_witness(
+                ratification,
+                &hyp,
+                Some(&intervention)
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1767,7 +1995,7 @@ mod tests {
         let mut ratification = base_ratification(&hyp);
         ratification.unresolved_required_gaps = vec![ContractId::new("gap.coverage").unwrap()];
         assert_eq!(
-            evaluate_ratification(&ratification).unwrap(),
+            evaluate_base_ratification(&ratification, &hyp).unwrap(),
             Err(vec![RatificationBlockedReasonV1::UnresolvedGapsPresent])
         );
     }
@@ -1779,7 +2007,7 @@ mod tests {
         ratification.conclusion = CausalConclusionV1::Refuted;
         // causal_role is still Some(...) from the base fixture: forbidden.
         assert_eq!(
-            evaluate_ratification(&ratification).unwrap(),
+            evaluate_base_ratification(&ratification, &hyp).unwrap(),
             Err(vec![
                 RatificationBlockedReasonV1::CausalRoleForbiddenForNonRatifiedConclusion
             ])
@@ -1838,6 +2066,84 @@ mod tests {
                 InterventionUnreachableReasonV1::HypothesisMechanismMismatch
             ])
         );
+    }
+
+    /// Blocker 4c: an intervention that contradicts the hypothesis's own
+    /// characterization of a registered material input — the hypothesis says
+    /// `Unchanged{digest}`, the intervention actually observed `Changed` on
+    /// that exact component — must not bind, even though the intervention
+    /// otherwise agrees on every causal identity.
+    #[test]
+    fn contradictory_material_input_observation_fails_binding_check() {
+        let mut hyp = hypothesis();
+        hyp.material_input_deltas = vec![MaterialInputDeltaV1 {
+            component: version_uri("commit", 0x10),
+            category: MaterialInputCategoryV1::Code,
+            observation: MaterialInputObservationV1::Unchanged {
+                digest: digest(0x01),
+            },
+        }];
+        let mut intervention = base_intervention(&hyp);
+        intervention.material_input_deltas = vec![MaterialInputDeltaV1 {
+            component: version_uri("commit", 0x10),
+            category: MaterialInputCategoryV1::Code,
+            observation: MaterialInputObservationV1::Changed {
+                before_digest: digest(0x01),
+                after_digest: digest(0x02),
+            },
+        }];
+        assert!(!intervention.binds_hypothesis(&hyp).unwrap());
+        assert_eq!(
+            derive_intervention_support_level(&hyp, &intervention).unwrap(),
+            Err(vec![
+                InterventionUnreachableReasonV1::HypothesisMechanismMismatch
+            ])
+        );
+    }
+
+    /// Blocker 3: a ratification cannot be replayed against a different
+    /// hypothesis merely because that hypothesis shares the same mechanism
+    /// narrative, predicted direction, and `recorded_at` — two hypotheses
+    /// with different cause/outcome/workload/artifact/environment identities
+    /// collide on `PreRecordedMechanismV1::commitment_digest` (its preimage
+    /// covers only the narrative, direction, and timestamp) but must never
+    /// collide on `CausalHypothesisV1::fingerprint`.
+    #[test]
+    fn ratification_cannot_be_replayed_against_a_different_hypothesis() {
+        let hyp_a = hypothesis();
+        let mut hyp_b = hyp_a.clone();
+        hyp_b.cause = uri("deployment", 0x99);
+        // Same mechanism commitment preimage (narrative, direction,
+        // recorded_at are unchanged), but a materially different hypothesis.
+        assert_eq!(
+            hyp_a.mechanism.commitment_digest().unwrap(),
+            hyp_b.mechanism.commitment_digest().unwrap()
+        );
+        assert_ne!(hyp_a.fingerprint().unwrap(), hyp_b.fingerprint().unwrap());
+
+        let ratification = base_ratification(&hyp_a);
+        assert!(ratification.binds_hypothesis(&hyp_a).unwrap());
+        assert!(!ratification.binds_hypothesis(&hyp_b).unwrap());
+        assert_eq!(
+            evaluate_ratification(&ratification, &hyp_b, Some(&base_intervention(&hyp_a))).unwrap(),
+            Err(vec![RatificationBlockedReasonV1::HypothesisBindingMismatch])
+        );
+    }
+
+    /// Blocker 2 (ratification half): a ratification whose `scope` differs
+    /// from the intervention it claims support from must not bind, even when
+    /// the digest matches (the digest alone cannot prove the record was
+    /// authenticated under the same tenant/project).
+    #[test]
+    fn ratification_cross_scope_intervention_binding_fails() {
+        let hyp = hypothesis();
+        let intervention = base_intervention(&hyp);
+        let mut ratification = base_ratification(&hyp);
+        ratification.scope = AuthenticatedProjectScopeV1::from_trusted_context(
+            ContractId::new("tenant.attacker").unwrap(),
+            ContractId::new("project.attacker").unwrap(),
+        );
+        assert!(!ratification.binds_intervention(&intervention).unwrap());
     }
 
     #[test]
@@ -1935,6 +2241,24 @@ mod tests {
     const NEGATIVE_RATIFICATION_SUPERSEDED_WITHOUT_DIGEST_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/causal/negative-ratification-superseded-without-digest.jsonl"
     );
+    const NEGATIVE_RATIFICATION_SUPERSEDED_CAUSAL_ROLE_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/causal/negative-ratification-superseded-causal-role.jsonl"
+    );
+    const NEGATIVE_INTERVENTION_SCOPE_MISMATCH_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/causal/negative-intervention-scope-mismatch.jsonl"
+    );
+    const NEGATIVE_INTERVENTION_UNOBSERVED_MATERIAL_INPUT_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/causal/negative-intervention-unobserved-material-input.jsonl"
+    );
+    const NEGATIVE_INTERVENTION_SINGLE_INPUT_CHANGED_ZERO_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/causal/negative-intervention-single-input-changed-zero.jsonl"
+    );
+    const NEGATIVE_RATIFICATION_UNRECONCILED_OPPOSING_EVIDENCE_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/causal/negative-ratification-unreconciled-opposing-evidence.jsonl"
+    );
+    const NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/causal/negative-ratification-empty-supporting-evidence.jsonl"
+    );
     const NEGATIVE_CAUSAL_ROLE_UNKNOWN_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/causal/negative-causal-role-unknown.jsonl"
     );
@@ -1947,9 +2271,9 @@ mod tests {
     const CAUSAL_HYPOTHESIS_V1_RAW_SHA256: &str =
         "37a4d3eb5f37a5a62076abb0a543e2c527aaad8195876d1f4dcb11da230d1c66";
     const CAUSAL_RATIFICATION_CONTRIBUTING_CAUSE_V1_RAW_SHA256: &str =
-        "b40db86931beb4f8ea238bfd0533a9afc7bc7316ae5301d3ef469b50928fd740";
+        "6d801166af4772deb58498d833090558561baee7ba9d7d3e1d8c2379d636fffc";
     const CAUSAL_RATIFICATION_PRIMARY_TRIGGER_V1_RAW_SHA256: &str =
-        "75ef9d100e17880472d5496a846ffe14003a1792d17f7ad646bbee1fbbb7371c";
+        "70d67360be1b03048a12eee19525f9fe9de1cf82495bad4b099ec1a00b0a20b8";
     const INTERVENTION_SUPPORT_V1_RAW_SHA256: &str =
         "09bd170b5195730c19992d6e0e1fe833dfd0f12dcaf42ed2a87317f1dc6a3893";
     const NEGATIVE_ADJUDICATION_STATE_UNKNOWN_RAW_SHA256: &str =
@@ -1973,28 +2297,40 @@ mod tests {
     const NEGATIVE_PREDICTION_AFTER_OBSERVATION_RAW_SHA256: &str =
         "b2ca92a4d637783e9e0fecc2616d54a5d66ecdb350adbe9ddd0185008b27f295";
     const NEGATIVE_PRIMARY_TRIGGER_SAME_RECEIPT_TWICE_RAW_SHA256: &str =
-        "5fe51b61a520505a66950db14d1742bb98a0baf521c1c8dda79082e969346ae7";
+        "b6286584e1a9bdfef300679db3007fcac3c3e0c51d7c469c295156891b748faa";
     const NEGATIVE_RATIFICATION_AGENT_EXCEPTION_REJECTED_RAW_SHA256: &str =
-        "471129d17d2172d34f1d8c7e532b27984187e217ec00f91b4c62a1f03bb6cf75";
+        "d8c4ac716999d5efb3e568bbd4650bb0d05106343fb3a94353aa087c92a09ae7";
     const NEGATIVE_RATIFICATION_AUTHOR_AS_RATIFIER_RAW_SHA256: &str =
-        "365aa2de73b102f844c24acf5e218d4b0d71edd6ecd0cdad6a791b86d2280474";
+        "d2b767d9e5551b860bcdf7629972ccbce49add7fee96c8bfa7cb9c3be2503956";
     const NEGATIVE_RATIFICATION_BELOW_INTERVENTION_SUPPORT_RAW_SHA256: &str =
-        "396abf5c605b09a381daa0440f5ebd9872adf27699f026ee86de363737287602";
+        "d3766a8061fd6853c1723e4d11f14248eef5f6792a79e98d66369257debc075c";
     const NEGATIVE_RATIFICATION_SUPERSEDED_WITHOUT_DIGEST_RAW_SHA256: &str =
-        "156e3ea784a331e5f54624742606535042a1d6ae30e1e7af6f8b6ad073b46e75";
+        "84d122708bd1b3df0b0e05d0ae1f0ab1e251f843dbce360f29b598539f591b56";
     const NEGATIVE_RATIFICATION_UNRESOLVED_GAPS_RAW_SHA256: &str =
-        "64699d6832d92b9b084f8d51bcb27568d67fd7a86902c4d5eb51232af045bafa";
+        "de14a2e8abb0539c5747591a1870df8c6a70fe8d96ee44ce47a1031432aacf71";
+    const NEGATIVE_RATIFICATION_SUPERSEDED_CAUSAL_ROLE_RAW_SHA256: &str =
+        "70e7a0f52cf245fb08d756f78ac10033825e78591621d77cfbb6392c49fac5d6";
+    const NEGATIVE_INTERVENTION_SCOPE_MISMATCH_RAW_SHA256: &str =
+        "1691453f7c9b9883211f82fd2b3075743a3d7810e4cb08e2f869c38bb6d2cd5b";
+    const NEGATIVE_INTERVENTION_UNOBSERVED_MATERIAL_INPUT_RAW_SHA256: &str =
+        "c980c4a0c8cdebca5567baa69b851c900a044c0f308604f86577638485d32e99";
+    const NEGATIVE_INTERVENTION_SINGLE_INPUT_CHANGED_ZERO_RAW_SHA256: &str =
+        "8c4927fdff6b07e7140a80865320dfcb31b6a303d3dde8981dbdd783b3d76ab2";
+    const NEGATIVE_RATIFICATION_UNRECONCILED_OPPOSING_EVIDENCE_RAW_SHA256: &str =
+        "30cf8a6a66b5f17b3a71d54b34818b8bb6192cf7829c42bcff5ae1e495b2c4ef";
+    const NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_RAW_SHA256: &str =
+        "380517f6442fba898b3e53a72a3131a795faad1c89285895f42e268d2af6d8c4";
     const VECTOR_SUITE_RAW_SHA256: &str =
-        "f45b5c5f1f23337eb248578c1a82cd8d81b2042753606e7d98d6e64c4b6613d0";
+        "8502a62f16d824f5988272e57cd3df4e19dce1b97222dd0c8232236f0c79bc45";
 
     const CAUSAL_HYPOTHESIS_FINGERPRINT: &str =
         "76b41ed32639adbe1291dd3aca9ae24c51f21ae570014b8119cfc0ce719f3dad";
     const INTERVENTION_SUPPORT_DIGEST: &str =
         "5fb951d6aa0d41b64812ce2e706012eb71621cd7c30dab644ff3e76e7599afe0";
     const RATIFICATION_CONTRIBUTING_CAUSE_DIGEST: &str =
-        "cad9fb5757a30b18204c953333e007e153e58d3f3667f6085d4b81137f1e1b84";
+        "71d9e5bde10a790907ccf5db2cb136f542db46c689cabce40598b268c088aabd";
     const RATIFICATION_PRIMARY_TRIGGER_DIGEST: &str =
-        "ff9e7b9ac4b5c975143e50b3714ff1162d9c3a52c56845c8dcef5155d0e1450b";
+        "cdf4b41bc5884fe1fe05ff7a12adccf38fdf67d250d5208a59b8871f91779cc4";
 
     /// One canonical JSON record plus exactly one trailing LF; the LF is
     /// excluded from every pinned digest.
@@ -2029,6 +2365,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one pinned (fixture, digest) pair per fixture file
     fn raw_fixture_bytes_are_pinned() {
         for (raw, expected) in [
             (CAUSAL_HYPOTHESIS_FIXTURE, CAUSAL_HYPOTHESIS_V1_RAW_SHA256),
@@ -2101,6 +2438,30 @@ mod tests {
                 NEGATIVE_RATIFICATION_SUPERSEDED_WITHOUT_DIGEST_RAW_SHA256,
             ),
             (
+                NEGATIVE_RATIFICATION_SUPERSEDED_CAUSAL_ROLE_FIXTURE,
+                NEGATIVE_RATIFICATION_SUPERSEDED_CAUSAL_ROLE_RAW_SHA256,
+            ),
+            (
+                NEGATIVE_INTERVENTION_SCOPE_MISMATCH_FIXTURE,
+                NEGATIVE_INTERVENTION_SCOPE_MISMATCH_RAW_SHA256,
+            ),
+            (
+                NEGATIVE_INTERVENTION_UNOBSERVED_MATERIAL_INPUT_FIXTURE,
+                NEGATIVE_INTERVENTION_UNOBSERVED_MATERIAL_INPUT_RAW_SHA256,
+            ),
+            (
+                NEGATIVE_INTERVENTION_SINGLE_INPUT_CHANGED_ZERO_FIXTURE,
+                NEGATIVE_INTERVENTION_SINGLE_INPUT_CHANGED_ZERO_RAW_SHA256,
+            ),
+            (
+                NEGATIVE_RATIFICATION_UNRECONCILED_OPPOSING_EVIDENCE_FIXTURE,
+                NEGATIVE_RATIFICATION_UNRECONCILED_OPPOSING_EVIDENCE_RAW_SHA256,
+            ),
+            (
+                NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_FIXTURE,
+                NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_RAW_SHA256,
+            ),
+            (
                 NEGATIVE_CAUSAL_ROLE_UNKNOWN_FIXTURE,
                 NEGATIVE_CAUSAL_ROLE_UNKNOWN_RAW_SHA256,
             ),
@@ -2142,14 +2503,28 @@ mod tests {
 
     #[test]
     fn positive_ratification_fixtures_are_admitted() {
+        let hyp: CausalHypothesisV1 = decode_and_prove_canonical(CAUSAL_HYPOTHESIS_FIXTURE);
+        let intervention: InterventionSupportV1 =
+            decode_and_prove_canonical(INTERVENTION_SUPPORT_FIXTURE);
+
         let contributing: CausalRatificationV1 =
             decode_and_prove_canonical(RATIFICATION_CONTRIBUTING_CAUSE_FIXTURE);
         assert_eq!(
             contributing.digest().unwrap().to_hex(),
             RATIFICATION_CONTRIBUTING_CAUSE_DIGEST
         );
-        assert_eq!(evaluate_ratification(&contributing).unwrap(), Ok(()));
-        assert!(AdmittedCausalRatificationV1::from_test_witness(contributing).is_ok());
+        assert_eq!(
+            evaluate_ratification(&contributing, &hyp, Some(&intervention)).unwrap(),
+            Ok(())
+        );
+        assert!(
+            AdmittedCausalRatificationV1::from_test_witness(
+                contributing,
+                &hyp,
+                Some(&intervention)
+            )
+            .is_ok()
+        );
 
         let primary: CausalRatificationV1 =
             decode_and_prove_canonical(RATIFICATION_PRIMARY_TRIGGER_FIXTURE);
@@ -2161,8 +2536,14 @@ mod tests {
         assert!(confirmation_lines_contain_independent_pair(
             &primary.confirmation_lines
         ));
-        assert_eq!(evaluate_ratification(&primary).unwrap(), Ok(()));
-        assert!(AdmittedCausalRatificationV1::from_test_witness(primary).is_ok());
+        assert_eq!(
+            evaluate_ratification(&primary, &hyp, Some(&intervention)).unwrap(),
+            Ok(())
+        );
+        assert!(
+            AdmittedCausalRatificationV1::from_test_witness(primary, &hyp, Some(&intervention))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2205,6 +2586,14 @@ mod tests {
                 NEGATIVE_PREDICTION_AFTER_OBSERVATION_FIXTURE,
                 InterventionUnreachableReasonV1::PredictionRecordedAfterObservation,
             ),
+            (
+                NEGATIVE_INTERVENTION_SCOPE_MISMATCH_FIXTURE,
+                InterventionUnreachableReasonV1::ScopeMismatch,
+            ),
+            (
+                NEGATIVE_INTERVENTION_UNOBSERVED_MATERIAL_INPUT_FIXTURE,
+                InterventionUnreachableReasonV1::UnobservedMaterialInput,
+            ),
         ];
         for (raw, expected_reason) in cases {
             let intervention: InterventionSupportV1 = decode_and_prove_canonical(raw);
@@ -2214,6 +2603,21 @@ mod tests {
                 "unexpected reason set for one negative intervention fixture"
             );
         }
+    }
+
+    /// Blocker 4b: an intervention that declares `single_input_changed` but
+    /// whose own inventory shows zero changed inputs is internally
+    /// inconsistent and must be rejected at the shape level (not merely a
+    /// `derive_intervention_support_level` reason).
+    #[test]
+    fn negative_single_input_changed_zero_fixture_fails_validate_shape() {
+        let intervention: InterventionSupportV1 =
+            decode_and_prove_canonical(NEGATIVE_INTERVENTION_SINGLE_INPUT_CHANGED_ZERO_FIXTURE);
+        assert_eq!(
+            intervention.material_input_separation,
+            MaterialInputSeparationV1::SingleInputChanged
+        );
+        assert!(intervention.validate_shape().is_err());
     }
 
     #[test]
@@ -2239,11 +2643,26 @@ mod tests {
                 NEGATIVE_RATIFICATION_AGENT_EXCEPTION_REJECTED_FIXTURE,
                 RatificationBlockedReasonV1::SeparationOfDutyFailed,
             ),
+            (
+                NEGATIVE_RATIFICATION_SUPERSEDED_CAUSAL_ROLE_FIXTURE,
+                RatificationBlockedReasonV1::CausalRoleForbiddenForNonRatifiedConclusion,
+            ),
+            (
+                NEGATIVE_RATIFICATION_UNRECONCILED_OPPOSING_EVIDENCE_FIXTURE,
+                RatificationBlockedReasonV1::UnreconciledOpposingEvidencePresent,
+            ),
+            (
+                NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_FIXTURE,
+                RatificationBlockedReasonV1::SupportingEvidenceRequiredForPositiveCausalRole,
+            ),
         ];
+        let hyp: CausalHypothesisV1 = decode_and_prove_canonical(CAUSAL_HYPOTHESIS_FIXTURE);
+        let intervention: InterventionSupportV1 =
+            decode_and_prove_canonical(INTERVENTION_SUPPORT_FIXTURE);
         for (raw, expected_reason) in cases {
             let ratification: CausalRatificationV1 = decode_and_prove_canonical(raw);
             assert_eq!(
-                evaluate_ratification(&ratification).unwrap(),
+                evaluate_ratification(&ratification, &hyp, Some(&intervention)).unwrap(),
                 Err(vec![*expected_reason]),
                 "unexpected reason set for one negative ratification fixture"
             );
@@ -2294,6 +2713,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one (name, digest) pair per fixture file in the manifest
     fn vector_suite_manifest_matches_every_pinned_fixture_digest() {
         let suite: CausalVectorSuiteV1 = decode_and_prove_canonical(VECTOR_SUITE_FIXTURE);
         assert_eq!(suite.schema_version, CAUSAL_SCHEMA_VERSION);
@@ -2358,6 +2778,18 @@ mod tests {
                 NEGATIVE_EXPOSURE_AFTER_ONSET_RAW_SHA256,
             ),
             (
+                "negative-intervention-scope-mismatch",
+                NEGATIVE_INTERVENTION_SCOPE_MISMATCH_RAW_SHA256,
+            ),
+            (
+                "negative-intervention-single-input-changed-zero",
+                NEGATIVE_INTERVENTION_SINGLE_INPUT_CHANGED_ZERO_RAW_SHA256,
+            ),
+            (
+                "negative-intervention-unobserved-material-input",
+                NEGATIVE_INTERVENTION_UNOBSERVED_MATERIAL_INPUT_RAW_SHA256,
+            ),
+            (
                 "negative-material-inputs-inseparable",
                 NEGATIVE_MATERIAL_INPUTS_INSEPARABLE_RAW_SHA256,
             ),
@@ -2382,8 +2814,20 @@ mod tests {
                 NEGATIVE_RATIFICATION_BELOW_INTERVENTION_SUPPORT_RAW_SHA256,
             ),
             (
+                "negative-ratification-empty-supporting-evidence",
+                NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_RAW_SHA256,
+            ),
+            (
+                "negative-ratification-superseded-causal-role",
+                NEGATIVE_RATIFICATION_SUPERSEDED_CAUSAL_ROLE_RAW_SHA256,
+            ),
+            (
                 "negative-ratification-superseded-without-digest",
                 NEGATIVE_RATIFICATION_SUPERSEDED_WITHOUT_DIGEST_RAW_SHA256,
+            ),
+            (
+                "negative-ratification-unreconciled-opposing-evidence",
+                NEGATIVE_RATIFICATION_UNRECONCILED_OPPOSING_EVIDENCE_RAW_SHA256,
             ),
             (
                 "negative-ratification-unresolved-gaps",

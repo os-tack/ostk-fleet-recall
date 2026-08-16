@@ -107,6 +107,83 @@ proving one specific failure mode fails closed:
 - `negative-adjudication-state-unknown.jsonl` — the bare JSON string
   `"pending"` where an `AdjudicationState` is expected; the closed set is
   exactly `open`, `ratified`, `refuted`, `superseded`.
+- `negative-ratification-superseded-causal-role.jsonl` — `conclusion:
+  superseded` that still carries `causal_role: contributing_cause`;
+  `evaluate_ratification` returns `CausalRoleForbiddenForNonRatifiedConclusion`.
+  Fixed post-review: the `Superseded` arm used to be empty, so a `superseded`
+  record could restate a positive causal role at any support level with no
+  intervention evidence and no second confirmation, and
+  `project_adjudication_state` would accept it as the very first record for a
+  hypothesis (`open -> superseded`). `Refuted` and `Superseded` now share one
+  match arm.
+- `negative-intervention-scope-mismatch.jsonl` — an `InterventionSupportV1`
+  authenticated under `tenant.attacker`/`project.attacker` instead of the
+  hypothesis's `tenant.fixture`/`project.fixture`, otherwise identical to the
+  positive fixture; `derive_intervention_support_level` returns
+  `ScopeMismatch`. Fixed post-review: `binds_hypothesis` compared every causal
+  identity except `scope`, so a cross-tenant/cross-project intervention could
+  reach `intervention_supported`. `CausalRatificationV1::binds_hypothesis` and
+  `::binds_intervention` check scope the same way (see
+  `ratification_cross_scope_intervention_binding_fails` in
+  `src/memory_contracts/causal.rs`).
+- `negative-intervention-unobserved-material-input.jsonl` — a second,
+  unregistered material input reported `Unobserved` alongside the one
+  registered `Changed` input; `derive_intervention_support_level` returns
+  `UnobservedMaterialInput`. Fixed post-review: an `Unobserved` entry used to
+  be silently ignored by every check, so an intervention that never actually
+  looked at a material input could still reach `intervention_supported`
+  (RUN-03 requires every unknown or unobserved dimension to be explicitly
+  reported and to block the strongest support level, not to be read as
+  "unchanged").
+- `negative-intervention-single-input-changed-zero.jsonl` — a shape-only
+  negative: `material_input_separation: single_input_changed` with an
+  inventory that shows *zero* changed inputs (the one registered component is
+  `Unchanged`); `InterventionSupportV1::validate_shape` rejects it. Fixed
+  post-review: the consistency check used to be `changed <= 1`, so a record
+  could declare `single_input_changed` while its own inventory showed no
+  changed input at all.
+- `negative-ratification-unreconciled-opposing-evidence.jsonl` — a `ratified`
+  conclusion citing one item of `opposing_evidence` with `reconciliation:
+  null`; `evaluate_ratification` returns `UnreconciledOpposingEvidencePresent`.
+  Fixed post-review: `opposing_evidence` used to be a bare list of
+  `AcceptedEventId`s that `evaluate_ratification` never read at all, so
+  arbitrary unreconciled opposing evidence could sit on an otherwise-passing
+  positive record (doc line 1467: "All verified opposing evidence must be
+  reconciled or the causal claim remains open"). Each entry is now an
+  `OpposingEvidenceEntryV1` with an optional `OpposingEvidenceReconciliationV1`.
+- `negative-ratification-empty-supporting-evidence.jsonl` — a `ratified`
+  conclusion with a positive `causal_role` and an empty `supporting_evidence`
+  list; `evaluate_ratification` returns
+  `SupportingEvidenceRequiredForPositiveCausalRole`. Fixed post-review: an
+  empty `supporting_evidence` list used to pass silently.
+
+The following two attacks from the same review are covered by inline Rust
+tests in `src/memory_contracts/causal.rs` rather than a byte-frozen fixture,
+consistent with how `HypothesisMechanismMismatch` itself has no dedicated
+fixture (`unbound_intervention_fails_the_hypothesis_binding_check`):
+
+- `contradictory_material_input_observation_fails_binding_check` — an
+  intervention that reports `Changed` for a component the hypothesis already
+  pinned as `Unchanged` fails `binds_hypothesis`
+  (`InterventionUnreachableReasonV1::HypothesisMechanismMismatch`).
+  `registered_components_are_covered` now requires a registered component's
+  observation to match exactly unless the hypothesis itself left it
+  `Unobserved`.
+- `ratification_cannot_be_replayed_against_a_different_hypothesis` — two
+  hypotheses that differ in every identity but share one mechanism narrative,
+  predicted direction, and `recorded_at` collide on
+  `PreRecordedMechanismV1::commitment_digest` but never on
+  `CausalHypothesisV1::fingerprint`. Fixed post-review:
+  `CausalRatificationV1` used to carry `hypothesis_commitment_digest` — the
+  mechanism's own commitment digest, whose preimage is only
+  `{schema_version, mechanism_narrative, predicted_outcome_direction,
+  recorded_at}` — so one ratification record could be replayed against any
+  hypothesis that happened to share those four fields. The field is now
+  `hypothesis_fingerprint`, checked against
+  `CausalHypothesisV1::fingerprint` (which covers every causal identity plus
+  scope) by the new `CausalRatificationV1::binds_hypothesis`. A parallel
+  `intervention_support_digest` + `binds_intervention` binds the record to
+  the exact `InterventionSupportV1` its `achieved_support` rests on.
 
 ## How digests are pinned
 
@@ -136,6 +213,11 @@ fixture file above plus the derived digests of the four positive artifacts.
 It is itself `include_bytes!`'d and pinned the same way, so the manifest and
 the fixtures it names cannot silently drift apart.
 
+`CausalRatificationV1` carries `hypothesis_fingerprint` (not
+`hypothesis_commitment_digest`) and an `intervention_support_digest`; every
+ratification fixture above was regenerated against the corrected preimage, so
+their derived digests differ from any value pinned before this fix.
+
 ## Invariant IDs
 
 - **CAUS-01** — proximity is not causality. Every positive path here requires
@@ -151,9 +233,9 @@ the fixtures it names cannot silently drift apart.
   never be invoked by `RatifierIdentityV1::Agent`.
 - **ACT-04** — recovery is not root-cause resolution. `AdjudicationState` and
   `SupportLevel` are independent axes; `evaluate_ratification` never lets a
-  `refuted` conclusion carry a positive causal role, and `project_adjudication_state`
-  never lets a later record erase what an earlier one established — only
-  append a legal transition on top of it.
+  `refuted` *or* `superseded` conclusion carry a positive causal role, and
+  `project_adjudication_state` never lets a later record erase what an
+  earlier one established — only append a legal transition on top of it.
 
 ## Reproducing or breaking these vectors
 
