@@ -91,16 +91,27 @@ entry's own frozen vector roots.
    proposed and authored by different principals. `contested-set.jsonl` records
    both contenders — each with its own activation ID, statement ID, target
    generation, activated head, proposer, author, and principal-sorted approver
-   set — the last common unambiguous head, and that head's policy. Every
-   contender must claim the same `contested_generation`, so a later generation's
-   activation cannot be smuggled into an earlier contest. While such a record
-   stands the projection is `ambiguous`.
+   set — the last common unambiguous head, and that head's policy. That file is
+   a **projection**, not an input: `AuditedContestedSetV1::from_durable_audit`
+   (crate-private) computes every one of those fields from the contenders'
+   persisted statement, receipt, and accepted event, and
+   `verify_contested_set_resolution` accepts nothing else. A contender's
+   activated head is reproduced from its own receipt digest, its proposer and
+   author come from the statement that hashes to `receipt.statement_id`, its
+   approver set from the receipt's `eligible_approvals`, and its
+   `contested_generation` from the authorizing policy's generation plus one. A
+   contender that never activated has no receipt whose digest is its activation
+   ID, so it cannot appear at all. While such a record stands the projection is
+   `ambiguous`.
 4. **Resolution.** `contested-resolution-statement.jsonl` compare-and-swaps the
    exact contested activation-ID set and selects one member.
    `contested-resolution-approval-set.jsonl` is approved under the last common
    unambiguous predecessor policy, and
    `contested-resolution-receipt.jsonl` binds the sorted approval attestations,
-   the server-derived threshold, and the self-selection verdict.
+   the server-derived threshold, and the self-selection verdict. Minting that
+   receipt takes the *re-audited* policy and the *re-audited* contested set, so
+   the accepted form cannot exist unless the authority and the contest are still
+   what they were at verification time.
 
 ## Frozen identities
 
@@ -123,9 +134,9 @@ version change, never a fixture refresh.
 | resolution statement | `97665d1abeb5c33e517d2be2cc4e5ca3d54d39f9700dcc0e80adeb7a268b1410` |
 | resolution receipt | `0f42d0373321e061ba3dfb286bc391fbc6fb66726a0afd7fc44fe93b80f01187` |
 | positive case manifest | `77e02c9c9565ac6b25c1dc1084a58ae1e8c8b07b62180a8d23bafa9310d8eedb` |
-| negative case manifest | `88981a93aabd932533a07ccb48b0cc4ba18c91f13cb6197523a3cc14e6f99dfb` |
-| `vector-suite.jsonl` raw SHA-256 | `a4e6961c38e8f7be5a41b4dde3c5d38c28d7ada4e624b296db00665266651c7c` |
-| `vector-suite.jsonl` manifest digest | `dfa8084c92fb434647193d252dc9bc2bc06ce58102682cb06aa16d05fb7c7551` |
+| negative case manifest | `e3081ae83a43a96f690409fb11a51416b147cd300e4c3bef2680e8add15fef14` |
+| `vector-suite.jsonl` raw SHA-256 | `df6b3db1cb46715c2ea880413604e3c92b168c2892f54f6f82253fb431458bd9` |
+| `vector-suite.jsonl` manifest digest | `44fa9d2831d1084146a6ff972db2d0aeebe3824f9d9ff9c6c41f687077632467` |
 
 The activation consistency key is
 `9921b7e572be77d3e100eb3d3093fb0d8ff4b3b5965f75110c18bfd34479b5ec` under family
@@ -146,23 +157,44 @@ one scope-local ordering stream.
   against it, so the accepted form cannot exist unless the head presented at
   mint time is still the exact head the statement named. The
   proposed package never authorizes itself, the author and proposer cannot
-  approve, and no contested successor may authorize its own selection.
+  approve, and no contested successor may authorize its own selection. The
+  principals barred from driving a resolution are read out of
+  `AuditedContestedSetV1`, whose constructor is crate-private for the same
+  reason, so nobody can bar a legitimate arbiter by inventing a contender that
+  names them, or un-bar a real party by omitting one.
+  `VerifiedContestedSetResolution::receipt_at` likewise takes the re-audited
+  policy *and* the re-audited contested set.
   *To break it:* make `InstalledSuccessorPolicyV2::from_durable_audit`,
-  `receipt_at`, `resulting_registry_head`, or `from_verified` public; drop the
-  re-audited head argument from `receipt_at`; verify
-  approvals against `target.activation_policy()` instead of the installed
+  `AuditedContenderActivationV2::from_durable_audit`,
+  `AuditedContestedSetV1::from_durable_audit`, `receipt_at`,
+  `resulting_registry_head`, or `from_verified` public; drop the
+  re-audited head argument from either `receipt_at`; let
+  `verify_contested_set_resolution` take a bare `RegistryContestedSetV1` again;
+  verify approvals against `target.activation_policy()` instead of the installed
   predecessor policy; drop the
   `ActivationPolicyEntryV2::validate_approval_principal_set` call; or let a
   contender's proposer drive `verify_contested_set_resolution`.
-- **AUTH-04 — normativity is designated.** Only an activation event moves the
-  head, and only a package a registry activation designates is normative. The
+- **AUTH-04 — normativity is designated.** Only a verified activation produces
+  a head, and only a package a registry activation designates is normative. An
+  activation event moves the head forward. A contested resolution does not mint
+  a head of its own: it selects among heads that activations already produced,
+  and it can install no other, because every contender's head is recomputed from
+  that contender's receipt digest before the contest exists as a value. The
   statement binds the exact package digest, the policy that governs it, the
-  policy it installs, and the conformance result. Checking a package in proposes
-  it; nothing here activates it.
+  policy it installs, and the conformance result. A contest is resolvable only
+  under the policy of the generation it forks from: `contested_generation` is
+  the audited policy's `generation() + 1` (checked_add, fail-closed on
+  overflow), derived at audit time and re-checked in
+  `verify_contested_set_resolution` and again at receipt mint. A resolution may
+  not take effect before the contenders it chooses between. Checking a package
+  in proposes it; nothing here activates it.
   *To break it:* let `validate_shape` accept a zero or unbound
   `target_package_digest`; stop requiring
-  `statement.target_activation_policy == target.activation_policy()`; or let the
-  event's `activated_head` name a policy digest other than the target's.
+  `statement.target_activation_policy == target.activation_policy()`; let the
+  event's `activated_head` name a policy digest other than the target's; stop
+  reproducing a contender's activated head from its receipt in
+  `AuditedContenderActivationV2::from_durable_audit`; or drop the
+  `contested_generation == authorizing_policy.generation() + 1` comparison.
 - **REPLAY-01 — semantic projections are rebuildable.** Every identity is a
   domain-separated digest over canonical bytes: replaying the same statement and
   approvals yields the same statement ID, approval IDs, activation ID, accepted
@@ -212,4 +244,11 @@ artifacts they describe. Regenerate with:
 | `genesis-generation-statement` | `from_generation = 0` is rejected outright |
 | `reactivating-the-current-package` | re-activating the exact current package is a no-op, not a transition |
 | `contested-resolution-by-a-contestant` | neither contested successor's proposer, author, or approver may drive the resolution |
-| `contested-resolution-set-drift` | resolution compare-and-swaps the exact contested activation-ID set, so a later contender cannot be silently excluded |
+| `contested-resolution-set-drift` | resolution compare-and-swaps the exact contested activation-ID set, so a later contender cannot be silently excluded — at verification and again at receipt mint |
+| `proposer-counted-as-approver` | the installed v2 rule bars the trusted proposer from approving, symmetrically with the author |
+| `fabricated-contested-contender` | a contender naming an arbitrary head, proposer, author, or approver set has no activation to audit and cannot enter a contested set |
+| `contested-contender-head-does-not-reproduce-from-its-activation` | a contender whose activated head, activation ID, or statement does not reproduce from its own receipt is rejected |
+| `contested-contender-of-another-predecessor-head` | a genuine activation of a different predecessor head is not a contender of this contest |
+| `contested-generation-does-not-follow-the-authorizing-policy` | `contested_generation` must be exactly the authorizing policy's generation plus one |
+| `contested-resolution-before-its-contenders` | a resolution cannot claim to take effect before the contest it resolves existed |
+| `stale-contested-authority-at-receipt-mint` | the resolution receipt seam re-audits the policy and the contested set, so a moved head cannot mint the accepted form |
