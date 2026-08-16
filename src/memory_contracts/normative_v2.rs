@@ -446,8 +446,16 @@ pub fn require_effective_not_before_accepted(
 /// before this correction. `statement_id` is a new, distinct normative
 /// binding statement whose `effective_from` may legitimately precede
 /// `accepted_at`, authorized only by `authorizing_policy` — a policy
-/// reference distinct from, and with a stricter threshold than, the normal
-/// activation policy.
+/// reference `validate()` requires to be distinct from, and to declare a
+/// strictly higher threshold than, `normal_activation_policy` (the ordinary
+/// policy this correction is exceptional relative to). Like
+/// [`NormativeActivationReceiptV2::required_threshold`], the two threshold
+/// fields here are declared, structural data: this contract layer proves
+/// only that the record is internally self-consistent (separately named,
+/// strictly higher), never that either policy reference names the server's
+/// actually-active policy or its actually-active threshold — a later
+/// runtime seam must still compare both references against the live
+/// registry before granting authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetroactiveCorrectionV1 {
@@ -457,14 +465,23 @@ pub struct RetroactiveCorrectionV1 {
     pub effective_from: CanonicalTimestamp,
     pub accepted_at: CanonicalTimestamp,
     pub authorizing_policy: RegistryReferenceV1,
+    pub authorizing_policy_required_threshold: u16,
+    pub normal_activation_policy: RegistryReferenceV1,
+    pub normal_activation_policy_required_threshold: u16,
 }
 
 impl RetroactiveCorrectionV1 {
     pub fn validate(&self) -> ContractResult<()> {
         self.authorizing_policy.validate()?;
+        self.normal_activation_policy.validate()?;
         if self.schema_version != RETROACTIVE_SCHEMA_VERSION
             || self.statement_id == self.superseded_as_known_statement_id
             || self.effective_from >= self.accepted_at
+            || self.authorizing_policy.entry_id == self.normal_activation_policy.entry_id
+            || self.authorizing_policy_required_threshold == 0
+            || self.normal_activation_policy_required_threshold == 0
+            || self.authorizing_policy_required_threshold
+                <= self.normal_activation_policy_required_threshold
         {
             return Err(ContractError::Schema(
                 "invalid retroactive correction v1".into(),
@@ -545,6 +562,9 @@ mod tests {
     const RETROACTIVE_NEGATIVE_NOT_RETROACTIVE_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/normative/retroactive-correction-negative-not-retroactive.jsonl"
     );
+    const RETROACTIVE_NEGATIVE_ORDINARY_POLICY_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/normative/retroactive-correction-negative-ordinary-policy.jsonl"
+    );
     const VECTOR_SUITE_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/normative/vector-suite.jsonl");
 
@@ -558,6 +578,54 @@ mod tests {
         "4a2b35d9bb149e8edae89ea8d9cc61c8d96075d56ba6299a882e602114c58ec7";
     const EXPECTED_CONTESTED_ID: &str =
         "103d1d2b73e0a6f29b60ae47247aa473c6faaee60b4d952d785bcaf60c245f57";
+
+    // Exact raw sha256 over every fixture file's full bytes (including its
+    // trailing LF), pinned independently of any typed decode. This is the
+    // house pattern from `remember_v2.rs`'s
+    // `hard_coded_contract_vectors_match_independent_ids`: unlike the
+    // `EXPECTED_*_ID` domain-separated digests above (which only cover the
+    // 5 fixtures with a semantic identity function), every fixture in this
+    // directory — positive, negative, and the vector-suite manifest itself
+    // — gets a raw byte pin here, so any tamper to any fixture's bytes
+    // (including a negative fixture edited to fail for a different reason
+    // than its filename and vector-suite description claim) fails
+    // `all_fixtures_are_byte_frozen` even when the fixture still happens to
+    // decode and still happens to be rejected by `validate()`.
+    const PROPOSAL_POSITIVE_RAW_SHA256: &str =
+        "8f8576ac7b4480d467183abc0e892235c2b423154a008019e5c8409b006f3b3e";
+    const PROPOSAL_NEGATIVE_UNSORTED_PROPOSITIONS_RAW_SHA256: &str =
+        "c3d6d6b00b0037f6888297ac5ea98b388028d91e1f11e4c5b3198eacec64cf25";
+    const PROPOSAL_NEGATIVE_OVERLAPPING_SPANS_RAW_SHA256: &str =
+        "5042aa5938b6b4bda4d4eb0002a985d00ac253cc89b5e69258b1a567a6e25560";
+    const PROPOSAL_NEGATIVE_WRONG_RESOURCE_FORM_RAW_SHA256: &str =
+        "b2c33b7c801edc0b92054d4bdfeca88e14595c66162ef561fd358e7b93505e72";
+    const RECEIPT_POSITIVE_AUTHOR_PLUS_INDEPENDENT_RAW_SHA256: &str =
+        "a953be98bae5dd78600cba231911a142e8f927b71410456cff234b64bf47f2a8";
+    const RECEIPT_NEGATIVE_AUTHOR_ONLY_RAW_SHA256: &str =
+        "c75d5ddcc775a7cf84c2e6c73ab1a2b4f8c1b2adb3054c0cf9cdead1eec590eb";
+    const LIFECYCLE_ACTIVATION_RAW_SHA256: &str =
+        "13e222e822903c06cee547b608a046498663b9ea387c1cc451a867a892f0c414";
+    const LIFECYCLE_SUPERSESSION_RAW_SHA256: &str =
+        "4ff7e019554d73aeca3a3e6daadf7a4fc5667504208005daf8ddd0f79b017249";
+    const LIFECYCLE_NEGATIVE_MISSING_SUPERSEDES_TARGET_RAW_SHA256: &str =
+        "29cd34788fdd8898a6404cc4f38107b5cadd680507d9efa0ca749576c3454874";
+    const CONTESTED_POSITIVE_RAW_SHA256: &str =
+        "93e83ab63ca50f39143db6ba941c3090b8cf637a8ba2675f6b9666dcaff74183";
+    const CONTESTED_NEGATIVE_SINGLE_STATEMENT_RAW_SHA256: &str =
+        "f3c9f130d32e6dcc667177d418be9bb3ba06403f21c69b2cdc08d249668ff0bf";
+    const RETROACTIVE_POSITIVE_RAW_SHA256: &str =
+        "00f00120f66986b61c0fb15a0e0ed532dc55a9416e5f86461ac0a59ff8d81051";
+    const RETROACTIVE_NEGATIVE_NOT_RETROACTIVE_RAW_SHA256: &str =
+        "baff312a248b10fec310d04aa12d13e5c119ad937afc0a2ca8e84aade847fdf1";
+    const RETROACTIVE_NEGATIVE_ORDINARY_POLICY_RAW_SHA256: &str =
+        "5b37b425ca9b5a956ef29032d6a19eb739e304bd15f4dbd6baad3c86f84a75bb";
+    const VECTOR_SUITE_RAW_SHA256: &str =
+        "96184b84a4496aa8ef1fe5d5ba288afb3cc46be03df5518783075b368848d3f5";
+
+    fn raw_sha256(bytes: &[u8]) -> String {
+        use sha2::{Digest as _, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
 
     fn record(artifact: &'static [u8]) -> &'static [u8] {
         let record = artifact
@@ -662,6 +730,7 @@ mod tests {
         statement_id: Sha256Digest,
         source_author: &str,
         approving_principals: &[&str],
+        required_threshold: u16,
         satisfied: bool,
     ) -> NormativeActivationReceiptV2 {
         let mut approvals: Vec<EligibleApprovalV1> = approving_principals
@@ -678,7 +747,7 @@ mod tests {
             statement_id,
             source_author_principal_id: ContractId::new(source_author).unwrap(),
             eligible_approvals: approvals,
-            required_threshold: 2,
+            required_threshold,
             separation_of_duty:
                 NormativeActivationSeparationOfDutyV2::IndependentApprovalFromSourceAuthor,
             separation_of_duty_satisfied: satisfied,
@@ -871,16 +940,40 @@ mod tests {
 
     // --- separation of duty ---
 
+    /// The shared message for every structural receipt guard (schema
+    /// version, threshold not met, too many/too few approvals, unsorted or
+    /// non-unique approvals) — distinct from the separation-of-duty
+    /// re-derivation message below. Asserting on these exact strings
+    /// (rather than `is_err()`) pins *which* family of guard rejected a
+    /// receipt, so a vector documented as an AUTH-03 `SoD` failure cannot
+    /// silently start passing only because an unrelated structural guard
+    /// happens to reject it for a different reason first.
+    const RECEIPT_STRUCTURAL_GUARD_ERROR: &str = "invalid normative activation receipt v2";
+    const RECEIPT_SOD_MISMATCH_ERROR: &str =
+        "declared separation-of-duty verdict does not match its declared approvals";
+
     #[test]
     fn author_only_approval_is_rejected() {
+        // required_threshold == 1: the lone author approval already meets
+        // the threshold, so the threshold guard at the top of `validate()`
+        // cannot reject this receipt — rejection can only come from the
+        // separation-of-duty re-derivation below it. This is the vector
+        // AUTH-03 actually depends on: with `required_threshold >= 2`,
+        // `approval_bindings_are_unique` already forces >= 2 distinct
+        // principals whenever the threshold is met, so SoD is trivially
+        // satisfied and never exercised.
         let statement_id = label_digest("statement");
         let author_only = receipt(
             statement_id,
             "principal.author",
             &["principal.author"],
+            1,
             true,
         );
-        assert!(author_only.validate().is_err());
+        assert_eq!(
+            author_only.validate(),
+            Err(ContractError::Schema(RECEIPT_SOD_MISMATCH_ERROR.into()))
+        );
     }
 
     #[test]
@@ -894,9 +987,13 @@ mod tests {
             statement_id,
             "principal.author",
             &["principal.author", "principal.independent"],
+            2,
             false,
         );
-        assert!(mismatched.validate().is_err());
+        assert_eq!(
+            mismatched.validate(),
+            Err(ContractError::Schema(RECEIPT_SOD_MISMATCH_ERROR.into()))
+        );
     }
 
     #[test]
@@ -906,6 +1003,7 @@ mod tests {
             statement_id,
             "principal.author",
             &["principal.author", "principal.independent"],
+            2,
             true,
         );
         assert!(ok.validate().is_ok());
@@ -914,14 +1012,17 @@ mod tests {
     #[test]
     fn threshold_not_met_is_rejected_even_with_independent_approval() {
         let statement_id = label_digest("statement");
-        let mut under_threshold = receipt(
+        let under_threshold = receipt(
             statement_id,
             "principal.author",
             &["principal.independent"],
+            2,
             true,
         );
-        under_threshold.required_threshold = 2;
-        assert!(under_threshold.validate().is_err());
+        assert_eq!(
+            under_threshold.validate(),
+            Err(ContractError::Schema(RECEIPT_STRUCTURAL_GUARD_ERROR.into()))
+        );
     }
 
     #[test]
@@ -931,12 +1032,16 @@ mod tests {
             statement_id,
             "principal.author",
             &["principal.author", "principal.independent"],
+            2,
             true,
         );
         duplicated.eligible_approvals[0].principal_id =
             duplicated.eligible_approvals[1].principal_id.clone();
         duplicated.eligible_approvals.sort();
-        assert!(duplicated.validate().is_err());
+        assert_eq!(
+            duplicated.validate(),
+            Err(ContractError::Schema(RECEIPT_STRUCTURAL_GUARD_ERROR.into()))
+        );
     }
 
     // --- lifecycle events ---
@@ -1072,6 +1177,9 @@ mod tests {
             effective_from: CanonicalTimestamp::parse("2026-01-01T00:00:00.000000000Z").unwrap(),
             accepted_at: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
             authorizing_policy: reference("normative.retroactive_correction_policy"),
+            authorizing_policy_required_threshold: 3,
+            normal_activation_policy: reference("normative.normal_activation_policy"),
+            normal_activation_policy_required_threshold: 2,
         };
         assert!(correction.validate().is_ok());
         // The prior as-known conclusion's identity is untouched: this is an
@@ -1091,6 +1199,9 @@ mod tests {
             effective_from: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
             accepted_at: CanonicalTimestamp::parse("2026-01-01T00:00:00.000000000Z").unwrap(),
             authorizing_policy: reference("normative.retroactive_correction_policy"),
+            authorizing_policy_required_threshold: 3,
+            normal_activation_policy: reference("normative.normal_activation_policy"),
+            normal_activation_policy_required_threshold: 2,
         };
         assert!(not_retroactive.validate().is_err());
     }
@@ -1105,8 +1216,69 @@ mod tests {
             effective_from: CanonicalTimestamp::parse("2026-01-01T00:00:00.000000000Z").unwrap(),
             accepted_at: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
             authorizing_policy: reference("normative.retroactive_correction_policy"),
+            authorizing_policy_required_threshold: 3,
+            normal_activation_policy: reference("normative.normal_activation_policy"),
+            normal_activation_policy_required_threshold: 2,
         };
         assert!(self_referential.validate().is_err());
+    }
+
+    /// AUTH-04: a retroactive correction naming the *ordinary* activation
+    /// policy as its own authorizing policy must be rejected — "an
+    /// exceptional retroactive correction requires a separately named
+    /// higher-threshold policy" is a requirement on the correction record
+    /// itself, not merely documentation. Neutering the distinctness or
+    /// threshold-comparison guard in `RetroactiveCorrectionV1::validate`
+    /// must make this test fail.
+    #[test]
+    fn a_correction_authorized_by_the_ordinary_activation_policy_is_rejected() {
+        let ordinary_policy_as_authorizer = RetroactiveCorrectionV1 {
+            schema_version: 1,
+            statement_id: label_digest("corrected-statement"),
+            superseded_as_known_statement_id: label_digest("prior-as-known-statement"),
+            effective_from: CanonicalTimestamp::parse("2026-01-01T00:00:00.000000000Z").unwrap(),
+            accepted_at: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
+            authorizing_policy: reference("normative.normal_activation_policy"),
+            authorizing_policy_required_threshold: 2,
+            normal_activation_policy: reference("normative.normal_activation_policy"),
+            normal_activation_policy_required_threshold: 2,
+        };
+        assert_eq!(
+            ordinary_policy_as_authorizer.validate(),
+            Err(ContractError::Schema(
+                "invalid retroactive correction v1".into()
+            ))
+        );
+    }
+
+    /// A distinct authorizing policy is not sufficient by itself: it must
+    /// also declare a strictly higher threshold than the normal activation
+    /// policy it is exceptional relative to. A merely-distinct policy at an
+    /// equal or lower threshold is not "higher-threshold" and must still be
+    /// rejected.
+    #[test]
+    fn a_correction_authorized_at_an_equal_or_lower_threshold_is_rejected() {
+        let equal_threshold = RetroactiveCorrectionV1 {
+            schema_version: 1,
+            statement_id: label_digest("corrected-statement"),
+            superseded_as_known_statement_id: label_digest("prior-as-known-statement"),
+            effective_from: CanonicalTimestamp::parse("2026-01-01T00:00:00.000000000Z").unwrap(),
+            accepted_at: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
+            authorizing_policy: reference("normative.retroactive_correction_policy"),
+            authorizing_policy_required_threshold: 2,
+            normal_activation_policy: reference("normative.normal_activation_policy"),
+            normal_activation_policy_required_threshold: 2,
+        };
+        assert_eq!(
+            equal_threshold.validate(),
+            Err(ContractError::Schema(
+                "invalid retroactive correction v1".into()
+            ))
+        );
+
+        let mut lower_threshold = equal_threshold;
+        lower_threshold.authorizing_policy_required_threshold = 1;
+        assert!(lower_threshold.validate().is_err());
     }
 
     // --- fixtures: byte-frozen positive and negative vectors ---
@@ -1214,7 +1386,95 @@ mod tests {
 
         let negative: RetroactiveCorrectionV1 =
             decode_strict(record(RETROACTIVE_NEGATIVE_NOT_RETROACTIVE_FIXTURE)).unwrap();
-        assert!(negative.validate().is_err());
+        assert_eq!(
+            negative.validate(),
+            Err(ContractError::Schema(
+                "invalid retroactive correction v1".into()
+            ))
+        );
+
+        // AUTH-04: the ordinary activation policy cannot authorize its own
+        // exception. This fixture is genuinely retroactive (its timestamps
+        // alone would pass) but names `normative.normal_activation_policy`
+        // as both `authorizing_policy` and `normal_activation_policy` at an
+        // equal threshold, so it must still be rejected.
+        let ordinary_policy: RetroactiveCorrectionV1 =
+            decode_strict(record(RETROACTIVE_NEGATIVE_ORDINARY_POLICY_FIXTURE)).unwrap();
+        assert!(ordinary_policy.effective_from < ordinary_policy.accepted_at);
+        assert_eq!(
+            ordinary_policy.validate(),
+            Err(ContractError::Schema(
+                "invalid retroactive correction v1".into()
+            ))
+        );
+    }
+
+    /// Every fixture in this directory — positive, negative, and the
+    /// vector-suite manifest — is pinned to an exact raw sha256 over its
+    /// full bytes (including the trailing LF), independent of whether it
+    /// happens to decode or happens to fail `validate()` for the reason its
+    /// filename claims. Tampering with any fixture's bytes (e.g. swapping
+    /// which field makes a negative fixture invalid, or fixing a negative
+    /// fixture into a passing one) fails this test even if every other
+    /// fixture-consuming test in this module still passes.
+    #[test]
+    #[allow(clippy::too_many_lines)] // enumerates every fixture in the directory
+    fn all_fixtures_are_byte_frozen() {
+        for (bytes, expected_raw_sha256) in [
+            (PROPOSAL_POSITIVE_FIXTURE, PROPOSAL_POSITIVE_RAW_SHA256),
+            (
+                PROPOSAL_NEGATIVE_UNSORTED_PROPOSITIONS_FIXTURE,
+                PROPOSAL_NEGATIVE_UNSORTED_PROPOSITIONS_RAW_SHA256,
+            ),
+            (
+                PROPOSAL_NEGATIVE_OVERLAPPING_SPANS_FIXTURE,
+                PROPOSAL_NEGATIVE_OVERLAPPING_SPANS_RAW_SHA256,
+            ),
+            (
+                PROPOSAL_NEGATIVE_WRONG_RESOURCE_FORM_FIXTURE,
+                PROPOSAL_NEGATIVE_WRONG_RESOURCE_FORM_RAW_SHA256,
+            ),
+            (
+                RECEIPT_POSITIVE_AUTHOR_PLUS_INDEPENDENT_FIXTURE,
+                RECEIPT_POSITIVE_AUTHOR_PLUS_INDEPENDENT_RAW_SHA256,
+            ),
+            (
+                RECEIPT_NEGATIVE_AUTHOR_ONLY_FIXTURE,
+                RECEIPT_NEGATIVE_AUTHOR_ONLY_RAW_SHA256,
+            ),
+            (
+                LIFECYCLE_ACTIVATION_FIXTURE,
+                LIFECYCLE_ACTIVATION_RAW_SHA256,
+            ),
+            (
+                LIFECYCLE_SUPERSESSION_FIXTURE,
+                LIFECYCLE_SUPERSESSION_RAW_SHA256,
+            ),
+            (
+                LIFECYCLE_NEGATIVE_MISSING_SUPERSEDES_TARGET_FIXTURE,
+                LIFECYCLE_NEGATIVE_MISSING_SUPERSEDES_TARGET_RAW_SHA256,
+            ),
+            (CONTESTED_POSITIVE_FIXTURE, CONTESTED_POSITIVE_RAW_SHA256),
+            (
+                CONTESTED_NEGATIVE_SINGLE_STATEMENT_FIXTURE,
+                CONTESTED_NEGATIVE_SINGLE_STATEMENT_RAW_SHA256,
+            ),
+            (
+                RETROACTIVE_POSITIVE_FIXTURE,
+                RETROACTIVE_POSITIVE_RAW_SHA256,
+            ),
+            (
+                RETROACTIVE_NEGATIVE_NOT_RETROACTIVE_FIXTURE,
+                RETROACTIVE_NEGATIVE_NOT_RETROACTIVE_RAW_SHA256,
+            ),
+            (
+                RETROACTIVE_NEGATIVE_ORDINARY_POLICY_FIXTURE,
+                RETROACTIVE_NEGATIVE_ORDINARY_POLICY_RAW_SHA256,
+            ),
+            (VECTOR_SUITE_FIXTURE, VECTOR_SUITE_RAW_SHA256),
+        ] {
+            assert_eq!(raw_sha256(bytes), expected_raw_sha256);
+        }
     }
 
     #[derive(Debug, Deserialize)]
@@ -1234,7 +1494,7 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(entries.len(), 18);
+        assert_eq!(entries.len(), 19);
         for entry in &entries {
             assert!(!entry.invariant_ids.is_empty());
             assert!(
@@ -1272,7 +1532,9 @@ mod tests {
         }
 
         fn write(output: &Path, name: &str, bytes: &[u8]) {
-            fs::write(output.join(name), framed(bytes)).unwrap();
+            let framed = framed(bytes);
+            eprintln!("{name} raw_sha256={}", raw_sha256(&framed));
+            fs::write(output.join(name), framed).unwrap();
         }
 
         let output = std::env::var_os("NORMATIVE_V2_VECTOR_OUTPUT")
@@ -1331,6 +1593,7 @@ mod tests {
             statement_id,
             "principal.author",
             &["principal.author", "principal.independent"],
+            2,
             true,
         );
         write(
@@ -1339,10 +1602,15 @@ mod tests {
             &encode_canonical(&receipt_positive).unwrap(),
         );
 
+        // required_threshold == 1: the lone author approval already meets
+        // the threshold, so this fixture is rejected only by the
+        // separation-of-duty re-derivation, not by the threshold guard —
+        // see `author_only_approval_is_rejected`.
         let receipt_negative = receipt(
             statement_id,
             "principal.author",
             &["principal.author"],
+            1,
             true,
         );
         write(
@@ -1437,6 +1705,9 @@ mod tests {
             effective_from: CanonicalTimestamp::parse("2026-01-01T00:00:00.000000000Z").unwrap(),
             accepted_at: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
             authorizing_policy: reference("normative.retroactive_correction_policy"),
+            authorizing_policy_required_threshold: 3,
+            normal_activation_policy: reference("normative.normal_activation_policy"),
+            normal_activation_policy_required_threshold: 2,
         };
         write(
             &output,
@@ -1451,11 +1722,34 @@ mod tests {
             effective_from: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
             accepted_at: CanonicalTimestamp::parse("2026-01-01T00:00:00.000000000Z").unwrap(),
             authorizing_policy: reference("normative.retroactive_correction_policy"),
+            authorizing_policy_required_threshold: 3,
+            normal_activation_policy: reference("normative.normal_activation_policy"),
+            normal_activation_policy_required_threshold: 2,
         };
         write(
             &output,
             "retroactive-correction-negative-not-retroactive.jsonl",
             &encode_canonical(&retroactive_negative).unwrap(),
+        );
+
+        // AUTH-04: naming the ordinary activation policy as the correction's
+        // own authorizing policy (same entry_id, same threshold) must be
+        // rejected even though the timestamps are genuinely retroactive.
+        let retroactive_negative_ordinary_policy = RetroactiveCorrectionV1 {
+            schema_version: 1,
+            statement_id: label_digest("corrected-statement"),
+            superseded_as_known_statement_id: label_digest("prior-as-known-statement"),
+            effective_from: CanonicalTimestamp::parse("2026-01-01T00:00:00.000000000Z").unwrap(),
+            accepted_at: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
+            authorizing_policy: reference("normative.normal_activation_policy"),
+            authorizing_policy_required_threshold: 2,
+            normal_activation_policy: reference("normative.normal_activation_policy"),
+            normal_activation_policy_required_threshold: 2,
+        };
+        write(
+            &output,
+            "retroactive-correction-negative-ordinary-policy.jsonl",
+            &encode_canonical(&retroactive_negative_ordinary_policy).unwrap(),
         );
 
         eprintln!("proposal_statement_id={statement_id}");
