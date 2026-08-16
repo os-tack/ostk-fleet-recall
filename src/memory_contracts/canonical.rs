@@ -277,6 +277,27 @@ where
         .map_err(|error| ContractError::Schema(error.to_string()))
 }
 
+/// Decode a closed typed schema and require the input to be exactly the
+/// canonical encoding of the decoded value.
+///
+/// [`decode_strict`] proves duplicate-safe strict JSON; [`require_canonical`]
+/// proves document-level canonical bytes. Neither is type-aware: a serde-derived
+/// struct also accepts a positional-array form, and an optional field may be
+/// omitted or `null`, so two distinct canonical documents can decode to one
+/// value. This gate closes that class for every contract type: it decodes, then
+/// re-encodes with [`encode_canonical`] and rejects the input unless the bytes
+/// are identical, so exactly one byte string exists per accepted value.
+pub fn decode_typed_canonical<T>(input: &[u8]) -> ContractResult<T>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let value: T = decode_strict(input)?;
+    if encode_canonical(&value)? != input {
+        return Err(ContractError::NotCanonical);
+    }
+    Ok(value)
+}
+
 /// Serialize a typed value, then validate and emit it through the strict profile.
 pub fn encode_canonical<T>(value: &T) -> ContractResult<Vec<u8>>
 where
@@ -583,6 +604,43 @@ mod tests {
     use serde::Deserialize;
 
     use super::*;
+
+    #[test]
+    fn typed_canonical_gate_rejects_positional_and_optional_key_forms() {
+        #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Probe {
+            a: u32,
+            b: Option<u32>,
+            c: String,
+        }
+        let object = b"{\"a\":1,\"b\":null,\"c\":\"x\"}";
+        let positional = b"[1,null,\"x\"]";
+        let omitted = b"{\"a\":1,\"c\":\"x\"}";
+        let decoded: Probe = super::decode_typed_canonical(object).unwrap();
+        assert_eq!(
+            decoded,
+            Probe {
+                a: 1,
+                b: None,
+                c: "x".into()
+            }
+        );
+        // Both alternates are canonical *documents* and decode to the same value...
+        assert!(super::require_canonical(positional).is_ok());
+        assert!(super::require_canonical(omitted).is_ok());
+        assert_eq!(super::decode_strict::<Probe>(positional).unwrap(), decoded);
+        assert_eq!(super::decode_strict::<Probe>(omitted).unwrap(), decoded);
+        // ...but only one byte string is the typed canonical form.
+        assert!(matches!(
+            super::decode_typed_canonical::<Probe>(positional),
+            Err(super::ContractError::NotCanonical)
+        ));
+        assert!(matches!(
+            super::decode_typed_canonical::<Probe>(omitted),
+            Err(super::ContractError::NotCanonical)
+        ));
+    }
 
     #[test]
     fn canonicalizes_without_collapsing_duplicate_keys() {
