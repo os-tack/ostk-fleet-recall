@@ -25,19 +25,40 @@
 //! W0-COVER's `CoverageReceiptV1` by digest only (this module never imports
 //! that contract) together with the completeness/freshness/continuity triple
 //! it asserts. [`derive_verification_outcome`] is the pure PRED-05 derivation:
-//! `verified_negative`/`verified_exact_set` require `closed_world_verified`,
-//! zero skipped/failed/unsupported/unknown inputs, and complete, current,
-//! contiguous-when-applicable coverage; `positive_verified` may still prove an
-//! individually found positive under partial coverage; `candidate_only` never
-//! verifies; dependency drift and timeout/resource exhaustion always resolve
-//! to `indeterminate`, never a verified negative and never a silent failure.
+//! it first requires the run to bind to *this* admission (the run's own
+//! `admission` reference equals [`AdmittedObserverV1::admission_reference`],
+//! its witnessed executable/dependency digests match the admitted identity,
+//! its configuration-context digest matches the admitted one, and every
+//! admission-required applicability dimension is present in the run's
+//! concrete applicability) before considering the run's outcome at all,
+//! since none of the executable/dependency check alone proves the run was
+//! actually produced under this admission's configuration or applicability
+//! scope; `verified_negative`/`verified_exact_set` further require
+//! `closed_world_verified`, zero skipped/failed/unsupported/unknown inputs,
+//! and complete, current, contiguous-when-applicable coverage;
+//! `positive_verified` may still prove an individually found positive under
+//! partial coverage; `candidate_only` never verifies; dependency drift and
+//! timeout/resource exhaustion always resolve to `indeterminate`, never a
+//! verified negative and never a silent failure. [`build_observer_result`]
+//! similarly rejects unless the caller-supplied predicate and applicability
+//! equal the admission's predicate and the run's applicability, so an
+//! admitted-for-P observer can never emit a verified finding about an
+//! unrelated predicate or an applicability its run never read.
 //!
-//! [`detect_disagreement`] implements `observer_derivation_disagreement`:
-//! incompatible outputs from two admitted observers with overlapping admitted
-//! domains, predicate references, and concrete applicability make every
-//! affected observation indeterminate, while a `candidate_only` output remains
-//! only opposing candidate evidence and never by itself invalidates a complete
-//! verified proof.
+//! [`detect_disagreement`] implements `observer_derivation_disagreement`: it
+//! first requires each result's `admission_digest` to equal
+//! `ObserverAdmissionV2::digest()` of the admission passed alongside it, so a
+//! hand-built public [`ObserverResultV1`] cannot borrow a genuine admission's
+//! authority merely by being passed next to it. Incompatible outputs from two
+//! admitted observers with overlapping admitted domains, predicate
+//! references, and concrete applicability then make every affected
+//! observation indeterminate, while an admission whose `mode` is
+//! `candidate_only` on either side never yields a disagreement: its output
+//! remains only opposing candidate evidence and never by itself invalidates a
+//! complete verified proof. That suppression is keyed on the admission's
+//! `mode`, never on a result's self-reported `verification_outcome`, so a
+//! forged verified-shaped result cannot claim disagreement authority a
+//! genuinely `candidate_only` admission was never granted.
 
 use std::fmt;
 
@@ -353,6 +374,7 @@ impl ObserverAdmissionV2 {
 #[derive(Debug)]
 pub struct AdmittedObserverV1 {
     admission: ObserverAdmissionV2,
+    admission_reference: RegistryReferenceV1,
 }
 
 impl AdmittedObserverV1 {
@@ -360,10 +382,35 @@ impl AdmittedObserverV1 {
         &self.admission
     }
 
+    /// The registry entry reference this activation witness bound to
+    /// `admission`. A run receipt's own `admission` field must equal this
+    /// exact reference (entry ID, version, and entry digest) before any
+    /// derivation may cite the run against this admission (COVER-01,
+    /// PRED-05): matching only the admitted executable/dependency identity
+    /// is not sufficient, since an unrelated admission can share the same
+    /// executable.
+    pub const fn admission_reference(&self) -> &RegistryReferenceV1 {
+        &self.admission_reference
+    }
+
     #[cfg(test)]
-    fn from_test_witness(admission: ObserverAdmissionV2) -> ContractResult<Self> {
+    fn from_test_witness(
+        admission: ObserverAdmissionV2,
+        admission_reference: RegistryReferenceV1,
+    ) -> ContractResult<Self> {
         admission.validate_shape()?;
-        Ok(Self { admission })
+        validate_registry_reference(&admission_reference)?;
+        let entry_id_matches = admission_reference.entry_id == admission.admission_id;
+        let version_matches = admission_reference.version == admission.version;
+        if !(entry_id_matches && version_matches) {
+            return Err(ContractError::Schema(
+                "admission reference does not identify this admission".into(),
+            ));
+        }
+        Ok(Self {
+            admission,
+            admission_reference,
+        })
     }
 }
 
@@ -640,10 +687,19 @@ pub fn derive_verification_outcome(
     admission.validate_shape()?;
     run.validate_shape()?;
 
+    if run.admission != *admitted.admission_reference() {
+        return Ok(VerificationOutcomeV1::Indeterminate);
+    }
     if !run
         .executable_identity
         .matches_admitted(&admission.identity)
     {
+        return Ok(VerificationOutcomeV1::Indeterminate);
+    }
+    if run.configuration_context_digest != admission.configuration_context_digest {
+        return Ok(VerificationOutcomeV1::Indeterminate);
+    }
+    if !run_covers_every_required_applicability_dimension(admission, run) {
         return Ok(VerificationOutcomeV1::Indeterminate);
     }
     if run.outcome == ObserverOutcomeKindV1::Timeout {
@@ -783,6 +839,13 @@ impl ObserverResultV1 {
 
 /// Build one [`ObserverResultV1`] whose `verification_outcome` is exactly
 /// [`derive_verification_outcome`]'s pure result for `admitted` and `run`.
+///
+/// Rejects with [`ContractError::Schema`] unless `predicate` is exactly
+/// `admitted.admission().predicate` and `applicability` is exactly
+/// `run.applicability`: an admitted-for-P observer must never be able to
+/// emit a verified finding about an unrelated predicate Q, nor about a
+/// concrete applicability its run receipt never actually read (COVER-01,
+/// AUTH-03).
 #[allow(clippy::too_many_arguments)]
 pub fn build_observer_result(
     admitted: &AdmittedObserverV1,
@@ -795,6 +858,16 @@ pub fn build_observer_result(
     evaluated_condition: EvaluatedConditionV1,
     effective_at: CanonicalTimestamp,
 ) -> ContractResult<ObserverResultV1> {
+    if predicate != admitted.admission().predicate {
+        return Err(ContractError::Schema(
+            "observer result predicate must match the admitted predicate".into(),
+        ));
+    }
+    if applicability != run.applicability {
+        return Err(ContractError::Schema(
+            "observer result applicability must match the run receipt applicability".into(),
+        ));
+    }
     let verification_outcome =
         derive_verification_outcome(admitted, run, claim_shape, evaluated_condition)?;
     let result = ObserverResultV1 {
@@ -892,14 +965,23 @@ impl ObserverDerivationDisagreementV1 {
 
 /// Pure `observer_derivation_disagreement` detector.
 ///
+/// Rejects with [`ContractError::Schema`] unless each result's
+/// `admission_digest` equals `ObserverAdmissionV2::digest()` of the admission
+/// passed alongside it: a hand-built `ObserverResultV1` (its fields are all
+/// public) must not be able to borrow a genuine admission's authority merely
+/// by being passed next to it in this call.
+///
 /// Returns `Ok(None)` when the two admissions' domains do not overlap, when
-/// the predicate or concrete applicability differ, or when either result is
-/// only `candidate_only` opposing evidence: a `candidate_only` output remains
-/// opposing candidate evidence and never by itself invalidates an otherwise
-/// complete verified proof. Returns `Ok(None)` when either result is already
-/// `indeterminate`, since there is nothing further to disagree about. Returns
-/// `Ok(Some(..))` only when both sides reached a real, differing
-/// determination over the same overlapping domain.
+/// the predicate or concrete applicability differ, or when either
+/// *admission's* `mode` is `candidate_only`: a `candidate_only` output
+/// remains opposing candidate evidence and never by itself invalidates an
+/// otherwise complete verified proof. This is keyed on the admission's mode,
+/// not on a result's self-reported `verification_outcome`, so a forged
+/// verified-shaped result cannot claim disagreement authority a genuinely
+/// `candidate_only` admission was never granted. Returns `Ok(None)` when
+/// either result is already `indeterminate`, since there is nothing further
+/// to disagree about. Returns `Ok(Some(..))` only when both sides reached a
+/// real, differing determination over the same overlapping domain.
 pub fn detect_disagreement(
     left_admission: &ObserverAdmissionV2,
     left_result: &ObserverResultV1,
@@ -911,6 +993,17 @@ pub fn detect_disagreement(
     right_admission.validate_shape()?;
     left_result.validate_shape()?;
     right_result.validate_shape()?;
+
+    if left_result.admission_digest != left_admission.digest()? {
+        return Err(ContractError::Schema(
+            "left result admission_digest does not match the left admission".into(),
+        ));
+    }
+    if right_result.admission_digest != right_admission.digest()? {
+        return Err(ContractError::Schema(
+            "right result admission_digest does not match the right admission".into(),
+        ));
+    }
 
     let domains_overlap = kinds_overlap(
         &left_admission.input_domain.supported_resource_kinds,
@@ -926,13 +1019,18 @@ pub fn detect_disagreement(
         return Ok(None);
     }
 
-    let neither_is_only_candidate_evidence = left_result.verification_outcome
-        != VerificationOutcomeV1::Candidate
-        && right_result.verification_outcome != VerificationOutcomeV1::Candidate;
+    // The suppression is keyed on the *admission's* mode, not on whatever
+    // `verification_outcome` a (potentially forged) result payload happens to
+    // carry: a `candidate_only` admission can never produce anything but
+    // candidate evidence, and no self-reported result field may override
+    // that governance fact.
+    let neither_admission_is_candidate_only = left_admission.mode
+        != ObserverAdmissionModeV1::CandidateOnly
+        && right_admission.mode != ObserverAdmissionModeV1::CandidateOnly;
     let both_reached_a_determination = left_result.verification_outcome
         != VerificationOutcomeV1::Indeterminate
         && right_result.verification_outcome != VerificationOutcomeV1::Indeterminate;
-    if !(neither_is_only_candidate_evidence && both_reached_a_determination) {
+    if !(neither_admission_is_candidate_only && both_reached_a_determination) {
         return Ok(None);
     }
 
@@ -982,6 +1080,30 @@ fn strictly_sorted_by_dimension(values: &[ConcreteApplicabilityDimensionV1]) -> 
         .all(|pair| pair[0].dimension_id < pair[1].dimension_id)
 }
 
+/// Whether every applicability dimension the admission's closed input domain
+/// requires (APPL-01/COVER-01) is present in the run's concrete applicability.
+/// `run.applicability` is already validated as strictly sorted by
+/// `dimension_id` (no duplicates), so "present" and "present exactly once"
+/// coincide; this is checked explicitly rather than assumed so a future
+/// relaxation of that sort invariant cannot silently reopen a duplicate-count
+/// bypass here.
+fn run_covers_every_required_applicability_dimension(
+    admission: &ObserverAdmissionV2,
+    run: &ObserverRunReceiptV1,
+) -> bool {
+    admission
+        .input_domain
+        .required_applicability_dimensions
+        .iter()
+        .all(|required_dimension| {
+            run.applicability
+                .iter()
+                .filter(|concrete| &concrete.dimension_id == required_dimension)
+                .count()
+                == 1
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -1029,7 +1151,7 @@ mod tests {
     const RUN_RECEIPT_SUCCESS_RAW_SHA256: &str =
         "363a5a83d47dfeae6ffe5df229966790d748dd31b40681881396b8c25da49d92";
     const RESULT_VERIFIED_NEGATIVE_RAW_SHA256: &str =
-        "a39760ee8635ac221ea29706dde44c56f6255ab241d6d62aafe515435005e703";
+        "ed2482bf4e1d492c3865d907223491ea76ab3ea78e51d6ece72753126b99029f";
     const VECTOR_SUITE_RAW_SHA256: &str =
         "f83d43d588d9b789b2cc50640d549498c06ad78bf9ff94f54525e7e0e273219f";
     const NEGATIVE_LLM_CLOSED_WORLD_RAW_SHA256: &str =
@@ -1217,6 +1339,15 @@ mod tests {
         }
     }
 
+    /// Admit `admission` under the registry entry reference its own
+    /// `admission_id`/`version` name, exactly as a genuine registry
+    /// activation witness would. Reused by every test so a call site cannot
+    /// accidentally admit under an unrelated reference.
+    fn admit(admission: ObserverAdmissionV2) -> AdmittedObserverV1 {
+        let admission_reference = reference(admission.admission_id.as_str());
+        AdmittedObserverV1::from_test_witness(admission, admission_reference).unwrap()
+    }
+
     fn matching_runtime_identity(
         admitted: &ObserverExecutableIdentityV1,
     ) -> ObserverRuntimeIdentityV1 {
@@ -1236,7 +1367,7 @@ mod tests {
     #[test]
     fn closed_world_admission_verifies_a_negative_under_full_coverage() {
         let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
-        let admitted = AdmittedObserverV1::from_test_witness(admission.clone()).unwrap();
+        let admitted = admit(admission.clone());
         let run = run_receipt(
             matching_runtime_identity(&admission.identity),
             zero_gap_inputs(),
@@ -1256,7 +1387,7 @@ mod tests {
     #[test]
     fn closed_world_admission_verifies_an_exact_set_under_full_coverage() {
         let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
-        let admitted = AdmittedObserverV1::from_test_witness(admission.clone()).unwrap();
+        let admitted = admit(admission.clone());
         let run = run_receipt(
             matching_runtime_identity(&admission.identity),
             zero_gap_inputs(),
@@ -1276,7 +1407,7 @@ mod tests {
     #[test]
     fn skipped_input_under_closed_world_is_indeterminate() {
         let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
-        let admitted = AdmittedObserverV1::from_test_witness(admission.clone()).unwrap();
+        let admitted = admit(admission.clone());
         let mut inputs = zero_gap_inputs();
         inputs.skipped = ObserverInputTallyV1 {
             total_count: 1,
@@ -1301,7 +1432,7 @@ mod tests {
     #[test]
     fn dependency_drift_is_always_indeterminate() {
         let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
-        let admitted = AdmittedObserverV1::from_test_witness(admission).unwrap();
+        let admitted = admit(admission);
         let run = run_receipt(
             drifted_runtime_identity(),
             zero_gap_inputs(),
@@ -1319,9 +1450,86 @@ mod tests {
     }
 
     #[test]
+    fn configuration_drift_is_always_indeterminate() {
+        // A run witnessed under a different configuration context than the
+        // one this admission is scoped to must never verify, even though its
+        // executable/dependency identity matches the admitted one.
+        let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let admitted = admit(admission.clone());
+        let mut run = run_receipt(
+            matching_runtime_identity(&admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        run.configuration_context_digest = digest_from_label("configuration.drifted");
+        let outcome = derive_verification_outcome(
+            &admitted,
+            &run,
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Absent,
+        )
+        .unwrap();
+        assert_eq!(outcome, VerificationOutcomeV1::Indeterminate);
+    }
+
+    #[test]
+    fn unrelated_admission_reference_is_indeterminate() {
+        // A run receipt whose `admission` field names an entirely different
+        // registry entry must never verify against this admission merely
+        // because its executable/dependency digests happen to match: matching
+        // executable identity alone does not prove the run was produced under
+        // *this* admission.
+        let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let admitted = admit(admission.clone());
+        let mut run = run_receipt(
+            matching_runtime_identity(&admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        run.admission = reference("observer.some.other.entry.entirely");
+        let outcome = derive_verification_outcome(
+            &admitted,
+            &run,
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Absent,
+        )
+        .unwrap();
+        assert_eq!(outcome, VerificationOutcomeV1::Indeterminate);
+    }
+
+    #[test]
+    fn missing_required_applicability_dimension_is_indeterminate() {
+        // The admission requires `repository_commit` as a concrete
+        // applicability dimension (`input_domain()`); a run that reports no
+        // applicability at all must never verify absence. `run.validate_shape`
+        // permits an empty applicability list structurally, so this must be
+        // enforced by the derivation, not by shape validation.
+        let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let admitted = admit(admission.clone());
+        let mut run = run_receipt(
+            matching_runtime_identity(&admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        run.applicability = Vec::new();
+        run.validate_shape().unwrap();
+        let outcome = derive_verification_outcome(
+            &admitted,
+            &run,
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Absent,
+        )
+        .unwrap();
+        assert_eq!(outcome, VerificationOutcomeV1::Indeterminate);
+    }
+
+    #[test]
     fn timeout_is_always_indeterminate_never_a_verified_negative() {
         let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
-        let admitted = AdmittedObserverV1::from_test_witness(admission.clone()).unwrap();
+        let admitted = admit(admission.clone());
         let run = run_receipt(
             matching_runtime_identity(&admission.identity),
             zero_gap_inputs(),
@@ -1341,7 +1549,7 @@ mod tests {
     #[test]
     fn candidate_only_never_verifies() {
         let admission = admission("ast_schema", ObserverAdmissionModeV1::CandidateOnly);
-        let admitted = AdmittedObserverV1::from_test_witness(admission.clone()).unwrap();
+        let admitted = admit(admission.clone());
         let run = run_receipt(
             matching_runtime_identity(&admission.identity),
             zero_gap_inputs(),
@@ -1394,8 +1602,7 @@ mod tests {
         coverage.completeness = ObserverCoverageCompletenessV1::Partial;
 
         let positive_admission = admission("ast_schema", ObserverAdmissionModeV1::PositiveVerified);
-        let positive_admitted =
-            AdmittedObserverV1::from_test_witness(positive_admission.clone()).unwrap();
+        let positive_admitted = admit(positive_admission.clone());
         let positive_run = run_receipt(
             matching_runtime_identity(&positive_admission.identity),
             inputs.clone(),
@@ -1412,8 +1619,7 @@ mod tests {
         assert_eq!(positive_outcome, VerificationOutcomeV1::VerifiedPositive);
 
         let candidate_admission = admission("llm", ObserverAdmissionModeV1::CandidateOnly);
-        let candidate_admitted =
-            AdmittedObserverV1::from_test_witness(candidate_admission.clone()).unwrap();
+        let candidate_admitted = admit(candidate_admission.clone());
         let candidate_run = run_receipt(
             matching_runtime_identity(&candidate_admission.identity),
             inputs,
@@ -1433,7 +1639,7 @@ mod tests {
     #[test]
     fn exact_set_claim_shape_rejects_an_absent_evaluated_condition() {
         let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
-        let admitted = AdmittedObserverV1::from_test_witness(admission.clone()).unwrap();
+        let admitted = admit(admission.clone());
         let run = run_receipt(
             matching_runtime_identity(&admission.identity),
             zero_gap_inputs(),
@@ -1449,6 +1655,64 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn build_observer_result_rejects_a_predicate_that_does_not_match_the_admission() {
+        // An admitted-for-P observer must never be able to emit a verified
+        // finding about an entirely different predicate Q merely by passing Q
+        // as the `predicate` parameter.
+        let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let admitted = admit(admission.clone());
+        let run = run_receipt(
+            matching_runtime_identity(&admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let unadmitted_predicate = reference("predicate.totally.unadmitted.security_policy");
+        let result = build_observer_result(
+            &admitted,
+            &run,
+            frozen_profile_reference_v1(),
+            scope(),
+            unadmitted_predicate,
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Absent,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_observer_result_rejects_an_applicability_that_does_not_match_the_run() {
+        // An admitted observer must never be able to emit a verified finding
+        // about a concrete applicability its run receipt never actually read.
+        let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let admitted = admit(admission.clone());
+        let run = run_receipt(
+            matching_runtime_identity(&admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let unrelated_applicability = vec![ConcreteApplicabilityDimensionV1 {
+            dimension_id: ContractId::new("unrelated_dimension").unwrap(),
+            resource: resource_uri("commit", IdentityForm::Version, 0x99),
+        }];
+        let result = build_observer_result(
+            &admitted,
+            &run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            unrelated_applicability,
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Absent,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1470,32 +1734,30 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_replay_reordered_but_sorted_inputs_yield_identical_digest() {
+    fn deterministic_replay_reordered_inputs_are_rejected_fail_closed() {
+        // PRED-05 order-independence is enforced by rejecting a genuinely
+        // non-canonical input sample order before a digest is ever produced,
+        // not by two differently-ordered receipts happening to hash equal.
+        // `inputs_b` here is actually descending (0x02 before 0x01) -- unlike
+        // the previous vector, which built both samples in the same ascending
+        // order and called a no-op `.sort()`, so it only ever exercised the
+        // already-canonical path and never observed a real reorder.
         let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
-        let mut inputs_a = zero_gap_inputs();
-        inputs_a.included.sample = vec![
-            resource_uri("rust.enum", IdentityForm::Occurrence, 0x01),
-            resource_uri("rust.enum", IdentityForm::Occurrence, 0x02),
-        ];
         let mut inputs_b = zero_gap_inputs();
         inputs_b.included.sample = vec![
-            resource_uri("rust.enum", IdentityForm::Occurrence, 0x01),
             resource_uri("rust.enum", IdentityForm::Occurrence, 0x02),
+            resource_uri("rust.enum", IdentityForm::Occurrence, 0x01),
         ];
-        inputs_b.included.sample.sort();
-        let run_a = run_receipt(
-            matching_runtime_identity(&admission.identity),
-            inputs_a,
-            full_coverage_witness(),
-            ObserverOutcomeKindV1::Success,
-        );
         let run_b = run_receipt(
             matching_runtime_identity(&admission.identity),
             inputs_b,
             full_coverage_witness(),
             ObserverOutcomeKindV1::Success,
         );
-        assert_eq!(run_a.digest().unwrap(), run_b.digest().unwrap());
+        assert_eq!(
+            run_b.digest(),
+            Err(ContractError::Schema("invalid observer input tally".into()))
+        );
     }
 
     #[test]
@@ -1512,8 +1774,7 @@ mod tests {
     fn overlapping_admitted_observers_with_incompatible_outputs_disagree() {
         let closed_admission =
             admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
-        let closed_admitted =
-            AdmittedObserverV1::from_test_witness(closed_admission.clone()).unwrap();
+        let closed_admitted = admit(closed_admission.clone());
         let closed_run = run_receipt(
             matching_runtime_identity(&closed_admission.identity),
             zero_gap_inputs(),
@@ -1536,14 +1797,14 @@ mod tests {
         let mut other_admission =
             admission("ast_schema", ObserverAdmissionModeV1::PositiveVerified);
         other_admission.admission_id = ContractId::new("observer.ast_schema_enum_v2").unwrap();
-        let other_admitted =
-            AdmittedObserverV1::from_test_witness(other_admission.clone()).unwrap();
-        let other_run = run_receipt(
+        let other_admitted = admit(other_admission.clone());
+        let mut other_run = run_receipt(
             matching_runtime_identity(&other_admission.identity),
             zero_gap_inputs(),
             full_coverage_witness(),
             ObserverOutcomeKindV1::Success,
         );
+        other_run.admission = reference(other_admission.admission_id.as_str());
         let positive_result = build_observer_result(
             &other_admitted,
             &other_run,
@@ -1572,8 +1833,7 @@ mod tests {
     fn non_overlapping_domains_never_disagree() {
         let closed_admission =
             admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
-        let closed_admitted =
-            AdmittedObserverV1::from_test_witness(closed_admission.clone()).unwrap();
+        let closed_admitted = admit(closed_admission.clone());
         let closed_run = run_receipt(
             matching_runtime_identity(&closed_admission.identity),
             zero_gap_inputs(),
@@ -1598,14 +1858,14 @@ mod tests {
         disjoint_admission.admission_id = ContractId::new("observer.other_enum").unwrap();
         disjoint_admission.input_domain.supported_resource_kinds =
             vec![ContractId::new("rust.struct").unwrap()];
-        let disjoint_admitted =
-            AdmittedObserverV1::from_test_witness(disjoint_admission.clone()).unwrap();
-        let disjoint_run = run_receipt(
+        let disjoint_admitted = admit(disjoint_admission.clone());
+        let mut disjoint_run = run_receipt(
             matching_runtime_identity(&disjoint_admission.identity),
             zero_gap_inputs(),
             full_coverage_witness(),
             ObserverOutcomeKindV1::Success,
         );
+        disjoint_run.admission = reference(disjoint_admission.admission_id.as_str());
         let positive_result = build_observer_result(
             &disjoint_admitted,
             &disjoint_run,
@@ -1634,8 +1894,7 @@ mod tests {
     fn candidate_only_opposing_evidence_does_not_invalidate_a_verified_proof() {
         let closed_admission =
             admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
-        let closed_admitted =
-            AdmittedObserverV1::from_test_witness(closed_admission.clone()).unwrap();
+        let closed_admitted = admit(closed_admission.clone());
         let closed_run = run_receipt(
             matching_runtime_identity(&closed_admission.identity),
             zero_gap_inputs(),
@@ -1656,7 +1915,7 @@ mod tests {
         .unwrap();
 
         let llm_admission = admission("llm", ObserverAdmissionModeV1::CandidateOnly);
-        let llm_admitted = AdmittedObserverV1::from_test_witness(llm_admission.clone()).unwrap();
+        let llm_admitted = admit(llm_admission.clone());
         let llm_run = run_receipt(
             matching_runtime_identity(&llm_admission.identity),
             zero_gap_inputs(),
@@ -1688,9 +1947,128 @@ mod tests {
     }
 
     #[test]
+    fn detect_disagreement_rejects_a_result_bound_to_a_different_admission() {
+        // `ObserverResultV1`'s fields are all public, so a caller can pass a
+        // result next to an admission it was never actually derived from.
+        // `admission_digest` must be checked against the accompanying
+        // admission's real digest, not assumed correct because it came out of
+        // `build_observer_result` for *some* admission.
+        let closed_admission =
+            admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let closed_admitted = admit(closed_admission.clone());
+        let closed_run = run_receipt(
+            matching_runtime_identity(&closed_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let mut negative_result = build_observer_result(
+            &closed_admitted,
+            &closed_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Absent,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+        negative_result.admission_digest = digest_from_label("forged.unrelated.admission");
+
+        let llm_admission = admission("llm", ObserverAdmissionModeV1::CandidateOnly);
+        let llm_admitted = admit(llm_admission.clone());
+        let llm_run = run_receipt(
+            matching_runtime_identity(&llm_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let candidate_result = build_observer_result(
+            &llm_admitted,
+            &llm_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Present,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+
+        let outcome = detect_disagreement(
+            &closed_admission,
+            &negative_result,
+            &llm_admission,
+            &candidate_result,
+            timestamp("2026-08-14T13:00:00.000000000Z"),
+        );
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn detect_disagreement_ignores_a_forged_verified_outcome_under_a_candidate_only_admission() {
+        // Even when a hand-built public `ObserverResultV1` correctly cites its
+        // candidate_only admission's real digest, forging
+        // `verification_outcome` to `verified_positive` must not defeat
+        // "candidate_only never invalidates a verified proof": suppression is
+        // keyed on the admission's `mode`, not on whatever outcome the result
+        // payload happens to self-report.
+        let closed_admission =
+            admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let closed_admitted = admit(closed_admission.clone());
+        let closed_run = run_receipt(
+            matching_runtime_identity(&closed_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let negative_result = build_observer_result(
+            &closed_admitted,
+            &closed_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Absent,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+
+        let llm_admission = admission("llm", ObserverAdmissionModeV1::CandidateOnly);
+        let forged_result = ObserverResultV1 {
+            schema_version: OBSERVER_SCHEMA_VERSION,
+            event_kind: ContractId::new(OBSERVER_RESULT_EVENT_KIND).unwrap(),
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            predicate: reference("predicate.mcp.remember.allowed_actions"),
+            applicability: applicability(),
+            admission_digest: llm_admission.digest().unwrap(),
+            run_receipt_digest: digest_from_label("forged.run_receipt"),
+            claim_shape: ObserverClaimShapeV1::Presence,
+            evaluated_condition: EvaluatedConditionV1::Present,
+            verification_outcome: VerificationOutcomeV1::VerifiedPositive,
+            effective_at: timestamp("2026-08-14T12:00:00.000000000Z"),
+        };
+        forged_result.validate_shape().unwrap();
+
+        let disagreement = detect_disagreement(
+            &closed_admission,
+            &negative_result,
+            &llm_admission,
+            &forged_result,
+            timestamp("2026-08-14T13:00:00.000000000Z"),
+        )
+        .unwrap();
+        assert!(disagreement.is_none());
+    }
+
+    #[test]
     fn admitted_observer_result_requires_valid_shape() {
         let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
-        let admitted = AdmittedObserverV1::from_test_witness(admission.clone()).unwrap();
+        let admitted = admit(admission.clone());
         let run = run_receipt(
             matching_runtime_identity(&admission.identity),
             zero_gap_inputs(),
@@ -1719,7 +2097,7 @@ mod tests {
     #[test]
     fn accepted_event_id_and_result_fingerprint_are_domain_separated() {
         let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
-        let admitted = AdmittedObserverV1::from_test_witness(admission.clone()).unwrap();
+        let admitted = admit(admission.clone());
         let run = run_receipt(
             matching_runtime_identity(&admission.identity),
             zero_gap_inputs(),
@@ -1856,5 +2234,24 @@ mod tests {
         let admission: ObserverAdmissionV2 =
             crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
         assert!(admission.validate_shape().is_err());
+    }
+
+    #[test]
+    fn result_verified_negative_fixture_chains_to_the_frozen_admission_and_run_receipt() {
+        // PRED-05: the frozen result vector's admission_digest/run_receipt_digest
+        // must be the real digests of the sibling frozen fixtures it claims to
+        // cite, not independent labels. Recomputed from the frozen bytes so the
+        // chain cannot silently drift again.
+        let admission_bytes = record(ADMISSION_FIXTURE);
+        let admission: ObserverAdmissionV2 =
+            crate::memory_contracts::canonical::decode_strict(admission_bytes).unwrap();
+        let run_bytes = record(RUN_RECEIPT_SUCCESS_FIXTURE);
+        let run: ObserverRunReceiptV1 =
+            crate::memory_contracts::canonical::decode_strict(run_bytes).unwrap();
+        let result_bytes = record(RESULT_VERIFIED_NEGATIVE_FIXTURE);
+        let result: ObserverResultV1 =
+            crate::memory_contracts::canonical::decode_strict(result_bytes).unwrap();
+        assert_eq!(result.admission_digest, admission.digest().unwrap());
+        assert_eq!(result.run_receipt_digest, run.digest().unwrap());
     }
 }

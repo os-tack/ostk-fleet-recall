@@ -22,6 +22,36 @@ def d(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
 
 
+ADMISSION_DIGEST_DOMAIN = "ostk-observer-admission-v2"
+RUN_RECEIPT_DIGEST_DOMAIN = "ostk-observer-run-receipt-v1"
+
+
+def canonical_bytes(obj) -> bytes:
+    """Byte-identical to Rust's `encode_canonical` for every shape this suite
+    uses (ints, strings, bools, arrays, and objects only -- no floats, no
+    non-ASCII): compact separators plus lexicographically sorted object keys,
+    exactly what the `ostk-canonical-json-v1` BTreeMap-backed encoder emits.
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+
+
+def domain_digest(prefix: str, obj) -> str:
+    """Replicates `domain_separated_digest(domain, encode_canonical(obj))`:
+    sha256(prefix || 0x00 || canonical_bytes). Used to chain a result
+    fixture's `admission_digest`/`run_receipt_digest` to the *real* digest of
+    the sibling fixture object it cites, so the two can never silently drift
+    apart the way a `d(f"{label}.admission_digest")` label placeholder would
+    let them (PRED-05).
+    """
+    hasher = hashlib.sha256()
+    hasher.update(prefix.encode())
+    hasher.update(b"\x00")
+    hasher.update(canonical_bytes(obj))
+    return hasher.hexdigest()
+
+
 def uri(kind: str, form: str, seed: int) -> str:
     return f"urn:ostk:{form}:v1:{kind}:sha256:{('%02x' % seed) * 32}"
 
@@ -151,7 +181,15 @@ def run_receipt(label_ns, admission_id, dep_labels, outcome="success", extra_ski
     }
 
 
-def result(label_ns, predicate_id, claim_shape, evaluated_condition, verification_outcome):
+def result(
+    label_ns,
+    predicate_id,
+    claim_shape,
+    evaluated_condition,
+    verification_outcome,
+    admission_obj,
+    run_receipt_obj,
+):
     return {
         "schema_version": 1,
         "event_kind": "observer.result.accepted",
@@ -171,8 +209,8 @@ def result(label_ns, predicate_id, claim_shape, evaluated_condition, verificatio
                 "resource": uri("commit", "version", 0x10),
             }
         ],
-        "admission_digest": d(f"{label_ns}.admission_digest"),
-        "run_receipt_digest": d(f"{label_ns}.run_receipt_digest"),
+        "admission_digest": domain_digest(ADMISSION_DIGEST_DOMAIN, admission_obj),
+        "run_receipt_digest": domain_digest(RUN_RECEIPT_DIGEST_DOMAIN, run_receipt_obj),
         "claim_shape": claim_shape,
         "evaluated_condition": evaluated_condition,
         "verification_outcome": verification_outcome,
@@ -208,10 +246,10 @@ def main():
     )
     write("observer-admission-candidate-only-v1.jsonl", candidate_only)
 
-    write(
-        "observer-run-receipt-success-v1.jsonl",
-        run_receipt("closed", "observer.ast_schema_enum", ["dependency.one", "dependency.two"]),
+    closed_run_receipt = run_receipt(
+        "closed", "observer.ast_schema_enum", ["dependency.one", "dependency.two"]
     )
+    write("observer-run-receipt-success-v1.jsonl", closed_run_receipt)
 
     write(
         "observer-result-verified-negative-v1.jsonl",
@@ -221,6 +259,8 @@ def main():
             "presence",
             "absent",
             "verified_negative",
+            closed_world,
+            closed_run_receipt,
         ),
     )
 

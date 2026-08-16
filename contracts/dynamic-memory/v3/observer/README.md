@@ -35,10 +35,16 @@ itself (AUTH-03, EVENT-03).
   by digest only — this module never imports that contract or redefines its
   shape, only its completeness/freshness/continuity triple plus digest.
 - `observer-result-verified-negative-v1.jsonl` — an `ObserverResultV1`
-  accepted-event preimage citing the closed-world admission and run-receipt
-  digests above, with `claim_shape: presence`, `evaluated_condition: absent`,
-  `verification_outcome: verified_negative`. Proves the closed shape a
-  `verified_negative` finding must take.
+  accepted-event preimage whose `admission_digest`/`run_receipt_digest` are
+  the *real* `ObserverAdmissionV2::digest()`/`ObserverRunReceiptV1::digest()`
+  of the closed-world admission and run-receipt fixtures above (asserted
+  against the frozen bytes by
+  `result_verified_negative_fixture_chains_to_the_frozen_admission_and_run_receipt`
+  in `observer.rs`, not merely decoded independently), with `claim_shape:
+  presence`, `evaluated_condition: absent`, `verification_outcome:
+  verified_negative`. Proves the closed shape a `verified_negative` finding
+  must take, and that PRED-05's supporting-evidence chain is real rather than
+  decorative.
 - `vector-suite.jsonl` — the manifest of every case file in this directory,
   proving the suite is closed and enumerable.
 - `negative-llm-closed-world-v1.jsonl` — `observer_kind: "llm"` admitted
@@ -93,4 +99,11 @@ relation fixture suites.
 `scripts/gen_observer_fixtures.py` at the repository root regenerates these
 files deterministically from human-readable labels (`hashlib.sha256(label)`)
 so every digest's provenance is auditable by inspection; it is a one-off
-authoring aid, not part of the build.
+authoring aid, not part of the build. The one exception is the result
+fixture's `admission_digest`/`run_receipt_digest`: those are computed by
+`domain_digest()`, a Python replica of
+`domain_separated_digest(domain, encode_canonical(obj))` (sorted-key compact
+JSON under a SHA-256 domain prefix), applied to the exact admission/run-receipt
+objects the script also writes to their own fixture files — so a regeneration
+can never again produce a result vector that cites digests unrelated to its
+siblings.
