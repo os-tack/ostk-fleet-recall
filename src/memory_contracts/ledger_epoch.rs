@@ -686,15 +686,24 @@ impl ProjectorCheckpointV1 {
 
 /// One generation published for one closed cursor-vector barrier.
 ///
-/// A first generation's barrier alone determines its identity within one
-/// initial publication — the same closed facts always start from the same
-/// generation regardless of shard schedule or arrival order — but
-/// `generation_id()` hashes the whole record, so an *accepted* superseding
-/// generation is additionally constrained by [`Self::validate_supersession`]:
-/// its barrier must strictly advance the one it `supersedes`, never merely
-/// restate it under a different `output_digest`. Late evidence publishes a
-/// strictly later generation over a strictly advanced barrier; the earlier
-/// generation's record and output are never deleted (REPLAY-01, REPLAY-02).
+/// Identity ([`Self::generation_id`]) is a pure function of *what was
+/// published* — `projector_id`, `projector_version`, `generation_sequence`,
+/// `output_digest`, and `supersedes` — and deliberately excludes `barrier`.
+/// A physical shard schedule (epoch, shard count, arrival order) is encoded
+/// only in `barrier`, so processing the same facts under a different shard
+/// schedule still yields the same generation (REPLAY-01: "same facts under
+/// a different shard schedule must produce the same generation"). `barrier`
+/// remains on the record as bound *evidence of closure*, checked
+/// structurally — never as part of identity — by every caller before
+/// admission: [`Self::validate_supersession`] requires a superseding
+/// generation to (a) name its exact predecessor's `generation_id`, (b) share
+/// that predecessor's `projector_id` and `projector_version` exactly (a
+/// generation is never superseded by a different projector or a different
+/// version of the same one), (c) carry `generation_sequence` exactly one
+/// past the predecessor's, and (d) strictly advance the predecessor's
+/// barrier. Late evidence publishes a strictly later generation over a
+/// strictly advanced barrier; the earlier generation's record and output are
+/// never deleted (REPLAY-01, REPLAY-02).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectionGenerationV1 {
@@ -705,6 +714,23 @@ pub struct ProjectionGenerationV1 {
     pub generation_sequence: u64,
     pub output_digest: Sha256Digest,
     pub supersedes: Option<Sha256Digest>,
+}
+
+/// The identity-only projection hashed by [`ProjectionGenerationV1::generation_id`].
+///
+/// Exists solely to keep `barrier` — a physical shard-schedule coordinate —
+/// out of the identity preimage; see the type-level doc on
+/// [`ProjectionGenerationV1`] for why. Serialize-only: this type is never
+/// decoded, only built from an already-validated [`ProjectionGenerationV1`]
+/// and canonically encoded.
+#[derive(Serialize)]
+struct ProjectionGenerationIdentityV1<'a> {
+    schema_version: u32,
+    projector_id: &'a ContractId,
+    projector_version: u32,
+    generation_sequence: u64,
+    output_digest: &'a Sha256Digest,
+    supersedes: &'a Option<Sha256Digest>,
 }
 
 impl ProjectionGenerationV1 {
@@ -725,30 +751,48 @@ impl ProjectionGenerationV1 {
         Ok(())
     }
 
-    /// `SHA-256("ostk-projection-generation-v1" || 0x00 || canonical_bytes(self))`.
+    /// `SHA-256("ostk-projection-generation-v1" || 0x00 || canonical_bytes(identity))`
+    /// where `identity` is [`ProjectionGenerationIdentityV1`] — `self`
+    /// minus `barrier`. See the type-level docs for why `barrier` is
+    /// excluded from identity.
     pub fn generation_id(&self) -> ContractResult<Sha256Digest> {
         self.validate()?;
+        let identity = ProjectionGenerationIdentityV1 {
+            schema_version: self.schema_version,
+            projector_id: &self.projector_id,
+            projector_version: self.projector_version,
+            generation_sequence: self.generation_sequence,
+            output_digest: &self.output_digest,
+            supersedes: &self.supersedes,
+        };
         Ok(domain_separated_digest(
             DigestDomain::ProjectionGenerationV1,
-            &encode_canonical(self)?,
+            &encode_canonical(&identity)?,
         ))
     }
 
     /// The cross-record half of "one generation per closed barrier": a
-    /// superseding generation must name its exact predecessor and its
-    /// barrier must strictly dominate that predecessor's — same epoch, the
-    /// same shard set, every cursor at or past the predecessor's offset, and
-    /// at least one strictly past it.
+    /// superseding generation must name its exact predecessor, share that
+    /// predecessor's exact projector identity and version, carry a sequence
+    /// exactly one past it, and its barrier must strictly dominate that
+    /// predecessor's — same epoch, the same shard set, every cursor at or
+    /// past the predecessor's offset, and at least one strictly past it.
     ///
-    /// `validate()` alone cannot enforce this: `generation_id()` hashes the
-    /// whole struct, including `output_digest`, so barrier identity alone
-    /// does not determine generation identity, and a caller could otherwise
-    /// publish two different `output_digest` values over the identical
-    /// closed barrier (rewriting "what happened" instead of recomputing it
-    /// after strictly more evidence closed). This method is the required
-    /// second check a runtime performs before admitting a superseding
-    /// generation; a same-or-earlier barrier is rejected regardless of what
-    /// `output_digest` it carries.
+    /// `validate()` alone cannot enforce any of this: it is a single-record
+    /// shape check, so two *different* records can each independently pass
+    /// `validate()` while disagreeing on projector, sequence, or barrier
+    /// with a named predecessor — and `generation_id()` deliberately
+    /// excludes `barrier` from identity (see the type-level docs), so
+    /// naming the right predecessor id alone says nothing about barrier
+    /// dominance. Without this method a caller could publish a generation
+    /// naming an unrelated projector's output as its successor, skip or
+    /// regress `generation_sequence`, or publish a different `output_digest`
+    /// over the identical closed barrier (rewriting "what happened" instead
+    /// of recomputing it after strictly more evidence closed). This method
+    /// is the required second check a runtime performs before admitting a
+    /// superseding generation; a cross-projector, cross-version,
+    /// non-consecutive-sequence, or same-or-earlier-barrier successor is
+    /// rejected regardless of what `output_digest` it carries.
     pub fn validate_supersession(&self, predecessor: &Self) -> ContractResult<()> {
         self.validate()?;
         predecessor.validate()?;
@@ -756,6 +800,35 @@ impl ProjectionGenerationV1 {
         if self.supersedes != Some(predecessor_id) {
             return Err(ContractError::Schema(
                 "superseding generation does not name its exact predecessor".into(),
+            ));
+        }
+        if self.projector_id != predecessor.projector_id {
+            return Err(ContractError::Schema(
+                "superseding generation belongs to a different projector".into(),
+            ));
+        }
+        if self.projector_version != predecessor.projector_version {
+            return Err(ContractError::Schema(
+                "superseding generation belongs to a different projector version; a deliberate \
+                 projector-version bump must be an explicit, separately named admission rule, \
+                 never this default supersession check"
+                    .into(),
+            ));
+        }
+        let expected_sequence =
+            predecessor
+                .generation_sequence
+                .checked_add(1)
+                .ok_or_else(|| {
+                    ContractError::Schema(
+                        "predecessor generation sequence would overflow on supersession".into(),
+                    )
+                })?;
+        if self.generation_sequence != expected_sequence {
+            return Err(ContractError::Schema(
+                "superseding generation sequence must be exactly one past its predecessor's; \
+                 a lower, equal, or skipped sequence is rejected"
+                    .into(),
             ));
         }
         if self.barrier.epoch_id != predecessor.barrier.epoch_id {
@@ -1096,7 +1169,7 @@ mod tests {
     const CURSOR_BARRIER_DIGEST: &str =
         "231b09eb8bb020d4e7fa5fb6d17bac004e67d2d3a7ca912b805f71ec408252c4";
     const PROJECTION_GENERATION_ID: &str =
-        "e23a748ac566af7f031c8e9dc9757a11c6df49b716f5b120365e39f84f48bf33";
+        "e8c614de33d18efe3c8e196a05ebaa5009cbace86e94e3e8fb8a8cf4a2cef040";
 
     fn record(artifact: &'static [u8]) -> &'static [u8] {
         let body = artifact
@@ -1589,6 +1662,172 @@ mod tests {
         let mut inconsistent = generation;
         inconsistent.generation_sequence = 1;
         assert!(inconsistent.validate().is_err());
+    }
+
+    #[test]
+    fn projection_generation_supersession_binds_projector_identity_and_sequence() {
+        // Attack 1 reproduction, now as a passing rejection: a hostile
+        // projector must never be able to supersede another projector's
+        // generation, even with a strictly-advanced barrier and the correct
+        // predecessor id.
+        let g0: ProjectionGenerationV1 = decode_strict(record(PROJECTION_GENERATION)).unwrap();
+        let g0_id = g0.generation_id().unwrap();
+
+        let mut advanced_cursors = g0.barrier.cursors.clone();
+        advanced_cursors[0].last_processed_offset =
+            CommittedOffsetV1::new(advanced_cursors[0].last_processed_offset.as_u64() + 1).unwrap();
+        let advanced_barrier =
+            CursorVectorBarrierV1::from_observations(g0.barrier.epoch_id, advanced_cursors)
+                .unwrap();
+
+        let hostile_projector = ProjectionGenerationV1 {
+            projector_id: ContractId::new("projector.hostile.other").unwrap(),
+            barrier: advanced_barrier.clone(),
+            generation_sequence: 1,
+            output_digest: digest(
+                "7777777777777777777777777777777777777777777777777777777777777777",
+            ),
+            supersedes: Some(g0_id),
+            ..g0
+        };
+        hostile_projector.validate().unwrap();
+        assert!(
+            hostile_projector.validate_supersession(&g0).is_err(),
+            "a different projector must never supersede another projector's generation"
+        );
+
+        // A projector-version bump is not, by default, an admitted
+        // supersession either. If a future workstream wants to allow one, it
+        // must be an explicit, separately named and separately tested
+        // admission rule, never this default check.
+        let hostile_version = ProjectionGenerationV1 {
+            projector_version: g0.projector_version + 1,
+            barrier: advanced_barrier.clone(),
+            generation_sequence: 1,
+            output_digest: digest(
+                "7777777777777777777777777777777777777777777777777777777777777777",
+            ),
+            supersedes: Some(g0_id),
+            ..g0.clone()
+        };
+        hostile_version.validate().unwrap();
+        assert!(
+            hostile_version.validate_supersession(&g0).is_err(),
+            "a differing projector_version must never supersede by default"
+        );
+
+        // Attack 2 reproduction, now as a passing rejection: build a
+        // legitimate predecessor `mid` at a high sequence number, then show
+        // a lower, equal, and skipped sequence are all rejected as its
+        // successor — not just a same-or-earlier barrier.
+        let mid = ProjectionGenerationV1 {
+            barrier: advanced_barrier.clone(),
+            generation_sequence: 50,
+            output_digest: digest(
+                "7777777777777777777777777777777777777777777777777777777777777777",
+            ),
+            supersedes: Some(g0_id),
+            ..g0.clone()
+        };
+        mid.validate().unwrap();
+        let mid_id = mid.generation_id().unwrap();
+
+        let mut further_cursors = advanced_barrier.cursors;
+        further_cursors[1].last_processed_offset =
+            CommittedOffsetV1::new(further_cursors[1].last_processed_offset.as_u64() + 1).unwrap();
+        let further_barrier =
+            CursorVectorBarrierV1::from_observations(g0.barrier.epoch_id, further_cursors).unwrap();
+
+        let build_successor = |generation_sequence: u64| ProjectionGenerationV1 {
+            barrier: further_barrier.clone(),
+            generation_sequence,
+            output_digest: digest(
+                "8888888888888888888888888888888888888888888888888888888888888888",
+            ),
+            supersedes: Some(mid_id),
+            ..g0.clone()
+        };
+
+        // Regression: mid's own predecessor sequence (should be 51).
+        let regressed_sequence = build_successor(1);
+        regressed_sequence.validate().unwrap();
+        assert!(
+            regressed_sequence.validate_supersession(&mid).is_err(),
+            "sequence regression (50 -> 1) must be rejected"
+        );
+
+        // Equal: repeating mid's own sequence is not an advance.
+        let equal_sequence = build_successor(50);
+        equal_sequence.validate().unwrap();
+        assert!(
+            equal_sequence.validate_supersession(&mid).is_err(),
+            "an equal sequence must be rejected"
+        );
+
+        // Skipped: 52 instead of the required 51.
+        let skipped_sequence = build_successor(52);
+        skipped_sequence.validate().unwrap();
+        assert!(
+            skipped_sequence.validate_supersession(&mid).is_err(),
+            "a skipped sequence must be rejected"
+        );
+
+        // Exactly one past mid's sequence, correct projector, strictly
+        // advanced barrier: accepted.
+        let correct_sequence = build_successor(51);
+        correct_sequence.validate().unwrap();
+        correct_sequence.validate_supersession(&mid).unwrap();
+    }
+
+    #[test]
+    fn projection_generation_identity_is_independent_of_shard_schedule() {
+        // REPLAY-01: "Processing the same facts in a different shard
+        // schedule must produce the same generation." Build the same
+        // publication (same projector, sequence, output, predecessor) over
+        // two genuinely different shard schedules — the golden two-shard
+        // barrier, and a one-shard schedule covering the same total
+        // progress under a distinct epoch (a shard-count change always
+        // mints a new epoch) — and show `generation_id()` agrees. This is a
+        // real schedule difference, not the reversed-arrival-order-of-the-
+        // same-shard-set case `cursor_vector_barrier_is_order_independent`
+        // already covers.
+        let two_shard: ProjectionGenerationV1 =
+            decode_strict(record(PROJECTION_GENERATION)).unwrap();
+        two_shard.validate().unwrap();
+        assert_eq!(
+            two_shard.barrier.cursors.len(),
+            2,
+            "the golden fixture must be a genuine multi-shard barrier"
+        );
+
+        let one_shard_epoch = EpochId::from_digest(digest(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        ));
+        let one_shard_barrier = CursorVectorBarrierV1::from_observations(
+            one_shard_epoch,
+            vec![ShardCursorEntryV1 {
+                shard: 0,
+                last_processed_offset: CommittedOffsetV1::new(14).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert_ne!(
+            one_shard_barrier.barrier_digest().unwrap(),
+            two_shard.barrier.barrier_digest().unwrap(),
+            "the two schedules must be genuinely different barriers, not the same one relabeled"
+        );
+
+        let one_shard = ProjectionGenerationV1 {
+            barrier: one_shard_barrier,
+            ..two_shard.clone()
+        };
+        one_shard.validate().unwrap();
+
+        assert_eq!(
+            one_shard.generation_id().unwrap(),
+            two_shard.generation_id().unwrap(),
+            "same facts under a different shard schedule must produce the same generation"
+        );
     }
 
     #[test]
