@@ -206,3 +206,37 @@ Amendments to this ADR:
   derives a disputed output referencing exactly the involved conflicts.
   Waiver writes remain W0-EPIS lifecycle events; consolidation never creates,
   modifies, or expires a waiver.
+
+## Addendum 2026-08-16: the read-side conflict-state mapping is total and conservative
+
+The repository seam derives `ConsolidationSourceConflictStateV1` from the
+live conflict projection. That derivation is a total function from the
+six-state lifecycle to the three read-side states, fixed as follows:
+
+| Lifecycle state (discrepancy episode) | Read-side state |
+| --- | --- |
+| `open` | `Open` |
+| `acknowledged` | `Open` |
+| `waived` (active, unexpired) | `Waived` |
+| `resolved` | `Clear` |
+| `dismissed` | `Clear` |
+| `superseded` | `Clear` |
+
+The rule is conservative by construction: a lifecycle state maps to `Clear`
+only when no live incompatibility remains. `acknowledged` is triage metadata
+only — it changes nothing about severity, verification, or surfacing — so it
+maps to `Open`; an acknowledged-but-unresolved incompatibility is never
+launderable into a clean source (CONS-04). `Waived` requires an active
+waiver: waiver expiry returns the same episode to `open`, so the seam reads
+the live projection and an expired waiver maps to `Open`, never to a stale
+`Waived` (CONS-04, ACT-03).
+
+The mapping is closed under future lifecycle states: any state not listed
+above maps to `Open`. Promoting a present or future state to `Waived` or
+`Clear` requires amending this ADR and the CONS family's invariant-registry
+entries — never a local decision at the seam.
+
+This table is the normative reference for the rustdoc on
+`ConsolidationSourceConflictStateV1`, which states the same mapping; the ADR
+now owns it so a seam implementation cannot relabel `acknowledged` as
+`Clear`.
