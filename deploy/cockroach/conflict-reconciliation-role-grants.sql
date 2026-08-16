@@ -420,13 +420,24 @@ FROM forbidden_out_of_boundary_grant;
 -- edge involving a NOLOGIN role, or on an ADMIN OPTION attached to an external
 -- member. LOGIN members of the reconciliation role without ADMIN OPTION are
 -- intentionally external identity-plane state and are allowed; deployments
--- must separately audit that member list against the one-shot runbook.
+-- must separately audit that member list against the one-shot runbook. The
+-- optional successor-activation role is not an identity-plane member: either
+-- edge direction involving it is always forbidden, independently of LOGIN and
+-- ADMIN OPTION state.
 WITH unexpected_role_edge AS (
     SELECT 1
     FROM [SHOW GRANTS ON ROLE] AS edge
     JOIN [SHOW USERS] AS member_role
       ON member_role.username = edge.member
     WHERE (
+        (
+            edge.role_name = 'fleet_conflict_reconciliation'
+            AND edge.member = 'fleet_registry_successor_activation'
+        ) OR (
+            edge.role_name = 'fleet_registry_successor_activation'
+            AND edge.member = 'fleet_conflict_reconciliation'
+        )
+    ) OR (
         edge.member = 'fleet_conflict_reconciliation'
         AND edge.role_name NOT IN (
             'admin',
@@ -452,7 +463,7 @@ SELECT IF(
     1:::INT8,
     CAST(
         concat(
-            'conflict reconciliation role has an unexpected NOLOGIN or admin-option inheritance edge: observed=',
+            'conflict reconciliation role has an unexpected successor, NOLOGIN, or admin-option inheritance edge: observed=',
             count(*)::STRING
         )
         AS INT8
@@ -540,15 +551,25 @@ SELECT IF(
 FROM [SHOW USERS]
 WHERE username = 'fleet_conflict_reconciliation';
 
--- Postcondition: reconciliation inherits no role, and no NOLOGIN role inherits
--- reconciliation. Externally provisioned LOGIN members without ADMIN OPTION
--- remain intentionally visible for the deployment identity audit.
+-- Postcondition: reconciliation inherits no role; no NOLOGIN role inherits
+-- reconciliation; and neither optional-successor edge exists regardless of
+-- that role's LOGIN or ADMIN OPTION state. Other externally provisioned LOGIN
+-- members without ADMIN OPTION remain visible for the identity audit.
 WITH forbidden_role_edge AS (
     SELECT 1
     FROM [SHOW GRANTS ON ROLE] AS edge
     JOIN [SHOW USERS] AS member_role
       ON member_role.username = edge.member
-    WHERE edge.member = 'fleet_conflict_reconciliation'
+    WHERE (
+           (
+               edge.role_name = 'fleet_conflict_reconciliation'
+               AND edge.member = 'fleet_registry_successor_activation'
+           ) OR (
+               edge.role_name = 'fleet_registry_successor_activation'
+               AND edge.member = 'fleet_conflict_reconciliation'
+           )
+       )
+       OR edge.member = 'fleet_conflict_reconciliation'
        OR (
            edge.role_name = 'fleet_conflict_reconciliation'
            AND (

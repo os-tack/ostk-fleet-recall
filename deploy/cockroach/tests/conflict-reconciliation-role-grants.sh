@@ -495,7 +495,7 @@ expect_policy_role_edge_failure() {
         fail "$label unexpectedly admitted an unknown NOLOGIN role edge"
     fi
     if ! grep -Fq \
-        'conflict reconciliation role has an unexpected NOLOGIN or admin-option inheritance edge' \
+        'conflict reconciliation role has an unexpected successor, NOLOGIN, or admin-option inheritance edge' \
         <<<"$output"; then
         echo "$output" >&2
         fail "$label did not fail on the exact role-edge preflight"
@@ -696,6 +696,33 @@ current_database_preflight=$(grep -F \
 assert_exact "fleet_recall current-database preflight" \
     "$current_database_preflight" \
     "    IF pg_catalog.current_database() <> 'fleet_recall' THEN"
+
+# The successor policy is optional: the reconciliation SQL must mention it
+# only in the two explicit, symmetric fail-closed edge predicates. In
+# particular, it must never require, create, alter, grant, or revoke that role.
+successor_preflight_references=$(sed -n \
+    '/^WITH unexpected_role_edge AS (/,/^FROM unexpected_role_edge;$/p' \
+    "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql" \
+    | grep -F 'fleet_registry_successor_activation' \
+    | sed -E 's/^[[:space:]]*//')
+expected_successor_edge_references="AND edge.member = 'fleet_registry_successor_activation'
+edge.role_name = 'fleet_registry_successor_activation'"
+assert_exact "optional successor pre-mutation edge predicates" \
+    "$successor_preflight_references" "$expected_successor_edge_references"
+
+successor_postcondition_references=$(sed -n \
+    '/^WITH forbidden_role_edge AS (/,/^FROM forbidden_role_edge;$/p' \
+    "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql" \
+    | grep -F 'fleet_registry_successor_activation' \
+    | sed -E 's/^[[:space:]]*//')
+assert_exact "optional successor postcondition edge predicates" \
+    "$successor_postcondition_references" "$expected_successor_edge_references"
+
+successor_policy_reference_count=$(grep -Fc \
+    'fleet_registry_successor_activation' \
+    "$repo_root/deploy/cockroach/conflict-reconciliation-role-grants.sql")
+assert_exact "optional successor policy reference count" \
+    "$successor_policy_reference_count" '4'
 
 # CockroachDB v26.2 rejects delegated SHOW statements inside PL/pgSQL function
 # bodies. Keep every SHOW-backed gate at statement scope; catalog-only DO
@@ -1239,6 +1266,122 @@ assert_root_scalar "temp-shadow public migration-history grant" \
      WHERE grantee = 'fleet_conflict_reconciliation'
        AND privilege_type = 'SELECT'
        AND NOT is_grantable" '1'
+
+# The successor-activation role is optional and is never created or mutated by
+# the reconciliation policy. If it does exist, its creator-scoped PUBLIC
+# routine default is still part of the all-grantor fail-closed boundary. Prove
+# that row blocks reconciliation before unrelated role drift is normalized,
+# then perform the explicit cluster-admin cleanup outside the policy.
+root_sql '
+CREATE ROLE fleet_registry_successor_activation;
+ALTER ROLE fleet_conflict_reconciliation WITH CONTROLJOB;
+' >/dev/null
+expect_policy_default_privilege_failure \
+    "optional successor creator-scoped PUBLIC routine default"
+assert_root_scalar "optional successor routine-default preservation" \
+    "SELECT count(*)::STRING
+     FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public]
+     WHERE role = 'fleet_registry_successor_activation'
+       AND NOT for_all_roles
+       AND object_type = 'routines'
+       AND grantee = 'public'
+       AND privilege_type = 'EXECUTE'
+       AND NOT is_grantable" '1'
+assert_root_scalar "successor-default gate role-option preservation" \
+    "SELECT count(*)::STRING
+     FROM [SHOW USERS] AS target_role
+     CROSS JOIN LATERAL unnest(target_role.options) AS role_option(option_name)
+     WHERE target_role.username = 'fleet_conflict_reconciliation'
+       AND role_option.option_name = 'CONTROLJOB'" '1'
+root_sql '
+GRANT fleet_registry_successor_activation TO root;
+ALTER DEFAULT PRIVILEGES FOR ROLE fleet_registry_successor_activation
+    REVOKE EXECUTE ON ROUTINES FROM public;
+REVOKE fleet_registry_successor_activation FROM root;
+' >/dev/null
+assert_root_scalar "optional successor routine-default cleanup" \
+    "SELECT count(*)::STRING
+     FROM [SHOW DEFAULT PRIVILEGES FOR GRANTEE public]
+     WHERE role = 'fleet_registry_successor_activation'
+       AND NOT for_all_roles
+       AND object_type = 'routines'
+       AND grantee = 'public'
+       AND privilege_type = 'EXECUTE'" '0'
+assert_root_scalar "optional successor cleanup membership" \
+    "SELECT count(*)::STRING
+     FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name = 'fleet_registry_successor_activation'
+        OR member = 'fleet_registry_successor_activation'" '0'
+
+# A LOGIN role without ADMIN OPTION is normally admitted as an externally
+# provisioned reconciliation member. The optional successor is deliberately
+# excluded from that identity-plane exception in both policy directions.
+root_sql '
+ALTER ROLE fleet_registry_successor_activation WITH LOGIN;
+GRANT fleet_conflict_reconciliation
+    TO fleet_registry_successor_activation;
+' >/dev/null
+expect_policy_role_edge_failure \
+    "optional LOGIN successor inheriting reconciliation"
+assert_root_scalar "failed optional-successor edge preservation" \
+    "SELECT count(*)::STRING
+     FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name = 'fleet_conflict_reconciliation'
+       AND member = 'fleet_registry_successor_activation'
+       AND NOT is_admin" '1'
+assert_root_scalar "failed optional-successor LOGIN preservation" \
+    "SELECT count(*)::STRING
+     FROM [SHOW USERS]
+     WHERE username = 'fleet_registry_successor_activation'
+       AND 'NOLOGIN' != ALL(options)" '1'
+assert_root_scalar "successor-edge gate role-option preservation" \
+    "SELECT count(*)::STRING
+     FROM [SHOW USERS] AS target_role
+     CROSS JOIN LATERAL unnest(target_role.options) AS role_option(option_name)
+     WHERE target_role.username = 'fleet_conflict_reconciliation'
+       AND role_option.option_name = 'CONTROLJOB'" '1'
+root_sql '
+REVOKE fleet_conflict_reconciliation
+    FROM fleet_registry_successor_activation;
+GRANT fleet_registry_successor_activation
+    TO fleet_conflict_reconciliation;
+' >/dev/null
+expect_policy_role_edge_failure \
+    "reconciliation inheriting optional LOGIN successor"
+assert_root_scalar "failed reverse optional-successor edge preservation" \
+    "SELECT count(*)::STRING
+     FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name = 'fleet_registry_successor_activation'
+       AND member = 'fleet_conflict_reconciliation'
+       AND NOT is_admin" '1'
+assert_root_scalar "reverse successor-edge gate role-option preservation" \
+    "SELECT count(*)::STRING
+     FROM [SHOW USERS] AS target_role
+     CROSS JOIN LATERAL unnest(target_role.options) AS role_option(option_name)
+     WHERE target_role.username = 'fleet_conflict_reconciliation'
+       AND role_option.option_name = 'CONTROLJOB'" '1'
+root_sql '
+REVOKE fleet_registry_successor_activation
+    FROM fleet_conflict_reconciliation;
+ALTER ROLE fleet_registry_successor_activation WITH
+    NOLOGIN NOCREATEROLE NOCREATEDB;
+' >/dev/null
+apply_reconciliation_policy >/dev/null
+assert_root_scalar "optional successor final role options" \
+    "SELECT count(*)::STRING
+     FROM [SHOW USERS]
+     WHERE username = 'fleet_registry_successor_activation'
+       AND options::STRING = '{NOLOGIN}'" '1'
+assert_root_scalar "optional successor final memberless boundary" \
+    "SELECT count(*)::STRING
+     FROM [SHOW GRANTS ON ROLE]
+     WHERE role_name = 'fleet_registry_successor_activation'
+        OR member = 'fleet_registry_successor_activation'" '0'
+assert_root_scalar "optional successor successful reapply" \
+    "SELECT count(*)::STRING
+     FROM [SHOW USERS]
+     WHERE username = 'fleet_conflict_reconciliation'
+       AND options::STRING = '{NOLOGIN}'" '1'
 
 # Database ownership alone cannot modify the cluster role boundary.
 expect_denied proof_database_owner "database owner role-option hardening" \
