@@ -1,7 +1,7 @@
 -- Long-lived runtime-writer role boundary for the dedicated fleet_recall
 -- database.
 --
--- Run only after the complete successful migration prefix 1 through 17. Later
+-- Run only after the complete successful migration prefix 1 through 18. Later
 -- successful migrations are compatible and cannot mask a missing or failed row
 -- in that bounded prefix. Run only as a cluster admin; database ownership alone
 -- is insufficient. This policy is independent of the private control,
@@ -67,18 +67,18 @@ DO $$
 DECLARE
     runtime_schema_ready BOOL;
 BEGIN
-    SELECT count(*) = 17
+    SELECT count(*) = 18
        AND min(version) = 1
-       AND max(version) = 17
+       AND max(version) = 18
        AND COALESCE(bool_and(success), false)
     INTO runtime_schema_ready
     FROM public._sqlx_migrations
-    WHERE version BETWEEN 1 AND 17;
+    WHERE version BETWEEN 1 AND 18;
 
     IF runtime_schema_ready IS DISTINCT FROM true THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
-            MESSAGE = 'runtime writer role requires the complete successful migration prefix through 17';
+            MESSAGE = 'runtime writer role requires the complete successful migration prefix through 18';
     END IF;
 END
 $$;
@@ -730,6 +730,29 @@ TO fleet_runtime;
 
 GRANT DELETE ON TABLE public.memory_chunk_history TO fleet_runtime;
 
+-- Exact Stage-4 evidence-plane surface (ADR 0002 D2). `remember` must commit
+-- its accepted event and its projection in ONE serializable transaction, so
+-- the appending identity is this same logical role. It receives append and
+-- head-advance authority on the general ledger only. It receives NO privilege
+-- on any memory_control_* or memory_registry_* base table: the control and
+-- successor policies' REVOKE lists stay byte-identical, and migration 0018's
+-- CHECK forbids a governance kind or the registry.activation family from ever
+-- entering this ledger. No DELETE and no UPDATE on events: the accepted
+-- envelope is append-only (EVID-01).
+GRANT SELECT, INSERT ON TABLE
+    public.memory_evidence_events,
+    public.memory_content_objects
+TO fleet_runtime;
+
+GRANT SELECT, INSERT, UPDATE ON TABLE public.memory_evidence_shard_heads
+    TO fleet_runtime;
+
+-- The head witness reads registry authority only through this migrator-owned
+-- view. CockroachDB v26.2.3 resolves the view's base-table reads with the
+-- view owner's privileges, so this single SELECT replaces every base-table
+-- grant the D4 witness would otherwise need.
+GRANT SELECT ON TABLE public.memory_writer_authority_v1 TO fleet_runtime;
+
 GRANT USAGE ON SEQUENCE
     public.memory_claim_id_seq,
     public.memory_claim_support_id_seq,
@@ -743,11 +766,11 @@ TO fleet_runtime;
 GRANT fleet_runtime TO fleet_writer;
 
 -- Exact direct logical-role surface: database CONNECT, public-schema USAGE,
--- twenty-six table-privilege rows, and three sequence-USAGE rows. Because
+-- thirty-four table-privilege rows, and three sequence-USAGE rows. Because
 -- SHOW GRANTS FOR also exposes cluster-global external connections, the exact
 -- count rejects those and every function/type/differently privileged row.
 SELECT IF(
-    count(*) = 31
+    count(*) = 39
         AND COALESCE(bool_and(
             NOT is_grantable
             AND (
@@ -774,7 +797,11 @@ SELECT IF(
                                 'memory_conflicts',
                                 'memory_conflict_members',
                                 'memory_claim_links',
-                                'memory_mutation_receipts'
+                                'memory_mutation_receipts',
+                                'memory_evidence_events',
+                                'memory_evidence_shard_heads',
+                                'memory_content_objects',
+                                'memory_writer_authority_v1'
                             ))
                         OR (privilege_type = 'INSERT'
                             AND object_name IN (
@@ -787,14 +814,18 @@ SELECT IF(
                                 'memory_conflicts',
                                 'memory_conflict_members',
                                 'memory_mutation_receipts',
-                                'memory_events'
+                                'memory_events',
+                                'memory_evidence_events',
+                                'memory_evidence_shard_heads',
+                                'memory_content_objects'
                             ))
                         OR (privilege_type = 'UPDATE'
                             AND object_name IN (
                                 'memory_chunks',
                                 'memory_claims',
                                 'memory_conflicts',
-                                'memory_mutation_receipts'
+                                'memory_mutation_receipts',
+                                'memory_evidence_shard_heads'
                             ))
                         OR (privilege_type = 'DELETE'
                             AND object_name = 'memory_chunk_history')
@@ -813,7 +844,7 @@ SELECT IF(
     1:::INT8,
     CAST(
         concat(
-            'runtime writer direct-grant postcondition differs from exact thirty-one-row matrix: observed=',
+            'runtime writer direct-grant postcondition differs from exact thirty-nine-row matrix: observed=',
             count(*)::STRING
         )
         AS INT8

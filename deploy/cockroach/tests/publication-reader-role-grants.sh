@@ -1797,6 +1797,14 @@ CREATE TABLE public.memory_control_events (id INT8 PRIMARY KEY);
 CREATE TABLE public.memory_registry_heads (id INT8 PRIMARY KEY);
 CREATE TABLE public.memory_mutation_receipts (id UUID PRIMARY KEY);
 CREATE TABLE public.memory_events (id UUID PRIMARY KEY);
+CREATE TABLE public.memory_evidence_events (id INT8 PRIMARY KEY);
+CREATE TABLE public.memory_evidence_shard_heads (id INT8 PRIMARY KEY);
+CREATE TABLE public.memory_evidence_quarantine (id INT8 PRIMARY KEY);
+CREATE TABLE public.memory_content_objects (id INT8 PRIMARY KEY);
+CREATE TABLE public.memory_relation_projection_v1 (id INT8 PRIMARY KEY);
+CREATE TABLE public.memory_relation_projection_watermarks_v1 (id INT8 PRIMARY KEY);
+CREATE VIEW public.memory_writer_authority_v1 AS
+    SELECT id FROM public.memory_control_events;
 
 INSERT INTO public._sqlx_migrations
 SELECT version, true FROM generate_series(1, 16) AS version;
@@ -3015,6 +3023,28 @@ expect_denied fleet_publication "reconciliation receipt read" \
     'SELECT id FROM public.memory_mutation_receipts'
 expect_denied fleet_publication "private event read" \
     'SELECT id FROM public.memory_events'
+# PUBLIC-03/PUBLIC-04: migration 18 adds evidence-plane, governed-content,
+# relation-projection, and writer-authority relations. None of them is one of
+# the reader's eight publication tables, and the reader holds no privilege on
+# any of them.
+for stage4_private_relation in \
+    memory_evidence_events \
+    memory_evidence_shard_heads \
+    memory_evidence_quarantine \
+    memory_content_objects \
+    memory_relation_projection_v1 \
+    memory_relation_projection_watermarks_v1 \
+    memory_writer_authority_v1
+do
+    expect_denied fleet_publication "$stage4_private_relation read" \
+        "SELECT id FROM public.$stage4_private_relation"
+    assert_root_scalar "$stage4_private_relation reader grants" \
+        "SELECT count(*)::STRING
+         FROM [SHOW GRANTS ON TABLE public.$stage4_private_relation]
+         WHERE grantee IN (
+             'fleet_publication', 'fleet_publication_reader', 'public'
+         )" '0'
+done
 expect_denied fleet_publication "database creation" \
     'CREATE DATABASE publication_reader_forbidden'
 expect_denied fleet_publication "role creation" \

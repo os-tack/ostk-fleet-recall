@@ -37,7 +37,7 @@ migration owner as a long-lived runtime subject would be incorrect.
 
 The runtime policy is mounted read-only from
 `deploy/cockroach/runtime-role-grants.sql` and must match SHA-256
-`9d713d7fe2ad6dbb4dc8f36b66ddab51eec12a068d1af2b0aeb6acb91657856d`; the
+`a224b6c247bf162359efb936d69ebd0f1ca5f2ea1823e14a517eb511b15e15e3`; the
 boundary and smoke scripts fail closed on any other digest. Its logical
 `fleet_runtime` role has exactly 31 direct, non-grantable rows: database
 `CONNECT`, public-schema `USAGE`, 26 table-operation rows, and `USAGE` on three

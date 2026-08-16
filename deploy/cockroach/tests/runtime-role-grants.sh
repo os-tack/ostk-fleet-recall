@@ -66,7 +66,7 @@ CREATE TEMP TABLE _sqlx_migrations (
     success BOOL NOT NULL
 );
 INSERT INTO _sqlx_migrations
-SELECT version, true FROM generate_series(1, 17) AS version;
+SELECT version, true FROM generate_series(1, 18) AS version;
 '
         sed -n '1,$p' "$policy"
     } | docker exec -i "$container" cockroach sql \
@@ -851,6 +851,9 @@ GRANT SELECT ON TABLE public._sqlx_migrations, public.memory_corpus_models, publ
 GRANT INSERT ON TABLE public.memory_corpus_models, public.memory_chunks, public.memory_claims, public.memory_claim_embeddings, public.memory_claim_support, public.memory_claim_events, public.memory_conflict_members, public.memory_conflicts, public.memory_mutation_receipts, public.memory_events TO fleet_runtime;
 GRANT UPDATE ON TABLE public.memory_chunks, public.memory_claims, public.memory_conflicts, public.memory_mutation_receipts TO fleet_runtime;
 GRANT DELETE ON TABLE public.memory_chunk_history TO fleet_runtime;
+GRANT SELECT, INSERT ON TABLE public.memory_evidence_events, public.memory_content_objects TO fleet_runtime;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.memory_evidence_shard_heads TO fleet_runtime;
+GRANT SELECT ON TABLE public.memory_writer_authority_v1 TO fleet_runtime;
 GRANT USAGE ON SEQUENCE public.memory_claim_id_seq, public.memory_claim_support_id_seq, public.memory_conflict_id_seq TO fleet_runtime;
 GRANT fleet_runtime TO fleet_writer;'
 assert_exact "complete runtime GRANT allowlist" \
@@ -878,9 +881,9 @@ fi
 
 for required_policy_shape in \
     "pg_catalog.current_database() <> 'fleet_recall'" \
-    'count(*) = 17' \
+    'count(*) = 18' \
     'min(version) = 1' \
-    'max(version) = 17' \
+    'max(version) = 18' \
     'COALESCE(bool_and(success), false)' \
     "options::STRING = '{NOLOGIN}'" \
     'SHOW DEFAULT PRIVILEGES FOR GRANTEE public' \
@@ -891,7 +894,7 @@ for required_policy_shape in \
     'REVOKE SYSTEM ALL FROM fleet_runtime' \
     'REVOKE ALL ON ALL TABLES IN SCHEMA public' \
     'REVOKE ALL ON ALL SEQUENCES IN SCHEMA public' \
-    'count(*) = 31'
+    'count(*) = 39'
 do
     grep -Fq "$required_policy_shape" "$policy" \
         || fail "runtime policy lost required shape: $required_policy_shape"
@@ -927,7 +930,7 @@ reviewed_source_manifest=$(shasum -a 256 \
 expected_reviewed_source_manifest="66e14beaa4faf10d26e9ebfdc3e079cdfc7dcf2f7c777eb04b9b48676747f33a  $repo_root/src/config.rs
 7084682294585060cf1350e5c74ba2c5676c6d06c7eb39929aa7878b5a37f983  $repo_root/src/main.rs
 7718c15393872a139956732629c472d813a2a014395f943a5382191966162745  $repo_root/src/private_postgres.rs
-284819aa6c367f27c7c614351a9127a7686672ad6fc7ae81fd23544c4b2863e5  $repo_root/src/store/cockroach.rs
+1579730319293f1b300023f9182b271072ac380c894915c515539031c5043c09  $repo_root/src/store/cockroach.rs
 b8c3ffbd3dfe7a74f76a06815f317db3e79b3129adaa14e2da5bea43f60b069f  $repo_root/src/ledger/cockroach.rs
 6f0c6874072baed1070204063ac65df0761eda2da862e51775ba85cc5a34b522  $repo_root/src/service.rs
 5c1707702371016d7d35a58ffe8179e6015d48564e12e36df81cfc8b2c5f5e70  $repo_root/src/application.rs
@@ -1214,6 +1217,32 @@ CREATE TABLE public.memory_registry_current_heads_v2 (id INT8 PRIMARY KEY);
 CREATE TABLE public.memory_registry_genesis_bridge_consumptions (id INT8 PRIMARY KEY);
 CREATE TABLE public.memory_registry_heads (id INT8 PRIMARY KEY);
 CREATE TABLE public.memory_registry_transitions (id INT8 PRIMARY KEY);
+CREATE TABLE public.memory_evidence_shard_heads (
+    id INT8 PRIMARY KEY,
+    value INT8 NOT NULL DEFAULT 0
+);
+CREATE TABLE public.memory_evidence_events (
+    id INT8 PRIMARY KEY,
+    value INT8 NOT NULL DEFAULT 0
+);
+CREATE TABLE public.memory_evidence_quarantine (
+    id INT8 PRIMARY KEY,
+    value INT8 NOT NULL DEFAULT 0
+);
+CREATE TABLE public.memory_content_objects (
+    id INT8 PRIMARY KEY,
+    value INT8 NOT NULL DEFAULT 0
+);
+CREATE TABLE public.memory_relation_projection_v1 (
+    id INT8 PRIMARY KEY,
+    value INT8 NOT NULL DEFAULT 0
+);
+CREATE TABLE public.memory_relation_projection_watermarks_v1 (
+    id INT8 PRIMARY KEY,
+    value INT8 NOT NULL DEFAULT 0
+);
+CREATE VIEW public.memory_writer_authority_v1 AS
+    SELECT id FROM public.memory_control_bootstraps;
 '
 
 # Wrong database and incomplete/failed real prefix gates precede target creation.
@@ -1229,15 +1258,15 @@ grep -Fq 'SQLSTATE: 55000' <<<"$wrong_database_output" \
 
 root_sql '
 INSERT INTO public._sqlx_migrations
-SELECT version, true FROM generate_series(1, 16) AS version;
+SELECT version, true FROM generate_series(1, 17) AS version;
 ' >/dev/null
-expect_policy_failure "missing migration 17" \
-    'runtime writer role requires the complete successful migration prefix through 17' \
+expect_policy_failure "missing migration 18" \
+    'runtime writer role requires the complete successful migration prefix through 18' \
     '55000'
 if temp_prefix_output=$(apply_policy_with_valid_temp_prefix 2>&1); then
     fail "valid temporary prefix masked the incomplete public prefix"
 fi
-grep -Fq 'runtime writer role requires the complete successful migration prefix through 17' \
+grep -Fq 'runtime writer role requires the complete successful migration prefix through 18' \
     <<<"$temp_prefix_output" \
     || fail "temporary-prefix gate did not read public._sqlx_migrations"
 assert_root_scalar "prefix-failure target creation" \
@@ -1245,12 +1274,12 @@ assert_root_scalar "prefix-failure target creation" \
      WHERE username = 'fleet_runtime'" '0'
 
 root_sql '
-INSERT INTO public._sqlx_migrations VALUES (17, false), (18, true);
+INSERT INTO public._sqlx_migrations VALUES (18, false), (19, true);
 ' >/dev/null
-expect_policy_failure "failed migration 17 with later success" \
-    'runtime writer role requires the complete successful migration prefix through 17' \
+expect_policy_failure "failed migration 18 with later success" \
+    'runtime writer role requires the complete successful migration prefix through 18' \
     '55000'
-root_sql 'UPDATE public._sqlx_migrations SET success = true WHERE version = 17' \
+root_sql 'UPDATE public._sqlx_migrations SET success = true WHERE version = 18' \
     >/dev/null
 
 # The fixed externally provisioned login must exist but be drained and exactly
@@ -1520,12 +1549,20 @@ table:fleet_recall:public:memory_conflict_members:SELECT:not_grantable
 table:fleet_recall:public:memory_conflicts:INSERT:not_grantable
 table:fleet_recall:public:memory_conflicts:SELECT:not_grantable
 table:fleet_recall:public:memory_conflicts:UPDATE:not_grantable
+table:fleet_recall:public:memory_content_objects:INSERT:not_grantable
+table:fleet_recall:public:memory_content_objects:SELECT:not_grantable
 table:fleet_recall:public:memory_corpus_models:INSERT:not_grantable
 table:fleet_recall:public:memory_corpus_models:SELECT:not_grantable
 table:fleet_recall:public:memory_events:INSERT:not_grantable
+table:fleet_recall:public:memory_evidence_events:INSERT:not_grantable
+table:fleet_recall:public:memory_evidence_events:SELECT:not_grantable
+table:fleet_recall:public:memory_evidence_shard_heads:INSERT:not_grantable
+table:fleet_recall:public:memory_evidence_shard_heads:SELECT:not_grantable
+table:fleet_recall:public:memory_evidence_shard_heads:UPDATE:not_grantable
 table:fleet_recall:public:memory_mutation_receipts:INSERT:not_grantable
 table:fleet_recall:public:memory_mutation_receipts:SELECT:not_grantable
-table:fleet_recall:public:memory_mutation_receipts:UPDATE:not_grantable'
+table:fleet_recall:public:memory_mutation_receipts:UPDATE:not_grantable
+table:fleet_recall:public:memory_writer_authority_v1:SELECT:not_grantable'
 assert_exact "connected runtime direct grant matrix" \
     "$actual_runtime_grants" "$expected_runtime_grants"
 assert_root_scalar "logical and writer exact NOLOGIN" \
@@ -2146,6 +2183,58 @@ expect_denied "receipt DELETE" \
      WHERE tenant_id = '0198a849-f6ae-7d61-9800-000000000001'
        AND idempotency_key = 'runtime-reservation'"
 
+# ADR 0002 D2/D4 and EVID-01: the writer appends to the general ledger,
+# advances only its own heads, and reads registry authority ONLY through the
+# migrator-owned view. No UPDATE or DELETE on the accepted envelope.
+expect_allowed "evidence event INSERT" \
+    'INSERT INTO public.memory_evidence_events VALUES (1, 0)'
+expect_allowed "evidence event SELECT" \
+    'SELECT value FROM public.memory_evidence_events WHERE id = 1'
+expect_denied "evidence event UPDATE" \
+    'UPDATE public.memory_evidence_events SET value = 1 WHERE id = 1'
+expect_denied "evidence event DELETE" \
+    'DELETE FROM public.memory_evidence_events WHERE id = 1'
+
+expect_allowed "evidence shard head INSERT" \
+    'INSERT INTO public.memory_evidence_shard_heads VALUES (1, 0)'
+expect_allowed "evidence shard head SELECT" \
+    'SELECT value FROM public.memory_evidence_shard_heads WHERE id = 1'
+expect_allowed "evidence shard head UPDATE" \
+    'UPDATE public.memory_evidence_shard_heads SET value = 1 WHERE id = 1'
+expect_denied "evidence shard head DELETE" \
+    'DELETE FROM public.memory_evidence_shard_heads WHERE id = 1'
+
+expect_allowed "content object INSERT" \
+    'INSERT INTO public.memory_content_objects VALUES (1, 0)'
+expect_allowed "content object SELECT" \
+    'SELECT value FROM public.memory_content_objects WHERE id = 1'
+expect_denied "content object UPDATE" \
+    'UPDATE public.memory_content_objects SET value = 1 WHERE id = 1'
+expect_denied "content object DELETE" \
+    'DELETE FROM public.memory_content_objects WHERE id = 1'
+
+expect_allowed "writer authority view SELECT" \
+    'SELECT count(*) FROM public.memory_writer_authority_v1'
+assert_root_scalar "writer authority view grant set" \
+    "SELECT COALESCE(string_agg(privilege_type, '|' ORDER BY privilege_type), '')
+     FROM [SHOW GRANTS ON TABLE public.memory_writer_authority_v1]
+     WHERE grantee IN ('fleet_runtime', 'fleet_writer', 'public')" 'SELECT'
+
+for evidence_private_table in \
+    memory_evidence_quarantine \
+    memory_relation_projection_v1 \
+    memory_relation_projection_watermarks_v1
+do
+    expect_denied "$evidence_private_table SELECT" \
+        "SELECT count(*) FROM public.$evidence_private_table"
+    expect_denied "$evidence_private_table INSERT" \
+        "INSERT INTO public.$evidence_private_table VALUES (9999, 0)"
+    expect_denied "$evidence_private_table UPDATE" \
+        "UPDATE public.$evidence_private_table SET value = value WHERE false"
+    expect_denied "$evidence_private_table DELETE" \
+        "DELETE FROM public.$evidence_private_table WHERE false"
+done
+
 expect_allowed "event INSERT" \
     'INSERT INTO public.memory_events VALUES (1, 0)'
 expect_denied "event SELECT" \
@@ -2224,10 +2313,10 @@ GRANT SYSTEM CONTROLJOB TO fleet_runtime;
 GRANT DELETE ON TABLE public.memory_chunks TO fleet_runtime;
 GRANT SELECT ON SEQUENCE public.memory_claim_link_id_seq TO fleet_runtime;
 GRANT SELECT ON TABLE public.memory_chunks TO public;
-UPDATE public._sqlx_migrations SET success = false WHERE version = 17;
+UPDATE public._sqlx_migrations SET success = false WHERE version = 18;
 ' >/dev/null
 expect_policy_failure "failed prefix preserves target drift" \
-    'runtime writer role requires the complete successful migration prefix through 17' \
+    'runtime writer role requires the complete successful migration prefix through 18' \
     '55000'
 # SHOW USERS lists only non-default role options, so LOGIN drift is visible
 # only as the absence of NOLOGIN.
@@ -2246,13 +2335,13 @@ assert_root_scalar "failed-prefix DELETE preservation" \
      WHERE grantee = 'fleet_runtime'
        AND object_name = 'memory_chunks'
        AND privilege_type = 'DELETE'" '1'
-root_sql 'UPDATE public._sqlx_migrations SET success = true WHERE version = 17' \
+root_sql 'UPDATE public._sqlx_migrations SET success = true WHERE version = 18' \
     >/dev/null
 apply_policy >/dev/null
 apply_policy >/dev/null
 assert_root_scalar "normalized exact direct grant count" \
     "SELECT count(*)::STRING FROM [SHOW GRANTS FOR fleet_runtime]
-     WHERE grantee = 'fleet_runtime'" '31'
+     WHERE grantee = 'fleet_runtime'" '39'
 assert_root_scalar "normalized forbidden adjacent grants" \
     "SELECT count(*)::STRING FROM [SHOW GRANTS FOR fleet_runtime]
      WHERE grantee = 'fleet_runtime'
@@ -2399,10 +2488,10 @@ assert_exact "terminal exact sorted runtime matrix" \
 
 # Terminal residue: the only incident edge is runtime -> fixed writer, both
 # subjects are NOLOGIN, the writer is direct-authority-free, and the runtime
-# surface is still exactly thirty-one rows after every adversary and reapply.
+# surface is still exactly thirty-nine rows after every adversary and reapply.
 assert_root_scalar "terminal direct grant count" \
     "SELECT count(*)::STRING FROM [SHOW GRANTS FOR fleet_runtime]
-     WHERE grantee = 'fleet_runtime'" '31'
+     WHERE grantee = 'fleet_runtime'" '39'
 assert_root_scalar "terminal direct writer grants" \
     "SELECT count(*)::STRING FROM [SHOW GRANTS FOR fleet_writer]
      WHERE grantee = 'fleet_writer'" '0'

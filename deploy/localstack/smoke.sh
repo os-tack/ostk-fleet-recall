@@ -5,7 +5,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 compose_file=$script_dir/compose.yaml
 runtime_policy=$repo_dir/deploy/cockroach/runtime-role-grants.sql
-expected_runtime_policy_sha256=9d713d7fe2ad6dbb4dc8f36b66ddab51eec12a068d1af2b0aeb6acb91657856d
+expected_runtime_policy_sha256=a224b6c247bf162359efb936d69ebd0f1ca5f2ea1823e14a517eb511b15e15e3
 publication_policy=$repo_dir/deploy/cockroach/publication-reader-role-grants.sql
 expected_publication_policy_sha256=ff3ada75aba9443875efb1f430a14829ef864b3f7409ae5d23f7bd381cb65226
 model_bundle=${FLEET_RECALL_MODEL_BUNDLE:-${1:-}}
