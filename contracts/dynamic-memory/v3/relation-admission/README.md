@@ -15,10 +15,14 @@ later repository seam must supply those facts before treating an
 - `candidate.jsonl` — a `ProviderAttestedRelationCandidateV2` asserting a
   `deployment_selects_artifact` edge with a `DeploymentBindsArtifactAndConfiguration`
   fact binding whose `artifact` and `configuration` are both `version`-form
-  (content-addressed) resource URIs, and a `Supports` verdict. The candidate
-  carries no provider-identity field: `evaluate_provider_attested_admission`
-  always takes the trusted provider identity and the observed evidence kind
-  as separate arguments (never read from this payload), matching the module
+  (content-addressed) resource URIs, and a `Supports` verdict. The fact
+  binding's `artifact` names the edge's own `target`, and its `configuration`
+  names the resource under the edge's `configuration` applicability
+  dimension — the fixture binds the edge it is admitted for, not merely a
+  same-shaped fact about a different one (PROV-01). The candidate carries no
+  provider-identity field: `evaluate_provider_attested_admission` always
+  takes the trusted provider identity and the observed evidence kind as
+  separate arguments (never read from this payload), matching the module
   doc's "never payload" rule.
 - `vector-suite.jsonl` — raw-pins the candidate fixture, records its
   content-addressed `candidate_id` (`SHA-256("ostk-relation-admission-v2" ||
@@ -50,7 +54,24 @@ in the test module.
   artifact, deployment) each require content-addressed (`version`-form)
   identifiers; `mutable_labels_are_structurally_insufficient` proves an
   `entity`-form (mutable-label) artifact or configuration URI is downgraded,
-  never silently admitted at `provider_attested` strength.
+  never silently admitted at `provider_attested` strength. Beyond kind and
+  form, `ProviderFactBindingV1::binds_edge` requires every bound identifier
+  to name the *exact same resource* as the edge it is claimed to admit
+  (edge `target` for the four single-identifier bindings; edge `target` plus
+  the `configuration` applicability dimension for the deployment binding).
+  Each binding has both a real `evaluate_provider_attested_admission` pass
+  (`ref_observes_revision_binding_admitted`,
+  `review_head_sha_binding_admitted`, `build_source_revision_binding_admitted`,
+  `artifact_digest_binding_admitted`, `deployment_immutable_identifiers_admitted`)
+  and a real edge-mismatch fail
+  (`*_binding_edge_mismatch_rejected`, one per binding, plus
+  `deployment_configuration_binding_edge_mismatch_rejected` for the
+  deployment binding's second identifier) — a fact about a different
+  artifact/revision/configuration than the edge asserts is rejected outright
+  (`FactBindingDoesNotBindTheEdge`), not admitted and not merely downgraded.
+  `ref_observes_revision_cannot_admit_deployment_edge` additionally proves a
+  correctly-kinded `RefObservesRevision` fact still cannot admit an unrelated
+  `deployment_selects_artifact` edge just because its evidence kind matches.
 - **AUTH-02** — the same test asserts the exact evidence-kind binding named
   by the invariant (Git ref event -> observed ref state only; review ->
   code-review evidence; build/artifact -> CI attempt; deployment -> deployment
@@ -83,4 +104,13 @@ are private and there is no public constructor other than
 impl to decode one from bytes either. Attempt to claim a Git ref event proves
 a deployment's artifact/configuration identity — rejected by the exhaustive
 `required_evidence_kind()` match, which the `evidence_kind_scope_mismatch_is_rejected_not_downgraded`
-test exercises directly.
+test exercises directly. Attempt to admit a provider fact whose evidence kind
+and binding *shape* are correct but whose bound identifier names a different
+artifact, revision, or configuration than the edge asserts — e.g. a real
+`DeploymentControlPlane` fact about artifact `sha256:4444…` admitted for an
+edge whose `target` is artifact `sha256:2222…`, or a real `GitRefEvent` fact
+about commit `sha256:6666…` admitted for a `deployment_selects_artifact` edge
+that names no commit at all — rejected by `ProviderFactBindingV1::binds_edge`
+as `FactBindingDoesNotBindTheEdge`, which every `*_binding_edge_mismatch_rejected`
+test and `ref_observes_revision_cannot_admit_deployment_edge` exercise
+directly.

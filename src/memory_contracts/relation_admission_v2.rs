@@ -28,6 +28,11 @@ use super::{
 
 const RELATION_ADMISSION_V2_SCHEMA_VERSION: u32 = 2;
 
+/// PROV-01: the applicability dimension id an edge must carry the deployment
+/// binding's configuration identity under, when that identity is not one of
+/// the edge's own `source`/`target` endpoints.
+const DEPLOYMENT_CONFIGURATION_DIMENSION_ID: &str = "configuration";
+
 /// Authenticated connector principal plus provider-instance namespace.
 ///
 /// No `Serialize`/`Deserialize` impl exists: this type can be built only
@@ -139,6 +144,52 @@ impl ProviderFactBindingV1 {
             } => is_version(artifact) && is_version(configuration),
         }
     }
+
+    /// PROV-01: whether this fact binding names the *exact same resource* as
+    /// `edge` — never merely a same-shaped fact about a different artifact,
+    /// revision, or configuration. Identity here is resource kind + content
+    /// digest (never the `identity_form`, which [`Self::identifiers_are_immutable`]
+    /// checks separately): a fact naming a resource by its mutable-label form
+    /// must still bind the same underlying resource to be eligible for
+    /// downgrade, rather than being silently accepted about something else
+    /// entirely.
+    ///
+    /// - `RefObservesRevision`/`ReviewApprovesRevision`/`BuildConsumesRevision`/
+    ///   `ArtifactBindsDigest` each bind exactly one identifier, which must
+    ///   name `edge.target` (the revision/artifact endpoint the edge asserts).
+    /// - `DeploymentBindsArtifactAndConfiguration` binds two: `artifact` must
+    ///   name `edge.target`, and `configuration` must name the resource under
+    ///   the edge's `configuration` applicability dimension. An edge with no
+    ///   such dimension can never be bound by this fact.
+    pub fn binds_edge(&self, edge: &RelationEdgeV1) -> bool {
+        let names_same_resource = |bound: &ResourceUri, endpoint: &ResourceUri| {
+            bound.resource_kind() == endpoint.resource_kind() && bound.digest() == endpoint.digest()
+        };
+        match self {
+            Self::RefObservesRevision {
+                observed_revision, ..
+            }
+            | Self::ReviewApprovesRevision {
+                reviewed_revision: observed_revision,
+            }
+            | Self::BuildConsumesRevision {
+                source_revision: observed_revision,
+            }
+            | Self::ArtifactBindsDigest {
+                artifact: observed_revision,
+            } => names_same_resource(observed_revision, &edge.target),
+            Self::DeploymentBindsArtifactAndConfiguration {
+                artifact,
+                configuration,
+            } => {
+                names_same_resource(artifact, &edge.target)
+                    && edge.applicability.iter().any(|dimension| {
+                        dimension.dimension_id.as_str() == DEPLOYMENT_CONFIGURATION_DIMENSION_ID
+                            && names_same_resource(configuration, &dimension.resource)
+                    })
+            }
+        }
+    }
 }
 
 /// Untrusted candidate for provider-attested relation admission.
@@ -204,6 +255,7 @@ pub enum RelationAdmissionOutcomeKindV2 {
 pub enum RelationAdmissionReasonV2 {
     ProviderFactBindingVerified,
     EvidenceKindAuthorityScopeMismatch,
+    FactBindingDoesNotBindTheEdge,
     MutableLabelInsufficientForProviderAttested,
     ProviderAttestedRequiresSupportsVerdict,
 }
@@ -265,6 +317,22 @@ pub fn evaluate_provider_attested_admission(
             candidate_id,
             outcome: RelationAdmissionOutcomeKindV2::Rejected,
             reason: RelationAdmissionReasonV2::EvidenceKindAuthorityScopeMismatch,
+            connector_principal_id,
+            provider_instance_namespace,
+        });
+    }
+
+    // PROV-01: a fact binding admits at `provider_attested` strength only
+    // the exact edge it names. A structurally valid, correctly-scoped fact
+    // about a *different* artifact/revision/configuration than `candidate.edge`
+    // asserts can never be admitted at any strength — it is rejected outright,
+    // not merely downgraded, because it is evidence for a different edge
+    // entirely, not weaker evidence for this one.
+    if !candidate.fact_binding.binds_edge(&candidate.edge) {
+        return Ok(RelationAdmissionOutcomeV2 {
+            candidate_id,
+            outcome: RelationAdmissionOutcomeKindV2::Rejected,
+            reason: RelationAdmissionReasonV2::FactBindingDoesNotBindTheEdge,
             connector_principal_id,
             provider_instance_namespace,
         });
@@ -339,9 +407,9 @@ mod tests {
     const VECTOR_SUITE_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/relation-admission/vector-suite.jsonl");
 
-    const CANDIDATE_ID: &str = "d15de2694b7451a72441b5c81c87524206f45d66b2d163413ab4d34de909b05e";
+    const CANDIDATE_ID: &str = "76a94308d7a2f8df5f8622e3104b539eaa16f9b133cdd01b1661d01f908872d4";
     const VECTOR_SUITE_DIGEST: &str =
-        "9d2d5dec9dc788c5ad4a6458a2189d9deaa4392e914f335622243dd2ae35af5c";
+        "05e33b77efbf312f7ae62ad716343d09a736ca04b8ea1ab864b20a6fddd61564";
 
     fn record(bytes: &[u8]) -> &[u8] {
         let body = bytes
@@ -421,19 +489,28 @@ mod tests {
             ),
             source: resource(IdentityForm::Entity, "deployment", '1'),
             target: resource(IdentityForm::Version, "artifact", '2'),
-            applicability: vec![ConcreteApplicabilityDimensionV1 {
-                dimension_id: ContractId::new("runtime_environment").unwrap(),
-                resource: resource(IdentityForm::Entity, "environment", '3'),
-            }],
+            applicability: vec![
+                ConcreteApplicabilityDimensionV1 {
+                    dimension_id: ContractId::new("configuration").unwrap(),
+                    resource: resource(IdentityForm::Version, "configuration", '5'),
+                },
+                ConcreteApplicabilityDimensionV1 {
+                    dimension_id: ContractId::new("runtime_environment").unwrap(),
+                    resource: resource(IdentityForm::Entity, "environment", '3'),
+                },
+            ],
         }
     }
 
+    // PROV-01: matches `edge()`'s `target` (artifact digit '2') and its
+    // `configuration` applicability dimension (digit '5') exactly, so the
+    // default (`Version`, `Version`) binding actually binds its own edge.
     fn deployment_fact_binding(
         artifact_form: IdentityForm,
         configuration_form: IdentityForm,
     ) -> ProviderFactBindingV1 {
         ProviderFactBindingV1::DeploymentBindsArtifactAndConfiguration {
-            artifact: resource(artifact_form, "artifact", '4'),
+            artifact: resource(artifact_form, "artifact", '2'),
             configuration: resource(configuration_form, "configuration", '5'),
         }
     }
@@ -444,6 +521,120 @@ mod tests {
             edge: edge(),
             verdict: RelationAttestationVerdictV1::Supports,
             fact_binding: deployment_fact_binding(IdentityForm::Version, IdentityForm::Version),
+        }
+    }
+
+    // PROV-01: a minimal matching edge + candidate for each of the four
+    // single-identifier fact bindings, so admission is exercised through
+    // `evaluate_provider_attested_admission` for every binding, not only
+    // checked at the `required_evidence_kind()`/`identifiers_are_immutable()`
+    // level.
+    fn ref_edge() -> RelationEdgeV1 {
+        RelationEdgeV1 {
+            schema_version: 1,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            registry: registry_binding(),
+            relation_proof: reference(
+                "relation.ref_observes_revision",
+                "d0b7d4e7b630ce599389e50948541e21b4aa24d4d030860f6cfcaf7508d49df4",
+            ),
+            source: resource(IdentityForm::Entity, "git_ref", 'a'),
+            target: resource(IdentityForm::Version, "commit", '6'),
+            applicability: vec![],
+        }
+    }
+
+    fn ref_candidate() -> ProviderAttestedRelationCandidateV2 {
+        ProviderAttestedRelationCandidateV2 {
+            schema_version: 2,
+            edge: ref_edge(),
+            verdict: RelationAttestationVerdictV1::Supports,
+            fact_binding: ProviderFactBindingV1::RefObservesRevision {
+                ref_name: ContractId::new("ref.main").unwrap(),
+                observed_revision: resource(IdentityForm::Version, "commit", '6'),
+            },
+        }
+    }
+
+    fn review_edge() -> RelationEdgeV1 {
+        RelationEdgeV1 {
+            schema_version: 1,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            registry: registry_binding(),
+            relation_proof: reference(
+                "relation.review_approves_revision",
+                "d0b7d4e7b630ce599389e50948541e21b4aa24d4d030860f6cfcaf7508d49df4",
+            ),
+            source: resource(IdentityForm::Entity, "review", 'b'),
+            target: resource(IdentityForm::Version, "commit", '7'),
+            applicability: vec![],
+        }
+    }
+
+    fn review_candidate() -> ProviderAttestedRelationCandidateV2 {
+        ProviderAttestedRelationCandidateV2 {
+            schema_version: 2,
+            edge: review_edge(),
+            verdict: RelationAttestationVerdictV1::Supports,
+            fact_binding: ProviderFactBindingV1::ReviewApprovesRevision {
+                reviewed_revision: resource(IdentityForm::Version, "commit", '7'),
+            },
+        }
+    }
+
+    fn build_edge() -> RelationEdgeV1 {
+        RelationEdgeV1 {
+            schema_version: 1,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            registry: registry_binding(),
+            relation_proof: reference(
+                "relation.build_consumes_revision",
+                "d0b7d4e7b630ce599389e50948541e21b4aa24d4d030860f6cfcaf7508d49df4",
+            ),
+            source: resource(IdentityForm::Entity, "build", 'c'),
+            target: resource(IdentityForm::Version, "commit", '8'),
+            applicability: vec![],
+        }
+    }
+
+    fn build_candidate() -> ProviderAttestedRelationCandidateV2 {
+        ProviderAttestedRelationCandidateV2 {
+            schema_version: 2,
+            edge: build_edge(),
+            verdict: RelationAttestationVerdictV1::Supports,
+            fact_binding: ProviderFactBindingV1::BuildConsumesRevision {
+                source_revision: resource(IdentityForm::Version, "commit", '8'),
+            },
+        }
+    }
+
+    fn artifact_edge() -> RelationEdgeV1 {
+        RelationEdgeV1 {
+            schema_version: 1,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            registry: registry_binding(),
+            relation_proof: reference(
+                "relation.artifact_binds_digest",
+                "d0b7d4e7b630ce599389e50948541e21b4aa24d4d030860f6cfcaf7508d49df4",
+            ),
+            source: resource(IdentityForm::Entity, "artifact", 'd'),
+            target: resource(IdentityForm::Version, "artifact", '9'),
+            applicability: vec![],
+        }
+    }
+
+    fn artifact_candidate() -> ProviderAttestedRelationCandidateV2 {
+        ProviderAttestedRelationCandidateV2 {
+            schema_version: 2,
+            edge: artifact_edge(),
+            verdict: RelationAttestationVerdictV1::Supports,
+            fact_binding: ProviderFactBindingV1::ArtifactBindsDigest {
+                artifact: resource(IdentityForm::Version, "artifact", '9'),
+            },
         }
     }
 
@@ -487,10 +678,17 @@ mod tests {
 
     fn negative_cases() -> Vec<String> {
         [
+            "artifact_digest_binding_edge_mismatch_rejected",
+            "build_source_revision_binding_edge_mismatch_rejected",
+            "deployment_artifact_binding_edge_mismatch_rejected",
+            "deployment_configuration_binding_edge_mismatch_rejected",
             "evidence_kind_scope_mismatch_rejected",
             "mutable_artifact_label_downgraded",
             "mutable_configuration_label_downgraded",
+            "ref_observes_revision_binding_edge_mismatch_rejected",
+            "ref_observes_revision_cannot_admit_deployment_edge",
             "refuting_verdict_rejected",
+            "review_head_sha_binding_edge_mismatch_rejected",
             "unknown_field",
             "verifier_result_missing_proof_recipe",
             "verifier_result_zero_digest_recipe",
@@ -660,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_binding_and_evidence_kind_is_admitted() {
+    fn deployment_immutable_identifiers_admitted() {
         let outcome = evaluate_provider_attested_admission(
             &provider_identity(),
             ProviderEvidenceKindV1::DeploymentControlPlane,
@@ -676,6 +874,149 @@ mod tests {
             RelationAdmissionReasonV2::ProviderFactBindingVerified
         );
         assert_eq!(outcome.candidate_id(), candidate().candidate_id().unwrap());
+    }
+
+    fn assert_admitted(
+        candidate: &ProviderAttestedRelationCandidateV2,
+        kind: ProviderEvidenceKindV1,
+    ) {
+        let outcome =
+            evaluate_provider_attested_admission(&provider_identity(), kind, candidate).unwrap();
+        assert_eq!(
+            outcome.outcome(),
+            RelationAdmissionOutcomeKindV2::AdmittedProviderAttested
+        );
+        assert_eq!(
+            outcome.reason(),
+            RelationAdmissionReasonV2::ProviderFactBindingVerified
+        );
+    }
+
+    fn assert_edge_mismatch_rejected(
+        candidate: &ProviderAttestedRelationCandidateV2,
+        kind: ProviderEvidenceKindV1,
+    ) {
+        let outcome =
+            evaluate_provider_attested_admission(&provider_identity(), kind, candidate).unwrap();
+        assert_eq!(outcome.outcome(), RelationAdmissionOutcomeKindV2::Rejected);
+        assert_eq!(
+            outcome.reason(),
+            RelationAdmissionReasonV2::FactBindingDoesNotBindTheEdge
+        );
+    }
+
+    #[test]
+    fn ref_observes_revision_binding_admitted() {
+        assert_admitted(&ref_candidate(), ProviderEvidenceKindV1::GitRefEvent);
+    }
+
+    #[test]
+    fn review_head_sha_binding_admitted() {
+        assert_admitted(&review_candidate(), ProviderEvidenceKindV1::CodeReview);
+    }
+
+    #[test]
+    fn build_source_revision_binding_admitted() {
+        assert_admitted(&build_candidate(), ProviderEvidenceKindV1::CiAttempt);
+    }
+
+    #[test]
+    fn artifact_digest_binding_admitted() {
+        assert_admitted(&artifact_candidate(), ProviderEvidenceKindV1::CiAttempt);
+    }
+
+    /// PROV-01: a provider fact is admitted only for the exact edge it
+    /// names. A fact about a different commit/revision/artifact than the
+    /// edge asserts must be rejected, never admitted or merely downgraded —
+    /// it is not weaker evidence for this edge, it is evidence for a
+    /// different one. Reproduces the PROV-01 finding's "R0" scenario for
+    /// each of the five closed `ProviderFactBindingV1` variants.
+    #[test]
+    fn ref_observes_revision_binding_edge_mismatch_rejected() {
+        let mismatched = ProviderAttestedRelationCandidateV2 {
+            fact_binding: ProviderFactBindingV1::RefObservesRevision {
+                ref_name: ContractId::new("ref.main").unwrap(),
+                observed_revision: resource(IdentityForm::Version, "commit", 'f'),
+            },
+            ..ref_candidate()
+        };
+        assert_edge_mismatch_rejected(&mismatched, ProviderEvidenceKindV1::GitRefEvent);
+    }
+
+    #[test]
+    fn review_head_sha_binding_edge_mismatch_rejected() {
+        let mismatched = ProviderAttestedRelationCandidateV2 {
+            fact_binding: ProviderFactBindingV1::ReviewApprovesRevision {
+                reviewed_revision: resource(IdentityForm::Version, "commit", 'f'),
+            },
+            ..review_candidate()
+        };
+        assert_edge_mismatch_rejected(&mismatched, ProviderEvidenceKindV1::CodeReview);
+    }
+
+    #[test]
+    fn build_source_revision_binding_edge_mismatch_rejected() {
+        let mismatched = ProviderAttestedRelationCandidateV2 {
+            fact_binding: ProviderFactBindingV1::BuildConsumesRevision {
+                source_revision: resource(IdentityForm::Version, "commit", 'f'),
+            },
+            ..build_candidate()
+        };
+        assert_edge_mismatch_rejected(&mismatched, ProviderEvidenceKindV1::CiAttempt);
+    }
+
+    #[test]
+    fn artifact_digest_binding_edge_mismatch_rejected() {
+        let mismatched = ProviderAttestedRelationCandidateV2 {
+            fact_binding: ProviderFactBindingV1::ArtifactBindsDigest {
+                artifact: resource(IdentityForm::Version, "artifact", 'f'),
+            },
+            ..artifact_candidate()
+        };
+        assert_edge_mismatch_rejected(&mismatched, ProviderEvidenceKindV1::CiAttempt);
+    }
+
+    #[test]
+    fn deployment_artifact_binding_edge_mismatch_rejected() {
+        // Exact PROV-01 R0 reproduction: a fact about a different artifact
+        // than `candidate().edge.target` must not be admitted.
+        let mismatched = ProviderAttestedRelationCandidateV2 {
+            fact_binding: ProviderFactBindingV1::DeploymentBindsArtifactAndConfiguration {
+                artifact: resource(IdentityForm::Version, "artifact", 'f'),
+                configuration: resource(IdentityForm::Version, "configuration", '5'),
+            },
+            ..candidate()
+        };
+        assert_edge_mismatch_rejected(&mismatched, ProviderEvidenceKindV1::DeploymentControlPlane);
+    }
+
+    #[test]
+    fn deployment_configuration_binding_edge_mismatch_rejected() {
+        let mismatched = ProviderAttestedRelationCandidateV2 {
+            fact_binding: ProviderFactBindingV1::DeploymentBindsArtifactAndConfiguration {
+                artifact: resource(IdentityForm::Version, "artifact", '2'),
+                configuration: resource(IdentityForm::Version, "configuration", 'f'),
+            },
+            ..candidate()
+        };
+        assert_edge_mismatch_rejected(&mismatched, ProviderEvidenceKindV1::DeploymentControlPlane);
+    }
+
+    /// Exact PROV-01 R1 reproduction: a `RefObservesRevision` fact about a
+    /// commit is evidence for a ref->revision edge only. AUTH-02 bounds it
+    /// to "the provider's observed ref state" — it must never admit an
+    /// unrelated `deployment_selects_artifact` edge even though the evidence
+    /// kind is correctly `GitRefEvent` for the binding's own declared kind.
+    #[test]
+    fn ref_observes_revision_cannot_admit_deployment_edge() {
+        let cross_edge_binding = ProviderAttestedRelationCandidateV2 {
+            fact_binding: ProviderFactBindingV1::RefObservesRevision {
+                ref_name: ContractId::new("ref.main").unwrap(),
+                observed_revision: resource(IdentityForm::Version, "commit", '6'),
+            },
+            ..candidate()
+        };
+        assert_edge_mismatch_rejected(&cross_edge_binding, ProviderEvidenceKindV1::GitRefEvent);
     }
 
     #[test]
