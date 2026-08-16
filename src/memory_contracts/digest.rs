@@ -191,6 +191,16 @@ pub enum DigestDomain {
     ObserverDisagreementV1, // W0-OBS
 
     // --- W0-ERASE domains ---
+    /// Accepted erasure event (`event_kind = "erasure.accepted"`).
+    ErasureEventV1, // W0-ERASE
+    /// Retrieval-deny tombstone installed atomically with an erasure event.
+    ErasureTombstoneV1, // W0-ERASE
+    /// Composite per-scope-kind epoch fence plus tenant/project generation.
+    ErasureFenceV1, // W0-ERASE
+    /// Per-store erasure completion receipt.
+    ErasureReceiptV1, // W0-ERASE
+    /// Legal hold deferring removal without widening visibility.
+    LegalHoldV1, // W0-ERASE
 
     // --- W0-LOG domains ---
     /// W0-LOG. `SuccessorLogEpochV1` identity.
@@ -389,7 +399,11 @@ impl DigestDomain {
             Self::ObserverDisagreementV1 => "ostk-observer-disagreement-v1", // W0-OBS
 
             // --- W0-ERASE prefixes ---
-
+            Self::ErasureEventV1 => "ostk-erasure-event-v1",
+            Self::ErasureTombstoneV1 => "ostk-erasure-tombstone-v1",
+            Self::ErasureFenceV1 => "ostk-erasure-fence-v1",
+            Self::ErasureReceiptV1 => "ostk-erasure-receipt-v1",
+            Self::LegalHoldV1 => "ostk-legal-hold-v1",
             // --- W0-LOG prefixes ---
             Self::LogEpochV2 => "ostk-log-epoch-v2",
             Self::EvidenceCompactionCheckpointV1 => "ostk-evidence-compaction-checkpoint-v1",
