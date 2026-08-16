@@ -4,14 +4,16 @@ set -eu
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 compose_file=$script_dir/compose.yaml
-policy=$repo_dir/deploy/cockroach/publication-reader-role-grants.sql
-expected_policy_sha256=ff3ada75aba9443875efb1f430a14829ef864b3f7409ae5d23f7bd381cb65226
+runtime_policy=$repo_dir/deploy/cockroach/runtime-role-grants.sql
+expected_runtime_policy_sha256=9d713d7fe2ad6dbb4dc8f36b66ddab51eec12a068d1af2b0aeb6acb91657856d
+publication_policy=$repo_dir/deploy/cockroach/publication-reader-role-grants.sql
+expected_publication_policy_sha256=ff3ada75aba9443875efb1f430a14829ef864b3f7409ae5d23f7bd381cb65226
 model_bundle=${FLEET_RECALL_MODEL_BUNDLE:-${1:-}}
 demo_port=${FLEET_RECALL_DEMO_PORT:-8088}
 localstack_port=${LOCALSTACK_PORT:-4566}
 
 fail() {
-    echo "LocalStack PUBLIC-03 smoke failed: $*" >&2
+    echo "LocalStack runtime/PUBLIC-03 smoke failed: $*" >&2
     exit 1
 }
 
@@ -138,11 +140,19 @@ if [ -n "$source_status" ]; then
 fi
 unset source_status
 
-if ! policy_hash_output=$(shasum -a 256 "$policy"); then
+if ! runtime_policy_hash_output=$(shasum -a 256 "$runtime_policy"); then
+    fail "runtime writer policy could not be hashed"
+fi
+runtime_policy_sha256=$(printf '%s\n' "$runtime_policy_hash_output" | awk '{print $1}')
+if [ "$runtime_policy_sha256" != "$expected_runtime_policy_sha256" ]; then
+    fail "runtime writer policy differs from the reviewed digest"
+fi
+
+if ! publication_policy_hash_output=$(shasum -a 256 "$publication_policy"); then
     fail "publication reader policy could not be hashed"
 fi
-policy_sha256=$(printf '%s\n' "$policy_hash_output" | awk '{print $1}')
-if [ "$policy_sha256" != "$expected_policy_sha256" ]; then
+publication_policy_sha256=$(printf '%s\n' "$publication_policy_hash_output" | awk '{print $1}')
+if [ "$publication_policy_sha256" != "$expected_publication_policy_sha256" ]; then
     fail "publication reader policy differs from the reviewed digest"
 fi
 
@@ -194,9 +204,13 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-if [ -n "$(compose ps --all --quiet 2>/dev/null || true)" ]; then
+if ! existing_project_containers=$(compose ps --all --quiet); then
+    fail "the fixed LocalStack Compose project could not be inspected"
+fi
+if [ -n "$existing_project_containers" ]; then
     fail "the fixed LocalStack Compose project already has containers; tear it down before a source-bound run"
 fi
+unset existing_project_containers
 
 production_metadata=$proof_tmp/production-metadata.json
 private_metadata=$proof_tmp/private-metadata.json
@@ -448,6 +462,70 @@ ORDER BY version;
     fail "migration prefix fingerprint input is not exactly 17 rows"
 migration_fingerprint=$(sha256_text "$migration_rows")
 
+runtime_grant_rows=$(root_rows "
+SELECT object_type || '|' || COALESCE(database_name, '') || '|' ||
+       COALESCE(schema_name, '') || '|' || COALESCE(object_name, '') || '|' ||
+       privilege_type || '|' ||
+       CASE WHEN is_grantable THEN 'grantable' ELSE 'not_grantable' END
+FROM [SHOW GRANTS FOR fleet_runtime]
+WHERE grantee = 'fleet_runtime'
+ORDER BY object_type, database_name, schema_name, object_name, privilege_type;
+")
+expected_runtime_grant_rows='database|fleet_recall|||CONNECT|not_grantable
+schema|fleet_recall|public||USAGE|not_grantable
+sequence|fleet_recall|public|memory_claim_id_seq|USAGE|not_grantable
+sequence|fleet_recall|public|memory_claim_support_id_seq|USAGE|not_grantable
+sequence|fleet_recall|public|memory_conflict_id_seq|USAGE|not_grantable
+table|fleet_recall|public|_sqlx_migrations|SELECT|not_grantable
+table|fleet_recall|public|memory_chunk_history|DELETE|not_grantable
+table|fleet_recall|public|memory_chunk_history|SELECT|not_grantable
+table|fleet_recall|public|memory_chunks|INSERT|not_grantable
+table|fleet_recall|public|memory_chunks|SELECT|not_grantable
+table|fleet_recall|public|memory_chunks|UPDATE|not_grantable
+table|fleet_recall|public|memory_claim_embeddings|INSERT|not_grantable
+table|fleet_recall|public|memory_claim_embeddings|SELECT|not_grantable
+table|fleet_recall|public|memory_claim_events|INSERT|not_grantable
+table|fleet_recall|public|memory_claim_links|SELECT|not_grantable
+table|fleet_recall|public|memory_claim_support|INSERT|not_grantable
+table|fleet_recall|public|memory_claim_support|SELECT|not_grantable
+table|fleet_recall|public|memory_claims|INSERT|not_grantable
+table|fleet_recall|public|memory_claims|SELECT|not_grantable
+table|fleet_recall|public|memory_claims|UPDATE|not_grantable
+table|fleet_recall|public|memory_conflict_members|INSERT|not_grantable
+table|fleet_recall|public|memory_conflict_members|SELECT|not_grantable
+table|fleet_recall|public|memory_conflicts|INSERT|not_grantable
+table|fleet_recall|public|memory_conflicts|SELECT|not_grantable
+table|fleet_recall|public|memory_conflicts|UPDATE|not_grantable
+table|fleet_recall|public|memory_corpus_models|INSERT|not_grantable
+table|fleet_recall|public|memory_corpus_models|SELECT|not_grantable
+table|fleet_recall|public|memory_events|INSERT|not_grantable
+table|fleet_recall|public|memory_mutation_receipts|INSERT|not_grantable
+table|fleet_recall|public|memory_mutation_receipts|SELECT|not_grantable
+table|fleet_recall|public|memory_mutation_receipts|UPDATE|not_grantable'
+[ "$runtime_grant_rows" = "$expected_runtime_grant_rows" ] || \
+    fail "runtime grant rows differ from the exact thirty-one-row contract"
+runtime_grant_fingerprint=$(sha256_text "$runtime_grant_rows")
+
+runtime_terminal=$(root_scalar "
+SELECT
+    (SELECT count(*)::STRING FROM [SHOW GRANTS FOR fleet_writer]
+      WHERE grantee = 'fleet_writer') || ':' ||
+    (SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+      WHERE role_name = 'fleet_runtime'
+        AND member = 'fleet_writer'
+        AND NOT is_admin) || ':' ||
+    (SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+      WHERE role_name IN ('fleet_runtime', 'fleet_writer')
+         OR member IN ('fleet_runtime', 'fleet_writer')) || ':' ||
+    (SELECT count(*)::STRING FROM [SHOW USERS]
+      WHERE username = 'fleet_runtime'
+        AND options::STRING = '{NOLOGIN}') || ':' ||
+    (SELECT count(*)::STRING FROM [SHOW USERS]
+      WHERE username = 'fleet_writer' AND options::STRING = '{}');
+")
+[ "$runtime_terminal" = '0:1:1:1:1' ] || \
+    fail "runtime principal terminal state is not 0:1:1:1:1"
+
 publication_grant_rows=$(root_rows "
 SELECT object_type || '|' || COALESCE(database_name, '') || '|' ||
        COALESCE(schema_name, '') || '|' || COALESCE(object_name, '') || '|' ||
@@ -505,10 +583,186 @@ SELECT
     (SELECT count(*)::STRING FROM [SHOW SYSTEM GRANTS]
       WHERE grantee IN (
         'fleet_migrator', 'fleet_writer', 'fleet_publication'
-      ));
+      )) || ':' ||
+    (SELECT count(*)::STRING FROM [SHOW GRANTS ON ROLE]
+      WHERE role_name = 'fleet_migrator'
+         OR member = 'fleet_migrator') || ':' ||
+    (SELECT count(*)::STRING
+       FROM pg_catalog.pg_class AS relation_object
+       JOIN pg_catalog.pg_namespace AS schema_object
+         ON schema_object.oid = relation_object.relnamespace
+       JOIN pg_catalog.pg_roles AS owner_role
+         ON owner_role.oid = relation_object.relowner
+      WHERE schema_object.nspname = 'public'
+        AND relation_object.relname = '_sqlx_migrations'
+        AND relation_object.relkind = 'r'
+        AND owner_role.rolname = 'fleet_migrator');
 ")
-[ "$identity_terminal" = '1:1:1:0:0' ] || \
-    fail "migrator/writer/publication identity terminal state is not 1:1:1:0:0"
+[ "$identity_terminal" = '1:1:1:0:0:0:1' ] || \
+    fail "migrator/writer/publication identity and owner terminal state is not 1:1:1:0:0:0:1"
+
+writer_database_url=$(get_secret \
+    ostk-fleet-recall/local/writer-database-url)
+writer_sql() {
+    compose exec --no-TTY cockroach cockroach sql \
+        --url "$writer_database_url" --format=tsv --execute="$1"
+}
+
+if ! writer_identity_output=$(writer_sql \
+    "SELECT pg_catalog.current_user() || ':' || pg_catalog.current_database();"); then
+    fail "direct writer identity query failed"
+fi
+writer_identity=$(printf '%s\n' "$writer_identity_output" | tail -n 1)
+[ "$writer_identity" = 'fleet_writer:fleet_recall' ] || \
+    fail "direct writer connection used the wrong identity"
+
+# Exercise each granted privilege kind without leaving application rows. The
+# three nextval calls intentionally consume values; gaps are valid sequence
+# behavior and the product scenario runs after this probe.
+writer_sql "
+SELECT count(*) FROM public._sqlx_migrations WHERE version BETWEEN 1 AND 17;
+INSERT INTO public.memory_events (
+    tenant_id, project, agent, session_id, event_kind, entity_kind, entity_id, payload
+)
+SELECT
+    '0198a849-f6ae-7d61-9800-000000000001'::UUID,
+    'localstack-demo', 'boundary-probe', 'boundary-probe',
+    'boundary_probe', 'probe', '0', '{}'::JSONB
+WHERE false;
+UPDATE public.memory_chunks SET updated_at = updated_at WHERE false;
+SELECT count(*) FROM public.memory_chunk_history WHERE false;
+DELETE FROM public.memory_chunk_history
+WHERE tenant_id = '0198a849-f6ae-7d61-9800-000000000001'::UUID
+  AND project = 'boundary-probe'
+  AND chunk_id = 'boundary-probe';
+SELECT nextval('public.memory_claim_id_seq'),
+       nextval('public.memory_claim_support_id_seq'),
+       nextval('public.memory_conflict_id_seq');
+" >/dev/null
+
+expect_writer_sql_denied() {
+    label=$1
+    statement=$2
+    denial_output=$proof_tmp/direct-writer-denial.out
+    if writer_sql "$statement" >"$denial_output" 2>&1; then
+        fail "$label unexpectedly succeeded"
+    fi
+    if ! grep -Eiq 'SQLSTATE:[[:space:]]*42501|permission denied|does not have.*privilege|insufficient privilege' \
+        "$denial_output"; then
+        fail "$label did not fail with a privilege denial"
+    fi
+    : >"$denial_output"
+}
+
+expect_writer_sql_denied 'writer migration INSERT' \
+    'INSERT INTO public._sqlx_migrations (version) SELECT 0::INT8 WHERE false'
+expect_writer_sql_denied 'writer migration UPDATE' \
+    'UPDATE public._sqlx_migrations SET success = success WHERE false'
+expect_writer_sql_denied 'writer migration DELETE' \
+    'DELETE FROM public._sqlx_migrations WHERE false'
+
+# Runtime data credentials cannot observe or forge any control, activation,
+# or successor authority row. Exercise all nine private relations directly;
+# the exact grant fingerprint above independently excludes every other verb.
+for private_table in \
+    memory_control_bootstraps \
+    memory_control_events \
+    memory_control_log_epochs \
+    memory_control_shard_heads \
+    memory_registry_activations \
+    memory_registry_current_heads_v2 \
+    memory_registry_genesis_bridge_consumptions \
+    memory_registry_heads \
+    memory_registry_transitions; do
+    expect_writer_sql_denied "writer private table $private_table SELECT" \
+        "SELECT count(*) FROM public.$private_table"
+    expect_writer_sql_denied "writer private table $private_table INSERT" \
+        "INSERT INTO public.$private_table (tenant_id)
+         SELECT '0198a849-f6ae-7d61-9800-000000000001'::UUID WHERE false"
+    expect_writer_sql_denied "writer private table $private_table UPDATE" \
+        "UPDATE public.$private_table SET tenant_id = tenant_id WHERE false"
+    expect_writer_sql_denied "writer private table $private_table DELETE" \
+        "DELETE FROM public.$private_table WHERE false"
+done
+
+# Negative probes cover every deliberately omitted adjacent verb on the exact
+# legacy runtime surface, plus the two wholly private legacy objects and the
+# unused fourth sequence.
+expect_writer_sql_denied 'writer active chunk DELETE' \
+    'DELETE FROM public.memory_chunks WHERE false'
+expect_writer_sql_denied 'writer history INSERT' \
+    "INSERT INTO public.memory_chunk_history (tenant_id)
+     SELECT '0198a849-f6ae-7d61-9800-000000000001'::UUID WHERE false"
+expect_writer_sql_denied 'writer history UPDATE' \
+    'UPDATE public.memory_chunk_history SET tenant_id = tenant_id WHERE false'
+expect_writer_sql_denied 'writer corpus-model UPDATE' \
+    'UPDATE public.memory_corpus_models SET updated_at = updated_at WHERE false'
+expect_writer_sql_denied 'writer corpus-model DELETE' \
+    'DELETE FROM public.memory_corpus_models WHERE false'
+expect_writer_sql_denied 'writer claim DELETE' \
+    'DELETE FROM public.memory_claims WHERE false'
+expect_writer_sql_denied 'writer claim-support UPDATE' \
+    'UPDATE public.memory_claim_support SET state = state WHERE false'
+expect_writer_sql_denied 'writer claim-support DELETE' \
+    'DELETE FROM public.memory_claim_support WHERE false'
+expect_writer_sql_denied 'writer claim-embedding UPDATE' \
+    'UPDATE public.memory_claim_embeddings SET updated_at = updated_at WHERE false'
+expect_writer_sql_denied 'writer claim-embedding DELETE' \
+    'DELETE FROM public.memory_claim_embeddings WHERE false'
+expect_writer_sql_denied 'writer claim-event SELECT' \
+    'SELECT count(*) FROM public.memory_claim_events'
+expect_writer_sql_denied 'writer claim-event UPDATE' \
+    'UPDATE public.memory_claim_events SET tenant_id = tenant_id WHERE false'
+expect_writer_sql_denied 'writer claim-event DELETE' \
+    'DELETE FROM public.memory_claim_events WHERE false'
+expect_writer_sql_denied 'writer conflict DELETE' \
+    'DELETE FROM public.memory_conflicts WHERE false'
+expect_writer_sql_denied 'writer conflict-member UPDATE' \
+    'UPDATE public.memory_conflict_members SET tenant_id = tenant_id WHERE false'
+expect_writer_sql_denied 'writer conflict-member DELETE' \
+    'DELETE FROM public.memory_conflict_members WHERE false'
+expect_writer_sql_denied 'writer claim-link INSERT' \
+    "INSERT INTO public.memory_claim_links (tenant_id)
+     SELECT '0198a849-f6ae-7d61-9800-000000000001'::UUID WHERE false"
+expect_writer_sql_denied 'writer claim-link UPDATE' \
+    'UPDATE public.memory_claim_links SET tenant_id = tenant_id WHERE false'
+expect_writer_sql_denied 'writer claim-link DELETE' \
+    'DELETE FROM public.memory_claim_links WHERE false'
+expect_writer_sql_denied 'writer receipt DELETE' \
+    'DELETE FROM public.memory_mutation_receipts WHERE false'
+expect_writer_sql_denied 'writer append-log SELECT' \
+    'SELECT count(*) FROM public.memory_events'
+expect_writer_sql_denied 'writer append-log UPDATE' \
+    'UPDATE public.memory_events SET tenant_id = tenant_id WHERE false'
+expect_writer_sql_denied 'writer append-log DELETE' \
+    'DELETE FROM public.memory_events WHERE false'
+for private_legacy_table in memory_claim_link_events memory_attention; do
+    expect_writer_sql_denied "writer private legacy $private_legacy_table SELECT" \
+        "SELECT count(*) FROM public.$private_legacy_table"
+    expect_writer_sql_denied "writer private legacy $private_legacy_table INSERT" \
+        "INSERT INTO public.$private_legacy_table (tenant_id)
+         SELECT '0198a849-f6ae-7d61-9800-000000000001'::UUID WHERE false"
+    expect_writer_sql_denied "writer private legacy $private_legacy_table UPDATE" \
+        "UPDATE public.$private_legacy_table SET tenant_id = tenant_id WHERE false"
+    expect_writer_sql_denied "writer private legacy $private_legacy_table DELETE" \
+        "DELETE FROM public.$private_legacy_table WHERE false"
+done
+expect_writer_sql_denied 'writer unused link sequence' \
+    "SELECT nextval('public.memory_claim_link_id_seq')"
+for allowed_sequence in \
+    memory_claim_id_seq \
+    memory_claim_support_id_seq \
+    memory_conflict_id_seq; do
+    expect_writer_sql_denied "writer sequence $allowed_sequence relation SELECT" \
+        "SELECT last_value FROM public.$allowed_sequence"
+    expect_writer_sql_denied "writer sequence $allowed_sequence setval" \
+        "SELECT setval('public.$allowed_sequence', 1)"
+done
+expect_writer_sql_denied 'writer schema DDL' \
+    'CREATE TABLE public.runtime_smoke_escape (id INT8 PRIMARY KEY)'
+expect_writer_sql_denied 'writer role delegation' \
+    'GRANT fleet_runtime TO fleet_publication'
+unset writer_database_url
 
 publication_database_url=$(get_secret \
     ostk-fleet-recall/local/publication-database-url)
@@ -716,12 +970,14 @@ receipt=$(jq -cn \
     --arg private_config_digest "$private_config_digest" \
     --arg private_manifest_digest "$private_manifest_digest" \
     --arg embedding_digest "$embedding_digest" \
-    --arg policy_sha256 "$policy_sha256" \
+    --arg runtime_policy_sha256 "$runtime_policy_sha256" \
+    --arg publication_policy_sha256 "$publication_policy_sha256" \
     --arg migration_fingerprint "$migration_fingerprint" \
+    --arg runtime_grant_fingerprint "$runtime_grant_fingerprint" \
     --arg publication_grant_fingerprint "$publication_grant_fingerprint" \
     --argjson fleet_scenario "$fleet_scenario" '
     {
-      schema: "fleet-localstack-publication-proof-v1",
+      schema: "fleet-localstack-publication-proof-v2",
       verified: true,
       capture: "live-local-emulator",
       generated_at: $generated_at,
@@ -753,7 +1009,19 @@ receipt=$(jq -cn \
           first: 1, last: 17, successful_rows: 17,
           fingerprint_sha256: $migration_fingerprint
         },
-        publication_policy_sha256: $policy_sha256,
+        migrator_principal: "fleet_migrator",
+        migrator_nologin_admin_system_revoked: true,
+        migrator_role_edges_absent: true,
+        migrator_migration_ownership_preserved: true,
+        runtime_policy_sha256: $runtime_policy_sha256,
+        runtime_grant_fingerprint_sha256: $runtime_grant_fingerprint,
+        runtime_principal: "fleet_writer",
+        runtime_role: "fleet_runtime",
+        runtime_direct_allowed_probes_succeeded: true,
+        runtime_migration_mutation_denied: true,
+        runtime_private_control_registry_successor_access_denied: true,
+        runtime_disallowed_legacy_ddl_delegation_setval_denied: true,
+        publication_policy_sha256: $publication_policy_sha256,
         publication_grant_fingerprint_sha256: $publication_grant_fingerprint,
         publication_principal: "fleet_publication",
         publication_role: "fleet_publication_reader",
@@ -780,8 +1048,19 @@ receipt=$(jq -cn \
     }
     ')
 printf '%s\n' "$receipt" | jq -e \
-    '.verified == true and
+    '.schema == "fleet-localstack-publication-proof-v2" and
+     .verified == true and
      .source.tracked_tree_clean == true and
+     .database.migrator_principal == "fleet_migrator" and
+     .database.migrator_nologin_admin_system_revoked == true and
+     .database.migrator_role_edges_absent == true and
+     .database.migrator_migration_ownership_preserved == true and
+     .database.runtime_principal == "fleet_writer" and
+     .database.runtime_role == "fleet_runtime" and
+     .database.runtime_direct_allowed_probes_succeeded == true and
+     .database.runtime_migration_mutation_denied == true and
+     .database.runtime_private_control_registry_successor_access_denied == true and
+     .database.runtime_disallowed_legacy_ddl_delegation_setval_denied == true and
      .cleanup == {
        mode: "release",
        fixed_project_containers_absent: true,

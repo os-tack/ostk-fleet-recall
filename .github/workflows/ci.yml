@@ -112,6 +112,8 @@ jobs:
             script: deploy/cockroach/tests/successor-activation-role-grants.sh
           - name: conflict reconciliation RBAC
             script: deploy/cockroach/tests/conflict-reconciliation-role-grants.sh
+          - name: runtime writer RBAC
+            script: deploy/cockroach/tests/runtime-role-grants.sh
           - name: publication reader RBAC
             script: deploy/cockroach/tests/publication-reader-role-grants.sh
           - name: control bootstrap CLI

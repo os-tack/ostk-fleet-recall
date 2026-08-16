@@ -105,6 +105,7 @@ counted as Docker evidence.
 | Activation RBAC parity | `registry-activation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Successor-activation RBAC parity | `successor-activation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Conflict-reconciliation RBAC parity | `conflict-reconciliation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
+| Runtime-writer RBAC parity | `runtime-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Publication-reader RBAC parity | `publication-reader-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Control bootstrap CLI parity | `control-bootstrap-cli.sh` in its own Docker container | Secondary packaging/CLI result only |
 
@@ -114,6 +115,44 @@ checksum-pinned official-binary correctness proof. Report the authoritative
 result and each Docker parity result separately; do not summarize one substrate
 as evidence that another passed. Every script owns bounded temporary state and
 cleans it on success, failure, or interruption.
+
+The runtime-writer parity proof freezes the reviewed source snapshot
+underpinning the current matrix before Docker starts; it does not claim
+unreviewed future reachability. Its exact SHA-256 inputs are `config.rs`
+`66e14beaa4faf10d26e9ebfdc3e079cdfc7dcf2f7c777eb04b9b48676747f33a`,
+`main.rs` `7084682294585060cf1350e5c74ba2c5676c6d06c7eb39929aa7878b5a37f983`,
+`private_postgres.rs`
+`7718c15393872a139956732629c472d813a2a014395f943a5382191966162745`,
+`store/cockroach.rs`
+`284819aa6c367f27c7c614351a9127a7686672ad6fc7ae81fd23544c4b2863e5`,
+`ledger/cockroach.rs`
+`b8c3ffbd3dfe7a74f76a06815f317db3e79b3129adaa14e2da5bea43f60b069f`,
+`service.rs` `6f0c6874072baed1070204063ac65df0761eda2da862e51775ba85cc5a34b522`,
+`application.rs`
+`5c1707702371016d7d35a58ffe8179e6015d48564e12e36df81cfc8b2c5f5e70`,
+and `reference_agent.rs`
+`2bfc742926ef753ee90458a294bb59dbddf2afa2e9983484548f2fe0b7b77d26`.
+
+The exact logical `fleet_runtime` matrix is database `CONNECT`, public-schema
+`USAGE`, 26 table-privilege rows, and `USAGE` on only the claim, support, and
+conflict ID sequences. Active chunk upsert has `SELECT`/`INSERT`/`UPDATE` on
+`memory_chunks` plus only the keyed `DELETE` on `memory_chunk_history` and the
+`SELECT` CockroachDB requires to evaluate that `DELETE`'s `WHERE` clause; the
+connected proof issues that keyed `DELETE` as `fleet_writer` and requires it to
+succeed.
+The production-shaped receipt reservation omits all three nullable FK keys;
+the proof revokes only claim-link `SELECT`, requires that same reservation to
+fail naming `memory_claim_links`, then reapplies the policy and requires it to
+succeed. Adjacent verbs and control, registry, attention, claim-link-event,
+claim-link-sequence, DDL, role, system, ownership, default, direct-principal,
+and PUBLIC authority are denied. Exhaustive external helpers enumerate every
+database and application schema, subject/PUBLIC current and future grants,
+database/schema/relation/function/type ownership, and cluster-global external
+connections before an audited LOGIN and at the terminal boundary. The fixed
+external `fleet_writer` is quiesced as exact `{NOLOGIN}` for policy application
+and inherits one non-admin leaf edge. Static-only mode exits before installing
+Docker cleanup or invoking Docker. This Docker lane remains secondary evidence;
+it does not assert application to LocalStack or AWS.
 
 The control and activation RBAC proofs apply migrations 3 through 14 over
 explicit stand-ins for the legacy v1/v2 objects, then synthesize the complete

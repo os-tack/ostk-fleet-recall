@@ -115,6 +115,7 @@ services:
     entrypoint: ["/bin/sh", "/localstack/database-boundary.sh"]
     volumes:
       - ./database-boundary.sh:/localstack/database-boundary.sh:ro
+      - ../cockroach/runtime-role-grants.sql:/localstack/runtime-role-grants.sql:ro
       - ../cockroach/publication-reader-role-grants.sql:/localstack/publication-reader-role-grants.sql:ro
     depends_on:
       migrate:

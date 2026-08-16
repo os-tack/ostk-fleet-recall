@@ -271,16 +271,14 @@ Create:
 
 CockroachDB Cloud UI-created SQL users initially receive `admin`. Revoke it
 from `fleet_writer` and `fleet_publication` before use; immediately quiesce
-`fleet_publication` with exact `NOLOGIN`. After migration, grant the
-`fleet_runtime` logical role private-writer DML only on
-`memory_corpus_models`, `memory_chunks`,
-`memory_chunk_history`, `memory_claims`, `memory_claim_support`,
-`memory_claim_embeddings`, `memory_claim_events`, `memory_conflicts`,
-`memory_conflict_members`, `memory_claim_links`, `memory_claim_link_events`,
-`memory_mutation_receipts`, `memory_events`, and `memory_attention`; grant only
-the four legacy sequences and `_sqlx_migrations` access listed in
-[MIGRATIONS.md](MIGRATIONS.md), then grant `fleet_writer` only membership in
-that logical role. Never use `ON ALL TABLES`, and never grant the
+`fleet_publication` with exact `NOLOGIN`. After migration, apply the exact
+checksum-pinned runtime policy
+[`deploy/cockroach/runtime-role-grants.sql`](../deploy/cockroach/runtime-role-grants.sql)
+to the `fleet_runtime` logical role: per-table private-writer verbs on the
+legacy corpus, claim, conflict, receipt, and event tables, `USAGE` on only the
+claim, claim-support, and conflict ID sequences, and `SELECT` on
+`_sqlx_migrations` (see [MIGRATIONS.md](MIGRATIONS.md)); the policy itself
+installs the sole `fleet_writer` membership edge. Never use `ON ALL TABLES`, and never grant the
 writer, publication reader, or `public` role access to `memory_control_bootstraps`,
 `memory_control_log_epochs`, `memory_control_shard_heads`, or
 `memory_control_events`. Also grant no runtime, bootstrap, or genesis-activation

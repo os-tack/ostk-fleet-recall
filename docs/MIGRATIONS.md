@@ -200,37 +200,17 @@ needs:
 
 Never grant private-writer privileges with `ON ALL TABLES IN SCHEMA public`: migration
 3 deliberately puts control tables in that schema, and future private tables
-must not become reachable through defaults. For example, after connecting as
-an authorized administrator and substituting the actual database/role names,
-grant the bounded legacy table set explicitly:
-
-```sql
-GRANT CONNECT ON DATABASE fleet_recall TO fleet_runtime;
-GRANT USAGE ON SCHEMA public TO fleet_runtime;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
-    memory_corpus_models,
-    memory_chunks,
-    memory_chunk_history,
-    memory_claims,
-    memory_claim_support,
-    memory_claim_embeddings,
-    memory_claim_events,
-    memory_conflicts,
-    memory_conflict_members,
-    memory_claim_links,
-    memory_claim_link_events,
-    memory_mutation_receipts,
-    memory_events,
-    memory_attention
-TO fleet_runtime;
-GRANT SELECT ON TABLE _sqlx_migrations TO fleet_runtime;
-GRANT USAGE, SELECT ON SEQUENCE
-    memory_claim_id_seq,
-    memory_claim_support_id_seq,
-    memory_conflict_id_seq,
-    memory_claim_link_id_seq
-TO fleet_runtime;
-```
+must not become reachable through defaults. The exact, checksum-pinned grant
+matrix is [`deploy/cockroach/runtime-role-grants.sql`](../deploy/cockroach/runtime-role-grants.sql);
+apply that file as an authorized administrator rather than hand-writing grants.
+It is deliberately narrower than the reusable library surface: per-table verbs
+only (for example `memory_chunk_history` receives `SELECT`/`DELETE` only, and
+`memory_attention` and `memory_claim_link_events` receive nothing), `USAGE` on
+only the claim, claim-support, and conflict ID sequences, and `SELECT` on
+`_sqlx_migrations`. The row-by-row table lives in
+[`deploy/localstack/README.md`](../deploy/localstack/README.md), and
+`deploy/cockroach/tests/runtime-role-grants.sh` proves the matrix against the
+reviewed source snapshot.
 
 Grant the external private-writer login only membership in `fleet_runtime`; do
 not copy these DML/sequence grants onto the fixed publication login.
