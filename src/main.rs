@@ -1872,6 +1872,7 @@ mod tests {
             embedding_model: "logical/model".into(),
             embedding_model_path: bundle.path().into(),
             embedding_model_sha256: digest,
+            writer_authority: None,
         };
 
         assert!(

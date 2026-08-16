@@ -688,6 +688,16 @@ pub struct FleetConfig {
     /// model name through a remote registry.
     pub embedding_model_path: PathBuf,
     pub embedding_model_sha256: String,
+    /// Deployment pins that enable the event-first writer path (ADR 0002 D4).
+    ///
+    /// `None` means the pins are absent and the event-first path is disabled;
+    /// a partial set never reaches this field because
+    /// [`WriterAuthorityConfig::from_lookup`] refuses it while this
+    /// configuration is being built. That refusal is the whole point of
+    /// carrying the group here: a half-applied task definition fails process
+    /// startup instead of silently downgrading a deployment that was meant to
+    /// run event-first.
+    pub writer_authority: Option<WriterAuthorityConfig>,
 }
 
 impl std::fmt::Debug for FleetConfig {
@@ -701,6 +711,7 @@ impl std::fmt::Debug for FleetConfig {
             .field("embedding_model", &self.embedding_model)
             .field("embedding_model_path", &self.embedding_model_path)
             .field("embedding_model_sha256", &self.embedding_model_sha256)
+            .field("writer_authority", &self.writer_authority)
             .finish()
     }
 }
@@ -901,6 +912,10 @@ fn fleet_config_from_lookup(
         "FLEET_RECALL_EMBEDDING_MODEL_PATH",
     )?);
     let embedding_model_sha256 = required_from(&mut lookup, "FLEET_RECALL_EMBEDDING_MODEL_SHA256")?;
+    // ADR 0002 D4: the writer-authority pin group is read by the same process
+    // configuration every runtime entry point loads, so a partial set fails
+    // startup here rather than leaving the event-first path silently disabled.
+    let writer_authority = WriterAuthorityConfig::from_lookup(&mut lookup)?;
 
     if max_connections == 0 {
         return Err(FleetError::Configuration(
@@ -937,6 +952,7 @@ fn fleet_config_from_lookup(
         embedding_model: embedding_model.to_owned(),
         embedding_model_path,
         embedding_model_sha256: embedding_model_sha256.to_ascii_lowercase(),
+        writer_authority,
     })
 }
 
@@ -1775,6 +1791,7 @@ mod tests {
             embedding_model: "logical/model".into(),
             embedding_model_path: bundle.path().into(),
             embedding_model_sha256: digest.clone(),
+            writer_authority: None,
         };
 
         assert!(config.verify_embedding_model_bundle().is_ok());
@@ -1817,6 +1834,7 @@ mod tests {
             embedding_model: "logical/model".into(),
             embedding_model_path: bundle.path().into(),
             embedding_model_sha256: "0".repeat(64),
+            writer_authority: None,
         };
         let debug = format!("{config:?}");
         assert!(!debug.contains("super-secret"));
@@ -3249,6 +3267,78 @@ mod tests {
                 WriterAuthorityConfig::from_lookup(|name| values.get(name).cloned()).is_err(),
                 "accepted non-canonical writer authority pin {name}"
             );
+        }
+    }
+
+    /// ADR 0002 D4 wiring. The pin group only protects a deployment if the
+    /// process configuration actually reads it, so all three states are
+    /// asserted through `FleetConfig` itself and not only through
+    /// `WriterAuthorityConfig`: absent leaves every existing runtime
+    /// assertion untouched, complete is carried, and partial fails the
+    /// configuration load that every runtime entry point performs.
+    #[test]
+    fn fleet_config_carries_the_writer_authority_pin_group_or_fails_closed() {
+        let mut absent = serving_values();
+        absent.insert(
+            "FLEET_RECALL_DATABASE_URL",
+            "postgresql://fleet_writer:writer-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+                .into(),
+        );
+
+        let config = FleetConfig::from_lookup(|name| absent.get(name).cloned())
+            .expect("an absent pin group must leave the runtime configuration loadable");
+        assert!(
+            config.writer_authority.is_none(),
+            "an absent pin group must leave the event-first path disabled"
+        );
+        assert_eq!(config.max_connections, 4);
+        assert_eq!(config.default_scope.project, "physical-project");
+        assert_eq!(config.embedding_model, "logical/publication-model");
+
+        let mut complete = absent.clone();
+        complete.extend(writer_authority_values());
+        let config = FleetConfig::from_lookup(|name| complete.get(name).cloned())
+            .expect("a complete pin group must load");
+        let pins = config
+            .writer_authority
+            .as_ref()
+            .expect("a complete pin group must reach the runtime configuration");
+        assert_eq!(
+            pins.semantic_scope().tenant_namespace.as_str(),
+            "tenant.acme"
+        );
+        assert_eq!(
+            pins.semantic_scope().project_namespace.as_str(),
+            "project.recall"
+        );
+        assert_eq!(
+            pins.bootstrap_receipt_digest().digest(),
+            parse_digest(FIXTURE_RECEIPT_DIGEST, "fixture").expect("fixture digest")
+        );
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(FIXTURE_RECEIPT_DIGEST));
+        assert!(!debug.contains("writer-secret"));
+
+        for omitted in WRITER_AUTHORITY_PIN_ENV_NAMES {
+            let mut partial = complete.clone();
+            partial.remove(omitted);
+            let error = FleetConfig::from_lookup(|name| partial.get(name).cloned())
+                .expect_err("a partial pin group must fail the runtime configuration load");
+            assert!(
+                format!("{error}").contains(omitted),
+                "the partial pin error must name the missing variable {omitted}"
+            );
+            let error = FleetConfig::from_migrator_lookup(|name| {
+                if name == "FLEET_RECALL_DATABASE_URL" {
+                    return Some(
+                        "postgresql://fleet_migrator:migrator-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+                            .to_owned(),
+                    );
+                }
+                partial.get(name).cloned()
+            })
+            .expect_err("the migrator entry point must fail closed on the same partial set");
+            assert!(format!("{error}").contains(omitted));
         }
     }
 
