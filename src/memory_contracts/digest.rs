@@ -177,7 +177,16 @@ pub enum DigestDomain {
     // --- W0-LOG domains ---
 
     // --- W0-NORM domains ---
-
+    /// Unsigned `NormativeBindingProposalV2` statement preimage.
+    NormativeBindingStatementV2,
+    /// `NormativeActivationReceiptV2` preimage (eligibility/threshold/`SoD`).
+    NormativeBindingReceiptV2,
+    /// `NormativeLifecycleEventV1` preimage: activation, retirement,
+    /// retraction, expiry, or supersession, each governed by active policy.
+    NormativeLifecycleEventV1,
+    /// `ContestedBindingV1` preimage for unorderable independently accepted
+    /// or late/corrective normative evidence.
+    NormativeContestedV1,
     // --- W0-QUAR domains ---
     /// Bounded dead-letter record for one rejected/quarantined delivery.
     QuarantineRecordV1,
@@ -294,7 +303,10 @@ impl DigestDomain {
             // --- W0-LOG prefixes ---
 
             // --- W0-NORM prefixes ---
-
+            Self::NormativeBindingStatementV2 => "ostk-normative-binding-statement-v2",
+            Self::NormativeBindingReceiptV2 => "ostk-normative-binding-receipt-v2",
+            Self::NormativeLifecycleEventV1 => "ostk-normative-lifecycle-event-v1",
+            Self::NormativeContestedV1 => "ostk-normative-contested-v1",
             // --- W0-QUAR prefixes ---
             Self::QuarantineRecordV1 => "ostk-quarantine-record-v1",
             // --- W0-TELEM prefixes ---
