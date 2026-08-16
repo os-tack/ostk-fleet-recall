@@ -30,14 +30,22 @@ attempt; the transport delivery ID and a bounded attempt count; an optional
 best-effort `source_fact_id`/`representation_key` digest pair, present only
 when identity could be derived before the delivery was rejected; the
 canonical payload's SHA-256 **digest only**, never its bytes; a closed
-`QuarantineReasonV1`; one bounded, non-secret `BoundedDiagnosticV1`; and a
-`received_at` timestamp.
+`QuarantineReasonV1`; one bounded `BoundedDiagnosticV1`; and a `received_at`
+timestamp.
 
-There is no field that can hold raw payload bytes, no second or
-payload-selected scope field, and no "release to projection" affordance of
-any kind. `#[serde(deny_unknown_fields)]` means a delivery that tries to add
-any of those keys is rejected before it is ever interpreted — the negative
-vectors below prove exactly that, per key.
+There is no dedicated field that can hold the rejected payload's raw bytes
+(only its digest, above), no second or payload-selected scope field, and no
+"release to projection" affordance of any kind. `#[serde(deny_unknown_fields)]`
+means a delivery that tries to add any of those keys is rejected before it
+is ever interpreted — the negative vectors below prove exactly that, per
+key. `BoundedDiagnosticV1.message` is a bounded, but content-unconstrained,
+`String` (up to `MAX_DIAGNOSTIC_MESSAGE_BYTES` = 512 bytes): the type does
+not itself forbid a caller from copying payload text or secrets into it, so
+"non-secret" is a calling-convention this contract expects trusted ingress
+code to uphold, not a type-level guarantee the way the digest-only payload
+field is. The searchable-leakage vector below only proves the record's
+*structural* fields carry no payload bytes; it does not probe
+`diagnostic.message` content.
 
 Two more bounds are enforced by `validate()`, matching the rest of this
 crate's identity-bearing durable timestamps and its bounded, non-payload
@@ -64,11 +72,17 @@ fields:
 `unknown_schema`, `oversize`, `duplicate_position`, `preimage_disagreement`,
 `redaction_failure`, `unknown_representation_version`. One positive fixture
 exists per reason. Whether `source_fact_id`/`representation_key` are present
-varies by reason. `unknown_schema`, `oversize`, and `invalid_signature` fire
-before any identity could be trusted, so both are `null`; the remaining
-reasons other than the two below fall in between and carry only
-`source_fact_id`. The per-fixture diagnostic message cites the exact
-invariant or document section it demonstrates.
+varies by reason, and the fixtures are not uniform within the "in between"
+group: `unknown_schema`, `oversize`, and `invalid_signature` fire before any
+identity could be trusted, so both fields are `null` in those fixtures;
+`unauthorized_scope`, `duplicate_position`, and `unknown_representation_version`
+carry only `source_fact_id`; `redaction_failure` carries both
+`source_fact_id` and `representation_key` (validate() only requires
+`diagnostic.redaction_required`, but this particular fixture happens to have
+both identity links derivable too); and `integrity_collision` /
+`preimage_disagreement` require both, enforced below. The per-fixture
+diagnostic message cites the exact invariant or document section it
+demonstrates.
 
 Two of these presence rules are not just convention: `validate()` enforces
 them and fails closed on a violation (`QuarantineRecordV1::
@@ -109,23 +123,43 @@ from its own preimage, because there is no field for it to diverge from.
 
 A quarantined delivery is resolved only by a new accepted event under a
 corrected representation, linked back to this record only through
-`source_fact_id` when one was recorded. `QuarantineRecordV1` and its durable
-`QuarantinedDeliveryV1` wrapper expose no `&mut self` method and no setter:
-there is no API surface with which to edit a reason, diagnostic, or any
-other field of an existing record.
+`source_fact_id` when one was recorded. The seal for this rule lives on
+`QuarantinedDeliveryV1`, the *durable* dead-letter form — mirroring
+`remember_v2::AdmittedRememberStatementV2` — which has a private field, no
+production constructor at this contract-only stage, no `&mut self` method,
+and no setter of any kind: once a rejection is durable there is no API
+surface with which to edit its reason, diagnostic, or any other field.
+
+`QuarantineRecordV1` itself is *not* sealed this way, and is not claimed to
+be: like every other pre-admission candidate value type in this crate (for
+example `remember_v2::RememberIngressCandidateV2`), every one of its twelve
+fields is `pub`, so it is freely constructible and mutable in-process —
+`record.reason = ...` and `record.diagnostic.message = ...` compile and are
+exercised by this module's own tests before a record is validated and
+wrapped. That is expected and consistent with the rest of the crate: the
+resolution rule is about what can happen to a record *once it is durable*,
+which is exactly the boundary `QuarantinedDeliveryV1` enforces.
 
 ## The "cannot become an accepted event or projection input" proof
 
 `QuarantinedDeliveryV1`'s field is private, mirroring
 `remember_v2::AdmittedRememberStatementV2`: no production constructor exists
 in this contract-only stage, only a `#[cfg(test)]` witness. The
-`NotProjectable` marker trait documents, and a compile-time test checks, the
-narrower and honest claim this module can actually make: neither
-`QuarantineRecordV1` nor `QuarantinedDeliveryV1` implements `From`/`Into` for
-any type in this crate today, and neither exposes a method returning an
-evidence or remember accepted-event type. Rust has no mechanism to forbid a
-future conversion impl in another module; the trait's documentation is the
-reviewer-facing tripwire, not a compiler guarantee.
+`NotProjectable` marker trait names the narrower and honest claim this
+module can actually make — neither `QuarantineRecordV1` nor
+`QuarantinedDeliveryV1` implements `From`/`Into` for any type in this crate
+today, and neither exposes a method returning an evidence or remember
+accepted-event type — and that claim is machine-checked by a source
+self-audit test, `source_self_audit_projectable_types_expose_no_conversion`
+in `quarantine.rs`, which scans the module's own text (excluding comments)
+for exactly those patterns and fails if any appear. A second, separate test,
+`not_projectable_marker_is_implemented`, checks only that both types
+implement the empty marker trait — that one is a shape check, not a
+guarantee check; the self-audit test is what actually enforces the claim.
+Rust still has no mechanism to forbid a future conversion impl written
+against these public types from some other module in the crate; within this
+file, today, "no conversion exists" is compiler-run, not merely
+reviewer-facing.
 
 ## Vectors
 
