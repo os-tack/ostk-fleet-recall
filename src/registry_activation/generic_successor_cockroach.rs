@@ -877,11 +877,14 @@ fn prepare_candidate(
         &authority.target,
         &authority.test_result,
         &authority.principal_binding,
-    )?;
+    )
+    .map_err(map_stale_head)?;
     // The compare-and-swap precondition, restated explicitly against the durable
     // head bytes: package-digest equality is never enough, because `A -> B -> A`
     // returns the same package digest under a new activation ID.
-    verified.require_expected_head(&audited.head)?;
+    verified
+        .require_expected_head(&audited.head)
+        .map_err(map_stale_head)?;
     // The operator's out-of-band expectation must also be the durable head, so a
     // ceremony prepared for one head cannot silently apply to another.
     if audited.head != authority.expected_head {
@@ -1489,6 +1492,15 @@ fn stored_position(row: &PgRow) -> Result<AppendPositionV1> {
         shard,
         committed_offset: stored_contract(CommittedOffsetV1::new(offset))?,
     })
+}
+
+/// A head mismatch is the one closed staleness outcome, not a generic contract
+/// failure: it is exactly the `A -> B -> A` and moved-head case.
+fn map_stale_head(error: ContractError) -> FleetError {
+    match error {
+        ContractError::StaleRegistryHead => FleetError::SuccessorActivationStale,
+        other => FleetError::ControlContract(other),
+    }
 }
 
 fn generic_corrupt(message: impl Into<String>) -> FleetError {

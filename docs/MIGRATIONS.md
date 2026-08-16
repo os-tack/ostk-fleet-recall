@@ -447,6 +447,27 @@ overwrite the genesis row, grant the genesis-activation credential access to
 the three successor tables, or operate the successor CLI with
 migrator/runtime authority.
 
+### Generic `N -> N+1` activation gate (`N >= 1`)
+
+Every generation after the one-time `0 -> 1` step is handled by the separate
+`CockroachGenericSuccessorRepository` and the
+`ostk-registry-generic-successor-activate` workstation CLI. That runtime
+requires the complete successful prefix through 17 and reuses the same
+`fleet_registry_successor_activation` role and the same
+`FLEET_RECALL_SUCCESSOR_*` process namespace; it needs **no new grant**, because
+it touches only relations that role already holds. It has no key bridge: the
+keys that authorize the step are the ones the currently active package
+installed, so the operator supplies that active package as an artifact and the
+repository independently rebuilds the same policy from durable bytes under the
+`registry.activation` control-shard head lock.
+
+Reverting means activating an earlier package digest as a later generation; the
+new activation ID makes it a forward transition and rewrites no prior interval.
+Contested-set recording and contested-set resolution have **no runtime yet** —
+no durable table exists — so the repository fails closed whenever the current
+head is absent, duplicated, or not `active`, and it never selects between rival
+successors.
+
 Run the dedicated secondary Docker RBAC proof before a ceremony:
 
 ```bash
