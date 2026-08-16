@@ -1,4 +1,2446 @@
-//! Discrepancy family/episode fingerprints, episode policy, envelope, lifecycle and verification states (DISC-01..05).
+//! Discrepancy family/episode fingerprints, episode policy, envelope, lifecycle and
+//! verification states.
 //!
-//! Wave-0 stub owned by W0-EPIS; the owning workstream replaces this file.
-//! No runtime authority is implied by an empty module.
+//! Three tiers, mirroring `relation.rs`:
+//!
+//! 1. [`DiscrepancyEnvelopeV1`] — the immutable per-detection identity. Its digest
+//!    preimage never includes lifecycle or verification state, so replaying the same
+//!    detection under a different acknowledge/waive/resolve/dismiss history always
+//!    yields the same [`DiscrepancyFamilyFingerprintV1`] and
+//!    [`DiscrepancyEpisodeFingerprintV1`] (DISC-01, DISC-02; "lifecycle state and
+//!    verification state therefore never define episode identity").
+//! 2. [`DiscrepancyLifecycleEventV1`] — an append-only transition (acknowledge, waive,
+//!    resolve, dismiss, and/or an independent verification update) that names the
+//!    exact episode it applies to (DISC-03, DISC-05, AUTH-03).
+//! 3. [`project_discrepancy_episode`] — a pure, order-independent replay of one
+//!    envelope plus its lifecycle events into a current [`DiscrepancyEpisodeProjectionV1`]
+//!    (REPLAY-01).
+//!
+//! The opening transition that seeds an episode fingerprint is selected by a total
+//! order over `(effective_at, provider_order, source_fact_id)`
+//! ([`OpeningTransitionCandidateV1`]) — never by receipt order. This is deliberately
+//! disjoint from the legacy `same_key_functional_value_v2` conflict identity in
+//! `src/ledger/conflict.rs`: that identity is an integer-keyed
+//! `(tenant_id, project, claim_key, detector)` database row, never a domain-separated
+//! SHA-256 preimage, so no value in either space can collide with or masquerade as a
+//! row in the other. See `contracts/dynamic-memory/v3/discrepancy/README.md`.
+
+use std::fmt;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use super::{
+    ContractError, ContractResult,
+    canonical::encode_canonical,
+    common::{
+        AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId, ProfileReferenceV1,
+        RegistryReferenceV1,
+    },
+    digest::{DigestDomain, Sha256Digest, domain_separated_digest},
+    evidence::{AcceptedEventId, SourceFactId},
+    evidence_v2::RegistryHeadBindingV1,
+    genesis::PropositionModalityV1,
+    identity::ResourceUri,
+};
+
+const DISCREPANCY_SCHEMA_VERSION: u32 = 1;
+const COMPARATOR_LINEAGE_SCHEMA_VERSION: u32 = 1;
+const EPISODE_POLICY_SCHEMA_VERSION: u32 = 1;
+const DISCREPANCY_ENVELOPE_EVENT_KIND: &str = "discrepancy.envelope.accepted";
+const DISCREPANCY_LIFECYCLE_EVENT_KIND: &str = "discrepancy.lifecycle.accepted";
+const MAX_APPLICABILITY_DIMENSIONS: usize = 64;
+const MAX_CONTINUITY_KEY_DIMENSIONS: usize = 32;
+const MAX_EVIDENCE_EVENT_IDS: usize = 256;
+const MAX_IMPLICATED_ACTORS: usize = 64;
+const MAX_MODALITY_COMPATIBILITY_RULES: usize = 16;
+const MAX_RATIONALE_BYTES: usize = 4_096;
+
+macro_rules! fingerprint_newtype {
+    ($name:ident) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(Sha256Digest);
+
+        impl $name {
+            pub const fn from_digest(digest: Sha256Digest) -> Self {
+                Self(digest)
+            }
+
+            pub const fn digest(self) -> Sha256Digest {
+                self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                self.0.serialize(serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                Sha256Digest::deserialize(deserializer).map(Self)
+            }
+        }
+    };
+}
+
+fingerprint_newtype!(DiscrepancyFamilyFingerprintV1);
+fingerprint_newtype!(DiscrepancyEpisodeFingerprintV1);
+fingerprint_newtype!(ComparatorLineageFingerprint);
+fingerprint_newtype!(DiscrepancyEnvelopeId);
+fingerprint_newtype!(DiscrepancyLifecycleEventId);
+
+fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn strictly_sorted_by_dimension(values: &[ApplicabilityDimensionV1]) -> bool {
+    values
+        .windows(2)
+        .all(|pair| pair[0].dimension_id < pair[1].dimension_id)
+}
+
+fn dimension_present(applicability: &[ApplicabilityDimensionV1], id: &ContractId) -> bool {
+    applicability
+        .binary_search_by(|dimension| dimension.dimension_id.cmp(id))
+        .is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// Finding types (lines 640-652 of the architecture doc)
+// ---------------------------------------------------------------------------
+
+/// Closed subtype set for `lifecycle_gap`. New subtypes require a new module
+/// release, never a caller-supplied string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleGapSubtypeV1 {
+    Validation,
+}
+
+/// Closed subtype set for `runtime_nonconformance`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeNonconformanceSubtypeV1 {
+    SloBreach,
+}
+
+/// Closed discrepancy finding-type taxonomy. Unknown wire values fail closed:
+/// there is no catch-all variant, so an unrecognized `kind` is a deserialize
+/// error rather than a silently accepted new category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FindingType {
+    ClaimConflict,
+    ClaimEvidenceContradiction,
+    SpecNonconformance,
+    DocumentationDrift,
+    ProvenanceGap,
+    LifecycleGap {
+        subtype: LifecycleGapSubtypeV1,
+    },
+    RuntimeNonconformance {
+        subtype: RuntimeNonconformanceSubtypeV1,
+    },
+    ConfigurationDrift,
+    ReleaseIntegrityConflict,
+    RegressionCandidate,
+    TelemetryDisagreement,
+}
+
+impl FindingType {
+    /// AUTH-03/DISC-05 separation-of-duty: a claim-conflict waiver's actor may
+    /// not be one of the conflicting claims' own authors. Other finding types
+    /// are not authored propositions in the same sense, so this contract layer
+    /// does not impose the same rule on them.
+    #[must_use]
+    pub const fn requires_waiver_separation_of_duty(self) -> bool {
+        matches!(self, Self::ClaimConflict)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Comparator lineage (PRED-01..05; legacy `same_key_functional_value_v2` is
+// intentionally narrower and is never generalized silently -- doc lines 360-369)
+// ---------------------------------------------------------------------------
+
+/// Closed cardinality algebra a comparator commits to. Legacy
+/// `same_key_functional_value_v2` corresponds only to `Functional`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardinalityAlgebraV1 {
+    Functional,
+    SetValued,
+    ThresholdRatio,
+    FiniteDomainExhaustive,
+}
+
+/// Closed polarity rule: how affirmation/negation combine under this comparator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolarityRuleV1 {
+    AffirmationsConflictOnDistinctValues,
+    AffirmationNegationConflictOnSameValue,
+    NegationsNeverConflict,
+}
+
+/// Closed rule for how the effective interval participates in comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveIntervalRuleV1 {
+    OverlapRequired,
+    ExactMatchRequired,
+}
+
+/// One declared-compatible ordered pair of modalities (PRED-04).
+///
+/// `left <= right` is required so `(Observed, Normative)` and `(Normative,
+/// Observed)` cannot both be registered as distinct rules for the same
+/// unordered pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModalityCompatibilityRuleV1 {
+    pub left: PropositionModalityV1,
+    pub right: PropositionModalityV1,
+}
+
+/// A comparator's exact incompatibility algorithm.
+///
+/// Bound together per doc lines 360-369: cardinality, polarity, modality
+/// compatibility, concrete-applicability requirement, effective-interval rule,
+/// coverage-proof requirement, and version. Changing any field changes the
+/// fingerprint, which is exactly "any change => new lineage."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComparatorLineageV1 {
+    pub schema_version: u32,
+    pub comparator_id: ContractId,
+    pub comparator_version: u32,
+    pub cardinality: CardinalityAlgebraV1,
+    pub polarity_rule: PolarityRuleV1,
+    pub modality_compatibility: Vec<ModalityCompatibilityRuleV1>,
+    pub concrete_applicability_required: bool,
+    pub effective_interval_rule: EffectiveIntervalRuleV1,
+    pub coverage_proof_required: bool,
+}
+
+impl ComparatorLineageV1 {
+    pub fn validate_shape(&self) -> ContractResult<()> {
+        let valid = self.schema_version == COMPARATOR_LINEAGE_SCHEMA_VERSION
+            && self.comparator_version > 0
+            && self.modality_compatibility.len() <= MAX_MODALITY_COMPATIBILITY_RULES
+            && self
+                .modality_compatibility
+                .iter()
+                .all(|rule| rule.left <= rule.right)
+            && strictly_sorted(&self.modality_compatibility);
+        if !valid {
+            return Err(ContractError::Schema("invalid comparator lineage".into()));
+        }
+        Ok(())
+    }
+
+    /// Any field change -- including a bare `comparator_version` bump -- yields a
+    /// different digest, which is the contract's entire notion of "new lineage."
+    pub fn fingerprint(&self) -> ContractResult<ComparatorLineageFingerprint> {
+        self.validate_shape()?;
+        Ok(ComparatorLineageFingerprint::from_digest(
+            domain_separated_digest(DigestDomain::ComparatorLineageV1, &encode_canonical(self)?),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Applicability (APPL-01..03 background: an omitted dimension is `unknown`,
+// never a silent `any`; `any` must be declared explicitly)
+// ---------------------------------------------------------------------------
+
+/// A concrete resource, or an explicitly declared wildcard.
+///
+/// There is no third, implicit "omitted means any" form: omission is modeled
+/// by the dimension's absence from the applicability vector entirely, which
+/// fails closed wherever that dimension is required (see
+/// [`DiscrepancyEnvelopeV1::validate_shape`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "form", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ApplicabilityDimensionValueV1 {
+    Concrete { resource: ResourceUri },
+    Any,
+}
+
+/// One applicability dimension keyed by a registry-controlled dimension ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicabilityDimensionV1 {
+    pub dimension_id: ContractId,
+    pub value: ApplicabilityDimensionValueV1,
+}
+
+// ---------------------------------------------------------------------------
+// Discrepancy family fingerprint (doc lines 1315-1319)
+// ---------------------------------------------------------------------------
+
+/// Preimage for [`DiscrepancyFamilyFingerprintV1`].
+///
+/// Binds tenant/project scope, finding type, canonical subject, predicate +
+/// comparator lineage, expectation identity, normalized applicability target,
+/// and episode-policy version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscrepancyFamilyPreimageV1 {
+    pub schema_version: u32,
+    pub profile: ProfileReferenceV1,
+    pub scope: AuthenticatedProjectScopeV1,
+    pub finding_type: FindingType,
+    pub canonical_subject: ResourceUri,
+    pub predicate: RegistryReferenceV1,
+    pub comparator_lineage_fingerprint: ComparatorLineageFingerprint,
+    pub expectation_policy: RegistryReferenceV1,
+    pub required_applicability_dimension_ids: Vec<ContractId>,
+    pub applicability: Vec<ApplicabilityDimensionV1>,
+    pub episode_policy_version: u32,
+}
+
+impl DiscrepancyFamilyPreimageV1 {
+    /// A required dimension absent from `applicability` fails closed here. It is
+    /// never silently treated as `any`: `any` can only ever come from an
+    /// explicit [`ApplicabilityDimensionValueV1::Any`] entry actually present in
+    /// the vector (APPL-02).
+    pub fn validate_shape(&self) -> ContractResult<()> {
+        self.profile.validate()?;
+        self.predicate.validate()?;
+        self.expectation_policy.validate()?;
+        let valid = self.schema_version == DISCREPANCY_SCHEMA_VERSION
+            && self.required_applicability_dimension_ids.len() <= MAX_APPLICABILITY_DIMENSIONS
+            && strictly_sorted(&self.required_applicability_dimension_ids)
+            && self.applicability.len() <= MAX_APPLICABILITY_DIMENSIONS
+            && strictly_sorted_by_dimension(&self.applicability)
+            && self
+                .required_applicability_dimension_ids
+                .iter()
+                .all(|id| dimension_present(&self.applicability, id))
+            && self.episode_policy_version > 0;
+        if !valid {
+            return Err(ContractError::Schema(
+                "invalid discrepancy family fingerprint preimage".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn fingerprint(&self) -> ContractResult<DiscrepancyFamilyFingerprintV1> {
+        self.validate_shape()?;
+        Ok(DiscrepancyFamilyFingerprintV1::from_digest(
+            domain_separated_digest(DigestDomain::DiscrepancyFamilyV1, &encode_canonical(self)?),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Episode policy V2 (doc lines 1329-1336, 1357-1358)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeWindowingV1 {
+    NonWindowed,
+    Windowed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeOpeningRuleV1 {
+    FirstVerifiedIncompatibleObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeClosingRuleV1 {
+    VerifiedCompatibleSupersessionOrScopeExit,
+}
+
+/// "Material comparator or predicate-schema changes create a new family linked
+/// by supersession" (doc line 1357-1358) is the only registered algorithm today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleChangeBehaviorV1 {
+    NewFamilyLinkedBySupersession,
+}
+
+/// The only registered late-evidence algorithm.
+///
+/// Late evidence is inserted by effective interval, and replay creates
+/// canonical replacement episodes, marking earlier projections superseded
+/// (doc lines 1353-1356).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LateEvidenceBehaviorV1 {
+    EffectiveIntervalReplayWithSupersession,
+}
+
+/// Every discrepancy type registers these per doc lines 1329-1336.
+///
+/// Continuity-key dimensions, opening rule, allowed observation gap,
+/// closing/confirmation rule, rule-change behavior, late-evidence behavior,
+/// and windowed vs non-windowed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EpisodePolicyV2 {
+    pub schema_version: u32,
+    pub policy_id: ContractId,
+    pub version: u32,
+    pub continuity_key_dimension_ids: Vec<ContractId>,
+    pub windowing: EpisodeWindowingV1,
+    pub opening_rule: EpisodeOpeningRuleV1,
+    /// `None` means no observation gap may be bridged: any missing interval ends
+    /// the known observed interval (doc lines 1338-1341).
+    pub allowed_observation_gap_seconds: Option<u64>,
+    pub closing_rule: EpisodeClosingRuleV1,
+    pub rule_change_behavior: RuleChangeBehaviorV1,
+    pub late_evidence_behavior: LateEvidenceBehaviorV1,
+}
+
+impl EpisodePolicyV2 {
+    pub fn validate_shape(&self) -> ContractResult<()> {
+        let valid = self.schema_version == EPISODE_POLICY_SCHEMA_VERSION
+            && self.version > 0
+            && self.continuity_key_dimension_ids.len() <= MAX_CONTINUITY_KEY_DIMENSIONS
+            && strictly_sorted(&self.continuity_key_dimension_ids);
+        if !valid {
+            return Err(ContractError::Schema("invalid episode policy".into()));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Opening transition -- pure total order, never receipt order (doc lines 1321-1327)
+// ---------------------------------------------------------------------------
+
+/// One candidate opening observation.
+///
+/// Field declaration order is the tie-break order: effective time, then
+/// registered provider order, then stable source-fact identity as the final
+/// tie-break -- receipt order never participates because no receipt-order
+/// field exists on this type at all.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpeningTransitionCandidateV1 {
+    pub effective_at: CanonicalTimestamp,
+    pub provider_order: u32,
+    pub source_fact_id: SourceFactId,
+}
+
+/// Select the deterministic opening transition from a candidate set.
+///
+/// The result does not depend on the order candidates are passed in (proven
+/// by `opening_transition_selection_is_receipt_order_independent`).
+pub fn select_opening_transition(
+    candidates: &[OpeningTransitionCandidateV1],
+) -> ContractResult<&OpeningTransitionCandidateV1> {
+    candidates.iter().min().ok_or_else(|| {
+        ContractError::Schema("opening transition selection requires at least one candidate".into())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Discrepancy episode fingerprint (doc lines 1321-1327)
+// ---------------------------------------------------------------------------
+
+/// Preimage for [`DiscrepancyEpisodeFingerprintV1`].
+///
+/// Binds family fingerprint, normalized continuity-key values, the
+/// deterministic opening transition's source-fact identity, and
+/// episode-policy version. Effective time and provider order participate
+/// only in *selecting* the winning candidate, never in the fingerprint
+/// content itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscrepancyEpisodePreimageV1 {
+    pub schema_version: u32,
+    pub family_fingerprint: DiscrepancyFamilyFingerprintV1,
+    pub continuity_key: Vec<ApplicabilityDimensionV1>,
+    pub opening_transition_source_fact_id: SourceFactId,
+    pub episode_policy_version: u32,
+}
+
+impl DiscrepancyEpisodePreimageV1 {
+    pub fn validate_shape(&self) -> ContractResult<()> {
+        let valid = self.schema_version == DISCREPANCY_SCHEMA_VERSION
+            && self.continuity_key.len() <= MAX_CONTINUITY_KEY_DIMENSIONS
+            && strictly_sorted_by_dimension(&self.continuity_key)
+            && self.episode_policy_version > 0;
+        if !valid {
+            return Err(ContractError::Schema(
+                "invalid discrepancy episode fingerprint preimage".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn fingerprint(&self) -> ContractResult<DiscrepancyEpisodeFingerprintV1> {
+        self.validate_shape()?;
+        Ok(DiscrepancyEpisodeFingerprintV1::from_digest(
+            domain_separated_digest(DigestDomain::DiscrepancyEpisodeV1, &encode_canonical(self)?),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Severity, lifecycle state, verification state (doc lines 657-660)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscrepancySeverityV1 {
+    Info,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// "Verification states are `candidate`, `verified`, `refuted`, and
+/// `indeterminate`." (doc line 657) Separate axis from [`LifecycleState`]: it
+/// changes without erasing lifecycle events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationState {
+    Candidate,
+    Verified,
+    Refuted,
+    Indeterminate,
+}
+
+/// "Lifecycle states are `open`, `acknowledged`, `resolved`, `waived`,
+/// `dismissed`, and `superseded`." (doc lines 658-659)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleState {
+    Open,
+    Acknowledged,
+    Resolved,
+    Waived,
+    Dismissed,
+    Superseded,
+}
+
+// ---------------------------------------------------------------------------
+// Discrepancy envelope (doc lines 626-638) -- the immutable per-detection identity
+// ---------------------------------------------------------------------------
+
+/// The generalized discrepancy envelope's immutable identity content.
+///
+/// Lifecycle state, verification state, and acknowledge/waive/resolve times
+/// are deliberately absent: they are rebuilt by [`project_discrepancy_episode`]
+/// over the append-only [`DiscrepancyLifecycleEventV1`] history, so they can
+/// never affect `family_fingerprint` or `episode_fingerprint`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscrepancyEnvelopeV1 {
+    pub schema_version: u32,
+    pub event_kind: ContractId,
+    pub profile: ProfileReferenceV1,
+    pub scope: AuthenticatedProjectScopeV1,
+    pub finding_type: FindingType,
+    pub severity: DiscrepancySeverityV1,
+    pub canonical_subject: ResourceUri,
+    pub predicate: RegistryReferenceV1,
+    pub comparator_lineage_fingerprint: ComparatorLineageFingerprint,
+    pub expectation_policy: RegistryReferenceV1,
+    pub episode_policy: RegistryReferenceV1,
+    pub required_applicability_dimension_ids: Vec<ContractId>,
+    pub applicability: Vec<ApplicabilityDimensionV1>,
+    pub continuity_key_dimension_ids: Vec<ContractId>,
+    pub family_fingerprint: DiscrepancyFamilyFingerprintV1,
+    pub opening_transition: OpeningTransitionCandidateV1,
+    pub episode_fingerprint: DiscrepancyEpisodeFingerprintV1,
+    pub registry: RegistryHeadBindingV1,
+    pub detector: RegistryReferenceV1,
+    pub extractor: Option<RegistryReferenceV1>,
+    pub member_evidence_ids: Vec<AcceptedEventId>,
+    pub supporting_evidence_ids: Vec<AcceptedEventId>,
+    pub opposing_evidence_ids: Vec<AcceptedEventId>,
+    pub coverage_receipt_ids: Vec<AcceptedEventId>,
+    /// Authors/actors implicated by this finding (e.g. the authors of
+    /// conflicting claims). Used to enforce AUTH-03 self-dismissal and DISC-05
+    /// waiver separation-of-duty; never used to grant authority.
+    pub implicated_actor_ids: Vec<ContractId>,
+    pub initial_verification_state: VerificationState,
+    pub detected_at: CanonicalTimestamp,
+    pub effective_from: CanonicalTimestamp,
+    pub effective_until: Option<CanonicalTimestamp>,
+}
+
+impl DiscrepancyEnvelopeV1 {
+    pub fn validate_shape(&self) -> ContractResult<()> {
+        self.profile.validate()?;
+        self.registry.validate_shape()?;
+        self.predicate.validate()?;
+        self.expectation_policy.validate()?;
+        self.episode_policy.validate()?;
+        self.detector.validate()?;
+        if let Some(extractor) = &self.extractor {
+            extractor.validate()?;
+        }
+
+        let structurally_valid = self.schema_version == DISCREPANCY_SCHEMA_VERSION
+            && self.event_kind.as_str() == DISCREPANCY_ENVELOPE_EVENT_KIND
+            && self.required_applicability_dimension_ids.len() <= MAX_APPLICABILITY_DIMENSIONS
+            && strictly_sorted(&self.required_applicability_dimension_ids)
+            && self.applicability.len() <= MAX_APPLICABILITY_DIMENSIONS
+            && strictly_sorted_by_dimension(&self.applicability)
+            && self
+                .required_applicability_dimension_ids
+                .iter()
+                .all(|id| dimension_present(&self.applicability, id))
+            && self.continuity_key_dimension_ids.len() <= MAX_CONTINUITY_KEY_DIMENSIONS
+            && strictly_sorted(&self.continuity_key_dimension_ids)
+            && self
+                .continuity_key_dimension_ids
+                .iter()
+                .all(|id| dimension_present(&self.applicability, id))
+            && !self.member_evidence_ids.is_empty()
+            && self.member_evidence_ids.len() <= MAX_EVIDENCE_EVENT_IDS
+            && strictly_sorted(&self.member_evidence_ids)
+            && !self.supporting_evidence_ids.is_empty()
+            && self.supporting_evidence_ids.len() <= MAX_EVIDENCE_EVENT_IDS
+            && strictly_sorted(&self.supporting_evidence_ids)
+            && self.opposing_evidence_ids.len() <= MAX_EVIDENCE_EVENT_IDS
+            && strictly_sorted(&self.opposing_evidence_ids)
+            && self.coverage_receipt_ids.len() <= MAX_EVIDENCE_EVENT_IDS
+            && strictly_sorted(&self.coverage_receipt_ids)
+            && self.implicated_actor_ids.len() <= MAX_IMPLICATED_ACTORS
+            && strictly_sorted(&self.implicated_actor_ids)
+            && self
+                .effective_until
+                .as_ref()
+                .is_none_or(|until| until > &self.effective_from);
+        if !structurally_valid {
+            return Err(ContractError::Schema("invalid discrepancy envelope".into()));
+        }
+
+        if self.family_fingerprint != self.compute_family_fingerprint()? {
+            return Err(ContractError::Schema(
+                "envelope family fingerprint does not match its own fields".into(),
+            ));
+        }
+        if self.episode_fingerprint != self.compute_episode_fingerprint()? {
+            return Err(ContractError::Schema(
+                "envelope episode fingerprint does not match its own fields".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn compute_family_fingerprint(&self) -> ContractResult<DiscrepancyFamilyFingerprintV1> {
+        DiscrepancyFamilyPreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: self.profile.clone(),
+            scope: self.scope.clone(),
+            finding_type: self.finding_type,
+            canonical_subject: self.canonical_subject.clone(),
+            predicate: self.predicate.clone(),
+            comparator_lineage_fingerprint: self.comparator_lineage_fingerprint,
+            expectation_policy: self.expectation_policy.clone(),
+            required_applicability_dimension_ids: self.required_applicability_dimension_ids.clone(),
+            applicability: self.applicability.clone(),
+            episode_policy_version: self.episode_policy.version,
+        }
+        .fingerprint()
+    }
+
+    fn continuity_key(&self) -> Vec<ApplicabilityDimensionV1> {
+        self.continuity_key_dimension_ids
+            .iter()
+            .filter_map(|id| {
+                self.applicability
+                    .iter()
+                    .find(|dimension| &dimension.dimension_id == id)
+                    .cloned()
+            })
+            .collect()
+    }
+
+    fn compute_episode_fingerprint(&self) -> ContractResult<DiscrepancyEpisodeFingerprintV1> {
+        DiscrepancyEpisodePreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            family_fingerprint: self.compute_family_fingerprint()?,
+            continuity_key: self.continuity_key(),
+            opening_transition_source_fact_id: self.opening_transition.source_fact_id,
+            episode_policy_version: self.episode_policy.version,
+        }
+        .fingerprint()
+    }
+
+    pub fn envelope_id(&self) -> ContractResult<DiscrepancyEnvelopeId> {
+        self.validate_shape()?;
+        Ok(DiscrepancyEnvelopeId::from_digest(domain_separated_digest(
+            DigestDomain::DiscrepancyEnvelopeV1,
+            &encode_canonical(self)?,
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle events, waivers, dismissals (DISC-03, DISC-05, AUTH-03)
+// ---------------------------------------------------------------------------
+
+/// Server-bound actor identity, descriptive until trusted admission proves it
+/// from credential context (matches `RememberActorV2`'s convention).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscrepancyActorV1 {
+    pub principal_id: ContractId,
+}
+
+/// Closed waiver reason taxonomy (DISC-05: "explicit, attributed, scoped").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaiverReasonKindV1 {
+    CapacityDeferred,
+    CostExceedsRisk,
+    UpstreamBlocked,
+    PolicyException,
+    ScheduledRemediation,
+}
+
+/// Signed-lifecycle-event shape for a waiver (DISC-05).
+///
+/// `actor` and `expiry_at` are mandatory fields, not `Option`, so "waiver
+/// without actor" and "waiver without expiry" cannot even be constructed by a
+/// well-typed caller; wire input omitting either fails to deserialize at all
+/// under `deny_unknown_fields`. `review_by` is the softer, optional companion
+/// checkpoint distinct from the hard `expiry_at`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaiverRecordV1 {
+    pub actor: DiscrepancyActorV1,
+    pub reason_kind: WaiverReasonKindV1,
+    pub rationale: String,
+    /// Empty means the waiver applies to the full episode applicability; a
+    /// non-empty scope narrows it. It never widens or erases the underlying
+    /// incompatible interval (DISC-05, DISC-03).
+    pub applicability_scope: Vec<ApplicabilityDimensionV1>,
+    pub expiry_at: CanonicalTimestamp,
+    pub review_by: Option<CanonicalTimestamp>,
+}
+
+impl WaiverRecordV1 {
+    pub fn validate_shape(&self) -> ContractResult<()> {
+        let valid = !self.rationale.trim().is_empty()
+            && self.rationale.len() <= MAX_RATIONALE_BYTES
+            && self.applicability_scope.len() <= MAX_APPLICABILITY_DIMENSIONS
+            && strictly_sorted_by_dimension(&self.applicability_scope)
+            && self
+                .review_by
+                .as_ref()
+                .is_none_or(|review_by| review_by <= &self.expiry_at);
+        if !valid {
+            return Err(ContractError::Schema("invalid waiver record".into()));
+        }
+        Ok(())
+    }
+}
+
+/// Closed dismissal reason taxonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DismissalReasonKindV1 {
+    FalsePositive,
+    DuplicateOfOtherEpisode,
+    OutOfScope,
+    NotReproducible,
+}
+
+/// A structured dismissal reason. `rationale` must be non-empty: "dismiss
+/// without justification" fails [`DiscrepancyLifecycleEventV1::validate_shape`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DismissalReasonV1 {
+    pub kind: DismissalReasonKindV1,
+    pub rationale: String,
+}
+
+impl DismissalReasonV1 {
+    fn validate_shape(&self) -> ContractResult<()> {
+        if self.rationale.trim().is_empty() || self.rationale.len() > MAX_RATIONALE_BYTES {
+            return Err(ContractError::Schema(
+                "dismissal requires a non-empty, bounded rationale".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Closed lifecycle transition taxonomy. Exactly one may be carried per
+/// [`DiscrepancyLifecycleEventV1`] (or none, if the event carries only a
+/// verification update).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transition", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LifecycleTransitionV1 {
+    Acknowledge {
+        actor: DiscrepancyActorV1,
+    },
+    Waive {
+        waiver: WaiverRecordV1,
+    },
+    /// DISC-03: resolution appends evidence. `resolution_evidence_ids` must be
+    /// non-empty -- a resolution with no cited evidence is rejected.
+    Resolve {
+        actor: DiscrepancyActorV1,
+        resolution_evidence_ids: Vec<AcceptedEventId>,
+    },
+    Dismiss {
+        actor: DiscrepancyActorV1,
+        reason: DismissalReasonV1,
+    },
+}
+
+/// Append-only discrepancy lifecycle transition, targeting one exact episode.
+///
+/// It contains no storage locator, receipt clock, epoch, shard, offset, or
+/// append-chain field: physical append order can never affect projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscrepancyLifecycleEventV1 {
+    pub schema_version: u32,
+    pub event_kind: ContractId,
+    pub profile: ProfileReferenceV1,
+    pub scope: AuthenticatedProjectScopeV1,
+    pub episode_fingerprint: DiscrepancyEpisodeFingerprintV1,
+    pub effective_at: CanonicalTimestamp,
+    /// Independent of `lifecycle_transition`: verification state "changes
+    /// without erasing lifecycle events" (doc line 665).
+    pub verification_update: Option<VerificationState>,
+    pub lifecycle_transition: Option<LifecycleTransitionV1>,
+    pub evidence_event_ids: Vec<AcceptedEventId>,
+}
+
+impl DiscrepancyLifecycleEventV1 {
+    pub fn validate_shape(&self) -> ContractResult<()> {
+        self.profile.validate()?;
+        if let Some(LifecycleTransitionV1::Waive { waiver }) = &self.lifecycle_transition {
+            waiver.validate_shape()?;
+        }
+        if let Some(LifecycleTransitionV1::Dismiss { reason, .. }) = &self.lifecycle_transition {
+            reason.validate_shape()?;
+        }
+
+        let resolution_evidence_valid = match &self.lifecycle_transition {
+            Some(LifecycleTransitionV1::Resolve {
+                resolution_evidence_ids,
+                ..
+            }) => {
+                !resolution_evidence_ids.is_empty()
+                    && resolution_evidence_ids.len() <= MAX_EVIDENCE_EVENT_IDS
+                    && strictly_sorted(resolution_evidence_ids)
+            }
+            _ => true,
+        };
+
+        let valid = self.schema_version == DISCREPANCY_SCHEMA_VERSION
+            && self.event_kind.as_str() == DISCREPANCY_LIFECYCLE_EVENT_KIND
+            && self.evidence_event_ids.len() <= MAX_EVIDENCE_EVENT_IDS
+            && strictly_sorted(&self.evidence_event_ids)
+            && (self.verification_update.is_some() || self.lifecycle_transition.is_some())
+            && resolution_evidence_valid;
+        if !valid {
+            return Err(ContractError::Schema(
+                "invalid discrepancy lifecycle event".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn lifecycle_event_id(&self) -> ContractResult<DiscrepancyLifecycleEventId> {
+        self.validate_shape()?;
+        Ok(DiscrepancyLifecycleEventId::from_digest(
+            domain_separated_digest(
+                DigestDomain::DiscrepancyLifecycleEventV1,
+                &encode_canonical(self)?,
+            ),
+        ))
+    }
+}
+
+/// Authorize one lifecycle event against its target envelope.
+///
+/// The episode must match, a dismiss actor may not be self-implicated
+/// (AUTH-03), and a claim-conflict waiver actor may not be the conflicted
+/// claim author (DISC-05 separation of duty).
+pub fn authorize_lifecycle_transition(
+    envelope: &DiscrepancyEnvelopeV1,
+    event: &DiscrepancyLifecycleEventV1,
+) -> ContractResult<()> {
+    // `implicated_actor_ids` must be proven sorted before `binary_search` below
+    // can be trusted.
+    envelope.validate_shape()?;
+    event.validate_shape()?;
+    if event.episode_fingerprint != envelope.episode_fingerprint {
+        return Err(ContractError::Schema(
+            "lifecycle event targets a different episode than its envelope".into(),
+        ));
+    }
+    if let Some(transition) = &event.lifecycle_transition {
+        match transition {
+            LifecycleTransitionV1::Dismiss { actor, .. } => {
+                if envelope
+                    .implicated_actor_ids
+                    .binary_search(&actor.principal_id)
+                    .is_ok()
+                {
+                    return Err(ContractError::Schema(
+                        "AUTH-03: an implicated actor cannot dismiss their own discrepancy".into(),
+                    ));
+                }
+            }
+            LifecycleTransitionV1::Waive { waiver } => {
+                if envelope.finding_type.requires_waiver_separation_of_duty()
+                    && envelope
+                        .implicated_actor_ids
+                        .binary_search(&waiver.actor.principal_id)
+                        .is_ok()
+                {
+                    return Err(ContractError::Schema(
+                        "separation of duty: waiver actor is a conflicted claim author".into(),
+                    ));
+                }
+            }
+            LifecycleTransitionV1::Acknowledge { .. } | LifecycleTransitionV1::Resolve { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Episode relations: combined_from / continues / possibly_continues / superseded
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeRelationKindV1 {
+    CombinedFrom,
+    Continues,
+    PossiblyContinues,
+    Superseded,
+}
+
+/// An explicit, non-destructive relation between episodes. `combined_from`
+/// requires at least two sources; the other kinds require exactly one. The
+/// target may never also appear as one of its own sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscrepancyEpisodeRelationV1 {
+    pub schema_version: u32,
+    pub kind: EpisodeRelationKindV1,
+    pub from_episodes: Vec<DiscrepancyEpisodeFingerprintV1>,
+    pub to_episode: DiscrepancyEpisodeFingerprintV1,
+}
+
+impl DiscrepancyEpisodeRelationV1 {
+    pub fn validate_shape(&self) -> ContractResult<()> {
+        let arity_valid = match self.kind {
+            EpisodeRelationKindV1::CombinedFrom => self.from_episodes.len() >= 2,
+            EpisodeRelationKindV1::Continues
+            | EpisodeRelationKindV1::PossiblyContinues
+            | EpisodeRelationKindV1::Superseded => self.from_episodes.len() == 1,
+        };
+        let valid = self.schema_version == DISCREPANCY_SCHEMA_VERSION
+            && arity_valid
+            && strictly_sorted(&self.from_episodes)
+            && !self.from_episodes.contains(&self.to_episode);
+        if !valid {
+            return Err(ContractError::Schema(
+                "invalid discrepancy episode relation".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure replay projection (REPLAY-01, DISC-03)
+// ---------------------------------------------------------------------------
+
+/// Rebuildable current state of one episode.
+///
+/// Lifecycle state, verification state, and (if waived, even after expiry)
+/// the waiver context. Deliberately `Serialize`-only, like
+/// `RelationProjectionV1`: it is a server-derived projection, not
+/// authority-bearing wire input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiscrepancyEpisodeProjectionV1 {
+    pub episode_fingerprint: DiscrepancyEpisodeFingerprintV1,
+    pub lifecycle_state: LifecycleState,
+    pub verification_state: VerificationState,
+    /// Populated whenever a waiver has ever been applied, including after its
+    /// expiry has reopened the episode -- surfacing keeps its waiver context.
+    pub active_waiver: Option<WaiverRecordV1>,
+    pub acknowledged_at: Option<CanonicalTimestamp>,
+    pub waived_at: Option<CanonicalTimestamp>,
+    pub resolved_at: Option<CanonicalTimestamp>,
+    pub resolution_evidence_ids: Vec<AcceptedEventId>,
+    pub applied_event_count: usize,
+}
+
+/// Deterministically replay one envelope's lifecycle events into current state.
+///
+/// Events are ordered by `(effective_at, canonical event bytes)`, never by
+/// input `Vec` position, so passing the same events in a different order always
+/// yields an identical result (REPLAY-01). `evaluation_time` is a pure input: a
+/// waiver whose `expiry_at` has passed returns the lifecycle state to `open`
+/// without erasing or splitting the underlying interval and without discarding
+/// the waiver context (DISC-05, DISC-03).
+pub fn project_discrepancy_episode(
+    envelope: &DiscrepancyEnvelopeV1,
+    events: &[DiscrepancyLifecycleEventV1],
+    evaluation_time: &CanonicalTimestamp,
+) -> ContractResult<DiscrepancyEpisodeProjectionV1> {
+    envelope.validate_shape()?;
+    for event in events {
+        authorize_lifecycle_transition(envelope, event)?;
+    }
+
+    let mut ordered: Vec<(&DiscrepancyLifecycleEventV1, Vec<u8>)> = events
+        .iter()
+        .map(|event| Ok((event, encode_canonical(event)?)))
+        .collect::<ContractResult<_>>()?;
+    ordered.sort_by(|(left_event, left_bytes), (right_event, right_bytes)| {
+        left_event
+            .effective_at
+            .cmp(&right_event.effective_at)
+            .then_with(|| left_bytes.cmp(right_bytes))
+    });
+
+    let mut state = DiscrepancyEpisodeProjectionV1 {
+        episode_fingerprint: envelope.episode_fingerprint,
+        lifecycle_state: LifecycleState::Open,
+        verification_state: envelope.initial_verification_state,
+        active_waiver: None,
+        acknowledged_at: None,
+        waived_at: None,
+        resolved_at: None,
+        resolution_evidence_ids: Vec::new(),
+        applied_event_count: 0,
+    };
+
+    for (event, _) in ordered {
+        if let Some(update) = event.verification_update {
+            state.verification_state = update;
+        }
+        match &event.lifecycle_transition {
+            Some(LifecycleTransitionV1::Acknowledge { .. }) => {
+                if state.lifecycle_state == LifecycleState::Open {
+                    state.lifecycle_state = LifecycleState::Acknowledged;
+                }
+                state
+                    .acknowledged_at
+                    .get_or_insert_with(|| event.effective_at.clone());
+            }
+            Some(LifecycleTransitionV1::Waive { waiver }) => {
+                state.lifecycle_state = LifecycleState::Waived;
+                state.waived_at = Some(event.effective_at.clone());
+                state.active_waiver = Some(waiver.clone());
+            }
+            Some(LifecycleTransitionV1::Resolve {
+                resolution_evidence_ids,
+                ..
+            }) => {
+                state.lifecycle_state = LifecycleState::Resolved;
+                state.resolved_at = Some(event.effective_at.clone());
+                state
+                    .resolution_evidence_ids
+                    .clone_from(resolution_evidence_ids);
+            }
+            Some(LifecycleTransitionV1::Dismiss { .. }) => {
+                state.lifecycle_state = LifecycleState::Dismissed;
+            }
+            None => {}
+        }
+        state.applied_event_count += 1;
+    }
+
+    // Waiver expiry is a pure function of `evaluation_time`, not a stored event:
+    // it never rewrites the interval and never discards the waiver context; it
+    // only returns the still-continuing episode to `open`.
+    if state.lifecycle_state == LifecycleState::Waived
+        && let Some(waiver) = &state.active_waiver
+        && &waiver.expiry_at <= evaluation_time
+    {
+        state.lifecycle_state = LifecycleState::Open;
+    }
+
+    Ok(state)
+}
+
+/// A family with at least `threshold` waivers is a drift signal, not a
+/// verified finding.
+///
+/// The return type structurally cannot express `Verified` -- nomination is
+/// always `candidate_only`, no matter how large `waiver_count` grows (PRED-01:
+/// similarity/pattern signals cannot open a verified discrepancy on their
+/// own).
+pub fn nominate_repeated_waiver_drift(
+    waiver_count: usize,
+    threshold: usize,
+) -> ContractResult<Option<VerificationState>> {
+    if threshold == 0 {
+        return Err(ContractError::Schema(
+            "repeated-waiver drift threshold must be positive".into(),
+        ));
+    }
+    Ok((waiver_count >= threshold).then_some(VerificationState::Candidate))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path, str::FromStr};
+
+    use sha2::{Digest as _, Sha256};
+
+    use super::*;
+    use crate::memory_contracts::{
+        canonical::{decode_strict, require_canonical},
+        common::frozen_profile_reference_v1,
+        identity::IdentityForm,
+        registry::RegistryHeadV1,
+    };
+
+    const ENVELOPE_FIXTURE: &[u8] =
+        include_bytes!("../../contracts/dynamic-memory/v3/discrepancy/discrepancy-envelope.jsonl");
+    const COMPARATOR_LINEAGE_FIXTURE: &[u8] =
+        include_bytes!("../../contracts/dynamic-memory/v3/discrepancy/comparator-lineage.jsonl");
+    const EPISODE_POLICY_FIXTURE: &[u8] =
+        include_bytes!("../../contracts/dynamic-memory/v3/discrepancy/episode-policy.jsonl");
+    const LIFECYCLE_ACKNOWLEDGE_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/discrepancy/lifecycle-event-acknowledge.jsonl"
+    );
+    const LIFECYCLE_WAIVE_FIXTURE: &[u8] =
+        include_bytes!("../../contracts/dynamic-memory/v3/discrepancy/lifecycle-event-waive.jsonl");
+    const LIFECYCLE_RESOLVE_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/discrepancy/lifecycle-event-resolve.jsonl"
+    );
+    const LIFECYCLE_DISMISS_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/discrepancy/lifecycle-event-dismiss.jsonl"
+    );
+    const EPISODE_RELATION_SPLIT_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/discrepancy/episode-relation-superseded-split.jsonl"
+    );
+    const EPISODE_RELATION_COMBINED_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/discrepancy/episode-relation-combined-from.jsonl"
+    );
+    const VECTOR_SUITE_FIXTURE: &[u8] =
+        include_bytes!("../../contracts/dynamic-memory/v3/discrepancy/vector-suite.jsonl");
+
+    const FAMILY_FINGERPRINT: &str =
+        "2a0e121fcd2b26621670f810a213e72d91a4a3084c2314ff7811b105cc9c6374";
+    const EPISODE_FINGERPRINT: &str =
+        "41dc523d985324bbb4c268eb7b0f814547caa8250180274703107487d46e246d";
+    const ENVELOPE_ID: &str = "91d220c7d6e869f8cdd10b5d6c3b50d8546b69cfd33403abadcaf1d6e1be756b";
+    const COMPARATOR_LINEAGE_FINGERPRINT: &str =
+        "11589b382071ef9df593ef7efe4df898f2ad4ed8e1775a011d4ec3912a5116d2";
+    const VECTOR_SUITE_DIGEST: &str =
+        "22ad2ee2c68b237de122311187905b9a57d28c7116c9d31c07e786269b72521f";
+
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DiscrepancyVectorSuiteV1 {
+        schema_version: u32,
+        fixture_authority: String,
+        envelope_path: String,
+        envelope_id: DiscrepancyEnvelopeId,
+        family_fingerprint: DiscrepancyFamilyFingerprintV1,
+        episode_fingerprint: DiscrepancyEpisodeFingerprintV1,
+        comparator_lineage_path: String,
+        comparator_lineage_fingerprint: ComparatorLineageFingerprint,
+        episode_policy_path: String,
+        lifecycle_acknowledge_path: String,
+        lifecycle_waive_path: String,
+        lifecycle_resolve_path: String,
+        lifecycle_dismiss_path: String,
+        episode_relation_split_path: String,
+        episode_relation_combined_path: String,
+        negative_cases: Vec<String>,
+    }
+
+    fn record(artifact: &'static [u8]) -> &'static [u8] {
+        let body = artifact
+            .strip_suffix(b"\n")
+            .expect("contract artifact must have one repository-framing LF");
+        assert!(!body.ends_with(b"\n"));
+        assert!(!body.contains(&b'\r'));
+        body
+    }
+
+    fn digest(value: &str) -> Sha256Digest {
+        Sha256Digest::from_str(value).unwrap()
+    }
+
+    fn raw_sha256(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn scope() -> AuthenticatedProjectScopeV1 {
+        AuthenticatedProjectScopeV1::from_trusted_context(
+            ContractId::new("tenant.fixture").unwrap(),
+            ContractId::new("project.fixture").unwrap(),
+        )
+    }
+
+    fn registry_binding() -> RegistryHeadBindingV1 {
+        RegistryHeadBindingV1 {
+            head: RegistryHeadV1 {
+                activation_id: digest(
+                    "5a7263f5c98e75b94e82341d2a7729e9578d4691691b5a8401e1c37a83931261",
+                ),
+                package_digest: digest(
+                    "5a931fd5551bec47f83adb019f3e794d1b6a759f4501e7ea26a83076d9518177",
+                ),
+                activation_policy_digest: digest(
+                    "6f92f99ff35969845f08f9b64cee7d86fa42dc6165ebc617d950be8960b86968",
+                ),
+            },
+            effective_from: CanonicalTimestamp::parse("2026-08-15T04:00:00.000000000Z").unwrap(),
+            effective_until: None,
+        }
+    }
+
+    fn reference(id: &str, digest_value: &str) -> RegistryReferenceV1 {
+        RegistryReferenceV1 {
+            entry_id: ContractId::new(id).unwrap(),
+            version: 1,
+            entry_digest: digest(digest_value),
+        }
+    }
+
+    fn resource(identity_form: IdentityForm, kind: &str, digit: char) -> ResourceUri {
+        format!(
+            "urn:ostk:{}:v1:{kind}:sha256:{}",
+            identity_form.as_str(),
+            digit.to_string().repeat(64)
+        )
+        .parse()
+        .unwrap()
+    }
+
+    fn source_fact_id(digit: char) -> SourceFactId {
+        SourceFactId::from_digest(digest(&digit.to_string().repeat(64)))
+    }
+
+    fn evidence_id(digit: char) -> AcceptedEventId {
+        AcceptedEventId::from_digest(digest(&digit.to_string().repeat(64)))
+    }
+
+    fn comparator_lineage() -> ComparatorLineageV1 {
+        ComparatorLineageV1 {
+            schema_version: 1,
+            comparator_id: ContractId::new("comparator.exact_value_v1").unwrap(),
+            comparator_version: 1,
+            cardinality: CardinalityAlgebraV1::Functional,
+            polarity_rule: PolarityRuleV1::AffirmationNegationConflictOnSameValue,
+            modality_compatibility: vec![ModalityCompatibilityRuleV1 {
+                left: PropositionModalityV1::Attested,
+                right: PropositionModalityV1::Normative,
+            }],
+            concrete_applicability_required: true,
+            effective_interval_rule: EffectiveIntervalRuleV1::OverlapRequired,
+            coverage_proof_required: false,
+        }
+    }
+
+    fn episode_policy() -> EpisodePolicyV2 {
+        EpisodePolicyV2 {
+            schema_version: 1,
+            policy_id: ContractId::new("episode.non_windowed_state_v1").unwrap(),
+            version: 1,
+            continuity_key_dimension_ids: vec![ContractId::new("runtime_environment").unwrap()],
+            windowing: EpisodeWindowingV1::NonWindowed,
+            opening_rule: EpisodeOpeningRuleV1::FirstVerifiedIncompatibleObservation,
+            allowed_observation_gap_seconds: Some(3_600),
+            closing_rule: EpisodeClosingRuleV1::VerifiedCompatibleSupersessionOrScopeExit,
+            rule_change_behavior: RuleChangeBehaviorV1::NewFamilyLinkedBySupersession,
+            late_evidence_behavior: LateEvidenceBehaviorV1::EffectiveIntervalReplayWithSupersession,
+        }
+    }
+
+    fn applicability() -> Vec<ApplicabilityDimensionV1> {
+        vec![
+            ApplicabilityDimensionV1 {
+                dimension_id: ContractId::new("repository_commit").unwrap(),
+                value: ApplicabilityDimensionValueV1::Concrete {
+                    resource: resource(IdentityForm::Version, "commit", '3'),
+                },
+            },
+            ApplicabilityDimensionV1 {
+                dimension_id: ContractId::new("runtime_environment").unwrap(),
+                value: ApplicabilityDimensionValueV1::Concrete {
+                    resource: resource(IdentityForm::Entity, "environment", '4'),
+                },
+            },
+        ]
+    }
+
+    fn envelope() -> DiscrepancyEnvelopeV1 {
+        let lineage_fingerprint = comparator_lineage().fingerprint().unwrap();
+        let opening_transition = OpeningTransitionCandidateV1 {
+            effective_at: CanonicalTimestamp::parse("2026-08-15T04:05:00.000000000Z").unwrap(),
+            provider_order: 0,
+            source_fact_id: source_fact_id('5'),
+        };
+        let required_applicability_dimension_ids =
+            vec![ContractId::new("runtime_environment").unwrap()];
+        let continuity_key_dimension_ids = vec![ContractId::new("runtime_environment").unwrap()];
+        let episode_policy = reference(
+            "episode.non_windowed_state_v1",
+            "7a12f99ff35969845f08f9b64cee7d86fa42dc6165ebc617d950be8960b86999",
+        );
+        let expectation_policy = reference(
+            "policy.database_choice_v1",
+            "d0b7d4e7b630ce599389e50948541e21b4aa24d4d030860f6cfcaf7508d49df4",
+        );
+        let predicate = reference(
+            "predicate.database_choice_v1",
+            "36660875b3d71595ccb4b5dfbc17c4c0fe546eec0fa4b8da6a63b17fec074586",
+        );
+        let detector = reference(
+            "detector.claim_conflict_v1",
+            "8a12f99ff35969845f08f9b64cee7d86fa42dc6165ebc617d950be8960b86111",
+        );
+        let family_fingerprint = DiscrepancyFamilyPreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            finding_type: FindingType::ClaimConflict,
+            canonical_subject: resource(IdentityForm::Entity, "repository", '1'),
+            predicate: predicate.clone(),
+            comparator_lineage_fingerprint: lineage_fingerprint,
+            expectation_policy: expectation_policy.clone(),
+            required_applicability_dimension_ids: required_applicability_dimension_ids.clone(),
+            applicability: applicability(),
+            episode_policy_version: episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        let episode_fingerprint = DiscrepancyEpisodePreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            family_fingerprint,
+            continuity_key: vec![applicability()[1].clone()],
+            opening_transition_source_fact_id: opening_transition.source_fact_id,
+            episode_policy_version: episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        DiscrepancyEnvelopeV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            event_kind: ContractId::new(DISCREPANCY_ENVELOPE_EVENT_KIND).unwrap(),
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            finding_type: FindingType::ClaimConflict,
+            severity: DiscrepancySeverityV1::Medium,
+            canonical_subject: resource(IdentityForm::Entity, "repository", '1'),
+            predicate,
+            comparator_lineage_fingerprint: lineage_fingerprint,
+            expectation_policy,
+            episode_policy,
+            required_applicability_dimension_ids,
+            applicability: applicability(),
+            continuity_key_dimension_ids,
+            family_fingerprint,
+            opening_transition,
+            episode_fingerprint,
+            registry: registry_binding(),
+            detector,
+            extractor: None,
+            member_evidence_ids: vec![evidence_id('6'), evidence_id('7')],
+            supporting_evidence_ids: vec![evidence_id('8')],
+            opposing_evidence_ids: vec![],
+            coverage_receipt_ids: vec![],
+            implicated_actor_ids: vec![
+                ContractId::new("principal.author_a").unwrap(),
+                ContractId::new("principal.author_b").unwrap(),
+            ],
+            initial_verification_state: VerificationState::Candidate,
+            detected_at: CanonicalTimestamp::parse("2026-08-15T04:06:00.000000000Z").unwrap(),
+            effective_from: CanonicalTimestamp::parse("2026-08-15T04:05:00.000000000Z").unwrap(),
+            effective_until: None,
+        }
+    }
+
+    fn lifecycle_event(
+        episode_fingerprint: DiscrepancyEpisodeFingerprintV1,
+        effective_at: &str,
+        transition: Option<LifecycleTransitionV1>,
+        verification_update: Option<VerificationState>,
+        evidence_digit: char,
+    ) -> DiscrepancyLifecycleEventV1 {
+        DiscrepancyLifecycleEventV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            event_kind: ContractId::new(DISCREPANCY_LIFECYCLE_EVENT_KIND).unwrap(),
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            episode_fingerprint,
+            effective_at: CanonicalTimestamp::parse(effective_at).unwrap(),
+            verification_update,
+            lifecycle_transition: transition,
+            evidence_event_ids: vec![evidence_id(evidence_digit)],
+        }
+    }
+
+    fn acknowledge_event(
+        episode_fingerprint: DiscrepancyEpisodeFingerprintV1,
+    ) -> DiscrepancyLifecycleEventV1 {
+        lifecycle_event(
+            episode_fingerprint,
+            "2026-08-15T05:00:00.000000000Z",
+            Some(LifecycleTransitionV1::Acknowledge {
+                actor: DiscrepancyActorV1 {
+                    principal_id: ContractId::new("principal.on_call").unwrap(),
+                },
+            }),
+            None,
+            '9',
+        )
+    }
+
+    fn waiver_record(actor_id: &str, expiry_at: &str) -> WaiverRecordV1 {
+        WaiverRecordV1 {
+            actor: DiscrepancyActorV1 {
+                principal_id: ContractId::new(actor_id).unwrap(),
+            },
+            reason_kind: WaiverReasonKindV1::CapacityDeferred,
+            rationale: "capacity deferred to next sprint".into(),
+            applicability_scope: vec![],
+            expiry_at: CanonicalTimestamp::parse(expiry_at).unwrap(),
+            review_by: None,
+        }
+    }
+
+    fn waive_event(
+        episode_fingerprint: DiscrepancyEpisodeFingerprintV1,
+        actor_id: &str,
+        expiry_at: &str,
+    ) -> DiscrepancyLifecycleEventV1 {
+        lifecycle_event(
+            episode_fingerprint,
+            "2026-08-15T05:10:00.000000000Z",
+            Some(LifecycleTransitionV1::Waive {
+                waiver: waiver_record(actor_id, expiry_at),
+            }),
+            None,
+            'a',
+        )
+    }
+
+    fn resolve_event(
+        episode_fingerprint: DiscrepancyEpisodeFingerprintV1,
+    ) -> DiscrepancyLifecycleEventV1 {
+        lifecycle_event(
+            episode_fingerprint,
+            "2026-08-15T06:00:00.000000000Z",
+            Some(LifecycleTransitionV1::Resolve {
+                actor: DiscrepancyActorV1 {
+                    principal_id: ContractId::new("principal.on_call").unwrap(),
+                },
+                resolution_evidence_ids: vec![evidence_id('b')],
+            }),
+            None,
+            'b',
+        )
+    }
+
+    fn dismiss_event(
+        episode_fingerprint: DiscrepancyEpisodeFingerprintV1,
+        actor_id: &str,
+    ) -> DiscrepancyLifecycleEventV1 {
+        lifecycle_event(
+            episode_fingerprint,
+            "2026-08-15T05:30:00.000000000Z",
+            Some(LifecycleTransitionV1::Dismiss {
+                actor: DiscrepancyActorV1 {
+                    principal_id: ContractId::new(actor_id).unwrap(),
+                },
+                reason: DismissalReasonV1 {
+                    kind: DismissalReasonKindV1::NotReproducible,
+                    rationale: "unable to reproduce after three attempts".into(),
+                },
+            }),
+            None,
+            'c',
+        )
+    }
+
+    fn episode_relation_split(
+        old_episode: DiscrepancyEpisodeFingerprintV1,
+        new_episode: DiscrepancyEpisodeFingerprintV1,
+    ) -> DiscrepancyEpisodeRelationV1 {
+        DiscrepancyEpisodeRelationV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            kind: EpisodeRelationKindV1::Superseded,
+            from_episodes: vec![old_episode],
+            to_episode: new_episode,
+        }
+    }
+
+    fn episode_relation_combined(
+        first: DiscrepancyEpisodeFingerprintV1,
+        second: DiscrepancyEpisodeFingerprintV1,
+        combined: DiscrepancyEpisodeFingerprintV1,
+    ) -> DiscrepancyEpisodeRelationV1 {
+        let mut from_episodes = vec![first, second];
+        from_episodes.sort();
+        DiscrepancyEpisodeRelationV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            kind: EpisodeRelationKindV1::CombinedFrom,
+            from_episodes,
+            to_episode: combined,
+        }
+    }
+
+    fn negative_cases() -> Vec<String> {
+        [
+            "applicability_duplicate_or_unsorted",
+            "comparator_lineage_version_bump_changes_lineage_fingerprint",
+            "continuity_key_dimension_missing_from_applicability",
+            "dismiss_missing_or_empty_rationale",
+            "envelope_episode_fingerprint_mismatch",
+            "envelope_family_fingerprint_mismatch",
+            "implicated_actor_cannot_dismiss_own_finding",
+            "lifecycle_event_targets_wrong_episode",
+            "lifecycle_event_with_no_transition_or_verification_update",
+            "physical_append_fields_absent",
+            "receipt_order_independent_opening_transition",
+            "repeated_waiver_drift_is_never_verified",
+            "required_applicability_dimension_omitted_is_not_any",
+            "resolve_requires_nonempty_evidence",
+            "self_implicated_waiver_violates_separation_of_duty",
+            "unknown_finding_type",
+            "waiver_missing_actor_or_expiry",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    fn vector_suite() -> DiscrepancyVectorSuiteV1 {
+        let envelope = envelope();
+        DiscrepancyVectorSuiteV1 {
+            schema_version: 1,
+            fixture_authority: "none; structural canonical fixture bytes never prove active registry, actor, or evidence authority".into(),
+            envelope_path: "discrepancy-envelope.jsonl".into(),
+            envelope_id: envelope.envelope_id().unwrap(),
+            family_fingerprint: envelope.family_fingerprint,
+            episode_fingerprint: envelope.episode_fingerprint,
+            comparator_lineage_path: "comparator-lineage.jsonl".into(),
+            comparator_lineage_fingerprint: comparator_lineage().fingerprint().unwrap(),
+            episode_policy_path: "episode-policy.jsonl".into(),
+            lifecycle_acknowledge_path: "lifecycle-event-acknowledge.jsonl".into(),
+            lifecycle_waive_path: "lifecycle-event-waive.jsonl".into(),
+            lifecycle_resolve_path: "lifecycle-event-resolve.jsonl".into(),
+            lifecycle_dismiss_path: "lifecycle-event-dismiss.jsonl".into(),
+            episode_relation_split_path: "episode-relation-superseded-split.jsonl".into(),
+            episode_relation_combined_path: "episode-relation-combined-from.jsonl".into(),
+            negative_cases: negative_cases(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // one exhaustive fixture/digest cross-check, not test logic sprawl
+    fn hard_coded_fixtures_match_canonical_vectors() {
+        for bytes in [
+            ENVELOPE_FIXTURE,
+            COMPARATOR_LINEAGE_FIXTURE,
+            EPISODE_POLICY_FIXTURE,
+            LIFECYCLE_ACKNOWLEDGE_FIXTURE,
+            LIFECYCLE_WAIVE_FIXTURE,
+            LIFECYCLE_RESOLVE_FIXTURE,
+            LIFECYCLE_DISMISS_FIXTURE,
+            EPISODE_RELATION_SPLIT_FIXTURE,
+            EPISODE_RELATION_COMBINED_FIXTURE,
+            VECTOR_SUITE_FIXTURE,
+        ] {
+            require_canonical(record(bytes)).unwrap();
+        }
+
+        let expected_envelope = envelope();
+        assert_eq!(
+            encode_canonical(&expected_envelope).unwrap(),
+            record(ENVELOPE_FIXTURE)
+        );
+        let decoded_envelope: DiscrepancyEnvelopeV1 =
+            decode_strict(record(ENVELOPE_FIXTURE)).unwrap();
+        decoded_envelope.validate_shape().unwrap();
+        assert_eq!(decoded_envelope, expected_envelope);
+
+        let expected_lineage = comparator_lineage();
+        assert_eq!(
+            encode_canonical(&expected_lineage).unwrap(),
+            record(COMPARATOR_LINEAGE_FIXTURE)
+        );
+
+        let expected_policy = episode_policy();
+        assert_eq!(
+            encode_canonical(&expected_policy).unwrap(),
+            record(EPISODE_POLICY_FIXTURE)
+        );
+
+        let episode_fingerprint = expected_envelope.episode_fingerprint;
+        let acknowledge = acknowledge_event(episode_fingerprint);
+        assert_eq!(
+            encode_canonical(&acknowledge).unwrap(),
+            record(LIFECYCLE_ACKNOWLEDGE_FIXTURE)
+        );
+        let waive = waive_event(
+            episode_fingerprint,
+            "principal.on_call",
+            "2026-09-15T00:00:00.000000000Z",
+        );
+        assert_eq!(
+            encode_canonical(&waive).unwrap(),
+            record(LIFECYCLE_WAIVE_FIXTURE)
+        );
+        let resolve = resolve_event(episode_fingerprint);
+        assert_eq!(
+            encode_canonical(&resolve).unwrap(),
+            record(LIFECYCLE_RESOLVE_FIXTURE)
+        );
+        let dismiss = dismiss_event(episode_fingerprint, "principal.on_call");
+        assert_eq!(
+            encode_canonical(&dismiss).unwrap(),
+            record(LIFECYCLE_DISMISS_FIXTURE)
+        );
+
+        let other_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        ));
+        let combined_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        ));
+        let split_relation = episode_relation_split(episode_fingerprint, other_episode);
+        split_relation.validate_shape().unwrap();
+        assert_eq!(
+            encode_canonical(&split_relation).unwrap(),
+            record(EPISODE_RELATION_SPLIT_FIXTURE)
+        );
+        let combined_relation =
+            episode_relation_combined(episode_fingerprint, other_episode, combined_episode);
+        combined_relation.validate_shape().unwrap();
+        assert_eq!(
+            encode_canonical(&combined_relation).unwrap(),
+            record(EPISODE_RELATION_COMBINED_FIXTURE)
+        );
+
+        let expected_suite = vector_suite();
+        assert_eq!(
+            encode_canonical(&expected_suite).unwrap(),
+            record(VECTOR_SUITE_FIXTURE)
+        );
+        let suite: DiscrepancyVectorSuiteV1 = decode_strict(record(VECTOR_SUITE_FIXTURE)).unwrap();
+        assert_eq!(suite, expected_suite);
+        assert!(strictly_sorted(&suite.negative_cases));
+        assert!(suite.fixture_authority.starts_with("none;"));
+
+        assert_eq!(
+            expected_envelope.family_fingerprint.digest(),
+            digest(FAMILY_FINGERPRINT)
+        );
+        assert_eq!(
+            expected_envelope.episode_fingerprint.digest(),
+            digest(EPISODE_FINGERPRINT)
+        );
+        assert_eq!(
+            expected_envelope.envelope_id().unwrap().digest(),
+            digest(ENVELOPE_ID)
+        );
+        assert_eq!(
+            expected_lineage.fingerprint().unwrap().digest(),
+            digest(COMPARATOR_LINEAGE_FINGERPRINT)
+        );
+        assert_eq!(
+            domain_separated_digest(
+                super::super::digest::DigestDomain::TestVectorManifest,
+                record(VECTOR_SUITE_FIXTURE)
+            ),
+            digest(VECTOR_SUITE_DIGEST)
+        );
+    }
+
+    #[test]
+    fn lifecycle_and_verification_never_define_episode_identity() {
+        let first = envelope();
+        let mut second = envelope();
+        second.severity = DiscrepancySeverityV1::Critical;
+        second.detected_at = CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap();
+        second.initial_verification_state = VerificationState::Verified;
+        assert_eq!(first.family_fingerprint, second.family_fingerprint);
+        assert_eq!(first.episode_fingerprint, second.episode_fingerprint);
+
+        let episode_fingerprint = first.episode_fingerprint;
+        let acknowledged = project_discrepancy_episode(
+            &first,
+            &[acknowledge_event(episode_fingerprint)],
+            &CanonicalTimestamp::parse("2026-08-15T05:01:00.000000000Z").unwrap(),
+        )
+        .unwrap();
+        let untouched = project_discrepancy_episode(
+            &first,
+            &[],
+            &CanonicalTimestamp::parse("2026-08-15T05:01:00.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            acknowledged.episode_fingerprint,
+            untouched.episode_fingerprint
+        );
+        assert_ne!(acknowledged.lifecycle_state, untouched.lifecycle_state);
+    }
+
+    #[test]
+    fn late_evidence_that_only_appends_keeps_the_same_episode() {
+        let mut later = envelope();
+        later.detected_at = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap();
+        later.supporting_evidence_ids = vec![evidence_id('8'), evidence_id('9')];
+        assert_eq!(envelope().episode_fingerprint, later.episode_fingerprint);
+        later.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn late_evidence_that_changes_the_opening_transition_creates_a_replacement_episode() {
+        let original = envelope();
+        let mut earlier_evidence = envelope();
+        earlier_evidence.opening_transition = OpeningTransitionCandidateV1 {
+            effective_at: CanonicalTimestamp::parse("2026-08-15T04:00:00.000000000Z").unwrap(),
+            provider_order: 0,
+            source_fact_id: source_fact_id('1'),
+        };
+        earlier_evidence.episode_fingerprint = DiscrepancyEpisodePreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            family_fingerprint: earlier_evidence.family_fingerprint,
+            continuity_key: vec![applicability()[1].clone()],
+            opening_transition_source_fact_id: earlier_evidence.opening_transition.source_fact_id,
+            episode_policy_version: earlier_evidence.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        earlier_evidence.validate_shape().unwrap();
+
+        assert_eq!(
+            original.family_fingerprint,
+            earlier_evidence.family_fingerprint
+        );
+        assert_ne!(
+            original.episode_fingerprint,
+            earlier_evidence.episode_fingerprint
+        );
+
+        // Replay of the union of candidates always selects the earlier one,
+        // matching the replacement episode's opening transition.
+        let candidates = [
+            original.opening_transition.clone(),
+            earlier_evidence.opening_transition.clone(),
+        ];
+        let winner = select_opening_transition(&candidates).unwrap();
+        assert_eq!(winner, &earlier_evidence.opening_transition);
+
+        let replacement = episode_relation_split(
+            original.episode_fingerprint,
+            earlier_evidence.episode_fingerprint,
+        );
+        replacement.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn late_evidence_that_combines_two_episodes_records_combined_from() {
+        let first = envelope();
+        let mut second_source = envelope();
+        second_source.opening_transition.source_fact_id = source_fact_id('2');
+        second_source.episode_fingerprint = DiscrepancyEpisodePreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            family_fingerprint: second_source.family_fingerprint,
+            continuity_key: vec![applicability()[1].clone()],
+            opening_transition_source_fact_id: second_source.opening_transition.source_fact_id,
+            episode_policy_version: second_source.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        assert_ne!(first.episode_fingerprint, second_source.episode_fingerprint);
+
+        let combined = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        ));
+        let relation = episode_relation_combined(
+            first.episode_fingerprint,
+            second_source.episode_fingerprint,
+            combined,
+        );
+        relation.validate_shape().unwrap();
+        assert_eq!(relation.kind, EpisodeRelationKindV1::CombinedFrom);
+        assert_eq!(relation.from_episodes.len(), 2);
+
+        let mut single_source = relation;
+        single_source.from_episodes.truncate(1);
+        assert!(single_source.validate_shape().is_err());
+    }
+
+    #[test]
+    fn recurrence_after_resolved_interval_opens_a_new_episode_in_the_same_family() {
+        let original = envelope();
+        let episode_fingerprint = original.episode_fingerprint;
+        let resolved = project_discrepancy_episode(
+            &original,
+            &[resolve_event(episode_fingerprint)],
+            &CanonicalTimestamp::parse("2026-08-15T06:01:00.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved.lifecycle_state, LifecycleState::Resolved);
+
+        let mut recurrence = envelope();
+        recurrence.opening_transition.source_fact_id = source_fact_id('4');
+        recurrence.detected_at =
+            CanonicalTimestamp::parse("2026-09-01T00:00:00.000000000Z").unwrap();
+        recurrence.effective_from =
+            CanonicalTimestamp::parse("2026-09-01T00:00:00.000000000Z").unwrap();
+        recurrence.episode_fingerprint = DiscrepancyEpisodePreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            family_fingerprint: recurrence.family_fingerprint,
+            continuity_key: vec![applicability()[1].clone()],
+            opening_transition_source_fact_id: recurrence.opening_transition.source_fact_id,
+            episode_policy_version: recurrence.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        recurrence.validate_shape().unwrap();
+
+        assert_eq!(original.family_fingerprint, recurrence.family_fingerprint);
+        assert_ne!(original.episode_fingerprint, recurrence.episode_fingerprint);
+    }
+
+    #[test]
+    fn long_gap_links_a_new_episode_by_possibly_continues() {
+        let stale = envelope();
+        let mut resumed = envelope();
+        resumed.opening_transition.source_fact_id = source_fact_id('9');
+        resumed.episode_fingerprint = DiscrepancyEpisodePreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            family_fingerprint: resumed.family_fingerprint,
+            continuity_key: vec![applicability()[1].clone()],
+            opening_transition_source_fact_id: resumed.opening_transition.source_fact_id,
+            episode_policy_version: resumed.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+
+        let relation = DiscrepancyEpisodeRelationV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            kind: EpisodeRelationKindV1::PossiblyContinues,
+            from_episodes: vec![stale.episode_fingerprint],
+            to_episode: resumed.episode_fingerprint,
+        };
+        relation.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn waiver_does_not_split_or_erase_the_interval_and_expiry_reopens_the_same_episode() {
+        let original_interval = envelope();
+        let envelope = envelope();
+        let episode_fingerprint = envelope.episode_fingerprint;
+        let events = [waive_event(
+            episode_fingerprint,
+            "principal.on_call",
+            "2026-08-20T00:00:00.000000000Z",
+        )];
+
+        let before_expiry = project_discrepancy_episode(
+            &envelope,
+            &events,
+            &CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(before_expiry.lifecycle_state, LifecycleState::Waived);
+        assert!(before_expiry.active_waiver.is_some());
+
+        let after_expiry = project_discrepancy_episode(
+            &envelope,
+            &events,
+            &CanonicalTimestamp::parse("2026-08-21T00:00:00.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after_expiry.lifecycle_state, LifecycleState::Open);
+        // Surfacing keeps the waiver context even after expiry reopens the episode.
+        assert!(after_expiry.active_waiver.is_some());
+        assert_eq!(
+            before_expiry.episode_fingerprint,
+            after_expiry.episode_fingerprint
+        );
+        assert_eq!(envelope.effective_from, original_interval.effective_from);
+        assert_eq!(envelope.effective_until, original_interval.effective_until);
+    }
+
+    #[test]
+    fn rule_change_creates_a_new_family_linked_by_supersession() {
+        let original = envelope();
+        let mut new_comparator = comparator_lineage();
+        new_comparator.comparator_version += 1;
+        let mut changed = envelope();
+        changed.comparator_lineage_fingerprint = new_comparator.fingerprint().unwrap();
+        changed.family_fingerprint = DiscrepancyFamilyPreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: changed.profile.clone(),
+            scope: changed.scope.clone(),
+            finding_type: changed.finding_type,
+            canonical_subject: changed.canonical_subject.clone(),
+            predicate: changed.predicate.clone(),
+            comparator_lineage_fingerprint: changed.comparator_lineage_fingerprint,
+            expectation_policy: changed.expectation_policy.clone(),
+            required_applicability_dimension_ids: changed
+                .required_applicability_dimension_ids
+                .clone(),
+            applicability: changed.applicability.clone(),
+            episode_policy_version: changed.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        changed.episode_fingerprint = DiscrepancyEpisodePreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            family_fingerprint: changed.family_fingerprint,
+            continuity_key: vec![applicability()[1].clone()],
+            opening_transition_source_fact_id: changed.opening_transition.source_fact_id,
+            episode_policy_version: changed.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        changed.validate_shape().unwrap();
+
+        assert_ne!(original.family_fingerprint, changed.family_fingerprint);
+        assert_eq!(
+            episode_policy().rule_change_behavior,
+            RuleChangeBehaviorV1::NewFamilyLinkedBySupersession
+        );
+    }
+
+    #[test]
+    fn detector_upgrade_under_the_same_contract_appends_a_derivation_to_the_same_family() {
+        let original = envelope();
+        let mut upgraded = envelope();
+        upgraded.detector = reference(
+            "detector.claim_conflict_v1",
+            "9a12f99ff35969845f08f9b64cee7d86fa42dc6165ebc617d950be8960b86222",
+        );
+        upgraded.validate_shape().unwrap();
+        assert_eq!(original.family_fingerprint, upgraded.family_fingerprint);
+        assert_eq!(original.episode_fingerprint, upgraded.episode_fingerprint);
+    }
+
+    #[test]
+    fn deployment_during_active_breach_does_not_split_it() {
+        let breach = envelope();
+        // A concurrent, unrelated finding shares no family/episode identity with
+        // the active breach: it cannot split it merely by effective-time overlap.
+        let mut unrelated = envelope();
+        unrelated.finding_type = FindingType::RuntimeNonconformance {
+            subtype: RuntimeNonconformanceSubtypeV1::SloBreach,
+        };
+        unrelated.family_fingerprint = DiscrepancyFamilyPreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: unrelated.profile.clone(),
+            scope: unrelated.scope.clone(),
+            finding_type: unrelated.finding_type,
+            canonical_subject: unrelated.canonical_subject.clone(),
+            predicate: unrelated.predicate.clone(),
+            comparator_lineage_fingerprint: unrelated.comparator_lineage_fingerprint,
+            expectation_policy: unrelated.expectation_policy.clone(),
+            required_applicability_dimension_ids: unrelated
+                .required_applicability_dimension_ids
+                .clone(),
+            applicability: unrelated.applicability.clone(),
+            episode_policy_version: unrelated.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        unrelated.episode_fingerprint = DiscrepancyEpisodePreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            family_fingerprint: unrelated.family_fingerprint,
+            continuity_key: vec![applicability()[1].clone()],
+            opening_transition_source_fact_id: unrelated.opening_transition.source_fact_id,
+            episode_policy_version: unrelated.episode_policy.version,
+        }
+        .fingerprint()
+        .unwrap();
+        unrelated.validate_shape().unwrap();
+        assert_ne!(breach.family_fingerprint, unrelated.family_fingerprint);
+        assert_ne!(breach.episode_fingerprint, unrelated.episode_fingerprint);
+    }
+
+    #[test]
+    fn non_windowed_policy_opens_on_first_incompatible_and_closes_only_on_verified_resolution() {
+        let policy = episode_policy();
+        assert_eq!(policy.windowing, EpisodeWindowingV1::NonWindowed);
+        assert_eq!(
+            policy.opening_rule,
+            EpisodeOpeningRuleV1::FirstVerifiedIncompatibleObservation
+        );
+        assert_eq!(
+            policy.closing_rule,
+            EpisodeClosingRuleV1::VerifiedCompatibleSupersessionOrScopeExit
+        );
+        let envelope = envelope();
+        let untouched = project_discrepancy_episode(
+            &envelope,
+            &[],
+            &CanonicalTimestamp::parse("2026-08-15T04:06:00.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(untouched.lifecycle_state, LifecycleState::Open);
+    }
+
+    #[test]
+    fn opening_transition_selection_is_receipt_order_independent() {
+        let earliest = OpeningTransitionCandidateV1 {
+            effective_at: CanonicalTimestamp::parse("2026-08-15T04:00:00.000000000Z").unwrap(),
+            provider_order: 5,
+            source_fact_id: source_fact_id('1'),
+        };
+        let middle = OpeningTransitionCandidateV1 {
+            effective_at: CanonicalTimestamp::parse("2026-08-15T04:05:00.000000000Z").unwrap(),
+            provider_order: 0,
+            source_fact_id: source_fact_id('2'),
+        };
+        let tie_break_by_provider_order = OpeningTransitionCandidateV1 {
+            effective_at: middle.effective_at.clone(),
+            provider_order: 1,
+            source_fact_id: source_fact_id('3'),
+        };
+        let candidates = [
+            earliest.clone(),
+            middle.clone(),
+            tie_break_by_provider_order.clone(),
+        ];
+        let forward = select_opening_transition(&candidates).unwrap().clone();
+        let reversed: Vec<_> = candidates.iter().rev().cloned().collect();
+        let backward = select_opening_transition(&reversed).unwrap().clone();
+        assert_eq!(forward, backward);
+        assert_eq!(forward, earliest);
+
+        // With effective_at tied, provider_order breaks the tie -- never receipt
+        // position (`middle` is passed after `tie_break_by_provider_order` here).
+        let tie_candidates = [tie_break_by_provider_order, middle.clone()];
+        assert_eq!(select_opening_transition(&tie_candidates).unwrap(), &middle);
+
+        assert!(select_opening_transition(&[]).is_err());
+    }
+
+    #[test]
+    fn family_fingerprint_omits_lifecycle_and_receipt_fields() {
+        let preimage_bytes = encode_canonical(&DiscrepancyFamilyPreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            finding_type: FindingType::ClaimConflict,
+            canonical_subject: resource(IdentityForm::Entity, "repository", '1'),
+            predicate: reference(
+                "predicate.database_choice_v1",
+                "36660875b3d71595ccb4b5dfbc17c4c0fe546eec0fa4b8da6a63b17fec074586",
+            ),
+            comparator_lineage_fingerprint: comparator_lineage().fingerprint().unwrap(),
+            expectation_policy: reference(
+                "policy.database_choice_v1",
+                "d0b7d4e7b630ce599389e50948541e21b4aa24d4d030860f6cfcaf7508d49df4",
+            ),
+            required_applicability_dimension_ids: vec![
+                ContractId::new("runtime_environment").unwrap(),
+            ],
+            applicability: applicability(),
+            episode_policy_version: 1,
+        })
+        .unwrap();
+        let text = std::str::from_utf8(&preimage_bytes).unwrap();
+        for forbidden in [
+            "\"receipt_order\"",
+            "\"lifecycle_state\"",
+            "\"verification_state\"",
+            "\"append_position\"",
+            "\"epoch_id\"",
+            "\"shard\"",
+        ] {
+            assert!(!text.contains(forbidden), "forbidden field {forbidden}");
+        }
+    }
+
+    #[test]
+    fn physical_append_and_lifecycle_fields_are_absent_from_the_lifecycle_event() {
+        let acknowledge = acknowledge_event(envelope().episode_fingerprint);
+        let canonical = encode_canonical(&acknowledge).unwrap();
+        let text = std::str::from_utf8(&canonical).unwrap();
+        for forbidden in [
+            "\"accepted_at\"",
+            "\"append_position\"",
+            "\"epoch_id\"",
+            "\"shard\"",
+            "\"committed_offset\"",
+        ] {
+            assert!(!text.contains(forbidden), "forbidden field {forbidden}");
+        }
+
+        let mut value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "accepted_at".into(),
+            serde_json::Value::String("2026-08-15T05:06:00.000000000Z".into()),
+        );
+        assert!(
+            decode_strict::<DiscrepancyLifecycleEventV1>(&serde_json::to_vec(&value).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn dismiss_requires_nonempty_rationale() {
+        let mut dismiss = dismiss_event(envelope().episode_fingerprint, "principal.on_call");
+        if let Some(LifecycleTransitionV1::Dismiss { reason, .. }) =
+            &mut dismiss.lifecycle_transition
+        {
+            reason.rationale = "   ".into();
+        }
+        assert!(dismiss.validate_shape().is_err());
+    }
+
+    #[test]
+    fn resolve_requires_nonempty_evidence() {
+        let mut resolve = resolve_event(envelope().episode_fingerprint);
+        if let Some(LifecycleTransitionV1::Resolve {
+            resolution_evidence_ids,
+            ..
+        }) = &mut resolve.lifecycle_transition
+        {
+            resolution_evidence_ids.clear();
+        }
+        assert!(resolve.validate_shape().is_err());
+    }
+
+    #[test]
+    fn lifecycle_event_requires_a_transition_or_verification_update() {
+        let mut empty = acknowledge_event(envelope().episode_fingerprint);
+        empty.lifecycle_transition = None;
+        empty.verification_update = None;
+        assert!(empty.validate_shape().is_err());
+
+        let mut only_verification = empty;
+        only_verification.verification_update = Some(VerificationState::Verified);
+        assert!(only_verification.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn lifecycle_event_must_target_the_envelope_episode() {
+        let envelope = envelope();
+        let wrong_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "4444444444444444444444444444444444444444444444444444444444444444",
+        ));
+        let event = acknowledge_event(wrong_episode);
+        assert!(authorize_lifecycle_transition(&envelope, &event).is_err());
+    }
+
+    #[test]
+    fn auth_03_rejects_self_implicated_dismiss() {
+        let envelope = envelope();
+        let self_implicated = dismiss_event(envelope.episode_fingerprint, "principal.author_a");
+        assert!(authorize_lifecycle_transition(&envelope, &self_implicated).is_err());
+
+        let independent = dismiss_event(envelope.episode_fingerprint, "principal.on_call");
+        authorize_lifecycle_transition(&envelope, &independent).unwrap();
+    }
+
+    #[test]
+    fn separation_of_duty_rejects_a_claim_conflict_waiver_from_a_conflicted_author() {
+        let envelope = envelope();
+        assert!(envelope.finding_type.requires_waiver_separation_of_duty());
+        let conflicted_waiver = waive_event(
+            envelope.episode_fingerprint,
+            "principal.author_a",
+            "2026-09-01T00:00:00.000000000Z",
+        );
+        assert!(authorize_lifecycle_transition(&envelope, &conflicted_waiver).is_err());
+
+        let independent_waiver = waive_event(
+            envelope.episode_fingerprint,
+            "principal.on_call",
+            "2026-09-01T00:00:00.000000000Z",
+        );
+        authorize_lifecycle_transition(&envelope, &independent_waiver).unwrap();
+
+        // The same rule does not apply outside claim_conflict findings.
+        let mut non_conflict = envelope;
+        non_conflict.finding_type = FindingType::DocumentationDrift;
+        assert!(
+            !non_conflict
+                .finding_type
+                .requires_waiver_separation_of_duty()
+        );
+    }
+
+    #[test]
+    fn repeated_waiver_drift_is_always_candidate_only() {
+        assert_eq!(nominate_repeated_waiver_drift(0, 3).unwrap(), None);
+        assert_eq!(
+            nominate_repeated_waiver_drift(3, 3).unwrap(),
+            Some(VerificationState::Candidate)
+        );
+        assert_eq!(
+            nominate_repeated_waiver_drift(1_000_000, 3).unwrap(),
+            Some(VerificationState::Candidate)
+        );
+        assert!(nominate_repeated_waiver_drift(5, 0).is_err());
+    }
+
+    #[test]
+    fn required_applicability_dimension_omitted_is_rejected_not_treated_as_any() {
+        let mut missing = DiscrepancyFamilyPreimageV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            finding_type: FindingType::ClaimConflict,
+            canonical_subject: resource(IdentityForm::Entity, "repository", '1'),
+            predicate: reference(
+                "predicate.database_choice_v1",
+                "36660875b3d71595ccb4b5dfbc17c4c0fe546eec0fa4b8da6a63b17fec074586",
+            ),
+            comparator_lineage_fingerprint: comparator_lineage().fingerprint().unwrap(),
+            expectation_policy: reference(
+                "policy.database_choice_v1",
+                "d0b7d4e7b630ce599389e50948541e21b4aa24d4d030860f6cfcaf7508d49df4",
+            ),
+            required_applicability_dimension_ids: vec![
+                ContractId::new("runtime_environment").unwrap(),
+            ],
+            applicability: applicability(),
+            episode_policy_version: 1,
+        };
+        missing
+            .applicability
+            .retain(|dim| dim.dimension_id.as_str() != "runtime_environment");
+        assert!(missing.validate_shape().is_err());
+
+        // Explicitly declaring `any` is the only way to satisfy a required
+        // dimension without a concrete resource.
+        missing.applicability.push(ApplicabilityDimensionV1 {
+            dimension_id: ContractId::new("runtime_environment").unwrap(),
+            value: ApplicabilityDimensionValueV1::Any,
+        });
+        assert!(missing.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn envelope_fingerprints_fail_closed_on_tampering() {
+        let mut tampered_family = envelope();
+        tampered_family.severity = DiscrepancySeverityV1::Critical;
+        tampered_family.family_fingerprint = DiscrepancyFamilyFingerprintV1::from_digest(digest(
+            "5555555555555555555555555555555555555555555555555555555555555555",
+        ));
+        assert!(tampered_family.validate_shape().is_err());
+
+        let mut tampered_episode = envelope();
+        tampered_episode.episode_fingerprint = DiscrepancyEpisodeFingerprintV1::from_digest(
+            digest("6666666666666666666666666666666666666666666666666666666666666666"),
+        );
+        assert!(tampered_episode.validate_shape().is_err());
+    }
+
+    #[test]
+    fn unknown_finding_type_and_unknown_fields_fail_closed() {
+        let canonical = record(ENVELOPE_FIXTURE);
+        let mut value: serde_json::Value = serde_json::from_slice(canonical).unwrap();
+        value["finding_type"]["kind"] = serde_json::Value::String("root_cause_theory".into());
+        assert!(
+            decode_strict::<DiscrepancyEnvelopeV1>(&serde_json::to_vec(&value).unwrap()).is_err()
+        );
+
+        let mut extra_field: serde_json::Value = serde_json::from_slice(canonical).unwrap();
+        extra_field.as_object_mut().unwrap().insert(
+            "lifecycle_state".into(),
+            serde_json::Value::String("open".into()),
+        );
+        assert!(
+            decode_strict::<DiscrepancyEnvelopeV1>(&serde_json::to_vec(&extra_field).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn waiver_without_actor_or_expiry_fails_to_deserialize() {
+        let waiver = waiver_record("principal.on_call", "2026-09-01T00:00:00.000000000Z");
+        let mut value = serde_json::to_value(&waiver).unwrap();
+        let mut missing_actor = value.clone();
+        missing_actor.as_object_mut().unwrap().remove("actor");
+        assert!(
+            decode_strict::<WaiverRecordV1>(&serde_json::to_vec(&missing_actor).unwrap()).is_err()
+        );
+
+        value.as_object_mut().unwrap().remove("expiry_at");
+        assert!(decode_strict::<WaiverRecordV1>(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn comparator_lineage_version_bump_is_a_new_lineage() {
+        let base = comparator_lineage();
+        let mut bumped = base.clone();
+        bumped.comparator_version += 1;
+        assert_ne!(base.fingerprint().unwrap(), bumped.fingerprint().unwrap());
+
+        let mut different_cardinality = base.clone();
+        different_cardinality.cardinality = CardinalityAlgebraV1::SetValued;
+        assert_ne!(
+            base.fingerprint().unwrap(),
+            different_cardinality.fingerprint().unwrap()
+        );
+
+        let mut different_polarity = base.clone();
+        different_polarity.polarity_rule = PolarityRuleV1::NegationsNeverConflict;
+        assert_ne!(
+            base.fingerprint().unwrap(),
+            different_polarity.fingerprint().unwrap()
+        );
+
+        let mut reversed_modality = base;
+        reversed_modality.modality_compatibility = vec![ModalityCompatibilityRuleV1 {
+            left: PropositionModalityV1::Normative,
+            right: PropositionModalityV1::Attested,
+        }];
+        assert!(reversed_modality.validate_shape().is_err());
+    }
+
+    #[test]
+    fn episode_relation_arity_is_enforced() {
+        let a = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "7777777777777777777777777777777777777777777777777777777777777777",
+        ));
+        let b = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "8888888888888888888888888888888888888888888888888888888888888888",
+        ));
+
+        let single_source_combine = DiscrepancyEpisodeRelationV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            kind: EpisodeRelationKindV1::CombinedFrom,
+            from_episodes: vec![a],
+            to_episode: b,
+        };
+        assert!(single_source_combine.validate_shape().is_err());
+
+        let self_referential = DiscrepancyEpisodeRelationV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            kind: EpisodeRelationKindV1::Continues,
+            from_episodes: vec![a],
+            to_episode: a,
+        };
+        assert!(self_referential.validate_shape().is_err());
+    }
+
+    #[test]
+    #[ignore = "maintainer-only canonical discrepancy fixture regeneration"]
+    fn regenerate_discrepancy_contract_artifacts() {
+        fn write(output: &Path, name: &str, bytes: &[u8]) {
+            let mut framed = bytes.to_vec();
+            framed.push(b'\n');
+            fs::write(output.join(name), framed).unwrap();
+        }
+
+        let output = std::env::var_os("DISCREPANCY_VECTOR_OUTPUT")
+            .map(std::path::PathBuf::from)
+            .expect("DISCREPANCY_VECTOR_OUTPUT is required");
+        fs::create_dir_all(&output).unwrap();
+
+        let envelope = envelope();
+        let episode_fingerprint = envelope.episode_fingerprint;
+        let lineage = comparator_lineage();
+        let policy = episode_policy();
+        let acknowledge = acknowledge_event(episode_fingerprint);
+        let waive = waive_event(
+            episode_fingerprint,
+            "principal.on_call",
+            "2026-09-15T00:00:00.000000000Z",
+        );
+        let resolve = resolve_event(episode_fingerprint);
+        let dismiss = dismiss_event(episode_fingerprint, "principal.on_call");
+        let other_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        ));
+        let combined_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        ));
+        let split_relation = episode_relation_split(episode_fingerprint, other_episode);
+        let combined_relation =
+            episode_relation_combined(episode_fingerprint, other_episode, combined_episode);
+        let suite = vector_suite();
+
+        for (name, bytes) in [
+            (
+                "discrepancy-envelope.jsonl",
+                encode_canonical(&envelope).unwrap(),
+            ),
+            (
+                "comparator-lineage.jsonl",
+                encode_canonical(&lineage).unwrap(),
+            ),
+            ("episode-policy.jsonl", encode_canonical(&policy).unwrap()),
+            (
+                "lifecycle-event-acknowledge.jsonl",
+                encode_canonical(&acknowledge).unwrap(),
+            ),
+            (
+                "lifecycle-event-waive.jsonl",
+                encode_canonical(&waive).unwrap(),
+            ),
+            (
+                "lifecycle-event-resolve.jsonl",
+                encode_canonical(&resolve).unwrap(),
+            ),
+            (
+                "lifecycle-event-dismiss.jsonl",
+                encode_canonical(&dismiss).unwrap(),
+            ),
+            (
+                "episode-relation-superseded-split.jsonl",
+                encode_canonical(&split_relation).unwrap(),
+            ),
+            (
+                "episode-relation-combined-from.jsonl",
+                encode_canonical(&combined_relation).unwrap(),
+            ),
+            ("vector-suite.jsonl", encode_canonical(&suite).unwrap()),
+        ] {
+            write(&output, name, &bytes);
+        }
+
+        println!("FAMILY_FINGERPRINT {}", envelope.family_fingerprint);
+        println!("EPISODE_FINGERPRINT {}", envelope.episode_fingerprint);
+        println!("ENVELOPE_ID {}", envelope.envelope_id().unwrap());
+        println!(
+            "COMPARATOR_LINEAGE_FINGERPRINT {}",
+            lineage.fingerprint().unwrap()
+        );
+        println!(
+            "VECTOR_SUITE_DIGEST {}",
+            domain_separated_digest(
+                super::super::digest::DigestDomain::TestVectorManifest,
+                &encode_canonical(&suite).unwrap()
+            )
+        );
+        for bytes in [
+            ("ENVELOPE_RAW_SHA256", encode_canonical(&envelope).unwrap()),
+            ("VECTOR_SUITE_RAW_SHA256", encode_canonical(&suite).unwrap()),
+        ] {
+            let mut framed = bytes.1.clone();
+            framed.push(b'\n');
+            println!("{} {}", bytes.0, raw_sha256(&framed));
+        }
+    }
+}

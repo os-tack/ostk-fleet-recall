@@ -1,0 +1,1 @@
+{"cardinality":"functional","comparator_id":"comparator.exact_value_v1","comparator_version":1,"concrete_applicability_required":true,"coverage_proof_required":false,"effective_interval_rule":"overlap_required","modality_compatibility":[{"left":"attested","right":"normative"}],"polarity_rule":"affirmation_negation_conflict_on_same_value","schema_version":1}
