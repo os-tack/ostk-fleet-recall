@@ -217,6 +217,29 @@ root_scalar() {
     "$crdb" sql --url="$root_url" --format=tsv --execute="$1" | tail -n +2
 }
 
+# CockroachDB's TSV reporter CSV-quotes fields containing double quotes. Use
+# its JSON envelope for JSON-valued strings, then require one named object.
+root_json_object() {
+    "$crdb" sql --url="$root_url" --format=json --execute="$1" |
+        jq -sce '
+            if length == 1
+               and (.[0] | type) == "array"
+               and (.[0] | length) == 1
+               and (.[0][0] | type) == "object"
+               and (.[0][0] | keys) == ["json_value"]
+               and (.[0][0].json_value | type) == "string"
+            then
+                (.[0][0].json_value | fromjson) as $decoded
+                | if ($decoded | type) == "object"
+                  then $decoded
+                  else error("SQL JSON scalar was not an object")
+                  end
+            else
+                error("SQL JSON query did not return exactly one named scalar")
+            end
+        '
+}
+
 root_sql_in_database() {
     local database=$1
     local statement=$2
@@ -1860,10 +1883,11 @@ assert_root_scalar "exact reconciliation receipt coordinate" \
      FROM memory_mutation_receipts
      WHERE tenant_id = '$reconciliation_tenant_id'
        AND project = '$reconciliation_project'" 'match'
-stored_reconciliation_response=$(root_scalar "
-    SELECT response::STRING
+stored_reconciliation_response=$(root_json_object "
+    SELECT response::STRING AS json_value
     FROM memory_mutation_receipts
     WHERE tenant_id = '$reconciliation_tenant_id'
+      AND project = '$reconciliation_project'
       AND idempotency_key = '$reconciliation_idempotency_key'")
 jq -e \
     --arg event "$reconciliation_event_id" \
@@ -1906,8 +1930,8 @@ assert_root_scalar "exact reconciliation aggregate event coordinate" \
      FROM memory_events
      WHERE tenant_id = '$reconciliation_tenant_id'
        AND project = '$reconciliation_project'" 'match'
-reconciliation_audit=$(root_scalar "
-    SELECT payload::STRING
+reconciliation_audit=$(root_json_object "
+    SELECT payload::STRING AS json_value
     FROM memory_events
     WHERE tenant_id = '$reconciliation_tenant_id'
       AND project = '$reconciliation_project'
