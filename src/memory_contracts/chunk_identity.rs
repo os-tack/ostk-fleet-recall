@@ -209,8 +209,14 @@ impl SourceSpanV1 {
         Ok(())
     }
 
-    pub const fn byte_len(&self) -> u64 {
-        self.byte_end - self.byte_start
+    /// Total: `None` on any decoded-but-unvalidated span whose `byte_end`
+    /// does not exceed `byte_start` (the exact condition
+    /// [`Self::validate`] rejects). `decode_strict` alone does not call
+    /// `validate`, so this must never assume a decoded span is already
+    /// well-formed; a bare subtraction here would panic in a debug build
+    /// and silently wrap to a near-`u64::MAX` length in release.
+    pub const fn byte_len(&self) -> Option<u64> {
+        self.byte_end.checked_sub(self.byte_start)
     }
 }
 
@@ -502,8 +508,20 @@ pub struct GenerationPointerV1 {
 }
 
 impl GenerationPointerV1 {
+    /// Rejects the all-zero, sequence-0 degenerate pointer: unlike every
+    /// other preimage in this module (`ParserKeyV1`,
+    /// `ChunkOccurrencePreimageV1`, `ParseRunManifestPreimageV1`,
+    /// `EmbeddingIdentityPreimageV1`, `StorageIdentityPreimageV1`,
+    /// `BodyReferenceStateV1`), this is the CAS anchor for the
+    /// registry-declared active parser generation, so an uninitialised
+    /// pointer must never be admissible as either the expected-prior or
+    /// proposed pointer of a generation switch.
     pub fn validate(&self) -> ContractResult<()> {
-        if self.schema_version != CHUNK_IDENTITY_SCHEMA_VERSION {
+        if self.schema_version != CHUNK_IDENTITY_SCHEMA_VERSION
+            || self.active_parser_key.digest() == Sha256Digest::ZERO
+            || self.active_manifest_id.digest() == Sha256Digest::ZERO
+            || self.generation_sequence == 0
+        {
             return Err(ContractError::Schema("invalid generation pointer".into()));
         }
         Ok(())
@@ -537,11 +555,14 @@ impl GenerationPointerSwitchProposalV1 {
     pub fn validate(&self) -> ContractResult<()> {
         self.expected_prior_pointer.validate()?;
         self.proposed_pointer.validate()?;
+        let expected_next_sequence = self
+            .expected_prior_pointer
+            .generation_sequence
+            .checked_add(1);
         if self.schema_version != CHUNK_IDENTITY_SCHEMA_VERSION
             || self.coverage_verification_digest == Sha256Digest::ZERO
             || self.determinism_verification_digest == Sha256Digest::ZERO
-            || self.proposed_pointer.generation_sequence
-                != self.expected_prior_pointer.generation_sequence + 1
+            || Some(self.proposed_pointer.generation_sequence) != expected_next_sequence
             || self.proposed_pointer == self.expected_prior_pointer
         {
             return Err(ContractError::Schema(
@@ -593,11 +614,18 @@ impl AdmittedGenerationSwitchV1 {
     }
 }
 
-/// Which content an embedding was computed over, selected by policy. Using a
-/// tagged union rather than a separate selector-plus-digest pair makes a
-/// selector/digest mismatch structurally impossible.
+/// Which content an embedding was computed over, selected by policy.
+///
+/// Using a tagged union rather than a separate selector-plus-digest pair,
+/// combined with `deny_unknown_fields`, makes a selector/digest mismatch
+/// structurally impossible: without `deny_unknown_fields` an
+/// internally-tagged enum only requires the *selected* arm's own fields to
+/// be present, but does not reject an unrelated key such as a stray
+/// `occurrence_id` riding alongside a `body` arm — `deny_unknown_fields`
+/// closes exactly that gap by rejecting any field the chosen arm does not
+/// declare.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EmbeddingInputV1 {
     Body { body_content_id: Sha256Digest },
     Occurrence { occurrence_id: ChunkOccurrenceId },
@@ -889,6 +917,36 @@ mod tests {
             .insert("manifest_id".into(), serde_json::json!("deadbeef"));
         let bytes = serde_json::to_vec(&value).unwrap();
         assert!(decode_strict::<ChunkOccurrencePreimageV1>(&bytes).is_err());
+    }
+
+    #[test]
+    fn span_byte_len_is_total_even_on_an_invalid_start_after_end_span() {
+        // `byte_len` must never panic (debug) or wrap (release) on a value
+        // `decode_strict` alone would accept: `decode_strict` does not call
+        // `validate`, so a `byte_start > byte_end` span can reach `byte_len`
+        // unvalidated. It must report `None`, not abort or return a
+        // near-`u64::MAX` nonsense length.
+        let backwards = SourceSpanV1 {
+            schema_version: CHUNK_IDENTITY_SCHEMA_VERSION,
+            byte_start: 100,
+            byte_end: 5,
+            span_digest: digest_of(0xaa),
+            ordinal: 0,
+        };
+        assert_eq!(backwards.byte_len(), None);
+        assert!(backwards.validate().is_err());
+
+        // `byte_start == byte_end` is itself a validation error (an empty
+        // span), but `checked_sub` alone cannot distinguish "empty" from
+        // "well-formed": it reports the correctly-computed zero length,
+        // exactly like any other total unsigned subtraction, and
+        // `validate` remains the sole authority on emptiness.
+        let equal = span(0, 5, 5, 0xaa);
+        assert_eq!(equal.byte_len(), Some(0));
+        assert!(equal.validate().is_err());
+
+        let forward = span(0, 5, 100, 0xaa);
+        assert_eq!(forward.byte_len(), Some(95));
     }
 
     #[test]
@@ -1242,6 +1300,25 @@ mod tests {
     }
 
     #[test]
+    fn generation_switch_rejects_a_sequence_that_would_overflow_to_the_advancing_value() {
+        // `expected_prior_pointer.generation_sequence` is `pub u64` and can
+        // be hydrated from storage at `u64::MAX` (not reachable through
+        // `decode_strict`'s canonical-integer cap, but reachable once a
+        // pointer has been round-tripped through a runtime store). An
+        // unchecked `+ 1` would wrap to 0 and a proposal advancing to
+        // sequence 0 would then satisfy a same-value check, admitting a
+        // generation rollback; `checked_add` must reject it instead.
+        let rollback_proposal = GenerationPointerSwitchProposalV1 {
+            schema_version: CHUNK_IDENTITY_SCHEMA_VERSION,
+            expected_prior_pointer: generation_pointer(u64::MAX, 0x01),
+            proposed_pointer: generation_pointer(0, 0x02),
+            coverage_verification_digest: digest_of(0x77),
+            determinism_verification_digest: digest_of(0x88),
+        };
+        assert!(rollback_proposal.validate().is_err());
+    }
+
+    #[test]
     fn erasure_removes_occurrence_immediately_and_predicate_flips_when_last_reference_gone() {
         let occurrence_a = occurrence(0, 0x22).occurrence_id().unwrap();
         let occurrence_b = occurrence(1, 0x22).occurrence_id().unwrap();
@@ -1342,6 +1419,12 @@ mod tests {
         const NEGATIVE_UNKNOWN_FLAG_FIXTURE: &[u8] = include_bytes!(
             "../../contracts/dynamic-memory/v3/chunk-identity/negative-unknown-normalization-flag.jsonl"
         );
+        const NEGATIVE_EMBEDDING_EXTRA_FIELD_FIXTURE: &[u8] = include_bytes!(
+            "../../contracts/dynamic-memory/v3/chunk-identity/negative-embedding-input-extra-field.jsonl"
+        );
+        const NEGATIVE_DEGENERATE_POINTER_FIXTURE: &[u8] = include_bytes!(
+            "../../contracts/dynamic-memory/v3/chunk-identity/negative-degenerate-generation-pointer.jsonl"
+        );
         const VECTOR_SUITE_FIXTURE: &[u8] =
             include_bytes!("../../contracts/dynamic-memory/v3/chunk-identity/vector-suite.jsonl");
 
@@ -1377,8 +1460,12 @@ mod tests {
             "e0233a8818df79a1b7a806e0eed5102ca2984954eebf1c5a96e1cee04d6af182";
         const NEGATIVE_UNKNOWN_FLAG_RAW_SHA256: &str =
             "f7d6b4107427cd9e52d0ebb5631d4484ee9241033644c7bb2451721c50275ef5";
+        const NEGATIVE_EMBEDDING_EXTRA_FIELD_RAW_SHA256: &str =
+            "88a031718b3daa83dc3993966e4e86f2b3616a81f2baa9736427f2574a0e3daa";
+        const NEGATIVE_DEGENERATE_POINTER_RAW_SHA256: &str =
+            "05da6417540a485eebd6ff2503ee2b8c2bfb78802b2e66a12ca01cdba8bde9ee";
         const VECTOR_SUITE_RAW_SHA256: &str =
-            "304fd0f4868a49ed308016b54a2ee00b2df0b844d45e0093f17c9ccfaedbb545";
+            "b6b0c341b74f1648c6583b812b637220f497a4c26292ae0ae24af624a0d67d53";
 
         const PARSER_KEY_ID: &str =
             "dabca33866e026b582a8e58a7721b5e5ae222bbef2ba7f72b77f8621df79ffd1";
@@ -1390,6 +1477,8 @@ mod tests {
             "ac3114392112930133c5b8ed105e0ea120e38f0156345488b8543190ffb5e66e";
         const GENERATION_1_ID: &str =
             "17a2c60b8e5191e6e93459825f13f7a7ad3a76c7b439a26c2aadef74241fc5c1";
+        const GENERATION_2_ID: &str =
+            "f68101c36dfae0d4a18d4593daa03f12700be98d5786e031690028c4ccfa39ab";
         const EMBEDDING_BODY_ID: &str =
             "9feff2ba8eafe9f35367b320432b86ecdf09936b2aebc1c3dd7a064b1681b0e4";
         const EMBEDDING_OCCURRENCE_ID: &str =
@@ -1441,6 +1530,14 @@ mod tests {
                 (
                     NEGATIVE_UNKNOWN_FLAG_FIXTURE,
                     NEGATIVE_UNKNOWN_FLAG_RAW_SHA256,
+                ),
+                (
+                    NEGATIVE_EMBEDDING_EXTRA_FIELD_FIXTURE,
+                    NEGATIVE_EMBEDDING_EXTRA_FIELD_RAW_SHA256,
+                ),
+                (
+                    NEGATIVE_DEGENERATE_POINTER_FIXTURE,
+                    NEGATIVE_DEGENERATE_POINTER_RAW_SHA256,
                 ),
                 (VECTOR_SUITE_FIXTURE, VECTOR_SUITE_RAW_SHA256),
             ] {
@@ -1555,6 +1652,79 @@ mod tests {
             assert!(!decoded.may_reclaim_shared_storage());
         }
 
+        /// `vector-suite.jsonl` is a restatement, not an independent source
+        /// of truth: every field it carries must be recomputable from a
+        /// checked-in preimage fixture (or a value already pinned above) and
+        /// this test is that recomputation. A digest with no preimage
+        /// anywhere in the repository cannot be falsified by any test, so it
+        /// must not appear here at all — see README.md, "How digests are
+        /// pinned".
+        #[test]
+        fn vector_suite_fixture_restates_only_recomputable_digests_and_all_match() {
+            let value: serde_json::Value =
+                serde_json::from_slice(record(VECTOR_SUITE_FIXTURE)).unwrap();
+            let obj = value.as_object().unwrap();
+            let get = |key: &str| obj.get(key).unwrap().as_str().unwrap();
+
+            assert_eq!(get("parser_key_id"), PARSER_KEY_ID);
+            assert_eq!(get("occurrence_id"), OCCURRENCE_ID);
+            assert_eq!(get("manifest_id"), MANIFEST_ID);
+            assert_eq!(get("supersession_id"), SUPERSESSION_ID);
+            assert_eq!(get("generation_1_id"), GENERATION_1_ID);
+            assert_eq!(get("embedding_body_id"), EMBEDDING_BODY_ID);
+            assert_eq!(get("embedding_occurrence_id"), EMBEDDING_OCCURRENCE_ID);
+            assert_eq!(get("storage_identity_id"), STORAGE_IDENTITY_ID);
+
+            // body_content_id is recomputable: it is the occurrence
+            // fixture's own field, independently decoded here rather than
+            // trusted from vector-suite.jsonl alone.
+            let occurrence: ChunkOccurrencePreimageV1 =
+                decode_strict(record(OCCURRENCE_FIXTURE)).unwrap();
+            assert_eq!(
+                get("body_content_id"),
+                occurrence.body_content_id.to_string()
+            );
+
+            // generation_2_id is recomputable: it is pointer_id() of the
+            // switch-proposal fixture's own proposed_pointer.
+            let proposal: GenerationPointerSwitchProposalV1 =
+                decode_strict(record(SWITCH_PROPOSAL_FIXTURE)).unwrap();
+            let recomputed_generation_2_id =
+                proposal.proposed_pointer.pointer_id().unwrap().to_string();
+            assert_eq!(recomputed_generation_2_id, GENERATION_2_ID);
+            assert_eq!(get("generation_2_id"), recomputed_generation_2_id);
+
+            // The closed list of this directory's negative fixture stems.
+            let negative_cases: Vec<&str> = obj["negative_cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.as_str().unwrap())
+                .collect();
+            assert_eq!(
+                negative_cases,
+                vec![
+                    "degenerate_generation_pointer",
+                    "embedding_input_extra_field",
+                    "empty_span",
+                    "line_number_field",
+                    "manifest_id_inside_occurrence",
+                    "overlapping_spans",
+                    "unknown_normalization_flag",
+                    "unsorted_spans",
+                ]
+            );
+
+            // parser_key_v2_id / occurrence_v2_id / manifest_v2_id were
+            // removed: no checked-in v3 fixture computes a "generation 2"
+            // ParserKeyV1/ChunkOccurrencePreimageV1/ParseRunManifestPreimageV1,
+            // so restating hardcoded digests for them here would be an
+            // unfalsifiable claim no test could ever catch drifting stale.
+            assert!(!obj.contains_key("parser_key_v2_id"));
+            assert!(!obj.contains_key("occurrence_v2_id"));
+            assert!(!obj.contains_key("manifest_v2_id"));
+        }
+
         #[test]
         fn negative_fixtures_reject_an_unrecognized_field_at_decode_time() {
             // `manifest_id` and `line` are not fields of
@@ -1567,6 +1737,39 @@ mod tests {
             assert!(
                 decode_strict::<ChunkOccurrencePreimageV1>(record(NEGATIVE_LINE_FIXTURE)).is_err()
             );
+        }
+
+        /// `EmbeddingInputV1` is internally tagged (`kind` selects the
+        /// arm), and before `deny_unknown_fields` was added, a JSON payload
+        /// could carry the `body` arm's own `body_content_id` *and* a stray
+        /// `occurrence_id` that no `EmbeddingInputV1::Body` field names: the
+        /// second digest was silently dropped at decode instead of being
+        /// rejected, so a selector/digest mismatch was constructible. This
+        /// fixture pins that it is now rejected at decode time, before
+        /// `EmbeddingIdentityPreimageV1::validate` ever runs.
+        #[test]
+        fn negative_fixture_rejects_a_stray_digest_alongside_the_selected_embedding_input_arm() {
+            assert!(
+                decode_strict::<EmbeddingIdentityPreimageV1>(record(
+                    NEGATIVE_EMBEDDING_EXTRA_FIELD_FIXTURE
+                ))
+                .is_err()
+            );
+        }
+
+        /// This fixture is a structurally well-formed `GenerationPointerV1`
+        /// (no unrecognized field), so `decode_strict` succeeds; it is the
+        /// all-zero, sequence-0 degenerate pointer that
+        /// `GenerationPointerV1::validate` must reject, unlike a decode-only
+        /// check. A degenerate pointer must never be admissible as either
+        /// the `expected_prior_pointer` or the `proposed_pointer` of a CAS
+        /// switch.
+        #[test]
+        fn negative_fixture_rejects_the_degenerate_all_zero_generation_pointer() {
+            let decoded: GenerationPointerV1 =
+                decode_strict(record(NEGATIVE_DEGENERATE_POINTER_FIXTURE)).unwrap();
+            assert!(decoded.validate().is_err());
+            assert!(decoded.pointer_id().is_err());
         }
 
         #[test]

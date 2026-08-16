@@ -8,9 +8,12 @@ URIs, and registry references below are deterministic test material, not
 proof that any real parser, registry package, or coverage receipt exists.
 
 Every `.jsonl` file contains exactly one canonical JSON record plus exactly
-one trailing LF; the LF is excluded from every pinned digest. Every record is
-byte-frozen: the Rust test suite `include_bytes!`s each file, asserts the raw
-file SHA-256 against a hardcoded constant, decodes it with
+one trailing LF. The raw-byte SHA-256 pin is over the exact checked-in bytes
+with that LF included; the record's own identity digest (computed after
+stripping the LF and decoding) necessarily excludes it, since the LF is
+framing, not part of the canonical JSON record. Every record is byte-frozen:
+the Rust test suite `include_bytes!`s each file, asserts the raw file SHA-256
+against a hardcoded constant, decodes it with
 `canonical::require_canonical`/`decode_strict`, and recomputes the record's
 identity digest against a second hardcoded constant. Changing any field,
 byte, or digest below is a contract-version change, not a fixture update.
@@ -48,10 +51,15 @@ byte, or digest below is a contract-version change, not a fixture update.
 - `embedding-identity-body-v1.jsonl` and
   `embedding-identity-occurrence-v1.jsonl` — `EmbeddingIdentityPreimageV1`
   under the two `EmbeddingInputV1` selector arms. The selector and its input
-  digest are one tagged field, not a separate selector-plus-digest pair, so a
-  selector/digest mismatch cannot be constructed. Embedding nondeterminism
-  (a remote model's retried output) cannot affect this identity because no
-  embedding vector byte is a field of the preimage.
+  digest are one tagged field, not a separate selector-plus-digest pair, and
+  `EmbeddingInputV1` carries `#[serde(deny_unknown_fields)]` (matching every
+  other tagged enum in this module tree), so a selector/digest mismatch
+  cannot be constructed: an internally-tagged enum without
+  `deny_unknown_fields` only requires the *selected* arm's own fields to be
+  present, it does not by itself reject an unrelated key riding alongside
+  that arm — `deny_unknown_fields` is what closes that gap. Embedding
+  nondeterminism (a remote model's retried output) cannot affect this
+  identity because no embedding vector byte is a field of the preimage.
 - `storage-identity-v1.jsonl` — `StorageIdentityPreimageV1` and its derived
   `StorageIdentityId`. Domain-keyed: the protection-domain identifier is
   hashed into the same preimage as the body-content digest, so the emitted
@@ -82,6 +90,23 @@ byte, or digest below is a contract-version change, not a fixture update.
   `declared_normalization_rules` contains `"not_a_real_rule"`. The closed
   `NormalizationRuleV1` enum has no such variant, so decoding fails before
   any structural validation runs.
+- `negative-embedding-input-extra-field.jsonl` — the `embedding-identity-body-v1.jsonl`
+  record with an `occurrence_id` key added inside the `input` object
+  alongside the `body` arm's own `body_content_id`. Before
+  `EmbeddingInputV1` carried `#[serde(deny_unknown_fields)]`, this exact
+  shape decoded successfully with the stray `occurrence_id` silently
+  dropped, so `EmbeddingIdentityPreimageV1::embedding_identity_id` computed
+  the same identity as the clean `embedding-identity-body-v1.jsonl` record —
+  a selector/digest mismatch was constructible. `deny_unknown_fields` now
+  rejects it at decode time.
+- `negative-degenerate-generation-pointer.jsonl` — a `GenerationPointerV1`
+  record with `generation_sequence: 0` and both digests set to
+  `Sha256Digest::ZERO`. It decodes structurally (no unrecognized field), but
+  `GenerationPointerV1::validate` now rejects it: unlike every other
+  preimage in this module, `GenerationPointerV1` used to check only
+  `schema_version`, so this all-zero, uninitialised pointer would validate
+  and receive a real `GenerationPointerId` — making a degenerate pointer a
+  legal CAS witness for the registry's active-parser-generation anchor.
 
 ## Vectors proved only in Rust (not separately fixture-frozen)
 
@@ -149,6 +174,23 @@ adds around the file) are both hardcoded as `&str` constants in
 to the checked-in file is caught even before decoding), then asserts
 `canonical::require_canonical` accepts the bytes unchanged (the checked-in
 file *is* its own canonical form), decodes it, and asserts the recomputed
-identity digest against the second constant. `vector-suite.jsonl` restates
-every pinned digest and the closed list of negative-case names as one
-manifest record, and is itself pinned the same way.
+identity digest against the second constant.
+
+`vector-suite.jsonl` is pinned the same way for its raw bytes (a hardcoded
+`VECTOR_SUITE_RAW_SHA256` constant), but it is not itself a decoded contract
+record — it is a restatement, so its trustworthiness depends on every field
+it restates being independently cross-checked against a real recomputation,
+never merely asserted to decode. `vector_suite_fixture_restates_only_recomputable_digests_and_all_match`
+is that cross-check: it decodes `vector-suite.jsonl` as JSON and asserts
+every digest field equals either an already-pinned `*_ID` constant or a
+value freshly recomputed from a checked-in preimage fixture (`body_content_id`
+from `chunk-occurrence-v1.jsonl`'s own field; `generation_2_id` from
+`pointer_id()` of `generation-pointer-switch-proposal-v1.jsonl`'s own
+`proposed_pointer`), plus the closed `negative_cases` list. It restates no
+field that lacks such a source: an earlier draft additionally restated
+`parser_key_v2_id`, `occurrence_v2_id`, and `manifest_v2_id` for a
+hypothetical "generation 2" parser key, occurrence, and manifest that this
+directory has no checked-in preimage for, so no test could ever have caught
+those three digests going stale or simply being wrong. They were removed
+rather than left as unfalsifiable claims; a real second generation belongs
+in its own fixture set once one actually exists.
