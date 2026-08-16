@@ -28,9 +28,9 @@ pub const EMBEDDING_DIMENSION: usize = 512;
 /// Largest integer every supported JavaScript/JSON client can represent
 /// without precision loss.
 pub const MAX_PUBLIC_NUMERIC_ID: i64 = 9_007_199_254_740_991;
-/// Oldest additive database schema supported by the existing recall, remember,
-/// ingestion, and public-demo paths.
-pub const MINIMUM_RECALL_SCHEMA_VERSION: i64 = 2;
+/// Oldest complete additive database schema supported by the current recall,
+/// remember, conflict-projection, ingestion, and public-demo paths.
+pub const MINIMUM_RECALL_SCHEMA_VERSION: i64 = 17;
 
 const CONTIGUOUS_SCHEMA_VERSION_SQL: &str = "SELECT COALESCE(MAX(CASE \
          WHEN prefix_success AND version = ordinal THEN version \
@@ -538,8 +538,9 @@ pub struct DatabaseCapabilities {
 impl DatabaseCapabilities {
     /// Whether this database has reached a command's minimum additive schema.
     ///
-    /// Callers that depend on newer tables must supply their own higher floor;
-    /// a later migration must not make the established schema-2 paths unhealthy.
+    /// Private staged commands with deliberately narrower contracts supply
+    /// their own floors; the serving/runtime floor tracks the current public
+    /// recall and conflict-projection surface.
     #[must_use]
     pub const fn supports_schema_version(&self, minimum: i64) -> bool {
         self.schema_version >= minimum
@@ -1836,9 +1837,9 @@ mod tests {
     #[test]
     fn database_schema_compatibility_is_a_minimum_floor() {
         for (schema_version, minimum, expected) in [
-            (1, MINIMUM_RECALL_SCHEMA_VERSION, false),
-            (2, MINIMUM_RECALL_SCHEMA_VERSION, true),
-            (3, MINIMUM_RECALL_SCHEMA_VERSION, true),
+            (16, MINIMUM_RECALL_SCHEMA_VERSION, false),
+            (17, MINIMUM_RECALL_SCHEMA_VERSION, true),
+            (18, MINIMUM_RECALL_SCHEMA_VERSION, true),
             (2, 3, false),
             (3, 3, true),
         ] {
