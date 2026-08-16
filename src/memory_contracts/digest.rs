@@ -148,6 +148,8 @@ pub enum DigestDomain {
     /// Immutable record of two or more incompatible successors of one head.
     RegistryContestedSetV1,
     // --- W0-COVER domains ---
+    /// `CoverageReceiptV1` (COVER-01..03): connector/observer coverage receipts.
+    CoverageReceipt,
 
     // --- W0-CHUNK domains ---
     /// W0-CHUNK. Chunk-occurrence identity preimage (source URI + parser key + spans).
@@ -260,6 +262,7 @@ impl DigestDomain {
             // W0-SUCC
             Self::RegistryContestedSetV1 => "ostk-registry-contested-set-v1",
             // --- W0-COVER prefixes ---
+            Self::CoverageReceipt => "ostk-coverage-receipt-v1",
 
             // --- W0-CHUNK prefixes ---
             Self::ChunkOccurrenceV1 => "ostk-chunk-occurrence-v1",
