@@ -91,6 +91,18 @@ DISCREPANCY_VECTOR_OUTPUT=contracts/dynamic-memory/v3/discrepancy \
   clears `effective_from`/`effective_until` on the envelope
   (`waiver_does_not_split_or_erase_the_interval_and_expiry_reopens_the_same_episode`),
   and expiry is a pure function of `evaluation_time`, never a rewrite.
+  `applicability_scope` is checked, not decorative: **chosen semantics** — every
+  entry in `applicability_scope` must exactly match (same `dimension_id`, same
+  `value`) an entry actually present in the target envelope's `applicability`.
+  `authorize_lifecycle_transition` rejects the `Waive` transition outright (full
+  suppression is refused, not partially applied) whenever a scope entry names a
+  dimension the envelope does not carry, or a concrete value that disagrees with
+  the envelope's value for that dimension; an empty scope always covers (applies
+  to the full episode). There is no third, silently-accepted "narrower than the
+  envelope but still applied" projection outcome
+  (`disc_05_waiver_scope_must_cover_the_envelope_applicability`, covering both
+  the out-of-scope-value and alien-dimension negative cases, plus the covered
+  positive case reaching `LifecycleState::Waived`).
 - **PRED-01** (typed comparison only) — `nominate_repeated_waiver_drift`'s return
   type is `Option<VerificationState>` restricted at the call site to `Candidate`
   only; there is no code path in this module that can return `Verified` from a
@@ -127,7 +139,22 @@ DISCREPANCY_VECTOR_OUTPUT=contracts/dynamic-memory/v3/discrepancy \
   alone must never authorize a cross-tenant transition
   (`lifecycle_event_scope_must_match_the_envelope_scope`), matching the
   `self.scope != other.scope` convention every sibling contract in this crate
-  already enforces.
+  already enforces. AUTH-03 also covers a bare verification-state change, not
+  only a `lifecycle_transition`: `verification_update` is
+  `Option<VerificationUpdateV1>`, and `VerificationUpdateV1.actor` is a
+  mandatory (non-`Option`) field, so an unattributed verification flip cannot
+  even be constructed by a well-typed caller or deserialized under
+  `deny_unknown_fields`
+  (`unattributed_verification_update_fails_to_deserialize`).
+  `authorize_lifecycle_transition` additionally rejects a `Refuted`
+  verification update whose actor is self-implicated — the strongest possible
+  suppression a verification update can achieve, gated by the same
+  `is_self_implicated` check as `Dismiss`/`Resolve`/`Waive`
+  (`auth_03_rejects_self_implicated_verification_refutation`). Promotion to
+  `Verified` requires non-empty `evidence_event_ids` at
+  `VerificationUpdateV1::validate_shape` (PRED-01/PRED-05: "a verified
+  discrepancy cites evidence"), not left to a caller to remember
+  (`promotion_to_verified_with_empty_evidence_is_rejected`).
 - **DISC-03** (resolution accumulation) — `project_discrepancy_episode` accumulates
   `resolution_evidence_ids` across every `Resolve` transition in the replay
   (sorted, deduplicated, order-independent) instead of overwriting them, so a later
@@ -151,6 +178,56 @@ DISCREPANCY_VECTOR_OUTPUT=contracts/dynamic-memory/v3/discrepancy \
   to `validate_shape`; it is a separate seam (like
   `validate_against_structural_connector` in `evidence_v2.rs`) because
   `validate_shape` has no access to the resolved policy body.
+- **APPL-01/APPL-02/PRED-03/COVER-01 binding to a registered comparator lineage**
+  (doc "Predicate schema" 341-379; the same payload-selected-authority class as
+  the episode-policy gap above, on the comparator/predicate axis) —
+  `DiscrepancyEnvelopeV1::validate_against_comparator_lineage` binds the
+  envelope's `comparator_lineage_fingerprint` and
+  `required_applicability_dimension_ids` to an exact
+  `StructurallyResolvedComparatorLineageV1` (mirroring
+  `StructurallyResolvedEpisodePolicyV2`, reusing
+  `RegistryEntryKind::PredicateSchema` under its own `entry_schema_id`
+  `registry.comparator_lineage`, disjoint from `genesis.rs`'s
+  `PredicateSchemaEntryV1` body `registry.predicate_schema` — no
+  digest.rs/registry.rs/genesis.rs change). `validate_shape` alone only proves
+  the envelope's own applicability is internally self-consistent against
+  whatever the *producer* declared as required; it cannot prove
+  `comparator_lineage_fingerprint` names a real registered lineage, nor that
+  the envelope actually satisfies that lineage's own
+  `concrete_applicability_required`/`coverage_proof_required` flags. The bound
+  check proves, in order:
+  (a) the fingerprint matches the resolved lineage's own fingerprint
+  (`envelope_comparator_lineage_fingerprint_divergent_from_registry_is_rejected`);
+  (d) `required_applicability_dimension_ids` equals the registry's set for
+  this lineage, not the payload's own declaration
+  (`envelope_required_applicability_dimension_ids_divergent_from_registry_is_rejected`);
+  (b) if `concrete_applicability_required`, every required dimension resolves
+  to `Concrete`, never `Any`
+  (`envelope_any_applicability_under_concrete_requirement_is_rejected`); (c) if
+  `coverage_proof_required`, `coverage_receipt_ids` is non-empty
+  (`envelope_missing_coverage_receipt_under_coverage_requirement_is_rejected`).
+  Positive case:
+  `envelope_validates_against_its_exact_registered_comparator_lineage`. A
+  runtime admitting an envelope must call this in addition to `validate_shape`
+  and `validate_against_episode_policy`, for the same reason: none of them has
+  access to the others' resolved registry body.
+
+## `LifecycleState::Superseded` reachability (doc lines 1353-1356, 1329-1331)
+
+`project_discrepancy_episode` takes a `relations: &[DiscrepancyEpisodeRelationV1]`
+parameter. Whenever a `superseded` relation's `from_episodes` contains the
+target envelope's `episode_fingerprint`, the projection is
+`LifecycleState::Superseded`, overriding every event-driven lifecycle
+transition and the waiver-expiry reopen (`superseded_dominates_a_waiver_expiry_reopen`)
+— a replaced episode is frozen, not reopened. This is the *only* producer of
+`Superseded`: passing `&[]` (no relation set applies) never yields it. The
+split vector
+(`late_evidence_that_changes_the_opening_transition_creates_a_replacement_episode`)
+asserts both halves of the doc's "old marked superseded, retained": the OLD
+episode's projection is `Superseded`, the NEW episode's is not, and neither
+episode's own fingerprint changes because of the relation (retention without
+erasure — the relation is an append-only sibling record, never a rewrite of
+either envelope).
 
 ## Fingerprint domain separation from `memory_conflicts`
 

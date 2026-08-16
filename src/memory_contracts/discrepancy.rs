@@ -50,6 +50,8 @@ const EPISODE_POLICY_SCHEMA_VERSION: u32 = 1;
 const DISCREPANCY_ENVELOPE_EVENT_KIND: &str = "discrepancy.envelope.accepted";
 const DISCREPANCY_LIFECYCLE_EVENT_KIND: &str = "discrepancy.lifecycle.accepted";
 const EPISODE_POLICY_ENTRY_SCHEMA_ID: &str = "registry.episode_policy";
+const COMPARATOR_LINEAGE_REGISTRATION_SCHEMA_VERSION: u32 = 1;
+const COMPARATOR_LINEAGE_ENTRY_SCHEMA_ID: &str = "registry.comparator_lineage";
 const MAX_APPLICABILITY_DIMENSIONS: usize = 64;
 const MAX_CONTINUITY_KEY_DIMENSIONS: usize = 32;
 const MAX_EVIDENCE_EVENT_IDS: usize = 256;
@@ -250,6 +252,97 @@ impl ComparatorLineageV1 {
         Ok(ComparatorLineageFingerprint::from_digest(
             domain_separated_digest(DigestDomain::ComparatorLineageV1, &encode_canonical(self)?),
         ))
+    }
+}
+
+/// Registry-entry body binding one [`ComparatorLineageV1`] to its required dimensions.
+///
+/// The required-applicability-dimension set the registry -- never an envelope
+/// payload -- actually attaches to it (doc "Predicate schema", PRED-02,
+/// APPL-01: required selectors resolve against the registered predicate, not
+/// a caller-declared list).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComparatorLineageRegistrationV1 {
+    pub schema_version: u32,
+    pub lineage: ComparatorLineageV1,
+    pub required_applicability_dimension_ids: Vec<ContractId>,
+}
+
+impl ComparatorLineageRegistrationV1 {
+    fn validate_shape(&self) -> ContractResult<()> {
+        self.lineage.validate_shape()?;
+        let valid = self.schema_version == COMPARATOR_LINEAGE_REGISTRATION_SCHEMA_VERSION
+            && self.required_applicability_dimension_ids.len() <= MAX_APPLICABILITY_DIMENSIONS
+            && strictly_sorted(&self.required_applicability_dimension_ids);
+        if !valid {
+            return Err(ContractError::Schema(
+                "invalid comparator lineage registration".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One exact comparator-lineage registry entry whose reference and body agree.
+///
+/// Named `StructurallyResolved`, matching `StructurallyResolvedEpisodePolicyV2`
+/// (this module) and `StructurallyResolvedConnectorSchemaV2`
+/// (`evidence_v2.rs`): any caller can construct registry-entry bytes; runtime
+/// admission must additionally prove membership in the exact active
+/// package/head. Reuses `RegistryEntryKind::PredicateSchema` (the doc's
+/// PRED-02 predicate/comparator category) under its own `entry_schema_id`
+/// (`registry.comparator_lineage`), disjoint from `genesis.rs`'s
+/// `PredicateSchemaEntryV1` body (`registry.predicate_schema`) -- the same
+/// kind tag, a distinct body namespace, exactly the reuse-without-collision
+/// pattern `StructurallyResolvedEpisodePolicyV2` already established for
+/// `RegistryEntryKind::EpisodePolicy`. No digest.rs/registry.rs/genesis.rs
+/// change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructurallyResolvedComparatorLineageV1 {
+    registry_reference: RegistryReferenceV1,
+    registration: ComparatorLineageRegistrationV1,
+}
+
+impl StructurallyResolvedComparatorLineageV1 {
+    pub fn from_registry_entry(entry: &RegistryEntryV1) -> ContractResult<Self> {
+        entry.validate()?;
+        if entry.kind != RegistryEntryKind::PredicateSchema
+            || entry.entry_schema_id.as_str() != COMPARATOR_LINEAGE_ENTRY_SCHEMA_ID
+            || entry.entry_schema_version != COMPARATOR_LINEAGE_REGISTRATION_SCHEMA_VERSION
+        {
+            return Err(ContractError::Schema(
+                "registry entry is not a comparator lineage registration body".into(),
+            ));
+        }
+        let body_bytes = encode_canonical(&entry.body)?;
+        let registration: ComparatorLineageRegistrationV1 = decode_strict(&body_bytes)?;
+        registration.validate_shape()?;
+        let identity_matches = registration.lineage.comparator_id == entry.entry_id;
+        let version_matches = registration.lineage.comparator_version == entry.version;
+        if !identity_matches || !version_matches {
+            return Err(ContractError::ManifestMismatch);
+        }
+        Ok(Self {
+            registry_reference: RegistryReferenceV1 {
+                entry_id: entry.entry_id.clone(),
+                version: entry.version,
+                entry_digest: entry.digest()?,
+            },
+            registration,
+        })
+    }
+
+    pub const fn lineage(&self) -> &ComparatorLineageV1 {
+        &self.registration.lineage
+    }
+
+    pub fn required_applicability_dimension_ids(&self) -> &[ContractId] {
+        &self.registration.required_applicability_dimension_ids
+    }
+
+    pub const fn registry_reference(&self) -> &RegistryReferenceV1 {
+        &self.registry_reference
     }
 }
 
@@ -768,6 +861,73 @@ impl DiscrepancyEnvelopeV1 {
         }
         Ok(())
     }
+
+    /// Bind this envelope's `comparator_lineage_fingerprint` and
+    /// `required_applicability_dimension_ids` to the exact registered
+    /// [`ComparatorLineageV1`], closing the payload-selected-authority gap
+    /// left by `validate_shape` alone: `validate_shape` only proves the
+    /// envelope's own applicability is internally consistent (sorted, and a
+    /// superset of whatever the *producer* declared as required), never that
+    /// `comparator_lineage_fingerprint` actually names a registered lineage,
+    /// nor that the envelope actually satisfies that lineage's own
+    /// `concrete_applicability_required` / `coverage_proof_required` flags.
+    /// Proves, in order:
+    /// (a) `comparator_lineage_fingerprint` equals `resolved.lineage()`'s own
+    ///     fingerprint;
+    /// (d) `required_applicability_dimension_ids` equals the registry's set
+    ///     for this lineage, not the payload's own declaration;
+    /// (b) if `concrete_applicability_required`, every required dimension
+    ///     resolves to `Concrete`, never `Any`;
+    /// (c) if `coverage_proof_required`, `coverage_receipt_ids` is non-empty.
+    /// A runtime admitting an envelope as an accepted event must call this in
+    /// addition to `validate_shape`, mirroring
+    /// `validate_against_episode_policy`.
+    pub fn validate_against_comparator_lineage(
+        &self,
+        resolved: &StructurallyResolvedComparatorLineageV1,
+    ) -> ContractResult<()> {
+        self.validate_shape()?;
+        let lineage = resolved.lineage();
+        if self.comparator_lineage_fingerprint != lineage.fingerprint()? {
+            return Err(ContractError::ManifestMismatch);
+        }
+        if self.required_applicability_dimension_ids
+            != resolved.required_applicability_dimension_ids()
+        {
+            return Err(ContractError::Schema(
+                "envelope required_applicability_dimension_ids diverges from the registered comparator lineage"
+                    .into(),
+            ));
+        }
+        if lineage.concrete_applicability_required {
+            let all_concrete = resolved
+                .required_applicability_dimension_ids()
+                .iter()
+                .all(|id| {
+                    self.applicability
+                        .iter()
+                        .find(|dimension| &dimension.dimension_id == id)
+                        .is_some_and(|dimension| {
+                            matches!(
+                                dimension.value,
+                                ApplicabilityDimensionValueV1::Concrete { .. }
+                            )
+                        })
+                });
+            if !all_concrete {
+                return Err(ContractError::Schema(
+                    "comparator lineage requires concrete applicability for every required dimension"
+                        .into(),
+                ));
+            }
+        }
+        if lineage.coverage_proof_required && self.coverage_receipt_ids.is_empty() {
+            return Err(ContractError::Schema(
+                "comparator lineage requires at least one coverage receipt".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -809,6 +969,18 @@ pub struct WaiverRecordV1 {
     /// Empty means the waiver applies to the full episode applicability; a
     /// non-empty scope narrows it. It never widens or erases the underlying
     /// incompatible interval (DISC-05, DISC-03).
+    ///
+    /// Chosen semantics (DISC-05 "a waiver is ... scoped"): every entry here
+    /// must exactly match (same `dimension_id`, same `value`) an entry
+    /// actually present in the target envelope's `applicability`.
+    /// `authorize_lifecycle_transition` rejects the transition outright --
+    /// full stop, not a partial-suppression projection -- whenever a scope
+    /// entry names a dimension the envelope does not carry, or names a
+    /// concrete value that disagrees with the envelope's value for that
+    /// dimension. A waiver that clears this check suppresses the whole
+    /// episode; there is no third, silently-accepted "narrower than the
+    /// envelope but still applied" outcome. See
+    /// `waiver_scope_covers_envelope`.
     pub applicability_scope: Vec<ApplicabilityDimensionV1>,
     pub expiry_at: CanonicalTimestamp,
     pub review_by: Option<CanonicalTimestamp>,
@@ -885,6 +1057,42 @@ pub enum LifecycleTransitionV1 {
     },
 }
 
+/// Attributed verification-state change (AUTH-03, PRED-01, PRED-05).
+///
+/// A bare `Option<VerificationState>` on the wire would let any event flip a
+/// finding's verification state with no actor at all to authorize or
+/// attribute against -- including an unattributed `Refuted` flip reachable by
+/// an implicated actor precisely because no actor field exists to check, and
+/// an evidence-free promotion straight to `Verified`. `actor` is mandatory
+/// (not `Option`), so an unattributed verification change cannot even be
+/// constructed by a well-typed caller or deserialized under
+/// `deny_unknown_fields`. Promotion to `Verified` additionally requires a
+/// non-empty `evidence_event_ids` here, at shape validation, rather than
+/// leaving PRED-01/PRED-05's "a verified discrepancy cites evidence"
+/// requirement to a caller who might forget to check it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationUpdateV1 {
+    pub actor: DiscrepancyActorV1,
+    pub state: VerificationState,
+    pub evidence_event_ids: Vec<AcceptedEventId>,
+}
+
+impl VerificationUpdateV1 {
+    fn validate_shape(&self) -> ContractResult<()> {
+        let valid = self.evidence_event_ids.len() <= MAX_EVIDENCE_EVENT_IDS
+            && strictly_sorted(&self.evidence_event_ids)
+            && (self.state != VerificationState::Verified || !self.evidence_event_ids.is_empty());
+        if !valid {
+            return Err(ContractError::Schema(
+                "invalid verification update: promotion to verified requires non-empty evidence"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Append-only discrepancy lifecycle transition, targeting one exact episode.
 ///
 /// It contains no storage locator, receipt clock, epoch, shard, offset, or
@@ -899,8 +1107,9 @@ pub struct DiscrepancyLifecycleEventV1 {
     pub episode_fingerprint: DiscrepancyEpisodeFingerprintV1,
     pub effective_at: CanonicalTimestamp,
     /// Independent of `lifecycle_transition`: verification state "changes
-    /// without erasing lifecycle events" (doc line 665).
-    pub verification_update: Option<VerificationState>,
+    /// without erasing lifecycle events" (doc line 665). Attributed and, for
+    /// promotion to `Verified`, evidenced -- see [`VerificationUpdateV1`].
+    pub verification_update: Option<VerificationUpdateV1>,
     pub lifecycle_transition: Option<LifecycleTransitionV1>,
     pub evidence_event_ids: Vec<AcceptedEventId>,
 }
@@ -908,6 +1117,9 @@ pub struct DiscrepancyLifecycleEventV1 {
 impl DiscrepancyLifecycleEventV1 {
     pub fn validate_shape(&self) -> ContractResult<()> {
         self.profile.validate()?;
+        if let Some(update) = &self.verification_update {
+            update.validate_shape()?;
+        }
         if let Some(LifecycleTransitionV1::Waive { waiver }) = &self.lifecycle_transition {
             waiver.validate_shape()?;
         }
@@ -964,6 +1176,27 @@ fn is_self_implicated(envelope: &DiscrepancyEnvelopeV1, principal_id: &ContractI
         .is_ok()
 }
 
+/// True when every entry in `scope` exactly matches (same `dimension_id`,
+/// same `value`) an entry actually present in `applicability`.
+///
+/// An empty `scope` vacuously covers (DISC-05: "empty means the waiver
+/// applies to the full episode applicability"). A non-empty `scope` entry
+/// naming a dimension the envelope does not carry at all, or naming a
+/// concrete value that disagrees with the envelope's value for that
+/// dimension, does not cover -- without this check `applicability_scope` is
+/// otherwise decorative: a field no code path reads is worse than no field
+/// at all, since it reads as enforcement in review and grants none.
+fn waiver_scope_covers_envelope(
+    scope: &[ApplicabilityDimensionV1],
+    applicability: &[ApplicabilityDimensionV1],
+) -> bool {
+    scope.iter().all(|scoped| {
+        applicability.iter().any(|dimension| {
+            dimension.dimension_id == scoped.dimension_id && dimension.value == scoped.value
+        })
+    })
+}
+
 /// Authorize one lifecycle event against its target envelope.
 ///
 /// The event's authenticated `scope`/`profile` must match the envelope's own
@@ -982,6 +1215,12 @@ fn is_self_implicated(envelope: &DiscrepancyEnvelopeV1, principal_id: &ContractI
 /// and `implicated_actor_ids` is itself a generic field any finding type may
 /// populate. `Acknowledge` is deliberately exempt: acknowledging a discrepancy
 /// one is implicated in does not resolve or suppress it.
+///
+/// DISC-05 ("a waiver is explicit, attributed, scoped"): a `Waive` transition
+/// is additionally rejected outright when its `waiver.applicability_scope`
+/// does not cover the envelope's `applicability`
+/// (`waiver_scope_covers_envelope`) -- an out-of-scope or alien-dimension
+/// scope can no longer suppress the episode at all.
 pub fn authorize_lifecycle_transition(
     envelope: &DiscrepancyEnvelopeV1,
     event: &DiscrepancyLifecycleEventV1,
@@ -1020,9 +1259,32 @@ pub fn authorize_lifecycle_transition(
                         "AUTH-03: an implicated actor cannot waive their own discrepancy".into(),
                     ));
                 }
+                if !waiver_scope_covers_envelope(
+                    &waiver.applicability_scope,
+                    &envelope.applicability,
+                ) {
+                    return Err(ContractError::Schema(
+                        "DISC-05: waiver applicability_scope does not cover the envelope's applicability"
+                            .into(),
+                    ));
+                }
             }
             LifecycleTransitionV1::Acknowledge { .. } => {}
         }
+    }
+    // AUTH-03 also covers a bare verification-state change: refuting a
+    // finding is the strongest possible suppression a verification update can
+    // achieve, so it is gated by the same self-implication check as
+    // Dismiss/Resolve/Waive, at minimum. Promotion to `Verified` with no
+    // evidence is rejected earlier, structurally, by
+    // `VerificationUpdateV1::validate_shape`.
+    if let Some(update) = &event.verification_update
+        && update.state == VerificationState::Refuted
+        && is_self_implicated(envelope, &update.actor.principal_id)
+    {
+        return Err(ContractError::Schema(
+            "AUTH-03: an implicated actor cannot refute their own finding".into(),
+        ));
     }
     Ok(())
 }
@@ -1106,14 +1368,30 @@ pub struct DiscrepancyEpisodeProjectionV1 {
 /// waiver whose `expiry_at` has passed returns the lifecycle state to `open`
 /// without erasing or splitting the underlying interval and without discarding
 /// the waiver context (DISC-05, DISC-03).
+///
+/// `relations` is the full set of [`DiscrepancyEpisodeRelationV1`] records that
+/// may name this envelope's episode. Whenever a `superseded` relation's
+/// `from_episodes` contains `envelope.episode_fingerprint` -- i.e. this is the
+/// OLD side of a canonical replacement -- the projection is
+/// [`LifecycleState::Superseded`], overriding whatever lifecycle transitions
+/// replayed above it (a replaced episode is frozen, not reopened by a later
+/// waiver expiry). This is the only producer of `Superseded`: the variant is
+/// otherwise unreachable, matching the doc's "replay ... marks the earlier
+/// projections superseded, retaining explicit `combined_from` or `continues`
+/// relations." Pass `&[]` when no relation set applies (an episode with no
+/// known supersession is never superseded).
 pub fn project_discrepancy_episode(
     envelope: &DiscrepancyEnvelopeV1,
     events: &[DiscrepancyLifecycleEventV1],
+    relations: &[DiscrepancyEpisodeRelationV1],
     evaluation_time: &CanonicalTimestamp,
 ) -> ContractResult<DiscrepancyEpisodeProjectionV1> {
     envelope.validate_shape()?;
     for event in events {
         authorize_lifecycle_transition(envelope, event)?;
+    }
+    for relation in relations {
+        relation.validate_shape()?;
     }
 
     let mut ordered: Vec<(&DiscrepancyLifecycleEventV1, Vec<u8>)> = events
@@ -1140,8 +1418,8 @@ pub fn project_discrepancy_episode(
     };
 
     for (event, _) in ordered {
-        if let Some(update) = event.verification_update {
-            state.verification_state = update;
+        if let Some(update) = &event.verification_update {
+            state.verification_state = update.state;
         }
         match &event.lifecycle_transition {
             Some(LifecycleTransitionV1::Acknowledge { .. }) => {
@@ -1190,6 +1468,21 @@ pub fn project_discrepancy_episode(
         && &waiver.expiry_at <= evaluation_time
     {
         state.lifecycle_state = LifecycleState::Open;
+    }
+
+    // A canonical replacement freezes the old side's projection: this check
+    // runs last so supersession dominates every event-driven transition and
+    // the waiver-expiry reopen above, retaining the episode's history without
+    // erasing it (doc: "marks the earlier projections superseded, retaining
+    // explicit ... relations").
+    let is_superseded = relations.iter().any(|relation| {
+        relation.kind == EpisodeRelationKindV1::Superseded
+            && relation
+                .from_episodes
+                .contains(&envelope.episode_fingerprint)
+    });
+    if is_superseded {
+        state.lifecycle_state = LifecycleState::Superseded;
     }
 
     Ok(state)
@@ -1262,7 +1555,7 @@ mod tests {
     const COMPARATOR_LINEAGE_FINGERPRINT: &str =
         "11589b382071ef9df593ef7efe4df898f2ad4ed8e1775a011d4ec3912a5116d2";
     const VECTOR_SUITE_DIGEST: &str =
-        "069827cc724d8376484ba9550fcc20984402635c175cb6ee67b5074d451b3cf5";
+        "49f31ef97bfea3adde890e622e6147c1c251559f081b87259a9a812737fee017";
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -1425,6 +1718,52 @@ mod tests {
         bound
     }
 
+    /// The registry entry that structurally resolves to [`comparator_lineage`]
+    /// plus the registry-declared required-applicability-dimension set, using
+    /// the same test-constructed-data convention as `episode_policy_entry()`.
+    fn comparator_lineage_registration_entry() -> RegistryEntryV1 {
+        let registration = ComparatorLineageRegistrationV1 {
+            schema_version: COMPARATOR_LINEAGE_REGISTRATION_SCHEMA_VERSION,
+            lineage: comparator_lineage(),
+            required_applicability_dimension_ids: vec![
+                ContractId::new("runtime_environment").unwrap(),
+            ],
+        };
+        let body_bytes = encode_canonical(&registration).unwrap();
+        let body: CanonicalValue = decode_strict(&body_bytes).unwrap();
+        RegistryEntryV1 {
+            schema_version: 1,
+            kind: RegistryEntryKind::PredicateSchema,
+            entry_id: registration.lineage.comparator_id.clone(),
+            version: registration.lineage.comparator_version,
+            entry_schema_id: ContractId::new(COMPARATOR_LINEAGE_ENTRY_SCHEMA_ID).unwrap(),
+            entry_schema_version: COMPARATOR_LINEAGE_REGISTRATION_SCHEMA_VERSION,
+            body,
+            positive_vector_digest: digest(
+                "cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11cc11",
+            ),
+            negative_vector_digest: digest(
+                "dd11dd11dd11dd11dd11dd11dd11dd11dd11dd11dd11dd11dd11dd11dd11dd11",
+            ),
+        }
+    }
+
+    fn resolved_comparator_lineage() -> StructurallyResolvedComparatorLineageV1 {
+        StructurallyResolvedComparatorLineageV1::from_registry_entry(
+            &comparator_lineage_registration_entry(),
+        )
+        .unwrap()
+    }
+
+    /// Recompute `family_fingerprint`/`episode_fingerprint` from an envelope's
+    /// current fields, using the module's own private preimage computation
+    /// (visible here as a descendant module) rather than re-deriving the
+    /// preimage by hand at every call site.
+    fn refingerprint(envelope: &mut DiscrepancyEnvelopeV1) {
+        envelope.family_fingerprint = envelope.compute_family_fingerprint().unwrap();
+        envelope.episode_fingerprint = envelope.compute_episode_fingerprint().unwrap();
+    }
+
     fn applicability() -> Vec<ApplicabilityDimensionV1> {
         vec![
             ApplicabilityDimensionV1 {
@@ -1532,7 +1871,7 @@ mod tests {
         episode_fingerprint: DiscrepancyEpisodeFingerprintV1,
         effective_at: &str,
         transition: Option<LifecycleTransitionV1>,
-        verification_update: Option<VerificationState>,
+        verification_update: Option<VerificationUpdateV1>,
         evidence_digit: char,
     ) -> DiscrepancyLifecycleEventV1 {
         DiscrepancyLifecycleEventV1 {
@@ -1661,9 +2000,13 @@ mod tests {
     fn negative_cases() -> Vec<String> {
         [
             "applicability_duplicate_or_unsorted",
+            "comparator_lineage_fingerprint_diverges_from_registry",
+            "comparator_lineage_requires_concrete_applicability_for_required_dimensions",
+            "comparator_lineage_requires_coverage_receipt_when_coverage_proof_required",
             "comparator_lineage_version_bump_changes_lineage_fingerprint",
             "continuity_key_dimension_missing_from_applicability",
             "dismiss_missing_or_empty_rationale",
+            "envelope_comparator_lineage_required_applicability_dimension_ids_diverge_from_registry",
             "envelope_continuity_key_diverges_from_registered_episode_policy",
             "envelope_episode_fingerprint_mismatch",
             "envelope_episode_policy_reference_diverges_from_registry_entry_digest",
@@ -1678,9 +2021,14 @@ mod tests {
             "repeated_waiver_drift_is_never_verified",
             "required_applicability_dimension_omitted_is_not_any",
             "resolve_requires_nonempty_evidence",
+            "self_implicated_verification_refutation_violates_auth_03",
             "self_implicated_waiver_violates_separation_of_duty",
+            "superseded_lifecycle_state_reachable_via_episode_relation",
+            "unattributed_verification_update_is_not_representable",
             "unknown_finding_type",
+            "verified_promotion_requires_nonempty_evidence",
             "waiver_missing_actor_or_expiry",
+            "waiver_scope_out_of_scope_or_alien_dimension_is_rejected",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -1844,11 +2192,13 @@ mod tests {
         let acknowledged = project_discrepancy_episode(
             &first,
             &[acknowledge_event(episode_fingerprint)],
+            &[],
             &CanonicalTimestamp::parse("2026-08-15T05:01:00.000000000Z").unwrap(),
         )
         .unwrap();
         let untouched = project_discrepancy_episode(
             &first,
+            &[],
             &[],
             &CanonicalTimestamp::parse("2026-08-15T05:01:00.000000000Z").unwrap(),
         )
@@ -1912,6 +2262,40 @@ mod tests {
             earlier_evidence.episode_fingerprint,
         );
         replacement.validate_shape().unwrap();
+
+        // "Old marked superseded, retained" (doc lines 1353-1356): the OLD
+        // side's projection is `Superseded` once the relation is supplied,
+        // and the NEW side's is not -- neither episode's own fingerprint
+        // changes because of the relation (retention without erasure; the
+        // relation is an append-only sibling record, never a rewrite).
+        let eval_time = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap();
+        let old_side = project_discrepancy_episode(
+            &original,
+            &[],
+            std::slice::from_ref(&replacement),
+            &eval_time,
+        )
+        .unwrap();
+        assert_eq!(old_side.lifecycle_state, LifecycleState::Superseded);
+        assert_eq!(old_side.episode_fingerprint, original.episode_fingerprint);
+
+        let new_side = project_discrepancy_episode(
+            &earlier_evidence,
+            &[],
+            std::slice::from_ref(&replacement),
+            &eval_time,
+        )
+        .unwrap();
+        assert_ne!(new_side.lifecycle_state, LifecycleState::Superseded);
+        assert_eq!(
+            new_side.episode_fingerprint,
+            earlier_evidence.episode_fingerprint
+        );
+
+        // An episode with no relation naming it at all is never superseded --
+        // `Superseded` is unreachable except through an explicit relation.
+        let unrelated = project_discrepancy_episode(&original, &[], &[], &eval_time).unwrap();
+        assert_ne!(unrelated.lifecycle_state, LifecycleState::Superseded);
     }
 
     #[test]
@@ -1954,6 +2338,7 @@ mod tests {
         let resolved = project_discrepancy_episode(
             &original,
             &[resolve_event(episode_fingerprint)],
+            &[],
             &CanonicalTimestamp::parse("2026-08-15T06:01:00.000000000Z").unwrap(),
         )
         .unwrap();
@@ -2018,6 +2403,7 @@ mod tests {
         let before_expiry = project_discrepancy_episode(
             &envelope,
             &events,
+            &[],
             &CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap(),
         )
         .unwrap();
@@ -2027,6 +2413,7 @@ mod tests {
         let after_expiry = project_discrepancy_episode(
             &envelope,
             &events,
+            &[],
             &CanonicalTimestamp::parse("2026-08-21T00:00:00.000000000Z").unwrap(),
         )
         .unwrap();
@@ -2039,6 +2426,30 @@ mod tests {
         );
         assert_eq!(envelope.effective_from, original_interval.effective_from);
         assert_eq!(envelope.effective_until, original_interval.effective_until);
+    }
+
+    #[test]
+    fn superseded_dominates_a_waiver_expiry_reopen() {
+        // A replaced episode is frozen: supersession must win even when an
+        // expired waiver would otherwise have reopened it to `Open`.
+        let envelope = envelope();
+        let new_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "5555555555555555555555555555555555555555555555555555555555555555",
+        ));
+        let relation = episode_relation_split(envelope.episode_fingerprint, new_episode);
+        let events = [waive_event(
+            envelope.episode_fingerprint,
+            "principal.on_call",
+            "2026-08-20T00:00:00.000000000Z",
+        )];
+        let after_expiry = project_discrepancy_episode(
+            &envelope,
+            &events,
+            &[relation],
+            &CanonicalTimestamp::parse("2026-08-21T00:00:00.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after_expiry.lifecycle_state, LifecycleState::Superseded);
     }
 
     #[test]
@@ -2082,6 +2493,7 @@ mod tests {
                 second_resolve.clone(),
                 third_resolve.clone(),
             ],
+            &[],
             &CanonicalTimestamp::parse("2026-08-15T11:00:00.000000000Z").unwrap(),
         )
         .unwrap();
@@ -2093,6 +2505,7 @@ mod tests {
         let reordered = project_discrepancy_episode(
             &envelope,
             &[third_resolve, first_resolve, second_resolve],
+            &[],
             &CanonicalTimestamp::parse("2026-08-15T11:00:00.000000000Z").unwrap(),
         )
         .unwrap();
@@ -2301,6 +2714,7 @@ mod tests {
         let untouched = project_discrepancy_episode(
             &envelope,
             &[],
+            &[],
             &CanonicalTimestamp::parse("2026-08-15T04:06:00.000000000Z").unwrap(),
         )
         .unwrap();
@@ -2438,7 +2852,13 @@ mod tests {
         assert!(empty.validate_shape().is_err());
 
         let mut only_verification = empty;
-        only_verification.verification_update = Some(VerificationState::Verified);
+        only_verification.verification_update = Some(VerificationUpdateV1 {
+            actor: DiscrepancyActorV1 {
+                principal_id: ContractId::new("principal.on_call").unwrap(),
+            },
+            state: VerificationState::Verified,
+            evidence_event_ids: vec![evidence_id('b')],
+        });
         assert!(only_verification.validate_shape().is_ok());
     }
 
@@ -2561,6 +2981,101 @@ mod tests {
             authorize_lifecycle_transition(&non_conflict, &spec_nonconformance_self_waiver)
                 .is_err()
         );
+    }
+
+    fn waiver_with_scope(
+        actor_id: &str,
+        expiry_at: &str,
+        applicability_scope: Vec<ApplicabilityDimensionV1>,
+    ) -> WaiverRecordV1 {
+        WaiverRecordV1 {
+            applicability_scope,
+            ..waiver_record(actor_id, expiry_at)
+        }
+    }
+
+    #[test]
+    fn disc_05_waiver_scope_must_cover_the_envelope_applicability() {
+        let envelope = envelope();
+        // Positive: a scope entry that exactly matches an applicability
+        // dimension the envelope actually carries covers, and authorizes,
+        // the waiver.
+        let covered = lifecycle_event(
+            envelope.episode_fingerprint,
+            "2026-08-15T05:10:00.000000000Z",
+            Some(LifecycleTransitionV1::Waive {
+                waiver: waiver_with_scope(
+                    "principal.on_call",
+                    "2026-09-01T00:00:00.000000000Z",
+                    vec![applicability()[1].clone()],
+                ),
+            }),
+            None,
+            'a',
+        );
+        authorize_lifecycle_transition(&envelope, &covered).unwrap();
+        let projection = project_discrepancy_episode(
+            &envelope,
+            &[covered],
+            &[],
+            &CanonicalTimestamp::parse("2026-08-15T06:00:00.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(projection.lifecycle_state, LifecycleState::Waived);
+
+        // Negative: a scope entry naming the same dimension_id the envelope
+        // carries, but a DIFFERENT concrete value, does not cover -- an
+        // "out-of-scope" waiver must not suppress the episode.
+        let out_of_scope_value = ApplicabilityDimensionV1 {
+            dimension_id: ContractId::new("runtime_environment").unwrap(),
+            value: ApplicabilityDimensionValueV1::Concrete {
+                resource: resource(IdentityForm::Entity, "environment", '7'),
+            },
+        };
+        let out_of_scope = lifecycle_event(
+            envelope.episode_fingerprint,
+            "2026-08-15T05:10:00.000000000Z",
+            Some(LifecycleTransitionV1::Waive {
+                waiver: waiver_with_scope(
+                    "principal.on_call",
+                    "2026-09-01T00:00:00.000000000Z",
+                    vec![out_of_scope_value],
+                ),
+            }),
+            None,
+            'a',
+        );
+        assert!(authorize_lifecycle_transition(&envelope, &out_of_scope).is_err());
+
+        // Negative: a scope entry naming a dimension_id the envelope does not
+        // carry at all does not cover either.
+        let alien_dimension = ApplicabilityDimensionV1 {
+            dimension_id: ContractId::new("totally_unrelated_dimension").unwrap(),
+            value: ApplicabilityDimensionValueV1::Any,
+        };
+        let alien = lifecycle_event(
+            envelope.episode_fingerprint,
+            "2026-08-15T05:10:00.000000000Z",
+            Some(LifecycleTransitionV1::Waive {
+                waiver: waiver_with_scope(
+                    "principal.on_call",
+                    "2026-09-01T00:00:00.000000000Z",
+                    vec![alien_dimension],
+                ),
+            }),
+            None,
+            'a',
+        );
+        assert!(authorize_lifecycle_transition(&envelope, &alien).is_err());
+
+        // Empty scope (the default `waiver_record`/`waive_event` fixtures use)
+        // always covers: it applies to the full episode applicability.
+        let empty_scope = waive_event(
+            envelope.episode_fingerprint,
+            "principal.on_call",
+            "2026-09-01T00:00:00.000000000Z",
+        );
+        authorize_lifecycle_transition(&envelope, &empty_scope).unwrap();
     }
 
     #[test]
@@ -2700,6 +3215,126 @@ mod tests {
     }
 
     #[test]
+    fn envelope_validates_against_its_exact_registered_comparator_lineage() {
+        // Positive: the shared `envelope()` fixture's comparator lineage
+        // fingerprint, required-applicability-dimension set, concrete
+        // applicability, and (empty, since `coverage_proof_required` is
+        // false) coverage receipts all satisfy the registered lineage.
+        envelope()
+            .validate_against_comparator_lineage(&resolved_comparator_lineage())
+            .unwrap();
+    }
+
+    #[test]
+    fn envelope_comparator_lineage_fingerprint_divergent_from_registry_is_rejected() {
+        // (a): a self-consistent envelope whose comparator lineage fingerprint
+        // names a *different* (version-bumped) lineage than the one
+        // `resolved_comparator_lineage()` resolves must be rejected -- the
+        // envelope alone proves nothing about which lineage is registered.
+        let mut bumped_lineage = comparator_lineage();
+        bumped_lineage.comparator_version += 1;
+        let mut divergent = envelope();
+        divergent.comparator_lineage_fingerprint = bumped_lineage.fingerprint().unwrap();
+        refingerprint(&mut divergent);
+        divergent.validate_shape().unwrap();
+        assert!(
+            divergent
+                .validate_against_comparator_lineage(&resolved_comparator_lineage())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn envelope_required_applicability_dimension_ids_divergent_from_registry_is_rejected() {
+        // (d): `validate_shape` alone accepts any producer-declared required
+        // set that is a subset of `applicability` -- including the empty
+        // set. The registered comparator lineage requires
+        // `[runtime_environment]`; a producer that declares no required
+        // dimensions at all must still be rejected once checked against the
+        // registry.
+        let mut no_required = envelope();
+        no_required.required_applicability_dimension_ids = vec![];
+        refingerprint(&mut no_required);
+        no_required.validate_shape().unwrap();
+        assert!(
+            no_required
+                .validate_against_comparator_lineage(&resolved_comparator_lineage())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn envelope_any_applicability_under_concrete_requirement_is_rejected() {
+        // (b): the registered lineage has `concrete_applicability_required =
+        // true`. `validate_shape` alone accepts a required dimension whose
+        // value is `Any` -- `Any` merely has to be *present*, not concrete.
+        // The registry-bound check must reject it.
+        let mut any_required = envelope();
+        any_required.applicability[1].value = ApplicabilityDimensionValueV1::Any;
+        refingerprint(&mut any_required);
+        any_required.validate_shape().unwrap();
+        assert!(
+            any_required
+                .validate_against_comparator_lineage(&resolved_comparator_lineage())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn envelope_missing_coverage_receipt_under_coverage_requirement_is_rejected() {
+        // (c): a lineage registered with `coverage_proof_required = true`
+        // rejects an envelope with no coverage receipts, and accepts one with
+        // at least one.
+        let mut coverage_required_lineage = comparator_lineage();
+        coverage_required_lineage.coverage_proof_required = true;
+        let registration = ComparatorLineageRegistrationV1 {
+            schema_version: COMPARATOR_LINEAGE_REGISTRATION_SCHEMA_VERSION,
+            lineage: coverage_required_lineage.clone(),
+            required_applicability_dimension_ids: vec![
+                ContractId::new("runtime_environment").unwrap(),
+            ],
+        };
+        let body_bytes = encode_canonical(&registration).unwrap();
+        let body: CanonicalValue = decode_strict(&body_bytes).unwrap();
+        let entry = RegistryEntryV1 {
+            schema_version: 1,
+            kind: RegistryEntryKind::PredicateSchema,
+            entry_id: coverage_required_lineage.comparator_id.clone(),
+            version: coverage_required_lineage.comparator_version,
+            entry_schema_id: ContractId::new(COMPARATOR_LINEAGE_ENTRY_SCHEMA_ID).unwrap(),
+            entry_schema_version: COMPARATOR_LINEAGE_REGISTRATION_SCHEMA_VERSION,
+            body,
+            positive_vector_digest: digest(
+                "ee22ee22ee22ee22ee22ee22ee22ee22ee22ee22ee22ee22ee22ee22ee22ee22",
+            ),
+            negative_vector_digest: digest(
+                "ff22ff22ff22ff22ff22ff22ff22ff22ff22ff22ff22ff22ff22ff22ff22ff22",
+            ),
+        };
+        let resolved =
+            StructurallyResolvedComparatorLineageV1::from_registry_entry(&entry).unwrap();
+
+        let mut no_coverage = envelope();
+        no_coverage.comparator_lineage_fingerprint =
+            coverage_required_lineage.fingerprint().unwrap();
+        refingerprint(&mut no_coverage);
+        no_coverage.validate_shape().unwrap();
+        assert!(no_coverage.coverage_receipt_ids.is_empty());
+        assert!(
+            no_coverage
+                .validate_against_comparator_lineage(&resolved)
+                .is_err()
+        );
+
+        let mut with_coverage = no_coverage;
+        with_coverage.coverage_receipt_ids = vec![evidence_id('9')];
+        with_coverage.validate_shape().unwrap();
+        with_coverage
+            .validate_against_comparator_lineage(&resolved)
+            .unwrap();
+    }
+
+    #[test]
     fn unknown_finding_type_and_unknown_fields_fail_closed() {
         let canonical = record(ENVELOPE_FIXTURE);
         let mut value: serde_json::Value = serde_json::from_slice(canonical).unwrap();
@@ -2731,6 +3366,90 @@ mod tests {
 
         value.as_object_mut().unwrap().remove("expiry_at");
         assert!(decode_strict::<WaiverRecordV1>(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn unattributed_verification_update_fails_to_deserialize() {
+        // AUTH-03: an actor-free verification-state change (the wire shape
+        // this closes) cannot even be constructed by a well-typed caller,
+        // matching `WaiverRecordV1`'s mandatory-`actor` convention.
+        let update = VerificationUpdateV1 {
+            actor: DiscrepancyActorV1 {
+                principal_id: ContractId::new("principal.on_call").unwrap(),
+            },
+            state: VerificationState::Refuted,
+            evidence_event_ids: vec![],
+        };
+        let mut value = serde_json::to_value(&update).unwrap();
+        value.as_object_mut().unwrap().remove("actor");
+        assert!(
+            decode_strict::<VerificationUpdateV1>(&serde_json::to_vec(&value).unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn promotion_to_verified_with_empty_evidence_is_rejected() {
+        // PRED-01/PRED-05: a verified discrepancy cites evidence -- promotion
+        // to `Verified` with no evidence is rejected at shape validation, not
+        // left to a caller to remember to check.
+        let evidence_free_promotion = VerificationUpdateV1 {
+            actor: DiscrepancyActorV1 {
+                principal_id: ContractId::new("principal.on_call").unwrap(),
+            },
+            state: VerificationState::Verified,
+            evidence_event_ids: vec![],
+        };
+        assert!(evidence_free_promotion.validate_shape().is_err());
+
+        let evidenced_promotion = VerificationUpdateV1 {
+            evidence_event_ids: vec![evidence_id('b')],
+            ..evidence_free_promotion
+        };
+        assert!(evidenced_promotion.validate_shape().is_ok());
+
+        // Refuted/Candidate/Indeterminate never require evidence.
+        let evidence_free_refutation = VerificationUpdateV1 {
+            actor: DiscrepancyActorV1 {
+                principal_id: ContractId::new("principal.on_call").unwrap(),
+            },
+            state: VerificationState::Refuted,
+            evidence_event_ids: vec![],
+        };
+        assert!(evidence_free_refutation.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn auth_03_rejects_self_implicated_verification_refutation() {
+        let envelope = envelope();
+        let self_implicated_refutation = lifecycle_event(
+            envelope.episode_fingerprint,
+            "2026-08-15T05:20:00.000000000Z",
+            None,
+            Some(VerificationUpdateV1 {
+                actor: DiscrepancyActorV1 {
+                    principal_id: ContractId::new("principal.author_a").unwrap(),
+                },
+                state: VerificationState::Refuted,
+                evidence_event_ids: vec![],
+            }),
+            'f',
+        );
+        assert!(authorize_lifecycle_transition(&envelope, &self_implicated_refutation).is_err());
+
+        let independent_refutation = lifecycle_event(
+            envelope.episode_fingerprint,
+            "2026-08-15T05:20:00.000000000Z",
+            None,
+            Some(VerificationUpdateV1 {
+                actor: DiscrepancyActorV1 {
+                    principal_id: ContractId::new("principal.on_call").unwrap(),
+                },
+                state: VerificationState::Refuted,
+                evidence_event_ids: vec![],
+            }),
+            'f',
+        );
+        authorize_lifecycle_transition(&envelope, &independent_refutation).unwrap();
     }
 
     #[test]
