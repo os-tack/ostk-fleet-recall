@@ -558,9 +558,9 @@ fn registry_head_output(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-    use std::ffi::OsStr;
-    use std::fs;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::{OsStr, OsString};
+    use std::fs::{self, OpenOptions};
     use std::io::Write as _;
     use std::process::Command as ProcessCommand;
     use std::str::FromStr as _;
@@ -569,15 +569,18 @@ mod tests {
     use ostk_fleet_recall::memory_contracts::bootstrap::{
         AppendPositionV1, CommittedOffsetV1, EpochId,
     };
-    use ostk_fleet_recall::memory_contracts::common::{CanonicalTimestamp, ContractId};
+    use ostk_fleet_recall::memory_contracts::common::{CanonicalTimestamp, ContractId, FixedHex64};
     use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
     use ostk_fleet_recall::memory_contracts::evidence::AcceptedEventId;
     use ostk_fleet_recall::memory_contracts::evidence_v2::RegistryHeadBindingV1;
     use ostk_fleet_recall::memory_contracts::genesis_activation::RegistryTestResultDigest;
     use ostk_fleet_recall::memory_contracts::registry::RegistryHeadV1;
     use ostk_fleet_recall::memory_contracts::successor_activation::{
-        SuccessorRegistryActivationId, SuccessorRegistryActivationStatementId,
+        SuccessorRegistryActivationApprovalV1, SuccessorRegistryActivationId,
+        SuccessorRegistryActivationStatementId,
     };
+    use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    use sha2::{Digest as _, Sha256};
     use sqlx::ConnectOptions as _;
 
     use super::*;
@@ -612,6 +615,36 @@ mod tests {
     const BRIDGE_DIGEST: &str = "e15309eba5118e21996a7cee6b3780c1a237982bdf4f22460bca4da189ef6592";
     const EXPLICIT_URL: &str = "postgresql://successor:explicit-secret@cluster.example:26257/fleet_recall?sslmode=verify-full";
     const SUBPROCESS_CASE: &str = "FLEET_RECALL_SUCCESSOR_SUBPROCESS_CASE";
+    const SUCCESSOR_FIXTURE_ENV_PREFIX: &str = "FLEET_RECALL_SUCCESSOR_CLI_";
+    const SUCCESSOR_FIXTURE_DIR_ENV: &str = "FLEET_RECALL_SUCCESSOR_CLI_FIXTURE_DIR";
+    const SUCCESSOR_FIXTURE_GENESIS_ACTIVATION_ID_ENV: &str =
+        "FLEET_RECALL_SUCCESSOR_CLI_GENESIS_ACTIVATION_ID";
+    const SUCCESSOR_FIXTURE_GENESIS_PACKAGE_DIGEST_ENV: &str =
+        "FLEET_RECALL_SUCCESSOR_CLI_GENESIS_PACKAGE_DIGEST";
+    const SUCCESSOR_FIXTURE_GENESIS_ACTIVATION_POLICY_DIGEST_ENV: &str =
+        "FLEET_RECALL_SUCCESSOR_CLI_GENESIS_ACTIVATION_POLICY_DIGEST";
+    const SUCCESSOR_FIXTURE_GENESIS_EFFECTIVE_FROM_ENV: &str =
+        "FLEET_RECALL_SUCCESSOR_CLI_GENESIS_EFFECTIVE_FROM";
+    const SUCCESSOR_FIXTURE_EFFECTIVE_FROM_ENV: &str = "FLEET_RECALL_SUCCESSOR_CLI_EFFECTIVE_FROM";
+    const SUCCESSOR_FIXTURE_STALE_EFFECTIVE_FROM_ENV: &str =
+        "FLEET_RECALL_SUCCESSOR_CLI_STALE_EFFECTIVE_FROM";
+    const SUCCESSOR_FIXTURE_ENV_NAMES: [&str; 7] = [
+        SUCCESSOR_FIXTURE_DIR_ENV,
+        SUCCESSOR_FIXTURE_GENESIS_ACTIVATION_ID_ENV,
+        SUCCESSOR_FIXTURE_GENESIS_PACKAGE_DIGEST_ENV,
+        SUCCESSOR_FIXTURE_GENESIS_ACTIVATION_POLICY_DIGEST_ENV,
+        SUCCESSOR_FIXTURE_GENESIS_EFFECTIVE_FROM_ENV,
+        SUCCESSOR_FIXTURE_EFFECTIVE_FROM_ENV,
+        SUCCESSOR_FIXTURE_STALE_EFFECTIVE_FROM_ENV,
+    ];
+    const MAX_SUCCESSOR_FIXTURE_PATH_BYTES: usize = 4_096;
+
+    const EMITTED_BRIDGE: &str = "genesis-successor-key-bridge.jsonl";
+    const EMITTED_BRIDGE_DIGEST: &str = "genesis-successor-key-bridge-digest.txt";
+    const EMITTED_STATEMENT: &str = "activation-statement.jsonl";
+    const EMITTED_APPROVAL_SET: &str = "activation-approval-set.jsonl";
+    const EMITTED_STALE_STATEMENT: &str = "activation-statement-stale.jsonl";
+    const EMITTED_STALE_APPROVAL_SET: &str = "activation-approval-set-stale.jsonl";
 
     fn digest(value: &str) -> Sha256Digest {
         Sha256Digest::from_str(value).unwrap()
@@ -662,6 +695,442 @@ mod tests {
                 ContractId::new("principal.author").unwrap(),
             ),
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct DynamicSuccessorFixtureInput {
+        output_directory: PathBuf,
+        genesis_head: RegistryHeadBindingV1,
+        effective_from: CanonicalTimestamp,
+        stale_effective_from: CanonicalTimestamp,
+    }
+
+    #[derive(Debug)]
+    struct DynamicSuccessorFixture {
+        canonical_bridge: Vec<u8>,
+        bridge_digest: GenesisSuccessorKeyBridgeDigest,
+        canonical_statement: Vec<u8>,
+        canonical_approval_set: Vec<u8>,
+        canonical_stale_statement: Vec<u8>,
+        canonical_stale_approval_set: Vec<u8>,
+    }
+
+    fn dynamic_successor_fixture_input_from_env() -> anyhow::Result<DynamicSuccessorFixtureInput> {
+        let variables = std::env::vars_os().filter(|(name, _)| {
+            name.as_encoded_bytes()
+                .starts_with(SUCCESSOR_FIXTURE_ENV_PREFIX.as_bytes())
+        });
+        dynamic_successor_fixture_input_from_variables(variables)
+    }
+
+    fn dynamic_successor_fixture_input_from_variables(
+        variables: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> anyhow::Result<DynamicSuccessorFixtureInput> {
+        let mut values = BTreeMap::new();
+        for (name, value) in variables {
+            let name = name
+                .into_string()
+                .map_err(|_| anyhow!("successor fixture environment name is not UTF-8"))?;
+            ensure!(
+                SUCCESSOR_FIXTURE_ENV_NAMES.contains(&name.as_str()),
+                "unexpected successor fixture environment variable {name}"
+            );
+            let value = value
+                .into_string()
+                .map_err(|_| anyhow!("successor fixture environment value is not UTF-8"))?;
+            ensure!(
+                values.insert(name.clone(), value).is_none(),
+                "duplicate successor fixture environment variable {name}"
+            );
+        }
+        ensure!(
+            values.len() == SUCCESSOR_FIXTURE_ENV_NAMES.len(),
+            "successor fixture environment contract is incomplete"
+        );
+
+        let directory = take_fixture_env_value(&mut values, SUCCESSOR_FIXTURE_DIR_ENV)?;
+        ensure!(
+            !directory.is_empty() && directory.len() <= MAX_SUCCESSOR_FIXTURE_PATH_BYTES,
+            "successor fixture directory path is empty or exceeds its bound"
+        );
+        let directory = PathBuf::from(directory);
+        ensure!(
+            directory.is_absolute(),
+            "successor fixture directory must be an absolute path"
+        );
+        let output_directory =
+            fs::canonicalize(&directory).context("canonicalize successor fixture directory")?;
+        ensure!(
+            output_directory.as_os_str().as_encoded_bytes().len()
+                <= MAX_SUCCESSOR_FIXTURE_PATH_BYTES
+                && output_directory.parent().is_some()
+                && fs::metadata(&output_directory)
+                    .context("inspect successor fixture directory")?
+                    .is_dir(),
+            "successor fixture directory is invalid or exceeds its bound"
+        );
+
+        let activation_id =
+            parse_fixture_digest(&mut values, SUCCESSOR_FIXTURE_GENESIS_ACTIVATION_ID_ENV)?;
+        let package_digest =
+            parse_fixture_digest(&mut values, SUCCESSOR_FIXTURE_GENESIS_PACKAGE_DIGEST_ENV)?;
+        let activation_policy_digest = parse_fixture_digest(
+            &mut values,
+            SUCCESSOR_FIXTURE_GENESIS_ACTIVATION_POLICY_DIGEST_ENV,
+        )?;
+        let genesis_effective_from =
+            parse_fixture_timestamp(&mut values, SUCCESSOR_FIXTURE_GENESIS_EFFECTIVE_FROM_ENV)?;
+        let effective_from =
+            parse_fixture_timestamp(&mut values, SUCCESSOR_FIXTURE_EFFECTIVE_FROM_ENV)?;
+        let stale_effective_from =
+            parse_fixture_timestamp(&mut values, SUCCESSOR_FIXTURE_STALE_EFFECTIVE_FROM_ENV)?;
+        ensure!(
+            effective_from != stale_effective_from,
+            "successor fixture statements must have distinct effective timestamps"
+        );
+        ensure!(
+            values.is_empty(),
+            "successor fixture environment contract was not consumed exactly"
+        );
+
+        let genesis_head = RegistryHeadBindingV1 {
+            head: RegistryHeadV1 {
+                activation_id,
+                package_digest,
+                activation_policy_digest,
+            },
+            effective_from: genesis_effective_from,
+            effective_until: None,
+        };
+        genesis_head.validate_shape()?;
+        Ok(DynamicSuccessorFixtureInput {
+            output_directory,
+            genesis_head,
+            effective_from,
+            stale_effective_from,
+        })
+    }
+
+    fn take_fixture_env_value(
+        values: &mut BTreeMap<String, String>,
+        name: &'static str,
+    ) -> anyhow::Result<String> {
+        values
+            .remove(name)
+            .ok_or_else(|| anyhow!("successor fixture environment contract is missing {name}"))
+    }
+
+    fn parse_fixture_digest(
+        values: &mut BTreeMap<String, String>,
+        name: &'static str,
+    ) -> anyhow::Result<Sha256Digest> {
+        let value = take_fixture_env_value(values, name)?;
+        ensure!(value.len() == 64, "{name} must be one bounded digest");
+        value
+            .parse()
+            .with_context(|| format!("parse successor fixture digest {name}"))
+    }
+
+    fn parse_fixture_timestamp(
+        values: &mut BTreeMap<String, String>,
+        name: &'static str,
+    ) -> anyhow::Result<CanonicalTimestamp> {
+        let value = take_fixture_env_value(values, name)?;
+        ensure!(value.len() == 30, "{name} must be one bounded timestamp");
+        CanonicalTimestamp::parse(value)
+            .with_context(|| format!("parse successor fixture timestamp {name}"))
+    }
+
+    fn dynamic_successor_fixture(
+        input: &DynamicSuccessorFixtureInput,
+    ) -> anyhow::Result<DynamicSuccessorFixture> {
+        let mut bridge: GenesisSuccessorKeyBridgeV1 =
+            decode_strict(&read_framed_canonical_record(Path::new(BRIDGE))?)?;
+        bridge.genesis_registry_head = input.genesis_head.clone();
+        bridge.validate_shape()?;
+        let canonical_bridge = encode_canonical(&bridge)?;
+        ensure!(
+            canonical_bridge.len() <= MAX_INPUT_BYTES,
+            "generated successor bridge exceeds the canonical input bound"
+        );
+        let bridge_digest = GenesisSuccessorKeyBridgeDigest::from_digest(domain_separated_digest(
+            DigestDomain::GenesisSuccessorKeyBridgeV1,
+            &canonical_bridge,
+        ));
+        ensure!(
+            bridge.bridge_digest()? == bridge_digest,
+            "generated successor bridge digest is not canonical"
+        );
+
+        let template: SuccessorRegistryActivationStatementV1 =
+            decode_strict(&read_framed_canonical_record(Path::new(STATEMENT))?)?;
+        let (canonical_statement, canonical_approval_set) = dynamic_successor_statement(
+            &template,
+            &bridge,
+            bridge_digest,
+            input.effective_from.clone(),
+        )?;
+        let (canonical_stale_statement, canonical_stale_approval_set) =
+            dynamic_successor_statement(
+                &template,
+                &bridge,
+                bridge_digest,
+                input.stale_effective_from.clone(),
+            )?;
+        ensure!(
+            canonical_statement != canonical_stale_statement
+                && canonical_approval_set != canonical_stale_approval_set,
+            "generated successor fixture ceremonies must be distinct"
+        );
+
+        Ok(DynamicSuccessorFixture {
+            canonical_bridge,
+            bridge_digest,
+            canonical_statement,
+            canonical_approval_set,
+            canonical_stale_statement,
+            canonical_stale_approval_set,
+        })
+    }
+
+    fn dynamic_successor_statement(
+        template: &SuccessorRegistryActivationStatementV1,
+        bridge: &GenesisSuccessorKeyBridgeV1,
+        bridge_digest: GenesisSuccessorKeyBridgeDigest,
+        effective_from: CanonicalTimestamp,
+    ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        let mut statement = template.clone();
+        statement.expected_predecessor_head = bridge.genesis_registry_head.clone();
+        statement.genesis_successor_key_bridge_digest = bridge_digest;
+        statement.effective_from = effective_from;
+        statement.validate_shape()?;
+        let canonical_statement = encode_canonical(&statement)?;
+        ensure!(
+            canonical_statement.len() <= MAX_INPUT_BYTES,
+            "generated successor statement exceeds the canonical input bound"
+        );
+        let statement_id = statement.statement_id()?;
+        let mut signature_message = SUCCESSOR_APPROVAL_SIGNATURE_PREFIX.to_vec();
+        signature_message.extend_from_slice(statement_id.digest().as_bytes());
+
+        let mut approvals = Vec::with_capacity(2);
+        for (principal, seed) in [("principal.alice", 1_u8), ("principal.bob", 2_u8)] {
+            let principal_id = ContractId::new(principal)?;
+            let key_pair = Ed25519KeyPair::from_seed_unchecked(&[seed; 32])
+                .map_err(|_| anyhow!("construct deterministic successor fixture signer"))?;
+            let bridge_signer = bridge
+                .key_map
+                .iter()
+                .find(|binding| binding.principal_id == principal_id)
+                .ok_or_else(|| anyhow!("successor fixture signer is absent from the bridge"))?;
+            ensure!(
+                bridge_signer.algorithm == ActivationSignatureAlgorithmV2::Ed25519
+                    && bridge_signer.public_key.as_bytes() == key_pair.public_key().as_ref(),
+                "successor fixture signer key does not match the bridge"
+            );
+            let signature: [u8; 64] = key_pair
+                .sign(&signature_message)
+                .as_ref()
+                .try_into()
+                .map_err(|_| anyhow!("successor fixture signature has the wrong length"))?;
+            approvals.push(SuccessorRegistryActivationApprovalV1 {
+                schema_version: 1,
+                statement_id,
+                signer_principal_id: principal_id,
+                signature: FixedHex64::from_bytes(signature),
+            });
+        }
+        approvals.sort_unstable_by(|left, right| {
+            left.signer_principal_id.cmp(&right.signer_principal_id)
+        });
+        let approval_set = SuccessorRegistryActivationApprovalSetV1 {
+            schema_version: 1,
+            statement_id,
+            approvals,
+        };
+        approval_set.validate_shape()?;
+        let canonical_approval_set = encode_canonical(&approval_set)?;
+        ensure!(
+            canonical_approval_set.len() <= MAX_INPUT_BYTES,
+            "generated successor approval set exceeds the canonical input bound"
+        );
+        Ok((canonical_statement, canonical_approval_set))
+    }
+
+    fn verify_dynamic_successor_fixture(fixture: &DynamicSuccessorFixture) -> anyhow::Result<()> {
+        let staging = tempfile::tempdir().context("create successor fixture verification area")?;
+        let bridge = staging.path().join(EMITTED_BRIDGE);
+        let statement = staging.path().join(EMITTED_STATEMENT);
+        let approval_set = staging.path().join(EMITTED_APPROVAL_SET);
+        let stale_statement = staging.path().join(EMITTED_STALE_STATEMENT);
+        let stale_approval_set = staging.path().join(EMITTED_STALE_APPROVAL_SET);
+        write_framed_fixture_record(&bridge, &fixture.canonical_bridge, false)?;
+        write_framed_fixture_record(&statement, &fixture.canonical_statement, false)?;
+        write_framed_fixture_record(&approval_set, &fixture.canonical_approval_set, false)?;
+        write_framed_fixture_record(&stale_statement, &fixture.canonical_stale_statement, false)?;
+        write_framed_fixture_record(
+            &stale_approval_set,
+            &fixture.canonical_stale_approval_set,
+            false,
+        )?;
+
+        let receipt = fixture_receipt();
+        let mut authority = fixture_authority(&receipt);
+        authority.bridge_digest = fixture.bridge_digest;
+        authority.bridge_pin =
+            GenesisSuccessorKeyBridgePin::from_trusted_config(fixture.bridge_digest);
+        let mut paths = artifact_args();
+        paths.genesis_key_bridge = bridge;
+        paths.activation_statement = statement;
+        paths.activation_approval_set = approval_set;
+        verify_artifacts(&paths, &authority)
+            .context("verify generated current successor fixture ceremony")?;
+        paths.activation_statement = stale_statement;
+        paths.activation_approval_set = stale_approval_set;
+        verify_artifacts(&paths, &authority)
+            .context("verify generated stale successor fixture ceremony")?;
+        Ok(())
+    }
+
+    fn emit_dynamic_successor_fixture(
+        input: &DynamicSuccessorFixtureInput,
+        fixture: &DynamicSuccessorFixture,
+    ) -> anyhow::Result<()> {
+        // No destination artifact is created until both generated ceremonies
+        // pass the same complete offline verifier used by the production CLI.
+        verify_dynamic_successor_fixture(fixture)?;
+
+        let outputs = [
+            EMITTED_BRIDGE,
+            EMITTED_BRIDGE_DIGEST,
+            EMITTED_STATEMENT,
+            EMITTED_APPROVAL_SET,
+            EMITTED_STALE_STATEMENT,
+            EMITTED_STALE_APPROVAL_SET,
+        ];
+        for name in outputs {
+            ensure!(
+                !input.output_directory.join(name).exists(),
+                "successor fixture output already exists: {name}"
+            );
+        }
+
+        write_framed_fixture_record(
+            &input.output_directory.join(EMITTED_BRIDGE),
+            &fixture.canonical_bridge,
+            true,
+        )?;
+        write_new_fixture_bytes(
+            &input.output_directory.join(EMITTED_BRIDGE_DIGEST),
+            format!("{}\n", fixture.bridge_digest).as_bytes(),
+        )?;
+        write_framed_fixture_record(
+            &input.output_directory.join(EMITTED_STATEMENT),
+            &fixture.canonical_statement,
+            true,
+        )?;
+        write_framed_fixture_record(
+            &input.output_directory.join(EMITTED_APPROVAL_SET),
+            &fixture.canonical_approval_set,
+            true,
+        )?;
+        write_framed_fixture_record(
+            &input.output_directory.join(EMITTED_STALE_STATEMENT),
+            &fixture.canonical_stale_statement,
+            true,
+        )?;
+        write_framed_fixture_record(
+            &input.output_directory.join(EMITTED_STALE_APPROVAL_SET),
+            &fixture.canonical_stale_approval_set,
+            true,
+        )?;
+        Ok(())
+    }
+
+    fn write_framed_fixture_record(
+        path: &Path,
+        canonical_record: &[u8],
+        create_new: bool,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            !canonical_record.is_empty() && canonical_record.len() <= MAX_INPUT_BYTES,
+            "successor fixture canonical record exceeds its bound"
+        );
+        require_canonical(canonical_record)?;
+        let mut framed = Vec::with_capacity(canonical_record.len() + 1);
+        framed.extend_from_slice(canonical_record);
+        framed.push(b'\n');
+        if create_new {
+            write_new_fixture_bytes(path, &framed)
+        } else {
+            fs::write(path, framed)
+                .with_context(|| format!("write staged successor fixture {}", path.display()))
+        }
+    }
+
+    fn write_new_fixture_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        ensure!(
+            bytes.len() <= MAX_INPUT_BYTES + 1,
+            "successor fixture output exceeds its bound"
+        );
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("create successor fixture output {}", path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("write successor fixture output {}", path.display()))?;
+        file.flush()
+            .with_context(|| format!("flush successor fixture output {}", path.display()))
+    }
+
+    fn raw_sha256(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn checked_in_dynamic_fixture_input(output_directory: PathBuf) -> DynamicSuccessorFixtureInput {
+        let bridge: GenesisSuccessorKeyBridgeV1 =
+            decode_strict(&read_framed_canonical_record(Path::new(BRIDGE)).unwrap()).unwrap();
+        DynamicSuccessorFixtureInput {
+            output_directory,
+            genesis_head: bridge.genesis_registry_head,
+            effective_from: CanonicalTimestamp::parse("2026-08-15T04:10:00.000000000Z").unwrap(),
+            stale_effective_from: CanonicalTimestamp::parse("2026-08-15T04:11:00.000000000Z")
+                .unwrap(),
+        }
+    }
+
+    fn complete_fixture_environment(directory: &Path) -> Vec<(OsString, OsString)> {
+        vec![
+            (
+                SUCCESSOR_FIXTURE_DIR_ENV.into(),
+                directory.as_os_str().to_owned(),
+            ),
+            (
+                SUCCESSOR_FIXTURE_GENESIS_ACTIVATION_ID_ENV.into(),
+                "5a7263f5c98e75b94e82341d2a7729e9578d4691691b5a8401e1c37a83931261".into(),
+            ),
+            (
+                SUCCESSOR_FIXTURE_GENESIS_PACKAGE_DIGEST_ENV.into(),
+                "5a931fd5551bec47f83adb019f3e794d1b6a759f4501e7ea26a83076d9518177".into(),
+            ),
+            (
+                SUCCESSOR_FIXTURE_GENESIS_ACTIVATION_POLICY_DIGEST_ENV.into(),
+                "6f92f99ff35969845f08f9b64cee7d86fa42dc6165ebc617d950be8960b86968".into(),
+            ),
+            (
+                SUCCESSOR_FIXTURE_GENESIS_EFFECTIVE_FROM_ENV.into(),
+                "2026-08-15T03:00:00.000000000Z".into(),
+            ),
+            (
+                SUCCESSOR_FIXTURE_EFFECTIVE_FROM_ENV.into(),
+                "2026-08-15T04:10:00.000000000Z".into(),
+            ),
+            (
+                SUCCESSOR_FIXTURE_STALE_EFFECTIVE_FROM_ENV.into(),
+                "2026-08-15T04:11:00.000000000Z".into(),
+            ),
+        ]
     }
 
     fn assert_exact_keys(value: &Value, expected: &[&str]) {
@@ -716,6 +1185,164 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn dynamic_fixture_environment_is_closed_exact_and_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let variables = complete_fixture_environment(directory.path());
+        let parsed = dynamic_successor_fixture_input_from_variables(variables.clone()).unwrap();
+        assert_eq!(
+            parsed.output_directory,
+            directory.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            parsed.genesis_head.head.activation_id.to_string(),
+            "5a7263f5c98e75b94e82341d2a7729e9578d4691691b5a8401e1c37a83931261"
+        );
+        assert_ne!(parsed.effective_from, parsed.stale_effective_from);
+
+        let mut incomplete = variables.clone();
+        incomplete.pop();
+        assert!(dynamic_successor_fixture_input_from_variables(incomplete).is_err());
+
+        let mut extended = variables.clone();
+        extended.push((
+            "FLEET_RECALL_SUCCESSOR_CLI_UNREVIEWED_INPUT".into(),
+            "attacker-selected".into(),
+        ));
+        assert!(dynamic_successor_fixture_input_from_variables(extended).is_err());
+
+        let mut relative = variables;
+        relative[0].1 = "relative/output".into();
+        assert!(dynamic_successor_fixture_input_from_variables(relative).is_err());
+    }
+
+    #[test]
+    fn dynamic_fixture_bytes_are_canonical_distinct_and_frozen() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = checked_in_dynamic_fixture_input(directory.path().to_owned());
+        let fixture = dynamic_successor_fixture(&input).unwrap();
+        assert_eq!(
+            fixture.canonical_bridge,
+            read_framed_canonical_record(Path::new(BRIDGE)).unwrap()
+        );
+        assert_eq!(fixture.bridge_digest.to_string(), BRIDGE_DIGEST);
+        assert_eq!(
+            fixture.canonical_statement,
+            read_framed_canonical_record(Path::new(STATEMENT)).unwrap()
+        );
+        assert_eq!(
+            fixture.canonical_approval_set,
+            read_framed_canonical_record(Path::new(APPROVAL_SET)).unwrap()
+        );
+
+        let current: SuccessorRegistryActivationStatementV1 =
+            decode_strict(&fixture.canonical_statement).unwrap();
+        let stale: SuccessorRegistryActivationStatementV1 =
+            decode_strict(&fixture.canonical_stale_statement).unwrap();
+        assert_ne!(
+            current.statement_id().unwrap(),
+            stale.statement_id().unwrap()
+        );
+        verify_dynamic_successor_fixture(&fixture).unwrap();
+
+        let framed_hash = |record: &[u8]| {
+            let mut framed = record.to_vec();
+            framed.push(b'\n');
+            raw_sha256(&framed)
+        };
+        assert_eq!(
+            framed_hash(&fixture.canonical_bridge),
+            "e008106413023eb6e9da0e9e200d8b8f58b4cae7434a723a9e2e56f357c3b25b"
+        );
+        assert_eq!(
+            raw_sha256(format!("{}\n", fixture.bridge_digest).as_bytes()),
+            "9cfc18e9360cd36aa018be314a63a6f17e3f2686d51bb1304c7ad4de88e7316c"
+        );
+        assert_eq!(
+            framed_hash(&fixture.canonical_statement),
+            "8ff1523115d72b131f7ae7c65089d48fc0235e6ac53d743bfe3734a144f981a9"
+        );
+        assert_eq!(
+            framed_hash(&fixture.canonical_approval_set),
+            "6f4979d161e5b43c50dfe441095b4682d2b9c523042b87789172ea62f2f59a11"
+        );
+        assert_eq!(
+            framed_hash(&fixture.canonical_stale_statement),
+            "1c00146ff9c1f0ab8c12d0ad067125b8bee5663472db474d9d58bc653f99d83a"
+        );
+        assert_eq!(
+            framed_hash(&fixture.canonical_stale_approval_set),
+            "8b324b85cade594ef5a611460c8820d488d1bb68fd3a1e46df5f3aecd5a27590"
+        );
+    }
+
+    #[test]
+    fn dynamic_fixture_rebinds_fresh_head_and_recomputes_all_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut input = checked_in_dynamic_fixture_input(directory.path().to_owned());
+        input.genesis_head.head.activation_id = digest(&"ab".repeat(32));
+        input.genesis_head.effective_from =
+            CanonicalTimestamp::parse("2026-08-16T03:00:00.000000000Z").unwrap();
+        input.effective_from = CanonicalTimestamp::parse("2026-08-16T04:10:00.000000000Z").unwrap();
+        input.stale_effective_from =
+            CanonicalTimestamp::parse("2026-08-16T04:11:00.000000000Z").unwrap();
+
+        let fixture = dynamic_successor_fixture(&input).unwrap();
+        assert_ne!(fixture.bridge_digest.to_string(), BRIDGE_DIGEST);
+        let bridge: GenesisSuccessorKeyBridgeV1 = decode_strict(&fixture.canonical_bridge).unwrap();
+        assert_eq!(bridge.genesis_registry_head, input.genesis_head);
+
+        let current: SuccessorRegistryActivationStatementV1 =
+            decode_strict(&fixture.canonical_statement).unwrap();
+        let stale: SuccessorRegistryActivationStatementV1 =
+            decode_strict(&fixture.canonical_stale_statement).unwrap();
+        let current_approvals: SuccessorRegistryActivationApprovalSetV1 =
+            decode_strict(&fixture.canonical_approval_set).unwrap();
+        let stale_approvals: SuccessorRegistryActivationApprovalSetV1 =
+            decode_strict(&fixture.canonical_stale_approval_set).unwrap();
+        assert_eq!(current.expected_predecessor_head, input.genesis_head);
+        assert_eq!(stale.expected_predecessor_head, input.genesis_head);
+        assert_eq!(
+            current.genesis_successor_key_bridge_digest,
+            fixture.bridge_digest
+        );
+        assert_eq!(
+            stale.genesis_successor_key_bridge_digest,
+            fixture.bridge_digest
+        );
+        assert_eq!(
+            current_approvals.statement_id,
+            current.statement_id().unwrap()
+        );
+        assert_eq!(stale_approvals.statement_id, stale.statement_id().unwrap());
+        assert_ne!(current_approvals.statement_id, stale_approvals.statement_id);
+        verify_dynamic_successor_fixture(&fixture).unwrap();
+    }
+
+    #[test]
+    fn dynamic_fixture_emitter_has_no_production_surface() {
+        let source = include_str!("ostk-registry-successor-activate.rs");
+        let test_module = source.find("#[cfg(test)]").unwrap();
+        let emitter = source
+            .rfind("fn emit_dynamic_successor_fixture_for_connected_proof()")
+            .unwrap();
+        assert!(test_module < emitter);
+        assert!(source[test_module..emitter].ends_with(
+            "#[ignore = \"test-harness-only; requires the closed successor fixture environment\"]\n    #[test]\n    "
+        ));
+        assert!(Cli::try_parse_from(["ostk-registry-successor-activate", "emit"]).is_err());
+    }
+
+    /// Test-harness-only emitter for a disposable connected role proof. The
+    /// production parser exposes no signing or artifact-generation command.
+    #[ignore = "test-harness-only; requires the closed successor fixture environment"]
+    #[test]
+    fn emit_dynamic_successor_fixture_for_connected_proof() -> anyhow::Result<()> {
+        let input = dynamic_successor_fixture_input_from_env()?;
+        let fixture = dynamic_successor_fixture(&input)?;
+        emit_dynamic_successor_fixture(&input, &fixture)
     }
 
     #[test]
