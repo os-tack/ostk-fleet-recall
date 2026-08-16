@@ -18,9 +18,9 @@ legacy reconciliation; migration 17 adds the covering current-conflict
 detector/state projection index required by normal serving; and migration 18
 adds the Stage-4 runtime foundations recorded in
 [ADR 0002](adr/0002-stage4-runtime-foundations.md): the general accepted-event
-ledger (`memory_evidence_events` plus `memory_evidence_shard_heads`) under the
-control ledger's single log epoch, the quarantine, governed-content, and
-relation-projection tables, the nullable `accepted_event_id` columns on
+ledger (`memory_evidence_events` plus `memory_evidence_shard_heads`, which
+carries no foreign key to any control or registry table), the quarantine,
+governed-content, and relation-projection tables, the nullable `accepted_event_id` columns on
 `memory_claims` and `memory_mutation_receipts`, and the read-only
 `memory_writer_authority_v1` head-witness view.
 
@@ -71,7 +71,16 @@ COLUMN` steps run against schema-locked tables. Every object it creates uses
 `IF NOT EXISTS`, and each new column's CHECK is installed by a separate `ADD
 CONSTRAINT IF NOT EXISTS` rather than inline: an inline named CHECK is not
 resumable, because a re-run skips the existing column and still rejects the
-duplicate constraint name with SQLSTATE `42710`.
+duplicate constraint name with SQLSTATE `42710`. Migration 18 then commits and
+asserts the committed public catalog exactly like v15 through v17: the exact
+ordered column shape of all six new tables and the view, the authority view's
+kind, owner, and complete `pg_get_viewdef` definition, the absence of any
+foreign key on the evidence head table, and the exact events-to-heads
+foreign-key definition. `IF NOT EXISTS` alone would silently ADOPT an unrelated object
+that merely shares a name -- a forged `memory_writer_authority_v1`, or a
+`memory_evidence_quarantine` carrying a payload column -- and record it as a
+successful version 18; every one of those cases now fails with SQLSTATE
+`55000` before SQLx can write its history row.
 
 Those are database correctness guarantees. The original recorded LocalStack
 Docker/Compose application-image smoke stopped at migration 9 and remains only
@@ -206,6 +215,15 @@ needs:
 - `USAGE` on its schema and sequences;
 - only the documented DML privileges on legacy corpus, claim, and projection
   tables;
+- append, head-advance, quarantine and relation-projection privileges on the
+  Stage-4 evidence plane only (`memory_evidence_events`,
+  `memory_evidence_shard_heads`, `memory_evidence_quarantine`,
+  `memory_content_objects`, `memory_relation_projection_v1`,
+  `memory_relation_projection_watermarks_v1`), with no `UPDATE` or `DELETE`
+  on the accepted envelope, no `DELETE` anywhere, and no privilege on any
+  `memory_control_*` or `memory_registry_*` base table;
+- `SELECT` on the migrator-owned `memory_writer_authority_v1` view, which is
+  the writer's only registry/bootstrap read path;
 - read access to SQLx migration metadata for health checks;
 - no `CREATE`, `DROP`, role-management, cluster-setting, or external-connection
   privileges.
@@ -250,8 +268,9 @@ entire positive grant surface is `CONNECT` on `fleet_recall`, `USAGE` on schema
 It has zero DML, DDL, sequence, system, private-table, ownership, grant-option,
 or future-default authority. Apply
 [`publication-reader-role-grants.sql`](../deploy/cockroach/publication-reader-role-grants.sql)
-only as a cluster admin after prefix 1 through 17, with
-`fleet_publication` already drained and set to exact `NOLOGIN`. Audit both
+only as a cluster admin after prefix 1 through 17 -- a bounded gate that stays
+true at eighteen migrations, and which this release deliberately did not move --
+with `fleet_publication` already drained and set to exact `NOLOGIN`. Audit both
 principals and inherited PUBLIC authority across every database, freeze role,
 grant, default, ownership, and schema-DDL dependencies, reapply the policy
 under that freeze, and only then perform the separate exact authentication
@@ -564,11 +583,15 @@ exact failed version:
   exact `indexdef`. If the exact backfill committed without a history row, the
   normal migrator retry preserves it and records success. A missing index is
   rebuilt; a same-name wrong-shape index fails closed.
-- v18 creates six tables, one unique index, one view, two nullable columns, and
-  two named CHECK constraints, every one of them with `IF NOT EXISTS`. Any
+- v18 creates six tables, one unique index, one view, two nullable columns,
+  and two named CHECK constraints, every one of them with `IF NOT EXISTS`, and
+  then proves each object's committed catalog shape. Any
   prefix of that file may already be committed after an interruption; the
   reviewed recovery is the normal migrator retry, which is a no-op for every
   object that already exists. It rewrites no existing row and drops nothing.
+  A `55000` from its closing assertions is not an interruption: it means an
+  object with one of those names is not the object this migration defines, and
+  it requires a separately reviewed forward repair rather than a retry.
 
 1. Leave the application service at zero.
 2. Preserve the migration task logs and exact CockroachDB error.
@@ -589,7 +612,8 @@ exact failed version:
    the complete covering index definition and job state. For v18, compare the
    six new tables, `memory_evidence_events_predecessor_unique_idx`, the
    `memory_writer_authority_v1` view and its owner, and both
-   `accepted_event_id` columns with their named CHECK constraints.
+   `accepted_event_id` columns with their named CHECK constraints. The
+   migration's own closing assertions report the drifted relation by name.
 5. If this is a brand-new empty demo database, the safest recovery is to create
    another empty database and run the complete migrator once against that
    replacement. Deleting the partial database is a separate destructive

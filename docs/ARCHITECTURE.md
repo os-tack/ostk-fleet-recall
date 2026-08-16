@@ -199,12 +199,17 @@ version conflict uniqueness by detector and add the exact claim-transition and
 current-conflict projection indexes. Migration 18 adds the Stage-4 runtime
 foundations of [ADR 0002](adr/0002-stage4-runtime-foundations.md): the general
 accepted-event ledger `memory_evidence_events` and its `memory_evidence_shard_heads`
-under the control ledger's single log epoch, `memory_evidence_quarantine`,
+-- which deliberately carries no foreign key to any control or registry table,
+per the ADR's 2026-08-16 amendment, so the appender can seed a head without a
+control-plane grant -- `memory_evidence_quarantine`,
 `memory_content_objects`, the relation projection and its per-`(ledger_family,
 shard)` watermark, the nullable `accepted_event_id` columns on `memory_claims`
 and `memory_mutation_receipts`, and the read-only `memory_writer_authority_v1`
 head-witness view. It grants the runtime role nothing on any `memory_control_*`
-or `memory_registry_*` base table.
+or `memory_registry_*` base table. Every object is created with `IF NOT
+EXISTS` for resumability and then asserted against the committed public
+catalog, so a same-name object with another shape fails closed with SQLSTATE
+`55000` instead of being adopted as a successful version 18.
 
 The current conflict detector is the immutable contract
 `same_key_functional_value_v2`. A conflict-eligible legacy claim key is the

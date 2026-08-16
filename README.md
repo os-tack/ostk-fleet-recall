@@ -617,7 +617,7 @@ The authoritative migration correctness lane targets the pinned official
 CockroachDB v26.2.3 binary and covers fresh, interruption, catalog-drift,
 transactional rollback, successor-repository and successor-CLI state matrices,
 functional-polarity, conflict reconciliation, the publication reader, and all
-four private CLIs through migration 17 on one checksum-pinned TLS server. That
+four private CLIs through migration 18 on one checksum-pinned TLS server. That
 complete local wrapper passed. The full role allow/deny/grant-option matrices
 remain separate Docker RBAC proofs. The current LocalStack production-image
 PUBLIC-03 smoke passed at commit `cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4`;

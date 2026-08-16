@@ -13,7 +13,7 @@ long-lived process:
 1. `database-bootstrap` creates `fleet_recall` and enables only the temporary
    `fleet_migrator` principal.
 2. `migrate` fetches only the migrator raw-URL secret and applies the complete
-   embedded migration prefix 1 through 17.
+   embedded migration prefix 1 through 18.
 3. `database-boundary` retires the migrator and provisions both fixed external
    principals, `fleet_writer` and `fleet_publication`, in exact quiesced
    `NOLOGIN` state.
@@ -37,10 +37,10 @@ migration owner as a long-lived runtime subject would be incorrect.
 
 The runtime policy is mounted read-only from
 `deploy/cockroach/runtime-role-grants.sql` and must match SHA-256
-`a224b6c247bf162359efb936d69ebd0f1ca5f2ea1823e14a517eb511b15e15e3`; the
+`f9fcf11f8b9cb6df83a245b2843f099bdd00352c274d1e37f6983992847b06cf`; the
 boundary and smoke scripts fail closed on any other digest. Its logical
-`fleet_runtime` role has exactly 31 direct, non-grantable rows: database
-`CONNECT`, public-schema `USAGE`, 26 table-operation rows, and `USAGE` on three
+`fleet_runtime` role has exactly 47 direct, non-grantable rows: database
+`CONNECT`, public-schema `USAGE`, 42 table-operation rows, and `USAGE` on three
 sequences. The table matrix is:
 
 | Table | Operations |
@@ -58,6 +58,13 @@ sequences. The table matrix is:
 | `memory_claim_links` | `SELECT` |
 | `memory_mutation_receipts` | `SELECT`, `INSERT`, `UPDATE` |
 | `memory_events` | `INSERT` |
+| `memory_evidence_events` | `SELECT`, `INSERT` |
+| `memory_evidence_quarantine` | `SELECT`, `INSERT` |
+| `memory_evidence_shard_heads` | `SELECT`, `INSERT`, `UPDATE` |
+| `memory_content_objects` | `SELECT`, `INSERT` |
+| `memory_relation_projection_v1` | `SELECT`, `INSERT`, `UPDATE` |
+| `memory_relation_projection_watermarks_v1` | `SELECT`, `INSERT`, `UPDATE` |
+| `memory_writer_authority_v1` (view) | `SELECT` |
 
 The three sequences are `memory_claim_id_seq`,
 `memory_claim_support_id_seq`, and `memory_conflict_id_seq`; `setval` remains
@@ -122,10 +129,12 @@ A successful run emits one JSON receipt binding:
 
 - the clean checked-out 40-hex commit and both OCI revision labels;
 - production/private image config and BuildKit manifest digests;
-- the exact successful migration-prefix-17 catalog fingerprint;
+- the exact successful migration-prefix-17 catalog fingerprint (a bounded
+  window that stays true as later additive migrations land; the lane itself
+  applies the complete embedded prefix, now 1 through 18);
 - retired `fleet_migrator` `NOLOGIN`/admin/system state while preserving its
   migration-ledger ownership;
-- both reviewed policy digests, the exact 31-row runtime-grant fingerprint,
+- both reviewed policy digests, the exact 47-row runtime-grant fingerprint,
   and the exact ten-row reader-grant fingerprint;
 - zero direct writer grants, the sole `fleet_runtime -> fleet_writer` leaf
   edge, direct allowed writer probes, and authorization denials for migration
@@ -173,7 +182,7 @@ but a v2 receipt remains pending a full clean LocalStack run from a clean
 commit. Do not reinterpret the v1 receipt as runtime-role evidence.
 
 The accepted exact-v26.2.3 TLS local wrapper separately covers the complete
-prefix through 17, rollback/interruption/drift behavior, live repositories,
+prefix through 18, rollback/interruption/drift behavior, live repositories,
 private CLIs, and the publication product boundary. The publication-reader
 Docker RBAC proof also passed as secondary policy-packaging parity, and the
 runtime-writer Docker RBAC proof (`deploy/cockroach/tests/runtime-role-grants.sh`)

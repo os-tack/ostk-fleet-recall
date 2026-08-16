@@ -74,14 +74,16 @@ serializable transaction; only CockroachDB SQLSTATE `40001` retries the whole
 operation. Application claim, support, conflict, event, and receipt mutations
 follow the same bounded idempotent/serializable rule.
 
-Current source embeds migrations 1 through 17. Migrations 3 through 9 add and
+Current source embeds migrations 1 through 18. Migrations 3 through 9 add and
 harden the private control and genesis-activation projections; migrations 10
 through 14 add exact genesis-root indexes and three durable successor tables;
-and migrations 15 through 17 version conflict uniqueness by detector and add
-the exact reconciliation/current-projection indexes. Current release completion
-requires exactly the seventeen successful rows 1 through 17. Normal recall,
+migrations 15 through 17 version conflict uniqueness by detector and add
+the exact reconciliation/current-projection indexes; and migration 18 adds the
+Stage-4 evidence plane, governed content store, relation projection, and the
+migrator-owned writer-authority view (ADR 0002). Current release completion
+requires exactly the eighteen successful rows 1 through 18. Normal recall,
 remember, ingest, MCP, health, and public-demo paths require an uninterrupted
-successful prefix of at least 17 and remain compatible with later additive
+successful prefix of at least 18 and remain compatible with later additive
 migrations. The private compatibility gates remain control 3, genesis 9,
 successor repository 14, and conflict reconciliation 16. A later successful row
 cannot mask a missing or failed prerequisite in any gate.
@@ -90,9 +92,13 @@ Versions 1 through 11 are nontransactional schema changes; v10 and v11 recover
 an interrupted exact index through `IF NOT EXISTS` plus a fail-closed catalog
 shape assertion. Versions 12 through 14 run with SQLx bookkeeping in one
 transaction on a dedicated session with `autocommit_before_ddl = false`.
-Versions 15 through 17 return to resumable nontransactional online DDL: v15
+Versions 15 through 18 return to resumable nontransactional online DDL: v15
 admits only its exact detector-index transition states and rewrites no conflict
-data; v16/v17 commit one covering backfill and assert its exact catalog shape.
+data; v16/v17 commit one covering backfill and assert its exact catalog shape;
+v18 creates every new relation with `IF NOT EXISTS`, commits, and then fails
+closed with SQLSTATE `55000` unless each one -- including the authority view's
+owner and exact definition -- has the shape this migration defines, so a
+same-name object is never silently adopted as a successful version 18.
 The dedicated session is closed rather than returned to the runtime pool.
 These mechanics establish durable shape, not an application authorization
 boundary.

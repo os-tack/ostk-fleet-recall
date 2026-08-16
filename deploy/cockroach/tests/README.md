@@ -59,9 +59,9 @@ absent between and after those windows. Final cleanup revokes it, restores
 `NOLOGIN`, clears the login password, proves authentication fails, and requires
 no successor membership residue.
 
-That exact 1-through-17 assertion freezes the current HEAD release; it is
+That exact 1-through-18 assertion freezes the current HEAD release; it is
 distinct from the serving compatibility floor, which accepts a complete
-successful prefix of at least 17.
+successful prefix of at least 18.
 
 These current-release assertions do not widen the private compatibility gates:
 Stage 2 still requires the complete successful prefix through 3, genesis Stage
@@ -128,7 +128,7 @@ unreviewed future reachability. Its exact SHA-256 inputs are `config.rs`
 `private_postgres.rs`
 `7718c15393872a139956732629c472d813a2a014395f943a5382191966162745`,
 `store/cockroach.rs`
-`284819aa6c367f27c7c614351a9127a7686672ad6fc7ae81fd23544c4b2863e5`,
+`3e0085da62d839d84c9987a14fb7114918a324e33b033690f87fa0bdad01ed5e`,
 `ledger/cockroach.rs`
 `b8c3ffbd3dfe7a74f76a06815f317db3e79b3129adaa14e2da5bea43f60b069f`,
 `service.rs` `6f0c6874072baed1070204063ac65df0761eda2da862e51775ba85cc5a34b522`,
@@ -138,8 +138,22 @@ and `reference_agent.rs`
 `2bfc742926ef753ee90458a294bb59dbddf2afa2e9983484548f2fe0b7b77d26`.
 
 The exact logical `fleet_runtime` matrix is database `CONNECT`, public-schema
-`USAGE`, 26 table-privilege rows, and `USAGE` on only the claim, support, and
-conflict ID sequences. Active chunk upsert has `SELECT`/`INSERT`/`UPDATE` on
+`USAGE`, 42 table-privilege rows, and `USAGE` on only the claim, support, and
+conflict ID sequences (47 rows in total). Sixteen of those table rows are the
+Stage-4 evidence plane of ADR 0002 D2 as amended on 2026-08-16:
+`SELECT`/`INSERT` on `memory_evidence_events`, `memory_evidence_quarantine`,
+and `memory_content_objects`, `SELECT`/`INSERT`/`UPDATE` on
+`memory_evidence_shard_heads`, `memory_relation_projection_v1`, and
+`memory_relation_projection_watermarks_v1`, and `SELECT` on the
+migrator-owned view `memory_writer_authority_v1`. The connected proof creates
+`memory_evidence_shard_heads` and `memory_evidence_events` from the real
+migration-0018 text rather than from foreign-key-free stand-ins, then executes
+the lazy head seed, one accepted-event append, and the head CAS advance as
+`fleet_writer`; an event under an unseeded head must be rejected by the real
+`memory_evidence_event_head_fk`. That fixture is why this class of failure
+cannot pass again: migration 0018's head table carries no foreign key to any
+control or registry parent, because CockroachDB v26.2.3 would then demand a
+control-table `SELECT` grant from the appending role. Active chunk upsert has `SELECT`/`INSERT`/`UPDATE` on
 `memory_chunks` plus only the keyed `DELETE` on `memory_chunk_history` and the
 `SELECT` CockroachDB requires to evaluate that `DELETE`'s `WHERE` clause; the
 connected proof issues that keyed `DELETE` as `fleet_writer` and requires it to

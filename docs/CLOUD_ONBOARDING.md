@@ -28,12 +28,14 @@ revision-6 evidence; the Cloud `EXPLAIN` is separately captured historical plan
 evidence. None was rerun for revision 10.
 
 The current checkout is newer than that recorded deployment. Its embedded
-migrator now contains versions 1 through 17, including private control-ledger,
+migrator now contains versions 1 through 18, including private control-ledger,
 genesis-activation and successor-schema projections, detector-versioned
-conflict uniqueness, and exact reconciliation/current-projection indexes.
-Current source release completion requires exactly the seventeen successful
-rows 1 through 17. Serving requires an uninterrupted successful prefix of at
-least 17 and remains compatible with later additive migrations. The private
+conflict uniqueness, exact reconciliation/current-projection indexes, and the
+Stage-4 evidence plane, governed content store, relation projection, and
+writer-authority view (ADR 0002).
+Current source release completion requires exactly the eighteen successful
+rows 1 through 18. Serving requires an uninterrupted successful prefix of at
+least 18 and remains compatible with later additive migrations. The private
 compatibility gates remain control 3, genesis 9, successor repository 14, and
 conflict reconciliation 16. Do not
 reinterpret the live revision-10 schema-2 status or 552-row seed as evidence
@@ -276,8 +278,14 @@ checksum-pinned runtime policy
 [`deploy/cockroach/runtime-role-grants.sql`](../deploy/cockroach/runtime-role-grants.sql)
 to the `fleet_runtime` logical role: per-table private-writer verbs on the
 legacy corpus, claim, conflict, receipt, and event tables, `USAGE` on only the
-claim, claim-support, and conflict ID sequences, and `SELECT` on
-`_sqlx_migrations` (see [MIGRATIONS.md](MIGRATIONS.md)); the policy itself
+claim, claim-support, and conflict ID sequences, `SELECT` on
+`_sqlx_migrations`, the Stage-4 evidence-plane append surface
+(`SELECT`/`INSERT` on `memory_evidence_events`, `memory_evidence_quarantine`,
+and `memory_content_objects`, and `SELECT`/`INSERT`/`UPDATE` on
+`memory_evidence_shard_heads`, `memory_relation_projection_v1`, and
+`memory_relation_projection_watermarks_v1`), and `SELECT` on the
+migrator-owned view `memory_writer_authority_v1`
+(see [MIGRATIONS.md](MIGRATIONS.md)); the policy itself
 installs the sole `fleet_writer` membership edge. Never use `ON ALL TABLES`, and never grant the
 writer, publication reader, or `public` role access to `memory_control_bootstraps`,
 `memory_control_log_epochs`, `memory_control_shard_heads`, or
@@ -293,11 +301,15 @@ private logical-role policies have run, apply the deny-only
 [quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql);
 it gates on all fourteen successful rows, revokes every existing application
 role named by that policy, and grants nothing. Migrations 15 through 17 add or
-replace indexes and do not change the quarantine's table set. See
+replace indexes and migration 18 adds only evidence-plane, content,
+projection, and writer-authority objects, so neither changes the quarantine's
+table set. See
 [CockroachDB access management](https://www.cockroachlabs.com/docs/cockroachcloud/managing-access).
 
 The publication login never receives those writer grants directly. After the
-complete successful prefix 1 through 17, a cluster admin applies
+complete successful prefix 1 through 17 -- a bounded gate that stays true at
+eighteen migrations, and which this release deliberately did not move -- a
+cluster admin applies
 [`publication-reader-role-grants.sql`](../deploy/cockroach/publication-reader-role-grants.sql)
 while `fleet_publication` is drained and exact `NOLOGIN`. The policy creates
 and hardens the logical `fleet_publication_reader` role to `NOLOGIN`, then
@@ -395,7 +407,7 @@ local operator process; disable the login or remove the secret afterward. If
 the Stage-3 genesis-activation ceremony is run, create another distinct
 principal with the exact activation grants in [MIGRATIONS.md](MIGRATIONS.md)
 and retire it after use. That genesis repository keeps its prefix-1-through-9
-compatibility gate even when the current release prefix reaches 17; it has no
+compatibility gate even when the current release prefix reaches 18; it has no
 successor-table authority. The successor repository keeps its prefix-14 gate,
 and reconciliation keeps prefix 16; neither one-shot logical role nor any
 member is authorized by any of the three planned AWS credentials. All private
@@ -509,12 +521,12 @@ policy immediately before enabling that exact login. Run the one-off
 idempotent seed task with the writer secret, then approve scaling the public
 service, which receives only the publication secret, to one.
 For a separately approved deployment of the current checkout, that migration
-task must finish exactly the uninterrupted prefix 1 through 17: versions 1
+task must finish exactly the uninterrupted prefix 1 through 18: versions 1
 through 11 use the nontransactional policy (with resumable exact-catalog
 assertions in v10/v11), v12 through v14 use the dedicated transactional
-session, and v15 through v17 return to resumable nontransactional online DDL.
+session, and v15 through v18 return to resumable nontransactional online DDL.
 Serving remains compatible with a later additive successful prefix, but the
-current release artifact contains exactly 1–17. Do not substitute manual SQL or
+current release artifact contains exactly 1–18. Do not substitute manual SQL or
 a Docker-only smoke for that release gate.
 Validate HTTPS and recall, force a task replacement, and prove recall again.
 Capture representative Cloud `EXPLAIN` separately with the approved bounded

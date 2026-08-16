@@ -45,8 +45,8 @@ to CockroachDB. After connecting it requires exactly three successful SQLx rows
 for the uninterrupted prefix 1 through 3 before touching the control tables;
 a later successful migration cannot mask a failed or missing prerequisite.
 This is deliberately a Stage-2 compatibility gate, not proof that the current
-release's exact prefix 1 through 17 is complete, that serving's minimum
-uninterrupted prefix of 17 is ready, or that genesis/successor/reconciliation
+release's exact prefix 1 through 18 is complete, that serving's minimum
+uninterrupted prefix of 18 is ready, or that genesis/successor/reconciliation
 authority exists. Neither artifact may override physical or semantic routing.
 
 Apply once, then audit a replay using the same authority:
@@ -119,7 +119,8 @@ deny-only
 [quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql).
 The quarantine deliberately retains its complete successful prefix 1 through
 14 gate because migrations 12 through 14 create its three successor tables and
-15 through 17 only add/replace indexes. It revokes those tables from the
+15 through 17 only add/replace indexes, and 18 adds only evidence-plane,
+content, projection, and writer-authority objects. It revokes those tables from the
 existing application roles and grants nothing. Connect to the dedicated
 `fleet_recall` database as a cluster admin, or as a dedicated security operator
 with `CREATEROLE`, the required role admin options and SYSTEM grant options,
@@ -224,7 +225,7 @@ duplicate predecessor. It prints the effective grants and removes the
 container. This is the frozen Stage-2/genesis-role proof boundary, not a
 successor writer or current application-image migration-parity proof. The
 authoritative official CockroachDB v26.2.3 correctness lane covers versions 1
-through 17 and exercises the successor repository, functional-polarity matrix,
+through 18 and exercises the successor repository, functional-polarity matrix,
 conflict-reconciliation repository/CLI, and the complete successor-CLI state
 matrix under temporary role-membership windows. The successor and
 reconciliation allow/deny/grant-option matrices remain separate secondary

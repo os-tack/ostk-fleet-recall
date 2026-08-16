@@ -258,7 +258,7 @@ The wrapper starts one Fargate task from the dedicated migration task
 definition, waits for it to stop, and propagates its exit code. It never prints
 the injected database URL.
 
-Before starting a current prefix-17 runtime, the cluster security operator must
+Before starting a current prefix-18 runtime, the cluster security operator must
 apply/reapply the frozen control and genesis-activation logical-role policies,
 then apply the deny-only
 [`successor-schema-quarantine-grants.sql`](../cockroach/successor-schema-quarantine-grants.sql).
