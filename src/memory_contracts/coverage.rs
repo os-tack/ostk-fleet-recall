@@ -20,6 +20,33 @@
 //! method here is a structural, non-zero [`RegistryReferenceV1`] only —
 //! proving that the reference names an *active* registry entry of the
 //! expected kind is a runtime concern outside this offline contract layer.
+//!
+//! # Decode strictness (COVER-03) and the required ingress gate
+//!
+//! [`CoverageReceiptV1`] identity is defined over the **typed canonical
+//! form**, and [`crate::memory_contracts::canonical::decode_typed_canonical`] is the only decode
+//! function this module treats as an admissible ingress gate for wire bytes
+//! a caller intends to bind by [`CoverageReceiptV1::receipt_id`]. Every
+//! plain struct in this module — and [`RegistryReferenceV1`] from
+//! `common.rs` that it embeds — derives `Deserialize`, and a derived
+//! `Deserialize` on a plain struct accepts a well-typed *positional* JSON
+//! array in a field's place exactly as readily as an object, while an
+//! `Option` field may be accepted whether its wire key is present-as-`null`
+//! or omitted entirely. Under [`crate::memory_contracts::canonical::decode_strict`] alone — which
+//! only proves duplicate-safe strict JSON, not that the input is the *sole*
+//! accepted encoding of the value it decodes to — two distinct byte strings
+//! can therefore decode to one `==` [`CoverageReceiptV1`] and so bind the
+//! identical `receipt_id()`, defeating the one property `negative_support_admissible`
+//! callers are told to trust. `decode_typed_canonical` closes this for the
+//! whole receipt, root and every nested struct at once, without any
+//! type-specific `Deserialize` override: it decodes with `decode_strict`,
+//! re-encodes the decoded value with [`encode_canonical`], and
+//! rejects the input unless the two byte strings are identical, so at most
+//! one accepted byte string exists per receipt value. See "Digests and
+//! decode strictness" in this crate's
+//! `contracts/dynamic-memory/v3/coverage/README.md`, and
+//! `negative-nested-positional-producer.jsonl` /
+//! `negative-gap-omitted-key.jsonl` for the committed vectors that prove it.
 
 use std::fmt;
 
@@ -195,8 +222,13 @@ impl CoverageFreshnessV1 {
 ///
 /// The last watermark observed before the gap and, if resumption was itself
 /// observed, the watermark coverage resumed at. Both endpoints must share the
-/// same watermark kind and be strictly ordered so the gap has a provable,
-/// non-empty extent.
+/// same watermark kind and have a provable, non-empty extent: for a
+/// `provider_sequence` watermark, an integer, that means `gap_after` is
+/// *strictly ordered* before `gap_before`; for a `cursor` watermark, opaque
+/// provider-specific bytes with no crate-defined byte order, it means merely
+/// that the two are *distinct* — this module cannot impose an ordering on
+/// bytes it does not interpret, only require that the endpoints are not the
+/// same watermark.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SequenceGapV1 {
@@ -206,7 +238,7 @@ pub struct SequenceGapV1 {
 
 impl SequenceGapV1 {
     pub fn validate(&self) -> ContractResult<()> {
-        let is_ordered_and_bounded = match (&self.gap_after, &self.gap_before) {
+        let has_provable_extent = match (&self.gap_after, &self.gap_before) {
             (
                 CoverageWatermarkV1::Cursor { cursor: after },
                 CoverageWatermarkV1::Cursor { cursor: before },
@@ -220,9 +252,9 @@ impl SequenceGapV1 {
                 false
             }
         };
-        if !is_ordered_and_bounded {
+        if !has_provable_extent {
             return Err(ContractError::Schema(
-                "sequence gap endpoints must share one watermark kind and be strictly ordered"
+                "sequence gap endpoints must share one watermark kind and have a provable, non-empty extent (distinct cursor bytes, or a strictly ordered provider sequence)"
                     .into(),
             ));
         }
@@ -234,22 +266,25 @@ impl SequenceGapV1 {
 ///
 /// `gap_detected` always means the observed provider sequence has a known
 /// acquisition or ordering gap; the bounded description is optional because a
-/// gap can be known to exist without its exact extent being provable. The
-/// `gap` key itself is REQUIRED on the wire (its value may be `null`): a bare
-/// `Option<T>` field is optional-by-default under serde, which would let
+/// gap can be known to exist without its exact extent being provable. Under
+/// plain `#[derive(Deserialize)]`, `gap: Option<SequenceGapV1>` accepts the
+/// `gap` wire key whether present-as-`null` or omitted entirely — that is,
 /// `{"state":"gap_detected"}` and `{"gap":null,"state":"gap_detected"}` both
-/// decode to the same value, so two distinct canonical byte strings would
-/// decode to one `CoverageReceiptV1` (violating the invariant asserted below).
-/// `#[serde(deserialize_with = "Option::deserialize")]` makes the *field*
-/// mandatory while still allowing an explicit `null`.
+/// decode to the identical value under [`crate::memory_contracts::canonical::decode_strict`] alone.
+/// This module does not close that gap with a field-level
+/// `deserialize_with` override; it is closed once, generically, for this
+/// field and every other same-shaped one in the receipt by requiring
+/// [`crate::memory_contracts::canonical::decode_typed_canonical`] as the ingress gate (see the
+/// module-level doc comment): the omitted-key form re-encodes with an
+/// explicit `"gap":null`, which differs from the omitted-key input bytes, so
+/// `decode_typed_canonical` rejects it even though `decode_strict` alone
+/// would accept it. `negative-gap-omitted-key.jsonl` is the vector that
+/// proves this.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SequenceContinuityV1 {
     Contiguous {},
-    GapDetected {
-        #[serde(deserialize_with = "Option::deserialize")]
-        gap: Option<SequenceGapV1>,
-    },
+    GapDetected { gap: Option<SequenceGapV1> },
 }
 
 impl SequenceContinuityV1 {
@@ -301,15 +336,19 @@ impl CoverageProofBasisV1 {
 /// another; only [`negative_support_admissible`] combines them into an
 /// admission decision, and it does so without any default.
 ///
-/// `Deserialize` is hand-written (not derived) so that a well-typed
-/// *positional* JSON array root — the form serde's derived struct
-/// `Deserialize` accepts for any non-tagged struct via `visit_seq`, in
-/// addition to the intended `visit_map` object form — is rejected outright
-/// rather than silently decoding to the identical value and thus the
-/// identical `receipt_id()`. See "Digests and decode strictness" in this
-/// crate's `contracts/dynamic-memory/v3/coverage/README.md` for the review
-/// finding this closes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// `Deserialize` is a plain derive: it accepts more wire shapes than the one
+/// canonical shape (an object root, and a positional-array root with the
+/// fields below in declaration order — the same is true of every nested
+/// struct this type embeds). That is by design, not an oversight — this
+/// type's decode strictness comes from the ingress *gate*, not from a
+/// type-specific `Deserialize` override. Any caller intending to bind a
+/// decoded value by [`CoverageReceiptV1::receipt_id`] MUST decode through
+/// [`crate::memory_contracts::canonical::decode_typed_canonical`], never `decode_strict` alone or a
+/// bare `serde_json` call; see the module-level doc comment for why, and
+/// `contracts/dynamic-memory/v3/coverage/README.md`'s "Digests and decode
+/// strictness" section for the review finding this closes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoverageReceiptV1 {
     pub schema_version: u32,
     pub producer: ProducerIdentityV1,
@@ -323,79 +362,6 @@ pub struct CoverageReceiptV1 {
     pub source_digest: Sha256Digest,
     pub source_count: u32,
     pub evidence_id: AcceptedEventId,
-}
-
-/// Field-for-field mirror of [`CoverageReceiptV1`] used only to obtain a
-/// derived, `deny_unknown_fields` map-shaped `Deserialize` implementation
-/// that [`CoverageReceiptV1`]'s hand-written `Deserialize` forwards to after
-/// first forcing a JSON-object root (see the type-level doc comment above).
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CoverageReceiptV1Shadow {
-    schema_version: u32,
-    producer: ProducerIdentityV1,
-    scope: CoverageScopeV1,
-    watermark: CoverageWatermarkV1,
-    completeness: CoverageCompletenessV1,
-    freshness: CoverageFreshnessV1,
-    continuity: SequenceContinuityV1,
-    observed_through: CanonicalTimestamp,
-    proof_basis: CoverageProofBasisV1,
-    source_digest: Sha256Digest,
-    source_count: u32,
-    evidence_id: AcceptedEventId,
-}
-
-impl From<CoverageReceiptV1Shadow> for CoverageReceiptV1 {
-    fn from(shadow: CoverageReceiptV1Shadow) -> Self {
-        Self {
-            schema_version: shadow.schema_version,
-            producer: shadow.producer,
-            scope: shadow.scope,
-            watermark: shadow.watermark,
-            completeness: shadow.completeness,
-            freshness: shadow.freshness,
-            continuity: shadow.continuity,
-            observed_through: shadow.observed_through,
-            proof_basis: shadow.proof_basis,
-            source_digest: shadow.source_digest,
-            source_count: shadow.source_count,
-            evidence_id: shadow.evidence_id,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for CoverageReceiptV1 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct ObjectRootOnly;
-
-        impl<'de> serde::de::Visitor<'de> for ObjectRootOnly {
-            type Value = CoverageReceiptV1Shadow;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a coverage receipt encoded as a JSON object")
-            }
-
-            // Explicitly NOT implementing `visit_seq`: a positional JSON
-            // array root must fall through to serde's default "invalid
-            // type: sequence" error rather than being accepted field-by-
-            // field, which is what `#[derive(Deserialize)]` on a plain
-            // struct would otherwise do.
-            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
-            }
-        }
-
-        deserializer
-            .deserialize_map(ObjectRootOnly)
-            .map(CoverageReceiptV1Shadow::into)
-    }
 }
 
 impl CoverageReceiptV1 {
@@ -415,6 +381,23 @@ impl CoverageReceiptV1 {
         if self.observed_through < self.scope.window.window_end {
             return Err(ContractError::Schema(
                 "observed_through must reach the end of the covered window".into(),
+            ));
+        }
+        // Consistent with `validate_registered_reference` rejecting the
+        // zero digest for a registry reference, and the crate-wide
+        // convention (see e.g. `successor_activation.rs`, `evidence_v2.rs`)
+        // of rejecting the zero digest for every identity-bearing digest: an
+        // all-zero `source_digest` or `evidence_id` can never be the real
+        // digest of source material or an accepted event, so accepting it
+        // here would silently admit a receipt that names no actual source.
+        if self.source_digest == Sha256Digest::ZERO {
+            return Err(ContractError::Schema(
+                "source digest cannot use the zero digest".into(),
+            ));
+        }
+        if self.evidence_id.digest() == Sha256Digest::ZERO {
+            return Err(ContractError::Schema(
+                "evidence id cannot use the zero digest".into(),
             ));
         }
         // Reject a programmatically constructed value that the strict
@@ -509,7 +492,7 @@ mod tests {
 
     use super::*;
     use crate::memory_contracts::{
-        canonical::{decode_strict, require_canonical},
+        canonical::{decode_strict, decode_typed_canonical, require_canonical},
         digest::domain_separated_digest,
     };
 
@@ -604,6 +587,9 @@ mod tests {
     const NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/coverage/negative-well-typed-positional-array.jsonl"
     );
+    const NEGATIVE_NESTED_POSITIONAL_PRODUCER: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/coverage/negative-nested-positional-producer.jsonl"
+    );
     const EVALUATED_CONDITION_PRESENT: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/coverage/evaluated-condition-present.jsonl"
     );
@@ -682,6 +668,8 @@ mod tests {
         "68c1edcfd74f5e885302388e123c251ec7eae94351d209b61e13a463e1962410";
     const NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY_RAW_SHA256: &str =
         "3519ccc8b9e7cd1dd69e3df5d5c531ea08a41af3da15aa10813a1ab11e105080";
+    const NEGATIVE_NESTED_POSITIONAL_PRODUCER_RAW_SHA256: &str =
+        "426e39a8e467f4e1077fc630bf56137b4d01018c99bd008cf6ce8f3a46ada6ad";
     const EVALUATED_CONDITION_PRESENT_RAW_SHA256: &str =
         "87f7439876e4033adb5735dd9e8a4031ef2be2239574b1a83398efca11784151";
     const EVALUATED_CONDITION_ABSENT_RAW_SHA256: &str =
@@ -689,7 +677,7 @@ mod tests {
     const EVALUATED_CONDITION_INDETERMINATE_RAW_SHA256: &str =
         "e2a4db258cdc6e923416ddf6f071c079c1ad524c35ff11ce24facbad55cd1859";
     const VECTOR_SUITE_RAW_SHA256: &str =
-        "2fad727c50ecbfdc344c193a2cae874b6a8a0a30d9604c945c006a03ca193e4c";
+        "453f1c10f746253ec34e772316a47d022bf1ea1b78b66ba5b9f6fb42fcd7cfe1";
 
     const SCOPE_URI: &str = "urn:ostk:entity:v1:repository:sha256:1111111111111111111111111111111111111111111111111111111111111111";
     const REVISION_HEX: &str = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -728,7 +716,7 @@ mod tests {
         "3cee8a812644b227eff1da851263f4729a60a572f2e41bcf50587dba06609353";
 
     const VECTOR_SUITE_DIGEST: &str =
-        "f5473846fcaf65e6845bbd83b668af85b1c3f4bdd5f3c290e2f8e5b62e02b5cf";
+        "9c25f16aa8df684db51ac75b4d5f5e0bcfd1817bc9069e3993038f45667f5bc1";
 
     fn digest(value: &str) -> Sha256Digest {
         Sha256Digest::from_str(value).expect("hard-coded digest must be lowercase SHA-256")
@@ -908,6 +896,29 @@ mod tests {
         let mut basis = proof_basis();
         basis.proof_method_registration.entry_digest = Sha256Digest::ZERO;
         assert!(basis.validate().is_err());
+    }
+
+    /// Consistency: `validate_registered_reference` rejects the zero digest
+    /// for a `RegistryReferenceV1`, so the receipt's own identity-bearing
+    /// digests reject it too, rather than silently admitting a receipt that
+    /// names no actual source material or accepted event.
+    #[test]
+    fn zero_digest_source_and_evidence_identity_are_rejected() {
+        let mut zero_source = base_receipt(
+            CoverageCompletenessV1::Complete,
+            freshness_current(),
+            SequenceContinuityV1::Contiguous {},
+        );
+        zero_source.source_digest = Sha256Digest::ZERO;
+        assert!(zero_source.validate().is_err());
+
+        let mut zero_evidence = base_receipt(
+            CoverageCompletenessV1::Complete,
+            freshness_current(),
+            SequenceContinuityV1::Contiguous {},
+        );
+        zero_evidence.evidence_id = AcceptedEventId::from_digest(Sha256Digest::ZERO);
+        assert!(zero_evidence.validate().is_err());
     }
 
     /// Full complete/partial/unknown x current/stale x `contiguous/gap_detected`
@@ -1242,6 +1253,15 @@ mod tests {
 
     #[test]
     fn negative_vectors_fail_closed() {
+        // These fixtures fail at `decode_strict` + `validate()` already: a
+        // required field is entirely absent, a value is out of range, an
+        // enum tag is unregistered, or a structural rule (window ordering,
+        // gap ordering, `observed_through`) is violated. None of them is a
+        // same-ID-different-bytes case; those are proved separately by
+        // `same_id_different_bytes_forms_decode_under_decode_strict_but_are_rejected_by_decode_typed_canonical`
+        // below, because (by construction) they succeed under
+        // `decode_strict` + `validate()` and are caught only by the typed
+        // canonical round-trip.
         for bytes in [
             NEGATIVE_MISSING_OBSERVED_THROUGH,
             NEGATIVE_WINDOW_END_BEFORE_START,
@@ -1255,8 +1275,6 @@ mod tests {
             NEGATIVE_ARBITRARY_JSON_VALUE,
             NEGATIVE_NESTED_UNKNOWN_FIELD_CONTINUITY,
             NEGATIVE_OBSERVED_THROUGH_BEFORE_WINDOW_END,
-            NEGATIVE_GAP_OMITTED_KEY,
-            NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY,
         ] {
             let outcome = decode_strict::<CoverageReceiptV1>(record(bytes))
                 .and_then(|receipt| receipt.validate());
@@ -1264,53 +1282,114 @@ mod tests {
         }
     }
 
-    /// COVER-03 (review-blocker fix): omitting the `gap` key entirely on a
-    /// `gap_detected` continuity value must be rejected at DECODE, not merely
-    /// accepted with `gap: None`. Before this fix a bare `Option<T>` field
-    /// made `gap` optional-by-default, so `{"state":"gap_detected"}` and
-    /// `{"gap":null,"state":"gap_detected"}` decoded to the identical value
-    /// and thus the identical `receipt_id()` -- two distinct canonical byte
-    /// strings decoding to one value, and `require_canonical` returning `Ok`
-    /// on a byte string `encode_canonical` could never itself produce.
+    /// COVER-03: same-ID-different-bytes forms. Each of these fixtures
+    /// decodes to a `CoverageReceiptV1` `==` the canonical positive fixture
+    /// (`matrix-complete-current-contiguous.jsonl`) — same `receipt_id()` —
+    /// under plain `decode_strict`, because a derived `Deserialize` on a
+    /// plain struct accepts a positional-array form of any nested struct
+    /// exactly as readily as an object, and an `Option` field accepts its
+    /// wire key either omitted or present-as-`null`. This module does not
+    /// close that with type-specific `Deserialize` overrides; it is closed
+    /// once, generically, by requiring every caller to decode through
+    /// [`decode_typed_canonical`] instead: it decodes, then re-encodes the
+    /// decoded value and requires the result to equal the input, so an
+    /// alternate encoding of an already-representable value is rejected
+    /// even though the value itself is well-formed and would validate.
     #[test]
-    fn gap_detected_with_omitted_gap_key_is_rejected_at_decode() {
-        let outcome = decode_strict::<CoverageReceiptV1>(record(NEGATIVE_GAP_OMITTED_KEY));
-        let err = outcome.expect_err("omitted `gap` key must not decode");
-        let message = err.to_string();
-        assert!(
-            message.contains("gap"),
-            "expected a missing-field error naming `gap`, got: {message}"
+    fn same_id_different_bytes_forms_decode_under_decode_strict_but_are_rejected_by_decode_typed_canonical()
+     {
+        let canonical: CoverageReceiptV1 =
+            decode_strict(record(MATRIX_COMPLETE_CURRENT_CONTIGUOUS)).unwrap();
+        // The one wire form `negative-gap-omitted-key.jsonl` collides with
+        // under `decode_strict` is not one of the 12 pinned matrix
+        // fixtures (no matrix cell pairs `complete`+`current`+`gap_detected`
+        // with an explicit `gap: null`); construct it directly instead.
+        let complete_current_gap_none = base_receipt(
+            CoverageCompletenessV1::Complete,
+            freshness_current(),
+            SequenceContinuityV1::GapDetected { gap: None },
         );
 
-        // And the explicit-null form must still decode fine, with the two
-        // forms no longer able to collide: only one of the two canonical
-        // byte strings for this continuity value now exists.
-        let explicit_null = MATRIX_PARTIAL_CURRENT_GAP_DETECTED;
-        decode_strict::<CoverageReceiptV1>(record(explicit_null))
-            .expect("gap:null form must still decode");
+        for (name, bytes, expected) in [
+            (
+                "well_typed_positional_array (root)",
+                NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY,
+                &canonical,
+            ),
+            (
+                "nested_positional_producer (nested struct)",
+                NEGATIVE_NESTED_POSITIONAL_PRODUCER,
+                &canonical,
+            ),
+            (
+                "gap_omitted_key (omitted optional key)",
+                NEGATIVE_GAP_OMITTED_KEY,
+                &complete_current_gap_none,
+            ),
+        ] {
+            // `require_canonical` accepts the document: these are, byte for
+            // byte, alternate canonical *documents*.
+            require_canonical(record(bytes)).unwrap_or_else(|error| {
+                panic!("{name}: expected a canonical document, got {error:?}")
+            });
+            // `decode_strict` decodes it to the identical value as its
+            // clean-object-form counterpart, and that value validates and
+            // binds the identical `receipt_id()` — this is the exact
+            // same-ID-different-bytes collision COVER-03 forbids, if this
+            // were the accepted ingress path.
+            let decoded: CoverageReceiptV1 = decode_strict(record(bytes)).unwrap_or_else(|error| {
+                panic!("{name}: expected decode_strict to accept, got {error:?}")
+            });
+            assert_eq!(&decoded, expected, "{name}: must decode to the clean value");
+            assert!(decoded.validate().is_ok(), "{name}: must validate");
+            assert_eq!(
+                decoded.receipt_id().unwrap(),
+                expected.receipt_id().unwrap(),
+                "{name}: must bind the identical receipt_id under decode_strict alone"
+            );
+            // `decode_typed_canonical` is the required gate and rejects it:
+            // re-encoding the decoded value never reproduces this alternate
+            // input byte string.
+            let gated = decode_typed_canonical::<CoverageReceiptV1>(record(bytes));
+            assert!(
+                matches!(gated, Err(ContractError::NotCanonical)),
+                "{name}: decode_typed_canonical must reject with NotCanonical, got {gated:?}"
+            );
+        }
+
+        // And the canonical positive fixture itself must decode through the
+        // required gate cleanly, matching the plain `decode_strict` value.
+        let gated: CoverageReceiptV1 =
+            decode_typed_canonical(record(MATRIX_COMPLETE_CURRENT_CONTIGUOUS)).unwrap();
+        assert_eq!(gated, canonical);
     }
 
-    /// Review-blocker fix: a well-typed *positional* JSON array carrying
-    /// exactly the canonical receipt's 12 field values in declaration order
-    /// must be rejected at decode, not silently accepted as an alternate
-    /// encoding of the identical value (and thus the identical
-    /// `receipt_id()`). `#[derive(Deserialize)]` on a plain struct accepts
-    /// both a map root AND a positional-sequence root by default; only an
-    /// object root is the receipt's one canonical wire shape.
+    /// Every positive fixture — every full-receipt matrix cell and the
+    /// explicit `gap:null` form — decodes through the required
+    /// [`decode_typed_canonical`] ingress gate and reproduces the exact
+    /// `receipt_id()` pinned for it.
     #[test]
-    fn well_typed_positional_array_root_is_rejected_at_decode() {
-        let outcome =
-            decode_strict::<CoverageReceiptV1>(record(NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY));
-        let err = outcome.expect_err("a positional array root must not decode");
-        let message = err.to_string();
-        assert!(
-            message.contains("sequence") || message.contains("object"),
-            "expected an invalid-root-shape error, got: {message}"
-        );
-
-        // The map-shaped form of the exact same values must still decode.
-        decode_strict::<CoverageReceiptV1>(record(MATRIX_COMPLETE_CURRENT_CONTIGUOUS))
-            .expect("the object-root form of the identical values must still decode");
+    fn positive_matrix_fixtures_decode_through_the_typed_canonical_gate() {
+        for (fixture, expected_receipt_id) in [
+            (
+                MATRIX_COMPLETE_CURRENT_CONTIGUOUS,
+                MATRIX_COMPLETE_CURRENT_CONTIGUOUS_RECEIPT_ID,
+            ),
+            (
+                MATRIX_COMPLETE_CURRENT_GAP_DETECTED,
+                MATRIX_COMPLETE_CURRENT_GAP_DETECTED_RECEIPT_ID,
+            ),
+            (
+                MATRIX_PARTIAL_CURRENT_GAP_DETECTED,
+                MATRIX_PARTIAL_CURRENT_GAP_DETECTED_RECEIPT_ID,
+            ),
+        ] {
+            let decoded: CoverageReceiptV1 = decode_typed_canonical(record(fixture)).unwrap();
+            assert_eq!(
+                decoded.receipt_id().unwrap().digest(),
+                digest(expected_receipt_id)
+            );
+        }
     }
 
     /// A `Contiguous` continuity value with a smuggled `gap` key must be
@@ -1466,6 +1545,10 @@ mod tests {
                 NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY,
                 NEGATIVE_WELL_TYPED_POSITIONAL_ARRAY_RAW_SHA256,
             ),
+            (
+                NEGATIVE_NESTED_POSITIONAL_PRODUCER,
+                NEGATIVE_NESTED_POSITIONAL_PRODUCER_RAW_SHA256,
+            ),
             (VECTOR_SUITE_FIXTURE, VECTOR_SUITE_RAW_SHA256),
         ] {
             assert_eq!(raw_sha256(bytes), expected);
@@ -1495,8 +1578,8 @@ mod tests {
             canonical_receipt.receipt_id().unwrap()
         );
         assert_eq!(suite.matrix_case_count, 12);
-        assert_eq!(suite.negative_case_count, 14);
-        assert_eq!(suite.negative_cases.len(), 14);
+        assert_eq!(suite.negative_case_count, 15);
+        assert_eq!(suite.negative_cases.len(), 15);
         let mut sorted = suite.negative_cases.clone();
         sorted.sort();
         sorted.dedup();
