@@ -169,6 +169,16 @@ pub enum DigestDomain {
     /// W0-CHUNK. Protection-domain-keyed external storage identity preimage.
     StorageIdentityV1,
     // --- W0-EPIS domains ---
+    /// Discrepancy-family fingerprint preimage (`DiscrepancyFamilyPreimageV1`). // W0-EPIS
+    DiscrepancyFamilyV1, // W0-EPIS
+    /// Discrepancy-episode fingerprint preimage (`DiscrepancyEpisodePreimageV1`). // W0-EPIS
+    DiscrepancyEpisodeV1, // W0-EPIS
+    /// Immutable discrepancy-detection envelope (`DiscrepancyEnvelopeV1`). // W0-EPIS
+    DiscrepancyEnvelopeV1, // W0-EPIS
+    /// Comparator-lineage identity (`ComparatorLineageV1`). // W0-EPIS
+    ComparatorLineageV1, // W0-EPIS
+    /// Append-only discrepancy lifecycle transition (`DiscrepancyLifecycleEventV1`). // W0-EPIS
+    DiscrepancyLifecycleEventV1, // W0-EPIS
 
     // --- W0-OBS domains ---
     /// `ObserverAdmissionV2` body identity.
@@ -180,7 +190,7 @@ pub enum DigestDomain {
     /// `ObserverDerivationDisagreementV1` finding identity.
     ObserverDisagreementV1, // W0-OBS
 
-    // --- W0-ERASE domains ---
+                                 // --- W0-ERASE domains ---
 
     // --- W0-LOG domains ---
     /// W0-LOG. `SuccessorLogEpochV1` identity.
@@ -367,7 +377,11 @@ impl DigestDomain {
             Self::EmbeddingIdentityV1 => "ostk-embedding-identity-v1",
             Self::StorageIdentityV1 => "ostk-storage-identity-v1",
             // --- W0-EPIS prefixes ---
-
+            Self::DiscrepancyFamilyV1 => "ostk-discrepancy-family-v1",
+            Self::DiscrepancyEpisodeV1 => "ostk-discrepancy-episode-v1",
+            Self::DiscrepancyEnvelopeV1 => "ostk-discrepancy-envelope-v1",
+            Self::ComparatorLineageV1 => "ostk-comparator-lineage-v1",
+            Self::DiscrepancyLifecycleEventV1 => "ostk-discrepancy-lifecycle-event-v1",
             // --- W0-OBS prefixes ---
             Self::ObserverAdmissionV2 => "ostk-observer-admission-v2", // W0-OBS
             Self::ObserverRunReceiptV1 => "ostk-observer-run-receipt-v1", // W0-OBS
