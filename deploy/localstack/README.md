@@ -28,18 +28,31 @@ does **not** claim to emulate Fargate scheduling, ALB TLS/health registration,
 ECR push/pull, AWS IAM enforcement, multi-AZ networking, ECS Secrets Manager
 injection, or CloudWatch delivery. Those remain real-AWS staging gates.
 
-The current checkout now embeds migrations 1 through 14. Versions 1 through 11
-are nontransactional, with resumable exact-catalog assertions in v10 and v11;
-v12 through v14 are transactional on a dedicated session with
-`autocommit_before_ddl = false`. Fresh, populated-upgrade, interruption,
-catalog-drift, and rollback correctness passed against the official
-CockroachDB v26.2.3 binary. The recorded Docker/Compose smoke below predates
-migrations 10 through 14 and has not been rerun for those bytes, so it is not
-current Docker-image parity evidence. The harness also provides no successor
-repository, RBAC, or CLI proof; the three successor tables remain
-migrator/schema-owner only. Full quarantine allow/deny/grant-option checks
-belong to the separate Docker RBAC scripts, not this application-image harness
-or the official-binary migration lane.
+The current checkout now embeds migrations 1 through 17. Versions 1 through 11
+and 15 through 17 are nontransactional, with resumable exact-catalog
+assertions for the online index transitions; v12 through v14 are transactional
+on a dedicated session with `autocommit_before_ddl = false`. The repository's
+current authoritative CockroachDB v26.2.3 lane covers fresh and populated
+upgrades, interruption, catalog drift, and rollback. The exact current release
+chain is 1 through 17, while serving compatibility requires a complete
+successful prefix of at least 17; the private control, genesis, successor
+repository, and reconciliation gates remain 3, 9, 14, and 16 respectively.
+That authoritative connected lane is one checksum-pinned TLS server and one
+result covering three live repositories, the named ledger/store proofs, and
+three private CLIs. Docker RBAC jobs, including reconciliation RBAC, are
+secondary parity only.
+
+The recorded Docker/Compose smoke below predates migrations 10 through 17 and
+has not been rerun for those bytes, so it is not current Docker-image parity
+evidence. This harness itself provides no successor repository, RBAC, CLI, or
+conflict-reconciliation proof. The successor repository and
+`ostk-registry-successor-activate` exist in source, but the successor and
+conflict-reconciliation commands and roles remain workstation-only as
+applicable, with no LocalStack, AWS, Terraform, task, image, runtime, or route
+surface. The production target excludes all four private CLIs: control
+bootstrap, registry activation, registry successor activation, and conflict
+reconciliation. Full role allow/deny/grant-option checks belong to the separate
+Docker RBAC scripts, not this application-image harness.
 
 On 2026-08-13 the combined then-current-source smoke (through migration 9)
 passed with the production Rust 1.94 image. One run verified the S3 and Secrets

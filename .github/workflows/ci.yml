@@ -90,7 +90,7 @@ jobs:
           binary_dir="$RUNNER_TEMP/cockroach-${COCKROACH_VERSION}.linux-amd64"
           test "$("$binary_dir/cockroach" version --build-tag)" = "$COCKROACH_VERSION"
           echo "$binary_dir" >> "$GITHUB_PATH"
-      - name: Run three live repositories, conflict matrix, and two private CLIs
+      - name: Run three live repositories, named ledger/store proofs, and three private CLIs
         run: ./deploy/cockroach/tests/registry-activation-cli.sh
 
   # Docker is a secondary packaging/RBAC parity substrate. These jobs assert
@@ -142,6 +142,8 @@ jobs:
             test ! -e /usr/local/bin/aws &&
             test ! -e /usr/local/bin/ostk-control-bootstrap &&
             test ! -e /usr/local/bin/ostk-registry-activate &&
+            test ! -e /usr/local/bin/ostk-registry-successor-activate &&
+            test ! -e /usr/local/bin/ostk-conflict-reconcile &&
             test -x /usr/bin/curl &&
             test -r /opt/ostk/demo/demo.ndjson &&
             test -r /opt/ostk/demo/rich-demo.ndjson &&

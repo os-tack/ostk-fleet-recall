@@ -40,10 +40,24 @@ Migrations 15 through 17 add or replace indexes rather than successor tables,
 so the exact successor table set remains the three tables introduced by
 migrations 12 through 14.
 
+That exact 1-through-17 assertion freezes the current HEAD release; it is
+distinct from the serving compatibility floor, which accepts a complete
+successful prefix of at least 17.
+
 These current-release assertions do not widen the private compatibility gates:
 Stage 2 still requires the complete successful prefix through 3, genesis Stage
 3 through 9, the successor repository through 14, and conflict reconciliation
 through 16.
+
+Do not count the live successor-repository row as a successor-CLI result. The
+three private CLIs in this authoritative wrapper are control bootstrap, genesis
+activation, and conflict reconciliation. The source-present
+`ostk-registry-successor-activate` command is workstation-only and has no
+checked-in successor write-grant role policy or deployment route. Conflict
+reconciliation and its logical role are likewise one-shot workstation
+surfaces. None of the four private CLIs has an AWS, Terraform, task, production
+image, runtime, startup, or server-route surface; the production image excludes
+all four.
 
 Run the authoritative proof with an already checksum-verified binary:
 

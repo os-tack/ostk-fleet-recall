@@ -32,16 +32,17 @@ revision-6 evidence; Cloud `EXPLAIN` is separately captured historical plan
 evidence. None was rerun for revision 10.
 
 The current checkout is newer than that recorded release. Its embedded
-migrator contains versions 1 through 14, including private control-ledger,
-genesis-activation, and successor schema. Current release completion is the
-complete successful prefix 1 through 14; Stage 2 remains compatible with
-prefix 1 through 3, and the genesis Stage-3 repository remains compatible with
-prefix 1 through 9. Serving health intentionally remains compatible with a
-complete successful prefix of at least version 2. The live schema-2 status and
-552-row seed above remain historical deployment facts; they are not evidence
-that the later private migrations or ceremonies ran in AWS. Updating this
-runbook is not authorization to rerun the live migration task, alter grants, or
-apply Terraform.
+migrator contains versions 1 through 17, including private control-ledger,
+genesis-activation, successor, and conflict-detector schema. The exact current
+release chain is the complete successful prefix 1 through 17; serving
+compatibility requires a complete successful prefix of at least 17. The private
+compatibility gates remain narrower and distinct: Stage-2 control through 3,
+genesis Stage 3 through 9, the successor repository through 14, and conflict
+reconciliation through 16. The live schema-2 status and 552-row seed above
+remain historical deployment facts; they are not evidence that the later
+private migrations or ceremonies ran in AWS. Updating this runbook is not
+authorization to rerun the live migration task, alter grants, or apply
+Terraform.
 
 ## Prerequisites
 
@@ -85,16 +86,21 @@ task definition using only that ARN. Do not apply merely because this runbook
 describes the upgrade; secret creation, plan approval, and apply remain
 separate operator-authorized actions.
 
-The module has no control-bootstrap or registry-activation secret variable,
-execution role, task definition, startup hook, or route. Stage 2 uses a third
-SQL principal only when its local private ceremony runs; Stage 3 similarly
-uses a fourth. Do not reuse either Terraform-managed secret for those
-credentials. See the [security policy](../../docs/SECURITY.md) and
+The four private commands are workstation-only: `ostk-control-bootstrap`,
+`ostk-registry-activate`, `ostk-registry-successor-activate`, and
+`ostk-conflict-reconcile`. The Terraform module has no secret variable,
+execution role, SQL-role provisioning, task definition, startup hook, image
+binary, runtime invocation, or route for any of them. Stage 2 and genesis Stage
+3 use dedicated SQL principals only when their private ceremonies run; do not
+reuse either Terraform-managed secret for those credentials. See the
+[security policy](../../docs/SECURITY.md) and
 [migration privilege boundary](../../docs/MIGRATIONS.md).
 
-The module also has no successor writer secret, SQL role, task definition,
-startup hook, CLI invocation, or route. The migration-12-through-14 tables and
-successor contracts are schema only, not deployed runtime authority.
+The successor repository and workstation CLI exist in source, and conflict
+reconciliation has a workstation-applied logical-role policy. Neither is
+deployed runtime authority. There is no checked-in successor write-grant role
+policy, and the migration-12-through-14 tables remain quarantined in
+production until a separately reviewed deployment increment supplies one.
 
 ## 1. Prepare and pin the model bundle
 
@@ -184,21 +190,23 @@ race the initial schema migration.
 
 ## 4. Run exactly one migration task
 
-The current source migrator applies versions 1 through 14. Versions 1 through
-11 execute outside a wrapping SQL transaction because of CockroachDB
-schema-changer and schema-lock constraints. Versions 10 and 11 are recoverable
-after an interrupted metadata write only because they use `IF NOT EXISTS` and
-then fail closed unless the committed public index has the exact catalog
-definition. Versions 12 through 14 run with SQLx bookkeeping in one transaction
-on a dedicated session with `autocommit_before_ddl = false`; that session is
-closed rather than returned to the runtime pool.
+The current source migrator applies versions 1 through 17. Versions 1 through
+11 and 15 through 17 execute outside a wrapping SQL transaction because of
+CockroachDB schema-changer and schema-lock constraints. Versions 10, 11, and
+15 through 17 are resumable online index transitions that fail closed unless
+the committed public catalog has the exact expected definition. Versions 12
+through 14 run with SQLx bookkeeping in one transaction on a dedicated session
+with `autocommit_before_ddl = false`; that session is closed rather than
+returned to the runtime pool.
 
 Keep the service at zero and do not run two migrators concurrently or replay
 migration SQL manually. Afterward, verify the complete successful prefix 1
-through 14 separately. Stage 2 still accepts prefix 1 through 3, and the
-genesis Stage-3 repository still accepts prefix 1 through 9, but neither is the
-current release gate or successor authority. A serving health result of version
-2 or newer is only an additive compatibility check.
+through 17 separately. That is the exact current release chain; serving
+compatibility has a minimum complete-prefix floor of 17. Stage-2 control still
+accepts the prefix through 3, genesis Stage 3 through 9, the successor
+repository through 14, and conflict reconciliation through 16. None of those
+private compatibility floors is the serving floor or the exact current-release
+chain.
 
 ```bash
 ./deploy/aws/run-migration.sh
@@ -210,19 +218,25 @@ The wrapper starts one Fargate task from the dedicated migration task
 definition, waits for it to stop, and propagates its exit code. It never prints
 the injected database URL.
 
-Before starting a current prefix-14 runtime, the cluster security operator must
+Before starting a current prefix-17 runtime, the cluster security operator must
 apply/reapply the frozen control and genesis-activation logical-role policies,
 then apply the deny-only
 [`successor-schema-quarantine-grants.sql`](../cockroach/successor-schema-quarantine-grants.sql).
 The quarantine requires all fourteen successful rows, revokes every successor
 table privilege from `public` and the existing application roles, and grants
-nothing.
+nothing. Do not provision or enable a conflict-reconciliation member as part of
+serving startup. Its prefix-16 logical-role policy must be applied by a cluster
+admin; database ownership alone is insufficient. The policy and one-shot CLI
+are a separate, explicitly authorized workstation operation.
 
-The authoritative official-binary lane proves the v1–v14 migration behavior
-and applies/schema-checks the deny-only quarantine on CockroachDB v26.2.3. It
-does not prove the full role allow/deny/grant-option drift matrix; those claims
-belong to the separate Docker RBAC proofs. The recorded LocalStack application
-image smoke predates migrations 10 through 14, so it is not current image
+The authoritative official-binary lane uses one checksum-pinned,
+build-tag-pinned TLS CockroachDB v26.2.3 server and reports one connected
+result. It proves the v1–v17 migration behavior, three live repositories, the
+named ledger/store proofs, and the control-bootstrap, genesis-activation, and
+conflict-reconciliation CLIs. The reconciliation RBAC Docker proof and the
+other Docker role/CLI proofs remain secondary parity results; they cannot be
+substituted for that official result. The recorded LocalStack application
+image smoke predates migrations 10 through 17, so it is not current image
 parity. None of these local proofs says the migrations ran in the historical
 AWS database.
 
@@ -583,12 +597,17 @@ dropped, and the temporary workstation network rule was removed after capture.
   `memory_registry_transitions`,
   `memory_registry_genesis_bridge_consumptions`, or
   `memory_registry_current_heads_v2`. Those successor tables remain
-  migrator/schema-owner only under the quarantine policy until a successor
-  writer repository, write-grant RBAC policy, and CLI are implemented and
+  migrator/schema-owner only under the production quarantine. The successor
+  repository and workstation CLI do not grant production authority; keep the
+  quarantine until a write-grant RBAC policy and deployment increment are
   reviewed together.
-- No AWS role or task receives the private Stage-2 or Stage-3 ceremony
-  credential. Their least-privilege one-shot writers remain local/private until
-  a separately reviewed deployment increment explicitly wires them.
+- No AWS role or task receives a private control, genesis-activation,
+  successor-activation, or conflict-reconciliation credential. Their one-shot
+  commands remain workstation-only until a separately reviewed deployment
+  increment explicitly wires one.
+- The production image excludes all four private workstation binaries:
+  `ostk-control-bootstrap`, `ostk-registry-activate`,
+  `ostk-registry-successor-activate`, and `ostk-conflict-reconcile`.
 - Each task is permanently bound to one tenant, project, agent, privacy tier,
   embedding model, and bundle digest through deployment configuration. Public
   request data cannot select a different tenant or project.
