@@ -71,11 +71,12 @@ canonical-JSON layer forbids floating-point literals outright
 `MeasurementReceiptV1`-specific validation ever runs; the fixture pins that
 end-to-end rejection at the receipt boundary.
 
-**`negative-cap-exceeded-exemplar.jsonl`** — the private-with-exemplars
-selection with its policy swapped to `exemplar-policy-v1-public-activated`
-(512 B per-exemplar cap) and one exemplar's sanitized code frame inflated
-past that cap. Decodes structurally; `ExemplarSelectionReceiptV1::validate_shape`
-rejects it because one exemplar's canonical wire length exceeds
+**`negative-cap-exceeded-exemplar.jsonl`** — a fresh single-candidate,
+single-stratum selection against `exemplar-policy-v1-public-activated`
+(512 B per-exemplar cap; `candidate_count`/`eligible_count`/`selected_count`
+all 1), with that one exemplar's canonical wire length inflated past the cap
+after selection. Decodes structurally; `ExemplarSelectionReceiptV1::validate_shape`
+rejects it because the exemplar's canonical wire length exceeds
 `effective_caps().max_bytes_each`.
 
 **`negative-secret-shaped-field.jsonl`** — `exemplar-v1.jsonl` with an
@@ -88,6 +89,17 @@ exemplar even if a caller tried.
 injected `"raw_log_line":"2026-08-15 500 error at checkout.rs:42"` field.
 Same structural rejection: `ExemplarV1` has no field that can hold an
 arbitrary raw log line, sanitized or not.
+
+**`negative-compliant-partial-coverage.jsonl`** — `slo-evaluation-v1-compliant.jsonl`
+with `coverage_result` rewritten from `complete` to `partial`. Decodes
+structurally (nothing about the JSON shape is malformed); `SloEvaluationV1::validate_shape`
+rejects it. RUN-01 requires full coverage before ANY verified outcome --
+`compliant` and `nonconformant` are both rank-2 "verified" outcomes
+(`SloOutcomeV1::verification_rank`) -- so this pins the same requirement for
+`compliant` that `slo-evaluation-v1-nonconformant.jsonl`'s pinned
+`coverage_result: complete` already pins for `nonconformant`. Checking only
+the `nonconformant` arm would fail open: a `compliant` outcome could then be
+asserted at full verification rank under partial or unknown coverage.
 
 ## Digests
 

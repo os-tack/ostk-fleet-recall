@@ -458,7 +458,13 @@ impl SloEvaluationV1 {
             || !strictly_sorted(&self.measurement_receipt_ids)
             || self.concrete_context.len() > MAX_DIMENSIONS
             || !strictly_sorted_dimensions(&self.concrete_context)
-            || (matches!(self.outcome, SloOutcomeV1::Nonconformant)
+            // RUN-01: ANY verified state (rank 2 -- currently `Compliant`
+            // and `Nonconformant`, but written off the rank rather than a
+            // single enum arm so a future rank-2 variant cannot slip past
+            // this check) requires full coverage. Checking only the
+            // `Nonconformant` arm would fail open: a `Compliant` outcome
+            // under partial/unknown coverage would sail through.
+            || (self.outcome.verification_rank() == 2
                 && !matches!(self.coverage_result, CoverageCompletenessV1::Complete))
         {
             return Err(ContractError::Schema("invalid SLO evaluation".into()));
@@ -939,11 +945,21 @@ impl ExemplarSelectionReceiptV1 {
     /// private-only exemplar set can never appear through this accessor,
     /// regardless of what the underlying `exemplars` field happens to hold
     /// (PUBLIC-04, EVID-05).
-    pub fn public_exemplars(&self) -> &[ExemplarV1] {
+    ///
+    /// Publication is impossible without validation: this always runs
+    /// [`Self::validate_shape`] first (which re-derives `policy_digest` from
+    /// `policy` and enforces the zero cap for an unactivated public policy)
+    /// and returns nothing at all if it fails. A record with a tampered
+    /// `visibility` field -- decoded straight from a store without being
+    /// validated first -- cannot reach the `Public` branch below with a
+    /// mismatched `policy_digest`, and an unactivated public policy caps
+    /// `exemplars` at zero regardless of what `visibility` claims.
+    pub fn public_exemplars(&self) -> ContractResult<&[ExemplarV1]> {
+        self.validate_shape()?;
         if matches!(self.policy.visibility, ExemplarVisibilityV1::Public) {
-            &self.exemplars
+            Ok(&self.exemplars)
         } else {
-            &[]
+            Ok(&[])
         }
     }
 
@@ -1251,7 +1267,35 @@ mod tests {
     const EXPECTED_NEGATIVE_RAW_LOG_LINE_RAW_SHA256: &str =
         "0253f931594d74fb17a6285e42fb8ae92caad2f09c6b18a10867f40dd135e22f";
     const EXPECTED_VECTOR_SUITE_RAW_SHA256: &str =
-        "e06b208b06998c17fc9cf0701abe2c059d6943e81d8a456109082aefb1aae2e0";
+        "5eb25388cc66eafee76997d8d9cf4eb6f19f13dc113dfe28661f22eb839e9d82";
+
+    // Semantic identities, recomputed from the decoded fixtures below and
+    // asserted against these hard-coded constants -- not merely
+    // self-equality. The raw-SHA pins above only prove the checked-in bytes
+    // have not changed; they do NOT prove that `receipt_id()`,
+    // `evaluation_id()`, `exemplar_digest()`, or `exemplar_policy_digest()`
+    // still compute the same value from those bytes. Changing any of the
+    // three `DigestDomain` prefixes this workstream owns
+    // (`ostk-measurement-receipt-v1`, `ostk-slo-evaluation-v1`,
+    // `ostk-exemplar-selection-v1`), or the canonical encoding those
+    // functions hash, would silently change every id below while every
+    // fixture file, and the raw-SHA loop above, stayed green.
+    const EXPECTED_PRIVATE_RECEIPT_ID: &str =
+        "795340f7ef91d68f40c472b74b49bc45edc6a291df0b4b085861ab60e95aca6f";
+    const EXPECTED_UNAVAILABLE_RECEIPT_ID: &str =
+        "2b7badbe900d070622e42020026a38643a2b865b62a814467476346322cd3e64";
+    const EXPECTED_SLO_COMPLIANT_EVALUATION_ID: &str =
+        "5e7e4a5f6c630017c05a6191989b7717efac72839a9d8cdcef0ebe3ce6e1a878";
+    const EXPECTED_SLO_NONCONFORMANT_EVALUATION_ID: &str =
+        "6a1b7a6ef2d04b477470de293c265fe44937be650fd9eb84476a6b43afaeff64";
+    const EXPECTED_POLICY_PRIVATE_DIGEST: &str =
+        "fc8924afba85139d8b93b485d3a11dc39f5b2925f422e3aa3e0de4a0b42e541a";
+    const EXPECTED_POLICY_PUBLIC_ACTIVATED_DIGEST: &str =
+        "2e3c4248e4e39c3590a73ecd467918a48b400c2822b0adb7e47e492e8212cb55";
+    const EXPECTED_EXEMPLAR_DIGEST: &str =
+        "8cdd33bb5ecd5ae33f62f967c6bba9d37768ae07e719c0ef79e6b7e5a60ce723";
+    const EXPECTED_NEGATIVE_COMPLIANT_PARTIAL_COVERAGE_RAW_SHA256: &str =
+        "ae29b4f136b07993e899252366558368993b9a9d303d8b355b378969b9c50fcf";
 
     fn raw_sha256(bytes: &[u8]) -> String {
         hex::encode(Sha256::digest(bytes))
@@ -1309,6 +1353,9 @@ mod tests {
         let negative_raw_log_line_framed = include_bytes!(
             "../../contracts/dynamic-memory/v3/telemetry/negative-raw-log-line-field.jsonl"
         );
+        let negative_compliant_partial_coverage_framed = include_bytes!(
+            "../../contracts/dynamic-memory/v3/telemetry/negative-compliant-partial-coverage.jsonl"
+        );
         let vector_suite_framed =
             include_bytes!("../../contracts/dynamic-memory/v3/telemetry/vector-suite.jsonl");
 
@@ -1359,6 +1406,10 @@ mod tests {
                 EXPECTED_NEGATIVE_RAW_LOG_LINE_RAW_SHA256,
             ),
             (
+                negative_compliant_partial_coverage_framed.as_slice(),
+                EXPECTED_NEGATIVE_COMPLIANT_PARTIAL_COVERAGE_RAW_SHA256,
+            ),
+            (
                 vector_suite_framed.as_slice(),
                 EXPECTED_VECTOR_SUITE_RAW_SHA256,
             ),
@@ -1379,6 +1430,10 @@ mod tests {
         assert_eq!(private_receipt.exemplars.selected_count, 4);
         assert_eq!(private_receipt.exemplars.withheld_count, 1);
         assert_eq!(private_receipt.exemplars.exemplars.len(), 4);
+        assert_eq!(
+            private_receipt.receipt_id().unwrap().to_string(),
+            EXPECTED_PRIVATE_RECEIPT_ID
+        );
 
         let unavailable_receipt_bytes = fixture_record(unavailable_receipt_framed);
         let unavailable_receipt: MeasurementReceiptV1 =
@@ -1395,6 +1450,10 @@ mod tests {
             }
         ));
         assert_eq!(unavailable_receipt.exemplars.selected_count, 0);
+        assert_eq!(
+            unavailable_receipt.receipt_id().unwrap().to_string(),
+            EXPECTED_UNAVAILABLE_RECEIPT_ID
+        );
 
         let slo_compliant_bytes = fixture_record(slo_compliant_framed);
         let slo_compliant: SloEvaluationV1 = decode_strict(slo_compliant_bytes).unwrap();
@@ -1403,6 +1462,10 @@ mod tests {
         assert_eq!(
             encode_canonical(&slo_compliant).unwrap(),
             slo_compliant_bytes
+        );
+        assert_eq!(
+            slo_compliant.evaluation_id().unwrap().to_string(),
+            EXPECTED_SLO_COMPLIANT_EVALUATION_ID
         );
 
         let slo_nonconformant_bytes = fixture_record(slo_nonconformant_framed);
@@ -1417,6 +1480,10 @@ mod tests {
             encode_canonical(&slo_nonconformant).unwrap(),
             slo_nonconformant_bytes
         );
+        assert_eq!(
+            slo_nonconformant.evaluation_id().unwrap().to_string(),
+            EXPECTED_SLO_NONCONFORMANT_EVALUATION_ID
+        );
 
         let policy_private_bytes = fixture_record(policy_private_framed);
         let policy_private: ExemplarPolicyV1 = decode_strict(policy_private_bytes).unwrap();
@@ -1425,6 +1492,10 @@ mod tests {
         assert_eq!(
             encode_canonical(&policy_private).unwrap(),
             policy_private_bytes
+        );
+        assert_eq!(
+            exemplar_policy_digest(&policy_private).unwrap().to_string(),
+            EXPECTED_POLICY_PRIVATE_DIGEST
         );
 
         let policy_public_activated_bytes = fixture_record(policy_public_activated_framed);
@@ -1436,11 +1507,21 @@ mod tests {
             encode_canonical(&policy_public_activated).unwrap(),
             policy_public_activated_bytes
         );
+        assert_eq!(
+            exemplar_policy_digest(&policy_public_activated)
+                .unwrap()
+                .to_string(),
+            EXPECTED_POLICY_PUBLIC_ACTIVATED_DIGEST
+        );
 
         let exemplar_bytes = fixture_record(exemplar_framed);
         let exemplar_value: ExemplarV1 = decode_strict(exemplar_bytes).unwrap();
         exemplar_value.validate().unwrap();
         assert_eq!(encode_canonical(&exemplar_value).unwrap(), exemplar_bytes);
+        assert_eq!(
+            exemplar_value.exemplar_digest().unwrap().to_string(),
+            EXPECTED_EXEMPLAR_DIGEST
+        );
 
         let selection_erased_bytes = fixture_record(selection_erased_framed);
         let selection_erased: ExemplarSelectionReceiptV1 =
@@ -1479,6 +1560,24 @@ mod tests {
 
         let negative_raw_log_line_bytes = fixture_record(negative_raw_log_line_framed);
         assert!(decode_strict::<ExemplarV1>(negative_raw_log_line_bytes).is_err());
+
+        // RUN-01 fail-open guard: `compliant` + `partial` coverage decodes
+        // structurally (nothing about the JSON shape is malformed) but
+        // `validate_shape` must refuse it, exactly as it already refuses
+        // `nonconformant` + `partial`.
+        let negative_compliant_partial_coverage_bytes =
+            fixture_record(negative_compliant_partial_coverage_framed);
+        let negative_compliant_partial_coverage: SloEvaluationV1 =
+            decode_strict(negative_compliant_partial_coverage_bytes).unwrap();
+        assert_eq!(
+            negative_compliant_partial_coverage.outcome,
+            SloOutcomeV1::Compliant
+        );
+        assert!(
+            negative_compliant_partial_coverage
+                .validate_shape()
+                .is_err()
+        );
     }
 
     fn scope() -> AuthenticatedProjectScopeV1 {
@@ -1727,6 +1826,33 @@ mod tests {
             coverage_result: CoverageCompletenessV1::Partial,
             outcome: SloOutcomeV1::Nonconformant,
         };
+        assert!(value.validate_shape().is_err());
+        value.coverage_result = CoverageCompletenessV1::Complete;
+        value.validate_shape().unwrap();
+    }
+
+    #[test]
+    // RUN-01 fail-open regression: a `compliant` outcome is exactly as
+    // "verified" (`verification_rank() == 2`) as `nonconformant` and must be
+    // rejected under the same coverage weaker than `complete`, for BOTH
+    // `partial` and `unknown`. The guard is written off `verification_rank`
+    // precisely so this arm cannot be forgotten the way it originally was.
+    fn compliant_outcome_requires_complete_coverage() {
+        let mut value = SloEvaluationV1 {
+            schema_version: TELEMETRY_SCHEMA_VERSION,
+            scope: scope(),
+            normative_rule: registry_ref("normative.slo.checkout_latency", 20),
+            measurement_receipt_ids: vec![MeasurementReceiptId::from_digest(
+                Sha256Digest::from_bytes([21; 32]),
+            )],
+            comparator: registry_ref("comparator.less_than_or_equal", 22),
+            applicability_evaluator: registry_ref("applicability.default", 23),
+            concrete_context: Vec::new(),
+            coverage_result: CoverageCompletenessV1::Partial,
+            outcome: SloOutcomeV1::Compliant,
+        };
+        assert!(value.validate_shape().is_err());
+        value.coverage_result = CoverageCompletenessV1::Unknown;
         assert!(value.validate_shape().is_err());
         value.coverage_result = CoverageCompletenessV1::Complete;
         value.validate_shape().unwrap();
@@ -1988,7 +2114,7 @@ mod tests {
     #[test]
     fn public_reclassification_never_exposes_a_private_only_selection() {
         let private_selection = unbound_selection(&private_policy());
-        assert!(private_selection.public_exemplars().is_empty());
+        assert!(private_selection.public_exemplars().unwrap().is_empty());
 
         let candidates = vec![candidate(
             "route.only",
@@ -2005,14 +2131,57 @@ mod tests {
             select_exemplars_deterministic_stratified_hash_v1(&private_policy(), &population)
                 .unwrap();
         assert_eq!(private_with_exemplar.exemplars.len(), 1);
-        assert!(private_with_exemplar.public_exemplars().is_empty());
+        assert!(private_with_exemplar.public_exemplars().unwrap().is_empty());
 
         let public_with_exemplar = select_exemplars_deterministic_stratified_hash_v1(
             &public_activated_policy(),
             &population,
         )
         .unwrap();
-        assert_eq!(public_with_exemplar.public_exemplars().len(), 1);
+        assert_eq!(public_with_exemplar.public_exemplars().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn public_exemplars_rejects_a_receipt_with_tampered_visibility_instead_of_publishing_it() {
+        // Adversarial reproduction of the PUBLIC-04/EVID-05 blocker: take a
+        // legitimately Private receipt with real exemplars, decode it from
+        // wire bytes the way a store-backed reader would, then flip only
+        // the `visibility` token (leaving `policy_digest` bound to the
+        // original -- now mismatched -- private policy). The accessor must
+        // refuse to publish rather than trust the unvalidated field.
+        let candidates = vec![candidate(
+            "route.only",
+            93,
+            1,
+            CandidateOutcomeV1::Eligible(Box::new(exemplar(1, 0))),
+        )];
+        let population = PopulationInputV1::Bound {
+            snapshot_digest: Sha256Digest::from_bytes([94; 32]),
+            query_population_digest: Sha256Digest::from_bytes([95; 32]),
+            candidates: &candidates,
+        };
+        let private_with_exemplar =
+            select_exemplars_deterministic_stratified_hash_v1(&private_policy(), &population)
+                .unwrap();
+        assert_eq!(private_with_exemplar.exemplars.len(), 1);
+
+        let bytes = encode_canonical(&private_with_exemplar).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let flipped_text =
+            text.replacen("\"visibility\":\"private\"", "\"visibility\":\"public\"", 1);
+        assert_ne!(text, flipped_text);
+        let flipped_bytes =
+            crate::memory_contracts::canonical::parse_strict(flipped_text.as_bytes())
+                .unwrap()
+                .bytes()
+                .to_vec();
+        let tampered: ExemplarSelectionReceiptV1 = decode_strict(&flipped_bytes).unwrap();
+        assert!(matches!(
+            tampered.policy.visibility,
+            ExemplarVisibilityV1::Public
+        ));
+        assert!(tampered.validate_shape().is_err());
+        assert!(tampered.public_exemplars().is_err());
     }
 
     #[test]
@@ -2387,6 +2556,26 @@ mod tests {
         let sha = write("negative-raw-log-line-field.jsonl", raw_log_bytes);
         record(&mut manifest, "negative-raw-log-line-field.jsonl", sha);
 
+        // Negative (RUN-01 fail-open guard): a `compliant` outcome under
+        // `partial` coverage. Both `Compliant` and `Nonconformant` are
+        // rank-2 "verified" outcomes (`SloOutcomeV1::verification_rank`);
+        // this pins that the rank-2 coverage requirement is enforced for
+        // BOTH arms, not only the `Nonconformant` one the earlier
+        // `nonconformant_outcome_requires_complete_coverage` unit test
+        // already covered. Decodes structurally; `validate_shape` rejects it.
+        let compliant_partial_coverage =
+            slo_evaluation_fixture(SloOutcomeV1::Compliant, CoverageCompletenessV1::Partial);
+        assert!(compliant_partial_coverage.validate_shape().is_err());
+        let sha = write(
+            "negative-compliant-partial-coverage.jsonl",
+            encode_canonical(&compliant_partial_coverage).unwrap(),
+        );
+        record(
+            &mut manifest,
+            "negative-compliant-partial-coverage.jsonl",
+            sha,
+        );
+
         // The manifest itself: raw SHA-256 of every fixture's exact bytes,
         // plus the semantic identity each positive fixture decodes to. Built
         // from the in-memory bytes just written, then re-canonicalized like
@@ -2416,6 +2605,7 @@ mod tests {
                 "cap_exceeded_exemplar": "negative-cap-exceeded-exemplar.jsonl",
                 "secret_shaped_field": "negative-secret-shaped-field.jsonl",
                 "raw_log_line_field": "negative-raw-log-line-field.jsonl",
+                "compliant_partial_coverage": "negative-compliant-partial-coverage.jsonl",
             },
             "artifacts": manifest,
         });
