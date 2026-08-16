@@ -808,7 +808,6 @@ pub struct ExemplarSelectionReceiptV1 {
 }
 
 impl ExemplarSelectionReceiptV1 {
-    #[allow(clippy::too_many_lines)]
     pub fn validate_shape(&self) -> ContractResult<()> {
         self.policy.validate()?;
         if self.schema_version != TELEMETRY_SCHEMA_VERSION
@@ -840,6 +839,17 @@ impl ExemplarSelectionReceiptV1 {
             PopulationBoundaryV1::Bound { .. } => {}
         }
 
+        self.validate_counts_and_strata()?;
+        self.validate_caps_and_tombstones()?;
+        Ok(())
+    }
+
+    /// Candidate/eligible/withheld/selected/omitted arithmetic, canonical
+    /// strata order, per-stratum totals, and the present-plus-tombstoned
+    /// identity. Split out of [`Self::validate_shape`] purely to stay under
+    /// clippy's line-count lint on production code -- every check here ran
+    /// (and still runs) unconditionally as part of one shape validation.
+    fn validate_counts_and_strata(&self) -> ContractResult<()> {
         let eligible_from_candidates = self
             .candidate_count
             .checked_sub(self.withheld_count)
@@ -898,7 +908,13 @@ impl ExemplarSelectionReceiptV1 {
                 "present plus tombstoned exemplars must equal the selected count".into(),
             ));
         }
+        Ok(())
+    }
 
+    /// Policy-derived count/byte caps and tombstone/present-exemplar
+    /// consistency. Split out of [`Self::validate_shape`]; see
+    /// [`Self::validate_counts_and_strata`] for why.
+    fn validate_caps_and_tombstones(&self) -> ContractResult<()> {
         let caps = self.policy.effective_caps();
         if self.exemplars.len() > caps.max_count {
             return Err(ContractError::Schema(
