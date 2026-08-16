@@ -10,7 +10,6 @@ x-aws-environment: &aws-environment
   FLEET_RECALL_AWS_ENDPOINT_URL: http://localstack:4566
 
 x-fleet-environment: &fleet-environment
-  FLEET_RECALL_DATABASE_SECRET_ID: ostk-fleet-recall/local/database-url
   FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE: "1"
   FLEET_RECALL_TENANT_ID: 0198a849-f6ae-7d61-9800-000000000001
   FLEET_RECALL_PROJECT: localstack-demo
@@ -22,12 +21,16 @@ x-fleet-environment: &fleet-environment
   FLEET_RECALL_MODEL_S3_URI: s3://fleet-recall-local-models/bundles/demo
   RUST_LOG: ostk_fleet_recall=info
 
-x-fleet-base: &fleet-base
-  image: ostk-fleet-recall:localstack
+# The AWS-CLI-bearing target is confined to one-shot/private helpers. The
+# externally reachable app below is built from the exact production target.
+x-private-base: &private-base
+  image: ostk-fleet-recall:localstack-private
   build:
     context: ../..
     dockerfile: Dockerfile
     target: localstack
+    args:
+      VCS_REF: ${FLEET_RECALL_VCS_REF:?run deploy/localstack/smoke.sh}
   entrypoint: ["/bin/sh", "/localstack/app-entrypoint.sh"]
   environment:
     <<: [*aws-environment, *fleet-environment]
@@ -81,36 +84,126 @@ services:
     networks:
       - fleet
 
-  migrate:
-    <<: *fleet-base
-    command: ["migrate"]
+  database-bootstrap:
+    image: cockroachdb/cockroach:v26.2.3
+    entrypoint: ["/bin/sh", "/localstack/database-bootstrap.sh"]
+    volumes:
+      - ./database-bootstrap.sh:/localstack/database-bootstrap.sh:ro
     depends_on:
-      localstack:
-        condition: service_healthy
       cockroach:
         condition: service_healthy
     restart: "no"
+    networks:
+      - fleet
 
-  ingest:
-    <<: *fleet-base
-    command: ["ingest", "--input", "/demo/demo.ndjson"]
+  migrate:
+    <<: *private-base
+    command: ["migrate"]
+    environment:
+      <<: [*aws-environment, *fleet-environment]
+      FLEET_RECALL_PRIVATE_DATABASE_KIND: migrator
+      FLEET_RECALL_DATABASE_SECRET_ID: ostk-fleet-recall/local/migrator-database-url
+    depends_on:
+      localstack:
+        condition: service_healthy
+      database-bootstrap:
+        condition: service_completed_successfully
+    restart: "no"
+
+  database-boundary:
+    image: cockroachdb/cockroach:v26.2.3
+    entrypoint: ["/bin/sh", "/localstack/database-boundary.sh"]
     volumes:
-      - ./app-entrypoint.sh:/localstack/app-entrypoint.sh:ro
-      - ./aws-config:/localstack/aws-config:ro
-      - ../../examples:/demo:ro
+      - ./database-boundary.sh:/localstack/database-boundary.sh:ro
+      - ../cockroach/publication-reader-role-grants.sql:/localstack/publication-reader-role-grants.sql:ro
     depends_on:
       migrate:
         condition: service_completed_successfully
     restart: "no"
+    networks:
+      - fleet
 
-  app:
-    <<: *fleet-base
-    command: ["demo", "--listen", "0.0.0.0:8080"]
-    ports:
-      - "127.0.0.1:${FLEET_RECALL_DEMO_PORT:-8088}:8080"
+  ingest:
+    <<: *private-base
+    command: ["ingest", "--input", "/opt/ostk/demo/demo.ndjson"]
+    environment:
+      <<: [*aws-environment, *fleet-environment]
+      FLEET_RECALL_PRIVATE_DATABASE_KIND: writer
+      FLEET_RECALL_DATABASE_SECRET_ID: ostk-fleet-recall/local/writer-database-url
+    depends_on:
+      database-boundary:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # Fleet scenario and reference-agent writes execute here. It has the writer
+  # secret identifier but no publication URL and no externally published port.
+  writer:
+    <<: *private-base
+    command: ["localstack-writer-idle"]
+    environment:
+      <<: [*aws-environment, *fleet-environment]
+      FLEET_RECALL_PRIVATE_DATABASE_KIND: writer
+      FLEET_RECALL_DATABASE_SECRET_ID: ostk-fleet-recall/local/writer-database-url
     depends_on:
       ingest:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1 && test -r /opt/ostk/models/potion-retrieval-32M/model.safetensors"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  publication-secret:
+    image: ostk-fleet-recall:localstack-private
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: localstack
+      args:
+        VCS_REF: ${FLEET_RECALL_VCS_REF:?run deploy/localstack/smoke.sh}
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/localstack/secret-to-file.sh"]
+    environment:
+      <<: *aws-environment
+      FLEET_RECALL_DATABASE_SECRET_ID: ostk-fleet-recall/local/publication-database-url
+    volumes:
+      - ./secret-to-file.sh:/localstack/secret-to-file.sh:ro
+      - ./aws-config:/localstack/aws-config:ro
+      - publication-secret:/run/fleet-recall-publication
+    depends_on:
+      localstack:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - fleet
+
+  app:
+    image: ostk-fleet-recall:localstack-production
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: production
+      args:
+        VCS_REF: ${FLEET_RECALL_VCS_REF:?run deploy/localstack/smoke.sh}
+    entrypoint: ["/bin/sh", "/localstack/publication-entrypoint.sh"]
+    command: ["demo", "--listen", "0.0.0.0:8080"]
+    environment:
+      <<: [*aws-environment, *fleet-environment]
+    volumes:
+      - ./publication-entrypoint.sh:/localstack/publication-entrypoint.sh:ro
+      - ./aws-config:/localstack/aws-config:ro
+      - publication-secret:/run/fleet-recall-publication:ro
+    ports:
+      - "127.0.0.1:${FLEET_RECALL_DEMO_PORT:-8088}:8080"
+    depends_on:
+      database-boundary:
+        condition: service_completed_successfully
+      publication-secret:
+        condition: service_completed_successfully
+      writer:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/healthz"]
       interval: 5s
@@ -118,6 +211,12 @@ services:
       retries: 30
       start_period: 30s
     restart: unless-stopped
+    networks:
+      - fleet
+
+volumes:
+  publication-secret:
+    name: ostk-fleet-recall-local-publication-secret
 
 networks:
   fleet:

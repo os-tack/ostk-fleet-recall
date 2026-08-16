@@ -18,21 +18,22 @@ for command_name in docker jq; do
     fi
 done
 
-# Discover the one healthy demo container without evaluating Compose's secret
-# and model interpolations again. `smoke.sh` creates this fixed project name.
-app_container=$(docker ps \
+# Discover the one healthy private writer container without evaluating
+# Compose's secret and model interpolations again. The production app never
+# receives a writer URL and cannot execute this mutation scenario.
+writer_container=$(docker ps \
     --filter label=com.docker.compose.project=ostk-fleet-recall-local \
-    --filter label=com.docker.compose.service=app \
+    --filter label=com.docker.compose.service=writer \
     --filter status=running \
     --format '{{.ID}}')
-case "$app_container" in
+case "$writer_container" in
     '')
-        echo "the LocalStack Fleet Recall app is not running; start it with smoke.sh and KEEP_LOCALSTACK=1" >&2
+        echo "the LocalStack Fleet Recall writer is not running; start it with smoke.sh and KEEP_LOCALSTACK=1" >&2
         exit 69
         ;;
     *"
 "*)
-        echo "more than one LocalStack Fleet Recall app container is running" >&2
+        echo "more than one LocalStack Fleet Recall writer container is running" >&2
         exit 69
         ;;
 esac
@@ -49,7 +50,7 @@ run_agent() {
     agent=$1
     docker exec --interactive \
         --env "FLEET_RECALL_AGENT=$agent" \
-        "$app_container" \
+        "$writer_container" \
         /bin/sh /localstack/app-entrypoint.sh serve
 }
 
