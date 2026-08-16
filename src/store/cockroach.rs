@@ -37,7 +37,7 @@ pub const EMBEDDING_DIMENSION: usize = 512;
 pub const MAX_PUBLIC_NUMERIC_ID: i64 = 9_007_199_254_740_991;
 /// Oldest complete additive database schema supported by the current recall,
 /// remember, conflict-projection, ingestion, and public-demo paths.
-pub const MINIMUM_RECALL_SCHEMA_VERSION: i64 = 17;
+pub const MINIMUM_RECALL_SCHEMA_VERSION: i64 = 18;
 
 /// Exact application tables reachable from public health/status/recall SQL.
 ///
@@ -233,6 +233,8 @@ const CLAIM_TRANSITION_PROVENANCE_INDEX_MIGRATION_SQL: &str =
     include_str!("../../migrations/0016_claim_transition_provenance_index.sql");
 const CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL: &str =
     include_str!("../../migrations/0017_conflict_detector_projection_index.sql");
+const STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0018_stage4_evidence_ledger.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -274,7 +276,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
     ]
 }
 
-fn post_transactional_online_migrations() -> [Migration; 3] {
+fn post_transactional_online_migrations() -> [Migration; 4] {
     [
         Migration::new(
             15,
@@ -295,6 +297,15 @@ fn post_transactional_online_migrations() -> [Migration; 3] {
             Cow::Borrowed("exact conflict-detector projection index"),
             MigrationType::Simple,
             Cow::Borrowed(CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL),
+            true,
+        ),
+        Migration::new(
+            18,
+            Cow::Borrowed("stage-4 evidence ledger and writer authority"),
+            MigrationType::Simple,
+            Cow::Borrowed(STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL),
+            // Additive tables plus two online ADD COLUMN transitions on
+            // schema-locked tables; CockroachDB requires DDL autocommit here.
             true,
         ),
     ]
@@ -404,7 +415,7 @@ fn embedded_migrator() -> Migrator {
 fn pre_transactional_embedded_migrator() -> Migrator {
     let mut migrator = embedded_migrator();
     for migration in migrator.migrations.to_mut() {
-        // Recognize applied versions 12-17 during fail-closed history
+        // Recognize applied versions 12-18 during fail-closed history
         // validation, but leave them for their later transaction-policy phase.
         if migration.version >= 12 {
             migration.migration_type = MigrationType::ReversibleDown;
@@ -416,7 +427,7 @@ fn pre_transactional_embedded_migrator() -> Migrator {
 fn transactional_embedded_migrator() -> Migrator {
     let mut migrator = embedded_migrator();
     for migration in migrator.migrations.to_mut() {
-        // Versions 15-17 are resumable online schema changes and must wait for
+        // Versions 15-18 are resumable online schema changes and must wait for
         // the post-transactional phase with CockroachDB's DDL autocommit.
         if migration.version >= 15 {
             migration.migration_type = MigrationType::ReversibleDown;
@@ -990,7 +1001,7 @@ impl CockroachStore {
         // history row even though SQLx opened a transaction. Versions 1-11
         // require that default for online/legacy schema changes; versions
         // 12-14 require it disabled for genuinely atomic DDL plus bookkeeping.
-        // Versions 15-17 return to CockroachDB's online-DDL autocommit policy
+        // Versions 15-18 return to CockroachDB's online-DDL autocommit policy
         // in a third phase after the transactional successor tables are durable.
         let mut connection = self.pool.acquire().await?;
         let migration_result: Result<()> = async {
@@ -2246,9 +2257,9 @@ mod tests {
     #[test]
     fn database_schema_compatibility_is_a_minimum_floor() {
         for (schema_version, minimum, expected) in [
-            (16, MINIMUM_RECALL_SCHEMA_VERSION, false),
-            (17, MINIMUM_RECALL_SCHEMA_VERSION, true),
+            (17, MINIMUM_RECALL_SCHEMA_VERSION, false),
             (18, MINIMUM_RECALL_SCHEMA_VERSION, true),
+            (19, MINIMUM_RECALL_SCHEMA_VERSION, true),
             (2, 3, false),
             (3, 3, true),
         ] {
@@ -2437,7 +2448,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_migration_history_one_through_seventeen_is_byte_immutable() {
+    fn committed_migration_history_one_through_eighteen_is_byte_immutable() {
         for (migration, expected_sha256) in [
             (
                 INITIAL_MIGRATION_SQL,
@@ -2506,6 +2517,10 @@ mod tests {
             (
                 CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL,
                 "3fc6c7cbad7cb709238236672cde66870b42b580a0553dd14b375a5ee5bf9754",
+            ),
+            (
+                STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL,
+                "40305fa4239c446b894ba9ec5b513a19905dc930628749b34904a4b6846fec49",
             ),
         ] {
             assert_eq!(format!("{:x}", Sha256::digest(migration)), expected_sha256);
@@ -3017,8 +3032,113 @@ mod tests {
         );
     }
 
+    /// Migration 0018 is the physical boundary ADR 0002 D1/D2/D5 rely on. The
+    /// evidence ledger must mirror the control ledger without inheriting its
+    /// governance kinds, and it must never become a second log epoch.
     #[test]
-    fn embedded_migrator_registers_mixed_transaction_policy_through_seventeen() {
+    fn stage4_evidence_ledger_migration_is_additive_bounded_and_governance_free() {
+        let migration = STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL;
+        let tables = [
+            "memory_evidence_shard_heads",
+            "memory_evidence_events",
+            "memory_evidence_quarantine",
+            "memory_content_objects",
+            "memory_relation_projection_v1",
+            "memory_relation_projection_watermarks_v1",
+        ];
+        assert_eq!(
+            migration.matches("CREATE TABLE IF NOT EXISTS ").count(),
+            tables.len()
+        );
+        assert_eq!(migration.matches("CREATE TABLE ").count(), tables.len());
+        for table in tables {
+            assert!(
+                migration.contains(&format!(
+                    "CREATE TABLE IF NOT EXISTS {table} (\n    tenant_id"
+                )),
+                "{table} must be scoped by tenant_id first"
+            );
+        }
+        assert_eq!(migration.matches("CREATE VIEW ").count(), 1);
+        assert!(migration.contains("CREATE VIEW IF NOT EXISTS memory_writer_authority_v1 AS"));
+
+        // The evidence head shares the control ledger's single genesis epoch
+        // instead of minting its own, so UNIQUE (tenant_id, project) on
+        // memory_control_log_epochs keeps the single-epoch invariant literal.
+        assert!(migration.contains(
+            "REFERENCES memory_control_log_epochs (tenant_id, project, epoch_id, shard_count)"
+        ));
+        assert!(migration.contains(
+            "REFERENCES memory_evidence_shard_heads (tenant_id, project, epoch_id, shard)"
+        ));
+        assert!(migration.contains("UNIQUE (tenant_id, project, event_id)"));
+        assert!(migration.contains(
+            "CREATE UNIQUE INDEX IF NOT EXISTS memory_evidence_events_predecessor_unique_idx"
+        ));
+
+        // D1: no governance kind or family can be appended to this ledger.
+        for governance_kind in [
+            "'control.bootstrap.accepted'",
+            "'registry.genesis.activated'",
+            "'registry.successor.activated'",
+        ] {
+            assert!(
+                migration.contains(governance_kind),
+                "governance exclusion must name {governance_kind}"
+            );
+        }
+        assert!(migration.contains("event_kind NOT IN ("));
+        assert!(migration.contains("consistency_family <> 'registry.activation'"));
+
+        // D5 and REPLAY-02 shapes.
+        assert!(migration.contains("retention_class IN ('ephemeral', 'governed', 'immutable')"));
+        for erasure_axis in [
+            "erasure_representation_digest",
+            "erasure_source_fact_digest",
+            "erasure_resource_digest",
+            "erasure_privacy_subject_digest",
+        ] {
+            assert!(migration.contains(erasure_axis));
+        }
+        assert!(
+            !migration.contains("    payload "),
+            "quarantine must retain a digest and bounded diagnostic, never payload bytes"
+        );
+        assert!(migration.contains("octet_length(diagnostic) BETWEEN 1 AND 4096"));
+        assert!(migration.contains("ledger_family IN ('control', 'evidence')"));
+        assert!(migration.contains("PRIMARY KEY (tenant_id, project, ledger_family, shard)"));
+        assert!(
+            migration
+                .contains("projection_state IN ('declared', 'verified', 'refuted', 'contested')")
+        );
+
+        // D3: the accepted-event coordinate is additive, nullable, and shaped.
+        assert_eq!(migration.matches("ADD COLUMN IF NOT EXISTS ").count(), 2);
+        assert_eq!(
+            migration.matches("ADD CONSTRAINT IF NOT EXISTS ").count(),
+            2
+        );
+        assert_eq!(
+            migration
+                .matches(
+                    "CHECK (accepted_event_id IS NULL OR octet_length(accepted_event_id) = 32)"
+                )
+                .count(),
+            2
+        );
+
+        // Additive only: no destructive verb may enter an applied migration.
+        for destructive in ["DROP ", "TRUNCATE", "DELETE FROM", "UPDATE "] {
+            assert!(
+                !migration.contains(destructive),
+                "migration 0018 must stay additive; found {destructive}"
+            );
+        }
+        assert!(!migration.contains(" DEFAULT "));
+    }
+
+    #[test]
+    fn embedded_migrator_registers_mixed_transaction_policy_through_eighteen() {
         let migrator = embedded_migrator();
         assert_eq!(
             migrator
@@ -3026,7 +3146,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=17).collect::<Vec<_>>()
+            (1..=18).collect::<Vec<_>>()
         );
         assert_eq!(
             migrator
@@ -3034,7 +3154,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.no_tx)
                 .collect::<Vec<_>>(),
-            [vec![true; 11], vec![false; 3], vec![true; 3]].concat()
+            [vec![true; 11], vec![false; 3], vec![true; 4]].concat()
         );
         let control_ledger = migrator
             .migrations
@@ -3082,6 +3202,7 @@ mod tests {
             (15, CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL, true),
             (16, CLAIM_TRANSITION_PROVENANCE_INDEX_MIGRATION_SQL, true),
             (17, CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL, true),
+            (18, STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL, true),
         ] {
             let migration = migrator
                 .migrations
@@ -3105,9 +3226,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=17).collect::<Vec<_>>()
+            (1..=18).collect::<Vec<_>>()
         );
-        for version in 10..=17 {
+        for version in 10..=18 {
             let migration = pre_transactional
                 .migrations
                 .iter()
@@ -3129,7 +3250,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=17).collect::<Vec<_>>()
+            (1..=18).collect::<Vec<_>>()
         );
         for migration in transactional.migrations.iter() {
             let expected_type = if migration.version >= 15 {
@@ -3141,7 +3262,7 @@ mod tests {
         }
     }
 
-    async fn assert_exact_successful_migration_prefix_through_seventeen(pool: &PgPool) {
+    async fn assert_exact_successful_migration_prefix_through_eighteen(pool: &PgPool) {
         let actual = sqlx::query_as::<_, (i64, bool, Vec<u8>)>(
             "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version",
         )
@@ -3221,7 +3342,7 @@ mod tests {
         .unwrap();
 
         store.migrate().await.unwrap();
-        assert_exact_successful_migration_prefix_through_seventeen(store.pool()).await;
+        assert_exact_successful_migration_prefix_through_eighteen(store.pool()).await;
         assert_online_projection_indexes_are_covering(store.pool()).await;
 
         // Process death after both backfills but before either SQLx history row.
@@ -3230,7 +3351,7 @@ mod tests {
             .await
             .unwrap();
         store.migrate().await.unwrap();
-        assert_exact_successful_migration_prefix_through_seventeen(store.pool()).await;
+        assert_exact_successful_migration_prefix_through_eighteen(store.pool()).await;
 
         // Missing version 16 must be repairable even when exact version 17 is
         // already recorded, and an absent index must be rebuilt online.
@@ -3243,7 +3364,7 @@ mod tests {
             .await
             .unwrap();
         store.migrate().await.unwrap();
-        assert_exact_successful_migration_prefix_through_seventeen(store.pool()).await;
+        assert_exact_successful_migration_prefix_through_eighteen(store.pool()).await;
 
         // The same absent-index recovery applies to the tail migration.
         sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 17")
@@ -3257,7 +3378,7 @@ mod tests {
         .await
         .unwrap();
         store.migrate().await.unwrap();
-        assert_exact_successful_migration_prefix_through_seventeen(store.pool()).await;
+        assert_exact_successful_migration_prefix_through_eighteen(store.pool()).await;
 
         for (version, table_name, index_name) in [
             (
@@ -3304,7 +3425,7 @@ mod tests {
                 .await
                 .unwrap();
             store.migrate().await.unwrap();
-            assert_exact_successful_migration_prefix_through_seventeen(store.pool()).await;
+            assert_exact_successful_migration_prefix_through_eighteen(store.pool()).await;
         }
 
         sqlx::query("UPDATE _sqlx_migrations SET success = false WHERE version = 17")
@@ -3324,7 +3445,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO _sqlx_migrations \
                  (version, description, success, checksum, execution_time) \
-             VALUES (18, 'unknown migration', true, $1, 0)",
+             VALUES (19, 'unknown migration', true, $1, 0)",
         )
         .bind(vec![0_u8])
         .execute(store.pool())
@@ -3333,9 +3454,9 @@ mod tests {
         let unknown_error = store.migrate().await.unwrap_err();
         assert!(matches!(
             unknown_error,
-            FleetError::Migration(MigrateError::VersionMissing(18))
+            FleetError::Migration(MigrateError::VersionMissing(19))
         ));
-        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 18")
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 19")
             .execute(store.pool())
             .await
             .unwrap();
@@ -3365,7 +3486,7 @@ mod tests {
             .unwrap();
 
         store.migrate().await.unwrap();
-        assert_exact_successful_migration_prefix_through_seventeen(store.pool()).await;
+        assert_exact_successful_migration_prefix_through_eighteen(store.pool()).await;
         assert_online_projection_indexes_are_covering(store.pool()).await;
     }
 

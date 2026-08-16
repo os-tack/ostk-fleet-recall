@@ -1,6 +1,6 @@
 # CockroachDB migration policy
 
-Fleet Recall currently has seventeen embedded schema migrations. Migration 1
+Fleet Recall currently has eighteen embedded schema migrations. Migration 1
 creates the distributed corpus, claim and conflict ledgers, audit tables,
 vector indexes, and lexical inverted index; migration 2 adds the scoped support
 lookup; migration 3 adds the private control-event ledger; migration 4 adds the
@@ -14,10 +14,17 @@ append-only registry transition history, one-shot genesis-bridge consumption,
 and successor current-head projection. Migration 15 replaces conflict
 uniqueness by `(tenant, project, claim key)` with detector-versioned uniqueness;
 migration 16 adds the covering claim-transition provenance index required by
-legacy reconciliation; and migration 17 adds the covering current-conflict
-detector/state projection index required by normal serving.
+legacy reconciliation; migration 17 adds the covering current-conflict
+detector/state projection index required by normal serving; and migration 18
+adds the Stage-4 runtime foundations recorded in
+[ADR 0002](adr/0002-stage4-runtime-foundations.md): the general accepted-event
+ledger (`memory_evidence_events` plus `memory_evidence_shard_heads`) under the
+control ledger's single log epoch, the quarantine, governed-content, and
+relation-projection tables, the nullable `accepted_event_id` columns on
+`memory_claims` and `memory_mutation_receipts`, and the read-only
+`memory_writer_authority_v1` head-witness view.
 
-## Transaction policy: versions 1–11, 12–14, and 15–17
+## Transaction policy: versions 1–11, 12–14, and 15–18
 
 CockroachDB 26.2 runs vector-index creation through its declarative schema
 changer and rejects that operation inside an explicit multi-statement
@@ -50,7 +57,7 @@ returns to the shared runtime pool. Official CockroachDB v26.2.3 tests force the
 history insert to fail after DDL and require both the new table and history row
 to be absent.
 
-Versions 15 through 17 form a third phase with
+Versions 15 through 18 form a third phase with
 `autocommit_before_ddl = true` and `no_tx = true`. Migration 15 accepts only the
 exact old-only, old-plus-new, or new-only detector-index transition states. It
 creates and commits the new detector-versioned unique index, verifies both
@@ -59,7 +66,12 @@ commits, and verifies the exact final state; it rewrites no conflict rows.
 Migrations 16 and 17 each use `CREATE INDEX IF NOT EXISTS`, commit the online
 backfill, and assert the complete public catalog definition including stored
 columns. Same-name drift fails with SQLSTATE `55000` before SQLx can record
-success.
+success. Migration 18 belongs to this phase because its two `ALTER TABLE ADD
+COLUMN` steps run against schema-locked tables. Every object it creates uses
+`IF NOT EXISTS`, and each new column's CHECK is installed by a separate `ADD
+CONSTRAINT IF NOT EXISTS` rather than inline: an inline named CHECK is not
+resumable, because a re-run skips the existing column and still rejects the
+duplicate constraint name with SQLSTATE `42710`.
 
 Those are database correctness guarantees. The original recorded LocalStack
 Docker/Compose application-image smoke stopped at migration 9 and remains only
@@ -79,7 +91,7 @@ That is an operational constraint, not permission to run migration casually:
 - for versions 1 through 11, never assume an error rolled back DDL;
 - for versions 12 through 14, treat non-atomic state as evidence of an
   unreviewed runner/session or catalog drift;
-- for versions 15 through 17, wait for online jobs and use only the reviewed
+- for versions 15 through 18, wait for online jobs and use only the reviewed
   resumable catalog transitions; and
 - follow the version-specific recovery rules below instead of editing SQLx
   history.
@@ -103,7 +115,7 @@ application service and autoscaling minimum to zero.
 5. Run `./deploy/aws/run-migration.sh` once.
 6. Inspect the task's CloudWatch logs and confirm exit code zero.
 7. Separately, with the migrator/security-operator procedure, verify the exact
-   seventeen successful rows for prefix 1 through 17 and inspect all
+   eighteen successful rows for prefix 1 through 18 and inspect all
    schema-change jobs. The private compatibility gates remain intentionally
    distinct: Stage-2 control requires prefix 1 through 3, genesis Stage-3
    requires 1 through 9, the first-successor repository requires 1 through 14,
@@ -117,10 +129,10 @@ application service and autoscaling minimum to zero.
    exact login-enable operation described below.
 9. Run `health` and the one-off seed/reference work with the private writer
    credential. Current recall, remember, ingest, MCP, health, and public-demo
-   paths require an uninterrupted successful prefix of at least 17, including
+   paths require an uninterrupted successful prefix of at least 18, including
    the exact current indexes, cosine support, and configured model identity.
    Later additive rows remain compatible, but cannot mask a missing or failed
-   row in 1–17.
+   row in 1–18.
 10. Enable only the externally managed `fleet_publication` authentication,
     then set the desired/minimum service count to at least one and apply again.
     The public task receives only its publication-reader secret.
@@ -250,14 +262,16 @@ the external login or its password/identity-provider binding.
 Then apply and verify the exact control-plane exclusions and one-shot bootstrap
 grants in [the private control bootstrap policy](CONTROL_BOOTSTRAP.md). The
 base policy can first run after migration 3 and remains valid at that stage. At
-the current post-v17 release, create/harden both frozen private logical roles by
+the current post-v18 release, create/harden both frozen private logical roles by
 applying or reapplying the control and genesis-activation policies, then apply
 [quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql).
 That deny-only policy retains its own complete-successful-prefix-1-through-14
 gate, then revokes every privilege and grant option on the three successor
 tables from `public`, runtime, bootstrap, and genesis activation; it grants
 nothing. Migrations 15 through 17 add or replace indexes, not successor tables,
-so they do not change that quarantine's object set.
+and migration 18 adds only evidence-plane, content, and projection objects, so
+neither changes that quarantine's object set. The quarantine's three REVOKE
+targets stay byte-identical after migration 18.
 The base policy's checked-in grant proof machine-compares the normalized
 `SHOW GRANTS` result;
 runtime and `public` have no control-table privilege. The logical runtime and
@@ -292,7 +306,7 @@ registry-activation SQL principal and TLS secret out of band, or add separately
 reviewed Terraform/task wiring that preserves the same isolation.
 
 After the current release has the complete successful migration prefix 1
-through 17 and the reapplied Stage-2 control-role policy, apply
+through 18 and the reapplied Stage-2 control-role policy, apply
 [`registry-activation-role-grants.sql`](../deploy/cockroach/registry-activation-role-grants.sql)
 as the cluster-admin/delegated security operator described above, not merely as
 the database owner. The genesis Stage-3 repository's compatibility preflight
@@ -436,7 +450,7 @@ table, sequence, DDL, and delegation path. The proof uses CockroachDB 26.2.3 by
 default and removes its isolated container afterward. This Docker RBAC lane
 owns the complete allow/deny/grant-option drift matrix, including successor
 quarantine. The authoritative official-binary correctness lane separately
-applies the complete migration chain through 17 and exercises the successor
+applies the complete migration chain through 18 and exercises the successor
 repository plus the successor workstation CLI's offline binding, readiness,
 inserted, accepted, exact-replay, and stale matrix under two bounded membership
 windows. It does not replace the separate Docker RBAC matrix or prove image,
@@ -514,7 +528,7 @@ cross-database/PUBLIC audit before the policy and exclusive member window.
 
 Versions 1 through 11 execute without a wrapping SQL transaction. Versions 12
 through 14 execute transactionally only through the reviewed application
-migrator and its dedicated CockroachDB session. Versions 15 through 17 return
+migrator and its dedicated CockroachDB session. Versions 15 through 18 return
 to nontransactional, resumable online schema changes. Never synthesize, update,
 or delete a SQLx history row merely to bypass a gate. Recovery depends on the
 exact failed version:
@@ -550,6 +564,11 @@ exact failed version:
   exact `indexdef`. If the exact backfill committed without a history row, the
   normal migrator retry preserves it and records success. A missing index is
   rebuilt; a same-name wrong-shape index fails closed.
+- v18 creates six tables, one unique index, one view, two nullable columns, and
+  two named CHECK constraints, every one of them with `IF NOT EXISTS`. Any
+  prefix of that file may already be committed after an interruption; the
+  reviewed recovery is the normal migrator retry, which is a no-op for every
+  object that already exists. It rewrites no existing row and drops nothing.
 
 1. Leave the application service at zero.
 2. Preserve the migration task logs and exact CockroachDB error.
@@ -567,7 +586,10 @@ exact failed version:
    foreign keys, and matching SQLx row. For v15, inspect both the retired
    `memory_conflicts_tenant_id_project_claim_key_key` index and the new
    `memory_conflicts_scope_key_detector_unique_idx`. For v16 and v17, compare
-   the complete covering index definition and job state.
+   the complete covering index definition and job state. For v18, compare the
+   six new tables, `memory_evidence_events_predecessor_unique_idx`, the
+   `memory_writer_authority_v1` view and its owner, and both
+   `accepted_event_id` columns with their named CHECK constraints.
 5. If this is a brand-new empty demo database, the safest recovery is to create
    another empty database and run the complete migrator once against that
    replacement. Deleting the partial database is a separate destructive
@@ -601,15 +623,16 @@ exact failed version:
     conflict data to force a state through the gate. Any wrong-shape object or
     unrecognized combination requires a separately reviewed forward repair on
     a copy.
-11. For v16 or v17, wait for the online job to finish. If the exact index exists
-    without its success row, rerun the normal migrator so `IF NOT EXISTS` and
-    the catalog assertion record it. If the index is absent and no job remains,
-    the same rerun rebuilds it. Stop on `55000`, job failure, or same-name
-    drift; do not replace a durable index merely to make history pass.
+11. For v16, v17, or v18, wait for the online job to finish. If the exact
+    object exists without its success row, rerun the normal migrator so
+    `IF NOT EXISTS` and the catalog assertion record it. If the object is
+    absent and no job remains, the same rerun rebuilds it. Stop on `55000`, job
+    failure, or same-name drift; do not replace a durable index, table, or view
+    merely to make history pass.
 12. Reconcile SQLx bookkeeping only through these reviewed paths after the
     schema and completed jobs match the target. For the current release, keep
     serving and ceremony credentials disabled until the database has exactly
-    the seventeen successful rows 1 through 17 and the object/grant audit
+    the eighteen successful rows 1 through 18 and the object/grant audit
     passes. Serving remains compatible with a later additive uninterrupted
     prefix. The intentionally narrower private floors remain control 3,
     genesis 9, successor 14, and reconciliation 16; none substitutes for the

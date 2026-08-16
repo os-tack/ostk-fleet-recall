@@ -37,15 +37,16 @@ inspect/apply/replay for control and genesis activation; offline artifact
 binding, pre-genesis and failed-prefix rejection, then
 `Ready`/`Inserted`/`Accepted`/`ExactReplay`/`Stale` for successor activation;
 and materialize/exact replay for apply-only conflict reconciliation. It
-requires exactly 17 successful SQLx rows with versions 1 through 17, the three
+requires exactly 18 successful SQLx rows with versions 1 through 18, the three
 successor authority tables, the two genesis-root indexes, and the exact indexes
 introduced by migrations 15, 16, and 17. The retired pre-v15 conflict
 uniqueness index must be absent. The proof replays the resumable
 index-transition bytes, exercises online recovery, and shows that failed
-migration 12 is not masked by successful migration 17.
+migration 12 is not masked by successful migration 18.
 Migrations 15 through 17 add or replace indexes rather than successor tables,
-so the exact successor table set remains the three tables introduced by
-migrations 12 through 14.
+and migration 18 adds only evidence-plane, content, projection, and
+writer-authority objects, so the exact successor table set remains the three
+tables introduced by migrations 12 through 14.
 
 The successor CLI portion first cross-wires the approval set's top-level
 statement ID and every approval statement ID to prove exact artifact binding
@@ -169,7 +170,7 @@ statically revoke every privilege on the three new authority tables from
 CockroachDB v26.2 cannot conditionally execute privilege DDL inside PL/pgSQL,
 while the two base role policies must remain applicable at their original v3/v9
 deployment stages. These Docker policy-compatibility proofs do not claim the
-current exact prefix through 17.
+current exact prefix through 18.
 
 The successor-activation RBAC proof is a separate secondary Docker result for
 the admin-only `fleet_registry_successor_activation` policy. It uses
@@ -183,13 +184,13 @@ the absence of `DELETE` or sequence functions. The policy independently pins
 `search_path` to `pg_catalog, public, pg_temp` and qualifies every grant target.
 
 The policy rejects prefix 13 and a failed migration 14 even when successful
-rows 15 through the current release 17 are present. It admits a complete
+rows 15 through 17 are present. It admits a complete
 successful bounded prefix 1 through 14 while ignoring later rows, and requires
 the runtime, control-bootstrap, and genesis registry-activation roles to exist
 with options exactly `{NOLOGIN}` before target creation. Wrong-database and two
 same-session temporary-shadow adversaries prove that neither migration history
 nor grant targets can be redirected through `search_path`. The proof reapplies
-the policy at current prefix 17 and after option, system, object, grant-option,
+the policy at prefix 17 and after option, system, object, grant-option,
 PUBLIC, default-privilege, and named bidirectional-role drift, then applies it
 again to freeze idempotence.
 
@@ -407,7 +408,7 @@ four-mutable-database cleanup sets and their temporary-membership-to-empty-audit
 lifecycle are frozen there as well.
 
 The connected parity phase requires exact build tag `v26.2.3`, rejects the
-wrong database, incomplete or failed prefix 17, a missing/non-quiesced
+wrong database, incomplete or failed prefix 18, a missing/non-quiesced
 principal, and unsafe PUBLIC state before target creation. Pre-create PUBLIC
 function, type, system, default, and cluster-global external-connection grants
 leave the target absent. The proof injects the full v26.2 logical-role option

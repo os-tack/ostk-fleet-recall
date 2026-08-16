@@ -48,9 +48,9 @@ hackathon slice. Additional canonical Recall actions are also future work.
 ## Evidence status
 
 Source and deployment evidence are intentionally reported separately. The
-current checkout embeds migrations 1 through 17. Current release completion
-requires exactly the seventeen successful rows 1 through 17. Serving requires
-an uninterrupted successful prefix of at least 17 and remains compatible with
+current checkout embeds migrations 1 through 18. Current release completion
+requires exactly the eighteen successful rows 1 through 18. Serving requires
+an uninterrupted successful prefix of at least 18 and remains compatible with
 later additive migrations; a later successful row cannot hide a missing or
 failed prerequisite. The private compatibility gates deliberately remain
 narrower: Stage-2 control requires prefix 1 through 3, genesis Stage-3 requires
@@ -360,14 +360,16 @@ start the public demo yet:
 "$FLEET_RECALL_BIN" health
 ```
 
-The current embedded migrator applies versions 1 through 17 in three phases.
+The current embedded migrator applies versions 1 through 18 in three phases.
 Versions 1 through 11 execute without a wrapping SQL transaction because of
 CockroachDB schema-changer and schema-lock constraints; v10 and v11 are
 resumable only because they verify an exact committed index before SQLx records
 success. Versions 12 through 14 run transactionally on a dedicated migration
-session with `autocommit_before_ddl = false`. Versions 15 through 17 return to
-the resumable online-DDL policy, version conflict identity by detector, and add
-the exact reconciliation/current-projection indexes. Never run multiple
+session with `autocommit_before_ddl = false`. Versions 15 through 18 return to
+the resumable online-DDL policy, version conflict identity by detector, add
+the exact reconciliation/current-projection indexes, and add the Stage-4
+evidence ledger, governed content store, relation projection, and read-only
+writer-authority view. Never run multiple
 migrators concurrently or run the migration files manually as a substitute for
 that policy. See
 [migration and recovery rules](docs/MIGRATIONS.md) before recovering a failed
@@ -648,6 +650,7 @@ these local results is AWS deployment evidence.
 - [CockroachDB Agent Skills audit](docs/AGENT_SKILLS_AUDIT.md) and
   [requirements/evidence matrix](docs/REQUIREMENTS.md).
 - [Product/backend boundary ADR](docs/adr/0001-product-and-backend-boundary.md),
+  [Stage-4 runtime foundations ADR](docs/adr/0002-stage4-runtime-foundations.md),
   [delivery plan](docs/DELIVERY.md), and
   [hackathon submission packet](docs/SUBMISSION.md).
 

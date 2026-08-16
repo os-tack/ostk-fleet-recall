@@ -1676,11 +1676,11 @@ FLEET_RECONCILIATION_TEST_DATABASE_URL="$root_url" \
 
 # Freeze the authoritative schema independently of the two Stage-2/Stage-3
 # command preflights. The database must have exactly the successful embedded
-# migration chain through 17 and all three successor authority tables.
-assert_root_scalar "exact successful migration prefix 1 through 17" '
-    SELECT CASE WHEN count(*) = 17
+# migration chain through 18 and all three successor authority tables.
+assert_root_scalar "exact successful migration prefix 1 through 18" '
+    SELECT CASE WHEN count(*) = 18
                           AND min(version) = 1
-                          AND max(version) = 17
+                          AND max(version) = 18
                           AND COALESCE(bool_and(success), false)
                      THEN '\''ready'\'' ELSE '\''not_ready'\'' END
     FROM _sqlx_migrations' 'ready'
@@ -1715,42 +1715,43 @@ assert_root_scalar "retired conflict uniqueness index is absent" '
       AND tablename = '\''memory_conflicts'\''
       AND indexname = '\''memory_conflicts_tenant_id_project_claim_key_key'\''' '0'
 
-# Migrations 10, 11, and 15 through 17 are intentionally resumable online
-# index transitions. Replaying their exact bytes must accept the existing exact
-# indexes without changing SQLx history or silently accepting catalog drift.
+# Migrations 10, 11, and 15 through 18 are intentionally resumable online
+# schema transitions. Replaying their exact bytes must accept the existing exact
+# objects without changing SQLx history or silently accepting catalog drift.
 for migration_path in \
     "$repo_root/migrations/0010_registry_genesis_head_root_index.sql" \
     "$repo_root/migrations/0011_registry_genesis_activation_root_index.sql" \
     "$repo_root/migrations/0015_conflict_detector_uniqueness.sql" \
     "$repo_root/migrations/0016_claim_transition_provenance_index.sql" \
-    "$repo_root/migrations/0017_conflict_detector_projection_index.sql"
+    "$repo_root/migrations/0017_conflict_detector_projection_index.sql" \
+    "$repo_root/migrations/0018_stage4_evidence_ledger.sql"
 do
     "$crdb" sql --url="$root_url" < "$migration_path" >/dev/null
 done
 assert_root_scalar "migration history after exact index replay" \
-    'SELECT count(*)::STRING FROM _sqlx_migrations' '17'
+    'SELECT count(*)::STRING FROM _sqlx_migrations' '18'
 
-# Demonstrate why MAX(successful version) is not a readiness check: version 17
+# Demonstrate why MAX(successful version) is not a readiness check: version 18
 # remains successful while a failed version 12 makes the complete-prefix gate
 # false. Restore the row before exercising the v3/v9-compatible private CLIs.
 "$crdb" sql --url="$root_url" \
     --execute='UPDATE _sqlx_migrations SET success = false WHERE version = 12' >/dev/null
 assert_root_scalar "later success remains visible during failed migration 12" \
-    'SELECT max(version)::STRING FROM _sqlx_migrations WHERE success' '17'
-assert_root_scalar "failed migration 12 is not masked by version 17" '
-    SELECT CASE WHEN count(*) = 17
+    'SELECT max(version)::STRING FROM _sqlx_migrations WHERE success' '18'
+assert_root_scalar "failed migration 12 is not masked by version 18" '
+    SELECT CASE WHEN count(*) = 18
                           AND min(version) = 1
-                          AND max(version) = 17
+                          AND max(version) = 18
                           AND COALESCE(bool_and(success), false)
                      THEN '\''ready'\'' ELSE '\''not_ready'\'' END
     FROM _sqlx_migrations' 'not_ready'
 "$crdb" sql --url="$root_url" \
     --execute='UPDATE _sqlx_migrations SET success = true WHERE version = 12' >/dev/null
-assert_root_scalar "restored successful migration prefix 1 through 17" '
-    SELECT CASE WHEN count(*) = 17 AND COALESCE(bool_and(success), false)
+assert_root_scalar "restored successful migration prefix 1 through 18" '
+    SELECT CASE WHEN count(*) = 18 AND COALESCE(bool_and(success), false)
                      THEN '\''ready'\'' ELSE '\''not_ready'\'' END
     FROM _sqlx_migrations
-    WHERE version BETWEEN 1 AND 17' 'ready'
+    WHERE version BETWEEN 1 AND 18' 'ready'
 
 "$crdb" sql --url="$root_url" \
     < "$repo_root/deploy/cockroach/control-role-grants.sql" >/dev/null
@@ -2839,7 +2840,7 @@ successor_after_not_ready=$(successor_table_fingerprints)
 assert_exact "NotReady successor inspect seven-table fingerprints" \
     "$successor_after_not_ready" "$successor_before_not_ready"
 
-# A failed migration 14 cannot be masked by successful rows 15 through 17. The
+# A failed migration 14 cannot be masked by successful rows 15 through 18. The
 # database/schema preflight must happen before any write to all seven tables in
 # the successor repository's direct SQL surface.
 successor_before_failed_prefix=$(successor_table_fingerprints)
@@ -3609,7 +3610,7 @@ assert_exact "successor preserved legacy table fingerprints" \
     "$legacy_registry_after_successor" "$legacy_registry_before_successor"
 
 # The member's query plan must retain the repository's bounded primary-key span
-# over exactly migration versions 1 through 14 even though 15 through 17 exist.
+# over exactly migration versions 1 through 14 even though 15 through 18 exist.
 successor_prefix_explain=$("$crdb" sql --url="$successor_url" \
     --format=tsv --execute="
     EXPLAIN SELECT pg_catalog.current_database() = 'fleet_recall'

@@ -32,10 +32,11 @@ revision-6 evidence; Cloud `EXPLAIN` is separately captured historical plan
 evidence. None was rerun for revision 10.
 
 The current checkout is newer than that recorded release. Its embedded
-migrator contains versions 1 through 17, including private control-ledger,
-genesis-activation, successor, and conflict-detector schema. The exact current
-release chain is the complete successful prefix 1 through 17; serving
-compatibility requires a complete successful prefix of at least 17. The private
+migrator contains versions 1 through 18, including private control-ledger,
+genesis-activation, successor, conflict-detector, and Stage-4 evidence-ledger
+schema. The exact current release chain is the complete successful prefix 1
+through 18; serving compatibility requires a complete successful prefix of at
+least 18. The private
 compatibility gates remain narrower and distinct: Stage-2 control through 3,
 genesis Stage 3 through 9, the successor repository through 14, and conflict
 reconciliation through 16. The live schema-2 status and 552-row seed above
@@ -228,19 +229,20 @@ race the initial schema migration.
 
 ## 4. Run exactly one migration task
 
-The current source migrator applies versions 1 through 17. Versions 1 through
-11 and 15 through 17 execute outside a wrapping SQL transaction because of
+The current source migrator applies versions 1 through 18. Versions 1 through
+11 and 15 through 18 execute outside a wrapping SQL transaction because of
 CockroachDB schema-changer and schema-lock constraints. Versions 10, 11, and
 15 through 17 are resumable online index transitions that fail closed unless
-the committed public catalog has the exact expected definition. Versions 12
+the committed public catalog has the exact expected definition. Version 18 is
+resumable for the same reason: every object it creates uses `IF NOT EXISTS`. Versions 12
 through 14 run with SQLx bookkeeping in one transaction on a dedicated session
 with `autocommit_before_ddl = false`; that session is closed rather than
 returned to the runtime pool.
 
 Keep the service at zero and do not run two migrators concurrently or replay
 migration SQL manually. Afterward, verify the complete successful prefix 1
-through 17 separately. That is the exact current release chain; serving
-compatibility has a minimum complete-prefix floor of 17. Stage-2 control still
+through 18 separately. That is the exact current release chain; serving
+compatibility has a minimum complete-prefix floor of 18. Stage-2 control still
 accepts the prefix through 3, genesis Stage 3 through 9, the successor
 repository through 14, and conflict reconciliation through 16. None of those
 private compatibility floors is the serving floor or the exact current-release

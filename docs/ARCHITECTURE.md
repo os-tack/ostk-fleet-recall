@@ -169,10 +169,15 @@ IAM, Fargate, or AWS deployment.
 | Idempotent mutation receipts | `memory_mutation_receipts` | At most one committed mutation per tenant-wide key and identical canonical request |
 | Fleet events | `memory_events` | Durable audit and future projection/CDC seam |
 | Reserved attention (future) | `memory_attention` | Schema seam only; not read or written by the current vertical slice |
+| General accepted-event ledger | `memory_evidence_events`, `memory_evidence_shard_heads` | Append-only general events under the control ledger's single log epoch; carries no governance kind |
+| Ingress quarantine | `memory_evidence_quarantine` | Bounded integrity receipt for a rejected delivery: digest and diagnostic only, never payload bytes |
+| Governed content store | `memory_content_objects` | Envelope-encrypted governed bytes addressed by storage identity and indexed for erasure |
+| Relation projection | `memory_relation_projection_v1`, `memory_relation_projection_watermarks_v1` | Disposable current relation state with a per-`(ledger_family, shard)` cursor advanced in the same transaction |
+| Writer authority witness | `memory_writer_authority_v1` (view) | Read-only bootstrap/epoch/registry-head projection; the writer's only authority read path |
 
-Current release completion requires exactly the seventeen successful migration
-rows 1 through 17. Serving accepts an uninterrupted successful prefix of at
-least 17, including later additive migrations. The private repositories retain
+Current release completion requires exactly the eighteen successful migration
+rows 1 through 18. Serving accepts an uninterrupted successful prefix of at
+least 18, including later additive migrations. The private repositories retain
 their narrower, independently enforced compatibility floors:
 
 - Stage-2 control bootstrap requires successful prefix 1–3 and has a private
@@ -185,13 +190,21 @@ their narrower, independently enforced compatibility floors:
 - Legacy conflict reconciliation requires prefix 1–16 and has an apply-only
   workstation CLI plus database-local one-shot role policy. Its cross-database
   authority audit remains external.
-- Recall, remember, ingest, health, and the public demo require prefix 1–17 as
+- Recall, remember, ingest, health, and the public demo require prefix 1–18 as
   the normal runtime/serving release surface.
 
 Later additive rows cannot compensate for a missing or failed row inside a
 required prefix. Migrations 15 through 17 do not add successor tables: they
 version conflict uniqueness by detector and add the exact claim-transition and
-current-conflict projection indexes.
+current-conflict projection indexes. Migration 18 adds the Stage-4 runtime
+foundations of [ADR 0002](adr/0002-stage4-runtime-foundations.md): the general
+accepted-event ledger `memory_evidence_events` and its `memory_evidence_shard_heads`
+under the control ledger's single log epoch, `memory_evidence_quarantine`,
+`memory_content_objects`, the relation projection and its per-`(ledger_family,
+shard)` watermark, the nullable `accepted_event_id` columns on `memory_claims`
+and `memory_mutation_receipts`, and the read-only `memory_writer_authority_v1`
+head-witness view. It grants the runtime role nothing on any `memory_control_*`
+or `memory_registry_*` base table.
 
 The current conflict detector is the immutable contract
 `same_key_functional_value_v2`. A conflict-eligible legacy claim key is the
