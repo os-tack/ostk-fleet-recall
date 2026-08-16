@@ -108,6 +108,8 @@ jobs:
             script: deploy/cockroach/tests/control-role-grants.sh
           - name: registry RBAC
             script: deploy/cockroach/tests/registry-activation-role-grants.sh
+          - name: successor activation RBAC
+            script: deploy/cockroach/tests/successor-activation-role-grants.sh
           - name: conflict reconciliation RBAC
             script: deploy/cockroach/tests/conflict-reconciliation-role-grants.sh
           - name: control bootstrap CLI

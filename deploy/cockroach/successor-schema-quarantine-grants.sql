@@ -31,8 +31,8 @@ $$;
 
 -- In CockroachDB, REVOKE ALL removes both the privilege and its grant option;
 -- the engine does not implement PostgreSQL's trailing CASCADE syntax. The
--- successor repository will receive a separate, reviewed role policy; this
--- quarantine never grants access.
+-- successor repository receives its separate, reviewed boundary from
+-- successor-activation-role-grants.sql; this quarantine never grants access.
 REVOKE ALL ON TABLE
     memory_registry_transitions,
     memory_registry_genesis_bridge_consumptions,

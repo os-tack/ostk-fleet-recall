@@ -52,12 +52,13 @@ through 16.
 Do not count the live successor-repository row as a successor-CLI result. The
 three private CLIs in this authoritative wrapper are control bootstrap, genesis
 activation, and conflict reconciliation. The source-present
-`ostk-registry-successor-activate` command is workstation-only and has no
-checked-in successor write-grant role policy or deployment route. Conflict
-reconciliation and its logical role are likewise one-shot workstation
-surfaces. None of the four private CLIs has an AWS, Terraform, task, production
-image, runtime, startup, or server-route surface; the production image excludes
-all four.
+`ostk-registry-successor-activate` command is workstation-only. Its checked-in
+`fleet_registry_successor_activation` role policy is a short-lived, exclusive
+credential boundary, not a deployment route or an additional official-CLI
+result. Conflict reconciliation and its logical role are likewise one-shot
+workstation surfaces. None of the four private CLIs has an AWS, Terraform,
+task, production image, runtime, startup, or server-route surface; the
+production image excludes all four.
 
 Run the authoritative proof with an already checksum-verified binary:
 
@@ -78,6 +79,7 @@ counted as Docker evidence.
 | Official-binary correctness | One checksum-pinned, build-tag-pinned TLS `v26.2.3` server running the complete matrix and the control, genesis-activation, and conflict-reconciliation CLIs | The single authoritative connected result |
 | Control RBAC parity | `control-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Activation RBAC parity | `registry-activation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
+| Successor-activation RBAC parity | `successor-activation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Conflict-reconciliation RBAC parity | `conflict-reconciliation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Control bootstrap CLI parity | `control-bootstrap-cli.sh` in its own Docker container | Secondary packaging/CLI result only |
 
@@ -101,6 +103,60 @@ CockroachDB v26.2 cannot conditionally execute privilege DDL inside PL/pgSQL,
 while the two base role policies must remain applicable at their original v3/v9
 deployment stages. These Docker policy-compatibility proofs do not claim the
 current exact prefix through 17.
+
+The successor-activation RBAC proof is a separate secondary Docker result for
+the admin-only `fleet_registry_successor_activation` policy. It uses
+privilege-shaped stand-ins for the ten reachable authority tables; repository
+correctness remains in the authoritative official-binary Rust row. Static
+extraction freezes the production successor and shared-witness SQL at exact
+two-part `public.*` qualification, the schema check's leading
+`pg_catalog.current_database() = 'fleet_recall'`, the direct
+`SELECT`/`INSERT`/`UPDATE` targets, the two shared read-only control tables, and
+the absence of `DELETE` or sequence functions. The policy independently pins
+`search_path` to `pg_catalog, public, pg_temp` and qualifies every grant target.
+
+The policy rejects prefix 13 and a failed migration 14 even when successful
+rows 15 through the current release 17 are present. It admits a complete
+successful bounded prefix 1 through 14 while ignoring later rows, and requires
+the runtime, control-bootstrap, and genesis registry-activation roles to exist
+with options exactly `{NOLOGIN}` before target creation. Wrong-database and two
+same-session temporary-shadow adversaries prove that neither migration history
+nor grant targets can be redirected through `search_path`. The proof reapplies
+the policy at current prefix 17 and after option, system, object, grant-option,
+PUBLIC, default-privilege, and named bidirectional-role drift, then applies it
+again to freeze idempotence.
+
+The exact successor grant matrix is 16 non-grantable table rows: SQLx history
+`SELECT`; read-only control bootstrap and epoch rows; control events
+`SELECT`/`INSERT`; control heads `SELECT`/`UPDATE`; read-only genesis activation
+and head rows; successor transitions and genesis-bridge consumptions
+`SELECT`/`INSERT`; and current v2 heads `SELECT`/`INSERT`/`UPDATE`. The role has
+only database `CONNECT`, public-schema `USAGE`, and zero sequence, `DELETE`,
+DDL, system, grant-option, ownership, or unrelated-object authority. The policy
+also reasserts that PUBLIC and all three prior application roles have no grant
+on the three successor authority tables. CockroachDB v26.2 requires table-level
+`UPDATE` for the control-head `FOR UPDATE` lock; the proof contrasts a
+SELECT-only principal with the successor member for that lock. Current-head
+`UPDATE` is a direct repository write. Table-wide raw `INSERT` and `UPDATE`
+remain residual credential capabilities,
+so the login must be exclusive to the reviewed repository, enabled only for
+the one-shot transaction, then have membership removed and `NOLOGIN` restored.
+
+The successor policy carries the same v26.2 fail-closed default, PUBLIC system,
+virtual-schema, external-connection, current-database ownership, and
+cross-database external-audit model as conflict reconciliation. Its optional
+`fleet_conflict_reconciliation` coexistence path does not require or create
+that role. If the role exists, its non-target creator-scoped PUBLIC routine
+default is an explicit cluster-admin cleanup prerequisite, just like every
+other non-target routine default. CockroachDB v26.2 cannot conditionally run the
+missing-role-sensitive, grantee-targeted default audit across every grantor, so
+the policy does not admit that row by name. The proof creates and retains the
+real row, verifies the default gate preserves unrelated target drift, cleans it
+explicitly, and only then reapplies. Any membership edge between reconciliation
+and successor likewise fails before mutation for explicit cleanup because v26.2
+cannot conditionally revoke an optional role name without creating it. This is
+a fail-closed coexistence boundary, not a claim that the two independently
+ordered policies compose without their documented operator preflight.
 
 The conflict-reconciliation RBAC proof uses privilege-shaped minimal stand-ins
 for the six direct repository tables, the read-only `memory_claim_links`
