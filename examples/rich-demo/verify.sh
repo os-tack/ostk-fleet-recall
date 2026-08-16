@@ -177,8 +177,8 @@ line_count=$(wc -l < "$input" | tr -d '[:space:]')
 case $line_count in
     ''|*[!0-9]*) fail "line count is not numeric" ;;
 esac
-if [ "$line_count" -ne 3389 ]; then
-    fail "record count must be exactly 3389 (found $line_count)"
+if [ "$line_count" -ne 3981 ]; then
+    fail "record count must be exactly 3981 (found $line_count)"
 fi
 
 if awk 'length($0) > 16384 { exit 1 }' "$input"; then
@@ -366,11 +366,11 @@ if ! jq -s -e \
         | map(split("|")[0])
         | sort) as $expected_repository_sources
     | ($expected_doc_sources | length) == 32
-    and ($expected_repository_sources | length) == 224
+    and ($expected_repository_sources | length) == 233
     and
-    ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 725
+    ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 791
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 2458
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 2984
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:docs:v1") | .source_id] | unique | sort)
         == $expected_doc_sources
@@ -387,7 +387,43 @@ if ! jq -s -e \
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "src/bin/ostk-registry-successor-activate.rs"
-        )] | length) == 37
+        )] | length) == 62
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/bin/ostk-conflict-reconcile.rs"
+        )] | length) == 26
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/ledger/reconciliation.rs"
+        )] | length) == 135
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "deploy/cockroach/conflict-reconciliation-role-grants.sql"
+        )] | length) == 27
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "deploy/cockroach/successor-activation-role-grants.sql"
+        )] | length) == 23
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "deploy/cockroach/tests/conflict-reconciliation-role-grants.sh"
+        )] | length) == 95
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "deploy/cockroach/tests/successor-activation-role-grants.sh"
+        )] | length) == 77
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "migrations/0015_conflict_detector_uniqueness.sql"
+        )] | length) == 5
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "migrations/0016_claim_transition_provenance_index.sql"
+        )] | length) == 3
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "migrations/0017_conflict_detector_projection_index.sql"
+        )] | length) == 3
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "src/private_postgres.rs"
@@ -696,6 +732,12 @@ sensitive_projection() {
                 + "cluster.example:26257/fleet_recall?sslmode=verify-full"
             )
             | join("postgresql://public-test-fixture");
+        def scrub_public_reconciliation_postgres_fixture:
+            split(
+                "postgresql://" + "reconciler:explicit-secret@"
+                + "cluster.example:26257/fleet_recall?sslmode=verify-full"
+            )
+            | join("postgresql://public-test-fixture");
 
         if .source_config_id == "rich-demo:repository:v1"
             and .source_id == "src/private_postgres.rs"
@@ -703,6 +745,9 @@ sensitive_projection() {
         elif .source_config_id == "rich-demo:repository:v1"
             and .source_id == "src/bin/ostk-registry-successor-activate.rs"
         then .text |= scrub_public_successor_postgres_fixture
+        elif .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/bin/ostk-conflict-reconcile.rs"
+        then .text |= scrub_public_reconciliation_postgres_fixture
         else .
         end
     ' "$input"

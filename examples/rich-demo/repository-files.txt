@@ -135,11 +135,15 @@ deploy/aws/run-self-audit-proof.sh|aws_operations|shell
 deploy/aws/variables.tf|aws_infrastructure|terraform
 deploy/aws/verify-publication-receipts.sh|aws_operations|shell
 deploy/aws/versions.tf|aws_infrastructure|terraform
+deploy/cockroach/conflict-reconciliation-role-grants.sql|database_security|sql
 deploy/cockroach/control-role-grants.sql|database_security|sql
 deploy/cockroach/registry-activation-role-grants.sql|database_security|sql
+deploy/cockroach/successor-activation-role-grants.sql|database_security|sql
 deploy/cockroach/successor-schema-quarantine-grants.sql|database_security|sql
+deploy/cockroach/tests/conflict-reconciliation-role-grants.sh|database_security|shell
 deploy/cockroach/tests/control-role-grants.sh|database_security|shell
 deploy/cockroach/tests/registry-activation-role-grants.sh|database_security|shell
+deploy/cockroach/tests/successor-activation-role-grants.sh|database_security|shell
 deploy/container-entrypoint.sh|container_runtime|shell
 deploy/localstack/app-entrypoint.sh|local_development|shell
 deploy/localstack/aws-config|local_development|aws_config
@@ -168,7 +172,11 @@ migrations/0011_registry_genesis_activation_root_index.sql|database_schema|sql
 migrations/0012_registry_transition_history.sql|database_schema|sql
 migrations/0013_registry_genesis_bridge_consumption.sql|database_schema|sql
 migrations/0014_registry_current_head_v2.sql|database_schema|sql
+migrations/0015_conflict_detector_uniqueness.sql|database_schema|sql
+migrations/0016_claim_transition_provenance_index.sql|database_schema|sql
+migrations/0017_conflict_detector_projection_index.sql|database_schema|sql
 src/application.rs|application_code|rust
+src/bin/ostk-conflict-reconcile.rs|conflict_reconciliation|rust
 src/bin/ostk-control-bootstrap.rs|control_bootstrap|rust
 src/bin/ostk-registry-activate.rs|registry_activation|rust
 src/bin/ostk-registry-successor-activate.rs|successor_activation|rust
@@ -182,6 +190,7 @@ src/error.rs|application_code|rust
 src/ledger/cockroach.rs|claim_ledger|rust
 src/ledger/conflict.rs|claim_ledger|rust
 src/ledger/mod.rs|claim_ledger|rust
+src/ledger/reconciliation.rs|claim_ledger|rust
 src/ledger/repository.rs|claim_ledger|rust
 src/ledger/types.rs|claim_ledger|rust
 src/lib.rs|application_code|rust

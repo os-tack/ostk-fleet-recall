@@ -128,17 +128,35 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 3389
-    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 725
+    length == 3981
+    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 791
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 2458
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 2984
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "src/bin/ostk-control-bootstrap.rs")] | length) == 11
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "src/bin/ostk-registry-activate.rs")] | length) == 22
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "src/bin/ostk-registry-successor-activate.rs")] | length) == 37
+        and .source_id == "src/bin/ostk-registry-successor-activate.rs")] | length) == 62
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "src/bin/ostk-conflict-reconcile.rs")] | length) == 26
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "src/ledger/reconciliation.rs")] | length) == 135
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "deploy/cockroach/conflict-reconciliation-role-grants.sql")] | length) == 27
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "deploy/cockroach/successor-activation-role-grants.sql")] | length) == 23
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "deploy/cockroach/tests/conflict-reconciliation-role-grants.sh")] | length) == 95
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "deploy/cockroach/tests/successor-activation-role-grants.sh")] | length) == 77
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "migrations/0015_conflict_detector_uniqueness.sql")] | length) == 5
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "migrations/0016_claim_transition_provenance_index.sql")] | length) == 3
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "migrations/0017_conflict_detector_projection_index.sql")] | length) == 3
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "src/private_postgres.rs")] | length) == 10
     and ([.[] | select(.source_id == "src/config.rs")] | length) == 0
