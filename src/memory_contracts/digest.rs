@@ -128,6 +128,9 @@ pub enum DigestDomain {
     ConsolidationReceiptV1,
     /// W0-REG. Consolidation policy preimage for the consolidation lane.
     ConsolidationPolicyV1,
+    /// REG (integrator, 2026-08-16). Exact authored summary-text bytes committed to by a
+    /// consolidation receipt; enrichment never enters statement identity.
+    ConsolidationSummaryEnrichmentV1,
     // --- W0-SUCC domains ---
 
     // --- W0-COVER domains ---
@@ -203,6 +206,7 @@ impl DigestDomain {
             Self::ConsolidationStatementV1 => "ostk-consolidation-statement-v1",
             Self::ConsolidationReceiptV1 => "ostk-consolidation-receipt-v1",
             Self::ConsolidationPolicyV1 => "ostk-consolidation-policy-v1",
+            Self::ConsolidationSummaryEnrichmentV1 => "ostk-consolidation-summary-enrichment-v1",
             // --- W0-SUCC prefixes ---
 
             // --- W0-COVER prefixes ---
