@@ -6,10 +6,11 @@ frozen SHA-256
 `3eca6d7bc6fefa3ba0847e89733fc69f61226c80b8fab0af6578e1be672f27d3`,
 and requires `cockroach version --build-tag` to equal `v26.2.3` exactly.
 `registry-activation-cli.sh` repeats that build-tag check, starts one secure
-local server, runs `control_log_live`, `registry_activation_live`, and
-`successor_activation_live`, then exercises the inspect/apply/replay state
-machines of both private CLIs. The successor target is discovered by its exact
-test name before the environment-bound invocation, so a zero-test or inert run
+local server, runs `control_log_live`, `registry_activation_live`,
+`successor_activation_live`, and the exact functional-polarity conflict matrix,
+then exercises the inspect/apply/replay state machines of both currently wired private
+CLIs. The successor and conflict targets are discovered by their exact test
+names before the environment-bound invocations, so a zero-test or inert run
 cannot count as connected proof.
 The same isolated process also runs the DB-backed transactional-DDL rollback
 library test, requires the exact successful migration prefix 1 through 14,

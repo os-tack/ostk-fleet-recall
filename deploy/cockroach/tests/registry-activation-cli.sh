@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # This is the authoritative connected correctness proof. It uses the exact
-# official CockroachDB binary, runs all three live repository suites, and exercises
-# both private CLI state machines on one secure local server.
+# official CockroachDB binary, runs all three live repository suites plus the
+# conflict-contract matrix, and exercises both currently wired private CLI
+# state machines on one secure local server.
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../../.." && pwd)
 expected_crdb_build_tag=v26.2.3
@@ -152,6 +153,12 @@ grep -Fxq "$successor_live_test: test" <<<"$successor_live_listing" \
 FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
     cargo test --locked --test successor_activation_live \
         "$successor_live_test" -- --exact --nocapture
+conflict_live_test=ledger::cockroach::tests::live_conflict_polarity_matrix_when_configured
+conflict_live_listing=$(cargo test --locked --lib -- --list)
+grep -Fxq "$conflict_live_test: test" <<<"$conflict_live_listing" \
+    || fail "conflict polarity live proof test was not discovered"
+FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+    cargo test --locked --lib "$conflict_live_test" -- --exact --nocapture
 FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
     cargo test --locked --lib \
         store::cockroach::tests::live_transactional_migration_rolls_back_ddl_on_history_conflict_when_configured \
