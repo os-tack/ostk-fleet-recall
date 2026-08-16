@@ -161,3 +161,48 @@ meaning. Consolidation requires no new claim states: it composes existing
 - Recall-time `synthesize`, when implemented, remains ephemeral and labeled and
   never persists to the ledger; stored memory changes only through
   `remember(consolidate)`.
+
+## Addendum 2026-08-16: waiver-model disposition
+
+Fable accepted the conflict-tolerance model as requirement input for W0-EPIS
+(`.fleet-recall/coordination/handoffs/2026-08-16-fable-re-waiver-model-to-w0-epis.md`).
+The discrepancy model in `docs/DYNAMIC_MEMORY_ARCHITECTURE.md` (§Discrepancy
+model, §Discrepancy families and episodes, DISC-01..05, AUTH-03) is
+authoritative; the §"Conflict tolerance is durable policy" section above is a
+requirement reference for W0-EPIS, not a competing design. Where the two
+differ, the architecture doc's invariant registry wins and W0-EPIS records
+the difference in its README.
+
+The reconciled semantics:
+
+- Lifecycle states are the doc's set: `open`, `acknowledged`, `resolved`,
+  `waived`, `dismissed`, `superseded`. Verification states: `candidate`,
+  `verified`, `refuted`, `indeterminate`.
+- The waiver record shape follows §"Conflict tolerance is durable policy":
+  attributed actor, structured reason kind, rationale, applicability scope,
+  and an expiry or review-by time — a signed lifecycle event under the active
+  policy (DISC-05) that never rewrites evidence, severity, member claims, or
+  the underlying expectation.
+- The six verification vectors from
+  `.fleet-recall/coordination/handoffs/2026-08-16-kimi-waiver-model-to-w0-epis.md`
+  are in W0-EPIS's brief verbatim under
+  `contracts/dynamic-memory/v3/discrepancy/`: waive → expiry → same episode
+  reopens (identity preserved); the waiver never splits or erases the
+  incompatible interval; dismiss without justification rejected;
+  self-implicated dismiss rejected; separation-of-duty violation on a
+  normative-conflict waiver rejected; a waived conflict still surfaces with
+  context and an expired waiver reactivates surfacing; repeated-waiver drift
+  nomination emitted as candidate-only.
+
+Amendments to this ADR:
+
+- §"Schema evolution" is deferred: `memory_conflicts` stays byte-stable and
+  its evolution is not scheduled in Waves 0–3. The waiver columns described
+  there land whenever Fable and the SCHEMA owner schedule them.
+- The consolidation contract implements only the read side of tolerance:
+  `ConsolidationSourceConflictStateV1` mirrors `open`/`waived` from the live
+  conflict projection at the repository seam, and CONS-04 makes both states
+  non-launderable — a run over conflicted sources either fails closed or
+  derives a disputed output referencing exactly the involved conflicts.
+  Waiver writes remain W0-EPIS lifecycle events; consolidation never creates,
+  modifies, or expires a waiver.
