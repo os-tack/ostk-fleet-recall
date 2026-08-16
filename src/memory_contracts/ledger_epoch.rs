@@ -35,8 +35,11 @@
 //! also do not overlap, so decoding one artifact's bytes as the other type
 //! fails closed at the schema boundary, not merely by convention.
 //!
-//! Wave-0 stub owned by W0-LOG; the owning workstream replaces this file.
-//! No runtime authority is implied by an empty module.
+//! Owned by W0-LOG. No runtime authority is implied by these types alone:
+//! callers must invoke the paired validation methods documented on each type
+//! (in particular [`ReplayHorizonV1::validate_semantic_anchor`] and
+//! [`ProjectionGenerationV1::validate_supersession`]) before treating a
+//! decoded record as admitted.
 
 use serde::{Deserialize, Serialize};
 
@@ -114,6 +117,32 @@ impl ClosedHeadVectorV1 {
             ));
         }
         Ok(())
+    }
+
+    /// Normalize shard heads observed in arbitrary arrival order into the
+    /// canonical sorted-by-shard vector.
+    ///
+    /// Two producers who fence the same shards in a different order must
+    /// still emit byte-identical `ClosedHeadVectorV1`s so their digests
+    /// agree (REPLAY-01): this is the constructor that guarantees it, rather
+    /// than delegating "sort before you build one" to every caller by
+    /// convention. Duplicate shards — which can never legitimately arise
+    /// from one fence — are rejected rather than silently deduplicated.
+    pub fn from_heads(
+        epoch_id: EpochId,
+        mut heads: Vec<ClosedShardHeadV1>,
+    ) -> ContractResult<Self> {
+        heads.sort_by_key(|head| head.shard);
+        if heads.windows(2).any(|pair| pair[0].shard == pair[1].shard) {
+            return Err(ContractError::NonCanonicalSet { field: "heads" });
+        }
+        let vector = Self {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            epoch_id,
+            heads,
+        };
+        vector.validate()?;
+        Ok(vector)
     }
 }
 
@@ -258,13 +287,24 @@ impl EpochFenceV1 {
         self.successor_epoch.epoch_id()
     }
 
-    /// The pure fencing rule: an append still coordinate-bound to the
-    /// predecessor epoch after this fence has committed can never succeed
-    /// there — every shard head in that epoch is already closed.
+    /// The pure fencing rule: an allow-list, not a deny-list. Every shard
+    /// head in the predecessor epoch is closed by this fence, so the only
+    /// coordinate an append may legally target afterward is a shard within
+    /// this exact successor epoch. Any other epoch id — the fenced
+    /// predecessor, an earlier ancestor from a prior cutover, or an unknown
+    /// or fabricated epoch id an attacker supplies — is rejected, as is a
+    /// shard number the successor epoch's own partition recipe never
+    /// assigned.
     pub fn reject_append_after_fence(&self, position: &AppendPositionV1) -> ContractResult<()> {
-        if position.epoch_id == self.predecessor_epoch_id() {
+        let successor_epoch_id = self.successor_epoch_id()?;
+        if position.epoch_id != successor_epoch_id {
             return Err(ContractError::Schema(
-                "append targets a shard fenced by a newer log epoch".into(),
+                "append does not target the fence's successor epoch".into(),
+            ));
+        }
+        if position.shard >= self.successor_epoch.partition_recipe.shard_count {
+            return Err(ContractError::Schema(
+                "append targets a shard outside the successor epoch's partition recipe".into(),
             ));
         }
         Ok(())
@@ -369,6 +409,39 @@ impl EvidenceCompactionCheckpointCoreV1 {
             DigestDomain::EvidenceCompactionCheckpointV1,
             &encode_canonical(self)?,
         ))
+    }
+
+    /// Fold a tail of shard heads observed *after* this checkpoint onto its
+    /// closed shard positions, producing the closed head vector a semantic
+    /// replay starting from this checkpoint (checkpoint + tail) would reach.
+    ///
+    /// Every tail entry must not regress a shard the checkpoint already
+    /// closed (its offset must be `>=` the checkpoint's), and may introduce
+    /// a shard the checkpoint had not yet closed. The result is built with
+    /// [`ClosedHeadVectorV1::from_heads`], so it is sorted and
+    /// deduplicated-by-shard the same way a from-genesis replay's vector
+    /// would be — proving "checkpoint + tail replay reproduces the same
+    /// closed vector" a full replay reaching the same final shard state
+    /// would produce (REPLAY-01).
+    pub fn replay_tail(&self, tail: &[ClosedShardHeadV1]) -> ContractResult<ClosedHeadVectorV1> {
+        self.validate()?;
+        let mut by_shard: std::collections::BTreeMap<u16, ClosedShardHeadV1> = self
+            .closed_shard_positions
+            .heads
+            .iter()
+            .map(|head| (head.shard, *head))
+            .collect();
+        for advance in tail {
+            if let Some(existing) = by_shard.get(&advance.shard)
+                && advance.last_committed_offset.as_u64() < existing.last_committed_offset.as_u64()
+            {
+                return Err(ContractError::Schema(
+                    "replay tail regresses a shard the checkpoint already closed".into(),
+                ));
+            }
+            by_shard.insert(advance.shard, *advance);
+        }
+        ClosedHeadVectorV1::from_heads(self.epoch_id, by_shard.into_values().collect())
     }
 }
 
@@ -528,6 +601,37 @@ impl CursorVectorBarrierV1 {
             &encode_canonical(self)?,
         ))
     }
+
+    /// Normalize per-shard cursor observations collected in arbitrary
+    /// arrival order into the canonical sorted-by-shard barrier.
+    ///
+    /// This is the API a cross-shard join projector actually has: shard
+    /// cursors close independently and arrive at the projector in whatever
+    /// order their underlying shard processes happen to finish in. Two
+    /// projectors that observed the same closed shards under a different
+    /// arrival order must still emit byte-identical barriers so their
+    /// digests — and every `ProjectionGenerationV1` built from them — agree
+    /// (REPLAY-01, REPLAY-02). Duplicate shards are rejected rather than
+    /// silently deduplicated.
+    pub fn from_observations(
+        epoch_id: EpochId,
+        mut cursors: Vec<ShardCursorEntryV1>,
+    ) -> ContractResult<Self> {
+        cursors.sort_by_key(|entry| entry.shard);
+        if cursors
+            .windows(2)
+            .any(|pair| pair[0].shard == pair[1].shard)
+        {
+            return Err(ContractError::NonCanonicalSet { field: "cursors" });
+        }
+        let barrier = Self {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            epoch_id,
+            cursors,
+        };
+        barrier.validate()?;
+        Ok(barrier)
+    }
 }
 
 /// A performance cache valid only for one exact projector and registry
@@ -557,6 +661,16 @@ impl ProjectorCheckpointV1 {
         }
         self.cursor_vector.validate()?;
         self.verification_receipt.validate()?;
+        // Bind the receipt to this checkpoint's exact durable output, the
+        // same way EvidenceCompactionCheckpointV1 binds its receipt to
+        // core_digest — otherwise the receipt certifies nothing about this
+        // checkpoint in particular (REPLAY-02: a cursor advances atomically
+        // with that stage's complete durable output).
+        if self.verification_receipt.verified_subject_digest != self.output_digest {
+            return Err(ContractError::Schema(
+                "projector checkpoint receipt does not match its output digest".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -572,10 +686,14 @@ impl ProjectorCheckpointV1 {
 
 /// One generation published for one closed cursor-vector barrier.
 ///
-/// Barrier identity alone determines generation identity, so the same
-/// closed facts always publish under the same generation regardless of
-/// shard schedule or arrival order. Late evidence publishes a strictly
-/// later generation that names the one it `supersedes`; the earlier
+/// A first generation's barrier alone determines its identity within one
+/// initial publication — the same closed facts always start from the same
+/// generation regardless of shard schedule or arrival order — but
+/// `generation_id()` hashes the whole record, so an *accepted* superseding
+/// generation is additionally constrained by [`Self::validate_supersession`]:
+/// its barrier must strictly advance the one it `supersedes`, never merely
+/// restate it under a different `output_digest`. Late evidence publishes a
+/// strictly later generation over a strictly advanced barrier; the earlier
 /// generation's record and output are never deleted (REPLAY-01, REPLAY-02).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -614,6 +732,74 @@ impl ProjectionGenerationV1 {
             DigestDomain::ProjectionGenerationV1,
             &encode_canonical(self)?,
         ))
+    }
+
+    /// The cross-record half of "one generation per closed barrier": a
+    /// superseding generation must name its exact predecessor and its
+    /// barrier must strictly dominate that predecessor's — same epoch, the
+    /// same shard set, every cursor at or past the predecessor's offset, and
+    /// at least one strictly past it.
+    ///
+    /// `validate()` alone cannot enforce this: `generation_id()` hashes the
+    /// whole struct, including `output_digest`, so barrier identity alone
+    /// does not determine generation identity, and a caller could otherwise
+    /// publish two different `output_digest` values over the identical
+    /// closed barrier (rewriting "what happened" instead of recomputing it
+    /// after strictly more evidence closed). This method is the required
+    /// second check a runtime performs before admitting a superseding
+    /// generation; a same-or-earlier barrier is rejected regardless of what
+    /// `output_digest` it carries.
+    pub fn validate_supersession(&self, predecessor: &Self) -> ContractResult<()> {
+        self.validate()?;
+        predecessor.validate()?;
+        let predecessor_id = predecessor.generation_id()?;
+        if self.supersedes != Some(predecessor_id) {
+            return Err(ContractError::Schema(
+                "superseding generation does not name its exact predecessor".into(),
+            ));
+        }
+        if self.barrier.epoch_id != predecessor.barrier.epoch_id {
+            return Err(ContractError::Schema(
+                "superseding generation's barrier belongs to a different epoch".into(),
+            ));
+        }
+        if self.barrier.cursors.len() != predecessor.barrier.cursors.len() {
+            return Err(ContractError::Schema(
+                "superseding generation's barrier does not cover the same shard set".into(),
+            ));
+        }
+        let mut strictly_advanced = false;
+        for (next, previous) in self
+            .barrier
+            .cursors
+            .iter()
+            .zip(predecessor.barrier.cursors.iter())
+        {
+            if next.shard != previous.shard {
+                return Err(ContractError::Schema(
+                    "superseding generation's barrier does not cover the same shard set".into(),
+                ));
+            }
+            let next_offset = next.last_processed_offset.as_u64();
+            let previous_offset = previous.last_processed_offset.as_u64();
+            if next_offset < previous_offset {
+                return Err(ContractError::Schema(
+                    "superseding generation's barrier regresses a shard cursor".into(),
+                ));
+            }
+            if next_offset > previous_offset {
+                strictly_advanced = true;
+            }
+        }
+        if !strictly_advanced {
+            return Err(ContractError::Schema(
+                "superseding generation must strictly advance the barrier it supersedes; \
+                 late evidence means an advanced cursor vector, not a rewritten output over \
+                 the same closed vector"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -766,6 +952,24 @@ pub enum ReplayFrom {
 /// The historical bound may be strictly later than the semantic one
 /// (private raw payloads and archive tiers can retire before semantic
 /// identity does). Neither field may be omitted or defaulted.
+///
+/// A decoded `ReplayHorizonV1` is schema-shaped bytes, not an admitted
+/// claim: `semantic_replay_from` is a bare digest on the wire, and this
+/// crate is a pure leaf with no ambient authority to look up whether that
+/// digest actually names a real, independently verified evidence-compaction
+/// checkpoint. The private `validate_shape` helper therefore checks only
+/// well-formedness and is deliberately not `pub`. The only public entry
+/// point that decides
+/// whether a horizon may be trusted is [`Self::validate_semantic_anchor`],
+/// which requires a [`VerifiedReplayAnchorV1`] whenever
+/// `semantic_replay_from` names a checkpoint — and a `VerifiedReplayAnchorV1`
+/// is obtainable only from [`VerifiedReplayAnchorV1::from_checkpoint`], which
+/// only compiles against an `&EvidenceCompactionCheckpointV1`. A
+/// `ProjectorCheckpointV1`'s digest can be written into the wire bytes by an
+/// attacker, but it can never satisfy `validate_semantic_anchor`: the
+/// independently-derived anchor digest it is compared against cannot equal a
+/// digest produced under a different digest domain except by a SHA-256
+/// preimage collision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplayHorizonV1 {
@@ -775,11 +979,47 @@ pub struct ReplayHorizonV1 {
 }
 
 impl ReplayHorizonV1 {
-    pub fn validate(&self) -> ContractResult<()> {
+    /// Schema well-formedness only. Not sufficient on its own to trust a
+    /// decoded horizon — see [`Self::validate_semantic_anchor`].
+    fn validate_shape(&self) -> ContractResult<()> {
         if self.schema_version != LEDGER_EPOCH_SCHEMA_VERSION {
             return Err(ContractError::Schema("invalid replay horizon".into()));
         }
         Ok(())
+    }
+
+    /// The only admission check a runtime should treat as "this horizon may
+    /// be trusted." A `Genesis` semantic bound needs no anchor. A
+    /// `Checkpoint` semantic bound requires `anchor` to be present and its
+    /// independently-derived [`VerifiedReplayAnchorV1::checkpoint_digest`] to
+    /// equal the digest carried on the wire; anything else — including a
+    /// missing anchor, or an anchor derived from a different checkpoint —
+    /// fails closed.
+    pub fn validate_semantic_anchor(
+        &self,
+        anchor: Option<&VerifiedReplayAnchorV1>,
+    ) -> ContractResult<()> {
+        self.validate_shape()?;
+        match self.semantic_replay_from {
+            ReplayFrom::Genesis => Ok(()),
+            ReplayFrom::Checkpoint { checkpoint_digest } => {
+                let anchor = anchor.ok_or_else(|| {
+                    ContractError::Schema(
+                        "checkpoint-anchored semantic replay requires an independently \
+                         verified replay anchor"
+                            .into(),
+                    )
+                })?;
+                if anchor.checkpoint_digest() != checkpoint_digest {
+                    return Err(ContractError::Schema(
+                        "semantic replay checkpoint digest is not backed by the supplied \
+                         verified replay anchor"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Bound `semantic_replay_from` to one independently replay-verified
@@ -787,6 +1027,8 @@ impl ReplayHorizonV1 {
     /// `Checkpoint` semantic bound, and it requires a
     /// [`VerifiedReplayAnchorV1`] — obtainable only from an
     /// [`EvidenceCompactionCheckpointV1`] whose receipt already checked out.
+    /// A horizon built this way always passes
+    /// `validate_semantic_anchor(Some(anchor))` against that same anchor.
     pub const fn anchored(
         anchor: &VerifiedReplayAnchorV1,
         historical_content_available_from: ReplayFrom,
@@ -834,6 +1076,11 @@ mod tests {
     const CURSOR_VECTOR_BARRIER: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/ledger-epoch/cursor-vector-barrier.jsonl"
     );
+    const PROJECTION_GENERATION: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/ledger-epoch/projection-generation.jsonl"
+    );
+    const VECTOR_SUITE: &[u8] =
+        include_bytes!("../../contracts/dynamic-memory/v3/ledger-epoch/vector-suite.jsonl");
     const NEGATIVE_UNSORTED_HEAD_VECTOR: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/ledger-epoch/negative-unsorted-head-vector.jsonl"
     );
@@ -844,6 +1091,12 @@ mod tests {
         include_bytes!("../../contracts/dynamic-memory/v3/ledger-epoch/negative-seed-shape.jsonl");
     const SUCCESSOR_LOG_EPOCH_ID: &str =
         "1f8c197c5854fed8980db82d88f82f568ba7005da4ed6096a935b6d02e8429c2";
+    const PROJECTOR_CHECKPOINT_DIGEST: &str =
+        "8a44db6d8037225760678ea51a8f55db2fd6be63c0202cead1f2405e39fd333d";
+    const CURSOR_BARRIER_DIGEST: &str =
+        "231b09eb8bb020d4e7fa5fb6d17bac004e67d2d3a7ca912b805f71ec408252c4";
+    const PROJECTION_GENERATION_ID: &str =
+        "e23a748ac566af7f031c8e9dc9757a11c6df49b716f5b120365e39f84f48bf33";
 
     fn record(artifact: &'static [u8]) -> &'static [u8] {
         let body = artifact
@@ -1075,6 +1328,73 @@ mod tests {
     }
 
     #[test]
+    fn epoch_fence_is_an_allow_list_not_a_deny_list() {
+        let epoch = successor_epoch();
+        let successor_id = epoch.epoch_id().unwrap();
+        let fence = EpochFenceV1 {
+            schema_version: 1,
+            successor_epoch: epoch.clone(),
+        };
+        fence.validate().unwrap();
+
+        // Attack B: an unknown/fabricated epoch id is not the fenced
+        // predecessor, so a deny-list of exactly the predecessor would admit
+        // it. The allow-list rejects anything that is not the successor.
+        let fabricated = AppendPositionV1 {
+            epoch_id: EpochId::from_digest(digest(
+                "abababababababababababababababababababababababababababababababab",
+            )),
+            shard: 0,
+            committed_offset: CommittedOffsetV1::new(7).unwrap(),
+        };
+        assert!(fence.reject_append_after_fence(&fabricated).is_err());
+
+        // A grand-predecessor epoch (two cutovers back) is neither the
+        // fenced predecessor nor the successor, and must also be rejected —
+        // the "concurrent old-epoch append that loses the fence" case
+        // applies to every earlier generation, not only the immediate one.
+        let grand_predecessor = AppendPositionV1 {
+            epoch_id: EpochId::from_digest(digest(
+                "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            )),
+            shard: 0,
+            committed_offset: CommittedOffsetV1::new(3).unwrap(),
+        };
+        assert!(fence.reject_append_after_fence(&grand_predecessor).is_err());
+
+        // The fenced predecessor itself is still rejected.
+        let at_predecessor = AppendPositionV1 {
+            epoch_id: fence.predecessor_epoch_id(),
+            shard: 0,
+            committed_offset: CommittedOffsetV1::new(9).unwrap(),
+        };
+        assert!(fence.reject_append_after_fence(&at_predecessor).is_err());
+
+        // A shard the successor epoch's own partition recipe never assigned
+        // (shard_count is 32 here) is rejected even though the epoch id
+        // matches.
+        let shard_out_of_range = AppendPositionV1 {
+            epoch_id: successor_id,
+            shard: epoch.partition_recipe.shard_count,
+            committed_offset: CommittedOffsetV1::new(1).unwrap(),
+        };
+        assert!(
+            fence
+                .reject_append_after_fence(&shard_out_of_range)
+                .is_err()
+        );
+
+        // Only a position naming exactly the successor epoch and a shard
+        // within its recipe is admitted.
+        let admitted = AppendPositionV1 {
+            epoch_id: successor_id,
+            shard: epoch.partition_recipe.shard_count - 1,
+            committed_offset: CommittedOffsetV1::new(1).unwrap(),
+        };
+        assert!(fence.reject_append_after_fence(&admitted).is_ok());
+    }
+
+    #[test]
     fn evidence_compaction_and_projector_checkpoints_are_not_interchangeable() {
         let golden = record(EVIDENCE_COMPACTION_CHECKPOINT);
         require_canonical(golden).unwrap();
@@ -1091,7 +1411,7 @@ mod tests {
                 checkpoint_digest: anchor.checkpoint_digest(),
             },
         );
-        horizon.validate().unwrap();
+        horizon.validate_semantic_anchor(Some(&anchor)).unwrap();
         assert_eq!(
             horizon.semantic_replay_from,
             ReplayFrom::Checkpoint {
@@ -1108,6 +1428,48 @@ mod tests {
         projector.validate().unwrap();
         assert!(decode_strict::<EvidenceCompactionCheckpointV1>(projector_golden).is_err());
         assert!(decode_strict::<ProjectorCheckpointV1>(golden).is_err());
+    }
+
+    #[test]
+    fn projector_checkpoint_digest_can_never_satisfy_a_semantic_replay_anchor() {
+        // Attack: take a real ProjectorCheckpointV1's checkpoint_digest() and
+        // present it as a ReplayHorizonV1's semantic_replay_from, then round
+        // trip through the exact wire path a runtime uses (encode -> decode
+        // -> validate). The bare digest decodes fine — it is schema-valid
+        // bytes — but the type-level guarantee lives in
+        // validate_semantic_anchor, not in decode_strict/validate_shape.
+        let projector: ProjectorCheckpointV1 = decode_strict(record(PROJECTOR_CHECKPOINT)).unwrap();
+        let forged_digest = projector.checkpoint_digest().unwrap();
+
+        let forged_horizon = ReplayHorizonV1 {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            semantic_replay_from: ReplayFrom::Checkpoint {
+                checkpoint_digest: forged_digest,
+            },
+            historical_content_available_from: ReplayFrom::Genesis,
+        };
+        let wire_bytes = encode_canonical(&forged_horizon).unwrap();
+        let redecoded: ReplayHorizonV1 = decode_strict(&wire_bytes).unwrap();
+        assert_eq!(redecoded, forged_horizon);
+
+        // No anchor at all: rejected, not silently accepted as genesis.
+        assert!(redecoded.validate_semantic_anchor(None).is_err());
+
+        // A real anchor, but for a *different* (evidence-compaction)
+        // checkpoint: the digests disagree, so this is rejected too. This is
+        // the only anchor obtainable from this crate's public API — there is
+        // no way to construct a VerifiedReplayAnchorV1 whose
+        // checkpoint_digest() equals a ProjectorCheckpointV1's, short of a
+        // SHA-256 preimage collision across the two digest domains.
+        let checkpoint: EvidenceCompactionCheckpointV1 =
+            decode_strict(record(EVIDENCE_COMPACTION_CHECKPOINT)).unwrap();
+        let real_anchor = VerifiedReplayAnchorV1::from_checkpoint(&checkpoint).unwrap();
+        assert_ne!(real_anchor.checkpoint_digest(), forged_digest);
+        assert!(
+            redecoded
+                .validate_semantic_anchor(Some(&real_anchor))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1129,34 +1491,41 @@ mod tests {
         barrier.validate().unwrap();
         let first_digest = barrier.barrier_digest().unwrap();
 
-        // Simulate reversed shard arrival: build the same closed facts with
-        // entries swapped before validation re-sorts nothing (validate only
-        // *checks* sortedness — it is the producer's job to sort). Two
-        // producers who observed the same shards in a different arrival
-        // order must still emit the same sorted vector to agree on a
-        // digest; this exercises that the digest depends only on the
-        // sorted content, not on any hidden construction order.
-        let mut reversed = barrier.clone();
-        reversed.cursors.reverse();
-        reversed.cursors.sort_by_key(|entry| entry.shard);
-        assert_eq!(reversed.barrier_digest().unwrap(), first_digest);
+        // Genuinely reversed arrival: feed the same per-shard observations
+        // to the normalizing constructor in the opposite order the golden
+        // fixture lists them in. Unlike reversing an already-sorted vector
+        // and resorting it (which is the identity function on sorted input),
+        // this exercises a real different construction order through the
+        // one API a projector actually has for turning arrival-order
+        // observations into a canonical barrier.
+        let mut scrambled_order: Vec<ShardCursorEntryV1> = barrier.cursors.clone();
+        scrambled_order.reverse();
+        assert_ne!(
+            scrambled_order.first().unwrap().shard,
+            barrier.cursors.first().unwrap().shard,
+            "the golden fixture must have more than one shard for this to be a real reversal"
+        );
+        let from_scrambled =
+            CursorVectorBarrierV1::from_observations(barrier.epoch_id, scrambled_order).unwrap();
+        assert_eq!(from_scrambled, barrier);
+        assert_eq!(from_scrambled.barrier_digest().unwrap(), first_digest);
 
-        let generation = ProjectionGenerationV1 {
-            schema_version: 1,
-            projector_id: ContractId::new("projector.join.fixture").unwrap(),
-            projector_version: 1,
-            barrier,
-            generation_sequence: 0,
-            output_digest: digest(
-                "6666666666666666666666666666666666666666666666666666666666666666",
-            ),
-            supersedes: None,
-        };
+        // Duplicate shards can never legitimately arise from one fence.
+        let mut duplicated = barrier.cursors.clone();
+        duplicated.push(duplicated[0]);
+        assert_eq!(
+            CursorVectorBarrierV1::from_observations(barrier.epoch_id, duplicated),
+            Err(ContractError::NonCanonicalSet { field: "cursors" })
+        );
+
+        let generation: ProjectionGenerationV1 =
+            decode_strict(record(PROJECTION_GENERATION)).unwrap();
         generation.validate().unwrap();
+        assert_eq!(generation.barrier, barrier);
         let first_generation_id = generation.generation_id().unwrap();
 
         let same_facts_reversed = ProjectionGenerationV1 {
-            barrier: reversed,
+            barrier: from_scrambled,
             ..generation.clone()
         };
         assert_eq!(
@@ -1164,17 +1533,165 @@ mod tests {
             first_generation_id
         );
 
+        // Attack J reproduction, now as a passing rejection: a "later"
+        // generation over the identical closed barrier — different output,
+        // same facts — must be rejected. Late evidence means an advanced
+        // cursor vector, never a rewritten output over the same closed one.
+        let mut same_barrier_rewrite = generation.clone();
+        same_barrier_rewrite.generation_sequence = 1;
+        same_barrier_rewrite.supersedes = Some(first_generation_id);
+        same_barrier_rewrite.output_digest =
+            digest("7777777777777777777777777777777777777777777777777777777777777777");
+        same_barrier_rewrite.validate().unwrap();
+        assert!(
+            same_barrier_rewrite
+                .validate_supersession(&generation)
+                .is_err()
+        );
+
+        // A genuinely advanced barrier — one shard strictly past its
+        // predecessor's offset, the other unchanged, same shard set and
+        // epoch — is accepted, and the earlier generation's own record and
+        // id remain valid and unaffected.
+        let mut advanced_cursors = barrier.cursors.clone();
+        advanced_cursors[0].last_processed_offset =
+            CommittedOffsetV1::new(advanced_cursors[0].last_processed_offset.as_u64() + 1).unwrap();
+        let advanced_barrier =
+            CursorVectorBarrierV1::from_observations(barrier.epoch_id, advanced_cursors).unwrap();
         let mut later = generation.clone();
         later.generation_sequence = 1;
         later.supersedes = Some(first_generation_id);
+        later.barrier = advanced_barrier;
         later.output_digest =
             digest("7777777777777777777777777777777777777777777777777777777777777777");
         later.validate().unwrap();
+        later.validate_supersession(&generation).unwrap();
         assert_ne!(later.generation_id().unwrap(), first_generation_id);
+        // The earlier generation is preserved, not superseded away: its own
+        // digest and validation are unaffected by the later record existing.
+        assert_eq!(generation.generation_id().unwrap(), first_generation_id);
+        generation.validate().unwrap();
+
+        // A barrier that regresses any shard is rejected outright.
+        let mut regressed_cursors = barrier.cursors.clone();
+        regressed_cursors[0].last_processed_offset = CommittedOffsetV1::new(1).unwrap();
+        let regressed_barrier =
+            CursorVectorBarrierV1::from_observations(barrier.epoch_id, regressed_cursors).unwrap();
+        let mut regressed = generation.clone();
+        regressed.generation_sequence = 1;
+        regressed.supersedes = Some(first_generation_id);
+        regressed.barrier = regressed_barrier;
+        regressed.output_digest =
+            digest("7777777777777777777777777777777777777777777777777777777777777777");
+        regressed.validate().unwrap();
+        assert!(regressed.validate_supersession(&generation).is_err());
 
         let mut inconsistent = generation;
         inconsistent.generation_sequence = 1;
         assert!(inconsistent.validate().is_err());
+    }
+
+    #[test]
+    fn projection_generation_matches_golden_bytes_and_id() {
+        let golden = record(PROJECTION_GENERATION);
+        require_canonical(golden).unwrap();
+        let generation: ProjectionGenerationV1 = decode_strict(golden).unwrap();
+        generation.validate().unwrap();
+        assert_eq!(encode_canonical(&generation).unwrap(), golden);
+        assert_eq!(
+            generation.generation_id().unwrap(),
+            digest(PROJECTION_GENERATION_ID)
+        );
+    }
+
+    #[test]
+    fn closed_head_vector_from_heads_normalizes_and_rejects_duplicates() {
+        let closed = closed_predecessor_head();
+        let mut scrambled = closed.heads.clone();
+        scrambled.reverse();
+        let from_scrambled = ClosedHeadVectorV1::from_heads(closed.epoch_id, scrambled).unwrap();
+        assert_eq!(from_scrambled, closed);
+
+        let mut duplicated = closed.heads.clone();
+        duplicated.push(duplicated[0]);
+        assert_eq!(
+            ClosedHeadVectorV1::from_heads(closed.epoch_id, duplicated),
+            Err(ContractError::NonCanonicalSet { field: "heads" })
+        );
+    }
+
+    #[test]
+    fn checkpoint_plus_tail_replay_reproduces_the_same_closed_vector() {
+        let checkpoint: EvidenceCompactionCheckpointV1 =
+            decode_strict(record(EVIDENCE_COMPACTION_CHECKPOINT)).unwrap();
+        let epoch_id = checkpoint.core.epoch_id;
+
+        // Tail: shard 0 advances past the checkpoint (11 -> 15), shard 5 is
+        // untouched, and a shard the checkpoint had not yet closed (7)
+        // closes for the first time in the tail.
+        let tail = vec![
+            ClosedShardHeadV1 {
+                shard: 0,
+                last_committed_offset: CommittedOffsetV1::new(15).unwrap(),
+                chain_digest: digest(
+                    "3333333333333333333333333333333333333333333333333333333333333333",
+                ),
+            },
+            ClosedShardHeadV1 {
+                shard: 7,
+                last_committed_offset: CommittedOffsetV1::new(3).unwrap(),
+                chain_digest: digest(
+                    "4444444444444444444444444444444444444444444444444444444444444444",
+                ),
+            },
+        ];
+        let replayed = checkpoint.core.replay_tail(&tail).unwrap();
+
+        // A from-genesis full replay reaching the identical final shard
+        // state builds the same vector directly.
+        let full_replay = ClosedHeadVectorV1::from_heads(
+            epoch_id,
+            vec![
+                ClosedShardHeadV1 {
+                    shard: 0,
+                    last_committed_offset: CommittedOffsetV1::new(15).unwrap(),
+                    chain_digest: digest(
+                        "3333333333333333333333333333333333333333333333333333333333333333",
+                    ),
+                },
+                ClosedShardHeadV1 {
+                    shard: 5,
+                    last_committed_offset: CommittedOffsetV1::new(2).unwrap(),
+                    chain_digest: digest(
+                        "2222222222222222222222222222222222222222222222222222222222222222",
+                    ),
+                },
+                ClosedShardHeadV1 {
+                    shard: 7,
+                    last_committed_offset: CommittedOffsetV1::new(3).unwrap(),
+                    chain_digest: digest(
+                        "4444444444444444444444444444444444444444444444444444444444444444",
+                    ),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(replayed, full_replay);
+        assert_eq!(
+            encode_canonical(&replayed).unwrap(),
+            encode_canonical(&full_replay).unwrap()
+        );
+
+        // A tail that regresses a shard the checkpoint already closed fails
+        // closed rather than silently rewriting history.
+        let regressing_tail = vec![ClosedShardHeadV1 {
+            shard: 0,
+            last_committed_offset: CommittedOffsetV1::new(1).unwrap(),
+            chain_digest: digest(
+                "3333333333333333333333333333333333333333333333333333333333333333",
+            ),
+        }];
+        assert!(checkpoint.core.replay_tail(&regressing_tail).is_err());
     }
 
     #[test]
@@ -1229,7 +1746,8 @@ mod tests {
     #[test]
     fn replay_horizon_states_bounded_replay_explicitly() {
         let genesis_only = ReplayHorizonV1::genesis(ReplayFrom::Genesis);
-        genesis_only.validate().unwrap();
+        // A genesis semantic bound needs no anchor at all.
+        genesis_only.validate_semantic_anchor(None).unwrap();
         assert_eq!(genesis_only.semantic_replay_from, ReplayFrom::Genesis);
         assert_eq!(
             genesis_only.historical_content_available_from,
@@ -1240,13 +1758,155 @@ mod tests {
             decode_strict(record(EVIDENCE_COMPACTION_CHECKPOINT)).unwrap();
         let anchor = VerifiedReplayAnchorV1::from_checkpoint(&checkpoint).unwrap();
         let bounded = ReplayHorizonV1::anchored(&anchor, ReplayFrom::Genesis);
-        bounded.validate().unwrap();
+        // A checkpoint semantic bound is rejected without its anchor...
+        assert!(bounded.validate_semantic_anchor(None).is_err());
+        // ...and accepted with the exact anchor it was built from.
+        bounded.validate_semantic_anchor(Some(&anchor)).unwrap();
         assert_ne!(bounded.semantic_replay_from, ReplayFrom::Genesis);
         assert_eq!(
             bounded.semantic_replay_from,
             ReplayFrom::Checkpoint {
                 checkpoint_digest: anchor.checkpoint_digest()
             }
+        );
+    }
+
+    /// A record decoded from a `.jsonl` fixture, matching the shape
+    /// `vector-suite.jsonl` itself advertises. Keys are sorted for the same
+    /// reason every other fixture's keys are: this is a canonical JSON
+    /// document like any other, and it is round-tripped through
+    /// `encode_canonical`/`decode_strict` below.
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LedgerEpochVectorSuiteV1 {
+        archive_segment_manifest_digest: Sha256Digest,
+        cursor_vector_barrier_digest: Sha256Digest,
+        evidence_compaction_core_digest: Sha256Digest,
+        fixture_authority: String,
+        invariants: Vec<String>,
+        negative_fixtures: Vec<String>,
+        positive_fixtures: Vec<String>,
+        projection_generation_id: Sha256Digest,
+        projector_checkpoint_digest: Sha256Digest,
+        schema_version: u32,
+        successor_log_epoch_id: Sha256Digest,
+        topic: String,
+    }
+
+    #[test]
+    fn every_w0_log_digest_domain_is_pinned_by_a_hard_coded_hex_constant() {
+        // Every one of the six digest domains this workstream reserved
+        // (LogEpochV2, EvidenceCompactionCheckpointV1, ProjectorCheckpointV1,
+        // ArchiveSegmentManifestV1, CursorVectorV1, ProjectionGenerationV1)
+        // is exercised here by recomputing its golden fixture's digest and
+        // comparing it to a hard-coded hex constant. Renaming any one of the
+        // six `DigestDomain::prefix()` strings changes exactly one of these
+        // recomputed digests and fails this test.
+        let epoch: SuccessorLogEpochV1 = decode_strict(record(SUCCESSOR_LOG_EPOCH)).unwrap();
+        assert_eq!(
+            epoch.epoch_id().unwrap().digest(),
+            digest(SUCCESSOR_LOG_EPOCH_ID)
+        );
+
+        let checkpoint: EvidenceCompactionCheckpointV1 =
+            decode_strict(record(EVIDENCE_COMPACTION_CHECKPOINT)).unwrap();
+        assert_eq!(
+            checkpoint.core.core_digest().unwrap(),
+            digest("8db62c9381cc2a2e47855015adfe85baee5ab5a6980d3f7142e2c82499b83eef")
+        );
+
+        let projector: ProjectorCheckpointV1 = decode_strict(record(PROJECTOR_CHECKPOINT)).unwrap();
+        assert_eq!(
+            projector.checkpoint_digest().unwrap(),
+            digest(PROJECTOR_CHECKPOINT_DIGEST)
+        );
+
+        let admission: ArchiveMoveAdmissionV1 =
+            decode_strict(record(ARCHIVE_MOVE_ADMISSION)).unwrap();
+        assert_eq!(
+            admission.manifest.manifest_digest().unwrap(),
+            digest("13269e974c56de1985af23bf0ce1ab8c048ef676d2ef8eac1182838de0d95086")
+        );
+
+        let barrier: CursorVectorBarrierV1 = decode_strict(record(CURSOR_VECTOR_BARRIER)).unwrap();
+        assert_eq!(
+            barrier.barrier_digest().unwrap(),
+            digest(CURSOR_BARRIER_DIGEST)
+        );
+
+        let generation: ProjectionGenerationV1 =
+            decode_strict(record(PROJECTION_GENERATION)).unwrap();
+        generation.validate().unwrap();
+        assert_eq!(
+            generation.barrier.barrier_digest().unwrap(),
+            digest(CURSOR_BARRIER_DIGEST)
+        );
+        assert_eq!(
+            generation.generation_id().unwrap(),
+            digest(PROJECTION_GENERATION_ID)
+        );
+    }
+
+    #[test]
+    fn vector_suite_is_byte_frozen_and_advertises_every_pinned_digest() {
+        let golden = record(VECTOR_SUITE);
+        require_canonical(golden).unwrap();
+
+        let expected = LedgerEpochVectorSuiteV1 {
+            archive_segment_manifest_digest: digest(
+                "13269e974c56de1985af23bf0ce1ab8c048ef676d2ef8eac1182838de0d95086",
+            ),
+            cursor_vector_barrier_digest: digest(CURSOR_BARRIER_DIGEST),
+            evidence_compaction_core_digest: digest(
+                "8db62c9381cc2a2e47855015adfe85baee5ab5a6980d3f7142e2c82499b83eef",
+            ),
+            fixture_authority:
+                "none; structural fixtures are byte-exact contract vectors, not activated state"
+                    .into(),
+            invariants: ["REPLAY-01", "REPLAY-02", "EVENT-03", "EVID-01"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            negative_fixtures: [
+                "negative-unsorted-head-vector.jsonl",
+                "negative-missing-predecessor.jsonl",
+                "negative-seed-shape.jsonl",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            positive_fixtures: [
+                "successor-log-epoch.jsonl",
+                "evidence-compaction-checkpoint.jsonl",
+                "cursor-vector-barrier.jsonl",
+                "projection-generation.jsonl",
+                "projector-checkpoint.jsonl",
+                "archive-move-admission.jsonl",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            projection_generation_id: digest(PROJECTION_GENERATION_ID),
+            projector_checkpoint_digest: digest(PROJECTOR_CHECKPOINT_DIGEST),
+            schema_version: 1,
+            successor_log_epoch_id: digest(SUCCESSOR_LOG_EPOCH_ID),
+            topic: "ledger-epoch".into(),
+        };
+        assert_eq!(encode_canonical(&expected).unwrap(), golden);
+
+        let suite: LedgerEpochVectorSuiteV1 = decode_strict(golden).unwrap();
+        assert_eq!(suite, expected);
+
+        // Every digest the suite advertises is independently re-derived from
+        // its own golden fixture (not merely copied) in
+        // `every_w0_log_digest_domain_is_pinned_by_a_hard_coded_hex_constant`
+        // above; this test additionally proves the suite file itself is
+        // exactly reproducible and every field in it agrees with the
+        // constants that test uses.
+        assert!(
+            suite
+                .positive_fixtures
+                .contains(&"projection-generation.jsonl".to_string())
         );
     }
 }
