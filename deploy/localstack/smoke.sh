@@ -535,7 +535,7 @@ expect_publication_sql_denied() {
     if publication_sql "$statement" >"$denial_output" 2>&1; then
         fail "$label unexpectedly succeeded"
     fi
-    if ! grep -Eiq 'permission denied|does not have.*privilege|insufficient privilege' \
+    if ! grep -Eiq 'SQLSTATE:[[:space:]]*42501|permission denied|does not have.*privilege|insufficient privilege' \
         "$denial_output"; then
         fail "$label did not fail with a privilege denial"
     fi
