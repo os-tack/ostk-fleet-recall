@@ -31,7 +31,13 @@ best-effort `source_fact_id`/`representation_key` digest pair, present only
 when identity could be derived before the delivery was rejected; the
 canonical payload's SHA-256 **digest only**, never its bytes; a closed
 `QuarantineReasonV1`; one bounded `BoundedDiagnosticV1`; and a `received_at`
-timestamp.
+timestamp. `from_trusted_context` is a *construction convention*, not a
+type-level guarantee: `AuthenticatedProjectScopeV1` still derives
+`Deserialize`, so nothing in the type stops a caller from decoding an
+untrusted `scope` object directly — the deny-unknown-fields negative vector
+below proves only that no *second*, payload-declared scope key can be
+smuggled in alongside the one `scope` field, not that `scope`'s own contents
+were authenticated.
 
 There is no dedicated field that can hold the rejected payload's raw bytes
 (only its digest, above), no second or payload-selected scope field, and no
@@ -84,8 +90,9 @@ both identity links derivable too); and `integrity_collision` /
 diagnostic message cites the exact invariant or document section it
 demonstrates.
 
-Two of these presence rules are not just convention: `validate()` enforces
-them and fails closed on a violation (`QuarantineRecordV1::
+These presence rules are not just convention: `validate()` enforces an exact
+per-reason rule for every reason except `redaction_failure`, and fails
+closed on a violation (`QuarantineRecordV1::
 validate_reason_conditioned_identity`).
 
 - `integrity_collision` and `preimage_disagreement` are only defined
@@ -94,13 +101,38 @@ validate_reason_conditioned_identity`).
   representation identity"), so both `source_fact_id` and
   `representation_key` must be `Some` — a record with either missing does
   not decode-then-validate; `validate()` rejects it.
+- `invalid_signature`, `unknown_schema`, and `oversize` fire before any
+  identity could be trusted at all, so both `source_fact_id` and
+  `representation_key` must be `None` — a record with either present is
+  rejected. (These are the three reasons whose fixtures carry no
+  `source_fact_id` link at all; see "Reconciling reasons with no identity
+  link", below, for how their dead-letter rows are resolved.)
+- `unauthorized_scope`, `duplicate_position`, and
+  `unknown_representation_version` fire after a source identity is known but
+  before any representation could be resolved, so `source_fact_id` must be
+  `Some` and `representation_key` must be `None` — a record with
+  `source_fact_id` missing, or with `representation_key` present, is
+  rejected.
 - `redaction_failure` means redaction could not be confirmed complete, so
   `diagnostic.redaction_required` must be `true` on that record; `false`
-  contradicts the reason it is attached to and is rejected.
+  contradicts the reason it is attached to and is rejected. `validate()`
+  places no presence requirement on `source_fact_id`/`representation_key`
+  for this reason — the fixture happens to carry both, but that is fixture
+  convention, not an enforced rule.
 
-Every other reason carries no enforced presence requirement on
-`source_fact_id`/`representation_key` beyond the general "best-effort, `Some`
-only when non-zero" rule `validate()` already applies to both fields.
+### Reconciling reasons with no identity link
+
+`invalid_signature`, `unknown_schema`, and `oversize` reject a delivery
+before any source-fact identity could be trusted, so their dead-letter rows
+carry no `source_fact_id` to link against a future accepted event (see
+"Resolution is additive", below). Those rows are reconciled only
+*operationally*: an operator or connector matches `transport_delivery_id`
+and `connector_instance_id` against the delivering system's own
+redelivery/replay records to decide whether and how to resubmit the
+corrected representation. That match is never treated as a projection
+input and is never used to edit this record — it is an out-of-band
+operational lookup, not a contract-level link the way `source_fact_id` is
+for the other six reasons.
 
 ## Identity
 
@@ -123,7 +155,10 @@ from its own preimage, because there is no field for it to diverge from.
 
 A quarantined delivery is resolved only by a new accepted event under a
 corrected representation, linked back to this record only through
-`source_fact_id` when one was recorded. The seal for this rule lives on
+`source_fact_id` when one was recorded — see "Reconciling reasons with no
+identity link", above, for how the three reasons with no `source_fact_id`
+(`invalid_signature`, `unknown_schema`, `oversize`) are reconciled instead.
+The seal for this rule lives on
 `QuarantinedDeliveryV1`, the *durable* dead-letter form — mirroring
 `remember_v2::AdmittedRememberStatementV2` — which has a private field, no
 production constructor at this contract-only stage, no `&mut self` method,
@@ -138,7 +173,12 @@ fields is `pub`, so it is freely constructible and mutable in-process —
 exercised by this module's own tests before a record is validated and
 wrapped. That is expected and consistent with the rest of the crate: the
 resolution rule is about what can happen to a record *once it is durable*,
-which is exactly the boundary `QuarantinedDeliveryV1` enforces.
+which is exactly the boundary `QuarantinedDeliveryV1` enforces. That seal
+stops *in-place edits* to an already-durable record; it says nothing about,
+and cannot prevent, a holder of a `QuarantineRecordV1`/`QuarantinedDeliveryV1`
+value copying its field values elsewhere — sealing a mutation surface is not
+the same guarantee as controlling exfiltration of the values it already
+holds.
 
 ## The "cannot become an accepted event or projection input" proof
 
@@ -205,7 +245,14 @@ the payload's digest — rendered as hex — appears exactly once, in
 digest-domain prefix, every positive fixture's file name/reason/
 `quarantine_id`, the closed list of negative-case labels, and the leakage
 test's name. Its own raw bytes are pinned from Rust exactly like every other
-fixture in this directory.
+fixture in this directory. Its per-entry `quarantine_id` values are not only
+raw-SHA pinned: `vector_suite_quarantine_ids_match_referenced_fixtures`
+decodes the suite, loads the exact fixture each `positive_cases` entry
+names, and recomputes `quarantine_id()` from that fixture, asserting it
+equals the pinned value — so a suite entry that drifted from the fixture it
+claims to describe (a stale `quarantine_id`, or a `reason` that no longer
+matches the fixture's own `reason`) fails the build, not just a raw-byte
+diff against the suite document's own bytes.
 
 ## Digests are pinned, not regenerated
 
@@ -215,3 +262,15 @@ Every fixture's raw file SHA-256 and every positive fixture's derived
 test run. Changing any canonical record, the digest-domain prefix, or the
 byte/attempt-count bounds is a contract-version change, not a fixture
 regeneration.
+
+Every one of the fifteen fixtures in this directory (nine positive, five
+negative, and `vector-suite.jsonl`) is additionally asserted, from Rust, to
+be exactly its own canonical form: each fixture test strips the one
+repository-framing trailing LF and calls
+`canonical::require_canonical` on what remains, which re-parses the bytes
+and rejects anything whose canonical re-encoding differs from the input —
+catching a reordered key, different spacing, or non-minimal escaping that
+`decode_strict` alone would silently re-canonicalize past (`decode_strict`
+re-derives canonical form internally, so it validates the record's
+*meaning*, not that the fixture *file* was already exactly that canonical
+form).

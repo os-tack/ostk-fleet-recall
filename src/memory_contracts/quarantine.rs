@@ -13,27 +13,57 @@
 //! connector identity, a transport delivery ID and attempt count, an
 //! optional best-effort source-fact/representation link, a payload *digest*
 //! (never bytes), a closed [`QuarantineReasonV1`], one bounded
-//! [`BoundedDiagnosticV1`], and a receipt timestamp. It has no field that
-//! could hold raw payload bytes, no scope field a payload could select
-//! (EVID-04), and no "release to projection" affordance (EVID-05): a JSON
-//! delivery that tries to add any of those keys is rejected by
-//! `#[serde(deny_unknown_fields)]` before it is ever interpreted, and a
-//! delivery that omits a required field never decodes at all.
+//! [`BoundedDiagnosticV1`], and a receipt timestamp. There is no *dedicated*
+//! field that can hold raw payload bytes and no *second* scope field a
+//! payload could select: `#[serde(deny_unknown_fields)]` rejects a JSON
+//! delivery that tries to add either kind of key before it is ever
+//! interpreted, and a delivery that omits a required field never decodes at
+//! all. Neither guarantee is absolute at the type level, and this module
+//! does not claim it is:
+//!
+//! - `scope` is populated only by trusted ingress code calling
+//!   [`AuthenticatedProjectScopeV1::from_trusted_context`] — never parsed
+//!   from the rejected payload — but that is a *construction convention*
+//!   this module expects callers to uphold, not something the type itself
+//!   enforces: `AuthenticatedProjectScopeV1` still derives `Deserialize`
+//!   (this module's own negative vectors feed attacker-authored JSON
+//!   through `decode_strict` straight into it), so nothing in the type
+//!   prevents a caller from decoding an untrusted `scope` object directly.
+//!   The `deny_unknown_fields` negative vectors prove only that no
+//!   *second*, payload-declared scope key can be smuggled in alongside the
+//!   one `scope` field (EVID-04); they do not prove that field's own
+//!   contents were authenticated.
+//! - `diagnostic.message` and `transport_delivery_id` are bounded but
+//!   content-*unconstrained* channels: each is capped in bytes
+//!   ([`MAX_DIAGNOSTIC_MESSAGE_BYTES`], [`MAX_TRANSPORT_DELIVERY_ID_BYTES`])
+//!   but neither type forbids a caller from copying payload text into it.
+//!   Their non-secrecy is a calling convention trusted ingress code must
+//!   uphold — a bounded leak is still a leak (EVID-05) — not a type-level
+//!   guarantee the way the digest-only `canonical_payload_digest` field is.
 //!
 //! Resolution is external and additive: a quarantined delivery is resolved
 //! only by a *new* accepted event under a corrected representation, linked
 //! back to this record only through `source_fact_id` when one was
-//! derivable. That guarantee is enforced on [`QuarantinedDeliveryV1`], the
-//! durable dead-letter form (mirroring
+//! derivable. When `source_fact_id` is `null` (`unknown_schema`, `oversize`,
+//! `invalid_signature` — see [`QuarantineReasonV1`]), no such link exists:
+//! those dead-letter rows are reconciled only *operationally*, by an
+//! operator or connector matching `transport_delivery_id` and
+//! `connector_instance_id` against their own redelivery/replay records —
+//! never treated as a projection input, and never by editing this record.
+//! The resolution-by-new-event guarantee is enforced on
+//! [`QuarantinedDeliveryV1`], the durable dead-letter form (mirroring
 //! `remember_v2::AdmittedRememberStatementV2`): it has a private field, no
 //! production constructor, no `&mut self` method, and no setter of any
 //! kind, so once a rejection is durable it cannot be edited in place.
 //! [`QuarantineRecordV1`] itself is an ordinary *candidate* value type, like
 //! every other pre-admission struct in this crate (e.g.
-//! `remember_v2::RememberIngressCandidateV2`): its fields are `pub` and
-//! freely mutable in-process, which is what lets construction and test code
-//! build and adjust one before validating and wrapping it. The seal is on
-//! the durable wrapper, not on the value type that feeds it.
+//! `remember_v2::RememberIngressCandidateV2`): all twelve of its fields are
+//! `pub` and freely mutable in-process, which is what lets construction and
+//! test code build and adjust one before validating and wrapping it. The
+//! seal is on the durable wrapper's mutation surface, not on the value type
+//! that feeds it — it stops in-place edits to an already-durable record; it
+//! says nothing about, and cannot prevent, a holder of either type copying
+//! field values elsewhere.
 //!
 //! See [`NotProjectable`] for the exact, honestly-scoped shape of the
 //! "cannot become an accepted event or projection input" guarantee.
@@ -177,19 +207,32 @@ impl<'de> Deserialize<'de> for QuarantineRecordId {
 
 /// Bounded dead-letter record for one rejected delivery.
 ///
-/// Every field is either server-derived (`scope`, via
-/// [`AuthenticatedProjectScopeV1::from_trusted_context`], never a payload
-/// claim), transport/connector metadata, a digest, a closed reason, or a
-/// bounded diagnostic. There is no field that can hold raw payload bytes and
-/// no field a rejected delivery's own payload could use to select its own
-/// tenant, project, or disposition. `source_fact_id` and
-/// `representation_key` are best-effort: many rejection reasons (an unknown
-/// schema, an oversized batch, an unverified signature) fire before any
-/// identity could be trusted, so both are `None` in those cases. When
-/// present, they carry the exact digest bytes of the corresponding accepted-
-/// evidence identity so that trusted resolution code can compare them by
-/// value without this module depending on the evidence contracts' concrete
-/// types or versions.
+/// `scope` is populated only by trusted ingress code calling
+/// [`AuthenticatedProjectScopeV1::from_trusted_context`], never parsed from
+/// the rejected payload — but, as the module doc explains, that is a
+/// construction convention, not a type-level guarantee: the type still
+/// derives `Deserialize`. The remaining fields are transport/connector
+/// metadata, an optional best-effort source-fact/representation link, a
+/// payload *digest* (never bytes), a closed reason, and a bounded
+/// diagnostic. There is no *dedicated* field that can hold raw payload
+/// bytes and no *second* field a rejected delivery's own payload could use
+/// to select its own tenant or project — `diagnostic.message` and
+/// `transport_delivery_id` are bounded but content-unconstrained, so their
+/// non-secrecy is a calling convention, not a type property (see the module
+/// doc). `source_fact_id` and `representation_key` are best-effort, and
+/// `validate()` enforces an exact per-reason presence rule for seven of the
+/// nine [`QuarantineReasonV1`] variants: both required for
+/// `integrity_collision`/`preimage_disagreement` (EVENT-01 identity);
+/// both forbidden for `invalid_signature`/`unknown_schema`/`oversize`
+/// (identity was never trustable before rejection); `source_fact_id`
+/// required with `representation_key` forbidden for
+/// `unauthorized_scope`/`duplicate_position`/`unknown_representation_version`
+/// (a source identity was derivable but no representation could be
+/// resolved). `redaction_failure` places no presence requirement on either
+/// field. When present, they carry the exact digest bytes of the
+/// corresponding accepted-evidence identity so that trusted resolution code
+/// can compare them by value without this module depending on the evidence
+/// contracts' concrete types or versions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuarantineRecordV1 {
@@ -233,10 +276,17 @@ impl QuarantineRecordV1 {
     /// Enforce the per-reason presence rule the module and README document:
     /// `integrity_collision` and `preimage_disagreement` are only defined
     /// relative to a source-fact *and* representation identity (EVENT-01),
-    /// so both links must be derivable; `redaction_failure` means redaction
-    /// could not be confirmed, so the diagnostic must say so. This match is
-    /// exhaustive over the closed [`QuarantineReasonV1`] enum — adding a
-    /// tenth reason without extending this match is a compile error, so the
+    /// so both links must be derivable; `invalid_signature`,
+    /// `unknown_schema`, and `oversize` fire before any identity could be
+    /// trusted at all, so both links must be absent; `unauthorized_scope`,
+    /// `duplicate_position`, and `unknown_representation_version` fire after
+    /// a source identity is known but before any representation could be
+    /// resolved, so `source_fact_id` must be present and `representation_key`
+    /// must be absent; `redaction_failure` means redaction could not be
+    /// confirmed, so the diagnostic must say so (it places no presence
+    /// requirement on either identity link). This match is exhaustive over
+    /// the closed [`QuarantineReasonV1`] enum — adding a tenth reason
+    /// without extending this match is a compile error, so the
     /// "exhaustively matched" claim in the module doc comment stays true.
     fn validate_reason_conditioned_identity(&self) -> ContractResult<()> {
         match self.reason {
@@ -247,6 +297,24 @@ impl QuarantineRecordV1 {
                     ));
                 }
             }
+            QuarantineReasonV1::InvalidSignature
+            | QuarantineReasonV1::UnknownSchema
+            | QuarantineReasonV1::Oversize => {
+                if self.source_fact_id.is_some() || self.representation_key.is_some() {
+                    return Err(ContractError::Schema(
+                        "invalid_signature, unknown_schema, and oversize fire before any identity could be trusted, so source_fact_id and representation_key must both be absent".into(),
+                    ));
+                }
+            }
+            QuarantineReasonV1::UnauthorizedScope
+            | QuarantineReasonV1::DuplicatePosition
+            | QuarantineReasonV1::UnknownRepresentationVersion => {
+                if self.source_fact_id.is_none() || self.representation_key.is_some() {
+                    return Err(ContractError::Schema(
+                        "unauthorized_scope, duplicate_position, and unknown_representation_version require source_fact_id and forbid representation_key".into(),
+                    ));
+                }
+            }
             QuarantineReasonV1::RedactionFailure => {
                 if !self.diagnostic.redaction_required {
                     return Err(ContractError::Schema(
@@ -254,12 +322,6 @@ impl QuarantineRecordV1 {
                     ));
                 }
             }
-            QuarantineReasonV1::InvalidSignature
-            | QuarantineReasonV1::UnauthorizedScope
-            | QuarantineReasonV1::UnknownSchema
-            | QuarantineReasonV1::Oversize
-            | QuarantineReasonV1::DuplicatePosition
-            | QuarantineReasonV1::UnknownRepresentationVersion => {}
         }
         Ok(())
     }
@@ -338,7 +400,7 @@ impl QuarantinedDeliveryV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_contracts::canonical::decode_strict;
+    use crate::memory_contracts::canonical::{decode_strict, require_canonical};
 
     const INTEGRITY_COLLISION_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/quarantine/quarantine-integrity-collision.jsonl"
@@ -441,6 +503,18 @@ mod tests {
         hex::encode(hasher.finalize())
     }
 
+    /// Strip the one repository-framing trailing LF every fixture carries.
+    /// `require_canonical` demands the input bytes match the canonical form
+    /// exactly, and the frozen canonicalization profile treats a trailing
+    /// newline as whitespace outside the document, not part of it — so the
+    /// LF must be removed before the canonical-form check, exactly as
+    /// `relation.rs`/`evidence_v2.rs` do for their own frozen fixtures.
+    fn fixture_body(fixture: &[u8]) -> &[u8] {
+        fixture
+            .strip_suffix(b"\n")
+            .expect("fixture must end in exactly one repository-framing LF")
+    }
+
     fn assert_positive_fixture(
         fixture: &[u8],
         expected_raw_sha256: &str,
@@ -452,6 +526,13 @@ mod tests {
             expected_raw_sha256,
             "raw fixture bytes drifted"
         );
+        // Every frozen fixture must be exactly its own canonical form: a
+        // reordered key, different spacing, or non-minimal escaping would
+        // still decode-then-revalidate successfully (decode_strict
+        // re-canonicalizes internally) but would no longer be the byte-frozen
+        // canonical document the README promises.
+        require_canonical(fixture_body(fixture))
+            .expect("fixture must be exactly its own canonical form");
         let record: QuarantineRecordV1 = decode_strict(fixture).expect("valid quarantine record");
         record.validate().expect("fixture must validate");
         assert_eq!(record.reason, expected_reason);
@@ -582,6 +663,8 @@ mod tests {
             raw_sha256(NEGATIVE_RAW_PAYLOAD_FIXTURE),
             NEGATIVE_RAW_PAYLOAD_RAW_SHA256
         );
+        require_canonical(fixture_body(NEGATIVE_RAW_PAYLOAD_FIXTURE))
+            .expect("fixture must be exactly its own canonical form");
         let result: ContractResult<QuarantineRecordV1> =
             decode_strict(NEGATIVE_RAW_PAYLOAD_FIXTURE);
         assert!(result.is_err(), "a raw-payload field must not decode");
@@ -593,6 +676,8 @@ mod tests {
             raw_sha256(NEGATIVE_OVERSIZED_DIAGNOSTIC_FIXTURE),
             NEGATIVE_OVERSIZED_DIAGNOSTIC_RAW_SHA256
         );
+        require_canonical(fixture_body(NEGATIVE_OVERSIZED_DIAGNOSTIC_FIXTURE))
+            .expect("fixture must be exactly its own canonical form");
         let record: QuarantineRecordV1 =
             decode_strict(NEGATIVE_OVERSIZED_DIAGNOSTIC_FIXTURE).expect("shape decodes");
         assert!(
@@ -607,6 +692,8 @@ mod tests {
             raw_sha256(NEGATIVE_PAYLOAD_TENANT_FIXTURE),
             NEGATIVE_PAYLOAD_TENANT_RAW_SHA256
         );
+        require_canonical(fixture_body(NEGATIVE_PAYLOAD_TENANT_FIXTURE))
+            .expect("fixture must be exactly its own canonical form");
         let result: ContractResult<QuarantineRecordV1> =
             decode_strict(NEGATIVE_PAYLOAD_TENANT_FIXTURE);
         assert!(
@@ -621,6 +708,8 @@ mod tests {
             raw_sha256(NEGATIVE_MISSING_DELIVERY_ID_FIXTURE),
             NEGATIVE_MISSING_DELIVERY_ID_RAW_SHA256
         );
+        require_canonical(fixture_body(NEGATIVE_MISSING_DELIVERY_ID_FIXTURE))
+            .expect("fixture must be exactly its own canonical form");
         let result: ContractResult<QuarantineRecordV1> =
             decode_strict(NEGATIVE_MISSING_DELIVERY_ID_FIXTURE);
         assert!(result.is_err(), "a missing delivery ID must not decode");
@@ -632,6 +721,8 @@ mod tests {
             raw_sha256(NEGATIVE_RELEASE_TO_PROJECTION_FIXTURE),
             NEGATIVE_RELEASE_TO_PROJECTION_RAW_SHA256
         );
+        require_canonical(fixture_body(NEGATIVE_RELEASE_TO_PROJECTION_FIXTURE))
+            .expect("fixture must be exactly its own canonical form");
         let result: ContractResult<QuarantineRecordV1> =
             decode_strict(NEGATIVE_RELEASE_TO_PROJECTION_FIXTURE);
         assert!(
@@ -835,6 +926,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // exhaustively covers every QuarantineReasonV1 presence rule in one place
     fn reason_conditioned_identity_requirements_are_enforced() {
         // integrity_collision and preimage_disagreement are only defined
         // relative to a source-fact AND representation identity (EVENT-01);
@@ -868,6 +960,79 @@ mod tests {
             assert!(
                 record.validate().is_ok(),
                 "{reason:?} with both identity links present must be admitted"
+            );
+        }
+
+        // invalid_signature, unknown_schema, and oversize fire before any
+        // identity could be trusted at all; either link being present must
+        // fail closed, and both absent must be admitted.
+        for reason in [
+            QuarantineReasonV1::InvalidSignature,
+            QuarantineReasonV1::UnknownSchema,
+            QuarantineReasonV1::Oversize,
+        ] {
+            let mut record = sample_record();
+            record.reason = reason;
+            record.source_fact_id = Some(Sha256Digest::from_bytes([0x33; 32]));
+            record.representation_key = None;
+            assert!(
+                record.validate().is_err(),
+                "{reason:?} with a source_fact_id present must fail closed"
+            );
+
+            let mut record = sample_record();
+            record.reason = reason;
+            record.source_fact_id = None;
+            record.representation_key = Some(Sha256Digest::from_bytes([0x33; 32]));
+            assert!(
+                record.validate().is_err(),
+                "{reason:?} with a representation_key present must fail closed"
+            );
+
+            let mut record = sample_record();
+            record.reason = reason;
+            record.source_fact_id = None;
+            record.representation_key = None;
+            assert!(
+                record.validate().is_ok(),
+                "{reason:?} with both identity links absent must be admitted"
+            );
+        }
+
+        // unauthorized_scope, duplicate_position, and unknown_representation_
+        // version fire after a source identity is known but before any
+        // representation could be resolved: source_fact_id must be present
+        // and representation_key must be absent.
+        for reason in [
+            QuarantineReasonV1::UnauthorizedScope,
+            QuarantineReasonV1::DuplicatePosition,
+            QuarantineReasonV1::UnknownRepresentationVersion,
+        ] {
+            let mut record = sample_record();
+            record.reason = reason;
+            record.source_fact_id = None;
+            record.representation_key = None;
+            assert!(
+                record.validate().is_err(),
+                "{reason:?} with no source_fact_id must fail closed"
+            );
+
+            let mut record = sample_record();
+            record.reason = reason;
+            record.source_fact_id = Some(Sha256Digest::from_bytes([0x33; 32]));
+            record.representation_key = Some(Sha256Digest::from_bytes([0x44; 32]));
+            assert!(
+                record.validate().is_err(),
+                "{reason:?} with a representation_key present must fail closed"
+            );
+
+            let mut record = sample_record();
+            record.reason = reason;
+            record.source_fact_id = Some(Sha256Digest::from_bytes([0x33; 32]));
+            record.representation_key = None;
+            assert!(
+                record.validate().is_ok(),
+                "{reason:?} with source_fact_id present and representation_key absent must be admitted"
             );
         }
 
@@ -1002,5 +1167,108 @@ mod tests {
     #[test]
     fn vector_suite_fixture_is_pinned() {
         assert_eq!(raw_sha256(VECTOR_SUITE_FIXTURE), VECTOR_SUITE_RAW_SHA256);
+        require_canonical(fixture_body(VECTOR_SUITE_FIXTURE))
+            .expect("vector-suite.jsonl must be exactly its own canonical form");
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct QuarantineVectorSuitePositiveCaseV1 {
+        file: String,
+        quarantine_id: QuarantineRecordId,
+        reason: QuarantineReasonV1,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct QuarantineVectorSuiteV1 {
+        digest_domain_prefix: String,
+        fixture_authority: String,
+        leakage_vector: String,
+        negative_cases: Vec<String>,
+        positive_cases: Vec<QuarantineVectorSuitePositiveCaseV1>,
+        schema_version: u32,
+    }
+
+    /// Maps a positive fixture's file name, as cited in `vector-suite.jsonl`,
+    /// to the `include_bytes!` constant holding that exact fixture, so the
+    /// suite's pinned `quarantine_id` values can be recomputed from the
+    /// fixture each one actually references, rather than trusted as an
+    /// opaque pinned string.
+    fn positive_fixture_by_name(name: &str) -> &'static [u8] {
+        match name {
+            "quarantine-integrity-collision.jsonl" => INTEGRITY_COLLISION_FIXTURE,
+            "quarantine-invalid-signature.jsonl" => INVALID_SIGNATURE_FIXTURE,
+            "quarantine-unauthorized-scope.jsonl" => UNAUTHORIZED_SCOPE_FIXTURE,
+            "quarantine-unknown-schema.jsonl" => UNKNOWN_SCHEMA_FIXTURE,
+            "quarantine-oversize.jsonl" => OVERSIZE_FIXTURE,
+            "quarantine-duplicate-position.jsonl" => DUPLICATE_POSITION_FIXTURE,
+            "quarantine-preimage-disagreement.jsonl" => PREIMAGE_DISAGREEMENT_FIXTURE,
+            "quarantine-redaction-failure.jsonl" => REDACTION_FAILURE_FIXTURE,
+            "quarantine-unknown-representation-version.jsonl" => {
+                UNKNOWN_REPRESENTATION_VERSION_FIXTURE
+            }
+            other => panic!("vector-suite.jsonl references unknown fixture file {other:?}"),
+        }
+    }
+
+    /// Recompute every `vector-suite.jsonl` `quarantine_id` from the fixture
+    /// it names, rather than trusting the raw-file-SHA pin alone: a pinned
+    /// string can drift from what its fixture actually hashes to without a
+    /// raw-byte check ever noticing, since the raw SHA covers the suite
+    /// document's own bytes, not the relationship it asserts between a file
+    /// name and an identity.
+    #[test]
+    fn vector_suite_quarantine_ids_match_referenced_fixtures() {
+        let suite: QuarantineVectorSuiteV1 =
+            decode_strict(VECTOR_SUITE_FIXTURE).expect("vector-suite.jsonl must decode");
+        assert_eq!(suite.schema_version, QUARANTINE_SCHEMA_VERSION);
+        assert_eq!(
+            suite.digest_domain_prefix,
+            DigestDomain::QuarantineRecordV1.prefix()
+        );
+        assert_eq!(
+            suite.positive_cases.len(),
+            9,
+            "one positive case per QuarantineReasonV1 variant"
+        );
+        assert_eq!(
+            suite.fixture_authority,
+            "none; structural fixtures are assertions, not active-package or admission witnesses"
+        );
+        assert_eq!(
+            suite.leakage_vector,
+            "quarantined_record_does_not_contain_the_payloads_canonical_bytes"
+        );
+        assert_eq!(
+            suite.negative_cases,
+            vec![
+                "raw_payload_field",
+                "oversized_diagnostic",
+                "payload_selected_tenant_field",
+                "missing_delivery_id",
+                "release_to_projection_field",
+            ]
+        );
+
+        for case in &suite.positive_cases {
+            let fixture = positive_fixture_by_name(&case.file);
+            let record: QuarantineRecordV1 =
+                decode_strict(fixture).expect("referenced fixture must decode");
+            assert_eq!(
+                record.reason, case.reason,
+                "vector-suite.jsonl reason for {} does not match the referenced fixture's own reason",
+                case.file
+            );
+            let recomputed = record
+                .quarantine_id()
+                .expect("referenced fixture must validate and hash");
+            assert_eq!(
+                recomputed, case.quarantine_id,
+                "vector-suite.jsonl quarantine_id for {} does not match the id recomputed \
+                 from the fixture it references",
+                case.file
+            );
+        }
     }
 }
