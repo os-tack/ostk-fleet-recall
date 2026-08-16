@@ -446,6 +446,54 @@ impl SuccessorActivationRuntimeConfig {
     }
 }
 
+/// Minimal runtime configuration for the private conflict-reconciliation
+/// ceremony.
+///
+/// The process has its own database credential and physical fleet identity.
+/// It never consults serving, control-bootstrap, registry, or successor
+/// configuration and exposes no insecure-local database escape.
+#[derive(Clone)]
+pub struct ConflictReconciliationRuntimeConfig {
+    database_url: String,
+    trusted_scope: FleetScope,
+}
+
+impl std::fmt::Debug for ConflictReconciliationRuntimeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConflictReconciliationRuntimeConfig")
+            .field("database_url", &"<redacted>")
+            .field("trusted_scope", &"<bound>")
+            .finish()
+    }
+}
+
+impl ConflictReconciliationRuntimeConfig {
+    /// Read only the dedicated database URL and physical scope needed by this
+    /// one-shot writer.
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        conflict_reconciliation_runtime_config(
+            &required_from(&mut lookup, "FLEET_RECALL_RECONCILIATION_DATABASE_URL")?,
+            &required_from(&mut lookup, "FLEET_RECALL_RECONCILIATION_TENANT_ID")?,
+            &required_from(&mut lookup, "FLEET_RECALL_RECONCILIATION_PROJECT")?,
+        )
+    }
+
+    #[must_use]
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    #[must_use]
+    pub const fn trusted_scope(&self) -> &FleetScope {
+        &self.trusted_scope
+    }
+}
+
 #[derive(Clone)]
 pub struct FleetConfig {
     pub database_url: String,
@@ -839,6 +887,68 @@ fn successor_trusted_scope(
     })
 }
 
+fn conflict_reconciliation_runtime_config(
+    database_url: &str,
+    tenant_id: &str,
+    project: &str,
+) -> Result<ConflictReconciliationRuntimeConfig> {
+    validate_reconciliation_database_url(database_url)?;
+
+    let tenant_id = tenant_id.parse::<Uuid>().map_err(|error| {
+        FleetError::Configuration(format!(
+            "FLEET_RECALL_RECONCILIATION_TENANT_ID must be a UUID: {error}"
+        ))
+    })?;
+    if tenant_id.is_nil() {
+        return Err(FleetError::Configuration(
+            "FLEET_RECALL_RECONCILIATION_TENANT_ID must not be the nil UUID".into(),
+        ));
+    }
+    let trusted_scope = FleetScope::new(
+        tenant_id,
+        project,
+        "private-conflict-reconciliation",
+        None,
+        PrivacyTier::T1Project,
+    )
+    .map_err(|error| {
+        FleetError::Configuration(format!(
+            "FLEET_RECALL_RECONCILIATION_PROJECT is invalid: {error}"
+        ))
+    })?;
+
+    Ok(ConflictReconciliationRuntimeConfig {
+        database_url: database_url.to_owned(),
+        trusted_scope,
+    })
+}
+
+fn validate_reconciliation_database_url(database_url: &str) -> Result<()> {
+    const VARIABLE_NAME: &str = "FLEET_RECALL_RECONCILIATION_DATABASE_URL";
+    validate_database_url_with_local_escape(database_url, VARIABLE_NAME, false, false)?;
+    validate_explicit_private_database_identity(database_url, VARIABLE_NAME)?;
+
+    let parsed = Url::parse(database_url).map_err(|error| {
+        FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must be a valid PostgreSQL URL: {error}"
+        ))
+    })?;
+    let host = parsed.host_str().ok_or_else(|| {
+        FleetError::Configuration(format!("{VARIABLE_NAME} must include a hostname"))
+    })?;
+    let ordinary_network_host = match parsed.host() {
+        Some(Host::Ipv4(_) | Host::Ipv6(_)) => !host.contains('%'),
+        Some(Host::Domain(domain)) => is_ordinary_dns_host(domain),
+        None => false,
+    };
+    if !ordinary_network_host || host.starts_with(['/', '\\']) {
+        return Err(FleetError::Configuration(format!(
+            "{VARIABLE_NAME} must use an ordinary DNS or IP hostname, not an encoded or Unix-socket host"
+        )));
+    }
+    Ok(())
+}
+
 fn parse_digest(value: &str, variable_name: &str) -> Result<Sha256Digest> {
     Sha256Digest::from_str(value).map_err(|error| {
         FleetError::Configuration(format!(
@@ -1001,7 +1111,7 @@ fn validate_database_url_with_local_escape(
             }
             _ => {
                 return Err(FleetError::Configuration(format!(
-                    "{variable_name} contains unsupported connection parameter {name}"
+                    "{variable_name} contains an unsupported connection parameter; name and value are redacted"
                 )));
             }
         }
@@ -1347,6 +1457,17 @@ mod tests {
                 validate_database_url(&url, "TEST_DATABASE_URL").is_err(),
                 "accepted {parameter}"
             );
+        }
+
+        let error = validate_database_url(
+            "postgresql://user:secret@cluster.example:26257/defaultdb?sslmode=verify-full&forged%0Alog-line=secret-value",
+            "TEST_DATABASE_URL",
+        )
+        .expect_err("decoded control characters in query names must fail closed")
+        .to_string();
+        assert!(error.contains("name and value are redacted"));
+        for reflected in ["forged", "log-line", "secret-value", "\n"] {
+            assert!(!error.contains(reflected), "error reflected {reflected:?}");
         }
 
         for query in [
@@ -2138,6 +2259,163 @@ mod tests {
             values.insert("FLEET_RECALL_SUCCESSOR_DATABASE_URL", url.into());
             SuccessorActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
                 .unwrap_or_else(|error| panic!("rejected strict-TLS network IP {url}: {error}"));
+        }
+    }
+
+    const RECONCILIATION_VARIABLES: [&str; 3] = [
+        "FLEET_RECALL_RECONCILIATION_DATABASE_URL",
+        "FLEET_RECALL_RECONCILIATION_TENANT_ID",
+        "FLEET_RECALL_RECONCILIATION_PROJECT",
+    ];
+
+    fn reconciliation_values() -> BTreeMap<&'static str, String> {
+        BTreeMap::from([
+            (
+                "FLEET_RECALL_RECONCILIATION_DATABASE_URL",
+                "postgresql://reconciler:reconciliation-secret@cluster.example:26257/fleet_recall?sslmode=verify-full".into(),
+            ),
+            (
+                "FLEET_RECALL_RECONCILIATION_TENANT_ID",
+                "0198a849-f6ae-7d61-9800-000000000001".into(),
+            ),
+            (
+                "FLEET_RECALL_RECONCILIATION_PROJECT",
+                "physical-project".into(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn reconciliation_runtime_config_is_scope_bound_and_redacted() {
+        let values = reconciliation_values();
+        let config =
+            ConflictReconciliationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+                .expect("private conflict-reconciliation config");
+
+        assert_eq!(
+            config.trusted_scope().tenant_id,
+            Uuid::parse_str("0198a849-f6ae-7d61-9800-000000000001").unwrap()
+        );
+        assert_eq!(config.trusted_scope().project, "physical-project");
+        assert_eq!(
+            config.trusted_scope().agent,
+            "private-conflict-reconciliation"
+        );
+        assert_eq!(config.trusted_scope().session_id, None);
+        assert_eq!(config.trusted_scope().privacy_tier, PrivacyTier::T1Project);
+
+        let debug = format!("{config:?}");
+        for secret in [
+            config.database_url(),
+            "reconciler",
+            "reconciliation-secret",
+            "cluster.example",
+            "physical-project",
+            "0198a849-f6ae-7d61-9800-000000000001",
+        ] {
+            assert!(!debug.contains(secret), "debug exposed {secret}");
+        }
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("<bound>"));
+    }
+
+    #[test]
+    fn reconciliation_uses_only_its_exact_dedicated_variables() {
+        let values = reconciliation_values();
+        let mut requested = Vec::new();
+        ConflictReconciliationRuntimeConfig::from_lookup(|name| {
+            assert!(
+                RECONCILIATION_VARIABLES.contains(&name),
+                "looked up unrelated or fallback variable {name}"
+            );
+            requested.push(name.to_owned());
+            values.get(name).cloned()
+        })
+        .expect("dedicated reconciliation variables");
+        assert_eq!(requested, RECONCILIATION_VARIABLES);
+
+        for missing in RECONCILIATION_VARIABLES {
+            let mut values = reconciliation_values();
+            values.remove(missing);
+            values.insert(
+                "FLEET_RECALL_DATABASE_URL",
+                "postgresql://serving:wrong@cluster.example:26257/fleet?sslmode=verify-full".into(),
+            );
+            values.insert("FLEET_RECALL_TENANT_ID", Uuid::now_v7().to_string());
+            values.insert("FLEET_RECALL_PROJECT", "serving-project".into());
+            let error =
+                ConflictReconciliationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+                    .expect_err(
+                        "generic serving variables must not supply reconciliation authority",
+                    );
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{missing} is required")),
+                "wrong error for {missing}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconciliation_database_requires_strict_tls_and_explicit_identity() {
+        for url in [
+            "postgresql://reconciler:secret@cluster.example:26257/fleet?sslmode=verify-full",
+            "postgresql://reconciler:secret@127.0.0.1:26257/fleet?sslmode=verify-full",
+            "postgresql://reconciler:secret@[::1]:26257/fleet?sslmode=verify-full&sslrootcert=%2Fetc%2Fssl%2Fcerts%2Fca.pem",
+        ] {
+            let mut values = reconciliation_values();
+            values.insert("FLEET_RECALL_RECONCILIATION_DATABASE_URL", url.into());
+            ConflictReconciliationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+                .unwrap_or_else(|error| {
+                    panic!("rejected closed reconciliation URL {url}: {error}")
+                });
+        }
+
+        for url in [
+            "https://reconciler:secret@cluster.example:26257/fleet?sslmode=verify-full",
+            "postgresql://reconciler:secret@cluster.example:26257/fleet",
+            "postgresql://reconciler:secret@cluster.example:26257/fleet?sslmode=disable",
+            "postgresql://reconciler:secret@cluster.example:26257/fleet?sslmode=require",
+            "postgresql://reconciler:secret@cluster.example:26257/fleet?sslmode=verify-full&options=-csearch_path%3Dattacker",
+            "postgresql://reconciler:secret@cluster.example:26257/fleet?sslmode=verify-full&sslmode=disable",
+            "postgresql://:secret@cluster.example:26257/fleet?sslmode=verify-full",
+            "postgresql://reconciler@cluster.example:26257/fleet?sslmode=verify-full",
+            "postgresql://reconciler:@cluster.example:26257/fleet?sslmode=verify-full",
+            "postgresql://reconciler:secret@cluster.example/fleet?sslmode=verify-full",
+            "postgresql://reconciler:secret@cluster.example:0/fleet?sslmode=verify-full",
+            "postgresql://reconciler:secret@cluster.example:26257/?sslmode=verify-full",
+            "postgresql://reconciler:secret@%2Fvar%2Frun%2Fpostgres:26257/fleet?sslmode=verify-full",
+            "postgresql://reconciler:secret@bad_host.example:26257/fleet?sslmode=verify-full",
+            "postgresql://reconciler:secret@-bad.example:26257/fleet?sslmode=verify-full",
+        ] {
+            let mut values = reconciliation_values();
+            values.insert("FLEET_RECALL_RECONCILIATION_DATABASE_URL", url.into());
+            assert!(
+                ConflictReconciliationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+                    .is_err(),
+                "accepted unsafe reconciliation URL {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconciliation_rejects_invalid_physical_scope() {
+        for (name, value) in [
+            ("FLEET_RECALL_RECONCILIATION_TENANT_ID", "not-a-uuid"),
+            (
+                "FLEET_RECALL_RECONCILIATION_TENANT_ID",
+                "00000000-0000-0000-0000-000000000000",
+            ),
+            ("FLEET_RECALL_RECONCILIATION_PROJECT", " physical-project "),
+        ] {
+            let mut values = reconciliation_values();
+            values.insert(name, value.into());
+            assert!(
+                ConflictReconciliationRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+                    .is_err(),
+                "accepted invalid reconciliation scope {name}"
+            );
         }
     }
 }
