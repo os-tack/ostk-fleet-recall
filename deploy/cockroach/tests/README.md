@@ -62,6 +62,7 @@ counted as Docker evidence.
 | Official-binary correctness | One checksum-pinned, build-tag-pinned TLS `v26.2.3` server running the complete matrix and both private CLIs | The single authoritative connected result |
 | Control RBAC parity | `control-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Activation RBAC parity | `registry-activation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
+| Conflict-reconciliation RBAC parity | `conflict-reconciliation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Control bootstrap CLI parity | `control-bootstrap-cli.sh` in its own Docker container | Secondary packaging/CLI result only |
 
 Each Docker proof requires the running server's build tag to equal `v26.2.3`.
@@ -71,11 +72,11 @@ result and each Docker parity result separately; do not summarize one substrate
 as evidence that another passed. Every script owns bounded temporary state and
 cleans it on success, failure, or interruption.
 
-Both RBAC proofs apply migrations 3 through 14 over explicit stand-ins for the
-legacy v1/v2 objects, then synthesize the complete successful SQLx history 1
-through 14. They retain the private commands' narrower semantic preflights
-(bootstrap through 3, genesis activation through 9), inject successor-table
-privilege and grant-option drift, then apply and reapply
+The control and activation RBAC proofs apply migrations 3 through 14 over
+explicit stand-ins for the legacy v1/v2 objects, then synthesize the complete
+successful SQLx history 1 through 14. They retain the private commands' narrower
+semantic preflights (bootstrap through 3, genesis activation through 9), inject
+successor-table privilege and grant-option drift, then apply and reapply
 `successor-schema-quarantine-grants.sql`. That dedicated policy first requires
 all migration rows 1 through 14 to exist and be successful; only then does it
 statically revoke every privilege on the three new authority tables from
@@ -84,3 +85,75 @@ CockroachDB v26.2 cannot conditionally execute privilege DDL inside PL/pgSQL,
 while the two base role policies must remain applicable at their original v3/v9
 deployment stages. These Docker policy-compatibility proofs do not claim the
 current exact prefix through 17.
+
+The conflict-reconciliation RBAC proof uses privilege-shaped minimal stand-ins
+for the six repository tables, the conflict-ID sequence, and unrelated corpus/
+control/registry/successor surfaces; repository correctness remains in the
+official-binary Rust test. It rejects prefix 15 and failed migration 16 before
+any role or grant mutation, also rejects missing hardened control/activation
+role prerequisites before creating its role, admits the exact successful prefix
+through 16 with or without later migration 17, and reapplies the policy after
+privilege, grant-option, role-option, PUBLIC, and named bidirectional membership
+drift.
+Unexpected NOLOGIN-role inheritance, any additional application schema,
+implicit ownership authority, and direct reconciliation/PUBLIC grants outside
+the repairable `fleet_recall.public` boundary fail closed for operator repair.
+All schema, routine, table, sequence, and type defaults to PUBLIC or the
+reconciliation role are checked across every grantor with supported
+grantee-targeted `SHOW DEFAULT PRIVILEGES` queries at both database and
+public-schema scope. The CockroachDB
+[v26.2.3 engine test](https://github.com/cockroachdb/cockroach/blob/v26.2.3/pkg/sql/logictest/testdata/logic_test/show_default_privileges)
+synthesizes non-grantable PUBLIC routine `EXECUTE` and type `USAGE` for every
+role and `FOR ALL ROLES`, in addition to exact self-owner `ALL` rows. This
+stronger contract requires a cluster admin to revoke routine `EXECUTE` from
+every pre-existing non-target role and `FOR ALL ROLES` before a delegated
+security operator can apply it; v26.2 cannot dynamically revoke arbitrary role
+identifiers in this policy. `CREATE ROLE`
+contributes one exact target-grantor PUBLIC routine row, which remains admitted
+under the required quiescence because the final postconditions remove CREATE,
+ownership, and inheritance authority. The proof expects that row explicitly;
+every other PUBLIC routine or target/PUBLIC default is rejected, and the final
+four-`SHOW` union is empty after those exact engine-baseline exclusions. The
+policy admits only `public` plus CockroachDB's documented system/temporary
+schemas, so no uninspected application-schema default can hide. The proof injects
+arbitrary-grantor schema, routine, table, sequence, and noncanonical type
+defaults, verifies pre-mutation preservation, and removes them.
+
+CockroachDB v26.2's no-target `SHOW GRANTS` union also includes cluster-global
+external connections with a NULL database name. The policy rejects every
+PUBLIC external-connection grant instead of losing those rows to its current-
+database filter. The proof injects nodelocal `USAGE` and `DROP`, verifies the
+fail-closed preflight preserves both grants and unrelated role drift, cleans the
+exact external connection, and includes that cluster-global surface in the
+final out-of-boundary audit.
+
+Because every role implicitly inherits PUBLIC, the policy also fails before
+target-role creation if PUBLIC has any system privilege. The proof injects and
+preserves a PUBLIC `CREATEROLE` system grant, removes it explicitly, and includes
+PUBLIC in the final exact system-grant audit; the policy never silently revokes
+cluster-wide PUBLIC authority.
+Externally provisioned LOGIN members without ADMIN OPTION remain visible in the
+complete membership audit. Exact `SHOW` output plus allowed/denied operations
+freezes the one-shot logical role.
+
+The role policy independently clears the complete CockroachDB v26.2 direct
+option surface and system grants, including deprecated options that still have
+authorization effect, and requires final options to be exactly `{NOLOGIN}`.
+`SQLLOGIN` removes legacy `NOSQLLOGIN` drift while `NOLOGIN` remains the broader
+all-authentication-method deny. `VALID UNTIL`, certificate `SUBJECT`, and
+unremovable `PROVISIONSRC` identity drift fail before role mutation and require
+identity replacement or external cleanup. Password hashes are not exposed by
+`SHOW USERS`, and `PASSWORD NULL` cannot be exercised by this insecure Docker
+substrate; exact `NOLOGIN` is the portable denial even if a stale hash exists,
+while a secure-cluster operator can additionally clear a non-provisioned role's
+password.
+
+CockroachDB v26.2 requires table-level `UPDATE` for the repository's `FOR
+UPDATE` locks on conflict rows and memberships; the proof therefore also
+freezes the repository's actual `UPDATE` targets so that residual capability
+cannot silently become an application write path. The serving runtime retains
+its broader direct legacy-ledger DML because remember depends on it. The
+reconciliation role is the supported least-privilege one-shot credential, not
+an engine claim that a misused raw runtime credential cannot issue equivalent
+table mutations; the parity proof snapshots and preserves that overlap while
+proving there is no inheritance edge between the roles.
