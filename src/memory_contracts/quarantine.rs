@@ -52,6 +52,19 @@ pub const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 512;
 /// transport can retry, but an unbounded counter is not a contract value.
 pub const MAX_ATTEMPT_COUNT: u32 = 1_000_000;
 
+/// Hard byte bound on `transport_delivery_id`, tighter than the generic
+/// [`HexBytes`] 4,096-byte ceiling.
+///
+/// This field exists to deduplicate ingress attempts, not to carry payload:
+/// every real transport delivery identifier (a UUID, a provider-issued
+/// opaque token) fits in a handful of bytes. Bounding it here — rather than
+/// only at the generic newtype level — is itself the leakage guarantee: no
+/// non-digest field on this record can ever carry more than this many bytes
+/// of provider- or payload-controlled data, so at most
+/// `MAX_TRANSPORT_DELIVERY_ID_BYTES` bytes could ever "ride in" through this
+/// field, however the delivering transport chooses to populate it.
+pub const MAX_TRANSPORT_DELIVERY_ID_BYTES: usize = 64;
+
 /// Closed rejection-cause taxonomy for one quarantined delivery.
 ///
 /// This list is exhaustively matched everywhere a reason is interpreted.
@@ -199,10 +212,47 @@ impl QuarantineRecordV1 {
             || self.canonical_payload_digest == Sha256Digest::ZERO
             || self.source_fact_id == Some(Sha256Digest::ZERO)
             || self.representation_key == Some(Sha256Digest::ZERO)
+            || !self.received_at.is_microsecond_aligned()
+            || self.transport_delivery_id.as_bytes().len() > MAX_TRANSPORT_DELIVERY_ID_BYTES
         {
             return Err(ContractError::Schema("invalid quarantine record".into()));
         }
+        self.validate_reason_conditioned_identity()?;
         encode_canonical(self)?;
+        Ok(())
+    }
+
+    /// Enforce the per-reason presence rule the module and README document:
+    /// `integrity_collision` and `preimage_disagreement` are only defined
+    /// relative to a source-fact *and* representation identity (EVENT-01),
+    /// so both links must be derivable; `redaction_failure` means redaction
+    /// could not be confirmed, so the diagnostic must say so. This match is
+    /// exhaustive over the closed [`QuarantineReasonV1`] enum — adding a
+    /// tenth reason without extending this match is a compile error, so the
+    /// "exhaustively matched" claim in the module doc comment stays true.
+    fn validate_reason_conditioned_identity(&self) -> ContractResult<()> {
+        match self.reason {
+            QuarantineReasonV1::IntegrityCollision | QuarantineReasonV1::PreimageDisagreement => {
+                if self.source_fact_id.is_none() || self.representation_key.is_none() {
+                    return Err(ContractError::Schema(
+                        "integrity_collision and preimage_disagreement require both source_fact_id and representation_key".into(),
+                    ));
+                }
+            }
+            QuarantineReasonV1::RedactionFailure => {
+                if !self.diagnostic.redaction_required {
+                    return Err(ContractError::Schema(
+                        "redaction_failure requires diagnostic.redaction_required".into(),
+                    ));
+                }
+            }
+            QuarantineReasonV1::InvalidSignature
+            | QuarantineReasonV1::UnauthorizedScope
+            | QuarantineReasonV1::UnknownSchema
+            | QuarantineReasonV1::Oversize
+            | QuarantineReasonV1::DuplicatePosition
+            | QuarantineReasonV1::UnknownRepresentationVersion => {}
+        }
         Ok(())
     }
 
@@ -609,6 +659,17 @@ mod tests {
             !contains_subslice(&canonical_record_bytes, &raw_payload),
             "the canonicalized record must not contain the payload's raw bytes"
         );
+        // ...nor as its hex-encoded wire projection: every byte-bearing field
+        // on this record (HexBytes, Sha256Digest) is rendered as lowercase
+        // hex in canonical JSON, so a substring check restricted to raw
+        // bytes alone would miss payload bytes smuggled in through a field
+        // that hex-encodes on the wire (exactly how a naive raw-byte-only
+        // check missed the original transport_delivery_id leak).
+        let raw_payload_hex = hex::encode(&raw_payload);
+        assert!(
+            !contains_subslice(&canonical_record_bytes, raw_payload_hex.as_bytes()),
+            "the canonicalized record must not contain the payload's hex-encoded bytes either"
+        );
         // ...nor the payload's own canonical/content digest bytes rendered as
         // hex, beyond the one digest field the record is defined to carry.
         let payload_digest_hex = payload_digest.to_hex();
@@ -621,6 +682,21 @@ mod tests {
             "the payload digest must appear exactly once, in canonical_payload_digest"
         );
         assert_ne!(canonical_record_bytes, raw_payload);
+
+        // No field other than canonical_payload_digest can carry more than
+        // MAX_TRANSPORT_DELIVERY_ID_BYTES of payload-derived bytes: an
+        // attempt to smuggle a large slice of the payload through the one
+        // other byte-bearing field on this record must fail closed at
+        // validate(), before it could ever reach a canonicalized, searchable
+        // dead-letter row.
+        let mut smuggling_attempt = record;
+        let mut smuggled = raw_payload;
+        smuggled.resize(MAX_TRANSPORT_DELIVERY_ID_BYTES + 1, 0);
+        smuggling_attempt.transport_delivery_id = HexBytes::new(smuggled).unwrap();
+        assert!(
+            smuggling_attempt.validate().is_err(),
+            "a delivery ID built from payload bytes beyond the bound must fail closed"
+        );
     }
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -686,6 +762,116 @@ mod tests {
         let mut record = sample_record();
         record.attempt_count = MAX_ATTEMPT_COUNT;
         assert!(record.validate().is_ok());
+    }
+
+    #[test]
+    fn received_at_must_be_microsecond_aligned() {
+        // Two records identical except for sub-microsecond precision on
+        // `received_at` must not be admitted: an unaligned nanosecond value
+        // cannot round-trip through CockroachDB's microsecond `TIMESTAMPTZ`
+        // without changing bytes, which would make `quarantine_id()`
+        // unreproducible from the durably stored row (EVENT-01).
+        let mut record = sample_record();
+        record.received_at = CanonicalTimestamp::parse("2026-08-15T09:31:00.123456789Z").unwrap();
+        assert!(
+            record.validate().is_err(),
+            "a nanosecond-precision received_at must fail closed"
+        );
+
+        let mut record = sample_record();
+        record.received_at = CanonicalTimestamp::parse("2026-08-15T09:31:00.123456000Z").unwrap();
+        assert!(
+            record.validate().is_ok(),
+            "a microsecond-aligned received_at must be admitted"
+        );
+    }
+
+    #[test]
+    fn transport_delivery_id_is_bounded() {
+        // The generic HexBytes newtype alone would admit up to 4,096 bytes
+        // here; validate() imposes its own, much tighter, delivery-ID-shaped
+        // bound so a rejected delivery's transport-supplied ID cannot become
+        // a vector for smuggling arbitrary payload bytes into a searchable
+        // dead-letter record (EVID-05).
+        let mut record = sample_record();
+        record.transport_delivery_id =
+            HexBytes::new(vec![0xcd; MAX_TRANSPORT_DELIVERY_ID_BYTES]).unwrap();
+        assert!(
+            record.validate().is_ok(),
+            "a delivery ID at the bound must be admitted"
+        );
+
+        let mut record = sample_record();
+        record.transport_delivery_id =
+            HexBytes::new(vec![0xcd; MAX_TRANSPORT_DELIVERY_ID_BYTES + 1]).unwrap();
+        assert!(
+            record.validate().is_err(),
+            "a delivery ID one byte over the bound must fail closed"
+        );
+
+        let mut record = sample_record();
+        record.transport_delivery_id = HexBytes::new(vec![0xcd; 4_096]).unwrap();
+        assert!(
+            record.validate().is_err(),
+            "a maximal HexBytes payload must still fail closed under the tighter bound"
+        );
+    }
+
+    #[test]
+    fn reason_conditioned_identity_requirements_are_enforced() {
+        // integrity_collision and preimage_disagreement are only defined
+        // relative to a source-fact AND representation identity (EVENT-01);
+        // a record with either link missing must fail closed.
+        for reason in [
+            QuarantineReasonV1::IntegrityCollision,
+            QuarantineReasonV1::PreimageDisagreement,
+        ] {
+            let mut record = sample_record();
+            record.reason = reason;
+            record.source_fact_id = None;
+            record.representation_key = Some(Sha256Digest::from_bytes([0x33; 32]));
+            assert!(
+                record.validate().is_err(),
+                "{reason:?} with no source_fact_id must fail closed"
+            );
+
+            let mut record = sample_record();
+            record.reason = reason;
+            record.source_fact_id = Some(Sha256Digest::from_bytes([0x33; 32]));
+            record.representation_key = None;
+            assert!(
+                record.validate().is_err(),
+                "{reason:?} with no representation_key must fail closed"
+            );
+
+            let mut record = sample_record();
+            record.reason = reason;
+            record.source_fact_id = Some(Sha256Digest::from_bytes([0x33; 32]));
+            record.representation_key = Some(Sha256Digest::from_bytes([0x44; 32]));
+            assert!(
+                record.validate().is_ok(),
+                "{reason:?} with both identity links present must be admitted"
+            );
+        }
+
+        // redaction_failure means redaction could not be confirmed; a
+        // diagnostic that clears redaction_required contradicts the reason
+        // it is attached to and must fail closed.
+        let mut record = sample_record();
+        record.reason = QuarantineReasonV1::RedactionFailure;
+        record.diagnostic.redaction_required = false;
+        assert!(
+            record.validate().is_err(),
+            "redaction_failure with redaction_required=false must fail closed"
+        );
+
+        let mut record = sample_record();
+        record.reason = QuarantineReasonV1::RedactionFailure;
+        record.diagnostic.redaction_required = true;
+        assert!(
+            record.validate().is_ok(),
+            "redaction_failure with redaction_required=true must be admitted"
+        );
     }
 
     #[test]

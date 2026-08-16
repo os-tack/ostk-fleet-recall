@@ -2,11 +2,13 @@
 
 These fixtures freeze the dead-letter boundary for rejected deliveries. Every
 `.jsonl` file contains one canonical JSON record plus exactly one repository-
-framing LF; the LF is excluded from every contract digest (it is trailing
-whitespace to the frozen canonicalization profile's parser, not part of the
-canonical document). None of the fixture scope, connector identity, delivery
-ID, or digest carries runtime authority — these are structural assertions,
-not active-registry or admission witnesses.
+framing LF. The LF is excluded from `quarantine_id()` and every other
+*contract* digest — it is trailing whitespace to the frozen canonicalization
+profile's parser, not part of the canonical document — but it is included in
+the pinned raw *file* SHA-256 constants below, which hash the file exactly as
+it sits in the repository. None of the fixture scope, connector identity,
+delivery ID, or digest carries runtime authority — these are structural
+assertions, not active-registry or admission witnesses.
 
 ## What `QuarantineRecordV1` is, and is not
 
@@ -37,6 +39,24 @@ any kind. `#[serde(deny_unknown_fields)]` means a delivery that tries to add
 any of those keys is rejected before it is ever interpreted — the negative
 vectors below prove exactly that, per key.
 
+Two more bounds are enforced by `validate()`, matching the rest of this
+crate's identity-bearing durable timestamps and its bounded, non-payload
+fields:
+
+- `received_at` must be microsecond-aligned (`is_microsecond_aligned()`,
+  i.e. its last three nanosecond digits are `000`), matching
+  `evidence_v2`/`remember_v2`/`successor_activation` and the CockroachDB
+  writers that reject unaligned timestamps. `quarantine_id()` hashes
+  `received_at`'s exact nanosecond text, so an unaligned value that a
+  microsecond-precision `TIMESTAMPTZ` column cannot store byte-for-byte
+  would make the identity unreproducible from the durably stored row.
+- `transport_delivery_id` is capped at `MAX_TRANSPORT_DELIVERY_ID_BYTES` (64
+  bytes) by `validate()`, tighter than the generic `HexBytes` newtype's
+  4,096-byte ceiling. This field deduplicates ingress attempts, not payload;
+  the bound is the leakage guarantee for this field specifically — no more
+  than 64 bytes of transport- or payload-controlled data can ever ride into
+  a dead-letter record through it.
+
 ## Reasons
 
 `QuarantineReasonV1` is a closed, exhaustively matched enum:
@@ -44,13 +64,29 @@ vectors below prove exactly that, per key.
 `unknown_schema`, `oversize`, `duplicate_position`, `preimage_disagreement`,
 `redaction_failure`, `unknown_representation_version`. One positive fixture
 exists per reason. Whether `source_fact_id`/`representation_key` are present
-varies by reason and is intentional, not an oversight: `unknown_schema`,
-`oversize`, and `invalid_signature` fire before any identity could be
-trusted, so both are `null`; `integrity_collision`, `preimage_disagreement`,
-and `redaction_failure` fire after identity was derivable, so both are
-present; the remaining reasons fall in between and carry only
+varies by reason. `unknown_schema`, `oversize`, and `invalid_signature` fire
+before any identity could be trusted, so both are `null`; the remaining
+reasons other than the two below fall in between and carry only
 `source_fact_id`. The per-fixture diagnostic message cites the exact
 invariant or document section it demonstrates.
+
+Two of these presence rules are not just convention: `validate()` enforces
+them and fails closed on a violation (`QuarantineRecordV1::
+validate_reason_conditioned_identity`).
+
+- `integrity_collision` and `preimage_disagreement` are only defined
+  relative to a source-fact **and** representation identity ("Canonical
+  evidence event": "different canonical bytes for the same source-fact and
+  representation identity"), so both `source_fact_id` and
+  `representation_key` must be `Some` — a record with either missing does
+  not decode-then-validate; `validate()` rejects it.
+- `redaction_failure` means redaction could not be confirmed complete, so
+  `diagnostic.redaction_required` must be `true` on that record; `false`
+  contradicts the reason it is attached to and is rejected.
+
+Every other reason carries no enforced presence requirement on
+`source_fact_id`/`representation_key` beyond the general "best-effort, `Some`
+only when non-zero" rule `validate()` already applies to both fields.
 
 ## Identity
 
