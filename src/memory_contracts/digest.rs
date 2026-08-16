@@ -162,7 +162,8 @@ pub enum DigestDomain {
     // --- W0-NORM domains ---
 
     // --- W0-QUAR domains ---
-
+    /// Bounded dead-letter record for one rejected/quarantined delivery.
+    QuarantineRecordV1,
     // --- W0-TELEM domains ---
 
     // --- W0-CAUSE domains ---
@@ -257,7 +258,7 @@ impl DigestDomain {
             // --- W0-NORM prefixes ---
 
             // --- W0-QUAR prefixes ---
-
+            Self::QuarantineRecordV1 => "ostk-quarantine-record-v1",
             // --- W0-TELEM prefixes ---
 
             // --- W0-CAUSE prefixes ---
