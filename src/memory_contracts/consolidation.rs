@@ -17,26 +17,50 @@
 //!
 //! Statement identity is deterministic (CONS-05): it is a domain-separated
 //! digest over the canonical statement bytes, which bind the exact sorted
-//! source claim fingerprint+revision set, consolidator identity and version,
-//! policy reference and digest, output kind and modality, output depth,
-//! computed effective interval, and disposition. The authored summary text is
-//! versioned enrichment carried by the request and bound server-side by the
-//! receipt; it never enters statement identity, exactly like an embedding
-//! vector under REPLAY-01. The production digest constructor additionally
-//! requires the `ostk-consolidation-statement-v1` digest domain, which is a
-//! REG-lane allocation pending in `.fleet-recall/coordination/requests/
-//! 2026-08-16-kimi-reg-consolidation-digest-domains.md`; this revision
-//! deliberately ships canonical bytes and validation without that constructor.
+//! set of distinct source claim fingerprints and revisions, consolidator
+//! identity and version, policy reference and digest, output kind and
+//! modality, output depth, computed effective interval, and disposition. The
+//! authored summary text is versioned enrichment carried by the request and
+//! bound server-side by the receipt; it never enters statement identity,
+//! exactly like an embedding vector under REPLAY-01. The receipt's
+//! `summary_enrichment_digest` commits to the exact authored bytes under the
+//! dedicated `ostk-consolidation-summary-enrichment-v1` domain, filed with
+//! the REG lane for the W0-REG slot (`.fleet-recall/coordination/requests/
+//! 2026-08-16-kimi-reg-summary-enrichment-domain.md`). The statement, policy,
+//! receipt, and summary-enrichment digest constructors use the consolidation
+//! `DigestDomain` variants accepted by the REG lane (`.fleet-recall/
+//! coordination/requests/2026-08-16-fable-re-consolidation-digest-domains.md`)
+//! and landing with W0-REG. Until the variants merge, `validate_derivation`
+//! recomputes the policy body digest through a private prefix constant whose
+//! framing is byte-identical to `domain_separated_digest` (reconciliation
+//! option (b)), and the frozen fixtures carry the exact values computed under
+//! the frozen formula, so the follow-up swap to the typed variants changes no
+//! fixture bytes.
 //!
-//! Cycle rejection (CONS-09) cannot be decided from one statement alone: it
-//! requires the lineage-graph witness at the repository seam. What this
-//! contract enforces is a strictly sorted, unique source set, a bounded
-//! derivation depth, and an output depth exactly one greater than the deepest
-//! source, so lineage chains are finite and replay-deterministic.
+//! Scope containment (CONS-06) is a repository seam duty in the same pattern
+//! as `remember_v2`: the statement's single `scope` is server-derived, and
+//! the seam must additionally prove every source claim belongs to that scope
+//! and that no private or more-visible source content crosses into a wider
+//! output. Per-source visibility attributes are deliberately not modeled in
+//! v1; adding them is a statement v2 change.
+//!
+//! Cycle rejection (CONS-09) is split. The one self-cycle decidable from a
+//! single statement — the same claim fingerprint appearing twice at any
+//! revisions — is rejected here by the distinct-fingerprint source rule.
+//! General cycles through previously accepted derivatives require the
+//! lineage-graph witness at the repository seam. What this contract
+//! additionally enforces is a strictly sorted source set, a bounded
+//! derivation depth, and an output depth exactly one greater than the
+//! deepest source, so lineage chains are finite and replay-deterministic.
+//! Sources may mix modalities; the output is conservatively capped at the
+//! weakest source modality (CONS-03), and v1 accepts that a derivative may
+//! therefore summarize stronger evidence in weaker terms rather than
+//! rejecting the mix (kind stays uniform under the only admitted rule).
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use super::{
     ContractError, ContractResult,
@@ -57,6 +81,24 @@ const MAX_CONSOLIDATION_SOURCES: u32 = 64;
 const MAX_CONFLICT_REFERENCES: usize = 64;
 const MAX_CONSOLIDATION_DEPTH: u32 = 8;
 const MAX_ACCEPTED_EVENT_IDS: usize = 256;
+
+/// Policy body digest prefix accepted by the REG lane
+/// (`.fleet-recall/coordination/requests/2026-08-16-fable-re-consolidation-digest-domains.md`)
+/// and landing as a `DigestDomain` variant with W0-REG. Until then the
+/// recompute below frames through this private constant exactly like
+/// `digest::domain_separated_digest` (reconciliation option (b)); the swap to
+/// the variant changes no digest values and no fixture bytes.
+const CONSOLIDATION_POLICY_V1_DIGEST_PREFIX: &str = "ostk-consolidation-policy-v1";
+
+/// `SHA-256(prefix || 0x00 || bytes)`, byte-identical to
+/// `digest::domain_separated_digest` under the accepted prefixes.
+fn consolidation_domain_digest(prefix: &str, bytes: &[u8]) -> Sha256Digest {
+    let mut hash = Sha256::new();
+    hash.update(prefix.as_bytes());
+    hash.update([0]);
+    hash.update(bytes);
+    Sha256Digest::from_bytes(hash.finalize().into())
+}
 
 macro_rules! digest_newtype {
     ($name:ident) => {
@@ -330,10 +372,9 @@ impl ConsolidationStatementV1 {
     /// Canonical statement bytes, the exact preimage of statement identity.
     ///
     /// Statement identity is `SHA-256("ostk-consolidation-statement-v1" ||
-    /// 0x00 || canonical_bytes)`. The digest domain is a REG-lane allocation
-    /// pending in the coordination request dated 2026-08-16; until it lands in
-    /// `digest.rs`, no production identity constructor exists and these bytes
-    /// are the complete semantic content.
+    /// 0x00 || canonical_bytes)`. The digest domain is accepted by the REG
+    /// lane and lands with W0-REG; until it merges, no production identity
+    /// constructor exists and these bytes are the complete semantic content.
     pub fn canonical_bytes(&self) -> ContractResult<Vec<u8>> {
         encode_canonical(self)
     }
@@ -341,14 +382,20 @@ impl ConsolidationStatementV1 {
     /// Validate canonical public shape only; this grants no derivation
     /// authority and does not evaluate the policy.
     pub fn validate_shape(&self) -> ContractResult<()> {
-        self.profile.validate()?;
+        // The statement identity preimage pins the exact frozen
+        // canonicalization profile compiled into this binary; a statement
+        // cannot mint a second identity by naming other profile digests
+        // (CONS-05, REPLAY-01).
+        self.profile.require_frozen_runtime_profile()?;
         self.policy.validate()?;
         validate_interval(&self.effective_interval)?;
         self.disposition.validate()?;
         if self.schema_version != CONSOLIDATION_SCHEMA_VERSION
             || self.policy_digest == Sha256Digest::ZERO
             || self.consolidator_version == 0
-            || self.sources.len() < usize::try_from(MIN_CONSOLIDATION_SOURCES).unwrap_or(0)
+            || self.output_depth == 0
+            || self.output_depth > MAX_CONSOLIDATION_DEPTH + 1
+            || self.sources.len() < usize::try_from(MIN_CONSOLIDATION_SOURCES).unwrap_or(usize::MAX)
             || self.sources.len() > usize::try_from(MAX_CONSOLIDATION_SOURCES).unwrap_or(0)
             || !strictly_sorted_sources(&self.sources)
         {
@@ -374,12 +421,7 @@ impl ConsolidationStatementV1 {
     /// is linked.
     pub fn validate_derivation(&self, policy: &ConsolidationPolicyV1) -> ContractResult<()> {
         self.validate_shape()?;
-        policy.validate_shape()?;
-        if policy.policy_id != self.policy.entry_id || policy.version != self.policy.version {
-            return Err(ContractError::Schema(
-                "consolidation policy does not match its registry reference".into(),
-            ));
-        }
+        self.validate_policy_binding(policy)?;
         if self.sources.len() > usize::try_from(policy.max_sources).unwrap_or(0) {
             return Err(ContractError::Schema(
                 "consolidation source set exceeds the policy bound".into(),
@@ -485,6 +527,29 @@ impl ConsolidationStatementV1 {
         }
         Ok(())
     }
+
+    /// Bind the statement to the exact supplied policy body: the reference
+    /// must name the same entry and version, and `policy_digest` must
+    /// recompute from the canonical policy bytes (CONS-02). The seam
+    /// separately proves the reference is the active registry entry.
+    fn validate_policy_binding(&self, policy: &ConsolidationPolicyV1) -> ContractResult<()> {
+        policy.validate_shape()?;
+        if policy.policy_id != self.policy.entry_id || policy.version != self.policy.version {
+            return Err(ContractError::Schema(
+                "consolidation policy does not match its registry reference".into(),
+            ));
+        }
+        let recomputed_policy_digest = consolidation_domain_digest(
+            CONSOLIDATION_POLICY_V1_DIGEST_PREFIX,
+            &encode_canonical(policy)?,
+        );
+        if recomputed_policy_digest != self.policy_digest {
+            return Err(ContractError::Schema(
+                "consolidation policy digest does not commit to the supplied policy body".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Public, authority-free coordinate for one requested source claim.
@@ -519,9 +584,16 @@ impl ConsolidationRequestV1 {
     pub fn validate_shape(&self) -> ContractResult<()> {
         self.requested_policy.validate()?;
         if self.schema_version != CONSOLIDATION_SCHEMA_VERSION
-            || self.asserted_sources.len() < usize::try_from(MIN_CONSOLIDATION_SOURCES).unwrap_or(0)
+            || self.asserted_sources.len()
+                < usize::try_from(MIN_CONSOLIDATION_SOURCES).unwrap_or(usize::MAX)
             || self.asserted_sources.len() > usize::try_from(MAX_CONSOLIDATION_SOURCES).unwrap_or(0)
-            || !strictly_sorted(&self.asserted_sources)
+            || !strictly_sorted(
+                &self
+                    .asserted_sources
+                    .iter()
+                    .map(|source| source.claim_fingerprint)
+                    .collect::<Vec<_>>(),
+            )
             || self.asserted_sources.iter().any(|source| {
                 source.claim_revision == 0
                     || source.claim_fingerprint.digest() == Sha256Digest::ZERO
@@ -553,15 +625,17 @@ pub enum ConsolidationOutcomeV1 {
 
 /// Server record binding one statement identity to its outcome.
 ///
-/// The receipt is not identity authority: the statement digest it carries is
-/// verified against the accepted event, and the summary enrichment digest is
-/// bound here, server-side, precisely so that narrative bytes stay out of
-/// derivation identity (CONS-05).
+/// The receipt is not identity authority: the statement identity it carries
+/// is verified against the accepted event, and the summary enrichment digest
+/// is bound here, server-side, precisely so that narrative bytes stay out of
+/// derivation identity (CONS-05). The enrichment digest commits to the exact
+/// authored summary bytes under the existing `ostk-body-v1` body domain; see
+/// the module docs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsolidationReceiptV1 {
     pub schema_version: u32,
-    pub statement_digest: Sha256Digest,
+    pub statement_id: ConsolidationStatementIdV1,
     pub outcome: ConsolidationOutcomeV1,
     pub emitted_claim_fingerprint: SemanticClaimFingerprintV2,
     pub summary_enrichment_digest: Sha256Digest,
@@ -572,7 +646,7 @@ impl ConsolidationReceiptV1 {
     /// Validate canonical shape only; the receipt proves nothing by itself.
     pub fn validate_shape(&self) -> ContractResult<()> {
         if self.schema_version != CONSOLIDATION_SCHEMA_VERSION
-            || self.statement_digest == Sha256Digest::ZERO
+            || self.statement_id.digest() == Sha256Digest::ZERO
             || self.emitted_claim_fingerprint.digest() == Sha256Digest::ZERO
             || self.summary_enrichment_digest == Sha256Digest::ZERO
             || self.accepted_event_ids.is_empty()
@@ -606,8 +680,9 @@ fn validate_interval(interval: &ClaimEffectiveIntervalV2) -> ContractResult<()> 
 }
 
 /// The output interval is exactly the intersection of the source intervals:
-/// the latest start, and the earliest end unless any source is open-ended.
-/// An empty intersection fails closed (PRED-03).
+/// the latest start, and the earliest end among bounded sources; the result
+/// is open-ended only when every source is open-ended. An empty intersection
+/// fails closed (PRED-03).
 fn intersect_source_intervals(
     sources: &[ConsolidationSourceClaimV1],
 ) -> ContractResult<ClaimEffectiveIntervalV2> {
@@ -646,11 +721,14 @@ fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
         .all(|(left, right)| left < right)
 }
 
+/// Source claims are strictly ordered and unique by fingerprint alone: one
+/// claim at two revisions can never satisfy the two-source minimum, which
+/// would be self-consolidation (CONS-01/02/09).
 fn strictly_sorted_sources(sources: &[ConsolidationSourceClaimV1]) -> bool {
     strictly_sorted(
         &sources
             .iter()
-            .map(|source| (source.claim_fingerprint, source.claim_revision))
+            .map(|source| source.claim_fingerprint)
             .collect::<Vec<_>>(),
     )
 }
@@ -708,8 +786,132 @@ mod tests {
     const NEGATIVE_REQUEST_AUTHORITY_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/consolidation/negative-request-authority-fields.jsonl"
     );
+    const NEGATIVE_PROFILE_DIGEST_SPOOF_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/consolidation/negative-profile-digest-spoof.jsonl"
+    );
+    const NEGATIVE_DUPLICATE_SOURCE_CLAIM_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/consolidation/negative-duplicate-source-claim.jsonl"
+    );
+    const NEGATIVE_DISPUTED_REF_MISMATCH_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/consolidation/negative-disputed-ref-mismatch.jsonl"
+    );
+    const NEGATIVE_DISPUTED_REFS_UNSORTED_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/consolidation/negative-disputed-refs-unsorted.jsonl"
+    );
+    const NEGATIVE_MODALITY_NOT_POLICY_ADMITTED_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/consolidation/negative-modality-not-policy-admitted.jsonl"
+    );
+    const NEGATIVE_POLICY_DIGEST_MISMATCH_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/consolidation/negative-policy-digest-mismatch.jsonl"
+    );
     const VECTOR_SUITE_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/consolidation/vector-suite.jsonl");
+
+    // SHA-256 of the exact fixture file bytes, including the trailing LF.
+    // These pins make every fixture byte-for-byte immutable: any edit that is
+    // not reflected here, in the suite manifest, and in the digest-bearing
+    // fixtures fails the suite test.
+    const POLICY_RAW_SHA256: &str =
+        "2da697c8fadba3735f42ff6b0d0154afff9dfb2fc7e1f338d4c300c3af0e29c3";
+    const STATEMENT_RAW_SHA256: &str =
+        "dc9eff9ed0df8561e73d5735eea674b11f478b83806fe708edcd13fe90e78971";
+    const DISPUTED_STATEMENT_RAW_SHA256: &str =
+        "5e291f7790006a24c6e2feed7cd061fc74e0d5fda3535d907679f40c0dca5068";
+    const REQUEST_RAW_SHA256: &str =
+        "34d58029deab8d1d63699c9e407ed4df33fa43df0e5305a9c0b57d3a43c5820f";
+    const RECEIPT_RAW_SHA256: &str =
+        "77d6ca1e45c52ba5dc24ebd0f0e3ee485e0922b8b01ebe56c6acabf86840f5f7";
+    const NEGATIVE_SINGLE_SOURCE_RAW_SHA256: &str =
+        "c191dee52bc2a7af0c537097d463f68c00876cdece48ddf07a37b2327cc7691b";
+    const NEGATIVE_UNSORTED_SOURCES_RAW_SHA256: &str =
+        "8bd0ec489baf574890aa952fad9cd0391fde36562d4931a932f4beff719a6917";
+    const NEGATIVE_KIND_MIXING_RAW_SHA256: &str =
+        "817c73db6ad64ba98253e2922fd262567480a057c804266e49bd612f57a48fe3";
+    const NEGATIVE_MODALITY_PROMOTION_RAW_SHA256: &str =
+        "3d7c75550138d7a8aa4cd0b67cd575add718f9d0cdff9b50ab1ba3120f427e5c";
+    const NEGATIVE_NORMATIVE_OUTPUT_RAW_SHA256: &str =
+        "a2f9b11924fdad905b5095914c4671aa44d0ded9280603ff688cb586cbe8f280";
+    const NEGATIVE_DEPTH_EXCEEDED_RAW_SHA256: &str =
+        "ca9190d9d954ab0479dd4c4d0d443dfc2bf9e159b90958a835ee862a6972cea7";
+    const NEGATIVE_CONFLICT_LAUNDERING_RAW_SHA256: &str =
+        "80f25d58073f3f1aafd4138b20b8f878ad82a3891f2efb994d75fbfcf9db0012";
+    const NEGATIVE_DISPUTED_WITHOUT_REFS_RAW_SHA256: &str =
+        "01c7b223d18aebe4cc438f99cba603a145171ad93776db3d8d4457a61f67afdf";
+    const NEGATIVE_EMPTY_INTERVAL_RAW_SHA256: &str =
+        "7b23b2fe7a1a91fa27f7d35a6c5ed8c6c79fe3cf7bbd658b91cfadeaebccfbf0";
+    const NEGATIVE_REQUEST_AUTHORITY_RAW_SHA256: &str =
+        "68923c17059f163cdc0af30a9fe97da5af25ed55f6afcc6cdd606e6d3b44675a";
+    const NEGATIVE_PROFILE_DIGEST_SPOOF_RAW_SHA256: &str =
+        "fb43deb5f6bc85e419d1d7ada7872dd0fb0d45f81d37561684a041b924f7f697";
+    const NEGATIVE_DUPLICATE_SOURCE_CLAIM_RAW_SHA256: &str =
+        "84737fe473ce230f8ecef54bbb8139ba7b5e9e98eec430940ca170196b38b36e";
+    const NEGATIVE_DISPUTED_REF_MISMATCH_RAW_SHA256: &str =
+        "a18fea1caf6e81393e2687e941dd13ec44c78bd287e6179969d06abc84d7318d";
+    const NEGATIVE_DISPUTED_REFS_UNSORTED_RAW_SHA256: &str =
+        "9e82096d8ba0b226c61f692e30b7e7b43b9491b7ba674fa21da2e10aab8b8731";
+    const NEGATIVE_MODALITY_NOT_POLICY_ADMITTED_RAW_SHA256: &str =
+        "fd2d8820692ad41816949040c1d9dbc0bdea9765de173009ee4d3a2fc2be0d80";
+    const NEGATIVE_POLICY_DIGEST_MISMATCH_RAW_SHA256: &str =
+        "7138f4ace88e25750277b762b22630d7c56b4894441a8d85fcf3394c15e6b366";
+    const VECTOR_SUITE_RAW_SHA256: &str =
+        "b1a33cdb6c1e3c8543ebd077e0cce0abe536357f35cee7c84be337a67f427773";
+
+    /// Statement identity and summary enrichment prefixes, accepted by / filed
+    /// with the REG lane and landing as `DigestDomain` variants with W0-REG.
+    const CONSOLIDATION_STATEMENT_V1_DIGEST_PREFIX: &str = "ostk-consolidation-statement-v1";
+    const CONSOLIDATION_SUMMARY_ENRICHMENT_V1_DIGEST_PREFIX: &str =
+        "ostk-consolidation-summary-enrichment-v1";
+
+    /// Statement identity minted over the canonical statement bytes under the
+    /// accepted W0-REG `ostk-consolidation-statement-v1` domain prefix. The
+    /// recompute lands with the W0-REG merge; until then the value is pinned
+    /// here and threaded through the receipt fixture.
+    const STATEMENT_IDENTITY_V1: &str = "42cecb6a5bc67d24f8984121951327548ab3d48327d9ba0bbca2245f81b0dc6b; ostk-consolidation-statement-v1 over the canonical statement bytes";
+
+    /// Typed decode of `vector-suite.jsonl`; `deny_unknown_fields` makes the
+    /// manifest itself part of the pinned surface.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ConsolidationVectorSuiteV1 {
+        schema_version: u32,
+        digest_convention: String,
+        fixture_authority: String,
+        statement_identity: String,
+        policy_digest: String,
+        statement_digest: String,
+        disputed_statement_digest: String,
+        request_digest: String,
+        receipt_digest: String,
+        negative_case_digests: NegativeCaseDigestsV1,
+        negative_cases: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NegativeCaseDigestsV1 {
+        conflict_laundering: String,
+        depth_exceeded: String,
+        disputed_ref_mismatch: String,
+        disputed_refs_unsorted: String,
+        disputed_without_refs: String,
+        duplicate_source_claim: String,
+        empty_interval: String,
+        kind_mixing: String,
+        modality_not_policy_admitted: String,
+        modality_promotion: String,
+        normative_output: String,
+        policy_digest_mismatch: String,
+        profile_digest_spoof: String,
+        request_authority_fields: String,
+        single_source: String,
+        unsorted_sources: String,
+    }
+
+    fn raw_sha256(bytes: &[u8]) -> String {
+        let mut hash = Sha256::new();
+        hash.update(bytes);
+        Sha256Digest::from_bytes(hash.finalize().into()).to_hex()
+    }
 
     fn fixture_bytes(fixture: &[u8]) -> &[u8] {
         fixture
@@ -794,6 +996,18 @@ mod tests {
         }
     }
 
+    /// Bind a helper-built statement to the exact policy body the test will
+    /// validate against, mirroring the real policy digest commitment.
+    fn bind_policy_digest(
+        statement: &mut ConsolidationStatementV1,
+        policy: &ConsolidationPolicyV1,
+    ) {
+        statement.policy_digest = consolidation_domain_digest(
+            CONSOLIDATION_POLICY_V1_DIGEST_PREFIX,
+            &encode_canonical(policy).expect("encode policy"),
+        );
+    }
+
     fn scope() -> AuthenticatedProjectScopeV1 {
         AuthenticatedProjectScopeV1::from_trusted_context(
             ContractId::new("tenant.fixture").expect("valid tenant"),
@@ -851,11 +1065,11 @@ mod tests {
 
     #[test]
     fn valid_statement_passes_shape_and_derivation() {
-        let statement = valid_statement();
+        let mut statement = valid_statement();
         statement.validate_shape().expect("shape");
-        statement
-            .validate_derivation(&policy(ConsolidationConflictBehaviorV1::FailClosed))
-            .expect("derivation");
+        let policy = policy(ConsolidationConflictBehaviorV1::FailClosed);
+        bind_policy_digest(&mut statement, &policy);
+        statement.validate_derivation(&policy).expect("derivation");
         let bytes = statement.canonical_bytes().expect("canonical bytes");
         let decoded: ConsolidationStatementV1 = decode_strict(&bytes).expect("round trip");
         assert_eq!(decoded, statement);
@@ -878,38 +1092,34 @@ mod tests {
 
     #[test]
     fn output_kind_must_match_the_uniform_source_kind() {
+        let policy = policy(ConsolidationConflictBehaviorV1::FailClosed);
+
         let mut statement = valid_statement();
         statement.sources[1].assertion_kind = RememberAssertionKindV2::Decision;
-        assert!(
-            statement
-                .validate_derivation(&policy(ConsolidationConflictBehaviorV1::FailClosed))
-                .is_err()
-        );
+        bind_policy_digest(&mut statement, &policy);
+        assert!(statement.validate_derivation(&policy).is_err());
 
         let mut statement = valid_statement();
         statement.output_kind = RememberAssertionKindV2::Decision;
-        assert!(
-            statement
-                .validate_derivation(&policy(ConsolidationConflictBehaviorV1::FailClosed))
-                .is_err()
-        );
+        bind_policy_digest(&mut statement, &policy);
+        assert!(statement.validate_derivation(&policy).is_err());
     }
 
     #[test]
     fn output_modality_never_exceeds_the_weakest_source() {
+        let policy = policy(ConsolidationConflictBehaviorV1::FailClosed);
+
         let mut statement = valid_statement();
         statement.sources[1].modality = PropositionModalityV1::Attested;
-        assert!(
-            statement
-                .validate_derivation(&policy(ConsolidationConflictBehaviorV1::FailClosed))
-                .is_err()
-        );
+        bind_policy_digest(&mut statement, &policy);
+        assert!(statement.validate_derivation(&policy).is_err());
 
         let mut demoted = valid_statement();
         demoted.sources[1].modality = PropositionModalityV1::Attested;
         demoted.output_modality = PropositionModalityV1::Attested;
+        bind_policy_digest(&mut demoted, &policy);
         demoted
-            .validate_derivation(&policy(ConsolidationConflictBehaviorV1::FailClosed))
+            .validate_derivation(&policy)
             .expect("weakened output is admitted");
     }
 
@@ -924,33 +1134,28 @@ mod tests {
 
     #[test]
     fn derivation_depth_is_bounded_and_exact() {
+        let policy = policy(ConsolidationConflictBehaviorV1::FailClosed);
+
         let mut statement = valid_statement();
         statement.output_depth = 1;
-        assert!(
-            statement
-                .validate_derivation(&policy(ConsolidationConflictBehaviorV1::FailClosed))
-                .is_err()
-        );
+        bind_policy_digest(&mut statement, &policy);
+        assert!(statement.validate_derivation(&policy).is_err());
 
         let mut statement = valid_statement();
         statement.sources[1].consolidation_depth = 4;
         statement.output_depth = 5;
-        assert!(
-            statement
-                .validate_derivation(&policy(ConsolidationConflictBehaviorV1::FailClosed))
-                .is_err()
-        );
+        bind_policy_digest(&mut statement, &policy);
+        assert!(statement.validate_derivation(&policy).is_err());
     }
 
     #[test]
     fn interval_is_the_exact_intersection_and_empty_fails_closed() {
+        let policy = policy(ConsolidationConflictBehaviorV1::FailClosed);
+
         let mut statement = valid_statement();
         statement.effective_interval = interval("2026-08-05T00:00:00.000000000Z", None);
-        assert!(
-            statement
-                .validate_derivation(&policy(ConsolidationConflictBehaviorV1::FailClosed))
-                .is_err()
-        );
+        bind_policy_digest(&mut statement, &policy);
+        assert!(statement.validate_derivation(&policy).is_err());
 
         let mut statement = valid_statement();
         statement.sources[0].effective_interval = interval(
@@ -965,11 +1170,8 @@ mod tests {
             "2026-08-20T00:00:00.000000000Z",
             Some("2026-08-21T00:00:00.000000000Z"),
         );
-        assert!(
-            statement
-                .validate_derivation(&policy(ConsolidationConflictBehaviorV1::FailClosed))
-                .is_err()
-        );
+        bind_policy_digest(&mut statement, &policy);
+        assert!(statement.validate_derivation(&policy).is_err());
     }
 
     #[test]
@@ -988,7 +1190,7 @@ mod tests {
             )
         };
 
-        let laundering = statement(
+        let mut laundering = statement(
             vec![
                 clear_source(0x11, 0, interval("2026-08-01T00:00:00.000000000Z", None)),
                 conflicted(),
@@ -998,18 +1200,14 @@ mod tests {
             interval("2026-08-05T00:00:00.000000000Z", None),
             ConsolidationOutputDispositionV1::DerivedActive,
         );
-        assert!(
-            laundering
-                .validate_derivation(&policy(ConsolidationConflictBehaviorV1::FailClosed))
-                .is_err()
-        );
-        assert!(
-            laundering
-                .validate_derivation(&policy(ConsolidationConflictBehaviorV1::DeriveDisputed))
-                .is_err()
-        );
+        let fail_closed = policy(ConsolidationConflictBehaviorV1::FailClosed);
+        bind_policy_digest(&mut laundering, &fail_closed);
+        assert!(laundering.validate_derivation(&fail_closed).is_err());
+        let derive_disputed = policy(ConsolidationConflictBehaviorV1::DeriveDisputed);
+        bind_policy_digest(&mut laundering, &derive_disputed);
+        assert!(laundering.validate_derivation(&derive_disputed).is_err());
 
-        let disputed = statement(
+        let mut disputed = statement(
             vec![
                 clear_source(0x11, 0, interval("2026-08-01T00:00:00.000000000Z", None)),
                 conflicted(),
@@ -1021,8 +1219,9 @@ mod tests {
                 conflict_fingerprints: vec![digest(0xcc)],
             },
         );
+        bind_policy_digest(&mut disputed, &derive_disputed);
         disputed
-            .validate_derivation(&policy(ConsolidationConflictBehaviorV1::DeriveDisputed))
+            .validate_derivation(&derive_disputed)
             .expect("disputed output preserves the waived conflict");
     }
 
@@ -1089,7 +1288,7 @@ mod tests {
 
     #[test]
     fn negative_fixtures_fail_closed() {
-        let negative_statements: [(&[u8], &str); 9] = [
+        let negative_statements: [(&[u8], &str); 15] = [
             (NEGATIVE_SINGLE_SOURCE_FIXTURE, "single source"),
             (NEGATIVE_UNSORTED_SOURCES_FIXTURE, "unsorted sources"),
             (NEGATIVE_KIND_MIXING_FIXTURE, "kind mixing"),
@@ -1102,6 +1301,30 @@ mod tests {
             ),
             (NEGATIVE_EMPTY_INTERVAL_FIXTURE, "empty interval"),
             (NEGATIVE_NORMATIVE_OUTPUT_FIXTURE, "normative output"),
+            (
+                NEGATIVE_PROFILE_DIGEST_SPOOF_FIXTURE,
+                "profile digest spoof",
+            ),
+            (
+                NEGATIVE_DUPLICATE_SOURCE_CLAIM_FIXTURE,
+                "duplicate source claim",
+            ),
+            (
+                NEGATIVE_DISPUTED_REF_MISMATCH_FIXTURE,
+                "disputed ref mismatch",
+            ),
+            (
+                NEGATIVE_DISPUTED_REFS_UNSORTED_FIXTURE,
+                "disputed refs unsorted",
+            ),
+            (
+                NEGATIVE_MODALITY_NOT_POLICY_ADMITTED_FIXTURE,
+                "modality not policy-admitted",
+            ),
+            (
+                NEGATIVE_POLICY_DIGEST_MISMATCH_FIXTURE,
+                "policy digest mismatch",
+            ),
         ];
         let policy_bytes = fixture_bytes(POLICY_FIXTURE);
         let policy: ConsolidationPolicyV1 = decode_strict(policy_bytes).expect("decode policy");
@@ -1135,5 +1358,312 @@ mod tests {
     fn vector_suite_manifest_is_canonical() {
         require_canonical(fixture_bytes(VECTOR_SUITE_FIXTURE))
             .expect("vector suite manifest is canonical");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // one pin table freezes every fixture byte hash
+    fn vector_suite_manifest_pins_every_fixture_digest() {
+        let suite: ConsolidationVectorSuiteV1 =
+            serde_json::from_slice(fixture_bytes(VECTOR_SUITE_FIXTURE))
+                .expect("typed suite decode");
+        assert_eq!(suite.schema_version, 1);
+        assert_eq!(
+            suite.digest_convention,
+            "sha256 of the exact fixture file bytes including the trailing LF"
+        );
+        assert_eq!(
+            suite.fixture_authority,
+            "none; structural fixtures are assertions, not active-policy or derivation witnesses"
+        );
+        assert_eq!(suite.statement_identity, STATEMENT_IDENTITY_V1);
+
+        let positives: [(&str, &[u8], &str, &str); 5] = [
+            (
+                "consolidation-policy-v1.jsonl",
+                POLICY_FIXTURE,
+                POLICY_RAW_SHA256,
+                suite.policy_digest.as_str(),
+            ),
+            (
+                "consolidation-statement-v1.jsonl",
+                STATEMENT_FIXTURE,
+                STATEMENT_RAW_SHA256,
+                suite.statement_digest.as_str(),
+            ),
+            (
+                "consolidation-disputed-statement-v1.jsonl",
+                DISPUTED_STATEMENT_FIXTURE,
+                DISPUTED_STATEMENT_RAW_SHA256,
+                suite.disputed_statement_digest.as_str(),
+            ),
+            (
+                "consolidation-request-v1.jsonl",
+                REQUEST_FIXTURE,
+                REQUEST_RAW_SHA256,
+                suite.request_digest.as_str(),
+            ),
+            (
+                "consolidation-receipt-v1.jsonl",
+                RECEIPT_FIXTURE,
+                RECEIPT_RAW_SHA256,
+                suite.receipt_digest.as_str(),
+            ),
+        ];
+        let negatives: [(&str, &[u8], &str, &str); 16] = [
+            (
+                "negative-conflict-laundering.jsonl",
+                NEGATIVE_CONFLICT_LAUNDERING_FIXTURE,
+                NEGATIVE_CONFLICT_LAUNDERING_RAW_SHA256,
+                suite.negative_case_digests.conflict_laundering.as_str(),
+            ),
+            (
+                "negative-depth-exceeded.jsonl",
+                NEGATIVE_DEPTH_EXCEEDED_FIXTURE,
+                NEGATIVE_DEPTH_EXCEEDED_RAW_SHA256,
+                suite.negative_case_digests.depth_exceeded.as_str(),
+            ),
+            (
+                "negative-disputed-ref-mismatch.jsonl",
+                NEGATIVE_DISPUTED_REF_MISMATCH_FIXTURE,
+                NEGATIVE_DISPUTED_REF_MISMATCH_RAW_SHA256,
+                suite.negative_case_digests.disputed_ref_mismatch.as_str(),
+            ),
+            (
+                "negative-disputed-refs-unsorted.jsonl",
+                NEGATIVE_DISPUTED_REFS_UNSORTED_FIXTURE,
+                NEGATIVE_DISPUTED_REFS_UNSORTED_RAW_SHA256,
+                suite.negative_case_digests.disputed_refs_unsorted.as_str(),
+            ),
+            (
+                "negative-disputed-without-refs.jsonl",
+                NEGATIVE_DISPUTED_WITHOUT_REFS_FIXTURE,
+                NEGATIVE_DISPUTED_WITHOUT_REFS_RAW_SHA256,
+                suite.negative_case_digests.disputed_without_refs.as_str(),
+            ),
+            (
+                "negative-duplicate-source-claim.jsonl",
+                NEGATIVE_DUPLICATE_SOURCE_CLAIM_FIXTURE,
+                NEGATIVE_DUPLICATE_SOURCE_CLAIM_RAW_SHA256,
+                suite.negative_case_digests.duplicate_source_claim.as_str(),
+            ),
+            (
+                "negative-empty-interval.jsonl",
+                NEGATIVE_EMPTY_INTERVAL_FIXTURE,
+                NEGATIVE_EMPTY_INTERVAL_RAW_SHA256,
+                suite.negative_case_digests.empty_interval.as_str(),
+            ),
+            (
+                "negative-kind-mixing.jsonl",
+                NEGATIVE_KIND_MIXING_FIXTURE,
+                NEGATIVE_KIND_MIXING_RAW_SHA256,
+                suite.negative_case_digests.kind_mixing.as_str(),
+            ),
+            (
+                "negative-modality-not-policy-admitted.jsonl",
+                NEGATIVE_MODALITY_NOT_POLICY_ADMITTED_FIXTURE,
+                NEGATIVE_MODALITY_NOT_POLICY_ADMITTED_RAW_SHA256,
+                suite
+                    .negative_case_digests
+                    .modality_not_policy_admitted
+                    .as_str(),
+            ),
+            (
+                "negative-modality-promotion.jsonl",
+                NEGATIVE_MODALITY_PROMOTION_FIXTURE,
+                NEGATIVE_MODALITY_PROMOTION_RAW_SHA256,
+                suite.negative_case_digests.modality_promotion.as_str(),
+            ),
+            (
+                "negative-normative-output.jsonl",
+                NEGATIVE_NORMATIVE_OUTPUT_FIXTURE,
+                NEGATIVE_NORMATIVE_OUTPUT_RAW_SHA256,
+                suite.negative_case_digests.normative_output.as_str(),
+            ),
+            (
+                "negative-policy-digest-mismatch.jsonl",
+                NEGATIVE_POLICY_DIGEST_MISMATCH_FIXTURE,
+                NEGATIVE_POLICY_DIGEST_MISMATCH_RAW_SHA256,
+                suite.negative_case_digests.policy_digest_mismatch.as_str(),
+            ),
+            (
+                "negative-profile-digest-spoof.jsonl",
+                NEGATIVE_PROFILE_DIGEST_SPOOF_FIXTURE,
+                NEGATIVE_PROFILE_DIGEST_SPOOF_RAW_SHA256,
+                suite.negative_case_digests.profile_digest_spoof.as_str(),
+            ),
+            (
+                "negative-request-authority-fields.jsonl",
+                NEGATIVE_REQUEST_AUTHORITY_FIXTURE,
+                NEGATIVE_REQUEST_AUTHORITY_RAW_SHA256,
+                suite
+                    .negative_case_digests
+                    .request_authority_fields
+                    .as_str(),
+            ),
+            (
+                "negative-single-source.jsonl",
+                NEGATIVE_SINGLE_SOURCE_FIXTURE,
+                NEGATIVE_SINGLE_SOURCE_RAW_SHA256,
+                suite.negative_case_digests.single_source.as_str(),
+            ),
+            (
+                "negative-unsorted-sources.jsonl",
+                NEGATIVE_UNSORTED_SOURCES_FIXTURE,
+                NEGATIVE_UNSORTED_SOURCES_RAW_SHA256,
+                suite.negative_case_digests.unsorted_sources.as_str(),
+            ),
+        ];
+        for (name, bytes, pinned, manifest) in positives.into_iter().chain(negatives) {
+            let recomputed = raw_sha256(bytes);
+            assert_eq!(
+                recomputed, pinned,
+                "{name}: rust pin drifted from the fixture bytes"
+            );
+            assert_eq!(
+                recomputed, manifest,
+                "{name}: suite manifest digest drifted from the fixture bytes"
+            );
+        }
+        assert_eq!(
+            raw_sha256(VECTOR_SUITE_FIXTURE),
+            VECTOR_SUITE_RAW_SHA256,
+            "suite manifest self-pin drifted"
+        );
+        assert_eq!(
+            suite.negative_cases,
+            [
+                "conflict_laundering",
+                "depth_exceeded",
+                "disputed_ref_mismatch",
+                "disputed_refs_unsorted",
+                "disputed_without_refs",
+                "duplicate_source_claim",
+                "empty_interval",
+                "kind_mixing",
+                "modality_not_policy_admitted",
+                "modality_promotion",
+                "normative_output",
+                "policy_digest_mismatch",
+                "profile_digest_spoof",
+                "request_authority_fields",
+                "single_source",
+                "unsorted_sources",
+            ]
+            .map(String::from),
+            "negative case list must stay sorted and complete"
+        );
+    }
+
+    #[test]
+    fn positive_fixtures_reencode_to_their_exact_bytes() {
+        let policy: ConsolidationPolicyV1 =
+            decode_strict(fixture_bytes(POLICY_FIXTURE)).expect("decode policy");
+        assert_eq!(
+            encode_canonical(&policy).expect("encode policy"),
+            fixture_bytes(POLICY_FIXTURE)
+        );
+        let statement: ConsolidationStatementV1 =
+            decode_strict(fixture_bytes(STATEMENT_FIXTURE)).expect("decode statement");
+        assert_eq!(
+            encode_canonical(&statement).expect("encode statement"),
+            fixture_bytes(STATEMENT_FIXTURE)
+        );
+        let disputed: ConsolidationStatementV1 =
+            decode_strict(fixture_bytes(DISPUTED_STATEMENT_FIXTURE)).expect("decode disputed");
+        assert_eq!(
+            encode_canonical(&disputed).expect("encode disputed"),
+            fixture_bytes(DISPUTED_STATEMENT_FIXTURE)
+        );
+        let request: ConsolidationRequestV1 =
+            decode_strict(fixture_bytes(REQUEST_FIXTURE)).expect("decode request");
+        assert_eq!(
+            encode_canonical(&request).expect("encode request"),
+            fixture_bytes(REQUEST_FIXTURE)
+        );
+        let receipt: ConsolidationReceiptV1 =
+            decode_strict(fixture_bytes(RECEIPT_FIXTURE)).expect("decode receipt");
+        assert_eq!(
+            encode_canonical(&receipt).expect("encode receipt"),
+            fixture_bytes(RECEIPT_FIXTURE)
+        );
+
+        // The receipt names the statement identity minted over the canonical
+        // statement bytes under the accepted W0-REG domain prefix; the value
+        // recomputes locally with byte-identical framing.
+        let expected_identity: Sha256Digest =
+            "42cecb6a5bc67d24f8984121951327548ab3d48327d9ba0bbca2245f81b0dc6b"
+                .parse()
+                .expect("statement identity hex");
+        assert_eq!(receipt.statement_id.digest(), expected_identity);
+        let recomputed_identity = consolidation_domain_digest(
+            CONSOLIDATION_STATEMENT_V1_DIGEST_PREFIX,
+            &encode_canonical(&statement).expect("encode statement"),
+        );
+        assert_eq!(recomputed_identity, expected_identity);
+
+        // The receipt's summary enrichment digest commits to the exact
+        // authored summary bytes carried by the request fixture under the
+        // dedicated summary-enrichment prefix.
+        let recomputed_summary = consolidation_domain_digest(
+            CONSOLIDATION_SUMMARY_ENRICHMENT_V1_DIGEST_PREFIX,
+            request.summary_text.as_str().as_bytes(),
+        );
+        assert_eq!(receipt.summary_enrichment_digest, recomputed_summary);
+    }
+
+    #[test]
+    fn new_negative_fixtures_fail_at_the_documented_stage() {
+        let policy: ConsolidationPolicyV1 =
+            decode_strict(fixture_bytes(POLICY_FIXTURE)).expect("decode policy");
+
+        let shape_failures: [(&[u8], &str); 3] = [
+            (
+                NEGATIVE_PROFILE_DIGEST_SPOOF_FIXTURE,
+                "profile digest spoof",
+            ),
+            (
+                NEGATIVE_DUPLICATE_SOURCE_CLAIM_FIXTURE,
+                "duplicate source claim",
+            ),
+            (
+                NEGATIVE_DISPUTED_REFS_UNSORTED_FIXTURE,
+                "disputed refs unsorted",
+            ),
+        ];
+        for (fixture, case) in shape_failures {
+            let decoded: ConsolidationStatementV1 =
+                decode_strict(fixture_bytes(fixture)).expect("decode negative statement");
+            assert!(
+                decoded.validate_shape().is_err(),
+                "{case} must fail at the shape stage"
+            );
+        }
+
+        let derivation_failures: [(&[u8], &str); 3] = [
+            (
+                NEGATIVE_DISPUTED_REF_MISMATCH_FIXTURE,
+                "disputed ref mismatch",
+            ),
+            (
+                NEGATIVE_MODALITY_NOT_POLICY_ADMITTED_FIXTURE,
+                "modality not policy-admitted",
+            ),
+            (
+                NEGATIVE_POLICY_DIGEST_MISMATCH_FIXTURE,
+                "policy digest mismatch",
+            ),
+        ];
+        for (fixture, case) in derivation_failures {
+            let decoded: ConsolidationStatementV1 =
+                decode_strict(fixture_bytes(fixture)).expect("decode negative statement");
+            assert!(
+                decoded.validate_shape().is_ok(),
+                "{case} must pass the shape stage so the derivation rule is what falsifies it"
+            );
+            assert!(
+                decoded.validate_derivation(&policy).is_err(),
+                "{case} must fail at the derivation stage"
+            );
+        }
     }
 }
