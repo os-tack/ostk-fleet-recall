@@ -177,8 +177,8 @@ line_count=$(wc -l < "$input" | tr -d '[:space:]')
 case $line_count in
     ''|*[!0-9]*) fail "line count is not numeric" ;;
 esac
-if [ "$line_count" -ne 3981 ]; then
-    fail "record count must be exactly 3981 (found $line_count)"
+if [ "$line_count" -ne 4181 ]; then
+    fail "record count must be exactly 4181 (found $line_count)"
 fi
 
 if awk 'length($0) > 16384 { exit 1 }' "$input"; then
@@ -368,9 +368,9 @@ if ! jq -s -e \
     | ($expected_doc_sources | length) == 32
     and ($expected_repository_sources | length) == 233
     and
-    ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 791
+    ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 800
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 2984
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 3175
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:docs:v1") | .source_id] | unique | sort)
         == $expected_doc_sources
@@ -402,12 +402,20 @@ if ! jq -s -e \
         )] | length) == 27
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "deploy/cockroach/publication-reader-role-grants.sql"
+        )] | length) == 30
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
             and .source_id == "deploy/cockroach/successor-activation-role-grants.sql"
         )] | length) == 23
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "deploy/cockroach/tests/conflict-reconciliation-role-grants.sh"
         )] | length) == 95
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "deploy/cockroach/tests/publication-reader-role-grants.sh"
+        )] | length) == 130
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "deploy/cockroach/tests/successor-activation-role-grants.sh"
@@ -427,7 +435,11 @@ if ! jq -s -e \
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "src/private_postgres.rs"
-        )] | length) == 10
+        )] | length) == 15
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "tests/publication_reader_live.rs"
+        )] | length) == 16
     and ([.[] | select(.source_id == "src/config.rs")] | length) == 0
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1") | .source_id] | unique | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1") | .source_id] | sort)
@@ -720,7 +732,12 @@ sensitive_projection() {
                 ("postgresql://" + "writer:secret@" + "db.example:26257/fleet_recall?sslmode=verify-full&options=-csearch_path%3Dattacker"),
                 ("postgresql://" + "writer:secret@" + "db.example/fleet_recall?sslmode=verify-full"),
                 ("postgresql://" + "writer:secret@" + "db.example:0/fleet_recall?sslmode=verify-full"),
-                ("postgresql://" + "writer:secret@" + "db.example:26257/?sslmode=verify-full")
+                ("postgresql://" + "writer:secret@" + "db.example:26257/?sslmode=verify-full"),
+                ("postgresql://" + "fleet_publication:secret@" + "db.example:26257/fleet_recall?sslmode=verify-full"),
+                ("postgresql://" + "%66leet_publication:secret@" + "db.example:26257/fleet_recall?sslmode=verify-full"),
+                ("postgresql://" + "fleet_publication:do-not-print@" + "db.example:26257/other?sslmode=verify-full"),
+                ("postgresql://" + "writer_identity_42:wrong-user-secret-42@" + "db.example:26257/fleet_recall?sslmode=verify-full"),
+                ("postgresql://" + "%66leet_writer_43:encoded-wrong-secret-43@" + "db.example:26257/fleet_recall?sslmode=verify-full")
             ] as $fixtures
             | reduce $fixtures[] as $fixture (
                 .;

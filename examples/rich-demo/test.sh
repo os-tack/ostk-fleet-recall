@@ -107,6 +107,17 @@ git -C "$repo_root" ls-files |
             deploy/cockroach/tests/control-bootstrap-cli.sh) continue ;;
             deploy/cockroach/tests/registry-activation-cli.sh) continue ;;
             deploy/cockroach/tests/successor-activation-cli.sh) continue ;;
+            # LocalStack boundary fixtures contain deliberate local-only
+            # passwords or credential-shaped database URLs. Keep the exact
+            # harness files private; publication policy and connected proof
+            # source remain admitted below through the complete manifest.
+            deploy/localstack/app-entrypoint.sh) continue ;;
+            deploy/localstack/database-bootstrap.sh) continue ;;
+            deploy/localstack/database-boundary.sh) continue ;;
+            deploy/localstack/init/ready.d/10-seed-aws.sh) continue ;;
+            deploy/localstack/publication-entrypoint.sh) continue ;;
+            deploy/localstack/secret-to-file.sh) continue ;;
+            deploy/localstack/smoke.sh) continue ;;
             # Runtime configuration contains deliberate credential-shaped
             # negative fixtures. The connection-policy module is admitted via
             # the verifier's exact closed fixture projection instead.
@@ -128,10 +139,10 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 3981
-    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 791
+    length == 4181
+    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 800
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 2984
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 3175
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "src/bin/ostk-control-bootstrap.rs")] | length) == 11
@@ -146,9 +157,13 @@ if ! jq -s -e '
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "deploy/cockroach/conflict-reconciliation-role-grants.sql")] | length) == 27
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "deploy/cockroach/publication-reader-role-grants.sql")] | length) == 30
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "deploy/cockroach/successor-activation-role-grants.sql")] | length) == 23
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "deploy/cockroach/tests/conflict-reconciliation-role-grants.sh")] | length) == 95
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "deploy/cockroach/tests/publication-reader-role-grants.sh")] | length) == 130
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "deploy/cockroach/tests/successor-activation-role-grants.sh")] | length) == 77
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
@@ -158,7 +173,9 @@ if ! jq -s -e '
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "migrations/0017_conflict_detector_projection_index.sql")] | length) == 3
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "src/private_postgres.rs")] | length) == 10
+        and .source_id == "src/private_postgres.rs")] | length) == 15
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
+        and .source_id == "tests/publication_reader_live.rs")] | length) == 16
     and ([.[] | select(.source_id == "src/config.rs")] | length) == 0
 ' "$first" >/dev/null; then
     printf 'rich demo verification failed: exact repository corpus composition changed\n' >&2

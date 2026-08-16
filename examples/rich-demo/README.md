@@ -40,8 +40,8 @@ Run the deterministic reproduction test with:
 ./examples/rich-demo/test.sh
 ```
 
-The verifier requires exactly 3,981 unique chunks: 791 documentation chunks
-from 32 sources, 2,984 repository chunks from 233 source/configuration files,
+The verifier requires exactly 4,181 unique chunks: 800 documentation chunks
+from 32 sources, 3,175 repository chunks from 233 source/configuration files,
 the two exact self-audit code excerpts, and 204 operations records across twelve
 weeks. It also requires the expected decision and correction mix, zero-based
 per-source chunk indexes, bounded physical lines and text, only the public
@@ -55,8 +55,9 @@ The publication boundary excludes binary media, dependency and Terraform lock
 files, generated example corpora, evidence receipts, license/vendor text,
 ignored or private files, and a small explicit set of public test fixtures whose
 dummy URLs or AWS account IDs intentionally resemble credentials. Connected
-CockroachDB CLI proof wrappers remain outside the publication boundary because
-they construct password-bearing TLS URLs. The admitted `src/private_postgres.rs`
+CockroachDB CLI proof wrappers and credential-bearing LocalStack fixtures
+remain outside the publication boundary because they construct or contain
+password-bearing database URLs. The admitted `src/private_postgres.rs`
 connection-policy source plus the private successor-activation and
 conflict-reconciliation CLIs are the narrow exceptions: their closed sets of
 inert credential-shaped URL fixtures are removed only from the final
