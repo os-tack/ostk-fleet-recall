@@ -43,20 +43,20 @@ const ACTIVATION_CONSISTENCY_FAMILY: &str = "registry.activation";
 const ACTIVE_HEAD_STATE: &str = "active";
 const REQUIRE_ACTIVATION_SCHEMA_SQL: &str = "SELECT count(*) = 9 \
      AND COALESCE(bool_and(success), false) \
-     FROM _sqlx_migrations WHERE version BETWEEN 1 AND 9";
+     FROM public._sqlx_migrations WHERE version BETWEEN 1 AND 9";
 const SELECT_REGISTRY_STREAM_PREFIX_SQL: &str = "SELECT event_id, shard, committed_offset \
-     FROM memory_control_events \
+     FROM public.memory_control_events \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
        AND consistency_family = $4 AND consistency_key_digest = $5 \
      ORDER BY shard, committed_offset LIMIT 2";
 const SELECT_REGISTRY_STREAM_TIP_SQL: &str = "SELECT event_id, shard, committed_offset \
-     FROM memory_control_events \
+     FROM public.memory_control_events \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
        AND consistency_family = $4 AND consistency_key_digest = $5 \
      ORDER BY shard DESC, committed_offset DESC LIMIT 2";
-const SELECT_ACTIVATION_IDS_SQL: &str = "SELECT activation_id FROM memory_registry_activations \
+const SELECT_ACTIVATION_IDS_SQL: &str = "SELECT activation_id FROM public.memory_registry_activations \
      WHERE tenant_id = $1 AND project = $2 ORDER BY activation_id LIMIT 2";
-const SELECT_EVENT_AHEAD_OF_HEAD_SQL: &str = "SELECT event_id FROM memory_control_events \
+const SELECT_EVENT_AHEAD_OF_HEAD_SQL: &str = "SELECT event_id FROM public.memory_control_events \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 \
        AND committed_offset > $5 ORDER BY committed_offset LIMIT 1";
 
@@ -70,7 +70,7 @@ const SELECT_STATEMENT_SQL: &str = "SELECT activation_id, statement_id, \
      effective_until, accepted_at, accepted_event_id, control_epoch_id, control_shard, \
      control_committed_offset, canonical_statement, canonical_approval_set, \
      canonical_test_result, canonical_receipt, canonical_event \
-     FROM memory_registry_activations \
+     FROM public.memory_registry_activations \
      WHERE tenant_id = $1 AND project = $2 AND statement_id = $3";
 
 const SELECT_ACTIVATION_ID_SQL: &str = "SELECT activation_id, statement_id, \
@@ -83,21 +83,21 @@ const SELECT_ACTIVATION_ID_SQL: &str = "SELECT activation_id, statement_id, \
      effective_until, accepted_at, accepted_event_id, control_epoch_id, control_shard, \
      control_committed_offset, canonical_statement, canonical_approval_set, \
      canonical_test_result, canonical_receipt, canonical_event \
-     FROM memory_registry_activations \
+     FROM public.memory_registry_activations \
      WHERE tenant_id = $1 AND project = $2 AND activation_id = $3";
 
 const LOCK_CONTROL_HEAD_SQL: &str = "SELECT shard_count, last_committed_offset, chain_digest, advanced_at \
-     FROM memory_control_shard_heads \
+     FROM public.memory_control_shard_heads \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 FOR UPDATE";
 
-const INSERT_CONTROL_EVENT_SQL: &str = "INSERT INTO memory_control_events (\
+const INSERT_CONTROL_EVENT_SQL: &str = "INSERT INTO public.memory_control_events (\
      tenant_id, project, epoch_id, shard, committed_offset, event_id, event_schema_version, \
      event_kind, semantic_object_digest, consistency_family, consistency_key_digest, \
      canonical_event, previous_chain_digest, chain_digest, accepted_at\
      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
      ON CONFLICT DO NOTHING RETURNING event_id";
 
-const INSERT_ACTIVATION_SQL: &str = "INSERT INTO memory_registry_activations (\
+const INSERT_ACTIVATION_SQL: &str = "INSERT INTO public.memory_registry_activations (\
      tenant_id, project, activation_id, statement_id, bootstrap_statement_id, \
      bootstrap_receipt_digest, bootstrap_event_id, genesis_epoch_id, genesis_package_digest, \
      bootstrap_signer_policy_digest, profile_id, profile_digest, vector_manifest_digest, \
@@ -114,14 +114,14 @@ const INSERT_ACTIVATION_SQL: &str = "INSERT INTO memory_registry_activations (\
      $31, $32, $33, $34, $35\
      ) ON CONFLICT DO NOTHING RETURNING activation_id";
 
-const INSERT_REGISTRY_HEAD_SQL: &str = "INSERT INTO memory_registry_heads (\
+const INSERT_REGISTRY_HEAD_SQL: &str = "INSERT INTO public.memory_registry_heads (\
      tenant_id, project, head_state, activation_id, package_digest, activation_policy_digest, \
      source_event_id, source_epoch_id, source_shard, source_committed_offset, activated_at, \
      canonical_head\
      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
      ON CONFLICT DO NOTHING RETURNING activation_id";
 
-const ADVANCE_CONTROL_HEAD_SQL: &str = "UPDATE memory_control_shard_heads \
+const ADVANCE_CONTROL_HEAD_SQL: &str = "UPDATE public.memory_control_shard_heads \
      SET last_committed_offset = $5, chain_digest = $6, advanced_at = $7 \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 \
        AND last_committed_offset = $8 AND chain_digest = $9 \
@@ -431,9 +431,10 @@ async fn activate_in_transaction(
     }
 
     require_pinned_inactive_tail(transaction, scope, &witness, &locked).await?;
-    let accepted_at_database: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
-        .fetch_one(&mut **transaction)
-        .await?;
+    let accepted_at_database: DateTime<Utc> =
+        sqlx::query_scalar("SELECT pg_catalog.statement_timestamp()")
+            .fetch_one(&mut **transaction)
+            .await?;
     if accepted_at_database < locked.advanced_at {
         return Err(corrupt(
             "registry activation acceptance time precedes the locked control tail",
@@ -530,9 +531,9 @@ async fn require_bound_witness(
     let Some(witness) = load_durable_genesis_witness(transaction, scope).await? else {
         let stage_three_visible: bool = sqlx::query_scalar(
             "SELECT \
-                 EXISTS (SELECT 1 FROM memory_registry_activations \
+                 EXISTS (SELECT 1 FROM public.memory_registry_activations \
                          WHERE tenant_id = $1 AND project = $2 LIMIT 1) \
-              OR EXISTS (SELECT 1 FROM memory_registry_heads \
+              OR EXISTS (SELECT 1 FROM public.memory_registry_heads \
                          WHERE tenant_id = $1 AND project = $2 LIMIT 1)",
         )
         .bind(scope.tenant_id())
@@ -611,7 +612,7 @@ async fn select_registry_head(
         "SELECT head_state, activation_id, package_digest, activation_policy_digest, \
                 source_event_id, source_epoch_id, source_shard, source_committed_offset, \
                 activated_at, canonical_head \
-         FROM memory_registry_heads WHERE tenant_id = $1 AND project = $2",
+         FROM public.memory_registry_heads WHERE tenant_id = $1 AND project = $2",
     )
     .bind(scope.tenant_id())
     .bind(scope.project())
@@ -646,7 +647,7 @@ async fn read_control_head(
     } else {
         sqlx::query(
             "SELECT shard_count, last_committed_offset, chain_digest, advanced_at \
-             FROM memory_control_shard_heads \
+             FROM public.memory_control_shard_heads \
              WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4",
         )
         .bind(scope.tenant_id())
@@ -698,7 +699,7 @@ async fn require_pinned_inactive_tail(
 
     let consistency_key = registry_activation_consistency_partition_key(scope.semantic_scope())?;
     let registry_events: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT event_id FROM memory_control_events \
+        "SELECT event_id FROM public.memory_control_events \
          WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
            AND consistency_family = $4 AND consistency_key_digest = $5 \
          ORDER BY shard, committed_offset LIMIT 2",
@@ -825,9 +826,9 @@ async fn insert_control_event(
     if inserted.is_none() {
         let collision_visible: bool = sqlx::query_scalar(
             "SELECT \
-                 EXISTS (SELECT 1 FROM memory_control_events \
+                 EXISTS (SELECT 1 FROM public.memory_control_events \
                          WHERE tenant_id = $1 AND project = $2 AND event_id = $3) \
-                 OR EXISTS (SELECT 1 FROM memory_control_events \
+                 OR EXISTS (SELECT 1 FROM public.memory_control_events \
                          WHERE tenant_id = $1 AND project = $2 AND epoch_id = $4 \
                            AND shard = $5 AND committed_offset = $6)",
         )
@@ -958,7 +959,7 @@ async fn advance_control_head(
         .await?;
     let Some(row) = row else {
         let current = sqlx::query(
-            "SELECT last_committed_offset, chain_digest FROM memory_control_shard_heads \
+            "SELECT last_committed_offset, chain_digest FROM public.memory_control_shard_heads \
              WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4",
         )
         .bind(scope.tenant_id())
@@ -1507,7 +1508,7 @@ async fn select_control_event(
         "SELECT event_id, event_schema_version, event_kind, semantic_object_digest, \
                 consistency_family, consistency_key_digest, canonical_event, \
                 previous_chain_digest, chain_digest, accepted_at \
-         FROM memory_control_events \
+         FROM public.memory_control_events \
          WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
            AND shard = $4 AND committed_offset = $5",
     )
@@ -2166,7 +2167,7 @@ mod tests {
     fn append_lock_and_head_advance_are_exact_cas_operations() {
         assert!(LOCK_CONTROL_HEAD_SQL.contains("advanced_at"));
         assert!(LOCK_CONTROL_HEAD_SQL.ends_with("FOR UPDATE"));
-        assert!(ADVANCE_CONTROL_HEAD_SQL.starts_with("UPDATE memory_control_shard_heads"));
+        assert!(ADVANCE_CONTROL_HEAD_SQL.starts_with("UPDATE public.memory_control_shard_heads"));
         assert!(ADVANCE_CONTROL_HEAD_SQL.contains("last_committed_offset = $8"));
         assert!(ADVANCE_CONTROL_HEAD_SQL.contains("chain_digest = $9"));
         assert!(ADVANCE_CONTROL_HEAD_SQL.contains("RETURNING"));

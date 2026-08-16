@@ -50,12 +50,13 @@ const ACTIVATION_CONSISTENCY_FAMILY: &str = "registry.activation";
 const ACTIVE_HEAD_STATE: &str = "active";
 const MAX_BOUND_ARTIFACT_BYTES: usize = 1_048_576;
 
-const REQUIRE_SUCCESSOR_SCHEMA_SQL: &str = "SELECT count(*) = 14 \
+const REQUIRE_SUCCESSOR_SCHEMA_SQL: &str = "SELECT pg_catalog.current_database() = 'fleet_recall' \
+     AND count(*) = 14 \
      AND COALESCE(bool_and(success), false) \
-     FROM _sqlx_migrations WHERE version BETWEEN 1 AND 14";
+     FROM public._sqlx_migrations WHERE version BETWEEN 1 AND 14";
 
 const LOCK_CONTROL_HEAD_SQL: &str = "SELECT shard_count, last_committed_offset, \
-     chain_digest, advanced_at FROM memory_control_shard_heads \
+     chain_digest, advanced_at FROM public.memory_control_shard_heads \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 FOR UPDATE";
 
 const SELECT_TRANSITIONS_SQL: &str = "SELECT generation, activation_id, statement_id, \
@@ -75,7 +76,7 @@ const SELECT_TRANSITIONS_SQL: &str = "SELECT generation, activation_id, statemen
      predecessor_accepted_at, predecessor_source_event_id, predecessor_source_epoch_id, \
      predecessor_source_shard, predecessor_source_committed_offset, canonical_package, \
      canonical_statement, canonical_approval_set, canonical_test_result, canonical_receipt, \
-     canonical_event, canonical_head FROM memory_registry_transitions \
+     canonical_event, canonical_head FROM public.memory_registry_transitions \
      WHERE tenant_id = $1 AND project = $2 ORDER BY generation LIMIT 3";
 
 const SELECT_BRIDGES_SQL: &str = "SELECT bridge_digest, from_generation, genesis_activation_id, \
@@ -90,17 +91,17 @@ const SELECT_BRIDGES_SQL: &str = "SELECT bridge_digest, from_generation, genesis
      successor_contract_project_namespace, successor_effective_from, successor_accepted_at, \
      successor_source_event_id, successor_source_epoch_id, successor_source_shard, \
      successor_source_committed_offset, canonical_bridge, consumed_at \
-     FROM memory_registry_genesis_bridge_consumptions \
+     FROM public.memory_registry_genesis_bridge_consumptions \
      WHERE tenant_id = $1 AND project = $2 LIMIT 2";
 
 const SELECT_CURRENT_HEADS_SQL: &str = "SELECT head_state, generation, activation_id, \
      package_digest, activation_policy_digest, profile_id, profile_digest, \
      vector_manifest_digest, contract_tenant_namespace, contract_project_namespace, \
      effective_from, accepted_at, source_event_id, source_epoch_id, source_shard, \
-     source_committed_offset, canonical_head FROM memory_registry_current_heads_v2 \
+     source_committed_offset, canonical_head FROM public.memory_registry_current_heads_v2 \
      WHERE tenant_id = $1 AND project = $2 LIMIT 2";
 
-const INSERT_GENESIS_TRANSITION_SQL: &str = "INSERT INTO memory_registry_transitions (\
+const INSERT_GENESIS_TRANSITION_SQL: &str = "INSERT INTO public.memory_registry_transitions (\
      tenant_id, project, generation, activation_id, statement_id, package_digest, \
      activation_policy_digest, test_result_digest, profile_id, profile_digest, \
      vector_manifest_digest, contract_tenant_namespace, contract_project_namespace, \
@@ -132,7 +133,7 @@ const INSERT_GENESIS_TRANSITION_SQL: &str = "INSERT INTO memory_registry_transit
      a.control_committed_offset, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
      NULL, NULL, NULL, NULL, NULL, $4, a.canonical_statement, a.canonical_approval_set, \
      a.canonical_test_result, a.canonical_receipt, a.canonical_event, $5 \
-     FROM memory_registry_activations AS a JOIN memory_registry_heads AS h \
+     FROM public.memory_registry_activations AS a JOIN public.memory_registry_heads AS h \
        ON h.tenant_id = a.tenant_id AND h.project = a.project \
       AND h.activation_id = a.activation_id AND h.package_digest = a.activated_package_digest \
       AND h.activation_policy_digest = a.activated_policy_digest \
@@ -143,7 +144,7 @@ const INSERT_GENESIS_TRANSITION_SQL: &str = "INSERT INTO memory_registry_transit
      WHERE a.tenant_id = $1 AND a.project = $2 AND a.activation_id = $3 \
      ON CONFLICT DO NOTHING RETURNING generation";
 
-const INSERT_GENESIS_CURRENT_HEAD_SQL: &str = "INSERT INTO memory_registry_current_heads_v2 (\
+const INSERT_GENESIS_CURRENT_HEAD_SQL: &str = "INSERT INTO public.memory_registry_current_heads_v2 (\
      tenant_id, project, head_state, generation, activation_id, package_digest, \
      activation_policy_digest, profile_id, profile_digest, vector_manifest_digest, \
      contract_tenant_namespace, contract_project_namespace, effective_from, accepted_at, \
@@ -152,17 +153,17 @@ const INSERT_GENESIS_CURRENT_HEAD_SQL: &str = "INSERT INTO memory_registry_curre
      activation_policy_digest, profile_id, profile_digest, vector_manifest_digest, \
      contract_tenant_namespace, contract_project_namespace, effective_from, accepted_at, \
      source_event_id, source_epoch_id, source_shard, source_committed_offset, canonical_head \
-     FROM memory_registry_transitions WHERE tenant_id = $1 AND project = $2 \
+     FROM public.memory_registry_transitions WHERE tenant_id = $1 AND project = $2 \
      AND generation = 0 AND activation_id = $3 ON CONFLICT DO NOTHING RETURNING generation";
 
-const INSERT_CONTROL_EVENT_SQL: &str = "INSERT INTO memory_control_events (\
+const INSERT_CONTROL_EVENT_SQL: &str = "INSERT INTO public.memory_control_events (\
      tenant_id, project, epoch_id, shard, committed_offset, event_id, event_schema_version, \
      event_kind, semantic_object_digest, consistency_family, consistency_key_digest, \
      canonical_event, previous_chain_digest, chain_digest, accepted_at) \
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
      ON CONFLICT DO NOTHING RETURNING event_id";
 
-const INSERT_SUCCESSOR_TRANSITION_SQL: &str = "INSERT INTO memory_registry_transitions (\
+const INSERT_SUCCESSOR_TRANSITION_SQL: &str = "INSERT INTO public.memory_registry_transitions (\
      tenant_id, project, generation, activation_id, statement_id, package_digest, \
      activation_policy_digest, test_result_digest, profile_id, profile_digest, \
      vector_manifest_digest, contract_tenant_namespace, contract_project_namespace, \
@@ -191,12 +192,12 @@ const INSERT_SUCCESSOR_TRANSITION_SQL: &str = "INSERT INTO memory_registry_trans
      g.activation_policy_digest, g.profile_id, g.profile_digest, g.vector_manifest_digest, \
      g.contract_tenant_namespace, g.contract_project_namespace, g.effective_from, g.accepted_at, \
      g.source_event_id, g.source_epoch_id, g.source_shard, g.source_committed_offset, $25, $26, \
-     $27, $28, $29, $30, $31 FROM memory_registry_transitions AS g \
+     $27, $28, $29, $30, $31 FROM public.memory_registry_transitions AS g \
      WHERE g.tenant_id = $1 AND g.project = $2 AND g.generation = 0 \
        AND g.activation_id = $3 ON CONFLICT DO NOTHING RETURNING generation";
 
 const INSERT_BRIDGE_CONSUMPTION_SQL: &str = "INSERT INTO \
-     memory_registry_genesis_bridge_consumptions (tenant_id, project, bridge_digest, \
+     public.memory_registry_genesis_bridge_consumptions (tenant_id, project, bridge_digest, \
      from_generation, genesis_activation_id, genesis_package_digest, \
      genesis_activation_policy_digest, genesis_profile_id, genesis_profile_digest, \
      genesis_vector_manifest_digest, genesis_contract_tenant_namespace, \
@@ -216,13 +217,13 @@ const INSERT_BRIDGE_CONSUMPTION_SQL: &str = "INSERT INTO \
      s.package_digest, s.activation_policy_digest, s.profile_id, s.profile_digest, \
      s.vector_manifest_digest, s.contract_tenant_namespace, s.contract_project_namespace, \
      s.effective_from, s.accepted_at, s.source_event_id, s.source_epoch_id, s.source_shard, \
-     s.source_committed_offset, $4, $5 FROM memory_registry_transitions AS g \
-     JOIN memory_registry_transitions AS s ON s.tenant_id = g.tenant_id \
+     s.source_committed_offset, $4, $5 FROM public.memory_registry_transitions AS g \
+     JOIN public.memory_registry_transitions AS s ON s.tenant_id = g.tenant_id \
        AND s.project = g.project AND s.generation = 1 \
      WHERE g.tenant_id = $1 AND g.project = $2 AND g.generation = 0 \
      ON CONFLICT DO NOTHING RETURNING bridge_digest";
 
-const ADVANCE_CURRENT_HEAD_SQL: &str = "UPDATE memory_registry_current_heads_v2 AS h SET \
+const ADVANCE_CURRENT_HEAD_SQL: &str = "UPDATE public.memory_registry_current_heads_v2 AS h SET \
      generation = s.generation, activation_id = s.activation_id, \
      package_digest = s.package_digest, activation_policy_digest = s.activation_policy_digest, \
      profile_id = s.profile_id, profile_digest = s.profile_digest, \
@@ -232,7 +233,7 @@ const ADVANCE_CURRENT_HEAD_SQL: &str = "UPDATE memory_registry_current_heads_v2 
      accepted_at = s.accepted_at, source_event_id = s.source_event_id, \
      source_epoch_id = s.source_epoch_id, source_shard = s.source_shard, \
      source_committed_offset = s.source_committed_offset, canonical_head = s.canonical_head \
-     FROM memory_registry_transitions AS g, memory_registry_transitions AS s \
+     FROM public.memory_registry_transitions AS g, public.memory_registry_transitions AS s \
      WHERE h.tenant_id = $1 AND h.project = $2 AND h.head_state = $3 \
        AND g.tenant_id = h.tenant_id AND g.project = h.project AND g.generation = 0 \
        AND s.tenant_id = h.tenant_id AND s.project = h.project AND s.generation = 1 \
@@ -249,7 +250,7 @@ const ADVANCE_CURRENT_HEAD_SQL: &str = "UPDATE memory_registry_current_heads_v2 
        AND h.source_committed_offset = g.source_committed_offset \
        AND h.canonical_head = g.canonical_head RETURNING h.generation";
 
-const ADVANCE_CONTROL_HEAD_SQL: &str = "UPDATE memory_control_shard_heads SET \
+const ADVANCE_CONTROL_HEAD_SQL: &str = "UPDATE public.memory_control_shard_heads SET \
      last_committed_offset = $5, chain_digest = $6, advanced_at = $7 \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 \
        AND last_committed_offset = $8 AND chain_digest = $9 \
@@ -516,7 +517,7 @@ async fn activate_in_transaction(
                 successor_corrupt(format!("fresh successor insertion point rejected: {error}"))
             })?;
             let accepted_at_database: DateTime<Utc> =
-                sqlx::query_scalar("SELECT statement_timestamp()")
+                sqlx::query_scalar("SELECT pg_catalog.statement_timestamp()")
                     .fetch_one(&mut **transaction)
                     .await?;
             if accepted_at_database < locked.advanced_at {
@@ -685,7 +686,7 @@ async fn require_genesis_projection_present(
     scope: &TrustedControlScope,
 ) -> Result<()> {
     let activation_ids: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT activation_id FROM memory_registry_activations \
+        "SELECT activation_id FROM public.memory_registry_activations \
          WHERE tenant_id = $1 AND project = $2 ORDER BY activation_id LIMIT 2",
     )
     .bind(scope.tenant_id())
@@ -693,7 +694,7 @@ async fn require_genesis_projection_present(
     .fetch_all(&mut **transaction)
     .await?;
     let head_ids: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT activation_id FROM memory_registry_heads \
+        "SELECT activation_id FROM public.memory_registry_heads \
          WHERE tenant_id = $1 AND project = $2 LIMIT 2",
     )
     .bind(scope.tenant_id())
@@ -800,7 +801,7 @@ async fn audit_ready_state(
 ) -> Result<()> {
     let consistency_key = registry_activation_consistency_partition_key(scope.semantic_scope())?;
     let rows = sqlx::query(
-        "SELECT event_id, shard, committed_offset FROM memory_control_events \
+        "SELECT event_id, shard, committed_offset FROM public.memory_control_events \
          WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
            AND consistency_family = $4 AND consistency_key_digest = $5 \
          ORDER BY shard, committed_offset LIMIT 3",
@@ -834,7 +835,7 @@ async fn audit_ready_state(
         offset_as_i64(genesis.inspection.append_position.committed_offset)?,
     )?;
     let ahead: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT event_id FROM memory_control_events WHERE tenant_id = $1 AND project = $2 \
+        "SELECT event_id FROM public.memory_control_events WHERE tenant_id = $1 AND project = $2 \
          AND epoch_id = $3 AND shard = $4 AND committed_offset > $5 \
          ORDER BY committed_offset LIMIT 1",
     )
@@ -1880,7 +1881,7 @@ async fn audit_successor_control_event(
         "SELECT event_id, event_schema_version, event_kind, semantic_object_digest, \
                 consistency_family, consistency_key_digest, canonical_event, \
                 previous_chain_digest, chain_digest, accepted_at \
-         FROM memory_control_events WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
+         FROM public.memory_control_events WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
            AND shard = $4 AND committed_offset = $5",
     )
     .bind(scope.tenant_id())
@@ -1930,7 +1931,7 @@ async fn audit_successor_control_event(
         .ok_or_else(|| successor_corrupt("successor source offset underflowed"))?;
     let predecessor = sqlx::query(
         "SELECT event_id, previous_chain_digest, chain_digest, accepted_at \
-         FROM memory_control_events \
+         FROM public.memory_control_events \
          WHERE tenant_id = $1 AND project = $2 \
          AND epoch_id = $3 AND shard = $4 AND committed_offset = $5",
     )
@@ -1974,7 +1975,7 @@ async fn audit_successor_control_event(
         ));
     }
     let ahead: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT event_id FROM memory_control_events WHERE tenant_id = $1 AND project = $2 \
+        "SELECT event_id FROM public.memory_control_events WHERE tenant_id = $1 AND project = $2 \
          AND epoch_id = $3 AND shard = $4 AND committed_offset > $5 \
          ORDER BY committed_offset LIMIT 1",
     )
@@ -2003,7 +2004,7 @@ async fn audit_registry_stream_pair(
 ) -> Result<()> {
     let consistency_key = registry_activation_consistency_partition_key(scope.semantic_scope())?;
     let rows = sqlx::query(
-        "SELECT event_id, shard, committed_offset FROM memory_control_events \
+        "SELECT event_id, shard, committed_offset FROM public.memory_control_events \
          WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
            AND consistency_family = $4 AND consistency_key_digest = $5 \
          ORDER BY shard, committed_offset LIMIT 3",
@@ -2245,16 +2246,135 @@ fn expect_timestamp(row: &PgRow, column: &str, expected: DateTime<Utc>) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::memory_contracts::digest::{DigestDomain, domain_separated_digest};
 
+    const CONTROL_LOG_SOURCE: &str = include_str!("../control_log/cockroach.rs");
+    const GENESIS_COCKROACH_SOURCE: &str = include_str!("cockroach.rs");
+    const GENESIS_AUDIT_SOURCE: &str = include_str!("genesis_audit.rs");
+    const SUCCESSOR_SOURCE: &str = include_str!("successor_cockroach.rs");
+    const AUTHORITY_RELATIONS: [&str; 10] = [
+        "_sqlx_migrations",
+        "memory_control_bootstraps",
+        "memory_control_log_epochs",
+        "memory_control_shard_heads",
+        "memory_control_events",
+        "memory_registry_activations",
+        "memory_registry_heads",
+        "memory_registry_transitions",
+        "memory_registry_genesis_bridge_consumptions",
+        "memory_registry_current_heads_v2",
+    ];
+
+    fn production_prefix(source: &'static str) -> &'static str {
+        source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(code, _)| code)
+    }
+
+    fn successor_authority_source() -> String {
+        [
+            production_prefix(SUCCESSOR_SOURCE),
+            production_prefix(GENESIS_AUDIT_SOURCE),
+            production_prefix(GENESIS_COCKROACH_SOURCE),
+            production_prefix(CONTROL_LOG_SOURCE),
+        ]
+        .join("\n")
+    }
+
     #[test]
     fn schema_preflight_requires_the_exact_successful_prefix_through_fourteen() {
+        assert!(
+            REQUIRE_SUCCESSOR_SCHEMA_SQL
+                .starts_with("SELECT pg_catalog.current_database() = 'fleet_recall'")
+        );
         assert!(REQUIRE_SUCCESSOR_SCHEMA_SQL.contains("count(*) = 14"));
         assert!(REQUIRE_SUCCESSOR_SCHEMA_SQL.contains("bool_and(success)"));
+        assert!(REQUIRE_SUCCESSOR_SCHEMA_SQL.contains("FROM public._sqlx_migrations"));
         assert!(REQUIRE_SUCCESSOR_SCHEMA_SQL.contains("version BETWEEN 1 AND 14"));
         assert!(!REQUIRE_SUCCESSOR_SCHEMA_SQL.contains("MAX"));
         assert!(!REQUIRE_SUCCESSOR_SCHEMA_SQL.contains("EXISTS"));
+    }
+
+    #[test]
+    fn apply_and_inspect_share_the_database_and_schema_first_statement() {
+        for (start, end) in [
+            (
+                "async fn activate_in_transaction(",
+                "\nasync fn inspect_in_transaction(",
+            ),
+            (
+                "async fn inspect_in_transaction(",
+                "\nasync fn require_successor_schema(",
+            ),
+        ] {
+            let start = SUCCESSOR_SOURCE.find(start).expect("transaction function");
+            let end = SUCCESSOR_SOURCE[start..]
+                .find(end)
+                .map(|offset| start + offset)
+                .expect("transaction function boundary");
+            let body = &SUCCESSOR_SOURCE[start..end];
+            let identity_and_schema = body
+                .find("require_successor_schema(transaction).await?")
+                .expect("database/schema preflight");
+            let next_database_use = body
+                .find("require_bound_bootstrap_before_lock(")
+                .expect("durable bootstrap read");
+            assert!(identity_and_schema < next_database_use);
+        }
+    }
+
+    #[test]
+    fn search_path_and_temporary_shadows_cannot_redirect_successor_authority_sql() {
+        let source = successor_authority_source();
+        let mut found = BTreeSet::new();
+
+        for token in source.split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '.'))
+        }) {
+            let relation = token.strip_prefix("public.").unwrap_or(token);
+            let is_authority_relation = relation == "_sqlx_migrations"
+                || relation.starts_with("memory_control_")
+                || relation.starts_with("memory_registry_");
+            if !is_authority_relation {
+                continue;
+            }
+            assert!(
+                token.starts_with("public."),
+                "unqualified successor authority relation can follow search_path: {token}"
+            );
+            assert!(
+                AUTHORITY_RELATIONS.contains(&relation),
+                "unreviewed successor authority relation: {relation}"
+            );
+            found.insert(relation);
+        }
+
+        assert_eq!(
+            found,
+            AUTHORITY_RELATIONS.into_iter().collect(),
+            "reachable relation inventory changed"
+        );
+        assert!(!source.contains("public.public."));
+        assert!(!source.contains("pg_temp."));
+        assert!(!source.contains("attacker."));
+
+        for function in ["current_database()", "statement_timestamp()"] {
+            for (offset, _) in source.match_indices(function) {
+                assert!(
+                    source[..offset].ends_with("pg_catalog."),
+                    "{function} can follow an attacker-controlled search_path"
+                );
+            }
+        }
+        for sequence_function in ["nextval(", "currval(", "setval("] {
+            assert!(
+                !source.contains(sequence_function),
+                "successor authority unexpectedly consumes a sequence via {sequence_function}"
+            );
+        }
     }
 
     #[test]
@@ -2283,10 +2403,9 @@ mod tests {
 
     #[test]
     fn source_uses_one_server_timestamp_and_no_database_default() {
-        let source = include_str!("successor_cockroach.rs");
         assert_eq!(
-            source
-                .matches("query_scalar(\"SELECT statement_timestamp()\")")
+            production_prefix(SUCCESSOR_SOURCE)
+                .matches("query_scalar(\"SELECT pg_catalog.statement_timestamp()\")")
                 .count(),
             1
         );

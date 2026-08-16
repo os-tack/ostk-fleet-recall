@@ -34,7 +34,7 @@ const CONTROL_CONSISTENCY_FAMILY: &str = "control.bootstrap";
 const PARTITION_RECIPE_ID: &str = "ostk.partition.sha256_prefix64_modulo";
 const PARTITION_RECIPE_VERSION: i32 = 1;
 const PARTITION_ALGORITHM: &str = "sha256_prefix64_modulo";
-const INSERT_BOOTSTRAP_RESERVATION_SQL: &str = "INSERT INTO memory_control_bootstraps (\
+const INSERT_BOOTSTRAP_RESERVATION_SQL: &str = "INSERT INTO public.memory_control_bootstraps (\
          tenant_id, project, contract_tenant_namespace, contract_project_namespace, \
          receipt_digest, statement_id, bootstrap_event_id, profile_id, profile_digest, \
          vector_manifest_digest, genesis_registry_package_digest, signer_policy_digest, \
@@ -44,12 +44,12 @@ const INSERT_BOOTSTRAP_RESERVATION_SQL: &str = "INSERT INTO memory_control_boots
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
          $15, $16, $17, 1, $18, $19, $20\
      ) ON CONFLICT (tenant_id, project) DO NOTHING RETURNING receipt_digest";
-const ADVANCE_SELECTED_HEAD_SQL: &str = "UPDATE memory_control_shard_heads \
+const ADVANCE_SELECTED_HEAD_SQL: &str = "UPDATE public.memory_control_shard_heads \
      SET last_committed_offset = 1, chain_digest = $5, advanced_at = $7 \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 \
        AND last_committed_offset = 0 AND chain_digest = $6";
 const BOUNDED_HEAD_SET_SQL: &str = "SELECT shard, shard_count, last_committed_offset, chain_digest, advanced_at \
-     FROM memory_control_shard_heads \
+     FROM public.memory_control_shard_heads \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
      ORDER BY shard LIMIT $4";
 
@@ -246,9 +246,10 @@ impl GenesisRepository for CockroachGenesisRepository {
                     return Ok(GenesisBootstrapOutcome::ExactReplay(inspection));
                 }
 
-                let accepted_at: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
-                    .fetch_one(&mut **transaction)
-                    .await?;
+                let accepted_at: DateTime<Utc> =
+                    sqlx::query_scalar("SELECT pg_catalog.statement_timestamp()")
+                        .fetch_one(&mut **transaction)
+                        .await?;
 
                 let reservation =
                     insert_bootstrap_reservation(transaction, &scope, &prepared, accepted_at)
@@ -340,7 +341,7 @@ async fn insert_epoch(
 ) -> Result<()> {
     let event = &prepared.append.event;
     let result = sqlx::query(
-        "INSERT INTO memory_control_log_epochs (\
+        "INSERT INTO public.memory_control_log_epochs (\
              tenant_id, project, epoch_id, bootstrap_receipt_digest, canonical_epoch, \
              partition_recipe_id, partition_recipe_version, partition_algorithm, \
              partition_seed, shard_count, created_at\
@@ -374,7 +375,7 @@ async fn insert_genesis_heads(
     accepted_at: DateTime<Utc>,
 ) -> Result<()> {
     let mut builder = QueryBuilder::<Postgres>::new(
-        "INSERT INTO memory_control_shard_heads (\
+        "INSERT INTO public.memory_control_shard_heads (\
              tenant_id, project, epoch_id, shard, shard_count, last_committed_offset, chain_digest, advanced_at\
          ) ",
     );
@@ -407,7 +408,7 @@ async fn insert_bootstrap_event(
     let offset = i64::try_from(append.append_position.committed_offset.as_u64())
         .map_err(|_| corrupt("bootstrap offset exceeds INT8"))?;
     let result = sqlx::query(
-        "INSERT INTO memory_control_events (\
+        "INSERT INTO public.memory_control_events (\
              tenant_id, project, epoch_id, shard, committed_offset, event_id, \
              event_schema_version, event_kind, semantic_object_digest, consistency_family, \
              consistency_key_digest, canonical_event, previous_chain_digest, chain_digest, accepted_at\
@@ -493,7 +494,7 @@ pub async fn load_durable_genesis_witness(
                 vector_manifest_digest, genesis_registry_package_digest, signer_policy_digest, \
                 signer_count, approval_threshold, epoch_id, shard_count, bootstrap_shard, \
                 bootstrap_offset, canonical_receipt, canonical_genesis_package, accepted_at \
-         FROM memory_control_bootstraps WHERE tenant_id = $1 AND project = $2",
+         FROM public.memory_control_bootstraps WHERE tenant_id = $1 AND project = $2",
     )
     .bind(scope.tenant_id())
     .bind(scope.project())
@@ -516,11 +517,11 @@ async fn ensure_no_orphan_control_rows(
 ) -> Result<()> {
     let has_children: bool = sqlx::query_scalar(
         "SELECT \
-             EXISTS (SELECT 1 FROM memory_control_log_epochs \
+             EXISTS (SELECT 1 FROM public.memory_control_log_epochs \
                      WHERE tenant_id = $1 AND project = $2) \
-          OR EXISTS (SELECT 1 FROM memory_control_shard_heads \
+          OR EXISTS (SELECT 1 FROM public.memory_control_shard_heads \
                      WHERE tenant_id = $1 AND project = $2) \
-          OR EXISTS (SELECT 1 FROM memory_control_events \
+          OR EXISTS (SELECT 1 FROM public.memory_control_events \
                      WHERE tenant_id = $1 AND project = $2)",
     )
     .bind(scope.tenant_id())
@@ -751,7 +752,7 @@ async fn ensure_epoch_matches(
         "SELECT bootstrap_receipt_digest, canonical_epoch, partition_recipe_id, \
                 partition_recipe_version, partition_algorithm, partition_seed, shard_count, \
                 created_at \
-         FROM memory_control_log_epochs \
+         FROM public.memory_control_log_epochs \
          WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3",
     )
     .bind(scope.tenant_id())
@@ -800,7 +801,7 @@ async fn ensure_event_matches(
         "SELECT event_id, event_schema_version, event_kind, semantic_object_digest, \
                 consistency_family, consistency_key_digest, canonical_event, \
                 previous_chain_digest, chain_digest, accepted_at \
-         FROM memory_control_events \
+         FROM public.memory_control_events \
          WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 \
            AND shard = $4 AND committed_offset = $5",
     )
@@ -946,7 +947,7 @@ mod tests {
         assert!(INSERT_BOOTSTRAP_RESERVATION_SQL.contains("$20"));
         assert!(!INSERT_BOOTSTRAP_RESERVATION_SQL.contains("$21"));
 
-        assert!(ADVANCE_SELECTED_HEAD_SQL.starts_with("UPDATE memory_control_shard_heads"));
+        assert!(ADVANCE_SELECTED_HEAD_SQL.starts_with("UPDATE public.memory_control_shard_heads"));
         assert!(ADVANCE_SELECTED_HEAD_SQL.contains("last_committed_offset = 0"));
         assert!(ADVANCE_SELECTED_HEAD_SQL.contains("chain_digest = $6"));
         assert!(ADVANCE_SELECTED_HEAD_SQL.contains("advanced_at = $7"));

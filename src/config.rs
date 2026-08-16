@@ -1242,9 +1242,9 @@ fn validate_successor_database_url(database_url: &str) -> Result<()> {
             "{VARIABLE_NAME} must include an explicit nonzero numeric port"
         )));
     }
-    if parsed.path().trim_start_matches('/').is_empty() {
+    if parsed.path() != "/fleet_recall" {
         return Err(FleetError::Configuration(format!(
-            "{VARIABLE_NAME} must include a nonempty database path"
+            "{VARIABLE_NAME} must select exactly the fleet_recall database"
         )));
     }
 
@@ -2168,32 +2168,32 @@ mod tests {
         let mut values = successor_activation_values();
         values.insert(
             "FLEET_RECALL_SUCCESSOR_DATABASE_URL",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&sslrootcert=%2Fetc%2Fssl%2Fcerts%2Fca.pem".into(),
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&sslrootcert=%2Fetc%2Fssl%2Fcerts%2Fca.pem".into(),
         );
         assert!(
             SuccessorActivationRuntimeConfig::from_lookup(|name| values.get(name).cloned()).is_ok()
         );
 
         for url in [
-            "https://successor:secret@cluster.example:26257/fleet?sslmode=verify-full",
-            "cockroachdb://successor:secret@cluster.example:26257/fleet?sslmode=verify-full",
-            "postgresql:///fleet?sslmode=verify-full",
-            "postgresql://successor:secret@cluster.example:26257/fleet",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=require",
-            "postgresql://successor:secret@127.0.0.1:26257/fleet?sslmode=disable",
-            "postgresql://successor:secret@cluster.example:26257/fleet?ssl-mode=verify-full",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&ssl-root-cert=/tmp/ca.pem",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&sslmode=disable",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&sslrootcert=/tmp/one.pem&sslrootcert=/tmp/two.pem",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&sslrootcert=relative.pem",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&host=attacker.example",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&hostaddr=127.0.0.1",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&options=-csearch_path%3Dattacker",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&user=other",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&port=5432",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&application_name=other",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full&unknown=value",
-            "postgresql://successor:secret@cluster.example:26257/fleet?sslmode=verify-full#ignored",
+            "https://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full",
+            "cockroachdb://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full",
+            "postgresql:///fleet_recall?sslmode=verify-full",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=require",
+            "postgresql://successor:secret@127.0.0.1:26257/fleet_recall?sslmode=disable",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?ssl-mode=verify-full",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&ssl-root-cert=/tmp/ca.pem",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&sslmode=disable",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&sslrootcert=/tmp/one.pem&sslrootcert=/tmp/two.pem",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&sslrootcert=relative.pem",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&host=attacker.example",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&hostaddr=127.0.0.1",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&options=-csearch_path%3Dattacker",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&user=other",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&port=5432",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&application_name=other",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full&unknown=value",
+            "postgresql://successor:secret@cluster.example:26257/fleet_recall?sslmode=verify-full#ignored",
         ] {
             let mut values = successor_activation_values();
             values.insert("FLEET_RECALL_SUCCESSOR_DATABASE_URL", url.into());
@@ -2204,11 +2204,11 @@ mod tests {
     #[test]
     fn successor_activation_database_url_requires_explicit_connection_identity() {
         for url in [
-            "postgresql://:secret@cluster.example:26257/fleet?sslmode=verify-full",
-            "postgresql://successor@cluster.example:26257/fleet?sslmode=verify-full",
-            "postgresql://successor:@cluster.example:26257/fleet?sslmode=verify-full",
-            "postgresql://successor:secret@cluster.example/fleet?sslmode=verify-full",
-            "postgresql://successor:secret@cluster.example:0/fleet?sslmode=verify-full",
+            "postgresql://:secret@cluster.example:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://successor@cluster.example:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://successor:@cluster.example:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://successor:secret@cluster.example/fleet_recall?sslmode=verify-full",
+            "postgresql://successor:secret@cluster.example:0/fleet_recall?sslmode=verify-full",
             "postgresql://successor:secret@cluster.example:26257?sslmode=verify-full",
             "postgresql://successor:secret@cluster.example:26257/?sslmode=verify-full",
             "postgresql://successor:secret@cluster.example:26257//?sslmode=verify-full",
@@ -2224,16 +2224,46 @@ mod tests {
     }
 
     #[test]
+    fn successor_activation_database_name_is_exact_and_canonical() {
+        for database_path in [
+            "fleet",
+            "defaultdb",
+            "fleet_recall/",
+            "fleet_recall/other",
+            "%66leet_recall",
+            "fleet%5Frecall",
+        ] {
+            let mut values = successor_activation_values();
+            values.insert(
+                "FLEET_RECALL_SUCCESSOR_DATABASE_URL",
+                format!(
+                    "postgresql://successor:secret@cluster.example:26257/{database_path}?sslmode=verify-full"
+                ),
+            );
+            let error = successor_configuration_error(
+                &values,
+                &format!("accepted noncanonical successor database path {database_path}"),
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("must select exactly the fleet_recall database"),
+                "wrong database-name error for {database_path}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn successor_activation_rejects_encoded_unix_socket_and_non_dns_hosts() {
         for url in [
-            "postgresql://successor:secret@%2Fvar%2Frun%2Fpostgres/fleet?sslmode=verify-full",
-            "postgresql://successor:secret@%2Fvar%2Frun%2Fpostgres:26257/fleet?sslmode=verify-full",
-            "postgresql://successor:secret@%2fvar%2frun%2fpostgres:26257/fleet?sslmode=verify-full",
-            "postgresql://successor:secret@%252Fvar%252Frun%252Fpostgres:26257/fleet?sslmode=verify-full",
-            "postgresql://successor:secret@%5C%5Cserver%5Csocket:26257/fleet?sslmode=verify-full",
-            "postgresql://successor:secret@bad_host.example:26257/fleet?sslmode=verify-full",
-            "postgresql://successor:secret@-bad.example:26257/fleet?sslmode=verify-full",
-            "postgresql://successor:secret@bad..example:26257/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@%2Fvar%2Frun%2Fpostgres/fleet_recall?sslmode=verify-full",
+            "postgresql://successor:secret@%2Fvar%2Frun%2Fpostgres:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://successor:secret@%2fvar%2frun%2fpostgres:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://successor:secret@%252Fvar%252Frun%252Fpostgres:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://successor:secret@%5C%5Cserver%5Csocket:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://successor:secret@bad_host.example:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://successor:secret@-bad.example:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://successor:secret@bad..example:26257/fleet_recall?sslmode=verify-full",
         ] {
             let mut values = successor_activation_values();
             values.insert("FLEET_RECALL_SUCCESSOR_DATABASE_URL", url.into());
@@ -2252,8 +2282,8 @@ mod tests {
     #[test]
     fn successor_activation_allows_network_ips_only_with_verify_full() {
         for url in [
-            "postgresql://successor:secret@127.0.0.1:26257/fleet?sslmode=verify-full",
-            "postgresql://successor:secret@[::1]:26257/fleet?sslmode=verify-full",
+            "postgresql://successor:secret@127.0.0.1:26257/fleet_recall?sslmode=verify-full",
+            "postgresql://successor:secret@[::1]:26257/fleet_recall?sslmode=verify-full",
         ] {
             let mut values = successor_activation_values();
             values.insert("FLEET_RECALL_SUCCESSOR_DATABASE_URL", url.into());
