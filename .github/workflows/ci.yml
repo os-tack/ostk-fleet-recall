@@ -211,4 +211,5 @@ jobs:
           LOCALSTACK_AUTH_TOKEN: ci-placeholder
           FLEET_RECALL_MODEL_BUNDLE: /tmp/ci-model-placeholder
           FLEET_RECALL_EMBEDDING_MODEL_SHA256: "0000000000000000000000000000000000000000000000000000000000000000"
+          FLEET_RECALL_VCS_REF: "0000000000000000000000000000000000000000"
         run: docker compose --env-file /dev/null -f deploy/localstack/compose.yaml config --quiet
