@@ -117,6 +117,31 @@ pub enum DigestDomain {
     GenesisChain,
     AppendChain,
     Body,
+    // --- W0-REG domains ---
+
+    // --- W0-SUCC domains ---
+
+    // --- W0-COVER domains ---
+
+    // --- W0-CHUNK domains ---
+
+    // --- W0-EPIS domains ---
+
+    // --- W0-OBS domains ---
+
+    // --- W0-ERASE domains ---
+
+    // --- W0-LOG domains ---
+
+    // --- W0-NORM domains ---
+
+    // --- W0-QUAR domains ---
+
+    // --- W0-TELEM domains ---
+
+    // --- W0-CAUSE domains ---
+
+    // --- W0-ACT domains ---
 }
 
 impl DigestDomain {
@@ -163,6 +188,31 @@ impl DigestDomain {
             Self::GenesisChain => "ostk-genesis-chain-v1",
             Self::AppendChain => "ostk-append-chain-v1",
             Self::Body => "ostk-body-v1",
+            // --- W0-REG prefixes ---
+
+            // --- W0-SUCC prefixes ---
+
+            // --- W0-COVER prefixes ---
+
+            // --- W0-CHUNK prefixes ---
+
+            // --- W0-EPIS prefixes ---
+
+            // --- W0-OBS prefixes ---
+
+            // --- W0-ERASE prefixes ---
+
+            // --- W0-LOG prefixes ---
+
+            // --- W0-NORM prefixes ---
+
+            // --- W0-QUAR prefixes ---
+
+            // --- W0-TELEM prefixes ---
+
+            // --- W0-CAUSE prefixes ---
+
+            // --- W0-ACT prefixes ---
         }
     }
 }
