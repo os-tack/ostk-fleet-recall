@@ -50,7 +50,7 @@ log at the commit named.
 | W1-SUCC (generic `N -> N+1` runtime + private CLI + live test) | `5733712`, `cb5fbdc`, `4fc86bb` | clean on first review at `b3ec6e1`, merged as `4fc86bb` |
 | W0-CHUNK closeout (chunk and embedding identity) | `f2d92ef`, `b3f2e00`, `3aba77d`, `c26e16e` | closeout clean at `c26e16e` |
 | W0-COVER closeout (`CoverageReceiptV1`) | `3a1fd67`, `c3205f7`, `f0b1202`, `ea35986`, `62a07d6` | closeout clean at `62a07d6` |
-| W1-APPEND (evidence-ledger append seam + live proof) | `d257052`, `c6dd9f8`, `8122744` | **no reviewer verdict is recorded in the wave log** — the chronology's last entry is the W0-CHUNK/W0-COVER merge at `62a07d6`, which precedes this merge. `.fleet-recall/fleet/RESUME.md` carries one open observation against it (two `#[doc(hidden)] pub` constructors to tighten). Treat this row as merged-but-unrecorded, not as reviewed-clean. |
+| W1-APPEND (evidence-ledger append seam + live proof) | `d257052`, `c6dd9f8`, `8122744` | Reviewer verdict **clean** at branch head `e2a4ee7` (round 2, after one fix binding the stored event to the head the append transaction reads); Fable gate rerun: cargo gates green and all 13 `tests/evidence_ledger_live.rs` tests green on official v26.2.3 after the cherry-pick. One open observation (two `#[doc(hidden)] pub` constructors to tighten at W1-PROOF) is recorded in `.fleet-recall/fleet/RESUME.md`. |
 | W1-CLOSE (this bundle) | this branch | pending Fable's gate |
 
 ## Not merged, with residual blockers
@@ -115,7 +115,9 @@ publication EXIT=0
 
 **W1-CLOSE re-runs on this branch.** The official lane was re-run locally after
 wiring twelve additional connected tests into it; it passed with exit 0 and the
-new tests are visible in its output:
+new tests are visible in its output. The runtime, successor-activation, and
+publication-reader Docker parity proofs were also re-run green on the final
+branch head (secondary evidence only):
 
 ```
 test live_generic_successor_activation_when_configured ... ok
