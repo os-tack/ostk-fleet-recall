@@ -177,8 +177,8 @@ line_count=$(wc -l < "$input" | tr -d '[:space:]')
 case $line_count in
     ''|*[!0-9]*) fail "line count is not numeric" ;;
 esac
-if [ "$line_count" -ne 4382 ]; then
-    fail "record count must be exactly 4382 (found $line_count)"
+if [ "$line_count" -ne 5641 ]; then
+    fail "record count must be exactly 5641 (found $line_count)"
 fi
 
 if awk 'length($0) > 16384 { exit 1 }' "$input"; then
@@ -365,12 +365,12 @@ if ! jq -s -e \
         | map(select(length > 0 and (startswith("#") | not)))
         | map(split("|")[0])
         | sort) as $expected_repository_sources
-    | ($expected_doc_sources | length) == 32
-    and ($expected_repository_sources | length) == 235
+    | ($expected_doc_sources | length) == 42
+    and ($expected_repository_sources | length) == 391
     and
-    ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 848
+    ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 1050
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 3328
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 4385
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:docs:v1") | .source_id] | unique | sort)
         == $expected_doc_sources
@@ -388,6 +388,10 @@ if ! jq -s -e \
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "src/bin/ostk-registry-successor-activate.rs"
         )] | length) == 62
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/bin/ostk-registry-generic-successor-activate.rs"
+        )] | length) == 35
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "src/bin/ostk-conflict-reconcile.rs"
@@ -415,19 +419,19 @@ if ! jq -s -e \
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "deploy/cockroach/tests/publication-reader-role-grants.sh"
-        )] | length) == 130
+        )] | length) == 132
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "deploy/cockroach/runtime-role-grants.sql"
-        )] | length) == 29
+        )] | length) == 31
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "deploy/cockroach/tests/runtime-role-grants.sh"
-        )] | length) == 101
+        )] | length) == 111
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "deploy/cockroach/tests/successor-activation-role-grants.sh"
-        )] | length) == 77
+        )] | length) == 83
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "migrations/0015_conflict_detector_uniqueness.sql"
@@ -442,12 +446,32 @@ if ! jq -s -e \
         )] | length) == 3
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "migrations/0018_stage4_evidence_ledger.sql"
+        )] | length) == 40
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
             and .source_id == "src/private_postgres.rs"
         )] | length) == 24
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/evidence_ledger/cockroach.rs"
+        )] | length) == 47
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/registry_activation/generic_successor_cockroach.rs"
+        )] | length) == 69
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
             and .source_id == "tests/publication_reader_live.rs"
         )] | length) == 16
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "tests/evidence_ledger_live.rs"
+        )] | length) == 60
+    and ([.[] | select(
+            .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "tests/generic_successor_activation_live.rs"
+        )] | length) == 48
     and ([.[] | select(.source_id == "src/config.rs")] | length) == 0
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1") | .source_id] | unique | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1") | .source_id] | sort)
@@ -500,9 +524,9 @@ if ! jq -s -e \
             .source_config_id == "rich-demo:docs:v1"
             and .source_id == "docs/DYNAMIC_MEMORY_ARCHITECTURE.md"
         );
-        (.text | startswith("Draft target architecture; not implemented. "))
-        and .facets.document_status == ["draft_target"]
-        and (.facets.tags | index("draft_target")) != null
+        (.text | startswith("Target architecture; stages 1-3 frozen; stage 4 partially implemented; stages 5-10 contract vectors in progress. "))
+        and .facets.document_status == ["partial_target"]
+        and (.facets.tags | index("partial_target")) != null
     )
     and ([.[] | select(
             .source_config_id == "rich-demo:self-audit:v1"
@@ -574,7 +598,7 @@ while IFS='|' read -r relative_path _; do
             | $record.extra.source_line_end as $finish
             | section_at($lines; $start) as $section
             | ((if $record.source_id == "docs/DYNAMIC_MEMORY_ARCHITECTURE.md"
-                then "Draft target architecture; not implemented. "
+                then "Target architecture; stages 1-3 frozen; stage 4 partially implemented; stages 5-10 contract vectors in progress. "
                 else ""
                 end)
                 + "Source document " + $record.source_id
@@ -769,6 +793,12 @@ sensitive_projection() {
                 + "cluster.example:26257/fleet_recall?sslmode=verify-full"
             )
             | join("postgresql://public-test-fixture");
+        def scrub_public_generic_successor_postgres_fixture:
+            split(
+                "postgresql://" + "generic:explicit-secret@"
+                + "cluster.example:26257/fleet_recall?sslmode=verify-full"
+            )
+            | join("postgresql://public-test-fixture");
 
         if .source_config_id == "rich-demo:repository:v1"
             and .source_id == "src/private_postgres.rs"
@@ -779,6 +809,9 @@ sensitive_projection() {
         elif .source_config_id == "rich-demo:repository:v1"
             and .source_id == "src/bin/ostk-conflict-reconcile.rs"
         then .text |= scrub_public_reconciliation_postgres_fixture
+        elif .source_config_id == "rich-demo:repository:v1"
+            and .source_id == "src/bin/ostk-registry-generic-successor-activate.rs"
+        then .text |= scrub_public_generic_successor_postgres_fixture
         else .
         end
     ' "$input"

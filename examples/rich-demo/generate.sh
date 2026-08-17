@@ -71,8 +71,8 @@ emit_document_chunks() {
         document_status=
         status_prefix=
         if [ "$relative_path" = "docs/DYNAMIC_MEMORY_ARCHITECTURE.md" ]; then
-            document_status=draft_target
-            status_prefix='Draft target architecture; not implemented. '
+            document_status=partial_target
+            status_prefix='Target architecture; stages 1-3 frozen; stage 4 partially implemented; stages 5-10 contract vectors in progress. '
         fi
 
         awk -v source_path="$relative_path" -v status_prefix="$status_prefix" -v max_chars=1500 '

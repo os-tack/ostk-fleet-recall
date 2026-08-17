@@ -8,6 +8,13 @@ contracts/dynamic-memory/v2/remember/README.md|memory_contracts
 contracts/dynamic-memory/v2/stage4-successor/README.md|memory_contracts
 contracts/dynamic-memory/v2/successor-activation/README.md|successor_activation
 contracts/dynamic-memory/v2/successor-policy/README.md|memory_contracts
+contracts/dynamic-memory/v3/README.md|memory_contracts
+contracts/dynamic-memory/v3/chunk-identity/README.md|memory_contracts
+contracts/dynamic-memory/v3/consolidation/README.md|memory_contracts
+contracts/dynamic-memory/v3/coverage/README.md|memory_contracts
+contracts/dynamic-memory/v3/quarantine/README.md|memory_contracts
+contracts/dynamic-memory/v3/registry-gen2/README.md|memory_contracts
+contracts/dynamic-memory/v3/successor-generic/README.md|successor_activation
 docs/ARCHITECTURE.md|architecture
 docs/CONTROL_BOOTSTRAP.md|control_bootstrap
 docs/DYNAMIC_MEMORY_ARCHITECTURE.md|dynamic_architecture
@@ -22,8 +29,11 @@ docs/DELIVERY.md|delivery
 docs/OSTK_DEMO.md|ostk_demo
 docs/SECURITY.md|security
 docs/adr/0001-product-and-backend-boundary.md|architecture_decision
+docs/adr/0002-stage4-runtime-foundations.md|architecture_decision
+docs/adr/0003-consolidation-and-conflict-tolerance.md|architecture_decision
 docs/assets/README.md|media
 docs/evidence/README.md|evidence
+docs/evidence/2026-08-16-dynamic-memory-wave0-1-signoff.md|evidence
 deploy/aws/README.md|aws
 deploy/aws/network/README.md|aws_network
 deploy/cockroach/tests/README.md|database_verification
