@@ -1,6 +1,6 @@
 # Dynamic corpus and causal runtime architecture
 
-Status: **draft target architecture; selected bounded foundations implemented**
+Status: **target architecture; stages 1–3 frozen; stage 4 partially implemented; stages 5–10 contract vectors in progress**
 
 Fleet Recall currently serves a statically generated, revision-linked corpus
 and a deliberate typed-claim ledger. This document defines the target model in
@@ -274,6 +274,62 @@ must not disguise a semantic change.
   warnings.
 - **DISC-05 — Waivers are durable policy.** A waiver is explicit, attributed,
   scoped, and expiring where practical. It does not rewrite evidence.
+
+### Consolidation lane
+
+Reserved by ADR 0003 (`docs/adr/0003-consolidation-and-conflict-tolerance.md`),
+which owns the full rationale. The ten definitions below are the ADR's own
+one-line statements, reproduced verbatim so the registry stays the single place
+an identifier is looked up. No CONS invariant has a runtime today; the
+consolidation contract module implements the read side of conflict tolerance
+only.
+
+- **CONS-01 — Consolidation is derivation, never mutation.** It appends new
+  claims, links, support, and lifecycle events. Replacement is supersession,
+  which preserves history.
+- **CONS-02 — Exact, atomic lineage.** Every derivative binds the exact sorted
+  source claim ID+revision set, consolidator identity/version, registry digest,
+  and derivation receipt. Claim, links, support, events, and receipt commit in
+  one transaction. A consolidation that cannot record full lineage does not
+  commit.
+- **CONS-03 — No authority promotion.** Output kind, modality, and confidence
+  are computed by a versioned policy and are never stronger than the weakest
+  input. Consolidation cannot create normativity, verify the unverified, or
+  close an `open_question`.
+- **CONS-04 — Conflicts are non-launderable.** If any source is a member of a
+  conflict in `open` or `waived` state, the run either fails closed or produces
+  a `disputed` claim that preserves the disagreement and references the
+  conflict. Consolidation never resolves, dismisses, waives, or hides a
+  conflict. A waived conflict is still an open incompatibility for this rule.
+- **CONS-05 — Deterministic identity, idempotent replay.** Re-running with the
+  same inputs and idempotency key is a no-op. The same inputs under a new
+  consolidator version produce an explicitly superseding derivation, not a
+  duplicate.
+- **CONS-06 — Scope containment.** Output tenant, project, and visibility are
+  the server-derived intersection of input scopes. Cross-scope candidate sets
+  fail closed. Private inputs never reach the publication projection through a
+  summary.
+- **CONS-07 — Erasure dominates derivatives.** Derivatives are indexed as
+  materializations of every source. Source erasure or retention expiry forces
+  re-derivation or tombstoning before the derivative is served; a derivative
+  whose only reproducible support is gone becomes `unsupported` or
+  `unverifiable`, and dependent conflicts are recomputed (EVID-08, EVID-09).
+- **CONS-08 — Lifecycle coupling.** Supersession, retraction, or expiry of a
+  source emits a re-evaluation event for its derivatives. A derivative whose
+  entire live support is gone cannot silently remain `active`.
+- **CONS-09 — Acyclic, depth-accounted lineage.** The derivation graph rejects
+  cycles. Claims beyond a registered consolidation depth are excluded from
+  candidate nomination unless a versioned policy explicitly permits deeper
+  derivation.
+- **CONS-10 — Detector re-entry.** A same-key relationship between a derivative
+  and its own sources is governed by a registered comparator rule —
+  transaction-atomic supersession or an explicit derivation exemption — never
+  an ad-hoc detector skip.
+
+Where ADR 0003's conflict-tolerance section and this document's discrepancy
+model differ, this document's registry wins; ADR 0003's 2026-08-16 addendum
+records that disposition and fixes the total, conservative mapping from the
+six-state discrepancy lifecycle to the contract's three read-side states.
 
 ### Runtime and actions
 
@@ -814,6 +870,18 @@ This does not require or authorize dynamic ingestion.
 4. Add general accepted-evidence and relation-attestation events. Make
    synchronous `remember` atomically append its event and projection. Prove
    immutability, scope binding, replay, and verified-versus-declared behavior.
+
+   Partially implemented. Landed: migration 0018 (the evidence event/head pair,
+   the quarantine table, the governed content table, the relation-projection
+   pair, and the read-only writer-authority view); the generic accepted-event
+   append seam with quarantine on integrity collision and preimage
+   disagreement, exact-replay no-op, and per-shard chain audit; the
+   writer-authority head witness read inside the append transaction; and the
+   repeatable generic `N -> N+1` registry activation runtime with its private
+   workstation CLI. Still absent: the evidence, relation, and remember
+   event-first paths that would make `remember` itself append-and-project in
+   one transaction; the bootstrap-manifest import of legacy chunks, claims,
+   conflicts, and receipts; and connected-proof wiring for all of those.
 5. Project one local transcript connector and one Git history connector into
    content-addressed repository membership and lexical-first/dense-later evidence
    with local cursors and coverage receipts. Arrow IPC may carry bounded batches
@@ -1076,12 +1144,40 @@ interpretation, and preserves every prior as-known conclusion.
 Accepted evidence enters a sharded append ledger with a transactional offset per
 shard. Offsets order projector work only; they never establish provider event
 order, authority, or causality. Semantic event identity never contains a shard
-or physical partition key. An append position is `(log epoch, shard, committed
-offset)`. Shards are selected from credential-bound tenant/project scope plus a
-stable hash. Changing the shard count creates a new log epoch and checkpoint;
-evidence IDs do not change. Offset assignment, accepted representation, and shard
-head advance commit in one transaction. Failed transactions publish neither row
-nor offset.
+or physical partition key. An append position is `(ledger family, log epoch,
+shard, committed offset)`. Shards are selected from credential-bound
+tenant/project scope plus a stable hash. Changing the shard count creates a new
+log epoch and checkpoint; evidence IDs do not change. Offset assignment,
+accepted representation, and shard head advance commit in one transaction.
+Failed transactions publish neither row nor offset.
+
+That ledger is one semantic ledger realized as two physical ledgers (ADR 0002
+D1). Governance events — control bootstrap and registry activation, family
+`registry.activation` -- append to the control pair (`memory_control_events`
+plus `memory_control_shard_heads`); general accepted events — evidence,
+relation attestations, claims, and the later observer, discrepancy, and erasure
+kinds — append to the evidence pair (`memory_evidence_events` plus
+`memory_evidence_shard_heads`). Both pairs bind the same single log-epoch row,
+the same partition recipe, seed, and shard count, the same append-position
+algebra, the same append-chain digest recipe, and one `event_kind` /
+`consistency_family` namespace. `ledger family` therefore selects a physical
+table, never a second semantic ledger. A database CHECK forbids governance
+kinds in the evidence plane and general kinds never appear in the control
+plane, so an append position stays unique within `(ledger family, epoch, shard,
+offset)`; projector cursors, cursor vectors, and evidence-compaction
+checkpoints key their closed head vectors by `(ledger family, shard)`.
+
+The split is a privilege boundary, not a semantic one: one shared physical
+table would hand the serving process raw `INSERT` into the governance ledger.
+For the same reason the evidence head table carries no foreign key to the
+control epoch table — a foreign-key check runs with the writer's privileges,
+so such a key would force a control-table `SELECT` grant on the serving role
+and reopen the boundary it exists to close. Epoch binding is enforced inside
+the append transaction instead: the writer reads the single genesis epoch
+through the read-only writer-authority view and requires the evidence head's
+epoch identity and shard count to equal it, so the single-epoch uniqueness
+constraint stays literal. Evidence heads are bound through that authority view;
+the events-to-heads foreign key inside the evidence plane remains.
 
 The registry defines a consistency/partition key for each event kind, normally a
 canonical entity or source-fact family. Related facts that require shard-local

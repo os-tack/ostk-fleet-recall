@@ -174,6 +174,24 @@ membership and disable the login afterward. There is no AWS secret/task,
 production-image binary, startup hook, or runtime/public route. These source
 capabilities do not expand Stage-2 authority.
 
+After the complete successful prefix 1 through 17, a second repeatable
+generation `N -> N+1` runtime and its own private workstation CLI
+(`ostk-registry-generic-successor-activate`, apply/inspect only, no fixture
+emitter) run the same ceremony under the same
+`fleet_registry_successor_activation` role. It needs no new grant: its
+production SQL surface reaches only `memory_control_events`,
+`memory_control_shard_heads`, `memory_registry_transitions`,
+`memory_registry_current_heads_v2`, and the migration-history preflight, all of
+which the frozen first-successor role already covers, and the
+[successor-activation grant proof](../deploy/cockroach/tests/successor-activation-role-grants.sh)
+asserts that containment directly. At generation `N >= 1` there is no key
+bridge: the authorizing keys come from the package the current head installs,
+which the ceremony supplies as an artifact so its whole approval closure is
+checked offline before any database URL is parsed. Like the first-successor
+CLI it has no Terraform, production-image, ECS, MCP, HTTP, or serving-runtime
+wiring; CI asserts `/usr/local/bin/ostk-registry-generic-successor-activate`
+is absent from the runtime image.
+
 After the complete successful prefix 1 through 16, conflict reconciliation has
 its own separate database-local one-shot
 [role policy](../deploy/cockroach/conflict-reconciliation-role-grants.sql); a
