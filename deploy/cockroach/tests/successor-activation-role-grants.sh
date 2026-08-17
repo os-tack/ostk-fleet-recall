@@ -475,6 +475,96 @@ repository_delete_targets=$(grep -Eio \
     <<<"$successor_source_flat" || true)
 assert_exact "successor DELETE targets" "$repository_delete_targets" ''
 
+# The repeatable generic N -> N+1 runtime is a second producer under the same
+# role. Its production SQL surface is pinned separately from the frozen 0 -> 1
+# module so neither module's inventory can hide behind the other's, and it is
+# asserted to be a SUBSET of the grants the frozen module already needs: the
+# generic ceremony touches no relation the successor role was not already
+# reviewed for, so this proof's grant matrix is unchanged.
+generic_successor_source=$(sed '/^#\[cfg(test)\]/,$d' \
+    "$repo_root/src/registry_activation/generic_successor_cockroach.rs")
+generic_successor_source_flat=$(tr '\n' ' ' <<<"$generic_successor_source")
+
+generic_repository_sql_tables=$(grep -Eo \
+    '(FROM|JOIN|INTO|UPDATE)[[:space:]\\]+public\.memory_[a-z0-9_]+' \
+    <<<"$generic_successor_source_flat" \
+    | sed -E 's/.*public\.(memory_[a-z0-9_]+)$/\1/' \
+    | sort -u)
+expected_generic_repository_sql_tables='memory_control_events
+memory_control_shard_heads
+memory_registry_current_heads_v2
+memory_registry_transitions'
+assert_exact "generic successor direct SQL table surface" \
+    "$generic_repository_sql_tables" "$expected_generic_repository_sql_tables"
+
+generic_repository_select_targets=$(grep -Eo \
+    '(FROM|JOIN)[[:space:]\\]+public\.memory_[a-z0-9_]+' \
+    <<<"$generic_successor_source_flat" \
+    | sed -E 's/.*public\.(memory_[a-z0-9_]+)$/\1/' \
+    | sort -u)
+assert_exact "generic successor direct SELECT targets" \
+    "$generic_repository_select_targets" "$expected_generic_repository_sql_tables"
+
+generic_repository_insert_targets=$(grep -Eo \
+    'INTO[[:space:]\\]+public\.memory_[a-z0-9_]+' \
+    <<<"$generic_successor_source_flat" \
+    | sed -E 's/.*public\.(memory_[a-z0-9_]+)$/\1/' \
+    | sort -u)
+expected_generic_repository_insert_targets='memory_control_events
+memory_registry_transitions'
+assert_exact "generic successor INSERT targets" \
+    "$generic_repository_insert_targets" \
+    "$expected_generic_repository_insert_targets"
+
+generic_repository_update_targets=$(grep -Eo \
+    'UPDATE[[:space:]\\]+public\.memory_[a-z0-9_]+' \
+    <<<"$generic_successor_source_flat" \
+    | sed -E 's/.*public\.(memory_[a-z0-9_]+)$/\1/' \
+    | sort -u)
+expected_generic_repository_update_targets='memory_control_shard_heads
+memory_registry_current_heads_v2'
+assert_exact "generic successor UPDATE targets" \
+    "$generic_repository_update_targets" \
+    "$expected_generic_repository_update_targets"
+
+generic_repository_delete_targets=$(grep -Eio \
+    'DELETE[[:space:]\\]+FROM[[:space:]\\]+public\.memory_[a-z0-9_]+' \
+    <<<"$generic_successor_source_flat" || true)
+assert_exact "generic successor DELETE targets" \
+    "$generic_repository_delete_targets" ''
+
+# Every relation the generic module reaches must already be a relation the
+# frozen 0 -> 1 module reaches, so the reviewed grant matrix below stays exact.
+while IFS= read -r generic_relation; do
+    test -n "$generic_relation" || continue
+    grep -Fqx "$generic_relation" <<<"$expected_repository_sql_tables" \
+        || fail "generic successor reaches an ungranted relation: $generic_relation"
+done <<<"$expected_generic_repository_sql_tables"
+
+# The generic module's own reachability audit pins _sqlx_migrations beside the
+# four memory_* relations; the shared control-log witness below supplies
+# memory_control_bootstraps / memory_control_log_epochs for its durable
+# bootstrap read. Nothing else may appear.
+generic_migration_reads=$(grep -Eo \
+    '(FROM|JOIN|INTO|UPDATE)[[:space:]\\]+public\._sqlx_migrations' \
+    <<<"$generic_successor_source_flat" \
+    | sed -E 's/.*public\.(_sqlx_migrations)$/\1/' \
+    | sort -u)
+assert_exact "generic successor migration-history reads" \
+    "$generic_migration_reads" '_sqlx_migrations'
+grep -Fq 'load_durable_genesis_witness' <<<"$generic_successor_source" \
+    || fail "generic successor lost its shared durable-bootstrap witness read"
+
+generic_schema_preflight=$(sed -n \
+    '/^const REQUIRE_GENERIC_SUCCESSOR_SCHEMA_SQL:/,/version BETWEEN 1 AND 17";$/p' \
+    "$repo_root/src/registry_activation/generic_successor_cockroach.rs")
+expected_generic_schema_preflight='const REQUIRE_GENERIC_SUCCESSOR_SCHEMA_SQL: &str = "SELECT pg_catalog.current_database() = '\''fleet_recall'\'' \
+     AND count(*) = 17 \
+     AND COALESCE(bool_and(success), false) \
+     FROM public._sqlx_migrations WHERE version BETWEEN 1 AND 17";'
+assert_exact "database/schema-first generic successor prefix preflight bytes" \
+    "$generic_schema_preflight" "$expected_generic_schema_preflight"
+
 shared_control_source=$(sed '/^#\[cfg(test)\]/,$d' \
     "$repo_root/src/control_log/cockroach.rs")
 shared_successor_read_targets=$(printf '%s\n' "$shared_control_source" \
@@ -498,6 +588,7 @@ assert_exact "database/schema-first successor prefix preflight bytes" \
 
 production_authority_source=$(for source_file in \
     "$repo_root/src/registry_activation/successor_cockroach.rs" \
+    "$repo_root/src/registry_activation/generic_successor_cockroach.rs" \
     "$repo_root/src/registry_activation/cockroach.rs" \
     "$repo_root/src/registry_activation/genesis_audit.rs" \
     "$repo_root/src/control_log/cockroach.rs"; do
