@@ -21,6 +21,18 @@ cannot count as connected success.
 | Stage-2 control repository | `--test control_log_live` / `live_stage2_genesis_repository_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Genesis Stage-3 repository | `--test registry_activation_live` / `live_genesis_registry_activation_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Successor repository | `--test successor_activation_live` / `live_first_successor_activation_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Generic N -> N+1 successor repository | `--test generic_successor_activation_live` / `live_generic_successor_activation_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence ledger: all three Stage-4 kinds append and audit | `--test evidence_ledger_live` / `live_all_three_stage4_kinds_append_and_audit_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence ledger: chain tamper is reported by the audit | `--test evidence_ledger_live` / `live_chain_tamper_is_reported_by_the_audit_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence ledger: concurrent appends to distinct shards keep independent heads | `--test evidence_ledger_live` / `live_concurrent_appends_to_distinct_shards_keep_independent_heads_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence ledger: concurrent appends to one shard form one chain | `--test evidence_ledger_live` / `live_concurrent_appends_to_one_shard_form_one_chain_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence ledger: exact replay is a no-op | `--test evidence_ledger_live` / `live_exact_replay_is_a_no_op_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence ledger: integrity collision is quarantined | `--test evidence_ledger_live` / `live_integrity_collision_is_quarantined_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence ledger: least-privilege probe role appends without control grants | `--test evidence_ledger_live` / `live_least_privilege_probe_role_appends_without_control_grants_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence ledger: preimage disagreement is quarantined | `--test evidence_ledger_live` / `live_preimage_disagreement_is_quarantined_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence ledger: single append and shard chain audit | `--test evidence_ledger_live` / `live_single_append_and_shard_chain_audit_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence ledger: statement bound to a never-active head writes nothing | `--test evidence_ledger_live` / `live_statement_bound_to_a_never_active_head_writes_nothing_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence ledger: witness mismatch writes nothing | `--test evidence_ledger_live` / `live_witness_mismatch_writes_nothing_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Current-projection whole-unit retry | `--lib` / `ledger::cockroach::tests::live_current_projection_whole_unit_retry_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Current-projection snapshot race | `--lib` / `ledger::cockroach::tests::live_current_projection_snapshot_race_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Functional-polarity conflict matrix | `--lib` / `ledger::cockroach::tests::live_conflict_polarity_matrix_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
@@ -32,11 +44,20 @@ cannot count as connected success.
 | Dense retrieval uses the C-SPANN vector index | `--lib` / `store::cockroach::tests::live_cockroach_dense_plan_uses_vector_index_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Publication reader recall/deny boundary | `--test publication_reader_live` / `publication_reader_executes_the_real_recall_surface` | `FLEET_RECALL_PUBLICATION_DATABASE_URL` plus the mode-0600 test-only admin secret-file path |
 
-The same isolated server also exercises all four private workstation CLIs:
+The evidence-ledger row set is asserted complete: the wrapper compares every
+`live_*` name the `evidence_ledger_live` harness lists against the exact set it
+runs, so a new connected test that nobody wires fails the proof instead of
+silently not running.
+
+The same isolated server also exercises all five private workstation CLIs:
 inspect/apply/replay for control and genesis activation; offline artifact
 binding, pre-genesis and failed-prefix rejection, then
 `Ready`/`Inserted`/`Accepted`/`ExactReplay`/`Stale` for successor activation;
-and materialize/exact replay for apply-only conflict reconciliation. It
+apply/inspect for the repeatable generic `N -> N+1` successor ceremony
+(`ostk-registry-generic-successor-activate`, built and asserted executable --
+its production parser exposes no fixture emitter, so no emitter discovery is
+wired for it); and materialize/exact replay for apply-only conflict
+reconciliation. It
 requires exactly 18 successful SQLx rows with versions 1 through 18, the three
 successor authority tables, the two genesis-root indexes, and the exact indexes
 introduced by migrations 15, 16, and 17. The retired pre-v15 conflict

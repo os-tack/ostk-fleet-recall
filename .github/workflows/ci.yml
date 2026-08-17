@@ -149,6 +149,7 @@ jobs:
             test ! -e /usr/local/bin/ostk-control-bootstrap &&
             test ! -e /usr/local/bin/ostk-registry-activate &&
             test ! -e /usr/local/bin/ostk-registry-successor-activate &&
+            test ! -e /usr/local/bin/ostk-registry-generic-successor-activate &&
             test ! -e /usr/local/bin/ostk-conflict-reconcile &&
             test -x /usr/bin/curl &&
             test -r /opt/ostk/demo/demo.ndjson &&

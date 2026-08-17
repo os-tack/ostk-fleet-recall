@@ -1633,6 +1633,49 @@ FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
     cargo test --locked --test successor_activation_live "$successor_live_test" \
         -- --exact --nocapture
 
+# The repeatable generic N -> N+1 ceremony runs its own whole chain in a
+# uuid-scoped tenant/project, so it neither depends on nor disturbs the 0 -> 1
+# regression above.
+generic_successor_live_test=live_generic_successor_activation_when_configured
+generic_successor_live_listing=$(cargo test --locked \
+    --test generic_successor_activation_live -- --list)
+require_discovered_test "$generic_successor_live_listing" \
+    "$generic_successor_live_test"
+FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+    cargo test --locked --test generic_successor_activation_live \
+        "$generic_successor_live_test" -- --exact --nocapture
+
+# Every Stage-4 evidence-ledger connected test, by exact discovered name. The
+# list is asserted complete against the harness listing below, so a new live_*
+# test that nobody wires here fails this proof instead of silently not running.
+evidence_ledger_live_tests='live_all_three_stage4_kinds_append_and_audit_when_configured
+live_chain_tamper_is_reported_by_the_audit_when_configured
+live_concurrent_appends_to_distinct_shards_keep_independent_heads_when_configured
+live_concurrent_appends_to_one_shard_form_one_chain_when_configured
+live_exact_replay_is_a_no_op_when_configured
+live_integrity_collision_is_quarantined_when_configured
+live_least_privilege_probe_role_appends_without_control_grants_when_configured
+live_preimage_disagreement_is_quarantined_when_configured
+live_single_append_and_shard_chain_audit_when_configured
+live_statement_bound_to_a_never_active_head_writes_nothing_when_configured
+live_witness_mismatch_writes_nothing_when_configured'
+evidence_ledger_live_listing=$(cargo test --locked \
+    --test evidence_ledger_live -- --list)
+discovered_evidence_ledger_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$evidence_ledger_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact evidence-ledger connected test set" \
+    "$discovered_evidence_ledger_live_tests" "$evidence_ledger_live_tests"
+while IFS= read -r evidence_ledger_live_test; do
+    test -n "$evidence_ledger_live_test" || continue
+    require_discovered_test "$evidence_ledger_live_listing" \
+        "$evidence_ledger_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test evidence_ledger_live \
+            "$evidence_ledger_live_test" -- --exact --nocapture
+done <<<"$evidence_ledger_live_tests"
+
 current_retry_live_test=ledger::cockroach::tests::live_current_projection_whole_unit_retry_when_configured
 current_snapshot_live_test=ledger::cockroach::tests::live_current_projection_snapshot_race_when_configured
 conflict_live_test=ledger::cockroach::tests::live_conflict_polarity_matrix_when_configured
@@ -2476,10 +2519,17 @@ cargo build --locked \
     --bin ostk-control-bootstrap \
     --bin ostk-registry-activate \
     --bin ostk-registry-successor-activate \
+    --bin ostk-registry-generic-successor-activate \
     --bin ostk-conflict-reconcile >/dev/null
 successor_binary="$repo_root/target/debug/ostk-registry-successor-activate"
 test -x "$successor_binary" \
     || fail "locked build did not produce the successor activation CLI"
+# The generic N -> N+1 CLI has no fixture emitter by design: its production
+# parser exposes only apply/inspect, so this proof asserts the built artifact
+# and deliberately wires no emitter discovery for it.
+generic_successor_binary="$repo_root/target/debug/ostk-registry-generic-successor-activate"
+test -x "$generic_successor_binary" \
+    || fail "locked build did not produce the generic successor activation CLI"
 successor_emitter_test_name='tests::emit_dynamic_successor_fixture_for_connected_proof'
 successor_emitter_listing=$(cargo test --locked \
     --bin ostk-registry-successor-activate -- --list)
