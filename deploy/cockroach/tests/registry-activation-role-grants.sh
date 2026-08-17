@@ -108,7 +108,7 @@ application_head_update=$(sed -n \
     '/^const ADVANCE_CONTROL_HEAD_SQL:/,/^     RETURNING last_committed_offset, chain_digest";$/p' \
     "$repo_root/src/registry_activation/cockroach.rs")
 # shellcheck disable=SC2016 # Rust bind placeholders are intentional literals.
-expected_application_head_update='const ADVANCE_CONTROL_HEAD_SQL: &str = "UPDATE memory_control_shard_heads \
+expected_application_head_update='const ADVANCE_CONTROL_HEAD_SQL: &str = "UPDATE public.memory_control_shard_heads \
      SET last_committed_offset = $5, chain_digest = $6, advanced_at = $7 \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 \
        AND last_committed_offset = $8 AND chain_digest = $9 \
@@ -116,7 +116,7 @@ expected_application_head_update='const ADVANCE_CONTROL_HEAD_SQL: &str = "UPDATE
 assert_exact "activation repository shard-head CAS" \
     "$application_head_update" "$expected_application_head_update"
 application_head_update_count=$(grep -Ec \
-    '^const [A-Z_]+: &str = "UPDATE memory_control_shard_heads' \
+    '^const [A-Z_]+: &str = "UPDATE public[.]memory_control_shard_heads' \
     "$repo_root/src/registry_activation/cockroach.rs")
 assert_exact "activation repository shard-head UPDATE count" \
     "$application_head_update_count" '1'
@@ -128,11 +128,11 @@ assert_exact "activation repository event kind" \
     "$activation_event_kind" 'registry.genesis.activated'
 
 activation_schema_preflight=$(sed -n \
-    '/^const REQUIRE_ACTIVATION_SCHEMA_SQL:/,/^     FROM _sqlx_migrations WHERE version BETWEEN 1 AND 9";$/p' \
+    '/^const REQUIRE_ACTIVATION_SCHEMA_SQL:/,/^     FROM public[.]_sqlx_migrations WHERE version BETWEEN 1 AND 9";$/p' \
     "$repo_root/src/registry_activation/cockroach.rs")
 expected_activation_schema_preflight='const REQUIRE_ACTIVATION_SCHEMA_SQL: &str = "SELECT count(*) = 9 \
      AND COALESCE(bool_and(success), false) \
-     FROM _sqlx_migrations WHERE version BETWEEN 1 AND 9";'
+     FROM public._sqlx_migrations WHERE version BETWEEN 1 AND 9";'
 assert_exact "activation repository complete migration prefix" \
     "$activation_schema_preflight" "$expected_activation_schema_preflight"
 
