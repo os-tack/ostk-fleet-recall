@@ -935,6 +935,16 @@ assert_exact "zero unqualified current_database calls" \
 # the matrix. The semantic reachability assertions below explain the one narrow
 # keyed history DELETE (and the SELECT CockroachDB requires to evaluate its
 # WHERE clause); any source change requires a new privilege review.
+#
+# The Wave-1 Stage-4 runtime source (writer-authority head witness, evidence v2
+# admission + governed content store, relation attestation projection, and the
+# bootstrap-manifest import contract) is frozen here too. Those modules compile
+# into the executable but are not reachable from the running server: main.rs
+# wires none of them, and the event-first remember(assert) route that would
+# drive them fails closed (application.rs) until the deployment carries the
+# writer-authority pins. They add no reachable database access path, so the
+# grant matrix and policy SQL are unchanged; freezing their bytes forces a new
+# privilege review the moment a future wave wires them into a live role.
 reviewed_source_manifest=$(shasum -a 256 \
     "$repo_root/src/config.rs" \
     "$repo_root/src/main.rs" \
@@ -943,16 +953,32 @@ reviewed_source_manifest=$(shasum -a 256 \
     "$repo_root/src/ledger/cockroach.rs" \
     "$repo_root/src/service.rs" \
     "$repo_root/src/application.rs" \
-    "$repo_root/src/reference_agent.rs") \
+    "$repo_root/src/reference_agent.rs" \
+    "$repo_root/src/registry_witness/mod.rs" \
+    "$repo_root/src/evidence_ledger/admission.rs" \
+    "$repo_root/src/evidence_ledger/content_store.rs" \
+    "$repo_root/src/relation_projection/mod.rs" \
+    "$repo_root/src/relation_projection/cockroach.rs" \
+    "$repo_root/src/relation_projection/projector.rs" \
+    "$repo_root/src/relation_projection/repository.rs" \
+    "$repo_root/src/memory_contracts/bootstrap_manifest.rs") \
     || fail "could not hash the reviewed runtime source snapshot"
-expected_reviewed_source_manifest="5ddd1e204c55dce12b0f22c94557c5271d7e559c0668d4cc46907d8cb2422f45  $repo_root/src/config.rs
+expected_reviewed_source_manifest="9c1058448fd1b1c8a8bf95c7156b087c237c7e6d9be4b106e9759906dd4e5411  $repo_root/src/config.rs
 76224d95199b19cf12b52f623ece802b9c5d57abc57833c17de2ccd336db16be  $repo_root/src/main.rs
 7718c15393872a139956732629c472d813a2a014395f943a5382191966162745  $repo_root/src/private_postgres.rs
 586f6c9c935140de9580e4b4490df3fc24a9f30e9f4c6c6bf1e194c6e6fc9d1e  $repo_root/src/store/cockroach.rs
 b8c3ffbd3dfe7a74f76a06815f317db3e79b3129adaa14e2da5bea43f60b069f  $repo_root/src/ledger/cockroach.rs
-6f0c6874072baed1070204063ac65df0761eda2da862e51775ba85cc5a34b522  $repo_root/src/service.rs
-5c1707702371016d7d35a58ffe8179e6015d48564e12e36df81cfc8b2c5f5e70  $repo_root/src/application.rs
-2bfc742926ef753ee90458a294bb59dbddf2afa2e9983484548f2fe0b7b77d26  $repo_root/src/reference_agent.rs"
+c885c07bce2caa310a2b9f1d8fd2aa49edc672c4184bb4b85a9e2018993f9cb1  $repo_root/src/service.rs
+ee1d0b5a13f1906c13cbd3e93d26196d7bdace91895d8d2302c440d66ec8ef53  $repo_root/src/application.rs
+2bfc742926ef753ee90458a294bb59dbddf2afa2e9983484548f2fe0b7b77d26  $repo_root/src/reference_agent.rs
+eebc2a17a41b3caa9b6f751f6d3f28b658aa9670f3cfb21d1e00b91219ffada6  $repo_root/src/registry_witness/mod.rs
+d0c4c264139cb97bfc488fd164d078f71d65cce812b7a081936647e1bbd1b3ec  $repo_root/src/evidence_ledger/admission.rs
+e162ab08fc55a6ec4760bf4fceca6ab90645dea404d9c189a057dfc72d53bb4f  $repo_root/src/evidence_ledger/content_store.rs
+4afddafc55424f6cdab7f1b3779135ee0287f560d5f78ae76d055f0ea2fd1498  $repo_root/src/relation_projection/mod.rs
+8d77efb246e57764887a1f518d78f0ab0f39a456b3a804733bb0e5c0acf94066  $repo_root/src/relation_projection/cockroach.rs
+98d26bf151cd34ab5a08c61b69c9bb206f714fe9829885472f99a4d6fa71bb9a  $repo_root/src/relation_projection/projector.rs
+ac8d34bbb67749e561a81fcce6d30b4be23887a0800b568187b7fe3a15e89e24  $repo_root/src/relation_projection/repository.rs
+5728dfb3b50116801dad7ba13fdb12a0367ad170156562626da72b357aa43d6c  $repo_root/src/memory_contracts/bootstrap_manifest.rs"
 assert_exact "reviewed runtime source manifest" \
     "$reviewed_source_manifest" "$expected_reviewed_source_manifest"
 
