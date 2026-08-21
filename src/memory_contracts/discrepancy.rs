@@ -122,6 +122,23 @@ fn dimension_present(applicability: &[ApplicabilityDimensionV1], id: &ContractId
         .is_ok()
 }
 
+/// True when `text` has no visible content once ordinary whitespace AND the
+/// zero-width Unicode characters `str::trim` does not strip are removed.
+///
+/// `str::trim` only strips `White_Space`; U+200B ZERO WIDTH SPACE, U+200C/
+/// U+200D (ZWNJ/ZWJ), U+FEFF (BOM / ZERO WIDTH NO-BREAK SPACE), and U+2060
+/// WORD JOINER are not `White_Space`, so `"\u{200B}".trim().is_empty()` is
+/// `false` -- a rationale of only invisible characters would otherwise pass
+/// a "dismiss/waive without justification is rejected" check in form while
+/// evading it in substance.
+fn is_blank_rationale(text: &str) -> bool {
+    text.chars()
+        .filter(|character| !matches!(character, '\u{200B}'..='\u{200D}' | '\u{FEFF}' | '\u{2060}'))
+        .collect::<String>()
+        .trim()
+        .is_empty()
+}
+
 // ---------------------------------------------------------------------------
 // Finding types (lines 640-652 of the architecture doc)
 // ---------------------------------------------------------------------------
@@ -290,14 +307,30 @@ impl ComparatorLineageRegistrationV1 {
 /// (this module) and `StructurallyResolvedConnectorSchemaV2`
 /// (`evidence_v2.rs`): any caller can construct registry-entry bytes; runtime
 /// admission must additionally prove membership in the exact active
-/// package/head. Reuses `RegistryEntryKind::PredicateSchema` (the doc's
-/// PRED-02 predicate/comparator category) under its own `entry_schema_id`
-/// (`registry.comparator_lineage`), disjoint from `genesis.rs`'s
-/// `PredicateSchemaEntryV1` body (`registry.predicate_schema`) -- the same
-/// kind tag, a distinct body namespace, exactly the reuse-without-collision
-/// pattern `StructurallyResolvedEpisodePolicyV2` already established for
-/// `RegistryEntryKind::EpisodePolicy`. No digest.rs/registry.rs/genesis.rs
-/// change.
+/// package/head.
+///
+/// Binds to the real `RegistryEntryKind::ComparatorLineage` reserved slot
+/// (W0-REG-2, `dd21a2e`) under its own `entry_schema_id`
+/// (`registry.comparator_lineage`) -- **not** a squat on
+/// `RegistryEntryKind::PredicateSchema` as an earlier revision of this type
+/// did. The kind is `is_generation2_only()`, so `decode_successor_entry`
+/// (`successor_package.rs`) and `decode_entry` (`genesis.rs`) both reject any
+/// package that carries this entry outright: no `SemanticallyClosedGenesisPackage`,
+/// `SemanticallyClosedSuccessorPackage`, or (by extension)
+/// `SemanticallyClosedStage4Package` can ever admit a comparator-lineage
+/// registration today (`comparator_lineage_entry_is_rejected_by_every_v1_and_successor_closure`).
+/// The one path that genuinely proves package membership without decoding is
+/// `generation2::ReservedSlotCarriageV1::from_package_entry` -- a
+/// manifest-verified, canonically ordered, digest-checked
+/// `RegistryPackageV1` can carry this entry, and the carriage reports the
+/// same canonical body bytes this type resolves from a raw entry directly
+/// (`comparator_lineage_registration_is_carriable_through_the_real_registry_package_path`).
+/// Carriage is not admission (`generation2.rs`'s own `ReservedSlotCarriageV1`
+/// doc): full generation-2 typed-body dispatch for this kind is still W0-REG's
+/// to wire (flagged under `requests`), so `from_registry_entry` below remains
+/// a structural-only resolution, exactly like
+/// `StructurallyResolvedEpisodePolicyV2`, used both directly on test-constructed
+/// entries and on the body bytes a `ReservedSlotCarriageV1` reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructurallyResolvedComparatorLineageV1 {
     registry_reference: RegistryReferenceV1,
@@ -307,7 +340,7 @@ pub struct StructurallyResolvedComparatorLineageV1 {
 impl StructurallyResolvedComparatorLineageV1 {
     pub fn from_registry_entry(entry: &RegistryEntryV1) -> ContractResult<Self> {
         entry.validate()?;
-        if entry.kind != RegistryEntryKind::PredicateSchema
+        if entry.kind != RegistryEntryKind::ComparatorLineage
             || entry.entry_schema_id.as_str() != COMPARATOR_LINEAGE_ENTRY_SCHEMA_ID
             || entry.entry_schema_version != COMPARATOR_LINEAGE_REGISTRATION_SCHEMA_VERSION
         {
@@ -988,7 +1021,7 @@ pub struct WaiverRecordV1 {
 
 impl WaiverRecordV1 {
     pub fn validate_shape(&self) -> ContractResult<()> {
-        let valid = !self.rationale.trim().is_empty()
+        let valid = !is_blank_rationale(&self.rationale)
             && self.rationale.len() <= MAX_RATIONALE_BYTES
             && self.applicability_scope.len() <= MAX_APPLICABILITY_DIMENSIONS
             && strictly_sorted_by_dimension(&self.applicability_scope)
@@ -1024,7 +1057,7 @@ pub struct DismissalReasonV1 {
 
 impl DismissalReasonV1 {
     fn validate_shape(&self) -> ContractResult<()> {
-        if self.rationale.trim().is_empty() || self.rationale.len() > MAX_RATIONALE_BYTES {
+        if is_blank_rationale(&self.rationale) || self.rationale.len() > MAX_RATIONALE_BYTES {
             return Err(ContractError::Schema(
                 "dismissal requires a non-empty, bounded rationale".into(),
             ));
@@ -1268,6 +1301,17 @@ pub fn authorize_lifecycle_transition(
                             .into(),
                     ));
                 }
+                // DISC-05 ("a waiver is durable policy"): a waiver whose
+                // `expiry_at` is already at or before the event's own
+                // `effective_at` never had effect -- it would project `Open`
+                // the instant it is applied, recording an audit-trail entry
+                // for a suppression that never actually suppressed anything.
+                if waiver.expiry_at <= event.effective_at {
+                    return Err(ContractError::Schema(
+                        "DISC-05: waiver expiry_at must be strictly after the event's own effective_at"
+                            .into(),
+                    ));
+                }
             }
             LifecycleTransitionV1::Acknowledge { .. } => {}
         }
@@ -1305,10 +1349,26 @@ pub enum EpisodeRelationKindV1 {
 /// An explicit, non-destructive relation between episodes. `combined_from`
 /// requires at least two sources; the other kinds require exactly one. The
 /// target may never also appear as one of its own sources.
+///
+/// Carries `scope`, `profile`, and `family_fingerprint` -- the same
+/// authenticated-scope-binding convention every sibling contract in this
+/// crate uses -- because a relation can force the strongest possible
+/// suppression an episode's projection can reach
+/// (`LifecycleState::Superseded`, via [`project_discrepancy_episode`]) purely
+/// from its episode fingerprints, which are public identifiers, not secrets.
+/// Without this binding, a relation minted with only the public fingerprints
+/// of two episodes in different tenants or different discrepancy families
+/// could suppress one from the other; `project_discrepancy_episode` rejects
+/// any relation naming its envelope whose `scope`/`profile`/`family_fingerprint`
+/// diverges from the envelope's own, mirroring
+/// `authorize_lifecycle_transition`'s identical check on lifecycle events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscrepancyEpisodeRelationV1 {
     pub schema_version: u32,
+    pub profile: ProfileReferenceV1,
+    pub scope: AuthenticatedProjectScopeV1,
+    pub family_fingerprint: DiscrepancyFamilyFingerprintV1,
     pub kind: EpisodeRelationKindV1,
     pub from_episodes: Vec<DiscrepancyEpisodeFingerprintV1>,
     pub to_episode: DiscrepancyEpisodeFingerprintV1,
@@ -1316,6 +1376,7 @@ pub struct DiscrepancyEpisodeRelationV1 {
 
 impl DiscrepancyEpisodeRelationV1 {
     pub fn validate_shape(&self) -> ContractResult<()> {
+        self.profile.validate()?;
         let arity_valid = match self.kind {
             EpisodeRelationKindV1::CombinedFrom => self.from_episodes.len() >= 2,
             EpisodeRelationKindV1::Continues
@@ -1333,6 +1394,102 @@ impl DiscrepancyEpisodeRelationV1 {
         }
         Ok(())
     }
+
+    /// True when this relation names `episode_fingerprint`, either as a
+    /// source or as its target.
+    fn names(&self, episode_fingerprint: DiscrepancyEpisodeFingerprintV1) -> bool {
+        self.to_episode == episode_fingerprint || self.from_episodes.contains(&episode_fingerprint)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Observation gap (doc lines 1338-1348): the seam `allowed_observation_gap_seconds`
+// actually feeds. A declared field no code path reads is worse than no field
+// at all (see the waiver-scope docstring above): this is that field's reader.
+// ---------------------------------------------------------------------------
+
+/// Outcome of comparing an observation gap against
+/// [`EpisodePolicyV2::allowed_observation_gap_seconds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationGapOutcomeV1 {
+    /// The gap is within the registered bound: the SAME episode continues,
+    /// its observed interval recorded incomplete but not ended.
+    Bridged,
+    /// The gap exceeds the registered bound -- or the policy registers no
+    /// bound at all (`allowed_observation_gap_seconds: None`, "no observation
+    /// gap may be bridged") -- so the prior occurrence's known observed
+    /// interval ends here.
+    EpisodeEnded,
+}
+
+/// Classify the gap between one episode's last known observed instant and
+/// the next candidate occurrence's opening instant, against
+/// `policy.allowed_observation_gap_seconds`.
+///
+/// `EpisodeEnded` is the outcome a caller pairs with a
+/// `VerificationState::Indeterminate` verification update on the prior
+/// occurrence (already representable: `VerificationUpdateV1 { state:
+/// VerificationState::Indeterminate, .. }` needs no new type) and a
+/// `PossiblyContinues` relation linking it to the newly opened episode. This
+/// function only classifies the gap; recording those two outcomes is the
+/// caller's responsibility, matching every other pure decision function in
+/// this module (`select_opening_transition`, `nominate_repeated_waiver_drift`).
+pub fn classify_observation_gap(
+    policy: &EpisodePolicyV2,
+    prior_effective_until: &CanonicalTimestamp,
+    next_effective_from: &CanonicalTimestamp,
+) -> ContractResult<ObservationGapOutcomeV1> {
+    if next_effective_from <= prior_effective_until {
+        return Err(ContractError::Schema(
+            "observation gap requires the next occurrence to begin strictly after the prior one ends"
+                .into(),
+        ));
+    }
+    let gap_seconds = seconds_between(prior_effective_until, next_effective_from)?;
+    Ok(match policy.allowed_observation_gap_seconds {
+        Some(allowed) if gap_seconds <= allowed => ObservationGapOutcomeV1::Bridged,
+        _ => ObservationGapOutcomeV1::EpisodeEnded,
+    })
+}
+
+/// Whole seconds between two canonical UTC timestamps. Both are already
+/// proven parseable RFC 3339 by [`CanonicalTimestamp::parse`], so only the
+/// ordering precondition (`classify_observation_gap`'s caller) can make this
+/// fail in practice.
+fn seconds_between(
+    earlier: &CanonicalTimestamp,
+    later: &CanonicalTimestamp,
+) -> ContractResult<u64> {
+    let earlier = chrono::DateTime::parse_from_rfc3339(earlier.as_str())
+        .map_err(|_| ContractError::Schema("timestamp is not parseable".into()))?;
+    let later = chrono::DateTime::parse_from_rfc3339(later.as_str())
+        .map_err(|_| ContractError::Schema("timestamp is not parseable".into()))?;
+    u64::try_from(later.signed_duration_since(earlier).num_seconds())
+        .map_err(|_| ContractError::Schema("observation gap is not positive".into()))
+}
+
+/// A `PossiblyContinues` relation is only meaningful once the gap has ended
+/// the prior occurrence's observed interval.
+///
+/// Asserting it while the gap between the two episodes is still within the
+/// registered bound (`ObservationGapOutcomeV1::Bridged`) is rejected: the
+/// policy itself says those two occurrences bridge into ONE episode, so
+/// linking them as merely "possibly" the same occurrence contradicts the
+/// very policy that resolved them.
+pub fn validate_possibly_continues_gap(
+    relation: &DiscrepancyEpisodeRelationV1,
+    gap_outcome: ObservationGapOutcomeV1,
+) -> ContractResult<()> {
+    relation.validate_shape()?;
+    if relation.kind == EpisodeRelationKindV1::PossiblyContinues
+        && gap_outcome == ObservationGapOutcomeV1::Bridged
+    {
+        return Err(ContractError::Schema(
+            "possibly_continues asserted within the allowed observation gap: the policy bridges these occurrences into one episode"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1370,16 +1527,26 @@ pub struct DiscrepancyEpisodeProjectionV1 {
 /// the waiver context (DISC-05, DISC-03).
 ///
 /// `relations` is the full set of [`DiscrepancyEpisodeRelationV1`] records that
-/// may name this envelope's episode. Whenever a `superseded` relation's
-/// `from_episodes` contains `envelope.episode_fingerprint` -- i.e. this is the
-/// OLD side of a canonical replacement -- the projection is
-/// [`LifecycleState::Superseded`], overriding whatever lifecycle transitions
-/// replayed above it (a replaced episode is frozen, not reopened by a later
-/// waiver expiry). This is the only producer of `Superseded`: the variant is
-/// otherwise unreachable, matching the doc's "replay ... marks the earlier
-/// projections superseded, retaining explicit `combined_from` or `continues`
-/// relations." Pass `&[]` when no relation set applies (an episode with no
-/// known supersession is never superseded).
+/// may name this envelope's episode. Whenever a `superseded` OR
+/// `combined_from` relation's `from_episodes` contains
+/// `envelope.episode_fingerprint` -- i.e. this is a SOURCE side of a
+/// canonical replacement, whether a one-to-one split/rebind or a
+/// many-to-one combine -- the projection is [`LifecycleState::Superseded`],
+/// overriding whatever lifecycle transitions replayed above it (a replaced
+/// episode is frozen, not reopened by a later waiver expiry). This is the
+/// only producer of `Superseded`: the variant is otherwise unreachable,
+/// matching the doc's "replay ... marks the earlier projections superseded,
+/// retaining explicit `combined_from` or `continues` relations." Pass `&[]`
+/// when no relation set applies (an episode with no known supersession is
+/// never superseded).
+///
+/// A relation that names this envelope's episode -- as a source or as the
+/// target -- but whose `scope`/`profile`/`family_fingerprint` diverges from
+/// the envelope's own is rejected with an error, never silently ignored or
+/// silently trusted: an episode fingerprint is a public identifier, not a
+/// secret, so knowledge of it alone must never authorize a cross-tenant or
+/// cross-family transition (mirroring `authorize_lifecycle_transition`'s
+/// identical scope/profile check on lifecycle events).
 pub fn project_discrepancy_episode(
     envelope: &DiscrepancyEnvelopeV1,
     events: &[DiscrepancyLifecycleEventV1],
@@ -1392,6 +1559,23 @@ pub fn project_discrepancy_episode(
     }
     for relation in relations {
         relation.validate_shape()?;
+        // A relation's episode fingerprints are public identifiers, not
+        // secrets (matching `authorize_lifecycle_transition`'s identical
+        // reasoning for lifecycle events): a relation that names this
+        // envelope's episode at all -- as a source or as the target -- must
+        // be bound to the exact same authenticated scope/profile and the
+        // exact same discrepancy family, or it is rejected outright rather
+        // than silently ignored or silently trusted.
+        if relation.names(envelope.episode_fingerprint)
+            && (relation.scope != envelope.scope
+                || relation.profile != envelope.profile
+                || relation.family_fingerprint != envelope.family_fingerprint)
+        {
+            return Err(ContractError::Schema(
+                "episode relation naming this envelope diverges in scope/profile/family from the envelope"
+                    .into(),
+            ));
+        }
     }
 
     let mut ordered: Vec<(&DiscrepancyLifecycleEventV1, Vec<u8>)> = events
@@ -1404,6 +1588,14 @@ pub fn project_discrepancy_episode(
             .cmp(&right_event.effective_at)
             .then_with(|| left_bytes.cmp(right_bytes))
     });
+    // Idempotent replay: a byte-identical event supplied more than once (an
+    // at-least-once delivery retry, a duplicate append) is applied once, not
+    // once per occurrence -- REPLAY-01's order-independence guarantee is
+    // weaker than it should be if it holds for reordering but not repetition.
+    // Dedup only after sorting so which physical copy survives is itself
+    // deterministic, never input-position-dependent.
+    let mut seen_event_bytes: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    ordered.retain(|(_, bytes)| seen_event_bytes.insert(bytes.clone()));
 
     let mut state = DiscrepancyEpisodeProjectionV1 {
         episode_fingerprint: envelope.episode_fingerprint,
@@ -1474,12 +1666,19 @@ pub fn project_discrepancy_episode(
     // runs last so supersession dominates every event-driven transition and
     // the waiver-expiry reopen above, retaining the episode's history without
     // erasing it (doc: "marks the earlier projections superseded, retaining
-    // explicit ... relations").
+    // explicit `combined_from` or `continues` relations"). Both `superseded`
+    // (split) AND `combined_from` (bridge) relations retire their SOURCE
+    // episodes this way -- a combine is a supersession of two-or-more
+    // episodes into one canonical replacement, not merely a record of the
+    // arity rule: the same continuous incompatible interval must not surface
+    // three times (once per source, once for the combined episode).
     let is_superseded = relations.iter().any(|relation| {
-        relation.kind == EpisodeRelationKindV1::Superseded
-            && relation
-                .from_episodes
-                .contains(&envelope.episode_fingerprint)
+        matches!(
+            relation.kind,
+            EpisodeRelationKindV1::Superseded | EpisodeRelationKindV1::CombinedFrom
+        ) && relation
+            .from_episodes
+            .contains(&envelope.episode_fingerprint)
     });
     if is_superseded {
         state.lifecycle_state = LifecycleState::Superseded;
@@ -1491,10 +1690,13 @@ pub fn project_discrepancy_episode(
 /// A family with at least `threshold` waivers is a drift signal, not a
 /// verified finding.
 ///
-/// The return type structurally cannot express `Verified` -- nomination is
-/// always `candidate_only`, no matter how large `waiver_count` grows (PRED-01:
-/// similarity/pattern signals cannot open a verified discrepancy on their
-/// own).
+/// `Option<VerificationState>` could technically carry `Verified` -- the
+/// restriction to `Candidate`-only is enforced by this function's body, not
+/// by the return type itself. It is *this call site*, not the type, that
+/// structurally cannot express `Verified`, no matter how large
+/// `waiver_count` grows (PRED-01: similarity/pattern signals cannot open a
+/// verified discrepancy on their own); see
+/// `repeated_waiver_drift_is_always_candidate_only`.
 pub fn nominate_repeated_waiver_drift(
     waiver_count: usize,
     threshold: usize,
@@ -1517,8 +1719,14 @@ mod tests {
     use crate::memory_contracts::{
         canonical::{CanonicalValue, decode_strict, require_canonical},
         common::frozen_profile_reference_v1,
+        generation2::ReservedSlotCarriageV1,
+        genesis::SemanticallyClosedGenesisPackage,
         identity::IdentityForm,
-        registry::RegistryHeadV1,
+        registry::{
+            ManifestVerifiedRegistryPackage, RegistryHeadV1, RegistryManifestEntryV1,
+            RegistryPackageV1,
+        },
+        successor_package::SemanticallyClosedSuccessorPackage,
     };
 
     const ENVELOPE_FIXTURE: &[u8] =
@@ -1546,6 +1754,13 @@ mod tests {
     );
     const VECTOR_SUITE_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/discrepancy/vector-suite.jsonl");
+    // Frozen v1/Stage-4 fixtures, reused read-only here (never re-pinned by
+    // this workstream) only to prove a comparator-lineage entry appended to
+    // an otherwise-valid package is rejected by every v1/successor closure.
+    const GENESIS_REGISTRY_PACKAGE_FIXTURE: &[u8] =
+        include_bytes!("../../contracts/dynamic-memory/v1/genesis-registry-package.jsonl");
+    const STAGE4_SUCCESSOR_PACKAGE_FIXTURE: &[u8] =
+        include_bytes!("../../contracts/dynamic-memory/v2/stage4-successor/registry-package.jsonl");
 
     const FAMILY_FINGERPRINT: &str =
         "2a0e121fcd2b26621670f810a213e72d91a4a3084c2314ff7811b105cc9c6374";
@@ -1555,7 +1770,7 @@ mod tests {
     const COMPARATOR_LINEAGE_FINGERPRINT: &str =
         "11589b382071ef9df593ef7efe4df898f2ad4ed8e1775a011d4ec3912a5116d2";
     const VECTOR_SUITE_DIGEST: &str =
-        "49f31ef97bfea3adde890e622e6147c1c251559f081b87259a9a812737fee017";
+        "e1897e015369b91282401e7e9567f1c7dadbb351e67054869b2deb08798809fd";
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -1733,7 +1948,7 @@ mod tests {
         let body: CanonicalValue = decode_strict(&body_bytes).unwrap();
         RegistryEntryV1 {
             schema_version: 1,
-            kind: RegistryEntryKind::PredicateSchema,
+            kind: RegistryEntryKind::ComparatorLineage,
             entry_id: registration.lineage.comparator_id.clone(),
             version: registration.lineage.comparator_version,
             entry_schema_id: ContractId::new(COMPARATOR_LINEAGE_ENTRY_SCHEMA_ID).unwrap(),
@@ -1753,6 +1968,121 @@ mod tests {
             &comparator_lineage_registration_entry(),
         )
         .unwrap()
+    }
+
+    /// Re-sort a package's entries and rebuild its manifest to match, after
+    /// appending an entry by hand -- the same canonicalization
+    /// `generation2.rs`'s own test helper performs, duplicated here rather
+    /// than imported since it is private to that module.
+    fn canonicalize_package_order(package: &mut RegistryPackageV1) {
+        package.entries.sort_by(|left, right| {
+            (left.kind.as_str(), left.entry_id.as_str(), left.version).cmp(&(
+                right.kind.as_str(),
+                right.entry_id.as_str(),
+                right.version,
+            ))
+        });
+        package.manifest = package
+            .entries
+            .iter()
+            .map(|entry| RegistryManifestEntryV1 {
+                kind: entry.kind,
+                entry_id: entry.entry_id.clone(),
+                version: entry.version,
+                entry_digest: entry.digest().unwrap(),
+            })
+            .collect();
+    }
+
+    /// Blocker 1 (rebind to the real registry kind): a manifest-verified,
+    /// canonically ordered, digest-checked `RegistryPackageV1` -- the crate's
+    /// real registry-package path, not a hand-built loose `RegistryEntryV1`
+    /// -- can carry a comparator-lineage registration entry, and the
+    /// `ReservedSlotCarriageV1` it reports resolves into the identical
+    /// canonical body `StructurallyResolvedComparatorLineageV1` resolves
+    /// directly from the same raw entry.
+    #[test]
+    fn comparator_lineage_registration_is_carriable_through_the_real_registry_package_path() {
+        let entry = comparator_lineage_registration_entry();
+        let package = RegistryPackageV1 {
+            schema_version: 1,
+            profile: frozen_profile_reference_v1(),
+            entries: vec![entry.clone()],
+            manifest: vec![RegistryManifestEntryV1 {
+                kind: entry.kind,
+                entry_id: entry.entry_id.clone(),
+                version: entry.version,
+                entry_digest: entry.digest().unwrap(),
+            }],
+            positive_vector_suite_digest: digest(
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
+            negative_vector_suite_digest: digest(
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            ),
+        };
+        let verified = ManifestVerifiedRegistryPackage::new(
+            package,
+            &frozen_profile_reference_v1(),
+        )
+        .expect(
+            "a package carrying only a reserved comparator-lineage entry still manifest-verifies",
+        );
+
+        let carriage = ReservedSlotCarriageV1::from_package_entry(
+            &verified,
+            RegistryEntryKind::ComparatorLineage,
+            &entry.entry_id,
+            entry.version,
+        )
+        .expect("the reserved-slot carriage path is the crate's real registry membership proof");
+        assert_eq!(carriage.entry_reference().entry_id, entry.entry_id);
+
+        let via_carriage: ComparatorLineageRegistrationV1 =
+            decode_strict(carriage.body_bytes()).unwrap();
+        let resolved_directly = resolved_comparator_lineage();
+        assert_eq!(&via_carriage.lineage, resolved_directly.lineage());
+        assert_eq!(
+            via_carriage.required_applicability_dimension_ids,
+            resolved_directly.required_applicability_dimension_ids()
+        );
+    }
+
+    /// Blocker 1 (rejection by every v1/successor closure): the same entry
+    /// appended to an otherwise-valid, frozen genesis (v1) or Stage-4
+    /// (successor) package is rejected outright -- `ComparatorLineage` is
+    /// `is_generation2_only()`, so `decode_entry` (`genesis.rs`) and
+    /// `decode_successor_entry` (`successor_package.rs`) both refuse it
+    /// before reaching any comparator-specific logic.
+    /// `SemanticallyClosedStage4Package::from_successor_package` only
+    /// narrows an already-closed `SemanticallyClosedSuccessorPackage`, so the
+    /// successor rejection below forecloses every Stage-4 package too.
+    #[test]
+    fn comparator_lineage_entry_is_rejected_by_every_v1_and_successor_closure() {
+        let entry = comparator_lineage_registration_entry();
+
+        let mut genesis_package: RegistryPackageV1 =
+            decode_strict(record(GENESIS_REGISTRY_PACKAGE_FIXTURE)).unwrap();
+        genesis_package.entries.push(entry.clone());
+        canonicalize_package_order(&mut genesis_package);
+        let genesis_verified =
+            ManifestVerifiedRegistryPackage::new(genesis_package, &frozen_profile_reference_v1())
+                .unwrap();
+        let genesis_error =
+            SemanticallyClosedGenesisPackage::from_manifest_verified(genesis_verified).unwrap_err();
+        assert!(format!("{genesis_error:?}").contains("generation-2-only"));
+
+        let mut successor_package: RegistryPackageV1 =
+            decode_strict(record(STAGE4_SUCCESSOR_PACKAGE_FIXTURE)).unwrap();
+        successor_package.entries.push(entry);
+        canonicalize_package_order(&mut successor_package);
+        let successor_verified =
+            ManifestVerifiedRegistryPackage::new(successor_package, &frozen_profile_reference_v1())
+                .unwrap();
+        let successor_error =
+            SemanticallyClosedSuccessorPackage::from_manifest_verified(successor_verified)
+                .unwrap_err();
+        assert!(format!("{successor_error:?}").contains("generation-2-only"));
     }
 
     /// Recompute `family_fingerprint`/`episode_fingerprint` from an envelope's
@@ -1973,9 +2303,13 @@ mod tests {
     fn episode_relation_split(
         old_episode: DiscrepancyEpisodeFingerprintV1,
         new_episode: DiscrepancyEpisodeFingerprintV1,
+        family_fingerprint: DiscrepancyFamilyFingerprintV1,
     ) -> DiscrepancyEpisodeRelationV1 {
         DiscrepancyEpisodeRelationV1 {
             schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            family_fingerprint,
             kind: EpisodeRelationKindV1::Superseded,
             from_episodes: vec![old_episode],
             to_episode: new_episode,
@@ -1986,11 +2320,15 @@ mod tests {
         first: DiscrepancyEpisodeFingerprintV1,
         second: DiscrepancyEpisodeFingerprintV1,
         combined: DiscrepancyEpisodeFingerprintV1,
+        family_fingerprint: DiscrepancyFamilyFingerprintV1,
     ) -> DiscrepancyEpisodeRelationV1 {
         let mut from_episodes = vec![first, second];
         from_episodes.sort();
         DiscrepancyEpisodeRelationV1 {
             schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            family_fingerprint,
             kind: EpisodeRelationKindV1::CombinedFrom,
             from_episodes,
             to_episode: combined,
@@ -2000,23 +2338,28 @@ mod tests {
     fn negative_cases() -> Vec<String> {
         [
             "applicability_duplicate_or_unsorted",
+            "comparator_lineage_entry_rejected_by_every_v1_and_successor_closure",
             "comparator_lineage_fingerprint_diverges_from_registry",
             "comparator_lineage_requires_concrete_applicability_for_required_dimensions",
             "comparator_lineage_requires_coverage_receipt_when_coverage_proof_required",
             "comparator_lineage_version_bump_changes_lineage_fingerprint",
             "continuity_key_dimension_missing_from_applicability",
             "dismiss_missing_or_empty_rationale",
+            "dismiss_or_waiver_rationale_of_only_zero_width_spaces_is_rejected",
             "envelope_comparator_lineage_required_applicability_dimension_ids_diverge_from_registry",
             "envelope_continuity_key_diverges_from_registered_episode_policy",
             "envelope_episode_fingerprint_mismatch",
             "envelope_episode_policy_reference_diverges_from_registry_entry_digest",
             "envelope_family_fingerprint_mismatch",
+            "episode_relation_cross_family_is_rejected",
+            "episode_relation_foreign_scope_is_rejected",
             "implicated_actor_cannot_dismiss_own_finding",
             "implicated_actor_cannot_resolve_own_finding",
             "lifecycle_event_scope_or_profile_diverges_from_envelope",
             "lifecycle_event_targets_wrong_episode",
             "lifecycle_event_with_no_transition_or_verification_update",
             "physical_append_fields_absent",
+            "possibly_continues_rejected_within_the_allowed_observation_gap",
             "receipt_order_independent_opening_transition",
             "repeated_waiver_drift_is_never_verified",
             "required_applicability_dimension_omitted_is_not_any",
@@ -2027,6 +2370,7 @@ mod tests {
             "unattributed_verification_update_is_not_representable",
             "unknown_finding_type",
             "verified_promotion_requires_nonempty_evidence",
+            "waiver_expiry_at_or_before_the_events_effective_at_is_rejected",
             "waiver_missing_actor_or_expiry",
             "waiver_scope_out_of_scope_or_alien_dimension_is_rejected",
         ]
@@ -2129,14 +2473,22 @@ mod tests {
         let combined_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
             "2222222222222222222222222222222222222222222222222222222222222222",
         ));
-        let split_relation = episode_relation_split(episode_fingerprint, other_episode);
+        let split_relation = episode_relation_split(
+            episode_fingerprint,
+            other_episode,
+            expected_envelope.family_fingerprint,
+        );
         split_relation.validate_shape().unwrap();
         assert_eq!(
             encode_canonical(&split_relation).unwrap(),
             record(EPISODE_RELATION_SPLIT_FIXTURE)
         );
-        let combined_relation =
-            episode_relation_combined(episode_fingerprint, other_episode, combined_episode);
+        let combined_relation = episode_relation_combined(
+            episode_fingerprint,
+            other_episode,
+            combined_episode,
+            expected_envelope.family_fingerprint,
+        );
         combined_relation.validate_shape().unwrap();
         assert_eq!(
             encode_canonical(&combined_relation).unwrap(),
@@ -2260,6 +2612,7 @@ mod tests {
         let replacement = episode_relation_split(
             original.episode_fingerprint,
             earlier_evidence.episode_fingerprint,
+            original.family_fingerprint,
         );
         replacement.validate_shape().unwrap();
 
@@ -2313,6 +2666,7 @@ mod tests {
         .fingerprint()
         .unwrap();
         assert_ne!(first.episode_fingerprint, second_source.episode_fingerprint);
+        assert_eq!(first.family_fingerprint, second_source.family_fingerprint);
 
         let combined = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
             "3333333333333333333333333333333333333333333333333333333333333333",
@@ -2321,10 +2675,44 @@ mod tests {
             first.episode_fingerprint,
             second_source.episode_fingerprint,
             combined,
+            first.family_fingerprint,
         );
         relation.validate_shape().unwrap();
         assert_eq!(relation.kind, EpisodeRelationKindV1::CombinedFrom);
         assert_eq!(relation.from_episodes.len(), 2);
+
+        // Doc:1353-1356 ("replay ... marks the earlier projections
+        // superseded, retaining explicit combined_from ... relations")
+        // applies to the combine case exactly as it does to the split case:
+        // BOTH sources project `Superseded` once the relation is supplied,
+        // retained (not erased) -- the same continuous incompatible interval
+        // must not surface three times (once per source, once for the
+        // combined episode).
+        let eval_time = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap();
+        let first_projection =
+            project_discrepancy_episode(&first, &[], std::slice::from_ref(&relation), &eval_time)
+                .unwrap();
+        assert_eq!(first_projection.lifecycle_state, LifecycleState::Superseded);
+        assert_eq!(
+            first_projection.episode_fingerprint,
+            first.episode_fingerprint
+        );
+
+        let second_projection = project_discrepancy_episode(
+            &second_source,
+            &[],
+            std::slice::from_ref(&relation),
+            &eval_time,
+        )
+        .unwrap();
+        assert_eq!(
+            second_projection.lifecycle_state,
+            LifecycleState::Superseded
+        );
+        assert_eq!(
+            second_projection.episode_fingerprint,
+            second_source.episode_fingerprint
+        );
 
         let mut single_source = relation;
         single_source.from_episodes.truncate(1);
@@ -2366,10 +2754,44 @@ mod tests {
     }
 
     #[test]
-    fn long_gap_links_a_new_episode_by_possibly_continues() {
-        let stale = envelope();
+    fn observation_gap_within_the_allowed_bound_is_bridged() {
+        // `episode_policy()`'s `allowed_observation_gap_seconds` is
+        // `Some(3_600)`; a 30-minute gap is within that bound.
+        let outcome = classify_observation_gap(
+            &episode_policy(),
+            &CanonicalTimestamp::parse("2026-08-15T06:00:00.000000000Z").unwrap(),
+            &CanonicalTimestamp::parse("2026-08-15T06:30:00.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(outcome, ObservationGapOutcomeV1::Bridged);
+    }
+
+    #[test]
+    fn observation_gap_with_no_allowed_bound_never_bridges() {
+        // Doc lines 1338-1341 / the field's own doc comment: `None` means no
+        // observation gap may ever be bridged, no matter how short.
+        let mut never_bridges = episode_policy();
+        never_bridges.allowed_observation_gap_seconds = None;
+        let outcome = classify_observation_gap(
+            &never_bridges,
+            &CanonicalTimestamp::parse("2026-08-15T06:00:00.000000000Z").unwrap(),
+            &CanonicalTimestamp::parse("2026-08-15T06:00:01.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(outcome, ObservationGapOutcomeV1::EpisodeEnded);
+    }
+
+    #[test]
+    fn long_gap_ends_the_prior_occurrence_and_links_a_new_episode_by_possibly_continues() {
+        let mut stale = envelope();
+        stale.effective_until =
+            Some(CanonicalTimestamp::parse("2026-08-15T06:00:00.000000000Z").unwrap());
+        stale.validate_shape().unwrap();
+
         let mut resumed = envelope();
         resumed.opening_transition.source_fact_id = source_fact_id('9');
+        resumed.effective_from =
+            CanonicalTimestamp::parse("2026-08-20T00:00:00.000000000Z").unwrap();
         resumed.episode_fingerprint = DiscrepancyEpisodePreimageV1 {
             schema_version: DISCREPANCY_SCHEMA_VERSION,
             family_fingerprint: resumed.family_fingerprint,
@@ -2379,14 +2801,83 @@ mod tests {
         }
         .fingerprint()
         .unwrap();
+        resumed.validate_shape().unwrap();
+
+        // Multi-day gap, far beyond the registered one-hour bound.
+        let gap_outcome = classify_observation_gap(
+            &episode_policy(),
+            stale.effective_until.as_ref().unwrap(),
+            &resumed.effective_from,
+        )
+        .unwrap();
+        assert_eq!(gap_outcome, ObservationGapOutcomeV1::EpisodeEnded);
 
         let relation = DiscrepancyEpisodeRelationV1 {
             schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            family_fingerprint: stale.family_fingerprint,
             kind: EpisodeRelationKindV1::PossiblyContinues,
             from_episodes: vec![stale.episode_fingerprint],
             to_episode: resumed.episode_fingerprint,
         };
+        validate_possibly_continues_gap(&relation, gap_outcome).unwrap();
+
+        // The prior occurrence becomes observation-indeterminate: already
+        // representable via `VerificationUpdateV1` (no new type needed),
+        // reached through the same replay every other verification-state
+        // change goes through.
+        let indeterminate_event = lifecycle_event(
+            stale.episode_fingerprint,
+            "2026-08-16T00:00:00.000000000Z",
+            None,
+            Some(VerificationUpdateV1 {
+                actor: DiscrepancyActorV1 {
+                    principal_id: ContractId::new("principal.on_call").unwrap(),
+                },
+                state: VerificationState::Indeterminate,
+                evidence_event_ids: vec![],
+            }),
+            'd',
+        );
+        let projected = project_discrepancy_episode(
+            &stale,
+            &[indeterminate_event],
+            &[],
+            &CanonicalTimestamp::parse("2026-08-16T00:00:01.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            projected.verification_state,
+            VerificationState::Indeterminate
+        );
+    }
+
+    #[test]
+    fn possibly_continues_is_rejected_within_the_allowed_observation_gap() {
+        let bridged = classify_observation_gap(
+            &episode_policy(),
+            &CanonicalTimestamp::parse("2026-08-15T06:00:00.000000000Z").unwrap(),
+            &CanonicalTimestamp::parse("2026-08-15T06:30:00.000000000Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bridged, ObservationGapOutcomeV1::Bridged);
+
+        let stale = envelope();
+        let resumed_fingerprint = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "6666666666666666666666666666666666666666666666666666666666666666",
+        ));
+        let relation = DiscrepancyEpisodeRelationV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            family_fingerprint: stale.family_fingerprint,
+            kind: EpisodeRelationKindV1::PossiblyContinues,
+            from_episodes: vec![stale.episode_fingerprint],
+            to_episode: resumed_fingerprint,
+        };
         relation.validate_shape().unwrap();
+        assert!(validate_possibly_continues_gap(&relation, bridged).is_err());
     }
 
     #[test]
@@ -2436,7 +2927,11 @@ mod tests {
         let new_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
             "5555555555555555555555555555555555555555555555555555555555555555",
         ));
-        let relation = episode_relation_split(envelope.episode_fingerprint, new_episode);
+        let relation = episode_relation_split(
+            envelope.episode_fingerprint,
+            new_episode,
+            envelope.family_fingerprint,
+        );
         let events = [waive_event(
             envelope.episode_fingerprint,
             "principal.on_call",
@@ -2450,6 +2945,84 @@ mod tests {
         )
         .unwrap();
         assert_eq!(after_expiry.lifecycle_state, LifecycleState::Superseded);
+    }
+
+    #[test]
+    fn episode_relation_with_foreign_scope_is_rejected() {
+        // A relation minted with only the public episode fingerprints must
+        // not suppress an envelope in a DIFFERENT tenant/project scope --
+        // matching `lifecycle_event_scope_or_profile_diverges_from_envelope`'s
+        // identical guarantee for lifecycle events.
+        let envelope = envelope();
+        let new_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "9999999999999999999999999999999999999999999999999999999999999999",
+        ));
+        let mut relation = episode_relation_split(
+            envelope.episode_fingerprint,
+            new_episode,
+            envelope.family_fingerprint,
+        );
+        relation.scope = AuthenticatedProjectScopeV1::from_trusted_context(
+            ContractId::new("tenant.attacker").unwrap(),
+            ContractId::new("project.attacker").unwrap(),
+        );
+        relation.validate_shape().unwrap();
+        let eval_time = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap();
+        assert!(project_discrepancy_episode(&envelope, &[], &[relation], &eval_time).is_err());
+    }
+
+    #[test]
+    fn episode_relation_naming_a_different_family_is_rejected() {
+        // A `superseded` relation whose declared `family_fingerprint`
+        // diverges from the envelope's own real family must not suppress it
+        // -- knowledge of the public episode fingerprint alone is not proof
+        // the replacement belongs to the same discrepancy family.
+        let envelope = envelope();
+        let new_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "9999999999999999999999999999999999999999999999999999999999999999",
+        ));
+        let mut relation = episode_relation_split(
+            envelope.episode_fingerprint,
+            new_episode,
+            envelope.family_fingerprint,
+        );
+        relation.family_fingerprint = DiscrepancyFamilyFingerprintV1::from_digest(digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ));
+        relation.validate_shape().unwrap();
+        let eval_time = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap();
+        assert!(project_discrepancy_episode(&envelope, &[], &[relation], &eval_time).is_err());
+    }
+
+    #[test]
+    fn unrelated_episode_relation_in_the_pool_is_ignored_without_scope_or_family_checks() {
+        // A relations pool naming OTHER episodes entirely (never this
+        // envelope's fingerprint, as source or target) must not be rejected
+        // merely for existing in the same slice -- only relations that
+        // actually name this envelope are scope/profile/family-checked.
+        let envelope = envelope();
+        let unrelated_a = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "9999999999999999999999999999999999999999999999999999999999999999",
+        ));
+        let unrelated_b = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ));
+        let mut unrelated_relation = episode_relation_split(
+            unrelated_a,
+            unrelated_b,
+            DiscrepancyFamilyFingerprintV1::from_digest(digest(
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            )),
+        );
+        unrelated_relation.scope = AuthenticatedProjectScopeV1::from_trusted_context(
+            ContractId::new("tenant.attacker").unwrap(),
+            ContractId::new("project.attacker").unwrap(),
+        );
+        unrelated_relation.validate_shape().unwrap();
+        let eval_time = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap();
+        let projection =
+            project_discrepancy_episode(&envelope, &[], &[unrelated_relation], &eval_time).unwrap();
+        assert_ne!(projection.lifecycle_state, LifecycleState::Superseded);
     }
 
     #[test]
@@ -2829,6 +3402,77 @@ mod tests {
             reason.rationale = "   ".into();
         }
         assert!(dismiss.validate_shape().is_err());
+    }
+
+    #[test]
+    fn dismiss_rationale_of_only_zero_width_spaces_is_rejected() {
+        // `str::trim` alone treats U+200B ZERO WIDTH SPACE as non-whitespace,
+        // so a rationale of only zero-width characters would otherwise pass
+        // the non-empty check in form while carrying no visible content.
+        let mut dismiss = dismiss_event(envelope().episode_fingerprint, "principal.on_call");
+        if let Some(LifecycleTransitionV1::Dismiss { reason, .. }) =
+            &mut dismiss.lifecycle_transition
+        {
+            reason.rationale = "\u{200B}\u{200B}\u{200B}".into();
+        }
+        assert!(dismiss.validate_shape().is_err());
+    }
+
+    #[test]
+    fn waiver_rationale_of_only_zero_width_spaces_is_rejected() {
+        let mut waiver = waiver_record("principal.on_call", "2026-09-15T00:00:00.000000000Z");
+        waiver.rationale = "\u{200B}".into();
+        assert!(waiver.validate_shape().is_err());
+    }
+
+    #[test]
+    fn rationale_mixing_zero_width_and_visible_content_still_passes() {
+        // The zero-width filter must not reject ordinary rationale text that
+        // merely happens to contain a zero-width character (e.g. copy-pasted
+        // from a rich-text source); only rationale that is ENTIRELY
+        // invisible once whitespace and zero-width characters are stripped
+        // is blank.
+        assert!(!is_blank_rationale("capacity\u{200B} deferred"));
+    }
+
+    #[test]
+    fn waiver_expiry_at_or_before_the_events_effective_at_is_rejected() {
+        // DISC-05 ("a waiver is durable policy"): a waiver that expires
+        // before or exactly when it takes effect never had effect.
+        let envelope = envelope();
+        let backdated = waive_event(
+            envelope.episode_fingerprint,
+            "principal.on_call",
+            "2026-08-15T05:10:00.000000000Z", // == the event's own effective_at
+        );
+        assert!(authorize_lifecycle_transition(&envelope, &backdated).is_err());
+    }
+
+    #[test]
+    fn duplicate_byte_identical_lifecycle_events_are_applied_once() {
+        // REPLAY-01's order-independence guarantee is weaker than it should
+        // be if it holds for reordering but not repetition: an
+        // at-least-once delivery retry that appends the same event twice
+        // must not be double-counted or double-applied.
+        let envelope = envelope();
+        let acknowledge = acknowledge_event(envelope.episode_fingerprint);
+        let eval_time = CanonicalTimestamp::parse("2026-08-15T05:01:00.000000000Z").unwrap();
+        let once = project_discrepancy_episode(
+            &envelope,
+            std::slice::from_ref(&acknowledge),
+            &[],
+            &eval_time,
+        )
+        .unwrap();
+        let duplicated = project_discrepancy_episode(
+            &envelope,
+            &[acknowledge.clone(), acknowledge],
+            &[],
+            &eval_time,
+        )
+        .unwrap();
+        assert_eq!(duplicated.applied_event_count, once.applied_event_count);
+        assert_eq!(duplicated.applied_event_count, 1);
     }
 
     #[test]
@@ -3298,7 +3942,7 @@ mod tests {
         let body: CanonicalValue = decode_strict(&body_bytes).unwrap();
         let entry = RegistryEntryV1 {
             schema_version: 1,
-            kind: RegistryEntryKind::PredicateSchema,
+            kind: RegistryEntryKind::ComparatorLineage,
             entry_id: coverage_required_lineage.comparator_id.clone(),
             version: coverage_required_lineage.comparator_version,
             entry_schema_id: ContractId::new(COMPARATOR_LINEAGE_ENTRY_SCHEMA_ID).unwrap(),
@@ -3490,8 +4134,13 @@ mod tests {
             "8888888888888888888888888888888888888888888888888888888888888888",
         ));
 
+        let family_fingerprint = envelope().family_fingerprint;
+
         let single_source_combine = DiscrepancyEpisodeRelationV1 {
             schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            family_fingerprint,
             kind: EpisodeRelationKindV1::CombinedFrom,
             from_episodes: vec![a],
             to_episode: b,
@@ -3500,6 +4149,9 @@ mod tests {
 
         let self_referential = DiscrepancyEpisodeRelationV1 {
             schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            family_fingerprint,
             kind: EpisodeRelationKindV1::Continues,
             from_episodes: vec![a],
             to_episode: a,
@@ -3539,9 +4191,17 @@ mod tests {
         let combined_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
             "2222222222222222222222222222222222222222222222222222222222222222",
         ));
-        let split_relation = episode_relation_split(episode_fingerprint, other_episode);
-        let combined_relation =
-            episode_relation_combined(episode_fingerprint, other_episode, combined_episode);
+        let split_relation = episode_relation_split(
+            episode_fingerprint,
+            other_episode,
+            envelope.family_fingerprint,
+        );
+        let combined_relation = episode_relation_combined(
+            episode_fingerprint,
+            other_episode,
+            combined_episode,
+            envelope.family_fingerprint,
+        );
         let suite = vector_suite();
 
         for (name, bytes) in [
