@@ -2782,6 +2782,55 @@ mod tests {
     }
 
     #[test]
+    fn observation_gap_exactly_at_the_bound_is_bridged_one_second_over_is_not() {
+        // Pins the `<=` (not `<`) boundary: a mutation flipping the operator
+        // would change the outcome at exactly the registered bound but agree
+        // everywhere else, so only a boundary-exact vector can kill it.
+        let policy = episode_policy(); // allowed_observation_gap_seconds = Some(3_600)
+        let prior = CanonicalTimestamp::parse("2026-08-15T06:00:00.000000000Z").unwrap();
+        let at_bound = CanonicalTimestamp::parse("2026-08-15T07:00:00.000000000Z").unwrap(); // +3600s
+        let one_second_over = CanonicalTimestamp::parse("2026-08-15T07:00:01.000000000Z").unwrap(); // +3601s
+        assert_eq!(
+            classify_observation_gap(&policy, &prior, &at_bound).unwrap(),
+            ObservationGapOutcomeV1::Bridged
+        );
+        assert_eq!(
+            classify_observation_gap(&policy, &prior, &one_second_over).unwrap(),
+            ObservationGapOutcomeV1::EpisodeEnded
+        );
+    }
+
+    #[test]
+    fn observation_gap_requires_strictly_increasing_timestamps() {
+        let policy = episode_policy();
+        let earlier = CanonicalTimestamp::parse("2026-08-15T06:00:00.000000000Z").unwrap();
+        let same_instant = earlier.clone();
+        assert!(classify_observation_gap(&policy, &earlier, &same_instant).is_err());
+        let before = CanonicalTimestamp::parse("2026-08-15T05:59:59.000000000Z").unwrap();
+        assert!(classify_observation_gap(&policy, &earlier, &before).is_err());
+    }
+
+    #[test]
+    fn validate_possibly_continues_gap_does_not_reject_other_relation_kinds() {
+        // `validate_possibly_continues_gap`'s rejection is specific to
+        // `PossiblyContinues`; a `Superseded` (or any other kind) relation
+        // must pass regardless of the gap outcome -- otherwise a mutation
+        // that dropped the `kind == PossiblyContinues` conjunct (rejecting
+        // every kind under a `Bridged` gap) would go undetected.
+        let envelope = envelope();
+        let new_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "9999999999999999999999999999999999999999999999999999999999999999",
+        ));
+        let relation = episode_relation_split(
+            envelope.episode_fingerprint,
+            new_episode,
+            envelope.family_fingerprint,
+        );
+        assert_eq!(relation.kind, EpisodeRelationKindV1::Superseded);
+        validate_possibly_continues_gap(&relation, ObservationGapOutcomeV1::Bridged).unwrap();
+    }
+
+    #[test]
     fn long_gap_ends_the_prior_occurrence_and_links_a_new_episode_by_possibly_continues() {
         let mut stale = envelope();
         stale.effective_until =
@@ -2969,6 +3018,64 @@ mod tests {
         relation.validate_shape().unwrap();
         let eval_time = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap();
         assert!(project_discrepancy_episode(&envelope, &[], &[relation], &eval_time).is_err());
+    }
+
+    #[test]
+    fn episode_relation_with_foreign_profile_is_rejected() {
+        // Same guarantee as the foreign-scope case, isolated to the
+        // `profile` conjunct alone (scope and family left matching): the
+        // relation-binding check is `scope != .. || profile != .. || family
+        // != ..`, and a mutation that dropped only the `profile` disjunct
+        // would otherwise go undetected by the foreign-scope/foreign-family
+        // tests, which each vary a different field.
+        let envelope = envelope();
+        let new_episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "9999999999999999999999999999999999999999999999999999999999999999",
+        ));
+        let mut relation = episode_relation_split(
+            envelope.episode_fingerprint,
+            new_episode,
+            envelope.family_fingerprint,
+        );
+        // `ProfileReferenceV1::validate` only checks `profile_id` against the
+        // one fixed compiled-in profile, so a divergent `profile_digest`
+        // (same `profile_id`) still passes `validate_shape` -- exactly the
+        // divergence a real cross-profile relation would carry.
+        relation.profile.profile_digest =
+            digest("1234123412341234123412341234123412341234123412341234123412341234");
+        relation.validate_shape().unwrap();
+        assert_ne!(relation.profile, envelope.profile);
+        let eval_time = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap();
+        assert!(project_discrepancy_episode(&envelope, &[], &[relation], &eval_time).is_err());
+    }
+
+    #[test]
+    fn possibly_continues_naming_this_episode_does_not_supersede_it() {
+        // The `is_superseded` producer fires only for `Superseded` and
+        // `CombinedFrom` -- a `PossiblyContinues` relation naming this
+        // envelope's episode as a source must leave it `Open` (or whatever
+        // the events alone project), never `Superseded`. Without this test,
+        // a mutation widening the `matches!` to admit every relation kind
+        // (or narrowing it to drop `CombinedFrom`) would go undetected by
+        // the split/combine positive vectors, which only ever supply the
+        // kind they mean to test.
+        let stale = envelope();
+        let resumed_fingerprint = DiscrepancyEpisodeFingerprintV1::from_digest(digest(
+            "9999999999999999999999999999999999999999999999999999999999999999",
+        ));
+        let relation = DiscrepancyEpisodeRelationV1 {
+            schema_version: DISCREPANCY_SCHEMA_VERSION,
+            profile: frozen_profile_reference_v1(),
+            scope: scope(),
+            family_fingerprint: stale.family_fingerprint,
+            kind: EpisodeRelationKindV1::PossiblyContinues,
+            from_episodes: vec![stale.episode_fingerprint],
+            to_episode: resumed_fingerprint,
+        };
+        relation.validate_shape().unwrap();
+        let eval_time = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap();
+        let projection = project_discrepancy_episode(&stale, &[], &[relation], &eval_time).unwrap();
+        assert_ne!(projection.lifecycle_state, LifecycleState::Superseded);
     }
 
     #[test]
