@@ -125,7 +125,10 @@ impl NormativeBindingProposalV2 {
             || self.source_spans.len() > MAX_SPANS
             || self.propositions.is_empty()
             || self.propositions.len() > MAX_PROPOSITIONS
-            || self.applicability_selector.as_object().is_none()
+            || self
+                .applicability_selector
+                .as_object()
+                .is_none_or(std::collections::BTreeMap::is_empty)
             || !strictly_sorted(&self.source_spans)
             || !strictly_sorted(&self.propositions)
             || self
@@ -180,6 +183,7 @@ impl NormativeBindingProposalV2 {
         &self,
         current: &NormativeCompositeHeadV2,
     ) -> ContractResult<()> {
+        self.validate()?;
         if &self.expected_composite_head() != current {
             return Err(ContractError::StaleRegistryHead);
         }
@@ -197,6 +201,7 @@ impl NormativeBindingProposalV2 {
         active_effective_from: &CanonicalTimestamp,
         active_effective_until: Option<&CanonicalTimestamp>,
     ) -> ContractResult<()> {
+        self.validate()?;
         if active_binding_family_id != &self.binding_family_id {
             return Ok(());
         }
@@ -351,6 +356,7 @@ impl NormativeLifecycleEventV1 {
             | NormativeLifecycleKindV1::Expiry => self.supersedes_statement_id.is_none(),
         };
         if self.schema_version != LIFECYCLE_SCHEMA_VERSION
+            || self.statement_id == Sha256Digest::ZERO
             || !supersession_target_consistent
             || self.supersedes_statement_id == Some(Sha256Digest::ZERO)
             || self.supersedes_statement_id == Some(self.statement_id)
@@ -403,6 +409,7 @@ impl ContestedBindingV1 {
             || self.contested_statement_ids.len() < 2
             || self.contested_statement_ids.len() > MAX_CONTESTED_STATEMENTS
             || !strictly_sorted(&self.contested_statement_ids)
+            || self.contested_statement_ids.contains(&Sha256Digest::ZERO)
         {
             return Err(ContractError::Schema(
                 "invalid contested normative binding v1".into(),
@@ -480,6 +487,8 @@ impl RetroactiveCorrectionV1 {
         self.authorizing_policy.validate()?;
         self.normal_activation_policy.validate()?;
         if self.schema_version != RETROACTIVE_SCHEMA_VERSION
+            || self.statement_id == Sha256Digest::ZERO
+            || self.superseded_as_known_statement_id == Sha256Digest::ZERO
             || self.statement_id == self.superseded_as_known_statement_id
             || self.effective_from >= self.accepted_at
             || self.authorizing_policy.entry_id == self.normal_activation_policy.entry_id
@@ -642,7 +651,7 @@ mod tests {
     const RETROACTIVE_NEGATIVE_ORDINARY_POLICY_RAW_SHA256: &str =
         "5b37b425ca9b5a956ef29032d6a19eb739e304bd15f4dbd6baad3c86f84a75bb";
     const VECTOR_SUITE_RAW_SHA256: &str =
-        "ea3ee93f7ee91e097ed027d96148ede17181011cbd6c2484cae19f23ae9a0a45";
+        "88b8f67815a025c5225f626e60ab806a920e507e37ed335c82d8dec9a295a036";
 
     fn raw_sha256(bytes: &[u8]) -> String {
         use sha2::{Digest as _, Sha256};
@@ -875,6 +884,19 @@ mod tests {
         assert!(invalid.validate().is_err());
     }
 
+    /// APPL-01: an empty object `{}` is the canonical encoding of `any` in
+    /// most selector languages, so it must fail closed exactly like a
+    /// non-object selector rather than silently resolving every dimension
+    /// to `any`. Deleting the `.is_empty()` half of the `is_none_or` guard
+    /// (leaving only the "must be an object" check above) must fail this
+    /// test.
+    #[test]
+    fn empty_object_applicability_selector_fails_closed() {
+        let mut invalid = proposal();
+        invalid.applicability_selector = CanonicalValue::Object(BTreeMap::new());
+        assert!(invalid.validate().is_err());
+    }
+
     /// AUTH-04: a bounded effective interval whose `effective_until` is at or
     /// before its own `effective_from` is invalid shape, regardless of the
     /// two-binding overlap check below. Every other proposal fixture and
@@ -919,6 +941,30 @@ mod tests {
         assert_eq!(
             statement.require_current_composite(&binding_set_changed),
             Err(ContractError::StaleRegistryHead)
+        );
+    }
+
+    /// A caller that reaches for `require_current_composite` or
+    /// `require_non_conflicting_activation` without separately calling
+    /// `validate()` must not get an unconditional pass on a shape that is
+    /// otherwise invalid (a non-object selector here). Deleting the
+    /// `self.validate()?;` line at the top of either method must fail this
+    /// test.
+    #[test]
+    fn relational_helpers_reject_an_unvalidated_shape() {
+        let mut invalid = proposal();
+        invalid.applicability_selector = CanonicalValue::String("production".into());
+        let current = invalid.expected_composite_head();
+        assert!(invalid.require_current_composite(&current).is_err());
+        assert!(
+            invalid
+                .require_non_conflicting_activation(
+                    &invalid.binding_family_id,
+                    label_digest("active-statement"),
+                    &CanonicalTimestamp::parse("2026-01-01T00:00:00.000000000Z").unwrap(),
+                    None,
+                )
+                .is_err()
         );
     }
 
@@ -1048,6 +1094,7 @@ mod tests {
     const RECEIPT_STRUCTURAL_GUARD_ERROR: &str = "invalid normative activation receipt v2";
     const RECEIPT_SOD_MISMATCH_ERROR: &str =
         "declared separation-of-duty verdict does not match its declared approvals";
+    const PROPOSAL_STRUCTURAL_GUARD_ERROR: &str = "invalid normative binding proposal v2";
 
     #[test]
     fn author_only_approval_is_rejected() {
@@ -1227,6 +1274,25 @@ mod tests {
         assert!(self_referential.validate().is_err());
     }
 
+    /// Zero-digest hygiene: `Sha256Digest::ZERO` is already rejected as a
+    /// `supersedes_statement_id` two lines above; it must be rejected as the
+    /// event's own `statement_id` for the same reason (a real digest is
+    /// never all-zero), consistent with `RetroactiveCorrectionV1` below.
+    #[test]
+    fn zero_statement_id_is_rejected() {
+        let event = NormativeLifecycleEventV1 {
+            schema_version: 1,
+            kind: NormativeLifecycleKindV1::Activation,
+            binding_family_id: ContractId::new("slo.home.errors").unwrap(),
+            statement_id: Sha256Digest::ZERO,
+            registry_head: registry_head("2026-01-01T00:00:00.000000000Z"),
+            effective_at: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
+            supersedes_statement_id: None,
+            waiver_reference_digest: None,
+        };
+        assert!(event.validate().is_err());
+    }
+
     #[test]
     fn every_lifecycle_kind_produces_a_distinct_event_id() {
         let base = |kind: NormativeLifecycleKindV1, target: Option<Sha256Digest>| {
@@ -1304,6 +1370,23 @@ mod tests {
         );
     }
 
+    /// Zero-digest hygiene: a real statement ID is never `Sha256Digest::ZERO`,
+    /// consistent with the lifecycle event and retroactive-correction guards.
+    /// `ZERO` sorts first (all-zero bytes), so this vector is otherwise
+    /// strictly sorted and would validate but for the new zero-digest guard.
+    #[test]
+    fn a_zero_digest_among_contested_statements_is_rejected() {
+        let with_zero = ContestedBindingV1 {
+            schema_version: 1,
+            binding_family_id: ContractId::new("slo.home.errors").unwrap(),
+            contested_statement_ids: vec![Sha256Digest::ZERO, label_digest("statement-a")],
+            reason: NormativeContestReasonV1::LateOrCorrectiveEvidence,
+            detected_at: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
+            waiver_reference_digest: None,
+        };
+        assert!(with_zero.validate().is_err());
+    }
+
     // --- retroactive correction ---
 
     #[test]
@@ -1372,6 +1455,28 @@ mod tests {
             normal_activation_policy_required_threshold: 2,
         };
         assert!(self_referential.validate().is_err());
+    }
+
+    /// Zero-digest hygiene: neither `statement_id` nor
+    /// `superseded_as_known_statement_id` may be `Sha256Digest::ZERO`,
+    /// consistent with the lifecycle-event and contested-binding guards.
+    #[test]
+    fn a_zero_digest_statement_id_is_rejected() {
+        let mut zero_new = RetroactiveCorrectionV1 {
+            schema_version: 1,
+            statement_id: Sha256Digest::ZERO,
+            superseded_as_known_statement_id: label_digest("prior-as-known-statement"),
+            effective_from: CanonicalTimestamp::parse("2026-01-01T00:00:00.000000000Z").unwrap(),
+            accepted_at: CanonicalTimestamp::parse("2026-08-15T09:00:00.000000000Z").unwrap(),
+            authorizing_policy: reference("normative.retroactive_correction_policy"),
+            authorizing_policy_required_threshold: 3,
+            normal_activation_policy: reference("normative.normal_activation_policy"),
+            normal_activation_policy_required_threshold: 2,
+        };
+        assert!(zero_new.validate().is_err());
+        zero_new.statement_id = label_digest("corrected-statement");
+        zero_new.superseded_as_known_statement_id = Sha256Digest::ZERO;
+        assert!(zero_new.validate().is_err());
     }
 
     /// AUTH-04: a retroactive correction naming the *ordinary* activation
@@ -1467,15 +1572,30 @@ mod tests {
     fn fixture_proposal_negatives_fail_closed() {
         let unsorted: NormativeBindingProposalV2 =
             decode_strict(record(PROPOSAL_NEGATIVE_UNSORTED_PROPOSITIONS_FIXTURE)).unwrap();
-        assert!(unsorted.validate().is_err());
+        assert_eq!(
+            unsorted.validate(),
+            Err(ContractError::Schema(
+                PROPOSAL_STRUCTURAL_GUARD_ERROR.into()
+            ))
+        );
 
         let overlapping: NormativeBindingProposalV2 =
             decode_strict(record(PROPOSAL_NEGATIVE_OVERLAPPING_SPANS_FIXTURE)).unwrap();
-        assert!(overlapping.validate().is_err());
+        assert_eq!(
+            overlapping.validate(),
+            Err(ContractError::Schema(
+                PROPOSAL_STRUCTURAL_GUARD_ERROR.into()
+            ))
+        );
 
         let wrong_form: NormativeBindingProposalV2 =
             decode_strict(record(PROPOSAL_NEGATIVE_WRONG_RESOURCE_FORM_FIXTURE)).unwrap();
-        assert!(wrong_form.validate().is_err());
+        assert_eq!(
+            wrong_form.validate(),
+            Err(ContractError::Schema(
+                PROPOSAL_STRUCTURAL_GUARD_ERROR.into()
+            ))
+        );
     }
 
     #[test]
@@ -1692,7 +1812,7 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(entries.len(), 25);
+        assert_eq!(entries.len(), 26);
         for entry in &entries {
             assert!(!entry.invariant_ids.is_empty());
             assert!(
