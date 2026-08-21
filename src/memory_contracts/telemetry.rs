@@ -2705,6 +2705,78 @@ mod tests {
         both_erased.validate_shape().unwrap();
     }
 
+    /// Mechanical mutation check (PREFLIGHT item 1): each conjunct inside
+    /// `validate_caps_and_tombstones`'s tombstone-shape loop -- canonical
+    /// order, in-range `selection_index`, and no duplicate `selection_index`
+    /// -- had no dedicated killing test; deleting any one of the three left
+    /// every other committed test green (confirmed by hand before writing
+    /// this test: `if false && <conjunct> { .. }` on each, one at a time,
+    /// left `cargo test --lib memory_contracts::telemetry` fully green).
+    /// Starting from a receipt with two genuinely erased, content-identical
+    /// exemplars -- `present + tombstoned == selected_count` stays satisfied
+    /// throughout, so the count-consistency check never fires first and each
+    /// mutation below isolates exactly one conjunct.
+    #[test]
+    fn tombstone_shape_conjuncts_are_each_independently_enforced() {
+        let duplicate = exemplar(1, 0);
+        let candidates = vec![
+            candidate(
+                "route.only",
+                140,
+                1,
+                CandidateOutcomeV1::Eligible(Box::new(duplicate.clone())),
+            ),
+            candidate(
+                "route.only",
+                141,
+                2,
+                CandidateOutcomeV1::Eligible(Box::new(duplicate)),
+            ),
+        ];
+        let population = PopulationInputV1::Bound {
+            snapshot_digest: Sha256Digest::from_bytes([142; 32]),
+            query_population_digest: Sha256Digest::from_bytes([143; 32]),
+            candidates: &candidates,
+        };
+        let selection =
+            select_exemplars_deterministic_stratified_hash_v1(&private_policy(), &population)
+                .unwrap();
+        let erased_at = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap();
+        let one_erased = selection
+            .erase_exemplar_at(
+                0,
+                erased_at.clone(),
+                registry_ref("erasure.policy.default", 40),
+            )
+            .unwrap();
+        let both_erased = one_erased
+            .erase_exemplar_at(0, erased_at, registry_ref("erasure.policy.default", 40))
+            .unwrap();
+        assert_eq!(both_erased.exemplars.len(), 0);
+        assert_eq!(both_erased.tombstones.len(), 2);
+        assert_eq!(both_erased.tombstones[0].selection_index, 0);
+        assert_eq!(both_erased.tombstones[1].selection_index, 1);
+        both_erased.validate_shape().unwrap();
+
+        // Kills `!tombstoned_indices.insert(tombstone.selection_index)`:
+        // present(0) + tombstoned(2) == selected_count(2) is unaffected, so
+        // only the duplicate-index conjunct can reject this.
+        let mut duplicate_index = both_erased.clone();
+        duplicate_index.tombstones[1].selection_index = 0;
+        assert!(duplicate_index.validate_shape().is_err());
+
+        // Kills `tombstone.selection_index >= self.selected_count`.
+        let mut out_of_range = both_erased.clone();
+        out_of_range.tombstones[1].selection_index = 99;
+        assert!(out_of_range.validate_shape().is_err());
+
+        // Kills `!strictly_sorted(&self.tombstones)`: indices stay 0 and 1
+        // (both valid, both unique) but out of canonical order.
+        let mut unsorted = both_erased;
+        unsorted.tombstones.swap(0, 1);
+        assert!(unsorted.validate_shape().is_err());
+    }
+
     #[test]
     fn cap_exceeded_exemplar_is_rejected() {
         let candidates = vec![candidate(
