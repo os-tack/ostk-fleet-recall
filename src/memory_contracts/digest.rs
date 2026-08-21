@@ -195,6 +195,13 @@ pub enum DigestDomain {
     CursorVectorV1,
     /// W0-LOG. `ProjectionGenerationV1` identity: one generation per closed barrier.
     ProjectionGenerationV1,
+    /// W0-LOG. `ProjectionGenerationV1` record digest: names exactly one
+    /// publication record (identity + barrier + `generation_sequence` +
+    /// `supersedes`), unlike `ProjectionGenerationV1` above which deliberately
+    /// coalesces every record sharing the same published facts. `supersedes`
+    /// must point at a predecessor's digest under THIS domain, never the
+    /// other one.
+    ProjectionGenerationRecordV1, // W0-LOG
 
     // --- W0-NORM domains ---
     /// Unsigned `NormativeBindingProposalV2` statement preimage.
@@ -363,6 +370,7 @@ impl DigestDomain {
             Self::ArchiveSegmentManifestV1 => "ostk-archive-segment-manifest-v1",
             Self::CursorVectorV1 => "ostk-cursor-vector-v1",
             Self::ProjectionGenerationV1 => "ostk-projection-generation-v1",
+            Self::ProjectionGenerationRecordV1 => "ostk-projection-generation-record-v1", // W0-LOG
             // --- W0-NORM prefixes ---
             Self::NormativeBindingStatementV2 => "ostk-normative-binding-statement-v2",
             Self::NormativeBindingReceiptV2 => "ostk-normative-binding-receipt-v2",

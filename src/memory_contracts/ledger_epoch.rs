@@ -725,14 +725,37 @@ impl ProjectorCheckpointV1 {
 /// remain on the record as bound *evidence of closure and chaining*,
 /// checked structurally — never as part of identity — by every caller
 /// before admission: [`Self::validate_supersession`] requires a superseding
-/// generation to (a) name its exact predecessor's `generation_id`, (b) share
-/// that predecessor's `projector_id` and `projector_version` exactly (a
-/// generation is never superseded by a different projector or a different
-/// version of the same one), (c) carry `generation_sequence` exactly one
-/// past the predecessor's, and (d) strictly advance the predecessor's
-/// barrier. Late evidence publishes a strictly later generation over a
-/// strictly advanced barrier; the earlier generation's record and output are
-/// never deleted (REPLAY-01, REPLAY-02).
+/// generation to (a) name its exact predecessor's [`Self::record_digest`],
+/// (b) share that predecessor's `projector_id` and `projector_version`
+/// exactly (a generation is never superseded by a different projector or a
+/// different version of the same one), (c) carry `generation_sequence`
+/// exactly one past the predecessor's, and (d) strictly advance the
+/// predecessor's barrier. Late evidence publishes a strictly later
+/// generation over a strictly advanced barrier; the earlier generation's
+/// record and output are never deleted (REPLAY-01, REPLAY-02).
+///
+/// `supersedes` deliberately does **not** name a predecessor's
+/// [`Self::generation_id`]: because `generation_id` is schedule-independent
+/// by design (see above), two *different* records — e.g. the same total
+/// facts published as one generation under a coarse schedule and as a later
+/// generation over a smaller barrier under a finer one, or a strictly
+/// earlier generation and a later one that happens to reach the same
+/// output — can share one `generation_id`. If `supersedes` named that
+/// shared id, either record could satisfy a lookup for the other: a
+/// caller could name a low-barrier record as predecessor and have the
+/// check silently resolve against a different, higher-barrier record with
+/// the identical id, admitting a rewritten `output_digest` over a barrier
+/// that record had already closed. `supersedes` instead names
+/// [`Self::record_digest`], a digest over the full record — including
+/// `barrier`, `generation_sequence`, and `supersedes` itself — that
+/// therefore names exactly one publication record, never an equivalence
+/// class. This also makes self-reference cryptographically, not just
+/// conventionally, impossible: `record_digest` is a function of `self`
+/// *including* its own `supersedes` field, so a record cannot choose a
+/// `supersedes` value equal to its own `record_digest()` without first
+/// knowing the output of a hash that itself depends on that same value —
+/// the classic hash-pointer non-self-reference argument, not a special-cased
+/// check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectionGenerationV1 {
@@ -759,6 +782,26 @@ struct ProjectionGenerationIdentityV1<'a> {
     projector_id: &'a ContractId,
     projector_version: u32,
     output_digest: &'a Sha256Digest,
+}
+
+/// The full-record projection hashed by [`ProjectionGenerationV1::record_digest`].
+///
+/// Distinct from [`ProjectionGenerationIdentityV1`]: `record_digest` names
+/// exactly *one publication record* — this record's own `generation_id()`
+/// plus `barrier`, `generation_sequence`, and `supersedes` — whereas
+/// `generation_id` deliberately coalesces every record that published the
+/// same facts. `supersedes` is checked against a predecessor's
+/// `record_digest`, never its `generation_id` — see the type-level docs on
+/// [`ProjectionGenerationV1`] for why naming the schedule-independent id
+/// would let two different records substitute for one another. Serialize
+/// -only: this type is never decoded, only built from an already-validated
+/// `ProjectionGenerationV1` and canonically encoded.
+#[derive(Serialize)]
+struct ProjectionGenerationRecordV1<'a> {
+    generation_id: &'a Sha256Digest,
+    barrier: &'a CursorVectorBarrierV1,
+    generation_sequence: u64,
+    supersedes: &'a Option<Sha256Digest>,
 }
 
 impl ProjectionGenerationV1 {
@@ -797,6 +840,35 @@ impl ProjectionGenerationV1 {
         ))
     }
 
+    /// `SHA-256("ostk-projection-generation-record-v1" || 0x00 || canonical_bytes(record))`
+    /// where `record` is [`ProjectionGenerationRecordV1`] — this record's
+    /// [`Self::generation_id`] plus `barrier`, `generation_sequence`, and
+    /// `supersedes`. Unlike `generation_id`, this names exactly one
+    /// publication record: two records that publish the same facts under a
+    /// different shard schedule share a `generation_id` but never a
+    /// `record_digest`, because their `barrier`/`generation_sequence` differ.
+    /// [`Self::validate_supersession`] checks `supersedes` against a
+    /// predecessor's `record_digest`, never its `generation_id` — see the
+    /// type-level docs for why the id alone is not a safe supersession
+    /// target. Because the preimage includes this record's own `supersedes`
+    /// field, no record can be constructed whose `supersedes` equals its own
+    /// `record_digest()`: doing so would require choosing a `supersedes`
+    /// value equal to the SHA-256 output of a preimage that already contains
+    /// that same value, a hash fixed point, not a value a caller can pick.
+    pub fn record_digest(&self) -> ContractResult<Sha256Digest> {
+        let generation_id = self.generation_id()?;
+        let record = ProjectionGenerationRecordV1 {
+            generation_id: &generation_id,
+            barrier: &self.barrier,
+            generation_sequence: self.generation_sequence,
+            supersedes: &self.supersedes,
+        };
+        Ok(domain_separated_digest(
+            DigestDomain::ProjectionGenerationRecordV1,
+            &encode_canonical(&record)?,
+        ))
+    }
+
     /// The cross-record half of "one generation per closed barrier": a
     /// superseding generation must name its exact predecessor, share that
     /// predecessor's exact projector identity and version, carry a sequence
@@ -807,24 +879,36 @@ impl ProjectionGenerationV1 {
     /// `validate()` alone cannot enforce any of this: it is a single-record
     /// shape check, so two *different* records can each independently pass
     /// `validate()` while disagreeing on projector, sequence, or barrier
-    /// with a named predecessor — and `generation_id()` deliberately
-    /// excludes `barrier`, `generation_sequence`, and `supersedes` from
-    /// identity (see the type-level docs), so naming the right predecessor
-    /// id alone says nothing about barrier dominance. Without this method a
-    /// caller could publish a generation
-    /// naming an unrelated projector's output as its successor, skip or
-    /// regress `generation_sequence`, or publish a different `output_digest`
-    /// over the identical closed barrier (rewriting "what happened" instead
-    /// of recomputing it after strictly more evidence closed). This method
-    /// is the required second check a runtime performs before admitting a
-    /// superseding generation; a cross-projector, cross-version,
-    /// non-consecutive-sequence, or same-or-earlier-barrier successor is
-    /// rejected regardless of what `output_digest` it carries.
+    /// with a named predecessor. Naming the predecessor also cannot use
+    /// `generation_id()`: that identity deliberately excludes `barrier`,
+    /// `generation_sequence`, and `supersedes` (see the type-level docs), so
+    /// two different records — e.g. the same total facts published under two
+    /// different shard schedules, or a strictly earlier and a strictly later
+    /// generation that happen to reach the same output — can share one
+    /// `generation_id`. If `supersedes` were checked against that shared id,
+    /// either record could satisfy a lookup for the other, letting a
+    /// superseding generation reference a low-barrier record's id while
+    /// actually being checked against — and admitted as a rewrite over — a
+    /// different, higher-barrier record that happens to share it. This
+    /// method instead resolves `supersedes` against [`Self::record_digest`],
+    /// which names exactly one record, so no such substitution is possible.
+    /// Without this method (and without the `record_digest` resolution) a
+    /// caller could publish a generation naming an unrelated projector's
+    /// output as its successor, skip or regress `generation_sequence`, or
+    /// publish a different `output_digest` over the identical closed barrier
+    /// (rewriting "what happened" instead of recomputing it after strictly
+    /// more evidence closed) by way of an id-colliding substitute
+    /// predecessor. This method is the required second check a runtime
+    /// performs before admitting a superseding generation; a cross-projector,
+    /// cross-version, non-consecutive-sequence, or same-or-earlier-barrier
+    /// successor is rejected regardless of what `output_digest` it carries,
+    /// and no record — including `self` itself — can satisfy this check by
+    /// naming a predecessor's `generation_id` in place of its `record_digest`.
     pub fn validate_supersession(&self, predecessor: &Self) -> ContractResult<()> {
         self.validate()?;
         predecessor.validate()?;
-        let predecessor_id = predecessor.generation_id()?;
-        if self.supersedes != Some(predecessor_id) {
+        let predecessor_record_digest = predecessor.record_digest()?;
+        if self.supersedes != Some(predecessor_record_digest) {
             return Err(ContractError::Schema(
                 "superseding generation does not name its exact predecessor".into(),
             ));
@@ -1211,6 +1295,13 @@ mod tests {
         "231b09eb8bb020d4e7fa5fb6d17bac004e67d2d3a7ca912b805f71ec408252c4";
     const PROJECTION_GENERATION_ID: &str =
         "5d619c49cfceb87413a7dfb437feb0ab90ed5901918b9afc400b664b442dac82";
+    /// `ProjectionGenerationV1::record_digest()` of the golden
+    /// `projection-generation.jsonl` fixture (sequence 0, `supersedes:
+    /// null`) under the `ostk-projection-generation-record-v1` domain. Added
+    /// this round to close the residual-review generation-identity fix; see
+    /// `projection_generation_record_digest_prevents_identity_collision_attacks`.
+    const PROJECTION_GENERATION_RECORD_DIGEST: &str =
+        "0b3fae0fb9fa222294c93316b3975c94745a8f32ecee75fb4954b2b3e5161765";
 
     fn record(artifact: &'static [u8]) -> &'static [u8] {
         let body = artifact
@@ -1677,6 +1768,7 @@ mod tests {
         generation.validate().unwrap();
         assert_eq!(generation.barrier, barrier);
         let first_generation_id = generation.generation_id().unwrap();
+        let first_record_digest = generation.record_digest().unwrap();
 
         let same_facts_reversed = ProjectionGenerationV1 {
             barrier: from_scrambled,
@@ -1686,21 +1778,35 @@ mod tests {
             same_facts_reversed.generation_id().unwrap(),
             first_generation_id
         );
+        // Byte-identical barrier (reconstructed, not merely relabeled) means
+        // a byte-identical record, so the record digest agrees too.
+        assert_eq!(
+            same_facts_reversed.record_digest().unwrap(),
+            first_record_digest
+        );
 
         // Attack J reproduction, now as a passing rejection: a "later"
         // generation over the identical closed barrier — different output,
         // same facts — must be rejected. Late evidence means an advanced
         // cursor vector, never a rewritten output over the same closed one.
+        // `supersedes` names the predecessor's `record_digest` (never its
+        // `generation_id` — see `validate_supersession`'s docs), so this
+        // reaches the barrier check on its own terms rather than failing
+        // earlier on a mismatched predecessor reference.
         let mut same_barrier_rewrite = generation.clone();
         same_barrier_rewrite.generation_sequence = 1;
-        same_barrier_rewrite.supersedes = Some(first_generation_id);
+        same_barrier_rewrite.supersedes = Some(first_record_digest);
         same_barrier_rewrite.output_digest =
             digest("7777777777777777777777777777777777777777777777777777777777777777");
         same_barrier_rewrite.validate().unwrap();
-        assert!(
-            same_barrier_rewrite
-                .validate_supersession(&generation)
-                .is_err()
+        assert_eq!(
+            same_barrier_rewrite.validate_supersession(&generation),
+            Err(ContractError::Schema(
+                "superseding generation must strictly advance the barrier it supersedes; late \
+                 evidence means an advanced cursor vector, not a rewritten output over the same \
+                 closed vector"
+                    .into()
+            ))
         );
 
         // A genuinely advanced barrier — one shard strictly past its
@@ -1714,16 +1820,18 @@ mod tests {
             CursorVectorBarrierV1::from_observations(barrier.epoch_id, advanced_cursors).unwrap();
         let mut later = generation.clone();
         later.generation_sequence = 1;
-        later.supersedes = Some(first_generation_id);
+        later.supersedes = Some(first_record_digest);
         later.barrier = advanced_barrier;
         later.output_digest =
             digest("7777777777777777777777777777777777777777777777777777777777777777");
         later.validate().unwrap();
         later.validate_supersession(&generation).unwrap();
         assert_ne!(later.generation_id().unwrap(), first_generation_id);
+        assert_ne!(later.record_digest().unwrap(), first_record_digest);
         // The earlier generation is preserved, not superseded away: its own
         // digest and validation are unaffected by the later record existing.
         assert_eq!(generation.generation_id().unwrap(), first_generation_id);
+        assert_eq!(generation.record_digest().unwrap(), first_record_digest);
         generation.validate().unwrap();
 
         // A barrier that regresses any shard is rejected outright.
@@ -1733,7 +1841,7 @@ mod tests {
             CursorVectorBarrierV1::from_observations(barrier.epoch_id, regressed_cursors).unwrap();
         let mut regressed = generation.clone();
         regressed.generation_sequence = 1;
-        regressed.supersedes = Some(first_generation_id);
+        regressed.supersedes = Some(first_record_digest);
         regressed.barrier = regressed_barrier;
         regressed.output_digest =
             digest("7777777777777777777777777777777777777777777777777777777777777777");
@@ -1752,7 +1860,11 @@ mod tests {
         // generation, even with a strictly-advanced barrier and the correct
         // predecessor id.
         let g0: ProjectionGenerationV1 = decode_strict(record(PROJECTION_GENERATION)).unwrap();
-        let g0_id = g0.generation_id().unwrap();
+        // `supersedes` is checked against a predecessor's `record_digest`,
+        // never its `generation_id` (see `validate_supersession`'s docs), so
+        // every `supersedes` value built in this test below names g0's
+        // record digest, not its id.
+        let g0_record_digest = g0.record_digest().unwrap();
 
         let mut advanced_cursors = g0.barrier.cursors.clone();
         advanced_cursors[0].last_processed_offset =
@@ -1768,7 +1880,7 @@ mod tests {
             output_digest: digest(
                 "7777777777777777777777777777777777777777777777777777777777777777",
             ),
-            supersedes: Some(g0_id),
+            supersedes: Some(g0_record_digest),
             ..g0
         };
         hostile_projector.validate().unwrap();
@@ -1788,7 +1900,7 @@ mod tests {
             output_digest: digest(
                 "7777777777777777777777777777777777777777777777777777777777777777",
             ),
-            supersedes: Some(g0_id),
+            supersedes: Some(g0_record_digest),
             ..g0.clone()
         };
         hostile_version.validate().unwrap();
@@ -1807,11 +1919,11 @@ mod tests {
             output_digest: digest(
                 "7777777777777777777777777777777777777777777777777777777777777777",
             ),
-            supersedes: Some(g0_id),
+            supersedes: Some(g0_record_digest),
             ..g0.clone()
         };
         mid.validate().unwrap();
-        let mid_id = mid.generation_id().unwrap();
+        let mid_record_digest = mid.record_digest().unwrap();
 
         let mut further_cursors = advanced_barrier.cursors;
         further_cursors[1].last_processed_offset =
@@ -1825,7 +1937,7 @@ mod tests {
             output_digest: digest(
                 "8888888888888888888888888888888888888888888888888888888888888888",
             ),
-            supersedes: Some(mid_id),
+            supersedes: Some(mid_record_digest),
             ..g0.clone()
         };
 
@@ -1858,6 +1970,156 @@ mod tests {
         let correct_sequence = build_successor(51);
         correct_sequence.validate().unwrap();
         correct_sequence.validate_supersession(&mid).unwrap();
+    }
+
+    /// Residual-review regression: `generation_id()` is deliberately
+    /// schedule-independent (REPLAY-01), so two records that publish the
+    /// same total facts under different schedules can — and, in this test,
+    /// deliberately do — share one `generation_id`. Before this fix
+    /// `supersedes` was checked against that shared id, so a `supersedes`
+    /// value could resolve to either record: (ATTACK 1) a record could name
+    /// its OWN id as its own predecessor, and (ATTACK 2) a rewrite could be
+    /// admitted against a lower-barrier record sharing the same id as the
+    /// higher-barrier record it was actually trying to overwrite. This test
+    /// pins that `record_digest()` — which `supersedes` is now checked
+    /// against — closes both: (a) it disambiguates records that share a
+    /// `generation_id`, (b) no record can name itself as its own
+    /// predecessor, and (c) neither `early` nor `current` below admits a
+    /// same-barrier rewrite carrying a different `output_digest`.
+    #[test]
+    fn projection_generation_record_digest_prevents_identity_collision_attacks() {
+        let early: ProjectionGenerationV1 = decode_strict(record(PROJECTION_GENERATION)).unwrap();
+        early.validate().unwrap();
+        assert_eq!(early.generation_sequence, 0);
+        assert_eq!(early.supersedes, None);
+
+        // (a) Two records differing ONLY in barrier share a `generation_id`
+        // (identity deliberately excludes `barrier`) but must NOT share a
+        // `record_digest` (which deliberately includes it).
+        let mut advanced_cursors = early.barrier.cursors.clone();
+        advanced_cursors[0].last_processed_offset =
+            CommittedOffsetV1::new(advanced_cursors[0].last_processed_offset.as_u64() + 1).unwrap();
+        let advanced_barrier =
+            CursorVectorBarrierV1::from_observations(early.barrier.epoch_id, advanced_cursors)
+                .unwrap();
+        let barrier_only_difference = ProjectionGenerationV1 {
+            barrier: advanced_barrier.clone(),
+            ..early.clone()
+        };
+        barrier_only_difference.validate().unwrap();
+        assert_eq!(
+            barrier_only_difference.generation_id().unwrap(),
+            early.generation_id().unwrap(),
+            "differing only in barrier must not change generation_id"
+        );
+        assert_ne!(
+            barrier_only_difference.record_digest().unwrap(),
+            early.record_digest().unwrap(),
+            "differing barrier must change record_digest even though generation_id agrees"
+        );
+
+        // `current`: a legitimate successor of `early`, over a strictly
+        // advanced barrier, publishing the SAME output_digest as `early` —
+        // so `current.generation_id() == early.generation_id()` by
+        // construction, reproducing the collision the old scheme could not
+        // tell apart. `supersedes` correctly names `early`'s record digest.
+        let current = ProjectionGenerationV1 {
+            barrier: advanced_barrier,
+            generation_sequence: 1,
+            supersedes: Some(early.record_digest().unwrap()),
+            ..early.clone()
+        };
+        current.validate().unwrap();
+        current.validate_supersession(&early).unwrap();
+        assert_eq!(
+            current.generation_id().unwrap(),
+            early.generation_id().unwrap(),
+            "current and early must genuinely collide on generation_id for this test to be real"
+        );
+        assert_ne!(
+            current.record_digest().unwrap(),
+            early.record_digest().unwrap(),
+            "the fix: record_digest disambiguates what generation_id conflates"
+        );
+
+        // (b) ATTACK 1 — self-reference. Take `current`, compute the digest
+        // it would need to carry in `supersedes` to name itself, and build a
+        // record that carries exactly that value. Because `record_digest`
+        // hashes a preimage that already contains `supersedes`, changing
+        // `supersedes` to the attempted value changes the resulting digest —
+        // a record cannot be constructed whose `supersedes` equals its own
+        // `record_digest()` by direct assignment, only by finding a SHA-256
+        // fixed point. `validate_supersession` independently rejects the
+        // attempt: it is checked here treating the record as its own named
+        // predecessor.
+        let attempted_self_reference = current.record_digest().unwrap();
+        let self_ref = ProjectionGenerationV1 {
+            supersedes: Some(attempted_self_reference),
+            ..current.clone()
+        };
+        self_ref.validate().unwrap();
+        assert_ne!(
+            self_ref.record_digest().unwrap(),
+            attempted_self_reference,
+            "setting supersedes to a guessed self-digest changes the actual digest -- a record \
+             cannot name itself by direct construction, only by a SHA-256 preimage attack"
+        );
+        assert!(
+            self_ref.validate_supersession(&self_ref).is_err(),
+            "a record naming itself as its own predecessor must be rejected"
+        );
+
+        // (c) ATTACK 2 — output rewrite over an already-published barrier via
+        // an id-colliding substitute predecessor. `rewrite` claims the exact
+        // same barrier `current` already closed, with a DIFFERENT
+        // output_digest, and honestly names what it is trying to overwrite:
+        // `current`'s own record_digest (the value an attacker rewriting
+        // `current` would naturally use).
+        let rewrite = ProjectionGenerationV1 {
+            barrier: current.barrier.clone(),
+            generation_sequence: current.generation_sequence + 1,
+            output_digest: digest(
+                "7777777777777777777777777777777777777777777777777777777777777777",
+            ),
+            supersedes: Some(current.record_digest().unwrap()),
+            ..current.clone()
+        };
+        rewrite.validate().unwrap();
+        assert_ne!(rewrite.output_digest, current.output_digest);
+
+        // Checked against the record it honestly names (`current`): the
+        // supersedes reference matches, but the barrier is byte-identical to
+        // `current`'s own, not strictly advanced -- rejected on its own
+        // substantive terms.
+        assert_eq!(
+            rewrite.validate_supersession(&current),
+            Err(ContractError::Schema(
+                "superseding generation must strictly advance the barrier it supersedes; late \
+                 evidence means an advanced cursor vector, not a rewritten output over the same \
+                 closed vector"
+                    .into()
+            ))
+        );
+        // Checked against `early` -- the record that shares `current`'s
+        // generation_id and therefore would have been an admissible
+        // substitute under the old generation_id-keyed scheme (early's
+        // barrier is strictly dominated by rewrite's, so the barrier check
+        // alone would have passed): rejected outright, because `rewrite`'s
+        // `supersedes` names `current`'s record_digest, which is NOT equal
+        // to `early`'s record_digest even though their generation_ids agree.
+        // No single `supersedes` value can any longer satisfy both records.
+        assert_ne!(
+            current.record_digest().unwrap(),
+            early.record_digest().unwrap()
+        );
+        assert_eq!(
+            rewrite.validate_supersession(&early),
+            Err(ContractError::Schema(
+                "superseding generation does not name its exact predecessor".into()
+            )),
+            "a different output_digest over a barrier current already closed must not be \
+             admissible by substituting a lower-barrier same-output predecessor"
+        );
     }
 
     #[test]
@@ -2180,13 +2442,14 @@ mod tests {
 
     #[test]
     fn every_w0_log_digest_domain_is_pinned_by_a_hard_coded_hex_constant() {
-        // Every one of the six digest domains this workstream reserved
+        // Every one of the seven digest domains this workstream reserved
         // (LogEpochV2, EvidenceCompactionCheckpointV1, ProjectorCheckpointV1,
-        // ArchiveSegmentManifestV1, CursorVectorV1, ProjectionGenerationV1)
-        // is exercised here by recomputing its golden fixture's digest and
-        // comparing it to a hard-coded hex constant. Renaming any one of the
-        // six `DigestDomain::prefix()` strings changes exactly one of these
-        // recomputed digests and fails this test.
+        // ArchiveSegmentManifestV1, CursorVectorV1, ProjectionGenerationV1,
+        // ProjectionGenerationRecordV1) is exercised here by recomputing its
+        // golden fixture's digest and comparing it to a hard-coded hex
+        // constant. Renaming any one of the seven `DigestDomain::prefix()`
+        // strings changes exactly one of these recomputed digests and fails
+        // this test.
         let epoch: SuccessorLogEpochV1 = decode_strict(record(SUCCESSOR_LOG_EPOCH)).unwrap();
         assert_eq!(
             epoch.epoch_id().unwrap().digest(),
@@ -2229,6 +2492,10 @@ mod tests {
         assert_eq!(
             generation.generation_id().unwrap(),
             digest(PROJECTION_GENERATION_ID)
+        );
+        assert_eq!(
+            generation.record_digest().unwrap(),
+            digest(PROJECTION_GENERATION_RECORD_DIGEST)
         );
     }
 
