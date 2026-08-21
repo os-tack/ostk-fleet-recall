@@ -45,6 +45,13 @@ impl RecallAction {
 #[serde(rename_all = "snake_case")]
 pub enum RememberAction {
     Record,
+    /// Event-first ingestion beside the byte-identical legacy [`Self::Record`]
+    /// path (ADR 0002 D3). An accepted `assert` appends `memory.claim.accepted`
+    /// to the Stage-4 evidence ledger and writes the legacy claim projection in
+    /// one serializable transaction. The route fails closed with a typed error
+    /// until the deployment carries the writer-authority configuration D4
+    /// requires; `record` is unaffected either way.
+    Assert,
     Supersede,
     Retract,
     Forget,
@@ -62,6 +69,7 @@ impl RememberAction {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Record => "record",
+            Self::Assert => "assert",
             Self::Supersede => "supersede",
             Self::Retract => "retract",
             Self::Forget => "forget",
@@ -293,6 +301,21 @@ mod tests {
         assert_eq!(
             request.argument("query"),
             Some(&Value::String("distributed memory".into()))
+        );
+    }
+
+    #[test]
+    fn assert_action_wire_string_round_trips() {
+        // The event-first action deserializes from its snake_case wire label so
+        // an MCP `remember` call with `"action":"assert"` reaches the disabled
+        // route rather than being silently coerced into `record` (ADR 0002 D3).
+        let decoded: RememberAction = serde_json::from_str("\"assert\"").unwrap();
+        assert_eq!(decoded, RememberAction::Assert);
+        assert_eq!(RememberAction::Assert.as_str(), "assert");
+        assert_ne!(RememberAction::Assert, RememberAction::Record);
+        assert_eq!(
+            serde_json::to_value(RememberAction::Assert).unwrap(),
+            Value::String("assert".into())
         );
     }
 

@@ -463,6 +463,41 @@ impl CockroachMemoryService {
             .await;
         Ok(committed_remember_result(&mutation, conflicts))
     }
+
+    /// Fail the event-first `assert` route closed (ADR 0002 D3/D4).
+    ///
+    /// An enabled `assert` would build a `RememberIngressCandidateV2` from the
+    /// trusted server scope (never from payload — EVID-04), route it to the
+    /// unique active `RememberAdmissionRuleV2` resolved from the witnessed
+    /// active package, rederive the subject from the activated identity recipe,
+    /// re-audit applicability and support event IDs, and append
+    /// `memory.claim.accepted` through
+    /// `AppendableAcceptedEvent::admitted_memory_claim` with an
+    /// `AppendProjection` that writes the legacy `memory_claims` /
+    /// `memory_events` / receipt rows carrying `accepted_event_id` in the SAME
+    /// serializable transaction (EVENT-03).
+    ///
+    /// That path is deliberately fenced off. ADR 0002 D4 requires three
+    /// `FleetConfig` writer-authority pins
+    /// (`FLEET_RECALL_CONTRACT_TENANT_NAMESPACE`,
+    /// `FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE`,
+    /// `FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST`) and an in-transaction
+    /// writer-authority witness before an accepted event may be minted; "when
+    /// absent the `assert` route is disabled and every legacy behaviour is
+    /// byte-stable". This deployment carries neither the pins (owned by
+    /// `W1-HEAD`, `src/config.rs`) nor a non-stub witness loader
+    /// (`src/registry_witness`), so the route fails closed before any argument
+    /// is inspected: no admission rule is consulted, no head is read, no
+    /// synthesized canonical event is produced, and nothing is written
+    /// (APPL-01/02, PRED-03, AUTH-03).
+    fn assert_route_disabled() -> ServiceError {
+        ServiceError::Unavailable(
+            "remember(assert) is disabled: this deployment carries neither the ADR 0002 D4 \
+             writer-authority configuration pins nor an active-head witness, so the event-first \
+             path cannot mint an accepted event; use remember(record)"
+                .into(),
+        )
+    }
 }
 
 /// Build the response only after the serializable mutation has committed.
@@ -726,6 +761,7 @@ impl FleetMemoryService for CockroachMemoryService {
         self.ensure_scope(&scope)?;
         match request.action {
             RememberAction::Record => self.remember_record(&scope, request).await,
+            RememberAction::Assert => Err(Self::assert_route_disabled()),
             action => Err(ServiceError::InvalidRequest(format!(
                 "remember({}) is outside the hackathon vertical slice",
                 action.as_str()
@@ -952,6 +988,19 @@ mod tests {
         assert_eq!(parse_safe_id(&json!(42)).unwrap(), 42);
         assert_eq!(parse_safe_id(&json!("42")).unwrap(), 42);
         assert!(parse_safe_id(&json!(9_007_199_254_740_992_i64)).is_err());
+    }
+
+    #[test]
+    fn assert_route_is_disabled_and_fails_closed() {
+        // ADR 0002 D4: with no writer-authority pins and a stub witness loader,
+        // `remember(assert)` must fail closed with a typed error and never
+        // reach a write path. This pins the enforced half of the enum-variant
+        // doc claim without needing a database-backed service.
+        let error = CockroachMemoryService::assert_route_disabled();
+        assert!(matches!(error, ServiceError::Unavailable(_)));
+        let message = error.to_string();
+        assert!(message.contains("remember(assert) is disabled"));
+        assert!(message.contains("use remember(record)"));
     }
 
     #[test]
