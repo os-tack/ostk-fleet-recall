@@ -945,8 +945,8 @@ reviewed_source_manifest=$(shasum -a 256 \
     "$repo_root/src/application.rs" \
     "$repo_root/src/reference_agent.rs") \
     || fail "could not hash the reviewed runtime source snapshot"
-expected_reviewed_source_manifest="22ebe3cf6803559e3559d8312cd0657d75f628c83234f1d3d24f78f613347ee1  $repo_root/src/config.rs
-7084682294585060cf1350e5c74ba2c5676c6d06c7eb39929aa7878b5a37f983  $repo_root/src/main.rs
+expected_reviewed_source_manifest="5ddd1e204c55dce12b0f22c94557c5271d7e559c0668d4cc46907d8cb2422f45  $repo_root/src/config.rs
+76224d95199b19cf12b52f623ece802b9c5d57abc57833c17de2ccd336db16be  $repo_root/src/main.rs
 7718c15393872a139956732629c472d813a2a014395f943a5382191966162745  $repo_root/src/private_postgres.rs
 586f6c9c935140de9580e4b4490df3fc24a9f30e9f4c6c6bf1e194c6e6fc9d1e  $repo_root/src/store/cockroach.rs
 b8c3ffbd3dfe7a74f76a06815f317db3e79b3129adaa14e2da5bea43f60b069f  $repo_root/src/ledger/cockroach.rs
