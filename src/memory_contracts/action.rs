@@ -13,10 +13,17 @@
 //! [`ReconciledExecutionV1`] are the only accepted-authority forms; each has
 //! private fields and is constructible only by the matching pure function in
 //! this module (`authorize`, `revalidate_authorization`,
-//! `reconcile_receipt`), never by deserializing a payload. This module cannot
-//! authenticate a decision-maker, observe real provider state, or execute
-//! anything; it defines the exact structural rules a later runtime seam must
-//! still apply.
+//! `reconcile_receipt`), never by deserializing a payload. These three forms
+//! compose into a single chain a runtime cannot skip a link of:
+//! `revalidate_authorization` takes the `AuthorizedActionV1` `authorize`
+//! produced (so it re-derives AUTH-03 self-promotion and ACT-02 expiry
+//! ordering rather than trusting a bare `AuthorizationV1` payload), and
+//! `reconcile_receipt` takes the `RevalidatedAuthorizationV1`
+//! `revalidate_authorization` produced for that exact attempt (so a receipt
+//! can never close an attempt that was never actually revalidated). This
+//! module cannot authenticate a decision-maker, observe real provider state,
+//! or execute anything; it defines the exact structural rules a later
+//! runtime seam must still apply.
 
 use std::fmt;
 
@@ -257,11 +264,13 @@ impl AuthorizedActionV1 {
     /// way always names a proposal its authorization actually approved.
     /// A caller may still hand-assemble an [`ExecutionRequestV1`] directly
     /// (it derives `Deserialize`); [`revalidate_authorization`] is what
-    /// closes that gap by independently re-checking
-    /// `attempt.request.proposal_digest == authorization.proposal_digest`
-    /// against the authorization actually supplied at revalidation time,
-    /// so a hand-assembled request naming an unapproved proposal is
-    /// rejected there rather than trusted because it was well-formed.
+    /// closes that gap, and it closes a wider one than the digest fields
+    /// alone: it requires an [`AuthorizedActionV1`] as a separate argument
+    /// from the `AuthorizationV1` it revalidates, cross-checked by digest,
+    /// so a hand-assembled attempt naming an unapproved proposal — or an
+    /// authorization that was never validly granted in the first place
+    /// (self-authorized, or expiring after its own proposal) — is rejected
+    /// there rather than trusted because its fields happened to line up.
     pub fn open_execution_request(
         &self,
         idempotency_key: FixedHex32,
@@ -428,7 +437,12 @@ impl ExecutionAttemptV1 {
 ///
 /// Exact authorization binding, unexpired, uses remaining, unchanged current
 /// state (compare-and-swap), and an unchanged precondition set (ACT-03).
-/// Constructible only via [`revalidate_authorization`].
+/// Constructible only via [`revalidate_authorization`], which itself
+/// requires an [`AuthorizedActionV1`] — so a self-authorized authorization,
+/// or one whose expiry outlives its proposal, or one naming a proposal
+/// digest no [`ActionProposalV1`] ever produced, can never yield a value of
+/// this type (AUTH-03): [`authorize`] already rejects all three, and this
+/// type cannot be reached without first passing through it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RevalidatedAuthorizationV1 {
     attempt_id: AttemptIdV1,
@@ -451,6 +465,15 @@ impl RevalidatedAuthorizationV1 {
 /// authorization expiry, remaining uses, and the exact precondition set
 /// immediately before execution.
 ///
+/// `authorized` must be the exact [`AuthorizedActionV1`] a prior call to
+/// [`authorize`] produced for `authorization` (AUTH-03/ACT-02): this is the
+/// structural gate that makes a self-authorized authorization, an
+/// authorization whose expiry outlives its proposal, and an authorization
+/// naming a proposal digest no [`ActionProposalV1`] ever produced all
+/// unreachable here — none of them can ever produce an [`AuthorizedActionV1`]
+/// in the first place, so there is no way to call this function for them at
+/// all, not merely a check that rejects them after the fact.
+///
 /// Runtime obligation (not enforced by this pure leaf): `remaining_uses_before_attempt`
 /// is a plain caller-supplied count, not a value this module reads from
 /// durable storage. The runtime must persist `remaining_uses_after` from the
@@ -459,12 +482,25 @@ impl RevalidatedAuthorizationV1 {
 /// concurrent revalidation of the same authorization — this function has no
 /// way to detect a racing decrement it never saw.
 pub fn revalidate_authorization(
+    authorized: &AuthorizedActionV1,
     authorization: &AuthorizationV1,
     attempt: &ExecutionAttemptV1,
     remaining_uses_before_attempt: u32,
 ) -> ContractResult<RevalidatedAuthorizationV1> {
     let authorization_digest = authorization.authorization_digest()?;
     attempt.validate_shape()?;
+    // AUTH-03: the authorization presented here must be the exact one
+    // `authorized` was granted for. Without this cross-check, a caller could
+    // obtain a legitimate `AuthorizedActionV1` for one compliant
+    // proposal/authorization pair and then supply an entirely different,
+    // non-compliant `authorization` (self-authorized, expiry-outliving, or
+    // naming a phantom proposal) alongside it — laundering the proof.
+    if authorized.authorization_digest != authorization_digest {
+        return Err(ContractError::Schema(
+            "the authorized pairing does not name the authorization presented at revalidation (AUTH-03)"
+                .into(),
+        ));
+    }
     if attempt.request.authorization_digest != authorization_digest {
         return Err(ContractError::Schema(
             "execution attempt does not bind the exact authorization digest".into(),
@@ -474,10 +510,10 @@ pub fn revalidate_authorization(
     // was granted for. Without this, `attempt.request.proposal_digest` is a
     // wire-decoded field a caller controls; nothing else in this function
     // (or `reconcile_receipt`/`check_idempotency_reuse`) compares it against
-    // `authorization.proposal_digest`, so a single authorization could
+    // `authorized.proposal_digest`, so a single authorization could
     // otherwise revalidate attempts declaring arbitrary, unauthorized
     // proposals.
-    if attempt.request.proposal_digest != authorization.proposal_digest {
+    if attempt.request.proposal_digest != authorized.proposal_digest {
         return Err(ContractError::Schema(
             "execution attempt declares a proposal digest the authorization did not approve (ACT-02)"
                 .into(),
@@ -628,12 +664,26 @@ impl ReconciledExecutionV1 {
 
 /// ACT-03: the same attempt is reconciled by provider request ID and
 /// read-after-write state, never by wall-clock proximity or a fresh attempt.
+///
+/// `revalidated` must be the exact [`RevalidatedAuthorizationV1`] a prior
+/// call to [`revalidate_authorization`] produced for `attempt` (AUTH-03):
+/// this makes a receipt closing an attempt that was never actually
+/// revalidated — including one whose authorization was never validly
+/// granted in the first place — structurally unreachable here, not merely
+/// rejected after the fact.
 pub fn reconcile_receipt(
+    revalidated: &RevalidatedAuthorizationV1,
     attempt: &ExecutionAttemptV1,
     receipt: &ExecutionReceiptV1,
 ) -> ContractResult<ReconciledExecutionV1> {
     let attempt_id = attempt.attempt_id()?;
     let receipt_id = receipt.receipt_id()?;
+    if revalidated.attempt_id != attempt_id {
+        return Err(ContractError::Schema(
+            "the revalidation proof does not name the attempt this receipt reconciles (AUTH-03)"
+                .into(),
+        ));
+    }
     if receipt.attempt_id != attempt_id {
         return Err(ContractError::Schema(
             "receipt does not bind the exact attempt identity".into(),
@@ -767,7 +817,7 @@ mod tests {
     const VERIFICATION_ID: &str =
         "52acc011337f5ca3dde28b3c298fc6f3008ad9b0dda25bc732d1396a2b3d29d6";
     const VECTOR_SUITE_DIGEST: &str =
-        "21b2f0ef7e7e450622e55266b9cc04d40e9f82f91dafec69676e209dc998929a";
+        "81a0fb26d88da203f684ca0df9f7839d7dad244d2a11fff5f3038fcecfd2137e";
 
     fn record(bytes: &[u8]) -> &[u8] {
         let body = bytes
@@ -858,6 +908,14 @@ mod tests {
             .unwrap()
     }
 
+    fn authorized_action() -> AuthorizedActionV1 {
+        authorize(&proposal(), &authorization()).unwrap()
+    }
+
+    fn revalidated() -> RevalidatedAuthorizationV1 {
+        revalidate_authorization(&authorized_action(), &authorization(), &attempt(), 1).unwrap()
+    }
+
     fn attempt() -> ExecutionAttemptV1 {
         ExecutionAttemptV1 {
             schema_version: 1,
@@ -935,6 +993,13 @@ mod tests {
             "attempt_scope_or_profile_mismatch_rejected",
             "authorization_expiry_outlives_proposal_rejected",
             "authorization_expiry_reached",
+            "authorization_outliving_proposal_cannot_revalidate",
+            "authorization_preconditions_exceed_max_rejected",
+            "execution_attempt_preconditions_exceed_max_rejected",
+            "execution_attempt_preconditions_unsorted_or_duplicate_rejected",
+            "execution_attempt_schema_version_mismatch_rejected",
+            "execution_receipt_completion_digest_zero_rejected",
+            "execution_receipt_schema_version_mismatch_rejected",
             "idempotency_reuse_different_authorization",
             "idempotency_reuse_different_proposal",
             "mitigation_independent_of_verification_result",
@@ -942,10 +1007,12 @@ mod tests {
             "receipt_predates_attempt",
             "receipt_provider_request_id_mismatch",
             "receipt_scope_mismatch",
+            "receipt_without_revalidation_rejected",
             "receipt_wrong_attempt_binding",
             "reconciliation_state_result_mismatch",
             "revalidated_at_after_started_at_rejected",
             "revalidation_gap_exceeds_freshness_window_rejected",
+            "self_authorized_authorization_cannot_revalidate",
             "self_authorized_proposal_rejected",
             "stale_current_state_fails_closed",
             "stale_preconditions_fail_closed",
@@ -1170,28 +1237,46 @@ mod tests {
 
     #[test]
     fn revalidation_fails_closed_on_stale_state_expiry_and_uses() {
+        let authorized = authorized_action();
         let authorized_authorization = authorization();
-        revalidate_authorization(&authorized_authorization, &attempt(), 1).unwrap();
+        revalidate_authorization(&authorized, &authorized_authorization, &attempt(), 1).unwrap();
 
         let mut stale_state = attempt();
         stale_state.revalidated_current_state = state('9');
-        assert!(revalidate_authorization(&authorized_authorization, &stale_state, 1).is_err());
+        assert!(
+            revalidate_authorization(&authorized, &authorized_authorization, &stale_state, 1)
+                .is_err()
+        );
 
         let mut stale_preconditions = attempt();
         stale_preconditions.revalidated_preconditions =
             vec![ContractId::new("precondition.on_call_paged").unwrap()];
         assert!(
-            revalidate_authorization(&authorized_authorization, &stale_preconditions, 1).is_err()
+            revalidate_authorization(
+                &authorized,
+                &authorized_authorization,
+                &stale_preconditions,
+                1
+            )
+            .is_err()
         );
 
         let mut expired = attempt();
         expired.revalidated_at =
             CanonicalTimestamp::parse("2026-08-16T01:00:00.000000000Z").unwrap();
         expired.started_at = expired.revalidated_at.clone();
-        assert!(revalidate_authorization(&authorized_authorization, &expired, 1).is_err());
+        assert!(
+            revalidate_authorization(&authorized, &authorized_authorization, &expired, 1).is_err()
+        );
 
-        assert!(revalidate_authorization(&authorized_authorization, &attempt(), 0).is_err());
-        assert!(revalidate_authorization(&authorized_authorization, &attempt(), 2).is_err());
+        assert!(
+            revalidate_authorization(&authorized, &authorized_authorization, &attempt(), 0)
+                .is_err()
+        );
+        assert!(
+            revalidate_authorization(&authorized, &authorized_authorization, &attempt(), 2)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1203,7 +1288,7 @@ mod tests {
         on_time.revalidated_at =
             CanonicalTimestamp::parse("2026-08-16T00:04:30.000000000Z").unwrap();
         on_time.validate_shape().unwrap();
-        revalidate_authorization(&authorization(), &on_time, 1).unwrap();
+        revalidate_authorization(&authorized_action(), &authorization(), &on_time, 1).unwrap();
 
         // Negative: a revalidation recorded *after* dispatch already began
         // revalidates nothing and must be rejected, not accepted as if a
@@ -1225,6 +1310,16 @@ mod tests {
         stale_gap.revalidated_at =
             CanonicalTimestamp::parse("2026-08-16T00:05:00.000000000Z").unwrap();
         assert!(stale_gap.validate_shape().is_err());
+
+        // Exact boundary: a gap of exactly `MAX_REVALIDATION_TO_START_GAP`
+        // (300s) is still valid; pins `>` against a `>=` mutant, which the
+        // strictly-greater `stale_gap` case above cannot distinguish.
+        let mut at_boundary_gap = attempt();
+        at_boundary_gap.started_at =
+            CanonicalTimestamp::parse("2026-08-16T00:10:00.000000000Z").unwrap();
+        at_boundary_gap.revalidated_at =
+            CanonicalTimestamp::parse("2026-08-16T00:05:00.000000000Z").unwrap();
+        at_boundary_gap.validate_shape().unwrap();
     }
 
     #[test]
@@ -1240,7 +1335,15 @@ mod tests {
             unauthorized_proposal.request.proposal_digest,
             authorization().proposal_digest
         );
-        assert!(revalidate_authorization(&authorization(), &unauthorized_proposal, 1).is_err());
+        assert!(
+            revalidate_authorization(
+                &authorized_action(),
+                &authorization(),
+                &unauthorized_proposal,
+                1
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1250,7 +1353,10 @@ mod tests {
             ContractId::new("tenant.attacker").unwrap(),
             ContractId::new("project.attacker").unwrap(),
         );
-        assert!(revalidate_authorization(&authorization(), &mismatched_scope, 1).is_err());
+        assert!(
+            revalidate_authorization(&authorized_action(), &authorization(), &mismatched_scope, 1)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1287,7 +1393,7 @@ mod tests {
 
     #[test]
     fn reconciliation_binds_exact_attempt_and_provider_request_id() {
-        let reconciled = reconcile_receipt(&attempt(), &receipt()).unwrap();
+        let reconciled = reconcile_receipt(&revalidated(), &attempt(), &receipt()).unwrap();
         assert_eq!(reconciled.attempt_id(), attempt().attempt_id().unwrap());
         assert_eq!(
             reconciled.reconciliation_state(),
@@ -1296,17 +1402,17 @@ mod tests {
 
         let mut wrong_attempt = receipt();
         wrong_attempt.attempt_id = AttemptIdV1::from_digest(digest(&"7".repeat(64)));
-        assert!(reconcile_receipt(&attempt(), &wrong_attempt).is_err());
+        assert!(reconcile_receipt(&revalidated(), &attempt(), &wrong_attempt).is_err());
 
         let mut wrong_provider_request = receipt();
         wrong_provider_request.provider_request_id =
             ContractId::new("provider.request.other").unwrap();
-        assert!(reconcile_receipt(&attempt(), &wrong_provider_request).is_err());
+        assert!(reconcile_receipt(&revalidated(), &attempt(), &wrong_provider_request).is_err());
 
         let mut before_attempt = receipt();
         before_attempt.recorded_at =
             CanonicalTimestamp::parse("2026-08-15T00:00:00.000000000Z").unwrap();
-        assert!(reconcile_receipt(&attempt(), &before_attempt).is_err());
+        assert!(reconcile_receipt(&revalidated(), &attempt(), &before_attempt).is_err());
     }
 
     #[test]
@@ -1320,7 +1426,7 @@ mod tests {
             wrong_before_state.before_state,
             attempt().revalidated_current_state
         );
-        assert!(reconcile_receipt(&attempt(), &wrong_before_state).is_err());
+        assert!(reconcile_receipt(&revalidated(), &attempt(), &wrong_before_state).is_err());
     }
 
     #[test]
@@ -1332,7 +1438,7 @@ mod tests {
             ContractId::new("tenant.attacker").unwrap(),
             ContractId::new("project.attacker").unwrap(),
         );
-        assert!(reconcile_receipt(&attempt(), &wrong_scope).is_err());
+        assert!(reconcile_receipt(&revalidated(), &attempt(), &wrong_scope).is_err());
     }
 
     #[test]
@@ -1393,6 +1499,153 @@ mod tests {
         let mut inverted_window = verification();
         inverted_window.observation_window_end = inverted_window.observation_window_start.clone();
         assert!(inverted_window.validate_shape().is_err());
+    }
+
+    /// `n` sorted, distinct `ContractId`s for exercising the `MAX_PRECONDITIONS`
+    /// bound and the sortedness conjunct at an exact, controlled length.
+    fn preconditions(count: usize) -> Vec<ContractId> {
+        (0..count)
+            .map(|index| ContractId::new(format!("precondition.p{index:03}")).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn authorization_preconditions_exceed_max_rejected() {
+        // ACT-02: MAX_PRECONDITIONS is an inclusive bound. The 2-precondition
+        // fixture never reaches it, so `> MAX_PRECONDITIONS` and `>=
+        // MAX_PRECONDITIONS` (or `== MAX_PRECONDITIONS`) are indistinguishable
+        // without an exact-boundary case on both sides.
+        let mut at_bound = authorization();
+        at_bound.preconditions = preconditions(64);
+        at_bound.validate_shape().unwrap();
+
+        let mut over_bound = authorization();
+        over_bound.preconditions = preconditions(65);
+        assert!(over_bound.validate_shape().is_err());
+    }
+
+    #[test]
+    fn execution_attempt_preconditions_exceed_max_rejected() {
+        let mut at_bound = attempt();
+        at_bound.revalidated_preconditions = preconditions(64);
+        at_bound.validate_shape().unwrap();
+
+        let mut over_bound = attempt();
+        over_bound.revalidated_preconditions = preconditions(65);
+        assert!(over_bound.validate_shape().is_err());
+    }
+
+    #[test]
+    fn execution_attempt_preconditions_unsorted_or_duplicate_rejected() {
+        let mut unsorted = attempt();
+        unsorted.revalidated_preconditions = vec![
+            ContractId::new("precondition.p001").unwrap(),
+            ContractId::new("precondition.p000").unwrap(),
+        ];
+        assert!(unsorted.validate_shape().is_err());
+
+        let mut duplicated = attempt();
+        duplicated.revalidated_preconditions = vec![
+            ContractId::new("precondition.p000").unwrap(),
+            ContractId::new("precondition.p000").unwrap(),
+        ];
+        assert!(duplicated.validate_shape().is_err());
+    }
+
+    #[test]
+    fn execution_attempt_schema_version_mismatch_rejected() {
+        let mut wrong_schema = attempt();
+        wrong_schema.schema_version = 2;
+        assert!(wrong_schema.validate_shape().is_err());
+    }
+
+    #[test]
+    fn execution_receipt_completion_digest_zero_rejected() {
+        let mut zero_completion = receipt();
+        zero_completion.completion_digest = Sha256Digest::ZERO;
+        assert!(zero_completion.validate_shape().is_err());
+    }
+
+    #[test]
+    fn execution_receipt_schema_version_mismatch_rejected() {
+        let mut wrong_schema = receipt();
+        wrong_schema.schema_version = 2;
+        assert!(wrong_schema.validate_shape().is_err());
+    }
+
+    #[test]
+    fn self_authorized_authorization_cannot_revalidate() {
+        // AUTH-03: `revalidate_authorization` requires the `AuthorizedActionV1`
+        // proof `authorize` only produces for a non-self-promoted pairing. A
+        // self-authorized authorization can never produce that proof, so it
+        // can never reach `revalidate_authorization` at all.
+        let mut self_authorized = authorization();
+        self_authorized.decision_maker_principal_id = proposal().proposer_principal_id;
+        assert!(authorize(&proposal(), &self_authorized).is_err());
+
+        // Holding a *legitimately* authorized pairing for a different,
+        // compliant authorization cannot be laundered into revalidating the
+        // self-authorized one: `authorized.authorization_digest` will not
+        // match the self-authorized authorization's own digest.
+        let legitimate = authorized_action();
+        let mut attempt_for_self_authorized = attempt();
+        attempt_for_self_authorized.request.authorization_digest =
+            self_authorized.authorization_digest().unwrap();
+        assert!(
+            revalidate_authorization(
+                &legitimate,
+                &self_authorized,
+                &attempt_for_self_authorized,
+                1
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn authorization_outliving_proposal_cannot_revalidate() {
+        // ACT-02/AUTH-03: the same structural gate closes an authorization
+        // whose expiry outlives its proposal's expiry.
+        let mut outliving = authorization();
+        outliving.expiry = CanonicalTimestamp::parse("2027-01-01T00:00:00.000000000Z").unwrap();
+        assert!(authorize(&proposal(), &outliving).is_err());
+
+        let legitimate = authorized_action();
+        let mut attempt_for_outliving = attempt();
+        attempt_for_outliving.request.authorization_digest =
+            outliving.authorization_digest().unwrap();
+        assert!(
+            revalidate_authorization(&legitimate, &outliving, &attempt_for_outliving, 1).is_err()
+        );
+    }
+
+    #[test]
+    fn receipt_without_revalidation_rejected() {
+        // AUTH-03/ACT-03: `reconcile_receipt` requires the exact
+        // `RevalidatedAuthorizationV1` proof `revalidate_authorization`
+        // produced for *this* attempt. A revalidation proof minted for one
+        // attempt cannot close a receipt for a different attempt that was
+        // never itself revalidated.
+        let revalidated_for_first = revalidated();
+
+        let mut other_attempt = attempt();
+        other_attempt.request.idempotency_key = FixedHex32::from_bytes([0x11; 32]);
+        assert_ne!(
+            other_attempt.attempt_id().unwrap(),
+            attempt().attempt_id().unwrap()
+        );
+
+        let mut receipt_for_other_attempt = receipt();
+        receipt_for_other_attempt.attempt_id = other_attempt.attempt_id().unwrap();
+
+        assert!(
+            reconcile_receipt(
+                &revalidated_for_first,
+                &other_attempt,
+                &receipt_for_other_attempt
+            )
+            .is_err()
+        );
     }
 
     #[test]
