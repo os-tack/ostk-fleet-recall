@@ -218,13 +218,32 @@ fixture (`unbound_intervention_fails_the_hypothesis_binding_check`):
   claims.
 - `project_adjudication_state_rejects_a_fold_mixing_two_hypotheses` — two
   ratification records for two different hypotheses (different `cause`
-  identity, so different `hypothesis_fingerprint`s), folded together. Fixed
-  post-review: `project_adjudication_state` used to fold any slice of
-  `CausalRatificationV1` without ever checking they named the same
+  identity, so different `hypothesis_fingerprint`s), folded together with an
+  otherwise legal transition (`open -> refuted -> superseded`) and a
+  `supersedes` digest that correctly cites the immediate predecessor, so the
+  fingerprint mismatch is the *only* possible reason the fold can reject
+  them. (The first version of this test folded two `Ratified` records, which
+  `is_allowed_adjudication_transition` already rejects on its own —
+  `Ratified -> Ratified` is not a legal transition — so the fingerprint
+  check was never actually exercised; a mutation run against the fixed
+  version confirmed the corrected test kills the mutant the first version
+  missed.) Fixed post-review: `project_adjudication_state` used to fold any
+  slice of `CausalRatificationV1` without ever checking they named the same
   hypothesis, so a record authored for hypothesis B could flip hypothesis
   A's projected adjudication state. The fold now fails closed the first time
   a folded record's `hypothesis_fingerprint` differs from the one already
   seen.
+- `project_adjudication_state_rejects_a_fold_mixing_two_scopes` — two
+  ratification records sharing one `hypothesis_fingerprint` but
+  authenticated under different `scope`s, otherwise identical to the test
+  above (legal transition, correct `supersedes` citation). Fixed post-review:
+  the fold checked `hypothesis_fingerprint` equality but never `scope`
+  equality, so a record authored under a foreign tenant/project — which can
+  never truthfully `binds_hypothesis` against any real hypothesis in that
+  scope — could still be folded and flip another scope's projected
+  adjudication state, purely because it happened to collide on the
+  fingerprint field. The fold now fails closed the first time a folded
+  record's `scope` differs from the one already seen.
 - `project_adjudication_state_rejects_supersedes_citing_a_foreign_digest` and
   `project_adjudication_state_rejects_a_superseded_record_with_no_predecessor`
   — a `superseded` record whose `supersedes` digest names something other
@@ -244,6 +263,61 @@ fixture (`unbound_intervention_fails_the_hypothesis_binding_check`):
   same treatment now, for consistency (a real digest can never be `ZERO`, so
   this is also implied by the fold-level check above, but the shape check
   fails closed one layer earlier).
+- `evaluate_ratification_rejects_ratified_positive_role_with_no_bound_intervention`
+  and `evaluate_ratification_rejects_intervention_that_does_not_match_the_cited_digest`
+  — a `ratified`/positive-role record checked with `intervention: None`, and
+  the same record checked against an intervention whose digest does not
+  match `intervention_support_digest`. Both `MissingInterventionBinding` and
+  `InterventionBindingMismatch` were declared reasons with zero test
+  coverage: nothing in the crate ever called `evaluate_ratification` with
+  `None`, and nothing supplied a non-matching `Some(intervention)`. Both
+  conjuncts of the `None` arm's guard (`conclusion == Ratified &&
+  causal_role.is_some()`) survived mutation before these tests existed.
+- `separation_of_duty_exception_activated_after_closure_watermark_is_rejected`,
+  `separation_of_duty_exception_activated_exactly_at_closure_watermark_is_rejected`,
+  and `evaluate_ratification_rejects_retroactively_activated_separation_of_duty_exception`
+  — a human-role exception whose `activated_at` is dated after (or exactly
+  at) the ratification's own `closure_watermark`. Fixed post-review:
+  `evaluate_separation_of_duty` checked only that an exception was *present*
+  and validly referenced, never that it was *previously* activated relative
+  to the ratification it excuses — so an author of the implicated change
+  could cite an exception "activated" a century after the fact and still
+  pass. `evaluate_separation_of_duty` now takes `closure_watermark` and
+  requires `exception.activated_at < closure_watermark` (strictly before,
+  matching `PreRecordedMechanismV1::recorded_before`'s treatment of equal
+  instants).
+- `unobserved_material_input_observation_rejects_unknown_field`,
+  `exemplars_only_basis_rejects_unknown_field`,
+  `material_input_separation_unit_variants_reject_unknown_field`, and
+  `smuggled_field_inside_material_input_separation_is_rejected_at_full_record_decode`
+  — a JSON key smuggled alongside the tag of a *unit* variant
+  (`Unobserved`, `ExemplarsOnly`, `SingleInputChanged`,
+  `MultipleInputsInseparable`). Fixed post-review:
+  `#[serde(deny_unknown_fields)]` on an internally-tagged enum has no effect
+  on a unit variant — serde routes it through a tag-only visitor that never
+  checks residual keys — so two different byte strings (a clean record and
+  one with a smuggled key inside a unit-variant field) decoded to the
+  identical value and digested to the identical `InterventionSupportV1`
+  digest. Each affected variant is now declared as the empty struct-variant
+  form (`Unobserved {}`, ...), which serializes to identical wire bytes but
+  is field-checked at decode. `raw_fixture_bytes_are_pinned` and
+  `vector_suite_manifest_matches_every_pinned_fixture_digest` (below) pass
+  unchanged — no golden fixture byte moved.
+- `strictly_sorted_rejects_duplicate_adjacent_elements`,
+  `duplicate_material_input_component_is_rejected`,
+  `duplicate_entries_in_causal_ratification_canonical_sets_are_rejected`,
+  `duplicate_entries_in_intervention_support_canonical_sets_are_rejected`, and
+  `duplicate_implicated_change_author_is_rejected` — an exact duplicate
+  (not merely misordered) adjacent entry in a canonical set. Fixed
+  post-review: `strictly_sorted` and `strictly_sorted_by_component` both use
+  `<`, which rejects misordering AND duplication, but no assertion in the
+  crate exercised the duplicate case specifically, so a `<` -> `<=`
+  mutation — which still catches misordering — silently admitted an exact
+  duplicate on every canonical set in the module
+  (`material_input_deltas`, `evidence_bundle_digests`,
+  `supporting_evidence`, `opposing_evidence`, `unresolved_required_gaps`,
+  `residual_unknowns`, `implicated_change_author_principal_ids`, and
+  `provenance_to_exposed_cohort` / `cohort_comparison.receipts`).
 
 ## How digests are pinned
 
@@ -297,17 +371,66 @@ their derived digests differ from any value pinned before this fix.
 - **AUTH-03** — agents cannot self-promote. `evaluate_separation_of_duty`
   rejects any ratifier that is the proposer, the executor, or an author of
   the implicated change, and the human-only signed-exception carve-out can
-  never be invoked by `RatifierIdentityV1::Agent`.
+  never be invoked by `RatifierIdentityV1::Agent`. The exception itself is
+  also provably prior: `evaluate_separation_of_duty` requires
+  `exception.activated_at < ratification.closure_watermark`, so an exception
+  "activated" at or after the ratification it excuses — retroactive
+  self-authorization — is rejected exactly like a missing exception. This
+  proves only relative ordering between two self-asserted timestamps, the
+  same as `PreRecordedMechanismV1::recorded_before`; it does not prove
+  either timestamp is honest — an external anchor or trusted clock witness
+  remains a runtime concern outside this contract-only stage.
 - **ACT-04** — recovery is not root-cause resolution. `AdjudicationState` and
   `SupportLevel` are independent axes; `evaluate_ratification` never lets a
   `refuted` *or* `superseded` conclusion carry a positive causal role, and
   `project_adjudication_state` never lets a later record erase what an
   earlier one established — only append a legal transition on top of it.
   This append-only guarantee is also identity-checked: every folded record
-  must share the same `hypothesis_fingerprint` (a record for a different
-  hypothesis can never flip this one's projected state), and a `superseded`
-  record must cite the exact digest of the record it immediately follows
-  (an arbitrary or absent prior digest fails closed).
+  must share both the same `hypothesis_fingerprint` and the same
+  authenticated `scope` as the first (a record for a different hypothesis,
+  or one authenticated under a different tenant/project, can never flip
+  this one's projected state), and a `superseded` record must cite the
+  exact digest of the record it immediately follows (an arbitrary or absent
+  prior digest fails closed).
+
+- `mechanism_narrative_rejects_empty_control_and_non_nfc_text` and
+  `mechanism_narrative_length_boundary_is_inclusive_of_the_maximum` —
+  `MechanismNarrativeTextV1::parse`. A full-file mutation sweep (this
+  round) found three additional pre-existing survivors here despite this
+  test's name claiming non-NFC coverage: `||` -> `&&` on the non-NFC clause
+  (nothing ever passed genuinely non-NFC-normalized text — only control
+  characters and emptiness were exercised), and `>` -> `==` / `>` -> `>=`
+  on the length check (nothing exercised the length boundary at all). Also
+  added an assertion on `MechanismNarrativeTextV1::as_str`'s actual return
+  value, which no test anywhere in the crate had called.
+- `missing_intervention_binding_guard_requires_ratified_conclusion_not_merely_a_causal_role`
+  — a targeted mutation run (restricted to `evaluate_ratification`, 15
+  mutants, all caught) found this round's own
+  `evaluate_ratification_rejects_ratified_positive_role_with_no_bound_intervention`
+  test does not discriminate `&&` from `||` in the `None`-arm guard: with
+  `causal_role: None`, both operators evaluate `false` since the second
+  conjunct is already false. This test instead sets a non-`Ratified`
+  conclusion with `causal_role: Some(..)`, so the first conjunct is false
+  and the second true — the only shape that tells `&&` and `||` apart.
+
+## Known non-blocking gaps
+
+- `MaterialInputSeparationV1::MultipleInputsIsolated { isolation_receipt }`
+  lets an intervention introduce a second *changed* material input that the
+  hypothesis's own RUN-03 registered inventory never named, and still reach
+  `intervention_supported`: `registered_components_are_covered` only checks
+  hypothesis -> intervention coverage (every component the hypothesis
+  registered must be observed consistently), never the reverse (that the
+  intervention introduces no new changed component the hypothesis never
+  registered). `isolation_receipt` is the intended defense for exactly this
+  case, but resolving whether it actually proves isolation is a later
+  runtime seam's job, not something this contract-only layer can check.
+- `CausalRatificationV1::bounded_scope` is declared and digested but read by
+  no predicate in this module; it is a consumer-side concern (what the
+  ratification's conclusion actually covers), not a v1 admissibility input.
+  `closure_watermark` and `SignedSeparationOfDutyExceptionV1::activated_at`
+  were in the same position before this round — both are now read by
+  `evaluate_separation_of_duty`'s activation-ordering check above.
 
 ## Reproducing or breaking these vectors
 
@@ -334,11 +457,75 @@ their derived digests differ from any value pinned before this fix.
 - To break `project_adjudication_state`'s identity binding, you would need to
   stop comparing every folded record's `hypothesis_fingerprint` to the first
   one seen — `project_adjudication_state_rejects_a_fold_mixing_two_hypotheses`
-  exists exactly to catch that — or to stop comparing a `superseded`
-  record's `supersedes` digest to the immediately preceding folded record's
-  own digest —
+  exists exactly to catch that, with a legal transition and a correct
+  `supersedes` citation so the fingerprint conjunct is the sole possible
+  rejection — or to stop comparing every folded record's `scope` to the
+  first one seen — `project_adjudication_state_rejects_a_fold_mixing_two_scopes`
+  exists exactly to catch that, the same way — or to stop comparing a
+  `superseded` record's `supersedes` digest to the immediately preceding
+  folded record's own digest —
   `project_adjudication_state_rejects_supersedes_citing_a_foreign_digest`
   exists exactly to catch that.
+- To break `evaluate_ratification`'s bound-intervention requirement, you
+  would need to stop requiring *some* intervention when a `ratified`
+  conclusion carries a positive causal role —
+  `evaluate_ratification_rejects_ratified_positive_role_with_no_bound_intervention`
+  exists exactly to catch that — or to stop checking that a supplied
+  intervention actually matches the cited digest —
+  `evaluate_ratification_rejects_intervention_that_does_not_match_the_cited_digest`
+  exists exactly to catch that.
+- To break the separation-of-duty exception's activation-ordering
+  requirement, you would need to stop comparing `exception.activated_at`
+  against `closure_watermark` (or weaken `<` to `<=`) —
+  `separation_of_duty_exception_activated_after_closure_watermark_is_rejected`
+  and `separation_of_duty_exception_activated_exactly_at_closure_watermark_is_rejected`
+  exist exactly to catch that.
+- To break a unit variant's unknown-field rejection, you would need to
+  revert it from the empty struct-variant form back to the bare unit form —
+  `unobserved_material_input_observation_rejects_unknown_field`,
+  `exemplars_only_basis_rejects_unknown_field`, and
+  `material_input_separation_unit_variants_reject_unknown_field` each exist
+  exactly to catch that for their variant.
+- To break any canonical set's rejection of an exact duplicate entry, you
+  would need to weaken `strictly_sorted` or `strictly_sorted_by_component`
+  from `<` to `<=` — `strictly_sorted_rejects_duplicate_adjacent_elements`
+  and its per-field companions exist exactly to catch that.
+- To break `MechanismNarrativeTextV1::parse`'s non-NFC or length-boundary
+  checks, you would need to weaken the non-NFC `||` to `&&` or the length
+  `>` to `==`/`>=` — `mechanism_narrative_rejects_empty_control_and_non_nfc_text`
+  and `mechanism_narrative_length_boundary_is_inclusive_of_the_maximum` exist
+  exactly to catch that.
+- To break `evaluate_ratification`'s requirement that `MissingInterventionBinding`
+  fires only for an actually-`Ratified` conclusion (not merely a stray
+  positive `causal_role`), you would need to weaken its guard's `&&` to
+  `||` —
+  `missing_intervention_binding_guard_requires_ratified_conclusion_not_merely_a_causal_role`
+  exists exactly to catch that.
+
+## Mechanical verification (this round)
+
+`mutants.sh`'s own shard/`-j 1` invocation fails in this environment: the
+harness's `/bin/bash` is 3.2.57 (Apple's frozen build), which has a known
+`set -u` bug on an empty array (`"${SHARD[@]}"`), and separately `cargo
+mutants --in-place` rejects `--jobs`/`-j` outright in the installed version
+(the same conflict the previous adversarial review's own preflight
+documented working around). This round ran `cargo +1.94 mutants` directly
+through the slot wrapper instead, in two passes: a whole-file pass (`-f
+src/memory_contracts/causal.rs`, no `--re` filter, all ~330 mutants —
+closing the coverage gap the previous review's function-name regex left,
+since a bare `-f` with no filter also reaches every `Type::method` mutant)
+established that `project_adjudication_state`'s fingerprint AND scope
+identity checks are both caught before this pass was stopped partway
+through for time; a second, narrower pass restricted to exactly the
+functions this round touched (`project_adjudication_state`,
+`evaluate_ratification`, `evaluate_separation_of_duty`, `strictly_sorted`,
+`strictly_sorted_by_component`, `MechanismNarrativeTextV1::parse`,
+`MaterialInputObservationV1`, `CorroboratingEvidenceBasisV1`,
+`MaterialInputSeparationV1`) ran to completion: 47 mutants, 45 caught, 1
+unviable, 1 missed (`evaluate_ratification`'s `None`-arm `&&`, fixed by
+`missing_intervention_binding_guard_requires_ratified_conclusion_not_merely_a_causal_role`
+above and reverified caught by a follow-up 15-mutant pass restricted to
+`evaluate_ratification` alone: 15/15 caught).
 
 Changing any canonical record, any expected digest, or any DigestDomain
 prefix in this directory is a contract-version change.
