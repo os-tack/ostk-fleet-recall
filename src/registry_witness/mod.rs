@@ -1079,6 +1079,34 @@ mod tests {
         encode_canonical(&binding).expect("canonical head")
     }
 
+    /// The mechanical mutation pre-flight found this uncovered: `framed_record`
+    /// was only ever exercised on the frozen, already-well-framed compiled-in
+    /// artifacts, so `body.ends_with(b"\n") || body.contains(&b'\r')` and
+    /// `&&` were indistinguishable — neither disjunct was ever true alone.
+    /// Each artifact below makes exactly one disjunct true so a `&&` mutant
+    /// (which would then require both) fails to reject it.
+    #[test]
+    fn framed_record_requires_exactly_one_trailing_lf_and_no_carriage_return() {
+        assert!(
+            framed_record(b"no trailing lf").is_err(),
+            "missing the required trailing LF must be rejected"
+        );
+        assert!(
+            framed_record(b"double\n\n").is_err(),
+            "a second trailing LF (ends_with true, contains('\\r') false) must \
+             be rejected on its own"
+        );
+        assert!(
+            framed_record(b"has\rcarriage\nreturn\n").is_err(),
+            "an embedded CR (ends_with false, contains('\\r') true) must be \
+             rejected on its own"
+        );
+        assert_eq!(
+            framed_record(b"exactly one lf\n").expect("well-framed artifact"),
+            b"exactly one lf"
+        );
+    }
+
     #[test]
     fn compiled_in_packages_are_semantically_closed() {
         let genesis = genesis_package().expect("genesis package closure");
