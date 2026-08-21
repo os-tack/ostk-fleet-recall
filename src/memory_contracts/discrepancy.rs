@@ -2085,6 +2085,118 @@ mod tests {
         assert!(format!("{successor_error:?}").contains("generation-2-only"));
     }
 
+    /// Closeout blocker (PRED-02/APPL-01 registry-path admissibility): mirrors
+    /// `relation_policy_v2.rs::selector_and_body_identity_are_exact` for
+    /// `StructurallyResolvedComparatorLineageV1::from_registry_entry`. Each
+    /// registry-binding conjunct -- kind, entry-schema id, entry-schema
+    /// version, body identity, body version -- is asserted individually so a
+    /// caller cannot smuggle a wrong-kind, wrong-schema, or
+    /// identity/version-mismatched entry past structural resolution. Kills
+    /// the surviving `||`-to-`&&` mutants at the `entry.kind`/
+    /// `entry.entry_schema_id`/`entry.entry_schema_version` disjunct and the
+    /// `!identity_matches || !version_matches` disjunct.
+    #[test]
+    fn comparator_lineage_registry_binding_conjuncts_are_exact() {
+        let valid = comparator_lineage_registration_entry();
+
+        let mut wrong_kind = valid.clone();
+        wrong_kind.kind = RegistryEntryKind::AuthorityRule;
+        assert!(StructurallyResolvedComparatorLineageV1::from_registry_entry(&wrong_kind).is_err());
+
+        let mut wrong_schema_id = valid.clone();
+        wrong_schema_id.entry_schema_id = ContractId::new("registry.authority_rule").unwrap();
+        assert!(
+            StructurallyResolvedComparatorLineageV1::from_registry_entry(&wrong_schema_id).is_err()
+        );
+
+        let mut wrong_schema_version = valid.clone();
+        wrong_schema_version.entry_schema_version =
+            COMPARATOR_LINEAGE_REGISTRATION_SCHEMA_VERSION + 1;
+        assert!(
+            StructurallyResolvedComparatorLineageV1::from_registry_entry(&wrong_schema_version)
+                .is_err()
+        );
+
+        let mut wrong_body_identity = valid.clone();
+        let mut registration = ComparatorLineageRegistrationV1 {
+            schema_version: COMPARATOR_LINEAGE_REGISTRATION_SCHEMA_VERSION,
+            lineage: comparator_lineage(),
+            required_applicability_dimension_ids: vec![
+                ContractId::new("runtime_environment").unwrap(),
+            ],
+        };
+        registration.lineage.comparator_id = ContractId::new("comparator.other_v1").unwrap();
+        let body_bytes = encode_canonical(&registration).unwrap();
+        wrong_body_identity.body = decode_strict(&body_bytes).unwrap();
+        assert!(
+            StructurallyResolvedComparatorLineageV1::from_registry_entry(&wrong_body_identity)
+                .is_err()
+        );
+
+        let mut wrong_body_version = valid;
+        let mut registration = ComparatorLineageRegistrationV1 {
+            schema_version: COMPARATOR_LINEAGE_REGISTRATION_SCHEMA_VERSION,
+            lineage: comparator_lineage(),
+            required_applicability_dimension_ids: vec![
+                ContractId::new("runtime_environment").unwrap(),
+            ],
+        };
+        registration.lineage.comparator_version += 1;
+        let body_bytes = encode_canonical(&registration).unwrap();
+        wrong_body_version.body = decode_strict(&body_bytes).unwrap();
+        assert!(
+            StructurallyResolvedComparatorLineageV1::from_registry_entry(&wrong_body_version)
+                .is_err()
+        );
+    }
+
+    /// Closeout blocker (PRED-02/APPL-01 registry-path admissibility): the
+    /// identical conjunct-by-conjunct proof as
+    /// `comparator_lineage_registry_binding_conjuncts_are_exact`, for
+    /// `StructurallyResolvedEpisodePolicyV2::from_registry_entry`. Kills the
+    /// analogous surviving mutants at the `entry.kind`/`entry.entry_schema_id`/
+    /// `entry.entry_schema_version` disjunct and the
+    /// `!identity_matches || !version_matches` disjunct at lines 566-579.
+    #[test]
+    fn episode_policy_registry_binding_conjuncts_are_exact() {
+        let valid = episode_policy_entry();
+
+        let mut wrong_kind = valid.clone();
+        wrong_kind.kind = RegistryEntryKind::AuthorityRule;
+        assert!(StructurallyResolvedEpisodePolicyV2::from_registry_entry(&wrong_kind).is_err());
+
+        let mut wrong_schema_id = valid.clone();
+        wrong_schema_id.entry_schema_id = ContractId::new("registry.authority_rule").unwrap();
+        assert!(
+            StructurallyResolvedEpisodePolicyV2::from_registry_entry(&wrong_schema_id).is_err()
+        );
+
+        let mut wrong_schema_version = valid.clone();
+        wrong_schema_version.entry_schema_version = EPISODE_POLICY_SCHEMA_VERSION + 1;
+        assert!(
+            StructurallyResolvedEpisodePolicyV2::from_registry_entry(&wrong_schema_version)
+                .is_err()
+        );
+
+        let mut wrong_body_identity = valid.clone();
+        let mut policy = episode_policy();
+        policy.policy_id = ContractId::new("episode.other_v1").unwrap();
+        let body_bytes = encode_canonical(&policy).unwrap();
+        wrong_body_identity.body = decode_strict(&body_bytes).unwrap();
+        assert!(
+            StructurallyResolvedEpisodePolicyV2::from_registry_entry(&wrong_body_identity).is_err()
+        );
+
+        let mut wrong_body_version = valid;
+        let mut policy = episode_policy();
+        policy.version += 1;
+        let body_bytes = encode_canonical(&policy).unwrap();
+        wrong_body_version.body = decode_strict(&body_bytes).unwrap();
+        assert!(
+            StructurallyResolvedEpisodePolicyV2::from_registry_entry(&wrong_body_version).is_err()
+        );
+    }
+
     /// Recompute `family_fingerprint`/`episode_fingerprint` from an envelope's
     /// current fields, using the module's own private preimage computation
     /// (visible here as a descendant module) rather than re-deriving the
