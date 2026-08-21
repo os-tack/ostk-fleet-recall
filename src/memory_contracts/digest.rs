@@ -180,9 +180,9 @@ pub enum DigestDomain {
     /// `ObserverDerivationDisagreementV1` finding identity.
     ObserverDisagreementV1, // W0-OBS
 
-                            // --- W0-ERASE domains ---
+    // --- W0-ERASE domains ---
 
-                            // --- W0-LOG domains ---
+    // --- W0-LOG domains ---
 
     // --- W0-NORM domains ---
     /// Unsigned `NormativeBindingProposalV2` statement preimage.
@@ -310,9 +310,9 @@ impl DigestDomain {
             Self::ObserverResultV1 => "ostk-observer-result-v1",       // W0-OBS
             Self::ObserverDisagreementV1 => "ostk-observer-disagreement-v1", // W0-OBS
 
-                                                                        // --- W0-ERASE prefixes ---
+            // --- W0-ERASE prefixes ---
 
-                                                                        // --- W0-LOG prefixes ---
+            // --- W0-LOG prefixes ---
 
             // --- W0-NORM prefixes ---
             Self::NormativeBindingStatementV2 => "ostk-normative-binding-statement-v2",
