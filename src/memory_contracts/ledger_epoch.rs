@@ -417,7 +417,15 @@ impl EvidenceCompactionCheckpointCoreV1 {
     ///
     /// Every tail entry must not regress a shard the checkpoint already
     /// closed (its offset must be `>=` the checkpoint's), and may introduce
-    /// a shard the checkpoint had not yet closed. The result is built with
+    /// a shard the checkpoint had not yet closed. A tail entry naming a
+    /// shard the checkpoint already closed at the identical offset is
+    /// accepted only when its `chain_digest` also matches exactly (an
+    /// idempotent no-op re-observation); the same offset with a *different*
+    /// chain digest is a forked append chain — contested input, not an
+    /// advance — and is rejected rather than silently substituted, so a
+    /// replayer can never be made to adopt a different history for a shard
+    /// the checkpoint already closed while reporting the same offset
+    /// (REPLAY-01, EVID-01). The result is built with
     /// [`ClosedHeadVectorV1::from_heads`], so it is sorted and
     /// deduplicated-by-shard the same way a from-genesis replay's vector
     /// would be — proving "checkpoint + tail replay reproduces the same
@@ -432,12 +440,23 @@ impl EvidenceCompactionCheckpointCoreV1 {
             .map(|head| (head.shard, *head))
             .collect();
         for advance in tail {
-            if let Some(existing) = by_shard.get(&advance.shard)
-                && advance.last_committed_offset.as_u64() < existing.last_committed_offset.as_u64()
-            {
-                return Err(ContractError::Schema(
-                    "replay tail regresses a shard the checkpoint already closed".into(),
-                ));
+            if let Some(existing) = by_shard.get(&advance.shard) {
+                let existing_offset = existing.last_committed_offset.as_u64();
+                let advance_offset = advance.last_committed_offset.as_u64();
+                if advance_offset < existing_offset {
+                    return Err(ContractError::Schema(
+                        "replay tail regresses a shard the checkpoint already closed".into(),
+                    ));
+                }
+                if advance_offset == existing_offset
+                    && advance.chain_digest != existing.chain_digest
+                {
+                    return Err(ContractError::Schema(
+                        "replay tail forks a shard the checkpoint already closed: same offset, \
+                         different chain digest"
+                            .into(),
+                    ));
+                }
             }
             by_shard.insert(advance.shard, *advance);
         }
@@ -687,15 +706,25 @@ impl ProjectorCheckpointV1 {
 /// One generation published for one closed cursor-vector barrier.
 ///
 /// Identity ([`Self::generation_id`]) is a pure function of *what was
-/// published* — `projector_id`, `projector_version`, `generation_sequence`,
-/// `output_digest`, and `supersedes` — and deliberately excludes `barrier`.
-/// A physical shard schedule (epoch, shard count, arrival order) is encoded
-/// only in `barrier`, so processing the same facts under a different shard
-/// schedule still yields the same generation (REPLAY-01: "same facts under
-/// a different shard schedule must produce the same generation"). `barrier`
-/// remains on the record as bound *evidence of closure*, checked
-/// structurally — never as part of identity — by every caller before
-/// admission: [`Self::validate_supersession`] requires a superseding
+/// published* — `schema_version`, `projector_id`, `projector_version`, and
+/// `output_digest` — and deliberately excludes `barrier`, `generation_sequence`,
+/// and `supersedes`. All three are shard-schedule artifacts, not published
+/// facts: `barrier` is a physical coordinate outright, and
+/// `generation_sequence`/`supersedes` record *how many intermediate
+/// generations this schedule needed* to reach the published facts — which
+/// itself depends on the shard schedule, because a finer-grained schedule
+/// can require an extra intermediate generation to cover the identical
+/// total facts a coarser schedule reaches in one (e.g. a two-shard schedule
+/// publishing generation 1, superseding generation 0, over the same total
+/// facts a one-shard schedule publishes as generation 0 with no
+/// predecessor). REPLAY-01's "same facts under a different shard schedule
+/// must produce the same generation" is a statement about `output_digest`
+/// — the actual published facts — so only fields that are themselves a
+/// function of the published facts (plus the fixed projector identity)
+/// belong in identity. `barrier`, `generation_sequence`, and `supersedes`
+/// remain on the record as bound *evidence of closure and chaining*,
+/// checked structurally — never as part of identity — by every caller
+/// before admission: [`Self::validate_supersession`] requires a superseding
 /// generation to (a) name its exact predecessor's `generation_id`, (b) share
 /// that predecessor's `projector_id` and `projector_version` exactly (a
 /// generation is never superseded by a different projector or a different
@@ -718,9 +747,10 @@ pub struct ProjectionGenerationV1 {
 
 /// The identity-only projection hashed by [`ProjectionGenerationV1::generation_id`].
 ///
-/// Exists solely to keep `barrier` — a physical shard-schedule coordinate —
-/// out of the identity preimage; see the type-level doc on
-/// [`ProjectionGenerationV1`] for why. Serialize-only: this type is never
+/// Exists solely to keep `barrier`, `generation_sequence`, and `supersedes`
+/// — each a shard-schedule artifact rather than a published fact — out of
+/// the identity preimage; see the type-level doc on [`ProjectionGenerationV1`]
+/// for why all three are excluded. Serialize-only: this type is never
 /// decoded, only built from an already-validated [`ProjectionGenerationV1`]
 /// and canonically encoded.
 #[derive(Serialize)]
@@ -728,9 +758,7 @@ struct ProjectionGenerationIdentityV1<'a> {
     schema_version: u32,
     projector_id: &'a ContractId,
     projector_version: u32,
-    generation_sequence: u64,
     output_digest: &'a Sha256Digest,
-    supersedes: &'a Option<Sha256Digest>,
 }
 
 impl ProjectionGenerationV1 {
@@ -752,18 +780,16 @@ impl ProjectionGenerationV1 {
     }
 
     /// `SHA-256("ostk-projection-generation-v1" || 0x00 || canonical_bytes(identity))`
-    /// where `identity` is [`ProjectionGenerationIdentityV1`] — `self`
-    /// minus `barrier`. See the type-level docs for why `barrier` is
-    /// excluded from identity.
+    /// where `identity` is [`ProjectionGenerationIdentityV1`] — `self` minus
+    /// `barrier`, `generation_sequence`, and `supersedes`. See the
+    /// type-level docs for why all three are excluded from identity.
     pub fn generation_id(&self) -> ContractResult<Sha256Digest> {
         self.validate()?;
         let identity = ProjectionGenerationIdentityV1 {
             schema_version: self.schema_version,
             projector_id: &self.projector_id,
             projector_version: self.projector_version,
-            generation_sequence: self.generation_sequence,
             output_digest: &self.output_digest,
-            supersedes: &self.supersedes,
         };
         Ok(domain_separated_digest(
             DigestDomain::ProjectionGenerationV1,
@@ -782,9 +808,10 @@ impl ProjectionGenerationV1 {
     /// shape check, so two *different* records can each independently pass
     /// `validate()` while disagreeing on projector, sequence, or barrier
     /// with a named predecessor — and `generation_id()` deliberately
-    /// excludes `barrier` from identity (see the type-level docs), so
-    /// naming the right predecessor id alone says nothing about barrier
-    /// dominance. Without this method a caller could publish a generation
+    /// excludes `barrier`, `generation_sequence`, and `supersedes` from
+    /// identity (see the type-level docs), so naming the right predecessor
+    /// id alone says nothing about barrier dominance. Without this method a
+    /// caller could publish a generation
     /// naming an unrelated projector's output as its successor, skip or
     /// regress `generation_sequence`, or publish a different `output_digest`
     /// over the identical closed barrier (rewriting "what happened" instead
@@ -1011,10 +1038,24 @@ impl AdmittedArchiveMoveV1 {
 /// There is no silent "unbounded"/default variant: every [`ReplayHorizonV1`]
 /// names one of these two forms for both its semantic and
 /// historical-content bounds.
+///
+/// `Genesis` is deliberately the empty *struct* variant `Genesis {}`, not a
+/// unit variant. Serde's `#[serde(deny_unknown_fields)]` on an internally
+/// tagged enum (`#[serde(tag = "kind")]`) has no effect on a unit variant —
+/// it is deserialized by a `void` visitor that never inspects a payload, so
+/// `{"kind":"genesis","evil":"payload"}` would decode successfully with a
+/// unit `Genesis` and silently drop the unknown field. A struct variant,
+/// even an empty one, IS deserialized through serde's normal
+/// field-checking machinery, so `deny_unknown_fields` applies exactly as it
+/// does to `Checkpoint`. This changes nothing on the wire: an empty struct
+/// variant serializes identically to a unit variant under internal tagging
+/// — `{"kind":"genesis"}` — so every existing fixture byte is unaffected;
+/// see `replay_from_genesis_unit_variant_rejects_unknown_fields` for the
+/// pinned proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReplayFrom {
-    Genesis,
+    Genesis {},
     Checkpoint { checkpoint_digest: Sha256Digest },
 }
 
@@ -1074,7 +1115,7 @@ impl ReplayHorizonV1 {
     ) -> ContractResult<()> {
         self.validate_shape()?;
         match self.semantic_replay_from {
-            ReplayFrom::Genesis => Ok(()),
+            ReplayFrom::Genesis {} => Ok(()),
             ReplayFrom::Checkpoint { checkpoint_digest } => {
                 let anchor = anchor.ok_or_else(|| {
                     ContractError::Schema(
@@ -1119,7 +1160,7 @@ impl ReplayHorizonV1 {
     pub const fn genesis(historical_content_available_from: ReplayFrom) -> Self {
         Self {
             schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
-            semantic_replay_from: ReplayFrom::Genesis,
+            semantic_replay_from: ReplayFrom::Genesis {},
             historical_content_available_from,
         }
     }
@@ -1169,7 +1210,7 @@ mod tests {
     const CURSOR_BARRIER_DIGEST: &str =
         "231b09eb8bb020d4e7fa5fb6d17bac004e67d2d3a7ca912b805f71ec408252c4";
     const PROJECTION_GENERATION_ID: &str =
-        "e8c614de33d18efe3c8e196a05ebaa5009cbace86e94e3e8fb8a8cf4a2cef040";
+        "5d619c49cfceb87413a7dfb437feb0ab90ed5901918b9afc400b664b442dac82";
 
     fn record(artifact: &'static [u8]) -> &'static [u8] {
         let body = artifact
@@ -1499,6 +1540,7 @@ mod tests {
         require_canonical(projector_golden).unwrap();
         let projector: ProjectorCheckpointV1 = decode_strict(projector_golden).unwrap();
         projector.validate().unwrap();
+        assert_eq!(encode_canonical(&projector).unwrap(), projector_golden);
         assert!(decode_strict::<EvidenceCompactionCheckpointV1>(projector_golden).is_err());
         assert!(decode_strict::<ProjectorCheckpointV1>(golden).is_err());
     }
@@ -1519,7 +1561,7 @@ mod tests {
             semantic_replay_from: ReplayFrom::Checkpoint {
                 checkpoint_digest: forged_digest,
             },
-            historical_content_available_from: ReplayFrom::Genesis,
+            historical_content_available_from: ReplayFrom::Genesis {},
         };
         let wire_bytes = encode_canonical(&forged_horizon).unwrap();
         let redecoded: ReplayHorizonV1 = decode_strict(&wire_bytes).unwrap();
@@ -1546,6 +1588,44 @@ mod tests {
     }
 
     #[test]
+    fn replay_from_genesis_unit_variant_rejects_unknown_fields() {
+        // Before this fix, serde's `#[serde(deny_unknown_fields)]` had no
+        // effect on the unit variant of an internally tagged enum: the
+        // variant is deserialized by a `void` visitor that never inspects a
+        // payload, so an unknown field smuggled into a `"kind":"genesis"`
+        // object decoded successfully and was silently dropped. `Genesis`
+        // is now the empty struct variant `Genesis {}`, which goes through
+        // serde's normal field-checking machinery -- exactly like
+        // `Checkpoint` already did -- so the same attack must now fail
+        // closed through the exact runtime decode path (`decode_strict`).
+        let honest = br#"{"historical_content_available_from":{"kind":"genesis"},"schema_version":1,"semantic_replay_from":{"kind":"genesis"}}"#;
+        let decoded: ReplayHorizonV1 = decode_strict(honest).unwrap();
+        assert_eq!(decoded.semantic_replay_from, ReplayFrom::Genesis {});
+        assert_eq!(
+            decoded.historical_content_available_from,
+            ReplayFrom::Genesis {}
+        );
+        // The wire bytes for the empty struct variant are identical to the
+        // unit-variant bytes it replaces: `{"kind":"genesis"}`, no change
+        // to any existing fixture.
+        assert_eq!(encode_canonical(&decoded).unwrap(), honest);
+
+        let smuggled_semantic = br#"{"historical_content_available_from":{"kind":"genesis"},"schema_version":1,"semantic_replay_from":{"evil":"payload","kind":"genesis"}}"#;
+        assert!(decode_strict::<ReplayHorizonV1>(smuggled_semantic).is_err());
+
+        // Both positions a `ReplayFrom::Genesis {}` can appear in are
+        // covered, not just `semantic_replay_from`.
+        let smuggled_historical = br#"{"historical_content_available_from":{"evil":"payload","kind":"genesis"},"schema_version":1,"semantic_replay_from":{"kind":"genesis"}}"#;
+        assert!(decode_strict::<ReplayHorizonV1>(smuggled_historical).is_err());
+
+        // The struct variant `Checkpoint` was already protected; pinned
+        // here for parity so both arms of the enum are proven under one
+        // test.
+        let smuggled_checkpoint = br#"{"historical_content_available_from":{"kind":"genesis"},"schema_version":1,"semantic_replay_from":{"checkpoint_digest":"1111111111111111111111111111111111111111111111111111111111111111","evil":"payload","kind":"checkpoint"}}"#;
+        assert!(decode_strict::<ReplayHorizonV1>(smuggled_checkpoint).is_err());
+    }
+
+    #[test]
     fn checkpoint_receipt_mismatch_fails_closed() {
         let checkpoint: EvidenceCompactionCheckpointV1 =
             decode_strict(record(EVIDENCE_COMPACTION_CHECKPOINT)).unwrap();
@@ -1562,6 +1642,7 @@ mod tests {
         require_canonical(golden).unwrap();
         let barrier: CursorVectorBarrierV1 = decode_strict(golden).unwrap();
         barrier.validate().unwrap();
+        assert_eq!(encode_canonical(&barrier).unwrap(), golden);
         let first_digest = barrier.barrier_digest().unwrap();
 
         // Genuinely reversed arrival: feed the same per-shard observations
@@ -1782,24 +1863,37 @@ mod tests {
     #[test]
     fn projection_generation_identity_is_independent_of_shard_schedule() {
         // REPLAY-01: "Processing the same facts in a different shard
-        // schedule must produce the same generation." Build the same
-        // publication (same projector, sequence, output, predecessor) over
-        // two genuinely different shard schedules — the golden two-shard
-        // barrier, and a one-shard schedule covering the same total
-        // progress under a distinct epoch (a shard-count change always
-        // mints a new epoch) — and show `generation_id()` agrees. This is a
-        // real schedule difference, not the reversed-arrival-order-of-the-
-        // same-shard-set case `cursor_vector_barrier_is_order_independent`
-        // already covers.
-        let two_shard: ProjectionGenerationV1 =
+        // schedule must produce the same generation." A genuine schedule
+        // difference is not only a different `barrier`: it can change HOW
+        // MANY intermediate generations a schedule needed to publish before
+        // reaching the same total facts (a finer-grained shard schedule can
+        // require an extra generation a coarser one does not). A test that
+        // varies only `barrier` while holding `generation_sequence` and
+        // `supersedes` fixed proves barrier-exclusion, which is true by
+        // construction and cannot fail — it does not prove
+        // schedule-independence. This test varies the publication history
+        // itself: a one-generation schedule (sequence 0, no predecessor)
+        // and a two-generation schedule's final record (sequence 1,
+        // superseding an earlier generation) that reach the identical total
+        // facts (`output_digest`) must produce the identical `generation_id`.
+        let single_generation_schedule: ProjectionGenerationV1 =
             decode_strict(record(PROJECTION_GENERATION)).unwrap();
-        two_shard.validate().unwrap();
+        single_generation_schedule.validate().unwrap();
         assert_eq!(
-            two_shard.barrier.cursors.len(),
+            single_generation_schedule.generation_sequence, 0,
+            "the golden fixture must be an unsuperseded first generation"
+        );
+        assert_eq!(single_generation_schedule.supersedes, None);
+        assert_eq!(
+            single_generation_schedule.barrier.cursors.len(),
             2,
             "the golden fixture must be a genuine multi-shard barrier"
         );
 
+        // A different shard schedule (different epoch, different shard
+        // count/cursor set — a genuinely different barrier, not the same
+        // one relabeled) whose SECOND published generation reaches the
+        // SAME total facts as the golden schedule's ONLY generation.
         let one_shard_epoch = EpochId::from_digest(digest(
             "1111111111111111111111111111111111111111111111111111111111111111",
         ));
@@ -1813,20 +1907,42 @@ mod tests {
         .unwrap();
         assert_ne!(
             one_shard_barrier.barrier_digest().unwrap(),
-            two_shard.barrier.barrier_digest().unwrap(),
+            single_generation_schedule.barrier.barrier_digest().unwrap(),
             "the two schedules must be genuinely different barriers, not the same one relabeled"
         );
 
-        let one_shard = ProjectionGenerationV1 {
+        // Stand-in for "an earlier generation this schedule published
+        // before reaching the golden total facts". Its own identity is
+        // irrelevant beyond being distinct from the golden record's, since
+        // this test's claim is about the SECOND (final) generation's id.
+        let arbitrary_earlier_generation_id =
+            digest("6666666666666666666666666666666666666666666666666666666666666666");
+
+        let two_generation_schedule_final_record = ProjectionGenerationV1 {
             barrier: one_shard_barrier,
-            ..two_shard.clone()
+            generation_sequence: 1,
+            supersedes: Some(arbitrary_earlier_generation_id),
+            ..single_generation_schedule.clone()
         };
-        one_shard.validate().unwrap();
+        two_generation_schedule_final_record.validate().unwrap();
+        assert_ne!(
+            two_generation_schedule_final_record.generation_sequence,
+            single_generation_schedule.generation_sequence,
+            "the two schedules must genuinely differ in publication history, not just barrier"
+        );
+        assert_ne!(
+            two_generation_schedule_final_record.supersedes,
+            single_generation_schedule.supersedes
+        );
 
         assert_eq!(
-            one_shard.generation_id().unwrap(),
-            two_shard.generation_id().unwrap(),
-            "same facts under a different shard schedule must produce the same generation"
+            two_generation_schedule_final_record
+                .generation_id()
+                .unwrap(),
+            single_generation_schedule.generation_id().unwrap(),
+            "same total facts (same output_digest) under a different shard schedule -- including \
+             a different number of intermediate generations needed to reach them -- must produce \
+             the same generation id"
         );
     }
 
@@ -1931,6 +2047,36 @@ mod tests {
             ),
         }];
         assert!(checkpoint.core.replay_tail(&regressing_tail).is_err());
+
+        // A tail entry naming a shard the checkpoint already closed, at the
+        // IDENTICAL offset the checkpoint already recorded, but with a
+        // DIFFERENT chain digest, is a forked append chain -- contested
+        // input, not an advance -- and must fail closed rather than being
+        // silently substituted for the checkpoint's own closed head.
+        let honest_shard0 = checkpoint
+            .core
+            .closed_shard_positions
+            .heads
+            .iter()
+            .find(|head| head.shard == 0)
+            .copied()
+            .unwrap();
+        let forked_tail = vec![ClosedShardHeadV1 {
+            shard: 0,
+            last_committed_offset: honest_shard0.last_committed_offset,
+            chain_digest: digest(
+                "dead00000000000000000000000000000000000000000000000000000000beef",
+            ),
+        }];
+        assert_ne!(forked_tail[0].chain_digest, honest_shard0.chain_digest);
+        assert!(checkpoint.core.replay_tail(&forked_tail).is_err());
+
+        // Equal offset AND equal chain digest is an idempotent no-op: the
+        // checkpoint's own closed head, re-observed, is accepted and leaves
+        // the resulting vector unchanged.
+        let idempotent_tail = vec![honest_shard0];
+        let replayed_noop = checkpoint.core.replay_tail(&idempotent_tail).unwrap();
+        assert_eq!(replayed_noop, checkpoint.core.closed_shard_positions);
     }
 
     #[test]
@@ -1984,24 +2130,24 @@ mod tests {
 
     #[test]
     fn replay_horizon_states_bounded_replay_explicitly() {
-        let genesis_only = ReplayHorizonV1::genesis(ReplayFrom::Genesis);
+        let genesis_only = ReplayHorizonV1::genesis(ReplayFrom::Genesis {});
         // A genesis semantic bound needs no anchor at all.
         genesis_only.validate_semantic_anchor(None).unwrap();
-        assert_eq!(genesis_only.semantic_replay_from, ReplayFrom::Genesis);
+        assert_eq!(genesis_only.semantic_replay_from, ReplayFrom::Genesis {});
         assert_eq!(
             genesis_only.historical_content_available_from,
-            ReplayFrom::Genesis
+            ReplayFrom::Genesis {}
         );
 
         let checkpoint: EvidenceCompactionCheckpointV1 =
             decode_strict(record(EVIDENCE_COMPACTION_CHECKPOINT)).unwrap();
         let anchor = VerifiedReplayAnchorV1::from_checkpoint(&checkpoint).unwrap();
-        let bounded = ReplayHorizonV1::anchored(&anchor, ReplayFrom::Genesis);
+        let bounded = ReplayHorizonV1::anchored(&anchor, ReplayFrom::Genesis {});
         // A checkpoint semantic bound is rejected without its anchor...
         assert!(bounded.validate_semantic_anchor(None).is_err());
         // ...and accepted with the exact anchor it was built from.
         bounded.validate_semantic_anchor(Some(&anchor)).unwrap();
-        assert_ne!(bounded.semantic_replay_from, ReplayFrom::Genesis);
+        assert_ne!(bounded.semantic_replay_from, ReplayFrom::Genesis {});
         assert_eq!(
             bounded.semantic_replay_from,
             ReplayFrom::Checkpoint {
