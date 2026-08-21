@@ -362,6 +362,15 @@ impl RelationAdmissionOutcomeV2 {
 /// authenticated ingress — never from `candidate`. AUTH-02 bounds which
 /// evidence kind may prove which fact; PROV-01 requires every bound
 /// identifier to be content-addressed rather than a mutable label.
+///
+/// Runtime obligation (not enforced by this pure leaf): `provider_identity`
+/// carries a connector principal and provider-instance namespace, but no
+/// tenant/project scope — this function has no trusted scope to compare
+/// `candidate.edge.scope` against, so an `AdmittedProviderAttested` outcome
+/// grants no scope authority by itself. The runtime seam that consumes this
+/// outcome must independently check `candidate.edge.scope` against the
+/// connector's authorized scope before treating the admission as usable for
+/// that tenant/project.
 pub fn evaluate_provider_attested_admission(
     provider_identity: &TrustedProviderIdentityV1,
     observed_evidence_kind: ProviderEvidenceKindV1,

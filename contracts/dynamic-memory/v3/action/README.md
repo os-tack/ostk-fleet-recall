@@ -97,9 +97,20 @@ updating every literal constant in `action.rs`'s test module.
   for a *different*, compliant pairing cannot be laundered onto them because
   the digest cross-check fails. `reconcile_receipt()` mirrors this one stage
   later: it takes the `RevalidatedAuthorizationV1` `revalidate_authorization`
-  produced for the exact attempt being reconciled, so a receipt can never
-  close an attempt that was never actually revalidated
-  (`receipt_without_revalidation_rejected`).
+  produced for the exact attempt being reconciled, checked two ways.
+  `revalidated.attempt_id` pins the request identity (proposal digest +
+  authorization digest + idempotency key), but that identity is deliberately
+  invariant across a retry (ACT-03), so it alone does not prove *this*
+  `ExecutionAttemptV1`'s observational fields — scope, revalidated current
+  state/preconditions/timestamp, provider request ID, started time — are the
+  ones that were actually revalidated. `reconcile_receipt()` additionally
+  recomputes `ExecutionAttemptV1::revalidation_binding()`, a digest over the
+  *entire* canonical attempt, and rejects unless it matches the digest
+  `RevalidatedAuthorizationV1` carries from revalidation time
+  (`reconciled_attempt_is_not_the_revalidated_attempt`,
+  `cross_tenant_attempt_reuses_a_foreign_revalidation`) — so a receipt can
+  never close an attempt whose observational fields differ from the one that
+  was actually revalidated (`receipt_without_revalidation_rejected`).
 - **ACT-03** — `revalidate_authorization()` fails closed on a changed current
   state (`stale_current_state_fails_closed`), a changed precondition set
   (`stale_preconditions_fail_closed`), an expired authorization
@@ -175,10 +186,25 @@ the one that produced `authorized` in the first place
 receipt for an attempt that was never actually revalidated by supplying a
 `RevalidatedAuthorizationV1` minted for some *other* attempt — rejected by
 `reconcile_receipt`'s `revalidated.attempt_id == attempt.attempt_id()` check
-(`receipt_without_revalidation_rejected`). Attempt to reuse an idempotency
-key for a different proposal to bypass CAS — rejected by
-`check_idempotency_reuse`. Attempt to resubmit a timed-out attempt hoping for
-a fresh identity — the identity is invariant under retry by construction.
+(`receipt_without_revalidation_rejected`). Attempt the narrower version of
+the same laundering: hold a genuine `RevalidatedAuthorizationV1`, then hand
+`reconcile_receipt` a *different* `ExecutionAttemptV1` that shares the exact
+same request (so `attempt_id` still matches) but carries a tampered scope,
+`revalidated_current_state`, `provider_request_id`, or timestamps — such as
+a cross-tenant scope or a pre-state the proof never actually revalidated —
+rejected by `reconcile_receipt`'s second, independent check, which
+recomputes `ExecutionAttemptV1::revalidation_binding()` (a digest over the
+entire canonical attempt) and rejects unless it matches the digest
+`RevalidatedAuthorizationV1` recorded at revalidation time
+(`reconciled_attempt_is_not_the_revalidated_attempt`,
+`cross_tenant_attempt_reuses_a_foreign_revalidation`). `attempt_id` alone
+cannot catch this: it is derived only from the request (proposal digest +
+authorization digest + idempotency key) and is deliberately invariant across
+a retry that resupplies that same request (ACT-03), so it never encodes any
+observational field. Attempt to reuse an idempotency key for a different
+proposal to bypass CAS — rejected by `check_idempotency_reuse`. Attempt to
+resubmit a timed-out attempt hoping for a fresh identity — the identity is
+invariant under retry by construction.
 
 Attempt to hand-assemble an `ExecutionAttemptV1`/`ExecutionRequestV1` that
 binds the *right* authorization digest but declares a *different*

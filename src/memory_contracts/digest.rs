@@ -221,6 +221,16 @@ pub enum DigestDomain {
     ActionVerificationV1,
     /// `ProviderAttestedRelationCandidateV2` admission-candidate identity (PROV-01, REL-01).
     RelationAdmissionV2,
+    /// Full-`ExecutionAttemptV1` binding digest carried by
+    /// `RevalidatedAuthorizationV1` (AUTH-03, ACT-03): distinct from
+    /// [`Self::ActionAttemptV1`], which frames only the request-derived
+    /// `AttemptIdV1` and is invariant across retries by design. This domain
+    /// frames the *entire* canonical attempt — scope, profile, revalidated
+    /// state/preconditions/timestamp, provider request ID, and started time
+    /// — so `reconcile_receipt` can reject an attempt whose observational
+    /// fields were swapped after revalidation even though it kept the same
+    /// request (and therefore the same `AttemptIdV1`).
+    ActionAttemptRevalidationV1,
     // --- W1 domains (evidence ledger, head witness, remember/evidence/relation runtime) ---
     /// W1-APPEND. Offset-zero chain digest of one lazily seeded evidence shard
     /// head, framed over the genesis log-epoch ID and the shard number.
@@ -233,7 +243,7 @@ pub enum DigestDomain {
     /// fully determined by `(epoch, shard)` and can grant no forgeable
     /// authority. Sharing one domain across the two ledgers would make an
     /// evidence offset-zero digest replayable as a control one.
-    EvidenceGenesisChainV1,
+    EvidenceGenesisChainV1, // W1-APPEND
 }
 
 impl DigestDomain {
@@ -352,8 +362,9 @@ impl DigestDomain {
             Self::ActionReceiptV1 => "ostk-action-receipt-v1",
             Self::ActionVerificationV1 => "ostk-action-verification-v1",
             Self::RelationAdmissionV2 => "ostk-relation-admission-v2",
+            Self::ActionAttemptRevalidationV1 => "ostk-action-attempt-revalidation-v1",
             // --- W1 prefixes ---
-            Self::EvidenceGenesisChainV1 => "ostk-evidence-genesis-chain-v1",
+            Self::EvidenceGenesisChainV1 => "ostk-evidence-genesis-chain-v1", // W1-APPEND
         }
     }
 }

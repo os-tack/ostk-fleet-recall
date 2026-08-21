@@ -431,6 +431,22 @@ impl ExecutionAttemptV1 {
         self.validate_shape()?;
         self.request.attempt_id()
     }
+
+    /// AUTH-03/ACT-03: a digest over the *entire* canonical attempt, used to
+    /// bind [`RevalidatedAuthorizationV1`] to the exact
+    /// [`ExecutionAttemptV1`] it was minted for. Deliberately distinct from
+    /// [`Self::attempt_id`], which is derived only from the canonical
+    /// [`ExecutionRequestV1`] and so is invariant across a retry that
+    /// resupplies the same request with a new observation of scope,
+    /// revalidated state/preconditions/timestamp, provider request ID, or
+    /// started time.
+    fn revalidation_binding(&self) -> ContractResult<Sha256Digest> {
+        self.validate_shape()?;
+        Ok(domain_separated_digest(
+            DigestDomain::ActionAttemptRevalidationV1,
+            &encode_canonical(self)?,
+        ))
+    }
 }
 
 /// Opaque proof that an authorization was rechecked immediately before execution.
@@ -443,9 +459,23 @@ impl ExecutionAttemptV1 {
 /// digest no [`ActionProposalV1`] ever produced, can never yield a value of
 /// this type (AUTH-03): [`authorize`] already rejects all three, and this
 /// type cannot be reached without first passing through it.
+///
+/// `attempt_binding` is a domain-separated digest over the *entire* canonical
+/// [`ExecutionAttemptV1`] `revalidate_authorization` was given — not merely
+/// [`AttemptIdV1`], which is derived only from the canonical
+/// [`ExecutionRequestV1`] (proposal digest + authorization digest +
+/// idempotency key) so that a retry or timeout never mints a new action
+/// identity. Because `AttemptIdV1` deliberately excludes every observational
+/// field (scope, profile, revalidated state/preconditions/timestamp,
+/// provider request ID, started time), an `attempt_id`-only check lets a
+/// caller hand [`reconcile_receipt`] a *different* [`ExecutionAttemptV1`]
+/// that shares the same request but carries tampered observational fields
+/// (AUTH-03). `attempt_binding` closes that: [`reconcile_receipt`] recomputes
+/// it over the attempt it is given and rejects unless it matches exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RevalidatedAuthorizationV1 {
     attempt_id: AttemptIdV1,
+    attempt_binding: Sha256Digest,
     remaining_uses_after: u32,
 }
 
@@ -549,6 +579,7 @@ pub fn revalidate_authorization(
     }
     Ok(RevalidatedAuthorizationV1 {
         attempt_id: attempt.attempt_id()?,
+        attempt_binding: attempt.revalidation_binding()?,
         remaining_uses_after: remaining_uses_before_attempt - 1,
     })
 }
@@ -666,11 +697,20 @@ impl ReconciledExecutionV1 {
 /// read-after-write state, never by wall-clock proximity or a fresh attempt.
 ///
 /// `revalidated` must be the exact [`RevalidatedAuthorizationV1`] a prior
-/// call to [`revalidate_authorization`] produced for `attempt` (AUTH-03):
-/// this makes a receipt closing an attempt that was never actually
-/// revalidated — including one whose authorization was never validly
-/// granted in the first place — structurally unreachable here, not merely
-/// rejected after the fact.
+/// call to [`revalidate_authorization`] produced for `attempt` (AUTH-03).
+/// This is checked two ways, and both are required: `revalidated.attempt_id`
+/// pins the request identity (proposal + authorization + idempotency key),
+/// but that identity is deliberately invariant across a retry, so a caller
+/// holding a genuine revalidation proof could otherwise present a
+/// *different* [`ExecutionAttemptV1`] sharing that same request while
+/// carrying tampered scope, revalidated state/preconditions/timestamp,
+/// provider request ID, or started time. `revalidated_attempt_binding`
+/// closes that: it is a digest over the *entire* canonical attempt
+/// `revalidate_authorization` actually validated, and this function rejects
+/// unless the attempt presented here re-derives the exact same digest — so a
+/// receipt can never close an attempt whose observational fields differ
+/// from the one that was actually revalidated, including one whose
+/// authorization was never validly granted in the first place.
 pub fn reconcile_receipt(
     revalidated: &RevalidatedAuthorizationV1,
     attempt: &ExecutionAttemptV1,
@@ -682,6 +722,11 @@ pub fn reconcile_receipt(
         return Err(ContractError::Schema(
             "the revalidation proof does not name the attempt this receipt reconciles (AUTH-03)"
                 .into(),
+        ));
+    }
+    if revalidated.attempt_binding != attempt.revalidation_binding()? {
+        return Err(ContractError::Schema(
+            "attempt does not match the exact attempt that was revalidated (AUTH-03)".into(),
         ));
     }
     if receipt.attempt_id != attempt_id {
@@ -817,7 +862,7 @@ mod tests {
     const VERIFICATION_ID: &str =
         "52acc011337f5ca3dde28b3c298fc6f3008ad9b0dda25bc732d1396a2b3d29d6";
     const VECTOR_SUITE_DIGEST: &str =
-        "81a0fb26d88da203f684ca0df9f7839d7dad244d2a11fff5f3038fcecfd2137e";
+        "f6281f8fbe43d5a08d726080774c305e376d54f98e807acd1e9b09083073ef08";
 
     fn record(bytes: &[u8]) -> &[u8] {
         let body = bytes
@@ -995,6 +1040,7 @@ mod tests {
             "authorization_expiry_reached",
             "authorization_outliving_proposal_cannot_revalidate",
             "authorization_preconditions_exceed_max_rejected",
+            "cross_tenant_attempt_reuses_a_foreign_revalidation",
             "execution_attempt_preconditions_exceed_max_rejected",
             "execution_attempt_preconditions_unsorted_or_duplicate_rejected",
             "execution_attempt_schema_version_mismatch_rejected",
@@ -1009,6 +1055,7 @@ mod tests {
             "receipt_scope_mismatch",
             "receipt_without_revalidation_rejected",
             "receipt_wrong_attempt_binding",
+            "reconciled_attempt_is_not_the_revalidated_attempt",
             "reconciliation_state_result_mismatch",
             "revalidated_at_after_started_at_rejected",
             "revalidation_gap_exceeds_freshness_window_rejected",
@@ -1643,6 +1690,76 @@ mod tests {
                 &revalidated_for_first,
                 &other_attempt,
                 &receipt_for_other_attempt
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reconciled_attempt_is_not_the_revalidated_attempt() {
+        // AUTH-03: `RevalidatedAuthorizationV1` binds the *entire* canonical
+        // attempt it was minted for, not merely the request-derived
+        // `AttemptIdV1`, which is deliberately invariant across a retry (so
+        // a timeout or resubmission never mints a new action identity). A
+        // caller who holds a genuine revalidation proof must not be able to
+        // hand `reconcile_receipt` a *different* `ExecutionAttemptV1` that
+        // shares the exact same request (identical `attempt_id`) but
+        // declares a different revalidated pre-state than the one actually
+        // revalidated — that would let the receipt assert an arbitrary
+        // before-state the CAS was never checked against.
+        let revalidated_for_original = revalidated();
+
+        let mut tampered_attempt = attempt();
+        tampered_attempt.revalidated_current_state = state('9');
+        assert_eq!(
+            tampered_attempt.attempt_id().unwrap(),
+            attempt().attempt_id().unwrap()
+        );
+
+        // The receipt is built to match the *tampered* attempt exactly, so
+        // every other `reconcile_receipt` check (attempt/receipt binding,
+        // provider request ID, before-state-vs-attempt, scope, ordering)
+        // passes; only the revalidation-binding digest can catch this.
+        let mut receipt_for_tampered = receipt();
+        receipt_for_tampered.before_state = tampered_attempt.revalidated_current_state;
+
+        assert!(
+            reconcile_receipt(
+                &revalidated_for_original,
+                &tampered_attempt,
+                &receipt_for_tampered
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cross_tenant_attempt_reuses_a_foreign_revalidation() {
+        // AUTH-03/APPL-01: the same laundering as above, narrowed to scope.
+        // A different `ExecutionAttemptV1` sharing the original's exact
+        // request (so its `attempt_id` is unchanged) but scoped to a
+        // foreign tenant/project must not be reconcilable against a
+        // revalidation proof minted for the legitimate tenant.
+        let revalidated_for_original = revalidated();
+
+        let mut tampered_attempt = attempt();
+        tampered_attempt.scope = AuthenticatedProjectScopeV1::from_trusted_context(
+            ContractId::new("tenant.attacker").unwrap(),
+            ContractId::new("project.attacker").unwrap(),
+        );
+        assert_eq!(
+            tampered_attempt.attempt_id().unwrap(),
+            attempt().attempt_id().unwrap()
+        );
+
+        let mut receipt_for_tampered = receipt();
+        receipt_for_tampered.scope = tampered_attempt.scope.clone();
+
+        assert!(
+            reconcile_receipt(
+                &revalidated_for_original,
+                &tampered_attempt,
+                &receipt_for_tampered
             )
             .is_err()
         );
