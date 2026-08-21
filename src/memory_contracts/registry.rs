@@ -30,7 +30,11 @@ pub enum RegistryEntryKind {
     AuthorityRule,
     CausalRatificationPolicy,
     ClassifierPolicy,
+    /// Generation-2 only: comparator lineage registration for typed comparison.
+    ComparatorLineage,
     ConnectorSchema,
+    /// Generation-2 only: consolidation policy governing derived summaries.
+    ConsolidationPolicy,
     CoverageProof,
     EpisodePolicy,
     EvidenceSchema,
@@ -60,7 +64,9 @@ impl RegistryEntryKind {
             Self::AuthorityRule => "authority_rule",
             Self::CausalRatificationPolicy => "causal_ratification_policy",
             Self::ClassifierPolicy => "classifier_policy",
+            Self::ComparatorLineage => "comparator_lineage",
             Self::ConnectorSchema => "connector_schema",
+            Self::ConsolidationPolicy => "consolidation_policy",
             Self::CoverageProof => "coverage_proof",
             Self::EpisodePolicy => "episode_policy",
             Self::EvidenceSchema => "evidence_schema",
@@ -89,7 +95,11 @@ impl RegistryEntryKind {
     pub const fn is_generation2_only(self) -> bool {
         matches!(
             self,
-            Self::ArrowBatchSchema | Self::LogEpochRecipe | Self::ParserContract
+            Self::ArrowBatchSchema
+                | Self::ComparatorLineage
+                | Self::ConsolidationPolicy
+                | Self::LogEpochRecipe
+                | Self::ParserContract
         )
     }
 
@@ -107,36 +117,40 @@ impl RegistryEntryKind {
             Self::AuthorityRule => 3,
             Self::CausalRatificationPolicy => 4,
             Self::ClassifierPolicy => 5,
-            Self::ConnectorSchema => 6,
-            Self::CoverageProof => 7,
-            Self::EpisodePolicy => 8,
-            Self::EvidenceSchema => 9,
-            Self::ExemplarPolicy => 10,
-            Self::IdentityRecipe => 11,
-            Self::LogEpochRecipe => 12,
-            Self::NamespaceDefinition => 13,
-            Self::NormativeBindingSchema => 14,
-            Self::ObserverAdmission => 15,
-            Self::ParserContract => 16,
-            Self::PredicateSchema => 17,
-            Self::PublicationRule => 18,
-            Self::RedactionPolicy => 19,
-            Self::RelationProof => 20,
-            Self::ResourceKindSchema => 21,
-            Self::RetentionPolicy => 22,
+            Self::ComparatorLineage => 6,
+            Self::ConnectorSchema => 7,
+            Self::ConsolidationPolicy => 8,
+            Self::CoverageProof => 9,
+            Self::EpisodePolicy => 10,
+            Self::EvidenceSchema => 11,
+            Self::ExemplarPolicy => 12,
+            Self::IdentityRecipe => 13,
+            Self::LogEpochRecipe => 14,
+            Self::NamespaceDefinition => 15,
+            Self::NormativeBindingSchema => 16,
+            Self::ObserverAdmission => 17,
+            Self::ParserContract => 18,
+            Self::PredicateSchema => 19,
+            Self::PublicationRule => 20,
+            Self::RedactionPolicy => 21,
+            Self::RelationProof => 22,
+            Self::ResourceKindSchema => 23,
+            Self::RetentionPolicy => 24,
         }
     }
 }
 
 /// Every closed entry kind, in canonical `as_str` order.
-pub const ALL_REGISTRY_ENTRY_KINDS: [RegistryEntryKind; 23] = [
+pub const ALL_REGISTRY_ENTRY_KINDS: [RegistryEntryKind; 25] = [
     RegistryEntryKind::ActivationPolicy,
     RegistryEntryKind::ApplicabilityEvaluator,
     RegistryEntryKind::ArrowBatchSchema,
     RegistryEntryKind::AuthorityRule,
     RegistryEntryKind::CausalRatificationPolicy,
     RegistryEntryKind::ClassifierPolicy,
+    RegistryEntryKind::ComparatorLineage,
     RegistryEntryKind::ConnectorSchema,
+    RegistryEntryKind::ConsolidationPolicy,
     RegistryEntryKind::CoverageProof,
     RegistryEntryKind::EpisodePolicy,
     RegistryEntryKind::EvidenceSchema,
@@ -213,7 +227,7 @@ const fn slot(
 /// The table is exhaustive by construction: any triple outside it classifies as
 /// [`BodySchemaSlotClassV1::Unknown`], and every consumer fails closed on both
 /// `Unknown` and `Generation2Reserved`.
-pub const BODY_SCHEMA_SLOTS: [BodySchemaSlotV1; 32] = [
+pub const BODY_SCHEMA_SLOTS: [BodySchemaSlotV1; 34] = [
     slot(
         RegistryEntryKind::ActivationPolicy,
         "registry.activation_policy",
@@ -263,6 +277,12 @@ pub const BODY_SCHEMA_SLOTS: [BodySchemaSlotV1; 32] = [
         BodySchemaSlotClassV1::Generation1Dispatched,
     ),
     slot(
+        RegistryEntryKind::ComparatorLineage,
+        "registry.comparator_lineage",
+        1,
+        BodySchemaSlotClassV1::Generation2Reserved,
+    ),
+    slot(
         RegistryEntryKind::ConnectorSchema,
         "registry.connector_schema",
         1,
@@ -273,6 +293,12 @@ pub const BODY_SCHEMA_SLOTS: [BodySchemaSlotV1; 32] = [
         "registry.connector_schema",
         2,
         BodySchemaSlotClassV1::Generation2Dispatched,
+    ),
+    slot(
+        RegistryEntryKind::ConsolidationPolicy,
+        "registry.consolidation_policy",
+        1,
+        BodySchemaSlotClassV1::Generation2Reserved,
     ),
     slot(
         RegistryEntryKind::CoverageProof,
@@ -816,7 +842,7 @@ mod tests {
 
     #[test]
     fn every_kind_has_one_wire_name_and_a_stable_generation() {
-        assert_eq!(ALL_REGISTRY_ENTRY_KINDS.len(), 23);
+        assert_eq!(ALL_REGISTRY_ENTRY_KINDS.len(), 25);
         for (index, kind) in ALL_REGISTRY_ENTRY_KINDS.into_iter().enumerate() {
             let wire = serde_json::to_string(&kind).unwrap();
             assert_eq!(wire, format!("\"{}\"", kind.as_str()));
@@ -839,7 +865,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             generation2_only,
-            ["arrow_batch_schema", "log_epoch_recipe", "parser_contract"]
+            [
+                "arrow_batch_schema",
+                "comparator_lineage",
+                "consolidation_policy",
+                "log_epoch_recipe",
+                "parser_contract"
+            ]
         );
         // A name outside the closed set can never decode into a kind.
         assert!(serde_json::from_str::<RegistryEntryKind>("\"transcript_session\"").is_err());
@@ -889,7 +921,7 @@ mod tests {
         };
         assert_eq!(counts(BodySchemaSlotClassV1::Generation1Dispatched), 20);
         assert_eq!(counts(BodySchemaSlotClassV1::Generation2Dispatched), 5);
-        assert_eq!(counts(BodySchemaSlotClassV1::Generation2Reserved), 7);
+        assert_eq!(counts(BodySchemaSlotClassV1::Generation2Reserved), 9);
     }
 
     #[test]

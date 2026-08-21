@@ -80,6 +80,62 @@ Each negative is one canonical record that violates exactly one rule.
 express a kind outside the closed enum, so that case is built by editing the
 serialized value and must be rejected at decode.
 
+## The r2 revision
+
+The closed slot table widened, so this directory now has two revisions.
+
+**r1 is frozen and superseded.** Every file without an `-r2` suffix keeps the
+bytes it was frozen with, and `generation2.rs` still pins each one by raw
+SHA-256 and by domain digest — `43af6352…` for the manifest, `5a4bbcd7…` for
+the slot table, `ec497fd0…` for the suite. Those pins are pure functions of the
+bytes, so they hold forever. What r1 no longer does is *close*: it reserved
+exactly seven slots against a table that now reserves nine, so
+`StructurallyClosedGeneration2Manifest::decode` rejects the r1 manifest with
+"reserved slots differ from the closed table" and the r1 slot-table projection
+no longer equals the compiled table. `r1_artifacts_stay_byte_frozen_and_are_superseded_by_r2`
+asserts exactly that, in both directions. A silently widened table would have
+kept passing; the visible break is the freeze working.
+
+**r2 is the current revision.** `composition-manifest-r2.jsonl`,
+`body-schema-slots-r2.jsonl`, `vector-suite-r2.jsonl`, and eight `-r2`
+negatives are the same contract over the widened table, pinned by
+`r2_canonical_artifacts_and_literal_pins_are_frozen`:
+
+| Artifact | Domain digest | Raw SHA-256 |
+| --- | --- | --- |
+| `composition-manifest-r2.jsonl` | `6d6e8ac25bab65b8faa1c9399aec70a319143c6401d6205e918b108ad369a4ed` | `532c58564b8053e8cecb90ea0972639aefe200e393ecf7d32544f0ffec1ca44b` |
+| `body-schema-slots-r2.jsonl` | `a3db241757b3e5a8f02680557e5568a1e83ac97ff4e934c1ebc36618a00e877d` | `90d79dcb6c11691a67e7163f8f0c5eef079df1c41a621e6eb769e6ff3a1a1658` |
+| `vector-suite-r2.jsonl` | `8d6929de2d3af569b8d7f9d603c3185786948ba7d23d1594b9c89674c9dc7ef8` | `211edfe7c97f0abd25b8a797def76af24b41960d88b196575b87b8169821ceeb` |
+
+The manifest digest moved because the reserved set grew; nothing else did. The
+predecessor head and the frozen Stage-4 package digest
+`16f98d5df93b74dab5b2188274cbd1da21d089ff7a64cd8fc29679946e7fe2c9` are
+byte-identical in both revisions, and the r2 suite pins them so a revision
+cannot quietly retarget the transition.
+
+### What r2 adds
+
+Two generation-2-only entry kinds, each with exactly one reserved slot:
+
+| Kind | Wire name | Entry schema | Table index | Slot class |
+| --- | --- | --- | --- | --- |
+| `ComparatorLineage` | `comparator_lineage` | `registry.comparator_lineage` v1 | 6 | `generation2_reserved` |
+| `ConsolidationPolicy` | `consolidation_policy` | `registry.consolidation_policy` v1 | 8 | `generation2_reserved` |
+
+`ALL_REGISTRY_ENTRY_KINDS` grows 23 → 25, `BODY_SCHEMA_SLOTS` 32 → 34, and the
+reserved count 7 → 9. Both kinds are `is_generation2_only`, so the genesis (v1)
+closure and the generic successor closure reject any package that names them,
+with the same "generation-2-only kind" error the three earlier reserved kinds
+get. Typed dispatch for `ConsolidationPolicyV1` and
+`ComparatorLineageRegistrationV1` bodies lands with the generation-2 typed-body
+wiring, not here: reserving a name never admits a body.
+
+One negative is new: `negative-generation2-only-root-r2.jsonl` names
+`consolidation_policy` as a carry-forward root. A root must select a
+*dispatched* triple, so a generation-2-only kind can never be one — the
+manifest is rejected even though the root is otherwise well formed and in
+canonical position.
+
 ## Freeze discipline
 
 `vector-suite.jsonl` pins the manifest digest, the slot-table digest, the
@@ -89,8 +145,10 @@ every artifact in this directory. Literal Rust constants in
 acyclic and every artifact is reachable from a compiled constant.
 
 Every JSONL file is exactly one canonical JSON record followed by one LF. These
-bytes are frozen: correcting one is a new version, never an edit in place.
-Regenerate with the maintainer-only ignored test:
+bytes are frozen: correcting one is a new version, never an edit in place. The
+regeneration test writes the *current* revision's file names only (`-r2`
+today), so it can never overwrite a superseded revision. Regenerate with the
+maintainer-only ignored test:
 
     GENERATION2_VECTOR_OUTPUT=contracts/dynamic-memory/v3/registry-gen2 \
       cargo +1.94 test --locked --lib \

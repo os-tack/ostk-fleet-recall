@@ -307,6 +307,8 @@ const fn legacy_schema_id(kind: RegistryEntryKind) -> &'static str {
         RegistryEntryKind::ActivationPolicy => "registry.activation_policy",
         RegistryEntryKind::ApplicabilityEvaluator => "registry.applicability_evaluator",
         RegistryEntryKind::ArrowBatchSchema
+        | RegistryEntryKind::ComparatorLineage // W0-REG-2
+        | RegistryEntryKind::ConsolidationPolicy // W0-REG-2
         | RegistryEntryKind::LogEpochRecipe
         | RegistryEntryKind::ParserContract => "registry.generation2_only_kind_has_no_v1_schema",
         RegistryEntryKind::AuthorityRule => "registry.authority_rule",

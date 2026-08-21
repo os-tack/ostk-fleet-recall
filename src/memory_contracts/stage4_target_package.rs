@@ -1023,6 +1023,8 @@ fn schema_id(kind: RegistryEntryKind, entry_schema_version: u32) -> &'static str
             // W0-REG: generation-2-only kinds are outside the frozen 27-entry
             // inventory, so this label can never match an expected entry.
             RegistryEntryKind::ArrowBatchSchema
+            | RegistryEntryKind::ComparatorLineage // W0-REG-2
+            | RegistryEntryKind::ConsolidationPolicy // W0-REG-2
             | RegistryEntryKind::LogEpochRecipe
             | RegistryEntryKind::ParserContract => {
                 "registry.generation2_only_kind_has_no_v1_schema"

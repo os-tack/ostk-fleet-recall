@@ -17,6 +17,12 @@
 //! normative contracts; a manifest that lists a slot does not admit its body)
 //! and REPLAY-01 (the manifest digest is a pure function of canonical bytes, so
 //! replaying the same manifest yields the same identity).
+//!
+//! Widening the closed slot table is a revision, never an edit. The r1
+//! artifacts under `contracts/dynamic-memory/v3/registry-gen2/` keep their
+//! bytes and their pinned digests forever; the current revision is r2, and the
+//! r1 manifest deliberately no longer closes against the widened table. That
+//! visible break is the freeze doing its job.
 
 use serde::{Deserialize, Serialize};
 
@@ -567,6 +573,39 @@ mod tests {
     const VECTOR_SUITE_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/registry-gen2/vector-suite.jsonl");
 
+    const MANIFEST_R2_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/registry-gen2/composition-manifest-r2.jsonl"
+    );
+    const SLOT_TABLE_R2_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/registry-gen2/body-schema-slots-r2.jsonl"
+    );
+    const NEGATIVE_DUPLICATE_ROOT_R2_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/registry-gen2/negative-duplicate-root-r2.jsonl"
+    );
+    const NEGATIVE_GENERATION2_ONLY_ROOT_R2_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/registry-gen2/negative-generation2-only-root-r2.jsonl"
+    );
+    const NEGATIVE_MISSING_REQUIRED_KIND_R2_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/registry-gen2/negative-missing-required-kind-r2.jsonl"
+    );
+    const NEGATIVE_RESERVED_WRONG_VERSION_R2_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/registry-gen2/negative-reserved-wrong-version-r2.jsonl"
+    );
+    const NEGATIVE_UNKNOWN_KIND_R2_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/registry-gen2/negative-unknown-kind-r2.jsonl"
+    );
+    const NEGATIVE_UNSORTED_ROOTS_R2_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/registry-gen2/negative-unsorted-roots-r2.jsonl"
+    );
+    const NEGATIVE_V1_KIND_AT_V2_R2_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/registry-gen2/negative-v1-kind-at-v2-r2.jsonl"
+    );
+    const NEGATIVE_WRONG_PREDECESSOR_HEAD_R2_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/registry-gen2/negative-wrong-predecessor-head-r2.jsonl"
+    );
+    const VECTOR_SUITE_R2_FIXTURE: &[u8] =
+        include_bytes!("../../contracts/dynamic-memory/v3/registry-gen2/vector-suite-r2.jsonl");
+
     /// The frozen Stage-4 package digest. This constant must never change.
     const STAGE4_PACKAGE_DIGEST_HEX: &str =
         "16f98d5df93b74dab5b2188274cbd1da21d089ff7a64cd8fc29679946e7fe2c9";
@@ -582,6 +621,23 @@ mod tests {
         "78f8500aa91ae4f1e3a3213f0dc205c0019c667a7edeec2b0bd88a60352a8dc2";
     const EXPECTED_VECTOR_SUITE_RAW_SHA256: &str =
         "b8503470bf563810d6d6a98b8838d626ad56c76e8bd6b12bc8281c3449c3de88";
+
+    /// r1 froze exactly seven reserved slots and 32 closed-table triples.
+    const R1_RESERVED_SLOT_COUNT: usize = 7;
+    const R1_SLOT_TABLE_LEN: usize = 32;
+
+    const EXPECTED_MANIFEST_R2_DIGEST: &str =
+        "6d6e8ac25bab65b8faa1c9399aec70a319143c6401d6205e918b108ad369a4ed";
+    const EXPECTED_SLOT_TABLE_R2_DIGEST: &str =
+        "a3db241757b3e5a8f02680557e5568a1e83ac97ff4e934c1ebc36618a00e877d";
+    const EXPECTED_VECTOR_SUITE_R2_DIGEST: &str =
+        "8d6929de2d3af569b8d7f9d603c3185786948ba7d23d1594b9c89674c9dc7ef8";
+    const EXPECTED_MANIFEST_R2_RAW_SHA256: &str =
+        "532c58564b8053e8cecb90ea0972639aefe200e393ecf7d32544f0ffec1ca44b";
+    const EXPECTED_SLOT_TABLE_R2_RAW_SHA256: &str =
+        "90d79dcb6c11691a67e7163f8f0c5eef079df1c41a621e6eb769e6ff3a1a1658";
+    const EXPECTED_VECTOR_SUITE_R2_RAW_SHA256: &str =
+        "211edfe7c97f0abd25b8a797def76af24b41960d88b196575b87b8169821ceeb";
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -796,6 +852,28 @@ mod tests {
         value
     }
 
+    /// A carry-forward root must select a dispatched triple. A generation-2-only
+    /// kind never can, so naming one as a root is rejected even though the root
+    /// is otherwise well formed and in canonical position.
+    fn negative_generation2_only_root() -> Generation2CompositionManifestV1 {
+        let mut value = manifest();
+        value.carry_forward_roots.insert(
+            3,
+            Generation2CarryForwardRootV1 {
+                kind: RegistryEntryKind::ConsolidationPolicy,
+                entry_id: ContractId::new("consolidation.default").unwrap(),
+                version: 1,
+                entry_schema_id: ContractId::new("registry.consolidation_policy").unwrap(),
+                entry_schema_version: 1,
+                entry_digest: domain_separated_digest(
+                    DigestDomain::RegistryEntry,
+                    b"consolidation.default@1",
+                ),
+            },
+        );
+        value
+    }
+
     fn negative_unsorted_roots() -> Generation2CompositionManifestV1 {
         let mut value = manifest();
         value.carry_forward_roots.swap(0, 1);
@@ -823,54 +901,59 @@ mod tests {
         vec![
             (
                 "duplicate_root",
-                "negative-duplicate-root.jsonl",
+                "negative-duplicate-root-r2.jsonl",
                 encode_canonical(&negative_duplicate_root()).unwrap(),
             ),
             (
+                "generation2_only_root",
+                "negative-generation2-only-root-r2.jsonl",
+                encode_canonical(&negative_generation2_only_root()).unwrap(),
+            ),
+            (
                 "missing_required_kind",
-                "negative-missing-required-kind.jsonl",
+                "negative-missing-required-kind-r2.jsonl",
                 encode_canonical(&negative_missing_required_kind()).unwrap(),
             ),
             (
                 "reserved_triple_wrong_version",
-                "negative-reserved-wrong-version.jsonl",
+                "negative-reserved-wrong-version-r2.jsonl",
                 encode_canonical(&negative_reserved_wrong_version()).unwrap(),
             ),
             (
                 "unknown_kind",
-                "negative-unknown-kind.jsonl",
+                "negative-unknown-kind-r2.jsonl",
                 negative_unknown_kind_bytes(),
             ),
             (
                 "unsorted_roots",
-                "negative-unsorted-roots.jsonl",
+                "negative-unsorted-roots-r2.jsonl",
                 encode_canonical(&negative_unsorted_roots()).unwrap(),
             ),
             (
                 "v1_kind_claimed_at_v2",
-                "negative-v1-kind-at-v2.jsonl",
+                "negative-v1-kind-at-v2-r2.jsonl",
                 encode_canonical(&negative_v1_kind_at_v2()).unwrap(),
             ),
             (
                 "wrong_predecessor_head",
-                "negative-wrong-predecessor-head.jsonl",
+                "negative-wrong-predecessor-head-r2.jsonl",
                 encode_canonical(&negative_wrong_predecessor_head()).unwrap(),
             ),
         ]
     }
 
-    fn vector_suite() -> Generation2VectorSuiteV1 {
+    fn vector_suite_r2() -> Generation2VectorSuiteV1 {
         let manifest_bytes = encode_canonical(&manifest()).unwrap();
         let table = BodySchemaSlotTableV1::from_compiled_table().unwrap();
         let table_bytes = encode_canonical(&table).unwrap();
         Generation2VectorSuiteV1 {
             schema_version: 1,
-            suite_id: ContractId::new("registry.generation2.composition").unwrap(),
+            suite_id: ContractId::new("registry.generation2.composition.r2").unwrap(),
             fixture_authority: FIXTURE_AUTHORITY.to_owned(),
-            manifest_path: "composition-manifest.jsonl".into(),
+            manifest_path: "composition-manifest-r2.jsonl".into(),
             manifest_digest: manifest().digest().unwrap(),
             manifest_raw_sha256: framed_raw_sha256(&manifest_bytes),
-            slot_table_path: "body-schema-slots.jsonl".into(),
+            slot_table_path: "body-schema-slots-r2.jsonl".into(),
             slot_table_digest: manifest_domain_digest(&table_bytes),
             slot_table_raw_sha256: framed_raw_sha256(&table_bytes),
             predecessor_head: generation1_expected_head().unwrap(),
@@ -929,10 +1012,20 @@ mod tests {
 
     #[test]
     fn every_generation1_closure_rejects_generation2_only_kinds() {
-        for (kind, schema_id) in [
+        // Exactly the generation-2-only set: a new such kind that skips this
+        // loop fails the count assertion below instead of escaping coverage.
+        let generation2_only = [
             (
                 RegistryEntryKind::ArrowBatchSchema,
                 "registry.arrow_batch_schema",
+            ),
+            (
+                RegistryEntryKind::ComparatorLineage,
+                "registry.comparator_lineage",
+            ),
+            (
+                RegistryEntryKind::ConsolidationPolicy,
+                "registry.consolidation_policy",
             ),
             (
                 RegistryEntryKind::LogEpochRecipe,
@@ -942,7 +1035,15 @@ mod tests {
                 RegistryEntryKind::ParserContract,
                 "registry.parser_contract",
             ),
-        ] {
+        ];
+        assert_eq!(
+            generation2_only.map(|(kind, _)| kind).to_vec(),
+            crate::memory_contracts::registry::ALL_REGISTRY_ENTRY_KINDS
+                .into_iter()
+                .filter(|kind| kind.is_generation2_only())
+                .collect::<Vec<_>>()
+        );
+        for (kind, schema_id) in generation2_only {
             let mut genesis = genesis_package();
             genesis
                 .entries
@@ -1037,7 +1138,10 @@ mod tests {
         // The reserved set the manifest freezes is exactly the reserved class
         // of the closed table, so this list plus the three generation-2-only
         // kinds is the whole reservation.
-        assert_eq!(reserved_generation2_slots().unwrap().len(), 7);
+        assert_eq!(
+            reserved_generation2_slots().unwrap().len(),
+            R1_RESERVED_SLOT_COUNT + 2
+        );
     }
 
     #[test]
@@ -1115,6 +1219,7 @@ mod tests {
             negative_v1_kind_at_v2(),
             negative_reserved_wrong_version(),
             negative_unsorted_roots(),
+            negative_generation2_only_root(),
         ] {
             assert!(StructurallyClosedGeneration2Manifest::new(value).is_err());
         }
@@ -1151,40 +1256,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_artifacts_and_literal_pins_are_frozen() {
-        let closed = StructurallyClosedGeneration2Manifest::decode(record(MANIFEST_FIXTURE))
-            .expect("frozen manifest must decode");
-        assert_eq!(closed.manifest(), &manifest());
-        assert_eq!(closed.manifest_digest(), digest(EXPECTED_MANIFEST_DIGEST));
-
-        let table: BodySchemaSlotTableV1 = decode_strict(record(SLOT_TABLE_FIXTURE)).unwrap();
-        table.validate().unwrap();
-        assert_eq!(table, BodySchemaSlotTableV1::from_compiled_table().unwrap());
-        assert_eq!(
-            manifest_domain_digest(record(SLOT_TABLE_FIXTURE)),
-            digest(EXPECTED_SLOT_TABLE_DIGEST)
-        );
-
-        for fixture in [
-            NEGATIVE_MISSING_REQUIRED_KIND_FIXTURE,
-            NEGATIVE_DUPLICATE_ROOT_FIXTURE,
-            NEGATIVE_UNKNOWN_KIND_FIXTURE,
-            NEGATIVE_WRONG_PREDECESSOR_HEAD_FIXTURE,
-            NEGATIVE_V1_KIND_AT_V2_FIXTURE,
-            NEGATIVE_RESERVED_WRONG_VERSION_FIXTURE,
-            NEGATIVE_UNSORTED_ROOTS_FIXTURE,
-        ] {
-            require_canonical(record(fixture)).unwrap();
-            assert!(StructurallyClosedGeneration2Manifest::decode(record(fixture)).is_err());
-        }
-
-        let suite: Generation2VectorSuiteV1 = decode_strict(record(VECTOR_SUITE_FIXTURE)).unwrap();
-        assert_eq!(suite, vector_suite());
-        assert_eq!(
-            manifest_domain_digest(record(VECTOR_SUITE_FIXTURE)),
-            digest(EXPECTED_VECTOR_SUITE_DIGEST)
-        );
-
+    fn r1_artifacts_stay_byte_frozen_and_are_superseded_by_r2() {
+        // Raw hashes and domain digests are pure functions of the file bytes,
+        // so these hold no matter what the compiled table now says. If any r1
+        // file were edited or regenerated, this is what would fail.
         for (fixture, expected) in [
             (MANIFEST_FIXTURE, EXPECTED_MANIFEST_RAW_SHA256),
             (SLOT_TABLE_FIXTURE, EXPECTED_SLOT_TABLE_RAW_SHA256),
@@ -1192,6 +1267,32 @@ mod tests {
         ] {
             assert_eq!(raw_sha256(fixture), expected);
         }
+        assert_eq!(
+            domain_separated_digest(
+                DigestDomain::Generation2CompositionManifestV1,
+                record(MANIFEST_FIXTURE),
+            ),
+            digest(EXPECTED_MANIFEST_DIGEST)
+        );
+        assert_eq!(
+            manifest_domain_digest(record(SLOT_TABLE_FIXTURE)),
+            digest(EXPECTED_SLOT_TABLE_DIGEST)
+        );
+        assert_eq!(
+            manifest_domain_digest(record(VECTOR_SUITE_FIXTURE)),
+            digest(EXPECTED_VECTOR_SUITE_DIGEST)
+        );
+
+        // The r1 suite still parses and still pins its own negatives exactly.
+        let suite: Generation2VectorSuiteV1 = decode_strict(record(VECTOR_SUITE_FIXTURE)).unwrap();
+        assert_eq!(suite.suite_id.as_str(), "registry.generation2.composition");
+        assert_eq!(suite.manifest_digest, digest(EXPECTED_MANIFEST_DIGEST));
+        assert_eq!(suite.slot_table_digest, digest(EXPECTED_SLOT_TABLE_DIGEST));
+        assert_eq!(suite.predecessor_head, generation1_expected_head().unwrap());
+        assert_eq!(
+            suite.stage4_package_digest,
+            digest(STAGE4_PACKAGE_DIGEST_HEX)
+        );
         for (pin, fixture) in suite.negative_artifacts.iter().zip([
             NEGATIVE_DUPLICATE_ROOT_FIXTURE,
             NEGATIVE_MISSING_REQUIRED_KIND_FIXTURE,
@@ -1202,7 +1303,185 @@ mod tests {
             NEGATIVE_WRONG_PREDECESSOR_HEAD_FIXTURE,
         ]) {
             assert_eq!(pin.raw_sha256, raw_sha256(fixture), "{}", pin.path);
+            require_canonical(record(fixture)).unwrap();
+            assert!(StructurallyClosedGeneration2Manifest::decode(record(fixture)).is_err());
         }
+
+        // Widening the closed table supersedes r1 instead of editing it. r1
+        // reserved seven slots; the compiled table now reserves nine, so the
+        // r1 manifest no longer closes and the r1 slot-table projection no
+        // longer equals the compiled table. That visible break is the freeze
+        // doing its job: a silently widened table would have kept passing.
+        let error =
+            StructurallyClosedGeneration2Manifest::decode(record(MANIFEST_FIXTURE)).unwrap_err();
+        assert!(
+            matches!(&error, ContractError::Schema(message)
+                if message.contains("reserved slots differ from the closed table")),
+            "{error:?}"
+        );
+        let r1_table: BodySchemaSlotTableV1 = decode_strict(record(SLOT_TABLE_FIXTURE)).unwrap();
+        assert_eq!(r1_table.slots.len(), R1_SLOT_TABLE_LEN);
+        assert_eq!(
+            r1_table
+                .slots
+                .iter()
+                .filter(|slot| slot.slot_class == BodySchemaSlotClassV1::Generation2Reserved)
+                .count(),
+            R1_RESERVED_SLOT_COUNT
+        );
+        assert_ne!(
+            r1_table,
+            BodySchemaSlotTableV1::from_compiled_table().unwrap()
+        );
+        assert!(r1_table.validate().is_err());
+    }
+
+    #[test]
+    fn r2_canonical_artifacts_and_literal_pins_are_frozen() {
+        let closed = StructurallyClosedGeneration2Manifest::decode(record(MANIFEST_R2_FIXTURE))
+            .expect("frozen r2 manifest must decode");
+        assert_eq!(closed.manifest(), &manifest());
+        assert_eq!(
+            closed.manifest_digest(),
+            digest(EXPECTED_MANIFEST_R2_DIGEST)
+        );
+        assert_eq!(
+            closed.manifest().reserved_slots.len(),
+            R1_RESERVED_SLOT_COUNT + 2
+        );
+
+        let table: BodySchemaSlotTableV1 = decode_strict(record(SLOT_TABLE_R2_FIXTURE)).unwrap();
+        table.validate().unwrap();
+        assert_eq!(table, BodySchemaSlotTableV1::from_compiled_table().unwrap());
+        assert_eq!(table.slots.len(), R1_SLOT_TABLE_LEN + 2);
+        assert_eq!(
+            manifest_domain_digest(record(SLOT_TABLE_R2_FIXTURE)),
+            digest(EXPECTED_SLOT_TABLE_R2_DIGEST)
+        );
+
+        for fixture in [
+            NEGATIVE_DUPLICATE_ROOT_R2_FIXTURE,
+            NEGATIVE_GENERATION2_ONLY_ROOT_R2_FIXTURE,
+            NEGATIVE_MISSING_REQUIRED_KIND_R2_FIXTURE,
+            NEGATIVE_RESERVED_WRONG_VERSION_R2_FIXTURE,
+            NEGATIVE_UNKNOWN_KIND_R2_FIXTURE,
+            NEGATIVE_UNSORTED_ROOTS_R2_FIXTURE,
+            NEGATIVE_V1_KIND_AT_V2_R2_FIXTURE,
+            NEGATIVE_WRONG_PREDECESSOR_HEAD_R2_FIXTURE,
+        ] {
+            require_canonical(record(fixture)).unwrap();
+            assert!(StructurallyClosedGeneration2Manifest::decode(record(fixture)).is_err());
+        }
+
+        // The one negative this revision adds: a generation-2-only kind can
+        // never be a carry-forward root, because a root must be dispatched.
+        let error = StructurallyClosedGeneration2Manifest::decode(record(
+            NEGATIVE_GENERATION2_ONLY_ROOT_R2_FIXTURE,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&error, ContractError::Schema(message)
+                if message.contains("selects the non-dispatched triple")),
+            "{error:?}"
+        );
+
+        let suite: Generation2VectorSuiteV1 =
+            decode_strict(record(VECTOR_SUITE_R2_FIXTURE)).unwrap();
+        assert_eq!(suite, vector_suite_r2());
+        assert_eq!(
+            manifest_domain_digest(record(VECTOR_SUITE_R2_FIXTURE)),
+            digest(EXPECTED_VECTOR_SUITE_R2_DIGEST)
+        );
+        // The r2 suite pins the frozen Stage-4 package and the same
+        // generation-1 head as r1: this revision widens the slot table and
+        // nothing else.
+        assert_eq!(
+            suite.stage4_package_digest,
+            digest(STAGE4_PACKAGE_DIGEST_HEX)
+        );
+        assert_eq!(suite.predecessor_head, generation1_expected_head().unwrap());
+
+        for (fixture, expected) in [
+            (MANIFEST_R2_FIXTURE, EXPECTED_MANIFEST_R2_RAW_SHA256),
+            (SLOT_TABLE_R2_FIXTURE, EXPECTED_SLOT_TABLE_R2_RAW_SHA256),
+            (VECTOR_SUITE_R2_FIXTURE, EXPECTED_VECTOR_SUITE_R2_RAW_SHA256),
+        ] {
+            assert_eq!(raw_sha256(fixture), expected);
+        }
+        for (pin, fixture) in suite.negative_artifacts.iter().zip([
+            NEGATIVE_DUPLICATE_ROOT_R2_FIXTURE,
+            NEGATIVE_GENERATION2_ONLY_ROOT_R2_FIXTURE,
+            NEGATIVE_MISSING_REQUIRED_KIND_R2_FIXTURE,
+            NEGATIVE_RESERVED_WRONG_VERSION_R2_FIXTURE,
+            NEGATIVE_UNKNOWN_KIND_R2_FIXTURE,
+            NEGATIVE_UNSORTED_ROOTS_R2_FIXTURE,
+            NEGATIVE_V1_KIND_AT_V2_R2_FIXTURE,
+            NEGATIVE_WRONG_PREDECESSOR_HEAD_R2_FIXTURE,
+        ]) {
+            assert_eq!(pin.raw_sha256, raw_sha256(fixture), "{}", pin.path);
+        }
+    }
+
+    #[test]
+    fn r2_reserves_exactly_two_new_kinds_and_nothing_else() {
+        let closed = StructurallyClosedGeneration2Manifest::decode(record(MANIFEST_R2_FIXTURE))
+            .expect("frozen r2 manifest must decode");
+        let table: BodySchemaSlotTableV1 = decode_strict(record(SLOT_TABLE_R2_FIXTURE)).unwrap();
+
+        // Each new kind holds exactly one slot, reserved, at entry schema v1 —
+        // and it is reserved in the frozen manifest too, not only in the table.
+        for (kind, schema_id) in [
+            (
+                RegistryEntryKind::ComparatorLineage,
+                "registry.comparator_lineage",
+            ),
+            (
+                RegistryEntryKind::ConsolidationPolicy,
+                "registry.consolidation_policy",
+            ),
+        ] {
+            let slots = table
+                .slots
+                .iter()
+                .filter(|slot| slot.kind == kind)
+                .collect::<Vec<_>>();
+            assert_eq!(slots.len(), 1, "{}", kind.as_str());
+            assert_eq!(slots[0].entry_schema_id.as_str(), schema_id);
+            assert_eq!(slots[0].entry_schema_version, 1);
+            assert_eq!(
+                slots[0].slot_class,
+                BodySchemaSlotClassV1::Generation2Reserved
+            );
+            assert!(
+                closed
+                    .manifest()
+                    .reserved_slots
+                    .iter()
+                    .any(|slot| slot.kind == kind && slot.entry_schema_id.as_str() == schema_id),
+                "{}",
+                kind.as_str()
+            );
+        }
+
+        // Nothing else moved: r2 is r1's table plus those two reserved slots.
+        let r1_table: BodySchemaSlotTableV1 = decode_strict(record(SLOT_TABLE_FIXTURE)).unwrap();
+        let added = table
+            .slots
+            .iter()
+            .filter(|slot| !r1_table.slots.contains(slot))
+            .map(|slot| slot.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            added,
+            [
+                RegistryEntryKind::ComparatorLineage,
+                RegistryEntryKind::ConsolidationPolicy
+            ]
+        );
+        assert!(
+            r1_table.slots.iter().all(|slot| table.slots.contains(slot)),
+            "r2 must be a superset of the r1 table"
+        );
     }
 
     #[test]
@@ -1221,16 +1500,18 @@ mod tests {
             .expect("GENERATION2_VECTOR_OUTPUT is required");
         fs::create_dir_all(&output).unwrap();
 
+        // r1 file names are never written here: widening the closed table is a
+        // new revision, and the r1 bytes stay exactly as they were frozen.
         let manifest_bytes = encode_canonical(&manifest()).unwrap();
-        write(&output, "composition-manifest.jsonl", &manifest_bytes);
+        write(&output, "composition-manifest-r2.jsonl", &manifest_bytes);
         let table_bytes =
             encode_canonical(&BodySchemaSlotTableV1::from_compiled_table().unwrap()).unwrap();
-        write(&output, "body-schema-slots.jsonl", &table_bytes);
+        write(&output, "body-schema-slots-r2.jsonl", &table_bytes);
         for (_, path, bytes) in negative_artifact_bytes() {
             write(&output, path, &bytes);
         }
-        let suite_bytes = encode_canonical(&vector_suite()).unwrap();
-        write(&output, "vector-suite.jsonl", &suite_bytes);
+        let suite_bytes = encode_canonical(&vector_suite_r2()).unwrap();
+        write(&output, "vector-suite-r2.jsonl", &suite_bytes);
 
         println!("manifest_digest={}", manifest().digest().unwrap());
         println!("slot_table_digest={}", manifest_domain_digest(&table_bytes));

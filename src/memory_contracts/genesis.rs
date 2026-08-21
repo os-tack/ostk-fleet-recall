@@ -1062,6 +1062,8 @@ pub(crate) fn decode_entry(
         // keeps them visible here so a later typed body cannot be added by
         // widening a wildcard arm.
         RegistryEntryKind::ArrowBatchSchema
+        | RegistryEntryKind::ComparatorLineage // W0-REG-2
+        | RegistryEntryKind::ConsolidationPolicy // W0-REG-2
         | RegistryEntryKind::LogEpochRecipe
         | RegistryEntryKind::ParserContract => return Err(generation2_only_kind_error(entry)),
     })
