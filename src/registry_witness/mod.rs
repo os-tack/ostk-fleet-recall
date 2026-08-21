@@ -40,6 +40,15 @@
 //!   under the same head yields the same append coordinates and the same
 //!   semantic identities.
 //!
+//! [`WriterAuthorityWitness::to_append_witness`] is the reconciliation seam
+//! with `crate::evidence_ledger::WriterAuthorityWitness`: that type is
+//! `W1-APPEND`'s deliberately plain, publicly constructible value object for
+//! what the append transaction compares against, and this method is the only
+//! place this crate turns an unforgeable head witness into one. See that
+//! type's own module documentation for why a value object is safe there; see
+//! the adapter method here for why the two are not competing notions of the
+//! same thing.
+//!
 //! What this module deliberately does NOT verify, because the runtime role has
 //! zero privilege on the control and registry base tables (ADR 0002 D2): the
 //! full transition chain from generation 0 to the current generation, the
@@ -66,7 +75,8 @@ use crate::memory_contracts::bootstrap::{
 };
 use crate::memory_contracts::canonical::{decode_strict, encode_canonical, require_canonical};
 use crate::memory_contracts::common::{
-    CanonicalTimestamp, ContractId, frozen_profile_reference_v1,
+    AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId, FixedHex32,
+    frozen_profile_reference_v1,
 };
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::evidence_v2::RegistryHeadBindingV1;
@@ -320,6 +330,62 @@ impl WriterAuthorityWitness {
     pub fn package(&self) -> &SemanticallyClosedStage4Package {
         &self.package
     }
+
+    /// Produce the append transaction's consumable witness (ADR 0002 D4
+    /// seam), reconciling the two `WriterAuthorityWitness` types this crate
+    /// carries after `W1-APPEND` merged its own interim value object.
+    ///
+    /// This module owns *production*: reading the view, verifying descent
+    /// from the pinned bootstrap root, and enforcing the deployment pins.
+    /// `crate::evidence_ledger::WriterAuthorityWitness` owns only what the
+    /// append transaction compares against, and is deliberately a plain
+    /// value object with no privileged constructor of its own — see that
+    /// type's module documentation for why a forged instance still cannot
+    /// append anything. This method is the one adapter between them: every
+    /// field is copied verbatim from a witness this module already proved
+    /// internally consistent against a live, pin-verified row, so
+    /// `from_authority_snapshot` re-derives nothing new here, it only
+    /// re-checks that the copy is self-consistent (the same redundancy its
+    /// own doc comment asks callers to accept). Deleting the append-side
+    /// type instead of adapting to it is not an option: it is retained by
+    /// value inside `AppendableAcceptedEvent` across the whole admission
+    /// path, and every `W1-APPEND` live test constructs one directly.
+    ///
+    /// # Errors
+    ///
+    /// Only if the two contract types disagree about a shape that this
+    /// witness's own construction already forbids (defence in depth, not a
+    /// verdict this method's caller should expect to see in practice).
+    pub fn to_append_witness(
+        &self,
+    ) -> crate::evidence_ledger::EvidenceAppendResult<crate::evidence_ledger::WriterAuthorityWitness>
+    {
+        let head_scope = AuthenticatedProjectScopeV1::from_trusted_context(
+            self.contract_tenant_namespace.clone(),
+            self.contract_project_namespace.clone(),
+        );
+        let bootstrap_scope = self.bootstrap.receipt().statement.scope.clone();
+        let genesis_epoch = self.bootstrap.receipt().statement.genesis_epoch.clone();
+        crate::evidence_ledger::WriterAuthorityWitness::from_authority_snapshot(
+            crate::evidence_ledger::WriterAuthoritySnapshot {
+                head_state: ACTIVE_HEAD_STATE.to_owned(),
+                generation: self.generation,
+                activation_id: self.activation_id,
+                package_digest: self.package_digest,
+                activation_policy_digest: self.activation_policy_digest,
+                log_epoch_id: self.log_epoch_id,
+                partition_recipe_id: self.partition_recipe_id.as_str().to_owned(),
+                partition_recipe_version: self.partition_recipe_version,
+                partition_algorithm: partition_algorithm_column(self.partition_algorithm)
+                    .to_owned(),
+                partition_seed: FixedHex32::from_bytes(self.partition_seed),
+                log_shard_count: self.shard_count,
+                head_scope,
+                bootstrap_scope,
+                genesis_epoch,
+            },
+        )
+    }
 }
 
 /// Read and verify the active writer authority on a pool connection.
@@ -395,12 +461,21 @@ where
         .bind(&scope.project)
         .fetch_all(executor)
         .await?;
-    let mut rows = rows.into_iter();
+    let row = require_single(rows.into_iter())?;
+    verify_row(scope, &AuthorityRow::read(&row)?, config)
+}
+
+/// Exactly one item, or a fail-closed verdict (D4). Extracted from
+/// [`verify_with_executor`] so the zero-row and multi-row cases can be proved
+/// offline over any iterator, without a database: [`sqlx::postgres::PgRow`]
+/// cannot be constructed outside a live connection, so the ambiguity verdict
+/// would otherwise be untestable except through a connected proof.
+fn require_single<T>(mut rows: impl Iterator<Item = T>) -> WitnessResult<T> {
     let row = rows.next().ok_or(WriterAuthorityRejection::Absent)?;
     if rows.next().is_some() {
         return Err(WriterAuthorityRejection::Ambiguous.into());
     }
-    verify_row(scope, &AuthorityRow::read(&row)?, config)
+    Ok(row)
 }
 
 /// Exactly the columns the witness consumes, decoded once into contract types.
@@ -1059,9 +1134,8 @@ mod tests {
     }
 
     #[test]
-    fn the_decode_cache_is_keyed_by_exact_canonical_bytes_and_is_bounded() {
+    fn a_rejected_head_never_enters_the_decode_cache() {
         let first = decode_cache().lock().expect("cache").len();
-        assert!(first <= DECODE_CACHE_CAPACITY);
         assert!(decode_canonical_head(b"{}").is_err());
         assert!(decode_canonical_head(b"not json").is_err());
         assert_eq!(
@@ -1082,6 +1156,42 @@ mod tests {
         assert_eq!(
             witness.package().package_digest(),
             stage4_package().expect("Stage-4 package").package_digest()
+        );
+    }
+
+    /// The reconciliation seam between this module's unforgeable witness and
+    /// `W1-APPEND`'s plain append-side value object: every field the
+    /// append-side snapshot carries must survive the round trip unchanged,
+    /// and `from_authority_snapshot`'s own internal-consistency proof must
+    /// accept it, so `verify_row`'s own checks (namespace pins, epoch
+    /// binding, descent) are what make the adapter's construction infallible
+    /// in practice.
+    #[test]
+    fn the_witness_adapts_cleanly_to_the_append_transactions_witness() {
+        let fixture = authority_fixture(0x5d);
+        let witness = verify_row(&fixture.scope, &fixture.row, &fixture.config).expect("witness");
+        let append_witness = witness
+            .to_append_witness()
+            .expect("a verified witness must always adapt");
+        assert_eq!(append_witness.head().activation_id, witness.activation_id());
+        assert_eq!(
+            append_witness.head().package_digest,
+            witness.package_digest()
+        );
+        assert_eq!(
+            append_witness.head().activation_policy_digest,
+            witness.activation_policy_digest()
+        );
+        assert_eq!(append_witness.generation(), witness.generation());
+        assert_eq!(append_witness.epoch_id(), witness.log_epoch_id());
+        assert_eq!(append_witness.shard_count(), witness.shard_count());
+        assert_eq!(
+            append_witness.semantic_scope().tenant_namespace,
+            *witness.contract_tenant_namespace()
+        );
+        assert_eq!(
+            append_witness.semantic_scope().project_namespace,
+            *witness.contract_project_namespace()
         );
     }
 
@@ -1248,11 +1358,26 @@ mod tests {
         let fixture = authority_fixture(0x53);
         verify_descent(&fixture.row, 1).expect("the fixture descent must verify");
         let mutations: [(&str, RowMutation); 11] = [
+            // The predecessor is mutated to the SAME foreign value as the
+            // root field under test, so the generation-1 predecessor-equality
+            // arm (`predecessor_* != Some(row.root_*)`) stays satisfied and
+            // cannot itself reject; only the root-vs-genesis-package
+            // comparison this vector targets can still fire. Mutating the
+            // root field alone (as a prior revision of this vector did) left
+            // that comparison silently unreachable: cargo-mutants could
+            // neuter `row.root_package_digest != genesis_package.package_digest()`
+            // or `row.root_activation_policy_digest != expected_root_policy`
+            // and every gate still passed, because the unchanged predecessor
+            // field disagreed with the *new* root value and the later arm
+            // caught it instead.
             ("root_package_digest", |row| {
                 row.root_package_digest = Sha256Digest::from_bytes(FOREIGN_DIGEST);
+                row.predecessor_package_digest = Some(Sha256Digest::from_bytes(FOREIGN_DIGEST));
             }),
             ("root_activation_policy_digest", |row| {
                 row.root_activation_policy_digest = Sha256Digest::from_bytes(FOREIGN_DIGEST);
+                row.predecessor_activation_policy_digest =
+                    Some(Sha256Digest::from_bytes(FOREIGN_DIGEST));
             }),
             ("zero root_activation_id", |row| {
                 row.root_activation_id = Sha256Digest::ZERO;
@@ -1287,6 +1412,143 @@ mod tests {
         for (label, mutate) in mutations {
             expect_rejection(&fixture, label, mutate, WriterAuthorityRejection::Descent);
         }
+    }
+
+    /// A generation-2 row whose predecessor is a real prior head, not the
+    /// genesis root, so the `generation == 1` predecessor-equality arm of
+    /// `verify_descent` cannot run for it. Only the NULL guards in the second
+    /// `if` block remain load-bearing at this generation.
+    fn authority_fixture_generation_two(seed_byte: u8) -> AuthorityFixture {
+        let mut fixture = authority_fixture(seed_byte);
+        fixture.row.generation = 2;
+        fixture.row.predecessor_generation = Some(1);
+        fixture.row.predecessor_activation_id = Some(Sha256Digest::from_bytes([0x44; 32]));
+        fixture.row.predecessor_package_digest = Some(Sha256Digest::from_bytes([0x45; 32]));
+        fixture.row.predecessor_activation_policy_digest =
+            Some(Sha256Digest::from_bytes([0x46; 32]));
+        fixture
+    }
+
+    /// AUTH-04 descent, generation >= 2. At generation 1 a `None` predecessor
+    /// digest is masked: with the NULL guard deleted, `None != Some(root)`
+    /// still evaluates true in the generation-1 predecessor-equality arm, so
+    /// the row is rejected for the wrong reason and the deletion is
+    /// undetectable by that vector alone. The `if generation == 1` guard
+    /// means that masking arm does not even run at generation 2, so a
+    /// deleted NULL guard there passes every prior check and mints a witness
+    /// from a row with no recorded predecessor package or policy. This is
+    /// exactly the reviewer's finding, extended from
+    /// `predecessor_activation_policy_digest` (named in the blocker) to
+    /// `predecessor_package_digest`, which has the identical masking shape.
+    #[test]
+    fn descent_verification_requires_the_predecessor_null_guards_beyond_generation_one() {
+        let fixture = authority_fixture_generation_two(0x5b);
+        verify_descent(&fixture.row, 2).expect("the generation-2 fixture descent must verify");
+        verify_row(&fixture.scope, &fixture.row, &fixture.config)
+            .expect("a well-formed generation-2 row mints a witness");
+
+        let mutations: [(&str, RowMutation); 3] = [
+            ("absent predecessor_package_digest at generation 2", |row| {
+                row.predecessor_package_digest = None;
+            }),
+            (
+                "absent predecessor_activation_policy_digest at generation 2",
+                |row| row.predecessor_activation_policy_digest = None,
+            ),
+            ("misordered predecessor_generation at generation 2", |row| {
+                row.predecessor_generation = Some(0);
+            }),
+        ];
+        for (label, mutate) in mutations {
+            expect_rejection(&fixture, label, mutate, WriterAuthorityRejection::Descent);
+        }
+    }
+
+    /// D4. The authority query's `LIMIT 2` exists so the driver can
+    /// distinguish "exactly one" from "more than one" in a single round trip.
+    /// That distinction is made by [`require_single`], extracted so it can be
+    /// proved here without a database: zero rows fail closed as `Absent`, two
+    /// (or more) fail closed as `Ambiguous`, and this is the only place either
+    /// verdict can be produced. This is currently unreachable on a live
+    /// database (the view's primary key admits at most one active row per
+    /// scope) but becomes load-bearing if that uniqueness is ever relaxed, so
+    /// it is covered here rather than left silent.
+    #[test]
+    fn ambiguous_and_absent_authority_rows_fail_closed() {
+        assert!(matches!(
+            require_single(std::iter::empty::<u8>()),
+            Err(WriterAuthorityError::Rejected(
+                WriterAuthorityRejection::Absent
+            ))
+        ));
+        assert!(matches!(
+            require_single([1_u8, 2_u8].into_iter()),
+            Err(WriterAuthorityError::Rejected(
+                WriterAuthorityRejection::Ambiguous
+            ))
+        ));
+        assert!(matches!(
+            require_single([1_u8, 2_u8, 3_u8].into_iter()),
+            Err(WriterAuthorityError::Rejected(
+                WriterAuthorityRejection::Ambiguous
+            ))
+        ));
+        assert_eq!(
+            require_single(std::iter::once(7_u8)).expect("exactly one row"),
+            7
+        );
+    }
+
+    /// D4. The cache is keyed by exact canonical bytes: two distinct heads
+    /// occupy two distinct entries, and re-decoding the same bytes hits the
+    /// cache rather than allocating a fresh binding (proved by `Arc::ptr_eq`,
+    /// which is safe under test-thread parallelism because it never depends
+    /// on the cache's total size). The capacity bound is proved by inserting
+    /// more distinct canonical heads than `DECODE_CACHE_CAPACITY` from this
+    /// one test alone: `decode_canonical_head` holds the cache's mutex across
+    /// its whole check-clear-insert sequence, so the `len() <=
+    /// DECODE_CACHE_CAPACITY` assertion below is not racy against sibling
+    /// tests sharing the same process-global cache, and it fails if the
+    /// eviction check is ever deleted, because this test's own insertions
+    /// alone exceed the capacity regardless of what else is concurrently
+    /// cached.
+    #[test]
+    fn the_decode_cache_is_keyed_by_exact_canonical_bytes_and_is_bounded() {
+        let fixture = authority_fixture(0x5c);
+        let first_bytes = head_bytes(&fixture, |binding| {
+            binding.head.activation_id = Sha256Digest::from_bytes([0xa1; 32]);
+        });
+        let second_bytes = head_bytes(&fixture, |binding| {
+            binding.head.activation_id = Sha256Digest::from_bytes([0xa2; 32]);
+        });
+        assert_ne!(first_bytes, second_bytes);
+
+        let first = decode_canonical_head(&first_bytes).expect("first head decodes");
+        let second = decode_canonical_head(&second_bytes).expect("second head decodes");
+        assert_ne!(
+            first.head.activation_id, second.head.activation_id,
+            "two distinct canonical heads must decode to two distinct bindings"
+        );
+
+        let first_again = decode_canonical_head(&first_bytes).expect("first head still decodes");
+        assert!(
+            Arc::ptr_eq(&first, &first_again),
+            "re-decoding the same canonical bytes must hit the cache, not allocate a fresh binding"
+        );
+
+        for marker in 0..u8::try_from(DECODE_CACHE_CAPACITY).expect("small capacity") + 5 {
+            let bytes = head_bytes(&fixture, |binding| {
+                binding.head.activation_id = Sha256Digest::from_bytes([0xb0 + marker; 32]);
+            });
+            decode_canonical_head(&bytes).expect("filler head decodes");
+        }
+        assert!(
+            decode_cache().lock().expect("cache").len() <= DECODE_CACHE_CAPACITY,
+            "the decode cache must never exceed its documented capacity"
+        );
+
+        assert!(decode_canonical_head(b"{}").is_err());
+        assert!(decode_canonical_head(b"not json").is_err());
     }
 
     /// D4. The canonical head must bind the projected columns exactly. Each
