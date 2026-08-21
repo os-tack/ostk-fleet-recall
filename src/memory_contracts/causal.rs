@@ -48,8 +48,14 @@
 //! conclusion can never carry a causal role; unreconciled opposing evidence
 //! blocks a `ratified` conclusion; and the ratifier can never be the
 //! proposing agent, the executor, or an author of the implicated change,
-//! except under a previously activated signed separation-of-duty policy that
-//! an agent ratifier can never invoke.
+//! except under a signed separation-of-duty policy that was *provably*
+//! activated before this record's own `closure_watermark` (an agent ratifier
+//! can never invoke it at all, and an exception dated at or after the
+//! ratification it excuses is retroactive self-authorization, not a prior
+//! exception, so it is rejected the same as a missing one); a `ratified`
+//! conclusion with a positive causal role and no bound intervention at all
+//! is rejected, distinctly from one whose bound intervention does not
+//! qualify.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use unicode_normalization::UnicodeNormalization;
@@ -145,28 +151,43 @@ pub const fn is_allowed_adjudication_transition(
 /// without mutating anything already folded. This never inspects or discards
 /// supporting/opposing evidence: it only projects state.
 ///
-/// Two identity checks apply per event, both CAUS-01: every folded record
+/// Three identity checks apply per event, all CAUS-01: every folded record
 /// must carry the exact same `hypothesis_fingerprint` as the first (a
 /// ratification authored for a different hypothesis can never flip this
 /// one's adjudication state — `project_adjudication_state` does not resolve
 /// a hypothesis from a digest itself, so this is the only identity binding
-/// available at this pure layer), and a `superseded` record's `supersedes`
-/// digest must equal exactly the digest of the immediately preceding folded
-/// record (never an arbitrary or absent prior digest — `validate_shape`
-/// only checks presence, not the value).
+/// available at this pure layer), every folded record must also carry the
+/// exact same authenticated `scope` as the first (a record's
+/// `hypothesis_fingerprint` alone can never be produced by a foreign scope —
+/// `CausalHypothesisV1::fingerprint` covers `scope` too — but that fact is
+/// only useful if the fold checks the record's *own* `scope` field itself,
+/// since this pure layer never resolves a hypothesis to compare against),
+/// and a `superseded` record's `supersedes` digest must equal exactly the
+/// digest of the immediately preceding folded record (never an arbitrary or
+/// absent prior digest — `validate_shape` only checks presence, not the
+/// value).
 pub fn project_adjudication_state(
     events: &[CausalRatificationV1],
 ) -> ContractResult<AdjudicationState> {
     let mut current = AdjudicationState::Open;
-    let mut fingerprint: Option<Sha256Digest> = None;
+    let mut identity: Option<(Sha256Digest, &AuthenticatedProjectScopeV1)> = None;
     let mut previous: Option<&CausalRatificationV1> = None;
     for event in events {
         event.validate_shape()?;
-        match fingerprint {
-            None => fingerprint = Some(event.hypothesis_fingerprint),
-            Some(expected) if expected != event.hypothesis_fingerprint => {
+        match identity {
+            None => identity = Some((event.hypothesis_fingerprint, &event.scope)),
+            Some((expected_fingerprint, _))
+                if expected_fingerprint != event.hypothesis_fingerprint =>
+            {
                 return Err(ContractError::Schema(
                     "adjudication fold mixes ratification records for different causal hypotheses"
+                        .into(),
+                ));
+            }
+            Some((_, expected_scope)) if *expected_scope != event.scope => {
+                return Err(ContractError::Schema(
+                    "adjudication fold mixes ratification records authenticated under different \
+                     tenant/project scopes"
                         .into(),
                 ));
             }
@@ -322,10 +343,22 @@ pub enum MaterialInputCategoryV1 {
 ///
 /// `Unobserved` is explicit rather than an absent field, so a
 /// gap in coverage cannot be silently read as "unchanged" (RUN-03, PRED-03).
+///
+/// Declared as the empty struct-variant form `Unobserved {}`, not the bare
+/// unit form `Unobserved`, even though both serialize to the identical wire
+/// bytes `{"state":"unobserved"}`: `#[serde(deny_unknown_fields)]` on an
+/// internally-tagged enum has no effect on a *unit* variant (serde routes it
+/// through a tag-only visitor that never checks for residual keys), so a
+/// bare `Unobserved` would silently accept `{"state":"unobserved","x":1}` as
+/// the identical decoded value. The empty-struct form goes through the
+/// normal field-checked struct visitor instead. See
+/// `unobserved_material_input_observation_rejects_unknown_field` and the
+/// identical fix already applied to `SequenceContinuityV1::Contiguous {}` in
+/// `coverage.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MaterialInputObservationV1 {
-    Unobserved,
+    Unobserved {},
     Unchanged {
         digest: Sha256Digest,
     },
@@ -360,7 +393,7 @@ impl MaterialInputObservationV1 {
     /// checking coverage must inspect this directly rather than treating an
     /// absent `Changed` as a negative result.
     const fn is_unobserved(&self) -> bool {
-        matches!(self, Self::Unobserved)
+        matches!(self, Self::Unobserved {})
     }
 }
 
@@ -472,10 +505,17 @@ impl CausalHypothesisV1 {
 /// `mechanistically_corroborated`: causal use requires a separately admitted
 /// verifier binding exact trace, workload, and revision identities to the
 /// proposed mechanism.
+///
+/// `ExemplarsOnly` is the empty struct-variant form `ExemplarsOnly {}`, not
+/// the bare unit form: `#[serde(deny_unknown_fields)]` on an
+/// internally-tagged enum does not check unknown keys on a *unit* variant
+/// (see [`MaterialInputObservationV1::Unobserved`]'s doc comment for why);
+/// the struct-variant form serializes to the identical `{"kind":
+/// "exemplars_only"}` bytes but goes through the field-checked visitor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CorroboratingEvidenceBasisV1 {
-    ExemplarsOnly,
+    ExemplarsOnly {},
     MechanisticVerifierBound(Box<MechanisticVerifierBoundV1>),
 }
 
@@ -512,8 +552,8 @@ pub fn maximum_support_without_intervention(
 ) -> ContractResult<SupportLevel> {
     basis.validate_shape()?;
     Ok(match (basis, scope_associated) {
-        (CorroboratingEvidenceBasisV1::ExemplarsOnly, false) => SupportLevel::Possible,
-        (CorroboratingEvidenceBasisV1::ExemplarsOnly, true) => SupportLevel::ScopeAssociated,
+        (CorroboratingEvidenceBasisV1::ExemplarsOnly {}, false) => SupportLevel::Possible,
+        (CorroboratingEvidenceBasisV1::ExemplarsOnly {}, true) => SupportLevel::ScopeAssociated,
         (CorroboratingEvidenceBasisV1::MechanisticVerifierBound(_), _) => {
             SupportLevel::MechanisticallyCorroborated
         }
@@ -606,11 +646,20 @@ impl VerifiedOutcomeV1 {
 /// `MultipleInputsInseparable` always blocks `intervention_supported`
 /// (lines 1418-1476): recovery correlating with several simultaneous changes
 /// never proves which one mattered.
+///
+/// `SingleInputChanged` and `MultipleInputsInseparable` are the empty
+/// struct-variant form (`SingleInputChanged {}`), not the bare unit form:
+/// `#[serde(deny_unknown_fields)]` on an internally-tagged enum does not
+/// check unknown keys on a *unit* variant (see
+/// [`MaterialInputObservationV1::Unobserved`]'s doc comment for why); the
+/// struct-variant form serializes to the identical
+/// `{"kind":"single_input_changed"}` / `{"kind":"multiple_inputs_inseparable"}`
+/// bytes but goes through the field-checked visitor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MaterialInputSeparationV1 {
-    SingleInputChanged,
-    MultipleInputsInseparable,
+    SingleInputChanged {},
+    MultipleInputsInseparable {},
     MultipleInputsIsolated { isolation_receipt: AcceptedEventId },
 }
 
@@ -780,8 +829,8 @@ impl InterventionSupportV1 {
             // that declares `single_input_changed` while its own inventory
             // shows zero changed inputs is internally inconsistent and must
             // be rejected at the shape level, not silently accepted.
-            MaterialInputSeparationV1::SingleInputChanged => changed == 1,
-            MaterialInputSeparationV1::MultipleInputsInseparable
+            MaterialInputSeparationV1::SingleInputChanged {} => changed == 1,
+            MaterialInputSeparationV1::MultipleInputsInseparable {}
             | MaterialInputSeparationV1::MultipleInputsIsolated { .. } => changed >= 2,
         };
         if self.schema_version != CAUSAL_SCHEMA_VERSION
@@ -923,7 +972,7 @@ pub fn derive_intervention_support_level(
     }
     if matches!(
         intervention.material_input_separation,
-        MaterialInputSeparationV1::MultipleInputsInseparable
+        MaterialInputSeparationV1::MultipleInputsInseparable {}
     ) {
         reasons.push(InterventionUnreachableReasonV1::MaterialInputsChangedInseparably);
     }
@@ -1106,10 +1155,24 @@ impl SeparationOfDutyResultV1 {
 ///
 /// The ratifier passes outright
 /// when distinct from every named role. When not distinct, only a
-/// [`RatifierIdentityV1::HumanPrincipal`] citing a previously activated
+/// [`RatifierIdentityV1::HumanPrincipal`] citing a *previously* activated
 /// [`SignedSeparationOfDutyExceptionV1`] can still pass; an agent ratifier
-/// can never use the exception, and a missing exception never passes.
-pub fn evaluate_separation_of_duty(result: &SeparationOfDutyResultV1) -> ContractResult<bool> {
+/// can never use the exception, a missing exception never passes, and an
+/// exception is honored only when its
+/// [`SignedSeparationOfDutyExceptionV1::activated_at`] strictly precedes
+/// `closure_watermark` — the exact instant [`CausalRatificationV1`] records
+/// as this record's own closure. "Previously activated" is a claim about
+/// *when relative to this ratification*, not merely that the field is
+/// present: an exception dated after the ratification it excuses would be
+/// retroactive self-authorization, which is the one thing AUTH-03's
+/// human-only carve-out must never become. Equal instants do not count as
+/// "before" (matching [`PreRecordedMechanismV1::recorded_before`]'s
+/// treatment of equal instants) — a policy cannot activate at the exact
+/// moment it excuses.
+pub fn evaluate_separation_of_duty(
+    result: &SeparationOfDutyResultV1,
+    closure_watermark: &CanonicalTimestamp,
+) -> ContractResult<bool> {
     result.validate_shape()?;
     let ratifier_id = result.ratifier.principal_id();
     let distinct = *ratifier_id != result.proposer_principal_id
@@ -1128,7 +1191,7 @@ pub fn evaluate_separation_of_duty(result: &SeparationOfDutyResultV1) -> Contrac
         RatifierIdentityV1::HumanPrincipal { .. } => match &result.exception {
             Some(exception) => {
                 exception.policy_reference.validate()?;
-                Ok(true)
+                Ok(exception.activated_at < *closure_watermark)
             }
             None => Ok(false),
         },
@@ -1477,7 +1540,10 @@ pub fn evaluate_ratification(
         }
     }
 
-    if !evaluate_separation_of_duty(&ratification.separation_of_duty)? {
+    if !evaluate_separation_of_duty(
+        &ratification.separation_of_duty,
+        &ratification.closure_watermark,
+    )? {
         reasons.push(RatificationBlockedReasonV1::SeparationOfDutyFailed);
     }
 
@@ -1629,7 +1695,7 @@ mod tests {
             },
             provenance_to_exposed_cohort: vec![event(0x01), event(0x02)],
             material_input_deltas: hypothesis.material_input_deltas.clone(),
-            material_input_separation: MaterialInputSeparationV1::SingleInputChanged,
+            material_input_separation: MaterialInputSeparationV1::SingleInputChanged {},
             mechanism: hypothesis.mechanism.clone(),
             intervention: AuthorizedInterventionV1 {
                 kind: InterventionKindV1::AuthorizedRollback,
@@ -1764,21 +1830,79 @@ mod tests {
         );
     }
 
+    /// The fingerprint conjunct must be the *sole possible rejection*: the
+    /// two folded records here differ ONLY in `hypothesis_fingerprint` (via
+    /// a different `cause` identity), their conclusions form an otherwise
+    /// legal transition (`open -> refuted -> superseded`), and the second
+    /// record's `supersedes` correctly cites the immediate predecessor's own
+    /// digest. Before this test existed, the only committed reproduction
+    /// used two `Ratified` records, which `is_allowed_adjudication_transition`
+    /// already rejects on its own (`Ratified -> Ratified` is not a legal
+    /// transition) — so the fingerprint check at the heart of this function
+    /// was never actually exercised, and mutating `expected_fingerprint !=
+    /// event.hypothesis_fingerprint` to `false` left the entire suite green.
     #[test]
     fn project_adjudication_state_rejects_a_fold_mixing_two_hypotheses() {
-        // Two ratification records that differ only in which hypothesis they
-        // were authored for (different `cause` identity, so a different
-        // `hypothesis_fingerprint`) must never be folded together: a record
-        // authored for hypothesis B must not be able to flip hypothesis A's
-        // projected adjudication state.
         let hyp_a = hypothesis();
         let mut hyp_b = hypothesis();
         hyp_b.cause = uri("deployment", 0xbb);
         assert_ne!(hyp_a.fingerprint().unwrap(), hyp_b.fingerprint().unwrap());
 
-        let ratified_a = base_ratification(&hyp_a);
-        let ratified_b = base_ratification(&hyp_b);
-        assert!(project_adjudication_state(&[ratified_a, ratified_b]).is_err());
+        let mut refuted_a = base_ratification(&hyp_a);
+        refuted_a.conclusion = CausalConclusionV1::Refuted;
+        refuted_a.causal_role = None;
+        refuted_a.achieved_support = SupportLevel::MechanisticallyCorroborated;
+
+        let mut superseded_b = base_ratification(&hyp_b);
+        superseded_b.conclusion = CausalConclusionV1::Superseded;
+        superseded_b.causal_role = None;
+        // Correctly cites the immediate predecessor's real digest — the
+        // supersedes-lineage check alone must not be why this is rejected.
+        superseded_b.supersedes = Some(refuted_a.digest().unwrap());
+
+        // `Refuted -> Superseded` is a legal transition
+        // (`is_allowed_adjudication_transition`), so if this is rejected it
+        // can only be the fingerprint mismatch.
+        assert!(is_allowed_adjudication_transition(
+            AdjudicationState::Refuted,
+            AdjudicationState::Superseded
+        ));
+        assert!(project_adjudication_state(&[refuted_a, superseded_b]).is_err());
+    }
+
+    /// Blocker 4: the fold must also fail closed when two records share one
+    /// `hypothesis_fingerprint` but were authenticated under different
+    /// `scope`s. `CausalHypothesisV1::fingerprint` covers `scope`, so a
+    /// record can never truthfully carry hypothesis A's fingerprint while
+    /// authenticated under a foreign scope — but that fact only protects the
+    /// fold if the fold itself checks the record's own `scope` field,
+    /// because this pure layer never resolves a hypothesis to compare
+    /// against. The two records below differ ONLY in `scope`: same
+    /// fingerprint, a legal transition, and a correct supersedes citation,
+    /// so the scope conjunct is the sole possible rejection.
+    #[test]
+    fn project_adjudication_state_rejects_a_fold_mixing_two_scopes() {
+        let hyp = hypothesis();
+        let mut refuted = base_ratification(&hyp);
+        refuted.conclusion = CausalConclusionV1::Refuted;
+        refuted.causal_role = None;
+        refuted.achieved_support = SupportLevel::MechanisticallyCorroborated;
+
+        let mut superseded_foreign_scope = base_ratification(&hyp);
+        superseded_foreign_scope.conclusion = CausalConclusionV1::Superseded;
+        superseded_foreign_scope.causal_role = None;
+        superseded_foreign_scope.scope = AuthenticatedProjectScopeV1::from_trusted_context(
+            ContractId::new("tenant.attacker").unwrap(),
+            ContractId::new("project.attacker").unwrap(),
+        );
+        superseded_foreign_scope.supersedes = Some(refuted.digest().unwrap());
+
+        assert_eq!(
+            refuted.hypothesis_fingerprint,
+            superseded_foreign_scope.hypothesis_fingerprint
+        );
+        assert_ne!(refuted.scope, superseded_foreign_scope.scope);
+        assert!(project_adjudication_state(&[refuted, superseded_foreign_scope]).is_err());
     }
 
     #[test]
@@ -1830,7 +1954,30 @@ mod tests {
         assert!(MechanismNarrativeTextV1::parse("").is_err());
         assert!(MechanismNarrativeTextV1::parse("has\ttab").is_err());
         assert!(MechanismNarrativeTextV1::parse("has\nnewline").is_err());
-        assert!(MechanismNarrativeTextV1::parse("ok narrative").is_ok());
+        // Decomposed ("NFD") "café" is not equal to its own NFC
+        // normalization, so it must be rejected even though it has no
+        // control characters and is well within the length limit — despite
+        // this test's name, nothing here actually exercised non-NFC text
+        // before this assertion (a full-file mutation sweep found `||` ->
+        // `&&` on this exact clause survived: with no non-NFC assertion,
+        // only the length-and-non-NFC conjunction mattered, never the
+        // non-NFC check alone).
+        assert!(MechanismNarrativeTextV1::parse("cafe\u{0301}").is_err());
+        let parsed = MechanismNarrativeTextV1::parse("ok narrative").unwrap();
+        assert_eq!(parsed.as_str(), "ok narrative");
+    }
+
+    /// A full-file mutation sweep found `value.len() > MAX_..._BYTES` at
+    /// `MechanismNarrativeTextV1::parse` had no test exercising its
+    /// boundary at all (`>` -> `==` and `>` -> `>=` both survived): a
+    /// narrative of exactly the maximum length must be accepted, and one
+    /// byte over must be rejected.
+    #[test]
+    fn mechanism_narrative_length_boundary_is_inclusive_of_the_maximum() {
+        let at_limit = "a".repeat(MAX_MECHANISM_NARRATIVE_BYTES);
+        let over_limit = "a".repeat(MAX_MECHANISM_NARRATIVE_BYTES + 1);
+        assert!(MechanismNarrativeTextV1::parse(at_limit).is_ok());
+        assert!(MechanismNarrativeTextV1::parse(over_limit).is_err());
     }
 
     // -- maximum_support_without_intervention --------------------------------
@@ -1838,7 +1985,7 @@ mod tests {
     #[test]
     fn exemplars_only_never_reaches_mechanistic_corroboration() {
         let exemplar_scope_associated = maximum_support_without_intervention(
-            &CorroboratingEvidenceBasisV1::ExemplarsOnly,
+            &CorroboratingEvidenceBasisV1::ExemplarsOnly {},
             true,
         )
         .unwrap();
@@ -1846,7 +1993,7 @@ mod tests {
         assert!(exemplar_scope_associated < SupportLevel::MechanisticallyCorroborated);
 
         let exemplar_bare = maximum_support_without_intervention(
-            &CorroboratingEvidenceBasisV1::ExemplarsOnly,
+            &CorroboratingEvidenceBasisV1::ExemplarsOnly {},
             false,
         )
         .unwrap();
@@ -1962,7 +2109,8 @@ mod tests {
             },
         ];
         let mut confounded = base_intervention(&confounded_hypothesis);
-        confounded.material_input_separation = MaterialInputSeparationV1::MultipleInputsInseparable;
+        confounded.material_input_separation =
+            MaterialInputSeparationV1::MultipleInputsInseparable {};
         assert_eq!(
             derive_intervention_support_level(&confounded_hypothesis, &confounded).unwrap(),
             Err(vec![
@@ -1990,13 +2138,19 @@ mod tests {
 
     // -- evaluate_separation_of_duty ------------------------------------------
 
+    /// A `closure_watermark` used by tests that do not themselves exercise
+    /// the activation-ordering check (matches `base_ratification`'s value).
+    fn closure_watermark() -> CanonicalTimestamp {
+        ts("2026-08-15T13:00:00.000000000Z")
+    }
+
     #[test]
     fn separation_of_duty_rejects_author_of_change_as_ratifier() {
         let mut result = base_separation_of_duty();
         result.ratifier = RatifierIdentityV1::HumanPrincipal {
             principal_id: ContractId::new("principal.author-one").unwrap(),
         };
-        assert!(!evaluate_separation_of_duty(&result).unwrap());
+        assert!(!evaluate_separation_of_duty(&result, &closure_watermark()).unwrap());
     }
 
     #[test]
@@ -2013,7 +2167,7 @@ mod tests {
             },
             activated_at: ts("2026-08-15T09:00:00.000000000Z"),
         });
-        assert!(!evaluate_separation_of_duty(&result).unwrap());
+        assert!(!evaluate_separation_of_duty(&result, &closure_watermark()).unwrap());
     }
 
     #[test]
@@ -2022,7 +2176,7 @@ mod tests {
         result.ratifier = RatifierIdentityV1::HumanPrincipal {
             principal_id: ContractId::new("principal.executor").unwrap(),
         };
-        assert!(!evaluate_separation_of_duty(&result).unwrap());
+        assert!(!evaluate_separation_of_duty(&result, &closure_watermark()).unwrap());
 
         result.exception = Some(SignedSeparationOfDutyExceptionV1 {
             policy_reference: RegistryReferenceV1 {
@@ -2032,10 +2186,166 @@ mod tests {
             },
             activated_at: ts("2026-08-15T09:00:00.000000000Z"),
         });
-        assert!(evaluate_separation_of_duty(&result).unwrap());
+        assert!(evaluate_separation_of_duty(&result, &closure_watermark()).unwrap());
+    }
+
+    /// Blocker 5: an exception's `activated_at` must be *provably prior* to
+    /// the ratification's own `closure_watermark`, not merely present. This
+    /// is the exact reproduction from the adversarial review: an author of
+    /// the implicated change citing an exception "activated" a century after
+    /// the ratification it is meant to excuse — retroactive
+    /// self-authorization, which AUTH-03's human-only carve-out must never
+    /// admit.
+    #[test]
+    fn separation_of_duty_exception_activated_after_closure_watermark_is_rejected() {
+        let mut result = base_separation_of_duty();
+        result.ratifier = RatifierIdentityV1::HumanPrincipal {
+            principal_id: ContractId::new("principal.author-one").unwrap(),
+        };
+        result.exception = Some(SignedSeparationOfDutyExceptionV1 {
+            policy_reference: RegistryReferenceV1 {
+                entry_id: ContractId::new("policy.sod_exception").unwrap(),
+                version: 1,
+                entry_digest: digest(0xd1),
+            },
+            activated_at: ts("2126-08-15T09:00:00.000000000Z"),
+        });
+        assert!(!evaluate_separation_of_duty(&result, &closure_watermark()).unwrap());
+    }
+
+    /// Equal instants do not count as "before" — matching
+    /// `PreRecordedMechanismV1::recorded_before`'s strict treatment of an
+    /// equal timestamp.
+    #[test]
+    fn separation_of_duty_exception_activated_exactly_at_closure_watermark_is_rejected() {
+        let mut result = base_separation_of_duty();
+        result.ratifier = RatifierIdentityV1::HumanPrincipal {
+            principal_id: ContractId::new("principal.author-one").unwrap(),
+        };
+        let watermark = closure_watermark();
+        result.exception = Some(SignedSeparationOfDutyExceptionV1 {
+            policy_reference: RegistryReferenceV1 {
+                entry_id: ContractId::new("policy.sod_exception").unwrap(),
+                version: 1,
+                entry_digest: digest(0xd1),
+            },
+            activated_at: watermark.clone(),
+        });
+        assert!(!evaluate_separation_of_duty(&result, &watermark).unwrap());
+    }
+
+    /// End-to-end: the same retroactive-exception attack blocks the whole
+    /// ratification through `evaluate_ratification`, not merely the isolated
+    /// `evaluate_separation_of_duty` predicate.
+    #[test]
+    fn evaluate_ratification_rejects_retroactively_activated_separation_of_duty_exception() {
+        let hyp = hypothesis();
+        let mut ratification = base_ratification(&hyp);
+        ratification.separation_of_duty.ratifier = RatifierIdentityV1::HumanPrincipal {
+            principal_id: ContractId::new("principal.author-one").unwrap(),
+        };
+        ratification.separation_of_duty.exception = Some(SignedSeparationOfDutyExceptionV1 {
+            policy_reference: RegistryReferenceV1 {
+                entry_id: ContractId::new("policy.sod_exception").unwrap(),
+                version: 1,
+                entry_digest: digest(0xd1),
+            },
+            // A century after `ratification.closure_watermark`.
+            activated_at: ts("2126-08-15T09:00:00.000000000Z"),
+        });
+        assert_eq!(
+            evaluate_base_ratification(&ratification, &hyp).unwrap(),
+            Err(vec![RatificationBlockedReasonV1::SeparationOfDutyFailed])
+        );
     }
 
     // -- evaluate_ratification -------------------------------------------------
+
+    /// Blocker 2: a `ratified` conclusion with a positive causal role and
+    /// literally no bound intervention at all (`intervention: None`) must be
+    /// rejected — before this fix, the `None` arm of `evaluate_ratification`
+    /// had zero test coverage, and both of its conjuncts (`conclusion ==
+    /// Ratified`, `causal_role.is_some()`) survived mutation. Every other
+    /// check passes (bound hypothesis, non-empty supporting evidence, no
+    /// opposing evidence, separation of duty), so
+    /// `MissingInterventionBinding` must be the *only* reported reason.
+    #[test]
+    fn evaluate_ratification_rejects_ratified_positive_role_with_no_bound_intervention() {
+        let hyp = hypothesis();
+        let ratification = base_ratification(&hyp);
+        assert_eq!(
+            evaluate_ratification(&ratification, &hyp, None).unwrap(),
+            Err(vec![
+                RatificationBlockedReasonV1::MissingInterventionBinding
+            ])
+        );
+    }
+
+    /// A `ratified` conclusion with a positive causal role but no causal
+    /// role... i.e. a `refuted`/non-positive-role record must NOT be
+    /// blocked by `MissingInterventionBinding` even with no intervention
+    /// supplied: the conjunct is `conclusion == Ratified && causal_role.is_some()`,
+    /// not `conclusion == Ratified` alone.
+    #[test]
+    fn missing_intervention_binding_does_not_fire_for_non_ratified_conclusion() {
+        let hyp = hypothesis();
+        let mut ratification = base_ratification(&hyp);
+        ratification.conclusion = CausalConclusionV1::Refuted;
+        ratification.causal_role = None;
+        ratification.achieved_support = SupportLevel::MechanisticallyCorroborated;
+        let result = evaluate_ratification(&ratification, &hyp, None).unwrap();
+        assert!(result.is_ok(), "unexpected block set: {result:?}");
+    }
+
+    /// Mechanical mutation testing found the sibling test above does not
+    /// discriminate `&&` from `||` in the `None`-arm guard
+    /// (`conclusion == Ratified && causal_role.is_some()`): with
+    /// `causal_role: None`, both operators evaluate to `false` since the
+    /// second conjunct is already `false`. This test instead sets
+    /// `causal_role: Some(..)` on a NON-ratified conclusion — the first
+    /// conjunct is `false`, the second is `true`. Under the correct `&&`,
+    /// `MissingInterventionBinding` must not fire (only
+    /// `CausalRoleForbiddenForNonRatifiedConclusion`, from the later
+    /// conclusion-match block, should); under the `||` mutant it would
+    /// fire in addition, which mechanical mutation testing confirmed this
+    /// exact test catches (`1495:17: replace && with || in
+    /// evaluate_ratification` — MISSED before this test, CAUGHT after).
+    #[test]
+    fn missing_intervention_binding_guard_requires_ratified_conclusion_not_merely_a_causal_role() {
+        let hyp = hypothesis();
+        let mut ratification = base_ratification(&hyp);
+        ratification.conclusion = CausalConclusionV1::Refuted;
+        // causal_role stays `Some(..)` from `base_ratification`.
+        assert_eq!(
+            evaluate_ratification(&ratification, &hyp, None).unwrap(),
+            Err(vec![
+                RatificationBlockedReasonV1::CausalRoleForbiddenForNonRatifiedConclusion
+            ])
+        );
+    }
+
+    /// Blocker 2 (mismatch half): a `ratified`/positive-role record whose
+    /// cited `intervention_support_digest` does not match the digest of the
+    /// intervention actually supplied must be rejected with
+    /// `InterventionBindingMismatch`, not silently pass through to the
+    /// re-derivation check.
+    #[test]
+    fn evaluate_ratification_rejects_intervention_that_does_not_match_the_cited_digest() {
+        let hyp = hypothesis();
+        let ratification = base_ratification(&hyp);
+        let mut foreign_intervention = base_intervention(&hyp);
+        foreign_intervention.intervention.provider_receipt = event(0xf0);
+        assert_ne!(
+            ratification.intervention_support_digest,
+            Some(foreign_intervention.digest().unwrap())
+        );
+        assert_eq!(
+            evaluate_ratification(&ratification, &hyp, Some(&foreign_intervention)).unwrap(),
+            Err(vec![
+                RatificationBlockedReasonV1::InterventionBindingMismatch
+            ])
+        );
+    }
 
     #[test]
     fn positive_caused_by_cannot_ratify_below_intervention_support() {
@@ -2176,6 +2486,96 @@ mod tests {
         assert!(decoded.is_err());
     }
 
+    // -- unit-variant unknown-field smuggling (blocker 3) --------------------
+    //
+    // `#[serde(tag = "...", deny_unknown_fields)]` on an internally-tagged
+    // enum has NO effect on a *unit* variant: serde routes it through a
+    // tag-only visitor that never inspects residual keys, so
+    // `Unobserved`/`ExemplarsOnly`/`SingleInputChanged`/
+    // `MultipleInputsInseparable` used to accept — and silently drop — any
+    // extra JSON key smuggled alongside their tag. The fix promotes each to
+    // the empty struct-variant form (`Unobserved {}`, ...), which serializes
+    // to the identical wire bytes but goes through the field-checked struct
+    // visitor. These tests decode the mutated bytes directly rather than
+    // relying on a byte-frozen fixture, matching this module's existing
+    // `unknown_causal_role_is_rejected_at_decode` /
+    // `unknown_adjudication_state_is_rejected_at_decode` pattern.
+
+    #[test]
+    fn unobserved_material_input_observation_rejects_unknown_field() {
+        let mut value = serde_json::to_value(MaterialInputObservationV1::Unobserved {}).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("smuggled".into(), serde_json::json!("payload"));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(decode_strict::<MaterialInputObservationV1>(&bytes).is_err());
+    }
+
+    #[test]
+    fn exemplars_only_basis_rejects_unknown_field() {
+        let mut value =
+            serde_json::to_value(CorroboratingEvidenceBasisV1::ExemplarsOnly {}).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("smuggled".into(), serde_json::json!("payload"));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(decode_strict::<CorroboratingEvidenceBasisV1>(&bytes).is_err());
+    }
+
+    #[test]
+    fn material_input_separation_unit_variants_reject_unknown_field() {
+        for variant in [
+            MaterialInputSeparationV1::SingleInputChanged {},
+            MaterialInputSeparationV1::MultipleInputsInseparable {},
+        ] {
+            let mut value = serde_json::to_value(&variant).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("isolation_receipt".into(), serde_json::json!("urn:evil"));
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert!(
+                decode_strict::<MaterialInputSeparationV1>(&bytes).is_err(),
+                "variant {variant:?} must reject a smuggled field"
+            );
+        }
+    }
+
+    /// Closes the exact digest-collision path from the adversarial review:
+    /// before the unit-variant fix, `{"material_input_separation":
+    /// {"kind":"single_input_changed"}}` and `{"material_input_separation":
+    /// {"kind":"single_input_changed","isolation_receipt":"urn:evil"}}` were
+    /// two different byte strings that decoded to the identical
+    /// `InterventionSupportV1` and digested to the identical value — a party
+    /// pinning raw wire bytes and a party pinning the canonical digest would
+    /// disagree about what was admitted.
+    #[test]
+    fn smuggled_field_inside_material_input_separation_is_rejected_at_full_record_decode() {
+        let hyp = hypothesis();
+        let intervention = base_intervention(&hyp);
+        let clean_digest = intervention.digest().unwrap();
+
+        let mut value = serde_json::to_value(&intervention).unwrap();
+        value
+            .get_mut("material_input_separation")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("isolation_receipt".into(), serde_json::json!("urn:evil"));
+        let smuggled_bytes = serde_json::to_vec(&value).unwrap();
+
+        let decoded: ContractResult<InterventionSupportV1> = decode_strict(&smuggled_bytes);
+        assert!(
+            decoded.is_err(),
+            "a smuggled key inside material_input_separation must be rejected at decode, not \
+             silently collapsed to the clean record"
+        );
+        // Sanity: the clean record's own digest is unaffected by this test.
+        assert_eq!(intervention.digest().unwrap(), clean_digest);
+    }
+
     #[test]
     fn cause_equal_to_outcome_is_rejected() {
         let mut hyp = hypothesis();
@@ -2188,6 +2588,84 @@ mod tests {
         let mut hyp = hypothesis();
         hyp.material_input_deltas = vec![];
         assert!(hyp.validate_shape().is_err());
+    }
+
+    // -- duplicate (not merely misordered) canonical-set entries ------------
+    //
+    // PREFLIGHT item 10 / blocker 1(b): `strictly_sorted` and
+    // `strictly_sorted_by_component` both use `<`, which rejects both a
+    // misordered pair AND a duplicated (equal) adjacent pair. Before these
+    // tests, every existing assertion in the crate only ever exercised
+    // misordering, so a `<` -> `<=` mutation — which still rejects
+    // misordering but silently *admits* an exact duplicate — left the whole
+    // suite green on every one of these fields.
+
+    #[test]
+    fn strictly_sorted_rejects_duplicate_adjacent_elements() {
+        assert!(strictly_sorted(&[1, 2, 3]));
+        assert!(!strictly_sorted(&[1, 2, 2, 3]));
+    }
+
+    #[test]
+    fn duplicate_material_input_component_is_rejected() {
+        let mut hyp = hypothesis();
+        let dup = hyp.material_input_deltas[0].clone();
+        hyp.material_input_deltas = vec![dup.clone(), dup];
+        assert!(hyp.validate_shape().is_err());
+    }
+
+    #[test]
+    fn duplicate_entries_in_causal_ratification_canonical_sets_are_rejected() {
+        let hyp = hypothesis();
+
+        let mut evidence_bundle_dup = base_ratification(&hyp);
+        evidence_bundle_dup.evidence_bundle_digests = vec![digest(0xa1), digest(0xa1)];
+        assert!(evidence_bundle_dup.validate_shape().is_err());
+
+        let mut supporting_dup = base_ratification(&hyp);
+        supporting_dup.supporting_evidence = vec![event(0x91), event(0x91)];
+        assert!(supporting_dup.validate_shape().is_err());
+
+        let mut opposing_dup = base_ratification(&hyp);
+        let entry = OpposingEvidenceEntryV1 {
+            event: event(0x95),
+            reconciliation: None,
+        };
+        opposing_dup.opposing_evidence = vec![entry.clone(), entry];
+        assert!(opposing_dup.validate_shape().is_err());
+
+        let mut gaps_dup = base_ratification(&hyp);
+        let gap = ContractId::new("gap.coverage").unwrap();
+        gaps_dup.unresolved_required_gaps = vec![gap.clone(), gap];
+        assert!(gaps_dup.validate_shape().is_err());
+
+        let mut residual_dup = base_ratification(&hyp);
+        let unknown = ContractId::new("unknown.residual").unwrap();
+        residual_dup.residual_unknowns = vec![unknown.clone(), unknown];
+        assert!(residual_dup.validate_shape().is_err());
+    }
+
+    #[test]
+    fn duplicate_entries_in_intervention_support_canonical_sets_are_rejected() {
+        let hyp = hypothesis();
+
+        let mut provenance_dup = base_intervention(&hyp);
+        provenance_dup.provenance_to_exposed_cohort = vec![event(0x01), event(0x01)];
+        assert!(provenance_dup.validate_shape().is_err());
+
+        let mut mixed_receipts_dup = base_intervention(&hyp);
+        mixed_receipts_dup.cohort_comparison = CohortComparisonV1::Mixed {
+            receipts: vec![event(0x81), event(0x81)],
+        };
+        assert!(mixed_receipts_dup.validate_shape().is_err());
+    }
+
+    #[test]
+    fn duplicate_implicated_change_author_is_rejected() {
+        let mut result = base_separation_of_duty();
+        let author = ContractId::new("principal.author-one").unwrap();
+        result.implicated_change_author_principal_ids = vec![author.clone(), author];
+        assert!(result.validate_shape().is_err());
     }
 
     #[test]
@@ -2770,7 +3248,7 @@ mod tests {
             decode_and_prove_canonical(NEGATIVE_INTERVENTION_SINGLE_INPUT_CHANGED_ZERO_FIXTURE);
         assert_eq!(
             intervention.material_input_separation,
-            MaterialInputSeparationV1::SingleInputChanged
+            MaterialInputSeparationV1::SingleInputChanged {}
         );
         assert!(intervention.validate_shape().is_err());
     }
