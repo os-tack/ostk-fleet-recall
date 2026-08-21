@@ -36,14 +36,20 @@
 //! [`evaluate_ratification`] is the pure v1 ratification policy (CAUS-01,
 //! AUTH-03, ACT-04): it requires the exact [`CausalHypothesisV1`] (and, when
 //! claimed, the exact [`InterventionSupportV1`]) the record binds to, both
-//! checked for scope and identity equality; no positive `caused_by`
-//! conclusion is admissible below `intervention_supported`; `primary_trigger`
-//! additionally requires an independent second confirmation; a `refuted` or
-//! `superseded` conclusion can never carry a causal role; unreconciled
-//! opposing evidence blocks a `ratified` conclusion; and the ratifier can
-//! never be the proposing agent, the executor, or an author of the
-//! implicated change, except under a previously activated signed
-//! separation-of-duty policy that an agent ratifier can never invoke.
+//! checked for scope and identity equality; for a `ratified` conclusion with
+//! a positive causal role it re-derives the bound intervention's support
+//! level with [`derive_intervention_support_level`] rather than trusting the
+//! record's own `achieved_support` field, so a disqualified intervention
+//! (partial coverage, an ambiguous execution outcome, wrong scope, an
+//! unbound hypothesis, ...) can never be cited to reach
+//! `intervention_supported`; no positive `caused_by` conclusion is
+//! admissible below `intervention_supported`; `primary_trigger` additionally
+//! requires an independent second confirmation; a `refuted` or `superseded`
+//! conclusion can never carry a causal role; unreconciled opposing evidence
+//! blocks a `ratified` conclusion; and the ratifier can never be the
+//! proposing agent, the executor, or an author of the implicated change,
+//! except under a previously activated signed separation-of-duty policy that
+//! an agent ratifier can never invoke.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use unicode_normalization::UnicodeNormalization;
@@ -138,12 +144,45 @@ pub const fn is_allowed_adjudication_transition(
 /// example `ratified -> refuted`, or reopening `superseded`) fails closed
 /// without mutating anything already folded. This never inspects or discards
 /// supporting/opposing evidence: it only projects state.
+///
+/// Two identity checks apply per event, both CAUS-01: every folded record
+/// must carry the exact same `hypothesis_fingerprint` as the first (a
+/// ratification authored for a different hypothesis can never flip this
+/// one's adjudication state — `project_adjudication_state` does not resolve
+/// a hypothesis from a digest itself, so this is the only identity binding
+/// available at this pure layer), and a `superseded` record's `supersedes`
+/// digest must equal exactly the digest of the immediately preceding folded
+/// record (never an arbitrary or absent prior digest — `validate_shape`
+/// only checks presence, not the value).
 pub fn project_adjudication_state(
     events: &[CausalRatificationV1],
 ) -> ContractResult<AdjudicationState> {
     let mut current = AdjudicationState::Open;
+    let mut fingerprint: Option<Sha256Digest> = None;
+    let mut previous: Option<&CausalRatificationV1> = None;
     for event in events {
         event.validate_shape()?;
+        match fingerprint {
+            None => fingerprint = Some(event.hypothesis_fingerprint),
+            Some(expected) if expected != event.hypothesis_fingerprint => {
+                return Err(ContractError::Schema(
+                    "adjudication fold mixes ratification records for different causal hypotheses"
+                        .into(),
+                ));
+            }
+            Some(_) => {}
+        }
+        if event.conclusion == CausalConclusionV1::Superseded {
+            let immediate_predecessor_digest =
+                previous.map(CausalRatificationV1::digest).transpose()?;
+            if event.supersedes != immediate_predecessor_digest {
+                return Err(ContractError::Schema(
+                    "a superseded conclusion must cite the digest of the immediately preceding \
+                     folded ratification record"
+                        .into(),
+                ));
+            }
+        }
         let next = event.conclusion.as_adjudication_state();
         if !is_allowed_adjudication_transition(current, next) {
             return Err(ContractError::Schema(
@@ -151,6 +190,7 @@ pub fn project_adjudication_state(
             ));
         }
         current = next;
+        previous = Some(event);
     }
     Ok(current)
 }
@@ -1201,6 +1241,9 @@ impl CausalRatificationV1 {
             || self
                 .intervention_support_digest
                 .is_some_and(|digest| digest == Sha256Digest::ZERO)
+            || self
+                .supersedes
+                .is_some_and(|digest| digest == Sha256Digest::ZERO)
             || self.evidence_bundle_digests.is_empty()
             || self.evidence_bundle_digests.len() > MAX_EVIDENCE_BUNDLE_DIGESTS
             || !strictly_sorted(&self.evidence_bundle_digests)
@@ -1299,6 +1342,16 @@ pub enum RatificationBlockedReasonV1 {
     /// scope or a digest that does not match
     /// [`CausalRatificationV1::binds_intervention`].
     InterventionBindingMismatch,
+    /// The bound intervention (see [`CausalRatificationV1::binds_intervention`])
+    /// does not itself reach `intervention_supported` under
+    /// [`derive_intervention_support_level`] — for example partial coverage,
+    /// an ambiguous execution outcome, or an intervention that does not
+    /// actually bind the hypothesis's identities/mechanism. `binds_intervention`
+    /// only proves the ratification cites the exact record it claims to; it
+    /// says nothing about whether that record qualifies. `achieved_support`
+    /// on [`CausalRatificationV1`] is a self-asserted field and is never
+    /// trusted on its own for this check.
+    BoundInterventionDoesNotReachInterventionSupported,
     CausalRoleRequiredForRatifiedConclusion,
     CausalRoleForbiddenForNonRatifiedConclusion,
     PositiveCauseBelowInterventionSupport,
@@ -1321,14 +1374,18 @@ pub enum RatificationBlockedReasonV1 {
 /// record must bind to the exact `hypothesis` supplied (and, when supplied,
 /// the exact `intervention`) — see
 /// [`CausalRatificationV1::binds_hypothesis`]/[`CausalRatificationV1::binds_intervention`].
-/// A `ratified` conclusion requires a causal role, `achieved_support ==
-/// intervention_supported` backed by a bound intervention record, non-empty
-/// supporting evidence, every cited opposing-evidence item reconciled, and —
-/// for `primary_trigger` — an independent second confirmation. A `refuted`
-/// or `superseded` conclusion may not carry a causal role. A `superseded`
-/// conclusion must cite what it supersedes (checked by
-/// [`CausalRatificationV1::validate_shape`]). Every conclusion requires the
-/// separation-of-duty result to pass.
+/// A `ratified` conclusion with a positive causal role requires the bound
+/// intervention to itself re-derive to
+/// `SupportLevel::InterventionSupported` under
+/// [`derive_intervention_support_level`] — `achieved_support` on the record
+/// is self-asserted and is never trusted on its own; this function proves it
+/// rather than believing it. A `ratified` conclusion also requires a causal
+/// role, non-empty supporting evidence, every cited opposing-evidence item
+/// reconciled, and — for `primary_trigger` — an independent second
+/// confirmation. A `refuted` or `superseded` conclusion may not carry a
+/// causal role. A `superseded` conclusion must cite what it supersedes
+/// (checked by [`CausalRatificationV1::validate_shape`]). Every conclusion
+/// requires the separation-of-duty result to pass.
 pub fn evaluate_ratification(
     ratification: &CausalRatificationV1,
     hypothesis: &CausalHypothesisV1,
@@ -1348,6 +1405,26 @@ pub fn evaluate_ratification(
         Some(intervention) => {
             if !ratification.binds_intervention(intervention)? {
                 reasons.push(RatificationBlockedReasonV1::InterventionBindingMismatch);
+            } else if ratification.conclusion == CausalConclusionV1::Ratified
+                && ratification.causal_role.is_some()
+                && !matches!(
+                    derive_intervention_support_level(hypothesis, intervention)?,
+                    Ok(SupportLevel::InterventionSupported)
+                )
+            {
+                // `binds_intervention` only proves this ratification cites
+                // the exact InterventionSupportV1 record it claims to (right
+                // scope, right digest). It proves nothing about whether that
+                // record actually qualifies — `achieved_support` on the
+                // ratification is self-asserted and must never be trusted on
+                // its own. Re-derive the support level from the bound
+                // intervention itself; this call also covers
+                // `intervention.binds_hypothesis(hypothesis)` and the CAUS-01
+                // scope check (`ScopeMismatch`), so no separate check is
+                // needed here.
+                reasons.push(
+                    RatificationBlockedReasonV1::BoundInterventionDoesNotReachInterventionSupported,
+                );
             }
         }
         None => {
@@ -1687,6 +1764,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn project_adjudication_state_rejects_a_fold_mixing_two_hypotheses() {
+        // Two ratification records that differ only in which hypothesis they
+        // were authored for (different `cause` identity, so a different
+        // `hypothesis_fingerprint`) must never be folded together: a record
+        // authored for hypothesis B must not be able to flip hypothesis A's
+        // projected adjudication state.
+        let hyp_a = hypothesis();
+        let mut hyp_b = hypothesis();
+        hyp_b.cause = uri("deployment", 0xbb);
+        assert_ne!(hyp_a.fingerprint().unwrap(), hyp_b.fingerprint().unwrap());
+
+        let ratified_a = base_ratification(&hyp_a);
+        let ratified_b = base_ratification(&hyp_b);
+        assert!(project_adjudication_state(&[ratified_a, ratified_b]).is_err());
+    }
+
+    #[test]
+    fn project_adjudication_state_rejects_supersedes_citing_a_foreign_digest() {
+        let hyp = hypothesis();
+        let ratified = base_ratification(&hyp);
+        let mut superseded = base_ratification(&hyp);
+        superseded.conclusion = CausalConclusionV1::Superseded;
+        // Cites a real digest, but not the one belonging to the record it
+        // was actually folded after.
+        superseded.supersedes = Some(digest(0xde));
+        assert_ne!(superseded.supersedes, Some(ratified.digest().unwrap()));
+
+        assert!(project_adjudication_state(&[ratified, superseded]).is_err());
+    }
+
+    #[test]
+    fn project_adjudication_state_rejects_a_superseded_record_with_no_predecessor() {
+        // A `superseded` conclusion as the very first folded record can
+        // never cite a real predecessor, so it can never be admitted:
+        // `supersedes` would have to name the digest of a record that was
+        // never folded.
+        let hyp = hypothesis();
+        let mut superseded = base_ratification(&hyp);
+        superseded.conclusion = CausalConclusionV1::Superseded;
+        superseded.supersedes = Some(digest(0xde));
+        assert!(project_adjudication_state(std::slice::from_ref(&superseded)).is_err());
+    }
+
     // -- PreRecordedMechanismV1 ----------------------------------------------
 
     #[test]
@@ -2023,6 +2144,22 @@ mod tests {
         assert!(ratification.validate_shape().is_err());
     }
 
+    #[test]
+    fn supersedes_zero_digest_is_rejected_at_shape() {
+        // `hypothesis_fingerprint == ZERO`, `intervention_support_digest ==
+        // Some(ZERO)`, and any ZERO entry in `evidence_bundle_digests` are
+        // all rejected by validate_shape; `supersedes` gets the same
+        // treatment for consistency, even though `project_adjudication_state`
+        // separately rejects it (ZERO can never equal a real predecessor
+        // digest).
+        let hyp = hypothesis();
+        let mut ratification = base_ratification(&hyp);
+        ratification.conclusion = CausalConclusionV1::Superseded;
+        ratification.causal_role = None;
+        ratification.supersedes = Some(Sha256Digest::ZERO);
+        assert!(ratification.validate_shape().is_err());
+    }
+
     // -- unknown-role / shape negatives ----------------------------------------
 
     #[test]
@@ -2124,9 +2261,18 @@ mod tests {
         let ratification = base_ratification(&hyp_a);
         assert!(ratification.binds_hypothesis(&hyp_a).unwrap());
         assert!(!ratification.binds_hypothesis(&hyp_b).unwrap());
+        // Checked against hyp_b, this fails two independent ways: the
+        // ratification itself does not bind hyp_b (wrong fingerprint), and
+        // the intervention it cites — built for hyp_a — does not re-derive
+        // to `intervention_supported` against hyp_b either (it does not
+        // bind hyp_b's identities/mechanism). Both are reported; neither
+        // masks the other.
         assert_eq!(
             evaluate_ratification(&ratification, &hyp_b, Some(&base_intervention(&hyp_a))).unwrap(),
-            Err(vec![RatificationBlockedReasonV1::HypothesisBindingMismatch])
+            Err(vec![
+                RatificationBlockedReasonV1::HypothesisBindingMismatch,
+                RatificationBlockedReasonV1::BoundInterventionDoesNotReachInterventionSupported,
+            ])
         );
     }
 
@@ -2229,6 +2375,9 @@ mod tests {
     const NEGATIVE_RATIFICATION_BELOW_INTERVENTION_SUPPORT_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/causal/negative-ratification-below-intervention-support.jsonl"
     );
+    const NEGATIVE_RATIFICATION_DISQUALIFIED_INTERVENTION_FIXTURE: &[u8] = include_bytes!(
+        "../../contracts/dynamic-memory/v3/causal/negative-ratification-disqualified-intervention.jsonl"
+    );
     const NEGATIVE_PRIMARY_TRIGGER_SAME_RECEIPT_TWICE_FIXTURE: &[u8] = include_bytes!(
         "../../contracts/dynamic-memory/v3/causal/negative-primary-trigger-same-receipt-twice.jsonl"
     );
@@ -2304,6 +2453,8 @@ mod tests {
         "d2b767d9e5551b860bcdf7629972ccbce49add7fee96c8bfa7cb9c3be2503956";
     const NEGATIVE_RATIFICATION_BELOW_INTERVENTION_SUPPORT_RAW_SHA256: &str =
         "d3766a8061fd6853c1723e4d11f14248eef5f6792a79e98d66369257debc075c";
+    const NEGATIVE_RATIFICATION_DISQUALIFIED_INTERVENTION_RAW_SHA256: &str =
+        "d078f992a72d43a731b2e2f1bf12ef04ce53cf402fa07245aa047a385611592e";
     const NEGATIVE_RATIFICATION_SUPERSEDED_WITHOUT_DIGEST_RAW_SHA256: &str =
         "84d122708bd1b3df0b0e05d0ae1f0ab1e251f843dbce360f29b598539f591b56";
     const NEGATIVE_RATIFICATION_UNRESOLVED_GAPS_RAW_SHA256: &str =
@@ -2321,7 +2472,7 @@ mod tests {
     const NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_RAW_SHA256: &str =
         "380517f6442fba898b3e53a72a3131a795faad1c89285895f42e268d2af6d8c4";
     const VECTOR_SUITE_RAW_SHA256: &str =
-        "8502a62f16d824f5988272e57cd3df4e19dce1b97222dd0c8232236f0c79bc45";
+        "3372b58f86fdb8e22bb490730cf03027b8564419f4709b9b07b4a3373eb5991b";
 
     const CAUSAL_HYPOTHESIS_FINGERPRINT: &str =
         "76b41ed32639adbe1291dd3aca9ae24c51f21ae570014b8119cfc0ce719f3dad";
@@ -2420,6 +2571,10 @@ mod tests {
             (
                 NEGATIVE_RATIFICATION_BELOW_INTERVENTION_SUPPORT_FIXTURE,
                 NEGATIVE_RATIFICATION_BELOW_INTERVENTION_SUPPORT_RAW_SHA256,
+            ),
+            (
+                NEGATIVE_RATIFICATION_DISQUALIFIED_INTERVENTION_FIXTURE,
+                NEGATIVE_RATIFICATION_DISQUALIFIED_INTERVENTION_RAW_SHA256,
             ),
             (
                 NEGATIVE_PRIMARY_TRIGGER_SAME_RECEIPT_TWICE_FIXTURE,
@@ -2814,6 +2969,10 @@ mod tests {
                 NEGATIVE_RATIFICATION_BELOW_INTERVENTION_SUPPORT_RAW_SHA256,
             ),
             (
+                "negative-ratification-disqualified-intervention",
+                NEGATIVE_RATIFICATION_DISQUALIFIED_INTERVENTION_RAW_SHA256,
+            ),
+            (
                 "negative-ratification-empty-supporting-evidence",
                 NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_RAW_SHA256,
             ),
@@ -2839,5 +2998,92 @@ mod tests {
             assert_eq!(entry.name.as_str(), *name);
             assert_eq!(entry.raw_sha256.to_hex(), *raw_sha256);
         }
+    }
+
+    /// Blocker 1: `achieved_support` on a `CausalRatificationV1` is
+    /// self-asserted and must never be trusted on its own. This fixture's
+    /// record claims `achieved_support: intervention_supported`, but the
+    /// `InterventionSupportV1` it cites (`negative-coverage-partial.jsonl`,
+    /// the cheapest disqualifying mutation — `coverage.completeness:
+    /// partial`) does not itself re-derive to `intervention_supported`.
+    /// `evaluate_ratification` must catch this even though `binds_intervention`
+    /// (digest + scope match) is satisfied.
+    #[test]
+    fn disqualified_bound_intervention_blocks_ratification_despite_self_asserted_support() {
+        let hyp: CausalHypothesisV1 = decode_and_prove_canonical(CAUSAL_HYPOTHESIS_FIXTURE);
+        let disqualified_intervention: InterventionSupportV1 =
+            decode_and_prove_canonical(include_bytes!(
+                "../../contracts/dynamic-memory/v3/causal/negative-coverage-partial.jsonl"
+            ));
+        let ratification: CausalRatificationV1 =
+            decode_and_prove_canonical(NEGATIVE_RATIFICATION_DISQUALIFIED_INTERVENTION_FIXTURE);
+
+        // The record cites exactly this intervention (digest + scope match);
+        // the flaw is that the cited intervention does not qualify, not that
+        // the citation is wrong.
+        assert!(
+            ratification
+                .binds_intervention(&disqualified_intervention)
+                .unwrap()
+        );
+        assert_eq!(
+            ratification.achieved_support,
+            SupportLevel::InterventionSupported
+        );
+        assert!(matches!(
+            derive_intervention_support_level(&hyp, &disqualified_intervention).unwrap(),
+            Err(reasons) if reasons == vec![InterventionUnreachableReasonV1::IncompleteOrStaleCoverage]
+        ));
+
+        assert_eq!(
+            evaluate_ratification(&ratification, &hyp, Some(&disqualified_intervention)).unwrap(),
+            Err(vec![
+                RatificationBlockedReasonV1::BoundInterventionDoesNotReachInterventionSupported
+            ])
+        );
+    }
+
+    /// Mutation coverage for the `ratification.conclusion ==
+    /// CausalConclusionV1::Ratified` conjunct guarding the re-derivation
+    /// branch in `evaluate_ratification`. Same disqualified-but-correctly-
+    /// bound intervention as the fixture test above (so `binds_intervention`
+    /// passes and the `else if` branch is actually reachable), but
+    /// `conclusion` is `superseded` with a (structurally permitted at this
+    /// point, forbidden by the later conclusion match) leftover positive
+    /// `causal_role`. The only admissible reason is
+    /// `CausalRoleForbiddenForNonRatifiedConclusion`; flipping the `==` to
+    /// `!=` (or deleting the conjunct) would additionally surface
+    /// `BoundInterventionDoesNotReachInterventionSupported` here, since the
+    /// disqualified intervention never derives to `intervention_supported`
+    /// regardless of `conclusion`. This test fails on that mutant.
+    #[test]
+    fn superseded_conclusion_skips_the_intervention_rederivation_branch() {
+        let hyp = hypothesis();
+        let disqualified_intervention: InterventionSupportV1 =
+            decode_and_prove_canonical(include_bytes!(
+                "../../contracts/dynamic-memory/v3/causal/negative-coverage-partial.jsonl"
+            ));
+        let mut ratification = base_ratification(&hyp);
+        ratification.conclusion = CausalConclusionV1::Superseded;
+        ratification.supersedes = Some(digest(0xde));
+        ratification.intervention_support_digest =
+            Some(disqualified_intervention.digest().unwrap());
+        // causal_role is left `Some(ContributingCause)` from base_ratification:
+        // structurally permitted at the point evaluate_ratification checks
+        // the intervention binding (that ordering is exactly what this test
+        // pins), forbidden only by the later match on `conclusion`.
+        assert!(ratification.causal_role.is_some());
+        assert!(
+            ratification
+                .binds_intervention(&disqualified_intervention)
+                .unwrap()
+        );
+
+        assert_eq!(
+            evaluate_ratification(&ratification, &hyp, Some(&disqualified_intervention)).unwrap(),
+            Err(vec![
+                RatificationBlockedReasonV1::CausalRoleForbiddenForNonRatifiedConclusion
+            ])
+        );
     }
 }

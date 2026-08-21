@@ -82,6 +82,18 @@ proving one specific failure mode fails closed:
   `evaluate_ratification` returns `PositiveCauseBelowInterventionSupport`.
   The v1 policy never ratifies a positive `caused_by` conclusion below
   `intervention_supported`.
+- `negative-ratification-disqualified-intervention.jsonl` — the exact
+  positive `causal-ratification-contributing-cause-v1.jsonl` record, except
+  its `intervention_support_digest` cites `negative-coverage-partial.jsonl`'s
+  intervention (the cheapest disqualifying mutation: `coverage.completeness:
+  partial`) instead of the qualifying one. `achieved_support` still
+  self-reports `intervention_supported`, and `binds_intervention` still
+  passes (the digest citation is correct). `evaluate_ratification` returns
+  `BoundInterventionDoesNotReachInterventionSupported`. Fixed post-review:
+  `achieved_support` is self-asserted and was previously never checked
+  against what the cited intervention actually derives to; see the note in
+  the "How digests are pinned" section's `hypothesis_fingerprint` entry
+  above.
 - `negative-primary-trigger-same-receipt-twice.jsonl` — `primary_trigger`
   with two confirmation lines citing the *same* `source_fact_id` under two
   different `failure_mode` labels; `evaluate_ratification` returns
@@ -183,7 +195,55 @@ fixture (`unbound_intervention_fails_the_hypothesis_binding_check`):
   `CausalHypothesisV1::fingerprint` (which covers every causal identity plus
   scope) by the new `CausalRatificationV1::binds_hypothesis`. A parallel
   `intervention_support_digest` + `binds_intervention` binds the record to
-  the exact `InterventionSupportV1` its `achieved_support` rests on.
+  the exact `InterventionSupportV1` its `achieved_support` claims to rest
+  on — but `binds_intervention` only proves the citation is correct (right
+  scope, right digest); it proves nothing about whether the cited record
+  itself qualifies. See `negative-ratification-disqualified-intervention.jsonl`
+  below for the check that closes that gap.
+- `disqualified_bound_intervention_blocks_ratification_despite_self_asserted_support`
+  (Rust-only vector, see `negative-ratification-disqualified-intervention.jsonl`
+  below) — a `ratified`/`contributing_cause` record whose `achieved_support`
+  self-reports `intervention_supported` and whose `intervention_support_digest`
+  correctly cites a real `InterventionSupportV1` (so `binds_intervention`
+  passes), but that cited intervention itself has `coverage.completeness:
+  partial` and so does not re-derive to `intervention_supported`. Fixed
+  post-review: `evaluate_ratification` used to trust `achieved_support` at
+  face value once the digest citation checked out; it now calls
+  `derive_intervention_support_level` on the bound intervention itself and
+  requires `Ok(SupportLevel::InterventionSupported)`, rejecting with
+  `BoundInterventionDoesNotReachInterventionSupported` otherwise. This call
+  also subsumes `intervention.binds_hypothesis(hypothesis)` and the CAUS-01
+  scope check, so a disqualified or wrongly-bound intervention can never be
+  cited to reach `intervention_supported` no matter what the record itself
+  claims.
+- `project_adjudication_state_rejects_a_fold_mixing_two_hypotheses` — two
+  ratification records for two different hypotheses (different `cause`
+  identity, so different `hypothesis_fingerprint`s), folded together. Fixed
+  post-review: `project_adjudication_state` used to fold any slice of
+  `CausalRatificationV1` without ever checking they named the same
+  hypothesis, so a record authored for hypothesis B could flip hypothesis
+  A's projected adjudication state. The fold now fails closed the first time
+  a folded record's `hypothesis_fingerprint` differs from the one already
+  seen.
+- `project_adjudication_state_rejects_supersedes_citing_a_foreign_digest` and
+  `project_adjudication_state_rejects_a_superseded_record_with_no_predecessor`
+  — a `superseded` record whose `supersedes` digest names something other
+  than the immediately preceding folded record (a real but unrelated digest,
+  or — for the no-predecessor case — any digest at all when there is no
+  predecessor to name). Fixed post-review: `validate_shape` requires
+  `supersedes` to be *present* for a `superseded` conclusion, but no code
+  path compared its *value* to anything — a superseded record could claim to
+  supersede an arbitrary or nonexistent prior digest. `project_adjudication_state`
+  now requires `event.supersedes == <digest of the immediately preceding
+  folded record>` (computed via `CausalRatificationV1::digest`) whenever a
+  folded record's conclusion is `superseded`.
+- `supersedes_zero_digest_is_rejected_at_shape` — `supersedes:
+  "0000...0000"` (`Sha256Digest::ZERO`). `validate_shape` already rejected a
+  `ZERO` `hypothesis_fingerprint`, a `ZERO` `intervention_support_digest`,
+  and any `ZERO` entry in `evidence_bundle_digests`; `supersedes` gets the
+  same treatment now, for consistency (a real digest can never be `ZERO`, so
+  this is also implied by the fold-level check above, but the shape check
+  fails closed one layer earlier).
 
 ## How digests are pinned
 
@@ -223,7 +283,14 @@ their derived digests differ from any value pinned before this fix.
 - **CAUS-01** — proximity is not causality. Every positive path here requires
   either a bound `InterventionSupportV1` or, below that tier, an explicitly
   named `CorroboratingEvidenceBasisV1`; nothing reaches
-  `intervention_supported` from timing alone.
+  `intervention_supported` from timing alone. The binding itself is
+  identity-checked, not merely digest-checked: `evaluate_ratification`
+  re-derives the bound intervention's support level with
+  `derive_intervention_support_level` rather than trusting the record's own
+  `achieved_support`, so an intervention with a correct citation but the
+  wrong scope, an unbound hypothesis, or disqualifying evidence (partial
+  coverage, an ambiguous execution outcome, ...) can never be cited to reach
+  `intervention_supported`.
 - **RUN-01** — telemetry is evidence, not causation. The pre-recorded
   mechanism plus `recorded_before` check is exactly this: an outcome is
   compared against a *pre-registered* expectation, not narrated afterward.
@@ -236,6 +303,11 @@ their derived digests differ from any value pinned before this fix.
   `refuted` *or* `superseded` conclusion carry a positive causal role, and
   `project_adjudication_state` never lets a later record erase what an
   earlier one established — only append a legal transition on top of it.
+  This append-only guarantee is also identity-checked: every folded record
+  must share the same `hypothesis_fingerprint` (a record for a different
+  hypothesis can never flip this one's projected state), and a `superseded`
+  record must cite the exact digest of the record it immediately follows
+  (an arbitrary or absent prior digest fails closed).
 
 ## Reproducing or breaking these vectors
 
@@ -254,6 +326,19 @@ their derived digests differ from any value pinned before this fix.
   independent merely because their `failure_mode` labels differ — the
   `negative-primary-trigger-same-receipt-twice.jsonl` vector exists exactly to
   catch that.
+- To break `evaluate_ratification`'s re-derivation of the bound
+  intervention's support level, you would need to go back to trusting
+  `achieved_support` at face value once `binds_intervention` passes — the
+  `negative-ratification-disqualified-intervention.jsonl` vector exists
+  exactly to catch that (a correct citation to a disqualified record).
+- To break `project_adjudication_state`'s identity binding, you would need to
+  stop comparing every folded record's `hypothesis_fingerprint` to the first
+  one seen — `project_adjudication_state_rejects_a_fold_mixing_two_hypotheses`
+  exists exactly to catch that — or to stop comparing a `superseded`
+  record's `supersedes` digest to the immediately preceding folded record's
+  own digest —
+  `project_adjudication_state_rejects_supersedes_citing_a_foreign_digest`
+  exists exactly to catch that.
 
 Changing any canonical record, any expected digest, or any DigestDomain
 prefix in this directory is a contract-version change.
