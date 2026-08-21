@@ -104,16 +104,29 @@
 //! inventing an invalid dead-letter shape — that condition is a stored-ledger
 //! tamper, not a connector delivery.
 
+mod admission;
 mod appendable;
 mod cockroach;
+mod content_store;
 mod error;
 mod repository;
 mod witness;
 
+pub use admission::{
+    ActiveStage4Package, AdmittedEvidenceStatementV2, ClockOrderKind, EvidenceAdmissionError,
+    EvidenceAdmissionRequestV1, EvidenceIngressLocatorsV1, ResourceIdentityKind, admit_evidence,
+    derive_integrity_state,
+};
 pub use appendable::{
     AcceptedEventKindV1, AppendableAcceptedEvent, EvidenceDeliveryContextV1, SemanticIdentityRuleV1,
 };
 pub use cockroach::CockroachAcceptedEventRepository;
+pub use content_store::{
+    CONTENT_KEY_ENCRYPTION_KEY_ENV, ContentKeyEncryptionKey, ContentObjectWrite,
+    GovernedContentAssociatedDataV1, GovernedContentObjectV1, GovernedContentProjection,
+    MAX_GOVERNED_CONTENT_BYTES, SealedContentObject, fetch_governed_content,
+    store_governed_content,
+};
 pub use error::{
     AuthorityUnavailableKind, EvidenceAppendError, EvidenceAppendResult, WitnessMismatchKind,
 };

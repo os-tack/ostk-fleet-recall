@@ -11,6 +11,7 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::control_log::TrustedControlScope;
+use crate::evidence_ledger::{CONTENT_KEY_ENCRYPTION_KEY_ENV, ContentKeyEncryptionKey};
 use crate::memory_contracts::bootstrap::{BootstrapPin, BootstrapReceiptDigest};
 use crate::memory_contracts::common::{AuthenticatedProjectScopeV1, ContractId};
 use crate::memory_contracts::digest::Sha256Digest;
@@ -1376,6 +1377,21 @@ fn model_bundle_sha256_at(canonical: &Path) -> Result<String> {
     }
 
     Ok(hex::encode(digest.finalize()))
+}
+
+/// Load the governed-content key-encryption key (ADR 0002 D5).
+///
+/// Deliberately a standalone accessor rather than a [`FleetConfig`] field.
+/// [`PublicationConfig`] embeds a `FleetConfig`, and the publication process
+/// must never hold the key that unwraps governed content DEKs — a field would
+/// hand it one. Every caller that needs the key asks for it explicitly, so the
+/// set of processes holding it is the set of call sites (PUBLIC-03, EVID-05).
+///
+/// The variable is required when called: a deployment that enables governed
+/// evidence admission without a key fails closed at startup instead of storing
+/// unencrypted bytes.
+pub fn content_key_encryption_key() -> Result<ContentKeyEncryptionKey> {
+    ContentKeyEncryptionKey::from_hex(&required(CONTENT_KEY_ENCRYPTION_KEY_ENV)?)
 }
 
 fn required(name: &str) -> Result<String> {
