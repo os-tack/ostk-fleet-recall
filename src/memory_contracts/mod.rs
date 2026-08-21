@@ -6,6 +6,7 @@
 
 pub mod action;
 pub mod bootstrap;
+pub mod bootstrap_manifest;
 pub mod canonical;
 pub mod causal;
 pub mod chunk_identity;

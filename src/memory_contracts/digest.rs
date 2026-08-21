@@ -267,6 +267,14 @@ pub enum DigestDomain {
     /// authority. Sharing one domain across the two ledgers would make an
     /// evidence offset-zero digest replayable as a control one.
     EvidenceGenesisChainV1, // W1-APPEND
+    /// W1-IMPORT. Content-addressed digest of one `BootstrapManifestV1`
+    /// enumeration of legacy `memory_chunks`/`memory_claims`/
+    /// `memory_conflicts`/`memory_conflict_members`/`memory_mutation_receipts`
+    /// rows. Distinct from [`DigestDomain::AcceptedEvent`], which frames the
+    /// full `bootstrap.manifest.accepted` preimage (profile, scope, registry
+    /// head, and this digest together); this domain frames only the sorted
+    /// row enumeration itself.
+    BootstrapManifestV1, // W1-IMPORT
 }
 
 impl DigestDomain {
@@ -397,6 +405,7 @@ impl DigestDomain {
             Self::ActionAttemptRevalidationV1 => "ostk-action-attempt-revalidation-v1",
             // --- W1 prefixes ---
             Self::EvidenceGenesisChainV1 => "ostk-evidence-genesis-chain-v1", // W1-APPEND
+            Self::BootstrapManifestV1 => "ostk-bootstrap-manifest-v1",        // W1-IMPORT
         }
     }
 }
