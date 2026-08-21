@@ -897,6 +897,81 @@ mod tests {
         assert!(invalid.validate().is_err());
     }
 
+    /// Mutation coverage: no fixture or inline proposal anywhere else in
+    /// this suite carries an empty `source_spans`, so merging this disjunct
+    /// with its neighbor via `&&` survives the whole suite without it.
+    #[test]
+    fn empty_source_spans_is_rejected() {
+        let mut invalid = proposal();
+        invalid.source_spans = Vec::new();
+        assert!(invalid.validate().is_err());
+    }
+
+    /// Mutation coverage: the identical gap for `propositions.is_empty()`.
+    #[test]
+    fn empty_propositions_is_rejected() {
+        let mut invalid = proposal();
+        invalid.propositions = Vec::new();
+        assert!(invalid.validate().is_err());
+    }
+
+    /// Mutation coverage: `source_spans.len() > MAX_SPANS` has no dedicated
+    /// vector. `MAX_SPANS + 1` non-overlapping, strictly increasing spans
+    /// are otherwise valid shape, so only the bound guard rejects them.
+    #[test]
+    fn too_many_source_spans_is_rejected() {
+        let mut invalid = proposal();
+        invalid.source_spans = (0..=MAX_SPANS as u64)
+            .map(|i| SourceByteSpanV1 {
+                start: i * 100,
+                end: i * 100 + 50,
+                selected_bytes_digest: label_digest(&format!("span-{i}")),
+            })
+            .collect();
+        assert!(invalid.validate().is_err());
+    }
+
+    /// Mutation coverage: `propositions.len() > MAX_PROPOSITIONS` has no
+    /// dedicated vector. `MAX_PROPOSITIONS + 1` propositions sharing one
+    /// predicate schema with strictly sorted fingerprints are otherwise
+    /// valid shape.
+    #[test]
+    fn too_many_propositions_is_rejected() {
+        let labels: Vec<String> = (0..=MAX_PROPOSITIONS)
+            .map(|i| format!("proposition-{i}"))
+            .collect();
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let mut invalid = proposal();
+        invalid.propositions = sorted_label_digests(&label_refs)
+            .into_iter()
+            .map(|fingerprint| NormativePropositionV1 {
+                predicate_schema: reference("slo.error_rate"),
+                proposition_fingerprint: fingerprint,
+            })
+            .collect();
+        assert!(invalid.validate().is_err());
+    }
+
+    /// Mutation coverage: merging the `blob_id`/`parser_artifact_id`
+    /// Occurrence-form checks via `&&` survives the whole suite because
+    /// `proposal-negative-wrong-resource-form.jsonl` only ever misshapes
+    /// `repository_version_id`; neither `blob_id` nor `parser_artifact_id`
+    /// has its own negative vector. This covers `blob_id` alone.
+    #[test]
+    fn blob_id_wrong_form_alone_is_rejected() {
+        let mut invalid = proposal();
+        invalid.blob_id = resource("entity", "git_blob", "blob");
+        assert!(invalid.validate().is_err());
+    }
+
+    /// Mutation coverage: the `parser_artifact_id` half of the same pair.
+    #[test]
+    fn parser_artifact_id_wrong_form_alone_is_rejected() {
+        let mut invalid = proposal();
+        invalid.parser_artifact_id = resource("entity", "artifact", "parser");
+        assert!(invalid.validate().is_err());
+    }
+
     /// AUTH-04: a bounded effective interval whose `effective_until` is at or
     /// before its own `effective_from` is invalid shape, regardless of the
     /// two-binding overlap check below. Every other proposal fixture and
