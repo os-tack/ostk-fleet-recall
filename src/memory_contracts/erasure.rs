@@ -1795,6 +1795,48 @@ mod tests {
         }));
         assert!(duplicate_kind_five_entries.validate().is_err());
 
+        // Two ADJACENT, byte-identical entries (same kind, same epoch) --
+        // the exact shape `strictly_sorted`'s `< -> <=` mutation would admit.
+        // Unlike the reordering fixture above, this pins the fixed four-slot
+        // fence's actual defense: a duplicate entry always displaces one of
+        // the four required kinds (here `SourceFact` is missing), so
+        // `covers_every_required_kind` rejects it independently of
+        // `strictly_sorted`. The shared `strictly_sorted` mutation is killed
+        // by the receipt and recompute-target fixtures below, where no
+        // fixed-arity coverage guard exists to catch it; this fixture
+        // documents that the fence's own rejection of a duplicate entry does
+        // not depend on that shared helper alone.
+        let mut adjacent_duplicate_entries = genesis_fence();
+        adjacent_duplicate_entries.entries = vec![
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::PrivacySubject,
+                epoch: 0,
+            },
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::PrivacySubject,
+                epoch: 0,
+            },
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::Representation,
+                epoch: 0,
+            },
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::Resource,
+                epoch: 0,
+            },
+        ];
+        assert_eq!(
+            adjacent_duplicate_entries.entries[0],
+            adjacent_duplicate_entries.entries[1]
+        );
+        assert!(!strictly_sorted(&adjacent_duplicate_entries.entries));
+        assert_eq!(
+            adjacent_duplicate_entries.validate(),
+            Err(ContractError::Schema(
+                "erasure fence must cover exactly the four scope kinds once each".into()
+            ))
+        );
+
         let negative_fence: ErasureFenceV1 =
             decode_strict(record(NEGATIVE_FENCE_MISSING_SCOPE_FIXTURE)).unwrap();
         // Distinguishing property, not just the shared error string: this
@@ -2091,6 +2133,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one exhaustive receipt-shape test, incl. the mutation-killing duplicate/cap/sortedness fixtures
     fn receipt_complete_requires_no_residual_and_key_destroyed() {
         receipt_pending().validate().unwrap();
         receipt_complete().validate().unwrap();
@@ -2122,6 +2165,29 @@ mod tests {
         assert_eq!(unsorted_residuals.residual_inventory.len(), 2);
         assert!(!strictly_sorted(&unsorted_residuals.residual_inventory));
         assert!(unsorted_residuals.validate().is_err());
+
+        // Two ADJACENT, byte-identical residual rows -- the shape
+        // `strictly_sorted`'s `< -> <=` mutation admits but reordering does
+        // not: reversing two distinct rows still produces a strictly
+        // descending pair under either operator, so it cannot distinguish
+        // `<` from `<=`. A duplicate row can: nothing else in `validate`
+        // rejects a `pending` receipt that names the same store twice, so
+        // this fixture flips from rejected to accepted under that mutation
+        // alone.
+        let mut duplicate_residual_rows = receipt_pending();
+        duplicate_residual_rows.residual_inventory =
+            vec![duplicate_residual_rows.residual_inventory[0].clone(); 2];
+        assert_eq!(
+            duplicate_residual_rows.residual_inventory[0],
+            duplicate_residual_rows.residual_inventory[1]
+        );
+        assert!(!strictly_sorted(
+            &duplicate_residual_rows.residual_inventory
+        ));
+        assert_eq!(
+            duplicate_residual_rows.validate(),
+            Err(ContractError::Schema("invalid erasure receipt".into()))
+        );
 
         // Isolate `residual_inventory.len() > MAX_RESIDUAL_STORES`: a
         // strictly-sorted, `pending` (so the `complete` conjunction never
@@ -2290,6 +2356,32 @@ mod tests {
         );
     }
 
+    /// The equality boundary: a `released_at` that exactly equals
+    /// `placed_at` -- a zero-duration "release" recorded at the instant of
+    /// placement. This must fail exactly like the strictly-before case
+    /// above; the prior test alone cannot distinguish `*released >
+    /// self.placed_at` from `*released >= self.placed_at`, since both
+    /// operators reject a strictly-earlier release identically. Only this
+    /// equal-instant fixture flips outcome between the two operators: under
+    /// `>=` it would validate, and `permits_removal` would then answer
+    /// `true` for every `at >= placed_at`, lifting a hold that was supposed
+    /// to defer removal for its entire active interval.
+    #[test]
+    fn permits_removal_fails_closed_on_release_equal_to_placement() {
+        let mut hold = legal_hold_active();
+        hold.released_at = Some(hold.placed_at.clone());
+        assert_eq!(
+            hold.validate(),
+            Err(ContractError::Schema("invalid legal hold".into()))
+        );
+        assert_eq!(
+            hold.permits_removal(
+                &CanonicalTimestamp::parse("2026-08-20T00:00:00.000000000Z").unwrap()
+            ),
+            Err(ContractError::Schema("invalid legal hold".into()))
+        );
+    }
+
     #[test]
     fn forbidden_matcher_forces_disable_and_purge() {
         assert_eq!(
@@ -2428,6 +2520,76 @@ mod tests {
                 "invalid dependent support transition".into()
             ))
         );
+    }
+
+    #[test]
+    fn dependent_support_transition_bounds_and_sorts_recompute_targets() {
+        // Two ADJACENT, byte-identical recompute targets -- the shape
+        // `strictly_sorted`'s `< -> <=` mutation admits, and simultaneously
+        // the shape that neuters `:880`'s `(len > MAX) || !strictly_sorted`
+        // if that `||` is mutated to `&&`: with only two targets (well under
+        // the cap), the left side of the disjunction is false, so an `&&`
+        // mutant would make the whole clause false regardless of sortedness.
+        // Every other conjunct passes: `next_state` downgrades, the list is
+        // non-empty, no target is the zero digest.
+        let mut duplicate_recompute_targets = dependent_transition_unverifiable();
+        let one_target = duplicate_recompute_targets.recompute_targets[0];
+        duplicate_recompute_targets.recompute_targets = vec![one_target, one_target];
+        assert!(!duplicate_recompute_targets.recompute_targets.is_empty());
+        assert!(!strictly_sorted(
+            &duplicate_recompute_targets.recompute_targets
+        ));
+        assert_eq!(
+            duplicate_recompute_targets.validate(),
+            Err(ContractError::Schema(
+                "invalid dependent support transition".into()
+            ))
+        );
+
+        // Isolate `self.recompute_targets.len() > MAX_RECOMPUTE_TARGETS`: a
+        // strictly-sorted, otherwise entirely valid transition naming one
+        // more recompute target than the cap permits. Kills both `> -> ==`
+        // (which would reject only an exact `MAX + 1`-length list, not this
+        // over-cap one) and confirms the cap fires at all.
+        let mut over_cap_targets = dependent_transition_unverifiable();
+        over_cap_targets.recompute_targets = (0..=MAX_RECOMPUTE_TARGETS)
+            .map(|index| {
+                AcceptedEventId::from_digest(labelled_digest(&format!(
+                    "dependent-transition.recompute.over.{index:04}"
+                )))
+            })
+            .collect();
+        over_cap_targets.recompute_targets.sort();
+        assert_eq!(
+            over_cap_targets.recompute_targets.len(),
+            MAX_RECOMPUTE_TARGETS + 1
+        );
+        assert!(strictly_sorted(&over_cap_targets.recompute_targets));
+        assert_eq!(
+            over_cap_targets.validate(),
+            Err(ContractError::Schema(
+                "invalid dependent support transition".into()
+            ))
+        );
+
+        // The boundary itself -- exactly `MAX_RECOMPUTE_TARGETS` entries --
+        // must still validate, so the rejection above is specifically about
+        // exceeding the cap. This also kills `> -> >=`, which would reject
+        // this exact-cap fixture.
+        let mut at_cap_targets = dependent_transition_unverifiable();
+        at_cap_targets.recompute_targets = (0..MAX_RECOMPUTE_TARGETS)
+            .map(|index| {
+                AcceptedEventId::from_digest(labelled_digest(&format!(
+                    "dependent-transition.recompute.at.{index:04}"
+                )))
+            })
+            .collect();
+        at_cap_targets.recompute_targets.sort();
+        assert_eq!(
+            at_cap_targets.recompute_targets.len(),
+            MAX_RECOMPUTE_TARGETS
+        );
+        at_cap_targets.validate().unwrap();
     }
 
     #[test]
