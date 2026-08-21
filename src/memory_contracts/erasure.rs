@@ -32,6 +32,42 @@
 //! ([`ErasureFenceCasV1::may_commit`]) fails closed the moment *any* erasure
 //! of a relevant kind lands, without this module needing to reason about
 //! which exact target the in-flight work touched.
+//!
+//! # Decode strictness (EVID-01) and the required ingress gate
+//!
+//! Every record type in this module —
+//! [`ErasureEventV1`], [`ErasureTombstoneV1`], [`ErasureFenceV1`],
+//! [`ErasureReceiptV1`], [`LegalHoldV1`], [`RetainableMatcherPolicyV1`],
+//! [`RestoreGateV1`], [`DependentSupportTransitionV1`], and
+//! [`CheckpointErasureRuleV1`] — defines its identity (where it has one) or
+//! its accepted shape over the **typed canonical form**, and
+//! [`super::canonical::decode_typed_canonical`] is the only decode function
+//! this module treats as an admissible ingress gate for wire bytes a caller
+//! intends to trust, exactly as `coverage.rs` documents for
+//! [`super::coverage::CoverageReceiptV1`]. [`super::canonical::decode_strict`]
+//! alone proves duplicate-safe strict JSON, never that the input is the
+//! *sole* accepted encoding of the value it decodes to: a derived
+//! `Deserialize` on a plain struct accepts a well-typed positional JSON array
+//! in a nested struct's place exactly as readily as an object, an `Option`
+//! field accepts its wire key whether present-as-`null` or omitted entirely,
+//! and — the sharper failure for a module whose entire purpose is denying
+//! retrieval of erased content — `#[serde(deny_unknown_fields)]` on an
+//! internally-tagged enum does not reject an extra key riding alongside a
+//! *bare unit* variant's tag (serde issue #1358). This module closes the
+//! last of those at the type level for its three fieldless variants
+//! ([`ProspectiveReConsentV1::NotAuthorized`], [`TombstoneLifecycleV1::
+//! DigestOnly`], [`RetainableMatcherPolicyV1::PseudonymousMatcherForbidden`]
+//! are `{}` struct variants, not unit variants — see each one's doc comment)
+//! and closes every other same-ID-different-bytes shape, generically and at
+//! once, by requiring `decode_typed_canonical`: it decodes with
+//! `decode_strict`, re-encodes the decoded value with
+//! [`super::canonical::encode_canonical`], and rejects the input unless the
+//! two byte strings are identical, so at most one accepted byte string
+//! exists per value. See
+//! `same_id_different_bytes_forms_decode_under_decode_strict_but_are_rejected_by_decode_typed_canonical`
+//! in the tests module for the reproduced collisions (an unknown field on a
+//! fieldless variant, an omitted optional key, a positional-array nested
+//! struct) and their rejection.
 
 use serde::{Deserialize, Serialize};
 
@@ -106,8 +142,23 @@ impl EffectiveIntervalV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProspectiveReConsentV1 {
-    NotAuthorized,
-    AuthorizedForNewSourceFact { consent_policy: RegistryReferenceV1 },
+    /// Fieldless *struct* variant (`{}`), not a bare unit variant. Serde's
+    /// internally-tagged representation buffers every wire key — including
+    /// ones outside the closed field set — into a `Content` tree keyed only
+    /// by the `kind` tag before dispatching to the variant deserializer; for
+    /// a bare unit variant that dispatch calls `deserialize_unit`, which
+    /// accepts (and silently drops) any sibling keys regardless of
+    /// `#[serde(deny_unknown_fields)]` on the enum. A zero-field *struct*
+    /// variant instead dispatches through `deserialize_struct` with an empty
+    /// field list, which does enforce `deny_unknown_fields` — so
+    /// `{"kind":"not_authorized","exfiltrated":"..."}` is rejected at decode,
+    /// not merely re-encoded away. See `SequenceContinuityV1::Contiguous {}`
+    /// in `coverage.rs` for the identical fix. The wire shape is unchanged:
+    /// `{}` still serializes as exactly `{"kind":"not_authorized"}`.
+    NotAuthorized {},
+    AuthorizedForNewSourceFact {
+        consent_policy: RegistryReferenceV1,
+    },
 }
 
 /// Stable accepted-erasure semantic preimage proposed to the append ledger.
@@ -362,7 +413,15 @@ pub enum TombstoneDenyModeV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TombstoneLifecycleV1 {
-    DigestOnly,
+    /// Fieldless *struct* variant (`{}`), not a bare unit variant — see
+    /// [`ProspectiveReConsentV1::NotAuthorized`] for why: `deny_unknown_fields`
+    /// on this internally-tagged enum does not, by itself, reject an extra
+    /// key riding alongside a bare unit variant's `kind` tag (serde issue
+    /// #1358), which is exactly the shape this type exists to forbid — a
+    /// tombstone is the record that asserts an erased identity carries no
+    /// payload bytes. `{}` still serializes as exactly `{"kind":
+    /// "digest_only"}`.
+    DigestOnly {},
     DigestAndMetadata {
         installed_at: CanonicalTimestamp,
         superseded_by: Option<AcceptedEventId>,
@@ -374,9 +433,20 @@ pub enum TombstoneLifecycleV1 {
 /// It
 /// carries no payload byte, canonical text, or embedding — only a digest,
 /// policy reference, and policy-gated lifecycle metadata.
-/// `#[serde(deny_unknown_fields)]` on this type and on
-/// [`TombstoneLifecycleV1`] means no later field can smuggle payload bytes
-/// back in without becoming a new, separately reviewed contract version.
+/// `#[serde(deny_unknown_fields)]` on this type closes that for every field
+/// this struct declares directly. It does **not**, by itself, close it for
+/// [`TombstoneLifecycleV1::DigestOnly`]: `deny_unknown_fields` on an
+/// internally-tagged enum does not reject an extra key riding alongside a
+/// *bare unit* variant's tag (serde issue #1358) — an ingress path that
+/// decoded with [`super::canonical::decode_strict`] alone could accept
+/// `{"kind":"digest_only","canonical_text":"..."}` and silently drop the
+/// smuggled field, reproducing the clean tombstone's identity. This module
+/// closes that two ways: `DigestOnly {}` is a fieldless *struct* variant,
+/// not a unit variant, so the smuggled key is rejected at decode time (see
+/// `DigestOnly`'s doc comment); and every caller must decode through
+/// [`super::canonical::decode_typed_canonical`], the required ingress gate
+/// for this module (see the module-level doc comment), which independently
+/// rejects any input whose re-encoding does not reproduce it byte for byte.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErasureTombstoneV1 {
@@ -392,7 +462,7 @@ impl ErasureTombstoneV1 {
     pub fn validate(&self) -> ContractResult<()> {
         validate_policy_reference(&self.policy_basis)?;
         let lifecycle_is_valid = match &self.lifecycle {
-            TombstoneLifecycleV1::DigestOnly => true,
+            TombstoneLifecycleV1::DigestOnly {} => true,
             TombstoneLifecycleV1::DigestAndMetadata {
                 installed_at,
                 superseded_by,
@@ -456,7 +526,7 @@ pub fn re_consent_permits_new_source_fact(
             validate_policy_reference(consent_policy).is_ok()
                 && candidate_target.target_digest != tombstone.target.target_digest
         }
-        ProspectiveReConsentV1::NotAuthorized => false,
+        ProspectiveReConsentV1::NotAuthorized {} => false,
     })
 }
 
@@ -688,8 +758,13 @@ pub enum RetainableMatcherScopeActionV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RetainableMatcherPolicyV1 {
-    PseudonymousMatcherAllowed { matcher_policy: RegistryReferenceV1 },
-    PseudonymousMatcherForbidden,
+    PseudonymousMatcherAllowed {
+        matcher_policy: RegistryReferenceV1,
+    },
+    /// Fieldless *struct* variant (`{}`), not a bare unit variant — see
+    /// [`ProspectiveReConsentV1::NotAuthorized`] for why. `{}` still
+    /// serializes as exactly `{"kind":"pseudonymous_matcher_forbidden"}`.
+    PseudonymousMatcherForbidden {},
 }
 
 impl RetainableMatcherPolicyV1 {
@@ -712,7 +787,9 @@ impl RetainableMatcherPolicyV1 {
         self.validate()?;
         Ok(match self {
             Self::PseudonymousMatcherAllowed { .. } => RetainableMatcherScopeActionV1::Retain,
-            Self::PseudonymousMatcherForbidden => RetainableMatcherScopeActionV1::DisableAndPurge,
+            Self::PseudonymousMatcherForbidden {} => {
+                RetainableMatcherScopeActionV1::DisableAndPurge
+            }
         })
     }
 }
@@ -856,7 +933,7 @@ mod tests {
 
     use super::*;
     use crate::memory_contracts::{
-        canonical::{decode_strict, require_canonical},
+        canonical::{decode_strict, decode_typed_canonical, require_canonical},
         common::frozen_profile_reference_v1,
     };
 
@@ -1097,7 +1174,7 @@ mod tests {
                 "2026-01-01T00:00:00.000000000Z",
             )
             .unwrap(),
-            re_consent: ProspectiveReConsentV1::NotAuthorized,
+            re_consent: ProspectiveReConsentV1::NotAuthorized {},
             requested_at: CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap(),
         }
     }
@@ -1119,7 +1196,7 @@ mod tests {
             target: target_representation(),
             erasure_event_id: event_representation().accepted_event_id().unwrap(),
             policy_basis: policy_basis(),
-            lifecycle: TombstoneLifecycleV1::DigestOnly,
+            lifecycle: TombstoneLifecycleV1::DigestOnly {},
         }
     }
 
@@ -1302,7 +1379,7 @@ mod tests {
     }
 
     fn retainable_matcher_forbidden() -> RetainableMatcherPolicyV1 {
-        RetainableMatcherPolicyV1::PseudonymousMatcherForbidden
+        RetainableMatcherPolicyV1::PseudonymousMatcherForbidden {}
     }
 
     fn restore_gate_quarantined() -> RestoreGateV1 {
@@ -1539,6 +1616,64 @@ mod tests {
         assert_ne!(
             tombstone_digest_only().tombstone_id().unwrap(),
             tombstone_with_metadata().tombstone_id().unwrap()
+        );
+    }
+
+    /// EVID-01/EVID-05: a bare *unit* variant of an internally-tagged enum
+    /// does not enforce `deny_unknown_fields` (serde issue #1358) -- serde
+    /// buffers every wire key into a `Content` tree keyed only by the tag
+    /// before dispatching to the variant deserializer, and for a unit
+    /// variant that dispatch calls `deserialize_unit`, which accepts and
+    /// silently drops any sibling key. Reproduced against all three of this
+    /// module's fieldless-by-design variants: each smuggled-key form below
+    /// decodes cleanly under an unpatched unit-variant declaration and
+    /// reproduces the clean record's identity -- carrying the exact erased
+    /// plaintext straight through a tombstone, an erasure event's re-consent
+    /// claim, or a retainable-matcher policy. Declaring each variant as a
+    /// fieldless *struct* variant (`Variant {}`, wire-identical to a unit
+    /// variant) instead dispatches through `deserialize_struct` with an
+    /// empty field list, which does enforce `deny_unknown_fields` and
+    /// rejects every case below at DECODE -- matching the `Contiguous {}`
+    /// fix in `coverage.rs`'s `SequenceContinuityV1`.
+    #[test]
+    fn fieldless_variants_reject_unknown_fields_at_decode() {
+        let clean_tombstone_bytes =
+            std::str::from_utf8(record(TOMBSTONE_DIGEST_ONLY_FIXTURE)).unwrap();
+        let smuggled_tombstone_bytes = clean_tombstone_bytes.replace(
+            r#""lifecycle":{"kind":"digest_only"}"#,
+            r#""lifecycle":{"canonical_text":"THE ERASED PLAINTEXT","kind":"digest_only"}"#,
+        );
+        assert_ne!(smuggled_tombstone_bytes, clean_tombstone_bytes);
+        assert!(
+            decode_strict::<ErasureTombstoneV1>(smuggled_tombstone_bytes.as_bytes()).is_err(),
+            "an unknown field riding inside TombstoneLifecycleV1::DigestOnly must be rejected \
+             at decode, not silently dropped"
+        );
+
+        let clean_event_bytes = std::str::from_utf8(record(ERASURE_EVENT_FIXTURE)).unwrap();
+        let smuggled_event_bytes = clean_event_bytes.replace(
+            r#""re_consent":{"kind":"not_authorized"}"#,
+            r#""re_consent":{"exfiltrated":"THE ERASED PLAINTEXT","kind":"not_authorized"}"#,
+        );
+        assert_ne!(smuggled_event_bytes, clean_event_bytes);
+        assert!(
+            decode_strict::<ErasureEventV1>(smuggled_event_bytes.as_bytes()).is_err(),
+            "an unknown field riding inside ProspectiveReConsentV1::NotAuthorized must be \
+             rejected at decode, not silently dropped"
+        );
+
+        let clean_matcher_bytes =
+            std::str::from_utf8(record(RETAINABLE_MATCHER_FORBIDDEN_FIXTURE)).unwrap();
+        let smuggled_matcher_bytes = clean_matcher_bytes.replace(
+            r#"{"kind":"pseudonymous_matcher_forbidden"}"#,
+            r#"{"exfiltrated":"THE ERASED PLAINTEXT","kind":"pseudonymous_matcher_forbidden"}"#,
+        );
+        assert_ne!(smuggled_matcher_bytes, clean_matcher_bytes);
+        assert!(
+            decode_strict::<RetainableMatcherPolicyV1>(smuggled_matcher_bytes.as_bytes()).is_err(),
+            "an unknown field riding inside \
+             RetainableMatcherPolicyV1::PseudonymousMatcherForbidden must be rejected at \
+             decode, not silently dropped"
         );
     }
 
@@ -1884,7 +2019,7 @@ mod tests {
         assert!(
             !re_consent_permits_new_source_fact(
                 &tombstone,
-                &ProspectiveReConsentV1::NotAuthorized,
+                &ProspectiveReConsentV1::NotAuthorized {},
                 &different_target
             )
             .unwrap()
@@ -1987,6 +2122,46 @@ mod tests {
         assert_eq!(unsorted_residuals.residual_inventory.len(), 2);
         assert!(!strictly_sorted(&unsorted_residuals.residual_inventory));
         assert!(unsorted_residuals.validate().is_err());
+
+        // Isolate `residual_inventory.len() > MAX_RESIDUAL_STORES`: a
+        // strictly-sorted, `pending` (so the `complete` conjunction never
+        // applies), otherwise entirely valid receipt naming one more
+        // governed store than the cap permits. No fixture carries this --
+        // `MAX_RESIDUAL_STORES` is 64, too large for a byte-frozen `.jsonl`
+        // record -- so it is pinned directly against the constant.
+        let mut over_cap_residuals = receipt_pending();
+        over_cap_residuals.residual_inventory = (0..=MAX_RESIDUAL_STORES)
+            .map(|index| ErasureStoreResidualV1 {
+                store_id: ContractId::new(format!("store.{index:03}")).unwrap(),
+                deletion_actor: ErasureDeletionActorV1::FleetRecall,
+                residual_present: false,
+            })
+            .collect();
+        assert_eq!(
+            over_cap_residuals.residual_inventory.len(),
+            MAX_RESIDUAL_STORES + 1
+        );
+        assert!(strictly_sorted(&over_cap_residuals.residual_inventory));
+        assert_eq!(
+            over_cap_residuals.validate(),
+            Err(ContractError::Schema("invalid erasure receipt".into()))
+        );
+        // The boundary itself -- exactly `MAX_RESIDUAL_STORES` rows -- must
+        // still validate, so the rejection above is specifically about
+        // exceeding the cap, not merely about having many rows.
+        let mut at_cap_residuals = receipt_pending();
+        at_cap_residuals.residual_inventory = (0..MAX_RESIDUAL_STORES)
+            .map(|index| ErasureStoreResidualV1 {
+                store_id: ContractId::new(format!("store.{index:03}")).unwrap(),
+                deletion_actor: ErasureDeletionActorV1::FleetRecall,
+                residual_present: false,
+            })
+            .collect();
+        assert_eq!(
+            at_cap_residuals.residual_inventory.len(),
+            MAX_RESIDUAL_STORES
+        );
+        at_cap_residuals.validate().unwrap();
 
         // A receipt bound to no erasure event at all (the zero digest) must
         // never validate: it is the record that discharges EVID-08, and it
@@ -2207,6 +2382,35 @@ mod tests {
             ))
         );
 
+        // Isolate `!downgrades && !self.recompute_targets.is_empty()` from
+        // the contradiction conjunct next to it:
+        // `negative-dependent-transition-contradiction.jsonl` cannot do
+        // this alone, because it also sets `sufficient_redacted_evidence_
+        // remains: false` under `next_state: verified`, which trips
+        // `sufficient_redacted_evidence_remains == downgrades` (false ==
+        // false) at the same time. Setting `sufficient_redacted_evidence_
+        // remains: true` instead makes that half of the disjunction `false`
+        // (true == false), so only the non-empty recompute list under a
+        // non-downgrading `next_state` is left to explain the rejection.
+        let mut verified_with_recompute_targets = dependent_transition_unverifiable();
+        verified_with_recompute_targets.next_state = SupportVerificationStateV1::Verified;
+        verified_with_recompute_targets.sufficient_redacted_evidence_remains = true;
+        assert!(!verified_with_recompute_targets.recompute_targets.is_empty());
+        assert_ne!(
+            verified_with_recompute_targets.sufficient_redacted_evidence_remains,
+            !matches!(
+                verified_with_recompute_targets.next_state,
+                SupportVerificationStateV1::Verified
+            ),
+            "the contradiction conjunct must not also be tripped by this fixture"
+        );
+        assert_eq!(
+            verified_with_recompute_targets.validate(),
+            Err(ContractError::Schema(
+                "invalid dependent support transition".into()
+            ))
+        );
+
         let negative_transition: DependentSupportTransitionV1 =
             decode_strict(record(NEGATIVE_DEPENDENT_TRANSITION_CONTRADICTION_FIXTURE)).unwrap();
         // Distinguishing property: this fixture claims `next_state:
@@ -2244,6 +2448,175 @@ mod tests {
                 "invalid checkpoint erasure rule".into()
             ))
         );
+    }
+
+    /// EVID-01/EVID-09: same-ID-different-bytes forms that survive the
+    /// fieldless-variant fix above because they do not touch a tagged enum
+    /// at all. A derived `Deserialize` on a plain struct accepts a
+    /// well-typed positional JSON array in a nested struct's place exactly
+    /// as readily as an object, and an `Option` field accepts its wire key
+    /// whether present-as-`null` or omitted entirely -- so each fixture
+    /// below decodes under `decode_strict` alone to a value `==` the clean
+    /// fixture and binds the identical content-addressed identity, exactly
+    /// the same-ID-different-bytes collision `coverage.rs` documents for
+    /// `CoverageReceiptV1`. `decode_typed_canonical` is the required
+    /// ingress gate that closes this, generically, by re-encoding the
+    /// decoded value and rejecting the input unless the bytes match.
+    #[test]
+    fn same_id_different_bytes_forms_decode_under_decode_strict_but_are_rejected_by_decode_typed_canonical()
+     {
+        // Omitted optional key: `legal-hold-active.jsonl` minus its
+        // `"released_at":null` entry.
+        let clean_hold_bytes = std::str::from_utf8(record(LEGAL_HOLD_ACTIVE_FIXTURE)).unwrap();
+        let omitted_released_at = clean_hold_bytes.replace(r#""released_at":null,"#, "");
+        assert_ne!(omitted_released_at, clean_hold_bytes);
+        require_canonical(omitted_released_at.as_bytes()).unwrap_or_else(|error| {
+            panic!("omitted released_at: expected a canonical document, got {error:?}")
+        });
+        let decoded_hold: LegalHoldV1 = decode_strict(omitted_released_at.as_bytes())
+            .unwrap_or_else(|error| {
+                panic!("omitted released_at: expected decode_strict to accept, got {error:?}")
+            });
+        assert_eq!(decoded_hold, legal_hold_active());
+        decoded_hold.validate().unwrap();
+        assert_eq!(
+            decoded_hold.hold_id().unwrap(),
+            legal_hold_active().hold_id().unwrap(),
+            "must bind the identical hold_id under decode_strict alone"
+        );
+        assert_eq!(
+            decode_typed_canonical::<LegalHoldV1>(omitted_released_at.as_bytes()),
+            Err(ContractError::NotCanonical)
+        );
+
+        // Omitted optional key: `erasure-tombstone-with-metadata.jsonl`
+        // minus its `,"superseded_by":null` entry.
+        let clean_tombstone_bytes =
+            std::str::from_utf8(record(TOMBSTONE_WITH_METADATA_FIXTURE)).unwrap();
+        let omitted_superseded_by = clean_tombstone_bytes.replace(r#","superseded_by":null"#, "");
+        assert_ne!(omitted_superseded_by, clean_tombstone_bytes);
+        require_canonical(omitted_superseded_by.as_bytes()).unwrap_or_else(|error| {
+            panic!("omitted superseded_by: expected a canonical document, got {error:?}")
+        });
+        let decoded_tombstone: ErasureTombstoneV1 = decode_strict(omitted_superseded_by.as_bytes())
+            .unwrap_or_else(|error| {
+                panic!("omitted superseded_by: expected decode_strict to accept, got {error:?}")
+            });
+        assert_eq!(decoded_tombstone, tombstone_with_metadata());
+        decoded_tombstone.validate().unwrap();
+        assert_eq!(
+            decoded_tombstone.tombstone_id().unwrap(),
+            tombstone_with_metadata().tombstone_id().unwrap(),
+            "must bind the identical tombstone_id under decode_strict alone"
+        );
+        assert_eq!(
+            decode_typed_canonical::<ErasureTombstoneV1>(omitted_superseded_by.as_bytes()),
+            Err(ContractError::NotCanonical)
+        );
+
+        // Positional-array form of a nested struct: `erasure-fence-genesis
+        // .jsonl` with its `privacy_subject` entry rewritten from
+        // `{"epoch":0,"kind":"privacy_subject"}` (field order: `kind`, then
+        // `epoch`) to `["privacy_subject",0]`.
+        let clean_fence_bytes = std::str::from_utf8(record(FENCE_GENESIS_FIXTURE)).unwrap();
+        let positional_fence = clean_fence_bytes.replace(
+            r#"{"epoch":0,"kind":"privacy_subject"}"#,
+            r#"["privacy_subject",0]"#,
+        );
+        assert_ne!(positional_fence, clean_fence_bytes);
+        require_canonical(positional_fence.as_bytes()).unwrap_or_else(|error| {
+            panic!("positional fence entry: expected a canonical document, got {error:?}")
+        });
+        let decoded_fence: ErasureFenceV1 = decode_strict(positional_fence.as_bytes())
+            .unwrap_or_else(|error| {
+                panic!("positional fence entry: expected decode_strict to accept, got {error:?}")
+            });
+        assert_eq!(decoded_fence, genesis_fence());
+        decoded_fence.validate().unwrap();
+        assert_eq!(
+            decoded_fence.fence_id().unwrap(),
+            genesis_fence().fence_id().unwrap(),
+            "must bind the identical fence_id under decode_strict alone"
+        );
+        assert_eq!(
+            decode_typed_canonical::<ErasureFenceV1>(positional_fence.as_bytes()),
+            Err(ContractError::NotCanonical)
+        );
+    }
+
+    /// EVID-01: every fixture in the directory that decodes at all --
+    /// positive and negative alike -- must decode through the required
+    /// `decode_typed_canonical` ingress gate the module doc comment names,
+    /// not merely through `require_canonical` (which
+    /// `hard_coded_contract_vectors_match_independent_ids` already proves
+    /// for every fixture). `negative-tombstone-payload-bytes.jsonl` is the
+    /// sole exception: it does not decode as `ErasureTombstoneV1` under
+    /// plain `decode_strict` either, and `decode_typed_canonical` must
+    /// refuse it too, since it delegates to `decode_strict` first.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn every_decodable_fixture_decodes_through_the_typed_canonical_gate() {
+        for bytes in [
+            ERASURE_EVENT_FIXTURE,
+            ERASURE_EVENT_PRIVACY_SUBJECT_FIXTURE,
+            NEGATIVE_EVENT_EFFECTIVE_BEFORE_POLICY_FIXTURE,
+        ] {
+            decode_typed_canonical::<ErasureEventV1>(record(bytes)).unwrap();
+        }
+        for bytes in [
+            TOMBSTONE_DIGEST_ONLY_FIXTURE,
+            TOMBSTONE_WITH_METADATA_FIXTURE,
+        ] {
+            decode_typed_canonical::<ErasureTombstoneV1>(record(bytes)).unwrap();
+        }
+        assert!(
+            decode_typed_canonical::<ErasureTombstoneV1>(record(
+                NEGATIVE_TOMBSTONE_PAYLOAD_BYTES_FIXTURE
+            ))
+            .is_err()
+        );
+        for bytes in [
+            FENCE_GENESIS_FIXTURE,
+            FENCE_ADVANCED_FIXTURE,
+            FENCE_GENERATION_ONLY_ADVANCE_FIXTURE,
+            FENCE_PRIVACY_SUBJECT_ONLY_ADVANCE_FIXTURE,
+            FENCE_REPRESENTATION_ONLY_ADVANCE_FIXTURE,
+            NEGATIVE_FENCE_MISSING_SCOPE_FIXTURE,
+        ] {
+            decode_typed_canonical::<ErasureFenceV1>(record(bytes)).unwrap();
+        }
+        for bytes in [
+            RECEIPT_PENDING_FIXTURE,
+            RECEIPT_COMPLETE_FIXTURE,
+            NEGATIVE_RECEIPT_COMPLETE_WITH_RESIDUAL_FIXTURE,
+            NEGATIVE_RECEIPT_COMPLETE_RESIDUAL_DESPITE_KEY_DESTROYED_FIXTURE,
+        ] {
+            decode_typed_canonical::<ErasureReceiptV1>(record(bytes)).unwrap();
+        }
+        for bytes in [
+            LEGAL_HOLD_ACTIVE_FIXTURE,
+            NEGATIVE_LEGAL_HOLD_PUBLICATION_VISIBILITY_FIXTURE,
+        ] {
+            decode_typed_canonical::<LegalHoldV1>(record(bytes)).unwrap();
+        }
+        decode_typed_canonical::<RetainableMatcherPolicyV1>(record(
+            RETAINABLE_MATCHER_FORBIDDEN_FIXTURE,
+        ))
+        .unwrap();
+        decode_typed_canonical::<RestoreGateV1>(record(RESTORE_GATE_QUARANTINED_FIXTURE)).unwrap();
+        for bytes in [
+            DEPENDENT_TRANSITION_UNVERIFIABLE_FIXTURE,
+            NEGATIVE_DEPENDENT_TRANSITION_CONTRADICTION_FIXTURE,
+        ] {
+            decode_typed_canonical::<DependentSupportTransitionV1>(record(bytes)).unwrap();
+        }
+        for bytes in [
+            CHECKPOINT_RULE_FIXTURE,
+            NEGATIVE_CHECKPOINT_SAME_DIGEST_FIXTURE,
+        ] {
+            decode_typed_canonical::<CheckpointErasureRuleV1>(record(bytes)).unwrap();
+        }
+        decode_typed_canonical::<ErasureVectorSuiteV1>(record(VECTOR_SUITE_FIXTURE)).unwrap();
     }
 
     #[test]
