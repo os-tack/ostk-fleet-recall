@@ -1844,6 +1844,64 @@ mod tests {
         );
     }
 
+    /// Non-blocking observation fix: `vector-suite.jsonl` was previously
+    /// pinned only by its raw SHA-256 above, never parsed, so its embedded
+    /// `receipt_id`/`evaluation_id`/`*_digest` fields could silently drift
+    /// from the values the code actually computes while every gate stayed
+    /// green (the Rust `EXPECTED_*` constants happened to carry the same
+    /// values independently, not because anything compared them). This test
+    /// closes that gap: it parses the manifest as JSON and asserts every
+    /// semantic id it restates equals the same `EXPECTED_*` constant the
+    /// fixture corpus test above already pins from the decoded records.
+    #[test]
+    fn vector_suite_restates_only_the_pinned_semantic_ids_and_all_match() {
+        let vector_suite_framed =
+            include_bytes!("../../contracts/dynamic-memory/v3/telemetry/vector-suite.jsonl");
+        let value: serde_json::Value = serde_json::from_slice(vector_suite_framed).unwrap();
+        let artifacts = value["artifacts"].as_object().unwrap();
+        let field = |file: &str, key: &str| {
+            artifacts[file][key]
+                .as_str()
+                .unwrap_or_else(|| panic!("{file}.{key} missing from vector-suite.jsonl"))
+                .to_string()
+        };
+
+        assert_eq!(
+            field("exemplar-policy-v1-private.jsonl", "policy_digest"),
+            EXPECTED_POLICY_PRIVATE_DIGEST
+        );
+        assert_eq!(
+            field("exemplar-policy-v1-public-activated.jsonl", "policy_digest"),
+            EXPECTED_POLICY_PUBLIC_ACTIVATED_DIGEST
+        );
+        assert_eq!(
+            field("exemplar-v1.jsonl", "exemplar_digest"),
+            EXPECTED_EXEMPLAR_DIGEST
+        );
+        assert_eq!(
+            field(
+                "measurement-receipt-v1-population-unavailable.jsonl",
+                "receipt_id"
+            ),
+            EXPECTED_UNAVAILABLE_RECEIPT_ID
+        );
+        assert_eq!(
+            field(
+                "measurement-receipt-v1-private-with-exemplars.jsonl",
+                "receipt_id"
+            ),
+            EXPECTED_PRIVATE_RECEIPT_ID
+        );
+        assert_eq!(
+            field("slo-evaluation-v1-compliant.jsonl", "evaluation_id"),
+            EXPECTED_SLO_COMPLIANT_EVALUATION_ID
+        );
+        assert_eq!(
+            field("slo-evaluation-v1-nonconformant.jsonl", "evaluation_id"),
+            EXPECTED_SLO_NONCONFORMANT_EVALUATION_ID
+        );
+    }
+
     fn scope() -> AuthenticatedProjectScopeV1 {
         AuthenticatedProjectScopeV1::from_trusted_context(
             ContractId::new("tenant.default").unwrap(),
