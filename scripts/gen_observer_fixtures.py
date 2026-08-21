@@ -59,7 +59,7 @@ def uri(kind: str, form: str, seed: int) -> str:
 def write(name: str, obj) -> None:
     path = os.path.join(ROOT, name)
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(obj, separators=(",", ":")))
+        handle.write(canonical_bytes(obj).decode("utf-8"))
         handle.write("\n")
     print("wrote", path)
 
