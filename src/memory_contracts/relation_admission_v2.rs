@@ -33,6 +33,20 @@ const RELATION_ADMISSION_V2_SCHEMA_VERSION: u32 = 2;
 /// the edge's own `source`/`target` endpoints.
 const DEPLOYMENT_CONFIGURATION_DIMENSION_ID: &str = "configuration";
 
+/// AUTH-02: the closed relation type each [`ProviderFactBindingV1`] variant is
+/// bounded to prove, expressed as the exact `relation_proof` registry entry
+/// id the edge must carry and the resource kind its `source` endpoint must
+/// have. A fact binding whose identifiers happen to name the same digest as
+/// an edge's target is still not evidence for that edge unless the edge is
+/// also the *kind* of edge this evidence kind is bounded to prove: a Git ref
+/// event proves the provider's observed ref state only, never a deployment,
+/// review, or build edge that happens to name the same content-addressed
+/// revision or artifact.
+struct ProviderFactBindingRelationKindV1 {
+    relation_proof_entry_id: &'static str,
+    source_resource_kind: &'static str,
+}
+
 /// Authenticated connector principal plus provider-instance namespace.
 ///
 /// No `Serialize`/`Deserialize` impl exists: this type can be built only
@@ -190,6 +204,50 @@ impl ProviderFactBindingV1 {
             }
         }
     }
+
+    /// AUTH-02: the exact relation type this fact binding variant is bounded
+    /// to prove.
+    const fn expected_relation_kind(&self) -> ProviderFactBindingRelationKindV1 {
+        match self {
+            Self::RefObservesRevision { .. } => ProviderFactBindingRelationKindV1 {
+                relation_proof_entry_id: "relation.ref_observes_revision",
+                source_resource_kind: "git_ref",
+            },
+            Self::ReviewApprovesRevision { .. } => ProviderFactBindingRelationKindV1 {
+                relation_proof_entry_id: "relation.review_approves_revision",
+                source_resource_kind: "review",
+            },
+            Self::BuildConsumesRevision { .. } => ProviderFactBindingRelationKindV1 {
+                relation_proof_entry_id: "relation.build_consumes_revision",
+                source_resource_kind: "build",
+            },
+            Self::ArtifactBindsDigest { .. } => ProviderFactBindingRelationKindV1 {
+                relation_proof_entry_id: "relation.artifact_binds_digest",
+                source_resource_kind: "artifact",
+            },
+            Self::DeploymentBindsArtifactAndConfiguration { .. } => {
+                ProviderFactBindingRelationKindV1 {
+                    relation_proof_entry_id: "relation.deployment_selects_artifact",
+                    source_resource_kind: "deployment",
+                }
+            }
+        }
+    }
+
+    /// AUTH-02: whether `edge` is even the *kind* of edge this fact binding
+    /// variant is bounded to prove, independent of whether its specific
+    /// identifiers happen to match. This is checked separately from, and
+    /// before, [`Self::binds_edge`]: a provider fact that is structurally
+    /// competent to prove only a ref->revision edge (say) must never admit
+    /// an unrelated deployment or review edge merely because one of its
+    /// bound identifiers happens to name the same content-addressed digest
+    /// as that edge's target — that is evidence for a different edge
+    /// entirely, not weaker evidence for this one.
+    fn admits_relation_kind(&self, edge: &RelationEdgeV1) -> bool {
+        let expected = self.expected_relation_kind();
+        edge.relation_proof.entry_id.as_str() == expected.relation_proof_entry_id
+            && edge.source.resource_kind().as_str() == expected.source_resource_kind
+    }
 }
 
 /// Untrusted candidate for provider-attested relation admission.
@@ -255,6 +313,7 @@ pub enum RelationAdmissionOutcomeKindV2 {
 pub enum RelationAdmissionReasonV2 {
     ProviderFactBindingVerified,
     EvidenceKindAuthorityScopeMismatch,
+    FactBindingCannotProveThisRelation,
     FactBindingDoesNotBindTheEdge,
     MutableLabelInsufficientForProviderAttested,
     ProviderAttestedRequiresSupportsVerdict,
@@ -317,6 +376,23 @@ pub fn evaluate_provider_attested_admission(
             candidate_id,
             outcome: RelationAdmissionOutcomeKindV2::Rejected,
             reason: RelationAdmissionReasonV2::EvidenceKindAuthorityScopeMismatch,
+            connector_principal_id,
+            provider_instance_namespace,
+        });
+    }
+
+    // AUTH-02: a fact binding is admissible only for the closed relation
+    // type it is bounded to prove, checked before any identifier is
+    // compared. A same-digest coincidence between a bound identifier and an
+    // unrelated edge's target must never be enough: a Git ref event proves
+    // only the provider's observed ref state, CI proves only the named
+    // attempt, and a deployment control-plane event proves only its
+    // registered predicates — never each other's edges.
+    if !candidate.fact_binding.admits_relation_kind(&candidate.edge) {
+        return Ok(RelationAdmissionOutcomeV2 {
+            candidate_id,
+            outcome: RelationAdmissionOutcomeKindV2::Rejected,
+            reason: RelationAdmissionReasonV2::FactBindingCannotProveThisRelation,
             connector_principal_id,
             provider_instance_namespace,
         });
@@ -409,7 +485,7 @@ mod tests {
 
     const CANDIDATE_ID: &str = "76a94308d7a2f8df5f8622e3104b539eaa16f9b133cdd01b1661d01f908872d4";
     const VECTOR_SUITE_DIGEST: &str =
-        "05e33b77efbf312f7ae62ad716343d09a736ca04b8ea1ab864b20a6fddd61564";
+        "422c312a21f14b057c0e071f7b5c4c5543c5d8ab88d63a87345925c8d56dd7e5";
 
     fn record(bytes: &[u8]) -> &[u8] {
         let body = bytes
@@ -678,9 +754,13 @@ mod tests {
 
     fn negative_cases() -> Vec<String> {
         [
+            "artifact_binds_digest_cannot_admit_build_edge",
             "artifact_digest_binding_edge_mismatch_rejected",
+            "build_consumes_revision_cannot_admit_deployment_edge",
             "build_source_revision_binding_edge_mismatch_rejected",
             "deployment_artifact_binding_edge_mismatch_rejected",
+            "deployment_binding_relation_entry_id_mismatch_rejected",
+            "deployment_binding_source_kind_mismatch_rejected",
             "deployment_configuration_binding_edge_mismatch_rejected",
             "evidence_kind_scope_mismatch_rejected",
             "mutable_artifact_label_downgraded",
@@ -688,6 +768,7 @@ mod tests {
             "ref_observes_revision_binding_edge_mismatch_rejected",
             "ref_observes_revision_cannot_admit_deployment_edge",
             "refuting_verdict_rejected",
+            "review_approves_revision_cannot_admit_artifact_edge",
             "review_head_sha_binding_edge_mismatch_rejected",
             "unknown_field",
             "verifier_result_missing_proof_recipe",
@@ -1002,21 +1083,128 @@ mod tests {
         assert_edge_mismatch_rejected(&mismatched, ProviderEvidenceKindV1::DeploymentControlPlane);
     }
 
-    /// Exact PROV-01 R1 reproduction: a `RefObservesRevision` fact about a
-    /// commit is evidence for a ref->revision edge only. AUTH-02 bounds it
-    /// to "the provider's observed ref state" — it must never admit an
-    /// unrelated `deployment_selects_artifact` edge even though the evidence
-    /// kind is correctly `GitRefEvent` for the binding's own declared kind.
+    fn assert_relation_kind_rejected(
+        candidate: &ProviderAttestedRelationCandidateV2,
+        kind: ProviderEvidenceKindV1,
+    ) {
+        let outcome =
+            evaluate_provider_attested_admission(&provider_identity(), kind, candidate).unwrap();
+        assert_eq!(outcome.outcome(), RelationAdmissionOutcomeKindV2::Rejected);
+        assert_eq!(
+            outcome.reason(),
+            RelationAdmissionReasonV2::FactBindingCannotProveThisRelation
+        );
+    }
+
+    /// AUTH-02 "R2" reproduction: a `RefObservesRevision` fact keeps the
+    /// *exact same digest* as `candidate().edge.target` (so a binds_edge-only
+    /// check would have admitted it) but the edge is a
+    /// `deployment_selects_artifact` edge, not a ref->revision edge. A Git
+    /// ref event proves only the provider's observed ref state — it must
+    /// never admit an unrelated deployment edge merely because it happens to
+    /// name the same content-addressed artifact digest.
     #[test]
     fn ref_observes_revision_cannot_admit_deployment_edge() {
-        let cross_edge_binding = ProviderAttestedRelationCandidateV2 {
+        let same_digest_wrong_relation = ProviderAttestedRelationCandidateV2 {
             fact_binding: ProviderFactBindingV1::RefObservesRevision {
                 ref_name: ContractId::new("ref.main").unwrap(),
-                observed_revision: resource(IdentityForm::Version, "commit", '6'),
+                observed_revision: resource(IdentityForm::Version, "artifact", '2'),
             },
             ..candidate()
         };
-        assert_edge_mismatch_rejected(&cross_edge_binding, ProviderEvidenceKindV1::GitRefEvent);
+        assert_eq!(
+            same_digest_wrong_relation.edge.target,
+            resource(IdentityForm::Version, "artifact", '2')
+        );
+        assert_relation_kind_rejected(
+            &same_digest_wrong_relation,
+            ProviderEvidenceKindV1::GitRefEvent,
+        );
+    }
+
+    /// AUTH-02 "R3" reproduction: same shape as R2, `BuildConsumesRevision`
+    /// in place of `RefObservesRevision`. CI proves only the named attempt
+    /// result — it must never admit an unrelated deployment edge.
+    #[test]
+    fn build_consumes_revision_cannot_admit_deployment_edge() {
+        let same_digest_wrong_relation = ProviderAttestedRelationCandidateV2 {
+            fact_binding: ProviderFactBindingV1::BuildConsumesRevision {
+                source_revision: resource(IdentityForm::Version, "artifact", '2'),
+            },
+            ..candidate()
+        };
+        assert_relation_kind_rejected(
+            &same_digest_wrong_relation,
+            ProviderEvidenceKindV1::CiAttempt,
+        );
+    }
+
+    /// AUTH-02 "R4" reproduction: a `ReviewApprovesRevision` fact names the
+    /// exact same digest as `artifact_candidate().edge.target`, but the edge
+    /// is an `artifact_binds_digest` edge, not a review->revision edge.
+    /// GitHub proves its PR/review/merge facts, never an unrelated
+    /// artifact-digest edge.
+    #[test]
+    fn review_approves_revision_cannot_admit_artifact_edge() {
+        let same_digest_wrong_relation = ProviderAttestedRelationCandidateV2 {
+            fact_binding: ProviderFactBindingV1::ReviewApprovesRevision {
+                reviewed_revision: resource(IdentityForm::Version, "artifact", '9'),
+            },
+            ..artifact_candidate()
+        };
+        assert_relation_kind_rejected(
+            &same_digest_wrong_relation,
+            ProviderEvidenceKindV1::CodeReview,
+        );
+    }
+
+    /// AUTH-02, fifth variant: an `ArtifactBindsDigest` fact names the exact
+    /// same digest as `build_candidate().edge.target`, but the edge is a
+    /// `build_consumes_revision` edge, not an artifact->digest edge.
+    #[test]
+    fn artifact_binds_digest_cannot_admit_build_edge() {
+        let same_digest_wrong_relation = ProviderAttestedRelationCandidateV2 {
+            fact_binding: ProviderFactBindingV1::ArtifactBindsDigest {
+                artifact: resource(IdentityForm::Version, "commit", '8'),
+            },
+            ..build_candidate()
+        };
+        assert_relation_kind_rejected(
+            &same_digest_wrong_relation,
+            ProviderEvidenceKindV1::CiAttempt,
+        );
+    }
+
+    /// AUTH-02 conjunct isolation (deployment variant): `relation_proof`
+    /// names an unregistered relation type while the edge's `source` kind
+    /// and every bound identifier still match — proving the `entry_id`
+    /// comparison alone, independent of `binds_edge`, gates admission.
+    #[test]
+    fn deployment_binding_relation_entry_id_mismatch_rejected() {
+        let mut wrong_entry_id_edge = candidate();
+        let mut relation_proof = wrong_entry_id_edge.edge.relation_proof.clone();
+        relation_proof.entry_id =
+            ContractId::new("relation.deployment_selects_configuration").unwrap();
+        wrong_entry_id_edge.edge.relation_proof = relation_proof;
+        assert_relation_kind_rejected(
+            &wrong_entry_id_edge,
+            ProviderEvidenceKindV1::DeploymentControlPlane,
+        );
+    }
+
+    /// AUTH-02 conjunct isolation (deployment variant): `relation_proof`
+    /// correctly names `relation.deployment_selects_artifact`, but the
+    /// edge's `source` is not a `deployment` resource — proving the
+    /// `source_resource_kind` comparison alone, independent of the
+    /// `entry_id` comparison, also gates admission.
+    #[test]
+    fn deployment_binding_source_kind_mismatch_rejected() {
+        let mut wrong_source_kind_edge = candidate();
+        wrong_source_kind_edge.edge.source = resource(IdentityForm::Entity, "build", '1');
+        assert_relation_kind_rejected(
+            &wrong_source_kind_edge,
+            ProviderEvidenceKindV1::DeploymentControlPlane,
+        );
     }
 
     #[test]

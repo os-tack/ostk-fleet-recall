@@ -40,7 +40,7 @@ compared against a literal hex constant in the test module.
 `RelationAdmissionOutcomeV2` itself has no wire form and is never fixture
 material: it is a private-field, non-`Deserialize` capability constructible
 only by calling `evaluate_provider_attested_admission` in-process, so the
-test suite exercises its five closed reason variants directly rather than by
+test suite exercises its six closed reason variants directly rather than by
 decoding a payload. Regenerating `candidate.jsonl`/`vector-suite.jsonl`
 (`cargo +1.94 test regenerate_relation_admission_v2_artifacts -- --ignored
 --nocapture` with `RELATION_ADMISSION_VECTOR_OUTPUT` set) is a
@@ -69,15 +69,30 @@ in the test module.
   deployment binding's second identifier) — a fact about a different
   artifact/revision/configuration than the edge asserts is rejected outright
   (`FactBindingDoesNotBindTheEdge`), not admitted and not merely downgraded.
-  `ref_observes_revision_cannot_admit_deployment_edge` additionally proves a
-  correctly-kinded `RefObservesRevision` fact still cannot admit an unrelated
-  `deployment_selects_artifact` edge just because its evidence kind matches.
-- **AUTH-02** — the same test asserts the exact evidence-kind binding named
-  by the invariant (Git ref event -> observed ref state only; review ->
-  code-review evidence; build/artifact -> CI attempt; deployment -> deployment
-  control-plane); `evidence_kind_scope_mismatch_is_rejected_not_downgraded`
-  proves a `GitRefEvent` cannot admit a deployment fact — scope mismatches
-  fail closed as `Rejected`, not merely downgraded.
+- **AUTH-02** — `ProviderFactBindingV1::admits_relation_kind` binds each
+  variant to the closed relation type it is bounded to prove (the edge's
+  `relation_proof` registry entry id and the resource kind of its `source`
+  endpoint), checked *before* `binds_edge` and independent of it: a fact
+  binding that names the same digest as an edge's target is still rejected
+  (`FactBindingCannotProveThisRelation`, never merely downgraded) when the
+  edge itself is not the kind of edge that evidence kind is bounded to
+  prove. `ref_observes_revision_cannot_admit_deployment_edge`,
+  `build_consumes_revision_cannot_admit_deployment_edge`,
+  `review_approves_revision_cannot_admit_artifact_edge`, and
+  `artifact_binds_digest_cannot_admit_build_edge` each hold the bound
+  identifier's digest exactly equal to the wrong edge's target and vary only
+  the edge's relation type, proving the same-digest coincidence alone can
+  never admit a cross-relation fact.
+  `deployment_binding_relation_entry_id_mismatch_rejected` and
+  `deployment_binding_source_kind_mismatch_rejected` isolate the two
+  `admits_relation_kind` conjuncts independently for the deployment binding.
+  The evidence-kind binding named by the invariant itself (Git ref event ->
+  observed ref state only; review -> code-review evidence; build/artifact ->
+  CI attempt; deployment -> deployment control-plane) is asserted by
+  `each_prov01_binding_maps_to_its_exact_evidence_kind`, and
+  `evidence_kind_scope_mismatch_is_rejected_not_downgraded` proves a
+  `GitRefEvent` cannot admit a deployment fact — scope mismatches fail
+  closed as `Rejected`, not merely downgraded.
 - **REL-01** — `RelationAdmissionOutcomeV2` has private fields, no
   `Deserialize` impl, and is constructed only inside
   `evaluate_provider_attested_admission`; no payload byte can select
@@ -108,9 +123,23 @@ test exercises directly. Attempt to admit a provider fact whose evidence kind
 and binding *shape* are correct but whose bound identifier names a different
 artifact, revision, or configuration than the edge asserts — e.g. a real
 `DeploymentControlPlane` fact about artifact `sha256:4444…` admitted for an
-edge whose `target` is artifact `sha256:2222…`, or a real `GitRefEvent` fact
-about commit `sha256:6666…` admitted for a `deployment_selects_artifact` edge
-that names no commit at all — rejected by `ProviderFactBindingV1::binds_edge`
-as `FactBindingDoesNotBindTheEdge`, which every `*_binding_edge_mismatch_rejected`
-test and `ref_observes_revision_cannot_admit_deployment_edge` exercise
-directly.
+edge whose `target` is artifact `sha256:2222…` — rejected by
+`ProviderFactBindingV1::binds_edge` as `FactBindingDoesNotBindTheEdge`, which
+every `*_binding_edge_mismatch_rejected` test exercises directly. Attempt the
+sharper AUTH-02 attack: keep a bound identifier's digest *exactly equal* to
+an edge's target so `binds_edge` alone would admit it, but point the fact at
+an edge of a different relation type entirely — e.g. a real `GitRefEvent`
+fact naming the same content-addressed digest as a
+`deployment_selects_artifact` edge's `target` artifact, or a real
+`ReviewApprovesRevision` fact naming the same digest as an
+`artifact_binds_digest` edge's `target` — rejected by
+`ProviderFactBindingV1::admits_relation_kind` as
+`FactBindingCannotProveThisRelation` before `binds_edge` is even consulted,
+which `ref_observes_revision_cannot_admit_deployment_edge`,
+`build_consumes_revision_cannot_admit_deployment_edge`,
+`review_approves_revision_cannot_admit_artifact_edge`, and
+`artifact_binds_digest_cannot_admit_build_edge` each exercise directly for a
+different pair of relation types. A Git ref event proves the provider's
+observed ref state only, CI proves only the named attempt, and a deployment
+control-plane event proves only its registered predicates — never each
+other's edges, no matter what digest happens to coincide.
