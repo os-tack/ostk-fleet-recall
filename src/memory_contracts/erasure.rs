@@ -291,6 +291,24 @@ pub struct ErasureFenceCasV1 {
     pub current: ErasureFenceV1,
 }
 
+/// The epoch a fence's `entries` assign to exactly one occurrence of `kind`.
+///
+/// Returns `None` when `kind` is missing OR ambiguous (more than one entry
+/// claims it) rather than picking either candidate — an ambiguous fence has
+/// no epoch anyone can trust for that kind, so it must compare unequal to
+/// everything, never equal by accident. This is what keeps
+/// [`ErasureFenceCasV1::may_commit`] sound even if `entries.len() ==
+/// REQUIRED_FENCE_KINDS.len()` were ever weakened or bypassed: a duplicate-kind
+/// `expected` fence cannot satisfy a lookup that requires a single match.
+fn single_epoch_for_kind(entries: &[ErasureFenceEntryV1], kind: ErasureScopeKind) -> Option<u64> {
+    let mut matches = entries.iter().filter(|entry| entry.kind == kind);
+    let only = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(only.epoch)
+}
+
 impl ErasureFenceCasV1 {
     pub fn validate(&self) -> ContractResult<()> {
         self.expected.validate()?;
@@ -306,14 +324,26 @@ impl ErasureFenceCasV1 {
     /// Whether the work that captured `expected` may still commit against
     /// `current`. `false` means the commit must fail closed and restart from
     /// a freshly observed fence.
+    ///
+    /// `no_epoch_advanced` binds each required scope kind by exact,
+    /// unambiguous per-kind lookup (`single_epoch_for_kind`) rather than
+    /// asking whether *some* `expected` entry matches each `current` entry.
+    /// That keeps this sound on its own — not merely because `validate()`
+    /// happens to force exactly four entries, one per kind — so a forged
+    /// `expected` fence carrying a duplicate kind can never be read as
+    /// "no epoch advanced" even if the arity guard in `ErasureFenceV1::
+    /// validate` were ever removed or bypassed upstream.
     pub fn may_commit(&self) -> ContractResult<bool> {
         self.validate()?;
         let same_generation = self.expected.generation.value == self.current.generation.value;
-        let no_epoch_advanced = self.current.entries.iter().all(|current_entry| {
-            self.expected.entries.iter().any(|expected_entry| {
-                expected_entry.kind == current_entry.kind
-                    && expected_entry.epoch == current_entry.epoch
-            })
+        let no_epoch_advanced = REQUIRED_FENCE_KINDS.iter().all(|kind| {
+            match (
+                single_epoch_for_kind(&self.current.entries, *kind),
+                single_epoch_for_kind(&self.expected.entries, *kind),
+            ) {
+                (Some(current_epoch), Some(expected_epoch)) => current_epoch == expected_epoch,
+                _ => false,
+            }
         });
         Ok(same_generation && no_epoch_advanced)
     }
@@ -368,9 +398,9 @@ impl ErasureTombstoneV1 {
                 superseded_by,
             } => {
                 installed_at.is_microsecond_aligned()
-                    && superseded_by
-                        .as_ref()
-                        .is_none_or(|id| id.digest() != Sha256Digest::ZERO)
+                    && superseded_by.as_ref().is_none_or(|id| {
+                        id.digest() != Sha256Digest::ZERO && *id != self.erasure_event_id
+                    })
             }
         };
         if self.schema_version != ERASURE_SCHEMA_VERSION
@@ -615,10 +645,22 @@ impl LegalHoldV1 {
 
     /// Whether removal may proceed at `at`. A hold defers removal for its
     /// entire active interval; only a recorded release lifts it.
-    pub fn permits_removal(&self, at: &CanonicalTimestamp) -> bool {
-        self.released_at
+    ///
+    /// Fails closed on the hold itself first: `self.validate()` must succeed
+    /// before any permissive answer is possible. An unvalidatable hold (for
+    /// example one whose `released_at` precedes `placed_at`) has a release
+    /// state nobody can trust, so it must never be treated as "released" and
+    /// therefore permissive — a legal hold exists to DEFER removal, and
+    /// answering `true` for a record this module cannot validate would
+    /// destroy held material. This is the same fail-closed shape as
+    /// `re_consent_permits_new_source_fact`, `RetainableMatcherPolicyV1::
+    /// required_scope_action`, and `RestoreGateV1::outcome`.
+    pub fn permits_removal(&self, at: &CanonicalTimestamp) -> ContractResult<bool> {
+        self.validate()?;
+        Ok(self
+            .released_at
             .as_ref()
-            .is_some_and(|released| released <= at)
+            .is_some_and(|released| released <= at))
     }
 
     /// Content-addressed identity of this exact hold state. Placing and
@@ -1308,6 +1350,58 @@ mod tests {
         zero_target.target.target_digest = Sha256Digest::ZERO;
         assert!(zero_target.validate_shape().is_err());
 
+        // Foreign/unfrozen profile: `profile` is in the `ostk-erasure-event-v1`
+        // digest preimage and is this candidate's anchor to the frozen
+        // runtime profile. Nothing else in `validate_shape` rejects a
+        // candidate under a different profile, so this must be pinned
+        // directly.
+        let mut foreign_profile = event.clone();
+        foreign_profile.profile.profile_digest = Sha256Digest::ZERO;
+        assert_eq!(
+            foreign_profile.validate_shape(),
+            Err(ContractError::ProfileMismatch)
+        );
+        assert_eq!(
+            foreign_profile.accepted_event_id(),
+            Err(ContractError::ProfileMismatch)
+        );
+
+        // Bounded interval, positive case: `effective_until` set strictly
+        // after `effective_from` must validate. Every other fixture in this
+        // module leaves `effective_until: null`, so without this the
+        // `until.is_microsecond_aligned() && *until > self.effective_from`
+        // branch has no fixture exercising it at all.
+        let mut bounded_interval = event.clone();
+        bounded_interval.effective.effective_until =
+            Some(CanonicalTimestamp::parse("2026-09-16T00:00:00.000000000Z").unwrap());
+        bounded_interval.validate_shape().unwrap();
+
+        // Bounded interval, negative case: `effective_until` at or before
+        // `effective_from` must fail closed. This isolates
+        // `*until > self.effective_from` from the alignment check next to it.
+        let mut inverted_interval = event.clone();
+        inverted_interval.effective.effective_until =
+            Some(inverted_interval.effective.effective_from.clone());
+        assert_eq!(
+            inverted_interval.validate_shape(),
+            Err(ContractError::Schema(
+                "invalid erasure effective interval".into()
+            ))
+        );
+
+        // `requested_at` misalignment, isolated from every other conjunct:
+        // an otherwise shape-valid event whose `requested_at` carries a
+        // sub-microsecond nanosecond value must fail closed.
+        let mut misaligned_requested_at = event.clone();
+        misaligned_requested_at.requested_at =
+            CanonicalTimestamp::parse("2026-08-16T00:00:00.000000001Z").unwrap();
+        assert_eq!(
+            misaligned_requested_at.validate_shape(),
+            Err(ContractError::Schema(
+                "invalid erasure event candidate".into()
+            ))
+        );
+
         let mut effective_before_policy = event;
         effective_before_policy.effective.effective_from =
             CanonicalTimestamp::parse("2025-01-01T00:00:00.000000000Z").unwrap();
@@ -1398,6 +1492,41 @@ mod tests {
         zero_event_id.erasure_event_id = AcceptedEventId::from_digest(Sha256Digest::ZERO);
         assert!(zero_event_id.validate().is_err());
 
+        // `DigestAndMetadata.installed_at` must itself be microsecond-aligned;
+        // an unaligned nanosecond value must fail closed.
+        let mut misaligned_installed_at = tombstone_with_metadata();
+        let TombstoneLifecycleV1::DigestAndMetadata { installed_at, .. } =
+            &mut misaligned_installed_at.lifecycle
+        else {
+            unreachable!("tombstone_with_metadata always uses DigestAndMetadata");
+        };
+        *installed_at = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000001Z").unwrap();
+        assert!(misaligned_installed_at.validate().is_err());
+
+        // `superseded_by`, when present, must not be the zero digest -- a
+        // tombstone cannot claim supersession by an event that does not
+        // exist.
+        let mut zero_superseded_by = tombstone_with_metadata();
+        let TombstoneLifecycleV1::DigestAndMetadata { superseded_by, .. } =
+            &mut zero_superseded_by.lifecycle
+        else {
+            unreachable!("tombstone_with_metadata always uses DigestAndMetadata");
+        };
+        *superseded_by = Some(AcceptedEventId::from_digest(Sha256Digest::ZERO));
+        assert!(zero_superseded_by.validate().is_err());
+
+        // A tombstone must not name its own `erasure_event_id` as the event
+        // that supersedes it -- a tombstone cannot be its own successor.
+        let mut self_superseded = tombstone_with_metadata();
+        let own_event_id = self_superseded.erasure_event_id;
+        let TombstoneLifecycleV1::DigestAndMetadata { superseded_by, .. } =
+            &mut self_superseded.lifecycle
+        else {
+            unreachable!("tombstone_with_metadata always uses DigestAndMetadata");
+        };
+        *superseded_by = Some(own_event_id);
+        assert!(self_superseded.validate().is_err());
+
         // The type itself has no field that could carry payload bytes; a
         // fixture attempting to add one is rejected by
         // `#[serde(deny_unknown_fields)]`, exercised below against the
@@ -1414,6 +1543,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one test isolating every conjunct of ErasureFenceV1::validate
     fn fence_requires_all_four_scope_kinds_exactly_once() {
         genesis_fence().validate().unwrap();
         advanced_fence().validate().unwrap();
@@ -1421,6 +1551,24 @@ mod tests {
         let mut missing_scope = genesis_fence();
         missing_scope.entries.pop();
         assert!(missing_scope.validate().is_err());
+
+        // A fence whose generation names a different tenant/project than the
+        // fence itself must fail closed: the fence's own scope binding
+        // (`self.generation.scope != self.scope`) is what ties an
+        // otherwise-well-formed fence to one tenant/project, and nothing else
+        // in this shape catches a mismatch here.
+        let mut mismatched_generation_scope = genesis_fence();
+        mismatched_generation_scope.generation.scope =
+            AuthenticatedProjectScopeV1::from_trusted_context(
+                ContractId::new("tenant.other").unwrap(),
+                ContractId::new("project.other").unwrap(),
+            );
+        assert_eq!(
+            mismatched_generation_scope.validate(),
+            Err(ContractError::Schema(
+                "erasure fence must cover exactly the four scope kinds once each".into()
+            ))
+        );
 
         // Isolate the `covers_every_required_kind` conjunct from the
         // `entries.len() != 4` check: four entries, strictly sorted, but one
@@ -1469,6 +1617,49 @@ mod tests {
         assert!(!strictly_sorted(&unsorted_but_complete.entries));
         assert!(unsorted_but_complete.validate().is_err());
 
+        // Isolate `entries.len() != REQUIRED_FENCE_KINDS.len()` from both the
+        // coverage and sortedness checks: five entries, strictly sorted, and
+        // covering all four required kinds -- PrivacySubject duplicated with
+        // two different epochs. Neither `covers_every_required_kind` nor
+        // `strictly_sorted` rejects this; only the length conjunct does. This
+        // matters beyond the shape check itself: a fence like this is exactly
+        // what `ErasureFenceCasV1::may_commit` must never treat as a sound
+        // `expected` snapshot (see `single_epoch_for_kind`).
+        let duplicate_kind_five_entries = ErasureFenceV1 {
+            entries: vec![
+                ErasureFenceEntryV1 {
+                    kind: ErasureScopeKind::PrivacySubject,
+                    epoch: 0,
+                },
+                ErasureFenceEntryV1 {
+                    kind: ErasureScopeKind::PrivacySubject,
+                    epoch: 1,
+                },
+                ErasureFenceEntryV1 {
+                    kind: ErasureScopeKind::Representation,
+                    epoch: 0,
+                },
+                ErasureFenceEntryV1 {
+                    kind: ErasureScopeKind::Resource,
+                    epoch: 0,
+                },
+                ErasureFenceEntryV1 {
+                    kind: ErasureScopeKind::SourceFact,
+                    epoch: 0,
+                },
+            ],
+            ..genesis_fence()
+        };
+        assert_eq!(duplicate_kind_five_entries.entries.len(), 5);
+        assert!(strictly_sorted(&duplicate_kind_five_entries.entries));
+        assert!(REQUIRED_FENCE_KINDS.iter().all(|kind| {
+            duplicate_kind_five_entries
+                .entries
+                .iter()
+                .any(|entry| entry.kind == *kind)
+        }));
+        assert!(duplicate_kind_five_entries.validate().is_err());
+
         let negative_fence: ErasureFenceV1 =
             decode_strict(record(NEGATIVE_FENCE_MISSING_SCOPE_FIXTURE)).unwrap();
         // Distinguishing property, not just the shared error string: this
@@ -1484,6 +1675,78 @@ mod tests {
         assert_ne!(
             genesis_fence().fence_id().unwrap(),
             advanced_fence().fence_id().unwrap()
+        );
+    }
+
+    /// `single_epoch_for_kind` -- the primitive `may_commit`'s
+    /// `no_epoch_advanced` is built on -- must stay sound even when handed
+    /// entries that `ErasureFenceV1::validate` would already reject. A
+    /// duplicate-kind lookup must answer `None` (ambiguous), never either
+    /// candidate epoch, so a forged five-entry `expected` fence can never
+    /// forge agreement with a genuine four-entry `current` fence. This holds
+    /// independently of the `entries.len()` arity guard in
+    /// `ErasureFenceV1::validate`.
+    #[test]
+    fn single_epoch_for_kind_is_ambiguous_on_duplicate_and_absent_on_missing() {
+        let duplicate = [
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::PrivacySubject,
+                epoch: 0,
+            },
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::PrivacySubject,
+                epoch: 1,
+            },
+        ];
+        assert_eq!(
+            single_epoch_for_kind(&duplicate, ErasureScopeKind::PrivacySubject),
+            None
+        );
+        assert_eq!(
+            single_epoch_for_kind(&duplicate, ErasureScopeKind::Representation),
+            None
+        );
+
+        let single = [ErasureFenceEntryV1 {
+            kind: ErasureScopeKind::Resource,
+            epoch: 7,
+        }];
+        assert_eq!(
+            single_epoch_for_kind(&single, ErasureScopeKind::Resource),
+            Some(7)
+        );
+
+        // The exploit shape from the prior review round: a strictly sorted,
+        // all-four-kinds-covered, five-entry `expected` fence (PrivacySubject
+        // duplicated) can never read as "no epoch advanced" against a
+        // genuine four-entry `current` fence, because the ambiguous
+        // PrivacySubject lookup on `expected` alone forces `no_epoch_advanced`
+        // to `false` regardless of what `current` says.
+        let forged_expected = [
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::PrivacySubject,
+                epoch: 0,
+            },
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::PrivacySubject,
+                epoch: 1,
+            },
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::Representation,
+                epoch: 0,
+            },
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::Resource,
+                epoch: 0,
+            },
+            ErasureFenceEntryV1 {
+                kind: ErasureScopeKind::SourceFact,
+                epoch: 0,
+            },
+        ];
+        assert_eq!(
+            single_epoch_for_kind(&forged_expected, ErasureScopeKind::PrivacySubject),
+            None
         );
     }
 
@@ -1701,6 +1964,19 @@ mod tests {
         key_not_destroyed.key_destroyed = false;
         assert!(key_not_destroyed.validate().is_err());
 
+        // A `complete` receipt with an EMPTY `residual_inventory` is vacuous
+        // completion: zero stores verified, yet the receipt claims full
+        // cleanup. `any_residual_present` over an empty vector is trivially
+        // `false`, so only the standalone `residual_inventory.is_empty()`
+        // guard catches this.
+        let mut empty_inventory = receipt_complete();
+        empty_inventory.residual_inventory = Vec::new();
+        assert!(empty_inventory.residual_inventory.is_empty());
+        assert_eq!(
+            empty_inventory.validate(),
+            Err(ContractError::Schema("invalid erasure receipt".into()))
+        );
+
         // Isolate `strictly_sorted(&self.residual_inventory)`: the same two
         // rows as `receipt_pending()`, only reordered. Every other conjunct
         // still passes (non-empty, within the size cap, `pending` so the
@@ -1785,16 +2061,20 @@ mod tests {
         assert!(hold.hold_id().is_ok());
         let before = CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap();
         let during = CanonicalTimestamp::parse("2026-08-17T00:00:00.000000000Z").unwrap();
-        assert!(!hold.permits_removal(&before));
-        assert!(!hold.permits_removal(&during));
+        assert!(!hold.permits_removal(&before).unwrap());
+        assert!(!hold.permits_removal(&during).unwrap());
 
         let mut released = hold;
         released.released_at =
             Some(CanonicalTimestamp::parse("2026-08-18T00:00:00.000000000Z").unwrap());
-        assert!(released.permits_removal(
-            &CanonicalTimestamp::parse("2026-08-19T00:00:00.000000000Z").unwrap()
-        ));
-        assert!(!released.permits_removal(&during));
+        assert!(
+            released
+                .permits_removal(
+                    &CanonicalTimestamp::parse("2026-08-19T00:00:00.000000000Z").unwrap()
+                )
+                .unwrap()
+        );
+        assert!(!released.permits_removal(&during).unwrap());
 
         let negative_hold: LegalHoldV1 =
             decode_strict(record(NEGATIVE_LEGAL_HOLD_PUBLICATION_VISIBILITY_FIXTURE)).unwrap();
@@ -1807,6 +2087,30 @@ mod tests {
         );
         assert_eq!(
             negative_hold.validate(),
+            Err(ContractError::Schema("invalid legal hold".into()))
+        );
+    }
+
+    /// An unvalidatable hold (`released_at` precedes `placed_at`) must never
+    /// answer `permits_removal` with a permissive `true`: it must fail
+    /// `validate()` and `permits_removal` must propagate that as `Err`, never
+    /// a bare bool. This kills the `*released > self.placed_at` mutation
+    /// (`&& true`) directly: with the conjunct neutered, `validate()` would
+    /// wrongly accept this hold and `permits_removal` would wrongly permit
+    /// removal at a time after the (invalid) release.
+    #[test]
+    fn permits_removal_fails_closed_on_release_before_placement() {
+        let mut hold = legal_hold_active();
+        hold.released_at =
+            Some(CanonicalTimestamp::parse("2020-01-01T00:00:00.000000000Z").unwrap());
+        assert_eq!(
+            hold.validate(),
+            Err(ContractError::Schema("invalid legal hold".into()))
+        );
+        assert_eq!(
+            hold.permits_removal(
+                &CanonicalTimestamp::parse("2026-08-16T00:00:00.000000000Z").unwrap()
+            ),
             Err(ContractError::Schema("invalid legal hold".into()))
         );
     }
@@ -1881,6 +2185,27 @@ mod tests {
         zero_recompute_target.recompute_targets =
             vec![AcceptedEventId::from_digest(Sha256Digest::ZERO)];
         assert!(zero_recompute_target.validate().is_err());
+
+        // Isolate `sufficient_redacted_evidence_remains == downgrades` from
+        // the recompute-list conjuncts: `next_state` downgrades and
+        // `recompute_targets` is non-empty, so both list-consistency
+        // conjuncts already pass on their own -- only the direct
+        // contradiction between `sufficient_redacted_evidence_remains` and
+        // `downgrades` (asserting redacted evidence remains sufficient while
+        // simultaneously downgrading support) catches this.
+        let mut contradicts_downgrade = dependent_transition_unverifiable();
+        assert!(!matches!(
+            contradicts_downgrade.next_state,
+            SupportVerificationStateV1::Verified
+        ));
+        assert!(!contradicts_downgrade.recompute_targets.is_empty());
+        contradicts_downgrade.sufficient_redacted_evidence_remains = true;
+        assert_eq!(
+            contradicts_downgrade.validate(),
+            Err(ContractError::Schema(
+                "invalid dependent support transition".into()
+            ))
+        );
 
         let negative_transition: DependentSupportTransitionV1 =
             decode_strict(record(NEGATIVE_DEPENDENT_TRANSITION_CONTRADICTION_FIXTURE)).unwrap();
@@ -2023,6 +2348,14 @@ mod tests {
             DEPENDENT_TRANSITION_UNVERIFIABLE_FIXTURE,
             CHECKPOINT_RULE_FIXTURE,
             VECTOR_SUITE_FIXTURE,
+            NEGATIVE_TOMBSTONE_PAYLOAD_BYTES_FIXTURE,
+            NEGATIVE_RECEIPT_COMPLETE_WITH_RESIDUAL_FIXTURE,
+            NEGATIVE_RECEIPT_COMPLETE_RESIDUAL_DESPITE_KEY_DESTROYED_FIXTURE,
+            NEGATIVE_FENCE_MISSING_SCOPE_FIXTURE,
+            NEGATIVE_EVENT_EFFECTIVE_BEFORE_POLICY_FIXTURE,
+            NEGATIVE_LEGAL_HOLD_PUBLICATION_VISIBILITY_FIXTURE,
+            NEGATIVE_CHECKPOINT_SAME_DIGEST_FIXTURE,
+            NEGATIVE_DEPENDENT_TRANSITION_CONTRADICTION_FIXTURE,
         ] {
             require_canonical(record(bytes)).unwrap();
         }
