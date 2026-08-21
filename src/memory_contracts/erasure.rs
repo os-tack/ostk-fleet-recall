@@ -1479,6 +1479,19 @@ mod tests {
             ))
         );
 
+        // Equal-instant boundary, positive case: `effective_from` exactly
+        // equal to `policy_basis_effective_from` must validate. Every other
+        // fixture in this module leaves a strict gap between the two
+        // timestamps, so without this the `effective_from <
+        // policy_basis_effective_from` conjunct's boundary is never
+        // exercised and a `<` -> `<=` mutation there is invisible: it would
+        // wrongly reject this exact case.
+        let mut effective_equal_to_policy = event.clone();
+        effective_equal_to_policy.effective.effective_from = effective_equal_to_policy
+            .policy_basis_effective_from
+            .clone();
+        effective_equal_to_policy.validate_shape().unwrap();
+
         let mut effective_before_policy = event;
         effective_before_policy.effective.effective_from =
             CanonicalTimestamp::parse("2025-01-01T00:00:00.000000000Z").unwrap();
@@ -2606,6 +2619,50 @@ mod tests {
         );
         assert_eq!(
             negative_rule.validate(),
+            Err(ContractError::Schema(
+                "invalid checkpoint erasure rule".into()
+            ))
+        );
+
+        // Zero previous digest, isolated: an otherwise-valid rule (distinct
+        // nonzero digests, a strictly advancing generation, the correct
+        // schema version) whose `previous_checkpoint_digest` is the zero
+        // digest must still fail closed. This is the sole assertion
+        // distinguishing `||` from `&&` at the join between the
+        // `schema_version` conjunct and this one: under `&&`, a wrong
+        // `schema_version` alone would no longer reject (masked unless this
+        // conjunct also held), and under the next join's `&&` a zero
+        // previous digest alone would no longer reject (masked unless the
+        // zero-new-digest conjunct also held) -- so this single fixture
+        // kills both adjacent `|| -> &&` mutants.
+        let mut zero_previous_digest = checkpoint_rule();
+        zero_previous_digest.previous_checkpoint_digest = Sha256Digest::ZERO;
+        assert_eq!(
+            zero_previous_digest.validate(),
+            Err(ContractError::Schema(
+                "invalid checkpoint erasure rule".into()
+            ))
+        );
+
+        // Zero new digest, isolated: mirrors the previous-digest case above
+        // so the `new_checkpoint_digest == ZERO` conjunct is pinned in its
+        // own right, independent of the zero-previous-digest fixture.
+        let mut zero_new_digest = checkpoint_rule();
+        zero_new_digest.new_checkpoint_digest = Sha256Digest::ZERO;
+        assert_eq!(
+            zero_new_digest.validate(),
+            Err(ContractError::Schema(
+                "invalid checkpoint erasure rule".into()
+            ))
+        );
+
+        // Unrecognized schema_version, isolated: an otherwise-valid rule
+        // under a schema version this module does not recognize must fail
+        // closed, independent of every digest/generation conjunct.
+        let mut wrong_schema_version = checkpoint_rule();
+        wrong_schema_version.schema_version = ERASURE_SCHEMA_VERSION + 1;
+        assert_eq!(
+            wrong_schema_version.validate(),
             Err(ContractError::Schema(
                 "invalid checkpoint erasure rule".into()
             ))
