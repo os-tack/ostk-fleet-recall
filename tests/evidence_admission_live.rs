@@ -1302,12 +1302,39 @@ async fn live_a_tampered_content_row_fails_the_next_append_closed_when_configure
             ),
         )
         .await;
+    // Capture and assert the ACTUAL outcome, not just `is_err()`: the earlier
+    // flake returned `Ok(AppendOutcome::_)` because an unlocked fence read
+    // missed the tamper, and a bare `is_err()` would not have told us which
+    // path produced the wrong answer. The fence is a hard, non-retryable
+    // integrity refusal, so it surfaces through the closed storage/integrity
+    // seam carrying the storage-identity divergence message.
+    let error = match outcome {
+        Ok(unexpected) => panic!(
+            "a divergent stored content object must fail the append closed, \
+             but the append returned {unexpected:?}"
+        ),
+        Err(error) => error,
+    };
     assert!(
-        outcome.is_err(),
-        "a divergent stored content object must fail the append closed"
+        matches!(&error, EvidenceAppendError::Storage(_)),
+        "the divergent stored row must fail closed through the storage/integrity \
+         seam, got {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("diverges from the admitted object under one storage identity"),
+        "the append must fail with the storage-identity divergence, got {error}"
     );
     assert_eq!(
         scoped_count(&pool, "memory_evidence_events", &scope.physical_scope).await,
+        1
+    );
+    // No divergent content object was accepted: the origin row is the only one,
+    // and it is exactly the tampered row the fence read (EVID-01 fails closed
+    // without mutating the stored row).
+    assert_eq!(
+        scoped_count(&pool, "memory_content_objects", &scope.physical_scope).await,
         1
     );
 }

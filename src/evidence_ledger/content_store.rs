@@ -78,6 +78,14 @@
 //! nonces, so equal plaintext yields different bytes, and comparing them would
 //! turn a correct retry into a false integrity alarm.
 //!
+//! The comparison reads the conflicting row with `SELECT … FOR UPDATE`, not an
+//! unlocked follow-up `SELECT`. `ON CONFLICT DO NOTHING` does not advance the
+//! append transaction's read timestamp, so an unlocked read could be served a
+//! pre-tamper snapshot and let a divergent stored row pass the append open. The
+//! locking read resolves the latest committed version and refreshes the read
+//! timestamp forward to it (or restarts the append with a retryable
+//! serialization error), so the divergence fails closed on every execution.
+//!
 //! # Why the four erasure-index columns stay NULL here
 //!
 //! A storage identity is `f(protection domain, content digest)`
@@ -155,6 +163,24 @@ const SELECT_CONTENT_OBJECT_SQL: &str = "SELECT protection_domain_id, media_type
      retention_policy_entry_version, retention_policy_digest, wrapped_dek, encrypted_bytes \
      FROM public.memory_content_objects \
      WHERE tenant_id = $1 AND project = $2 AND storage_identity = $3";
+
+/// The `ON CONFLICT DO NOTHING` insert reported that the row already existed, so
+/// the fence must compare the admitted object against the row the write
+/// conflicted with. That read is `FOR UPDATE`, never an unlocked follow-up
+/// `SELECT`: an unlocked read is served at the append transaction's read
+/// timestamp, which the `DO NOTHING` conflict scan does not advance, so a
+/// divergence committed after that timestamp — a stored-row tamper — can be
+/// invisible to it (EVID-01 could pass the append open). A locking read
+/// resolves the latest committed version of the row and refreshes the read
+/// timestamp forward to it (or restarts the append with a retryable serialization
+/// error), so the fence sees the tamper on every execution. This is the same
+/// `FOR UPDATE` discipline the shard-head lock uses.
+const LOCK_CONTENT_OBJECT_SQL: &str = "SELECT protection_domain_id, media_type, byte_length, \
+     content_digest, retention_class, retention_policy_entry_id, \
+     retention_policy_entry_version, retention_policy_digest, wrapped_dek, encrypted_bytes \
+     FROM public.memory_content_objects \
+     WHERE tenant_id = $1 AND project = $2 AND storage_identity = $3 \
+     FOR UPDATE";
 
 /// The deployment key-encryption key that wraps every per-object DEK.
 ///
@@ -648,7 +674,7 @@ async fn require_stored_object_matches(
     project: &str,
     sealed: &SealedContentObject,
 ) -> EvidenceAppendResult<()> {
-    let row = sqlx::query(SELECT_CONTENT_OBJECT_SQL)
+    let row = sqlx::query(LOCK_CONTENT_OBJECT_SQL)
         .bind(tenant_id)
         .bind(project)
         .bind(sealed.storage_identity.as_bytes().to_vec())
@@ -912,6 +938,22 @@ mod tests {
         let mut stored = admitted.clone();
         stored.media_type = ContractId::new("application.github.push").unwrap();
         assert!(!storage_identity_columns_diverge(&stored, &admitted));
+    }
+
+    /// The dedup fence must read the conflicting row under a lock so a stored
+    /// tamper committed after the append's read timestamp cannot hide behind an
+    /// unlocked snapshot read (EVID-01). The retrieval path is a plain read and
+    /// must NOT lock, so it never contends with a concurrent append.
+    #[test]
+    fn the_dedup_fence_reads_under_a_lock_and_retrieval_does_not() {
+        assert!(LOCK_CONTENT_OBJECT_SQL.contains("FOR UPDATE"));
+        assert!(!SELECT_CONTENT_OBJECT_SQL.contains("FOR UPDATE"));
+        // The two statements differ only by the trailing lock clause: the fence
+        // must compare exactly the columns retrieval decodes.
+        assert_eq!(
+            LOCK_CONTENT_OBJECT_SQL,
+            format!("{SELECT_CONTENT_OBJECT_SQL} FOR UPDATE")
+        );
     }
 
     #[test]
