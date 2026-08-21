@@ -113,11 +113,11 @@ extract_application_excerpt() {
             }
         }
         END {
-            if (record_count != 1 || marker_count != 1 || record_line != marker_line - 2 ||
-                    marker_line < 4 || marker_line + 3 > NR) {
+            if (record_count != 1 || marker_count != 1 || record_line != marker_line - 3 ||
+                    marker_line < 5 || marker_line + 3 > NR) {
                 exit 1
             }
-            for (line = marker_line - 3; line <= marker_line + 3; line++) {
+            for (line = marker_line - 4; line <= marker_line + 3; line++) {
                 print lines[line]
             }
         }
@@ -140,11 +140,11 @@ extract_application_coordinates() {
             }
         }
         END {
-            if (record_count != 1 || marker_count != 1 || record_line != marker_line - 2 ||
-                    marker_line < 4 || marker_line + 3 > NR) {
+            if (record_count != 1 || marker_count != 1 || record_line != marker_line - 3 ||
+                    marker_line < 5 || marker_line + 3 > NR) {
                 exit 1
             }
-            print marker_line - 3, marker_line + 3
+            print marker_line - 4, marker_line + 3
         }
     ' "$1"
 }
@@ -177,8 +177,8 @@ line_count=$(wc -l < "$input" | tr -d '[:space:]')
 case $line_count in
     ''|*[!0-9]*) fail "line count is not numeric" ;;
 esac
-if [ "$line_count" -ne 5641 ]; then
-    fail "record count must be exactly 5641 (found $line_count)"
+if [ "$line_count" -ne 7676 ]; then
+    fail "record count must be exactly 7676 (found $line_count)"
 fi
 
 if awk 'length($0) > 16384 { exit 1 }' "$input"; then
@@ -365,12 +365,12 @@ if ! jq -s -e \
         | map(select(length > 0 and (startswith("#") | not)))
         | map(split("|")[0])
         | sort) as $expected_repository_sources
-    | ($expected_doc_sources | length) == 42
-    and ($expected_repository_sources | length) == 391
+    | ($expected_doc_sources | length) == 54
+    and ($expected_repository_sources | length) == 559
     and
-    ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 1050
+    ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 1296
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 4385
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 6174
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:docs:v1") | .source_id] | unique | sort)
         == $expected_doc_sources
@@ -427,7 +427,7 @@ if ! jq -s -e \
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "deploy/cockroach/tests/runtime-role-grants.sh"
-        )] | length) == 111
+        )] | length) == 112
     and ([.[] | select(
             .source_config_id == "rich-demo:repository:v1"
             and .source_id == "deploy/cockroach/tests/successor-activation-role-grants.sh"

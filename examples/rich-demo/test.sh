@@ -139,10 +139,10 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 5641
-    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 1050
+    length == 7676
+    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 1296
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 4385
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 6174
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "src/bin/ostk-control-bootstrap.rs")] | length) == 11
@@ -169,7 +169,7 @@ if ! jq -s -e '
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "deploy/cockroach/runtime-role-grants.sql")] | length) == 31
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "deploy/cockroach/tests/runtime-role-grants.sh")] | length) == 111
+        and .source_id == "deploy/cockroach/tests/runtime-role-grants.sh")] | length) == 112
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "deploy/cockroach/tests/successor-activation-role-grants.sh")] | length) == 83
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"

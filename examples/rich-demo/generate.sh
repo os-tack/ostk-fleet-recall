@@ -564,11 +564,11 @@ extract_application_excerpt() {
             }
         }
         END {
-            if (record_count != 1 || marker_count != 1 || record_line != marker_line - 2 ||
-                    marker_line < 4 || marker_line + 3 > NR) {
+            if (record_count != 1 || marker_count != 1 || record_line != marker_line - 3 ||
+                    marker_line < 5 || marker_line + 3 > NR) {
                 exit 1
             }
-            for (line = marker_line - 3; line <= marker_line + 3; line++) {
+            for (line = marker_line - 4; line <= marker_line + 3; line++) {
                 print lines[line]
             }
         }
@@ -591,11 +591,11 @@ extract_application_coordinates() {
             }
         }
         END {
-            if (record_count != 1 || marker_count != 1 || record_line != marker_line - 2 ||
-                    marker_line < 4 || marker_line + 3 > NR) {
+            if (record_count != 1 || marker_count != 1 || record_line != marker_line - 3 ||
+                    marker_line < 5 || marker_line + 3 > NR) {
                 exit 1
             }
-            print marker_line - 3, marker_line + 3
+            print marker_line - 4, marker_line + 3
         }
     ' "$1"
 }
