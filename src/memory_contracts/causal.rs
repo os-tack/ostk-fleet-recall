@@ -3086,4 +3086,45 @@ mod tests {
             ])
         );
     }
+
+    /// Mutation coverage for the `ratification.causal_role.is_some()`
+    /// conjunct guarding the re-derivation branch in `evaluate_ratification`
+    /// (and, incidentally, the first committed exercise of
+    /// `CausalRoleRequiredForRatifiedConclusion`, which no prior test
+    /// reached). `conclusion` is `ratified` — so the re-derivation branch's
+    /// other two conjuncts are satisfied — but `causal_role` is `None`, so a
+    /// `ratified` record with no causal role is rejected on that ground
+    /// alone; the bound intervention's own disqualification (partial
+    /// coverage) must never additionally surface here, since a record with
+    /// no causal role makes no claim for `derive_intervention_support_level`
+    /// to re-derive against. Deleting `causal_role.is_some()` (or flipping it
+    /// to a tautology) would surface `BoundInterventionDoesNotReachInterventionSupported`
+    /// too, which this exact-match assertion catches.
+    #[test]
+    fn causal_role_none_on_ratified_conclusion_skips_the_intervention_rederivation_branch() {
+        let hyp = hypothesis();
+        let mut disqualified_intervention = base_intervention(&hyp);
+        disqualified_intervention.coverage.completeness = CoverageCompletenessV1::Partial;
+        let mut ratification = base_ratification(&hyp);
+        ratification.causal_role = None;
+        ratification.intervention_support_digest =
+            Some(disqualified_intervention.digest().unwrap());
+        assert!(
+            ratification
+                .binds_intervention(&disqualified_intervention)
+                .unwrap()
+        );
+        assert!(
+            derive_intervention_support_level(&hyp, &disqualified_intervention)
+                .unwrap()
+                .is_err()
+        );
+
+        assert_eq!(
+            evaluate_ratification(&ratification, &hyp, Some(&disqualified_intervention)).unwrap(),
+            Err(vec![
+                RatificationBlockedReasonV1::CausalRoleRequiredForRatifiedConclusion
+            ])
+        );
+    }
 }
