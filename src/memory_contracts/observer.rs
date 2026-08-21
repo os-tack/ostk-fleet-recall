@@ -678,11 +678,15 @@ fn verification_outcome_is_shape_admissible(
 /// receipts to a verification outcome.
 ///
 /// Dependency drift (the run's witnessed executable/dependency digests do not
-/// exactly match the admitted identity) and a `timeout` outcome both resolve
-/// to `indeterminate` unconditionally: never a verified negative, never a
-/// silent failure. A `candidate_only` admission never verifies. Otherwise,
+/// exactly match the admitted identity), a run outcome kind its own
+/// admission never declared in `declared_outcome_kinds`, and a `timeout`
+/// outcome all resolve to `indeterminate` unconditionally: never a verified
+/// negative, never a silent failure. A `candidate_only` admission never
+/// verifies. Otherwise,
 /// `verified_negative`/`verified_exact_set` require `closed_world_verified`,
-/// zero skipped/failed/unsupported/unknown inputs, and complete, current,
+/// zero skipped/failed/unsupported/unknown inputs, a non-empty included-input
+/// tally (a closed domain that included nothing proves nothing, however
+/// "complete" the coverage receipt reports it), and complete, current,
 /// contiguous-when-applicable coverage; a `positive_verified` (or
 /// `closed_world_verified`) admission may still emit an individually proven
 /// positive under partial coverage, provided the run itself did not fail to
@@ -712,6 +716,13 @@ pub fn derive_verification_outcome(
     if !run_covers_every_required_applicability_dimension(admission, run) {
         return Ok(VerificationOutcomeV1::Indeterminate);
     }
+    // A run reporting an outcome kind its own admission never declared is
+    // contested input, not a silent pass-through: the declared set is a
+    // closed enumeration of what this admitted observer may honestly report,
+    // not decoration.
+    if !admission.declared_outcome_kinds.contains(&run.outcome) {
+        return Ok(VerificationOutcomeV1::Indeterminate);
+    }
     if run.outcome == ObserverOutcomeKindV1::Timeout {
         return Ok(VerificationOutcomeV1::Indeterminate);
     }
@@ -725,8 +736,14 @@ pub fn derive_verification_outcome(
         EvaluatedConditionV1::Absent => DefiniteConditionV1::Absent,
     };
 
-    let full_coverage =
-        run.inputs.has_no_gap_inputs() && run.coverage.is_complete_current_and_contiguous();
+    // A closed input boundary that included nothing (`included.total_count ==
+    // 0`) can never itself support a verified negative or exact-set finding:
+    // the coverage receipt is the external authority for "complete", but
+    // this module stays fail-closed on its own rather than trusting that a
+    // vacuously empty domain was ever the domain the admission intended.
+    let full_coverage = run.inputs.has_no_gap_inputs()
+        && run.coverage.is_complete_current_and_contiguous()
+        && !run.inputs.included.is_empty();
 
     let outcome = match (claim_shape, condition) {
         (ObserverClaimShapeV1::Presence, DefiniteConditionV1::Absent) => {
@@ -977,18 +994,29 @@ impl ObserverDerivationDisagreementV1 {
 /// `run` supports.
 ///
 /// Every field of [`ObserverResultV1`] and [`ObserverRunReceiptV1`] is
-/// public, so none of these three bindings may be trusted from the payload
+/// public, so none of these five bindings may be trusted from the payload
 /// alone (AUTH-03): `result.admission_digest` must equal
 /// `admitted.admission().digest()`; `result.run_receipt_digest` must equal
 /// `run.digest()` (naming a run receipt that was never actually supplied is
-/// rejected, not merely unverified); and `result.verification_outcome` must
-/// equal what [`derive_verification_outcome`] independently recomputes from
+/// rejected, not merely unverified); `result.predicate` must equal
+/// `admitted.admission().predicate` -- exactly, by `entry_id`, `version`,
+/// AND `entry_digest`, i.e. the doc's "predicate versions" (PRED-05) -- so an
+/// observer admitted for predicate Q can never emit a verified finding about
+/// an unrelated predicate P merely by relabelling the payload field;
+/// `result.applicability` must equal `run.applicability`, so a result can
+/// never claim a concrete applicability its own cited run receipt never
+/// actually read (COVER-01); and `result.verification_outcome` must equal
+/// what [`derive_verification_outcome`] independently recomputes from
 /// `admitted`, `run`, and the result's own `claim_shape`/
 /// `evaluated_condition` -- a self-reported outcome relabelled away from its
 /// cited run receipt's honest derivation (for example, forging
 /// `verified_positive` over a run whose honest derivation is `indeterminate`
 /// because it timed out) is rejected outright, never silently accepted and
-/// merely ignored downstream.
+/// merely ignored downstream. These are the same bindings
+/// [`build_observer_result`] already enforces at construction time; this
+/// function re-derives and re-checks all of them from the supplied
+/// capabilities so a second entry point (a stored/replayed result) can never
+/// reopen the seam that one honest constructor closes.
 fn require_result_matches_admitted_run(
     admitted: &AdmittedObserverV1,
     run: &ObserverRunReceiptV1,
@@ -1003,6 +1031,16 @@ fn require_result_matches_admitted_run(
     if result.run_receipt_digest != run.digest()? {
         return Err(ContractError::Schema(
             "result run_receipt_digest does not match the supplied run receipt".into(),
+        ));
+    }
+    if result.predicate != admitted.admission().predicate {
+        return Err(ContractError::Schema(
+            "result predicate does not match the supplied admission's predicate".into(),
+        ));
+    }
+    if result.applicability != run.applicability {
+        return Err(ContractError::Schema(
+            "result applicability does not match the supplied run receipt's applicability".into(),
         ));
     }
     let expected_outcome = derive_verification_outcome(
@@ -1069,8 +1107,15 @@ pub fn detect_disagreement(
         &left_admission_body.input_domain.supported_source_kinds,
         &right_admission_body.input_domain.supported_source_kinds,
     );
-    let same_predicate = left_result.predicate == right_result.predicate;
-    let same_applicability = left_result.applicability == right_result.applicability;
+    // Keyed on the *admitted* predicate and the *run's* applicability, not on
+    // the two results' self-reported `predicate`/`applicability` fields:
+    // `require_result_matches_admitted_run` above has already proven each
+    // result's fields equal its own admission's predicate and its own run's
+    // applicability, but overlap must be decided on the trusted capabilities
+    // directly so no future entry point can reintroduce a payload-to-payload
+    // comparison here (PRED-05, COVER-01).
+    let same_predicate = left_admission_body.predicate == right_admission_body.predicate;
+    let same_applicability = left_run.applicability == right_run.applicability;
     let same_scope = left_result.scope == right_result.scope;
     if !(domains_overlap && same_predicate && same_applicability && same_scope) {
         return Ok(None);
@@ -1443,6 +1488,34 @@ mod tests {
     }
 
     #[test]
+    fn closed_world_admission_never_verifies_a_negative_over_an_empty_included_tally() {
+        // A closed input boundary that included nothing proves nothing,
+        // however "complete/current/contiguous" the coverage witness reports
+        // it: `included.total_count == 0` must fail closed rather than
+        // vacuously support a verified negative.
+        let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let admitted = admit(admission.clone());
+        let vacuous_inputs = ObserverInputAccountingV1 {
+            included: empty_input_tally(),
+            ..zero_gap_inputs()
+        };
+        let run = run_receipt(
+            matching_runtime_identity(&admission.identity),
+            vacuous_inputs,
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let outcome = derive_verification_outcome(
+            &admitted,
+            &run,
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Absent,
+        )
+        .unwrap();
+        assert_eq!(outcome, VerificationOutcomeV1::Indeterminate);
+    }
+
+    #[test]
     fn closed_world_admission_verifies_an_exact_set_under_full_coverage() {
         let admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
         let admitted = admit(admission.clone());
@@ -1526,6 +1599,31 @@ mod tests {
             &run,
             ObserverClaimShapeV1::Presence,
             EvaluatedConditionV1::Absent,
+        )
+        .unwrap();
+        assert_eq!(outcome, VerificationOutcomeV1::Indeterminate);
+    }
+
+    #[test]
+    fn run_outcome_undeclared_by_its_own_admission_is_indeterminate() {
+        // An admission's `declared_outcome_kinds` is a closed enumeration of
+        // what this admitted observer may honestly report, not a decorative
+        // hint: a run reporting a kind its own admission never declared must
+        // never verify.
+        let mut admission = admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        admission.declared_outcome_kinds = vec![ObserverOutcomeKindV1::Success];
+        let admitted = admit(admission.clone());
+        let run = run_receipt(
+            matching_runtime_identity(&admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Partial,
+        );
+        let outcome = derive_verification_outcome(
+            &admitted,
+            &run,
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Present,
         )
         .unwrap();
         assert_eq!(outcome, VerificationOutcomeV1::Indeterminate);
@@ -1953,6 +2051,143 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_domains_with_different_admitted_predicates_never_disagree() {
+        // Same admitted input domain (so `domains_overlap` alone would not
+        // suppress this), but each side is genuinely admitted for a
+        // different predicate. Overlap must be keyed on the *admitted*
+        // predicates, not merely on whether the two supported-kind sets
+        // intersect.
+        let closed_admission =
+            admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let closed_admitted = admit(closed_admission.clone());
+        let closed_run = run_receipt(
+            matching_runtime_identity(&closed_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let negative_result = build_observer_result(
+            &closed_admitted,
+            &closed_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Absent,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+
+        let mut other_admission =
+            admission("ast_schema", ObserverAdmissionModeV1::PositiveVerified);
+        other_admission.admission_id = ContractId::new("observer.other_predicate").unwrap();
+        other_admission.predicate = reference("predicate.totally.unrelated.topic");
+        let other_admitted = admit(other_admission.clone());
+        let mut other_run = run_receipt(
+            matching_runtime_identity(&other_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        other_run.admission = reference(other_admission.admission_id.as_str());
+        let positive_result = build_observer_result(
+            &other_admitted,
+            &other_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.totally.unrelated.topic"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Present,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+
+        let disagreement = detect_disagreement(
+            &closed_admitted,
+            &closed_run,
+            &negative_result,
+            &other_admitted,
+            &other_run,
+            &positive_result,
+            timestamp("2026-08-14T13:00:00.000000000Z"),
+        )
+        .unwrap();
+        assert!(disagreement.is_none());
+    }
+
+    #[test]
+    fn overlapping_domains_with_different_run_applicability_never_disagree() {
+        // Same admitted domain and same admitted predicate, but each run
+        // actually read a different concrete applicability. Overlap must be
+        // keyed on the two *runs*' applicability, not merely on domain and
+        // predicate overlap.
+        let closed_admission =
+            admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let closed_admitted = admit(closed_admission.clone());
+        let closed_run = run_receipt(
+            matching_runtime_identity(&closed_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let negative_result = build_observer_result(
+            &closed_admitted,
+            &closed_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Absent,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+
+        let other_applicability = vec![ConcreteApplicabilityDimensionV1 {
+            dimension_id: ContractId::new("repository_commit").unwrap(),
+            resource: resource_uri("commit", IdentityForm::Version, 0x99),
+        }];
+        let mut other_admission =
+            admission("ast_schema", ObserverAdmissionModeV1::PositiveVerified);
+        other_admission.admission_id = ContractId::new("observer.other_applicability").unwrap();
+        let other_admitted = admit(other_admission.clone());
+        let mut other_run = run_receipt(
+            matching_runtime_identity(&other_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        other_run.admission = reference(other_admission.admission_id.as_str());
+        other_run.applicability = other_applicability.clone();
+        let positive_result = build_observer_result(
+            &other_admitted,
+            &other_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            other_applicability,
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Present,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+
+        let disagreement = detect_disagreement(
+            &closed_admitted,
+            &closed_run,
+            &negative_result,
+            &other_admitted,
+            &other_run,
+            &positive_result,
+            timestamp("2026-08-14T13:00:00.000000000Z"),
+        )
+        .unwrap();
+        assert!(disagreement.is_none());
+    }
+
+    #[test]
     fn candidate_only_opposing_evidence_does_not_invalidate_a_verified_proof() {
         let closed_admission =
             admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
@@ -2203,6 +2438,168 @@ mod tests {
             &closed_admitted,
             &timed_out_run,
             &relabelled_result,
+            &llm_admitted,
+            &llm_run,
+            &candidate_result,
+            timestamp("2026-08-14T13:00:00.000000000Z"),
+        );
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn detect_disagreement_rejects_a_result_whose_predicate_is_relabelled_to_an_unrelated_admission()
+     {
+        // A genuine closed_world_verified admission for predicate P produces
+        // a real, complete VerifiedNegative. A genuinely admitted (`admit`),
+        // honestly-run positive_verified observer under a wholly UNRELATED
+        // admission and predicate Q produces its own real VerifiedPositive
+        // about Q. The only mutation is relabelling the attacker's public
+        // `predicate` field to P after the fact: `predicate` is never
+        // consumed by `derive_verification_outcome`, so the attacker's
+        // self-reported `verification_outcome` still matches its own honest
+        // re-derivation, and `validate_shape` alone cannot catch it. Without
+        // binding `result.predicate == admitted.admission().predicate`,
+        // this forged pair would be treated as opposing evidence over the
+        // victim's predicate and could nullify a complete verified proof
+        // about an unrelated P (PRED-05, COVER-01, AUTH-03).
+        let closed_admission =
+            admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let closed_admitted = admit(closed_admission.clone());
+        let closed_run = run_receipt(
+            matching_runtime_identity(&closed_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let negative_result = build_observer_result(
+            &closed_admitted,
+            &closed_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Absent,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+        assert_eq!(
+            negative_result.verification_outcome,
+            VerificationOutcomeV1::VerifiedNegative
+        );
+
+        let mut unrelated_admission =
+            admission("ast_schema", ObserverAdmissionModeV1::PositiveVerified);
+        unrelated_admission.admission_id = ContractId::new("observer.unrelated_topic").unwrap();
+        unrelated_admission.predicate = reference("predicate.totally.unrelated.topic");
+        let unrelated_admitted = admit(unrelated_admission.clone());
+        let unrelated_run = ObserverRunReceiptV1 {
+            admission: reference("observer.unrelated_topic"),
+            ..run_receipt(
+                matching_runtime_identity(&unrelated_admission.identity),
+                zero_gap_inputs(),
+                full_coverage_witness(),
+                ObserverOutcomeKindV1::Success,
+            )
+        };
+        let mut attacker_result = build_observer_result(
+            &unrelated_admitted,
+            &unrelated_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.totally.unrelated.topic"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Present,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+        assert_eq!(
+            attacker_result.verification_outcome,
+            VerificationOutcomeV1::VerifiedPositive
+        );
+        attacker_result.predicate = reference("predicate.mcp.remember.allowed_actions");
+        attacker_result.validate_shape().unwrap();
+
+        let outcome = detect_disagreement(
+            &closed_admitted,
+            &closed_run,
+            &negative_result,
+            &unrelated_admitted,
+            &unrelated_run,
+            &attacker_result,
+            timestamp("2026-08-14T13:00:00.000000000Z"),
+        );
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn detect_disagreement_rejects_a_result_whose_applicability_was_never_read_by_its_run() {
+        // Same shape of attack as the predicate relabel above, but on
+        // `applicability`: the result claims a concrete applicability its
+        // own cited run receipt never actually read. `applicability` is
+        // never consumed by `derive_verification_outcome` either, so the
+        // relabelled result's `verification_outcome` still matches its
+        // honest re-derivation and `validate_shape` alone cannot catch it.
+        let closed_admission =
+            admission("ast_schema", ObserverAdmissionModeV1::ClosedWorldVerified);
+        let closed_admitted = admit(closed_admission.clone());
+        let closed_run = run_receipt(
+            matching_runtime_identity(&closed_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let mut negative_result = build_observer_result(
+            &closed_admitted,
+            &closed_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Absent,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+        assert_eq!(
+            negative_result.verification_outcome,
+            VerificationOutcomeV1::VerifiedNegative
+        );
+        // The run receipt cited by digest is unchanged, and its
+        // `applicability` never included this alternate dimension value --
+        // only the public result field is relabelled.
+        negative_result.applicability = vec![ConcreteApplicabilityDimensionV1 {
+            dimension_id: ContractId::new("repository_commit").unwrap(),
+            resource: resource_uri("commit", IdentityForm::Version, 0x99),
+        }];
+        negative_result.validate_shape().unwrap();
+
+        let llm_admission = admission("llm", ObserverAdmissionModeV1::CandidateOnly);
+        let llm_admitted = admit(llm_admission.clone());
+        let llm_run = run_receipt(
+            matching_runtime_identity(&llm_admission.identity),
+            zero_gap_inputs(),
+            full_coverage_witness(),
+            ObserverOutcomeKindV1::Success,
+        );
+        let candidate_result = build_observer_result(
+            &llm_admitted,
+            &llm_run,
+            frozen_profile_reference_v1(),
+            scope(),
+            reference("predicate.mcp.remember.allowed_actions"),
+            applicability(),
+            ObserverClaimShapeV1::Presence,
+            EvaluatedConditionV1::Present,
+            timestamp("2026-08-14T12:00:00.000000000Z"),
+        )
+        .unwrap();
+
+        let outcome = detect_disagreement(
+            &closed_admitted,
+            &closed_run,
+            &negative_result,
             &llm_admitted,
             &llm_run,
             &candidate_result,

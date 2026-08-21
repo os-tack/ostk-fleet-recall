@@ -65,13 +65,19 @@ itself (AUTH-03, EVENT-03).
   `observer_kind` in `{llm, semantic_search}` admitted at any mode other than
   `candidate_only`; `derive_verification_outcome` additionally refuses to
   reach `verified_negative`/`verified_exact_set` unless the admission is
-  `closed_world_verified` and the run reports zero skipped, failed,
-  unsupported, and unknown inputs under complete, current,
-  contiguous-when-applicable coverage.
+  `closed_world_verified`, the run reports zero skipped, failed,
+  unsupported, and unknown inputs, the run's `included` input tally is
+  non-empty (a closed domain that included nothing proves nothing, however
+  "complete" the coverage witness reports it), and coverage is complete,
+  current, contiguous-when-applicable.
 - **PRED-05** — every `ObserverRunReceiptV1` carries its own witnessed
   executable/dependency digests, the exact immutable `source_version` it
   read, exact applicability/configuration digests, input/output digests, and
-  a coverage witness; `derive_verification_outcome` is a pure function of an
+  a coverage witness; `derive_verification_outcome` also rejects a run whose
+  `outcome` was never declared in its own admission's `declared_outcome_kinds`
+  (that set is a closed enumeration, not decoration) as `indeterminate`, the
+  same way it treats dependency drift or a `timeout`;
+  `derive_verification_outcome` is a pure function of an
   `AdmittedObserverV1` and one `ObserverRunReceiptV1` with no hidden state, so
   identical inputs reproduce an identical outcome and an identical
   `ObserverRunReceiptV1::digest()`.
@@ -84,13 +90,26 @@ itself (AUTH-03, EVENT-03).
   `ObserverAdmissionV2`, so no payload can grant itself verification
   authority merely by asserting a matching admission ID. `detect_disagreement`
   additionally requires each side's exact `ObserverRunReceiptV1` and rejects
-  unless the accompanying `ObserverResultV1`'s `admission_digest` and
+  unless the accompanying `ObserverResultV1` reproduces from the supplied
+  admission and run receipt on *every* binding: `admission_digest` and
   `run_receipt_digest` equal the real digests of the admission/run receipt
-  supplied alongside it *and* its self-reported `verification_outcome`
-  equals what `derive_verification_outcome` independently recomputes from
-  that admission and run receipt — closing the seam where a self-reported
-  `verification_outcome` could otherwise be relabelled (e.g. away from a
-  timed-out run's honest `indeterminate`) using only public bytes.
+  supplied alongside it; `predicate` equals the admission's own `predicate`
+  (entry ID, version, AND entry digest — PRED-05's "predicate versions"), so
+  an observer admitted for predicate Q can never emit a verified finding
+  about an unrelated predicate P merely by relabelling the payload field;
+  `applicability` equals the run receipt's own `applicability`, so a result
+  can never claim a concrete applicability its own cited run never actually
+  read (COVER-01); and its self-reported `verification_outcome` equals what
+  `derive_verification_outcome` independently recomputes from that admission
+  and run receipt. `detect_disagreement`'s domain-overlap test is likewise
+  keyed on the two *admissions*' predicates and the two *runs*' applicability,
+  never on the results' self-reported fields, so a payload-to-payload
+  comparison can never reopen a seam these bindings just closed. Together
+  these close the seam where a self-reported `verification_outcome` could
+  otherwise be relabelled (e.g. away from a timed-out run's honest
+  `indeterminate`), or a genuine proof about one predicate/applicability
+  could be relabelled to oppose a genuine, unrelated verified proof, using
+  only public bytes.
 
 ## How digests are pinned
 
