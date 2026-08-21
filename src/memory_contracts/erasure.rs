@@ -2395,6 +2395,25 @@ mod tests {
         );
     }
 
+    /// `validate`'s disjunction relies on Rust binding `&&` tighter than
+    /// `||`; a fold of that disjunction to `&&` would silently AND the
+    /// `target.target_digest == Sha256Digest::ZERO` conjunct into the rest
+    /// instead of independently rejecting it, admitting a legal hold that
+    /// names the null/sentinel target. This isolates that conjunct alone:
+    /// every other field of the hold is otherwise fully valid (correct
+    /// schema version, microsecond-aligned `placed_at`, no `released_at`,
+    /// `visibility_ceiling` below the publication ceiling), so only the
+    /// zero target digest can cause the rejection.
+    #[test]
+    fn legal_hold_fails_closed_on_zero_target_digest() {
+        let mut hold = legal_hold_active();
+        hold.target.target_digest = Sha256Digest::ZERO;
+        assert_eq!(
+            hold.validate(),
+            Err(ContractError::Schema("invalid legal hold".into()))
+        );
+    }
+
     #[test]
     fn forbidden_matcher_forces_disable_and_purge() {
         assert_eq!(
