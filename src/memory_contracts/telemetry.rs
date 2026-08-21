@@ -366,6 +366,20 @@ impl MeasurementReceiptV1 {
         self.missingness.validate()?;
         validate_dimensions(&self.dimensions, &self.missingness.missing_dimensions)?;
         self.exemplars.validate_shape()?;
+        // Non-blocking observation fix: `ExemplarV1::occurred_within` used to
+        // be dead production code, so a receipt whose window was e.g.
+        // 2026-08-15T12:00..12:05 validated with an exemplar dated
+        // 2019-01-01 -- illustration evidence from a different incident
+        // could ride inside a receipt it never happened in. Every present
+        // (non-tombstoned) exemplar must have occurred inside this receipt's
+        // own measurement window.
+        for present_exemplar in &self.exemplars.exemplars {
+            if !present_exemplar.occurred_within(&self.window) {
+                return Err(ContractError::Schema(
+                    "exemplar occurred outside the measurement window".into(),
+                ));
+            }
+        }
         if self.schema_version != TELEMETRY_SCHEMA_VERSION || self.evaluation_time < self.window.end
         {
             return Err(ContractError::Schema("invalid measurement receipt".into()));
@@ -2091,6 +2105,43 @@ mod tests {
         let mut value = receipt(unbound_selection(&private_policy()));
         value.evaluation_time = window().start;
         assert!(value.validate_shape().is_err());
+    }
+
+    /// Non-blocking observation fix: previously `ExemplarV1::occurred_within`
+    /// was never called by production code, so a receipt whose window was
+    /// 2026-08-15T12:00..12:05 validated with an exemplar dated seven years
+    /// outside it. Build a receipt with one genuinely selected exemplar
+    /// (occurring inside the window, so this passes today), confirm it
+    /// validates, then move only that exemplar's `occurred_at` outside the
+    /// window and confirm `validate_shape` now refuses it.
+    #[test]
+    fn exemplar_outside_the_measurement_window_is_rejected() {
+        let candidates = vec![candidate(
+            "route.only",
+            96,
+            1,
+            CandidateOutcomeV1::Eligible(Box::new(exemplar(1, 0))),
+        )];
+        let population = PopulationInputV1::Bound {
+            snapshot_digest: Sha256Digest::from_bytes([97; 32]),
+            query_population_digest: Sha256Digest::from_bytes([98; 32]),
+            candidates: &candidates,
+        };
+        let selection =
+            select_exemplars_deterministic_stratified_hash_v1(&private_policy(), &population)
+                .unwrap();
+        assert_eq!(selection.exemplars.len(), 1);
+        assert!(selection.exemplars[0].occurred_within(&window()));
+
+        let value = receipt(selection.clone());
+        value.validate_shape().unwrap();
+
+        let mut outside_window = selection;
+        outside_window.exemplars[0].occurred_at =
+            CanonicalTimestamp::parse("2019-01-01T00:00:00.000000000Z").unwrap();
+        assert!(!outside_window.exemplars[0].occurred_within(&window()));
+        let tampered = receipt(outside_window);
+        assert!(tampered.validate_shape().is_err());
     }
 
     #[test]
