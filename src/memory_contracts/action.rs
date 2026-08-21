@@ -450,6 +450,14 @@ impl RevalidatedAuthorizationV1 {
 /// Rechecks current state with compare-and-swap semantics, and revalidates
 /// authorization expiry, remaining uses, and the exact precondition set
 /// immediately before execution.
+///
+/// Runtime obligation (not enforced by this pure leaf): `remaining_uses_before_attempt`
+/// is a plain caller-supplied count, not a value this module reads from
+/// durable storage. The runtime must persist `remaining_uses_after` from the
+/// returned [`RevalidatedAuthorizationV1`] back to the authorization's durable
+/// use counter, atomically with (or otherwise safely ordered against) any
+/// concurrent revalidation of the same authorization — this function has no
+/// way to detect a racing decrement it never saw.
 pub fn revalidate_authorization(
     authorization: &AuthorizationV1,
     attempt: &ExecutionAttemptV1,
