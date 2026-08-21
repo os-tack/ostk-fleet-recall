@@ -123,7 +123,7 @@ pub use appendable::{
 pub use cockroach::CockroachAcceptedEventRepository;
 pub use content_store::{
     CONTENT_KEY_ENCRYPTION_KEY_ENV, ContentKeyEncryptionKey, ContentObjectWrite,
-    GovernedContentAssociatedDataV1, GovernedContentObjectV1, GovernedContentProjection,
+    GovernedContentAssociatedDataV2, GovernedContentObjectV1, GovernedContentProjection,
     MAX_GOVERNED_CONTENT_BYTES, SealedContentObject, fetch_governed_content,
     store_governed_content,
 };

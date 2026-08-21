@@ -1253,15 +1253,17 @@ async fn live_a_tampered_content_row_fails_the_next_append_closed_when_configure
         .await
         .unwrap();
 
-    // Tamper with the stored governed row's retention binding, out of band.
+    // Tamper, out of band, with a column the storage identity itself
+    // determines: the row now claims a content digest its own stored bytes do
+    // not have. Only such a column may fail a later lawful append.
     let affected = sqlx::query(
-        "UPDATE memory_content_objects \
-         SET retention_policy_entry_version = retention_policy_entry_version + 1 \
+        "UPDATE memory_content_objects SET content_digest = $4 \
          WHERE tenant_id = $1 AND project = $2 AND storage_identity = $3",
     )
     .bind(scope.physical_scope.tenant_id)
     .bind(&scope.physical_scope.project)
     .bind(origin.content().storage_identity().as_bytes().to_vec())
+    .bind(vec![0xCD_u8; 32])
     .execute(&pool)
     .await
     .unwrap()
@@ -1308,4 +1310,198 @@ async fn live_a_tampered_content_row_fails_the_next_append_closed_when_configure
         scoped_count(&pool, "memory_evidence_events", &scope.physical_scope).await,
         1
     );
+}
+
+/// EVID-01, the media-type collision: two DIFFERENT lawful source facts whose
+/// redacted bytes are byte-identical reach ONE storage identity, and they may
+/// legitimately assert different media types. The media type is not in
+/// `StorageIdentityPreimageV1`, so it must not decide whether the second append
+/// commits. Both events append, against one content row.
+#[tokio::test]
+async fn live_identical_bytes_with_different_media_types_both_append_when_configured() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = live_pool(&database_url).await;
+    let fixture = fixture();
+    let scope = activate_stage4(&pool, &fixture, "mediatype", 69).await;
+    let active = active_package(&fixture, &scope);
+
+    let first = ingress_candidate();
+    let origin = admit(&active, &first, CANONICAL_PAYLOAD).unwrap();
+    scope
+        .repository
+        .append(
+            &scope.witness,
+            &origin.appendable(&scope.witness).unwrap(),
+            Arc::new(
+                GovernedContentProjection::new(
+                    &scope.trusted_scope,
+                    origin.content(),
+                    &content_key(),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    // A genuinely distinct source fact — a different logical event — over the
+    // same canonical bytes, asserting a different media type.
+    let mut second = ingress_candidate();
+    second.source_fact.logical_event_key = HexBytes::new(b"another-lawful-event".to_vec()).unwrap();
+    second.canonical_payload.asserted_media_type =
+        ContractId::new("application.github.push").unwrap();
+    let other = admit(&active, &second, CANONICAL_PAYLOAD).unwrap();
+
+    assert_ne!(
+        other.statement().source_fact_id,
+        origin.statement().source_fact_id
+    );
+    assert_eq!(
+        other.content().storage_identity(),
+        origin.content().storage_identity(),
+        "identical bytes in one protection domain are one storage identity"
+    );
+    assert_ne!(
+        other.statement().canonical_content.media_type,
+        origin.statement().canonical_content.media_type
+    );
+
+    let outcome = scope
+        .repository
+        .append(
+            &scope.witness,
+            &other.appendable(&scope.witness).unwrap(),
+            Arc::new(
+                GovernedContentProjection::new(
+                    &scope.trusted_scope,
+                    other.content(),
+                    &content_key(),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, AppendOutcome::Appended { .. }));
+    assert_eq!(
+        scoped_count(&pool, "memory_evidence_events", &scope.physical_scope).await,
+        2,
+        "the second lawful evidence fact must not be lost to a media-type collision"
+    );
+    assert_eq!(
+        scoped_count(&pool, "memory_content_objects", &scope.physical_scope).await,
+        1
+    );
+
+    // The row keeps the first writer's annotation, and the bytes still open:
+    // the media type is not bound into the envelope's associated data.
+    let stored = content_object(&scope, origin.content().storage_identity())
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.content().media_type,
+        origin.statement().canonical_content.media_type
+    );
+    assert_eq!(stored.open(&content_key()).unwrap(), CANONICAL_PAYLOAD);
+}
+
+/// The same fence from the other side: a lawful retention-policy rotation moves
+/// the annotation on new statements while stored rows keep what they were
+/// written with. A deduplicated append after that rotation must still commit,
+/// and the stored bytes must still open.
+#[tokio::test]
+async fn live_a_retention_annotation_rotation_does_not_wedge_a_row_when_configured() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = live_pool(&database_url).await;
+    let fixture = fixture();
+    let scope = activate_stage4(&pool, &fixture, "rotation", 70).await;
+    let active = active_package(&fixture, &scope);
+
+    let candidate = ingress_candidate();
+    let locators = ingress_locators();
+    let origin = admit(&active, &candidate, CANONICAL_PAYLOAD).unwrap();
+    scope
+        .repository
+        .append(
+            &scope.witness,
+            &origin.appendable(&scope.witness).unwrap(),
+            Arc::new(
+                GovernedContentProjection::new(
+                    &scope.trusted_scope,
+                    origin.content(),
+                    &content_key(),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Exactly what a successor activation that bumps `retention.default` leaves
+    // behind: the stored row's retention annotation no longer equals what a new
+    // statement carries. Applied to the row here so the proof needs no second
+    // activation ceremony; the divergence is mechanically identical.
+    let affected = sqlx::query(
+        "UPDATE memory_content_objects          SET retention_policy_entry_version = retention_policy_entry_version + 1,              retention_policy_digest = $4          WHERE tenant_id = $1 AND project = $2 AND storage_identity = $3",
+    )
+    .bind(scope.physical_scope.tenant_id)
+    .bind(&scope.physical_scope.project)
+    .bind(origin.content().storage_identity().as_bytes().to_vec())
+    .bind(vec![0x5A_u8; 32])
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(affected, 1);
+
+    let successor = admit_evidence(
+        &active,
+        EvidenceAdmissionRequestV1 {
+            candidate: &candidate,
+            locators: &locators,
+            canonical_payload: CANONICAL_PAYLOAD,
+            delivery: admission_delivery(1),
+            lineage: RepresentationLineageV2::Supersedes {
+                predecessor_representation_key: origin.statement().representation_key,
+            },
+        },
+    )
+    .unwrap();
+    let outcome = scope
+        .repository
+        .append(
+            &scope.witness,
+            &successor.appendable(&scope.witness).unwrap(),
+            Arc::new(
+                GovernedContentProjection::new(
+                    &scope.trusted_scope,
+                    successor.content(),
+                    &content_key(),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, AppendOutcome::Appended { .. }));
+    assert_eq!(
+        scoped_count(&pool, "memory_evidence_events", &scope.physical_scope).await,
+        2,
+        "a rotated retention annotation must not wedge a deduplicated row"
+    );
+    assert_eq!(
+        scoped_count(&pool, "memory_content_objects", &scope.physical_scope).await,
+        1
+    );
+
+    // And the rotated annotation did not cost the bytes: retention class and
+    // policy are not in the envelope's associated data.
+    let stored = content_object(&scope, origin.content().storage_identity())
+        .await
+        .unwrap();
+    assert_eq!(stored.open(&content_key()).unwrap(), CANONICAL_PAYLOAD);
 }

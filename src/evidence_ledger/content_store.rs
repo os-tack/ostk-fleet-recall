@@ -20,11 +20,17 @@
 //! `FLEET_RECALL_CONTENT_KEK_HEX`), and the body is sealed under the DEK. Both
 //! AEAD operations are AES-256-GCM (`ring`, already pinned) and both use the
 //! SAME associated data: the canonical bytes of
-//! [`GovernedContentAssociatedDataV1`], which commits to the semantic scope,
-//! the storage identity, the content digest, the byte length, the protection
-//! domain, the media type, and the retention class/policy. A ciphertext
-//! therefore cannot be moved to another row, another scope, another protection
-//! domain, or another retention class: the open fails.
+//! [`GovernedContentAssociatedDataV2`], which commits to the semantic scope,
+//! the storage identity, and the three facts that storage identity itself
+//! determines — the protection domain, the content digest, and the byte
+//! length. A ciphertext therefore cannot be moved to another row, another
+//! scope, or another protection domain: the open fails.
+//!
+//! Nothing else is bound. The media type and the retention class/policy are row
+//! annotations that are NOT a function of the storage identity (next section),
+//! and binding them would mean a lawful annotation migration leaves the bytes
+//! permanently unopenable. Tamper-evidence for a column belongs to whatever
+//! governs that column; it is not worth buying by wedging the payload.
 //!
 //! A per-object DEK is what makes artifact-scoped cryptographic erasure
 //! possible at all (EVID-08: *"Each archived artifact has a unique
@@ -32,17 +38,45 @@
 //! key is not sufficient"*). Destroying one `wrapped_dek` destroys exactly one
 //! object.
 //!
-//! # Idempotence, and what a conflict means
+//! # Idempotence, and exactly which columns a conflict may fail on
 //!
 //! The insert is `ON CONFLICT DO NOTHING`. A conflict is expected and lawful:
-//! two representations of the same source fact can reference the same governed
-//! bytes, and a retried delivery reaches the same storage identity. When the
-//! row already exists, every *governed* column is compared field by field and a
-//! divergence fails the whole append closed with
-//! [`EvidenceAppendError::LedgerIntegrity`]. The ciphertext columns are
-//! deliberately NOT compared: each seal draws fresh nonces, so equal plaintext
-//! yields different bytes, and comparing them would turn a correct retry into a
-//! false integrity alarm.
+//! two representations of one source fact can reference the same governed
+//! bytes, a retried delivery reaches the same storage identity, and two
+//! genuinely different source facts whose redacted bytes happen to be identical
+//! land on the same row.
+//!
+//! When the row already exists, the stored columns fall into two groups, and
+//! only the first group may fail an append:
+//!
+//! 1. **Determined by the row key.** [`StorageIdentityPreimageV1`] is
+//!    `{schema_version, protection_domain_id, body_content_id}`, so a storage
+//!    identity fixes the protection domain and the content digest, and the byte
+//!    length is fixed by the bytes that digest commits to. A divergence in one
+//!    of those three is a stored-row tamper or a digest collision, and it fails
+//!    the whole append closed with [`EvidenceAppendError::LedgerIntegrity`].
+//! 2. **Annotations; the first writer's values stand.** The media type is a
+//!    connector assertion (`IngressContentReferenceV1::asserted_media_type`)
+//!    and the retention class/policy are read out of the *currently* activated
+//!    retention entry. Neither is in the storage-identity preimage, so neither
+//!    is a function of the row key: two lawful source facts carrying identical
+//!    redacted bytes may legitimately assert different media types, and a
+//!    lawful successor activation that bumps `retention.default`'s version
+//!    legitimately changes what a NEW statement carries while stored rows keep
+//!    what they were written with. Comparing those columns would let one
+//!    connector-asserted string — or one routine policy rotation — wedge every
+//!    later lawful append over those bytes, permanently and on every retry. So
+//!    they are not compared.
+//!
+//!    The row's annotation is not the authority for anything. Each accepted
+//!    event carries its own `canonical_content` (media type included) and its
+//!    own retention class and retention policy reference in the ledger, which is
+//!    where a consumer must read them; the row's copies are operational
+//!    metadata for a storage sweep over deduplicated bytes.
+//!
+//! The ciphertext columns are not compared either: each seal draws fresh
+//! nonces, so equal plaintext yields different bytes, and comparing them would
+//! turn a correct retry into a false integrity alarm.
 //!
 //! # Why the four erasure-index columns stay NULL here
 //!
@@ -82,7 +116,7 @@ use crate::FleetError;
 use crate::control_log::TrustedControlScope;
 use crate::memory_contracts::canonical::encode_canonical;
 use crate::memory_contracts::common::{
-    AuthenticatedProjectScopeV1, ContractId, RegistryReferenceV1,
+    AuthenticatedProjectScopeV1, CanonicalDecimal, ContractId, RegistryReferenceV1,
 };
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::evidence::{GovernedContentIdentityV1, RetentionClass};
@@ -105,7 +139,7 @@ const AEAD_TAG_LEN: usize = 16;
 const DEK_LEN: usize = 32;
 const KEK_LEN: usize = 32;
 const WRAPPED_DEK_LEN: usize = NONCE_LEN + DEK_LEN + AEAD_TAG_LEN;
-const ASSOCIATED_DATA_SCHEMA_VERSION: u32 = 1;
+const ASSOCIATED_DATA_SCHEMA_VERSION: u32 = 2;
 
 const INSERT_CONTENT_OBJECT_SQL: &str = "INSERT INTO public.memory_content_objects (\
      tenant_id, project, storage_identity, protection_domain_id, media_type, byte_length, \
@@ -200,18 +234,22 @@ impl ContentKeyEncryptionKey {
 
 /// Exact associated data both AEAD operations bind.
 ///
-/// Every field here is server-derived by admission. Binding them means a
-/// ciphertext is only openable in the row, scope, protection domain, and
-/// retention class it was sealed for.
+/// Every field here is server-derived by admission AND is a function of the row
+/// this object is stored in: the semantic scope is the row's own
+/// `(tenant_id, project)`, and the protection domain, content digest, and byte
+/// length are what the storage identity commits to. Binding exactly these means
+/// a ciphertext is only openable in the row, scope, and protection domain it was
+/// sealed for — and that no column which is merely an annotation can ever make
+/// lawful bytes unopenable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GovernedContentAssociatedDataV1 {
+pub struct GovernedContentAssociatedDataV2 {
     pub schema_version: u32,
     pub scope: AuthenticatedProjectScopeV1,
     pub storage_identity: Sha256Digest,
-    pub content: GovernedContentIdentityV1,
-    pub retention_class: RetentionClass,
-    pub retention_policy: RegistryReferenceV1,
+    pub protection_domain_id: ContractId,
+    pub content_digest: Sha256Digest,
+    pub byte_length: CanonicalDecimal,
 }
 
 /// One governed payload with its server-derived identity and its plaintext.
@@ -277,14 +315,14 @@ impl GovernedContentObjectV1 {
         &self.scope
     }
 
-    fn associated_data(&self) -> GovernedContentAssociatedDataV1 {
-        GovernedContentAssociatedDataV1 {
+    fn associated_data(&self) -> GovernedContentAssociatedDataV2 {
+        GovernedContentAssociatedDataV2 {
             schema_version: ASSOCIATED_DATA_SCHEMA_VERSION,
             scope: self.scope.clone(),
             storage_identity: self.storage_identity,
-            content: self.content.clone(),
-            retention_class: self.retention_class,
-            retention_policy: self.retention_policy.clone(),
+            protection_domain_id: self.content.protection_domain_id.clone(),
+            content_digest: self.content.content_digest,
+            byte_length: self.content.byte_length.clone(),
         }
     }
 
@@ -347,14 +385,14 @@ impl SealedContentObject {
         self.storage_identity
     }
 
-    fn associated_data(&self) -> GovernedContentAssociatedDataV1 {
-        GovernedContentAssociatedDataV1 {
+    fn associated_data(&self) -> GovernedContentAssociatedDataV2 {
+        GovernedContentAssociatedDataV2 {
             schema_version: ASSOCIATED_DATA_SCHEMA_VERSION,
             scope: self.scope.clone(),
             storage_identity: self.storage_identity,
-            content: self.content.clone(),
-            retention_class: self.retention_class,
-            retention_policy: self.retention_policy.clone(),
+            protection_domain_id: self.content.protection_domain_id.clone(),
+            content_digest: self.content.content_digest,
+            byte_length: self.content.byte_length.clone(),
         }
     }
 
@@ -398,8 +436,9 @@ impl SealedContentObject {
 pub enum ContentObjectWrite {
     /// A new row was inserted in this transaction.
     Inserted,
-    /// The exact governed object was already stored; every governed column
-    /// matched. No second row was written (EVID-01).
+    /// The bytes were already stored: every column the storage identity
+    /// determines matched. No second row was written, and the stored row keeps
+    /// the first writer's annotations (EVID-01).
     AlreadyStored,
 }
 
@@ -619,20 +658,35 @@ async fn require_stored_object_matches(
             integrity("content object insert conflicted yet no stored row is visible")
         })?;
     let stored = decode_stored_columns(&row)?;
-    // Ciphertext columns are deliberately excluded: fresh nonces make equal
-    // plaintext produce different bytes. Everything compared here IS a function
-    // of the storage identity or of the activated retention policy, so a
-    // divergence is a stored-row tamper or an undeclared policy migration, not
-    // a lawful second reference to the same bytes.
-    if stored.content != sealed.content
-        || stored.retention_class != sealed.retention_class
-        || stored.retention_policy != sealed.retention_policy
-    {
+    if storage_identity_columns_diverge(&stored.content, &sealed.content) {
         return Err(integrity(
             "stored governed content object diverges from the admitted object under one storage identity",
         ));
     }
     Ok(())
+}
+
+/// Do a stored row and an admitted object disagree on a column that the storage
+/// identity itself determines?
+///
+/// Exactly three columns qualify, because [`StorageIdentityPreimageV1`] is
+/// `{schema_version, protection_domain_id, body_content_id}`: the protection
+/// domain, the content digest, and the byte length that digest commits to. The
+/// media type and the retention class/policy are deliberately absent — they are
+/// annotations, not functions of the row key, and letting them answer this
+/// question would turn a connector-asserted string, or a lawful retention-policy
+/// rotation, into a permanent and un-retryable append failure. See the module
+/// documentation.
+///
+/// The ciphertext columns are absent for a different reason: fresh nonces make
+/// equal plaintext produce different bytes.
+fn storage_identity_columns_diverge(
+    stored: &GovernedContentIdentityV1,
+    admitted: &GovernedContentIdentityV1,
+) -> bool {
+    stored.protection_domain_id != admitted.protection_domain_id
+        || stored.content_digest != admitted.content_digest
+        || stored.byte_length != admitted.byte_length
 }
 
 fn random_nonce(random: &SystemRandom) -> EvidenceAppendResult<Vec<u8>> {
@@ -793,13 +847,71 @@ mod tests {
     }
 
     #[test]
-    fn ciphertext_is_bound_to_the_retention_class() {
+    fn ciphertext_is_bound_to_the_protection_domain() {
         let mut sealed = object(b"payload").seal(&kek(1)).unwrap();
-        sealed.retention_class = RetentionClass::Immutable;
+        sealed.content.protection_domain_id = ContractId::new("project.other").unwrap();
         assert!(matches!(
             sealed.open(&kek(1)),
             Err(EvidenceAppendError::LedgerIntegrity(_))
         ));
+    }
+
+    #[test]
+    fn ciphertext_is_bound_to_the_content_digest_and_to_the_byte_length() {
+        let mut sealed = object(b"payload").seal(&kek(1)).unwrap();
+        sealed.content.content_digest = Sha256Digest::from_bytes([0xCD; 32]);
+        assert!(matches!(
+            sealed.open(&kek(1)),
+            Err(EvidenceAppendError::LedgerIntegrity(_))
+        ));
+        let mut sealed = object(b"payload").seal(&kek(1)).unwrap();
+        sealed.content.byte_length = CanonicalDecimal::parse("9".to_owned()).unwrap();
+        assert!(matches!(
+            sealed.open(&kek(1)),
+            Err(EvidenceAppendError::LedgerIntegrity(_))
+        ));
+    }
+
+    /// A column that is not a function of the storage identity must never be
+    /// able to make lawful bytes unopenable: a media type is a connector
+    /// assertion, and a retention annotation is rotated by lawful successor
+    /// activations.
+    #[test]
+    fn annotations_outside_the_storage_identity_do_not_gate_opening() {
+        let plaintext = b"payload";
+        let mut sealed = object(plaintext).seal(&kek(1)).unwrap();
+        sealed.content.media_type = ContractId::new("application.github.push").unwrap();
+        sealed.retention_class = RetentionClass::Immutable;
+        sealed.retention_policy.version = 4;
+        sealed.retention_policy.entry_digest = Sha256Digest::from_bytes([0x5A; 32]);
+        assert_eq!(sealed.open(&kek(1)).unwrap(), plaintext);
+    }
+
+    /// Each of the three storage-identity columns alone is a divergence, and no
+    /// other column is one. This predicate decides whether a lawful append over
+    /// already-stored bytes commits, so every conjunct is pinned here.
+    #[test]
+    fn only_the_storage_identity_columns_can_fail_a_deduplicated_append() {
+        let admitted = object(b"payload").content;
+        assert!(!storage_identity_columns_diverge(&admitted, &admitted));
+
+        let mut stored = admitted.clone();
+        stored.protection_domain_id = ContractId::new("project.other").unwrap();
+        assert!(storage_identity_columns_diverge(&stored, &admitted));
+
+        let mut stored = admitted.clone();
+        stored.content_digest = Sha256Digest::from_bytes([0xCD; 32]);
+        assert!(storage_identity_columns_diverge(&stored, &admitted));
+
+        let mut stored = admitted.clone();
+        stored.byte_length = CanonicalDecimal::parse("9".to_owned()).unwrap();
+        assert!(storage_identity_columns_diverge(&stored, &admitted));
+
+        // Two lawful source facts with identical redacted bytes may assert
+        // different media types; both must append against the one row.
+        let mut stored = admitted.clone();
+        stored.media_type = ContractId::new("application.github.push").unwrap();
+        assert!(!storage_identity_columns_diverge(&stored, &admitted));
     }
 
     #[test]
