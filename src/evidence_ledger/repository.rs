@@ -60,7 +60,7 @@ pub enum AppendOutcome {
 /// event that produced them (ADR 0002 D3 writes `accepted_event_id`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProjectionContext {
-    /// Which of the three Stage-4 kinds is being appended.
+    /// Which of the four Stage-4 kinds is being appended.
     pub kind: AcceptedEventKindV1,
     /// Semantic identity of the event being appended.
     pub accepted_event_id: AcceptedEventId,

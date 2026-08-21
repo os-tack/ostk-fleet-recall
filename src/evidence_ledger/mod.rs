@@ -3,7 +3,8 @@
 //! # One semantic ledger, two physical ledgers (ADR 0002 D1)
 //!
 //! General accepted events — `evidence.accepted`,
-//! `relation.attestation.accepted`, and `memory.claim.accepted` — are appended
+//! `relation.attestation.accepted`, `memory.claim.accepted`, and
+//! `bootstrap.manifest.accepted` — are appended
 //! to `memory_evidence_events` + `memory_evidence_shard_heads`, the physical
 //! mirror of the control ledger. Both physical ledgers share ONE semantic
 //! ledger contract: the same genesis log epoch, the same partition recipe and
@@ -106,6 +107,7 @@
 
 mod admission;
 mod appendable;
+mod bootstrap_import;
 mod cockroach;
 mod content_store;
 mod error;
@@ -119,6 +121,9 @@ pub use admission::{
 };
 pub use appendable::{
     AcceptedEventKindV1, AppendableAcceptedEvent, EvidenceDeliveryContextV1, SemanticIdentityRuleV1,
+};
+pub use bootstrap_import::{
+    BootstrapImportProjection, IMPORT_ROWS_TABLE, import_rows_table_exists,
 };
 pub use cockroach::CockroachAcceptedEventRepository;
 pub use content_store::{

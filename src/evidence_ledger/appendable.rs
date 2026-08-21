@@ -23,7 +23,7 @@
 //!
 //! # Governance kinds are unconstructible
 //!
-//! [`AcceptedEventKindV1`] is a closed three-variant enum and `event_kind` is
+//! [`AcceptedEventKindV1`] is a closed four-variant enum and `event_kind` is
 //! derived from the variant, never from caller input. There is no variant for
 //! `control.bootstrap.accepted`, `registry.genesis.activated`, or
 //! `registry.successor.activated`, and no constructor accepts a free-form kind
@@ -34,6 +34,9 @@
 
 use crate::memory_contracts::ContractError;
 use crate::memory_contracts::bootstrap::ConsistencyPartitionKeyV1;
+use crate::memory_contracts::bootstrap_manifest::{
+    AdmittedBootstrapManifestStatementV1, BootstrapManifestAcceptedStatementV1,
+};
 use crate::memory_contracts::canonical::encode_canonical;
 use crate::memory_contracts::common::{AuthenticatedProjectScopeV1, ContractId, HexBytes};
 use crate::memory_contracts::digest::Sha256Digest;
@@ -64,6 +67,9 @@ pub enum AcceptedEventKindV1 {
     RelationAttestation,
     /// `memory.claim.accepted` — one admitted remember assertion.
     MemoryClaim,
+    /// `bootstrap.manifest.accepted` — one admitted bootstrap-manifest import
+    /// of legacy chunks, claims, conflicts, and receipts (W1-IMPORT).
+    BootstrapManifest,
 }
 
 impl AcceptedEventKindV1 {
@@ -74,15 +80,28 @@ impl AcceptedEventKindV1 {
             Self::Evidence => "evidence.accepted",
             Self::RelationAttestation => "relation.attestation.accepted",
             Self::MemoryClaim => "memory.claim.accepted",
+            Self::BootstrapManifest => "bootstrap.manifest.accepted",
         }
     }
 
     /// How this kind's `semantic_object_digest` participates in replay
     /// classification. See [`SemanticIdentityRuleV1`].
+    ///
+    /// `BootstrapManifest` is [`SemanticIdentityRuleV1::UniquePreimage`],
+    /// keyed on the manifest digest: EVENT-01 is literal for a
+    /// content-addressed import exactly as it is for evidence — at most one
+    /// accepted bootstrap-manifest event may exist per exact row enumeration.
+    /// Unlike `Evidence`, this kind carries no
+    /// [`EvidenceDeliveryContextV1`]/[`EvidenceIdentityLinks`] pair (a legacy
+    /// import has no connector delivery), so a preimage disagreement here
+    /// fails closed through the same [`EvidenceAppendError::LedgerIntegrity`]
+    /// backstop `RelationAttestation`/`MemoryClaim` use for their own
+    /// same-event-ID byte divergence, rather than a
+    /// [`crate::memory_contracts::quarantine::QuarantineRecordV1`] row.
     #[must_use]
     pub const fn semantic_identity_rule(self) -> SemanticIdentityRuleV1 {
         match self {
-            Self::Evidence => SemanticIdentityRuleV1::UniquePreimage,
+            Self::Evidence | Self::BootstrapManifest => SemanticIdentityRuleV1::UniquePreimage,
             Self::RelationAttestation | Self::MemoryClaim => SemanticIdentityRuleV1::Cumulative,
         }
     }
@@ -294,6 +313,49 @@ impl AppendableAcceptedEvent {
         })
     }
 
+    /// Admit one `bootstrap.manifest.accepted` statement for append
+    /// (W1-IMPORT).
+    ///
+    /// # Contract
+    ///
+    /// Hidden for the same reason as [`Self::relation_attestation`] and
+    /// [`Self::memory_claim`]: the caller MUST already have honestly
+    /// enumerated the legacy rows the statement's manifest names and derived
+    /// every `row_digest` via
+    /// [`crate::memory_contracts::bootstrap_manifest::legacy_row_digest`].
+    /// This seam proves only structural closure and the head binding, never
+    /// that the enumeration matches the live legacy tables — that is the
+    /// private import CLI's offline preflight. Prefer
+    /// [`Self::admitted_bootstrap_manifest`] once
+    /// `AdmittedBootstrapManifestStatementV1` gains a production constructor.
+    #[doc(hidden)]
+    pub fn bootstrap_manifest(
+        statement: &BootstrapManifestAcceptedStatementV1,
+        witness: &WriterAuthorityWitness,
+    ) -> EvidenceAppendResult<Self> {
+        statement.validate_shape()?;
+        let bound = require_bound(&statement.scope, &statement.registry, witness)?;
+        Ok(Self {
+            kind: AcceptedEventKindV1::BootstrapManifest,
+            event_kind: require_kind(
+                &statement.event_kind,
+                AcceptedEventKindV1::BootstrapManifest,
+            )?,
+            event_schema_version: statement.schema_version,
+            canonical_event: encode_canonical(statement)?,
+            accepted_event_id: statement.accepted_event_id()?,
+            // The content-addressed row-enumeration coordinate: EVENT-01
+            // applies literally, exactly as it does for evidence.
+            semantic_object_digest: statement.manifest_digest.digest(),
+            consistency: statement.consistency_partition_key()?,
+            scope: statement.scope.clone(),
+            head_binding: bound.binding,
+            canonical_head_binding: bound.canonical,
+            evidence_identity: None,
+            delivery: None,
+        })
+    }
+
     /// Admit a declared or inferred relation attestation from its capability.
     pub fn admitted_relation_attestation(
         attestation: &AdmittedRelationAttestation,
@@ -319,7 +381,15 @@ impl AppendableAcceptedEvent {
         Self::memory_claim(admitted.statement(), witness)
     }
 
-    /// Which of the three Stage-4 kinds this is.
+    /// Admit a bootstrap-manifest import from its capability.
+    pub fn admitted_bootstrap_manifest(
+        admitted: &AdmittedBootstrapManifestStatementV1,
+        witness: &WriterAuthorityWitness,
+    ) -> EvidenceAppendResult<Self> {
+        Self::bootstrap_manifest(admitted.statement(), witness)
+    }
+
+    /// Which of the four Stage-4 kinds this is.
     #[must_use]
     pub const fn kind(&self) -> AcceptedEventKindV1 {
         self.kind
@@ -458,11 +528,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepted_event_kinds_are_the_three_stage4_general_kinds() {
+    fn accepted_event_kinds_are_the_four_stage4_general_kinds() {
         let kinds = [
             AcceptedEventKindV1::Evidence,
             AcceptedEventKindV1::RelationAttestation,
             AcceptedEventKindV1::MemoryClaim,
+            AcceptedEventKindV1::BootstrapManifest,
         ];
         let labels: Vec<&str> = kinds.iter().map(|kind| kind.as_str()).collect();
         assert_eq!(
@@ -470,7 +541,8 @@ mod tests {
             vec![
                 "evidence.accepted",
                 "relation.attestation.accepted",
-                "memory.claim.accepted"
+                "memory.claim.accepted",
+                "bootstrap.manifest.accepted"
             ]
         );
         // Compile-time governance exclusion: the closed enum has no variant a
@@ -487,9 +559,13 @@ mod tests {
     }
 
     #[test]
-    fn only_evidence_carries_the_unique_preimage_rule() {
+    fn only_evidence_and_bootstrap_manifest_carry_the_unique_preimage_rule() {
         assert_eq!(
             AcceptedEventKindV1::Evidence.semantic_identity_rule(),
+            SemanticIdentityRuleV1::UniquePreimage
+        );
+        assert_eq!(
+            AcceptedEventKindV1::BootstrapManifest.semantic_identity_rule(),
             SemanticIdentityRuleV1::UniquePreimage
         );
         assert_eq!(
