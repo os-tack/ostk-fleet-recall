@@ -274,6 +274,16 @@ must not disguise a semantic change.
   warnings.
 - **DISC-05 — Waivers are durable policy.** A waiver is explicit, attributed,
   scoped, and expiring where practical. It does not rewrite evidence.
+- **DISC-06 — Comparisons cite a registered comparator lineage.** A discrepancy
+  envelope binds a `comparator_lineage_fingerprint` and its required
+  applicability dimensions to the exact registered
+  `RegistryEntryKind::ComparatorLineage` entry (`registry.comparator_lineage`,
+  reserved generation-2-only by W0-REG-2), not to the producer's own
+  declaration. That kind is generation-2 only, so no genesis, successor, or
+  Stage-4 package admits it today: a comparator lineage is carriable through a
+  manifest-verified registry package and structurally resolved, but full
+  typed-body dispatch is deferred to a later generation. Comparison never runs
+  against an unregistered or ad-hoc lineage.
 
 ### Consolidation lane
 
@@ -876,12 +886,26 @@ This does not require or authorize dynamic ingestion.
    pair, and the read-only writer-authority view); the generic accepted-event
    append seam with quarantine on integrity collision and preimage
    disagreement, exact-replay no-op, and per-shard chain audit; the
-   writer-authority head witness read inside the append transaction; and the
-   repeatable generic `N -> N+1` registry activation runtime with its private
-   workstation CLI. Still absent: the evidence, relation, and remember
-   event-first paths that would make `remember` itself append-and-project in
-   one transaction; the bootstrap-manifest import of legacy chunks, claims,
-   conflicts, and receipts; and connected-proof wiring for all of those.
+   writer-authority head witness read inside the append transaction; evidence
+   v2 admission against the witnessed active package with a governed,
+   content-addressed, per-object-encrypted content object committed in the same
+   serializable transaction; relation-attestation append with an atomic durable
+   projection and a monotonic per-edge watermark; the
+   `remember(action="assert")` event-first route, wired beside the
+   byte-identical `record` path but fenced off — it fails closed until the
+   deployment carries the writer-authority configuration pins and a non-stub
+   in-transaction witness (ADR 0002 D3/D4); the private bootstrap-manifest
+   import CLI that admits legacy chunks, claims, conflicts, and receipts as one
+   signed, content-addressed event; and the repeatable generic `N -> N+1`
+   registry activation runtime with its private workstation CLI. These
+   evidence, content, relation, and witness modules compile into the library
+   but are not yet reachable from the running server; each carries live
+   CockroachDB proofs that the official-binary lane discovers and runs by exact
+   name. Still absent: enabling the `assert` route so synchronous `remember`
+   itself appends-and-projects in one transaction (the configuration pins plus
+   a witness loader that mints accepted events); wiring any of these dormant
+   modules into a serving path; and the Stage-5 connectors and projectors
+   below.
 5. Project one local transcript connector and one Git history connector into
    content-addressed repository membership and lexical-first/dense-later evidence
    with local cursors and coverage receipts. Arrow IPC may carry bounded batches
