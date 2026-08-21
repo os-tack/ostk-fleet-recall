@@ -519,6 +519,113 @@ impl TryFrom<Generation2CompositionManifestV1> for StructurallyClosedGeneration2
     }
 }
 
+/// One reserved-slot entry a generation-2 package carries as opaque bytes.
+///
+/// Carriage is not admission, and this typestate is deliberately inert. It
+/// proves that a manifest-verified package contains exactly one entry at the
+/// given `(kind, entry_id, version)` tuple, that the entry's `(kind, entry
+/// schema ID, entry schema version)` triple is a member of the closed table
+/// classified [`BodySchemaSlotClassV1::Generation2Reserved`] and bound to that
+/// slot's digest, and that the body re-encodes under the bounded canonical
+/// profile. It never decodes the body into a typed contract, and no closure
+/// consumes it: the genesis closure, the successor closure, and
+/// [`StructurallyClosedGeneration2Manifest::close_against_package`] reject the
+/// very same package (AUTH-04 — naming a slot designates nothing). It grants
+/// nothing that reading `package.package().entries` did not already grant; its
+/// only purpose is to state and test the reserved-carriage rule in one place,
+/// so a contract whose typed dispatch has not landed can still prove its
+/// registry entry is expressible rather than unreachable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedSlotCarriageV1 {
+    slot: Generation2ReservedSlotV1,
+    entry_reference: RegistryReferenceV1,
+    body_bytes: Vec<u8>,
+}
+
+impl ReservedSlotCarriageV1 {
+    /// Locate one reserved-slot entry inside a manifest-verified package.
+    ///
+    /// A dispatched or unknown triple is refused here: this seam exists only
+    /// for slots whose typed body is not wired, so using it as a generic entry
+    /// accessor fails closed.
+    pub fn from_package_entry(
+        package: &ManifestVerifiedRegistryPackage,
+        kind: RegistryEntryKind,
+        entry_id: &ContractId,
+        version: u32,
+    ) -> ContractResult<Self> {
+        // `validate_package` already rejected any package whose entries repeat
+        // a `(kind, entry_id, version)` sort key, so the first match is the
+        // only match.
+        let entry = package
+            .package()
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.kind == kind && entry.entry_id == *entry_id && entry.version == version
+            })
+            .ok_or_else(|| {
+                ContractError::Schema(format!(
+                    "package carries no {} entry {entry_id}@{version}",
+                    kind.as_str()
+                ))
+            })?;
+        // `ManifestVerifiedRegistryPackage` already ran `RegistryEntryV1::validate`
+        // over every entry, so the body is known to be a bounded canonical object.
+        let class = classify_body_schema_triple(
+            entry.kind,
+            entry.entry_schema_id.as_str(),
+            entry.entry_schema_version,
+        );
+        if class != BodySchemaSlotClassV1::Generation2Reserved {
+            return Err(ContractError::Schema(format!(
+                "entry {entry_id}@{version} selects the {} triple ({}, {}, {}), not a reserved slot",
+                class.as_str(),
+                entry.kind.as_str(),
+                entry.entry_schema_id,
+                entry.entry_schema_version
+            )));
+        }
+        let record = BodySchemaSlotRecordV1 {
+            schema_version: SLOT_SCHEMA_VERSION,
+            kind: entry.kind,
+            entry_schema_id: entry.entry_schema_id.clone(),
+            entry_schema_version: entry.entry_schema_version,
+            slot_class: BodySchemaSlotClassV1::Generation2Reserved,
+        };
+        Ok(Self {
+            // `BodySchemaSlotRecordV1::digest` revalidates the record against
+            // the compiled table before hashing, so the digest a carriage
+            // reports is always the table's decision, never a caller's claim.
+            slot: Generation2ReservedSlotV1 {
+                kind: entry.kind,
+                entry_schema_id: entry.entry_schema_id.clone(),
+                entry_schema_version: entry.entry_schema_version,
+                slot_digest: record.digest()?,
+            },
+            entry_reference: RegistryReferenceV1 {
+                entry_id: entry.entry_id.clone(),
+                version: entry.version,
+                entry_digest: entry.digest()?,
+            },
+            body_bytes: encode_canonical(&entry.body)?,
+        })
+    }
+
+    pub const fn slot(&self) -> &Generation2ReservedSlotV1 {
+        &self.slot
+    }
+
+    pub const fn entry_reference(&self) -> &RegistryReferenceV1 {
+        &self.entry_reference
+    }
+
+    /// Canonical body bytes, undecoded. Reading them is not dispatching them.
+    pub fn body_bytes(&self) -> &[u8] {
+        &self.body_bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -1482,6 +1589,168 @@ mod tests {
             r1_table.slots.iter().all(|slot| table.slots.contains(slot)),
             "r2 must be a superset of the r1 table"
         );
+    }
+
+    /// A package carrying one reserved-slot entry, built from the frozen
+    /// Stage-4 inventory so nothing but the added entry can be responsible for
+    /// a closure verdict.
+    fn package_carrying(
+        kind: RegistryEntryKind,
+        schema_id: &str,
+    ) -> ManifestVerifiedRegistryPackage {
+        let mut package = stage4_package();
+        package
+            .entries
+            .push(generation2_only_entry(kind, schema_id));
+        verified(rebuild(package))
+    }
+
+    #[test]
+    fn reserved_slot_entries_are_carriable_as_opaque_bytes_but_never_admitted() {
+        let closed = StructurallyClosedGeneration2Manifest::new(manifest()).unwrap();
+        for (kind, schema_id) in [
+            (
+                RegistryEntryKind::ComparatorLineage,
+                "registry.comparator_lineage",
+            ),
+            (
+                RegistryEntryKind::ConsolidationPolicy,
+                "registry.consolidation_policy",
+            ),
+        ] {
+            let package = package_carrying(kind, schema_id);
+            let entry_id = ContractId::new("generation2.reserved").unwrap();
+            let carriage =
+                ReservedSlotCarriageV1::from_package_entry(&package, kind, &entry_id, 1).unwrap();
+
+            // Carriage: the entry is expressible inside a manifest-verified
+            // package, its triple is a named reserved slot bound to the
+            // closed-table digest, and its body stays opaque canonical bytes.
+            assert_eq!(carriage.slot().kind, kind);
+            assert_eq!(carriage.slot().entry_schema_id.as_str(), schema_id);
+            assert_eq!(carriage.slot().entry_schema_version, 1);
+            let expected_slot = reserved_generation2_slots()
+                .unwrap()
+                .into_iter()
+                .find(|slot| slot.kind == kind)
+                .expect("the closed table reserves this kind");
+            assert_eq!(carriage.slot(), &expected_slot);
+            assert_eq!(carriage.entry_reference().entry_id, entry_id);
+            assert_eq!(carriage.entry_reference().version, 1);
+            let manifest_digest = package
+                .package()
+                .manifest
+                .iter()
+                .find(|manifest| manifest.kind == kind && manifest.entry_id == entry_id)
+                .expect("the package manifest commits to the carried entry")
+                .entry_digest;
+            assert_eq!(carriage.entry_reference().entry_digest, manifest_digest);
+            assert_eq!(carriage.body_bytes(), b"{\"schema_version\":1}");
+            require_canonical(carriage.body_bytes()).unwrap();
+
+            // Not admission: every closure in this binary still fails closed.
+            let successor_error =
+                SemanticallyClosedSuccessorPackage::from_manifest_verified(package.clone())
+                    .unwrap_err();
+            assert!(
+                matches!(&successor_error, ContractError::Schema(message)
+                    if message.contains("generation-2-only kind")),
+                "{successor_error:?}"
+            );
+            let mut genesis = genesis_package();
+            genesis
+                .entries
+                .push(generation2_only_entry(kind, schema_id));
+            let genesis_error = SemanticallyClosedGenesisPackage::from_manifest_verified(verified(
+                rebuild(genesis),
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(&genesis_error, ContractError::Schema(message)
+                    if message.contains("generation-2-only kind")),
+                "{genesis_error:?}"
+            );
+            let composition_error = closed.close_against_package(&package).unwrap_err();
+            assert!(
+                matches!(&composition_error, ContractError::Schema(message)
+                    if message.contains("generation2_reserved")),
+                "{composition_error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn carriage_refuses_anything_that_is_not_a_reserved_slot() {
+        let package = package_carrying(
+            RegistryEntryKind::ComparatorLineage,
+            "registry.comparator_lineage",
+        );
+        let reserved_id = ContractId::new("generation2.reserved").unwrap();
+
+        // A dispatched triple is not a reserved slot: this seam is not a
+        // general-purpose entry accessor.
+        let dispatched = ReservedSlotCarriageV1::from_package_entry(
+            &package,
+            RegistryEntryKind::ActivationPolicy,
+            &ContractId::new("activation.default").unwrap(),
+            2,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&dispatched, ContractError::Schema(message)
+                if message.contains("generation2_dispatched")
+                    && message.contains("not a reserved slot")),
+            "{dispatched:?}"
+        );
+
+        // An unknown triple fails closed on the same clause.
+        let mut unknown_package = stage4_package();
+        let mut unknown = generation2_only_entry(
+            RegistryEntryKind::ComparatorLineage,
+            "registry.comparator_lineage",
+        );
+        unknown.entry_schema_version = 2;
+        unknown_package.entries.push(unknown);
+        let unknown_error = ReservedSlotCarriageV1::from_package_entry(
+            &verified(rebuild(unknown_package)),
+            RegistryEntryKind::ComparatorLineage,
+            &reserved_id,
+            1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&unknown_error, ContractError::Schema(message)
+                if message.contains("unknown")),
+            "{unknown_error:?}"
+        );
+
+        // Wrong kind, wrong ID, and wrong version are each a miss.
+        for (kind, entry_id, version) in [
+            (
+                RegistryEntryKind::ConsolidationPolicy,
+                "generation2.reserved",
+                1,
+            ),
+            (RegistryEntryKind::ComparatorLineage, "generation2.other", 1),
+            (
+                RegistryEntryKind::ComparatorLineage,
+                "generation2.reserved",
+                2,
+            ),
+        ] {
+            let error = ReservedSlotCarriageV1::from_package_entry(
+                &package,
+                kind,
+                &ContractId::new(entry_id).unwrap(),
+                version,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, ContractError::Schema(message)
+                    if message.contains("package carries no")),
+                "{error:?}"
+            );
+        }
     }
 
     #[test]

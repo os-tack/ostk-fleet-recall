@@ -136,6 +136,17 @@ One negative is new: `negative-generation2-only-root-r2.jsonl` names
 manifest is rejected even though the root is otherwise well formed and in
 canonical position.
 
+### Carriage is not admission
+
+`ReservedSlotCarriageV1` proves a manifest-verified package can *carry* an
+entry whose triple is a reserved slot, keeping the body as opaque canonical
+bytes bound to that slot's closed-table digest. It decodes nothing and no
+closure consumes it: `reserved_slot_entries_are_carriable_as_opaque_bytes_but_never_admitted`
+builds such a package for both new kinds and asserts the genesis closure, the
+successor closure, and `close_against_package` all still reject it. That is the
+distinction a contract needs while its typed dispatch is pending — its registry
+entry is expressible rather than unreachable, and still inadmissible.
+
 ## Freeze discipline
 
 `vector-suite.jsonl` pins the manifest digest, the slot-table digest, the
