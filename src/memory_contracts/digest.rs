@@ -279,6 +279,11 @@ pub enum DigestDomain {
 
 impl DigestDomain {
     /// Immutable ASCII prefix included in every domain-separated preimage.
+    // Integrator: DigestDomain is a closed set that grows one arm per merged
+    // workstream; the union of all Wave-0/Wave-1 domains pushes this exhaustive
+    // match past clippy's default line cap. One arm per domain is the intended
+    // shape (no sub-dispatch), so allow the length here.
+    #[allow(clippy::too_many_lines)]
     pub const fn prefix(self) -> &'static str {
         match self {
             Self::CanonicalProfile => "ostk-canonical-profile-v1",
