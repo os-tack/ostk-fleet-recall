@@ -1534,6 +1534,12 @@ mod tests {
         // retry, the semantic identity is the same struct field.
         assert_eq!(retry.accepted_event_id, event_id);
 
+        // NOTE: this only proves the retry is rejected when its
+        // retry_position also names the predecessor epoch — it never
+        // reaches the same-physical-position conjunct below, because the
+        // earlier "does not target the successor epoch" guard fires first.
+        // `lost_fence_retry_rejects_identical_position_but_admits_partial_overlap`
+        // isolates that conjunct directly.
         let mut same_position_retry = retry.clone();
         same_position_retry.retry_position = same_position_retry.losing_position;
         assert!(same_position_retry.validate_against(&fence).is_err());
@@ -1541,6 +1547,76 @@ mod tests {
         let mut wrong_predecessor = retry;
         wrong_predecessor.losing_position.epoch_id = successor_id;
         assert!(wrong_predecessor.validate_against(&fence).is_err());
+    }
+
+    #[test]
+    fn lost_fence_retry_rejects_identical_position_but_admits_partial_overlap() {
+        // Isolates the same-physical-position conjunct in
+        // `LostFenceRetryV1::validate_against` (the "retry must occupy a
+        // different physical position than the losing append" check) from
+        // both epoch guards that precede it. Unlike the sibling test above,
+        // `losing_position` and `retry_position` here each independently
+        // satisfy their own epoch guard (predecessor / successor
+        // respectively), so a mutant that deletes or weakens the
+        // same-position check is the only way this test can pass.
+        let epoch = successor_epoch();
+        let successor_id = epoch.epoch_id().unwrap();
+        let fence = EpochFenceV1 {
+            schema_version: 1,
+            successor_epoch: epoch.clone(),
+        };
+        fence.validate().unwrap();
+
+        let key = ConsistencyPartitionKeyV1 {
+            family: ContractId::new("evidence.lost-fence-retry").unwrap(),
+            key_digest: digest("6666666666666666666666666666666666666666666666666666666666666666"),
+        };
+        let shard = partition_for_successor_epoch(&epoch, &key).unwrap();
+        let event_id = AcceptedEventId::from_digest(digest(
+            "7777777777777777777777777777777777777777777777777777777777777777",
+        ));
+
+        let losing_position = AppendPositionV1 {
+            epoch_id: predecessor_epoch_id(),
+            shard,
+            committed_offset: CommittedOffsetV1::new(20).unwrap(),
+        };
+
+        // Same (shard, committed_offset) as the losing append, but a
+        // successor epoch id -- both epoch guards pass, so only the
+        // physical-position conjunct can reject it.
+        let identical_position_retry = LostFenceRetryV1 {
+            schema_version: 1,
+            accepted_event_id: event_id,
+            consistency_partition_key: key,
+            losing_position,
+            retry_position: AppendPositionV1 {
+                epoch_id: successor_id,
+                shard,
+                committed_offset: CommittedOffsetV1::new(20).unwrap(),
+            },
+        };
+        assert_eq!(
+            identical_position_retry.validate_against(&fence),
+            Err(ContractError::Schema(
+                "retry must occupy a different physical position than the losing append".into()
+            ))
+        );
+
+        // The shape a real cutover actually produces: the retry lands on
+        // the SAME shard (its consistency-key hash is unchanged) at a
+        // DIFFERENT committed offset. This kills the `&&` -> `||` mutant --
+        // under `||` this would already be rejected as "identical".
+        let partial_overlap_retry = LostFenceRetryV1 {
+            retry_position: AppendPositionV1 {
+                epoch_id: successor_id,
+                shard,
+                committed_offset: CommittedOffsetV1::new(21).unwrap(),
+            },
+            ..identical_position_retry
+        };
+        partial_overlap_retry.validate_against(&fence).unwrap();
+        assert_eq!(partial_overlap_retry.accepted_event_id, event_id);
     }
 
     #[test]
