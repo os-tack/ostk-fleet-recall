@@ -210,14 +210,7 @@ impl AppendProjection for RelationProjectionAppend {
         transaction: &mut Transaction<'_, Postgres>,
         context: ProjectionContext,
     ) -> EvidenceAppendResult<()> {
-        if context.kind != AcceptedEventKindV1::RelationAttestation {
-            // Defensive: this adapter must never be attached to any other
-            // accepted-event kind's append.
-            return Err(EvidenceAppendError::LedgerIntegrity(format!(
-                "relation projection adapter received a {} accepted event",
-                context.kind.as_str()
-            )));
-        }
+        require_relation_attestation_kind(context.kind)?;
 
         let row: PgRow = sqlx::query(SELECT_EVENT_BY_ID_SQL)
             .bind(self.trusted_scope.tenant_id())
@@ -460,6 +453,19 @@ fn parse_basis(value: &str) -> EvidenceAppendResult<RelationAttestationBasisV1> 
     }
 }
 
+/// Defensive guard: this adapter must never run for any accepted-event kind
+/// other than a relation attestation. Extracted as a pure function (no
+/// transaction needed) so it is unit-testable without a live database.
+fn require_relation_attestation_kind(kind: AcceptedEventKindV1) -> EvidenceAppendResult<()> {
+    if kind != AcceptedEventKindV1::RelationAttestation {
+        return Err(EvidenceAppendError::LedgerIntegrity(format!(
+            "relation projection adapter received a {} accepted event",
+            kind.as_str()
+        )));
+    }
+    Ok(())
+}
+
 fn bytes(digest: Sha256Digest) -> Vec<u8> {
     digest.as_bytes().to_vec()
 }
@@ -518,6 +524,24 @@ mod tests {
             parse_state("unknown"),
             Err(EvidenceAppendError::LedgerIntegrity(_))
         ));
+    }
+
+    #[test]
+    fn require_relation_attestation_kind_accepts_only_that_kind() {
+        // Kills a mutant that flips the `!=` guard to `==`: the adapter must
+        // reject every OTHER kind and accept only `RelationAttestation`.
+        assert!(
+            require_relation_attestation_kind(AcceptedEventKindV1::RelationAttestation).is_ok()
+        );
+        for other in [
+            AcceptedEventKindV1::Evidence,
+            AcceptedEventKindV1::MemoryClaim,
+        ] {
+            assert!(matches!(
+                require_relation_attestation_kind(other),
+                Err(EvidenceAppendError::LedgerIntegrity(_))
+            ));
+        }
     }
 
     #[test]
