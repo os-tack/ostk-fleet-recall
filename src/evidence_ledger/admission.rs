@@ -303,6 +303,33 @@ impl ActiveStage4Package {
         Ok(first)
     }
 
+    /// Prove one registry reference names an entry the active package itself
+    /// closes over, at that exact kind, version, and entry digest.
+    ///
+    /// Used for references that arrive inside an activated policy *body* rather
+    /// than as a top-level entry: the body is package bytes, but the reference
+    /// it carries is still just a triple until it is resolved here.
+    fn require_entry(
+        &self,
+        kind: RegistryEntryKind,
+        reference: &RegistryReferenceV1,
+        label: &'static str,
+    ) -> Result<(), EvidenceAdmissionError> {
+        let entry = self
+            .entries()
+            .iter()
+            .find(|entry| entry.kind == kind && entry.entry_id == reference.entry_id)
+            .ok_or(EvidenceAdmissionError::RegistryReferenceNotInActivePackage(
+                label,
+            ))?;
+        if entry.version != reference.version || entry.digest()? != reference.entry_digest {
+            return Err(EvidenceAdmissionError::RegistryReferenceNotInActivePackage(
+                label,
+            ));
+        }
+        Ok(())
+    }
+
     fn recipe(
         &self,
         reference: &RegistryReferenceV1,
@@ -527,6 +554,19 @@ pub fn admit_evidence(
 /// Assemble the representation identity from the active package and the
 /// server-derived governance. Every field is copied from a proven source; the
 /// function takes no caller-supplied value except the lineage.
+///
+/// The lineage is not checked against stored ledger state, and it does not need
+/// to be at this stage: every other field here is a function of the active
+/// package and the proven source fact, so for a fixed package and a fixed source
+/// fact, `Origin` lineage always reproduces the SAME representation key — hence
+/// the same accepted-event ID, which the append transaction classifies as a
+/// replay or an integrity collision, never as a new representation. `Supersedes`
+/// is therefore structurally the only way to mint a distinct representation of
+/// one source fact, and it must name its immediate predecessor. The property
+/// holds by construction rather than by an explicit refusal;
+/// `a_new_representation_must_name_its_predecessor` pins the key inequality that
+/// makes it so, and the ledger-side replay/quarantine classification is what
+/// enforces the consequence.
 fn build_representation(
     active: &ActiveStage4Package,
     connector: &StructurallyResolvedConnectorSchemaV2,
@@ -662,6 +702,20 @@ fn require_derived_resource_identities(
     Ok(())
 }
 
+/// Compare every locator coordinate that names a published source-fact field
+/// against the field the candidate declares under that name.
+///
+/// Residual, recorded rather than hidden: `SourceFactIdentityV2` publishes only
+/// `immutable_revision` and `provider_object_id` as coordinate-shaped fields, so
+/// a locator whose components name neither is not bound to any published fact.
+/// Under the frozen recipe the provider-instance locator is exactly that case —
+/// its single component is `provider_installation_id`, which the source fact
+/// does not declare — so for that one URI EVID-02's rederivation proves the
+/// caller's inputs are internally consistent, not that they match a published
+/// provider fact. Closing it requires an installation-id field on the source
+/// fact, which is a contract change this stage may not make;
+/// `the_locator_binding_ignores_keys_it_does_not_own` pins today's behaviour so
+/// the gap cannot close or widen silently.
 fn require_locator_coordinates(
     candidate: &EvidenceIngressCandidateV2,
     locator: &CanonicalLocatorV1,
@@ -707,6 +761,18 @@ fn derive_server_governance(
     classifier.require_admissible(classifier_entry)?;
     retention.require_admissible(retention_entry)?;
     publication.require_admissible(publication_entry)?;
+
+    // The publication rule names an exemplar policy inside its own body. Every
+    // other registry reference this module consumes — the connector, both
+    // identity recipes, all four policy entries — is resolved against the active
+    // package, and this one must be too: an activated rule that pointed at an
+    // exemplar policy the package does not close over would be an unresolved
+    // governance reference admitted as if it were proven (AUTH-04).
+    active.require_entry(
+        RegistryEntryKind::ExemplarPolicy,
+        &publication.exemplar_policy,
+        "exemplar policy",
+    )?;
 
     reconcile_publication(
         classifier.default_publication,
@@ -2147,19 +2213,7 @@ mod tests {
         let active = active_package();
         let locators = built_locators(&active);
         let oversized = vec![b'x'; usize::try_from(MAX_GOVERNED_CONTENT_BYTES).unwrap() + 1];
-        let content_digest = Sha256Digest::from_bytes(Sha256::digest(&oversized).into());
-        let mut candidate = built_candidate(&active);
-        candidate.canonical_payload.content_digest = content_digest;
-        candidate.canonical_payload.byte_length =
-            CanonicalDecimal::parse(oversized.len().to_string()).unwrap();
-        candidate.canonical_payload.storage_identity = StorageIdentityPreimageV1 {
-            schema_version: STORAGE_IDENTITY_SCHEMA_VERSION,
-            protection_domain_id: active.scope().project_namespace.clone(),
-            body_content_id: content_digest,
-        }
-        .storage_identity()
-        .unwrap()
-        .digest();
+        let candidate = candidate_for_payload(&active, &oversized);
         assert!(matches!(
             admit_evidence(
                 &active,
@@ -2173,5 +2227,144 @@ mod tests {
             ),
             Err(EvidenceAdmissionError::ContentTooLarge)
         ));
+    }
+
+    /// The bound is inclusive: a payload of exactly `MAX_GOVERNED_CONTENT_BYTES`
+    /// seals to exactly the 1 MiB migration 0018's CHECK allows, so it must be
+    /// admitted. Without this, `>` and `>=` are indistinguishable here.
+    #[test]
+    fn a_payload_of_exactly_the_governed_bound_is_admitted() {
+        let active = active_package();
+        let locators = built_locators(&active);
+        let exact = vec![b'x'; usize::try_from(MAX_GOVERNED_CONTENT_BYTES).unwrap()];
+        let candidate = candidate_for_payload(&active, &exact);
+        let admitted = admit_evidence(
+            &active,
+            EvidenceAdmissionRequestV1 {
+                candidate: &candidate,
+                locators: &locators,
+                canonical_payload: &exact,
+                delivery: delivery(),
+                lineage: RepresentationLineageV2::Origin,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            admitted.statement().canonical_content.byte_length.as_str(),
+            MAX_GOVERNED_CONTENT_BYTES.to_string()
+        );
+    }
+
+    /// Two lawful candidates over the SAME canonical bytes may assert different
+    /// media types. Both must admit, and both must reach the one storage
+    /// identity — the media type is not in the storage-identity preimage, so it
+    /// cannot be allowed to fork or to wedge the row (EVID-01).
+    #[test]
+    fn identical_bytes_with_different_asserted_media_types_share_one_storage_identity() {
+        let active = active_package();
+        let locators = built_locators(&active);
+        let first = built_candidate(&active);
+
+        let mut second = built_candidate(&active);
+        second.canonical_payload.asserted_media_type =
+            ContractId::new("application.github.push").unwrap();
+        second.source_fact.logical_event_key =
+            HexBytes::new(b"another-lawful-event".to_vec()).unwrap();
+        assert_ne!(
+            first.canonical_payload.asserted_media_type,
+            second.canonical_payload.asserted_media_type
+        );
+
+        let admit_one = |candidate: &EvidenceIngressCandidateV2| {
+            admit_evidence(
+                &active,
+                EvidenceAdmissionRequestV1 {
+                    candidate,
+                    locators: &locators,
+                    canonical_payload: CANONICAL_PAYLOAD,
+                    delivery: delivery(),
+                    lineage: RepresentationLineageV2::Origin,
+                },
+            )
+            .unwrap()
+        };
+        let first = admit_one(&first);
+        let second = admit_one(&second);
+
+        assert_ne!(
+            first.statement().source_fact_id,
+            second.statement().source_fact_id
+        );
+        assert_eq!(
+            first.content().storage_identity(),
+            second.content().storage_identity()
+        );
+        assert_ne!(
+            first.statement().canonical_content.media_type,
+            second.statement().canonical_content.media_type
+        );
+    }
+
+    /// Rebind the frozen candidate to different canonical bytes, deriving the
+    /// storage identity exactly as admission will.
+    fn candidate_for_payload(
+        active: &ActiveStage4Package,
+        payload: &[u8],
+    ) -> EvidenceIngressCandidateV2 {
+        let content_digest = Sha256Digest::from_bytes(Sha256::digest(payload).into());
+        let mut candidate = built_candidate(active);
+        candidate.canonical_payload.content_digest = content_digest;
+        candidate.canonical_payload.byte_length =
+            CanonicalDecimal::parse(payload.len().to_string()).unwrap();
+        candidate.canonical_payload.storage_identity = StorageIdentityPreimageV1 {
+            schema_version: STORAGE_IDENTITY_SCHEMA_VERSION,
+            protection_domain_id: active.scope().project_namespace.clone(),
+            body_content_id: content_digest,
+        }
+        .storage_identity()
+        .unwrap()
+        .digest();
+        candidate
+    }
+
+    /// Every coordinate of a body-carried registry reference is resolved against
+    /// the active package: kind, entry id, version, and entry digest.
+    #[test]
+    fn a_body_carried_registry_reference_must_resolve_in_the_active_package() {
+        let active = active_package();
+        let publication = active
+            .unique_entry(RegistryEntryKind::PublicationRule, "publication")
+            .unwrap();
+        let body: PublicationRuleBodyV1 = decode_body(publication).unwrap();
+        let reference = body.exemplar_policy;
+        active
+            .require_entry(
+                RegistryEntryKind::ExemplarPolicy,
+                &reference,
+                "exemplar policy",
+            )
+            .unwrap();
+
+        let refused = |kind: RegistryEntryKind, reference: &RegistryReferenceV1| {
+            matches!(
+                active.require_entry(kind, reference, "exemplar policy"),
+                Err(EvidenceAdmissionError::RegistryReferenceNotInActivePackage(
+                    "exemplar policy"
+                ))
+            )
+        };
+        assert!(refused(RegistryEntryKind::RetentionPolicy, &reference));
+
+        let mut absent = reference.clone();
+        absent.entry_id = ContractId::new("exemplar.absent").unwrap();
+        assert!(refused(RegistryEntryKind::ExemplarPolicy, &absent));
+
+        let mut wrong_version = reference.clone();
+        wrong_version.version += 1;
+        assert!(refused(RegistryEntryKind::ExemplarPolicy, &wrong_version));
+
+        let mut wrong_digest = reference;
+        wrong_digest.entry_digest = Sha256Digest::from_bytes([0x11; 32]);
+        assert!(refused(RegistryEntryKind::ExemplarPolicy, &wrong_digest));
     }
 }
