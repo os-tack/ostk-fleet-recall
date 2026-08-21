@@ -3,10 +3,12 @@ set -euo pipefail
 
 # This is the authoritative connected correctness proof. It uses the exact
 # official CockroachDB binary, discovers and runs every named opt-in live test
-# in this authoritative matrix, and exercises the four private CLIs included
-# in this proof (control bootstrap, genesis activation, successor activation,
-# and conflict reconciliation) on one secure local server. The one server and
-# its result are never Docker parity evidence.
+# in this authoritative matrix, exercises five private CLIs (control bootstrap,
+# genesis activation, successor activation, the repeatable generic N -> N+1
+# successor ceremony, and conflict reconciliation), and builds and asserts a
+# sixth (the bootstrap-manifest import, whose connected behaviour is proven by
+# tests/bootstrap_manifest_live.rs) on one secure local server. The one server
+# and its result are never Docker parity evidence.
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../../.." && pwd)
 expected_crdb_build_tag=v26.2.3
@@ -1676,6 +1678,119 @@ while IFS= read -r evidence_ledger_live_test; do
             "$evidence_ledger_live_test" -- --exact --nocapture
 done <<<"$evidence_ledger_live_tests"
 
+# Every Wave-1 writer-authority head-witness (W1-HEAD) connected test, by exact
+# discovered name. The set is asserted complete against the harness listing, so
+# a new live_* test that nobody wires here fails this proof instead of silently
+# not running. The suite's one offline test does not begin with live_ and is
+# excluded by the discovery filter.
+registry_witness_live_tests='live_writer_authority_binds_the_witness_to_the_physical_scope_it_read_when_configured
+live_writer_authority_descent_columns_are_held_by_the_schema_when_configured
+live_writer_authority_fails_closed_without_an_active_head_when_configured
+live_writer_authority_never_observes_a_torn_head_across_a_concurrent_rollback_when_configured
+live_writer_authority_rejects_a_break_glass_activation_id_mismatch_when_configured
+live_writer_authority_rejects_a_canonical_head_that_misbinds_the_projection_when_configured
+live_writer_authority_rejects_a_durable_log_epoch_drift_when_configured
+live_writer_authority_rejects_a_mismatched_bootstrap_receipt_pin_when_configured
+live_writer_authority_rejects_a_non_serializable_transaction_when_configured
+live_writer_authority_rejects_mismatched_contract_namespaces_when_configured
+live_writer_authority_rejects_noncanonical_head_bytes_when_configured
+live_writer_authority_runs_under_the_runtime_grant_matrix_without_control_access_when_configured
+live_writer_authority_witness_materializes_the_stage4_head_when_configured'
+registry_witness_live_listing=$(cargo test --locked \
+    --test registry_witness_live -- --list)
+discovered_registry_witness_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$registry_witness_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact writer-authority witness connected test set" \
+    "$discovered_registry_witness_live_tests" "$registry_witness_live_tests"
+while IFS= read -r registry_witness_live_test; do
+    test -n "$registry_witness_live_test" || continue
+    require_discovered_test "$registry_witness_live_listing" \
+        "$registry_witness_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test registry_witness_live \
+            "$registry_witness_live_test" -- --exact --nocapture
+done <<<"$registry_witness_live_tests"
+
+# Every Wave-1 evidence v2 admission + governed content store (W1-EVID)
+# connected test, by exact discovered name; the set is asserted complete.
+evidence_admission_live_tests='live_a_retention_annotation_rotation_does_not_wedge_a_row_when_configured
+live_a_tampered_content_row_fails_the_next_append_closed_when_configured
+live_admission_appends_event_and_content_atomically_when_configured
+live_exact_replay_writes_no_second_content_row_when_configured
+live_failing_projection_leaves_no_event_head_or_content_when_configured
+live_identical_bytes_with_different_media_types_both_append_when_configured
+live_late_arrival_preserves_provider_clocks_when_configured
+live_rejections_happen_before_any_write_when_configured
+live_same_representation_other_bytes_is_quarantined_when_configured
+live_second_representation_reuses_one_content_object_when_configured'
+evidence_admission_live_listing=$(cargo test --locked \
+    --test evidence_admission_live -- --list)
+discovered_evidence_admission_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$evidence_admission_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact evidence-admission connected test set" \
+    "$discovered_evidence_admission_live_tests" "$evidence_admission_live_tests"
+while IFS= read -r evidence_admission_live_test; do
+    test -n "$evidence_admission_live_test" || continue
+    require_discovered_test "$evidence_admission_live_listing" \
+        "$evidence_admission_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test evidence_admission_live \
+            "$evidence_admission_live_test" -- --exact --nocapture
+done <<<"$evidence_admission_live_tests"
+
+# Every Wave-1 relation attestation append + durable projection (W1-REL)
+# connected test, by exact discovered name; the set is asserted complete.
+relation_projection_live_tests='live_attest_produces_projection_row_and_watermark_in_one_transaction
+live_concurrent_attestations_on_one_edge_form_one_chain_with_a_monotonic_watermark
+live_exact_replay_is_a_no_op_and_the_watermark_is_unchanged
+live_refute_flips_state_and_retains_the_prior_event
+live_replay01_rebuild_from_event_rows_equals_the_incremental_projection
+live_unauthorized_supersession_is_rejected_and_nothing_is_written'
+relation_projection_live_listing=$(cargo test --locked \
+    --test relation_projection_live -- --list)
+discovered_relation_projection_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$relation_projection_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact relation-projection connected test set" \
+    "$discovered_relation_projection_live_tests" \
+    "$relation_projection_live_tests"
+while IFS= read -r relation_projection_live_test; do
+    test -n "$relation_projection_live_test" || continue
+    require_discovered_test "$relation_projection_live_listing" \
+        "$relation_projection_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test relation_projection_live \
+            "$relation_projection_live_test" -- --exact --nocapture
+done <<<"$relation_projection_live_tests"
+
+# Every Wave-1 bootstrap-manifest import (W1-IMPORT) connected test, by exact
+# discovered name; the set is asserted complete.
+bootstrap_manifest_live_tests='live_bootstrap_manifest_determinism_replay_and_chain_audit_when_configured
+live_bootstrap_manifest_row_collision_is_refused_with_no_head_advance_when_configured
+live_bootstrap_manifest_scope_binding_when_configured'
+bootstrap_manifest_live_listing=$(cargo test --locked \
+    --test bootstrap_manifest_live -- --list)
+discovered_bootstrap_manifest_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$bootstrap_manifest_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact bootstrap-manifest connected test set" \
+    "$discovered_bootstrap_manifest_live_tests" \
+    "$bootstrap_manifest_live_tests"
+while IFS= read -r bootstrap_manifest_live_test; do
+    test -n "$bootstrap_manifest_live_test" || continue
+    require_discovered_test "$bootstrap_manifest_live_listing" \
+        "$bootstrap_manifest_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test bootstrap_manifest_live \
+            "$bootstrap_manifest_live_test" -- --exact --nocapture
+done <<<"$bootstrap_manifest_live_tests"
+
 current_retry_live_test=ledger::cockroach::tests::live_current_projection_whole_unit_retry_when_configured
 current_snapshot_live_test=ledger::cockroach::tests::live_current_projection_snapshot_race_when_configured
 conflict_live_test=ledger::cockroach::tests::live_conflict_polarity_matrix_when_configured
@@ -2520,7 +2635,8 @@ cargo build --locked \
     --bin ostk-registry-activate \
     --bin ostk-registry-successor-activate \
     --bin ostk-registry-generic-successor-activate \
-    --bin ostk-conflict-reconcile >/dev/null
+    --bin ostk-conflict-reconcile \
+    --bin ostk-bootstrap-manifest-import >/dev/null
 successor_binary="$repo_root/target/debug/ostk-registry-successor-activate"
 test -x "$successor_binary" \
     || fail "locked build did not produce the successor activation CLI"
@@ -2567,6 +2683,13 @@ test -x "$successor_emitter_test_binary" \
 reconciliation_binary="$repo_root/target/debug/ostk-conflict-reconcile"
 test -x "$reconciliation_binary" \
     || fail "locked build did not produce the conflict reconciliation CLI"
+# The Wave-1 bootstrap-manifest import CLI (W1-IMPORT) has no fixture emitter by
+# design: its connected behaviour is proven by tests/bootstrap_manifest_live.rs
+# above, so this proof asserts only the built artifact and wires no emitter
+# discovery for it.
+bootstrap_manifest_import_binary="$repo_root/target/debug/ostk-bootstrap-manifest-import"
+test -x "$bootstrap_manifest_import_binary" \
+    || fail "locked build did not produce the bootstrap-manifest import CLI"
 
 bootstrap_receipt="$repo_root/contracts/dynamic-memory/v1/bootstrap-receipt.jsonl"
 genesis_package="$repo_root/contracts/dynamic-memory/v1/genesis-registry-package.jsonl"

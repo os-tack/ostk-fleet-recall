@@ -995,6 +995,29 @@ async fn live_writer_authority_runs_under_the_runtime_grant_matrix_without_contr
     .execute(&probe_pool)
     .await
     .expect("the runtime identity must be able to seed an evidence shard head");
+
+    // Tear the probe role down. Without this the leaked witness_probe_* role
+    // survives on a shared server and pollutes a later default-privilege
+    // assertion in the official CLI lane; CockroachDB also refuses to drop a
+    // role that still holds a grant, so the teardown mirrors the grant list
+    // exactly (matching the evidence_ledger_live probe convention).
+    probe_pool.close().await;
+    for (_privileges, relations) in RUNTIME_EVIDENCE_GRANTS {
+        sqlx::query(&format!("REVOKE ALL ON TABLE {relations} FROM {role}"))
+            .execute(&pool)
+            .await
+            .expect("revoke probe runtime privileges");
+    }
+    for statement in [
+        format!("REVOKE ALL ON SCHEMA public FROM {role}"),
+        format!("REVOKE ALL ON DATABASE fleet_recall FROM {role}"),
+        format!("DROP ROLE IF EXISTS {role}"),
+    ] {
+        sqlx::query(&statement)
+            .execute(&pool)
+            .await
+            .expect("drop probe role");
+    }
 }
 
 /// Rewrite the root test URL into a password-authenticated URL for the probe

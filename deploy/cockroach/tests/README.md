@@ -33,6 +33,38 @@ cannot count as connected success.
 | Evidence ledger: single append and shard chain audit | `--test evidence_ledger_live` / `live_single_append_and_shard_chain_audit_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Evidence ledger: statement bound to a never-active head writes nothing | `--test evidence_ledger_live` / `live_statement_bound_to_a_never_active_head_writes_nothing_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Evidence ledger: witness mismatch writes nothing | `--test evidence_ledger_live` / `live_witness_mismatch_writes_nothing_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: binds the witness to the physical scope it read | `--test registry_witness_live` / `live_writer_authority_binds_the_witness_to_the_physical_scope_it_read_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: descent columns are held by the schema | `--test registry_witness_live` / `live_writer_authority_descent_columns_are_held_by_the_schema_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: fails closed without an active head | `--test registry_witness_live` / `live_writer_authority_fails_closed_without_an_active_head_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: never observes a torn head across a concurrent rollback | `--test registry_witness_live` / `live_writer_authority_never_observes_a_torn_head_across_a_concurrent_rollback_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: rejects a break-glass activation-id mismatch | `--test registry_witness_live` / `live_writer_authority_rejects_a_break_glass_activation_id_mismatch_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: rejects a canonical head that misbinds the projection | `--test registry_witness_live` / `live_writer_authority_rejects_a_canonical_head_that_misbinds_the_projection_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: rejects a durable log-epoch drift | `--test registry_witness_live` / `live_writer_authority_rejects_a_durable_log_epoch_drift_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: rejects a mismatched bootstrap-receipt pin | `--test registry_witness_live` / `live_writer_authority_rejects_a_mismatched_bootstrap_receipt_pin_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: rejects a non-serializable transaction | `--test registry_witness_live` / `live_writer_authority_rejects_a_non_serializable_transaction_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: rejects mismatched contract namespaces | `--test registry_witness_live` / `live_writer_authority_rejects_mismatched_contract_namespaces_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: rejects noncanonical head bytes | `--test registry_witness_live` / `live_writer_authority_rejects_noncanonical_head_bytes_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: runs under the runtime grant matrix without control access | `--test registry_witness_live` / `live_writer_authority_runs_under_the_runtime_grant_matrix_without_control_access_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Writer-authority witness: materializes the Stage-4 head | `--test registry_witness_live` / `live_writer_authority_witness_materializes_the_stage4_head_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence admission: a retention-annotation rotation does not wedge a row | `--test evidence_admission_live` / `live_a_retention_annotation_rotation_does_not_wedge_a_row_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence admission: a tampered content row fails the next append closed | `--test evidence_admission_live` / `live_a_tampered_content_row_fails_the_next_append_closed_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence admission: appends event and content atomically | `--test evidence_admission_live` / `live_admission_appends_event_and_content_atomically_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence admission: exact replay writes no second content row | `--test evidence_admission_live` / `live_exact_replay_writes_no_second_content_row_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence admission: a failing projection leaves no event head or content | `--test evidence_admission_live` / `live_failing_projection_leaves_no_event_head_or_content_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence admission: identical bytes with different media types both append | `--test evidence_admission_live` / `live_identical_bytes_with_different_media_types_both_append_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence admission: late arrival preserves provider clocks | `--test evidence_admission_live` / `live_late_arrival_preserves_provider_clocks_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence admission: rejections happen before any write | `--test evidence_admission_live` / `live_rejections_happen_before_any_write_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence admission: same representation, other bytes is quarantined | `--test evidence_admission_live` / `live_same_representation_other_bytes_is_quarantined_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Evidence admission: a second representation reuses one content object | `--test evidence_admission_live` / `live_second_representation_reuses_one_content_object_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Relation projection: attest produces a projection row and watermark in one transaction | `--test relation_projection_live` / `live_attest_produces_projection_row_and_watermark_in_one_transaction` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Relation projection: concurrent attestations on one edge form one chain with a monotonic watermark | `--test relation_projection_live` / `live_concurrent_attestations_on_one_edge_form_one_chain_with_a_monotonic_watermark` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Relation projection: exact replay is a no-op and the watermark is unchanged | `--test relation_projection_live` / `live_exact_replay_is_a_no_op_and_the_watermark_is_unchanged` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Relation projection: refute flips state and retains the prior event | `--test relation_projection_live` / `live_refute_flips_state_and_retains_the_prior_event` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Relation projection: replay rebuild from event rows equals the incremental projection | `--test relation_projection_live` / `live_replay01_rebuild_from_event_rows_equals_the_incremental_projection` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Relation projection: unauthorized supersession is rejected and nothing is written | `--test relation_projection_live` / `live_unauthorized_supersession_is_rejected_and_nothing_is_written` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Bootstrap manifest: determinism, replay, and chain audit | `--test bootstrap_manifest_live` / `live_bootstrap_manifest_determinism_replay_and_chain_audit_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Bootstrap manifest: row collision is refused with no head advance | `--test bootstrap_manifest_live` / `live_bootstrap_manifest_row_collision_is_refused_with_no_head_advance_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
+| Bootstrap manifest: scope binding | `--test bootstrap_manifest_live` / `live_bootstrap_manifest_scope_binding_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Current-projection whole-unit retry | `--lib` / `ledger::cockroach::tests::live_current_projection_whole_unit_retry_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Current-projection snapshot race | `--lib` / `ledger::cockroach::tests::live_current_projection_snapshot_race_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
 | Functional-polarity conflict matrix | `--lib` / `ledger::cockroach::tests::live_conflict_polarity_matrix_when_configured` | `FLEET_RECALL_TEST_DATABASE_URL` |
@@ -47,7 +79,12 @@ cannot count as connected success.
 The evidence-ledger row set is asserted complete: the wrapper compares every
 `live_*` name the `evidence_ledger_live` harness lists against the exact set it
 runs, so a new connected test that nobody wires fails the proof instead of
-silently not running.
+silently not running. The four Wave-1 Stage-4 suites -- `registry_witness_live`
+(writer-authority head witness), `evidence_admission_live` (evidence v2
+admission and governed content store), `relation_projection_live` (relation
+attestation append and durable projection), and `bootstrap_manifest_live`
+(bootstrap-manifest import) -- are each asserted complete the same way, so an
+unwired `live_*` in any of them fails the proof.
 
 The same isolated server also exercises all five private workstation CLIs:
 inspect/apply/replay for control and genesis activation; offline artifact
@@ -57,7 +94,11 @@ apply/inspect for the repeatable generic `N -> N+1` successor ceremony
 (`ostk-registry-generic-successor-activate`, built and asserted executable --
 its production parser exposes no fixture emitter, so no emitter discovery is
 wired for it); and materialize/exact replay for apply-only conflict
-reconciliation. It
+reconciliation. It also builds and asserts executable a sixth private CLI, the
+bootstrap-manifest import (`ostk-bootstrap-manifest-import`); like the generic
+successor CLI it exposes no fixture emitter, so no emitter discovery is wired
+for it, and its connected behaviour is proven by `bootstrap_manifest_live`
+above. It
 requires exactly 18 successful SQLx rows with versions 1 through 18, the three
 successor authority tables, the two genesis-root indexes, and the exact indexes
 introduced by migrations 15, 16, and 17. The retired pre-v15 conflict
@@ -94,9 +135,9 @@ inside the same one-server result; do not report either as a separate server
 result. The checked-in `fleet_registry_successor_activation` role policy is a
 short-lived, exclusive credential boundary, not a deployment route. Conflict
 reconciliation and its logical role are likewise one-shot workstation
-surfaces. None of the four private CLIs has an AWS, Terraform, task, production
+surfaces. None of the six private CLIs has an AWS, Terraform, task, production
 image, runtime, startup, or server-route surface; the production image excludes
-all four.
+all six.
 
 Run the authoritative proof with an already checksum-verified binary:
 
@@ -125,7 +166,7 @@ counted as Docker evidence.
 
 | Reported result | Substrate and scope | Relationship to authority |
 | --- | --- | --- |
-| Official-binary correctness | One checksum-pinned, build-tag-pinned TLS `v26.2.3` server running the complete matrix and all four private CLIs | The single authoritative connected result |
+| Official-binary correctness | One checksum-pinned, build-tag-pinned TLS `v26.2.3` server running the complete matrix and all six private CLIs | The single authoritative connected result |
 | Control RBAC parity | `control-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Activation RBAC parity | `registry-activation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |
 | Successor-activation RBAC parity | `successor-activation-role-grants.sh` in its own Docker container | Secondary packaging/RBAC result only |

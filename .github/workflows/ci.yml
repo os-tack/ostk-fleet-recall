@@ -151,6 +151,7 @@ jobs:
             test ! -e /usr/local/bin/ostk-registry-successor-activate &&
             test ! -e /usr/local/bin/ostk-registry-generic-successor-activate &&
             test ! -e /usr/local/bin/ostk-conflict-reconcile &&
+            test ! -e /usr/local/bin/ostk-bootstrap-manifest-import &&
             test -x /usr/bin/curl &&
             test -r /opt/ostk/demo/demo.ndjson &&
             test -r /opt/ostk/demo/rich-demo.ndjson &&
