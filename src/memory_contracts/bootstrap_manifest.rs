@@ -554,6 +554,54 @@ mod tests {
     }
 
     #[test]
+    fn primary_key_at_max_components_is_accepted() {
+        // Exactly MAX_PRIMARY_KEY_COMPONENTS is the admitted upper edge. The
+        // rejection test above only pins MAX+1; without this the `len() > MAX`
+        // conjunct survives a `>=` mutant that would wrongly reject the
+        // boundary itself. Single row, so strict-sort is trivially satisfied
+        // and only the component-count bound is exercised.
+        let mut at_max = manifest();
+        at_max.rows.truncate(1);
+        at_max.rows[0].primary_key = (0..MAX_PRIMARY_KEY_COMPONENTS)
+            .map(|value| LegacyPrimaryKeyComponentV1::Integer {
+                value: i64::try_from(value).unwrap(),
+            })
+            .collect();
+        assert_eq!(at_max.rows[0].primary_key.len(), MAX_PRIMARY_KEY_COMPONENTS);
+        at_max
+            .validate_shape()
+            .expect("a row with exactly MAX_PRIMARY_KEY_COMPONENTS must be admitted");
+    }
+
+    #[test]
+    fn manifest_at_max_rows_is_accepted() {
+        // Exactly MAX_MANIFEST_ROWS is the admitted upper edge. The rejection
+        // test above only pins MAX+1; without this the `len() > MAX` conjunct
+        // survives both a `>=` mutant (rejects the boundary) and a `==` mutant
+        // (rejects only the boundary). MAX_MANIFEST_ROWS equals the canonical
+        // profile's MAX_COLLECTION_ELEMENTS, whose own admit-at-most-that check
+        // also accepts exactly this many, so the encode step does not mask it.
+        let mut at_max = manifest();
+        at_max.rows = (0..MAX_MANIFEST_ROWS)
+            .map(|index| BootstrapManifestRowV1 {
+                table: LegacyTableV1::MemoryClaims,
+                primary_key: vec![LegacyPrimaryKeyComponentV1::Integer {
+                    value: i64::try_from(index).unwrap(),
+                }],
+                row_digest: Sha256Digest::from_bytes([0x5a; 32]),
+            })
+            .collect();
+        assert_eq!(at_max.rows.len(), MAX_MANIFEST_ROWS);
+        assert!(
+            strictly_sorted_rows(&at_max.rows),
+            "fixture must be sorted so only the length bound is exercised"
+        );
+        at_max
+            .validate_shape()
+            .expect("a manifest with exactly MAX_MANIFEST_ROWS must be admitted");
+    }
+
+    #[test]
     fn accepted_statement_scope_must_equal_manifest_scope() {
         let mut foreign = statement();
         foreign.scope = AuthenticatedProjectScopeV1::from_trusted_context(
