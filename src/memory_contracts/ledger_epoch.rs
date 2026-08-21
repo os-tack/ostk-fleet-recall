@@ -1412,6 +1412,10 @@ mod tests {
 
     #[test]
     fn epoch_missing_predecessor_fails_closed() {
+        // The negative fixture is itself canonical JSON (well-formed,
+        // sorted, byte-minimal) -- it is `SuccessorLogEpochV1` that rejects
+        // it, at the schema boundary, not the canonical-JSON parser.
+        require_canonical(record(NEGATIVE_MISSING_PREDECESSOR)).unwrap();
         assert!(
             decode_strict::<SuccessorLogEpochV1>(record(NEGATIVE_MISSING_PREDECESSOR)).is_err()
         );
@@ -1419,11 +1423,18 @@ mod tests {
 
     #[test]
     fn seed_shape_fails_closed() {
+        // As above: canonical JSON, rejected by `FixedHex32`'s exact-length
+        // requirement, not by canonical-form parsing.
+        require_canonical(record(NEGATIVE_SEED_SHAPE)).unwrap();
         assert!(decode_strict::<SuccessorLogEpochV1>(record(NEGATIVE_SEED_SHAPE)).is_err());
     }
 
     #[test]
     fn unsorted_head_vector_fails_closed() {
+        // As above: canonical JSON, rejected by `ClosedHeadVectorV1::validate`'s
+        // ordering check, not by canonical-form parsing -- `decode_strict`
+        // below succeeds precisely because the shape is well-formed.
+        require_canonical(record(NEGATIVE_UNSORTED_HEAD_VECTOR)).unwrap();
         let decoded: ClosedHeadVectorV1 = decode_strict(record(NEGATIVE_UNSORTED_HEAD_VECTOR))
             .expect("shape is well-formed JSON; only ordering is invalid");
         assert_eq!(
