@@ -80,22 +80,27 @@ projection's message text, not the `LedgerIntegrity` variant directly. See
 
 ## Fixtures in this directory
 
-- `bootstrap-manifest-v1.jsonl` — one positive `BootstrapManifestV1`: two
-  rows (`memory_chunks`, `memory_claims`), already sorted.
+- `bootstrap-manifest-v1.jsonl` — one positive `BootstrapManifestV1`: four
+  rows in strict ascending `(table, primary_key)` order — `memory_chunks`/`1`,
+  `memory_claims`/`1`, `memory_claims`/`2`, `memory_conflicts`/`1`.
 - `bootstrap-manifest-accepted-statement-v1.jsonl` — the accepted-event
   preimage binding that manifest to a profile/scope/registry-head triple.
-- `negative-unsorted-rows.jsonl` — the same manifest with its two rows
+- `negative-unsorted-rows.jsonl` — the same manifest with its first two rows
   swapped: rejected by the strict-sort check, not silently re-sorted.
 - `negative-duplicate-row.jsonl` — the same manifest with a second entry for
-  `memory_chunks`/`chunk-1` carrying a *different* `row_digest`: still
-  rejected by the strict-sort check, because it compares only
-  `(table, primary_key)`, never `row_digest`.
+  `memory_chunks`/`1` carrying a *different* `row_digest`: still rejected by
+  the strict-sort check, because it compares only `(table, primary_key)`,
+  never `row_digest`.
 - `negative-foreign-scope.jsonl` — the accepted statement with its `scope`
   changed to a tenant/project the manifest does not carry: rejected because
   `statement.scope != statement.manifest.scope`.
 - `negative-unknown-field.jsonl` — the positive manifest with an extra
   `legacy_row_bytes` key spliced in at the top level: rejected at decode time
   by `#[serde(deny_unknown_fields)]`, never reaching `validate_shape`.
+- `vector-suite.jsonl` — the canonical suite index (sorted keys, one LF): it
+  enumerates every positive and negative fixture above by file path and pins
+  the two frozen digest identities. Its own bytes are asserted canonical from
+  Rust (`vector_suite_fixture_is_pinned` calls `require_canonical`).
 
 ## Regenerating
 

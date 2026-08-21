@@ -693,7 +693,7 @@ mod tests {
     const VECTOR_SUITE_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/bootstrap-manifest/vector-suite.jsonl");
     const VECTOR_SUITE_RAW_SHA256: &str =
-        "bda168c96d0f94837ae980fbcdc0a31ad87e9befcf4c49d44bc36cccdb778325";
+        "1d8032e4e77ddccd1383ad74064f53a53ab9c4e48fd27d8643f6ae6d54fa9371";
 
     const MANIFEST_DIGEST: &str =
         "d0c4448b3cc623c6f242feaa655c57aa3952c7c2cb15576c5dc60d670f50846c";
@@ -824,6 +824,54 @@ mod tests {
             VECTOR_SUITE_RAW_SHA256,
             "vector-suite.jsonl drifted"
         );
+        // Canonicality is pinned like every sibling fixture: the suite index's
+        // own bytes must already be in the frozen canonical profile (sorted
+        // keys, one LF stripped as repository framing), not merely decode to a
+        // canonical meaning.
+        require_canonical(fixture_body(VECTOR_SUITE_FIXTURE))
+            .expect("vector-suite.jsonl must be exactly its own canonical form");
+
+        // The suite must literally enumerate every positive AND negative
+        // fixture in this directory by file path, and its embedded identities
+        // must equal the pinned digest constants (declared == enforced).
+        let suite: serde_json::Value =
+            decode_strict(VECTOR_SUITE_FIXTURE).expect("suite is strict JSON");
+        let file_of = |case: &serde_json::Value| -> String {
+            case.get("file")
+                .and_then(serde_json::Value::as_str)
+                .expect("each case names its fixture file")
+                .to_owned()
+        };
+        let positives = suite["positive_cases"].as_array().unwrap();
+        let negatives = suite["negative_cases"].as_array().unwrap();
+        let mut enumerated: Vec<String> = positives
+            .iter()
+            .chain(negatives.iter())
+            .map(file_of)
+            .collect();
+        enumerated.sort();
+        assert_eq!(
+            enumerated,
+            vec![
+                "bootstrap-manifest-accepted-statement-v1.jsonl".to_owned(),
+                "bootstrap-manifest-v1.jsonl".to_owned(),
+                "negative-duplicate-row.jsonl".to_owned(),
+                "negative-foreign-scope.jsonl".to_owned(),
+                "negative-unknown-field.jsonl".to_owned(),
+                "negative-unsorted-rows.jsonl".to_owned(),
+            ],
+            "suite must enumerate exactly the six frozen fixtures by file path"
+        );
+        assert_eq!(
+            positives[0]["manifest_digest"].as_str().unwrap(),
+            MANIFEST_DIGEST,
+            "suite's manifest_digest must match the pinned constant"
+        );
+        assert_eq!(
+            positives[1]["accepted_event_id"].as_str().unwrap(),
+            ACCEPTED_EVENT_ID,
+            "suite's accepted_event_id must match the pinned constant"
+        );
     }
 
     /// Maintainer-only regeneration of the frozen fixtures above. Run with
@@ -831,6 +879,7 @@ mod tests {
     /// --lib memory_contracts::bootstrap_manifest::tests::regenerate -- --ignored --nocapture`.
     #[test]
     #[ignore = "maintainer-only canonical fixture regeneration"]
+    #[allow(clippy::too_many_lines)] // one linear maintainer emitter per fixture, incl. the suite index
     fn regenerate_bootstrap_manifest_contract_artifacts() {
         use std::{fs, path::Path};
 
@@ -900,6 +949,52 @@ mod tests {
             &output,
             "negative-unknown-field.jsonl",
             &serde_json::to_vec(&unknown_field).unwrap(),
+        );
+
+        // The suite index is regenerated through the same canonical encoder as
+        // every fixture it names, so it is byte-canonical (sorted keys) by
+        // construction. Every positive AND negative fixture in this directory
+        // is enumerated by its own file path, and the domain prefixes and
+        // digests are derived from the contract, never hand-asserted.
+        let legacy_tables: Vec<&str> = [
+            LegacyTableV1::MemoryChunks,
+            LegacyTableV1::MemoryClaims,
+            LegacyTableV1::MemoryConflicts,
+            LegacyTableV1::MemoryConflictMembers,
+            LegacyTableV1::MemoryMutationReceipts,
+        ]
+        .into_iter()
+        .map(LegacyTableV1::as_str)
+        .collect();
+        let suite = serde_json::json!({
+            "schema_version": BOOTSTRAP_MANIFEST_SCHEMA_VERSION,
+            "digest_domain_prefix": DigestDomain::BootstrapManifestV1.prefix(),
+            "accepted_event_digest_domain_prefix": DigestDomain::AcceptedEvent.prefix(),
+            "provenance_kind": LEGACY_IMPORT_PROVENANCE_KIND,
+            "legacy_tables": legacy_tables,
+            "positive_cases": [
+                {
+                    "file": "bootstrap-manifest-v1.jsonl",
+                    "kind": "manifest",
+                    "manifest_digest": manifest.manifest_digest().unwrap().to_string(),
+                },
+                {
+                    "file": "bootstrap-manifest-accepted-statement-v1.jsonl",
+                    "kind": "accepted_statement",
+                    "accepted_event_id": statement.accepted_event_id().unwrap().to_string(),
+                },
+            ],
+            "negative_cases": [
+                { "case": "unsorted_rows", "file": "negative-unsorted-rows.jsonl" },
+                { "case": "duplicate_row_identity", "file": "negative-duplicate-row.jsonl" },
+                { "case": "foreign_scope", "file": "negative-foreign-scope.jsonl" },
+                { "case": "unknown_field", "file": "negative-unknown-field.jsonl" },
+            ],
+        });
+        write(
+            &output,
+            "vector-suite.jsonl",
+            &encode_canonical(&suite).unwrap(),
         );
 
         println!("MANIFEST_DIGEST {}", manifest.manifest_digest().unwrap());
