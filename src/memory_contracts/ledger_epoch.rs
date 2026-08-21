@@ -1941,6 +1941,113 @@ mod tests {
     }
 
     #[test]
+    fn cursor_vector_barrier_validate_rejects_malformed_shape_directly() {
+        // Mirrors `closed_head_vector_validate_rejects_malformed_shape_directly`:
+        // `from_observations` sorts and rejects duplicates *before*
+        // delegating to `validate()`, so it never exercises `validate()`'s
+        // own conjuncts. Construct `CursorVectorBarrierV1` directly -- the
+        // shape a `decode_strict` on untrusted wire bytes would actually
+        // produce -- to pin each one (REPLAY-01, REPLAY-02).
+        let base: CursorVectorBarrierV1 = decode_strict(record(CURSOR_VECTOR_BARRIER)).unwrap();
+        base.validate().unwrap();
+
+        let mut wrong_schema_version = base.clone();
+        wrong_schema_version.schema_version = LEDGER_EPOCH_SCHEMA_VERSION + 1;
+        assert_eq!(
+            wrong_schema_version.validate(),
+            Err(ContractError::Schema(
+                "invalid cursor vector barrier".into()
+            ))
+        );
+
+        let empty = CursorVectorBarrierV1 {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            epoch_id: base.epoch_id,
+            cursors: Vec::new(),
+        };
+        assert_eq!(
+            empty.validate(),
+            Err(ContractError::Schema(
+                "invalid cursor vector barrier".into()
+            ))
+        );
+
+        // Exactly at the boundary (MAX_VECTOR_SHARDS entries) must still be
+        // ACCEPTED -- this is what kills a `>` -> `>=` mutant on the length
+        // check, which the +1-oversized case alone cannot distinguish.
+        let at_boundary_cursors: Vec<ShardCursorEntryV1> = (0..u32::try_from(MAX_VECTOR_SHARDS)
+            .unwrap())
+            .map(|shard| ShardCursorEntryV1 {
+                shard: u16::try_from(shard).unwrap(),
+                last_processed_offset: base.cursors[0].last_processed_offset,
+            })
+            .collect();
+        assert_eq!(at_boundary_cursors.len(), MAX_VECTOR_SHARDS);
+        CursorVectorBarrierV1 {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            epoch_id: base.epoch_id,
+            cursors: at_boundary_cursors,
+        }
+        .validate()
+        .unwrap();
+
+        let oversized_cursors: Vec<ShardCursorEntryV1> = (0..=u32::try_from(MAX_VECTOR_SHARDS)
+            .unwrap())
+            .map(|shard| ShardCursorEntryV1 {
+                shard: u16::try_from(shard).unwrap(),
+                last_processed_offset: base.cursors[0].last_processed_offset,
+            })
+            .collect();
+        assert_eq!(oversized_cursors.len(), MAX_VECTOR_SHARDS + 1);
+        let oversized = CursorVectorBarrierV1 {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            epoch_id: base.epoch_id,
+            cursors: oversized_cursors,
+        };
+        assert_eq!(
+            oversized.validate(),
+            Err(ContractError::Schema(
+                "invalid cursor vector barrier".into()
+            ))
+        );
+
+        // Duplicate-by-shard, decoded directly: the sorted-strictly-
+        // increasing window check, not the constructor's separate equality
+        // check, must reject it. Inserted adjacent (not appended at the
+        // end) so the duplicate pair is strictly-increasing-adjacent rather
+        // than out-of-order -- this is what kills a `<` -> `<=` mutant,
+        // which an out-of-order pair alone cannot distinguish.
+        let mut duplicate_cursors = base.cursors.clone();
+        duplicate_cursors.insert(1, duplicate_cursors[0]);
+        let duplicated = CursorVectorBarrierV1 {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            epoch_id: base.epoch_id,
+            cursors: duplicate_cursors,
+        };
+        assert_eq!(
+            duplicated.validate(),
+            Err(ContractError::NonCanonicalSet { field: "cursors" })
+        );
+
+        // Same shard named twice with a DIFFERENT last_processed_offset:
+        // still the same shard twice, and the check compares `shard` alone.
+        let mut conflicting_duplicate_cursors = base.cursors.clone();
+        let mut conflicting = conflicting_duplicate_cursors[0];
+        conflicting.last_processed_offset =
+            CommittedOffsetV1::new(conflicting.last_processed_offset.as_u64() + 1).unwrap();
+        conflicting_duplicate_cursors.insert(1, conflicting);
+        let conflicting_duplicated = CursorVectorBarrierV1 {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            epoch_id: base.epoch_id,
+            cursors: conflicting_duplicate_cursors,
+        };
+        assert_eq!(
+            conflicting_duplicated.validate(),
+            Err(ContractError::NonCanonicalSet { field: "cursors" })
+        );
+    }
+
+    #[test]
     fn projection_generation_supersession_binds_projector_identity_and_sequence() {
         // Attack 1 reproduction, now as a passing rejection: a hostile
         // projector must never be able to supersede another projector's
@@ -2322,6 +2429,138 @@ mod tests {
             ClosedHeadVectorV1::from_heads(closed.epoch_id, duplicated),
             Err(ContractError::NonCanonicalSet { field: "heads" })
         );
+    }
+
+    #[test]
+    fn closed_head_vector_validate_rejects_malformed_shape_directly() {
+        // `from_heads` sorts and rejects duplicates *before* delegating to
+        // `validate()`, so every prior test that goes through `from_heads`
+        // never actually exercises `validate()`'s own conjuncts (schema
+        // version, non-empty, bounded length, strictly-sorted-and-unique).
+        // These construct `ClosedHeadVectorV1` directly -- its fields are
+        // public precisely so decoded, not just constructed, records can be
+        // validated -- to pin each conjunct independently (REPLAY-01,
+        // PREFLIGHT 2/8: fail closed on malformed decoded input).
+        let base = closed_predecessor_head();
+
+        let mut wrong_schema_version = base.clone();
+        wrong_schema_version.schema_version = LEDGER_EPOCH_SCHEMA_VERSION + 1;
+        assert_eq!(
+            wrong_schema_version.validate(),
+            Err(ContractError::Schema("invalid closed head vector".into()))
+        );
+
+        let empty = ClosedHeadVectorV1 {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            epoch_id: base.epoch_id,
+            heads: Vec::new(),
+        };
+        assert_eq!(
+            empty.validate(),
+            Err(ContractError::Schema("invalid closed head vector".into()))
+        );
+
+        // Exactly at the boundary (MAX_VECTOR_SHARDS entries) must still be
+        // ACCEPTED -- this is what kills a `>` -> `>=` mutant on the length
+        // check, which the +1-oversized case alone cannot distinguish.
+        let at_boundary_heads: Vec<ClosedShardHeadV1> = (0..u32::try_from(MAX_VECTOR_SHARDS)
+            .unwrap())
+            .map(|shard| ClosedShardHeadV1 {
+                shard: u16::try_from(shard).unwrap(),
+                last_committed_offset: CommittedOffsetV1::new(1).unwrap(),
+                chain_digest: base.heads[0].chain_digest,
+            })
+            .collect();
+        assert_eq!(at_boundary_heads.len(), MAX_VECTOR_SHARDS);
+        ClosedHeadVectorV1 {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            epoch_id: base.epoch_id,
+            heads: at_boundary_heads,
+        }
+        .validate()
+        .unwrap();
+
+        let oversized_heads: Vec<ClosedShardHeadV1> = (0..=u32::try_from(MAX_VECTOR_SHARDS)
+            .unwrap())
+            .map(|shard| ClosedShardHeadV1 {
+                shard: u16::try_from(shard).unwrap(),
+                last_committed_offset: CommittedOffsetV1::new(1).unwrap(),
+                chain_digest: base.heads[0].chain_digest,
+            })
+            .collect();
+        assert_eq!(oversized_heads.len(), MAX_VECTOR_SHARDS + 1);
+        let oversized = ClosedHeadVectorV1 {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            epoch_id: base.epoch_id,
+            heads: oversized_heads,
+        };
+        assert_eq!(
+            oversized.validate(),
+            Err(ContractError::Schema("invalid closed head vector".into()))
+        );
+
+        // Duplicate-by-shard, decoded directly (not via `from_heads`): the
+        // sorted-strictly-increasing window check, not the constructor's
+        // separate equality check, must reject it. Inserted adjacent (not
+        // appended at the end) so the duplicate pair is
+        // strictly-increasing-adjacent rather than out-of-order -- this is
+        // what kills a `<` -> `<=` mutant, which an out-of-order pair alone
+        // cannot distinguish.
+        let mut duplicate_heads = base.heads.clone();
+        duplicate_heads.insert(1, duplicate_heads[0]);
+        let duplicated = ClosedHeadVectorV1 {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            epoch_id: base.epoch_id,
+            heads: duplicate_heads,
+        };
+        assert_eq!(
+            duplicated.validate(),
+            Err(ContractError::NonCanonicalSet { field: "heads" })
+        );
+
+        // A shard naming the same value twice with a DIFFERENT
+        // last_committed_offset/chain_digest still names the same shard
+        // twice -- the ordering/uniqueness check compares `shard` alone, not
+        // the whole entry, and must still reject it.
+        let mut conflicting_duplicate_heads = base.heads.clone();
+        let mut conflicting = conflicting_duplicate_heads[0];
+        conflicting.last_committed_offset = CommittedOffsetV1::new(999).unwrap();
+        conflicting_duplicate_heads.insert(1, conflicting);
+        let conflicting_duplicated = ClosedHeadVectorV1 {
+            schema_version: LEDGER_EPOCH_SCHEMA_VERSION,
+            epoch_id: base.epoch_id,
+            heads: conflicting_duplicate_heads,
+        };
+        assert_eq!(
+            conflicting_duplicated.validate(),
+            Err(ContractError::NonCanonicalSet { field: "heads" })
+        );
+
+        // The valid base case still passes, proving these rejections are
+        // about the specific mutation, not an over-broad check.
+        base.validate().unwrap();
+    }
+
+    #[test]
+    fn closed_head_vector_validate_bounded_by_enforces_the_epoch_shard_count() {
+        let base = closed_predecessor_head();
+        // `base` closes shards 0 and 5, so shard_count 6 (shards 0..=5) is
+        // exactly bounding and must be accepted...
+        base.validate_bounded_by(6).unwrap();
+        // ...while shard_count 5 (shards 0..=4) excludes shard 5 and must be
+        // rejected. This directly exercises `validate_bounded_by`'s own `>=`
+        // comparison, which otherwise has no test at all.
+        assert!(base.validate_bounded_by(5).is_err());
+        // The boundary itself: a shard_count equal to the highest closed
+        // shard number is still out of range (shards are 0-indexed).
+        assert!(base.validate_bounded_by(5).is_err());
+        assert!(base.validate_bounded_by(4).is_err());
+
+        // `validate_bounded_by` must still fail closed on a malformed vector
+        // even when every head is within bounds.
+        let mut wrong_schema_version = base;
+        wrong_schema_version.schema_version = LEDGER_EPOCH_SCHEMA_VERSION + 1;
+        assert!(wrong_schema_version.validate_bounded_by(4096).is_err());
     }
 
     #[test]
