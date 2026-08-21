@@ -1214,6 +1214,7 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use super::*;
+    use crate::memory_contracts::canonical::require_canonical;
     use crate::memory_contracts::common::frozen_profile_reference_v1;
 
     const ADMISSION_FIXTURE: &[u8] = include_bytes!(
@@ -2695,6 +2696,7 @@ mod tests {
     fn admission_fixture_is_frozen_and_decodes() {
         let bytes = record(ADMISSION_FIXTURE);
         assert_eq!(raw_sha256(bytes), ADMISSION_RAW_SHA256);
+        require_canonical(bytes).unwrap();
         let admission: ObserverAdmissionV2 =
             crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
         admission.validate_shape().unwrap();
@@ -2706,6 +2708,7 @@ mod tests {
     fn positive_verified_fixture_decodes() {
         let bytes = record(ADMISSION_POSITIVE_FIXTURE);
         assert_eq!(raw_sha256(bytes), ADMISSION_POSITIVE_RAW_SHA256);
+        require_canonical(bytes).unwrap();
         let admission: ObserverAdmissionV2 =
             crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
         admission.validate_shape().unwrap();
@@ -2716,6 +2719,7 @@ mod tests {
     fn candidate_only_fixture_decodes() {
         let bytes = record(ADMISSION_CANDIDATE_FIXTURE);
         assert_eq!(raw_sha256(bytes), ADMISSION_CANDIDATE_RAW_SHA256);
+        require_canonical(bytes).unwrap();
         let admission: ObserverAdmissionV2 =
             crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
         admission.validate_shape().unwrap();
@@ -2726,6 +2730,7 @@ mod tests {
     fn run_receipt_success_fixture_decodes() {
         let bytes = record(RUN_RECEIPT_SUCCESS_FIXTURE);
         assert_eq!(raw_sha256(bytes), RUN_RECEIPT_SUCCESS_RAW_SHA256);
+        require_canonical(bytes).unwrap();
         let run: ObserverRunReceiptV1 =
             crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
         run.validate_shape().unwrap();
@@ -2736,6 +2741,7 @@ mod tests {
     fn result_verified_negative_fixture_decodes() {
         let bytes = record(RESULT_VERIFIED_NEGATIVE_FIXTURE);
         assert_eq!(raw_sha256(bytes), RESULT_VERIFIED_NEGATIVE_RAW_SHA256);
+        require_canonical(bytes).unwrap();
         let result: ObserverResultV1 =
             crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
         result.validate_shape().unwrap();
@@ -2749,6 +2755,7 @@ mod tests {
     fn vector_suite_fixture_is_present() {
         let bytes = record(VECTOR_SUITE_FIXTURE);
         assert_eq!(raw_sha256(bytes), VECTOR_SUITE_RAW_SHA256);
+        require_canonical(bytes).unwrap();
         let _: serde_json::Value = serde_json::from_slice(bytes).unwrap();
     }
 
@@ -2758,7 +2765,12 @@ mod tests {
         assert_eq!(raw_sha256(bytes), NEGATIVE_LLM_CLOSED_WORLD_RAW_SHA256);
         let admission: ObserverAdmissionV2 =
             crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
-        assert!(admission.validate_shape().is_err());
+        assert_eq!(
+            admission.validate_shape(),
+            Err(ContractError::Schema(
+                "invalid observer admission v2".into()
+            ))
+        );
     }
 
     #[test]
@@ -2767,7 +2779,13 @@ mod tests {
         assert_eq!(raw_sha256(bytes), NEGATIVE_UNKNOWN_FIELD_RAW_SHA256);
         let decoded: ContractResult<ObserverAdmissionV2> =
             crate::memory_contracts::canonical::decode_strict(bytes);
-        assert!(decoded.is_err());
+        match decoded {
+            Err(ContractError::Schema(message)) => {
+                assert!(message.contains("unknown field"));
+                assert!(message.contains("unexpected_extra_field"));
+            }
+            other => panic!("expected Schema error for unknown field, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2776,7 +2794,12 @@ mod tests {
         assert_eq!(raw_sha256(bytes), NEGATIVE_UNSORTED_DEPENDENCY_RAW_SHA256);
         let admission: ObserverAdmissionV2 =
             crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
-        assert!(admission.validate_shape().is_err());
+        assert_eq!(
+            admission.validate_shape(),
+            Err(ContractError::Schema(
+                "invalid observer executable identity".into()
+            ))
+        );
     }
 
     #[test]

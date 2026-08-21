@@ -3,11 +3,12 @@
 These fixtures freeze the contract-only boundary for exhaustive-observer
 admission (COVER-01), its run receipts, its typed `observer.result.accepted`
 event, and the pure `observer_derivation_disagreement` detector. Every
-`.jsonl` file contains one record plus exactly one trailing LF; the LF is
-excluded from every pinned digest. None of the fixture identifiers, digests,
-or timestamps carries runtime authority: deserializing or structurally
-validating any of these types grants no governance or append authority by
-itself (AUTH-03, EVENT-03).
+`.jsonl` file contains exactly one record in `ostk-canonical-json-v1` form
+(sorted object keys, compact separators, no extra whitespace) plus exactly one
+trailing LF; the LF is excluded from every pinned digest. None of the fixture
+identifiers, digests, or timestamps carries runtime authority: deserializing or
+structurally validating any of these types grants no governance or append
+authority by itself (AUTH-03, EVENT-03).
 
 ## What each vector proves
 
