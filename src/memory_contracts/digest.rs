@@ -190,7 +190,7 @@ pub enum DigestDomain {
     /// `ObserverDerivationDisagreementV1` finding identity.
     ObserverDisagreementV1, // W0-OBS
 
-                                 // --- W0-ERASE domains ---
+    // --- W0-ERASE domains ---
 
     // --- W0-LOG domains ---
     /// W0-LOG. `SuccessorLogEpochV1` identity.
