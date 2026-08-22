@@ -67,7 +67,12 @@
 //!   would need its own key, retention, and publication boundary, which this
 //!   connector does not have.
 //! * **COVER-03** — a coverage receipt is only built when the drain produced a
-//!   ref-observation accepted event to bind.
+//!   ref-observation accepted event to bind, and only from facts the ledger
+//!   made durable. A quarantine writes a dead-letter receipt and no event row,
+//!   so a quarantined fact never becomes a receipt's anchor, never appears in
+//!   the receipt's source manifest or count, and — when it is the ref
+//!   observation itself — voids the whole scope's receipt closed rather than
+//!   letting an older surviving observation stand in for it.
 
 pub mod drain;
 pub mod error;
@@ -77,8 +82,8 @@ pub mod scan;
 
 pub use drain::{
     GitCoverageBindingV1, GitDrainContextV1, GitDrainReportV1, drain_git_facts,
-    git_coverage_observation, git_fact_canonical_bytes, git_resume_sequence,
-    git_scan_manifest_digest,
+    git_coverage_observation, git_fact_canonical_bytes, git_fact_manifest_keys,
+    git_resume_sequence, git_scan_manifest_digest,
 };
 pub use error::{
     GitDrainError, GitDrainResult, GitFactError, GitFactResult, GitIngressError, GitIngressResult,

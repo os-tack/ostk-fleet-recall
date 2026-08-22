@@ -143,4 +143,15 @@ pub enum GitDrainError {
     /// coverage receipt to bind (COVER-03 rejects a zero evidence id).
     #[error("git drain produced no ref observation to anchor a coverage receipt")]
     NoRefObservation,
+    /// The ledger refused this scan's ref observation into quarantine, so no
+    /// event row backs the newest view of the ref. A quarantine writes a
+    /// dead-letter receipt and NO event, so the accepted-event id the drain
+    /// computed names nothing in `memory_evidence_events`; anchoring a coverage
+    /// receipt on it -- or falling back to an older observation that survived
+    /// -- would claim coverage of a range whose newest evidence the ledger
+    /// declined (COVER-03).
+    #[error(
+        "git drain ref observation was quarantined, so no accepted event backs a coverage receipt"
+    )]
+    RefObservationQuarantined,
 }
