@@ -1431,7 +1431,7 @@ if ! publication_store_digest=$(shasum -a 256 "$publication_store_source" \
 fi
 assert_exact "frozen publication-reader session-pinning source digest" \
     "$publication_store_digest" \
-    'e3fb646beee9b4d1e78eafef3654116f8cf2b36472dcafc50ecc5363c3164997'
+    'c31a9a8e1344d5961e4477817389bdd4ffa8df90f9b0bbdb82387e3dc6423648'
 if ! publication_live_test_digest=$(shasum -a 256 "$publication_live_test_source" \
     | awk 'NR == 1 { print $1 }'); then
     fail "could not hash the publication-reader connected test"

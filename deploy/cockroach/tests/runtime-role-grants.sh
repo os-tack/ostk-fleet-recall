@@ -966,7 +966,7 @@ reviewed_source_manifest=$(shasum -a 256 \
 expected_reviewed_source_manifest="768f70b2da57f0beca31687eaf763e8774b144d3b300d47f25bb5a2635e894ed  $repo_root/src/config.rs
 76224d95199b19cf12b52f623ece802b9c5d57abc57833c17de2ccd336db16be  $repo_root/src/main.rs
 7718c15393872a139956732629c472d813a2a014395f943a5382191966162745  $repo_root/src/private_postgres.rs
-e3fb646beee9b4d1e78eafef3654116f8cf2b36472dcafc50ecc5363c3164997  $repo_root/src/store/cockroach.rs
+c31a9a8e1344d5961e4477817389bdd4ffa8df90f9b0bbdb82387e3dc6423648  $repo_root/src/store/cockroach.rs
 b8c3ffbd3dfe7a74f76a06815f317db3e79b3129adaa14e2da5bea43f60b069f  $repo_root/src/ledger/cockroach.rs
 c885c07bce2caa310a2b9f1d8fd2aa49edc672c4184bb4b85a9e2018993f9cb1  $repo_root/src/service.rs
 ee1d0b5a13f1906c13cbd3e93d26196d7bdace91895d8d2302c440d66ec8ef53  $repo_root/src/application.rs

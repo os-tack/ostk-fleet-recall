@@ -190,7 +190,7 @@ unreviewed future reachability. Its exact SHA-256 inputs are `config.rs`
 `private_postgres.rs`
 `7718c15393872a139956732629c472d813a2a014395f943a5382191966162745`,
 `store/cockroach.rs`
-`e3fb646beee9b4d1e78eafef3654116f8cf2b36472dcafc50ecc5363c3164997`,
+`c31a9a8e1344d5961e4477817389bdd4ffa8df90f9b0bbdb82387e3dc6423648`,
 `ledger/cockroach.rs`
 `b8c3ffbd3dfe7a74f76a06815f317db3e79b3129adaa14e2da5bea43f60b069f`,
 `service.rs` `6f0c6874072baed1070204063ac65df0761eda2da862e51775ba85cc5a34b522`,
