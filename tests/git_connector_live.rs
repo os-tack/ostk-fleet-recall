@@ -28,10 +28,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use ostk_fleet_recall::FleetScope;
 use ostk_fleet_recall::connectors::git::{
-    GitConnectorBindingV1, GitCoverageBindingV1, GitDrainContextV1, GitFactV1, GitIngressClocksV1,
-    GitObjectId, GitRefName, GitRefObservationLogV1, GitRepositoryIdV1, GitRepositoryReader,
-    GitScanError, GitScanRequestV1, GitTreeScanModeV1, drain_git_facts, git_coverage_observation,
-    git_resume_sequence,
+    GitConnectorBindingV1, GitCoverageBindingV1, GitDrainContextV1, GitDrainError, GitFactV1,
+    GitIngressClocksV1, GitObjectId, GitRefName, GitRefObservationLogV1, GitRepositoryIdV1,
+    GitRepositoryReader, GitScanError, GitScanRequestV1, GitTreeScanModeV1, drain_git_facts,
+    git_coverage_observation, git_resume_sequence,
 };
 use ostk_fleet_recall::control_log::{
     CockroachGenesisRepository, GenesisRepository, TrustedControlScope,
@@ -51,12 +51,12 @@ use ostk_fleet_recall::memory_contracts::bootstrap::{
 };
 use ostk_fleet_recall::memory_contracts::canonical::{decode_strict, encode_canonical};
 use ostk_fleet_recall::memory_contracts::common::{
-    AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId, FixedHex32, FixedHex64,
+    AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId, FixedHex32, FixedHex64, HexBytes,
     ProfileReferenceV1, RegistryReferenceV1, frozen_profile_reference_v1,
 };
 use ostk_fleet_recall::memory_contracts::coverage::{
-    CoverageFreshnessV1, CoverageProofBasisV1, CoverageProofMethodV1, CoverageWindowV1,
-    FreshnessStateV1, ProducerIdentityV1, ProducerKindV1,
+    CoverageFreshnessV1, CoverageProofBasisV1, CoverageProofMethodV1, CoverageScopeV1,
+    CoverageWindowV1, FreshnessStateV1, ProducerIdentityV1, ProducerKindV1,
 };
 use ostk_fleet_recall::memory_contracts::digest::{
     DigestDomain, Sha256Digest, domain_separated_digest,
@@ -1338,11 +1338,14 @@ async fn live_a_coverage_receipt_binds_the_ref_observation_and_is_idempotent_whe
         &scan.target,
         target,
         target,
-        &facts,
         &report,
         now,
     )
     .unwrap();
+    assert_eq!(
+        observation.source_count, 5,
+        "the manifest reports the five facts the ledger kept"
+    );
     assert_eq!(
         observation.evidence_id,
         report.ref_observation_event.unwrap(),
@@ -1394,4 +1397,213 @@ async fn live_a_coverage_receipt_binds_the_ref_observation_and_is_idempotent_whe
         "the next scan resumes at the cursor's exclusive high watermark"
     );
     assert_eq!(git_resume_sequence(None), 1, "an unseen ref starts at one");
+}
+
+/// A ref observation the ledger QUARANTINES may not anchor a coverage receipt.
+///
+/// A quarantine writes a dead-letter row and no event row, so the accepted-event
+/// id the drain computed for the refused observation names nothing in
+/// `memory_evidence_events`. A receipt anchored on it would assert that a
+/// repo+ref range is covered while citing a ledger position that does not exist
+/// — the "trust me, I looked" claim COVER-03 forbids.
+///
+/// The quarantining pair here is the one the resume path actually produces: a
+/// ref observation's source-fact identity closes over `(repository, ref_name,
+/// target, observation_seq, observed_at)` only, while its governed bytes also
+/// carry `previous_target` and `observer`. A connector that resumes from the
+/// repo+ref cursor and rebuilds its in-memory observation log, or that is
+/// re-registered under a different observer id, re-renders the same observation
+/// with different bytes; the ledger refuses the second as a preimage
+/// disagreement.
+///
+/// The test is a differential: the same call on the drain report whose
+/// observation WAS accepted mints a receipt and a cursor row against the very
+/// same scope, so the empty tables above are the refusal talking.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One linear proof: accept, quarantine, refuse, then the positive control.
+async fn live_a_quarantined_ref_observation_cannot_anchor_a_receipt_when_configured() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = live_pool(&database_url).await;
+    let fixture = fixture();
+    let scope = activate_stage4(&pool, &fixture, "quarantine", 77).await;
+    let active = active_package(&fixture, &scope);
+    let binding = binding(&fixture, &scope);
+
+    let repository = ScratchRepository::init("quarantine");
+    build_history(&repository);
+    let reader = repository.reader();
+    let scan = reader.scan(&scan_request("refs/heads/main")).unwrap();
+
+    let window_start = canonical_time(server_time(&pool).await);
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let now = canonical_time(server_time(&pool).await);
+
+    // The observation the connector minted through its append-only log.
+    let observed = observation_fact(
+        reader.repository(),
+        &scan.ref_name,
+        &[(&scan.target.to_hex(), &now)],
+    );
+    let GitFactV1::RefObservation(accepted) = observed[0].clone() else {
+        panic!("the log mints ref observations")
+    };
+
+    // The same observation as a resumed connector re-renders it: identical on
+    // every field the source-fact identity closes over, different in the two
+    // fields only the governed payload carries.
+    let mut rebuilt = accepted;
+    rebuilt.previous_target = Some(GitObjectId::parse_hex(&"5c".repeat(20)).unwrap());
+    rebuilt.observer = ContractId::new("connector.git.instance-1.resumed").unwrap();
+    let rebuilt = GitFactV1::RefObservation(rebuilt);
+    assert_eq!(
+        observed[0].immutable_revision().unwrap(),
+        rebuilt.immutable_revision().unwrap(),
+        "the two renderings share one source-fact revision"
+    );
+    assert_ne!(
+        observed[0].canonical_payload().unwrap(),
+        rebuilt.canonical_payload().unwrap(),
+        "and disagree on the bytes, which is what the ledger refuses"
+    );
+
+    let key = content_key();
+    let context = GitDrainContextV1 {
+        binding: &binding,
+        active: &active,
+        witness: &scope.witness,
+        ledger: scope.repository.as_ref(),
+        control_scope: &scope.trusted_scope,
+        kek: &key,
+        clocks: &clocks(&now),
+    };
+    let anchored = drain_git_facts(&context, &observed).await.unwrap();
+    assert_eq!(anchored.appended, 1, "{anchored:?}");
+    assert!(anchored.ref_observation_event.is_some());
+
+    let refused_drain = drain_git_facts(&context, std::slice::from_ref(&rebuilt))
+        .await
+        .unwrap();
+    assert_eq!(refused_drain.quarantined, 1, "{refused_drain:?}");
+    assert_eq!(refused_drain.appended, 0);
+    assert_eq!(refused_drain.replayed, 0);
+    assert_eq!(refused_drain.quarantined_ref_observations, 1);
+    assert!(
+        refused_drain.ref_observation_event.is_none(),
+        "a quarantined observation is not an anchor: {refused_drain:?}"
+    );
+    assert!(
+        refused_drain.events.is_empty(),
+        "a quarantine is not a ledger position: {refused_drain:?}"
+    );
+    assert!(
+        refused_drain.admitted_keys.is_empty(),
+        "a refused fact is not observed source material: {refused_drain:?}"
+    );
+
+    // The ledger really did refuse it: one event row, one dead-letter row.
+    assert_eq!(
+        scoped_count(&pool, "memory_evidence_events", &scope.physical_scope).await,
+        1,
+        "the quarantine wrote no second event row"
+    );
+    assert_eq!(
+        scoped_count(&pool, "memory_evidence_quarantine", &scope.physical_scope).await,
+        1
+    );
+
+    let ref_ingress = binding.build_ingress(&rebuilt, &clocks(&now), 1).unwrap();
+    let ref_resource = ref_ingress
+        .candidate
+        .source_fact
+        .canonical_resource_id
+        .clone();
+    let coverage = coverage_binding(CoverageWindowV1 {
+        window_start,
+        window_end: now.clone(),
+    });
+    let target = SequenceIntervalV1::new(1, 3).unwrap();
+    let coverage_scope = CoverageScopeV1 {
+        scope: ref_resource.clone(),
+        revision: HexBytes::new(scan.target.as_bytes().to_vec()).unwrap(),
+        window: coverage.window.clone(),
+    };
+
+    let refused = git_coverage_observation(
+        &coverage,
+        ref_resource.clone(),
+        &scan.target,
+        target,
+        target,
+        &refused_drain,
+        now.clone(),
+    );
+    assert!(
+        matches!(refused, Err(GitDrainError::RefObservationQuarantined)),
+        "a drain whose ref observation was quarantined must fail closed: {refused:?}"
+    );
+
+    let coverage_repository = CockroachCoverageRuntimeRepository::new(
+        pool.clone(),
+        scope.trusted_scope.clone(),
+        retry_policy(),
+    );
+    assert_eq!(
+        coverage_repository
+            .count_receipts_for_instance(&coverage.connector_instance)
+            .await
+            .unwrap(),
+        0,
+        "the refusal minted no receipt"
+    );
+    assert!(
+        coverage_repository
+            .read_cursor(&coverage.connector_instance, &coverage_scope, target)
+            .await
+            .unwrap()
+            .is_none(),
+        "the refusal advanced no cursor for the scope"
+    );
+
+    // Positive control on the SAME scope: the accepted observation does anchor
+    // a receipt, so the two empty tables above are the guard, not missing wiring.
+    let observation = git_coverage_observation(
+        &coverage,
+        ref_resource,
+        &scan.target,
+        target,
+        target,
+        &anchored,
+        now,
+    )
+    .unwrap();
+    assert_eq!(observation.scope, coverage_scope);
+    assert_eq!(
+        observation.evidence_id,
+        anchored.ref_observation_event.unwrap()
+    );
+    assert_eq!(
+        observation.source_count, 1,
+        "only the accepted observation is counted as source material"
+    );
+    let recorded = coverage_repository.observe(&observation).await.unwrap();
+    assert!(
+        matches!(recorded, CoverageObservationOutcome::Recorded { .. }),
+        "the accepted observation must extend coverage: {recorded:?}"
+    );
+    assert_eq!(
+        coverage_repository
+            .count_receipts_for_instance(&coverage.connector_instance)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        coverage_repository
+            .read_cursor(&coverage.connector_instance, &coverage_scope, target)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
