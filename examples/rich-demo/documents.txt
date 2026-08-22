@@ -46,6 +46,7 @@ docs/assets/README.md|media
 docs/evidence/README.md|evidence
 docs/evidence/2026-08-16-dynamic-memory-wave0-1-signoff.md|evidence
 docs/evidence/2026-08-21-dynamic-memory-wave0-1-complete.md|evidence
+docs/evidence/2026-08-22-dynamic-memory-wave2-signoff.md|evidence
 deploy/aws/README.md|aws
 deploy/aws/network/README.md|aws_network
 deploy/cockroach/tests/README.md|database_verification
