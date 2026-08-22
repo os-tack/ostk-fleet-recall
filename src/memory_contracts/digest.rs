@@ -349,6 +349,22 @@ pub enum DigestDomain {
     /// is a function of the set, never of the order statements were activated
     /// in, so two histories with the same live set produce the same head.
     NormativeActiveBindingSetV1, // W3-NORM
+    // --- W3-CIEV domains ---
+    /// W3-CIEV. Provider-fact identity preimage for the CI-evidence connector:
+    /// the workflow-run object, the run ATTEMPT that makes a re-run a new
+    /// immutable revision rather than a rewrite, and the window observation
+    /// that records exactly which finite range of runs a scan read.
+    CiProviderFactV1, // W3-CIEV
+    /// W3-CIEV. Content-addressed digest of exactly which CI facts one window
+    /// scan observed, in order. This is the `source_digest` a coverage receipt
+    /// records, so it frames the observed set rather than any governed payload.
+    CiScanManifestV1, // W3-CIEV
+    /// W3-CIEV. Content address of one measured coverage window — repository,
+    /// workflow, branch, inclusive run-number range, and fetch instant. It is
+    /// what the durable measured-window record is keyed by, so two scans of the
+    /// same range at different instants are two distinct measurements rather
+    /// than one overwritten row.
+    CiCoverageWindowV1, // W3-CIEV
 }
 
 impl DigestDomain {
@@ -501,8 +517,11 @@ impl DigestDomain {
             Self::GitProviderFactV1 => "ostk-git-provider-fact-v1",         // W2-GIT
             Self::GitScanManifestV1 => "ostk-git-scan-manifest-v1",         // W2-GIT
             Self::TranscriptTurnRevisionV1 => "ostk-transcript-turn-revision-v1", // W2-TRANS
-            // --- W3-NORM prefixes ---
+            // --- W3 prefixes ---
             Self::NormativeActiveBindingSetV1 => "ostk-normative-active-binding-set-v1", // W3-NORM
+            Self::CiProviderFactV1 => "ostk-ci-provider-fact-v1", // W3-CIEV
+            Self::CiScanManifestV1 => "ostk-ci-scan-manifest-v1", // W3-CIEV
+            Self::CiCoverageWindowV1 => "ostk-ci-coverage-window-v1", // W3-CIEV
         }
     }
 }

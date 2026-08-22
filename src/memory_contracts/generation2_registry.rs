@@ -146,9 +146,28 @@ pub const TRANSCRIPT_CONNECTOR: Generation2ConnectorIds = Generation2ConnectorId
     evidence_kind: "transcript.turn",
 };
 
-/// Both connector chains, in the order they are appended.
-pub const GENERATION_TWO_CONNECTORS: [Generation2ConnectorIds; 2] =
-    [GIT_CONNECTOR, TRANSCRIPT_CONNECTOR];
+/// The CI-evidence connector's generation-2 identity chain (W3-CIEV).
+///
+/// A settled workflow run is a content-addressed immutable object exactly like
+/// a git object and a transcript turn: its coordinate is the source fact's own
+/// `immutable_revision`, which closes over the run, the attempt, the settled
+/// conclusion, and the settle instant. It therefore takes the same
+/// entity/version coordinate pair as the other two chains rather than a special
+/// case of its own.
+pub const CI_CONNECTOR: Generation2ConnectorIds = Generation2ConnectorIds {
+    namespace: "namespace.ci.workflow_run",
+    entity_kind: "ci_workflow_run",
+    version_kind: "ci_workflow_run_version",
+    entity_recipe: "identity.ci.workflow_run",
+    version_recipe: "identity.ci.workflow_run_version",
+    evidence_schema: "evidence.ci.workflow_run",
+    connector_schema: "connector.ci.workflow_run",
+    evidence_kind: "ci.workflow_run",
+};
+
+/// Every connector chain, in the order they are appended.
+pub const GENERATION_TWO_CONNECTORS: [Generation2ConnectorIds; 3] =
+    [GIT_CONNECTOR, TRANSCRIPT_CONNECTOR, CI_CONNECTOR];
 
 fn missing(entry_id: &str) -> ContractError {
     ContractError::Schema(format!(
