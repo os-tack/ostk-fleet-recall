@@ -241,6 +241,8 @@ const COVERAGE_RUNTIME_MIGRATION_SQL: &str =
     include_str!("../../migrations/0020_coverage_runtime.sql");
 const RECALL_PROJECTION_MIGRATION_SQL: &str =
     include_str!("../../migrations/0021_recall_projection.sql");
+const TRANSCRIPT_CONNECTOR_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0022_transcript_connector.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -341,6 +343,15 @@ fn post_transactional_online_migrations() -> [Migration; 7] {
             // CockroachDB 26.2 cannot build a vector index through its legacy
             // transactional schema changer, so this must run with DDL
             // autocommit like migration 0001.
+            true,
+        ),
+        Migration::new(
+            22,
+            Cow::Borrowed("transcript connector outbox and source cursors"),
+            MigrationType::Simple,
+            Cow::Borrowed(TRANSCRIPT_CONNECTOR_MIGRATION_SQL),
+            // W2-TRANS. Additive CREATE TABLE/INDEX DDL only; CockroachDB
+            // requires it outside SQLx's transaction wrapper, like 0018-0020.
             true,
         ),
     ]
