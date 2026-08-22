@@ -365,6 +365,26 @@ pub enum DigestDomain {
     /// same range at different instants are two distinct measurements rather
     /// than one overwritten row.
     CiCoverageWindowV1, // W3-CIEV
+    // --- W3-OBSRT domains ---
+    /// W3-OBSRT. Content identity of the exact source blob one observer run
+    /// read, framed over the blob's raw bytes. Distinct from the git object id:
+    /// this is an OSTK-domain digest the runtime recomputes itself, so a
+    /// tampered object store cannot satisfy it merely by answering with the
+    /// object id it was asked for.
+    ObserverSourceBlobV1, // W3-OBSRT
+    /// W3-OBSRT. Exact input identity of one observer run: repository, commit,
+    /// path, blob object id, and blob content digest, length-framed in that
+    /// order. This is what makes a run receipt name the git object it read
+    /// rather than "the current source".
+    ObserverRunInputV1, // W3-OBSRT
+    /// W3-OBSRT. Exact output identity of one observer run: the enumeration
+    /// algorithm, its exhaustiveness verdict, every diagnostic it raised, and
+    /// every enumerated member, length-framed in that order.
+    ObserverRunOutputV1, // W3-OBSRT
+    /// W3-OBSRT. Logical event key of one persisted observer run record:
+    /// the admission digest, the run receipt digest, and the result
+    /// fingerprint.
+    ObserverRunRecordV1, // W3-OBSRT
 }
 
 impl DigestDomain {
@@ -522,6 +542,11 @@ impl DigestDomain {
             Self::CiProviderFactV1 => "ostk-ci-provider-fact-v1",                        // W3-CIEV
             Self::CiScanManifestV1 => "ostk-ci-scan-manifest-v1",                        // W3-CIEV
             Self::CiCoverageWindowV1 => "ostk-ci-coverage-window-v1",                    // W3-CIEV
+            // --- W3-OBSRT prefixes ---
+            Self::ObserverSourceBlobV1 => "ostk-observer-source-blob-v1", // W3-OBSRT
+            Self::ObserverRunInputV1 => "ostk-observer-run-input-v1",     // W3-OBSRT
+            Self::ObserverRunOutputV1 => "ostk-observer-run-output-v1",   // W3-OBSRT
+            Self::ObserverRunRecordV1 => "ostk-observer-run-record-v1",   // W3-OBSRT
         }
     }
 }

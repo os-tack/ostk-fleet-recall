@@ -30,7 +30,7 @@ use chrono::DateTime;
 
 use crate::memory_contracts::common::{CanonicalDecimal, CanonicalTimestamp, HexBytes};
 
-use super::error::{GitScanError, GitScanResult};
+use super::error::{GitFactError, GitScanError, GitScanResult};
 use super::fact::{
     GIT_FACT_SCHEMA_VERSION, GitBlobSourceFactV1, GitCommitFactV1, GitFactV1, GitFileModeV1,
     GitIdentityV1, GitObjectId, GitRefName, GitRepositoryIdV1, MAX_GIT_MESSAGE_BYTES,
@@ -150,6 +150,87 @@ impl GitRepositoryReader {
             detail: "ref line is empty",
         })?;
         Ok(GitObjectId::parse_hex(oid)?)
+    }
+
+    /// Resolve one exact path inside one exact commit's tree to the tree entry
+    /// git actually has there.
+    ///
+    /// Takes a commit object id, never a revision expression: the caller must
+    /// already know which commit it is observing, and `HEAD`, `main@{1}`, or
+    /// `v2^{}` would each let the repository decide what "the" source is at
+    /// read time. The path reaches argv only after `--` and only as bytes git
+    /// itself echoed back for comparison; a path that is absent, is not a
+    /// blob, or resolves more than once fails closed.
+    pub fn resolve_path_blob(
+        &self,
+        commit_id: &GitObjectId,
+        path: &[u8],
+    ) -> GitScanResult<GitTreeEntryV1> {
+        let path_text = std::str::from_utf8(path).map_err(|_| GitScanError::Output {
+            command: "ls-tree",
+            detail: "path is not UTF-8",
+        })?;
+        if path_text.is_empty() || path_text.starts_with('-') {
+            return Err(GitScanError::Output {
+                command: "ls-tree",
+                detail: "path is empty or could be read as an option",
+            });
+        }
+        let hex = commit_id.to_hex();
+        let stdout = self.run(
+            "ls-tree",
+            &[
+                "ls-tree",
+                "-z",
+                "--full-tree",
+                "--end-of-options",
+                &hex,
+                "--",
+                path_text,
+            ],
+        )?;
+        let mut entries = parse_ls_tree(&stdout)?;
+        if entries.len() != 1 {
+            return Err(GitScanError::Output {
+                command: "ls-tree",
+                detail: "path did not resolve to exactly one tree entry",
+            });
+        }
+        let entry = entries.remove(0);
+        if entry.path.as_bytes() != path {
+            return Err(GitScanError::Output {
+                command: "ls-tree",
+                detail: "resolved tree entry names a different path",
+            });
+        }
+        Ok(entry)
+    }
+
+    /// Read one blob object's exact bytes.
+    ///
+    /// The reader does not check that these bytes hash to `blob_id`: that is
+    /// deliberately the caller's obligation, because only the caller knows
+    /// which digest domain its own integrity check runs under. See
+    /// `crate::observer_runtime::source` for the check this crate performs.
+    pub fn read_blob(&self, blob_id: &GitObjectId) -> GitScanResult<Vec<u8>> {
+        let hex = blob_id.to_hex();
+        let kind = self.run("cat-file", &["cat-file", "-t", &hex])?;
+        if kind.as_slice().trim_ascii() != b"blob" {
+            return Err(GitScanError::Output {
+                command: "cat-file",
+                detail: "object is not a blob",
+            });
+        }
+        self.run("cat-file", &["cat-file", "blob", &hex])
+    }
+
+    /// Read one exact commit object as a provider fact.
+    ///
+    /// Exposed so a consumer that already knows which commit it is bound to
+    /// (an observer pinned to one revision, say) can read the commit's tree
+    /// without walking a ref.
+    pub fn read_commit_fact(&self, commit_id: &GitObjectId) -> GitScanResult<GitCommitFactV1> {
+        self.read_commit(commit_id)
     }
 
     /// Walk one ref and render its commit and blob-source facts.
@@ -334,6 +415,78 @@ impl GitRepositoryReader {
         }
         Ok(output.stdout)
     }
+}
+
+/// One tree entry resolved at an exact commit and path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitTreeEntryV1 {
+    /// The path, exactly as git echoed it.
+    pub path: HexBytes,
+    /// The entry's file mode.
+    pub mode: GitFileModeV1,
+    /// The blob the entry names.
+    pub blob_id: GitObjectId,
+}
+
+/// Parse `git ls-tree -z --full-tree <commit> -- <path>` output.
+///
+/// Records are NUL-terminated, so a path containing a newline, a quote, or a
+/// tab round-trips unchanged rather than being re-escaped. The record's own
+/// size field is deliberately not requested: the caller reads the blob's bytes
+/// anyway, so taking the length from the bytes it actually holds is one fewer
+/// value that could disagree with them.
+fn parse_ls_tree(stdout: &[u8]) -> GitScanResult<Vec<GitTreeEntryV1>> {
+    let mut entries = Vec::new();
+    for record in stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or(GitScanError::Output {
+                command: "ls-tree",
+                detail: "tree record has no path separator",
+            })?;
+        let (meta, path) = record.split_at(tab);
+        let path = &path[1..];
+        let meta_text = std::str::from_utf8(meta).map_err(|_| GitScanError::Output {
+            command: "ls-tree",
+            detail: "tree record metadata is not UTF-8",
+        })?;
+        let mut fields = meta_text.split_whitespace();
+        let mode = fields.next().ok_or(GitScanError::Output {
+            command: "ls-tree",
+            detail: "tree record has no mode",
+        })?;
+        let kind = fields.next().ok_or(GitScanError::Output {
+            command: "ls-tree",
+            detail: "tree record has no object type",
+        })?;
+        let oid = fields.next().ok_or(GitScanError::Output {
+            command: "ls-tree",
+            detail: "tree record has no object id",
+        })?;
+        if fields.next().is_some() {
+            return Err(GitScanError::Output {
+                command: "ls-tree",
+                detail: "tree record has unexpected trailing metadata",
+            });
+        }
+        if kind != "blob" {
+            return Err(GitScanError::Output {
+                command: "ls-tree",
+                detail: "tree entry is not a blob",
+            });
+        }
+        entries.push(GitTreeEntryV1 {
+            path: HexBytes::new(path.to_vec())
+                .map_err(|error| GitScanError::Fact(GitFactError::Contract(error)))?,
+            mode: GitFileModeV1::parse(mode)?,
+            blob_id: GitObjectId::parse_hex(oid)?,
+        });
+    }
+    Ok(entries)
 }
 
 /// One added-or-modified tree entry.
@@ -709,5 +862,53 @@ author A <a@b.test> 1755259200 +0000\n\
     fn a_truncated_diff_tree_record_is_refused() {
         let stdout = b":000000 100644 0000 A\0path\0".to_vec();
         assert!(parse_diff_tree(&stdout).is_err());
+    }
+
+    #[test]
+    fn a_tree_record_parses_into_one_exact_blob_entry() {
+        let stdout =
+            b"100644 blob 1111111111111111111111111111111111111111\tsrc/service.rs\0".to_vec();
+        let entries = parse_ls_tree(&stdout).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path.as_bytes(), b"src/service.rs");
+        assert_eq!(entries[0].mode, GitFileModeV1::Regular);
+        assert_eq!(
+            entries[0].blob_id.to_hex(),
+            "1111111111111111111111111111111111111111"
+        );
+    }
+
+    #[test]
+    fn a_tree_path_with_a_newline_survives_nul_separated_parsing() {
+        let stdout =
+            b"100755 blob 2222222222222222222222222222222222222222\tweird\nname.rs\0".to_vec();
+        let entries = parse_ls_tree(&stdout).unwrap();
+        assert_eq!(entries[0].path.as_bytes(), b"weird\nname.rs");
+        assert_eq!(entries[0].mode, GitFileModeV1::Executable);
+    }
+
+    #[test]
+    fn a_tree_entry_that_is_not_a_blob_is_refused() {
+        // A directory, a submodule gitlink, and a tag each name something this
+        // reader has no bytes for; answering with the object id anyway would
+        // let an observer claim it read a file it never read.
+        for kind in ["tree", "commit", "tag"] {
+            let record =
+                format!("040000 {kind} 3333333333333333333333333333333333333333\tsrc\0");
+            assert!(parse_ls_tree(record.as_bytes()).is_err(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_tree_record_with_trailing_metadata_is_refused() {
+        let stdout =
+            b"100644 blob 1111111111111111111111111111111111111111 extra\ta.rs\0".to_vec();
+        assert!(parse_ls_tree(&stdout).is_err());
+    }
+
+    #[test]
+    fn a_tree_record_with_no_path_separator_is_refused() {
+        let stdout = b"100644 blob 1111111111111111111111111111111111111111 a.rs\0".to_vec();
+        assert!(parse_ls_tree(&stdout).is_err());
     }
 }

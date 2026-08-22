@@ -96,4 +96,6 @@ pub use fact::{
     GitRefObservationLogV1, GitRepositoryIdV1, MAX_GIT_MESSAGE_BYTES, MAX_GIT_PATH_BYTES,
 };
 pub use ingress::{GIT_FACT_MEDIA_TYPE, GitConnectorBindingV1, GitIngressClocksV1, GitIngressV1};
-pub use scan::{GitRepositoryReader, GitScanRequestV1, GitScanV1, GitTreeScanModeV1};
+pub use scan::{
+    GitRepositoryReader, GitScanRequestV1, GitScanV1, GitTreeEntryV1, GitTreeScanModeV1,
+};

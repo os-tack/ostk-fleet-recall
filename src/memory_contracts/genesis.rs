@@ -403,6 +403,60 @@ pub struct ObserverAdmissionEntryV1 {
     configuration_digest: Sha256Digest,
 }
 
+/// Read-only accessors for the activated governance decision this entry IS.
+///
+/// The fields stay private: nothing may construct or edit an admission entry
+/// outside a registry package. A runtime that wants to execute this observer
+/// still has to prove its own executable, dependency closure, configuration,
+/// mode, and predicate equal what governance admitted here, and these
+/// accessors are how it reads the values it must match (AUTH-03).
+impl ObserverAdmissionEntryV1 {
+    #[must_use]
+    pub const fn observer_id(&self) -> &ContractId {
+        &self.observer_id
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    #[must_use]
+    pub const fn predicate_schema(&self) -> &RegistryReferenceV1 {
+        &self.predicate_schema
+    }
+
+    #[must_use]
+    pub const fn evidence_schema(&self) -> &RegistryReferenceV1 {
+        &self.evidence_schema
+    }
+
+    #[must_use]
+    pub const fn admission_mode(&self) -> ObserverAdmissionModeV1 {
+        self.admission_mode
+    }
+
+    #[must_use]
+    pub const fn coverage(&self) -> &CoverageRequirementV1 {
+        &self.coverage
+    }
+
+    #[must_use]
+    pub const fn executable_artifact_digest(&self) -> Sha256Digest {
+        self.executable_artifact_digest
+    }
+
+    #[must_use]
+    pub const fn dependency_closure_digest(&self) -> Sha256Digest {
+        self.dependency_closure_digest
+    }
+
+    #[must_use]
+    pub const fn configuration_digest(&self) -> Sha256Digest {
+        self.configuration_digest
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PredicateSchemaEntryV1 {
