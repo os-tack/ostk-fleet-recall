@@ -7,6 +7,11 @@
 //! it returns early. The pure derivation and rejection classes are covered by
 //! ordinary unit tests in `src/projectors/`.
 //!
+//! Every database-gated test in this file is named `live_*`: that prefix is
+//! how the authoritative official-binary lane
+//! (`deploy/cockroach/tests/registry-activation-cli.sh`) discovers the suite,
+//! so a database-gated test without it would silently never run in CI.
+//!
 //! The projection's upstream is W2-BODY's `memory_body_objects_v1`. Most tests
 //! here get there the real way: seed the accepted evidence log with genuine,
 //! contract-validated `EvidenceStatementV2` canonical bytes, run the body
@@ -533,7 +538,7 @@ const SOURCE_B: &[u8] = b"unrelated marmalade of tessellated basalt\n\nsecond ma
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn body_rows_become_lexically_searchable_without_any_embedding() {
+async fn live_body_rows_become_lexically_searchable_without_any_embedding() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -594,7 +599,7 @@ async fn body_rows_become_lexically_searchable_without_any_embedding() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_dense_worker_backfills_later_and_dense_search_then_works() {
+async fn live_the_dense_worker_backfills_later_and_dense_search_then_works() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -658,8 +663,8 @@ async fn the_dense_worker_backfills_later_and_dense_search_then_works() {
 // batch, then check every consequence. Splitting it would hide the ordering the
 // assertions depend on.
 #[allow(clippy::too_many_lines)]
-async fn killing_the_dense_worker_mid_batch_leaves_lexical_intact_and_the_dense_cursor_consistent()
-{
+async fn live_killing_the_dense_worker_mid_batch_leaves_lexical_intact_and_the_dense_cursor_consistent()
+ {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -782,7 +787,7 @@ async fn killing_the_dense_worker_mid_batch_leaves_lexical_intact_and_the_dense_
 
 /// A provider outage aborts the dense batch and reaches nothing else.
 #[tokio::test]
-async fn a_failing_embedding_provider_never_removes_lexical_availability() {
+async fn live_a_failing_embedding_provider_never_removes_lexical_availability() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -858,7 +863,7 @@ async fn a_failing_embedding_provider_never_removes_lexical_availability() {
 /// A model that answers with a vector no index may store is refused, and the
 /// refusal is contained to the dense tier.
 #[tokio::test]
-async fn a_degenerate_provider_vector_is_refused_and_writes_no_dense_row() {
+async fn live_a_degenerate_provider_vector_is_refused_and_writes_no_dense_row() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -908,7 +913,7 @@ async fn a_degenerate_provider_vector_is_refused_and_writes_no_dense_row() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn replay_from_the_body_tables_rebuilds_byte_identical_projections() {
+async fn live_replay_from_the_body_tables_rebuilds_byte_identical_projections() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -944,7 +949,7 @@ async fn replay_from_the_body_tables_rebuilds_byte_identical_projections() {
 
 /// The lexical batch's rows and its cursor advance are one transaction.
 #[tokio::test]
-async fn the_lexical_cursor_advances_atomically_with_its_rows() {
+async fn live_the_lexical_cursor_advances_atomically_with_its_rows() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -982,7 +987,7 @@ async fn the_lexical_cursor_advances_atomically_with_its_rows() {
 /// A body row whose stored bytes do not reproduce its content address fails the
 /// projection closed, writes no lexical row, and leaves the cursor unadvanced.
 #[tokio::test]
-async fn a_body_row_whose_bytes_do_not_match_its_address_fails_the_projection_closed() {
+async fn live_a_body_row_whose_bytes_do_not_match_its_address_fails_the_projection_closed() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -1033,7 +1038,7 @@ async fn a_body_row_whose_bytes_do_not_match_its_address_fails_the_projection_cl
 
 /// Every read and write stays inside the scope bound at construction.
 #[tokio::test]
-async fn the_projection_never_crosses_the_scope_it_was_bound_to() {
+async fn live_the_projection_never_crosses_the_scope_it_was_bound_to() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -1086,7 +1091,7 @@ async fn the_projection_never_crosses_the_scope_it_was_bound_to() {
 /// The dense vector index keeps the C-SPANN equality prefix migration 0001
 /// requires, and the dense recall query binds exactly that prefix.
 #[tokio::test]
-async fn the_dense_vector_index_keeps_the_c_spann_equality_prefix() {
+async fn live_the_dense_vector_index_keeps_the_c_spann_equality_prefix() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -1120,7 +1125,7 @@ async fn the_dense_vector_index_keeps_the_c_spann_equality_prefix() {
 /// The projection is private-plane only: no publication grant on any of its
 /// tables.
 #[tokio::test]
-async fn no_projection_table_is_granted_to_the_publication_role() {
+async fn live_no_projection_table_is_granted_to_the_publication_role() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };

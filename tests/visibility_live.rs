@@ -7,6 +7,11 @@
 //! classification and its rejection classes are covered by ordinary unit tests
 //! in `src/projectors/visibility.rs`.
 //!
+//! Every database-gated test in this file is named `live_*`: that prefix is
+//! how the authoritative official-binary lane
+//! (`deploy/cockroach/tests/registry-activation-cli.sh`) discovers the suite,
+//! so a database-gated test without it would silently never run in CI.
+//!
 //! The interesting tests here are the NEGATIVE ones. This module's claim is not
 //! "the publication plane returns the right rows" but "the publication plane
 //! cannot return a private row, by any query it is able to write". So the
@@ -602,7 +607,8 @@ fn restricted_role_url(admin_url: &str, role: &str, password: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_private_plane_sees_both_classes_and_the_publication_plane_sees_only_public_rows() {
+async fn live_the_private_plane_sees_both_classes_and_the_publication_plane_sees_only_public_rows()
+{
     let Some(url) = database_url() else {
         return;
     };
@@ -675,7 +681,7 @@ async fn the_private_plane_sees_both_classes_and_the_publication_plane_sees_only
 }
 
 #[tokio::test]
-async fn ranking_count_and_offset_probes_never_reveal_a_private_row() {
+async fn live_ranking_count_and_offset_probes_never_reveal_a_private_row() {
     let Some(url) = database_url() else {
         return;
     };
@@ -726,7 +732,7 @@ async fn ranking_count_and_offset_probes_never_reveal_a_private_row() {
 }
 
 #[tokio::test]
-async fn the_real_publication_role_has_no_sql_path_to_a_private_row() {
+async fn live_the_real_publication_role_has_no_sql_path_to_a_private_row() {
     let Some(url) = database_url() else {
         return;
     };
@@ -844,7 +850,7 @@ async fn the_real_publication_role_has_no_sql_path_to_a_private_row() {
 }
 
 #[tokio::test]
-async fn a_body_with_no_recorded_decision_projects_as_private() {
+async fn live_a_body_with_no_recorded_decision_projects_as_private() {
     let Some(url) = database_url() else {
         return;
     };
@@ -911,7 +917,7 @@ async fn a_body_with_no_recorded_decision_projects_as_private() {
 }
 
 #[tokio::test]
-async fn a_later_private_event_over_the_same_bytes_demotes_an_already_public_row() {
+async fn live_a_later_private_event_over_the_same_bytes_demotes_an_already_public_row() {
     let Some(url) = database_url() else {
         return;
     };
@@ -1016,7 +1022,7 @@ async fn a_later_private_event_over_the_same_bytes_demotes_an_already_public_row
 }
 
 #[tokio::test]
-async fn the_database_itself_refuses_an_unapproved_publication_safe_row() {
+async fn live_the_database_itself_refuses_an_unapproved_publication_safe_row() {
     let Some(url) = database_url() else {
         return;
     };

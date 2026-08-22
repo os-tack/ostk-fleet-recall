@@ -8,6 +8,11 @@
 //! points at a disposable single-node instance (see the fleet worker protocol
 //! section 3, `crdb-up.sh`); otherwise they return early.
 //!
+//! Every database-gated test in this file is named `live_*`: that prefix is
+//! how the authoritative official-binary lane
+//! (`deploy/cockroach/tests/registry-activation-cli.sh`) discovers the suite,
+//! so a database-gated test without it would silently never run in CI.
+//!
 //! The projector consumes ACCEPTED evidence events from `memory_evidence_events`
 //! (`event_kind = 'evidence.accepted'`). These tests seed that log directly with
 //! genuine, contract-validated `EvidenceStatementV2` canonical bytes — the exact
@@ -457,7 +462,7 @@ async fn clear_body_plane(pool: &PgPool, tenant_id: Uuid, project: &str) {
 /// REPLAY-01: replaying the accepted-event log from empty rebuilds byte-identical
 /// body/occurrence/manifest rows.
 #[tokio::test]
-async fn replay_from_empty_rebuilds_byte_identical_rows() {
+async fn live_replay_from_empty_rebuilds_byte_identical_rows() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -510,7 +515,7 @@ async fn replay_from_empty_rebuilds_byte_identical_rows() {
 /// Re-projecting an already-consumed log is a no-op: no new rows, cursor
 /// unchanged, snapshot byte-identical.
 #[tokio::test]
-async fn reprojection_is_idempotent() {
+async fn live_reprojection_is_idempotent() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -544,7 +549,7 @@ async fn reprojection_is_idempotent() {
 /// A body content address presented over different bytes than the ones durably
 /// stored fails the whole event closed: no occurrence rows, cursor unadvanced.
 #[tokio::test]
-async fn body_content_collision_fails_closed() {
+async fn live_body_content_collision_fails_closed() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -618,7 +623,7 @@ async fn body_content_collision_fails_closed() {
 /// An occurrence id presented over a different canonical preimage than the one
 /// already stored fails the event closed.
 #[tokio::test]
-async fn occurrence_preimage_collision_fails_closed() {
+async fn live_occurrence_preimage_collision_fails_closed() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -680,7 +685,7 @@ async fn occurrence_preimage_collision_fails_closed() {
 /// A parser-key upgrade opens a shadow generation without mutating the prior
 /// generation's rows.
 #[tokio::test]
-async fn parser_upgrade_opens_a_shadow_generation() {
+async fn live_parser_upgrade_opens_a_shadow_generation() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
@@ -763,7 +768,7 @@ async fn parser_upgrade_opens_a_shadow_generation() {
 /// Cursor atomicity: rows and the cursor advance in ONE transaction, so a
 /// rollback (a crash between output and cursor commit) leaves BOTH unadvanced.
 #[tokio::test]
-async fn cursor_atomicity_rollback_leaves_both_unadvanced() {
+async fn live_cursor_atomicity_rollback_leaves_both_unadvanced() {
     let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
         return;
     };
