@@ -313,6 +313,12 @@ pub enum DigestDomain {
     /// of representation identity. Distinct from [`Self::ParserKeyV1`],
     /// which frames only the bare parser key preimage.
     ParserContractV2, // W2-PKG
+    /// W2-PROJ. Normalized lexical-projection text identity: frames the
+    /// normalization version and the exact normalized text a body was projected
+    /// into. Distinct from [`Self::Body`], which frames the raw body bytes; a
+    /// lexical projection is a lossy, normalized derivation of those bytes and
+    /// must not be addressable under the body's own content address.
+    LexicalProjectionTextV1, // W2-PROJ
 }
 
 impl DigestDomain {
@@ -461,6 +467,7 @@ impl DigestDomain {
             Self::Stage5TargetPackageV1 => "ostk-stage5-target-package-v1", // W2-PKG
             Self::CoverageProofV2 => "ostk-coverage-proof-v2",              // W2-PKG
             Self::ParserContractV2 => "ostk-parser-contract-v2",            // W2-PKG
+            Self::LexicalProjectionTextV1 => "ostk-lexical-projection-text-v1", // W2-PROJ
         }
     }
 }
