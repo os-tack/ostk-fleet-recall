@@ -122,6 +122,13 @@ git -C "$repo_root" ls-files |
             # negative fixtures. The connection-policy module is admitted via
             # the verifier's exact closed fixture projection instead.
             src/config.rs) continue ;;
+            # W0-TELEM's exemplar-scrubbing negative vector is deliberately
+            # secret-shaped; it matches .dockerignore's `**/*secret*` and so is
+            # excluded from the production image build context. Keep it out of
+            # the publication corpus too, so the manifest is consistent with
+            # what actually ships (the telemetry contract is exercised by its
+            # own frozen Rust vectors regardless).
+            contracts/dynamic-memory/v3/telemetry/negative-secret-shaped-field.jsonl) continue ;;
         esac
         printf '%s\n' "$path"
     done |
@@ -139,10 +146,10 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 7676
+    length == 7675
     and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 1296
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 6174
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 6173
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "src/bin/ostk-control-bootstrap.rs")] | length) == 11

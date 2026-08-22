@@ -366,7 +366,6 @@ contracts/dynamic-memory/v3/telemetry/negative-cap-exceeded-exemplar.jsonl|memor
 contracts/dynamic-memory/v3/telemetry/negative-compliant-partial-coverage.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v3/telemetry/negative-float-result.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v3/telemetry/negative-raw-log-line-field.jsonl|memory_contracts|jsonl
-contracts/dynamic-memory/v3/telemetry/negative-secret-shaped-field.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v3/telemetry/negative-selected-count-exceeds-cap.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v3/telemetry/negative-tombstone-invalid-erasure-policy.jsonl|memory_contracts|jsonl
 contracts/dynamic-memory/v3/telemetry/negative-tombstone-invalid-schema-version.jsonl|memory_contracts|jsonl
