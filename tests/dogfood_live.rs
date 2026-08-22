@@ -54,11 +54,11 @@ use ostk_fleet_recall::connectors::git::{
     GitTreeScanModeV1, drain_git_facts, git_coverage_observation,
 };
 use ostk_fleet_recall::connectors::transcript::{
-    CockroachTranscriptOutboxRepository, RedactionGuaranteeV1, TranscriptCollectionRequestV1,
-    TranscriptConnectorBindingV1, TranscriptCoverageBindingV1, TranscriptDrainModeV1,
-    TranscriptDrainRequest, TranscriptEnqueueOutcome, TranscriptIngressClocksV1,
-    TranscriptOutboxRepository, collect_batch, drain_outbox, scan_secrets,
-    transcript_parser_key_v2,
+    CockroachTranscriptOutboxRepository, REDACTION_PLACEHOLDER, RedactionGuaranteeV1,
+    TranscriptCollectionRequestV1, TranscriptConnectorBindingV1, TranscriptCoverageBindingV1,
+    TranscriptDrainModeV1, TranscriptDrainRequest, TranscriptEnqueueOutcome,
+    TranscriptIngressClocksV1, TranscriptOutboxRepository, collect_batch, drain_outbox,
+    scan_secrets, transcript_parser_key_v2,
 };
 use ostk_fleet_recall::control_log::{
     CockroachGenesisRepository, GenesisRepository, TrustedControlScope,
@@ -88,12 +88,15 @@ use ostk_fleet_recall::memory_contracts::digest::{
     DigestDomain, Sha256Digest, domain_separated_digest,
 };
 use ostk_fleet_recall::memory_contracts::evidence_v2::RegistryHeadBindingV1;
+use ostk_fleet_recall::memory_contracts::generation2_registry::{
+    GIT_CONNECTOR, TRANSCRIPT_CONNECTOR, generation_two_registry_package,
+};
 use ostk_fleet_recall::memory_contracts::genesis::SemanticallyClosedGenesisPackage;
 use ostk_fleet_recall::memory_contracts::genesis_activation::{
     GenesisActivationPrincipalBinding, GenesisRegistryActivationApprovalSetV1,
     GenesisRegistryActivationApprovalV1, GenesisRegistryActivationStatementV1,
-    GenesisRegistryAnchorV1, RegistryTestResultDigest, RegistryTestRunnerPin,
-    VerifiedRegistryTestResult, genesis_activation_policy_digest,
+    GenesisRegistryAnchorV1, RegistryTestOutcomeV1, RegistryTestResultDigest, RegistryTestResultV1,
+    RegistryTestRunnerPin, VerifiedRegistryTestResult, genesis_activation_policy_digest,
     verify_genesis_registry_activation, verify_registry_test_result,
 };
 use ostk_fleet_recall::memory_contracts::identity::ResourceUri;
@@ -149,10 +152,12 @@ const GENERATION_1_PACKAGE: &[u8] =
 const GENERATION_1_TEST_RESULT: &[u8] = include_bytes!(
     "../contracts/dynamic-memory/v2/successor-activation/registry-test-result.jsonl"
 );
-const GENERATION_2_PACKAGE: &[u8] =
-    include_bytes!("../contracts/dynamic-memory/v3/successor-generic/generation-2-package.jsonl");
-const GENERATION_2_TEST_RESULT: &[u8] =
-    include_bytes!("../contracts/dynamic-memory/v3/successor-generic/activation-test-result.jsonl");
+// The generation-2 package is COMPOSED from the generation-1 package by
+// `generation_two_registry_package`, not frozen as bytes: its digest is a pure
+// function of generation 1's bytes plus that composition, so a fixture would
+// only be a second copy of something already derivable. Its conformance result
+// is minted here for the same reason, and the runner pin below is the
+// deployment-trusted value the ceremony checks it against.
 
 const GENESIS_TEST_RESULT_DIGEST: &str =
     "e91e08070250a722446195b76ee685a9697298b9fdce9809027f120c829b679d";
@@ -162,8 +167,6 @@ const GENESIS_RUNNER_CONFIGURATION: &str =
     "1d12aabe349fd0013389f93bf1917b0de6bbd5d2bd7156c85faff0b97360686d";
 const GENERATION_1_TEST_RESULT_DIGEST: &str =
     "e6783b2a018957a5861fe4e0670f55613d1ace35e381a6a9f5190ea9d7fbff8d";
-const GENERATION_2_TEST_RESULT_DIGEST: &str =
-    "92fa5a109739a2509c57104d50f0c13416295380aee9e7f81f860dad2d1d08d7";
 const SUCCESSOR_RUNNER_ARTIFACT: &str =
     "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
 const SUCCESSOR_RUNNER_CONFIGURATION: &str =
@@ -205,6 +208,11 @@ const SNIPPET_CHARS: usize = 320;
 /// recall snippet because these are the rows the questions are answered from.
 const EVIDENCE_SNIPPET_CHARS: usize = 900;
 
+/// Instant the composed generation-2 conformance result declares. Fixed rather
+/// than a wall clock so the result — and therefore the activation statement
+/// that names its digest — is reproducible across runs.
+const GENERATION_2_TEST_COMPLETED_AT: &str = "2026-08-22T04:00:00.000000000Z";
+
 const GIT_INSTANCE: &str = "connector.git.aetia";
 const TRANSCRIPT_INSTANCE_PREFIX: &str = "connector.transcript";
 const COVERAGE_SCOPE_URI: &str = "urn:ostk:entity:v1:repository:sha256:1111111111111111111111111111111111111111111111111111111111111111";
@@ -241,7 +249,14 @@ struct ContractFixture {
     genesis_test_result: VerifiedRegistryTestResult,
     genesis_principal_binding: GenesisActivationPrincipalBinding,
     stage4: SemanticallyClosedStage4Package,
-    generation_2: StructurallyClosedSuccessorTargetV2,
+    /// The composed generation-2 registry package: generation 1's 27 entries
+    /// carried forward byte for byte, plus one closed version-form identity
+    /// chain per Wave-2 connector.
+    generation_2: ManifestVerifiedRegistryPackage,
+    generation_2_closed: SemanticallyClosedSuccessorPackage,
+    generation_2_target: StructurallyClosedSuccessorTargetV2,
+    generation_2_test_result: Vec<u8>,
+    generation_2_test_result_digest: RegistryTestResultDigest,
 }
 
 fn fixture() -> ContractFixture {
@@ -269,13 +284,40 @@ fn fixture() -> ContractFixture {
         SemanticallyClosedSuccessorPackage::from_manifest_verified(stage4_manifest).unwrap(),
     )
     .unwrap();
-    let generation_2_manifest =
-        ManifestVerifiedRegistryPackage::decode(record(GENERATION_2_PACKAGE), &profile).unwrap();
+    let generation_2 = generation_two_registry_package(
+        &ManifestVerifiedRegistryPackage::decode(record(GENERATION_1_PACKAGE), &profile).unwrap(),
+    )
+    .expect("the generation-2 composition must close");
+    let generation_2_closed =
+        SemanticallyClosedSuccessorPackage::from_manifest_verified(generation_2.clone())
+            .expect("the composed generation-2 package must close semantically");
+    let generation_2_target =
+        StructurallyClosedSuccessorTargetV2::from_manifest_verified(&generation_2)
+            .expect("the composed generation-2 package must be an activatable target");
+    let generation_2_test_result = encode_canonical(&RegistryTestResultV1 {
+        schema_version: 1,
+        profile: profile.clone(),
+        package_digest: generation_2.package_digest(),
+        positive_vector_suite_digest: generation_2.package().positive_vector_suite_digest,
+        negative_vector_suite_digest: generation_2.package().negative_vector_suite_digest,
+        executed_vector_manifest_digest: profile.vector_manifest_digest,
+        runner_artifact_digest: digest(SUCCESSOR_RUNNER_ARTIFACT),
+        runner_configuration_digest: digest(SUCCESSOR_RUNNER_CONFIGURATION),
+        passed_case_count: 1,
+        failed_case_count: 0,
+        outcome: RegistryTestOutcomeV1::Passed,
+        completed_at: CanonicalTimestamp::parse(GENERATION_2_TEST_COMPLETED_AT).unwrap(),
+    })
+    .unwrap();
+    let generation_2_test_result_digest = RegistryTestResultDigest::from_digest(
+        domain_separated_digest(DigestDomain::RegistryTestResult, &generation_2_test_result),
+    );
     ContractFixture {
-        generation_2: StructurallyClosedSuccessorTargetV2::from_manifest_verified(
-            &generation_2_manifest,
-        )
-        .unwrap(),
+        generation_2,
+        generation_2_closed,
+        generation_2_target,
+        generation_2_test_result,
+        generation_2_test_result_digest,
         profile,
         semantic_scope,
         genesis_package,
@@ -359,16 +401,24 @@ struct ActivatedMemory {
     pool: PgPool,
     physical_scope: FleetScope,
     trusted_scope: TrustedControlScope,
-    bootstrap_receipt_digest: BootstrapReceiptDigest,
-    generation_1_head: RegistryHeadBindingV1,
-    active: ActiveStage4Package,
+    /// The ACTIVE generation-2 package, narrowed to the git connector schema.
+    active_git: ActiveStage4Package,
+    /// The same activated package, narrowed to the transcript connector schema.
+    active_transcript: ActiveStage4Package,
+    /// What the generation-1 -> 2 ceremony reported, verbatim, for the report.
+    generation_two: String,
     witness: WriterAuthorityWitness,
     ledger: Arc<CockroachAcceptedEventRepository>,
     coverage: CockroachCoverageRuntimeRepository,
 }
 
-/// Walk bootstrap, genesis activation, and the frozen `0 -> 1` ceremony, then
-/// bind the ACTIVE package the connectors admit against.
+/// Walk bootstrap, genesis activation, the frozen `0 -> 1` ceremony and the
+/// generic `1 -> 2` transition, then bind the ACTIVE generation-2 package each
+/// connector admits against.
+///
+/// Generation 2 is activated BEFORE anything is ingested, which is the whole
+/// point: a fact admitted under generation 1 names an occurrence-form canonical
+/// resource the body plane can never chunk.
 #[allow(clippy::too_many_lines)] // one helper keeps the whole real prefix visible
 async fn activate(pool: &PgPool, fixture: &ContractFixture) -> ActivatedMemory {
     let physical = physical_scope();
@@ -596,10 +646,47 @@ async fn activate(pool: &PgPool, fixture: &ContractFixture) -> ActivatedMemory {
         control.clone(),
         retry_policy(),
     ));
+    let generation_1_witness = ledger.read_writer_authority_witness().await.unwrap();
+    assert_eq!(
+        generation_1_witness.generation(),
+        1,
+        "the head must be generation one before the transition"
+    );
+    ActiveStage4Package::bind(
+        &fixture.stage4,
+        generation_1_head.clone(),
+        &generation_1_witness,
+    )
+    .expect("the generation-1 head activated the Stage-4 target");
+
+    let (generation_2_head, generation_two) = activate_generation_two(
+        pool,
+        &control,
+        bootstrap_receipt_digest,
+        &generation_1_head,
+        fixture,
+    )
+    .await;
     let witness = ledger.read_writer_authority_witness().await.unwrap();
-    assert_eq!(witness.generation(), 1, "the head must be generation one");
-    let active = ActiveStage4Package::bind(&fixture.stage4, generation_1_head.clone(), &witness)
-        .expect("the activated package is the Stage-4 target");
+    assert_eq!(
+        witness.generation(),
+        2,
+        "ingestion runs under the generation-2 head"
+    );
+    let active_git = ActiveStage4Package::bind_connector(
+        fixture.generation_2_closed.clone(),
+        &ContractId::new(GIT_CONNECTOR.connector_schema).unwrap(),
+        generation_2_head.clone(),
+        &witness,
+    )
+    .expect("the generation-2 head activated the package carrying the git connector");
+    let active_transcript = ActiveStage4Package::bind_connector(
+        fixture.generation_2_closed.clone(),
+        &ContractId::new(TRANSCRIPT_CONNECTOR.connector_schema).unwrap(),
+        generation_2_head,
+        &witness,
+    )
+    .expect("the generation-2 head activated the package carrying the transcript connector");
 
     ActivatedMemory {
         coverage: CockroachCoverageRuntimeRepository::new(
@@ -610,9 +697,9 @@ async fn activate(pool: &PgPool, fixture: &ContractFixture) -> ActivatedMemory {
         pool: pool.clone(),
         physical_scope: physical,
         trusted_scope: control,
-        bootstrap_receipt_digest,
-        generation_1_head,
-        active,
+        active_git,
+        active_transcript,
+        generation_two,
         witness,
         ledger,
     }
@@ -718,7 +805,7 @@ async fn ingest_git(memory: &ActivatedMemory, git_dir: &Path, ref_name: &str) ->
         .expect("the real repository must scan");
 
     let binding = ostk_fleet_recall::connectors::git::GitConnectorBindingV1::resolve(
-        &memory.active,
+        &memory.active_git,
         ContractId::new("connector.git").unwrap(),
         ContractId::new(GIT_INSTANCE).unwrap(),
         INSTALLATION_ID,
@@ -753,7 +840,7 @@ async fn ingest_git(memory: &ActivatedMemory, git_dir: &Path, ref_name: &str) ->
     let report = drain_git_facts(
         &GitDrainContextV1 {
             binding: &binding,
-            active: &memory.active,
+            active: &memory.active_git,
             witness: &memory.witness,
             ledger: memory.ledger.as_ref(),
             control_scope: &memory.trusted_scope,
@@ -867,7 +954,7 @@ async fn ingest_transcript(memory: &ActivatedMemory, path: &Path) -> TranscriptI
         memory.trusted_scope.clone(),
         retry_policy(),
     );
-    let guarantee = RedactionGuaranteeV1::from_active_package(&memory.active)
+    let guarantee = RedactionGuaranteeV1::from_active_package(&memory.active_transcript)
         .expect("the activated package must promise redaction before the durable outbox");
     let parser_key = transcript_parser_key_v2();
     let mut instance_coordinates = BTreeMap::new();
@@ -899,7 +986,7 @@ async fn ingest_transcript(memory: &ActivatedMemory, path: &Path) -> TranscriptI
         let window_end = bytes.len().min(resume + TRANSCRIPT_WINDOW_BYTES);
         let observed = canonical_time(server_time(&memory.pool).await);
         let (batch, stats) = collect_batch(&TranscriptCollectionRequestV1 {
-            active: &memory.active,
+            active: &memory.active_transcript,
             binding: &binding,
             guarantee: &guarantee,
             parser_key: &parser_key,
@@ -957,7 +1044,7 @@ async fn ingest_transcript(memory: &ActivatedMemory, path: &Path) -> TranscriptI
 
     loop {
         let summary = drain_outbox(TranscriptDrainRequest {
-            active: &memory.active,
+            active: &memory.active_transcript,
             witness: &memory.witness,
             outbox: &outbox,
             ledger: memory.ledger.as_ref(),
@@ -1235,30 +1322,41 @@ async fn clock_witness(memory: &ActivatedMemory, object_id_hex: &str) -> Option<
 }
 
 // ---------------------------------------------------------------------------
-// The generation-2 step, run LAST because of what it proves.
+// The generation-2 step, run FIRST because of what it enables.
 // ---------------------------------------------------------------------------
 
-/// Activate `1 -> 2` through the generic successor runtime, then report whether
-/// the evidence-admission seam can bind the resulting head.
+/// Activate `1 -> 2` through the generic successor runtime and return the
+/// resulting head plus what the ceremony reported.
+///
+/// Nothing about the composed package shortcuts the ceremony: the repository
+/// re-verifies the package bytes, the conformance result against a
+/// deployment-trusted runner pin, the installed activation policy, and both
+/// approvals, then compare-and-swaps the durable head.
 #[allow(clippy::too_many_lines)] // one linear activation ceremony
-async fn activate_generation_two(memory: &ActivatedMemory, fixture: &ContractFixture) -> String {
+async fn activate_generation_two(
+    pool: &PgPool,
+    control: &TrustedControlScope,
+    bootstrap_receipt_digest: BootstrapReceiptDigest,
+    generation_1_head: &RegistryHeadBindingV1,
+    fixture: &ContractFixture,
+) -> (RegistryHeadBindingV1, String) {
     let repository = CockroachGenericSuccessorRepository::new(
-        memory.pool.clone(),
-        memory.trusted_scope.clone(),
+        pool.clone(),
+        control.clone(),
         retry_policy(),
-        memory.bootstrap_receipt_digest,
-        record(GENERATION_2_PACKAGE).to_vec(),
-        record(GENERATION_2_TEST_RESULT),
+        bootstrap_receipt_digest,
+        fixture.generation_2.canonical_bytes().to_vec(),
+        &fixture.generation_2_test_result,
         GenericSuccessorTestRunnerPin::from_trusted_config(
             digest(SUCCESSOR_RUNNER_ARTIFACT),
             digest(SUCCESSOR_RUNNER_CONFIGURATION),
-            RegistryTestResultDigest::from_digest(digest(GENERATION_2_TEST_RESULT_DIGEST)),
+            fixture.generation_2_test_result_digest,
         ),
         GenericSuccessorPrincipalBinding::from_trusted_config(
             ContractId::new(PROPOSER).unwrap(),
             ContractId::new(AUTHOR).unwrap(),
         ),
-        memory.generation_1_head.clone(),
+        generation_1_head.clone(),
     )
     .unwrap();
 
@@ -1266,7 +1364,7 @@ async fn activate_generation_two(memory: &ActivatedMemory, fixture: &ContractFix
     // from the target package's own activation policy exactly as the connected
     // proof that owns this ceremony takes it.
     let installed = fixture
-        .generation_2
+        .generation_2_target
         .activation_policy()
         .registry_reference()
         .clone();
@@ -1276,20 +1374,18 @@ async fn activate_generation_two(memory: &ActivatedMemory, fixture: &ContractFix
         schema_version: 2,
         profile: fixture.profile.clone(),
         scope: fixture.semantic_scope.clone(),
-        expected_predecessor_head: memory.generation_1_head.clone(),
+        expected_predecessor_head: generation_1_head.clone(),
         current_activation_policy: installed,
-        target_package_digest: fixture.generation_2.package_digest(),
+        target_package_digest: fixture.generation_2_target.package_digest(),
         target_activation_policy: fixture
-            .generation_2
+            .generation_2_target
             .activation_policy()
             .registry_reference()
             .clone(),
-        test_vector_result_digest: RegistryTestResultDigest::from_digest(digest(
-            GENERATION_2_TEST_RESULT_DIGEST,
-        )),
+        test_vector_result_digest: fixture.generation_2_test_result_digest,
         from_generation: 1,
         to_generation: 2,
-        effective_from: canonical_time(server_time(&memory.pool).await),
+        effective_from: canonical_time(server_time(pool).await),
         effective_until: None,
         proposer_principal_id: ContractId::new(PROPOSER).unwrap(),
         package_author_principal_id: ContractId::new(AUTHOR).unwrap(),
@@ -1329,27 +1425,25 @@ async fn activate_generation_two(memory: &ActivatedMemory, fixture: &ContractFix
 
     match repository.activate_generic_successor(&candidate).await {
         Ok(GenericSuccessorActivationOutcome::Inserted(accepted)) => {
-            let witness = memory.ledger.read_writer_authority_witness().await.unwrap();
-            let bind = ActiveStage4Package::bind(
-                &fixture.stage4,
-                accepted.registry_head.clone(),
-                &witness,
+            let head = accepted.registry_head;
+            let report = format!(
+                "installed generation 2 (package digest `{}`, {} registry entries) BEFORE any \
+                 ingestion. It carries every generation-1 entry forward byte for byte and adds \
+                 one closed version-form identity chain per connector, so the two connector \
+                 instances below deliver as `{}` and `{}`. The frozen generation-1 Stage-4 \
+                 package no longer binds this head, which is correct: its digest is not the \
+                 activated one.",
+                head.head.package_digest.to_hex(),
+                fixture.generation_2.package().entries.len(),
+                GIT_CONNECTOR.connector_schema,
+                TRANSCRIPT_CONNECTOR.connector_schema,
             );
-            format!(
-                "installed generation {} (package digest {}); \
-                 the evidence-admission seam binding this head: {}",
-                witness.generation(),
-                accepted.registry_head.head.package_digest.to_hex(),
-                match bind {
-                    Ok(_) => "ACCEPTED".to_owned(),
-                    Err(error) => format!("REFUSED ({error})"),
-                }
-            )
+            (head, report)
         }
         Ok(GenericSuccessorActivationOutcome::ExactReplay(_)) => {
-            "an exact replay of an activation this run did not perform".to_owned()
+            panic!("a fresh generation-2 activation must insert")
         }
-        Err(error) => format!("REFUSED: {error}"),
+        Err(error) => panic!("the generation-2 activation must succeed: {error}"),
     }
 }
 
@@ -1475,6 +1569,13 @@ async fn live_this_repository_and_this_session_answer_the_operators_two_question
         .iter()
         .map(|row| (row.0.clone(), row.4.clone()))
         .collect();
+    // How many searchable rows had a secret-shaped range removed. Reported so
+    // the recall plane's redaction is a visible number rather than a silent
+    // behaviour.
+    let redacted_rows = body_text
+        .values()
+        .filter(|text| text.contains(REDACTION_PLACEHOLDER))
+        .count();
 
     // The lexical lane is `plainto_tsquery`, which ANDs its terms, so each
     // question is asked as several SHORT probes rather than one long phrase
@@ -1516,23 +1617,25 @@ async fn live_this_repository_and_this_session_answer_the_operators_two_question
             ),
         ],
     };
+    let q2_probes = vec![
+        probe(&reader, &body_text, Q2_COMMIT).await,
+        probe(&reader, &body_text, "3127aac").await,
+        probe(&reader, &body_text, "record-count").await,
+    ];
+    let q2_hits: usize = q2_probes.iter().map(|probe| probe.rows.len()).sum();
     let q2 = AnsweredQuestion {
         question: "Q2. Why did this verification exist? (the rich-demo record-count pin deleted in 3127aac)",
-        probes: vec![
-            probe(&reader, &body_text, Q2_COMMIT).await,
-            probe(&reader, &body_text, "3127aac").await,
-            probe(&reader, &body_text, "record-count").await,
-        ],
+        probes: q2_probes,
         clocks: clock_witness(&memory, Q2_COMMIT).await,
         evidence: vec![
             ("3127aac", evidence_scan(&governed, "3127aac", 4)),
             ("record-count", evidence_scan(&governed, "record-count", 4)),
         ],
         verdict: format!(
-            "**The recall path returned nothing for this question** (see the probes below), so \
-             everything shown here comes from a FULL SCAN of the evidence plane — every governed \
-             content object in the scope, opened and searched. That is not recall; it is what \
-             the memory holds while the index that should reach it does not exist.\n\n\
+            "**The recall path returned {q2_hits} hit(s) across the probes below.** The \
+             evidence-plane scan that follows them is the CONTROL, not the answer: it opens every \
+             governed content object in the scope, so the gap between what it finds and what the \
+             probes return is the measure of the index, not of the memory.\n\n\
              **The transcript-to-commit link is DECLARED, not provider-verified.** At Stage 5 the \
              git connector's `GitDeclaredLinkV1` has exactly one verification state, `declared`: \
              the connector reads a local object store and has no evidence that any agent turn \
@@ -1543,10 +1646,6 @@ async fn live_this_repository_and_this_session_answer_the_operators_two_question
              session that discussed this pin is absent."
         ),
     };
-
-    // The generation-2 step runs LAST: it changes the active head, and what it
-    // proves about the admission seam is part of the report.
-    let generation_two = activate_generation_two(&memory, &fixture).await;
 
     let report = render_report(
         &git,
@@ -1560,9 +1659,10 @@ async fn live_this_repository_and_this_session_answer_the_operators_two_question
         lexical_run.rows_indexed,
         lexical_run.rows_unindexable,
         durable.len(),
+        redacted_rows,
         &q1,
         &q2,
-        &generation_two,
+        &memory.generation_two,
     );
 
     match std::env::var("FLEET_RECALL_DOGFOOD_REPORT") {
@@ -1584,6 +1684,7 @@ fn render_report(
     rows_indexed: u64,
     rows_unindexable: u64,
     durable_blobs: usize,
+    redacted_rows: usize,
     q1: &AnsweredQuestion,
     q2: &AnsweredQuestion,
     generation_two: &str,
@@ -1591,12 +1692,14 @@ fn render_report(
     let mut out = String::new();
     let verdict = verdict_label;
 
-    let _ = writeln!(out, "# W2-DOGFOOD acceptance run\n");
+    let _ = writeln!(out, "# Dogfood acceptance run\n");
     let _ = writeln!(
         out,
         "Generated by `tests/dogfood_live.rs` against a local disposable CockroachDB. \
-         Every number and every quoted row below is system output captured during the run; \
-         nothing here is hand-written from knowledge the system did not have.\n"
+         Every number and every quoted row below is system output captured during THIS run; \
+         nothing measured here is hand-written from knowledge the system did not have. The \
+         diagnosis prose additionally cites the previous run's published figures, which are in \
+         this file's own git history.\n"
     );
 
     let _ = writeln!(out, "## What was ingested\n");
@@ -1682,38 +1785,57 @@ fn render_report(
          be exactly the mistake COVER-01..03 exist to prevent.\n"
     );
 
+    let accepted_total = events_projected + events_unprojectable;
+    let _ = writeln!(
+        out,
+        "## Where the chain now runs, and what still does not\n"
+    );
+    let _ = writeln!(
+        out,
+        "**{events_projected} of {accepted_total} accepted events projected into a body; \
+         {events_unprojectable} did not.** That is the run's most important number, so it is \
+         stated before the answers rather than after them.\n\n\
+         The previous run projected 0 of 980. Two independent breaks caused that, and both are \
+         named here because the fix for each is a design decision a reader should be able to \
+         audit.\n\n\
+         **1. Identity form.** The frozen generation-1 package carries exactly one connector \
+         schema, `connector.github.push`, naming `identity.github.push`, whose identity form is \
+         `occurrence`. `derive_parse_run` requires a VERSION-form resource, because an occurrence \
+         URI names no immutable source-object version to chunk, and refuses closed rather than \
+         mint occurrences against it. Generation 1's own version-form recipe, \
+         `identity.github.commit`, could not be pointed at either: a version locator must name a \
+         parent entity derived under the SAME authority namespace, and a namespace's coordinate \
+         keys must equal its recipe's, so `identity.github.commit` (namespace \
+         `namespace.github.commit`, key `commit_oid`) can never derive its declared `repository` \
+         parent (namespace `namespace.github.repository`, key `provider_repository_id`). This run \
+         therefore ingests under a GENERATION-2 package, activated before anything is ingested, \
+         which carries every generation-1 entry forward byte for byte and adds one closed \
+         version-form identity chain per connector. The parent of a version resource is DERIVED \
+         from the child's own proven coordinates, never supplied by a caller.\n\n\
+         **2. Provider text.** The git connector carries verbatim provider text as `HexBytes`, \
+         because the canonical-JSON profile admits only NFC strings with no control scalars and a \
+         real commit message has newlines. A body therefore holds `\"message\":\"<hex>\"`, and \
+         indexing it verbatim indexed a hex string. The rule taken: **the body stays byte-exact \
+         and the lexical text learns to read it.** The lexical projector now renders a body's \
+         scalar leaves and hex-decodes the byte-string fields its media type declares as text. \
+         The alternative — rendering provider text as canonical strings in the body — was \
+         rejected because it would either reject ordinary commits or rewrite provider bytes, and \
+         either way it would move the body's content address and every chunk-occurrence identity \
+         derived from it. Only the lossy search text changed; `LEXICAL_NORMALIZATION_VERSION` \
+         rose 1 -> 2 so the two texts can never claim the same identity.\n"
+    );
     if events_unprojectable > 0 {
-        let _ = writeln!(out, "## Where the chain breaks\n");
         let _ = writeln!(
             out,
-            "**{events_unprojectable} of {} accepted events could not be projected into a body, \
-             and {events_projected} could.** This is the run's most important result, so it is \
-             stated before the answers rather than after them.\n\n\
-             The generation-1 package's only connector schema, `connector.github.push`, names \
-             `identity.github.push` as its `canonical_resource_identity_recipe`, and that recipe's \
-             `identity_form` is `occurrence`. Both Wave-2 connectors resolve their canonical \
-             resource from that one recipe, so EVERY fact they admit — commit, ref observation, \
-             transcript turn alike — names an occurrence-form resource. \
-             `derive_parse_run` requires a VERSION-form resource, because an occurrence URI names \
-             no immutable source-object version to chunk, and refuses closed rather than mint \
-             occurrences against it.\n\n\
-             The package does contain a version-form recipe (`identity.github.commit`), but no \
-             connector schema in the ACTIVE package points at it. So the connectors and the body \
-             plane are both correct and do not yet meet: at generation 1 there is no path from \
-             ingested evidence to a body, and therefore none to the lexical tier or to recall.\n\n\
-             The run also pins the failure mode this exposed: before this change the projector \
-             failed the whole pass closed on the first such event, which parked the watermark in \
-             front of it permanently and starved every later event. It now advances past an event \
-             it can never chunk and reports the count — it still mints nothing, and the count is a \
-             named field so the gap cannot hide as an absence.\n\n\
-             **A second break sits behind the first.** Even with bodies, the lexical tier could \
-             not word-search a commit message: the git connector carries verbatim provider text \
-             as `HexBytes`, so the canonical body holds `\"message\":\"<hex>\"` and its lexical \
-             text would be a hex string. This report had to hex-decode every commit message it \
-             quotes below, which is the evidence for the claim. Transcript turn text is a plain \
-             canonical string and does not have this problem — so the two connectors do not agree \
-             on how provider text reaches recall either.\n",
-            events_projected + events_unprojectable
+            "**The class that still does not project**, named rather than left as an absence: \
+             {events_unprojectable} event(s). The projector advances past an event it cannot \
+             chunk and reports the count in a named field, so the gap cannot hide; see the \
+             `unprojectable` column above and the counts table for the exact split.\n"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "No accepted event was left unprojectable in this run.\n"
         );
     }
 
@@ -1842,7 +1964,20 @@ fn render_report(
          `scan_secrets` — every transcript outbox row (candidate, locators, payload), every \
          accepted-event canonical record, every projected body, and every lexical text. \
          Findings: **0**. The run asserts this, so a leak fails the test rather than \
-         appearing as a line in a report nobody reads.\n"
+         appearing as a line in a report nobody reads.\n\n\
+         **{redacted_rows} searchable row(s) had a secret-shaped range removed before being \
+         indexed.** That number is here because it is a real finding this run produced, not a \
+         behaviour to leave implicit: this repository's own history contains a commit whose \
+         message quotes a `postgresql://user:pass@host` fixture string. Carried as `HexBytes` it \
+         was invisible to a scanner reading the body; decoding it for search is what made it \
+         readable, and the activated redaction policy says `secrets_allowed_in_recall: false`, \
+         so the recall plane removes it.\n\n\
+         **The residual, stated plainly:** the BODY still holds those bytes, hex-encoded, and \
+         deliberately so — a body is evidence and must reproduce the provider fact exactly. What \
+         was removed is the retrievable copy. Closing the gap at ingress needs a redactor on the \
+         GIT connector, which has none; the transcript connector redacts before its durable \
+         outbox and the git connector does not. That asymmetry is a finding of this run, not a \
+         thing it fixed.\n"
     );
 
     let _ = writeln!(out, "## What this does NOT show\n");
@@ -1867,12 +2002,24 @@ fn render_report(
          - **Lexical only.** No embedding model ran, so `dense_complete` is whatever the \
           readiness block above says, and no hit came from a dense lane.\n\
          - **The evidence-plane scan is not a retrieval capability.** It opens and searches \
-          EVERY governed object in the scope. It answers here because the corpus is small and \
-          the index does not exist; it is not what a memory of any size would do, and its \
-          results must not be read as evidence that recall works.\n\
+          EVERY governed object in the scope. It is kept as the CONTROL — the thing recall is \
+          measured against — not as an answer: it is not what a memory of any size would do, and \
+          its results must never be read as evidence that recall works.\n\
          - **Bodies are canonical fact renderings, not prose.** A body is a connector's \
-          canonical JSON for one provider fact, so a commit message lives inside its fact — \
-          hex-encoded, as above — rather than as a bare message.\n",
+          canonical JSON for one provider fact, so a commit message lives inside its fact as \
+          hex-encoded bytes rather than as a bare message. What changed is the LEXICAL text, \
+          which is a declared-lossy rendering addressed under its own digest domain; the body \
+          bytes and every identity derived from them are untouched.\n\
+         - **Recall hits are lexical, and `plainto_tsquery` ANDs its terms.** A probe that \
+          returns nothing means those exact tokens are not in the index — not that the memory \
+          lacks the fact. An abbreviated object id is a different token from the full one, so a \
+          short-hash probe can miss a body whose full hash it holds.\n\
+         - **A commit message reaching recall is a LEXICAL rendering, not the message.** The \
+          index holds a decoded, whitespace-folded, secret-redacted projection of the body. \
+          Quoting it as the provider's exact bytes would be wrong; the body is where those \
+          live.\n\
+         - **Nothing here is provider-verified.** Every fact is what a local object store and a \
+          local session file said, read by a connector with no provider credential.\n",
         git.commits_walked, git.ref_name
     );
 

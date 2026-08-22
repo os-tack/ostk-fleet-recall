@@ -292,9 +292,23 @@ fn derive_identities(
             .entry_id
             .clone(),
     );
-    let canonical_resource_id =
-        derive_resource_uri(&resource_context, &resource_locator, &resource_recipe, None)?
-            .into_uri();
+    // Re-derived rather than carried: `resource_locator` already names the
+    // parent, but a URI must never be minted against a parent nobody
+    // re-derived. `None` for an entity or occurrence recipe.
+    let resource_parent = derive_version_parent(
+        active.manifest_verified_package(),
+        active.profile(),
+        active.scope(),
+        &resource_recipe,
+        &resource_locator,
+    )?;
+    let canonical_resource_id = derive_resource_uri(
+        &resource_context,
+        &resource_locator,
+        &resource_recipe,
+        resource_parent.as_ref(),
+    )?
+    .into_uri();
     Ok(DerivedIdentitiesV1 {
         instance_locator,
         resource_locator,

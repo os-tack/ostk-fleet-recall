@@ -21,6 +21,11 @@
 //!   addressed under its own digest domain
 //!   ([`DigestDomain::LexicalProjectionTextV1`]) and never under the body's
 //!   content address.
+//! * **No secret is retrievable.** The activated redaction policy says
+//!   `secrets_allowed_in_recall: false`, and the lexical tier is the recall
+//!   index, so every secret-shaped range is replaced before a row is written
+//!   ([`redact_for_recall`]). The body keeps the provider's exact bytes; the
+//!   searchable copy does not.
 //!
 //! # Why the pipeline knows about media types
 //!
@@ -57,6 +62,11 @@ use std::borrow::Cow;
 
 use unicode_normalization::UnicodeNormalization as _;
 
+// The secret scanner and its replacement discipline live beside the transcript
+// connector, which is where they were first needed. They are not
+// transcript-specific: the shapes they match are credentials wherever they
+// appear, and the recall plane needs exactly the same refusal.
+use crate::connectors::transcript::{REDACTION_PLACEHOLDER, RedactionDispositionV1, redact};
 use crate::memory_contracts::digest::{DigestDomain, Sha256Digest, body_digest, framed_digest};
 
 use super::error::{RecallProjectionError, RecallProjectionResult};
@@ -305,6 +315,37 @@ pub fn lexical_text_digest(
     )
 }
 
+/// Strip every secret-shaped range out of the text the recall plane will index.
+///
+/// The activated redaction policy this memory runs under says
+/// `secrets_allowed_in_recall: false`. The lexical tier IS the recall index, so
+/// this is that activated promise enforced at exactly the plane it names.
+///
+/// It matters here and not before because of what rendering does: the git
+/// connector carries verbatim provider bytes as `HexBytes`, so a
+/// credential-shaped commit message is invisible to a scanner reading the body
+/// and visible the moment the text is decoded for search. The dogfood run found
+/// exactly one such commit in this repository's own history — a message quoting
+/// a `postgresql://user:pass@host` fixture string — and it is that decoding, not
+/// this projector, that made it readable.
+///
+/// Residual, recorded rather than hidden: the BODY still holds those bytes, and
+/// deliberately so — a body is evidence and must reproduce the provider fact
+/// exactly. What this removes is the *retrievable* copy. Closing the gap at
+/// ingress needs a redactor on the git connector, which is a connector change,
+/// not a projector one.
+///
+/// A text redaction cannot neutralize (an unredactable class, or a residual
+/// match after replacement) collapses to the placeholder alone: the recall
+/// plane's answer to "this could not be made safe" is to carry no searchable
+/// text from it, never a partial redaction.
+fn redact_for_recall(text: &str) -> String {
+    match redact(text).disposition {
+        RedactionDispositionV1::Stage { text } => text,
+        RedactionDispositionV1::Withhold { .. } => REDACTION_PLACEHOLDER.to_owned(),
+    }
+}
+
 /// Normalize body bytes into the exact text the lexical tier indexes.
 ///
 /// The pipeline, in order:
@@ -316,8 +357,13 @@ pub fn lexical_text_digest(
 ///    other control scalar is dropped, which folds CR/LF, tabs, and stray
 ///    control bytes without depending on the platform's line endings;
 /// 4. runs of spaces collapse and the ends are trimmed;
-/// 5. the result is truncated to [`MAX_LEXICAL_TEXT_BYTES`] on a `char`
+/// 5. every secret-shaped range is replaced ([`redact_for_recall`]);
+/// 6. the result is truncated to [`MAX_LEXICAL_TEXT_BYTES`] on a `char`
 ///    boundary and re-trimmed.
+///
+/// Redaction runs BEFORE truncation because a replacement can be longer than
+/// what it replaces; truncating first could push a redacted row past the
+/// column bound.
 ///
 /// An empty result is `Unindexable(EmptyAfterNormalization)`.
 fn normalize(body_bytes: &[u8]) -> (LexicalStateV1, String) {
@@ -344,6 +390,8 @@ fn normalize(body_bytes: &[u8]) -> (LexicalStateV1, String) {
         }
         normalized.push(character);
     }
+
+    let mut normalized = redact_for_recall(&normalized);
 
     if normalized.len() > MAX_LEXICAL_TEXT_BYTES {
         let mut boundary = MAX_LEXICAL_TEXT_BYTES;
@@ -395,6 +443,7 @@ pub fn derive_lexical_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::transcript::scan_secrets;
 
     /// An undeclared media type: raw-byte normalization, the version-1 path.
     const OPAQUE: &str = "application.octet-stream";
@@ -606,6 +655,52 @@ mod tests {
             lexical_text_digest(LEXICAL_NORMALIZATION_VERSION, LexicalStateV1::Indexed, text),
             body_digest(text.as_bytes())
         );
+    }
+
+    #[test]
+    fn a_credential_shaped_commit_message_never_reaches_the_search_index() {
+        // The leak the dogfood run found, as a unit test. This repository's own
+        // history contains a commit whose message quotes a
+        // `postgresql://user:pass@host` fixture string. Carried as HexBytes it
+        // was invisible to a scanner reading the body; decoded for search it is
+        // a credential shape, and the activated redaction policy says secrets
+        // are not allowed in recall.
+        let message = "corpus fixture: EXPLICIT_URL = \"postgresql://generic:explicit-secret@cluster.example\"";
+        let body = format!(
+            "{{\"kind\":\"commit\",\"message\":\"{}\"}}",
+            hex::encode(message)
+        );
+        let derived = projection_of(GIT_FACT_MEDIA_TYPE, body.as_bytes());
+        assert_eq!(derived.state, LexicalStateV1::Indexed);
+        assert!(!derived.text.contains("explicit-secret"));
+        assert!(derived.text.contains(REDACTION_PLACEHOLDER));
+        // The surrounding prose survives: this is a redaction, not a drop.
+        assert!(derived.text.contains("corpus fixture"));
+        // And the check is not fooled by its own output.
+        assert!(scan_secrets(&derived.text).is_empty());
+    }
+
+    #[test]
+    fn an_unredactable_secret_leaves_no_searchable_text_at_all() {
+        // A private-key block has no dependable end marker, so the redactor
+        // refuses to guess where it stops. The recall plane's answer is to
+        // carry nothing from that body rather than a partial redaction.
+        let body = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK\n";
+        let derived = projection_of(OPAQUE, body.as_bytes());
+        assert_eq!(derived.text, REDACTION_PLACEHOLDER);
+        assert!(scan_secrets(&derived.text).is_empty());
+    }
+
+    #[test]
+    fn redaction_happens_before_truncation_so_a_row_stays_inside_its_bound() {
+        // A replacement is longer than a one-character match, so truncating
+        // first could push a redacted row past the stored column bound.
+        let mut source = "a".repeat(MAX_LEXICAL_TEXT_BYTES - 8);
+        source.push_str(" https://u:p@h ");
+        source.push_str(&"b".repeat(64));
+        let derived = projection_of(OPAQUE, source.as_bytes());
+        assert!(derived.text.len() <= MAX_LEXICAL_TEXT_BYTES);
+        assert!(!derived.text.contains("u:p@h"));
     }
 
     #[test]

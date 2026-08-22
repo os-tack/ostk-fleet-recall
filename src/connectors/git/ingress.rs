@@ -264,7 +264,12 @@ impl GitConnectorBindingV1 {
             self.scope.clone(),
             recipe.recipe().authority_namespace.entry_id.clone(),
         );
-        Ok(derive_resource_uri(&context, locator, recipe, None)?.into_uri())
+        // Re-derived rather than carried: `locator` already names the parent,
+        // but a URI must never be minted against a parent nobody re-derived.
+        // `None` for an entity or occurrence recipe, which have no parent.
+        let parent =
+            derive_version_parent(&self.package, &self.profile, &self.scope, recipe, locator)?;
+        Ok(derive_resource_uri(&context, locator, recipe, parent.as_ref())?.into_uri())
     }
 
     /// Fill the recipe's component rules, and only those, from proven values.
