@@ -245,6 +245,8 @@ const TRANSCRIPT_CONNECTOR_MIGRATION_SQL: &str =
     include_str!("../../migrations/0022_transcript_connector.sql");
 const RECALL_VISIBILITY_MIGRATION_SQL: &str =
     include_str!("../../migrations/0023_recall_visibility.sql");
+const NORMATIVE_ACTIVATION_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0024_normative_activation.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -286,7 +288,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
     ]
 }
 
-fn post_transactional_online_migrations() -> [Migration; 9] {
+fn post_transactional_online_migrations() -> [Migration; 10] {
     [
         Migration::new(
             15,
@@ -365,6 +367,15 @@ fn post_transactional_online_migrations() -> [Migration; 9] {
             // one VECTOR index, and two views. CockroachDB 26.2 cannot build a
             // vector index through its legacy transactional schema changer, so
             // this runs with DDL autocommit like migrations 0001 and 0021.
+            true,
+        ),
+        Migration::new(
+            24,
+            Cow::Borrowed("normative activation head, log, and projection"),
+            MigrationType::Simple,
+            Cow::Borrowed(NORMATIVE_ACTIVATION_MIGRATION_SQL),
+            // W3-NORM. Additive CREATE TABLE/INDEX DDL only; CockroachDB
+            // requires it outside SQLx's transaction wrapper, like 0018-0023.
             true,
         ),
     ]
@@ -3299,7 +3310,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_migrator_registers_mixed_transaction_policy_through_twenty_three() {
+    fn embedded_migrator_registers_mixed_transaction_policy_through_twenty_four() {
         let migrator = embedded_migrator();
         assert_eq!(
             migrator
@@ -3307,7 +3318,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=23).collect::<Vec<_>>()
+            (1..=24).collect::<Vec<_>>()
         );
         assert_eq!(
             migrator
@@ -3315,7 +3326,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.no_tx)
                 .collect::<Vec<_>>(),
-            [vec![true; 11], vec![false; 3], vec![true; 9]].concat()
+            [vec![true; 11], vec![false; 3], vec![true; 10]].concat()
         );
         let control_ledger = migrator
             .migrations
@@ -3369,6 +3380,7 @@ mod tests {
             (21, RECALL_PROJECTION_MIGRATION_SQL, true),
             (22, TRANSCRIPT_CONNECTOR_MIGRATION_SQL, true),
             (23, RECALL_VISIBILITY_MIGRATION_SQL, true),
+            (24, NORMATIVE_ACTIVATION_MIGRATION_SQL, true),
         ] {
             let migration = migrator
                 .migrations
@@ -3392,7 +3404,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=23).collect::<Vec<_>>()
+            (1..=24).collect::<Vec<_>>()
         );
         for version in 10..=23 {
             let migration = pre_transactional
@@ -3416,7 +3428,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=23).collect::<Vec<_>>()
+            (1..=24).collect::<Vec<_>>()
         );
         for migration in transactional.migrations.iter() {
             let expected_type = if migration.version >= 15 {
