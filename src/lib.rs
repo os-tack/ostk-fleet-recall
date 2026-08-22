@@ -8,6 +8,7 @@
 #![recursion_limit = "256"]
 
 pub mod application;
+pub mod body_store;
 pub mod config;
 pub mod context;
 pub mod control_log;
