@@ -19,6 +19,7 @@ pub mod ledger;
 pub mod mcp;
 pub mod memory_contracts;
 pub mod private_postgres;
+pub mod projectors;
 pub mod reference_agent;
 pub mod registry_activation;
 pub mod registry_witness;
