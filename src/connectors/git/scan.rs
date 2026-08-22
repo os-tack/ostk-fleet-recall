@@ -893,16 +893,14 @@ author A <a@b.test> 1755259200 +0000\n\
         // reader has no bytes for; answering with the object id anyway would
         // let an observer claim it read a file it never read.
         for kind in ["tree", "commit", "tag"] {
-            let record =
-                format!("040000 {kind} 3333333333333333333333333333333333333333\tsrc\0");
+            let record = format!("040000 {kind} 3333333333333333333333333333333333333333\tsrc\0");
             assert!(parse_ls_tree(record.as_bytes()).is_err(), "{kind}");
         }
     }
 
     #[test]
     fn a_tree_record_with_trailing_metadata_is_refused() {
-        let stdout =
-            b"100644 blob 1111111111111111111111111111111111111111 extra\ta.rs\0".to_vec();
+        let stdout = b"100644 blob 1111111111111111111111111111111111111111 extra\ta.rs\0".to_vec();
         assert!(parse_ls_tree(&stdout).is_err());
     }
 

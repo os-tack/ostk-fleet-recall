@@ -77,10 +77,13 @@ pub mod receipt;
 pub mod source;
 
 pub use admission::{
-    ADMISSION_ENUMERATION_ALGORITHM, ObserverAdmissionBindingV1, dependency_closure_digest,
+    ADMISSION_ENUMERATION_ALGORITHM, ObserverAdmissionBindingV1, ObserverRuntimeDeclarationV1,
+    dependency_closure_digest, remember_basis_is_package_governed,
     require_remember_basis_is_package_governed,
 };
-pub use drain::{ObserverDrainContextV1, ObserverRunOutcomeV1, drain_observer_run};
+pub use drain::{
+    ObserverAppendDispositionV1, ObserverDrainContextV1, ObserverRunOutcomeV1, drain_observer_run,
+};
 pub use enumeration::{
     ALL_DIAGNOSTICS, ENUMERATION_ALGORITHM_ID, MAX_MEMBER_BOUND, RustEnumEnumerationV1,
     SET_PRESERVING_ATTRIBUTES, enumerate_rust_enum,
@@ -94,4 +97,6 @@ pub use receipt::{
     MAX_OBSERVED_SOURCE_BYTES, ObserverQuestionV1, ObserverRunPlanV1, ObserverRunRecordV1,
     build_observer_run,
 };
-pub use source::{ObservedSourceV1, ObserverSourcePinV1, bind_observed_source};
+pub use source::{
+    ObservedSourceV1, ObserverSourcePinV1, bind_observed_source, source_content_digest,
+};

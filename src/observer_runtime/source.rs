@@ -12,7 +12,8 @@
 //! Three separate disagreements, three separate refusals:
 //!
 //! * **`ls-tree` resolves the path to a different blob.** This is the
-//!   adversarial case the DoD names: the same claimed commit, a different
+//!   adversarial case the definition of done names: the same claimed commit,
+//!   a different
 //!   blob. [`ObserverRuntimeError::BlobIdMismatch`].
 //! * **The bytes do not hash to the object id they were read under.** A store
 //!   that answers a request for blob B with other bytes is lying about the
@@ -38,6 +39,8 @@
 //! observation is about, which is precisely the ambiguity the receipt exists
 //! to remove.
 
+use std::str::FromStr as _;
+
 use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY};
 
 use crate::connectors::git::{
@@ -46,6 +49,7 @@ use crate::connectors::git::{
 };
 use crate::memory_contracts::common::{CanonicalDecimal, CanonicalTimestamp, HexBytes};
 use crate::memory_contracts::digest::{DigestDomain, Sha256Digest, framed_digest};
+use crate::memory_contracts::identity::ResourceUri;
 
 use super::error::{ObserverRuntimeError, ObserverRuntimeResult};
 
@@ -139,6 +143,35 @@ pub fn source_content_digest(bytes: &[u8]) -> Sha256Digest {
     framed_digest(DigestDomain::ObserverSourceBlobV1, &[bytes])
 }
 
+/// Resource kind of an observed source revision.
+const OBSERVED_REVISION_RESOURCE_KIND: &str = "commit";
+
+impl ObservedSourceV1 {
+    /// The version-form resource URI naming exactly what this run read.
+    ///
+    /// This is deliberately NOT derived through an activated identity recipe,
+    /// and the reason is worth stating rather than assuming. The frozen
+    /// package's only version-form recipe, `identity.github.commit`, hashes
+    /// `commit_oid` alone: a URI derived under it names the COMMIT, which is
+    /// exactly the "the source at that revision" ambiguity a run receipt
+    /// exists to remove — two different files at one commit would share one
+    /// identity, and a store answering with a different object in the same
+    /// commit's tree would be indistinguishable. (That recipe also has no
+    /// entity-parent recipe inside its own authority namespace in the frozen
+    /// package, so it cannot mint a version URI there at all.)
+    ///
+    /// So the observed revision is content-addressed over the whole pinned
+    /// coordinate set — repository, commit, path, blob object id, and blob
+    /// content digest — through [`Self::input_digest`]. Change any one of them
+    /// and this URI changes, which is the property the receipt actually needs.
+    pub fn observed_revision_uri(&self) -> ObserverRuntimeResult<ResourceUri> {
+        Ok(ResourceUri::from_str(&format!(
+            "urn:ostk:version:v1:{OBSERVED_REVISION_RESOURCE_KIND}:sha256:{}",
+            self.input_digest()
+        ))?)
+    }
+}
+
 /// Read the pinned blob, and refuse unless every pinned coordinate holds.
 ///
 /// `max_bytes` bounds the blob this runtime will read into memory; a blob over
@@ -188,7 +221,7 @@ pub fn bind_observed_source(
         // two to disagree about.
         byte_length: CanonicalDecimal::parse(bytes.len().to_string())?,
         blob_id: pin.blob_id.clone(),
-        committed_at: commit.committer.at.clone(),
+        committed_at: commit.committer.at,
     };
     GitFactV1::BlobSource(fact.clone()).validate()?;
     Ok(ObservedSourceV1 {
@@ -206,10 +239,7 @@ pub fn bind_observed_source(
 /// with a different function, so for those ids this check is skipped and the
 /// pinned `ostk-observer-source-blob-v1` content digest — which is enforced
 /// unconditionally — carries the integrity claim alone.
-fn require_git_object_integrity(
-    blob_id: &GitObjectId,
-    bytes: &[u8],
-) -> ObserverRuntimeResult<()> {
+fn require_git_object_integrity(blob_id: &GitObjectId, bytes: &[u8]) -> ObserverRuntimeResult<()> {
     let hex = blob_id.to_hex();
     if hex.len() != SHA1_OBJECT_ID_HEX_LEN {
         return Ok(());
@@ -251,6 +281,8 @@ pub fn pinned_repository(reader: &GitRepositoryReader) -> GitRepositoryIdV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_contracts::common::ContractId;
+    use crate::memory_contracts::identity::IdentityForm;
 
     fn blob_id_of(bytes: &[u8]) -> String {
         let mut context = Context::new(&SHA1_FOR_LEGACY_USE_ONLY);
@@ -288,6 +320,47 @@ mod tests {
     fn a_sha256_object_id_skips_the_sha1_check_rather_than_running_the_wrong_one() {
         let sha256_id = GitObjectId::parse_hex(&hex::encode([0x11_u8; 32])).unwrap();
         require_git_object_integrity(&sha256_id, b"anything").unwrap();
+    }
+
+    #[test]
+    fn the_observed_revision_uri_is_version_form_and_names_the_whole_pin() {
+        let repository =
+            GitRepositoryIdV1::from_trusted_config(ContractId::new("git.repo.t").unwrap(), 7)
+                .unwrap();
+        let build = |blob_seed: u8, content: &[u8]| ObservedSourceV1 {
+            fact: GitBlobSourceFactV1 {
+                schema_version: GIT_FACT_SCHEMA_VERSION,
+                repository: repository.clone(),
+                commit_id: GitObjectId::parse_hex(&hex::encode([0x11_u8; 20])).unwrap(),
+                tree_id: GitObjectId::parse_hex(&hex::encode([0x22_u8; 20])).unwrap(),
+                path: HexBytes::new(b"service.rs".to_vec()).unwrap(),
+                mode: crate::connectors::git::GitFileModeV1::Regular,
+                byte_length: CanonicalDecimal::parse(content.len().to_string()).unwrap(),
+                blob_id: GitObjectId::parse_hex(&hex::encode([blob_seed; 20])).unwrap(),
+                committed_at: CanonicalTimestamp::parse("2026-08-15T12:00:00.000000000Z").unwrap(),
+            },
+            bytes: content.to_vec(),
+            content_digest: source_content_digest(content),
+        };
+        let one = build(0x33, b"a");
+        assert_eq!(
+            one.observed_revision_uri().unwrap().identity_form(),
+            IdentityForm::Version
+        );
+        // A different blob at the same commit is a different revision, and so
+        // is the same blob id carrying different bytes.
+        assert_ne!(
+            one.observed_revision_uri().unwrap(),
+            build(0x44, b"a").observed_revision_uri().unwrap()
+        );
+        assert_ne!(
+            one.observed_revision_uri().unwrap(),
+            build(0x33, b"b").observed_revision_uri().unwrap()
+        );
+        assert_eq!(
+            one.observed_revision_uri().unwrap(),
+            build(0x33, b"a").observed_revision_uri().unwrap()
+        );
     }
 
     #[test]

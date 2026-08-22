@@ -54,9 +54,11 @@ use crate::memory_contracts::digest::{DigestDomain, Sha256Digest, framed_digest}
 
 use super::error::{ObserverRuntimeError, ObserverRuntimeResult};
 
-/// Identity of the algorithm this module implements. It is part of the
-/// admission body, so changing the scanner means a new algorithm id and a new
-/// governance decision, not a silent behaviour change under the same one.
+/// Identity of the algorithm this module implements.
+///
+/// It is part of the admission body, so changing the scanner means a new
+/// algorithm id and a new governance decision, not a silent behaviour change
+/// under the same one.
 pub const ENUMERATION_ALGORITHM_ID: &str = "enumeration.rust-enum-brace-scan.v1";
 
 /// The enum declares `#[non_exhaustive]`, so the source itself says the set is
@@ -140,7 +142,7 @@ impl RustEnumEnumerationV1 {
     /// and the reasons it might be wrong are one value, so a caller cannot
     /// keep the claim and drop the reasons.
     #[must_use]
-    pub fn exhaustive(&self) -> bool {
+    pub const fn exhaustive(&self) -> bool {
         self.diagnostics.is_empty()
     }
 
@@ -164,7 +166,8 @@ impl RustEnumEnumerationV1 {
         } else {
             b"non-exhaustive"
         };
-        let mut parts: Vec<&[u8]> = Vec::with_capacity(self.diagnostics.len() + self.members.len() + 4);
+        let mut parts: Vec<&[u8]> =
+            Vec::with_capacity(self.diagnostics.len() + self.members.len() + 4);
         parts.push(ENUMERATION_ALGORITHM_ID.as_bytes());
         parts.push(self.enum_name.as_bytes());
         parts.push(verdict);
@@ -906,8 +909,7 @@ mod tests {
 
     #[test]
     fn a_struct_variant_brace_does_not_terminate_the_body() {
-        let enumeration =
-            enumerate("pub enum Action {\n    Record { at: u64 },\n    Assert,\n}\n");
+        let enumeration = enumerate("pub enum Action {\n    Record { at: u64 },\n    Assert,\n}\n");
         assert_eq!(enumeration.members(), ["Record", "Assert"]);
         assert!(!enumeration.exhaustive());
     }
@@ -936,7 +938,11 @@ mod tests {
         // The bounded read cannot even see the member the full read finds, so
         // "absent" from it is exactly the claim that must never verify.
         assert!(!bounded.contains("Retract"));
-        assert!(enumerate_rust_enum(source, "Action", 3).unwrap().contains("Retract"));
+        assert!(
+            enumerate_rust_enum(source, "Action", 3)
+                .unwrap()
+                .contains("Retract")
+        );
     }
 
     #[test]
@@ -1004,8 +1010,8 @@ mod tests {
 
     #[test]
     fn an_unterminated_body_is_refused() {
-        let error = enumerate_rust_enum("pub enum Action {\n    Record,\n", "Action", 8)
-            .unwrap_err();
+        let error =
+            enumerate_rust_enum("pub enum Action {\n    Record,\n", "Action", 8).unwrap_err();
         assert!(matches!(
             error,
             ObserverRuntimeError::EnumBodyUnterminated(_)
@@ -1031,15 +1037,16 @@ mod tests {
     #[test]
     fn output_digest_separates_members_diagnostics_and_exhaustiveness() {
         let plain = enumerate("pub enum Action { Record, Assert }");
-        let gated = enumerate(
-            "pub enum Action {\n    Record,\n    #[cfg(unix)]\n    Assert,\n}\n",
-        );
+        let gated = enumerate("pub enum Action {\n    Record,\n    #[cfg(unix)]\n    Assert,\n}\n");
         assert_eq!(plain.members(), gated.members());
         assert_ne!(plain.output_digest(), gated.output_digest());
 
         let reordered = enumerate("pub enum Action { Assert, Record }");
         assert_ne!(plain.output_digest(), reordered.output_digest());
-        assert_eq!(plain.output_digest(), enumerate("pub enum Action { Record, Assert }").output_digest());
+        assert_eq!(
+            plain.output_digest(),
+            enumerate("pub enum Action { Record, Assert }").output_digest()
+        );
     }
 
     #[test]

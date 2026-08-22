@@ -8,9 +8,12 @@
 //! it cannot discharge the proof itself. This module is the one place in the
 //! crate that discharges it, and the chain runs:
 //!
-//! 1. The deployment pins a bootstrap receipt digest out of band. The head
-//!    witness ([`crate::registry_witness::WriterAuthorityWitness`]) exists only
-//!    after that pin, the durable log epoch, and the active head all agree.
+//! 1. The deployment pins a bootstrap receipt digest out of band.
+//!    [`VerifiedBootstrapReceipt`] has private fields and is minted only by
+//!    `verify_pinned_bootstrap`, i.e. only after that out-of-band pin, the
+//!    signatures, and the signer threshold all check out. It cannot be
+//!    fabricated by a caller, which is why it is the argument here rather
+//!    than a bare digest.
 //! 2. That receipt's statement names one
 //!    `genesis_registry_package_digest`. A supplied
 //!    [`SemanticallyClosedGenesisPackage`] whose own recomputed digest is not
@@ -43,6 +46,7 @@
 //! leaves no receipt and no event.
 
 use crate::evidence_ledger::ActiveStage4Package;
+use crate::memory_contracts::bootstrap::VerifiedBootstrapReceipt;
 use crate::memory_contracts::common::{ContractId, RegistryReferenceV1};
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::genesis::{
@@ -51,17 +55,19 @@ use crate::memory_contracts::genesis::{
 };
 use crate::memory_contracts::observer::{
     AdmittedObserverV1, ObserverAdmissionModeV1, ObserverAdmissionV2,
+    ObserverEnumerationAlgorithmV1, ObserverExecutableIdentityV1, ObserverInputDomainV1,
+    ObserverOutcomeKindV1, ObserverToolchainVersionsV1,
 };
 use crate::memory_contracts::registry::{RegistryEntryKind, RegistryEntryV1};
 use crate::memory_contracts::remember_v2::RememberAdmissionRuleV2;
-use crate::registry_witness::WriterAuthorityWitness;
 
 use super::enumeration::{ALL_DIAGNOSTICS, ENUMERATION_ALGORITHM_ID};
 use super::error::{ObserverRuntimeError, ObserverRuntimeResult};
 
-/// The enumeration algorithm this runtime is admitted to run, as a contract
-/// id. Kept beside the admission binding so a reader can see in one place that
-/// the algorithm the receipt names is the algorithm the code implements.
+/// The enumeration algorithm this runtime is admitted to run.
+///
+/// Kept beside the admission binding so a reader can see in one place that the
+/// algorithm the receipt names is the algorithm the code implements.
 pub const ADMISSION_ENUMERATION_ALGORITHM: &str = ENUMERATION_ALGORITHM_ID;
 
 /// One observer admission, proven to be the activated one.
@@ -99,13 +105,12 @@ impl ObserverAdmissionBindingV1 {
     /// admission it was not granted is exactly the self-admission AUTH-03
     /// forbids.
     pub fn resolve(
-        witness: &WriterAuthorityWitness,
+        bootstrap: &VerifiedBootstrapReceipt,
         genesis: &SemanticallyClosedGenesisPackage,
         declared: ObserverAdmissionV2,
     ) -> ObserverRuntimeResult<Self> {
         declared.validate_shape()?;
-        let pinned = witness
-            .bootstrap()
+        let pinned = bootstrap
             .receipt()
             .statement
             .genesis_registry_package_digest;
@@ -142,10 +147,25 @@ impl ObserverAdmissionBindingV1 {
 pub fn require_remember_basis_is_package_governed(
     active: &ActiveStage4Package,
 ) -> ObserverRuntimeResult<()> {
-    for entry in active.registry_entries() {
+    remember_basis_is_package_governed(active.registry_entries())
+}
+
+/// The pure predicate behind [`require_remember_basis_is_package_governed`].
+///
+/// Split out so the rule can be exercised against hand-built entries without
+/// a database: the interesting case is the one a live deployment is not
+/// supposed to reach.
+pub fn remember_basis_is_package_governed(
+    entries: &[RegistryEntryV1],
+) -> ObserverRuntimeResult<()> {
+    for entry in entries {
         if entry.kind != RegistryEntryKind::AuthorityRule {
             continue;
         }
+        // A body that does not decode as a remember admission rule says
+        // nothing about the remember basis; an authority rule of some other
+        // shape is not evidence either way, so it is skipped rather than
+        // treated as permission.
         let Ok(rule) = decode_remember_rule(entry) else {
             continue;
         };
@@ -154,6 +174,103 @@ pub fn require_remember_basis_is_package_governed(
         }
     }
     Ok(())
+}
+
+/// Deployment configuration for one observer runtime instance.
+///
+/// Everything here is stated by the operator, and every field the activated
+/// registry entry also decides is CHECKED against it by
+/// [`ObserverAdmissionBindingV1::resolve`]. That is the point of the split: a
+/// misconfigured runtime is refused rather than admitted under whatever it
+/// happened to declare, and the fields the generation-1 entry shape does not
+/// carry are still bound into the admission digest every result event names.
+#[derive(Debug, Clone)]
+pub struct ObserverRuntimeDeclarationV1 {
+    /// The admission id and version this runtime claims to run as.
+    pub admission_id: ContractId,
+    /// The admission version.
+    pub version: u32,
+    /// The observer kind. Never `llm` or `semantic_search` for a verified
+    /// mode: the contract forces those to `candidate_only`.
+    pub observer_kind: ContractId,
+    /// The executable artifact digest governance pinned.
+    pub executable_digest: Sha256Digest,
+    /// The dependency closure digest governance pinned.
+    pub dependency_closure_pin: Sha256Digest,
+    /// The configuration context digest governance pinned.
+    pub configuration_context_digest: Sha256Digest,
+    /// The admission mode governance granted.
+    pub mode: ObserverAdmissionModeV1,
+    /// The predicate this observer is admitted for.
+    pub predicate: RegistryReferenceV1,
+    /// The closed input boundary this observer reads.
+    pub input_domain: ObserverInputDomainV1,
+    /// The toolchain identifiers closed into the proof.
+    pub toolchain_versions: ObserverToolchainVersionsV1,
+    /// The coverage-receipt recipe the run receipt's witness is built under.
+    pub coverage_receipt_recipe: RegistryReferenceV1,
+    /// Positive conformance vector digest.
+    pub positive_vector_digest: Sha256Digest,
+    /// Negative conformance vector digest.
+    pub negative_vector_digest: Sha256Digest,
+    /// Mutation conformance vector digest.
+    pub mutation_vector_digest: Sha256Digest,
+    /// Adversarial conformance vector digest.
+    pub adversarial_vector_digest: Sha256Digest,
+}
+
+impl ObserverRuntimeDeclarationV1 {
+    /// Render the declaration as the v2 admission body.
+    ///
+    /// The enumeration algorithm id and its registered diagnostics come from
+    /// the CODE, not from configuration: the set of constructs this observer
+    /// knows it might not understand is a property of the scanner, and letting
+    /// an operator shorten it would let a deployment quietly claim more
+    /// exhaustiveness than the algorithm can deliver.
+    pub fn to_admission(&self) -> ObserverRuntimeResult<ObserverAdmissionV2> {
+        let mut diagnostics = ALL_DIAGNOSTICS.to_vec();
+        diagnostics.sort_unstable();
+        let admission = ObserverAdmissionV2 {
+            schema_version: 1,
+            admission_id: self.admission_id.clone(),
+            version: self.version,
+            identity: ObserverExecutableIdentityV1 {
+                observer_kind: self.observer_kind.clone(),
+                executable_digest: self.executable_digest,
+                dependency_digests: dependency_closure_digest(self.dependency_closure_pin),
+                version: self.version,
+            },
+            predicate: self.predicate.clone(),
+            input_domain: self.input_domain.clone(),
+            configuration_context_digest: self.configuration_context_digest,
+            toolchain_versions: self.toolchain_versions.clone(),
+            mode: self.mode,
+            enumeration_algorithm: ObserverEnumerationAlgorithmV1 {
+                algorithm_id: ContractId::new(ADMISSION_ENUMERATION_ALGORITHM)?,
+                unsupported_feature_diagnostics: diagnostics
+                    .into_iter()
+                    .map(ContractId::new)
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+            // The closed set of outcome kinds this runtime can honestly
+            // report. `parse_failure` is absent because a source this runtime
+            // cannot read is refused before a receipt exists, and `stale` is
+            // absent because an immutable blob named by object id has no
+            // newer version to be stale against.
+            declared_outcome_kinds: vec![
+                ObserverOutcomeKindV1::Success,
+                ObserverOutcomeKindV1::Partial,
+                ObserverOutcomeKindV1::Timeout,
+            ],
+            coverage_receipt_recipe: self.coverage_receipt_recipe.clone(),
+            positive_vector_digest: self.positive_vector_digest,
+            negative_vector_digest: self.negative_vector_digest,
+            mutation_vector_digest: self.mutation_vector_digest,
+            adversarial_vector_digest: self.adversarial_vector_digest,
+        };
+        admission.validate_shape()?;
+        Ok(admission)
+    }
 }
 
 /// Decode one authority-rule entry body as a remember admission rule.
@@ -258,7 +375,9 @@ fn require_declaration_matches_activation(
         ));
     }
     if declared.mode != map_admission_mode(activated.admission_mode()) {
-        return Err(ObserverRuntimeError::AdmissionDisagreement("admission mode"));
+        return Err(ObserverRuntimeError::AdmissionDisagreement(
+            "admission mode",
+        ));
     }
     if declared.predicate != *activated.predicate_schema() {
         return Err(ObserverRuntimeError::AdmissionDisagreement(
@@ -328,6 +447,67 @@ mod tests {
             map_admission_mode(GenesisObserverAdmissionModeV1::ClosedWorldVerified),
             ObserverAdmissionModeV1::PositiveVerified
         );
+    }
+
+    use crate::memory_contracts::canonical::{decode_strict, encode_canonical};
+    use crate::memory_contracts::registry::ManifestVerifiedRegistryPackage;
+
+    const STAGE4_PACKAGE: &[u8] =
+        include_bytes!("../../contracts/dynamic-memory/v2/stage4-successor/registry-package.jsonl");
+
+    fn stage4_entries() -> Vec<RegistryEntryV1> {
+        let body = STAGE4_PACKAGE
+            .strip_suffix(b"\n")
+            .expect("contract JSONL carries exactly one framing LF");
+        let profile = crate::memory_contracts::common::frozen_profile_reference_v1();
+        ManifestVerifiedRegistryPackage::decode(body, &profile)
+            .expect("the frozen package must decode")
+            .package()
+            .entries
+            .clone()
+    }
+
+    #[test]
+    fn the_frozen_active_package_does_not_let_a_run_change_the_remember_basis() {
+        remember_basis_is_package_governed(&stage4_entries()).unwrap();
+    }
+
+    #[test]
+    fn a_package_that_enables_registered_observer_appends_refuses_the_run() {
+        let mut entries = stage4_entries();
+        let rule_entry = entries
+            .iter_mut()
+            .find(|entry| entry.kind == RegistryEntryKind::AuthorityRule)
+            .expect("the frozen package has a remember admission rule");
+        let bytes = crate::memory_contracts::canonical::canonical_bytes(&rule_entry.body).unwrap();
+        let mut rule: RememberAdmissionRuleV2 = decode_strict(&bytes).unwrap();
+        assert!(
+            !rule.registered_observer_append_enabled,
+            "the frozen rule must start closed, or this test proves nothing"
+        );
+        rule.registered_observer_append_enabled = true;
+        rule_entry.body = decode_strict(&encode_canonical(&rule).unwrap()).unwrap();
+
+        let error = remember_basis_is_package_governed(&entries).unwrap_err();
+        assert!(
+            matches!(error, ObserverRuntimeError::RunWouldChangeRememberBasis),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_authority_rule_of_another_shape_is_not_read_as_permission() {
+        // A body that does not decode as a remember admission rule must be
+        // skipped, not treated as either grant or denial: an unrelated
+        // authority rule says nothing about the remember basis.
+        let mut entries = stage4_entries();
+        let rule_entry = entries
+            .iter_mut()
+            .find(|entry| entry.kind == RegistryEntryKind::AuthorityRule)
+            .expect("the frozen package has a remember admission rule");
+        rule_entry.body =
+            decode_strict(br#"{"unrelated":true}"#.as_slice()).expect("canonical object");
+        remember_basis_is_package_governed(&entries).unwrap();
     }
 
     #[test]

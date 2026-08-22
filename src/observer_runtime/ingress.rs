@@ -113,7 +113,6 @@ pub struct ObserverConnectorBindingV1 {
     package: ManifestVerifiedRegistryPackage,
     provider_instance_recipe: ValidatedIdentityRecipe,
     canonical_resource_recipe: ValidatedIdentityRecipe,
-    source_version_recipe: ValidatedIdentityRecipe,
     scope: AuthenticatedProjectScopeV1,
     profile: ProfileReferenceV1,
     principal_id: ContractId,
@@ -122,22 +121,13 @@ pub struct ObserverConnectorBindingV1 {
 }
 
 impl ObserverConnectorBindingV1 {
-    /// Resolve the connector, both connector recipes, and the version-form
-    /// recipe the run receipt's `source_version` is derived through.
-    ///
-    /// `source_version_recipe_id` names a recipe that must already be in the
-    /// activated package — it is selected, never introduced. It is separate
-    /// from the connector's own canonical-resource recipe because that recipe
-    /// is occurrence-form (it names the delivery), while a run receipt's
-    /// `source_version` must be version-form: it names the revision that was
-    /// read, which is exactly what `identity.github.commit` is for.
+    /// Resolve the connector and both of its identity recipes out of the
+    /// package the active head activated.
     pub fn resolve(
         active: &ActiveStage4Package,
         principal_id: ContractId,
         connector_instance_id: ContractId,
         installation_id: u64,
-        source_version_recipe_id: &ContractId,
-        source_version_recipe_version: u32,
     ) -> GitIngressResult<Self> {
         let manifest = active.manifest_verified_package();
         let connector = active.connector().clone();
@@ -151,18 +141,11 @@ impl ObserverConnectorBindingV1 {
             &connector.schema().canonical_resource_identity_recipe,
             "canonical resource",
         )?;
-        let source_version_recipe = ValidatedIdentityRecipe::from_package(
-            manifest,
-            source_version_recipe_id,
-            source_version_recipe_version,
-        )
-        .map_err(|_| GitIngressError::RecipeNotInActivePackage("source version"))?;
         Ok(Self {
             connector,
             package: manifest.clone(),
             provider_instance_recipe,
             canonical_resource_recipe,
-            source_version_recipe,
             scope: active.scope().clone(),
             profile: active.profile().clone(),
             principal_id,
@@ -189,23 +172,6 @@ impl ObserverConnectorBindingV1 {
         &self.connector_instance_id
     }
 
-    /// The version-form resource URI naming one observed commit.
-    ///
-    /// Derived through the ACTIVATED recipe, so the URI a receipt reports is
-    /// the one the registry's own identity rules produce for that revision —
-    /// not a digest this runtime invented and called a URI.
-    pub fn source_version_uri(&self, commit_oid: &[u8]) -> GitIngressResult<ResourceUri> {
-        let locator = self.locator(
-            &self.source_version_recipe,
-            &ProvenCoordinates {
-                immutable_revision: commit_oid,
-                provider_object_id: commit_oid,
-                commit_oid: Some(commit_oid),
-            },
-        )?;
-        self.derive(&self.source_version_recipe, &locator)
-    }
-
     /// Build one ingress from one observer run record.
     pub fn build_ingress(
         &self,
@@ -222,7 +188,6 @@ impl ObserverConnectorBindingV1 {
         let coordinates = ProvenCoordinates {
             immutable_revision: immutable_revision.as_bytes(),
             provider_object_id: provider_object_id.as_bytes(),
-            commit_oid: None,
         };
         let instance_locator = self.locator(&self.provider_instance_recipe, &coordinates)?;
         let provider_instance_id =
@@ -356,7 +321,6 @@ impl ObserverConnectorBindingV1 {
 struct ProvenCoordinates<'run> {
     immutable_revision: &'run [u8],
     provider_object_id: &'run [u8],
-    commit_oid: Option<&'run [u8]>,
 }
 
 /// The one place a locator coordinate is filled.
@@ -385,10 +349,6 @@ fn proven_locator_component(
             installation_id.as_str().to_owned(),
             LocatorEncoding::Decimal,
         )),
-        "commit_oid" => coordinates.commit_oid.map_or_else(
-            || Err(GitIngressError::UnsupportedLocatorComponent(key.to_owned())),
-            |oid| Ok((hex::encode(oid), LocatorEncoding::HexBytes)),
-        ),
         _ => Err(GitIngressError::UnsupportedLocatorComponent(key.to_owned())),
     }
 }
@@ -449,7 +409,6 @@ mod tests {
         ProvenCoordinates {
             immutable_revision: b"\x01\x02",
             provider_object_id: b"\x03\x04",
-            commit_oid: None,
         }
     }
 
@@ -483,25 +442,12 @@ mod tests {
     #[test]
     fn a_coordinate_this_runtime_cannot_prove_is_refused_not_guessed() {
         for key in ["provider_repository_id", "commit_oid", "anything_else"] {
-            let error =
-                proven_locator_component(key, &installation(), &coordinates()).unwrap_err();
+            let error = proven_locator_component(key, &installation(), &coordinates()).unwrap_err();
             assert!(
                 matches!(error, GitIngressError::UnsupportedLocatorComponent(named) if named == key),
                 "{key}"
             );
         }
-    }
-
-    #[test]
-    fn a_commit_coordinate_is_fillable_only_when_a_commit_is_in_hand() {
-        let with_commit = ProvenCoordinates {
-            commit_oid: Some(b"\xaa\xbb"),
-            ..coordinates()
-        };
-        assert_eq!(
-            proven_locator_component("commit_oid", &installation(), &with_commit).unwrap(),
-            ("aabb".to_owned(), LocatorEncoding::HexBytes)
-        );
     }
 
     #[test]

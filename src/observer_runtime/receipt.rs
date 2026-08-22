@@ -315,13 +315,12 @@ fn input_accounting(enumeration: &RustEnumEnumerationV1) -> ObserverInputAccount
 /// A fabricated URI would be indistinguishable from a derived one, so the
 /// count carries the accounting alone and the members themselves are carried
 /// in the run record beside the receipt.
-const fn tally(total: usize) -> ObserverInputTallyV1 {
+fn tally(total: usize) -> ObserverInputTallyV1 {
     ObserverInputTallyV1 {
-        total_count: if total > u32::MAX as usize {
-            u32::MAX
-        } else {
-            total as u32
-        },
+        // Saturating rather than wrapping: an accounting that wrapped to a
+        // small number would understate a gap, and understating a gap is the
+        // one arithmetic error that could turn an unknown into a verdict.
+        total_count: u32::try_from(total).unwrap_or(u32::MAX),
         sample: Vec::new(),
     }
 }
@@ -333,7 +332,7 @@ const fn tally(total: usize) -> ObserverInputTallyV1 {
 /// this observer: its input domain is one immutable git blob named by object
 /// id, so there is no newer version of the thing it read that it could be
 /// stale relative to.
-fn coverage_witness(
+const fn coverage_witness(
     enumeration: &RustEnumEnumerationV1,
     plan: &ObserverRunPlanV1,
 ) -> ObserverCoverageWitnessV1 {
@@ -355,7 +354,7 @@ fn coverage_witness(
 /// `parse_failure`: this runtime refuses a source it cannot read rather than
 /// reporting a run over it, so a receipt that exists is a receipt whose source
 /// parsed.
-fn run_outcome(enumeration: &RustEnumEnumerationV1) -> ObserverOutcomeKindV1 {
+const fn run_outcome(enumeration: &RustEnumEnumerationV1) -> ObserverOutcomeKindV1 {
     if enumeration.exhaustive() {
         ObserverOutcomeKindV1::Success
     } else {
@@ -364,6 +363,12 @@ fn run_outcome(enumeration: &RustEnumEnumerationV1) -> ObserverOutcomeKindV1 {
 }
 
 /// The enum name as a contract id.
+///
+/// `ContractId` is lowercase by construction, so the record's `enum_name`
+/// field is a case-folded label. The MEMBERS are stored verbatim in
+/// [`ObserverRunRecordV1::members`] and framed verbatim into the output
+/// digest, so nothing about the actual finding is case-folded — only the label
+/// that says which item was read.
 fn enum_name_id(enum_name: &str) -> ObserverRuntimeResult<ContractId> {
     Ok(ContractId::new(enum_name.to_ascii_lowercase())?)
 }
