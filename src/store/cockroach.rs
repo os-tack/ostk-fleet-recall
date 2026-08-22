@@ -3428,7 +3428,7 @@ mod tests {
         }
     }
 
-    async fn assert_exact_successful_migration_prefix_through_eighteen(pool: &PgPool) {
+    async fn assert_exact_successful_migration_prefix(pool: &PgPool) {
         let actual = sqlx::query_as::<_, (i64, bool, Vec<u8>)>(
             "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version",
         )
@@ -3508,7 +3508,7 @@ mod tests {
         .unwrap();
 
         store.migrate().await.unwrap();
-        assert_exact_successful_migration_prefix_through_eighteen(store.pool()).await;
+        assert_exact_successful_migration_prefix(store.pool()).await;
         assert_online_projection_indexes_are_covering(store.pool()).await;
 
         // Process death after both backfills but before either SQLx history row.
@@ -3517,7 +3517,7 @@ mod tests {
             .await
             .unwrap();
         store.migrate().await.unwrap();
-        assert_exact_successful_migration_prefix_through_eighteen(store.pool()).await;
+        assert_exact_successful_migration_prefix(store.pool()).await;
 
         // Missing version 16 must be repairable even when exact version 17 is
         // already recorded, and an absent index must be rebuilt online.
@@ -3530,7 +3530,7 @@ mod tests {
             .await
             .unwrap();
         store.migrate().await.unwrap();
-        assert_exact_successful_migration_prefix_through_eighteen(store.pool()).await;
+        assert_exact_successful_migration_prefix(store.pool()).await;
 
         // The same absent-index recovery applies to the tail migration.
         sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 17")
@@ -3544,7 +3544,7 @@ mod tests {
         .await
         .unwrap();
         store.migrate().await.unwrap();
-        assert_exact_successful_migration_prefix_through_eighteen(store.pool()).await;
+        assert_exact_successful_migration_prefix(store.pool()).await;
 
         for (version, table_name, index_name) in [
             (
@@ -3591,7 +3591,7 @@ mod tests {
                 .await
                 .unwrap();
             store.migrate().await.unwrap();
-            assert_exact_successful_migration_prefix_through_eighteen(store.pool()).await;
+            assert_exact_successful_migration_prefix(store.pool()).await;
         }
 
         sqlx::query("UPDATE _sqlx_migrations SET success = false WHERE version = 17")
@@ -3608,11 +3608,22 @@ mod tests {
             .await
             .unwrap();
 
+        // A version the embedded migrator does not know must be rejected. Derive
+        // it from the highest embedded version so that adding a real migration
+        // (as every wave does) can never collide with this probe.
+        let unknown_version = embedded_migrator()
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .unwrap()
+            + 1;
         sqlx::query(
             "INSERT INTO _sqlx_migrations \
                  (version, description, success, checksum, execution_time) \
-             VALUES (19, 'unknown migration', true, $1, 0)",
+             VALUES ($1, 'unknown migration', true, $2, 0)",
         )
+        .bind(unknown_version)
         .bind(vec![0_u8])
         .execute(store.pool())
         .await
@@ -3620,9 +3631,11 @@ mod tests {
         let unknown_error = store.migrate().await.unwrap_err();
         assert!(matches!(
             unknown_error,
-            FleetError::Migration(MigrateError::VersionMissing(19))
+            FleetError::Migration(MigrateError::VersionMissing(version))
+                if version == unknown_version
         ));
-        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 19")
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+            .bind(unknown_version)
             .execute(store.pool())
             .await
             .unwrap();
@@ -3652,7 +3665,7 @@ mod tests {
             .unwrap();
 
         store.migrate().await.unwrap();
-        assert_exact_successful_migration_prefix_through_eighteen(store.pool()).await;
+        assert_exact_successful_migration_prefix(store.pool()).await;
         assert_online_projection_indexes_are_covering(store.pool()).await;
     }
 
