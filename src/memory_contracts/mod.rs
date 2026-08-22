@@ -21,6 +21,7 @@ pub mod error;
 pub mod evidence;
 pub mod evidence_v2;
 pub mod generation2;
+pub mod generation2_registry;
 pub mod genesis;
 pub mod genesis_activation;
 pub mod identity;

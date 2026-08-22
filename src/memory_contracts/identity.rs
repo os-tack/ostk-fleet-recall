@@ -234,6 +234,120 @@ impl ValidatedIdentityRecipe {
     pub const fn registry_reference(&self) -> &RegistryReferenceV1 {
         &self.registry_reference
     }
+
+    /// The resource-kind schema this recipe's parent entity must resolve to.
+    ///
+    /// `Some` exactly when the recipe's identity form is `version`: the recipe
+    /// closure already rejects a version recipe with no parent kind and an
+    /// entity/occurrence recipe that names one.
+    #[must_use]
+    pub const fn parent_entity_kind(&self) -> Option<&RegistryReferenceV1> {
+        self.parent_entity_kind.as_ref()
+    }
+
+    /// The authority namespace this recipe hashes under.
+    #[must_use]
+    pub const fn authority_namespace_id(&self) -> &ContractId {
+        &self.authority_namespace_id
+    }
+}
+
+/// Resolve the entity recipe a `version`-form recipe's parent must be derived
+/// under, out of the same offline package closure.
+///
+/// The parent is *derived, never supplied*. A caller hands a version-form
+/// locator and nothing else; this function finds the one recipe in the package
+/// that can produce a parent [`validate_locator`] will accept:
+///
+/// * `entity` identity form,
+/// * `resource_kind_schema` equal to the child's declared `parent_entity_kind`,
+/// * the same authority namespace as the child (which
+///   [`ValidatedIdentityRecipe::from_package`] in turn forces to the same
+///   coordinate keys).
+///
+/// Zero matches or more than one is a closed refusal, not a guess: a package in
+/// which the parent is ambiguous must not be allowed to mint version identities
+/// under whichever recipe happened to sort first.
+///
+/// Returns `Ok(None)` when `child` is not a version recipe — such a recipe has
+/// no parent, and asking for one is not an error.
+pub fn resolve_parent_entity_recipe(
+    package: &ManifestVerifiedRegistryPackage,
+    child: &ValidatedIdentityRecipe,
+) -> ContractResult<Option<ValidatedIdentityRecipe>> {
+    let Some(parent_kind) = child.parent_entity_kind() else {
+        return Ok(None);
+    };
+    let mut matches = package
+        .package()
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == RegistryEntryKind::IdentityRecipe)
+        .filter_map(|entry| {
+            let bytes = encode_canonical(&entry.body).ok()?;
+            let recipe: IdentityRecipeV1 = super::canonical::decode_strict(&bytes).ok()?;
+            (recipe.identity_form == IdentityForm::Entity
+                && recipe.resource_kind_schema == *parent_kind
+                && recipe.authority_namespace.entry_id == *child.authority_namespace_id())
+            .then_some((recipe.recipe_id, recipe.version))
+        });
+    let Some((recipe_id, version)) = matches.next() else {
+        return Err(ContractError::InvalidIdentityRecipe(
+            "version recipe has no entity-parent recipe in this package".into(),
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(ContractError::InvalidIdentityRecipe(
+            "version recipe has an ambiguous entity-parent recipe".into(),
+        ));
+    }
+    Ok(Some(ValidatedIdentityRecipe::from_package(
+        package, &recipe_id, version,
+    )?))
+}
+
+/// Derive the parent-entity identity one `version`-form locator must name.
+///
+/// The parent locator is *reconstructed* from the child's own already-proven
+/// coordinates — same profile, same scope, same components — under the parent
+/// recipe resolved by [`resolve_parent_entity_recipe`]. Nothing about the parent
+/// comes from a request: a caller cannot name a parent, choose the recipe that
+/// derives it, or vary a coordinate between child and parent.
+///
+/// Returns `Ok(None)` when `child_recipe` is not a version recipe.
+pub fn derive_version_parent(
+    package: &ManifestVerifiedRegistryPackage,
+    profile: &ProfileReferenceV1,
+    scope: &AuthenticatedProjectScopeV1,
+    child_recipe: &ValidatedIdentityRecipe,
+    child_locator: &CanonicalLocatorV1,
+) -> ContractResult<Option<DerivedResourceIdentityV1>> {
+    let Some(parent_recipe) = resolve_parent_entity_recipe(package, child_recipe)? else {
+        return Ok(None);
+    };
+    let parent_locator = CanonicalLocatorV1 {
+        schema_version: IDENTITY_SCHEMA_VERSION,
+        profile: profile.clone(),
+        scope: scope.clone(),
+        identity_form: parent_recipe.recipe().identity_form,
+        resource_kind: parent_recipe.recipe().resource_kind.clone(),
+        recipe: parent_recipe.registry_reference().clone(),
+        provider_instance_namespace: parent_recipe.authority_namespace_id().clone(),
+        // An entity is a root: nothing above it to name.
+        parent_entity: None,
+        components: child_locator.components.clone(),
+    };
+    let parent_context = IdentityDerivationContextV1::from_trusted_context(
+        profile.clone(),
+        scope.clone(),
+        parent_recipe.authority_namespace_id().clone(),
+    );
+    Ok(Some(derive_resource_uri(
+        &parent_context,
+        &parent_locator,
+        &parent_recipe,
+        None,
+    )?))
 }
 
 /// Trusted identity inputs supplied by authenticated ingress, never by the
