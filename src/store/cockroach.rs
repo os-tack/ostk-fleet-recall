@@ -3286,7 +3286,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_migrator_registers_mixed_transaction_policy_through_twenty_one() {
+    fn embedded_migrator_registers_mixed_transaction_policy_through_twenty_two() {
         let migrator = embedded_migrator();
         assert_eq!(
             migrator
@@ -3294,7 +3294,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=21).collect::<Vec<_>>()
+            (1..=22).collect::<Vec<_>>()
         );
         assert_eq!(
             migrator
@@ -3302,7 +3302,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.no_tx)
                 .collect::<Vec<_>>(),
-            [vec![true; 11], vec![false; 3], vec![true; 7]].concat()
+            [vec![true; 11], vec![false; 3], vec![true; 8]].concat()
         );
         let control_ledger = migrator
             .migrations
@@ -3378,9 +3378,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=21).collect::<Vec<_>>()
+            (1..=22).collect::<Vec<_>>()
         );
-        for version in 10..=21 {
+        for version in 10..=22 {
             let migration = pre_transactional
                 .migrations
                 .iter()
@@ -3402,7 +3402,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=21).collect::<Vec<_>>()
+            (1..=22).collect::<Vec<_>>()
         );
         for migration in transactional.migrations.iter() {
             let expected_type = if migration.version >= 15 {
