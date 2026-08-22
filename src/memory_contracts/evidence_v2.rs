@@ -272,6 +272,67 @@ impl StructurallyResolvedConnectorSchemaV2 {
     }
 }
 
+/// One connector *instance* named inside a generation-2 package (W2-PKG).
+///
+/// An installed deployment identifier is bound to the exact
+/// structurally-resolved connector schema it runs.
+/// `StructurallyResolvedConnectorSchemaV2` alone names a schema contract; a
+/// package that ingests from several installations of the same or different
+/// providers must additionally name each connector instance, and this binding
+/// is how it does so.
+///
+/// Like the resolved schema it wraps, this is `StructurallyResolved`, not
+/// `Active`: any caller can name an instance id. Runtime admission must still
+/// prove the schema is a member of the active package/head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorInstanceBindingV2 {
+    connector_instance_id: ContractId,
+    schema: StructurallyResolvedConnectorSchemaV2,
+}
+
+impl ConnectorInstanceBindingV2 {
+    /// Bind a connector-instance identifier to a resolved schema. The instance
+    /// id is a non-empty contract identifier; the schema is already validated
+    /// by its own resolver, so this adds only the instance-naming layer.
+    pub fn new(
+        connector_instance_id: ContractId,
+        schema: StructurallyResolvedConnectorSchemaV2,
+    ) -> ContractResult<Self> {
+        if connector_instance_id.as_str().is_empty() {
+            return Err(ContractError::Schema(
+                "connector instance id must be non-empty".into(),
+            ));
+        }
+        Ok(Self {
+            connector_instance_id,
+            schema,
+        })
+    }
+
+    pub const fn connector_instance_id(&self) -> &ContractId {
+        &self.connector_instance_id
+    }
+
+    pub const fn schema(&self) -> &StructurallyResolvedConnectorSchemaV2 {
+        &self.schema
+    }
+}
+
+impl StructurallyResolvedConnectorSchemaV2 {
+    /// Name one installed instance of this resolved connector schema.
+    ///
+    /// This extends the resolved schema so a generation-2 package can name
+    /// *both* of its connector instances (for example a transcript connector
+    /// and a git-history connector) without collapsing them into one schema
+    /// reference (W2-PKG).
+    pub fn bind_instance(
+        &self,
+        connector_instance_id: ContractId,
+    ) -> ContractResult<ConnectorInstanceBindingV2> {
+        ConnectorInstanceBindingV2::new(connector_instance_id, self.clone())
+    }
+}
+
 /// Provider-truth preimage, stable across registry-head activations.
 ///
 /// Connector schema is absent on purpose. Provider namespace and immutable

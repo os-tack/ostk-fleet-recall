@@ -105,6 +105,7 @@ macro_rules! digest_newtype {
 }
 
 digest_newtype!(CoverageReceiptId);
+digest_newtype!(CoverageProofV2Id); // W2-PKG
 
 /// Closed kind of the artifact that produced a coverage receipt.
 ///
@@ -484,6 +485,123 @@ fn validate_registered_reference(
         )));
     }
     Ok(())
+}
+
+/// Generation-2 coverage constants (W2-PKG).
+const COVERAGE_PROOF_V2_SCHEMA_VERSION: u32 = 2;
+const MAX_COVERAGE_PROOF_INSTANCES: usize = 64;
+
+/// One connector instance's cursor watermark inside a generation-2 coverage
+/// proof.
+///
+/// The watermark is deliberately restricted to the opaque-cursor form: a
+/// generation-2 package's connectors (transcript, version-history) advance by
+/// an opaque resumable cursor, not a monotone provider sequence, so a
+/// provider-sequence watermark here is a category error and is rejected. Each
+/// binding also carries the completeness and continuity witnesses for exactly
+/// that instance, so the proof records per-instance coverage rather than one
+/// blended claim across instances.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorInstanceCursorV2 {
+    pub connector_instance_id: ContractId,
+    pub cursor: HexBytes,
+    pub completeness: CoverageCompletenessV1,
+    pub continuity: SequenceContinuityV1,
+}
+
+impl ConnectorInstanceCursorV2 {
+    /// Validate one instance cursor: a non-empty instance id, a non-empty
+    /// opaque cursor, and a well-formed continuity witness.
+    pub fn validate(&self) -> ContractResult<()> {
+        self.continuity.validate()?;
+        if self.connector_instance_id.as_str().is_empty() || self.cursor.as_bytes().is_empty() {
+            return Err(ContractError::Schema(
+                "connector instance cursor must name a non-empty instance and cursor".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The watermark restated in the shared `CoverageWatermarkV1` cursor form,
+    /// so downstream watermark logic sees one representation.
+    #[must_use]
+    pub fn watermark(&self) -> CoverageWatermarkV1 {
+        CoverageWatermarkV1::Cursor {
+            cursor: self.cursor.clone(),
+        }
+    }
+}
+
+/// Connector-instance-cursor-aware coverage proof (COVER-01..03, W2-PKG).
+///
+/// A generation-2 package ingests from more than one connector instance. This
+/// proof binds one cursor watermark, completeness, and continuity witness *per
+/// connector instance* under one shared scope, freshness, and proof basis, so
+/// the package can prove it read every named instance to a resumable cursor.
+/// Distinct from [`CoverageReceiptV1`], which records a single producer's
+/// coverage; this proof carries the whole instance set and is content-addressed
+/// under [`DigestDomain::CoverageProofV2`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageProofV2 {
+    pub schema_version: u32,
+    pub scope: CoverageScopeV1,
+    pub freshness: CoverageFreshnessV1,
+    pub proof_basis: CoverageProofBasisV1,
+    pub observed_through: CanonicalTimestamp,
+    pub instances: Vec<ConnectorInstanceCursorV2>,
+}
+
+impl CoverageProofV2 {
+    /// Validate the proof: schema version, scope/freshness/basis, a bounded,
+    /// non-empty, strictly-ordered-and-unique instance set, and that reading
+    /// reached the end of the covered window.
+    pub fn validate(&self) -> ContractResult<()> {
+        self.scope.validate()?;
+        self.freshness.validate()?;
+        self.proof_basis.validate()?;
+        if self.schema_version != COVERAGE_PROOF_V2_SCHEMA_VERSION
+            || self.instances.is_empty()
+            || self.instances.len() > MAX_COVERAGE_PROOF_INSTANCES
+        {
+            return Err(ContractError::Schema("invalid coverage proof v2".into()));
+        }
+        if self.observed_through < self.scope.window.window_end {
+            return Err(ContractError::Schema(
+                "observed_through must reach the end of the covered window".into(),
+            ));
+        }
+        for instance in &self.instances {
+            instance.validate()?;
+        }
+        if !self
+            .instances
+            .windows(2)
+            .all(|pair| pair[0].connector_instance_id < pair[1].connector_instance_id)
+        {
+            return Err(ContractError::NonCanonicalSet { field: "instances" });
+        }
+        encode_canonical(self)?;
+        Ok(())
+    }
+
+    /// `SHA-256("ostk-coverage-proof-v2" || 0x00 || canonical_proof_bytes)`.
+    pub fn proof_id(&self) -> ContractResult<CoverageProofV2Id> {
+        self.validate()?;
+        Ok(CoverageProofV2Id::from_digest(domain_separated_digest(
+            DigestDomain::CoverageProofV2,
+            &encode_canonical(self)?,
+        )))
+    }
+
+    /// True when this proof carries a cursor witness for `connector_instance_id`.
+    #[must_use]
+    pub fn covers_instance(&self, connector_instance_id: &ContractId) -> bool {
+        self.instances
+            .iter()
+            .any(|instance| &instance.connector_instance_id == connector_instance_id)
+    }
 }
 
 #[cfg(test)]

@@ -295,6 +295,24 @@ pub enum DigestDomain {
     /// head, and this digest together); this domain frames only the sorted
     /// row enumeration itself.
     BootstrapManifestV1, // W1-IMPORT
+    // --- W2 domains (generation-2 semantically-closed target package) ---
+    /// W2-PKG. Content-addressed identity of one generation-2
+    /// semantically-closed target package manifest
+    /// (`Stage5PackageManifestV1`): the ordered, deduplicated set of the
+    /// gen-2 component digests the package binds. Distinct from
+    /// [`Self::RegistryPackage`], which frames a full embedded registry
+    /// package; this domain frames only the component-digest manifest.
+    Stage5TargetPackageV1, // W2-PKG
+    /// W2-PKG. Connector-instance-cursor-aware coverage proof
+    /// (`CoverageProofV2`) identity. Distinct from [`Self::CoverageReceipt`],
+    /// which frames a single-producer receipt; this domain frames a proof
+    /// that binds a per-connector-instance cursor set.
+    CoverageProofV2, // W2-PKG
+    /// W2-PKG. Parser-contract (`ParserContractV2`) identity: the parser
+    /// key plus the normalization configuration that together become part
+    /// of representation identity. Distinct from [`Self::ParserKeyV1`],
+    /// which frames only the bare parser key preimage.
+    ParserContractV2, // W2-PKG
 }
 
 impl DigestDomain {
@@ -439,6 +457,10 @@ impl DigestDomain {
             // --- W1 prefixes ---
             Self::EvidenceGenesisChainV1 => "ostk-evidence-genesis-chain-v1", // W1-APPEND
             Self::BootstrapManifestV1 => "ostk-bootstrap-manifest-v1",        // W1-IMPORT
+            // --- W2 prefixes ---
+            Self::Stage5TargetPackageV1 => "ostk-stage5-target-package-v1", // W2-PKG
+            Self::CoverageProofV2 => "ostk-coverage-proof-v2",              // W2-PKG
+            Self::ParserContractV2 => "ostk-parser-contract-v2",            // W2-PKG
         }
     }
 }
