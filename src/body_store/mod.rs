@@ -41,11 +41,13 @@
 
 mod cockroach;
 mod error;
+mod governed_resolver;
 mod parser;
 mod projector;
 mod repository;
 
 pub use cockroach::CockroachBodyProjectionRepository;
+pub use governed_resolver::GovernedContentResolver;
 pub use error::{BodyProjectionError, BodyProjectionResult};
 pub use parser::{
     LINE_PARSER_VERSION, PARAGRAPH_PARSER_VERSION, ParsedSegmentV1, parse_source,
