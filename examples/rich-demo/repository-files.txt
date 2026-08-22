@@ -473,6 +473,7 @@ src/bin/ostk-registry-generic-successor-activate.rs|successor_activation|rust
 src/bin/ostk-registry-successor-activate.rs|successor_activation|rust
 src/body_store/cockroach.rs|body_store|rust
 src/body_store/error.rs|body_store|rust
+src/body_store/governed_resolver.rs|body_store|rust
 src/body_store/mod.rs|body_store|rust
 src/body_store/parser.rs|body_store|rust
 src/body_store/projector.rs|body_store|rust
@@ -611,6 +612,7 @@ tests/body_projection_live.rs|database_verification|rust
 tests/bootstrap_manifest_live.rs|database_verification|rust
 tests/control_log_live.rs|database_verification|rust
 tests/coverage_runtime_live.rs|database_verification|rust
+tests/dogfood_live.rs|database_verification|rust
 tests/evidence_admission_live.rs|database_verification|rust
 tests/evidence_ledger_live.rs|database_verification|rust
 tests/generic_successor_activation_live.rs|database_verification|rust

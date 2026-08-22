@@ -75,6 +75,12 @@ git -C "$repo_root" ls-files '*.md' |
     while IFS= read -r path; do
         case $path in
             licenses/README.md) continue ;;
+            # The W2-DOGFOOD acceptance run quotes rows the connectors ingested
+            # from the operator's OWN local agent transcript. Those excerpts are
+            # private local data that happens to be committed as evidence; they
+            # must never enter the published corpus, so this document is
+            # deliberately absent from documents.txt rather than missing from it.
+            docs/evidence/2026-08-22-dogfood-report.md) continue ;;
         esac
         printf '%s\n' "$path"
     done |
