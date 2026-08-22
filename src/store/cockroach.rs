@@ -235,6 +235,8 @@ const CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL: &str =
     include_str!("../../migrations/0017_conflict_detector_projection_index.sql");
 const STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL: &str =
     include_str!("../../migrations/0018_stage4_evidence_ledger.sql");
+const BODY_PROJECTION_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0019_body_projection.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -276,7 +278,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
     ]
 }
 
-fn post_transactional_online_migrations() -> [Migration; 4] {
+fn post_transactional_online_migrations() -> [Migration; 5] {
     [
         Migration::new(
             15,
@@ -306,6 +308,15 @@ fn post_transactional_online_migrations() -> [Migration; 4] {
             Cow::Borrowed(STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL),
             // Additive tables plus two online ADD COLUMN transitions on
             // schema-locked tables; CockroachDB requires DDL autocommit here.
+            true,
+        ),
+        Migration::new(
+            19,
+            Cow::Borrowed("content-addressed body/occurrence/manifest projection"),
+            MigrationType::Simple,
+            Cow::Borrowed(BODY_PROJECTION_MIGRATION_SQL),
+            // W2-BODY. Additive new tables only; online DDL like migration 0018,
+            // so CockroachDB requires DDL autocommit here.
             true,
         ),
     ]
@@ -3240,7 +3251,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_migrator_registers_mixed_transaction_policy_through_eighteen() {
+    fn embedded_migrator_registers_mixed_transaction_policy_through_nineteen() {
         let migrator = embedded_migrator();
         assert_eq!(
             migrator
@@ -3248,7 +3259,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=18).collect::<Vec<_>>()
+            (1..=19).collect::<Vec<_>>()
         );
         assert_eq!(
             migrator
@@ -3256,7 +3267,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.no_tx)
                 .collect::<Vec<_>>(),
-            [vec![true; 11], vec![false; 3], vec![true; 4]].concat()
+            [vec![true; 11], vec![false; 3], vec![true; 5]].concat()
         );
         let control_ledger = migrator
             .migrations
@@ -3305,6 +3316,7 @@ mod tests {
             (16, CLAIM_TRANSITION_PROVENANCE_INDEX_MIGRATION_SQL, true),
             (17, CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL, true),
             (18, STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL, true),
+            (19, BODY_PROJECTION_MIGRATION_SQL, true),
         ] {
             let migration = migrator
                 .migrations
@@ -3328,9 +3340,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=18).collect::<Vec<_>>()
+            (1..=19).collect::<Vec<_>>()
         );
-        for version in 10..=18 {
+        for version in 10..=19 {
             let migration = pre_transactional
                 .migrations
                 .iter()
@@ -3352,7 +3364,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=18).collect::<Vec<_>>()
+            (1..=19).collect::<Vec<_>>()
         );
         for migration in transactional.migrations.iter() {
             let expected_type = if migration.version >= 15 {
