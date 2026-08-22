@@ -470,6 +470,7 @@ src/application.rs|application_code|rust
 src/bin/ostk-bootstrap-manifest-import.rs|bootstrap_manifest|rust
 src/bin/ostk-conflict-reconcile.rs|conflict_reconciliation|rust
 src/bin/ostk-control-bootstrap.rs|control_bootstrap|rust
+src/bin/ostk-observer-run.rs|observer_runtime|rust
 src/bin/ostk-registry-activate.rs|registry_activation|rust
 src/bin/ostk-registry-generic-successor-activate.rs|successor_activation|rust
 src/bin/ostk-registry-successor-activate.rs|successor_activation|rust
@@ -616,6 +617,14 @@ src/normative_runtime/projection.rs|normative_runtime|rust
 src/normative_runtime/projection_tests.rs|normative_runtime|rust
 src/normative_runtime/repository.rs|normative_runtime|rust
 src/normative_runtime/repository_tests.rs|normative_runtime|rust
+src/observer_runtime/admission.rs|observer_runtime|rust
+src/observer_runtime/drain.rs|observer_runtime|rust
+src/observer_runtime/enumeration.rs|observer_runtime|rust
+src/observer_runtime/error.rs|observer_runtime|rust
+src/observer_runtime/ingress.rs|observer_runtime|rust
+src/observer_runtime/mod.rs|observer_runtime|rust
+src/observer_runtime/receipt.rs|observer_runtime|rust
+src/observer_runtime/source.rs|observer_runtime|rust
 src/private_postgres.rs|database_security|rust
 src/projectors/cockroach.rs|projectors|rust
 src/projectors/dense.rs|projectors|rust
@@ -652,6 +661,7 @@ tests/evidence_ledger_live.rs|database_verification|rust
 tests/generic_successor_activation_live.rs|database_verification|rust
 tests/git_connector_live.rs|database_verification|rust
 tests/normative_activation_live.rs|database_verification|rust
+tests/observer_runtime_live.rs|database_verification|rust
 tests/publication_reader_live.rs|database_verification|rust
 tests/recall_projection_live.rs|database_verification|rust
 tests/registry_activation_live.rs|database_verification|rust

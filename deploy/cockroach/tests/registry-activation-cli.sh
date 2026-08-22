@@ -2041,6 +2041,34 @@ while IFS= read -r ci_connector_live_test; do
             "$ci_connector_live_test" -- --exact --nocapture
 done <<<"$ci_connector_live_tests"
 
+# Every Wave-3 exhaustive observer runtime (W3-OBSRT) connected test, by exact
+# discovered name; the set is asserted complete, so a live_* test that nobody
+# wires here fails this proof instead of silently not running.
+observer_runtime_live_tests='live_a_brace_desynchronised_blob_is_indeterminate_never_negative_when_configured
+live_a_crafted_attribute_blob_is_indeterminate_never_negative_when_configured
+live_a_partial_enumeration_is_indeterminate_never_negative_when_configured
+live_a_repeated_run_is_an_exact_replay_when_configured
+live_a_run_never_moves_the_remember_basis_when_configured
+live_a_tampered_blob_never_reaches_the_ledger_when_configured
+live_an_exhaustive_run_verifies_and_names_the_exact_blob_when_configured'
+observer_runtime_live_listing=$(cargo test --locked \
+    --test observer_runtime_live -- --list)
+discovered_observer_runtime_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$observer_runtime_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact observer-runtime connected test set" \
+    "$discovered_observer_runtime_live_tests" \
+    "$observer_runtime_live_tests"
+while IFS= read -r observer_runtime_live_test; do
+    test -n "$observer_runtime_live_test" || continue
+    require_discovered_test "$observer_runtime_live_listing" \
+        "$observer_runtime_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test observer_runtime_live \
+            "$observer_runtime_live_test" -- --exact --nocapture
+done <<<"$observer_runtime_live_tests"
+
 current_retry_live_test=ledger::cockroach::tests::live_current_projection_whole_unit_retry_when_configured
 current_snapshot_live_test=ledger::cockroach::tests::live_current_projection_snapshot_race_when_configured
 conflict_live_test=ledger::cockroach::tests::live_conflict_polarity_matrix_when_configured
