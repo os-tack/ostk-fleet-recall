@@ -139,4 +139,7 @@ pub use repository::{
     AcceptedEventRepository, AppendOutcome, AppendProjection, FnProjection, NoProjection,
     ProjectionContext, ShardChainAudit, ShardChainDivergence, ShardChainDivergenceKind,
 };
-pub use witness::{WriterAuthoritySnapshot, WriterAuthorityWitness, evidence_genesis_chain_digest};
+pub use witness::{
+    WriterAuthoritySnapshot, WriterAuthorityWitness, evidence_genesis_chain_digest,
+    partition_algorithm_label,
+};

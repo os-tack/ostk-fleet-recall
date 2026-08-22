@@ -333,6 +333,15 @@ pub enum DigestDomain {
     /// coverage receipt records, so it frames the observed set rather than any
     /// governed payload.
     GitScanManifestV1, // W2-GIT
+    /// W2-TRANS. Immutable-revision preimage of one local-transcript turn
+    /// (`TranscriptTurnRevisionPreimageV1`): the parser key digest, the raw
+    /// source span, the turn's position, and the digest of the exact redacted
+    /// body. Distinct from [`Self::ParserKeyV1`], which frames only the parser
+    /// key, and from [`Self::ChunkOccurrenceV1`], which frames an extracted
+    /// chunk; this domain frames the provider-side revision a transcript turn
+    /// publishes, so the parser's identity and configuration are part of the
+    /// turn's canonical-resource identity.
+    TranscriptTurnRevisionV1, // W2-TRANS
 }
 
 impl DigestDomain {
@@ -484,6 +493,7 @@ impl DigestDomain {
             Self::LexicalProjectionTextV1 => "ostk-lexical-projection-text-v1", // W2-PROJ
             Self::GitProviderFactV1 => "ostk-git-provider-fact-v1",         // W2-GIT
             Self::GitScanManifestV1 => "ostk-git-scan-manifest-v1",         // W2-GIT
+            Self::TranscriptTurnRevisionV1 => "ostk-transcript-turn-revision-v1", // W2-TRANS
         }
     }
 }

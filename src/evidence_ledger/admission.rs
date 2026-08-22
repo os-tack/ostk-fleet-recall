@@ -279,6 +279,29 @@ impl ActiveStage4Package {
         &self.profile
     }
 
+    /// The manifest-verified package the active head activated.
+    ///
+    /// Exposed so a connector can resolve an activated identity recipe through
+    /// [`ValidatedIdentityRecipe::from_package`] and build a locator from the
+    /// recipe's own component rules — the same closure this module rederives
+    /// against. Read-only: nothing here can select or alter the active package.
+    #[must_use]
+    pub const fn manifest_verified_package(
+        &self,
+    ) -> &crate::memory_contracts::registry::ManifestVerifiedRegistryPackage {
+        self.package.successor_package().manifest_verified_package()
+    }
+
+    /// Every registry entry the active package closes over.
+    ///
+    /// Exposed so a connector can read an ACTIVATED policy body (for instance,
+    /// to prove the redaction policy promises redaction before the durable
+    /// outbox) instead of carrying its own copy of a governance decision.
+    #[must_use]
+    pub fn registry_entries(&self) -> &[RegistryEntryV1] {
+        self.entries()
+    }
+
     fn entries(&self) -> &[RegistryEntryV1] {
         &self
             .package
