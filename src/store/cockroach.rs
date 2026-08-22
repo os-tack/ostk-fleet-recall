@@ -284,7 +284,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
     ]
 }
 
-fn post_transactional_online_migrations() -> [Migration; 7] {
+fn post_transactional_online_migrations() -> [Migration; 8] {
     [
         Migration::new(
             15,
@@ -3354,6 +3354,7 @@ mod tests {
             (19, BODY_PROJECTION_MIGRATION_SQL, true),
             (20, COVERAGE_RUNTIME_MIGRATION_SQL, true),
             (21, RECALL_PROJECTION_MIGRATION_SQL, true),
+            (22, TRANSCRIPT_CONNECTOR_MIGRATION_SQL, true),
         ] {
             let migration = migrator
                 .migrations

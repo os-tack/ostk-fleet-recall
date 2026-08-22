@@ -336,20 +336,17 @@ fn build_turn(
     })
 }
 
-/// Parse one transcript source in full.
+/// Bound the source and place the durable cursor inside it, before a single
+/// line is framed.
 ///
-/// `resume_from` is the byte offset the durable cursor already covers; bytes
-/// before it are re-read to keep line framing exact but produce no turns, and
-/// `first_ordinal` continues the source's turn numbering. A source that shrank
-/// below `resume_from`, or whose prefix no longer frames the same lines, is a
-/// closed [`TranscriptConnectorError::MalformedTranscript`] rather than a
-/// silently re-numbered stream.
-pub fn parse_transcript(
+/// A source larger than the batch bound, or one that has SHRUNK below the
+/// offset the cursor already covers, is refused whole: a partial parse of
+/// either would renumber the turns that follow.
+fn bounded_resume_offset(
     source_id: &str,
     bytes: &[u8],
     resume_from: u64,
-    first_ordinal: u32,
-) -> TranscriptConnectorResult<ParsedTranscriptV1> {
+) -> TranscriptConnectorResult<usize> {
     if bytes.len() > MAX_TRANSCRIPT_BYTES {
         return Err(malformed(
             source_id,
@@ -366,6 +363,24 @@ pub fn parse_transcript(
             "transcript is shorter than the durable cursor",
         ));
     }
+    Ok(resume)
+}
+
+/// Parse one transcript source in full.
+///
+/// `resume_from` is the byte offset the durable cursor already covers; bytes
+/// before it are re-read to keep line framing exact but produce no turns, and
+/// `first_ordinal` continues the source's turn numbering. A source that shrank
+/// below `resume_from`, or whose prefix no longer frames the same lines, is a
+/// closed [`TranscriptConnectorError::MalformedTranscript`] rather than a
+/// silently re-numbered stream.
+pub fn parse_transcript(
+    source_id: &str,
+    bytes: &[u8],
+    resume_from: u64,
+    first_ordinal: u32,
+) -> TranscriptConnectorResult<ParsedTranscriptV1> {
+    let resume = bounded_resume_offset(source_id, bytes, resume_from)?;
 
     let mut turns = Vec::new();
     let mut skipped_records = 0_u32;
