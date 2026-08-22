@@ -13,5 +13,6 @@
 //! therefore cannot widen what is admissible: the worst a mis-implemented one
 //! can do is produce candidates that admission rejects.
 
+pub mod ci;
 pub mod git;
 pub mod transcript;

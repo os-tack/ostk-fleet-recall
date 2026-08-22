@@ -247,6 +247,7 @@ const RECALL_VISIBILITY_MIGRATION_SQL: &str =
     include_str!("../../migrations/0023_recall_visibility.sql");
 const NORMATIVE_ACTIVATION_MIGRATION_SQL: &str =
     include_str!("../../migrations/0024_normative_activation.sql");
+const CI_CONNECTOR_MIGRATION_SQL: &str = include_str!("../../migrations/0026_ci_connector.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -288,7 +289,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
     ]
 }
 
-fn post_transactional_online_migrations() -> [Migration; 10] {
+fn post_transactional_online_migrations() -> [Migration; 11] {
     [
         Migration::new(
             15,
@@ -376,6 +377,19 @@ fn post_transactional_online_migrations() -> [Migration; 10] {
             Cow::Borrowed(NORMATIVE_ACTIVATION_MIGRATION_SQL),
             // W3-NORM. Additive CREATE TABLE/INDEX DDL only; CockroachDB
             // requires it outside SQLx's transaction wrapper, like 0018-0023.
+            true,
+        ),
+        Migration::new(
+            26,
+            Cow::Borrowed("ci connector measured windows"),
+            MigrationType::Simple,
+            Cow::Borrowed(CI_CONNECTOR_MIGRATION_SQL),
+            // W3-CIEV. Additive: one new table and one index. CockroachDB
+            // requires this DDL outside SQLx's transaction wrapper, like
+            // migrations 0018-0023. Version 25 is reserved for an item that
+            // added no migration and is absent here on purpose; SQLx orders
+            // migrations by version and does not require them to be
+            // contiguous.
             true,
         ),
     ]
@@ -3310,7 +3324,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_migrator_registers_mixed_transaction_policy_through_twenty_four() {
+    fn embedded_migrator_registers_mixed_transaction_policy_through_twenty_six() {
         let migrator = embedded_migrator();
         assert_eq!(
             migrator
@@ -3318,7 +3332,10 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=24).collect::<Vec<_>>()
+            // W3-NORM registers migration 24 and W3-CIEV registers 26;
+            // version 25 is reserved for an item that added no migration, so
+            // the sequence is deliberately non-contiguous.
+            (1..=24).chain(std::iter::once(26)).collect::<Vec<_>>()
         );
         assert_eq!(
             migrator
@@ -3326,7 +3343,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.no_tx)
                 .collect::<Vec<_>>(),
-            [vec![true; 11], vec![false; 3], vec![true; 10]].concat()
+            [vec![true; 11], vec![false; 3], vec![true; 11]].concat()
         );
         let control_ledger = migrator
             .migrations
@@ -3381,6 +3398,7 @@ mod tests {
             (22, TRANSCRIPT_CONNECTOR_MIGRATION_SQL, true),
             (23, RECALL_VISIBILITY_MIGRATION_SQL, true),
             (24, NORMATIVE_ACTIVATION_MIGRATION_SQL, true),
+            (26, CI_CONNECTOR_MIGRATION_SQL, true),
         ] {
             let migration = migrator
                 .migrations
@@ -3404,9 +3422,12 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=24).collect::<Vec<_>>()
+            // W3-NORM registers migration 24 and W3-CIEV registers 26;
+            // version 25 is reserved for an item that added no migration, so
+            // the sequence is deliberately non-contiguous.
+            (1..=24).chain(std::iter::once(26)).collect::<Vec<_>>()
         );
-        for version in 10..=23 {
+        for version in (10..=24).chain(std::iter::once(26)) {
             let migration = pre_transactional
                 .migrations
                 .iter()
@@ -3428,7 +3449,10 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=24).collect::<Vec<_>>()
+            // W3-NORM registers migration 24 and W3-CIEV registers 26;
+            // version 25 is reserved for an item that added no migration, so
+            // the sequence is deliberately non-contiguous.
+            (1..=24).chain(std::iter::once(26)).collect::<Vec<_>>()
         );
         for migration in transactional.migrations.iter() {
             let expected_type = if migration.version >= 15 {
