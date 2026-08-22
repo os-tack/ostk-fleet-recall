@@ -85,8 +85,10 @@ pub use drain::{
     ObserverAppendDispositionV1, ObserverDrainContextV1, ObserverRunOutcomeV1, drain_observer_run,
 };
 pub use enumeration::{
-    ALL_DIAGNOSTICS, ENUMERATION_ALGORITHM_ID, MAX_MEMBER_BOUND, RustEnumEnumerationV1,
-    SET_PRESERVING_ATTRIBUTES, enumerate_rust_enum,
+    ALL_DIAGNOSTICS, DIAGNOSTIC_BOUND_EXCEEDED, DIAGNOSTIC_ENUM_ATTRIBUTE, DIAGNOSTIC_ENUM_GENERIC,
+    DIAGNOSTIC_MACRO_UNRESOLVED, DIAGNOSTIC_NON_EXHAUSTIVE, DIAGNOSTIC_VARIANT_ATTRIBUTE,
+    DIAGNOSTIC_VARIANT_PAYLOAD, DIAGNOSTIC_VARIANT_UNRECOGNISED, ENUMERATION_ALGORITHM_ID,
+    MAX_MEMBER_BOUND, RustEnumEnumerationV1, SET_PRESERVING_ATTRIBUTES, enumerate_rust_enum,
 };
 pub use error::{ObserverRuntimeError, ObserverRuntimeResult};
 pub use ingress::{

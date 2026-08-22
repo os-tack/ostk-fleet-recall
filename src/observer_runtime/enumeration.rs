@@ -59,7 +59,16 @@ use super::error::{ObserverRuntimeError, ObserverRuntimeResult};
 /// It is part of the admission body, so changing the scanner means a new
 /// algorithm id and a new governance decision, not a silent behaviour change
 /// under the same one.
-pub const ENUMERATION_ALGORITHM_ID: &str = "enumeration.rust-enum-brace-scan.v1";
+///
+/// `.v2` locates an item's attributes by walking whole `#[…]` groups rather
+/// than by hunting backwards for the previous item's `}` or `;`. The `.v1`
+/// reader could have its attribute search truncated by a `{`, `}` or `;`
+/// inside a preceding attribute's token tree and would then report NO
+/// attributes at all — losing a `#[non_exhaustive]` or a `#[cfg]` and calling
+/// the read exhaustive. Two readers that disagree about whether a blob is
+/// exhaustively enumerable are two different algorithms, so they get two
+/// different ids.
+pub const ENUMERATION_ALGORITHM_ID: &str = "enumeration.rust-enum-brace-scan.v2";
 
 /// The enum declares `#[non_exhaustive]`, so the source itself says the set is
 /// open.
@@ -207,7 +216,12 @@ pub fn enumerate_rust_enum(
     if declaration.generic {
         diagnostics.insert(DIAGNOSTIC_ENUM_GENERIC.to_owned());
     }
-    for attribute in &declaration.attributes {
+    // An attribute region the reader could not close is an unproven attribute
+    // list, and an unproven attribute list is a caveat, never a clean read.
+    if declaration.attributes.unparseable {
+        diagnostics.insert(DIAGNOSTIC_ENUM_ATTRIBUTE.to_owned());
+    }
+    for attribute in &declaration.attributes.names {
         if attribute == "non_exhaustive" {
             diagnostics.insert(DIAGNOSTIC_NON_EXHAUSTIVE.to_owned());
         } else if !attribute_preserves_the_set(attribute) {
@@ -267,8 +281,8 @@ pub fn enumerate_rust_enum(
 struct Declaration {
     /// Byte offset just after the opening `{`.
     body_start: usize,
-    /// Non-doc attribute names immediately preceding the declaration.
-    attributes: Vec<String>,
+    /// What the reader could determine about the preceding attribute list.
+    attributes: AttributeScan,
     /// Whether the declaration carries generic parameters.
     generic: bool,
 }
@@ -361,29 +375,40 @@ fn attribute_preserves_the_set(name: &str) -> bool {
     SET_PRESERVING_ATTRIBUTES.contains(&name)
 }
 
-/// Names of the attributes attached to an item.
-///
-/// The region searched runs from the end of the previous module-level item (a
-/// depth-zero `;` or `}`) to the item's own keyword, so a multi-line
-/// attribute, an interleaved doc comment, and a block comment are all handled
-/// by bracket matching rather than by a line heuristic. A line-oriented reader
-/// would stop at the first line it did not recognise and silently miss a
-/// `#[cfg]` above it, which is exactly the caveat that must not be missed.
-fn preceding_attributes(bytes: &[u8], item_start: usize) -> Vec<String> {
-    let region = &bytes[last_item_boundary(bytes, item_start)..item_start];
-    let text = String::from_utf8_lossy(region);
-    let mut attributes = parse_attribute_names(text.as_ref());
-    attributes.sort_unstable();
-    attributes.dedup();
-    attributes
+/// What the reader could determine about an item's attribute list.
+#[derive(Debug, Default)]
+struct AttributeScan {
+    /// Names of the attributes attached to the item, sorted and deduplicated.
+    names: Vec<String>,
+    /// The reader met an attribute region it could not parse to its end.
+    ///
+    /// This is never "no attributes". An attribute the reader cannot close is
+    /// an attribute whose effect on the variant set is unknown, and unknown
+    /// costs the read its exhaustiveness.
+    unparseable: bool,
 }
 
-/// Offset just past the last module-level `;` or `}` before `before`.
-fn last_item_boundary(bytes: &[u8], before: usize) -> usize {
-    let prefix = &bytes[..before];
+/// Names of the attributes attached to the item beginning at `item_start`.
+///
+/// The prefix is walked forward from byte zero with the literal- and
+/// comment-aware [`Scanner`], and every `#[...]` group is consumed *whole* by
+/// bracket matching before any byte inside it is considered. That is the whole
+/// point: an attribute's token tree may legally be brace-delimited and may
+/// legally contain `{`, `}` and `;`, so a reader that hunts backwards for the
+/// previous item's `}` or `;` without stepping over attributes can land its
+/// boundary in the middle of the attribute list and then find no attributes at
+/// all. Dropping a `#[non_exhaustive]` or a `#[cfg]` that way turns an unproven
+/// set into a silently exhaustive one, which is exactly the failure this module
+/// exists to prevent — so the search must not be truncatable by attribute
+/// content.
+///
+/// The accumulated list resets at a depth-zero `;` or `}` reached *outside* any
+/// attribute group, which is the end of the previous module-level item.
+fn preceding_attributes(bytes: &[u8], item_start: usize) -> AttributeScan {
+    let prefix = &bytes[..item_start];
     let mut scanner = Scanner::new(prefix);
     let mut depth: i64 = 0;
-    let mut boundary = 0_usize;
+    let mut names: Vec<String> = Vec::new();
     while let Some(event) = scanner.next_event() {
         match event {
             Event::OpenBrace => depth += 1,
@@ -391,55 +416,91 @@ fn last_item_boundary(bytes: &[u8], before: usize) -> usize {
                 depth -= 1;
                 if depth <= 0 {
                     depth = 0;
-                    boundary = scanner.position();
-                }
-            }
-            Event::Other => {
-                let position = scanner.position();
-                if depth == 0 && prefix[position - 1] == b';' {
-                    boundary = position;
+                    names.clear();
                 }
             }
             Event::Word { .. } => {}
+            Event::Other => {
+                let position = scanner.position();
+                if depth != 0 {
+                    continue;
+                }
+                match prefix[position - 1] {
+                    b'#' => {
+                        let Some((name, end)) = read_attribute(prefix, position - 1) else {
+                            return AttributeScan {
+                                names,
+                                unparseable: true,
+                            };
+                        };
+                        names.push(name);
+                        scanner = Scanner::at(prefix, end);
+                    }
+                    b';' => names.clear(),
+                    _ => {}
+                }
+            }
         }
     }
-    boundary
+    names.sort_unstable();
+    names.dedup();
+    AttributeScan {
+        names,
+        unparseable: false,
+    }
 }
 
-/// Attribute names appearing at the front of `text`, skipping comments.
-fn parse_attribute_names(text: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut rest = text.trim_start();
-    loop {
-        if let Some(after) = rest.strip_prefix("//") {
-            rest = after.find('\n').map_or("", |index| &after[index + 1..]);
-            rest = rest.trim_start();
-            continue;
-        }
-        if rest.starts_with("/*") {
-            let Some(end) = rest.find("*/") else {
-                return names;
-            };
-            rest = rest[end + 2..].trim_start();
-            continue;
-        }
-        if rest.starts_with('#') {
-            let Some(open) = rest.find('[') else {
-                return names;
-            };
-            let Some(close) = matching_bracket(&rest[open..]) else {
-                return names;
-            };
-            let inner = &rest[open + 1..open + close];
-            let name_end = inner
-                .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
-                .unwrap_or(inner.len());
-            names.push(inner[..name_end].to_owned());
-            rest = rest[open + close + 1..].trim_start();
-            continue;
-        }
-        return names;
+/// Read one whole attribute whose `#` sits at `hash`.
+///
+/// Returns its leading path segment and the offset just past its closing `]`,
+/// or `None` when the region is not an attribute this reader can close — a `#`
+/// with no `[`, or a `[` with no balanced `]`. Both are refusals, not empty
+/// results.
+fn read_attribute(bytes: &[u8], hash: usize) -> Option<(String, usize)> {
+    let mut cursor = skip_trivia(bytes, hash + 1);
+    // `#![...]` is the inner form. It attaches to the enclosing item rather
+    // than the next one, but it is still a group that must be stepped over
+    // whole, and naming it costs at worst one spurious caveat.
+    if bytes.get(cursor) == Some(&b'!') {
+        cursor = skip_trivia(bytes, cursor + 1);
     }
+    if bytes.get(cursor) != Some(&b'[') {
+        return None;
+    }
+    let end = attribute_group_end(bytes, cursor)?;
+    let inner = &bytes[cursor + 1..end - 1];
+    let text = String::from_utf8_lossy(inner);
+    let trimmed = text.trim_start();
+    let name_end = trimmed
+        .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .unwrap_or(trimmed.len());
+    Some((trimmed[..name_end].to_owned(), end))
+}
+
+/// Offset just past the `]` that closes the bracket group opening at `open`.
+///
+/// Uses the [`Scanner`], so a `]` inside a string, a raw string, a character
+/// literal or a comment does not close the group, and `{`, `}` and `;` inside
+/// the group are ignored entirely.
+fn attribute_group_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut scanner = Scanner::at(bytes, open);
+    let mut depth = 0_i64;
+    while let Some(event) = scanner.next_event() {
+        if matches!(event, Event::Other) {
+            let position = scanner.position();
+            match bytes[position - 1] {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(position);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// Offset just past the `>` closing a generic parameter list opening at `open`.
@@ -553,22 +614,13 @@ fn strip_leading_attributes<'item>(
 }
 
 /// Offset of the `]` closing an attribute opening at the start of `text`.
+///
+/// Literal-aware via [`attribute_group_end`], so `#[doc = "]"]` closes at its
+/// last bracket rather than at the one inside the string.
 fn matching_bracket(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
-    let mut depth = 0_i64;
-    for (index, byte) in bytes.iter().enumerate() {
-        match byte {
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(index);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    let open = bytes.iter().position(|byte| *byte == b'[')?;
+    attribute_group_end(bytes, open).map(|end| end - 1)
 }
 
 /// Split a leading Rust identifier off `text`.
@@ -893,6 +945,89 @@ mod tests {
     }
 
     #[test]
+    fn a_brace_delimited_attribute_cannot_hide_the_non_exhaustive_marker() {
+        // `#[bar { baz }]` is a legal attribute whose token tree contains
+        // braces. A reader that treats any `}` as the end of the previous item
+        // loses every attribute above it — including this `#[non_exhaustive]`.
+        let enumeration = enumerate(
+            "#[non_exhaustive]\n#[bar { baz }]\npub enum Action {\n    Record,\n    Assert,\n}\n",
+        );
+        assert_eq!(enumeration.members(), ["Record", "Assert"]);
+        assert!(!enumeration.exhaustive());
+        assert!(ids(&enumeration).contains(&DIAGNOSTIC_NON_EXHAUSTIVE));
+        assert!(ids(&enumeration).contains(&DIAGNOSTIC_ENUM_ATTRIBUTE));
+    }
+
+    #[test]
+    fn a_brace_delimited_attribute_cannot_hide_a_cfg_gate() {
+        let enumeration = enumerate(
+            "#[cfg(feature = \"x\")]\n#[bar { baz }]\npub enum Action {\n    Record,\n    Assert,\n}\n",
+        );
+        assert!(!enumeration.exhaustive());
+        assert_eq!(ids(&enumeration), [DIAGNOSTIC_ENUM_ATTRIBUTE]);
+    }
+
+    #[test]
+    fn a_semicolon_inside_an_attribute_does_not_end_the_previous_item() {
+        let enumeration = enumerate(
+            "#[non_exhaustive]\n#[bar(a; b)]\npub enum Action {\n    Record,\n    Assert,\n}\n",
+        );
+        assert!(!enumeration.exhaustive());
+        assert!(ids(&enumeration).contains(&DIAGNOSTIC_NON_EXHAUSTIVE));
+        assert!(ids(&enumeration).contains(&DIAGNOSTIC_ENUM_ATTRIBUTE));
+    }
+
+    #[test]
+    fn an_unknown_brace_delimited_attribute_alone_makes_the_read_non_exhaustive() {
+        // An attribute proc-macro may rewrite the item wholesale, so seeing one
+        // at all costs the read its exhaustiveness — whatever delimiter it used.
+        let enumeration =
+            enumerate("#[bar { baz }]\npub enum Action {\n    Record,\n    Assert,\n}\n");
+        assert_eq!(enumeration.members(), ["Record", "Assert"]);
+        assert!(!enumeration.exhaustive());
+        assert_eq!(ids(&enumeration), [DIAGNOSTIC_ENUM_ATTRIBUTE]);
+    }
+
+    #[test]
+    fn an_attribute_region_the_reader_cannot_parse_fails_closed() {
+        // Unbalanced `[`: the reader cannot prove what the attribute list was,
+        // so it must say so rather than report an empty list.
+        let enumeration =
+            enumerate("#[bar[oops]\npub enum Action {\n    Record,\n    Assert,\n}\n");
+        assert!(!enumeration.exhaustive());
+        assert!(ids(&enumeration).contains(&DIAGNOSTIC_ENUM_ATTRIBUTE));
+
+        // A `#` at item level that never opens a bracket is equally unprovable.
+        let stray = enumerate("#\npub enum Action {\n    Record,\n    Assert,\n}\n");
+        assert!(!stray.exhaustive());
+        assert!(ids(&stray).contains(&DIAGNOSTIC_ENUM_ATTRIBUTE));
+    }
+
+    #[test]
+    fn a_preceding_item_with_braces_does_not_swallow_the_enum_attributes() {
+        let enumeration = enumerate(
+            "fn helper() { let _ = 1; }\n#[non_exhaustive]\npub enum Action {\n    Record,\n}\n",
+        );
+        assert!(!enumeration.exhaustive());
+        assert_eq!(ids(&enumeration), [DIAGNOSTIC_NON_EXHAUSTIVE]);
+    }
+
+    #[test]
+    fn a_bracket_inside_an_attribute_string_does_not_close_it() {
+        // `#[doc = "]"]` closes at the LAST bracket; a counter that is blind to
+        // string literals would stop early and misread the rest as a variant.
+        let enumeration = enumerate(
+            "#[doc = \"]\"]\npub enum Action {\n    #[doc = \"]\"]\n    Record,\n    Assert,\n}\n",
+        );
+        assert_eq!(enumeration.members(), ["Record", "Assert"]);
+        assert!(
+            enumeration.exhaustive(),
+            "diagnostics: {:?}",
+            ids(&enumeration)
+        );
+    }
+
+    #[test]
     fn a_macro_inside_the_body_makes_the_read_non_exhaustive() {
         let enumeration = enumerate("pub enum Action {\n    Record,\n    generated!(),\n}\n");
         assert!(!enumeration.exhaustive());
@@ -1047,6 +1182,30 @@ mod tests {
             plain.output_digest(),
             enumerate("pub enum Action { Record, Assert }").output_digest()
         );
+    }
+
+    #[test]
+    fn a_crafted_attribute_cannot_make_the_real_enum_look_exhaustive() {
+        // The observed blob is untrusted by construction, so "a source file
+        // written to defeat this reader" is in the threat model. Here the real
+        // file is crafted so that a brace-and-semicolon token tree sits between
+        // the reader and a `#[non_exhaustive]`.
+        let source = include_str!("../service.rs").replace(
+            "pub enum RememberAction {",
+            "#[non_exhaustive]\n#[rewrites_the_item { and; a; semicolon }]\npub enum RememberAction {",
+        );
+        let enumeration = enumerate_rust_enum(&source, "RememberAction", 64).unwrap();
+        assert!(
+            !enumeration.exhaustive(),
+            "diagnostics: {:?}",
+            ids(&enumeration)
+        );
+        assert!(ids(&enumeration).contains(&DIAGNOSTIC_NON_EXHAUSTIVE));
+        assert!(ids(&enumeration).contains(&DIAGNOSTIC_ENUM_ATTRIBUTE));
+        // `Deploy` really is absent from the real enum. A read that cannot
+        // prove it saw the whole set still must not be allowed to say so, and
+        // downstream only ever learns that through the diagnostics.
+        assert!(!enumeration.contains("Deploy"));
     }
 
     #[test]
