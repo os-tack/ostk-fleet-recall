@@ -26,7 +26,11 @@
 //!
 //! # What it deliberately cannot claim
 //!
-//! It cannot claim that a run outside its window did or did not fail.
+//! It cannot claim that a run outside its window did or did not fail, and it
+//! cannot claim a window the provider's own answer did not reach: a `gh`
+//! listing cut off by its `--limit` narrows the minted window to the oldest run
+//! it actually names, or is refused outright, rather than reporting an unread
+//! range as measured ([`scan`]).
 //! [`answer_first_failure`] checks containment BEFORE it examines any run, so a
 //! question reaching outside the measured range resolves to
 //! [`CiFirstFailureAnswerV1::Unknown`] rather than to a negative. Absence of a
@@ -110,5 +114,5 @@ pub use fact::{
 pub use ingress::{CI_FACT_MEDIA_TYPE, CiConnectorBindingV1, CiIngressClocksV1, CiIngressV1};
 pub use scan::{
     CiRunProvider, CiScanRequestV1, CiScanV1, GH_RUN_LIST_FIELDS, GhCliRunProvider,
-    RecordedRunProvider, scan_runs,
+    MAX_GH_RUN_LIST_LIMIT, RecordedRunProvider, scan_runs,
 };

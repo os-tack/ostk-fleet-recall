@@ -108,6 +108,56 @@ pub enum CiScanError {
     /// The requested window is empty or inverted.
     #[error("ci scan request names an empty window")]
     EmptyWindow,
+    /// The provider's own listing maximum is too small to reach back to the
+    /// requested window's first run.
+    ///
+    /// The listing is newest-first with no run-number filter, so a limit that
+    /// does not reach `first_run_number` returns only the newest slice and the
+    /// older part of the request is simply absent. Capping the limit and
+    /// scanning anyway would mint a window claiming runs the provider never
+    /// showed, which is the false-completeness COVER-01..03 forbid. The caller
+    /// must narrow the request instead.
+    #[error(
+        "ci provider listing would have to reach back {needed} runs to touch run \
+         {first_run_number}, more than the provider's maximum of {maximum}"
+    )]
+    ProviderReachExceeded {
+        /// How many runs the listing would have to reach back.
+        needed: u64,
+        /// The provider's own maximum.
+        maximum: u64,
+        /// The window's first run number, which the limit could not reach.
+        first_run_number: u64,
+    },
+    /// The operator-supplied newest run number is older than the window's last
+    /// run, so the listing cannot contain the top of the requested range.
+    #[error(
+        "ci provider head run {newest_run_number} is older than the requested last run \
+         {last_run_number}"
+    )]
+    StaleProviderHead {
+        /// The newest run number the caller configured.
+        newest_run_number: u64,
+        /// The last run number the request asks for.
+        last_run_number: u64,
+    },
+    /// The provider's answer was cut off at its limit before reaching anything
+    /// the requested window could be narrowed to.
+    ///
+    /// A truncated listing proves coverage back to the oldest run it names and
+    /// no further. When even that run lies above the window, there is nothing
+    /// honest left to claim, so the scan refuses rather than reporting an
+    /// unmeasured range as measured.
+    #[error(
+        "ci provider listing was cut off at {item_count} items and never reached the requested \
+         window ending at run {last_run_number}"
+    )]
+    ListingTruncated {
+        /// How many items the truncated listing carried.
+        item_count: usize,
+        /// The last run number the request asks for.
+        last_run_number: u64,
+    },
 }
 
 /// Result alias for ingress construction.

@@ -6,7 +6,10 @@
 //! those real bytes rather than by inventing a payload.
 
 use super::*;
-use crate::connectors::ci::fact::{CiOutcomeV1, CiRunStatusV1};
+use crate::connectors::ci::fact::{
+    CiFailureQuestionV1, CiFirstFailureAnswerV1, CiOutcomeV1, CiRunStatusV1, CiUnknownReasonV1,
+    answer_first_failure,
+};
 use crate::memory_contracts::common::ContractId;
 
 fn repository() -> CiRepositoryIdV1 {
@@ -299,4 +302,182 @@ fn every_recorded_job_step_carries_a_modelled_status() {
         .flat_map(|run| run.jobs.iter())
         .all(|job| job.status == CiRunStatusV1::Completed);
     assert!(modelled, "every job in a settled run has completed");
+}
+
+// ---------------------------------------------------------------------------
+// A window may only claim what the provider's answer actually reached.
+//
+// `gh run list` is newest-first behind a `--limit`. When the limit does not
+// reach the oldest run the request asks for, the payload holds the newest
+// slice and NOTHING says the rest was dropped. These are the proofs that a
+// scan cannot turn that silence into coverage.
+// ---------------------------------------------------------------------------
+
+/// The REAL recorded listing, cut the way `gh --limit` cuts one: newest first,
+/// keeping only runs at or above `oldest_kept`.
+fn newest_first_truncated_listing(oldest_kept: u64) -> Vec<u8> {
+    let mut items: Vec<serde_json::Value> = serde_json::from_slice(RECORDED_RUN_LIST).unwrap();
+    items.retain(|item| item["number"].as_u64().unwrap() >= oldest_kept);
+    items.sort_by_key(|item| std::cmp::Reverse(item["number"].as_u64().unwrap()));
+    serde_json::to_vec(&items).unwrap()
+}
+
+#[test]
+fn a_truncated_listing_narrows_the_window_instead_of_claiming_what_it_never_read() {
+    // The provider was asked for runs 1..8 but its limit only reached run 6,
+    // so runs 1..5 -- including the repository's real first failure at run 5 --
+    // are absent from the payload with no marker saying so.
+    let listing = newest_first_truncated_listing(6);
+    let provider = recorded_provider()
+        .with_runs(&listing)
+        .with_listing_bound(3);
+
+    let scan = scan_runs(&provider, &recorded_request(repository()), &fetched_at())
+        .expect("a cut-off listing still measures the part it reached");
+
+    assert_eq!(
+        scan.window.first_run_number, 6,
+        "the window may only claim back to the oldest run the listing proves it reached"
+    );
+    assert_eq!(scan.window.last_run_number, 8);
+    assert_eq!(scan.narrowed_from_first_run_number, Some(1));
+    assert!(scan.was_narrowed());
+    assert!(
+        !scan.window.starts_at_origin(),
+        "a window that never reached run one cannot support the origin question"
+    );
+    assert_eq!(
+        scan.runs
+            .iter()
+            .map(|run| run.run_number)
+            .collect::<Vec<_>>(),
+        vec![6, 7, 8]
+    );
+
+    // And the question the connector exists for now resolves honestly. Before
+    // the window was narrowed this returned FirstFailure { run_number: 8 } --
+    // the real first failure is run 5, below the cut.
+    let answer = answer_first_failure(
+        &scan.window,
+        &scan.runs,
+        CiFailureQuestionV1::since_the_beginning(RECORDED_LAST_RUN),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            answer,
+            CiFirstFailureAnswerV1::Unknown {
+                reason: CiUnknownReasonV1::QuestionStartsBeforeWindow,
+                ..
+            }
+        ),
+        "unexpected answer over an unread range: {answer:?}"
+    );
+    assert!(!answer.is_verified_negative());
+}
+
+#[test]
+fn a_listing_cut_off_above_the_window_is_refused_rather_than_read_as_a_negative() {
+    // The limit reached only runs 6..8 while the request asks about 1..4, so
+    // NOTHING in the requested range was looked at. Filtering the listing to
+    // the window leaves it empty, which without this refusal would mint a
+    // window over 1..4 and answer "no failure occurred" about runs nobody read.
+    let listing = newest_first_truncated_listing(6);
+    let provider = recorded_provider()
+        .with_runs(&listing)
+        .with_listing_bound(3);
+    let mut request = recorded_request(repository());
+    request.last_run_number = 4;
+
+    let error = scan_runs(&provider, &request, &fetched_at())
+        .expect_err("an unread range is not a measured one");
+    assert!(
+        matches!(
+            error,
+            CiScanError::ListingTruncated {
+                item_count: 3,
+                last_run_number: 4,
+            }
+        ),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn a_listing_that_did_not_reach_its_bound_is_the_whole_answer() {
+    // The complementary case: the recorded corpus is short of its bound, so it
+    // is the provider's complete answer and the window keeps the full request.
+    let provider = recorded_provider().with_listing_bound(64);
+    let scan = scan_runs(&provider, &recorded_request(repository()), &fetched_at()).unwrap();
+    assert_eq!(scan.window.first_run_number, RECORDED_FIRST_RUN);
+    assert_eq!(scan.narrowed_from_first_run_number, None);
+    assert!(!scan.was_narrowed());
+    assert!(scan.window.starts_at_origin());
+}
+
+#[test]
+fn a_reach_beyond_the_providers_maximum_is_refused_rather_than_silently_capped() {
+    // Runs 5000..5100 with a head at run 9000: the provider would have to list
+    // 4001 runs to touch 5000. Capping at 1000 returns runs 8001..9000, none of
+    // which is in the window -- the scan would read nothing and claim
+    // 5000..5100 anyway.
+    let mut request = recorded_request(repository());
+    request.first_run_number = 5_000;
+    request.last_run_number = 5_100;
+
+    let error = request
+        .provider_limit(9_000)
+        .expect_err("a limit that cannot reach the window is not a limit to use");
+    assert!(
+        matches!(
+            error,
+            CiScanError::ProviderReachExceeded {
+                needed: 4_001,
+                maximum: MAX_GH_RUN_LIST_LIMIT,
+                first_run_number: 5_000,
+            }
+        ),
+        "unexpected error: {error}"
+    );
+
+    // The real provider refuses before it spawns anything, so nothing here
+    // opens a socket to prove it.
+    let real = GhCliRunProvider::new(RECORDED_REPOSITORY, 9_000).unwrap();
+    assert!(matches!(
+        real.list_runs(&request),
+        Err(CiScanError::ProviderReachExceeded { .. })
+    ));
+    assert!(matches!(
+        real.listing_bound(&request),
+        Err(CiScanError::ProviderReachExceeded { .. })
+    ));
+
+    // A reach of exactly the maximum is still admissible.
+    let edge = recorded_request(repository());
+    assert_eq!(edge.provider_limit(1_000).unwrap(), MAX_GH_RUN_LIST_LIMIT);
+    assert!(matches!(
+        edge.provider_limit(1_001),
+        Err(CiScanError::ProviderReachExceeded { .. })
+    ));
+}
+
+#[test]
+fn a_head_run_older_than_the_window_is_refused() {
+    // A stale operator-supplied head truncates the listing exactly as a short
+    // limit does, and it cannot even contain the top of the range.
+    let request = recorded_request(repository());
+    let error = request
+        .provider_limit(4)
+        .expect_err("a head below the window cannot list the window");
+    assert!(
+        matches!(
+            error,
+            CiScanError::StaleProviderHead {
+                newest_run_number: 4,
+                last_run_number: 8,
+            }
+        ),
+        "unexpected error: {error}"
+    );
+    assert!(request.provider_limit(RECORDED_LAST_RUN).is_ok());
 }

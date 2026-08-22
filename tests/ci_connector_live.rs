@@ -21,6 +21,10 @@
 //!   — returns the failing run;
 //! * the measured window is durable, and the operator's question resolves to
 //!   run 5 inside it and to UNKNOWN outside it;
+//! * a provider answer cut off by its own `--limit` narrows the window it
+//!   mints, and the narrowing survives into durable state, so the question
+//!   below the cut resolves to UNKNOWN rather than naming a later run as the
+//!   first failure;
 //! * a re-drain of the same recorded window is an exact replay;
 //! * an unsettled run is refused, and a candidate whose scope is not the
 //!   witness's is refused closed before anything is written.
@@ -1315,5 +1319,126 @@ async fn live_a_candidate_that_declares_a_foreign_scope_is_refused() {
         scoped_count(&pool, "memory_evidence_events", &memory.physical_scope).await,
         0,
         "a refused candidate writes nothing"
+    );
+}
+
+/// A provider answer cut off by its own `--limit` narrows the window, and the
+/// narrowing survives all the way into durable state.
+///
+/// This is the failure the window discipline exists to stop. `gh run list` is
+/// newest-first behind a limit; when the limit does not reach the oldest run
+/// the request names, the payload holds only the newest slice and says nothing
+/// about the rest. Minting the requested window over that answer would record
+/// a durable claim to have measured runs 1..8 while having read only 6..8 —
+/// and this repository's real first CI failure is run 5, below the cut. The
+/// question would then answer "run 8 was the first failure", which is false.
+#[tokio::test]
+async fn live_a_truncated_provider_listing_records_only_the_range_it_reached() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = live_pool(&database_url).await;
+    let fixture = fixture();
+    let memory = activate(&pool, &fixture, "cutoff", 0x35).await;
+    let binding = binding(&memory);
+
+    // The REAL recorded listing, cut the way a short `--limit` cuts one.
+    let mut items: Vec<serde_json::Value> = serde_json::from_slice(RECORDED_RUN_LIST).unwrap();
+    items.retain(|item| item["number"].as_u64().unwrap() >= 6);
+    items.sort_by_key(|item| std::cmp::Reverse(item["number"].as_u64().unwrap()));
+    let cut = serde_json::to_vec(&items).unwrap();
+    let provider = recorded_provider()
+        .with_runs(&cut)
+        .with_listing_bound(u64::try_from(items.len()).unwrap());
+
+    // The request still asks for the whole history.
+    let request = recorded_request(repository_id());
+    assert_eq!(request.first_run_number, RECORDED_FIRST_RUN);
+    let scan = scan_runs(&provider, &request, &fetched_at()).expect("the reached part is readable");
+    assert_eq!(
+        scan.window.first_run_number, 6,
+        "the window may only claim the range the provider's answer reached"
+    );
+    assert_eq!(
+        scan.narrowed_from_first_run_number,
+        Some(RECORDED_FIRST_RUN)
+    );
+    assert_eq!(scan.admitted_run_count(), 3);
+
+    // Drain it: three runs plus one window observation.
+    let mut log = CiWindowObservationLogV1::new(ContractId::new(CONNECTOR_INSTANCE).unwrap());
+    let facts = ci_scan_facts(&scan, &mut log, 16).expect("the scan must become a fact batch");
+    let received_at = canonical_time(server_time(&pool).await);
+    let context = CiDrainContextV1 {
+        binding: &binding,
+        active: &memory.active,
+        witness: &memory.witness,
+        ledger: memory.ledger.as_ref(),
+        control_scope: &memory.trusted_scope,
+        kek: &content_key(),
+        clocks: &clocks(received_at),
+    };
+    let report = drain_ci_facts(&context, &facts)
+        .await
+        .expect("the reached runs are admissible");
+    assert_eq!(report.appended, 4);
+    assert_eq!(report.quarantined, 0);
+
+    // The DURABLE window states the narrowed range, not the requested one.
+    let windows = CockroachCiMeasuredWindowRepository::new(
+        pool.clone(),
+        memory.physical_scope.tenant_id,
+        memory.physical_scope.project.clone(),
+    );
+    let row = CiMeasuredWindowRowV1 {
+        connector_instance: ContractId::new(CONNECTOR_INSTANCE).unwrap(),
+        window: scan.window.clone(),
+        window_id: scan.window.window_id().unwrap(),
+        admitted_run_count: scan.admitted_run_count(),
+        failed_run_count: scan.failed_run_count(),
+        source_digest: ci_scan_manifest_digest(&report.admitted_keys),
+        evidence_id: report.window_observation_event.unwrap(),
+    };
+    windows
+        .record_window(&row)
+        .await
+        .expect("the measured window must be recordable");
+    let recorded = windows
+        .measured_windows(&ContractId::new(CONNECTOR_INSTANCE).unwrap())
+        .await
+        .expect("the measured window must be readable");
+    assert_eq!(recorded.len(), 1);
+    let measured = &recorded[0].window;
+    assert_eq!(
+        measured.first_run_number, 6,
+        "durable state must not claim a range the provider never showed"
+    );
+    assert!(
+        !measured.starts_at_origin(),
+        "a cut-off window cannot support the origin question"
+    );
+
+    // And the operator's question, asked against that durable window, is
+    // UNKNOWN — never a negative and never a false first.
+    let answer = answer_first_failure(
+        measured,
+        &scan.runs,
+        CiFailureQuestionV1::since_the_beginning(RECORDED_LAST_RUN),
+    )
+    .expect("the question must resolve");
+    assert!(
+        matches!(
+            answer,
+            CiFirstFailureAnswerV1::Unknown {
+                reason: CiUnknownReasonV1::QuestionStartsBeforeWindow,
+                ..
+            }
+        ),
+        "a question below the measured window must be UNKNOWN: {answer:?}"
+    );
+    assert!(!answer.is_verified_negative());
+    assert_ne!(
+        RECORDED_FIRST_FAILING_RUN, 8,
+        "run 5 is the real first failure, and it is below the cut"
     );
 }

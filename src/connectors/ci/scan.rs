@@ -25,6 +25,30 @@
 //! caller must narrow the request to a range the provider has finished. A
 //! window is a claim about immutable objects, and a range containing a moving
 //! one is not that claim.
+//!
+//! # A window is what the provider SHOWED, never what the request asked for
+//!
+//! `gh run list` is newest-first and takes a `--limit`, not a run-number range.
+//! Ask for a limit that does not reach back to the window's first run and the
+//! provider answers with the newest slice and says nothing about the rest —
+//! the older part of the request is simply absent from the payload, with no
+//! marker in it. Minting the requested window over that answer would claim runs
+//! nobody read: a failure below the cut would vanish and be reported as a later
+//! run being "the first failure", and an empty slice would read as "no failure
+//! occurred" over a range that was never opened. Two rules keep that from
+//! happening:
+//!
+//! * [`CiScanRequestV1::provider_limit`] REFUSES a request whose reach exceeds
+//!   [`MAX_GH_RUN_LIST_LIMIT`], or whose configured head run is older than the
+//!   window's last run, instead of clamping the limit and under-reading.
+//! * [`scan_runs`] asks the seam for its [`CiRunProvider::listing_bound`] and,
+//!   when the answer reached that bound, narrows the minted window to the
+//!   oldest run the listing actually names — recording the request's own first
+//!   run in [`CiScanV1::narrowed_from_first_run_number`] — or refuses outright
+//!   when the cut landed above the window entirely. A question below the
+//!   narrowed window then resolves to
+//!   [`super::fact::CiFirstFailureAnswerV1::Unknown`], which is the honest
+//!   answer.
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -50,6 +74,12 @@ headBranch,headSha,event,status,conclusion,createdAt,startedAt,updatedAt,attempt
 
 /// Largest provider payload this reader will parse, in bytes.
 pub const MAX_PROVIDER_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Largest `--limit` `gh run list` will honour.
+///
+/// A request needing more reach than this is refused, never capped: see
+/// [`CiScanRequestV1::provider_limit`].
+pub const MAX_GH_RUN_LIST_LIMIT: u64 = 1_000;
 
 /// What one scan asks the provider for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,11 +154,34 @@ impl CiScanRequestV1 {
     ///
     /// The provider lists newest first with no run-number filter, so the limit
     /// must reach back far enough to include the oldest run in the window.
-    /// Bounded by the provider's own maximum.
-    #[must_use]
-    pub const fn provider_limit(&self, newest_run_number: u64) -> u64 {
+    ///
+    /// This deliberately does NOT clamp. Clamping to
+    /// [`MAX_GH_RUN_LIST_LIMIT`] would return the newest slice of the history
+    /// and leave the older part of the window absent from the payload, while
+    /// the minted window went on claiming the whole requested range — a scan
+    /// that reads runs 8001..9000 but says it measured 5000..5100 turns an
+    /// unread range into a verified negative. There is nothing honest to
+    /// return here, so the request is refused and the caller must narrow it.
+    ///
+    /// A `newest_run_number` older than [`Self::last_run_number`] is refused
+    /// for the same reason: the listing could not contain the top of the range
+    /// either.
+    pub const fn provider_limit(&self, newest_run_number: u64) -> CiScanResult<u64> {
+        if newest_run_number < self.last_run_number {
+            return Err(CiScanError::StaleProviderHead {
+                newest_run_number,
+                last_run_number: self.last_run_number,
+            });
+        }
         let reach = newest_run_number.saturating_sub(self.first_run_number) + 1;
-        if reach > 1_000 { 1_000 } else { reach }
+        if reach > MAX_GH_RUN_LIST_LIMIT {
+            return Err(CiScanError::ProviderReachExceeded {
+                needed: reach,
+                maximum: MAX_GH_RUN_LIST_LIMIT,
+                first_run_number: self.first_run_number,
+            });
+        }
+        Ok(reach)
     }
 }
 
@@ -140,6 +193,20 @@ impl CiScanRequestV1 {
 pub trait CiRunProvider: Send + Sync {
     /// The `gh run list` payload for `request`: a JSON array of run objects.
     fn list_runs(&self, request: &CiScanRequestV1) -> CiScanResult<Vec<u8>>;
+
+    /// The most run objects [`Self::list_runs`] may return for `request`.
+    ///
+    /// This is what lets [`scan_runs`] tell a COMPLETE answer from a CUT-OFF
+    /// one. The provider lists newest first, so a listing that reaches this
+    /// bound may have been truncated at its OLD end, and the scan may then
+    /// only claim coverage back to the oldest run the listing actually names.
+    ///
+    /// There is deliberately no default implementation. A defaulted "my answer
+    /// is always complete" is exactly the assumption that mints a window over
+    /// runs nobody read, so every provider has to state its own bound.
+    /// [`u64::MAX`] is the honest answer for a provider whose payload is
+    /// complete by construction.
+    fn listing_bound(&self, request: &CiScanRequestV1) -> CiScanResult<u64>;
 
     /// The `gh run view <run_id> --json jobs` payload for one run.
     fn view_run_jobs(&self, run_id: u64) -> CiScanResult<Vec<u8>>;
@@ -205,7 +272,9 @@ impl GhCliRunProvider {
 impl CiRunProvider for GhCliRunProvider {
     fn list_runs(&self, request: &CiScanRequestV1) -> CiScanResult<Vec<u8>> {
         request.validate()?;
-        let limit = request.provider_limit(self.newest_run_number).to_string();
+        // Refuses before anything is spawned when the reach the window needs is
+        // beyond what `gh` will list.
+        let limit = request.provider_limit(self.newest_run_number)?.to_string();
         Self::run(
             "run list",
             &[
@@ -223,6 +292,11 @@ impl CiRunProvider for GhCliRunProvider {
                 GH_RUN_LIST_FIELDS,
             ],
         )
+    }
+
+    fn listing_bound(&self, request: &CiScanRequestV1) -> CiScanResult<u64> {
+        request.validate()?;
+        request.provider_limit(self.newest_run_number)
     }
 
     fn view_run_jobs(&self, run_id: u64) -> CiScanResult<Vec<u8>> {
@@ -248,11 +322,23 @@ impl CiRunProvider for GhCliRunProvider {
 }
 
 /// The recorded provider: exact bytes captured from `gh`, replayed offline.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RecordedRunProvider {
     runs: Vec<u8>,
+    listing_bound: u64,
     jobs: BTreeMap<u64, Vec<u8>>,
     annotations: BTreeMap<u64, Vec<u8>>,
+}
+
+impl Default for RecordedRunProvider {
+    fn default() -> Self {
+        Self {
+            runs: Vec::new(),
+            listing_bound: u64::MAX,
+            jobs: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+        }
+    }
 }
 
 impl RecordedRunProvider {
@@ -261,9 +347,23 @@ impl RecordedRunProvider {
     pub fn new(runs: &[u8]) -> Self {
         Self {
             runs: runs.to_vec(),
+            // A recording is the WHOLE answer unless a test says otherwise.
+            listing_bound: u64::MAX,
             jobs: BTreeMap::new(),
             annotations: BTreeMap::new(),
         }
+    }
+
+    /// Replay the recorded bytes as the answer of a provider whose limit was
+    /// `bound`.
+    ///
+    /// Used to reproduce the shape `gh` returns when `--limit` cuts a
+    /// newest-first listing off before it reaches the oldest run the request
+    /// asked for.
+    #[must_use]
+    pub const fn with_listing_bound(mut self, bound: u64) -> Self {
+        self.listing_bound = bound;
+        self
     }
 
     /// Record the captured `gh run view --json jobs` payload for one run.
@@ -296,6 +396,11 @@ impl CiRunProvider for RecordedRunProvider {
     fn list_runs(&self, request: &CiScanRequestV1) -> CiScanResult<Vec<u8>> {
         request.validate()?;
         Ok(self.runs.clone())
+    }
+
+    fn listing_bound(&self, request: &CiScanRequestV1) -> CiScanResult<u64> {
+        request.validate()?;
+        Ok(self.listing_bound)
     }
 
     fn view_run_jobs(&self, run_id: u64) -> CiScanResult<Vec<u8>> {
@@ -383,9 +488,20 @@ fn provider_time(value: &str) -> CiScanResult<CanonicalTimestamp> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiScanV1 {
     /// The finite range this scan actually read.
+    ///
+    /// This is the range the provider's answer DEMONSTRABLY covered, which is
+    /// not always the range the request asked for: see
+    /// [`Self::narrowed_from_first_run_number`].
     pub window: CiCoverageWindowV1,
     /// Settled runs inside the window, ordered by run number.
     pub runs: Vec<CiWorkflowRunFactV1>,
+    /// The request's own first run number, when the provider's answer was cut
+    /// off before reaching it and the window had to be narrowed.
+    ///
+    /// `None` means the window is exactly the range that was asked for. When
+    /// it is `Some`, everything below [`CiCoverageWindowV1::first_run_number`]
+    /// is UNMEASURED and no answer derived from this scan may speak about it.
+    pub narrowed_from_first_run_number: Option<u64>,
 }
 
 impl CiScanV1 {
@@ -400,6 +516,41 @@ impl CiScanV1 {
     pub fn admitted_run_count(&self) -> u32 {
         u32::try_from(self.runs.len()).unwrap_or(u32::MAX)
     }
+
+    /// Whether the window claims less than the request asked for.
+    #[must_use]
+    pub const fn was_narrowed(&self) -> bool {
+        self.narrowed_from_first_run_number.is_some()
+    }
+}
+
+/// The first run number the provider's answer PROVES it reached back to.
+///
+/// A listing that did not reach its bound is the provider's complete answer for
+/// the filter, so it proves coverage back to the request's own first run — an
+/// absent run number means no such run matched, not that nobody looked. A
+/// listing that DID reach its bound may have been cut off at its old end, so it
+/// proves coverage back only as far as the oldest run it names, and the window
+/// must be narrowed to that. When even the oldest run it names is above the
+/// window, nothing about the request was measured and the scan refuses.
+fn measured_first_run_number(
+    request: &CiScanRequestV1,
+    listed_run_numbers: &[u64],
+    listing_bound: u64,
+) -> CiScanResult<u64> {
+    let item_count = listed_run_numbers.len();
+    let truncated = u64::try_from(item_count).unwrap_or(u64::MAX) >= listing_bound;
+    if !truncated {
+        return Ok(request.first_run_number);
+    }
+    match listed_run_numbers.iter().copied().min() {
+        Some(oldest) if oldest <= request.first_run_number => Ok(request.first_run_number),
+        Some(oldest) if oldest <= request.last_run_number => Ok(oldest),
+        _ => Err(CiScanError::ListingTruncated {
+            item_count,
+            last_run_number: request.last_run_number,
+        }),
+    }
 }
 
 /// Read one finite window of settled runs from the provider.
@@ -413,6 +564,7 @@ pub fn scan_runs(
     fetched_at: &CanonicalTimestamp,
 ) -> CiScanResult<CiScanV1> {
     request.validate()?;
+    let listing_bound = provider.listing_bound(request)?;
     let listing = provider.list_runs(request)?;
     if listing.len() > MAX_PROVIDER_PAYLOAD_BYTES {
         return Err(CiScanError::ScanTooLarge(MAX_PROVIDER_PAYLOAD_BYTES));
@@ -422,9 +574,14 @@ pub fn scan_runs(
             detail: "run listing is not the expected JSON array of run objects",
         })?;
 
+    // What the listing proves, before anything is filtered. A window may only
+    // claim a range the provider's answer demonstrably reached.
+    let listed_run_numbers: Vec<u64> = items.iter().map(|item| item.number).collect();
+    let measured_first = measured_first_run_number(request, &listed_run_numbers, listing_bound)?;
+
     let mut runs = Vec::new();
     for item in items {
-        if item.number < request.first_run_number || item.number > request.last_run_number {
+        if item.number < measured_first || item.number > request.last_run_number {
             continue;
         }
         runs.push(build_run(provider, request, &item)?);
@@ -447,7 +604,7 @@ pub fn scan_runs(
         repository: request.repository.clone(),
         workflow: CiTextV1::render(&request.workflow_file)?,
         branch: CiTextV1::render(&request.branch)?,
-        first_run_number: request.first_run_number,
+        first_run_number: measured_first,
         last_run_number: request.last_run_number,
         fetched_at: fetched_at.clone(),
     };
@@ -461,7 +618,13 @@ pub fn scan_runs(
             });
         }
     }
-    Ok(CiScanV1 { window, runs })
+    let narrowed_from_first_run_number =
+        (measured_first > request.first_run_number).then_some(request.first_run_number);
+    Ok(CiScanV1 {
+        window,
+        runs,
+        narrowed_from_first_run_number,
+    })
 }
 
 /// Build one settled run fact, refusing an unsettled one closed.

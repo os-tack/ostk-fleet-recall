@@ -82,6 +82,7 @@ fn scan() -> CiScanV1 {
                 )
             })
             .collect(),
+        narrowed_from_first_run_number: None,
     }
 }
 
