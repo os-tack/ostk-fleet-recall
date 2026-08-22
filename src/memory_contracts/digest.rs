@@ -319,6 +319,20 @@ pub enum DigestDomain {
     /// lexical projection is a lossy, normalized derivation of those bytes and
     /// must not be addressable under the body's own content address.
     LexicalProjectionTextV1, // W2-PROJ
+    // --- W2-GIT domains ---
+    /// W2-GIT. Provider-fact identity preimage for the git history connector:
+    /// the tree-entry coordinate, the ref entity, and the ref-observation
+    /// revision that makes a force push a NEW source fact rather than a
+    /// rewrite of the old one. Distinct from [`Self::Body`] and
+    /// [`Self::EvidenceSourceFactV2`], which frame content and the full
+    /// source-fact envelope respectively; this domain frames only the
+    /// connector's own provider coordinates.
+    GitProviderFactV1, // W2-GIT
+    /// W2-GIT. Content-addressed digest of exactly which git facts one
+    /// repository+ref scan observed, in order. This is the `source_digest` a
+    /// coverage receipt records, so it frames the observed set rather than any
+    /// governed payload.
+    GitScanManifestV1, // W2-GIT
 }
 
 impl DigestDomain {
@@ -468,6 +482,8 @@ impl DigestDomain {
             Self::CoverageProofV2 => "ostk-coverage-proof-v2",              // W2-PKG
             Self::ParserContractV2 => "ostk-parser-contract-v2",            // W2-PKG
             Self::LexicalProjectionTextV1 => "ostk-lexical-projection-text-v1", // W2-PROJ
+            Self::GitProviderFactV1 => "ostk-git-provider-fact-v1",         // W2-GIT
+            Self::GitScanManifestV1 => "ostk-git-scan-manifest-v1",         // W2-GIT
         }
     }
 }

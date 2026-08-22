@@ -10,6 +10,7 @@
 pub mod application;
 pub mod body_store;
 pub mod config;
+pub mod connectors;
 pub mod context;
 pub mod control_log;
 pub mod coverage_runtime;
