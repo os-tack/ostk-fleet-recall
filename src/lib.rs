@@ -19,6 +19,7 @@ pub mod evidence_ledger;
 pub mod ledger;
 pub mod mcp;
 pub mod memory_contracts;
+pub mod normative_runtime;
 pub mod private_postgres;
 pub mod projectors;
 pub mod reference_agent;
