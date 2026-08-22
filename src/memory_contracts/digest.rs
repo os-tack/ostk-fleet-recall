@@ -519,9 +519,9 @@ impl DigestDomain {
             Self::TranscriptTurnRevisionV1 => "ostk-transcript-turn-revision-v1", // W2-TRANS
             // --- W3 prefixes ---
             Self::NormativeActiveBindingSetV1 => "ostk-normative-active-binding-set-v1", // W3-NORM
-            Self::CiProviderFactV1 => "ostk-ci-provider-fact-v1", // W3-CIEV
-            Self::CiScanManifestV1 => "ostk-ci-scan-manifest-v1", // W3-CIEV
-            Self::CiCoverageWindowV1 => "ostk-ci-coverage-window-v1", // W3-CIEV
+            Self::CiProviderFactV1 => "ostk-ci-provider-fact-v1",                        // W3-CIEV
+            Self::CiScanManifestV1 => "ostk-ci-scan-manifest-v1",                        // W3-CIEV
+            Self::CiCoverageWindowV1 => "ostk-ci-coverage-window-v1",                    // W3-CIEV
         }
     }
 }
