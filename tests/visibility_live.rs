@@ -62,7 +62,7 @@ use ostk_fleet_recall::memory_contracts::registry::RegistryHeadV1;
 use ostk_fleet_recall::projectors::{
     CockroachDenseProjector, CockroachLexicalProjector, CockroachRecallReader, DenseProjector,
     EMBEDDING_DIMENSIONS, EmbeddingModelDescriptorV1, EmbeddingProvider, LexicalProjector,
-    PRIVATE_PLANE_RECALL_TABLES, RecallPlaneV1, RecallProjectionResult,
+    PRIVATE_PLANE_RECALL_TABLES, PUBLICATION_PLANE_VIEWS, RecallPlaneV1, RecallProjectionResult,
     publication_plane_grant_statements,
 };
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig, RetryPolicy};
@@ -732,6 +732,10 @@ async fn live_ranking_count_and_offset_probes_never_reveal_a_private_row() {
 }
 
 #[tokio::test]
+// One role, one grant surface, four attacks on it, and the teardown that
+// mirrors the grants. Splitting it would separate the grants from the
+// attacks they are supposed to withstand.
+#[allow(clippy::too_many_lines)]
 async fn live_the_real_publication_role_has_no_sql_path_to_a_private_row() {
     let Some(url) = database_url() else {
         return;
@@ -747,20 +751,20 @@ async fn live_the_real_publication_role_has_no_sql_path_to_a_private_row() {
     // Install the exact deployment grant surface: CONNECT, schema USAGE, and
     // the two publication VIEWS. No base table appears here, and the statements
     // come from the runtime rather than being retyped.
-    let role = "w2vis_publication_probe";
-    let password = "w2visprobepassword";
+    let role = format!("w2vis_probe_{}", Uuid::now_v7().simple());
+    let password = Uuid::now_v7().simple().to_string();
     let database: String = sqlx::query_scalar("SELECT pg_catalog.current_database()")
         .fetch_one(&pool)
         .await
         .unwrap();
     for statement in [
-        format!("CREATE ROLE IF NOT EXISTS {role} LOGIN PASSWORD '{password}'"),
+        format!("CREATE ROLE {role} WITH LOGIN PASSWORD '{password}'"),
         format!("GRANT CONNECT ON DATABASE {database} TO {role}"),
         format!("GRANT USAGE ON SCHEMA public TO {role}"),
     ] {
         sqlx::query(&statement).execute(&pool).await.unwrap();
     }
-    for statement in publication_plane_grant_statements(role) {
+    for statement in publication_plane_grant_statements(&role) {
         assert!(
             PRIVATE_PLANE_RECALL_TABLES
                 .iter()
@@ -772,7 +776,7 @@ async fn live_the_real_publication_role_has_no_sql_path_to_a_private_row() {
 
     let restricted: PgPool = PgPoolOptions::new()
         .max_connections(2)
-        .connect(&restricted_role_url(&url, role, password))
+        .connect(&restricted_role_url(&url, &role, &password))
         .await
         .expect("the restricted role must be able to connect");
 
@@ -846,7 +850,26 @@ async fn live_the_real_publication_role_has_no_sql_path_to_a_private_row() {
     assert!(texts[0].contains("public digest"));
     assert!(texts.iter().all(|text| !text.contains("postmortem")));
 
+    // Tear the probe role down. A leaked w2vis_probe_* role survives on the one
+    // server the authoritative official-binary lane runs everything on, where
+    // it shows up as an extra grantor row in that lane's exact PUBLIC
+    // routine-default audit. CockroachDB also refuses to drop a role that still
+    // holds a grant, so the teardown mirrors the grant list exactly (the
+    // registry_witness_live / evidence_ledger_live probe convention).
     restricted.close().await;
+    for view in PUBLICATION_PLANE_VIEWS {
+        sqlx::query(&format!("REVOKE ALL ON TABLE public.{view} FROM {role}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for statement in [
+        format!("REVOKE ALL ON SCHEMA public FROM {role}"),
+        format!("REVOKE ALL ON DATABASE {database} FROM {role}"),
+        format!("DROP ROLE IF EXISTS {role}"),
+    ] {
+        sqlx::query(&statement).execute(&pool).await.unwrap();
+    }
 }
 
 #[tokio::test]
