@@ -1791,6 +1791,198 @@ while IFS= read -r bootstrap_manifest_live_test; do
             "$bootstrap_manifest_live_test" -- --exact --nocapture
 done <<<"$bootstrap_manifest_live_tests"
 
+# Every Wave-2 gen-2 Stage-5 package activation (W2-PKG) connected test, by
+# exact discovered name; the set is asserted complete, so a live_* test that
+# nobody wires here fails this proof instead of silently not running.
+stage5_package_activation_live_tests='live_stage5_generation_two_activation_is_durable_and_idempotent'
+stage5_package_activation_live_listing=$(cargo test --locked \
+    --test stage5_package_activation_live -- --list)
+discovered_stage5_package_activation_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$stage5_package_activation_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact stage5-package-activation connected test set" \
+    "$discovered_stage5_package_activation_live_tests" \
+    "$stage5_package_activation_live_tests"
+while IFS= read -r stage5_package_activation_live_test; do
+    test -n "$stage5_package_activation_live_test" || continue
+    require_discovered_test "$stage5_package_activation_live_listing" \
+        "$stage5_package_activation_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test stage5_package_activation_live \
+            "$stage5_package_activation_live_test" -- --exact --nocapture
+done <<<"$stage5_package_activation_live_tests"
+
+# Every Wave-2 content-addressed body projection (W2-BODY) connected test, by
+# exact discovered name; the set is asserted complete, so a live_* test that
+# nobody wires here fails this proof instead of silently not running.
+body_projection_live_tests='live_body_content_collision_fails_closed
+live_cursor_atomicity_rollback_leaves_both_unadvanced
+live_occurrence_preimage_collision_fails_closed
+live_parser_upgrade_opens_a_shadow_generation
+live_replay_from_empty_rebuilds_byte_identical_rows
+live_reprojection_is_idempotent'
+body_projection_live_listing=$(cargo test --locked \
+    --test body_projection_live -- --list)
+discovered_body_projection_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$body_projection_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact body-projection connected test set" \
+    "$discovered_body_projection_live_tests" \
+    "$body_projection_live_tests"
+while IFS= read -r body_projection_live_test; do
+    test -n "$body_projection_live_test" || continue
+    require_discovered_test "$body_projection_live_listing" \
+        "$body_projection_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test body_projection_live \
+            "$body_projection_live_test" -- --exact --nocapture
+done <<<"$body_projection_live_tests"
+
+# Every Wave-2 coverage runtime (W2-COVER-RT) connected test, by exact
+# discovered name; the set is asserted complete, so a live_* test that nobody
+# wires here fails this proof instead of silently not running.
+coverage_runtime_live_tests='live_complete_coverage_is_recorded_at_the_db_level
+live_cursor_advance_and_receipt_are_atomic
+live_observed_through_short_of_window_end_fails_closed
+live_partial_coverage_from_a_gap_is_recorded
+live_re_observing_a_covered_range_is_idempotent
+live_unknown_coverage_from_an_unobserved_region_is_recorded
+live_zero_evidence_id_fails_closed'
+coverage_runtime_live_listing=$(cargo test --locked \
+    --test coverage_runtime_live -- --list)
+discovered_coverage_runtime_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$coverage_runtime_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact coverage-runtime connected test set" \
+    "$discovered_coverage_runtime_live_tests" \
+    "$coverage_runtime_live_tests"
+while IFS= read -r coverage_runtime_live_test; do
+    test -n "$coverage_runtime_live_test" || continue
+    require_discovered_test "$coverage_runtime_live_listing" \
+        "$coverage_runtime_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test coverage_runtime_live \
+            "$coverage_runtime_live_test" -- --exact --nocapture
+done <<<"$coverage_runtime_live_tests"
+
+# Every Wave-2 lexical-first / dense-later recall projection (W2-PROJ)
+# connected test, by exact discovered name; the set is asserted complete, so a
+# live_* test that nobody wires here fails this proof instead of silently not
+# running.
+recall_projection_live_tests='live_a_body_row_whose_bytes_do_not_match_its_address_fails_the_projection_closed
+live_a_degenerate_provider_vector_is_refused_and_writes_no_dense_row
+live_a_failing_embedding_provider_never_removes_lexical_availability
+live_body_rows_become_lexically_searchable_without_any_embedding
+live_killing_the_dense_worker_mid_batch_leaves_lexical_intact_and_the_dense_cursor_consistent
+live_no_projection_table_is_granted_to_the_publication_role
+live_replay_from_the_body_tables_rebuilds_byte_identical_projections
+live_the_dense_vector_index_keeps_the_c_spann_equality_prefix
+live_the_dense_worker_backfills_later_and_dense_search_then_works
+live_the_lexical_cursor_advances_atomically_with_its_rows
+live_the_projection_never_crosses_the_scope_it_was_bound_to'
+recall_projection_live_listing=$(cargo test --locked \
+    --test recall_projection_live -- --list)
+discovered_recall_projection_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$recall_projection_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact recall-projection connected test set" \
+    "$discovered_recall_projection_live_tests" \
+    "$recall_projection_live_tests"
+while IFS= read -r recall_projection_live_test; do
+    test -n "$recall_projection_live_test" || continue
+    require_discovered_test "$recall_projection_live_listing" \
+        "$recall_projection_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test recall_projection_live \
+            "$recall_projection_live_test" -- --exact --nocapture
+done <<<"$recall_projection_live_tests"
+
+# Every Wave-2 transcript connector ingress (W2-TRANS) connected test, by exact
+# discovered name; the set is asserted complete, so a live_* test that nobody
+# wires here fails this proof instead of silently not running.
+transcript_connector_live_tests='live_a_batch_and_its_source_cursor_advance_atomically
+live_a_candidate_selecting_a_foreign_scope_is_refused_closed
+live_a_connector_outside_the_active_package_is_refused_closed
+live_a_planted_secret_never_reaches_the_outbox_the_ledger_or_the_content_store
+live_a_transcript_directory_flows_to_accepted_events_and_content_objects
+live_re_collecting_a_source_and_re_draining_are_both_idempotent'
+transcript_connector_live_listing=$(cargo test --locked \
+    --test transcript_connector_live -- --list)
+discovered_transcript_connector_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$transcript_connector_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact transcript-connector connected test set" \
+    "$discovered_transcript_connector_live_tests" \
+    "$transcript_connector_live_tests"
+while IFS= read -r transcript_connector_live_test; do
+    test -n "$transcript_connector_live_test" || continue
+    require_discovered_test "$transcript_connector_live_listing" \
+        "$transcript_connector_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test transcript_connector_live \
+            "$transcript_connector_live_test" -- --exact --nocapture
+done <<<"$transcript_connector_live_tests"
+
+# Every Wave-2 git connector ingress (W2-GIT) connected test, by exact
+# discovered name; the set is asserted complete, so a live_* test that nobody
+# wires here fails this proof instead of silently not running.
+git_connector_live_tests='live_a_coverage_receipt_binds_the_ref_observation_and_is_idempotent_when_configured
+live_a_cross_tenant_candidate_is_rejected_closed_when_configured
+live_a_force_push_produces_a_new_observation_and_preserves_history_when_configured
+live_a_quarantined_ref_observation_cannot_anchor_a_receipt_when_configured
+live_a_re_scan_is_an_exact_replay_when_configured
+live_a_scratch_repository_flows_to_accepted_events_when_configured
+live_a_tag_and_a_rename_are_covered_when_configured'
+git_connector_live_listing=$(cargo test --locked \
+    --test git_connector_live -- --list)
+discovered_git_connector_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$git_connector_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact git-connector connected test set" \
+    "$discovered_git_connector_live_tests" \
+    "$git_connector_live_tests"
+while IFS= read -r git_connector_live_test; do
+    test -n "$git_connector_live_test" || continue
+    require_discovered_test "$git_connector_live_listing" \
+        "$git_connector_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test git_connector_live \
+            "$git_connector_live_test" -- --exact --nocapture
+done <<<"$git_connector_live_tests"
+
+# Every Wave-2 private/publication read-plane boundary (W2-VIS) connected test,
+# by exact discovered name; the set is asserted complete, so a live_* test that
+# nobody wires here fails this proof instead of silently not running.
+visibility_live_tests='live_a_body_with_no_recorded_decision_projects_as_private
+live_a_later_private_event_over_the_same_bytes_demotes_an_already_public_row
+live_ranking_count_and_offset_probes_never_reveal_a_private_row
+live_the_database_itself_refuses_an_unapproved_publication_safe_row
+live_the_private_plane_sees_both_classes_and_the_publication_plane_sees_only_public_rows
+live_the_real_publication_role_has_no_sql_path_to_a_private_row'
+visibility_live_listing=$(cargo test --locked \
+    --test visibility_live -- --list)
+discovered_visibility_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$visibility_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact read-plane visibility connected test set" \
+    "$discovered_visibility_live_tests" \
+    "$visibility_live_tests"
+while IFS= read -r visibility_live_test; do
+    test -n "$visibility_live_test" || continue
+    require_discovered_test "$visibility_live_listing" \
+        "$visibility_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test visibility_live \
+            "$visibility_live_test" -- --exact --nocapture
+done <<<"$visibility_live_tests"
+
 current_retry_live_test=ledger::cockroach::tests::live_current_projection_whole_unit_retry_when_configured
 current_snapshot_live_test=ledger::cockroach::tests::live_current_projection_snapshot_race_when_configured
 conflict_live_test=ledger::cockroach::tests::live_conflict_polarity_matrix_when_configured
