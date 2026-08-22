@@ -35,6 +35,7 @@ pub mod relation_admission_v2;
 pub mod relation_policy_v2;
 pub mod remember_v2;
 pub mod stage4_target_package;
+pub mod stage5_target_package;
 pub mod successor_activation;
 pub mod successor_generic;
 pub mod successor_package;
