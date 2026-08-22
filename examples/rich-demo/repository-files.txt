@@ -552,6 +552,8 @@ src/memory_contracts/error.rs|memory_contracts|rust
 src/memory_contracts/evidence.rs|memory_contracts|rust
 src/memory_contracts/evidence_v2.rs|memory_contracts|rust
 src/memory_contracts/generation2.rs|memory_contracts|rust
+src/memory_contracts/generation2_registry.rs|memory_contracts|rust
+src/memory_contracts/generation2_registry_tests.rs|memory_contracts|rust
 src/memory_contracts/genesis.rs|memory_contracts|rust
 src/memory_contracts/genesis_activation.rs|genesis_activation|rust
 src/memory_contracts/identity.rs|memory_contracts|rust

@@ -48,13 +48,13 @@ No accepted event was left unprojectable in this run.
 
 **Coverage verdict for the window: UNKNOWN.** The two receipts this run produced cover a git ref observation (`complete` over its own one-observation domain) and this session's transcript turns (`partial`). Neither domain is the CI-result domain, so coverage of the window the question asks about is not partial — it is unmeasured. Reporting the git receipt's `complete` as though it answered the question would be exactly the false completeness COVER-01..03 exist to prevent.
 
-The three clocks the ledger keeps separate, read back from the accepted event `50fcb4830dbf22ae863ed620d9f67f1170ac212f3d69439b2d5a8cc86e210a3a`:
+The three clocks the ledger keeps separate, read back from the accepted event `ef3d30050a0fa350afd837ef4db70a643c47a3e83ede826ccf010368938fe774`:
 
 | clock | value | what it means |
 | --- | --- | --- |
 | `occurred_at` | `2026-08-22T01:16:36.000000000Z` | the provider's own instant (the commit's committer time) |
 | `observed_at` | `2026-08-22T01:16:36.000000000Z` | when this connector saw the fact |
-| `accepted_at` | `2026-08-22T18:28:54.911066+00:00` | the database clock when the event became durable |
+| `accepted_at` | `2026-08-22T18:46:25.804141+00:00` | the database clock when the event became durable |
 
 Probes issued through `CockroachRecallReader::recall` (the lexical lane is `plainto_tsquery`, which ANDs its terms, so the question is asked as several short probes; every result is shown, including the empty ones):
 
@@ -240,13 +240,13 @@ Every governed content object in the scope, opened and searched. This is what th
 
 **Coverage verdict for this question's window: `partial`** (the transcript domain's own receipt). This run ingested exactly one session; every other session that discussed this pin is absent.
 
-The three clocks the ledger keeps separate, read back from the accepted event `721d0ae2389e252cc6786d796a1965a9dd2db8b1b25599db12acb4f4be0a252b`:
+The three clocks the ledger keeps separate, read back from the accepted event `e89e1876b63c1aa181a732128bf130a3d5a7ccd939d3452cea9e6102947792dc`:
 
 | clock | value | what it means |
 | --- | --- | --- |
 | `occurred_at` | `2026-08-22T02:03:31.000000000Z` | the provider's own instant (the commit's committer time) |
 | `observed_at` | `2026-08-22T02:03:31.000000000Z` | when this connector saw the fact |
-| `accepted_at` | `2026-08-22T18:28:55.009764+00:00` | the database clock when the event became durable |
+| `accepted_at` | `2026-08-22T18:46:25.895182+00:00` | the database clock when the event became durable |
 
 Probes issued through `CockroachRecallReader::recall` (the lexical lane is `plainto_tsquery`, which ANDs its terms, so the question is asked as several short probes; every result is shown, including the empty ones):
 
@@ -487,7 +487,7 @@ Every governed content object in the scope, opened and searched. This is what th
 
 4917 durable blobs were re-read and re-scanned with the connector's own `scan_secrets` — every transcript outbox row (candidate, locators, payload), every accepted-event canonical record, every projected body, and every lexical text. Findings: **0**. The run asserts this, so a leak fails the test rather than appearing as a line in a report nobody reads.
 
-**2 searchable row(s) had a secret-shaped range removed before being indexed.** That number is here because it is a real finding this run produced, not a behaviour to leave implicit: this repository's own history contains a commit whose message quotes a `postgresql://user:pass@host` fixture string. Carried as `HexBytes` it was invisible to a scanner reading the body; decoding it for search is what made it readable, and the activated redaction policy says `secrets_allowed_in_recall: false`, so the recall plane removes it.
+**2 searchable row(s) had a secret-shaped range removed before being indexed.** That number is here because it is a real finding this run produced, not a behaviour to leave implicit: this repository's own history contains a commit whose message quotes a connection-string fixture with an embedded `user:password` authority. Carried as `HexBytes` it was invisible to a scanner reading the body; decoding it for search is what made it readable, and the activated redaction policy says `secrets_allowed_in_recall: false`, so the recall plane removes it.
 
 **The residual, stated plainly:** the BODY still holds those bytes, hex-encoded, and deliberately so — a body is evidence and must reproduce the provider fact exactly. What was removed is the retrievable copy. Closing the gap at ingress needs a redactor on the GIT connector, which has none; the transcript connector redacts before its durable outbox and the git connector does not. That asymmetry is a finding of this run, not a thing it fixed.
 

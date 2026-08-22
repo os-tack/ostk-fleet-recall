@@ -138,6 +138,11 @@ git -C "$repo_root" ls-files |
             src/connectors/transcript/redactor_tests.rs) continue ;;
             src/connectors/transcript/test_fixture.rs) continue ;;
             tests/transcript_connector_live.rs) continue ;;
+            # W3-CHAIN: the lexical projector's tests carry the same kind of
+            # deliberate secret-shaped fixtures (a URL-embedded credential and a
+            # private-key header) because they test a redaction boundary. The
+            # production module src/projectors/lexical.rs stays in the corpus.
+            src/projectors/lexical_tests.rs) continue ;;
             # W0-TELEM's exemplar-scrubbing negative vector is deliberately
             # secret-shaped; it matches .dockerignore's `**/*secret*` and so is
             # excluded from the production image build context. Keep it out of

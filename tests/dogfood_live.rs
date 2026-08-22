@@ -1968,7 +1968,7 @@ fn render_report(
          **{redacted_rows} searchable row(s) had a secret-shaped range removed before being \
          indexed.** That number is here because it is a real finding this run produced, not a \
          behaviour to leave implicit: this repository's own history contains a commit whose \
-         message quotes a `postgresql://user:pass@host` fixture string. Carried as `HexBytes` it \
+         message quotes a connection-string fixture with an embedded `user:password` authority. Carried as `HexBytes` it \
          was invisible to a scanner reading the body; decoding it for search is what made it \
          readable, and the activated redaction policy says `secrets_allowed_in_recall: false`, \
          so the recall plane removes it.\n\n\
