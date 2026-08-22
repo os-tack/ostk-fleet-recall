@@ -21,6 +21,39 @@
 //!   addressed under its own digest domain
 //!   ([`DigestDomain::LexicalProjectionTextV1`]) and never under the body's
 //!   content address.
+//!
+//! # Why the pipeline knows about media types
+//!
+//! A body is a connector's canonical JSON rendering of one provider fact, not
+//! prose. Two consequences made the first version of this module unable to
+//! answer a word query:
+//!
+//! * a canonical body is JSON, so its punctuation and key names outweigh its
+//!   content in an inverted index; and
+//! * the git connector carries verbatim provider byte strings as `HexBytes`,
+//!   because the canonical-JSON profile admits only NFC strings with no control
+//!   scalars and a real commit message has newlines. A body therefore holds
+//!   `"message":"<hex>"`, and indexing it verbatim indexes a hex string. The
+//!   dogfood report had to hex-decode every commit message it quoted.
+//!
+//! The rule chosen, and the trade-off it takes: **the body stays byte-exact and
+//! the lexical text learns to read it.** For a media type this module declares,
+//! [`derive_lexical_projection`] renders the body's scalar leaves in canonical
+//! order and hex-decodes the byte-string fields that media type declares as
+//! text, then normalizes the result. The alternative — rendering provider text
+//! as canonical strings in the *body* — was rejected because it would either
+//! reject ordinary commits or rewrite provider bytes, and either way would move
+//! the body's content address and with it every chunk-occurrence identity
+//! derived from it.
+//!
+//! Nothing about identity is weakened by this. The body's content address, the
+//! occurrence ids, and the parse manifest are all unchanged; only the *lossy*
+//! search text differs, it is still addressed under its own digest domain, and
+//! [`LEXICAL_NORMALIZATION_VERSION`] rises so the old and new texts can never
+//! claim the same identity. A media type this module does not declare is
+//! normalized from its raw bytes exactly as before.
+
+use std::borrow::Cow;
 
 use unicode_normalization::UnicodeNormalization as _;
 
@@ -32,8 +65,120 @@ use super::error::{RecallProjectionError, RecallProjectionResult};
 ///
 /// It is part of the lexical text's digest preimage: changing the pipeline
 /// without changing this constant would let two different normalizers claim the
-/// same identity.
-pub const LEXICAL_NORMALIZATION_VERSION: u32 = 1;
+/// same identity. Version 2 added the media-type-aware rendering described
+/// above; version 1 normalized raw body bytes for every media type.
+pub const LEXICAL_NORMALIZATION_VERSION: u32 = 2;
+
+/// Media type of a canonical git provider fact.
+pub const GIT_FACT_MEDIA_TYPE: &str = "application.ostk-git-fact-v1";
+/// Media type of a canonical JSON body with no byte-string fields (the
+/// transcript connector's turn body).
+pub const CANONICAL_JSON_MEDIA_TYPE: &str = "application.json";
+
+/// Deepest canonical-JSON nesting this renderer will walk.
+///
+/// Well below the canonical profile's own depth bound, so a body that reaches
+/// it is not a body this pipeline produced; it falls back to raw-byte
+/// normalization rather than recursing.
+const MAX_RENDER_DEPTH: u32 = 32;
+
+/// Keys whose JSON string value is lowercase hex of verbatim provider bytes,
+/// per media type, sorted so lookup is a binary search.
+///
+/// This is a *declaration about a body format*, not a decoding heuristic: a key
+/// not listed here is indexed exactly as it is stored, so an object id stays an
+/// object id and is never mangled into bytes it does not mean.
+fn declared_text_fields(media_type: &str) -> Option<&'static [&'static str]> {
+    match media_type {
+        // GitCommitFactV1::message, GitIdentityV1::{name,email},
+        // GitBlobSourceFactV1::path.
+        GIT_FACT_MEDIA_TYPE => Some(&["email", "message", "name", "path"]),
+        // Canonical JSON with no byte-string fields: rendering still strips the
+        // JSON scaffolding so the turn text dominates its own index entry.
+        CANONICAL_JSON_MEDIA_TYPE => Some(&[]),
+        _ => None,
+    }
+}
+
+fn push_word(out: &mut String, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    out.push_str(value);
+}
+
+/// Append one JSON value's scalar leaves, decoding declared byte-string fields.
+///
+/// `key` is the object key the value was reached under, carried through arrays
+/// so a list of byte strings decodes element by element.
+fn render_value(
+    value: &serde_json::Value,
+    fields: &[&str],
+    key: Option<&str>,
+    depth: u32,
+    out: &mut String,
+) -> bool {
+    if depth > MAX_RENDER_DEPTH {
+        return false;
+    }
+    match value {
+        serde_json::Value::Null => {}
+        serde_json::Value::Bool(flag) => push_word(out, if *flag { "true" } else { "false" }),
+        serde_json::Value::Number(number) => push_word(out, &number.to_string()),
+        serde_json::Value::String(text) => {
+            let decoded = key
+                .filter(|name| fields.binary_search(name).is_ok())
+                .and_then(|_| hex::decode(text).ok())
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+            match decoded {
+                // Lossy on purpose: provider bytes with no declared encoding
+                // still have to produce SOME deterministic text, and the body
+                // itself keeps the exact bytes.
+                Some(text) => push_word(out, &text),
+                None => push_word(out, text),
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if !render_value(item, fields, key, depth + 1, out) {
+                    return false;
+                }
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for (name, item) in entries {
+                if !render_value(item, fields, Some(name), depth + 1, out) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The bytes the normalizer runs over for one body.
+///
+/// A declared media type whose body parses as JSON is rendered; anything else —
+/// an undeclared media type, a body that is not JSON, a body deeper than
+/// [`MAX_RENDER_DEPTH`] — falls back to the raw body bytes, which is the
+/// version-1 behaviour and never loses a body.
+fn searchable_source<'body>(media_type: &str, body_bytes: &'body [u8]) -> Cow<'body, [u8]> {
+    let Some(fields) = declared_text_fields(media_type) else {
+        return Cow::Borrowed(body_bytes);
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
+        return Cow::Borrowed(body_bytes);
+    };
+    let mut rendered = String::new();
+    if render_value(&value, fields, None, 0, &mut rendered) {
+        Cow::Owned(rendered.into_bytes())
+    } else {
+        Cow::Borrowed(body_bytes)
+    }
+}
 
 /// Upper bound on the normalized text stored per body.
 ///
@@ -221,14 +366,22 @@ fn normalize(body_bytes: &[u8]) -> (LexicalStateV1, String) {
 
 /// Derive one body's lexical projection, failing closed if the supplied bytes
 /// do not reproduce the body's content address.
+///
+/// `media_type` is the body row's own stored media type. It selects the
+/// rendering described in the module docs and nothing else: it cannot change
+/// the integrity check, and an unrecognized value is normalized from raw bytes.
 pub fn derive_lexical_projection(
     body_content_id: Sha256Digest,
     body_bytes: &[u8],
+    media_type: &str,
 ) -> RecallProjectionResult<LexicalProjectionV1> {
+    // Identity BEFORE any rendering: the media type steers what gets indexed,
+    // so it must never be able to steer what gets accepted.
     if body_digest(body_bytes) != body_content_id {
         return Err(RecallProjectionError::BodyIntegrityMismatch);
     }
-    let (state, text) = normalize(body_bytes);
+    let source = searchable_source(media_type, body_bytes);
+    let (state, text) = normalize(&source);
     let text_digest = lexical_text_digest(LEXICAL_NORMALIZATION_VERSION, state, &text);
     Ok(LexicalProjectionV1 {
         body_content_id,
@@ -243,8 +396,15 @@ pub fn derive_lexical_projection(
 mod tests {
     use super::*;
 
+    /// An undeclared media type: raw-byte normalization, the version-1 path.
+    const OPAQUE: &str = "application.octet-stream";
+
     fn projection(bytes: &[u8]) -> LexicalProjectionV1 {
-        derive_lexical_projection(body_digest(bytes), bytes).unwrap()
+        derive_lexical_projection(body_digest(bytes), bytes, OPAQUE).unwrap()
+    }
+
+    fn projection_of(media_type: &str, bytes: &[u8]) -> LexicalProjectionV1 {
+        derive_lexical_projection(body_digest(bytes), bytes, media_type).unwrap()
     }
 
     #[test]
@@ -254,9 +414,94 @@ mod tests {
         let honest = b"alpha beta";
         let swapped = b"gamma delta";
         assert!(matches!(
-            derive_lexical_projection(body_digest(honest), swapped),
+            derive_lexical_projection(body_digest(honest), swapped, OPAQUE),
             Err(RecallProjectionError::BodyIntegrityMismatch)
         ));
+    }
+
+    #[test]
+    fn the_media_type_cannot_talk_a_mismatched_body_past_the_integrity_check() {
+        // Rendering happens AFTER the content address is proven, so no media
+        // type — declared or not — can make foreign bytes projectable.
+        let honest = b"{\"message\":\"6869\"}";
+        let swapped = b"{\"message\":\"6a6b\"}";
+        assert!(matches!(
+            derive_lexical_projection(body_digest(honest), swapped, GIT_FACT_MEDIA_TYPE),
+            Err(RecallProjectionError::BodyIntegrityMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_git_fact_body_indexes_its_commit_message_as_words() {
+        // The defect the dogfood report found: a commit message carried as
+        // HexBytes indexed as a hex string, so `record-count` could not hit the
+        // commit that deleted the record-count pin.
+        let message = "ci: delete the brittle record-count pins";
+        let body = format!(
+            "{{\"commit_id\":\"abc123\",\"kind\":\"commit\",\"message\":\"{}\"}}",
+            hex::encode(message)
+        );
+        let derived = projection_of(GIT_FACT_MEDIA_TYPE, body.as_bytes());
+        assert_eq!(derived.state, LexicalStateV1::Indexed);
+        assert!(derived.text.contains("record-count"));
+        assert!(derived.text.contains("brittle"));
+        // The object id is not a declared text field, so it stays exactly as
+        // the body records it rather than being decoded into noise.
+        assert!(derived.text.contains("abc123"));
+        // And the hex spelling of the message is gone from the index.
+        assert!(!derived.text.contains(&hex::encode(message)));
+    }
+
+    #[test]
+    fn an_undeclared_media_type_still_indexes_the_raw_body() {
+        // Fallback, not failure: an unknown body format loses the rendering,
+        // never the row.
+        let body = br#"{"message":"6869"}"#;
+        let derived = projection_of(OPAQUE, body);
+        assert_eq!(derived.state, LexicalStateV1::Indexed);
+        assert!(derived.text.contains("6869"));
+    }
+
+    #[test]
+    fn a_canonical_json_body_indexes_its_text_without_the_json_scaffolding() {
+        let body = br#"{"ordinal":415,"role":"assistant","text":"the record-count pin"}"#;
+        let derived = projection_of(CANONICAL_JSON_MEDIA_TYPE, body);
+        assert_eq!(derived.text, "415 assistant the record-count pin");
+    }
+
+    #[test]
+    fn a_declared_field_that_is_not_hex_is_indexed_verbatim() {
+        // A body whose declared text field holds an ordinary string must not be
+        // dropped or mangled; decoding is best-effort, indexing is not.
+        let body = br#"{"message":"not hex at all"}"#;
+        let derived = projection_of(GIT_FACT_MEDIA_TYPE, body);
+        assert_eq!(derived.text, "not hex at all");
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_falls_back_to_its_raw_bytes() {
+        let body = b"this is not json";
+        let derived = projection_of(GIT_FACT_MEDIA_TYPE, body);
+        assert_eq!(derived.text, "this is not json");
+    }
+
+    #[test]
+    fn rendering_is_deterministic_and_independent_of_the_body_address() {
+        let body = br#"{"message":"6869","name":"6a6b"}"#;
+        assert_eq!(
+            projection_of(GIT_FACT_MEDIA_TYPE, body),
+            projection_of(GIT_FACT_MEDIA_TYPE, body)
+        );
+        // Two media types over the same bytes produce different SEARCH text and
+        // different text digests, and the body address is untouched by either.
+        assert_ne!(
+            projection_of(GIT_FACT_MEDIA_TYPE, body).text_digest,
+            projection_of(OPAQUE, body).text_digest
+        );
+        assert_eq!(
+            projection_of(GIT_FACT_MEDIA_TYPE, body).body_content_id,
+            projection_of(OPAQUE, body).body_content_id
+        );
     }
 
     #[test]

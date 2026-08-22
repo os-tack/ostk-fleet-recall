@@ -598,9 +598,8 @@ async fn activate(pool: &PgPool, fixture: &ContractFixture) -> ActivatedMemory {
     ));
     let witness = ledger.read_writer_authority_witness().await.unwrap();
     assert_eq!(witness.generation(), 1, "the head must be generation one");
-    let active =
-        ActiveStage4Package::bind(&fixture.stage4, generation_1_head.clone(), &witness)
-            .expect("the activated package is the Stage-4 target");
+    let active = ActiveStage4Package::bind(&fixture.stage4, generation_1_head.clone(), &witness)
+        .expect("the activated package is the Stage-4 target");
 
     ActivatedMemory {
         coverage: CockroachCoverageRuntimeRepository::new(

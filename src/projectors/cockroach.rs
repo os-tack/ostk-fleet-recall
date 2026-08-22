@@ -101,7 +101,7 @@ const UPSERT_CURSOR_SQL: &str = "INSERT INTO public.memory_recall_projection_cur
 // whose decision was never recorded — is PRIVATE, never publication-safe by
 // omission.
 const SELECT_BODIES_FROM_START_SQL: &str = "SELECT body.content_sha256, body.body_bytes, \
-            body.created_at, \
+            body.media_type, body.created_at, \
             COALESCE(visibility.visibility_class, 'private') AS visibility_class \
      FROM public.memory_body_objects_v1 AS body \
      LEFT JOIN public.memory_body_visibility_v1 AS visibility \
@@ -112,7 +112,7 @@ const SELECT_BODIES_FROM_START_SQL: &str = "SELECT body.content_sha256, body.bod
      ORDER BY body.created_at, body.content_sha256 LIMIT $3";
 
 const SELECT_BODIES_AFTER_SQL: &str = "SELECT body.content_sha256, body.body_bytes, \
-            body.created_at, \
+            body.media_type, body.created_at, \
             COALESCE(visibility.visibility_class, 'private') AS visibility_class \
      FROM public.memory_body_objects_v1 AS body \
      LEFT JOIN public.memory_body_visibility_v1 AS visibility \
@@ -268,6 +268,9 @@ const COMPLETENESS_PUBLICATION_SQL: &str = "SELECT \
 struct BodyRowV1 {
     position: BodyPositionV1,
     body_bytes: Vec<u8>,
+    /// The body row's own stored media type, which selects the lexical
+    /// rendering. Read from the body table, never from a request.
+    media_type: String,
     visibility: RowVisibilityClassV1,
 }
 
@@ -492,6 +495,7 @@ impl CockroachLexicalProjector {
                         content_id: digest32(row.try_get("content_sha256")?)?,
                     },
                     body_bytes: row.try_get("body_bytes")?,
+                    media_type: row.try_get("media_type")?,
                     visibility: RowVisibilityClassV1::parse(
                         row.try_get::<String, _>("visibility_class")?.as_str(),
                     )?,
@@ -514,7 +518,11 @@ impl CockroachLexicalProjector {
         let mut last = None;
         for body in batch {
             // Fails closed if the stored bytes do not reproduce the address.
-            let derived = derive_lexical_projection(body.position.content_id, &body.body_bytes)?;
+            let derived = derive_lexical_projection(
+                body.position.content_id,
+                &body.body_bytes,
+                &body.media_type,
+            )?;
             self.write_lexical(transaction, body.position, body.visibility, &derived)
                 .await?;
             summary.bodies_consumed += 1;
