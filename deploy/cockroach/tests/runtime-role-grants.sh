@@ -963,7 +963,7 @@ reviewed_source_manifest=$(shasum -a 256 \
     "$repo_root/src/relation_projection/repository.rs" \
     "$repo_root/src/memory_contracts/bootstrap_manifest.rs") \
     || fail "could not hash the reviewed runtime source snapshot"
-expected_reviewed_source_manifest="9c1058448fd1b1c8a8bf95c7156b087c237c7e6d9be4b106e9759906dd4e5411  $repo_root/src/config.rs
+expected_reviewed_source_manifest="768f70b2da57f0beca31687eaf763e8774b144d3b300d47f25bb5a2635e894ed  $repo_root/src/config.rs
 76224d95199b19cf12b52f623ece802b9c5d57abc57833c17de2ccd336db16be  $repo_root/src/main.rs
 7718c15393872a139956732629c472d813a2a014395f943a5382191966162745  $repo_root/src/private_postgres.rs
 586f6c9c935140de9580e4b4490df3fc24a9f30e9f4c6c6bf1e194c6e6fc9d1e  $repo_root/src/store/cockroach.rs
@@ -972,7 +972,7 @@ c885c07bce2caa310a2b9f1d8fd2aa49edc672c4184bb4b85a9e2018993f9cb1  $repo_root/src
 ee1d0b5a13f1906c13cbd3e93d26196d7bdace91895d8d2302c440d66ec8ef53  $repo_root/src/application.rs
 2bfc742926ef753ee90458a294bb59dbddf2afa2e9983484548f2fe0b7b77d26  $repo_root/src/reference_agent.rs
 eebc2a17a41b3caa9b6f751f6d3f28b658aa9670f3cfb21d1e00b91219ffada6  $repo_root/src/registry_witness/mod.rs
-d0c4c264139cb97bfc488fd164d078f71d65cce812b7a081936647e1bbd1b3ec  $repo_root/src/evidence_ledger/admission.rs
+597768f597ba5e2bc31dfe12a6b5d0276049dc027b3dd0fdcdcac00f10da88ef  $repo_root/src/evidence_ledger/admission.rs
 e162ab08fc55a6ec4760bf4fceca6ab90645dea404d9c189a057dfc72d53bb4f  $repo_root/src/evidence_ledger/content_store.rs
 4afddafc55424f6cdab7f1b3779135ee0287f560d5f78ae76d055f0ea2fd1498  $repo_root/src/relation_projection/mod.rs
 8d77efb246e57764887a1f518d78f0ab0f39a456b3a804733bb0e5c0acf94066  $repo_root/src/relation_projection/cockroach.rs

@@ -122,6 +122,9 @@ git -C "$repo_root" ls-files |
             # negative fixtures. The connection-policy module is admitted via
             # the verifier's exact closed fixture projection instead.
             src/config.rs) continue ;;
+            # config_tests.rs holds config.rs's relocated credential-shaped
+            # negative fixtures (hygiene test-extraction); keep it private too.
+            src/config_tests.rs) continue ;;
             # W0-TELEM's exemplar-scrubbing negative vector is deliberately
             # secret-shaped; it matches .dockerignore's `**/*secret*` and so is
             # excluded from the production image build context. Keep it out of
@@ -146,10 +149,10 @@ RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
 if ! jq -s -e '
-    length == 7675
+    length == 7688
     and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 1296
     and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 6173
+    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 6186
     and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
     and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
         and .source_id == "src/bin/ostk-control-bootstrap.rs")] | length) == 11
