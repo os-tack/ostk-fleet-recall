@@ -87,11 +87,12 @@ use ostk_fleet_recall::memory_contracts::successor_policy::{
     GenesisSuccessorKeyBridgePin, GenesisSuccessorKeyBridgeV1,
 };
 use ostk_fleet_recall::observer_runtime::{
-    MAX_OBSERVED_SOURCE_BYTES, ObserverAdmissionBindingV1, ObserverAppendDispositionV1,
-    ObserverConnectorBindingV1, ObserverDrainContextV1, ObserverIngressClocksV1,
-    ObserverQuestionV1, ObserverRunPlanV1, ObserverRunRecordV1, ObserverRuntimeDeclarationV1,
-    ObserverRuntimeError, ObserverSourcePinV1, bind_observed_source, build_observer_run,
-    drain_observer_run, enumerate_rust_enum, source_content_digest,
+    DIAGNOSTIC_ENUM_ATTRIBUTE, DIAGNOSTIC_NON_EXHAUSTIVE, MAX_OBSERVED_SOURCE_BYTES,
+    ObserverAdmissionBindingV1, ObserverAppendDispositionV1, ObserverConnectorBindingV1,
+    ObserverDrainContextV1, ObserverIngressClocksV1, ObserverQuestionV1, ObserverRunPlanV1,
+    ObserverRunRecordV1, ObserverRuntimeDeclarationV1, ObserverRuntimeError, ObserverSourcePinV1,
+    bind_observed_source, build_observer_run, drain_observer_run, enumerate_rust_enum,
+    source_content_digest,
 };
 use ostk_fleet_recall::registry_activation::{
     CockroachGenesisActivationRepository, CockroachSuccessorActivationRepository,
@@ -251,10 +252,13 @@ impl ScratchRepository {
     }
 }
 
-/// One scratch repository holding the real observed source at one commit,
-/// plus a SECOND commit holding a tampered blob at the same path.
+/// One scratch repository holding the observed source at one commit, plus a
+/// SECOND commit holding a tampered blob at the same path.
 struct ObservedRepository {
     repository: ScratchRepository,
+    /// Exactly the bytes committed as the honest blob, so every digest the
+    /// tests recompute comes from the object that is really in the repository.
+    honest_source: Vec<u8>,
     honest_commit: GitObjectId,
     honest_blob: GitObjectId,
     tampered_commit: GitObjectId,
@@ -262,15 +266,25 @@ struct ObservedRepository {
 }
 
 fn build_observed_repository(label: &str) -> ObservedRepository {
+    build_observed_repository_from(label, OBSERVED_SOURCE)
+}
+
+/// The same fixture over arbitrary honest bytes.
+///
+/// A blob is untrusted input by construction — the runtime already refuses to
+/// take the object store's word for what it holds — so "a source file crafted
+/// to defeat the reader" is inside the threat model and needs a vector of its
+/// own.
+fn build_observed_repository_from(label: &str, honest_source: &[u8]) -> ObservedRepository {
     let repository = ScratchRepository::init(label);
-    let honest_blob = repository.blob(OBSERVED_SOURCE);
+    let honest_blob = repository.blob(honest_source);
     let honest_tree = repository.tree(&[("service.rs", &honest_blob)]);
     let honest_commit = repository.commit(&honest_tree, "the observed revision");
 
     // A source that declares an EXTRA action. Same path, different blob: the
     // adversarial input is "the commit you named, but not the object you
     // named".
-    let tampered_source = String::from_utf8(OBSERVED_SOURCE.to_vec())
+    let tampered_source = String::from_utf8(honest_source.to_vec())
         .expect("the observed source is UTF-8")
         .replace(
             "pub enum RememberAction {\n    Record,",
@@ -278,7 +292,7 @@ fn build_observed_repository(label: &str) -> ObservedRepository {
         );
     assert_ne!(
         tampered_source.as_bytes(),
-        OBSERVED_SOURCE,
+        honest_source,
         "the tampered source must actually differ, or the adversarial vector proves nothing"
     );
     let tampered_blob = repository.blob(tampered_source.as_bytes());
@@ -286,6 +300,7 @@ fn build_observed_repository(label: &str) -> ObservedRepository {
     let tampered_commit = repository.commit(&tampered_tree, "a tampered revision");
 
     ObservedRepository {
+        honest_source: honest_source.to_vec(),
         honest_commit: GitObjectId::parse_hex(&honest_commit).unwrap(),
         honest_blob: GitObjectId::parse_hex(&honest_blob).unwrap(),
         tampered_commit: GitObjectId::parse_hex(&tampered_commit).unwrap(),
@@ -837,7 +852,7 @@ fn run_record(
         commit_id: observed.honest_commit.clone(),
         path: OBSERVED_PATH.to_vec(),
         blob_id: observed.honest_blob.clone(),
-        content_digest: source_content_digest(OBSERVED_SOURCE),
+        content_digest: source_content_digest(&observed.honest_source),
     };
     let source = bind_observed_source(&reader, &pin, MAX_OBSERVED_SOURCE_BYTES)
         .expect("the pinned source must bind");
@@ -892,7 +907,7 @@ async fn drain_observed_blob(
             commit_id: observed.honest_commit.clone(),
             path: OBSERVED_PATH.to_vec(),
             blob_id: observed.honest_blob.clone(),
-            content_digest: source_content_digest(OBSERVED_SOURCE),
+            content_digest: source_content_digest(&observed.honest_source),
         },
         MAX_OBSERVED_SOURCE_BYTES,
     )
@@ -1408,6 +1423,124 @@ async fn live_a_partial_enumeration_is_indeterminate_never_negative_when_configu
         scoped_count(&pool, "memory_evidence_events", &scope.physical_scope).await,
         2,
         "the cited blob event, plus this indeterminate observation"
+    );
+}
+
+/// The real source with `#[non_exhaustive]` parked behind a brace-delimited
+/// attribute whose token tree also carries a `;`.
+///
+/// Every one of those tokens is legal inside an attribute, and every one of
+/// them is a tempting "end of the previous item" marker for a reader that
+/// hunts backwards. If the reader is fooled, the attribute list it reports is
+/// EMPTY — the `#[non_exhaustive]`, the `#[serde]`, and the unknown attribute
+/// macro all vanish at once, the read claims exhaustiveness, and "Deploy is
+/// absent" becomes a verified negative about a set nobody enumerated.
+fn crafted_attribute_source() -> Vec<u8> {
+    let text = String::from_utf8(OBSERVED_SOURCE.to_vec()).expect("the observed source is UTF-8");
+    let crafted = text.replace(
+        "pub enum RememberAction {",
+        "#[non_exhaustive]\n#[rewrites_the_item { and; a; semicolon }]\npub enum RememberAction {",
+    );
+    assert_ne!(
+        crafted.as_bytes(),
+        OBSERVED_SOURCE,
+        "the crafted source must actually differ, or the vector proves nothing"
+    );
+    crafted.into_bytes()
+}
+
+#[tokio::test]
+async fn live_a_crafted_attribute_blob_is_indeterminate_never_negative_when_configured() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = live_pool(&database_url).await;
+    let fixture = fixture();
+    let scope = activate_stage4(&pool, &fixture, "crafted", 86).await;
+    let active = active_package(&fixture, &scope);
+    let admission = admission_binding(&fixture, &scope);
+    let connector = connector_binding(&fixture, &scope);
+    let observed = build_observed_repository_from("crafted", &crafted_attribute_source());
+    let evidence_event = drain_observed_blob(&pool, &fixture, &scope, &observed).await;
+
+    // A full-budget read of a genuine, correctly-pinned blob. Nothing about the
+    // transport is wrong here: the object really is the one the pin names, so
+    // no integrity check fires. The only defence is the reader's honesty about
+    // what it could not prove it understood.
+    let record = run_record(
+        &fixture,
+        &scope,
+        &admission,
+        &observed,
+        evidence_event,
+        ObserverQuestionV1::Membership {
+            member: "Deploy".to_owned(),
+        },
+        64,
+    );
+
+    assert!(
+        !record.exhaustive,
+        "an attribute the reader cannot prove harmless is not an exhaustive read"
+    );
+    let diagnostics: Vec<&str> = record.diagnostics.iter().map(ContractId::as_str).collect();
+    assert!(
+        diagnostics.contains(&DIAGNOSTIC_NON_EXHAUSTIVE),
+        "the marker must survive the attribute above it: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics.contains(&DIAGNOSTIC_ENUM_ATTRIBUTE),
+        "the unknown attribute macro is itself a caveat: {diagnostics:?}"
+    );
+    assert_eq!(record.receipt.outcome, ObserverOutcomeKindV1::Partial);
+    assert_eq!(
+        record.receipt.coverage.completeness,
+        ObserverCoverageCompletenessV1::Partial
+    );
+    assert_eq!(
+        record.verification_outcome(),
+        VerificationOutcomeV1::Indeterminate
+    );
+    assert_ne!(
+        record.verification_outcome(),
+        VerificationOutcomeV1::VerifiedNegative,
+        "a crafted blob must never buy a verdict about a set nobody enumerated"
+    );
+
+    // The caveat is durable, not a log line: the appended observation carries
+    // the indeterminate verdict and still names the exact object it read.
+    let now = canonical_time(server_time(&pool).await);
+    let key = content_key();
+    let context = ObserverDrainContextV1 {
+        binding: &connector,
+        active: &active,
+        witness: &scope.witness,
+        ledger: scope.repository.as_ref(),
+        control_scope: &scope.trusted_scope,
+        kek: &key,
+        clocks: &clocks(&now),
+    };
+    let outcome = drain_observer_run(&context, &record).await.unwrap();
+    assert_eq!(outcome.disposition, ObserverAppendDispositionV1::Appended);
+    assert_eq!(
+        outcome.verification_outcome,
+        VerificationOutcomeV1::Indeterminate
+    );
+    let reader = observed.repository.reader();
+    let bound = bind_observed_source(
+        &reader,
+        &ObserverSourcePinV1 {
+            commit_id: observed.honest_commit.clone(),
+            path: OBSERVED_PATH.to_vec(),
+            blob_id: observed.honest_blob.clone(),
+            content_digest: source_content_digest(&observed.honest_source),
+        },
+        MAX_OBSERVED_SOURCE_BYTES,
+    )
+    .unwrap();
+    assert_eq!(
+        record.receipt.source_version,
+        bound.observed_revision_uri().unwrap()
     );
 }
 
