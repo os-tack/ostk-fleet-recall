@@ -342,6 +342,13 @@ pub enum DigestDomain {
     /// publishes, so the parser's identity and configuration are part of the
     /// turn's canonical-resource identity.
     TranscriptTurnRevisionV1, // W2-TRANS
+    /// W3-NORM. Length-framed digest of the SET of normative binding statements
+    /// currently live for one binding family (`binding_family_id` followed by
+    /// every live `statement_id`, sorted). This is the "binding-family revision"
+    /// half of the composite compare-and-set head an activation must match; it
+    /// is a function of the set, never of the order statements were activated
+    /// in, so two histories with the same live set produce the same head.
+    NormativeActiveBindingSetV1, // W3-NORM
 }
 
 impl DigestDomain {
@@ -494,6 +501,8 @@ impl DigestDomain {
             Self::GitProviderFactV1 => "ostk-git-provider-fact-v1",         // W2-GIT
             Self::GitScanManifestV1 => "ostk-git-scan-manifest-v1",         // W2-GIT
             Self::TranscriptTurnRevisionV1 => "ostk-transcript-turn-revision-v1", // W2-TRANS
+            // --- W3-NORM prefixes ---
+            Self::NormativeActiveBindingSetV1 => "ostk-normative-active-binding-set-v1", // W3-NORM
         }
     }
 }
