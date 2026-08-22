@@ -63,15 +63,24 @@ const PROVIDER_OBJECT_ID_KEY: &str = "provider_object_id";
 /// Locator coordinate naming the deployment's installation.
 const PROVIDER_INSTALLATION_ID_KEY: &str = "provider_installation_id";
 
-/// The two ingress clocks the connector reads from its own trusted context.
+/// The one ingress clock the connector reads from its own trusted context.
 ///
 /// `occurred_at` is not here on purpose: it belongs to the provider fact, and
 /// taking it from ingress would let the connector restate when a commit
 /// happened (EVID-03).
+///
+/// Neither is `observed_at`, and that is the subtler point. `observed_at` is
+/// inside the accepted-event preimage, so if it were a wall clock, two scans of
+/// an unchanged repository would produce two different events for one source
+/// fact — the ledger would see the same representation with different bytes and
+/// quarantine the second as an integrity collision instead of recognising a
+/// replay. For git the honest value is the fact's own instant anyway: a commit
+/// object is immutable and self-dating, and a ref *observation* carries its
+/// observation instant inside its own identity. So the connector observes what
+/// git recorded, and `received_at` — which is deliberately NOT part of the
+/// accepted-event preimage — is the only free clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitIngressClocksV1 {
-    /// When this connector read the fact out of the object store.
-    pub observed_at: CanonicalTimestamp,
     /// When the ingress accepted the reading.
     pub received_at: CanonicalTimestamp,
 }
@@ -175,6 +184,8 @@ impl GitConnectorBindingV1 {
         fact.validate()?;
         let occurred_at = fact.occurred_at().clone();
         require_clock_order(&occurred_at, clocks)?;
+        // See `GitIngressClocksV1`: the observation instant is the fact's own.
+        let observed_at = occurred_at.clone();
 
         let instance_locator = self.locator(&self.provider_instance_recipe, None)?;
         let provider_instance_id =
@@ -213,7 +224,7 @@ impl GitConnectorBindingV1 {
             // provider actor, so it asserts none (AUTH-02).
             provider_actor_id: None,
             occurred_at,
-            observed_at: clocks.observed_at.clone(),
+            observed_at,
             authenticated_ingress_principal_id: self.principal_id.clone(),
             connector_instance_id: self.connector_instance_id.clone(),
             provider_delivery_id: logical_event_key.clone(),
@@ -333,29 +344,21 @@ fn resolve_recipe(
 
 /// EVID-03, checked here so a bad reading never reaches admission.
 ///
-/// A commit whose committer clock runs ahead of this host's is refused rather
+/// A commit whose recorded clock runs ahead of this host's is refused rather
 /// than back-dated: rewriting either clock would make the ordering true by
 /// fabrication.
 fn require_clock_order(
     occurred_at: &CanonicalTimestamp,
     clocks: &GitIngressClocksV1,
 ) -> GitIngressResult<()> {
-    if !occurred_at.is_microsecond_aligned()
-        || !clocks.observed_at.is_microsecond_aligned()
-        || !clocks.received_at.is_microsecond_aligned()
-    {
+    if !occurred_at.is_microsecond_aligned() || !clocks.received_at.is_microsecond_aligned() {
         return Err(GitIngressError::ClockOrder(
             "a clock is not microsecond aligned",
         ));
     }
-    if clocks.observed_at < *occurred_at {
+    if clocks.received_at < *occurred_at {
         return Err(GitIngressError::ClockOrder(
-            "observed_at precedes occurred_at",
-        ));
-    }
-    if clocks.received_at < clocks.observed_at {
-        return Err(GitIngressError::ClockOrder(
-            "received_at precedes observed_at",
+            "received_at precedes the provider clock",
         ));
     }
     Ok(())
@@ -365,9 +368,8 @@ fn require_clock_order(
 mod tests {
     use super::*;
 
-    fn clocks(observed: &str, received: &str) -> GitIngressClocksV1 {
+    fn clocks(received: &str) -> GitIngressClocksV1 {
         GitIngressClocksV1 {
-            observed_at: CanonicalTimestamp::parse(observed).unwrap(),
             received_at: CanonicalTimestamp::parse(received).unwrap(),
         }
     }
@@ -381,10 +383,7 @@ mod tests {
         assert!(
             require_clock_order(
                 &stamp("2026-08-15T12:00:00.000000000Z"),
-                &clocks(
-                    "2026-08-15T12:00:01.000000000Z",
-                    "2026-08-15T12:00:02.000000000Z"
-                ),
+                &clocks("2026-08-15T12:00:02.000000000Z"),
             )
             .is_ok()
         );
@@ -395,47 +394,35 @@ mod tests {
         assert!(
             require_clock_order(
                 &stamp("2026-08-15T12:00:00.000000000Z"),
-                &clocks(
-                    "2026-08-15T12:00:00.000000000Z",
-                    "2026-08-15T12:00:00.000000000Z"
-                ),
+                &clocks("2026-08-15T12:00:00.000000000Z"),
             )
             .is_ok()
         );
     }
 
     #[test]
-    fn a_commit_clock_ahead_of_the_reader_is_refused() {
+    fn a_provider_clock_ahead_of_the_reader_is_refused() {
         let refused = require_clock_order(
             &stamp("2026-08-15T12:00:05.000000000Z"),
-            &clocks(
-                "2026-08-15T12:00:01.000000000Z",
-                "2026-08-15T12:00:02.000000000Z",
-            ),
+            &clocks("2026-08-15T12:00:01.000000000Z"),
         );
         assert!(matches!(refused, Err(GitIngressError::ClockOrder(_))));
     }
 
     #[test]
-    fn a_receipt_before_the_reading_is_refused() {
-        let refused = require_clock_order(
-            &stamp("2026-08-15T12:00:00.000000000Z"),
-            &clocks(
-                "2026-08-15T12:00:02.000000000Z",
-                "2026-08-15T12:00:01.000000000Z",
-            ),
-        );
-        assert!(matches!(refused, Err(GitIngressError::ClockOrder(_))));
-    }
-
-    #[test]
-    fn a_sub_microsecond_clock_is_refused() {
+    fn a_sub_microsecond_provider_clock_is_refused() {
         let refused = require_clock_order(
             &stamp("2026-08-15T12:00:00.000000001Z"),
-            &clocks(
-                "2026-08-15T12:00:01.000000000Z",
-                "2026-08-15T12:00:02.000000000Z",
-            ),
+            &clocks("2026-08-15T12:00:02.000000000Z"),
+        );
+        assert!(matches!(refused, Err(GitIngressError::ClockOrder(_))));
+    }
+
+    #[test]
+    fn a_sub_microsecond_receipt_clock_is_refused() {
+        let refused = require_clock_order(
+            &stamp("2026-08-15T12:00:00.000000000Z"),
+            &clocks("2026-08-15T12:00:02.000000001Z"),
         );
         assert!(matches!(refused, Err(GitIngressError::ClockOrder(_))));
     }
