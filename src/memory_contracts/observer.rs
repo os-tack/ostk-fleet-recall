@@ -408,6 +408,29 @@ impl AdmittedObserverV1 {
         admission: ObserverAdmissionV2,
         admission_reference: RegistryReferenceV1,
     ) -> ContractResult<Self> {
+        Self::from_activation_witness(admission, admission_reference)
+    }
+
+    /// Mint the activation capability from an admission a caller has ALREADY
+    /// proven is the one an activated registry package admitted.
+    ///
+    /// Deliberately `pub(crate)`: this contract module cannot itself read a
+    /// registry package, so the proof obligation lives one layer up, and
+    /// restricting the constructor to this crate keeps the number of places
+    /// that can discharge it countable. `crate::observer_runtime::admission`
+    /// is the only production caller, and it resolves both arguments out of
+    /// the genesis registry package the deployment-pinned bootstrap receipt
+    /// names -- never from the observer's own request (AUTH-03: an observer
+    /// cannot admit itself).
+    ///
+    /// What this function still checks for itself, because a caller could get
+    /// them wrong without lying: the admission's own closed wire shape, the
+    /// reference's shape, and that the reference actually identifies THIS
+    /// admission by entry id and version.
+    pub(crate) fn from_activation_witness(
+        admission: ObserverAdmissionV2,
+        admission_reference: RegistryReferenceV1,
+    ) -> ContractResult<Self> {
         admission.validate_shape()?;
         validate_registry_reference(&admission_reference)?;
         let entry_id_matches = admission_reference.entry_id == admission.admission_id;
@@ -934,6 +957,27 @@ impl AdmittedObserverResultV1 {
     #[cfg(test)]
     fn from_test_witness(result: ObserverResultV1) -> ContractResult<Self> {
         result.validate_shape()?;
+        Ok(Self { result })
+    }
+
+    /// Promote a candidate result to the opaque append capability, but only
+    /// after re-deriving every binding it claims from the SUPPLIED admission
+    /// capability and run receipt.
+    ///
+    /// This is [`require_result_matches_admitted_run`] as a constructor: the
+    /// result's `admission_digest`, `run_receipt_digest`, `predicate`,
+    /// `applicability`, and self-reported `verification_outcome` must all
+    /// independently reproduce, so a stored or replayed `ObserverResultV1`
+    /// cannot reopen the seam [`build_observer_result`] closes. `pub(crate)`
+    /// for the same reason as [`AdmittedObserverV1::from_activation_witness`]:
+    /// the caller still owes the proof that `admitted` came from an activated
+    /// registry, and that proof lives in `crate::observer_runtime`.
+    pub(crate) fn from_derivation(
+        admitted: &AdmittedObserverV1,
+        run: &ObserverRunReceiptV1,
+        result: ObserverResultV1,
+    ) -> ContractResult<Self> {
+        require_result_matches_admitted_run(admitted, run, &result)?;
         Ok(Self { result })
     }
 }
