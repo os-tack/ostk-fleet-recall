@@ -87,12 +87,12 @@ use ostk_fleet_recall::memory_contracts::successor_policy::{
     GenesisSuccessorKeyBridgePin, GenesisSuccessorKeyBridgeV1,
 };
 use ostk_fleet_recall::observer_runtime::{
-    DIAGNOSTIC_ENUM_ATTRIBUTE, DIAGNOSTIC_NON_EXHAUSTIVE, MAX_OBSERVED_SOURCE_BYTES,
-    ObserverAdmissionBindingV1, ObserverAppendDispositionV1, ObserverConnectorBindingV1,
-    ObserverDrainContextV1, ObserverIngressClocksV1, ObserverQuestionV1, ObserverRunPlanV1,
-    ObserverRunRecordV1, ObserverRuntimeDeclarationV1, ObserverRuntimeError, ObserverSourcePinV1,
-    bind_observed_source, build_observer_run, drain_observer_run, enumerate_rust_enum,
-    source_content_digest,
+    DIAGNOSTIC_ENUM_ATTRIBUTE, DIAGNOSTIC_NON_EXHAUSTIVE, DIAGNOSTIC_SOURCE_UNBALANCED,
+    MAX_OBSERVED_SOURCE_BYTES, ObserverAdmissionBindingV1, ObserverAppendDispositionV1,
+    ObserverConnectorBindingV1, ObserverDrainContextV1, ObserverIngressClocksV1,
+    ObserverQuestionV1, ObserverRunPlanV1, ObserverRunRecordV1, ObserverRuntimeDeclarationV1,
+    ObserverRuntimeError, ObserverSourcePinV1, bind_observed_source, build_observer_run,
+    drain_observer_run, enumerate_rust_enum, source_content_digest,
 };
 use ostk_fleet_recall::registry_activation::{
     CockroachGenesisActivationRepository, CockroachSuccessorActivationRepository,
@@ -1423,6 +1423,134 @@ async fn live_a_partial_enumeration_is_indeterminate_never_negative_when_configu
         scoped_count(&pool, "memory_evidence_events", &scope.physical_scope).await,
         2,
         "the cited blob event, plus this indeterminate observation"
+    );
+}
+
+/// The real source with a `#[non_exhaustive]` parked behind an attribute whose
+/// token tree carries one more `}` than `{`, and with the `Forget` variant
+/// deleted.
+///
+/// This is the shape that a reader with two brace-depth counters could be
+/// steered by: one counter stepping over the attribute group whole and the
+/// other counting the braces inside it end up in different places in the same
+/// file, and the attributes below fall into the gap. Every byte of it is a
+/// blob a pin can honestly name, so nothing upstream of the reader can catch
+/// it — and the question below is about a variant that IS an allowed remember
+/// action in the real enum, so a verdict of "absent" here would be a verified
+/// negative asserting the opposite of the truth.
+fn desynchronising_attribute_source() -> Vec<u8> {
+    let text = String::from_utf8(OBSERVED_SOURCE.to_vec()).expect("the observed source is UTF-8");
+    let crafted = text
+        .replace(
+            "pub enum RememberAction {",
+            "#[doc( } )]\n#[non_exhaustive]\npub enum RememberAction {",
+        )
+        .replace("    Forget,\n", "");
+    assert!(
+        !crafted.contains("    Forget,\n"),
+        "the vector only means something if the variant really is gone"
+    );
+    crafted.into_bytes()
+}
+
+#[tokio::test]
+async fn live_a_brace_desynchronised_blob_is_indeterminate_never_negative_when_configured() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    // The strongest form of the vector puts a bare `{` after the attribute, so
+    // that a reader counting the braces inside it lands back at module level
+    // while an attribute reader that stepped over the group whole is one body
+    // deep. There is one counter now, so the enum simply is not at module
+    // level, and "not uniquely locatable" is a refusal rather than a reading.
+    let unlocatable = String::from_utf8(OBSERVED_SOURCE.to_vec())
+        .unwrap()
+        .replace(
+            "pub enum RememberAction {",
+            "#[doc( } )]\n{\n#[non_exhaustive]\npub enum RememberAction {",
+        )
+        .replace("    Forget,\n", "");
+    assert!(
+        matches!(
+            enumerate_rust_enum(&unlocatable, OBSERVED_ENUM, 64),
+            Err(ObserverRuntimeError::EnumNotUnique { found: 0, .. })
+        ),
+        "a blob that moves the enum out of module level must be refused, not read"
+    );
+
+    let pool = live_pool(&database_url).await;
+    let fixture = fixture();
+    let scope = activate_stage4(&pool, &fixture, "desync", 88).await;
+    let active = active_package(&fixture, &scope);
+    let admission = admission_binding(&fixture, &scope);
+    let connector = connector_binding(&fixture, &scope);
+    let observed = build_observed_repository_from("desync", &desynchronising_attribute_source());
+    let evidence_event = drain_observed_blob(&pool, &fixture, &scope, &observed).await;
+
+    // A full-budget read of a genuine, correctly-pinned blob, asked about a
+    // variant the crafted source no longer declares.
+    let record = run_record(
+        &fixture,
+        &scope,
+        &admission,
+        &observed,
+        evidence_event,
+        ObserverQuestionV1::Membership {
+            member: "Forget".to_owned(),
+        },
+        64,
+    );
+
+    assert!(
+        !record.exhaustive,
+        "a file whose braces this reader cannot balance is not an exhaustive read"
+    );
+    let diagnostics: Vec<&str> = record.diagnostics.iter().map(ContractId::as_str).collect();
+    assert!(
+        diagnostics.contains(&DIAGNOSTIC_NON_EXHAUSTIVE),
+        "the marker must survive the attribute above it: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics.contains(&DIAGNOSTIC_SOURCE_UNBALANCED),
+        "the reader must say it could not structure the file: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics.contains(&DIAGNOSTIC_ENUM_ATTRIBUTE),
+        "an attribute the reader could not close is an unproven list: {diagnostics:?}"
+    );
+    assert_eq!(record.receipt.outcome, ObserverOutcomeKindV1::Partial);
+    assert_eq!(
+        record.receipt.coverage.completeness,
+        ObserverCoverageCompletenessV1::Partial
+    );
+    assert_eq!(
+        record.verification_outcome(),
+        VerificationOutcomeV1::Indeterminate
+    );
+    assert_ne!(
+        record.verification_outcome(),
+        VerificationOutcomeV1::VerifiedNegative,
+        "`forget` is an allowed remember action; no crafted blob may buy the opposite"
+    );
+
+    // And the caveat is durable: the appended observation carries the
+    // indeterminate verdict rather than a negative one.
+    let now = canonical_time(server_time(&pool).await);
+    let key = content_key();
+    let context = ObserverDrainContextV1 {
+        binding: &connector,
+        active: &active,
+        witness: &scope.witness,
+        ledger: scope.repository.as_ref(),
+        control_scope: &scope.trusted_scope,
+        kek: &key,
+        clocks: &clocks(&now),
+    };
+    let outcome = drain_observer_run(&context, &record).await.unwrap();
+    assert_eq!(outcome.disposition, ObserverAppendDispositionV1::Appended);
+    assert_eq!(
+        outcome.verification_outcome,
+        VerificationOutcomeV1::Indeterminate
     );
 }
 
