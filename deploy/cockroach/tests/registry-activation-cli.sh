@@ -1983,6 +1983,64 @@ while IFS= read -r visibility_live_test; do
             "$visibility_live_test" -- --exact --nocapture
 done <<<"$visibility_live_tests"
 
+# Every Wave-3 normative activation runtime (W3-NORM) connected test, by exact
+# discovered name; the set is asserted complete, so a live_* test that nobody
+# wires here fails this proof instead of silently not running.
+normative_activation_live_tests='live_a_contested_overlap_projects_unknown
+live_a_crash_after_the_writes_leaves_nothing_durable
+live_a_lawful_activation_installs_and_is_durable
+live_a_proposal_bound_to_another_scope_or_registry_is_refused
+live_a_second_activation_against_a_stale_head_loses_cleanly
+live_an_implicated_actor_cannot_activate_the_change
+live_an_overlapping_activation_without_supersession_is_refused
+live_supersession_and_retirement_append_without_erasing_history
+live_the_projection_rebuilds_byte_identically_from_the_event_log
+live_two_concurrent_activations_against_one_head_produce_exactly_one_winner
+live_two_projects_cannot_see_each_others_normative_state'
+normative_activation_live_listing=$(cargo test --locked \
+    --test normative_activation_live -- --list)
+discovered_normative_activation_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$normative_activation_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact normative-activation connected test set" \
+    "$discovered_normative_activation_live_tests" \
+    "$normative_activation_live_tests"
+while IFS= read -r normative_activation_live_test; do
+    test -n "$normative_activation_live_test" || continue
+    require_discovered_test "$normative_activation_live_listing" \
+        "$normative_activation_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test normative_activation_live \
+            "$normative_activation_live_test" -- --exact --nocapture
+done <<<"$normative_activation_live_tests"
+
+# Every Wave-3 CI-evidence connector (W3-CIEV) connected test, by exact
+# discovered name; the set is asserted complete, so a live_* test that nobody
+# wires here fails this proof instead of silently not running.
+ci_connector_live_tests='live_a_candidate_that_declares_a_foreign_scope_is_refused
+live_a_redrain_of_the_same_window_is_an_exact_replay
+live_a_truncated_provider_listing_records_only_the_range_it_reached
+live_an_unsettled_run_is_refused_before_anything_is_written
+live_the_recorded_ci_window_closes_the_chain_to_recall'
+ci_connector_live_listing=$(cargo test --locked \
+    --test ci_connector_live -- --list)
+discovered_ci_connector_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$ci_connector_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact ci-connector connected test set" \
+    "$discovered_ci_connector_live_tests" \
+    "$ci_connector_live_tests"
+while IFS= read -r ci_connector_live_test; do
+    test -n "$ci_connector_live_test" || continue
+    require_discovered_test "$ci_connector_live_listing" \
+        "$ci_connector_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test ci_connector_live \
+            "$ci_connector_live_test" -- --exact --nocapture
+done <<<"$ci_connector_live_tests"
+
 current_retry_live_test=ledger::cockroach::tests::live_current_projection_whole_unit_retry_when_configured
 current_snapshot_live_test=ledger::cockroach::tests::live_current_projection_snapshot_race_when_configured
 conflict_live_test=ledger::cockroach::tests::live_conflict_polarity_matrix_when_configured
