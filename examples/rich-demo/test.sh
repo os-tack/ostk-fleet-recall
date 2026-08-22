@@ -125,6 +125,13 @@ git -C "$repo_root" ls-files |
             # config_tests.rs holds config.rs's relocated credential-shaped
             # negative fixtures (hygiene test-extraction); keep it private too.
             src/config_tests.rs) continue ;;
+            # W2-TRANS redaction fixtures: these files carry DELIBERATE
+            # secret-shaped strings (that is how a redactor is tested), so they
+            # match the sensitive-pattern gate and must stay out of the
+            # publication corpus, exactly like src/config.rs's negative fixtures.
+            src/connectors/transcript/redactor_tests.rs) continue ;;
+            src/connectors/transcript/test_fixture.rs) continue ;;
+            tests/transcript_connector_live.rs) continue ;;
             # W0-TELEM's exemplar-scrubbing negative vector is deliberately
             # secret-shaped; it matches .dockerignore's `**/*secret*` and so is
             # excluded from the production image build context. Keep it out of
