@@ -237,6 +237,8 @@ const STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL: &str =
     include_str!("../../migrations/0018_stage4_evidence_ledger.sql");
 const BODY_PROJECTION_MIGRATION_SQL: &str =
     include_str!("../../migrations/0019_body_projection.sql");
+const COVERAGE_RUNTIME_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0020_coverage_runtime.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -317,6 +319,12 @@ fn post_transactional_online_migrations() -> [Migration; 5] {
             Cow::Borrowed(BODY_PROJECTION_MIGRATION_SQL),
             // W2-BODY. Additive new tables only; online DDL like migration 0018,
             // so CockroachDB requires DDL autocommit here.
+            20,
+            Cow::Borrowed("coverage runtime cursors and receipts"),
+            MigrationType::Simple,
+            Cow::Borrowed(COVERAGE_RUNTIME_MIGRATION_SQL),
+            // Additive CREATE TABLE/INDEX DDL; CockroachDB requires it outside
+            // SQLx's transaction wrapper, like every other schema change here.
             true,
         ),
     ]
@@ -3259,7 +3267,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=19).collect::<Vec<_>>()
+            (1..=20).collect::<Vec<_>>()
         );
         assert_eq!(
             migrator
@@ -3317,6 +3325,7 @@ mod tests {
             (17, CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL, true),
             (18, STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL, true),
             (19, BODY_PROJECTION_MIGRATION_SQL, true),
+            (20, COVERAGE_RUNTIME_MIGRATION_SQL, true),
         ] {
             let migration = migrator
                 .migrations
@@ -3340,9 +3349,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=19).collect::<Vec<_>>()
+            (1..=20).collect::<Vec<_>>()
         );
-        for version in 10..=19 {
+        for version in 10..=20 {
             let migration = pre_transactional
                 .migrations
                 .iter()
@@ -3364,7 +3373,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=19).collect::<Vec<_>>()
+            (1..=20).collect::<Vec<_>>()
         );
         for migration in transactional.migrations.iter() {
             let expected_type = if migration.version >= 15 {
