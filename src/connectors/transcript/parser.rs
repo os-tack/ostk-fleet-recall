@@ -46,20 +46,54 @@ use super::error::{TranscriptConnectorError, TranscriptConnectorResult};
 /// `schema_version` of every chunk-identity value this parser mints.
 const CHUNK_IDENTITY_SCHEMA_VERSION: u32 = 1;
 
-/// Version of the transcript parser. Bumping it is a new parser identity and
-/// therefore a new representation for every turn it re-parses.
-pub const TRANSCRIPT_PARSER_VERSION: u32 = 1;
+/// Version of the transcript parser AS IT NOW BEHAVES. Bumping it is a new
+/// parser identity and therefore a new representation for every turn it
+/// re-parses.
+///
+/// It went from 1 to 2 when the parser was first pointed at a real Claude
+/// session file rather than a hand-written fixture. Two behaviours changed, and
+/// both change which turns exist, so the identity had to change with them —
+/// see [`transcript_parser_key_v2`].
+pub const TRANSCRIPT_PARSER_VERSION: u32 = 2;
 
-/// Exact configuration label whose digest becomes the parser key's
-/// `configuration_digest`. It names every choice that changes output bytes.
-const TRANSCRIPT_PARSER_CONFIGURATION: &str = "ostk-transcript-jsonl:v1;records=user,assistant;skips=system,summary;\
+/// The retired generation-1 parser version.
+///
+/// Kept so [`transcript_parser_key_v1`] still mints its exact original bytes:
+/// a turn already ingested under generation 1 keeps its identity forever, and
+/// re-parsing it under generation 2 must be a visibly different representation
+/// rather than a silent reinterpretation.
+const TRANSCRIPT_PARSER_GENERATION_1_VERSION: u32 = 1;
+
+/// Exact configuration label of the RETIRED generation-1 parser. Frozen: its
+/// digest is part of every generation-1 turn's identity.
+const TRANSCRIPT_PARSER_CONFIGURATION_V1: &str = "ostk-transcript-jsonl:v1;records=user,assistant;skips=system,summary;\
      keys=sessionId|session_id,uuid,timestamp,message.content;\
      blocks=text-only;join=lf;normalize=newline_lf,trailing_whitespace_trim";
 
+/// Exact configuration label whose digest becomes the CURRENT parser key's
+/// `configuration_digest`. It names every choice that changes output bytes,
+/// including the two that generation 2 changed: the full closed set of
+/// non-turn record kinds a Claude session file actually contains, and the
+/// treatment of a `user`/`assistant` record whose content carries no text
+/// block at all (a tool call or a tool result).
+const TRANSCRIPT_PARSER_CONFIGURATION_V2: &str = "ostk-transcript-jsonl:v2;records=user,assistant;\
+     skips=system,summary,mode,permission-mode,atis-latch,bridge-session,ai-title,last-prompt,\
+     queue-operation,attachment,file-history-snapshot,file-history-delta;\
+     text_free_turn_records=skipped;keys=sessionId|session_id,uuid,timestamp,message.content;\
+     blocks=text-only;join=lf;normalize=newline_lf,trailing_whitespace_trim;\
+     batch_bound=unconsumed_remainder";
+
 const TRANSCRIPT_PARSER_ARTIFACT: &str = "ostk-transcript-jsonl-parser";
 
-/// Largest transcript file this parser will accept in one batch (8 MiB). A
-/// larger file is refused rather than partially parsed.
+/// Largest span of UNCONSUMED transcript bytes this parser will accept in one
+/// batch (8 MiB). A batch larger than this is refused rather than partially
+/// parsed.
+///
+/// It bounds the remainder rather than the file: a session file grows without
+/// limit while its durable cursor advances behind it, so bounding the whole
+/// file made a source permanently unreadable the moment it crossed 8 MiB, even
+/// when the batch left to read was a few kilobytes. The real 9.7 MiB session
+/// file this connector was first pointed at is exactly that case.
 pub const MAX_TRANSCRIPT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Largest number of turns one batch may carry.
@@ -72,14 +106,20 @@ fn label_digest(label: &str) -> Sha256Digest {
     Sha256Digest::from_bytes(Sha256::digest(label.as_bytes()).into())
 }
 
-/// The frozen parser key of the transcript connector.
+/// The RETIRED generation-1 parser key, frozen at its original bytes.
+///
+/// It no longer describes what this parser does. It is kept, and kept exactly,
+/// because a turn ingested under it carries its digest inside an immutable
+/// revision: re-parsing that turn under [`transcript_parser_key_v2`] must be a
+/// visibly different representation, which is only provable if the old identity
+/// still exists to compare against.
 #[must_use]
 pub fn transcript_parser_key_v1() -> ParserKeyV1 {
     ParserKeyV1 {
         schema_version: CHUNK_IDENTITY_SCHEMA_VERSION,
         parser_artifact_digest: label_digest(TRANSCRIPT_PARSER_ARTIFACT),
-        parser_version: TRANSCRIPT_PARSER_VERSION,
-        configuration_digest: label_digest(TRANSCRIPT_PARSER_CONFIGURATION),
+        parser_version: TRANSCRIPT_PARSER_GENERATION_1_VERSION,
+        configuration_digest: label_digest(TRANSCRIPT_PARSER_CONFIGURATION_V1),
         // Strictly sorted, as ParserKeyV1::validate requires: NewlineLf is
         // declared before TrailingWhitespaceTrim in NormalizationRuleV1.
         declared_normalization_rules: vec![
@@ -89,23 +129,39 @@ pub fn transcript_parser_key_v1() -> ParserKeyV1 {
     }
 }
 
-/// A second parser key, identical except for its version and configuration.
+/// The CURRENT production parser key.
 ///
-/// It exists so the "parser identity is part of representation identity"
-/// property can be proven as ordinary software: canonicalizing the same turn
-/// under this key must produce a different revision, source-fact ID, and
-/// representation key. It is never used by the production collector.
+/// Generation 2 exists because generation 1 could not read a real Claude
+/// session file at all. Two behaviours changed, and each one changes which
+/// turns exist, so the identity changed with them rather than the behaviour
+/// changing underneath the old identity:
+///
+/// 1. **The closed record-kind set grew.** A live session file carries
+///    `mode`, `permission-mode`, `atis-latch`, `bridge-session`, `ai-title`,
+///    `last-prompt`, `queue-operation`, `attachment`, `file-history-snapshot`,
+///    and `file-history-delta` records. Generation 1 knew four kinds and
+///    aborted the batch on the first line of every real file. The set is still
+///    CLOSED — an unrecognized kind still aborts — because a silently skipped
+///    record is an invisible coverage hole.
+/// 2. **A turn record with no text block is a skip, not an abort.** Most
+///    `assistant` records in a real session carry only `tool_use` or
+///    `thinking` blocks, and most `user` records carry only `tool_result`
+///    blocks. Those records carry no conversational turn, so they are counted
+///    in [`ParsedTranscriptV1::skipped_records`] exactly like a `system`
+///    record. Generation 1 treated them as malformed, which refused 1 841 of
+///    the 2 463 turn-shaped records in the session file this connector was
+///    first pointed at.
 #[must_use]
 pub fn transcript_parser_key_v2() -> ParserKeyV1 {
     ParserKeyV1 {
         schema_version: CHUNK_IDENTITY_SCHEMA_VERSION,
         parser_artifact_digest: label_digest(TRANSCRIPT_PARSER_ARTIFACT),
-        parser_version: TRANSCRIPT_PARSER_VERSION + 1,
-        configuration_digest: label_digest(
-            "ostk-transcript-jsonl:v2;records=user,assistant;skips=system,summary;\
-             blocks=text-only;join=lf;normalize=newline_lf",
-        ),
-        declared_normalization_rules: vec![NormalizationRuleV1::NewlineLf],
+        parser_version: TRANSCRIPT_PARSER_VERSION,
+        configuration_digest: label_digest(TRANSCRIPT_PARSER_CONFIGURATION_V2),
+        declared_normalization_rules: vec![
+            NormalizationRuleV1::NewlineLf,
+            NormalizationRuleV1::TrailingWhitespaceTrim,
+        ],
     }
 }
 
@@ -113,14 +169,40 @@ pub fn transcript_parser_key_v2() -> ParserKeyV1 {
 ///
 /// Closed on purpose: an unrecognized `type` must abort the batch rather than be
 /// silently skipped, because a skipped record is an invisible coverage hole.
-/// `System` and `Summary` records carry no turn and are counted, not dropped.
+/// Every kind other than `User` and `Assistant` carries no turn and is counted,
+/// not dropped.
+///
+/// The non-turn kinds below `Summary` are the session-runtime bookkeeping
+/// records a live Claude session file actually contains. They are enumerated
+/// rather than tolerated by a catch-all, so a kind the agent runtime adds in
+/// future still stops the batch and gets a deliberate decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 enum TranscriptRecordKind {
     User,
     Assistant,
     System,
     Summary,
+    /// Session mode banner.
+    Mode,
+    /// Permission-mode banner.
+    PermissionMode,
+    /// Opaque session-attestation latch.
+    AtisLatch,
+    /// Cloud bridge-session association.
+    BridgeSession,
+    /// Generated session title.
+    AiTitle,
+    /// Echo of the last prompt submitted.
+    LastPrompt,
+    /// Prompt-queue bookkeeping.
+    QueueOperation,
+    /// File or image attached to a prompt.
+    Attachment,
+    /// Tracked-file backup snapshot.
+    FileHistorySnapshot,
+    /// Tracked-file backup delta.
+    FileHistoryDelta,
 }
 
 /// Which side of the conversation a turn came from.
@@ -283,11 +365,19 @@ struct LineContext<'line> {
 
 /// Turn one decoded record into a [`ParsedTurnV1`], refusing closed on any
 /// field the turn's identity needs and does not have.
+///
+/// Returns `Ok(None)` for a turn-shaped record whose content carries no text
+/// block — a tool call, a tool result, or a thinking-only reply. Those are not
+/// malformed: they are records the transcript legitimately holds that carry no
+/// conversational turn, so the caller counts them exactly like a `system`
+/// record instead of failing the batch. Every field the identity NEEDS is still
+/// refused closed above, so this is a narrow allowance for one absent field,
+/// not a general tolerance.
 fn build_turn(
     context: &LineContext<'_>,
     record: TranscriptRecordV1,
     role: TranscriptRoleV1,
-) -> TranscriptConnectorResult<ParsedTurnV1> {
+) -> TranscriptConnectorResult<Option<ParsedTurnV1>> {
     let (source_id, line_ordinal) = (context.source_id, context.line_ordinal);
     let session_id = record
         .session_id
@@ -309,11 +399,7 @@ fn build_turn(
             .and_then(|message| message.content.as_ref()),
     );
     if text.is_empty() {
-        return Err(malformed(
-            source_id,
-            line_ordinal,
-            "record carries no extractable text",
-        ));
+        return Ok(None);
     }
     let span = SourceSpanV1 {
         schema_version: CHUNK_IDENTITY_SCHEMA_VERSION,
@@ -325,7 +411,7 @@ fn build_turn(
         ordinal: context.ordinal,
     };
     span.validate()?;
-    Ok(ParsedTurnV1 {
+    Ok(Some(ParsedTurnV1 {
         session_id,
         turn_uid,
         role,
@@ -333,7 +419,7 @@ fn build_turn(
         occurred_at,
         text,
         span,
-    })
+    }))
 }
 
 /// Bound the source and place the durable cursor inside it, before a single
@@ -347,13 +433,6 @@ fn bounded_resume_offset(
     bytes: &[u8],
     resume_from: u64,
 ) -> TranscriptConnectorResult<usize> {
-    if bytes.len() > MAX_TRANSCRIPT_BYTES {
-        return Err(malformed(
-            source_id,
-            0,
-            "transcript exceeds the batch bound",
-        ));
-    }
     let resume = usize::try_from(resume_from)
         .map_err(|_| malformed(source_id, 0, "resume offset is out of range"))?;
     if resume > bytes.len() {
@@ -361,6 +440,17 @@ fn bounded_resume_offset(
             source_id,
             0,
             "transcript is shorter than the durable cursor",
+        ));
+    }
+    // The bound is on the UNCONSUMED remainder, not the file: a session file
+    // grows without limit behind an advancing cursor, and bounding the whole
+    // file would make a source permanently unreadable once it crossed the
+    // bound, however small the batch left to read.
+    if bytes.len() - resume > MAX_TRANSCRIPT_BYTES {
+        return Err(malformed(
+            source_id,
+            0,
+            "transcript batch exceeds the batch bound",
         ));
     }
     Ok(resume)
@@ -434,7 +524,18 @@ pub fn parse_transcript(
         let role = match record.kind {
             TranscriptRecordKind::User => TranscriptRoleV1::User,
             TranscriptRecordKind::Assistant => TranscriptRoleV1::Assistant,
-            TranscriptRecordKind::System | TranscriptRecordKind::Summary => {
+            TranscriptRecordKind::System
+            | TranscriptRecordKind::Summary
+            | TranscriptRecordKind::Mode
+            | TranscriptRecordKind::PermissionMode
+            | TranscriptRecordKind::AtisLatch
+            | TranscriptRecordKind::BridgeSession
+            | TranscriptRecordKind::AiTitle
+            | TranscriptRecordKind::LastPrompt
+            | TranscriptRecordKind::QueueOperation
+            | TranscriptRecordKind::Attachment
+            | TranscriptRecordKind::FileHistorySnapshot
+            | TranscriptRecordKind::FileHistoryDelta => {
                 skipped_records = skipped_records
                     .checked_add(1)
                     .ok_or_else(|| malformed(source_id, line_ordinal, "skip count overflow"))?;
@@ -444,7 +545,7 @@ pub fn parse_transcript(
             }
         };
 
-        turns.push(build_turn(
+        let Some(turn) = build_turn(
             &LineContext {
                 source_id,
                 line_ordinal,
@@ -455,7 +556,19 @@ pub fn parse_transcript(
             },
             record,
             role,
-        )?);
+        )?
+        else {
+            // A turn-shaped record carrying only tool or thinking blocks: no
+            // conversational turn, so it is counted rather than dropped and the
+            // turn ordinal does not advance.
+            skipped_records = skipped_records
+                .checked_add(1)
+                .ok_or_else(|| malformed(source_id, line_ordinal, "skip count overflow"))?;
+            consumed = next;
+            offset = next;
+            continue;
+        };
+        turns.push(turn);
         if turns.len() > MAX_TURNS_PER_BATCH {
             return Err(malformed(
                 source_id,

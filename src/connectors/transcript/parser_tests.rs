@@ -138,19 +138,86 @@ fn a_record_with_an_uncanonical_timestamp_is_refused() {
 }
 
 #[test]
-fn a_record_with_no_extractable_text_is_refused() {
+fn a_turn_record_with_no_text_block_is_counted_not_refused() {
+    // Generation 2: a tool call, a tool result, or a thinking-only reply is a
+    // real record that carries no conversational turn. It is counted like a
+    // `system` record, takes no ordinal, and does not fail the batch.
     let bytes = format!(
-        "{}\n",
-        r#"{"type":"assistant","sessionId":"s","uuid":"u","timestamp":"2026-08-15T12:30:00Z","message":{"content":[{"type":"tool_use","id":"t"}]}}"#
+        "{}\n{}\n{}\n",
+        r#"{"type":"assistant","sessionId":"s","uuid":"u1","timestamp":"2026-08-15T12:30:00Z","message":{"content":[{"type":"tool_use","id":"t"}]}}"#,
+        line("user", "turn-1", "2026-08-15T12:30:01.000Z", "hello"),
+        r#"{"type":"user","sessionId":"s","uuid":"u2","timestamp":"2026-08-15T12:30:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"t"}]}}"#
     );
-    let error = parse_transcript("s", bytes.as_bytes(), 0, 0).unwrap_err();
-    assert!(matches!(
-        error,
-        TranscriptConnectorError::MalformedTranscript {
-            reason: "record carries no extractable text",
-            ..
+    let parsed = parse_transcript("s", bytes.as_bytes(), 0, 0).unwrap();
+    assert_eq!(parsed.turns.len(), 1);
+    assert_eq!(parsed.turns[0].text, "hello");
+    assert_eq!(parsed.turns[0].ordinal, 0, "skips take no turn ordinal");
+    assert_eq!(parsed.skipped_records, 2);
+}
+
+#[test]
+fn a_turn_record_missing_an_identity_field_is_still_refused() {
+    // The text allowance is narrow: a record missing a field the IDENTITY needs
+    // still fails the batch closed rather than being counted as a skip.
+    for (reason, raw) in [
+        (
+            "record has no turn uid",
+            r#"{"type":"assistant","sessionId":"s","timestamp":"2026-08-15T12:30:00Z","message":{"content":[{"type":"tool_use","id":"t"}]}}"#,
+        ),
+        (
+            "record has no canonical timestamp",
+            r#"{"type":"assistant","sessionId":"s","uuid":"u","message":{"content":[{"type":"tool_use","id":"t"}]}}"#,
+        ),
+    ] {
+        let bytes = format!("{raw}\n");
+        let error = parse_transcript("s", bytes.as_bytes(), 0, 0).unwrap_err();
+        match error {
+            TranscriptConnectorError::MalformedTranscript { reason: got, .. } => {
+                assert_eq!(got, reason);
+            }
+            other => panic!("expected a malformed-transcript refusal, got {other:?}"),
         }
+    }
+}
+
+#[test]
+fn every_session_runtime_record_kind_is_counted_and_none_is_a_turn() {
+    // The exact non-turn kinds a live Claude session file carries. Each must be
+    // a counted skip; an unrecognized kind must still abort (covered by
+    // `an_unknown_record_type_is_refused_rather_than_skipped`).
+    let kinds = [
+        "mode",
+        "permission-mode",
+        "atis-latch",
+        "bridge-session",
+        "ai-title",
+        "last-prompt",
+        "queue-operation",
+        "attachment",
+        "file-history-snapshot",
+        "file-history-delta",
+        "system",
+        "summary",
+    ];
+    let mut source = String::new();
+    for kind in kinds {
+        source.push_str(&format!(r#"{{"type":"{kind}","sessionId":"s"}}"#));
+        source.push('\n');
+    }
+    source.push_str(&line(
+        "user",
+        "turn-1",
+        "2026-08-15T12:30:00.000Z",
+        "hello",
     ));
+    source.push('\n');
+    let parsed = parse_transcript("s", source.as_bytes(), 0, 0).unwrap();
+    assert_eq!(parsed.turns.len(), 1);
+    assert_eq!(
+        parsed.skipped_records,
+        u32::try_from(kinds.len()).unwrap(),
+        "every non-turn kind is counted, never silently dropped"
+    );
 }
 
 #[test]
@@ -206,16 +273,38 @@ fn a_cursor_that_does_not_land_on_a_line_boundary_is_refused() {
 }
 
 #[test]
-fn an_oversized_transcript_is_refused_rather_than_partially_parsed() {
+fn an_oversized_batch_is_refused_rather_than_partially_parsed() {
     let bytes = vec![b'x'; MAX_TRANSCRIPT_BYTES + 1];
     let error = parse_transcript("s", &bytes, 0, 0).unwrap_err();
     assert!(matches!(
         error,
         TranscriptConnectorError::MalformedTranscript {
-            reason: "transcript exceeds the batch bound",
+            reason: "transcript batch exceeds the batch bound",
             ..
         }
     ));
+}
+
+#[test]
+fn a_file_past_the_bound_is_still_readable_once_its_cursor_has_advanced() {
+    // The bound is on the UNCONSUMED remainder. A session file that has grown
+    // past the bound must stay readable: bounding the whole file made a live
+    // source permanently unreadable the moment it crossed 8 MiB, however small
+    // the batch left to read.
+    let turn = line("user", "turn-1", "2026-08-15T12:30:00.000Z", "hello");
+    let mut bytes = vec![b'\n'; MAX_TRANSCRIPT_BYTES + 1];
+    bytes.extend_from_slice(turn.as_bytes());
+    bytes.push(b'\n');
+    let resume = u64::try_from(MAX_TRANSCRIPT_BYTES + 1).unwrap();
+
+    assert!(
+        parse_transcript("s", &bytes, 0, 0).is_err(),
+        "reading the whole file in one batch is still refused"
+    );
+    let parsed = parse_transcript("s", &bytes, resume, 7).unwrap();
+    assert_eq!(parsed.turns.len(), 1);
+    assert_eq!(parsed.turns[0].ordinal, 7, "numbering continues");
+    assert_eq!(parsed.consumed_bytes, u64::try_from(bytes.len()).unwrap());
 }
 
 #[test]
@@ -240,6 +329,12 @@ fn both_parser_keys_validate_and_are_distinct_identities() {
         second.key_digest().unwrap().digest()
     );
     assert_eq!(first.declared_normalization_rules.len(), 2);
+    // The retired generation-1 key keeps its own version; the production key is
+    // the parser's current one, so a behaviour change is visible as an identity
+    // change rather than happening underneath the old identity.
+    assert_eq!(first.parser_version, 1);
+    assert_eq!(second.parser_version, TRANSCRIPT_PARSER_VERSION);
+    assert_ne!(first.configuration_digest, second.configuration_digest);
 }
 
 #[test]

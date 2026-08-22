@@ -33,7 +33,7 @@ use crate::memory_contracts::common::{CanonicalDecimal, CanonicalTimestamp, HexB
 use super::error::{GitScanError, GitScanResult};
 use super::fact::{
     GIT_FACT_SCHEMA_VERSION, GitBlobSourceFactV1, GitCommitFactV1, GitFactV1, GitFileModeV1,
-    GitIdentityV1, GitObjectId, GitRefName, GitRepositoryIdV1,
+    GitIdentityV1, GitObjectId, GitRefName, GitRepositoryIdV1, MAX_GIT_MESSAGE_BYTES,
 };
 
 /// Largest stdout this reader accepts from one `git` invocation.
@@ -404,11 +404,16 @@ fn parse_commit_object(object: &[u8]) -> GitScanResult<ParsedCommit> {
             command: "cat-file",
             detail: "commit object has no committer header",
         })?,
-        message: HexBytes::new(if message.is_empty() {
-            b"\n".to_vec()
-        } else {
-            message.to_vec()
-        })
+        // The message declares the connector's own wider bound: it is verbatim
+        // provider text, and truncating it would change what the commit said.
+        message: HexBytes::new_bounded(
+            if message.is_empty() {
+                b"\n".to_vec()
+            } else {
+                message.to_vec()
+            },
+            MAX_GIT_MESSAGE_BYTES,
+        )
         .map_err(|_| GitScanError::Output {
             command: "cat-file",
             detail: "commit message exceeds the connector's bound",
@@ -619,6 +624,25 @@ committer A <a@b.test> 1755259200 +0000\n\n"
             parse_commit_object(&object),
             Err(GitScanError::Output { .. })
         ));
+    }
+
+    #[test]
+    fn a_multi_kilobyte_commit_message_parses_verbatim() {
+        // The regression this bound was widened for: real commit objects in
+        // this repository carry structured multi-kilobyte messages, and the
+        // parser must render them whole rather than refusing the walk.
+        let body = "what changed and why: a long structured paragraph\n".repeat(200);
+        assert!(
+            body.len() > 4_096,
+            "the fixture must exceed the old 4 KiB bound"
+        );
+        let mut object = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+author A <a@b.test> 1755259200 +0000\n\
+committer A <a@b.test> 1755259200 +0000\n\n"
+            .to_vec();
+        object.extend_from_slice(body.as_bytes());
+        let parsed = parse_commit_object(&object).unwrap();
+        assert_eq!(parsed.message.as_bytes(), body.as_bytes());
     }
 
     #[test]

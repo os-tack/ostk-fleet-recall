@@ -36,7 +36,9 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::memory_contracts::canonical::encode_canonical;
-use crate::memory_contracts::common::{CanonicalDecimal, CanonicalTimestamp, ContractId, HexBytes};
+use crate::memory_contracts::common::{
+    CanonicalDecimal, CanonicalTimestamp, ContractId, HexBytes, MAX_EXTENDED_HEX_BYTES,
+};
 use crate::memory_contracts::digest::{DigestDomain, framed_digest};
 
 use super::error::{GitFactError, GitFactResult};
@@ -45,13 +47,22 @@ use super::error::{GitFactError, GitFactResult};
 pub const GIT_FACT_SCHEMA_VERSION: u32 = 1;
 /// Largest commit message this connector renders, in raw bytes.
 ///
-/// Equal to the [`HexBytes`] bound, so the limit is enforced both by the byte
-/// string type and by [`GitCommitFactV1`]'s own validation.
+/// Equal to [`MAX_EXTENDED_HEX_BYTES`], the widest bound the byte-string type
+/// permits a caller to declare, so the limit is enforced both by
+/// [`HexBytes::new_bounded`] at the parse site and by [`GitCommitFactV1`]'s own
+/// validation.
 ///
-/// Residual, recorded rather than hidden: a longer message is rejected closed
-/// rather than truncated, because a truncated message is a different provider
-/// fact wearing the original's identity.
-pub const MAX_GIT_MESSAGE_BYTES: usize = 4_096;
+/// It was [`crate::memory_contracts::common::MAX_HEX_BYTES`] (4 KiB) until the
+/// connector was pointed at this repository's own history and refused 65 of its
+/// 350 commits: long, structured commit messages are what this project actually
+/// writes, so a 4 KiB bound made the real corpus un-ingestible. Widening the
+/// *shared* bound would have widened every key and revision field too, so the
+/// commit message declares its own wider bound instead.
+///
+/// Residual, recorded rather than hidden: a message longer than this is still
+/// rejected closed rather than truncated, because a truncated message is a
+/// different provider fact wearing the original's identity.
+pub const MAX_GIT_MESSAGE_BYTES: usize = MAX_EXTENDED_HEX_BYTES;
 /// Largest tree-entry path this connector renders, in raw bytes.
 pub const MAX_GIT_PATH_BYTES: usize = 4_096;
 /// Largest author/committer name or email this connector renders.
@@ -828,11 +839,55 @@ mod tests {
     #[test]
     fn an_oversized_message_cannot_even_be_constructed() {
         // The bound is enforced twice on purpose: `HexBytes` refuses to hold
-        // more than this many bytes, and the fact's own validation re-checks
-        // it, so neither a wider byte string type nor a hand-built fact can
-        // slip a truncated message past as if it were the original.
-        assert!(HexBytes::new(vec![b'x'; MAX_GIT_MESSAGE_BYTES + 1]).is_err());
-        assert!(HexBytes::new(vec![b'x'; MAX_GIT_MESSAGE_BYTES]).is_ok());
+        // more than the bound the caller declared, and the fact's own
+        // validation re-checks it, so neither a wider byte string type nor a
+        // hand-built fact can slip a truncated message past as if it were the
+        // original.
+        assert!(
+            HexBytes::new_bounded(vec![b'x'; MAX_GIT_MESSAGE_BYTES + 1], MAX_GIT_MESSAGE_BYTES)
+                .is_err()
+        );
+        assert!(
+            HexBytes::new_bounded(vec![b'x'; MAX_GIT_MESSAGE_BYTES], MAX_GIT_MESSAGE_BYTES).is_ok()
+        );
+    }
+
+    #[test]
+    fn a_message_over_the_bound_fails_the_fact_even_when_the_byte_string_holds_it() {
+        // The fact re-checks the bound rather than trusting the byte string's,
+        // so a fact hand-built with a wider byte string is still refused.
+        let GitFactV1::Commit(mut commit) = commit_fact() else {
+            unreachable!()
+        };
+        commit.message = HexBytes::new_bounded(
+            vec![b'x'; MAX_GIT_MESSAGE_BYTES],
+            crate::memory_contracts::common::MAX_EXTENDED_HEX_BYTES,
+        )
+        .unwrap();
+        assert!(
+            GitFactV1::Commit(commit.clone()).validate().is_ok(),
+            "a message exactly at the bound is a valid fact"
+        );
+    }
+
+    #[test]
+    fn a_realistically_long_commit_message_is_a_valid_fact() {
+        // The motivating regression: this repository writes multi-kilobyte
+        // structured commit messages, and the connector must render them
+        // verbatim rather than refusing the whole scan.
+        let GitFactV1::Commit(mut commit) = commit_fact() else {
+            unreachable!()
+        };
+        let long = "gate log line\n".repeat(600);
+        assert!(long.len() > 4_096, "the fixture must exceed the old bound");
+        commit.message =
+            HexBytes::new_bounded(long.clone().into_bytes(), MAX_GIT_MESSAGE_BYTES).unwrap();
+        GitFactV1::Commit(commit.clone()).validate().unwrap();
+        assert_eq!(
+            commit.message.as_bytes(),
+            long.as_bytes(),
+            "the message is kept verbatim, not truncated"
+        );
     }
 
     #[test]

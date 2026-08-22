@@ -285,13 +285,47 @@ impl<'de> Deserialize<'de> for CanonicalDecimal {
     }
 }
 
+/// Default upper bound on a [`HexBytes`] value: every contract field that
+/// carries a key, an object id, or a revision fits comfortably inside it.
+pub const MAX_HEX_BYTES: usize = 4_096;
+
+/// Absolute ceiling a caller may raise its own [`HexBytes`] bound to with
+/// [`HexBytes::new_bounded`].
+///
+/// It exists for exactly one shape of value: verbatim provider text a connector
+/// must not truncate, because truncating it would silently change what the
+/// provider said. A git commit message is the motivating case — this
+/// repository's own history carries 65 commits (of 350) whose messages exceed
+/// [`MAX_HEX_BYTES`], so the narrow bound refused the real corpus outright.
+/// Every OTHER field keeps the narrow bound: widening a shared input bound to
+/// accommodate one field would weaken every field that shares it.
+pub const MAX_EXTENDED_HEX_BYTES: usize = 65_536;
+
 /// Lowercase hexadecimal bytes with no alternate wire encoding.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HexBytes(Vec<u8>);
 
 impl HexBytes {
     pub fn new(bytes: Vec<u8>) -> ContractResult<Self> {
-        if bytes.is_empty() || bytes.len() > 4_096 {
+        Self::new_bounded(bytes, MAX_HEX_BYTES)
+    }
+
+    /// Build a value under a bound the CALLER declares, up to
+    /// [`MAX_EXTENDED_HEX_BYTES`].
+    ///
+    /// `max_len` is itself validated, so "pass a bigger number" is not an
+    /// escape hatch from the bound — only a way to name a wider one the
+    /// contract already permits. The wire decoder deliberately keeps the narrow
+    /// [`MAX_HEX_BYTES`] bound: no record this repository decodes carries an
+    /// extended field, so accepting one off the wire would widen the parser for
+    /// no reader.
+    pub fn new_bounded(bytes: Vec<u8>, max_len: usize) -> ContractResult<Self> {
+        if max_len == 0 || max_len > MAX_EXTENDED_HEX_BYTES {
+            return Err(ContractError::Schema(
+                "hex byte string bound is invalid".into(),
+            ));
+        }
+        if bytes.is_empty() || bytes.len() > max_len {
             return Err(ContractError::Schema(
                 "hex byte string length is invalid".into(),
             ));
@@ -428,6 +462,57 @@ fn is_canonical_decimal(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_bytes_keeps_the_narrow_bound_by_default() {
+        assert!(HexBytes::new(vec![b'x'; MAX_HEX_BYTES]).is_ok());
+        assert!(HexBytes::new(vec![b'x'; MAX_HEX_BYTES + 1]).is_err());
+        assert!(HexBytes::new(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_caller_declared_bound_widens_only_that_call() {
+        // The extended form exists for verbatim provider text; naming it is a
+        // per-call decision, so nothing that keeps calling `new` is widened.
+        let long = vec![b'x'; MAX_HEX_BYTES + 1];
+        assert!(HexBytes::new_bounded(long.clone(), MAX_EXTENDED_HEX_BYTES).is_ok());
+        assert!(HexBytes::new(long).is_err());
+    }
+
+    #[test]
+    fn a_declared_bound_cannot_exceed_the_contract_ceiling() {
+        // "Pass a bigger number" must not be an escape hatch: the bound itself
+        // is validated before the length is.
+        assert!(HexBytes::new_bounded(vec![b'x'; 8], MAX_EXTENDED_HEX_BYTES + 1).is_err());
+        assert!(HexBytes::new_bounded(vec![b'x'; 8], usize::MAX).is_err());
+        assert!(HexBytes::new_bounded(vec![b'x'; 8], 0).is_err());
+    }
+
+    #[test]
+    fn a_value_over_its_declared_bound_is_refused_rather_than_truncated() {
+        let bound = 16;
+        let over = HexBytes::new_bounded(vec![b'x'; bound + 1], bound);
+        assert!(over.is_err(), "an over-bound value must be refused whole");
+        assert_eq!(
+            HexBytes::new_bounded(vec![b'x'; bound], bound)
+                .unwrap()
+                .as_bytes()
+                .len(),
+            bound,
+            "a value exactly at the bound is kept verbatim"
+        );
+    }
+
+    #[test]
+    fn the_wire_decoder_keeps_the_narrow_bound() {
+        // An extended value serializes, but no record this repository decodes
+        // carries one, so the decoder stays narrow rather than widening for a
+        // reader that does not exist.
+        let extended = HexBytes::new_bounded(vec![b'x'; MAX_HEX_BYTES + 1], MAX_EXTENDED_HEX_BYTES)
+            .expect("the extended bound admits it");
+        let json = serde_json::to_string(&extended).unwrap();
+        assert!(serde_json::from_str::<HexBytes>(&json).is_err());
+    }
 
     #[test]
     fn identifiers_are_closed_ascii_names() {
