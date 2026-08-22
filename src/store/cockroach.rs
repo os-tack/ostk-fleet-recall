@@ -280,7 +280,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
     ]
 }
 
-fn post_transactional_online_migrations() -> [Migration; 5] {
+fn post_transactional_online_migrations() -> [Migration; 6] {
     [
         Migration::new(
             15,
@@ -319,6 +319,9 @@ fn post_transactional_online_migrations() -> [Migration; 5] {
             Cow::Borrowed(BODY_PROJECTION_MIGRATION_SQL),
             // W2-BODY. Additive new tables only; online DDL like migration 0018,
             // so CockroachDB requires DDL autocommit here.
+            true,
+        ),
+        Migration::new(
             20,
             Cow::Borrowed("coverage runtime cursors and receipts"),
             MigrationType::Simple,
@@ -3259,7 +3262,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_migrator_registers_mixed_transaction_policy_through_nineteen() {
+    fn embedded_migrator_registers_mixed_transaction_policy_through_twenty() {
         let migrator = embedded_migrator();
         assert_eq!(
             migrator
@@ -3275,7 +3278,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.no_tx)
                 .collect::<Vec<_>>(),
-            [vec![true; 11], vec![false; 3], vec![true; 5]].concat()
+            [vec![true; 11], vec![false; 3], vec![true; 6]].concat()
         );
         let control_ledger = migrator
             .migrations
