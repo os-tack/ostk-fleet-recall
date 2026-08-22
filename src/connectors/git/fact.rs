@@ -865,7 +865,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            GitFactV1::Commit(commit.clone()).validate().is_ok(),
+            GitFactV1::Commit(commit).validate().is_ok(),
             "a message exactly at the bound is a valid fact"
         );
     }

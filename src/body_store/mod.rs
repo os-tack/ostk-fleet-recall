@@ -47,8 +47,8 @@ mod projector;
 mod repository;
 
 pub use cockroach::CockroachBodyProjectionRepository;
-pub use governed_resolver::GovernedContentResolver;
 pub use error::{BodyProjectionError, BodyProjectionResult};
+pub use governed_resolver::GovernedContentResolver;
 pub use parser::{
     LINE_PARSER_VERSION, PARAGRAPH_PARSER_VERSION, ParsedSegmentV1, parse_source,
     reference_parser_key_v1, reference_parser_key_v2,

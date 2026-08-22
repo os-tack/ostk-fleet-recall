@@ -93,8 +93,19 @@ pub struct BodyProjectionSnapshotV1 {
 /// What one projection pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProjectionRunSummaryV1 {
-    /// Accepted evidence events consumed in this pass.
+    /// Accepted evidence events consumed in this pass that produced a body.
     pub events_projected: u64,
+    /// Accepted evidence events consumed in this pass that can NEVER produce a
+    /// body, because their canonical resource is not version-form and so names
+    /// no immutable source-object version to chunk.
+    ///
+    /// They are counted rather than dropped and rather than fatal: a permanent
+    /// property of one event must not park the watermark in front of it forever
+    /// and starve every later event. A non-zero count here means the connector
+    /// that produced those events and this projector do not yet agree on an
+    /// identity form — a deployment fact an operator must see, which is why it
+    /// is a named field and not an absence.
+    pub events_unprojectable: u64,
     /// Occurrence rows the pass derived (including idempotent re-derivations).
     pub occurrences_derived: u64,
     /// Shadow generations opened in this pass (a parser upgrade per source).

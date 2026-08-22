@@ -171,6 +171,9 @@ const UPSERT_WATERMARK_SQL: &str = "INSERT INTO public.memory_body_projection_wa
 struct EventOutcome {
     occurrences_derived: u64,
     shadow_opened: bool,
+    /// The event names a source this projector can never chunk, so it produced
+    /// no body rows and only advanced the watermark past itself.
+    unprojectable: bool,
 }
 
 /// Private body-projection repository bound once to physical scope and one
@@ -287,7 +290,11 @@ impl CockroachBodyProjectionRepository {
             };
             for (offset, canonical) in self.events_for_shard(shard, after).await? {
                 let outcome = self.project_one_event(shard, offset, canonical).await?;
-                summary.events_projected += 1;
+                if outcome.unprojectable {
+                    summary.events_unprojectable += 1;
+                } else {
+                    summary.events_projected += 1;
+                }
                 summary.occurrences_derived += outcome.occurrences_derived;
                 if outcome.shadow_opened {
                     summary.shadow_generations_opened += 1;
@@ -349,7 +356,34 @@ impl CockroachBodyProjectionRepository {
     ) -> BodyProjectionResult<EventOutcome> {
         let statement: EvidenceStatementV2 = decode_strict(canonical)?;
         let source_bytes = self.resolver.resolve(&statement).await?;
-        let derived = derive_parse_run(&statement, &source_bytes, &self.parser_key)?;
+        let derived = match derive_parse_run(&statement, &source_bytes, &self.parser_key) {
+            Ok(derived) => derived,
+            // An event whose canonical resource is not version-form names no
+            // immutable source-object version, so it has no body and never
+            // will: this is a PERMANENT property of the event, not a transient
+            // failure the content plane can fix. Failing the pass closed here
+            // would leave the watermark parked in front of it forever and stop
+            // every LATER event from ever being projected, which is a worse
+            // outcome than recording it. `derive_parse_run` still refused to
+            // mint anything, so no occurrence is created against an occurrence
+            // URI; the watermark advances, the event is counted in
+            // `ProjectionRunSummaryV1::events_unprojectable`, and nothing is
+            // silently dropped. Every other rejection class stays fatal.
+            Err(BodyProjectionError::NonVersionedSource(_)) => {
+                let now: DateTime<Utc> =
+                    sqlx::query_scalar("SELECT pg_catalog.statement_timestamp()")
+                        .fetch_one(&mut **transaction)
+                        .await?;
+                self.advance_watermark(transaction, shard, offset, now)
+                    .await?;
+                return Ok(EventOutcome {
+                    occurrences_derived: 0,
+                    shadow_opened: false,
+                    unprojectable: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let accepted_event_id = statement.accepted_event_id()?;
         let accepted_event_bytes = bytes(accepted_event_id.digest());
         let source_uri = derived.source_object_version_uri.to_string();
@@ -396,6 +430,7 @@ impl CockroachBodyProjectionRepository {
         Ok(EventOutcome {
             occurrences_derived,
             shadow_opened: generation.shadow_opened,
+            unprojectable: false,
         })
     }
 

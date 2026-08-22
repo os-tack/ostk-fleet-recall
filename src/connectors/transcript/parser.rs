@@ -34,6 +34,7 @@
 
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
+use unicode_normalization::UnicodeNormalization as _;
 
 use crate::memory_contracts::chunk_identity::{
     NormalizationRuleV1, ParserKeyV1, SourceSpanV1, source_span_digest,
@@ -79,9 +80,10 @@ const TRANSCRIPT_PARSER_CONFIGURATION_V1: &str = "ostk-transcript-jsonl:v1;recor
 const TRANSCRIPT_PARSER_CONFIGURATION_V2: &str = "ostk-transcript-jsonl:v2;records=user,assistant;\
      skips=system,summary,mode,permission-mode,atis-latch,bridge-session,ai-title,last-prompt,\
      queue-operation,attachment,file-history-snapshot,file-history-delta;\
-     text_free_turn_records=skipped;keys=sessionId|session_id,uuid,timestamp,message.content;\
-     blocks=text-only;join=lf;normalize=newline_lf,trailing_whitespace_trim;\
-     batch_bound=unconsumed_remainder";
+     text_free_turn_records=skipped;keys=sessionId>session_id,uuid,timestamp,message.content;\
+     blocks=text-only;join=lf;\
+     normalize=newline_lf,unicode_nfc,whitespace_collapse,trailing_whitespace_trim,\
+     control_character_strip;batch_bound=unconsumed_remainder";
 
 const TRANSCRIPT_PARSER_ARTIFACT: &str = "ostk-transcript-jsonl-parser";
 
@@ -151,6 +153,15 @@ pub fn transcript_parser_key_v1() -> ParserKeyV1 {
 ///    record. Generation 1 treated them as malformed, which refused 1 841 of
 ///    the 2 463 turn-shaped records in the session file this connector was
 ///    first pointed at.
+/// 3. **`sessionId` and `session_id` are two fields, not an alias.** A real
+///    record carries both spellings, and a serde `alias` turns the second one
+///    into a duplicate-field error that refuses the line. `sessionId` wins
+///    when both are present.
+/// 4. **Normalization folds whitespace and strips control scalars.** The
+///    canonical encoder refuses a control scalar in a string and refuses a
+///    non-NFC string, so generation 1's preserved interior newlines made a real
+///    multi-line turn impossible to canonically encode. See [`normalize`] for
+///    the residual this costs.
 #[must_use]
 pub fn transcript_parser_key_v2() -> ParserKeyV1 {
     ParserKeyV1 {
@@ -158,9 +169,15 @@ pub fn transcript_parser_key_v2() -> ParserKeyV1 {
         parser_artifact_digest: label_digest(TRANSCRIPT_PARSER_ARTIFACT),
         parser_version: TRANSCRIPT_PARSER_VERSION,
         configuration_digest: label_digest(TRANSCRIPT_PARSER_CONFIGURATION_V2),
+        // Strictly sorted, as ParserKeyV1::validate requires: declaration order
+        // in NormalizationRuleV1 is NewlineLf, UnicodeNfc, WhitespaceCollapse,
+        // TrailingWhitespaceTrim, ControlCharacterStrip.
         declared_normalization_rules: vec![
             NormalizationRuleV1::NewlineLf,
+            NormalizationRuleV1::UnicodeNfc,
+            NormalizationRuleV1::WhitespaceCollapse,
             NormalizationRuleV1::TrailingWhitespaceTrim,
+            NormalizationRuleV1::ControlCharacterStrip,
         ],
     }
 }
@@ -233,11 +250,18 @@ impl TranscriptRoleV1 {
 struct TranscriptRecordV1 {
     #[serde(rename = "type")]
     kind: TranscriptRecordKind,
-    /// Claude session files spell this `sessionId`; the `snake_case` alias is
-    /// accepted so a hand-written fixture is not a different format. Both names
-    /// are part of the parser's configuration digest.
-    #[serde(default, rename = "sessionId", alias = "session_id")]
-    session_id: Option<String>,
+    /// Claude session files spell this `sessionId`.
+    ///
+    /// A real record carries BOTH spellings — 2 338 of the 2 467 turn-shaped
+    /// records in the observed session file do — so this cannot be a serde
+    /// `alias`: an alias makes the second spelling a duplicate-field error and
+    /// refuses the line. Two separate optional fields accept either or both,
+    /// and `sessionId` wins when both are present, which is stated here and in
+    /// the parser's configuration digest rather than left to field order.
+    #[serde(default, rename = "sessionId")]
+    session_id_camel: Option<String>,
+    #[serde(default, rename = "session_id")]
+    session_id_snake: Option<String>,
     #[serde(default)]
     uuid: Option<String>,
     #[serde(default)]
@@ -310,18 +334,41 @@ fn malformed(source_id: &str, line_ordinal: u32, reason: &'static str) -> Transc
     }
 }
 
-/// Collapse CRLF and lone CR to LF, strip trailing spaces/tabs from each line,
-/// then drop trailing blank lines. Exactly the two declared normalization rules.
+/// Exactly the five declared normalization rules, in one pass: NFC-compose,
+/// fold every whitespace scalar (CRLF, LF, tabs) to a single ASCII space, drop
+/// every other control scalar, collapse runs, and trim both ends.
+///
+/// # Why generation 2 folds newlines
+///
+/// The canonical encoder refuses any control scalar in a string
+/// ([`crate::memory_contracts::canonical`]) and refuses any string that is not
+/// NFC. A conversational turn is inherently multi-line, so generation 1 — which
+/// preserved interior newlines — produced a body that could not be canonically
+/// encoded at all: the first real turn of a real session file failed with
+/// `ForbiddenUnicode`. Folding is what makes the turn expressible.
+///
+/// Residual, recorded rather than hidden: **line structure is not preserved**.
+/// The canonical body carries the turn's words, in order, and not its layout.
+/// A consumer that needs the original layout must go back to the source span
+/// the turn carries, which names the exact raw bytes it came from.
 fn normalize(raw: &str) -> String {
-    let lf = raw.replace("\r\n", "\n").replace('\r', "\n");
-    let mut lines: Vec<&str> = lf
-        .split('\n')
-        .map(|line| line.trim_end_matches([' ', '\t']))
-        .collect();
-    while lines.last().is_some_and(|line| line.is_empty()) {
-        lines.pop();
+    let mut normalized = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for character in raw.nfc() {
+        if character.is_whitespace() {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if character.is_control() {
+            continue;
+        }
+        if pending_space {
+            normalized.push(' ');
+            pending_space = false;
+        }
+        normalized.push(character);
     }
-    lines.join("\n")
+    normalized
 }
 
 fn extract_text(content: Option<&TranscriptContentV1>) -> String {
@@ -379,8 +426,10 @@ fn build_turn(
     role: TranscriptRoleV1,
 ) -> TranscriptConnectorResult<Option<ParsedTurnV1>> {
     let (source_id, line_ordinal) = (context.source_id, context.line_ordinal);
+    // `sessionId` wins over `session_id` when a record carries both.
     let session_id = record
-        .session_id
+        .session_id_camel
+        .or(record.session_id_snake)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| malformed(source_id, line_ordinal, "record has no session id"))?;
     let turn_uid = record
@@ -420,6 +469,49 @@ fn build_turn(
         text,
         span,
     }))
+}
+
+/// What one framed line turned out to be.
+///
+/// There are exactly two outcomes and no third: a line is a turn, or it is a
+/// counted non-turn record. An unrecognized record kind is neither — it is a
+/// closed refusal from [`classify_line`], because a silently skipped record is
+/// an invisible coverage hole.
+enum LineKind {
+    /// Carries no conversational turn: a session-runtime record, or a
+    /// turn-shaped record whose content holds only tool or thinking blocks.
+    Skipped,
+    /// A conversational turn. Boxed so the two variants stay similar in size.
+    Turn(Box<ParsedTurnV1>),
+}
+
+/// Decode one framed line and decide what it is.
+fn classify_line(context: &LineContext<'_>, line: &[u8]) -> TranscriptConnectorResult<LineKind> {
+    let record: TranscriptRecordV1 = serde_json::from_slice(line).map_err(|_| {
+        malformed(
+            context.source_id,
+            context.line_ordinal,
+            "line is not a transcript record",
+        )
+    })?;
+    let role = match record.kind {
+        TranscriptRecordKind::User => TranscriptRoleV1::User,
+        TranscriptRecordKind::Assistant => TranscriptRoleV1::Assistant,
+        TranscriptRecordKind::System
+        | TranscriptRecordKind::Summary
+        | TranscriptRecordKind::Mode
+        | TranscriptRecordKind::PermissionMode
+        | TranscriptRecordKind::AtisLatch
+        | TranscriptRecordKind::BridgeSession
+        | TranscriptRecordKind::AiTitle
+        | TranscriptRecordKind::LastPrompt
+        | TranscriptRecordKind::QueueOperation
+        | TranscriptRecordKind::Attachment
+        | TranscriptRecordKind::FileHistorySnapshot
+        | TranscriptRecordKind::FileHistoryDelta => return Ok(LineKind::Skipped),
+    };
+    Ok(build_turn(context, record, role)?
+        .map_or(LineKind::Skipped, |turn| LineKind::Turn(Box::new(turn))))
 }
 
 /// Bound the source and place the durable cursor inside it, before a single
@@ -519,33 +611,7 @@ pub fn parse_transcript(
             ));
         }
 
-        let record: TranscriptRecordV1 = serde_json::from_slice(line)
-            .map_err(|_| malformed(source_id, line_ordinal, "line is not a transcript record"))?;
-        let role = match record.kind {
-            TranscriptRecordKind::User => TranscriptRoleV1::User,
-            TranscriptRecordKind::Assistant => TranscriptRoleV1::Assistant,
-            TranscriptRecordKind::System
-            | TranscriptRecordKind::Summary
-            | TranscriptRecordKind::Mode
-            | TranscriptRecordKind::PermissionMode
-            | TranscriptRecordKind::AtisLatch
-            | TranscriptRecordKind::BridgeSession
-            | TranscriptRecordKind::AiTitle
-            | TranscriptRecordKind::LastPrompt
-            | TranscriptRecordKind::QueueOperation
-            | TranscriptRecordKind::Attachment
-            | TranscriptRecordKind::FileHistorySnapshot
-            | TranscriptRecordKind::FileHistoryDelta => {
-                skipped_records = skipped_records
-                    .checked_add(1)
-                    .ok_or_else(|| malformed(source_id, line_ordinal, "skip count overflow"))?;
-                consumed = next;
-                offset = next;
-                continue;
-            }
-        };
-
-        let Some(turn) = build_turn(
+        let classified = classify_line(
             &LineContext {
                 source_id,
                 line_ordinal,
@@ -554,13 +620,9 @@ pub fn parse_transcript(
                 line,
                 ordinal,
             },
-            record,
-            role,
-        )?
-        else {
-            // A turn-shaped record carrying only tool or thinking blocks: no
-            // conversational turn, so it is counted rather than dropped and the
-            // turn ordinal does not advance.
+            line,
+        )?;
+        let LineKind::Turn(turn) = classified else {
             skipped_records = skipped_records
                 .checked_add(1)
                 .ok_or_else(|| malformed(source_id, line_ordinal, "skip count overflow"))?;
@@ -568,7 +630,7 @@ pub fn parse_transcript(
             offset = next;
             continue;
         };
-        turns.push(turn);
+        turns.push(*turn);
         if turns.len() > MAX_TURNS_PER_BATCH {
             return Err(malformed(
                 source_id,

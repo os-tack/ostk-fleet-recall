@@ -201,15 +201,10 @@ fn every_session_runtime_record_kind_is_counted_and_none_is_a_turn() {
     ];
     let mut source = String::new();
     for kind in kinds {
-        source.push_str(&format!(r#"{{"type":"{kind}","sessionId":"s"}}"#));
-        source.push('\n');
+        use std::fmt::Write as _;
+        let _ = writeln!(source, r#"{{"type":"{kind}","sessionId":"s"}}"#);
     }
-    source.push_str(&line(
-        "user",
-        "turn-1",
-        "2026-08-15T12:30:00.000Z",
-        "hello",
-    ));
+    source.push_str(&line("user", "turn-1", "2026-08-15T12:30:00.000Z", "hello"));
     source.push('\n');
     let parsed = parse_transcript("s", source.as_bytes(), 0, 0).unwrap();
     assert_eq!(parsed.turns.len(), 1);
@@ -309,12 +304,33 @@ fn a_file_past_the_bound_is_still_readable_once_its_cursor_has_advanced() {
 
 #[test]
 fn normalization_applies_exactly_the_declared_rules() {
-    // CRLF collapses to LF, trailing spaces/tabs go, trailing blank lines go.
-    assert_eq!(normalize("a  \r\nb\t\n\n\n"), "a\nb");
-    // Interior blank lines are preserved: whitespace collapse is NOT declared.
-    assert_eq!(normalize("a\n\nb"), "a\n\nb");
-    // Leading whitespace is preserved: only TRAILING trim is declared.
-    assert_eq!(normalize("  a"), "  a");
+    // Every whitespace scalar folds to one space; runs collapse; both ends trim.
+    assert_eq!(normalize("a  \r\nb\t\n\n\n"), "a b");
+    assert_eq!(normalize("a\n\nb"), "a b");
+    assert_eq!(normalize("  a  "), "a");
+    // Control scalars that are not whitespace are dropped outright.
+    assert_eq!(normalize("a\u{0}\u{7}b"), "ab");
+    // NFC composition, so two byte spellings of one word normalize alike.
+    assert_eq!(normalize("cafe\u{301}"), normalize("caf\u{e9}"));
+}
+
+#[test]
+fn a_normalized_turn_is_canonically_encodable() {
+    // The property generation 2 exists for: generation 1 preserved interior
+    // newlines, and the canonical encoder refuses ANY control scalar in a
+    // string, so a real multi-line turn could not be encoded at all.
+    let raw = "first line\n\nsecond line\twith a tab\r\nand a CRLF";
+    let normalized = normalize(raw);
+    assert!(!normalized.chars().any(char::is_control));
+    ostk_fleet_recall_canonical_probe(&normalized);
+}
+
+/// Encode the normalized text through the exact canonical encoder the
+/// connector's candidate goes through, so this test fails if the encoder ever
+/// stops accepting what the parser emits.
+fn ostk_fleet_recall_canonical_probe(text: &str) {
+    crate::memory_contracts::canonical::encode_canonical(&text.to_owned())
+        .expect("a normalized turn must be canonically encodable");
 }
 
 #[test]
@@ -335,6 +351,33 @@ fn both_parser_keys_validate_and_are_distinct_identities() {
     assert_eq!(first.parser_version, 1);
     assert_eq!(second.parser_version, TRANSCRIPT_PARSER_VERSION);
     assert_ne!(first.configuration_digest, second.configuration_digest);
+}
+
+#[test]
+fn a_record_carrying_both_session_id_spellings_parses_and_camel_case_wins() {
+    // Real records carry BOTH spellings. A serde alias would make the second
+    // one a duplicate-field error and refuse the line; two fields with a stated
+    // precedence accept either or both.
+    let both = format!(
+        "{}\n",
+        r#"{"type":"user","sessionId":"camel","session_id":"snake","uuid":"u","timestamp":"2026-08-15T12:30:00Z","message":{"content":"hi"}}"#
+    );
+    assert_eq!(
+        parse_transcript("s", both.as_bytes(), 0, 0).unwrap().turns[0].session_id,
+        "camel"
+    );
+
+    let snake_only = format!(
+        "{}\n",
+        r#"{"type":"user","session_id":"snake","uuid":"u","timestamp":"2026-08-15T12:30:00Z","message":{"content":"hi"}}"#
+    );
+    assert_eq!(
+        parse_transcript("s", snake_only.as_bytes(), 0, 0)
+            .unwrap()
+            .turns[0]
+            .session_id,
+        "snake"
+    );
 }
 
 #[test]
