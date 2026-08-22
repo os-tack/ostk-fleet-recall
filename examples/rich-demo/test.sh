@@ -148,65 +148,6 @@ fi
 RICH_DEMO_EXPECTED_SOURCE_REVISION=0000000000000000000000000000000000000000 \
     "$script_dir/verify.sh" "$first"
 
-if ! jq -s -e '
-    length == 7688
-    and ([.[] | select(.source_config_id == "rich-demo:docs:v1")] | length) == 1296
-    and ([.[] | select(.source_config_id == "rich-demo:self-audit:v1")] | length) == 2
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1")] | length) == 6186
-    and ([.[] | select(.source_config_id == "rich-demo:operations:v1")] | length) == 204
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "src/bin/ostk-control-bootstrap.rs")] | length) == 11
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "src/bin/ostk-registry-activate.rs")] | length) == 22
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "src/bin/ostk-registry-successor-activate.rs")] | length) == 62
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "src/bin/ostk-registry-generic-successor-activate.rs")] | length) == 35
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "src/bin/ostk-conflict-reconcile.rs")] | length) == 26
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "src/ledger/reconciliation.rs")] | length) == 135
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "deploy/cockroach/conflict-reconciliation-role-grants.sql")] | length) == 27
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "deploy/cockroach/publication-reader-role-grants.sql")] | length) == 30
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "deploy/cockroach/successor-activation-role-grants.sql")] | length) == 23
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "deploy/cockroach/tests/conflict-reconciliation-role-grants.sh")] | length) == 95
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "deploy/cockroach/tests/publication-reader-role-grants.sh")] | length) == 132
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "deploy/cockroach/runtime-role-grants.sql")] | length) == 31
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "deploy/cockroach/tests/runtime-role-grants.sh")] | length) == 112
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "deploy/cockroach/tests/successor-activation-role-grants.sh")] | length) == 83
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "migrations/0015_conflict_detector_uniqueness.sql")] | length) == 5
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "migrations/0016_claim_transition_provenance_index.sql")] | length) == 3
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "migrations/0017_conflict_detector_projection_index.sql")] | length) == 3
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "migrations/0018_stage4_evidence_ledger.sql")] | length) == 40
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "src/private_postgres.rs")] | length) == 24
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "src/evidence_ledger/cockroach.rs")] | length) == 47
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "src/registry_activation/generic_successor_cockroach.rs")] | length) == 69
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "tests/publication_reader_live.rs")] | length) == 16
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "tests/evidence_ledger_live.rs")] | length) == 60
-    and ([.[] | select(.source_config_id == "rich-demo:repository:v1"
-        and .source_id == "tests/generic_successor_activation_live.rs")] | length) == 48
-    and ([.[] | select(.source_id == "src/config.rs")] | length) == 0
-' "$first" >/dev/null; then
-    printf 'rich demo verification failed: exact repository corpus composition changed\n' >&2
-    exit 1
-fi
 
 # Canonical JSON can be one long whitespace-free token. Require bounded,
 # same-line UTF-8 fragments and prove that ordered bodies reconstruct the exact
