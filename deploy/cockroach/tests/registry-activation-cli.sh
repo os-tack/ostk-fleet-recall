@@ -2084,18 +2084,43 @@ FLEET_RECONCILIATION_TEST_DATABASE_URL="$root_url" \
 
 # Freeze the authoritative schema independently of the two Stage-2/Stage-3
 # command preflights. The database must have exactly the successful embedded
-# migration chain -- every migration, contiguous from 1, all successful -- and
-# all three successor authority tables. The head is derived from migrations/ so
-# that adding a migration (as every wave does) cannot leave this proof asserting
-# a stale prefix; the contiguity check is what makes the derived count exact.
-migration_head=$(find "$repo_root/migrations" -name '*.sql' | wc -l | tr -d ' ')
-if [ "$migration_head" -lt 18 ]; then
-    fail "refusing to run with an implausible migration head: $migration_head"
+# migration chain -- every migration in migrations/, all successful, starting at
+# version 1 -- and all three successor authority tables. Both quantities are
+# derived from migrations/ so that adding a migration (as every wave does)
+# cannot leave this proof asserting a stale schema.
+#
+# How many migrations exist and what the highest version is are two DIFFERENT
+# numbers. Migration numbering is deliberately not required to be contiguous: a
+# number reserved for a workstream that ends up shipping no migration leaves a
+# permanent gap (0025 is exactly that), so the file count is a cardinality and
+# never a version. Deriving one from the other is what made this lane assert a
+# schema that cannot exist. Pinning the count AND the maximum together is still
+# exact -- it admits only one applied set for a given migrations/ directory --
+# while staying correct by construction across any future gap.
+migration_count=$(find "$repo_root/migrations" -name '*.sql' | wc -l | tr -d ' ')
+migration_max=$(find "$repo_root/migrations" -name '*.sql' -exec basename {} \; \
+    | sed -n 's/^0*\([0-9][0-9]*\)_.*\.sql$/\1/p' \
+    | sort -n \
+    | tail -n 1)
+case ${migration_max:-} in
+    '' | *[!0-9]*)
+        fail "could not derive a numeric migration version from migrations/"
+        ;;
+esac
+if [ "$migration_count" -lt 18 ]; then
+    fail "refusing to run with an implausible migration count: $migration_count"
 fi
-assert_root_scalar "exact successful migration prefix 1 through $migration_head" '
-    SELECT CASE WHEN count(*) = '"$migration_head"'
+if [ "$migration_max" -lt 18 ]; then
+    fail "refusing to run with an implausible migration version head: $migration_max"
+fi
+if [ "$migration_max" -lt "$migration_count" ]; then
+    fail "migration version head $migration_max is below the migration count $migration_count"
+fi
+assert_root_scalar \
+    "exact successful migration set of $migration_count through version $migration_max" '
+    SELECT CASE WHEN count(*) = '"$migration_count"'
                           AND min(version) = 1
-                          AND max(version) = '"$migration_head"'
+                          AND max(version) = '"$migration_max"'
                           AND COALESCE(bool_and(success), false)
                      THEN '\''ready'\'' ELSE '\''not_ready'\'' END
     FROM _sqlx_migrations' 'ready'
@@ -2144,19 +2169,20 @@ do
     "$crdb" sql --url="$root_url" < "$migration_path" >/dev/null
 done
 assert_root_scalar "migration history after exact index replay" \
-    'SELECT count(*)::STRING FROM _sqlx_migrations' "$migration_head"
+    'SELECT count(*)::STRING FROM _sqlx_migrations' "$migration_count"
 
-# Demonstrate why MAX(successful version) is not a readiness check: version 18
-# remains successful while a failed version 12 makes the complete-prefix gate
-# false. Restore the row before exercising the v3/v9-compatible private CLIs.
+# Demonstrate why MAX(successful version) is not a readiness check: the head
+# version remains successful while a failed version 12 makes the complete-set
+# gate false. Restore the row before exercising the v3/v9-compatible private
+# CLIs.
 "$crdb" sql --url="$root_url" \
     --execute='UPDATE _sqlx_migrations SET success = false WHERE version = 12' >/dev/null
 assert_root_scalar "later success remains visible during failed migration 12" \
-    'SELECT max(version)::STRING FROM _sqlx_migrations WHERE success' "$migration_head"
+    'SELECT max(version)::STRING FROM _sqlx_migrations WHERE success' "$migration_max"
 assert_root_scalar "failed migration 12 is not masked by the head version" '
-    SELECT CASE WHEN count(*) = '"$migration_head"'
+    SELECT CASE WHEN count(*) = '"$migration_count"'
                           AND min(version) = 1
-                          AND max(version) = '"$migration_head"'
+                          AND max(version) = '"$migration_max"'
                           AND COALESCE(bool_and(success), false)
                      THEN '\''ready'\'' ELSE '\''not_ready'\'' END
     FROM _sqlx_migrations' 'not_ready'
