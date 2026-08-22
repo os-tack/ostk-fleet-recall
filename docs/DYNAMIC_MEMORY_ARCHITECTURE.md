@@ -1,6 +1,6 @@
 # Dynamic corpus and causal runtime architecture
 
-Status: **target architecture; stages 1–3 frozen; stage 4 partially implemented; stages 5–10 contract vectors in progress**
+Status: **target architecture; stages 1–3 frozen; stage 4 partially implemented; stage 5 connectors and projectors implemented as private-plane library runtimes with connected proofs, reachable from no serving path; stages 6–10 contract vectors in progress**
 
 Fleet Recall currently serves a statically generated, revision-linked corpus
 and a deliberate typed-claim ledger. This document defines the target model in
@@ -12,10 +12,15 @@ documented in [ARCHITECTURE.md](ARCHITECTURE.md), its security boundary in
 [SECURITY.md](SECURITY.md), and the local-versus-fleet product decision in
 [ADR 0001](adr/0001-product-and-backend-boundary.md).
 
-No connector, webhook, queue, incident controller, asynchronous embedding
-worker, or public mutation route is implied to exist today. The current source
-does implement the bounded PUBLIC-03 publication identity and planned AWS task
-input separation; those Terraform changes have not been applied.
+No webhook, transport queue, remote ingress, incident controller, or public
+mutation route exists today. Two local connectors (agent transcripts and git
+history), the content-addressed body projector, the coverage runtime, the
+lexical-first/dense-later recall projectors, and the embedding worker's provider
+seam are implemented as private-plane library modules with live-CockroachDB
+proofs; no binary and no serving path constructs any of them, and no production
+embedding provider implements that seam. The current source does implement the
+bounded PUBLIC-03 publication identity and planned AWS task input separation;
+those Terraform changes have not been applied.
 
 ## Purpose
 
@@ -623,6 +628,52 @@ When provider ordering and graph reachability cannot establish one current
 state, the projection remains ambiguous or `unknown`; it never invents a total
 order from arrival time.
 
+**Implemented (Stage 5, private plane only).** Two connectors now produce
+candidates through the Stage-4 admission seam rather than appending directly.
+The local transcript collector parses agent-transcript JSONL, redacts and
+classifies each turn, stages the redacted candidate in a durable outbox together
+with its per-source cursor in one serializable transaction, and drains that
+outbox into accepted evidence events. A turn whose post-redaction rescan still
+matches a secret shape is withheld entirely, so no row exists for a later stage
+to leak, and the type that carries a staged batch cannot be constructed without
+a redaction guarantee derived from the active package's policy. The git history
+connector reads a local object store through read-only `git` subprocesses and
+claims three fact families — commit facts, blob-source facts, and ref
+*observations* — with an ancestry claim type that has exactly one variant, so
+"released" and "deployed" are unconstructible rather than merely discouraged.
+Neither connector can widen what is admissible: only the admission seam resolves
+a connector schema from the active package, rederives resource identity, and
+binds scope to the writer credential, so a candidate naming a foreign scope or a
+connector outside the active package is refused before anything is written.
+
+Downstream, a body projector consumes the accepted-event stream into
+content-addressed bodies, chunk occurrences with their raw-source spans, one
+parse-run manifest per source representation, commit/ref membership, and a
+parser generation pointer (migration 0019), advancing its per-shard cursor
+atomically with each event's rows. A parser-key upgrade opens a shadow
+generation by compare-and-swap; it never rewrites the prior generation. A
+coverage runtime keeps a merged observed range per connector instance and writes
+a coverage receipt in the same serializable transaction as each cursor advance
+(migration 0020); `complete`, `partial`, and `unknown` are derived from that
+observed range rather than accepted from a caller-supplied field.
+
+The recall projection (migration 0021) is split across two tables. The lexical
+tier's generated `TSVECTOR` column makes a body findable with no model in the
+path; the dense tier is written by a separate background worker behind an
+embedding-provider seam. The tiers occupy different tables, keep independent
+cursors, and share no statement, so a failing or absent provider cannot remove
+lexical availability — which is also what lets the dense vector index keep the
+equality-prefixed, `NOT NULL` shape CockroachDB's C-SPANN requires. No
+production embedding provider implements that seam; the connected proofs drive
+it with a deterministic fixture, including its outage and degenerate-vector
+paths.
+
+None of these modules is reachable from the serving process or from any binary,
+and the accepted-event append seam they use is the Stage-4 one, unchanged. There
+is still no webhook, no transport queue, no remote connector cursor, no
+dead-letter path for a remote delivery, and no acknowledgement protocol:
+everything here reads local material on the private plane.
+
 ## Repository history
 
 The target repository model does not duplicate every unchanged file for each
@@ -640,6 +691,17 @@ A verified provider ref update atomically advances that exact ref projection. A
 merge contributes provenance, but it advances the default-branch view only when
 provider evidence establishes that the configured default ref reaches the merge
 result. It does not make the revision built, released, or deployed.
+
+**Implemented (Stage 5, private plane only).** Migration 0019's tables are that
+content-addressed model: bodies keyed by their content digest, chunk occurrences
+with exact raw-source spans, and commit/ref membership recorded per parse run.
+The git connector's ref-observation log is append-only, and an observation's
+identity closes over its sequence number and instant, so a force push mints a
+*new* source fact naming the previous target while every earlier observation
+keeps its exact bytes, its exact identity, and its place in the ledger. The
+current view is simply the newest observation. Nothing merged advances a
+default-branch view from a merge, and no provider-verified PR, CI, artifact, or
+deployment relation exists — that is stage 8.
 
 ## Provenance graph and causal hypotheses
 
@@ -842,6 +904,29 @@ revision-10 route predates this boundary. A production activation must still
 repeat the external cross-database/PUBLIC audit and directly verify live grants
 and task inputs before serving.
 
+**Implemented (Stage 5).** The recall projection carries that asymmetry down to
+the row. Migration 0023 records one visibility class per content-addressed body,
+derived from the accepted evidence event that produced it, and the projectors
+copy it onto every row they write. A row is publication-safe only when the
+event's visibility class and publication class are both the approved value *and*
+the governed content's protection domain is exactly the event's own
+authenticated project namespace; every other combination — including one a
+future enum variant introduces — classifies private. Three independent layers
+hold that closed: the column defaults to `private`, so an INSERT that omits it
+cannot be public by omission; a database `CHECK` refuses a publication-safe row
+whose recorded evidence classes are not the approved pair, so a runtime bug
+cannot store an approval the evidence never granted; and the predicate is
+compared inside the lexical and dense SQL ahead of ranking, so count, offset,
+and ranking probes see the same boundary a plain query does. The publication
+plane reads two fixed filtered views and is granted nothing on the base tables,
+which puts a private row outside its privilege set rather than merely outside
+its answers.
+
+That grant is a deployment action, and it has not been made. The deployed
+`fleet_publication_reader` role still holds `SELECT` on exactly the eight tables
+listed above and on neither new view; the grant statements are generated by the
+projector module and applied only inside the connected proof.
+
 ## Failure, convergence, and history
 
 - Connector lag and projection watermarks are visible; stale projections do
@@ -903,14 +988,41 @@ This does not require or authorize dynamic ingestion.
    CockroachDB proofs that the official-binary lane discovers and runs by exact
    name. Still absent: enabling the `assert` route so synchronous `remember`
    itself appends-and-projects in one transaction (the configuration pins plus
-   a witness loader that mints accepted events); wiring any of these dormant
-   modules into a serving path; and the Stage-5 connectors and projectors
-   below.
+   a witness loader that mints accepted events); and wiring any of these dormant
+   modules into a serving path. The Stage-5 connectors and projectors below have
+   since landed on those same dormant terms.
 5. Project one local transcript connector and one Git history connector into
    content-addressed repository membership and lexical-first/dense-later evidence
    with local cursors and coverage receipts. Arrow IPC may carry bounded batches
    between collectors, projectors, embedding workers, and replay scanners, but
    canonical accepted-event bytes remain the identity and signature authority.
+
+   Implemented, private only. Landed: a generation-2 semantically-closed target
+   package that binds two connector instances, a connector-instance-cursor
+   coverage proof, and a parser contract by content digest, together with its
+   live `1 -> 2` activation through the Wave-1 generic successor runtime;
+   migration 0019 and the body projector (content-addressed bodies, chunk
+   occurrences and spans, parse-run manifests, commit/ref membership, and
+   compare-and-swap parser generation pointers) with a per-shard cursor that
+   advances atomically with each event's rows; migration 0020 and the coverage
+   runtime (per-connector-instance merged observed ranges, with the receipt and
+   the cursor advance in one serializable transaction); migration 0021 and the
+   split lexical/dense recall projectors with independent cursors, so a failing
+   or absent embedding provider cannot remove lexical availability; migration
+   0022 and the local transcript collector (parse, redact, canonicalize, durable
+   outbox, drain), which withholds any turn whose post-redaction rescan still
+   matches a secret shape; the git history connector, whose ref-observation log
+   is append-only and whose ancestry claim type carries exactly one variant; and
+   migration 0023's per-row visibility class, enforced inside the recall SQL and
+   behind two filtered publication views.
+
+   Still absent at this stage: any Arrow IPC transport — the registry reserves
+   an `arrow_batch_schema` entry kind, but no Arrow encoder, decoder, or
+   dependency exists, and canonical bytes are the only transport in the merged
+   code; any production embedding provider behind the dense seam; a scheduler,
+   daemon, or CLI that runs any connector or projector, since every module here
+   is constructed only by its own tests; and the publication-role grant on the
+   two new views, which is a deployment action that has not been performed.
 6. Admit one exhaustive code/spec observer and add basic discrepancy derivation.
 7. Add authenticated private ingress, durable queueing, remote connector
    cursors, and dead-letter/quarantine behavior.
