@@ -92,7 +92,7 @@ pub fn active_package() -> ActiveStage4Package {
     })
     .expect("the frozen bootstrap receipt must yield a consistent witness");
 
-    ActiveStage4Package::bind(package, head, &witness)
+    ActiveStage4Package::bind(&package, head, &witness)
         .expect("the frozen package must bind to a head that activated it")
 }
 

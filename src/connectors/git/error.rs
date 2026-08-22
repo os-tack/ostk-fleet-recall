@@ -84,10 +84,6 @@ pub enum GitIngressError {
     /// A fact this ingress was asked to render is not valid.
     #[error("git ingress fact failure: {0}")]
     Fact(#[from] GitFactError),
-    /// The offline package handed to the binder is not the one the active head
-    /// activated, so nothing may be resolved from it.
-    #[error("the supplied registry package is not the activated package")]
-    PackageNotActive,
     /// An identity recipe the active connector names is not resolvable from the
     /// active package.
     #[error("active package does not resolve the {0} identity recipe")]

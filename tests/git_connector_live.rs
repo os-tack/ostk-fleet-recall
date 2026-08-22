@@ -698,12 +698,11 @@ fn content_key() -> ContentKeyEncryptionKey {
 }
 
 fn active_package(fixture: &ContractFixture, scope: &Stage4Scope) -> ActiveStage4Package {
-    ActiveStage4Package::bind(fixture.target.clone(), scope.head.clone(), &scope.witness).unwrap()
+    ActiveStage4Package::bind(&fixture.target, scope.head.clone(), &scope.witness).unwrap()
 }
 
 fn binding(fixture: &ContractFixture, scope: &Stage4Scope) -> GitConnectorBindingV1 {
     GitConnectorBindingV1::resolve(
-        &fixture.target,
         &active_package(fixture, scope),
         ContractId::new("connector.git").unwrap(),
         ContractId::new("connector.git.instance-1").unwrap(),

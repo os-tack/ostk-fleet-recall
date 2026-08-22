@@ -6,7 +6,12 @@ use crate::memory_contracts::canonical::require_canonical;
 use crate::memory_contracts::common::{HexBytes, frozen_profile_reference_v1};
 use crate::memory_contracts::digest::{DigestDomain, domain_separated_digest};
 use crate::memory_contracts::evidence_v2::{IngressContentReferenceV1, SourceFactIdentityV2};
-use crate::memory_contracts::identity::{IdentityForm, LocatorComponentV1, ResourceUri};
+use crate::memory_contracts::generation2_registry::{
+    GIT_CONNECTOR, TRANSCRIPT_CONNECTOR, generation_two_registry_package,
+};
+use crate::memory_contracts::identity::{
+    IdentityForm, LocatorComponentV1, ResourceUri, derive_version_parent,
+};
 use crate::memory_contracts::registry::{ManifestVerifiedRegistryPackage, RegistryHeadV1};
 use crate::memory_contracts::successor_package::SemanticallyClosedSuccessorPackage;
 
@@ -150,7 +155,7 @@ fn active_package() -> ActiveStage4Package {
     let package = target_package();
     let head = synthetic_head(package.package_digest());
     let witness = witness_for(&head);
-    ActiveStage4Package::bind(package, head, &witness)
+    ActiveStage4Package::bind(&package, head, &witness)
         .expect("the frozen package must bind to a head that activated it")
 }
 
@@ -547,7 +552,7 @@ fn a_package_that_is_not_the_activated_one_cannot_bind() {
     head.head.package_digest = Sha256Digest::from_bytes([0x11; 32]);
     let witness = witness_for(&head);
     assert!(matches!(
-        ActiveStage4Package::bind(package.clone(), head, &witness),
+        ActiveStage4Package::bind(&package, head, &witness),
         Err(EvidenceAdmissionError::PackageNotActive)
     ));
 
@@ -556,7 +561,7 @@ fn a_package_that_is_not_the_activated_one_cannot_bind() {
     let mut other = good.clone();
     other.head.activation_id = Sha256Digest::from_bytes([0x22; 32]);
     assert!(matches!(
-        ActiveStage4Package::bind(package, good, &witness_for(&other)),
+        ActiveStage4Package::bind(&package, good, &witness_for(&other)),
         Err(EvidenceAdmissionError::PackageNotActive)
     ));
 }
@@ -1318,4 +1323,310 @@ fn a_body_carried_registry_reference_must_resolve_in_the_active_package() {
     let mut wrong_digest = reference;
     wrong_digest.entry_digest = Sha256Digest::from_bytes([0x11; 32]);
     assert!(refused(RegistryEntryKind::ExemplarPolicy, &wrong_digest));
+}
+
+// -----------------------------------------------------------------------
+// Generation 2: version-form canonical resources and their derived parents
+// -----------------------------------------------------------------------
+
+fn generation_two_package() -> SemanticallyClosedSuccessorPackage {
+    let manifest = ManifestVerifiedRegistryPackage::decode(
+        record(TARGET_PACKAGE),
+        &frozen_profile_reference_v1(),
+    )
+    .unwrap();
+    let generation_two = generation_two_registry_package(&manifest)
+        .expect("the generation-2 composition must close");
+    SemanticallyClosedSuccessorPackage::from_manifest_verified(generation_two).unwrap()
+}
+
+fn generation_two_active(connector_schema_id: &str) -> ActiveStage4Package {
+    let package = generation_two_package();
+    let head = synthetic_head(package.package_digest());
+    let witness = witness_for(&head);
+    ActiveStage4Package::bind_connector(
+        package,
+        &ContractId::new(connector_schema_id).unwrap(),
+        head,
+        &witness,
+    )
+    .expect("the generation-2 package must bind to the head that activated it")
+}
+
+/// One connector's canonical-resource locator under generation 2, with its
+/// parent entity derived exactly the way admission will rederive it.
+fn generation_two_locators(active: &ActiveStage4Package) -> EvidenceIngressLocatorsV1 {
+    generation_two_locators_for(active, b"sha256:abc")
+}
+
+/// The same, over an arbitrary revision, so a test can build a locator that is
+/// internally consistent yet names a revision the candidate does not publish.
+fn generation_two_locators_for(
+    active: &ActiveStage4Package,
+    revision: &[u8],
+) -> EvidenceIngressLocatorsV1 {
+    let connector = active.connector();
+    let resource_recipe = active
+        .recipe(
+            &connector.schema().canonical_resource_identity_recipe,
+            "canonical resource identity recipe",
+        )
+        .unwrap();
+    let mut canonical_resource = CanonicalLocatorV1 {
+        schema_version: 1,
+        profile: active.profile().clone(),
+        scope: active.scope().clone(),
+        identity_form: resource_recipe.recipe().identity_form,
+        resource_kind: resource_recipe.recipe().resource_kind.clone(),
+        recipe: connector
+            .schema()
+            .canonical_resource_identity_recipe
+            .clone(),
+        provider_instance_namespace: resource_recipe.authority_namespace_id().clone(),
+        parent_entity: None,
+        components: vec![LocatorComponentV1 {
+            key: ContractId::new(IMMUTABLE_REVISION_KEY).unwrap(),
+            encoding: LocatorEncoding::HexBytes,
+            value: hex::encode(revision),
+        }],
+    };
+    let parent = derive_version_parent(
+        active.manifest_verified_package(),
+        active.profile(),
+        active.scope(),
+        &resource_recipe,
+        &canonical_resource,
+    )
+    .unwrap()
+    .expect("a version recipe derives a parent");
+    canonical_resource.parent_entity = Some(parent.uri().clone());
+    EvidenceIngressLocatorsV1 {
+        provider_instance: built_locators(active).provider_instance,
+        canonical_resource,
+    }
+}
+
+fn generation_two_candidate(
+    active: &ActiveStage4Package,
+    locators: &EvidenceIngressLocatorsV1,
+) -> EvidenceIngressCandidateV2 {
+    let connector = active.connector();
+    let resource_recipe = active
+        .recipe(
+            &connector.schema().canonical_resource_identity_recipe,
+            "canonical resource identity recipe",
+        )
+        .unwrap();
+    let parent = derive_version_parent(
+        active.manifest_verified_package(),
+        active.profile(),
+        active.scope(),
+        &resource_recipe,
+        &locators.canonical_resource,
+    )
+    .unwrap();
+    let context = IdentityDerivationContextV1::from_trusted_context(
+        active.profile().clone(),
+        active.scope().clone(),
+        resource_recipe.authority_namespace_id().clone(),
+    );
+    let canonical_resource_id = derive_resource_uri(
+        &context,
+        &locators.canonical_resource,
+        &resource_recipe,
+        parent.as_ref(),
+    )
+    .unwrap()
+    .into_uri();
+    let provider_instance_id = derived_uri(
+        active,
+        &locators.provider_instance,
+        &connector.schema().provider_instance_identity_recipe,
+        "namespace.github.provider_instance",
+        "provider instance identity recipe",
+    );
+
+    let content_digest = Sha256Digest::from_bytes(Sha256::digest(CANONICAL_PAYLOAD).into());
+    let storage_identity = StorageIdentityPreimageV1 {
+        schema_version: STORAGE_IDENTITY_SCHEMA_VERSION,
+        protection_domain_id: active.scope().project_namespace.clone(),
+        body_content_id: content_digest,
+    }
+    .storage_identity()
+    .unwrap()
+    .digest();
+    EvidenceIngressCandidateV2 {
+        schema_version: EVIDENCE_SCHEMA_VERSION,
+        scope: active.scope().clone(),
+        connector_schema: connector.registry_reference().clone(),
+        source_fact: SourceFactIdentityV2 {
+            schema_version: EVIDENCE_SCHEMA_VERSION,
+            scope: active.scope().clone(),
+            provider_namespace: connector.schema().provider_namespace.clone(),
+            provider_instance_id,
+            logical_event_key: HexBytes::new(b"turn:123".to_vec()).unwrap(),
+            provider_object_id: HexBytes::new(b"123".to_vec()).unwrap(),
+            immutable_revision: HexBytes::new(b"sha256:abc".to_vec()).unwrap(),
+            canonical_resource_id,
+        },
+        provider_actor_id: None,
+        occurred_at: CanonicalTimestamp::parse("2026-08-15T12:30:00.000000000Z").unwrap(),
+        observed_at: CanonicalTimestamp::parse("2026-08-15T12:30:01.000000000Z").unwrap(),
+        authenticated_ingress_principal_id: ContractId::new("connector.github").unwrap(),
+        connector_instance_id: ContractId::new("connector.github.instance-1").unwrap(),
+        provider_delivery_id: HexBytes::new(b"delivery-1".to_vec()).unwrap(),
+        received_at: CanonicalTimestamp::parse("2026-08-15T12:30:02.000000000Z").unwrap(),
+        canonical_payload: IngressContentReferenceV1 {
+            asserted_media_type: ContractId::new("application.json").unwrap(),
+            byte_length: CanonicalDecimal::parse(CANONICAL_PAYLOAD.len().to_string()).unwrap(),
+            content_digest,
+            storage_identity,
+        },
+        private_raw_artifact: None,
+    }
+}
+
+#[test]
+fn a_version_form_resource_is_admitted_under_generation_two() {
+    // The whole point of W3-CHAIN: a fact admitted under the ACTIVE generation-2
+    // package names a VERSION-form canonical resource, which is the only form
+    // the body plane will chunk.
+    let active = generation_two_active(GIT_CONNECTOR.connector_schema);
+    let locators = generation_two_locators(&active);
+    let candidate = generation_two_candidate(&active, &locators);
+    let admitted = admit_with(&active, &candidate, &locators).unwrap();
+    assert_eq!(
+        admitted
+            .statement()
+            .source_fact
+            .canonical_resource_id
+            .identity_form(),
+        IdentityForm::Version
+    );
+    admitted.appendable(&witness_for(active.head())).unwrap();
+}
+
+#[test]
+fn a_version_form_locator_naming_no_parent_is_refused() {
+    let active = generation_two_active(GIT_CONNECTOR.connector_schema);
+    let locators = generation_two_locators(&active);
+    let candidate = generation_two_candidate(&active, &locators);
+    let mut orphan = locators;
+    orphan.canonical_resource.parent_entity = None;
+    assert!(matches!(
+        admit_with(&active, &candidate, &orphan),
+        Err(EvidenceAdmissionError::ParentEntityUnsupported)
+    ));
+}
+
+#[test]
+fn a_version_form_locator_naming_a_parent_the_package_does_not_derive_is_refused() {
+    // The attack this seam exists to refuse: a caller minting its own parent
+    // URI so the canonical-resource URI hashes over a coordinate nothing proved.
+    let active = generation_two_active(GIT_CONNECTOR.connector_schema);
+    let locators = generation_two_locators(&active);
+    let candidate = generation_two_candidate(&active, &locators);
+    let mut forged = locators;
+    forged.canonical_resource.parent_entity =
+        Some(candidate.source_fact.provider_instance_id.clone());
+    assert!(matches!(
+        admit_with(&active, &candidate, &forged),
+        Err(EvidenceAdmissionError::ParentEntityUnsupported)
+    ));
+}
+
+#[test]
+fn a_version_form_locator_over_another_revision_does_not_rederive_the_declared_uri() {
+    // The parent is derived from the child's components, so a different
+    // revision moves BOTH URIs together and the locator stays internally
+    // consistent. Rederivation against the DECLARED identity is what refuses it.
+    let active = generation_two_active(GIT_CONNECTOR.connector_schema);
+    let honest = generation_two_locators(&active);
+    let candidate = generation_two_candidate(&active, &honest);
+    let other = generation_two_locators_for(&active, b"sha256:not-the-revision");
+    assert_ne!(
+        other.canonical_resource.parent_entity,
+        honest.canonical_resource.parent_entity
+    );
+    assert!(matches!(
+        admit_with(&active, &candidate, &other),
+        Err(EvidenceAdmissionError::ResourceIdentityMismatch(
+            ResourceIdentityKind::CanonicalResource
+        ))
+    ));
+}
+
+#[test]
+fn a_version_form_uri_stays_bound_to_the_published_revision() {
+    // The complement: locator and declared URI agree, but the candidate
+    // publishes a different `immutable_revision`. Without the coordinate
+    // binding a caller could hash one revision into the version URI while the
+    // envelope claimed another (EVID-02, PROV-01).
+    let active = generation_two_active(GIT_CONNECTOR.connector_schema);
+    let locators = generation_two_locators(&active);
+    let mut candidate = generation_two_candidate(&active, &locators);
+    candidate.source_fact.immutable_revision =
+        HexBytes::new(b"sha256:some-other-revision".to_vec()).unwrap();
+    assert!(matches!(
+        admit_with(&active, &candidate, &locators),
+        Err(EvidenceAdmissionError::LocatorCoordinateMismatch(
+            IMMUTABLE_REVISION_KEY
+        ))
+    ));
+}
+
+#[test]
+fn the_two_generation_two_connectors_derive_different_resources_for_one_revision() {
+    // Distinct recipes, distinct namespaces: the same immutable revision seen by
+    // the git connector and by the transcript connector is never one resource.
+    let git = generation_two_active(GIT_CONNECTOR.connector_schema);
+    let transcript = generation_two_active(TRANSCRIPT_CONNECTOR.connector_schema);
+    let git_locators = generation_two_locators(&git);
+    let transcript_locators = generation_two_locators(&transcript);
+    let git_candidate = generation_two_candidate(&git, &git_locators);
+    let transcript_candidate = generation_two_candidate(&transcript, &transcript_locators);
+    assert_eq!(
+        git_locators.canonical_resource.components,
+        transcript_locators.canonical_resource.components
+    );
+    assert_ne!(
+        git_candidate.source_fact.canonical_resource_id,
+        transcript_candidate.source_fact.canonical_resource_id
+    );
+    admit_with(&git, &git_candidate, &git_locators).unwrap();
+    admit_with(&transcript, &transcript_candidate, &transcript_locators).unwrap();
+}
+
+#[test]
+fn binding_a_connector_the_active_package_does_not_carry_is_refused() {
+    let package = generation_two_package();
+    let head = synthetic_head(package.package_digest());
+    let witness = witness_for(&head);
+    assert!(matches!(
+        ActiveStage4Package::bind_connector(
+            package,
+            &ContractId::new("connector.not.in.this.package").unwrap(),
+            head,
+            &witness,
+        ),
+        Err(EvidenceAdmissionError::ConnectorNotInActivePackage)
+    ));
+}
+
+#[test]
+fn binding_generation_two_against_a_head_that_activated_something_else_is_refused() {
+    let package = generation_two_package();
+    // A real head, just not this package's. Digest binding is the whole proof,
+    // so it must refuse.
+    let foreign = synthetic_head(target_package().package_digest());
+    let witness = witness_for(&foreign);
+    assert!(matches!(
+        ActiveStage4Package::bind_connector(
+            package,
+            &ContractId::new(GIT_CONNECTOR.connector_schema).unwrap(),
+            foreign,
+            &witness,
+        ),
+        Err(EvidenceAdmissionError::PackageNotActive)
+    ));
 }

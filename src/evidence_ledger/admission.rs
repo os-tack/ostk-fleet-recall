@@ -49,9 +49,14 @@
 //!   retention boundary for the private raw archive; that boundary does not
 //!   exist, so a candidate carrying one is refused rather than quietly stored
 //!   under the governed key.
-//! * A `version`-form resource whose locator names a parent entity. The parent
-//!   derivation seam is not built, and guessing a parent would be exactly the
-//!   self-asserted identity this module exists to prevent.
+//! * A *caller-supplied* parent entity. A `version`-form resource does name a
+//!   parent, but the parent is derived here from the child's own already-proven
+//!   coordinates and the active package's unique entity recipe for the declared
+//!   parent kind (see [`derive_version_parent`]). A locator that names a parent
+//!   the package does not derive to is refused
+//!   ([`EvidenceAdmissionError::ParentEntityUnsupported`]), which is what keeps
+//!   a parent from being the self-asserted identity this module exists to
+//!   prevent.
 //! * `provider_verified` / `signature_verified` integrity. See
 //!   [`derive_integrity_state`].
 
@@ -77,11 +82,12 @@ use crate::memory_contracts::evidence_v2::{
     StructurallyResolvedConnectorSchemaV2, derive_representation_key_v2, derive_source_fact_id_v2,
 };
 use crate::memory_contracts::identity::{
-    CanonicalLocatorV1, IdentityDerivationContextV1, LocatorEncoding, ValidatedIdentityRecipe,
-    derive_resource_uri,
+    CanonicalLocatorV1, IdentityDerivationContextV1, IdentityForm, LocatorEncoding,
+    ValidatedIdentityRecipe, derive_resource_uri, derive_version_parent,
 };
 use crate::memory_contracts::registry::{RegistryEntryKind, RegistryEntryV1};
 use crate::memory_contracts::stage4_target_package::SemanticallyClosedStage4Package;
+use crate::memory_contracts::successor_package::SemanticallyClosedSuccessorPackage;
 use crate::memory_contracts::{ContractError, ContractResult};
 
 use super::appendable::{AppendableAcceptedEvent, EvidenceDeliveryContextV1};
@@ -174,8 +180,11 @@ pub enum EvidenceAdmissionError {
     /// candidate declares under the same name.
     #[error("locator component {0} does not equal the declared provider coordinate")]
     LocatorCoordinateMismatch(&'static str),
-    /// A locator names a parent entity, which this stage cannot derive.
-    #[error("locators naming a parent entity are not admitted yet")]
+    /// A locator's parent entity is not the one the active package derives:
+    /// a provider-instance locator naming any parent, an entity/occurrence
+    /// resource naming one, a version resource naming none, or a version
+    /// resource naming a parent other than the derived one.
+    #[error("locator parent entity is not the one the active package derives")]
     ParentEntityUnsupported,
     /// EVID-03 clock ordering failed.
     #[error("evidence clocks are inconsistent: {}", .0.as_str())]
@@ -204,8 +213,8 @@ pub enum EvidenceAdmissionError {
     Append(#[from] EvidenceAppendError),
 }
 
-/// One offline Stage-4 package proven to be the package the active head
-/// activated.
+/// One offline package proven to be the package the active head activated,
+/// narrowed to the one connector schema a caller runs as.
 ///
 /// This is the type that turns "a package" into "the active package". It is not
 /// registry authority on its own: the authority is the writer-authority view
@@ -214,23 +223,86 @@ pub enum EvidenceAdmissionError {
 /// link from that head to a concrete, manifest-verified set of entries, so
 /// connector and recipe resolution can be *from the active package* rather than
 /// from whatever bytes a caller happened to pass.
+///
+/// Generation 1 carries exactly one connector schema, so [`Self::bind`] resolves
+/// it with no choice to make. Generation 2 carries one connector schema per
+/// installed connector, so [`Self::bind_connector`] takes the schema id the
+/// caller runs as and proves *that* entry is a member of the activated package.
+/// Naming a connector the active package does not carry is refused
+/// ([`EvidenceAdmissionError::ConnectorNotInActivePackage`]); naming one it does
+/// carry selects an entry, never authority — every recipe, policy, and digest
+/// still comes from the activated bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveStage4Package {
-    package: SemanticallyClosedStage4Package,
+    package: SemanticallyClosedSuccessorPackage,
+    connector: StructurallyResolvedConnectorSchemaV2,
     head: RegistryHeadBindingV1,
     scope: AuthenticatedProjectScopeV1,
     profile: ProfileReferenceV1,
 }
 
 impl ActiveStage4Package {
-    /// Prove `package` is the activated package for `witness`'s head.
+    /// Prove the frozen generation-1 Stage-4 `package` is the activated package
+    /// for `witness`'s head.
     ///
     /// The head binding is the caller's; every field of its head triple must
     /// equal the witness's, and the package's own recomputed digest must equal
     /// the activated `package_digest`. Scope and profile are then taken from
     /// the witness and the package respectively — never from a request.
     pub fn bind(
-        package: SemanticallyClosedStage4Package,
+        package: &SemanticallyClosedStage4Package,
+        head: RegistryHeadBindingV1,
+        witness: &WriterAuthorityWitness,
+    ) -> Result<Self, EvidenceAdmissionError> {
+        let connector = package.connector_schema().clone();
+        Self::bound(
+            package.successor_package().clone(),
+            connector,
+            head,
+            witness,
+        )
+    }
+
+    /// Prove `package` is the activated package for `witness`'s head, and
+    /// narrow it to the connector schema entry `connector_schema_id` names.
+    ///
+    /// This is the generation-2 path. The schema id selects which of the
+    /// activated package's connector entries this binding delivers as; it can
+    /// never introduce one, because the entry is resolved out of the already
+    /// digest-checked package closure.
+    pub fn bind_connector(
+        package: SemanticallyClosedSuccessorPackage,
+        connector_schema_id: &ContractId,
+        head: RegistryHeadBindingV1,
+        witness: &WriterAuthorityWitness,
+    ) -> Result<Self, EvidenceAdmissionError> {
+        let entry = package
+            .manifest_verified_package()
+            .package()
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.kind == RegistryEntryKind::ConnectorSchema
+                    && entry.entry_id == *connector_schema_id
+            })
+            .ok_or(EvidenceAdmissionError::ConnectorNotInActivePackage)?;
+        let reference = RegistryReferenceV1 {
+            entry_id: entry.entry_id.clone(),
+            version: entry.version,
+            entry_digest: entry
+                .digest()
+                .map_err(|_| EvidenceAdmissionError::ConnectorNotInActivePackage)?,
+        };
+        let connector = package
+            .connector_schema(&reference)
+            .ok_or(EvidenceAdmissionError::ConnectorNotInActivePackage)?
+            .clone();
+        Self::bound(package, connector, head, witness)
+    }
+
+    fn bound(
+        package: SemanticallyClosedSuccessorPackage,
+        connector: StructurallyResolvedConnectorSchemaV2,
         head: RegistryHeadBindingV1,
         witness: &WriterAuthorityWitness,
     ) -> Result<Self, EvidenceAdmissionError> {
@@ -242,23 +314,23 @@ impl ActiveStage4Package {
             return Err(EvidenceAdmissionError::PackageNotActive);
         }
         let profile = package
-            .successor_package()
             .manifest_verified_package()
             .package()
             .profile
             .clone();
         Ok(Self {
             package,
+            connector,
             head,
             scope: witness.semantic_scope().clone(),
             profile,
         })
     }
 
-    /// The activated connector schema, resolved from the package itself.
+    /// The activated connector schema this binding delivers as.
     #[must_use]
-    pub fn connector(&self) -> &StructurallyResolvedConnectorSchemaV2 {
-        self.package.connector_schema()
+    pub const fn connector(&self) -> &StructurallyResolvedConnectorSchemaV2 {
+        &self.connector
     }
 
     /// The exact active-head binding every admitted statement carries.
@@ -289,7 +361,7 @@ impl ActiveStage4Package {
     pub const fn manifest_verified_package(
         &self,
     ) -> &crate::memory_contracts::registry::ManifestVerifiedRegistryPackage {
-        self.package.successor_package().manifest_verified_package()
+        self.package.manifest_verified_package()
     }
 
     /// Every registry entry the active package closes over.
@@ -303,12 +375,7 @@ impl ActiveStage4Package {
     }
 
     fn entries(&self) -> &[RegistryEntryV1] {
-        &self
-            .package
-            .successor_package()
-            .manifest_verified_package()
-            .package()
-            .entries
+        &self.package.manifest_verified_package().package().entries
     }
 
     fn unique_entry(
@@ -358,7 +425,7 @@ impl ActiveStage4Package {
         reference: &RegistryReferenceV1,
         label: &'static str,
     ) -> Result<ValidatedIdentityRecipe, EvidenceAdmissionError> {
-        let manifest = self.package.successor_package().manifest_verified_package();
+        let manifest = self.package.manifest_verified_package();
         let recipe =
             ValidatedIdentityRecipe::from_package(manifest, &reference.entry_id, reference.version)
                 .map_err(|_| EvidenceAdmissionError::RegistryReferenceNotInActivePackage(label))?;
@@ -660,9 +727,9 @@ fn require_derived_resource_identities(
     candidate: &EvidenceIngressCandidateV2,
     locators: &EvidenceIngressLocatorsV1,
 ) -> Result<(), EvidenceAdmissionError> {
-    if locators.provider_instance.parent_entity.is_some()
-        || locators.canonical_resource.parent_entity.is_some()
-    {
+    // A provider instance is an entity: it is a root, so a parent on its
+    // locator is nonsense whatever the package says.
+    if locators.provider_instance.parent_entity.is_some() {
         return Err(EvidenceAdmissionError::ParentEntityUnsupported);
     }
 
@@ -704,11 +771,32 @@ fn require_derived_resource_identities(
             .entry_id
             .clone(),
     );
+    // The parent of a version-form resource is DERIVED, never accepted: it is
+    // rebuilt from this locator's own components under the active package's
+    // unique entity recipe for the parent kind the child recipe declares. A
+    // locator that names any other parent — including one the caller minted
+    // itself — cannot match and is refused.
+    let parent = derive_version_parent(
+        active.manifest_verified_package(),
+        active.profile(),
+        active.scope(),
+        &resource_recipe,
+        &locators.canonical_resource,
+    )?;
+    match (
+        resource_recipe.recipe().identity_form,
+        &locators.canonical_resource.parent_entity,
+        parent.as_ref(),
+    ) {
+        (IdentityForm::Version, Some(named), Some(derived)) if named == derived.uri() => {}
+        (IdentityForm::Entity | IdentityForm::Occurrence, None, None) => {}
+        _ => return Err(EvidenceAdmissionError::ParentEntityUnsupported),
+    }
     let resource = derive_resource_uri(
         &resource_context,
         &locators.canonical_resource,
         &resource_recipe,
-        None,
+        parent.as_ref(),
     )?;
     if *resource.uri() != candidate.source_fact.canonical_resource_id {
         return Err(EvidenceAdmissionError::ResourceIdentityMismatch(

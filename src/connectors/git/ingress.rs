@@ -38,10 +38,9 @@ use crate::memory_contracts::evidence_v2::{
 };
 use crate::memory_contracts::identity::{
     CanonicalLocatorV1, IdentityDerivationContextV1, LocatorComponentV1, LocatorEncoding,
-    ResourceUri, ValidatedIdentityRecipe, derive_resource_uri,
+    ResourceUri, ValidatedIdentityRecipe, derive_resource_uri, derive_version_parent,
 };
 use crate::memory_contracts::registry::ManifestVerifiedRegistryPackage;
-use crate::memory_contracts::stage4_target_package::SemanticallyClosedStage4Package;
 use sha2::{Digest as _, Sha256};
 
 use super::error::{GitIngressError, GitIngressResult};
@@ -103,6 +102,7 @@ pub struct GitIngressV1 {
 #[derive(Debug, Clone)]
 pub struct GitConnectorBindingV1 {
     connector: StructurallyResolvedConnectorSchemaV2,
+    package: ManifestVerifiedRegistryPackage,
     provider_instance_recipe: ValidatedIdentityRecipe,
     canonical_resource_recipe: ValidatedIdentityRecipe,
     scope: AuthenticatedProjectScopeV1,
@@ -116,21 +116,16 @@ impl GitConnectorBindingV1 {
     /// Resolve the git connector and both identity recipes from the package the
     /// active head activated.
     ///
-    /// `package` must be the same package `active` was bound to. Comparing the
-    /// package digest is what makes that a proof rather than an assumption: a
-    /// caller holding two packages cannot resolve recipes out of the one that is
-    /// not active.
+    /// Every input comes from `active`, which is itself only constructible by
+    /// proving a package digest against a writer-authority witness. There is no
+    /// second package a caller could resolve a recipe out of by mistake.
     pub fn resolve(
-        package: &SemanticallyClosedStage4Package,
         active: &ActiveStage4Package,
         principal_id: ContractId,
         connector_instance_id: ContractId,
         installation_id: u64,
     ) -> GitIngressResult<Self> {
-        if package.package_digest() != active.head().head.package_digest {
-            return Err(GitIngressError::PackageNotActive);
-        }
-        let manifest = package.successor_package().manifest_verified_package();
+        let manifest = active.manifest_verified_package();
         let connector = active.connector().clone();
         let provider_instance_recipe = resolve_recipe(
             manifest,
@@ -144,6 +139,7 @@ impl GitConnectorBindingV1 {
         )?;
         Ok(Self {
             connector,
+            package: manifest.clone(),
             provider_instance_recipe,
             canonical_resource_recipe,
             scope: active.scope().clone(),
@@ -289,7 +285,7 @@ impl GitConnectorBindingV1 {
                 value,
             });
         }
-        Ok(CanonicalLocatorV1 {
+        let locator = CanonicalLocatorV1 {
             schema_version: IDENTITY_SCHEMA_VERSION,
             profile: self.profile.clone(),
             scope: self.scope.clone(),
@@ -297,10 +293,19 @@ impl GitConnectorBindingV1 {
             resource_kind: recipe.recipe().resource_kind.clone(),
             recipe: recipe.registry_reference().clone(),
             provider_instance_namespace: recipe.recipe().authority_namespace.entry_id.clone(),
-            // Deriving a parent entity is a seam admission itself refuses, so
-            // this connector never names one.
             parent_entity: None,
             components,
+        };
+        // A version-form recipe names a parent entity, and the parent is
+        // derived from this locator's own proven coordinates through the ACTIVE
+        // package — the same function admission rederives with, so a locator
+        // this connector builds and one admission accepts cannot disagree. A
+        // non-version recipe derives no parent and keeps `None`.
+        let parent =
+            derive_version_parent(&self.package, &self.profile, &self.scope, recipe, &locator)?;
+        Ok(CanonicalLocatorV1 {
+            parent_entity: parent.map(|derived| derived.uri().clone()),
+            ..locator
         })
     }
 }

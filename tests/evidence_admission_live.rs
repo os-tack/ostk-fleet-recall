@@ -617,7 +617,7 @@ fn ingress_locators() -> EvidenceIngressLocatorsV1 {
 }
 
 fn active_package(fixture: &ContractFixture, scope: &Stage4Scope) -> ActiveStage4Package {
-    ActiveStage4Package::bind(fixture.target.clone(), scope.head.clone(), &scope.witness).unwrap()
+    ActiveStage4Package::bind(&fixture.target, scope.head.clone(), &scope.witness).unwrap()
 }
 
 fn admission_delivery(attempt: u32) -> EvidenceDeliveryContextV1 {
@@ -1032,7 +1032,7 @@ async fn live_rejections_happen_before_any_write_when_configured() {
     let mut stale_head = scope.head.clone();
     stale_head.head.activation_id = Sha256Digest::from_bytes([0x77; 32]);
     assert!(matches!(
-        ActiveStage4Package::bind(fixture.target.clone(), stale_head, &scope.witness),
+        ActiveStage4Package::bind(&fixture.target, stale_head, &scope.witness),
         Err(EvidenceAdmissionError::PackageNotActive)
     ));
 

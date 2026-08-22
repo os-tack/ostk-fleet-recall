@@ -599,7 +599,7 @@ async fn activate(pool: &PgPool, fixture: &ContractFixture) -> ActivatedMemory {
     let witness = ledger.read_writer_authority_witness().await.unwrap();
     assert_eq!(witness.generation(), 1, "the head must be generation one");
     let active =
-        ActiveStage4Package::bind(fixture.stage4.clone(), generation_1_head.clone(), &witness)
+        ActiveStage4Package::bind(&fixture.stage4, generation_1_head.clone(), &witness)
             .expect("the activated package is the Stage-4 target");
 
     ActivatedMemory {
@@ -719,7 +719,6 @@ async fn ingest_git(memory: &ActivatedMemory, git_dir: &Path, ref_name: &str) ->
         .expect("the real repository must scan");
 
     let binding = ostk_fleet_recall::connectors::git::GitConnectorBindingV1::resolve(
-        &fixture().stage4,
         &memory.active,
         ContractId::new("connector.git").unwrap(),
         ContractId::new(GIT_INSTANCE).unwrap(),
@@ -1333,7 +1332,7 @@ async fn activate_generation_two(memory: &ActivatedMemory, fixture: &ContractFix
         Ok(GenericSuccessorActivationOutcome::Inserted(accepted)) => {
             let witness = memory.ledger.read_writer_authority_witness().await.unwrap();
             let bind = ActiveStage4Package::bind(
-                fixture.stage4.clone(),
+                &fixture.stage4,
                 accepted.registry_head.clone(),
                 &witness,
             );

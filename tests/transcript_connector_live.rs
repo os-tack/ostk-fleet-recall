@@ -537,7 +537,7 @@ async fn live_connector(pool: &PgPool, fixture: &ContractFixture, label: &str) -
         fixture.target.package_digest(),
         "the activated package must be the Stage-4 target"
     );
-    let active = ActiveStage4Package::bind(fixture.target.clone(), head, &witness).unwrap();
+    let active = ActiveStage4Package::bind(&fixture.target, head, &witness).unwrap();
 
     LiveConnector {
         outbox: CockroachTranscriptOutboxRepository::new(

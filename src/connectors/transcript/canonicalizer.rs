@@ -46,7 +46,7 @@ use crate::memory_contracts::evidence_v2::{
 };
 use crate::memory_contracts::identity::{
     CanonicalLocatorV1, IdentityDerivationContextV1, LocatorComponentV1, LocatorEncoding,
-    ValidatedIdentityRecipe, derive_resource_uri,
+    ValidatedIdentityRecipe, derive_resource_uri, derive_version_parent,
 };
 
 use super::error::{TranscriptConnectorError, TranscriptConnectorResult};
@@ -213,7 +213,7 @@ fn build_locator(
             value,
         });
     }
-    Ok(CanonicalLocatorV1 {
+    let locator = CanonicalLocatorV1 {
         schema_version: 1,
         profile: active.profile().clone(),
         scope: active.scope().clone(),
@@ -223,6 +223,21 @@ fn build_locator(
         provider_instance_namespace: recipe_body.authority_namespace.entry_id.clone(),
         parent_entity: None,
         components,
+    };
+    // A version-form recipe names a parent entity. It is derived from this
+    // locator's own proven coordinates through the ACTIVE package, by the same
+    // function the admission seam rederives with, so the ingress-side locator
+    // and the admitted one cannot disagree. A non-version recipe keeps `None`.
+    let parent = derive_version_parent(
+        active.manifest_verified_package(),
+        active.profile(),
+        active.scope(),
+        validated,
+        &locator,
+    )?;
+    Ok(CanonicalLocatorV1 {
+        parent_entity: parent.map(|derived| derived.uri().clone()),
+        ..locator
     })
 }
 
