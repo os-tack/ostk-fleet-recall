@@ -280,32 +280,9 @@ impl GitConnectorBindingV1 {
         let rules = &recipe.recipe().component_rules;
         let mut components = Vec::with_capacity(rules.len());
         for rule in rules {
-            let (value, encoding) = match (rule.key.as_str(), fact) {
-                (IMMUTABLE_REVISION_KEY, Some(fact)) => (
-                    hex::encode(fact.immutable_revision()?.as_bytes()),
-                    LocatorEncoding::HexBytes,
-                ),
-                (PROVIDER_OBJECT_ID_KEY, Some(fact)) => (
-                    hex::encode(fact.provider_object_id()?.as_bytes()),
-                    LocatorEncoding::HexBytes,
-                ),
-                (PROVIDER_INSTALLATION_ID_KEY, _) => (
-                    self.installation_id.as_str().to_owned(),
-                    LocatorEncoding::Decimal,
-                ),
-                _ => {
-                    return Err(GitIngressError::UnsupportedLocatorComponent(
-                        rule.key.as_str().to_owned(),
-                    ));
-                }
-            };
-            if rule.encoding != encoding {
-                return Err(GitIngressError::LocatorEncodingMismatch {
-                    key: rule.key.as_str().to_owned(),
-                    demanded: rule.encoding,
-                    supplied: encoding,
-                });
-            }
+            let (value, encoding) =
+                proven_locator_component(rule.key.as_str(), &self.installation_id, fact)?;
+            require_component_encoding(rule.key.as_str(), rule.encoding, encoding)?;
             components.push(LocatorComponentV1 {
                 key: rule.key.clone(),
                 encoding,
@@ -326,6 +303,58 @@ impl GitConnectorBindingV1 {
             components,
         })
     }
+}
+
+/// The one place a locator coordinate is filled, and the only three values it
+/// may be filled from.
+///
+/// A recipe naming a coordinate this connector cannot prove is refused rather
+/// than guessed (PROV-01, EVID-02): a fabricated coordinate hashes into the
+/// resource URI exactly like a proven one, so the two would be
+/// indistinguishable downstream. A fact-derived coordinate is likewise refused
+/// when there is no fact in hand — the provider-instance recipe names the
+/// installation, never an object — instead of falling back to a placeholder.
+fn proven_locator_component(
+    key: &str,
+    installation_id: &CanonicalDecimal,
+    fact: Option<&GitFactV1>,
+) -> GitIngressResult<(String, LocatorEncoding)> {
+    match (key, fact) {
+        (IMMUTABLE_REVISION_KEY, Some(fact)) => Ok((
+            hex::encode(fact.immutable_revision()?.as_bytes()),
+            LocatorEncoding::HexBytes,
+        )),
+        (PROVIDER_OBJECT_ID_KEY, Some(fact)) => Ok((
+            hex::encode(fact.provider_object_id()?.as_bytes()),
+            LocatorEncoding::HexBytes,
+        )),
+        (PROVIDER_INSTALLATION_ID_KEY, _) => Ok((
+            installation_id.as_str().to_owned(),
+            LocatorEncoding::Decimal,
+        )),
+        _ => Err(GitIngressError::UnsupportedLocatorComponent(key.to_owned())),
+    }
+}
+
+/// The encoding the recipe demands must be the encoding the proven value
+/// actually has.
+///
+/// Re-encoding the value to satisfy the recipe would change the bytes the
+/// resource URI is hashed from while leaving the recipe reference intact, so a
+/// mismatch fails closed.
+fn require_component_encoding(
+    key: &str,
+    demanded: LocatorEncoding,
+    supplied: LocatorEncoding,
+) -> GitIngressResult<()> {
+    if demanded == supplied {
+        return Ok(());
+    }
+    Err(GitIngressError::LocatorEncodingMismatch {
+        key: key.to_owned(),
+        demanded,
+        supplied,
+    })
 }
 
 fn resolve_recipe(
@@ -376,6 +405,110 @@ mod tests {
 
     fn stamp(value: &str) -> CanonicalTimestamp {
         CanonicalTimestamp::parse(value).unwrap()
+    }
+
+    fn installation() -> CanonicalDecimal {
+        CanonicalDecimal::parse("4242".to_owned()).unwrap()
+    }
+
+    fn commit_fact() -> GitFactV1 {
+        use crate::connectors::git::fact::{
+            GIT_FACT_SCHEMA_VERSION, GitAncestryClaimV1, GitCommitFactV1, GitIdentityV1,
+            GitObjectId, GitRepositoryIdV1,
+        };
+        use crate::memory_contracts::common::HexBytes;
+
+        let identity = GitIdentityV1 {
+            name: HexBytes::new(b"Ada".to_vec()).unwrap(),
+            email: HexBytes::new(b"ada@example.test".to_vec()).unwrap(),
+            at: stamp("2026-08-15T12:00:00.000000000Z"),
+            utc_offset_minutes: 0,
+        };
+        GitFactV1::Commit(GitCommitFactV1 {
+            schema_version: GIT_FACT_SCHEMA_VERSION,
+            repository: GitRepositoryIdV1::from_trusted_config(
+                ContractId::new("git.repo.fixture").unwrap(),
+                4242,
+            )
+            .unwrap(),
+            commit_id: GitObjectId::parse_hex(&hex::encode([0x11_u8; 20])).unwrap(),
+            tree_id: GitObjectId::parse_hex(&hex::encode([0x22_u8; 20])).unwrap(),
+            parents: Vec::new(),
+            author: identity.clone(),
+            committer: identity,
+            message: HexBytes::new(b"first".to_vec()).unwrap(),
+            ancestry: GitAncestryClaimV1::RecordedParents,
+            declared_links: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn the_three_proven_coordinates_fill_from_the_values_they_name() {
+        let fact = commit_fact();
+        let (revision, encoding) =
+            proven_locator_component(IMMUTABLE_REVISION_KEY, &installation(), Some(&fact)).unwrap();
+        assert_eq!(encoding, LocatorEncoding::HexBytes);
+        assert_eq!(revision, hex::encode([0x11_u8; 20]));
+
+        let (object, encoding) =
+            proven_locator_component(PROVIDER_OBJECT_ID_KEY, &installation(), Some(&fact)).unwrap();
+        assert_eq!(encoding, LocatorEncoding::HexBytes);
+        assert_eq!(object, hex::encode([0x11_u8; 20]));
+
+        let (installation_value, encoding) =
+            proven_locator_component(PROVIDER_INSTALLATION_ID_KEY, &installation(), None).unwrap();
+        assert_eq!(encoding, LocatorEncoding::Decimal);
+        assert_eq!(installation_value, "4242");
+    }
+
+    #[test]
+    fn a_coordinate_this_connector_cannot_prove_is_refused_not_guessed() {
+        let fact = commit_fact();
+        let refused =
+            proven_locator_component("provider_repository_url", &installation(), Some(&fact));
+        assert!(matches!(
+            refused,
+            Err(GitIngressError::UnsupportedLocatorComponent(key)) if key == "provider_repository_url"
+        ));
+    }
+
+    #[test]
+    fn a_fact_derived_coordinate_is_refused_when_there_is_no_fact() {
+        // The provider-instance recipe names the installation, not an object;
+        // asking it for a revision must fail closed rather than fall back to a
+        // placeholder that would still hash into the URI.
+        for key in [IMMUTABLE_REVISION_KEY, PROVIDER_OBJECT_ID_KEY] {
+            let refused = proven_locator_component(key, &installation(), None);
+            assert!(matches!(
+                refused,
+                Err(GitIngressError::UnsupportedLocatorComponent(refused_key)) if refused_key == key
+            ));
+        }
+    }
+
+    #[test]
+    fn a_recipe_demanding_another_encoding_of_a_proven_value_is_refused() {
+        let refused = require_component_encoding(
+            IMMUTABLE_REVISION_KEY,
+            LocatorEncoding::Decimal,
+            LocatorEncoding::HexBytes,
+        );
+        assert!(matches!(
+            refused,
+            Err(GitIngressError::LocatorEncodingMismatch {
+                key,
+                demanded: LocatorEncoding::Decimal,
+                supplied: LocatorEncoding::HexBytes,
+            }) if key == IMMUTABLE_REVISION_KEY
+        ));
+        assert!(
+            require_component_encoding(
+                IMMUTABLE_REVISION_KEY,
+                LocatorEncoding::HexBytes,
+                LocatorEncoding::HexBytes,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

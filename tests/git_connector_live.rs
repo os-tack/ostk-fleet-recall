@@ -30,7 +30,7 @@ use ostk_fleet_recall::FleetScope;
 use ostk_fleet_recall::connectors::git::{
     GitConnectorBindingV1, GitCoverageBindingV1, GitDrainContextV1, GitFactV1, GitIngressClocksV1,
     GitObjectId, GitRefName, GitRefObservationLogV1, GitRepositoryIdV1, GitRepositoryReader,
-    GitScanRequestV1, GitTreeScanModeV1, drain_git_facts, git_coverage_observation,
+    GitScanError, GitScanRequestV1, GitTreeScanModeV1, drain_git_facts, git_coverage_observation,
     git_resume_sequence,
 };
 use ostk_fleet_recall::control_log::{
@@ -783,6 +783,87 @@ fn coverage_binding(window: CoverageWindowV1) -> GitCoverageBindingV1 {
         },
         window,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reader-level proofs. These read a real repository through the real `git`
+// plumbing but never touch the ledger, so they run with or without a database.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_walk_that_would_exceed_its_commit_bound_fails_closed() {
+    let repository = ScratchRepository::init("bound-commits");
+    let history = build_history(&repository);
+    let reader = repository.reader();
+
+    // The history has two commits, so a one-commit bound must be refused rather
+    // than answered with a truncated walk that looks like a complete one.
+    let refused = reader.scan(&GitScanRequestV1 {
+        max_commits: 1,
+        ..scan_request("refs/heads/main")
+    });
+    assert!(
+        matches!(refused, Err(GitScanError::ScanTooLarge(1))),
+        "{refused:?}"
+    );
+
+    // The same walk under a bound that fits succeeds, so the refusal is the
+    // bound and not a broken reader.
+    let scan = reader
+        .scan(&GitScanRequestV1 {
+            max_commits: 2,
+            ..scan_request("refs/heads/main")
+        })
+        .expect("a walk within its bound must succeed");
+    assert_eq!(
+        scan.commits
+            .iter()
+            .map(GitObjectId::to_hex)
+            .collect::<Vec<_>>(),
+        vec![history.first_commit.clone(), history.renamed_commit],
+        "and it walks oldest first"
+    );
+}
+
+#[test]
+fn a_scan_that_would_exceed_its_fact_bound_fails_closed() {
+    let repository = ScratchRepository::init("bound-facts");
+    build_history(&repository);
+    let reader = repository.reader();
+
+    // Two commits with one changed path each render four facts.
+    let refused = reader.scan(&GitScanRequestV1 {
+        max_facts: 3,
+        ..scan_request("refs/heads/main")
+    });
+    assert!(
+        matches!(refused, Err(GitScanError::ScanTooLarge(3))),
+        "{refused:?}"
+    );
+
+    let scan = reader
+        .scan(&GitScanRequestV1 {
+            max_facts: 4,
+            ..scan_request("refs/heads/main")
+        })
+        .expect("a scan within its bound must succeed");
+    assert_eq!(scan.facts.len(), 4);
+}
+
+#[test]
+fn a_ref_the_repository_does_not_have_is_refused_rather_than_invented() {
+    let repository = ScratchRepository::init("absent-ref");
+    build_history(&repository);
+    let reader = repository.reader();
+
+    let refused = reader.scan(&scan_request("refs/heads/does-not-exist"));
+    assert!(
+        matches!(refused, Err(GitScanError::Command { .. })),
+        "{refused:?}"
+    );
+
+    // And a name that could be read as an option never reaches argv at all.
+    assert!(GitRefName::parse("--upload-pack=touch /tmp/pwn").is_err());
 }
 
 // ---------------------------------------------------------------------------
