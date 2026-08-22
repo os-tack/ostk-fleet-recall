@@ -170,11 +170,11 @@ pub struct RecallResultV1 {
 }
 
 /// `(body_content_id, lexical_state, unindexable_reason, normalization_version,
-/// lexical_text, lexical_text_digest)` snapshot tuple.
-pub type SnapshotLexicalRowV1 = (Vec<u8>, String, String, i64, String, Vec<u8>);
+/// lexical_text, lexical_text_digest, visibility_class)` snapshot tuple.
+pub type SnapshotLexicalRowV1 = (Vec<u8>, String, String, i64, String, Vec<u8>, String);
 /// `(body_content_id, embedding_identity_id, model_digest, distance_metric,
-/// dimensions, embedding text)` snapshot tuple.
-pub type SnapshotDenseRowV1 = (Vec<u8>, Vec<u8>, Vec<u8>, String, i64, String);
+/// dimensions, embedding text, visibility_class)` snapshot tuple.
+pub type SnapshotDenseRowV1 = (Vec<u8>, Vec<u8>, Vec<u8>, String, i64, String, String);
 
 /// A deterministic, sorted snapshot of both projection tiers for one scope.
 ///

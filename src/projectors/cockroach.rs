@@ -29,6 +29,12 @@
 //! * **Fail closed on identity drift.** A lexical text digest or an embedding
 //!   identity that disagrees with the row already stored under the same body
 //!   content address aborts the batch with a typed error and writes nothing.
+//! * **Visibility binding (W2-VIS).** Every projection row carries the
+//!   read-plane class of the accepted evidence event that produced its body,
+//!   defaulting to `'private'` at the column level. The recall predicate lives
+//!   INSIDE the SQL — the publication plane reads views whose own WHERE clause
+//!   is the restriction — so a private row is excluded before ranking, before
+//!   `LIMIT`, and before any count. Nothing here post-filters in Rust.
 //! * **Scope binding.** `(tenant_id, project)` is bound at construction; every
 //!   read and write is filtered by that exact pair, so no stored row and no
 //!   caller-supplied query can redirect a read or a write to another tenant or
@@ -62,6 +68,7 @@ use super::repository::{
     ProjectorKindV1, RecallCompletenessV1, RecallHitV1, RecallProjectionSnapshotV1, RecallResultV1,
     RecallTierV1,
 };
+use super::visibility::{RecallPlaneV1, RowVisibilityClassV1};
 
 /// Bodies consumed per transaction when none is configured.
 pub const DEFAULT_PROJECTION_BATCH: u32 = 64;
@@ -88,35 +95,61 @@ const UPSERT_CURSOR_SQL: &str = "INSERT INTO public.memory_recall_projection_cur
             public.memory_recall_projection_cursors_v1.last_body_content_id) \
          < (excluded.last_body_created_at, excluded.last_body_content_id)";
 
-const SELECT_BODIES_FROM_START_SQL: &str = "SELECT content_sha256, body_bytes, created_at \
-     FROM public.memory_body_objects_v1 \
-     WHERE tenant_id = $1 AND project = $2 \
-     ORDER BY created_at, content_sha256 LIMIT $3";
+// The body scan carries the visibility decision with it. The LEFT JOIN plus
+// COALESCE is the fail-closed default (W2-VIS): a body with no
+// memory_body_visibility_v1 row — one projected before migration 0023, or one
+// whose decision was never recorded — is PRIVATE, never publication-safe by
+// omission.
+const SELECT_BODIES_FROM_START_SQL: &str = "SELECT body.content_sha256, body.body_bytes, \
+            body.created_at, \
+            COALESCE(visibility.visibility_class, 'private') AS visibility_class \
+     FROM public.memory_body_objects_v1 AS body \
+     LEFT JOIN public.memory_body_visibility_v1 AS visibility \
+       ON visibility.tenant_id = body.tenant_id \
+      AND visibility.project = body.project \
+      AND visibility.body_content_id = body.content_sha256 \
+     WHERE body.tenant_id = $1 AND body.project = $2 \
+     ORDER BY body.created_at, body.content_sha256 LIMIT $3";
 
-const SELECT_BODIES_AFTER_SQL: &str = "SELECT content_sha256, body_bytes, created_at \
-     FROM public.memory_body_objects_v1 \
-     WHERE tenant_id = $1 AND project = $2 \
-       AND (created_at, content_sha256) > ($3, $4) \
-     ORDER BY created_at, content_sha256 LIMIT $5";
+const SELECT_BODIES_AFTER_SQL: &str = "SELECT body.content_sha256, body.body_bytes, \
+            body.created_at, \
+            COALESCE(visibility.visibility_class, 'private') AS visibility_class \
+     FROM public.memory_body_objects_v1 AS body \
+     LEFT JOIN public.memory_body_visibility_v1 AS visibility \
+       ON visibility.tenant_id = body.tenant_id \
+      AND visibility.project = body.project \
+      AND visibility.body_content_id = body.content_sha256 \
+     WHERE body.tenant_id = $1 AND body.project = $2 \
+       AND (body.created_at, body.content_sha256) > ($3, $4) \
+     ORDER BY body.created_at, body.content_sha256 LIMIT $5";
 
+// The conflict arm is a DOWNGRADE-ONLY reconciliation: a body whose recorded
+// decision has since collapsed to private demotes its already-written lexical
+// row, and no arm here ever writes 'publication_safe' over a stored row.
 const INSERT_LEXICAL_SQL: &str = "INSERT INTO public.memory_body_lexical_projection_v1 (\
      tenant_id, project, body_content_id, body_created_at, lexical_state, \
-     unindexable_reason, normalization_version, lexical_text, lexical_text_digest\
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-     ON CONFLICT (tenant_id, project, body_content_id) DO NOTHING";
+     unindexable_reason, normalization_version, lexical_text, lexical_text_digest, \
+     visibility_class\
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+     ON CONFLICT (tenant_id, project, body_content_id) DO UPDATE SET \
+     visibility_class = 'private' \
+     WHERE public.memory_body_lexical_projection_v1.visibility_class \
+         IS DISTINCT FROM excluded.visibility_class";
 
 const SELECT_LEXICAL_DIGEST_SQL: &str = "SELECT lexical_text_digest \
      FROM public.memory_body_lexical_projection_v1 \
      WHERE tenant_id = $1 AND project = $2 AND body_content_id = $3";
 
+// The dense tier takes its visibility from the lexical row rather than
+// re-deriving it, so the two tiers cannot disagree about one body.
 const SELECT_LEXICAL_FROM_START_SQL: &str = "SELECT body_content_id, body_created_at, \
-     lexical_state, unindexable_reason, lexical_text \
+     lexical_state, unindexable_reason, lexical_text, visibility_class \
      FROM public.memory_body_lexical_projection_v1 \
      WHERE tenant_id = $1 AND project = $2 \
      ORDER BY body_created_at, body_content_id LIMIT $3";
 
 const SELECT_LEXICAL_AFTER_SQL: &str = "SELECT body_content_id, body_created_at, \
-     lexical_state, unindexable_reason, lexical_text \
+     lexical_state, unindexable_reason, lexical_text, visibility_class \
      FROM public.memory_body_lexical_projection_v1 \
      WHERE tenant_id = $1 AND project = $2 \
        AND (body_created_at, body_content_id) > ($3, $4) \
@@ -125,9 +158,36 @@ const SELECT_LEXICAL_AFTER_SQL: &str = "SELECT body_content_id, body_created_at,
 const INSERT_DENSE_SQL: &str = "INSERT INTO public.memory_body_dense_projection_v1 (\
      tenant_id, project, body_content_id, body_created_at, embedding_identity_id, \
      model_digest, tokenization_version, preprocessing_version, distance_metric, \
-     dimensions, embedding\
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::VECTOR(512)) \
-     ON CONFLICT (tenant_id, project, body_content_id) DO NOTHING";
+     dimensions, embedding, visibility_class\
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::VECTOR(512), $12) \
+     ON CONFLICT (tenant_id, project, body_content_id) DO UPDATE SET \
+     visibility_class = 'private' \
+     WHERE public.memory_body_dense_projection_v1.visibility_class \
+         IS DISTINCT FROM excluded.visibility_class";
+
+// Downgrade-only reconciliation, run at the end of every pass. A body whose
+// recorded decision collapsed to private AFTER its projection row was written
+// leaves the publication plane here; neither statement can move a row the other
+// way, because 'private' is the only value either one assigns.
+const DEMOTE_LEXICAL_SQL: &str = "UPDATE public.memory_body_lexical_projection_v1 AS lexical \
+     SET visibility_class = 'private' \
+     WHERE lexical.tenant_id = $1 AND lexical.project = $2 \
+       AND lexical.visibility_class = 'publication_safe' \
+       AND NOT EXISTS (SELECT 1 FROM public.memory_body_visibility_v1 AS visibility \
+             WHERE visibility.tenant_id = lexical.tenant_id \
+               AND visibility.project = lexical.project \
+               AND visibility.body_content_id = lexical.body_content_id \
+               AND visibility.visibility_class = 'publication_safe')";
+
+const DEMOTE_DENSE_SQL: &str = "UPDATE public.memory_body_dense_projection_v1 AS dense \
+     SET visibility_class = 'private' \
+     WHERE dense.tenant_id = $1 AND dense.project = $2 \
+       AND dense.visibility_class = 'publication_safe' \
+       AND NOT EXISTS (SELECT 1 FROM public.memory_body_lexical_projection_v1 AS lexical \
+             WHERE lexical.tenant_id = dense.tenant_id \
+               AND lexical.project = dense.project \
+               AND lexical.body_content_id = dense.body_content_id \
+               AND lexical.visibility_class = 'publication_safe')";
 
 const SELECT_DENSE_IDENTITY_SQL: &str = "SELECT embedding_identity_id \
      FROM public.memory_body_dense_projection_v1 \
@@ -142,12 +202,36 @@ const LEXICAL_RECALL_SQL: &str = "SELECT body_content_id, \
        AND search_document @@ plainto_tsquery('english', $3) \
      ORDER BY score DESC, body_content_id LIMIT $4";
 
+// The publication plane's lexical lane. It reads the VIEW, whose own WHERE
+// clause is the visibility predicate, so the restriction is applied before
+// ts_rank orders anything: a private row never occupies a rank slot, never
+// shifts an offset, and never contributes to a count. The public database role
+// holds SELECT on this view and on nothing else, so the same restriction also
+// holds for any direct SQL that role can write (PUBLIC-03, PUBLIC-04).
+const LEXICAL_RECALL_PUBLICATION_SQL: &str = "SELECT body_content_id, \
+     ts_rank(search_document, plainto_tsquery('english', $3))::FLOAT4 AS score \
+     FROM public.memory_body_lexical_publication_v1 \
+     WHERE tenant_id = $1 AND project = $2 \
+       AND search_document @@ plainto_tsquery('english', $3) \
+     ORDER BY score DESC, body_content_id LIMIT $4";
+
 // C-SPANN equality prefix: tenant_id and project are the only columns ahead of
 // `embedding` in memory_body_dense_projection_semantic_idx, and both are bound
 // with equality here, so CockroachDB can serve the ANN portion of the scan.
 const DENSE_RECALL_SQL: &str = "SELECT body_content_id, \
      (embedding <=> $3::VECTOR(512))::FLOAT4 AS distance \
      FROM public.memory_body_dense_projection_v1 \
+     WHERE tenant_id = $1 AND project = $2 \
+     ORDER BY embedding <=> $3::VECTOR(512) LIMIT $4";
+
+// The publication plane's dense lane. Inlining the view adds
+// `visibility_class = 'publication_safe'`, which is why migration 0023 builds
+// memory_body_dense_projection_publication_idx with visibility_class in the
+// equality prefix: the restriction is part of the index prefix rather than a
+// post-filter that could truncate an ANN top-k.
+const DENSE_RECALL_PUBLICATION_SQL: &str = "SELECT body_content_id, \
+     (embedding <=> $3::VECTOR(512))::FLOAT4 AS distance \
+     FROM public.memory_body_dense_publication_v1 \
      WHERE tenant_id = $1 AND project = $2 \
      ORDER BY embedding <=> $3::VECTOR(512) LIMIT $4";
 
@@ -162,11 +246,29 @@ const COMPLETENESS_SQL: &str = "SELECT \
      (SELECT count(*) FROM public.memory_body_dense_projection_v1 \
         WHERE tenant_id = $1 AND project = $2) AS densely_embedded";
 
+// Publication-plane readiness counts only publication-safe rows, and counts
+// them through the views. `bodies_total` is the publication-safe lexical
+// population rather than the body-plane total: the publication plane must not
+// be able to learn how many private bodies exist by subtracting one readiness
+// number from another. It also has no privilege on memory_body_objects_v1, so
+// the private total is not merely hidden here, it is unreachable.
+const COMPLETENESS_PUBLICATION_SQL: &str = "SELECT \
+     (SELECT count(*) FROM public.memory_body_lexical_publication_v1 \
+        WHERE tenant_id = $1 AND project = $2) AS bodies_total, \
+     (SELECT count(*) FROM public.memory_body_lexical_publication_v1 \
+        WHERE tenant_id = $1 AND project = $2 AND lexical_state = 'indexed') AS lexically_indexed, \
+     (SELECT count(*) FROM public.memory_body_lexical_publication_v1 \
+        WHERE tenant_id = $1 AND project = $2 AND lexical_state = 'unindexable') \
+        AS lexically_unindexable, \
+     (SELECT count(*) FROM public.memory_body_dense_publication_v1 \
+        WHERE tenant_id = $1 AND project = $2) AS densely_embedded";
+
 /// One body row the lexical projector consumes.
 #[derive(Debug, Clone)]
 struct BodyRowV1 {
     position: BodyPositionV1,
     body_bytes: Vec<u8>,
+    visibility: RowVisibilityClassV1,
 }
 
 /// One lexical row the dense worker consumes.
@@ -175,6 +277,16 @@ struct LexicalRowV1 {
     position: BodyPositionV1,
     state: LexicalStateV1,
     text: String,
+    visibility: RowVisibilityClassV1,
+}
+
+/// One embedded body waiting to be written, carrying the read plane it
+/// inherited from its lexical row.
+#[derive(Debug, Clone)]
+struct EmbeddedRowV1 {
+    position: BodyPositionV1,
+    visibility: RowVisibilityClassV1,
+    admitted: DerivedEmbeddingV1,
 }
 
 /// Physical scope plus pool, shared by all three runtimes in this module.
@@ -380,6 +492,9 @@ impl CockroachLexicalProjector {
                         content_id: digest32(row.try_get("content_sha256")?)?,
                     },
                     body_bytes: row.try_get("body_bytes")?,
+                    visibility: RowVisibilityClassV1::parse(
+                        row.try_get::<String, _>("visibility_class")?.as_str(),
+                    )?,
                 })
             })
             .collect()
@@ -400,7 +515,7 @@ impl CockroachLexicalProjector {
         for body in batch {
             // Fails closed if the stored bytes do not reproduce the address.
             let derived = derive_lexical_projection(body.position.content_id, &body.body_bytes)?;
-            self.write_lexical(transaction, body.position, &derived)
+            self.write_lexical(transaction, body.position, body.visibility, &derived)
                 .await?;
             summary.bodies_consumed += 1;
             if derived.state.is_indexed() {
@@ -428,6 +543,7 @@ impl CockroachLexicalProjector {
         &self,
         transaction: &mut Transaction<'_, Postgres>,
         position: BodyPositionV1,
+        visibility: RowVisibilityClassV1,
         derived: &LexicalProjectionV1,
     ) -> RecallProjectionResult<()> {
         sqlx::query(INSERT_LEXICAL_SQL)
@@ -440,6 +556,7 @@ impl CockroachLexicalProjector {
             .bind(i64::from(derived.normalization_version))
             .bind(&derived.text)
             .bind(bytes(derived.text_digest))
+            .bind(visibility.as_str())
             .execute(&mut **transaction)
             .await?;
 
@@ -473,7 +590,27 @@ impl CockroachLexicalProjector {
             summary.absorb(self.commit_batch(&batch).await?);
             position = Some(last);
         }
+        self.reconcile_visibility().await?;
         Ok(summary)
+    }
+
+    /// Demote every lexical row whose body is no longer recorded as
+    /// publication-safe, and report how many rows left the publication plane.
+    ///
+    /// Bodies are content-addressed and therefore shared, so a body admitted
+    /// under an approved event and later re-admitted under a private one has
+    /// its recorded decision collapsed to private by the body projector. This
+    /// statement propagates that collapse to a lexical row that was already
+    /// written. It only ever assigns `'private'`, so running it more often than
+    /// necessary is safe and running it can never widen the publication plane.
+    pub async fn reconcile_visibility(&self) -> RecallProjectionResult<u64> {
+        let demoted = sqlx::query(DEMOTE_LEXICAL_SQL)
+            .bind(self.scope.tenant_id)
+            .bind(&self.scope.project)
+            .execute(&self.scope.pool)
+            .await?
+            .rows_affected();
+        Ok(demoted)
     }
 
     /// One batch, one bounded serializable-transaction retry loop.
@@ -632,6 +769,9 @@ impl CockroachDenseProjector {
                     },
                     state,
                     text: row.try_get("lexical_text")?,
+                    visibility: RowVisibilityClassV1::parse(
+                        row.try_get::<String, _>("visibility_class")?.as_str(),
+                    )?,
                 })
             })
             .collect()
@@ -646,7 +786,7 @@ impl CockroachDenseProjector {
     async fn embed_batch(
         &self,
         batch: &[LexicalRowV1],
-    ) -> RecallProjectionResult<(Vec<(BodyPositionV1, DerivedEmbeddingV1)>, u64)> {
+    ) -> RecallProjectionResult<(Vec<EmbeddedRowV1>, u64)> {
         let descriptor = self.provider.descriptor();
         let mut embedded = Vec::with_capacity(batch.len());
         let mut unindexable = 0_u64;
@@ -657,7 +797,13 @@ impl CockroachDenseProjector {
             }
             let vector = self.provider.embed(&row.text).await?;
             let admitted = admit_embedding(descriptor, row.position.content_id, vector)?;
-            embedded.push((row.position, admitted));
+            embedded.push(EmbeddedRowV1 {
+                position: row.position,
+                // Copied from the lexical row, never re-derived: the two tiers
+                // cannot disagree about one body's read plane.
+                visibility: row.visibility,
+                admitted,
+            });
         }
         Ok((embedded, unindexable))
     }
@@ -667,7 +813,7 @@ impl CockroachDenseProjector {
     async fn apply_batch(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
-        embedded: &[(BodyPositionV1, DerivedEmbeddingV1)],
+        embedded: &[EmbeddedRowV1],
         last: BodyPositionV1,
         consumed: u64,
     ) -> RecallProjectionResult<()> {
@@ -675,13 +821,14 @@ impl CockroachDenseProjector {
             .fetch_one(&mut **transaction)
             .await?;
         let descriptor = self.provider.descriptor();
-        for (position, admitted) in embedded {
+        for row in embedded {
+            let admitted = &row.admitted;
             let encoded = serialize_vector(&admitted.vector)?;
             sqlx::query(INSERT_DENSE_SQL)
                 .bind(self.scope.tenant_id)
                 .bind(&self.scope.project)
                 .bind(bytes(admitted.body_content_id))
-                .bind(position.created_at)
+                .bind(row.position.created_at)
                 .bind(bytes(admitted.identity.digest()))
                 .bind(bytes(descriptor.model_digest))
                 .bind(i64::from(descriptor.tokenization_version))
@@ -689,6 +836,7 @@ impl CockroachDenseProjector {
                 .bind(distance_metric_label(descriptor.distance_metric))
                 .bind(i64::from(descriptor.dimensions))
                 .bind(encoded)
+                .bind(row.visibility.as_str())
                 .execute(&mut **transaction)
                 .await?;
 
@@ -738,13 +886,31 @@ impl CockroachDenseProjector {
             });
             position = Some(last);
         }
+        self.reconcile_visibility().await?;
         Ok(summary)
+    }
+
+    /// Demote every dense row whose lexical row is no longer publication-safe,
+    /// and report how many rows left the publication plane.
+    ///
+    /// The dense tier follows the lexical tier rather than the body table, for
+    /// the same reason [`Self::embed_batch`] copies the class instead of
+    /// re-deriving it: one source of truth per body. Like its lexical
+    /// counterpart it only ever assigns `'private'`.
+    pub async fn reconcile_visibility(&self) -> RecallProjectionResult<u64> {
+        let demoted = sqlx::query(DEMOTE_DENSE_SQL)
+            .bind(self.scope.tenant_id)
+            .bind(&self.scope.project)
+            .execute(&self.scope.pool)
+            .await?
+            .rows_affected();
+        Ok(demoted)
     }
 
     /// One batch, one bounded serializable-transaction retry loop.
     async fn commit_batch(
         &self,
-        embedded: &[(BodyPositionV1, DerivedEmbeddingV1)],
+        embedded: &[EmbeddedRowV1],
         last: BodyPositionV1,
         consumed: u64,
     ) -> RecallProjectionResult<()> {
@@ -811,10 +977,15 @@ impl DenseProjector for CockroachDenseProjector {
 // Read side.
 // ---------------------------------------------------------------------------
 
-/// Recall over the projection, bound once to physical scope.
+/// Recall over the projection, bound once to physical scope AND one read plane.
+///
+/// The plane is chosen at construction and is not a request parameter: a
+/// publication reader has no method that reaches a private row, and a caller
+/// holding one cannot widen it (W2-VIS).
 #[derive(Clone)]
 pub struct CockroachRecallReader {
     scope: ScopeBinding,
+    plane: RecallPlaneV1,
 }
 
 impl std::fmt::Debug for CockroachRecallReader {
@@ -828,7 +999,8 @@ impl std::fmt::Debug for CockroachRecallReader {
 }
 
 impl CockroachRecallReader {
-    /// Bind one pool and one physical scope.
+    /// Bind one pool and one physical scope on the PRIVATE plane, which sees
+    /// both visibility classes.
     #[must_use]
     pub const fn new(pool: PgPool, tenant_id: Uuid, project: String) -> Self {
         Self {
@@ -837,12 +1009,47 @@ impl CockroachRecallReader {
                 tenant_id,
                 project,
             },
+            plane: RecallPlaneV1::Private,
         }
     }
 
+    /// Bind one pool and one physical scope on the PUBLICATION plane.
+    ///
+    /// Every statement this reader issues names a publication view, never a
+    /// base table, so the reader is safe to hand a pool authenticated as the
+    /// public database role — which holds SELECT on exactly those views. The
+    /// restriction does not depend on that role, though: the same reader over
+    /// an admin pool still cannot return a private row, because the views
+    /// themselves cannot name one.
+    #[must_use]
+    pub const fn publication(pool: PgPool, tenant_id: Uuid, project: String) -> Self {
+        Self {
+            scope: ScopeBinding {
+                pool,
+                tenant_id,
+                project,
+            },
+            plane: RecallPlaneV1::Publication,
+        }
+    }
+
+    /// Which read plane this reader answers for.
+    #[must_use]
+    pub const fn plane(&self) -> RecallPlaneV1 {
+        self.plane
+    }
+
     /// Read how complete each tier is for this scope.
+    ///
+    /// On the publication plane every count is taken through the publication
+    /// views, so the readiness numbers carry no information about how many
+    /// private rows exist.
     pub async fn completeness(&self) -> RecallProjectionResult<RecallCompletenessV1> {
-        let row: PgRow = sqlx::query(COMPLETENESS_SQL)
+        let statement = match self.plane {
+            RecallPlaneV1::Private => COMPLETENESS_SQL,
+            RecallPlaneV1::Publication => COMPLETENESS_PUBLICATION_SQL,
+        };
+        let row: PgRow = sqlx::query(statement)
             .bind(self.scope.tenant_id)
             .bind(&self.scope.project)
             .fetch_one(&self.scope.pool)
@@ -934,7 +1141,11 @@ impl CockroachRecallReader {
         if query_text.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let rows: Vec<PgRow> = sqlx::query(LEXICAL_RECALL_SQL)
+        let statement = match self.plane {
+            RecallPlaneV1::Private => LEXICAL_RECALL_SQL,
+            RecallPlaneV1::Publication => LEXICAL_RECALL_PUBLICATION_SQL,
+        };
+        let rows: Vec<PgRow> = sqlx::query(statement)
             .bind(self.scope.tenant_id)
             .bind(&self.scope.project)
             .bind(query_text)
@@ -963,7 +1174,11 @@ impl CockroachRecallReader {
             )));
         }
         let encoded = serialize_vector(query_vector)?;
-        let rows: Vec<PgRow> = sqlx::query(DENSE_RECALL_SQL)
+        let statement = match self.plane {
+            RecallPlaneV1::Private => DENSE_RECALL_SQL,
+            RecallPlaneV1::Publication => DENSE_RECALL_PUBLICATION_SQL,
+        };
+        let rows: Vec<PgRow> = sqlx::query(statement)
             .bind(self.scope.tenant_id)
             .bind(&self.scope.project)
             .bind(encoded)
@@ -984,11 +1199,19 @@ impl CockroachRecallReader {
     /// scope. Two snapshots taken after two independent replays compare equal
     /// iff the projectors rebuilt byte-identical rows (REPLAY-01).
     pub async fn snapshot(&self) -> RecallProjectionResult<RecallProjectionSnapshotV1> {
+        // The snapshot reads base tables, which is a private-plane capability
+        // by construction. Refuse it on the publication plane rather than
+        // issuing a statement the public role has no privilege for.
+        if !self.plane.admits_private_rows() {
+            return Err(RecallProjectionError::InvalidRequest(
+                "the publication plane cannot snapshot the private projection tables".into(),
+            ));
+        }
         let mut snapshot = RecallProjectionSnapshotV1::default();
 
         let lexical_rows: Vec<PgRow> = sqlx::query(
             "SELECT body_content_id, lexical_state, unindexable_reason, normalization_version, \
-                    lexical_text, lexical_text_digest \
+                    lexical_text, lexical_text_digest, visibility_class \
              FROM public.memory_body_lexical_projection_v1 \
              WHERE tenant_id = $1 AND project = $2 ORDER BY body_content_id",
         )
@@ -1004,12 +1227,13 @@ impl CockroachRecallReader {
                 row.try_get("normalization_version")?,
                 row.try_get("lexical_text")?,
                 row.try_get("lexical_text_digest")?,
+                row.try_get("visibility_class")?,
             ));
         }
 
         let dense_rows: Vec<PgRow> = sqlx::query(
             "SELECT body_content_id, embedding_identity_id, model_digest, distance_metric, \
-                    dimensions, embedding::STRING AS embedding_text \
+                    dimensions, embedding::STRING AS embedding_text, visibility_class \
              FROM public.memory_body_dense_projection_v1 \
              WHERE tenant_id = $1 AND project = $2 ORDER BY body_content_id",
         )
@@ -1025,6 +1249,7 @@ impl CockroachRecallReader {
                 row.try_get("distance_metric")?,
                 row.try_get("dimensions")?,
                 row.try_get("embedding_text")?,
+                row.try_get("visibility_class")?,
             ));
         }
 
@@ -1060,18 +1285,33 @@ mod tests {
         // writes without tenant_id AND project equality could cross tenants.
         for statement in [
             SELECT_CURSOR_SQL,
-            SELECT_BODIES_FROM_START_SQL,
-            SELECT_BODIES_AFTER_SQL,
             SELECT_LEXICAL_DIGEST_SQL,
             SELECT_LEXICAL_FROM_START_SQL,
             SELECT_LEXICAL_AFTER_SQL,
             SELECT_DENSE_IDENTITY_SQL,
             LEXICAL_RECALL_SQL,
+            LEXICAL_RECALL_PUBLICATION_SQL,
             DENSE_RECALL_SQL,
+            DENSE_RECALL_PUBLICATION_SQL,
             COMPLETENESS_SQL,
+            COMPLETENESS_PUBLICATION_SQL,
         ] {
             assert!(
                 statement.contains("tenant_id = $1") && statement.contains("project = $2"),
+                "statement must bind scope first: {statement}"
+            );
+        }
+        // The body scan and the two demotions qualify their scope columns with
+        // a table alias, because they join a second relation; the binding is
+        // the same equality pair.
+        for statement in [
+            SELECT_BODIES_FROM_START_SQL,
+            SELECT_BODIES_AFTER_SQL,
+            DEMOTE_LEXICAL_SQL,
+            DEMOTE_DENSE_SQL,
+        ] {
+            assert!(
+                statement.contains(".tenant_id = $1") && statement.contains(".project = $2"),
                 "statement must bind scope first: {statement}"
             );
         }
@@ -1095,9 +1335,115 @@ mod tests {
         // only serve the ANN portion when every column ahead of the vector is
         // an equality predicate, so the dense query must never grow a range
         // filter or an extra prefix column.
-        assert!(DENSE_RECALL_SQL.contains("WHERE tenant_id = $1 AND project = $2 "));
-        assert!(DENSE_RECALL_SQL.contains("ORDER BY embedding <=> $3::VECTOR(512)"));
-        assert!(!DENSE_RECALL_SQL.contains(" AND ("));
+        for statement in [DENSE_RECALL_SQL, DENSE_RECALL_PUBLICATION_SQL] {
+            assert!(statement.contains("WHERE tenant_id = $1 AND project = $2 "));
+            assert!(statement.contains("ORDER BY embedding <=> $3::VECTOR(512)"));
+            assert!(!statement.contains(" AND ("));
+        }
+        // The publication lane binds its third equality column by reading the
+        // view; migration 0023 gives that shape its own index prefix
+        // (tenant_id, project, visibility_class, embedding).
+        assert!(DENSE_RECALL_PUBLICATION_SQL.contains("memory_body_dense_publication_v1"));
+    }
+
+    #[test]
+    fn the_visibility_predicate_lives_inside_the_sql_not_in_rust() {
+        // The whole point of W2-VIS: the restriction is a SQL relation, applied
+        // before ts_rank/ANN ordering and before LIMIT, so a private row never
+        // occupies a rank slot, shifts an offset, or contributes to a count.
+        // Nothing in this module filters hits after the query returns.
+        for statement in [
+            LEXICAL_RECALL_PUBLICATION_SQL,
+            DENSE_RECALL_PUBLICATION_SQL,
+            COMPLETENESS_PUBLICATION_SQL,
+        ] {
+            // Every publication statement reads publication views only. A base
+            // table here would be both a leak and an unprivileged statement for
+            // the public database role.
+            for private in crate::projectors::PRIVATE_PLANE_RECALL_TABLES {
+                assert!(
+                    !statement.contains(private),
+                    "publication statement must not name {private}: {statement}"
+                );
+            }
+        }
+        assert!(LEXICAL_RECALL_PUBLICATION_SQL.contains("memory_body_lexical_publication_v1"));
+        assert!(COMPLETENESS_PUBLICATION_SQL.contains("memory_body_lexical_publication_v1"));
+        assert!(COMPLETENESS_PUBLICATION_SQL.contains("memory_body_dense_publication_v1"));
+        // The private plane keeps reading the base tables and therefore still
+        // sees both classes: it carries no visibility predicate at all.
+        for statement in [LEXICAL_RECALL_SQL, DENSE_RECALL_SQL, COMPLETENESS_SQL] {
+            assert!(
+                !statement.contains("publication_safe"),
+                "the private plane must not filter by class: {statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn publication_readiness_counts_cannot_reveal_the_private_population() {
+        // A count/offset probe is the cheapest existence oracle. Every
+        // publication readiness count is taken through a publication view, and
+        // bodies_total is the publication-safe population -- not the body-plane
+        // total, whose difference would be the private count.
+        assert!(!COMPLETENESS_PUBLICATION_SQL.contains("memory_body_objects_v1"));
+        assert_eq!(
+            COMPLETENESS_PUBLICATION_SQL
+                .matches("memory_body_lexical_publication_v1")
+                .count(),
+            3
+        );
+        assert_eq!(
+            COMPLETENESS_PUBLICATION_SQL
+                .matches("memory_body_dense_publication_v1")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn every_visibility_write_can_only_demote() {
+        // The projection's class is never widened by any statement here: the
+        // two conflict arms and the two reconciliation statements assign the
+        // literal 'private' and nothing else.
+        for statement in [
+            INSERT_LEXICAL_SQL,
+            INSERT_DENSE_SQL,
+            DEMOTE_LEXICAL_SQL,
+            DEMOTE_DENSE_SQL,
+        ] {
+            assert!(
+                statement.contains("visibility_class = 'private'"),
+                "{statement}"
+            );
+            // The only assignment either statement makes is to 'private': the
+            // SET clause is `visibility_class = 'private'` and no SET clause
+            // anywhere mentions the publication class.
+            assert!(
+                !statement.contains("SET visibility_class = 'publication_safe'"),
+                "no statement may assign publication_safe: {statement}"
+            );
+        }
+        // The two INSERTs carry the derived class as a bound parameter, so
+        // 'private' is the only class literal either can ever WRITE.
+        for statement in [INSERT_LEXICAL_SQL, INSERT_DENSE_SQL] {
+            assert!(statement.contains("visibility_class"), "{statement}");
+            assert_eq!(statement.matches("'publication_safe'").count(), 0);
+        }
+    }
+
+    #[test]
+    fn the_body_scan_defaults_an_unrecorded_body_to_private() {
+        // Fail closed on a missing decision: a body with no
+        // memory_body_visibility_v1 row (projected before migration 0023, or
+        // never classified) is private, not publication-safe by omission.
+        for statement in [SELECT_BODIES_FROM_START_SQL, SELECT_BODIES_AFTER_SQL] {
+            assert!(statement.contains("LEFT JOIN public.memory_body_visibility_v1"));
+            assert!(
+                statement.contains("COALESCE(visibility.visibility_class, 'private')"),
+                "{statement}"
+            );
+        }
     }
 
     #[test]
@@ -1123,6 +1469,11 @@ mod tests {
                 !crate::store::cockroach::PUBLICATION_READ_TABLES.contains(&table),
                 "{table} must stay off the public plane"
             );
+        }
+        // The public plane reaches body recall through the two views of
+        // migration 0023 instead, which are not tables and hold no private row.
+        for view in crate::projectors::PUBLICATION_PLANE_VIEWS {
+            assert!(!crate::store::cockroach::PUBLICATION_READ_TABLES.contains(&view));
         }
     }
 

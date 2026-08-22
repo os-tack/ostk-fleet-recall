@@ -37,6 +37,7 @@ use crate::memory_contracts::common::ContractId;
 use crate::memory_contracts::digest::{DigestDomain, Sha256Digest, body_digest, framed_digest};
 use crate::memory_contracts::evidence_v2::EvidenceStatementV2;
 use crate::memory_contracts::identity::{IdentityForm, ResourceUri};
+use crate::projectors::BodyVisibilityV1;
 
 use super::error::{BodyProjectionError, BodyProjectionResult};
 use super::parser::parse_source;
@@ -115,6 +116,12 @@ pub struct DerivedParseRunV1 {
     pub media_type: ContractId,
     /// Protection domain of the governed source content.
     pub protection_domain_id: ContractId,
+    /// Read-plane visibility this event grants every body it produces (W2-VIS).
+    ///
+    /// Derived, never chosen: [`BodyVisibilityV1::from_statement`] is a pure
+    /// function of the event's own governance envelope, and returns
+    /// `Private` for everything that is not the exact approved triple.
+    pub visibility: BodyVisibilityV1,
     /// Distinct content-addressed bodies, in first-seen order.
     pub bodies: Vec<DerivedBodyV1>,
     /// Ordered chunk occurrences.
@@ -265,6 +272,7 @@ pub fn derive_parse_run(
         parser_key_id,
         media_type: statement.canonical_content.media_type.clone(),
         protection_domain_id: statement.canonical_content.protection_domain_id.clone(),
+        visibility: BodyVisibilityV1::from_statement(statement),
         bodies,
         occurrences,
         manifest: DerivedManifestV1 {

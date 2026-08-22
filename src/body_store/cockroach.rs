@@ -6,7 +6,9 @@
 //! `memory_body_objects_v1`, `memory_chunk_occurrences_v1`,
 //! `memory_chunk_occurrence_spans_v1`, `memory_parse_run_manifests_v1`,
 //! `memory_source_commit_membership_v1`, `memory_generation_pointers_v1`, and
-//! the cursor `memory_body_projection_watermarks_v1`.
+//! the cursor `memory_body_projection_watermarks_v1`. It also writes migration
+//! 0023's `memory_body_visibility_v1`, one read-plane decision per body, in the
+//! same transaction as the body row (W2-VIS).
 //!
 //! # Invariants enforced here
 //!
@@ -46,6 +48,7 @@ use crate::memory_contracts::chunk_identity::{
 };
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::evidence_v2::EvidenceStatementV2;
+use crate::projectors::RowVisibilityClassV1;
 use crate::store::cockroach::{RetryPolicy, is_retryable, is_retryable_fleet_error};
 
 use super::error::{BodyProjectionError, BodyProjectionResult};
@@ -82,6 +85,30 @@ const INSERT_BODY_SQL: &str = "INSERT INTO public.memory_body_objects_v1 (\
 
 const SELECT_BODY_BYTES_SQL: &str = "SELECT body_bytes FROM public.memory_body_objects_v1 \
      WHERE tenant_id = $1 AND project = $2 AND content_sha256 = $3";
+
+// W2-VIS. One visibility decision per content-addressed body, written in the
+// SAME transaction as the body row it describes.
+//
+// Bodies are content-addressed and therefore SHARED: two events with different
+// governance envelopes can produce byte-identical bodies. The conflict arm
+// resolves that the only safe way — any disagreement collapses the stored class
+// to 'private'. Publication safety therefore requires UNANIMITY across every
+// event that ever produced the body, and a later private event demotes a body
+// the publication plane could previously see. The reverse can never happen: the
+// arm has no path that writes 'publication_safe' over an existing row.
+const INSERT_BODY_VISIBILITY_SQL: &str = "INSERT INTO public.memory_body_visibility_v1 (\
+     tenant_id, project, body_content_id, visibility_class, protection_domain_id, \
+     source_visibility_class, source_publication_class, first_accepted_event_id, updated_at\
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+     ON CONFLICT (tenant_id, project, body_content_id) DO UPDATE SET \
+     visibility_class = 'private', \
+     updated_at = excluded.updated_at \
+     WHERE public.memory_body_visibility_v1.visibility_class \
+         IS DISTINCT FROM excluded.visibility_class";
+
+const SELECT_BODY_VISIBILITY_SQL: &str = "SELECT visibility_class \
+     FROM public.memory_body_visibility_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND body_content_id = $3";
 
 const INSERT_OCCURRENCE_SQL: &str = "INSERT INTO public.memory_chunk_occurrences_v1 (\
      tenant_id, project, occurrence_id, source_object_version_uri, parser_key_id, \
@@ -543,6 +570,64 @@ impl CockroachBodyProjectionRepository {
                     ));
                 }
             }
+
+            self.write_body_visibility(
+                transaction,
+                derived,
+                body.content_sha256,
+                accepted_event_bytes,
+                now,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Record this event's read-plane decision for one body (W2-VIS), then read
+    /// the durable row back and refuse anything stronger than the decision just
+    /// derived.
+    ///
+    /// The read-back is the fail-closed half: the database's own
+    /// `memory_body_visibility_publication_requires_approval` constraint already
+    /// refuses a publication-safe row over unapproved evidence, and this check
+    /// refuses the remaining case — a stored row that is publication-safe while
+    /// the event being applied classified the body private.
+    async fn write_body_visibility(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        derived: &DerivedParseRunV1,
+        content_sha256: Sha256Digest,
+        accepted_event_bytes: &[u8],
+        now: DateTime<Utc>,
+    ) -> BodyProjectionResult<()> {
+        let visibility = &derived.visibility;
+        sqlx::query(INSERT_BODY_VISIBILITY_SQL)
+            .bind(self.tenant_id)
+            .bind(&self.project)
+            .bind(bytes(content_sha256))
+            .bind(visibility.class.as_str())
+            .bind(visibility.protection_domain_id.as_str())
+            .bind(visibility.source_visibility_label())
+            .bind(visibility.source_publication_label())
+            .bind(accepted_event_bytes)
+            .bind(now)
+            .execute(&mut **transaction)
+            .await?;
+
+        let stored: String = sqlx::query_scalar(SELECT_BODY_VISIBILITY_SQL)
+            .bind(self.tenant_id)
+            .bind(&self.project)
+            .bind(bytes(content_sha256))
+            .fetch_one(&mut **transaction)
+            .await?;
+        let stored = RowVisibilityClassV1::parse(&stored).map_err(|error| {
+            BodyProjectionError::LedgerIntegrity(format!("stored body visibility: {error}"))
+        })?;
+        if stored.is_publication_safe() && !visibility.class.is_publication_safe() {
+            return Err(BodyProjectionError::LedgerIntegrity(
+                "stored body visibility is publication-safe but this event classifies the body private"
+                    .into(),
+            ));
         }
         Ok(())
     }

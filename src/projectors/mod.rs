@@ -47,13 +47,24 @@
 //! * [`dense`] — pure embedding identity, vector admission, and the
 //!   [`EmbeddingProvider`] seam.
 //! * [`repository`] — projector traits, cursor shapes, and readiness types.
+//! * [`visibility`] — the pure private/publication-safe classification and the
+//!   names of the two read planes' SQL objects (W2-VIS).
 //! * [`cockroach`] — the `CockroachDB` runtimes and the read side.
+//!
+//! # Visibility
+//!
+//! Every projection row carries a [`RowVisibilityClassV1`] derived from the
+//! accepted evidence event that produced its body, and the recall queries
+//! compare against it in their WHERE clause, ahead of ranking. The publication
+//! plane reads two filtered views that cannot name a private row at all. See
+//! [`visibility`].
 
 mod cockroach;
 pub mod dense;
 mod error;
 pub mod lexical;
 mod repository;
+pub mod visibility;
 
 pub use cockroach::{
     CockroachDenseProjector, CockroachLexicalProjector, CockroachRecallReader,
@@ -73,4 +84,9 @@ pub use repository::{
     BodyPositionV1, DenseProjector, LexicalProjector, ProjectionCursorV1, ProjectionPassSummaryV1,
     ProjectorKindV1, RecallCompletenessV1, RecallHitV1, RecallProjectionSnapshotV1, RecallResultV1,
     RecallTierV1,
+};
+pub use visibility::{
+    BODY_VISIBILITY_TABLE, BodyVisibilityV1, PRIVATE_PLANE_RECALL_TABLES, PUBLICATION_PLANE_VIEWS,
+    RecallPlaneV1, RowVisibilityClassV1, classify_row_visibility, evidence_publication_label,
+    evidence_visibility_label, publication_plane_grant_statements,
 };
