@@ -12,6 +12,7 @@ pub mod body_store;
 pub mod config;
 pub mod context;
 pub mod control_log;
+pub mod coverage_runtime;
 pub mod error;
 pub mod evidence_ledger;
 pub mod ledger;
