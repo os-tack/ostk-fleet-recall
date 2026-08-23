@@ -162,7 +162,9 @@ fn a_self_implicated_dismissal_is_refused() {
 
 // --- relation admission ---
 
-fn relation_for(sample: &crate::memory_contracts::discrepancy::DiscrepancyEnvelopeV1) -> DiscrepancyEpisodeRelationV1 {
+fn relation_for(
+    sample: &crate::memory_contracts::discrepancy::DiscrepancyEnvelopeV1,
+) -> DiscrepancyEpisodeRelationV1 {
     DiscrepancyEpisodeRelationV1 {
         schema_version: 1,
         profile: sample.profile.clone(),
@@ -211,9 +213,7 @@ fn log_records_round_trip_canonically() {
     let sample = envelope();
     let event = acknowledge_event(&sample, "2026-08-15T05:00:00.000000000Z");
 
-    let envelope_record = DiscrepancyLogRecordV1::Envelope {
-        envelope: sample.clone(),
-    };
+    let envelope_record = DiscrepancyLogRecordV1::Envelope { envelope: sample };
     assert_eq!(envelope_record.record_kind(), "envelope");
     envelope_record.validate().unwrap();
     let bytes = encode_canonical(&envelope_record).unwrap();

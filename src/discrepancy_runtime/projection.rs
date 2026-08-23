@@ -49,9 +49,11 @@ use crate::memory_contracts::{ContractError, ContractResult};
 /// with; equals the contract's own `DISCREPANCY_SCHEMA_VERSION`.
 pub const DISCREPANCY_RUNTIME_SCHEMA_VERSION: u32 = 1;
 
-/// Upper bound on one episode's ledger log (envelope plus lifecycle events).
-/// A rebuild replays every record, so the log is bounded rather than
-/// unbounded-and-hoped-for, mirroring the normative runtime's bound.
+/// Upper bound on one episode's ledger log.
+///
+/// Envelope plus lifecycle events: a rebuild replays every record, so the
+/// log is bounded rather than unbounded-and-hoped-for, mirroring the
+/// normative runtime's bound.
 pub const MAX_EPISODE_LOG_ENTRIES: usize = 4096;
 
 /// Upper bound on one family's stored relation set, for the same reason.
@@ -181,7 +183,10 @@ fn side_indeterminacy(
     };
     let mut reasons = Vec::new();
     if side.value_digest.is_none() {
-        reasons.push(pick(Reason::ObservedUnmeasured, Reason::NormativeUnmeasured));
+        reasons.push(pick(
+            Reason::ObservedUnmeasured,
+            Reason::NormativeUnmeasured,
+        ));
     }
     match side.completeness {
         CoverageCompletenessV1::Complete => {}
@@ -290,7 +295,10 @@ pub fn seed_episode_fingerprint(
     continuity_key: &[ApplicabilityDimensionV1],
     episode_policy_version: u32,
     candidates: &[OpeningTransitionCandidateV1],
-) -> ContractResult<(OpeningTransitionCandidateV1, DiscrepancyEpisodeFingerprintV1)> {
+) -> ContractResult<(
+    OpeningTransitionCandidateV1,
+    DiscrepancyEpisodeFingerprintV1,
+)> {
     let winner = select_opening_transition(candidates)?.clone();
     let fingerprint = DiscrepancyEpisodePreimageV1 {
         schema_version: DISCREPANCY_RUNTIME_SCHEMA_VERSION,

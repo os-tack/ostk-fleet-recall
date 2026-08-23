@@ -341,8 +341,7 @@ async fn admit_envelope_in_transaction(
         .execute(&mut **transaction)
         .await?;
 
-    let relations =
-        load_relations(transaction, scope, admitted.family_fingerprint).await?;
+    let relations = load_relations(transaction, scope, admitted.family_fingerprint).await?;
     let stored = derive_stored_projection(envelope, &[], &relations, 1)?;
     upsert_projection(transaction, scope, &stored, now).await?;
 
@@ -555,9 +554,8 @@ fn derive_stored_projection(
     cursor_seq: u64,
 ) -> Result<StoredDiscrepancyProjectionV1> {
     let (projection, evaluated_at) = project_ledger_episode(envelope, events, relations)?;
-    let canonical_projection =
-        crate::memory_contracts::canonical::encode_canonical(&projection)
-            .map_err(FleetError::from)?;
+    let canonical_projection = crate::memory_contracts::canonical::encode_canonical(&projection)
+        .map_err(FleetError::from)?;
     Ok(StoredDiscrepancyProjectionV1 {
         episode_fingerprint: envelope.episode_fingerprint,
         cursor_seq,

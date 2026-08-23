@@ -212,6 +212,7 @@ pub fn admit_relation(
 /// relation names several episodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)] // one envelope seeds each log; boxing it buys nothing.
 pub enum DiscrepancyLogRecordV1 {
     Envelope { envelope: DiscrepancyEnvelopeV1 },
     Lifecycle { event: DiscrepancyLifecycleEventV1 },

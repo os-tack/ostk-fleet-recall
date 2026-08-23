@@ -3337,7 +3337,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_migrator_registers_mixed_transaction_policy_through_twenty_six() {
+    fn embedded_migrator_registers_mixed_transaction_policy_through_twenty_seven() {
         let migrator = embedded_migrator();
         assert_eq!(
             migrator
@@ -3345,10 +3345,11 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            // W3-NORM registers migration 24 and W3-CIEV registers 26;
-            // version 25 is reserved for an item that added no migration, so
-            // the sequence is deliberately non-contiguous.
-            (1..=24).chain(std::iter::once(26)).collect::<Vec<_>>()
+            // W3-NORM registers migration 24, W3-CIEV registers 26, and
+            // W3-DISC registers 27; version 25 is reserved for an item that
+            // added no migration, so the sequence is deliberately
+            // non-contiguous.
+            (1..=24).chain([26, 27]).collect::<Vec<_>>()
         );
         assert_eq!(
             migrator
@@ -3356,7 +3357,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.no_tx)
                 .collect::<Vec<_>>(),
-            [vec![true; 11], vec![false; 3], vec![true; 11]].concat()
+            [vec![true; 11], vec![false; 3], vec![true; 12]].concat()
         );
         let control_ledger = migrator
             .migrations
@@ -3412,6 +3413,7 @@ mod tests {
             (23, RECALL_VISIBILITY_MIGRATION_SQL, true),
             (24, NORMATIVE_ACTIVATION_MIGRATION_SQL, true),
             (26, CI_CONNECTOR_MIGRATION_SQL, true),
+            (27, DISCREPANCY_LEDGER_MIGRATION_SQL, true),
         ] {
             let migration = migrator
                 .migrations
@@ -3435,12 +3437,13 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            // W3-NORM registers migration 24 and W3-CIEV registers 26;
-            // version 25 is reserved for an item that added no migration, so
-            // the sequence is deliberately non-contiguous.
-            (1..=24).chain(std::iter::once(26)).collect::<Vec<_>>()
+            // W3-NORM registers migration 24, W3-CIEV registers 26, and
+            // W3-DISC registers 27; version 25 is reserved for an item that
+            // added no migration, so the sequence is deliberately
+            // non-contiguous.
+            (1..=24).chain([26, 27]).collect::<Vec<_>>()
         );
-        for version in (10..=24).chain(std::iter::once(26)) {
+        for version in (10..=24).chain([26, 27]) {
             let migration = pre_transactional
                 .migrations
                 .iter()
@@ -3462,10 +3465,11 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            // W3-NORM registers migration 24 and W3-CIEV registers 26;
-            // version 25 is reserved for an item that added no migration, so
-            // the sequence is deliberately non-contiguous.
-            (1..=24).chain(std::iter::once(26)).collect::<Vec<_>>()
+            // W3-NORM registers migration 24, W3-CIEV registers 26, and
+            // W3-DISC registers 27; version 25 is reserved for an item that
+            // added no migration, so the sequence is deliberately
+            // non-contiguous.
+            (1..=24).chain([26, 27]).collect::<Vec<_>>()
         );
         for migration in transactional.migrations.iter() {
             let expected_type = if migration.version >= 15 {

@@ -79,8 +79,13 @@ fn derive_stored_projection_denormalises_the_fold() {
     );
     assert!(!stored.canonical_projection.is_empty());
     // Deterministic: the same log folds to the same bytes.
-    let again = derive_stored_projection(&sample, &[resolve_event(&sample, "2026-08-15T06:00:00.000000000Z")], &[], 2)
-        .unwrap();
+    let again = derive_stored_projection(
+        &sample,
+        &[resolve_event(&sample, "2026-08-15T06:00:00.000000000Z")],
+        &[],
+        2,
+    )
+    .unwrap();
     assert_eq!(again.canonical_projection, stored.canonical_projection);
 }
 

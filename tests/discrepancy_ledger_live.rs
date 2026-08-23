@@ -493,7 +493,10 @@ async fn live_envelope_admission_is_durable_and_projection_reloads_identically()
     let repository = ledger(&pool, "roundtrip");
     let detection = envelope('5');
 
-    let outcome = repository.admit_envelope(&candidate(detection.clone())).await.unwrap();
+    let outcome = repository
+        .admit_envelope(&candidate(detection.clone()))
+        .await
+        .unwrap();
     assert_appended(&outcome, Some(1));
 
     let ack = acknowledge_event(&detection, "2026-08-15T05:00:00.000000000Z");
@@ -552,8 +555,14 @@ async fn live_replayed_appends_are_idempotent_and_do_not_move_the_projection() {
     let repository = ledger(&pool, "idempotent");
     let detection = envelope('5');
 
-    repository.admit_envelope(&candidate(detection.clone())).await.unwrap();
-    let replayed = repository.admit_envelope(&candidate(detection.clone())).await.unwrap();
+    repository
+        .admit_envelope(&candidate(detection.clone()))
+        .await
+        .unwrap();
+    let replayed = repository
+        .admit_envelope(&candidate(detection.clone()))
+        .await
+        .unwrap();
     assert!(matches!(
         replayed,
         DiscrepancyAppendOutcomeV1::AlreadyRecorded { .. }
@@ -578,7 +587,14 @@ async fn live_replayed_appends_are_idempotent_and_do_not_move_the_projection() {
         .unwrap()
         .unwrap();
     assert_eq!(after, before);
-    assert_eq!(repository.read_log(detection.episode_fingerprint).await.unwrap().len(), 2);
+    assert_eq!(
+        repository
+            .read_log(detection.episode_fingerprint)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 // --- receipt order does not move the projection ---
@@ -591,18 +607,27 @@ async fn live_event_receipt_order_does_not_move_the_projection() {
     let pool = live_pool(&database_url).await;
     let detection = envelope('5');
     let ack = acknowledge_event(&detection, "2026-08-15T05:00:00.000000000Z");
-    let dismiss = dismiss_event(&detection, "2026-08-15T05:30:00.000000000Z", "principal.on_call");
+    let dismiss = dismiss_event(
+        &detection,
+        "2026-08-15T05:30:00.000000000Z",
+        "principal.on_call",
+    );
 
     // Ledger A receives the events in effective order.
     let ordered = ledger(&pool, "order-effective");
-    ordered.admit_envelope(&candidate(detection.clone())).await.unwrap();
+    ordered
+        .admit_envelope(&candidate(detection.clone()))
+        .await
+        .unwrap();
     ordered.append_lifecycle_event(&ack).await.unwrap();
     ordered.append_lifecycle_event(&dismiss).await.unwrap();
 
     // Ledger B receives the LATE event last: the dismissal (later effective
     // time) arrives before the acknowledgement it post-dates.
     let late = ledger(&pool, "order-late");
-    late.admit_envelope(&candidate(detection.clone())).await.unwrap();
+    late.admit_envelope(&candidate(detection.clone()))
+        .await
+        .unwrap();
     late.append_lifecycle_event(&dismiss).await.unwrap();
     late.append_lifecycle_event(&ack).await.unwrap();
 
@@ -642,7 +667,10 @@ async fn live_a_divergent_envelope_for_a_seeded_episode_is_refused() {
     let pool = live_pool(&database_url).await;
     let repository = ledger(&pool, "divergent");
     let detection = envelope('5');
-    repository.admit_envelope(&candidate(detection.clone())).await.unwrap();
+    repository
+        .admit_envelope(&candidate(detection.clone()))
+        .await
+        .unwrap();
 
     // Same episode fingerprint (severity is not identity-bearing), different
     // envelope bytes: per-detection identity may not be rewritten.
@@ -653,10 +681,22 @@ async fn live_a_divergent_envelope_for_a_seeded_episode_is_refused() {
         detection.envelope_id().unwrap()
     );
     assert_eq!(divergent.episode_fingerprint, detection.episode_fingerprint);
-    assert!(repository.admit_envelope(&candidate(divergent)).await.is_err());
+    assert!(
+        repository
+            .admit_envelope(&candidate(divergent))
+            .await
+            .is_err()
+    );
 
     // Nothing was appended by the refused attempt.
-    assert_eq!(repository.read_log(detection.episode_fingerprint).await.unwrap().len(), 1);
+    assert_eq!(
+        repository
+            .read_log(detection.episode_fingerprint)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     let reloaded = repository
         .read_envelope(detection.episode_fingerprint)
         .await
@@ -692,7 +732,10 @@ async fn live_a_self_implicated_dismissal_is_refused_and_writes_nothing() {
     let pool = live_pool(&database_url).await;
     let repository = ledger(&pool, "auth03");
     let detection = envelope('5');
-    repository.admit_envelope(&candidate(detection.clone())).await.unwrap();
+    repository
+        .admit_envelope(&candidate(detection.clone()))
+        .await
+        .unwrap();
 
     // AUTH-03: principal.author_a is implicated by the envelope itself.
     let self_dismiss = dismiss_event(
@@ -700,7 +743,12 @@ async fn live_a_self_implicated_dismissal_is_refused_and_writes_nothing() {
         "2026-08-15T05:30:00.000000000Z",
         "principal.author_a",
     );
-    assert!(repository.append_lifecycle_event(&self_dismiss).await.is_err());
+    assert!(
+        repository
+            .append_lifecycle_event(&self_dismiss)
+            .await
+            .is_err()
+    );
 
     let stored = repository
         .read_projection(detection.episode_fingerprint)
@@ -709,7 +757,14 @@ async fn live_a_self_implicated_dismissal_is_refused_and_writes_nothing() {
         .unwrap();
     assert_eq!(stored.cursor_seq, 1);
     assert_eq!(stored.lifecycle_state, LifecycleState::Open);
-    assert_eq!(repository.read_log(detection.episode_fingerprint).await.unwrap().len(), 1);
+    assert_eq!(
+        repository
+            .read_log(detection.episode_fingerprint)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -759,7 +814,12 @@ async fn live_a_foreign_scope_envelope_is_refused_before_touching_the_database()
     .unwrap();
     let foreign_episode = foreign_envelope.episode_fingerprint;
 
-    assert!(repository.admit_envelope(&candidate(foreign_envelope)).await.is_err());
+    assert!(
+        repository
+            .admit_envelope(&candidate(foreign_envelope))
+            .await
+            .is_err()
+    );
     assert!(
         repository
             .read_projection(foreign_episode)
@@ -767,7 +827,13 @@ async fn live_a_foreign_scope_envelope_is_refused_before_touching_the_database()
             .unwrap()
             .is_none()
     );
-    assert!(repository.read_log(foreign_episode).await.unwrap().is_empty());
+    assert!(
+        repository
+            .read_log(foreign_episode)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 // --- relations ---
@@ -784,7 +850,10 @@ async fn live_a_superseding_relation_freezes_the_source_episode() {
     assert_eq!(source.family_fingerprint, replacement.family_fingerprint);
     assert_ne!(source.episode_fingerprint, replacement.episode_fingerprint);
 
-    repository.admit_envelope(&candidate(source.clone())).await.unwrap();
+    repository
+        .admit_envelope(&candidate(source.clone()))
+        .await
+        .unwrap();
     repository
         .admit_envelope(&candidate(replacement.clone()))
         .await
@@ -857,7 +926,10 @@ async fn live_a_relation_claiming_another_family_for_a_seeded_episode_is_refused
     let pool = live_pool(&database_url).await;
     let repository = ledger(&pool, "cross-family");
     let detection = envelope('5');
-    repository.admit_envelope(&candidate(detection.clone())).await.unwrap();
+    repository
+        .admit_envelope(&candidate(detection.clone()))
+        .await
+        .unwrap();
 
     // A relation minted with only public fingerprints, claiming a DIFFERENT
     // family while naming this scope's episode as its suppression source.
@@ -874,7 +946,13 @@ async fn live_a_relation_claiming_another_family_for_a_seeded_episode_is_refused
     };
     assert!(repository.append_relation(&relation).await.is_err());
     // Nothing was stored, and the episode is untouched.
-    assert!(repository.read_relations(alien_family).await.unwrap().is_empty());
+    assert!(
+        repository
+            .read_relations(alien_family)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let stored = repository
         .read_projection(detection.episode_fingerprint)
         .await

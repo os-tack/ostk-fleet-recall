@@ -17,7 +17,10 @@ fn window(start: &str, end: &str) -> CoverageWindowV1 {
 }
 
 fn compared() -> CoverageWindowV1 {
-    window("2026-08-15T00:00:00.000000000Z", "2026-08-15T06:00:00.000000000Z")
+    window(
+        "2026-08-15T00:00:00.000000000Z",
+        "2026-08-15T06:00:00.000000000Z",
+    )
 }
 
 /// A side that fully measured the compared interval.
@@ -166,8 +169,7 @@ fn every_failed_conjunct_on_both_sides_is_reported() {
     bad_observed.freshness = FreshnessStateV1::Stale;
     let mut bad_normative = normative('a');
     bad_normative.value_digest = None;
-    let verdict =
-        compare_measured_sides(&compared(), &bad_observed, &bad_normative).unwrap();
+    let verdict = compare_measured_sides(&compared(), &bad_observed, &bad_normative).unwrap();
     let ComparisonVerdictV1::Indeterminate { reasons } = verdict else {
         panic!("poisoned comparison must be indeterminate");
     };
@@ -215,7 +217,10 @@ fn invalid_measured_window_is_rejected() {
 /// A provider whose honest answer is "I only read part of that window".
 struct PartialProvider;
 impl ComparisonSideProvider for PartialProvider {
-    fn measure(&self, compared: &CoverageWindowV1) -> crate::memory_contracts::ContractResult<MeasuredComparisonSideV1> {
+    fn measure(
+        &self,
+        compared: &CoverageWindowV1,
+    ) -> crate::memory_contracts::ContractResult<MeasuredComparisonSideV1> {
         Ok(MeasuredComparisonSideV1 {
             role: ComparisonSideRoleV1::Observed,
             measured_window: compared.clone(),
@@ -228,7 +233,10 @@ impl ComparisonSideProvider for PartialProvider {
 
 struct CompleteNormativeProvider;
 impl ComparisonSideProvider for CompleteNormativeProvider {
-    fn measure(&self, compared: &CoverageWindowV1) -> crate::memory_contracts::ContractResult<MeasuredComparisonSideV1> {
+    fn measure(
+        &self,
+        compared: &CoverageWindowV1,
+    ) -> crate::memory_contracts::ContractResult<MeasuredComparisonSideV1> {
         Ok(MeasuredComparisonSideV1 {
             role: ComparisonSideRoleV1::Normative,
             measured_window: compared.clone(),
@@ -241,8 +249,7 @@ impl ComparisonSideProvider for CompleteNormativeProvider {
 
 #[test]
 fn provider_reported_partial_coverage_flows_into_the_verdict() {
-    let verdict =
-        compare_sides(&compared(), &PartialProvider, &CompleteNormativeProvider).unwrap();
+    let verdict = compare_sides(&compared(), &PartialProvider, &CompleteNormativeProvider).unwrap();
     assert_eq!(
         verdict,
         ComparisonVerdictV1::Indeterminate {
@@ -280,12 +287,20 @@ fn opening_transition_total_order_beats_receipt_order() {
     let receipt_order = [late.clone(), early.clone()];
     let effective_order = [early.clone(), late.clone()];
 
-    let (winner_a, fingerprint_a) =
-        seed_episode_fingerprint(sample.family_fingerprint, &continuity_key, 1, &receipt_order)
-            .unwrap();
-    let (winner_b, fingerprint_b) =
-        seed_episode_fingerprint(sample.family_fingerprint, &continuity_key, 1, &effective_order)
-            .unwrap();
+    let (winner_a, fingerprint_a) = seed_episode_fingerprint(
+        sample.family_fingerprint,
+        &continuity_key,
+        1,
+        &receipt_order,
+    )
+    .unwrap();
+    let (winner_b, fingerprint_b) = seed_episode_fingerprint(
+        sample.family_fingerprint,
+        &continuity_key,
+        1,
+        &effective_order,
+    )
+    .unwrap();
     assert_eq!(winner_a, early);
     assert_eq!(winner_a, winner_b);
     assert_eq!(fingerprint_a, fingerprint_b);
@@ -298,10 +313,7 @@ fn opening_transition_breaks_ties_by_provider_order_then_source_fact() {
     let sample = envelope();
     let continuity_key: Vec<_> = vec![super::super::testbed::applicability()[1].clone()];
     let same_time = "2026-08-15T04:00:00.000000000Z";
-    let by_provider = [
-        candidate(same_time, 3, 'a'),
-        candidate(same_time, 1, 'f'),
-    ];
+    let by_provider = [candidate(same_time, 3, 'a'), candidate(same_time, 1, 'f')];
     let (winner, _) =
         seed_episode_fingerprint(sample.family_fingerprint, &continuity_key, 1, &by_provider)
             .unwrap();
@@ -355,7 +367,7 @@ fn projection_is_identical_under_every_event_permutation_including_late_arrival(
         // after both later events were already known.
         vec![waive.clone(), resolve.clone(), ack.clone()],
         vec![resolve.clone(), ack.clone(), waive.clone()],
-        vec![resolve.clone(), waive.clone(), ack.clone()],
+        vec![resolve, waive, ack],
     ];
     let (reference, reference_time) =
         project_ledger_episode(&sample, &permutations[0], &[]).unwrap();
