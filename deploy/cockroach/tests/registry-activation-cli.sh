@@ -2052,6 +2052,36 @@ while IFS= read -r observer_runtime_live_test; do
             "$observer_runtime_live_test" -- --exact --nocapture
 done <<<"$observer_runtime_live_tests"
 
+# Every Wave-3 discrepancy ledger (W3-DISC) connected test, by exact
+# discovered name; the set is asserted complete, so a live_* test that nobody
+# wires here fails this proof instead of silently not running.
+discrepancy_ledger_live_tests='live_a_divergent_envelope_for_a_seeded_episode_is_refused
+live_a_foreign_scope_envelope_is_refused_before_touching_the_database
+live_a_lifecycle_event_without_an_admitted_envelope_is_refused
+live_a_relation_claiming_another_family_for_a_seeded_episode_is_refused
+live_a_self_implicated_dismissal_is_refused_and_writes_nothing
+live_a_superseding_relation_freezes_the_source_episode
+live_envelope_admission_is_durable_and_projection_reloads_identically
+live_event_receipt_order_does_not_move_the_projection
+live_replayed_appends_are_idempotent_and_do_not_move_the_projection'
+discrepancy_ledger_live_listing=$(cargo test --locked \
+    --test discrepancy_ledger_live -- --list)
+discovered_discrepancy_ledger_live_tests=$(grep -E '^live_[a-z0-9_]+: test$' \
+    <<<"$discrepancy_ledger_live_listing" \
+    | sed 's/: test$//' \
+    | sort)
+assert_exact "exact discrepancy-ledger connected test set" \
+    "$discovered_discrepancy_ledger_live_tests" \
+    "$discrepancy_ledger_live_tests"
+while IFS= read -r discrepancy_ledger_live_test; do
+    test -n "$discrepancy_ledger_live_test" || continue
+    require_discovered_test "$discrepancy_ledger_live_listing" \
+        "$discrepancy_ledger_live_test"
+    FLEET_RECALL_TEST_DATABASE_URL="$root_url" \
+        cargo test --locked --test discrepancy_ledger_live \
+            "$discrepancy_ledger_live_test" -- --exact --nocapture
+done <<<"$discrepancy_ledger_live_tests"
+
 current_retry_live_test=ledger::cockroach::tests::live_current_projection_whole_unit_retry_when_configured
 current_snapshot_live_test=ledger::cockroach::tests::live_current_projection_snapshot_race_when_configured
 conflict_live_test=ledger::cockroach::tests::live_conflict_polarity_matrix_when_configured
