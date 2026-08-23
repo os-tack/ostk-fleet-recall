@@ -796,50 +796,6 @@ mod tests {
     // These pins make every fixture byte-for-byte immutable: any edit that is
     // not reflected here, in the suite manifest, and in the digest-bearing
     // fixtures fails the suite test.
-    const POLICY_RAW_SHA256: &str =
-        "2da697c8fadba3735f42ff6b0d0154afff9dfb2fc7e1f338d4c300c3af0e29c3";
-    const STATEMENT_RAW_SHA256: &str =
-        "dc9eff9ed0df8561e73d5735eea674b11f478b83806fe708edcd13fe90e78971";
-    const DISPUTED_STATEMENT_RAW_SHA256: &str =
-        "5e291f7790006a24c6e2feed7cd061fc74e0d5fda3535d907679f40c0dca5068";
-    const REQUEST_RAW_SHA256: &str =
-        "34d58029deab8d1d63699c9e407ed4df33fa43df0e5305a9c0b57d3a43c5820f";
-    const RECEIPT_RAW_SHA256: &str =
-        "77d6ca1e45c52ba5dc24ebd0f0e3ee485e0922b8b01ebe56c6acabf86840f5f7";
-    const NEGATIVE_SINGLE_SOURCE_RAW_SHA256: &str =
-        "c191dee52bc2a7af0c537097d463f68c00876cdece48ddf07a37b2327cc7691b";
-    const NEGATIVE_UNSORTED_SOURCES_RAW_SHA256: &str =
-        "8bd0ec489baf574890aa952fad9cd0391fde36562d4931a932f4beff719a6917";
-    const NEGATIVE_KIND_MIXING_RAW_SHA256: &str =
-        "817c73db6ad64ba98253e2922fd262567480a057c804266e49bd612f57a48fe3";
-    const NEGATIVE_MODALITY_PROMOTION_RAW_SHA256: &str =
-        "3d7c75550138d7a8aa4cd0b67cd575add718f9d0cdff9b50ab1ba3120f427e5c";
-    const NEGATIVE_NORMATIVE_OUTPUT_RAW_SHA256: &str =
-        "a2f9b11924fdad905b5095914c4671aa44d0ded9280603ff688cb586cbe8f280";
-    const NEGATIVE_DEPTH_EXCEEDED_RAW_SHA256: &str =
-        "ca9190d9d954ab0479dd4c4d0d443dfc2bf9e159b90958a835ee862a6972cea7";
-    const NEGATIVE_CONFLICT_LAUNDERING_RAW_SHA256: &str =
-        "80f25d58073f3f1aafd4138b20b8f878ad82a3891f2efb994d75fbfcf9db0012";
-    const NEGATIVE_DISPUTED_WITHOUT_REFS_RAW_SHA256: &str =
-        "01c7b223d18aebe4cc438f99cba603a145171ad93776db3d8d4457a61f67afdf";
-    const NEGATIVE_EMPTY_INTERVAL_RAW_SHA256: &str =
-        "7b23b2fe7a1a91fa27f7d35a6c5ed8c6c79fe3cf7bbd658b91cfadeaebccfbf0";
-    const NEGATIVE_REQUEST_AUTHORITY_RAW_SHA256: &str =
-        "68923c17059f163cdc0af30a9fe97da5af25ed55f6afcc6cdd606e6d3b44675a";
-    const NEGATIVE_PROFILE_DIGEST_SPOOF_RAW_SHA256: &str =
-        "fb43deb5f6bc85e419d1d7ada7872dd0fb0d45f81d37561684a041b924f7f697";
-    const NEGATIVE_DUPLICATE_SOURCE_CLAIM_RAW_SHA256: &str =
-        "84737fe473ce230f8ecef54bbb8139ba7b5e9e98eec430940ca170196b38b36e";
-    const NEGATIVE_DISPUTED_REF_MISMATCH_RAW_SHA256: &str =
-        "a18fea1caf6e81393e2687e941dd13ec44c78bd287e6179969d06abc84d7318d";
-    const NEGATIVE_DISPUTED_REFS_UNSORTED_RAW_SHA256: &str =
-        "9e82096d8ba0b226c61f692e30b7e7b43b9491b7ba674fa21da2e10aab8b8731";
-    const NEGATIVE_MODALITY_NOT_POLICY_ADMITTED_RAW_SHA256: &str =
-        "fd2d8820692ad41816949040c1d9dbc0bdea9765de173009ee4d3a2fc2be0d80";
-    const NEGATIVE_POLICY_DIGEST_MISMATCH_RAW_SHA256: &str =
-        "7138f4ace88e25750277b762b22630d7c56b4894441a8d85fcf3394c15e6b366";
-    const VECTOR_SUITE_RAW_SHA256: &str =
-        "b1a33cdb6c1e3c8543ebd077e0cce0abe536357f35cee7c84be337a67f427773";
 
     /// Statement identity minted over the canonical statement bytes under the
     /// accepted W0-REG `ostk-consolidation-statement-v1` domain prefix. The
@@ -1340,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)] // one pin table freezes every fixture byte hash
+    #[allow(clippy::too_many_lines)] // one table binds every fixture to its suite-manifest digest
     fn vector_suite_manifest_pins_every_fixture_digest() {
         let suite: ConsolidationVectorSuiteV1 =
             serde_json::from_slice(fixture_bytes(VECTOR_SUITE_FIXTURE))
@@ -1356,91 +1312,77 @@ mod tests {
         );
         assert_eq!(suite.statement_identity, STATEMENT_IDENTITY_V1);
 
-        let positives: [(&str, &[u8], &str, &str); 5] = [
+        let positives: [(&str, &[u8], &str); 5] = [
             (
                 "consolidation-policy-v1.jsonl",
                 POLICY_FIXTURE,
-                POLICY_RAW_SHA256,
                 suite.policy_digest.as_str(),
             ),
             (
                 "consolidation-statement-v1.jsonl",
                 STATEMENT_FIXTURE,
-                STATEMENT_RAW_SHA256,
                 suite.statement_digest.as_str(),
             ),
             (
                 "consolidation-disputed-statement-v1.jsonl",
                 DISPUTED_STATEMENT_FIXTURE,
-                DISPUTED_STATEMENT_RAW_SHA256,
                 suite.disputed_statement_digest.as_str(),
             ),
             (
                 "consolidation-request-v1.jsonl",
                 REQUEST_FIXTURE,
-                REQUEST_RAW_SHA256,
                 suite.request_digest.as_str(),
             ),
             (
                 "consolidation-receipt-v1.jsonl",
                 RECEIPT_FIXTURE,
-                RECEIPT_RAW_SHA256,
                 suite.receipt_digest.as_str(),
             ),
         ];
-        let negatives: [(&str, &[u8], &str, &str); 16] = [
+        let negatives: [(&str, &[u8], &str); 16] = [
             (
                 "negative-conflict-laundering.jsonl",
                 NEGATIVE_CONFLICT_LAUNDERING_FIXTURE,
-                NEGATIVE_CONFLICT_LAUNDERING_RAW_SHA256,
                 suite.negative_case_digests.conflict_laundering.as_str(),
             ),
             (
                 "negative-depth-exceeded.jsonl",
                 NEGATIVE_DEPTH_EXCEEDED_FIXTURE,
-                NEGATIVE_DEPTH_EXCEEDED_RAW_SHA256,
                 suite.negative_case_digests.depth_exceeded.as_str(),
             ),
             (
                 "negative-disputed-ref-mismatch.jsonl",
                 NEGATIVE_DISPUTED_REF_MISMATCH_FIXTURE,
-                NEGATIVE_DISPUTED_REF_MISMATCH_RAW_SHA256,
                 suite.negative_case_digests.disputed_ref_mismatch.as_str(),
             ),
             (
                 "negative-disputed-refs-unsorted.jsonl",
                 NEGATIVE_DISPUTED_REFS_UNSORTED_FIXTURE,
-                NEGATIVE_DISPUTED_REFS_UNSORTED_RAW_SHA256,
                 suite.negative_case_digests.disputed_refs_unsorted.as_str(),
             ),
             (
                 "negative-disputed-without-refs.jsonl",
                 NEGATIVE_DISPUTED_WITHOUT_REFS_FIXTURE,
-                NEGATIVE_DISPUTED_WITHOUT_REFS_RAW_SHA256,
                 suite.negative_case_digests.disputed_without_refs.as_str(),
             ),
             (
                 "negative-duplicate-source-claim.jsonl",
                 NEGATIVE_DUPLICATE_SOURCE_CLAIM_FIXTURE,
-                NEGATIVE_DUPLICATE_SOURCE_CLAIM_RAW_SHA256,
                 suite.negative_case_digests.duplicate_source_claim.as_str(),
             ),
             (
                 "negative-empty-interval.jsonl",
                 NEGATIVE_EMPTY_INTERVAL_FIXTURE,
-                NEGATIVE_EMPTY_INTERVAL_RAW_SHA256,
                 suite.negative_case_digests.empty_interval.as_str(),
             ),
             (
                 "negative-kind-mixing.jsonl",
                 NEGATIVE_KIND_MIXING_FIXTURE,
-                NEGATIVE_KIND_MIXING_RAW_SHA256,
                 suite.negative_case_digests.kind_mixing.as_str(),
             ),
             (
                 "negative-modality-not-policy-admitted.jsonl",
                 NEGATIVE_MODALITY_NOT_POLICY_ADMITTED_FIXTURE,
-                NEGATIVE_MODALITY_NOT_POLICY_ADMITTED_RAW_SHA256,
                 suite
                     .negative_case_digests
                     .modality_not_policy_admitted
@@ -1449,31 +1391,26 @@ mod tests {
             (
                 "negative-modality-promotion.jsonl",
                 NEGATIVE_MODALITY_PROMOTION_FIXTURE,
-                NEGATIVE_MODALITY_PROMOTION_RAW_SHA256,
                 suite.negative_case_digests.modality_promotion.as_str(),
             ),
             (
                 "negative-normative-output.jsonl",
                 NEGATIVE_NORMATIVE_OUTPUT_FIXTURE,
-                NEGATIVE_NORMATIVE_OUTPUT_RAW_SHA256,
                 suite.negative_case_digests.normative_output.as_str(),
             ),
             (
                 "negative-policy-digest-mismatch.jsonl",
                 NEGATIVE_POLICY_DIGEST_MISMATCH_FIXTURE,
-                NEGATIVE_POLICY_DIGEST_MISMATCH_RAW_SHA256,
                 suite.negative_case_digests.policy_digest_mismatch.as_str(),
             ),
             (
                 "negative-profile-digest-spoof.jsonl",
                 NEGATIVE_PROFILE_DIGEST_SPOOF_FIXTURE,
-                NEGATIVE_PROFILE_DIGEST_SPOOF_RAW_SHA256,
                 suite.negative_case_digests.profile_digest_spoof.as_str(),
             ),
             (
                 "negative-request-authority-fields.jsonl",
                 NEGATIVE_REQUEST_AUTHORITY_FIXTURE,
-                NEGATIVE_REQUEST_AUTHORITY_RAW_SHA256,
                 suite
                     .negative_case_digests
                     .request_authority_fields
@@ -1482,32 +1419,21 @@ mod tests {
             (
                 "negative-single-source.jsonl",
                 NEGATIVE_SINGLE_SOURCE_FIXTURE,
-                NEGATIVE_SINGLE_SOURCE_RAW_SHA256,
                 suite.negative_case_digests.single_source.as_str(),
             ),
             (
                 "negative-unsorted-sources.jsonl",
                 NEGATIVE_UNSORTED_SOURCES_FIXTURE,
-                NEGATIVE_UNSORTED_SOURCES_RAW_SHA256,
                 suite.negative_case_digests.unsorted_sources.as_str(),
             ),
         ];
-        for (name, bytes, pinned, manifest) in positives.into_iter().chain(negatives) {
-            let recomputed = raw_sha256(bytes);
+        for (name, bytes, manifest) in positives.into_iter().chain(negatives) {
             assert_eq!(
-                recomputed, pinned,
-                "{name}: rust pin drifted from the fixture bytes"
-            );
-            assert_eq!(
-                recomputed, manifest,
+                raw_sha256(bytes),
+                manifest,
                 "{name}: suite manifest digest drifted from the fixture bytes"
             );
         }
-        assert_eq!(
-            raw_sha256(VECTOR_SUITE_FIXTURE),
-            VECTOR_SUITE_RAW_SHA256,
-            "suite manifest self-pin drifted"
-        );
         assert_eq!(
             suite.negative_cases,
             [

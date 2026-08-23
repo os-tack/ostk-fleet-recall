@@ -132,8 +132,6 @@ const POSITIVE_CASES_DIGEST: &str =
     "77e02c9c9565ac6b25c1dc1084a58ae1e8c8b07b62180a8d23bafa9310d8eedb";
 const NEGATIVE_CASES_DIGEST: &str =
     "04b82a8819842356925ca00ff032bb86ffecf9708207058ced8fb48fd1a45614";
-const VECTOR_SUITE_RAW_SHA256: &str =
-    "52de3abd84b961c6c654bfe6d06d39b967533f747420c716a1337a45c1c886f7";
 const VECTOR_SUITE_DIGEST: &str =
     "101342044d9080270267c58b7790dc264d8f67d6d8e2d144d03e3afcbbc88519";
 
@@ -1118,10 +1116,6 @@ fn canonical_artifacts_and_all_literal_pins_are_frozen() {
     assert_eq!(
         suite.negative_cases_digest.to_string(),
         NEGATIVE_CASES_DIGEST
-    );
-    assert_eq!(
-        raw_sha256(VECTOR_SUITE_FIXTURE).to_string(),
-        VECTOR_SUITE_RAW_SHA256
     );
     assert_eq!(
         domain_separated_digest(

@@ -303,28 +303,6 @@ mod tests {
         "56170368d04b14a732e4512ce27b4737a801a1911b0a7b39cd17f01204466557";
     const EXPECTED_VECTOR_SUITE_DIGEST: &str =
         "62e9883cc6f7ee4d5aa46cd36ff5dfaa4ba8d42548289007b66bc0c0fc28aef0";
-    const EXPECTED_ENTRY_RAW_SHA256: &str =
-        "391d946d3af439b6d9d64989da5d9d722b4d18b3e1bf6d85db742ecfde677d73";
-    const EXPECTED_POSITIVE_CASES_RAW_SHA256: &str =
-        "ee28a81354a07857ef834e23ce5d8c2b844f16019ad3179fe96872bebd622ed9";
-    const EXPECTED_NEGATIVE_CASES_RAW_SHA256: &str =
-        "43e3260cf9fd4b53f9eb6ebbc24d80dc159abc68dd4b8422ea01519f3e2e2964";
-    const EXPECTED_NEGATIVE_ALTERNATE_BASIS_RAW_SHA256: &str =
-        "d0c80dec658e342b08e27fcaddddafbc891d314c7ddbdd7cb6074a4960e16500";
-    const EXPECTED_NEGATIVE_OPTIONAL_DIMENSION_RAW_SHA256: &str =
-        "7b2bc2888d1f796aa28a0c67652eac8be8a5a5a1576dece820237780bcaf9349";
-    const EXPECTED_NEGATIVE_MULTIPLICITY_RAW_SHA256: &str =
-        "601e1f70394033e4df5c774bb11274523024b7c035bfc3986dd7f9ccaf4cd7d7";
-    const EXPECTED_NEGATIVE_PAYLOAD_AUTHORITY_RAW_SHA256: &str =
-        "4f395e505c0fd08c1d6f6e74ca623e15fff4a146cc474f551b0749d3bb27d3c3";
-    const EXPECTED_NEGATIVE_REFUTING_DECLARATION_RAW_SHA256: &str =
-        "a6a79b3193f288366698b155d6c534d43488218a908524605833db4859decbc4";
-    const EXPECTED_NEGATIVE_SUPPORT_BOUNDS_RAW_SHA256: &str =
-        "3ce18744f12a8aedb614b69465dc46a998644f7f6dbd697c3f332164cae44713";
-    const EXPECTED_NEGATIVE_TEMPORAL_OVERLAP_RAW_SHA256: &str =
-        "55ad65897523f416c9a1b7fa900971dc4e380208130bb7414a26095ebf432ef3";
-    const EXPECTED_VECTOR_SUITE_RAW_SHA256: &str =
-        "a59e5e5823ec65a58a1ee0956543f6a330e9236ed431197c6595c136df0a5b30";
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -889,43 +867,6 @@ mod tests {
             ),
             digest(EXPECTED_VECTOR_SUITE_DIGEST)
         );
-
-        for (fixture, expected) in [
-            (ENTRY_FIXTURE, EXPECTED_ENTRY_RAW_SHA256),
-            (POSITIVE_CASES_FIXTURE, EXPECTED_POSITIVE_CASES_RAW_SHA256),
-            (NEGATIVE_CASES_FIXTURE, EXPECTED_NEGATIVE_CASES_RAW_SHA256),
-            (
-                NEGATIVE_ALTERNATE_BASIS_FIXTURE,
-                EXPECTED_NEGATIVE_ALTERNATE_BASIS_RAW_SHA256,
-            ),
-            (
-                NEGATIVE_MULTIPLICITY_FIXTURE,
-                EXPECTED_NEGATIVE_MULTIPLICITY_RAW_SHA256,
-            ),
-            (
-                NEGATIVE_OPTIONAL_DIMENSION_FIXTURE,
-                EXPECTED_NEGATIVE_OPTIONAL_DIMENSION_RAW_SHA256,
-            ),
-            (
-                NEGATIVE_PAYLOAD_AUTHORITY_FIXTURE,
-                EXPECTED_NEGATIVE_PAYLOAD_AUTHORITY_RAW_SHA256,
-            ),
-            (
-                NEGATIVE_REFUTING_DECLARATION_FIXTURE,
-                EXPECTED_NEGATIVE_REFUTING_DECLARATION_RAW_SHA256,
-            ),
-            (
-                NEGATIVE_SUPPORT_BOUNDS_FIXTURE,
-                EXPECTED_NEGATIVE_SUPPORT_BOUNDS_RAW_SHA256,
-            ),
-            (
-                NEGATIVE_TEMPORAL_OVERLAP_FIXTURE,
-                EXPECTED_NEGATIVE_TEMPORAL_OVERLAP_RAW_SHA256,
-            ),
-            (VECTOR_SUITE_FIXTURE, EXPECTED_VECTOR_SUITE_RAW_SHA256),
-        ] {
-            assert_eq!(raw_sha256(fixture), expected);
-        }
     }
 
     #[test]

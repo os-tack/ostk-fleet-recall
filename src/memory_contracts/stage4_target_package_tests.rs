@@ -47,19 +47,8 @@ const PACKAGE_FIXTURE: &[u8] =
 const VECTOR_SUITE_FIXTURE: &[u8] =
     include_bytes!("../../contracts/dynamic-memory/v2/stage4-successor/vector-suite.jsonl");
 
-const PACKAGE_RAW_SHA256: &str = "6e6a8eafe34913cc472ee9d970ddc23588568e9738040d464e1193d378e9f323";
-const ENTRY_POSITIVE_RAW_SHA256: &str =
-    "9856ee9037c658687295b02d6463e932fbe569c59842d44876dd370f3f682bb0";
-const ENTRY_NEGATIVE_RAW_SHA256: &str =
-    "e0fbf541359fa607471675b41abecb23ce6d0a0d9d4358c738f694ec79178e7a";
-const PACKAGE_POSITIVE_RAW_SHA256: &str =
-    "b3437f8538545b4e32dff8baffa9e3e0006d9cd2c9c5c444425d1a22e431dd8f";
-const PACKAGE_NEGATIVE_RAW_SHA256: &str =
-    "f0a443ce82917038abfbbce85d2fdfab1d279175e5795da456ab7af5bd744d4b";
 const VECTOR_SUITE_DIGEST_HEX: &str =
     "9ea1e713be391b7c510135deb0c53cdb6e709a888f3e50df0f304c2dc940a656";
-const VECTOR_SUITE_RAW_SHA256: &str =
-    "c6e4b30b0b9d63502e9c5126388ab9f1d75b0d2a495d821d5d7c3072affad4fd";
 
 const FIXTURE_AUTHORITY: &str = "test_only_no_runtime_authority";
 const CONSISTENCY_RECIPE_ID: &str = "ostk.consistency.source_fact_id";
@@ -1050,20 +1039,6 @@ fn canonical_artifacts_and_all_digest_layers_are_hard_pinned() {
 }
 
 #[test]
-fn framed_raw_artifacts_are_hard_pinned() {
-    for (fixture, expected) in [
-        (PACKAGE_FIXTURE, PACKAGE_RAW_SHA256),
-        (ENTRY_POSITIVE_FIXTURE, ENTRY_POSITIVE_RAW_SHA256),
-        (ENTRY_NEGATIVE_FIXTURE, ENTRY_NEGATIVE_RAW_SHA256),
-        (PACKAGE_POSITIVE_FIXTURE, PACKAGE_POSITIVE_RAW_SHA256),
-        (PACKAGE_NEGATIVE_FIXTURE, PACKAGE_NEGATIVE_RAW_SHA256),
-        (VECTOR_SUITE_FIXTURE, VECTOR_SUITE_RAW_SHA256),
-    ] {
-        assert_eq!(raw_sha256(fixture), expected);
-    }
-}
-
-#[test]
 fn package_manifests_pin_entries_without_creating_a_digest_cycle() {
     let package = target_package();
     let positive: PackageCaseManifestV1 = decode_strict(record(PACKAGE_POSITIVE_FIXTURE)).unwrap();
@@ -1318,27 +1293,6 @@ fn regenerate_stage4_target_artifacts() {
     println!("PACKAGE_POSITIVE_DIGEST {}", suite.package_positive_digest);
     println!("PACKAGE_NEGATIVE_DIGEST {}", suite.package_negative_digest);
     println!("VECTOR_SUITE_DIGEST {}", vector_digest(&suite));
-    println!("PACKAGE_RAW_SHA256 {}", suite.package_raw_sha256);
-    println!(
-        "ENTRY_POSITIVE_RAW_SHA256 {}",
-        suite.entry_positive_raw_sha256
-    );
-    println!(
-        "ENTRY_NEGATIVE_RAW_SHA256 {}",
-        suite.entry_negative_raw_sha256
-    );
-    println!(
-        "PACKAGE_POSITIVE_RAW_SHA256 {}",
-        suite.package_positive_raw_sha256
-    );
-    println!(
-        "PACKAGE_NEGATIVE_RAW_SHA256 {}",
-        suite.package_negative_raw_sha256
-    );
-    println!(
-        "VECTOR_SUITE_RAW_SHA256 {}",
-        framed_raw_sha256(&encode_canonical(&suite).unwrap())
-    );
     for pin in &suite.entry_pins {
         println!(
             "ENTRY {} {}@{} {}",

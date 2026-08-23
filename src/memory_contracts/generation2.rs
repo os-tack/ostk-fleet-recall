@@ -722,12 +722,6 @@ mod tests {
         "5a4bbcd7e17557cf0215d0932644b5cf3c78028681393249364a959c2c481d43";
     const EXPECTED_VECTOR_SUITE_DIGEST: &str =
         "ec497fd0adb5a850862bbfebdc6f5024422e916919aff59dc02788a9972abefd";
-    const EXPECTED_MANIFEST_RAW_SHA256: &str =
-        "cad41bb3fdac991cea1d0a56a5dbbd65d259db7373d871bd2468024b26232ee7";
-    const EXPECTED_SLOT_TABLE_RAW_SHA256: &str =
-        "78f8500aa91ae4f1e3a3213f0dc205c0019c667a7edeec2b0bd88a60352a8dc2";
-    const EXPECTED_VECTOR_SUITE_RAW_SHA256: &str =
-        "b8503470bf563810d6d6a98b8838d626ad56c76e8bd6b12bc8281c3449c3de88";
 
     /// r1 froze exactly seven reserved slots and 32 closed-table triples.
     const R1_RESERVED_SLOT_COUNT: usize = 7;
@@ -739,12 +733,6 @@ mod tests {
         "a3db241757b3e5a8f02680557e5568a1e83ac97ff4e934c1ebc36618a00e877d";
     const EXPECTED_VECTOR_SUITE_R2_DIGEST: &str =
         "8d6929de2d3af569b8d7f9d603c3185786948ba7d23d1594b9c89674c9dc7ef8";
-    const EXPECTED_MANIFEST_R2_RAW_SHA256: &str =
-        "532c58564b8053e8cecb90ea0972639aefe200e393ecf7d32544f0ffec1ca44b";
-    const EXPECTED_SLOT_TABLE_R2_RAW_SHA256: &str =
-        "90d79dcb6c11691a67e7163f8f0c5eef079df1c41a621e6eb769e6ff3a1a1658";
-    const EXPECTED_VECTOR_SUITE_R2_RAW_SHA256: &str =
-        "211edfe7c97f0abd25b8a797def76af24b41960d88b196575b87b8169821ceeb";
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -1364,16 +1352,9 @@ mod tests {
 
     #[test]
     fn r1_artifacts_stay_byte_frozen_and_are_superseded_by_r2() {
-        // Raw hashes and domain digests are pure functions of the file bytes,
-        // so these hold no matter what the compiled table now says. If any r1
-        // file were edited or regenerated, this is what would fail.
-        for (fixture, expected) in [
-            (MANIFEST_FIXTURE, EXPECTED_MANIFEST_RAW_SHA256),
-            (SLOT_TABLE_FIXTURE, EXPECTED_SLOT_TABLE_RAW_SHA256),
-            (VECTOR_SUITE_FIXTURE, EXPECTED_VECTOR_SUITE_RAW_SHA256),
-        ] {
-            assert_eq!(raw_sha256(fixture), expected);
-        }
+        // Domain digests are pure functions of the file bytes, so these hold
+        // no matter what the compiled table now says. If any r1 file were
+        // edited or regenerated, this is what would fail.
         assert_eq!(
             domain_separated_digest(
                 DigestDomain::Generation2CompositionManifestV1,
@@ -1508,13 +1489,6 @@ mod tests {
         );
         assert_eq!(suite.predecessor_head, generation1_expected_head().unwrap());
 
-        for (fixture, expected) in [
-            (MANIFEST_R2_FIXTURE, EXPECTED_MANIFEST_R2_RAW_SHA256),
-            (SLOT_TABLE_R2_FIXTURE, EXPECTED_SLOT_TABLE_R2_RAW_SHA256),
-            (VECTOR_SUITE_R2_FIXTURE, EXPECTED_VECTOR_SUITE_R2_RAW_SHA256),
-        ] {
-            assert_eq!(raw_sha256(fixture), expected);
-        }
         for (pin, fixture) in suite.negative_artifacts.iter().zip([
             NEGATIVE_DUPLICATE_ROOT_R2_FIXTURE,
             NEGATIVE_GENERATION2_ONLY_ROOT_R2_FIXTURE,

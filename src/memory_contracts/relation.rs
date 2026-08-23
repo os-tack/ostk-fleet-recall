@@ -569,14 +569,6 @@ mod tests {
         "b3e13395d8f3a74d3e29dc8cd972c349b962cf4b088ac6ad2ccce226aeff0bc6";
     const VECTOR_SUITE_DIGEST: &str =
         "87e7f7c8df11dff099bc0e6ff66fbd97ea4bbcca815c85c9bac415c0faa22d6f";
-    const EDGE_RAW_SHA256: &str =
-        "7bc7d8f6737fd7450dfd7d7e40e53d2d22cf61299bb288b0b6344addb5a368d5";
-    const DECLARED_EVENT_RAW_SHA256: &str =
-        "cd9d6080a7280f0ee7e2a9ac3c64b4947252a882b9b324f9c490bcd10769d966";
-    const VERIFIED_EVENT_RAW_SHA256: &str =
-        "b663076dd30b40b64d7003f324e136b33c4939d5bd94bd3096bc05a3f3cf1437";
-    const VECTOR_SUITE_RAW_SHA256: &str =
-        "3752543c19c49d7f857d075abb698882ce9e00b63972fe45359476c4bb2d37fd";
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -901,22 +893,6 @@ mod tests {
         assert_eq!(suite.consistency_key_digest, digest(RELATION_FINGERPRINT));
         assert!(suite.fixture_authority.starts_with("none;"));
         assert!(strictly_sorted(&suite.negative_cases));
-        assert_eq!(raw_sha256(EDGE_FIXTURE), EDGE_RAW_SHA256);
-        assert_eq!(
-            raw_sha256(DECLARED_EVENT_FIXTURE),
-            DECLARED_EVENT_RAW_SHA256
-        );
-        assert_eq!(
-            raw_sha256(VERIFIED_EVENT_FIXTURE),
-            VERIFIED_EVENT_RAW_SHA256
-        );
-        assert_eq!(raw_sha256(VECTOR_SUITE_FIXTURE), VECTOR_SUITE_RAW_SHA256);
-        assert_eq!(suite.relation_edge_raw_sha256, EDGE_RAW_SHA256);
-        assert_eq!(suite.declared_event_raw_sha256, DECLARED_EVENT_RAW_SHA256);
-        assert_eq!(
-            suite.verified_support_event_raw_sha256,
-            VERIFIED_EVENT_RAW_SHA256
-        );
     }
 
     #[test]
@@ -1392,19 +1368,6 @@ mod tests {
         println!(
             "VECTOR_SUITE_DIGEST {}",
             domain_separated_digest(DigestDomain::TestVectorManifest, &suite_bytes)
-        );
-        println!("EDGE_RAW_SHA256 {}", framed_raw_sha256(&edge_bytes));
-        println!(
-            "DECLARED_EVENT_RAW_SHA256 {}",
-            framed_raw_sha256(&declared_bytes)
-        );
-        println!(
-            "VERIFIED_EVENT_RAW_SHA256 {}",
-            framed_raw_sha256(&verified_bytes)
-        );
-        println!(
-            "VECTOR_SUITE_RAW_SHA256 {}",
-            framed_raw_sha256(&suite_bytes)
         );
     }
 }

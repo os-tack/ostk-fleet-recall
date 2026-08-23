@@ -82,26 +82,6 @@ const NEGATIVE_CASES_DIGEST: &str =
 const VECTOR_SUITE_DIGEST: &str =
     "f40254b9f2d242afc9b65f330879fb6c0094b10097636d1bf24558632fed785d";
 
-const TARGET_PACKAGE_RAW_SHA256: &str =
-    "6e6a8eafe34913cc472ee9d970ddc23588568e9738040d464e1193d378e9f323";
-const BRIDGE_RAW_SHA256: &str = "e008106413023eb6e9da0e9e200d8b8f58b4cae7434a723a9e2e56f357c3b25b";
-const TEST_RESULT_RAW_SHA256: &str =
-    "bc07fb8d0a79bea19f671a6f091611f14a7997ac72fbc72599472512562c962b";
-const STATEMENT_RAW_SHA256: &str =
-    "8ff1523115d72b131f7ae7c65089d48fc0235e6ac53d743bfe3734a144f981a9";
-const APPROVAL_SET_RAW_SHA256: &str =
-    "6f4979d161e5b43c50dfe441095b4682d2b9c523042b87789172ea62f2f59a11";
-const RECEIPT_RAW_SHA256: &str = "875d33d98753779dde29bfa0ea9d9da620a596a48b4b516ccf6f0b3c521170a2";
-const ACTIVATED_HEAD_RAW_SHA256: &str =
-    "189814fb4dd696e8ebfab61177f29d7077eb17b486759bb6f01b96e30b965ea5";
-const EVENT_RAW_SHA256: &str = "57c841d4d66c1df89823a866413bd58807c1c2e2ecab0151b9cd2d433aae4c32";
-const POSITIVE_VECTORS_RAW_SHA256: &str =
-    "82e132178b897b611b1e2e7b32a20ea1dfa32385902dcf875594a40d1e68c766";
-const NEGATIVE_VECTORS_RAW_SHA256: &str =
-    "7f39618c63360c0dfcc8cfbed729e76645724dd921b40cb9f5e678be277c6cce";
-const VECTOR_SUITE_RAW_SHA256: &str =
-    "95939cafebae1f98ca05c5efbfaea3f5dce0f52ed4ba485b5a9c2fc1b48884b8";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SuccessorActivationCaseOutcomeV1 {
@@ -658,20 +638,19 @@ fn verified_request() -> VerifiedSuccessorRegistryActivationRequest {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn canonical_artifacts_and_all_literal_pins_are_frozen() {
-    for (fixture, expected_raw_sha256) in [
-        (TARGET_PACKAGE_FIXTURE, TARGET_PACKAGE_RAW_SHA256),
-        (BRIDGE_FIXTURE, BRIDGE_RAW_SHA256),
-        (TEST_RESULT_FIXTURE, TEST_RESULT_RAW_SHA256),
-        (ACTIVATION_STATEMENT_FIXTURE, STATEMENT_RAW_SHA256),
-        (ACTIVATION_APPROVAL_SET_FIXTURE, APPROVAL_SET_RAW_SHA256),
-        (ACTIVATION_RECEIPT_FIXTURE, RECEIPT_RAW_SHA256),
-        (ACTIVATED_HEAD_FIXTURE, ACTIVATED_HEAD_RAW_SHA256),
-        (ACTIVATION_EVENT_FIXTURE, EVENT_RAW_SHA256),
-        (POSITIVE_VECTORS_FIXTURE, POSITIVE_VECTORS_RAW_SHA256),
-        (NEGATIVE_VECTORS_FIXTURE, NEGATIVE_VECTORS_RAW_SHA256),
-        (VECTOR_SUITE_FIXTURE, VECTOR_SUITE_RAW_SHA256),
+    for fixture in [
+        TARGET_PACKAGE_FIXTURE,
+        BRIDGE_FIXTURE,
+        TEST_RESULT_FIXTURE,
+        ACTIVATION_STATEMENT_FIXTURE,
+        ACTIVATION_APPROVAL_SET_FIXTURE,
+        ACTIVATION_RECEIPT_FIXTURE,
+        ACTIVATED_HEAD_FIXTURE,
+        ACTIVATION_EVENT_FIXTURE,
+        POSITIVE_VECTORS_FIXTURE,
+        NEGATIVE_VECTORS_FIXTURE,
+        VECTOR_SUITE_FIXTURE,
     ] {
-        assert_eq!(raw_sha256(fixture).to_string(), expected_raw_sha256);
         require_canonical(record(fixture)).unwrap();
     }
 

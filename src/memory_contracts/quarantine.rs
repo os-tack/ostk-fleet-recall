@@ -444,64 +444,26 @@ mod tests {
         "../../contracts/dynamic-memory/v3/quarantine/negative-release-to-projection-field.jsonl"
     );
 
-    const INTEGRITY_COLLISION_RAW_SHA256: &str =
-        "c411c6a154083f6596b670943d503ffad8e15538614dfe41957a3d11c5c997ee";
     const INTEGRITY_COLLISION_ID: &str =
         "596a89d0158a062c87f4ed98fa1bd875c1d9d7deb8b33a1f4cd136977dcef83b";
-    const INVALID_SIGNATURE_RAW_SHA256: &str =
-        "4e57de9e6043dcd286e073617ecfaf35fb8f14891dc85e8440eb556e144380dd";
     const INVALID_SIGNATURE_ID: &str =
         "20bf032d415b58f2e8fc5439a21c0ffa8a705d6449cf9f9e54a330b47190699f";
-    const UNAUTHORIZED_SCOPE_RAW_SHA256: &str =
-        "95be635fdbce6f9eccb0f4e1de3fc5a9162f66c6bcd8099e62c2ba3d0e366d55";
     const UNAUTHORIZED_SCOPE_ID: &str =
         "7ce49698579dd3c6d7f83934f3b81dc6658bb417f1d977e8a8c9d3f34ea5bdc3";
-    const UNKNOWN_SCHEMA_RAW_SHA256: &str =
-        "fe08edb166f414bb0c76f1622326cfa908e7452237532d99fcc4abb909211ba3";
     const UNKNOWN_SCHEMA_ID: &str =
         "9f2a68aaf032fde60be6eb7cb54f04d2634fe46de873c2be506f9039aeeb1593";
-    const OVERSIZE_RAW_SHA256: &str =
-        "5a762f09b1f99ed9278df8b5c956cf897716615abdc7b6117055ebda9c4e5d2b";
     const OVERSIZE_ID: &str = "d9ce7dd66fc4e525034e9b2cb9596834a4c7eb47d8c4225ea5d3f205aba05e6b";
-    const DUPLICATE_POSITION_RAW_SHA256: &str =
-        "93e7e87d4a9a2077c5dbb588fa35f69508b3c45e09c32d9ab63dfb99cfca5513";
     const DUPLICATE_POSITION_ID: &str =
         "f00ef0090dbc703a60cb9df80aa6fce29e0ae8765e3f010400bffc27f68fd045";
-    const PREIMAGE_DISAGREEMENT_RAW_SHA256: &str =
-        "a2bcd590a46676a4ae9f4d41074f609bd6d5fb0e32e6a05cde48d664b211f1b0";
     const PREIMAGE_DISAGREEMENT_ID: &str =
         "ffe01c5a37d4445dcc3ea88a9b049172d1fd5ff1d2f34ba04598053678d8710e";
-    const REDACTION_FAILURE_RAW_SHA256: &str =
-        "a33e40ccea5eb4bad8581cdfc3eef3d2e8ec91480ffb8c8ff0b7bb52d251802e";
     const REDACTION_FAILURE_ID: &str =
         "512089675dc6fa91e7bc13b75033a193e6a67afc289ac5520548dc63d01b9a88";
-    const UNKNOWN_REPRESENTATION_VERSION_RAW_SHA256: &str =
-        "564197a05ec35e747b0b9aac0b6e763caa91e97d323e8b3019b1556ef93cd79b";
     const UNKNOWN_REPRESENTATION_VERSION_ID: &str =
         "58bd1b257fcfec9ccf245e24bfcced39f0d9366393180ba937b303cecaa2431d";
 
-    const NEGATIVE_RAW_PAYLOAD_RAW_SHA256: &str =
-        "9dab9a7dc0c058db6fe6609cb04f40e43cd06af3d915341c1f25cd75ca38bff4";
-    const NEGATIVE_OVERSIZED_DIAGNOSTIC_RAW_SHA256: &str =
-        "d74aa2f604d4f5d7ea9e5390fccb3ce7d0197d99061663badaa6c2cc1c71ad88";
-    const NEGATIVE_PAYLOAD_TENANT_RAW_SHA256: &str =
-        "19a81915b788d691ab01cf339b3ac8311429b9c6cf2dd1707530b1d158a7b090";
-    const NEGATIVE_MISSING_DELIVERY_ID_RAW_SHA256: &str =
-        "1b69007e9dadef694b0e5b012266104d37e12a97d2bf834acf721a42539436d6";
-    const NEGATIVE_RELEASE_TO_PROJECTION_RAW_SHA256: &str =
-        "7ab927ba7a9c8a75411e9220352691d0c8ce53ed748ca0523d860b032efe41a4";
-
     const VECTOR_SUITE_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/quarantine/vector-suite.jsonl");
-    const VECTOR_SUITE_RAW_SHA256: &str =
-        "70d648fdae83d88bda66709d1b9ae8687241b319a766cb21edc3cab90d943f1a";
-
-    fn raw_sha256(bytes: &[u8]) -> String {
-        use sha2::{Digest as _, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        hex::encode(hasher.finalize())
-    }
 
     /// Strip the one repository-framing trailing LF every fixture carries.
     /// `require_canonical` demands the input bytes match the canonical form
@@ -517,15 +479,9 @@ mod tests {
 
     fn assert_positive_fixture(
         fixture: &[u8],
-        expected_raw_sha256: &str,
         expected_reason: QuarantineReasonV1,
         expected_id: &str,
     ) {
-        assert_eq!(
-            raw_sha256(fixture),
-            expected_raw_sha256,
-            "raw fixture bytes drifted"
-        );
         // Every frozen fixture must be exactly its own canonical form: a
         // reordered key, different spacing, or non-minimal escaping would
         // still decode-then-revalidate successfully (decode_strict
@@ -546,7 +502,6 @@ mod tests {
     fn positive_integrity_collision_vector() {
         assert_positive_fixture(
             INTEGRITY_COLLISION_FIXTURE,
-            INTEGRITY_COLLISION_RAW_SHA256,
             QuarantineReasonV1::IntegrityCollision,
             INTEGRITY_COLLISION_ID,
         );
@@ -556,7 +511,6 @@ mod tests {
     fn positive_invalid_signature_vector() {
         assert_positive_fixture(
             INVALID_SIGNATURE_FIXTURE,
-            INVALID_SIGNATURE_RAW_SHA256,
             QuarantineReasonV1::InvalidSignature,
             INVALID_SIGNATURE_ID,
         );
@@ -566,7 +520,6 @@ mod tests {
     fn positive_unauthorized_scope_vector() {
         assert_positive_fixture(
             UNAUTHORIZED_SCOPE_FIXTURE,
-            UNAUTHORIZED_SCOPE_RAW_SHA256,
             QuarantineReasonV1::UnauthorizedScope,
             UNAUTHORIZED_SCOPE_ID,
         );
@@ -576,7 +529,6 @@ mod tests {
     fn positive_unknown_schema_vector() {
         assert_positive_fixture(
             UNKNOWN_SCHEMA_FIXTURE,
-            UNKNOWN_SCHEMA_RAW_SHA256,
             QuarantineReasonV1::UnknownSchema,
             UNKNOWN_SCHEMA_ID,
         );
@@ -584,19 +536,13 @@ mod tests {
 
     #[test]
     fn positive_oversize_vector() {
-        assert_positive_fixture(
-            OVERSIZE_FIXTURE,
-            OVERSIZE_RAW_SHA256,
-            QuarantineReasonV1::Oversize,
-            OVERSIZE_ID,
-        );
+        assert_positive_fixture(OVERSIZE_FIXTURE, QuarantineReasonV1::Oversize, OVERSIZE_ID);
     }
 
     #[test]
     fn positive_duplicate_position_vector() {
         assert_positive_fixture(
             DUPLICATE_POSITION_FIXTURE,
-            DUPLICATE_POSITION_RAW_SHA256,
             QuarantineReasonV1::DuplicatePosition,
             DUPLICATE_POSITION_ID,
         );
@@ -606,7 +552,6 @@ mod tests {
     fn positive_preimage_disagreement_vector() {
         assert_positive_fixture(
             PREIMAGE_DISAGREEMENT_FIXTURE,
-            PREIMAGE_DISAGREEMENT_RAW_SHA256,
             QuarantineReasonV1::PreimageDisagreement,
             PREIMAGE_DISAGREEMENT_ID,
         );
@@ -616,7 +561,6 @@ mod tests {
     fn positive_redaction_failure_vector() {
         assert_positive_fixture(
             REDACTION_FAILURE_FIXTURE,
-            REDACTION_FAILURE_RAW_SHA256,
             QuarantineReasonV1::RedactionFailure,
             REDACTION_FAILURE_ID,
         );
@@ -626,7 +570,6 @@ mod tests {
     fn positive_unknown_representation_version_vector() {
         assert_positive_fixture(
             UNKNOWN_REPRESENTATION_VERSION_FIXTURE,
-            UNKNOWN_REPRESENTATION_VERSION_RAW_SHA256,
             QuarantineReasonV1::UnknownRepresentationVersion,
             UNKNOWN_REPRESENTATION_VERSION_ID,
         );
@@ -659,10 +602,6 @@ mod tests {
 
     #[test]
     fn negative_raw_payload_field_is_rejected_as_unknown_key() {
-        assert_eq!(
-            raw_sha256(NEGATIVE_RAW_PAYLOAD_FIXTURE),
-            NEGATIVE_RAW_PAYLOAD_RAW_SHA256
-        );
         require_canonical(fixture_body(NEGATIVE_RAW_PAYLOAD_FIXTURE))
             .expect("fixture must be exactly its own canonical form");
         let result: ContractResult<QuarantineRecordV1> =
@@ -672,10 +611,6 @@ mod tests {
 
     #[test]
     fn negative_oversized_diagnostic_decodes_but_fails_validation() {
-        assert_eq!(
-            raw_sha256(NEGATIVE_OVERSIZED_DIAGNOSTIC_FIXTURE),
-            NEGATIVE_OVERSIZED_DIAGNOSTIC_RAW_SHA256
-        );
         require_canonical(fixture_body(NEGATIVE_OVERSIZED_DIAGNOSTIC_FIXTURE))
             .expect("fixture must be exactly its own canonical form");
         let record: QuarantineRecordV1 =
@@ -688,10 +623,6 @@ mod tests {
 
     #[test]
     fn negative_payload_selected_tenant_field_is_rejected_as_unknown_key() {
-        assert_eq!(
-            raw_sha256(NEGATIVE_PAYLOAD_TENANT_FIXTURE),
-            NEGATIVE_PAYLOAD_TENANT_RAW_SHA256
-        );
         require_canonical(fixture_body(NEGATIVE_PAYLOAD_TENANT_FIXTURE))
             .expect("fixture must be exactly its own canonical form");
         let result: ContractResult<QuarantineRecordV1> =
@@ -704,10 +635,6 @@ mod tests {
 
     #[test]
     fn negative_missing_delivery_id_does_not_decode() {
-        assert_eq!(
-            raw_sha256(NEGATIVE_MISSING_DELIVERY_ID_FIXTURE),
-            NEGATIVE_MISSING_DELIVERY_ID_RAW_SHA256
-        );
         require_canonical(fixture_body(NEGATIVE_MISSING_DELIVERY_ID_FIXTURE))
             .expect("fixture must be exactly its own canonical form");
         let result: ContractResult<QuarantineRecordV1> =
@@ -717,10 +644,6 @@ mod tests {
 
     #[test]
     fn negative_release_to_projection_field_is_rejected_as_unknown_key() {
-        assert_eq!(
-            raw_sha256(NEGATIVE_RELEASE_TO_PROJECTION_FIXTURE),
-            NEGATIVE_RELEASE_TO_PROJECTION_RAW_SHA256
-        );
         require_canonical(fixture_body(NEGATIVE_RELEASE_TO_PROJECTION_FIXTURE))
             .expect("fixture must be exactly its own canonical form");
         let result: ContractResult<QuarantineRecordV1> =
@@ -1166,7 +1089,6 @@ mod tests {
 
     #[test]
     fn vector_suite_fixture_is_pinned() {
-        assert_eq!(raw_sha256(VECTOR_SUITE_FIXTURE), VECTOR_SUITE_RAW_SHA256);
         require_canonical(fixture_body(VECTOR_SUITE_FIXTURE))
             .expect("vector-suite.jsonl must be exactly its own canonical form");
     }

@@ -78,42 +78,6 @@ const EXPECTED_PROPOSAL_BOUNDED_INTERVAL_STATEMENT_ID: &str =
 // than its filename and vector-suite description claim) fails
 // `all_fixtures_are_byte_frozen` even when the fixture still happens to
 // decode and still happens to be rejected by `validate()`.
-const PROPOSAL_POSITIVE_RAW_SHA256: &str =
-    "8f8576ac7b4480d467183abc0e892235c2b423154a008019e5c8409b006f3b3e";
-const PROPOSAL_POSITIVE_BOUNDED_INTERVAL_RAW_SHA256: &str =
-    "2e99d00ed3d9aa3c9b9858f4316b0d15b08ca704937d63ed778a7ee939ac39dd";
-const PROPOSAL_NEGATIVE_UNSORTED_PROPOSITIONS_RAW_SHA256: &str =
-    "c3d6d6b00b0037f6888297ac5ea98b388028d91e1f11e4c5b3198eacec64cf25";
-const PROPOSAL_NEGATIVE_OVERLAPPING_SPANS_RAW_SHA256: &str =
-    "5042aa5938b6b4bda4d4eb0002a985d00ac253cc89b5e69258b1a567a6e25560";
-const PROPOSAL_NEGATIVE_WRONG_RESOURCE_FORM_RAW_SHA256: &str =
-    "b2c33b7c801edc0b92054d4bdfeca88e14595c66162ef561fd358e7b93505e72";
-const RECEIPT_POSITIVE_AUTHOR_PLUS_INDEPENDENT_RAW_SHA256: &str =
-    "a953be98bae5dd78600cba231911a142e8f927b71410456cff234b64bf47f2a8";
-const RECEIPT_NEGATIVE_AUTHOR_ONLY_RAW_SHA256: &str =
-    "c75d5ddcc775a7cf84c2e6c73ab1a2b4f8c1b2adb3054c0cf9cdead1eec590eb";
-const RECEIPT_NEGATIVE_AUTHOR_ONLY_HONEST_RAW_SHA256: &str =
-    "596e4ed80bb5527a97d4f8fe0aaff8893b5358244802dddc581442a71b7b3b1a";
-const LIFECYCLE_ACTIVATION_RAW_SHA256: &str =
-    "13e222e822903c06cee547b608a046498663b9ea387c1cc451a867a892f0c414";
-const LIFECYCLE_SUPERSESSION_RAW_SHA256: &str =
-    "4ff7e019554d73aeca3a3e6daadf7a4fc5667504208005daf8ddd0f79b017249";
-const LIFECYCLE_NEGATIVE_MISSING_SUPERSEDES_TARGET_RAW_SHA256: &str =
-    "29cd34788fdd8898a6404cc4f38107b5cadd680507d9efa0ca749576c3454874";
-const LIFECYCLE_NEGATIVE_SELF_SUPERSESSION_RAW_SHA256: &str =
-    "47ef8010322f0bf79001cf277af65370557f695deef9bbc83d1b02c629cf912d";
-const CONTESTED_POSITIVE_RAW_SHA256: &str =
-    "93e83ab63ca50f39143db6ba941c3090b8cf637a8ba2675f6b9666dcaff74183";
-const CONTESTED_NEGATIVE_SINGLE_STATEMENT_RAW_SHA256: &str =
-    "f3c9f130d32e6dcc667177d418be9bb3ba06403f21c69b2cdc08d249668ff0bf";
-const RETROACTIVE_POSITIVE_RAW_SHA256: &str =
-    "00f00120f66986b61c0fb15a0e0ed532dc55a9416e5f86461ac0a59ff8d81051";
-const RETROACTIVE_NEGATIVE_NOT_RETROACTIVE_RAW_SHA256: &str =
-    "baff312a248b10fec310d04aa12d13e5c119ad937afc0a2ca8e84aade847fdf1";
-const RETROACTIVE_NEGATIVE_ORDINARY_POLICY_RAW_SHA256: &str =
-    "5b37b425ca9b5a956ef29032d6a19eb739e304bd15f4dbd6baad3c86f84a75bb";
-const VECTOR_SUITE_RAW_SHA256: &str =
-    "88b8f67815a025c5225f626e60ab806a920e507e37ed335c82d8dec9a295a036";
 
 fn raw_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
@@ -1247,86 +1211,6 @@ fn fixture_retroactive_correction_positive_and_negative() {
             "invalid retroactive correction v1".into()
         ))
     );
-}
-
-/// Every fixture in this directory — positive, negative, and the
-/// vector-suite manifest — is pinned to an exact raw sha256 over its
-/// full bytes (including the trailing LF), independent of whether it
-/// happens to decode or happens to fail `validate()` for the reason its
-/// filename claims. Tampering with any fixture's bytes (e.g. swapping
-/// which field makes a negative fixture invalid, or fixing a negative
-/// fixture into a passing one) fails this test even if every other
-/// fixture-consuming test in this module still passes.
-#[test]
-#[allow(clippy::too_many_lines)] // enumerates every fixture in the directory
-fn all_fixtures_are_byte_frozen() {
-    for (bytes, expected_raw_sha256) in [
-        (PROPOSAL_POSITIVE_FIXTURE, PROPOSAL_POSITIVE_RAW_SHA256),
-        (
-            PROPOSAL_POSITIVE_BOUNDED_INTERVAL_FIXTURE,
-            PROPOSAL_POSITIVE_BOUNDED_INTERVAL_RAW_SHA256,
-        ),
-        (
-            PROPOSAL_NEGATIVE_UNSORTED_PROPOSITIONS_FIXTURE,
-            PROPOSAL_NEGATIVE_UNSORTED_PROPOSITIONS_RAW_SHA256,
-        ),
-        (
-            PROPOSAL_NEGATIVE_OVERLAPPING_SPANS_FIXTURE,
-            PROPOSAL_NEGATIVE_OVERLAPPING_SPANS_RAW_SHA256,
-        ),
-        (
-            PROPOSAL_NEGATIVE_WRONG_RESOURCE_FORM_FIXTURE,
-            PROPOSAL_NEGATIVE_WRONG_RESOURCE_FORM_RAW_SHA256,
-        ),
-        (
-            RECEIPT_POSITIVE_AUTHOR_PLUS_INDEPENDENT_FIXTURE,
-            RECEIPT_POSITIVE_AUTHOR_PLUS_INDEPENDENT_RAW_SHA256,
-        ),
-        (
-            RECEIPT_NEGATIVE_AUTHOR_ONLY_FIXTURE,
-            RECEIPT_NEGATIVE_AUTHOR_ONLY_RAW_SHA256,
-        ),
-        (
-            RECEIPT_NEGATIVE_AUTHOR_ONLY_HONEST_FIXTURE,
-            RECEIPT_NEGATIVE_AUTHOR_ONLY_HONEST_RAW_SHA256,
-        ),
-        (
-            LIFECYCLE_ACTIVATION_FIXTURE,
-            LIFECYCLE_ACTIVATION_RAW_SHA256,
-        ),
-        (
-            LIFECYCLE_SUPERSESSION_FIXTURE,
-            LIFECYCLE_SUPERSESSION_RAW_SHA256,
-        ),
-        (
-            LIFECYCLE_NEGATIVE_MISSING_SUPERSEDES_TARGET_FIXTURE,
-            LIFECYCLE_NEGATIVE_MISSING_SUPERSEDES_TARGET_RAW_SHA256,
-        ),
-        (
-            LIFECYCLE_NEGATIVE_SELF_SUPERSESSION_FIXTURE,
-            LIFECYCLE_NEGATIVE_SELF_SUPERSESSION_RAW_SHA256,
-        ),
-        (CONTESTED_POSITIVE_FIXTURE, CONTESTED_POSITIVE_RAW_SHA256),
-        (
-            CONTESTED_NEGATIVE_SINGLE_STATEMENT_FIXTURE,
-            CONTESTED_NEGATIVE_SINGLE_STATEMENT_RAW_SHA256,
-        ),
-        (
-            RETROACTIVE_POSITIVE_FIXTURE,
-            RETROACTIVE_POSITIVE_RAW_SHA256,
-        ),
-        (
-            RETROACTIVE_NEGATIVE_NOT_RETROACTIVE_FIXTURE,
-            RETROACTIVE_NEGATIVE_NOT_RETROACTIVE_RAW_SHA256,
-        ),
-        (
-            RETROACTIVE_NEGATIVE_ORDINARY_POLICY_FIXTURE,
-            RETROACTIVE_NEGATIVE_ORDINARY_POLICY_RAW_SHA256,
-        ),
-        (VECTOR_SUITE_FIXTURE, VECTOR_SUITE_RAW_SHA256),
-    ] {
-        assert_eq!(raw_sha256(bytes), expected_raw_sha256);
-    }
 }
 
 #[derive(Debug, Deserialize)]

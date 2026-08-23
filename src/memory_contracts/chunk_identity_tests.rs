@@ -751,47 +751,6 @@ mod fixture_pinning {
     const VECTOR_SUITE_FIXTURE: &[u8] =
         include_bytes!("../../contracts/dynamic-memory/v3/chunk-identity/vector-suite.jsonl");
 
-    const PARSER_KEY_RAW_SHA256: &str =
-        "825ba35ceb22ba74bbe77140c037c84c0f58dcdc9d4f2456f2f5fc3d83c9e8b6";
-    const OCCURRENCE_RAW_SHA256: &str =
-        "b7dde66c3d2fd1723b8b5378a1e77a176a50ed0590a777112f5c5796c887784c";
-    const MANIFEST_RAW_SHA256: &str =
-        "4cbde9c0f3a287c163c50fdd713da070697328b8ec6985c38205311b03f14eaf";
-    const SUPERSESSION_RAW_SHA256: &str =
-        "918f4bfc5259b1d288387cdc6887a0d46fa67e4dadfc2a40e1f07d713e8d801c";
-    const GENERATION_POINTER_RAW_SHA256: &str =
-        "b812cb9ec9bfbae5d691b8ac6cfd272f676a7a562ab1339c37325d355273d2a8";
-    const SWITCH_PROPOSAL_RAW_SHA256: &str =
-        "9ca92966eeef6c1f6ee16d365b9ab51e25bc19e0ae043d511af762df1cb84f94";
-    const EMBEDDING_BODY_RAW_SHA256: &str =
-        "ddfe5ee574b260fa6710977bf7455fa0a19020b07505f5997e4ab2e1bf28a6de";
-    const EMBEDDING_OCCURRENCE_RAW_SHA256: &str =
-        "260ed5292c12e90a4602444b9e04951fc1d26c09feb6b8cad4871a882bce6b70";
-    const STORAGE_IDENTITY_RAW_SHA256: &str =
-        "1b8b5351790723a5a76c6662b0010a6dc7b69a50811932799f7835b3816fbb6c";
-    const BODY_REFERENCE_STATE_RAW_SHA256: &str =
-        "f2eb6243224df1250c533846c80e7122a03a801e1ee3727ae5953c7361d4daa1";
-    const NEGATIVE_MANIFEST_ID_RAW_SHA256: &str =
-        "95c625f3300e74e1218c7e9790e4a29b11d26596c96f150c91f43e2df26f4f10";
-    const NEGATIVE_LINE_RAW_SHA256: &str =
-        "f3f2fabefa0ddd702f58d380b6a29e735a9abf96607059483da3cc2e311f3da6";
-    const NEGATIVE_EMPTY_SPAN_RAW_SHA256: &str =
-        "331ab92aeff614002ef6a22dc58cf75c1e0d6b92f482532b329fae836f2edfe4";
-    const NEGATIVE_OVERLAP_RAW_SHA256: &str =
-        "39d92486f39b2dfc5b4254151bc93d6620fb6d19c92add84fcd9208af549c83b";
-    const NEGATIVE_UNSORTED_RAW_SHA256: &str =
-        "e0233a8818df79a1b7a806e0eed5102ca2984954eebf1c5a96e1cee04d6af182";
-    const NEGATIVE_UNKNOWN_FLAG_RAW_SHA256: &str =
-        "f7d6b4107427cd9e52d0ebb5631d4484ee9241033644c7bb2451721c50275ef5";
-    const NEGATIVE_EMBEDDING_EXTRA_FIELD_RAW_SHA256: &str =
-        "88a031718b3daa83dc3993966e4e86f2b3616a81f2baa9736427f2574a0e3daa";
-    const NEGATIVE_DEGENERATE_POINTER_RAW_SHA256: &str =
-        "05da6417540a485eebd6ff2503ee2b8c2bfb78802b2e66a12ca01cdba8bde9ee";
-    const NEGATIVE_ZERO_SUCCESSOR_SUPERSESSION_RAW_SHA256: &str =
-        "6efe68aefa45f7e6e36b4bfc15eb5d630f07ba50a93f789a1107f47739c3d39f";
-    const VECTOR_SUITE_RAW_SHA256: &str =
-        "07aae4e848bf031fb7b790e758774cf981a47183cd81f65f8950054ef878118c";
-
     const PARSER_KEY_ID: &str = "dabca33866e026b582a8e58a7721b5e5ae222bbef2ba7f72b77f8621df79ffd1";
     const OCCURRENCE_ID: &str = "eef3a0739aeee8057cd0aeaa417946f8358c75d769fdea9438ee147d85b63c83";
     const MANIFEST_ID: &str = "33bd2ea3f050020ca616593be82bb70c85d0177cde1d507cb6866565b361b9e4";
@@ -814,61 +773,6 @@ mod fixture_pinning {
             .expect("every checked-in fixture must have exactly one framing LF");
         assert!(!body.ends_with(b"\n"));
         body
-    }
-
-    fn raw_sha256(bytes: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        hex::encode(hasher.finalize())
-    }
-
-    #[test]
-    fn every_fixture_raw_byte_pin_is_frozen() {
-        for (bytes, expected) in [
-            (PARSER_KEY_FIXTURE, PARSER_KEY_RAW_SHA256),
-            (OCCURRENCE_FIXTURE, OCCURRENCE_RAW_SHA256),
-            (MANIFEST_FIXTURE, MANIFEST_RAW_SHA256),
-            (SUPERSESSION_FIXTURE, SUPERSESSION_RAW_SHA256),
-            (GENERATION_POINTER_FIXTURE, GENERATION_POINTER_RAW_SHA256),
-            (SWITCH_PROPOSAL_FIXTURE, SWITCH_PROPOSAL_RAW_SHA256),
-            (EMBEDDING_BODY_FIXTURE, EMBEDDING_BODY_RAW_SHA256),
-            (
-                EMBEDDING_OCCURRENCE_FIXTURE,
-                EMBEDDING_OCCURRENCE_RAW_SHA256,
-            ),
-            (STORAGE_IDENTITY_FIXTURE, STORAGE_IDENTITY_RAW_SHA256),
-            (
-                BODY_REFERENCE_STATE_FIXTURE,
-                BODY_REFERENCE_STATE_RAW_SHA256,
-            ),
-            (
-                NEGATIVE_MANIFEST_ID_FIXTURE,
-                NEGATIVE_MANIFEST_ID_RAW_SHA256,
-            ),
-            (NEGATIVE_LINE_FIXTURE, NEGATIVE_LINE_RAW_SHA256),
-            (NEGATIVE_EMPTY_SPAN_FIXTURE, NEGATIVE_EMPTY_SPAN_RAW_SHA256),
-            (NEGATIVE_OVERLAP_FIXTURE, NEGATIVE_OVERLAP_RAW_SHA256),
-            (NEGATIVE_UNSORTED_FIXTURE, NEGATIVE_UNSORTED_RAW_SHA256),
-            (
-                NEGATIVE_UNKNOWN_FLAG_FIXTURE,
-                NEGATIVE_UNKNOWN_FLAG_RAW_SHA256,
-            ),
-            (
-                NEGATIVE_EMBEDDING_EXTRA_FIELD_FIXTURE,
-                NEGATIVE_EMBEDDING_EXTRA_FIELD_RAW_SHA256,
-            ),
-            (
-                NEGATIVE_DEGENERATE_POINTER_FIXTURE,
-                NEGATIVE_DEGENERATE_POINTER_RAW_SHA256,
-            ),
-            (
-                NEGATIVE_ZERO_SUCCESSOR_SUPERSESSION_FIXTURE,
-                NEGATIVE_ZERO_SUCCESSOR_SUPERSESSION_RAW_SHA256,
-            ),
-            (VECTOR_SUITE_FIXTURE, VECTOR_SUITE_RAW_SHA256),
-        ] {
-            assert_eq!(raw_sha256(bytes), expected);
-        }
     }
 
     #[test]

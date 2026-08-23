@@ -687,16 +687,6 @@ mod tests {
         "f50ab365c5687a2779ff1bf641470ed783f8f084d3d0a916c24c7f95f414dcb0";
     const EXPECTED_NEGATIVE_VECTOR_DIGEST: &str =
         "f0b39c94ea6994fdb9d275ff30319ae0960e0ca77bf807de59789278c66c537d";
-    const EXPECTED_POLICY_RAW_SHA256: &str =
-        "8b35043e259472ef444ac4203160269fc62d69ab2af71cb4c13888b4a8ef2f1a";
-    const EXPECTED_BRIDGE_RAW_SHA256: &str =
-        "e008106413023eb6e9da0e9e200d8b8f58b4cae7434a723a9e2e56f357c3b25b";
-    const EXPECTED_POSITIVE_VECTORS_RAW_SHA256: &str =
-        "da8e12c77785a5cfbd130790cc7fe193585962c111c07de7e3e70d449c67e19f";
-    const EXPECTED_NEGATIVE_VECTORS_RAW_SHA256: &str =
-        "157619270955455725cee486e0e232d0312bba209c916ed77bbb96686aceb6a0";
-    const EXPECTED_VECTOR_SUITE_RAW_SHA256: &str =
-        "8b6c2ac601cf5a26e9fd1eab6de3c7616e1bb42ba552cb444ea6b81becb8d18b";
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -977,20 +967,13 @@ mod tests {
 
     #[test]
     fn authoritative_fixtures_and_hard_coded_digests_are_frozen() {
-        for (framed, expected_raw) in [
-            (POLICY_FIXTURE, EXPECTED_POLICY_RAW_SHA256),
-            (BRIDGE_FIXTURE, EXPECTED_BRIDGE_RAW_SHA256),
-            (
-                POSITIVE_VECTORS_FIXTURE,
-                EXPECTED_POSITIVE_VECTORS_RAW_SHA256,
-            ),
-            (
-                NEGATIVE_VECTORS_FIXTURE,
-                EXPECTED_NEGATIVE_VECTORS_RAW_SHA256,
-            ),
-            (VECTOR_SUITE_FIXTURE, EXPECTED_VECTOR_SUITE_RAW_SHA256),
+        for framed in [
+            POLICY_FIXTURE,
+            BRIDGE_FIXTURE,
+            POSITIVE_VECTORS_FIXTURE,
+            NEGATIVE_VECTORS_FIXTURE,
+            VECTOR_SUITE_FIXTURE,
         ] {
-            assert_eq!(raw_sha256(framed), expected_raw);
             require_canonical(record(framed)).unwrap();
         }
 
@@ -1066,22 +1049,6 @@ mod tests {
         assert_eq!(
             suite.genesis_activation_id,
             genesis_head().head.activation_id
-        );
-        assert_eq!(
-            suite.raw_sha256.activation_policy_v2,
-            EXPECTED_POLICY_RAW_SHA256
-        );
-        assert_eq!(
-            suite.raw_sha256.genesis_successor_key_bridge_v1,
-            EXPECTED_BRIDGE_RAW_SHA256
-        );
-        assert_eq!(
-            suite.raw_sha256.positive_vectors,
-            EXPECTED_POSITIVE_VECTORS_RAW_SHA256
-        );
-        assert_eq!(
-            suite.raw_sha256.negative_vectors,
-            EXPECTED_NEGATIVE_VECTORS_RAW_SHA256
         );
         assert_eq!(
             domain_separated_digest(

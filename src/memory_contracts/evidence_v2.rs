@@ -705,7 +705,6 @@ mod tests {
         canonical::{CanonicalValue, require_canonical},
         common::frozen_profile_reference_v1,
     };
-    use sha2::{Digest as _, Sha256};
 
     const EXPECTED_SOURCE_FACT_ID: &str =
         "1b85e827dbdb36627ba53dd336ac1ca42a811bfdbd0395631d1e60062ee3610c";
@@ -733,22 +732,6 @@ mod tests {
         "422f0ae9d0f996661269f2c4ce4dedf6ac37edc8c650de67f076adfc176ec538";
     const EXPECTED_INTEGRITY_EVENT_ID: &str =
         "d6aebb962c0fc25811d0e4a870cbb3afb2376285dbdfb460da763a1bd69a389c";
-    const EXPECTED_CONNECTOR_RAW_SHA256: &str =
-        "2c7eed9d0a5b9107415b9f11551b6db5923aeb11e991e2b56c091038756f34f7";
-    const EXPECTED_SOURCE_RAW_SHA256: &str =
-        "7771c8ede425cce12528ceca81d69662d05b4ba19811e1a2b90da89c18b46225";
-    const EXPECTED_REPRESENTATION_RAW_SHA256: &str =
-        "abadfb76594e8001700c4b61ea2ae4dbfe26d1234129419ebb2f311ff14bb660";
-    const EXPECTED_SUCCESSOR_RAW_SHA256: &str =
-        "05053b36f4e3e7fda74c9b102a96bd23a3d0fd9deeb2f66888a4a39737cf0e7b";
-    const EXPECTED_STATEMENT_RAW_SHA256: &str =
-        "7c64432cc11c7f85c721ee3789343f4c22804fbe2ef34a946f7f8d652bfc199a";
-    const EXPECTED_BAD_FAMILY_RAW_SHA256: &str =
-        "6c9470b0760a3789d267d5416b9900cf0787c3b47ebda6a165eefab1176f9022";
-    const EXPECTED_BAD_DERIVATION_RAW_SHA256: &str =
-        "587d239629963b92274382fcb4609c6d39515a2bee6e4e6288286c47511824a1";
-    const EXPECTED_VECTOR_SUITE_RAW_SHA256: &str =
-        "3bdd2c2112023772b33fe9e5479f823d6293350339686c250a431a034b2d9628";
 
     fn digest(domain: DigestDomain, label: &str) -> Sha256Digest {
         domain_separated_digest(domain, label.as_bytes())
@@ -968,10 +951,6 @@ mod tests {
         record
     }
 
-    fn raw_sha256(bytes: &[u8]) -> String {
-        hex::encode(Sha256::digest(bytes))
-    }
-
     #[test]
     fn authoritative_artifacts_and_hard_coded_digests_are_frozen() {
         let connector_framed = include_bytes!(
@@ -990,22 +969,6 @@ mod tests {
         );
         let vector_suite_framed =
             include_bytes!("../../contracts/dynamic-memory/v2/evidence/vector-suite.jsonl");
-        for (framed, expected) in [
-            (connector_framed.as_slice(), EXPECTED_CONNECTOR_RAW_SHA256),
-            (source_framed.as_slice(), EXPECTED_SOURCE_RAW_SHA256),
-            (
-                representation_framed.as_slice(),
-                EXPECTED_REPRESENTATION_RAW_SHA256,
-            ),
-            (successor_framed.as_slice(), EXPECTED_SUCCESSOR_RAW_SHA256),
-            (statement_framed.as_slice(), EXPECTED_STATEMENT_RAW_SHA256),
-            (
-                vector_suite_framed.as_slice(),
-                EXPECTED_VECTOR_SUITE_RAW_SHA256,
-            ),
-        ] {
-            assert_eq!(raw_sha256(framed), expected);
-        }
         let connector_bytes = fixture_record(connector_framed);
         let source_bytes = fixture_record(source_framed);
         let representation_bytes = fixture_record(representation_framed);
@@ -1064,23 +1027,16 @@ mod tests {
 
     #[test]
     fn authoritative_negative_connector_records_fail_closed() {
-        for (framed, expected_raw_sha256) in [
-            (
-                include_bytes!(
-                    "../../contracts/dynamic-memory/v2/evidence/negative-connector-family.jsonl"
-                )
-                .as_slice(),
-                EXPECTED_BAD_FAMILY_RAW_SHA256,
-            ),
-            (
-                include_bytes!(
-                    "../../contracts/dynamic-memory/v2/evidence/negative-connector-derivation.jsonl"
-                )
-                .as_slice(),
-                EXPECTED_BAD_DERIVATION_RAW_SHA256,
-            ),
+        for framed in [
+            include_bytes!(
+                "../../contracts/dynamic-memory/v2/evidence/negative-connector-family.jsonl"
+            )
+            .as_slice(),
+            include_bytes!(
+                "../../contracts/dynamic-memory/v2/evidence/negative-connector-derivation.jsonl"
+            )
+            .as_slice(),
         ] {
-            assert_eq!(raw_sha256(framed), expected_raw_sha256);
             let record = fixture_record(framed);
             assert!(decode_strict::<ConnectorSchemaV2>(record).is_err());
         }

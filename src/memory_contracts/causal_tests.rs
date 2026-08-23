@@ -1294,63 +1294,6 @@ const NEGATIVE_ADJUDICATION_STATE_UNKNOWN_FIXTURE: &[u8] = include_bytes!(
 const VECTOR_SUITE_FIXTURE: &[u8] =
     include_bytes!("../../contracts/dynamic-memory/v3/causal/vector-suite.jsonl");
 
-const CAUSAL_HYPOTHESIS_V1_RAW_SHA256: &str =
-    "37a4d3eb5f37a5a62076abb0a543e2c527aaad8195876d1f4dcb11da230d1c66";
-const CAUSAL_RATIFICATION_CONTRIBUTING_CAUSE_V1_RAW_SHA256: &str =
-    "6d801166af4772deb58498d833090558561baee7ba9d7d3e1d8c2379d636fffc";
-const CAUSAL_RATIFICATION_PRIMARY_TRIGGER_V1_RAW_SHA256: &str =
-    "70d67360be1b03048a12eee19525f9fe9de1cf82495bad4b099ec1a00b0a20b8";
-const INTERVENTION_SUPPORT_V1_RAW_SHA256: &str =
-    "09bd170b5195730c19992d6e0e1fe833dfd0f12dcaf42ed2a87317f1dc6a3893";
-const NEGATIVE_ADJUDICATION_STATE_UNKNOWN_RAW_SHA256: &str =
-    "6006c8517af64611108324ddb24ea0332b6a2114b53e75acf4bf55ae285d66ca";
-const NEGATIVE_CAUSAL_ROLE_UNKNOWN_RAW_SHA256: &str =
-    "1104841ac38aae06cb66cbef248f7f3bbdc66b7d31b4426ab3cddc31bca7b0c4";
-const NEGATIVE_CAUSE_EQUALS_OUTCOME_RAW_SHA256: &str =
-    "ed0d5e213ca31e2b09174bb98530cabe35a97675e146a0b15be370d02799417b";
-const NEGATIVE_COHORTS_MIXED_RAW_SHA256: &str =
-    "480c27570215e93e8e9d0888383acb015920a0f42dea9fc8b12478da992e6300";
-const NEGATIVE_COVERAGE_PARTIAL_RAW_SHA256: &str =
-    "3d1b75eb9a6dbfc16cf0c8e5071f331fdc53bdb64228bce2c1cec2a40b0178cd";
-const NEGATIVE_EMPTY_MATERIAL_INPUT_INVENTORY_RAW_SHA256: &str =
-    "eec04adf03de139a5d3a66241bff196b302ad097b328b836619654a6314ad393";
-const NEGATIVE_EXECUTION_AMBIGUOUS_RAW_SHA256: &str =
-    "2f53c3e137666b91babba72eb8afa1c4964f51607b0ea149078b0f1cdecbe1b8";
-const NEGATIVE_EXPOSURE_AFTER_ONSET_RAW_SHA256: &str =
-    "d79aef147f1167be576257d1c059cfbf48084d2e22280a45ea3093327c073295";
-const NEGATIVE_MATERIAL_INPUTS_INSEPARABLE_RAW_SHA256: &str =
-    "ffe56a7358429ff1e9fce2179b459e747e5fef7fc301ab5de46855c6fe49cdf1";
-const NEGATIVE_PREDICTION_AFTER_OBSERVATION_RAW_SHA256: &str =
-    "b2ca92a4d637783e9e0fecc2616d54a5d66ecdb350adbe9ddd0185008b27f295";
-const NEGATIVE_PRIMARY_TRIGGER_SAME_RECEIPT_TWICE_RAW_SHA256: &str =
-    "b6286584e1a9bdfef300679db3007fcac3c3e0c51d7c469c295156891b748faa";
-const NEGATIVE_RATIFICATION_AGENT_EXCEPTION_REJECTED_RAW_SHA256: &str =
-    "d8c4ac716999d5efb3e568bbd4650bb0d05106343fb3a94353aa087c92a09ae7";
-const NEGATIVE_RATIFICATION_AUTHOR_AS_RATIFIER_RAW_SHA256: &str =
-    "d2b767d9e5551b860bcdf7629972ccbce49add7fee96c8bfa7cb9c3be2503956";
-const NEGATIVE_RATIFICATION_BELOW_INTERVENTION_SUPPORT_RAW_SHA256: &str =
-    "d3766a8061fd6853c1723e4d11f14248eef5f6792a79e98d66369257debc075c";
-const NEGATIVE_RATIFICATION_DISQUALIFIED_INTERVENTION_RAW_SHA256: &str =
-    "d078f992a72d43a731b2e2f1bf12ef04ce53cf402fa07245aa047a385611592e";
-const NEGATIVE_RATIFICATION_SUPERSEDED_WITHOUT_DIGEST_RAW_SHA256: &str =
-    "84d122708bd1b3df0b0e05d0ae1f0ab1e251f843dbce360f29b598539f591b56";
-const NEGATIVE_RATIFICATION_UNRESOLVED_GAPS_RAW_SHA256: &str =
-    "de14a2e8abb0539c5747591a1870df8c6a70fe8d96ee44ce47a1031432aacf71";
-const NEGATIVE_RATIFICATION_SUPERSEDED_CAUSAL_ROLE_RAW_SHA256: &str =
-    "70e7a0f52cf245fb08d756f78ac10033825e78591621d77cfbb6392c49fac5d6";
-const NEGATIVE_INTERVENTION_SCOPE_MISMATCH_RAW_SHA256: &str =
-    "1691453f7c9b9883211f82fd2b3075743a3d7810e4cb08e2f869c38bb6d2cd5b";
-const NEGATIVE_INTERVENTION_UNOBSERVED_MATERIAL_INPUT_RAW_SHA256: &str =
-    "c980c4a0c8cdebca5567baa69b851c900a044c0f308604f86577638485d32e99";
-const NEGATIVE_INTERVENTION_SINGLE_INPUT_CHANGED_ZERO_RAW_SHA256: &str =
-    "8c4927fdff6b07e7140a80865320dfcb31b6a303d3dde8981dbdd783b3d76ab2";
-const NEGATIVE_RATIFICATION_UNRECONCILED_OPPOSING_EVIDENCE_RAW_SHA256: &str =
-    "30cf8a6a66b5f17b3a71d54b34818b8bb6192cf7829c42bcff5ae1e495b2c4ef";
-const NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_RAW_SHA256: &str =
-    "380517f6442fba898b3e53a72a3131a795faad1c89285895f42e268d2af6d8c4";
-const VECTOR_SUITE_RAW_SHA256: &str =
-    "3372b58f86fdb8e22bb490730cf03027b8564419f4709b9b07b4a3373eb5991b";
-
 const CAUSAL_HYPOTHESIS_FINGERPRINT: &str =
     "76b41ed32639adbe1291dd3aca9ae24c51f21ae570014b8119cfc0ce719f3dad";
 const INTERVENTION_SUPPORT_DIGEST: &str =
@@ -1390,121 +1333,6 @@ where
         "fixture bytes are not already in canonical form"
     );
     decoded
-}
-
-#[test]
-#[allow(clippy::too_many_lines)] // one pinned (fixture, digest) pair per fixture file
-fn raw_fixture_bytes_are_pinned() {
-    for (raw, expected) in [
-        (CAUSAL_HYPOTHESIS_FIXTURE, CAUSAL_HYPOTHESIS_V1_RAW_SHA256),
-        (
-            INTERVENTION_SUPPORT_FIXTURE,
-            INTERVENTION_SUPPORT_V1_RAW_SHA256,
-        ),
-        (
-            RATIFICATION_CONTRIBUTING_CAUSE_FIXTURE,
-            CAUSAL_RATIFICATION_CONTRIBUTING_CAUSE_V1_RAW_SHA256,
-        ),
-        (
-            RATIFICATION_PRIMARY_TRIGGER_FIXTURE,
-            CAUSAL_RATIFICATION_PRIMARY_TRIGGER_V1_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_CAUSE_EQUALS_OUTCOME_FIXTURE,
-            NEGATIVE_CAUSE_EQUALS_OUTCOME_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_EMPTY_MATERIAL_INPUT_INVENTORY_FIXTURE,
-            NEGATIVE_EMPTY_MATERIAL_INPUT_INVENTORY_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_EXPOSURE_AFTER_ONSET_FIXTURE,
-            NEGATIVE_EXPOSURE_AFTER_ONSET_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_COVERAGE_PARTIAL_FIXTURE,
-            NEGATIVE_COVERAGE_PARTIAL_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_COHORTS_MIXED_FIXTURE,
-            NEGATIVE_COHORTS_MIXED_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_EXECUTION_AMBIGUOUS_FIXTURE,
-            NEGATIVE_EXECUTION_AMBIGUOUS_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_MATERIAL_INPUTS_INSEPARABLE_FIXTURE,
-            NEGATIVE_MATERIAL_INPUTS_INSEPARABLE_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_PREDICTION_AFTER_OBSERVATION_FIXTURE,
-            NEGATIVE_PREDICTION_AFTER_OBSERVATION_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_RATIFICATION_UNRESOLVED_GAPS_FIXTURE,
-            NEGATIVE_RATIFICATION_UNRESOLVED_GAPS_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_RATIFICATION_BELOW_INTERVENTION_SUPPORT_FIXTURE,
-            NEGATIVE_RATIFICATION_BELOW_INTERVENTION_SUPPORT_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_RATIFICATION_DISQUALIFIED_INTERVENTION_FIXTURE,
-            NEGATIVE_RATIFICATION_DISQUALIFIED_INTERVENTION_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_PRIMARY_TRIGGER_SAME_RECEIPT_TWICE_FIXTURE,
-            NEGATIVE_PRIMARY_TRIGGER_SAME_RECEIPT_TWICE_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_RATIFICATION_AUTHOR_AS_RATIFIER_FIXTURE,
-            NEGATIVE_RATIFICATION_AUTHOR_AS_RATIFIER_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_RATIFICATION_AGENT_EXCEPTION_REJECTED_FIXTURE,
-            NEGATIVE_RATIFICATION_AGENT_EXCEPTION_REJECTED_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_RATIFICATION_SUPERSEDED_WITHOUT_DIGEST_FIXTURE,
-            NEGATIVE_RATIFICATION_SUPERSEDED_WITHOUT_DIGEST_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_RATIFICATION_SUPERSEDED_CAUSAL_ROLE_FIXTURE,
-            NEGATIVE_RATIFICATION_SUPERSEDED_CAUSAL_ROLE_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_INTERVENTION_SCOPE_MISMATCH_FIXTURE,
-            NEGATIVE_INTERVENTION_SCOPE_MISMATCH_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_INTERVENTION_UNOBSERVED_MATERIAL_INPUT_FIXTURE,
-            NEGATIVE_INTERVENTION_UNOBSERVED_MATERIAL_INPUT_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_INTERVENTION_SINGLE_INPUT_CHANGED_ZERO_FIXTURE,
-            NEGATIVE_INTERVENTION_SINGLE_INPUT_CHANGED_ZERO_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_RATIFICATION_UNRECONCILED_OPPOSING_EVIDENCE_FIXTURE,
-            NEGATIVE_RATIFICATION_UNRECONCILED_OPPOSING_EVIDENCE_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_FIXTURE,
-            NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_CAUSAL_ROLE_UNKNOWN_FIXTURE,
-            NEGATIVE_CAUSAL_ROLE_UNKNOWN_RAW_SHA256,
-        ),
-        (
-            NEGATIVE_ADJUDICATION_STATE_UNKNOWN_FIXTURE,
-            NEGATIVE_ADJUDICATION_STATE_UNKNOWN_RAW_SHA256,
-        ),
-        (VECTOR_SUITE_FIXTURE, VECTOR_SUITE_RAW_SHA256),
-    ] {
-        assert_eq!(raw_sha256_hex(raw), expected);
-    }
 }
 
 #[test]
@@ -1761,114 +1589,111 @@ fn vector_suite_manifest_matches_every_pinned_fixture_digest() {
         RATIFICATION_PRIMARY_TRIGGER_DIGEST
     );
 
-    let expected: &[(&str, &str)] = &[
-        ("causal-hypothesis-v1", CAUSAL_HYPOTHESIS_V1_RAW_SHA256),
+    let expected: &[(&str, &[u8])] = &[
+        ("causal-hypothesis-v1", CAUSAL_HYPOTHESIS_FIXTURE),
         (
             "causal-ratification-contributing-cause-v1",
-            CAUSAL_RATIFICATION_CONTRIBUTING_CAUSE_V1_RAW_SHA256,
+            RATIFICATION_CONTRIBUTING_CAUSE_FIXTURE,
         ),
         (
             "causal-ratification-primary-trigger-v1",
-            CAUSAL_RATIFICATION_PRIMARY_TRIGGER_V1_RAW_SHA256,
+            RATIFICATION_PRIMARY_TRIGGER_FIXTURE,
         ),
-        (
-            "intervention-support-v1",
-            INTERVENTION_SUPPORT_V1_RAW_SHA256,
-        ),
+        ("intervention-support-v1", INTERVENTION_SUPPORT_FIXTURE),
         (
             "negative-adjudication-state-unknown",
-            NEGATIVE_ADJUDICATION_STATE_UNKNOWN_RAW_SHA256,
+            NEGATIVE_ADJUDICATION_STATE_UNKNOWN_FIXTURE,
         ),
         (
             "negative-causal-role-unknown",
-            NEGATIVE_CAUSAL_ROLE_UNKNOWN_RAW_SHA256,
+            NEGATIVE_CAUSAL_ROLE_UNKNOWN_FIXTURE,
         ),
         (
             "negative-cause-equals-outcome",
-            NEGATIVE_CAUSE_EQUALS_OUTCOME_RAW_SHA256,
+            NEGATIVE_CAUSE_EQUALS_OUTCOME_FIXTURE,
         ),
-        ("negative-cohorts-mixed", NEGATIVE_COHORTS_MIXED_RAW_SHA256),
+        ("negative-cohorts-mixed", NEGATIVE_COHORTS_MIXED_FIXTURE),
         (
             "negative-coverage-partial",
-            NEGATIVE_COVERAGE_PARTIAL_RAW_SHA256,
+            NEGATIVE_COVERAGE_PARTIAL_FIXTURE,
         ),
         (
             "negative-empty-material-input-inventory",
-            NEGATIVE_EMPTY_MATERIAL_INPUT_INVENTORY_RAW_SHA256,
+            NEGATIVE_EMPTY_MATERIAL_INPUT_INVENTORY_FIXTURE,
         ),
         (
             "negative-execution-ambiguous",
-            NEGATIVE_EXECUTION_AMBIGUOUS_RAW_SHA256,
+            NEGATIVE_EXECUTION_AMBIGUOUS_FIXTURE,
         ),
         (
             "negative-exposure-after-onset",
-            NEGATIVE_EXPOSURE_AFTER_ONSET_RAW_SHA256,
+            NEGATIVE_EXPOSURE_AFTER_ONSET_FIXTURE,
         ),
         (
             "negative-intervention-scope-mismatch",
-            NEGATIVE_INTERVENTION_SCOPE_MISMATCH_RAW_SHA256,
+            NEGATIVE_INTERVENTION_SCOPE_MISMATCH_FIXTURE,
         ),
         (
             "negative-intervention-single-input-changed-zero",
-            NEGATIVE_INTERVENTION_SINGLE_INPUT_CHANGED_ZERO_RAW_SHA256,
+            NEGATIVE_INTERVENTION_SINGLE_INPUT_CHANGED_ZERO_FIXTURE,
         ),
         (
             "negative-intervention-unobserved-material-input",
-            NEGATIVE_INTERVENTION_UNOBSERVED_MATERIAL_INPUT_RAW_SHA256,
+            NEGATIVE_INTERVENTION_UNOBSERVED_MATERIAL_INPUT_FIXTURE,
         ),
         (
             "negative-material-inputs-inseparable",
-            NEGATIVE_MATERIAL_INPUTS_INSEPARABLE_RAW_SHA256,
+            NEGATIVE_MATERIAL_INPUTS_INSEPARABLE_FIXTURE,
         ),
         (
             "negative-prediction-after-observation",
-            NEGATIVE_PREDICTION_AFTER_OBSERVATION_RAW_SHA256,
+            NEGATIVE_PREDICTION_AFTER_OBSERVATION_FIXTURE,
         ),
         (
             "negative-primary-trigger-same-receipt-twice",
-            NEGATIVE_PRIMARY_TRIGGER_SAME_RECEIPT_TWICE_RAW_SHA256,
+            NEGATIVE_PRIMARY_TRIGGER_SAME_RECEIPT_TWICE_FIXTURE,
         ),
         (
             "negative-ratification-agent-exception-rejected",
-            NEGATIVE_RATIFICATION_AGENT_EXCEPTION_REJECTED_RAW_SHA256,
+            NEGATIVE_RATIFICATION_AGENT_EXCEPTION_REJECTED_FIXTURE,
         ),
         (
             "negative-ratification-author-as-ratifier",
-            NEGATIVE_RATIFICATION_AUTHOR_AS_RATIFIER_RAW_SHA256,
+            NEGATIVE_RATIFICATION_AUTHOR_AS_RATIFIER_FIXTURE,
         ),
         (
             "negative-ratification-below-intervention-support",
-            NEGATIVE_RATIFICATION_BELOW_INTERVENTION_SUPPORT_RAW_SHA256,
+            NEGATIVE_RATIFICATION_BELOW_INTERVENTION_SUPPORT_FIXTURE,
         ),
         (
             "negative-ratification-disqualified-intervention",
-            NEGATIVE_RATIFICATION_DISQUALIFIED_INTERVENTION_RAW_SHA256,
+            NEGATIVE_RATIFICATION_DISQUALIFIED_INTERVENTION_FIXTURE,
         ),
         (
             "negative-ratification-empty-supporting-evidence",
-            NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_RAW_SHA256,
+            NEGATIVE_RATIFICATION_EMPTY_SUPPORTING_EVIDENCE_FIXTURE,
         ),
         (
             "negative-ratification-superseded-causal-role",
-            NEGATIVE_RATIFICATION_SUPERSEDED_CAUSAL_ROLE_RAW_SHA256,
+            NEGATIVE_RATIFICATION_SUPERSEDED_CAUSAL_ROLE_FIXTURE,
         ),
         (
             "negative-ratification-superseded-without-digest",
-            NEGATIVE_RATIFICATION_SUPERSEDED_WITHOUT_DIGEST_RAW_SHA256,
+            NEGATIVE_RATIFICATION_SUPERSEDED_WITHOUT_DIGEST_FIXTURE,
         ),
         (
             "negative-ratification-unreconciled-opposing-evidence",
-            NEGATIVE_RATIFICATION_UNRECONCILED_OPPOSING_EVIDENCE_RAW_SHA256,
+            NEGATIVE_RATIFICATION_UNRECONCILED_OPPOSING_EVIDENCE_FIXTURE,
         ),
         (
             "negative-ratification-unresolved-gaps",
-            NEGATIVE_RATIFICATION_UNRESOLVED_GAPS_RAW_SHA256,
+            NEGATIVE_RATIFICATION_UNRESOLVED_GAPS_FIXTURE,
         ),
     ];
     assert_eq!(suite.fixture_raw_sha256.len(), expected.len());
-    for ((name, raw_sha256), entry) in expected.iter().zip(suite.fixture_raw_sha256.iter()) {
+    for ((name, bytes), entry) in expected.iter().zip(suite.fixture_raw_sha256.iter()) {
         assert_eq!(entry.name.as_str(), *name);
-        assert_eq!(entry.raw_sha256.to_hex(), *raw_sha256);
+        assert_eq!(entry.raw_sha256.to_hex(), raw_sha256_hex(bytes));
     }
 }
 

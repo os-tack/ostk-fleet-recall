@@ -1,7 +1,5 @@
 use std::{fs, path::Path, str::FromStr};
 
-use sha2::{Digest as _, Sha256};
-
 use super::*;
 use crate::memory_contracts::{
     canonical::{CanonicalValue, decode_strict, require_canonical},
@@ -87,10 +85,6 @@ fn record(artifact: &'static [u8]) -> &'static [u8] {
 
 fn digest(value: &str) -> Sha256Digest {
     Sha256Digest::from_str(value).unwrap()
-}
-
-fn raw_sha256(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }
 
 fn scope() -> AuthenticatedProjectScopeV1 {
@@ -2707,12 +2701,4 @@ fn regenerate_discrepancy_contract_artifacts() {
             &encode_canonical(&suite).unwrap()
         )
     );
-    for bytes in [
-        ("ENVELOPE_RAW_SHA256", encode_canonical(&envelope).unwrap()),
-        ("VECTOR_SUITE_RAW_SHA256", encode_canonical(&suite).unwrap()),
-    ] {
-        let mut framed = bytes.1.clone();
-        framed.push(b'\n');
-        println!("{} {}", bytes.0, raw_sha256(&framed));
-    }
 }

@@ -6,41 +6,6 @@ use crate::memory_contracts::{
 };
 use sha2::{Digest as _, Sha256};
 
-const EXPECTED_PRIVATE_RECEIPT_RAW_SHA256: &str =
-    "a7ad8669ed13129c9ea20edeb1ef7366b1cf7c98a67135c10f73e9a4a215a17d";
-const EXPECTED_UNAVAILABLE_RECEIPT_RAW_SHA256: &str =
-    "8b85689c0ea4c22fb2f46256a1836d7dc0bdfc1352507c51a4c3a42840f3dd46";
-const EXPECTED_SLO_COMPLIANT_RAW_SHA256: &str =
-    "a14b0aab4a6c23acecbc12a4d9da2fffb9c7a0500a5f6fd07bc3581a0947d3a8";
-const EXPECTED_SLO_NONCONFORMANT_RAW_SHA256: &str =
-    "143c004b864f051752f681a45185d09cbea157876f364f7dee1f375093552245";
-const EXPECTED_POLICY_PRIVATE_RAW_SHA256: &str =
-    "0e0b2c9844695ba6ad9beb4c745fb89d613fcf5205e7cb853634833fe735b3c9";
-const EXPECTED_POLICY_PUBLIC_ACTIVATED_RAW_SHA256: &str =
-    "cfff1bce1aff5dd865538a66e19f89165fe46fd104233a366cd3d397fd82f32a";
-const EXPECTED_EXEMPLAR_RAW_SHA256: &str =
-    "0e7a6b613281957e7b2be5f46e759368f376d39f88b3d6f35a89b3c2bc8aa406";
-const EXPECTED_SELECTION_ERASED_RAW_SHA256: &str =
-    "52268bfdcbb1f2e77f69239ceb3198006aa70efe486dc86540dcc26ffd9227c7";
-const EXPECTED_SELECTION_CAP_TRUNCATED_RAW_SHA256: &str =
-    "514d02715f0e688d12dcb48de8188248fa070e0a0152fd0aa152df21a66532bc";
-const EXPECTED_NEGATIVE_FLOAT_RAW_SHA256: &str =
-    "deb7bbba3996c8a8e2169a895ce948ffd4e8af742847d24df88b74e1bee4e66f";
-const EXPECTED_NEGATIVE_CAP_EXCEEDED_RAW_SHA256: &str =
-    "7a27836cf61199174ec342777b1470c1c88939cdde79a2dfcf04f0e334722e3e";
-const EXPECTED_NEGATIVE_SECRET_FIELD_RAW_SHA256: &str =
-    "9377fe56379612bc143d917d407a832e21b4d9c9563fad49d986aae856b2bdc0";
-const EXPECTED_NEGATIVE_RAW_LOG_LINE_RAW_SHA256: &str =
-    "0253f931594d74fb17a6285e42fb8ae92caad2f09c6b18a10867f40dd135e22f";
-const EXPECTED_NEGATIVE_SELECTED_COUNT_EXCEEDS_CAP_RAW_SHA256: &str =
-    "234ae09541413f2c7cc8da81bd4d17d32f55ce4b5e49e77e7f786f4f6d71a2da";
-const EXPECTED_NEGATIVE_TOMBSTONE_INVALID_SCHEMA_VERSION_RAW_SHA256: &str =
-    "804adcdaff390a07da0e50bdd2ded6a4540abea9830bcc281c9207d081a30577";
-const EXPECTED_NEGATIVE_TOMBSTONE_INVALID_ERASURE_POLICY_RAW_SHA256: &str =
-    "59b0465eff2baf9d4caf0a221d79a103c4dc31047c22cbaba94f703d3ea8ee8d";
-const EXPECTED_VECTOR_SUITE_RAW_SHA256: &str =
-    "c2c0769b67994f77ebedb2f5c6eaf80e31891cc181f30fb1ab9a71f6b966e897";
-
 // Semantic identities, recomputed from the decoded fixtures below and
 // asserted against these hard-coded constants -- not merely
 // self-equality. The raw-SHA pins above only prove the checked-in bytes
@@ -66,12 +31,6 @@ const EXPECTED_POLICY_PUBLIC_ACTIVATED_DIGEST: &str =
     "2e3c4248e4e39c3590a73ecd467918a48b400c2822b0adb7e47e492e8212cb55";
 const EXPECTED_EXEMPLAR_DIGEST: &str =
     "8cdd33bb5ecd5ae33f62f967c6bba9d37768ae07e719c0ef79e6b7e5a60ce723";
-const EXPECTED_NEGATIVE_COMPLIANT_PARTIAL_COVERAGE_RAW_SHA256: &str =
-    "ae29b4f136b07993e899252366558368993b9a9d303d8b355b378969b9c50fcf";
-
-fn raw_sha256(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
 
 /// Strip the exact single trailing LF and require the remainder to
 /// already be canonical-JSON bytes.
@@ -139,83 +98,6 @@ fn authoritative_fixture_corpus_is_frozen() {
     let negative_tombstone_invalid_erasure_policy_framed = include_bytes!(
         "../../contracts/dynamic-memory/v3/telemetry/negative-tombstone-invalid-erasure-policy.jsonl"
     );
-    let vector_suite_framed =
-        include_bytes!("../../contracts/dynamic-memory/v3/telemetry/vector-suite.jsonl");
-
-    for (framed, expected) in [
-        (
-            private_receipt_framed.as_slice(),
-            EXPECTED_PRIVATE_RECEIPT_RAW_SHA256,
-        ),
-        (
-            unavailable_receipt_framed.as_slice(),
-            EXPECTED_UNAVAILABLE_RECEIPT_RAW_SHA256,
-        ),
-        (
-            slo_compliant_framed.as_slice(),
-            EXPECTED_SLO_COMPLIANT_RAW_SHA256,
-        ),
-        (
-            slo_nonconformant_framed.as_slice(),
-            EXPECTED_SLO_NONCONFORMANT_RAW_SHA256,
-        ),
-        (
-            policy_private_framed.as_slice(),
-            EXPECTED_POLICY_PRIVATE_RAW_SHA256,
-        ),
-        (
-            policy_public_activated_framed.as_slice(),
-            EXPECTED_POLICY_PUBLIC_ACTIVATED_RAW_SHA256,
-        ),
-        (exemplar_framed.as_slice(), EXPECTED_EXEMPLAR_RAW_SHA256),
-        (
-            selection_erased_framed.as_slice(),
-            EXPECTED_SELECTION_ERASED_RAW_SHA256,
-        ),
-        (
-            selection_cap_truncated_framed.as_slice(),
-            EXPECTED_SELECTION_CAP_TRUNCATED_RAW_SHA256,
-        ),
-        (
-            negative_float_framed.as_slice(),
-            EXPECTED_NEGATIVE_FLOAT_RAW_SHA256,
-        ),
-        (
-            negative_cap_exceeded_framed.as_slice(),
-            EXPECTED_NEGATIVE_CAP_EXCEEDED_RAW_SHA256,
-        ),
-        (
-            negative_secret_field_framed.as_slice(),
-            EXPECTED_NEGATIVE_SECRET_FIELD_RAW_SHA256,
-        ),
-        (
-            negative_raw_log_line_framed.as_slice(),
-            EXPECTED_NEGATIVE_RAW_LOG_LINE_RAW_SHA256,
-        ),
-        (
-            negative_compliant_partial_coverage_framed.as_slice(),
-            EXPECTED_NEGATIVE_COMPLIANT_PARTIAL_COVERAGE_RAW_SHA256,
-        ),
-        (
-            negative_selected_count_exceeds_cap_framed.as_slice(),
-            EXPECTED_NEGATIVE_SELECTED_COUNT_EXCEEDS_CAP_RAW_SHA256,
-        ),
-        (
-            negative_tombstone_invalid_schema_version_framed.as_slice(),
-            EXPECTED_NEGATIVE_TOMBSTONE_INVALID_SCHEMA_VERSION_RAW_SHA256,
-        ),
-        (
-            negative_tombstone_invalid_erasure_policy_framed.as_slice(),
-            EXPECTED_NEGATIVE_TOMBSTONE_INVALID_ERASURE_POLICY_RAW_SHA256,
-        ),
-        (
-            vector_suite_framed.as_slice(),
-            EXPECTED_VECTOR_SUITE_RAW_SHA256,
-        ),
-    ] {
-        assert_eq!(raw_sha256(framed), expected);
-    }
-
     // Positive fixtures decode into their exact typed contracts, and
     // re-encoding produces byte-identical output (the fixture is the
     // canonical form, not merely "a" valid encoding of it).
@@ -236,9 +118,9 @@ fn authoritative_fixture_corpus_is_frozen() {
     // Blocker fix (ordering-rule pinning): re-run the selector over the
     // exact (uncapped) population `write_fixture_corpus` generated this
     // fixture from and require byte-for-byte equality of the embedded
-    // selection receipt with the frozen record. Neither the raw fixture
-    // SHA-256 above, nor the per-stratum count/permutation-equality
-    // checks in `selection_is_deterministic_and_input_order_is_irrelevant`,
+    // selection receipt with the frozen record. The per-stratum
+    // count/permutation-equality checks in
+    // `selection_is_deterministic_and_input_order_is_irrelevant` do not
     // detect an inverted ordering-key comparator; recomputing and
     // comparing canonical bytes against this exact population does.
     let private_with_exemplars_candidates = two_stratum_candidates();

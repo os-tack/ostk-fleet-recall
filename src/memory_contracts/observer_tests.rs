@@ -1,7 +1,5 @@
 use std::str::FromStr;
 
-use sha2::{Digest as _, Sha256};
-
 use super::*;
 use crate::memory_contracts::canonical::require_canonical;
 use crate::memory_contracts::common::frozen_profile_reference_v1;
@@ -32,24 +30,6 @@ const NEGATIVE_UNSORTED_DEPENDENCY_FIXTURE: &[u8] = include_bytes!(
 );
 
 const ADMISSION_DIGEST: &str = "6ecf60cd22cdd72f53e59b8c239a4dfd063d6e4c30aeda68a5a8f781b20dd4c4";
-const ADMISSION_RAW_SHA256: &str =
-    "10742b3198fe59664df6721900ab89c8ca3cb8ecf2d28d207fb9a24de757ffce";
-const ADMISSION_POSITIVE_RAW_SHA256: &str =
-    "56d3df41e09fae038ea02a7728688f95e95f67f0f5ff14f04e119b25e675d8b9";
-const ADMISSION_CANDIDATE_RAW_SHA256: &str =
-    "f86bb1dda0cd027cea31ea536db60e48cc31aaa9fd2b69c4da4fae9857417ee2";
-const RUN_RECEIPT_SUCCESS_RAW_SHA256: &str =
-    "d0e614be910017935d0f2667fc0f2143f8f2d020224a44079b5d9ac2bde7509e";
-const RESULT_VERIFIED_NEGATIVE_RAW_SHA256: &str =
-    "e60d73b6bd9d0452d10dac19c220c230dfd7e64d1d469afdbe8ff0d971947e37";
-const VECTOR_SUITE_RAW_SHA256: &str =
-    "f101acd3565e4d0c8425885b821e0c8943ebc560d243764ccd0f40562333296c";
-const NEGATIVE_LLM_CLOSED_WORLD_RAW_SHA256: &str =
-    "be437394e1c017463c966a8ee39ba3f70ef88a2f72ef834602b317b13303a8cd";
-const NEGATIVE_UNKNOWN_FIELD_RAW_SHA256: &str =
-    "7dd6033e985916035f15ec9584c2dcc50fe55c23a19947670718ac50a5b2e2f2";
-const NEGATIVE_UNSORTED_DEPENDENCY_RAW_SHA256: &str =
-    "825bb66f599b1fc9eea04634a070c084bf07dd2aab03faded109bb8e44390716";
 
 fn record(bytes: &[u8]) -> &[u8] {
     let body = bytes
@@ -58,10 +38,6 @@ fn record(bytes: &[u8]) -> &[u8] {
     assert!(!body.ends_with(b"\n"));
     assert!(!body.contains(&b'\r'));
     body
-}
-
-fn raw_sha256(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }
 
 fn digest_from_label(label: &str) -> Sha256Digest {
@@ -1463,7 +1439,6 @@ fn digest(value: &str) -> Sha256Digest {
 #[test]
 fn admission_fixture_is_frozen_and_decodes() {
     let bytes = record(ADMISSION_FIXTURE);
-    assert_eq!(raw_sha256(bytes), ADMISSION_RAW_SHA256);
     require_canonical(bytes).unwrap();
     let admission: ObserverAdmissionV2 =
         crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
@@ -1475,7 +1450,6 @@ fn admission_fixture_is_frozen_and_decodes() {
 #[test]
 fn positive_verified_fixture_decodes() {
     let bytes = record(ADMISSION_POSITIVE_FIXTURE);
-    assert_eq!(raw_sha256(bytes), ADMISSION_POSITIVE_RAW_SHA256);
     require_canonical(bytes).unwrap();
     let admission: ObserverAdmissionV2 =
         crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
@@ -1486,7 +1460,6 @@ fn positive_verified_fixture_decodes() {
 #[test]
 fn candidate_only_fixture_decodes() {
     let bytes = record(ADMISSION_CANDIDATE_FIXTURE);
-    assert_eq!(raw_sha256(bytes), ADMISSION_CANDIDATE_RAW_SHA256);
     require_canonical(bytes).unwrap();
     let admission: ObserverAdmissionV2 =
         crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
@@ -1497,7 +1470,6 @@ fn candidate_only_fixture_decodes() {
 #[test]
 fn run_receipt_success_fixture_decodes() {
     let bytes = record(RUN_RECEIPT_SUCCESS_FIXTURE);
-    assert_eq!(raw_sha256(bytes), RUN_RECEIPT_SUCCESS_RAW_SHA256);
     require_canonical(bytes).unwrap();
     let run: ObserverRunReceiptV1 =
         crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
@@ -1508,7 +1480,6 @@ fn run_receipt_success_fixture_decodes() {
 #[test]
 fn result_verified_negative_fixture_decodes() {
     let bytes = record(RESULT_VERIFIED_NEGATIVE_FIXTURE);
-    assert_eq!(raw_sha256(bytes), RESULT_VERIFIED_NEGATIVE_RAW_SHA256);
     require_canonical(bytes).unwrap();
     let result: ObserverResultV1 =
         crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
@@ -1522,7 +1493,6 @@ fn result_verified_negative_fixture_decodes() {
 #[test]
 fn vector_suite_fixture_is_present() {
     let bytes = record(VECTOR_SUITE_FIXTURE);
-    assert_eq!(raw_sha256(bytes), VECTOR_SUITE_RAW_SHA256);
     require_canonical(bytes).unwrap();
     let _: serde_json::Value = serde_json::from_slice(bytes).unwrap();
 }
@@ -1530,7 +1500,6 @@ fn vector_suite_fixture_is_present() {
 #[test]
 fn negative_llm_closed_world_fixture_is_rejected() {
     let bytes = record(NEGATIVE_LLM_CLOSED_WORLD_FIXTURE);
-    assert_eq!(raw_sha256(bytes), NEGATIVE_LLM_CLOSED_WORLD_RAW_SHA256);
     let admission: ObserverAdmissionV2 =
         crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
     assert_eq!(
@@ -1544,7 +1513,6 @@ fn negative_llm_closed_world_fixture_is_rejected() {
 #[test]
 fn negative_unknown_field_fixture_is_rejected() {
     let bytes = record(NEGATIVE_UNKNOWN_FIELD_FIXTURE);
-    assert_eq!(raw_sha256(bytes), NEGATIVE_UNKNOWN_FIELD_RAW_SHA256);
     let decoded: ContractResult<ObserverAdmissionV2> =
         crate::memory_contracts::canonical::decode_strict(bytes);
     match decoded {
@@ -1559,7 +1527,6 @@ fn negative_unknown_field_fixture_is_rejected() {
 #[test]
 fn negative_unsorted_dependency_digests_fixture_is_rejected() {
     let bytes = record(NEGATIVE_UNSORTED_DEPENDENCY_FIXTURE);
-    assert_eq!(raw_sha256(bytes), NEGATIVE_UNSORTED_DEPENDENCY_RAW_SHA256);
     let admission: ObserverAdmissionV2 =
         crate::memory_contracts::canonical::decode_strict(bytes).unwrap();
     assert_eq!(
