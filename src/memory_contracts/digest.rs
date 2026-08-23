@@ -385,6 +385,12 @@ pub enum DigestDomain {
     /// the admission digest, the run receipt digest, and the result
     /// fingerprint.
     ObserverRunRecordV1, // W3-OBSRT
+    // --- W3-DISC domains ---
+    /// W3-DISC. Identity of one episode relation record
+    /// (`DiscrepancyEpisodeRelationV1`) as appended to the discrepancy
+    /// ledger — used to make a replayed relation append idempotent rather
+    /// than double-applied.
+    DiscrepancyEpisodeRelationV1, // W3-DISC
 }
 
 impl DigestDomain {
@@ -547,6 +553,8 @@ impl DigestDomain {
             Self::ObserverRunInputV1 => "ostk-observer-run-input-v1",     // W3-OBSRT
             Self::ObserverRunOutputV1 => "ostk-observer-run-output-v1",   // W3-OBSRT
             Self::ObserverRunRecordV1 => "ostk-observer-run-record-v1",   // W3-OBSRT
+            // --- W3-DISC prefixes ---
+            Self::DiscrepancyEpisodeRelationV1 => "ostk-discrepancy-episode-relation-v1", // W3-DISC
         }
     }
 }
