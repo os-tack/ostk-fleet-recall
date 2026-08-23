@@ -1,4 +1,5 @@
 README.md|project
+contracts/dynamic-memory/README.md|memory_contracts
 contracts/dynamic-memory/v1/README.md|memory_contracts
 contracts/dynamic-memory/v1/genesis-activation/README.md|genesis_activation
 contracts/dynamic-memory/v2/evidence/README.md|memory_contracts
