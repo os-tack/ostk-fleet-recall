@@ -248,6 +248,8 @@ const RECALL_VISIBILITY_MIGRATION_SQL: &str =
 const NORMATIVE_ACTIVATION_MIGRATION_SQL: &str =
     include_str!("../../migrations/0024_normative_activation.sql");
 const CI_CONNECTOR_MIGRATION_SQL: &str = include_str!("../../migrations/0026_ci_connector.sql");
+const DISCREPANCY_LEDGER_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0027_discrepancy_ledger.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -289,7 +291,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
     ]
 }
 
-fn post_transactional_online_migrations() -> [Migration; 11] {
+fn post_transactional_online_migrations() -> [Migration; 12] {
     [
         Migration::new(
             15,
@@ -390,6 +392,17 @@ fn post_transactional_online_migrations() -> [Migration; 11] {
             // added no migration and is absent here on purpose; SQLx orders
             // migrations by version and does not require them to be
             // contiguous.
+            true,
+        ),
+        Migration::new(
+            27,
+            Cow::Borrowed("discrepancy ledger head, log, relations, and projection"),
+            MigrationType::Simple,
+            Cow::Borrowed(DISCREPANCY_LEDGER_MIGRATION_SQL),
+            // W3-DISC. Additive: four new tables and one unique index.
+            // CockroachDB requires this DDL outside SQLx's transaction
+            // wrapper, like migrations 0018-0026. Version 25 remains the
+            // deliberate permanent gap.
             true,
         ),
     ]
