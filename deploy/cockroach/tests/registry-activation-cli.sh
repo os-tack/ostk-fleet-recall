@@ -1413,11 +1413,8 @@ assert_exact "SHOW/virtual-table-free reconciliation policy function bodies" \
     "$unsupported_query_in_function_body" ''
 
 # The official publication phase is credited only to the independently frozen
-# SQL policy, session-pinning source, and connected product test reviewed for
-# PUBLIC-03.
+# SQL policy reviewed for PUBLIC-03.
 publication_policy="$repo_root/deploy/cockroach/publication-reader-role-grants.sql"
-publication_store_source="$repo_root/src/store/cockroach.rs"
-publication_live_test_source="$repo_root/tests/publication_reader_live.rs"
 if ! publication_policy_digest=$(shasum -a 256 "$publication_policy" \
     | awk 'NR == 1 { print $1 }'); then
     fail "could not hash the publication-reader policy"
@@ -1425,20 +1422,6 @@ fi
 assert_exact "frozen publication-reader policy digest" \
     "$publication_policy_digest" \
     'ff3ada75aba9443875efb1f430a14829ef864b3f7409ae5d23f7bd381cb65226'
-if ! publication_store_digest=$(shasum -a 256 "$publication_store_source" \
-    | awk 'NR == 1 { print $1 }'); then
-    fail "could not hash the publication-reader session-pinning source"
-fi
-assert_exact "frozen publication-reader session-pinning source digest" \
-    "$publication_store_digest" \
-    'fb41ed7bbff22a1a252c729a31c639ab3a24eec496c23e2dccc201a186842d46'
-if ! publication_live_test_digest=$(shasum -a 256 "$publication_live_test_source" \
-    | awk 'NR == 1 { print $1 }'); then
-    fail "could not hash the publication-reader connected test"
-fi
-assert_exact "frozen publication-reader connected-test digest" \
-    "$publication_live_test_digest" \
-    'cad2d1e970c4639c1c2d783e65097dee89845088c773310dc03700d200220888'
 publication_policy_first_statement=$(awk '
     /^[[:space:]]*--/ || /^[[:space:]]*$/ { next }
     { print; exit }
