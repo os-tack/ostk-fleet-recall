@@ -120,7 +120,7 @@ fi
 # silently bind to an unrelated ancestor or user-level OS instance.
 ostk_state=$repo_root/.ostk
 [ ! -L "$ostk_state" ] && [ -d "$ostk_state" ] || \
-    ostk_demo_die 'optional live OSTK demo is not initialized here; Fleet Recall and the VHS rehearsal do not require OSTK (see docs/OSTK_DEMO.md)'
+    ostk_demo_die 'optional live OSTK demo is not initialized here; Fleet Recall does not require OSTK (see docs/OSTK_DEMO.md)'
 for state_file in .language .primefile version; do
     [ -f "$ostk_state/$state_file" ] && [ ! -L "$ostk_state/$state_file" ] || \
         ostk_demo_die "optional live OSTK project is incomplete: $ostk_state/$state_file"

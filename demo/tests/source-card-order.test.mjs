@@ -167,7 +167,7 @@ test('safe inline markdown emits only the allowlisted DOM elements',()=>{
 test('HTTPS autolinks and immutable repository-relative links render safely',()=>{
   const revision='b'.repeat(40);
   const source={
-    source_id:'docs/VIDEO_DEMO.md',
+    source_id:'docs/ARCHITECTURE.md',
     extra:{source_revision:revision},
   };
   const tokens=plain(markdownContext.inlineMarkdownTokens(
@@ -196,7 +196,7 @@ test('HTTPS autolinks and immutable repository-relative links render safely',()=
 
 test('a wholly inline-code repository link label renders without backticks',()=>{
   const revision='d'.repeat(40);
-  const source={source_id:'docs/VIDEO_DEMO.md',extra:{source_revision:revision}};
+  const source={source_id:'docs/ARCHITECTURE.md',extra:{source_revision:revision}};
   const rendered=markdownDomContext.renderInlineMarkdown(
     '[`ARCHITECTURE.md`](ARCHITECTURE.md)',
     source,
@@ -220,7 +220,7 @@ test('a wholly inline-code repository link label renders without backticks',()=>
 
 test('repository-relative links fail closed on unsafe context or destination',()=>{
   const revision='c'.repeat(40);
-  const source={source_id:'docs/VIDEO_DEMO.md',extra:{source_revision:revision}};
+  const source={source_id:'docs/ARCHITECTURE.md',extra:{source_revision:revision}};
   const unsafe='[up](../README.md) [root](/README.md) [network](//evil.example/x) '
     +'[encoded](%2e%2e/README.md) [query](ARCHITECTURE.md?raw=1) '
     +'[scheme](javascript:alert(1)) [credentials](https://user@example.com/x)';
@@ -230,8 +230,8 @@ test('repository-relative links fail closed on unsafe context or destination',()
   );
 
   for(const unsafeSource of [
-    {source_id:'docs/VIDEO_DEMO.md',extra:{source_revision:'0'.repeat(40)}},
-    {source_id:'docs/../VIDEO_DEMO.md',extra:{source_revision:revision}},
+    {source_id:'docs/ARCHITECTURE.md',extra:{source_revision:'0'.repeat(40)}},
+    {source_id:'docs/../ARCHITECTURE.md',extra:{source_revision:revision}},
     {source_id:'conversation/not-a-repository-path',extra:{source_revision:revision}},
   ]){
     const markdown='[ARCHITECTURE.md](ARCHITECTURE.md)';

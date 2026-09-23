@@ -187,17 +187,11 @@ in this contract-only stage, only a `#[cfg(test)]` witness. The
 module can actually make — neither `QuarantineRecordV1` nor
 `QuarantinedDeliveryV1` implements `From`/`Into` for any type in this crate
 today, and neither exposes a method returning an evidence or remember
-accepted-event type — and that claim is machine-checked by a source
-self-audit test, `source_self_audit_projectable_types_expose_no_conversion`
-in `quarantine.rs`, which scans the module's own text (excluding comments)
-for exactly those patterns and fails if any appear. A second, separate test,
-`not_projectable_marker_is_implemented`, checks only that both types
-implement the empty marker trait — that one is a shape check, not a
-guarantee check; the self-audit test is what actually enforces the claim.
-Rust still has no mechanism to forbid a future conversion impl written
-against these public types from some other module in the crate; within this
-file, today, "no conversion exists" is compiler-run, not merely
-reviewer-facing.
+accepted-event type. A test, `not_projectable_marker_is_implemented`,
+checks that both types implement the empty marker trait. Rust has no
+mechanism to forbid a future conversion impl written against these public
+types from some other module in the crate, so keeping them non-projectable
+is a review rule, not a compiler guarantee.
 
 ## Vectors
 

@@ -102,7 +102,8 @@ fallback. Serializable isolation is the fence — no separate CAS. A decode cach
 the pinned bootstrap root is verified at startup and on any observed activation-ID change, with
 the verdict cached per exact activation ID.
 
-`FleetConfig` gains `FLEET_RECALL_CONTRACT_TENANT_NAMESPACE`,
+`WriterAuthorityConfig::from_env` (not the serving `FleetConfig`) reads
+`FLEET_RECALL_CONTRACT_TENANT_NAMESPACE`,
 `FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE`, `FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST` (all three
 required for the event-first path; when absent the `assert` route is disabled and every legacy
 behaviour is byte-stable) and an optional break-glass `FLEET_RECALL_EXPECTED_ACTIVATION_ID` that
