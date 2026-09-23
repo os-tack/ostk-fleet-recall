@@ -1211,6 +1211,11 @@ impl<'source> Scanner<'source> {
 mod tests {
     use super::*;
 
+    /// A frozen snapshot of a real-world Rust module that declares the
+    /// `RememberAction` and `RecallAction` enums. It is a checked-in fixture,
+    /// not the live `src/service.rs`, so that module can change freely.
+    const SERVICE_SOURCE: &str = include_str!("fixtures/service.rs.txt");
+
     fn enumerate(source: &str) -> RustEnumEnumerationV1 {
         enumerate_rust_enum(source, "Action", 64).unwrap()
     }
@@ -1520,10 +1525,10 @@ mod tests {
     #[test]
     fn a_crafted_attribute_cannot_make_the_real_enum_look_exhaustive() {
         // The observed blob is untrusted by construction, so "a source file
-        // written to defeat this reader" is in the threat model. Here the real
+        // written to defeat this reader" is in the threat model. Here a real
         // file is crafted so that a brace-and-semicolon token tree sits between
         // the reader and a `#[non_exhaustive]`.
-        let source = include_str!("../service.rs").replace(
+        let source = SERVICE_SOURCE.replace(
             "pub enum RememberAction {",
             "#[non_exhaustive]\n#[rewrites_the_item { and; a; semicolon }]\npub enum RememberAction {",
         );
@@ -1535,7 +1540,7 @@ mod tests {
         );
         assert!(ids(&enumeration).contains(&DIAGNOSTIC_NON_EXHAUSTIVE));
         assert!(ids(&enumeration).contains(&DIAGNOSTIC_ENUM_ATTRIBUTE));
-        // `Deploy` really is absent from the real enum. A read that cannot
+        // `Deploy` really is absent from the fixture's enum. A read that cannot
         // prove it saw the whole set still must not be allowed to say so, and
         // downstream only ever learns that through the diagnostics.
         assert!(!enumeration.contains("Deploy"));
@@ -1543,7 +1548,7 @@ mod tests {
 
     #[test]
     fn the_real_remember_action_enum_enumerates_exhaustively() {
-        let source = include_str!("../service.rs");
+        let source = SERVICE_SOURCE;
         let enumeration = enumerate_rust_enum(source, "RememberAction", 64).unwrap();
         assert!(
             enumeration.exhaustive(),
@@ -1644,7 +1649,7 @@ mod tests {
 
     #[test]
     fn a_crafted_blob_cannot_report_a_present_variant_as_absent() {
-        // End to end on the real file. The observed blob is untrusted by
+        // End to end on a real file. The observed blob is untrusted by
         // construction and this one genuinely IS the object a pin would name,
         // so no integrity check upstream can catch it: the entire defence is
         // the reader refusing to call a read exhaustive when it cannot prove it
@@ -1652,7 +1657,7 @@ mod tests {
         // is hidden behind a net-negative brace count — which is exactly a
         // verified negative asserting that `forget` is not an allowed remember
         // action, the worst output this subsystem can produce.
-        let source = include_str!("../service.rs")
+        let source = SERVICE_SOURCE
             .replace(
                 "pub enum RememberAction {",
                 "#[doc( } )]\n{\n#[non_exhaustive]\npub enum RememberAction {",

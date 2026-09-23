@@ -12,8 +12,8 @@
 //! ~600 lines of ceremony in `tests/`, alongside the frozen contract artifacts
 //! the ceremony is pinned to. An `examples/` binary would have to duplicate all
 //! of it into `src/` (widening the production surface for a demo) or into a new
-//! crate. A `--test` binary also runs under exactly the harness the wave-close
-//! official-binary lane already drives.
+//! crate. A `--test` binary also runs under the same `cargo test` harness as
+//! every other live suite.
 //!
 //! # Running it
 //!

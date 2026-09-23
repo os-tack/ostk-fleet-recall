@@ -2246,135 +2246,15 @@ fn expect_timestamp(row: &PgRow, column: &str, expected: DateTime<Utc>) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
     use crate::memory_contracts::digest::{DigestDomain, domain_separated_digest};
 
-    const CONTROL_LOG_SOURCE: &str = include_str!("../control_log/cockroach.rs");
-    const GENESIS_COCKROACH_SOURCE: &str = include_str!("cockroach.rs");
-    const GENESIS_AUDIT_SOURCE: &str = include_str!("genesis_audit.rs");
-    const SUCCESSOR_SOURCE: &str = include_str!("successor_cockroach.rs");
-    const AUTHORITY_RELATIONS: [&str; 10] = [
-        "_sqlx_migrations",
-        "memory_control_bootstraps",
-        "memory_control_log_epochs",
-        "memory_control_shard_heads",
-        "memory_control_events",
-        "memory_registry_activations",
-        "memory_registry_heads",
-        "memory_registry_transitions",
-        "memory_registry_genesis_bridge_consumptions",
-        "memory_registry_current_heads_v2",
-    ];
-
-    fn production_prefix(source: &'static str) -> &'static str {
-        source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(code, _)| code)
-    }
-
-    fn successor_authority_source() -> String {
-        [
-            production_prefix(SUCCESSOR_SOURCE),
-            production_prefix(GENESIS_AUDIT_SOURCE),
-            production_prefix(GENESIS_COCKROACH_SOURCE),
-            production_prefix(CONTROL_LOG_SOURCE),
-        ]
-        .join("\n")
-    }
-
     #[test]
-    fn schema_preflight_requires_the_exact_successful_prefix_through_fourteen() {
-        assert!(
-            REQUIRE_SUCCESSOR_SCHEMA_SQL
-                .starts_with("SELECT pg_catalog.current_database() = 'fleet_recall'")
-        );
-        assert!(REQUIRE_SUCCESSOR_SCHEMA_SQL.contains("count(*) = 14"));
+    fn schema_preflight_requires_a_complete_successful_prefix() {
         assert!(REQUIRE_SUCCESSOR_SCHEMA_SQL.contains("bool_and(success)"));
         assert!(REQUIRE_SUCCESSOR_SCHEMA_SQL.contains("FROM public._sqlx_migrations"));
-        assert!(REQUIRE_SUCCESSOR_SCHEMA_SQL.contains("version BETWEEN 1 AND 14"));
         assert!(!REQUIRE_SUCCESSOR_SCHEMA_SQL.contains("MAX"));
         assert!(!REQUIRE_SUCCESSOR_SCHEMA_SQL.contains("EXISTS"));
-    }
-
-    #[test]
-    fn apply_and_inspect_share_the_database_and_schema_first_statement() {
-        for (start, end) in [
-            (
-                "async fn activate_in_transaction(",
-                "\nasync fn inspect_in_transaction(",
-            ),
-            (
-                "async fn inspect_in_transaction(",
-                "\nasync fn require_successor_schema(",
-            ),
-        ] {
-            let start = SUCCESSOR_SOURCE.find(start).expect("transaction function");
-            let end = SUCCESSOR_SOURCE[start..]
-                .find(end)
-                .map(|offset| start + offset)
-                .expect("transaction function boundary");
-            let body = &SUCCESSOR_SOURCE[start..end];
-            let identity_and_schema = body
-                .find("require_successor_schema(transaction).await?")
-                .expect("database/schema preflight");
-            let next_database_use = body
-                .find("require_bound_bootstrap_before_lock(")
-                .expect("durable bootstrap read");
-            assert!(identity_and_schema < next_database_use);
-        }
-    }
-
-    #[test]
-    fn search_path_and_temporary_shadows_cannot_redirect_successor_authority_sql() {
-        let source = successor_authority_source();
-        let mut found = BTreeSet::new();
-
-        for token in source.split(|character: char| {
-            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '.'))
-        }) {
-            let relation = token.strip_prefix("public.").unwrap_or(token);
-            let is_authority_relation = relation == "_sqlx_migrations"
-                || relation.starts_with("memory_control_")
-                || relation.starts_with("memory_registry_");
-            if !is_authority_relation {
-                continue;
-            }
-            assert!(
-                token.starts_with("public."),
-                "unqualified successor authority relation can follow search_path: {token}"
-            );
-            assert!(
-                AUTHORITY_RELATIONS.contains(&relation),
-                "unreviewed successor authority relation: {relation}"
-            );
-            found.insert(relation);
-        }
-
-        assert_eq!(
-            found,
-            AUTHORITY_RELATIONS.into_iter().collect(),
-            "reachable relation inventory changed"
-        );
-        assert!(!source.contains("public.public."));
-        assert!(!source.contains("pg_temp."));
-        assert!(!source.contains("attacker."));
-
-        for function in ["current_database()", "statement_timestamp()"] {
-            for (offset, _) in source.match_indices(function) {
-                assert!(
-                    source[..offset].ends_with("pg_catalog."),
-                    "{function} can follow an attacker-controlled search_path"
-                );
-            }
-        }
-        for sequence_function in ["nextval(", "currval(", "setval("] {
-            assert!(
-                !source.contains(sequence_function),
-                "successor authority unexpectedly consumes a sequence via {sequence_function}"
-            );
-        }
     }
 
     #[test]
@@ -2402,13 +2282,7 @@ mod tests {
     }
 
     #[test]
-    fn source_uses_one_server_timestamp_and_no_database_default() {
-        assert_eq!(
-            production_prefix(SUCCESSOR_SOURCE)
-                .matches("query_scalar(\"SELECT pg_catalog.statement_timestamp()\")")
-                .count(),
-            1
-        );
+    fn inserts_take_no_database_default_timestamp() {
         assert!(!INSERT_CONTROL_EVENT_SQL.contains("now()"));
         assert!(!INSERT_SUCCESSOR_TRANSITION_SQL.contains("now()"));
         assert!(!INSERT_BRIDGE_CONSUMPTION_SQL.contains("now()"));

@@ -491,39 +491,6 @@ mod tests {
         );
     }
 
-    /// Test-harness-only emitter used by the disposable connected CLI proof.
-    /// The production parser has no signing or artifact-generation command.
-    #[test]
-    fn emit_time_bound_ceremony_for_connected_proof() {
-        let Ok(directory) = std::env::var("FLEET_RECALL_REGISTRY_CLI_FIXTURE_DIR") else {
-            return;
-        };
-        let effective_from = std::env::var("FLEET_RECALL_REGISTRY_CLI_EFFECTIVE_FROM")
-            .expect("connected proof must bind one server timestamp");
-        let effective_from = CanonicalTimestamp::parse(effective_from).unwrap();
-        let stale_effective_from = std::env::var("FLEET_RECALL_REGISTRY_CLI_STALE_EFFECTIVE_FROM")
-            .expect("connected proof must bind a distinct proposal timestamp");
-        let stale_effective_from = CanonicalTimestamp::parse(stale_effective_from).unwrap();
-        let (statement, approvals) = time_bound_ceremony(effective_from.clone(), [1, 2]);
-        let (_, alternate_approvals) = time_bound_ceremony(effective_from, [1, 3]);
-        let (stale_statement, stale_approvals) = time_bound_ceremony(stale_effective_from, [1, 2]);
-        let directory = Path::new(&directory);
-        write_framed_record(&directory.join("activation-statement.jsonl"), statement);
-        write_framed_record(&directory.join("activation-approval-set.jsonl"), approvals);
-        write_framed_record(
-            &directory.join("activation-approval-set-alternate.jsonl"),
-            alternate_approvals,
-        );
-        write_framed_record(
-            &directory.join("activation-statement-stale.jsonl"),
-            stale_statement,
-        );
-        write_framed_record(
-            &directory.join("activation-approval-set-stale.jsonl"),
-            stale_approvals,
-        );
-    }
-
     #[test]
     fn authority_and_transport_are_not_cli_routing_inputs() {
         let valid = [

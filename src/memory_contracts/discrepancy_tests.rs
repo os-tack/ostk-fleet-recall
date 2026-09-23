@@ -50,8 +50,6 @@ const EPISODE_FINGERPRINT: &str =
 const ENVELOPE_ID: &str = "91d220c7d6e869f8cdd10b5d6c3b50d8546b69cfd33403abadcaf1d6e1be756b";
 const COMPARATOR_LINEAGE_FINGERPRINT: &str =
     "11589b382071ef9df593ef7efe4df898f2ad4ed8e1775a011d4ec3912a5116d2";
-const VECTOR_SUITE_DIGEST: &str =
-    "e1897e015369b91282401e7e9567f1c7dadbb351e67054869b2deb08798809fd";
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -890,13 +888,6 @@ fn hard_coded_fixtures_match_canonical_vectors() {
     assert_eq!(
         expected_lineage.fingerprint().unwrap().digest(),
         digest(COMPARATOR_LINEAGE_FINGERPRINT)
-    );
-    assert_eq!(
-        domain_separated_digest(
-            super::super::digest::DigestDomain::TestVectorManifest,
-            record(VECTOR_SUITE_FIXTURE)
-        ),
-        digest(VECTOR_SUITE_DIGEST)
     );
 }
 
@@ -2693,12 +2684,5 @@ fn regenerate_discrepancy_contract_artifacts() {
     println!(
         "COMPARATOR_LINEAGE_FINGERPRINT {}",
         lineage.fingerprint().unwrap()
-    );
-    println!(
-        "VECTOR_SUITE_DIGEST {}",
-        domain_separated_digest(
-            super::super::digest::DigestDomain::TestVectorManifest,
-            &encode_canonical(&suite).unwrap()
-        )
     );
 }

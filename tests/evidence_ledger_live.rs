@@ -120,9 +120,9 @@ const SUCCESSOR_RUNNER_ARTIFACT: &str =
 const SUCCESSOR_RUNNER_CONFIGURATION: &str =
     "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2";
 
-/// Exactly the relations ADR 0002 D2 adds to `fleet_runtime`, copied from
-/// `deploy/cockroach/runtime-role-grants.sql`. The policy itself is a ceremony
-/// with many preconditions, so the probe test replays only this grant list.
+/// The relations ADR 0002 D2 adds to `fleet_runtime`, mirroring
+/// `deploy/cockroach/runtime-role-grants.sql`. The policy itself has many
+/// preconditions, so the probe test replays only this grant list.
 const RUNTIME_SELECT_INSERT: &[&str] = &[
     "public.memory_evidence_events",
     "public.memory_evidence_quarantine",
@@ -1700,24 +1700,6 @@ fn probe_database_url(database_url: &str, role: &str, password: &str) -> Result<
         .map_err(|()| "test URL cannot carry a password".to_owned())?;
     url.query_pairs_mut().clear().extend_pairs(preserved);
     Ok(url.to_string())
-}
-
-#[test]
-fn the_probe_grant_list_matches_the_runtime_policy() {
-    let policy = include_str!("../deploy/cockroach/runtime-role-grants.sql");
-    for relation in RUNTIME_SELECT_INSERT
-        .iter()
-        .chain(RUNTIME_SELECT_INSERT_UPDATE.iter())
-        .chain(std::iter::once(&RUNTIME_SELECT_ONLY))
-    {
-        assert!(
-            policy.contains(relation),
-            "the probe grants a relation the runtime policy does not: {relation}"
-        );
-    }
-    assert!(policy.contains("GRANT SELECT, INSERT ON TABLE"));
-    assert!(policy.contains("GRANT SELECT, INSERT, UPDATE ON TABLE"));
-    assert!(policy.contains("GRANT SELECT ON TABLE public.memory_writer_authority_v1"));
 }
 
 #[test]

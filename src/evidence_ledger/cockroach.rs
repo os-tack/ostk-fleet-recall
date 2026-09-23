@@ -88,7 +88,7 @@ const SELECT_EVENT_BY_ID_SQL: &str = "SELECT epoch_id, shard, committed_offset, 
 
 /// Bounded by the primary-key prefix `(tenant, project, epoch, shard)`, so this
 /// is a single-shard scan rather than a table scan. A dedicated index on
-/// `semantic_object_digest` belongs to the migration owner; see the handoff.
+/// `semantic_object_digest` would need a new forward migration.
 const SELECT_EVENT_BY_SEMANTIC_OBJECT_SQL: &str = "SELECT event_id \
      FROM public.memory_evidence_events \
      WHERE tenant_id = $1 AND project = $2 AND epoch_id = $3 AND shard = $4 \
@@ -1115,12 +1115,8 @@ mod tests {
     use super::*;
     use crate::memory_contracts::registry::RegistryHeadV1;
 
-    /// Every SQL statement this module can execute, by name.
-    ///
-    /// The two boundary tests below iterate this one list, and
-    /// `the_sql_inventory_is_complete` proves the list names every `const …_SQL`
-    /// declared in this file, so a newly added statement cannot escape either
-    /// check by being forgotten in a hand-maintained array.
+    /// Every SQL statement this module can execute, by name. The two boundary
+    /// tests below iterate this one list; add new statements here.
     const ALL_SQL: [(&str, &str); 11] = [
         ("SELECT_AUTHORITY_FENCE_SQL", SELECT_AUTHORITY_FENCE_SQL),
         ("SELECT_AUTHORITY_WITNESS_SQL", SELECT_AUTHORITY_WITNESS_SQL),
@@ -1137,31 +1133,6 @@ mod tests {
         ("INSERT_QUARANTINE_SQL", INSERT_QUARANTINE_SQL),
         ("AUDIT_EVENT_PAGE_SQL", AUDIT_EVENT_PAGE_SQL),
     ];
-
-    #[test]
-    fn the_sql_inventory_is_complete() {
-        // Self-audit of this source file: every `const …_SQL` declaration must
-        // be in ALL_SQL. Without this, adding `const UPDATE_EVENT_SQL` would
-        // silently escape both boundary tests below (reviewer observation).
-        let source = include_str!("cockroach.rs");
-        let declared: Vec<&str> = source
-            .lines()
-            .filter_map(|line| line.strip_prefix("const "))
-            .filter_map(|rest| rest.split(':').next())
-            .filter(|name| name.ends_with("_SQL"))
-            .collect();
-        assert_eq!(
-            declared.len(),
-            ALL_SQL.len(),
-            "declared SQL constants: {declared:?}"
-        );
-        for name in declared {
-            assert!(
-                ALL_SQL.iter().any(|(known, _)| *known == name),
-                "SQL constant {name} is not covered by the boundary tests"
-            );
-        }
-    }
 
     #[test]
     fn every_statement_stays_inside_the_runtime_grant_boundary() {

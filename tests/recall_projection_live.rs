@@ -3,14 +3,11 @@
 //!
 //! Every `#[tokio::test]` here exercises the real `CockroachDB` runtime and runs
 //! only when `FLEET_RECALL_TEST_DATABASE_URL` points at a disposable single-node
-//! instance (see the fleet worker protocol section 3, `crdb-up.sh`); otherwise
-//! it returns early. The pure derivation and rejection classes are covered by
-//! ordinary unit tests in `src/projectors/`.
+//! instance; otherwise it returns early. The pure derivation and rejection
+//! classes are covered by ordinary unit tests in `src/projectors/`.
 //!
-//! Every database-gated test in this file is named `live_*`: that prefix is
-//! how the authoritative official-binary lane
-//! (`deploy/cockroach/tests/registry-activation-cli.sh`) discovers the suite,
-//! so a database-gated test without it would silently never run in CI.
+//! Every database-gated test in this file is named `live_*`, so they run with
+//! `cargo test -- live_` when `FLEET_RECALL_TEST_DATABASE_URL` is set.
 //!
 //! The projection's upstream is W2-BODY's `memory_body_objects_v1`. Most tests
 //! here get there the real way: seed the accepted evidence log with genuine,

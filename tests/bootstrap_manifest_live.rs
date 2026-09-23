@@ -3,18 +3,15 @@
 //! Set the exact `FLEET_RECALL_TEST_DATABASE_URL` variable to a disposable
 //! `CockroachDB` 26.2 database. Every test here is inert otherwise. Nothing in
 //! this file starts a database process, invokes Docker, or targets a cloud
-//! service. Bring up your own instance per
-//! `.fleet-recall/fleet/WORKER_PROTOCOL.md` section 3 and tear it down when
-//! done.
+//! service. Bring up your own instance and tear it down when done.
 //!
 //! # The proposed side table
 //!
-//! `memory_bootstrap_import_rows` is a proposed table the SCHEMA lane has not
-//! migrated in yet (see the W1-IMPORT handoff `requests` for its exact DDL).
-//! Every test that needs the projection to actually run checks
-//! [`import_rows_table_exists`] first and skips with a clear message when the
-//! table is absent, rather than adding a migration itself (`WORKER_PROTOCOL.md`
-//! section 5: "SCHEMA lane owns 0019+").
+//! `memory_bootstrap_import_rows` is a proposed table that no migration
+//! creates yet (its intended shape is documented on the
+//! `ostk-bootstrap-manifest-import` binary). Every test that needs the
+//! projection to actually run checks [`import_rows_table_exists`] first and
+//! skips with a clear message when the table is absent.
 //!
 //! # Setup boilerplate
 //!
@@ -656,7 +653,7 @@ async fn live_bootstrap_manifest_determinism_replay_and_chain_audit_when_configu
     if !import_rows_table_exists(&pool).await {
         eprintln!(
             "skipping live_bootstrap_manifest_determinism_replay_and_chain_audit_when_configured: \
-             memory_bootstrap_import_rows does not exist yet (SCHEMA lane migration pending)"
+             memory_bootstrap_import_rows does not exist yet (no migration creates it)"
         );
         return;
     }
@@ -736,7 +733,7 @@ async fn live_bootstrap_manifest_row_collision_is_refused_with_no_head_advance_w
     if !import_rows_table_exists(&pool).await {
         eprintln!(
             "skipping live_bootstrap_manifest_row_collision_is_refused_with_no_head_advance_when_configured: \
-             memory_bootstrap_import_rows does not exist yet (SCHEMA lane migration pending)"
+             memory_bootstrap_import_rows does not exist yet (no migration creates it)"
         );
         return;
     }

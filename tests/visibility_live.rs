@@ -2,15 +2,12 @@
 //!
 //! Every `#[tokio::test]` here exercises the real `CockroachDB` runtime and runs
 //! only when `FLEET_RECALL_TEST_DATABASE_URL` points at a disposable single-node
-//! instance whose principal may create roles (see the fleet worker protocol
-//! section 3, `crdb-up.sh`); otherwise it returns early. The pure
-//! classification and its rejection classes are covered by ordinary unit tests
-//! in `src/projectors/visibility.rs`.
+//! instance whose principal may create roles; otherwise it returns early. The
+//! pure classification and its rejection classes are covered by ordinary unit
+//! tests in `src/projectors/visibility.rs`.
 //!
-//! Every database-gated test in this file is named `live_*`: that prefix is
-//! how the authoritative official-binary lane
-//! (`deploy/cockroach/tests/registry-activation-cli.sh`) discovers the suite,
-//! so a database-gated test without it would silently never run in CI.
+//! Every database-gated test in this file is named `live_*`, so they run with
+//! `cargo test -- live_` when `FLEET_RECALL_TEST_DATABASE_URL` is set.
 //!
 //! The interesting tests here are the NEGATIVE ones. This module's claim is not
 //! "the publication plane returns the right rows" but "the publication plane
@@ -850,12 +847,12 @@ async fn live_the_real_publication_role_has_no_sql_path_to_a_private_row() {
     assert!(texts[0].contains("public digest"));
     assert!(texts.iter().all(|text| !text.contains("postmortem")));
 
-    // Tear the probe role down. A leaked w2vis_probe_* role survives on the one
-    // server the authoritative official-binary lane runs everything on, where
-    // it shows up as an extra grantor row in that lane's exact PUBLIC
-    // routine-default audit. CockroachDB also refuses to drop a role that still
-    // holds a grant, so the teardown mirrors the grant list exactly (the
-    // registry_witness_live / evidence_ledger_live probe convention).
+    // Tear the probe role down. A leaked w2vis_probe_* role survives on the
+    // shared test database that every live suite runs against, where it can
+    // disturb suites that audit roles or default privileges. CockroachDB also
+    // refuses to drop a role that still holds a grant, so the teardown mirrors
+    // the grant list exactly (the registry_witness_live / evidence_ledger_live
+    // probe convention).
     restricted.close().await;
     for view in PUBLICATION_PLANE_VIEWS {
         sqlx::query(&format!("REVOKE ALL ON TABLE public.{view} FROM {role}"))

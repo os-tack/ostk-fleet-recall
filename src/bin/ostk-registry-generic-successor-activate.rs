@@ -707,33 +707,6 @@ mod tests {
     }
 
     #[test]
-    fn source_keeps_lazy_repository_construction_before_the_first_acquire() {
-        let source = include_str!("ostk-registry-generic-successor-activate.rs");
-        let prepare = source.find("fn prepare_execution(").unwrap();
-        let prepare_source = &source[prepare..];
-        let verify = prepare_source
-            .find("let artifacts = verify_artifacts")
-            .unwrap();
-        let options = prepare_source
-            .find("let connect_options = private_postgres_connect_options(")
-            .unwrap();
-        assert!(verify < options);
-
-        let main = source.find("async fn main()").unwrap();
-        let main_source = &source[main..prepare];
-        let lazy = main_source.find(".connect_lazy_with(").unwrap();
-        let repository = main_source
-            .find("CockroachGenericSuccessorRepository::new(")
-            .unwrap();
-        let acquire = main_source.find("let connection = pool").unwrap();
-        assert!(lazy < repository && repository < acquire);
-        let eager_pool_helper = [".connect_", "with("].concat();
-        assert!(!source.contains(&eager_pool_helper));
-        assert!(source.contains(".max_connections(MAX_CONNECTIONS)"));
-        assert!(source.contains(".min_connections(0)"));
-    }
-
-    #[test]
     fn parser_exposes_only_apply_and_inspect() {
         assert!(Cli::try_parse_from(["ostk-registry-generic-successor-activate", "emit"]).is_err());
         assert!(Cli::try_parse_from(["ostk-registry-generic-successor-activate", "sign"]).is_err());

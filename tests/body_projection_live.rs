@@ -5,13 +5,10 @@
 //! fail-closed rejection classes and REPLAY-01 byte-stability at the derivation
 //! layer with no database. The `#[tokio::test]` functions exercise the real
 //! `CockroachDB` runtime and run only when `FLEET_RECALL_TEST_DATABASE_URL`
-//! points at a disposable single-node instance (see the fleet worker protocol
-//! section 3, `crdb-up.sh`); otherwise they return early.
+//! points at a disposable single-node instance; otherwise they return early.
 //!
-//! Every database-gated test in this file is named `live_*`: that prefix is
-//! how the authoritative official-binary lane
-//! (`deploy/cockroach/tests/registry-activation-cli.sh`) discovers the suite,
-//! so a database-gated test without it would silently never run in CI.
+//! Every database-gated test in this file is named `live_*`, so they run with
+//! `cargo test -- live_` when `FLEET_RECALL_TEST_DATABASE_URL` is set.
 //!
 //! The projector consumes ACCEPTED evidence events from `memory_evidence_events`
 //! (`event_kind = 'evidence.accepted'`). These tests seed that log directly with

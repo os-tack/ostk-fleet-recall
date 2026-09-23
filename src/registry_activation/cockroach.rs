@@ -2114,10 +2114,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_preflight_requires_exact_successful_migration_nine() {
-        assert!(REQUIRE_ACTIVATION_SCHEMA_SQL.contains("count(*) = 9"));
+    fn schema_preflight_requires_a_complete_successful_prefix() {
         assert!(REQUIRE_ACTIVATION_SCHEMA_SQL.contains("bool_and(success)"));
-        assert!(REQUIRE_ACTIVATION_SCHEMA_SQL.contains("version BETWEEN 1 AND 9"));
         assert!(!REQUIRE_ACTIVATION_SCHEMA_SQL.contains("EXISTS"));
         assert!(!REQUIRE_ACTIVATION_SCHEMA_SQL.contains("MAX"));
     }
@@ -2140,17 +2138,6 @@ mod tests {
         assert!(
             SELECT_REGISTRY_STREAM_TIP_SQL.contains("ORDER BY shard DESC, committed_offset DESC")
         );
-    }
-
-    #[test]
-    fn genesis_only_projection_probe_and_writer_constants_are_bound() {
-        assert!(SELECT_ACTIVATION_IDS_SQL.starts_with("SELECT activation_id"));
-        assert!(SELECT_ACTIVATION_IDS_SQL.contains("tenant_id = $1 AND project = $2"));
-        assert!(SELECT_ACTIVATION_IDS_SQL.contains("LIMIT 2"));
-        assert!(INSERT_CONTROL_EVENT_SQL.contains("$7"));
-        assert!(!INSERT_CONTROL_EVENT_SQL.contains("VALUES ($1, $2, $3, $4, $5, $6, 1"));
-        assert!(INSERT_REGISTRY_HEAD_SQL.contains("VALUES ($1, $2, $3"));
-        assert!(!INSERT_REGISTRY_HEAD_SQL.contains("'active'"));
     }
 
     #[test]

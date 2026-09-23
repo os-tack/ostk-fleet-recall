@@ -46,9 +46,9 @@ const SELECT_EVENT_BY_ID_SQL: &str = "SELECT canonical_event FROM public.memory_
 /// `(tenant, project, epoch, shard)` the way `memory_evidence_events`' other
 /// lookups are: there is no secondary index on `consistency_key_digest`, so
 /// this is a full scan of every relation-attestation row for the tenant and
-/// project. Correct, not free — flagged in the W1-REL handoff as a request to
-/// the migration owner for a partial index on
-/// `(tenant_id, project, consistency_family, consistency_key_digest)`.
+/// project. Correct, not free — a partial index on
+/// `(tenant_id, project, consistency_family, consistency_key_digest)` would
+/// need a new forward migration.
 const SELECT_EVENTS_BY_FINGERPRINT_SQL: &str = "SELECT canonical_event FROM public.memory_evidence_events \
      WHERE tenant_id = $1 AND project = $2 AND consistency_family = $3 \
        AND consistency_key_digest = $4 AND event_kind = $5";

@@ -8,8 +8,9 @@
 //! The bootstrap -> genesis -> successor ceremony is copied from
 //! `tests/git_connector_live.rs` so every run below happens against a head
 //! that is the Stage-4 package at generation one. What is new is what the
-//! observer does against that head, over the REAL `src/service.rs` bytes
-//! written into a scratch repository as a real git blob:
+//! observer does against that head, over a frozen snapshot of a real Rust
+//! module (`src/observer_runtime/fixtures/service.rs.txt`) written into a
+//! scratch repository as a real git blob:
 //!
 //! * the positive vector — an exhaustive enumeration of the real
 //!   `RememberAction` enum yields a VERIFIED result whose receipt names the
@@ -131,11 +132,12 @@ const SUCCESSOR_RUNNER_ARTIFACT: &str =
 const SUCCESSOR_RUNNER_CONFIGURATION: &str =
     "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2";
 
-/// THE source under observation: the real module that declares the real
-/// `RememberAction` enum this predicate is about. It is written into a scratch
-/// repository as a real git blob, so the observer reads a genuine git object
-/// rather than a fixture that resembles one.
-const OBSERVED_SOURCE: &[u8] = include_bytes!("../src/service.rs");
+/// THE source under observation: a frozen snapshot of the real module that
+/// declares the `RememberAction` enum this predicate is about. It is a
+/// checked-in fixture rather than the live `src/service.rs`, so that module can
+/// change freely. It is written into a scratch repository as a real git blob,
+/// so the observer reads a genuine git object.
+const OBSERVED_SOURCE: &[u8] = include_bytes!("../src/observer_runtime/fixtures/service.rs.txt");
 /// The path the observed blob lives at inside the scratch tree.
 const OBSERVED_PATH: &[u8] = b"service.rs";
 /// The enum the predicate is about.

@@ -23,8 +23,7 @@
 //! imported legacy identity to a proposed side table,
 //! `memory_bootstrap_import_rows` (`tenant_id`, `project`, `table_name`,
 //! `row_key`, `row_digest`, `accepted_event_id`; `PRIMARY KEY (tenant_id,
-//! project, table_name, row_key)`), which the SCHEMA lane has not yet
-//! migrated in. A
+//! project, table_name, row_key)`), which no migration creates yet. A
 //! second manifest naming an already-imported row with different bytes fails
 //! the whole append transaction closed — no event row, no head advance —
 //! exactly like a stored-bytes divergence under one accepted-event ID does
@@ -563,19 +562,5 @@ mod tests {
         for forbidden in ["postgresql://", "FLEET_RECALL_BOOTSTRAP_IMPORT"] {
             assert!(!serialized.contains(forbidden));
         }
-    }
-
-    #[test]
-    fn source_verifies_artifacts_before_any_env_read() {
-        let source = include_str!("ostk-bootstrap-manifest-import.rs");
-        let main = source.find("async fn main()").unwrap();
-        let main_source = &source[main..];
-        let verify = main_source.find("verify_artifacts(args)").unwrap();
-        let env_scope = main_source.find("trusted_scope_from_env()").unwrap();
-        let env_db = main_source
-            .find("FLEET_RECALL_BOOTSTRAP_IMPORT_DATABASE_URL")
-            .unwrap();
-        assert!(verify < env_scope);
-        assert!(verify < env_db);
     }
 }

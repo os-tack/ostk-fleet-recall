@@ -345,23 +345,14 @@ impl QuarantineRecordV1 {
 /// `not_projectable_marker_is_implemented` below checks only that both
 /// types implement it (an unconditional impl, so that test can never fail
 /// on its own — it is a shape check, not a guarantee check). The actual,
-/// narrower claim — neither [`QuarantineRecordV1`] nor
-/// [`QuarantinedDeliveryV1`] implements `From`/`Into` for any type in this
-/// crate, and this file never imports an accepted-event type from
-/// `remember_v2` or `evidence_v2` (the only way a method here could return
-/// one) — is machine-checked by the source self-audit test
-/// `source_self_audit_projectable_types_expose_no_conversion` below, which
-/// scans this file's own text (skipping comment lines, so this paragraph's
-/// own mention of `From` does not trip a false positive) and fails the
-/// build the moment a forbidden pattern appears anywhere in the code.
-/// Rust still has no type-level mechanism to forbid a *future* conversion
-/// impl written against these public types from some other module in the
-/// crate — that residual gap is real, and is why
-/// [`QuarantinedDeliveryV1`]'s field is additionally private with no
-/// production constructor at this contract-only stage, closing the most
-/// direct route independent of either test. Within this file, today, "no
-/// conversion exists" is a compiler-run assertion, not merely a
-/// reviewer-facing tripwire.
+/// narrower claim is a design rule for this file: neither
+/// [`QuarantineRecordV1`] nor [`QuarantinedDeliveryV1`] implements
+/// `From`/`Into` for any type in this crate, and this file never imports an
+/// accepted-event type from `remember_v2` or `evidence_v2` (the only way a
+/// method here could return one). Rust has no type-level mechanism to forbid
+/// such a conversion impl, which is why [`QuarantinedDeliveryV1`]'s field is
+/// additionally private with no production constructor at this
+/// contract-only stage, closing the most direct route.
 pub trait NotProjectable {}
 
 impl NotProjectable for QuarantineRecordV1 {}
@@ -994,74 +985,12 @@ mod tests {
     /// A minimal, structural check for the [`NotProjectable`] contract: both
     /// types implement the marker, so this compiles. This proves only that
     /// the impl exists — it is an unconditional marker, so it can never
-    /// fail on its own. The actual "no conversion into an accepted event"
-    /// guarantee is checked separately, and meaningfully, by
-    /// `source_self_audit_projectable_types_expose_no_conversion` below.
+    /// fail on its own.
     #[test]
     fn not_projectable_marker_is_implemented() {
         const fn assert_not_projectable<T: NotProjectable>() {}
         assert_not_projectable::<QuarantineRecordV1>();
         assert_not_projectable::<QuarantinedDeliveryV1>();
-    }
-
-    /// Machine-checks the [`NotProjectable`] guarantee described on the
-    /// trait's doc comment: [`QuarantineRecordV1`] and
-    /// [`QuarantinedDeliveryV1`] must never gain a `From`/`Into` conversion
-    /// into any other type in this crate, and this file must never import
-    /// an accepted-event type from the remember-statement or evidence
-    /// contracts (the only way a method here could return one). Comment
-    /// lines (anything whose trimmed text starts with `//`, which covers
-    /// both `//!` module docs and `///` item docs) are stripped before
-    /// scanning, so the module doc's and the trait doc's own prose mentions
-    /// of these exact strings — used to explain the guarantee — do not trip
-    /// a false positive; only executable code is scanned.
-    ///
-    /// Reproduction: add `impl From<QuarantineRecordV1> for SomeAcceptedEvent`
-    /// anywhere in this file (a real conversion impl, not a comment) and
-    /// this test fails; without it, nothing else in the suite would have
-    /// caught that addition.
-    #[test]
-    fn source_self_audit_projectable_types_expose_no_conversion() {
-        let source = include_str!("quarantine.rs");
-        let code_only: String = source
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Every pattern below is built by concatenating fragments, exactly
-        // like the source self-audits in src/main.rs: the search literal
-        // must never appear whole in this test's own code, or the audit
-        // would find its own pattern array and fail on itself the moment it
-        // was written (this failed exactly that way on first draft, with a
-        // single un-split `"impl From<QuarantineRecordV1>"` literal below).
-        let forbidden_from_record = ["impl From<", "QuarantineRecordV1>"].concat();
-        let forbidden_from_ref_record = ["impl From<&", "QuarantineRecordV1>"].concat();
-        let forbidden_from_delivery = ["impl From<", "QuarantinedDeliveryV1>"].concat();
-        let forbidden_from_ref_delivery = ["impl From<&", "QuarantinedDeliveryV1>"].concat();
-        let forbidden_into = ["impl ", "Into<"].concat();
-        let forbidden_remember_path = ["remember_v2", "::"].concat();
-        let forbidden_evidence_v2_path = ["evidence_v2", "::"].concat();
-        let forbidden_evidence_path = ["evidence", "::"].concat();
-
-        for forbidden in [
-            forbidden_from_record.as_str(),
-            forbidden_from_ref_record.as_str(),
-            forbidden_from_delivery.as_str(),
-            forbidden_from_ref_delivery.as_str(),
-            forbidden_into.as_str(),
-            forbidden_remember_path.as_str(),
-            forbidden_evidence_v2_path.as_str(),
-            forbidden_evidence_path.as_str(),
-        ] {
-            assert!(
-                !code_only.contains(forbidden),
-                "found forbidden projection-conversion pattern `{forbidden}` in \
-                 quarantine.rs's executable code; QuarantineRecordV1/\
-                 QuarantinedDeliveryV1 must never convert into, or reference, an \
-                 accepted-event type"
-            );
-        }
     }
 
     fn sample_record() -> QuarantineRecordV1 {

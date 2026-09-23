@@ -24,15 +24,12 @@
 //! bound server-side by the receipt; it never enters statement identity,
 //! exactly like an embedding vector under REPLAY-01. The receipt's
 //! `summary_enrichment_digest` commits to the exact authored bytes under the
-//! dedicated `ostk-consolidation-summary-enrichment-v1` domain
-//! (`.fleet-recall/coordination/requests/
-//! 2026-08-16-kimi-reg-summary-enrichment-domain.md`). The statement, policy,
-//! receipt, and summary-enrichment digest constructors use the consolidation
-//! `DigestDomain` variants accepted by the REG lane (`.fleet-recall/
-//! coordination/requests/2026-08-16-fable-re-consolidation-digest-domains.md`)
-//! and landed with W0-REG. `validate_derivation` recomputes the policy body
-//! digest through `domain_separated_digest`, and the frozen fixtures carry
-//! the exact values computed under the frozen formula.
+//! dedicated `ostk-consolidation-summary-enrichment-v1` domain. The
+//! statement, policy, receipt, and summary-enrichment digest constructors use
+//! the dedicated consolidation `DigestDomain` variants. `validate_derivation`
+//! recomputes the policy body digest through `domain_separated_digest`, and
+//! the frozen fixtures carry the exact values computed under the frozen
+//! formula.
 //!
 //! Scope containment (CONS-06) is a repository seam duty in the same pattern
 //! as `remember_v2`: the statement's single `scope` is server-derived, and

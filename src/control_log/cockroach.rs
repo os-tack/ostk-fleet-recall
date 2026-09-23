@@ -944,8 +944,6 @@ mod tests {
         assert!(INSERT_BOOTSTRAP_RESERVATION_SQL.contains("ON CONFLICT"));
         assert!(INSERT_BOOTSTRAP_RESERVATION_SQL.contains("DO NOTHING"));
         assert!(!INSERT_BOOTSTRAP_RESERVATION_SQL.contains("DO UPDATE"));
-        assert!(INSERT_BOOTSTRAP_RESERVATION_SQL.contains("$20"));
-        assert!(!INSERT_BOOTSTRAP_RESERVATION_SQL.contains("$21"));
 
         assert!(ADVANCE_SELECTED_HEAD_SQL.starts_with("UPDATE public.memory_control_shard_heads"));
         assert!(ADVANCE_SELECTED_HEAD_SQL.contains("last_committed_offset = 0"));

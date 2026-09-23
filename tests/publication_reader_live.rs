@@ -1,13 +1,15 @@
 //! Connected proof for the bounded public recall identity.
 //!
-//! The official wrapper must provide exactly these production inputs:
+//! This test is `#[ignore]`d; run it manually with
+//! `cargo test --test publication_reader_live -- --ignored`. The caller must
+//! provide exactly these production inputs:
 //! `FLEET_RECALL_PUBLICATION_DATABASE_URL` (whose decoded username is exactly
 //! `fleet_publication`), `FLEET_RECALL_TENANT_ID` (a fresh UUID),
 //! `FLEET_RECALL_PROJECT` (a unique `publication-live-*` value),
 //! `FLEET_RECALL_AGENT`, `FLEET_RECALL_MAX_CONNECTIONS`,
 //! `FLEET_RECALL_EMBEDDING_MODEL`, `FLEET_RECALL_EMBEDDING_MODEL_PATH`, and
 //! `FLEET_RECALL_EMBEDDING_MODEL_SHA256`. Local plaintext proof additionally
-//! requires `FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1`. The wrapper must
+//! requires `FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1`. The caller must
 //! leave `FLEET_RECALL_DATABASE_URL` and every case-insensitive `PG*` variable
 //! unset. `FLEET_RECALL_PUBLICATION_TEST_ADMIN_SECRET_FILE` is a test-only path
 //! whose contents are an admin setup URL using a principal distinct from

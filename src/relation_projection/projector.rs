@@ -34,8 +34,8 @@
 //! ever be admitted unverified; `ProviderAttested`/`VerifierResult` may only
 //! ever be admitted verified), so this port and the original accept exactly
 //! the same closed input sets and compute exactly the same output for them.
-//! See the W1-REL handoff for the request to add a real capability
-//! constructor so this port can be deleted in favor of the original.
+//! A real capability constructor would let this port be deleted in favor of
+//! the original.
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::memory_contracts::evidence::AcceptedEventId;
@@ -419,7 +419,7 @@ mod tests {
     // that path). `memory_contracts::relation`'s own test suite has no
     // dedicated self-reference case either, for the same reason. A mutant
     // that deletes this disjunct alone is therefore also an unreachable
-    // equivalent mutant (see the W1-REL handoff).
+    // equivalent mutant.
 
     #[test]
     fn cross_attestor_supersession_is_rejected() {
@@ -521,6 +521,5 @@ mod tests {
     // above). `reject_supersession_cycles` is therefore defense-in-depth
     // against a future weakening of that earlier check or a hash collision,
     // not something a mutation test can drive through a valid input set; a
-    // mutant that disables it survives and is a documented, justified
-    // survivor (see the W1-REL handoff).
+    // mutant that disables it survives and is a justified survivor.
 }

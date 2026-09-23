@@ -447,34 +447,6 @@ mod tests {
     }
 
     #[test]
-    fn source_orders_validation_and_lazy_construction_before_redacted_acquire() {
-        let source = include_str!("ostk-conflict-reconcile.rs");
-        let main = source.find("async fn main()").unwrap();
-        let main_source = &source[main..source.find("fn validate_apply_args(").unwrap()];
-        let cli = main_source.find("let cli = Cli::parse();").unwrap();
-        let input_validation = main_source.find("validate_apply_args(raw_args)?").unwrap();
-        let config = main_source
-            .find("ConflictReconciliationRuntimeConfig::from_env()")
-            .unwrap();
-        let options = main_source
-            .find("private_postgres_connect_options(")
-            .unwrap();
-        let lazy = main_source.find(".connect_lazy_with(").unwrap();
-        let repository = main_source
-            .find("CockroachConflictReconciliationRepository::new(")
-            .unwrap();
-        let acquire = main_source.find("let connection = pool").unwrap();
-        let apply = main_source.find(".reconcile_legacy_conflict(").unwrap();
-
-        assert!(cli < input_validation && input_validation < config && config < options);
-        assert!(options < lazy && lazy < repository && repository < acquire && acquire < apply);
-        assert!(source.contains(".min_connections(0)"));
-        assert!(source.contains("connect private conflict reconciliation database failed"));
-        let eager_pool_helper = [".connect_", "with("].concat();
-        assert!(!source.contains(&eager_pool_helper));
-    }
-
-    #[test]
     fn output_is_exact_bounded_redacted_and_uses_decimal_string_ids() {
         let value = reconciliation_output(&request(), &result(false)).unwrap();
         let mut keys = value

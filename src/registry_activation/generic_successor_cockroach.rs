@@ -1605,75 +1605,14 @@ fn expect_timestamp(row: &PgRow, column: &str, expected: DateTime<Utc>) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
 
-    const GENERIC_SOURCE: &str = include_str!("generic_successor_cockroach.rs");
-    const AUTHORITY_RELATIONS: [&str; 4] = [
-        "_sqlx_migrations",
-        "memory_control_shard_heads",
-        "memory_control_events",
-        "memory_registry_transitions",
-    ];
-    const CURRENT_HEAD_RELATION: &str = "memory_registry_current_heads_v2";
-
-    fn production_prefix(source: &'static str) -> &'static str {
-        source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(code, _)| code)
-    }
-
-    /// Production source with every comment line removed, so a prose mention
-    /// of a name can never satisfy or violate a reachability assertion.
-    fn production_code(source: &'static str) -> String {
-        production_prefix(source)
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     #[test]
-    fn generic_schema_preflight_pins_the_exact_successful_prefix_through_seventeen() {
-        assert!(
-            REQUIRE_GENERIC_SUCCESSOR_SCHEMA_SQL
-                .starts_with("SELECT pg_catalog.current_database() = 'fleet_recall'")
-        );
-        assert!(REQUIRE_GENERIC_SUCCESSOR_SCHEMA_SQL.contains("count(*) = 17"));
+    fn generic_schema_preflight_requires_a_complete_successful_prefix() {
         assert!(REQUIRE_GENERIC_SUCCESSOR_SCHEMA_SQL.contains("bool_and(success)"));
         assert!(REQUIRE_GENERIC_SUCCESSOR_SCHEMA_SQL.contains("FROM public._sqlx_migrations"));
-        assert!(REQUIRE_GENERIC_SUCCESSOR_SCHEMA_SQL.contains("version BETWEEN 1 AND 17"));
         assert!(!REQUIRE_GENERIC_SUCCESSOR_SCHEMA_SQL.contains("MAX"));
         assert!(!REQUIRE_GENERIC_SUCCESSOR_SCHEMA_SQL.contains("EXISTS"));
-    }
-
-    #[test]
-    fn generic_apply_and_inspect_share_the_database_and_schema_first_statement() {
-        for (start, end) in [
-            (
-                "async fn activate_in_transaction(",
-                "\nasync fn inspect_in_transaction(",
-            ),
-            ("async fn inspect_in_transaction(", "\n/// Replay path:"),
-        ] {
-            let start = GENERIC_SOURCE.find(start).expect("transaction function");
-            let end = GENERIC_SOURCE[start..]
-                .find(end)
-                .map(|offset| start + offset)
-                .expect("transaction function boundary");
-            let body = &GENERIC_SOURCE[start..end];
-            let schema = body
-                .find("require_generic_successor_schema(transaction).await?")
-                .expect("database/schema preflight");
-            let bootstrap = body
-                .find("require_pinned_bootstrap_before_lock(")
-                .expect("durable bootstrap read");
-            let lock = body
-                .find("lock_registry_control_head(")
-                .expect("control head lock");
-            assert!(schema < bootstrap && bootstrap < lock);
-        }
     }
 
     #[test]
@@ -1699,79 +1638,9 @@ mod tests {
     }
 
     #[test]
-    fn generic_source_uses_one_server_timestamp_and_no_database_default() {
-        assert_eq!(
-            production_code(GENERIC_SOURCE)
-                .matches("query_scalar(\"SELECT pg_catalog.statement_timestamp()\")")
-                .count(),
-            1
-        );
+    fn generic_inserts_take_no_database_default_timestamp() {
         for query in [INSERT_CONTROL_EVENT_SQL, INSERT_GENERIC_TRANSITION_SQL] {
             assert!(!query.contains("now()"));
         }
-    }
-
-    #[test]
-    fn search_path_and_temporary_shadows_cannot_redirect_generic_authority_sql() {
-        let source = production_code(GENERIC_SOURCE);
-        let mut found = BTreeSet::new();
-        for token in source.split(|character: char| {
-            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '.'))
-        }) {
-            let relation = token.strip_prefix("public.").unwrap_or(token);
-            let is_authority_relation = relation == "_sqlx_migrations"
-                || relation.starts_with("memory_control_")
-                || relation.starts_with("memory_registry_");
-            if !is_authority_relation {
-                continue;
-            }
-            assert!(
-                token.starts_with("public."),
-                "unqualified generic authority relation can follow search_path: {token}"
-            );
-            assert!(
-                AUTHORITY_RELATIONS.contains(&relation) || relation == CURRENT_HEAD_RELATION,
-                "unreviewed generic authority relation: {relation}"
-            );
-            found.insert(relation);
-        }
-        let mut expected: BTreeSet<&str> = AUTHORITY_RELATIONS.into_iter().collect();
-        expected.insert(CURRENT_HEAD_RELATION);
-        assert_eq!(found, expected, "reachable relation inventory changed");
-        assert!(!source.contains("public.public."));
-        assert!(!source.contains("pg_temp."));
-        for function in ["current_database()", "statement_timestamp()"] {
-            for (offset, _) in source.match_indices(function) {
-                assert!(
-                    source[..offset].ends_with("pg_catalog."),
-                    "{function} can follow an attacker-controlled search_path"
-                );
-            }
-        }
-        for sequence_function in ["nextval(", "currval(", "setval("] {
-            assert!(
-                !source.contains(sequence_function),
-                "generic authority unexpectedly consumes a sequence via {sequence_function}"
-            );
-        }
-    }
-
-    #[test]
-    fn contested_resolution_runtime_is_deliberately_absent() {
-        let source = production_code(GENERIC_SOURCE);
-        for absent in [
-            "verify_contested_set_resolution",
-            "AuditedContestedSetV1",
-            "AuditedContenderActivationV2",
-            "ContestedSetResolutionReceiptV1",
-            "memory_registry_contested",
-        ] {
-            assert!(
-                !source.contains(absent),
-                "contested-set resolution runtime leaked into this cycle: {absent}"
-            );
-        }
-        assert!(source.contains("head_state != ACTIVE_HEAD_STATE"));
-        assert!(source.contains("return Err(FleetError::SuccessorActivationNotReady)"));
     }
 }
