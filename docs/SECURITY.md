@@ -21,17 +21,13 @@ authority.
 
 The public HTTP router exposes only `/`, `/healthz`, `/api/status`, and the
 non-mutating `POST /api/recall`. It has no MCP, ingest, remember, control
-bootstrap, registry activation, or other mutation route. The submitted
-CloudFront distribution is therefore a read-only recall surface, even though
-recall uses POST. That historical live observation does not attest its database
-principal or grant matrix. In the current checked-in source, the public process
-instead authenticates as exactly the fixed external `fleet_publication` login,
-whose only membership is the logical `fleet_publication_reader` role; router
-shape is not treated as the database authorization boundary. That current
-boundary is locally proved but unapplied to the historical AWS stack.
+bootstrap, registry activation, or other mutation route. The CloudFront
+distribution is therefore a read-only recall surface, even though recall uses
+POST. Router shape is not treated as the database authorization boundary: the
+public process authenticates as exactly the fixed external `fleet_publication`
+login, whose only membership is the logical `fleet_publication_reader` role.
 CloudFront-to-ALB transport and viewer-TLS limitations are documented without
-stronger claims in the
-[AWS runbook](../deploy/aws/README.md).
+stronger claims in the [AWS runbook](../deploy/aws/README.md).
 
 ## Offline authority and append-only control state
 
@@ -74,25 +70,26 @@ serializable transaction; only CockroachDB SQLSTATE `40001` retries the whole
 operation. Application claim, support, conflict, event, and receipt mutations
 follow the same bounded idempotent/serializable rule.
 
-Current source embeds migrations 1 through 18. Migrations 3 through 9 add and
-harden the private control and genesis-activation projections; migrations 10
-through 14 add exact genesis-root indexes and three durable successor tables;
-migrations 15 through 17 version conflict uniqueness by detector and add
-the exact reconciliation/current-projection indexes; and migration 18 adds the
-Stage-4 evidence plane, governed content store, relation projection, and the
-migrator-owned writer-authority view (ADR 0002). Current release completion
-requires exactly the eighteen successful rows 1 through 18. Normal recall,
-remember, ingest, MCP, health, and public-demo paths require an uninterrupted
-successful prefix of at least 18 and remain compatible with later additive
-migrations. The private compatibility gates remain control 3, genesis 9,
-successor repository 14, and conflict reconciliation 16. A later successful row
-cannot mask a missing or failed prerequisite in any gate.
+Migrations 3 through 9 add and harden the private control and
+genesis-activation projections; migrations 10 through 14 add exact
+genesis-root indexes and three durable successor tables; migrations 15 through
+17 version conflict uniqueness by detector and add the exact
+reconciliation/current-projection indexes; migration 18 adds the Stage-4
+evidence plane, governed content store, relation projection, and the
+migrator-owned writer-authority view (ADR 0002); and later migrations add
+private-plane tables for the dynamic-memory runtimes (see
+[MIGRATIONS.md](MIGRATIONS.md)). Normal recall, remember, ingest, MCP, health,
+and public-demo paths require an uninterrupted successful prefix through at
+least version 18 and remain compatible with later additive migrations. The
+private compatibility gates remain control 3, genesis 9, successor repository
+14, and conflict reconciliation 16. A later successful row cannot mask a
+missing or failed prerequisite in any gate.
 
 Versions 1 through 11 are nontransactional schema changes; v10 and v11 recover
 an interrupted exact index through `IF NOT EXISTS` plus a fail-closed catalog
 shape assertion. Versions 12 through 14 run with SQLx bookkeeping in one
 transaction on a dedicated session with `autocommit_before_ddl = false`.
-Versions 15 through 18 return to resumable nontransactional online DDL: v15
+Versions 15 onward return to resumable nontransactional online DDL: v15
 admits only its exact detector-index transition states and rewrites no conflict
 data; v16/v17 commit one covering backfill and assert its exact catalog shape;
 v18 creates every new relation with `IF NOT EXISTS`, commits, and then fails
@@ -110,7 +107,7 @@ boundary.
 
 The current AWS Terraform defines exactly three planned database credential
 paths: a publication-reader URL for the public application task, a private
-writer URL for seed/reference/MCP DML, and a distinct DDL-capable migrator URL.
+writer URL for seed/MCP DML, and a distinct DDL-capable migrator URL.
 Their three concrete secret ARNs must be pairwise distinct. The public task has
 distinct publication execution and task roles and receives only the
 publication secret. Its execution policy permits exactly
@@ -212,17 +209,11 @@ reconciliation scope.
 
 The publication process additionally requires the decoded URL username and
 the connected CockroachDB `current_user` to be exactly `fleet_publication`;
-private database URL variables are rejected from its environment. The official
-local CockroachDB v26.2.3 TLS wrapper passes that connected PUBLIC-03 boundary.
-A separate clean-checkout LocalStack run at commit `cd6ecfc` passes the current
-three-secret image/config/database denial and replacement lane, with its
-[receipt](evidence/localstack-publication-cd6ecfc-20260816.json) explicitly
-marking AWS apply, IAM enforcement, TLS, database-password authentication, and
-Fargate as unproved. Terraform's 21 configuration tests pass, but the current
-Terraform remains unapplied; none of these local results is an AWS deployment
-or activation claim.
+private database URL variables are rejected from its environment.
+`tests/publication_reader_live.rs` exercises that boundary against a real
+CockroachDB database.
 
-Apply the exact current-object/PUBLIC policies and normalized grant proofs in
+Apply the exact current-object/PUBLIC policies described in
 [MIGRATIONS.md](MIGRATIONS.md) and
 [CONTROL_BOOTSTRAP.md](CONTROL_BOOTSTRAP.md). Runtime has no control-table
 privilege. The private logical roles are non-login, have no admin or SYSTEM
@@ -306,7 +297,7 @@ not publication-safe artifacts.
 `RUSTSEC-2023-0071` affects `rsa 0.9`, which appears in Cargo's lockfile through
 SQLx's optional MySQL driver. This application enables only SQLx PostgreSQL;
 `cargo tree --target <deployment-target> -i rsa` and `-i sqlx-mysql` must both
-remain empty in CI. There is no fixed `rsa` release listed by the advisory.
+remain empty. There is no fixed `rsa` release listed by the advisory.
 The exception is therefore confined to an inactive optional package, not a
 linked runtime dependency, and should be removed as soon as SQLx's graph no
 longer records it.

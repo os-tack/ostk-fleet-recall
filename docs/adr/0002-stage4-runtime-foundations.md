@@ -1,11 +1,13 @@
 # ADR 0002: Stage-4 runtime foundations — one semantic ledger, two physical ledgers, and a narrow writer
 
-- Status: accepted (fleet panel 2026-08-16: correctness lens, invariant/security lens, chair Fable)
+- Status: accepted and implemented in migration 0018 and `src/evidence_ledger`. The D3 `assert`
+  route is wired but fails closed because serving does not load the D4 writer-authority
+  configuration yet, and no serving path runs the evidence ledger.
 - Date: 2026-08-16
 - Scope: the six decisions (D1–D6) that every Stage-4 runtime workstream (Wave 1) depends on.
   Target semantics are defined by `docs/DYNAMIC_MEMORY_ARCHITECTURE.md`; this record fixes the
-  implementation choices where that document leaves latitude. Panel evidence (file:line) is
-  retained in the fleet wave log; only conclusions and their cascade are recorded here.
+  implementation choices where that document leaves latitude. Only conclusions and their cascade
+  are recorded here.
 
 ## D1 — General accepted events: one semantic ledger, two physical ledgers
 
@@ -42,8 +44,8 @@ with the writer's privileges, so such an FK would force a `SELECT` grant on a co
 `fleet_runtime` (SQLSTATE 42501 on lazy head seeding otherwise) and would reopen the
 control/runtime privilege boundary that D2 closes. Epoch binding is enforced by the appender (the
 head's `epoch_id`/`shard_count` must equal the authority view's genesis epoch inside the same
-serializable transaction) and proven by W1-APPEND live tests and the runtime proof; the
-events→heads FK inside the evidence plane remains. A CockroachDB FK to control tables is not to be
+serializable transaction) and covered by the W1-APPEND live tests; the events→heads FK inside
+the evidence plane remains. A CockroachDB FK to control tables is not to be
 reintroduced without amending D2.
 
 **Why.** Table-level grants are the only privilege primitive this schema relies on. Sharing
@@ -66,9 +68,7 @@ relation projector run inside the same runtime process and transaction, `SELECT,
 carry only the first four relations; the remaining three are added in the same wave before W1-APPEND
 and W1-REL merge). It gains NO privilege on any
 `memory_control_*` or `memory_registry_*` base table; the control and successor policies' REVOKE
-lists stay byte-identical. The runtime-role proof's exact matrix count is recomputed from the
-final grant list, and every source-manifest / policy-digest / LocalStack refreeze for D2+D3+D4
-happens ONCE at wave close (W1-PROOF), not per commit.
+lists stay unchanged.
 
 Residual accepted and documented: a compromised runtime can wedge its own evidence shards (never
 the governance ledger); detection is the chain audit, remedy is a successor log epoch (W0-LOG).
@@ -77,7 +77,7 @@ the governance ledger); detection is the chain audit, remedy is a successor log 
 
 **Decision.** The MCP `remember` tool gains action `assert` carrying a
 `RememberIngressCandidateV2` plus the existing `idempotency_key`; `record` stays byte-identical in
-wire schema and behaviour, the reference agent and MCP tests keep passing unchanged. The server
+wire schema and behaviour, and the MCP tests keep passing unchanged. The server
 routes `assert` to the unique active admission rule for (trusted scope, predicate schema, basis),
 rederives the subject from the activated identity recipe, re-audits applicability dimensions and
 support event IDs, builds the production `AdmittedRememberStatementV2`, appends
@@ -117,7 +117,7 @@ Migration 0018 therefore adds `memory_content_objects` keyed by
 `content_digest`, `retention_class`, retention-policy reference, a per-object DEK wrapped under a
 config-provided KEK (`FLEET_RECALL_CONTENT_KEK_HEX`, AES-256-GCM via the already-pinned `ring`),
 the envelope-encrypted bytes, and erasure-index keys for the four `ErasureScopeKind` axes. The
-table is NEVER in the publication reader's eight tables (its proof asserts the exclusion).
+table is NEVER in the publication reader's eight tables (its live test asserts the exclusion).
 `memory.claim.accepted` keeps its inline assertion text and is classified immutable-inline with a
 documented erasure limitation. Tombstone/fence/generation machinery is W0-ERASE's contract and is
 not built here.
@@ -149,10 +149,7 @@ relation state per fingerprint + per-shard cursor advanced atomically with the p
 
 ## Consequences
 
-- Waves 1–3 build on a writer that can never touch the governance ledger; the control/registry
-  proofs stay untouched.
-- One refreeze at Wave-1 close: the eight-file runtime source manifest, the runtime policy
-  digest (LocalStack `smoke.sh` / `database-boundary.sh` / README), the migration-prefix pins
-  (17 → 18), and the exact grant-matrix count.
+- Later work builds on a writer that can never touch the governance ledger; the control and
+  registry role policies stay untouched.
 - The doc's "one ledger" wording is amended to name the two physical ledgers under one epoch.
 - Legacy `record` remains a pre-history projection until imported by the bootstrap-manifest event.

@@ -75,8 +75,9 @@ error.
 | `negative-private-raw.jsonl` | `PrivateRawArtifactUnsupported` | `a_private_raw_artifact_is_refused` |
 
 `vector-suite.jsonl` lists every file with its raw SHA-256 plus the derived
-identities, and `src/evidence_ledger/admission.rs` pins each of those hashes as
-a Rust constant.
+identities. `src/evidence_ledger/admission_tests.rs` checks that every file is
+one canonical record and asserts the derived identities against golden
+`EXPECTED_*` constants.
 
 ## What these vectors deliberately do not cover
 

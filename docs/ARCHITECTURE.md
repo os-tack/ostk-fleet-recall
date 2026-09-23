@@ -7,26 +7,28 @@ The local `ostk-recall` corpus remains the workstation default.
 that must coordinate across process, host, and availability-zone boundaries;
 using OSTK is optional.
 
-This document describes the implemented hackathon system. The current source
-includes the bounded PUBLIC-03 database and task-input separation described
-below. The broader proposed event-driven corpus, provider-evidenced provenance
-graph, separately graded causal hypotheses, runtime observation model, and
-private control plane are specified in
-[Dynamic corpus and causal runtime architecture](DYNAMIC_MEMORY_ARCHITECTURE.md);
-they are not claims about the current deployment.
+This document describes the serving system: the MCP server, the read-only
+HTTP demo, the CockroachDB schema they use, and the checked-in AWS topology,
+including the bounded PUBLIC-03 database and task-input separation described
+below. The broader event-driven corpus, provider-evidenced provenance graph,
+separately graded causal hypotheses, runtime observation model, and private
+control plane are specified in
+[Dynamic corpus and causal runtime architecture](DYNAMIC_MEMORY_ARCHITECTURE.md).
+Much of that design exists as library code with live database tests, but no
+serving binary runs it yet; see the README's
+[built but not yet wired](../README.md#built-but-not-yet-wired) section.
 
 ## Current checked-in topology
 
 ```mermaid
 %%{init: {"flowchart": {"rankSpacing": 46.5}}}%%
 flowchart TB
-    visitor["Hackathon judge / demo visitor"]
+    visitor["Demo visitor"]
     operator["Operator"]
     cloudfront["Amazon CloudFront\nHTTPS viewer endpoint\ncache disabled"]
     alb["Restricted AWS ALB origin\nCloudFront prefix-list ingress\n403 without secret origin header"]
     demo["ECS/Fargate demo service\nprivate subnets; publication recall"]
     seed["One-off ECS seed task\nimmutable sample corpus"]
-    policy["Reference policy agents A/B/C\none-off ECS/Fargate tasks"]
     agents["Optional MCP clients\nlocal or separately deployed"]
     mcp["Fleet Recall MCP\nlocal stdio per trusted scope"]
     s3[("Amazon S3\npinned model bundle")]
@@ -42,7 +44,8 @@ flowchart TB
 
     visitor -->|HTTPS viewer request| cloudfront
     cloudfront -->|HTTP 80 + generated origin header| alb
-    operator -.->|launch evidence run| policy
+    operator -.->|launch one-off task| migrator
+    operator -.->|launch one-off task| seed
     alb -->|HTTP 8080| demo
     agents <-->|MCP stdio| mcp
     s3 -.-> public_inputs
@@ -54,21 +57,18 @@ flowchart TB
     public_inputs -.-> demo
     private_inputs -.-> seed
     private_inputs -.-> migrator
-    private_inputs -.-> policy
     demo --> crdb
     seed --> crdb
-    policy --> crdb
     mcp --> crdb
     migrator --> crdb
     demo --> logs
     seed --> logs
-    policy --> logs
     migrator --> logs
 ```
 
-The public path is deliberately asymmetric. A hackathon judge or demo visitor
-reaches CloudFront over HTTPS. CloudFront then reaches the internet-facing ALB
-over HTTP port 80 and adds a Terraform-generated, 48-character origin header.
+The public path is deliberately asymmetric. A demo visitor reaches CloudFront
+over HTTPS. CloudFront then reaches the internet-facing ALB over HTTP port 80
+and adds a Terraform-generated, 48-character origin header.
 The ALB security group accepts port 80 only from AWS's managed CloudFront
 origin-facing prefix list, and its default listener action returns `403` unless
 that header matches. Accepted requests are forwarded over HTTP 8080 to the demo
@@ -76,31 +76,21 @@ service in private subnets. HTTPS therefore terminates at CloudFront; this path
 is not described as TLS 1.2-minimum or end-to-end TLS.
 
 The operator is separate from that visitor path and uses authenticated AWS
-control-plane tooling to launch the one-off reference-policy evidence run.
+control-plane tooling to launch the one-off migration and seed tasks.
 
-The diagram describes the current checked-in Terraform plan. Its publication
-secret, publication execution role, publication task role, and distinct
-customer-managed KMS key scope have been statically validated but not applied.
-The historical live revision-10 deployment described in the README predates
-PUBLIC-03 and establishes only the read-only HTTP route; it is not evidence that
-the new database or IAM boundary is live in AWS.
+The diagram describes the checked-in Terraform. Its publication secret,
+publication execution role, publication task role, and distinct
+customer-managed KMS key scope pass `terraform validate` and the module's
+Terraform tests but have not yet been applied to a live AWS stack.
 
-The checked-in Terraform provisions the HTTP demo, migration, seed, and
-reference-policy-agent task definitions. The demo task receives only
-`FLEET_RECALL_PUBLICATION_DATABASE_URL`; migration and writer-capable tasks use
-their separate private credentials. The historical evidence wrapper starts
-four independent Fargate tasks bound to agents A, B, C, and B: they record a
-decision, retrieve it through lexical+dense RRF, persist a cited rollout
-action, surface an incompatible decision, and persist a cited escalation. Each
-task receives only its trusted identity and run coordinate; CockroachDB is the
-durable handoff between processes. The policy is deliberately fixed and
-fail-closed, so this proof needs neither an LLM nor OSTK.
+The checked-in Terraform provisions the HTTP demo, migration, and seed task
+definitions. The demo task receives only
+`FLEET_RECALL_PUBLICATION_DATABASE_URL`; the migration and seed tasks use their
+separate private credentials.
 
-The MCP path remains the product interface for arbitrary fleet clients and is
-exercised by separately bound local processes in the deterministic LocalStack
-scenario. An optional OSTK bridge can coordinate those clients, but Terraform
-does not provision OSTK workers or MCP sidecars and the hosted submission does
-not depend on either one.
+The MCP path is the product interface for arbitrary fleet clients. An optional
+OSTK bridge can coordinate those clients, but Terraform does not provision OSTK
+workers or MCP sidecars and the hosted demo does not depend on either one.
 
 Private authority processes remain outside this topology. The workstation-only
 successor CLI constructs the checked-in first-successor repository, and the
@@ -118,7 +108,7 @@ the corpus, typed claims, idempotency receipts, conflict ledger, and events
 remain in CockroachDB Cloud. A private S3 prefix supplies the same
 content-addressed 512-dimensional model to every task, preventing embedding
 drift between writers and readers. The schema reserves `memory_attention` for
-a future agent/session focus feature; the current vertical slice neither reads
+a future agent/session focus feature; the current serving path neither reads
 nor writes that table.
 
 The public demo exposes a bounded recall request and health endpoint, not a
@@ -135,27 +125,9 @@ Driver construction fixes the username, database, and
 `ostk-fleet-recall-publication` application name. Every new connection and
 every pool reuse re-witnesses those values and sets and verifies canonical
 `search_path = pg_catalog, public, pg_temp` before application SQL runs.
-Reference agents mutate through the same trusted service facade inside one-off
-tasks; general fleet clients mutate over MCP. In both paths
-tenant/project/agent coordinates come from deployment rather than
-caller-controlled JSON.
-
-The reference policy never executes recalled text. It accepts only one exact,
-typed migration decision from agent A, re-reads the selected claim by numeric
-ID, and emits one allowlisted action with the source claim ID attached. Agent C
-then records the deliberately incompatible value; the final agent-B task
-requires the exact two-member disputed conflict before it records a cited
-pause-and-escalate action. Any missing lane, actor, value, state, member, or
-citation fails the task closed.
-
-The source boundary has two accepted local connected proofs. The authoritative
-wrapper passed against the exact official CockroachDB v26.2.3 binary over TLS,
-including the live publication reader and the existing repository/private-CLI
-matrix. The production-image LocalStack smoke passed at source commit
-`cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4` and preserved recall after replacing
-the public container. LocalStack deliberately used insecure CockroachDB and no
-AWS apply, so it proves neither database TLS/password authentication nor real
-IAM, Fargate, or AWS deployment.
+Fleet clients mutate over MCP and the seed task writes through trusted ingest;
+in both paths tenant/project/agent coordinates come from deployment rather
+than caller-controlled JSON.
 
 ## Memory planes
 
@@ -168,17 +140,25 @@ IAM, Fargate, or AWS deployment.
 | Conflict ledger | `memory_conflicts`, members | Surface incompatible active typed claims rather than silently choosing one |
 | Idempotent mutation receipts | `memory_mutation_receipts` | At most one committed mutation per tenant-wide key and identical canonical request |
 | Fleet events | `memory_events` | Durable audit and future projection/CDC seam |
-| Reserved attention (future) | `memory_attention` | Schema seam only; not read or written by the current vertical slice |
+| Reserved attention (future) | `memory_attention` | Schema seam only; not read or written by the current serving path |
 | General accepted-event ledger | `memory_evidence_events`, `memory_evidence_shard_heads` | Append-only general events under the control ledger's single log epoch; carries no governance kind |
 | Ingress quarantine | `memory_evidence_quarantine` | Bounded integrity receipt for a rejected delivery: digest and diagnostic only, never payload bytes |
 | Governed content store | `memory_content_objects` | Envelope-encrypted governed bytes addressed by storage identity and indexed for erasure |
 | Relation projection | `memory_relation_projection_v1`, `memory_relation_projection_watermarks_v1` | Disposable current relation state with a per-`(ledger_family, shard)` cursor advanced in the same transaction |
 | Writer authority witness | `memory_writer_authority_v1` (view) | Read-only bootstrap/epoch/registry-head projection; the writer's only authority read path |
 
-Current release completion requires exactly the eighteen successful migration
-rows 1 through 18. Serving accepts an uninterrupted successful prefix of at
-least 18, including later additive migrations. The private repositories retain
-their narrower, independently enforced compatibility floors:
+Later migrations (19 onward, see [`migrations/`](../migrations)) add
+private-plane tables for the dynamic-memory runtimes: content-addressed body
+projection, coverage cursors and receipts, the lexical/dense recall projection
+and its visibility class, the transcript and CI connector state, normative
+activation, and the discrepancy ledger. The serving path does not read or
+write them yet; see
+[Dynamic corpus and causal runtime architecture](DYNAMIC_MEMORY_ARCHITECTURE.md).
+
+Serving accepts an uninterrupted successful migration prefix through at least
+version 18, and later additive migrations remain compatible. The private
+repositories retain their narrower, independently enforced compatibility
+floors:
 
 - Stage-2 control bootstrap requires successful prefix 1–3 and has a private
   workstation repository/CLI plus one-shot role.
@@ -190,8 +170,7 @@ their narrower, independently enforced compatibility floors:
 - Legacy conflict reconciliation requires prefix 1–16 and has an apply-only
   workstation CLI plus database-local one-shot role policy. Its cross-database
   authority audit remains external.
-- Recall, remember, ingest, health, and the public demo require prefix 1–18 as
-  the normal runtime/serving release surface.
+- Recall, remember, ingest, health, and the public demo require prefix 1–18.
 
 Later additive rows cannot compensate for a missing or failed row inside a
 required prefix. Migrations 15 through 17 do not add successor tables: they
@@ -350,4 +329,67 @@ response delivery. A changed request using the same key is rejected.
   one trusted repository scope per request/task.
 - Changefeeds, cross-region locality policy, WAF, private Cockroach connectivity,
   and bulk set-based ingestion are natural production extensions; none is
-  required for correctness of the hackathon vertical slice.
+  required for correctness of the current serving path.
+
+## Roadmap and open work
+
+### Next product steps
+
+- Implement the reserved Recall actions. The service contract already names
+  `remember` supersede, retract, forget, restore, resolve, relate, split,
+  focus, track, and consolidate, and `recall` surface, discover, synthesize,
+  and audit; today only `remember(record)` and
+  `recall(search|get|conflicts|status)` are served, and the others return an
+  error.
+- Wire the dynamic-memory runtimes that already exist as library code into a
+  worker or CLI and into MCP recall; the README's
+  [built but not yet wired](../README.md#built-but-not-yet-wired) section lists
+  what that needs.
+- Package Fleet Recall as an optional OSTK Recall plugin/backend.
+- Add authenticated workload identity and dynamic multi-project routing
+  without trusting MCP parameters.
+- Add set-based bounded ingestion, changefeed-driven projections, and
+  multi-region locality policies.
+- Add private AWS/CockroachDB connectivity, WAF/rate limiting, operational
+  SLOs, and contention/hot-range alerts.
+
+### Acceptance scenarios
+
+These are the behaviors the serving path is built to preserve:
+
+1. An agent in project A cannot retrieve project B's or another tenant's rows,
+   even when it injects scope-like values into MCP arguments.
+2. Agent A records a typed decision with an idempotency key; replay returns the
+   original receipt and creates no duplicate claim or event.
+3. Agent B semantically recalls the decision through vector plus lexical RRF
+   and records a changed rollout plan based on that memory.
+4. Agent C records an overlapping, incompatible typed value; both claims become
+   disputed and an explainable conflict is surfaced. Agent B pauses the rollout
+   and records an operator escalation.
+5. A serving task can be terminated and replaced without losing durable memory.
+6. Representative dense, source-prefixed dense, and lexical queries select both
+   scoped vector indexes and the lexical inverted index.
+7. A semantic source search resolves exact hash-bound claim support, surfaces
+   the relevant documentation and implementation chunks, and projects their
+   exact open conflict without corpus-wide natural-language inference.
+
+### Known technical debt
+
+1. **JavaScript-safe numeric claim IDs are sequential.** Recall's public claim
+   contract uses numeric IDs, so Fleet Recall caps sequences at `2^53-1`
+   instead of replacing them with UUIDs. Composite tenant/project prefixes
+   distribute different fleets, but one very hot project may still concentrate
+   writes. Before production scale, run contention tests and add hash-sharded
+   lookup indexes or version the public ID contract.
+2. **Trusted NDJSON ingestion upserts rows individually.** Each write stays
+   small and independently retryable, but network efficiency is left on the
+   table. Batch bounded rows via `UNNEST`/set-based SQL without combining
+   embedding work with transactions.
+3. **The public demo has broad outbound network egress.** Terraform narrows
+   inbound traffic and IAM resources, but a production VPC should use AWS
+   service endpoints/prefix lists and private CockroachDB connectivity.
+4. **Operational monitoring is scaffolded, not baselined.** CloudWatch
+   application logs are enabled and Terraform supports optional ECS Container
+   Insights, but retry-rate, p99 latency, long-transaction, contention, and
+   hot-range alert thresholds still need to be measured under representative
+   load.

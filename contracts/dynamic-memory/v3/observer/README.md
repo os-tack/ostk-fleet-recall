@@ -112,18 +112,16 @@ authority by itself (AUTH-03, EVENT-03).
   could be relabelled to oppose a genuine, unrelated verified proof, using
   only public bytes.
 
-## How digests are pinned
+## How digests are checked
 
-Every `.jsonl` file is `include_bytes!`-frozen into
-`src/memory_contracts/observer.rs`. Each fixture's raw SHA-256 (over the file
-bytes minus the framing LF) is pinned as a `_RAW_SHA256` constant, and the
-closed-world admission's semantic identity is additionally pinned as
-`ADMISSION_DIGEST`, computed by `ObserverAdmissionV2::digest()` under the
-`ostk-observer-admission-v2` domain from `src/memory_contracts/digest.rs`.
-Changing any canonical record, digest domain prefix, fixed event kind
-(`observer.result.accepted`), declared-outcome-kind ordering, or pinned
-digest is a contract-version change, exactly as for the v2 remember and
-relation fixture suites.
+Every `.jsonl` file is loaded with `include_bytes!` by the observer tests in
+`src/memory_contracts/observer_tests.rs`. The closed-world admission's semantic
+identity is checked against the golden `ADMISSION_DIGEST`, computed by
+`ObserverAdmissionV2::digest()` under the `ostk-observer-admission-v2` domain
+from `src/memory_contracts/digest.rs`. Changing any canonical record, digest
+domain prefix, fixed event kind (`observer.result.accepted`), declared
+outcome-kind ordering, or golden digest is a contract-version change, exactly
+as for the v2 remember and relation fixture suites.
 
 `scripts/gen_observer_fixtures.py` at the repository root regenerates these
 files deterministically from human-readable labels (`hashlib.sha256(label)`)

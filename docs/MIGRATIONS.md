@@ -1,30 +1,39 @@
 # CockroachDB migration policy
 
-Fleet Recall currently has eighteen embedded schema migrations. Migration 1
-creates the distributed corpus, claim and conflict ledgers, audit tables,
-vector indexes, and lexical inverted index; migration 2 adds the scoped support
-lookup; migration 3 adds the private control-event ledger; migration 4 adds the
-immutable genesis-registry activation ledger and singleton active head;
-migration 5 adds the scoped unique control-event predecessor index; and
-migrations 6 through 9 remove the implicit clock defaults from the bootstrap,
-epoch, shard-head, and event projections, respectively. Migrations 10 and 11
-add the exact immutable genesis-head and genesis-activation root indexes needed
-by successor foreign keys. Migrations 12 through 14 add, respectively, the
-append-only registry transition history, one-shot genesis-bridge consumption,
-and successor current-head projection. Migration 15 replaces conflict
-uniqueness by `(tenant, project, claim key)` with detector-versioned uniqueness;
-migration 16 adds the covering claim-transition provenance index required by
-legacy reconciliation; migration 17 adds the covering current-conflict
-detector/state projection index required by normal serving; and migration 18
-adds the Stage-4 runtime foundations recorded in
-[ADR 0002](adr/0002-stage4-runtime-foundations.md): the general accepted-event
-ledger (`memory_evidence_events` plus `memory_evidence_shard_heads`, which
-carries no foreign key to any control or registry table), the quarantine,
-governed-content, and relation-projection tables, the nullable `accepted_event_id` columns on
-`memory_claims` and `memory_mutation_receipts`, and the read-only
-`memory_writer_authority_v1` head-witness view.
+The embedded schema migrations live in [`migrations/`](../migrations), and
+`ostk-fleet-recall migrate` applies them in order; each file's header comment
+describes it. Migration 1 creates the distributed corpus, claim and conflict
+ledgers, audit tables, vector indexes, and lexical inverted index; migration 2
+adds the scoped support lookup; migration 3 adds the private control-event
+ledger; migration 4 adds the immutable genesis-registry activation ledger and
+singleton active head; migration 5 adds the scoped unique control-event
+predecessor index; and migrations 6 through 9 remove the implicit clock
+defaults from the bootstrap, epoch, shard-head, and event projections,
+respectively. Migrations 10 and 11 add the exact immutable genesis-head and
+genesis-activation root indexes needed by successor foreign keys. Migrations 12
+through 14 add, respectively, the append-only registry transition history,
+one-shot genesis-bridge consumption, and successor current-head projection.
+Migration 15 replaces conflict uniqueness by `(tenant, project, claim key)`
+with detector-versioned uniqueness; migration 16 adds the covering
+claim-transition provenance index required by legacy reconciliation; migration
+17 adds the covering current-conflict detector/state projection index required
+by normal serving; and migration 18 adds the Stage-4 runtime foundations
+recorded in [ADR 0002](adr/0002-stage4-runtime-foundations.md): the general
+accepted-event ledger (`memory_evidence_events` plus
+`memory_evidence_shard_heads`, which carries no foreign key to any control or
+registry table), the quarantine, governed-content, and relation-projection
+tables, the nullable `accepted_event_id` columns on `memory_claims` and
+`memory_mutation_receipts`, and the read-only `memory_writer_authority_v1`
+head-witness view.
 
-## Transaction policy: versions 1–11, 12–14, and 15–18
+Migrations from 19 onward add private-plane tables for the dynamic-memory
+runtimes: the content-addressed body projection, the coverage runtime, the
+recall projection and its per-row visibility class, transcript and CI
+connector state, normative activation, and the discrepancy ledger. Version 25
+is a deliberate, permanent gap. No serving path reads these tables yet, and
+the runtime role policy does not grant them.
+
+## Transaction policy: versions 1–11, 12–14, and 15 onward
 
 CockroachDB 26.2 runs vector-index creation through its declarative schema
 changer and rejects that operation inside an explicit multi-statement
@@ -53,11 +62,11 @@ the same dedicated connection with `autocommit_before_ddl = false`. That
 CockroachDB session setting is required: its default would commit DDL before
 SQLx inserts the matching history row even inside SQLx's transaction. The
 dedicated connection is closed on success or failure, so the override never
-returns to the shared runtime pool. Official CockroachDB v26.2.3 tests force the
-history insert to fail after DDL and require both the new table and history row
-to be absent.
+returns to the shared runtime pool. A live CockroachDB test forces the history
+insert to fail after DDL and requires both the new table and history row to be
+absent.
 
-Versions 15 through 18 form a third phase with
+Versions 15 onward form a third phase with
 `autocommit_before_ddl = true` and `no_tx = true`. Migration 15 accepts only the
 exact old-only, old-plus-new, or new-only detector-index transition states. It
 creates and commits the new detector-versioned unique index, verifies both
@@ -92,16 +101,13 @@ those cases now fails with SQLSTATE `55000` before SQLx can write its history
 row. The constraint fingerprint filters no `contype`, so an ADDED constraint
 drifts as loudly as a missing one.
 
-Those are database correctness guarantees. The original recorded LocalStack
-Docker/Compose application-image smoke stopped at migration 9 and remains only
-historical through-9 evidence. A separate clean-checkout PUBLIC-03 LocalStack
-run at commit `cd6ecfc` subsequently passed the current prefix-17 migration,
-three-secret publication boundary, replacement, and denial probes. Its
-[durable receipt](evidence/localstack-publication-cd6ecfc-20260816.json)
-explicitly records that this insecure local lane proves neither AWS apply/IAM
-enforcement nor TLS, database-password authentication, or Fargate.
+Migrations 19 onward follow the same resumable pattern: each carries the
+`-- no-transaction` marker, creates its objects with `IF NOT EXISTS`, and most
+close with catalog-shape assertions that fail with SQLSTATE `55000` on a
+same-name object of another shape.
 
-That is an operational constraint, not permission to run migration casually:
+Resumability is an operational constraint, not permission to run migration
+casually:
 
 - run one migrator only;
 - keep every application service at zero during the initial migration;
@@ -110,20 +116,20 @@ That is an operational constraint, not permission to run migration casually:
 - for versions 1 through 11, never assume an error rolled back DDL;
 - for versions 12 through 14, treat non-atomic state as evidence of an
   unreviewed runner/session or catalog drift;
-- for versions 15 through 18, wait for online jobs and use only the reviewed
+- for versions 15 onward, wait for online jobs and use only the reviewed
   resumable catalog transitions; and
 - follow the version-specific recovery rules below instead of editing SQLx
   history.
 
-The Terraform deployment provides separate migration, private-writer
-seed/reference, and publication-reader task capability paths and defaults the
+The Terraform deployment provides separate migration, private-writer seed,
+and publication-reader task capability paths and defaults the
 application service and autoscaling minimum to zero.
 
 ## Cloud bootstrap
 
 1. Create a dedicated, empty CockroachDB database named `fleet_recall`.
 2. Create three separate database capability paths: a DDL-capable migrator, a
-   private writer for seed/reference/MCP DML, and the fixed external
+   private writer for seed/MCP DML, and the fixed external
    `fleet_publication` login for the public demo. Store their strict-TLS URLs as
    three distinct raw AWS Secrets Manager values. Provision
    `fleet_publication` outside Terraform in the exact quiesced `NOLOGIN` state;
@@ -133,25 +139,25 @@ application service and autoscaling minimum to zero.
 4. Confirm no other migration task is running in ECS.
 5. Run `./deploy/aws/run-migration.sh` once.
 6. Inspect the task's CloudWatch logs and confirm exit code zero.
-7. Separately, with the migrator/security-operator procedure, verify the exact
-   eighteen successful rows for prefix 1 through 18 and inspect all
-   schema-change jobs. The private compatibility gates remain intentionally
-   distinct: Stage-2 control requires prefix 1 through 3, genesis Stage-3
-   requires 1 through 9, the first-successor repository requires 1 through 14,
-   and conflict-detector reconciliation requires 1 through 16. None is a
-   substitute for the current release gate or serving floor.
+7. Separately, with the migrator/security-operator procedure, verify that
+   `_sqlx_migrations` has a successful row for every file in `migrations/` and
+   inspect all schema-change jobs. The private compatibility gates remain
+   intentionally distinct: Stage-2 control requires prefix 1 through 3,
+   genesis Stage-3 requires 1 through 9, the first-successor repository
+   requires 1 through 14, and conflict-detector reconciliation requires 1
+   through 16. None is a substitute for the serving floor.
 8. While `fleet_publication` remains quiesced, perform the required
    cross-database/default/ownership/PUBLIC audit and apply
    [`publication-reader-role-grants.sql`](../deploy/cockroach/publication-reader-role-grants.sql).
    Freeze role, grant, default, ownership, and schema-DDL changes; repeat the
    external audit if necessary and reapply the policy immediately before the
    exact login-enable operation described below.
-9. Run `health` and the one-off seed/reference work with the private writer
-   credential. Current recall, remember, ingest, MCP, health, and public-demo
-   paths require an uninterrupted successful prefix of at least 18, including
-   the exact current indexes, cosine support, and configured model identity.
-   Later additive rows remain compatible, but cannot mask a missing or failed
-   row in 1–18.
+9. Run `health` and the one-off seed with the private writer credential.
+   Recall, remember, ingest, MCP, health, and the public demo require an
+   uninterrupted successful prefix through at least version 18
+   (`MINIMUM_RECALL_SCHEMA_VERSION`), the exact current indexes, cosine
+   support, and the configured model identity. Later additive rows remain
+   compatible, but cannot mask a missing or failed row in 1–18.
 10. Enable only the externally managed `fleet_publication` authentication,
     then set the desired/minimum service count to at least one and apply again.
     The public task receives only its publication-reader secret.
@@ -211,15 +217,12 @@ policies. Their deterministic hardening performs `ALTER ROLE`, removes role
 membership (including accidental `admin` inheritance), and revokes SYSTEM
 privileges. Run them as a cluster admin, or as a dedicated security operator
 with `CREATEROLE`, every required role admin option and SYSTEM grant option,
-plus grant authority on the database, schema, tables, and sequences. The
-disposable proofs create a database-owner-only user and require those hardening
-statements to be denied.
+plus grant authority on the database, schema, tables, and sequences.
 
 The migration principal needs database/schema creation privileges for tables,
 sequences, secondary indexes, and SQLx's migration bookkeeping table. A
 separately provisioned private-writer login is a member only of the hardened
-`NOLOGIN` `fleet_runtime` logical role. That seed/reference/MCP grant bundle
-needs:
+`NOLOGIN` `fleet_runtime` logical role. That seed/MCP grant bundle needs:
 
 - `CONNECT` on the Fleet Recall database;
 - `USAGE` on its schema and sequences;
@@ -240,17 +243,17 @@ needs:
 
 Never grant private-writer privileges with `ON ALL TABLES IN SCHEMA public`: migration
 3 deliberately puts control tables in that schema, and future private tables
-must not become reachable through defaults. The exact, checksum-pinned grant
-matrix is [`deploy/cockroach/runtime-role-grants.sql`](../deploy/cockroach/runtime-role-grants.sql);
+must not become reachable through defaults. The reviewed grant matrix is
+[`deploy/cockroach/runtime-role-grants.sql`](../deploy/cockroach/runtime-role-grants.sql);
 apply that file as an authorized administrator rather than hand-writing grants.
 It is deliberately narrower than the reusable library surface: per-table verbs
 only (for example `memory_chunk_history` receives `SELECT`/`DELETE` only, and
 `memory_attention` and `memory_claim_link_events` receive nothing), `USAGE` on
 only the claim, claim-support, and conflict ID sequences, and `SELECT` on
-`_sqlx_migrations`. The row-by-row table lives in
-[`deploy/localstack/README.md`](../deploy/localstack/README.md), and
-`deploy/cockroach/tests/runtime-role-grants.sh` proves the matrix against the
-reviewed source snapshot.
+`_sqlx_migrations`. The SQL file is the row-by-row reference. It grants
+nothing on the tables from migration 19 onward yet; when a runtime starts
+using them, extend the policy together with its migration-prefix gate and its
+closing grant-count postcondition.
 
 Grant the external private-writer login only membership in `fleet_runtime`; do
 not copy these DML/sequence grants onto the fixed publication login.
@@ -278,10 +281,10 @@ entire positive grant surface is `CONNECT` on `fleet_recall`, `USAGE` on schema
 It has zero DML, DDL, sequence, system, private-table, ownership, grant-option,
 or future-default authority. Apply
 [`publication-reader-role-grants.sql`](../deploy/cockroach/publication-reader-role-grants.sql)
-only as a cluster admin after prefix 1 through 17 -- a bounded gate that stays
-true at eighteen migrations, and which this release deliberately did not move --
-with `fleet_publication` already drained and set to exact `NOLOGIN`. Audit both
-principals and inherited PUBLIC authority across every database, freeze role,
+only as a cluster admin after prefix 1 through 17 (the policy's own gate;
+later migrations remain compatible), with `fleet_publication` already drained
+and set to exact `NOLOGIN`. Audit both principals and inherited PUBLIC
+authority across every database, freeze role,
 grant, default, ownership, and schema-DDL dependencies, reapply the policy
 under that freeze, and only then perform the separate exact authentication
 enable. Quiesce/drain the login and repeat the audit/reapply sequence after
@@ -290,40 +293,33 @@ the external login or its password/identity-provider binding.
 
 Then apply and verify the exact control-plane exclusions and one-shot bootstrap
 grants in [the private control bootstrap policy](CONTROL_BOOTSTRAP.md). The
-base policy can first run after migration 3 and remains valid at that stage. At
-the current post-v18 release, create/harden both frozen private logical roles by
-applying or reapplying the control and genesis-activation policies, then apply
+base policy can first run after migration 3 and remains valid at that stage.
+Once the database is past migration 14, create/harden both frozen private
+logical roles by applying or reapplying the control and genesis-activation
+policies, then apply the
 [quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql).
-That deny-only policy retains its own complete-successful-prefix-1-through-14
-gate, then revokes every privilege and grant option on the three successor
-tables from `public`, runtime, bootstrap, and genesis activation; it grants
-nothing. Migrations 15 through 17 add or replace indexes, not successor tables,
-and migration 18 adds only evidence-plane, content, and projection objects, so
-neither changes that quarantine's object set. The quarantine's three REVOKE
-targets stay byte-identical after migration 18.
-The base policy's checked-in grant proof machine-compares the normalized
-`SHOW GRANTS` result;
-runtime and `public` have no control-table privilege. The logical runtime and
-bootstrap bundles are forced to `NOLOGIN`, `NOCREATEROLE`, and `NOCREATEDB`;
-the policy removes their direct SYSTEM grants, inherited admin, and both
-runtime/bootstrap membership directions. It also re-revokes `public` grants on
-all current tables and sequences and resets the bootstrap role's complete
-current-object surface before adding back its exact ledger grants.
+That deny-only policy retains its own complete-successful-prefix-1-through-14 gate,
+then revokes every privilege and grant option on the three successor tables
+from `public`, runtime, bootstrap, and genesis activation; it grants nothing.
+Later migrations add no successor tables, so they do not change that
+quarantine's object set. Runtime and `public` have no control-table privilege.
+The logical runtime and bootstrap bundles are forced to `NOLOGIN`,
+`NOCREATEROLE`, and `NOCREATEDB`; the policy removes their direct SYSTEM
+grants, inherited admin, and both runtime/bootstrap membership directions. It
+also re-revokes `public` grants on all current tables and sequences and resets
+the bootstrap role's complete current-object surface before adding back its
+exact ledger grants.
 
 These scripts reset current objects; they do not establish a universal
 future-object rule for an unknown schema creator. Run `SHOW DEFAULT PRIVILEGES`
 as the actual migrator and require no table/sequence default that grants
-`public` or an application logical role. The pinned proofs freeze that exact
-empty result for their schema creator. Re-audit defaults and reapply both
+`public` or an application logical role. Re-audit defaults and reapply both
 current-object policies after every migration. Review all expanded grants and
 revoke unnecessary defaults.
 
 All three planned database URLs must use TLS verification. Keep credentials
 out of Terraform state, image layers, ECS environment literals, logs, and demo
-responses. The official local CockroachDB v26.2.3 TLS wrapper passes the
-PUBLIC-03 connected publication proof. Terraform's 21 configuration tests also
-pass, but the current Terraform has not been applied and neither local result
-proves an AWS deployment.
+responses.
 
 ### Stage-3 pre-activation gate
 
@@ -334,8 +330,8 @@ above. Before enabling a cloud activation path, provision a separate
 registry-activation SQL principal and TLS secret out of band, or add separately
 reviewed Terraform/task wiring that preserves the same isolation.
 
-After the current release has the complete successful migration prefix 1
-through 18 and the reapplied Stage-2 control-role policy, apply
+After the complete successful migration prefix 1 through 9 (later migrations
+are compatible) and the reapplied Stage-2 control-role policy, apply
 [`registry-activation-role-grants.sql`](../deploy/cockroach/registry-activation-role-grants.sql)
 as the cluster-admin/delegated security operator described above, not merely as
 the database owner. The genesis Stage-3 repository's compatibility preflight
@@ -384,8 +380,8 @@ Therefore the shard-head grant cannot be narrowed to
 `last_committed_offset`, `chain_digest`, and `advanced_at` in RBAC alone. Keep
 the activation credential exclusive to the reviewed private repository and
 unavailable to runtime, bootstrap, interactive users, and general operators.
-The grant proof freezes that repository's only shard-head `UPDATE`: it sets
-exactly those three columns and scopes the compare-and-swap by tenant, project,
+The repository's only shard-head `UPDATE` sets exactly those three columns and
+scopes the compare-and-swap by tenant, project,
 epoch, shard, prior offset, and prior chain digest. Changes to epoch, shard, or
 shard count are not part of the credential's reviewed application path.
 
@@ -468,43 +464,10 @@ no durable table exists — so the repository fails closed whenever the current
 head is absent, duplicated, or not `active`, and it never selects between rival
 successors.
 
-Run the dedicated secondary Docker RBAC proof before a ceremony:
-
-```bash
-./deploy/cockroach/tests/successor-activation-role-grants.sh
-```
-
-It freezes the exact policy/grant matrix, fail-closed preconditions, allowed and
-denied SQL operations, drift repair, external-audit shape, and reapplication on
-CockroachDB v26.2.3. It is packaging/RBAC parity, not the authoritative
-connected correctness result and not AWS evidence.
-
-Separately, run the pinned genesis-activation Docker RBAC proof before
-deployment:
-
-```bash
-./deploy/cockroach/tests/registry-activation-role-grants.sh
-```
-
-It machine-compares normalized database, schema, migration, control, registry,
-system, role-option, and bidirectional role-membership results after injecting
-and repairing direct, inherited, and `public` database/schema/table/sequence
-drift. It also proves a database owner cannot perform the cluster-security
-hardening and freezes an empty relevant `SHOW DEFAULT PRIVILEGES` result for
-the schema creator. It freezes the repository's sole exact shard-head CAS and
-event kind, pins and exercises the complete successful-prefix-1-through-9
-genesis preflight, and proves failed versions 4, 5, and 9 cannot be masked by
-the other successful rows. It exercises each allowed operation with valid
-foreign-key-bound rows and requires authorization failures for every forbidden
-table, sequence, DDL, and delegation path. The proof uses CockroachDB 26.2.3 by
-default and removes its isolated container afterward. This Docker RBAC lane
-owns the complete allow/deny/grant-option drift matrix, including successor
-quarantine. The authoritative official-binary correctness lane separately
-applies the complete migration chain through 18 and exercises the successor
-repository plus the successor workstation CLI's offline binding, readiness,
-inserted, accepted, exact-replay, and stale matrix under two bounded membership
-windows. It does not replace the separate Docker RBAC matrix or prove image,
-AWS, or deployment authority.
+The live suites `tests/registry_activation_live.rs`,
+`tests/successor_activation_live.rs`, and
+`tests/generic_successor_activation_live.rs` exercise these repositories
+against a real CockroachDB database.
 
 ### Conflict-detector reconciliation gate
 
@@ -562,24 +525,17 @@ cargo run --locked --bin ostk-conflict-reconcile -- apply \
 
 The command is apply-only and reports `materialized` or `exact_replay`. It has
 no inspect/server mode, Terraform secret, ECS task, production-image binary,
-runtime credential, MCP method, or HTTP route. Run the dedicated secondary
-Docker RBAC proof before use:
-
-```bash
-./deploy/cockroach/tests/conflict-reconciliation-role-grants.sh
-```
-
-That proof also exercises the optional-successor creator-default cleanup and
-exact role-edge preflights. It must not be cited as proof that the two policies
-self-compose: the cluster admin still performs the conditional cleanup and
-cross-database/PUBLIC audit before the policy and exclusive member window.
+runtime credential, MCP method, or HTTP route. The successor and
+reconciliation policies do not self-compose: the cluster admin still performs
+the conditional cleanup and cross-database/PUBLIC audit before each policy
+apply and exclusive member window.
 
 ## Failure and interruption recovery
 
 Versions 1 through 11 execute without a wrapping SQL transaction. Versions 12
 through 14 execute transactionally only through the reviewed application
-migrator and its dedicated CockroachDB session. Versions 15 through 18 return
-to nontransactional, resumable online schema changes. Never synthesize, update,
+migrator and its dedicated CockroachDB session. Versions 15 onward return to
+nontransactional, resumable online schema changes. Never synthesize, update,
 or delete a SQLx history row merely to bypass a gate. Recovery depends on the
 exact failed version:
 
@@ -591,10 +547,10 @@ exact failed version:
   `memory_control_events_predecessor_unique_idx` must fail with name drift
   instead of being accepted. Duplicate legacy predecessors must fail its unique
   backfill before any of migrations 6 through 9 remove a timestamp default.
-- v6 through v9 each contain exactly one `DROP DEFAULT`. The pinned
-  CockroachDB 26.2.3 proof verifies each statement is idempotent when its DDL
-  committed but SQLx success-row insertion was interrupted. Resume only after
-  catalog inspection confirms the expected column and no unrelated drift.
+- v6 through v9 each contain exactly one `DROP DEFAULT`, which is idempotent
+  when its DDL committed but SQLx success-row insertion was interrupted.
+  Resume only after catalog inspection confirms the expected column and no
+  unrelated drift.
 - v10 and v11 each create one schema-locked unique-index backfill, commit it,
   then assert its exact public catalog definition. If the exact index committed
   but SQLx history did not, the normal migrator retry is the reviewed recovery:
@@ -624,6 +580,10 @@ exact failed version:
   A `55000` from its closing assertions is not an interruption: it means an
   object with one of those names is not the object this migration defines, and
   it requires a separately reviewed forward repair rather than a retry.
+- v19 onward follow the v18 pattern: every object uses `IF NOT EXISTS`, the
+  normal migrator retry is the reviewed recovery after an interruption, and a
+  `55000` from a closing assertion means a same-name object has another shape
+  and needs a separately reviewed forward repair.
 
 1. Leave the application service at zero.
 2. Preserve the migration task logs and exact CockroachDB error.
@@ -681,20 +641,18 @@ exact failed version:
     conflict data to force a state through the gate. Any wrong-shape object or
     unrecognized combination requires a separately reviewed forward repair on
     a copy.
-11. For v16, v17, or v18, wait for the online job to finish. If the exact
+11. For v16 onward, wait for the online job to finish. If the exact
     object exists without its success row, rerun the normal migrator so
     `IF NOT EXISTS` and the catalog assertion record it. If the object is
     absent and no job remains, the same rerun rebuilds it. Stop on `55000`, job
     failure, or same-name drift; do not replace a durable index, table, or view
     merely to make history pass.
 12. Reconcile SQLx bookkeeping only through these reviewed paths after the
-    schema and completed jobs match the target. For the current release, keep
-    serving and ceremony credentials disabled until the database has exactly
-    the eighteen successful rows 1 through 18 and the object/grant audit
-    passes. Serving remains compatible with a later additive uninterrupted
-    prefix. The intentionally narrower private floors remain control 3,
-    genesis 9, successor 14, and reconciliation 16; none substitutes for the
-    current release-completion gate or grants another role's authority.
+    schema and completed jobs match the target. Keep serving and ceremony
+    credentials disabled until every embedded migration has a successful row
+    and the object/grant audit passes. The intentionally narrower private
+    floors remain control 3, genesis 9, successor 14, and reconciliation 16;
+    none grants another role's authority.
 
 There is no automatic down migration. ECS image rollback and database schema
 rollback are separate concerns: old binaries must remain compatible during a

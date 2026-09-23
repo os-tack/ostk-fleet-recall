@@ -164,8 +164,7 @@ meaning. Consolidation requires no new claim states: it composes existing
 
 ## Addendum 2026-08-16: waiver-model disposition
 
-Fable accepted the conflict-tolerance model as requirement input for W0-EPIS
-(`.fleet-recall/coordination/handoffs/2026-08-16-fable-re-waiver-model-to-w0-epis.md`).
+The conflict-tolerance model was accepted as requirement input for W0-EPIS.
 The discrepancy model in `docs/DYNAMIC_MEMORY_ARCHITECTURE.md` (§Discrepancy
 model, §Discrepancy families and episodes, DISC-01..05, AUTH-03) is
 authoritative; the §"Conflict tolerance is durable policy" section above is a
@@ -183,9 +182,7 @@ The reconciled semantics:
   and an expiry or review-by time — a signed lifecycle event under the active
   policy (DISC-05) that never rewrites evidence, severity, member claims, or
   the underlying expectation.
-- The six verification vectors from
-  `.fleet-recall/coordination/handoffs/2026-08-16-kimi-waiver-model-to-w0-epis.md`
-  are in W0-EPIS's brief verbatim under
+- The waiver model's verification vectors live under
   `contracts/dynamic-memory/v3/discrepancy/`: waive → expiry → same episode
   reopens (identity preserved); the waiver never splits or erases the
   incompatible interval; dismiss without justification rejected;
@@ -198,7 +195,7 @@ Amendments to this ADR:
 
 - §"Schema evolution" is deferred: `memory_conflicts` stays byte-stable and
   its evolution is not scheduled in Waves 0–3. The waiver columns described
-  there land whenever Fable and the SCHEMA owner schedule them.
+  there land when they are scheduled.
 - The consolidation contract implements only the read side of tolerance:
   `ConsolidationSourceConflictStateV1` mirrors `open`/`waived` from the live
   conflict projection at the repository seam, and CONS-04 makes both states

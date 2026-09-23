@@ -1,13 +1,12 @@
 # Opt-in OSTK fleet demo
 
 OSTK is **not** required to build, run, deploy, or use Fleet Recall. It is not
-required for the deterministic three-identity MCP scenario or the default
-tmux/VHS rehearsal. This directory is an optional integration experiment for
-people who already use OSTK and explicitly choose to launch bounded model
-sessions.
+required for the deterministic three-identity MCP scenario in the LocalStack
+harness. This demo is an optional integration experiment for people who
+already use OSTK and explicitly choose to launch bounded model sessions.
 
 This demo connects real OSTK agent sessions to Fleet Recall's stdio MCP server,
-then proves that recalled memory changes an external action. It runs entirely
+then shows that recalled memory changes an external action. It runs entirely
 against the repository's CockroachDB + LocalStack environment; it does not need
 an AWS account.
 
@@ -73,7 +72,7 @@ derives agent identity exclusively from kernel-stamped `OSTK_AGENT`.
 Prerequisites are Docker, AWS CLI, `jq`, OSTK 7.7.7, a model configured for
 OSTK, and the model bundle required by the LocalStack smoke environment.
 
-First keep the already-tested local stack running. The smoke script reads a
+First start the local stack and keep it running. The smoke script reads a
 LocalStack token from its documented environment or exact root `.env`
 assignment without sourcing that file.
 
@@ -152,9 +151,8 @@ Re-run the deterministic evidence gate for a known run:
   signed workload identity when that surface exists.
 - LocalStack and a single-node CockroachDB container validate contracts and
   data flow, not AWS availability or CockroachDB distributed fault tolerance.
-- The non-billable gates validate CLI shape and the bridge contract. Actual
-  OSTK sandbox execution remains unclaimed until an explicitly authorized live
-  run produces `target/ostk-demo/<run-id>/final.json`.
+- The non-billable tests validate CLI shape and the bridge contract; only an
+  explicitly authorized live run exercises actual OSTK sandbox execution.
 
 ## Non-billable tests
 

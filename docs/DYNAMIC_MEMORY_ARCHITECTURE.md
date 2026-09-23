@@ -1,26 +1,28 @@
 # Dynamic corpus and causal runtime architecture
 
-Status: **target architecture; stages 1–3 frozen; stage 4 partially implemented; stage 5 connectors and projectors implemented as private-plane library runtimes with connected proofs, reachable from no serving path; stages 6–10 contract vectors in progress**
+Status: **target architecture; stages 1–3 implemented, private only; stage 4 partially implemented; stage 5 connectors and projectors and the stage 6 normative, observer, and discrepancy runtimes implemented as private-plane library runtimes with live CockroachDB tests, reachable from no serving path; stage 8 partially implemented (CI connector); stage 7 not started; stages 9–10 contract vectors only**
 
 Fleet Recall currently serves a statically generated, revision-linked corpus
 and a deliberate typed-claim ledger. This document defines the target model in
 which that static corpus becomes a bootstrap snapshot and the durable memory is
 a replayable projection of authenticated evidence events.
 
-This is not a description of the judging deployment. The implemented system is
+This is not a description of the current deployment. The implemented system is
 documented in [ARCHITECTURE.md](ARCHITECTURE.md), its security boundary in
 [SECURITY.md](SECURITY.md), and the local-versus-fleet product decision in
 [ADR 0001](adr/0001-product-and-backend-boundary.md).
 
 No webhook, transport queue, remote ingress, incident controller, or public
 mutation route exists today. Two local connectors (agent transcripts and git
-history), the content-addressed body projector, the coverage runtime, the
-lexical-first/dense-later recall projectors, and the embedding worker's provider
-seam are implemented as private-plane library modules with live-CockroachDB
-proofs; no binary and no serving path constructs any of them, and no production
-embedding provider implements that seam. The current source does implement the
-bounded PUBLIC-03 publication identity and planned AWS task input separation;
-those Terraform changes have not been applied.
+history), a CI workflow-run connector, the content-addressed body projector,
+the coverage runtime, the lexical-first/dense-later recall projectors, the
+embedding worker's provider seam, and the Stage-6 normative activation,
+observer, and discrepancy runtimes are implemented as private-plane library
+modules with live CockroachDB tests. No serving path constructs any of them
+(only the observer has a runner, the private `ostk-observer-run` binary), and
+no production embedding provider implements that seam. The current source does
+implement the bounded PUBLIC-03 publication identity and planned AWS task input
+separation; those Terraform changes have not been applied.
 
 ## Purpose
 
@@ -644,7 +646,9 @@ claims three fact families — commit facts, blob-source facts, and ref
 Neither connector can widen what is admissible: only the admission seam resolves
 a connector schema from the active package, rederives resource identity, and
 binds scope to the writer credential, so a candidate naming a foreign scope or a
-connector outside the active package is refused before anything is written.
+connector outside the active package is refused before anything is written. A
+third connector for CI workflow runs (migration 0026) follows the same pattern;
+see stage 8 below.
 
 Downstream, a body projector consumes the accepted-event stream into
 content-addressed bodies, chunk occurrences with their raw-source spans, one
@@ -664,8 +668,8 @@ embedding-provider seam. The tiers occupy different tables, keep independent
 cursors, and share no statement, so a failing or absent provider cannot remove
 lexical availability — which is also what lets the dense vector index keep the
 equality-prefixed, `NOT NULL` shape CockroachDB's C-SPANN requires. No
-production embedding provider implements that seam; the connected proofs drive
-it with a deterministic fixture, including its outage and degenerate-vector
+production embedding provider implements that seam; the live tests drive it
+with a deterministic fixture, including its outage and degenerate-vector
 paths.
 
 None of these modules is reachable from the serving process or from any binary,
@@ -896,11 +900,7 @@ re-witnesses the fixed login, database, application name, and canonical search
 path. Terraform now separates the publication secret, execution role, task
 role, and customer-managed KMS key scope from writer paths.
 
-That is source evidence, not a claim about the historical judging deployment.
-The official CockroachDB v26.2.3 TLS wrapper and the full production-image
-LocalStack smoke passed locally; LocalStack used an insecure database and no
-real IAM or Fargate. Terraform remains unapplied, and the historical live
-revision-10 route predates this boundary. A production activation must still
+That Terraform has not been applied in this form. A production activation must
 repeat the external cross-database/PUBLIC audit and directly verify live grants
 and task inputs before serving.
 
@@ -925,7 +925,7 @@ its answers.
 That grant is a deployment action, and it has not been made. The deployed
 `fleet_publication_reader` role still holds `SELECT` on exactly the eight tables
 listed above and on neither new view; the grant statements are generated by the
-projector module and applied only inside the connected proof.
+projector module and applied only inside its live test.
 
 ## Failure, convergence, and history
 
@@ -960,7 +960,7 @@ This does not require or authorize dynamic ingestion.
    signer set, and threshold.
 3. **Checked in, private only:** genesis and first-successor activation
    repositories with compare-and-swap heads, replay, stale-candidate, and
-   contested-history proofs. No deployment or serving path consumes those
+   contested-history tests. No deployment or serving path consumes those
    accepted heads yet.
 4. Add general accepted-evidence and relation-attestation events. Make
    synchronous `remember` atomically append its event and projection. Prove
@@ -984,13 +984,14 @@ This does not require or authorize dynamic ingestion.
    signed, content-addressed event; and the repeatable generic `N -> N+1`
    registry activation runtime with its private workstation CLI. These
    evidence, content, relation, and witness modules compile into the library
-   but are not yet reachable from the running server; each carries live
-   CockroachDB proofs that the official-binary lane discovers and runs by exact
-   name. Still absent: enabling the `assert` route so synchronous `remember`
-   itself appends-and-projects in one transaction (the configuration pins plus
-   a witness loader that mints accepted events); and wiring any of these dormant
-   modules into a serving path. The Stage-5 connectors and projectors below have
-   since landed on those same dormant terms.
+   but are not yet reachable from the running server; each has live
+   CockroachDB tests. Still absent: enabling the `assert` route so synchronous
+   `remember` itself appends-and-projects in one transaction (the configuration
+   pins plus a witness loader that mints accepted events); a migration for the
+   proposed `memory_bootstrap_import_rows` table the bootstrap-manifest import
+   writes, without which that CLI cannot complete; and wiring any of these
+   dormant modules into a serving path. The Stage-5 connectors and projectors
+   below have since landed on those same dormant terms.
 5. Project one local transcript connector and one Git history connector into
    content-addressed repository membership and lexical-first/dense-later evidence
    with local cursors and coverage receipts. Arrow IPC may carry bounded batches
@@ -1024,9 +1025,27 @@ This does not require or authorize dynamic ingestion.
    is constructed only by its own tests; and the publication-role grant on the
    two new views, which is a deployment action that has not been performed.
 6. Admit one exhaustive code/spec observer and add basic discrepancy derivation.
+
+   Implemented, private only. Landed: migration 0024 and the normative
+   activation runtime (a per-binding-family composite compare-and-set head, an
+   append-only normative log of lifecycle events and contest records, and the
+   active-normative projection advanced atomically with its cursor); the
+   exhaustive observer runtime and its private `ostk-observer-run` worker,
+   which evaluates one enum at one exact commit and blob and admits a run
+   receipt plus a typed observer result through the evidence admission seam;
+   and migration 0027 and the discrepancy ledger runtime (a per-episode head,
+   an append-only episode log, family-keyed episode relations, and a
+   deterministic episode projection advanced atomically with its log). Still
+   absent: glue that feeds observer results and active normative bindings into
+   discrepancy derivation, and any serving path.
 7. Add authenticated private ingress, durable queueing, remote connector
    cursors, and dead-letter/quarantine behavior.
 8. Add provider-verified PR, CI, artifact, and deployment relations.
+
+   Partially implemented, private only: migration 0026 and the CI-evidence
+   connector, which turns workflow runs into accepted events through the same
+   admission seam and records exactly which finite range of runs each connector
+   instance read. PR, artifact, and deployment relations are not implemented.
 9. Add observation receipts and read-only incident reconstruction.
 10. Consider action proposal and authorization only after the read-only
     incident model is independently safe and replayable.
@@ -1052,14 +1071,17 @@ may remain Arrow-native because they are reproducible and cite the exact source
 event and projector/model digests. Unknown schemas, duplicate event positions,
 oversized batches, or row/preimage disagreement fail closed into quarantine.
 
-## Design admission gates
+## Design guidelines
 
-No implementation stage begins until every contract consumed by that stage has
-authoritative test vectors. Stages 1–9 require the applicable read-plane,
-evidence, registry, replay, graph, discrepancy, redaction, and
-privilege-separation vectors below. Stage 10 additionally requires action
-proposal, authorization, execution-attempt, stale-precondition,
-idempotency-collision, reconciliation, and verification vectors.
+Prefer to define the contracts a stage consumes, with representative test
+vectors for anything that carries identity or authority, before building its
+runtime, and grow tests alongside the implementation. This is guidance, not a
+gate: a stage can land incrementally. The areas below are the ones stages 1–9
+most often need read-plane, evidence, registry, replay, graph, discrepancy,
+redaction, and privilege-separation coverage for. Stage 10 should additionally
+cover action proposal, authorization, execution-attempt, stale-precondition,
+idempotency-collision, reconciliation, and verification behavior before it
+acts on anything.
 
 - Canonical resource identifiers and normalization rules
 - Registry canonicalization, pinned genesis/bootstrap authority, prior-policy
@@ -1718,6 +1740,6 @@ The following remain deployment choices rather than epistemic ambiguities:
   the fixed v1 ceilings;
 - service sizing, autoscaling, and regional topology.
 
-Each choice must still satisfy the invariant registry and admission gates. None
-may alter semantic event identity, authority, applicability, replay, erasure,
-discrepancy, causal, or public-boundary behavior.
+Each choice must still satisfy the invariant registry and the design
+guidelines. None may alter semantic event identity, authority, applicability,
+replay, erasure, discrepancy, causal, or public-boundary behavior.

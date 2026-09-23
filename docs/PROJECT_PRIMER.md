@@ -6,7 +6,7 @@ An inference call is temporary, but the decisions made around it can govern work
 
 ## What survives replacement
 
-The ECS/Fargate application tasks are deliberately stateless. Corpus chunks, typed claims, support records, idempotency receipts, conflicts, and action history live in CockroachDB Cloud, so a complete serving-task replacement does not erase memory. The historical revision-6 AWS verifier replaced the whole running task set and then recalled the exact same action and escalation claim IDs through lexical and vector retrieval. Separately, the current production-image LocalStack proof replaced the publication container and preserved recall at source commit `cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4`; that local result is not AWS evidence.
+The ECS/Fargate application tasks are deliberately stateless. Corpus chunks, typed claims, support records, idempotency receipts, conflicts, and action history live in CockroachDB Cloud, so a complete serving-task replacement does not erase memory.
 
 ## Why CockroachDB is the memory plane
 
@@ -26,7 +26,7 @@ A typed claim can cite an exact corpus chunk using its source coordinate and con
 
 ## What runs on AWS
 
-CloudFront provides the public HTTPS viewer endpoint and forwards uncached read-only requests to a restricted Application Load Balancer. Private-subnet ECS/Fargate tasks run the Rust service, pull the immutable image from ECR, load the pinned embedding model from a private S3 prefix, and send bounded operational evidence to CloudWatch Logs. The current checked-in Terraform gives the public task a distinct publication secret, execution role, task role, and customer-managed KMS key scope; writer and migrator credentials remain on private task paths. That plan is validated but unapplied. The historical live revision-10 deployment predates this PUBLIC-03 source change and proves the public route, not the new IAM/database separation. CockroachDB Cloud remains the durable data plane when any individual AWS task stops.
+CloudFront provides the public HTTPS viewer endpoint and forwards uncached read-only requests to a restricted Application Load Balancer. Private-subnet ECS/Fargate tasks run the Rust service, pull the immutable image from ECR, load the pinned embedding model from a private S3 prefix, and send bounded operational logs to CloudWatch. The current checked-in Terraform gives the public task a distinct publication secret, execution role, task role, and customer-managed KMS key scope; writer and migrator credentials remain on private task paths. That plan is validated but not yet applied. CockroachDB Cloud remains the durable data plane when any individual AWS task stops.
 
 ## What the public demo can and cannot do
 

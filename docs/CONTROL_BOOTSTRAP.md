@@ -42,12 +42,12 @@ uses the receipt's profile reference. It then requires canonical bytes,
 manifest closure, all genesis entry kinds and dependencies, exact semantic
 scope, valid Ed25519 attestations, and the signer threshold before connecting
 to CockroachDB. After connecting it requires exactly three successful SQLx rows
-for the uninterrupted prefix 1 through 3 before touching the control tables;
-a later successful migration cannot mask a failed or missing prerequisite.
-This is deliberately a Stage-2 compatibility gate, not proof that the current
-release's exact prefix 1 through 18 is complete, that serving's minimum
-uninterrupted prefix of 18 is ready, or that genesis/successor/reconciliation
-authority exists. Neither artifact may override physical or semantic routing.
+for the uninterrupted prefix 1 through 3 before touching the control tables; a
+later successful migration cannot mask a failed or missing prerequisite. This
+is deliberately a Stage-2 compatibility gate, not proof that every embedded
+migration has been applied, that serving's minimum prefix is ready, or that
+genesis/successor/reconciliation authority exists. Neither artifact may
+override physical or semantic routing.
 
 Apply once, then audit a replay using the same authority:
 
@@ -81,7 +81,7 @@ The current checked-in application/Terraform design has three distinct database
 capability paths and raw secret values:
 
 1. the migrator owns/applies schema and is dormant afterward;
-2. the private writer performs seed/reference/MCP DML through only the
+2. the private writer performs seed/MCP DML through only the
    hardened `NOLOGIN` `fleet_runtime` logical role; and
 3. the fixed external `fleet_publication` login serves only the read-only demo
    through the non-login `fleet_publication_reader` logical role.
@@ -113,15 +113,13 @@ Stage-2 control secret or task.
 
 The base policy can first be applied after migration 0003 and must remain
 runnable at that original Stage-2 boundary. Reapply it after later migrations
-create objects. For the current complete release prefix through migration 0017,
-also apply or reapply the genesis-activation base role policy, followed by the
-deny-only
+create objects. Once the database is past migration 0014, also apply or
+reapply the genesis-activation base role policy, followed by the deny-only
 [quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql).
 The quarantine deliberately retains its complete successful prefix 1 through
 14 gate because migrations 12 through 14 create its three successor tables and
-15 through 17 only add/replace indexes, and 18 adds only evidence-plane,
-content, projection, and writer-authority objects. It revokes those tables from the
-existing application roles and grants nothing. Connect to the dedicated
+later migrations add none. It revokes those tables from the existing
+application roles and grants nothing. Connect to the dedicated
 `fleet_recall` database as a cluster admin, or as a dedicated security operator
 with `CREATEROLE`, the required role admin options and SYSTEM grant options,
 plus grant authority on every object in the policy, and apply
@@ -129,8 +127,7 @@ plus grant authority on every object in the policy, and apply
 If the database has another name, produce and review a copy with the database
 identifier changed; do not interpolate an unchecked identifier into SQL.
 Database ownership alone cannot perform the role-option, membership, and SYSTEM
-hardening; the checked-in proof requires those statements to fail for a
-database-owner-only user.
+hardening.
 
 The resulting bootstrap role has:
 
@@ -156,7 +153,7 @@ default. Run `SHOW DEFAULT PRIVILEGES` as the actual migrator and require no
 table/sequence default granting `public` or either application logical role;
 reapply and re-audit after migrations create objects.
 
-After migration 0014, that audit and quarantine proof must show no `public`,
+After migration 0014, that audit must show no `public`,
 runtime, bootstrap, or genesis-activation grant on
 `memory_registry_transitions`,
 `memory_registry_genesis_bridge_consumptions`, or
@@ -182,15 +179,12 @@ emitter) run the same ceremony under the same
 production SQL surface reaches only `memory_control_events`,
 `memory_control_shard_heads`, `memory_registry_transitions`,
 `memory_registry_current_heads_v2`, and the migration-history preflight, all of
-which the frozen first-successor role already covers, and the
-[successor-activation grant proof](../deploy/cockroach/tests/successor-activation-role-grants.sh)
-asserts that containment directly. At generation `N >= 1` there is no key
-bridge: the authorizing keys come from the package the current head installs,
-which the ceremony supplies as an artifact so its whole approval closure is
-checked offline before any database URL is parsed. Like the first-successor
-CLI it has no Terraform, production-image, ECS, MCP, HTTP, or serving-runtime
-wiring; CI asserts `/usr/local/bin/ostk-registry-generic-successor-activate`
-is absent from the runtime image.
+which the first-successor role already covers. At generation `N >= 1` there is
+no key bridge: the authorizing keys come from the package the current head
+installs, which the ceremony supplies as an artifact so its whole approval
+closure is checked offline before any database URL is parsed. Like the
+first-successor CLI it has no Terraform, production-image, ECS, MCP, HTTP, or
+serving-runtime wiring, and the production image does not contain it.
 
 After the complete successful prefix 1 through 16, conflict reconciliation has
 its own separate database-local one-shot
@@ -226,26 +220,7 @@ grants, which this dedicated-database policy replaces explicitly:
 - <https://www.cockroachlabs.com/docs/v26.2/grant>
 - <https://www.cockroachlabs.com/docs/stable/security-reference/authorization>
 
-Run the disposable local proof before deployment:
-
-```bash
-./deploy/cockroach/tests/control-role-grants.sh
-```
-
-The proof starts an isolated local CockroachDB, applies the frozen
-Stage-2/genesis migration slice 0003 through 0009, injects and repairs
-role-option, SYSTEM, admin/cross-role, direct-object, and `public` drift,
-asserts exact
-current/default privileges, proves a database owner cannot run cluster-security
-hardening, freezes the command's distinct successful-prefix-1-through-3 gate,
-exercises each allowed statement, and rejects authorization escapes and a
-duplicate predecessor. It prints the effective grants and removes the
-container. This is the frozen Stage-2/genesis-role proof boundary, not a
-successor writer or current application-image migration-parity proof. The
-authoritative official CockroachDB v26.2.3 correctness lane covers versions 1
-through 18 and exercises the successor repository, functional-polarity matrix,
-conflict-reconciliation repository/CLI, and the complete successor-CLI state
-matrix under temporary role-membership windows. The successor and
-reconciliation allow/deny/grant-option matrices remain separate secondary
-Docker RBAC results and do not become authoritative merely because their build
-tag matches. Neither substrate contacts AWS or needs LocalStack.
+`tests/control_log_live.rs` exercises the control-ledger repository against a
+real CockroachDB database; see the README's
+[development workflow](../README.md#development-workflow) for running the live
+tests.

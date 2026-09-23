@@ -4,11 +4,9 @@ These fixtures freeze the dead-letter boundary for rejected deliveries. Every
 `.jsonl` file contains one canonical JSON record plus exactly one repository-
 framing LF. The LF is excluded from `quarantine_id()` and every other
 *contract* digest — it is trailing whitespace to the frozen canonicalization
-profile's parser, not part of the canonical document — but it is included in
-the pinned raw *file* SHA-256 constants below, which hash the file exactly as
-it sits in the repository. None of the fixture scope, connector identity,
-delivery ID, or digest carries runtime authority — these are structural
-assertions, not active-registry or admission witnesses.
+profile's parser, not part of the canonical document. None of the fixture
+scope, connector identity, delivery ID, or digest carries runtime authority —
+these are structural assertions, not active-registry or admission witnesses.
 
 ## What `QuarantineRecordV1` is, and is not
 
@@ -244,28 +242,24 @@ the payload's digest — rendered as hex — appears exactly once, in
 `vector-suite.jsonl` is a single canonical JSON summary record pinning the
 digest-domain prefix, every positive fixture's file name/reason/
 `quarantine_id`, the closed list of negative-case labels, and the leakage
-test's name. Its own raw bytes are pinned from Rust exactly like every other
-fixture in this directory. Its per-entry `quarantine_id` values are not only
-raw-SHA pinned: `vector_suite_quarantine_ids_match_referenced_fixtures`
-decodes the suite, loads the exact fixture each `positive_cases` entry
-names, and recomputes `quarantine_id()` from that fixture, asserting it
-equals the pinned value — so a suite entry that drifted from the fixture it
-claims to describe (a stale `quarantine_id`, or a `reason` that no longer
-matches the fixture's own `reason`) fails the build, not just a raw-byte
-diff against the suite document's own bytes.
+test's name. `vector_suite_quarantine_ids_match_referenced_fixtures` decodes
+the suite, loads the exact fixture each `positive_cases` entry names, and
+recomputes `quarantine_id()` from that fixture, asserting it equals the
+suite's value — so a suite entry that drifted from the fixture it claims to
+describe (a stale `quarantine_id`, or a `reason` that no longer matches the
+fixture's own `reason`) fails the build.
 
-## Digests are pinned, not regenerated
+## Golden digests
 
-Every fixture's raw file SHA-256 and every positive fixture's derived
-`quarantine_id` are hardcoded as Rust `const`s in
-`src/memory_contracts/quarantine.rs`'s test module and asserted on every
-test run. Changing any canonical record, the digest-domain prefix, or the
+Every positive fixture's derived `quarantine_id` is hardcoded as a Rust
+`const` in `src/memory_contracts/quarantine.rs`'s test module and asserted on
+every test run. Changing any canonical record, the digest-domain prefix, or the
 byte/attempt-count bounds is a contract-version change, not a fixture
 regeneration.
 
-Every one of the fifteen fixtures in this directory (nine positive, five
-negative, and `vector-suite.jsonl`) is additionally asserted, from Rust, to
-be exactly its own canonical form: each fixture test strips the one
+Every fixture in this directory (positive, negative, and
+`vector-suite.jsonl`) is additionally asserted, from Rust, to be exactly its
+own canonical form: each fixture test strips the one
 repository-framing trailing LF and calls
 `canonical::require_canonical` on what remains, which re-parses the bytes
 and rejects anything whose canonical re-encoding differs from the input —

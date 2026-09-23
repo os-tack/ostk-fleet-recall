@@ -1,59 +1,10 @@
-# Cloud onboarding for the hackathon demo
+# Cloud onboarding
 
-This is the human-approved path from the validated LocalStack deployment to a
-real AWS and CockroachDB Cloud demo. It does not automate account creation,
+This is the human-approved path from a validated LocalStack run to a real AWS
+and CockroachDB Cloud deployment. It does not automate account creation,
 billing choices, DNS ownership, or database credentials. Do not place database
 URLs, passwords, AWS access keys, or secret values in this repository,
 Terraform variables, command-line arguments, screenshots, or shell history.
-
-Recorded revision-10 release state: the onboarding path was completed for the
-live submission candidate at
-<https://d13zrqfh66r7ub.cloudfront.net>. Immutable image `git-56b577c82b9c`
-at source commit `56b577c82b9c5a5c80d73103f7f6b56d51698872` runs with all
-four task-definition families at revision 10; the service is 1/1 healthy. The
-idempotent rich-seed task exited zero and upserted exactly 552 rows: 346 documentation
-chunks, 2 code chunks, and 204 operations chunks. The public API returned the
-exact release revision and source-line ranges for repository-backed hits.
-Final desktop and 390px mobile QA verified safe inline Markdown, immutable exact
-`#Lx-Ly` links, a relative repository link rendered as a code-styled anchor,
-and no horizontal overflow. The final seven-query smoke gate passed.
-The ECR Basic OS-package scan is `COMPLETE` with an empty finding-severity
-count; this does not claim
-language or application-dependency coverage. GitHub Actions run
-[`31832684235`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31832684235)
-completed all five jobs successfully. The checked-in seven-query public
-relevance receipt remains historical revision-7 evidence. The self-audit,
-reference-agent, replacement, and validation artifacts remain historical
-revision-6 evidence; the Cloud `EXPLAIN` is separately captured historical plan
-evidence. None was rerun for revision 10.
-
-The current checkout is newer than that recorded deployment. Its embedded
-migrator now contains versions 1 through 18, including private control-ledger,
-genesis-activation and successor-schema projections, detector-versioned
-conflict uniqueness, exact reconciliation/current-projection indexes, and the
-Stage-4 evidence plane, governed content store, relation projection, and
-writer-authority view (ADR 0002).
-Current source release completion requires exactly the eighteen successful
-rows 1 through 18. Serving requires an uninterrupted successful prefix of at
-least 18 and remains compatible with later additive migrations. The private
-compatibility gates remain control 3, genesis 9, successor repository 14, and
-conflict reconciliation 16. Do not
-reinterpret the live revision-10 schema-2 status or 552-row seed as evidence
-that the later migrations, roles, or private ceremonies were deployed. This
-source and runbook update is not approval to rerun migration, change
-CockroachDB grants, or take any AWS action against the recorded live candidate.
-
-The older LocalStack receipt remains historical application-image evidence only
-through migration 9. Separately, a clean-checkout PUBLIC-03 LocalStack run at
-commit `cd6ecfc` passed the current prefix-17 migration, three-secret
-publication boundary, denial probes, and replacement check. Its
-[durable receipt](evidence/localstack-publication-cd6ecfc-20260816.json) records
-an insecure local CockroachDB lane and explicitly marks AWS apply, IAM
-enforcement, TLS, database-password authentication, and Fargate as unproved.
-The official local CockroachDB v26.2.3 TLS wrapper also passes the connected
-publication-reader proof, and Terraform's 21 configuration tests pass. None of
-those local results changes the historical AWS facts above: current Terraform
-is unapplied and no PUBLIC-03 AWS deployment or activation has occurred.
 
 The labels below are gates:
 
@@ -75,12 +26,10 @@ aws --version
 docker buildx version
 docker info --format 'server={{.ServerVersion}} arch={{.Architecture}}'
 
-# Terraform is currently cached here even though it is not on PATH.
-export PATH="/private/tmp/terraform-1.15.8:$PATH"
 terraform version
 
 # This must succeed after AWS SSO onboarding. It prints identity metadata only.
-AWS_PROFILE=ostk-hackathon
+AWS_PROFILE=ostk-fleet-recall
 AWS_REGION=us-east-1
 export AWS_PROFILE AWS_REGION
 aws sts get-caller-identity --query Arn --output text
@@ -88,16 +37,11 @@ aws sts get-caller-identity --query Arn --output text
 
 Deployment-workstation notes:
 
-- AWS CLI, Docker, Buildx, `jq`, and the cached Terraform binary were used for
-  the live deployment. AWS SSO sessions are temporary; authenticate again
-  before any follow-up operation.
+- AWS SSO sessions are temporary; authenticate again before any follow-up
+  operation.
 - `deploy/aws/run-migration.sh` and the other wrappers require `terraform` to
   be on `PATH`.
-- The migration, runtime grants, and publication-safe Cloud `EXPLAIN` capture
-  were completed. The plan fixture used a separate logical database; production
-  data was untouched, the fixture database was dropped, and the temporary
-  workstation network rule was removed.
-- The tested bundle is preserved as regular files under the ignored
+- Keep the model bundle as regular files under the ignored
   `.models/potion-retrieval-32M/hf-6fc8051fab2a1e0ee76689cf08c853792ac285e7/`
   directory. Git does not track the 129 MB weights.
 
@@ -125,7 +69,7 @@ budget, and region. This runbook assumes `us-east-1`.
 ## 2. Configure the non-root deployment identity
 
 **APPROVAL REQUIRED:** Enable IAM Identity Center, create a human deploy user,
-and assign it to this account. For the short hackathon deployment, approve
+and assign it to this account. For a short-lived demo deployment, approve
 either a time-limited administrator permission set or a reviewed custom set
 covering the resources in `deploy/aws`. The Terraform deployer must be able to
 manage IAM roles and policies, ECR, ECS/Fargate, EC2 security groups, ALB,
@@ -135,10 +79,10 @@ not grant all required IAM administration.
 Configure temporary SSO credentials rather than static access keys:
 
 ```bash
-aws configure sso --profile ostk-hackathon
-aws sso login --profile ostk-hackathon
+aws configure sso --profile ostk-fleet-recall
+aws sso login --profile ostk-fleet-recall
 
-AWS_PROFILE=ostk-hackathon
+AWS_PROFILE=ostk-fleet-recall
 AWS_REGION=us-east-1
 export AWS_PROFILE AWS_REGION
 aws sts get-caller-identity --query Arn --output text
@@ -155,7 +99,7 @@ temporary session expires.
 Secrets Manager, ALB, and ACM. Use the same provider/region for CockroachDB
 Cloud when available. The current default is `us-east-1`.
 
-Recommended hackathon network:
+Recommended demo network:
 
 - one VPC;
 - two public ALB subnets in distinct availability zones;
@@ -169,7 +113,7 @@ One NAT is the lower-cost demo choice but is a single-AZ egress dependency and
 can incur cross-AZ charges. A NAT Gateway per AZ is the more resilient,
 higher-cost production choice. Public task subnets avoid NAT charges, but task
 IPs are not stable and would force a broad database allowlist; do not use that
-shortcut for the public submission. AWS documents the trade-off in
+shortcut for a public deployment. AWS documents the trade-off in
 [ECS outbound networking](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/networking-outbound.html)
 and bills NAT per hour and per processed GB under
 [NAT Gateway pricing](https://docs.aws.amazon.com/en_en/vpc/latest/userguide/nat-gateway-pricing.html).
@@ -191,17 +135,16 @@ aws ec2 describe-nat-gateways \
 
 ## 4. Prepare the public HTTPS name
 
-The live submission candidate uses the Terraform CloudFront mode and generated
-hostname <https://d13zrqfh66r7ub.cloudfront.net>; it did not require a custom
-domain or ACM certificate. CloudFront's default certificate terminates viewer
+The default Terraform CloudFront mode uses a generated `*.cloudfront.net`
+hostname and needs no custom domain or ACM certificate. CloudFront's default
+certificate terminates viewer
 HTTPS, and AWS fixes the generated-hostname viewer policy at a TLSv1 minimum
 while permitting negotiation of newer TLS. CloudFront connects to the ALB over
 HTTP port 80. The origin is restricted to AWS's CloudFront origin-facing
 managed prefix list and a Terraform-generated secret header. This is not
 end-to-end TLS and must not be described as enforcing a TLS 1.2 viewer minimum.
 
-The following custom-domain path remains available as an alternative, but it
-was not used for this deployment.
+The following custom-domain path is an alternative.
 
 **APPROVAL REQUIRED — COST-BEARING:** Approve an existing domain and DNS
 provider, or explicitly approve purchase of a non-refundable domain. Route 53
@@ -265,7 +208,7 @@ Create:
 - `fleet_migrator`: DDL-capable for the one-off schema migration;
 - `fleet_writer`: no admin membership; after policy application it receives
   membership only in the hardened `NOLOGIN` `fleet_runtime` logical role for
-  the private seed/reference/MCP DML grants documented in
+  the private seed/MCP DML grants documented in
   [MIGRATIONS.md](MIGRATIONS.md); and
 - `fleet_publication`: the fixed public-application login, provisioned outside
   Terraform and kept in exact `NOLOGIN` state until its policy ceremony is
@@ -273,8 +216,8 @@ Create:
 
 CockroachDB Cloud UI-created SQL users initially receive `admin`. Revoke it
 from `fleet_writer` and `fleet_publication` before use; immediately quiesce
-`fleet_publication` with exact `NOLOGIN`. After migration, apply the exact
-checksum-pinned runtime policy
+`fleet_publication` with exact `NOLOGIN`. After migration, apply the reviewed
+runtime policy
 [`deploy/cockroach/runtime-role-grants.sql`](../deploy/cockroach/runtime-role-grants.sql)
 to the `fleet_runtime` logical role: per-table private-writer verbs on the
 legacy corpus, claim, conflict, receipt, and event tables, `USAGE` on only the
@@ -300,16 +243,13 @@ runtime path exists. After the prefix reaches 14 and the two earlier frozen
 private logical-role policies have run, apply the deny-only
 [quarantine policy](../deploy/cockroach/successor-schema-quarantine-grants.sql);
 it gates on all fourteen successful rows, revokes every existing application
-role named by that policy, and grants nothing. Migrations 15 through 17 add or
-replace indexes and migration 18 adds only evidence-plane, content,
-projection, and writer-authority objects, so neither changes the quarantine's
-table set. See
+role named by that policy, and grants nothing. Later migrations add no
+successor tables, so they do not change the quarantine's table set. See
 [CockroachDB access management](https://www.cockroachlabs.com/docs/cockroachcloud/managing-access).
 
 The publication login never receives those writer grants directly. After the
-complete successful prefix 1 through 17 -- a bounded gate that stays true at
-eighteen migrations, and which this release deliberately did not move -- a
-cluster admin applies
+complete successful prefix 1 through 17 (the policy's own gate; later
+migrations remain compatible), a cluster admin applies
 [`publication-reader-role-grants.sql`](../deploy/cockroach/publication-reader-role-grants.sql)
 while `fleet_publication` is drained and exact `NOLOGIN`. The policy creates
 and hardens the logical `fleet_publication_reader` role to `NOLOGIN`, then
@@ -367,8 +307,7 @@ rejects missing, wildcard, or colliding references. The public application has
 distinct publication execution and task roles, consumes only the publication
 secret, and uses only its concrete publication-specific CMKs for conditional
 decrypt. The publication CMK list must be disjoint from the writer/migrator
-list. The 21 Terraform configuration tests cover these boundaries and pass,
-but the current configuration remains unapplied. The module has no
+list. The module's Terraform tests cover these boundaries. The module has no
 control-bootstrap, genesis-activation, successor, or conflict-reconciliation
 secret input, IAM execution role, ECS task, startup hook, or public route. Do
 not overload any deployed AWS secret with a private ceremony credential.
@@ -407,8 +346,8 @@ local operator process; disable the login or remove the secret afterward. If
 the Stage-3 genesis-activation ceremony is run, create another distinct
 principal with the exact activation grants in [MIGRATIONS.md](MIGRATIONS.md)
 and retire it after use. That genesis repository keeps its prefix-1-through-9
-compatibility gate even when the current release prefix reaches 18; it has no
-successor-table authority. The successor repository keeps its prefix-14 gate,
+compatibility gate as later migrations land; it has no successor-table
+authority. The successor repository keeps its prefix-14 gate,
 and reconciliation keeps prefix 16; neither one-shot logical role nor any
 member is authorized by any of the three planned AWS credentials. All private
 ceremonies remain local until a separate deployment increment adds and reviews
@@ -417,9 +356,9 @@ summarized in [SECURITY.md](SECURITY.md).
 
 ## 7. Preserve and upload the pinned model
 
-The tested bundle has already been copied out of temporary storage into the
-Git-ignored `.models/` directory. Verify the regular-file release bundle and
-recompute its application digest before upload:
+Copy the bundle out of temporary storage into the Git-ignored `.models/`
+directory. Verify the regular-file release bundle and recompute its
+application digest before upload:
 
 ```bash
 cd /absolute/path/to/ostk-fleet-recall
@@ -503,10 +442,10 @@ Continue with [the AWS deployment runbook](../deploy/aws/README.md), using:
 - a generated tenant UUID and the trusted project/agent names;
 - an immutable commit-derived ECR image tag; and
 - exactly one public HTTPS mode: `enable_cloudfront = true` with no certificate
-  ARN for the generated hostname (the selected live mode), or a covered ACM
-  certificate ARN plus exact custom demo hostname.
+  ARN for the generated hostname, or a covered ACM certificate ARN plus exact
+  custom demo hostname.
 
-Retain the safe judging defaults from `terraform.tfvars.example`:
+Keep the safe defaults from `terraform.tfvars.example`:
 
 ```hcl
 log_retention_days         = 60
@@ -520,129 +459,22 @@ quiesced. Under a dependency freeze, repeat the external audit and reapply the
 policy immediately before enabling that exact login. Run the one-off
 idempotent seed task with the writer secret, then approve scaling the public
 service, which receives only the publication secret, to one.
-For a separately approved deployment of the current checkout, that migration
-task must finish exactly the uninterrupted prefix 1 through 18: versions 1
-through 11 use the nontransactional policy (with resumable exact-catalog
-assertions in v10/v11), v12 through v14 use the dedicated transactional
-session, and v15 through v18 return to resumable nontransactional online DDL.
-Serving remains compatible with a later additive successful prefix, but the
-current release artifact contains exactly 1–18. Do not substitute manual SQL or
-a Docker-only smoke for that release gate.
-Validate HTTPS and recall, force a task replacement, and prove recall again.
-Capture representative Cloud `EXPLAIN` separately with the approved bounded
-method before final submission; capability flags and RRF observations are not
-a physical-plan substitute. The completed capture is documented in
-[`docs/evidence/cockroach-cloud-explain.txt`](evidence/cockroach-cloud-explain.txt).
-Only after the public demo is running and healthy should you run the standalone
-deterministic reference policy fleet:
+The migration task must finish the complete uninterrupted prefix of embedded
+migrations; see [MIGRATIONS.md](MIGRATIONS.md) for the per-version transaction
+policy and recovery rules. Do not substitute manual SQL or a Docker-only smoke
+for that step. Validate HTTPS and recall, force a task replacement, and check
+recall again. To confirm production query plans, capture representative
+`EXPLAIN` output against a disposable fixture database; capability flags and
+RRF observations are not a physical-plan substitute.
 
-```bash
-RUN_ID=devpost-cloud-YYYYMMDDTHHMMSSZ
-mkdir -p target/aws-evidence
-./deploy/aws/run-reference-agent.sh "$RUN_ID" \
-  >"target/aws-evidence/reference-agent-$RUN_ID.json"
-jq -e '.schema == "fleet-reference-agent-run-v1" and .verified == true' \
-  "target/aws-evidence/reference-agent-$RUN_ID.json"
-```
-
-For the current revision-10 deployment, immutable image `git-56b577c82b9c` at
-source commit `56b577c82b9c5a5c80d73103f7f6b56d51698872` runs with the
-serving, migration, seed, and reference-agent task-definition families all at
-revision 10; the service is 1/1 healthy. The idempotent rich-seed task exited zero and
-upserted exactly 552 rows: 346 documentation chunks, 2 code chunks, and 204
-operations chunks. Current public API results carry the exact release revision
-and source-line ranges. Final desktop and 390px mobile QA verified safe inline
-Markdown, immutable exact `#Lx-Ly` links, a relative repository link rendered
-as a code-styled anchor, and no horizontal overflow. The final seven-query
-smoke gate passed. The ECR Basic OS-package scan completed with an empty
-finding-severity count,
-and GitHub Actions run
-[`31832684235`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31832684235)
-completed all five jobs successfully.
-
-That 552-row count is bound only to the recorded revision-10 image. The
-rich-demo generator is deterministic for a fixed source revision and manifest,
-but documentation changes alter chunk bytes, source lines, and potentially the
-row count. Before any new image is seeded, generate and test the rich corpus
-from that exact immutable tree and record its new verified manifest/breakdown;
-never carry the historical 552 count forward as a current-source claim.
-
-The checked-in
-[seven-query public relevance receipt](evidence/public-relevance-efe6fbf-20260814.json)
-is historical revision-7 evidence for the prior 548-row release, not the
-revision-10 smoke receipt.
-
-The checked-in artifacts that follow are historical revision-6 cloud evidence;
-the reference-agent and replacement proofs were not rerun for revision 10. The
-[source-conflict self-audit](evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json)
-verified documentation-backed claim 9, code-backed claim 10, and their exact
-open conflict 3 through semantic recall. Historical revision-6 run
-`devpost-final6-20260814T143523Z` then produced the checked-in
-[reference-agent](evidence/reference-agent-devpost-final6-20260814T143523Z.json),
-[replacement](evidence/replacement-devpost-final6-20260814T143523Z.json), and
-[publication-validation](evidence/publication-validation-devpost-final6-20260814T143523Z.json)
-receipts. Reference-agent task definition revision 6 correlated
-decision/action/incompatible/escalation claims 15/16/17/18 with open conflict
-5. Public lexical/dense RRF observed exact action and escalation claims 16 and
-18. Serving task definition revision 6 then changed the complete task set to a
-fully disjoint set and observed those same exact claims afterward.
-
-The separately captured historical Cloud `EXPLAIN` proof exercised the exact
-production project-vector, source-vector, and lexical SQL shapes on a
-10,001-row disposable fixture. It selected `memory_chunks_semantic_idx`,
-`memory_chunks_source_semantic_idx`, and `memory_chunks_lexical_idx`; all
-assertions passed. Production was untouched, the fixture database was dropped,
-and the temporary workstation network rule was removed. It was not rerun on
-revision 10. The first lexical plan ran immediately after `ANALYZE` and briefly
-saw stale statistics; the unchanged
-query selected the inverted index once fresh statistics became visible roughly
-two minutes later. No `FORCE_INDEX` hint was used or implied.
-
-The wrapper requires `aws`, `curl`, `jq`, and `terraform`. It derives the real
-Terraform `demo_url`, fails unless `/healthz` succeeds, then starts four one-off
-Fargate tasks in sequence: Agent A records and idempotently replays the
-migration decision; Agent B finds it through lexical+dense RRF, verifies it by
-exact get, persists a cited action, and rereads that action; Agent C records an
-incompatible decision and proves the exact disputed A/C members and values;
-then the same deployment-bound B identity recalls the open conflict, persists a
-cited escalation, and rereads it. It validates each task override, exit, and
-structured CloudWatch receipt, then uses the public read-only recall API to
-require the exact action and escalation claim IDs. It emits a final JSON object
-only when the AWS tasks, CockroachDB memory chain, and public demo all
-correlate. This is the default AWS agent proof and invokes neither OSTK nor an
-LLM. A local run or Terraform test is not a substitute for the completed live
-Fargate/CockroachDB Cloud capture.
-
-The receipt includes four per-step task/log coordinates and a `public_demo`
-section with the ready state, exact observed action/escalation claim IDs, and
-lexical+dense RRF diagnostics. Protect the raw JSON artifact, local Terraform
-state, and `terraform.tfvars`; all are ignored but remain operationally
-sensitive. Redact AWS account/infrastructure identifiers before screenshots or
-publication. The final video should lead with the live AWS UI and show reviewed,
-redacted cloud agent and replacement receipts. A fresh standalone Fleet Recall
-capture is optional local terminal footage; an OSTK render is an explicitly
-optional alternate. Neither is cloud proof.
-
-## Judging availability hold, then teardown
-
-The [official rules](https://cockroachdb-ai.devpost.com/rules) require the
-working project to remain available free of charge and without restriction
-until the judging period ends. Once the URL is submitted, keep the public ECS
-service, CockroachDB Cloud data plane, S3 model objects, the database secrets
-actually used by that historical revision-10 deployment,
-networking, DNS/TLS, and required logs operational through **September 15, 2026
-at 5:00 PM EDT / 4:00 PM CDT**. Monitor and repair the deployment during that
-hold; do not scale it to zero, revoke judging access, destroy it, or begin the
-steps below before the deadline. Keep ALB deletion protection enabled and the
-60-day CloudWatch log retention intact for the entire judging window.
+## 9. Teardown
 
 **APPROVAL REQUIRED — DESTRUCTIVE AND COST-BEARING:** Teardown deletes or
-disconnects resources and can destroy evidence or data. Preserve submission
-evidence, wait until the judging hold has expired, and obtain explicit approval
-for every external deletion.
+disconnects resources and can destroy data. Preserve anything you still need
+and obtain explicit approval for every external deletion.
 
 1. Set ECS desired/minimum capacity to zero and apply; verify no tasks remain.
-2. Preserve required logs, screenshots, cloud plans, and the final demo URL.
+2. Preserve required logs and any cloud plans you want to keep.
 3. Set `enable_deletion_protection = false`, review and apply that deliberate
    change, and verify that ALB protection is disabled. Only then run and review
    a separate `terraform plan -destroy` before approving `terraform destroy`.
@@ -661,4 +493,4 @@ for every external deletion.
 
 Do not delete the CockroachDB database, S3 versions, secrets, Terraform state,
 or registered domain merely to reduce cost without a separate destructive
-approval and a verified backup/evidence plan.
+approval and a verified backup plan.

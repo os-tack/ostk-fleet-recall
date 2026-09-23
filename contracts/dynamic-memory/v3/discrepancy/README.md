@@ -1,14 +1,16 @@
 # Discrepancy family/episode contracts (W0-EPIS)
 
-Byte-frozen canonical JSON vectors for `src/memory_contracts/discrepancy.rs`. Every
-file is exactly one canonical `ostk-canonical-json-v1` record plus one trailing LF
-(`require_canonical` in `discrepancy.rs`'s tests enforces this on every fixture in
-this directory). Digests are pinned as literal hex constants in
-`discrepancy.rs::tests` and asserted equal to values recomputed from these bytes, so
-any accidental edit to a fixture fails `cargo test` rather than silently drifting.
+Canonical JSON vectors for `src/memory_contracts/discrepancy.rs`. Every file is
+exactly one canonical `ostk-canonical-json-v1` record plus one trailing LF
+(`require_canonical` in the discrepancy tests enforces this on every fixture in
+this directory). `hard_coded_fixtures_match_canonical_vectors` asserts that each
+fixture equals `encode_canonical` of the same Rust-constructed value, and the
+family, episode, envelope, and comparator-lineage identities are checked against
+golden hex constants, so an accidental edit to a fixture fails `cargo test` rather
+than silently drifting.
 
-Regenerate all files here (maintainer-only, requires re-pinning the digest constants
-printed to stdout afterward) with:
+Regenerate all files here (maintainer-only; afterward, update any golden identity
+constant whose printed value changed) with:
 
 ```
 DISCREPANCY_VECTOR_OUTPUT=contracts/dynamic-memory/v3/discrepancy \
@@ -56,17 +58,13 @@ DISCREPANCY_VECTOR_OUTPUT=contracts/dynamic-memory/v3/discrepancy \
   merely a record of the arity rule. Carries `scope`/`profile`/`family_fingerprint`
   like the split relation.
 - `vector-suite.jsonl` — one manifest binding every fixture's path and every
-  fingerprint/identity pinned in `discrepancy.rs::tests`, plus the sorted list of
+  fingerprint/identity the discrepancy tests check, plus the sorted list of
   negative-case names exercised only in Rust (no separate JSON fixture per negative
-  case, matching `relation.rs`'s pattern). It does not itself carry a raw-SHA-256
-  field per fixture (unlike `contracts/dynamic-memory/v2/relation/vector-suite.jsonl`,
-  which does); byte integrity here is instead enforced directly by
-  `hard_coded_fixtures_match_canonical_vectors`'s `assert_eq!` against
-  `encode_canonical` of the same Rust-constructed value for every fixture, which is
-  an equivalent guarantee, not a weaker one. The module's `raw_sha256` test helper
-  exists only to print values into `regenerate_discrepancy_contract_artifacts`'s
-  (maintainer-only, `#[ignore]`) stdout for cross-checking during a manual refreeze;
-  it is not consumed by any committed assertion.
+  case, matching `relation.rs`'s pattern). It carries no raw-SHA-256 field per
+  fixture (unlike `contracts/dynamic-memory/v2/relation/vector-suite.jsonl`);
+  byte integrity here comes from `hard_coded_fixtures_match_canonical_vectors`'s
+  `assert_eq!` against `encode_canonical` of the same Rust-constructed value for
+  every fixture.
 
 ## Invariant IDs covered here, and how a reviewer could try to break each one
 
@@ -218,9 +216,7 @@ DISCREPANCY_VECTOR_OUTPUT=contracts/dynamic-memory/v3/discrepancy \
   and `validate_against_episode_policy`, for the same reason: none of them has
   access to the others' resolved registry body.
 
-  **Registry-path admissibility** (closing the adversarial-review blocker that
-  the `PredicateSchema` squat left `validate_against_comparator_lineage`
-  structurally unreachable at runtime): `ComparatorLineage` is
+  **Registry-path admissibility:** `ComparatorLineage` is
   `is_generation2_only()`, so no `SemanticallyClosedGenesisPackage` (v1),
   `SemanticallyClosedSuccessorPackage`, or `SemanticallyClosedStage4Package`
   can ever admit this entry — `decode_entry` (`genesis.rs`) and
@@ -236,10 +232,9 @@ DISCREPANCY_VECTOR_OUTPUT=contracts/dynamic-memory/v3/discrepancy \
   `StructurallyResolvedComparatorLineageV1` resolves directly from the same
   raw entry (`comparator_lineage_registration_is_carriable_through_the_real_registry_package_path`).
   Carriage is not admission (`generation2.rs`'s own `ReservedSlotCarriageV1`
-  doc comment): full generation-2 typed-body dispatch for this kind is a
-  separate piece of work this workstream cannot do itself (`registry.rs`/
-  `generation2.rs`/`successor_package.rs` are outside its owned files) —
-  flagged under the handoff's `requests` to W0-REG.
+  doc comment): full generation-2 typed-body dispatch for this kind is separate,
+  not-yet-implemented work in `registry.rs`/`generation2.rs`/
+  `successor_package.rs`.
 
 ## `LifecycleState::Superseded` reachability (doc lines 1353-1356, 1329-1331)
 
@@ -264,10 +259,9 @@ supplied, and neither source's own fingerprint changes — the same continuous
 incompatible interval must not surface three times (once per source, once
 for the combined episode).
 
-**Scope/profile/family binding on relations** (closing the adversarial-review
-blocker that a relation could force `Superseded` — the strongest suppression
-in the model — from only the public episode fingerprints, with no
-authenticated binding at all): `DiscrepancyEpisodeRelationV1` now carries
+**Scope/profile/family binding on relations.** Without a binding, a relation
+could force `Superseded` — the strongest suppression in the model — from only
+the public episode fingerprints. `DiscrepancyEpisodeRelationV1` therefore carries
 `scope`, `profile`, and `family_fingerprint`, and `project_discrepancy_episode`
 rejects (returns `Err`, does not merely ignore) any relation that names the
 target envelope's episode — as a source or as the `to_episode` — whose
@@ -305,7 +299,7 @@ decision functions, matching `select_opening_transition` and
 update and the relation once the gap is classified remains the caller's
 responsibility.
 
-## Other hardening closed from the adversarial review's non-blocking observations
+## Other hardening
 
 - **Zero-width rationale**: `str::trim` alone does not strip U+200B/U+200C/
   U+200D/U+FEFF/U+2060, so a rationale of only those characters passed the
@@ -315,30 +309,25 @@ responsibility.
   `waiver_rationale_of_only_zero_width_spaces_is_rejected`), while ordinary
   rationale that merely contains a stray zero-width character still passes
   (`rationale_mixing_zero_width_and_visible_content_still_passes`).
-- **Backdated waiver expiry**: `authorize_lifecycle_transition` now rejects a
+- **Backdated waiver expiry**: `authorize_lifecycle_transition` rejects a
   `Waive` transition whose `waiver.expiry_at` is at or before the event's own
   `effective_at` — such a waiver would project `Open` the instant it is
   applied, recording an audit-trail entry for a suppression that never had
   effect (`waiver_expiry_at_or_before_the_events_effective_at_is_rejected`).
-- **Duplicate event idempotency**: `project_discrepancy_episode` now dedups
+- **Duplicate event idempotency**: `project_discrepancy_episode` dedups
   byte-identical lifecycle events (by canonical bytes, after sorting) before
   replaying them, so an at-least-once delivery retry that appends the same
   event twice is applied once, not once per occurrence
   (`duplicate_byte_identical_lifecycle_events_are_applied_once`).
-- **`nominate_repeated_waiver_drift` doc accuracy**: the function's doc
-  comment previously claimed the return type "structurally cannot express
-  `Verified`" — false; `Option<VerificationState>` can express
-  `Some(Verified)`, only the function *body* restricts it to `Candidate`.
-  The comment now states this precisely.
 
-Declined (non-blocker, unchanged from the prior review):
+Known limitations, kept deliberately:
 - **Episode-policy version-only binding**: family/episode fingerprints bind
   the bare `episode_policy_version` integer, never the policy's
   `entry_id`/`entry_digest`, so two distinct registered policies sharing a
-  version number collapse into one family/episode. Both the brief and doc
-  lines 1315-1319 specify "episode-policy version" as the bound field; this
-  is the specified preimage shape, not a defect this workstream can unilaterally
-  widen without a doc/brief change.
+  version number collapse into one family/episode. The architecture doc
+  ("Discrepancy families and episodes") specifies "episode-policy version" as
+  the bound field; this is the specified preimage shape, and widening it needs
+  a doc change first.
 - **Waiver-expiry-reopen always returns `Open`, never a prior `Resolved`
   state**: changing this would require tracking and restoring an arbitrary
   prior lifecycle state (potentially itself the product of several
@@ -366,5 +355,5 @@ for, a row in the other: one is a bigint-keyed table row, the other is a 32-byte
 digest under a fixed, versioned preimage that a legacy `memory_conflicts` row could
 never have been hashed into (the detector column holds the literal string
 `same_key_functional_value_v2`, which is not a valid preimage for either domain).
-`memory_conflicts` and `same_key_functional_value_v2` are untouched by this
-workstream (contract-only work).
+These contracts do not touch `memory_conflicts` or
+`same_key_functional_value_v2`.

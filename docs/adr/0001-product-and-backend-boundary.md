@@ -28,9 +28,3 @@ configuration and cannot be overridden by MCP arguments.
   upstream backend-neutral interfaces are extracted.
 - The shared corpus is durable; transient attention may remain task-local until
   an explicit persistence policy is implemented.
-
-## Submission boundary
-
-The hackathon submission is this new repository and its Cockroach/AWS
-adaptation. Existing Recall and OSTK code are disclosed as pre-existing
-frameworks.

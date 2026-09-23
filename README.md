@@ -1,189 +1,142 @@
 # ostk-fleet-recall
 
-![OSTK Fleet Recall: distributed, conflict-aware agent memory](docs/assets/devpost-thumbnail-v2.png)
-
 > **Agents are replaceable. Their memory shouldn't be—and when two disagree,
 > memory should say so.**
 
-Shared, durable semantic memory for agent fleets, backed by CockroachDB while
-preserving Recall's local-first semantics and two-tool MCP contract. It works
-with any MCP client; OSTK orchestration is an optional integration, not an
-install or runtime requirement.
+Fleet Recall is distributed, conflict-aware shared memory for agent fleets. It
+keeps a durable semantic corpus and a typed-claim ledger in CockroachDB and
+serves them over the two-tool Recall MCP contract, `recall` and `remember`, so
+agents running in different processes and on different hosts can share what
+they know, record what they decided, and see when they disagree. It works with
+any MCP client; OSTK orchestration is an optional integration, not an install
+or runtime requirement.
 
-`ostk-recall` remains the private, local-first corpus powered by LanceDB and
-SQLite. Fleet Recall is the distributed backend for agents that need to share
-memory across processes and hosts. This repository is new work for the
-CockroachDB AI Agents Hackathon and reuses the separately disclosed
-[`ostk-recall`](https://github.com/os-tack/ostk-recall) project.
+[`ostk-recall`](https://github.com/os-tack/ostk-recall) remains the private,
+local-first corpus powered by LanceDB and SQLite. Fleet Recall is its
+distributed sibling for agents that need to share memory across processes and
+hosts ([ADR 0001](docs/adr/0001-product-and-backend-boundary.md)). The project
+started as a CockroachDB AI Agents Hackathon entry.
 
-The implemented hackathon surface is intentionally small:
+## What runs today
 
-- `recall(search|get|conflicts|status)` reads hybrid vector/lexical corpus and
-  typed-claim state.
-- `remember(record)` records a deliberate typed claim with provenance,
-  idempotent mutation receipts, and conflict detection.
-- `ingest` is a trusted operator CLI for populating the active chunk corpus.
-- `reference-agent` runs one bounded step of the deterministic rollout-safety
-  policy used by the default AWS agent proof.
-- `demo` is a bounded, read-only HTTP surface; it exposes no mutation route.
+The `ostk-fleet-recall` binary has these commands:
 
-The reference policy agent is ordinary Fleet Recall application code: it
-retrieves memory, applies an explicit deterministic policy, and records a cited
-action. It does not invoke OSTK, an LLM, or a model API. The OSTK adapter is a
-strictly optional interoperability path.
+- `serve` speaks newline-delimited JSON-RPC/MCP on stdin/stdout with two tools:
+  - `recall(search|get|conflicts|status)` reads the hybrid vector/lexical
+    corpus and typed-claim state.
+  - `remember(record)` records a deliberate typed claim with provenance,
+    idempotent mutation receipts, and conflict detection.
+- `demo` serves a bounded, read-only HTTP surface (`/`, `/healthz`,
+  `/api/status`, and `POST /api/recall`). It exposes no mutation route.
+- `migrate` applies the embedded CockroachDB schema migrations.
+- `health` checks connectivity, the schema prefix, the required indexes,
+  cosine support, and the active model identity.
+- `ingest` is a trusted operator command that loads NDJSON into the active
+  chunk corpus.
+- `model-digest` prints the versioned digest of a local model bundle.
 
-Four operational binaries are private workstation tools, not product or hosted
-routes. `ostk-control-bootstrap` and `ostk-registry-activate` implement the
-Stage-2 and genesis Stage-3 ceremonies. `ostk-registry-successor-activate`
-applies or inspects the one-time genesis-to-first-successor transition through
-the checked-in successor repository. `ostk-conflict-reconcile` is apply-only
-and materializes a new v2 conflict lineage for one immutable legacy conflict
-revision. None is copied into the production image or wired into Terraform,
-ECS, the public HTTP service, or normal MCP/runtime startup.
+Recall is hybrid: CockroachDB `VECTOR(512)` C-SPANN search and a stored
+`TSVECTOR` inverted index, fused with reciprocal-rank fusion, over embeddings
+from a pinned local model2vec model. Every claim mutation commits its claim,
+support, conflict, receipt, corpus projection, and audit events in one
+serializable transaction.
 
-Attention schema space is reserved for future compatibility, but attention
-actions and a runtime attention workflow are **not implemented** in this
-hackathon slice. Additional canonical Recall actions are also future work.
+Conflict detection uses the `same_key_functional_value_v2` detector. A claim
+key (`subject::predicate`) is functional over overlapping effective intervals:
+two affirmations conflict when their typed values differ, an affirmation and a
+negation conflict only when they name the same value, and two negations are
+compatible. Conflicting claims become `disputed`, and recall surfaces the open
+conflict with the exact members that caused it instead of silently choosing
+one. The detector compares typed propositions; it performs no natural-language
+inference.
 
-## Evidence status
+The service contract also reserves further Recall actions (for example
+`remember` supersede/retract and `recall` surface/discover) and an attention
+schema. These return an error or are unused today; see the
+[roadmap](docs/ARCHITECTURE.md#roadmap-and-open-work).
 
-Source and deployment evidence are intentionally reported separately. The
-current checkout embeds migrations 1 through 18. Current release completion
-requires exactly the eighteen successful rows 1 through 18. Serving requires
-an uninterrupted successful prefix of at least 18 and remains compatible with
-later additive migrations; a later successful row cannot hide a missing or
-failed prerequisite. The private compatibility gates deliberately remain
-narrower: Stage-2 control requires prefix 1 through 3, genesis Stage-3 requires
-1 through 9, the first-successor repository requires 1 through 14, and
-conflict-detector reconciliation requires 1 through 16.
+## Private operator CLIs
 
-Migrations 12 through 14 supply the three successor tables. The successor
-repository, apply/inspect workstation CLI, and database-local
-`fleet_registry_successor_activation` one-shot role policy now exist. The
-policy is cluster-admin-only and creates a hardened `NOLOGIN` logical role; it
-does not provision a login or add an AWS secret, task, production-image binary,
-startup hook, or public/runtime route. The deny-only quarantine continues to
-keep those tables away from PUBLIC and the three prior application logical
-roles, and the reconciliation policy separately grants them no successor-table
-access. A
-separately provisioned successor login may receive role membership only for an
-exclusive local ceremony after cleanup of the other optional role's
-creator-scoped PUBLIC routine default and either-direction membership edges,
-the required external cross-database and PUBLIC-authority audit, and immediate
-policy reapply. It must lose that membership and login capability afterward.
-Conflict reconciliation likewise has an apply-only workstation CLI and a
-database-local, cluster-admin-only one-shot role policy. Database ownership is
-insufficient for either policy, and their mandatory cross-database audits
-remain external operator steps. Neither has Terraform, ECS, production-image,
-serving, or runtime wiring.
+`src/bin` holds private workstation tools. None is copied into the production
+image or wired into Terraform, ECS, the public HTTP service, or normal
+MCP/runtime startup, and each reads a dedicated private database URL instead
+of the serving one.
 
-The current source separately implements the PUBLIC-03 publication boundary.
-The only admitted public login is `fleet_publication`, which inherits one
-`NOLOGIN` logical role, `fleet_publication_reader`. That role has `CONNECT` on
-`fleet_recall`, `USAGE` on `public`, and `SELECT` on exactly
-`_sqlx_migrations`, `memory_corpus_models`, `memory_chunks`,
-`memory_claim_embeddings`, `memory_claim_support`, `memory_claims`,
-`memory_conflict_members`, and `memory_conflicts`. It has no sequence, DML,
-DDL, system, delegation, or private-table authority. `demo` accepts only
-`FLEET_RECALL_PUBLICATION_DATABASE_URL` and rejects writer, control, activation,
-reconciliation, and test database variables. Its pool witnesses
-`current_user = fleet_publication`, `current_database = fleet_recall`, the fixed
-`ostk-fleet-recall-publication` application name, and canonical `search_path =
-pg_catalog, public, pg_temp` both when a connection is created and before it is
-reused.
+- `ostk-control-bootstrap` accepts the out-of-band-pinned genesis bootstrap
+  receipt into the append-only control ledger (Stage 2); see
+  [private control-ledger bootstrap](docs/CONTROL_BOOTSTRAP.md).
+- `ostk-registry-activate` performs the genesis Stage-3 registry activation.
+- `ostk-registry-successor-activate` applies or inspects the one-time
+  genesis-to-first-successor (`0 -> 1`) registry transition.
+- `ostk-registry-generic-successor-activate` applies or inspects every later
+  `N -> N+1` registry transition.
+- `ostk-conflict-reconcile` is apply-only and materializes a new v2 conflict
+  lineage for one immutable legacy conflict revision.
+- `ostk-bootstrap-manifest-import` admits legacy chunks, claims, conflicts, and
+  receipts as one signed, content-addressed bootstrap-manifest event.
+- `ostk-observer-run` runs the exhaustive observer over one enum at one exact
+  commit and emits a run receipt and typed observer result.
 
-The checked-in Terraform now plans a distinct publication secret, execution
-role, task role, and publication-only customer-managed KMS key set. Those
-Terraform changes are validated but **unapplied**. A local authoritative TLS
-run against the exact official CockroachDB v26.2.3 binary passed the publication
-reader and existing repository/private-CLI matrix. The full LocalStack
-production-image PUBLIC-03 smoke also passed at source commit
-`cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4`, including direct read, denied DML,
-DDL, and role delegation, writer-protocol denial in the public container, and
-recall after replacing that container; its
-[source-bound receipt](docs/evidence/localstack-publication-cd6ecfc-20260816.json)
-records the exact limits. Its database is deliberately insecure, so this does
-not prove database TLS, password authentication, real IAM, Fargate, or any AWS
-apply.
+The grants and gates these tools rely on are described in
+[migration operations](docs/MIGRATIONS.md) and
+[security policy](docs/SECURITY.md).
 
-None of those source facts upgrades the historical cloud evidence below. The
-live revision-10 deployment predates this source boundary and proves a
-read-only HTTP route, not the new publication database or IAM separation.
+## Built but not yet wired
 
-The submission candidate is live at
-[https://d13zrqfh66r7ub.cloudfront.net](https://d13zrqfh66r7ub.cloudfront.net).
-The live revision-10 cutover runs source commit
-`56b577c82b9c5a5c80d73103f7f6b56d51698872` as immutable ARM64 image tag
-`git-56b577c82b9c`. The serving, migration, seed, and reference-agent
-task-definition families are all revision 10, and the service is healthy with
-one desired and one running task. Its idempotent rich-seed task exited zero and upserted
-exactly 552 rows: 346 documentation chunks, 2 code chunks, and 204 operations
-chunks. The public API returned repository-backed hits with the exact release
-`source_revision` and inclusive source-line ranges. Final desktop and 390px
-mobile QA verified safe inline Markdown, immutable exact `#Lx-Ly` links, a
-relative repository link rendered as a code-styled anchor, and no horizontal
-overflow. The final seven-query smoke gate passed. The public status surface
-reports CockroachDB 26.2.5, schema version 2, enabled vector, lexical,
-conflict-membership, and claim-support-chunk indexes, working cosine distance,
-and the pinned 512-dimension embedding model. The ECR Basic OS-package scan is
-`COMPLETE` with an empty finding-severity count; this does not claim Rust, Go,
-or application-dependency coverage. GitHub Actions run
-[`31832684235`](https://github.com/os-tack/ostk-fleet-recall/actions/runs/31832684235)
-completed all five jobs successfully for this release.
+A larger dynamic-memory plane, specified in
+[Dynamic corpus and causal runtime architecture](docs/DYNAMIC_MEMORY_ARCHITECTURE.md),
+exists as library code with live CockroachDB tests, but no serving binary runs
+it:
 
-The checked-in
-[seven-query public relevance receipt](docs/evidence/public-relevance-efe6fbf-20260814.json)
-is **historical revision-7 evidence** for the prior 548-row image boundary. It
-records exact conflict mappings for the specification-versus-code and migration
-examples, four relevant conflict-free answers, and zero results with zero
-conflicts for a nonsense query. It was not regenerated for revision 10 and must
-not be presented as the revision-10 smoke receipt.
+- the Stage-4 evidence ledger (`src/evidence_ledger`): accepted-event append,
+  ingress quarantine, the envelope-encrypted governed content store, and the
+  writer-authority witness;
+- relation projection (`src/relation_projection`);
+- connectors for git history, agent transcripts, and CI runs
+  (`src/connectors`);
+- the content-addressed body store and projector (`src/body_store`) and the
+  lexical-first/dense-later recall projectors with per-row visibility
+  (`src/projectors`);
+- the coverage runtime (`src/coverage_runtime`);
+- the normative activation, observer, and discrepancy runtimes
+  (`src/normative_runtime`, `src/observer_runtime`,
+  `src/discrepancy_runtime`); only the observer has a runner, the private
+  `ostk-observer-run`;
+- `remember(action="assert")`, which the service routes but rejects because
+  serving does not load a writer-authority configuration yet;
+- the bootstrap-manifest import, whose `memory_bootstrap_import_rows` table has
+  no migration yet, so its CLI and live tests cannot complete;
+- contract vectors and pure contract modules for later stages (for example
+  action, causal, consolidation, erasure, telemetry, and ledger epochs) under
+  `contracts/dynamic-memory/v3` and `src/memory_contracts`.
 
-The checked-in receipts below are **historical revision-6 cloud evidence**;
-the reference-agent and replacement proofs were not rerun for the current
-revision-10 release. The publication-safe
-[source-conflict self-audit receipt](docs/evidence/self-audit-devpost-self-audit-20260814T133640Z-rev6.json)
-proves that semantic recall surfaced the exact documentation and code sources
-behind incompatible Boolean claims 9 and 10 and projected their exact open
-conflict 3. The
-[reference-agent receipt](docs/evidence/reference-agent-devpost-final6-20260814T143523Z.json)
-then correlates decision, action, incompatible-decision, and escalation claims
-15/16/17/18 with open conflict 5 across four one-off Fargate tasks. The
-[replacement receipt](docs/evidence/replacement-devpost-final6-20260814T143523Z.json)
-records a fully disjoint serving-task-set replacement that preserved exact
-public claims 16 and 18 through lexical/dense RRF; the
-[publication verifier receipt](docs/evidence/publication-validation-devpost-final6-20260814T143523Z.json)
-cross-validates the pair. These were observed live in AWS/CockroachDB Cloud,
-but they describe the revision-6 boundary, not a revision-10 reference-agent or
-replacement run. LocalStack and local tests remain preflight evidence only.
+Wiring this plane into the product needs, at minimum:
 
-HTTPS is provided by CloudFront's default certificate. AWS fixes that
-generated-hostname viewer policy at a TLSv1 minimum, although newer TLS can be
-negotiated. CloudFront reaches the ALB over restricted HTTP, guarded by the
-CloudFront origin-facing prefix list and a secret origin header, so this is not
-an end-to-end-TLS or TLS-1.2-minimum claim.
+- a worker or CLI that runs the connectors and projectors;
+- a production embedding provider behind the dense projection's
+  `EmbeddingProvider` seam;
+- runtime-role grants on the tables from migrations 19–27 (the runtime policy
+  in `deploy/cockroach/runtime-role-grants.sql` grants nothing on them yet),
+  the publication grant on the filtered views from migration 23, and a content
+  key-encryption key for the governed content store;
+- MCP recall reading the new projections (`CockroachRecallReader`);
+- a lighter writer-authority seam: evidence appends are authorized through the
+  `memory_writer_authority_v1` view, whose rows only the signed registry
+  ceremony writes today.
 
-The publication-safe
-[CockroachDB Cloud `EXPLAIN` artifact](docs/evidence/cockroach-cloud-explain.txt)
-records all assertions passing for the exact production project-vector,
-source-vector, and lexical SQL shapes on a 10,001-row disposable fixture. The
-plans select `memory_chunks_semantic_idx`,
-`memory_chunks_source_semantic_idx`, and `memory_chunks_lexical_idx`. The
-production database was untouched, the fixture database was dropped, and the
-temporary workstation network rule was removed. The final public video and
-remaining entrant/Devpost fields are still release gates. This separately
-captured plan evidence was not rerun as part of the revision-10 cutover.
+## Deployment
 
-The final-cut plan leads with the live AWS UI and then shows the reviewed cloud
-agent and replacement receipts; see [`docs/VIDEO_DEMO.md`](docs/VIDEO_DEMO.md).
-A standalone Fleet Recall MCP capture is optional local terminal footage, and a
-verified OSTK render is an optional alternate. Neither substitutes for cloud
-proof.
-
-Keep the public judging deployment free and unrestricted
-through **September 15, 2026 at 5:00 PM EDT / 4:00 PM CDT**. Do not scale it to
-zero or tear down its AWS, CockroachDB Cloud, DNS/TLS, model, secret, logging,
-or network dependencies before that hold expires.
+The checked-in AWS Terraform provisions ECS/Fargate task definitions and a
+service, an ALB behind CloudFront, ECR, IAM roles, and CloudWatch logging. Tasks
+load the pinned model from a private S3 prefix and receive separate migrator,
+private-writer, or publication-reader database URLs from Secrets Manager
+secrets created outside Terraform. The module passes `terraform validate` and
+its Terraform tests, but its current form has not been applied. See the
+[AWS Terraform runbook](deploy/aws/README.md),
+[cloud onboarding](docs/CLOUD_ONBOARDING.md), and the
+[LocalStack harness](deploy/localstack/README.md), which builds the real image
+and exercises its S3 and Secrets Manager interfaces against a local
+CockroachDB.
 
 ## Local quickstart
 
@@ -360,28 +313,24 @@ start the public demo yet:
 "$FLEET_RECALL_BIN" health
 ```
 
-The current embedded migrator applies versions 1 through 18 in three phases.
-Versions 1 through 11 execute without a wrapping SQL transaction because of
-CockroachDB schema-changer and schema-lock constraints; v10 and v11 are
-resumable only because they verify an exact committed index before SQLx records
-success. Versions 12 through 14 run transactionally on a dedicated migration
-session with `autocommit_before_ddl = false`. Versions 15 through 18 return to
-the resumable online-DDL policy, version conflict identity by detector, add
-the exact reconciliation/current-projection indexes, and add the Stage-4
-evidence ledger, governed content store, relation projection, and read-only
-writer-authority view. Never run multiple
-migrators concurrently or run the migration files manually as a substitute for
-that policy. See
+`migrate` applies every embedded migration in [`migrations/`](migrations) in
+order. Most run without a wrapping SQL transaction because of CockroachDB
+schema-changer and schema-lock constraints, so an interruption can leave
+committed DDL behind; versions 12 through 14 run transactionally on a
+dedicated migration session with `autocommit_before_ddl = false`. Never run
+multiple migrators concurrently or run the migration files manually as a
+substitute for that policy. See
 [migration and recovery rules](docs/MIGRATIONS.md) before recovering a failed
 migration.
 
 ### 4. Establish the publication boundary and exercise the HTTP demo
 
-Quiesce the private migrator, provision the fixed publication principal, run
-the complete cross-database/PUBLIC audit, apply and reapply the reviewed reader
-policy under the same change freeze, and only then enable the publication
-login. The checked-in boundary helper fails closed on an unexpected database,
-grant, owner, future default, role edge, or policy digest:
+The checked-in boundary helper retires the migrator login, provisions the
+private `fleet_writer` and the fixed `fleet_publication` login, applies the
+reviewed runtime and publication-reader policies from `deploy/cockroach/`, and
+only then enables the two logins. On a shared or production cluster, follow
+the audit and change-freeze steps in [migration operations](docs/MIGRATIONS.md)
+instead:
 
 ```bash
 docker exec --interactive ostk-fleet-recall-crdb \
@@ -430,8 +379,11 @@ wait "$FLEET_RECALL_DEMO_PID" || true
 ```
 
 The HTTP service exposes only `/`, `/healthz`, `/api/status`, and bounded
-`POST /api/recall`. It is a hackathon demonstrator, not an authenticated
-multi-tenant control plane.
+`POST /api/recall`. It is a demonstrator, not an authenticated multi-tenant
+control plane. Its recall cards render the bounded inline Markdown retained by
+the corpus and link every repository-backed documentation or code chunk to the
+immutable source commit and exact inclusive line range recorded at ingestion;
+synthetic records without a checked-in source stay visibly unlinked.
 
 ### 5. Exercise the MCP server
 
@@ -562,6 +514,11 @@ the remaining rows.
   `ostk-fleet-recall-publication` application name, and canonical search path.
   Do not expose a future mutation route publicly without workload identity,
   authorization, rate limiting, and production network controls.
+- In the AWS topology, CloudFront terminates viewer HTTPS with its default
+  certificate (AWS fixes the generated-hostname policy at a TLSv1 minimum,
+  although newer TLS can be negotiated) and reaches the ALB over restricted
+  HTTP, guarded by the CloudFront origin-facing prefix list and a secret origin
+  header. This is not end-to-end TLS.
 - Migrations 12 through 14 reserve durable successor state, and a private
   successor repository, workstation CLI, and reviewed one-shot logical-role
   policy exist. The deny-only quarantine keeps their three tables away from
@@ -579,80 +536,62 @@ the remaining rows.
 See [security and supply-chain policy](docs/SECURITY.md) and the
 [architecture](docs/ARCHITECTURE.md) for the complete invariants.
 
-## Tests
+## Development workflow
 
-The repository CI contract is reproducible on Rust 1.94:
+CI runs these checks (Rust 1.94):
 
 ```bash
 cargo fmt --all -- --check
-cargo check --locked --all-targets
-cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+cargo deny check
+node --test demo/tests/source-card-order.test.mjs
 ```
 
-Database tests skip unless explicitly pointed at a disposable CockroachDB 26.2
-database. Against the local quickstart database, run them serially. The plan
-test writes more than 10,000 fixture rows, so do not target shared or valuable
-data:
+Database tests are named `live_*` and skip unless
+`FLEET_RECALL_TEST_DATABASE_URL` points at a disposable CockroachDB 26.2
+database. Each test migrates the schema it needs, some create roles, and the
+plan test writes more than 10,000 fixture rows, so use a throwaway database and
+a user with admin rights, never shared or valuable data. The conflict
+reconciliation tests read `FLEET_RECONCILIATION_TEST_DATABASE_URL` instead. Run
+the live tests serially:
 
 ```bash
-export FLEET_RECALL_TEST_DATABASE_URL="$FLEET_RECALL_DATABASE_URL"
-
-cargo test --locked \
-  store::cockroach::tests::live_cockroach_round_trip_when_configured \
-  -- --nocapture --test-threads=1
-cargo test --locked \
-  ledger::cockroach::tests::live_claim_conflict_and_replay_when_configured \
-  -- --nocapture --test-threads=1
-cargo test --locked \
-  store::cockroach::tests::live_cockroach_dense_plan_uses_vector_index_when_configured \
-  -- --nocapture --test-threads=1
+export FLEET_RECALL_TEST_DATABASE_URL='postgresql://USER:PASSWORD@HOST:26257/DATABASE?sslmode=verify-full'
+export FLEET_RECONCILIATION_TEST_DATABASE_URL="$FLEET_RECALL_TEST_DATABASE_URL"
+cargo test --locked --all-targets -- live_ --test-threads=1
 ```
 
-The final test asserts that representative dense, source-prefixed dense, and
-lexical queries select their intended CockroachDB indexes rather than proving
-only one-row functional behavior.
+CI runs the same command against a single-node CockroachDB v26.2.3 container;
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) shows the exact setup.
+`store::cockroach::tests::live_cockroach_dense_plan_uses_vector_index_when_configured`
+asserts that representative dense, source-prefixed dense, and lexical queries
+select their intended CockroachDB indexes. Two suites need more than the
+database URL: `tests/dogfood_live.rs` also skips unless its
+`FLEET_RECALL_DOGFOOD_*` inputs are set, and `tests/publication_reader_live.rs`
+is `#[ignore]` and documents its environment at the top of the file.
 
-The authoritative migration correctness lane targets the pinned official
-CockroachDB v26.2.3 binary and covers fresh, interruption, catalog-drift,
-transactional rollback, successor-repository and successor-CLI state matrices,
-functional-polarity, conflict reconciliation, the publication reader, and all
-four private CLIs through migration 18 on one checksum-pinned TLS server. That
-complete local wrapper passed. The full role allow/deny/grant-option matrices
-remain separate Docker RBAC proofs. The current LocalStack production-image
-PUBLIC-03 smoke passed at commit `cd6ecfca2c1a6d112ba058aad899a21aa34bb0f4`;
-the older through-migration-9 run remains historical evidence only. None of
-these local results is AWS deployment evidence.
+## Documentation
 
-## Deployment and project documentation
-
-- [LocalStack contract harness](deploy/localstack/README.md): builds the real
-  image and exercises S3/Secrets Manager interfaces with local CockroachDB. It
-  is an emulator preflight, **not evidence of an AWS deployment**.
-- [Optional OSTK adapter demo](docs/OSTK_DEMO.md): can coordinate bounded OSTK
-  model sessions through a checked-in non-native stdio bridge; Fleet Recall,
-  its deterministic policy agent, and the default plan require no OSTK or LLM
-  run.
-- [Reproducible terminal video](docs/VIDEO_DEMO.md): renders the four-pane tmux
-  scenario with VHS from sanitized rehearsal evidence, a fresh verified
-  standalone Fleet Recall MCP run, or an explicitly optional verified OSTK
-  run.
-- [Cloud onboarding](docs/CLOUD_ONBOARDING.md): explicit AWS/CockroachDB account,
-  approval, cost, identity, TLS, model, and teardown gates.
-- [AWS Terraform runbook](deploy/aws/README.md): dormant-by-default ECS/Fargate,
-  ALB, CloudFront, ECR, S3, Secrets Manager, and CloudWatch infrastructure,
-  including the four-step deterministic reference-agent proof flow and the
-  sanitized record of the live submission deployment.
-- [Architecture](docs/ARCHITECTURE.md),
-  [draft dynamic corpus and causal runtime architecture](docs/DYNAMIC_MEMORY_ARCHITECTURE.md),
-  [migration operations](docs/MIGRATIONS.md), and
+- [Architecture](docs/ARCHITECTURE.md), including the roadmap and known
+  technical debt.
+- [Dynamic corpus and causal runtime architecture](docs/DYNAMIC_MEMORY_ARCHITECTURE.md):
+  the target design for the dynamic-memory plane and its staged status.
+- [Project primer](docs/PROJECT_PRIMER.md).
+- [Migration operations](docs/MIGRATIONS.md) and
   [security policy](docs/SECURITY.md).
-- [CockroachDB Agent Skills audit](docs/AGENT_SKILLS_AUDIT.md) and
-  [requirements/evidence matrix](docs/REQUIREMENTS.md).
-- [Product/backend boundary ADR](docs/adr/0001-product-and-backend-boundary.md),
-  [Stage-4 runtime foundations ADR](docs/adr/0002-stage4-runtime-foundations.md),
-  [delivery plan](docs/DELIVERY.md), and
-  [hackathon submission packet](docs/SUBMISSION.md).
+- [Private control-ledger bootstrap](docs/CONTROL_BOOTSTRAP.md).
+- [Cloud onboarding](docs/CLOUD_ONBOARDING.md): AWS/CockroachDB account,
+  approval, cost, identity, TLS, model, and teardown steps.
+- [AWS Terraform runbook](deploy/aws/README.md) and
+  [LocalStack harness](deploy/localstack/README.md).
+- [Optional OSTK adapter demo](docs/OSTK_DEMO.md): coordinates bounded OSTK
+  model sessions through a checked-in non-native stdio bridge; Fleet Recall
+  itself requires no OSTK or LLM.
+- Decision records: [product/backend boundary](docs/adr/0001-product-and-backend-boundary.md),
+  [Stage-4 runtime foundations](docs/adr/0002-stage4-runtime-foundations.md),
+  and [consolidation and conflict tolerance](docs/adr/0003-consolidation-and-conflict-tolerance.md).
+- [Dynamic memory contract corpus](contracts/dynamic-memory/README.md).
 
 ## Cleanup
 
@@ -671,11 +610,3 @@ because the volume contains the local memory corpus.
 Fleet Recall is available under either the Apache License 2.0 or MIT license.
 The pinned MinishLab model is separately published under MIT; see its linked
 model card for attribution and license metadata.
-
-## Source-linked demo evidence
-
-The public recall cards render the bounded inline Markdown retained by the
-corpus and link every repository-backed documentation or code chunk to the
-immutable source commit and exact inclusive line range recorded at ingestion.
-Synthetic operations narratives remain visibly unlinked because they are
-generated evidence, not checked-in source files.

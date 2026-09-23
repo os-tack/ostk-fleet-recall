@@ -8,19 +8,16 @@ URIs, and registry references below are deterministic test material, not
 proof that any real parser, registry package, or coverage receipt exists.
 
 Every `.jsonl` file contains exactly one canonical JSON record plus exactly
-one trailing LF. The raw-byte SHA-256 pin is over the exact checked-in bytes
-with that LF included; the record's own identity digest (computed after
-stripping the LF and decoding) necessarily excludes it, since the LF is
-framing, not part of the canonical JSON record. Every record is byte-frozen:
-the Rust test suite `include_bytes!`s each file, asserts the raw file SHA-256
-against a hardcoded constant, decodes it with `canonical::require_canonical`
-and `canonical::decode_typed_canonical` (duplicate-safe strict parsing, plus
+one trailing LF. The record's own identity digest (computed after stripping
+the LF and decoding) excludes it, since the LF is framing, not part of the
+canonical JSON record. The Rust test suite `include_bytes!`s each file,
+decodes it with `canonical::require_canonical` and
+`canonical::decode_typed_canonical` (duplicate-safe strict parsing, plus
 requiring the checked-in bytes to be exactly the typed value's own canonical
 re-encoding — closing the positional-array/omitted-optional-key class for
 every fixture, not just document-level canonicality), and recomputes the
-record's identity digest against a second hardcoded constant. Changing any
-field, byte, or digest below is a contract-version change, not a fixture
-update.
+record's identity digest against a golden constant. Changing any field, byte,
+or digest below is a contract-version change, not a fixture update.
 
 ## What each positive vector proves
 
@@ -198,40 +195,26 @@ supersession, dedup) rather than about one record's own byte shape:
   references leaves the predicate `false`
   (`erasure_removes_occurrence_immediately_and_predicate_flips_when_last_reference_gone`).
 
-## How digests are pinned
+## How digests are checked
 
-Every fixture file's raw SHA-256 (the exact checked-in bytes, LF included)
-and its decoded record's identity digest (via the relevant `*_id`/
+The positive fixtures' decoded identity digests (via the relevant `*_id`/
 `*_identity` method, which excludes the LF and any framing this repository
-adds around the file) are both hardcoded as `&str` constants in
-`chunk_identity.rs`'s test module. A test loads the fixture with
-`include_bytes!`, asserts the raw SHA-256 first (so a silent byte-level edit
-to the checked-in file is caught even before decoding), then asserts
-`canonical::require_canonical` accepts the bytes unchanged (the checked-in
-file *is* its own canonical form), decodes it, and asserts the recomputed
-identity digest against the second constant.
+adds around the file) are hardcoded as golden `&str` constants in
+`chunk_identity_tests.rs`. A test loads the fixture with `include_bytes!`,
+asserts `canonical::require_canonical` accepts the bytes unchanged (the
+checked-in file *is* its own canonical form), decodes it, and asserts the
+recomputed identity digest against that constant.
 
-`vector-suite.jsonl` is pinned the same way for its raw bytes (a hardcoded
-`VECTOR_SUITE_RAW_SHA256` constant), but it is not itself a decoded contract
-record — it is a restatement, so its trustworthiness depends on every field
-it restates being independently cross-checked against a real recomputation,
-never merely asserted to decode. `vector_suite_fixture_restates_only_recomputable_digests_and_all_match`
+`vector-suite.jsonl` is not itself a decoded contract record — it is a
+restatement, so its trustworthiness depends on every field it restates being
+independently cross-checked against a real recomputation, never merely
+asserted to decode. `vector_suite_fixture_restates_only_recomputable_digests_and_all_match`
 is that cross-check: it decodes `vector-suite.jsonl` as JSON and asserts
 every digest field equals either an already-pinned `*_ID` constant or a
 value freshly recomputed from a checked-in preimage fixture (`body_content_id`
 from `chunk-occurrence-v1.jsonl`'s own field; `generation_2_id` from
 `pointer_id()` of `generation-pointer-switch-proposal-v1.jsonl`'s own
 `proposed_pointer`), plus the closed `negative_cases` list. It restates no
-field that lacks such a source: an earlier draft additionally restated
-`parser_key_v2_id`, `occurrence_v2_id`, and `manifest_v2_id` for a
-hypothetical "generation 2" parser key, occurrence, and manifest that this
-directory has no checked-in preimage for, so no test could ever have caught
-those three digests going stale or simply being wrong. They were removed
-rather than left as unfalsifiable claims; a real second generation belongs
-in its own fixture set once one actually exists.
-
-`vector-suite.jsonl` was refrozen once, honestly, in a closeout fix: only its
-`negative_cases` array gained the `"zero_successor_supersession"` entry
-(alphabetically ordered, matching the new frozen negative fixture above); no
-other field changed. `VECTOR_SUITE_RAW_SHA256` in `chunk_identity.rs` was
-recomputed from the new checked-in bytes, not hand-edited.
+field that lacks such a source, so it carries no digests for a hypothetical
+second parser generation; a real second generation belongs in its own fixture
+set once one exists.
