@@ -22,19 +22,15 @@ terraform output -raw nat_public_ip
 terraform output -json private_subnet_id_list
 ```
 
-The stack deliberately uses one NAT gateway to control hackathon cost. Tasks in
-the second availability zone depend on that gateway and can incur cross-AZ data
-charges; this is not a production multi-AZ egress design.
+The stack deliberately uses one NAT gateway to control cost. Tasks in the second
+availability zone depend on that gateway and can incur cross-AZ data charges;
+this is not a production multi-AZ egress design.
 
-Do not destroy the stack before the `hold_until` judging deadline. After the
-application stack has been destroyed, evidence has been preserved, and the hold
-has expired, remove the NAT `/32` from CockroachDB Cloud and run `terraform
-destroy`. NAT gateway and unattached Elastic IP charges stop only after destroy
-completes. The private, encrypted, versioned S3 object configured by
-`backend.hcl` is the authoritative state; preserve its versions and access until
-the network has been intentionally destroyed. The example enables Terraform's
-native S3 lock file, which requires Terraform 1.10 or newer.
+The private, encrypted, versioned S3 object configured by `backend.hcl` is the
+authoritative state; preserve its versions and access until the network has been
+intentionally destroyed. The example enables Terraform's native S3 lock file,
+which requires Terraform 1.10 or newer.
 
-The NAT gateway and EIP also use Terraform `prevent_destroy` guards. After the
-hold expires, remove those two guards in a reviewed change before running the
-separate destroy plan. A timestamp tag alone is not a deletion control.
+To tear down, destroy the application stack first, remove the NAT `/32` from
+CockroachDB Cloud, then run `terraform destroy` here. NAT gateway and unattached
+Elastic IP charges stop only after destroy completes.

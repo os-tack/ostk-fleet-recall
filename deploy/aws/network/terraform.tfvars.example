@@ -1,9 +1,8 @@
 aws_region = "us-east-1"
 name       = "ostk-fleet-recall"
 
-vpc_id                 = "vpc-0123456789abcdef0"
-nat_public_subnet_id    = "subnet-0123456789abcdef0"
-hold_until              = "2026-09-15T21:00:00Z"
+vpc_id               = "vpc-0123456789abcdef0"
+nat_public_subnet_id = "subnet-0123456789abcdef0"
 
 private_subnets = {
   a = {

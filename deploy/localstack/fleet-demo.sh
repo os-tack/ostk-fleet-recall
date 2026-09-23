@@ -339,14 +339,10 @@ summary=$(jq -cn \
     --argjson conflict_id "$conflict_id" \
     '{
         schema_version: 1,
-        verified: true,
-        evidence_kind: "fleet-recall-mcp-scenario",
-        capture: "live",
         run_id: $run_id,
         generated_at: $generated_at,
         scenario: $run_id,
         provenance: {
-            generator: "deploy/localstack/fleet-demo.sh",
             backend: "cockroachdb",
             transport: "mcp-stdio",
             ostk_used: false,

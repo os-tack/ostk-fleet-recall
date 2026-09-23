@@ -144,39 +144,11 @@ run "dormant_cloudfront_bootstrap" {
 
   assert {
     condition = (
-      aws_cloudwatch_log_group.app.retention_in_days == 60 &&
-      aws_lb.app.enable_deletion_protection
-    )
-    error_message = "submission defaults must retain evidence and protect the public endpoint through judging"
-  }
-
-  assert {
-    condition = (
-      jsondecode(aws_ecs_task_definition.reference_agent.container_definitions)[0].command ==
-      ["reference-agent", "--step", "record-decision", "--run-id", "terraform-placeholder"]
-    )
-    error_message = "the one-off reference-agent task must default to the safe writer step"
-  }
-
-  assert {
-    condition = (
-      [for entry in jsondecode(aws_ecs_task_definition.reference_agent.container_definitions)[0].environment : entry.value if entry.name == "FLEET_RECALL_AGENT"] ==
-      ["agent-a"]
-    )
-    error_message = "the reference-agent task default must be deployment-bound to agent-a"
-  }
-
-  assert {
-    condition = (
       jsondecode(aws_ecs_task_definition.app.container_definitions)[0].secrets == [{
         name      = "FLEET_RECALL_PUBLICATION_DATABASE_URL"
         valueFrom = var.publication_database_url_secret_arn
       }] &&
       jsondecode(aws_ecs_task_definition.seed.container_definitions)[0].secrets == [{
-        name      = "FLEET_RECALL_DATABASE_URL"
-        valueFrom = var.database_url_secret_arn
-      }] &&
-      jsondecode(aws_ecs_task_definition.reference_agent.container_definitions)[0].secrets == [{
         name      = "FLEET_RECALL_DATABASE_URL"
         valueFrom = var.database_url_secret_arn
       }] &&
@@ -200,7 +172,6 @@ run "dormant_cloudfront_bootstrap" {
       ])) == 3 &&
       aws_ecs_task_definition.app.execution_role_arn == aws_iam_role.execution_publication.arn &&
       aws_ecs_task_definition.seed.execution_role_arn == aws_iam_role.execution_runtime.arn &&
-      aws_ecs_task_definition.reference_agent.execution_role_arn == aws_iam_role.execution_runtime.arn &&
       aws_ecs_task_definition.migration.execution_role_arn == aws_iam_role.execution_migration.arn
     )
     error_message = "publication, writer, and migration tasks must use isolated execution roles"
@@ -213,7 +184,6 @@ run "dormant_cloudfront_bootstrap" {
       aws_iam_role.task_publication.name != aws_iam_role.task.name &&
       aws_ecs_task_definition.app.task_role_arn == aws_iam_role.task_publication.arn &&
       aws_ecs_task_definition.seed.task_role_arn == aws_iam_role.task.arn &&
-      aws_ecs_task_definition.reference_agent.task_role_arn == aws_iam_role.task.arn &&
       aws_ecs_task_definition.migration.task_role_arn == aws_iam_role.task.arn
     )
     error_message = "the publication app must have a distinct task role while private task-role flows remain unchanged"

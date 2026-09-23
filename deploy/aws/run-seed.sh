@@ -3,23 +3,11 @@ set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
+if [ $# -ne 0 ]; then
+    echo "usage: $0" >&2
+    exit 64
+fi
 seed_input=/opt/ostk/demo/demo.ndjson
-seed_label=demo-corpus
-case $# in
-    0) ;;
-    1)
-        if [ "$1" != "--rich-demo" ]; then
-            echo "usage: $0 [--rich-demo]" >&2
-            exit 64
-        fi
-        seed_input=/opt/ostk/demo/rich-demo.ndjson
-        seed_label=rich-demo-corpus
-        ;;
-    *)
-        echo "usage: $0 [--rich-demo]" >&2
-        exit 64
-        ;;
-esac
 
 for command_name in aws jq terraform; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -67,7 +55,7 @@ if [ -z "$task_arn" ]; then
 fi
 unset run_result
 
-echo "waiting for the idempotent $seed_label seed task: $task_arn"
+echo "waiting for the idempotent demo-corpus seed task: $task_arn"
 aws ecs wait tasks-stopped --region "$region" --cluster "$cluster" --tasks "$task_arn"
 
 description=$(aws ecs describe-tasks \

@@ -22,8 +22,3 @@ output "private_route_table_id" {
   description = "Route table associated with every managed private subnet."
   value       = aws_route_table.private.id
 }
-
-output "hold_until" {
-  description = "Judging hold copied into the resource tags."
-  value       = var.hold_until
-}

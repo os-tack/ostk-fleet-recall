@@ -10,7 +10,7 @@ case "${1:-}" in
         expected_secret_id=ostk-fleet-recall/local/migrator-database-url
         expected_user=fleet_migrator
         ;;
-    serve|health|ingest|reference-agent|localstack-writer-idle)
+    serve|health|ingest|localstack-writer-idle)
         expected_kind=writer
         expected_secret_id=ostk-fleet-recall/local/writer-database-url
         expected_user=fleet_writer

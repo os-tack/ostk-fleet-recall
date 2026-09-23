@@ -1,13 +1,10 @@
 locals {
-  container_name                = "memory"
-  container_port                = 8080
-  cloudfront_origin_header_name = "X-Fleet-Recall-Origin"
-  cloudfront_origin_id          = "fleet-recall-alb"
-  app_command                   = ["demo", "--listen", "0.0.0.0:8080"]
-  seed_command                  = ["ingest", "--input", "/opt/ostk/demo/demo.ndjson"]
-  reference_agent_command = [
-    "reference-agent", "--step", "record-decision", "--run-id", "terraform-placeholder"
-  ]
+  container_name                   = "memory"
+  container_port                   = 8080
+  cloudfront_origin_header_name    = "X-Fleet-Recall-Origin"
+  cloudfront_origin_id             = "fleet-recall-alb"
+  app_command                      = ["demo", "--listen", "0.0.0.0:8080"]
+  seed_command                     = ["ingest", "--input", "/opt/ostk/demo/demo.ndjson"]
   model_bucket_name                = trimprefix(var.model_bucket_arn, "arn:aws:s3:::")
   model_prefix                     = trim(var.model_object_prefix, "/")
   model_s3_uri                     = "s3://${local.model_bucket_name}/${local.model_prefix}"
@@ -63,10 +60,6 @@ locals {
     { name = "FLEET_RECALL_MODEL_S3_URI", value = local.model_s3_uri },
     { name = "RUST_LOG", value = "ostk_fleet_recall=info" },
   ]
-  reference_agent_environment = concat(
-    [for entry in local.common_environment : entry if entry.name != "FLEET_RECALL_AGENT"],
-    [{ name = "FLEET_RECALL_AGENT", value = "agent-a" }],
-  )
   log_configuration = {
     logDriver = "awslogs"
     options = {
@@ -790,55 +783,6 @@ resource "aws_ecs_task_definition" "seed" {
     user        = "10001:10001"
     command     = local.seed_command
     environment = local.common_environment
-    secrets = [{
-      name      = "FLEET_RECALL_DATABASE_URL"
-      valueFrom = var.database_url_secret_arn
-    }]
-    readonlyRootFilesystem = false
-    stopTimeout            = 30
-    linuxParameters = {
-      initProcessEnabled = true
-    }
-    logConfiguration = local.log_configuration
-  }])
-
-  depends_on = [
-    aws_iam_role_policy_attachment.execution_runtime,
-    aws_iam_role_policy.runtime_database_secret,
-    aws_iam_role_policy.model_bundle,
-  ]
-}
-
-# A standalone, deterministic policy agent—not an OSTK or LLM dependency.
-# `run-reference-agent.sh` starts this one-off task four times in sequence,
-# overriding only the bounded step, run ID, and deployment-bound agent name.
-# Each invocation independently loads the pinned model and reaches CockroachDB
-# through the least-privilege runtime identity.
-resource "aws_ecs_task_definition" "reference_agent" {
-  family                   = "${var.name}-reference-agent"
-  requires_compatibilities = ["FARGATE"]
-  network_mode             = "awsvpc"
-  cpu                      = tostring(var.task_cpu)
-  memory                   = tostring(var.task_memory)
-  execution_role_arn       = aws_iam_role.execution_runtime.arn
-  task_role_arn            = aws_iam_role.task.arn
-
-  runtime_platform {
-    operating_system_family = "LINUX"
-    cpu_architecture        = var.cpu_architecture
-  }
-
-  ephemeral_storage {
-    size_in_gib = var.ephemeral_storage_gib
-  }
-
-  container_definitions = jsonencode([{
-    name        = local.container_name
-    image       = local.image_uri
-    essential   = true
-    user        = "10001:10001"
-    command     = local.reference_agent_command
-    environment = local.reference_agent_environment
     secrets = [{
       name      = "FLEET_RECALL_DATABASE_URL"
       valueFrom = var.database_url_secret_arn

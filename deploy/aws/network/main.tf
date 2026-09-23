@@ -23,10 +23,6 @@ resource "aws_subnet" "private" {
 resource "aws_eip" "nat" {
   domain = "vpc"
 
-  lifecycle {
-    prevent_destroy = true
-  }
-
   tags = {
     Name = "${var.name}-nat"
   }
@@ -37,8 +33,6 @@ resource "aws_nat_gateway" "app" {
   subnet_id     = data.aws_subnet.nat.id
 
   lifecycle {
-    prevent_destroy = true
-
     precondition {
       condition     = data.aws_subnet.nat.vpc_id == data.aws_vpc.selected.id
       error_message = "nat_public_subnet_id must belong to vpc_id."

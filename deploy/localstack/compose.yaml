@@ -136,7 +136,7 @@ services:
         condition: service_completed_successfully
     restart: "no"
 
-  # Fleet scenario and reference-agent writes execute here. It has the writer
+  # Fleet scenario writes execute here. It has the writer
   # secret identifier but no publication URL and no externally published port.
   writer:
     <<: *private-base

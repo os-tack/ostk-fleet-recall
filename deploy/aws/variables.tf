@@ -112,7 +112,7 @@ variable "publication_database_url_secret_arn" {
 }
 
 variable "database_url_secret_arn" {
-  description = "Required ARN whose raw value is the TLS CockroachDB writer URL used by seed and reference-agent tasks."
+  description = "Required ARN whose raw value is the TLS CockroachDB writer URL used by seed tasks."
   type        = string
   sensitive   = true
 
@@ -339,7 +339,7 @@ variable "autoscaling_cpu_target" {
 }
 
 variable "log_retention_days" {
-  description = "CloudWatch application log retention; the 60-day default preserves judging evidence."
+  description = "CloudWatch application log retention in days."
   type        = number
   default     = 60
 
@@ -359,7 +359,7 @@ variable "enable_container_insights" {
 }
 
 variable "enable_deletion_protection" {
-  description = "Protect the public ALB from accidental deletion during the judging window."
+  description = "Protect the public ALB from accidental deletion."
   type        = bool
   default     = true
 }

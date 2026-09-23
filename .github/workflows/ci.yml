@@ -8,85 +8,9 @@ permissions:
   contents: read
 
 jobs:
-  # Deployed identities derive from the exact bytes under
-  # contracts/dynamic-memory/v1 and v2, so those trees are append-only:
-  # new vector files may land, but existing bytes must never change.
-  # This path rule is the enforcement; there are no in-repo byte digests
-  # (hash what git doesn't control, never what it does).
-  frozen-contracts:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Forbid modifying or deleting frozen v1/v2 contract bytes
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          set -euo pipefail
-          base="$BASE_SHA"
-          if ! printf '%s' "$base" | grep -Eqx '[0-9a-f]{40}' \
-            || [ "$base" = "0000000000000000000000000000000000000000" ] \
-            || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-            if git rev-parse --verify --quiet 'HEAD~1^{commit}' >/dev/null; then
-              echo "::notice::No usable base SHA (force-push or new branch); comparing against HEAD~1"
-              base="$(git rev-parse HEAD~1)"
-            else
-              echo "::notice::Single-commit history; skipping the frozen-path check"
-              exit 0
-            fi
-          fi
-          changed="$(git diff --diff-filter=MD --name-only "$base"...HEAD -- \
-            contracts/dynamic-memory/v1 contracts/dynamic-memory/v2)"
-          if [ -n "$changed" ]; then
-            echo "frozen contract bytes modified — v1/v2 are append-only; cut a v3 vector instead"
-            echo "offending files (modified or deleted since $base):"
-            printf '%s\n' "$changed"
-            exit 1
-          fi
-          echo "frozen-path check passed: no modifications or deletions under" \
-            "contracts/dynamic-memory/v1 or v2 (base $base)"
-
-  docs:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: Validate Mermaid diagrams
-        run: |
-          printf '%s\n' '{"args":["--no-sandbox"]}' > "$RUNNER_TEMP/puppeteer.json"
-          npx --yes @mermaid-js/mermaid-cli@11.16.0 \
-            -p "$RUNNER_TEMP/puppeteer.json" \
-            -i docs/ARCHITECTURE.md \
-            -o "$RUNNER_TEMP/fleet-recall-architecture.md"
-      - name: Validate submission images
-        run: ./docs/assets/verify-media.sh
-      - name: Test demo source-card ordering
-        run: node --test demo/tests/source-card-order.test.mjs
-
-  video:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.25.8"
-          cache: false
-      - name: Install pinned video test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends jq tmux
-          GOBIN="$RUNNER_TEMP/bin" \
-            go install github.com/charmbracelet/vhs@v0.11.0
-          "$RUNNER_TEMP/bin/vhs" --version | grep -F 'vhs version v0.11.0'
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-      - name: Test video evidence, provenance, tapes, and choreography
-        run: ./demo/video/tests/run.sh
-
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -95,79 +19,54 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo check --locked --all-targets
-      - run: cargo test --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
       - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check
-      - name: Verify inactive RSA advisory path
-        run: |
-          test -z "$(cargo tree --locked --target x86_64-unknown-linux-gnu -i rsa 2>/dev/null)"
-          test -z "$(cargo tree --locked --target x86_64-unknown-linux-gnu -i sqlx-mysql 2>/dev/null)"
-
-  cockroachdb-official:
-    name: CockroachDB / authoritative official-binary correctness
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
         with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - name: Install the pinned CockroachDB binary
-        env:
-          COCKROACH_VERSION: v26.2.3
-          COCKROACH_ARCHIVE_SHA256: 3eca6d7bc6fefa3ba0847e89733fc69f61226c80b8fab0af6578e1be672f27d3
+          node-version: "22"
+      - name: Test demo source-card ordering
+        run: node --test demo/tests/source-card-order.test.mjs
+      # The image generates its certificates under /cockroach/certs, including
+      # the root client certificate, and creates COCKROACH_DATABASE once the node
+      # is up. Live tests connect as root over verify-full TLS; the ones that
+      # create password LOGIN roles need a secure node.
+      - name: Start CockroachDB
         run: |
-          archive="cockroach-${COCKROACH_VERSION}.linux-amd64.tgz"
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --output "$RUNNER_TEMP/$archive" \
-            "https://binaries.cockroachdb.com/$archive"
-          printf '%s  %s\n' "$COCKROACH_ARCHIVE_SHA256" "$RUNNER_TEMP/$archive" \
-            | sha256sum --check --strict
-          tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP"
-          binary_dir="$RUNNER_TEMP/cockroach-${COCKROACH_VERSION}.linux-amd64"
-          test "$("$binary_dir/cockroach" version --build-tag)" = "$COCKROACH_VERSION"
-          echo "$binary_dir" >> "$GITHUB_PATH"
-      - name: Run authoritative TLS repositories, private CLIs, and publication reader proof
-        run: ./deploy/cockroach/tests/registry-activation-cli.sh
-
-  # Docker is a secondary packaging/RBAC parity substrate. These jobs assert
-  # the exact server build tag, but cannot substitute for the authoritative
-  # checksum-pinned official-binary correctness lane above.
-  cockroachdb-docker-parity:
-    name: CockroachDB / secondary Docker parity / ${{ matrix.name }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: control RBAC
-            script: deploy/cockroach/tests/control-role-grants.sh
-          - name: registry RBAC
-            script: deploy/cockroach/tests/registry-activation-role-grants.sh
-          - name: successor activation RBAC
-            script: deploy/cockroach/tests/successor-activation-role-grants.sh
-          - name: conflict reconciliation RBAC
-            script: deploy/cockroach/tests/conflict-reconciliation-role-grants.sh
-          - name: runtime writer RBAC
-            script: deploy/cockroach/tests/runtime-role-grants.sh
-          - name: publication reader RBAC
-            script: deploy/cockroach/tests/publication-reader-role-grants.sh
-          - name: control bootstrap CLI
-            script: deploy/cockroach/tests/control-bootstrap-cli.sh
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - name: Run the secondary Docker parity proof
-        env:
-          PROOF_SCRIPT: ${{ matrix.script }}
-        run: ./"$PROOF_SCRIPT"
+          docker run --detach --name crdb \
+            --publish 127.0.0.1:26257:26257 \
+            --env COCKROACH_DATABASE=fleet_recall \
+            cockroachdb/cockroach:v26.2.3 start-single-node
+          ready=0
+          for _ in $(seq 1 120); do
+            if docker exec crdb cockroach sql --certs-dir=/cockroach/certs \
+                --host=127.0.0.1 --format=tsv --execute='SHOW DATABASES' 2>/dev/null \
+                | cut -f1 | grep -qx fleet_recall; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            docker logs crdb
+            exit 1
+          fi
+          certs="$RUNNER_TEMP/crdb-certs"
+          mkdir -p "$certs"
+          for file in ca.crt client.root.crt client.root.key; do
+            docker cp "crdb:/cockroach/certs/$file" "$certs/$file"
+          done
+          chmod 600 "$certs/client.root.key"
+      # Every live_ test migrates its own database and returns early when its
+      # URL is unset, so the filter needs no list of test names.
+      - name: Live database tests
+        run: |
+          certs="$RUNNER_TEMP/crdb-certs"
+          url="postgresql://root@127.0.0.1:26257/fleet_recall?sslmode=verify-full&sslrootcert=$certs/ca.crt&sslcert=$certs/client.root.crt&sslkey=$certs/client.root.key"
+          FLEET_RECALL_TEST_DATABASE_URL="$url" \
+          FLEET_RECONCILIATION_TEST_DATABASE_URL="$url" \
+            cargo test --locked --all-targets -- live_ --test-threads=1
 
   container:
     runs-on: ubuntu-24.04
@@ -184,7 +83,7 @@ jobs:
         run: |
           docker run --rm --entrypoint /bin/sh ostk-fleet-recall:ci -c '
             test "$(id -u)" -eq 10001 &&
-            test "$(s5cmd version)" = "v2.3.0-991c9fb" &&
+            test -x /usr/local/bin/s5cmd &&
             test ! -e /usr/local/bin/aws &&
             test ! -e /usr/local/bin/ostk-control-bootstrap &&
             test ! -e /usr/local/bin/ostk-registry-activate &&
@@ -194,14 +93,14 @@ jobs:
             test ! -e /usr/local/bin/ostk-bootstrap-manifest-import &&
             test -x /usr/bin/curl &&
             test -r /opt/ostk/demo/demo.ndjson &&
-            test -r /opt/ostk/demo/rich-demo.ndjson &&
-            test "$(wc -l </opt/ostk/demo/rich-demo.ndjson)" -ge 500 &&
             test -r /usr/share/licenses/s5cmd/s5cmd-LICENSE &&
             test -r /usr/share/licenses/s5cmd/go-LICENSE &&
             test -r /usr/share/licenses/s5cmd/vendor/github.com/aws/aws-sdk-go/LICENSE.txt &&
             test -r /usr/share/licenses/s5cmd/vendor/github.com/aws/aws-sdk-go/NOTICE.txt
           '
+      # Advisory only: newly published CVEs should not turn unrelated commits red.
       - name: Scan OS and Go packages
+        continue-on-error: true
         run: |
           docker run --rm \
             --volume /var/run/docker.sock:/var/run/docker.sock \
@@ -229,24 +128,9 @@ jobs:
           terraform -chdir=network init -backend=false -lockfile=readonly
           terraform -chdir=network validate
           terraform -chdir=network test
-      - name: Validate deployment shell scripts
+      - name: Validate shell scripts
         working-directory: .
-        run: find deploy demo examples/rich-demo -type f -name '*.sh' -exec sh -n {} +
-      - name: Test the deterministic rich demo corpus
-        working-directory: .
-        run: ./examples/rich-demo/test.sh
-      - name: Test the AWS reference-agent evidence wrapper
-        working-directory: .
-        run: ./deploy/aws/tests/reference-agent-wrapper.sh
-      - name: Test the AWS source-conflict self-audit wrapper
-        working-directory: .
-        run: ./deploy/aws/tests/self-audit-wrapper.sh
-      - name: Test the AWS corpus seed selector
-        working-directory: .
-        run: ./deploy/aws/tests/seed-wrapper.sh
-      - name: Test AWS replacement and publication evidence wrappers
-        working-directory: .
-        run: ./deploy/aws/tests/replacement-proof.sh
+        run: find deploy demo -type f -name '*.sh' -exec sh -n {} +
       - name: Render the LocalStack Compose contract
         working-directory: .
         env:

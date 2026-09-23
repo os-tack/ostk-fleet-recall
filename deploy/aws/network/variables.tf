@@ -53,17 +53,6 @@ variable "private_subnets" {
   }
 }
 
-variable "hold_until" {
-  description = "UTC timestamp before which judging infrastructure must not be destroyed."
-  type        = string
-  default     = "2026-09-15T21:00:00Z"
-
-  validation {
-    condition     = can(timecmp(var.hold_until, "2026-09-15T21:00:00Z")) && timecmp(var.hold_until, "2026-09-15T21:00:00Z") >= 0
-    error_message = "hold_until must be RFC3339 and no earlier than the judging deadline."
-  }
-}
-
 variable "tags" {
   description = "Additional tags applied through the AWS provider."
   type        = map(string)

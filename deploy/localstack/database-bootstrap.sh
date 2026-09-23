@@ -3,7 +3,7 @@ set -eu
 
 # Bootstrap only what must exist before the dedicated migrator connects. The
 # later database-boundary step revokes this temporary admin membership and
-# provisions the writer/publication identities after migration 17 succeeds.
+# provisions the writer/publication identities after migration succeeds.
 cockroach sql --insecure --host=cockroach:26257 --database=defaultdb \
     --execute="
 CREATE DATABASE IF NOT EXISTS fleet_recall;

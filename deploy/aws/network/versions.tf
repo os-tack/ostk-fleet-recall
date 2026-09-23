@@ -18,7 +18,6 @@ provider "aws" {
       {
         Application = var.name
         ManagedBy   = "terraform"
-        HoldUntil   = var.hold_until
       },
     )
   }

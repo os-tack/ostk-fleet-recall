@@ -78,16 +78,6 @@ run "rejects_same_availability_zone" {
   expect_failures = [var.private_subnets]
 }
 
-run "rejects_early_teardown_hold" {
-  command = plan
-
-  variables {
-    hold_until = "2026-09-15T20:59:59Z"
-  }
-
-  expect_failures = [var.hold_until]
-}
-
 run "rejects_nat_subnet_from_another_vpc" {
   command = plan
 
