@@ -122,9 +122,7 @@ pub use admission::{
 pub use appendable::{
     AcceptedEventKindV1, AppendableAcceptedEvent, EvidenceDeliveryContextV1, SemanticIdentityRuleV1,
 };
-pub use bootstrap_import::{
-    BootstrapImportProjection, IMPORT_ROWS_TABLE, import_rows_table_exists,
-};
+pub use bootstrap_import::{BootstrapImportProjection, IMPORT_ROWS_TABLE};
 pub use cockroach::CockroachAcceptedEventRepository;
 pub use content_store::{
     CONTENT_KEY_ENCRYPTION_KEY_ENV, ContentKeyEncryptionKey, ContentObjectWrite,

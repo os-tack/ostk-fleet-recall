@@ -104,8 +104,10 @@ it:
   `ostk-observer-run`;
 - `remember(action="assert")`, which the service routes but rejects because
   serving does not load a writer-authority configuration yet;
-- the bootstrap-manifest import, whose `memory_bootstrap_import_rows` table has
-  no migration yet, so its CLI and live tests cannot complete;
+- the bootstrap-manifest import (`ostk-bootstrap-manifest-import`), which
+  admits legacy chunks, claims, conflicts, and receipts as one signed event
+  and records each imported row in `memory_bootstrap_import_rows`
+  (migration 0028);
 - contract vectors and pure contract modules for later stages (for example
   action, causal, consolidation, erasure, telemetry, and ledger epochs) under
   `contracts/dynamic-memory/v3` and `src/memory_contracts`.

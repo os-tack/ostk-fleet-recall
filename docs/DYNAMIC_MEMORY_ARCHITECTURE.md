@@ -987,9 +987,7 @@ This does not require or authorize dynamic ingestion.
    but are not yet reachable from the running server; each has live
    CockroachDB tests. Still absent: enabling the `assert` route so synchronous
    `remember` itself appends-and-projects in one transaction (the configuration
-   pins plus a witness loader that mints accepted events); a migration for the
-   proposed `memory_bootstrap_import_rows` table the bootstrap-manifest import
-   writes, without which that CLI cannot complete; and wiring any of these
+   pins plus a witness loader that mints accepted events); and wiring any of these
    dormant modules into a serving path. The Stage-5 connectors and projectors
    below have since landed on those same dormant terms.
 5. Project one local transcript connector and one Git history connector into

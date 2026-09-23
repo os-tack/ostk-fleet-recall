@@ -278,6 +278,8 @@ const NORMATIVE_ACTIVATION_MIGRATION_SQL: &str =
 const CI_CONNECTOR_MIGRATION_SQL: &str = include_str!("../../migrations/0026_ci_connector.sql");
 const DISCREPANCY_LEDGER_MIGRATION_SQL: &str =
     include_str!("../../migrations/0027_discrepancy_ledger.sql");
+const BOOTSTRAP_IMPORT_ROWS_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0028_bootstrap_import_rows.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -319,7 +321,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
     ]
 }
 
-fn post_transactional_online_migrations() -> [Migration; 12] {
+fn post_transactional_online_migrations() -> [Migration; 13] {
     [
         Migration::new(
             15,
@@ -431,6 +433,16 @@ fn post_transactional_online_migrations() -> [Migration; 12] {
             // CockroachDB requires this DDL outside SQLx's transaction
             // wrapper, like migrations 0018-0026. Version 25 remains the
             // deliberate permanent gap.
+            true,
+        ),
+        Migration::new(
+            28,
+            Cow::Borrowed("bootstrap-manifest import rows"),
+            MigrationType::Simple,
+            Cow::Borrowed(BOOTSTRAP_IMPORT_ROWS_MIGRATION_SQL),
+            // W1-IMPORT. Additive: the side table the bootstrap-manifest
+            // import projection writes, plus one index. Runs outside SQLx's
+            // transaction wrapper like migrations 0018-0027.
             true,
         ),
     ]

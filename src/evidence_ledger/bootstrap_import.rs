@@ -1,9 +1,7 @@
 //! Reusable projection for the bootstrap-manifest import side table
 //! (W1-IMPORT).
 //!
-//! `memory_bootstrap_import_rows` is a PROPOSED table that no migration
-//! creates yet; its intended columns and key are documented on the
-//! `ostk-bootstrap-manifest-import` binary. Every caller of
+//! `memory_bootstrap_import_rows` is created by migration 0028. Every caller of
 //! [`BootstrapImportProjection`] — the private import CLI
 //! (`ostk-bootstrap-manifest-import`) and its own connected tests
 //! (`tests/bootstrap_manifest_live.rs`) — shares this ONE implementation, so
@@ -36,7 +34,7 @@
 //! [`AcceptedEventKindV1::BootstrapManifest`]: super::AcceptedEventKindV1
 
 use async_trait::async_trait;
-use sqlx::{PgPool, Postgres, Row as _, Transaction};
+use sqlx::{Postgres, Row as _, Transaction};
 
 use crate::control_log::TrustedControlScope;
 use crate::memory_contracts::bootstrap_manifest::BootstrapManifestRowV1;
@@ -47,21 +45,6 @@ use super::repository::{AppendProjection, ProjectionContext};
 
 /// Exact table name this projection reads and writes.
 pub const IMPORT_ROWS_TABLE: &str = "public.memory_bootstrap_import_rows";
-
-/// Whether `memory_bootstrap_import_rows` currently exists.
-///
-/// Connected tests and the private import CLI use this to skip or fail with a
-/// clear message rather than an opaque "relation does not exist" error while
-/// no migration creates the table.
-pub async fn import_rows_table_exists(pool: &PgPool) -> bool {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-         WHERE table_schema = 'public' AND table_name = 'memory_bootstrap_import_rows')",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or(false)
-}
 
 /// Records one row per imported legacy identity.
 #[derive(Debug, Clone)]

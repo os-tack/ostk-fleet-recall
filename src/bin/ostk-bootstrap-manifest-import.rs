@@ -20,10 +20,10 @@
 //! # Projection
 //!
 //! The append's projection ([`BootstrapImportProjection`]) writes one row per
-//! imported legacy identity to a proposed side table,
+//! imported legacy identity to the side table migration 0028 creates,
 //! `memory_bootstrap_import_rows` (`tenant_id`, `project`, `table_name`,
 //! `row_key`, `row_digest`, `accepted_event_id`; `PRIMARY KEY (tenant_id,
-//! project, table_name, row_key)`), which no migration creates yet. A
+//! project, table_name, row_key)`). A
 //! second manifest naming an already-imported row with different bytes fails
 //! the whole append transaction closed — no event row, no head advance —
 //! exactly like a stored-bytes divergence under one accepted-event ID does

@@ -5,13 +5,10 @@
 //! this file starts a database process, invokes Docker, or targets a cloud
 //! service. Bring up your own instance and tear it down when done.
 //!
-//! # The proposed side table
+//! # The side table
 //!
-//! `memory_bootstrap_import_rows` is a proposed table that no migration
-//! creates yet (its intended shape is documented on the
-//! `ostk-bootstrap-manifest-import` binary). Every test that needs the
-//! projection to actually run checks [`import_rows_table_exists`] first and
-//! skips with a clear message when the table is absent.
+//! Migration 0028 creates `memory_bootstrap_import_rows`, which the import
+//! projection writes in the same transaction as the event append.
 //!
 //! # Setup boilerplate
 //!
@@ -37,7 +34,6 @@ use ostk_fleet_recall::evidence_ledger::{
     AcceptedEventRepository, AppendOutcome, AppendProjection, AppendableAcceptedEvent,
     BootstrapImportProjection, CockroachAcceptedEventRepository, EvidenceAppendError,
     EvidenceAppendResult, ProjectionContext, WitnessMismatchKind, WriterAuthorityWitness,
-    import_rows_table_exists,
 };
 use ostk_fleet_recall::memory_contracts::bootstrap::{
     BootstrapAttestationV1, BootstrapPin, BootstrapReceiptDigest, BootstrapReceiptV1, EpochId,
@@ -650,13 +646,6 @@ async fn live_bootstrap_manifest_determinism_replay_and_chain_audit_when_configu
         return;
     };
     let pool = live_pool(&database_url).await;
-    if !import_rows_table_exists(&pool).await {
-        eprintln!(
-            "skipping live_bootstrap_manifest_determinism_replay_and_chain_audit_when_configured: \
-             memory_bootstrap_import_rows does not exist yet (no migration creates it)"
-        );
-        return;
-    }
     let fixture = fixture();
     let scope = activate_stage4(&pool, &fixture, "determinism", 51).await;
 
@@ -730,13 +719,6 @@ async fn live_bootstrap_manifest_row_collision_is_refused_with_no_head_advance_w
         return;
     };
     let pool = live_pool(&database_url).await;
-    if !import_rows_table_exists(&pool).await {
-        eprintln!(
-            "skipping live_bootstrap_manifest_row_collision_is_refused_with_no_head_advance_when_configured: \
-             memory_bootstrap_import_rows does not exist yet (no migration creates it)"
-        );
-        return;
-    }
     let fixture = fixture();
     let scope = activate_stage4(&pool, &fixture, "collision", 52).await;
 
