@@ -478,14 +478,14 @@ impl CockroachMemoryService {
     /// serializable transaction (EVENT-03).
     ///
     /// That path is deliberately fenced off. ADR 0002 D4 requires three
-    /// `FleetConfig` writer-authority pins
+    /// writer-authority pins
     /// (`FLEET_RECALL_CONTRACT_TENANT_NAMESPACE`,
     /// `FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE`,
     /// `FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST`) and an in-transaction
     /// writer-authority witness before an accepted event may be minted; "when
     /// absent the `assert` route is disabled and every legacy behaviour is
-    /// byte-stable". This deployment carries neither the pins (owned by
-    /// `W1-HEAD`, `src/config.rs`) nor a non-stub witness loader
+    /// byte-stable". The serving runtime loads neither the pins
+    /// (`WriterAuthorityConfig`, `src/config.rs`) nor a non-stub witness loader
     /// (`src/registry_witness`), so the route fails closed before any argument
     /// is inspected: no admission rule is consulted, no head is read, no
     /// synthesized canonical event is produced, and nothing is written
@@ -747,7 +747,7 @@ impl FleetMemoryService for CockroachMemoryService {
             RecallAction::Conflicts => self.recall_conflicts(&scope, request.arguments).await,
             RecallAction::Status => self.recall_status(request.arguments).await,
             action => Err(ServiceError::InvalidRequest(format!(
-                "recall({}) is outside the hackathon vertical slice",
+                "recall({}) is not implemented yet",
                 action.as_str()
             ))),
         }
@@ -763,7 +763,7 @@ impl FleetMemoryService for CockroachMemoryService {
             RememberAction::Record => self.remember_record(&scope, request).await,
             RememberAction::Assert => Err(Self::assert_route_disabled()),
             action => Err(ServiceError::InvalidRequest(format!(
-                "remember({}) is outside the hackathon vertical slice",
+                "remember({}) is not implemented yet",
                 action.as_str()
             ))),
         }

@@ -104,8 +104,8 @@ pub fn writer_postgres_connect_options(
 /// Build closed driver options for the one-shot schema migrator.
 ///
 /// This boundary is deliberately distinct from the runtime writer so the
-/// DDL-capable credential cannot be accepted by serving, health, ingestion,
-/// or reference-agent processes.
+/// DDL-capable credential cannot be accepted by serving, health, or ingestion
+/// processes.
 pub fn migrator_postgres_connect_options(
     database_url: &str,
     expected_ssl_policy: PrivatePostgresSslPolicy,

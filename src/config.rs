@@ -531,12 +531,16 @@ impl ConflictReconciliationRuntimeConfig {
 /// Deployment-only pins that enable the event-first writer path (ADR 0002 D4).
 ///
 /// The three primary pins are optional as one group. Either all three are
-/// present, and the per-transaction head witness plus the `assert` route are
-/// enabled, or all three are absent, the event-first path stays disabled, and
-/// every legacy behaviour remains byte-stable. A partial set is a
-/// configuration error rather than a silently disabled authority path, so a
-/// half-applied task definition can never downgrade a deployment that was
-/// meant to run event-first.
+/// present and the event-first path can verify the per-transaction head
+/// witness, or all three are absent and the event-first path stays disabled.
+/// A partial set is a configuration error rather than a silently disabled
+/// authority path, so a half-applied task definition can never downgrade a
+/// process that was meant to run event-first.
+///
+/// Only the processes that run the event-first path load this group (through
+/// [`WriterAuthorityConfig::from_env`]). The serving runtime's
+/// [`FleetConfig`] does not read it, so pins meant for another tool never stop
+/// `serve`, `health`, `ingest`, `migrate`, or `demo` from starting.
 ///
 /// These values are deployment authority, never request or payload fields:
 /// the semantic namespaces come from process configuration and the receipt pin
@@ -689,16 +693,6 @@ pub struct FleetConfig {
     /// model name through a remote registry.
     pub embedding_model_path: PathBuf,
     pub embedding_model_sha256: String,
-    /// Deployment pins that enable the event-first writer path (ADR 0002 D4).
-    ///
-    /// `None` means the pins are absent and the event-first path is disabled;
-    /// a partial set never reaches this field because
-    /// [`WriterAuthorityConfig::from_lookup`] refuses it while this
-    /// configuration is being built. That refusal is the whole point of
-    /// carrying the group here: a half-applied task definition fails process
-    /// startup instead of silently downgrading a deployment that was meant to
-    /// run event-first.
-    pub writer_authority: Option<WriterAuthorityConfig>,
 }
 
 impl std::fmt::Debug for FleetConfig {
@@ -712,7 +706,6 @@ impl std::fmt::Debug for FleetConfig {
             .field("embedding_model", &self.embedding_model)
             .field("embedding_model_path", &self.embedding_model_path)
             .field("embedding_model_sha256", &self.embedding_model_sha256)
-            .field("writer_authority", &self.writer_authority)
             .finish()
     }
 }
@@ -913,10 +906,6 @@ fn fleet_config_from_lookup(
         "FLEET_RECALL_EMBEDDING_MODEL_PATH",
     )?);
     let embedding_model_sha256 = required_from(&mut lookup, "FLEET_RECALL_EMBEDDING_MODEL_SHA256")?;
-    // ADR 0002 D4: the writer-authority pin group is read by the same process
-    // configuration every runtime entry point loads, so a partial set fails
-    // startup here rather than leaving the event-first path silently disabled.
-    let writer_authority = WriterAuthorityConfig::from_lookup(&mut lookup)?;
 
     if max_connections == 0 {
         return Err(FleetError::Configuration(
@@ -953,7 +942,6 @@ fn fleet_config_from_lookup(
         embedding_model: embedding_model.to_owned(),
         embedding_model_path,
         embedding_model_sha256: embedding_model_sha256.to_ascii_lowercase(),
-        writer_authority,
     })
 }
 

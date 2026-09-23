@@ -144,15 +144,9 @@
     .steps li::before { content:counter(step); position:absolute; left:0; top:0; display:grid; place-items:center; width:1.55rem; height:1.55rem; border-radius:50%; color:#08202a; background:var(--cyan); font:800 .68rem/1 ui-monospace,SFMono-Regular,Menlo,monospace; }
     .steps strong { display:block; color:var(--ink); font-size:.84rem; margin-bottom:.15rem; }
     .steps p { margin:0; color:var(--muted); font-size:.78rem; line-height:1.45; }
-    .proof-card { margin-top:.55rem; border:1px solid #34523e; border-radius:13px; padding:.9rem; background:#0c1913; }
-    .proof-card strong { display:block; color:var(--green); font-size:.7rem; letter-spacing:.08em; text-transform:uppercase; margin-bottom:.28rem; }
-    .proof-card p { margin:0; color:#c6ddd0; font-size:.78rem; line-height:1.48; }
-    .proof-card code { color:#dcf5e5; }
-    .proof-card a { color:#a9ecc2; text-underline-offset:.2em; }
     #status-text { min-width:0; overflow-wrap:anywhere; }
     .read-only { display:flex; gap:.62rem; align-items:flex-start; margin-top:1rem; color:var(--muted); font-size:.76rem; }
     .lock { color:var(--green); }
-    footer { color:var(--quiet); font:500 .7rem/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; margin-top:1.6rem; }
     .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
     [hidden] { display:none !important; }
     @media (max-width:860px) {
@@ -253,14 +247,9 @@
         <li><strong>Link provenance</strong><p>Each result retains its source coordinate; typed claims can cite an exact content hash.</p></li>
         <li><strong>Surface disagreement</strong><p>Only a retrieved claim or matching source edge can carry its open conflict into the answer.</p></li>
       </ol>
-      <div class="proof-card">
-        <strong>Verified on AWS</strong>
-        <p>A full Fargate task-set replacement preserved the exact cited action and escalation claims under CockroachDB schema 2. Inspect <a href="https://github.com/os-tack/ostk-fleet-recall/blob/main/docs/evidence/replacement-devpost-final6-20260814T143523Z.json" target="_blank" rel="noopener">run <code>devpost-final6-20260814T143523Z</code></a>.</p>
-      </div>
       <div class="read-only"><span class="lock" aria-hidden="true">●</span><span>This public experience is bounded and read-only. Writes stay behind the canonical MCP <code>remember</code> tool.</span></div>
     </aside>
   </div>
-  <footer>Live hackathon deployment · raw API evidence remains available for inspection</footer>
 </main>
 
 <script>

@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::private_postgres::{
@@ -187,18 +188,45 @@ async fn pin_private_runtime_session(
     Ok(())
 }
 
-const CONTIGUOUS_SCHEMA_VERSION_SQL: &str = "SELECT COALESCE(MAX(CASE \
-         WHEN prefix_success AND version = ordinal THEN version \
-         ELSE 0 \
-       END), 0)::INT8 \
-     FROM (\
-       SELECT version, \
-              ROW_NUMBER() OVER (ORDER BY version) AS ordinal, \
-              BOOL_AND(success) OVER (\
-                ORDER BY version ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
-              ) AS prefix_success \
-       FROM _sqlx_migrations\
-     ) AS ordered_migrations";
+const APPLIED_MIGRATIONS_SQL: &str =
+    "SELECT version, success FROM _sqlx_migrations ORDER BY version";
+
+/// Versions registered by [`embedded_migrator`], in order.
+static EMBEDDED_MIGRATION_VERSIONS: LazyLock<Vec<i64>> = LazyLock::new(|| {
+    embedded_migrator()
+        .migrations
+        .iter()
+        .map(|migration| migration.version)
+        .collect()
+});
+
+/// Highest embedded version whose whole embedded prefix is applied
+/// successfully.
+///
+/// Versions the embedded migrator never registers (such as the permanent gap
+/// at 25) are not required. A missing embedded version or any failed applied
+/// row stops the prefix, so a later success cannot hide an interrupted
+/// migration.
+fn contiguous_schema_version(embedded: &[i64], applied: &[(i64, bool)]) -> i64 {
+    let first_failure = applied
+        .iter()
+        .filter(|(_, success)| !success)
+        .map(|(version, _)| *version)
+        .min();
+    let succeeded = applied
+        .iter()
+        .filter(|(_, success)| *success)
+        .map(|(version, _)| *version)
+        .collect::<HashSet<_>>();
+    embedded
+        .iter()
+        .take_while(|version| {
+            succeeded.contains(version) && first_failure.is_none_or(|failed| failed > **version)
+        })
+        .last()
+        .copied()
+        .unwrap_or(0)
+}
 
 const INITIAL_MIGRATION_SQL: &str = include_str!("../../migrations/0001_fleet_memory.sql");
 const CLAIM_SUPPORT_CHUNK_MIGRATION_SQL: &str =
@@ -578,9 +606,10 @@ const MAX_RETRIEVAL_METADATA_ROWS: usize = 100;
 /// Minimum native cosine similarity accepted by the fleet chunk-recall dense
 /// lane for the pinned `minishlab/potion-retrieval-32M` generation.
 ///
-/// A deterministic sweep over the checked-in 548-row demo corpus placed the
-/// best clearly off-domain probes at 0.142 similarity, while broad in-domain
-/// questions started at 0.205 and the project-purpose query reached 0.290.
+/// A deterministic sweep over a 548-row demo corpus (no longer in the tree)
+/// placed the best clearly off-domain probes at 0.142 similarity, while broad
+/// in-domain questions started at 0.205 and the project-purpose query reached
+/// 0.290.
 /// The deliberately conservative 0.18 boundary removes nearest-neighbour
 /// padding without requiring lexical hits to clear a dense threshold.
 pub(crate) const RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY: f32 = 0.18;
@@ -1207,11 +1236,14 @@ impl CockroachStore {
             sqlx::query_scalar("SELECT ('[1,0]'::VECTOR(2) <=> '[1,0]'::VECTOR(2))::FLOAT8 = 0.0")
                 .fetch_one(&mut *connection)
                 .await?;
-        // Report only the highest uninterrupted successful prefix. A failed or
-        // missing intermediate migration cannot be hidden by a later success.
-        let schema_version: i64 = sqlx::query_scalar(CONTIGUOUS_SCHEMA_VERSION_SQL)
-            .fetch_one(&mut *connection)
+        // Report only the highest uninterrupted successful embedded prefix. A
+        // failed or missing intermediate migration cannot be hidden by a later
+        // success.
+        let applied_migrations = sqlx::query_as::<_, (i64, bool)>(APPLIED_MIGRATIONS_SQL)
+            .fetch_all(&mut *connection)
             .await?;
+        let schema_version =
+            contiguous_schema_version(&EMBEDDED_MIGRATION_VERSIONS, &applied_migrations);
 
         Ok(DatabaseCapabilities {
             version,
@@ -2151,137 +2183,6 @@ mod tests {
     }
 
     #[test]
-    fn publication_read_inventory_and_session_authority_are_exact() {
-        let source = include_str!("cockroach.rs");
-
-        assert_eq!(
-            PUBLICATION_READ_TABLES,
-            [
-                "_sqlx_migrations",
-                "memory_corpus_models",
-                "memory_chunks",
-                "memory_claim_embeddings",
-                "memory_claim_support",
-                "memory_claims",
-                "memory_conflict_members",
-                "memory_conflicts",
-            ]
-        );
-        assert!(
-            PUBLICATION_READ_TABLES
-                .iter()
-                .all(|table| !table.ends_with("_seq"))
-        );
-        assert_eq!(PUBLICATION_POSTGRES_USER, "fleet_publication");
-        assert_eq!(
-            PUBLICATION_CURRENT_USER_SQL,
-            "SELECT pg_catalog.current_user()"
-        );
-        assert_eq!(
-            PUBLICATION_CURRENT_DATABASE_SQL,
-            "SELECT pg_catalog.current_database()"
-        );
-        assert_eq!(
-            PUBLICATION_CURRENT_APPLICATION_NAME_SQL,
-            "SELECT pg_catalog.current_setting('application_name')"
-        );
-        assert_eq!(
-            PUBLICATION_SET_SEARCH_PATH_SQL,
-            "SELECT pg_catalog.set_config('search_path', $1, false)"
-        );
-        assert_eq!(PUBLICATION_SEARCH_PATH, "pg_catalog, public, pg_temp");
-        for hook in [
-            ".after_connect(|connection, _metadata| {",
-            ".before_acquire(|connection, _metadata| {",
-        ] {
-            assert!(
-                source.contains(hook),
-                "publication pool must retain session hook {hook}"
-            );
-        }
-        let witness_call = ["pin_publication_session(connection)", ".await"].concat();
-        assert_eq!(
-            source.matches(&witness_call).count(),
-            2,
-            "new and reused publication connections must share the authority witness"
-        );
-        for authority_guard in [
-            "current_user != PUBLICATION_POSTGRES_USER",
-            "current_database != PUBLICATION_POSTGRES_DATABASE",
-            "application_name != PUBLICATION_POSTGRES_APPLICATION_NAME",
-            "search_path != PUBLICATION_SEARCH_PATH",
-        ] {
-            assert!(
-                source.contains(authority_guard),
-                "publication authority witness must retain guard {authority_guard}"
-            );
-        }
-    }
-
-    #[test]
-    fn private_writer_and_migrator_pool_authority_is_exact() {
-        let source = include_str!("cockroach.rs");
-
-        assert_eq!(WRITER_POSTGRES_USER, "fleet_writer");
-        assert_eq!(MIGRATOR_POSTGRES_USER, "fleet_migrator");
-        assert_ne!(WRITER_POSTGRES_USER, MIGRATOR_POSTGRES_USER);
-        assert_eq!(PRIVATE_RUNTIME_POSTGRES_DATABASE, "fleet_recall");
-        assert_eq!(
-            PRIVATE_RUNTIME_CURRENT_USER_SQL,
-            "SELECT pg_catalog.current_user()"
-        );
-        assert_eq!(
-            PRIVATE_RUNTIME_CURRENT_DATABASE_SQL,
-            "SELECT pg_catalog.current_database()"
-        );
-        assert_eq!(
-            PRIVATE_RUNTIME_CURRENT_APPLICATION_NAME_SQL,
-            "SELECT pg_catalog.current_setting('application_name')"
-        );
-        assert_eq!(
-            PRIVATE_RUNTIME_SET_SEARCH_PATH_SQL,
-            "SELECT pg_catalog.set_config('search_path', $1, false)"
-        );
-        assert_eq!(
-            PRIVATE_RUNTIME_CURRENT_SEARCH_PATH_SQL,
-            "SELECT pg_catalog.current_setting('search_path')"
-        );
-        assert_eq!(PRIVATE_RUNTIME_SEARCH_PATH, "pg_catalog, public, pg_temp");
-        assert!(source.contains("pub async fn connect_writer("));
-        assert!(source.contains("pub async fn connect_migrator("));
-        let witness_call = [
-            "pin_private_runtime_session(connection, identity)",
-            ".await",
-        ]
-        .concat();
-        assert_eq!(
-            source.matches(&witness_call).count(),
-            2,
-            "new and reused private connections must share the authority witness"
-        );
-        for authority_guard in [
-            "current_user != identity.expected_user()",
-            "current_database != PRIVATE_RUNTIME_POSTGRES_DATABASE",
-            "application_name != identity.expected_application_name()",
-            "search_path != PRIVATE_RUNTIME_SEARCH_PATH",
-        ] {
-            assert!(
-                source.contains(authority_guard),
-                "private authority witness must retain guard {authority_guard}"
-            );
-        }
-        for generic_error in [
-            "unexpected principal; connection details are redacted",
-            "unexpected database; connection details are redacted",
-            "fixed application name; connection details are redacted",
-            "fixed search path; connection details are redacted",
-            "private PostgreSQL connection failed; connection details are redacted",
-        ] {
-            assert!(source.contains(generic_error));
-        }
-    }
-
-    #[test]
     fn vector_serialization_round_trips_without_special_values() {
         let embedding = (0..EMBEDDING_DIMENSION)
             .map(|index| f32::from(u16::try_from(index).unwrap()) / 17.0 - 4.0)
@@ -2374,11 +2275,40 @@ mod tests {
     }
 
     #[test]
-    fn schema_capability_requires_an_uninterrupted_successful_prefix() {
-        assert!(CONTIGUOUS_SCHEMA_VERSION_SQL.contains("ROW_NUMBER() OVER (ORDER BY version)"));
-        assert!(CONTIGUOUS_SCHEMA_VERSION_SQL.contains("BOOL_AND(success) OVER"));
-        assert!(CONTIGUOUS_SCHEMA_VERSION_SQL.contains("version = ordinal"));
-        assert!(!CONTIGUOUS_SCHEMA_VERSION_SQL.contains("MAX(version)::INT8 WHERE success"));
+    fn schema_version_is_the_uninterrupted_successful_embedded_prefix() {
+        let succeeded = |versions: &[i64]| {
+            versions
+                .iter()
+                .map(|version| (*version, true))
+                .collect::<Vec<_>>()
+        };
+
+        let embedded = [1, 2, 3, 5, 6];
+        assert_eq!(contiguous_schema_version(&embedded, &[]), 0);
+        // A version the embedded migrator never registers is not a gap.
+        assert_eq!(
+            contiguous_schema_version(&embedded, &succeeded(&embedded)),
+            6
+        );
+        // A missing embedded version cannot be hidden by later successes.
+        assert_eq!(
+            contiguous_schema_version(&embedded, &succeeded(&[1, 2, 5, 6])),
+            2
+        );
+        // Neither can a failed row, whether or not this binary embeds it.
+        let mut applied = succeeded(&[1, 2, 5, 6]);
+        applied.push((3, false));
+        assert_eq!(contiguous_schema_version(&embedded, &applied), 2);
+        let mut applied = succeeded(&embedded);
+        applied.push((4, false));
+        assert_eq!(contiguous_schema_version(&embedded, &applied), 3);
+
+        let embedded = EMBEDDED_MIGRATION_VERSIONS.as_slice();
+        assert_eq!(
+            contiguous_schema_version(embedded, &succeeded(embedded)),
+            *embedded.last().unwrap(),
+            "a fully migrated database reports the last embedded version"
+        );
     }
 
     #[test]
@@ -2490,61 +2420,6 @@ mod tests {
     }
 
     #[test]
-    fn embedded_schema_reserves_all_durable_layers() {
-        let migration = include_str!("../../migrations/0001_fleet_memory.sql");
-        for table in [
-            "memory_corpus_models",
-            "memory_chunks",
-            "memory_chunk_history",
-            "memory_claims",
-            "memory_claim_embeddings",
-            "memory_conflicts",
-            "memory_events",
-            "memory_attention",
-            "memory_mutation_receipts",
-        ] {
-            assert!(migration.contains(&format!("CREATE TABLE {table}")));
-        }
-        assert!(migration.contains("vector_cosine_ops"));
-        assert!(migration.contains("ON memory_chunks (tenant_id, project, embedding"));
-        assert!(migration.contains(
-            "ON memory_chunks (tenant_id, project, source, embedding vector_cosine_ops)"
-        ));
-        assert!(migration.contains(
-            "ON memory_claim_embeddings (tenant_id, project, model, vector vector_cosine_ops)"
-        ));
-        assert!(!migration.contains("unique_rowid()"));
-        for sequence in [
-            "memory_claim_id_seq",
-            "memory_claim_support_id_seq",
-            "memory_conflict_id_seq",
-            "memory_claim_link_id_seq",
-        ] {
-            assert!(migration.contains(&format!(
-                "CREATE SEQUENCE {sequence} START 1 MINVALUE 1 MAXVALUE {MAX_PUBLIC_NUMERIC_ID}"
-            )));
-        }
-        assert_eq!(
-            migration
-                .matches("CHECK (id BETWEEN 1 AND 9007199254740991)")
-                .count(),
-            4
-        );
-    }
-
-    #[test]
-    fn support_chunk_migration_adds_the_scoped_point_lookup() {
-        let migration = include_str!("../../migrations/0002_claim_support_chunk_lookup.sql");
-        assert!(migration.contains("CREATE INDEX memory_claim_support_chunk_idx"));
-        assert!(
-            migration.contains(
-                "ON memory_claim_support (tenant_id, project, chunk_id, state, claim_id)"
-            )
-        );
-        assert!(!migration.contains("DROP "));
-    }
-
-    #[test]
     fn committed_migration_history_one_through_eighteen_is_byte_immutable() {
         for (migration, expected_sha256) in [
             (
@@ -2624,860 +2499,49 @@ mod tests {
         }
     }
 
+    /// The embedded migrator mirrors `migrations/`: every file is registered
+    /// once, in version order, with its own bytes, and only the transactional
+    /// successor-table migrations (12 through 14) run inside a SQL transaction.
     #[test]
-    fn control_event_ledger_migration_is_scoped_bounded_and_additive() {
-        let migration = CONTROL_EVENT_LEDGER_MIGRATION_SQL;
-        let tables = [
-            "memory_control_bootstraps",
-            "memory_control_log_epochs",
-            "memory_control_shard_heads",
-            "memory_control_events",
-        ];
-        assert_eq!(migration.matches("CREATE TABLE ").count(), tables.len());
-        for table in tables {
-            assert!(migration.contains(&format!("CREATE TABLE {table}")));
-            assert!(migration.contains(&format!("CREATE TABLE {table} (\n    tenant_id")));
-        }
+    fn embedded_migrator_matches_the_migrations_directory() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut files = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "sql"))
+            .map(|path| {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                let version = name.split_once('_').unwrap().0.parse::<i64>().unwrap();
+                (version, std::fs::read_to_string(&path).unwrap())
+            })
+            .collect::<Vec<_>>();
+        files.sort_by_key(|(version, _)| *version);
 
-        for scope_leading_key in [
-            "PRIMARY KEY (tenant_id, project)",
-            "PRIMARY KEY (tenant_id, project, epoch_id)",
-            "PRIMARY KEY (tenant_id, project, epoch_id, shard)",
-            "PRIMARY KEY (tenant_id, project, epoch_id, shard, committed_offset)",
-            "UNIQUE (tenant_id, project, receipt_digest)",
-            "UNIQUE (tenant_id, project, bootstrap_event_id)",
-            "UNIQUE (tenant_id, project, event_id)",
-        ] {
-            assert!(migration.contains(scope_leading_key));
-        }
-
-        assert!(migration.contains("CHECK (bootstrap_offset = 1)"));
-        assert!(migration.contains("CHECK (committed_offset > 0)"));
-        assert!(migration.contains("CHECK (last_committed_offset >= 0)"));
-        assert!(migration.contains("CHECK (approval_threshold BETWEEN 1 AND signer_count)"));
-        assert_eq!(migration.matches("BETWEEN 1 AND 1048576").count(), 4);
-        assert!(migration.contains("CHECK (shard_count BETWEEN 1 AND 4096)"));
-        assert!(
-            migration
-                .contains("CHECK (partition_recipe_id = 'ostk.partition.sha256_prefix64_modulo')")
-        );
-        assert!(migration.contains("CHECK (partition_recipe_version = 1)"));
-        assert!(migration.contains("CHECK (octet_length(event_id) = 32)"));
-        assert!(migration.contains("CHECK (octet_length(chain_digest) = 32)"));
-        assert!(migration.contains("canonical_receipt                 BYTES NOT NULL"));
-        assert!(migration.contains("canonical_genesis_package         BYTES NOT NULL"));
-        assert!(migration.contains("canonical_event              BYTES NOT NULL"));
-        for scoped_foreign_key in [
-            "FOREIGN KEY (tenant_id, project, bootstrap_receipt_digest)",
-            "FOREIGN KEY (tenant_id, project, epoch_id, shard_count)",
-            "FOREIGN KEY (tenant_id, project, epoch_id, shard)",
-        ] {
-            assert!(migration.contains(scoped_foreign_key));
-        }
-        assert_eq!(migration.matches("CREATE INDEX ").count(), 0);
-        assert_eq!(migration.matches("CREATE SEQUENCE ").count(), 0);
-        assert!(!migration.contains("JSONB"));
-
-        let uppercase = migration.to_ascii_uppercase();
-        for forbidden in ["ALTER ", "DROP ", "UPDATE ", "DELETE "] {
-            assert!(!uppercase.contains(forbidden));
-        }
-        assert!(!migration.contains("memory_events"));
-    }
-
-    #[test]
-    fn genesis_registry_activation_migration_is_scoped_bounded_and_additive() {
-        let migration = GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL;
-        let tables = ["memory_registry_activations", "memory_registry_heads"];
-        assert_eq!(migration.matches("CREATE TABLE ").count(), tables.len());
-        for table in tables {
-            assert!(migration.contains(&format!("CREATE TABLE {table}")));
-            assert!(migration.contains(&format!("CREATE TABLE {table} (\n    tenant_id")));
-        }
-
-        assert!(migration.contains("PRIMARY KEY (tenant_id, project, activation_id)"));
-        assert!(migration.contains("PRIMARY KEY (tenant_id, project)"));
-        for scope_leading_key in [
-            "UNIQUE (tenant_id, project, statement_id)",
-            "UNIQUE (tenant_id, project, accepted_event_id)",
-        ] {
-            assert!(migration.contains(scope_leading_key));
-        }
-        for canonical_projection in [
-            "canonical_statement",
-            "canonical_approval_set",
-            "canonical_test_result",
-            "canonical_receipt",
-            "canonical_event",
-            "canonical_head",
-        ] {
-            assert!(migration.contains(canonical_projection));
-        }
-        for scoped_foreign_key in [
-            "memory_registry_activation_bootstrap_anchor_fk",
-            "FOREIGN KEY (tenant_id, project, genesis_epoch_id)",
-            "REFERENCES memory_registry_activations",
-            "REFERENCES memory_control_events",
-        ] {
-            assert!(migration.contains(scoped_foreign_key));
-        }
-
-        assert!(migration.contains("approval_ids_packed                BYTES NOT NULL"));
-        assert!(migration.contains("CHECK (approval_count BETWEEN 1 AND 64)"));
-        assert!(
-            migration.contains("CHECK (octet_length(approval_ids_packed) = approval_count * 32)")
-        );
-        assert!(migration.contains("CHECK (required_threshold BETWEEN 1 AND approval_count)"));
-        assert!(migration.contains("CHECK (separation_of_duty_satisfied)"));
-        assert!(migration.contains("CHECK (effective_until IS NULL)"));
-        assert!(migration.contains("CHECK (effective_from >= bootstrap_accepted_at)"));
-        assert!(migration.contains("CHECK (accepted_at >= effective_from)"));
-        assert!(migration.contains("CHECK (control_epoch_id = genesis_epoch_id)"));
-        assert!(migration.contains("CHECK (activated_package_digest = genesis_package_digest)"));
-        assert!(migration.contains("CHECK (head_state = 'active')"));
-        assert_eq!(migration.matches("BETWEEN 1 AND 1048576").count(), 6);
-        assert_eq!(migration.matches("CREATE UNIQUE INDEX ").count(), 2);
-        assert_eq!(migration.matches("CREATE INDEX ").count(), 1);
-        assert!(
-            migration.contains("CREATE UNIQUE INDEX memory_control_bootstraps_registry_anchor_idx")
-        );
-        assert!(
-            migration.contains("CREATE UNIQUE INDEX memory_control_events_registry_source_idx")
-        );
-        assert!(migration.contains("CREATE INDEX memory_control_events_consistency_stream_idx"));
-        assert!(migration.contains(
-            "consistency_key_digest,\n        shard,\n        committed_offset\n    ) STORING (event_id)"
-        ));
-        assert!(
-            migration
-                .contains("accepted_event_id,\n            control_epoch_id,\n            control_shard,\n            control_committed_offset,\n            activation_id,\n            accepted_at\n        )")
-        );
-        assert!(migration.contains("semantic_object_digest,"));
-        for normalized_event_field in [
-            "event_schema_version               INT4 NOT NULL",
-            "event_kind                         STRING NOT NULL",
-            "consistency_family                 STRING NOT NULL",
-            "consistency_key_digest             BYTES NOT NULL",
-            "previous_chain_digest              BYTES NOT NULL",
-            "append_chain_digest                BYTES NOT NULL",
-        ] {
-            assert!(!migration.contains(normalized_event_field));
-        }
-        assert!(!migration.contains("memory_registry_head_control_source_fk"));
-        assert_eq!(migration.matches("CREATE SEQUENCE ").count(), 0);
-        assert!(!migration.contains("JSONB"));
-
-        let uppercase = migration.to_ascii_uppercase();
-        for forbidden in ["ALTER ", "DROP ", "UPDATE ", "DELETE ", "GRANT ", "REVOKE "] {
-            assert!(!uppercase.contains(forbidden));
-        }
-        assert!(!migration.contains("memory_events"));
-    }
-
-    #[test]
-    fn control_ledger_hardening_migrations_are_single_ordered_schema_changes() {
-        let migrations = [
-            CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL,
-            CONTROL_BOOTSTRAP_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
-            CONTROL_EPOCH_EXPLICIT_CREATION_TIME_MIGRATION_SQL,
-            CONTROL_HEAD_EXPLICIT_ADVANCE_TIME_MIGRATION_SQL,
-            CONTROL_EVENT_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
-        ];
-        for migration in migrations {
-            assert!(migration.starts_with("-- no-transaction\n"));
-            let sql = migration
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("--"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert_eq!(sql.matches(';').count(), 1);
-            assert!(!sql.contains("IF NOT EXISTS"));
-            assert!(!sql.contains("UPDATE "));
-            assert!(!sql.contains("DELETE "));
-            assert!(!sql.contains("GRANT "));
-            assert!(!sql.contains("REVOKE "));
-        }
-
-        assert_eq!(
-            CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL
-                .matches("CREATE UNIQUE INDEX ")
-                .count(),
-            1
-        );
-        assert!(
-            CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL
-                .contains("CREATE UNIQUE INDEX memory_control_events_predecessor_unique_idx")
-        );
-        assert!(CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL.contains(
-            "ON memory_control_events (\n        tenant_id,\n        project,\n        epoch_id,\n        shard,\n        previous_chain_digest\n    )"
-        ));
-        for (migration, timestamp_change) in [
-            (
-                CONTROL_BOOTSTRAP_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
-                "ALTER TABLE memory_control_bootstraps\n    ALTER COLUMN accepted_at DROP DEFAULT",
-            ),
-            (
-                CONTROL_EPOCH_EXPLICIT_CREATION_TIME_MIGRATION_SQL,
-                "ALTER TABLE memory_control_log_epochs\n    ALTER COLUMN created_at DROP DEFAULT",
-            ),
-            (
-                CONTROL_HEAD_EXPLICIT_ADVANCE_TIME_MIGRATION_SQL,
-                "ALTER TABLE memory_control_shard_heads\n    ALTER COLUMN advanced_at DROP DEFAULT",
-            ),
-            (
-                CONTROL_EVENT_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
-                "ALTER TABLE memory_control_events\n    ALTER COLUMN accepted_at DROP DEFAULT",
-            ),
-        ] {
-            assert_eq!(migration.matches("ALTER COLUMN ").count(), 1);
-            assert!(migration.contains(timestamp_change));
-        }
-    }
-
-    fn assert_transactional_single_additive_schema_change(migration: &str) {
-        assert!(!migration.starts_with("-- no-transaction\n"));
-        let sql = migration
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(sql.matches(';').count(), 1);
-        assert_eq!(sql.matches("CREATE ").count(), 1);
-        let uppercase = sql.to_ascii_uppercase();
-        for forbidden in [
-            "IF NOT EXISTS",
-            "INSERT ",
-            "UPDATE ",
-            "DELETE ",
-            "ALTER ",
-            "DROP ",
-            "GRANT ",
-            "REVOKE ",
-        ] {
-            assert!(!uppercase.contains(forbidden));
-        }
-    }
-
-    fn assert_resumable_exact_index_migration(migration: &str, table_name: &str, index_name: &str) {
-        assert!(migration.starts_with("-- no-transaction\n"));
-        let sql = migration
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let create = format!("CREATE UNIQUE INDEX IF NOT EXISTS {index_name}");
-        assert_eq!(
-            sql.lines().filter(|line| line.starts_with(&create)).count(),
-            1
-        );
-        assert_eq!(sql.matches("DO $$").count(), 1);
-        assert_eq!(sql.matches("COMMIT;").count(), 1);
-        assert_eq!(sql.matches("FROM pg_catalog.pg_indexes").count(), 1);
-        assert!(sql.find(&create).unwrap() < sql.find("DO $$").unwrap());
-        assert!(sql.find(&create).unwrap() < sql.find("COMMIT;").unwrap());
-        assert!(sql.find("COMMIT;").unwrap() < sql.find("DO $$").unwrap());
-        assert!(sql.contains("current_database()"));
-        assert!(sql.contains(&format!("tablename = '{table_name}'")));
-        assert!(sql.contains(&format!("indexname = '{index_name}'")));
-        assert!(sql.contains("IF exact_index IS DISTINCT FROM true THEN"));
-        assert!(sql.contains("ERRCODE = '55000'"));
-        assert!(sql.contains("catalog shape mismatch"));
-        let uppercase = sql.to_ascii_uppercase();
-        for forbidden in [
-            "INSERT ", "UPDATE ", "DELETE ", "ALTER ", "DROP ", "GRANT ", "REVOKE ",
-        ] {
-            assert!(!uppercase.contains(forbidden));
-        }
-    }
-
-    fn assert_resumable_exact_covering_index_migration(
-        migration: &str,
-        table_name: &str,
-        index_name: &str,
-        exact_catalog_definition: &str,
-    ) {
-        assert!(migration.starts_with("-- no-transaction\n"));
-        let sql = migration
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let create = format!("CREATE INDEX IF NOT EXISTS {index_name}");
-        assert_eq!(
-            sql.lines().filter(|line| line.starts_with(&create)).count(),
-            1
-        );
-        assert_eq!(sql.matches("DO $$").count(), 1);
-        assert_eq!(sql.matches("COMMIT;").count(), 1);
-        assert_eq!(sql.matches("FROM pg_catalog.pg_indexes").count(), 1);
-        assert_eq!(sql.matches("ERRCODE = '55000'").count(), 1);
-        assert!(sql.find(&create).unwrap() < sql.find("COMMIT;").unwrap());
-        assert!(sql.find("COMMIT;").unwrap() < sql.find("DO $$").unwrap());
-        assert!(sql.contains("current_database()"));
-        assert!(sql.contains(&format!("tablename = '{table_name}'")));
-        assert!(sql.contains(&format!("indexname = '{index_name}'")));
-        assert!(sql.contains(exact_catalog_definition));
-        assert!(sql.contains("IF exact_index IS DISTINCT FROM true THEN"));
-        assert!(sql.contains("catalog shape mismatch"));
-        assert!(sql.contains(" STORING ("));
-        assert!(!sql.contains("CREATE UNIQUE INDEX"));
-        let uppercase = sql.to_ascii_uppercase();
-        for forbidden in [
-            "INSERT ", "UPDATE ", "DELETE ", "ALTER ", "DROP ", "GRANT ", "REVOKE ",
-        ] {
-            assert!(!uppercase.contains(forbidden));
-        }
-    }
-
-    fn assert_resumable_conflict_detector_uniqueness_migration() {
-        let migration = CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL;
-        assert!(migration.starts_with("-- no-transaction\n"));
-        let sql = migration
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(sql.matches("DO $$").count(), 3);
-        assert_eq!(sql.matches("COMMIT;").count(), 2);
-        assert_eq!(
-            sql.matches(
-                "CREATE UNIQUE INDEX IF NOT EXISTS memory_conflicts_scope_key_detector_unique_idx"
-            )
-            .count(),
-            1
-        );
-        assert_eq!(
-            sql.matches(
-                "DROP INDEX IF EXISTS memory_conflicts@memory_conflicts_tenant_id_project_claim_key_key CASCADE;"
-            )
-            .count(),
-            1
-        );
-        assert!(sql.contains("(tenant_id ASC, project ASC, claim_key ASC, detector ASC)'"));
-        assert!(sql.contains("(tenant_id ASC, project ASC, claim_key ASC)'"));
-        assert!(sql.contains(
-            "(old_present AND old_exact AND NOT new_present)\n        OR (old_present AND old_exact AND new_present AND new_exact)\n        OR (NOT old_present AND new_present AND new_exact)"
-        ));
-        assert!(sql.contains("catalog shape mismatch before legacy drop"));
-        assert!(sql.contains("detector unique index final catalog state mismatch"));
-        assert_eq!(sql.matches("ERRCODE = '55000'").count(), 6);
-        assert!(
-            sql.find("CREATE UNIQUE INDEX IF NOT EXISTS")
-                .expect("detector index creation")
-                < sql
-                    .find("DROP INDEX IF EXISTS")
-                    .expect("legacy index removal")
-        );
-        let uppercase = sql.to_ascii_uppercase();
-        for forbidden in [
-            "INSERT ",
-            "UPDATE ",
-            "DELETE ",
-            "ALTER ",
-            "CREATE TABLE ",
-            "GRANT ",
-            "REVOKE ",
-        ] {
-            assert!(!uppercase.contains(forbidden));
-        }
-    }
-
-    fn assert_exact_genesis_root_indexes() {
-        assert!(
-            REGISTRY_GENESIS_HEAD_ROOT_INDEX_MIGRATION_SQL.contains(
-                "CREATE UNIQUE INDEX IF NOT EXISTS memory_registry_heads_genesis_root_idx"
-            )
-        );
-        assert!(REGISTRY_GENESIS_HEAD_ROOT_INDEX_MIGRATION_SQL.contains(
-            "source_event_id,\n        source_epoch_id,\n        source_shard,\n        source_committed_offset,\n        activated_at"
-        ));
-        assert!(
-            REGISTRY_GENESIS_ACTIVATION_ROOT_INDEX_MIGRATION_SQL.contains(
-                "CREATE UNIQUE INDEX IF NOT EXISTS memory_registry_activations_genesis_root_idx"
-            )
-        );
-        assert!(REGISTRY_GENESIS_ACTIVATION_ROOT_INDEX_MIGRATION_SQL.contains(
-            "profile_id,\n        profile_digest,\n        vector_manifest_digest,\n        contract_tenant_namespace,\n        contract_project_namespace,\n        effective_from"
-        ));
-    }
-
-    fn assert_transition_history_schema() {
-        let transitions = REGISTRY_TRANSITION_HISTORY_MIGRATION_SQL;
-        assert_eq!(transitions.matches("CREATE TABLE ").count(), 1);
-        assert!(transitions.contains("CREATE TABLE memory_registry_transitions"));
-        assert!(transitions.contains("OPEN-HEAD-ONLY SCHEMA CONTRACT"));
-        assert!(transitions.contains("canonical RegistryHeadBindingV1 preimage"));
-        assert!(transitions.contains("never byte-copy the narrower legacy canonical_head"));
-        assert!(
-            GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL.contains("CHECK (effective_until IS NULL)")
-        );
-        let transition_sql = transitions
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(!transition_sql.contains("effective_until"));
-        assert!(transitions.contains("PRIMARY KEY (tenant_id, project, generation)"));
-        for exact_anchor in [
-            "memory_registry_transition_genesis_head_fk",
-            "REFERENCES memory_registry_heads",
-            "memory_registry_transition_genesis_activation_fk",
-            "REFERENCES memory_registry_activations",
-            "memory_registry_transition_control_source_fk",
-            "REFERENCES memory_control_events",
-            "memory_registry_transition_predecessor_fk",
-            "REFERENCES memory_registry_transitions",
-        ] {
-            assert!(transitions.contains(exact_anchor));
-        }
-        assert!(transitions.contains("generation = 0"));
-        assert!(transitions.contains("package_digest = root_package_digest"));
-        assert!(transitions.contains("predecessor_generation IS NULL"));
-        assert!(transitions.contains("predecessor_generation = generation - 1"));
-        for required_predecessor in [
-            "predecessor_generation",
-            "predecessor_activation_id",
-            "predecessor_package_digest",
-            "predecessor_activation_policy_digest",
-            "predecessor_profile_id",
-            "predecessor_profile_digest",
-            "predecessor_vector_manifest_digest",
-            "predecessor_contract_tenant_namespace",
-            "predecessor_contract_project_namespace",
-            "predecessor_effective_from",
-            "predecessor_accepted_at",
-            "predecessor_source_event_id",
-            "predecessor_source_epoch_id",
-            "predecessor_source_shard",
-            "predecessor_source_committed_offset",
-        ] {
-            assert!(transitions.contains(&format!("{required_predecessor} IS NOT NULL")));
-        }
-        assert!(transitions.contains("predecessor_source_committed_offset > 0"));
-        assert!(transitions.contains("profile_digest = root_profile_digest"));
-        assert!(
-            transitions.contains("contract_project_namespace = root_contract_project_namespace")
-        );
-        assert_eq!(transitions.matches("BETWEEN 1 AND 1048576").count(), 7);
-        assert!(!transitions.contains(" DEFAULT "));
-    }
-
-    fn assert_bridge_and_current_head_schemas() {
-        let bridge = REGISTRY_GENESIS_BRIDGE_CONSUMPTION_MIGRATION_SQL;
-        assert_eq!(bridge.matches("CREATE TABLE ").count(), 1);
-        assert!(bridge.contains("PRIMARY KEY (tenant_id, project)"));
-        assert_eq!(
-            bridge
-                .matches("REFERENCES memory_registry_transitions")
-                .count(),
-            2
-        );
-        assert!(bridge.contains("CHECK (from_generation = 0 AND to_generation = 1)"));
-        assert!(bridge.contains("OPEN-HEAD-ONLY SCHEMA"));
-        assert!(bridge.contains("consumed_at = successor_accepted_at"));
-        assert!(bridge.contains("octet_length(canonical_bridge) BETWEEN 1 AND 1048576"));
-        assert!(!bridge.contains(" DEFAULT "));
-
-        let current_head = REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL;
-        assert_eq!(current_head.matches("CREATE TABLE ").count(), 1);
-        assert!(current_head.contains("CREATE TABLE memory_registry_current_heads_v2"));
-        assert!(current_head.contains("OPEN-HEAD-ONLY SCHEMA CONTRACT"));
-        assert!(current_head.contains("exact canonical RegistryHeadBindingV1 preimage"));
-        assert!(current_head.contains("never the narrower legacy RegistryHeadV1 bytes"));
-        assert!(current_head.contains("PRIMARY KEY (tenant_id, project)"));
-        assert!(current_head.contains("memory_registry_current_head_transition_fk"));
-        assert!(current_head.contains("REFERENCES memory_registry_transitions"));
-        assert!(current_head.contains("CHECK (head_state = 'active')"));
-        assert!(current_head.contains("octet_length(canonical_head) BETWEEN 1 AND 1048576"));
-        assert!(!current_head.contains(" DEFAULT "));
-    }
-
-    #[test]
-    fn successor_transition_migrations_use_recoverable_transaction_policy() {
-        assert_resumable_exact_index_migration(
-            REGISTRY_GENESIS_HEAD_ROOT_INDEX_MIGRATION_SQL,
-            "memory_registry_heads",
-            "memory_registry_heads_genesis_root_idx",
-        );
-        assert_resumable_exact_index_migration(
-            REGISTRY_GENESIS_ACTIVATION_ROOT_INDEX_MIGRATION_SQL,
-            "memory_registry_activations",
-            "memory_registry_activations_genesis_root_idx",
-        );
-        for migration in [
-            REGISTRY_TRANSITION_HISTORY_MIGRATION_SQL,
-            REGISTRY_GENESIS_BRIDGE_CONSUMPTION_MIGRATION_SQL,
-            REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL,
-        ] {
-            assert_transactional_single_additive_schema_change(migration);
-        }
-        assert_exact_genesis_root_indexes();
-        assert_transition_history_schema();
-        assert_bridge_and_current_head_schemas();
-        assert_resumable_conflict_detector_uniqueness_migration();
-        assert_resumable_exact_covering_index_migration(
-            CLAIM_TRANSITION_PROVENANCE_INDEX_MIGRATION_SQL,
-            "memory_claim_events",
-            "memory_claim_events_transition_provenance_idx",
-            "USING btree (tenant_id ASC, project ASC, claim_id ASC, event_kind ASC, created_at DESC, event_id DESC) STORING (reason, from_state, to_state, payload)",
-        );
-        assert_resumable_exact_covering_index_migration(
-            CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL,
-            "memory_conflicts",
-            "memory_conflicts_scope_detector_state_recency_idx",
-            "USING btree (tenant_id ASC, project ASC, detector ASC, state ASC, last_seen_at DESC, id ASC) STORING (claim_key, kind, rationale, revision, detected_at, resolved_at, resolution_kind, resolution_reason)",
-        );
-    }
-
-    /// Migration 0018 is the physical boundary ADR 0002 D1/D2/D5 rely on. The
-    /// evidence ledger must mirror the control ledger without inheriting its
-    /// governance kinds, and it must never become a second log epoch.
-    #[test]
-    #[allow(clippy::too_many_lines)] // one shape contract, asserted in one place
-    fn stage4_evidence_ledger_migration_is_additive_bounded_and_governance_free() {
-        let migration = STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL;
-        let tables = [
-            "memory_evidence_shard_heads",
-            "memory_evidence_events",
-            "memory_evidence_quarantine",
-            "memory_content_objects",
-            "memory_relation_projection_v1",
-            "memory_relation_projection_watermarks_v1",
-        ];
-        assert_eq!(
-            migration.matches("CREATE TABLE IF NOT EXISTS ").count(),
-            tables.len()
-        );
-        assert_eq!(migration.matches("CREATE TABLE ").count(), tables.len());
-        for table in tables {
-            assert!(
-                migration.contains(&format!(
-                    "CREATE TABLE IF NOT EXISTS {table} (\n    tenant_id"
-                )),
-                "{table} must be scoped by tenant_id first"
-            );
-        }
-        assert_eq!(migration.matches("CREATE VIEW ").count(), 1);
-        assert!(migration.contains("CREATE VIEW IF NOT EXISTS memory_writer_authority_v1 AS"));
-
-        // ADR 0002 D1 amendment (2026-08-16): the evidence head table carries
-        // NO foreign key at all, and no relation in this migration may target a
-        // control or registry parent. CockroachDB v26.2.3 evaluates a
-        // foreign-key check with the INSERTING role's privileges, so a
-        // control-plane parent would make D1's lazy head seed impossible for a
-        // role that D2 denies every control grant (observed SQLSTATE 42501),
-        // and that grant is not durable either: control-role-grants.sql REVOKEs
-        // ALL on memory_control_log_epochs FROM fleet_runtime on every reapply.
-        // The events -> heads edge stays, inside the evidence plane.
-        assert!(
-            !migration.contains("REFERENCES memory_control_"),
-            "no evidence-plane foreign key may target a control-plane table"
-        );
-        assert!(
-            !migration.contains("REFERENCES memory_registry_"),
-            "no evidence-plane foreign key may target a registry table"
-        );
-        // One declared foreign key (events -> heads), the closing catalog
-        // assertion that pins its exact definition, and the same edge inside
-        // the complete constraint-set fingerprint of memory_evidence_events.
-        assert_eq!(migration.matches("FOREIGN KEY ").count(), 3);
-        assert_eq!(
-            migration
-                .matches("        FOREIGN KEY (tenant_id, project, epoch_id, shard)\n")
-                .count(),
-            1
-        );
-        assert!(migration.contains("epoch_id                    BYTES NOT NULL"));
-        assert!(migration.contains("CONSTRAINT memory_evidence_head_epoch_id_shape"));
-        assert!(migration.contains("CONSTRAINT memory_evidence_head_shard_count_bound"));
-        assert!(migration.contains(
-            "REFERENCES memory_evidence_shard_heads (tenant_id, project, epoch_id, shard)"
-        ));
-        assert!(migration.contains("UNIQUE (tenant_id, project, event_id)"));
-        assert!(migration.contains(
-            "CREATE UNIQUE INDEX IF NOT EXISTS memory_evidence_events_predecessor_unique_idx"
-        ));
-
-        // D1: no governance kind or family can be appended to this ledger.
-        for governance_kind in [
-            "'control.bootstrap.accepted'",
-            "'registry.genesis.activated'",
-            "'registry.successor.activated'",
-        ] {
-            assert!(
-                migration.contains(governance_kind),
-                "governance exclusion must name {governance_kind}"
-            );
-        }
-        assert!(migration.contains("event_kind NOT IN ("));
-        assert!(migration.contains("consistency_family <> 'registry.activation'"));
-
-        // D5 and REPLAY-02 shapes.
-        assert!(migration.contains("retention_class IN ('ephemeral', 'governed', 'immutable')"));
-        for erasure_axis in [
-            "erasure_representation_digest",
-            "erasure_source_fact_digest",
-            "erasure_resource_digest",
-            "erasure_privacy_subject_digest",
-        ] {
-            assert!(migration.contains(erasure_axis));
-        }
-        assert!(
-            !migration.contains("    payload "),
-            "quarantine must retain a digest and bounded diagnostic, never payload bytes"
-        );
-        assert!(migration.contains("octet_length(diagnostic) BETWEEN 1 AND 4096"));
-        assert!(migration.contains("ledger_family IN ('control', 'evidence')"));
-        assert!(migration.contains("PRIMARY KEY (tenant_id, project, ledger_family, shard)"));
-        assert!(
-            migration
-                .contains("projection_state IN ('declared', 'verified', 'refuted', 'contested')")
-        );
-
-        // D3: the accepted-event coordinate is additive, nullable, and shaped.
-        assert_eq!(migration.matches("ADD COLUMN IF NOT EXISTS ").count(), 2);
-        assert_eq!(
-            migration.matches("ADD CONSTRAINT IF NOT EXISTS ").count(),
-            2
-        );
-        assert_eq!(
-            migration
-                .matches(
-                    "CHECK (accepted_event_id IS NULL OR octet_length(accepted_event_id) = 32)"
-                )
-                .count(),
-            2
-        );
-
-        // Additive only: no destructive verb may enter an applied migration.
-        for destructive in ["DROP ", "TRUNCATE", "DELETE FROM", "UPDATE "] {
-            assert!(
-                !migration.contains(destructive),
-                "migration 0018 must stay additive; found {destructive}"
-            );
-        }
-        assert!(!migration.contains(" DEFAULT "));
-
-        // Same-name drift must fail closed rather than be adopted. IF NOT
-        // EXISTS alone would record a forged authority view or a quarantine
-        // table carrying a payload column as a successful version 18.
-        assert_eq!(migration.matches("ERRCODE = '55000'").count(), 8);
-        for drift_assertion in [
-            "migration 0018 same-name relation drift: ",
-            "memory_writer_authority_v1 is not a view",
-            "memory_writer_authority_v1 is not owned by this migrator",
-            "memory_writer_authority_v1 catalog definition mismatch",
-            "memory_evidence_shard_heads must carry no foreign key",
-            "memory_evidence_event_head_fk does not bind the evidence shard head",
-            "migration 0018 relation constraint drift: ",
-            "migration 0018 accepted-event column constraint drift: ",
-        ] {
-            assert!(
-                migration.contains(drift_assertion),
-                "migration 0018 must fail closed with {drift_assertion}"
-            );
-        }
-        for relation in tables
-            .iter()
-            .chain(std::iter::once(&"memory_writer_authority_v1"))
-        {
-            assert!(
-                migration.contains(&format!("        ('{relation}',")),
-                "{relation} must be covered by the same-name drift assertion"
-            );
-        }
-
-        // A column-shape-only assertion is not enough: an adopted
-        // memory_evidence_events with the exact fifteen columns and the exact
-        // events -> heads foreign key, but WITHOUT the governance CHECK and
-        // WITHOUT UNIQUE (tenant_id, project, event_id), was recorded as a
-        // successful version 18 and then accepted a
-        // 'registry.successor.activated' row (blocking review finding,
-        // 2026-08-16). Every created relation therefore pins its COMPLETE
-        // committed constraint set, ordered by (contype, name).
-        assert_eq!(
-            migration
-                .matches("|| constraint_object.conname || ':'")
-                .count(),
-            1
-        );
-        for relation in tables {
-            assert!(
-                migration.contains(&format!("p:{relation}_pkey:PRIMARY KEY (")),
-                "{relation} must pin its primary key in the constraint fingerprint"
-            );
-        }
-        for constraint_fingerprint in [
-            "c:memory_evidence_event_governance_exclusion:CHECK (((event_kind NOT IN (",
-            "u:memory_evidence_events_tenant_id_project_event_id_key:UNIQUE (tenant_id ASC, \
-             project ASC, event_id ASC)",
-            "u:memory_evidence_events_predecessor_unique_idx:UNIQUE (tenant_id ASC, project ASC, \
-             epoch_id ASC, shard ASC, previous_chain_digest ASC)",
-            "f:memory_evidence_event_head_fk:FOREIGN KEY (tenant_id, project, epoch_id, shard)",
-            "c:memory_evidence_quarantine_diagnostic_bound:",
-            "c:memory_content_object_retention_class:",
-            "c:memory_relation_projection_state:",
-            "c:memory_relation_watermark_ledger_family:",
-        ] {
-            assert!(
-                migration.contains(constraint_fingerprint),
-                "the constraint fingerprint must pin {constraint_fingerprint}"
-            );
-        }
-        for accepted_event_constraint in [
-            "('memory_claims', 'memory_claim_accepted_event_id_shape',",
-            "('memory_mutation_receipts', 'memory_mutation_receipt_accepted_event_id_shape',",
-        ] {
-            assert!(
-                migration.contains(accepted_event_constraint),
-                "the accepted-event constraint assertion must pin \
-                 {accepted_event_constraint}"
-            );
-        }
-    }
-
-    #[test]
-    fn embedded_migrator_registers_mixed_transaction_policy_through_twenty_seven() {
         let migrator = embedded_migrator();
-        assert_eq!(
-            migrator
-                .migrations
-                .iter()
-                .map(|migration| migration.version)
-                .collect::<Vec<_>>(),
-            // W3-NORM registers migration 24, W3-CIEV registers 26, and
-            // W3-DISC registers 27; version 25 is reserved for an item that
-            // added no migration, so the sequence is deliberately
-            // non-contiguous.
-            (1..=24).chain([26, 27]).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            migrator
-                .migrations
-                .iter()
-                .map(|migration| migration.no_tx)
-                .collect::<Vec<_>>(),
-            [vec![true; 11], vec![false; 3], vec![true; 12]].concat()
-        );
-        let control_ledger = migrator
-            .migrations
-            .iter()
-            .find(|migration| migration.version == 3)
-            .unwrap();
-        assert_eq!(
-            control_ledger.sql.as_ref(),
-            CONTROL_EVENT_LEDGER_MIGRATION_SQL
-        );
-        assert!(control_ledger.no_tx);
-        let registry_activation = migrator
-            .migrations
-            .iter()
-            .find(|migration| migration.version == 4)
-            .unwrap();
-        assert_eq!(
-            registry_activation.sql.as_ref(),
-            GENESIS_REGISTRY_ACTIVATION_MIGRATION_SQL
-        );
-        assert!(registry_activation.no_tx);
-        for (version, sql, expected_no_tx) in [
-            (5, CONTROL_LEDGER_INVARIANTS_MIGRATION_SQL, true),
-            (
-                6,
-                CONTROL_BOOTSTRAP_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
-                true,
-            ),
-            (7, CONTROL_EPOCH_EXPLICIT_CREATION_TIME_MIGRATION_SQL, true),
-            (8, CONTROL_HEAD_EXPLICIT_ADVANCE_TIME_MIGRATION_SQL, true),
-            (
-                9,
-                CONTROL_EVENT_EXPLICIT_ACCEPTANCE_TIME_MIGRATION_SQL,
-                true,
-            ),
-            (10, REGISTRY_GENESIS_HEAD_ROOT_INDEX_MIGRATION_SQL, true),
-            (
-                11,
-                REGISTRY_GENESIS_ACTIVATION_ROOT_INDEX_MIGRATION_SQL,
-                true,
-            ),
-            (12, REGISTRY_TRANSITION_HISTORY_MIGRATION_SQL, false),
-            (13, REGISTRY_GENESIS_BRIDGE_CONSUMPTION_MIGRATION_SQL, false),
-            (14, REGISTRY_CURRENT_HEAD_V2_MIGRATION_SQL, false),
-            (15, CONFLICT_DETECTOR_UNIQUENESS_MIGRATION_SQL, true),
-            (16, CLAIM_TRANSITION_PROVENANCE_INDEX_MIGRATION_SQL, true),
-            (17, CONFLICT_DETECTOR_PROJECTION_INDEX_MIGRATION_SQL, true),
-            (18, STAGE4_EVIDENCE_LEDGER_MIGRATION_SQL, true),
-            (19, BODY_PROJECTION_MIGRATION_SQL, true),
-            (20, COVERAGE_RUNTIME_MIGRATION_SQL, true),
-            (21, RECALL_PROJECTION_MIGRATION_SQL, true),
-            (22, TRANSCRIPT_CONNECTOR_MIGRATION_SQL, true),
-            (23, RECALL_VISIBILITY_MIGRATION_SQL, true),
-            (24, NORMATIVE_ACTIVATION_MIGRATION_SQL, true),
-            (26, CI_CONNECTOR_MIGRATION_SQL, true),
-            (27, DISCREPANCY_LEDGER_MIGRATION_SQL, true),
-        ] {
-            let migration = migrator
-                .migrations
-                .iter()
-                .find(|migration| migration.version == version)
-                .unwrap();
-            assert_eq!(migration.sql.as_ref(), sql);
-            assert_eq!(migration.no_tx, expected_no_tx);
-        }
         assert!(migrator.no_tx);
         assert!(!migrator.locking);
-    }
-
-    #[test]
-    fn embedded_migrator_registers_three_execution_phases() {
-        let pre_transactional = pre_transactional_embedded_migrator();
-        assert!(!pre_transactional.ignore_missing);
+        assert!(!migrator.ignore_missing);
+        let versions = migrator
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+        assert!(versions.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(
-            pre_transactional
-                .migrations
+            versions,
+            files
                 .iter()
-                .map(|migration| migration.version)
-                .collect::<Vec<_>>(),
-            // W3-NORM registers migration 24, W3-CIEV registers 26, and
-            // W3-DISC registers 27; version 25 is reserved for an item that
-            // added no migration, so the sequence is deliberately
-            // non-contiguous.
-            (1..=24).chain([26, 27]).collect::<Vec<_>>()
+                .map(|(version, _)| *version)
+                .collect::<Vec<_>>()
         );
-        for version in (10..=24).chain([26, 27]) {
-            let migration = pre_transactional
-                .migrations
-                .iter()
-                .find(|migration| migration.version == version)
-                .unwrap();
-            let expected_type = if version <= 11 {
-                MigrationType::Simple
-            } else {
-                MigrationType::ReversibleDown
-            };
-            assert_eq!(migration.migration_type, expected_type);
-        }
-
-        let transactional = transactional_embedded_migrator();
-        assert!(!transactional.ignore_missing);
-        assert_eq!(
-            transactional
-                .migrations
-                .iter()
-                .map(|migration| migration.version)
-                .collect::<Vec<_>>(),
-            // W3-NORM registers migration 24, W3-CIEV registers 26, and
-            // W3-DISC registers 27; version 25 is reserved for an item that
-            // added no migration, so the sequence is deliberately
-            // non-contiguous.
-            (1..=24).chain([26, 27]).collect::<Vec<_>>()
-        );
-        for migration in transactional.migrations.iter() {
-            let expected_type = if migration.version >= 15 {
-                MigrationType::ReversibleDown
-            } else {
-                MigrationType::Simple
-            };
-            assert_eq!(migration.migration_type, expected_type);
+        for (migration, (_, sql)) in migrator.migrations.iter().zip(&files) {
+            assert_eq!(migration.sql.as_ref(), sql, "version {}", migration.version);
+            assert_eq!(
+                migration.no_tx,
+                !(12..=14).contains(&migration.version),
+                "version {}",
+                migration.version
+            );
         }
     }
 

@@ -73,7 +73,6 @@ fn configured_digest_and_registry_identity_are_verified() {
         embedding_model: "logical/model".into(),
         embedding_model_path: bundle.path().into(),
         embedding_model_sha256: digest.clone(),
-        writer_authority: None,
     };
 
     assert!(config.verify_embedding_model_bundle().is_ok());
@@ -116,7 +115,6 @@ fn debug_never_exposes_database_credentials() {
         embedding_model: "logical/model".into(),
         embedding_model_path: bundle.path().into(),
         embedding_model_sha256: "0".repeat(64),
-        writer_authority: None,
     };
     let debug = format!("{config:?}");
     assert!(!debug.contains("super-secret"));
@@ -1537,76 +1535,41 @@ fn writer_authority_rejects_noncanonical_pins() {
     }
 }
 
-/// ADR 0002 D4 wiring. The pin group only protects a deployment if the
-/// process configuration actually reads it, so all three states are
-/// asserted through `FleetConfig` itself and not only through
-/// `WriterAuthorityConfig`: absent leaves every existing runtime
-/// assertion untouched, complete is carried, and partial fails the
-/// configuration load that every runtime entry point performs.
+/// The serving runtime does not read the writer-authority pin group, so a
+/// partial set meant for another tool (the control bootstrap also reads
+/// `FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST`) must not stop the writer,
+/// migrator, or publication configuration from loading.
 #[test]
-fn fleet_config_carries_the_writer_authority_pin_group_or_fails_closed() {
-    let mut absent = serving_values();
-    absent.insert(
+fn serving_configs_ignore_a_partial_writer_authority_pin_group() {
+    let mut writer = serving_values();
+    writer.insert(
+        "FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST",
+        FIXTURE_RECEIPT_DIGEST.into(),
+    );
+    let mut migrator = writer.clone();
+    let mut publication = writer.clone();
+    writer.insert(
         "FLEET_RECALL_DATABASE_URL",
         "postgresql://fleet_writer:writer-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
             .into(),
     );
+    migrator.insert(
+        "FLEET_RECALL_DATABASE_URL",
+        "postgresql://fleet_migrator:migrator-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+            .into(),
+    );
+    publication.insert(
+        "FLEET_RECALL_PUBLICATION_DATABASE_URL",
+        "postgresql://fleet_publication:reader-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+            .into(),
+    );
 
-    let config = FleetConfig::from_lookup(|name| absent.get(name).cloned())
-        .expect("an absent pin group must leave the runtime configuration loadable");
-    assert!(
-        config.writer_authority.is_none(),
-        "an absent pin group must leave the event-first path disabled"
-    );
-    assert_eq!(config.max_connections, 4);
-    assert_eq!(config.default_scope.project, "physical-project");
-    assert_eq!(config.embedding_model, "logical/publication-model");
-
-    let mut complete = absent.clone();
-    complete.extend(writer_authority_values());
-    let config = FleetConfig::from_lookup(|name| complete.get(name).cloned())
-        .expect("a complete pin group must load");
-    let pins = config
-        .writer_authority
-        .as_ref()
-        .expect("a complete pin group must reach the runtime configuration");
-    assert_eq!(
-        pins.semantic_scope().tenant_namespace.as_str(),
-        "tenant.acme"
-    );
-    assert_eq!(
-        pins.semantic_scope().project_namespace.as_str(),
-        "project.recall"
-    );
-    assert_eq!(
-        pins.bootstrap_receipt_digest().digest(),
-        parse_digest(FIXTURE_RECEIPT_DIGEST, "fixture").expect("fixture digest")
-    );
-    let debug = format!("{config:?}");
-    assert!(!debug.contains(FIXTURE_RECEIPT_DIGEST));
-    assert!(!debug.contains("writer-secret"));
-
-    for omitted in WRITER_AUTHORITY_PIN_ENV_NAMES {
-        let mut partial = complete.clone();
-        partial.remove(omitted);
-        let error = FleetConfig::from_lookup(|name| partial.get(name).cloned())
-            .expect_err("a partial pin group must fail the runtime configuration load");
-        assert!(
-            format!("{error}").contains(omitted),
-            "the partial pin error must name the missing variable {omitted}"
-        );
-        let error = FleetConfig::from_migrator_lookup(|name| {
-            if name == "FLEET_RECALL_DATABASE_URL" {
-                return Some(
-                    "postgresql://fleet_migrator:migrator-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
-                        .to_owned(),
-                );
-            }
-            partial.get(name).cloned()
-        })
-        .expect_err("the migrator entry point must fail closed on the same partial set");
-        assert!(format!("{error}").contains(omitted));
-    }
+    FleetConfig::from_lookup(|name| writer.get(name).cloned())
+        .expect("the writer configuration must ignore writer-authority pins");
+    FleetConfig::from_migrator_lookup(|name| migrator.get(name).cloned())
+        .expect("the migrator configuration must ignore writer-authority pins");
+    PublicationConfig::from_lookup(|name| publication.get(name).cloned())
+        .expect("the publication configuration must ignore writer-authority pins");
 }
 
 #[test]

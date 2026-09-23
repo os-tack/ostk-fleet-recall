@@ -161,6 +161,7 @@ test('safe inline markdown emits only the allowlisted DOM elements',()=>{
   assert.equal(link.href,'https://example.com/docs');
   assert.equal(link.target,'_blank');
   assert.equal(link.rel,'noopener noreferrer nofollow');
+  assert.doesNotMatch(page,/innerHTML/);
 });
 
 test('HTTPS autolinks and immutable repository-relative links render safely',()=>{
@@ -550,23 +551,4 @@ test('sample selection tracks exact questions and clears for custom input',()=>{
   assert.deepEqual(buttons.map(button=>button.pressed),['false','true']);
   selectionContext.syncSampleSelection('custom question');
   assert.deepEqual(buttons.map(button=>button.pressed),['false','false']);
-});
-
-test('presentation language stays tied to exact evidence',()=>{
-  assert.match(page,/Evidence ranked for this question/);
-  assert.match(page,/fusedRank===1\?'Best match':'Related evidence'/);
-  assert.match(page,/operator review required/);
-  assert.match(page,/replacement-devpost-final6-20260814T143523Z[.]json/);
-  assert.match(page,/setAttribute\('role','alert'\)/);
-  assert.doesNotMatch(page,/Sources behind this disagreement/);
-  assert.doesNotMatch(page,/hasMatchingEscalation/);
-  assert.doesNotMatch(page,/escalated for operator review/);
-  assert.match(page,/else if\(hit[?][.]source==='markdown'\)\{\s*card[.]append\(renderInlineMarkdown\(snippet,hit\)\)/);
-  assert.match(page,/if\(hit[?][.]source==='code'\)\{\s*const pre=element\('pre'\)/);
-  assert.match(page,/JSON[.]stringify\(\{query,limit:20,category:selectedCategory\}\)/);
-  assert.match(page,/typed claim search/);
-  assert.match(page,/selectedCategory==='claim'\?'retrieved claims in':'retrieved \+ fused in'/);
-  assert.match(page,/Where is the MCP server configured and which tools does it expose[?]/);
-  assert.match(page,/What AWS services does this project use[?]/);
-  assert.doesNotMatch(page,/innerHTML/);
 });

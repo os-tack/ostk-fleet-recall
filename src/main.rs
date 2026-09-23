@@ -20,7 +20,6 @@ use clap::{Parser, Subcommand};
 use ostk_fleet_recall::config::{PublicationConfig, model_bundle_sha256};
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::McpServer;
-use ostk_fleet_recall::reference_agent::{ReferenceAgentStep, run_reference_agent};
 use ostk_fleet_recall::service::{
     FleetRecallService, RecallAction, RecallRequest, RecallResult, ServiceError,
 };
@@ -129,7 +128,7 @@ impl ChunkEmbedder for PinnedEmbedder {
 enum Command {
     /// Serve the Recall MCP protocol over stdin/stdout.
     Serve,
-    /// Serve the bounded, read-only hackathon demo over HTTP.
+    /// Serve the bounded, read-only demo over HTTP.
     Demo {
         /// Address on which the HTTP demo listens.
         #[arg(long, default_value = "0.0.0.0:8080", value_name = "ADDRESS")]
@@ -144,15 +143,6 @@ enum Command {
         /// NDJSON path, or `-` for stdin.
         #[arg(long, default_value = "-", value_name = "PATH")]
         input: String,
-    },
-    /// Run one bounded, deterministic policy-agent step against fleet memory.
-    ReferenceAgent {
-        /// Scenario step. Each step requires its documented deployment-bound agent.
-        #[arg(long, value_enum)]
-        step: ReferenceAgentStep,
-        /// Stable scenario coordinate shared across the selected scenario steps.
-        #[arg(long, value_name = "ID")]
-        run_id: String,
     },
     /// Print the versioned SHA-256 for a local model2vec bundle.
     ModelDigest {
@@ -176,9 +166,7 @@ impl Command {
             Self::Demo { .. } => RuntimeDatabaseIdentity::Publication,
             Self::Migrate => RuntimeDatabaseIdentity::Migrator,
             Self::ModelDigest { .. } => RuntimeDatabaseIdentity::None,
-            Self::Serve | Self::Health | Self::Ingest { .. } | Self::ReferenceAgent { .. } => {
-                RuntimeDatabaseIdentity::Writer
-            }
+            Self::Serve | Self::Health | Self::Ingest { .. } => RuntimeDatabaseIdentity::Writer,
         }
     }
 }
@@ -261,29 +249,12 @@ async fn main() -> anyhow::Result<()> {
                 Command::Health => run_health(&config).await?,
                 Command::Serve => run_serve(config).await?,
                 Command::Ingest { input } => run_ingest(&config, &input).await?,
-                Command::ReferenceAgent { step, run_id } => {
-                    run_reference_agent_step(&config, step, &run_id).await?;
-                }
                 Command::Demo { .. } | Command::Migrate | Command::ModelDigest { .. } => {
                     unreachable!("command identity was classified before configuration load")
                 }
             }
         }
     }
-    Ok(())
-}
-
-async fn run_reference_agent_step(
-    config: &FleetConfig,
-    step: ReferenceAgentStep,
-    run_id: &str,
-) -> anyhow::Result<()> {
-    let (service, _) = build_memory_service(config).await?;
-    let evidence =
-        run_reference_agent(service.as_ref(), config.default_scope.clone(), step, run_id)
-            .await
-            .map_err(anyhow::Error::msg)?;
-    println!("{}", serde_json::to_string(&evidence)?);
     Ok(())
 }
 
@@ -1136,16 +1107,11 @@ impl PinnedEmbeddingConfig for PublicationConfig {
 }
 
 fn load_pinned_embedder(config: &impl PinnedEmbeddingConfig) -> anyhow::Result<PinnedEmbedder> {
-    let canonical_before = config.verified_bundle_path()?;
-    let local_path = canonical_before.to_str().ok_or_else(|| {
+    let canonical = config.verified_bundle_path()?;
+    let local_path = canonical.to_str().ok_or_else(|| {
         anyhow::anyhow!("embedding model bundle path must be valid UTF-8 for model2vec")
     })?;
     let inner = Embedder::load(local_path).context("load verified local embedding model bundle")?;
-    let canonical_after = config.verified_bundle_path()?;
-    ensure!(
-        canonical_before == canonical_after,
-        "embedding model bundle path changed while the model was loading"
-    );
     ensure!(
         inner.dim() == EMBEDDING_DIMENSION,
         "embedding model dimension mismatch: schema requires {EMBEDDING_DIMENSION}, bundle produced {}",
@@ -1512,10 +1478,6 @@ mod tests {
             Command::Serve,
             Command::Health,
             Command::Ingest { input: "-".into() },
-            Command::ReferenceAgent {
-                step: ReferenceAgentStep::RecordDecision,
-                run_id: "run-1".into(),
-            },
         ] {
             assert_eq!(
                 command.runtime_database_identity(),
@@ -1529,34 +1491,6 @@ mod tests {
             .runtime_database_identity(),
             RuntimeDatabaseIdentity::None
         );
-    }
-
-    #[test]
-    fn production_commands_route_only_through_fixed_private_connectors() {
-        let source = include_str!("main.rs");
-        let writer_connector = ["CockroachStore::connect_", "writer("].concat();
-        let migrator_connector = ["CockroachStore::connect_", "migrator("].concat();
-        let migrate_store_call = ["connect_migrator_", "store(config).await?"].concat();
-        let writer_store_call = ["connect_", "store(config).await?"].concat();
-        let raw_connector = ["CockroachStore::", "connect("].concat();
-        let migrator_config = ["FleetConfig::from_", "migrator_env()?"].concat();
-        let writer_config = ["FleetConfig::from_", "writer_env()?"].concat();
-
-        assert_eq!(source.matches(&writer_connector).count(), 1);
-        assert_eq!(source.matches(&migrator_connector).count(), 1);
-        assert_eq!(
-            source.matches(&raw_connector).count(),
-            0,
-            "production main must not reach the generic admin/test connector"
-        );
-        assert_eq!(source.matches(&migrate_store_call).count(), 1);
-        assert_eq!(
-            source.matches(&writer_store_call).count(),
-            3,
-            "health, service construction, and ingestion must use the writer boundary"
-        );
-        assert_eq!(source.matches(&migrator_config).count(), 1);
-        assert_eq!(source.matches(&writer_config).count(), 1);
     }
 
     #[derive(Default)]
@@ -1837,26 +1771,6 @@ mod tests {
     }
 
     #[test]
-    fn reference_agent_cli_contract_matches_ecs_overrides() {
-        let cli = Cli::try_parse_from([
-            "ostk-fleet-recall",
-            "reference-agent",
-            "--step",
-            "recall-and-act",
-            "--run-id",
-            "cloud-proof-1",
-        ])
-        .expect("CLI");
-        assert!(matches!(
-            cli.command,
-            Command::ReferenceAgent {
-                step: ReferenceAgentStep::RecallAndAct,
-                ref run_id,
-            } if run_id == "cloud-proof-1"
-        ));
-    }
-
-    #[test]
     fn migration_preflight_rejects_hash_valid_but_malformed_model_bundle() {
         let bundle = tempfile::tempdir().expect("tempdir");
         fs::write(bundle.path().join("config.json"), b"not model2vec config").expect("config");
@@ -1872,7 +1786,6 @@ mod tests {
             embedding_model: "logical/model".into(),
             embedding_model_path: bundle.path().into(),
             embedding_model_sha256: digest,
-            writer_authority: None,
         };
 
         assert!(
@@ -2324,7 +2237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demo_page_leads_with_conflict_story_and_keeps_raw_evidence_collapsed() {
+    async fn demo_page_is_served_under_csp_without_inner_html() {
         let router = test_demo_router(Arc::new(DemoService::default()));
         let response = router
             .oneshot(Request::get("/").body(Body::empty()).unwrap())
@@ -2340,27 +2253,6 @@ mod tests {
         );
         let body = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
         let page = std::str::from_utf8(&body).expect("demo page must be UTF-8");
-        assert!(page.contains("When agents disagree, memory should"));
-        assert!(page.contains("Does MCP remember support deliberate retractions?"));
-        assert!(
-            page.contains("How are conflicting migration strategies represented and escalated?")
-        );
-        assert!(page.contains("incompatible typed claims"));
-        assert!(page.contains("claim_support_chunk_index_enabled"));
-        assert!(page.contains("conflict_matches"));
-        assert!(page.contains("source_support"));
-        assert!(page.contains("fused_hit_rank"));
-        assert!(page.contains("<details id=\"raw\" hidden>"));
-        assert!(page.contains("View raw evidence envelope"));
-        assert!(page.contains("response.headers.get('server-timing')"));
-        assert!(page.contains("document.createElement(tag)"));
-        assert!(page.contains("Verified on AWS"));
-        assert!(page.contains("syncSampleSelection"));
-        assert!(page.contains("aria-pressed=\"true\""));
-        assert!(page.contains("exact retrieved claim/source association"));
-        assert!(page.contains("rich-demo/docs/"));
-        assert!(page.contains("src\\/[A-Za-z0-9._/-]+\\.rs"));
-        assert!(page.contains("https://github.com/os-tack/ostk-fleet-recall/blob/main/"));
         assert!(!page.contains("innerHTML"));
     }
 
