@@ -60,6 +60,20 @@ pub trait ClaimLedger: Send + Sync {
         idempotency_key: &str,
     ) -> Result<ClaimMutation>;
 
+    /// Replay a committed lifecycle request whose action this deployment does
+    /// not serve, reading its receipt without taking a lock or writing.
+    ///
+    /// `retract` names the request when its arguments parsed as a retract; the
+    /// stored result replays only for exactly that request. Any other receipt
+    /// under the key is an idempotency conflict. `Ok(None)` means no receipt
+    /// holds the key in this tenant.
+    async fn replay_unserved_lifecycle(
+        &self,
+        scope: &FleetScope,
+        idempotency_key: &str,
+        retract: Option<(ClaimTarget, Option<&str>)>,
+    ) -> Result<Option<ClaimMutation>>;
+
     async fn get_claim(&self, scope: &FleetScope, id: i64) -> Result<Option<Claim>>;
 
     /// Hydrate conflicts by id in any state (at most 100 ids). Unknown ids are

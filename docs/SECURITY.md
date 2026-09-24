@@ -263,7 +263,8 @@ credential, so this is authority over agents that run the reviewed binary with
 their own `FLEET_RECALL_AGENT`, not cryptographic workload identity. A holder
 of that credential can issue the same SQL directly (see below).
 `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` withdraws the action and restores
-the record-only tool surface.
+the record-only tool surface; a retract committed before the switch still
+replays when its identical request is retried.
 
 ## Residual SQL authority and recovery
 

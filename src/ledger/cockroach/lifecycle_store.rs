@@ -110,8 +110,12 @@ const CLOSE_CONFLICT_SQL: &str = "UPDATE memory_conflicts \
      WHERE tenant_id = $1 AND project = $2 AND id = $3 \
        AND detector = 'same_key_functional_value_v2' AND state = 'open' AND revision = $4 \
      RETURNING revision";
-/// A disputed member returns to `active` only when no other open conflict of
-/// any detector (including an unreconciled legacy row) still holds it.
+/// A disputed member returns to `active` only when no other open conflict
+/// still holds it. The legacy row on the closing lineage's own key (`$5`) is
+/// not such a conflict: a key only gains its v2 lineage beside a legacy row
+/// through reconciliation, which preserves that row unchanged and hands the
+/// key's disputes to v2, exactly as every current-facing read already treats
+/// it. Any other open membership, of any detector, still holds the claim.
 const RESTORE_DISPUTED_MEMBERS_SQL: &str = "UPDATE memory_claims AS claim \
      SET state = 'active', revision = claim.revision + 1, updated_at = now() \
      WHERE claim.tenant_id = $1 AND claim.project = $2 AND claim.id = ANY($4) \
@@ -126,7 +130,8 @@ const RESTORE_DISPUTED_MEMBERS_SQL: &str = "UPDATE memory_claims AS claim \
          JOIN memory_conflicts@primary AS c \
            ON c.tenant_id = o.tenant_id AND c.project = o.project AND c.id = o.conflict_id \
          WHERE o.tenant_id = $1 AND o.project = $2 AND o.claim_id = claim.id \
-           AND o.conflict_id <> $3 AND c.state = 'open'\
+           AND o.conflict_id <> $3 AND c.state = 'open' \
+           AND NOT (c.detector = 'same_key_typed_value' AND c.claim_key = $5)\
        ) \
      RETURNING claim.id, claim.revision";
 const INSERT_TRANSITION_EVENT_SQL: &str = "INSERT INTO memory_claim_events (\
@@ -173,15 +178,7 @@ pub(super) async fn retract_claim(
     if let Some(reason) = reason {
         validate_reason(reason).map_err(FleetError::Memory)?;
     }
-    let request = lifecycle_request_identity(
-        RETRACT_OPERATION,
-        scope,
-        &json!({
-            "claim_id": target.claim_id,
-            "expected_revision": target.expected_revision,
-            "reason": reason,
-        }),
-    );
+    let request = retract_request(scope, target, reason);
     let scope = scope.clone();
     let reason = reason.map(str::to_owned);
     let key = key.to_owned();
@@ -203,6 +200,56 @@ pub(super) async fn retract_claim(
         })
     })
     .await
+}
+
+/// The canonical request identity a `retract` receipt stores.
+fn retract_request(scope: &FleetScope, target: ClaimTarget, reason: Option<&str>) -> Value {
+    lifecycle_request_identity(
+        RETRACT_OPERATION,
+        scope,
+        &json!({
+            "claim_id": target.claim_id,
+            "expected_revision": target.expected_revision,
+            "reason": reason,
+        }),
+    )
+}
+
+/// R1 for a deployment that does not serve the request's action: a committed
+/// request still replays, so a refusal is only ever returned for a key that no
+/// receipt holds. One autocommit read; nothing is locked or written.
+pub(super) async fn replay_unserved_lifecycle(
+    ledger: &CockroachClaimLedger,
+    scope: &FleetScope,
+    idempotency_key: &str,
+    retract: Option<(ClaimTarget, Option<&str>)>,
+) -> Result<Option<ClaimMutation>> {
+    ledger.ensure_scope(scope)?;
+    // A key no mutation accepts can hold no receipt.
+    let Ok(key) = validated_idempotency_key(idempotency_key) else {
+        return Ok(None);
+    };
+    let Some(row) = sqlx::query(SELECT_RECEIPT_SQL)
+        .bind(scope.tenant_id)
+        .bind(key)
+        .fetch_optional(&ledger.pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some((target, reason)) = retract else {
+        // Arguments that do not name a retract cannot equal a committed one.
+        return Err(FleetError::IdempotencyConflict(
+            "idempotency key was already used for a different mutation".into(),
+        ));
+    };
+    decode_receipt_parts(
+        &row,
+        scope,
+        RETRACT_OPERATION,
+        &retract_request(scope, target, reason),
+    )
+    .map(Some)
 }
 
 #[allow(clippy::too_many_lines)] // one serializable unit, kept in its lock order
@@ -291,18 +338,24 @@ async fn retract_once(
     let plan = match (open_lineage, conflict_key) {
         (Some(lineage), Some(claim_key)) => {
             let sql_pairs = key_incompatible_pairs(transaction, scope, claim_key).await?;
-            Some(plan_reevaluation(Some(lineage), &remaining, &sql_pairs))
+            Some((
+                claim_key,
+                plan_reevaluation(Some(lineage), &remaining, &sql_pairs),
+            ))
         }
         _ => None,
     };
     let mut conflicts_resolved = Vec::new();
     let mut claims_restored = Vec::new();
     let reevaluation = match plan {
-        Some(Reevaluation::Close {
-            conflict_id,
-            revision: conflict_revision,
-            restore_candidates,
-        }) => {
+        Some((
+            claim_key,
+            Reevaluation::Close {
+                conflict_id,
+                revision: conflict_revision,
+                restore_candidates,
+            },
+        )) => {
             let closed_revision = close_conflict(
                 transaction,
                 scope,
@@ -317,8 +370,11 @@ async fn retract_once(
             claims_restored = restore_disputed_members(
                 transaction,
                 scope,
-                conflict_id,
-                closed_revision,
+                RestoreScope {
+                    conflict_id,
+                    conflict_revision: closed_revision,
+                    claim_key,
+                },
                 &restore_candidates,
                 key,
             )
@@ -331,22 +387,28 @@ async fn retract_once(
                 &[],
             ))
         }
-        Some(Reevaluation::StillOpen {
-            conflict_id,
-            revision: conflict_revision,
-            pairs,
-        }) => Some(reevaluation_report(
+        Some((
+            _,
+            Reevaluation::StillOpen {
+                conflict_id,
+                revision: conflict_revision,
+                pairs,
+            },
+        )) => Some(reevaluation_report(
             conflict_id,
             "still_open",
             conflict_revision,
             &pairs,
         )),
-        Some(Reevaluation::Divergent {
-            conflict_id,
-            revision: conflict_revision,
-            rust_pairs,
-            sql_pairs,
-        }) => {
+        Some((
+            _,
+            Reevaluation::Divergent {
+                conflict_id,
+                revision: conflict_revision,
+                rust_pairs,
+                sql_pairs,
+            },
+        )) => {
             tracing::error!(
                 conflict_id,
                 rust_pairs = rust_pairs.len(),
@@ -360,7 +422,7 @@ async fn retract_once(
                 &sql_pairs,
             ))
         }
-        Some(Reevaluation::NoLineage | Reevaluation::NotOpen) | None => None,
+        Some((_, Reevaluation::NoLineage | Reevaluation::NotOpen)) | None => None,
     };
 
     // R9: the claim as committed, and the one keyed event.
@@ -694,14 +756,25 @@ async fn close_conflict(
         .ok_or_else(|| protocol_error("locked open conflict changed before its verified close"))
 }
 
+/// The closed v2 lineage whose disputed members a verified close restores.
+struct RestoreScope<'a> {
+    conflict_id: i64,
+    conflict_revision: i64,
+    claim_key: &'a str,
+}
+
 async fn restore_disputed_members(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
-    conflict_id: i64,
-    conflict_revision: i64,
+    lineage: RestoreScope<'_>,
     candidates: &[i64],
     key: &str,
 ) -> Result<Vec<i64>> {
+    let RestoreScope {
+        conflict_id,
+        conflict_revision,
+        claim_key,
+    } = lineage;
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -710,6 +783,7 @@ async fn restore_disputed_members(
         .bind(&scope.project)
         .bind(conflict_id)
         .bind(candidates)
+        .bind(claim_key)
         .fetch_all(&mut **transaction)
         .await?;
     let mut restored_ids = Vec::with_capacity(restored.len());

@@ -254,9 +254,11 @@ Every recorded claim is also projected into the corpus as a synthetic
 writer, chunk search reads the current state of the claims behind the fused
 synthetic hits and drops those that are no longer `active` or `disputed` before
 projecting conflicts, reporting them in
-`diagnostics.retrieval.lifecycle_hidden_claim_ids`. The publication reader is
-unchanged. Claim search already filters by lifecycle state unless
-`include_history` is set.
+`diagnostics.retrieval.lifecycle_hidden_claim_ids`. When dropped hits leave the
+page short, retrieval runs again with a larger window, up to the 100-hit bound,
+and a page still short there carries a `lifecycle_hidden_hits_underfilled`
+warning. The publication reader is unchanged. Claim search already filters by
+lifecycle state unless `include_history` is set.
 
 ## Deliberate-memory write path
 
@@ -309,7 +311,9 @@ the detector recomputes its incompatible pairs over the claims that remain
 current, both in Rust and in SQL. If the two agree that no pair remains, the
 conflict moves to `resolved` with the server-written reason kind
 `no_current_incompatibility`, and each disputed member that no other open
-conflict of any detector still holds returns to `active`. Otherwise the
+conflict still holds returns to `active`. The key's preserved legacy row does
+not hold it: once reconciliation gave the key a v2 lineage, that row is
+history, as it already is for every current-facing read. Otherwise the
 conflict stays open; if the two pair sets differ, nothing is closed and the
 response reports `divergent`. Every transition writes a claim event, and the
 call writes exactly one keyed `claim_retracted` event. A refusal is a typed
@@ -338,7 +342,8 @@ lifecycle and record calls surface as `40001` and retry.
    read. No request names a conflict outcome: a conflict closes only when the
    detector finds no incompatible lifecycle-current pair on its key, and a
    disputed claim is restored only when no other open conflict holds it. Every
-   disputed claim therefore stays a member of at least one open conflict, and
+   disputed claim therefore stays a member of at least one open current
+   lineage (v2 when its key has one, otherwise legacy), and
    every open v2 conflict keeps at least one incompatible current pair. A
    refused lifecycle request rolls back completely and leaves no receipt.
 

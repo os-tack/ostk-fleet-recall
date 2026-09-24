@@ -18,8 +18,10 @@ use crate::{FleetError, FleetScope, Result};
 
 /// Only authored claims may be retired by the serving writer.
 pub const OPERATOR_ASSERTED_ORIGIN: &str = "operator_asserted";
-/// Upper bound on an optional lifecycle audit note.
-pub const MAX_LIFECYCLE_REASON_BYTES: usize = 1_000;
+/// Upper bound, in Unicode characters, on an optional lifecycle audit note.
+/// It counts characters as the advertised JSON Schema `maxLength` does, so a
+/// schema-valid note is never refused by the server.
+pub const MAX_LIFECYCLE_REASON_CHARS: usize = 1_000;
 /// Remaining incompatible pairs echoed in a reevaluation; the count is exact.
 pub const MAX_REPORTED_REMAINING_PAIRS: usize = 32;
 
@@ -407,12 +409,12 @@ pub fn lifecycle_request_identity(action: &str, scope: &FleetScope, input: &Valu
     })
 }
 
-/// A lifecycle audit note is 1..=1000 bytes of visible text with no control
-/// characters other than newline and tab.
+/// A lifecycle audit note is 1..=1000 characters of visible text with no
+/// control characters other than newline and tab.
 pub fn validate_reason(reason: &str) -> std::result::Result<(), String> {
-    if reason.is_empty() || reason.len() > MAX_LIFECYCLE_REASON_BYTES {
+    if reason.is_empty() || reason.chars().count() > MAX_LIFECYCLE_REASON_CHARS {
         return Err(format!(
-            "reason must be between 1 and {MAX_LIFECYCLE_REASON_BYTES} bytes"
+            "reason must be between 1 and {MAX_LIFECYCLE_REASON_CHARS} characters"
         ));
     }
     if is_blank_rationale(reason) {
@@ -753,12 +755,16 @@ mod tests {
     fn reasons_are_bounded_visible_text() {
         assert!(validate_reason("wrong value; see ticket 12").is_ok());
         assert!(validate_reason("line one\nline two\tindented").is_ok());
-        assert!(validate_reason(&"x".repeat(MAX_LIFECYCLE_REASON_BYTES)).is_ok());
+        assert!(validate_reason(&"x".repeat(MAX_LIFECYCLE_REASON_CHARS)).is_ok());
+        // The bound counts characters, as the tool schema's maxLength does:
+        // 1000 three-byte CJK characters are 3000 bytes and still valid.
+        assert!(validate_reason(&"\u{7406}".repeat(MAX_LIFECYCLE_REASON_CHARS)).is_ok());
         for rejected in [
             String::new(),
             " \n\t ".into(),
             "\u{200B}\u{FEFF}".into(),
-            "x".repeat(MAX_LIFECYCLE_REASON_BYTES + 1),
+            "x".repeat(MAX_LIFECYCLE_REASON_CHARS + 1),
+            "\u{7406}".repeat(MAX_LIFECYCLE_REASON_CHARS + 1),
             "bell\u{7}".into(),
             "carriage\rreturn".into(),
         ] {

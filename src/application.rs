@@ -245,29 +245,52 @@ impl CockroachMemoryService {
         })
     }
 
+    /// One hybrid retrieval pass over the corpus.
+    async fn retrieve_chunks(&self, params: &RecallParams) -> ServiceResult<Vec<RecallHit>> {
+        let retrieval_corpus = self.corpus.retrieval_reader();
+        ostk_recall_retrieval::recall(&retrieval_corpus, self.embedder.as_ref(), None, params)
+            .await
+            .map_err(|error| ServiceError::Internal(format!("hybrid recall: {error}")))
+    }
+
     /// Retired claims keep their synthetic chunk row. On the private writer,
-    /// hide such hits before the conflict projection so a retracted claim can
-    /// neither surface nor select a conflict through chunk search. Returns the
-    /// hidden claim ids only when the gate is on.
-    async fn hide_retired_claim_chunks(
+    /// such hits are dropped before the conflict projection so a retracted
+    /// claim can neither surface nor select a conflict through chunk search.
+    /// Dropping them after retrieval's cut would short the page, so the
+    /// retrieval window grows until `limit` current hits fill it, retrieval
+    /// runs out of hits, or the window reaches the tool's hit bound.
+    async fn retrieve_lifecycle_current_chunks(
         &self,
         scope: &FleetScope,
-        hits: Vec<RecallHit>,
-    ) -> ServiceResult<(Vec<RecallHit>, Option<Vec<i64>>)> {
-        if !self.lifecycle.hide_non_current_claim_chunks {
-            return Ok((hits, None));
+        params: &mut RecallParams,
+        limit: usize,
+    ) -> ServiceResult<LifecyclePage> {
+        let mut window = limit;
+        loop {
+            params.limit = Some(window);
+            let hits = self.retrieve_chunks(params).await?;
+            let returned = hits.len();
+            let claim_ids = synthetic_claim_ids(&hits);
+            let states = if claim_ids.is_empty() {
+                Vec::new()
+            } else {
+                self.ledger
+                    .claim_states(scope, &claim_ids)
+                    .await
+                    .map_err(service_error)?
+            };
+            let (hits, hidden_claim_ids) = page_lifecycle_hits(hits, &states, limit);
+            match next_lifecycle_window(window, returned, hits.len(), limit) {
+                LifecycleRefill::Grow(next) => window = next,
+                outcome => {
+                    return Ok(LifecyclePage {
+                        hits,
+                        hidden_claim_ids,
+                        underfilled: outcome == LifecycleRefill::Underfilled,
+                    });
+                }
+            }
         }
-        let claim_ids = synthetic_claim_ids(&hits);
-        let states = if claim_ids.is_empty() {
-            Vec::new()
-        } else {
-            self.ledger
-                .claim_states(scope, &claim_ids)
-                .await
-                .map_err(service_error)?
-        };
-        let (kept, hidden) = partition_lifecycle_hits(hits, &states);
-        Ok((kept, Some(hidden)))
     }
 
     /// Hybrid chunk search with its conflict projection and diagnostics.
@@ -277,7 +300,7 @@ impl CockroachMemoryService {
         args: SearchArgs,
         limit: usize,
     ) -> ServiceResult<RecallResult> {
-        let params = RecallParams {
+        let mut params = RecallParams {
             query: args.query,
             project: Some(scope.project.clone()),
             source: args.source,
@@ -296,14 +319,15 @@ impl CockroachMemoryService {
             // lanes under the same relevance contract as every source.
             ranking_overrides: Some(fleet_ranking_overrides()),
         };
-        let retrieval_corpus = self.corpus.retrieval_reader();
-        let mut hits =
-            ostk_recall_retrieval::recall(&retrieval_corpus, self.embedder.as_ref(), None, &params)
-                .await
-                .map_err(|error| ServiceError::Internal(format!("hybrid recall: {error}")))?;
+        let (mut hits, hiding) = if self.lifecycle.hide_non_current_claim_chunks {
+            let page = self
+                .retrieve_lifecycle_current_chunks(scope, &mut params, limit)
+                .await?;
+            (page.hits, Some((page.hidden_claim_ids, page.underfilled)))
+        } else {
+            (self.retrieve_chunks(&params).await?, None)
+        };
         let metadata_elided = self.hydrate_retrieval_metadata(&mut hits).await?;
-        let (hits, lifecycle_hidden_claim_ids) =
-            self.hide_retired_claim_chunks(scope, hits).await?;
         let projection = self.project_chunk_conflicts(scope, &hits).await?;
         let conflict_matches = conflict_match_diagnostics(
             &projection.conflicts,
@@ -325,6 +349,12 @@ impl CockroachMemoryService {
                 "message": "additional exact source-support associations exist beyond the bounded conflict-trigger diagnostic"
             }));
         }
+        if hiding.as_ref().is_some_and(|(_, underfilled)| *underfilled) {
+            result.warnings.push(json!({
+                "code": "lifecycle_hidden_hits_underfilled",
+                "message": "chunks of claims that are no longer current filled the bounded retrieval window, so fewer hits than the limit are returned and current memory may rank below it; narrow the query or filter by source"
+            }));
+        }
         let mut retrieval = json!({
             "lanes": ["lexical", "dense"],
             "fusion": "rrf",
@@ -337,7 +367,7 @@ impl CockroachMemoryService {
             "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
             "stratified_code_prefetch": 0,
         });
-        if let Some(hidden) = lifecycle_hidden_claim_ids {
+        if let Some((hidden, _)) = hiding {
             retrieval["lifecycle_hidden_claim_ids"] = json!(hidden);
         }
         result.diagnostics.insert("retrieval".into(), retrieval);
@@ -554,15 +584,61 @@ impl CockroachMemoryService {
             .retract_claim(scope, target, reason.as_deref(), &idempotency_key)
             .await
             .map_err(service_error)?;
-        // Every conflict the retract touched, in any state: the claim's
-        // lineage membership plus whatever the detector re-evaluated.
-        let requested = affected_conflict_ids(&mutation);
+        Ok(self.lifecycle_result(scope, &mutation).await)
+    }
+
+    /// Project a committed (or replayed) lifecycle mutation: every conflict it
+    /// touched, in any state, from the claim's lineage membership plus
+    /// whatever the detector re-evaluated.
+    async fn lifecycle_result(
+        &self,
+        scope: &FleetScope,
+        mutation: &ClaimMutation,
+    ) -> RememberResult {
+        let requested = affected_conflict_ids(mutation);
         let conflicts = if requested.is_empty() {
             Ok(Vec::new())
         } else {
             self.ledger.get_conflicts(scope, &requested).await
         };
-        Ok(committed_lifecycle_result(&mutation, &requested, conflicts))
+        committed_lifecycle_result(mutation, &requested, conflicts)
+    }
+
+    /// A committed request replays before any precondition, the surface
+    /// included: a writer that no longer serves an action (for example after
+    /// `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`) still returns the stored
+    /// result of a request committed under the key. Any other use of the key
+    /// is an idempotency conflict, so `refusal`, which promises the key was
+    /// not consumed, is returned only for a key that no receipt holds.
+    async fn replay_unserved_or_refuse(
+        &self,
+        scope: &FleetScope,
+        request: RememberRequest,
+        refusal: ServiceError,
+    ) -> ServiceResult<RememberResult> {
+        let Some(idempotency_key) = request.idempotency_key else {
+            return Err(refusal);
+        };
+        let retract = if request.action == RememberAction::Retract {
+            parse_retract_arguments(request.arguments).ok()
+        } else {
+            None
+        };
+        let replay = self
+            .ledger
+            .replay_unserved_lifecycle(
+                scope,
+                &idempotency_key,
+                retract
+                    .as_ref()
+                    .map(|(target, reason)| (*target, reason.as_deref())),
+            )
+            .await
+            .map_err(service_error)?;
+        match replay {
+            Some(mutation) => Ok(self.lifecycle_result(scope, &mutation).await),
+            None => Err(refusal),
+        }
     }
 
     /// Fail the event-first `assert` route closed (ADR 0002 D3/D4).
@@ -921,7 +997,11 @@ impl FleetMemoryService for CockroachMemoryService {
         request: RememberRequest,
     ) -> ServiceResult<RememberResult> {
         self.ensure_scope(&scope)?;
-        authorize_surface(self.lifecycle.surface, request.action)?;
+        if let Err(refusal) = authorize_surface(self.lifecycle.surface, request.action) {
+            return self
+                .replay_unserved_or_refuse(&scope, request, refusal)
+                .await;
+        }
         match request.action {
             RememberAction::Record => self.remember_record(&scope, request).await,
             RememberAction::Assert => Err(Self::assert_route_disabled()),
@@ -1006,32 +1086,81 @@ fn synthetic_claim_ids(hits: &[RecallHit]) -> Vec<i64> {
     ids
 }
 
-/// Keep ordinary hits and synthetic claim hits whose claim is still
-/// lifecycle-current; return the hidden claim ids. A synthetic hit whose claim
-/// no longer exists is hidden too.
-fn partition_lifecycle_hits(
+/// A chunk page after lifecycle hiding.
+struct LifecyclePage {
     hits: Vec<RecallHit>,
+    /// Claims whose synthetic hits ranked within the page but were hidden.
+    hidden_claim_ids: Vec<i64>,
+    /// The page is short only because hidden hits filled the largest window.
+    underfilled: bool,
+}
+
+/// Fill a page of at most `limit` hits in rank order: ordinary hits and
+/// synthetic claim hits whose claim is still lifecycle-current. A synthetic
+/// hit whose claim is not current, or no longer exists, is skipped, and its
+/// claim id is reported when it ranked ahead of the page's last kept hit.
+fn page_lifecycle_hits(
+    window: Vec<RecallHit>,
     states: &[(i64, ClaimState)],
+    limit: usize,
 ) -> (Vec<RecallHit>, Vec<i64>) {
     let states = states.iter().copied().collect::<HashMap<_, _>>();
+    let mut kept = Vec::with_capacity(limit.min(window.len()));
     let mut hidden = Vec::new();
-    let kept = hits
-        .into_iter()
-        .filter(|hit| match synthetic_claim_id(hit) {
+    for hit in window {
+        if kept.len() >= limit {
+            break;
+        }
+        match synthetic_claim_id(&hit) {
             Some(claim_id)
                 if !states
                     .get(&claim_id)
                     .is_some_and(|state| state.is_current()) =>
             {
                 hidden.push(claim_id);
-                false
             }
-            _ => true,
-        })
-        .collect();
+            _ => kept.push(hit),
+        }
+    }
     hidden.sort_unstable();
     hidden.dedup();
     (kept, hidden)
+}
+
+/// Largest retrieval window a lifecycle-filtered chunk page refills to: the
+/// tool's own hit bound, which also bounds the claim-state lookup.
+const MAX_LIFECYCLE_SEARCH_WINDOW: usize = MAX_TOOL_RESULTS;
+const LIFECYCLE_SEARCH_WINDOW_GROWTH: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleRefill {
+    /// The page is full, or retrieval returned everything it had.
+    Done,
+    /// Hidden hits shorted the page; retrieve again with this window.
+    Grow(usize),
+    /// Hidden hits shorted the page at the largest window.
+    Underfilled,
+}
+
+/// Decide whether a page shorted by hidden hits is refilled. `returned` is
+/// the number of hits the last retrieval window of size `window` yielded.
+fn next_lifecycle_window(
+    window: usize,
+    returned: usize,
+    kept: usize,
+    limit: usize,
+) -> LifecycleRefill {
+    if kept >= limit || returned < window {
+        LifecycleRefill::Done
+    } else if window >= MAX_LIFECYCLE_SEARCH_WINDOW {
+        LifecycleRefill::Underfilled
+    } else {
+        LifecycleRefill::Grow(
+            window
+                .saturating_mul(LIFECYCLE_SEARCH_WINDOW_GROWTH)
+                .min(MAX_LIFECYCLE_SEARCH_WINDOW),
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1758,7 +1887,10 @@ mod tests {
     /// A service whose pool never connects: anything that reaches I/O fails,
     /// so a passing assertion proves the decision was made before I/O.
     fn offline_service(surface: RememberSurface) -> CockroachMemoryService {
-        let pool = sqlx::PgPool::connect_lazy("postgresql://root@127.0.0.1:1/offline").unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgresql://root@127.0.0.1:1/offline")
+            .unwrap();
         let scope = offline_scope();
         let embedder: Arc<dyn ChunkEmbedder> = Arc::new(OfflineEmbedder);
         let ledger = Arc::new(
@@ -1920,6 +2052,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_reason_the_lifecycle_schema_admits_is_accepted() {
+        // JSON Schema maxLength counts characters; so must the server, or a
+        // schema-valid multi-byte note would be refused.
+        let tool = crate::mcp::remember_tool_for(CLAIM_LIFECYCLE);
+        let reason = &tool["inputSchema"]["properties"]["reason"];
+        let max = usize::try_from(reason["maxLength"].as_u64().unwrap()).unwrap();
+        let min = usize::try_from(reason["minLength"].as_u64().unwrap()).unwrap();
+        let retract = |reason: String| {
+            parse_retract_arguments(retract_arguments(
+                &json!({ "claim_id": 41, "expected_revision": 2, "reason": reason }),
+            ))
+        };
+        for admitted in [
+            "\u{7406}".repeat(max),
+            "\u{1F4DD}".repeat(max),
+            "x".repeat(max),
+            "x".repeat(min),
+        ] {
+            assert!(retract(admitted).is_ok());
+        }
+        assert!(retract("\u{7406}".repeat(max + 1)).is_err());
+    }
+
     #[tokio::test]
     async fn lifecycle_actions_require_idempotency_key() {
         let service = offline_service(CLAIM_LIFECYCLE);
@@ -1948,6 +2104,25 @@ mod tests {
             FleetMemoryService::remember_surface(&record_only),
             RememberSurface::RECORD_ONLY
         );
+        // With no key there is no receipt to replay, so the refusal needs no I/O.
+        let error = FleetMemoryService::remember(
+            &record_only,
+            offline_scope(),
+            RememberRequest::new(
+                RememberAction::Retract,
+                None,
+                retract_arguments(&json!({ "claim_id": 41, "expected_revision": 2 })),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, ServiceError::Refused(refusal) if refusal.code == "lifecycle_unavailable"),
+            "{error}"
+        );
+        // A keyed request may already have committed on a writer that served
+        // it. Its refusal promises the key is unused, so when the receipt
+        // cannot be checked the outcome is unknown rather than not_applied.
         let error = FleetMemoryService::remember(
             &record_only,
             offline_scope(),
@@ -1959,10 +2134,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            matches!(&error, ServiceError::Refused(refusal) if refusal.code == "lifecycle_unavailable"),
-            "{error}"
-        );
+        assert!(matches!(error, ServiceError::Unavailable(_)), "{error}");
         let error = FleetMemoryService::recall(
             &record_only,
             offline_scope(),
@@ -2095,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_lifecycle_hits_hides_only_non_current_synthetic_claims() {
+    fn page_lifecycle_hits_hides_only_non_current_synthetic_claims() {
         let mut spoofed_source = fixture_hit("claim:2", &json!({ "claim_id": 2 }));
         spoofed_source.source = "markdown".into();
         let hits = vec![
@@ -2116,7 +2288,7 @@ mod tests {
             (2, ClaimState::Retracted),
             (4, ClaimState::Disputed),
         ];
-        let (kept, hidden) = partition_lifecycle_hits(hits, &states);
+        let (kept, hidden) = page_lifecycle_hits(hits.clone(), &states, MAX_TOOL_RESULTS);
         assert_eq!(
             kept.iter()
                 .map(|hit| (hit.chunk_id.as_str(), hit.source.as_str()))
@@ -2132,5 +2304,51 @@ mod tests {
         );
         // Claim 3 no longer exists, so its orphaned chunk is hidden too.
         assert_eq!(hidden, [2, 3]);
+
+        // A page keeps rank order and reports only the hidden hits that
+        // ranked ahead of its end.
+        let (kept, hidden) = page_lifecycle_hits(hits, &states, 2);
+        assert_eq!(
+            kept.iter()
+                .map(|hit| hit.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            ["claim:1", "docs/design.md#0"]
+        );
+        assert_eq!(hidden, [2]);
+    }
+
+    #[test]
+    fn lifecycle_search_refills_short_pages_up_to_the_hit_bound() {
+        // A full page, or a retrieval that returned everything it had, is final.
+        assert_eq!(next_lifecycle_window(3, 3, 3, 3), LifecycleRefill::Done);
+        assert_eq!(next_lifecycle_window(12, 9, 1, 3), LifecycleRefill::Done);
+        // Hidden hits shorted a full window: retrieve a larger one.
+        assert_eq!(next_lifecycle_window(3, 3, 0, 3), LifecycleRefill::Grow(12));
+        assert_eq!(
+            next_lifecycle_window(48, 48, 2, 3),
+            LifecycleRefill::Grow(100)
+        );
+        // The window never exceeds the tool's hit bound; a page still short
+        // there is reported, not silently returned.
+        assert_eq!(
+            next_lifecycle_window(MAX_TOOL_RESULTS, MAX_TOOL_RESULTS, 2, 3),
+            LifecycleRefill::Underfilled
+        );
+        assert_eq!(
+            next_lifecycle_window(MAX_TOOL_RESULTS, MAX_TOOL_RESULTS, 99, MAX_TOOL_RESULTS),
+            LifecycleRefill::Underfilled
+        );
+        // Every window sequence from any limit reaches the bound and stops.
+        for limit in 1..=MAX_TOOL_RESULTS {
+            let mut window = limit;
+            let mut passes = 1;
+            while let LifecycleRefill::Grow(next) = next_lifecycle_window(window, window, 0, limit)
+            {
+                assert!(next > window && next <= MAX_TOOL_RESULTS);
+                window = next;
+                passes += 1;
+            }
+            assert!(passes <= 5, "limit {limit} took {passes} passes");
+        }
     }
 }

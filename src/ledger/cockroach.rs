@@ -786,6 +786,15 @@ impl ClaimLedger for CockroachClaimLedger {
         lifecycle_store::retract_claim(self, scope, target, reason, idempotency_key).await
     }
 
+    async fn replay_unserved_lifecycle(
+        &self,
+        scope: &FleetScope,
+        idempotency_key: &str,
+        retract: Option<(ClaimTarget, Option<&str>)>,
+    ) -> Result<Option<ClaimMutation>> {
+        lifecycle_store::replay_unserved_lifecycle(self, scope, idempotency_key, retract).await
+    }
+
     async fn get_conflicts(
         &self,
         scope: &FleetScope,

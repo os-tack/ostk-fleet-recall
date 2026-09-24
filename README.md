@@ -59,11 +59,11 @@ A conflict is never resolved by fiat. An agent can retract only its own
 claims, and a conflict closes only when the detector re-checks the key and finds
 no incompatible current pair left ([ADR 0004](docs/adr/0004-serving-conflict-lifecycle.md)).
 On the private writer, chunk search also drops the synthetic `claim:{id}` hits of
-claims that are no longer current and lists them in
-`diagnostics.retrieval.lifecycle_hidden_claim_ids`. Setting
-`FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` (the default is `enabled`) restores
-the record-only surface: the historical `tools/list` byte for byte and
-unfiltered chunk search. The public demo always serves that record-only
+claims that are no longer current, lists them in
+`diagnostics.retrieval.lifecycle_hidden_claim_ids`, and refills the page from
+lower-ranked results. Setting `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` (the
+default is `enabled`) restores the record-only surface: the historical
+`tools/list` byte for byte and unfiltered chunk search. The public demo always serves that record-only
 surface.
 
 The service contract also reserves further Recall actions (for example
@@ -435,7 +435,7 @@ delivery; after an ambiguous response, retry the same full request and key.
 To retire a claim it authored, an agent sends `remember(retract)` with the
 claim id and the revision it last read, for example from `recall` `get` with
 `kind=claim`. `reason` is an optional private audit note of at most 1,000
-bytes:
+characters:
 
 ```json
 {"action":"retract","idempotency_key":"readme/retract/v1","claim_id":41,"expected_revision":2,"reason":"superseded by the migration review"}
@@ -462,6 +462,12 @@ unknown outcome, and it does not consume the idempotency key:
 ```json
 {"code":-32602,"message":"remember(retract) refused: stale_revision: claim 41 is at revision 3 (disputed)","data":{"code":"stale_revision","outcome":"not_applied","retry":"nothing was committed and the idempotency_key was not consumed; re-read and send a corrected request","details":{"claim_id":41,"current_revision":3,"current_state":"disputed"}}}
 ```
+
+A writer that does not serve `retract`, such as one started with
+`FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`, checks the key's receipt first: a
+retract that already committed under the key replays its stored result, any
+other use of the key is an idempotency conflict, and only an unused key is
+refused as `lifecycle_unavailable`.
 
 Most stdio MCP clients use a configuration shaped like the following. Replace
 the absolute paths and digest; this example deliberately contains only local,

@@ -60,9 +60,13 @@ detector's exact predicate. Only when both agree that no pair remains does the
 server set the v2 conflict to `resolved`, bump its revision, and write
 `resolution_kind = no_current_incompatibility` with a fixed-template reason.
 A disagreement leaves the conflict open and reports `divergent`. The close then
-restores each disputed member to `active` unless another open conflict of any
-detector, including an unreconciled legacy row, still holds it. There is no
-`suppressed` outcome and no partial restore.
+restores each disputed member to `active` unless another open conflict still
+holds it. The legacy `same_key_typed_value` row on the same key is not such a
+conflict: a key gains a v2 lineage beside a legacy row only through
+reconciliation, which preserves that row unchanged, never closes it, and hands
+the key's disputes to v2, and every current-facing read already prefers v2
+over it. Any other open membership, of any detector, still holds the claim.
+There is no `suppressed` outcome and no partial restore.
 
 The locks follow the record path's order (the key's lineage rows, then its
 current claims in ascending id order), so lifecycle and record calls serialize
@@ -73,8 +77,9 @@ membership is historical, so `Claim.conflict_ids` keeps listing it.
 **Why.** ADR 0003's addendum allows `Clear` only when no live incompatibility
 remains, and AUTH-03 lets anyone trigger a check whose outcome depends on data
 alone. The invariants this preserves are: every disputed claim belongs to at
-least one open conflict, and every open v2 conflict keeps at least one
-incompatible current pair.
+least one open current lineage (its key's v2 lineage when one exists,
+otherwise an unreconciled legacy one), and every open v2 conflict keeps at
+least one incompatible current pair.
 
 ## D6 — Refusals are typed and roll back
 
@@ -87,7 +92,13 @@ transaction and its receipt reservation roll back: nothing is committed and
 the idempotency key stays free. MCP reports it as JSON-RPC `invalid_params`
 with `data.outcome = "not_applied"`, never through the outcome-unknown path.
 A committed request replays before any precondition, so retrying a
-committed retract returns its stored result rather than `not_current`.
+committed retract returns its stored result rather than `not_current`. That
+includes the surface check: a writer that no longer serves `retract` (for
+example after `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`) reads the key's
+receipt before refusing. It replays a committed identical retract, reports any
+other use of the key as an idempotency conflict, and refuses with
+`lifecycle_unavailable` only when no receipt holds the key, so the refusal's
+promise that the key was not consumed stays true.
 
 ## Clarification of ADR 0002 D3
 

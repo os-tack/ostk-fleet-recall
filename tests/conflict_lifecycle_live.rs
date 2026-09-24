@@ -12,11 +12,11 @@ use std::time::Duration;
 use ostk_fleet_recall::application::LifecycleServing;
 use ostk_fleet_recall::ledger::{
     ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget,
-    CockroachClaimLedger, LifecycleRefusal, RefusalCode,
+    CockroachClaimLedger, CockroachConflictReconciliationRepository, LifecycleRefusal, RefusalCode,
 };
 use ostk_fleet_recall::service::{
     FleetMemoryService, RecallAction, RecallRequest, RecallResult, RememberAction, RememberRequest,
-    RememberSurface, ServiceError,
+    RememberResult, RememberSurface, ServiceError,
 };
 use ostk_fleet_recall::store::cockroach::{
     CockroachStore, EMBEDDING_DIMENSION, PoolConfig, RetryPolicy,
@@ -33,6 +33,14 @@ const MODEL: &str = "lifecycle-live-512";
 const AGENT_A: &str = "agent-a";
 const AGENT_B: &str = "agent-b";
 const AGENT_C: &str = "agent-c";
+
+/// What the private writer serves unless `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`.
+const PRIVATE_WRITER: LifecycleServing = LifecycleServing {
+    surface: RememberSurface {
+        claim_lifecycle: true,
+    },
+    hide_non_current_claim_chunks: true,
+};
 
 /// The schema is shared, so migration runs once per test process.
 static MIGRATED: Mutex<bool> = Mutex::const_new(false);
@@ -54,6 +62,37 @@ impl ChunkEmbedder for UnitEmbedder {
             .map(|_| {
                 let mut vector = vec![0.0; EMBEDDING_DIMENSION];
                 vector[0] = 1.0;
+                vector
+            })
+            .collect()
+    }
+}
+
+/// Places every text at the query's direction except those containing
+/// `trailing`, which sit at cosine 0.6: still inside the dense lane, but ranked
+/// after every other chunk, so a test can fix which hits lead the fused page.
+struct RankingEmbedder;
+
+impl ChunkEmbedder for RankingEmbedder {
+    fn dim(&self) -> usize {
+        EMBEDDING_DIMENSION
+    }
+
+    fn model_id(&self) -> &'static str {
+        MODEL
+    }
+
+    fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        texts
+            .iter()
+            .map(|text| {
+                let mut vector = vec![0.0; EMBEDDING_DIMENSION];
+                if text.contains("trailing") {
+                    vector[0] = 0.6;
+                    vector[1] = 0.8;
+                } else {
+                    vector[0] = 1.0;
+                }
                 vector
             })
             .collect()
@@ -128,6 +167,34 @@ impl Fleet {
             policy,
         )
         .expect("agent ledger")
+    }
+
+    /// The memory service `agent`'s writer composes, serving `lifecycle`.
+    fn service(&self, agent: &str, lifecycle: LifecycleServing) -> CockroachMemoryService {
+        self.service_embedding(agent, lifecycle, Arc::new(UnitEmbedder))
+    }
+
+    fn service_embedding(
+        &self,
+        agent: &str,
+        lifecycle: LifecycleServing,
+        embedder: Arc<dyn ChunkEmbedder>,
+    ) -> CockroachMemoryService {
+        let ledger = CockroachClaimLedger::new(
+            self.pool().clone(),
+            self.scope(agent),
+            embedder.clone(),
+            RetryPolicy::default(),
+        )
+        .expect("agent ledger");
+        CockroachMemoryService::new(
+            self.scope(agent),
+            Arc::new(self.store.clone()),
+            Arc::new(ledger),
+            embedder,
+        )
+        .expect("memory service")
+        .with_lifecycle(lifecycle)
     }
 
     async fn record(&self, agent: &str, input: &ClaimInput, key: &str) -> ClaimMutation {
@@ -252,6 +319,53 @@ impl Fleet {
         .unwrap()
     }
 
+    /// Seed a legacy-era disputed decision on `{subject}::database-choice`, as
+    /// the retired typed-value detector left them before reconciliation.
+    async fn legacy_disputed_decision(&self, subject: &str, value: &str, actor: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO memory_claims (\
+                 tenant_id, project, kind, claim_key, subject, predicate, value, text, \
+                 polarity, state, origin, actor, conflict_eligible\
+             ) VALUES ($1, $2, 'decision', $3, $4, 'database-choice', $5, \
+                 'legacy lifecycle fixture', 1, 'disputed', 'operator_asserted', $6, true) \
+             RETURNING id",
+        )
+        .bind(self.tenant)
+        .bind(&self.project)
+        .bind(format!("{subject}::database-choice"))
+        .bind(subject)
+        .bind(json!(value))
+        .bind(actor)
+        .fetch_one(self.pool())
+        .await
+        .unwrap()
+    }
+
+    async fn conflict_row(&self, conflict_id: i64) -> (String, i64) {
+        sqlx::query_as(
+            "SELECT state, revision FROM memory_conflicts \
+             WHERE tenant_id = $1 AND project = $2 AND id = $3",
+        )
+        .bind(self.tenant)
+        .bind(&self.project)
+        .bind(conflict_id)
+        .fetch_one(self.pool())
+        .await
+        .unwrap()
+    }
+
+    async fn claim_state(&self, claim_id: i64) -> String {
+        sqlx::query_scalar(
+            "SELECT state FROM memory_claims WHERE tenant_id = $1 AND project = $2 AND id = $3",
+        )
+        .bind(self.tenant)
+        .bind(&self.project)
+        .bind(claim_id)
+        .fetch_one(self.pool())
+        .await
+        .unwrap()
+    }
+
     async fn legacy_conflict(&self, claim_key: &str, members: &[i64]) -> i64 {
         let conflict_id: i64 = sqlx::query_scalar(
             "INSERT INTO memory_conflicts (tenant_id, project, claim_key, detector, rationale) \
@@ -298,6 +412,9 @@ impl Fleet {
     }
 
     /// The lifecycle invariants every committed interleaving must preserve.
+    ///
+    /// A key's lineage follows the read side's precedence: once the key has a
+    /// v2 lineage, its preserved legacy row is history, not a current lineage.
     async fn assert_lifecycle_invariants(&self) {
         let orphaned_disputes: Vec<i64> = sqlx::query_scalar(
             "SELECT c.id FROM memory_claims AS c \
@@ -308,7 +425,12 @@ impl Fleet {
                    ON k.tenant_id = m.tenant_id AND k.project = m.project \
                   AND k.id = m.conflict_id \
                  WHERE m.tenant_id = $1 AND m.project = $2 AND m.claim_id = c.id \
-                   AND k.state = 'open')",
+                   AND k.state = 'open' \
+                   AND (k.detector = 'same_key_functional_value_v2' OR NOT EXISTS (\
+                     SELECT 1 FROM memory_conflicts AS v2 \
+                     WHERE v2.tenant_id = k.tenant_id AND v2.project = k.project \
+                       AND v2.claim_key = k.claim_key \
+                       AND v2.detector = 'same_key_functional_value_v2')))",
         )
         .bind(self.tenant)
         .bind(&self.project)
@@ -317,7 +439,7 @@ impl Fleet {
         .unwrap();
         assert!(
             orphaned_disputes.is_empty(),
-            "disputed claims outside every open lineage: {orphaned_disputes:?}"
+            "disputed claims outside every open current lineage: {orphaned_disputes:?}"
         );
 
         let unjustified_open: Vec<i64> = sqlx::query_scalar(
@@ -852,41 +974,220 @@ async fn live_retract_replay_and_cross_operation_reuse_when_configured() {
     fleet.cleanup().await;
 }
 
+fn retract_request(key: String, claim_id: i64, expected_revision: i64) -> RememberRequest {
+    RememberRequest::new(
+        RememberAction::Retract,
+        Some(key),
+        Map::from_iter([
+            ("claim_id".into(), json!(claim_id)),
+            ("expected_revision".into(), json!(expected_revision)),
+        ]),
+    )
+}
+
+fn refusal_code(result: Result<RememberResult, ServiceError>) -> &'static str {
+    match result {
+        Err(ServiceError::Refused(refusal)) => refusal.code,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
 #[tokio::test]
-async fn live_restore_skips_claims_in_another_open_lineage_when_configured() {
+async fn live_retract_replays_on_record_only_writer_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "surface-replay").await;
+    let scope = fleet.scope(AGENT_A);
+    let enabled = fleet.service(AGENT_A, PRIVATE_WRITER);
+    // The same writer after FLEET_RECALL_REMEMBER_LIFECYCLE=disabled.
+    let disabled = fleet.service(AGENT_A, LifecycleServing::default());
+    let x = fleet
+        .record(AGENT_A, &decision("surface-replay", &json!("x"), 1), "a/x")
+        .await;
+    let y = fleet
+        .record(AGENT_B, &decision("surface-replay", &json!("y"), 1), "b/y")
+        .await;
+    let revision = fleet.claim(x.claim.id).await.revision;
+    let committed = FleetMemoryService::remember(
+        &enabled,
+        scope.clone(),
+        retract_request(fleet.key("a/retract"), x.claim.id, revision),
+    )
+    .await
+    .expect("the enabled writer commits the retract");
+    assert_eq!(committed.data["idempotent_replay"], false);
+
+    // A retry whose response was lost reaches the disabled writer: it gets
+    // the stored result, not a refusal claiming nothing was committed.
+    let replay = FleetMemoryService::remember(
+        &disabled,
+        scope.clone(),
+        retract_request(fleet.key("a/retract"), x.claim.id, revision),
+    )
+    .await
+    .expect("a committed retract replays where retract is no longer served");
+    assert_eq!(replay.data["idempotent_replay"], true);
+    let mut normalized = replay.data.clone();
+    normalized["idempotent_replay"] = json!(false);
+    assert_eq!(normalized, committed.data);
+    assert_eq!(replay.data["claims_restored"], json!([y.claim.id]));
+    assert_eq!(replay.conflicts[0]["state"], "resolved");
+    assert_eq!(fleet.receipt_count("a/retract").await, 1);
+    assert_eq!(fleet.keyed_events("a/retract").await.len(), 1);
+
+    // Any other use of a consumed key is an idempotency conflict, never a
+    // refusal saying the key is free.
+    fleet.record(AGENT_A, &note("a plain note"), "a/note").await;
+    for (key, request) in [
+        (
+            "a/retract",
+            retract_request(fleet.key("a/retract"), x.claim.id, revision + 1),
+        ),
+        (
+            "a/retract",
+            retract_request(fleet.key("a/retract"), 0, revision),
+        ),
+        (
+            "a/note",
+            retract_request(fleet.key("a/note"), x.claim.id, revision),
+        ),
+        (
+            "a/retract",
+            RememberRequest::new(
+                RememberAction::Supersede,
+                Some(fleet.key("a/retract")),
+                Map::new(),
+            ),
+        ),
+    ] {
+        let error = FleetMemoryService::remember(&disabled, scope.clone(), request)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, ServiceError::InvalidRequest(message)
+                if message.contains("already used for a different mutation")),
+            "{key}: {error}"
+        );
+    }
+
+    // Only a key no receipt holds is refused as not served, and it stays free.
+    let unused = FleetMemoryService::remember(
+        &disabled,
+        scope.clone(),
+        retract_request(fleet.key("a/unused"), y.claim.id, 1),
+    )
+    .await;
+    assert_eq!(refusal_code(unused), "lifecycle_unavailable");
+    fleet.assert_key_unconsumed("a/unused").await;
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // reconcile, close, and read back one legacy-era key
+async fn live_restore_after_reconciliation_ignores_preserved_legacy_row_when_configured() {
     let Some(database_url) = database_url() else {
         return;
     };
     let fleet = Fleet::new(&database_url, "restore-guard").await;
+    let claim_key = "restore-guard::database-choice";
+    // Legacy-era state: x and y disputed under the retired typed-value lineage.
     let x = fleet
-        .record(AGENT_A, &decision("restore-guard", &json!("x"), 1), "a/x")
+        .legacy_disputed_decision("restore-guard", "x", AGENT_A)
         .await;
     let y = fleet
-        .record(AGENT_B, &decision("restore-guard", &json!("y"), 1), "b/y")
+        .legacy_disputed_decision("restore-guard", "y", AGENT_B)
         .await;
-    let v2_conflict = y.claim.conflict_ids[0];
-    // An unreconciled legacy lineage on the same key still holds y open.
-    let legacy = fleet
-        .legacy_conflict("restore-guard::database-choice", &[y.claim.id])
-        .await;
+    let legacy = fleet.legacy_conflict(claim_key, &[x, y]).await;
+    let legacy_before = fleet.conflict_row(legacy).await;
+
+    // The step a legacy_lineage refusal points to: reconciliation preserves
+    // the legacy row unchanged and hands the key's disputes to a v2 lineage.
+    let reconciled = CockroachConflictReconciliationRepository::new(
+        fleet.pool().clone(),
+        fleet.scope(AGENT_C),
+        RetryPolicy::default(),
+    )
+    .unwrap()
+    .reconcile_legacy_conflict(
+        &fleet.scope(AGENT_C),
+        legacy,
+        legacy_before.1,
+        &fleet.key("c/reconcile"),
+    )
+    .await
+    .expect("reconciliation succeeds");
+    assert_eq!(reconciled.v2_state, "open");
+    assert_eq!(reconciled.v2_member_ids, [x, y]);
+    let v2_conflict = reconciled.conflict_id;
+    assert_eq!(fleet.conflict_row(legacy).await, legacy_before);
+    assert_eq!(fleet.claim(y).await.conflict_ids, [v2_conflict]);
 
     let retracted = fleet
-        .retract(
-            AGENT_A,
-            x.claim.id,
-            fleet.claim(x.claim.id).await.revision,
-            "a/retract",
-        )
+        .retract(AGENT_A, x, fleet.claim(x).await.revision, "a/retract")
         .await
         .unwrap();
     assert_eq!(retracted.conflicts_resolved, [v2_conflict]);
-    assert!(
-        retracted.claims_restored.is_empty(),
-        "a claim in another open lineage stays disputed"
+    assert_eq!(
+        retracted.claims_restored,
+        [y],
+        "the preserved legacy row does not hold a reconciled key's member"
     );
+    assert_eq!(retracted.reevaluation.as_ref().unwrap().outcome, "closed");
     assert_eq!(fleet.conflict(v2_conflict).await.state, "resolved");
-    assert_eq!(fleet.conflict(legacy).await.state, "open");
-    assert_eq!(fleet.claim(y.claim.id).await.state, ClaimState::Disputed);
+    assert_eq!(fleet.claim(y).await.state, ClaimState::Active);
+    // History is append-only: the legacy row is still exactly as it was.
+    assert_eq!(fleet.conflict_row(legacy).await, legacy_before);
+    // No reader sees a dispute: nothing open is listed or projected for y.
+    let ledger = fleet.ledger(AGENT_C);
+    let scope = fleet.scope(AGENT_C);
+    assert!(
+        ledger
+            .list_conflicts(&scope, false, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        ledger
+            .conflicts_for_claim_ids(&scope, &[y], 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    fleet.assert_lifecycle_invariants().await;
+
+    // Any other open conflict still holds its member: here an open lineage on
+    // another key that also lists z keeps z disputed after z's key closes.
+    let w = fleet
+        .record(AGENT_A, &decision("restore-hold", &json!("w"), 1), "a/w")
+        .await;
+    let z = fleet
+        .record(AGENT_B, &decision("restore-hold", &json!("z"), 1), "b/z")
+        .await;
+    let held_conflict = z.claim.conflict_ids[0];
+    let holder = fleet
+        .legacy_conflict("restore-hold-elsewhere::database-choice", &[z.claim.id])
+        .await;
+    let closed = fleet
+        .retract(
+            AGENT_A,
+            w.claim.id,
+            fleet.claim(w.claim.id).await.revision,
+            "a/retract-w",
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed.conflicts_resolved, [held_conflict]);
+    assert!(
+        closed.claims_restored.is_empty(),
+        "an open conflict on another key still holds z"
+    );
+    // Read the row itself: claim reads fail closed on a cross-key membership.
+    assert_eq!(fleet.claim_state(z.claim.id).await, "disputed");
+    assert_eq!(fleet.conflict_row(holder).await.0, "open");
     fleet.assert_lifecycle_invariants().await;
 
     fleet.cleanup().await;
@@ -924,25 +1225,8 @@ async fn live_private_search_hides_retracted_synthetic_chunk_publication_unchang
     };
     let fleet = Fleet::new(&database_url, "search").await;
     let scope = fleet.scope(AGENT_A);
-    let store = Arc::new(fleet.store.clone());
-    let embedder: Arc<dyn ChunkEmbedder> = Arc::new(UnitEmbedder);
-    let service = |lifecycle: LifecycleServing| {
-        CockroachMemoryService::new(
-            scope.clone(),
-            store.clone(),
-            Arc::new(fleet.ledger(AGENT_A)),
-            embedder.clone(),
-        )
-        .unwrap()
-        .with_lifecycle(lifecycle)
-    };
-    let private = service(LifecycleServing {
-        surface: RememberSurface {
-            claim_lifecycle: true,
-        },
-        hide_non_current_claim_chunks: true,
-    });
-    let record_only = service(LifecycleServing::default());
+    let private = fleet.service(AGENT_A, PRIVATE_WRITER);
+    let record_only = fleet.service(AGENT_A, LifecycleServing::default());
 
     let x = fleet
         .record(AGENT_A, &decision("quokkaledger", &json!("x"), 1), "a/x")
@@ -1078,6 +1362,86 @@ async fn live_private_search_hides_retracted_synthetic_chunk_publication_unchang
         .await
         .unwrap();
     assert!(status.data.get("remember_surface").is_none());
+
+    fleet.cleanup().await;
+}
+
+#[tokio::test]
+async fn live_private_search_refills_page_past_retracted_hits_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "search-refill").await;
+    let scope = fleet.scope(AGENT_A);
+    let embedder: Arc<dyn ChunkEmbedder> = Arc::new(RankingEmbedder);
+    let private = fleet.service_embedding(AGENT_A, PRIVATE_WRITER, embedder.clone());
+    let record_only = fleet.service_embedding(AGENT_A, LifecycleServing::default(), embedder);
+    let remember = |request: RememberRequest| {
+        let private = &private;
+        let scope = scope.clone();
+        async move { FleetMemoryService::remember(private, scope, request).await }
+    };
+
+    // Seven notes that outrank the current one in both lanes, then retracted.
+    let mut retracted = Vec::new();
+    for index in 0..7 {
+        let recorded = remember(RememberRequest::new(
+            RememberAction::Record,
+            Some(fleet.key(&format!("a/note-{index}"))),
+            Map::from_iter([
+                ("kind".into(), json!("note")),
+                (
+                    "text".into(),
+                    json!(format!(
+                        "zebrafinch zebrafinch zebrafinch migration note {index}"
+                    )),
+                ),
+            ]),
+        ))
+        .await
+        .unwrap();
+        let claim_id = recorded.data["claim"]["id"].as_i64().unwrap();
+        remember(retract_request(
+            fleet.key(&format!("a/retract-{index}")),
+            claim_id,
+            1,
+        ))
+        .await
+        .unwrap();
+        retracted.push(claim_id);
+    }
+    let current = remember(RememberRequest::new(
+        RememberAction::Record,
+        Some(fleet.key("a/current")),
+        Map::from_iter([
+            ("kind".into(), json!("note")),
+            ("text".into(), json!("zebrafinch migration note, trailing")),
+        ]),
+    ))
+    .await
+    .unwrap();
+    let current_chunk = format!("claim:{}", current.data["claim"]["id"]);
+    let query = json!({ "query": "zebrafinch migration note", "kind": "chunk", "limit": 3 });
+
+    // Retracted notes fill the whole first retrieval window; the page is
+    // refilled from a larger one instead of coming back empty.
+    let page = recall(&private, &scope, RecallAction::Search, query.clone())
+        .await
+        .unwrap();
+    assert_eq!(hit_ids(&page), std::slice::from_ref(&current_chunk));
+    assert_eq!(
+        page.diagnostics["retrieval"]["lifecycle_hidden_claim_ids"],
+        json!(retracted)
+    );
+    assert!(page.warnings.is_empty(), "{:?}", page.warnings);
+
+    // The record-only surface is unfiltered: the same query's top three are
+    // exactly the retracted notes that the private page skipped.
+    let publication = recall(&record_only, &scope, RecallAction::Search, query)
+        .await
+        .unwrap();
+    assert_eq!(hit_ids(&publication).len(), 3);
+    assert!(!hit_ids(&publication).contains(&current_chunk));
 
     fleet.cleanup().await;
 }

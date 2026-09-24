@@ -268,7 +268,7 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 1000,
-                "description": "Optional private audit note for retract."
+                "description": "Optional private audit note for retract, at most 1000 characters."
             }),
         );
     }
