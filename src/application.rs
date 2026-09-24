@@ -1,6 +1,7 @@
 //! Cockroach-backed implementation of the backend-neutral memory service.
 
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,6 +11,10 @@ use ostk_recall_core::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use crate::evidence_recall::{
+    EvidenceDenseLaneV1, EvidenceReadinessV1, EvidenceRecall, EvidenceSearchV1, EvidenceSourceV1,
+    EvidenceSourcesV1, MAX_EVIDENCE_SEARCH_LIMIT, MAX_EVIDENCE_SOURCES,
+};
 use crate::ledger::{
     ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict, ConflictMutation,
     ConflictTarget, DismissalTerms, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LifecycleMutation,
@@ -18,21 +23,26 @@ use crate::ledger::{
     overlay_episode_revision, unlogged_transitions, validate_lifecycle_reason, validate_rationale,
     validate_waiver_hours,
 };
+use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::discrepancy::{DismissalReasonKindV1, WaiverReasonKindV1};
+use crate::projectors::EMBEDDING_DIMENSIONS;
 use crate::remember_runtime::{AssertStatusV1, RememberAssertInputV1};
 use crate::service::{
-    ConflictCoverage, FleetMemoryService, RecallAction, RecallRequest, RecallResult, Refusal,
-    RememberAction, RememberRequest, RememberResult, RememberSurface, ServiceError, ServiceResult,
-    authorize_surface,
+    ConflictCoverage, FleetMemoryService, RecallAction, RecallRequest, RecallResult, RecallSurface,
+    Refusal, RememberAction, RememberRequest, RememberResult, RememberSurface, ServiceError,
+    ServiceResult, authorize_surface,
 };
 use crate::store::cockroach::{
     CockroachStore, RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY, RetrievalHitMetadata,
     active_embedding_model,
 };
+use crate::worker::WorkerSourceOutcomeV1;
 use crate::{FleetError, FleetScope};
 
 const MAX_TOOL_RESULTS: usize = 100;
 const DEFAULT_TOOL_RESULTS: usize = 10;
+// `recall(kind=evidence)` shares the tool's limit bound.
+const _: () = assert!(MAX_TOOL_RESULTS == MAX_EVIDENCE_SEARCH_LIMIT);
 // Chunk search passes this query to CockroachDB's `plainto_tsquery`; keep every
 // token below the same conservative bound enforced for indexed corpus text.
 const MAX_TSVECTOR_QUERY_LEXEME_BYTES: usize = 16_000;
@@ -86,6 +96,9 @@ pub struct CockroachMemoryService {
     /// Withhold every asserted claim from every read. Only the publication
     /// composition ([`Self::publication`]) sets it.
     withhold_asserted_claims: bool,
+    /// `recall(kind=evidence)` over the Stage-5 tiers (ADR 0006); `None` when
+    /// this instance does not serve it.
+    evidence: Option<Arc<dyn EvidenceRecall>>,
 }
 
 struct ChunkConflictProjection {
@@ -129,6 +142,7 @@ impl std::fmt::Debug for CockroachMemoryService {
             .field("lifecycle", &self.lifecycle)
             .field("assert_status", &self.assert_status)
             .field("withhold_asserted_claims", &self.withhold_asserted_claims)
+            .field("evidence_recall", &self.evidence.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -156,6 +170,7 @@ impl CockroachMemoryService {
             lifecycle: LifecycleServing::default(),
             assert_status: None,
             withhold_asserted_claims: false,
+            evidence: None,
         })
     }
 
@@ -200,6 +215,18 @@ impl CockroachMemoryService {
     #[must_use]
     pub fn with_assert_status(mut self, status: Option<AssertStatusV1>) -> Self {
         self.assert_status = status;
+        self
+    }
+
+    /// Serve `recall(kind=evidence)` (ADR 0006) through `evidence`: `search`
+    /// and `get` with `kind=evidence`, and an `evidence` block in
+    /// `recall(status)`, all advertised in `tools/list`. Only the private
+    /// writer composition calls this, and only where
+    /// [`crate::evidence_recall::start_evidence_recall`] found the scope's
+    /// Stage-5 tables readable; the publication reader never serves it.
+    #[must_use]
+    pub fn with_evidence_recall(mut self, evidence: Arc<dyn EvidenceRecall>) -> Self {
+        self.evidence = Some(evidence);
         self
     }
 
@@ -559,6 +586,14 @@ impl CockroachMemoryService {
         scope: &FleetScope,
         arguments: Map<String, Value>,
     ) -> ServiceResult<RecallResult> {
+        // Evidence recall reads the Stage-5 tiers, never the chunk corpus, so
+        // the corpus's vector generation does not gate it: its dense lane was
+        // matched to this process's model when it was probed (ADR 0006).
+        if let Some(evidence) = self.evidence.as_deref()
+            && arguments.get("kind").and_then(Value::as_str) == Some("evidence")
+        {
+            return self.search_evidence(evidence, arguments).await;
+        }
         self.verify_embedding_generation()
             .await
             .map_err(service_error)?;
@@ -604,12 +639,60 @@ impl CockroachMemoryService {
         }
     }
 
+    /// `recall(search, kind=evidence)`: one evidence search with the query's
+    /// embedding for the dense lane, and every readiness, source, and absence
+    /// fact the answer depends on.
+    async fn search_evidence(
+        &self,
+        evidence: &dyn EvidenceRecall,
+        arguments: Map<String, Value>,
+    ) -> ServiceResult<RecallResult> {
+        let args: SearchArgs = from_arguments(arguments, "recall search")?;
+        validate_search_args(&args)?;
+        reject_evidence_unsupported_filters(&args)?;
+        let limit = bounded_limit(args.limit)?;
+        let vector = self.embed_evidence_query(&args.query).await;
+        let search = evidence
+            .search(&args.query, vector, limit)
+            .await
+            .map_err(service_error)?;
+        Ok(evidence_search_result(search))
+    }
+
+    /// The query's vector for the evidence dense lane, from the process
+    /// embedder on the blocking pool. `None` when the encode panics or yields
+    /// a vector no cosine index can compare (wrong width, non-finite, or the
+    /// zero vector); the search then runs its lexical lane alone and says so.
+    async fn embed_evidence_query(&self, query: &str) -> Option<Vec<f32>> {
+        let embedder = Arc::clone(&self.embedder);
+        let query = query.to_owned();
+        match tokio::task::spawn_blocking(move || embedder.encode_batch(&[query.as_str()])).await {
+            Ok(vectors) => vectors
+                .into_iter()
+                .next()
+                .filter(|vector| dense_query_vector_usable(vector)),
+            Err(error) => {
+                tracing::warn!(error = %error, "evidence query embedding failed");
+                None
+            }
+        }
+    }
+
     async fn recall_get(
         &self,
         scope: &FleetScope,
         arguments: Map<String, Value>,
     ) -> ServiceResult<RecallResult> {
         let args: GetArgs = from_arguments(arguments, "recall get")?;
+        if let Some(evidence) = self.evidence.as_deref()
+            && args.kind.as_deref() == Some("evidence")
+        {
+            let id = parse_evidence_id(&args.id)?;
+            let body = evidence.get(id).await.map_err(service_error)?;
+            let mut result = RecallResult::new(json!({ "evidence": body }));
+            result.conflict_coverage = ConflictCoverage::not_evaluated();
+            return Ok(result);
+        }
         match args.kind.as_deref().unwrap_or("chunk") {
             "claim" | "assertion" => {
                 let id = parse_safe_id(&args.id)?;
@@ -862,6 +945,11 @@ impl CockroachMemoryService {
         }
         if let Some(status) = &self.assert_status {
             result.data["remember_assert"] = json!(status);
+        }
+        if let Some(evidence) = self.evidence.as_deref() {
+            let (block, warnings) = evidence_status(evidence).await;
+            result.data["evidence"] = block;
+            result.warnings.extend(warnings);
         }
         result.conflict_coverage = ConflictCoverage::not_evaluated();
         Ok(result)
@@ -1545,6 +1633,13 @@ impl FleetMemoryService for CockroachMemoryService {
     fn remember_surface(&self) -> RememberSurface {
         self.lifecycle.surface
     }
+
+    fn recall_surface(&self) -> RecallSurface {
+        RecallSurface {
+            evidence: self.evidence.is_some(),
+            ..RecallSurface::NONE
+        }
+    }
 }
 
 /// Validate a claim an agent writes through `record` or as a `supersede`
@@ -2151,6 +2246,188 @@ fn reject_claim_only_unsupported_filters(args: &SearchArgs) -> ServiceResult<()>
         ));
     }
     Ok(())
+}
+
+fn reject_evidence_unsupported_filters(args: &SearchArgs) -> ServiceResult<()> {
+    if args.source.is_some()
+        || args.max_per_source_id.is_some()
+        || args.min_score.is_some()
+        || args.intent.is_some()
+        || args.include_history
+    {
+        return Err(ServiceError::InvalidRequest(
+            "evidence search does not support source, max_per_source_id, min_score, intent, or include_history; use kind=chunk for those filters"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A hit's id: the lowercase hex content address `search` returned.
+fn parse_evidence_id(value: &Value) -> ServiceResult<Sha256Digest> {
+    value
+        .as_str()
+        .and_then(|id| Sha256Digest::from_str(id).ok())
+        .ok_or_else(|| {
+            ServiceError::InvalidRequest(
+                "evidence id must be a hit's id: 64 lowercase hex characters".into(),
+            )
+        })
+}
+
+/// Whether a query vector can be compared with the dense tier's: its width,
+/// finite components, and not the zero vector, whose cosine is undefined.
+fn dense_query_vector_usable(vector: &[f32]) -> bool {
+    vector.len() == EMBEDDING_DIMENSIONS as usize
+        && vector.iter().all(|component| component.is_finite())
+        && vector.iter().any(|component| *component != 0.0)
+}
+
+/// The recall result of one evidence search.
+fn evidence_search_result(search: EvidenceSearchV1) -> RecallResult {
+    let EvidenceSearchV1 {
+        hits,
+        readiness,
+        sources,
+        absence,
+    } = search;
+    let mut warnings = evidence_warnings(&readiness, &sources);
+    // The lane is served but this search carried no vector: the process
+    // embedder gave none the lane could use.
+    if readiness.dense_lane == EvidenceDenseLaneV1::NoQueryVector {
+        warnings.push(json!({
+            "code": "evidence_query_not_embedded",
+            "message": "the query has no usable embedding under the pinned model, so only the lexical lane ran"
+        }));
+    }
+    let lanes = if readiness.dense_lane == EvidenceDenseLaneV1::Used {
+        json!(["lexical", "dense"])
+    } else {
+        json!(["lexical"])
+    };
+    let dense_lane = readiness.dense_lane;
+    let mut result = RecallResult::new(json!({
+        "hits": hits,
+        "readiness": readiness,
+        "sources": sources,
+        "absence": absence,
+    }));
+    result.conflict_coverage = ConflictCoverage::not_evaluated();
+    result.warnings = warnings;
+    result.diagnostics.insert(
+        "retrieval".into(),
+        json!({
+            "tier": "evidence",
+            "lanes": lanes,
+            "dense_lane": dense_lane,
+            "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
+        }),
+    );
+    result
+}
+
+/// `recall(status).evidence` and the warnings it adds. A failed read is a
+/// warning, never a failed status.
+async fn evidence_status(evidence: &dyn EvidenceRecall) -> (Value, Vec<Value>) {
+    match evidence.status().await {
+        Ok(status) => {
+            let warnings = evidence_warnings(&status.readiness, &status.sources);
+            (
+                json!({
+                    "served": true,
+                    "readiness": status.readiness,
+                    "sources": status.sources,
+                }),
+                warnings,
+            )
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "evidence recall status read failed");
+            (
+                json!({ "served": true, "readiness": null, "sources": null }),
+                vec![json!({
+                    "code": "evidence_status_unavailable",
+                    "message": "evidence readiness and sources could not be read; recall(kind=evidence) is still served"
+                })],
+            )
+        }
+    }
+}
+
+/// What an evidence answer's readiness and sources warn about: projection
+/// lag, pending ingest, a disabled dense lane, failed or stale sources, and a
+/// cut listing. The absence verdict carries the same facts as reasons; these
+/// say them whether or not anything matched.
+fn evidence_warnings(readiness: &EvidenceReadinessV1, sources: &EvidenceSourcesV1) -> Vec<Value> {
+    let mut warnings = Vec::new();
+    if readiness.events_awaiting_body_projection > 0 {
+        warnings.push(json!({
+            "code": "evidence_body_projection_lag",
+            "message": format!(
+                "{} accepted evidence events are waiting for the body projector; the newest evidence is not searchable until the worker's project step runs",
+                readiness.events_awaiting_body_projection
+            ),
+        }));
+    }
+    if readiness.transcript_turns_awaiting_admission > 0 {
+        warnings.push(json!({
+            "code": "evidence_ingest_pending",
+            "message": format!(
+                "{} transcript turns are staged and not yet admitted as evidence",
+                readiness.transcript_turns_awaiting_admission
+            ),
+        }));
+    }
+    if !readiness.lexical_current {
+        warnings.push(json!({
+            "code": "evidence_lexical_projection_lag",
+            "message": "some evidence bodies have not been through the lexical projector yet"
+        }));
+    }
+    if readiness.dense_lane == EvidenceDenseLaneV1::DisabledForeignModel {
+        warnings.push(json!({
+            "code": "evidence_dense_lane_disabled",
+            "message": "the dense lane is off: the scope's dense tier holds vectors of another embedding model; only the lexical lane runs"
+        }));
+    } else if !readiness.dense_current {
+        warnings.push(json!({
+            "code": "evidence_dense_projection_lag",
+            "message": "some lexically searchable bodies have no embedding yet; the dense lane cannot find them"
+        }));
+    }
+    let instances = |matches: fn(&EvidenceSourceV1) -> bool| {
+        sources
+            .active
+            .iter()
+            .filter(|source| matches(source))
+            .map(|source| source.connector_instance.clone())
+            .collect::<Vec<_>>()
+    };
+    let failed = instances(|source| source.last_outcome == WorkerSourceOutcomeV1::Failed);
+    if !failed.is_empty() {
+        warnings.push(json!({
+            "code": "evidence_source_failed",
+            "message": "the worker's last attempt at these sources failed; see each source's last_error",
+            "connector_instances": failed,
+        }));
+    }
+    let stale = instances(|source| source.stale);
+    if !stale.is_empty() {
+        warnings.push(json!({
+            "code": "evidence_source_stale",
+            "message": "these sources' last completed check is older than their staleness bound",
+            "connector_instances": stale,
+        }));
+    }
+    if sources.truncated {
+        warnings.push(json!({
+            "code": "evidence_sources_truncated",
+            "message": format!(
+                "more than {MAX_EVIDENCE_SOURCES} sources are active; only the first are listed"
+            ),
+        }));
+    }
+    warnings
 }
 
 fn parse_safe_id(value: &Value) -> ServiceResult<i64> {
@@ -2765,12 +3042,19 @@ mod tests {
     /// A service whose pool never connects: anything that reaches I/O fails,
     /// so a passing assertion proves the decision was made before I/O.
     fn offline_service(surface: RememberSurface) -> CockroachMemoryService {
+        offline_service_with(surface, Arc::new(OfflineEmbedder))
+    }
+
+    /// [`offline_service`] with its own process embedder.
+    fn offline_service_with(
+        surface: RememberSurface,
+        embedder: Arc<dyn ChunkEmbedder>,
+    ) -> CockroachMemoryService {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(200))
             .connect_lazy("postgresql://root@127.0.0.1:1/offline")
             .unwrap();
         let scope = offline_scope();
-        let embedder: Arc<dyn ChunkEmbedder> = Arc::new(OfflineEmbedder);
         let ledger = Arc::new(
             CockroachClaimLedger::new(
                 pool.clone(),
@@ -3813,5 +4097,558 @@ mod tests {
             }
             assert!(passes <= 5, "limit {limit} took {passes} passes");
         }
+    }
+
+    /// A 512-wide embedder whose every vector the dense lane can use.
+    struct UnitEmbedder;
+
+    impl ChunkEmbedder for UnitEmbedder {
+        fn dim(&self) -> usize {
+            EMBEDDING_DIMENSION
+        }
+
+        fn model_id(&self) -> &'static str {
+            "offline-test"
+        }
+
+        fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+            texts
+                .iter()
+                .map(|_| {
+                    let mut vector = vec![0.0; EMBEDDING_DIMENSION];
+                    vector[0] = 1.0;
+                    vector
+                })
+                .collect()
+        }
+    }
+
+    const KNOWN_BODY: [u8; 32] = [0xab; 32];
+    const GIT_SOURCE: &str = "connector.git.fixture";
+    const TRANSCRIPT_SOURCE: &str = "connector.transcript.fixture";
+
+    fn evidence_readiness(dense_lane: EvidenceDenseLaneV1) -> EvidenceReadinessV1 {
+        EvidenceReadinessV1 {
+            events_awaiting_body_projection: 2,
+            transcript_turns_awaiting_admission: 0,
+            lexical_current: true,
+            dense_current: true,
+            dense_lane,
+            as_of: Utc::now(),
+        }
+    }
+
+    /// A git source whose last attempt failed and a transcript source whose
+    /// last check is stale.
+    fn evidence_sources() -> EvidenceSourcesV1 {
+        use crate::evidence_recall::EvidenceCoverageV1;
+        use crate::memory_contracts::coverage::CoverageCompletenessV1;
+        use crate::worker::WorkerSourceKindV1;
+        let coverage = Some(EvidenceCoverageV1 {
+            completeness: CoverageCompletenessV1::Complete,
+            observed: vec![[1, 2]],
+            target: [1, 2],
+            as_of: Utc::now(),
+        });
+        EvidenceSourcesV1 {
+            active: vec![
+                EvidenceSourceV1 {
+                    connector_instance: GIT_SOURCE.into(),
+                    kind: WorkerSourceKindV1::Git,
+                    state: "active".into(),
+                    last_outcome: WorkerSourceOutcomeV1::Failed,
+                    last_checked_at: Some(Utc::now()),
+                    last_error: Some("ref not found".into()),
+                    stale: false,
+                    coverage: coverage.clone(),
+                },
+                EvidenceSourceV1 {
+                    connector_instance: TRANSCRIPT_SOURCE.into(),
+                    kind: WorkerSourceKindV1::Transcript,
+                    state: "active".into(),
+                    last_outcome: WorkerSourceOutcomeV1::Ok,
+                    last_checked_at: Some(Utc::now()),
+                    last_error: None,
+                    stale: true,
+                    coverage,
+                },
+            ],
+            truncated: false,
+        }
+    }
+
+    /// An [`EvidenceRecall`] that answers from fixtures and records every
+    /// call, or fails every call.
+    #[derive(Default)]
+    struct FakeEvidence {
+        fail: bool,
+        /// Each search's query, whether it carried a vector, and its limit.
+        searches: std::sync::Mutex<Vec<(String, bool, usize)>>,
+        gets: std::sync::Mutex<Vec<Sha256Digest>>,
+        statuses: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeEvidence {
+        fn failing() -> Self {
+            Self {
+                fail: true,
+                ..Self::default()
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.searches.lock().unwrap().len()
+                + self.gets.lock().unwrap().len()
+                + self.statuses.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn outcome<T>(&self, value: T) -> crate::Result<T> {
+            if self.fail {
+                Err(FleetError::Memory("evidence tables unreadable".into()))
+            } else {
+                Ok(value)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EvidenceRecall for FakeEvidence {
+        async fn search(
+            &self,
+            query: &str,
+            query_vector: Option<Vec<f32>>,
+            limit: usize,
+        ) -> crate::Result<EvidenceSearchV1> {
+            use crate::evidence_recall::{
+                AbsenceV1, AbsenceVerdictV1, EvidenceHitV1, EvidenceMatchV1,
+            };
+            self.searches
+                .lock()
+                .unwrap()
+                .push((query.to_owned(), query_vector.is_some(), limit));
+            let dense_lane = if query_vector.is_some() {
+                EvidenceDenseLaneV1::Used
+            } else {
+                EvidenceDenseLaneV1::NoQueryVector
+            };
+            self.outcome(EvidenceSearchV1 {
+                hits: vec![EvidenceHitV1 {
+                    id: Sha256Digest::from_bytes(KNOWN_BODY),
+                    matched_by: EvidenceMatchV1::Lexical,
+                    lexical_score: Some(0.5),
+                    dense_similarity: None,
+                    media_type: "application.git-commit-v1".into(),
+                    snippet: "document the zephyrine cache eviction".into(),
+                    snippet_truncated: false,
+                    first_accepted_event_id: Sha256Digest::from_bytes([0xcd; 32]),
+                }],
+                readiness: evidence_readiness(dense_lane),
+                sources: evidence_sources(),
+                absence: AbsenceV1 {
+                    verdict: AbsenceVerdictV1::Present,
+                    reasons: Vec::new(),
+                    as_of: Some(Utc::now()),
+                },
+            })
+        }
+
+        async fn get(
+            &self,
+            id: Sha256Digest,
+        ) -> crate::Result<Option<crate::evidence_recall::EvidenceBodyV1>> {
+            self.gets.lock().unwrap().push(id);
+            self.outcome((id == Sha256Digest::from_bytes(KNOWN_BODY)).then(|| {
+                crate::evidence_recall::EvidenceBodyV1 {
+                    id,
+                    media_type: "application.git-commit-v1".into(),
+                    text: "document the zephyrine cache eviction".into(),
+                    text_bytes: 37,
+                    visibility_class: crate::projectors::RowVisibilityClassV1::Private,
+                    first_accepted_event_id: Sha256Digest::from_bytes([0xcd; 32]),
+                }
+            }))
+        }
+
+        async fn status(&self) -> crate::Result<crate::evidence_recall::EvidenceStatusV1> {
+            self.statuses
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.outcome(crate::evidence_recall::EvidenceStatusV1 {
+                readiness: evidence_readiness(EvidenceDenseLaneV1::Available),
+                sources: evidence_sources(),
+            })
+        }
+    }
+
+    fn evidence_service(
+        embedder: Arc<dyn ChunkEmbedder>,
+        evidence: &Arc<FakeEvidence>,
+    ) -> CockroachMemoryService {
+        let evidence: Arc<dyn EvidenceRecall> = evidence.clone();
+        offline_service_with(RememberSurface::RECORD_ONLY, embedder).with_evidence_recall(evidence)
+    }
+
+    fn recall_request(action: RecallAction, arguments: &Value) -> RecallRequest {
+        RecallRequest::new(action, arguments.as_object().unwrap().clone())
+    }
+
+    fn warning_codes(warnings: &[Value]) -> Vec<&str> {
+        warnings
+            .iter()
+            .map(|warning| warning["code"].as_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn evidence_search_answers_without_the_corpus() {
+        let evidence = Arc::new(FakeEvidence::default());
+        let service = evidence_service(Arc::new(UnitEmbedder), &evidence);
+        assert_eq!(
+            FleetMemoryService::recall_surface(&service),
+            RecallSurface {
+                evidence: true,
+                ..RecallSurface::NONE
+            }
+        );
+        // The offline pool fails every read, so an answer proves the search
+        // never touched the corpus.
+        let result = FleetMemoryService::recall(
+            &service,
+            offline_scope(),
+            recall_request(
+                RecallAction::Search,
+                &json!({ "kind": "evidence", "query": "zephyrine cache", "limit": 5 }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *evidence.searches.lock().unwrap(),
+            [("zephyrine cache".to_owned(), true, 5)]
+        );
+        let data = result.data.as_object().unwrap();
+        let mut keys = data.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, ["absence", "hits", "readiness", "sources"]);
+        assert_eq!(result.data["hits"][0]["id"], "ab".repeat(32));
+        assert_eq!(result.data["hits"][0]["matched_by"], "lexical");
+        assert_eq!(result.data["absence"]["verdict"], "present");
+        assert_eq!(result.data["readiness"]["dense_lane"], "used");
+        assert_eq!(
+            result.data["sources"]["active"][0]["last_outcome"],
+            "failed"
+        );
+        assert!(result.conflicts.is_empty());
+        assert_eq!(result.conflict_coverage, ConflictCoverage::not_evaluated());
+        let retrieval = &result.diagnostics["retrieval"];
+        assert_eq!(retrieval["tier"], "evidence");
+        assert_eq!(retrieval["lanes"], json!(["lexical", "dense"]));
+        assert_eq!(
+            retrieval["dense_min_cosine_similarity"],
+            json!(RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY)
+        );
+        assert_eq!(
+            warning_codes(&result.warnings),
+            [
+                "evidence_body_projection_lag",
+                "evidence_source_failed",
+                "evidence_source_stale"
+            ]
+        );
+        assert_eq!(
+            result.warnings[1]["connector_instances"],
+            json!([GIT_SOURCE])
+        );
+        assert_eq!(
+            result.warnings[2]["connector_instances"],
+            json!([TRANSCRIPT_SOURCE])
+        );
+
+        // A query the process model cannot embed searches lexically, and
+        // says so; the default limit applies.
+        let evidence = Arc::new(FakeEvidence::default());
+        let service = evidence_service(Arc::new(OfflineEmbedder), &evidence);
+        let result = FleetMemoryService::recall(
+            &service,
+            offline_scope(),
+            recall_request(
+                RecallAction::Search,
+                &json!({ "kind": "evidence", "query": "zephyrine" }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *evidence.searches.lock().unwrap(),
+            [("zephyrine".to_owned(), false, DEFAULT_TOOL_RESULTS)]
+        );
+        assert_eq!(result.diagnostics["retrieval"]["lanes"], json!(["lexical"]));
+        assert!(warning_codes(&result.warnings).contains(&"evidence_query_not_embedded"));
+    }
+
+    #[tokio::test]
+    async fn evidence_search_refuses_what_it_cannot_honor_before_searching() {
+        let evidence = Arc::new(FakeEvidence::default());
+        let service = evidence_service(Arc::new(UnitEmbedder), &evidence);
+        for arguments in [
+            json!({ "kind": "evidence", "query": "q", "source": "git" }),
+            json!({ "kind": "evidence", "query": "q", "max_per_source_id": 3 }),
+            json!({ "kind": "evidence", "query": "q", "min_score": 0.0 }),
+            json!({ "kind": "evidence", "query": "q", "intent": "general" }),
+            json!({ "kind": "evidence", "query": "q", "include_history": true }),
+            json!({ "kind": "evidence", "query": "q", "limit": 0 }),
+            json!({ "kind": "evidence", "query": "q", "limit": 101 }),
+            json!({ "kind": "evidence", "query": " " }),
+            json!({ "kind": "evidence", "query": "q", "since": "2026-01-01" }),
+            json!({ "kind": "evidence" }),
+        ] {
+            let error = FleetMemoryService::recall(
+                &service,
+                offline_scope(),
+                recall_request(RecallAction::Search, &arguments),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, ServiceError::InvalidRequest(_)),
+                "{arguments}: {error}"
+            );
+        }
+        assert_eq!(evidence.calls(), 0);
+
+        // A search the evidence tables cannot answer is a failed read, not a
+        // client error.
+        let failing = Arc::new(FakeEvidence::failing());
+        let error = FleetMemoryService::recall(
+            &evidence_service(Arc::new(UnitEmbedder), &failing),
+            offline_scope(),
+            recall_request(
+                RecallAction::Search,
+                &json!({ "kind": "evidence", "query": "zephyrine" }),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServiceError::Internal(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn evidence_get_returns_the_body_or_null() {
+        let evidence = Arc::new(FakeEvidence::default());
+        let service = evidence_service(Arc::new(UnitEmbedder), &evidence);
+        let get = |id: Value| {
+            FleetMemoryService::recall(
+                &service,
+                offline_scope(),
+                recall_request(RecallAction::Get, &json!({ "kind": "evidence", "id": id })),
+            )
+        };
+        let found = get(json!("ab".repeat(32))).await.unwrap();
+        assert_eq!(found.data["evidence"]["id"], "ab".repeat(32));
+        assert_eq!(
+            found.data["evidence"]["text"],
+            "document the zephyrine cache eviction"
+        );
+        assert_eq!(found.data["evidence"]["visibility_class"], "private");
+        assert_eq!(found.conflict_coverage, ConflictCoverage::not_evaluated());
+        let missing = get(json!("42".repeat(32))).await.unwrap();
+        assert!(missing.data["evidence"].is_null());
+        assert_eq!(evidence.gets.lock().unwrap().len(), 2);
+
+        for id in [
+            json!("AB".repeat(32)),
+            json!("ab".repeat(31)),
+            json!(format!("{}g", "a".repeat(63))),
+            json!(42),
+            json!(null),
+        ] {
+            let error = get(id.clone()).await.unwrap_err();
+            assert!(
+                matches!(&error, ServiceError::InvalidRequest(message) if message.contains("64 lowercase hex")),
+                "{id}: {error}"
+            );
+        }
+        assert_eq!(evidence.gets.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unserved_evidence_keeps_the_historical_errors() {
+        let service = offline_service(RememberSurface::RECORD_ONLY);
+        assert_eq!(
+            FleetMemoryService::recall_surface(&service),
+            RecallSurface::NONE
+        );
+        let error = FleetMemoryService::recall(
+            &service,
+            offline_scope(),
+            recall_request(
+                RecallAction::Get,
+                &json!({ "kind": "evidence", "id": "ab".repeat(32) }),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid memory request: recall get kind \"evidence\" is not supported"
+        );
+        // An unserved evidence search takes the chunk and claim path, exactly
+        // as any other unsupported kind does.
+        let mut errors = Vec::new();
+        for kind in ["evidence", "unknown"] {
+            let error = FleetMemoryService::recall(
+                &service,
+                offline_scope(),
+                recall_request(
+                    RecallAction::Search,
+                    &json!({ "kind": kind, "query": "zephyrine" }),
+                ),
+            )
+            .await
+            .unwrap_err();
+            errors.push(error.to_string());
+        }
+        assert_eq!(errors[0], errors[1]);
+    }
+
+    #[tokio::test]
+    async fn attaching_evidence_leaves_every_other_request_as_it_was() {
+        let evidence = Arc::new(FakeEvidence::default());
+        let plain = offline_service(CONFLICT_LIFECYCLE);
+        let attached = offline_service(CONFLICT_LIFECYCLE)
+            .with_evidence_recall(evidence.clone() as Arc<dyn EvidenceRecall>);
+        assert_eq!(
+            FleetMemoryService::remember_surface(&attached),
+            CONFLICT_LIFECYCLE
+        );
+        let reads = [
+            (
+                RecallAction::Search,
+                json!({ "kind": "chunk", "query": "zephyrine" }),
+            ),
+            (RecallAction::Search, json!({ "query": "zephyrine" })),
+            (
+                RecallAction::Search,
+                json!({ "kind": "claim", "query": "zephyrine" }),
+            ),
+            (RecallAction::Get, json!({ "kind": "chunk", "id": "c1" })),
+            (RecallAction::Get, json!({ "kind": "claim", "id": 41 })),
+            (RecallAction::Get, json!({ "kind": "conflict", "id": 9 })),
+            (RecallAction::Conflicts, json!({})),
+            (RecallAction::Status, json!({})),
+        ];
+        for (action, arguments) in reads {
+            let mut outcomes = Vec::new();
+            for service in [&plain, &attached] {
+                let outcome = FleetMemoryService::recall(
+                    service,
+                    offline_scope(),
+                    recall_request(action, &arguments),
+                )
+                .await;
+                outcomes.push(format!("{outcome:?}"));
+            }
+            assert_eq!(outcomes[0], outcomes[1], "{arguments}");
+        }
+        let mut outcomes = Vec::new();
+        for service in [&plain, &attached] {
+            let outcome = FleetMemoryService::remember(
+                service,
+                offline_scope(),
+                RememberRequest::new(
+                    RememberAction::Record,
+                    Some("record/1".into()),
+                    retract_arguments(&json!({ "kind": "decision", "text": "t" })),
+                ),
+            )
+            .await;
+            outcomes.push(format!("{outcome:?}"));
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+        assert_eq!(evidence.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn evidence_status_reports_or_warns_but_never_fails() {
+        let (block, warnings) = evidence_status(&FakeEvidence::default()).await;
+        assert_eq!(block["served"], true);
+        assert_eq!(block["readiness"]["dense_lane"], "available");
+        assert_eq!(
+            block["sources"]["active"][1]["connector_instance"],
+            TRANSCRIPT_SOURCE
+        );
+        assert_eq!(
+            warning_codes(&warnings),
+            [
+                "evidence_body_projection_lag",
+                "evidence_source_failed",
+                "evidence_source_stale"
+            ]
+        );
+
+        let (block, warnings) = evidence_status(&FakeEvidence::failing()).await;
+        assert_eq!(
+            block,
+            json!({ "served": true, "readiness": null, "sources": null })
+        );
+        assert_eq!(warning_codes(&warnings), ["evidence_status_unavailable"]);
+    }
+
+    #[test]
+    fn evidence_warnings_name_each_condition_once() {
+        let current = EvidenceReadinessV1 {
+            events_awaiting_body_projection: 0,
+            ..evidence_readiness(EvidenceDenseLaneV1::Available)
+        };
+        let healthy = EvidenceSourcesV1 {
+            active: Vec::new(),
+            truncated: false,
+        };
+        assert!(evidence_warnings(&current, &healthy).is_empty());
+
+        let lagging = EvidenceReadinessV1 {
+            transcript_turns_awaiting_admission: 3,
+            lexical_current: false,
+            dense_current: false,
+            ..current
+        };
+        let truncated = EvidenceSourcesV1 {
+            active: Vec::new(),
+            truncated: true,
+        };
+        assert_eq!(
+            warning_codes(&evidence_warnings(&lagging, &truncated)),
+            [
+                "evidence_ingest_pending",
+                "evidence_lexical_projection_lag",
+                "evidence_dense_projection_lag",
+                "evidence_sources_truncated"
+            ]
+        );
+        // A disabled lane is reported as disabled, not as lagging.
+        let foreign = EvidenceReadinessV1 {
+            dense_current: false,
+            dense_lane: EvidenceDenseLaneV1::DisabledForeignModel,
+            ..current
+        };
+        assert_eq!(
+            warning_codes(&evidence_warnings(&foreign, &healthy)),
+            ["evidence_dense_lane_disabled"]
+        );
+    }
+
+    #[test]
+    fn only_a_comparable_query_vector_reaches_the_dense_lane() {
+        let mut unit = vec![0.0; EMBEDDING_DIMENSION];
+        unit[0] = 1.0;
+        assert!(dense_query_vector_usable(&unit));
+        assert!(!dense_query_vector_usable(&vec![0.0; EMBEDDING_DIMENSION]));
+        assert!(!dense_query_vector_usable(&unit[1..]));
+        assert!(!dense_query_vector_usable(&[]));
+        let mut nan = unit.clone();
+        nan[3] = f32::NAN;
+        assert!(!dense_query_vector_usable(&nan));
+        let mut infinite = unit;
+        infinite[3] = f32::INFINITY;
+        assert!(!dense_query_vector_usable(&infinite));
     }
 }

@@ -267,20 +267,58 @@ pub fn recall_tool_for(surface: RememberSurface) -> Value {
     tool
 }
 
+/// What `recall`'s description adds when evidence recall is served.
+const EVIDENCE_DESCRIPTION: &str = "kind=evidence searches connector evidence (git history, agent transcripts, CI runs); every answer carries readiness, per-source status and coverage, and an absence verdict: absent only when nothing matched over a current projection with every source fresh and complete, otherwise unknown. get with kind=evidence takes a hit's 64-hex id.";
+
 /// `recall` as served beside the given remember and recall surfaces.
 ///
 /// It is the [`recall_tool_for`] schema of the remember surface, widened by
 /// each recall capability served; with [`RecallSurface::NONE`] it is exactly
 /// [`recall_tool_for`].
+///
+/// Evidence recall (ADR 0006) adds `evidence` to the `kind` enum, one
+/// sentence to the description, and a branch that limits `kind=evidence` to
+/// `search` and `get` without the chunk-only filters.
 #[must_use]
 pub fn recall_tool_for_surfaces(remember: RememberSurface, recall: RecallSurface) -> Value {
-    // No recall capability widens the schema yet. Naming every field keeps a
-    // new capability from compiling until this schema advertises it.
+    // Naming every field keeps a new capability from compiling until this
+    // schema advertises it. Discrepancies are not advertised yet.
     let RecallSurface {
-        evidence: _,
+        evidence,
         discrepancies: _,
     } = recall;
-    recall_tool_for(remember)
+    let mut tool = recall_tool_for(remember);
+    if evidence {
+        add_evidence_kind(&mut tool);
+    }
+    tool
+}
+
+fn add_evidence_kind(tool: &mut Value) {
+    if let Some(description) = tool["description"].as_str() {
+        tool["description"] = json!(format!("{description} {EVIDENCE_DESCRIPTION}"));
+    }
+    let schema = &mut tool["inputSchema"];
+    if let Some(kinds) = schema["properties"]["kind"]["enum"].as_array_mut() {
+        kinds.push(json!("evidence"));
+    }
+    if let Some(all_of) = schema["allOf"].as_array_mut() {
+        all_of.push(json!({
+            "if": {
+                "properties": { "kind": { "const": "evidence" } },
+                "required": ["kind"]
+            },
+            "then": {
+                "properties": {
+                    "action": { "enum": ["search", "get"] },
+                    "source": false,
+                    "max_per_source_id": false,
+                    "min_score": false,
+                    "intent": false
+                }
+            }
+        }));
+    }
 }
 
 /// `remember` restricted to the actions the surface serves. The record-only
@@ -915,6 +953,74 @@ mod tests {
                 "{surface:?}"
             );
         }
+    }
+
+    #[test]
+    fn evidence_recall_adds_one_kind_and_one_branch_to_recall_only() {
+        let evidence = RecallSurface {
+            evidence: true,
+            ..RecallSurface::NONE
+        };
+        for surface in [
+            RememberSurface::RECORD_ONLY,
+            lifecycle_surface(),
+            conflict_surface(),
+            adjudication_surface(),
+            RememberSurface {
+                assert: true,
+                ..RememberSurface::RECORD_ONLY
+            },
+        ] {
+            let listed = tool_list_for_surfaces(surface, evidence);
+            assert_eq!(listed.len(), 2, "{surface:?}");
+            // The remember tool is exactly what the remember surface lists.
+            assert_eq!(
+                serde_json::to_vec(&listed[1]).unwrap(),
+                serde_json::to_vec(&remember_tool_for(surface)).unwrap(),
+                "{surface:?}"
+            );
+
+            let base = recall_tool_for(surface);
+            let recall = &listed[0];
+            assert_eq!(*recall, recall_tool_for_surfaces(surface, evidence));
+            let schema = &recall["inputSchema"];
+            let kinds = schema["properties"]["kind"]["enum"].as_array().unwrap();
+            assert_eq!(kinds.last(), Some(&json!("evidence")), "{surface:?}");
+            let description = recall["description"].as_str().unwrap();
+            assert!(description.contains("kind=evidence"), "{description}");
+            assert!(description.contains("absence verdict"), "{description}");
+
+            let branch = schema["allOf"].as_array().unwrap().last().unwrap();
+            assert_eq!(branch["if"]["properties"]["kind"]["const"], "evidence");
+            assert_eq!(branch["if"]["required"], json!(["kind"]));
+            assert_eq!(
+                branch["then"]["properties"]["action"]["enum"],
+                json!(["search", "get"])
+            );
+            let properties = schema["properties"].as_object().unwrap();
+            for filter in ["source", "max_per_source_id", "min_score", "intent"] {
+                assert_eq!(branch["then"]["properties"][filter], false, "{filter}");
+                assert!(properties.contains_key(filter), "{filter} is declared");
+            }
+
+            // Take the three additions back out and the rest is untouched.
+            let mut stripped = recall.clone();
+            stripped["description"] = base["description"].clone();
+            stripped["inputSchema"]["properties"]["kind"]["enum"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+            stripped["inputSchema"]["allOf"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+            assert_eq!(stripped, base, "{surface:?}");
+        }
+        // The historical shortcut applies only when nothing is added.
+        assert_ne!(
+            tool_list_for_surfaces(RememberSurface::RECORD_ONLY, evidence),
+            tool_list()
+        );
     }
 
     #[test]

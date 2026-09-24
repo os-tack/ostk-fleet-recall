@@ -20,6 +20,7 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use ostk_fleet_recall::application::LifecycleServing;
 use ostk_fleet_recall::config::{PublicationConfig, model_bundle_sha256};
+use ostk_fleet_recall::evidence_recall::start_evidence_recall;
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::McpServer;
 use ostk_fleet_recall::remember_runtime::start_event_first_assert;
@@ -468,6 +469,17 @@ async fn build_memory_service(
     .await
     .bind_ledger(ledger);
     let assert = assert_status.as_ref().is_some_and(|status| status.served);
+    // recall(kind=evidence) is served wherever migration 30 is applied and
+    // this login may read the Stage-5 tables (ADR 0006). Like assert, it is
+    // additive: a missing grant or a failed probe turns it off with a log
+    // line, never stops serve, and leaves every tool schema as it was.
+    let evidence = start_evidence_recall(
+        store.pool(),
+        &capabilities,
+        &config.default_scope,
+        &config.embedding_model_sha256,
+    )
+    .await;
     let mut service = CockroachMemoryService::new(
         config.default_scope.clone(),
         store.clone(),
@@ -475,6 +487,9 @@ async fn build_memory_service(
         embedder,
     )?
     .with_assert_status(assert_status);
+    if let Some(evidence) = evidence {
+        service = service.with_evidence_recall(evidence);
+    }
     if config.lifecycle.remember_lifecycle {
         let lifecycle = LifecycleServing {
             surface: RememberSurface {

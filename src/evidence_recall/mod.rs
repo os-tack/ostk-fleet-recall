@@ -62,6 +62,8 @@
 //!
 //! # Serving
 //!
+//! `serve` answers `recall(kind=evidence)` through the [`EvidenceRecall`]
+//! [`start_evidence_recall`] returns, when it returns one.
 //! [`probe_evidence_recall`] mints the [`EvidenceRecallCapability`] a
 //! [`CockroachEvidenceRecall`] needs, once, at startup. It checks the schema
 //! has reached migration 30 and that the login may read every table this
@@ -72,6 +74,7 @@
 //! base tables only, so the publication process never builds it.
 
 mod cockroach;
+mod serve;
 mod verdict;
 
 use async_trait::async_trait;
@@ -89,6 +92,7 @@ pub use cockroach::{
     CockroachEvidenceRecall, EVIDENCE_RECALL_TABLES, EvidenceRecallCapability,
     probe_evidence_recall,
 };
+pub use serve::start_evidence_recall;
 pub use verdict::absence_verdict;
 
 /// First schema evidence recall can read: migration 30 creates the worker

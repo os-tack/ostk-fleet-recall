@@ -17,25 +17,43 @@
 //! back for an id that is not in the scope; and the startup probe refuses a
 //! login that cannot read the Stage-5 tables while the runtime grants suffice
 //! for every read.
+//!
+//! Served over MCP (ADR 0006), composed as `serve` composes it: `tools/list`
+//! advertises `kind=evidence` exactly where the probe finds the Stage-5 tables
+//! readable, `recall` answers evidence search, get, and status through the
+//! server's real newline framing, and a login without the Stage-5 grants
+//! keeps every tool schema and every error text byte for byte what it was.
 
 mod common;
 
+use std::sync::Arc;
+
+use common::authority::retry_policy;
 use common::runtime_role::RuntimeProbeRole;
 use common::worker::{
     COMMIT_WORD, FAILING_STEP_WORD, GIT_INSTANCE, STUB_MODEL_DIGEST, StubEmbedder, TRANSCRIPT_WORD,
     WorkerFixture,
 };
-use ostk_fleet_recall::FleetScope;
 use ostk_fleet_recall::evidence_recall::{
     AbsenceReasonV1, AbsenceVerdictV1, CockroachEvidenceRecall, EvidenceDenseLaneV1,
     EvidenceMatchV1, EvidenceRecall, EvidenceSearchV1, probe_evidence_recall,
+    start_evidence_recall,
 };
+use ostk_fleet_recall::ledger::CockroachClaimLedger;
+use ostk_fleet_recall::mcp::{McpServer, tool_list, tool_list_for_surfaces};
 use ostk_fleet_recall::memory_contracts::coverage::CoverageCompletenessV1;
 use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
+use ostk_fleet_recall::service::{RecallSurface, RememberSurface};
 use ostk_fleet_recall::store::cockroach::{CockroachStore, DatabaseCapabilities, PoolConfig};
 use ostk_fleet_recall::worker::{WorkerSourceOutcomeV1, WorkerStepStatusV1, WorkerStepV1};
+use ostk_fleet_recall::{CockroachMemoryService, FleetScope};
 use ostk_recall_core::ChunkEmbedder;
+use serde_json::{Value, json};
 use sqlx::PgPool;
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
+};
+use tokio::task::JoinHandle;
 
 /// Words no fixture source contains.
 const NONSENSE: &str = "xylophagous quokkaberry";
@@ -460,4 +478,389 @@ async fn live_probe_refuses_without_select_when_configured() {
     assert!(body.is_some());
     assert!(!status.sources.active.is_empty());
     assert_absent(&absent);
+}
+
+/// The serving process's query model in the MCP proof: the stub's model id,
+/// but every query embeds to the first unit vector. A stub body vector is a
+/// hash expanded to 512 components of magnitude at most 127.5, so its cosine
+/// with that unit vector is far below the dense floor: the dense lane runs on
+/// every search and never clears the floor. Every hit is then a lexical one,
+/// and whether an empty answer is absent or unknown is decided by the verdict
+/// alone, not by which stub vectors happen to be near.
+struct FarQueryEmbedder;
+
+impl ChunkEmbedder for FarQueryEmbedder {
+    fn dim(&self) -> usize {
+        StubEmbedder.dim()
+    }
+
+    fn model_id(&self) -> &'static str {
+        StubEmbedder.model_id()
+    }
+
+    fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        texts
+            .iter()
+            .map(|_| {
+                let mut vector = vec![0.0; self.dim()];
+                vector[0] = 1.0;
+                vector
+            })
+            .collect()
+    }
+}
+
+/// `serve`'s MCP server for `scope` over `pool`, composed as
+/// `build_memory_service` composes a record-only writer: evidence recall is
+/// attached exactly when `start_evidence_recall` serves it for this login,
+/// under the stub model's digest. The scope's corpus model is registered, as
+/// deployment bootstrap registers it, so chunk search answers too.
+async fn serve_as_main(
+    owner: &PgPool,
+    pool: &PgPool,
+    capabilities: &DatabaseCapabilities,
+    scope: &FleetScope,
+    embedder: Arc<dyn ChunkEmbedder>,
+) -> (McpServer, bool) {
+    CockroachStore::from_pool(owner.clone(), scope.clone())
+        .expect("a valid store scope")
+        .initialize_embedding_model(embedder.model_id())
+        .await
+        .expect("register the corpus model");
+    let ledger = CockroachClaimLedger::new(
+        pool.clone(),
+        scope.clone(),
+        embedder.clone(),
+        retry_policy(),
+    )
+    .expect("claim ledger");
+    let evidence = start_evidence_recall(
+        pool,
+        capabilities,
+        scope,
+        &Sha256Digest::from_bytes(STUB_MODEL_DIGEST).to_hex(),
+    )
+    .await;
+    let served = evidence.is_some();
+    let mut service = CockroachMemoryService::new(
+        scope.clone(),
+        Arc::new(CockroachStore::from_pool(pool.clone(), scope.clone()).expect("store scope")),
+        Arc::new(ledger),
+        embedder,
+    )
+    .expect("memory service");
+    if let Some(evidence) = evidence {
+        service = service.with_evidence_recall(evidence);
+    }
+    (
+        McpServer::new(Arc::new(service), scope.clone()).expect("MCP server"),
+        served,
+    )
+}
+
+/// One MCP session over an in-memory duplex: each request is one line in and
+/// its response one line out, through the server's real newline framing.
+struct McpSession {
+    writer: WriteHalf<DuplexStream>,
+    lines: Lines<BufReader<ReadHalf<DuplexStream>>>,
+    task: JoinHandle<std::io::Result<()>>,
+    next_id: u64,
+}
+
+impl McpSession {
+    fn open(server: McpServer) -> Self {
+        let (client, server_side) = tokio::io::duplex(4 << 20);
+        let (server_reader, server_writer) = tokio::io::split(server_side);
+        let task = tokio::spawn(async move { server.serve(server_reader, server_writer).await });
+        let (reader, writer) = tokio::io::split(client);
+        Self {
+            writer,
+            lines: BufReader::new(reader).lines(),
+            task,
+            next_id: 0,
+        }
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let mut request = json!({ "jsonrpc": "2.0", "id": self.next_id, "method": method });
+        if !params.is_null() {
+            request["params"] = params;
+        }
+        self.writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("the server reads the request");
+        let line = self
+            .lines
+            .next_line()
+            .await
+            .expect("the server answers")
+            .expect("one response line per request");
+        let response: Value = serde_json::from_str(&line).expect("the response is JSON");
+        assert_eq!(response["id"], self.next_id, "{response}");
+        response
+    }
+
+    async fn tools(&mut self) -> Value {
+        self.request("tools/list", Value::Null).await["result"]["tools"].clone()
+    }
+
+    /// `recall`'s structured content, or the JSON-RPC error of a refused
+    /// request.
+    async fn recall(&mut self, arguments: Value) -> Result<Value, Value> {
+        let response = self
+            .request(
+                "tools/call",
+                json!({ "name": "recall", "arguments": arguments }),
+            )
+            .await;
+        if let Some(error) = response.get("error") {
+            return Err(error.clone());
+        }
+        let result = &response["result"];
+        assert_eq!(result["isError"], false, "{}", result["content"][0]["text"]);
+        Ok(result["structuredContent"].clone())
+    }
+
+    async fn recall_ok(&mut self, arguments: Value) -> Value {
+        let context = arguments.to_string();
+        self.recall(arguments)
+            .await
+            .unwrap_or_else(|error| panic!("{context}: {error}"))
+    }
+
+    async fn close(mut self) {
+        self.writer.shutdown().await.expect("close the client side");
+        self.task
+            .await
+            .expect("the server task finishes")
+            .expect("the server ends cleanly at end of input");
+    }
+}
+
+fn warning_codes(content: &Value) -> Vec<String> {
+    content["warnings"]
+        .as_array()
+        .expect("warnings are an array")
+        .iter()
+        .map(|warning| warning["code"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one MCP session from tools/list through status
+async fn live_serve_recall_evidence_end_to_end_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let capabilities = capabilities(&database_url).await;
+    let fixture = WorkerFixture::install(&pool, "evidence-serve").await;
+    tick(&fixture, &pool, "all").await;
+    let scope = &fixture.installed.scope;
+    let (server, evidence_served) = serve_as_main(
+        &pool,
+        &pool,
+        &capabilities,
+        scope,
+        Arc::new(FarQueryEmbedder),
+    )
+    .await;
+    assert!(
+        evidence_served,
+        "a login that reads the Stage-5 tables serves evidence"
+    );
+    let mut session = McpSession::open(server);
+
+    // tools/list advertises kind=evidence beside the record-only remember.
+    let tools = session.tools().await;
+    let expected = tool_list_for_surfaces(
+        RememberSurface::RECORD_ONLY,
+        RecallSurface {
+            evidence: true,
+            ..RecallSurface::NONE
+        },
+    );
+    assert_eq!(tools, json!(expected));
+    assert_eq!(tools[1], tool_list()[1], "remember is unchanged");
+    assert!(
+        tools[0]["inputSchema"]["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("evidence"))
+    );
+
+    // Search embeds the query for the dense lane and finds the commit
+    // lexically; get returns its full text by the hit's id.
+    let found = session
+        .recall_ok(json!({ "action": "search", "kind": "evidence", "query": COMMIT_WORD }))
+        .await;
+    assert_eq!(found["tool"], "recall");
+    assert_eq!(found["data"]["absence"]["verdict"], "present");
+    assert_eq!(found["data"]["readiness"]["dense_lane"], "used");
+    assert!(
+        found["data"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["matched_by"] == "lexical"),
+        "{found}"
+    );
+    assert_eq!(found["conflict_coverage"]["status"], "not_evaluated");
+    let retrieval = &found["diagnostics"]["retrieval"];
+    assert_eq!(retrieval["tier"], "evidence");
+    assert_eq!(retrieval["lanes"], json!(["lexical", "dense"]));
+    assert!(
+        found["data"]["sources"]["active"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["connector_instance"] == GIT_INSTANCE)
+    );
+    let mut commit = None;
+    for hit in found["data"]["hits"].as_array().unwrap() {
+        let body = session
+            .recall_ok(json!({ "action": "get", "kind": "evidence", "id": hit["id"] }))
+            .await;
+        let body = &body["data"]["evidence"];
+        assert_eq!(body["id"], hit["id"]);
+        assert_eq!(
+            body["first_accepted_event_id"],
+            hit["first_accepted_event_id"]
+        );
+        if body["text"].as_str().unwrap().contains(COMMIT_WORD) {
+            commit = Some(body.clone());
+        }
+    }
+    let commit = commit.expect("a hit's full text carries the commit word");
+    assert!(!commit["media_type"].as_str().unwrap().is_empty());
+    let missing = session
+        .recall_ok(json!({ "action": "get", "kind": "evidence", "id": "42".repeat(32) }))
+        .await;
+    assert!(missing["data"]["evidence"].is_null());
+
+    // Nothing matches a nonsense query over a current, covered, fresh scope.
+    let absent = session
+        .recall_ok(json!({ "action": "search", "kind": "evidence", "query": NONSENSE, "limit": 5 }))
+        .await;
+    assert_eq!(absent["data"]["hits"], json!([]));
+    assert_eq!(absent["data"]["absence"]["verdict"], "absent", "{absent}");
+    assert!(warning_codes(&absent).is_empty(), "{absent}");
+
+    // Chunk-only filters are refused as invalid parameters.
+    let refused = session
+        .recall(json!({
+            "action": "search", "kind": "evidence", "query": COMMIT_WORD, "min_score": 0.2
+        }))
+        .await
+        .expect_err("min_score is not an evidence filter");
+    assert_eq!(refused["code"], -32602);
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("evidence search does not support"),
+        "{refused}"
+    );
+
+    // Status reports readiness and every source.
+    let status = session.recall_ok(json!({ "action": "status" })).await;
+    let evidence = &status["data"]["evidence"];
+    assert_eq!(evidence["served"], true);
+    assert_eq!(evidence["readiness"]["lexical_current"], true);
+    assert!(
+        evidence["sources"]["active"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|source| source["last_outcome"] == "ok" && source["stale"] == false),
+        "{evidence}"
+    );
+
+    // Chunk search still answers from the corpus, not the evidence tiers.
+    let chunks = session
+        .recall_ok(json!({ "action": "search", "query": COMMIT_WORD }))
+        .await;
+    assert_eq!(chunks["diagnostics"]["retrieval"]["fusion"], "rrf");
+    assert!(chunks["data"].get("absence").is_none());
+
+    // A stale source turns an empty answer unknown, and the answer says which
+    // source and why.
+    sqlx::query(
+        "UPDATE memory_worker_sources_v1 \
+         SET last_checked_at = last_checked_at - INTERVAL '2 days' \
+         WHERE tenant_id = $1 AND project = $2 AND connector_instance_id = $3",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .bind(GIT_INSTANCE)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let stale = session
+        .recall_ok(json!({ "action": "search", "kind": "evidence", "query": NONSENSE }))
+        .await;
+    assert_eq!(stale["data"]["absence"]["verdict"], "unknown");
+    assert_eq!(stale["data"]["absence"]["reasons"], json!(["source_stale"]));
+    assert_eq!(warning_codes(&stale), ["evidence_source_stale"]);
+    assert_eq!(
+        stale["warnings"][0]["connector_instances"],
+        json!([GIT_INSTANCE])
+    );
+    session.close().await;
+}
+
+#[tokio::test]
+async fn live_serve_without_grants_keeps_tools_byte_identical_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let owner = common::migrated_pool(&database_url).await;
+    let capabilities = capabilities(&database_url).await;
+    let scope = common::fresh_scope("evidence-serve-ungranted");
+    // The runtime login as it was before the Stage-5 block: the evidence
+    // and claim planes, nothing Stage-5 reads.
+    let role = RuntimeProbeRole::create_claim_writer(&owner, &database_url).await;
+    let (server, evidence_served) = serve_as_main(
+        &owner,
+        &role.pool,
+        &capabilities,
+        &scope,
+        Arc::new(StubEmbedder),
+    )
+    .await;
+    let mut session = McpSession::open(server);
+    let tools = session.tools().await;
+    let search = session
+        .recall(json!({ "action": "search", "kind": "evidence", "query": COMMIT_WORD }))
+        .await;
+    let get = session
+        .recall(json!({ "action": "get", "kind": "evidence", "id": "42".repeat(32) }))
+        .await;
+    let status = session.recall(json!({ "action": "status" })).await;
+    session.close().await;
+    role.drop_role(&owner).await;
+
+    assert!(
+        !evidence_served,
+        "a login without the Stage-5 grants serves no evidence"
+    );
+    assert_eq!(tools, json!(tool_list()));
+    assert_eq!(
+        serde_json::to_vec(&tools).unwrap(),
+        serde_json::to_vec(&tool_list()).unwrap()
+    );
+    let search = search.expect_err("kind=evidence is not served");
+    assert_eq!(
+        search["message"],
+        "recall search kind \"evidence\" is not supported; use chunk or claim"
+    );
+    let get = get.expect_err("kind=evidence is not served");
+    assert_eq!(
+        get["message"],
+        "recall get kind \"evidence\" is not supported"
+    );
+    let status = status.expect("status answers");
+    assert!(status["data"].get("evidence").is_none(), "{status}");
 }

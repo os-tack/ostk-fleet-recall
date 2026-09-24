@@ -1,0 +1,228 @@
+# ADR 0006: The Stage-5 memory worker and evidence recall
+
+- Status: accepted and implemented. `ostk-fleet-recall worker --once` runs
+  every Stage-5 connector and projector for one scope in one tick and records
+  each source's status; `ostk-fleet-recall serve` answers
+  `recall(kind="evidence")` over the projected tiers, with readiness,
+  per-source status and coverage, and an absence verdict, wherever the writer
+  login may read the Stage-5 tables.
+- Date: 2026-09-24
+- Scope: how git history, agent transcripts, and CI runs become recallable
+  evidence, what a tick records about each source, what an evidence answer
+  claims, and how `serve` exposes it. It builds on ADR 0002 (the Stage-4
+  runtime and grants) and ADR 0005 (the writer authority every event-first
+  writer runs under).
+
+## Context
+
+The connectors (git, transcript, CI), the body projector, and the lexical and
+dense projectors existed as libraries with their own tests, but nothing ran
+them together, nothing said whether a source had been read recently, and no
+agent could search what they produced. An empty search answer was therefore
+unreadable: it could mean the evidence does not exist, or that the worker
+never ran, failed, fell behind, or covered only part of a source.
+
+## D1 — One worker command, run as `fleet_runtime`, one instance per source
+
+**Decision.** `ostk-fleet-recall worker --sources <file> --once
+[--steps <groups>]` runs one tick: transcript, git, and CI ingest (provider
+material to accepted events), then bodies, lexical, and dense projection
+(accepted events to recall tiers), in that order. `--steps` is a
+comma-separated list of `all` (the default), `ingest`, `project` (bodies and
+lexical), and `embed` (dense). It connects
+as the `fleet_writer` login and so runs as `fleet_runtime`, like `serve`
+(owner decision D6); no worker role exists.
+
+- **Authority.** Every tick that ingests verifies the writer authority afresh
+  (ADR 0005) and binds each connector schema from that tick's active package;
+  every append re-reads the head in its own serializable transaction. Server
+  time comes from `statement_timestamp()`.
+- **Privileges.** Before a tick, a rolled-back probe plans an insert into each
+  table the selected steps write and a `SELECT ... FOR UPDATE` on each table
+  they lock. A missing privilege stops the run naming the table and
+  `deploy/cockroach/runtime-role-grants.sql`.
+- **Instances.** Each configured source is its own connector instance: a git
+  ref and a CI workflow each name theirs, and each transcript file gets
+  `<instance_prefix>.<sanitized stem>` (the first 16 hex characters of the
+  file name's SHA-256 when that would be empty or exceed 128 bytes). A source's coverage
+  cursors, receipts, and status row are keyed by its instance, so one source's
+  failure or lag never hides behind another's.
+- **Failure isolation.** A failed source is recorded and the tick continues;
+  the report (one JSON line on stdout) carries every step and source outcome,
+  and the exit status is 1 when any step failed.
+- **Scheduling.** There is no loop: a deployment schedules the command (cron,
+  a systemd timer, a scheduled task), one worker per `(tenant, project)` at a
+  time. The git and CI steps shell out to `git` and `gh`, which the production
+  image does not carry, so ingest runs on a host that has them and holds the
+  writer login and the content key; `--steps project,embed` also runs in the
+  container.
+
+## D2 — What each source's newest coverage cursor means
+
+**Decision.** Each connector's coverage domain is chosen so that the newest
+cursor of an instance says something checkable:
+
+- **git** observes its ref only when the ref's target differs from the
+  revision of the instance's latest receipt; one observation covers `[1, 2)`
+  of a domain whose target is `[1, 2)`, so it is complete. An unmoved ref is
+  `unchanged` and opens no new domain.
+- **transcript** drains one file's pending turns under a domain whose target
+  is `[lowest pending ordinal, next ordinal)`. A tick that stages new turns
+  opens a new domain, so the newest cursor says the newest drained slice is
+  complete, not that the whole file is; older slices keep their own cursors.
+- **CI** reads from the run after the highest measured window up to the
+  provider's settled high-water mark (the highest run below the lowest run
+  not yet completed), and the domain's target is that run range.
+
+**Unregistered labels.** Receipts name the freshness rule
+`coverage.freshness.worker_tick` and the proof method
+`coverage.proof.enumerated_snapshot`. These are compile-time labels, not
+entries of the active package: no package registers them and the coverage
+runtime does not resolve them. Registering them is deferred.
+
+## D3 — Worker source status and the staleness rule
+
+**Decision.** Migration 0030 adds `memory_worker_sources_v1`, one row per
+`(tenant_id, project, connector_instance_id)`, which the worker upserts after
+every attempt: the source kind, `state` (`active` or `retired`), the outcome
+(`ok`, `unchanged`, or `failed` with an error cut to 2048 bytes),
+`last_attempt_at`, and `last_checked_at`, which only `ok` and `unchanged` set.
+A source that has never completed a check has a null `last_checked_at`; a
+source that fails on every tick still reports. When all three ingest steps
+run, rows for instances the sources file no longer configures become
+`retired` and leave every evidence answer.
+
+A source is **stale** when `statement_timestamp() - last_checked_at` exceeds
+its `stale_after_seconds`: 86400 by default, overridable per source, bounded
+to `[60, 31536000]`. Freshness comes from this row, not from the cursor: a git
+ref that has not moved is not re-observed, but each tick that checks it
+records the check. The table is operational status, not evidence; it carries
+no foreign key and is never granted to the publication reader.
+
+## D4 — Absence is defined over the lexical tier
+
+**Decision.** Every evidence answer carries a verdict. Any hit makes it
+`present`. With no hit it is `absent` only when all of these hold, and
+`unknown` otherwise, with every reason that applies:
+
+- the query has lexical terms (`query_has_no_lexical_terms`), because the
+  verdict is a claim about the lexical tier, whose matching is exact and
+  reproducible;
+- no accepted evidence event awaits the body projector
+  (`body_projection_lag`) and no transcript turn awaits admission
+  (`ingest_outbox_pending`);
+- every body has been through the lexical projector
+  (`lexical_projection_lag`);
+- at least one source is active (`no_sources_registered`), and every active
+  source's last outcome is not `failed` (`source_failed`), its last completed
+  check exists (`source_never_checked`) and is not stale (`source_stale`), and
+  its newest coverage cursor is complete (`incomplete_coverage`);
+- the source listing (at most 256) was not cut (`listing_truncated`).
+
+The dense tier never blocks `absent`: its lag is reported, not required. The
+verdict's `as_of` is the oldest last completed check among the active
+sources. Reads run in the order that makes the verdict sound: sources, then
+readiness, then the recall lanes, so a check the listing saw committed its
+events before readiness counted them, and the lanes search a lexical tier at
+least as new as the one readiness counted.
+
+**Consequence for dense matches.** `serve` embeds every query, so the dense
+lane runs whenever it is served. A dense neighbour whose cosine similarity
+clears the chunk-recall floor (0.18) is a hit, so it makes the answer
+`present`, flagged `matched_by: "dense"` with its similarity. `absent`
+therefore also means no dense neighbour cleared the floor. How often a
+loosely related neighbour clears 0.18 depends on the model; a floor of its
+own for evidence, or a verdict over lexical hits alone, is an open
+calibration decision.
+
+## D5 — `kind=evidence` is additive, not fused into chunk RRF
+
+**Decision.** Evidence recall is a separate `kind` of the existing `recall`
+tool with its own answer shape; chunk search and its reciprocal-rank fusion
+are unchanged, and no evidence hit enters them.
+
+- **When it is served.** `serve` probes once at startup: the schema must have
+  reached migration 30 and the login must be able to `SELECT` every table
+  evidence recall reads. There is no switch. Where the probe fails (a
+  deployment without the Stage-5 grants), `tools/list`, every response, and
+  every error text stay byte for byte what they were, and
+  `recall(search|get, kind=evidence)` is refused exactly as any unsupported
+  kind is. A failing probe is logged and never stops `serve`. The publication
+  process never serves it: evidence recall reads private base tables only.
+- **What is advertised.** `tools/list` adds `evidence` to `recall`'s `kind`
+  enum, one description sentence, and a branch that allows only `search` and
+  `get` with `kind=evidence` and forbids `source`, `max_per_source_id`,
+  `min_score`, and `intent`; the server also refuses those and
+  `include_history`. The `remember` tool is unchanged.
+- **search** returns `data {hits, readiness, sources, absence}`. A hit carries
+  its 64-hex content id, the lanes that matched it and their scores, its media
+  type, a 600-character snippet of the lexical tier's redacted recall text,
+  and the accepted event that first produced it. `warnings` name projection
+  lag, pending ingest, a disabled dense lane, failed or stale sources (with
+  their instances), a cut listing, and a query the model could not embed;
+  `diagnostics.retrieval` is `{tier: "evidence", lanes, dense_lane,
+  dense_min_cosine_similarity}`; `conflict_coverage` is `not_evaluated`.
+- **get** takes a hit's id and returns `data.evidence`: the body's full recall
+  text (at most 256 KiB), its media type, visibility class, and first accepted
+  event, or `null`.
+- **status** adds `data.evidence {served, readiness, sources}` and the same
+  warnings. A failed evidence read there is a warning
+  (`evidence_status_unavailable`), never a failed status.
+
+Snippets and fetched text are the lexical tier's text, never the stored body
+bytes: that text is normalized and has every secret-shaped range replaced
+before it is written.
+
+## D6 — One embedding model per deployment
+
+**Decision.** Every dense row records the digest of the model that embedded
+it (the operator's `FLEET_RECALL_EMBEDDING_MODEL_SHA256`), and `serve` embeds
+queries with the same pinned bundle. The startup probe checks once whether the
+scope's dense tier holds a vector of any other model; if it does, the dense
+lane is off for the process (`dense_lane: "disabled_foreign_model"`, logged at
+startup and warned on every answer) and the lexical lane still serves. A
+model change therefore needs a re-embed and a `serve` restart. Evidence
+search is not gated on the chunk corpus's embedding generation, which
+concerns a different table; the probe's check is the one that matters for
+its dense lane.
+
+## D7 — UPDATE on `memory_content_objects`, for `SELECT ... FOR UPDATE`
+
+**Decision.** CockroachDB v26.2.3 requires `UPDATE` for `SELECT ... FOR
+UPDATE`. The governed content store takes that lock whenever an append
+deduplicates onto an existing content object, which the worker's transcript
+path does whenever a resumed session file repeats a turn. `fleet_runtime`
+therefore holds `UPDATE` on `memory_content_objects`, in the one Stage-5 block
+of `deploy/cockroach/runtime-role-grants.sql`. No runtime statement updates
+that table, but the grant is table-wide: a holder of the writer login could
+rewrite a content row directly. The publication role gains nothing.
+
+## D8 — Observer-run records appear as evidence
+
+**Decision.** The body projector consumes every `evidence.accepted` event in
+the scope, not only the worker's. Observer-run records (from
+`ostk-observer-run` and `ostk-spec`) are such events with version-form
+resources, so they become bodies, are indexed lexically over their raw bytes,
+and can be recalled; their media type,
+`application.ostk-observer-run-record-v1`, lets a reader tell them apart.
+`memory.claim.accepted` events are not evidence events and never reach the
+body plane.
+
+## Consequences
+
+- An agent can ask whether the fleet's own history, transcripts, or CI runs
+  mention something, and learn from the same answer whether an empty result
+  is trustworthy, and if not, which source or projection is why.
+- `absent` is a strong claim and is reported rarely: any failing, stale, or
+  never-checked source, any unprojected evidence, or a dense neighbour above
+  the floor keeps the verdict `present` or `unknown`.
+- Operators schedule the worker and watch its report and exit status; the
+  status table is what evidence recall trusts, so a worker that stops running
+  turns every empty answer `unknown` once its sources go stale.
+
+**Deferred.** An `--interval` loop and managed scheduling; `git` and `gh` in
+the production image; changed-path and incremental git scans and a git ingress
+redactor; transcript tool-use, tool-result, and thinking records;
+publication-plane evidence recall; fusing evidence into chunk recall;
+registering the coverage labels in a package; dense or semantic absence
+verdicts and an evidence-specific dense floor; query-centred snippets.
