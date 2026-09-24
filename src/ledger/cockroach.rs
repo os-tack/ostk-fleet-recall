@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use ostk_recall_core::{Chunk, ChunkEmbedder};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgPool, PgRow};
@@ -13,22 +14,28 @@ use sqlx::{Row, Transaction};
 
 use crate::ledger::types::PreparedClaim;
 use crate::ledger::{
-    Claim, ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimSupport,
-    ClaimTarget, Conflict, ConflictHistory, ConflictLifecycleRows, ConflictMutation,
+    AssertedClaimMutation, Claim, ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState,
+    ClaimSupport, ClaimTarget, Conflict, ConflictHistory, ConflictLifecycleRows, ConflictMutation,
     ConflictTarget, DismissalTerms, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
     FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2, LifecycleMutation, LifecycleReplayRequest,
     SemanticClaimHit, SupportedClaimCoordinate, SupportedClaimIds, WaiverTerms,
 };
+use crate::memory_contracts::evidence::AcceptedEventId;
+use crate::remember_runtime::{EventFirstAssert, RememberAssertInputV1, actor_for_agent};
 use crate::store::cockroach::{
     ConflictLifecycleCapability, EMBEDDING_DIMENSION, RetryPolicy, serialize_vector,
     with_serializable_retry,
 };
 use crate::{FleetError, FleetScope, Result};
 
+mod assert_store;
 mod conflict_store;
 mod lifecycle_store;
 
+use lifecycle_store::Replayable;
+
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+const RECORD_OPERATION: &str = "record";
 const MAX_LEDGER_RESULTS: usize = 100;
 const CLAIM_CANDIDATE_MULTIPLIER: usize = 8;
 const MAX_CLAIM_CANDIDATES: usize = 1_000;
@@ -317,6 +324,9 @@ pub struct CockroachClaimLedger {
     /// The deployment enabled adjudication (`dismiss` and `waive`). It takes
     /// effect only together with the conflict lifecycle capability.
     conflict_adjudication: bool,
+    /// Set only when the writer-authority pins verified at startup; without
+    /// it every assert is refused as `assert_unavailable`.
+    event_first_assert: Option<Arc<EventFirstAssert>>,
 }
 
 impl std::fmt::Debug for CockroachClaimLedger {
@@ -332,6 +342,7 @@ impl std::fmt::Debug for CockroachClaimLedger {
                 "conflict_adjudication",
                 &self.serves_conflict_adjudication(),
             )
+            .field("event_first_assert", &self.serves_event_first_assert())
             .finish_non_exhaustive()
     }
 }
@@ -363,6 +374,7 @@ impl CockroachClaimLedger {
             retry_policy,
             conflict_lifecycle: None,
             conflict_adjudication: false,
+            event_first_assert: None,
         })
     }
 
@@ -398,6 +410,48 @@ impl CockroachClaimLedger {
     #[must_use]
     pub const fn serves_conflict_adjudication(&self) -> bool {
         self.conflict_adjudication && self.conflict_lifecycle.is_some()
+    }
+
+    /// Serve `remember(action="assert")` event first through `assert`'s
+    /// writer authority.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Configuration`] when the authority is bound to another
+    /// physical tenant or project than this ledger, or asserts as another
+    /// actor than `agent.<agent>` of this ledger's trusted agent: the accepted
+    /// event and its claim projection must land in the same scope, attributed
+    /// to the same agent.
+    pub fn with_event_first_assert(mut self, assert: Arc<EventFirstAssert>) -> Result<Self> {
+        let physical = assert.authority().physical_scope();
+        if physical.tenant_id != self.trusted_scope.tenant_id
+            || physical.project != self.trusted_scope.project
+        {
+            return Err(FleetError::Configuration(
+                "the event-first assert authority is bound to another tenant or project than the \
+                 claim ledger"
+                    .into(),
+            ));
+        }
+        let actor = actor_for_agent(&self.trusted_scope.agent).map_err(|error| {
+            FleetError::Configuration(format!(
+                "the fleet agent cannot assert as a contract actor: {error}"
+            ))
+        })?;
+        if assert.actor() != &actor {
+            return Err(FleetError::Configuration(format!(
+                "the event-first assert actor `{}` is not this ledger's agent actor `{actor}`",
+                assert.actor()
+            )));
+        }
+        self.event_first_assert = Some(assert);
+        Ok(self)
+    }
+
+    /// Whether this ledger serves the event-first assert.
+    #[must_use]
+    pub const fn serves_event_first_assert(&self) -> bool {
+        self.event_first_assert.is_some()
     }
 
     fn ensure_scope(&self, scope: &FleetScope) -> Result<()> {
@@ -508,7 +562,10 @@ impl ClaimLedger for CockroachClaimLedger {
         // A non-transactional fast path avoids embedding a known replay. The
         // transaction performs the same check again, so a concurrent first
         // mutation remains at-most-once despite response loss and retries.
-        if let Some(mutation) = replayed_record(&self.pool, scope, key, &request).await? {
+        if let Some(mutation) =
+            replayed_mutation::<ClaimMutation>(&self.pool, scope, key, &request, RECORD_OPERATION)
+                .await?
+        {
             return Ok(mutation);
         }
         let passages = self.embed_claim_passages(scope, input, &prepared)?;
@@ -540,7 +597,7 @@ impl ClaimLedger for CockroachClaimLedger {
                 .fetch_optional(&mut **transaction)
                 .await?
                 {
-                    return decode_record_receipt(&row, &scope, &request);
+                    return decode_mutation_receipt(&row, &scope, &request, RECORD_OPERATION);
                 }
 
                 let reservation = sqlx::query_scalar::<_, String>(
@@ -566,7 +623,7 @@ impl ClaimLedger for CockroachClaimLedger {
                     .bind(&key)
                     .fetch_one(&mut **transaction)
                     .await?;
-                    return decode_record_receipt(&row, &scope, &request);
+                    return decode_mutation_receipt(&row, &scope, &request, RECORD_OPERATION);
                 }
 
                 require_active_model(transaction, &scope, &model).await?;
@@ -578,6 +635,7 @@ impl ClaimLedger for CockroachClaimLedger {
                     &passages,
                     &model,
                     serde_json::json!({ "idempotency_key": key }),
+                    None,
                 )
                 .await?;
                 let (conflicts_opened, conflict_detection) =
@@ -630,6 +688,23 @@ impl ClaimLedger for CockroachClaimLedger {
             })
         })
         .await
+    }
+
+    async fn assert_claim(
+        &self,
+        scope: &FleetScope,
+        input: &RememberAssertInputV1,
+        idempotency_key: &str,
+    ) -> Result<AssertedClaimMutation> {
+        assert_store::assert_claim(self, scope, input, idempotency_key).await
+    }
+
+    async fn claim_accepted_event_id(
+        &self,
+        scope: &FleetScope,
+        claim_id: i64,
+    ) -> Result<Option<AcceptedEventId>> {
+        assert_store::claim_accepted_event_id(self, scope, claim_id).await
     }
 
     async fn retract_claim(
@@ -1526,6 +1601,10 @@ async fn require_active_model(
 
 /// Insert a new `active` claim with its support rows, passage embeddings,
 /// synthetic corpus chunk, and `recorded` claim event.
+///
+/// `accepted_event_id` is the accepted event an assert projects; record and
+/// supersede pass `None`, which stores NULL as they always have.
+#[allow(clippy::too_many_arguments)] // one claim projection; every caller supplies each part
 async fn insert_claim_projection(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
@@ -1534,8 +1613,9 @@ async fn insert_claim_projection(
     passages: &[ClaimPassage],
     model: &str,
     recorded_payload: Value,
+    accepted_event_id: Option<&[u8]>,
 ) -> Result<Claim> {
-    let mut claim = insert_claim(transaction, scope, input, prepared).await?;
+    let mut claim = insert_claim(transaction, scope, input, prepared, accepted_event_id).await?;
     claim.support = insert_support(transaction, scope, claim.id, input).await?;
 
     for (passage_index, passage_text, vector) in passages {
@@ -2350,12 +2430,16 @@ fn compact_text(text: &str, max_chars: usize) -> String {
     }
 }
 
-async fn replayed_record(
+/// The committed receipt under `idempotency_key` in this tenant, if any, read
+/// outside any transaction: `Some` replays it for exactly `request` under
+/// `operation`, or is an idempotency conflict.
+async fn replayed_mutation<T: DeserializeOwned + Replayable>(
     pool: &PgPool,
     scope: &FleetScope,
     idempotency_key: &str,
     request: &Value,
-) -> Result<Option<ClaimMutation>> {
+    operation: &str,
+) -> Result<Option<T>> {
     let row = sqlx::query(
         "SELECT project, operation, request, response \
          FROM memory_mutation_receipts \
@@ -2366,30 +2450,20 @@ async fn replayed_record(
     .fetch_optional(pool)
     .await?;
     row.as_ref()
-        .map(|row| decode_record_receipt(row, scope, request))
+        .map(|row| decode_mutation_receipt(row, scope, request, operation))
         .transpose()
 }
 
-fn decode_record_receipt(
+/// Decode a committed receipt as the replay of `request` under `operation`.
+/// A receipt for another project, operation, or request is an idempotency
+/// conflict.
+fn decode_mutation_receipt<T: DeserializeOwned + Replayable>(
     row: &PgRow,
     scope: &FleetScope,
     request: &Value,
-) -> Result<ClaimMutation> {
-    let receipt_project: String = row.try_get("project")?;
-    let operation: String = row.try_get("operation")?;
-    let original_request: Value = row.try_get("request")?;
-    if receipt_project != scope.project || operation != "record" || original_request != *request {
-        return Err(FleetError::IdempotencyConflict(
-            "idempotency key was already used for a different mutation".into(),
-        ));
-    }
-    let response: Option<Value> = row.try_get("response")?;
-    let mut mutation: ClaimMutation = serde_json::from_value(response.ok_or_else(|| {
-        FleetError::Memory("committed idempotency receipt has no response".into())
-    })?)
-    .map_err(|error| FleetError::Memory(format!("decode idempotency receipt: {error}")))?;
-    mutation.idempotent_replay = true;
-    Ok(mutation)
+    operation: &str,
+) -> Result<T> {
+    lifecycle_store::decode_receipt_parts(row, scope, operation, request)
 }
 
 async fn insert_claim(
@@ -2397,12 +2471,16 @@ async fn insert_claim(
     scope: &FleetScope,
     input: &ClaimInput,
     prepared: &PreparedClaim,
+    accepted_event_id: Option<&[u8]>,
 ) -> Result<Claim> {
     let row = sqlx::query(
         "INSERT INTO memory_claims (\
              tenant_id, project, kind, claim_key, subject, predicate, value, text, polarity, \
-             state, origin, actor, confidence, valid_from, valid_to, conflict_eligible\
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', $10, $11, $12, $13, $14, $15) \
+             state, origin, actor, confidence, valid_from, valid_to, conflict_eligible, \
+             accepted_event_id\
+         ) VALUES (\
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', $10, $11, $12, $13, $14, $15, $16\
+         ) \
          RETURNING id, project, kind, claim_key, subject, predicate, value, text, polarity, \
                    state, origin, actor, confidence, valid_from, valid_to, superseded_by, \
                    revision, conflict_eligible, created_at, updated_at",
@@ -2422,6 +2500,7 @@ async fn insert_claim(
     .bind(input.valid_from)
     .bind(input.valid_to)
     .bind(prepared.conflict_eligible)
+    .bind(accepted_event_id)
     .fetch_one(&mut **transaction)
     .await?;
     decode_claim(&row)

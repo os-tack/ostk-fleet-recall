@@ -25,12 +25,13 @@ pub(crate) use lifecycle::{validate_rationale, validate_waiver_hours};
 pub use reconciliation::{
     CockroachConflictReconciliationRepository, ConflictDetectorReconciliation,
 };
+pub(crate) use repository::assert_unavailable;
 pub use repository::{ClaimLedger, SupportedClaimCoordinate, SupportedClaimIds};
 pub use types::{
-    Acknowledgement, Claim, ClaimInput, ClaimKind, ClaimMutation, ClaimState, ClaimSupport,
-    ClaimSupportInput, ClaimTarget, ClosureView, Conflict, ConflictCoverage, ConflictHistory,
-    ConflictLifecycleEvent, ConflictLifecycleOverlay, ConflictLifecycleRows, ConflictMutation,
-    ConflictReevaluation, ConflictTarget, DismissalTerms, LifecycleMutation,
-    LifecycleReplayRequest, RevisionGap, SemanticClaimHit, SupersededClaim, WaiverTerms,
-    WaiverView,
+    AcceptedEventRefV1, Acknowledgement, AssertedClaimMutation, Claim, ClaimInput, ClaimKind,
+    ClaimMutation, ClaimState, ClaimSupport, ClaimSupportInput, ClaimTarget, ClosureView, Conflict,
+    ConflictCoverage, ConflictHistory, ConflictLifecycleEvent, ConflictLifecycleOverlay,
+    ConflictLifecycleRows, ConflictMutation, ConflictReevaluation, ConflictTarget, DismissalTerms,
+    LifecycleMutation, LifecycleReplayRequest, RevisionGap, SemanticClaimHit, SupersededClaim,
+    WaiverTerms, WaiverView,
 };

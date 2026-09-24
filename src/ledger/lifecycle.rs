@@ -66,10 +66,13 @@ const V2_DETECTOR_CLASS: i64 = 2;
 const LEGACY_DETECTOR_CLASS: i64 = 1;
 const UNKNOWN_DETECTOR_CLASS: i64 = 0;
 
-/// Closed vocabulary for a refused lifecycle mutation.
+/// Closed vocabulary for a refused lifecycle or assert mutation.
 ///
 /// A refusal is decided before commit, so the whole transaction (including
-/// the idempotency reservation) rolls back and the key stays free.
+/// the idempotency reservation) rolls back and the key stays free. The
+/// `remember(action="assert")` codes, from `AssertUnavailable` on, refuse
+/// before or inside the event-first append transaction, so a refused assert
+/// writes neither its accepted event nor its claim projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefusalCode {
@@ -92,6 +95,21 @@ pub enum RefusalCode {
     BoundExceeded,
     LifecycleUnavailable,
     AdjudicationDisabled,
+    /// This writer does not serve the event-first assert: no writer-authority
+    /// pins are configured, or they did not verify at startup.
+    AssertUnavailable,
+    /// The pinned writer authority did not verify for this request.
+    WriterAuthorityUnavailable,
+    /// The active remember route did not admit the assertion; `details.reason`
+    /// names which check failed.
+    AssertionNotAdmitted,
+    /// A support evidence event ID names no accepted event in this scope.
+    SupportEventUnknown,
+    /// The active registry head moved between admission and append.
+    RegistryHeadChanged,
+    /// This exact accepted statement is already in the ledger, committed
+    /// under another idempotency key.
+    AlreadyAsserted,
 }
 
 impl RefusalCode {
@@ -117,6 +135,12 @@ impl RefusalCode {
             Self::BoundExceeded => "bound_exceeded",
             Self::LifecycleUnavailable => "lifecycle_unavailable",
             Self::AdjudicationDisabled => "adjudication_disabled",
+            Self::AssertUnavailable => "assert_unavailable",
+            Self::WriterAuthorityUnavailable => "writer_authority_unavailable",
+            Self::AssertionNotAdmitted => "assertion_not_admitted",
+            Self::SupportEventUnknown => "support_event_unknown",
+            Self::RegistryHeadChanged => "registry_head_changed",
+            Self::AlreadyAsserted => "already_asserted",
         }
     }
 }
@@ -1977,6 +2001,12 @@ mod tests {
             RefusalCode::BoundExceeded,
             RefusalCode::LifecycleUnavailable,
             RefusalCode::AdjudicationDisabled,
+            RefusalCode::AssertUnavailable,
+            RefusalCode::WriterAuthorityUnavailable,
+            RefusalCode::AssertionNotAdmitted,
+            RefusalCode::SupportEventUnknown,
+            RefusalCode::RegistryHeadChanged,
+            RefusalCode::AlreadyAsserted,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), json!(code.as_str()));
         }

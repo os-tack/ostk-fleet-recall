@@ -1,11 +1,15 @@
 use async_trait::async_trait;
+use serde_json::json;
 
 use crate::ledger::{
-    Claim, ClaimInput, ClaimMutation, ClaimState, ClaimTarget, Conflict, ConflictHistory,
-    ConflictLifecycleRows, ConflictMutation, ConflictTarget, DismissalTerms, LifecycleMutation,
-    LifecycleReplayRequest, SemanticClaimHit, WaiverTerms,
+    AssertedClaimMutation, Claim, ClaimInput, ClaimMutation, ClaimState, ClaimTarget, Conflict,
+    ConflictHistory, ConflictLifecycleRows, ConflictMutation, ConflictTarget, DismissalTerms,
+    LifecycleMutation, LifecycleRefusal, LifecycleReplayRequest, RefusalCode, SemanticClaimHit,
+    WaiverTerms,
 };
-use crate::{FleetScope, Result};
+use crate::memory_contracts::evidence::AcceptedEventId;
+use crate::remember_runtime::RememberAssertInputV1;
+use crate::{FleetError, FleetScope, Result};
 
 /// Bounded claim coordinates resolved from exact source-chunk support rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +49,38 @@ pub trait ClaimLedger: Send + Sync {
         input: &ClaimInput,
         idempotency_key: &str,
     ) -> Result<ClaimMutation>;
+
+    /// Assert through the active registry's remember route, event first.
+    ///
+    /// One serializable transaction appends the admitted
+    /// `memory.claim.accepted` event and commits, with it, the claim
+    /// projection `record` would write (plus the event's ID), the conflict
+    /// detector, the audit events, and the idempotency receipt. Every refusal
+    /// (`assert_unavailable`, `writer_authority_unavailable`,
+    /// `assertion_not_admitted`, `support_event_unknown`,
+    /// `registry_head_changed`, `already_asserted`) is a typed
+    /// [`FleetError::LifecycleRefused`] that writes nothing and leaves the
+    /// key free. A ledger that does not serve the event-first path refuses
+    /// every assert as `assert_unavailable`, which is this default.
+    async fn assert_claim(
+        &self,
+        _scope: &FleetScope,
+        _input: &RememberAssertInputV1,
+        _idempotency_key: &str,
+    ) -> Result<AssertedClaimMutation> {
+        Err(assert_unavailable())
+    }
+
+    /// The accepted event a claim was projected from, or `None` when the
+    /// claim does not exist or was written by `record`, `supersede`, or an
+    /// import that predates the event-first path.
+    async fn claim_accepted_event_id(
+        &self,
+        _scope: &FleetScope,
+        _claim_id: i64,
+    ) -> Result<Option<AcceptedEventId>> {
+        Ok(None)
+    }
 
     /// Retract a lifecycle-current operator assertion the caller authored.
     ///
@@ -225,4 +261,15 @@ pub trait ClaimLedger: Send + Sync {
         chunk_ids: &[String],
         limit: usize,
     ) -> Result<SupportedClaimIds>;
+}
+
+/// The refusal of an assert this writer does not serve.
+pub fn assert_unavailable() -> FleetError {
+    LifecycleRefusal::new(
+        RefusalCode::AssertUnavailable,
+        "this writer does not serve remember(action=\"assert\"): its writer-authority pins are \
+         not configured or did not verify at startup",
+        json!({}),
+    )
+    .into()
 }

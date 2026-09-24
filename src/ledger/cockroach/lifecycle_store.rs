@@ -669,6 +669,7 @@ async fn supersede_once(
         passages,
         model,
         json!({ "idempotency_key": key, "supersedes": predecessor.id }),
+        None,
     )
     .await?;
     let (conflicts_opened, detection) =

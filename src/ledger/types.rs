@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ledger::{canonical_json, normalize_key_part};
+use crate::memory_contracts::bootstrap::EpochId;
 use crate::memory_contracts::discrepancy::{DismissalReasonKindV1, WaiverReasonKindV1};
+use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::{FleetError, Result};
 
 // `memory_claims` are projected into `memory_chunks`, whose generated
@@ -475,6 +477,33 @@ pub struct ClaimMutation {
     /// for record and whenever no open v2 conflict was re-evaluated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reevaluation: Option<ConflictReevaluation>,
+}
+
+/// Where the accepted event an asserted claim was projected from sits in the
+/// general accepted-event ledger (`memory_evidence_events`).
+///
+/// `event_id` is the semantic accepted-event identity; the rest is the
+/// physical append position, which is never part of that identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedEventRefV1 {
+    pub event_id: AcceptedEventId,
+    pub epoch_id: EpochId,
+    pub shard: u16,
+    pub committed_offset: u64,
+}
+
+/// The committed result of `remember(action="assert")`: the claim mutation
+/// exactly as record shapes it, plus the accepted event it projects.
+///
+/// This, not [`ClaimMutation`], is the stored receipt response of an assert,
+/// so a record response or receipt never gains an `accepted_event` key and a
+/// replayed assert returns the event it committed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssertedClaimMutation {
+    #[serde(flatten)]
+    pub mutation: ClaimMutation,
+    pub accepted_event: AcceptedEventRefV1,
 }
 
 /// The predecessor claim of a committed `supersede`, as that mutation left it.
