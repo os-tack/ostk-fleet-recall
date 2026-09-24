@@ -11,11 +11,12 @@ use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Row, Transaction};
 
+use crate::ledger::types::PreparedClaim;
 use crate::ledger::{
     Claim, ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimSupport,
     ClaimTarget, Conflict, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
-    FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2, SemanticClaimHit, SupportedClaimCoordinate,
-    SupportedClaimIds,
+    FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2, LifecycleReplayRequest, SemanticClaimHit,
+    SupportedClaimCoordinate, SupportedClaimIds,
 };
 use crate::store::cockroach::{
     EMBEDDING_DIMENSION, RetryPolicy, serialize_vector, with_serializable_retry,
@@ -361,6 +362,61 @@ impl CockroachClaimLedger {
         }
         Ok(())
     }
+
+    /// Embed the passages of a claim about to be written.
+    ///
+    /// Embedding is intentionally outside the transaction. A model load or
+    /// expensive encode cannot hold SQL locks, and deterministic passages can
+    /// be safely reused if Cockroach asks us to replay the transaction.
+    fn embed_claim_passages(
+        &self,
+        scope: &FleetScope,
+        input: &ClaimInput,
+        prepared: &PreparedClaim,
+    ) -> Result<Vec<ClaimPassage>> {
+        let now = Utc::now();
+        let provisional = Claim {
+            id: 0,
+            project: scope.project.clone(),
+            kind: input.kind,
+            claim_key: prepared.claim_key.clone(),
+            subject: prepared.subject.clone(),
+            predicate: prepared.predicate.clone(),
+            value: prepared.value.clone(),
+            text: input.text.trim().to_string(),
+            polarity: input.polarity,
+            state: ClaimState::Active,
+            origin: input.origin.trim().to_string(),
+            actor: Some(scope.agent.clone()),
+            confidence: input.confidence,
+            valid_from: input.valid_from,
+            valid_to: input.valid_to,
+            superseded_by: None,
+            revision: 1,
+            conflict_eligible: prepared.conflict_eligible,
+            created_at: now,
+            updated_at: now,
+            support: Vec::new(),
+            conflict_ids: Vec::new(),
+        };
+        let passage_texts = provisional.embedding_passages();
+        let passage_refs = passage_texts.iter().map(String::as_str).collect::<Vec<_>>();
+        let vectors = self.embedder.encode_batch(&passage_refs);
+        if vectors.len() != passage_texts.len() {
+            return Err(FleetError::Memory(format!(
+                "claim embedder returned {} vectors for {} passages",
+                vectors.len(),
+                passage_texts.len()
+            )));
+        }
+        let mut passages = Vec::with_capacity(passage_texts.len());
+        for (index, (text, vector)) in passage_texts.into_iter().zip(vectors).enumerate() {
+            let passage_index = i32::try_from(index)
+                .map_err(|_| FleetError::Memory("too many claim passages".into()))?;
+            passages.push((passage_index, text, serialize_vector(&vector)?));
+        }
+        Ok(passages)
+    }
 }
 
 #[async_trait]
@@ -404,50 +460,7 @@ impl ClaimLedger for CockroachClaimLedger {
         if let Some(mutation) = replayed_record(&self.pool, scope, key, &request).await? {
             return Ok(mutation);
         }
-        // Embedding is intentionally outside the transaction. A model load or
-        // expensive encode cannot hold SQL locks, and deterministic passages
-        // can be safely reused if Cockroach asks us to replay the transaction.
-        let now = Utc::now();
-        let provisional = Claim {
-            id: 0,
-            project: scope.project.clone(),
-            kind: input.kind,
-            claim_key: prepared.claim_key.clone(),
-            subject: prepared.subject.clone(),
-            predicate: prepared.predicate.clone(),
-            value: prepared.value.clone(),
-            text: input.text.trim().to_string(),
-            polarity: input.polarity,
-            state: ClaimState::Active,
-            origin: input.origin.trim().to_string(),
-            actor: Some(scope.agent.clone()),
-            confidence: input.confidence,
-            valid_from: input.valid_from,
-            valid_to: input.valid_to,
-            superseded_by: None,
-            revision: 1,
-            conflict_eligible: prepared.conflict_eligible,
-            created_at: now,
-            updated_at: now,
-            support: Vec::new(),
-            conflict_ids: Vec::new(),
-        };
-        let passage_texts = provisional.embedding_passages();
-        let passage_refs = passage_texts.iter().map(String::as_str).collect::<Vec<_>>();
-        let vectors = self.embedder.encode_batch(&passage_refs);
-        if vectors.len() != passage_texts.len() {
-            return Err(FleetError::Memory(format!(
-                "claim embedder returned {} vectors for {} passages",
-                vectors.len(),
-                passage_texts.len()
-            )));
-        }
-        let mut passages = Vec::with_capacity(passage_texts.len());
-        for (index, (text, vector)) in passage_texts.into_iter().zip(vectors).enumerate() {
-            let passage_index = i32::try_from(index)
-                .map_err(|_| FleetError::Memory("too many claim passages".into()))?;
-            passages.push((passage_index, text, serialize_vector(&vector)?));
-        }
+        let passages = self.embed_claim_passages(scope, input, &prepared)?;
 
         let scope = scope.clone();
         let input = input.clone();
@@ -505,243 +518,35 @@ impl ClaimLedger for CockroachClaimLedger {
                     return decode_record_receipt(&row, &scope, &request);
                 }
 
-                // Deployment bootstrap owns model registration. Steady-state
-                // fleet mutations only read and compare this immutable project
-                // coordinate, avoiding a shared-row INSERT/ON CONFLICT write on
-                // every remember call.
-                let active_model: Option<String> = sqlx::query_scalar(
-                    "SELECT embedding_model FROM memory_corpus_models \
-                     WHERE tenant_id = $1 AND project = $2",
+                require_active_model(transaction, &scope, &model).await?;
+                let mut claim = insert_claim_projection(
+                    transaction,
+                    &scope,
+                    &input,
+                    &prepared,
+                    &passages,
+                    &model,
+                    serde_json::json!({ "idempotency_key": key }),
                 )
-                .bind(scope.tenant_id)
-                .bind(&scope.project)
-                .fetch_optional(&mut **transaction)
                 .await?;
-                let active_model = active_model.ok_or_else(|| {
-                    FleetError::Configuration(
-                        "active embedding generation is not initialized; run deployment bootstrap"
-                            .into(),
-                    )
-                })?;
-                if active_model != model {
-                    return Err(protocol_error(format!(
-                        "claim embedding model '{model}' does not match active corpus model '{active_model}'"
-                    )));
-                }
-
-                let mut claim = insert_claim(transaction, &scope, &input, &prepared).await?;
-                claim.support = insert_support(transaction, &scope, claim.id, &input).await?;
-
-                for (passage_index, passage_text, vector) in &passages {
-                    sqlx::query(
-                        "INSERT INTO memory_claim_embeddings (\
-                             tenant_id, project, claim_id, passage_index, passage_text, model, vector\
-                         ) VALUES ($1, $2, $3, $4, $5, $6, $7::VECTOR(512))",
-                    )
-                    .bind(scope.tenant_id)
-                    .bind(&scope.project)
-                    .bind(claim.id)
-                    .bind(passage_index)
-                    .bind(passage_text)
-                    .bind(&model)
-                    .bind(vector)
-                    .execute(&mut **transaction)
-                    .await?;
-                }
-
-                // Project the authoritative claim into the active corpus in
-                // the same transaction. Default recall(search) can therefore
-                // find deliberate memory through both lexical and vector
-                // lanes without a claim-specific caller hint.
-                let (_, primary_passage, primary_vector) = passages
-                    .first()
-                    .ok_or_else(|| protocol_error("claim produced no embedding passages"))?;
-                let chunk_id = format!("claim:{}", claim.id);
-                let source_id = format!("claim/{}", claim.id);
-                let content_hash = hex::encode(Sha256::digest(claim.text.as_bytes()));
-                let embedding_hash = Chunk::embedding_input_hash(&model, "", primary_passage);
-                sqlx::query(
-                    "INSERT INTO memory_chunks (\
-                         tenant_id, project, chunk_id, source, source_id, source_config_id, \
-                         chunk_index, source_timestamp, text, content_sha256, \
-                         embedding_input_sha256, embedding_model, embedding, facets, links, extra\
-                     ) VALUES (\
-                         $1, $2, $3, 'ostk_memory', $4, 'synthetic:claim', 0, now(), $5, $6, \
-                         $7, $8, $9::VECTOR(512), $10, '{}'::JSONB, $11\
-                     ) ON CONFLICT (tenant_id, project, chunk_id) DO UPDATE SET \
-                         text = excluded.text, content_sha256 = excluded.content_sha256, \
-                         embedding_input_sha256 = excluded.embedding_input_sha256, \
-                         embedding_model = excluded.embedding_model, embedding = excluded.embedding, \
-                         facets = excluded.facets, extra = excluded.extra, updated_at = now()",
-                )
-                .bind(scope.tenant_id)
-                .bind(&scope.project)
-                .bind(&chunk_id)
-                .bind(&source_id)
-                .bind(&claim.text)
-                .bind(content_hash)
-                .bind(embedding_hash)
-                .bind(&model)
-                .bind(primary_vector)
-                .bind(serde_json::json!({
-                    "project": [scope.project.clone()],
-                    "record_kind": [claim.kind.as_str()],
-                }))
-                .bind(serde_json::json!({ "claim_id": claim.id, "claim_key": claim.claim_key }))
-                .execute(&mut **transaction)
-                .await?;
-
-                // The claim is born active. If conflict detection below
-                // changes it to disputed, a separate transition event records
-                // that lifecycle edge rather than folding it into creation.
-                sqlx::query(
-                    "INSERT INTO memory_claim_events (\
-                         tenant_id, project, claim_id, event_kind, actor, to_state, payload\
-                     ) VALUES ($1, $2, $3, 'recorded', $4, 'active', $5)",
-                )
-                .bind(scope.tenant_id)
-                .bind(&scope.project)
-                .bind(claim.id)
-                .bind(&scope.agent)
-                .bind(serde_json::json!({ "idempotency_key": key }))
-                .execute(&mut **transaction)
-                .await?;
-
-                let mut conflicts_opened = Vec::new();
-                let conflict_detection = if let (true, Some(claim_key), Some(value)) = (
-                    prepared.conflict_eligible,
-                    prepared.claim_key.as_deref(),
-                    prepared.value.as_ref(),
-                ) {
-                    require_current_conflict_detector(transaction, &scope, claim_key).await?;
-                    let comparison_bound = i64::try_from(
-                        MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON,
-                    )
-                    .map_err(|_| protocol_error("conflict mutation bound is outside INT8 range"))?;
-                    let candidate_rows = sqlx::query_as::<_, (i64, bool, i64)>(
-                        INCOMPATIBLE_CURRENT_CLAIMS_SQL,
-                    )
-                    .bind(scope.tenant_id)
-                    .bind(&scope.project)
-                    .bind(claim.id)
-                    .bind(claim_key)
-                    .bind(value)
-                    .bind(input.polarity)
-                    .bind(input.valid_from)
-                    .bind(input.valid_to)
-                    .bind(comparison_bound + 1)
-                    .fetch_all(&mut **transaction)
-                    .await?;
-
-                    let candidate_count = candidate_rows.first().map_or(0, |row| row.2);
-                    if candidate_count > comparison_bound {
-                        return Err(FleetError::Memory(format!(
-                            "same-key comparison exceeds the bounded mutation limit of {MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON} lifecycle-current claims"
-                        )));
-                    }
-                    if candidate_rows
-                        .iter()
-                        .any(|row| row.2 != candidate_count)
-                    {
-                        return Err(protocol_error(
-                            "same-key comparison returned an inconsistent candidate count",
-                        ));
-                    }
-                    let mut incompatible_ids = candidate_rows
-                        .iter()
-                        .filter_map(|(id, incompatible, _)| incompatible.then_some(id))
-                        .copied()
-                        .collect::<Vec<_>>();
-                    incompatible_ids.sort_unstable();
-                    incompatible_ids.dedup();
-
-                    let mut detected_conflict_id = None;
-
-                    if !incompatible_ids.is_empty() {
-                        let observation =
-                            observe_conflict(transaction, &scope, claim_key).await?;
-                        let conflict_id = observation.id;
-                        detected_conflict_id = Some(conflict_id);
-
-                        let mut member_ids = incompatible_ids.clone();
-                        member_ids.push(claim.id);
-                        member_ids.sort_unstable();
-                        member_ids.dedup();
-                        for member_id in &member_ids {
-                            sqlx::query(
-                                "INSERT INTO memory_conflict_members (\
-                                     tenant_id, project, conflict_id, claim_id\
-                                 ) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
-                            )
-                            .bind(scope.tenant_id)
-                            .bind(&scope.project)
-                            .bind(conflict_id)
-                            .bind(member_id)
-                            .execute(&mut **transaction)
-                            .await?;
-                        }
-                        let transitioned_ids = sqlx::query_scalar::<_, i64>(
-                            "UPDATE memory_claims SET state = 'disputed', revision = revision + 1, \
-                                 updated_at = now() \
-                             WHERE tenant_id = $1 AND project = $2 AND id = ANY($3) \
-                               AND state = 'active' \
-                             RETURNING id",
-                        )
-                        .bind(scope.tenant_id)
-                        .bind(&scope.project)
-                        .bind(&member_ids)
-                        .fetch_all(&mut **transaction)
-                        .await?;
-
-                        for transitioned_id in &transitioned_ids {
-                            insert_disputed_transition_event(
-                                transaction,
-                                &scope,
-                                *transitioned_id,
-                                conflict_id,
-                            )
-                            .await?;
-                        }
-                        if transitioned_ids.contains(&claim.id) {
-                            claim.state = ClaimState::Disputed;
-                            claim.revision += 1;
-                        }
-                        claim.conflict_ids.push(conflict_id);
-                        if observation.opened {
-                            conflicts_opened.push(conflict_id);
-                        }
-                    }
-                    Some(complete_conflict_detection_audit(
-                        detected_conflict_id,
-                        incompatible_ids,
-                        candidate_count,
-                    ))
-                } else {
-                    None
-                };
+                let (conflicts_opened, conflict_detection) =
+                    detect_and_observe(transaction, &scope, &mut claim, &input, &prepared).await?;
 
                 let event_payload =
                     claim_recorded_event_payload(claim.claim_key.as_deref(), conflict_detection);
-
-                sqlx::query(
-                    "INSERT INTO memory_events (\
-                         tenant_id, project, agent, session_id, event_kind, entity_kind, \
-                         entity_id, idempotency_key, payload\
-                     ) VALUES ($1, $2, $3, $4, 'claim_recorded', 'claim', $5, $6, $7)",
+                insert_claim_recorded_event(
+                    transaction,
+                    &scope,
+                    claim.id,
+                    Some(&key),
+                    event_payload,
                 )
-                .bind(scope.tenant_id)
-                .bind(&scope.project)
-                .bind(&scope.agent)
-                .bind(&scope.session_id)
-                .bind(claim.id.to_string())
-                .bind(&key)
-                .bind(event_payload)
-                .execute(&mut **transaction)
                 .await?;
 
                 let mutation = ClaimMutation {
                     operation: "record".into(),
                     claim,
+                    superseded: None,
                     idempotent_replay: false,
                     conflicts_opened,
                     conflicts_resolved: Vec::new(),
@@ -786,13 +591,25 @@ impl ClaimLedger for CockroachClaimLedger {
         lifecycle_store::retract_claim(self, scope, target, reason, idempotency_key).await
     }
 
+    async fn supersede_claim(
+        &self,
+        scope: &FleetScope,
+        target: ClaimTarget,
+        reason: Option<&str>,
+        successor: &ClaimInput,
+        idempotency_key: &str,
+    ) -> Result<ClaimMutation> {
+        lifecycle_store::supersede_claim(self, scope, target, reason, successor, idempotency_key)
+            .await
+    }
+
     async fn replay_unserved_lifecycle(
         &self,
         scope: &FleetScope,
         idempotency_key: &str,
-        retract: Option<(ClaimTarget, Option<&str>)>,
+        request: Option<LifecycleReplayRequest<'_>>,
     ) -> Result<Option<ClaimMutation>> {
-        lifecycle_store::replay_unserved_lifecycle(self, scope, idempotency_key, retract).await
+        lifecycle_store::replay_unserved_lifecycle(self, scope, idempotency_key, request).await
     }
 
     async fn get_conflicts(
@@ -1559,6 +1376,274 @@ async fn require_current_conflict_detector(
     Ok(())
 }
 
+/// One embedded claim passage: `(passage_index, passage_text, serialized vector)`.
+type ClaimPassage = (i32, String, String);
+
+/// Deployment bootstrap owns model registration. Steady-state fleet mutations
+/// only read and compare this immutable project coordinate, avoiding a
+/// shared-row INSERT/ON CONFLICT write on every remember call.
+async fn require_active_model(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    model: &str,
+) -> Result<()> {
+    let active_model: Option<String> = sqlx::query_scalar(
+        "SELECT embedding_model FROM memory_corpus_models \
+         WHERE tenant_id = $1 AND project = $2",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let active_model = active_model.ok_or_else(|| {
+        FleetError::Configuration(
+            "active embedding generation is not initialized; run deployment bootstrap".into(),
+        )
+    })?;
+    if active_model != model {
+        return Err(protocol_error(format!(
+            "claim embedding model '{model}' does not match active corpus model '{active_model}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Insert a new `active` claim with its support rows, passage embeddings,
+/// synthetic corpus chunk, and `recorded` claim event.
+async fn insert_claim_projection(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    input: &ClaimInput,
+    prepared: &PreparedClaim,
+    passages: &[ClaimPassage],
+    model: &str,
+    recorded_payload: Value,
+) -> Result<Claim> {
+    let mut claim = insert_claim(transaction, scope, input, prepared).await?;
+    claim.support = insert_support(transaction, scope, claim.id, input).await?;
+
+    for (passage_index, passage_text, vector) in passages {
+        sqlx::query(
+            "INSERT INTO memory_claim_embeddings (\
+                 tenant_id, project, claim_id, passage_index, passage_text, model, vector\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7::VECTOR(512))",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(claim.id)
+        .bind(passage_index)
+        .bind(passage_text)
+        .bind(model)
+        .bind(vector)
+        .execute(&mut **transaction)
+        .await?;
+    }
+
+    // Project the authoritative claim into the active corpus in the same
+    // transaction. Default recall(search) can therefore find deliberate memory
+    // through both lexical and vector lanes without a claim-specific caller
+    // hint.
+    let (_, primary_passage, primary_vector) = passages
+        .first()
+        .ok_or_else(|| protocol_error("claim produced no embedding passages"))?;
+    let chunk_id = format!("claim:{}", claim.id);
+    let source_id = format!("claim/{}", claim.id);
+    let content_hash = hex::encode(Sha256::digest(claim.text.as_bytes()));
+    let embedding_hash = Chunk::embedding_input_hash(model, "", primary_passage);
+    sqlx::query(
+        "INSERT INTO memory_chunks (\
+             tenant_id, project, chunk_id, source, source_id, source_config_id, \
+             chunk_index, source_timestamp, text, content_sha256, \
+             embedding_input_sha256, embedding_model, embedding, facets, links, extra\
+         ) VALUES (\
+             $1, $2, $3, 'ostk_memory', $4, 'synthetic:claim', 0, now(), $5, $6, \
+             $7, $8, $9::VECTOR(512), $10, '{}'::JSONB, $11\
+         ) ON CONFLICT (tenant_id, project, chunk_id) DO UPDATE SET \
+             text = excluded.text, content_sha256 = excluded.content_sha256, \
+             embedding_input_sha256 = excluded.embedding_input_sha256, \
+             embedding_model = excluded.embedding_model, embedding = excluded.embedding, \
+             facets = excluded.facets, extra = excluded.extra, updated_at = now()",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .bind(&chunk_id)
+    .bind(&source_id)
+    .bind(&claim.text)
+    .bind(content_hash)
+    .bind(embedding_hash)
+    .bind(model)
+    .bind(primary_vector)
+    .bind(serde_json::json!({
+        "project": [scope.project.clone()],
+        "record_kind": [claim.kind.as_str()],
+    }))
+    .bind(serde_json::json!({ "claim_id": claim.id, "claim_key": claim.claim_key }))
+    .execute(&mut **transaction)
+    .await?;
+
+    // The claim is born active. If conflict detection later changes it to
+    // disputed, a separate transition event records that lifecycle edge
+    // rather than folding it into creation.
+    sqlx::query(
+        "INSERT INTO memory_claim_events (\
+             tenant_id, project, claim_id, event_kind, actor, to_state, payload\
+         ) VALUES ($1, $2, $3, 'recorded', $4, 'active', $5)",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .bind(claim.id)
+    .bind(&scope.agent)
+    .bind(recorded_payload)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(claim)
+}
+
+/// Run the functional-value detector for a claim just inserted in this
+/// transaction: compare it with the key's other lifecycle-current claims, and
+/// open, reopen, or join the key's v2 conflict when an incompatible pair
+/// exists, disputing every member. Returns the conflicts this call opened or
+/// reopened and the audit for its `claim_recorded` event (`None` when the
+/// claim is not conflict-eligible).
+#[allow(clippy::too_many_lines)] // the detector's bounded compare-and-join is one unit
+async fn detect_and_observe(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    claim: &mut Claim,
+    input: &ClaimInput,
+    prepared: &PreparedClaim,
+) -> Result<(Vec<i64>, Option<ConflictDetectionAudit>)> {
+    let mut conflicts_opened = Vec::new();
+    let conflict_detection = if let (true, Some(claim_key), Some(value)) = (
+        prepared.conflict_eligible,
+        prepared.claim_key.as_deref(),
+        prepared.value.as_ref(),
+    ) {
+        require_current_conflict_detector(transaction, scope, claim_key).await?;
+        let comparison_bound = i64::try_from(MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON)
+            .map_err(|_| protocol_error("conflict mutation bound is outside INT8 range"))?;
+        let candidate_rows = sqlx::query_as::<_, (i64, bool, i64)>(INCOMPATIBLE_CURRENT_CLAIMS_SQL)
+            .bind(scope.tenant_id)
+            .bind(&scope.project)
+            .bind(claim.id)
+            .bind(claim_key)
+            .bind(value)
+            .bind(input.polarity)
+            .bind(input.valid_from)
+            .bind(input.valid_to)
+            .bind(comparison_bound + 1)
+            .fetch_all(&mut **transaction)
+            .await?;
+
+        let candidate_count = candidate_rows.first().map_or(0, |row| row.2);
+        if candidate_count > comparison_bound {
+            return Err(FleetError::Memory(format!(
+                "same-key comparison exceeds the bounded mutation limit of {MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON} lifecycle-current claims"
+            )));
+        }
+        if candidate_rows.iter().any(|row| row.2 != candidate_count) {
+            return Err(protocol_error(
+                "same-key comparison returned an inconsistent candidate count",
+            ));
+        }
+        let mut incompatible_ids = candidate_rows
+            .iter()
+            .filter_map(|(id, incompatible, _)| incompatible.then_some(id))
+            .copied()
+            .collect::<Vec<_>>();
+        incompatible_ids.sort_unstable();
+        incompatible_ids.dedup();
+
+        let mut detected_conflict_id = None;
+
+        if !incompatible_ids.is_empty() {
+            let observation = observe_conflict(transaction, scope, claim_key).await?;
+            let conflict_id = observation.id;
+            detected_conflict_id = Some(conflict_id);
+
+            let mut member_ids = incompatible_ids.clone();
+            member_ids.push(claim.id);
+            member_ids.sort_unstable();
+            member_ids.dedup();
+            for member_id in &member_ids {
+                sqlx::query(
+                    "INSERT INTO memory_conflict_members (\
+                         tenant_id, project, conflict_id, claim_id\
+                     ) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                )
+                .bind(scope.tenant_id)
+                .bind(&scope.project)
+                .bind(conflict_id)
+                .bind(member_id)
+                .execute(&mut **transaction)
+                .await?;
+            }
+            let transitioned_ids = sqlx::query_scalar::<_, i64>(
+                "UPDATE memory_claims SET state = 'disputed', revision = revision + 1, \
+                     updated_at = now() \
+                 WHERE tenant_id = $1 AND project = $2 AND id = ANY($3) \
+                   AND state = 'active' \
+                 RETURNING id",
+            )
+            .bind(scope.tenant_id)
+            .bind(&scope.project)
+            .bind(&member_ids)
+            .fetch_all(&mut **transaction)
+            .await?;
+
+            for transitioned_id in &transitioned_ids {
+                insert_disputed_transition_event(transaction, scope, *transitioned_id, conflict_id)
+                    .await?;
+            }
+            if transitioned_ids.contains(&claim.id) {
+                claim.state = ClaimState::Disputed;
+                claim.revision += 1;
+            }
+            claim.conflict_ids.push(conflict_id);
+            if observation.opened {
+                conflicts_opened.push(conflict_id);
+            }
+        }
+        Some(complete_conflict_detection_audit(
+            detected_conflict_id,
+            incompatible_ids,
+            candidate_count,
+        ))
+    } else {
+        None
+    };
+    Ok((conflicts_opened, conflict_detection))
+}
+
+/// The `claim_recorded` audit event of a newly inserted claim. Record keys it
+/// with the request's idempotency key; a successor written by another
+/// mutation leaves it unkeyed, because that mutation writes its own keyed
+/// event.
+async fn insert_claim_recorded_event(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    claim_id: i64,
+    idempotency_key: Option<&str>,
+    payload: Value,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO memory_events (\
+             tenant_id, project, agent, session_id, event_kind, entity_kind, \
+             entity_id, idempotency_key, payload\
+         ) VALUES ($1, $2, $3, $4, 'claim_recorded', 'claim', $5, $6, $7)",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .bind(&scope.agent)
+    .bind(&scope.session_id)
+    .bind(claim_id.to_string())
+    .bind(idempotency_key)
+    .bind(payload)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 async fn observe_conflict(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
@@ -2195,7 +2280,7 @@ async fn insert_claim(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     input: &ClaimInput,
-    prepared: &crate::ledger::types::PreparedClaim,
+    prepared: &PreparedClaim,
 ) -> Result<Claim> {
     let row = sqlx::query(
         "INSERT INTO memory_claims (\

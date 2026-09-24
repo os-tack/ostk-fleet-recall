@@ -260,7 +260,7 @@ pub type ServiceResult<T> = std::result::Result<T, ServiceError>;
 /// byte-for-byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct RememberSurface {
-    /// Owner retirement of authored claims (`retract`).
+    /// Owner lifecycle of authored claims (`retract` and `supersede`).
     pub claim_lifecycle: bool,
 }
 
@@ -275,7 +275,7 @@ impl RememberSurface {
     pub const fn allows(self, action: RememberAction) -> bool {
         match action {
             RememberAction::Record => true,
-            RememberAction::Retract => self.claim_lifecycle,
+            RememberAction::Retract | RememberAction::Supersede => self.claim_lifecycle,
             _ => false,
         }
     }
@@ -413,8 +413,8 @@ mod tests {
             claim_lifecycle: true,
         };
         assert!(authorize_surface(lifecycle, RememberAction::Retract).is_ok());
-        // Supersede and resolve are not served by this surface yet.
-        assert!(authorize_surface(lifecycle, RememberAction::Supersede).is_err());
+        assert!(authorize_surface(lifecycle, RememberAction::Supersede).is_ok());
+        // Conflict resolve is not served by this surface yet.
         assert!(authorize_surface(lifecycle, RememberAction::Resolve).is_err());
         // Record and non-lifecycle actions keep their own dispatch outcome.
         for surface in [RememberSurface::RECORD_ONLY, lifecycle] {

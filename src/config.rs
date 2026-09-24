@@ -684,8 +684,9 @@ impl WriterAuthorityConfig {
 /// Deployment switches for the serving claim/conflict lifecycle (ADR 0004).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LifecycleConfig {
-    /// Serve owner retirement of authored claims (`remember(retract)`) and
-    /// hide retired claims' synthetic chunks from private search.
+    /// Serve the owner lifecycle of authored claims (`remember(retract)` and
+    /// `remember(supersede)`) and hide retired claims' synthetic chunks from
+    /// private search.
     /// `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` restores the record-only
     /// surface and its byte-identical `tools/list`.
     pub remember_lifecycle: bool,

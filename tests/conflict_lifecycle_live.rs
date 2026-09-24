@@ -1,6 +1,7 @@
-//! Connected proof for the serving claim lifecycle (ADR 0004, slice 1):
-//! owner `retract`, detector-verified conflict close with member restore,
-//! conflict lookup by id, and private search hiding retired claim chunks.
+//! Connected proof for the serving claim lifecycle (ADR 0004, slices 1 and 2):
+//! owner `retract` and `supersede`, detector-verified conflict close with
+//! member restore, conflict lookup by id, and private search hiding retired
+//! claim chunks.
 //!
 //! Set `FLEET_RECALL_TEST_DATABASE_URL` to a disposable `CockroachDB` 26.2
 //! database; every test is inert otherwise. Each test migrates, works in a
@@ -13,6 +14,7 @@ use ostk_fleet_recall::application::LifecycleServing;
 use ostk_fleet_recall::ledger::{
     ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget,
     CockroachClaimLedger, CockroachConflictReconciliationRepository, LifecycleRefusal, RefusalCode,
+    SupersededClaim,
 };
 use ostk_fleet_recall::service::{
     FleetMemoryService, RecallAction, RecallRequest, RecallResult, RememberAction, RememberRequest,
@@ -222,6 +224,50 @@ impl Fleet {
                 &self.key(key),
             )
             .await
+    }
+
+    async fn supersede(
+        &self,
+        agent: &str,
+        claim_id: i64,
+        expected_revision: i64,
+        successor: &ClaimInput,
+        key: &str,
+    ) -> ostk_fleet_recall::Result<ClaimMutation> {
+        self.ledger(agent)
+            .supersede_claim(
+                &self.scope(agent),
+                ClaimTarget {
+                    claim_id,
+                    expected_revision,
+                },
+                None,
+                successor,
+                &self.key(key),
+            )
+            .await
+    }
+
+    /// Every claim row in the tenant, so a refusal can prove it wrote none.
+    async fn tenant_claim_count(&self) -> i64 {
+        sqlx::query_scalar("SELECT count(*)::INT8 FROM memory_claims WHERE tenant_id = $1")
+            .bind(self.tenant)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn superseded_by(&self, claim_id: i64) -> Option<i64> {
+        sqlx::query_scalar(
+            "SELECT superseded_by FROM memory_claims \
+             WHERE tenant_id = $1 AND project = $2 AND id = $3",
+        )
+        .bind(self.tenant)
+        .bind(&self.project)
+        .bind(claim_id)
+        .fetch_one(self.pool())
+        .await
+        .unwrap()
     }
 
     async fn claim(&self, claim_id: i64) -> ostk_fleet_recall::ledger::Claim {
@@ -485,6 +531,31 @@ impl Fleet {
         assert!(
             bad_receipts.is_empty(),
             "receipts without a response or exactly one keyed event: {bad_receipts:?}"
+        );
+
+        // A superseded claim, and only a superseded claim, names its
+        // successor, which its author wrote on the same kind, key, and
+        // detector eligibility.
+        let broken_links: Vec<i64> = sqlx::query_scalar(
+            "SELECT p.id FROM memory_claims AS p \
+             LEFT JOIN memory_claims AS s \
+               ON s.tenant_id = p.tenant_id AND s.project = p.project AND s.id = p.superseded_by \
+             WHERE p.tenant_id = $1 AND p.project = $2 \
+               AND ((p.state = 'superseded') <> (p.superseded_by IS NOT NULL) \
+                    OR (p.superseded_by IS NOT NULL AND (s.id IS NULL OR s.id <= p.id \
+                        OR s.kind <> p.kind \
+                        OR s.claim_key IS DISTINCT FROM p.claim_key \
+                        OR s.conflict_eligible <> p.conflict_eligible \
+                        OR s.actor IS DISTINCT FROM p.actor)))",
+        )
+        .bind(self.tenant)
+        .bind(&self.project)
+        .fetch_all(self.pool())
+        .await
+        .unwrap();
+        assert!(
+            broken_links.is_empty(),
+            "superseded claims without a same-shape successor: {broken_links:?}"
         );
     }
 
@@ -1536,6 +1607,7 @@ fn probe_database_url(database_url: &str, role: &str, password: &str) -> String 
     url.to_string()
 }
 
+#[allow(clippy::too_many_lines)] // grants, then every lifecycle write under exactly them
 async fn run_probe_role(fleet: &Fleet, probe_url: &str, role: &str) -> Result<(), String> {
     for (privilege, tables) in RUNTIME_GRANTS {
         sqlx::query(&format!(
@@ -1620,6 +1692,33 @@ async fn run_probe_role(fleet: &Fleet, probe_url: &str, role: &str) -> Result<()
                 "probe read the wrong conflict state: {conflicts:?}"
             ));
         }
+        // Supersede writes the successor and links the predecessor to it
+        // through the self-referencing foreign key, with the same grants.
+        let restored = ledger(AGENT_B)
+            .get_claim(&fleet.scope(AGENT_B), y.claim.id)
+            .await
+            .map_err(|error| format!("probe claim read: {error}"))?
+            .ok_or("probe could not read the restored claim")?;
+        let superseded = ledger(AGENT_B)
+            .supersede_claim(
+                &fleet.scope(AGENT_B),
+                ClaimTarget {
+                    claim_id: y.claim.id,
+                    expected_revision: restored.revision,
+                },
+                Some("probe supersede"),
+                &decision("grant-probe", &json!("z"), 1),
+                &fleet.key("probe/supersede"),
+            )
+            .await
+            .map_err(|error| format!("probe supersede: {error}"))?;
+        if superseded
+            .superseded
+            .map(|predecessor| predecessor.superseded_by)
+            != Some(superseded.claim.id)
+        {
+            return Err(format!("probe supersede did not link: {superseded:?}"));
+        }
         Ok(())
     }
     .await;
@@ -1628,7 +1727,7 @@ async fn run_probe_role(fleet: &Fleet, probe_url: &str, role: &str) -> Result<()
 }
 
 #[tokio::test]
-async fn live_runtime_grant_probe_role_can_retract_when_configured() {
+async fn live_runtime_grant_probe_role_can_retract_and_supersede_when_configured() {
     let Some(database_url) = database_url() else {
         return;
     };
@@ -1907,5 +2006,761 @@ async fn live_get_conflict_returns_any_state_when_configured() {
     assert!(ledger.get_conflicts(&scope, &too_many).await.is_err());
     assert!(ledger.claim_states(&scope, &too_many).await.is_err());
 
+    fleet.cleanup().await;
+}
+
+/// `remember(supersede)` arguments: the successor's claim fields beside the
+/// predecessor target, as an MCP client sends them.
+fn supersede_request(
+    key: String,
+    claim_id: i64,
+    expected_revision: i64,
+    successor: &ClaimInput,
+) -> RememberRequest {
+    let mut arguments = serde_json::to_value(successor)
+        .unwrap()
+        .as_object()
+        .cloned()
+        .unwrap();
+    arguments.insert("claim_id".into(), json!(claim_id));
+    arguments.insert("expected_revision".into(), json!(expected_revision));
+    RememberRequest::new(RememberAction::Supersede, Some(key), arguments)
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one concession proves rows, events, replay, and search
+async fn live_supersede_to_compatible_value_resolves_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "supersede-close").await;
+    let scope = fleet.scope(AGENT_A);
+    let private = fleet.service(AGENT_A, PRIVATE_WRITER);
+    let x = fleet
+        .record(AGENT_A, &decision("supersede-close", &json!("x"), 1), "a/x")
+        .await;
+    let y = fleet
+        .record(AGENT_B, &decision("supersede-close", &json!("y"), 1), "b/y")
+        .await;
+    let conflict_id = y.claim.conflict_ids[0];
+    let before = fleet.conflict(conflict_id).await;
+    let x_before = fleet.claim(x.claim.id).await;
+    assert_eq!(x_before.state, ClaimState::Disputed);
+
+    // A concedes: its successor states y, on the same key spelled differently.
+    let mut successor = decision("  Supersede   Close ", &json!("y"), 1);
+    successor.text = "lifecycle fixture concedes y after review".into();
+    let request = || {
+        supersede_request(
+            fleet.key("a/supersede"),
+            x.claim.id,
+            x_before.revision,
+            &successor,
+        )
+    };
+    let committed = FleetMemoryService::remember(&private, scope.clone(), request())
+        .await
+        .expect("an owner supersede commits");
+    let mutation: ClaimMutation = serde_json::from_value(committed.data.clone()).unwrap();
+    assert_eq!(mutation.operation, "supersede");
+    assert!(!mutation.idempotent_replay);
+    let successor_id = mutation.claim.id;
+    assert!(successor_id > y.claim.id);
+    assert_eq!(mutation.claim.state, ClaimState::Active);
+    assert_eq!(mutation.claim.revision, 1);
+    assert_eq!(mutation.claim.claim_key, x.claim.claim_key);
+    assert_eq!(mutation.claim.actor.as_deref(), Some(AGENT_A));
+    assert_eq!(mutation.claim.value, Some(json!("y")));
+    assert!(
+        mutation.claim.conflict_ids.is_empty(),
+        "a compatible successor never joins the conflict"
+    );
+    assert_eq!(
+        mutation.superseded,
+        Some(SupersededClaim {
+            id: x.claim.id,
+            state: ClaimState::Superseded,
+            revision: x_before.revision + 1,
+            superseded_by: successor_id,
+        })
+    );
+    assert!(mutation.conflicts_opened.is_empty());
+    assert_eq!(mutation.conflicts_resolved, [conflict_id]);
+    assert_eq!(mutation.claims_restored, [y.claim.id]);
+    let reevaluation = mutation.reevaluation.as_ref().expect("re-evaluated");
+    assert_eq!(reevaluation.outcome, "closed");
+    assert_eq!(reevaluation.conflict_revision, before.revision + 1);
+    assert_eq!(reevaluation.remaining_pair_count, 0);
+    assert_eq!(committed.conflicts.len(), 1);
+    assert_eq!(committed.conflicts[0]["state"], "resolved");
+    assert_eq!(committed.conflict_coverage.status, "complete");
+
+    let predecessor = fleet.claim(x.claim.id).await;
+    assert_eq!(predecessor.state, ClaimState::Superseded);
+    assert_eq!(predecessor.revision, x_before.revision + 1);
+    assert_eq!(predecessor.superseded_by, Some(successor_id));
+    let retire = fleet
+        .transitions(x.claim.id)
+        .await
+        .pop()
+        .expect("retire event");
+    assert_eq!(
+        (retire.0.as_str(), retire.1.as_str(), retire.2.as_str()),
+        ("superseded_by_author", "disputed", "superseded")
+    );
+    assert_eq!(retire.3["successor_claim_id"], successor_id);
+    assert_eq!(retire.3["revision_before"], x_before.revision);
+    let after = fleet.conflict(conflict_id).await;
+    assert_eq!(after.state, "resolved");
+    assert_eq!(after.revision, before.revision + 1);
+    assert_eq!(
+        after.resolution_kind.as_deref(),
+        Some("no_current_incompatibility")
+    );
+    assert_eq!(
+        after.resolution_reason,
+        Some(format!(
+            "no lifecycle-current incompatible pair remains after supersede of claim {} by claim {successor_id}",
+            x.claim.id
+        ))
+    );
+    assert_eq!(after.member_count, 2);
+    let peer = fleet.claim(y.claim.id).await;
+    assert_eq!(peer.state, ClaimState::Active);
+    let restore = fleet.transitions(y.claim.id).await.pop().unwrap();
+    assert_eq!(restore.0, "conflict_resolved");
+    assert_eq!(restore.3["idempotency_key"], fleet.key("a/supersede"));
+
+    // One keyed event per call; the successor's own audit event is unkeyed.
+    let keyed = fleet.keyed_events("a/supersede").await;
+    assert_eq!(keyed.len(), 1);
+    assert_eq!(keyed[0].0, "claim_superseded");
+    assert_eq!(keyed[0].1["successor_claim_id"], successor_id);
+    assert_eq!(keyed[0].1["conflict_reevaluation"]["outcome"], "closed");
+    let recorded: Vec<(Option<String>, Value)> = sqlx::query_as(
+        "SELECT idempotency_key, payload FROM memory_events \
+         WHERE tenant_id = $1 AND project = $2 AND event_kind = 'claim_recorded' \
+           AND entity_id = $3",
+    )
+    .bind(fleet.tenant)
+    .bind(&fleet.project)
+    .bind(successor_id.to_string())
+    .fetch_all(fleet.pool())
+    .await
+    .unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].0, None);
+    assert_eq!(recorded[0].1["supersedes"], x.claim.id);
+    assert_eq!(
+        recorded[0].1["conflict_detection"]["incompatible_claim_ids"],
+        json!([])
+    );
+    let receipt_claim: Option<i64> = sqlx::query_scalar(
+        "SELECT claim_id FROM memory_mutation_receipts \
+         WHERE tenant_id = $1 AND idempotency_key = $2 AND operation = 'supersede'",
+    )
+    .bind(fleet.tenant)
+    .bind(fleet.key("a/supersede"))
+    .fetch_one(fleet.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipt_claim, Some(successor_id));
+    fleet.assert_lifecycle_invariants().await;
+
+    // A later reopen does not change the stored result a retry receives.
+    fleet
+        .record(AGENT_C, &decision("supersede-close", &json!("z"), 1), "c/z")
+        .await;
+    let replay = FleetMemoryService::remember(&private, scope.clone(), request())
+        .await
+        .unwrap();
+    assert_eq!(replay.data["idempotent_replay"], true);
+    let mut normalized = replay.data.clone();
+    normalized["idempotent_replay"] = json!(false);
+    assert_eq!(normalized, committed.data);
+    assert_eq!(fleet.keyed_events("a/supersede").await.len(), 1);
+    // Another successor under the key, or another operation, is a conflict.
+    let mut other = successor.clone();
+    other.text = "a different successor".into();
+    for result in [
+        fleet
+            .supersede(
+                AGENT_A,
+                x.claim.id,
+                x_before.revision,
+                &other,
+                "a/supersede",
+            )
+            .await,
+        fleet
+            .supersede(AGENT_A, x.claim.id, x_before.revision, &successor, "a/x")
+            .await,
+        fleet
+            .retract(AGENT_A, x.claim.id, x_before.revision, "a/supersede")
+            .await,
+        fleet
+            .ledger(AGENT_A)
+            .record_claim(&scope, &successor, &fleet.key("a/supersede"))
+            .await,
+    ] {
+        assert!(
+            matches!(result, Err(FleetError::IdempotencyConflict(_))),
+            "{result:?}"
+        );
+    }
+
+    // Reads: the claim names its successor, and private chunk search hides
+    // the retired predecessor while the successor's chunk stays visible.
+    let got = recall(
+        &private,
+        &scope,
+        RecallAction::Get,
+        json!({ "kind": "claim", "id": x.claim.id }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(got.data["claim"]["state"], "superseded");
+    assert_eq!(got.data["claim"]["superseded_by"], successor_id);
+    let page = recall(
+        &private,
+        &scope,
+        RecallAction::Search,
+        json!({ "query": "lifecycle fixture", "kind": "chunk", "limit": 10 }),
+    )
+    .await
+    .unwrap();
+    assert!(!hit_ids(&page).contains(&format!("claim:{}", x.claim.id)));
+    assert!(hit_ids(&page).contains(&format!("claim:{successor_id}")));
+    assert!(
+        page.diagnostics["retrieval"]["lifecycle_hidden_claim_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(x.claim.id))
+    );
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // join, concede, open, and keyless shapes on one fixture
+async fn live_supersede_to_incompatible_value_replaces_member_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "supersede-join").await;
+    let x = fleet
+        .record(AGENT_A, &decision("supersede-join", &json!("x"), 1), "a/x")
+        .await;
+    let y = fleet
+        .record(AGENT_B, &decision("supersede-join", &json!("y"), 1), "b/y")
+        .await;
+    let conflict_id = y.claim.conflict_ids[0];
+    let open = fleet.conflict(conflict_id).await;
+
+    // A changes its value to z, which still contradicts y: the successor
+    // takes the predecessor's place in the same open conflict.
+    let replaced = fleet
+        .supersede(
+            AGENT_A,
+            x.claim.id,
+            fleet.claim(x.claim.id).await.revision,
+            &decision("supersede-join", &json!("z"), 1),
+            "a/supersede",
+        )
+        .await
+        .unwrap();
+    let successor = replaced.claim.id;
+    assert_eq!(replaced.claim.state, ClaimState::Disputed);
+    assert_eq!(replaced.claim.conflict_ids, [conflict_id]);
+    assert!(
+        replaced.conflicts_opened.is_empty(),
+        "an open conflict is joined, not reopened"
+    );
+    assert!(replaced.conflicts_resolved.is_empty());
+    assert!(replaced.claims_restored.is_empty());
+    let reevaluation = replaced.reevaluation.as_ref().unwrap();
+    assert_eq!(reevaluation.outcome, "still_open");
+    assert_eq!(reevaluation.conflict_revision, open.revision);
+    assert_eq!(reevaluation.remaining_pairs, [[y.claim.id, successor]]);
+    let joined = fleet.conflict(conflict_id).await;
+    assert_eq!(joined.state, "open");
+    assert_eq!(joined.revision, open.revision);
+    assert_eq!(
+        joined
+            .members
+            .iter()
+            .map(|member| (member.id, member.state))
+            .collect::<Vec<_>>(),
+        [
+            (x.claim.id, ClaimState::Superseded),
+            (y.claim.id, ClaimState::Disputed),
+            (successor, ClaimState::Disputed),
+        ]
+    );
+    fleet.assert_lifecycle_invariants().await;
+
+    // B concedes to z in turn: nothing incompatible is left, so the conflict
+    // closes and A's disputed successor is restored.
+    let conceded = fleet
+        .supersede(
+            AGENT_B,
+            y.claim.id,
+            fleet.claim(y.claim.id).await.revision,
+            &decision("supersede-join", &json!("z"), 1),
+            "b/supersede",
+        )
+        .await
+        .unwrap();
+    assert_eq!(conceded.claim.state, ClaimState::Active);
+    assert_eq!(conceded.conflicts_resolved, [conflict_id]);
+    assert_eq!(conceded.claims_restored, [successor]);
+    assert_eq!(fleet.conflict(conflict_id).await.state, "resolved");
+    assert_eq!(fleet.claim(successor).await.state, ClaimState::Active);
+    fleet.assert_lifecycle_invariants().await;
+
+    // A supersede can also open a conflict: w1 and w2 agree until A's
+    // successor changes the value.
+    let w1 = fleet
+        .record(AGENT_A, &decision("supersede-open", &json!("w"), 1), "a/w")
+        .await;
+    let w2 = fleet
+        .record(AGENT_B, &decision("supersede-open", &json!("w"), 1), "b/w")
+        .await;
+    assert!(w2.claim.conflict_ids.is_empty());
+    let opened = fleet
+        .supersede(
+            AGENT_A,
+            w1.claim.id,
+            w1.claim.revision,
+            &decision("supersede-open", &json!("v"), 1),
+            "a/supersede-open",
+        )
+        .await
+        .unwrap();
+    assert_eq!(opened.conflicts_opened.len(), 1);
+    let opened_id = opened.conflicts_opened[0];
+    assert_eq!(opened.claim.conflict_ids, [opened_id]);
+    assert_eq!(opened.reevaluation.as_ref().unwrap().outcome, "still_open");
+    assert_eq!(fleet.claim(w2.claim.id).await.state, ClaimState::Disputed);
+    assert_eq!(
+        fleet
+            .conflict(opened_id)
+            .await
+            .members
+            .iter()
+            .map(|member| member.id)
+            .collect::<Vec<_>>(),
+        [w2.claim.id, opened.claim.id],
+        "the superseded predecessor never joins"
+    );
+    fleet.assert_lifecycle_invariants().await;
+
+    // A keyless note has no lineage to re-evaluate.
+    let draft = fleet
+        .record(AGENT_A, &note("first draft of the failover runbook"), "a/n")
+        .await;
+    let revised = fleet
+        .supersede(
+            AGENT_A,
+            draft.claim.id,
+            draft.claim.revision,
+            &note("second draft of the failover runbook"),
+            "a/supersede-note",
+        )
+        .await
+        .unwrap();
+    assert_eq!(revised.claim.kind, ClaimKind::Note);
+    assert_eq!(revised.claim.state, ClaimState::Active);
+    assert!(revised.reevaluation.is_none());
+    assert!(revised.conflicts_opened.is_empty() && revised.conflicts_resolved.is_empty());
+    assert_eq!(
+        fleet.superseded_by(draft.claim.id).await,
+        Some(revised.claim.id)
+    );
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // every supersede refusal with its no-residue proof
+async fn live_supersede_refusals_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "supersede-refusals").await;
+    let subject = "supersede-refusals";
+    let x = fleet
+        .record(AGENT_A, &decision(subject, &json!("x"), 1), "a/x")
+        .await;
+    fleet
+        .record(AGENT_B, &decision(subject, &json!("y"), 1), "b/y")
+        .await;
+    let x_disputed = fleet.claim(x.claim.id).await;
+    let valid = decision(subject, &json!("y"), 1);
+    let mut fact = valid.clone();
+    fact.kind = ClaimKind::Fact;
+    let mut valueless = valid.clone();
+    valueless.value = None;
+
+    let cases = [
+        (
+            AGENT_B,
+            x.claim.id,
+            x_disputed.revision,
+            valid.clone(),
+            "b/not-owner",
+            RefusalCode::NotOwner,
+        ),
+        (
+            AGENT_A,
+            x.claim.id,
+            x_disputed.revision - 1,
+            valid.clone(),
+            "a/stale",
+            RefusalCode::StaleRevision,
+        ),
+        (
+            AGENT_A,
+            x.claim.id,
+            x_disputed.revision,
+            fact,
+            "a/kind",
+            RefusalCode::SuccessorKindMismatch,
+        ),
+        (
+            AGENT_A,
+            x.claim.id,
+            x_disputed.revision,
+            decision("another-key", &json!("y"), 1),
+            "a/key",
+            RefusalCode::SuccessorKeyMismatch,
+        ),
+        (
+            AGENT_A,
+            x.claim.id,
+            x_disputed.revision,
+            valueless,
+            "a/eligibility",
+            RefusalCode::SuccessorEligibilityMismatch,
+        ),
+        (
+            AGENT_A,
+            9_007_199_254_740_990,
+            1,
+            valid.clone(),
+            "a/none",
+            RefusalCode::NotFound,
+        ),
+    ];
+    for (agent, claim_id, revision, successor, key, code) in cases {
+        let claims_before = fleet.tenant_claim_count().await;
+        let refused = refusal(
+            fleet
+                .supersede(agent, claim_id, revision, &successor, key)
+                .await,
+        );
+        assert_eq!(refused.code, code, "{key}");
+        assert_eq!(
+            fleet.tenant_claim_count().await,
+            claims_before,
+            "{key} wrote a successor"
+        );
+        fleet.assert_key_unconsumed(key).await;
+    }
+    let unchanged = fleet.claim(x.claim.id).await;
+    assert_eq!(
+        (unchanged.state, unchanged.revision, unchanged.superseded_by),
+        (x_disputed.state, x_disputed.revision, None)
+    );
+
+    // Once superseded, the predecessor is no longer current.
+    fleet
+        .supersede(
+            AGENT_A,
+            x.claim.id,
+            x_disputed.revision,
+            &valid,
+            "a/supersede",
+        )
+        .await
+        .expect("the corrected supersede commits");
+    let again = refusal(
+        fleet
+            .supersede(
+                AGENT_A,
+                x.claim.id,
+                x_disputed.revision + 1,
+                &valid,
+                "a/again",
+            )
+            .await,
+    );
+    assert_eq!(again.code, RefusalCode::NotCurrent);
+    assert_eq!(again.details["current_state"], "superseded");
+    fleet.assert_key_unconsumed("a/again").await;
+
+    // An unreconciled legacy key is refused before anything is written.
+    let legacy_claim = fleet
+        .raw_claim(
+            &fleet.project,
+            "legacy-guard",
+            "decision",
+            "operator_asserted",
+            Some(AGENT_A),
+        )
+        .await;
+    fleet
+        .legacy_conflict("legacy-guard::database-choice", &[legacy_claim])
+        .await;
+    let claims_before = fleet.tenant_claim_count().await;
+    let legacy = refusal(
+        fleet
+            .supersede(
+                AGENT_A,
+                legacy_claim,
+                1,
+                &decision("legacy-guard", &json!("postgres"), 1),
+                "a/legacy",
+            )
+            .await,
+    );
+    assert_eq!(legacy.code, RefusalCode::LegacyLineage);
+    assert_eq!(fleet.tenant_claim_count().await, claims_before);
+    fleet.assert_key_unconsumed("a/legacy").await;
+
+    // Only authored operator assertions have an owner who may replace them.
+    let derived = fleet
+        .raw_claim(
+            &fleet.project,
+            "derived",
+            "note",
+            "source_derived",
+            Some(AGENT_A),
+        )
+        .await;
+    let mut derived_successor = note("a corrected derived note");
+    derived_successor.subject = Some("derived".into());
+    derived_successor.predicate = Some("database-choice".into());
+    let derived_refusal = refusal(
+        fleet
+            .supersede(AGENT_A, derived, 1, &derived_successor, "a/derived")
+            .await,
+    );
+    assert_eq!(derived_refusal.code, RefusalCode::NotOperatorAsserted);
+    fleet.assert_key_unconsumed("a/derived").await;
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}
+
+#[tokio::test]
+async fn live_supersede_replays_on_record_only_writer_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "supersede-surface").await;
+    let scope = fleet.scope(AGENT_A);
+    let enabled = fleet.service(AGENT_A, PRIVATE_WRITER);
+    let disabled = fleet.service(AGENT_A, LifecycleServing::default());
+    let x = fleet
+        .record(
+            AGENT_A,
+            &decision("supersede-surface", &json!("x"), 1),
+            "a/x",
+        )
+        .await;
+    let successor = decision("supersede-surface", &json!("x2"), 1);
+    let request = |key: &str, successor: &ClaimInput| {
+        supersede_request(fleet.key(key), x.claim.id, 1, successor)
+    };
+    let committed =
+        FleetMemoryService::remember(&enabled, scope.clone(), request("a/supersede", &successor))
+            .await
+            .unwrap();
+
+    let replay =
+        FleetMemoryService::remember(&disabled, scope.clone(), request("a/supersede", &successor))
+            .await
+            .expect("a committed supersede replays where supersede is no longer served");
+    assert_eq!(replay.data["idempotent_replay"], true);
+    let mut normalized = replay.data.clone();
+    normalized["idempotent_replay"] = json!(false);
+    assert_eq!(normalized, committed.data);
+
+    let mut other = successor.clone();
+    other.text = "another successor".into();
+    let error =
+        FleetMemoryService::remember(&disabled, scope.clone(), request("a/supersede", &other))
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(&error, ServiceError::InvalidRequest(message)
+            if message.contains("already used for a different mutation")),
+        "{error}"
+    );
+    let unused =
+        FleetMemoryService::remember(&disabled, scope, request("a/unused", &successor)).await;
+    assert_eq!(refusal_code(unused), "lifecycle_unavailable");
+    fleet.assert_key_unconsumed("a/unused").await;
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupersedeRace {
+    Committed(i64),
+    Stale,
+}
+
+fn supersede_race(result: ostk_fleet_recall::Result<ClaimMutation>) -> SupersedeRace {
+    match result {
+        Ok(mutation) => {
+            assert_eq!(mutation.operation, "supersede");
+            SupersedeRace::Committed(mutation.claim.id)
+        }
+        Err(FleetError::LifecycleRefused(refusal))
+            if refusal.code == RefusalCode::StaleRevision =>
+        {
+            SupersedeRace::Stale
+        }
+        Err(error) => panic!("race produced an unexpected failure: {error}"),
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // two race shapes share one fixture and one invariant check
+async fn live_supersede_vs_concurrent_record_converges_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "supersede-race").await;
+    let second = CockroachStore::connect(
+        &database_url,
+        fleet.scope(AGENT_B),
+        PoolConfig {
+            max_connections: 8,
+            ..PoolConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let policy = RetryPolicy {
+        max_attempts: 32,
+        ..RetryPolicy::default()
+    };
+    let author_a = fleet.ledger_on(fleet.pool(), AGENT_A, policy);
+    let author_b = fleet.ledger_on(second.pool(), AGENT_B, policy);
+    let author_c = fleet.ledger_on(second.pool(), AGENT_C, policy);
+    let (scope_a, scope_b, scope_c) = (
+        fleet.scope(AGENT_A),
+        fleet.scope(AGENT_B),
+        fleet.scope(AGENT_C),
+    );
+
+    for round in 0..40 {
+        let subject = format!("supersede-race-{round}");
+        let x = author_a
+            .record_claim(
+                &scope_a,
+                &decision(&subject, &json!("x"), 1),
+                &fleet.key(&format!("{round}/x")),
+            )
+            .await
+            .unwrap();
+        let y = author_b
+            .record_claim(
+                &scope_b,
+                &decision(&subject, &json!("y"), 1),
+                &fleet.key(&format!("{round}/y")),
+            )
+            .await
+            .unwrap();
+        let conflict_id = y.claim.conflict_ids[0];
+        let x_revision = fleet.claim(x.claim.id).await.revision;
+        let barrier = Barrier::new(2);
+        // A concedes to y.
+        let supersede_x = async {
+            barrier.wait().await;
+            author_a
+                .supersede_claim(
+                    &scope_a,
+                    ClaimTarget {
+                        claim_id: x.claim.id,
+                        expected_revision: x_revision,
+                    },
+                    None,
+                    &decision(&subject, &json!("y"), 1),
+                    &fleet.key(&format!("{round}/supersede-x")),
+                )
+                .await
+        };
+        if round % 2 == 0 {
+            // C records a third value at the same moment. Either order ends
+            // with z contradicting both y and A's successor.
+            let record_z = async {
+                barrier.wait().await;
+                author_c
+                    .record_claim(
+                        &scope_c,
+                        &decision(&subject, &json!("z"), 1),
+                        &fleet.key(&format!("{round}/z")),
+                    )
+                    .await
+            };
+            let (x_result, z_result) = tokio::join!(supersede_x, record_z);
+            let SupersedeRace::Committed(successor) = supersede_race(x_result) else {
+                panic!("round {round}: the supersede must commit");
+            };
+            let z = z_result.expect("the racing record commits");
+            let conflict = fleet.conflict(conflict_id).await;
+            assert_eq!(conflict.state, "open", "round {round}");
+            for claim_id in [y.claim.id, successor, z.claim.id] {
+                assert_eq!(
+                    fleet.claim(claim_id).await.state,
+                    ClaimState::Disputed,
+                    "round {round}: claim {claim_id}"
+                );
+            }
+            assert_eq!(fleet.claim(x.claim.id).await.state, ClaimState::Superseded);
+        } else {
+            // B retracts y at the same moment. Each close restores the other
+            // author's claim, so exactly one of the two commits.
+            let y_revision = y.claim.revision;
+            let retract_y = async {
+                barrier.wait().await;
+                author_b
+                    .retract_claim(
+                        &scope_b,
+                        ClaimTarget {
+                            claim_id: y.claim.id,
+                            expected_revision: y_revision,
+                        },
+                        None,
+                        &fleet.key(&format!("{round}/retract-y")),
+                    )
+                    .await
+            };
+            let (x_result, y_result) = tokio::join!(supersede_x, retract_y);
+            match (supersede_race(x_result), race_outcome(y_result)) {
+                (SupersedeRace::Committed(successor), RaceOutcome::Stale) => {
+                    assert_eq!(fleet.claim(y.claim.id).await.state, ClaimState::Active);
+                    assert_eq!(fleet.claim(successor).await.state, ClaimState::Active);
+                    assert_eq!(fleet.claim(x.claim.id).await.state, ClaimState::Superseded);
+                }
+                (SupersedeRace::Stale, RaceOutcome::Committed) => {
+                    assert_eq!(fleet.claim(x.claim.id).await.state, ClaimState::Active);
+                    assert_eq!(fleet.claim(y.claim.id).await.state, ClaimState::Retracted);
+                }
+                other => panic!("round {round}: exactly one mutation commits, got {other:?}"),
+            }
+            assert_eq!(fleet.conflict(conflict_id).await.state, "resolved");
+        }
+    }
+    fleet.assert_lifecycle_invariants().await;
+
+    second.pool().close().await;
     fleet.cleanup().await;
 }

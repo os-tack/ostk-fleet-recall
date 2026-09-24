@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 
 use crate::ledger::{
-    Claim, ClaimInput, ClaimMutation, ClaimState, ClaimTarget, Conflict, SemanticClaimHit,
+    Claim, ClaimInput, ClaimMutation, ClaimState, ClaimTarget, Conflict, LifecycleReplayRequest,
+    SemanticClaimHit,
 };
 use crate::{FleetScope, Result};
 
@@ -60,18 +61,38 @@ pub trait ClaimLedger: Send + Sync {
         idempotency_key: &str,
     ) -> Result<ClaimMutation>;
 
+    /// Supersede a lifecycle-current operator assertion the caller authored
+    /// with a successor claim of the same kind, normalized key, and conflict
+    /// eligibility.
+    ///
+    /// The predecessor becomes `superseded` with `superseded_by` naming the
+    /// successor, which is written and run through the detector exactly as
+    /// `record` writes a claim. The key's open v2 conflict is then
+    /// re-evaluated over what is current: a compatible successor lets it
+    /// close, and an incompatible one replaces its predecessor as a member.
+    /// Authority and refusals are those of [`Self::retract_claim`], plus the
+    /// `successor_*_mismatch` refusals.
+    async fn supersede_claim(
+        &self,
+        scope: &FleetScope,
+        target: ClaimTarget,
+        reason: Option<&str>,
+        successor: &ClaimInput,
+        idempotency_key: &str,
+    ) -> Result<ClaimMutation>;
+
     /// Replay a committed lifecycle request whose action this deployment does
     /// not serve, reading its receipt without taking a lock or writing.
     ///
-    /// `retract` names the request when its arguments parsed as a retract; the
-    /// stored result replays only for exactly that request. Any other receipt
-    /// under the key is an idempotency conflict. `Ok(None)` means no receipt
-    /// holds the key in this tenant.
+    /// `request` names the request when its arguments parsed as that action;
+    /// the stored result replays only for exactly that request. Any other
+    /// receipt under the key is an idempotency conflict. `Ok(None)` means no
+    /// receipt holds the key in this tenant.
     async fn replay_unserved_lifecycle(
         &self,
         scope: &FleetScope,
         idempotency_key: &str,
-        retract: Option<(ClaimTarget, Option<&str>)>,
+        request: Option<LifecycleReplayRequest<'_>>,
     ) -> Result<Option<ClaimMutation>>;
 
     async fn get_claim(&self, scope: &FleetScope, id: i64) -> Result<Option<Claim>>;

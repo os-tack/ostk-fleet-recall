@@ -454,6 +454,10 @@ pub struct Conflict {
 pub struct ClaimMutation {
     pub operation: String,
     pub claim: Claim,
+    /// The predecessor a `supersede` retired in favour of `claim`. Omitted
+    /// otherwise, so record responses and stored receipts keep their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded: Option<SupersededClaim>,
     pub idempotent_replay: bool,
     pub conflicts_opened: Vec<i64>,
     pub conflicts_resolved: Vec<i64>,
@@ -467,11 +471,37 @@ pub struct ClaimMutation {
     pub reevaluation: Option<ConflictReevaluation>,
 }
 
+/// The predecessor claim of a committed `supersede`, as that mutation left it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupersededClaim {
+    pub id: i64,
+    pub state: ClaimState,
+    /// The predecessor's revision after the transition to `superseded`.
+    pub revision: i64,
+    /// The successor claim that replaced it.
+    pub superseded_by: i64,
+}
+
 /// An owner lifecycle target: the claim and the revision the caller last read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimTarget {
     pub claim_id: i64,
     pub expected_revision: i64,
+}
+
+/// A lifecycle request as parsed by a writer that does not serve its action.
+/// That writer still replays a receipt committed for exactly this request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LifecycleReplayRequest<'a> {
+    Retract {
+        target: ClaimTarget,
+        reason: Option<&'a str>,
+    },
+    Supersede {
+        target: ClaimTarget,
+        reason: Option<&'a str>,
+        successor: &'a ClaimInput,
+    },
 }
 
 /// The detector's verdict on a key's open v2 conflict after a lifecycle change.
@@ -546,6 +576,7 @@ mod tests {
                 support: Vec::new(),
                 conflict_ids: Vec::new(),
             },
+            superseded: None,
             idempotent_replay: false,
             conflicts_opened: Vec::new(),
             conflicts_resolved: Vec::new(),
@@ -588,9 +619,30 @@ mod tests {
         let encoded = serde_json::to_value(&retract).unwrap();
         assert_eq!(encoded["claims_restored"], serde_json::json!([42]));
         assert_eq!(encoded["reevaluation"]["outcome"], "closed");
+        assert!(encoded.get("superseded").is_none());
         assert_eq!(
             serde_json::from_value::<ClaimMutation>(encoded).unwrap(),
             retract
+        );
+
+        let mut supersede = retract;
+        supersede.operation = "supersede".into();
+        supersede.superseded = Some(SupersededClaim {
+            id: 40,
+            state: ClaimState::Superseded,
+            revision: 3,
+            superseded_by: 41,
+        });
+        let encoded = serde_json::to_value(&supersede).unwrap();
+        assert_eq!(
+            encoded["superseded"],
+            serde_json::json!({
+                "id": 40, "state": "superseded", "revision": 3, "superseded_by": 41,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ClaimMutation>(encoded).unwrap(),
+            supersede
         );
     }
 
@@ -598,6 +650,7 @@ mod tests {
     fn old_receipts_decode_without_new_fields() {
         let mut stored = serde_json::to_value(record_mutation()).unwrap();
         let object = stored.as_object_mut().unwrap();
+        object.remove("superseded");
         object.remove("claims_restored");
         object.remove("reevaluation");
         let decoded: ClaimMutation = serde_json::from_value(stored).unwrap();

@@ -719,7 +719,7 @@ async fn explicit_null_id_is_answered_while_absent_id_is_not() {
 }
 
 #[tokio::test]
-async fn lifecycle_surface_advertises_retract_and_record_only_does_not() {
+async fn lifecycle_surface_advertises_supersede_and_retract_record_only_does_not() {
     let list = json!({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"});
     let record_only = Arc::new(FakeService::default());
     let response = server(&record_only)
@@ -741,7 +741,7 @@ async fn lifecycle_surface_advertises_retract_and_record_only_does_not() {
     let tools = response.result.unwrap()["tools"].clone();
     assert_eq!(
         tools[1]["inputSchema"]["properties"]["action"]["enum"],
-        json!(["record", "retract"])
+        json!(["record", "supersede", "retract"])
     );
     assert!(
         tools[0]["inputSchema"]["properties"]["kind"]["enum"]

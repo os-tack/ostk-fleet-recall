@@ -31,6 +31,11 @@ The `ostk-fleet-recall` binary has these commands:
     incompatible lifecycle-current pair remains on the claim's key, the
     detector closes that key's conflict and returns its disputed members to
     `active`.
+  - `remember(supersede)` replaces a claim the calling agent authored with a
+    successor of the same kind, key, and value presence. The predecessor
+    becomes `superseded` and names its successor, which the detector checks
+    like any recorded claim: a compatible successor lets the key's conflict
+    close, and an incompatible one takes its predecessor's place in it.
 - `demo` serves a bounded, read-only HTTP surface (`/`, `/healthz`,
   `/api/status`, and `POST /api/recall`). It exposes no mutation route.
 - `migrate` applies the embedded CockroachDB schema migrations.
@@ -55,9 +60,10 @@ conflict with the exact members that caused it instead of silently choosing
 one. The detector compares typed propositions; it performs no natural-language
 inference.
 
-A conflict is never resolved by fiat. An agent can retract only its own
-claims, and a conflict closes only when the detector re-checks the key and finds
-no incompatible current pair left ([ADR 0004](docs/adr/0004-serving-conflict-lifecycle.md)).
+A conflict is never resolved by fiat. An agent can retract or supersede only
+its own claims, and a conflict closes only when the detector re-checks the key
+and finds no incompatible current pair left
+([ADR 0004](docs/adr/0004-serving-conflict-lifecycle.md)).
 On the private writer, chunk search also drops the synthetic `claim:{id}` hits of
 claims that are no longer current, lists them in
 `diagnostics.retrieval.lifecycle_hidden_claim_ids`, and refills the page from
@@ -67,7 +73,7 @@ default is `enabled`) restores the record-only surface: the historical
 surface.
 
 The service contract also reserves further Recall actions (for example
-`remember` supersede/resolve and `recall` surface/discover) and an attention
+`remember` resolve and `recall` surface/discover) and an attention
 schema. These return an error or are unused today; see the
 [roadmap](docs/ARCHITECTURE.md#roadmap-and-open-work).
 
@@ -446,8 +452,8 @@ plus `claims_restored` when the close returned members to `active`. When the
 key had an open conflict, `reevaluation` says whether it `closed` or is
 `still_open` and which incompatible pairs remain. `conflicts` lists every
 affected conflict in any state. Replays follow the same idempotency rules as
-`record`, and a `record` key cannot be reused for `retract` or the other way
-round.
+`record`, and a key used by one action (`record`, `retract`, or `supersede`)
+cannot be reused for another.
 
 The server checks the claim under row locks and refuses the request, before
 anything is written, when the caller is not its author (`not_owner`), the claim
@@ -463,9 +469,36 @@ unknown outcome, and it does not consume the idempotency key:
 {"code":-32602,"message":"remember(retract) refused: stale_revision: claim 41 is at revision 3 (disputed)","data":{"code":"stale_revision","outcome":"not_applied","retry":"nothing was committed and the idempotency_key was not consumed; re-read and send a corrected request","details":{"claim_id":41,"current_revision":3,"current_state":"disputed"}}}
 ```
 
-A writer that does not serve `retract`, such as one started with
+To replace a claim it authored instead, an agent sends `remember(supersede)`
+with the same `claim_id`, `expected_revision`, and optional `reason`, plus the
+successor's `record` fields. The successor must keep the predecessor's `kind`,
+its `subject`/`predicate` key after normalization (so `Fleet Store` matches
+`fleet-store`), and whether it carries a `value`, so a supersede can change what
+a claim says but can never move it off its key or out of the detector's view:
+
+```json
+{"action":"supersede","idempotency_key":"readme/supersede/v1","claim_id":41,"expected_revision":2,"reason":"the migration review chose a single migrator","kind":"decision","text":"Fleet schema migration runs through one dedicated migrator job.","subject":"fleet deployment","predicate":"migration strategy","value":"single dedicated migrator job"}
+```
+
+In the response, `data.claim` is the new successor and `data.superseded` is the
+predecessor as the mutation left it: `{id, state:"superseded", revision,
+superseded_by}`. The successor goes through the same conflict detection as a
+recorded claim, so `conflicts_opened` lists a conflict it opened or reopened.
+Then the key's open conflict is re-evaluated exactly as for a retract:
+`conflicts_resolved`, `claims_restored`, and `reevaluation` report whether a
+compatible successor let it close or an incompatible one keeps it `still_open`
+with the successor as a member. The predecessor stays a historical member of
+its conflicts, and `recall` `get` with `kind=claim` shows its `superseded_by`.
+
+A supersede is refused for the same reasons as a retract, and also when the
+successor changes the kind (`successor_kind_mismatch`), the normalized key
+(`successor_key_mismatch`), or whether the claim carries a value
+(`successor_eligibility_mismatch`). A malformed successor is an ordinary
+`invalid_params` error, exactly as for `record`.
+
+A writer that does not serve `retract` or `supersede`, such as one started with
 `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`, checks the key's receipt first: a
-retract that already committed under the key replays its stored result, any
+request that already committed under the key replays its stored result, any
 other use of the key is an idempotency conflict, and only an unused key is
 refused as `lifecycle_unavailable`.
 
@@ -543,13 +576,15 @@ the remaining rows.
   owner/tier row visibility is not implemented yet.
 - Actor provenance is derived from the trusted deployment agent. A supplied
   `remember.actor` is only an exact assertion and is stripped at the MCP edge.
-- Lifecycle authority is owner-only: `remember(retract)` changes only an
-  `operator_asserted` claim whose stored actor is the trusted deployment agent,
-  at the exact revision the caller read. No agent can resolve a conflict or
-  retire another agent's claim; a conflict closes only when the detector
-  finds no incompatible lifecycle-current pair. Every refusal rolls the whole
-  transaction back. This authority is as strong as the deployment's
-  `FLEET_RECALL_AGENT` binding over the shared writer credential.
+- Lifecycle authority is owner-only: `remember(retract)` and
+  `remember(supersede)` change only an `operator_asserted` claim whose stored
+  actor is the trusted deployment agent, at the exact revision the caller
+  read, and a successor keeps its predecessor's kind, key, and detector
+  eligibility. No agent can resolve a conflict or retire another agent's
+  claim; a conflict closes only when the detector finds no incompatible
+  lifecycle-current pair. Every refusal rolls the whole transaction back.
+  This authority is as strong as the deployment's `FLEET_RECALL_AGENT` binding
+  over the shared writer credential.
 - MCP frames, tool results, searches, conflict projections, claim passages,
   ingestion, and HTTP bodies/results are bounded. Backend details are redacted
   from protocol errors.

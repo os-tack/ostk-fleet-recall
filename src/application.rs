@@ -12,8 +12,8 @@ use serde_json::{Map, Value, json};
 
 use crate::ledger::{
     ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict,
-    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, SemanticClaimHit, SupportedClaimCoordinate,
-    validate_lifecycle_reason,
+    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LifecycleReplayRequest, SemanticClaimHit,
+    SupportedClaimCoordinate, validate_lifecycle_reason,
 };
 use crate::service::{
     ConflictCoverage, FleetMemoryService, RecallAction, RecallRequest, RecallResult, Refusal,
@@ -537,25 +537,7 @@ impl CockroachMemoryService {
             .map_err(service_error)?;
         let idempotency_key = required_idempotency_key(request.action, request.idempotency_key)?;
         let input: ClaimInput = from_arguments(request.arguments, "remember record")?;
-        input.validate().map_err(|error| match error {
-            FleetError::Memory(message) => ServiceError::InvalidRequest(message),
-            other => service_error(other),
-        })?;
-        if input
-            .actor
-            .as_deref()
-            .is_some_and(|actor| actor != scope.agent)
-        {
-            return Err(ServiceError::InvalidRequest(
-                "claim actor must match the authenticated fleet agent".into(),
-            ));
-        }
-        if input.origin == "source_derived" || input.origin == "legacy_unverified" {
-            return Err(ServiceError::InvalidRequest(
-                "remember(record) only accepts operator_asserted origin; projection imports use a trusted ingestion path"
-                    .into(),
-            ));
-        }
+        validate_operator_claim_input(RememberAction::Record, scope, &input)?;
         let mutation = self
             .ledger
             .record_claim(scope, &input, &idempotency_key)
@@ -582,6 +564,33 @@ impl CockroachMemoryService {
         let mutation = self
             .ledger
             .retract_claim(scope, target, reason.as_deref(), &idempotency_key)
+            .await
+            .map_err(service_error)?;
+        Ok(self.lifecycle_result(scope, &mutation).await)
+    }
+
+    async fn remember_supersede(
+        &self,
+        scope: &FleetScope,
+        request: RememberRequest,
+    ) -> ServiceResult<RememberResult> {
+        let idempotency_key = required_idempotency_key(request.action, request.idempotency_key)?;
+        let (target, reason, successor) = split_supersede_arguments(request.arguments)?;
+        validate_operator_claim_input(RememberAction::Supersede, scope, &successor)?;
+        // The successor is embedded like a recorded claim, so the process
+        // embedder must share the corpus's registered vector generation.
+        self.verify_embedding_generation()
+            .await
+            .map_err(service_error)?;
+        let mutation = self
+            .ledger
+            .supersede_claim(
+                scope,
+                target,
+                reason.as_deref(),
+                &successor,
+                &idempotency_key,
+            )
             .await
             .map_err(service_error)?;
         Ok(self.lifecycle_result(scope, &mutation).await)
@@ -619,19 +628,25 @@ impl CockroachMemoryService {
         let Some(idempotency_key) = request.idempotency_key else {
             return Err(refusal);
         };
-        let retract = if request.action == RememberAction::Retract {
-            parse_retract_arguments(request.arguments).ok()
-        } else {
-            None
+        let parsed = match request.action {
+            RememberAction::Retract => parse_retract_arguments(request.arguments)
+                .ok()
+                .map(|(target, reason)| UnservedLifecycle::Retract { target, reason }),
+            RememberAction::Supersede => split_supersede_arguments(request.arguments).ok().map(
+                |(target, reason, successor)| UnservedLifecycle::Supersede {
+                    target,
+                    reason,
+                    successor: Box::new(successor),
+                },
+            ),
+            _ => None,
         };
         let replay = self
             .ledger
             .replay_unserved_lifecycle(
                 scope,
                 &idempotency_key,
-                retract
-                    .as_ref()
-                    .map(|(target, reason)| (*target, reason.as_deref())),
+                parsed.as_ref().map(UnservedLifecycle::as_replay),
             )
             .await
             .map_err(service_error)?;
@@ -1006,6 +1021,7 @@ impl FleetMemoryService for CockroachMemoryService {
             RememberAction::Record => self.remember_record(&scope, request).await,
             RememberAction::Assert => Err(Self::assert_route_disabled()),
             RememberAction::Retract => self.remember_retract(&scope, request).await,
+            RememberAction::Supersede => self.remember_supersede(&scope, request).await,
             action => Err(ServiceError::InvalidRequest(format!(
                 "remember({}) is not implemented yet",
                 action.as_str()
@@ -1018,9 +1034,72 @@ impl FleetMemoryService for CockroachMemoryService {
     }
 }
 
+/// Validate a claim an agent writes through `record` or as a `supersede`
+/// successor: the domain limits, the trusted actor, and operator origin.
+fn validate_operator_claim_input(
+    action: RememberAction,
+    scope: &FleetScope,
+    input: &ClaimInput,
+) -> ServiceResult<()> {
+    input.validate().map_err(|error| match error {
+        FleetError::Memory(message) => ServiceError::InvalidRequest(message),
+        other => service_error(other),
+    })?;
+    if input
+        .actor
+        .as_deref()
+        .is_some_and(|actor| actor != scope.agent)
+    {
+        return Err(ServiceError::InvalidRequest(
+            "claim actor must match the authenticated fleet agent".into(),
+        ));
+    }
+    if input.origin == "source_derived" || input.origin == "legacy_unverified" {
+        return Err(ServiceError::InvalidRequest(format!(
+            "remember({}) only accepts operator_asserted origin; projection imports use a trusted ingestion path",
+            action.as_str()
+        )));
+    }
+    Ok(())
+}
+
+/// A lifecycle request parsed by a writer that does not serve its action.
+enum UnservedLifecycle {
+    Retract {
+        target: ClaimTarget,
+        reason: Option<String>,
+    },
+    Supersede {
+        target: ClaimTarget,
+        reason: Option<String>,
+        successor: Box<ClaimInput>,
+    },
+}
+
+impl UnservedLifecycle {
+    fn as_replay(&self) -> LifecycleReplayRequest<'_> {
+        match self {
+            Self::Retract { target, reason } => LifecycleReplayRequest::Retract {
+                target: *target,
+                reason: reason.as_deref(),
+            },
+            Self::Supersede {
+                target,
+                reason,
+                successor,
+            } => LifecycleReplayRequest::Supersede {
+                target: *target,
+                reason: reason.as_deref(),
+                successor,
+            },
+        }
+    }
+}
+
+/// The owner-lifecycle target fields shared by `retract` and `supersede`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RetractArgs {
+struct ClaimTargetArgs {
     claim_id: Value,
     expected_revision: i64,
     #[serde(default)]
@@ -1030,7 +1109,31 @@ struct RetractArgs {
 fn parse_retract_arguments(
     arguments: Map<String, Value>,
 ) -> ServiceResult<(ClaimTarget, Option<String>)> {
-    let args: RetractArgs = from_arguments(arguments, "remember retract")?;
+    parse_claim_target_arguments(arguments, "remember retract")
+}
+
+/// Split `supersede` arguments into the predecessor target, the optional
+/// audit note, and the successor claim. Every other field must be a
+/// `record` claim field.
+fn split_supersede_arguments(
+    mut arguments: Map<String, Value>,
+) -> ServiceResult<(ClaimTarget, Option<String>, ClaimInput)> {
+    let mut target_arguments = Map::new();
+    for field in ["claim_id", "expected_revision", "reason"] {
+        if let Some(value) = arguments.remove(field) {
+            target_arguments.insert(field.into(), value);
+        }
+    }
+    let (target, reason) = parse_claim_target_arguments(target_arguments, "remember supersede")?;
+    let successor: ClaimInput = from_arguments(arguments, "remember supersede")?;
+    Ok((target, reason, successor))
+}
+
+fn parse_claim_target_arguments(
+    arguments: Map<String, Value>,
+    operation: &str,
+) -> ServiceResult<(ClaimTarget, Option<String>)> {
+    let args: ClaimTargetArgs = from_arguments(arguments, operation)?;
     let claim_id = parse_safe_id(&args.claim_id).map_err(|_| {
         ServiceError::InvalidRequest(format!(
             "claim_id must be an integer between 1 and {MAX_SAFE_INTEGER}"
@@ -1777,6 +1880,7 @@ mod tests {
                 support: Vec::new(),
                 conflict_ids: vec![9],
             },
+            superseded: None,
             idempotent_replay: false,
             conflicts_opened: vec![9],
             conflicts_resolved: Vec::new(),
@@ -1947,6 +2051,7 @@ mod tests {
                 support: Vec::new(),
                 conflict_ids,
             },
+            superseded: None,
             idempotent_replay,
             conflicts_opened: Vec::new(),
             conflicts_resolved: Vec::new(),
@@ -2076,29 +2181,135 @@ mod tests {
         assert!(retract("\u{7406}".repeat(max + 1)).is_err());
     }
 
-    #[tokio::test]
-    async fn lifecycle_actions_require_idempotency_key() {
-        let service = offline_service(CLAIM_LIFECYCLE);
-        let error = FleetMemoryService::remember(
-            &service,
-            offline_scope(),
-            RememberRequest::new(
-                RememberAction::Retract,
-                None,
-                retract_arguments(&json!({ "claim_id": 41, "expected_revision": 2 })),
-            ),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(&error, ServiceError::InvalidRequest(message)
-                if message == "remember(retract) requires idempotency_key"),
-            "{error}"
+    fn successor_arguments(extra: &Value) -> Map<String, Value> {
+        let mut arguments = retract_arguments(&json!({
+            "claim_id": 41,
+            "expected_revision": 3,
+            "kind": "decision",
+            "text": "Use CockroachDB 26 for fleet memory",
+            "subject": "fleet",
+            "predicate": "database",
+            "value": "cockroachdb-26",
+        }));
+        arguments.extend(retract_arguments(extra));
+        arguments
+    }
+
+    #[test]
+    fn supersede_arguments_split_and_reject_unknown() {
+        let (target, reason, successor) = split_supersede_arguments(successor_arguments(
+            &json!({ "claim_id": "41", "reason": "storage review" }),
+        ))
+        .unwrap();
+        assert_eq!(
+            target,
+            ClaimTarget {
+                claim_id: 41,
+                expected_revision: 3
+            }
         );
+        assert_eq!(reason.as_deref(), Some("storage review"));
+        // Everything else is the successor, with record's defaults.
+        assert_eq!(successor.kind, ClaimKind::Decision);
+        assert_eq!(successor.text, "Use CockroachDB 26 for fleet memory");
+        assert_eq!(successor.value, Some(json!("cockroachdb-26")));
+        assert_eq!(successor.origin, "operator_asserted");
+        assert_eq!(successor.polarity, 1);
+
+        let mut without_target = successor_arguments(&json!({}));
+        without_target.remove("claim_id");
+        let mut without_revision = successor_arguments(&json!({}));
+        without_revision.remove("expected_revision");
+        let mut without_text = successor_arguments(&json!({}));
+        without_text.remove("text");
+        for rejected in [
+            without_target,
+            without_revision,
+            without_text,
+            retract_arguments(&json!({ "claim_id": 41, "expected_revision": 3 })),
+            successor_arguments(&json!({ "conflict_id": 9 })),
+            successor_arguments(&json!({ "agent": "other" })),
+            successor_arguments(&json!({ "tenant_id": "other" })),
+            successor_arguments(&json!({ "claim_id": 0 })),
+            successor_arguments(&json!({ "claim_id": 9_007_199_254_740_992_i64 })),
+            successor_arguments(&json!({ "expected_revision": 0 })),
+            successor_arguments(&json!({ "reason": " " })),
+            successor_arguments(&json!({ "kind": "memo" })),
+        ] {
+            let rendered = Value::Object(rejected.clone());
+            assert!(
+                matches!(
+                    split_supersede_arguments(rejected),
+                    Err(ServiceError::InvalidRequest(_))
+                ),
+                "{rendered} must be a client error"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn surfaces_gate_retract_and_conflict_lookup_before_io() {
+    async fn lifecycle_actions_require_idempotency_key() {
+        let service = offline_service(CLAIM_LIFECYCLE);
+        for (action, arguments) in [
+            (
+                RememberAction::Retract,
+                retract_arguments(&json!({ "claim_id": 41, "expected_revision": 2 })),
+            ),
+            (RememberAction::Supersede, successor_arguments(&json!({}))),
+        ] {
+            let error = FleetMemoryService::remember(
+                &service,
+                offline_scope(),
+                RememberRequest::new(action, None, arguments),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&error, ServiceError::InvalidRequest(message)
+                    if *message == format!("remember({}) requires idempotency_key", action.as_str())),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn supersede_successor_is_validated_before_io() {
+        let service = offline_service(CLAIM_LIFECYCLE);
+        for (extra, expected) in [
+            (
+                json!({ "origin": "source_derived" }),
+                "remember(supersede) only accepts operator_asserted origin",
+            ),
+            (
+                json!({ "actor": "agent-b" }),
+                "claim actor must match the authenticated fleet agent",
+            ),
+            (json!({ "polarity": 0 }), "claim polarity must be -1 or 1"),
+            (
+                json!({ "text": " padded " }),
+                "claim text must not have leading or trailing whitespace",
+            ),
+        ] {
+            let error = FleetMemoryService::remember(
+                &service,
+                offline_scope(),
+                RememberRequest::new(
+                    RememberAction::Supersede,
+                    Some("supersede/41".into()),
+                    successor_arguments(&extra),
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&error, ServiceError::InvalidRequest(message) if message.starts_with(expected)),
+                "{extra}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn surfaces_gate_lifecycle_actions_and_conflict_lookup_before_io() {
         let record_only = offline_service(RememberSurface::RECORD_ONLY);
         assert_eq!(
             FleetMemoryService::remember_surface(&record_only),
@@ -2112,6 +2323,21 @@ mod tests {
                 RememberAction::Retract,
                 None,
                 retract_arguments(&json!({ "claim_id": 41, "expected_revision": 2 })),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, ServiceError::Refused(refusal) if refusal.code == "lifecycle_unavailable"),
+            "{error}"
+        );
+        let error = FleetMemoryService::remember(
+            &record_only,
+            offline_scope(),
+            RememberRequest::new(
+                RememberAction::Supersede,
+                None,
+                successor_arguments(&json!({})),
             ),
         )
         .await

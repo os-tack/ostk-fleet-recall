@@ -321,6 +321,28 @@ error returned from inside the transaction, so the receipt reservation rolls
 back with everything else and the key stays free. Races between concurrent
 lifecycle and record calls surface as `40001` and retry.
 
+`remember(supersede)` combines the two paths in one serializable transaction.
+Like record, it validates and embeds the successor before the transaction,
+after a fast receipt lookup, so no model call holds a lock. Inside, after the
+receipt, it reads the predecessor and refuses a successor whose kind,
+normalized `subject::predicate` key, or conflict eligibility differs (a claim
+is eligible when it has a key, a value, and an eligible kind), so a supersede
+can never move a claim off its key or out of the detector's view. It then takes
+the retract path's locks and owner checks and moves the predecessor to
+`superseded`. The successor is written by the same helpers record uses: claim,
+support, passage vectors, `claim:{id}` corpus chunk, the `recorded` claim
+event, and conflict detection. Because the predecessor is no longer current,
+the detector compares the successor only with the claims that stay current. It
+may open, reopen, or join the key's v2 conflict. The predecessor's
+`superseded_by` is then set to the successor, the successor gets an unkeyed
+`claim_recorded` event that carries its detection audit and `supersedes`, and
+the key's lineage and current claims are locked again and re-evaluated as for
+a retract. A compatible successor therefore lets the conflict close and
+restores its members, while an incompatible one keeps it open with the
+successor as a member in its predecessor's place. The one keyed event is
+`claim_superseded`, and the receipt names the successor. The record path's
+SQL, statement order, and responses are unchanged by this sharing.
+
 ## Trust and isolation invariants
 
 1. A process is configured for exactly one tenant/project. SQL predicates and
@@ -338,8 +360,11 @@ lifecycle and record calls surface as `40001` and retry.
 6. Backend failures are logged server-side but database details are redacted
    from MCP clients.
 7. Retirement is owner-only and resolution is detector-verified. An agent can
-   retract only an `operator_asserted` claim it authored, at the revision it
-   read. No request names a conflict outcome: a conflict closes only when the
+   retract or supersede only an `operator_asserted` claim it authored, at the
+   revision it read, and a successor keeps its predecessor's kind, key, and
+   conflict eligibility. A supersede points its predecessor's `superseded_by`
+   at that later successor, written by the same author. No request names
+   a conflict outcome: a conflict closes only when the
    detector finds no incompatible lifecycle-current pair on its key, and a
    disputed claim is restored only when no other open conflict holds it. Every
    disputed claim therefore stays a member of at least one open current
@@ -382,13 +407,13 @@ lifecycle and record calls surface as `40001` and retry.
 ### Next product steps
 
 - Implement the reserved Recall actions. The service contract already names
-  `remember` supersede, forget, restore, resolve, relate, split, focus, track,
-  and consolidate, and `recall` surface, discover, synthesize, and audit;
-  today `remember(record|retract)` and `recall(search|get|conflicts|status)`
-  are served (with `get` covering claims, chunks, and, on the private writer,
-  conflicts), and the others return an error. Supersede, conflict
-  acknowledgement, and concession resolve are the next lifecycle steps in
-  [ADR 0004](adr/0004-serving-conflict-lifecycle.md).
+  `remember` forget, restore, resolve, relate, split, focus, track, and
+  consolidate, and `recall` surface, discover, synthesize, and audit;
+  today `remember(record|supersede|retract)` and
+  `recall(search|get|conflicts|status)` are served (with `get` covering claims,
+  chunks, and, on the private writer, conflicts), and the others return an
+  error. Conflict acknowledgement and concession resolve are the next
+  lifecycle steps in [ADR 0004](adr/0004-serving-conflict-lifecycle.md).
 - Wire the dynamic-memory runtimes that already exist as library code into a
   worker or CLI and into MCP recall; the README's
   [built but not yet wired](../README.md#built-but-not-yet-wired) section lists

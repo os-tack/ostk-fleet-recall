@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::ledger::{ClaimState, functional_values_are_incompatible, intervals_overlap};
+use crate::ledger::{ClaimKind, ClaimState, functional_values_are_incompatible, intervals_overlap};
 use crate::memory_contracts::discrepancy::is_blank_rationale;
 use crate::{FleetError, FleetScope, Result};
 
@@ -280,6 +280,81 @@ pub fn check_owner_transition(
     Ok(())
 }
 
+/// The detector-relevant identity of a claim: its kind, its normalized
+/// functional key, and whether the detector compares it at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimShape {
+    pub kind: ClaimKind,
+    pub claim_key: Option<String>,
+    pub conflict_eligible: bool,
+}
+
+/// A successor must keep its predecessor's kind, normalized key, and conflict
+/// eligibility, so a supersede can change a claim's value or wording but can
+/// never move it out of the detector's view or onto another key.
+pub fn check_successor(
+    predecessor_id: i64,
+    predecessor: &ClaimShape,
+    successor: &ClaimShape,
+) -> std::result::Result<(), LifecycleRefusal> {
+    if successor.kind != predecessor.kind {
+        return Err(LifecycleRefusal::new(
+            RefusalCode::SuccessorKindMismatch,
+            format!(
+                "claim {predecessor_id} is a {}; its successor must be a {} too, not a {}",
+                predecessor.kind.as_str(),
+                predecessor.kind.as_str(),
+                successor.kind.as_str()
+            ),
+            json!({
+                "claim_id": predecessor_id,
+                "kind": predecessor.kind.as_str(),
+                "successor_kind": successor.kind.as_str(),
+            }),
+        ));
+    }
+    if successor.claim_key != predecessor.claim_key {
+        return Err(LifecycleRefusal::new(
+            RefusalCode::SuccessorKeyMismatch,
+            format!(
+                "claim {predecessor_id} has claim_key {}; its successor's subject and predicate normalize to {}",
+                display_key(predecessor.claim_key.as_deref()),
+                display_key(successor.claim_key.as_deref())
+            ),
+            json!({
+                "claim_id": predecessor_id,
+                "claim_key": predecessor.claim_key,
+                "successor_claim_key": successor.claim_key,
+            }),
+        ));
+    }
+    if successor.conflict_eligible != predecessor.conflict_eligible {
+        let message = if predecessor.conflict_eligible {
+            format!(
+                "claim {predecessor_id} is conflict-eligible; its successor must also carry a value so the detector keeps comparing it"
+            )
+        } else {
+            format!(
+                "claim {predecessor_id} is not conflict-eligible; its successor must not carry a value either"
+            )
+        };
+        return Err(LifecycleRefusal::new(
+            RefusalCode::SuccessorEligibilityMismatch,
+            message,
+            json!({
+                "claim_id": predecessor_id,
+                "conflict_eligible": predecessor.conflict_eligible,
+                "successor_conflict_eligible": successor.conflict_eligible,
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn display_key(claim_key: Option<&str>) -> String {
+    claim_key.map_or_else(|| "none".to_owned(), |key| format!("'{key}'"))
+}
+
 /// Every incompatible pair among lifecycle-current, conflict-eligible claims
 /// of one functional key, as `(lower id, higher id)` in ascending order.
 ///
@@ -437,7 +512,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::ledger::{Claim, ClaimKind, claims_are_incompatible};
+    use crate::ledger::{Claim, ClaimInput, claims_are_incompatible};
 
     fn locked(id: i64, value: Value, polarity: i16) -> LockedKeyClaim {
         LockedKeyClaim {
@@ -670,6 +745,110 @@ mod tests {
             plan_reevaluation(lineage, &[y, z], &[]),
             Reevaluation::Divergent { .. }
         ));
+    }
+
+    fn claim_input(kind: ClaimKind, subject: Option<&str>, value: Option<Value>) -> ClaimInput {
+        ClaimInput {
+            kind,
+            text: "successor fixture".into(),
+            subject: subject.map(str::to_owned),
+            predicate: subject.map(|_| "Database".to_owned()),
+            value,
+            polarity: 1,
+            origin: OPERATOR_ASSERTED_ORIGIN.into(),
+            actor: None,
+            confidence: 1.0,
+            valid_from: None,
+            valid_to: None,
+            support: Vec::new(),
+        }
+    }
+
+    /// The shape `record` would give this input, as the successor check sees it.
+    fn shape_of(input: &ClaimInput) -> ClaimShape {
+        let prepared = input.prepare().unwrap();
+        ClaimShape {
+            kind: input.kind,
+            claim_key: prepared.claim_key,
+            conflict_eligible: prepared.conflict_eligible,
+        }
+    }
+
+    #[test]
+    fn successor_must_keep_kind_key_and_eligibility() {
+        let predecessor = shape_of(&claim_input(
+            ClaimKind::Decision,
+            Some("fleet-memory"),
+            Some(json!("cockroachdb")),
+        ));
+        assert_eq!(
+            predecessor.claim_key.as_deref(),
+            Some("fleet-memory::database")
+        );
+
+        // A new value, and spelling that normalizes to the same key, are fine.
+        let respelled = claim_input(
+            ClaimKind::Decision,
+            Some("  Fleet   Memory "),
+            Some(json!({"engine": "cockroachdb", "version": 26})),
+        );
+        assert!(check_successor(41, &predecessor, &shape_of(&respelled)).is_ok());
+        // A keyless note may be replaced by another keyless note.
+        let note = shape_of(&claim_input(ClaimKind::Note, None, None));
+        assert!(check_successor(41, &note, &note.clone()).is_ok());
+        // A keyed note carries no value, so it stays outside the detector.
+        let keyed_note = shape_of(&claim_input(ClaimKind::Note, Some("fleet-memory"), None));
+        assert!(!keyed_note.conflict_eligible);
+        assert!(check_successor(41, &keyed_note, &keyed_note.clone()).is_ok());
+
+        let refused = |successor: &ClaimInput| {
+            check_successor(41, &predecessor, &shape_of(successor)).unwrap_err()
+        };
+        let kind = refused(&claim_input(
+            ClaimKind::Fact,
+            Some("fleet-memory"),
+            Some(json!("x")),
+        ));
+        assert_eq!(kind.code, RefusalCode::SuccessorKindMismatch);
+        assert_eq!(kind.details["kind"], "decision");
+        assert_eq!(kind.details["successor_kind"], "fact");
+
+        let moved = refused(&claim_input(
+            ClaimKind::Decision,
+            Some("fleet-store"),
+            Some(json!("x")),
+        ));
+        assert_eq!(moved.code, RefusalCode::SuccessorKeyMismatch);
+        assert_eq!(moved.details["claim_key"], "fleet-memory::database");
+        assert_eq!(
+            moved.details["successor_claim_key"],
+            "fleet-store::database"
+        );
+        let unkeyed = refused(&claim_input(ClaimKind::Decision, None, Some(json!("x"))));
+        assert_eq!(unkeyed.code, RefusalCode::SuccessorKeyMismatch);
+        assert_eq!(unkeyed.details["successor_claim_key"], Value::Null);
+
+        // Dropping the value would take the key out of the detector's view.
+        let valueless = refused(&claim_input(
+            ClaimKind::Decision,
+            Some("fleet-memory"),
+            None,
+        ));
+        assert_eq!(valueless.code, RefusalCode::SuccessorEligibilityMismatch);
+        assert_eq!(valueless.details["conflict_eligible"], true);
+        assert_eq!(valueless.details["successor_conflict_eligible"], false);
+        // And adding one would bring an unchecked key into it.
+        let entering = check_successor(
+            41,
+            &shape_of(&claim_input(
+                ClaimKind::Decision,
+                Some("fleet-memory"),
+                None,
+            )),
+            &predecessor,
+        )
+        .unwrap_err();
+        assert_eq!(entering.code, RefusalCode::SuccessorEligibilityMismatch);
     }
 
     #[test]

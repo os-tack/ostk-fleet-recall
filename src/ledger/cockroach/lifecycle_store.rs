@@ -1,10 +1,14 @@
-//! Serializable lifecycle transactions for the `CockroachDB` claim ledger.
+//! Serializable lifecycle transactions (`retract`, `supersede`) for the
+//! `CockroachDB` claim ledger.
 //!
 //! Every statement is keyed on the trusted `(tenant_id, project)` and locks in
 //! the record path's order: the key's conflict lineage rows first, then its
-//! lifecycle-current claims in ascending id order. A refusal is an error from
+//! lifecycle-current claims in ascending id order. A supersede writes its
+//! successor through the same helpers record uses. A refusal is an error from
 //! inside the retried closure, so the transaction rolls back with its receipt
 //! reservation and the idempotency key stays free.
+
+use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -12,19 +16,27 @@ use sqlx::postgres::PgRow;
 use sqlx::{Row, Transaction};
 
 use super::{
-    CockroachClaimLedger, MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON, MAX_LEDGER_RESULTS, fetch_claim,
-    hydrate_conflicts, parse_claim_state, protocol_error,
+    ClaimPassage, CockroachClaimLedger, MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON, MAX_LEDGER_RESULTS,
+    claim_recorded_event_payload, detect_and_observe, fetch_claim, hydrate_conflicts,
+    insert_claim_projection, insert_claim_recorded_event, parse_claim_kind, parse_claim_state,
+    protocol_error, require_active_model,
 };
 use crate::ledger::lifecycle::{
-    ConflictRowState, LifecycleRefusal, LockedKeyClaim, MAX_REPORTED_REMAINING_PAIRS, Reevaluation,
-    RefusalCode, V2Lineage, check_owner_transition, classify_lineages, lifecycle_request_identity,
-    plan_reevaluation, validate_reason,
+    ClaimShape, ConflictRowState, LifecycleRefusal, LockedKeyClaim, MAX_REPORTED_REMAINING_PAIRS,
+    OPERATOR_ASSERTED_ORIGIN, Reevaluation, RefusalCode, V2Lineage, check_owner_transition,
+    check_successor, classify_lineages, lifecycle_request_identity, plan_reevaluation,
+    validate_reason,
 };
-use crate::ledger::{ClaimMutation, ClaimState, ClaimTarget, Conflict, ConflictReevaluation};
+use crate::ledger::types::PreparedClaim;
+use crate::ledger::{
+    ClaimInput, ClaimKind, ClaimMutation, ClaimState, ClaimTarget, Conflict, ConflictReevaluation,
+    LifecycleReplayRequest, SupersededClaim,
+};
 use crate::store::cockroach::with_serializable_retry;
 use crate::{FleetError, FleetScope, Result};
 
 const RETRACT_OPERATION: &str = "retract";
+const SUPERSEDE_OPERATION: &str = "supersede";
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 /// Every pair among 256 locked claims plus one sentinel row.
@@ -46,10 +58,10 @@ const FINISH_CLAIM_RECEIPT_SQL: &str = "UPDATE memory_mutation_receipts \
      WHERE tenant_id = $1 AND idempotency_key = $2 \
        AND project = $3 AND request = $4 AND operation = $5";
 
-const LIFECYCLE_TARGET_CLAIM_SQL: &str = "SELECT id, claim_key, state, origin, actor, revision, \
-            polarity, valid_from, valid_to, conflict_eligible, value \
+const LIFECYCLE_TARGET_CLAIM_SQL: &str = "SELECT id, kind, claim_key, state, origin, actor, \
+            revision, polarity, valid_from, valid_to, conflict_eligible, value \
      FROM memory_claims@primary WHERE tenant_id = $1 AND project = $2 AND id = $3";
-const LOCK_LIFECYCLE_TARGET_CLAIM_SQL: &str = "SELECT id, claim_key, state, origin, actor, \
+const LOCK_LIFECYCLE_TARGET_CLAIM_SQL: &str = "SELECT id, kind, claim_key, state, origin, actor, \
             revision, polarity, valid_from, valid_to, conflict_eligible, value \
      FROM memory_claims@primary WHERE tenant_id = $1 AND project = $2 AND id = $3 \
      FOR UPDATE";
@@ -137,10 +149,16 @@ const RESTORE_DISPUTED_MEMBERS_SQL: &str = "UPDATE memory_claims AS claim \
 const INSERT_TRANSITION_EVENT_SQL: &str = "INSERT INTO memory_claim_events (\
          tenant_id, project, claim_id, event_kind, actor, reason, from_state, to_state, payload\
      ) VALUES ($1, $2, $3, 'state_transition', $4, $5, $6, $7, $8)";
-const INSERT_CLAIM_RETRACTED_EVENT_SQL: &str = "INSERT INTO memory_events (\
+/// Link a predecessor this transaction just superseded to its successor.
+const SET_SUPERSEDED_BY_SQL: &str = "UPDATE memory_claims SET superseded_by = $4 \
+     WHERE tenant_id = $1 AND project = $2 AND id = $3 \
+       AND state = 'superseded' AND superseded_by IS NULL \
+     RETURNING revision";
+/// The one keyed `memory_events` row of a claim lifecycle mutation.
+const INSERT_KEYED_CLAIM_EVENT_SQL: &str = "INSERT INTO memory_events (\
          tenant_id, project, agent, session_id, event_kind, entity_kind, \
          entity_id, idempotency_key, payload\
-     ) VALUES ($1, $2, $3, $4, 'claim_retracted', 'claim', $5, $6, $7)";
+     ) VALUES ($1, $2, $3, $4, $5, 'claim', $6, $7, $8)";
 const GET_CONFLICTS_BY_ID_SQL: &str = "SELECT id, project, claim_key, kind, state, detector, \
             rationale, revision, detected_at, last_seen_at, resolved_at, resolution_kind, \
             resolution_reason \
@@ -162,7 +180,45 @@ impl Replayable for ClaimMutation {
 
 struct TargetRow {
     claim: LockedKeyClaim,
+    kind: ClaimKind,
     claim_key: Option<String>,
+}
+
+impl TargetRow {
+    fn shape(&self) -> ClaimShape {
+        ClaimShape {
+            kind: self.kind,
+            claim_key: self.claim_key.clone(),
+            conflict_eligible: self.claim.conflict_eligible,
+        }
+    }
+}
+
+/// A lifecycle target locked in record's order and checked for owner
+/// authority.
+struct LockedTarget {
+    claim: LockedKeyClaim,
+    /// The key the detector compares the target on; `None` when the target is
+    /// not conflict-eligible, so no lineage or peer claim was locked.
+    conflict_key: Option<String>,
+    lineage: Option<V2Lineage>,
+    /// The key's other lifecycle-current claims, locked in ascending id order.
+    remaining: Vec<LockedKeyClaim>,
+}
+
+/// The lineage and lifecycle-current claims of one key, as locked for R8.
+struct ReevaluationScope<'a> {
+    lineage: Option<V2Lineage>,
+    claim_key: &'a str,
+    current: &'a [LockedKeyClaim],
+}
+
+/// What R8 changed and what it reports.
+#[derive(Debug, Default)]
+struct ReevaluationEffect {
+    conflicts_resolved: Vec<i64>,
+    claims_restored: Vec<i64>,
+    reevaluation: Option<ConflictReevaluation>,
 }
 
 pub(super) async fn retract_claim(
@@ -215,6 +271,26 @@ fn retract_request(scope: &FleetScope, target: ClaimTarget, reason: Option<&str>
     )
 }
 
+/// The canonical request identity a `supersede` receipt stores. The successor
+/// is bound exactly as record binds its input.
+fn supersede_request(
+    scope: &FleetScope,
+    target: ClaimTarget,
+    reason: Option<&str>,
+    successor: &ClaimInput,
+) -> Value {
+    lifecycle_request_identity(
+        SUPERSEDE_OPERATION,
+        scope,
+        &json!({
+            "claim_id": target.claim_id,
+            "expected_revision": target.expected_revision,
+            "reason": reason,
+            "successor": successor,
+        }),
+    )
+}
+
 /// R1 for a deployment that does not serve the request's action: a committed
 /// request still replays, so a refusal is only ever returned for a key that no
 /// receipt holds. One autocommit read; nothing is locked or written.
@@ -222,7 +298,7 @@ pub(super) async fn replay_unserved_lifecycle(
     ledger: &CockroachClaimLedger,
     scope: &FleetScope,
     idempotency_key: &str,
-    retract: Option<(ClaimTarget, Option<&str>)>,
+    request: Option<LifecycleReplayRequest<'_>>,
 ) -> Result<Option<ClaimMutation>> {
     ledger.ensure_scope(scope)?;
     // A key no mutation accepts can hold no receipt.
@@ -237,22 +313,28 @@ pub(super) async fn replay_unserved_lifecycle(
     else {
         return Ok(None);
     };
-    let Some((target, reason)) = retract else {
-        // Arguments that do not name a retract cannot equal a committed one.
+    // Arguments that do not name a lifecycle request cannot equal a committed one.
+    let Some(request) = request else {
         return Err(FleetError::IdempotencyConflict(
             "idempotency key was already used for a different mutation".into(),
         ));
     };
-    decode_receipt_parts(
-        &row,
-        scope,
-        RETRACT_OPERATION,
-        &retract_request(scope, target, reason),
-    )
-    .map(Some)
+    let (operation, identity) = match request {
+        LifecycleReplayRequest::Retract { target, reason } => {
+            (RETRACT_OPERATION, retract_request(scope, target, reason))
+        }
+        LifecycleReplayRequest::Supersede {
+            target,
+            reason,
+            successor,
+        } => (
+            SUPERSEDE_OPERATION,
+            supersede_request(scope, target, reason, successor),
+        ),
+    };
+    decode_receipt_parts(&row, scope, operation, &identity).map(Some)
 }
 
-#[allow(clippy::too_many_lines)] // one serializable unit, kept in its lock order
 async fn retract_once(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
@@ -263,14 +345,10 @@ async fn retract_once(
 ) -> Result<ClaimMutation> {
     // R1/R2: a committed request replays before any precondition, so a
     // retried retract returns its stored result rather than `not_current`.
-    if let Some(row) = select_receipt(transaction, scope, key).await? {
-        return decode_receipt_parts(&row, scope, RETRACT_OPERATION, request);
-    }
-    if !reserve_receipt(transaction, scope, key, request, RETRACT_OPERATION).await? {
-        let row = select_receipt(transaction, scope, key)
-            .await?
-            .ok_or_else(|| protocol_error("conflicting idempotency receipt disappeared"))?;
-        return decode_receipt_parts(&row, scope, RETRACT_OPERATION, request);
+    if let Some(replay) =
+        replay_or_reserve(transaction, scope, key, request, RETRACT_OPERATION).await?
+    {
+        return Ok(replay);
     }
 
     // R3: plain read of the target.
@@ -278,155 +356,51 @@ async fn retract_once(
         return Err(not_found(target.claim_id).into());
     };
 
-    // R4/R5: lineage lock, then the key's current claims in id order.
-    let conflict_key = target_row
-        .claim
-        .conflict_eligible
-        .then_some(target_row.claim_key.as_deref())
-        .flatten();
-    let (locked_target, lineage, remaining) = if let Some(claim_key) = conflict_key {
-        let lineage = lock_lineages(transaction, scope, claim_key).await?;
-        let mut locked = lock_current_claims(transaction, scope, claim_key).await?;
-        let Some(position) = locked.iter().position(|claim| claim.id == target.claim_id) else {
-            // The plain read already shows why it is not current; the owner
-            // checks report it in their normal order.
-            check_owner_transition(&target_row.claim, &scope.agent, target.expected_revision)?;
-            return Err(protocol_error(
-                "lifecycle target left the locked current claim set",
-            ));
-        };
-        let locked_target = locked.remove(position);
-        (locked_target, lineage, locked)
-    } else {
-        let locked = read_target(transaction, scope, target.claim_id, true)
-            .await?
-            .ok_or_else(|| not_found(target.claim_id))?;
-        (locked.claim, None, Vec::new())
-    };
-
-    // R6: owner authority against the locked row.
-    check_owner_transition(&locked_target, &scope.agent, target.expected_revision)?;
+    // R4-R6: lineage lock, the key's current claims in id order, owner authority.
+    let locked = lock_owned_target(transaction, scope, target, &target_row).await?;
 
     // R7: the transition and its claim event.
-    let revision = sqlx::query_scalar::<_, i64>(TRANSITION_OWNED_CLAIM_SQL)
-        .bind(scope.tenant_id)
-        .bind(&scope.project)
-        .bind(locked_target.id)
-        .bind(locked_target.revision)
-        .bind(ClaimState::Retracted.as_str())
-        .bind(&scope.agent)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or_else(|| protocol_error("owned claim changed during its locked transition"))?;
+    let revision =
+        transition_owned_claim(transaction, scope, &locked.claim, ClaimState::Retracted).await?;
     insert_transition_event(
         transaction,
         scope,
-        locked_target.id,
+        locked.claim.id,
         "retracted_by_author",
-        locked_target.state,
+        locked.claim.state,
         ClaimState::Retracted,
         json!({
             "idempotency_key": key,
             "reason": reason,
-            "revision_before": locked_target.revision,
+            "revision_before": locked.claim.revision,
         }),
     )
     .await?;
 
     // R8: re-evaluate the key's open v2 conflict over what remains current.
-    let open_lineage = lineage.filter(|lineage| lineage.state == ConflictRowState::Open);
-    let plan = match (open_lineage, conflict_key) {
-        (Some(lineage), Some(claim_key)) => {
-            let sql_pairs = key_incompatible_pairs(transaction, scope, claim_key).await?;
-            Some((
-                claim_key,
-                plan_reevaluation(Some(lineage), &remaining, &sql_pairs),
-            ))
-        }
-        _ => None,
-    };
-    let mut conflicts_resolved = Vec::new();
-    let mut claims_restored = Vec::new();
-    let reevaluation = match plan {
-        Some((
-            claim_key,
-            Reevaluation::Close {
-                conflict_id,
-                revision: conflict_revision,
-                restore_candidates,
-            },
-        )) => {
-            let closed_revision = close_conflict(
+    let effect = match locked.conflict_key.as_deref() {
+        Some(claim_key) => {
+            reevaluate_key(
                 transaction,
                 scope,
-                conflict_id,
-                conflict_revision,
+                ReevaluationScope {
+                    lineage: locked.lineage,
+                    claim_key,
+                    current: &locked.remaining,
+                },
                 &format!(
                     "no lifecycle-current incompatible pair remains after retract of claim {}",
-                    locked_target.id
+                    locked.claim.id
                 ),
-            )
-            .await?;
-            claims_restored = restore_disputed_members(
-                transaction,
-                scope,
-                RestoreScope {
-                    conflict_id,
-                    conflict_revision: closed_revision,
-                    claim_key,
-                },
-                &restore_candidates,
                 key,
             )
-            .await?;
-            conflicts_resolved.push(conflict_id);
-            Some(reevaluation_report(
-                conflict_id,
-                "closed",
-                closed_revision,
-                &[],
-            ))
+            .await?
         }
-        Some((
-            _,
-            Reevaluation::StillOpen {
-                conflict_id,
-                revision: conflict_revision,
-                pairs,
-            },
-        )) => Some(reevaluation_report(
-            conflict_id,
-            "still_open",
-            conflict_revision,
-            &pairs,
-        )),
-        Some((
-            _,
-            Reevaluation::Divergent {
-                conflict_id,
-                revision: conflict_revision,
-                rust_pairs,
-                sql_pairs,
-            },
-        )) => {
-            tracing::error!(
-                conflict_id,
-                rust_pairs = rust_pairs.len(),
-                sql_pairs = sql_pairs.len(),
-                "lifecycle re-evaluation diverged between Rust and SQL; the conflict stays open"
-            );
-            Some(reevaluation_report(
-                conflict_id,
-                "divergent",
-                conflict_revision,
-                &sql_pairs,
-            ))
-        }
-        Some((_, Reevaluation::NoLineage | Reevaluation::NotOpen)) | None => None,
+        None => ReevaluationEffect::default(),
     };
 
     // R9: the claim as committed, and the one keyed event.
-    let claim = fetch_claim(transaction, scope, locked_target.id)
+    let claim = fetch_claim(transaction, scope, locked.claim.id)
         .await?
         .ok_or_else(|| protocol_error("retracted claim disappeared inside its transaction"))?;
     if claim.revision != revision || claim.state != ClaimState::Retracted {
@@ -434,31 +408,31 @@ async fn retract_once(
             "retracted claim did not read back its committed transition",
         ));
     }
-    sqlx::query(INSERT_CLAIM_RETRACTED_EVENT_SQL)
-        .bind(scope.tenant_id)
-        .bind(&scope.project)
-        .bind(&scope.agent)
-        .bind(&scope.session_id)
-        .bind(claim.id.to_string())
-        .bind(key)
-        .bind(json!({
+    insert_keyed_claim_event(
+        transaction,
+        scope,
+        "claim_retracted",
+        claim.id,
+        key,
+        json!({
             "claim_key": claim.claim_key,
-            "from_state": locked_target.state.as_str(),
+            "from_state": locked.claim.state.as_str(),
             "to_state": ClaimState::Retracted.as_str(),
             "revision": revision,
-            "conflict_reevaluation": reevaluation,
-        }))
-        .execute(&mut **transaction)
-        .await?;
+            "conflict_reevaluation": effect.reevaluation,
+        }),
+    )
+    .await?;
 
     let mutation = ClaimMutation {
         operation: RETRACT_OPERATION.into(),
         claim,
+        superseded: None,
         idempotent_replay: false,
         conflicts_opened: Vec::new(),
-        conflicts_resolved,
-        claims_restored,
-        reevaluation,
+        conflicts_resolved: effect.conflicts_resolved,
+        claims_restored: effect.claims_restored,
+        reevaluation: effect.reevaluation,
     };
     // R10: finish the reservation this transaction made.
     finish_claim_receipt(
@@ -467,6 +441,265 @@ async fn retract_once(
         key,
         request,
         RETRACT_OPERATION,
+        &mutation,
+    )
+    .await?;
+    Ok(mutation)
+}
+
+/// Everything a supersede transaction writes, prepared and embedded before
+/// the transaction starts so no model call ever holds a lock.
+struct SupersedeWrite {
+    target: ClaimTarget,
+    reason: Option<String>,
+    successor: ClaimInput,
+    prepared: PreparedClaim,
+    passages: Vec<ClaimPassage>,
+    model: String,
+    key: String,
+    request: Value,
+}
+
+pub(super) async fn supersede_claim(
+    ledger: &CockroachClaimLedger,
+    scope: &FleetScope,
+    target: ClaimTarget,
+    reason: Option<&str>,
+    successor: &ClaimInput,
+    idempotency_key: &str,
+) -> Result<ClaimMutation> {
+    ledger.ensure_scope(scope)?;
+    let key = validated_idempotency_key(idempotency_key)?;
+    validate_claim_target(target)?;
+    if let Some(reason) = reason {
+        validate_reason(reason).map_err(FleetError::Memory)?;
+    }
+    if successor
+        .actor
+        .as_deref()
+        .is_some_and(|actor| actor != scope.agent)
+    {
+        return Err(FleetError::InvalidScope(
+            "claim actor must match the authenticated fleet agent".into(),
+        ));
+    }
+    let prepared = successor.prepare()?;
+    if successor.origin != OPERATOR_ASSERTED_ORIGIN {
+        return Err(FleetError::Memory(
+            "a supersede successor must be an operator_asserted claim".into(),
+        ));
+    }
+    let request = supersede_request(scope, target, reason, successor);
+    // As for record, a non-transactional fast path avoids embedding a known
+    // replay; the transaction checks the receipt again before anything else.
+    if let Some(row) = sqlx::query(SELECT_RECEIPT_SQL)
+        .bind(scope.tenant_id)
+        .bind(key)
+        .fetch_optional(&ledger.pool)
+        .await?
+    {
+        return decode_receipt_parts(&row, scope, SUPERSEDE_OPERATION, &request);
+    }
+    let passages = ledger.embed_claim_passages(scope, successor, &prepared)?;
+    let write = Arc::new(SupersedeWrite {
+        target,
+        reason: reason.map(str::to_owned),
+        successor: successor.clone(),
+        prepared,
+        passages,
+        model: ledger.claim_model.clone(),
+        key: key.to_owned(),
+        request,
+    });
+    let scope = scope.clone();
+    with_serializable_retry(&ledger.pool, ledger.retry_policy, move |transaction| {
+        let scope = scope.clone();
+        let write = Arc::clone(&write);
+        Box::pin(async move { supersede_once(transaction, &scope, &write).await })
+    })
+    .await
+}
+
+#[allow(clippy::too_many_lines)] // one serializable unit, kept in its lock order
+async fn supersede_once(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    write: &SupersedeWrite,
+) -> Result<ClaimMutation> {
+    let SupersedeWrite {
+        target,
+        reason,
+        successor,
+        prepared,
+        passages,
+        model,
+        key,
+        request,
+    } = write;
+    let (target, reason, key) = (*target, reason.as_deref(), key.as_str());
+
+    // R1/R2, before any precondition, exactly as for retract.
+    if let Some(replay) =
+        replay_or_reserve(transaction, scope, key, request, SUPERSEDE_OPERATION).await?
+    {
+        return Ok(replay);
+    }
+
+    // R3: plain read; the successor must keep the predecessor's kind, key,
+    // and conflict eligibility, which never change after a claim is written.
+    let Some(target_row) = read_target(transaction, scope, target.claim_id, false).await? else {
+        return Err(not_found(target.claim_id).into());
+    };
+    check_successor(
+        target.claim_id,
+        &target_row.shape(),
+        &ClaimShape {
+            kind: successor.kind,
+            claim_key: prepared.claim_key.clone(),
+            conflict_eligible: prepared.conflict_eligible,
+        },
+    )?;
+
+    // R4-R6: the same locks and owner checks as retract.
+    let locked = lock_owned_target(transaction, scope, target, &target_row).await?;
+    let predecessor = &locked.claim;
+
+    // R7: retire the predecessor first, so the successor's detection below
+    // compares it only with the claims that stay lifecycle-current.
+    let revision =
+        transition_owned_claim(transaction, scope, predecessor, ClaimState::Superseded).await?;
+
+    // The successor is written exactly as record writes a claim.
+    require_active_model(transaction, scope, model).await?;
+    let mut claim = insert_claim_projection(
+        transaction,
+        scope,
+        successor,
+        prepared,
+        passages,
+        model,
+        json!({ "idempotency_key": key, "supersedes": predecessor.id }),
+    )
+    .await?;
+    let (conflicts_opened, detection) =
+        detect_and_observe(transaction, scope, &mut claim, successor, prepared).await?;
+
+    let linked_revision = sqlx::query_scalar::<_, i64>(SET_SUPERSEDED_BY_SQL)
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(predecessor.id)
+        .bind(claim.id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    if linked_revision != Some(revision) {
+        return Err(protocol_error(
+            "superseded claim changed before its successor link",
+        ));
+    }
+    insert_transition_event(
+        transaction,
+        scope,
+        predecessor.id,
+        "superseded_by_author",
+        predecessor.state,
+        ClaimState::Superseded,
+        json!({
+            "idempotency_key": key,
+            "reason": reason,
+            "revision_before": predecessor.revision,
+            "successor_claim_id": claim.id,
+        }),
+    )
+    .await?;
+    // The successor's own audit event is unkeyed: the one keyed event of this
+    // mutation is `claim_superseded` below.
+    let mut recorded = claim_recorded_event_payload(claim.claim_key.as_deref(), detection);
+    if let Some(recorded) = recorded.as_object_mut() {
+        recorded.insert("supersedes".into(), json!(predecessor.id));
+    }
+    insert_claim_recorded_event(transaction, scope, claim.id, None, recorded).await?;
+
+    // R8: the successor's detection may have inserted, reopened, or joined the
+    // key's lineage, so lock it and the current claims again, then re-evaluate
+    // over what is current now. A compatible successor lets the conflict
+    // close; an incompatible one has replaced its predecessor as a member.
+    let effect = match locked.conflict_key.as_deref() {
+        Some(claim_key) => {
+            let lineage = lock_lineages(transaction, scope, claim_key).await?;
+            let current = if lineage.is_some_and(|lineage| lineage.state == ConflictRowState::Open)
+            {
+                lock_current_claims(transaction, scope, claim_key).await?
+            } else {
+                Vec::new()
+            };
+            reevaluate_key(
+                transaction,
+                scope,
+                ReevaluationScope {
+                    lineage,
+                    claim_key,
+                    current: &current,
+                },
+                &format!(
+                    "no lifecycle-current incompatible pair remains after supersede of claim {} by claim {}",
+                    predecessor.id, claim.id
+                ),
+                key,
+            )
+            .await?
+        }
+        None => ReevaluationEffect::default(),
+    };
+
+    insert_keyed_claim_event(
+        transaction,
+        scope,
+        "claim_superseded",
+        predecessor.id,
+        key,
+        json!({
+            "claim_key": claim.claim_key,
+            "from_state": predecessor.state.as_str(),
+            "to_state": ClaimState::Superseded.as_str(),
+            "revision": revision,
+            "successor_claim_id": claim.id,
+            "conflicts_opened": conflicts_opened,
+            "conflict_reevaluation": effect.reevaluation,
+        }),
+    )
+    .await?;
+
+    let successor_id = claim.id;
+    let claim = fetch_claim(transaction, scope, successor_id)
+        .await?
+        .ok_or_else(|| protocol_error("successor claim disappeared inside its transaction"))?;
+    if !claim.state.is_current() {
+        return Err(protocol_error(
+            "successor claim is not lifecycle-current inside its transaction",
+        ));
+    }
+    let mutation = ClaimMutation {
+        operation: SUPERSEDE_OPERATION.into(),
+        claim,
+        superseded: Some(SupersededClaim {
+            id: predecessor.id,
+            state: ClaimState::Superseded,
+            revision,
+            superseded_by: successor_id,
+        }),
+        idempotent_replay: false,
+        conflicts_opened,
+        conflicts_resolved: effect.conflicts_resolved,
+        claims_restored: effect.claims_restored,
+        reevaluation: effect.reevaluation,
+    };
+    // R10: the receipt names the successor.
+    finish_claim_receipt(
+        transaction,
+        scope,
+        key,
+        request,
+        SUPERSEDE_OPERATION,
         &mutation,
     )
     .await?;
@@ -581,6 +814,208 @@ fn decode_receipt_values<T: DeserializeOwned + Replayable>(
     Ok(decoded)
 }
 
+/// R1/R2: replay a receipt committed under the key, or reserve the key for
+/// this mutation. `Some` is the stored result; `None` means this transaction
+/// now holds the reservation.
+async fn replay_or_reserve(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    key: &str,
+    request: &Value,
+    operation: &str,
+) -> Result<Option<ClaimMutation>> {
+    if let Some(row) = select_receipt(transaction, scope, key).await? {
+        return decode_receipt_parts(&row, scope, operation, request).map(Some);
+    }
+    if !reserve_receipt(transaction, scope, key, request, operation).await? {
+        let row = select_receipt(transaction, scope, key)
+            .await?
+            .ok_or_else(|| protocol_error("conflicting idempotency receipt disappeared"))?;
+        return decode_receipt_parts(&row, scope, operation, request).map(Some);
+    }
+    Ok(None)
+}
+
+/// R4-R6: lock the target's lineage and its key's lifecycle-current claims in
+/// ascending id order (or the target alone when the detector does not compare
+/// it), then check owner authority against the locked row.
+async fn lock_owned_target(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    target: ClaimTarget,
+    target_row: &TargetRow,
+) -> Result<LockedTarget> {
+    let conflict_key = target_row
+        .claim
+        .conflict_eligible
+        .then(|| target_row.claim_key.clone())
+        .flatten();
+    let (claim, lineage, remaining) = if let Some(claim_key) = conflict_key.as_deref() {
+        let lineage = lock_lineages(transaction, scope, claim_key).await?;
+        let mut locked = lock_current_claims(transaction, scope, claim_key).await?;
+        let Some(position) = locked.iter().position(|claim| claim.id == target.claim_id) else {
+            // The plain read already shows why it is not current; the owner
+            // checks report it in their normal order.
+            check_owner_transition(&target_row.claim, &scope.agent, target.expected_revision)?;
+            return Err(protocol_error(
+                "lifecycle target left the locked current claim set",
+            ));
+        };
+        let claim = locked.remove(position);
+        (claim, lineage, locked)
+    } else {
+        let locked = read_target(transaction, scope, target.claim_id, true)
+            .await?
+            .ok_or_else(|| not_found(target.claim_id))?;
+        (locked.claim, None, Vec::new())
+    };
+    check_owner_transition(&claim, &scope.agent, target.expected_revision)?;
+    Ok(LockedTarget {
+        claim,
+        conflict_key,
+        lineage,
+        remaining,
+    })
+}
+
+/// R7: move a locked, owner-checked claim out of the current states.
+async fn transition_owned_claim(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    claim: &LockedKeyClaim,
+    to_state: ClaimState,
+) -> Result<i64> {
+    sqlx::query_scalar::<_, i64>(TRANSITION_OWNED_CLAIM_SQL)
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(claim.id)
+        .bind(claim.revision)
+        .bind(to_state.as_str())
+        .bind(&scope.agent)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| protocol_error("owned claim changed during its locked transition"))
+}
+
+/// R8: when the key's v2 conflict is open, recompute its incompatible pairs
+/// over the locked lifecycle-current claims, in Rust and in SQL, and close it
+/// only when both agree that none remains. The close restores the disputed
+/// members no other open conflict still holds.
+async fn reevaluate_key(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    key_scope: ReevaluationScope<'_>,
+    resolution_reason: &str,
+    key: &str,
+) -> Result<ReevaluationEffect> {
+    let ReevaluationScope {
+        lineage,
+        claim_key,
+        current,
+    } = key_scope;
+    let Some(lineage) = lineage.filter(|lineage| lineage.state == ConflictRowState::Open) else {
+        return Ok(ReevaluationEffect::default());
+    };
+    let sql_pairs = key_incompatible_pairs(transaction, scope, claim_key).await?;
+    match plan_reevaluation(Some(lineage), current, &sql_pairs) {
+        Reevaluation::Close {
+            conflict_id,
+            revision: conflict_revision,
+            restore_candidates,
+        } => {
+            let closed_revision = close_conflict(
+                transaction,
+                scope,
+                conflict_id,
+                conflict_revision,
+                resolution_reason,
+            )
+            .await?;
+            let claims_restored = restore_disputed_members(
+                transaction,
+                scope,
+                RestoreScope {
+                    conflict_id,
+                    conflict_revision: closed_revision,
+                    claim_key,
+                },
+                &restore_candidates,
+                key,
+            )
+            .await?;
+            Ok(ReevaluationEffect {
+                conflicts_resolved: vec![conflict_id],
+                claims_restored,
+                reevaluation: Some(reevaluation_report(
+                    conflict_id,
+                    "closed",
+                    closed_revision,
+                    &[],
+                )),
+            })
+        }
+        Reevaluation::StillOpen {
+            conflict_id,
+            revision: conflict_revision,
+            pairs,
+        } => Ok(ReevaluationEffect {
+            reevaluation: Some(reevaluation_report(
+                conflict_id,
+                "still_open",
+                conflict_revision,
+                &pairs,
+            )),
+            ..ReevaluationEffect::default()
+        }),
+        Reevaluation::Divergent {
+            conflict_id,
+            revision: conflict_revision,
+            rust_pairs,
+            sql_pairs,
+        } => {
+            tracing::error!(
+                conflict_id,
+                rust_pairs = rust_pairs.len(),
+                sql_pairs = sql_pairs.len(),
+                "lifecycle re-evaluation diverged between Rust and SQL; the conflict stays open"
+            );
+            Ok(ReevaluationEffect {
+                reevaluation: Some(reevaluation_report(
+                    conflict_id,
+                    "divergent",
+                    conflict_revision,
+                    &sql_pairs,
+                )),
+                ..ReevaluationEffect::default()
+            })
+        }
+        Reevaluation::NoLineage | Reevaluation::NotOpen => Ok(ReevaluationEffect::default()),
+    }
+}
+
+/// The one keyed `memory_events` row of a claim lifecycle mutation.
+async fn insert_keyed_claim_event(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    event_kind: &str,
+    claim_id: i64,
+    key: &str,
+    payload: Value,
+) -> Result<()> {
+    sqlx::query(INSERT_KEYED_CLAIM_EVENT_SQL)
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(&scope.agent)
+        .bind(&scope.session_id)
+        .bind(event_kind)
+        .bind(claim_id.to_string())
+        .bind(key)
+        .bind(payload)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
 async fn select_receipt(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
@@ -659,7 +1094,9 @@ async fn read_target(
     else {
         return Ok(None);
     };
+    let kind: String = row.try_get("kind")?;
     Ok(Some(TargetRow {
+        kind: parse_claim_kind(&kind)?,
         claim_key: row.try_get("claim_key")?,
         claim: decode_locked_claim(&row)?,
     }))
@@ -1020,6 +1457,69 @@ mod tests {
             ),
             Err(FleetError::Memory(_))
         ));
+    }
+
+    fn successor(text: &str) -> ClaimInput {
+        serde_json::from_value(json!({
+            "kind": "fact", "text": text, "subject": "fleet", "predicate": "database",
+            "value": "cockroachdb",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn supersede_receipts_bind_the_successor_and_never_serve_another_operation() {
+        let scope = scope("project");
+        let target = ClaimTarget {
+            claim_id: 41,
+            expected_revision: 2,
+        };
+        let request = supersede_request(&scope, target, None, &successor("CockroachDB 26"));
+        let mut stored = stored_retract();
+        stored["operation"] = json!("supersede");
+        stored["superseded"] = json!({
+            "id": 41, "state": "superseded", "revision": 3, "superseded_by": 42,
+        });
+
+        let replay: ClaimMutation = decode_receipt_values(
+            "project",
+            SUPERSEDE_OPERATION,
+            &request,
+            Some(stored.clone()),
+            &scope,
+            SUPERSEDE_OPERATION,
+            &request,
+        )
+        .unwrap();
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.superseded.unwrap().superseded_by, 42);
+
+        // Another successor under the same key and target is a different
+        // request, and so is the same target as a retract.
+        for (operation, other) in [
+            (
+                SUPERSEDE_OPERATION,
+                supersede_request(&scope, target, None, &successor("CockroachDB 27")),
+            ),
+            (
+                SUPERSEDE_OPERATION,
+                supersede_request(&scope, target, Some("note"), &successor("CockroachDB 26")),
+            ),
+            (RETRACT_OPERATION, retract_request(&scope, target, None)),
+        ] {
+            assert!(matches!(
+                decode_receipt_values::<ClaimMutation>(
+                    "project",
+                    SUPERSEDE_OPERATION,
+                    &request,
+                    Some(stored.clone()),
+                    &scope,
+                    operation,
+                    &other,
+                ),
+                Err(FleetError::IdempotencyConflict(_))
+            ));
+        }
     }
 
     #[test]

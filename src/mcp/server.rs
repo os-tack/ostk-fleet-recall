@@ -486,7 +486,7 @@ fn compact_committed_remember_envelope(envelope: &Value) -> Value {
     // Lifecycle coordinates are bounded, so they survive compaction. They are
     // inserted only when present, which keeps record's compact bytes stable.
     if let Some(compact) = compact_data.as_object_mut() {
-        for key in ["claims_restored", "reevaluation"] {
+        for key in ["superseded", "claims_restored", "reevaluation"] {
             if let Some(value) = data.get(key) {
                 compact.insert(key.into(), value.clone());
             }
@@ -861,6 +861,17 @@ mod tests {
         assert_eq!(compact["data"]["reevaluation"]["outcome"], "closed");
         assert_eq!(compact["data"]["conflicts_resolved"], json!([9]));
         assert_eq!(compact["diagnostics"]["output_truncated"], true);
+        assert!(compact["data"].get("superseded").is_none());
+
+        // A supersede keeps its predecessor coordinate through compaction.
+        let mut supersede = retract;
+        supersede["operation"] = json!("supersede");
+        supersede["superseded"] = json!({
+            "id": 41, "state": "superseded", "revision": 3, "superseded_by": 42,
+        });
+        let compact = oversized_remember(&supersede);
+        assert_eq!(compact["data"]["superseded"]["superseded_by"], 42);
+        assert_eq!(compact["data"]["claim"]["id"], 42);
     }
 
     #[test]

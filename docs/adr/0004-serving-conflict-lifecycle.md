@@ -1,10 +1,10 @@
 # ADR 0004: Serving conflict lifecycle on the legacy ledger
 
-- Status: accepted. The first slice is implemented: `remember(retract)`,
-  detector-verified conflict close with member restore, `recall(get)` with
-  `kind=conflict`, and private search hiding retired claims' synthetic chunks.
-  Supersede, acknowledgement, concession resolve, and adjudication are later
-  slices and are not served.
+- Status: accepted. The first two slices are implemented:
+  `remember(retract)`, detector-verified conflict close with member restore,
+  `recall(get)` with `kind=conflict`, private search hiding retired claims'
+  synthetic chunks, and `remember(supersede)`. Acknowledgement, concession
+  resolve, and adjudication are later slices and are not served.
 - Date: 2026-09-24
 - Scope: how the serving writer lets agents retire their own claims and how a
   `same_key_functional_value_v2` conflict leaves the `open` state. Decisions
@@ -51,6 +51,34 @@ remain as history.
 revision check turns a lost update into a correctable refusal instead of a
 silent overwrite.
 
+**Supersede.** `remember(supersede)` retires a claim under the same owner
+checks and writes its successor in the same transaction. The successor must
+keep the predecessor's `kind`, its normalized `claim_key` (both may be absent),
+and its `conflict_eligible` flag. Otherwise the request is refused as
+`successor_kind_mismatch`, `successor_key_mismatch`, or
+`successor_eligibility_mismatch`. The predecessor moves to `superseded` first,
+so the successor goes through record's own claim-writing and detection steps
+against only the claims that stay current, and may open, reopen, or join the
+key's v2 conflict. Its actor is the trusted agent, its origin must be
+`operator_asserted`, and its `recorded` claim event names the predecessor.
+The predecessor's `superseded_by` then points at the successor. After that,
+the key's lineage and current claims are locked again and re-evaluated under
+D3: a successor compatible with the rest lets the conflict close, and an
+incompatible one keeps it open as a member in its predecessor's place. The
+predecessor keeps its historical memberships. The response returns the
+successor as `claim` and the predecessor as `superseded`, and the one keyed
+event is `claim_superseded`. The successor's own `claim_recorded` event is
+unkeyed. The embedding is computed before the transaction, after a fast
+receipt lookup, exactly as for record. The record path's SQL and statement
+order are shared through extracted helpers and are unchanged.
+
+Keeping kind, key, and eligibility is what makes a supersede safe to serve.
+Without it an agent could end a dispute by moving its claim to another key,
+downgrading it to a `note`, or dropping its value, which would retire one side
+of a live incompatibility without the detector ever seeing the change. Within
+those limits, a supersede may change the value, polarity, validity window,
+text, confidence, and support.
+
 ## D3 — Resolution is detector-verified only
 
 **Decision.** No request names a conflict outcome. After a lifecycle change,
@@ -86,16 +114,19 @@ least one incompatible current pair.
 **Decision.** A lifecycle precondition failure is a typed refusal with a
 closed code (`not_found`, `not_owner`, `not_operator_asserted`,
 `not_current`, `stale_revision`, `legacy_lineage`, `bound_exceeded`,
-`lifecycle_unavailable`, and codes reserved for later slices), a message, and
+`successor_kind_mismatch`, `successor_key_mismatch`,
+`successor_eligibility_mismatch`, `lifecycle_unavailable`, and codes reserved
+for later slices), a message, and
 bounded details. It is returned from inside the serializable closure, so the
 transaction and its receipt reservation roll back: nothing is committed and
 the idempotency key stays free. MCP reports it as JSON-RPC `invalid_params`
 with `data.outcome = "not_applied"`, never through the outcome-unknown path.
 A committed request replays before any precondition, so retrying a
-committed retract returns its stored result rather than `not_current`. That
-includes the surface check: a writer that no longer serves `retract` (for
-example after `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`) reads the key's
-receipt before refusing. It replays a committed identical retract, reports any
+committed retract or supersede returns its stored result rather than
+`not_current`. That includes the surface check: a writer that no longer
+serves `retract` or `supersede` (for example after
+`FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`) reads the key's receipt before
+refusing. It replays a committed identical request, reports any
 other use of the key as an idempotency conflict, and refuses with
 `lifecycle_unavailable` only when no receipt holds the key, so the refusal's
 promise that the key was not consumed stays true.
@@ -110,8 +141,8 @@ restores on the private writer, emits the historical tool list byte for byte.
 
 ## Consequences
 
-- Agents can withdraw their own mistakes, and conflicts close when the data no
-  longer supports them.
+- Agents can withdraw or correct their own mistakes, and conflicts close when
+  the data no longer supports them.
 - Authority is only as strong as `FLEET_RECALL_AGENT` over the shared
   `fleet_writer` credential; authenticated workload identity remains future
   work (see `docs/SECURITY.md`).

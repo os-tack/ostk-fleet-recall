@@ -239,10 +239,10 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
         return tool;
     }
     tool["description"] = json!(
-        "Deliberately record fleet memory or retract claims you authored. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
+        "Deliberately record fleet memory, or supersede or retract claims you authored. A successor keeps its predecessor's kind, subject/predicate key, and value presence. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
     );
     let schema = &mut tool["inputSchema"];
-    schema["properties"]["action"]["enum"] = json!(["record", "retract"]);
+    schema["properties"]["action"]["enum"] = json!(["record", "supersede", "retract"]);
     if let Some(properties) = schema["properties"].as_object_mut() {
         properties.insert(
             "claim_id".into(),
@@ -250,7 +250,7 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9_007_199_254_740_991_i64,
-                "description": "retract: a claim you authored (origin operator_asserted) in state active or disputed."
+                "description": "supersede/retract: a claim you authored (origin operator_asserted) in state active or disputed."
             }),
         );
         properties.insert(
@@ -259,7 +259,7 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9_007_199_254_740_991_i64,
-                "description": "retract: the claim revision you last read; a stale value is refused, not retried."
+                "description": "supersede/retract: the claim revision you last read; a stale value is refused, not retried."
             }),
         );
         properties.insert(
@@ -268,7 +268,7 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 1000,
-                "description": "Optional private audit note for retract, at most 1000 characters."
+                "description": "Optional private audit note for supersede or retract, at most 1000 characters."
             }),
         );
     }
@@ -284,6 +284,12 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
                 "required": ["kind", "text"],
                 "properties": forbid(&properties, &CLAIM_LIFECYCLE_FIELDS)
             }
+        },
+        {
+            // The successor carries record's claim fields; the server refuses
+            // one whose kind, normalized key, or value presence differs.
+            "if": { "properties": { "action": { "const": "supersede" } } },
+            "then": { "required": ["claim_id", "expected_revision", "kind", "text"] }
         },
         {
             "if": { "properties": { "action": { "const": "retract" } } },
@@ -413,7 +419,7 @@ mod tests {
         let properties = schema["properties"].as_object().unwrap();
         assert_eq!(
             schema["properties"]["action"]["enum"],
-            json!(["record", "retract"])
+            json!(["record", "supersede", "retract"])
         );
         assert_eq!(schema["required"], json!(["action", "idempotency_key"]));
         assert_eq!(schema["additionalProperties"], false);
@@ -426,7 +432,7 @@ mod tests {
         }
 
         let branches = schema["allOf"].as_array().unwrap();
-        assert_eq!(branches.len(), 2);
+        assert_eq!(branches.len(), 3);
         let record = &branches[0];
         assert_eq!(record["if"]["properties"]["action"]["const"], "record");
         assert_eq!(record["then"]["required"], json!(["kind", "text"]));
@@ -434,7 +440,18 @@ mod tests {
             record["then"]["properties"],
             json!({ "claim_id": false, "expected_revision": false, "reason": false })
         );
-        let retract = &branches[1];
+        // A supersede carries a full successor claim beside its target.
+        let supersede = &branches[1];
+        assert_eq!(
+            supersede["if"]["properties"]["action"]["const"],
+            "supersede"
+        );
+        assert_eq!(
+            supersede["then"]["required"],
+            json!(["claim_id", "expected_revision", "kind", "text"])
+        );
+        assert!(supersede["then"].get("properties").is_none());
+        let retract = &branches[2];
         assert_eq!(retract["if"]["properties"]["action"]["const"], "retract");
         assert_eq!(
             retract["then"]["required"],
@@ -450,7 +467,19 @@ mod tests {
         assert!(!forbidden.contains_key("scope"));
         // Every branch names only declared properties.
         for branch in branches {
-            for name in branch["then"]["properties"].as_object().unwrap().keys() {
+            let named = branch["then"]["properties"]
+                .as_object()
+                .into_iter()
+                .flat_map(Map::keys)
+                .map(String::as_str)
+                .chain(
+                    branch["then"]["required"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(Value::as_str),
+                );
+            for name in named {
                 assert!(properties.contains_key(name), "{name} is undeclared");
             }
         }

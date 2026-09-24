@@ -21,5 +21,6 @@ pub use reconciliation::{
 pub use repository::{ClaimLedger, SupportedClaimCoordinate, SupportedClaimIds};
 pub use types::{
     Claim, ClaimInput, ClaimKind, ClaimMutation, ClaimState, ClaimSupport, ClaimSupportInput,
-    ClaimTarget, Conflict, ConflictCoverage, ConflictReevaluation, SemanticClaimHit,
+    ClaimTarget, Conflict, ConflictCoverage, ConflictReevaluation, LifecycleReplayRequest,
+    SemanticClaimHit, SupersededClaim,
 };
