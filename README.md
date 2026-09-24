@@ -289,6 +289,7 @@ development flow:
 docker volume create ostk-fleet-recall-crdb
 docker run --detach \
   --name ostk-fleet-recall-crdb \
+  --hostname ostk-fleet-recall-crdb \
   --add-host cockroach:127.0.0.1 \
   --publish 127.0.0.1:26257:26257 \
   --publish 127.0.0.1:8081:8080 \
