@@ -337,7 +337,20 @@ over the successor tables. The successor repository, workstation CLI, and
 dedicated logical-role policy are implemented, but they are not an enabled
 production successor runtime: there is no deployed login, AWS secret or task,
 image binary, startup hook, or route. The migrator/schema owner retains
-technical authority and must not be repurposed as the ceremony credential.
+technical authority and must not be repurposed as the ceremony credential,
+with one sanctioned exception: `ostk-authority-install` runs the control
+bootstrap, genesis activation, `0 -> 1`, and `1 -> 2` ceremonies under the
+migrator login (see
+[CONTROL_BOOTSTRAP.md](CONTROL_BOOTSTRAP.md#writer-authority-installer)). Its
+signatures use the public fixture keys and prove nothing. From generation 1
+onward that is true of every successor: the compiled activation policy's
+eligible signers are the fixture keys, so any credential that can write the
+successor tables (the migrator, or a `fleet_registry_successor_activation`
+login) can activate a successor the compiled packages admit. What
+protects an installed physical scope is who holds the migrator and ceremony
+credentials, plus each writer's receipt-digest pin. Deployments that need
+separated ceremony credentials run the four ceremony CLIs, each under its own
+role.
 
 The successor role necessarily has raw `INSERT` and `UPDATE` table authority,
 including table-level `UPDATE` for its `FOR UPDATE`/compare-and-swap paths.

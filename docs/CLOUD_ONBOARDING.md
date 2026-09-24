@@ -331,7 +331,12 @@ authority, and reapply the policy.
 Only then may one external login receive exclusive temporary membership; revoke
 membership and disable the login afterward. There is no AWS credential/task,
 production-image binary, startup hook, or runtime route; the migrator/schema
-owner is not a ceremony credential.
+owner is not a ceremony credential for these CLIs. The one sanctioned
+exception is the workstation `ostk-authority-install`, which runs all four
+ceremonies under the migrator login and whose signatures are nominal (see
+[CONTROL_BOOTSTRAP.md](CONTROL_BOOTSTRAP.md#writer-authority-installer)). A
+deployment that needs separated ceremony credentials uses the ceremony CLIs
+with their roles instead.
 
 Conflict reconciliation has an apply-only workstation CLI and a checked-in
 database-local one-shot role policy. Only a cluster admin may apply it;

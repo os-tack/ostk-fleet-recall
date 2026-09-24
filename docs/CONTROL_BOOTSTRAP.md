@@ -80,7 +80,9 @@ before any non-test bootstrap.
 The current checked-in application/Terraform design has three distinct database
 capability paths and raw secret values:
 
-1. the migrator owns/applies schema and is dormant afterward;
+1. the migrator owns/applies schema and is dormant afterward, except for
+   the one sanctioned ceremony use described under
+   [Writer-authority installer](#writer-authority-installer);
 2. the private writer performs seed/MCP DML through only the
    hardened `NOLOGIN` `fleet_runtime` logical role; and
 3. the fixed external `fleet_publication` login serves only the read-only demo
@@ -104,12 +106,16 @@ ceremony runs, its login is a member only of the non-login
 `fleet_control_bootstrap` logical role, uses a dedicated private URL, runs this
 command once, and is disabled or its secret is removed afterward. The
 migration URL must never fall back to the writer, publication, or bootstrap
-URL; none of those URLs may be reused for another capability. The migrator
-must not grant writer or publication access through `ALL TABLES` or an
-`ALTER DEFAULT PRIVILEGES ... ALL TABLES` rule, because that silently grants
-future control tables. Terraform wires the three planned secret paths but
-does not provision CockroachDB identities, memberships, or grants; it has no
-Stage-2 control secret or task.
+URL; none of those URLs may be reused for another capability. The one
+sanctioned exception is `ostk-authority-install`, which runs all four
+ceremonies under the migrator URL (see
+[Writer-authority installer](#writer-authority-installer)). A deployment that
+needs separated ceremony credentials runs the four ceremony CLIs, each under
+its own role, instead. The migrator must not grant writer or publication
+access through `ALL TABLES` or an `ALTER DEFAULT PRIVILEGES ... ALL TABLES`
+rule, because that silently grants future control tables. Terraform wires
+the three planned secret paths but does not provision CockroachDB identities,
+memberships, or grants; it has no Stage-2 control secret or task.
 
 The base policy can first be applied after migration 0003 and must remain
 runnable at that original Stage-2 boundary. Reapply it after later migrations
@@ -260,7 +266,13 @@ cargo run --locked --bin ostk-authority-install -- apply
   write those tables; the migrator/schema owner keeps technical authority over
   them (see [migration operations](MIGRATIONS.md)). The installer adds no
   grant and needs none. The runtime and publication roles gain nothing.
-  Withdraw the migrator credential afterward, as you would after `migrate`.
+  This is the one sanctioned use of the migrator as a ceremony credential,
+  an exception to the separation under [SQL principals](#sql-principals) and
+  in [SECURITY.md](SECURITY.md#residual-sql-authority-and-recovery). It is
+  acceptable only because the installer's signatures are nominal anyway (see
+  below). A deployment that needs separated ceremony credentials runs the
+  four ceremony CLIs, each under its own role, instead. Withdraw the migrator
+  credential afterward, as you would after `migrate`.
 - **Output.** One JSON report: each step with `inserted` or
   `already_present`, the active `generation`, its `activation_id`, the
   activated `package`, and `pins`. The `pins` object's keys are the
@@ -302,11 +314,33 @@ seeds `0x01` and `0x02`. The frozen receipt names these keys `principal.1` and
 `principal.2`, and the compiled activation policy names them `principal.alice`
 and `principal.bob`. The installer also mints the generation-2 conformance
 result itself. Anyone can reproduce these signatures, so they authenticate
-nothing. Two things carry the authority. First, database role separation:
-only the owner/migrator login can write the tables this touches. Second, the
-out-of-band receipt-digest pin that each writer process loads. A deployment
-that needs real governance must author and sign its own ceremony artifacts
-with the four CLIs above, and pin that receipt instead.
+nothing.
+
+Signing the ceremonies by hand does not fix this from generation 1 onward.
+The strict witness admits only two packages: the compiled generation-1
+Stage-4 package, and the generation-2 package composed from it, which
+carries its activation policy forward unchanged. That policy's eligible
+signers are the fixture keys, and a successor activation is verified only
+against the installed policy's eligible signers. So `1 -> 2`, and every later
+successor from any head a writer can run under, can be signed by anyone,
+whatever an operator signed for the earlier steps. Only the control
+bootstrap, the genesis activation, and the `0 -> 1` key bridge can carry
+deployment keys, through the four CLIs above. No deployment of the compiled
+packages has non-nominal successor governance until a package whose
+activation policy names deployment keys is compiled in, and that work is
+deferred.
+
+Two things carry the authority. First, database role separation: only the
+schema owner/migrator login and the provisioned ceremony roles
+(`fleet_control_bootstrap`, `fleet_registry_activation`, and
+`fleet_registry_successor_activation`) can write the control and registry
+tables; the runtime and publication roles cannot. Treat the migrator and
+`fleet_registry_successor_activation` credentials, which can write the
+successor tables, as able to activate any successor the compiled policy
+admits, however the earlier steps were signed. Second, the out-of-band
+receipt-digest pin that each writer process loads. A deployment that signs
+its own bootstrap receipt with the CLIs above pins that receipt instead,
+which makes the bootstrap non-nominal but not the successors.
 
 The connected tests install their authority through the same library function
 (`tests/common/authority.rs`); `tests/authority_install_live.rs` proves

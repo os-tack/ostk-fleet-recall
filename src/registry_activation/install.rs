@@ -44,12 +44,23 @@
 //! `0x01`/`0x02`) that the frozen bootstrap receipt and the compiled
 //! generation-1 activation policy already name, and the generation-2
 //! conformance result is self-attested. Anyone can produce these signatures.
-//! The real gates are the database role separation — only the schema
-//! owner/migrator login can write the control and registry tables this touches
-//! — and the out-of-band receipt-digest pin the reported
-//! [`WriterAuthorityPinsV1`] hands each writer process. A deployment that needs
-//! real governance signs its own ceremony artifacts with the four activation
-//! CLIs instead.
+//!
+//! Signing by hand would not change that past generation 1. The strict
+//! witness admits only the two compiled packages, generation 2 carries the
+//! generation-1 activation policy forward, and a successor activation is
+//! verified only against the installed policy's eligible signers: the fixture
+//! keys. So `1 -> 2`, and every later successor from a head a writer can run
+//! under, can be signed by anyone, whoever signed the earlier steps. Only the
+//! control bootstrap, the genesis activation, and the `0 -> 1` key bridge can
+//! carry deployment keys. Non-nominal successor governance needs a compiled
+//! package whose activation policy names deployment keys, and none exists yet.
+//!
+//! The real gates are database role separation and the out-of-band
+//! receipt-digest pin the reported [`WriterAuthorityPinsV1`] hands each writer
+//! process. Only the schema owner/migrator login and the provisioned ceremony
+//! roles (`fleet_control_bootstrap`, `fleet_registry_activation`,
+//! `fleet_registry_successor_activation`) can write the control and registry
+//! tables this touches; the runtime and publication roles cannot.
 
 use std::str::FromStr as _;
 use std::sync::Arc;
