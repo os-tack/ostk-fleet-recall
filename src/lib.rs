@@ -30,6 +30,7 @@ pub mod registry_witness;
 pub mod relation_projection;
 pub mod remember_runtime;
 pub mod service;
+pub mod spec_conformance;
 pub mod store;
 pub mod worker;
 

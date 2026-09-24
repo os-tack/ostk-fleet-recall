@@ -32,6 +32,8 @@
 //! ingesting the same facts in a different sequence cannot move the episode
 //! fingerprint.
 
+use serde::{Deserialize, Serialize};
+
 use crate::memory_contracts::common::CanonicalTimestamp;
 use crate::memory_contracts::coverage::{
     CoverageCompletenessV1, CoverageWindowV1, FreshnessStateV1,
@@ -116,7 +118,11 @@ pub trait ComparisonSideProvider: Send + Sync {
 
 /// Why a comparison could not produce a verdict. Closed set: an unlisted
 /// cause cannot be smuggled in as a string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// The serde form is [`Self::as_str`], so a spec check record carries the
+/// same names agents read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ComparisonIndeterminacyV1 {
     ObservedUnmeasured,
     NormativeUnmeasured,

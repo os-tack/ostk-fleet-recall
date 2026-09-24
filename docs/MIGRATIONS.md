@@ -297,7 +297,10 @@ current. Migration 31 (ADR 0007) creates `memory_normative_statements_v1`,
 the canonical normative proposal and typed expectation each spec statement
 was activated with, and `memory_spec_checks_v1`, one content-addressed record
 per spec check with its verdict (`nonconforming`, `conforming`, or
-`unknown`) and the discrepancy episode it opened or joined. All three are
+`unknown`) and the discrepancy episode it opened or joined. Both are read and
+written through `spec_conformance::CockroachSpecRepository`, which re-derives
+each row's identity from its canonical bytes on every read, so a row edited in
+place is refused rather than re-interpreted. All three are
 private-plane tables with no foreign key; each migration follows the
 resumable pattern above and closes with a same-name drift guard (the column
 shape, plus migration 31's two indexes).

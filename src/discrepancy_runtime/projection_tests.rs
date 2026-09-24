@@ -460,6 +460,18 @@ fn every_indeterminacy_reason_has_its_own_snake_case_name() {
     ];
     let names: BTreeSet<&str> = reasons.iter().map(|reason| reason.as_str()).collect();
     assert_eq!(names.len(), reasons.len(), "two reasons share a name");
+    for reason in reasons {
+        let wire = serde_json::to_value(reason).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!(reason.as_str()),
+            "serde and as_str disagree"
+        );
+        assert_eq!(
+            serde_json::from_value::<ComparisonIndeterminacyV1>(wire).unwrap(),
+            reason
+        );
+    }
     for name in names {
         assert!(
             !name.is_empty()
