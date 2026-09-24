@@ -14,7 +14,16 @@
 //! - **AUTH-04** — normativity is designated. Nothing is treated as an active
 //!   registry unless the deployment-pinned bootstrap receipt, the durable log
 //!   epoch, and the active head all agree, and the head's package digest
-//!   materializes to a compiled-in semantically closed package.
+//!   materializes to a compiled-in semantically closed package. Exactly two
+//!   packages are compiled in ([`KnownRegistryPackage`]): the frozen
+//!   generation-1 Stage-4 package, and the generation-2 connector package
+//!   composed from those same bytes by
+//!   [`generation_two_registry_package`]. Both are build inputs, never
+//!   database state, so admitting a head's digest runs only admission rules
+//!   this process has itself closed. Every other digest, including any
+//!   generation-3 package, fails closed as
+//!   [`WriterAuthorityRejection::UnknownActivePackage`] until its bytes are
+//!   compiled in here.
 //! - **ABA safety** — the comparison is on the exact `activation_id`, never on
 //!   the package or policy digest, so an A -> B -> A rollback that restores a
 //!   previous package cannot be mistaken for the head the caller observed.
@@ -80,6 +89,7 @@ use crate::memory_contracts::common::{
 };
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::evidence_v2::RegistryHeadBindingV1;
+use crate::memory_contracts::generation2_registry::generation_two_registry_package;
 use crate::memory_contracts::genesis::SemanticallyClosedGenesisPackage;
 use crate::memory_contracts::genesis_activation::genesis_activation_policy_digest;
 use crate::memory_contracts::registry::ManifestVerifiedRegistryPackage;
@@ -94,7 +104,8 @@ const GENESIS_PACKAGE: &[u8] =
     include_bytes!("../../contracts/dynamic-memory/v1/genesis-registry-package.jsonl");
 
 /// Exact canonical bytes of the frozen first Stage-4 successor package. This
-/// is the only package a generation-1 head may activate.
+/// is the only package a generation-1 head may activate, and the generation-2
+/// connector package is composed from these same bytes.
 const STAGE4_PACKAGE: &[u8] =
     include_bytes!("../../contracts/dynamic-memory/v2/stage4-successor/registry-package.jsonl");
 
@@ -186,6 +197,74 @@ impl From<WriterAuthorityError> for FleetError {
 
 pub type WitnessResult<T> = std::result::Result<T, WriterAuthorityError>;
 
+/// Which compiled-in registry package an active head activates (AUTH-04).
+///
+/// The tag is recognized from the head's package digest, never from its
+/// generation: a rollback can re-activate an earlier package at a later
+/// generation, and the package, not the counter, decides which admission
+/// rules run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnownRegistryPackage {
+    /// The frozen first Stage-4 successor package. It carries one connector
+    /// schema, `connector.github.push`, and the `mcp.remember.allowed_actions`
+    /// remember route.
+    Stage4Generation1,
+    /// The generation-2 connector package: every generation-1 entry carried
+    /// forward byte for byte, plus one closed identity chain per Wave-2
+    /// connector (`connector.git.history`, `connector.transcript.session`,
+    /// `connector.ci.workflow_run`).
+    ConnectorGeneration2,
+}
+
+/// The compiled-in, semantically closed package an active head's digest
+/// materialized to.
+///
+/// Every known package is a [`SemanticallyClosedSuccessorPackage`], which is
+/// what connector binding and remember-route resolution read. Only the frozen
+/// generation-1 package also closes under the narrower Stage-4 target, so
+/// [`Self::stage4`] is `None` for generation 2 rather than a narrowing that
+/// would have to pretend the extra connectors do not exist.
+///
+/// There is no public constructor: the only way to hold one is
+/// [`materialize_active_package`], which admits exactly the compiled-in
+/// digests.
+#[derive(Debug, Clone)]
+pub struct ActiveRegistryPackage {
+    known: KnownRegistryPackage,
+    successor: Arc<SemanticallyClosedSuccessorPackage>,
+    stage4: Option<Arc<SemanticallyClosedStage4Package>>,
+}
+
+impl ActiveRegistryPackage {
+    /// Which compiled-in package this is.
+    #[must_use]
+    pub const fn known(&self) -> KnownRegistryPackage {
+        self.known
+    }
+
+    /// The package as a generic successor closure. Present for every known
+    /// package.
+    #[must_use]
+    pub fn successor(&self) -> &SemanticallyClosedSuccessorPackage {
+        &self.successor
+    }
+
+    /// The package narrowed to the frozen Stage-4 target, which only the
+    /// generation-1 package satisfies.
+    #[must_use]
+    pub fn stage4(&self) -> Option<&SemanticallyClosedStage4Package> {
+        self.stage4.as_deref()
+    }
+
+    /// Digest of the package's canonical bytes; equal to the head's
+    /// `package_digest` this package was materialized for.
+    #[must_use]
+    pub fn package_digest(&self) -> Sha256Digest {
+        self.successor.package_digest()
+    }
+}
+
 /// Proof that one exact registry activation is the current active head.
 ///
 /// The fields are private and there is no public constructor: the only way to
@@ -212,7 +291,8 @@ pub struct WriterAuthorityWitness {
     canonical_head: Arc<Vec<u8>>,
     head_binding: Arc<RegistryHeadBindingV1>,
     bootstrap: Arc<VerifiedBootstrapReceipt>,
-    package: Arc<SemanticallyClosedStage4Package>,
+    genesis: &'static SemanticallyClosedGenesisPackage,
+    package: ActiveRegistryPackage,
 }
 
 impl WriterAuthorityWitness {
@@ -325,10 +405,34 @@ impl WriterAuthorityWitness {
         &self.bootstrap
     }
 
-    /// The compiled-in, semantically closed package the active head activates.
+    /// The compiled-in, semantically closed package the active head
+    /// activates, as the generic successor closure every known package has.
+    /// Connector binding and remember-route resolution read this.
     #[must_use]
-    pub fn package(&self) -> &SemanticallyClosedStage4Package {
+    pub fn package(&self) -> &SemanticallyClosedSuccessorPackage {
+        self.package.successor()
+    }
+
+    /// The active package together with which compiled-in package it is.
+    #[must_use]
+    pub const fn active_package(&self) -> &ActiveRegistryPackage {
         &self.package
+    }
+
+    /// The active package narrowed to the frozen Stage-4 target: `Some` only
+    /// when the head activates the generation-1 package.
+    #[must_use]
+    pub fn stage4_package(&self) -> Option<&SemanticallyClosedStage4Package> {
+        self.package.stage4()
+    }
+
+    /// The compiled-in genesis package the pinned bootstrap receipt binds.
+    /// [`verify_pinned_bootstrap`] proved the receipt names exactly this
+    /// package's digest before this witness was minted, so it is pinned
+    /// authority, not an arbitrary build input.
+    #[must_use]
+    pub const fn genesis_package(&self) -> &'static SemanticallyClosedGenesisPackage {
+        self.genesis
     }
 
     /// Produce the append transaction's consumable witness (ADR 0002 D4
@@ -579,12 +683,13 @@ fn verify_row(
     // deployment pin, exact profile and semantic scope, exact genesis package
     // digest, signer threshold, and every signature. Nothing about this head
     // is trusted because the view returned it.
+    let genesis = compiled_genesis_package()?;
     let bootstrap = verify_pinned_bootstrap(
         &row.bootstrap_canonical_receipt,
         config.receipt_pin(),
         &frozen_profile_reference_v1(),
         pinned_scope,
-        genesis_package()?,
+        genesis,
     )?;
     verify_epoch(row, &bootstrap)?;
 
@@ -625,6 +730,7 @@ fn verify_row(
         canonical_head: Arc::new(row.canonical_head.clone()),
         head_binding,
         bootstrap: Arc::new(bootstrap),
+        genesis,
         package,
     })
 }
@@ -667,7 +773,7 @@ fn verify_epoch(row: &AuthorityRow, bootstrap: &VerifiedBootstrapReceipt) -> Wit
 /// none of which the runtime role may read. It is checked for shape only; the
 /// activation ceremonies and their audits establish it.
 fn verify_descent(row: &AuthorityRow, generation: u64) -> WitnessResult<()> {
-    let genesis_package = genesis_package()?;
+    let genesis_package = compiled_genesis_package()?;
     let expected_root_policy = genesis_activation_policy_digest(genesis_package)?;
     if row.root_package_digest != genesis_package.package_digest()
         || row.root_activation_policy_digest != expected_root_policy
@@ -729,20 +835,41 @@ fn verify_head_binding(
 
 /// Map the head's package digest to a compiled-in semantically closed package.
 ///
-/// Generation 1 activates exactly the frozen first Stage-4 package. Any other
-/// digest fails closed: the view deliberately exposes no `canonical_package`
-/// column, so a later generation needs either its own compiled-in bytes here
-/// or an additive migration that exposes the canonical package through
+/// Exactly two digests materialize:
+///
+/// - the frozen first Stage-4 package, as
+///   [`KnownRegistryPackage::Stage4Generation1`] with its Stage-4 narrowing;
+/// - the generation-2 connector package that
+///   [`generation_two_registry_package`] composes from those same frozen bytes,
+///   as [`KnownRegistryPackage::ConnectorGeneration2`] with no Stage-4
+///   narrowing.
+///
+/// Any other digest fails closed: the view deliberately exposes no
+/// `canonical_package` column, so a later package (generation 3 and beyond is
+/// deferred) needs either its own compiled-in bytes here or an additive
+/// migration that exposes the canonical package through
 /// `memory_writer_authority_v1`. Guessing is not an option — the writer would
 /// otherwise run admission rules it has never verified.
 pub fn materialize_active_package(
     package_digest: Sha256Digest,
-) -> WitnessResult<Arc<SemanticallyClosedStage4Package>> {
-    let package = stage4_package()?;
-    if package.package_digest() != package_digest {
-        return Err(WriterAuthorityRejection::UnknownActivePackage.into());
+) -> WitnessResult<ActiveRegistryPackage> {
+    let stage4 = compiled_stage4()?;
+    if stage4.stage4.package_digest() == package_digest {
+        return Ok(ActiveRegistryPackage {
+            known: KnownRegistryPackage::Stage4Generation1,
+            successor: Arc::clone(&stage4.successor),
+            stage4: Some(Arc::clone(&stage4.stage4)),
+        });
     }
-    Ok(package)
+    let generation_two = compiled_generation_two_package()?;
+    if generation_two.package_digest() == package_digest {
+        return Ok(ActiveRegistryPackage {
+            known: KnownRegistryPackage::ConnectorGeneration2,
+            successor: generation_two,
+            stage4: None,
+        });
+    }
+    Err(WriterAuthorityRejection::UnknownActivePackage.into())
 }
 
 /// Decode cache keyed ONLY by the exact canonical head bytes (D4). Nothing
@@ -776,18 +903,36 @@ fn decode_cache() -> &'static Mutex<HashMap<Vec<u8>, Arc<RegistryHeadBindingV1>>
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Compiled-in genesis package closure. These bytes are a build input, not
-/// database state, so memoizing the closure caches no authority.
-fn genesis_package() -> WitnessResult<&'static SemanticallyClosedGenesisPackage> {
-    static PACKAGE: OnceLock<Option<SemanticallyClosedGenesisPackage>> = OnceLock::new();
-    PACKAGE
-        .get_or_init(|| closed_genesis_package().ok())
+/// Memoize one compiled-in package closure.
+///
+/// Every package this module compiles in is a build input, not database state,
+/// so memoizing its closure caches no authority. A closure that fails is
+/// memoized as that failure: the bytes cannot change within a process, and
+/// every caller then fails closed with the same reason.
+fn memoized<T>(
+    cell: &'static OnceLock<Result<T, String>>,
+    label: &str,
+    close: impl FnOnce() -> ContractResult<T>,
+) -> WitnessResult<&'static T> {
+    cell.get_or_init(|| close().map_err(|error| error.to_string()))
         .as_ref()
-        .ok_or_else(|| {
-            WriterAuthorityError::Contract(ContractError::Schema(
-                "the compiled-in genesis registry package is not semantically closed".into(),
-            ))
+        .map_err(|reason| {
+            WriterAuthorityError::Contract(ContractError::Schema(format!(
+                "the compiled-in {label} is not semantically closed: {reason}"
+            )))
         })
+}
+
+/// The compiled-in genesis package: the one the pinned bootstrap receipt must
+/// bind, and the root every head descends from.
+///
+/// # Errors
+///
+/// A contract error when the compiled-in bytes do not close, which is a build
+/// defect rather than a verdict about any database.
+pub fn compiled_genesis_package() -> WitnessResult<&'static SemanticallyClosedGenesisPackage> {
+    static PACKAGE: OnceLock<Result<SemanticallyClosedGenesisPackage, String>> = OnceLock::new();
+    memoized(&PACKAGE, "genesis registry package", closed_genesis_package)
 }
 
 fn closed_genesis_package() -> ContractResult<SemanticallyClosedGenesisPackage> {
@@ -797,25 +942,73 @@ fn closed_genesis_package() -> ContractResult<SemanticallyClosedGenesisPackage> 
     SemanticallyClosedGenesisPackage::from_manifest_verified(manifest)
 }
 
-/// Compiled-in Stage-4 package closure, memoized for the same reason.
-fn stage4_package() -> WitnessResult<Arc<SemanticallyClosedStage4Package>> {
-    static PACKAGE: OnceLock<Option<Arc<SemanticallyClosedStage4Package>>> = OnceLock::new();
-    PACKAGE
-        .get_or_init(|| closed_stage4_package().ok().map(Arc::new))
-        .clone()
-        .ok_or_else(|| {
-            WriterAuthorityError::Contract(ContractError::Schema(
-                "the compiled-in Stage-4 successor package is not semantically closed".into(),
-            ))
-        })
+/// Both closures of the frozen generation-1 package, built once from the same
+/// bytes so a witness read hands out shared references and never clones a
+/// package.
+struct CompiledStage4 {
+    successor: Arc<SemanticallyClosedSuccessorPackage>,
+    stage4: Arc<SemanticallyClosedStage4Package>,
 }
 
-fn closed_stage4_package() -> ContractResult<SemanticallyClosedStage4Package> {
+fn compiled_stage4() -> WitnessResult<&'static CompiledStage4> {
+    static PACKAGE: OnceLock<Result<CompiledStage4, String>> = OnceLock::new();
+    memoized(&PACKAGE, "Stage-4 successor package", closed_stage4_package)
+}
+
+fn closed_stage4_package() -> ContractResult<CompiledStage4> {
     let profile = frozen_profile_reference_v1();
     let manifest =
         ManifestVerifiedRegistryPackage::decode(framed_record(STAGE4_PACKAGE)?, &profile)?;
     let successor = SemanticallyClosedSuccessorPackage::from_manifest_verified(manifest)?;
-    SemanticallyClosedStage4Package::from_successor_package(successor)
+    let stage4 = SemanticallyClosedStage4Package::from_successor_package(successor.clone())?;
+    Ok(CompiledStage4 {
+        successor: Arc::new(successor),
+        stage4: Arc::new(stage4),
+    })
+}
+
+/// The compiled-in frozen generation-1 Stage-4 package.
+///
+/// This is [`KnownRegistryPackage::Stage4Generation1`]; its generic successor
+/// closure is [`SemanticallyClosedStage4Package::successor_package`].
+///
+/// # Errors
+///
+/// A contract error when the compiled-in bytes do not close, which is a build
+/// defect rather than a verdict about any database.
+pub fn compiled_stage4_package() -> WitnessResult<Arc<SemanticallyClosedStage4Package>> {
+    compiled_stage4().map(|compiled| Arc::clone(&compiled.stage4))
+}
+
+/// The compiled-in generation-2 connector package.
+///
+/// This is [`KnownRegistryPackage::ConnectorGeneration2`]: the frozen Stage-4
+/// bytes composed by [`generation_two_registry_package`] and closed as a
+/// successor package. The composition is a pure function of compiled-in
+/// bytes, so its digest is as fixed as the frozen package's, and a head that
+/// activated it is admitted by digest exactly like generation 1.
+///
+/// # Errors
+///
+/// A contract error when the composition or its closure fails, which is a
+/// build defect rather than a verdict about any database.
+pub fn compiled_generation_two_package() -> WitnessResult<Arc<SemanticallyClosedSuccessorPackage>> {
+    static PACKAGE: OnceLock<Result<Arc<SemanticallyClosedSuccessorPackage>, String>> =
+        OnceLock::new();
+    memoized(
+        &PACKAGE,
+        "generation-2 connector package",
+        closed_generation_two_package,
+    )
+    .map(Arc::clone)
+}
+
+fn closed_generation_two_package() -> ContractResult<Arc<SemanticallyClosedSuccessorPackage>> {
+    let profile = frozen_profile_reference_v1();
+    let generation_one =
+        ManifestVerifiedRegistryPackage::decode(framed_record(STAGE4_PACKAGE)?, &profile)?;
+    let composed = generation_two_registry_package(&generation_one)?;
+    SemanticallyClosedSuccessorPackage::from_manifest_verified(composed).map(Arc::new)
 }
 
 /// Frozen contract artifacts carry exactly one trailing LF frame.
@@ -870,9 +1063,9 @@ mod tests {
     use crate::memory_contracts::bootstrap::{
         BootstrapAttestationV1, BootstrapPin, BootstrapReceiptDigest, BootstrapReceiptV1,
     };
-    use crate::memory_contracts::common::{FixedHex32, FixedHex64};
+    use crate::memory_contracts::common::{FixedHex32, FixedHex64, RegistryReferenceV1};
     use crate::memory_contracts::digest::{DigestDomain, domain_separated_digest};
-    use crate::memory_contracts::registry::RegistryHeadV1;
+    use crate::memory_contracts::registry::{RegistryEntryKind, RegistryHeadV1};
     use ostk_recall_core::PrivacyTier;
     use ring::signature::Ed25519KeyPair;
 
@@ -958,7 +1151,7 @@ mod tests {
             BootstrapPin::from_trusted_config(receipt_digest),
             &frozen_profile_reference_v1(),
             &receipt.statement.scope,
-            genesis_package().expect("genesis package"),
+            compiled_genesis_package().expect("genesis package"),
         )
         .expect("the re-signed receipt must verify against its own digest")
     }
@@ -973,8 +1166,8 @@ mod tests {
             bootstrap.receipt_digest(),
             None,
         );
-        let genesis = genesis_package().expect("genesis package");
-        let stage4 = stage4_package().expect("Stage-4 package");
+        let genesis = compiled_genesis_package().expect("genesis package");
+        let stage4 = compiled_stage4_package().expect("Stage-4 package");
         let root_activation_id = Sha256Digest::from_bytes([0x11; 32]);
         let root_policy = genesis_activation_policy_digest(genesis).expect("genesis policy digest");
         let activation_id = Sha256Digest::from_bytes([0x22; 32]);
@@ -1109,22 +1302,118 @@ mod tests {
 
     #[test]
     fn compiled_in_packages_are_semantically_closed() {
-        let genesis = genesis_package().expect("genesis package closure");
-        let stage4 = stage4_package().expect("Stage-4 package closure");
+        let genesis = compiled_genesis_package().expect("genesis package closure");
+        let stage4 = compiled_stage4_package().expect("Stage-4 package closure");
+        let generation_two =
+            compiled_generation_two_package().expect("generation-2 package closure");
         assert_ne!(genesis.package_digest(), stage4.package_digest());
+        assert_ne!(genesis.package_digest(), generation_two.package_digest());
+        assert_ne!(stage4.package_digest(), generation_two.package_digest());
+    }
+
+    /// Exact reference to the one entry of `kind` named `entry_id`, so a test
+    /// can ask the closure to resolve it as a typed route.
+    fn reference_in(
+        package: &SemanticallyClosedSuccessorPackage,
+        kind: RegistryEntryKind,
+        entry_id: &str,
+    ) -> RegistryReferenceV1 {
+        let entry = package
+            .manifest_verified_package()
+            .package()
+            .entries
+            .iter()
+            .find(|entry| entry.kind == kind && entry.entry_id.as_str() == entry_id)
+            .unwrap_or_else(|| panic!("the package must carry {entry_id}"));
+        RegistryReferenceV1 {
+            entry_id: entry.entry_id.clone(),
+            version: entry.version,
+            entry_digest: entry.digest().expect("entry digest"),
+        }
+    }
+
+    /// The remember route every known package must serve: the authority rule
+    /// resolves as a remember admission rule over the
+    /// `mcp.remember.allowed_actions` predicate, which itself resolves.
+    fn assert_serves_the_remember_route(package: &SemanticallyClosedSuccessorPackage) {
+        let predicate = reference_in(
+            package,
+            RegistryEntryKind::PredicateSchema,
+            "mcp.remember.allowed_actions",
+        );
+        assert!(
+            package.remember_predicate(&predicate).is_some(),
+            "mcp.remember.allowed_actions must resolve as a remember predicate"
+        );
+        let route = package
+            .remember_admission(&reference_in(
+                package,
+                RegistryEntryKind::AuthorityRule,
+                "remember.actor_assertion",
+            ))
+            .expect("remember.actor_assertion must resolve as a remember route");
+        assert_eq!(route.predicate_schema, predicate);
     }
 
     #[test]
-    fn materialization_admits_only_the_compiled_in_stage4_package() {
-        let stage4 = stage4_package().expect("Stage-4 package closure");
+    fn the_generation_one_digest_materializes_the_stage4_package() {
+        let stage4 = compiled_stage4_package().expect("Stage-4 package closure");
+        let active = materialize_active_package(stage4.package_digest())
+            .expect("the generation-1 digest materializes");
+
+        assert_eq!(active.known(), KnownRegistryPackage::Stage4Generation1);
+        assert_eq!(active.package_digest(), stage4.package_digest());
+        assert_eq!(active.successor().package_digest(), stage4.package_digest());
         assert_eq!(
-            materialize_active_package(stage4.package_digest())
-                .expect("Stage-4 digest materializes")
+            active
+                .stage4()
+                .expect("generation 1 keeps its Stage-4 narrowing")
                 .package_digest(),
             stage4.package_digest()
         );
+        assert_serves_the_remember_route(active.successor());
+        assert_eq!(
+            serde_json::to_value(active.known()).expect("tag serializes"),
+            serde_json::json!("stage4_generation1")
+        );
+    }
 
-        let genesis = genesis_package().expect("genesis package closure");
+    #[test]
+    fn the_composed_generation_two_digest_materializes_the_connector_package() {
+        let generation_two =
+            compiled_generation_two_package().expect("generation-2 package closure");
+        let active = materialize_active_package(generation_two.package_digest())
+            .expect("the composed generation-2 digest materializes");
+
+        assert_eq!(active.known(), KnownRegistryPackage::ConnectorGeneration2);
+        assert_eq!(active.package_digest(), generation_two.package_digest());
+        assert!(
+            active.stage4().is_none(),
+            "generation 2 does not close under the single-connector Stage-4 target"
+        );
+        let package = active.successor();
+        for connector in [
+            "connector.github.push",
+            "connector.git.history",
+            "connector.transcript.session",
+            "connector.ci.workflow_run",
+        ] {
+            let reference = reference_in(package, RegistryEntryKind::ConnectorSchema, connector);
+            assert!(
+                package.connector_schema(&reference).is_some(),
+                "{connector} must resolve as a connector schema of the generation-2 package"
+            );
+        }
+        assert_serves_the_remember_route(package);
+        assert_eq!(
+            serde_json::to_value(active.known()).expect("tag serializes"),
+            serde_json::json!("connector_generation2")
+        );
+    }
+
+    #[test]
+    fn an_unknown_digest_does_not_materialize() {
+        let genesis = compiled_genesis_package().expect("genesis package closure");
         for unknown in [
             Sha256Digest::ZERO,
             genesis.package_digest(),
@@ -1181,10 +1470,58 @@ mod tests {
         assert_eq!(witness.activation_id(), fixture.row.activation_id);
         assert_eq!(witness.partition_seed(), &[0x51_u8; 32]);
         assert_eq!(witness.canonical_head(), fixture.row.canonical_head);
+        let stage4 = compiled_stage4_package().expect("Stage-4 package");
+        assert_eq!(witness.package().package_digest(), stage4.package_digest());
         assert_eq!(
-            witness.package().package_digest(),
-            stage4_package().expect("Stage-4 package").package_digest()
+            witness.active_package().known(),
+            KnownRegistryPackage::Stage4Generation1
         );
+        assert_eq!(
+            witness
+                .stage4_package()
+                .expect("a generation-1 head keeps its Stage-4 narrowing")
+                .package_digest(),
+            stage4.package_digest()
+        );
+        assert_eq!(
+            witness.genesis_package().package_digest(),
+            fixture.row.root_package_digest,
+            "the witness hands out the genesis package the pinned receipt binds"
+        );
+    }
+
+    /// AUTH-04 at generation 2. A head that activated the composed
+    /// generation-2 connector package passes the whole `verify_row` path, and
+    /// the witness hands out that package, not the generation-1 one: the
+    /// connectors only generation 2 carries bind out of `package()`, and the
+    /// Stage-4 narrowing is absent.
+    #[test]
+    fn a_head_that_activates_the_generation_two_package_mints_a_witness() {
+        let mut fixture = authority_fixture_generation_two(0x5e);
+        let generation_two = compiled_generation_two_package()
+            .expect("generation-2 package")
+            .package_digest();
+        fixture.row.package_digest = generation_two;
+        fixture.row.canonical_head = head_bytes(&fixture, |binding| {
+            binding.head.package_digest = generation_two;
+        });
+
+        let witness = verify_row(&fixture.scope, &fixture.row, &fixture.config)
+            .expect("a generation-2 connector head mints a witness");
+        assert_eq!(witness.generation(), 2);
+        assert_eq!(witness.package_digest(), generation_two);
+        assert_eq!(witness.package().package_digest(), generation_two);
+        assert_eq!(
+            witness.active_package().known(),
+            KnownRegistryPackage::ConnectorGeneration2
+        );
+        assert!(witness.stage4_package().is_none());
+        let git = reference_in(
+            witness.package(),
+            RegistryEntryKind::ConnectorSchema,
+            "connector.git.history",
+        );
+        assert!(witness.package().connector_schema(&git).is_some());
     }
 
     /// The reconciliation seam between this module's unforgeable witness and
@@ -1226,19 +1563,19 @@ mod tests {
     /// AUTH-04. The head's package digest must materialize to a compiled-in
     /// semantically closed package, and that gate must be reached through the
     /// whole `verify_row` path, not only through the public helper. A head
-    /// carrying any other digest is exactly what W0-REG's generation-2
-    /// composition will produce, and the brief requires that path to fail
-    /// closed rather than to run admission rules whose bytes this process has
-    /// never verified. The canonical head is re-encoded to match, so the
-    /// binding check cannot mask the materialization check. The zero digest is
-    /// not a vector here because `RegistryHeadBindingV1::validate_shape`
-    /// refuses it two gates earlier;
-    /// `materialization_admits_only_the_compiled_in_stage4_package` covers it
-    /// against the helper directly.
+    /// carrying any other digest must fail closed rather than run admission
+    /// rules whose bytes this process has never verified. The canonical head
+    /// is re-encoded to match, so the binding check cannot mask the
+    /// materialization check. The zero digest is not a vector here because
+    /// `RegistryHeadBindingV1::validate_shape` refuses it two gates earlier;
+    /// `an_unknown_digest_does_not_materialize` covers it against the helper
+    /// directly.
     #[test]
     fn an_active_package_digest_that_is_not_compiled_in_fails_the_whole_path() {
         let fixture = authority_fixture(0x57);
-        let genesis_digest = genesis_package().expect("genesis package").package_digest();
+        let genesis_digest = compiled_genesis_package()
+            .expect("genesis package")
+            .package_digest();
         for (label, package_digest) in [
             (
                 "foreign package digest",

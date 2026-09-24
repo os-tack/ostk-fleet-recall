@@ -59,8 +59,8 @@ use ostk_fleet_recall::registry_activation::{
     SuccessorActivationOutcome, SuccessorActivationRepository,
 };
 use ostk_fleet_recall::registry_witness::{
-    WriterAuthorityError, WriterAuthorityRejection, load_and_verify, materialize_active_package,
-    verify_within,
+    KnownRegistryPackage, WriterAuthorityError, WriterAuthorityRejection, load_and_verify,
+    materialize_active_package, verify_within,
 };
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig, RetryPolicy};
 use ostk_recall_core::PrivacyTier;
@@ -603,6 +603,14 @@ async fn live_writer_authority_witness_materializes_the_stage4_head_when_configu
         fixture.target.package_digest(),
         "the witness must materialize the exact compiled-in Stage-4 package"
     );
+    assert_eq!(
+        witness.active_package().known(),
+        KnownRegistryPackage::Stage4Generation1
+    );
+    assert!(
+        witness.stage4_package().is_some(),
+        "a generation-1 head keeps its Stage-4 narrowing"
+    );
     assert_eq!(witness.shard_count(), 16);
     assert_eq!(
         witness.partition_recipe_id().as_str(),
@@ -1042,9 +1050,14 @@ fn probe_database_url(database_url: &str, role: &str, password: &str) -> String 
 #[test]
 fn writer_authority_materialization_rejects_an_unknown_package_digest() {
     let fixture = fixture();
+    let active = materialize_active_package(fixture.target.package_digest())
+        .expect("the frozen Stage-4 digest materializes");
+    assert_eq!(active.known(), KnownRegistryPackage::Stage4Generation1);
+    assert_eq!(active.package_digest(), fixture.target.package_digest());
     assert_eq!(
-        materialize_active_package(fixture.target.package_digest())
-            .expect("the frozen Stage-4 digest materializes")
+        active
+            .stage4()
+            .expect("generation 1 keeps its Stage-4 narrowing")
             .package_digest(),
         fixture.target.package_digest()
     );

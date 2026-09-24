@@ -39,6 +39,7 @@ use ostk_fleet_recall::body_store::{
     BodyProjectionRepository, CockroachBodyProjectionRepository, GovernedContentResolver,
     reference_parser_key_v1,
 };
+use ostk_fleet_recall::config::WriterAuthorityConfig;
 use ostk_fleet_recall::connectors::ci::CiFactError;
 use ostk_fleet_recall::connectors::ci::fact::CiWorkflowRunFactV1;
 use ostk_fleet_recall::connectors::ci::ingress::CiConnectorBindingV1;
@@ -125,6 +126,7 @@ use ostk_fleet_recall::registry_activation::{
     GenesisActivationRepository, SuccessorActivationCandidate, SuccessorActivationOutcome,
     SuccessorActivationRepository,
 };
+use ostk_fleet_recall::registry_witness::{KnownRegistryPackage, load_and_verify};
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig, RetryPolicy};
 use ostk_recall_core::PrivacyTier;
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
@@ -638,6 +640,26 @@ async fn activate(
         "CI ingestion runs under the generation-2 head, whose canonical resources are \
          version-form"
     );
+    // AUTH-04: the strict witness admits the composed generation-2 head under
+    // the deployment pins, and the package it materializes is exactly the one
+    // the CI connector binds out of below.
+    let strict = load_and_verify(
+        pool,
+        &physical,
+        &WriterAuthorityConfig::from_trusted_context(
+            fixture.semantic_scope.clone(),
+            bootstrap_receipt_digest,
+            None,
+        ),
+    )
+    .await
+    .expect("the strict witness must accept the composed generation-2 head");
+    assert_eq!(
+        strict.active_package().known(),
+        KnownRegistryPackage::ConnectorGeneration2
+    );
+    assert!(strict.stage4_package().is_none());
+    assert_eq!(strict.package(), &fixture.generation_2_closed);
     let active = ActiveStage4Package::bind_connector(
         fixture.generation_2_closed.clone(),
         &ContractId::new(CI_CONNECTOR.connector_schema).unwrap(),

@@ -91,6 +91,10 @@ const CLOSED_INPUT_BOUNDARY: &str = "boundary.crate-source";
 const SUPPORTED_SOURCE_KIND: &str = "git.blob";
 const SUPPORTED_RESOURCE_KIND: &str = "rust.enum";
 const REQUIRED_APPLICABILITY_DIMENSION: &str = "repository_commit";
+/// The connector schema an observer run delivers as. Every package the strict
+/// witness admits carries it: generation 1 has it as its only connector, and
+/// generation 2 carries every generation-1 entry forward byte for byte.
+const OBSERVER_CONNECTOR_SCHEMA: &str = "connector.github.push";
 
 /// Conformance vector digests for this build. These describe which vectors
 /// this executable was proven against, so they belong to the binary and not
@@ -374,8 +378,9 @@ async fn apply(args: ApplyArgs) -> anyhow::Result<()> {
     })?;
     let witness = load_and_verify(&pool, &scope, &authority).await?;
     let append_witness = witness.to_append_witness()?;
-    let active = ActiveStage4Package::bind(
-        witness.package(),
+    let active = ActiveStage4Package::bind_connector(
+        witness.package().clone(),
+        &ContractId::new(OBSERVER_CONNECTOR_SCHEMA)?,
         witness.head_binding().clone(),
         &append_witness,
     )?;
