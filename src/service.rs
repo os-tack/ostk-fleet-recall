@@ -46,11 +46,13 @@ impl RecallAction {
 pub enum RememberAction {
     Record,
     /// Event-first ingestion beside the byte-identical legacy [`Self::Record`]
-    /// path (ADR 0002 D3). An accepted `assert` appends `memory.claim.accepted`
-    /// to the Stage-4 evidence ledger and writes the legacy claim projection in
-    /// one serializable transaction. The route fails closed with a typed error
-    /// until the deployment carries the writer-authority configuration D4
-    /// requires; `record` is unaffected either way.
+    /// path (ADR 0002 D3, ADR 0005). An accepted `assert` appends
+    /// `memory.claim.accepted` to the evidence ledger and writes the legacy
+    /// claim projection, the conflict detector, and the receipt in one
+    /// serializable transaction. It is served, and advertised, only where the
+    /// writer-authority pins verified at startup
+    /// ([`RememberSurface::assert`]); anywhere else it is refused before any
+    /// I/O as `assert_unavailable`. `record` is unaffected either way.
     Assert,
     Supersede,
     Retract,
@@ -273,6 +275,7 @@ pub type ServiceResult<T> = std::result::Result<T, ServiceError>;
 /// is the historical surface and produces the historical tool schema
 /// byte-for-byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[allow(clippy::struct_excessive_bools)] // independent capabilities, reported as-is in recall(status)
 pub struct RememberSurface {
     /// Owner lifecycle of authored claims (`retract` and `supersede`).
     pub claim_lifecycle: bool,
@@ -284,6 +287,13 @@ pub struct RememberSurface {
     /// a conflict's members), served only with the conflict lifecycle and
     /// `FLEET_RECALL_CONFLICT_ADJUDICATION=enabled`.
     pub adjudication: bool,
+    /// Event-first `assert` (ADR 0005), served only when the writer-authority
+    /// pins verified at startup and the active package routes an assertion.
+    /// Independent of the lifecycle: a writer may serve `record` and `assert`
+    /// alone. Omitted from JSON when off, so every surface without it
+    /// serializes exactly as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub assert: bool,
 }
 
 impl RememberSurface {
@@ -291,6 +301,7 @@ impl RememberSurface {
         claim_lifecycle: false,
         conflict_lifecycle: false,
         adjudication: false,
+        assert: false,
     };
 
     /// Whether any lifecycle is served: the claim lifecycle, the conflict
@@ -311,11 +322,12 @@ impl RememberSurface {
     }
 
     /// Whether this surface serves `action`. `record` is always served; the
-    /// remaining non-lifecycle actions keep their own dispatch outcome.
+    /// remaining unlisted actions keep their own dispatch outcome.
     #[must_use]
     pub const fn allows(self, action: RememberAction) -> bool {
         match action {
             RememberAction::Record => true,
+            RememberAction::Assert => self.assert,
             RememberAction::Retract | RememberAction::Supersede => self.claim_lifecycle,
             RememberAction::Acknowledge | RememberAction::Resolve => self.conflict_lifecycle,
             RememberAction::Dismiss | RememberAction::Waive => self.serves_adjudication(),
@@ -346,14 +358,25 @@ impl RecallSurface {
     };
 }
 
-/// Refuse a lifecycle action the surface does not serve, before any I/O.
+/// Refuse an action the surface does not serve, before any I/O.
 ///
-/// `dismiss` and `waive` on a writer that serves the conflict lifecycle but
-/// not adjudication are refused as `adjudication_disabled`; every other
-/// unserved lifecycle action as `lifecycle_unavailable`. Actions outside the
-/// lifecycle vocabulary pass through unchanged so their existing outcomes
-/// (for example the fenced `assert` route) are preserved.
+/// An unserved `assert` is refused as `assert_unavailable`. `dismiss` and
+/// `waive` on a writer that serves the conflict lifecycle but not
+/// adjudication are refused as `adjudication_disabled`; every other unserved
+/// lifecycle action as `lifecycle_unavailable`. Actions outside both
+/// vocabularies pass through unchanged so their existing outcomes are
+/// preserved.
 pub fn authorize_surface(surface: RememberSurface, action: RememberAction) -> ServiceResult<()> {
+    if action == RememberAction::Assert && !surface.assert {
+        return Err(ServiceError::Refused(Refusal {
+            code: "assert_unavailable",
+            message: "remember(assert) is not served by this deployment: its writer-authority \
+                      pins are not configured or did not verify at startup; \
+                      recall(status).remember_assert says why when they are configured"
+                .into(),
+            details: serde_json::json!({ "action": action.as_str() }),
+        }));
+    }
     let adjudication_action = matches!(action, RememberAction::Dismiss | RememberAction::Waive);
     let lifecycle_action = adjudication_action
         || matches!(
@@ -469,8 +492,9 @@ mod tests {
     #[test]
     fn assert_action_wire_string_round_trips() {
         // The event-first action deserializes from its snake_case wire label so
-        // an MCP `remember` call with `"action":"assert"` reaches the disabled
-        // route rather than being silently coerced into `record` (ADR 0002 D3).
+        // an MCP `remember` call with `"action":"assert"` reaches the assert
+        // route (or its refusal) rather than being silently coerced into
+        // `record` (ADR 0002 D3).
         let decoded: RememberAction = serde_json::from_str("\"assert\"").unwrap();
         assert_eq!(decoded, RememberAction::Assert);
         assert_eq!(RememberAction::Assert.as_str(), "assert");
@@ -555,22 +579,95 @@ mod tests {
         };
         assert!(!switch_only.serves_adjudication());
         assert!(authorize_surface(switch_only, RememberAction::Dismiss).is_err());
-        // Record and non-lifecycle actions keep their own dispatch outcome.
+        // Record and the actions outside both vocabularies keep their own
+        // dispatch outcome.
         for surface in [
             RememberSurface::RECORD_ONLY,
             lifecycle,
             conflicts,
             adjudicating,
         ] {
-            for action in [
-                RememberAction::Record,
-                RememberAction::Assert,
-                RememberAction::Forget,
-            ] {
+            for action in [RememberAction::Record, RememberAction::Forget] {
                 assert!(authorize_surface(surface, action).is_ok());
             }
         }
         assert_eq!(RememberSurface::default(), RememberSurface::RECORD_ONLY);
+    }
+
+    #[test]
+    fn assert_is_refused_unless_served() {
+        let claim = RememberSurface {
+            claim_lifecycle: true,
+            ..RememberSurface::RECORD_ONLY
+        };
+        let adjudicating = RememberSurface {
+            conflict_lifecycle: true,
+            adjudication: true,
+            ..claim
+        };
+        // No lifecycle implies assert: every surface without it refuses.
+        for surface in [RememberSurface::RECORD_ONLY, claim, adjudicating] {
+            let Err(ServiceError::Refused(refusal)) =
+                authorize_surface(surface, RememberAction::Assert)
+            else {
+                panic!("{surface:?} does not serve assert");
+            };
+            assert_eq!(refusal.code, "assert_unavailable");
+            assert_eq!(refusal.details["action"], "assert");
+        }
+        // Assert is served alone or beside any lifecycle, and it serves no
+        // lifecycle action by itself.
+        let assert_only = RememberSurface {
+            assert: true,
+            ..RememberSurface::RECORD_ONLY
+        };
+        for surface in [
+            assert_only,
+            RememberSurface {
+                assert: true,
+                ..adjudicating
+            },
+        ] {
+            assert!(authorize_surface(surface, RememberAction::Assert).is_ok());
+            assert!(authorize_surface(surface, RememberAction::Record).is_ok());
+        }
+        assert!(!assert_only.lifecycle_served());
+        for action in [
+            RememberAction::Retract,
+            RememberAction::Supersede,
+            RememberAction::Resolve,
+            RememberAction::Acknowledge,
+            RememberAction::Dismiss,
+            RememberAction::Waive,
+        ] {
+            let Err(ServiceError::Refused(refusal)) = authorize_surface(assert_only, action) else {
+                panic!("assert alone does not serve {}", action.as_str());
+            };
+            assert_eq!(refusal.code, "lifecycle_unavailable");
+        }
+    }
+
+    #[test]
+    fn surface_json_names_assert_only_when_served() {
+        let conflicts = RememberSurface {
+            claim_lifecycle: true,
+            conflict_lifecycle: true,
+            adjudication: false,
+            assert: false,
+        };
+        assert_eq!(
+            serde_json::to_value(conflicts).unwrap(),
+            serde_json::json!({
+                "claim_lifecycle": true,
+                "conflict_lifecycle": true,
+                "adjudication": false,
+            })
+        );
+        let asserting = RememberSurface {
+            assert: true,
+            ..conflicts
+        };
+        assert_eq!(serde_json::to_value(asserting).unwrap()["assert"], true);
     }
 
     #[test]

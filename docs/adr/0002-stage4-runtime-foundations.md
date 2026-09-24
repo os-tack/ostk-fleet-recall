@@ -1,8 +1,9 @@
 # ADR 0002: Stage-4 runtime foundations — one semantic ledger, two physical ledgers, and a narrow writer
 
 - Status: accepted and implemented in migration 0018 and `src/evidence_ledger`. The D3 `assert`
-  route is wired but fails closed because serving does not load the D4 writer-authority
-  configuration yet, and no serving path runs the evidence ledger.
+  route is served, with the D4 writer-authority pins, as recorded in
+  [ADR 0005](0005-event-first-assert-and-writer-authority.md), which also amends D3's input
+  wording: the server builds the `RememberIngressCandidateV2` from an ergonomic MCP assertion.
 - Date: 2026-08-16
 - Scope: the six decisions (D1–D6) that every Stage-4 runtime workstream (Wave 1) depends on.
   Target semantics are defined by `docs/DYNAMIC_MEMORY_ARCHITECTURE.md`; this record fixes the

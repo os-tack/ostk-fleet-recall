@@ -19,6 +19,7 @@ use crate::ledger::{
     validate_waiver_hours,
 };
 use crate::memory_contracts::discrepancy::{DismissalReasonKindV1, WaiverReasonKindV1};
+use crate::remember_runtime::{AssertStatusV1, RememberAssertInputV1};
 use crate::service::{
     ConflictCoverage, FleetMemoryService, RecallAction, RecallRequest, RecallResult, Refusal,
     RememberAction, RememberRequest, RememberResult, RememberSurface, ServiceError, ServiceResult,
@@ -77,6 +78,9 @@ pub struct CockroachMemoryService {
     ledger: Arc<dyn ClaimLedger>,
     embedder: Arc<dyn ChunkEmbedder>,
     lifecycle: LifecycleServing,
+    /// What startup decided about `remember(assert)`, reported by
+    /// `recall(status)`; `None` when no writer-authority pins are configured.
+    assert_status: Option<AssertStatusV1>,
 }
 
 struct ChunkConflictProjection {
@@ -118,6 +122,7 @@ impl std::fmt::Debug for CockroachMemoryService {
             .field("trusted_scope", &self.trusted_scope)
             .field("embedding_model", &self.embedder.model_id())
             .field("lifecycle", &self.lifecycle)
+            .field("assert_status", &self.assert_status)
             .finish_non_exhaustive()
     }
 }
@@ -143,6 +148,7 @@ impl CockroachMemoryService {
             ledger,
             embedder,
             lifecycle: LifecycleServing::default(),
+            assert_status: None,
         })
     }
 
@@ -151,6 +157,16 @@ impl CockroachMemoryService {
     #[must_use]
     pub const fn with_lifecycle(mut self, lifecycle: LifecycleServing) -> Self {
         self.lifecycle = lifecycle;
+        self
+    }
+
+    /// Report what startup decided about `remember(assert)` in
+    /// `recall(status)` as `remember_assert`. `None`, the default, reports
+    /// nothing. Whether assert is served is the surface's
+    /// [`RememberSurface::assert`], set with [`Self::with_lifecycle`].
+    #[must_use]
+    pub fn with_assert_status(mut self, status: Option<AssertStatusV1>) -> Self {
+        self.assert_status = status;
         self
     }
 
@@ -465,6 +481,17 @@ impl CockroachMemoryService {
                     .await
                     .map_err(service_error)?;
                 let mut result = RecallResult::new(json!({ "claim": claim }));
+                // An asserted claim names the accepted event it projects; a
+                // recorded one carries no such field.
+                if claim.is_some()
+                    && let Some(event_id) = self
+                        .ledger
+                        .claim_accepted_event_id(scope, id)
+                        .await
+                        .map_err(service_error)?
+                {
+                    result.data["accepted_event_id"] = json!(event_id);
+                }
                 let mut conflicts = self
                     .ledger
                     .conflicts_for_claim_ids(scope, &[id], MAX_TOOL_RESULTS)
@@ -672,6 +699,9 @@ impl CockroachMemoryService {
         if self.lifecycle.surface.lifecycle_served() {
             result.data["remember_surface"] = json!(self.lifecycle.surface);
         }
+        if let Some(status) = &self.assert_status {
+            result.data["remember_assert"] = json!(status);
+        }
         result.conflict_coverage = ConflictCoverage::not_evaluated();
         Ok(result)
     }
@@ -702,6 +732,35 @@ impl CockroachMemoryService {
             .await;
         let (conflicts, overlay) = self.overlay_projection(scope, conflicts).await;
         let mut result = committed_remember_result(&mutation, conflicts);
+        mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
+        Ok(result)
+    }
+
+    /// `remember(assert)`: the event-first append through the active
+    /// registry route (ADR 0005), then the same post-commit conflict
+    /// projection `record` returns, with the accepted event it appended.
+    async fn remember_assert(
+        &self,
+        scope: &FleetScope,
+        request: RememberRequest,
+    ) -> ServiceResult<RememberResult> {
+        self.verify_embedding_generation()
+            .await
+            .map_err(service_error)?;
+        let idempotency_key = required_idempotency_key(request.action, request.idempotency_key)?;
+        let args: AssertArgs = from_arguments(request.arguments, "remember assert")?;
+        let asserted = self
+            .ledger
+            .assert_claim(scope, &args.assertion, &idempotency_key)
+            .await
+            .map_err(service_error)?;
+        let conflicts = self
+            .ledger
+            .conflicts_for_claim_ids(scope, &[asserted.mutation.claim.id], MAX_TOOL_RESULTS)
+            .await;
+        let (conflicts, overlay) = self.overlay_projection(scope, conflicts).await;
+        let mut result = committed_remember_result(&asserted.mutation, conflicts);
+        result.data["accepted_event"] = json!(asserted.accepted_event);
         mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
         Ok(result)
     }
@@ -924,41 +983,6 @@ impl CockroachMemoryService {
             Some(mutation) => Ok(self.replayed_result(scope, &mutation).await),
             None => Err(refusal),
         }
-    }
-
-    /// Fail the event-first `assert` route closed (ADR 0002 D3/D4).
-    ///
-    /// An enabled `assert` would build a `RememberIngressCandidateV2` from the
-    /// trusted server scope (never from payload — EVID-04), route it to the
-    /// unique active `RememberAdmissionRuleV2` resolved from the witnessed
-    /// active package, rederive the subject from the activated identity recipe,
-    /// re-audit applicability and support event IDs, and append
-    /// `memory.claim.accepted` through
-    /// `AppendableAcceptedEvent::admitted_memory_claim` with an
-    /// `AppendProjection` that writes the legacy `memory_claims` /
-    /// `memory_events` / receipt rows carrying `accepted_event_id` in the SAME
-    /// serializable transaction (EVENT-03).
-    ///
-    /// That path is deliberately fenced off. ADR 0002 D4 requires three
-    /// writer-authority pins
-    /// (`FLEET_RECALL_CONTRACT_TENANT_NAMESPACE`,
-    /// `FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE`,
-    /// `FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST`) and an in-transaction
-    /// writer-authority witness before an accepted event may be minted; "when
-    /// absent the `assert` route is disabled and every legacy behaviour is
-    /// byte-stable". The serving runtime loads neither the pins
-    /// (`WriterAuthorityConfig`, `src/config.rs`) nor a non-stub witness loader
-    /// (`src/registry_witness`), so the route fails closed before any argument
-    /// is inspected: no admission rule is consulted, no head is read, no
-    /// synthesized canonical event is produced, and nothing is written
-    /// (APPL-01/02, PRED-03, AUTH-03).
-    fn assert_route_disabled() -> ServiceError {
-        ServiceError::Unavailable(
-            "remember(assert) is disabled: this deployment carries neither the ADR 0002 D4 \
-             writer-authority configuration pins nor an active-head witness, so the event-first \
-             path cannot mint an accepted event; use remember(record)"
-                .into(),
-        )
     }
 }
 
@@ -1331,13 +1355,19 @@ impl FleetMemoryService for CockroachMemoryService {
     ) -> ServiceResult<RememberResult> {
         self.ensure_scope(&scope)?;
         if let Err(refusal) = authorize_surface(self.lifecycle.surface, request.action) {
+            // An unserved assert is refused before any I/O. Replaying a
+            // committed assert receipt once assert is turned off is deferred
+            // (ADR 0005); only the lifecycle actions replay here.
+            if request.action == RememberAction::Assert {
+                return Err(refusal);
+            }
             return self
                 .replay_unserved_or_refuse(&scope, request, refusal)
                 .await;
         }
         match request.action {
             RememberAction::Record => self.remember_record(&scope, request).await,
-            RememberAction::Assert => Err(Self::assert_route_disabled()),
+            RememberAction::Assert => self.remember_assert(&scope, request).await,
             RememberAction::Retract => self.remember_retract(&scope, request).await,
             RememberAction::Supersede => self.remember_supersede(&scope, request).await,
             RememberAction::Acknowledge => self.remember_acknowledge(&scope, request).await,
@@ -1862,6 +1892,14 @@ struct SearchArgs {
     include_history: bool,
 }
 
+/// `remember(assert)` arguments: the assertion and nothing else. The scope,
+/// actor, and key travel beside it, never inside it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssertArgs {
+    assertion: RememberAssertInputV1,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GetArgs {
@@ -2078,19 +2116,6 @@ mod tests {
         assert_eq!(parse_safe_id(&json!(42)).unwrap(), 42);
         assert_eq!(parse_safe_id(&json!("42")).unwrap(), 42);
         assert!(parse_safe_id(&json!(9_007_199_254_740_992_i64)).is_err());
-    }
-
-    #[test]
-    fn assert_route_is_disabled_and_fails_closed() {
-        // ADR 0002 D4: with no writer-authority pins and a stub witness loader,
-        // `remember(assert)` must fail closed with a typed error and never
-        // reach a write path. This pins the enforced half of the enum-variant
-        // doc claim without needing a database-backed service.
-        let error = CockroachMemoryService::assert_route_disabled();
-        assert!(matches!(error, ServiceError::Unavailable(_)));
-        let message = error.to_string();
-        assert!(message.contains("remember(assert) is disabled"));
-        assert!(message.contains("use remember(record)"));
     }
 
     #[test]
@@ -2602,12 +2627,14 @@ mod tests {
         claim_lifecycle: true,
         conflict_lifecycle: false,
         adjudication: false,
+        assert: false,
     };
 
     const CONFLICT_LIFECYCLE: RememberSurface = RememberSurface {
         claim_lifecycle: true,
         conflict_lifecycle: true,
         adjudication: false,
+        assert: false,
     };
 
     const ADJUDICATING: RememberSurface = RememberSurface {
@@ -2902,6 +2929,45 @@ mod tests {
                 "{extra}: {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn unserved_assert_is_refused_before_io() {
+        let assertion = retract_arguments(&json!({ "assertion": { "kind": "decision" } }));
+        // The offline pool fails any read, so a refusal proves no I/O ran,
+        // even for a keyed request.
+        for surface in [RememberSurface::RECORD_ONLY, CLAIM_LIFECYCLE, ADJUDICATING] {
+            let error = FleetMemoryService::remember(
+                &offline_service(surface),
+                offline_scope(),
+                RememberRequest::new(
+                    RememberAction::Assert,
+                    Some("assert/1".into()),
+                    assertion.clone(),
+                ),
+            )
+            .await
+            .unwrap_err();
+            let ServiceError::Refused(refusal) = &error else {
+                panic!("{surface:?}: {error}");
+            };
+            assert_eq!(refusal.code, "assert_unavailable");
+            assert_eq!(refusal.details["action"], "assert");
+        }
+        // A writer that serves assert takes it past the surface, to the
+        // corpus generation check, which needs the database.
+        let serving = offline_service(RememberSurface {
+            assert: true,
+            ..RememberSurface::RECORD_ONLY
+        });
+        let error = FleetMemoryService::remember(
+            &serving,
+            offline_scope(),
+            RememberRequest::new(RememberAction::Assert, Some("assert/2".into()), assertion),
+        )
+        .await
+        .unwrap_err();
+        assert!(!matches!(error, ServiceError::Refused(_)), "{error}");
     }
 
     #[tokio::test]

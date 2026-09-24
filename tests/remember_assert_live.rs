@@ -15,23 +15,35 @@
 //! acknowledges, while an intention never conflicts with an attestation; a
 //! refusal writes nothing and leaves its key free; the runtime role's
 //! existing grants suffice; and `record` is unchanged.
+//!
+//! Over MCP, composed as `serve` composes it, assert is advertised and served
+//! only where the writer-authority pins verify, beside or without the
+//! lifecycle; recall shows which accepted event a claim projects and what an
+//! agent may assert; and without usable pins every tool stays what it was and
+//! assert is a typed refusal.
 
 mod common;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, SubsecRound as _, Utc};
 use common::authority::{InstalledAuthority, install_generation_two, retry_policy};
 use common::runtime_role::RuntimeProbeRole;
+use ostk_fleet_recall::application::LifecycleServing;
 use ostk_fleet_recall::ledger::{
     AssertedClaimMutation, ClaimInput, ClaimKind, ClaimLedger, ClaimState, CockroachClaimLedger,
     ConflictTarget, LifecycleRefusal, RefusalCode,
 };
-use ostk_fleet_recall::remember_runtime::{EventFirstAssert, RememberAssertInputV1};
+use ostk_fleet_recall::mcp::{JsonRpcError, McpServer, tool_list_for};
+use ostk_fleet_recall::remember_runtime::{
+    EventFirstAssert, RememberAssertInputV1, start_event_first_assert_with,
+};
+use ostk_fleet_recall::service::RememberSurface;
 use ostk_fleet_recall::store::cockroach::{
     CockroachStore, ConflictLifecycleCapability, EMBEDDING_DIMENSION, probe_conflict_lifecycle,
 };
-use ostk_fleet_recall::{FleetError, FleetScope};
+use ostk_fleet_recall::{CockroachMemoryService, FleetError, FleetScope};
 use ostk_recall_core::{ChunkEmbedder, PrivacyTier};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -202,6 +214,77 @@ impl AssertFleet {
         (claim_event, recorded)
     }
 
+    /// The writer-authority pin group the installer printed, by variable
+    /// name, as `serve` reads it from its environment.
+    fn pins(&self) -> HashMap<String, String> {
+        serde_json::from_value(
+            serde_json::to_value(&self.authority.report.pins).expect("the pins serialize"),
+        )
+        .expect("the pins are one string per variable")
+    }
+
+    /// `agent`'s MCP server over the owner pool, composed as serve's
+    /// `build_memory_service` composes it: the claim ledger (with the
+    /// conflict lifecycle when `lifecycle`), assert started under `pins`
+    /// and bound to that ledger, and the surface both decide.
+    async fn mcp_server(
+        &self,
+        agent: &str,
+        lifecycle: bool,
+        pins: &HashMap<String, String>,
+    ) -> McpServer {
+        let scope = self.scope(agent);
+        let mut ledger = self.plain_ledger(&self.owner, agent);
+        if lifecycle {
+            ledger = ledger.with_conflict_lifecycle(self.conflict_lifecycle);
+        }
+        let (ledger, status) =
+            start_event_first_assert_with(self.owner.clone(), &scope, retry_policy(), |name| {
+                pins.get(name).cloned()
+            })
+            .await
+            .bind_ledger(ledger);
+        let assert = status.as_ref().is_some_and(|status| status.served);
+        let serving = if lifecycle {
+            LifecycleServing {
+                surface: RememberSurface {
+                    claim_lifecycle: true,
+                    conflict_lifecycle: true,
+                    adjudication: false,
+                    assert,
+                },
+                hide_non_current_claim_chunks: true,
+                lifecycle_overlay: true,
+            }
+        } else if assert {
+            LifecycleServing {
+                surface: RememberSurface {
+                    assert: true,
+                    ..RememberSurface::RECORD_ONLY
+                },
+                ..LifecycleServing::default()
+            }
+        } else {
+            LifecycleServing::default()
+        };
+        let store = CockroachStore::from_pool(self.owner.clone(), scope.clone())
+            .expect("the agent scope is a valid store scope");
+        let service = CockroachMemoryService::new(
+            scope.clone(),
+            Arc::new(store),
+            Arc::new(ledger),
+            Arc::new(UnitEmbedder),
+        )
+        .expect("memory service")
+        .with_assert_status(status)
+        .with_lifecycle(serving);
+        service
+            .verify_embedding_generation()
+            .await
+            .expect("the corpus model is initialized");
+        McpServer::new(Arc::new(service), scope).expect("MCP server")
+    }
+
     async fn has_receipt(&self, key: &str) -> bool {
         sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM memory_mutation_receipts \
@@ -230,6 +313,11 @@ fn assertion(value: bool, modality: &str) -> RememberAssertInputV1 {
         },
     }))
     .expect("the fixture assertion parses as the MCP input")
+}
+
+/// The MCP `assertion` for [`assertion`]'s claim.
+fn assertion_json(value: bool, modality: &str) -> Value {
+    serde_json::to_value(assertion(value, modality)).expect("the assertion serializes")
 }
 
 fn attested(value: bool) -> RememberAssertInputV1 {
@@ -770,4 +858,289 @@ async fn live_record_is_unaffected_when_configured() {
         matches!(attached, Err(FleetError::Configuration(_))),
         "{attached:?}"
     );
+}
+
+/// `tools/list` over `server`.
+async fn list_tools(server: &McpServer) -> Value {
+    server
+        .handle_value(json!({ "jsonrpc": "2.0", "id": "tools", "method": "tools/list" }))
+        .await
+        .expect("a request has a response")
+        .result
+        .expect("tools/list answers")["tools"]
+        .clone()
+}
+
+/// `tools/call` of `tool` over `server`: the structured content of a
+/// successful call, or the JSON-RPC error of a refused one.
+async fn call_tool(
+    server: &McpServer,
+    tool: &str,
+    arguments: Value,
+) -> Result<Value, JsonRpcError> {
+    let response = server
+        .handle_value(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments },
+        }))
+        .await
+        .expect("a request has a response");
+    if let Some(error) = response.error {
+        return Err(error);
+    }
+    let result = response.result.expect("tools/call answers");
+    assert_eq!(result["isError"], false, "{}", result["content"][0]["text"]);
+    Ok(result["structuredContent"].clone())
+}
+
+async fn mcp_assert(
+    server: &McpServer,
+    key: &str,
+    assertion: Value,
+) -> Result<Value, JsonRpcError> {
+    call_tool(
+        server,
+        "remember",
+        json!({ "action": "assert", "idempotency_key": key, "assertion": assertion }),
+    )
+    .await
+}
+
+async fn mcp_recall(server: &McpServer, arguments: Value) -> Value {
+    call_tool(server, "recall", arguments)
+        .await
+        .unwrap_or_else(|error| panic!("recall answers: {error:?}"))
+}
+
+/// The refusal code of a `remember` call refused before commit.
+fn refusal_code(error: &JsonRpcError) -> &str {
+    let data = error.data.as_ref().expect("a refusal carries data");
+    assert_eq!(data["outcome"], "not_applied", "{error:?}");
+    data["code"].as_str().expect("a refusal names its code")
+}
+
+fn remember_actions(tools: &Value) -> Value {
+    tools[1]["inputSchema"]["properties"]["action"]["enum"].clone()
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one end-to-end MCP pass from tools/list through status
+async fn live_mcp_assert_end_to_end_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let fleet = AssertFleet::new(&database_url, "assert-mcp").await;
+    let pins = fleet.pins();
+    // A serves the lifecycle and assert; B serves record and assert only.
+    let server_a = fleet.mcp_server(AGENT_A, true, &pins).await;
+    let server_b = fleet.mcp_server(AGENT_B, false, &pins).await;
+
+    let tools_a = list_tools(&server_a).await;
+    assert_eq!(
+        remember_actions(&tools_a),
+        json!([
+            "record",
+            "assert",
+            "supersede",
+            "retract",
+            "acknowledge",
+            "resolve"
+        ])
+    );
+    let tools_b = list_tools(&server_b).await;
+    assert_eq!(remember_actions(&tools_b), json!(["record", "assert"]));
+    assert_eq!(
+        tools_b[0],
+        tool_list_for(RememberSurface::RECORD_ONLY)[0],
+        "assert alone adds nothing to recall"
+    );
+
+    let yes = mcp_assert(&server_a, "assert-mcp-a", assertion_json(true, "attested"))
+        .await
+        .expect("A's assertion commits");
+    let data = &yes["data"];
+    assert_eq!(yes["action"], "assert");
+    assert_eq!(data["operation"], "assert");
+    assert_eq!(data["receipt"]["committed"], true);
+    let claim_a = data["claim"]["id"].as_i64().expect("the claim has an id");
+    let event_a = data["accepted_event"]["event_id"].clone();
+    assert!(event_a.is_string(), "{data}");
+    assert!(
+        data["accepted_event"]["committed_offset"].is_number(),
+        "{data}"
+    );
+
+    // The same key and request replay over MCP too.
+    let replayed = mcp_assert(&server_a, "assert-mcp-a", assertion_json(true, "attested"))
+        .await
+        .expect("the same key and request replay");
+    assert_eq!(replayed["data"]["receipt"]["idempotent_replay"], true);
+    assert_eq!(replayed["data"]["accepted_event"]["event_id"], event_a);
+
+    // B, which serves no lifecycle, disagrees and opens a conflict.
+    let no = mcp_assert(&server_b, "assert-mcp-b", assertion_json(false, "attested"))
+        .await
+        .expect("B's assertion commits");
+    let opened = no["data"]["conflicts_opened"].clone();
+    let conflict_id = opened[0].as_i64().expect("B's assertion opens a conflict");
+    assert_eq!(opened, json!([conflict_id]));
+    assert_eq!(no["data"]["claim"]["state"], "disputed");
+    assert_eq!(no["conflicts"][0]["id"], conflict_id);
+
+    // recall(get) names the accepted event an asserted claim projects, and
+    // a recorded claim names none.
+    let got = mcp_recall(
+        &server_a,
+        json!({ "action": "get", "kind": "claim", "id": claim_a }),
+    )
+    .await;
+    assert_eq!(got["data"]["accepted_event_id"], event_a);
+    assert_eq!(got["data"]["claim"]["id"], claim_a);
+    let recorded = call_tool(
+        &server_a,
+        "remember",
+        json!({
+            "action": "record", "idempotency_key": "assert-mcp-record",
+            "kind": "note", "text": "a recorded note beside the assertions",
+        }),
+    )
+    .await
+    .expect("record still commits");
+    assert!(
+        recorded["data"].get("accepted_event").is_none(),
+        "{recorded}"
+    );
+    let got = mcp_recall(
+        &server_a,
+        json!({ "action": "get", "kind": "claim", "id": recorded["data"]["claim"]["id"] }),
+    )
+    .await;
+    assert!(got["data"].get("accepted_event_id").is_none(), "{got}");
+
+    // recall(conflicts) shows the one conflict both assertions belong to,
+    // and the unchanged lifecycle acts on it over MCP.
+    let conflicts = mcp_recall(&server_a, json!({ "action": "conflicts" })).await;
+    let listed = conflicts["data"]["conflicts"].as_array().unwrap();
+    let [conflict] = listed.as_slice() else {
+        panic!("one open conflict: {listed:?}");
+    };
+    assert_eq!(conflict["id"], conflict_id);
+    let mut members = conflict["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|member| member["id"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    members.sort_unstable();
+    let mut expected = vec![claim_a, no["data"]["claim"]["id"].as_i64().unwrap()];
+    expected.sort_unstable();
+    assert_eq!(members, expected);
+    let acknowledged = call_tool(
+        &server_a,
+        "remember",
+        json!({
+            "action": "acknowledge", "idempotency_key": "assert-mcp-ack",
+            "conflict_id": conflict_id, "expected_revision": conflict["revision"],
+        }),
+    )
+    .await
+    .expect("the lifecycle acknowledges an asserted conflict");
+    assert_eq!(acknowledged["data"]["applied"], true);
+
+    // recall(status) says assert is served and what an agent may assert.
+    let status = mcp_recall(&server_a, json!({ "action": "status" })).await;
+    let assert_status = &status["data"]["remember_assert"];
+    assert_eq!(assert_status["served"], true, "{assert_status}");
+    assert!(assert_status.get("reason").is_none(), "{assert_status}");
+    assert_eq!(
+        assert_status["registry"]["package"],
+        "connector_generation2"
+    );
+    let route = &assert_status["route"];
+    assert_eq!(route["subject_keys"], json!(["provider_repository_id"]));
+    assert_eq!(
+        route["applicability_keys"]["repository_commit"],
+        json!(["commit_oid"])
+    );
+    assert_eq!(
+        route["applicability_keys"]["runtime_environment"],
+        json!(["environment_id"])
+    );
+    assert!(
+        route["modalities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("attested")),
+        "{route}"
+    );
+    assert_eq!(status["data"]["remember_surface"]["assert"], true);
+    let status_b = mcp_recall(&server_b, json!({ "action": "status" })).await;
+    assert_eq!(status_b["data"]["remember_assert"]["served"], true);
+    assert!(status_b["data"].get("remember_surface").is_none());
+}
+
+#[tokio::test]
+async fn live_mcp_without_pins_is_byte_stable_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let fleet = AssertFleet::new(&database_url, "assert-mcp-off").await;
+    let lifecycle = RememberSurface {
+        claim_lifecycle: true,
+        conflict_lifecycle: true,
+        adjudication: false,
+        assert: false,
+    };
+
+    // No pins: every tool is what the lifecycle writer always listed, recall
+    // reports nothing about assert, and assert is a typed refusal.
+    let unpinned = fleet.mcp_server(AGENT_A, true, &HashMap::new()).await;
+    assert_eq!(list_tools(&unpinned).await, json!(tool_list_for(lifecycle)));
+    let refused = mcp_assert(
+        &unpinned,
+        "assert-mcp-off-1",
+        assertion_json(true, "attested"),
+    )
+    .await
+    .expect_err("an unserved assert is refused");
+    assert_eq!(refusal_code(&refused), "assert_unavailable");
+    let status = mcp_recall(&unpinned, json!({ "action": "status" })).await;
+    assert!(status["data"].get("remember_assert").is_none(), "{status}");
+    let record_only = fleet.mcp_server(AGENT_B, false, &HashMap::new()).await;
+    assert_eq!(
+        list_tools(&record_only).await,
+        json!(tool_list_for(RememberSurface::RECORD_ONLY))
+    );
+
+    // A receipt pin the durable head does not carry: serve still starts,
+    // with assert off and the rejection reported.
+    let mut wrong = fleet.pins();
+    wrong.insert(
+        "FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST".into(),
+        "ab".repeat(32),
+    );
+    let mispinned = fleet.mcp_server(AGENT_A, true, &wrong).await;
+    assert_eq!(
+        list_tools(&mispinned).await,
+        json!(tool_list_for(lifecycle))
+    );
+    let refused = mcp_assert(
+        &mispinned,
+        "assert-mcp-off-2",
+        assertion_json(true, "attested"),
+    )
+    .await
+    .expect_err("assert is off under a wrong pin");
+    assert_eq!(refusal_code(&refused), "assert_unavailable");
+    let status = mcp_recall(&mispinned, json!({ "action": "status" })).await;
+    let assert_status = &status["data"]["remember_assert"];
+    assert_eq!(assert_status["served"], false, "{assert_status}");
+    assert!(
+        assert_status["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("receipt")),
+        "{assert_status}"
+    );
+    assert!(assert_status.get("route").is_none(), "{assert_status}");
+    assert!(!fleet.has_claims().await, "nothing was asserted");
 }

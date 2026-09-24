@@ -870,7 +870,8 @@ is `#[ignore]` and documents its environment at the top of the file.
 - Decision records: [product/backend boundary](docs/adr/0001-product-and-backend-boundary.md),
   [Stage-4 runtime foundations](docs/adr/0002-stage4-runtime-foundations.md),
   [consolidation and conflict tolerance](docs/adr/0003-consolidation-and-conflict-tolerance.md),
-  and [serving conflict lifecycle](docs/adr/0004-serving-conflict-lifecycle.md).
+  [serving conflict lifecycle](docs/adr/0004-serving-conflict-lifecycle.md), and
+  [event-first assert and writer authority](docs/adr/0005-event-first-assert-and-writer-authority.md).
 - [Dynamic memory contract corpus](contracts/dynamic-memory/README.md).
 
 ## Cleanup

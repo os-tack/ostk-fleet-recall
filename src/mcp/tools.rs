@@ -23,6 +23,8 @@ const CLAIM_LIFECYCLE_FIELDS: [&str; 3] = ["claim_id", "expected_revision", "rea
 /// Conflict-lifecycle `remember` properties that the claim actions must not
 /// carry. A property the surface does not declare is never named.
 const CONFLICT_FIELDS: [&str; 3] = ["conflict_id", "expected_member_count", "retract_claim_ids"];
+/// The event-first `remember` property that only `assert` carries.
+const ASSERT_FIELDS: [&str; 1] = ["assertion"];
 /// Adjudication `remember` properties that only `dismiss` and `waive` carry.
 const ADJUDICATION_FIELDS: [&str; 4] = [
     "reason_kind",
@@ -282,16 +284,20 @@ pub fn recall_tool_for_surfaces(remember: RememberSurface, recall: RecallSurface
 }
 
 /// `remember` restricted to the actions the surface serves. The record-only
-/// surface is exactly [`remember_tool`].
+/// surface is exactly [`remember_tool`], and a surface without `assert` is
+/// exactly what it was before `assert` existed.
 #[must_use]
 pub fn remember_tool_for(surface: RememberSurface) -> Value {
     let mut tool = remember_tool();
-    if !surface.claim_lifecycle && !surface.conflict_lifecycle {
+    if !surface.claim_lifecycle && !surface.conflict_lifecycle && !surface.assert {
         return tool;
     }
     tool["description"] = json!(remember_description(surface));
     let schema = &mut tool["inputSchema"];
     let mut actions = vec!["record"];
+    if surface.assert {
+        actions.push("assert");
+    }
     if surface.claim_lifecycle {
         actions.extend(["supersede", "retract"]);
     }
@@ -303,7 +309,12 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
     }
     schema["properties"]["action"]["enum"] = json!(actions);
     if let Some(properties) = schema["properties"].as_object_mut() {
-        insert_lifecycle_properties(properties, surface);
+        if surface.lifecycle_served() {
+            insert_lifecycle_properties(properties, surface);
+        }
+        if surface.assert {
+            properties.insert("assertion".into(), assertion_schema());
+        }
     }
     let properties = schema["properties"]
         .as_object()
@@ -317,6 +328,8 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
 /// One `allOf` branch per served action. Each forbids only properties the
 /// surface declares.
 fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) -> Vec<Value> {
+    // `assertion` is named last in every other action's forbid list; it is
+    // declared, and so forbidden, only where assert is served.
     let mut branches = vec![branch(
         properties,
         "record",
@@ -325,8 +338,12 @@ fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) 
             &CLAIM_LIFECYCLE_FIELDS,
             &CONFLICT_FIELDS,
             &ADJUDICATION_FIELDS,
+            &ASSERT_FIELDS,
         ]),
     )];
+    if surface.assert {
+        branches.push(assert_branch(properties));
+    }
     if surface.claim_lifecycle {
         // The successor carries record's claim fields; the server refuses one
         // whose kind, normalized key, or conflict eligibility differs.
@@ -334,13 +351,18 @@ fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) 
             properties,
             "supersede",
             &["claim_id", "expected_revision", "kind", "text"],
-            &named(&[&CONFLICT_FIELDS, &ADJUDICATION_FIELDS]),
+            &named(&[&CONFLICT_FIELDS, &ADJUDICATION_FIELDS, &ASSERT_FIELDS]),
         ));
         branches.push(branch(
             properties,
             "retract",
             &["claim_id", "expected_revision"],
-            &named(&[&CLAIM_FIELDS, &CONFLICT_FIELDS, &ADJUDICATION_FIELDS]),
+            &named(&[
+                &CLAIM_FIELDS,
+                &CONFLICT_FIELDS,
+                &ADJUDICATION_FIELDS,
+                &ASSERT_FIELDS,
+            ]),
         ));
     }
     if surface.conflict_lifecycle {
@@ -352,17 +374,31 @@ fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) 
                 &CLAIM_FIELDS,
                 &["claim_id", "expected_member_count", "retract_claim_ids"],
                 &ADJUDICATION_FIELDS,
+                &ASSERT_FIELDS,
             ]),
         ));
         branches.push(branch(
             properties,
             "resolve",
             &["conflict_id", "expected_revision", "expected_member_count"],
-            &named(&[&CLAIM_FIELDS, &["claim_id"], &ADJUDICATION_FIELDS]),
+            &named(&[
+                &CLAIM_FIELDS,
+                &["claim_id"],
+                &ADJUDICATION_FIELDS,
+                &ASSERT_FIELDS,
+            ]),
         ));
     }
     if surface.serves_adjudication() {
-        branches.push(adjudication_branch(
+        branches.extend(adjudication_branches(properties));
+    }
+    branches
+}
+
+/// The `dismiss` and `waive` branches.
+fn adjudication_branches(properties: &Map<String, Value>) -> [Value; 2] {
+    [
+        adjudication_branch(
             properties,
             "dismiss",
             &[
@@ -382,9 +418,10 @@ fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) 
                     "expires_in_hours",
                     "review_in_hours",
                 ],
+                &ASSERT_FIELDS,
             ]),
-        ));
-        branches.push(adjudication_branch(
+        ),
+        adjudication_branch(
             properties,
             "waive",
             &[
@@ -396,10 +433,30 @@ fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) 
                 "expires_in_hours",
             ],
             &WAIVER_REASON_KINDS,
-            &named(&[&CLAIM_FIELDS, &["claim_id", "retract_claim_ids", "reason"]]),
-        ));
-    }
-    branches
+            &named(&[
+                &CLAIM_FIELDS,
+                &["claim_id", "retract_claim_ids", "reason"],
+                &ASSERT_FIELDS,
+            ]),
+        ),
+    ]
+}
+
+/// The `assert` branch. The assertion carries its own claim, so none of
+/// record's top-level claim fields, and no lifecycle field, may ride beside
+/// it.
+fn assert_branch(properties: &Map<String, Value>) -> Value {
+    branch(
+        properties,
+        "assert",
+        &ASSERT_FIELDS,
+        &named(&[
+            &CLAIM_FIELDS,
+            &CLAIM_LIFECYCLE_FIELDS,
+            &CONFLICT_FIELDS,
+            &ADJUDICATION_FIELDS,
+        ]),
+    )
 }
 
 /// Property names from several groups, in order.
@@ -420,10 +477,19 @@ const CLOSE_RESTORES_MEMBERS: &str = "Whenever a conflict closes, each disputed 
 
 const WRITE_GUARANTEES: &str = "Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key.";
 
+/// What `assert` does, on every surface that serves it.
+const ASSERT_RULE: &str = "assert admits one claim through this deployment's active registry route, event first: recall(status).remember_assert.route names the predicate, its value kind and modalities, and the locator component keys of the subject and of each applicability dimension. Send those components, never URIs; the server derives every identity, stamps effective_from (never in the future) when omitted, and returns the accepted event with the claim. Agents asserting about the same subject and applicability share a claim_key and are checked for conflict; an intention never conflicts with an attestation. The identical assertion under another idempotency_key is refused as already_asserted. ";
+
 fn remember_description(surface: RememberSurface) -> String {
+    let assert_rule = if surface.assert { ASSERT_RULE } else { "" };
+    if !surface.lifecycle_served() {
+        return format!(
+            "Deliberately record fleet memory, or assert a claim. {assert_rule}{WRITE_GUARANTEES}"
+        );
+    }
     if !surface.conflict_lifecycle {
         return format!(
-            "Deliberately record fleet memory, or supersede or retract claims you authored. {SUCCESSOR_RULE}{WRITE_GUARANTEES}"
+            "Deliberately record fleet memory, or supersede or retract claims you authored. {SUCCESSOR_RULE}{assert_rule}{WRITE_GUARANTEES}"
         );
     }
     let adjudication = surface.serves_adjudication();
@@ -450,8 +516,61 @@ fn remember_description(surface: RememberSurface) -> String {
         ""
     };
     format!(
-        "Deliberately record fleet memory, {actions}. {successor_rule}acknowledge marks a conflict's current episode as seen and changes nothing else. {RESOLVE_RULE}{adjudication_rules}{CLOSE_RESTORES_MEMBERS}{WRITE_GUARANTEES}"
+        "Deliberately record fleet memory, {actions}. {successor_rule}acknowledge marks a conflict's current episode as seen and changes nothing else. {RESOLVE_RULE}{adjudication_rules}{CLOSE_RESTORES_MEMBERS}{assert_rule}{WRITE_GUARANTEES}"
     )
+}
+
+/// The `assert` input: one claim as locator components. It mirrors
+/// `RememberAssertInputV1`, which the server parses with unknown fields
+/// denied; the active route decides which keys and values it admits.
+fn assertion_schema() -> Value {
+    let component = json!({ "type": "string", "minLength": 1 });
+    json!({
+        "type": "object",
+        "description": "assert: the claim. recall(status).remember_assert.route names the predicate, value kind, modalities, subject_keys, and applicability_keys this deployment admits.",
+        "properties": {
+            "predicate": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Optional: the route's predicate id. Compare-only; a different predicate is refused, never routed."
+            },
+            "kind": { "type": "string", "enum": ["decision", "fact", "constraint", "preference", "procedure"] },
+            "text": { "type": "string", "minLength": 1, "maxLength": 100_000 },
+            "modality": { "type": "string", "enum": ["attested", "intended"] },
+            "polarity": { "type": "string", "enum": ["affirms", "negates"], "default": "affirms" },
+            "value": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "type": "string" } },
+                "description": "The tagged value of the route's value kind, e.g. {\"kind\":\"boolean\",\"value\":true}."
+            },
+            "subject": {
+                "type": "object",
+                "additionalProperties": component,
+                "description": "Subject locator components by key (route.subject_keys), e.g. {\"provider_repository_id\":\"908172635\"}."
+            },
+            "applicability": {
+                "type": "object",
+                "additionalProperties": { "type": "object", "additionalProperties": component },
+                "description": "Each applicability dimension's locator components by key (route.applicability_keys), e.g. {\"repository_commit\":{\"commit_oid\":\"<40 hex>\"},\"runtime_environment\":{\"environment_id\":\"production\"}}."
+            },
+            "effective_from": {
+                "type": "string",
+                "format": "date-time",
+                "description": "When the claim starts to hold; defaults to now and may not be in the future."
+            },
+            "effective_until": { "type": "string", "format": "date-time" },
+            "support_evidence_event_ids": {
+                "type": "array",
+                "maxItems": 256,
+                "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "description": "Accepted evidence event ids in this project that support the claim."
+            }
+        },
+        "required": ["kind", "text", "modality", "value", "subject", "applicability"],
+        "additionalProperties": false
+    })
 }
 
 fn insert_lifecycle_properties(properties: &mut Map<String, Value>, surface: RememberSurface) {
@@ -739,6 +858,7 @@ mod tests {
             claim_lifecycle: true,
             conflict_lifecycle: true,
             adjudication: false,
+            assert: false,
         }
     }
 
@@ -1208,5 +1328,194 @@ mod tests {
             schema["properties"]["action"]["enum"],
             recall_tool()["inputSchema"]["properties"]["action"]["enum"]
         );
+    }
+
+    fn asserting(surface: RememberSurface) -> RememberSurface {
+        RememberSurface {
+            assert: true,
+            ..surface
+        }
+    }
+
+    /// The `then.properties` names a branch forbids.
+    fn forbidden_by(branch: &Value) -> std::collections::BTreeSet<&str> {
+        branch["then"]["properties"]
+            .as_object()
+            .map(|properties| {
+                properties
+                    .iter()
+                    .filter(|(_, value)| **value == Value::Bool(false))
+                    .map(|(name, _)| name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn branch_for<'a>(tool: &'a Value, action: &str) -> &'a Value {
+        tool["inputSchema"]["allOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["if"]["properties"]["action"]["const"] == action)
+            .unwrap_or_else(|| panic!("{action} has a branch"))
+    }
+
+    #[test]
+    fn assert_only_surface_serves_record_and_assert() {
+        let surface = asserting(RememberSurface::RECORD_ONLY);
+        let tools = tool_list_for(surface);
+        // The recall tool is untouched: assert serves no conflict lookup.
+        assert_eq!(tools[0], recall_tool());
+        assert_eq!(recall_tool_for(surface), recall_tool());
+
+        let remember = &tools[1];
+        let schema = &remember["inputSchema"];
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!(["record", "assert"])
+        );
+        assert_eq!(schema["required"], json!(["action", "idempotency_key"]));
+        let properties = schema["properties"].as_object().unwrap();
+        for absent in CLAIM_LIFECYCLE_FIELDS
+            .iter()
+            .chain(&CONFLICT_FIELDS)
+            .chain(&ADJUDICATION_FIELDS)
+        {
+            assert!(!properties.contains_key(*absent), "{absent} is not served");
+        }
+        assert_eq!(schema["allOf"].as_array().unwrap().len(), 2);
+        let record = branch_for(remember, "record");
+        assert_eq!(record["then"]["required"], json!(["kind", "text"]));
+        assert_eq!(
+            forbidden_by(record),
+            std::collections::BTreeSet::from(["assertion"])
+        );
+        let assert = branch_for(remember, "assert");
+        assert_eq!(assert["then"]["required"], json!(["assertion"]));
+        assert_eq!(forbidden_by(assert), CLAIM_FIELDS.iter().copied().collect());
+        assert!(
+            remember["description"]
+                .as_str()
+                .unwrap()
+                .contains("recall(status).remember_assert")
+        );
+    }
+
+    #[test]
+    fn assert_beside_the_lifecycle_serves_both() {
+        let surface = asserting(adjudication_surface());
+        let tool = remember_tool_for(surface);
+        let schema = &tool["inputSchema"];
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!([
+                "record",
+                "assert",
+                "supersede",
+                "retract",
+                "acknowledge",
+                "resolve",
+                "dismiss",
+                "waive"
+            ])
+        );
+        // assert forbids a top-level kind and every lifecycle field; every
+        // other action forbids the assertion.
+        let assert = forbidden_by(branch_for(&tool, "assert"));
+        for field in CLAIM_FIELDS
+            .iter()
+            .chain(&CLAIM_LIFECYCLE_FIELDS)
+            .chain(&CONFLICT_FIELDS)
+            .chain(&ADJUDICATION_FIELDS)
+        {
+            assert!(assert.contains(field), "assert forbids {field}");
+        }
+        for action in [
+            "record",
+            "supersede",
+            "retract",
+            "acknowledge",
+            "resolve",
+            "dismiss",
+            "waive",
+        ] {
+            assert!(
+                forbidden_by(branch_for(&tool, action)).contains("assertion"),
+                "{action} forbids the assertion"
+            );
+        }
+        // The lifecycle properties and the recall tool are the lifecycle
+        // surface's.
+        let lifecycle = remember_tool_for(adjudication_surface());
+        for (name, property) in lifecycle["inputSchema"]["properties"].as_object().unwrap() {
+            if name != "action" {
+                assert_eq!(&schema["properties"][name], property, "{name}");
+            }
+        }
+        assert_eq!(
+            recall_tool_for(surface),
+            recall_tool_for(adjudication_surface())
+        );
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.contains("recall(status).remember_assert"));
+        assert!(description.contains("returns to active at a new revision"));
+    }
+
+    #[test]
+    fn surfaces_without_assert_never_mention_it() {
+        for surface in [
+            RememberSurface::RECORD_ONLY,
+            lifecycle_surface(),
+            conflict_surface(),
+            adjudication_surface(),
+        ] {
+            let listed = serde_json::to_string(&tool_list_for(surface)).unwrap();
+            assert!(!listed.contains("\"assert\""), "{surface:?}");
+            assert!(!listed.contains("\"assertion\":"), "{surface:?}");
+            assert!(!listed.contains("remember_assert"), "{surface:?}");
+        }
+    }
+
+    #[test]
+    fn assertion_schema_mirrors_the_server_input() {
+        use crate::remember_runtime::RememberAssertInputV1;
+        let tool = remember_tool_for(asserting(RememberSurface::RECORD_ONLY));
+        let assertion = &tool["inputSchema"]["properties"]["assertion"];
+        assert_eq!(assertion["additionalProperties"], false);
+        let example = json!({
+            "kind": "decision",
+            "text": "remember(assert) is allowed at this commit in production.",
+            "modality": "attested",
+            "value": { "kind": "boolean", "value": true },
+            "subject": { "provider_repository_id": "908172635" },
+            "applicability": {
+                "repository_commit": { "commit_oid": "3d99ec111a583e80533cbbc0c06798bb628e0979" },
+                "runtime_environment": { "environment_id": "production" }
+            },
+            "support_evidence_event_ids": ["ab".repeat(32)]
+        });
+        // Every property the schema declares is one the server parses, and
+        // the schema requires exactly the fields the server cannot default.
+        let parsed: RememberAssertInputV1 = serde_json::from_value(example.clone()).unwrap();
+        let reparsed = serde_json::to_value(&parsed).unwrap();
+        let declared = assertion["properties"].as_object().unwrap();
+        for key in reparsed.as_object().unwrap().keys() {
+            assert!(declared.contains_key(key), "{key} is declared");
+        }
+        assert_eq!(
+            declared.keys().collect::<Vec<_>>(),
+            reparsed.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+        for required in assertion["required"].as_array().unwrap() {
+            let mut missing = example.clone();
+            missing
+                .as_object_mut()
+                .unwrap()
+                .remove(required.as_str().unwrap());
+            assert!(
+                serde_json::from_value::<RememberAssertInputV1>(missing).is_err(),
+                "{required} is required by the server too"
+            );
+        }
     }
 }

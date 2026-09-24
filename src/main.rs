@@ -21,6 +21,7 @@ use ostk_fleet_recall::application::LifecycleServing;
 use ostk_fleet_recall::config::{PublicationConfig, model_bundle_sha256};
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::McpServer;
+use ostk_fleet_recall::remember_runtime::start_event_first_assert;
 use ostk_fleet_recall::service::{
     FleetRecallService, RecallAction, RecallRequest, RecallResult, RememberSurface, ServiceError,
 };
@@ -393,18 +394,31 @@ async fn build_memory_service(
             ledger = ledger.with_conflict_adjudication();
         }
     }
+    // remember(assert) is served only where the writer-authority pins verify
+    // (ADR 0005). Any pin or witness problem turns it off with a logged and
+    // reported reason; it never stops serve (D5).
+    let (ledger, assert_status) = start_event_first_assert(
+        store.pool().clone(),
+        &config.default_scope,
+        RetryPolicy::default(),
+    )
+    .await
+    .bind_ledger(ledger);
+    let assert = assert_status.as_ref().is_some_and(|status| status.served);
     let mut service = CockroachMemoryService::new(
         config.default_scope.clone(),
         store.clone(),
         Arc::new(ledger),
         embedder,
-    )?;
+    )?
+    .with_assert_status(assert_status);
     if config.lifecycle.remember_lifecycle {
         let lifecycle = LifecycleServing {
             surface: RememberSurface {
                 claim_lifecycle: true,
                 conflict_lifecycle: conflict_lifecycle.is_some(),
                 adjudication,
+                assert,
             },
             hide_non_current_claim_chunks: true,
             lifecycle_overlay: conflict_lifecycle.is_some(),
@@ -416,6 +430,15 @@ async fn build_memory_service(
             );
         }
         service = service.with_lifecycle(lifecycle);
+    } else if assert {
+        tracing::info!("serving the record and assert remember surface");
+        service = service.with_lifecycle(LifecycleServing {
+            surface: RememberSurface {
+                assert: true,
+                ..RememberSurface::RECORD_ONLY
+            },
+            ..LifecycleServing::default()
+        });
     } else {
         tracing::info!("serving the record-only remember surface");
     }

@@ -11,9 +11,15 @@
 //! writer-authority runtime and the actor it asserts as. The append itself,
 //! and the claim projection committed with it, live in the claim ledger
 //! (`CockroachClaimLedger::assert_claim`).
+//!
+//! [`serve`] is how `serve` starts it: served when the writer-authority pins
+//! verify, off (with a reason `recall(status)` reports) when they are
+//! configured but unusable, and absent when they are not configured. It never
+//! stops `serve` from starting.
 
 pub mod admission;
 pub mod event_first;
+pub mod serve;
 
 pub use admission::{
     AdmittedRememberAssertionV1, AssertRouteDescriptionV1, AssertRoutePredicateV1,
@@ -22,3 +28,6 @@ pub use admission::{
     claim_polarity_for, modality_name, resolve_assert_route,
 };
 pub use event_first::{EventFirstAssert, actor_for_agent};
+pub use serve::{
+    AssertStartup, AssertStatusV1, start_event_first_assert, start_event_first_assert_with,
+};
