@@ -81,6 +81,13 @@ pub const MAX_PROVIDER_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 /// [`CiScanRequestV1::provider_limit`].
 pub const MAX_GH_RUN_LIST_LIMIT: u64 = 1_000;
 
+/// How many of the newest runs
+/// [`GhCliRunProvider::discover_settled_high_water`] lists.
+///
+/// The high-water mark only has to see past the runs still in flight, and those
+/// are always the newest ones, so a short listing is enough.
+pub const SETTLED_HIGH_WATER_LISTING_LIMIT: u64 = 50;
+
 /// What one scan asks the provider for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiScanRequestV1 {
@@ -235,7 +242,7 @@ impl GhCliRunProvider {
     ///
     /// `newest_run_number` is how far back the listing must reach; it is
     /// operator configuration, read once from the provider by whatever schedules
-    /// the scan.
+    /// the scan — [`Self::discover_settled_high_water`] is that reading.
     pub fn new(repository: impl Into<String>, newest_run_number: u64) -> CiScanResult<Self> {
         let repository = repository.into();
         if !admissible_repository_coordinate(&repository) {
@@ -247,6 +254,49 @@ impl GhCliRunProvider {
             repository,
             newest_run_number,
         })
+    }
+
+    /// Ask the provider how far a scan may reach right now: the settled
+    /// high-water mark of one workflow on one branch.
+    ///
+    /// Lists the newest [`SETTLED_HIGH_WATER_LISTING_LIMIT`] runs with only
+    /// their numbers and statuses and hands the payload to
+    /// [`settled_high_water`]. `None` means no run is settled below the oldest
+    /// one still in flight, so there is nothing a scan could read yet. The
+    /// coordinates pass the same argv checks a scan request does, so a hostile
+    /// value never reaches `gh`.
+    pub fn discover_settled_high_water(
+        repository: &str,
+        workflow: &str,
+        branch: &str,
+    ) -> CiScanResult<Option<u64>> {
+        if !admissible_repository_coordinate(repository)
+            || !admissible_provider_argument(workflow)
+            || !admissible_provider_argument(branch)
+        {
+            return Err(CiScanError::Payload {
+                detail: "high-water discovery names an inadmissible provider coordinate",
+            });
+        }
+        let limit = SETTLED_HIGH_WATER_LISTING_LIMIT.to_string();
+        let listing = Self::run(
+            "run list",
+            &[
+                "run",
+                "list",
+                "--repo",
+                repository,
+                "--workflow",
+                workflow,
+                "--branch",
+                branch,
+                "--limit",
+                &limit,
+                "--json",
+                "number,status",
+            ],
+        )?;
+        settled_high_water(&listing)
     }
 
     fn run(command: &'static str, args: &[&str]) -> CiScanResult<Vec<u8>> {
@@ -474,6 +524,58 @@ struct GhAnnotation {
     annotation_level: String,
     title: String,
     message: String,
+}
+
+/// The two fields [`settled_high_water`] reads from each listed run.
+#[derive(Debug, Deserialize)]
+struct GhRunStatusItem {
+    number: u64,
+    status: String,
+}
+
+/// The highest run number a scan may ask for without meeting a run in flight.
+///
+/// `run_list_json` is a `gh run list --json number,status` payload (any listing
+/// carrying those two fields will do, including [`GH_RUN_LIST_FIELDS`]). The
+/// answer is the highest run number BELOW the lowest run whose status is not
+/// `completed`, or the highest run number when every listed run is completed.
+/// `None` means there is no such run: the listing is empty, or its oldest run is
+/// still in flight.
+///
+/// Stopping below the OLDEST unfinished run, not merely skipping it, is what
+/// keeps a window contiguous: [`scan_runs`] refuses a window that contains an
+/// unsettled run, and a later scan resumes one past the previous window, so a
+/// window that jumped over a run in flight could never come back for it.
+///
+/// A run that completed as `cancelled` counts as completed here; the scan then
+/// refuses it closed ([`super::fact::CiWorkflowRunFactV1::validate`]), so the
+/// caller sees a failure rather than a window that silently stops short. A
+/// status this connector does not model is refused, never guessed at.
+pub fn settled_high_water(run_list_json: &[u8]) -> CiScanResult<Option<u64>> {
+    if run_list_json.len() > MAX_PROVIDER_PAYLOAD_BYTES {
+        return Err(CiScanError::ScanTooLarge(MAX_PROVIDER_PAYLOAD_BYTES));
+    }
+    let items: Vec<GhRunStatusItem> =
+        serde_json::from_slice(run_list_json).map_err(|_| CiScanError::Payload {
+            detail: "run listing is not the expected JSON array of run numbers and statuses",
+        })?;
+    let mut oldest_unfinished: Option<u64> = None;
+    for item in &items {
+        if item.number == 0 {
+            return Err(CiScanError::Payload {
+                detail: "run listing names run number zero",
+            });
+        }
+        if CiRunStatusV1::parse(&item.status)? != CiRunStatusV1::Completed {
+            oldest_unfinished =
+                Some(oldest_unfinished.map_or(item.number, |oldest| oldest.min(item.number)));
+        }
+    }
+    Ok(items
+        .iter()
+        .map(|item| item.number)
+        .filter(|number| oldest_unfinished.is_none_or(|oldest| *number < oldest))
+        .max())
 }
 
 /// One provider instant, converted to the exact contract wire form.

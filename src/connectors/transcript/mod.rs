@@ -80,7 +80,7 @@ pub use collector::{
 };
 pub use drain::{
     TranscriptCoverageBindingV1, TranscriptDrainModeV1, TranscriptDrainRequest,
-    TranscriptDrainSummaryV1, drain_outbox,
+    TranscriptDrainSummaryV1, drain_outbox, drain_source_outbox,
 };
 pub use error::{TranscriptConnectorError, TranscriptConnectorResult};
 pub use outbox::{

@@ -10,7 +10,9 @@
 //! * that a cursor advance and its receipt row are one atomic unit (a fault
 //!   injected after both writes but before commit leaves NEITHER durable);
 //! * that re-observing an already-covered range is idempotent (no duplicate
-//!   receipt, no cursor regression).
+//!   receipt, no cursor regression);
+//! * that a connector instance's latest receipt is the one its most recently
+//!   advanced coverage domain points at.
 //!
 //! The coverage cursor and receipts are keyed by the trusted `(tenant, project)`
 //! pair; a fresh unique project per test isolates them. The semantic scope is
@@ -557,6 +559,122 @@ async fn live_zero_evidence_id_fails_closed() {
         scope
             .repository
             .read_cursor(&scope.connector_instance, &contract_scope(), target)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A scheduled runner asks "what did this instance cover last?" to skip an
+/// unchanged revision. The answer spans every coverage domain the instance
+/// owns and follows whichever one advanced most recently.
+#[tokio::test]
+async fn live_latest_receipt_for_instance_follows_the_most_recent_advance() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = live_pool(&database_url).await;
+    let scope = coverage_scope(&pool, "latest");
+    let target = interval(0, 100);
+    let at_revision = |observed: SequenceIntervalV1, revision: u8| {
+        let mut observation = observation(&scope, observed, target);
+        observation.scope.revision = HexBytes::new(vec![revision; 32]).unwrap();
+        observation
+    };
+    let recorded = |outcome: CoverageObservationOutcome| match outcome {
+        CoverageObservationOutcome::Recorded { receipt_id, .. } => receipt_id,
+        other @ CoverageObservationOutcome::AlreadyCovered { .. } => {
+            panic!("the observation must record a receipt, got {other:?}")
+        }
+    };
+
+    assert!(
+        scope
+            .repository
+            .latest_receipt_for_instance(&scope.connector_instance)
+            .await
+            .unwrap()
+            .is_none(),
+        "an instance that observed nothing has no latest receipt"
+    );
+
+    // Revision 0x22, partially covered.
+    let first = recorded(
+        scope
+            .repository
+            .observe(&at_revision(interval(0, 40), 0x22))
+            .await
+            .unwrap(),
+    );
+    let latest = scope
+        .repository
+        .latest_receipt_for_instance(&scope.connector_instance)
+        .await
+        .unwrap()
+        .expect("one advance leaves a latest receipt");
+    assert_eq!(latest.receipt_id().unwrap(), first);
+
+    // A newer revision opens a second domain, which becomes the latest.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let second = recorded(
+        scope
+            .repository
+            .observe(&at_revision(interval(0, 100), 0x33))
+            .await
+            .unwrap(),
+    );
+    let latest = scope
+        .repository
+        .latest_receipt_for_instance(&scope.connector_instance)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.receipt_id().unwrap(), second);
+    assert_eq!(latest.scope.revision.as_bytes(), &[0x33; 32]);
+    assert_eq!(latest.completeness, CoverageCompletenessV1::Complete);
+
+    // Advancing the older domain again makes ITS newest receipt the latest.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let third = recorded(
+        scope
+            .repository
+            .observe(&at_revision(interval(40, 100), 0x22))
+            .await
+            .unwrap(),
+    );
+    let latest = scope
+        .repository
+        .latest_receipt_for_instance(&scope.connector_instance)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.receipt_id().unwrap(), third);
+    assert_eq!(latest.scope.revision.as_bytes(), &[0x22; 32]);
+
+    // An idempotent re-observation advances nothing, so the latest stays put.
+    scope
+        .repository
+        .observe(&at_revision(interval(0, 100), 0x33))
+        .await
+        .unwrap();
+    assert_eq!(
+        scope
+            .repository
+            .latest_receipt_for_instance(&scope.connector_instance)
+            .await
+            .unwrap()
+            .unwrap()
+            .receipt_id()
+            .unwrap(),
+        third
+    );
+
+    // Another instance in the same project sees none of these receipts.
+    let other = ContractId::new("connector.github.instance-latest-other").unwrap();
+    assert!(
+        scope
+            .repository
+            .latest_receipt_for_instance(&other)
             .await
             .unwrap()
             .is_none()

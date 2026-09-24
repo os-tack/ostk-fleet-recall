@@ -176,10 +176,213 @@ pub trait TranscriptOutboxRepository: Send + Sync {
         limit: u32,
     ) -> TranscriptConnectorResult<Vec<TranscriptOutboxRowV1>>;
 
+    /// Read ONE source's staged rows, in the same order as
+    /// [`Self::staged_rows`].
+    ///
+    /// A scheduled runner drains each source under its own coverage binding, so
+    /// it must never see another source's rows. The default reads every staged
+    /// row and filters, which is correct for any implementation but reads the
+    /// whole outbox; the `CockroachDB` repository overrides it with a
+    /// source-bound statement.
+    async fn staged_rows_for_source(
+        &self,
+        source_id: &str,
+        pending_only: bool,
+        limit: u32,
+    ) -> TranscriptConnectorResult<Vec<TranscriptOutboxRowV1>> {
+        let mut rows = self.staged_rows(pending_only, u32::MAX).await?;
+        rows.retain(|row| row.source_id == source_id);
+        rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(rows)
+    }
+
+    /// The lowest turn ordinal of one source that is still pending, or `None`
+    /// when nothing of that source awaits the drain.
+    ///
+    /// This is where a runner's coverage target for the source starts: every
+    /// ordinal below it was drained by an earlier pass.
+    async fn pending_ordinal_floor(
+        &self,
+        source_id: &str,
+    ) -> TranscriptConnectorResult<Option<u32>> {
+        Ok(self
+            .staged_rows_for_source(source_id, true, u32::MAX)
+            .await?
+            .iter()
+            .map(|row| row.turn_ordinal)
+            .min())
+    }
+
     /// Mark one row drained. Idempotent, and used only on the replay path: the
     /// production path marks the row inside the append transaction.
     async fn mark_drained(&self, outbox_id: Sha256Digest) -> TranscriptConnectorResult<()>;
 
     /// Count outbox rows for one source, at any state.
     async fn count_rows(&self, source_id: &str) -> TranscriptConnectorResult<u64>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An in-memory outbox that implements only the required methods, so the
+    /// trait defaults are what the assertions exercise.
+    struct MemoryOutbox {
+        rows: Vec<TranscriptOutboxRowV1>,
+    }
+
+    #[async_trait]
+    impl TranscriptOutboxRepository for MemoryOutbox {
+        async fn enqueue_batch(
+            &self,
+            batch: &TranscriptBatchV1,
+        ) -> TranscriptConnectorResult<TranscriptEnqueueOutcome> {
+            Ok(TranscriptEnqueueOutcome::AlreadyCovered {
+                batch_seq: batch.cursor.batch_seq,
+            })
+        }
+
+        async fn read_cursor(
+            &self,
+            _source_id: &str,
+        ) -> TranscriptConnectorResult<Option<TranscriptCursorRowV1>> {
+            Ok(None)
+        }
+
+        async fn staged_rows(
+            &self,
+            pending_only: bool,
+            limit: u32,
+        ) -> TranscriptConnectorResult<Vec<TranscriptOutboxRowV1>> {
+            let mut rows: Vec<TranscriptOutboxRowV1> = self
+                .rows
+                .iter()
+                .filter(|row| !pending_only || row.state == TranscriptOutboxStateV1::Pending)
+                .cloned()
+                .collect();
+            rows.sort_by_key(|row| (row.batch_seq, row.turn_ordinal, row.outbox_id));
+            rows.truncate(usize::try_from(limit).unwrap());
+            Ok(rows)
+        }
+
+        async fn mark_drained(&self, _outbox_id: Sha256Digest) -> TranscriptConnectorResult<()> {
+            Ok(())
+        }
+
+        async fn count_rows(&self, source_id: &str) -> TranscriptConnectorResult<u64> {
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| row.source_id == source_id)
+                .count() as u64)
+        }
+    }
+
+    fn row(
+        source_id: &str,
+        turn_ordinal: u32,
+        batch_seq: u64,
+        state: TranscriptOutboxStateV1,
+    ) -> TranscriptOutboxRowV1 {
+        let id = format!("{source_id}:{turn_ordinal}");
+        TranscriptOutboxRowV1 {
+            outbox_id: Sha256Digest::from_bytes(
+                <sha2::Sha256 as sha2::Digest>::digest(id.as_bytes()).into(),
+            ),
+            source_id: source_id.to_owned(),
+            session_id: "session".to_owned(),
+            turn_ordinal,
+            canonical_candidate: Vec::new(),
+            canonical_locators: Vec::new(),
+            canonical_payload: Vec::new(),
+            state,
+            batch_seq,
+        }
+    }
+
+    /// Two sources interleaved across batches, with one drained row each.
+    fn outbox() -> MemoryOutbox {
+        use TranscriptOutboxStateV1::{Drained, Pending};
+        MemoryOutbox {
+            rows: vec![
+                row("a.jsonl", 0, 1, Drained),
+                row("b.jsonl", 0, 1, Drained),
+                row("a.jsonl", 1, 1, Pending),
+                row("b.jsonl", 1, 2, Pending),
+                row("a.jsonl", 2, 2, Pending),
+                row("b.jsonl", 2, 3, Pending),
+            ],
+        }
+    }
+
+    fn ordinals(rows: &[TranscriptOutboxRowV1]) -> Vec<(String, u32)> {
+        rows.iter()
+            .map(|row| (row.source_id.clone(), row.turn_ordinal))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_default_source_read_returns_only_that_source_in_drain_order() {
+        let outbox = outbox();
+        let pending = outbox
+            .staged_rows_for_source("a.jsonl", true, 256)
+            .await
+            .unwrap();
+        assert_eq!(
+            ordinals(&pending),
+            vec![("a.jsonl".to_owned(), 1), ("a.jsonl".to_owned(), 2)]
+        );
+        let every = outbox
+            .staged_rows_for_source("b.jsonl", false, 256)
+            .await
+            .unwrap();
+        assert_eq!(
+            ordinals(&every),
+            vec![
+                ("b.jsonl".to_owned(), 0),
+                ("b.jsonl".to_owned(), 1),
+                ("b.jsonl".to_owned(), 2)
+            ]
+        );
+        assert!(
+            outbox
+                .staged_rows_for_source("c.jsonl", false, 256)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_source_read_applies_its_limit_after_filtering() {
+        // Another source's rows sort first, so a limit applied before the filter
+        // would return nothing of this source.
+        let outbox = outbox();
+        let first = outbox
+            .staged_rows_for_source("b.jsonl", true, 1)
+            .await
+            .unwrap();
+        assert_eq!(ordinals(&first), vec![("b.jsonl".to_owned(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn the_default_pending_floor_is_the_lowest_pending_ordinal_of_the_source() {
+        let outbox = outbox();
+        assert_eq!(
+            outbox.pending_ordinal_floor("a.jsonl").await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            outbox.pending_ordinal_floor("b.jsonl").await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(outbox.pending_ordinal_floor("c.jsonl").await.unwrap(), None);
+        let drained = MemoryOutbox {
+            rows: vec![row("a.jsonl", 0, 1, TranscriptOutboxStateV1::Drained)],
+        };
+        assert_eq!(
+            drained.pending_ordinal_floor("a.jsonl").await.unwrap(),
+            None
+        );
+    }
 }

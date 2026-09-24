@@ -25,7 +25,7 @@
 //!   scope the credential did not authorize, is refused closed with nothing
 //!   appended (AUTH-04/EVID-02, EVID-04).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,7 +38,8 @@ use ostk_fleet_recall::connectors::transcript::{
     TranscriptConnectorError, TranscriptCoverageBindingV1, TranscriptDrainModeV1,
     TranscriptDrainRequest, TranscriptDrainSummaryV1, TranscriptEnqueueOutcome,
     TranscriptFaultInjection, TranscriptIngressClocksV1, TranscriptOutboxRepository,
-    TranscriptOutboxStateV1, collect_batch, drain_outbox, transcript_parser_key_v2,
+    TranscriptOutboxStateV1, collect_batch, drain_outbox, drain_source_outbox,
+    transcript_parser_key_v2,
 };
 use ostk_fleet_recall::control_log::{
     CockroachGenesisRepository, GenesisRepository, TrustedControlScope,
@@ -58,8 +59,8 @@ use ostk_fleet_recall::memory_contracts::common::{
     ProfileReferenceV1, RegistryReferenceV1, frozen_profile_reference_v1,
 };
 use ostk_fleet_recall::memory_contracts::coverage::{
-    CoverageFreshnessV1, CoverageProofBasisV1, CoverageProofMethodV1, CoverageScopeV1,
-    CoverageWindowV1, FreshnessStateV1, ProducerIdentityV1, ProducerKindV1,
+    CoverageFreshnessV1, CoverageProofBasisV1, CoverageProofMethodV1, CoverageReceiptV1,
+    CoverageScopeV1, CoverageWindowV1, FreshnessStateV1, ProducerIdentityV1, ProducerKindV1,
 };
 use ostk_fleet_recall::memory_contracts::digest::{
     DigestDomain, Sha256Digest, domain_separated_digest,
@@ -748,6 +749,15 @@ fn coverage_binding() -> TranscriptCoverageBindingV1 {
     }
 }
 
+/// The coverage binding a runner that drains source by source gives ONE source:
+/// the shared window and target, but the source's own id as the revision, so
+/// each source's receipts land in a coverage domain of their own.
+fn source_coverage_binding(source_id: &str) -> TranscriptCoverageBindingV1 {
+    let mut binding = coverage_binding();
+    binding.scope.revision = HexBytes::new(source_id.as_bytes().to_vec()).unwrap();
+    binding
+}
+
 impl LiveConnector {
     /// The ingress clocks one collection pass is stamped with, read from the
     /// DATABASE clock rather than from the transcript.
@@ -812,6 +822,62 @@ impl LiveConnector {
             limit: 256,
         })
         .await
+    }
+
+    /// Drain only `source_id`'s pending rows, under that source's own binding.
+    async fn drain_source(
+        &self,
+        source_id: &str,
+    ) -> Result<TranscriptDrainSummaryV1, TranscriptConnectorError> {
+        drain_source_outbox(
+            TranscriptDrainRequest {
+                active: &self.active,
+                witness: &self.witness,
+                outbox: &self.outbox,
+                ledger: self.ledger.as_ref(),
+                coverage: &self.coverage,
+                trusted_scope: self.outbox.trusted_scope(),
+                content_key: &content_key(),
+                coverage_binding: &source_coverage_binding(source_id),
+                mode: TranscriptDrainModeV1::Pending,
+                limit: 256,
+            },
+            source_id,
+        )
+        .await
+    }
+
+    async fn pending_floor(&self, source_id: &str) -> Option<u32> {
+        self.outbox.pending_ordinal_floor(source_id).await.unwrap()
+    }
+
+    /// The sources that have coverage receipts in this project, after checking
+    /// that every receipt is stamped with its OWN source's revision (the
+    /// instance names the source, the binding's revision is the source id).
+    async fn sources_with_own_receipts(&self) -> BTreeSet<String> {
+        let rows = sqlx::query_as::<_, (String, Vec<u8>)>(
+            "SELECT connector_instance_id, canonical_receipt FROM memory_coverage_receipts_v1 \
+             WHERE tenant_id = $1 AND project = $2",
+        )
+        .bind(self.physical_scope.tenant_id)
+        .bind(&self.physical_scope.project)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        let mut sources = BTreeSet::new();
+        for (instance, canonical) in rows {
+            let receipt: CoverageReceiptV1 = decode_strict(&canonical).unwrap();
+            let source_id = instance
+                .strip_prefix("connector.transcript.")
+                .expect("every receipt here is a transcript instance's");
+            assert_eq!(
+                receipt.scope.revision.as_bytes(),
+                source_id.as_bytes(),
+                "a receipt of {source_id} carries another source's revision"
+            );
+            sources.insert(source_id.to_owned());
+        }
+        sources
     }
 
     async fn scoped_count(&self, table: &str) -> i64 {
@@ -1403,5 +1469,98 @@ async fn live_a_candidate_selecting_a_foreign_scope_is_refused_closed() {
     assert_eq!(
         connector.outbox.staged_rows(true, 256).await.unwrap().len(),
         1
+    );
+}
+
+/// A runner drains each transcript source under its own coverage binding.
+/// Draining one source must neither read nor change another's staged rows, and
+/// every receipt it emits must carry its own source's revision — never the
+/// revision of whichever source happened to be drained alongside it.
+#[tokio::test]
+async fn live_draining_one_source_leaves_the_others_pending_under_their_own_coverage() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = live_pool(&database_url).await;
+    let connector = live_connector(&pool, &fixture(), "per-source-drain").await;
+    let (_directory, sources) = transcript_directory(&[
+        (
+            "session-a.jsonl",
+            clean_transcript("01931f2c-0000-7000-8000-00000000001a"),
+        ),
+        (
+            "session-b.jsonl",
+            clean_transcript("01931f2c-0000-7000-8000-00000000001b"),
+        ),
+    ]);
+    for path in &sources {
+        stage_one_clean_source(&connector, path).await;
+    }
+    let source_ids: Vec<String> = sources
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    let (first, second) = (&source_ids[0], &source_ids[1]);
+
+    // Both sources start fully pending from their first turn.
+    for source_id in &source_ids {
+        assert_eq!(connector.pending_floor(source_id).await, Some(0));
+    }
+
+    let summary = connector.drain_source(first).await.unwrap();
+    assert!(
+        summary.appended > 0,
+        "the drained source's turns are appended"
+    );
+
+    // The drained source has nothing left; the other is untouched.
+    assert_eq!(connector.pending_floor(first).await, None);
+    assert_eq!(connector.pending_floor(second).await, Some(0));
+    let untouched = connector
+        .outbox
+        .staged_rows_for_source(second, false, 256)
+        .await
+        .unwrap();
+    assert!(!untouched.is_empty());
+    assert!(
+        untouched
+            .iter()
+            .all(|row| row.source_id == *second && row.state == TranscriptOutboxStateV1::Pending)
+    );
+    assert_eq!(
+        connector.sources_with_own_receipts().await,
+        BTreeSet::from([first.clone()]),
+        "only the drained source has receipts"
+    );
+
+    // Draining the second source stamps ITS revision, and re-draining the
+    // first finds nothing to do.
+    connector.drain_source(second).await.unwrap();
+    assert_eq!(
+        connector.drain_source(first).await.unwrap().rows_read,
+        0,
+        "a drained source has no pending rows to re-read"
+    );
+    assert_eq!(
+        connector.sources_with_own_receipts().await,
+        source_ids.iter().cloned().collect::<BTreeSet<_>>()
+    );
+    for source_id in &source_ids {
+        let latest = connector
+            .coverage
+            .latest_receipt_for_instance(&binding(source_id).connector_instance_id)
+            .await
+            .unwrap()
+            .expect("a drained source has a latest receipt");
+        assert_eq!(latest.scope.revision.as_bytes(), source_id.as_bytes());
+    }
+    assert!(
+        connector
+            .outbox
+            .staged_rows(true, 256)
+            .await
+            .unwrap()
+            .is_empty(),
+        "both sources are drained"
     );
 }

@@ -175,6 +175,13 @@ pub struct TranscriptDrainRequest<'request> {
 }
 
 /// Drain staged transcript candidates into accepted evidence events.
+///
+/// Every staged row, whatever its source, is drained under the ONE
+/// [`TranscriptCoverageBindingV1`] the request carries. That is right when the
+/// outbox holds one source, or when every source shares one coverage domain; a
+/// runner that binds each source to its own domain (its own revision and
+/// target) drains with [`drain_source_outbox`] instead, so no receipt is stamped
+/// with another source's binding.
 pub async fn drain_outbox(
     request: TranscriptDrainRequest<'_>,
 ) -> TranscriptConnectorResult<TranscriptDrainSummaryV1> {
@@ -185,12 +192,44 @@ pub async fn drain_outbox(
             request.limit,
         )
         .await?;
+    drain_rows(&request, &rows).await
+}
+
+/// Drain ONE source's staged candidates into accepted evidence events.
+///
+/// Identical to [`drain_outbox`] — same admission, same atomic append, same
+/// replay handling, same per-turn coverage receipt — except that it reads only
+/// `source_id`'s rows. The request's coverage binding is therefore the binding
+/// of that one source, and every receipt this pass emits names that source's
+/// revision and target, never another's. Other sources' rows are neither read
+/// nor changed.
+pub async fn drain_source_outbox(
+    request: TranscriptDrainRequest<'_>,
+    source_id: &str,
+) -> TranscriptConnectorResult<TranscriptDrainSummaryV1> {
+    let rows = request
+        .outbox
+        .staged_rows_for_source(
+            source_id,
+            request.mode == TranscriptDrainModeV1::Pending,
+            request.limit,
+        )
+        .await?;
+    drain_rows(&request, &rows).await
+}
+
+/// The drain loop both entry points share: admit, append, and emit coverage for
+/// each row in order.
+async fn drain_rows(
+    request: &TranscriptDrainRequest<'_>,
+    rows: &[TranscriptOutboxRowV1],
+) -> TranscriptConnectorResult<TranscriptDrainSummaryV1> {
     let mut summary = TranscriptDrainSummaryV1 {
         rows_read: u64::try_from(rows.len()).unwrap_or(u64::MAX),
         ..TranscriptDrainSummaryV1::default()
     };
-    for row in &rows {
-        let (outcome, accepted_event_id) = drain_one(&request, row).await?;
+    for row in rows {
+        let (outcome, accepted_event_id) = drain_one(request, row).await?;
         match outcome {
             AppendOutcome::Appended { .. } => summary.appended += 1,
             AppendOutcome::Replayed { .. } => {
@@ -216,7 +255,7 @@ pub async fn drain_outbox(
                 });
             }
         }
-        match emit_coverage(&request, row, accepted_event_id).await? {
+        match emit_coverage(request, row, accepted_event_id).await? {
             CoverageObservationOutcome::Recorded { .. } => summary.receipts += 1,
             CoverageObservationOutcome::AlreadyCovered { .. } => {
                 summary.coverage_already_covered += 1;

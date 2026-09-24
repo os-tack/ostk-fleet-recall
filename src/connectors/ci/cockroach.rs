@@ -24,7 +24,7 @@ use crate::memory_contracts::evidence::AcceptedEventId;
 use super::error::{CiDrainError, CiDrainResult};
 use super::fact::{CI_FACT_SCHEMA_VERSION, CiCoverageWindowV1, CiRepositoryIdV1, CiTextV1};
 
-const INSERT_WINDOW_SQL: &str = "INSERT INTO memory_ci_measured_windows_v1 (\
+const INSERT_WINDOW_SQL: &str = "INSERT INTO public.memory_ci_measured_windows_v1 (\
      tenant_id, project, connector_instance, repository_id, installation_id, workflow, branch, \
      window_id, first_run_number, last_run_number, fetched_at, admitted_run_count, \
      failed_run_count, source_digest, evidence_id, recorded_at) \
@@ -36,12 +36,12 @@ const SELECT_WINDOWS_SQL: &str = "SELECT repository_id, installation_id, workflo
      window_id, \
      first_run_number, last_run_number, fetched_at, admitted_run_count, failed_run_count, \
      source_digest, evidence_id \
-     FROM memory_ci_measured_windows_v1 \
+     FROM public.memory_ci_measured_windows_v1 \
      WHERE tenant_id = $1 AND project = $2 AND connector_instance = $3 \
      ORDER BY repository_id, workflow, branch, first_run_number, last_run_number, window_id";
 
 const SELECT_HIGH_WATERMARK_SQL: &str = "SELECT coalesce(max(last_run_number), 0)::INT8 \
-     FROM memory_ci_measured_windows_v1 \
+     FROM public.memory_ci_measured_windows_v1 \
      WHERE tenant_id = $1 AND project = $2 AND connector_instance = $3 \
      AND repository_id = $4 AND workflow = $5 AND branch = $6";
 

@@ -481,3 +481,120 @@ fn a_head_run_older_than_the_window_is_refused() {
     );
     assert!(request.provider_limit(RECORDED_LAST_RUN).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// How far a scheduled scan may reach: the settled high-water mark.
+// ---------------------------------------------------------------------------
+
+/// Rewrite the status of several runs inside the REAL recorded listing.
+fn listing_with_statuses(statuses: &[(u64, &str)]) -> Vec<u8> {
+    let mut items: Vec<serde_json::Value> = serde_json::from_slice(RECORDED_RUN_LIST).unwrap();
+    for (run_number, status) in statuses {
+        let target = items
+            .iter_mut()
+            .find(|item| item["number"].as_u64() == Some(*run_number))
+            .expect("the recorded corpus must contain the run under test");
+        target["status"] = serde_json::Value::String((*status).to_owned());
+        target["conclusion"] = serde_json::Value::String(String::new());
+    }
+    serde_json::to_vec(&items).unwrap()
+}
+
+#[test]
+fn a_fully_settled_listing_reaches_its_newest_run() {
+    assert_eq!(
+        settled_high_water(RECORDED_RUN_LIST).unwrap(),
+        Some(RECORDED_LAST_RUN)
+    );
+    // The high-water mark is exactly as far as a scan of the corpus reads.
+    let mut request = recorded_request(repository());
+    request.last_run_number = settled_high_water(RECORDED_RUN_LIST).unwrap().unwrap();
+    assert!(scan_runs(&recorded_provider(), &request, &fetched_at()).is_ok());
+}
+
+#[test]
+fn the_high_water_mark_stops_below_the_oldest_run_in_flight() {
+    // Run 6 is still running and run 8 is queued. Run 7 has finished, but a
+    // window reaching it would have to contain run 6, so the mark stops at 5.
+    let listing = listing_with_statuses(&[(6, "in_progress"), (8, "queued")]);
+    assert_eq!(settled_high_water(&listing).unwrap(), Some(5));
+
+    // And the window that mark allows is one scan_runs accepts, while one
+    // reaching past it is refused closed.
+    let provider = recorded_provider().with_runs(&listing);
+    let mut request = recorded_request(repository());
+    request.last_run_number = 5;
+    assert!(scan_runs(&provider, &request, &fetched_at()).is_ok());
+    request.last_run_number = 7;
+    assert!(scan_runs(&provider, &request, &fetched_at()).is_err());
+}
+
+#[test]
+fn nothing_is_settled_when_the_oldest_listed_run_is_in_flight() {
+    let listing = listing_with_statuses(&[(1, "waiting")]);
+    assert_eq!(settled_high_water(&listing).unwrap(), None);
+    assert_eq!(settled_high_water(b"[]").unwrap(), None);
+}
+
+#[test]
+fn the_high_water_mark_reads_the_two_field_listing_in_any_order() {
+    // The shape `gh run list --json number,status` returns, newest first.
+    let listing = br#"[{"number":12,"status":"pending"},{"number":11,"status":"completed"},{"number":10,"status":"requested"},{"number":9,"status":"completed"}]"#;
+    assert_eq!(settled_high_water(listing).unwrap(), Some(9));
+    let oldest_first = br#"[{"number":9,"status":"completed"},{"number":10,"status":"completed"}]"#;
+    assert_eq!(settled_high_water(oldest_first).unwrap(), Some(10));
+}
+
+#[test]
+fn a_cancelled_run_is_not_skipped_by_the_high_water_mark() {
+    // Cancelled is a completed status. The mark reaches past it, so the scan
+    // meets it and refuses it closed instead of a window silently stopping
+    // short of everything newer.
+    let listing = edited_listing(6, "conclusion", "cancelled");
+    assert_eq!(
+        settled_high_water(&listing).unwrap(),
+        Some(RECORDED_LAST_RUN)
+    );
+}
+
+#[test]
+fn an_unreadable_high_water_listing_fails_closed() {
+    assert!(matches!(
+        settled_high_water(b"{\"number\":1}"),
+        Err(CiScanError::Payload { .. })
+    ));
+    assert!(matches!(
+        settled_high_water(br#"[{"number":1}]"#),
+        Err(CiScanError::Payload { .. })
+    ));
+    assert!(matches!(
+        settled_high_water(br#"[{"number":0,"status":"completed"}]"#),
+        Err(CiScanError::Payload { .. })
+    ));
+    assert!(matches!(
+        settled_high_water(br#"[{"number":3,"status":"paused"}]"#),
+        Err(CiScanError::Fact(
+            crate::connectors::ci::CiFactError::Status(_)
+        ))
+    ));
+}
+
+#[test]
+fn a_hostile_coordinate_never_reaches_the_high_water_listing() {
+    // Refused before anything is spawned: a spawn attempt would surface as
+    // `Spawn` or `Command`, never as `Payload`.
+    for (repository, workflow, branch) in [
+        ("--repo=evil", "ci.yml", "main"),
+        ("os-tack/ostk-fleet-recall", "--json", "main"),
+        ("os-tack/ostk-fleet-recall", "ci.yml", "../../etc/passwd"),
+        ("os-tack/ostk-fleet-recall", "ci.yml", ""),
+    ] {
+        assert!(
+            matches!(
+                GhCliRunProvider::discover_settled_high_water(repository, workflow, branch),
+                Err(CiScanError::Payload { .. })
+            ),
+            "{repository:?} {workflow:?} {branch:?} must be refused before argv is built"
+        );
+    }
+}

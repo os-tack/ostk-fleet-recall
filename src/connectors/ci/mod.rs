@@ -114,5 +114,6 @@ pub use fact::{
 pub use ingress::{CI_FACT_MEDIA_TYPE, CiConnectorBindingV1, CiIngressClocksV1, CiIngressV1};
 pub use scan::{
     CiRunProvider, CiScanRequestV1, CiScanV1, GH_RUN_LIST_FIELDS, GhCliRunProvider,
-    MAX_GH_RUN_LIST_LIMIT, RecordedRunProvider, scan_runs,
+    MAX_GH_RUN_LIST_LIMIT, RecordedRunProvider, SETTLED_HIGH_WATER_LISTING_LIMIT, scan_runs,
+    settled_high_water,
 };

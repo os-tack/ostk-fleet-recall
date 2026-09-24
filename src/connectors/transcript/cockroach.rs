@@ -66,6 +66,22 @@ const SELECT_ALL_SQL: &str = "SELECT outbox_id, source_id, session_id, turn_ordi
      WHERE tenant_id = $1 AND project = $2 \
      ORDER BY batch_seq, turn_ordinal, outbox_id LIMIT $3";
 
+const SELECT_SOURCE_PENDING_SQL: &str = "SELECT outbox_id, source_id, session_id, turn_ordinal, \
+     batch_seq, canonical_candidate, canonical_locators, canonical_payload, state \
+     FROM public.memory_transcript_outbox_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND source_id = $3 AND state = 'pending' \
+     ORDER BY batch_seq, turn_ordinal, outbox_id LIMIT $4";
+
+const SELECT_SOURCE_ALL_SQL: &str = "SELECT outbox_id, source_id, session_id, turn_ordinal, \
+     batch_seq, canonical_candidate, canonical_locators, canonical_payload, state \
+     FROM public.memory_transcript_outbox_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND source_id = $3 \
+     ORDER BY batch_seq, turn_ordinal, outbox_id LIMIT $4";
+
+const PENDING_ORDINAL_FLOOR_SQL: &str = "SELECT min(turn_ordinal)::INT8 \
+     FROM public.memory_transcript_outbox_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND source_id = $3 AND state = 'pending'";
+
 /// Also used inside the append transaction by the drain projection, so a row is
 /// marked drained in the very transaction that made its accepted event durable.
 pub(super) const MARK_DRAINED_SQL: &str = "UPDATE public.memory_transcript_outbox_v1 \
@@ -211,6 +227,48 @@ impl TranscriptOutboxRepository for CockroachTranscriptOutboxRepository {
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(decode_outbox_row).collect()
+    }
+
+    async fn staged_rows_for_source(
+        &self,
+        source_id: &str,
+        pending_only: bool,
+        limit: u32,
+    ) -> TranscriptConnectorResult<Vec<TranscriptOutboxRowV1>> {
+        let sql = if pending_only {
+            SELECT_SOURCE_PENDING_SQL
+        } else {
+            SELECT_SOURCE_ALL_SQL
+        };
+        let rows: Vec<PgRow> = sqlx::query(sql)
+            .bind(self.trusted_scope.tenant_id())
+            .bind(self.trusted_scope.project())
+            .bind(source_id)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(decode_outbox_row).collect()
+    }
+
+    async fn pending_ordinal_floor(
+        &self,
+        source_id: &str,
+    ) -> TranscriptConnectorResult<Option<u32>> {
+        let floor: Option<i64> = sqlx::query_scalar(PENDING_ORDINAL_FLOOR_SQL)
+            .bind(self.trusted_scope.tenant_id())
+            .bind(self.trusted_scope.project())
+            .bind(source_id)
+            .fetch_one(&self.pool)
+            .await?;
+        floor
+            .map(|ordinal| {
+                u32::try_from(ordinal).map_err(|_| {
+                    TranscriptConnectorError::LedgerIntegrity(
+                        "stored turn ordinal is out of range".into(),
+                    )
+                })
+            })
+            .transpose()
     }
 
     async fn mark_drained(&self, outbox_id: Sha256Digest) -> TranscriptConnectorResult<()> {

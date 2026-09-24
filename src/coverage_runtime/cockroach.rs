@@ -24,9 +24,11 @@ use sqlx::{Postgres, Row as _, Transaction};
 use crate::Result;
 use crate::control_log::TrustedControlScope;
 use crate::error::FleetError;
+use crate::memory_contracts::canonical::decode_strict;
 use crate::memory_contracts::common::ContractId;
 use crate::memory_contracts::coverage::{
-    CoverageCompletenessV1, CoverageReceiptId, CoverageScopeV1, SequenceContinuityV1,
+    CoverageCompletenessV1, CoverageReceiptId, CoverageReceiptV1, CoverageScopeV1,
+    SequenceContinuityV1,
 };
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::evidence::AcceptedEventId;
@@ -75,6 +77,22 @@ const SELECT_RECEIPT_SQL: &str = "SELECT completeness, evidence_id, source_count
 
 const COUNT_RECEIPTS_SQL: &str = "SELECT count(*) FROM public.memory_coverage_receipts_v1 \
      WHERE tenant_id = $1 AND project = $2 AND connector_instance_id = $3";
+
+/// The receipt a connector instance's most recently advanced cursor points at.
+///
+/// A connector instance can own many coverage domains (one per revision it has
+/// observed, for instance), each with its own cursor. The newest cursor by
+/// `updated_at` is the domain the instance last advanced, and its
+/// `last_receipt_id` names that domain's newest receipt. `coverage_key_digest`
+/// breaks an exact timestamp tie deterministically.
+const LATEST_RECEIPT_FOR_INSTANCE_SQL: &str = "SELECT r.canonical_receipt \
+     FROM public.memory_coverage_cursors_v1 AS c \
+     JOIN public.memory_coverage_receipts_v1 AS r \
+       ON r.tenant_id = c.tenant_id AND r.project = c.project \
+      AND r.receipt_id = c.last_receipt_id \
+     WHERE c.tenant_id = $1 AND c.project = $2 AND c.connector_instance_id = $3 \
+     ORDER BY c.updated_at DESC, c.coverage_key_digest \
+     LIMIT 1";
 
 /// Where, if anywhere, [`CockroachCoverageRuntimeRepository::observe_with_fault_injection`]
 /// forces the transaction to fail — used only by the connected atomicity proof.
@@ -162,6 +180,29 @@ impl CockroachCoverageRuntimeRepository {
             })
         })
         .await
+    }
+
+    /// The newest coverage receipt one connector instance has minted, across
+    /// every coverage domain it owns, or `None` when it has minted none.
+    ///
+    /// "Newest" is the receipt the most recently advanced cursor of this
+    /// instance points at. A scheduled runner reads it to learn which revision
+    /// it last covered — an unchanged revision needs no new scan. The stored
+    /// canonical bytes are decoded strictly, so a row that is not an exact
+    /// canonical receipt fails closed rather than steering the runner.
+    pub async fn latest_receipt_for_instance(
+        &self,
+        connector_instance: &ContractId,
+    ) -> Result<Option<CoverageReceiptV1>> {
+        let canonical: Option<Vec<u8>> = sqlx::query_scalar(LATEST_RECEIPT_FOR_INSTANCE_SQL)
+            .bind(self.trusted_scope.tenant_id())
+            .bind(self.trusted_scope.project())
+            .bind(connector_instance.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        canonical
+            .map(|bytes| decode_strict::<CoverageReceiptV1>(&bytes).map_err(FleetError::from))
+            .transpose()
     }
 }
 
@@ -353,7 +394,15 @@ fn frame(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn decode_cursor_row(row: &PgRow) -> Result<CoverageCursorRowV1> {
+/// Decode one `memory_coverage_cursors_v1` row. It reads `observed_ranges`,
+/// `target_start`, `target_end`, `observation_seq`, `last_completeness`,
+/// `last_receipt_id` and `updated_at`, so a statement that selects those columns
+/// can reuse it.
+///
+/// `pub` inside this private module, so the coverage runtime can re-export it
+/// crate-wide (`pub(crate) use`) for the first reader outside it that selects
+/// cursor rows directly; until then it stays module-internal.
+pub fn decode_cursor_row(row: &PgRow) -> Result<CoverageCursorRowV1> {
     let observed_bytes: Vec<u8> = row.try_get("observed_ranges")?;
     let observed: ObservedRangeV1 =
         serde_json::from_slice(&observed_bytes).map_err(|error| json_error(&error))?;
