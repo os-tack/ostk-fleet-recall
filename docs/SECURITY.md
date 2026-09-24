@@ -240,6 +240,31 @@ appends a distinct v2 lineage, idempotency receipt, audit event, and any
 claim-state transitions atomically. A compatible graph produces a durable
 dismissed v2 lineage; it never deletes the legacy evidence.
 
+## Claim and conflict lifecycle authority
+
+`remember(retract)` is the only serving lifecycle mutation
+([ADR 0004](adr/0004-serving-conflict-lifecycle.md)). Its authority rests on the
+deployment-asserted `FLEET_RECALL_AGENT`: the stored claim must name that agent
+as its actor, have `operator_asserted` origin, be `active` or `disputed`, and
+sit at the revision the caller read. A caller-supplied `actor` is still only an
+assertion that must match. A claim with no recorded actor can be retired by no
+one. No request can name a conflict outcome: the server closes a v2 conflict
+only after its own Rust and SQL pair computations agree that no incompatible
+lifecycle-current pair remains, and it writes the resolution reason from a
+fixed template, so agent text never reaches `memory_conflicts`. The optional
+audit note stays in the private-plane claim event and receipt. Keys with only
+an unreconciled legacy lineage are refused rather than changed.
+
+The feature adds no migration and no grant: the runtime role's existing
+`SELECT`/`UPDATE` on `memory_claims` and `memory_conflicts`, `SELECT` on
+`memory_conflict_members`, `INSERT` on the two event tables, and its receipt
+privileges cover it. Every agent in one deployment shares one `fleet_writer`
+credential, so this is authority over agents that run the reviewed binary with
+their own `FLEET_RECALL_AGENT`, not cryptographic workload identity. A holder
+of that credential can issue the same SQL directly (see below).
+`FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` withdraws the action and restores
+the record-only tool surface.
+
 ## Residual SQL authority and recovery
 
 CockroachDB grants table operations, not prepared-statement identities. A

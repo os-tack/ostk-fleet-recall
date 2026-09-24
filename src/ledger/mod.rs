@@ -2,6 +2,7 @@
 
 mod cockroach;
 mod conflict;
+mod lifecycle;
 mod reconciliation;
 mod repository;
 mod types;
@@ -12,11 +13,13 @@ pub use conflict::{
     claims_are_incompatible, functional_values_are_incompatible, intervals_overlap,
     normalize_key_part,
 };
+pub(crate) use lifecycle::validate_reason as validate_lifecycle_reason;
+pub use lifecycle::{LifecycleRefusal, RefusalCode};
 pub use reconciliation::{
     CockroachConflictReconciliationRepository, ConflictDetectorReconciliation,
 };
 pub use repository::{ClaimLedger, SupportedClaimCoordinate, SupportedClaimIds};
 pub use types::{
     Claim, ClaimInput, ClaimKind, ClaimMutation, ClaimState, ClaimSupport, ClaimSupportInput,
-    Conflict, ConflictCoverage, SemanticClaimHit,
+    ClaimTarget, Conflict, ConflictCoverage, ConflictReevaluation, SemanticClaimHit,
 };

@@ -681,6 +681,24 @@ impl WriterAuthorityConfig {
     }
 }
 
+/// Deployment switches for the serving claim/conflict lifecycle (ADR 0004).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleConfig {
+    /// Serve owner retirement of authored claims (`remember(retract)`) and
+    /// hide retired claims' synthetic chunks from private search.
+    /// `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` restores the record-only
+    /// surface and its byte-identical `tools/list`.
+    pub remember_lifecycle: bool,
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            remember_lifecycle: true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct FleetConfig {
     pub database_url: String,
@@ -693,6 +711,7 @@ pub struct FleetConfig {
     /// model name through a remote registry.
     pub embedding_model_path: PathBuf,
     pub embedding_model_sha256: String,
+    pub lifecycle: LifecycleConfig,
 }
 
 impl std::fmt::Debug for FleetConfig {
@@ -706,6 +725,7 @@ impl std::fmt::Debug for FleetConfig {
             .field("embedding_model", &self.embedding_model)
             .field("embedding_model_path", &self.embedding_model_path)
             .field("embedding_model_sha256", &self.embedding_model_sha256)
+            .field("lifecycle", &self.lifecycle)
             .finish()
     }
 }
@@ -906,6 +926,17 @@ fn fleet_config_from_lookup(
         "FLEET_RECALL_EMBEDDING_MODEL_PATH",
     )?);
     let embedding_model_sha256 = required_from(&mut lookup, "FLEET_RECALL_EMBEDDING_MODEL_SHA256")?;
+    let lifecycle = LifecycleConfig {
+        remember_lifecycle: match lookup("FLEET_RECALL_REMEMBER_LIFECYCLE").as_deref() {
+            None | Some("enabled") => true,
+            Some("disabled") => false,
+            Some(_) => {
+                return Err(FleetError::Configuration(
+                    "FLEET_RECALL_REMEMBER_LIFECYCLE must be enabled or disabled".into(),
+                ));
+            }
+        },
+    };
 
     if max_connections == 0 {
         return Err(FleetError::Configuration(
@@ -942,6 +973,7 @@ fn fleet_config_from_lookup(
         embedding_model: embedding_model.to_owned(),
         embedding_model_path,
         embedding_model_sha256: embedding_model_sha256.to_ascii_lowercase(),
+        lifecycle,
     })
 }
 

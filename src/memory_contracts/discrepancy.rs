@@ -131,7 +131,7 @@ fn dimension_present(applicability: &[ApplicabilityDimensionV1], id: &ContractId
 /// `false` -- a rationale of only invisible characters would otherwise pass
 /// a "dismiss/waive without justification is rejected" check in form while
 /// evading it in substance.
-fn is_blank_rationale(text: &str) -> bool {
+pub(crate) fn is_blank_rationale(text: &str) -> bool {
     text.chars()
         .filter(|character| !matches!(character, '\u{200B}'..='\u{200D}' | '\u{FEFF}' | '\u{2060}'))
         .collect::<String>()

@@ -73,6 +73,7 @@ fn configured_digest_and_registry_identity_are_verified() {
         embedding_model: "logical/model".into(),
         embedding_model_path: bundle.path().into(),
         embedding_model_sha256: digest.clone(),
+        lifecycle: LifecycleConfig::default(),
     };
 
     assert!(config.verify_embedding_model_bundle().is_ok());
@@ -115,6 +116,7 @@ fn debug_never_exposes_database_credentials() {
         embedding_model: "logical/model".into(),
         embedding_model_path: bundle.path().into(),
         embedding_model_sha256: "0".repeat(64),
+        lifecycle: LifecycleConfig::default(),
     };
     let debug = format!("{config:?}");
     assert!(!debug.contains("super-secret"));
@@ -226,6 +228,33 @@ fn writer_config_never_falls_back_to_publication_url() {
         config.database_ssl_policy,
         PrivatePostgresSslPolicy::VerifyFull
     );
+}
+
+#[test]
+fn remember_lifecycle_flag_defaults_enabled_and_rejects_unknown() {
+    let mut values = serving_values();
+    values.insert(
+        "FLEET_RECALL_DATABASE_URL",
+        "postgresql://fleet_writer:writer-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+            .into(),
+    );
+    let config = FleetConfig::from_lookup(|name| values.get(name).cloned()).expect("default");
+    assert!(config.lifecycle.remember_lifecycle);
+    assert_eq!(config.lifecycle, LifecycleConfig::default());
+
+    for (value, expected) in [("enabled", true), ("disabled", false)] {
+        values.insert("FLEET_RECALL_REMEMBER_LIFECYCLE", value.into());
+        let config = FleetConfig::from_lookup(|name| values.get(name).cloned()).expect(value);
+        assert_eq!(config.lifecycle.remember_lifecycle, expected);
+    }
+
+    for rejected in ["", "true", "Disabled", " disabled", "off"] {
+        values.insert("FLEET_RECALL_REMEMBER_LIFECYCLE", rejected.into());
+        let error = FleetConfig::from_lookup(|name| values.get(name).cloned())
+            .expect_err("unknown lifecycle switch must fail closed")
+            .to_string();
+        assert!(error.contains("FLEET_RECALL_REMEMBER_LIFECYCLE"), "{error}");
+    }
 }
 
 #[test]

@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use crate::FleetScope;
 use crate::service::{
-    ConflictCoverage, FleetMemoryService, RecallRequest, RecallResult, RememberRequest,
-    RememberResult, ServiceResult,
+    ConflictCoverage, FleetMemoryService, RecallRequest, RecallResult, Refusal, RememberRequest,
+    RememberResult, RememberSurface, ServiceResult,
 };
 
 use super::protocol::codes;
@@ -38,12 +38,14 @@ struct FakeService {
     calls: Mutex<Vec<ObservedCall>>,
     delay: Duration,
     remember_failure: Option<RememberFailure>,
+    surface: RememberSurface,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum RememberFailure {
     Unavailable,
     Internal,
+    Refused,
 }
 
 impl FakeService {
@@ -103,6 +105,11 @@ impl FleetMemoryService for FakeService {
                 RememberFailure::Internal => {
                     crate::service::ServiceError::Internal("sensitive internal detail".into())
                 }
+                RememberFailure::Refused => crate::service::ServiceError::Refused(Refusal {
+                    code: "not_owner",
+                    message: "claim 41 was not authored by this agent".into(),
+                    details: json!({ "claim_id": 41 }),
+                }),
             });
         }
         let mut result = RememberResult::new(json!({
@@ -114,6 +121,10 @@ impl FleetMemoryService for FakeService {
         }));
         result.conflict_coverage = ConflictCoverage::new("complete");
         Ok(result)
+    }
+
+    fn remember_surface(&self) -> RememberSurface {
+        self.surface
     }
 }
 
@@ -705,4 +716,76 @@ async fn explicit_null_id_is_answered_while_absent_id_is_not() {
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0]["id"], Value::Null);
     assert_eq!(responses[0]["result"], json!({}));
+}
+
+#[tokio::test]
+async fn lifecycle_surface_advertises_retract_and_record_only_does_not() {
+    let list = json!({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"});
+    let record_only = Arc::new(FakeService::default());
+    let response = server(&record_only)
+        .handle_value(list.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        response.result.unwrap()["tools"],
+        Value::Array(super::tool_list())
+    );
+
+    let lifecycle = Arc::new(FakeService {
+        surface: RememberSurface {
+            claim_lifecycle: true,
+        },
+        ..FakeService::default()
+    });
+    let response = server(&lifecycle).handle_value(list).await.unwrap();
+    let tools = response.result.unwrap()["tools"].clone();
+    assert_eq!(
+        tools[1]["inputSchema"]["properties"]["action"]["enum"],
+        json!(["record", "retract"])
+    );
+    assert!(
+        tools[0]["inputSchema"]["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("conflict"))
+    );
+}
+
+#[tokio::test]
+async fn refused_remember_is_invalid_params_with_not_applied_outcome() {
+    let fake = Arc::new(FakeService {
+        remember_failure: Some(RememberFailure::Refused),
+        ..FakeService::default()
+    });
+    let response = server(&fake)
+        .handle_value(json!({
+            "jsonrpc": "2.0", "id": 80, "method": "tools/call",
+            "params": {"name": "remember", "arguments": {
+                "action": "retract",
+                "idempotency_key": "retract/80",
+                "claim_id": 41,
+                "expected_revision": 2
+            }}
+        }))
+        .await
+        .unwrap();
+
+    assert!(response.result.is_none(), "a refusal is not a tool result");
+    let error = response.error.unwrap();
+    assert_eq!(error.code, codes::INVALID_PARAMS);
+    assert!(
+        error
+            .message
+            .starts_with("remember(retract) refused: not_owner")
+    );
+    let data = error.data.unwrap();
+    assert_eq!(data["code"], "not_owner");
+    assert_eq!(data["outcome"], "not_applied");
+    assert_eq!(data["details"]["claim_id"], 41);
+    let calls = fake.calls();
+    let ObservedCall::Remember { arguments, .. } = &calls[0] else {
+        panic!("remember reached the read path");
+    };
+    assert_eq!(arguments["claim_id"], 41);
+    assert_eq!(arguments["expected_revision"], 2);
 }

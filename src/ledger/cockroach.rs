@@ -12,14 +12,17 @@ use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Row, Transaction};
 
 use crate::ledger::{
-    Claim, ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimSupport, Conflict,
-    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2,
-    SemanticClaimHit, SupportedClaimCoordinate, SupportedClaimIds,
+    Claim, ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimSupport,
+    ClaimTarget, Conflict, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+    FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2, SemanticClaimHit, SupportedClaimCoordinate,
+    SupportedClaimIds,
 };
 use crate::store::cockroach::{
     EMBEDDING_DIMENSION, RetryPolicy, serialize_vector, with_serializable_retry,
 };
 use crate::{FleetError, FleetScope, Result};
+
+mod lifecycle_store;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const MAX_LEDGER_RESULTS: usize = 100;
@@ -742,6 +745,8 @@ impl ClaimLedger for CockroachClaimLedger {
                     idempotent_replay: false,
                     conflicts_opened,
                     conflicts_resolved: Vec::new(),
+                    claims_restored: Vec::new(),
+                    reevaluation: None,
                 };
                 let response = serde_json::to_value(&mutation).map_err(|error| {
                     protocol_error(format!("serialize idempotency response: {error}"))
@@ -769,6 +774,32 @@ impl ClaimLedger for CockroachClaimLedger {
             })
         })
         .await
+    }
+
+    async fn retract_claim(
+        &self,
+        scope: &FleetScope,
+        target: ClaimTarget,
+        reason: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<ClaimMutation> {
+        lifecycle_store::retract_claim(self, scope, target, reason, idempotency_key).await
+    }
+
+    async fn get_conflicts(
+        &self,
+        scope: &FleetScope,
+        conflict_ids: &[i64],
+    ) -> Result<Vec<Conflict>> {
+        lifecycle_store::get_conflicts(self, scope, conflict_ids).await
+    }
+
+    async fn claim_states(
+        &self,
+        scope: &FleetScope,
+        claim_ids: &[i64],
+    ) -> Result<Vec<(i64, ClaimState)>> {
+        lifecycle_store::claim_states(self, scope, claim_ids).await
     }
 
     async fn get_claim(&self, scope: &FleetScope, id: i64) -> Result<Option<Claim>> {

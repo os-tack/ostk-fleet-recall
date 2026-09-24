@@ -87,6 +87,10 @@ pub enum FleetError {
     SuccessorActivationCorrupt(String),
     #[error("memory operation failed: {0}")]
     Memory(String),
+    /// A lifecycle mutation was refused before commit; nothing was written and
+    /// its idempotency key was not consumed.
+    #[error("lifecycle refused: {0}")]
+    LifecycleRefused(Box<crate::ledger::LifecycleRefusal>),
 }
 
 pub type Result<T> = std::result::Result<T, FleetError>;

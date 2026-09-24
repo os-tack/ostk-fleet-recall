@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 
-use crate::ledger::{Claim, ClaimInput, ClaimMutation, Conflict, SemanticClaimHit};
+use crate::ledger::{
+    Claim, ClaimInput, ClaimMutation, ClaimState, ClaimTarget, Conflict, SemanticClaimHit,
+};
 use crate::{FleetScope, Result};
 
 /// Bounded claim coordinates resolved from exact source-chunk support rows.
@@ -42,7 +44,38 @@ pub trait ClaimLedger: Send + Sync {
         idempotency_key: &str,
     ) -> Result<ClaimMutation>;
 
+    /// Retract a lifecycle-current operator assertion the caller authored.
+    ///
+    /// Owner authority, the expected revision, and the key's lineage are
+    /// checked under row locks; a violation is a typed
+    /// [`crate::FleetError::LifecycleRefused`] that rolls the whole
+    /// transaction back. When the key's open v2 conflict has no incompatible
+    /// lifecycle-current pair left, the detector closes it and restores its
+    /// disputed members that no other open conflict still holds.
+    async fn retract_claim(
+        &self,
+        scope: &FleetScope,
+        target: ClaimTarget,
+        reason: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<ClaimMutation>;
+
     async fn get_claim(&self, scope: &FleetScope, id: i64) -> Result<Option<Claim>>;
+
+    /// Hydrate conflicts by id in any state (at most 100 ids). Unknown ids are
+    /// simply absent from the result.
+    async fn get_conflicts(
+        &self,
+        scope: &FleetScope,
+        conflict_ids: &[i64],
+    ) -> Result<Vec<Conflict>>;
+
+    /// Current lifecycle state of up to 100 claims. Unknown ids are absent.
+    async fn claim_states(
+        &self,
+        scope: &FleetScope,
+        claim_ids: &[i64],
+    ) -> Result<Vec<(i64, ClaimState)>>;
 
     async fn search_claims(
         &self,

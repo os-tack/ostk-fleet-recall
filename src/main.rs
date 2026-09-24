@@ -17,11 +17,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use ostk_fleet_recall::application::LifecycleServing;
 use ostk_fleet_recall::config::{PublicationConfig, model_bundle_sha256};
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::McpServer;
 use ostk_fleet_recall::service::{
-    FleetRecallService, RecallAction, RecallRequest, RecallResult, ServiceError,
+    FleetRecallService, RecallAction, RecallRequest, RecallResult, RememberSurface, ServiceError,
 };
 use ostk_fleet_recall::store::cockroach::{
     CockroachStore, EMBEDDING_DIMENSION, PoolConfig, RetryPolicy, ScopedChunk,
@@ -367,12 +368,25 @@ async fn build_memory_service(
         embedder.clone(),
         RetryPolicy::default(),
     )?);
-    let service = Arc::new(CockroachMemoryService::new(
+    let mut service = CockroachMemoryService::new(
         config.default_scope.clone(),
         store.clone(),
         ledger,
         embedder,
-    )?);
+    )?;
+    if config.lifecycle.remember_lifecycle {
+        let lifecycle = LifecycleServing {
+            surface: RememberSurface {
+                claim_lifecycle: true,
+            },
+            hide_non_current_claim_chunks: true,
+        };
+        tracing::info!(surface = ?lifecycle.surface, "serving the remember lifecycle surface");
+        service = service.with_lifecycle(lifecycle);
+    } else {
+        tracing::info!("serving the record-only remember surface");
+    }
+    let service = Arc::new(service);
     service.verify_embedding_generation().await?;
     Ok((service, store))
 }
@@ -965,6 +979,10 @@ async fn execute_demo_recall(
         Ok(Err(ServiceError::Internal(_))) => Err(demo_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({ "error": "memory operation failed" }),
+        )),
+        Ok(Err(ServiceError::Refused(refusal))) => Err(demo_json(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": refusal.message, "code": refusal.code }),
         )),
         Err(_) => Err(demo_json(
             StatusCode::GATEWAY_TIMEOUT,
@@ -1786,6 +1804,7 @@ mod tests {
             embedding_model: "logical/model".into(),
             embedding_model_path: bundle.path().into(),
             embedding_model_sha256: digest,
+            lifecycle: ostk_fleet_recall::config::LifecycleConfig::default(),
         };
 
         assert!(

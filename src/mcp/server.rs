@@ -8,13 +8,13 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 
 use crate::context::RequestedScope;
 use crate::service::{
-    FleetMemoryService, RecallAction, RecallRequest, RecallResult, RememberAction, RememberRequest,
-    RememberResult, ServiceError,
+    FleetMemoryService, RecallAction, RecallRequest, RecallResult, Refusal, RememberAction,
+    RememberRequest, RememberResult, ServiceError,
 };
 use crate::{FleetScope, Result};
 
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
-use super::tools::tool_list;
+use super::tools::tool_list_for;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub(super) const MAX_MCP_FRAME_BYTES: usize = 1_048_576;
@@ -53,6 +53,8 @@ struct WireRememberRequest {
 pub struct McpServer {
     service: Arc<dyn FleetMemoryService>,
     trusted_scope: FleetScope,
+    /// `tools/list` for the service's remember surface, computed once.
+    tools: Value,
 }
 
 impl McpServer {
@@ -60,9 +62,11 @@ impl McpServer {
     /// and every caller refinement is validated again before dispatch.
     pub fn new(service: Arc<dyn FleetMemoryService>, trusted_scope: FleetScope) -> Result<Self> {
         trusted_scope.validate()?;
+        let tools = json!({ "tools": tool_list_for(service.remember_surface()) });
         Ok(Self {
             service,
             trusted_scope,
+            tools,
         })
     }
 
@@ -194,7 +198,7 @@ impl McpServer {
         let result = match request.method.as_str() {
             "initialize" => Ok(initialize_result()),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tool_list() })),
+            "tools/list" => Ok(self.tools.clone()),
             "tools/call" => self.handle_tools_call(request.params).await,
             method => Err(JsonRpcError::method_not_found(method)),
         };
@@ -250,6 +254,7 @@ impl McpServer {
             Err(ServiceError::InvalidRequest(message)) => {
                 Err(JsonRpcError::invalid_params(message))
             }
+            Err(ServiceError::Refused(refusal)) => Err(refusal_error("recall", action, &refusal)),
             Err(error) => Ok(failed_tool_result("recall", action, &error)),
         }
     }
@@ -273,6 +278,9 @@ impl McpServer {
             Err(ServiceError::InvalidRequest(message)) => {
                 Err(JsonRpcError::invalid_params(message))
             }
+            // A refusal is decided before commit, so it never takes the
+            // outcome-unknown path below.
+            Err(ServiceError::Refused(refusal)) => Err(refusal_error("remember", action, &refusal)),
             Err(error) => Ok(failed_remember_tool_result(
                 action,
                 &error,
@@ -463,22 +471,32 @@ fn result_within_budget(result: &Value) -> bool {
 fn compact_committed_remember_envelope(envelope: &Value) -> Value {
     let data = &envelope["data"];
     let claim = &data["claim"];
+    let mut compact_data = json!({
+        "operation": data["operation"],
+        "claim": {
+            "id": claim["id"],
+            "state": claim["state"],
+            "revision": claim["revision"],
+        },
+        "idempotent_replay": data["idempotent_replay"],
+        "conflicts_opened": data["conflicts_opened"],
+        "conflicts_resolved": data["conflicts_resolved"],
+        "receipt": data["receipt"],
+    });
+    // Lifecycle coordinates are bounded, so they survive compaction. They are
+    // inserted only when present, which keeps record's compact bytes stable.
+    if let Some(compact) = compact_data.as_object_mut() {
+        for key in ["claims_restored", "reevaluation"] {
+            if let Some(value) = data.get(key) {
+                compact.insert(key.into(), value.clone());
+            }
+        }
+    }
     json!({
         "schema_version": envelope["schema_version"],
         "tool": "remember",
         "action": envelope["action"],
-        "data": {
-            "operation": data["operation"],
-            "claim": {
-                "id": claim["id"],
-                "state": claim["state"],
-                "revision": claim["revision"],
-            },
-            "idempotent_replay": data["idempotent_replay"],
-            "conflicts_opened": data["conflicts_opened"],
-            "conflicts_resolved": data["conflicts_resolved"],
-            "receipt": data["receipt"],
-        },
+        "data": compact_data,
         "conflicts": [],
         "conflict_coverage": {
             "status": "partial",
@@ -550,17 +568,49 @@ fn encode_bounded_response(response: &JsonRpcResponse) -> std::io::Result<Vec<u8
     Ok(encoded)
 }
 
-fn failed_tool_result(tool: &str, action: &str, error: &ServiceError) -> Value {
-    let kind = match error {
+/// A typed refusal is a correctable client error: JSON-RPC `invalid_params`
+/// whose data says nothing was applied and, for `remember`, that the
+/// idempotency key is still free.
+fn refusal_error(tool: &str, action: &str, refusal: &Refusal) -> JsonRpcError {
+    let retry = if tool == "remember" {
+        "nothing was committed and the idempotency_key was not consumed; re-read and send a corrected request"
+    } else {
+        "nothing was read or changed; send a corrected request"
+    };
+    let mut error = JsonRpcError::invalid_params(format!(
+        "{tool}({action}) refused: {}: {}",
+        refusal.code, refusal.message
+    ));
+    error.data = Some(json!({
+        "code": refusal.code,
+        "outcome": "not_applied",
+        "retry": retry,
+        "details": refusal.details,
+    }));
+    error
+}
+
+const fn failure_kind(error: &ServiceError) -> &'static str {
+    match error {
         ServiceError::InvalidRequest(_) => "invalid_request",
         ServiceError::Unavailable(_) => "unavailable",
         ServiceError::Internal(_) => "internal",
-    };
-    let public_message = match error {
+        ServiceError::Refused(_) => "refused",
+    }
+}
+
+const fn public_failure_message(error: &ServiceError) -> &str {
+    match error {
         ServiceError::InvalidRequest(message) => message.as_str(),
         ServiceError::Unavailable(_) => "memory service temporarily unavailable",
         ServiceError::Internal(_) => "memory operation failed",
-    };
+        ServiceError::Refused(refusal) => refusal.message.as_str(),
+    }
+}
+
+fn failed_tool_result(tool: &str, action: &str, error: &ServiceError) -> Value {
+    let kind = failure_kind(error);
+    let public_message = public_failure_message(error);
     json!({
         "content": [{
             "type": "text",
@@ -579,16 +629,8 @@ fn failed_remember_tool_result(
     error: &ServiceError,
     idempotency_key: Option<&str>,
 ) -> Value {
-    let kind = match error {
-        ServiceError::InvalidRequest(_) => "invalid_request",
-        ServiceError::Unavailable(_) => "unavailable",
-        ServiceError::Internal(_) => "internal",
-    };
-    let public_message = match error {
-        ServiceError::InvalidRequest(message) => message.as_str(),
-        ServiceError::Unavailable(_) => "memory service temporarily unavailable",
-        ServiceError::Internal(_) => "memory operation failed",
-    };
+    let kind = failure_kind(error);
+    let public_message = public_failure_message(error);
     let retry = "retry the identical full remember request with the same idempotency_key to obtain its durable receipt";
     let envelope = json!({
         "schema_version": 2,
@@ -739,6 +781,102 @@ mod tests {
             true
         );
         assert!(serde_json::to_vec(&response).unwrap().len() < 4_096);
+    }
+
+    #[test]
+    fn refusal_is_invalid_params_with_not_applied_data() {
+        let refusal = Refusal {
+            code: "stale_revision",
+            message: "claim 41 is at revision 3 (disputed)".into(),
+            details: json!({ "claim_id": 41, "current_revision": 3, "current_state": "disputed" }),
+        };
+        let error = refusal_error("remember", "retract", &refusal);
+        assert_eq!(error.code, crate::mcp::protocol::codes::INVALID_PARAMS);
+        assert_eq!(
+            error.message,
+            "remember(retract) refused: stale_revision: claim 41 is at revision 3 (disputed)"
+        );
+        let data = error.data.expect("refusal data");
+        assert_eq!(data["code"], "stale_revision");
+        assert_eq!(data["outcome"], "not_applied");
+        assert_eq!(data["details"]["current_revision"], 3);
+        assert!(
+            data["retry"]
+                .as_str()
+                .unwrap()
+                .contains("idempotency_key was not consumed")
+        );
+        // A refusal can never be mistaken for an unknown mutation outcome.
+        assert_ne!(data["outcome"], "unknown");
+    }
+
+    fn oversized_remember(data: &Value) -> Value {
+        let envelope = remember_envelope(
+            data["operation"].as_str().unwrap(),
+            &RememberResult::new(data.clone()),
+            Some("turn-7/key"),
+        );
+        successful_remember_tool_result(&envelope)["structuredContent"].clone()
+    }
+
+    #[test]
+    fn record_compact_envelope_is_unchanged() {
+        let record = json!({
+            "operation": "record",
+            "claim": { "id": 42, "state": "active", "revision": 1,
+                       "text": "x".repeat(MAX_MCP_TOOL_RESULT_BYTES) },
+            "idempotent_replay": false,
+            "conflicts_opened": [],
+            "conflicts_resolved": [],
+        });
+        let compact = oversized_remember(&record);
+        let keys = compact["data"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "claim",
+                "conflicts_opened",
+                "conflicts_resolved",
+                "idempotent_replay",
+                "operation",
+                "receipt",
+            ])
+        );
+
+        let mut retract = record;
+        retract["operation"] = json!("retract");
+        retract["conflicts_resolved"] = json!([9]);
+        retract["claims_restored"] = json!([43]);
+        retract["reevaluation"] = json!({
+            "conflict_id": 9, "outcome": "closed", "conflict_revision": 2,
+            "remaining_pair_count": 0, "remaining_pairs": [],
+        });
+        let compact = oversized_remember(&retract);
+        assert_eq!(compact["data"]["claims_restored"], json!([43]));
+        assert_eq!(compact["data"]["reevaluation"]["outcome"], "closed");
+        assert_eq!(compact["data"]["conflicts_resolved"], json!([9]));
+        assert_eq!(compact["diagnostics"]["output_truncated"], true);
+    }
+
+    #[test]
+    fn unavailable_lifecycle_failure_still_reports_outcome_unknown() {
+        let result = failed_remember_tool_result(
+            "retract",
+            &ServiceError::Unavailable("sensitive database detail".into()),
+            Some("retract/41"),
+        );
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["data"]["outcome"], "unknown");
+        assert_eq!(
+            result["structuredContent"]["data"]["receipt"]["idempotency_key"],
+            "retract/41"
+        );
+        assert!(!result.to_string().contains("sensitive"));
     }
 
     #[test]

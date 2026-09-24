@@ -11,12 +11,14 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::ledger::{
-    ClaimInput, ClaimLedger, ClaimMutation, Conflict, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
-    SemanticClaimHit, SupportedClaimCoordinate,
+    ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict,
+    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, SemanticClaimHit, SupportedClaimCoordinate,
+    validate_lifecycle_reason,
 };
 use crate::service::{
-    ConflictCoverage, FleetMemoryService, RecallAction, RecallRequest, RecallResult,
-    RememberAction, RememberRequest, RememberResult, ServiceError, ServiceResult,
+    ConflictCoverage, FleetMemoryService, RecallAction, RecallRequest, RecallResult, Refusal,
+    RememberAction, RememberRequest, RememberResult, RememberSurface, ServiceError, ServiceResult,
+    authorize_surface,
 };
 use crate::store::cockroach::{
     CockroachStore, RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY, RetrievalHitMetadata,
@@ -29,6 +31,21 @@ const DEFAULT_TOOL_RESULTS: usize = 10;
 // Chunk search passes this query to CockroachDB's `plainto_tsquery`; keep every
 // token below the same conservative bound enforced for indexed corpus text.
 const MAX_TSVECTOR_QUERY_LEXEME_BYTES: usize = 16_000;
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+/// Source of the corpus projection record writes for every claim.
+const SYNTHETIC_CLAIM_SOURCE: &str = "ostk_memory";
+
+/// Which lifecycle behaviour a service instance serves. The default is the
+/// historical record-only surface with unfiltered search, which the public
+/// recall process always keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LifecycleServing {
+    /// The `remember` actions served and advertised in `tools/list`.
+    pub surface: RememberSurface,
+    /// Drop synthetic `claim:{id}` chunk hits whose claim is no longer
+    /// lifecycle-current from `recall(search, kind=chunk)`.
+    pub hide_non_current_claim_chunks: bool,
+}
 
 /// The executable service composition: shared hybrid corpus reads plus the
 /// durable epistemic claim ledger, both bound to one deployment identity.
@@ -37,6 +54,7 @@ pub struct CockroachMemoryService {
     corpus: Arc<CockroachStore>,
     ledger: Arc<dyn ClaimLedger>,
     embedder: Arc<dyn ChunkEmbedder>,
+    lifecycle: LifecycleServing,
 }
 
 struct ChunkConflictProjection {
@@ -77,6 +95,7 @@ impl std::fmt::Debug for CockroachMemoryService {
             .debug_struct("CockroachMemoryService")
             .field("trusted_scope", &self.trusted_scope)
             .field("embedding_model", &self.embedder.model_id())
+            .field("lifecycle", &self.lifecycle)
             .finish_non_exhaustive()
     }
 }
@@ -101,7 +120,16 @@ impl CockroachMemoryService {
             corpus,
             ledger,
             embedder,
+            lifecycle: LifecycleServing::default(),
         })
+    }
+
+    /// Serve the given lifecycle surface. Only the private writer composition
+    /// calls this; the publication reader keeps the record-only default.
+    #[must_use]
+    pub const fn with_lifecycle(mut self, lifecycle: LifecycleServing) -> Self {
+        self.lifecycle = lifecycle;
+        self
     }
 
     /// Verify the process embedder shares the corpus's registered vector
@@ -217,6 +245,105 @@ impl CockroachMemoryService {
         })
     }
 
+    /// Retired claims keep their synthetic chunk row. On the private writer,
+    /// hide such hits before the conflict projection so a retracted claim can
+    /// neither surface nor select a conflict through chunk search. Returns the
+    /// hidden claim ids only when the gate is on.
+    async fn hide_retired_claim_chunks(
+        &self,
+        scope: &FleetScope,
+        hits: Vec<RecallHit>,
+    ) -> ServiceResult<(Vec<RecallHit>, Option<Vec<i64>>)> {
+        if !self.lifecycle.hide_non_current_claim_chunks {
+            return Ok((hits, None));
+        }
+        let claim_ids = synthetic_claim_ids(&hits);
+        let states = if claim_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.ledger
+                .claim_states(scope, &claim_ids)
+                .await
+                .map_err(service_error)?
+        };
+        let (kept, hidden) = partition_lifecycle_hits(hits, &states);
+        Ok((kept, Some(hidden)))
+    }
+
+    /// Hybrid chunk search with its conflict projection and diagnostics.
+    async fn search_chunks(
+        &self,
+        scope: &FleetScope,
+        args: SearchArgs,
+        limit: usize,
+    ) -> ServiceResult<RecallResult> {
+        let params = RecallParams {
+            query: args.query,
+            project: Some(scope.project.clone()),
+            source: args.source,
+            since: None,
+            before: None,
+            limit: Some(limit),
+            max_per_source_id: args.max_per_source_id,
+            min_score: args.min_score,
+            intent: args.intent.unwrap_or_default(),
+            attention_bias: None,
+            // The portable default's extra code-only dense lane is
+            // useful for local symbol search, but in a small public
+            // demo it grants weak code neighbours a fresh rank-zero
+            // contribution. Fleet recall disables that prefetch; code
+            // still participates in both primary lexical and dense
+            // lanes under the same relevance contract as every source.
+            ranking_overrides: Some(fleet_ranking_overrides()),
+        };
+        let retrieval_corpus = self.corpus.retrieval_reader();
+        let mut hits =
+            ostk_recall_retrieval::recall(&retrieval_corpus, self.embedder.as_ref(), None, &params)
+                .await
+                .map_err(|error| ServiceError::Internal(format!("hybrid recall: {error}")))?;
+        let metadata_elided = self.hydrate_retrieval_metadata(&mut hits).await?;
+        let (hits, lifecycle_hidden_claim_ids) =
+            self.hide_retired_claim_chunks(scope, hits).await?;
+        let projection = self.project_chunk_conflicts(scope, &hits).await?;
+        let conflict_matches = conflict_match_diagnostics(
+            &projection.conflicts,
+            &hits,
+            &projection.support_coordinates,
+        )?;
+        let mut result = RecallResult::new(json!({ "hits": hits }));
+        result.conflicts = serialize_conflicts(&projection.conflicts)?;
+        result.conflict_coverage = conflict_coverage(false, &projection.conflicts);
+        if projection.support_claims_truncated {
+            result.warnings.push(json!({
+                "code": "support_claim_projection_truncated",
+                "message": "more typed claims cite the surfaced evidence than fit in the bounded conflict projection"
+            }));
+        }
+        if projection.support_coordinates_truncated {
+            result.warnings.push(json!({
+                "code": "support_coordinate_projection_truncated",
+                "message": "additional exact source-support associations exist beyond the bounded conflict-trigger diagnostic"
+            }));
+        }
+        let mut retrieval = json!({
+            "lanes": ["lexical", "dense"],
+            "fusion": "rrf",
+            "metadata_elided": metadata_elided,
+            "support_claims_matched": projection.support_claim_count,
+            "supporting_chunk_ids": projection.supporting_chunk_ids,
+            "support_claims_truncated": projection.support_claims_truncated,
+            "support_coordinates_truncated": projection.support_coordinates_truncated,
+            "conflict_matches": conflict_matches,
+            "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
+            "stratified_code_prefetch": 0,
+        });
+        if let Some(hidden) = lifecycle_hidden_claim_ids {
+            retrieval["lifecycle_hidden_claim_ids"] = json!(hidden);
+        }
+        result.diagnostics.insert("retrieval".into(), retrieval);
+        Ok(result)
+    }
+
     async fn recall_search(
         &self,
         scope: &FleetScope,
@@ -229,74 +356,7 @@ impl CockroachMemoryService {
         validate_search_args(&args)?;
         let limit = bounded_limit(args.limit)?;
         match args.kind.as_deref().unwrap_or("chunk") {
-            "chunk" => {
-                let params = RecallParams {
-                    query: args.query,
-                    project: Some(scope.project.clone()),
-                    source: args.source,
-                    since: None,
-                    before: None,
-                    limit: Some(limit),
-                    max_per_source_id: args.max_per_source_id,
-                    min_score: args.min_score,
-                    intent: args.intent.unwrap_or_default(),
-                    attention_bias: None,
-                    // The portable default's extra code-only dense lane is
-                    // useful for local symbol search, but in a small public
-                    // demo it grants weak code neighbours a fresh rank-zero
-                    // contribution. Fleet recall disables that prefetch; code
-                    // still participates in both primary lexical and dense
-                    // lanes under the same relevance contract as every source.
-                    ranking_overrides: Some(fleet_ranking_overrides()),
-                };
-                let retrieval_corpus = self.corpus.retrieval_reader();
-                let mut hits = ostk_recall_retrieval::recall(
-                    &retrieval_corpus,
-                    self.embedder.as_ref(),
-                    None,
-                    &params,
-                )
-                .await
-                .map_err(|error| ServiceError::Internal(format!("hybrid recall: {error}")))?;
-                let metadata_elided = self.hydrate_retrieval_metadata(&mut hits).await?;
-                let projection = self.project_chunk_conflicts(scope, &hits).await?;
-                let conflict_matches = conflict_match_diagnostics(
-                    &projection.conflicts,
-                    &hits,
-                    &projection.support_coordinates,
-                )?;
-                let mut result = RecallResult::new(json!({ "hits": hits }));
-                result.conflicts = serialize_conflicts(&projection.conflicts)?;
-                result.conflict_coverage = conflict_coverage(false, &projection.conflicts);
-                if projection.support_claims_truncated {
-                    result.warnings.push(json!({
-                        "code": "support_claim_projection_truncated",
-                        "message": "more typed claims cite the surfaced evidence than fit in the bounded conflict projection"
-                    }));
-                }
-                if projection.support_coordinates_truncated {
-                    result.warnings.push(json!({
-                        "code": "support_coordinate_projection_truncated",
-                        "message": "additional exact source-support associations exist beyond the bounded conflict-trigger diagnostic"
-                    }));
-                }
-                result.diagnostics.insert(
-                    "retrieval".into(),
-                    json!({
-                        "lanes": ["lexical", "dense"],
-                        "fusion": "rrf",
-                        "metadata_elided": metadata_elided,
-                        "support_claims_matched": projection.support_claim_count,
-                        "supporting_chunk_ids": projection.supporting_chunk_ids,
-                        "support_claims_truncated": projection.support_claims_truncated,
-                        "support_coordinates_truncated": projection.support_coordinates_truncated,
-                        "conflict_matches": conflict_matches,
-                        "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
-                        "stratified_code_prefetch": 0,
-                    }),
-                );
-                Ok(result)
-            }
+            "chunk" => self.search_chunks(scope, args, limit).await,
             "claim" | "assertion" => {
                 reject_claim_only_unsupported_filters(&args)?;
                 let hits = self
@@ -377,6 +437,23 @@ impl CockroachMemoryService {
                 result.conflict_coverage = ConflictCoverage::not_evaluated();
                 Ok(result)
             }
+            // Conflict lookup by id is part of the lifecycle surface; the
+            // record-only (publication) surface keeps its historical kinds.
+            "conflict" if self.lifecycle.surface != RememberSurface::RECORD_ONLY => {
+                let id = parse_safe_id(&args.id)?;
+                let conflicts = self
+                    .ledger
+                    .get_conflicts(scope, &[id])
+                    .await
+                    .map_err(service_error)?;
+                let serialized = serialize_conflicts(&conflicts)?;
+                let mut result =
+                    RecallResult::new(json!({ "conflict": serialized.first().cloned() }));
+                result.conflict_coverage =
+                    conflict_coverage(lifecycle_coverage_complete(&[id], &conflicts), &conflicts);
+                result.conflicts = serialized;
+                Ok(result)
+            }
             other => Err(ServiceError::InvalidRequest(format!(
                 "recall get kind {other:?} is not supported"
             ))),
@@ -413,6 +490,9 @@ impl CockroachMemoryService {
             "embedding_model": self.embedder.model_id(),
             "embedding_dimension": self.embedder.dim(),
         }));
+        if self.lifecycle.surface != RememberSurface::RECORD_ONLY {
+            result.data["remember_surface"] = json!(self.lifecycle.surface);
+        }
         result.conflict_coverage = ConflictCoverage::not_evaluated();
         Ok(result)
     }
@@ -425,9 +505,7 @@ impl CockroachMemoryService {
         self.verify_embedding_generation()
             .await
             .map_err(service_error)?;
-        let idempotency_key = request.idempotency_key.ok_or_else(|| {
-            ServiceError::InvalidRequest("remember(record) requires idempotency_key".into())
-        })?;
+        let idempotency_key = required_idempotency_key(request.action, request.idempotency_key)?;
         let input: ClaimInput = from_arguments(request.arguments, "remember record")?;
         input.validate().map_err(|error| match error {
             FleetError::Memory(message) => ServiceError::InvalidRequest(message),
@@ -462,6 +540,29 @@ impl CockroachMemoryService {
             .conflicts_for_claim_ids(scope, &[mutation.claim.id], MAX_TOOL_RESULTS)
             .await;
         Ok(committed_remember_result(&mutation, conflicts))
+    }
+
+    async fn remember_retract(
+        &self,
+        scope: &FleetScope,
+        request: RememberRequest,
+    ) -> ServiceResult<RememberResult> {
+        let idempotency_key = required_idempotency_key(request.action, request.idempotency_key)?;
+        let (target, reason) = parse_retract_arguments(request.arguments)?;
+        let mutation = self
+            .ledger
+            .retract_claim(scope, target, reason.as_deref(), &idempotency_key)
+            .await
+            .map_err(service_error)?;
+        // Every conflict the retract touched, in any state: the claim's
+        // lineage membership plus whatever the detector re-evaluated.
+        let requested = affected_conflict_ids(&mutation);
+        let conflicts = if requested.is_empty() {
+            Ok(Vec::new())
+        } else {
+            self.ledger.get_conflicts(scope, &requested).await
+        };
+        Ok(committed_lifecycle_result(&mutation, &requested, conflicts))
     }
 
     /// Fail the event-first `assert` route closed (ADR 0002 D3/D4).
@@ -509,8 +610,72 @@ fn committed_remember_result(
     mutation: &ClaimMutation,
     conflicts: crate::Result<Vec<Conflict>>,
 ) -> RememberResult {
+    let expected_conflict_ids = &mutation.claim.conflict_ids;
+    let replay = mutation.idempotent_replay;
+    project_committed_conflicts(mutation, conflicts, |conflicts| {
+        // A fresh record's projected open conflicts are exactly its lineage
+        // memberships. A replayed receipt carries the claim as it was then;
+        // a membership it lists may have closed since, so only an open
+        // conflict it does not list makes the projection incomplete.
+        let memberships_covered = if replay {
+            conflicts
+                .iter()
+                .all(|conflict| expected_conflict_ids.contains(&conflict.id))
+        } else {
+            conflicts.len() == expected_conflict_ids.len()
+        };
+        memberships_covered && conflicts.iter().all(conflict_projection_complete)
+    })
+}
+
+/// Build a lifecycle response after commit. Its conflicts are every affected
+/// conflict in any state, and coverage is complete only when each requested
+/// conflict was found and fully projected.
+fn committed_lifecycle_result(
+    mutation: &ClaimMutation,
+    requested: &[i64],
+    conflicts: crate::Result<Vec<Conflict>>,
+) -> RememberResult {
+    project_committed_conflicts(mutation, conflicts, |conflicts| {
+        lifecycle_coverage_complete(requested, conflicts)
+    })
+}
+
+fn lifecycle_coverage_complete(requested: &[i64], conflicts: &[Conflict]) -> bool {
+    requested
+        .iter()
+        .all(|id| conflicts.iter().any(|conflict| conflict.id == *id))
+        && conflicts.iter().all(|conflict| {
+            conflict_projection_complete(conflict)
+                && conflict.detector == FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2
+        })
+}
+
+fn affected_conflict_ids(mutation: &ClaimMutation) -> Vec<i64> {
+    let mut ids = mutation
+        .claim
+        .conflict_ids
+        .iter()
+        .chain(&mutation.conflicts_resolved)
+        .copied()
+        .chain(
+            mutation
+                .reevaluation
+                .as_ref()
+                .map(|reevaluation| reevaluation.conflict_id),
+        )
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn project_committed_conflicts(
+    mutation: &ClaimMutation,
+    conflicts: crate::Result<Vec<Conflict>>,
+    coverage_complete: impl FnOnce(&[Conflict]) -> bool,
+) -> RememberResult {
     let claim_id = mutation.claim.id;
-    let expected_conflicts = mutation.claim.conflict_ids.len();
     let data = serde_json::to_value(mutation).unwrap_or_else(|error| {
         tracing::error!(
             error = %error,
@@ -538,11 +703,8 @@ fn committed_remember_result(
         Ok(conflicts) => match serialize_conflicts(&conflicts) {
             Ok(serialized) => {
                 result.conflicts = serialized;
-                result.conflict_coverage = conflict_coverage(
-                    conflicts.len() == expected_conflicts
-                        && conflicts.iter().all(conflict_projection_complete),
-                    &conflicts,
-                );
+                result.conflict_coverage =
+                    conflict_coverage(coverage_complete(&conflicts), &conflicts);
             }
             Err(error) => mark_post_commit_projection_unavailable(&mut result, claim_id, &error),
         },
@@ -759,15 +921,117 @@ impl FleetMemoryService for CockroachMemoryService {
         request: RememberRequest,
     ) -> ServiceResult<RememberResult> {
         self.ensure_scope(&scope)?;
+        authorize_surface(self.lifecycle.surface, request.action)?;
         match request.action {
             RememberAction::Record => self.remember_record(&scope, request).await,
             RememberAction::Assert => Err(Self::assert_route_disabled()),
+            RememberAction::Retract => self.remember_retract(&scope, request).await,
             action => Err(ServiceError::InvalidRequest(format!(
                 "remember({}) is not implemented yet",
                 action.as_str()
             ))),
         }
     }
+
+    fn remember_surface(&self) -> RememberSurface {
+        self.lifecycle.surface
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetractArgs {
+    claim_id: Value,
+    expected_revision: i64,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn parse_retract_arguments(
+    arguments: Map<String, Value>,
+) -> ServiceResult<(ClaimTarget, Option<String>)> {
+    let args: RetractArgs = from_arguments(arguments, "remember retract")?;
+    let claim_id = parse_safe_id(&args.claim_id).map_err(|_| {
+        ServiceError::InvalidRequest(format!(
+            "claim_id must be an integer between 1 and {MAX_SAFE_INTEGER}"
+        ))
+    })?;
+    if !(1..=MAX_SAFE_INTEGER).contains(&args.expected_revision) {
+        return Err(ServiceError::InvalidRequest(format!(
+            "expected_revision must be between 1 and {MAX_SAFE_INTEGER}"
+        )));
+    }
+    if let Some(reason) = args.reason.as_deref() {
+        validate_lifecycle_reason(reason).map_err(ServiceError::InvalidRequest)?;
+    }
+    Ok((
+        ClaimTarget {
+            claim_id,
+            expected_revision: args.expected_revision,
+        },
+        args.reason,
+    ))
+}
+
+fn required_idempotency_key(action: RememberAction, key: Option<String>) -> ServiceResult<String> {
+    key.ok_or_else(|| {
+        ServiceError::InvalidRequest(format!(
+            "remember({}) requires idempotency_key",
+            action.as_str()
+        ))
+    })
+}
+
+/// The claim id of a synthetic `claim:{id}` chunk written by record.
+///
+/// The coordinate is the reserved chunk id and source, not the bounded
+/// `extra` metadata, which retrieval elides above its byte limit.
+fn synthetic_claim_id(hit: &RecallHit) -> Option<i64> {
+    if hit.source != SYNTHETIC_CLAIM_SOURCE {
+        return None;
+    }
+    hit.chunk_id
+        .strip_prefix("claim:")
+        .and_then(|id| id.parse::<i64>().ok())
+        .filter(|id| (1..=MAX_SAFE_INTEGER).contains(id) && hit.chunk_id == format!("claim:{id}"))
+}
+
+fn synthetic_claim_ids(hits: &[RecallHit]) -> Vec<i64> {
+    let mut ids = hits
+        .iter()
+        .filter_map(synthetic_claim_id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Keep ordinary hits and synthetic claim hits whose claim is still
+/// lifecycle-current; return the hidden claim ids. A synthetic hit whose claim
+/// no longer exists is hidden too.
+fn partition_lifecycle_hits(
+    hits: Vec<RecallHit>,
+    states: &[(i64, ClaimState)],
+) -> (Vec<RecallHit>, Vec<i64>) {
+    let states = states.iter().copied().collect::<HashMap<_, _>>();
+    let mut hidden = Vec::new();
+    let kept = hits
+        .into_iter()
+        .filter(|hit| match synthetic_claim_id(hit) {
+            Some(claim_id)
+                if !states
+                    .get(&claim_id)
+                    .is_some_and(|state| state.is_current()) =>
+            {
+                hidden.push(claim_id);
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    hidden.sort_unstable();
+    hidden.dedup();
+    (kept, hidden)
 }
 
 #[derive(Debug, Deserialize)]
@@ -877,7 +1141,6 @@ fn reject_claim_only_unsupported_filters(args: &SearchArgs) -> ServiceResult<()>
 }
 
 fn parse_safe_id(value: &Value) -> ServiceResult<i64> {
-    const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
     let id = value
         .as_i64()
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
@@ -963,6 +1226,14 @@ fn service_error(error: FleetError) -> ServiceError {
         FleetError::InvalidScope(message) | FleetError::IdempotencyConflict(message) => {
             ServiceError::InvalidRequest(message)
         }
+        FleetError::LifecycleRefused(refusal) => {
+            let refusal = *refusal;
+            ServiceError::Refused(Refusal {
+                code: refusal.code.as_str(),
+                message: refusal.message,
+                details: refusal.details,
+            })
+        }
         FleetError::Database(error) => {
             tracing::error!(error = %error, "fleet database operation failed");
             ServiceError::Unavailable("database operation failed".into())
@@ -977,9 +1248,14 @@ fn service_error(error: FleetError) -> ServiceError {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use ostk_recall_core::Links;
+    use ostk_recall_core::{Links, PrivacyTier};
+    use uuid::Uuid;
 
-    use crate::ledger::{Claim, ClaimKind, ClaimState};
+    use crate::ledger::{
+        Claim, ClaimKind, ClaimState, CockroachClaimLedger, ConflictReevaluation, LifecycleRefusal,
+        RefusalCode,
+    };
+    use crate::store::cockroach::{EMBEDDING_DIMENSION, RetryPolicy};
 
     use super::*;
 
@@ -1375,6 +1651,8 @@ mod tests {
             idempotent_replay: false,
             conflicts_opened: vec![9],
             conflicts_resolved: Vec::new(),
+            claims_restored: Vec::new(),
+            reevaluation: None,
         };
 
         let result = committed_remember_result(
@@ -1445,5 +1723,414 @@ mod tests {
         );
         assert!(projected[0].matched_passage.contains("kind: decision"));
         assert!(projected[0].claim.value.is_none());
+    }
+
+    struct OfflineEmbedder;
+
+    impl ChunkEmbedder for OfflineEmbedder {
+        fn dim(&self) -> usize {
+            EMBEDDING_DIMENSION
+        }
+
+        fn model_id(&self) -> &'static str {
+            "offline-test"
+        }
+
+        fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+            texts
+                .iter()
+                .map(|_| vec![0.0; EMBEDDING_DIMENSION])
+                .collect()
+        }
+    }
+
+    fn offline_scope() -> FleetScope {
+        FleetScope::new(
+            Uuid::from_u128(1),
+            "project",
+            "agent-a",
+            None,
+            PrivacyTier::T1Project,
+        )
+        .unwrap()
+    }
+
+    /// A service whose pool never connects: anything that reaches I/O fails,
+    /// so a passing assertion proves the decision was made before I/O.
+    fn offline_service(surface: RememberSurface) -> CockroachMemoryService {
+        let pool = sqlx::PgPool::connect_lazy("postgresql://root@127.0.0.1:1/offline").unwrap();
+        let scope = offline_scope();
+        let embedder: Arc<dyn ChunkEmbedder> = Arc::new(OfflineEmbedder);
+        let ledger = Arc::new(
+            CockroachClaimLedger::new(
+                pool.clone(),
+                scope.clone(),
+                embedder.clone(),
+                RetryPolicy::default(),
+            )
+            .unwrap(),
+        );
+        let store = Arc::new(CockroachStore::from_pool(pool, scope.clone()).unwrap());
+        CockroachMemoryService::new(scope, store, ledger, embedder)
+            .unwrap()
+            .with_lifecycle(LifecycleServing {
+                surface,
+                hide_non_current_claim_chunks: surface.claim_lifecycle,
+            })
+    }
+
+    const CLAIM_LIFECYCLE: RememberSurface = RememberSurface {
+        claim_lifecycle: true,
+    };
+
+    fn retract_arguments(value: &Value) -> Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    fn fixture_mutation(conflict_ids: Vec<i64>, idempotent_replay: bool) -> ClaimMutation {
+        let now = Utc::now();
+        ClaimMutation {
+            operation: "record".into(),
+            claim: Claim {
+                id: 41,
+                project: "project".into(),
+                kind: ClaimKind::Fact,
+                claim_key: Some("fleet::database".into()),
+                subject: Some("fleet".into()),
+                predicate: Some("database".into()),
+                value: Some(json!("cockroachdb")),
+                text: "The fleet database is CockroachDB.".into(),
+                polarity: 1,
+                state: ClaimState::Disputed,
+                origin: "operator_asserted".into(),
+                actor: Some("agent-a".into()),
+                confidence: 1.0,
+                valid_from: None,
+                valid_to: None,
+                superseded_by: None,
+                revision: 2,
+                conflict_eligible: true,
+                created_at: now,
+                updated_at: now,
+                support: Vec::new(),
+                conflict_ids,
+            },
+            idempotent_replay,
+            conflicts_opened: Vec::new(),
+            conflicts_resolved: Vec::new(),
+            claims_restored: Vec::new(),
+            reevaluation: None,
+        }
+    }
+
+    fn fixture_conflict(id: i64, detector: &str) -> Conflict {
+        serde_json::from_value(json!({
+            "id": id,
+            "project": "project",
+            "claim_key": "fleet::database",
+            "kind": "contradiction",
+            "state": "resolved",
+            "detector": detector,
+            "rationale": "fixture",
+            "revision": 2,
+            "detected_at": "2026-09-01T00:00:00Z",
+            "last_seen_at": "2026-09-01T00:00:00Z",
+            "resolved_at": "2026-09-02T00:00:00Z",
+            "resolution_kind": "no_current_incompatibility",
+            "resolution_reason": "fixture",
+            "members": [],
+        }))
+        .unwrap()
+    }
+
+    fn fixture_hit(chunk_id: &str, extra: &Value) -> RecallHit {
+        let source = if chunk_id.starts_with("claim:") {
+            SYNTHETIC_CLAIM_SOURCE
+        } else {
+            "markdown"
+        };
+        serde_json::from_value(json!({
+            "chunk_id": chunk_id,
+            "source": source,
+            "source_id": chunk_id,
+            "snippet": chunk_id,
+            "score": 1.0,
+            "links": {},
+            "extra": extra,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn lifecycle_refusal_maps_to_refused_not_internal() {
+        let refusal = LifecycleRefusal::new(
+            RefusalCode::StaleRevision,
+            "claim 41 is at revision 3 (disputed)",
+            json!({ "claim_id": 41, "current_revision": 3, "current_state": "disputed" }),
+        );
+        let ServiceError::Refused(mapped) = service_error(refusal.into()) else {
+            panic!("a lifecycle refusal must stay a typed refusal");
+        };
+        assert_eq!(mapped.code, "stale_revision");
+        assert_eq!(mapped.message, "claim 41 is at revision 3 (disputed)");
+        assert_eq!(mapped.details["current_revision"], 3);
+    }
+
+    #[test]
+    fn retract_args_reject_unknown_fields_unsafe_ids_and_blank_reason() {
+        let (target, reason) = parse_retract_arguments(retract_arguments(
+            &json!({ "claim_id": 41, "expected_revision": 2 }),
+        ))
+        .unwrap();
+        assert_eq!(
+            target,
+            ClaimTarget {
+                claim_id: 41,
+                expected_revision: 2
+            }
+        );
+        assert!(reason.is_none());
+        let (target, reason) = parse_retract_arguments(retract_arguments(
+            &json!({ "claim_id": "41", "expected_revision": 2, "reason": "wrong value" }),
+        ))
+        .unwrap();
+        assert_eq!(target.claim_id, 41);
+        assert_eq!(reason.as_deref(), Some("wrong value"));
+
+        for rejected in [
+            json!({ "claim_id": 41, "expected_revision": 2, "text": "smuggled" }),
+            json!({ "claim_id": 41, "expected_revision": 2, "agent": "other" }),
+            json!({ "claim_id": 0, "expected_revision": 2 }),
+            json!({ "claim_id": -1, "expected_revision": 2 }),
+            json!({ "claim_id": 9_007_199_254_740_992_i64, "expected_revision": 2 }),
+            json!({ "claim_id": "forty-one", "expected_revision": 2 }),
+            json!({ "claim_id": 41 }),
+            json!({ "claim_id": 41, "expected_revision": 0 }),
+            json!({ "claim_id": 41, "expected_revision": "2" }),
+            json!({ "claim_id": 41, "expected_revision": 2, "reason": " \u{200B} " }),
+            json!({ "claim_id": 41, "expected_revision": 2, "reason": "" }),
+        ] {
+            assert!(
+                matches!(
+                    parse_retract_arguments(retract_arguments(&rejected)),
+                    Err(ServiceError::InvalidRequest(_))
+                ),
+                "{rejected} must be a client error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_actions_require_idempotency_key() {
+        let service = offline_service(CLAIM_LIFECYCLE);
+        let error = FleetMemoryService::remember(
+            &service,
+            offline_scope(),
+            RememberRequest::new(
+                RememberAction::Retract,
+                None,
+                retract_arguments(&json!({ "claim_id": 41, "expected_revision": 2 })),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, ServiceError::InvalidRequest(message)
+                if message == "remember(retract) requires idempotency_key"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn surfaces_gate_retract_and_conflict_lookup_before_io() {
+        let record_only = offline_service(RememberSurface::RECORD_ONLY);
+        assert_eq!(
+            FleetMemoryService::remember_surface(&record_only),
+            RememberSurface::RECORD_ONLY
+        );
+        let error = FleetMemoryService::remember(
+            &record_only,
+            offline_scope(),
+            RememberRequest::new(
+                RememberAction::Retract,
+                Some("retract/41".into()),
+                retract_arguments(&json!({ "claim_id": 41, "expected_revision": 2 })),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, ServiceError::Refused(refusal) if refusal.code == "lifecycle_unavailable"),
+            "{error}"
+        );
+        let error = FleetMemoryService::recall(
+            &record_only,
+            offline_scope(),
+            RecallRequest::new(
+                RecallAction::Get,
+                retract_arguments(&json!({ "kind": "conflict", "id": 9 })),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, ServiceError::InvalidRequest(message) if message.contains("not supported")),
+            "{error}"
+        );
+
+        let lifecycle = offline_service(CLAIM_LIFECYCLE);
+        assert_eq!(
+            FleetMemoryService::remember_surface(&lifecycle),
+            CLAIM_LIFECYCLE
+        );
+        let error = FleetMemoryService::recall(
+            &lifecycle,
+            offline_scope(),
+            RecallRequest::new(
+                RecallAction::Get,
+                retract_arguments(&json!({ "kind": "conflict", "id": 0 })),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServiceError::InvalidRequest(_)), "{error}");
+    }
+
+    #[test]
+    fn replayed_record_coverage_uses_subset_rule_fresh_record_stays_strict() {
+        let open_nine = || {
+            Ok(vec![fixture_conflict(
+                9,
+                FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+            )])
+        };
+        let open_ten = || {
+            Ok(vec![fixture_conflict(
+                10,
+                FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+            )])
+        };
+
+        // Fresh records keep strict equality with their lineage memberships.
+        let fresh = fixture_mutation(vec![9], false);
+        assert_eq!(
+            committed_remember_result(&fresh, open_nine())
+                .conflict_coverage
+                .status,
+            "complete"
+        );
+        assert_eq!(
+            committed_remember_result(&fresh, Ok(Vec::new()))
+                .conflict_coverage
+                .status,
+            "partial"
+        );
+
+        // A replay's stored membership may have closed since it committed.
+        let replay = fixture_mutation(vec![9], true);
+        assert_eq!(
+            committed_remember_result(&replay, Ok(Vec::new()))
+                .conflict_coverage
+                .status,
+            "complete"
+        );
+        assert_eq!(
+            committed_remember_result(&replay, open_nine())
+                .conflict_coverage
+                .status,
+            "complete"
+        );
+        // An open conflict the stored claim does not list is still partial.
+        assert_eq!(
+            committed_remember_result(&replay, open_ten())
+                .conflict_coverage
+                .status,
+            "partial"
+        );
+    }
+
+    #[test]
+    fn lifecycle_coverage_complete_only_when_all_requested_found() {
+        let v2 = fixture_conflict(9, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2);
+        assert!(lifecycle_coverage_complete(&[], &[]));
+        assert!(lifecycle_coverage_complete(&[9], std::slice::from_ref(&v2)));
+        assert!(!lifecycle_coverage_complete(
+            &[9, 10],
+            std::slice::from_ref(&v2)
+        ));
+        assert!(!lifecycle_coverage_complete(&[9], &[]));
+        assert!(!lifecycle_coverage_complete(
+            &[9],
+            &[fixture_conflict(9, "same_key_typed_value")]
+        ));
+        let mut truncated = v2.clone();
+        truncated.members_truncated = true;
+        assert!(!lifecycle_coverage_complete(&[9], &[truncated]));
+
+        let mut retract = fixture_mutation(vec![9], false);
+        retract.operation = "retract".into();
+        retract.conflicts_resolved = vec![9];
+        retract.reevaluation = Some(ConflictReevaluation {
+            conflict_id: 9,
+            outcome: "closed".into(),
+            conflict_revision: 2,
+            remaining_pair_count: 0,
+            remaining_pairs: Vec::new(),
+        });
+        assert_eq!(affected_conflict_ids(&retract), [9]);
+        let result = committed_lifecycle_result(&retract, &[9], Ok(vec![v2]));
+        assert_eq!(result.conflict_coverage.status, "complete");
+        assert_eq!(result.conflicts[0]["state"], "resolved");
+        assert_eq!(result.data["reevaluation"]["outcome"], "closed");
+        let degraded = committed_lifecycle_result(
+            &retract,
+            &[9],
+            Err(FleetError::Memory("sensitive backend detail".into())),
+        );
+        assert_eq!(
+            degraded.conflict_coverage.details["reason"],
+            "post_commit_projection_unavailable"
+        );
+        assert_eq!(degraded.data["claim"]["id"], 41);
+    }
+
+    #[test]
+    fn partition_lifecycle_hits_hides_only_non_current_synthetic_claims() {
+        let mut spoofed_source = fixture_hit("claim:2", &json!({ "claim_id": 2 }));
+        spoofed_source.source = "markdown".into();
+        let hits = vec![
+            fixture_hit("claim:1", &json!({ "claim_id": 1 })),
+            // Retrieval elides oversized metadata; the chunk id still binds it.
+            fixture_hit("claim:2", &json!({})),
+            fixture_hit("docs/design.md#0", &json!({})),
+            fixture_hit("claim:3", &json!({ "claim_id": 3 })),
+            // Ordinary chunks are never hidden, whatever metadata they carry.
+            fixture_hit("docs/notes.md#1", &json!({ "claim_id": 2 })),
+            spoofed_source,
+            fixture_hit("claim:04", &json!({})),
+            fixture_hit("claim:4", &json!({ "claim_id": 4 })),
+        ];
+        assert_eq!(synthetic_claim_ids(&hits), [1, 2, 3, 4]);
+        let states = [
+            (1, ClaimState::Active),
+            (2, ClaimState::Retracted),
+            (4, ClaimState::Disputed),
+        ];
+        let (kept, hidden) = partition_lifecycle_hits(hits, &states);
+        assert_eq!(
+            kept.iter()
+                .map(|hit| (hit.chunk_id.as_str(), hit.source.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("claim:1", SYNTHETIC_CLAIM_SOURCE),
+                ("docs/design.md#0", "markdown"),
+                ("docs/notes.md#1", "markdown"),
+                ("claim:2", "markdown"),
+                ("claim:04", SYNTHETIC_CLAIM_SOURCE),
+                ("claim:4", SYNTHETIC_CLAIM_SOURCE),
+            ]
+        );
+        // Claim 3 no longer exists, so its orphaned chunk is hidden too.
+        assert_eq!(hidden, [2, 3]);
     }
 }

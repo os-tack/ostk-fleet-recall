@@ -457,6 +457,35 @@ pub struct ClaimMutation {
     pub idempotent_replay: bool,
     pub conflicts_opened: Vec<i64>,
     pub conflicts_resolved: Vec<i64>,
+    /// Disputed claims a detector-verified close returned to `active`. Omitted
+    /// when empty so record responses and stored receipts keep their bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims_restored: Vec<i64>,
+    /// How a lifecycle change re-evaluated the key's open v2 conflict. Absent
+    /// for record and whenever no open v2 conflict was re-evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reevaluation: Option<ConflictReevaluation>,
+}
+
+/// An owner lifecycle target: the claim and the revision the caller last read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimTarget {
+    pub claim_id: i64,
+    pub expected_revision: i64,
+}
+
+/// The detector's verdict on a key's open v2 conflict after a lifecycle change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictReevaluation {
+    pub conflict_id: i64,
+    /// `closed`, `still_open`, or `divergent` (Rust and SQL disagreed, so the
+    /// conflict was conservatively left open).
+    pub outcome: String,
+    /// The conflict revision after this mutation.
+    pub conflict_revision: i64,
+    pub remaining_pair_count: usize,
+    /// At most 32 remaining incompatible `[lower, higher]` claim id pairs.
+    pub remaining_pairs: Vec<[i64; 2]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,6 +514,94 @@ mod tests {
             valid_to: None,
             support: Vec::new(),
         }
+    }
+
+    fn record_mutation() -> ClaimMutation {
+        let at = DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        ClaimMutation {
+            operation: "record".into(),
+            claim: Claim {
+                id: 41,
+                project: "project".into(),
+                kind: ClaimKind::Fact,
+                claim_key: Some("fleet::database".into()),
+                subject: Some("fleet".into()),
+                predicate: Some("database".into()),
+                value: Some(serde_json::json!("cockroachdb")),
+                text: "The fleet database is CockroachDB.".into(),
+                polarity: 1,
+                state: ClaimState::Active,
+                origin: "operator_asserted".into(),
+                actor: Some("agent".into()),
+                confidence: 1.0,
+                valid_from: None,
+                valid_to: None,
+                superseded_by: None,
+                revision: 1,
+                conflict_eligible: true,
+                created_at: at,
+                updated_at: at,
+                support: Vec::new(),
+                conflict_ids: Vec::new(),
+            },
+            idempotent_replay: false,
+            conflicts_opened: Vec::new(),
+            conflicts_resolved: Vec::new(),
+            claims_restored: Vec::new(),
+            reevaluation: None,
+        }
+    }
+
+    #[test]
+    fn record_mutation_serialization_is_byte_stable() {
+        let encoded = serde_json::to_value(record_mutation()).unwrap();
+        let keys = encoded
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "claim",
+                "conflicts_opened",
+                "conflicts_resolved",
+                "idempotent_replay",
+                "operation",
+            ]),
+            "a record mutation must not gain lifecycle keys"
+        );
+
+        let mut retract = record_mutation();
+        retract.operation = "retract".into();
+        retract.claims_restored = vec![42];
+        retract.reevaluation = Some(ConflictReevaluation {
+            conflict_id: 9,
+            outcome: "closed".into(),
+            conflict_revision: 4,
+            remaining_pair_count: 0,
+            remaining_pairs: Vec::new(),
+        });
+        let encoded = serde_json::to_value(&retract).unwrap();
+        assert_eq!(encoded["claims_restored"], serde_json::json!([42]));
+        assert_eq!(encoded["reevaluation"]["outcome"], "closed");
+        assert_eq!(
+            serde_json::from_value::<ClaimMutation>(encoded).unwrap(),
+            retract
+        );
+    }
+
+    #[test]
+    fn old_receipts_decode_without_new_fields() {
+        let mut stored = serde_json::to_value(record_mutation()).unwrap();
+        let object = stored.as_object_mut().unwrap();
+        object.remove("claims_restored");
+        object.remove("reevaluation");
+        let decoded: ClaimMutation = serde_json::from_value(stored).unwrap();
+        assert_eq!(decoded, record_mutation());
     }
 
     #[test]

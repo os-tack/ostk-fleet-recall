@@ -249,6 +249,15 @@ model-prefixed vector index. Lexical candidates use
 `memory_chunks_lexical_idx`; application-level reciprocal-rank fusion preserves
 Recall's retrieval semantics.
 
+Every recorded claim is also projected into the corpus as a synthetic
+`claim:{id}` chunk, and that row outlives the claim's lifecycle. On the private
+writer, chunk search reads the current state of the claims behind the fused
+synthetic hits and drops those that are no longer `active` or `disputed` before
+projecting conflicts, reporting them in
+`diagnostics.retrieval.lifecycle_hidden_claim_ids`. The publication reader is
+unchanged. Claim search already filters by lifecycle state unless
+`include_history` is set.
+
 ## Deliberate-memory write path
 
 ```mermaid
@@ -284,6 +293,30 @@ transaction committed, Fleet Recall returns its stored mutation result with
 execution. This is an at-most-one durable mutation guarantee, not exactly-once
 response delivery. A changed request using the same key is rejected.
 
+`remember(retract)` runs the same receipt protocol in its own serializable
+transaction ([ADR 0004](adr/0004-serving-conflict-lifecycle.md)). A committed
+receipt replays before any precondition is checked. The transaction then reads
+the target claim and, for a conflict-eligible claim, takes locks in the record
+path's order: first the key's conflict lineage rows, the same rows record's
+detector probe locks through the `(tenant_id, project, claim_key, detector)`
+index, then the key's lifecycle-current claims in ascending id order, bounded
+at 256.
+A claim that is not conflict-eligible is locked by primary key alone. Owner
+authority (trusted actor, `operator_asserted` origin, `active` or `disputed`
+state, and the expected revision) is checked against the locked row and
+repeated in the `UPDATE`'s `WHERE` clause. When the key's v2 conflict is open,
+the detector recomputes its incompatible pairs over the claims that remain
+current, both in Rust and in SQL. If the two agree that no pair remains, the
+conflict moves to `resolved` with the server-written reason kind
+`no_current_incompatibility`, and each disputed member that no other open
+conflict of any detector still holds returns to `active`. Otherwise the
+conflict stays open; if the two pair sets differ, nothing is closed and the
+response reports `divergent`. Every transition writes a claim event, and the
+call writes exactly one keyed `claim_retracted` event. A refusal is a typed
+error returned from inside the transaction, so the receipt reservation rolls
+back with everything else and the key stays free. Races between concurrent
+lifecycle and record calls surface as `40001` and retry.
+
 ## Trust and isolation invariants
 
 1. A process is configured for exactly one tenant/project. SQL predicates and
@@ -300,6 +333,14 @@ response delivery. A changed request using the same key is rejected.
    is explicit; a partial conflict view is never labeled complete.
 6. Backend failures are logged server-side but database details are redacted
    from MCP clients.
+7. Retirement is owner-only and resolution is detector-verified. An agent can
+   retract only an `operator_asserted` claim it authored, at the revision it
+   read. No request names a conflict outcome: a conflict closes only when the
+   detector finds no incompatible lifecycle-current pair on its key, and a
+   disputed claim is restored only when no other open conflict holds it. Every
+   disputed claim therefore stays a member of at least one open conflict, and
+   every open v2 conflict keeps at least one incompatible current pair. A
+   refused lifecycle request rolls back completely and leaves no receipt.
 
 ## Scaling and failure behavior
 
@@ -336,11 +377,13 @@ response delivery. A changed request using the same key is rejected.
 ### Next product steps
 
 - Implement the reserved Recall actions. The service contract already names
-  `remember` supersede, retract, forget, restore, resolve, relate, split,
-  focus, track, and consolidate, and `recall` surface, discover, synthesize,
-  and audit; today only `remember(record)` and
-  `recall(search|get|conflicts|status)` are served, and the others return an
-  error.
+  `remember` supersede, forget, restore, resolve, relate, split, focus, track,
+  and consolidate, and `recall` surface, discover, synthesize, and audit;
+  today `remember(record|retract)` and `recall(search|get|conflicts|status)`
+  are served (with `get` covering claims, chunks, and, on the private writer,
+  conflicts), and the others return an error. Supersede, conflict
+  acknowledgement, and concession resolve are the next lifecycle steps in
+  [ADR 0004](adr/0004-serving-conflict-lifecycle.md).
 - Wire the dynamic-memory runtimes that already exist as library code into a
   worker or CLI and into MCP recall; the README's
   [built but not yet wired](../README.md#built-but-not-yet-wired) section lists

@@ -23,9 +23,14 @@ The `ostk-fleet-recall` binary has these commands:
 
 - `serve` speaks newline-delimited JSON-RPC/MCP on stdin/stdout with two tools:
   - `recall(search|get|conflicts|status)` reads the hybrid vector/lexical
-    corpus and typed-claim state.
+    corpus and typed-claim state. `get` with `kind=conflict` returns one
+    conflict by id in any state, with its members.
   - `remember(record)` records a deliberate typed claim with provenance,
     idempotent mutation receipts, and conflict detection.
+  - `remember(retract)` retires a claim the calling agent authored. When no
+    incompatible lifecycle-current pair remains on the claim's key, the
+    detector closes that key's conflict and returns its disputed members to
+    `active`.
 - `demo` serves a bounded, read-only HTTP surface (`/`, `/healthz`,
   `/api/status`, and `POST /api/recall`). It exposes no mutation route.
 - `migrate` applies the embedded CockroachDB schema migrations.
@@ -50,8 +55,19 @@ conflict with the exact members that caused it instead of silently choosing
 one. The detector compares typed propositions; it performs no natural-language
 inference.
 
+A conflict is never resolved by fiat. An agent can retract only its own
+claims, and a conflict closes only when the detector re-checks the key and finds
+no incompatible current pair left ([ADR 0004](docs/adr/0004-serving-conflict-lifecycle.md)).
+On the private writer, chunk search also drops the synthetic `claim:{id}` hits of
+claims that are no longer current and lists them in
+`diagnostics.retrieval.lifecycle_hidden_claim_ids`. Setting
+`FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` (the default is `enabled`) restores
+the record-only surface: the historical `tools/list` byte for byte and
+unfiltered chunk search. The public demo always serves that record-only
+surface.
+
 The service contract also reserves further Recall actions (for example
-`remember` supersede/retract and `recall` surface/discover) and an attention
+`remember` supersede/resolve and `recall` surface/discover) and an attention
 schema. These return an error or are unused today; see the
 [roadmap](docs/ARCHITECTURE.md#roadmap-and-open-work).
 
@@ -416,6 +432,37 @@ second durable mutation. A changed full request using that key is rejected.
 This is at-most-one committed mutation behavior, not exactly-once response
 delivery; after an ambiguous response, retry the same full request and key.
 
+To retire a claim it authored, an agent sends `remember(retract)` with the
+claim id and the revision it last read, for example from `recall` `get` with
+`kind=claim`. `reason` is an optional private audit note of at most 1,000
+bytes:
+
+```json
+{"action":"retract","idempotency_key":"readme/retract/v1","claim_id":41,"expected_revision":2,"reason":"superseded by the migration review"}
+```
+
+The response's `data` holds the retracted `claim` and `conflicts_resolved`,
+plus `claims_restored` when the close returned members to `active`. When the
+key had an open conflict, `reevaluation` says whether it `closed` or is
+`still_open` and which incompatible pairs remain. `conflicts` lists every
+affected conflict in any state. Replays follow the same idempotency rules as
+`record`, and a `record` key cannot be reused for `retract` or the other way
+round.
+
+The server checks the claim under row locks and refuses the request, before
+anything is written, when the caller is not its author (`not_owner`), the claim
+is not an `operator_asserted` assertion (`not_operator_asserted`), it is no
+longer `active` or `disputed` (`not_current`), the revision moved
+(`stale_revision`), no such claim exists in the project (`not_found`), its
+key still has only an unreconciled legacy conflict lineage
+(`legacy_lineage`), or the key has more than 256 current claims
+(`bound_exceeded`). A refusal is a JSON-RPC `invalid_params` error, never an
+unknown outcome, and it does not consume the idempotency key:
+
+```json
+{"code":-32602,"message":"remember(retract) refused: stale_revision: claim 41 is at revision 3 (disputed)","data":{"code":"stale_revision","outcome":"not_applied","retry":"nothing was committed and the idempotency_key was not consumed; re-read and send a corrected request","details":{"claim_id":41,"current_revision":3,"current_state":"disputed"}}}
+```
+
 Most stdio MCP clients use a configuration shaped like the following. Replace
 the absolute paths and digest; this example deliberately contains only local,
 insecure development credentials. Client-specific configuration file names and
@@ -490,6 +537,13 @@ the remaining rows.
   owner/tier row visibility is not implemented yet.
 - Actor provenance is derived from the trusted deployment agent. A supplied
   `remember.actor` is only an exact assertion and is stripped at the MCP edge.
+- Lifecycle authority is owner-only: `remember(retract)` changes only an
+  `operator_asserted` claim whose stored actor is the trusted deployment agent,
+  at the exact revision the caller read. No agent can resolve a conflict or
+  retire another agent's claim; a conflict closes only when the detector
+  finds no incompatible lifecycle-current pair. Every refusal rolls the whole
+  transaction back. This authority is as strong as the deployment's
+  `FLEET_RECALL_AGENT` binding over the shared writer credential.
 - MCP frames, tool results, searches, conflict projections, claim passages,
   ingestion, and HTTP bodies/results are bounded. Backend details are redacted
   from protocol errors.
@@ -592,7 +646,8 @@ is `#[ignore]` and documents its environment at the top of the file.
   itself requires no OSTK or LLM.
 - Decision records: [product/backend boundary](docs/adr/0001-product-and-backend-boundary.md),
   [Stage-4 runtime foundations](docs/adr/0002-stage4-runtime-foundations.md),
-  and [consolidation and conflict tolerance](docs/adr/0003-consolidation-and-conflict-tolerance.md).
+  [consolidation and conflict tolerance](docs/adr/0003-consolidation-and-conflict-tolerance.md),
+  and [serving conflict lifecycle](docs/adr/0004-serving-conflict-lifecycle.md).
 - [Dynamic memory contract corpus](contracts/dynamic-memory/README.md).
 
 ## Cleanup

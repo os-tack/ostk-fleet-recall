@@ -1,6 +1,25 @@
 //! Canonical Recall-compatible MCP tool descriptions.
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+
+use crate::service::RememberSurface;
+
+/// Claim-shaped `remember` properties that a non-record action must not carry.
+const CLAIM_FIELDS: [&str; 11] = [
+    "kind",
+    "text",
+    "subject",
+    "predicate",
+    "value",
+    "support",
+    "origin",
+    "polarity",
+    "confidence",
+    "valid_from",
+    "valid_to",
+];
+/// Owner-lifecycle `remember` properties that `record` must not carry.
+const CLAIM_LIFECYCLE_FIELDS: [&str; 3] = ["claim_id", "expected_revision", "reason"];
 
 fn output_schema(tool: &str) -> Value {
     json!({
@@ -185,6 +204,119 @@ pub fn tool_list() -> Vec<Value> {
     vec![recall_tool(), remember_tool()]
 }
 
+/// `recall` as served beside the given remember surface. The record-only
+/// surface is exactly [`recall_tool`]; a lifecycle surface adds
+/// `get` with `kind=conflict`.
+#[must_use]
+pub fn recall_tool_for(surface: RememberSurface) -> Value {
+    let mut tool = recall_tool();
+    if surface == RememberSurface::RECORD_ONLY {
+        return tool;
+    }
+    tool["description"] = json!(
+        "Read fleet memory without changing semantic state. Search combines lexical and dense retrieval and reports conflict coverage. get with kind=conflict returns one conflict by id in any state, with its members."
+    );
+    let schema = &mut tool["inputSchema"];
+    schema["properties"]["kind"]["enum"] = json!(["chunk", "claim", "assertion", "conflict"]);
+    if let Some(all_of) = schema["allOf"].as_array_mut() {
+        all_of.push(json!({
+            "if": {
+                "properties": { "kind": { "const": "conflict" } },
+                "required": ["kind"]
+            },
+            "then": { "properties": { "action": { "const": "get" } } }
+        }));
+    }
+    tool
+}
+
+/// `remember` restricted to the actions the surface serves. The record-only
+/// surface is exactly [`remember_tool`].
+#[must_use]
+pub fn remember_tool_for(surface: RememberSurface) -> Value {
+    let mut tool = remember_tool();
+    if !surface.claim_lifecycle {
+        return tool;
+    }
+    tool["description"] = json!(
+        "Deliberately record fleet memory or retract claims you authored. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
+    );
+    let schema = &mut tool["inputSchema"];
+    schema["properties"]["action"]["enum"] = json!(["record", "retract"]);
+    if let Some(properties) = schema["properties"].as_object_mut() {
+        properties.insert(
+            "claim_id".into(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9_007_199_254_740_991_i64,
+                "description": "retract: a claim you authored (origin operator_asserted) in state active or disputed."
+            }),
+        );
+        properties.insert(
+            "expected_revision".into(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9_007_199_254_740_991_i64,
+                "description": "retract: the claim revision you last read; a stale value is refused, not retried."
+            }),
+        );
+        properties.insert(
+            "reason".into(),
+            json!({
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000,
+                "description": "Optional private audit note for retract."
+            }),
+        );
+    }
+    let properties = schema["properties"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    schema["required"] = json!(["action", "idempotency_key"]);
+    schema["allOf"] = json!([
+        {
+            "if": { "properties": { "action": { "const": "record" } } },
+            "then": {
+                "required": ["kind", "text"],
+                "properties": forbid(&properties, &CLAIM_LIFECYCLE_FIELDS)
+            }
+        },
+        {
+            "if": { "properties": { "action": { "const": "retract" } } },
+            "then": {
+                "required": ["claim_id", "expected_revision"],
+                "properties": forbid(&properties, &CLAIM_FIELDS)
+            }
+        }
+    ]);
+    tool
+}
+
+/// The agent-facing surface for one remember surface. The record-only
+/// surface is exactly [`tool_list`].
+#[must_use]
+pub fn tool_list_for(surface: RememberSurface) -> Vec<Value> {
+    if surface == RememberSurface::RECORD_ONLY {
+        return tool_list();
+    }
+    vec![recall_tool_for(surface), remember_tool_for(surface)]
+}
+
+/// `{name: false}` for each named property this schema actually declares.
+fn forbid(properties: &Map<String, Value>, names: &[&str]) -> Value {
+    Value::Object(
+        names
+            .iter()
+            .filter(|name| properties.contains_key(**name))
+            .map(|name| ((*name).to_owned(), Value::Bool(false)))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +380,102 @@ mod tests {
         assert_eq!(
             tools[1]["inputSchema"]["properties"]["action"]["enum"],
             json!(["record"])
+        );
+    }
+
+    fn lifecycle_surface() -> RememberSurface {
+        RememberSurface {
+            claim_lifecycle: true,
+        }
+    }
+
+    #[test]
+    fn record_only_surface_is_byte_identical() {
+        let historical = tool_list();
+        let gated = tool_list_for(RememberSurface::RECORD_ONLY);
+        assert_eq!(gated, historical);
+        assert_eq!(
+            serde_json::to_vec(&gated).unwrap(),
+            serde_json::to_vec(&historical).unwrap()
+        );
+        assert_eq!(recall_tool_for(RememberSurface::RECORD_ONLY), recall_tool());
+        assert_eq!(
+            remember_tool_for(RememberSurface::RECORD_ONLY),
+            remember_tool()
+        );
+        assert_ne!(tool_list_for(lifecycle_surface()), historical);
+    }
+
+    #[test]
+    fn claim_lifecycle_surface_branches_are_exact() {
+        let tool = remember_tool_for(lifecycle_surface());
+        let schema = &tool["inputSchema"];
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!(["record", "retract"])
+        );
+        assert_eq!(schema["required"], json!(["action", "idempotency_key"]));
+        assert_eq!(schema["additionalProperties"], false);
+        for field in CLAIM_LIFECYCLE_FIELDS {
+            assert!(properties.contains_key(field), "{field} is declared");
+        }
+        // Later-slice conflict actions are not advertised on this surface.
+        for absent in ["conflict_id", "expected_member_count", "retract_claim_ids"] {
+            assert!(!properties.contains_key(absent), "{absent} is not served");
+        }
+
+        let branches = schema["allOf"].as_array().unwrap();
+        assert_eq!(branches.len(), 2);
+        let record = &branches[0];
+        assert_eq!(record["if"]["properties"]["action"]["const"], "record");
+        assert_eq!(record["then"]["required"], json!(["kind", "text"]));
+        assert_eq!(
+            record["then"]["properties"],
+            json!({ "claim_id": false, "expected_revision": false, "reason": false })
+        );
+        let retract = &branches[1];
+        assert_eq!(retract["if"]["properties"]["action"]["const"], "retract");
+        assert_eq!(
+            retract["then"]["required"],
+            json!(["claim_id", "expected_revision"])
+        );
+        let forbidden = retract["then"]["properties"].as_object().unwrap();
+        assert_eq!(forbidden.len(), CLAIM_FIELDS.len());
+        for field in CLAIM_FIELDS {
+            assert_eq!(forbidden[field], false, "retract forbids {field}");
+        }
+        // The transport-only actor assertion and scope stay valid on retract.
+        assert!(!forbidden.contains_key("actor"));
+        assert!(!forbidden.contains_key("scope"));
+        // Every branch names only declared properties.
+        for branch in branches {
+            for name in branch["then"]["properties"].as_object().unwrap().keys() {
+                assert!(properties.contains_key(name), "{name} is undeclared");
+            }
+        }
+    }
+
+    #[test]
+    fn recall_conflict_kind_is_get_only() {
+        let tool = recall_tool_for(lifecycle_surface());
+        let schema = &tool["inputSchema"];
+        assert_eq!(
+            schema["properties"]["kind"]["enum"],
+            json!(["chunk", "claim", "assertion", "conflict"])
+        );
+        let branches = schema["allOf"].as_array().unwrap();
+        assert_eq!(
+            branches[..3],
+            recall_tool()["inputSchema"]["allOf"].as_array().unwrap()[..]
+        );
+        let conflict = &branches[3];
+        assert_eq!(conflict["if"]["properties"]["kind"]["const"], "conflict");
+        assert_eq!(conflict["if"]["required"], json!(["kind"]));
+        assert_eq!(conflict["then"]["properties"]["action"]["const"], "get");
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            recall_tool()["inputSchema"]["properties"]["action"]["enum"]
         );
     }
 }

@@ -223,6 +223,20 @@ impl RememberResult {
     }
 }
 
+/// A typed, caller-correctable refusal of a memory mutation.
+///
+/// Unlike [`ServiceError::Unavailable`] or [`ServiceError::Internal`], a
+/// refusal is decided before commit: nothing was written and the request's
+/// idempotency key was not consumed, so the caller can re-read and send a
+/// corrected request, even with the same key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// Stable snake-case code, e.g. `stale_revision` or `not_owner`.
+    pub code: &'static str,
+    pub message: String,
+    pub details: Value,
+}
+
 /// Backend-neutral service failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -232,9 +246,62 @@ pub enum ServiceError {
     Unavailable(String),
     #[error("memory operation failed: {0}")]
     Internal(String),
+    #[error("memory mutation refused ({}): {}", .0.code, .0.message)]
+    Refused(Refusal),
 }
 
 pub type ServiceResult<T> = std::result::Result<T, ServiceError>;
+
+/// Which `remember` actions a service instance serves.
+///
+/// The MCP edge advertises exactly this surface in `tools/list`, and the
+/// service refuses anything outside it before any I/O. [`Self::RECORD_ONLY`]
+/// is the historical surface and produces the historical tool schema
+/// byte-for-byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct RememberSurface {
+    /// Owner retirement of authored claims (`retract`).
+    pub claim_lifecycle: bool,
+}
+
+impl RememberSurface {
+    pub const RECORD_ONLY: Self = Self {
+        claim_lifecycle: false,
+    };
+
+    /// Whether this surface serves `action`. `record` is always served; the
+    /// remaining non-lifecycle actions keep their own dispatch outcome.
+    #[must_use]
+    pub const fn allows(self, action: RememberAction) -> bool {
+        match action {
+            RememberAction::Record => true,
+            RememberAction::Retract => self.claim_lifecycle,
+            _ => false,
+        }
+    }
+}
+
+/// Refuse a lifecycle action the surface does not serve, before any I/O.
+///
+/// Actions outside the lifecycle vocabulary pass through unchanged so their
+/// existing outcomes (for example the fenced `assert` route) are preserved.
+pub fn authorize_surface(surface: RememberSurface, action: RememberAction) -> ServiceResult<()> {
+    let lifecycle_action = matches!(
+        action,
+        RememberAction::Retract | RememberAction::Supersede | RememberAction::Resolve
+    );
+    if !lifecycle_action || surface.allows(action) {
+        return Ok(());
+    }
+    Err(ServiceError::Refused(Refusal {
+        code: "lifecycle_unavailable",
+        message: format!(
+            "remember({}) is not served by this deployment",
+            action.as_str()
+        ),
+        details: serde_json::json!({ "action": action.as_str() }),
+    }))
+}
 
 /// Recall-only capability used by publication adapters.
 ///
@@ -270,6 +337,11 @@ pub trait FleetMemoryService: Send + Sync {
         scope: FleetScope,
         request: RememberRequest,
     ) -> ServiceResult<RememberResult>;
+
+    /// The `remember` actions this instance serves; see [`RememberSurface`].
+    fn remember_surface(&self) -> RememberSurface {
+        RememberSurface::RECORD_ONLY
+    }
 }
 
 #[async_trait]
@@ -317,6 +389,44 @@ mod tests {
             serde_json::to_value(RememberAction::Assert).unwrap(),
             Value::String("assert".into())
         );
+    }
+
+    #[test]
+    fn authorize_surface_refuses_before_io() {
+        for action in [
+            RememberAction::Retract,
+            RememberAction::Supersede,
+            RememberAction::Resolve,
+        ] {
+            let Err(ServiceError::Refused(refusal)) =
+                authorize_surface(RememberSurface::RECORD_ONLY, action)
+            else {
+                panic!(
+                    "{} must be refused on the record-only surface",
+                    action.as_str()
+                );
+            };
+            assert_eq!(refusal.code, "lifecycle_unavailable");
+            assert_eq!(refusal.details["action"], action.as_str());
+        }
+        let lifecycle = RememberSurface {
+            claim_lifecycle: true,
+        };
+        assert!(authorize_surface(lifecycle, RememberAction::Retract).is_ok());
+        // Supersede and resolve are not served by this surface yet.
+        assert!(authorize_surface(lifecycle, RememberAction::Supersede).is_err());
+        assert!(authorize_surface(lifecycle, RememberAction::Resolve).is_err());
+        // Record and non-lifecycle actions keep their own dispatch outcome.
+        for surface in [RememberSurface::RECORD_ONLY, lifecycle] {
+            for action in [
+                RememberAction::Record,
+                RememberAction::Assert,
+                RememberAction::Forget,
+            ] {
+                assert!(authorize_surface(surface, action).is_ok());
+            }
+        }
+        assert_eq!(RememberSurface::default(), RememberSurface::RECORD_ONLY);
     }
 
     #[test]
