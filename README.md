@@ -27,6 +27,16 @@ The `ostk-fleet-recall` binary has these commands:
     conflict by id in any state, with its members and its lifecycle history.
     Every conflict the private writer returns carries a `lifecycle` overlay:
     who acknowledged or waived it, and who closed it and how.
+  - `recall(search|get, kind=evidence)` searches the connector evidence the
+    [memory worker](#memory-worker) admits (git history, agent transcripts,
+    CI runs). It is served wherever migration 30 is applied and the writer
+    login holds the Stage-5 grants; elsewhere `tools/list` is unchanged.
+    Every answer carries readiness, each source's status and newest coverage
+    cursor, and an absence verdict: `absent` only when nothing matched over a
+    current lexical tier with every source healthy, fresh, and completely
+    covered, otherwise `unknown` with the reasons. `recall(status)` then adds
+    an `evidence` block
+    ([ADR 0006](docs/adr/0006-stage5-worker-and-evidence-recall.md)).
   - `remember(record)` records a deliberate typed claim with provenance,
     idempotent mutation receipts, and conflict detection.
   - `remember(retract)` retires a claim the calling agent authored. When no
@@ -196,6 +206,23 @@ set `first_run_number` near its current run number. Otherwise the source fails
 with an error naming the lowest value the listing can reach. The worker never
 skips runs on its own, and runs below `first_run_number` are never read.
 
+A scope has exactly one sources file, and all of its ingest runs from one
+host. When all three ingest steps run, the worker retires every active status
+row whose instance its sources file does not configure. Two sources files for
+one scope, say git and CI on one host and transcripts on another, would
+retire each other's sources, and evidence recall would then vouch for an
+empty answer from one host's sources alone.
+
+The `project` step decrypts each governed content object with
+`FLEET_RECALL_CONTENT_KEK_HEX` and writes its bytes in plaintext to
+`memory_body_objects_v1`. The writer login, and so `serve`, can read that
+table without the key. Once a body is projected, the key no longer limits
+who can read it, and destroying the key no longer erases it: erasure must
+also purge the body rows and the lexical and dense rows derived from them.
+Git ingress redaction is deferred, so git bodies are raw commit text. The
+lexical tier's recall text, which is all evidence recall returns, is
+redacted; the body bytes are not.
+
 There is no long-running loop, so `--once` is required. Schedule the command
 with cron, a systemd timer, or a scheduled task, and run one worker per scope
 at a time. For example, with the environment above in the crontab:
@@ -212,8 +239,10 @@ exists as library code with live CockroachDB tests, but no serving binary runs
 it:
 
 - the Stage-4 evidence ledger (`src/evidence_ledger`): accepted-event append,
-  ingress quarantine, the envelope-encrypted governed content store, and the
-  writer-authority witness;
+  ingress quarantine, the envelope-encrypted governed content store (whose
+  protection ends at projection: the worker's `project` step writes bodies in
+  plaintext, see [memory worker](#memory-worker)), and the writer-authority
+  witness;
 - relation projection (`src/relation_projection`);
 - connectors for git history, agent transcripts, and CI runs
   (`src/connectors`);
@@ -224,8 +253,8 @@ it:
   projection's `EmbeddingProvider` seam;
 - the coverage runtime (`src/coverage_runtime`);
 - the memory worker (`src/worker`), which the `worker --once` subcommand runs
-  (see [memory worker](#memory-worker)). Its projections are written, but no
-  MCP recall reads them yet;
+  (see [memory worker](#memory-worker)). `serve` reads its projections
+  through evidence recall;
 - the evidence recall read library (`src/evidence_recall`) over those
   projections: a search returns hits with a snippet of recall text, readiness
   (evidence waiting for projection, transcript turns waiting in the outbox,
@@ -234,7 +263,8 @@ it:
   matched over a current lexical tier with every source healthy, fresh, and
   completely covered, and `unknown`, with reasons, otherwise.
   `probe_evidence_recall` gates it on migration 30 and SELECT on every table
-  it reads. `serve` does not construct it yet;
+  it reads. `serve` answers `recall(kind=evidence)` through it wherever the
+  probe passes ([ADR 0006](docs/adr/0006-stage5-worker-and-evidence-recall.md));
 - the normative activation, observer, and discrepancy runtimes
   (`src/normative_runtime`, `src/observer_runtime`,
   `src/discrepancy_runtime`); only the observer has a runner, the private
@@ -256,7 +286,6 @@ Wiring this plane into the product needs, at minimum:
   `fleet_runtime` the tables from migrations 19–27 and 29–31; see
   [MIGRATIONS.md](docs/MIGRATIONS.md#privilege-separation)), and a content
   key-encryption key for the governed content store;
-- MCP recall serving the evidence recall library (`recall(kind=evidence)`);
 - a lighter writer-authority seam: evidence appends are authorized through the
   `memory_writer_authority_v1` view, whose rows only the signed registry
   ceremony writes today.

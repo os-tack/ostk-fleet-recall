@@ -109,6 +109,15 @@ source that fails on every tick still reports. When all three ingest steps
 run, rows for instances the sources file no longer configures become
 `retired` and leave every evidence answer.
 
+Retirement treats one sources file as owning the whole scope: the table
+records no owner, so a run retires every active row its file does not name.
+A scope therefore has exactly one sources file, and its ingest runs from one
+host. Two files for one scope (git and CI on one host, transcripts on
+another) would retire each other's sources on every run, and evidence
+recall would vouch for an empty answer from one host's sources alone.
+Owner-scoped retirement needs an owner column, that is a new migration, and
+is deferred.
+
 A source is **stale** when `statement_timestamp() - last_checked_at` exceeds
 its `stale_after_seconds`: 86400 by default, overridable per source, bounded
 to `[60, 31536000]`. Freshness comes from this row, not from the cursor: a git
@@ -135,6 +144,13 @@ no foreign key and is never granted to the publication reader.
   check exists (`source_never_checked`) and is not stale (`source_stale`), and
   its newest coverage cursor is complete (`incomplete_coverage`);
 - the source listing (at most 256) was not cut (`listing_truncated`).
+
+Each transcript file is its own source (D1), so a transcript directory with
+more than 256 session files makes every empty answer `unknown`
+(`listing_truncated`), and every search answer carries the full listing, up
+to 256 sources. A compact search summary, with the verdict's source
+conditions computed over every active row rather than over the capped
+listing, is deferred.
 
 The dense tier never blocks `absent`: its lag is reported, not required. The
 verdict's `as_of` is the oldest last completed check among the active
@@ -244,6 +260,31 @@ and can be recalled; their media type,
 `memory.claim.accepted` events are not evidence events and never reach the
 body plane.
 
+## D9 — Projection writes governed content in plaintext
+
+**Decision.** The worker's `project` step builds the body plane from the
+governed content store: it unwraps each content object with the body key
+(`FLEET_RECALL_CONTENT_KEK_HEX`) and writes the decrypted bytes to
+`memory_body_objects_v1.body_bytes`, because the lexical and dense projectors
+read bodies, not ciphertext. That table is readable by the writer login
+(`fleet_runtime`, `serve` included) without the key.
+
+- Once a body is projected, the key no longer limits who can read that
+  evidence. The writer login alone can read every projected git, CI, and
+  transcript body, including anything secret-shaped in it: git ingress
+  redaction is deferred, so git bodies are raw commit text.
+- Destroying the key no longer erases projected evidence. Erasure must also
+  purge `memory_body_objects_v1` and the lexical and dense rows derived from
+  it.
+- What evidence recall returns is unaffected (D5): snippets and fetched text
+  are the lexical tier's redacted recall text, never `body_bytes`.
+
+The envelope encryption of the governed content store therefore protects
+content until projection. A deployment that needs key-scoped confidentiality
+after ingest must not run the `project` step, which leaves evidence recall
+nothing to search. Only the owner can delete body rows; `fleet_runtime`
+holds no `DELETE` on them.
+
 ## Consequences
 
 - An agent can ask whether the fleet's own history, transcripts, or CI runs
@@ -261,4 +302,8 @@ the production image; changed-path and incremental git scans and a git ingress
 redactor; transcript tool-use, tool-result, and thinking records;
 publication-plane evidence recall; fusing evidence into chunk recall;
 registering the coverage labels in a package; dense or semantic absence
-verdicts and an evidence-specific dense floor; query-centred snippets.
+verdicts and an evidence-specific dense floor; query-centred snippets;
+owner-scoped source retirement (D3); a compact search source summary and a
+verdict over every active source (D4); reporting a CI run in flight above
+the settled mark (D2); a readiness cache or counting index (D5); a re-embed
+step (D6); a body plane that stays encrypted at rest (D9).

@@ -515,13 +515,14 @@ and exact grant matrix), then restart `serve`.
   `record` itself still re-disputes the members of a dismissed pair when a new
   incompatible claim reopens their conflict, and waivers are unsigned and
   cannot be revoked early.
-- Wire the dynamic-memory projections into MCP recall. The
-  `ostk-fleet-recall worker --once` subcommand already runs the Stage-5
-  connectors and projectors, and the evidence recall library
-  (`src/evidence_recall`) reads what they write with readiness, coverage, and
-  an absence verdict, but no MCP recall path serves it yet. The
-  README's [built but not yet wired](../README.md#built-but-not-yet-wired)
-  section lists what that needs.
+- Extend evidence recall. The `ostk-fleet-recall worker --once` subcommand
+  runs the Stage-5 connectors and projectors, and `serve` answers
+  `recall(kind=evidence)` over what they write, with readiness, coverage, and
+  an absence verdict ([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)).
+  Publication-plane evidence recall, fusing evidence into chunk recall, and
+  the rest of ADR 0006's deferred list remain; the README's
+  [built but not yet wired](../README.md#built-but-not-yet-wired) section
+  lists what the rest of the plane needs.
 - Package Fleet Recall as an optional OSTK Recall plugin/backend.
 - Add authenticated workload identity and dynamic multi-project routing
   without trusting MCP parameters.

@@ -697,8 +697,9 @@ unregistered compile-time labels `coverage.freshness.worker_tick` and
 `evidence.accepted` event in the scope, so observer-run records become bodies
 as well, indexed over their raw bytes.
 
-Evidence recall (`src/evidence_recall`) is the read side of this plane, a
-library that serving does not construct yet. A search runs the lexical lane
+Evidence recall (`src/evidence_recall`) is the read side of this plane, which
+`serve` answers as `recall(kind=evidence)` wherever migration 30 is applied
+and the writer login holds the Stage-5 grants (ADR 0006). A search runs the lexical lane
 and, when the process embeds with the model the dense tier was built with, the
 dense lane (a dense match below the chunk lane's 0.18 cosine floor does not
 count), and hydrates each hit with a bounded snippet of the lexical tier's
@@ -717,7 +718,8 @@ drained slice; freshness comes from the status row. The sources are read before
 readiness, and readiness before the lanes, so a verdict never rests on a
 projection newer than the one it counted. A startup probe gates the library on
 migration 30 and SELECT on every table it reads, and disables the dense lane
-when the dense tier holds another model's vectors.
+when the dense tier holds another model's vectors; every dense query also
+compares the query vector only with vectors the serving model embedded.
 
 `ostk-fleet-recall worker --once` runs one tick as the private writer login and
 prints its report as one JSON line. It exits 1 when any step failed. Before the
@@ -727,8 +729,9 @@ command (cron or a scheduled task). The git and CI steps shell out to `git` and
 `gh`, which the production image does not carry, so ingest runs on a host;
 projection and embedding can run in the container.
 
-None of these modules is reachable from the serving process; outside tests,
-only the worker subcommand and `ostk-observer-run` run any of them. The accepted-event append seam
+Apart from evidence recall, which `serve` reads, none of these modules is
+reachable from the serving process; outside tests, only the worker subcommand
+and `ostk-observer-run` run any of them. The accepted-event append seam
 they use is the Stage-4 one, unchanged. There
 is still no webhook, no transport queue, no remote connector cursor, no
 dead-letter path for a remote delivery, and no acknowledgement protocol:
