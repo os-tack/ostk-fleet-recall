@@ -1511,6 +1511,7 @@ fn empty_object() -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1518,6 +1519,9 @@ mod tests {
 
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use ostk_fleet_recall::private_postgres::{
+        MIGRATOR_POSTGRES_USER, PUBLICATION_POSTGRES_USER, WRITER_POSTGRES_USER,
+    };
     use ostk_fleet_recall::service::ServiceResult;
     use ostk_recall_core::PrivacyTier;
     use tower::ServiceExt as _;
@@ -1566,6 +1570,148 @@ mod tests {
             .runtime_database_identity(),
             RuntimeDatabaseIdentity::None
         );
+    }
+
+    /// The README's shell blocks replayed in order as one session: plain and
+    /// exported assignments with `${name}` expansion, `unset`, and whether the
+    /// checked-in boundary helper has run. That helper retires
+    /// `fleet_migrator`, and only then provisions and enables `fleet_writer`
+    /// and `fleet_publication`.
+    #[derive(Default)]
+    struct QuickstartShell {
+        variables: HashMap<String, String>,
+        boundary_established: bool,
+    }
+
+    impl QuickstartShell {
+        fn run(&mut self, line: &str) {
+            let line = line.trim();
+            if line.starts_with('#') {
+                return;
+            }
+            if line.contains("deploy/localstack/database-boundary.sh") {
+                self.boundary_established = true;
+            }
+            if let Some(names) = line.strip_prefix("unset ") {
+                for name in names.split_whitespace() {
+                    self.variables.remove(name);
+                }
+                return;
+            }
+            let assignment = line.strip_prefix("export ").unwrap_or(line);
+            if let Some((name, value)) = assignment.split_once('=')
+                && !name.is_empty()
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+            {
+                let value = self.expand(value.trim_matches(['"', '\'']));
+                self.variables.insert(name.to_owned(), value);
+            }
+        }
+
+        fn expand(&self, value: &str) -> String {
+            let mut expanded = String::new();
+            let mut rest = value;
+            while let Some((before, after)) = rest.split_once("${") {
+                let (name, tail) = after
+                    .split_once('}')
+                    .expect("every shell expansion is closed");
+                expanded.push_str(before);
+                expanded.push_str(self.variables.get(name).map_or("", String::as_str));
+                rest = tail;
+            }
+            expanded.push_str(rest);
+            expanded
+        }
+
+        /// The login the database URL in `variable` authenticates as.
+        fn login(&self, variable: &str) -> Option<String> {
+            let url = self.variables.get(variable)?;
+            let options = url
+                .parse::<sqlx::postgres::PgConnectOptions>()
+                .unwrap_or_else(|error| panic!("{variable} is not a PostgreSQL URL: {error}"));
+            Some(options.get_username().to_owned())
+        }
+
+        /// Whether `login` can authenticate at this point of the session.
+        fn login_is_enabled(&self, login: &str) -> bool {
+            if login == MIGRATOR_POSTGRES_USER {
+                !self.boundary_established
+            } else {
+                self.boundary_established
+            }
+        }
+    }
+
+    /// Every `"$FLEET_RECALL_BIN"` command the README runs must, at that point
+    /// of the walkthrough, have a database URL for the login its identity
+    /// requires, and that login must be able to authenticate. A writer
+    /// command run with the migrator URL, or before the boundary helper
+    /// provisions `fleet_writer`, stops the quickstart.
+    #[test]
+    fn readme_runs_each_command_as_an_enabled_login_of_its_identity() {
+        let mut shell = QuickstartShell::default();
+        let mut identities_run = Vec::new();
+        let mut fence: Option<&str> = None;
+        for (index, line) in include_str!("../README.md").lines().enumerate() {
+            let line_number = index + 1;
+            if let Some(info) = line.strip_prefix("```") {
+                fence = if fence.is_some() { None } else { Some(info) };
+                continue;
+            }
+            if fence != Some("bash") {
+                continue;
+            }
+            shell.run(line);
+            let Some(arguments) = line.trim().strip_prefix("\"$FLEET_RECALL_BIN\" ") else {
+                continue;
+            };
+            let arguments = arguments
+                .split_whitespace()
+                .take_while(|word| !word.starts_with(['<', '>', '&', '|', ';', ')']));
+            let cli = Cli::try_parse_from(std::iter::once("ostk-fleet-recall").chain(arguments))
+                .unwrap_or_else(|error| panic!("README line {line_number}: {error}"));
+            let identity = cli.command.runtime_database_identity();
+            let (variable, login) = match identity {
+                RuntimeDatabaseIdentity::None => continue,
+                RuntimeDatabaseIdentity::Migrator => {
+                    ("FLEET_RECALL_DATABASE_URL", MIGRATOR_POSTGRES_USER)
+                }
+                RuntimeDatabaseIdentity::Writer => {
+                    ("FLEET_RECALL_DATABASE_URL", WRITER_POSTGRES_USER)
+                }
+                RuntimeDatabaseIdentity::Publication => {
+                    assert_eq!(
+                        shell.login("FLEET_RECALL_DATABASE_URL"),
+                        None,
+                        "README line {line_number}: the public demo refuses a private URL"
+                    );
+                    (
+                        "FLEET_RECALL_PUBLICATION_DATABASE_URL",
+                        PUBLICATION_POSTGRES_USER,
+                    )
+                }
+            };
+            assert_eq!(
+                shell.login(variable).as_deref(),
+                Some(login),
+                "README line {line_number}: a {identity:?} command needs {variable} as {login}"
+            );
+            assert!(
+                shell.login_is_enabled(login),
+                "README line {line_number}: {login} cannot authenticate at this step"
+            );
+            identities_run.push(identity);
+        }
+        for identity in [
+            RuntimeDatabaseIdentity::Migrator,
+            RuntimeDatabaseIdentity::Writer,
+            RuntimeDatabaseIdentity::Publication,
+        ] {
+            assert!(
+                identities_run.contains(&identity),
+                "the README never runs a {identity:?} command"
+            );
+        }
     }
 
     #[derive(Default)]

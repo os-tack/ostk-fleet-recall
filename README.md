@@ -340,7 +340,7 @@ Fleet Recall accepts an insecure database URL only when
 Compose-only `cockroach` hostname). Production configuration must omit that
 escape hatch and use `sslmode=verify-full`.
 
-### 3. Migrate and ingest through the private capability
+### 3. Migrate through the private schema capability
 
 Set every required runtime coordinate. Tenant, project, and agent are
 deployment authority, not request routing fields. The sample tenant is non-nil;
@@ -360,14 +360,11 @@ export FLEET_RECALL_EMBEDDING_MODEL_PATH="$FLEET_RECALL_MODEL_DIR"
 export RUST_LOG=ostk_fleet_recall=info
 ```
 
-This private URL is the only database capability in the process while it
-applies the embedded schema and loads the included non-sensitive corpus. Do not
-start the public demo yet:
+This migrator URL is the only database capability in the process while it
+applies the embedded schema. Do not start the public demo yet:
 
 ```bash
 "$FLEET_RECALL_BIN" migrate
-"$FLEET_RECALL_BIN" ingest --input examples/demo.ndjson
-"$FLEET_RECALL_BIN" health
 ```
 
 `migrate` applies every embedded migration in [`migrations/`](migrations) in
@@ -380,7 +377,11 @@ substitute for that policy. See
 [migration and recovery rules](docs/MIGRATIONS.md) before recovering a failed
 migration.
 
-### 4. Establish the publication boundary and exercise the HTTP demo
+`migrate` is the only command that authenticates as `fleet_migrator`.
+`ingest`, `health`, and `serve` accept only the private `fleet_writer` login,
+which does not exist until the next step provisions it.
+
+### 4. Establish the database boundary and load the corpus as the writer
 
 The checked-in boundary helper retires the migrator login, provisions the
 private `fleet_writer` and the fixed `fleet_publication` login, applies the
@@ -392,7 +393,26 @@ instead:
 ```bash
 docker exec --interactive ostk-fleet-recall-crdb \
   /bin/sh -s < deploy/localstack/database-boundary.sh
+```
 
+Replace the retired migrator URL with the DML-only writer the helper
+provisioned, and keep every other coordinate from step 3. Load the included
+non-sensitive corpus and check readiness as that writer:
+
+```bash
+local_writer_password=local-writer-only
+export FLEET_RECALL_DATABASE_URL="${local_pg_scheme}://fleet_writer:${local_writer_password}@127.0.0.1:26257/fleet_recall?sslmode=disable"
+
+"$FLEET_RECALL_BIN" ingest --input examples/demo.ndjson
+"$FLEET_RECALL_BIN" health
+```
+
+### 5. Exercise the HTTP demo
+
+The public demo refuses to start while a private database URL is set. Remove
+the writer URL and give it only the fixed publication login:
+
+```bash
 unset FLEET_RECALL_DATABASE_URL
 local_publication_password=local-publication-only
 export FLEET_RECALL_PUBLICATION_DATABASE_URL="${local_pg_scheme}://fleet_publication:${local_publication_password}@127.0.0.1:26257/fleet_recall?sslmode=disable"
@@ -442,13 +462,14 @@ the corpus and link every repository-backed documentation or code chunk to the
 immutable source commit and exact inclusive line range recorded at ingestion;
 synthetic records without a checked-in source stay visibly unlinked.
 
-### 5. Exercise the MCP server
+### 6. Exercise the MCP server
 
 `serve` speaks newline-delimited JSON-RPC/MCP on stdin/stdout. The following is
 a complete direct smoke exchange. Keep each JSON request on one physical line;
 the initialized notification intentionally has no response. The public
-capability is removed first because MCP includes the private `remember` tool;
-the boundary helper provisioned this DML-only writer without DDL authority.
+capability is removed first and the step 4 writer URL restored, because MCP
+includes the private `remember` tool; the boundary helper provisioned this
+DML-only writer without DDL authority.
 
 ```bash
 unset FLEET_RECALL_PUBLICATION_DATABASE_URL
