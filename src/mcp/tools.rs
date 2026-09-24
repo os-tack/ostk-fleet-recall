@@ -239,7 +239,7 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
         return tool;
     }
     tool["description"] = json!(
-        "Deliberately record fleet memory, or supersede or retract claims you authored. A successor keeps its predecessor's kind, subject/predicate key, and value presence. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
+        "Deliberately record fleet memory, or supersede or retract claims you authored. A successor keeps its predecessor's kind, subject/predicate key, and conflict eligibility: a keyed decision, fact, constraint, preference, or procedure keeps carrying a value, and a valueless one gains none. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
     );
     let schema = &mut tool["inputSchema"];
     schema["properties"]["action"]["enum"] = json!(["record", "supersede", "retract"]);
@@ -287,7 +287,7 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
         },
         {
             // The successor carries record's claim fields; the server refuses
-            // one whose kind, normalized key, or value presence differs.
+            // one whose kind, normalized key, or conflict eligibility differs.
             "if": { "properties": { "action": { "const": "supersede" } } },
             "then": { "required": ["claim_id", "expected_revision", "kind", "text"] }
         },

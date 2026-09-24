@@ -852,6 +852,48 @@ mod tests {
     }
 
     #[test]
+    fn successor_value_matters_only_where_it_changes_eligibility() {
+        let value = || Some(json!("cockroachdb"));
+        // Outside the detector a successor may add or drop a value: neither
+        // side is conflict-eligible, so nothing leaves or enters its view.
+        for kind in [
+            ClaimKind::Note,
+            ClaimKind::Observation,
+            ClaimKind::OpenQuestion,
+        ] {
+            let with = shape_of(&claim_input(kind, Some("fleet-memory"), value()));
+            let without = shape_of(&claim_input(kind, Some("fleet-memory"), None));
+            assert!(check_successor(41, &with, &without).is_ok(), "{kind:?}");
+            assert!(check_successor(41, &without, &with).is_ok(), "{kind:?}");
+        }
+        for kind in [
+            ClaimKind::Decision,
+            ClaimKind::Fact,
+            ClaimKind::Constraint,
+            ClaimKind::Preference,
+            ClaimKind::Procedure,
+        ] {
+            let keyless_with = shape_of(&claim_input(kind, None, value()));
+            let keyless_without = shape_of(&claim_input(kind, None, None));
+            assert!(check_successor(41, &keyless_with, &keyless_without).is_ok());
+            assert!(check_successor(41, &keyless_without, &keyless_with).is_ok());
+
+            // A keyed claim of a detector kind keeps its value presence.
+            let with = shape_of(&claim_input(kind, Some("fleet-memory"), value()));
+            let without = shape_of(&claim_input(kind, Some("fleet-memory"), None));
+            for (predecessor, successor) in [(&with, &without), (&without, &with)] {
+                assert_eq!(
+                    check_successor(41, predecessor, successor)
+                        .unwrap_err()
+                        .code,
+                    RefusalCode::SuccessorEligibilityMismatch,
+                    "{kind:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn classify_lineages_matches_write_probe_rules() {
         let v2 = (9, V2_DETECTOR_CLASS, "open".to_owned(), 3);
         let legacy = (4, LEGACY_DETECTOR_CLASS, "open".to_owned(), 1);

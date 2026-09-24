@@ -32,7 +32,7 @@ The `ostk-fleet-recall` binary has these commands:
     detector closes that key's conflict and returns its disputed members to
     `active`.
   - `remember(supersede)` replaces a claim the calling agent authored with a
-    successor of the same kind, key, and value presence. The predecessor
+    successor of the same kind, key, and conflict eligibility. The predecessor
     becomes `superseded` and names its successor, which the detector checks
     like any recorded claim: a compatible successor lets the key's conflict
     close, and an incompatible one takes its predecessor's place in it.
@@ -473,12 +473,18 @@ To replace a claim it authored instead, an agent sends `remember(supersede)`
 with the same `claim_id`, `expected_revision`, and optional `reason`, plus the
 successor's `record` fields. The successor must keep the predecessor's `kind`,
 its `subject`/`predicate` key after normalization (so `Fleet Store` matches
-`fleet-store`), and whether it carries a `value`, so a supersede can change what
-a claim says but can never move it off its key or out of the detector's view:
+`fleet-store`), and its conflict eligibility, so a supersede can change what a
+claim says but can never move it off its key or out of the detector's view:
 
 ```json
 {"action":"supersede","idempotency_key":"readme/supersede/v1","claim_id":41,"expected_revision":2,"reason":"the migration review chose a single migrator","kind":"decision","text":"Fleet schema migration runs through one dedicated migrator job.","subject":"fleet deployment","predicate":"migration strategy","value":"single dedicated migrator job"}
 ```
+
+A claim is conflict-eligible when it has a key, a `value`, and a `decision`,
+`fact`, `constraint`, `preference`, or `procedure` kind. A keyed claim of those
+kinds must therefore keep carrying a `value`, and a valueless one must not gain
+one. The detector never compares a `note`, `observation`, or `open_question`,
+or any keyless claim, so its successor may add or drop a `value`.
 
 In the response, `data.claim` is the new successor and `data.superseded` is the
 predecessor as the mutation left it: `{id, state:"superseded", revision,
@@ -492,7 +498,7 @@ its conflicts, and `recall` `get` with `kind=claim` shows its `superseded_by`.
 
 A supersede is refused for the same reasons as a retract, and also when the
 successor changes the kind (`successor_kind_mismatch`), the normalized key
-(`successor_key_mismatch`), or whether the claim carries a value
+(`successor_key_mismatch`), or the conflict eligibility
 (`successor_eligibility_mismatch`). A malformed successor is an ordinary
 `invalid_params` error, exactly as for `record`.
 
