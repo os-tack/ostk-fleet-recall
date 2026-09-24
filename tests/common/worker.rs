@@ -296,6 +296,19 @@ impl WorkerFixture {
 
     /// A worker running `steps` over `pool` (the owner, or a probe login).
     pub async fn worker(&self, pool: &PgPool, steps: &str) -> MemoryWorker {
+        self.worker_with(pool, steps, &self.sources_json(), Arc::new(RecordedCi))
+            .await
+    }
+
+    /// A worker running `steps` over `pool` with the sources file `sources`
+    /// and the CI providers `ci_providers`.
+    pub async fn worker_with(
+        &self,
+        pool: &PgPool,
+        steps: &str,
+        sources: &serde_json::Value,
+        ci_providers: Arc<dyn CiProviderFactory>,
+    ) -> MemoryWorker {
         let embedding = ChunkEmbedderProvider::new(
             Arc::new(StubEmbedder),
             Sha256Digest::from_bytes(STUB_MODEL_DIGEST),
@@ -306,9 +319,10 @@ impl WorkerFixture {
                 pool: pool.clone(),
                 scope: self.installed.scope.clone(),
                 authority: Some(self.installed.runtime(pool).await),
-                sources: self.sources(),
+                sources: WorkerSourcesV1::from_json_slice(&serde_json::to_vec(sources).unwrap())
+                    .expect("the sources file is valid"),
                 embedding: Some(Arc::new(embedding)),
-                ci_providers: Arc::new(RecordedCi),
+                ci_providers,
                 retry: retry_policy(),
             },
             parse_steps(steps).unwrap(),

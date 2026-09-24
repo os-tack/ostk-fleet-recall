@@ -70,6 +70,9 @@ cursor of an instance says something checkable:
   is `[lowest pending ordinal, next ordinal)`. A tick that stages new turns
   opens a new domain, so the newest cursor says the newest drained slice is
   complete, not that the whole file is; older slices keep their own cursors.
+  The file is read in windows of `window_bytes`; a line longer than the
+  window fails the source (it never reads as `unchanged`), and a tick whose
+  collection fails still drains the turns earlier windows staged.
 - **CI** reads from the run after the highest measured window up to the
   provider's settled high-water mark (the highest run below the lowest run
   not yet completed), and the domain's target is that run range.

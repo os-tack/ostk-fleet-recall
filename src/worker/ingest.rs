@@ -27,10 +27,11 @@ use crate::connectors::git::{
     drain_git_facts, git_coverage_observation,
 };
 use crate::connectors::transcript::{
-    CockroachTranscriptOutboxRepository, RedactionGuaranteeV1, TranscriptCollectionRequestV1,
-    TranscriptConnectorBindingV1, TranscriptCoverageBindingV1, TranscriptDrainModeV1,
-    TranscriptDrainRequest, TranscriptEnqueueOutcome, TranscriptIngressClocksV1,
-    TranscriptOutboxRepository as _, collect_batch, drain_source_outbox, transcript_parser_key_v2,
+    CockroachTranscriptOutboxRepository, MAX_TRANSCRIPT_BYTES, RedactionGuaranteeV1,
+    TranscriptCollectionRequestV1, TranscriptConnectorBindingV1, TranscriptCoverageBindingV1,
+    TranscriptDrainModeV1, TranscriptDrainRequest, TranscriptEnqueueOutcome,
+    TranscriptIngressClocksV1, TranscriptOutboxRepository as _, collect_batch, drain_source_outbox,
+    transcript_parser_key_v2,
 };
 use crate::coverage_runtime::{
     CockroachCoverageRuntimeRepository, CoverageObservationOutcome, CoverageRuntimeRepository as _,
@@ -683,15 +684,25 @@ impl Ingest<'_> {
         );
         let collected = self
             .collect_transcript(active, guarantee, file, instance, &outbox, counters)
-            .await?;
+            .await;
+        // The drain runs even when collection failed: turns an earlier window
+        // or tick staged are durable, and a bad later line must not strand
+        // them in the outbox, where every evidence answer would count them as
+        // pending. The source still reports the collection failure.
         let drained = self
             .drain_transcript(active, verified, file, &outbox, counters)
-            .await?;
-        Ok(if collected || drained {
-            WorkerSourceOutcomeV1::Ok
-        } else {
-            WorkerSourceOutcomeV1::Unchanged
-        })
+            .await;
+        match (collected, drained) {
+            (Ok(collected), Ok(drained)) => Ok(if collected || drained {
+                WorkerSourceOutcomeV1::Ok
+            } else {
+                WorkerSourceOutcomeV1::Unchanged
+            }),
+            (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+            (Err(collect), Err(drain)) => Err(format!(
+                "{collect}; draining its staged turns also failed: {drain}"
+            )),
+        }
     }
 
     /// Stage every complete line past the durable cursor, window by window.
@@ -772,21 +783,27 @@ impl Ingest<'_> {
                 "records_skipped",
                 u64::from(stats.records_skipped),
             );
-            match outbox.enqueue_batch(&batch).await.map_err(describe)? {
-                TranscriptEnqueueOutcome::Enqueued { rows_written, .. } => {
-                    add(counters, "turns_staged", rows_written);
-                }
-                TranscriptEnqueueOutcome::AlreadyCovered { .. } => break,
-            }
+            // A window that holds no complete line moves nothing. Decided
+            // before the enqueue, which would answer `AlreadyCovered` for a
+            // cursor that did not move and so hide a line no window can hold.
             if batch.cursor.byte_offset <= resume {
                 if window_end < data.len() {
                     return Err(format!(
-                        "{source_id} has a line longer than window_bytes ({}) at byte {resume}",
+                        "{source_id} has a line longer than window_bytes ({}) at byte {resume}; \
+                         nothing past it is read until its transcript group's window_bytes \
+                         (at most {MAX_TRANSCRIPT_BYTES}) exceeds the line",
                         group.window_bytes
                     ));
                 }
                 // Only a partial last line is left; the next tick reads it.
                 break;
+            }
+            match outbox.enqueue_batch(&batch).await.map_err(describe)? {
+                TranscriptEnqueueOutcome::Enqueued { rows_written, .. } => {
+                    add(counters, "turns_staged", rows_written);
+                }
+                // Another writer moved the durable cursor past this window.
+                TranscriptEnqueueOutcome::AlreadyCovered { .. } => break,
             }
             add(
                 counters,

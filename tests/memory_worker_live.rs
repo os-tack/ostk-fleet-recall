@@ -28,7 +28,7 @@ use common::authority::retry_policy;
 use common::runtime_role::RuntimeProbeRole;
 use common::worker::{
     BROKEN_TRANSCRIPT_LINE, CI_INSTANCE, COMMIT_WORD, FAILING_STEP_WORD, GIT_INSTANCE, RecordedCi,
-    StubEmbedder, TRANSCRIPT_WORD, WorkerFixture as Fixture,
+    StubEmbedder, TRANSCRIPT_WORD, WorkerFixture as Fixture, line,
 };
 use ostk_fleet_recall::FleetError;
 use ostk_fleet_recall::memory_contracts::canonical::decode_strict;
@@ -367,6 +367,190 @@ async fn live_worker_isolates_step_failures_when_configured() {
             .hits
             .is_empty(),
         "the healthy transcript is still recallable"
+    );
+}
+
+/// Append `lines` to one of the fixture's transcript files.
+fn append_transcript(fixture: &Fixture, file: &str, lines: &[String]) {
+    use std::io::Write as _;
+    let mut handle = std::fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.transcripts.path().join(file))
+        .unwrap();
+    for line in lines {
+        writeln!(handle, "{line}").unwrap();
+    }
+}
+
+/// The report of one transcript file in a tick.
+fn transcript_source<'r>(
+    report: &'r WorkerTickReportV1,
+    file: &str,
+) -> &'r ostk_fleet_recall::worker::WorkerSourceReportV1 {
+    report
+        .step(WorkerStepV1::Transcript)
+        .unwrap()
+        .sources
+        .iter()
+        .find(|source| source.source == file)
+        .unwrap_or_else(|| panic!("{file} is not reported"))
+}
+
+#[tokio::test]
+async fn live_worker_fails_a_transcript_line_longer_than_its_window_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = Fixture::install(&pool, "worker-long-line").await;
+    let mut sources = fixture.sources_json();
+    sources["transcripts"][0]["window_bytes"] = serde_json::json!(1024);
+    let worker = fixture
+        .worker_with(&pool, "all", &sources, Arc::new(RecordedCi))
+        .await;
+    assert_all_ok(&worker.run_tick().await);
+
+    // After a drained slice: one line no 1 KiB window can hold, then a turn
+    // behind it.
+    append_transcript(
+        &fixture,
+        "session.jsonl",
+        &[
+            line(
+                "assistant",
+                "turn-3",
+                "2026-08-15T12:30:02.000Z",
+                &"the importer log ".repeat(200),
+            ),
+            line(
+                "user",
+                "turn-4",
+                "2026-08-15T12:30:03.000Z",
+                "and what about the marmalizard rows",
+            ),
+        ],
+    );
+    let report = worker.run_tick().await;
+
+    // The source fails, naming the window, instead of reporting a stalled
+    // file as unchanged; the other steps are untouched.
+    let session = transcript_source(&report, "session.jsonl");
+    assert_eq!(
+        session.outcome,
+        WorkerSourceOutcomeV1::Failed,
+        "{session:?}"
+    );
+    assert!(
+        session
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("window_bytes")),
+        "{session:?}"
+    );
+    assert_eq!(
+        status(&report, WorkerStepV1::Transcript),
+        WorkerStepStatusV1::Failed
+    );
+    for step in [WorkerStepV1::Git, WorkerStepV1::Ci, WorkerStepV1::Bodies] {
+        assert_eq!(status(&report, step), WorkerStepStatusV1::Ok, "{step:?}");
+    }
+    let row = fixture
+        .statuses(&pool)
+        .await
+        .into_iter()
+        .find(|row| row.0 == "connector.transcript.session")
+        .expect("the source reports");
+    assert_eq!(
+        row.1, "failed",
+        "evidence recall must not trust this source"
+    );
+    assert!(row.2.is_some_and(|error| error.contains("window_bytes")));
+
+    // A second attempt fails the same way: the file never silently resumes
+    // past the line.
+    let again = worker.run_tick().await;
+    assert_eq!(
+        transcript_source(&again, "session.jsonl").outcome,
+        WorkerSourceOutcomeV1::Failed
+    );
+}
+
+#[tokio::test]
+async fn live_worker_admits_staged_turns_when_a_later_line_fails_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = Fixture::install(&pool, "worker-staged-then-broken").await;
+    let staged = format!(
+        "{}\n{}\n",
+        line(
+            "user",
+            "big-1",
+            "2026-08-17T10:00:00.000Z",
+            &format!(
+                "where does the gallimaufry ledger live {}",
+                "while the batch settles ".repeat(12)
+            ),
+        ),
+        line(
+            "assistant",
+            "big-2",
+            "2026-08-17T10:00:01.000Z",
+            &format!(
+                "it lives in the archive {}",
+                "once the batch settles ".repeat(12)
+            ),
+        ),
+    );
+    std::fs::write(
+        fixture.transcripts.path().join("big.jsonl"),
+        format!("{staged}{BROKEN_TRANSCRIPT_LINE}\n"),
+    )
+    .unwrap();
+    // The first window of big.jsonl holds exactly its two good turns, so
+    // they are staged before the next window reaches the line the parser
+    // refuses. Every other fixture file fits one window.
+    let mut sources = fixture.sources_json();
+    sources["transcripts"][0]["window_bytes"] = serde_json::json!(staged.len());
+    let report = fixture
+        .worker_with(&pool, "all", &sources, Arc::new(RecordedCi))
+        .await
+        .run_tick()
+        .await;
+
+    let big = transcript_source(&report, "big.jsonl");
+    assert_eq!(big.outcome, WorkerSourceOutcomeV1::Failed, "{big:?}");
+    assert!(
+        big.error
+            .as_deref()
+            .is_some_and(|error| error.contains("big.jsonl")),
+        "{big:?}"
+    );
+    assert!(
+        big.counters["appended"] > 0,
+        "the staged turns are admitted despite the bad line: {big:?}"
+    );
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM memory_transcript_outbox_v1 \
+         WHERE tenant_id = $1 AND project = $2 AND source_id = 'big.jsonl' \
+         AND state = 'pending')",
+    )
+    .bind(fixture.installed.scope.tenant_id)
+    .bind(&fixture.installed.scope.project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!pending, "no staged turn is stranded in the outbox");
+    assert!(
+        !fixture
+            .reader(&pool)
+            .recall("gallimaufry", None, 10)
+            .await
+            .unwrap()
+            .hits
+            .is_empty(),
+        "a turn staged before the bad line is recallable"
     );
 }
 

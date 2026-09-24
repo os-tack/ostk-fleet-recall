@@ -181,6 +181,12 @@ host that has both tools, the repositories, and the transcript files.
 [`examples/worker-sources.json`](examples/worker-sources.json) shows a sources
 file with one source of each kind.
 
+Each transcript file is read in windows of its group's `window_bytes` (4 MiB
+by default, at most 8 MiB) behind a durable cursor. A line longer than the
+window fails that file's source, naming the byte offset, until the group's
+`window_bytes` is raised past the line; nothing after it is read meanwhile.
+Turns staged from earlier windows are still admitted.
+
 There is no long-running loop, so `--once` is required. Schedule the command
 with cron, a systemd timer, or a scheduled task, and run one worker per scope
 at a time. For example, with the environment above in the crontab:
