@@ -127,7 +127,7 @@ pub use cockroach::CockroachAcceptedEventRepository;
 pub use content_store::{
     CONTENT_KEY_ENCRYPTION_KEY_ENV, ContentKeyEncryptionKey, ContentObjectWrite,
     GovernedContentAssociatedDataV2, GovernedContentObjectV1, GovernedContentProjection,
-    MAX_GOVERNED_CONTENT_BYTES, SealedContentObject, fetch_governed_content,
+    MAX_GOVERNED_CONTENT_BYTES, SealedContentObject, content_kek_from_env, fetch_governed_content,
     store_governed_content,
 };
 pub use error::{

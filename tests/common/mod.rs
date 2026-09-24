@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub mod authority;
+pub mod runtime_role;
 
 use ostk_fleet_recall::FleetScope;
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig};

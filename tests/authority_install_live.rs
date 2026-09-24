@@ -12,18 +12,29 @@
 //! exactly the pins the installer prints, both a Wave-2 connector and the
 //! generation-1 connector bind out of it, a re-run changes nothing, and a
 //! physical scope already installed for other namespaces is refused intact.
+//! It also proves the `WriterAuthorityRuntime` every appending process starts
+//! from those pins: it starts and binds connectors under nothing but the
+//! runtime role's grants, refuses pins the head does not honor, and re-reads
+//! the head on every verification instead of trusting its startup read.
 
 mod common;
 
 use common::authority::{install_generation_two, retry_policy, semantic_scope};
+use common::runtime_role::RuntimeProbeRole;
 use ostk_fleet_recall::FleetError;
+use ostk_fleet_recall::config::WriterAuthorityConfig;
 use ostk_fleet_recall::evidence_ledger::ActiveStage4Package;
+use ostk_fleet_recall::memory_contracts::bootstrap::BootstrapReceiptDigest;
 use ostk_fleet_recall::memory_contracts::common::{AuthenticatedProjectScopeV1, ContractId};
+use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
 use ostk_fleet_recall::memory_contracts::generation2_registry::GIT_CONNECTOR;
 use ostk_fleet_recall::registry_activation::install::{
     AuthorityInstallRequestV1, InstallStepOutcomeV1, install_writer_authority,
 };
-use ostk_fleet_recall::registry_witness::{KnownRegistryPackage, load_and_verify};
+use ostk_fleet_recall::registry_witness::{
+    KnownRegistryPackage, WriterAuthorityError, WriterAuthorityRejection, WriterAuthorityRuntime,
+    WriterAuthorityStartError, load_and_verify,
+};
 
 /// The one connector the frozen generation-1 package carries, which
 /// generation 2 carries forward.
@@ -173,4 +184,103 @@ async fn live_install_refuses_a_physical_scope_installed_for_other_namespaces_wh
         witness.active_package().known(),
         KnownRegistryPackage::ConnectorGeneration2
     );
+}
+
+#[tokio::test]
+async fn live_runtime_bundle_starts_and_binds_connectors_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let installed = install_generation_two(&pool, "authority-runtime").await;
+    let probe = RuntimeProbeRole::create(&pool, &database_url).await;
+
+    // The runtime starts under nothing but the runtime role's grants.
+    let (runtime, startup) = WriterAuthorityRuntime::start(
+        probe.pool.clone(),
+        installed.scope.clone(),
+        installed.config.clone(),
+        retry_policy(),
+    )
+    .await
+    .expect("the runtime grants must suffice to start under the installed pins");
+    assert_eq!(startup.package, KnownRegistryPackage::ConnectorGeneration2);
+    assert_eq!(startup.generation, installed.report.generation);
+    assert_eq!(startup.activation_id, installed.report.activation_id);
+    assert_eq!(runtime.semantic_scope(), &installed.semantic_scope);
+    assert_eq!(
+        runtime.ledger().trusted_scope(),
+        runtime.control_scope(),
+        "the ledger appends into exactly the scope the witness certifies"
+    );
+    assert_eq!(
+        runtime.control_scope().tenant_id(),
+        installed.scope.tenant_id
+    );
+    assert_eq!(runtime.control_scope().project(), installed.scope.project);
+
+    let authority = runtime
+        .verify()
+        .await
+        .expect("a started runtime must verify the head again");
+    assert_eq!(authority.witness().generation(), 2);
+    assert_eq!(
+        authority.witness().active_package().known(),
+        KnownRegistryPackage::ConnectorGeneration2
+    );
+    assert!(authority.witness().certifies_scope(&installed.scope));
+    assert_eq!(authority.head_binding(), authority.witness().head_binding());
+    for connector in [GIT_CONNECTOR.connector_schema, GITHUB_PUSH_CONNECTOR] {
+        authority
+            .bind_connector(&ContractId::new(connector).unwrap())
+            .unwrap_or_else(|error| {
+                panic!("the runtime must bind {connector} for admission: {error}")
+            });
+    }
+
+    // Pins the durable head does not honor stop a process at startup.
+    let wrong_pin = WriterAuthorityConfig::from_trusted_context(
+        installed.semantic_scope.clone(),
+        BootstrapReceiptDigest::from_digest(Sha256Digest::from_bytes([0x5a; 32])),
+        None,
+    );
+    let refusal = WriterAuthorityRuntime::start(
+        probe.pool.clone(),
+        installed.scope.clone(),
+        wrong_pin,
+        retry_policy(),
+    )
+    .await
+    .expect_err("a receipt pin the head does not carry must not start");
+    assert!(
+        matches!(
+            refusal,
+            WriterAuthorityStartError::Rejected(WriterAuthorityRejection::BootstrapPin)
+        ),
+        "unexpected refusal: {refusal}"
+    );
+
+    // Nothing from startup is cached: once the login loses the authority
+    // view, the very next verification fails.
+    sqlx::query(&format!(
+        "REVOKE SELECT ON TABLE public.memory_writer_authority_v1 FROM {}",
+        probe.name()
+    ))
+    .execute(&pool)
+    .await
+    .expect("revoke the probe's view grant");
+    let error = runtime
+        .verify()
+        .await
+        .expect_err("a verification must re-read the authority view");
+    let code = match &error {
+        WriterAuthorityError::Database(error) => error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .map(std::borrow::Cow::into_owned),
+        _ => None,
+    };
+    assert_eq!(code.as_deref(), Some("42501"), "unexpected error: {error}");
+
+    probe.drop_role(&pool).await;
 }

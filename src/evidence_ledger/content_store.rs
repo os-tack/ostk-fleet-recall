@@ -135,6 +135,37 @@ use super::repository::{AppendProjection, ProjectionContext};
 /// Environment variable holding the hex-encoded 32-byte content KEK.
 pub const CONTENT_KEY_ENCRYPTION_KEY_ENV: &str = "FLEET_RECALL_CONTENT_KEK_HEX";
 
+/// Read the governed-content KEK from [`CONTENT_KEY_ENCRYPTION_KEY_ENV`], if
+/// this process was given one.
+///
+/// `Ok(None)` means the variable is unset or blank; whether a process may run
+/// without the key is the caller's decision (a worker refuses the steps that
+/// need it, the observer refuses to append). A value that is present is parsed
+/// exactly as [`ContentKeyEncryptionKey::from_hex`] parses it, so a mis-set key
+/// fails closed rather than reading as absent.
+///
+/// The key is deliberately not `Clone`, so a caller that needs two independent
+/// holders (for example a drain and a body repository) calls this twice.
+/// Every call site is a process that holds the key; the publication process is
+/// never one (PUBLIC-03, EVID-05).
+///
+/// # Errors
+///
+/// [`FleetError::Configuration`] when the variable is present but is not a
+/// valid KEK.
+pub fn content_kek_from_env() -> Result<Option<ContentKeyEncryptionKey>, FleetError> {
+    content_kek_from_lookup(|name| std::env::var(name).ok())
+}
+
+fn content_kek_from_lookup(
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<Option<ContentKeyEncryptionKey>, FleetError> {
+    lookup(CONTENT_KEY_ENCRYPTION_KEY_ENV)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| ContentKeyEncryptionKey::from_hex(&value))
+        .transpose()
+}
+
 /// Largest plaintext this store admits.
 ///
 /// Migration 0018 bounds `encrypted_bytes` at 1 MiB, and AES-256-GCM adds a
@@ -1002,6 +1033,27 @@ mod tests {
         assert!(ContentKeyEncryptionKey::from_hex(&"a".repeat(65)).is_err());
         assert!(ContentKeyEncryptionKey::from_hex(&"A".repeat(64)).is_err());
         assert!(ContentKeyEncryptionKey::from_hex(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn an_optional_kek_is_absent_only_when_unset_or_blank() {
+        let load = |value: Option<&str>| {
+            content_kek_from_lookup(|name| {
+                assert_eq!(name, CONTENT_KEY_ENCRYPTION_KEY_ENV);
+                value.map(str::to_owned)
+            })
+        };
+        assert!(load(None).unwrap().is_none());
+        assert!(load(Some("  ")).unwrap().is_none());
+        let key = load(Some(&("0".repeat(63) + "1")))
+            .unwrap()
+            .expect("a valid key is present");
+        let sealed = object(b"optional key").seal(&key).unwrap();
+        assert_eq!(sealed.open(&key).unwrap(), b"optional key");
+        assert!(matches!(
+            load(Some(&"0".repeat(64))),
+            Err(FleetError::Configuration(_))
+        ));
     }
 
     #[test]

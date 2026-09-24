@@ -40,22 +40,16 @@
 //! refused before anything is written.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ostk_fleet_recall::FleetScope;
-use ostk_fleet_recall::config::WriterAuthorityConfig;
 use ostk_fleet_recall::connectors::git::{GitObjectId, GitRepositoryIdV1, GitRepositoryReader};
-use ostk_fleet_recall::control_log::TrustedControlScope;
-use ostk_fleet_recall::evidence_ledger::{
-    ActiveStage4Package, CONTENT_KEY_ENCRYPTION_KEY_ENV, CockroachAcceptedEventRepository,
-    ContentKeyEncryptionKey,
-};
+use ostk_fleet_recall::evidence_ledger::{CONTENT_KEY_ENCRYPTION_KEY_ENV, content_kek_from_env};
 use ostk_fleet_recall::memory_contracts::canonical::decode_strict;
 use ostk_fleet_recall::memory_contracts::common::{
-    AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId, ProfileReferenceV1,
-    RegistryReferenceV1, frozen_profile_reference_v1,
+    CanonicalTimestamp, ContractId, ProfileReferenceV1, RegistryReferenceV1,
+    frozen_profile_reference_v1,
 };
 use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
 use ostk_fleet_recall::memory_contracts::evidence::AcceptedEventId;
@@ -75,7 +69,7 @@ use ostk_fleet_recall::observer_runtime::{
 use ostk_fleet_recall::private_postgres::{
     PrivatePostgresSslPolicy, private_postgres_connect_options,
 };
-use ostk_fleet_recall::registry_witness::load_and_verify;
+use ostk_fleet_recall::registry_witness::WriterAuthorityRuntime;
 use ostk_fleet_recall::store::cockroach::RetryPolicy;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -373,49 +367,33 @@ async fn apply(args: ApplyArgs) -> anyhow::Result<()> {
         None,
         ostk_recall_core::PrivacyTier::T1Project,
     )?;
-    let authority = WriterAuthorityConfig::from_env()?.ok_or_else(|| {
-        anyhow!("the writer-authority pin group must be configured for an observer append")
+    // An observer append is event-first by definition, so an absent or
+    // partial pin group, or pins the durable head does not honor, stops the
+    // run before it appends anything (D5).
+    let (runtime, _startup) = WriterAuthorityRuntime::from_env(pool, scope, RetryPolicy::default())
+        .await?
+        .ok_or_else(|| {
+            anyhow!("the writer-authority pin group must be configured for an observer append")
+        })?;
+    let authority = runtime.verify().await?;
+    let active = authority.bind_connector(&ContractId::new(OBSERVER_CONNECTOR_SCHEMA)?)?;
+    let kek = content_kek_from_env()?.ok_or_else(|| {
+        anyhow!("{CONTENT_KEY_ENCRYPTION_KEY_ENV} must carry the governed-content key")
     })?;
-    let witness = load_and_verify(&pool, &scope, &authority).await?;
-    let append_witness = witness.to_append_witness()?;
-    let active = ActiveStage4Package::bind_connector(
-        witness.package().clone(),
-        &ContractId::new(OBSERVER_CONNECTOR_SCHEMA)?,
-        witness.head_binding().clone(),
-        &append_witness,
-    )?;
-
-    let control_scope = TrustedControlScope::from_trusted_context(
-        &scope,
-        AuthenticatedProjectScopeV1::from_trusted_context(
-            witness.contract_tenant_namespace().clone(),
-            witness.contract_project_namespace().clone(),
-        ),
-    )?;
-    let kek = ContentKeyEncryptionKey::from_hex(
-        &std::env::var(CONTENT_KEY_ENCRYPTION_KEY_ENV).with_context(|| {
-            format!("{CONTENT_KEY_ENCRYPTION_KEY_ENV} must carry the governed-content key")
-        })?,
-    )?;
     let connector = ObserverConnectorBindingV1::resolve(
         &active,
         ContractId::new(args.connector_principal.clone())?,
         ContractId::new(args.connector_instance.clone())?,
         args.inspect.source.installation_id,
     )?;
-    let ledger = Arc::new(CockroachAcceptedEventRepository::new(
-        pool.clone(),
-        control_scope.clone(),
-        RetryPolicy::default(),
-    ));
     let received_at = CanonicalTimestamp::from_datetime(&chrono::Utc::now())?;
     let outcome = drain_observer_run(
         &ObserverDrainContextV1 {
             binding: &connector,
             active: &active,
-            witness: &append_witness,
-            ledger: ledger.as_ref(),
-            control_scope: &control_scope,
+            witness: authority.append_witness(),
+            ledger: runtime.ledger().as_ref(),
+            control_scope: runtime.control_scope(),
             kek: &kek,
             clocks: &ObserverIngressClocksV1 { received_at },
         },

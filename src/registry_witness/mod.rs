@@ -67,6 +67,20 @@
 //! seventeen foreign-key columns (migration 0014), so what remains unverified
 //! here is verified by the activation ceremonies themselves and audited by the
 //! registry-activation binaries, which run as separate identities.
+//!
+//! [`WriterAuthorityRuntime`] (the `runtime` submodule) is the one composition
+//! every appending process builds on this module: the pins, the physical
+//! scope, the [`TrustedControlScope`](crate::control_log::TrustedControlScope)
+//! the witness certifies, and the evidence ledger bound to it. It re-runs
+//! [`load_and_verify`] on every [`WriterAuthorityRuntime::verify`] and caches
+//! no authority, so it adds nothing to the D4 rule above.
+
+mod runtime;
+
+pub use runtime::{
+    VerifiedWriterAuthority, WriterAuthorityRuntime, WriterAuthorityStartError,
+    WriterAuthorityStartupV1,
+};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

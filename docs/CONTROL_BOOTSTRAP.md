@@ -270,7 +270,9 @@ cargo run --locked --bin ostk-authority-install -- apply
   writer for that physical scope. The optional break-glass
   `FLEET_RECALL_EXPECTED_ACTIVATION_ID` takes the reported `activation_id`.
   The run ends by verifying the strict writer-authority witness under exactly
-  these pins.
+  these pins. A writer loads them through `WriterAuthorityRuntime::from_env`
+  (`src/registry_witness/runtime.rs`). It verifies the head once at startup
+  and again for every request or tick, and caches nothing between the two.
 - **Re-runs.** A re-run reports every step `already_present`, with the same
   pins and the same activation. A run that stopped partway resumes where it
   stopped. The genesis step resumes from the audited genesis root, because its

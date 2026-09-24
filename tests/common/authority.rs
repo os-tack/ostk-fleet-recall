@@ -11,6 +11,7 @@ use ostk_fleet_recall::memory_contracts::common::{AuthenticatedProjectScopeV1, C
 use ostk_fleet_recall::registry_activation::install::{
     AuthorityInstallReportV1, AuthorityInstallRequestV1, install_writer_authority,
 };
+use ostk_fleet_recall::registry_witness::WriterAuthorityRuntime;
 use ostk_fleet_recall::store::cockroach::RetryPolicy;
 use ring::rand::{SecureRandom as _, SystemRandom};
 use sqlx::PgPool;
@@ -42,6 +43,20 @@ impl InstalledAuthority {
     /// parses a fresh one.
     pub fn kek(&self) -> ContentKeyEncryptionKey {
         ContentKeyEncryptionKey::from_hex(&self.kek_hex).expect("the fixture key is valid hex")
+    }
+
+    /// A started writer-authority runtime for this install over `pool`: the
+    /// owner pool, or a probe pool that holds only runtime grants.
+    pub async fn runtime(&self, pool: &PgPool) -> WriterAuthorityRuntime {
+        let (runtime, _startup) = WriterAuthorityRuntime::start(
+            pool.clone(),
+            self.scope.clone(),
+            self.config.clone(),
+            retry_policy(),
+        )
+        .await
+        .expect("the installed authority must start a writer-authority runtime");
+        runtime
     }
 
     /// The request that installed this authority, for a re-run.

@@ -165,9 +165,15 @@ impl CockroachAcceptedEventRepository {
     /// it proves the authority row is internally consistent and that the stored
     /// canonical bootstrap receipt reproduces the row's own receipt digest, but
     /// it does NOT verify descent from the deployment-pinned bootstrap root and
-    /// does not consult the `FleetConfig` namespace pins. `W1-HEAD` owns both,
-    /// and will supersede this method. The append path never trusts the witness
-    /// on its own: it re-reads the same view inside the append transaction.
+    /// does not consult the writer-authority pins. The append path never
+    /// trusts the witness on its own: it re-reads the same view inside the
+    /// append transaction.
+    ///
+    /// Only connected tests and `ostk-bootstrap-manifest-import` call it. A
+    /// process that appends under deployment pins uses
+    /// [`WriterAuthorityRuntime::verify`](crate::registry_witness::WriterAuthorityRuntime::verify)
+    /// instead, which runs the strict witness (`W1-HEAD`) and adapts it into
+    /// this same seam type.
     pub async fn read_writer_authority_witness(
         &self,
     ) -> EvidenceAppendResult<WriterAuthorityWitness> {

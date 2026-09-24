@@ -11,7 +11,9 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::control_log::TrustedControlScope;
-use crate::evidence_ledger::{CONTENT_KEY_ENCRYPTION_KEY_ENV, ContentKeyEncryptionKey};
+use crate::evidence_ledger::{
+    CONTENT_KEY_ENCRYPTION_KEY_ENV, ContentKeyEncryptionKey, content_kek_from_env,
+};
 use crate::memory_contracts::bootstrap::{BootstrapPin, BootstrapReceiptDigest};
 use crate::memory_contracts::common::{AuthenticatedProjectScopeV1, ContractId};
 use crate::memory_contracts::digest::Sha256Digest;
@@ -532,15 +534,27 @@ impl ConflictReconciliationRuntimeConfig {
 ///
 /// The three primary pins are optional as one group. Either all three are
 /// present and the event-first path can verify the per-transaction head
-/// witness, or all three are absent and the event-first path stays disabled.
-/// A partial set is a configuration error rather than a silently disabled
-/// authority path, so a half-applied task definition can never downgrade a
-/// process that was meant to run event-first.
+/// witness, or all three are absent and the event-first path is not
+/// configured. A partial set is always reported as a configuration error,
+/// never read as an absent group. Processes load the group through
+/// [`WriterAuthorityRuntime::from_env`](crate::registry_witness::WriterAuthorityRuntime::from_env)
+/// (or [`WriterAuthorityConfig::from_env`] directly). What a process does with
+/// that error, or with pins the durable head does not honor, is its own
+/// policy (D5):
 ///
-/// Only the processes that run the event-first path load this group (through
-/// [`WriterAuthorityConfig::from_env`]). The serving runtime's
-/// [`FleetConfig`] does not read it, so pins meant for another tool never stop
-/// `serve`, `health`, `ingest`, `migrate`, or `demo` from starting.
+/// - A process whose job is to append event-first fails to start. That covers
+///   the worker's ingest steps, `ostk-spec`, and `ostk-observer-run`. A
+///   half-applied task definition can never downgrade it to a run that
+///   silently appends nothing.
+/// - `serve`, when it loads the group for its event-first route
+///   (`remember(action="assert")`), logs the error and starts with that route
+///   off. The route is additive: `recall` and `remember(record)` need no
+///   registry authority, so a pin only one route consumes does not take them
+///   down.
+///
+/// The serving runtime's [`FleetConfig`] still does not parse the group, so
+/// pins meant for another tool never stop `serve`, `health`, `ingest`,
+/// `migrate`, or `demo` from loading their configuration.
 ///
 /// These values are deployment authority, never request or payload fields:
 /// the semantic namespaces come from process configuration and the receipt pin
@@ -1556,9 +1570,12 @@ fn model_bundle_sha256_at(canonical: &Path) -> Result<String> {
 ///
 /// The variable is required when called: a deployment that enables governed
 /// evidence admission without a key fails closed at startup instead of storing
-/// unencrypted bytes.
+/// unencrypted bytes. [`content_kek_from_env`] is the optional form for a
+/// process that decides per step whether it needs the key.
 pub fn content_key_encryption_key() -> Result<ContentKeyEncryptionKey> {
-    ContentKeyEncryptionKey::from_hex(&required(CONTENT_KEY_ENCRYPTION_KEY_ENV)?)
+    content_kek_from_env()?.ok_or_else(|| {
+        FleetError::Configuration(format!("{CONTENT_KEY_ENCRYPTION_KEY_ENV} is required"))
+    })
 }
 
 fn required(name: &str) -> Result<String> {
