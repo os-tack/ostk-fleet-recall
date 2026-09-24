@@ -840,7 +840,9 @@ GRANT SELECT ON TABLE public.memory_discrepancy_relations_v1 TO fleet_runtime;
 -- content store takes that lock (LOCK_CONTENT_OBJECT_SQL in
 -- src/evidence_ledger/content_store.rs) whenever an append deduplicates onto
 -- an existing content object, to compare it against the admitted bytes. No
--- runtime statement issues UPDATE on this table.
+-- runtime statement issues UPDATE on this table, but the grant is table-wide:
+-- a holder of the writer login can rewrite any content row directly
+-- (docs/MIGRATIONS.md, "Privilege separation").
 GRANT UPDATE ON TABLE public.memory_content_objects TO fleet_runtime;
 
 GRANT USAGE ON SEQUENCE

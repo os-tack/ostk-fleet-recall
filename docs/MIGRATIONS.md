@@ -31,8 +31,11 @@ runtimes: the content-addressed body projection, the coverage runtime, the
 recall projection and its per-row visibility class, transcript and CI
 connector state, normative activation, the discrepancy ledger, and the
 bootstrap-manifest import rows. Version 25 is a deliberate, permanent gap. No
-serving path reads these tables yet, and the runtime role policy does not
-grant them.
+serving path reads these tables yet. The runtime role policy nonetheless
+grants `fleet_runtime` the tables of migrations 19 through 24, 26, and 27, as
+it does those of 29 through 31; it grants nothing on migration 23's
+publication views or migration 28's import rows (see
+[Privilege separation](#privilege-separation)).
 
 Migration 29 is the exception: it adds `memory_conflict_lifecycle_events_v1`,
 the append-only per-conflict lifecycle log the serving writer reads and appends
@@ -311,10 +314,23 @@ One more row is on a Stage-4 table: `UPDATE` on `memory_content_objects`.
 CockroachDB v26.2.3 requires `UPDATE` for `SELECT ... FOR UPDATE`, and the
 governed content store takes that lock whenever an append deduplicates onto
 an existing content object, to compare it with the admitted bytes
-(`LOCK_CONTENT_OBJECT_SQL` in `src/evidence_ledger/content_store.rs`). No
-runtime statement updates that table. The policy grants nothing on migration
-23's publication views or on migration 28's bootstrap-import rows, and the
-publication reader gains nothing from any of these rows. The policy closes by
+(`LOCK_CONTENT_OBJECT_SQL` in `src/evidence_ledger/content_store.rs`). The
+lock is deliberate (EVID-01): it reads the latest committed version of the
+row, not the append transaction's snapshot, so a stored row whose identity
+columns were altered after that snapshot fails the append instead of passing
+it. No runtime statement updates that table, but the grant is table-wide: a
+holder of the writer login can rewrite any content row in any tenant
+directly, including its ciphertext, wrapped key, and retention annotations.
+Without the deployment KEK, a rewritten ciphertext or wrapped key fails to
+open, because both are sealed with the scope and storage identity as
+associated data and opening re-checks the content digest. The retention
+annotations are not authority, because each accepted event carries its own.
+Treat such a rewrite as corruption, like any other direct-SQL misuse of the
+writer login (see
+[SECURITY.md](SECURITY.md#residual-sql-authority-and-recovery)). The policy
+grants nothing on migration 23's publication views or on migration 28's
+bootstrap-import rows, and the publication reader gains nothing from any of
+these rows. The policy closes by
 checking the exact 115-row matrix: database `CONNECT`, schema `USAGE`, 110
 table-privilege rows, and three sequence-`USAGE` rows.
 

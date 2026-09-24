@@ -323,8 +323,13 @@ is retried.
 ## Residual SQL authority and recovery
 
 CockroachDB grants table operations, not prepared-statement identities. A
-holder of a private writer URL can issue SQL outside the reviewed binary. The
-publication reader has no write table operation or sequence authority. The
+holder of a private writer URL can issue SQL outside the reviewed binary.
+That includes rewriting any governed content row: the runtime role holds
+table-level `UPDATE` on `memory_content_objects` only because CockroachDB
+requires it for the content store's `SELECT ... FOR UPDATE` dedupe lock, and
+no runtime statement issues `UPDATE` there (see
+[MIGRATIONS.md](MIGRATIONS.md#privilege-separation)). The publication reader
+has no write table operation or sequence authority. The
 bootstrap role's required raw inserts can occupy an immutable singleton or
 plant a detached future offset. The activation role can occupy immutable
 activation/head rows or misuse its table-level shard-head update. The unique

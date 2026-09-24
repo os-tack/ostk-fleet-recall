@@ -60,7 +60,8 @@ not a relaxation of any invariant (EVENT-03, REPLAY-01/02, EVID-01).
 **Decision.** `remember` must commit its accepted event and its projection in ONE serializable
 transaction (EVENT-03); one transaction is one connection is one role, so the appending identity is
 `fleet_runtime`. It gains exactly: `SELECT, INSERT` on `memory_evidence_events`; `SELECT, INSERT,
-UPDATE` on `memory_evidence_shard_heads`; `SELECT, INSERT` on `memory_content_objects` (D5);
+UPDATE` on `memory_evidence_shard_heads`; `SELECT, INSERT` on `memory_content_objects` (D5;
+`UPDATE` added by the 2026-09-24 amendment below);
 `SELECT` on the read-only view `memory_writer_authority_v1` (D4); and, because the appender and the
 relation projector run inside the same runtime process and transaction, `SELECT, INSERT` on
 `memory_evidence_quarantine` and `SELECT, INSERT, UPDATE` on `memory_relation_projection_v1` and
@@ -69,6 +70,16 @@ carry only the first four relations; the remaining three are added in the same w
 and W1-REL merge). It gains NO privilege on any
 `memory_control_*` or `memory_registry_*` base table; the control and successor policies' REVOKE
 lists stay unchanged.
+
+Amendment 2026-09-24: `fleet_runtime` also holds `UPDATE` on `memory_content_objects`, solely
+because CockroachDB v26.2.3 requires `UPDATE` for `SELECT ... FOR UPDATE`. The content store's
+dedupe fence (`LOCK_CONTENT_OBJECT_SQL`, EVID-01) takes that lock whenever an append lands on an
+existing content object, so without the grant every deduplicating governed-content append fails
+with 42501. No runtime statement issues `UPDATE` on that table. The grant is
+table-wide, though, so a compromised runtime can also rewrite stored content rows. Without the KEK
+a rewritten ciphertext or wrapped key makes the object fail to open rather than change what it
+says, and the retention annotations are operational metadata, not authority. Either rewrite is
+corruption to repair, like the shard-head wedge below.
 
 Residual accepted and documented: a compromised runtime can wedge its own evidence shards (never
 the governance ledger); detection is the chain audit, remedy is a successor log epoch (W0-LOG).
