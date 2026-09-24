@@ -157,8 +157,8 @@ corrected representation, linked back to this record only through
 identity link", above, for how the three reasons with no `source_fact_id`
 (`invalid_signature`, `unknown_schema`, `oversize`) are reconciled instead.
 The seal for this rule lives on
-`QuarantinedDeliveryV1`, the *durable* dead-letter form — mirroring
-`remember_v2::AdmittedRememberStatementV2` — which has a private field, no
+`QuarantinedDeliveryV1`, the *durable* dead-letter form — whose private field
+mirrors `remember_v2::AdmittedRememberStatementV2` — which has no
 production constructor at this contract-only stage, no `&mut self` method,
 and no setter of any kind: once a rejection is durable there is no API
 surface with which to edit its reason, diagnostic, or any other field.
@@ -181,7 +181,8 @@ holds.
 ## The "cannot become an accepted event or projection input" proof
 
 `QuarantinedDeliveryV1`'s field is private, mirroring
-`remember_v2::AdmittedRememberStatementV2`: no production constructor exists
+`remember_v2::AdmittedRememberStatementV2`. Unlike that type, which the
+server-side remember admission constructs, no production constructor exists
 in this contract-only stage, only a `#[cfg(test)]` witness. The
 `NotProjectable` marker trait names the narrower and honest claim this
 module can actually make — neither `QuarantineRecordV1` nor

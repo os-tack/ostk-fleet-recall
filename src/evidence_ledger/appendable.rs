@@ -286,8 +286,8 @@ impl AppendableAcceptedEvent {
     /// caller MUST already have routed the assertion through the unique active
     /// admission rule, rederived the subject from the activated identity
     /// recipe, and re-audited applicability and support events (ADR 0002 D3).
-    /// Prefer [`Self::admitted_memory_claim`] once
-    /// `AdmittedRememberStatementV2` has a production constructor.
+    /// Prefer [`Self::admitted_memory_claim`] with the capability
+    /// `crate::remember_runtime::admit_remember_assertion` mints.
     #[doc(hidden)]
     pub fn memory_claim(
         statement: &RememberAcceptedStatementV2,

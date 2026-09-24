@@ -1,6 +1,6 @@
 //! Typed canonical locators and content-addressed OSTK resource URIs.
 
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use unicode_normalization::UnicodeNormalization;
@@ -250,6 +250,162 @@ impl ValidatedIdentityRecipe {
     pub const fn authority_namespace_id(&self) -> &ContractId {
         &self.authority_namespace_id
     }
+
+    /// The trusted derivation context for this recipe inside one
+    /// authenticated scope: the package's profile, the caller's trusted
+    /// scope, and the recipe's own authority namespace. Nothing in it comes
+    /// from the resource assertion being derived.
+    pub(crate) fn derivation_context(
+        &self,
+        scope: &AuthenticatedProjectScopeV1,
+    ) -> IdentityDerivationContextV1 {
+        IdentityDerivationContextV1::from_trusted_context(
+            self.profile.clone(),
+            scope.clone(),
+            self.authority_namespace_id.clone(),
+        )
+    }
+}
+
+/// Build the canonical locator a recipe's component rules define from
+/// caller-supplied `key -> value` components.
+///
+/// Keys are matched exactly against the recipe's component rules and encoded
+/// as those rules say. A key the recipe does not name, or a rule with no
+/// supplied value, is refused rather than ignored or defaulted. Profile,
+/// scope, form, kind, recipe reference, and namespace all come from the
+/// recipe and the trusted scope, never from the components. Component values
+/// are checked against their encodings when the locator is derived.
+pub(crate) fn locator_from_components(
+    recipe: &ValidatedIdentityRecipe,
+    scope: &AuthenticatedProjectScopeV1,
+    parent_entity: Option<&ResourceUri>,
+    components: &BTreeMap<String, String>,
+) -> ContractResult<CanonicalLocatorV1> {
+    let rules = &recipe.recipe().component_rules;
+    if let Some(unknown) = components
+        .keys()
+        .find(|key| !rules.iter().any(|rule| rule.key.as_str() == key.as_str()))
+    {
+        return Err(ContractError::InvalidResourceLocator(format!(
+            "unknown locator component `{unknown}`"
+        )));
+    }
+    let components = rules
+        .iter()
+        .map(|rule| {
+            components
+                .get(rule.key.as_str())
+                .map(|value| LocatorComponentV1 {
+                    key: rule.key.clone(),
+                    encoding: rule.encoding,
+                    value: value.clone(),
+                })
+                .ok_or_else(|| {
+                    ContractError::InvalidResourceLocator(format!(
+                        "missing locator component `{}`",
+                        rule.key
+                    ))
+                })
+        })
+        .collect::<ContractResult<Vec<_>>>()?;
+    Ok(CanonicalLocatorV1 {
+        schema_version: IDENTITY_SCHEMA_VERSION,
+        profile: recipe.profile.clone(),
+        scope: scope.clone(),
+        identity_form: recipe.recipe().identity_form,
+        resource_kind: recipe.recipe().resource_kind.clone(),
+        recipe: recipe.registry_reference().clone(),
+        provider_instance_namespace: recipe.authority_namespace_id().clone(),
+        parent_entity: parent_entity.cloned(),
+        components,
+    })
+}
+
+/// Derive one entity-form identity from `key -> value` components under an
+/// already package-resolved recipe.
+pub(crate) fn derive_entity_with_recipe(
+    recipe: &ValidatedIdentityRecipe,
+    scope: &AuthenticatedProjectScopeV1,
+    components: &BTreeMap<String, String>,
+) -> ContractResult<DerivedResourceIdentityV1> {
+    if recipe.recipe().identity_form != IdentityForm::Entity {
+        return Err(ContractError::InvalidIdentityRecipe(
+            "component derivation requires an entity-form recipe".into(),
+        ));
+    }
+    let locator = locator_from_components(recipe, scope, None, components)?;
+    derive_resource_uri(&recipe.derivation_context(scope), &locator, recipe, None)
+}
+
+/// Derive one entity-form resource identity from `key -> value` locator
+/// components, under the exact recipe `recipe` names inside `package`.
+///
+/// The recipe is resolved out of the package and must match the reference's
+/// entry digest, not only its ID and version. Components are keyed and
+/// encoded by the recipe's component rules: a missing or unknown key, or a
+/// value that is not in its rule's canonical encoding, is refused. The
+/// derivation context is the package profile, the trusted `scope`, and the
+/// recipe's own authority namespace, so a caller supplies coordinates and
+/// nothing else.
+pub fn derive_entity_from_components(
+    package: &ManifestVerifiedRegistryPackage,
+    recipe: &RegistryReferenceV1,
+    scope: &AuthenticatedProjectScopeV1,
+    components: &BTreeMap<String, String>,
+) -> ContractResult<DerivedResourceIdentityV1> {
+    let validated =
+        ValidatedIdentityRecipe::from_package(package, &recipe.entry_id, recipe.version)?;
+    if validated.registry_reference() != recipe {
+        return Err(ContractError::InvalidIdentityRecipe(
+            "recipe reference does not match the package entry".into(),
+        ));
+    }
+    derive_entity_with_recipe(&validated, scope, components)
+}
+
+/// Derive a `version`-form identity under an explicitly supplied, already
+/// derived entity parent whose recipe may live in a different authority
+/// namespace (owner decision D1, recorded in ADR 0005).
+///
+/// [`validate_locator`] requires a version parent derived under the child's
+/// own authority namespace. The frozen `identity.github.commit` recipe lives
+/// in `namespace.github.commit`, while its declared parent kind (`repository`)
+/// has an entity recipe only in `namespace.github.repository`, so no locator
+/// can satisfy that rule and a commit URI is underivable through it. This
+/// function applies every other [`validate_locator`] check unchanged, and in
+/// place of the same-namespace rule requires that:
+///
+/// * the locator is version-form and names exactly `parent` as its parent;
+/// * `parent` is entity-form and was derived under the exact resource-kind
+///   schema reference (entry ID, version, AND digest) the recipe declares as
+///   its parent kind;
+/// * `parent` was derived in the same trusted scope as the context.
+///
+/// The parent is a value a caller already rederived, never a URI it asserted,
+/// and it is part of the hashed locator, so the same commit under two
+/// different repositories yields two different URIs.
+pub(crate) fn derive_version_under_entity_parent(
+    context: &IdentityDerivationContextV1,
+    locator: &CanonicalLocatorV1,
+    recipe: &ValidatedIdentityRecipe,
+    parent: &DerivedResourceIdentityV1,
+) -> ContractResult<DerivedResourceIdentityV1> {
+    validate_locator_identity(context, locator, recipe)?;
+    let parent_matches = locator.identity_form == IdentityForm::Version
+        && locator.parent_entity.as_ref() == Some(parent.uri())
+        && parent.uri().identity_form() == IdentityForm::Entity
+        && recipe.parent_entity_kind().is_some_and(|kind| {
+            kind == &parent.resource_kind_schema && kind.entry_id == *parent.uri().resource_kind()
+        })
+        && parent.scope == context.scope;
+    if !parent_matches {
+        return Err(ContractError::InvalidResourceLocator(
+            "version locator does not name a valid entity parent".into(),
+        ));
+    }
+    validate_locator_components(locator, recipe)?;
+    mint_derived_identity(context, locator, recipe)
 }
 
 /// Resolve the entity recipe a `version`-form recipe's parent must be derived
@@ -453,6 +609,16 @@ impl DerivedResourceIdentityV1 {
     pub fn into_uri(self) -> ResourceUri {
         self.uri
     }
+
+    /// Trusted scope this identity was derived in.
+    pub(crate) const fn scope(&self) -> &AuthenticatedProjectScopeV1 {
+        &self.scope
+    }
+
+    /// Exact resource-kind schema reference of the recipe that derived it.
+    pub(crate) const fn resource_kind_schema(&self) -> &RegistryReferenceV1 {
+        &self.resource_kind_schema
+    }
 }
 
 impl ResourceUri {
@@ -553,6 +719,15 @@ pub fn derive_resource_uri(
     parent: Option<&DerivedResourceIdentityV1>,
 ) -> ContractResult<DerivedResourceIdentityV1> {
     validate_locator(context, locator, recipe, parent)?;
+    mint_derived_identity(context, locator, recipe)
+}
+
+/// Hash an already validated locator into its derived identity.
+fn mint_derived_identity(
+    context: &IdentityDerivationContextV1,
+    locator: &CanonicalLocatorV1,
+    recipe: &ValidatedIdentityRecipe,
+) -> ContractResult<DerivedResourceIdentityV1> {
     let bytes = encode_canonical(locator)?;
     let digest = domain_separated_digest(DigestDomain::ResourceLocator, &bytes);
     Ok(DerivedResourceIdentityV1 {
@@ -573,24 +748,7 @@ pub fn validate_locator(
     validated_recipe: &ValidatedIdentityRecipe,
     validated_parent: Option<&DerivedResourceIdentityV1>,
 ) -> ContractResult<()> {
-    let recipe = validated_recipe.recipe();
-    locator.profile.validate()?;
-    locator.recipe.validate()?;
-    recipe.validate()?;
-    if locator.schema_version != IDENTITY_SCHEMA_VERSION
-        || locator.identity_form != recipe.identity_form
-        || locator.resource_kind != recipe.resource_kind
-        || locator.recipe != *validated_recipe.registry_reference()
-        || locator.profile != context.profile
-        || locator.profile != validated_recipe.profile
-        || locator.scope != context.scope
-        || locator.provider_instance_namespace != context.provider_instance_namespace
-        || locator.provider_instance_namespace != validated_recipe.authority_namespace_id
-    {
-        return Err(ContractError::InvalidResourceLocator(
-            "locator does not match recipe identity".into(),
-        ));
-    }
+    validate_locator_identity(context, locator, validated_recipe)?;
     match (
         locator.identity_form,
         locator.parent_entity.as_ref(),
@@ -617,6 +775,44 @@ pub fn validate_locator(
             ));
         }
     }
+    validate_locator_components(locator, validated_recipe)
+}
+
+/// Every [`validate_locator`] check that precedes the parent rule: profile,
+/// recipe, form, kind, scope, and namespace identity.
+fn validate_locator_identity(
+    context: &IdentityDerivationContextV1,
+    locator: &CanonicalLocatorV1,
+    validated_recipe: &ValidatedIdentityRecipe,
+) -> ContractResult<()> {
+    let recipe = validated_recipe.recipe();
+    locator.profile.validate()?;
+    locator.recipe.validate()?;
+    recipe.validate()?;
+    if locator.schema_version != IDENTITY_SCHEMA_VERSION
+        || locator.identity_form != recipe.identity_form
+        || locator.resource_kind != recipe.resource_kind
+        || locator.recipe != *validated_recipe.registry_reference()
+        || locator.profile != context.profile
+        || locator.profile != validated_recipe.profile
+        || locator.scope != context.scope
+        || locator.provider_instance_namespace != context.provider_instance_namespace
+        || locator.provider_instance_namespace != validated_recipe.authority_namespace_id
+    {
+        return Err(ContractError::InvalidResourceLocator(
+            "locator does not match recipe identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Every [`validate_locator`] check that follows the parent rule: the exact
+/// component set, keys, encodings, and canonical values.
+fn validate_locator_components(
+    locator: &CanonicalLocatorV1,
+    validated_recipe: &ValidatedIdentityRecipe,
+) -> ContractResult<()> {
+    let recipe = validated_recipe.recipe();
     if locator.components.len() != recipe.component_rules.len()
         || locator.components.len() > MAX_LOCATOR_COMPONENTS
     {

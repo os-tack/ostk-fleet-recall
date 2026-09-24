@@ -16,7 +16,7 @@ Receipt state, fence position, and append coordinates are not fields in that pre
 
 ## The unconstructible accepted-form typestates
 
-Two types have no production constructor in this contract-only stage, matching the pattern in `remember_v2.rs`'s `AdmittedRememberStatementV2`:
+Two types have no production constructor in this contract-only stage. They follow the sealed pattern of `remember_v2.rs`'s `AdmittedRememberStatementV2` (a private field that deserialization cannot fill), whose only production constructor is the crate-private server-side remember admission:
 
 - `AdmittedErasureEventV1` — the opaque capability a future append repository would consume. Only `AdmittedErasureEventV1::from_test_witness`, gated by `#[cfg(test)]`, can build one.
 - `ErasureAcceptanceEffectV1` — the atomic bundle the architecture document describes as one indivisible act: "acceptance atomically installs a retrieval-deny tombstone and increments every indexed target epoch plus a monotonic tenant/project erasure generation." Its `#[cfg(test)]`-only constructor cross-checks that the tombstone's `erasure_event_id` and `target` match the admitted event, that at least one advanced fence entry covers the event's own scope kind, and that the generation strictly increased — so a caller cannot assemble an "acceptance" out of three unrelated values.

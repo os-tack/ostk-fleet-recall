@@ -51,10 +51,11 @@
 //! `connector_instance_id` against their own redelivery/replay records —
 //! never treated as a projection input, and never by editing this record.
 //! The resolution-by-new-event guarantee is enforced on
-//! [`QuarantinedDeliveryV1`], the durable dead-letter form (mirroring
-//! `remember_v2::AdmittedRememberStatementV2`): it has a private field, no
-//! production constructor, no `&mut self` method, and no setter of any
-//! kind, so once a rejection is durable it cannot be edited in place.
+//! [`QuarantinedDeliveryV1`], the durable dead-letter form (its private
+//! field mirrors `remember_v2::AdmittedRememberStatementV2`): it has a
+//! private field, no production constructor, no `&mut self` method, and no
+//! setter of any kind, so once a rejection is durable it cannot be edited in
+//! place.
 //! [`QuarantineRecordV1`] itself is an ordinary *candidate* value type, like
 //! every other pre-admission struct in this crate (e.g.
 //! `remember_v2::RememberIngressCandidateV2`): all twelve of its fields are
@@ -361,7 +362,9 @@ impl NotProjectable for QuarantinedDeliveryV1 {}
 /// The durable dead-letter form of one validated [`QuarantineRecordV1`].
 ///
 /// No production constructor exists in this contract-only stage; only test
-/// code may witness one, mirroring `remember_v2::AdmittedRememberStatementV2`.
+/// code may witness one. Its private field mirrors
+/// `remember_v2::AdmittedRememberStatementV2`, whose only production
+/// constructor is the crate's server-side remember admission.
 /// A quarantined delivery is never mutated in place: resolution is a wholly
 /// separate, unrelated accepted event under a corrected representation,
 /// linked back only by `source_fact_id` when one was recorded. This type

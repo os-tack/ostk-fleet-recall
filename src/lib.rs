@@ -27,6 +27,7 @@ pub mod projectors;
 pub mod registry_activation;
 pub mod registry_witness;
 pub mod relation_projection;
+pub mod remember_runtime;
 pub mod service;
 pub mod store;
 

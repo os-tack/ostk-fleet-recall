@@ -10,13 +10,16 @@
 //! merely their canonical string shape.
 //!
 //! [`RememberAcceptedStatementV2`] remains a public wire contract, not an
-//! authority capability. A later repository seam may append only an opaque
+//! authority capability. A repository seam may append only an opaque
 //! [`AdmittedRememberStatementV2`] constructed from trusted scope, identity,
-//! actor, active-registry, support-event, and admission-rule witnesses in the
-//! same transaction. Resource-valued claims require the same exact body
-//! resolution and rederivation as subjects and applicability resources. This
-//! contract-only module intentionally exposes no
-//! production constructor for that typestate.
+//! actor, active-registry, support-event, and admission-rule witnesses.
+//! Resource-valued claims require the same exact body resolution and
+//! rederivation as subjects and applicability resources. This module exposes
+//! no public constructor for that typestate: its only production constructor,
+//! `admit_authenticated_actor_statement`, is crate-private and is called by
+//! the server-side assert admission (`crate::remember_runtime`) after it has
+//! routed the unique active rule and rederived every resource URI. Support
+//! events are re-audited by the append transaction, not here.
 //!
 //! This first seam records immutable assertions only. Correction, supersession,
 //! and retraction are deliberately separate future event kinds: each must name
@@ -44,7 +47,7 @@ use super::{
         AbsenceSemanticsV1, PredicateComparatorV1, PropositionModalityV1, PublicationDefaultV1,
         SensitivityDefaultV1,
     },
-    identity::ResourceUri,
+    identity::{DerivedResourceIdentityV1, ResourceUri},
     registry::{RegistryEntryKind, RegistryEntryV1},
     relation::ConcreteApplicabilityDimensionV1,
 };
@@ -415,7 +418,10 @@ impl RememberValueConstraintV2 {
         Ok(())
     }
 
-    fn accepts_value_shape(&self, value: &CanonicalClaimValueV2) -> bool {
+    /// Whether `value` has this constraint's tag and fits its declared
+    /// bounds. Preliminary shape agreement only; resource values still need
+    /// rederivation.
+    pub(crate) fn accepts_value_shape(&self, value: &CanonicalClaimValueV2) -> bool {
         match (self, value) {
             (Self::Boolean { .. }, CanonicalClaimValueV2::Boolean { .. })
             | (Self::CanonicalDecimal { .. }, CanonicalClaimValueV2::CanonicalDecimal { .. })
@@ -536,6 +542,43 @@ pub struct RememberEffectiveIntervalRuleV2 {
 }
 
 impl RememberEffectiveIntervalRuleV2 {
+    /// Whether this exact rule admits `interval` when the server clock reads
+    /// `now`.
+    ///
+    /// Every flag is enforced: an `effective_from` before `now` needs
+    /// `past_effective_from_allowed`, one after `now` needs
+    /// `future_effective_from_allowed`, and either needs
+    /// `payload_may_select_effective_from`; an open or bounded interval needs
+    /// its own flag; and alignment is checked when the rule requires it.
+    /// Timestamps compare correctly as strings because the canonical form is
+    /// fixed-width UTC.
+    #[must_use]
+    pub fn admits(&self, interval: &ClaimEffectiveIntervalV2, now: &CanonicalTimestamp) -> bool {
+        let from = &interval.effective_from;
+        let aligned = !self.microsecond_alignment_required
+            || (from.is_microsecond_aligned()
+                && interval
+                    .effective_until
+                    .as_ref()
+                    .is_none_or(CanonicalTimestamp::is_microsecond_aligned));
+        let from_allowed = match from.cmp(now) {
+            std::cmp::Ordering::Less => {
+                self.payload_may_select_effective_from && self.past_effective_from_allowed
+            }
+            std::cmp::Ordering::Equal => true,
+            std::cmp::Ordering::Greater => {
+                self.payload_may_select_effective_from && self.future_effective_from_allowed
+            }
+        };
+        let shape_allowed = interval
+            .effective_until
+            .as_ref()
+            .map_or(self.open_ended_interval_allowed, |until| {
+                self.bounded_interval_allowed && until > from
+            });
+        aligned && from_allowed && shape_allowed
+    }
+
     fn validate_shape(&self) -> ContractResult<()> {
         if !self.payload_may_select_effective_from
             || !self.microsecond_alignment_required
@@ -947,7 +990,7 @@ impl RememberIngressCandidateV2 {
 /// exact entries are members of the same active package and that the admission
 /// entry is the unique server-routed rule for the trusted scope, predicate,
 /// and basis. The candidate's admission reference is compare-only.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StructurallyResolvedRememberContractsV2 {
     predicate_reference: RegistryReferenceV1,
     predicate: RememberPredicateSchemaV2,
@@ -1316,10 +1359,11 @@ impl RememberAcceptedStatementV2 {
     }
 }
 
-/// Opaque authority capability consumed by the future append repository.
+/// Opaque authority capability consumed by the append repository.
 ///
-/// No production constructor exists in this contract-only stage. Deserializing
-/// or structurally validating [`RememberAcceptedStatementV2`] cannot create it.
+/// Its only production constructor is the crate-private
+/// `admit_authenticated_actor_statement`. Deserializing or structurally
+/// validating [`RememberAcceptedStatementV2`] cannot create it.
 #[derive(Debug)]
 pub struct AdmittedRememberStatementV2 {
     statement: RememberAcceptedStatementV2,
@@ -1335,6 +1379,130 @@ impl AdmittedRememberStatementV2 {
         statement.validate_shape()?;
         Ok(Self { statement })
     }
+}
+
+/// Resource identities the server rederived for one candidate.
+///
+/// Each value is a [`DerivedResourceIdentityV1`], which only the identity
+/// derivation functions can produce, so an asserted URI cannot stand in for a
+/// rederived one. `applicability` is in the candidate's order (strictly by
+/// dimension ID).
+#[derive(Debug)]
+pub(crate) struct RederivedRememberIdentitiesV2 {
+    pub(crate) subject: DerivedResourceIdentityV1,
+    pub(crate) applicability: Vec<(ContractId, DerivedResourceIdentityV1)>,
+}
+
+/// Mint the admitted typestate for one authenticated-actor assertion.
+///
+/// The caller must have routed `contracts` as the unique authenticated-actor
+/// rule of the active package whose head is `head`, and must pass the trusted
+/// `scope` and `actor`. This function then:
+///
+/// * re-runs [`StructurallyResolvedRememberContractsV2::validate_candidate_shape`];
+/// * requires the `authenticated_actor` basis;
+/// * requires the subject and every applicability URI to equal the
+///   server-rederived identity, under the exact resource-kind schema the
+///   predicate declares and in the trusted scope;
+/// * enforces the whole active [`RememberEffectiveIntervalRuleV2`] against the
+///   server clock `now` (including `future_effective_from_allowed`, which
+///   shape validation does not check);
+/// * builds the [`SemanticClaimV2`] and [`RememberAcceptedStatementV2`] with
+///   strictly sorted support IDs, and validates the statement.
+///
+/// Support events are NOT re-audited here: this is pure code, and the append
+/// transaction re-audits them against the ledger before it commits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn admit_authenticated_actor_statement(
+    contracts: &StructurallyResolvedRememberContractsV2,
+    candidate: &RememberIngressCandidateV2,
+    rederived: &RederivedRememberIdentitiesV2,
+    profile: &ProfileReferenceV1,
+    scope: &AuthenticatedProjectScopeV1,
+    head: &RegistryHeadBindingV1,
+    actor: RememberActorV2,
+    now: &CanonicalTimestamp,
+) -> ContractResult<AdmittedRememberStatementV2> {
+    contracts.validate_candidate_shape(candidate)?;
+    profile.require_frozen_runtime_profile()?;
+    head.validate_shape()?;
+    if candidate.requested_basis != RememberAdmissionBasisV2::AuthenticatedActor {
+        return Err(ContractError::Schema(
+            "only the authenticated-actor remember basis is admitted".into(),
+        ));
+    }
+    let subject_matches = rederived.subject.uri() == &candidate.asserted_subject
+        && rederived.subject.resource_kind_schema()
+            == &contracts.predicate.subject_identity.resource_kind_schema
+        && rederived.subject.scope() == scope;
+    let applicability_matches = rederived.applicability.len() == candidate.applicability.len()
+        && candidate
+            .applicability
+            .iter()
+            .zip(&rederived.applicability)
+            .all(|(asserted, (dimension_id, derived))| {
+                asserted.dimension_id == *dimension_id
+                    && &asserted.resource == derived.uri()
+                    && derived.scope() == scope
+                    && contracts
+                        .predicate
+                        .applicability_dimensions
+                        .iter()
+                        .any(|rule| {
+                            rule.dimension_id == *dimension_id
+                                && &rule.resource_identity.resource_kind_schema
+                                    == derived.resource_kind_schema()
+                        })
+            });
+    if !subject_matches || !applicability_matches {
+        return Err(ContractError::Schema(
+            "remember candidate resources differ from their server rederivation".into(),
+        ));
+    }
+    if !contracts
+        .admission
+        .effective_interval_rule
+        .admits(&candidate.effective_interval, now)
+    {
+        return Err(ContractError::Schema(
+            "remember effective interval is not admitted by the active rule".into(),
+        ));
+    }
+    let claim = SemanticClaimV2 {
+        schema_version: SEMANTIC_CLAIM_SCHEMA_VERSION,
+        profile: profile.clone(),
+        scope: scope.clone(),
+        registry: head.clone(),
+        subject: candidate.asserted_subject.clone(),
+        subject_identity_recipe: candidate.subject_identity_recipe.clone(),
+        predicate_schema: contracts.predicate_reference.clone(),
+        applicability_evaluator: contracts.predicate.applicability_evaluator.clone(),
+        assertion_kind: candidate.assertion_kind,
+        modality: candidate.modality,
+        polarity: candidate.polarity,
+        value: candidate.value.clone(),
+        applicability: candidate.applicability.clone(),
+        effective_interval: candidate.effective_interval.clone(),
+    };
+    let claim_fingerprint = claim.fingerprint()?;
+    let mut support_evidence_event_ids = candidate.support_evidence_event_ids.clone();
+    support_evidence_event_ids.sort_unstable();
+    let statement = RememberAcceptedStatementV2 {
+        schema_version: REMEMBER_SCHEMA_VERSION,
+        event_kind: ContractId::new(REMEMBER_ACCEPTED_EVENT_KIND)?,
+        profile: profile.clone(),
+        scope: scope.clone(),
+        registry: head.clone(),
+        claim,
+        claim_fingerprint,
+        assertion_text_utf8_hex_chunks: candidate.assertion_text_utf8_hex_chunks.clone(),
+        actor,
+        admission_rule: contracts.admission_reference.clone(),
+        admission_basis: RememberAdmissionBasisV2::AuthenticatedActor,
+        support_evidence_event_ids,
+    };
+    statement.validate_shape()?;
+    Ok(AdmittedRememberStatementV2 { statement })
 }
 
 fn is_forbidden_assertion_scalar(value: char) -> bool {
