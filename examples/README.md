@@ -19,3 +19,12 @@ The LocalStack harness does this automatically through
 identities and checking hybrid recall, replay deduplication, scope isolation,
 a persisted recall-driven action, an open two-member conflict, and a persisted
 operator escalation.
+
+# Worker sources
+
+`worker-sources.json` is an example sources file for
+`ostk-fleet-recall worker --once`, with one git ref, one transcript directory,
+and one CI workflow. Each source is its own connector instance. Replace the
+paths and repository coordinates with your own. See
+[memory worker](../README.md#memory-worker) for the environment the command
+reads and where each step can run.

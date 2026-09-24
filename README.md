@@ -56,6 +56,10 @@ The `ostk-fleet-recall` binary has these commands:
   cosine support, and the active model identity.
 - `ingest` is a trusted operator command that loads NDJSON into the active
   chunk corpus.
+- `worker --once` runs one tick of the [memory worker](#memory-worker): it
+  ingests the configured git refs, agent transcripts, and CI workflow runs as
+  accepted evidence, then projects them into the body, lexical, and dense
+  recall tiers.
 - `model-digest` prints the versioned digest of a local model bundle.
 
 Recall is hybrid: CockroachDB `VECTOR(512)` C-SPANN search and a stored
@@ -134,6 +138,57 @@ The grants and gates these tools rely on are described in
 [migration operations](docs/MIGRATIONS.md) and
 [security policy](docs/SECURITY.md).
 
+## Memory worker
+
+`ostk-fleet-recall worker --once --sources <file> [--steps <groups>]` runs one
+tick of the memory worker for the configured `(tenant, project)` and exits.
+Each tick ingests every configured source and then projects what was
+admitted, in this order:
+
+- `ingest`: each transcript file, git ref, and CI workflow becomes its own
+  connector instance. The worker admits new provider material as accepted
+  evidence under a freshly verified generation-2 head, writes coverage
+  receipts for what it read, and updates each source's status row in
+  `memory_worker_sources_v1`.
+- `project`: the body projector, then the lexical tier.
+- `embed`: the dense tier, through the pinned model2vec embedder.
+
+`--steps` takes a comma-separated list of those groups, or `all` (the
+default). A failure stays inside its source or step: the worker records it
+and continues. The tick's report goes to stdout as one JSON line, covering
+every step's status and counters and every source's outcome and error. The
+exit status is 1 when any step failed. A configuration or privilege problem
+stops the run before the tick, prints no report, and also exits 1.
+
+The command reads:
+
+- the same writer configuration as `serve`: `FLEET_RECALL_DATABASE_URL` as
+  `fleet_writer`, `FLEET_RECALL_TENANT_ID`, `FLEET_RECALL_PROJECT`,
+  `FLEET_RECALL_AGENT`, and the model bundle variables;
+- for `ingest` and `project`: the writer-authority pins that
+  `ostk-authority-install apply` prints, and `FLEET_RECALL_CONTENT_KEK_HEX`;
+- for `embed`: the pinned model bundle. Every dense row records
+  `FLEET_RECALL_EMBEDDING_MODEL_SHA256`.
+
+It needs migrations through 0030 and `deploy/cockroach/runtime-role-grants.sql`.
+Before the tick it checks every privilege the selected steps use and names
+the first one missing.
+
+The git step runs `git` and the CI step runs `gh` (with the operator's `gh`
+credential). The production image has neither, so run the ingest steps on a
+host that has both tools, the repositories, and the transcript files.
+`--steps project,embed` needs neither and is safe to run in the container.
+[`examples/worker-sources.json`](examples/worker-sources.json) shows a sources
+file with one source of each kind.
+
+There is no long-running loop, so `--once` is required. Schedule the command
+with cron, a systemd timer, or a scheduled task, and run one worker per scope
+at a time. For example, with the environment above in the crontab:
+
+```text
+*/15 * * * * ostk-fleet-recall worker --once --sources /etc/fleet-recall/worker-sources.json >>/var/log/fleet-recall/worker.jsonl
+```
+
 ## Built but not yet wired
 
 A larger dynamic-memory plane, specified in
@@ -153,13 +208,9 @@ it:
   embedding provider that puts the pinned model2vec embedder behind the dense
   projection's `EmbeddingProvider` seam;
 - the coverage runtime (`src/coverage_runtime`);
-- the memory worker library (`src/worker`): `MemoryWorker::run_tick` runs the
-  transcript, git, and CI connectors and then the body, lexical, and dense
-  projectors for one scope under a freshly verified generation-2 head, one
-  connector instance per configured source, isolates each source's and each
-  step's failure, and records every source's outcome in
-  `memory_worker_sources_v1` (migration 0030); `probe_worker_privileges`
-  checks the login's grants before the first tick;
+- the memory worker (`src/worker`), which the `worker --once` subcommand runs
+  (see [memory worker](#memory-worker)). Its projections are written, but no
+  MCP recall reads them yet;
 - the normative activation, observer, and discrepancy runtimes
   (`src/normative_runtime`, `src/observer_runtime`,
   `src/discrepancy_runtime`); only the observer has a runner, the private
@@ -176,8 +227,6 @@ it:
 
 Wiring this plane into the product needs, at minimum:
 
-- a CLI that runs `MemoryWorker` ticks, embedding the dense tier through
-  `ChunkEmbedderProvider`;
 - the publication grant on the filtered views from migration 23 (the runtime
   policy in `deploy/cockroach/runtime-role-grants.sql` already grants
   `fleet_runtime` the tables from migrations 19–27 and 29–31; see

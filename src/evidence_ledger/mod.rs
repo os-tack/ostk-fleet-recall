@@ -124,6 +124,7 @@ pub use appendable::{
 };
 pub use bootstrap_import::{BootstrapImportProjection, IMPORT_ROWS_TABLE};
 pub use cockroach::CockroachAcceptedEventRepository;
+pub(crate) use content_store::content_kek_from_lookup;
 pub use content_store::{
     CONTENT_KEY_ENCRYPTION_KEY_ENV, ContentKeyEncryptionKey, ContentObjectWrite,
     GovernedContentAssociatedDataV2, GovernedContentObjectV1, GovernedContentProjection,

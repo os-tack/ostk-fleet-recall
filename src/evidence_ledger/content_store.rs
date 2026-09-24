@@ -157,7 +157,8 @@ pub fn content_kek_from_env() -> Result<Option<ContentKeyEncryptionKey>, FleetEr
     content_kek_from_lookup(|name| std::env::var(name).ok())
 }
 
-fn content_kek_from_lookup(
+/// [`content_kek_from_env`] over an injected variable lookup.
+pub fn content_kek_from_lookup(
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<Option<ContentKeyEncryptionKey>, FleetError> {
     lookup(CONTENT_KEY_ENCRYPTION_KEY_ENV)

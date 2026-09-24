@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,7 +30,8 @@ use ostk_fleet_recall::store::cockroach::{
     CockroachStore, EMBEDDING_DIMENSION, PoolConfig, RetryPolicy, ScopedChunk,
     active_embedding_model, probe_conflict_lifecycle,
 };
-use ostk_fleet_recall::{CockroachMemoryService, FleetConfig, FleetScope};
+use ostk_fleet_recall::worker::{GhCliProviderFactory, WorkerCommandV1, WorkerProcessV1};
+use ostk_fleet_recall::{CockroachMemoryService, FleetConfig, FleetError, FleetScope};
 use ostk_recall_core::{
     Chunk, ChunkEmbedder, FacetSet, Links, Source, compose_header, filter_to_allowlist,
     is_archive_parent, is_valid_facet_key,
@@ -152,6 +154,21 @@ enum Command {
         #[arg(value_name = "BUNDLE")]
         bundle: PathBuf,
     },
+    /// Run one memory-worker tick: ingest the configured git, transcript, and
+    /// CI sources, then project and embed. Prints the tick report as one JSON
+    /// line and exits 1 when any step failed.
+    Worker {
+        /// The worker sources file (JSON).
+        #[arg(long, value_name = "PATH")]
+        sources: PathBuf,
+        /// Run exactly one tick and exit. Required: the worker has no
+        /// long-running loop, so schedule it (cron or a scheduled task).
+        #[arg(long)]
+        once: bool,
+        /// Comma-separated step groups: all, ingest, project, embed.
+        #[arg(long, default_value = "all", value_name = "GROUPS")]
+        steps: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +185,9 @@ impl Command {
             Self::Demo { .. } => RuntimeDatabaseIdentity::Publication,
             Self::Migrate => RuntimeDatabaseIdentity::Migrator,
             Self::ModelDigest { .. } => RuntimeDatabaseIdentity::None,
-            Self::Serve | Self::Health | Self::Ingest { .. } => RuntimeDatabaseIdentity::Writer,
+            Self::Serve | Self::Health | Self::Ingest { .. } | Self::Worker { .. } => {
+                RuntimeDatabaseIdentity::Writer
+            }
         }
     }
 }
@@ -214,7 +233,7 @@ impl IngestRole {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<ExitCode> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -251,16 +270,28 @@ async fn main() -> anyhow::Result<()> {
                 Command::Health => run_health(&config).await?,
                 Command::Serve => run_serve(config).await?,
                 Command::Ingest { input } => run_ingest(&config, &input).await?,
+                Command::Worker {
+                    sources,
+                    once,
+                    steps,
+                } => {
+                    let command = WorkerCommandV1 {
+                        sources,
+                        once,
+                        steps,
+                    };
+                    return run_worker(&config, &command).await;
+                }
                 Command::Demo { .. } | Command::Migrate | Command::ModelDigest { .. } => {
                     unreachable!("command identity was classified before configuration load")
                 }
             }
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
-async fn connect_store(config: &FleetConfig) -> anyhow::Result<CockroachStore> {
+async fn connect_store(config: &FleetConfig) -> ostk_fleet_recall::Result<CockroachStore> {
     let pool_config = PoolConfig {
         max_connections: config.max_connections,
         ..PoolConfig::default()
@@ -272,7 +303,6 @@ async fn connect_store(config: &FleetConfig) -> anyhow::Result<CockroachStore> {
         pool_config,
     )
     .await
-    .map_err(Into::into)
 }
 
 async fn connect_migrator_store(config: &FleetConfig) -> anyhow::Result<CockroachStore> {
@@ -347,6 +377,39 @@ async fn run_health(config: &FleetConfig) -> anyhow::Result<()> {
     let capabilities = store.capabilities().await?;
     println!("{}", serde_json::to_string_pretty(&capabilities)?);
     Ok(())
+}
+
+/// `worker --once`: one memory-worker tick as the writer login.
+///
+/// The library runs the whole command (`worker::run_command`); this binds it
+/// to the process: its environment, the pinned model bundle, `gh`, the writer
+/// connection, and stdout. The exit status is 1 when any step failed.
+async fn run_worker(config: &FleetConfig, command: &WorkerCommandV1) -> anyhow::Result<ExitCode> {
+    let load_embedder = || -> ostk_fleet_recall::Result<Arc<dyn ChunkEmbedder>> {
+        let embedder = load_pinned_embedder(config)
+            .map_err(|error| FleetError::Configuration(format!("{error:#}")))?;
+        Ok(Arc::new(embedder))
+    };
+    let lookup = |name: &str| std::env::var(name).ok();
+    let report = ostk_fleet_recall::worker::run_command(
+        command,
+        WorkerProcessV1 {
+            scope: config.default_scope.clone(),
+            embedding_model_sha256: &config.embedding_model_sha256,
+            load_embedder: &load_embedder,
+            lookup: &lookup,
+            ci_providers: Arc::new(GhCliProviderFactory),
+            retry: RetryPolicy::default(),
+        },
+        || async {
+            let store = connect_store(config).await?;
+            let capabilities = store.capabilities().await?;
+            Ok((store.pool().clone(), capabilities))
+        },
+        &mut io::stdout(),
+    )
+    .await?;
+    Ok(ExitCode::from(report.exit_code()))
 }
 
 async fn run_serve(config: FleetConfig) -> anyhow::Result<()> {
@@ -1557,6 +1620,11 @@ mod tests {
             Command::Serve,
             Command::Health,
             Command::Ingest { input: "-".into() },
+            Command::Worker {
+                sources: PathBuf::from("worker-sources.json"),
+                once: true,
+                steps: "all".into(),
+            },
         ] {
             assert_eq!(
                 command.runtime_database_identity(),
@@ -1979,6 +2047,40 @@ mod tests {
             cli.command,
             Command::Ingest { ref input } if input == "-"
         ));
+    }
+
+    #[test]
+    fn worker_cli_parses_its_flags_and_runs_as_the_writer() {
+        let cli = Cli::try_parse_from([
+            "ostk-fleet-recall",
+            "worker",
+            "--sources",
+            "x",
+            "--once",
+            "--steps",
+            "ingest,project",
+        ])
+        .expect("CLI");
+        assert_eq!(
+            cli.command.runtime_database_identity(),
+            RuntimeDatabaseIdentity::Writer
+        );
+        assert!(matches!(
+            cli.command,
+            Command::Worker { ref sources, once: true, ref steps }
+                if sources == Path::new("x") && steps == "ingest,project"
+        ));
+
+        let cli = Cli::try_parse_from(["ostk-fleet-recall", "worker", "--sources", "x"])
+            .expect("--once and --steps are optional to clap");
+        assert!(matches!(
+            cli.command,
+            Command::Worker { once: false, ref steps, .. } if steps == "all"
+        ));
+        assert!(
+            Cli::try_parse_from(["ostk-fleet-recall", "worker", "--once"]).is_err(),
+            "the sources file is required"
+        );
     }
 
     #[test]

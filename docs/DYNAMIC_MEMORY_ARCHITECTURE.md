@@ -18,12 +18,13 @@ history), a CI workflow-run connector, the content-addressed body projector,
 the coverage runtime, the lexical-first/dense-later recall projectors, the
 embedding worker's provider seam, and the Stage-6 normative activation,
 observer, and discrepancy runtimes are implemented as private-plane library
-modules with live CockroachDB tests. No serving path constructs any of them
-(only the observer has a runner, the private `ostk-observer-run` binary). The
-production embedding provider for that seam, `ChunkEmbedderProvider` over the
-pinned model2vec embedder, and the memory worker that runs every connector and
-projector for one scope (`src/worker`, `MemoryWorker::run_tick`) are library
-code that no binary constructs yet. The current source does implement the bounded PUBLIC-03 publication identity and
+modules with live CockroachDB tests. No serving path constructs any of them.
+Two commands run some of them. The private `ostk-observer-run` binary runs the
+observer. The `ostk-fleet-recall worker --once` subcommand runs the memory
+worker (`src/worker`), which runs every connector and projector for one scope,
+one tick per invocation. It embeds the dense tier through
+`ChunkEmbedderProvider`, the production provider for that seam, over the
+pinned model2vec embedder. The current source does implement the bounded PUBLIC-03 publication identity and
 planned AWS task input separation; those Terraform changes have not been
 applied.
 
@@ -676,9 +677,10 @@ pinned model2vec embedder `serve` and `ingest` load and declares its model
 digest, cosine distance, 512 dimensions, and the lexical normalization version
 as the embedding identity; it names an empty, non-finite, or zero vector as a
 provider failure, so an input the model cannot embed holds the dense cursor
-(never the lexical one) with a stated reason. No binary constructs it yet; the
-live tests drive the seam with a deterministic fixture, including its outage
-and degenerate-vector paths.
+(never the lexical one) with a stated reason. The worker's dense step
+constructs it from the model bundle it loads; the live tests drive the seam
+with a deterministic fixture, including its outage and degenerate-vector
+paths.
 
 The memory worker (`src/worker`) is the glue that runs this plane for one
 scope. `MemoryWorker::run_tick` verifies the writer authority afresh, binds the
@@ -692,10 +694,19 @@ failed or went stale from one that is current. Its receipts name the
 unregistered compile-time labels `coverage.freshness.worker_tick` and
 `coverage.proof.enumerated_snapshot`. The body projector consumes every
 `evidence.accepted` event in the scope, so observer-run records become bodies
-as well, indexed over their raw bytes. No binary constructs the worker yet.
+as well, indexed over their raw bytes.
 
-None of these modules is reachable from the serving process or from any binary,
-and the accepted-event append seam they use is the Stage-4 one, unchanged. There
+`ostk-fleet-recall worker --once` runs one tick as the private writer login and
+prints its report as one JSON line. It exits 1 when any step failed. Before the
+tick it reads only the inputs the selected steps need and checks every
+privilege they use. There is no loop or daemon, so a deployment schedules the
+command (cron or a scheduled task). The git and CI steps shell out to `git` and
+`gh`, which the production image does not carry, so ingest runs on a host;
+projection and embedding can run in the container.
+
+None of these modules is reachable from the serving process; outside tests,
+only the worker subcommand and `ostk-observer-run` run any of them. The accepted-event append seam
+they use is the Stage-4 one, unchanged. There
 is still no webhook, no transport queue, no remote connector cursor, no
 dead-letter path for a remote delivery, and no acknowledgement protocol:
 everything here reads local material on the private plane.
@@ -1040,11 +1051,10 @@ This does not require or authorize dynamic ingestion.
    Still absent at this stage: any Arrow IPC transport — the registry reserves
    an `arrow_batch_schema` entry kind, but no Arrow encoder, decoder, or
    dependency exists, and canonical bytes are the only transport in the merged
-   code; any binary that constructs the production embedding provider
-   (`ChunkEmbedderProvider`) behind the dense seam; a scheduler, daemon, or CLI
-   that runs any connector or projector — the memory worker library
-   (`src/worker`) runs them all for one scope, but only its own tests construct
-   it; and the publication-role grant on the two new views,
+   code; a scheduler or daemon that runs the connectors and projectors — the
+   `ostk-fleet-recall worker --once` subcommand runs them all for one scope, one
+   tick per invocation, embedding through `ChunkEmbedderProvider`, and a
+   deployment schedules it; and the publication-role grant on the two new views,
    which is a deployment action that has not been performed.
 6. Admit one exhaustive code/spec observer and add basic discrepancy derivation.
 

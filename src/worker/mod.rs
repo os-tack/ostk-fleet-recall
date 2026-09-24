@@ -9,6 +9,12 @@
 //!   -> bodies -> lexical -> dense  project: accepted events -> recall tiers
 //! ```
 //!
+//! `ostk-fleet-recall worker --once` runs one tick as a process through
+//! [`run_command`], which reads the inputs the selected steps need, checks the
+//! login's privileges, and prints the tick's [`WorkerTickReportV1`] as one
+//! JSON line. There is no long-running loop; a deployment schedules the
+//! command.
+//!
 //! # Authority
 //!
 //! Every tick that ingests verifies the writer authority afresh
@@ -68,6 +74,7 @@
 //! of the active package: no package registers them yet, and the coverage
 //! runtime does not resolve them.
 
+mod command;
 mod ingest;
 mod privileges;
 mod project;
@@ -95,6 +102,7 @@ use crate::projectors::EmbeddingProvider;
 use crate::registry_witness::WriterAuthorityRuntime;
 use crate::store::cockroach::RetryPolicy;
 
+pub use command::{WorkerCommandV1, WorkerProcessV1, run_command};
 pub use ingest::{COVERAGE_FRESHNESS_LABEL, COVERAGE_PROOF_LABEL, TRANSCRIPT_DRAIN_LIMIT};
 pub use privileges::{RUNTIME_GRANTS_POLICY, probe_worker_privileges};
 pub use sources::{
@@ -338,6 +346,13 @@ impl WorkerTickReportV1 {
     pub fn step(&self, step: WorkerStepV1) -> Option<&WorkerStepReportV1> {
         self.steps.get(&step)
     }
+
+    /// The `worker --once` exit status this tick earns: 1 when any step
+    /// failed, otherwise 0 (a skipped step is not a failure).
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        u8::from(self.failed())
+    }
 }
 
 /// Where the CI step gets a provider for one source.
@@ -469,30 +484,14 @@ impl MemoryWorker {
                 ));
             }
         }
+        require_inputs(&steps, |input| match input {
+            WorkerInput::Authority => deps.authority.is_some(),
+            WorkerInput::DrainKey => drain_kek.is_some(),
+            WorkerInput::BodyKey => body_kek.is_some(),
+            WorkerInput::Embedding => deps.embedding.is_some(),
+        })?;
         let ingest = steps.iter().any(|step| step.is_ingest());
         let bodies = steps.contains(&WorkerStepV1::Bodies);
-        if (ingest || bodies) && deps.authority.is_none() {
-            return Err(missing(
-                "the ingest and bodies steps",
-                "the writer-authority pins (FLEET_RECALL_CONTRACT_TENANT_NAMESPACE, \
-                 FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE, FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST)",
-            ));
-        }
-        if ingest && drain_kek.is_none() {
-            return Err(missing(
-                "the ingest steps",
-                "the content key (FLEET_RECALL_CONTENT_KEK_HEX)",
-            ));
-        }
-        if bodies && body_kek.is_none() {
-            return Err(missing(
-                "the bodies step",
-                "the content key (FLEET_RECALL_CONTENT_KEK_HEX)",
-            ));
-        }
-        if steps.contains(&WorkerStepV1::Dense) && deps.embedding.is_none() {
-            return Err(missing("the dense step", "an embedding provider"));
-        }
         let bodies = match (bodies, &deps.authority, body_kek) {
             (true, Some(authority), Some(kek)) => {
                 Some(Arc::new(CockroachBodyProjectionRepository::new(
@@ -565,8 +564,70 @@ impl MemoryWorker {
     }
 }
 
-fn missing(steps: &str, input: &str) -> FleetError {
-    FleetError::Configuration(format!("{steps} need {input}, which is not configured"))
+/// An input some steps cannot run without.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerInput {
+    /// The writer authority: the ingest steps append under it, and bodies
+    /// resolves governed content under its semantic scope.
+    Authority,
+    /// The content key the ingest drains seal with.
+    DrainKey,
+    /// The content key the body resolver opens with.
+    BodyKey,
+    /// The dense tier's provider.
+    Embedding,
+}
+
+impl WorkerInput {
+    const ALL: [Self; 4] = [
+        Self::Authority,
+        Self::DrainKey,
+        Self::BodyKey,
+        Self::Embedding,
+    ];
+
+    fn needed_by(self, steps: &BTreeSet<WorkerStepV1>) -> bool {
+        let ingest = steps.iter().any(|step| step.is_ingest());
+        let bodies = steps.contains(&WorkerStepV1::Bodies);
+        match self {
+            Self::Authority => ingest || bodies,
+            Self::DrainKey => ingest,
+            Self::BodyKey => bodies,
+            Self::Embedding => steps.contains(&WorkerStepV1::Dense),
+        }
+    }
+
+    fn refusal(self) -> FleetError {
+        let (steps, input) = match self {
+            Self::Authority => (
+                "the ingest and bodies steps",
+                "the writer-authority pins (FLEET_RECALL_CONTRACT_TENANT_NAMESPACE, \
+                 FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE, FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST)",
+            ),
+            Self::DrainKey => (
+                "the ingest steps",
+                "the content key (FLEET_RECALL_CONTENT_KEK_HEX)",
+            ),
+            Self::BodyKey => (
+                "the bodies step",
+                "the content key (FLEET_RECALL_CONTENT_KEK_HEX)",
+            ),
+            Self::Embedding => ("the dense step", "an embedding provider"),
+        };
+        FleetError::Configuration(format!("{steps} need {input}, which is not configured"))
+    }
+}
+
+/// Refuse, naming the first missing input, a step set some selected step of
+/// which lacks an input it needs. `present` says which inputs the caller has.
+fn require_inputs(
+    steps: &BTreeSet<WorkerStepV1>,
+    present: impl Fn(WorkerInput) -> bool,
+) -> Result<()> {
+    WorkerInput::ALL
+        .into_iter()
+        .find(|input| input.needed_by(steps) && !present(*input))
+        .map_or(Ok(()), |input| Err(input.refusal()))
 }
 
 #[cfg(test)]

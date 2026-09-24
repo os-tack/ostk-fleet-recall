@@ -515,10 +515,11 @@ and exact grant matrix), then restart `serve`.
   `record` itself still re-disputes the members of a dismissed pair when a new
   incompatible claim reopens their conflict, and waivers are unsigned and
   cannot be revoked early.
-- Wire the dynamic-memory runtimes that already exist as library code into a
-  worker or CLI and into MCP recall; the README's
-  [built but not yet wired](../README.md#built-but-not-yet-wired) section lists
-  what that needs.
+- Wire the dynamic-memory projections into MCP recall. The
+  `ostk-fleet-recall worker --once` subcommand already runs the Stage-5
+  connectors and projectors, but no recall path reads what they write yet. The
+  README's [built but not yet wired](../README.md#built-but-not-yet-wired)
+  section lists what that needs.
 - Package Fleet Recall as an optional OSTK Recall plugin/backend.
 - Add authenticated workload identity and dynamic multi-project routing
   without trusting MCP parameters.

@@ -13,11 +13,14 @@
 //! in the report and in its status row; and the whole tick, including the
 //! governed-content dedup path, runs under nothing but the runtime role's
 //! grants, while a login without the Stage-5 grants is refused by the
-//! preflight before anything runs.
+//! preflight before anything runs. The `worker --once` command
+//! (`worker::run_command`, the code path `ostk-fleet-recall worker` runs) reads
+//! its pins and key from its environment, prints each tick's report as one
+//! JSON line, and earns exit status 1 exactly when a step failed.
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -42,9 +45,9 @@ use ostk_fleet_recall::store::cockroach::{
     CockroachStore, DatabaseCapabilities, PoolConfig, RetryPolicy,
 };
 use ostk_fleet_recall::worker::{
-    CiProviderFactory, CiSourceV1, MemoryWorker, WorkerDeps, WorkerSourceOutcomeV1,
-    WorkerSourcesV1, WorkerStepStatusV1, WorkerStepV1, WorkerTickReportV1, parse_steps,
-    probe_worker_privileges,
+    CiProviderFactory, CiSourceV1, MemoryWorker, WorkerCommandV1, WorkerDeps, WorkerProcessV1,
+    WorkerSourceOutcomeV1, WorkerSourcesV1, WorkerStepStatusV1, WorkerStepV1, WorkerTickReportV1,
+    parse_steps, probe_worker_privileges, run_command,
 };
 use ostk_recall_core::ChunkEmbedder;
 use sha2::{Digest as _, Sha256};
@@ -277,8 +280,13 @@ impl Fixture {
     }
 
     fn sources(&self) -> WorkerSourcesV1 {
-        WorkerSourcesV1::from_json_slice(
-            &serde_json::to_vec(&serde_json::json!({
+        WorkerSourcesV1::from_json_slice(&serde_json::to_vec(&self.sources_json()).unwrap())
+            .expect("the fixture sources file is valid")
+    }
+
+    /// The sources file, as an operator would write it.
+    fn sources_json(&self) -> serde_json::Value {
+        serde_json::json!({
                 "schema_version": 1,
                 "coverage_since": "2026-08-01T00:00:00Z",
                 "git": [{
@@ -304,10 +312,53 @@ impl Fixture {
                     "workflow": RECORDED_WORKFLOW,
                     "branch": RECORDED_BRANCH
                 }]
-            }))
-            .unwrap(),
+        })
+    }
+
+    /// `worker --once --sources <file> --steps all` for this scope over
+    /// `pool`, with the installed pins and key as the command's environment.
+    /// Returns the command's outcome and what it printed.
+    async fn run_command(
+        &self,
+        pool: &PgPool,
+        capabilities: &DatabaseCapabilities,
+        sources: &Path,
+    ) -> (ostk_fleet_recall::Result<WorkerTickReportV1>, String) {
+        let mut variables: HashMap<String, String> = serde_json::from_value(
+            serde_json::to_value(&self.installed.report.pins).expect("the pins serialize"),
         )
-        .expect("the fixture sources file is valid")
+        .expect("the pins are one string per variable");
+        variables.insert(
+            "FLEET_RECALL_CONTENT_KEK_HEX".into(),
+            self.installed.kek_hex.clone(),
+        );
+        let lookup = |name: &str| variables.get(name).cloned();
+        let load_embedder =
+            || -> ostk_fleet_recall::Result<Arc<dyn ChunkEmbedder>> { Ok(Arc::new(StubEmbedder)) };
+        let connection = (pool.clone(), capabilities.clone());
+        let mut out = Vec::new();
+        let outcome = run_command(
+            &WorkerCommandV1 {
+                sources: sources.to_path_buf(),
+                once: true,
+                steps: "all".into(),
+            },
+            WorkerProcessV1 {
+                scope: self.installed.scope.clone(),
+                embedding_model_sha256: &"5a".repeat(32),
+                load_embedder: &load_embedder,
+                lookup: &lookup,
+                ci_providers: Arc::new(RecordedCi),
+                retry: retry_policy(),
+            },
+            move || async move { Ok(connection) },
+            &mut out,
+        )
+        .await;
+        (
+            outcome,
+            String::from_utf8(out).expect("the report is UTF-8"),
+        )
     }
 
     /// A worker running `steps` over `pool` (the owner, or a probe login).
@@ -671,5 +722,76 @@ async fn live_worker_runs_under_runtime_grants_when_configured() {
     assert_all_ok(&report);
     for step in WorkerStepV1::INGEST {
         assert!(counter(&report, step, "appended") > 0, "{step:?}");
+    }
+}
+
+/// The one line a `worker --once` run printed, parsed; it must be the report
+/// the run returned.
+fn printed_report(printed: &str, report: &WorkerTickReportV1) -> serde_json::Value {
+    assert!(printed.ends_with('\n'), "the report line is terminated");
+    assert_eq!(
+        printed.lines().count(),
+        1,
+        "one tick prints one line: {printed}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(printed).expect("the line is JSON");
+    assert_eq!(parsed, serde_json::to_value(report).unwrap());
+    parsed
+}
+
+#[tokio::test]
+async fn live_worker_command_once_writes_one_report_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let owner = common::migrated_pool(&database_url).await;
+    let capabilities = capabilities(&database_url).await;
+    let fixture = Fixture::install(&owner, "worker-command").await;
+    let directory = tempfile::tempdir().expect("sources directory");
+    let sources = directory.path().join("worker-sources.json");
+    std::fs::write(
+        &sources,
+        serde_json::to_vec_pretty(&fixture.sources_json()).unwrap(),
+    )
+    .unwrap();
+
+    // A login without the Stage-5 grants is refused before the tick, so
+    // nothing is printed and nothing is appended.
+    let without = RuntimeProbeRole::create_worker(&owner, &database_url, false).await;
+    let (refused, printed) = fixture
+        .run_command(&without.pool, &capabilities, &sources)
+        .await;
+    without.drop_role(&owner).await;
+    match refused {
+        Err(FleetError::Configuration(message)) => {
+            assert!(message.contains("runtime-role-grants.sql"), "{message}");
+        }
+        other => panic!("the preflight must refuse the login: {other:?}"),
+    }
+    assert!(printed.is_empty(), "a refused run prints no report");
+    assert!(fixture.evidence_kinds(&owner).await.is_empty());
+
+    let (outcome, printed) = fixture.run_command(&owner, &capabilities, &sources).await;
+    let report = outcome.expect("a healthy tick completes");
+    assert_all_ok(&report);
+    assert_eq!(report.exit_code(), 0);
+    let parsed = printed_report(&printed, &report);
+    assert_eq!(parsed["authority"]["generation"], 2);
+
+    std::fs::write(
+        fixture.transcripts.path().join("broken.jsonl"),
+        format!(
+            "{}\n",
+            r#"{"type":"telemetry-burst","sessionId":"s","uuid":"u","timestamp":"2026-08-15T12:30:00.000Z"}"#
+        ),
+    )
+    .unwrap();
+    let (outcome, printed) = fixture.run_command(&owner, &capabilities, &sources).await;
+    let report = outcome.expect("a tick with a failed step still reports");
+    assert_eq!(report.exit_code(), 1, "a failed step fails the process");
+    let parsed = printed_report(&printed, &report);
+    assert_eq!(parsed["steps"]["transcript"]["status"], "failed");
+    for step in ["git", "ci", "bodies", "lexical", "dense"] {
+        assert_eq!(parsed["steps"][step]["status"], "ok", "{step}");
     }
 }

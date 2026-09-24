@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "coverage_since": "2026-01-01T00:00:00Z",
+  "stale_after_seconds": 86400,
+  "git": [
+    {
+      "connector_principal": "connector.git",
+      "connector_instance": "connector.git.fleet-recall",
+      "installation_id": 1,
+      "repository_id": "git.repo.fleet-recall",
+      "git_dir": "/srv/fleet-recall/repos/ostk-fleet-recall/.git",
+      "ref_name": "refs/heads/main"
+    }
+  ],
+  "transcripts": [
+    {
+      "connector_principal": "connector.transcript",
+      "instance_prefix": "connector.transcript",
+      "installation_id": 1,
+      "dirs": ["/srv/fleet-recall/transcripts"]
+    }
+  ],
+  "ci": [
+    {
+      "connector_principal": "connector.ci",
+      "connector_instance": "connector.ci.fleet-recall",
+      "installation_id": 1,
+      "repository_id": "ci.repo.fleet-recall",
+      "provider_repository": "os-tack/ostk-fleet-recall",
+      "workflow": "ci.yml",
+      "branch": "main"
+    }
+  ]
+}
