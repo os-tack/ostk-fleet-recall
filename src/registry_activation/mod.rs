@@ -1,9 +1,13 @@
 //! Private persistence boundary for the one genesis registry activation.
+//!
+//! [`install`] drives the whole signed chain (control bootstrap, genesis,
+//! `0 -> 1`, `1 -> 2`) for one physical scope in a single idempotent call.
 
 mod cockroach;
 mod generic_successor_cockroach;
 mod generic_successor_repository;
 mod genesis_audit;
+pub mod install;
 mod repository;
 mod successor_cockroach;
 mod successor_repository;

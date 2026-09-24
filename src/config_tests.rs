@@ -1651,3 +1651,131 @@ fn reconciliation_rejects_invalid_physical_scope() {
         );
     }
 }
+
+const PROCESS_WRITER_URL: &str = "postgresql://fleet_writer:writer-secret@cluster.example:26257/fleet_recall?sslmode=verify-full";
+const PROCESS_MIGRATOR_URL: &str = "postgresql://fleet_migrator:migrator-secret@cluster.example:26257/fleet_recall?sslmode=verify-full";
+
+fn writer_process_values(database_url: &str) -> BTreeMap<&'static str, String> {
+    BTreeMap::from([
+        ("FLEET_RECALL_DATABASE_URL", database_url.to_owned()),
+        (
+            "FLEET_RECALL_TENANT_ID",
+            "0198a849-f6ae-7d61-9800-000000000001".into(),
+        ),
+        ("FLEET_RECALL_PROJECT", "physical-project".into()),
+    ])
+}
+
+#[test]
+fn writer_process_config_names_each_missing_variable() {
+    for omitted in [
+        "FLEET_RECALL_DATABASE_URL",
+        "FLEET_RECALL_TENANT_ID",
+        "FLEET_RECALL_PROJECT",
+    ] {
+        let mut values = writer_process_values(PROCESS_WRITER_URL);
+        values.remove(omitted);
+        let error = WriterProcessConfig::from_lookup("ostk-spec", |name| values.get(name).cloned())
+            .expect_err("a missing process variable must fail closed");
+        assert!(
+            error.to_string().contains(omitted),
+            "the error must name the missing variable {omitted}: {error}"
+        );
+    }
+}
+
+#[test]
+fn writer_process_config_binds_its_login_scope_and_agent_without_serving_inputs() {
+    let writer_values = writer_process_values(PROCESS_WRITER_URL);
+    let writer =
+        WriterProcessConfig::from_lookup("ostk-spec", |name| writer_values.get(name).cloned())
+            .expect("a writer process needs no embedding model, agent, or pins");
+    assert_eq!(writer.database_url(), PROCESS_WRITER_URL);
+    assert_eq!(
+        writer.database_ssl_policy(),
+        PrivatePostgresSslPolicy::VerifyFull
+    );
+    assert_eq!(
+        writer.physical_scope().tenant_id,
+        Uuid::parse_str("0198a849-f6ae-7d61-9800-000000000001").unwrap()
+    );
+    assert_eq!(writer.physical_scope().project, "physical-project");
+    assert_eq!(writer.physical_scope().agent, "ostk-spec");
+    let debug = format!("{writer:?}");
+    assert!(!debug.contains("writer-secret"));
+    assert!(debug.contains("<redacted>"));
+
+    // Each constructor admits exactly its own login.
+    assert!(
+        WriterProcessConfig::from_migrator_lookup("ostk-authority-install", |name| {
+            writer_values.get(name).cloned()
+        })
+        .is_err(),
+        "the migrator process must refuse the writer login"
+    );
+    let migrator_values = writer_process_values(PROCESS_MIGRATOR_URL);
+    WriterProcessConfig::from_migrator_lookup("ostk-authority-install", |name| {
+        migrator_values.get(name).cloned()
+    })
+    .expect("the migrator process admits the migrator login");
+    assert!(
+        WriterProcessConfig::from_lookup("ostk-spec", |name| migrator_values.get(name).cloned())
+            .is_err(),
+        "the writer process must refuse the migrator login"
+    );
+}
+
+#[test]
+fn writer_process_config_keeps_the_local_escape_and_rejects_a_bad_scope() {
+    let mut local = writer_process_values(
+        "postgresql://fleet_writer:local@127.0.0.1:26257/fleet_recall?sslmode=disable",
+    );
+    assert!(
+        WriterProcessConfig::from_lookup("ostk-spec", |name| local.get(name).cloned()).is_err(),
+        "plaintext needs the explicit local escape"
+    );
+    local.insert("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE", "1".into());
+    let config = WriterProcessConfig::from_lookup("ostk-spec", |name| local.get(name).cloned())
+        .expect("the loopback escape admits plaintext");
+    assert_eq!(
+        config.database_ssl_policy(),
+        PrivatePostgresSslPolicy::Disable
+    );
+
+    for (name, value) in [
+        ("FLEET_RECALL_TENANT_ID", "not-a-uuid"),
+        (
+            "FLEET_RECALL_TENANT_ID",
+            "00000000-0000-0000-0000-000000000000",
+        ),
+        ("FLEET_RECALL_PROJECT", " physical-project "),
+    ] {
+        let mut values = writer_process_values(PROCESS_WRITER_URL);
+        values.insert(name, value.into());
+        assert!(
+            WriterProcessConfig::from_lookup("ostk-spec", |name| values.get(name).cloned())
+                .is_err(),
+            "accepted invalid process scope {name}"
+        );
+    }
+}
+
+#[test]
+fn contract_semantic_scope_names_each_missing_namespace() {
+    let values = writer_authority_values();
+    let scope = contract_semantic_scope_from_lookup(|name| values.get(name).cloned())
+        .expect("both namespaces are present");
+    assert_eq!(scope.tenant_namespace.as_str(), "tenant.acme");
+    assert_eq!(scope.project_namespace.as_str(), "project.recall");
+
+    for omitted in &WRITER_AUTHORITY_PIN_ENV_NAMES[..2] {
+        let mut values = writer_authority_values();
+        values.remove(omitted);
+        let error = contract_semantic_scope_from_lookup(|name| values.get(name).cloned())
+            .expect_err("a missing namespace must fail closed");
+        assert!(
+            error.to_string().contains(omitted),
+            "the error must name the missing variable {omitted}: {error}"
+        );
+    }
+}

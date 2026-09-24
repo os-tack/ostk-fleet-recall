@@ -584,7 +584,9 @@ impl WriterAuthorityConfig {
         Self::from_lookup(|name| env::var(name).ok())
     }
 
-    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Option<Self>> {
+    pub(crate) fn from_lookup(
+        mut lookup: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Option<Self>> {
         let tenant_namespace = lookup(WRITER_AUTHORITY_PIN_ENV_NAMES[0]);
         let project_namespace = lookup(WRITER_AUTHORITY_PIN_ENV_NAMES[1]);
         let receipt_digest = lookup(WRITER_AUTHORITY_PIN_ENV_NAMES[2]);
@@ -678,6 +680,131 @@ impl WriterAuthorityConfig {
     #[must_use]
     pub const fn expected_activation_id(&self) -> Option<Sha256Digest> {
         self.expected_activation_id
+    }
+}
+
+/// Read the contract tenant/project namespaces an operator process acts for.
+///
+/// These are the first two variables of the writer-authority pin group
+/// ([`WriterAuthorityConfig`]), read on their own by a process that has to know
+/// the semantic scope before any receipt digest exists — the writer-authority
+/// installer mints the receipt the third pin names. Both are required.
+pub fn contract_semantic_scope_from_env() -> Result<AuthenticatedProjectScopeV1> {
+    contract_semantic_scope_from_lookup(|name| env::var(name).ok())
+}
+
+fn contract_semantic_scope_from_lookup(
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<AuthenticatedProjectScopeV1> {
+    let tenant_namespace = required_from(&mut lookup, WRITER_AUTHORITY_PIN_ENV_NAMES[0])?;
+    let project_namespace = required_from(&mut lookup, WRITER_AUTHORITY_PIN_ENV_NAMES[1])?;
+    Ok(AuthenticatedProjectScopeV1::from_trusted_context(
+        parse_contract_id(&tenant_namespace, WRITER_AUTHORITY_PIN_ENV_NAMES[0])?,
+        parse_contract_id(&project_namespace, WRITER_AUTHORITY_PIN_ENV_NAMES[1])?,
+    ))
+}
+
+/// Database identity and physical scope of a one-shot private operator
+/// process: the writer-authority installer today, `ostk-spec` and the worker
+/// later.
+///
+/// It reads the same variables as the serving runtime's database and scope —
+/// `FLEET_RECALL_DATABASE_URL` (with the `FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1`
+/// loopback escape), `FLEET_RECALL_TENANT_ID`, and `FLEET_RECALL_PROJECT` —
+/// and nothing else: no embedding model, no lifecycle switch, and no
+/// writer-authority pins. Only the login the URL must authenticate as differs
+/// by process, exactly as it does between `serve` and `migrate`:
+/// [`Self::from_env`] requires the private writer login and
+/// [`Self::from_migrator_env`] the schema owner/migrator login. The agent is
+/// the process's own fixed name, never configuration.
+#[derive(Clone)]
+pub struct WriterProcessConfig {
+    database_url: String,
+    database_ssl_policy: PrivatePostgresSslPolicy,
+    physical_scope: FleetScope,
+}
+
+impl std::fmt::Debug for WriterProcessConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WriterProcessConfig")
+            .field("database_url", &"<redacted>")
+            .field("database_ssl_policy", &self.database_ssl_policy)
+            .field("physical_scope", &self.physical_scope)
+            .finish()
+    }
+}
+
+impl WriterProcessConfig {
+    /// Load a process that authenticates as the private writer login.
+    pub fn from_env(agent: &str) -> Result<Self> {
+        Self::from_lookup(agent, |name| env::var(name).ok())
+    }
+
+    /// Load a process that authenticates as the schema owner/migrator login,
+    /// the same credential convention as `ostk-fleet-recall migrate`.
+    pub fn from_migrator_env(agent: &str) -> Result<Self> {
+        Self::from_migrator_lookup(agent, |name| env::var(name).ok())
+    }
+
+    /// [`Self::from_env`] over an injected variable lookup.
+    pub fn from_lookup(agent: &str, lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        Self::from_lookup_for_database_user(agent, lookup, WRITER_POSTGRES_USER)
+    }
+
+    /// [`Self::from_migrator_env`] over an injected variable lookup.
+    pub fn from_migrator_lookup(
+        agent: &str,
+        lookup: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self> {
+        Self::from_lookup_for_database_user(agent, lookup, MIGRATOR_POSTGRES_USER)
+    }
+
+    fn from_lookup_for_database_user(
+        agent: &str,
+        mut lookup: impl FnMut(&str) -> Option<String>,
+        expected_user: &str,
+    ) -> Result<Self> {
+        let database_url = required_from(&mut lookup, "FLEET_RECALL_DATABASE_URL")?;
+        let tenant_id = required_from(&mut lookup, "FLEET_RECALL_TENANT_ID")?;
+        let project = required_from(&mut lookup, "FLEET_RECALL_PROJECT")?;
+        let allow_insecure_local =
+            lookup("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE").is_some_and(|value| value == "1");
+        let database_ssl_policy = validate_private_runtime_database_url(
+            &database_url,
+            allow_insecure_local,
+            expected_user,
+        )?;
+        let tenant_id = tenant_id.parse::<Uuid>().map_err(|error| {
+            FleetError::Configuration(format!("FLEET_RECALL_TENANT_ID must be a UUID: {error}"))
+        })?;
+        Ok(Self {
+            database_url,
+            database_ssl_policy,
+            physical_scope: FleetScope::new(
+                tenant_id,
+                project,
+                agent,
+                None,
+                PrivacyTier::T1Project,
+            )?,
+        })
+    }
+
+    #[must_use]
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    #[must_use]
+    pub const fn database_ssl_policy(&self) -> PrivatePostgresSslPolicy {
+        self.database_ssl_policy
+    }
+
+    /// The physical `(tenant_id, project)` every query of this process binds.
+    #[must_use]
+    pub const fn physical_scope(&self) -> &FleetScope {
+        &self.physical_scope
     }
 }
 

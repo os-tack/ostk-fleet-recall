@@ -215,6 +215,36 @@ impl CockroachGenesisActivationRepository {
         })
     }
 
+    /// The audited head binding of the one durable genesis activation, or
+    /// `None` while the genesis registry head is still absent.
+    ///
+    /// A genesis statement is signed at ceremony time, so a later run cannot
+    /// rebuild the accepted statement and replay it. The writer-authority
+    /// installer resumes from this instead: it reconstructs the immutable
+    /// genesis root through the same full audit the first-successor ceremony
+    /// runs, and never trusts an unaudited row.
+    pub(super) async fn accepted_genesis_head(&self) -> Result<Option<RegistryHeadBindingV1>> {
+        let scope = self.trusted_scope.clone();
+        let authority = Arc::clone(&self.authority);
+        let pool = self.pool.clone();
+        let policy = self.retry_policy;
+        with_serializable_retry(&pool, policy, move |transaction| {
+            let scope = scope.clone();
+            let authority = Arc::clone(&authority);
+            Box::pin(async move {
+                require_activation_schema(transaction).await?;
+                if select_registry_head(transaction, &scope).await?.is_none() {
+                    return Ok(None);
+                }
+                genesis_audit::audit_immutable_genesis_root(transaction, &scope, &authority)
+                    .await?
+                    .head_binding()
+                    .map(Some)
+            })
+        })
+        .await
+    }
+
     fn prepare_request(
         &self,
         request: &VerifiedGenesisRegistryActivationRequest,

@@ -224,3 +224,84 @@ grants, which this dedicated-database policy replaces explicitly:
 real CockroachDB database; see the README's
 [development workflow](../README.md#development-workflow) for running the live
 tests.
+
+## Writer-authority installer
+
+The ceremony CLIs above each take canonical artifacts that someone must author
+and sign by hand at ceremony time. A deployment or disposable database that
+only needs its event-first writers to run can use `ostk-authority-install`
+instead. It drives the same four signed repositories in order, idempotently:
+the control bootstrap, the genesis activation, the `0 -> 1` first successor to
+the compiled Stage-4 package, and the generic `1 -> 2` transition to the
+compiled generation-2 connector package. It then prints the writer-authority
+pins. Generation 2 is its only target. Like the other ceremony binaries, it is
+a workstation tool: it is not in the production image, and the CI image job
+asserts that it is absent.
+
+### Runbook
+
+Run it once per physical `(tenant_id, project)`, after `ostk-fleet-recall
+migrate` has applied the complete migration prefix:
+
+```bash
+export FLEET_RECALL_DATABASE_URL=...               # schema owner/migrator login
+export FLEET_RECALL_TENANT_ID=...                  # physical tenant UUID
+export FLEET_RECALL_PROJECT=...                    # physical project
+export FLEET_RECALL_CONTRACT_TENANT_NAMESPACE=...   # for example tenant.acme
+export FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE=... # for example project.recall
+cargo run --locked --bin ostk-authority-install -- apply
+```
+
+- **Credential.** `FLEET_RECALL_DATABASE_URL` must authenticate as the schema
+  owner/migrator (`fleet_migrator`), the same convention as `migrate`, and it
+  is validated the same way (`sslmode=verify-full`, or
+  `FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1` for a loopback database).
+  The steps write the control and registry tables. No application role can
+  write those tables; the migrator/schema owner keeps technical authority over
+  them (see [migration operations](MIGRATIONS.md)). The installer adds no
+  grant and needs none. The runtime and publication roles gain nothing.
+  Withdraw the migrator credential afterward, as you would after `migrate`.
+- **Output.** One JSON report: each step with `inserted` or
+  `already_present`, the active `generation`, its `activation_id`, the
+  activated `package`, and `pins`. The `pins` object's keys are the
+  environment variables `FLEET_RECALL_CONTRACT_TENANT_NAMESPACE`,
+  `FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE`, and
+  `FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST`. Export them to every event-first
+  writer for that physical scope. The optional break-glass
+  `FLEET_RECALL_EXPECTED_ACTIVATION_ID` takes the reported `activation_id`.
+  The run ends by verifying the strict writer-authority witness under exactly
+  these pins.
+- **Re-runs.** A re-run reports every step `already_present`, with the same
+  pins and the same activation. A run that stopped partway resumes where it
+  stopped. The genesis step resumes from the audited genesis root, because its
+  statement is signed at ceremony time and cannot be replayed. Do not run two
+  installers against one physical scope at the same time. The loser fails
+  closed, and running it again completes the install.
+- **Refusals.** The installer never repairs anything. It refuses a physical
+  scope that already holds another bootstrap receipt, other contract
+  namespaces, a package the strict witness does not know, or the generation-1
+  package re-activated past generation 1. Installing other namespaces over
+  an installed physical scope is therefore refused, and the installed head
+  stays as it was.
+- **Receipt.** The bootstrap receipt is a pure function of the request. It is
+  the frozen `v1/bootstrap-receipt.jsonl` statement with its scope rewritten
+  to the requested namespaces and its partition seed set to a domain digest
+  of the physical tenant and project. Two physical scopes therefore never
+  share a genesis epoch, even when they share namespaces.
+
+### The signatures are nominal
+
+Every signature the installer makes uses the public Ed25519 test fixture keys:
+seeds `0x01` and `0x02`. The frozen receipt names these keys `principal.1` and
+`principal.2`, and the compiled activation policy names them `principal.alice`
+and `principal.bob`. The installer also mints the generation-2 conformance
+result itself. Anyone can reproduce these signatures, so they authenticate
+nothing. Two things carry the authority. First, database role separation:
+only the owner/migrator login can write the tables this touches. Second, the
+out-of-band receipt-digest pin that each writer process loads. A deployment
+that needs real governance must author and sign its own ceremony artifacts
+with the four CLIs above, and pin that receipt instead.
+
+The connected tests install their authority through the same library function
+(`tests/common/authority.rs`); `tests/authority_install_live.rs` proves
+the install, its idempotency, and the refusal.

@@ -124,6 +124,11 @@ of the serving one.
   receipts as one signed, content-addressed bootstrap-manifest event.
 - `ostk-observer-run` runs the exhaustive observer over one enum at one exact
   commit and emits a run receipt and typed observer result.
+- `ostk-authority-install` takes one physical scope to an active generation-2
+  registry head and prints the writer-authority pins. Unlike the tools above,
+  it reads `FLEET_RECALL_DATABASE_URL` as the schema owner/migrator login,
+  the same convention as `migrate`. Its fixture-key signatures are nominal; see
+  [writer-authority installer](docs/CONTROL_BOOTSTRAP.md#writer-authority-installer).
 
 The grants and gates these tools rely on are described in
 [migration operations](docs/MIGRATIONS.md) and
