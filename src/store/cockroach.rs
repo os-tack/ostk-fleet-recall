@@ -116,8 +116,25 @@ async fn pin_publication_session(connection: &mut PgConnection) -> sqlx::Result<
     Ok(())
 }
 
-/// Deterministic schema resolution for writer and migrator sessions.
+/// Deterministic schema resolution for writer sessions.
 pub const PRIVATE_RUNTIME_SEARCH_PATH: &str = "pg_catalog, public, pg_temp";
+/// Schema resolution for the one-shot schema migrator session.
+///
+/// A database creates an unqualified object in the first schema the
+/// `search_path` names. The embedded migrations, like `SQLx`'s own
+/// `_sqlx_migrations`, create unqualified objects, so under
+/// [`PRIVATE_RUNTIME_SEARCH_PATH`] they would target `pg_catalog`, which
+/// `CockroachDB` refuses (SQLSTATE 42501). This path names `public` first, so
+/// DDL lands there. It leaves `pg_catalog` unnamed, and an unnamed
+/// `pg_catalog` is searched implicitly before every named schema. Name
+/// resolution therefore keeps the writer's order: `pg_catalog`, then
+/// `public`, then `pg_temp`. The migrator pin witnesses both facts on every
+/// session.
+pub const MIGRATOR_SEARCH_PATH: &str = "public, pg_temp";
+/// The schema the migrator's unqualified DDL must create objects in.
+const MIGRATOR_CREATION_SCHEMA: &str = "public";
+/// The schema every private session must resolve names in first.
+const PRIVATE_RUNTIME_FIRST_RESOLVED_SCHEMA: &str = "pg_catalog";
 const PRIVATE_RUNTIME_CURRENT_USER_SQL: &str = "SELECT pg_catalog.current_user()";
 const PRIVATE_RUNTIME_CURRENT_DATABASE_SQL: &str = "SELECT pg_catalog.current_database()";
 const PRIVATE_RUNTIME_CURRENT_APPLICATION_NAME_SQL: &str =
@@ -126,6 +143,8 @@ const PRIVATE_RUNTIME_SET_SEARCH_PATH_SQL: &str =
     "SELECT pg_catalog.set_config('search_path', $1, false)";
 const PRIVATE_RUNTIME_CURRENT_SEARCH_PATH_SQL: &str =
     "SELECT pg_catalog.current_setting('search_path')";
+const PRIVATE_RUNTIME_SCHEMA_RESOLUTION_SQL: &str =
+    "SELECT pg_catalog.current_schema(), (pg_catalog.current_schemas(true))[1]";
 
 #[derive(Clone, Copy)]
 enum PrivateRuntimeSessionIdentity {
@@ -147,9 +166,24 @@ impl PrivateRuntimeSessionIdentity {
             Self::Migrator => MIGRATOR_POSTGRES_APPLICATION_NAME,
         }
     }
+
+    const fn search_path(self) -> &'static str {
+        match self {
+            Self::Writer => PRIVATE_RUNTIME_SEARCH_PATH,
+            Self::Migrator => MIGRATOR_SEARCH_PATH,
+        }
+    }
 }
 
 async fn pin_private_runtime_session(
+    connection: &mut PgConnection,
+    identity: PrivateRuntimeSessionIdentity,
+) -> sqlx::Result<()> {
+    witness_private_runtime_principal(connection, identity).await?;
+    pin_private_runtime_search_path(connection, identity).await
+}
+
+async fn witness_private_runtime_principal(
     connection: &mut PgConnection,
     identity: PrivateRuntimeSessionIdentity,
 ) -> sqlx::Result<()> {
@@ -181,18 +215,44 @@ async fn pin_private_runtime_session(
                 .into(),
         ));
     }
+    Ok(())
+}
+
+/// Set and witness the identity's fixed `search_path`. A migrator session
+/// also proves it creates in `public` while still resolving `pg_catalog`
+/// first; see [`MIGRATOR_SEARCH_PATH`].
+async fn pin_private_runtime_search_path(
+    connection: &mut PgConnection,
+    identity: PrivateRuntimeSessionIdentity,
+) -> sqlx::Result<()> {
     sqlx::query_scalar::<_, String>(PRIVATE_RUNTIME_SET_SEARCH_PATH_SQL)
-        .bind(PRIVATE_RUNTIME_SEARCH_PATH)
+        .bind(identity.search_path())
         .fetch_one(&mut *connection)
         .await?;
     let search_path = sqlx::query_scalar::<_, String>(PRIVATE_RUNTIME_CURRENT_SEARCH_PATH_SQL)
         .fetch_one(&mut *connection)
         .await?;
-    if search_path != PRIVATE_RUNTIME_SEARCH_PATH {
+    if search_path != identity.search_path() {
         return Err(sqlx::Error::Protocol(
             "private PostgreSQL session did not retain its fixed search path; connection details are redacted"
                 .into(),
         ));
+    }
+    if matches!(identity, PrivateRuntimeSessionIdentity::Migrator) {
+        let (creation_schema, first_resolved_schema) =
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                PRIVATE_RUNTIME_SCHEMA_RESOLUTION_SQL,
+            )
+            .fetch_one(&mut *connection)
+            .await?;
+        if creation_schema.as_deref() != Some(MIGRATOR_CREATION_SCHEMA)
+            || first_resolved_schema.as_deref() != Some(PRIVATE_RUNTIME_FIRST_RESOLVED_SCHEMA)
+        {
+            return Err(sqlx::Error::Protocol(
+                "private PostgreSQL migrator session did not create in public while resolving pg_catalog first; connection details are redacted"
+                    .into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -2953,6 +3013,102 @@ mod tests {
         assert_eq!(object_count, 0);
         assert_eq!(history_count, 1);
         connection.close().await.unwrap();
+    }
+
+    /// `ostk-fleet-recall migrate` must build the complete schema in a database
+    /// nothing has migrated yet. The migrator's principal witness admits only
+    /// `fleet_migrator` on `fleet_recall`, so this test creates its own
+    /// uniquely named database and drops it afterwards. Every session there is
+    /// pinned by the migrator's own search-path pin, as `connect_migrator`
+    /// pins it, and then runs what `run_migrate` runs after connecting.
+    #[tokio::test]
+    async fn live_migrator_session_migrates_a_fresh_database_when_configured() {
+        use futures::FutureExt as _;
+
+        let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+            return;
+        };
+        let owner = CockroachStore::connect(
+            &database_url,
+            scope("live-fresh-database-migrate-owner"),
+            PoolConfig {
+                max_connections: 1,
+                ..PoolConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let database = format!("fleet_recall_fresh_migrate_{}", Uuid::now_v7().simple());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(owner.pool())
+            .await
+            .unwrap();
+
+        let outcome =
+            std::panic::AssertUnwindSafe(migrate_fresh_database(&database_url, &database))
+                .catch_unwind()
+                .await;
+
+        sqlx::query(&format!("DROP DATABASE {database} CASCADE"))
+            .execute(owner.pool())
+            .await
+            .unwrap();
+        owner.pool().close().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    async fn migrate_fresh_database(database_url: &str, database: &str) {
+        let options = database_url
+            .parse::<PgConnectOptions>()
+            .unwrap()
+            .database(database)
+            .application_name(MIGRATOR_POSTGRES_APPLICATION_NAME);
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .after_connect(|connection, _metadata| {
+                Box::pin(async move {
+                    pin_private_runtime_search_path(
+                        connection,
+                        PrivateRuntimeSessionIdentity::Migrator,
+                    )
+                    .await
+                })
+            })
+            .before_acquire(|connection, _metadata| {
+                Box::pin(async move {
+                    pin_private_runtime_search_path(
+                        connection,
+                        PrivateRuntimeSessionIdentity::Migrator,
+                    )
+                    .await?;
+                    Ok(true)
+                })
+            })
+            .connect_with(options)
+            .await
+            .unwrap();
+        let store = CockroachStore::from_pool(pool, scope("live-fresh-database-migrate")).unwrap();
+
+        store
+            .migrate()
+            .await
+            .expect("a migrator session must migrate a database with no schema yet");
+        store.initialize_embedding_model("live-test").await.unwrap();
+        let capabilities = store.capabilities().await.unwrap();
+        let latest = *EMBEDDED_MIGRATION_VERSIONS.last().unwrap();
+        assert_eq!(capabilities.schema_version, latest);
+        assert!(capabilities.vector_index_enabled);
+        assert!(capabilities.lexical_index_enabled);
+        assert!(capabilities.conflict_membership_index_enabled);
+        assert!(capabilities.claim_support_chunk_index_enabled);
+
+        // An operator re-running `migrate` over the recorded history changes
+        // nothing and still succeeds.
+        store.migrate().await.unwrap();
+        assert_eq!(store.capabilities().await.unwrap().schema_version, latest);
+        store.pool().close().await;
     }
 
     /// Set `FLEET_RECALL_TEST_DATABASE_URL` to a disposable `CockroachDB` 26.2

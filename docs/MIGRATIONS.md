@@ -84,6 +84,18 @@ returns to the shared runtime pool. A live CockroachDB test forces the history
 insert to fail after DDL and requires both the new table and history row to be
 absent.
 
+Every migrator session pins `search_path = public, pg_temp`. The writer pins
+`pg_catalog, public, pg_temp`, and the migrator cannot use that path. The
+migrations, like SQLx's own `_sqlx_migrations`, create objects without a schema
+name, and a database creates such an object in the first schema that
+`search_path` names. Under the writer's path that schema is `pg_catalog`, and
+CockroachDB refuses it with SQLSTATE `42501`. An unnamed `pg_catalog` is still
+searched before every named schema, so names resolve in the same order as for
+the writer. On every new and reused connection, the migrator pin checks both
+facts: the session creates objects in `public`, and it resolves names in
+`pg_catalog` first. A live test runs `migrate` on a newly created database over
+sessions pinned this way.
+
 Versions 15 onward form a third phase with
 `autocommit_before_ddl = true` and `no_tx = true`. Migration 15 accepts only the
 exact old-only, old-plus-new, or new-only detector-index transition states. It
