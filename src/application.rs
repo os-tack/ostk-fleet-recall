@@ -2326,10 +2326,34 @@ fn evidence_search_result(search: EvidenceSearchV1) -> RecallResult {
     result
 }
 
-/// `recall(status).evidence` and the warnings it adds. A failed read is a
-/// warning, never a failed status.
+/// How long `recall(status)` waits for its evidence block.
+///
+/// The evidence read counts the scope's projection tiers, which grows with the
+/// evidence, while `status` is the cheap health check clients poll. Bounded
+/// well inside the MCP server's 30-second request deadline, a slow evidence
+/// read degrades to the `evidence_status_unavailable` warning instead of
+/// failing the whole status call.
+const EVIDENCE_STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `recall(status).evidence` and the warnings it adds. A failed or slow read
+/// is a warning, never a failed status.
 async fn evidence_status(evidence: &dyn EvidenceRecall) -> (Value, Vec<Value>) {
-    match evidence.status().await {
+    evidence_status_within(evidence, EVIDENCE_STATUS_DEADLINE).await
+}
+
+async fn evidence_status_within(
+    evidence: &dyn EvidenceRecall,
+    deadline: std::time::Duration,
+) -> (Value, Vec<Value>) {
+    let status = tokio::time::timeout(deadline, evidence.status())
+        .await
+        .unwrap_or_else(|_| {
+            Err(FleetError::Memory(format!(
+                "the evidence status read did not finish within {}s",
+                deadline.as_secs_f32()
+            )))
+        });
+    match status {
         Ok(status) => {
             let warnings = evidence_warnings(&status.readiness, &status.sources);
             (
@@ -4182,6 +4206,8 @@ mod tests {
     #[derive(Default)]
     struct FakeEvidence {
         fail: bool,
+        /// How long `status` takes before it answers.
+        status_delay: Option<std::time::Duration>,
         /// Each search's query, whether it carried a vector, and its limit.
         searches: std::sync::Mutex<Vec<(String, bool, usize)>>,
         gets: std::sync::Mutex<Vec<Sha256Digest>>,
@@ -4272,6 +4298,9 @@ mod tests {
         async fn status(&self) -> crate::Result<crate::evidence_recall::EvidenceStatusV1> {
             self.statuses
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(delay) = self.status_delay {
+                tokio::time::sleep(delay).await;
+            }
             self.outcome(crate::evidence_recall::EvidenceStatusV1 {
                 readiness: evidence_readiness(EvidenceDenseLaneV1::Available),
                 sources: evidence_sources(),
@@ -4586,6 +4615,20 @@ mod tests {
         );
 
         let (block, warnings) = evidence_status(&FakeEvidence::failing()).await;
+        assert_eq!(
+            block,
+            json!({ "served": true, "readiness": null, "sources": null })
+        );
+        assert_eq!(warning_codes(&warnings), ["evidence_status_unavailable"]);
+
+        // A read slower than the status deadline is a warning too, so a large
+        // evidence tier can never fail the cheap health check.
+        let slow = FakeEvidence {
+            status_delay: Some(std::time::Duration::from_secs(600)),
+            ..FakeEvidence::default()
+        };
+        let (block, warnings) =
+            evidence_status_within(&slow, std::time::Duration::from_millis(20)).await;
         assert_eq!(
             block,
             json!({ "served": true, "readiness": null, "sources": null })

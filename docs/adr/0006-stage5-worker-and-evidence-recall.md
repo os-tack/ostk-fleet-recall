@@ -183,8 +183,17 @@ are unchanged, and no evidence hit enters them.
   text (at most 256 KiB), its media type, visibility class, and first accepted
   event, or `null`.
 - **status** adds `data.evidence {served, readiness, sources}` and the same
-  warnings. A failed evidence read there is a warning
-  (`evidence_status_unavailable`), never a failed status.
+  warnings. A failed evidence read there, or one that takes longer than 10
+  seconds, is a warning (`evidence_status_unavailable`), never a failed
+  status.
+
+**Cost.** Readiness counts the scope's body, lexical, and dense tiers, and
+those tables have no narrow index to count through (each primary key stores
+the body bytes, the recall text, or the 512-dimension vector), so every
+evidence search and status read, and the startup foreign-model check, scans
+work proportional to the evidence in the scope. The 10-second bound keeps
+`status` answering; a readiness cache or a counting index (a new migration)
+is deferred.
 
 Snippets and fetched text are the lexical tier's text, never the stored body
 bytes: that text is normalized and has every secret-shaped range replaced
