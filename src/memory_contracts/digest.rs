@@ -391,6 +391,26 @@ pub enum DigestDomain {
     /// ledger — used to make a replayed relation append idempotent rather
     /// than double-applied.
     DiscrepancyEpisodeRelationV1, // W3-DISC
+    // --- Stage-6 spec conformance domains ---
+    /// Stage 6. Identity of one normative `ApprovalAttestationV1`, framed over
+    /// its canonical bytes (signature included). It is the `attestation_id` a
+    /// verified normative activation receipt records for that approval.
+    NormativeApprovalAttestationV1,
+    /// Stage 6. Fingerprint of one typed spec expectation (which enum in which
+    /// source path must or must not contain which member). A normative
+    /// proposal binds it as both its single proposition fingerprint and its
+    /// parser configuration digest.
+    NormativeMembershipExpectationV1,
+    /// Stage 6. Digest of the exact source bytes one normative proposal span
+    /// selects from the spec document it cites.
+    NormativeSourceSpanBytesV1,
+    /// Stage 6. Canonical value of one enum-membership condition (enum, member,
+    /// present or absent), which both sides of a spec comparison digest so a
+    /// normative and an observed side can be compared by value.
+    SpecMembershipValueV1,
+    /// Stage 6. Content identity of one spec conformance check record, so a
+    /// replayed check appends nothing new.
+    SpecCheckRecordV1,
 }
 
 impl DigestDomain {
@@ -555,6 +575,12 @@ impl DigestDomain {
             Self::ObserverRunRecordV1 => "ostk-observer-run-record-v1",   // W3-OBSRT
             // --- W3-DISC prefixes ---
             Self::DiscrepancyEpisodeRelationV1 => "ostk-discrepancy-episode-relation-v1", // W3-DISC
+            // --- Stage-6 spec conformance prefixes ---
+            Self::NormativeApprovalAttestationV1 => "ostk-normative-approval-attestation-v1",
+            Self::NormativeMembershipExpectationV1 => "ostk-normative-membership-expectation-v1",
+            Self::NormativeSourceSpanBytesV1 => "ostk-normative-source-span-bytes-v1",
+            Self::SpecMembershipValueV1 => "ostk-spec-membership-value-v1",
+            Self::SpecCheckRecordV1 => "ostk-spec-check-record-v1",
         }
     }
 }

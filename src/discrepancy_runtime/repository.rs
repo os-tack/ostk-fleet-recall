@@ -40,6 +40,7 @@ use crate::memory_contracts::discrepancy::{
     StructurallyResolvedEpisodePolicyV2, VerificationState, authorize_lifecycle_transition,
 };
 use crate::memory_contracts::{ContractError, ContractResult};
+use crate::registry_witness::WriterAuthorityWitness;
 use serde::{Deserialize, Serialize};
 
 /// The active registry head this runtime is bound to at construction.
@@ -55,6 +56,18 @@ pub struct DiscrepancyRegistryBindingV1 {
 }
 
 impl DiscrepancyRegistryBindingV1 {
+    /// The binding a strict writer-authority witness certifies: the active
+    /// head's package and activation-policy digests, never caller-supplied
+    /// ones. The witness is a snapshot of one read (D4), so a caller re-reads
+    /// it for every invocation rather than caching the binding.
+    #[must_use]
+    pub const fn from_witness(witness: &WriterAuthorityWitness) -> Self {
+        Self {
+            registry_package_digest: witness.package_digest(),
+            activation_policy_digest: witness.activation_policy_digest(),
+        }
+    }
+
     /// Reject a zero digest closed: an unbound runtime must not exist.
     pub fn validate(&self) -> ContractResult<()> {
         if self.registry_package_digest == Sha256Digest::ZERO

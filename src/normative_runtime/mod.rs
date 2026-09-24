@@ -14,6 +14,19 @@
 //!   pure), the request/outcome shapes, and the
 //!   [`repository::NormativeActivationRepository`] trait.
 //! * [`cockroach`] — the `CockroachDB` implementation over migration 0024.
+//! * [`approvals`] — pure. Verifies Ed25519 approvals against the active
+//!   activation policy's keys, under a normative-only signature domain, and
+//!   mints the [`crate::memory_contracts::normative_v2::NormativeActivationReceiptV2`]
+//!   [`repository::admit_activation`] consumes. The receipt is derived, never
+//!   supplied: its principals are keys the live policy lists, its threshold is
+//!   the policy's, and its `accepted_at` is the caller's server time.
+//!
+//! A caller holding a strict writer-authority witness takes the registry
+//! binding from it ([`repository::NormativeRegistryBindingV1::from_witness`])
+//! and requires the proposal to name exactly the witnessed head
+//! ([`repository::require_witnessed_head`]), which adds the exact
+//! `activation_id` (ABA safety) to the digest comparison `admit_activation`
+//! makes.
 //!
 //! # Invariants this module enforces
 //!
@@ -46,10 +59,15 @@
 //!   reads only order-insensitive sets, so reversing two conflicting records in
 //!   the log produces the identical projection.
 
+mod approvals;
 mod cockroach;
 mod projection;
 mod repository;
 
+pub use approvals::{
+    NORMATIVE_APPROVAL_SIGNATURE_PREFIX, approval_attestation_id, normative_approval_message,
+    verify_normative_approvals,
+};
 pub use cockroach::{CockroachNormativeActivationRepository, NormativeFaultInjection};
 pub use projection::{
     MAX_FAMILY_LOG_ENTRIES, NORMATIVE_PROJECTION_SCHEMA_VERSION, NormativeFamilyProjectionV1,
@@ -60,5 +78,5 @@ pub use repository::{
     AdmittedNormativeActivationV1, NormativeActivationCandidateV1, NormativeActivationOutcomeV1,
     NormativeActivationRepository, NormativeHeadRowV1, NormativeLifecycleRequestV1,
     NormativeRegistryBindingV1, NormativeTransitionV1, active_binding_set_digest, admit_activation,
-    admit_contest, admit_lifecycle, require_non_conflicting_against_live,
+    admit_contest, admit_lifecycle, require_non_conflicting_against_live, require_witnessed_head,
 };

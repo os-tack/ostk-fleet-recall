@@ -131,6 +131,26 @@ pub enum ComparisonIndeterminacyV1 {
     NormativeWindowShortfall,
 }
 
+impl ComparisonIndeterminacyV1 {
+    /// Stable `snake_case` wire name, for check records and agent-facing
+    /// output. The set is closed, so the name is total.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ObservedUnmeasured => "observed_unmeasured",
+            Self::NormativeUnmeasured => "normative_unmeasured",
+            Self::ObservedPartialCoverage => "observed_partial_coverage",
+            Self::NormativePartialCoverage => "normative_partial_coverage",
+            Self::ObservedUnknownCoverage => "observed_unknown_coverage",
+            Self::NormativeUnknownCoverage => "normative_unknown_coverage",
+            Self::ObservedStale => "observed_stale",
+            Self::NormativeStale => "normative_stale",
+            Self::ObservedWindowShortfall => "observed_window_shortfall",
+            Self::NormativeWindowShortfall => "normative_window_shortfall",
+        }
+    }
+}
+
 /// Outcome of comparing the observed side against the normative side over
 /// one interval.
 ///

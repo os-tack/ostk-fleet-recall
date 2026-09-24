@@ -441,3 +441,32 @@ fn projection_fails_closed_on_an_unauthorized_event() {
     );
     assert!(project_ledger_episode(&sample, &[self_dismiss], &[]).is_err());
 }
+
+#[test]
+fn every_indeterminacy_reason_has_its_own_snake_case_name() {
+    use std::collections::BTreeSet;
+
+    let reasons = [
+        ComparisonIndeterminacyV1::ObservedUnmeasured,
+        ComparisonIndeterminacyV1::NormativeUnmeasured,
+        ComparisonIndeterminacyV1::ObservedPartialCoverage,
+        ComparisonIndeterminacyV1::NormativePartialCoverage,
+        ComparisonIndeterminacyV1::ObservedUnknownCoverage,
+        ComparisonIndeterminacyV1::NormativeUnknownCoverage,
+        ComparisonIndeterminacyV1::ObservedStale,
+        ComparisonIndeterminacyV1::NormativeStale,
+        ComparisonIndeterminacyV1::ObservedWindowShortfall,
+        ComparisonIndeterminacyV1::NormativeWindowShortfall,
+    ];
+    let names: BTreeSet<&str> = reasons.iter().map(|reason| reason.as_str()).collect();
+    assert_eq!(names.len(), reasons.len(), "two reasons share a name");
+    for name in names {
+        assert!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+            "{name} is not snake_case"
+        );
+    }
+}

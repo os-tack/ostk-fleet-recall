@@ -253,7 +253,8 @@ impl NormativeActivationSeparationOfDutyV2 {
 /// verdict is actually re-derivable from `source_author_principal_id` and the
 /// declared approving principals — not merely asserted. A later runtime seam
 /// must still supply verified signatures and the server's live active
-/// eligible-signer set before this receipt carries any authority.
+/// eligible-signer set before this receipt carries any authority:
+/// [`crate::normative_runtime::verify_normative_approvals`] is that seam.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormativeActivationReceiptV2 {

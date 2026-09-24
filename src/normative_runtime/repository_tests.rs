@@ -628,3 +628,35 @@ fn a_length_extension_between_family_and_statement_cannot_collide() {
     let two = active_binding_set_digest(&ContractId::new("slo.a").unwrap(), &[label("x")]);
     assert_ne!(one, two);
 }
+
+// --- exact witnessed head ---
+
+#[test]
+fn the_exact_witnessed_head_is_accepted() {
+    require_witnessed_head(&proposal(), &registry_head()).unwrap();
+}
+
+#[test]
+fn a_head_differing_only_in_activation_id_is_stale() {
+    // An A -> B -> A rollback restores the package and policy digests, so the
+    // digest comparison admit_activation makes still passes; only the exact
+    // head comparison sees that this is a different activation.
+    let mut witnessed = registry_head();
+    witnessed.head.activation_id = label("a later activation of the same package");
+    admit(&candidate()).unwrap();
+    assert_eq!(
+        require_witnessed_head(&proposal(), &witnessed),
+        Err(ContractError::StaleRegistryHead)
+    );
+}
+
+#[test]
+fn a_head_differing_only_in_effective_from_is_stale() {
+    let mut witnessed = registry_head();
+    witnessed.effective_from = timestamp("2026-02-01T00:00:00.000000000Z");
+    admit(&candidate()).unwrap();
+    assert_eq!(
+        require_witnessed_head(&proposal(), &witnessed),
+        Err(ContractError::StaleRegistryHead)
+    );
+}

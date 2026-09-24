@@ -20,6 +20,7 @@ use crate::memory_contracts::normative_v2::{
     RetroactiveCorrectionV1, require_effective_not_before_accepted,
 };
 use crate::memory_contracts::{ContractError, ContractResult};
+use crate::registry_witness::WriterAuthorityWitness;
 
 use super::projection::{
     NormativeFamilyProjectionV1, NormativeLogEntryV1, NormativeLogRecordV1,
@@ -39,6 +40,18 @@ pub struct NormativeRegistryBindingV1 {
 }
 
 impl NormativeRegistryBindingV1 {
+    /// The binding a strict writer-authority witness certifies: the active
+    /// head's package and activation-policy digests, never caller-supplied
+    /// ones. The witness is a snapshot of one read (D4), so a caller re-reads
+    /// it for every invocation rather than caching the binding.
+    #[must_use]
+    pub const fn from_witness(witness: &WriterAuthorityWitness) -> Self {
+        Self {
+            registry_package_digest: witness.package_digest(),
+            activation_policy_digest: witness.activation_policy_digest(),
+        }
+    }
+
     /// Reject a zero digest closed: an unbound runtime must not exist.
     pub fn validate(&self) -> ContractResult<()> {
         if self.registry_package_digest == Sha256Digest::ZERO
@@ -194,6 +207,28 @@ pub fn active_binding_set_digest(
         DigestDomain::NormativeActiveBindingSetV1,
         &parts,
     ))
+}
+
+/// Refuse a proposal that does not name exactly the witnessed registry head.
+///
+/// [`admit_activation`] compares only the package and activation-policy
+/// digests, which an A -> B -> A rollback restores unchanged. A caller holding
+/// a strict writer-authority witness compares the whole head binding instead:
+/// the exact `activation_id` (ABA safety) and the head's effective interval, so
+/// a proposal drafted against an earlier activation of the same package is
+/// stale rather than silently re-targeted.
+///
+/// # Errors
+///
+/// [`ContractError::StaleRegistryHead`] on any difference.
+pub fn require_witnessed_head(
+    proposal: &NormativeBindingProposalV2,
+    head: &RegistryHeadBindingV1,
+) -> ContractResult<()> {
+    if &proposal.registry_head != head {
+        return Err(ContractError::StaleRegistryHead);
+    }
+    Ok(())
 }
 
 /// Every pure fail-closed check an activation must pass, in one place.
