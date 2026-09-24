@@ -346,6 +346,35 @@ fn redact_for_recall(text: &str) -> String {
     }
 }
 
+/// Steps 2 to 4 of the lexical normalization pipeline (see [`normalize`]).
+///
+/// That is Unicode NFC composition, every whitespace scalar folded into one
+/// ASCII space with the ends trimmed, and every other control scalar dropped.
+/// The lexical tier indexes text folded this way, so a query must be folded
+/// the same way before it is matched against it: a decomposed (NFD) query
+/// word, or one split by a control scalar, would otherwise never match the
+/// indexed spelling of the same word.
+#[must_use]
+pub fn fold_lexical_characters(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for character in text.nfc() {
+        if character.is_whitespace() {
+            pending_space = !folded.is_empty();
+            continue;
+        }
+        if character.is_control() {
+            continue;
+        }
+        if pending_space {
+            folded.push(' ');
+            pending_space = false;
+        }
+        folded.push(character);
+    }
+    folded
+}
+
 /// Normalize body bytes into the exact text the lexical tier indexes.
 ///
 /// The pipeline, in order:
@@ -357,6 +386,9 @@ fn redact_for_recall(text: &str) -> String {
 ///    other control scalar is dropped, which folds CR/LF, tabs, and stray
 ///    control bytes without depending on the platform's line endings;
 /// 4. runs of spaces collapse and the ends are trimmed;
+///
+///    (steps 2 to 4 are [`fold_lexical_characters`], which evidence recall
+///    also applies to a query);
 /// 5. every secret-shaped range is replaced ([`redact_for_recall`]);
 /// 6. the result is truncated to [`MAX_LEXICAL_TEXT_BYTES`] on a `char`
 ///    boundary and re-trimmed.
@@ -374,24 +406,7 @@ fn normalize(body_bytes: &[u8]) -> (LexicalStateV1, String) {
         );
     };
 
-    let mut normalized = String::with_capacity(decoded.len());
-    let mut pending_space = false;
-    for character in decoded.nfc() {
-        if character.is_whitespace() {
-            pending_space = !normalized.is_empty();
-            continue;
-        }
-        if character.is_control() {
-            continue;
-        }
-        if pending_space {
-            normalized.push(' ');
-            pending_space = false;
-        }
-        normalized.push(character);
-    }
-
-    let mut normalized = redact_for_recall(&normalized);
+    let mut normalized = redact_for_recall(&fold_lexical_characters(decoded));
 
     if normalized.len() > MAX_LEXICAL_TEXT_BYTES {
         let mut boundary = MAX_LEXICAL_TEXT_BYTES;

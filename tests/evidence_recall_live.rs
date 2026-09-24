@@ -375,6 +375,43 @@ async fn live_stopword_query_is_unknown_not_error_when_configured() {
 }
 
 #[tokio::test]
+async fn live_decomposed_query_finds_the_composed_word_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let capabilities = capabilities(&database_url).await;
+    let fixture = WorkerFixture::install(&pool, "evidence-nfd").await;
+    let head = fixture.repository.head();
+    // Composed (NFC), as the lexical tier indexes it.
+    fixture.repository.commit(
+        Some(&head),
+        "document the caf\u{e9} r\u{e9}sum\u{e9} policy",
+        LATE_COMMIT_DATE,
+    );
+    tick(&fixture, &pool, "all").await;
+    let recall = evidence(&pool, &capabilities, &fixture.installed.scope).await;
+
+    // Every spelling of a word the evidence holds is present, never absent:
+    // composed, decomposed (as macOS file names and some input methods
+    // produce), and interrupted by a control scalar the index drops.
+    for query in [
+        "r\u{e9}sum\u{e9}",
+        "re\u{301}sume\u{301}",
+        "cafe\u{301} policy",
+        "r\u{e9}s\u{7}um\u{e9}",
+    ] {
+        let answer = search(&recall, query).await;
+        assert_eq!(
+            answer.absence.verdict,
+            AbsenceVerdictV1::Present,
+            "{query:?}: {:?}",
+            answer.absence
+        );
+    }
+}
+
+#[tokio::test]
 async fn live_get_returns_full_text_or_null_when_configured() {
     let Some(database_url) = common::test_database_url() else {
         return;

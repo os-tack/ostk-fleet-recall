@@ -84,7 +84,7 @@ use serde::{Serialize, Serializer};
 use crate::error::Result;
 use crate::memory_contracts::coverage::CoverageCompletenessV1;
 use crate::memory_contracts::digest::Sha256Digest;
-use crate::projectors::RowVisibilityClassV1;
+use crate::projectors::{RowVisibilityClassV1, fold_lexical_characters};
 use crate::store::cockroach::MEMORY_WORKER_SCHEMA_VERSION;
 use crate::worker::{WorkerSourceKindV1, WorkerSourceOutcomeV1};
 
@@ -122,6 +122,11 @@ pub const MAX_EVIDENCE_QUERY_WORD_BYTES: usize = 1024;
 
 /// The query text evidence recall hands to `plainto_tsquery`.
 ///
+/// The query is first folded exactly as the lexical projector folds the text
+/// it indexes ([`fold_lexical_characters`]: NFC composition, whitespace
+/// folding, control scalars dropped), so a decomposed (NFD) spelling of an
+/// indexed word, or one a control scalar interrupts, still matches it.
+///
 /// `CockroachDB` 26.2's `plainto_tsquery` parses some punctuation as query
 /// syntax, so `error: foo (bar)` or `a & b` fails with SQLSTATE 42601 instead of
 /// searching for their words. Its `to_tsvector` splits indexed text on every
@@ -132,7 +137,7 @@ pub const MAX_EVIDENCE_QUERY_WORD_BYTES: usize = 1024;
 /// terms (every word a stopword); the database decides that.
 #[must_use]
 pub fn lexical_query_text(query: &str) -> String {
-    query
+    fold_lexical_characters(query)
         .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty() && word.len() <= MAX_EVIDENCE_QUERY_WORD_BYTES)
         .collect::<Vec<_>>()
@@ -355,6 +360,8 @@ pub trait EvidenceRecall: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use unicode_normalization::UnicodeNormalization as _;
+
     use super::*;
 
     #[test]
@@ -364,6 +371,37 @@ mod tests {
         assert_eq!(lexical_query_text("path/to/file.rs"), "path to file rs");
         assert_eq!(lexical_query_text("  café  x²  日本語 "), "café x² 日本語");
         assert_eq!(lexical_query_text("?!()"), "");
+    }
+
+    #[test]
+    fn query_text_is_folded_like_the_text_the_lexical_tier_indexes() {
+        // A decomposed spelling matches the composed word the index holds:
+        // a combining mark is not alphanumeric, so splitting before
+        // composing would cut "résumé" into "re" and "sume".
+        assert_eq!(lexical_query_text("re\u{301}sume\u{301}"), "résumé");
+        assert_eq!(
+            lexical_query_text("cafe\u{301} re\u{301}sume\u{301}"),
+            "café résumé"
+        );
+        // The index drops a control scalar and joins the halves around it.
+        assert_eq!(lexical_query_text("zephy\u{7}rine"), "zephyrine");
+        // Whatever the spelling, the query's words are the indexed text's.
+        for text in [
+            "Document the cafe\u{301} policy\r\n\tnow",
+            "ｆｕｌｌｗｉｄｔｈ Å\u{30a} ok",
+            "a\u{0}b c\u{85}d",
+        ] {
+            assert_eq!(
+                lexical_query_text(text),
+                lexical_query_text(&fold_lexical_characters(text)),
+                "{text:?}"
+            );
+            assert_eq!(
+                lexical_query_text(text),
+                lexical_query_text(&text.nfc().collect::<String>()),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
