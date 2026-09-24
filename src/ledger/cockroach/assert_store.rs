@@ -47,7 +47,11 @@
 //! origin `operator_asserted`, the agent as actor, confidence `1.0`, and
 //! conflict eligibility. The lifecycle (`retract`, `resolve`, `acknowledge`,
 //! `dismiss`, `waive`) then acts on that projection exactly as on a recorded
-//! claim; the accepted event stays in the ledger.
+//! claim; the accepted event stays in the ledger. The non-null
+//! `accepted_event_id` is what the publication reader withholds the claim,
+//! its synthetic chunk, and its conflicts by
+//! ([`CockroachMemoryService::publication`](crate::CockroachMemoryService::publication)),
+//! since the predicate's publication default is denied.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -57,7 +61,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
 
-use super::lifecycle_store::Replayable;
+use super::lifecycle_store::{Replayable, bounded_ids};
 use super::{
     ClaimPassage, CockroachClaimLedger, MAX_IDEMPOTENCY_KEY_BYTES, claim_recorded_event_payload,
     detect_and_observe, insert_claim_projection, insert_claim_recorded_event, protocol_error,
@@ -108,6 +112,11 @@ const CLAIM_BY_ACCEPTED_EVENT_SQL: &str = "SELECT id \
      ORDER BY id LIMIT 1";
 const CLAIM_ACCEPTED_EVENT_SQL: &str = "SELECT accepted_event_id FROM memory_claims \
      WHERE tenant_id = $1 AND project = $2 AND id = $3";
+/// Which of the given claims an assert projected, by primary key.
+const ASSERTED_CLAIM_IDS_SQL: &str = "SELECT id FROM memory_claims@primary \
+     WHERE tenant_id = $1 AND project = $2 AND id = ANY($3) \
+       AND accepted_event_id IS NOT NULL \
+     ORDER BY id";
 
 /// Serve one assert. See the module documentation for the order.
 pub(super) async fn assert_claim(
@@ -271,6 +280,25 @@ pub(super) async fn claim_accepted_event_id(
                 .map_err(|_| protocol_error("stored claim accepted_event_id is not 32 bytes"))
         })
         .transpose()
+}
+
+/// Which of up to 100 claims an assert projected, by primary key.
+pub(super) async fn asserted_claim_ids(
+    ledger: &CockroachClaimLedger,
+    scope: &FleetScope,
+    claim_ids: &[i64],
+) -> Result<Vec<i64>> {
+    ledger.ensure_scope(scope)?;
+    let ids = bounded_ids(claim_ids, "claim")?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(sqlx::query_scalar(ASSERTED_CLAIM_IDS_SQL)
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(&ids)
+        .fetch_all(&ledger.pool)
+        .await?)
 }
 
 /// The legacy claim row an admitted assertion projects to, as a

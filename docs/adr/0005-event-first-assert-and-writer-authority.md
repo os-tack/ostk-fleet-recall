@@ -136,14 +136,31 @@ is refused by the successor key check, since `record` input cannot reproduce a
 `claim-v2:` key. Event-first retraction, supersession, and correction are
 deferred.
 
-## D8 — No new grants
+## D8 — No new grants; the public reader withholds assertions
 
 **Decision.** `fleet_runtime` already holds the evidence-plane and
 writer-authority view grants and table access on `memory_claims`,
 `memory_events`, and the receipts. An assertion carries no governed content,
 so it needs no content key and takes no `memory_content_objects` lock. The
-publication role gains nothing, and the publication process never serves
+publication role gains no grant, and the publication process never serves
 assert.
+
+The publication reader does hold table-level `SELECT` on `memory_claims` and
+`memory_chunks`, where an assertion's projection lives, while the only
+remember predicate's publication default is `denied`. So the public reader
+withholds every asserted claim itself: the service `demo` builds
+(`CockroachMemoryService::publication`) drops each claim with a non-null
+`accepted_event_id` from claim search and `get`, its synthetic `claim:{id}`
+chunk from chunk search and `get`, and every conflict with it as a member. A
+withheld item reads exactly as an absent one, and nothing reports how many
+were withheld. The demo may therefore read a physical project where assert is
+enabled. This is a guarantee of the reviewed binary, not of the grant: a
+holder of the `fleet_publication` credential can still select those rows
+directly.
+
+**Deferred.** Publishing an assertion whose predicate allows it. Until a
+package carries such a predicate and the projection records it, every
+asserted claim is withheld.
 
 ## D9 — Serve degrades to assert-off (owner decision D5)
 
@@ -213,7 +230,7 @@ mapping, not URI equality.
   recorded ones, so every existing reader keeps working. Search and conflict
   projections do not carry `accepted_event_id`; only `recall(get, kind=claim)`
   does.
-- A deployment must not serve the public demo from a physical project where
-  assert is enabled: the predicate's publication default is denied, and the
-  publication reader has table-level SELECT on `memory_claims` and
-  `memory_chunks`.
+- The public demo withholds every asserted claim, its chunk, and its
+  conflicts (D8), so it may read a physical project where assert is enabled.
+  An assertion is not hidden from a holder of the publication credential who
+  issues SQL directly.

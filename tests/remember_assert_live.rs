@@ -20,7 +20,8 @@
 //! only where the writer-authority pins verify, beside or without the
 //! lifecycle; recall shows which accepted event a claim projects and what an
 //! agent may assert; and without usable pins every tool stays what it was and
-//! assert is a typed refusal.
+//! assert is a typed refusal. The public reader, composed as `demo` composes
+//! it, withholds every asserted claim.
 
 mod common;
 
@@ -39,7 +40,9 @@ use ostk_fleet_recall::mcp::{JsonRpcError, McpServer, tool_list_for};
 use ostk_fleet_recall::remember_runtime::{
     EventFirstAssert, RememberAssertInputV1, start_event_first_assert_with,
 };
-use ostk_fleet_recall::service::RememberSurface;
+use ostk_fleet_recall::service::{
+    FleetRecallService, RecallAction, RecallRequest, RecallResult, RememberSurface, ServiceResult,
+};
 use ostk_fleet_recall::store::cockroach::{
     CockroachStore, ConflictLifecycleCapability, EMBEDDING_DIMENSION, probe_conflict_lifecycle,
 };
@@ -858,6 +861,235 @@ async fn live_record_is_unaffected_when_configured() {
         matches!(attached, Err(FleetError::Configuration(_))),
         "{attached:?}"
     );
+}
+
+/// One recall through `service` as `scope`.
+async fn read(
+    service: &dyn FleetRecallService,
+    scope: &FleetScope,
+    action: RecallAction,
+    arguments: Value,
+) -> ServiceResult<RecallResult> {
+    let Value::Object(arguments) = arguments else {
+        panic!("recall arguments are an object");
+    };
+    service
+        .recall(scope.clone(), RecallRequest::new(action, arguments))
+        .await
+}
+
+/// Claim search, chunk search, a claim `get`, a chunk `get`, and the conflict
+/// list: every read the public demo can reach, and more.
+async fn every_read(
+    service: &dyn FleetRecallService,
+    scope: &FleetScope,
+    asserted_claim_id: i64,
+) -> ServiceResult<[RecallResult; 5]> {
+    let query = "decision at this commit";
+    Ok([
+        read(
+            service,
+            scope,
+            RecallAction::Search,
+            json!({ "query": query, "kind": "claim", "limit": 8 }),
+        )
+        .await?,
+        read(
+            service,
+            scope,
+            RecallAction::Search,
+            json!({ "query": query, "kind": "chunk", "limit": 8, "max_per_source_id": 1 }),
+        )
+        .await?,
+        read(
+            service,
+            scope,
+            RecallAction::Get,
+            json!({ "kind": "claim", "id": asserted_claim_id }),
+        )
+        .await?,
+        read(
+            service,
+            scope,
+            RecallAction::Get,
+            json!({ "kind": "chunk", "id": format!("claim:{asserted_claim_id}") }),
+        )
+        .await?,
+        read(service, scope, RecallAction::Conflicts, json!({})).await?,
+    ])
+}
+
+fn claim_hit_ids(result: &RecallResult) -> Vec<i64> {
+    result.data["hits"]
+        .as_array()
+        .expect("claim hits")
+        .iter()
+        .map(|hit| hit["claim"]["id"].as_i64().expect("claim id"))
+        .collect()
+}
+
+fn chunk_hit_ids(result: &RecallResult) -> Vec<String> {
+    result.data["hits"]
+        .as_array()
+        .expect("chunk hits")
+        .iter()
+        .map(|hit| hit["chunk_id"].as_str().expect("chunk id").to_owned())
+        .collect()
+}
+
+fn conflict_ids(conflicts: &[Value]) -> Vec<i64> {
+    conflicts
+        .iter()
+        .map(|conflict| conflict["id"].as_i64().expect("conflict id"))
+        .collect()
+}
+
+/// The public reader, composed as `demo` composes it and connected with only
+/// the publication reader's grants, withholds asserted claims (their
+/// predicate's publication default is denied): no search, `get`, or conflict
+/// list shows an assertion, its chunk, or its conflict, while recorded memory
+/// in the same scope stays public and the writer still recalls both.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one pass over every public read, then the writer's
+async fn live_publication_reader_withholds_asserted_claims_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let fleet = AssertFleet::new(&database_url, "assert-publication").await;
+    let (scope_a, scope_b) = (fleet.scope(AGENT_A), fleet.scope(AGENT_B));
+    let yes = fleet
+        .ledger(AGENT_A)
+        .await
+        .assert_claim(&scope_a, &attested(true), "assert-publication-a")
+        .await
+        .unwrap();
+    let no = fleet
+        .ledger(AGENT_B)
+        .await
+        .assert_claim(&scope_b, &attested(false), "assert-publication-b")
+        .await
+        .unwrap();
+    let [asserted_conflict] = no.mutation.conflicts_opened.as_slice() else {
+        panic!("the two assertions open one conflict");
+    };
+    let recorded = |value: bool| ClaimInput {
+        kind: ClaimKind::Decision,
+        text: format!("The recorded decision at this commit is {value}."),
+        subject: Some("fleet".into()),
+        predicate: Some("recorded-decision".into()),
+        value: Some(json!(value)),
+        polarity: 1,
+        origin: "operator_asserted".into(),
+        actor: None,
+        confidence: 1.0,
+        valid_from: None,
+        valid_to: None,
+        support: Vec::new(),
+    };
+    let recorded_yes = fleet
+        .plain_ledger(&fleet.owner, AGENT_A)
+        .record_claim(&scope_a, &recorded(true), "assert-publication-record-a")
+        .await
+        .unwrap();
+    let recorded_no = fleet
+        .plain_ledger(&fleet.owner, AGENT_B)
+        .record_claim(&scope_b, &recorded(false), "assert-publication-record-b")
+        .await
+        .unwrap();
+    let [recorded_conflict] = recorded_no.conflicts_opened.as_slice() else {
+        panic!("the two recorded claims open one conflict");
+    };
+    let asserted = [yes.mutation.claim.id, no.mutation.claim.id];
+    let public = [recorded_yes.claim.id, recorded_no.claim.id];
+
+    // The demo's composition, over a login with only the reader's grants.
+    let reader = RuntimeProbeRole::create_publication_reader(&fleet.owner, &database_url).await;
+    let visitor = fleet.scope("demo");
+    let embedder: Arc<dyn ChunkEmbedder> = Arc::new(UnitEmbedder);
+    let publication = CockroachMemoryService::publication(
+        visitor.clone(),
+        Arc::new(CockroachStore::from_pool(reader.pool.clone(), visitor.clone()).unwrap()),
+        Arc::new(
+            CockroachClaimLedger::new(
+                reader.pool.clone(),
+                visitor.clone(),
+                embedder.clone(),
+                retry_policy(),
+            )
+            .unwrap(),
+        ),
+        embedder,
+    )
+    .unwrap();
+    let outcome = every_read(&publication, &visitor, yes.mutation.claim.id).await;
+    reader.drop_role(&fleet.owner).await;
+    let [claims, chunks, claim, chunk, conflicts] =
+        outcome.expect("the public reads run under the reader's grants");
+
+    let claim_ids = claim_hit_ids(&claims);
+    assert!(
+        public.iter().all(|id| claim_ids.contains(id)),
+        "{claim_ids:?}"
+    );
+    assert!(
+        !asserted.iter().any(|id| claim_ids.contains(id)),
+        "{claim_ids:?}"
+    );
+    assert!(conflict_ids(&claims.conflicts).contains(recorded_conflict));
+    let chunk_ids = chunk_hit_ids(&chunks);
+    assert!(
+        public
+            .iter()
+            .all(|id| chunk_ids.contains(&format!("claim:{id}"))),
+        "{chunk_ids:?}"
+    );
+    assert!(
+        !asserted
+            .iter()
+            .any(|id| chunk_ids.contains(&format!("claim:{id}"))),
+        "{chunk_ids:?}"
+    );
+    assert!(claim.data["claim"].is_null(), "{:?}", claim.data);
+    assert!(claim.conflicts.is_empty());
+    assert!(chunk.data["chunk"].is_null(), "{:?}", chunk.data);
+    let listed = conflict_ids(&conflicts.conflicts);
+    assert!(listed.contains(recorded_conflict), "{listed:?}");
+    assert!(!listed.contains(asserted_conflict), "{listed:?}");
+    for (label, result) in [
+        ("claim search", &claims),
+        ("chunk search", &chunks),
+        ("claim get", &claim),
+        ("chunk get", &chunk),
+        ("conflicts", &conflicts),
+    ] {
+        let wire = serde_json::to_string(result).unwrap();
+        assert!(
+            !wire.contains("remember(assert) allowed"),
+            "{label} reveals an assertion: {wire}"
+        );
+    }
+
+    // The writer still recalls the assertions and their conflict.
+    let writer = CockroachMemoryService::new(
+        scope_a.clone(),
+        Arc::new(CockroachStore::from_pool(fleet.owner.clone(), scope_a.clone()).unwrap()),
+        Arc::new(fleet.plain_ledger(&fleet.owner, AGENT_A)),
+        Arc::new(UnitEmbedder),
+    )
+    .unwrap();
+    let [claims, chunks, claim, chunk, conflicts] =
+        every_read(&writer, &scope_a, yes.mutation.claim.id)
+            .await
+            .expect("the writer reads");
+    let claim_ids = claim_hit_ids(&claims);
+    assert!(
+        asserted.iter().all(|id| claim_ids.contains(id)),
+        "{claim_ids:?}"
+    );
+    assert!(chunk_hit_ids(&chunks).contains(&format!("claim:{}", yes.mutation.claim.id)));
+    assert_eq!(claim.data["claim"]["id"], yes.mutation.claim.id);
+    assert!(!chunk.data["chunk"].is_null());
+    assert!(conflict_ids(&conflicts.conflicts).contains(asserted_conflict));
 }
 
 /// `tools/list` over `server`.

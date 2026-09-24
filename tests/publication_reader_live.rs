@@ -354,8 +354,12 @@ async fn build_real_publication_service(
         embedder.clone(),
         RetryPolicy::default(),
     )?);
-    let service =
-        CockroachMemoryService::new(config.default_scope().clone(), store, ledger, embedder)?;
+    let service = CockroachMemoryService::publication(
+        config.default_scope().clone(),
+        store,
+        ledger,
+        embedder,
+    )?;
     service.verify_embedding_generation().await?;
     Ok(service)
 }

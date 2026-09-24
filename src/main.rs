@@ -459,7 +459,8 @@ async fn build_publication_service(
         embedder.clone(),
         RetryPolicy::default(),
     )?);
-    let service = Arc::new(CockroachMemoryService::new(
+    // The public reader withholds every asserted claim (ADR 0005 D8).
+    let service = Arc::new(CockroachMemoryService::publication(
         config.default_scope().clone(),
         store.clone(),
         ledger,

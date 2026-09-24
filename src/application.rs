@@ -46,9 +46,11 @@ const SYNTHETIC_CLAIM_SOURCE: &str = "ostk_memory";
 /// the conflict's log grows.
 const MAX_CONFLICT_LOOKUP_BYTES: usize = 576 * 1024;
 
-/// Which lifecycle behaviour a service instance serves. The default is the
-/// historical record-only surface with unfiltered search, which the public
-/// recall process always keeps.
+/// Which lifecycle behaviour a service instance serves.
+///
+/// The default is the historical record-only surface with no lifecycle
+/// filtering, which the public recall process always keeps; that process
+/// withholds only asserted claims ([`CockroachMemoryService::publication`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LifecycleServing {
     /// The `remember` actions served and advertised in `tools/list`.
@@ -81,6 +83,9 @@ pub struct CockroachMemoryService {
     /// What startup decided about `remember(assert)`, reported by
     /// `recall(status)`; `None` when no writer-authority pins are configured.
     assert_status: Option<AssertStatusV1>,
+    /// Withhold every asserted claim from every read. Only the publication
+    /// composition ([`Self::publication`]) sets it.
+    withhold_asserted_claims: bool,
 }
 
 struct ChunkConflictProjection {
@@ -123,6 +128,7 @@ impl std::fmt::Debug for CockroachMemoryService {
             .field("embedding_model", &self.embedder.model_id())
             .field("lifecycle", &self.lifecycle)
             .field("assert_status", &self.assert_status)
+            .field("withhold_asserted_claims", &self.withhold_asserted_claims)
             .finish_non_exhaustive()
     }
 }
@@ -149,7 +155,34 @@ impl CockroachMemoryService {
             embedder,
             lifecycle: LifecycleServing::default(),
             assert_status: None,
+            withhold_asserted_claims: false,
         })
+    }
+
+    /// The public recall composition: [`Self::new`], serving the record-only
+    /// default, with every asserted claim withheld from every read (ADR 0005
+    /// D8).
+    ///
+    /// An asserted claim's predicate carries `publication_default: denied`,
+    /// and the publication reader holds table-level `SELECT` on
+    /// `memory_claims` and `memory_chunks`, so this reader itself withholds
+    /// each claim that projects an accepted event: it is absent from claim
+    /// search and `get`, its synthetic `claim:{id}` chunk is absent from
+    /// chunk search and `get`, and no conflict with it as a member is
+    /// returned. Withheld items look exactly like absent ones.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn publication(
+        trusted_scope: FleetScope,
+        corpus: Arc<CockroachStore>,
+        ledger: Arc<dyn ClaimLedger>,
+        embedder: Arc<dyn ChunkEmbedder>,
+    ) -> crate::Result<Self> {
+        let mut service = Self::new(trusted_scope, corpus, ledger, embedder)?;
+        service.withhold_asserted_claims = true;
+        Ok(service)
     }
 
     /// Serve the given lifecycle surface. Only the private writer composition
@@ -294,10 +327,12 @@ impl CockroachMemoryService {
     /// Retired claims keep their synthetic chunk row. On the private writer,
     /// such hits are dropped before the conflict projection so a retracted
     /// claim can neither surface nor select a conflict through chunk search.
-    /// Dropping them after retrieval's cut would short the page, so the
-    /// retrieval window grows until `limit` current hits fill it, retrieval
-    /// runs out of hits, or the window reaches the tool's hit bound.
-    async fn retrieve_lifecycle_current_chunks(
+    /// The publication reader likewise drops the synthetic chunk of every
+    /// asserted claim, and reports nothing about it. Dropping hits after
+    /// retrieval's cut would short the page, so the retrieval window grows
+    /// until `limit` kept hits fill it, retrieval runs out of hits, or the
+    /// window reaches the tool's hit bound.
+    async fn retrieve_visible_chunks(
         &self,
         scope: &FleetScope,
         params: &mut RecallParams,
@@ -306,18 +341,31 @@ impl CockroachMemoryService {
         let mut window = limit;
         loop {
             params.limit = Some(window);
-            let hits = self.retrieve_chunks(params).await?;
+            let mut hits = self.retrieve_chunks(params).await?;
             let returned = hits.len();
-            let claim_ids = synthetic_claim_ids(&hits);
-            let states = if claim_ids.is_empty() {
-                Vec::new()
+            let withheld = self
+                .withheld_claim_ids(scope, &synthetic_claim_ids(&hits))
+                .await?;
+            if !withheld.is_empty() {
+                hits.retain(|hit| {
+                    synthetic_claim_id(hit).is_none_or(|claim_id| !withheld.contains(&claim_id))
+                });
+            }
+            let (hits, hidden_claim_ids) = if self.lifecycle.hide_non_current_claim_chunks {
+                let claim_ids = synthetic_claim_ids(&hits);
+                let states = if claim_ids.is_empty() {
+                    Vec::new()
+                } else {
+                    self.ledger
+                        .claim_states(scope, &claim_ids)
+                        .await
+                        .map_err(service_error)?
+                };
+                page_lifecycle_hits(hits, &states, limit)
             } else {
-                self.ledger
-                    .claim_states(scope, &claim_ids)
-                    .await
-                    .map_err(service_error)?
+                hits.truncate(limit);
+                (hits, Vec::new())
             };
-            let (hits, hidden_claim_ids) = page_lifecycle_hits(hits, &states, limit);
             match next_lifecycle_window(window, returned, hits.len(), limit) {
                 LifecycleRefill::Grow(next) => window = next,
                 outcome => {
@@ -329,6 +377,88 @@ impl CockroachMemoryService {
                 }
             }
         }
+    }
+
+    /// Claim search. The publication reader drops asserted claims and, as
+    /// chunk search does, grows the window to refill the page.
+    async fn search_visible_claims(
+        &self,
+        scope: &FleetScope,
+        query: &str,
+        include_history: bool,
+        limit: usize,
+    ) -> ServiceResult<Vec<SemanticClaimHit>> {
+        let mut window = limit;
+        loop {
+            let mut hits = self
+                .ledger
+                .search_claims(scope, query, include_history, window)
+                .await
+                .map_err(service_error)?;
+            if !self.withhold_asserted_claims {
+                return Ok(hits);
+            }
+            let returned = hits.len();
+            let claim_ids = hits.iter().map(|hit| hit.claim.id).collect::<Vec<_>>();
+            let withheld = self.withheld_claim_ids(scope, &claim_ids).await?;
+            hits.retain(|hit| !withheld.contains(&hit.claim.id));
+            hits.truncate(limit);
+            match next_lifecycle_window(window, returned, hits.len(), limit) {
+                LifecycleRefill::Grow(next) => window = next,
+                LifecycleRefill::Done | LifecycleRefill::Underfilled => return Ok(hits),
+            }
+        }
+    }
+
+    /// The asserted claims among `claim_ids`, which the publication reader
+    /// withholds. Always empty, with no read, on every other service.
+    async fn withheld_claim_ids(
+        &self,
+        scope: &FleetScope,
+        claim_ids: &[i64],
+    ) -> ServiceResult<HashSet<i64>> {
+        let mut withheld = HashSet::new();
+        if !self.withhold_asserted_claims || claim_ids.is_empty() {
+            return Ok(withheld);
+        }
+        let mut ids = claim_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        for batch in ids.chunks(MAX_TOOL_RESULTS) {
+            withheld.extend(
+                self.ledger
+                    .asserted_claim_ids(scope, batch)
+                    .await
+                    .map_err(service_error)?,
+            );
+        }
+        Ok(withheld)
+    }
+
+    /// Drop every conflict with an asserted member on the publication
+    /// reader. An asserted claim's `claim-v2:` key never equals a recorded
+    /// claim's `subject::predicate` key, so such a conflict has only asserted
+    /// members, and one returned member decides it even when the member list
+    /// is truncated.
+    async fn withhold_asserted_conflicts(
+        &self,
+        scope: &FleetScope,
+        conflicts: &mut Vec<Conflict>,
+    ) -> ServiceResult<()> {
+        let member_ids = conflicts
+            .iter()
+            .flat_map(|conflict| conflict.members.iter().map(|member| member.id))
+            .collect::<Vec<_>>();
+        let withheld = self.withheld_claim_ids(scope, &member_ids).await?;
+        if !withheld.is_empty() {
+            conflicts.retain(|conflict| {
+                !conflict
+                    .members
+                    .iter()
+                    .any(|member| withheld.contains(&member.id))
+            });
+        }
+        Ok(())
     }
 
     /// Hybrid chunk search with its conflict projection and diagnostics.
@@ -357,16 +487,24 @@ impl CockroachMemoryService {
             // lanes under the same relevance contract as every source.
             ranking_overrides: Some(fleet_ranking_overrides()),
         };
-        let (mut hits, hiding) = if self.lifecycle.hide_non_current_claim_chunks {
-            let page = self
-                .retrieve_lifecycle_current_chunks(scope, &mut params, limit)
-                .await?;
-            (page.hits, Some((page.hidden_claim_ids, page.underfilled)))
-        } else {
-            (self.retrieve_chunks(&params).await?, None)
-        };
+        let (mut hits, hiding) =
+            if self.lifecycle.hide_non_current_claim_chunks || self.withhold_asserted_claims {
+                let page = self
+                    .retrieve_visible_chunks(scope, &mut params, limit)
+                    .await?;
+                // Only lifecycle hiding is reported; a withheld claim is not.
+                let hiding = self
+                    .lifecycle
+                    .hide_non_current_claim_chunks
+                    .then_some((page.hidden_claim_ids, page.underfilled));
+                (page.hits, hiding)
+            } else {
+                (self.retrieve_chunks(&params).await?, None)
+            };
         let metadata_elided = self.hydrate_retrieval_metadata(&mut hits).await?;
         let mut projection = self.project_chunk_conflicts(scope, &hits).await?;
+        self.withhold_asserted_conflicts(scope, &mut projection.conflicts)
+            .await?;
         let conflict_matches = conflict_match_diagnostics(
             &projection.conflicts,
             &hits,
@@ -432,10 +570,8 @@ impl CockroachMemoryService {
             "claim" | "assertion" => {
                 reject_claim_only_unsupported_filters(&args)?;
                 let hits = self
-                    .ledger
-                    .search_claims(scope, &args.query, args.include_history, limit)
-                    .await
-                    .map_err(service_error)?;
+                    .search_visible_claims(scope, &args.query, args.include_history, limit)
+                    .await?;
                 let claim_ids = hits.iter().map(|hit| hit.claim.id).collect::<Vec<_>>();
                 let mut conflicts = self
                     .ledger
@@ -444,6 +580,8 @@ impl CockroachMemoryService {
                     .map_err(service_error)?;
                 let coverage_complete = conflicts.len() < MAX_TOOL_RESULTS
                     && conflicts.iter().all(conflict_projection_complete);
+                self.withhold_asserted_conflicts(scope, &mut conflicts)
+                    .await?;
                 let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
                 let hits = compact_claim_hits(hits);
                 let mut result = RecallResult::new(json!({ "hits": hits }));
@@ -475,11 +613,16 @@ impl CockroachMemoryService {
         match args.kind.as_deref().unwrap_or("chunk") {
             "claim" | "assertion" => {
                 let id = parse_safe_id(&args.id)?;
-                let claim = self
-                    .ledger
-                    .get_claim(scope, id)
-                    .await
-                    .map_err(service_error)?;
+                // A withheld claim reads exactly as an absent one.
+                let withheld = !self.withheld_claim_ids(scope, &[id]).await?.is_empty();
+                let claim = if withheld {
+                    None
+                } else {
+                    self.ledger
+                        .get_claim(scope, id)
+                        .await
+                        .map_err(service_error)?
+                };
                 let mut result = RecallResult::new(json!({ "claim": claim }));
                 // An asserted claim names the accepted event it projects; a
                 // recorded one carries no such field.
@@ -492,13 +635,18 @@ impl CockroachMemoryService {
                 {
                     result.data["accepted_event_id"] = json!(event_id);
                 }
-                let mut conflicts = self
-                    .ledger
-                    .conflicts_for_claim_ids(scope, &[id], MAX_TOOL_RESULTS)
-                    .await
-                    .map_err(service_error)?;
+                let mut conflicts = if withheld {
+                    Vec::new()
+                } else {
+                    self.ledger
+                        .conflicts_for_claim_ids(scope, &[id], MAX_TOOL_RESULTS)
+                        .await
+                        .map_err(service_error)?
+                };
                 let coverage_complete = conflicts.len() < MAX_TOOL_RESULTS
                     && conflicts.iter().all(conflict_projection_complete);
+                self.withhold_asserted_conflicts(scope, &mut conflicts)
+                    .await?;
                 let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
                 result.conflicts = serialize_conflicts(&conflicts)?;
                 result.conflict_coverage = conflict_coverage(coverage_complete, &conflicts);
@@ -527,7 +675,18 @@ impl CockroachMemoryService {
                     .fetch_chunks_scoped(&[id.to_string()], &filter)
                     .await
                     .map_err(|error| ServiceError::Internal(error.to_string()))?;
-                let chunk = chunks.into_iter().next().map(|hydrated| hydrated.chunk);
+                let mut chunk = chunks.into_iter().next().map(|hydrated| hydrated.chunk);
+                // A withheld claim's synthetic chunk reads as an absent chunk.
+                let claim_ids = chunk
+                    .as_ref()
+                    .and_then(|chunk| {
+                        synthetic_claim_coordinate(chunk.source.as_str(), &chunk.chunk_id)
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if !self.withheld_claim_ids(scope, &claim_ids).await?.is_empty() {
+                    chunk = None;
+                }
                 let mut result = RecallResult::new(json!({ "chunk": chunk }));
                 result.conflict_coverage = ConflictCoverage::not_evaluated();
                 Ok(result)
@@ -607,6 +766,8 @@ impl CockroachMemoryService {
             .map_err(service_error)?;
         let coverage_complete =
             conflicts.len() < limit && conflicts.iter().all(conflict_projection_complete);
+        self.withhold_asserted_conflicts(scope, &mut conflicts)
+            .await?;
         let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
         let serialized = serialize_conflicts(&conflicts)?;
         let mut result = RecallResult::new(json!({ "conflicts": serialized }));
@@ -1776,13 +1937,19 @@ fn required_idempotency_key(action: RememberAction, key: Option<String>) -> Serv
 /// The coordinate is the reserved chunk id and source, not the bounded
 /// `extra` metadata, which retrieval elides above its byte limit.
 fn synthetic_claim_id(hit: &RecallHit) -> Option<i64> {
-    if hit.source != SYNTHETIC_CLAIM_SOURCE {
+    synthetic_claim_coordinate(&hit.source, &hit.chunk_id)
+}
+
+/// The claim id a `(source, chunk_id)` coordinate names when it is a
+/// synthetic `claim:{id}` chunk.
+fn synthetic_claim_coordinate(source: &str, chunk_id: &str) -> Option<i64> {
+    if source != SYNTHETIC_CLAIM_SOURCE {
         return None;
     }
-    hit.chunk_id
+    chunk_id
         .strip_prefix("claim:")
         .and_then(|id| id.parse::<i64>().ok())
-        .filter(|id| (1..=MAX_SAFE_INTEGER).contains(id) && hit.chunk_id == format!("claim:{id}"))
+        .filter(|id| (1..=MAX_SAFE_INTEGER).contains(id) && chunk_id == format!("claim:{id}"))
 }
 
 fn synthetic_claim_ids(hits: &[RecallHit]) -> Vec<i64> {

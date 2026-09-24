@@ -1570,7 +1570,7 @@ fn validate_claim_target(target: ClaimTarget) -> Result<()> {
     Ok(())
 }
 
-fn bounded_ids(ids: &[i64], label: &str) -> Result<Vec<i64>> {
+pub(super) fn bounded_ids(ids: &[i64], label: &str) -> Result<Vec<i64>> {
     if ids.len() > MAX_LEDGER_RESULTS {
         return Err(FleetError::Memory(format!(
             "{label} id lookup accepts at most {MAX_LEDGER_RESULTS} ids"

@@ -26,6 +26,11 @@ distribution is therefore a read-only recall surface, even though recall uses
 POST. Router shape is not treated as the database authorization boundary: the
 public process authenticates as exactly the fixed external `fleet_publication`
 login, whose only membership is the logical `fleet_publication_reader` role.
+That role can select every claim and chunk row, so the public
+process itself withholds each claim written by `remember(assert)`, whose
+predicate's publication default is denied: the claim, its synthetic chunk,
+and its conflicts read as absent (ADR 0005 D8). That is a property of the
+reviewed binary; the credential alone can still select those rows.
 CloudFront-to-ALB transport and viewer-TLS limitations are documented without
 stronger claims in the [AWS runbook](../deploy/aws/README.md).
 

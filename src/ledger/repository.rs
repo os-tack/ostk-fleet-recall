@@ -82,6 +82,24 @@ pub trait ClaimLedger: Send + Sync {
         Ok(None)
     }
 
+    /// Which of up to 100 `claim_ids` project an accepted event, that is,
+    /// were written by `remember(assert)`. Unknown ids are absent. The
+    /// publication reader withholds these claims (ADR 0005 D8). The default
+    /// asks [`Self::claim_accepted_event_id`] for each id.
+    async fn asserted_claim_ids(&self, scope: &FleetScope, claim_ids: &[i64]) -> Result<Vec<i64>> {
+        let mut asserted = Vec::new();
+        for &claim_id in claim_ids {
+            if self
+                .claim_accepted_event_id(scope, claim_id)
+                .await?
+                .is_some()
+            {
+                asserted.push(claim_id);
+            }
+        }
+        Ok(asserted)
+    }
+
     /// Retract a lifecycle-current operator assertion the caller authored.
     ///
     /// Owner authority, the expected revision, and the key's lineage are

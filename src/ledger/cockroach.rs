@@ -707,6 +707,10 @@ impl ClaimLedger for CockroachClaimLedger {
         assert_store::claim_accepted_event_id(self, scope, claim_id).await
     }
 
+    async fn asserted_claim_ids(&self, scope: &FleetScope, claim_ids: &[i64]) -> Result<Vec<i64>> {
+        assert_store::asserted_claim_ids(self, scope, claim_ids).await
+    }
+
     async fn retract_claim(
         &self,
         scope: &FleetScope,

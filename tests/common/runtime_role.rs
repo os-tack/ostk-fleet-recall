@@ -1,8 +1,9 @@
 //! A disposable login that holds exactly the runtime role's evidence-plane
 //! grants, and optionally its claim-plane grants, so a connected test proves a
-//! writer path runs without the owner's privileges.
+//! writer path runs without the owner's privileges; or exactly the publication
+//! reader's grants, so it proves a public read runs with nothing more.
 
-use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig};
+use ostk_fleet_recall::store::cockroach::{CockroachStore, PUBLICATION_READ_TABLES, PoolConfig};
 use sqlx::PgPool;
 use url::Url;
 use uuid::Uuid;
@@ -69,7 +70,7 @@ pub const RUNTIME_SEQUENCES: &str = "public.memory_claim_id_seq, \
 pub struct RuntimeProbeRole {
     name: String,
     database: String,
-    grants: Vec<(&'static str, &'static str)>,
+    grants: Vec<(&'static str, String)>,
     sequences: bool,
     pub pool: PgPool,
 }
@@ -78,22 +79,34 @@ impl RuntimeProbeRole {
     /// Create the role through `owner` and connect as it over the same TLS
     /// settings as `database_url`, without its client certificate.
     pub async fn create(owner: &PgPool, database_url: &str) -> Self {
-        Self::create_with(owner, database_url, RUNTIME_EVIDENCE_GRANTS.to_vec(), false).await
+        Self::create_with(owner, database_url, owned(&RUNTIME_EVIDENCE_GRANTS), false).await
+    }
+
+    /// A login holding only `SELECT` on the publication reader's exact
+    /// tables (`deploy/cockroach/publication-reader-role-grants.sql`), as the
+    /// public `demo` process reads with.
+    pub async fn create_publication_reader(owner: &PgPool, database_url: &str) -> Self {
+        let tables = PUBLICATION_READ_TABLES
+            .iter()
+            .map(|table| format!("public.{table}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self::create_with(owner, database_url, vec![("SELECT", tables)], false).await
     }
 
     /// [`Self::create`], plus the runtime role's claim-plane table and
     /// sequence grants: what `remember` needs to write a claim and its
     /// accepted event.
     pub async fn create_claim_writer(owner: &PgPool, database_url: &str) -> Self {
-        let mut grants = RUNTIME_EVIDENCE_GRANTS.to_vec();
-        grants.extend(RUNTIME_CLAIM_GRANTS);
+        let mut grants = owned(&RUNTIME_EVIDENCE_GRANTS);
+        grants.extend(owned(&RUNTIME_CLAIM_GRANTS));
         Self::create_with(owner, database_url, grants, true).await
     }
 
     async fn create_with(
         owner: &PgPool,
         database_url: &str,
-        grants: Vec<(&'static str, &'static str)>,
+        grants: Vec<(&'static str, String)>,
         sequences: bool,
     ) -> Self {
         let name = format!("runtime_probe_{}", Uuid::now_v7().simple());
@@ -172,6 +185,13 @@ impl RuntimeProbeRole {
                 .unwrap_or_else(|error| panic!("{statement}: {error}"));
         }
     }
+}
+
+fn owned(grants: &[(&'static str, &'static str)]) -> Vec<(&'static str, String)> {
+    grants
+        .iter()
+        .map(|(privileges, relations)| (*privileges, (*relations).to_owned()))
+        .collect()
 }
 
 /// The owner URL rewritten to authenticate as the probe role by password:
