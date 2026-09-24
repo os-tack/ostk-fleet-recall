@@ -17,7 +17,8 @@
       "connector_principal": "connector.transcript",
       "instance_prefix": "connector.transcript",
       "installation_id": 1,
-      "dirs": ["/srv/fleet-recall/transcripts"]
+      "dirs": ["/srv/fleet-recall/transcripts"],
+      "window_bytes": 4194304
     }
   ],
   "ci": [
@@ -28,7 +29,8 @@
       "repository_id": "ci.repo.fleet-recall",
       "provider_repository": "os-tack/ostk-fleet-recall",
       "workflow": "ci.yml",
-      "branch": "main"
+      "branch": "main",
+      "first_run_number": 1
     }
   ]
 }

@@ -28,9 +28,10 @@ use common::authority::retry_policy;
 use common::runtime_role::RuntimeProbeRole;
 use common::worker::{
     BROKEN_TRANSCRIPT_LINE, CI_INSTANCE, COMMIT_WORD, FAILING_STEP_WORD, GIT_INSTANCE, RecordedCi,
-    StubEmbedder, TRANSCRIPT_WORD, WorkerFixture as Fixture, line,
+    RecordedCiSettledThrough, StubEmbedder, TRANSCRIPT_WORD, WorkerFixture as Fixture, line,
 };
 use ostk_fleet_recall::FleetError;
+use ostk_fleet_recall::connectors::ci::MAX_CI_WINDOW_RUNS;
 use ostk_fleet_recall::memory_contracts::canonical::decode_strict;
 use ostk_fleet_recall::memory_contracts::common::ContractId;
 use ostk_fleet_recall::memory_contracts::coverage::CoverageCompletenessV1;
@@ -551,6 +552,53 @@ async fn live_worker_admits_staged_turns_when_a_later_line_fails_when_configured
             .hits
             .is_empty(),
         "a turn staged before the bad line is recallable"
+    );
+}
+
+#[tokio::test]
+async fn live_worker_ci_receipt_is_partial_until_the_settled_head_is_read_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = Fixture::install(&pool, "worker-ci-backlog").await;
+    // A settled head more than one window past the resume point.
+    let head = u64::try_from(MAX_CI_WINDOW_RUNS).unwrap() + 88;
+    let worker = fixture
+        .worker_with(
+            &pool,
+            "ingest",
+            &fixture.sources_json(),
+            Arc::new(RecordedCiSettledThrough(head)),
+        )
+        .await;
+    let coverage = fixture.coverage(&pool);
+    let ci = ContractId::new(CI_INSTANCE).unwrap();
+
+    let report = worker.run_tick().await;
+    assert_eq!(status(&report, WorkerStepV1::Ci), WorkerStepStatusV1::Ok);
+    let receipt = coverage
+        .latest_receipt_for_instance(&ci)
+        .await
+        .unwrap()
+        .expect("the first window has a receipt");
+    assert_eq!(
+        receipt.completeness,
+        CoverageCompletenessV1::Partial,
+        "one window cannot claim the runs past it"
+    );
+
+    let report = worker.run_tick().await;
+    assert_eq!(status(&report, WorkerStepV1::Ci), WorkerStepStatusV1::Ok);
+    let receipt = coverage
+        .latest_receipt_for_instance(&ci)
+        .await
+        .unwrap()
+        .expect("the second window has a receipt");
+    assert_eq!(
+        receipt.completeness,
+        CoverageCompletenessV1::Complete,
+        "the tick that reaches the head is complete"
     );
 }
 

@@ -17,9 +17,9 @@ use sqlx::PgPool;
 
 use crate::connectors::ci::{
     CiConnectorBindingV1, CiCoverageBindingV1, CiDrainContextV1, CiIngressClocksV1,
-    CiMeasuredWindowRepository as _, CiMeasuredWindowRowV1, CiTextV1, CiWindowObservationLogV1,
-    CockroachCiMeasuredWindowRepository, MAX_CI_WINDOW_RUNS, ci_coverage_observation,
-    ci_scan_facts, ci_scan_manifest_digest, drain_ci_facts, scan_runs,
+    CiMeasuredWindowRepository as _, CiMeasuredWindowRowV1, CiScanError, CiTextV1,
+    CiWindowObservationLogV1, CockroachCiMeasuredWindowRepository, MAX_CI_WINDOW_RUNS,
+    ci_coverage_observation, ci_scan_facts, ci_scan_manifest_digest, drain_ci_facts, scan_runs,
 };
 use crate::connectors::git::{
     GitConnectorBindingV1, GitCoverageBindingV1, GitDrainContextV1, GitFactV1, GitIngressClocksV1,
@@ -35,7 +35,7 @@ use crate::connectors::transcript::{
 };
 use crate::coverage_runtime::{
     CockroachCoverageRuntimeRepository, CoverageObservationOutcome, CoverageRuntimeRepository as _,
-    SequenceIntervalV1,
+    ObservedRangeError, SequenceIntervalV1,
 };
 use crate::error::{FleetError, Result};
 use crate::evidence_ledger::{ActiveStage4Package, ContentKeyEncryptionKey};
@@ -1062,7 +1062,7 @@ impl Ingest<'_> {
         if high_water < first {
             return Ok(WorkerSourceOutcomeV1::Unchanged);
         }
-        let last = high_water.min(first.saturating_add(count(MAX_CI_WINDOW_RUNS) - 1));
+        let (last, target) = ci_tick_range(first, high_water).map_err(describe)?;
         let request = source.scan_request(first, last).map_err(describe)?;
         let fetched_at = server_instant(self.pool).await?;
         let scan = {
@@ -1070,7 +1070,7 @@ impl Ingest<'_> {
             tokio::task::spawn_blocking(move || scan_runs(provider.as_ref(), &request, &fetched_at))
                 .await
                 .map_err(|_| "the CI scan did not finish".to_owned())?
-                .map_err(describe)?
+                .map_err(|error| ci_scan_failure(&error))?
         };
         add(
             counters,
@@ -1111,10 +1111,6 @@ impl Ingest<'_> {
         add(counters, "replayed", report.replayed);
         add(counters, "quarantined", report.quarantined);
 
-        // The domain's target is the range this tick asked for. It equals the
-        // window's own range unless the provider's listing was cut short and
-        // the window narrowed, in which case the receipt is honestly partial.
-        let target = SequenceIntervalV1::new(first, last.saturating_add(1)).map_err(describe)?;
         let observation = ci_coverage_observation(
             &CiCoverageBindingV1 {
                 connector_instance: instance.clone(),
@@ -1156,6 +1152,49 @@ impl Ingest<'_> {
             CoverageObservationOutcome::AlreadyCovered { .. } => {}
         }
         Ok(())
+    }
+}
+
+/// The last run one CI tick reads from `first`, and the range its receipt
+/// claims.
+///
+/// A tick reads at most [`MAX_CI_WINDOW_RUNS`] runs, but the receipt's target
+/// runs to the settled high-water mark: when the backlog is longer than one
+/// window, the receipt is honestly partial and evidence recall stays
+/// `unknown` for the source until a later tick reads the rest. The target
+/// also covers the window's own range when the provider's listing was cut
+/// short and the window narrowed.
+fn ci_tick_range(
+    first: u64,
+    high_water: u64,
+) -> std::result::Result<(u64, SequenceIntervalV1), ObservedRangeError> {
+    let last = high_water.min(first.saturating_add(count(MAX_CI_WINDOW_RUNS) - 1));
+    Ok((
+        last,
+        SequenceIntervalV1::new(first, high_water.saturating_add(1))?,
+    ))
+}
+
+/// A CI scan failure, rendered for the report and the status row.
+///
+/// A listing that cannot reach back to the resume point never will on a
+/// later tick either, because the provider's head only moves away from it, so
+/// that failure names the first run number the listing can reach now. The
+/// worker never skips runs on its own: raising `first_run_number` is the
+/// operator's decision, and runs below it are never read.
+fn ci_scan_failure(error: &CiScanError) -> String {
+    match error {
+        CiScanError::ProviderReachExceeded {
+            needed,
+            maximum,
+            first_run_number,
+        } => format!(
+            "{error}; this source reads nothing until its first_run_number in the sources \
+             file is at least {} (leave a margin: the provider's head keeps moving), and runs \
+             below that are never read",
+            first_run_number.saturating_add(needed.saturating_sub(*maximum))
+        ),
+        other => other.to_string(),
     }
 }
 
@@ -1224,6 +1263,35 @@ mod tests {
         }
         assert!(freshness().validate().is_ok());
         assert!(proof_basis().validate().is_ok());
+    }
+
+    #[test]
+    fn a_ci_tick_reads_one_window_but_claims_through_the_settled_head() {
+        let (last, target) = ci_tick_range(1, 8).unwrap();
+        assert_eq!((last, target.start, target.end), (8, 1, 9));
+
+        // A backlog longer than one window: the tick reads the first window,
+        // and its receipt target still ends past the head, so it is partial.
+        let (last, target) = ci_tick_range(1, 520).unwrap();
+        assert_eq!(last, count(MAX_CI_WINDOW_RUNS));
+        assert_eq!((target.start, target.end), (1, 521));
+        let (last, target) = ci_tick_range(last + 1, 520).unwrap();
+        assert_eq!((last, target.start, target.end), (520, 513, 521));
+    }
+
+    #[test]
+    fn an_unreachable_ci_resume_point_names_the_first_run_the_listing_reaches() {
+        let message = ci_scan_failure(&CiScanError::ProviderReachExceeded {
+            needed: 2_050,
+            maximum: 1_000,
+            first_run_number: 1,
+        });
+        assert!(message.contains("first_run_number"), "{message}");
+        assert!(message.contains("at least 1051"), "{message}");
+        assert_eq!(
+            ci_scan_failure(&CiScanError::RecordedRunMissing(7)),
+            CiScanError::RecordedRunMissing(7).to_string()
+        );
     }
 
     fn source(outcome: WorkerSourceOutcomeV1, appended: u64) -> WorkerSourceReportV1 {

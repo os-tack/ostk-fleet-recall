@@ -187,6 +187,15 @@ window fails that file's source, naming the byte offset, until the group's
 `window_bytes` is raised past the line; nothing after it is read meanwhile.
 Turns staged from earlier windows are still admitted.
 
+A CI source reads at most 512 settled runs per tick, starting after its
+highest recorded window, or at its `first_run_number` (1 by default) when that
+is higher. Until a tick reaches the newest settled run, the source's newest
+receipt is partial and evidence answers stay `unknown`. `gh run list` reaches
+back at most 1000 runs from the head, so for a workflow with a longer history,
+set `first_run_number` near its current run number. Otherwise the source fails
+with an error naming the lowest value the listing can reach. The worker never
+skips runs on its own, and runs below `first_run_number` are never read.
+
 There is no long-running loop, so `--once` is required. Schedule the command
 with cron, a systemd timer, or a scheduled task, and run one worker per scope
 at a time. For example, with the environment above in the crontab:

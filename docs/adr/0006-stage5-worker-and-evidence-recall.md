@@ -73,9 +73,23 @@ cursor of an instance says something checkable:
   The file is read in windows of `window_bytes`; a line longer than the
   window fails the source (it never reads as `unchanged`), and a tick whose
   collection fails still drains the turns earlier windows staged.
-- **CI** reads from the run after the highest measured window up to the
-  provider's settled high-water mark (the highest run below the lowest run
-  not yet completed), and the domain's target is that run range.
+- **CI** reads from the run after the highest measured window (or from the
+  source's `first_run_number`, when higher) toward the provider's settled
+  high-water mark: the highest run below the oldest run not yet completed
+  among the 50 newest. One tick reads at most 512 runs, but the domain's
+  target runs to the mark, so a tick that reads only part of a backlog writes
+  a partial receipt and absence stays `unknown` until a later tick reaches
+  the mark. `gh run list` reaches back at most 1000 runs from the head; a
+  resume point further back fails the source with an error naming the lowest
+  `first_run_number` the listing reaches. The worker never skips runs on its
+  own.
+
+  The mark stops below the oldest run still in flight. While such a run
+  waits (for example on an environment approval), completed runs above it
+  are neither read nor known to any receipt, and the source reports
+  `unchanged`. A CI `absent` therefore covers only runs below the oldest
+  in-flight run; reporting that blocker (a partial receipt or a distinct
+  outcome, which migration 0030's outcome set does not allow) is deferred.
 
 **Unregistered labels.** Receipts name the freshness rule
 `coverage.freshness.worker_tick` and the proof method

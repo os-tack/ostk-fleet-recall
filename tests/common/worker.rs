@@ -217,6 +217,20 @@ impl CiProviderFactory for RecordedCi {
     }
 }
 
+/// The recorded CI corpus behind a provider that reports its settled
+/// high-water mark as the given run: a head further out than one window can
+/// read, with no run past 8 to find on the way.
+pub struct RecordedCiSettledThrough(pub u64);
+
+impl CiProviderFactory for RecordedCiSettledThrough {
+    fn provider(
+        &self,
+        _source: &CiSourceV1,
+    ) -> CiScanResult<Option<(Box<dyn CiRunProvider>, u64)>> {
+        Ok(Some((Box::new(recorded_provider()), self.0)))
+    }
+}
+
 /// A deterministic 512-component embedder with no zero component.
 pub struct StubEmbedder;
 
