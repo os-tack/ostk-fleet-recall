@@ -156,8 +156,9 @@ pub fn admit_embedding(
 
 /// The one seam between the dense worker and an embedding model.
 ///
-/// Production wires this to the fleet's embedding service; tests wire it to a
-/// deterministic in-process model. It is deliberately the ONLY asynchronous,
+/// Production wires this to the fleet's pinned model2vec embedder through
+/// [`super::ChunkEmbedderProvider`]; tests wire it to a deterministic
+/// in-process model. It is deliberately the ONLY asynchronous,
 /// failure-prone dependency of the dense tier, so "the model is down" is a
 /// single, typed, contained condition
 /// ([`RecallProjectionError::EmbeddingProvider`]) that cannot reach the lexical

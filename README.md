@@ -149,7 +149,9 @@ it:
   (`src/connectors`);
 - the content-addressed body store and projector (`src/body_store`) and the
   lexical-first/dense-later recall projectors with per-row visibility
-  (`src/projectors`);
+  (`src/projectors`), including `ChunkEmbedderProvider`, the production
+  embedding provider that puts the pinned model2vec embedder behind the dense
+  projection's `EmbeddingProvider` seam;
 - the coverage runtime (`src/coverage_runtime`);
 - the normative activation, observer, and discrepancy runtimes
   (`src/normative_runtime`, `src/observer_runtime`,
@@ -167,9 +169,8 @@ it:
 
 Wiring this plane into the product needs, at minimum:
 
-- a worker or CLI that runs the connectors and projectors;
-- a production embedding provider behind the dense projection's
-  `EmbeddingProvider` seam;
+- a worker or CLI that runs the connectors and projectors, embedding the
+  dense tier through `ChunkEmbedderProvider`;
 - the publication grant on the filtered views from migration 23 (the runtime
   policy in `deploy/cockroach/runtime-role-grants.sql` already grants
   `fleet_runtime` the tables from migrations 19–27 and 29–31; see

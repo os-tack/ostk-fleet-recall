@@ -46,6 +46,8 @@
 //! * [`lexical`] — pure normalization and lexical identity, no database.
 //! * [`dense`] — pure embedding identity, vector admission, and the
 //!   [`EmbeddingProvider`] seam.
+//! * [`ChunkEmbedderProvider`] — the production provider: the fleet's pinned
+//!   model2vec embedder behind that seam.
 //! * [`repository`] — projector traits, cursor shapes, and readiness types.
 //! * [`visibility`] — the pure private/publication-safe classification and the
 //!   names of the two read planes' SQL objects (W2-VIS).
@@ -59,6 +61,7 @@
 //! plane reads two filtered views that cannot name a private row at all. See
 //! [`visibility`].
 
+mod chunk_embedding;
 mod cockroach;
 pub mod dense;
 mod error;
@@ -66,6 +69,7 @@ pub mod lexical;
 mod repository;
 pub mod visibility;
 
+pub use chunk_embedding::ChunkEmbedderProvider;
 pub use cockroach::{
     CockroachDenseProjector, CockroachLexicalProjector, CockroachRecallReader,
     DEFAULT_PROJECTION_BATCH,

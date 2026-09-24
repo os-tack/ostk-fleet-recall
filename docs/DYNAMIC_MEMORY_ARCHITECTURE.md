@@ -19,10 +19,12 @@ the coverage runtime, the lexical-first/dense-later recall projectors, the
 embedding worker's provider seam, and the Stage-6 normative activation,
 observer, and discrepancy runtimes are implemented as private-plane library
 modules with live CockroachDB tests. No serving path constructs any of them
-(only the observer has a runner, the private `ostk-observer-run` binary), and
-no production embedding provider implements that seam. The current source does
-implement the bounded PUBLIC-03 publication identity and planned AWS task input
-separation; those Terraform changes have not been applied.
+(only the observer has a runner, the private `ostk-observer-run` binary). The
+production embedding provider for that seam, `ChunkEmbedderProvider` over the
+pinned model2vec embedder, is library code that no binary constructs yet. The
+current source does implement the bounded PUBLIC-03 publication identity and
+planned AWS task input separation; those Terraform changes have not been
+applied.
 
 ## Purpose
 
@@ -667,10 +669,15 @@ path; the dense tier is written by a separate background worker behind an
 embedding-provider seam. The tiers occupy different tables, keep independent
 cursors, and share no statement, so a failing or absent provider cannot remove
 lexical availability — which is also what lets the dense vector index keep the
-equality-prefixed, `NOT NULL` shape CockroachDB's C-SPANN requires. No
-production embedding provider implements that seam; the live tests drive it
-with a deterministic fixture, including its outage and degenerate-vector
-paths.
+equality-prefixed, `NOT NULL` shape CockroachDB's C-SPANN requires. The
+production provider for that seam, `ChunkEmbedderProvider`, wraps the same
+pinned model2vec embedder `serve` and `ingest` load and declares its model
+digest, cosine distance, 512 dimensions, and the lexical normalization version
+as the embedding identity; it names an empty, non-finite, or zero vector as a
+provider failure, so an input the model cannot embed holds the dense cursor
+(never the lexical one) with a stated reason. No binary constructs it yet; the
+live tests drive the seam with a deterministic fixture, including its outage
+and degenerate-vector paths.
 
 None of these modules is reachable from the serving process or from any binary,
 and the accepted-event append seam they use is the Stage-4 one, unchanged. There
@@ -1018,10 +1025,11 @@ This does not require or authorize dynamic ingestion.
    Still absent at this stage: any Arrow IPC transport — the registry reserves
    an `arrow_batch_schema` entry kind, but no Arrow encoder, decoder, or
    dependency exists, and canonical bytes are the only transport in the merged
-   code; any production embedding provider behind the dense seam; a scheduler,
-   daemon, or CLI that runs any connector or projector, since every module here
-   is constructed only by its own tests; and the publication-role grant on the
-   two new views, which is a deployment action that has not been performed.
+   code; any binary that constructs the production embedding provider
+   (`ChunkEmbedderProvider`) behind the dense seam; a scheduler, daemon, or CLI
+   that runs any connector or projector, since every module here is constructed
+   only by its own tests; and the publication-role grant on the two new views,
+   which is a deployment action that has not been performed.
 6. Admit one exhaustive code/spec observer and add basic discrepancy derivation.
 
    Implemented, private only. Landed: migration 0024 and the normative
