@@ -6,6 +6,7 @@
 
 pub mod authority;
 pub mod runtime_role;
+pub mod worker;
 
 use ostk_fleet_recall::FleetScope;
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig};

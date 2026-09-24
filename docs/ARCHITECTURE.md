@@ -517,7 +517,9 @@ and exact grant matrix), then restart `serve`.
   cannot be revoked early.
 - Wire the dynamic-memory projections into MCP recall. The
   `ostk-fleet-recall worker --once` subcommand already runs the Stage-5
-  connectors and projectors, but no recall path reads what they write yet. The
+  connectors and projectors, and the evidence recall library
+  (`src/evidence_recall`) reads what they write with readiness, coverage, and
+  an absence verdict, but no MCP recall path serves it yet. The
   README's [built but not yet wired](../README.md#built-but-not-yet-wired)
   section lists what that needs.
 - Package Fleet Recall as an optional OSTK Recall plugin/backend.

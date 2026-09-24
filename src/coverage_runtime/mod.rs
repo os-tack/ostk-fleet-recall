@@ -44,6 +44,7 @@ mod cockroach;
 mod observed_range;
 mod repository;
 
+pub(crate) use cockroach::decode_cursor_row;
 pub use cockroach::{CockroachCoverageRuntimeRepository, CoverageFaultInjection};
 pub use observed_range::{InsertOutcome, ObservedRangeError, ObservedRangeV1, SequenceIntervalV1};
 pub use repository::{

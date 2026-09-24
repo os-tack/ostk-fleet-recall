@@ -211,6 +211,15 @@ it:
 - the memory worker (`src/worker`), which the `worker --once` subcommand runs
   (see [memory worker](#memory-worker)). Its projections are written, but no
   MCP recall reads them yet;
+- the evidence recall read library (`src/evidence_recall`) over those
+  projections: a search returns hits with a snippet of recall text, readiness
+  (evidence waiting for projection, transcript turns waiting in the outbox,
+  lexical and dense currency), every active source's status and newest
+  coverage cursor, and an absence verdict that is `absent` only when nothing
+  matched over a current lexical tier with every source healthy, fresh, and
+  completely covered, and `unknown`, with reasons, otherwise.
+  `probe_evidence_recall` gates it on migration 30 and SELECT on every table
+  it reads. `serve` does not construct it yet;
 - the normative activation, observer, and discrepancy runtimes
   (`src/normative_runtime`, `src/observer_runtime`,
   `src/discrepancy_runtime`); only the observer has a runner, the private
@@ -232,7 +241,7 @@ Wiring this plane into the product needs, at minimum:
   `fleet_runtime` the tables from migrations 19–27 and 29–31; see
   [MIGRATIONS.md](docs/MIGRATIONS.md#privilege-separation)), and a content
   key-encryption key for the governed content store;
-- MCP recall reading the new projections (`CockroachRecallReader`);
+- MCP recall serving the evidence recall library (`recall(kind=evidence)`);
 - a lighter writer-authority seam: evidence appends are authorized through the
   `memory_writer_authority_v1` view, whose rows only the signed registry
   ceremony writes today.

@@ -1083,6 +1083,26 @@ impl CockroachRecallReader {
         query_vector: Option<&[f32]>,
         limit: usize,
     ) -> RecallProjectionResult<RecallResultV1> {
+        let (hits, tier) = self.recall_hits(query_text, query_vector, limit).await?;
+        Ok(RecallResultV1 {
+            hits,
+            tier,
+            completeness: self.completeness().await?,
+        })
+    }
+
+    /// The hits and tier of [`Self::recall`], without its readiness read.
+    ///
+    /// For a caller that reads [`Self::completeness`] itself, before the
+    /// lanes run: a readiness read taken after the lanes can count a row the
+    /// lanes did not see, so only one taken first says what the hits were
+    /// drawn from.
+    pub async fn recall_hits(
+        &self,
+        query_text: &str,
+        query_vector: Option<&[f32]>,
+        limit: usize,
+    ) -> RecallProjectionResult<(Vec<RecallHitV1>, RecallTierV1)> {
         if limit == 0 || limit > MAX_RECALL_LIMIT {
             return Err(RecallProjectionError::InvalidRequest(format!(
                 "recall limit must be between 1 and {MAX_RECALL_LIMIT}"
@@ -1133,12 +1153,7 @@ impl CockroachRecallReader {
                 }),
         );
         hits.truncate(limit);
-
-        Ok(RecallResultV1 {
-            hits,
-            tier,
-            completeness: self.completeness().await?,
-        })
+        Ok((hits, tier))
     }
 
     async fn lexical_lane(

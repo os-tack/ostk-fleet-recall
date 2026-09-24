@@ -21,300 +21,33 @@
 mod common;
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::Write as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use common::authority::{InstalledAuthority, install_generation_two, retry_policy};
+use common::authority::retry_policy;
 use common::runtime_role::RuntimeProbeRole;
-use ostk_fleet_recall::FleetError;
-use ostk_fleet_recall::connectors::ci::scan::{
-    RECORDED_BRANCH, RECORDED_REPOSITORY, RECORDED_WORKFLOW, recorded_provider,
+use common::worker::{
+    BROKEN_TRANSCRIPT_LINE, CI_INSTANCE, COMMIT_WORD, FAILING_STEP_WORD, GIT_INSTANCE, RecordedCi,
+    StubEmbedder, TRANSCRIPT_WORD, WorkerFixture as Fixture,
 };
-use ostk_fleet_recall::connectors::ci::{CiRunProvider, CiScanResult};
-use ostk_fleet_recall::control_log::TrustedControlScope;
-use ostk_fleet_recall::coverage_runtime::CockroachCoverageRuntimeRepository;
+use ostk_fleet_recall::FleetError;
 use ostk_fleet_recall::memory_contracts::canonical::decode_strict;
 use ostk_fleet_recall::memory_contracts::common::ContractId;
 use ostk_fleet_recall::memory_contracts::coverage::CoverageCompletenessV1;
-use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
 use ostk_fleet_recall::memory_contracts::evidence_v2::EvidenceStatementV2;
-use ostk_fleet_recall::projectors::{ChunkEmbedderProvider, CockroachRecallReader};
-use ostk_fleet_recall::store::cockroach::{
-    CockroachStore, DatabaseCapabilities, PoolConfig, RetryPolicy,
-};
+use ostk_fleet_recall::store::cockroach::{CockroachStore, DatabaseCapabilities, PoolConfig};
 use ostk_fleet_recall::worker::{
-    CiProviderFactory, CiSourceV1, MemoryWorker, WorkerCommandV1, WorkerDeps, WorkerProcessV1,
-    WorkerSourceOutcomeV1, WorkerSourcesV1, WorkerStepStatusV1, WorkerStepV1, WorkerTickReportV1,
-    parse_steps, probe_worker_privileges, run_command,
+    WorkerCommandV1, WorkerProcessV1, WorkerSourceOutcomeV1, WorkerStepStatusV1, WorkerStepV1,
+    WorkerTickReportV1, parse_steps, probe_worker_privileges, run_command,
 };
 use ostk_recall_core::ChunkEmbedder;
-use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
 
-/// The provider-installation coordinate every source is configured with.
-const INSTALLATION_ID: u64 = 4242;
-
-const GIT_INSTANCE: &str = "connector.git.worker";
-const CI_INSTANCE: &str = "connector.ci.worker";
-const TRANSCRIPT_PREFIX: &str = "connector.transcript";
-
-/// A word that occurs only in the scratch repository's second commit.
-const COMMIT_WORD: &str = "zephyrine";
-/// A word that occurs only in the scratch transcript's first turn.
-const TRANSCRIPT_WORD: &str = "quillback";
-/// The step that failed in the recorded CI corpus.
-const FAILING_STEP_WORD: &str = "Mermaid";
-
-/// Fixed past commit instants, so every scan of the scratch repository
-/// renders byte-identical commit facts.
-const FIRST_COMMIT_DATE: &str = "1755259200 +0000";
-const SECOND_COMMIT_DATE: &str = "1755345600 +0000";
-
 // ---------------------------------------------------------------------------
-// Scratch sources.
+// Test-only views of the fixture scope.
 // ---------------------------------------------------------------------------
-
-/// A bare scratch repository whose `refs/heads/main` has two commits.
-struct ScratchRepository {
-    directory: tempfile::TempDir,
-}
-
-impl ScratchRepository {
-    fn with_two_commits() -> Self {
-        let directory = tempfile::tempdir().expect("scratch repository directory");
-        let status = Command::new("git")
-            .args(["init", "--bare", "--quiet"])
-            .arg(directory.path())
-            .status()
-            .expect("git must be on PATH for the memory worker proof");
-        assert!(status.success(), "git init --bare must succeed");
-        let repository = Self { directory };
-        let readme = repository.git(&["hash-object", "-w", "--stdin"], Some(b"worker\n"), None);
-        let tree = repository.git(
-            &["mktree"],
-            Some(format!("100644 blob {readme}\tREADME.md\n").as_bytes()),
-            None,
-        );
-        let first = repository.git(
-            &["commit-tree", &tree, "-m", "seed the worker fixture"],
-            None,
-            Some(FIRST_COMMIT_DATE),
-        );
-        let second = repository.git(
-            &[
-                "commit-tree",
-                &tree,
-                "-p",
-                &first,
-                "-m",
-                &format!("document the {COMMIT_WORD} cache eviction"),
-            ],
-            None,
-            Some(SECOND_COMMIT_DATE),
-        );
-        repository.git(&["update-ref", "refs/heads/main", &second], None, None);
-        repository
-    }
-
-    fn path(&self) -> &Path {
-        self.directory.path()
-    }
-
-    fn git(&self, args: &[&str], stdin: Option<&[u8]>, date: Option<&str>) -> String {
-        let date = date.unwrap_or(FIRST_COMMIT_DATE);
-        let mut child = Command::new("git")
-            .arg(format!("--git-dir={}", self.directory.path().display()))
-            .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "Worker Fixture")
-            .env("GIT_AUTHOR_EMAIL", "worker@example.invalid")
-            .env("GIT_AUTHOR_DATE", date)
-            .env("GIT_COMMITTER_NAME", "Worker Fixture")
-            .env("GIT_COMMITTER_EMAIL", "worker@example.invalid")
-            .env("GIT_COMMITTER_DATE", date)
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("git must spawn");
-        if let Some(bytes) = stdin {
-            child
-                .stdin
-                .as_mut()
-                .expect("piped stdin")
-                .write_all(bytes)
-                .expect("git stdin");
-        }
-        let output = child.wait_with_output().expect("git must finish");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("plumbing output is ASCII")
-            .trim()
-            .to_owned()
-    }
-}
-
-const SESSION: &str = "0f3a8c5e-worker-session";
-
-fn line(kind: &str, uid: &str, timestamp: &str, text: &str) -> String {
-    format!(
-        r#"{{"type":"{kind}","sessionId":"{SESSION}","uuid":"{uid}","timestamp":"{timestamp}","message":{{"role":"{kind}","content":[{{"type":"text","text":{}}}]}}}}"#,
-        serde_json::to_string(text).unwrap()
-    )
-}
-
-fn first_turn_text() -> String {
-    format!("why does the {TRANSCRIPT_WORD} importer drop rows")
-}
-
-/// A scratch transcript directory.
-///
-/// `session.jsonl` holds two turns. `session-resumed.jsonl` repeats the first
-/// turn exactly as a resumed session file does, but with its own timestamp:
-/// the line differs, so the turn is a second source fact, while its redacted
-/// body is byte-identical, so its append deduplicates onto the governed
-/// content object the first file already wrote.
-fn transcript_directory() -> tempfile::TempDir {
-    let directory = tempfile::tempdir().expect("transcript directory");
-    let first = line(
-        "user",
-        "turn-1",
-        "2026-08-15T12:30:00.000Z",
-        &first_turn_text(),
-    );
-    std::fs::write(
-        directory.path().join("session.jsonl"),
-        format!(
-            "{first}\n{}\n",
-            line(
-                "assistant",
-                "turn-2",
-                "2026-08-15T12:30:01.000Z",
-                "the importer skips rows whose checksum collides"
-            )
-        ),
-    )
-    .unwrap();
-    std::fs::write(
-        directory.path().join("session-resumed.jsonl"),
-        format!(
-            "{}\n",
-            line(
-                "user",
-                "turn-1",
-                "2026-08-16T09:00:00.000Z",
-                &first_turn_text()
-            )
-        ),
-    )
-    .unwrap();
-    directory
-}
-
-/// The recorded CI corpus, settled through run 8.
-struct RecordedCi;
-
-impl CiProviderFactory for RecordedCi {
-    fn provider(
-        &self,
-        _source: &CiSourceV1,
-    ) -> CiScanResult<Option<(Box<dyn CiRunProvider>, u64)>> {
-        Ok(Some((Box::new(recorded_provider()), 8)))
-    }
-}
-
-/// A deterministic 512-component embedder with no zero component.
-struct StubEmbedder;
-
-impl ChunkEmbedder for StubEmbedder {
-    fn dim(&self) -> usize {
-        512
-    }
-
-    fn model_id(&self) -> &'static str {
-        "stub-model2vec-512"
-    }
-
-    fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
-        texts
-            .iter()
-            .map(|text| {
-                let seed = Sha256::digest(text.as_bytes());
-                (0..512)
-                    .map(|index| f32::from(seed[index % seed.len()]) - 127.5)
-                    .collect()
-            })
-            .collect()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Worker wiring.
-// ---------------------------------------------------------------------------
-
-/// One installed scope and the sources a worker runs for it.
-struct Fixture {
-    installed: InstalledAuthority,
-    repository: ScratchRepository,
-    transcripts: tempfile::TempDir,
-}
 
 impl Fixture {
-    async fn install(pool: &PgPool, label: &str) -> Self {
-        Self {
-            installed: install_generation_two(pool, label).await,
-            repository: ScratchRepository::with_two_commits(),
-            transcripts: transcript_directory(),
-        }
-    }
-
-    fn sources(&self) -> WorkerSourcesV1 {
-        WorkerSourcesV1::from_json_slice(&serde_json::to_vec(&self.sources_json()).unwrap())
-            .expect("the fixture sources file is valid")
-    }
-
-    /// The sources file, as an operator would write it.
-    fn sources_json(&self) -> serde_json::Value {
-        serde_json::json!({
-                "schema_version": 1,
-                "coverage_since": "2026-08-01T00:00:00Z",
-                "git": [{
-                    "connector_principal": "connector.git",
-                    "connector_instance": GIT_INSTANCE,
-                    "installation_id": INSTALLATION_ID,
-                    "repository_id": "git.repo.worker",
-                    "git_dir": self.repository.path(),
-                    "ref_name": "refs/heads/main"
-                }],
-                "transcripts": [{
-                    "connector_principal": "connector.transcript",
-                    "instance_prefix": TRANSCRIPT_PREFIX,
-                    "installation_id": INSTALLATION_ID,
-                    "dirs": [self.transcripts.path()]
-                }],
-                "ci": [{
-                    "connector_principal": "connector.ci",
-                    "connector_instance": CI_INSTANCE,
-                    "installation_id": INSTALLATION_ID,
-                    "repository_id": "ci.repo.worker",
-                    "provider_repository": RECORDED_REPOSITORY,
-                    "workflow": RECORDED_WORKFLOW,
-                    "branch": RECORDED_BRANCH
-                }]
-        })
-    }
-
     /// `worker --once --sources <file> --steps all` for this scope over
     /// `pool`, with the installed pins and key as the command's environment.
     /// Returns the command's outcome and what it printed.
@@ -358,50 +91,6 @@ impl Fixture {
         (
             outcome,
             String::from_utf8(out).expect("the report is UTF-8"),
-        )
-    }
-
-    /// A worker running `steps` over `pool` (the owner, or a probe login).
-    async fn worker(&self, pool: &PgPool, steps: &str) -> MemoryWorker {
-        let embedding = ChunkEmbedderProvider::new(
-            Arc::new(StubEmbedder),
-            Sha256Digest::from_bytes([0x5a; 32]),
-        )
-        .expect("the stub embedder is 512 wide");
-        MemoryWorker::new(
-            WorkerDeps {
-                pool: pool.clone(),
-                scope: self.installed.scope.clone(),
-                authority: Some(self.installed.runtime(pool).await),
-                sources: self.sources(),
-                embedding: Some(Arc::new(embedding)),
-                ci_providers: Arc::new(RecordedCi),
-                retry: retry_policy(),
-            },
-            parse_steps(steps).unwrap(),
-            Some(self.installed.kek()),
-            Some(self.installed.kek()),
-        )
-        .expect("every selected step has its inputs")
-    }
-
-    fn coverage(&self, pool: &PgPool) -> CockroachCoverageRuntimeRepository {
-        CockroachCoverageRuntimeRepository::new(
-            pool.clone(),
-            TrustedControlScope::from_trusted_context(
-                &self.installed.scope,
-                self.installed.semantic_scope.clone(),
-            )
-            .unwrap(),
-            RetryPolicy::default(),
-        )
-    }
-
-    fn reader(&self, pool: &PgPool) -> CockroachRecallReader {
-        CockroachRecallReader::new(
-            pool.clone(),
-            self.installed.scope.tenant_id,
-            self.installed.scope.project.clone(),
         )
     }
 
@@ -621,10 +310,7 @@ async fn live_worker_isolates_step_failures_when_configured() {
     let fixture = Fixture::install(&pool, "worker-isolation").await;
     std::fs::write(
         fixture.transcripts.path().join("broken.jsonl"),
-        format!(
-            "{}\n",
-            r#"{"type":"telemetry-burst","sessionId":"s","uuid":"u","timestamp":"2026-08-15T12:30:00.000Z"}"#
-        ),
+        format!("{BROKEN_TRANSCRIPT_LINE}\n"),
     )
     .unwrap();
     let report = fixture.worker(&pool, "all").await.run_tick().await;
@@ -780,10 +466,7 @@ async fn live_worker_command_once_writes_one_report_when_configured() {
 
     std::fs::write(
         fixture.transcripts.path().join("broken.jsonl"),
-        format!(
-            "{}\n",
-            r#"{"type":"telemetry-burst","sessionId":"s","uuid":"u","timestamp":"2026-08-15T12:30:00.000Z"}"#
-        ),
+        format!("{BROKEN_TRANSCRIPT_LINE}\n"),
     )
     .unwrap();
     let (outcome, printed) = fixture.run_command(&owner, &capabilities, &sources).await;

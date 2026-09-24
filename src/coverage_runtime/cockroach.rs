@@ -399,9 +399,9 @@ fn frame(hasher: &mut Sha256, bytes: &[u8]) {
 /// `last_receipt_id` and `updated_at`, so a statement that selects those columns
 /// can reuse it.
 ///
-/// `pub` inside this private module, so the coverage runtime can re-export it
-/// crate-wide (`pub(crate) use`) for the first reader outside it that selects
-/// cursor rows directly; until then it stays module-internal.
+/// `pub` inside this private module; the coverage runtime re-exports it
+/// crate-wide (`pub(crate) use`) for evidence recall, which lists each connector
+/// instance's newest cursor directly.
 pub fn decode_cursor_row(row: &PgRow) -> Result<CoverageCursorRowV1> {
     let observed_bytes: Vec<u8> = row.try_get("observed_ranges")?;
     let observed: ObservedRangeV1 =

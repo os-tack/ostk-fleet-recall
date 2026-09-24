@@ -16,7 +16,8 @@ No webhook, transport queue, remote ingress, incident controller, or public
 mutation route exists today. Two local connectors (agent transcripts and git
 history), a CI workflow-run connector, the content-addressed body projector,
 the coverage runtime, the lexical-first/dense-later recall projectors, the
-embedding worker's provider seam, and the Stage-6 normative activation,
+embedding worker's provider seam, the evidence recall read library over those
+projections, and the Stage-6 normative activation,
 observer, and discrepancy runtimes are implemented as private-plane library
 modules with live CockroachDB tests. No serving path constructs any of them.
 Two commands run some of them. The private `ostk-observer-run` binary runs the
@@ -695,6 +696,28 @@ unregistered compile-time labels `coverage.freshness.worker_tick` and
 `coverage.proof.enumerated_snapshot`. The body projector consumes every
 `evidence.accepted` event in the scope, so observer-run records become bodies
 as well, indexed over their raw bytes.
+
+Evidence recall (`src/evidence_recall`) is the read side of this plane, a
+library that serving does not construct yet. A search runs the lexical lane
+and, when the process embeds with the model the dense tier was built with, the
+dense lane (a dense match below the chunk lane's 0.18 cosine floor does not
+count), and hydrates each hit with a bounded snippet of the lexical tier's
+redacted recall text, its media type, and the accepted event that first
+produced its body. Every answer carries readiness (accepted events the body
+projector has not consumed, transcript turns still in the outbox, whether the
+lexical and dense tiers cover every body), each active source's status row and
+newest coverage cursor, and an absence verdict. The verdict is `present` when
+anything matched; `absent` only when the query has lexical terms, nothing is
+waiting for projection or admission, the lexical tier is current, and every
+active source's last attempt succeeded, its last completed check is within its
+`stale_after_seconds`, and its newest cursor is `complete`; and otherwise
+`unknown`, naming each reason. Absence is defined over the lexical tier, so
+dense lag never blocks it. For a transcript, `complete` describes its latest
+drained slice; freshness comes from the status row. The sources are read before
+readiness, and readiness before the lanes, so a verdict never rests on a
+projection newer than the one it counted. A startup probe gates the library on
+migration 30 and SELECT on every table it reads, and disables the dense lane
+when the dense tier holds another model's vectors.
 
 `ostk-fleet-recall worker --once` runs one tick as the private writer login and
 prints its report as one JSON line. It exits 1 when any step failed. Before the
