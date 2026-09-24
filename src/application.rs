@@ -507,7 +507,7 @@ impl CockroachMemoryService {
             }
             // Conflict lookup by id is part of the lifecycle surface; the
             // record-only (publication) surface keeps its historical kinds.
-            "conflict" if self.lifecycle.surface != RememberSurface::RECORD_ONLY => {
+            "conflict" if self.lifecycle.surface.lifecycle_served() => {
                 self.recall_conflict(scope, &args.id).await
             }
             other => Err(ServiceError::InvalidRequest(format!(
@@ -669,7 +669,7 @@ impl CockroachMemoryService {
             "embedding_model": self.embedder.model_id(),
             "embedding_dimension": self.embedder.dim(),
         }));
-        if self.lifecycle.surface != RememberSurface::RECORD_ONLY {
+        if self.lifecycle.surface.lifecycle_served() {
             result.data["remember_surface"] = json!(self.lifecycle.surface);
         }
         result.conflict_coverage = ConflictCoverage::not_evaluated();

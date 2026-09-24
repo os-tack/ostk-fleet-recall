@@ -14,7 +14,7 @@ use crate::service::{
 use crate::{FleetScope, Result};
 
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
-use super::tools::tool_list_for;
+use super::tools::tool_list_for_surfaces;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub(super) const MAX_MCP_FRAME_BYTES: usize = 1_048_576;
@@ -53,7 +53,8 @@ struct WireRememberRequest {
 pub struct McpServer {
     service: Arc<dyn FleetMemoryService>,
     trusted_scope: FleetScope,
-    /// `tools/list` for the service's remember surface, computed once.
+    /// `tools/list` for the service's remember and recall surfaces, computed
+    /// once.
     tools: Value,
 }
 
@@ -62,7 +63,9 @@ impl McpServer {
     /// and every caller refinement is validated again before dispatch.
     pub fn new(service: Arc<dyn FleetMemoryService>, trusted_scope: FleetScope) -> Result<Self> {
         trusted_scope.validate()?;
-        let tools = json!({ "tools": tool_list_for(service.remember_surface()) });
+        let tools = json!({
+            "tools": tool_list_for_surfaces(service.remember_surface(), service.recall_surface())
+        });
         Ok(Self {
             service,
             trusted_scope,

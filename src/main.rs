@@ -362,11 +362,12 @@ async fn build_memory_service(
     let embedder: Arc<dyn ChunkEmbedder> = Arc::new(load_pinned_embedder(config)?);
     let store = Arc::new(connect_store(config).await?);
     store.health_check().await?;
+    // One schema snapshot, read once, feeds every startup capability probe.
+    let capabilities = store.capabilities().await?;
     // The conflict lifecycle is served only when migration 29 is applied and
     // this role holds its grants; otherwise the claim lifecycle is served
     // alone. The probe runs once, so a later grant change needs a restart.
     let conflict_lifecycle = if config.lifecycle.remember_lifecycle {
-        let capabilities = store.capabilities().await?;
         probe_conflict_lifecycle(store.pool(), &capabilities).await?
     } else {
         None

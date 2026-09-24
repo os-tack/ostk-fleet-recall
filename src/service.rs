@@ -293,6 +293,16 @@ impl RememberSurface {
         adjudication: false,
     };
 
+    /// Whether any lifecycle is served: the claim lifecycle, the conflict
+    /// lifecycle, or both. Gates `recall(get, kind=conflict)`, the
+    /// `remember_surface` block in `recall(status)`, and the lifecycle
+    /// wording of the recall tool. Adjudication alone serves nothing: it
+    /// needs the conflict lifecycle beneath it.
+    #[must_use]
+    pub const fn lifecycle_served(self) -> bool {
+        self.claim_lifecycle || self.conflict_lifecycle
+    }
+
     /// Whether `dismiss` and `waive` are served: adjudication needs the
     /// conflict lifecycle beneath it.
     #[must_use]
@@ -312,6 +322,28 @@ impl RememberSurface {
             _ => false,
         }
     }
+}
+
+/// Which optional `recall` capabilities a service instance serves.
+///
+/// The MCP edge advertises exactly this surface beside the
+/// [`RememberSurface`] in `tools/list`. [`Self::NONE`] adds nothing, so the
+/// historical recall schema stays byte-for-byte what it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct RecallSurface {
+    /// `recall(kind=evidence)` over connector evidence, with readiness,
+    /// per-source coverage and an absence verdict.
+    pub evidence: bool,
+    /// `recall(action=discrepancies)` over spec-nonconformance episodes and
+    /// the latest spec checks.
+    pub discrepancies: bool,
+}
+
+impl RecallSurface {
+    pub const NONE: Self = Self {
+        evidence: false,
+        discrepancies: false,
+    };
 }
 
 /// Refuse a lifecycle action the surface does not serve, before any I/O.
@@ -393,6 +425,12 @@ pub trait FleetMemoryService: Send + Sync {
     /// The `remember` actions this instance serves; see [`RememberSurface`].
     fn remember_surface(&self) -> RememberSurface {
         RememberSurface::RECORD_ONLY
+    }
+
+    /// The optional `recall` capabilities this instance serves; see
+    /// [`RecallSurface`].
+    fn recall_surface(&self) -> RecallSurface {
+        RecallSurface::NONE
     }
 }
 
@@ -533,6 +571,40 @@ mod tests {
             }
         }
         assert_eq!(RememberSurface::default(), RememberSurface::RECORD_ONLY);
+    }
+
+    #[test]
+    fn lifecycle_served_matches_every_reachable_surface() {
+        // Serve composes the claim lifecycle first, the probed conflict
+        // lifecycle on top, and adjudication only above the conflict
+        // lifecycle; on each of those surfaces "a lifecycle is served" and
+        // "the surface is not record-only" agree.
+        let claim = RememberSurface {
+            claim_lifecycle: true,
+            ..RememberSurface::RECORD_ONLY
+        };
+        let conflicts = RememberSurface {
+            conflict_lifecycle: true,
+            ..claim
+        };
+        let adjudicating = RememberSurface {
+            adjudication: true,
+            ..conflicts
+        };
+        for surface in [RememberSurface::RECORD_ONLY, claim, conflicts, adjudicating] {
+            assert_eq!(
+                surface.lifecycle_served(),
+                surface != RememberSurface::RECORD_ONLY,
+                "{surface:?}"
+            );
+        }
+        // The adjudication switch without a lifecycle beneath it serves none.
+        let switch_only = RememberSurface {
+            adjudication: true,
+            ..RememberSurface::RECORD_ONLY
+        };
+        assert!(!switch_only.lifecycle_served());
+        assert!(!switch_only.serves_adjudication());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::service::RememberSurface;
+use crate::service::{RecallSurface, RememberSurface};
 
 /// Claim-shaped `remember` properties that a non-record action must not carry.
 const CLAIM_FIELDS: [&str; 11] = [
@@ -229,13 +229,13 @@ pub fn tool_list() -> Vec<Value> {
     vec![recall_tool(), remember_tool()]
 }
 
-/// `recall` as served beside the given remember surface. The record-only
-/// surface is exactly [`recall_tool`]; a lifecycle surface adds
+/// `recall` as served beside the given remember surface. A surface that
+/// serves no lifecycle is exactly [`recall_tool`]; a lifecycle surface adds
 /// `get` with `kind=conflict`.
 #[must_use]
 pub fn recall_tool_for(surface: RememberSurface) -> Value {
     let mut tool = recall_tool();
-    if surface == RememberSurface::RECORD_ONLY {
+    if !surface.lifecycle_served() {
         return tool;
     }
     tool["description"] = if surface.serves_adjudication() {
@@ -263,6 +263,22 @@ pub fn recall_tool_for(surface: RememberSurface) -> Value {
         }));
     }
     tool
+}
+
+/// `recall` as served beside the given remember and recall surfaces.
+///
+/// It is the [`recall_tool_for`] schema of the remember surface, widened by
+/// each recall capability served; with [`RecallSurface::NONE`] it is exactly
+/// [`recall_tool_for`].
+#[must_use]
+pub fn recall_tool_for_surfaces(remember: RememberSurface, recall: RecallSurface) -> Value {
+    // No recall capability widens the schema yet. Naming every field keeps a
+    // new capability from compiling until this schema advertises it.
+    let RecallSurface {
+        evidence: _,
+        discrepancies: _,
+    } = recall;
+    recall_tool_for(remember)
 }
 
 /// `remember` restricted to the actions the surface serves. The record-only
@@ -613,14 +629,25 @@ fn adjudication_branch(
     adjudication
 }
 
-/// The agent-facing surface for one remember surface. The record-only
-/// surface is exactly [`tool_list`].
+/// The agent-facing surface for one remember surface and no optional recall
+/// capability. The record-only surface is exactly [`tool_list`].
 #[must_use]
 pub fn tool_list_for(surface: RememberSurface) -> Vec<Value> {
-    if surface == RememberSurface::RECORD_ONLY {
+    tool_list_for_surfaces(surface, RecallSurface::NONE)
+}
+
+/// The agent-facing surface for a remember surface and a recall surface. The
+/// record-only remember surface beside [`RecallSurface::NONE`] is exactly
+/// [`tool_list`].
+#[must_use]
+pub fn tool_list_for_surfaces(remember: RememberSurface, recall: RecallSurface) -> Vec<Value> {
+    if remember == RememberSurface::RECORD_ONLY && recall == RecallSurface::NONE {
         return tool_list();
     }
-    vec![recall_tool_for(surface), remember_tool_for(surface)]
+    vec![
+        recall_tool_for_surfaces(remember, recall),
+        remember_tool_for(remember),
+    ]
 }
 
 /// `{name: false}` for each named property this schema actually declares.
@@ -737,6 +764,37 @@ mod tests {
             remember_tool()
         );
         assert_ne!(tool_list_for(lifecycle_surface()), historical);
+    }
+
+    #[test]
+    fn no_recall_capability_leaves_every_remember_surface_byte_identical() {
+        assert_eq!(RecallSurface::default(), RecallSurface::NONE);
+        assert_eq!(
+            tool_list_for_surfaces(RememberSurface::RECORD_ONLY, RecallSurface::NONE),
+            tool_list()
+        );
+        for surface in [
+            RememberSurface::RECORD_ONLY,
+            lifecycle_surface(),
+            conflict_surface(),
+            adjudication_surface(),
+        ] {
+            let listed = tool_list_for_surfaces(surface, RecallSurface::NONE);
+            assert_eq!(listed, tool_list_for(surface), "{surface:?}");
+            // The pair each remember surface advertised before recall
+            // surfaces existed, byte for byte.
+            let composed = vec![recall_tool_for(surface), remember_tool_for(surface)];
+            assert_eq!(
+                serde_json::to_vec(&listed).unwrap(),
+                serde_json::to_vec(&composed).unwrap(),
+                "{surface:?}"
+            );
+            assert_eq!(
+                recall_tool_for_surfaces(surface, RecallSurface::NONE),
+                recall_tool_for(surface),
+                "{surface:?}"
+            );
+        }
     }
 
     #[test]
