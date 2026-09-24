@@ -79,10 +79,14 @@ re-checks the key and finds no incompatible current pair left
 ([ADR 0004](docs/adr/0004-serving-conflict-lifecycle.md)). The one exception
 is adjudication, which a deployment must enable: an agent that authored none
 of a conflict's members may dismiss it as not a real disagreement, and the
-pairs it judged never keep that conflict open again. No action changes
-another agent's claim. Acknowledgements, waivers, dismissals, and
-detector-verified closes are appended to a per-conflict lifecycle log
-(migration 0029). The writer serves `acknowledge`, `resolve`, adjudication, the
+pairs it judged never keep that conflict open again. A later close that leaves
+such pairs out says so with `resolution_kind` `no_undismissed_incompatibility`
+instead of `no_current_incompatibility`. No action changes another agent's
+claim value, author, or applicability, but every close returns the conflict's
+disputed members, whoever wrote them, to `active` at a new revision (unless
+another open conflict still holds them). Acknowledgements, waivers,
+dismissals, and detector-verified closes are appended to a per-conflict
+lifecycle log (migration 0029). The writer serves `acknowledge`, `resolve`, adjudication, the
 overlay, and history only when its startup probe finds that log and the
 runtime grants on it; otherwise it serves `retract` and `supersede` alone and
 closes are audited in `memory_events` only.
@@ -554,14 +558,18 @@ member claims to retract:
 
 In one transaction the server retracts those claims exactly as `retract` would,
 then asks the detector, in Rust and in SQL, whether any incompatible current
-pair is left. If none is, the conflict is `resolved`, its remaining disputed
+pair is left, not counting pairs an adjudicator dismissed in this conflict
+(below). If none is, the conflict is `resolved`, its remaining disputed
 members return to `active`, and the response carries `claims_retracted`,
 `claims_restored`, `conflicts_resolved`, and the detector-attributed
 `lifecycle_event`. If a pair is left, for example in a three-way conflict, the
 whole request is refused as `still_incompatible` with the remaining `pairs`
 and nothing is retracted. Omitting `retract_claim_ids` only asks the detector
-to re-verify the conflict, which any agent may do. `resolve` never changes
-another agent's claim: naming one is refused as `not_owner`. It is also
+to re-verify the conflict, which any agent may do. `resolve` never retracts
+another agent's claim: naming one is refused as `not_owner`. The only other
+claims a close touches are the disputed members it restores, whoever wrote
+them: each returns to `active` at a new revision, so an agent holding one must
+re-read it before sending its `expected_revision`. It is also
 refused when a named claim is not a member (`not_member`) or no longer current
 (`not_current`), when the conflict is closed (`not_open`), and when its
 revision or member count moved (`stale_revision`, `stale_member_count`; an
@@ -613,6 +621,14 @@ conflict with a new incompatible claim, the judged pairs no longer count: a
 retract, supersede, or concession that leaves only dismissed pairs closes the
 conflict, and its `reevaluation.excluded_dismissed_pairs` and close event
 report how many were left out. A pair nobody dismissed still keeps it open.
+Such a close is `resolved` by the detector, but because the dismissed pairs
+are still current and still incompatible, the conflict's `resolution_kind` is
+`no_undismissed_incompatibility`, not `no_current_incompatibility`. Its logged
+`resolved` event keeps the reason kind `no_current_incompatibility`, the only
+one the log admits for a detector close, and carries the count in its payload.
+Every writer that can read the lifecycle log leaves recorded dismissals out,
+including one that does not serve `dismiss` itself, such as a writer started
+after adjudication was switched off.
 
 ```json
 {"action":"waive","idempotency_key":"readme/waive/v1","conflict_id":9,"expected_revision":1,"expected_member_count":2,"reason_kind":"capacity_deferred","rationale":"the migrator review is scheduled for the next release","expires_in_hours":72,"review_in_hours":24}
@@ -730,9 +746,12 @@ the remaining rows.
   `remember(supersede)`, and the retractions of `remember(resolve)` change
   only an `operator_asserted` claim whose stored actor is the trusted
   deployment agent, and a successor keeps its predecessor's kind, key, and
-  detector eligibility. No agent can retire another agent's claim. A
-  conflict closes only when the detector finds no incompatible
-  lifecycle-current pair, or when an adjudicator dismisses it:
+  detector eligibility. No agent can retire another agent's claim; a close
+  only returns the conflict's disputed members, whoever wrote them, to
+  `active` at a new revision. A conflict closes only when the detector finds
+  no incompatible lifecycle-current pair other than pairs an adjudicator
+  dismissed in that conflict (such a close reads `resolution_kind`
+  `no_undismissed_incompatibility`), or when an adjudicator dismisses it:
   `remember(dismiss)` and `remember(waive)` are off unless
   `FLEET_RECALL_CONFLICT_ADJUDICATION=enabled`, are refused to any author of
   any of the conflict's members, and fail closed when a member has no

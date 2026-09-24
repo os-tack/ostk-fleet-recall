@@ -29,9 +29,9 @@ use super::{
 };
 use crate::ledger::lifecycle::{
     ClaimShape, ConflictRowState, LifecycleRefusal, LockedKeyClaim, MAX_REPORTED_REMAINING_PAIRS,
-    OPERATOR_ASSERTED_ORIGIN, Reevaluation, RefusalCode, V2Lineage, check_owner_transition,
-    check_successor, classify_lineages, lifecycle_request_identity, plan_reevaluation,
-    validate_reason,
+    NO_CURRENT_INCOMPATIBILITY, OPERATOR_ASSERTED_ORIGIN, Reevaluation, RefusalCode, V2Lineage,
+    check_owner_transition, check_successor, classify_lineages, lifecycle_request_identity,
+    plan_reevaluation, validate_reason, verified_close_resolution_kind,
 };
 use crate::ledger::types::PreparedClaim;
 use crate::ledger::{
@@ -55,7 +55,6 @@ pub(super) const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_KEY_INCOMPATIBLE_PAIRS: usize =
     MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON * (MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON - 1) / 2;
 const RESOLVED_STATE: &str = "resolved";
-const NO_CURRENT_INCOMPATIBILITY: &str = "no_current_incompatibility";
 /// The claim-event reason of a disputed member a verified close restored.
 const RESOLVED_RESTORE_REASON: &str = "conflict_resolved";
 
@@ -1111,6 +1110,11 @@ pub(super) struct VerifiedClose<'a> {
 /// Close the key's v2 conflict as `resolved`, restore the disputed members no
 /// other open conflict holds, and, with the capability, log the close as a
 /// detector-attributed `resolved` event.
+///
+/// A close that left out dismissed pairs is written with resolution kind
+/// `no_undismissed_incompatibility`, since those pairs are still current and
+/// incompatible; its event keeps `no_current_incompatibility`, which the
+/// log's CHECK requires of every `resolved` event, and carries the count.
 pub(super) async fn apply_verified_close(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
@@ -1142,7 +1146,7 @@ pub(super) async fn apply_verified_close(
             conflict_id,
             expected_revision: conflict_revision,
             state: RESOLVED_STATE,
-            resolution_kind: NO_CURRENT_INCOMPATIBILITY,
+            resolution_kind: verified_close_resolution_kind(excluded_dismissed_pairs),
             resolution_reason: &resolution_reason,
         },
     )

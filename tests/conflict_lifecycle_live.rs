@@ -5062,14 +5062,25 @@ async fn live_dismissed_pair_does_not_keep_reopened_conflict_open_when_configure
     let reevaluation = retracted.reevaluation.as_ref().unwrap();
     assert_eq!(reevaluation.outcome, "closed");
     assert_eq!(reevaluation.excluded_dismissed_pairs, 1);
+    // x and y are both current and still incompatible to the detector, so
+    // the close must not claim that no current incompatibility remains, on
+    // the row or on any read of it.
     let (state, _, kind, reason) = fleet.conflict_resolution(conflict_id).await;
     assert_eq!(state, "resolved");
-    assert_eq!(kind.as_deref(), Some("no_current_incompatibility"));
+    assert_eq!(kind.as_deref(), Some("no_undismissed_incompatibility"));
     assert!(
         reason
             .unwrap()
             .contains("1 pair(s) an adjudicator dismissed")
     );
+    let read = fleet.conflict(conflict_id).await;
+    assert_eq!(
+        read.resolution_kind.as_deref(),
+        Some("no_undismissed_incompatibility")
+    );
+    for claim in [x.claim.id, y.claim.id] {
+        assert_eq!(fleet.claim(claim).await.state, ClaimState::Active);
+    }
     let log = fleet.lifecycle_log(conflict_id).await;
     assert_eq!(
         log.iter().map(|event| event.1.as_str()).collect::<Vec<_>>(),
@@ -5110,7 +5121,9 @@ async fn live_dismissed_pair_does_not_keep_reopened_conflict_open_when_configure
 
     // A writer without the lifecycle log cannot read dismissals, so it
     // excludes none: the conservative outcome keeps the conflict open. A
-    // re-verification on the full writer then closes it.
+    // re-verification on a writer with the log closes it, even one that does
+    // not serve dismiss itself: recorded dismissals count wherever they can
+    // be read, as every conflict surface's resolve text says.
     let (_, _, conflict_id) = two_party(&fleet, "dismissed-unprobed").await;
     let view = fleet.conflict_view(conflict_id).await;
     fleet.dismiss(AGENT_C, view, "c/dismiss-3").await.unwrap();
@@ -5151,6 +5164,16 @@ async fn live_dismissed_pair_does_not_keep_reopened_conflict_open_when_configure
     assert_eq!(
         event.payload.as_ref().unwrap()["excluded_dismissed_pairs"],
         1
+    );
+    // The log's CHECK fixes a detector close's reason kind; the row names the
+    // exclusion instead.
+    assert_eq!(
+        event.reason_kind.as_deref(),
+        Some("no_current_incompatibility")
+    );
+    assert_eq!(
+        fleet.conflict_resolution(conflict_id).await.2.as_deref(),
+        Some("no_undismissed_incompatibility")
     );
 
     fleet.assert_lifecycle_invariants().await;

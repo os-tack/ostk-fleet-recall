@@ -534,6 +534,31 @@ pub fn plan_reevaluation(
     }
 }
 
+/// The `memory_conflicts.resolution_kind` of a detector-verified close that
+/// found no incompatible current pair at all.
+pub const NO_CURRENT_INCOMPATIBILITY: &str = "no_current_incompatibility";
+/// The `memory_conflicts.resolution_kind` of a detector-verified close whose
+/// only remaining incompatible current pairs are ones an adjudicator
+/// dismissed in that conflict.
+pub const NO_UNDISMISSED_INCOMPATIBILITY: &str = "no_undismissed_incompatibility";
+
+/// The `resolution_kind` a detector-verified close writes to the conflict row.
+///
+/// A close that left out dismissed pairs says so in its own kind, because
+/// those pairs are still current and still incompatible to the detector:
+/// `no_current_incompatibility` is kept for a key with no incompatible
+/// current pair at all. The close's logged `resolved` event keeps
+/// `no_current_incompatibility`, the only reason kind the lifecycle log's
+/// CHECK admits for it, and reports the excluded count in its payload.
+#[must_use]
+pub const fn verified_close_resolution_kind(excluded_dismissed_pairs: usize) -> &'static str {
+    if excluded_dismissed_pairs == 0 {
+        NO_CURRENT_INCOMPATIBILITY
+    } else {
+        NO_UNDISMISSED_INCOMPATIBILITY
+    }
+}
+
 /// The wire name of a dismissal reason kind, exactly its contract serde name.
 #[must_use]
 pub const fn dismissal_reason_kind(kind: DismissalReasonKindV1) -> &'static str {
@@ -2015,6 +2040,38 @@ mod tests {
             plan_reevaluation(lineage, &[x, y], &[], &dismissed),
             Reevaluation::Divergent { .. }
         ));
+    }
+
+    #[test]
+    fn close_that_left_out_dismissed_pairs_does_not_claim_no_current_incompatibility() {
+        let lineage = Some(open_lineage());
+        let x = owned(41, "agent-a", "x", ClaimState::Disputed);
+        let y = owned(42, "agent-b", "y", ClaimState::Disputed);
+        let kind_of = |remaining: &[LockedKeyClaim],
+                       sql_pairs: &[(i64, i64)],
+                       dismissed: &BTreeSet<(i64, i64)>| {
+            match plan_reevaluation(lineage, remaining, sql_pairs, dismissed) {
+                Reevaluation::Close { excluded_pairs, .. } => {
+                    verified_close_resolution_kind(excluded_pairs)
+                }
+                other => panic!("expected a close, got {other:?}"),
+            }
+        };
+
+        // The key still holds the incompatible x/y pair, which the close only
+        // leaves out because an adjudicator dismissed it.
+        let excluding = kind_of(&[x.clone(), y], &[(41, 42)], &BTreeSet::from([(41, 42)]));
+        assert_ne!(excluding, NO_CURRENT_INCOMPATIBILITY);
+        assert_eq!(excluding, NO_UNDISMISSED_INCOMPATIBILITY);
+
+        // A key with no incompatible current pair at all keeps the plain kind,
+        // whatever was dismissed before.
+        for dismissed in [BTreeSet::new(), BTreeSet::from([(41, 42)])] {
+            assert_eq!(
+                kind_of(std::slice::from_ref(&x), &[], &dismissed),
+                NO_CURRENT_INCOMPATIBILITY
+            );
+        }
     }
 
     #[test]

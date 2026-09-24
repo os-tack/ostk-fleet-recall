@@ -335,7 +335,12 @@ the detector recomputes its incompatible pairs over the claims that remain
 current, both in Rust and in SQL. If the two agree that no pair remains, the
 conflict moves to `resolved` with the server-written reason kind
 `no_current_incompatibility`, and each disputed member that no other open
-conflict still holds returns to `active`. The key's preserved legacy row does
+conflict still holds returns to `active`, whoever wrote it, at a new revision.
+With the lifecycle log, the pairs an adjudicator dismissed in that conflict
+are left out once the two raw pair sets agree (see adjudication below); a
+close that needed to leave any out writes the reason kind
+`no_undismissed_incompatibility` instead, because those pairs are still
+current and incompatible. The key's preserved legacy row does
 not hold it: once reconciliation gave the key a v2 lineage, that row is
 history, as it already is for every current-facing read. Otherwise the
 conflict stays open; if the two pair sets differ, nothing is closed and the
@@ -405,7 +410,12 @@ and concession `resolve`) reads the pairs of its newest 64 dismissals and
 checks the raw Rust and SQL pair sets before leaving those pairs out, so a
 dismissed pair cannot keep a conflict that `record` reopened open forever,
 while a new pair still does. A writer without the capability excludes
-nothing, which can only keep a conflict open. A waiver writes only its
+nothing, which can only keep a conflict open; a writer with it excludes
+recorded dismissals whether or not it serves adjudication itself. Such a close
+writes `resolution_kind = no_undismissed_incompatibility` on the row; its
+logged `resolved` event keeps `no_current_incompatibility`, the only reason
+kind the log's CHECK admits for a detector close, and reports the count as
+`excluded_dismissed_pairs`. A waiver writes only its
 `waived` event, with `expires_at` and `review_by` computed from the database
 clock and the member count it covers; `memory_conflicts` and every claim stay
 as they were.
@@ -449,7 +459,9 @@ grant matrix), then restart `serve`.
    stays a member of at least one open current lineage (v2 when its key has
    one, otherwise legacy), and every open v2 conflict keeps at least one
    incompatible current pair. Acknowledgement and waiver change only the
-   lifecycle log, and no action changes another agent's claim. That log is append-only:
+   lifecycle log, and no action changes another agent's claim value, author,
+   or applicability: a close only returns disputed members, whoever wrote
+   them, to `active` at a new revision. That log is append-only:
    each conflict's events are numbered without gaps, at most one close is
    logged per resulting revision, and every event belongs to a committed
    receipt. Its bounds can refuse the conflict actions but never a verified

@@ -253,8 +253,11 @@ as its actor and must keep the predecessor's kind, normalized key, and
 conflict eligibility, so an agent cannot end a dispute by moving its claim
 out of the detector's view. No request can name a conflict outcome: the server closes a v2 conflict
 only after its own Rust and SQL pair computations agree that no incompatible
-lifecycle-current pair remains, and it writes the resolution reason from a
-fixed template, so agent text never reaches `memory_conflicts`. The optional
+lifecycle-current pair remains (apart from pairs an adjudicator dismissed,
+below), and it writes the resolution reason from a fixed template, so agent
+text never reaches `memory_conflicts`. A close returns each disputed member
+that no other open conflict holds to `active` at a new revision, whoever wrote
+it; that is the only change it makes to another agent's claim. The optional
 audit note stays in the private plane: in the claim event and receipt, and,
 for a logged close, in the lifecycle event's cause, which every agent in the
 project can read through the conflict's history. Keys with only an
@@ -283,8 +286,15 @@ claim could be the adjudicator's own. A dismissal changes no claim's value,
 author, or applicability: it closes the conflict row with the closed
 `dismissed:<reason_kind>` vocabulary and a fixed reason, returns its disputed
 members to `active`, and records the judged pairs, which later re-evaluations
-of that conflict leave out. A waiver writes only its lifecycle event, and its
-expiry and review time come from the database clock. The required rationale
+of that conflict leave out. Every writer holding the lifecycle capability
+leaves them out, whether or not it serves adjudication: switching
+`FLEET_RECALL_CONFLICT_ADJUDICATION` off stops new dismissals and waivers but
+does not withdraw recorded dismissals, so a conflict they judged can still
+close past them. Such a close writes the resolution kind
+`no_undismissed_incompatibility` rather than `no_current_incompatibility`, so
+a reader can tell that incompatible pairs remain current. A waiver writes only
+its lifecycle event, and its expiry and review time come from the database
+clock. The required rationale
 of both stays in the private lifecycle log, where every agent in the project
 can read it through the overlay and history, and never reaches
 `memory_conflicts` or the publication reader. Waivers are not signed and not

@@ -391,37 +391,51 @@ fn named(groups: &[&[&'static str]]) -> Vec<&'static str> {
     groups.concat()
 }
 
+/// The claim-lifecycle rule every surface serving supersede states.
+const SUCCESSOR_RULE: &str = "A successor keeps its predecessor's kind, subject/predicate key, and conflict eligibility: a keyed decision, fact, constraint, preference, or procedure keeps carrying a value, and a valueless one gains none. ";
+
+/// When a concession closes a conflict. Recorded dismissals count on every
+/// writer that reads the lifecycle log, whether or not it serves dismiss.
+const RESOLVE_RULE: &str = "resolve concedes: it retracts only your own member claims named in retract_claim_ids, and the conflict closes only if no incompatible current pair remains other than pairs an adjudicator dismissed in this conflict; otherwise nothing changes. ";
+
+/// What any close does to the other members, so an agent holding one knows
+/// its revision moved.
+const CLOSE_RESTORES_MEMBERS: &str = "Whenever a conflict closes, each disputed member that no other open conflict holds returns to active at a new revision, whoever authored it; no action changes another agent's claim value, author, or applicability. ";
+
+const WRITE_GUARANTEES: &str = "Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key.";
+
 fn remember_description(surface: RememberSurface) -> String {
-    if surface.serves_adjudication() {
-        let claims = if surface.claim_lifecycle {
-            "supersede or retract claims you authored, "
-        } else {
-            ""
-        };
+    if !surface.conflict_lifecycle {
         return format!(
-            "Deliberately record fleet memory, {claims}acknowledge or resolve conflicts, and, as an adjudicator, dismiss or waive them. {}acknowledge marks a conflict's current episode as seen and changes nothing else. resolve concedes: it retracts only your own member claims named in retract_claim_ids, and the conflict closes only if no incompatible current pair remains; otherwise nothing changes. dismiss and waive are refused (implicated) when you authored any member claim of the conflict, in any episode. dismiss judges the conflict not a real disagreement: it closes as dismissed, its disputed members return to active, and the pairs it judged never keep it open again. waive accepts the current episode until expires_in_hours: the conflict stays open and visible and reads waived until the waiver expires or a member joins. No action changes another agent's claim. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key.",
-            if surface.claim_lifecycle {
-                "A successor keeps its predecessor's kind, subject/predicate key, and conflict eligibility: a keyed decision, fact, constraint, preference, or procedure keeps carrying a value, and a valueless one gains none. "
-            } else {
-                ""
-            }
+            "Deliberately record fleet memory, or supersede or retract claims you authored. {SUCCESSOR_RULE}{WRITE_GUARANTEES}"
         );
     }
-    legacy_remember_description(surface).to_owned()
-}
-
-const fn legacy_remember_description(surface: RememberSurface) -> &'static str {
-    match (surface.claim_lifecycle, surface.conflict_lifecycle) {
-        (true, false) => {
-            "Deliberately record fleet memory, or supersede or retract claims you authored. A successor keeps its predecessor's kind, subject/predicate key, and conflict eligibility: a keyed decision, fact, constraint, preference, or procedure keeps carrying a value, and a valueless one gains none. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
-        }
+    let adjudication = surface.serves_adjudication();
+    let actions = match (surface.claim_lifecycle, adjudication) {
         (true, true) => {
-            "Deliberately record fleet memory, supersede or retract claims you authored, and acknowledge or resolve conflicts. A successor keeps its predecessor's kind, subject/predicate key, and conflict eligibility: a keyed decision, fact, constraint, preference, or procedure keeps carrying a value, and a valueless one gains none. acknowledge marks a conflict's current episode as seen and changes nothing else. resolve concedes: it retracts only your own member claims named in retract_claim_ids, and the conflict closes only if no incompatible current pair remains; otherwise nothing changes. No action changes another agent's claim. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
+            "supersede or retract claims you authored, acknowledge or resolve conflicts, and, as an adjudicator, dismiss or waive them"
         }
-        _ => {
-            "Deliberately record fleet memory, and acknowledge or resolve conflicts. acknowledge marks a conflict's current episode as seen and changes nothing else. resolve concedes: it retracts only your own member claims named in retract_claim_ids, and the conflict closes only if no incompatible current pair remains; otherwise nothing changes. No action changes another agent's claim. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
+        (false, true) => {
+            "acknowledge or resolve conflicts, and, as an adjudicator, dismiss or waive them"
         }
-    }
+        (true, false) => {
+            "supersede or retract claims you authored, and acknowledge or resolve conflicts"
+        }
+        (false, false) => "and acknowledge or resolve conflicts",
+    };
+    let successor_rule = if surface.claim_lifecycle {
+        SUCCESSOR_RULE
+    } else {
+        ""
+    };
+    let adjudication_rules = if adjudication {
+        "dismiss and waive are refused (implicated) when you authored any member claim of the conflict, in any episode. dismiss judges the conflict not a real disagreement: it closes as dismissed, and the pairs it judged never keep it open again. waive accepts the current episode until expires_in_hours: the conflict stays open and visible and reads waived until the waiver expires or a member joins. "
+    } else {
+        ""
+    };
+    format!(
+        "Deliberately record fleet memory, {actions}. {successor_rule}acknowledge marks a conflict's current episode as seen and changes nothing else. {RESOLVE_RULE}{adjudication_rules}{CLOSE_RESTORES_MEMBERS}{WRITE_GUARANTEES}"
+    )
 }
 
 fn insert_lifecycle_properties(properties: &mut Map<String, Value>, surface: RememberSurface) {
@@ -515,7 +529,7 @@ fn insert_lifecycle_properties(properties: &mut Map<String, Value>, surface: Rem
                     "minimum": 1,
                     "maximum": 9_007_199_254_740_991_i64
                 },
-                "description": "resolve: your own current member claims to retract atomically; the conflict closes only if no incompatible current pair remains. Omit it to only re-verify the conflict."
+                "description": "resolve: your own current member claims to retract atomically; the conflict closes only if no incompatible current pair remains other than pairs an adjudicator dismissed in this conflict. Omit it to only re-verify the conflict."
             }),
         );
     }
@@ -1063,6 +1077,56 @@ mod tests {
             let parsed: WaiverReasonKindV1 = serde_json::from_value(json!(kind)).unwrap();
             assert_eq!(crate::ledger::waiver_reason_kind(parsed), kind);
         }
+    }
+
+    /// Every surface that can close a conflict tells agents what a close does
+    /// to members they hold and which pairs no longer keep it open, whether
+    /// or not it serves dismiss itself.
+    #[test]
+    fn conflict_surfaces_describe_close_effects_on_every_writer() {
+        for surface in [
+            conflict_surface(),
+            adjudication_surface(),
+            RememberSurface {
+                claim_lifecycle: false,
+                ..conflict_surface()
+            },
+            RememberSurface {
+                claim_lifecycle: false,
+                ..adjudication_surface()
+            },
+        ] {
+            let tool = remember_tool_for(surface);
+            let description = tool["description"].as_str().unwrap();
+            assert!(
+                !description.contains("No action changes another agent's claim."),
+                "{surface:?}: a close does change other members' state and revision"
+            );
+            assert!(
+                description.contains("returns to active at a new revision, whoever authored it"),
+                "{surface:?}: {description}"
+            );
+            let retract_claim_ids =
+                tool["inputSchema"]["properties"]["retract_claim_ids"]["description"]
+                    .as_str()
+                    .unwrap();
+            for text in [description, retract_claim_ids] {
+                assert!(
+                    text.contains(
+                        "no incompatible current pair remains other than pairs an adjudicator dismissed"
+                    ),
+                    "{surface:?}: {text}"
+                );
+            }
+        }
+        // A writer without the lifecycle log reads no dismissals and excludes
+        // none, so its surface promises no exclusion.
+        assert!(
+            !remember_tool_for(lifecycle_surface())["description"]
+                .as_str()
+                .unwrap()
+                .contains("adjudicator")
+        );
     }
 
     #[test]

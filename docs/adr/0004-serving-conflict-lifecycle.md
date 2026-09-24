@@ -89,9 +89,14 @@ lifecycle-current claims, once in Rust and once in SQL with the record
 detector's exact predicate. Only when both agree that no pair remains does the
 server set the v2 conflict to `resolved`, bump its revision, and write
 `resolution_kind = no_current_incompatibility` with a fixed-template reason.
-A disagreement leaves the conflict open and reports `divergent`. The close then
-restores each disputed member to `active` unless another open conflict still
-holds it. The legacy `same_key_typed_value` row on the same key is not such a
+D5 adds the one exception: once the two raw pair sets agree, pairs an
+adjudicator dismissed in that conflict are left out, and a close that needed
+to leave any out writes `resolution_kind = no_undismissed_incompatibility`
+instead, because those pairs are still current and still incompatible. So
+`no_current_incompatibility` always means the key has no incompatible current
+pair at all. A disagreement leaves the conflict open and reports `divergent`.
+The close then restores each disputed member to `active`, whoever wrote it and
+at a new revision, unless another open conflict still holds it. The legacy `same_key_typed_value` row on the same key is not such a
 conflict: a key gains a v2 lineage beside a legacy row only through
 reconciliation, which preserves that row unchanged, never closes it, and hands
 the key's disputes to v2, and every current-facing read already prefers v2
@@ -109,7 +114,9 @@ remains, and AUTH-03 lets anyone trigger a check whose outcome depends on data
 alone. The invariants this preserves are: every disputed claim belongs to at
 least one open current lineage (its key's v2 lineage when one exists,
 otherwise an unreconciled legacy one), and every open v2 conflict keeps at
-least one incompatible current pair.
+least one incompatible current pair. A `no_undismissed_incompatibility` close
+reads `clear` for the same reason a dismissal does: the only incompatibility
+left is one a non-implicated adjudicator judged not real (D5).
 
 ## D4 — Acknowledgements and closes are events; `memory_conflicts` stays byte-stable
 
@@ -174,7 +181,8 @@ the record hot path or the publication tables. No foreign key keeps bulk
 deletes of `memory_conflicts` working and means no new parent grant. A
 concession that could leave an incompatible pair behind would let one agent
 declare a dispute over; refusing it keeps `resolved` meaning "no live
-incompatibility".
+incompatibility", apart from pairs an adjudicator judged not real, which such
+a close names in its resolution kind (D3).
 
 ## D5 — Adjudication is opt-in and belongs to uninvolved agents
 
@@ -210,9 +218,15 @@ newest 64 dismissals and, after the raw Rust and SQL pair sets agree, leaves
 those pairs out. A dismissed pair therefore cannot keep a conflict open once
 `record` reopens it with a new incompatible claim and that claim is retired,
 while any pair nobody dismissed still does. Such a close is still `resolved`
-by the detector; its reason, its `reevaluation`, and its event payload report
-how many dismissed pairs were left out. Ignoring older dismissals, or all of
-them on a writer without the capability, can only keep a conflict open.
+by the detector, with `resolution_kind = no_undismissed_incompatibility` (D3);
+its reason, its `reevaluation`, and its event payload report how many
+dismissed pairs were left out, and its event keeps the reason kind
+`no_current_incompatibility` that the log's CHECK requires of every detector
+close. Ignoring older dismissals, or all of them on a writer without the
+capability, can only keep a conflict open. Every writer with the capability
+leaves recorded dismissals out whether or not it serves adjudication, so
+switching adjudication off stops new dismissals and waivers but does not
+withdraw earlier ones; every conflict surface's `resolve` text says so.
 
 A waiver is a scoped, expiring risk acceptance (DISC-05). It appends a
 `waived` event with `expires_at` and an optional `review_by` computed from the
