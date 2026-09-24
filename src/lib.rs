@@ -30,6 +30,7 @@ pub mod relation_projection;
 pub mod remember_runtime;
 pub mod service;
 pub mod store;
+pub mod worker;
 
 pub use application::CockroachMemoryService;
 pub use config::{ControlBootstrapConfig, FleetConfig};

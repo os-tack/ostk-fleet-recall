@@ -21,8 +21,9 @@ observer, and discrepancy runtimes are implemented as private-plane library
 modules with live CockroachDB tests. No serving path constructs any of them
 (only the observer has a runner, the private `ostk-observer-run` binary). The
 production embedding provider for that seam, `ChunkEmbedderProvider` over the
-pinned model2vec embedder, is library code that no binary constructs yet. The
-current source does implement the bounded PUBLIC-03 publication identity and
+pinned model2vec embedder, and the memory worker that runs every connector and
+projector for one scope (`src/worker`, `MemoryWorker::run_tick`) are library
+code that no binary constructs yet. The current source does implement the bounded PUBLIC-03 publication identity and
 planned AWS task input separation; those Terraform changes have not been
 applied.
 
@@ -679,6 +680,20 @@ provider failure, so an input the model cannot embed holds the dense cursor
 live tests drive the seam with a deterministic fixture, including its outage
 and degenerate-vector paths.
 
+The memory worker (`src/worker`) is the glue that runs this plane for one
+scope. `MemoryWorker::run_tick` verifies the writer authority afresh, binds the
+transcript, git, and CI connector schemas from that head, drains each
+configured source as its own connector instance under its own coverage domain,
+and then runs the body, lexical, and dense projectors from their own cursors.
+A failure is isolated to its source or step and reported; every source's
+outcome, attempt time, and last completed check land in
+`memory_worker_sources_v1` (migration 0030), so a reader can tell a source that
+failed or went stale from one that is current. Its receipts name the
+unregistered compile-time labels `coverage.freshness.worker_tick` and
+`coverage.proof.enumerated_snapshot`. The body projector consumes every
+`evidence.accepted` event in the scope, so observer-run records become bodies
+as well, indexed over their raw bytes. No binary constructs the worker yet.
+
 None of these modules is reachable from the serving process or from any binary,
 and the accepted-event append seam they use is the Stage-4 one, unchanged. There
 is still no webhook, no transport queue, no remote connector cursor, no
@@ -1027,8 +1042,9 @@ This does not require or authorize dynamic ingestion.
    dependency exists, and canonical bytes are the only transport in the merged
    code; any binary that constructs the production embedding provider
    (`ChunkEmbedderProvider`) behind the dense seam; a scheduler, daemon, or CLI
-   that runs any connector or projector, since every module here is constructed
-   only by its own tests; and the publication-role grant on the two new views,
+   that runs any connector or projector — the memory worker library
+   (`src/worker`) runs them all for one scope, but only its own tests construct
+   it; and the publication-role grant on the two new views,
    which is a deployment action that has not been performed.
 6. Admit one exhaustive code/spec observer and add basic discrepancy derivation.
 

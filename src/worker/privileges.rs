@@ -1,0 +1,286 @@
+//! The worker's privilege preflight.
+//!
+//! A worker that starts under a login missing one Stage-5 grant would run
+//! every step up to the first statement that needs it and fail there, often
+//! after appending evidence, so the tick would report a failure half-way
+//! through a source. [`probe_worker_privileges`] instead checks, before the
+//! first tick, every privilege the selected steps use, and names the first
+//! missing one.
+//!
+//! Privileges are checked when a statement is planned, so each probe reads and
+//! writes nothing: an `INSERT ... SELECT ... WHERE false` needs SELECT and
+//! INSERT, and a `SELECT ... WHERE false FOR UPDATE` needs SELECT and UPDATE
+//! (`CockroachDB` requires UPDATE for a locking read, and an upsert's
+//! `DO UPDATE` or a compare-and-set advance needs it anyway). Every probe runs
+//! in one transaction that is rolled back whatever happens, the same shape as
+//! the conflict-lifecycle startup probe.
+
+use std::collections::BTreeSet;
+
+use sqlx::PgPool;
+
+use crate::error::{FleetError, Result};
+use crate::store::cockroach::{DatabaseCapabilities, MEMORY_WORKER_SCHEMA_VERSION};
+
+use super::WorkerStepV1;
+
+const INSUFFICIENT_PRIVILEGE_SQLSTATE: &str = "42501";
+
+/// The policy file that grants the runtime login what the worker needs.
+pub const RUNTIME_GRANTS_POLICY: &str = "deploy/cockroach/runtime-role-grants.sql";
+
+/// What one probe statement proves the login may do to one table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ProbeKind {
+    /// SELECT.
+    Read,
+    /// SELECT and INSERT.
+    Insert,
+    /// SELECT and UPDATE, through a locking read.
+    Lock,
+}
+
+impl ProbeKind {
+    const fn privileges(self) -> &'static str {
+        match self {
+            Self::Read => "SELECT",
+            Self::Insert => "SELECT and INSERT",
+            Self::Lock => "SELECT and UPDATE (a locking read or an upsert)",
+        }
+    }
+}
+
+/// One probe: a table, what is needed on it, and, for a table with a computed
+/// column, the columns an insert names (its primary key).
+type Probe = (&'static str, ProbeKind, Option<&'static str>);
+
+/// The evidence ledger, the governed content store, coverage, and worker
+/// status: what every ingest step writes.
+const INGEST_PROBES: &[Probe] = &[
+    ("memory_writer_authority_v1", ProbeKind::Read, None),
+    ("memory_evidence_events", ProbeKind::Insert, None),
+    ("memory_evidence_quarantine", ProbeKind::Insert, None),
+    ("memory_evidence_shard_heads", ProbeKind::Insert, None),
+    ("memory_evidence_shard_heads", ProbeKind::Lock, None),
+    ("memory_content_objects", ProbeKind::Insert, None),
+    ("memory_content_objects", ProbeKind::Lock, None),
+    ("memory_coverage_receipts_v1", ProbeKind::Insert, None),
+    ("memory_coverage_cursors_v1", ProbeKind::Insert, None),
+    ("memory_coverage_cursors_v1", ProbeKind::Lock, None),
+    ("memory_worker_sources_v1", ProbeKind::Insert, None),
+    ("memory_worker_sources_v1", ProbeKind::Lock, None),
+];
+
+const TRANSCRIPT_PROBES: &[Probe] = &[
+    ("memory_transcript_outbox_v1", ProbeKind::Insert, None),
+    ("memory_transcript_outbox_v1", ProbeKind::Lock, None),
+    ("memory_transcript_cursors_v1", ProbeKind::Insert, None),
+    ("memory_transcript_cursors_v1", ProbeKind::Lock, None),
+];
+
+const CI_PROBES: &[Probe] = &[("memory_ci_measured_windows_v1", ProbeKind::Insert, None)];
+
+const BODY_PROBES: &[Probe] = &[
+    ("memory_evidence_events", ProbeKind::Read, None),
+    ("memory_content_objects", ProbeKind::Read, None),
+    ("memory_body_objects_v1", ProbeKind::Insert, None),
+    ("memory_chunk_occurrences_v1", ProbeKind::Insert, None),
+    ("memory_chunk_occurrence_spans_v1", ProbeKind::Insert, None),
+    ("memory_parse_run_manifests_v1", ProbeKind::Insert, None),
+    (
+        "memory_source_commit_membership_v1",
+        ProbeKind::Insert,
+        None,
+    ),
+    ("memory_generation_pointers_v1", ProbeKind::Insert, None),
+    ("memory_generation_pointers_v1", ProbeKind::Lock, None),
+    (
+        "memory_body_projection_watermarks_v1",
+        ProbeKind::Insert,
+        None,
+    ),
+    (
+        "memory_body_projection_watermarks_v1",
+        ProbeKind::Lock,
+        None,
+    ),
+    ("memory_body_visibility_v1", ProbeKind::Insert, None),
+    ("memory_body_visibility_v1", ProbeKind::Lock, None),
+];
+
+/// `search_document` is a computed column, so an insert names the key.
+const LEXICAL_KEY: Option<&str> = Some("tenant_id, project, body_content_id");
+
+const LEXICAL_PROBES: &[Probe] = &[
+    ("memory_body_objects_v1", ProbeKind::Read, None),
+    ("memory_body_visibility_v1", ProbeKind::Read, None),
+    (
+        "memory_body_lexical_projection_v1",
+        ProbeKind::Insert,
+        LEXICAL_KEY,
+    ),
+    ("memory_body_lexical_projection_v1", ProbeKind::Lock, None),
+    (
+        "memory_recall_projection_cursors_v1",
+        ProbeKind::Insert,
+        None,
+    ),
+    ("memory_recall_projection_cursors_v1", ProbeKind::Lock, None),
+];
+
+const DENSE_PROBES: &[Probe] = &[
+    ("memory_body_lexical_projection_v1", ProbeKind::Read, None),
+    ("memory_body_visibility_v1", ProbeKind::Read, None),
+    ("memory_body_dense_projection_v1", ProbeKind::Insert, None),
+    ("memory_body_dense_projection_v1", ProbeKind::Lock, None),
+    (
+        "memory_recall_projection_cursors_v1",
+        ProbeKind::Insert,
+        None,
+    ),
+    ("memory_recall_projection_cursors_v1", ProbeKind::Lock, None),
+];
+
+/// The probes `steps` need, each once, in step order.
+fn probes_for(steps: &BTreeSet<WorkerStepV1>) -> Vec<Probe> {
+    let mut groups: Vec<&[Probe]> = Vec::new();
+    if steps.iter().any(|step| step.is_ingest()) {
+        groups.push(INGEST_PROBES);
+    }
+    if steps.contains(&WorkerStepV1::Transcript) {
+        groups.push(TRANSCRIPT_PROBES);
+    }
+    if steps.contains(&WorkerStepV1::Ci) {
+        groups.push(CI_PROBES);
+    }
+    if steps.contains(&WorkerStepV1::Bodies) {
+        groups.push(BODY_PROBES);
+    }
+    if steps.contains(&WorkerStepV1::Lexical) {
+        groups.push(LEXICAL_PROBES);
+    }
+    if steps.contains(&WorkerStepV1::Dense) {
+        groups.push(DENSE_PROBES);
+    }
+    let mut seen = BTreeSet::new();
+    groups
+        .into_iter()
+        .flatten()
+        .filter(|(table, kind, _)| seen.insert((*table, *kind)))
+        .copied()
+        .collect()
+}
+
+fn probe_statement((table, kind, columns): Probe) -> String {
+    match (kind, columns) {
+        (ProbeKind::Read, _) => format!("SELECT 1 FROM public.{table} WHERE false"),
+        (ProbeKind::Insert, None) => {
+            format!("INSERT INTO public.{table} SELECT * FROM public.{table} WHERE false")
+        }
+        (ProbeKind::Insert, Some(columns)) => format!(
+            "INSERT INTO public.{table} ({columns}) SELECT {columns} FROM public.{table} WHERE false"
+        ),
+        (ProbeKind::Lock, _) => format!("SELECT 1 FROM public.{table} WHERE false FOR UPDATE"),
+    }
+}
+
+/// Check, before the first tick, that the connected login holds every
+/// privilege the selected steps use.
+///
+/// Requires the schema to have reached migration 30
+/// ([`MEMORY_WORKER_SCHEMA_VERSION`]), which creates the worker status table.
+///
+/// # Errors
+///
+/// [`FleetError::Configuration`] for an older schema, or naming the first
+/// table the login lacks a privilege on and the policy file that grants it;
+/// any other database failure as itself.
+pub async fn probe_worker_privileges(
+    pool: &PgPool,
+    capabilities: &DatabaseCapabilities,
+    steps: &BTreeSet<WorkerStepV1>,
+) -> Result<()> {
+    if !capabilities.supports_schema_version(MEMORY_WORKER_SCHEMA_VERSION) {
+        return Err(FleetError::Configuration(format!(
+            "the memory worker needs the schema through migration {MEMORY_WORKER_SCHEMA_VERSION}, \
+             but this database has reached {}; run `ostk-fleet-recall migrate`",
+            capabilities.schema_version
+        )));
+    }
+    let mut transaction = pool.begin().await?;
+    let mut outcome = Ok(());
+    for probe in probes_for(steps) {
+        match sqlx::query(&probe_statement(probe))
+            .execute(&mut *transaction)
+            .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error))
+                if error.code().as_deref() == Some(INSUFFICIENT_PRIVILEGE_SQLSTATE) =>
+            {
+                outcome = Err(FleetError::Configuration(format!(
+                    "the worker's database login lacks {} on public.{}; apply \
+                     {RUNTIME_GRANTS_POLICY} after `migrate`, then restart the worker",
+                    probe.1.privileges(),
+                    probe.0
+                )));
+                break;
+            }
+            Err(error) => {
+                outcome = Err(error.into());
+                break;
+            }
+        }
+    }
+    // Every probe wrote nothing; roll back regardless of the outcome.
+    transaction.rollback().await?;
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn steps(names: &[WorkerStepV1]) -> BTreeSet<WorkerStepV1> {
+        names.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_projection_only_worker_probes_no_ingest_table() {
+        let probes = probes_for(&steps(&[WorkerStepV1::Lexical, WorkerStepV1::Dense]));
+        assert!(
+            probes
+                .iter()
+                .all(|(table, _, _)| !table.starts_with("memory_evidence")
+                    && !table.starts_with("memory_worker"))
+        );
+        assert!(
+            probes
+                .iter()
+                .any(|(table, _, _)| *table == "memory_body_dense_projection_v1")
+        );
+    }
+
+    #[test]
+    fn every_ingest_step_probes_worker_status_and_the_content_lock() {
+        for step in [
+            WorkerStepV1::Transcript,
+            WorkerStepV1::Git,
+            WorkerStepV1::Ci,
+        ] {
+            let probes = probes_for(&steps(&[step]));
+            assert!(probes.contains(&("memory_worker_sources_v1", ProbeKind::Lock, None)));
+            assert!(probes.contains(&("memory_content_objects", ProbeKind::Lock, None)));
+        }
+    }
+
+    #[test]
+    fn a_table_is_probed_once_per_privilege() {
+        let probes = probes_for(&WorkerStepV1::ALL.into_iter().collect());
+        let unique: BTreeSet<_> = probes
+            .iter()
+            .map(|(table, kind, _)| (table, kind))
+            .collect();
+        assert_eq!(unique.len(), probes.len());
+    }
+}

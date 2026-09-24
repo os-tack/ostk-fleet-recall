@@ -153,6 +153,13 @@ it:
   embedding provider that puts the pinned model2vec embedder behind the dense
   projection's `EmbeddingProvider` seam;
 - the coverage runtime (`src/coverage_runtime`);
+- the memory worker library (`src/worker`): `MemoryWorker::run_tick` runs the
+  transcript, git, and CI connectors and then the body, lexical, and dense
+  projectors for one scope under a freshly verified generation-2 head, one
+  connector instance per configured source, isolates each source's and each
+  step's failure, and records every source's outcome in
+  `memory_worker_sources_v1` (migration 0030); `probe_worker_privileges`
+  checks the login's grants before the first tick;
 - the normative activation, observer, and discrepancy runtimes
   (`src/normative_runtime`, `src/observer_runtime`,
   `src/discrepancy_runtime`); only the observer has a runner, the private
@@ -169,8 +176,8 @@ it:
 
 Wiring this plane into the product needs, at minimum:
 
-- a worker or CLI that runs the connectors and projectors, embedding the
-  dense tier through `ChunkEmbedderProvider`;
+- a CLI that runs `MemoryWorker` ticks, embedding the dense tier through
+  `ChunkEmbedderProvider`;
 - the publication grant on the filtered views from migration 23 (the runtime
   policy in `deploy/cockroach/runtime-role-grants.sql` already grants
   `fleet_runtime` the tables from migrations 19–27 and 29–31; see

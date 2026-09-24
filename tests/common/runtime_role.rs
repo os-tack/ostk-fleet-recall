@@ -58,6 +58,35 @@ pub const RUNTIME_CLAIM_GRANTS: [(&str, &str); 4] = [
     ("DELETE", "public.memory_chunk_history"),
 ];
 
+/// The Stage-5/6 block of `deploy/cockroach/runtime-role-grants.sql`: the
+/// body, coverage, recall, transcript, CI, normative, discrepancy, worker
+/// status, and spec-conformance tables (migrations 19-24, 26, 27, 30, 31),
+/// plus the UPDATE on `memory_content_objects` that `CockroachDB` requires for
+/// the dedup path's `SELECT ... FOR UPDATE`. Keep this in step with that file.
+pub const STAGE5_RUNTIME_GRANTS: [(&str, &str); 4] = [
+    (
+        "SELECT, INSERT",
+        "public.memory_body_objects_v1, public.memory_chunk_occurrences_v1, \
+         public.memory_chunk_occurrence_spans_v1, public.memory_parse_run_manifests_v1, \
+         public.memory_source_commit_membership_v1, public.memory_coverage_receipts_v1, \
+         public.memory_ci_measured_windows_v1, public.memory_normative_log_v1, \
+         public.memory_discrepancy_log_v1, public.memory_normative_statements_v1, \
+         public.memory_spec_checks_v1",
+    ),
+    (
+        "SELECT, INSERT, UPDATE",
+        "public.memory_generation_pointers_v1, public.memory_body_projection_watermarks_v1, \
+         public.memory_body_visibility_v1, public.memory_coverage_cursors_v1, \
+         public.memory_body_lexical_projection_v1, public.memory_body_dense_projection_v1, \
+         public.memory_recall_projection_cursors_v1, public.memory_transcript_outbox_v1, \
+         public.memory_transcript_cursors_v1, public.memory_normative_heads_v1, \
+         public.memory_normative_projections_v1, public.memory_discrepancy_heads_v1, \
+         public.memory_discrepancy_projections_v1, public.memory_worker_sources_v1",
+    ),
+    ("SELECT", "public.memory_discrepancy_relations_v1"),
+    ("UPDATE", "public.memory_content_objects"),
+];
+
 /// The sequences the same policy lets `fleet_runtime` draw claim, support,
 /// and conflict IDs from.
 pub const RUNTIME_SEQUENCES: &str = "public.memory_claim_id_seq, \
@@ -101,6 +130,17 @@ impl RuntimeProbeRole {
         let mut grants = owned(&RUNTIME_EVIDENCE_GRANTS);
         grants.extend(owned(&RUNTIME_CLAIM_GRANTS));
         Self::create_with(owner, database_url, grants, true).await
+    }
+
+    /// [`Self::create`], plus [`STAGE5_RUNTIME_GRANTS`] when `stage5` is set:
+    /// what the memory worker runs with, or, without the Stage-5 block, a
+    /// login that holds only the Stage-4 evidence grants.
+    pub async fn create_worker(owner: &PgPool, database_url: &str, stage5: bool) -> Self {
+        let mut grants = owned(&RUNTIME_EVIDENCE_GRANTS);
+        if stage5 {
+            grants.extend(owned(&STAGE5_RUNTIME_GRANTS));
+        }
+        Self::create_with(owner, database_url, grants, false).await
     }
 
     async fn create_with(
