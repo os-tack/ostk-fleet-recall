@@ -282,9 +282,13 @@ cargo run --locked --bin ostk-authority-install -- apply
 - **Refusals.** The installer never repairs anything. It refuses a physical
   scope that already holds another bootstrap receipt, other contract
   namespaces, a package the strict witness does not know, or the generation-1
-  package re-activated past generation 1. Installing other namespaces over
-  an installed physical scope is therefore refused, and the installed head
-  stays as it was.
+  package re-activated past generation 1. It reads the stored control
+  bootstrap as well as the writer-authority view, so a scope bootstrapped by a
+  hand-run `ostk-control-bootstrap`, or by an install for another request that
+  stopped before `0 -> 1`, is refused the same way as an installed one. Every
+  refusal is a configuration error and writes nothing. Installing other
+  namespaces over an installed physical scope is therefore refused, and the
+  installed head stays as it was.
 - **Receipt.** The bootstrap receipt is a pure function of the request. It is
   the frozen `v1/bootstrap-receipt.jsonl` statement with its scope rewritten
   to the requested namespaces and its partition seed set to a domain digest

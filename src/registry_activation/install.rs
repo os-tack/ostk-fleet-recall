@@ -30,10 +30,13 @@
 //! writer-authority view `memory_writer_authority_v1` through the strict
 //! witness and skips what is already durable; the genesis step, which the
 //! view cannot see until `0 -> 1` has projected a head, resumes from the
-//! audited genesis root instead. A head the installer did not put there —
-//! a package that is not a [`KnownRegistryPackage`], namespaces other than the
-//! request's, another bootstrap receipt — is refused, never repaired. The
-//! run finishes with [`load_and_verify`] under exactly the pins it reports.
+//! audited genesis root instead. Authority the installer would not have put
+//! there — a package that is not a [`KnownRegistryPackage`], namespaces other
+//! than the request's, another bootstrap receipt — is refused, never
+//! repaired, and refused the same way whether or not an earlier run got as far
+//! as a head: the stored control bootstrap is checked directly, because the
+//! view cannot see it until `0 -> 1` has committed. The run finishes with
+//! [`load_and_verify`] under exactly the pins it reports.
 //!
 //! # What the signatures prove (D4)
 //!
@@ -355,7 +358,8 @@ impl FixtureGovernanceKeys {
 /// A configuration error when the physical scope already holds authority the
 /// request does not describe (another bootstrap receipt, other namespaces, an
 /// unknown package, or a generation-1 package re-activated past generation 1),
-/// and any repository, contract, or database error from a step.
+/// with or without a registry head above that bootstrap, and any repository,
+/// contract, or database error from a step.
 pub async fn install_writer_authority(
     pool: &PgPool,
     request: &AuthorityInstallRequestV1,
@@ -377,17 +381,11 @@ pub async fn install_writer_authority(
         .await?
         .is_some();
 
-    // 1. The deterministic receipt: an exact replay reports AlreadyPresent,
-    //    and a different receipt in this physical scope is a conflict.
-    let bootstrap = CockroachGenesisRepository::new(pool.clone(), control.clone(), retry)
-        .bootstrap_genesis(&artifacts.bootstrap, artifacts.genesis)
-        .await?;
+    // 1. The deterministic receipt: an exact replay reports AlreadyPresent.
     steps.push(InstallStepReportV1 {
         step: InstallStepV1::ControlBootstrap,
-        outcome: match bootstrap {
-            GenesisBootstrapOutcome::Inserted(_) => InstallStepOutcomeV1::Inserted,
-            GenesisBootstrapOutcome::ExactReplay(_) => InstallStepOutcomeV1::AlreadyPresent,
-        },
+        outcome: bootstrap_control(pool, &control, retry, &request.physical_scope, &artifacts)
+            .await?,
     });
 
     // 2 and 3.
@@ -591,6 +589,74 @@ async fn read_installed_head(
         )) => Err(refused(&rejection.to_string())),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Step 1: apply the deterministic bootstrap receipt, refusing a physical
+/// scope whose stored bootstrap is another one.
+///
+/// The view read before this step cannot see a bootstrap with no head above
+/// it, so the stored singleton is checked directly first. A concurrent run
+/// for another request can still bootstrap the scope between that check and
+/// this write; that is reported as the same refusal, and any other failure as
+/// the step's own error.
+async fn bootstrap_control(
+    pool: &PgPool,
+    control: &TrustedControlScope,
+    retry: RetryPolicy,
+    physical_scope: &FleetScope,
+    artifacts: &InstallArtifacts,
+) -> Result<InstallStepOutcomeV1> {
+    if let Some(rejection) = foreign_bootstrap(pool, physical_scope, &artifacts.pins).await? {
+        return Err(refused(&rejection.to_string()));
+    }
+    match CockroachGenesisRepository::new(pool.clone(), control.clone(), retry)
+        .bootstrap_genesis(&artifacts.bootstrap, artifacts.genesis)
+        .await
+    {
+        Ok(GenesisBootstrapOutcome::Inserted(_)) => Ok(InstallStepOutcomeV1::Inserted),
+        Ok(GenesisBootstrapOutcome::ExactReplay(_)) => Ok(InstallStepOutcomeV1::AlreadyPresent),
+        Err(error) => match foreign_bootstrap(pool, physical_scope, &artifacts.pins).await {
+            Ok(Some(rejection)) => Err(refused(&rejection.to_string())),
+            _ => Err(error),
+        },
+    }
+}
+
+/// Why the physical scope's stored control bootstrap, if any, is not the one
+/// this request installs, or `None` when there is none or it is this one.
+///
+/// The strict witness sees a bootstrap only through a projected head, and
+/// there is none until `0 -> 1` commits. Before that, a hand-run control
+/// bootstrap or an install for another request that stopped partway leaves
+/// only the bootstrap singleton, and the control repository would report it
+/// as a bootstrap conflict or, under other namespaces, as a stored receipt
+/// that fails this request's audit. Comparing the singleton's pinned columns
+/// first makes each of those the installer's own refusal.
+async fn foreign_bootstrap(
+    pool: &PgPool,
+    physical_scope: &FleetScope,
+    pins: &WriterAuthorityPinsV1,
+) -> Result<Option<WriterAuthorityRejection>> {
+    let stored: Option<(String, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT contract_tenant_namespace, contract_project_namespace, receipt_digest \
+         FROM public.memory_control_bootstraps WHERE tenant_id = $1 AND project = $2",
+    )
+    .bind(physical_scope.tenant_id)
+    .bind(&physical_scope.project)
+    .fetch_optional(pool)
+    .await?;
+    let Some((tenant_namespace, project_namespace, receipt_digest)) = stored else {
+        return Ok(None);
+    };
+    if tenant_namespace != pins.contract_tenant_namespace.as_str()
+        || project_namespace != pins.contract_project_namespace.as_str()
+    {
+        return Ok(Some(WriterAuthorityRejection::ContractNamespace));
+    }
+    if receipt_digest.as_slice() != pins.bootstrap_receipt_digest.digest().as_bytes() {
+        return Ok(Some(WriterAuthorityRejection::BootstrapPin));
+    }
+    Ok(None)
 }
 
 /// Step 2: sign the genesis statement at server time and activate it.

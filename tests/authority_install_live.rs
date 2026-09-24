@@ -11,7 +11,8 @@
 //! frozen `tenant.fixture` ones, the strict witness accepts the result under
 //! exactly the pins the installer prints, both a Wave-2 connector and the
 //! generation-1 connector bind out of it, a re-run changes nothing, and a
-//! physical scope already installed for other namespaces is refused intact.
+//! physical scope already installed for other namespaces, or bootstrapped by
+//! another receipt with no head yet, is refused intact.
 //! It also proves the `WriterAuthorityRuntime` every appending process starts
 //! from those pins: it starts and binds connectors under nothing but the
 //! runtime role's grants, refuses pins the head does not honor, and re-reads
@@ -23,22 +24,36 @@ use common::authority::{install_generation_two, retry_policy, semantic_scope};
 use common::runtime_role::RuntimeProbeRole;
 use ostk_fleet_recall::FleetError;
 use ostk_fleet_recall::config::WriterAuthorityConfig;
+use ostk_fleet_recall::control_log::{
+    CockroachGenesisRepository, GenesisInspection, GenesisRepository as _, TrustedControlScope,
+};
 use ostk_fleet_recall::evidence_ledger::ActiveStage4Package;
-use ostk_fleet_recall::memory_contracts::bootstrap::BootstrapReceiptDigest;
-use ostk_fleet_recall::memory_contracts::common::{AuthenticatedProjectScopeV1, ContractId};
-use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
+use ostk_fleet_recall::memory_contracts::bootstrap::{
+    BootstrapPin, BootstrapReceiptDigest, verify_pinned_bootstrap,
+};
+use ostk_fleet_recall::memory_contracts::common::{
+    AuthenticatedProjectScopeV1, ContractId, frozen_profile_reference_v1,
+};
+use ostk_fleet_recall::memory_contracts::digest::{
+    DigestDomain, Sha256Digest, domain_separated_digest,
+};
 use ostk_fleet_recall::memory_contracts::generation2_registry::GIT_CONNECTOR;
 use ostk_fleet_recall::registry_activation::install::{
     AuthorityInstallRequestV1, InstallStepOutcomeV1, install_writer_authority,
 };
 use ostk_fleet_recall::registry_witness::{
     KnownRegistryPackage, WriterAuthorityError, WriterAuthorityRejection, WriterAuthorityRuntime,
-    WriterAuthorityStartError, load_and_verify,
+    WriterAuthorityStartError, compiled_genesis_package, load_and_verify,
 };
 
 /// The one connector the frozen generation-1 package carries, which
 /// generation 2 carries forward.
 const GITHUB_PUSH_CONNECTOR: &str = "connector.github.push";
+
+/// The frozen Stage-1 bootstrap receipt, as a hand-run `ostk-control-bootstrap`
+/// would apply it: `tenant.fixture`/`project.fixture`, public fixture keys.
+const FROZEN_BOOTSTRAP_RECEIPT: &[u8] =
+    include_bytes!("../contracts/dynamic-memory/v1/bootstrap-receipt.jsonl");
 
 #[tokio::test]
 async fn live_install_reaches_generation_two_and_the_strict_witness_accepts_it_when_configured() {
@@ -183,6 +198,91 @@ async fn live_install_refuses_a_physical_scope_installed_for_other_namespaces_wh
     assert_eq!(
         witness.active_package().known(),
         KnownRegistryPackage::ConnectorGeneration2
+    );
+}
+
+#[tokio::test]
+async fn live_install_refuses_a_physical_scope_bootstrapped_without_a_head_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let physical = common::fresh_scope("authority-foreign-bootstrap");
+
+    // A control bootstrap no install wrote, with no registry head above it:
+    // what a hand-run `ostk-control-bootstrap`, or an install for other
+    // namespaces that stopped after its first step, leaves behind. The strict
+    // witness cannot see it yet, because the view projects a head only once
+    // `0 -> 1` has committed.
+    let fixture_scope = AuthenticatedProjectScopeV1::from_trusted_context(
+        ContractId::new("tenant.fixture").unwrap(),
+        ContractId::new("project.fixture").unwrap(),
+    );
+    let genesis = compiled_genesis_package().expect("the compiled genesis package closes");
+    let receipt = FROZEN_BOOTSTRAP_RECEIPT
+        .strip_suffix(b"\n")
+        .expect("contract JSONL ends in one framing LF");
+    let bootstrap = verify_pinned_bootstrap(
+        receipt,
+        BootstrapPin::from_trusted_config(BootstrapReceiptDigest::from_digest(
+            domain_separated_digest(DigestDomain::BootstrapReceipt, receipt),
+        )),
+        &frozen_profile_reference_v1(),
+        &fixture_scope,
+        genesis,
+    )
+    .expect("the frozen receipt verifies under its own digest");
+    let control = CockroachGenesisRepository::new(
+        pool.clone(),
+        TrustedControlScope::from_trusted_context(&physical, fixture_scope.clone()).unwrap(),
+        retry_policy(),
+    );
+    control
+        .bootstrap_genesis(&bootstrap, genesis)
+        .await
+        .expect("the frozen receipt bootstraps a fresh physical scope");
+
+    // The installer's own receipt under the same namespaces, and other
+    // namespaces: neither is the authority this scope holds, and both are the
+    // installer's refusal, exactly as they are once a head exists.
+    for semantic in [fixture_scope.clone(), semantic_scope()] {
+        let request = AuthorityInstallRequestV1 {
+            physical_scope: physical.clone(),
+            semantic_scope: semantic.clone(),
+        };
+        let refusal = install_writer_authority(&pool, &request, retry_policy())
+            .await
+            .expect_err("a physical scope bootstrapped by another receipt must be refused");
+        assert!(
+            matches!(refusal, FleetError::Configuration(_)),
+            "the refusal for {} must be the installer's own verdict, not a failed write: {refusal}",
+            semantic.tenant_namespace.as_str()
+        );
+    }
+
+    // Nothing was written: the stored bootstrap is intact and still has no head.
+    assert!(matches!(
+        control
+            .inspect_genesis(&bootstrap, genesis)
+            .await
+            .expect("the stored bootstrap must still audit"),
+        GenesisInspection::Complete(_)
+    ));
+    let stored_pins = WriterAuthorityConfig::from_trusted_context(
+        fixture_scope,
+        bootstrap.receipt_digest(),
+        None,
+    );
+    let head = load_and_verify(&pool, &physical, &stored_pins).await;
+    assert!(
+        matches!(
+            head,
+            Err(WriterAuthorityError::Rejected(
+                WriterAuthorityRejection::Absent
+            ))
+        ),
+        "a refused install must not activate anything: {:?}",
+        head.map(|witness| witness.generation())
     );
 }
 
