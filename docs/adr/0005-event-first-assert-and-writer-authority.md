@@ -199,12 +199,12 @@ is `invalid_params` with `data.outcome = "not_applied"` and `data.code`:
 
 | Code | When |
 |---|---|
-| `assert_unavailable` | This writer does not serve assert (no pins, or they did not verify at startup). |
+| `assert_unavailable` | This writer does not serve assert (no pins, or they did not verify at startup), or the active package verified for this request serves no assert route. |
 | `writer_authority_unavailable` | The pinned writer authority did not verify for this request. |
-| `assertion_not_admitted` | The route did not admit the assertion; `details.reason` is `text_invalid`, `predicate_mismatch`, `locator_invalid`, `value_invalid`, `modality_not_allowed`, `support_invalid`, `effective_interval_invalid`, `registry_head_mismatch`, or `assertion_not_admitted`. |
+| `assertion_not_admitted` | The route did not admit the assertion; `details.reason` is `text_invalid`, `predicate_mismatch`, `locator_invalid`, `value_invalid`, `modality_not_allowed`, `support_invalid`, `effective_interval_invalid`, or `assertion_not_admitted`. |
 | `support_event_unknown` | A support event ID names no accepted event in this project. |
-| `registry_head_changed` | The active head moved between admission and append. |
-| `already_asserted` | This exact statement is already accepted under another key; `details` names the claim and the event. |
+| `registry_head_changed` | The active head moved. At admission, the route and the verified head name different packages (`details.reason` is `registry_head_mismatch`); between admission and append, the append's fence failed (`details.mismatch` names the field). |
+| `already_asserted` | This exact statement, with the same explicit `effective_from`, is already accepted under another key; `details` names the claim and the event. |
 
 Reusing a key for a different request remains an idempotency conflict, as for
 every other `remember` action.
