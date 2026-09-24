@@ -244,12 +244,17 @@ separately provisioned private-writer login is a member only of the hardened
 - only the documented DML privileges on legacy corpus, claim, and projection
   tables;
 - append, head-advance, quarantine and relation-projection privileges on the
-  Stage-4 evidence plane only (`memory_evidence_events`,
+  Stage-4 evidence plane (`memory_evidence_events`,
   `memory_evidence_shard_heads`, `memory_evidence_quarantine`,
   `memory_content_objects`, `memory_relation_projection_v1`,
   `memory_relation_projection_watermarks_v1`), with no `UPDATE` or `DELETE`
   on the accepted envelope, no `DELETE` anywhere, and no privilege on any
   `memory_control_*` or `memory_registry_*` base table;
+- append and advance privileges on the body, coverage, recall, transcript,
+  and CI connector tables, normative activation, the discrepancy ledger, the
+  conflict lifecycle log, worker source status, and spec conformance (the
+  tables of migrations 19 through 24, 26, 27, and 29 through 31), described
+  below;
 - `SELECT` on the migrator-owned `memory_writer_authority_v1` view, which is
   the writer's only registry/bootstrap read path;
 - read access to SQLx migration metadata for health checks;
@@ -265,16 +270,62 @@ It is deliberately narrower than the reusable library surface: per-table verbs
 only (for example `memory_chunk_history` receives `SELECT`/`DELETE` only, and
 `memory_attention` and `memory_claim_link_events` receive nothing), `USAGE` on
 only the claim, claim-support, and conflict ID sequences, and `SELECT` on
-`_sqlx_migrations`. The SQL file is the row-by-row reference. Of the tables
-from migration 19 onward it grants only `SELECT` and `INSERT` on migration
-29's conflict lifecycle log, never `UPDATE` or `DELETE`, so the log is
-append-only for the runtime; that grant is why the policy also requires a
-successful migration 29 (a separate gate beside the 1-through-18 prefix) and
-closes with a 49-row grant count. It grants nothing on the tables from
-migrations 19 through 28 yet; when a runtime starts using them, extend the
-policy the same way, together with a migration gate and the closing
-grant-count postcondition. The writer probes its grants only at startup, so
-restart `serve` after any policy change.
+`_sqlx_migrations`. The SQL file is the row-by-row reference.
+
+Migrations 30 and 31 add the last tables this policy covers. Migration 30
+(ADR 0006) creates `memory_worker_sources_v1`: one row per configured worker
+connector instance, recording when the worker last attempted the source, when
+it last completed a check (`ok` or `unchanged`), the outcome, a bounded error,
+and how long a completed check stays current. Evidence recall reads it to
+tell a source that failed, went stale, or never reported from one that is
+current. Migration 31 (ADR 0007) creates `memory_normative_statements_v1`,
+the canonical normative proposal and typed expectation each spec statement
+was activated with, and `memory_spec_checks_v1`, one content-addressed record
+per spec check with its verdict (`nonconforming`, `conforming`, or
+`unknown`) and the discrepancy episode it opened or joined. All three are
+private-plane tables with no foreign key; each migration follows the
+resumable pattern above and closes with a same-name drift guard (the column
+shape, plus migration 31's two indexes).
+
+For the tables from migration 19 onward the policy grants one of three
+shapes, and never `DELETE`:
+
+- **Append-only (`SELECT`, `INSERT`):** the Stage-5 body objects, chunk
+  occurrences and their spans, parse-run manifests, source-commit membership,
+  and coverage receipts; the CI connector's measured windows; the normative
+  and discrepancy logs; migration 29's conflict lifecycle log; and migration 31's normative
+  statements and spec checks. The runtime can add a logged event, receipt,
+  statement, or check but never rewrite or remove one.
+- **Advanced state (`SELECT`, `INSERT`, `UPDATE`):** generation pointers, the
+  body projection watermarks, body visibility, coverage cursors, the lexical
+  and dense recall projections and their cursors, the transcript outbox and
+  cursors, the normative and discrepancy heads and projections, and migration
+  30's worker source status. None of these rows is a logged event or a
+  receipt: they are heads, cursors, pointers, projections, the outbox's drain
+  state, and operational status. `UPDATE` covers each compare-and-set advance
+  or upsert, and the `SELECT ... FOR UPDATE` that locks a head or cursor.
+- **Read-only (`SELECT`):** `memory_discrepancy_relations_v1`. Nothing served
+  appends a relation yet.
+
+One more row is on a Stage-4 table: `UPDATE` on `memory_content_objects`.
+CockroachDB v26.2.3 requires `UPDATE` for `SELECT ... FOR UPDATE`, and the
+governed content store takes that lock whenever an append deduplicates onto
+an existing content object, to compare it with the admitted bytes
+(`LOCK_CONTENT_OBJECT_SQL` in `src/evidence_ledger/content_store.rs`). No
+runtime statement updates that table. The policy grants nothing on migration
+23's publication views or on migration 28's bootstrap-import rows, and the
+publication reader gains nothing from any of these rows. The policy closes by
+checking the exact 115-row matrix: database `CONNECT`, schema `USAGE`, 110
+table-privilege rows, and three sequence-`USAGE` rows.
+
+A single gate guards all of it. Before any change, the policy requires a
+successful SQLx row for every migration from 1 through 31 (version 25 is
+permanently unused); a later successful migration cannot mask a missing or
+failed one in that prefix. When a later migration adds tables a runtime
+needs, extend the policy in one edit: the gate, the grants, and the closing
+count together. The writer probes its grants only at startup, so after
+`migrate`, drain `fleet_writer`, reapply this policy, and then restart
+`serve`.
 
 Grant the external private-writer login only membership in `fleet_runtime`; do
 not copy these DML/sequence grants onto the fixed publication login.

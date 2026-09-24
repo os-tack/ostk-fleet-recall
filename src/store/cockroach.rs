@@ -42,6 +42,12 @@ pub const MINIMUM_RECALL_SCHEMA_VERSION: i64 = 18;
 /// First schema with the serving conflict lifecycle log (migration 0029).
 /// Below it the conflict lifecycle is simply not served.
 pub const CONFLICT_LIFECYCLE_SCHEMA_VERSION: i64 = 29;
+/// First schema with the worker source status table (migration 0030, ADR
+/// 0006). Below it no worker source status exists to read.
+pub const MEMORY_WORKER_SCHEMA_VERSION: i64 = 30;
+/// First schema with the spec conformance statement and check tables
+/// (migration 0031, ADR 0007).
+pub const SPEC_CONFORMANCE_SCHEMA_VERSION: i64 = 31;
 
 /// Exact application tables reachable from public health/status/recall SQL.
 ///
@@ -285,6 +291,10 @@ const BOOTSTRAP_IMPORT_ROWS_MIGRATION_SQL: &str =
     include_str!("../../migrations/0028_bootstrap_import_rows.sql");
 const CONFLICT_LIFECYCLE_EVENTS_MIGRATION_SQL: &str =
     include_str!("../../migrations/0029_conflict_lifecycle_events.sql");
+const WORKER_SOURCE_STATUS_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0030_worker_source_status.sql");
+const SPEC_CONFORMANCE_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0031_spec_conformance.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -326,7 +336,8 @@ fn successor_transition_migrations() -> [Migration; 5] {
     ]
 }
 
-fn post_transactional_online_migrations() -> [Migration; 14] {
+#[allow(clippy::too_many_lines)] // one registration per migration file, in version order
+fn post_transactional_online_migrations() -> [Migration; 16] {
     [
         Migration::new(
             15,
@@ -460,6 +471,26 @@ fn post_transactional_online_migrations() -> [Migration; 14] {
             // migrations 0018-0028. The serving runtime never requires it:
             // MINIMUM_RECALL_SCHEMA_VERSION stays 18, and the conflict
             // lifecycle is served only when the startup probe finds it.
+            true,
+        ),
+        Migration::new(
+            30,
+            Cow::Borrowed("worker source status"),
+            MigrationType::Simple,
+            Cow::Borrowed(WORKER_SOURCE_STATUS_MIGRATION_SQL),
+            // ADR 0006. Additive: one private-plane table with no foreign
+            // key. Runs outside SQLx's transaction wrapper like migrations
+            // 0018-0029; MINIMUM_RECALL_SCHEMA_VERSION stays 18.
+            true,
+        ),
+        Migration::new(
+            31,
+            Cow::Borrowed("spec conformance statements and checks"),
+            MigrationType::Simple,
+            Cow::Borrowed(SPEC_CONFORMANCE_MIGRATION_SQL),
+            // ADR 0007. Additive: two insert-only private-plane tables and
+            // two indexes, with no foreign key. Runs outside SQLx's
+            // transaction wrapper like migrations 0018-0030.
             true,
         ),
     ]

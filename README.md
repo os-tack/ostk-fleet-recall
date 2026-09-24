@@ -170,10 +170,10 @@ Wiring this plane into the product needs, at minimum:
 - a worker or CLI that runs the connectors and projectors;
 - a production embedding provider behind the dense projection's
   `EmbeddingProvider` seam;
-- runtime-role grants on the tables from migrations 19–28 (the runtime policy
-  in `deploy/cockroach/runtime-role-grants.sql` grants nothing on them yet; of
-  the later tables it covers only migration 29's conflict lifecycle log),
-  the publication grant on the filtered views from migration 23, and a content
+- the publication grant on the filtered views from migration 23 (the runtime
+  policy in `deploy/cockroach/runtime-role-grants.sql` already grants
+  `fleet_runtime` the tables from migrations 19–27 and 29–31; see
+  [MIGRATIONS.md](docs/MIGRATIONS.md#privilege-separation)), and a content
   key-encryption key for the governed content store;
 - MCP recall reading the new projections (`CockroachRecallReader`);
 - a lighter writer-authority seam: evidence appends are authorized through the

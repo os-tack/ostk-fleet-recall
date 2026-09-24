@@ -98,17 +98,18 @@ const SUCCESSOR_RUNNER_CONFIGURATION: &str =
 /// Exact table privileges deploy/cockroach/runtime-role-grants.sql installs for
 /// `fleet_runtime` on the Stage-4 evidence plane (ADR 0002 D2). The probe role
 /// in this file receives these and nothing else: no privilege on any
-/// `memory_control_*` or `memory_registry_*` base table.
+/// `memory_control_*` or `memory_registry_*` base table. UPDATE on
+/// `memory_content_objects` covers the `SELECT ... FOR UPDATE` a deduplicating
+/// governed-content append takes.
 const RUNTIME_EVIDENCE_GRANTS: [(&str, &str); 3] = [
     (
         "SELECT, INSERT",
-        "public.memory_evidence_events, public.memory_evidence_quarantine, \
-         public.memory_content_objects",
+        "public.memory_evidence_events, public.memory_evidence_quarantine",
     ),
     (
         "SELECT, INSERT, UPDATE",
         "public.memory_evidence_shard_heads, public.memory_relation_projection_v1, \
-         public.memory_relation_projection_watermarks_v1",
+         public.memory_relation_projection_watermarks_v1, public.memory_content_objects",
     ),
     ("SELECT", "public.memory_writer_authority_v1"),
 ];

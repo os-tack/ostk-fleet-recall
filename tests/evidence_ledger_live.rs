@@ -121,17 +121,19 @@ const SUCCESSOR_RUNNER_CONFIGURATION: &str =
     "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2";
 
 /// The relations ADR 0002 D2 adds to `fleet_runtime`, mirroring
-/// `deploy/cockroach/runtime-role-grants.sql`. The policy itself has many
-/// preconditions, so the probe test replays only this grant list.
+/// `deploy/cockroach/runtime-role-grants.sql`, plus the UPDATE on
+/// `memory_content_objects` that a deduplicating governed-content append's
+/// `SELECT ... FOR UPDATE` needs. The policy itself has many preconditions, so
+/// the probe test replays only this grant list.
 const RUNTIME_SELECT_INSERT: &[&str] = &[
     "public.memory_evidence_events",
     "public.memory_evidence_quarantine",
-    "public.memory_content_objects",
 ];
 const RUNTIME_SELECT_INSERT_UPDATE: &[&str] = &[
     "public.memory_evidence_shard_heads",
     "public.memory_relation_projection_v1",
     "public.memory_relation_projection_watermarks_v1",
+    "public.memory_content_objects",
 ];
 const RUNTIME_SELECT_ONLY: &str = "public.memory_writer_authority_v1";
 

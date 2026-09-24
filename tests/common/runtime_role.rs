@@ -12,17 +12,19 @@ use super::fresh_scope;
 /// The table privileges `deploy/cockroach/runtime-role-grants.sql` gives
 /// `fleet_runtime` on the Stage-4 evidence plane (ADR 0002 D2). A probe role
 /// receives these and nothing else: no privilege on any `memory_control_*` or
-/// `memory_registry_*` base table. Keep this in step with that file.
+/// `memory_registry_*` base table. UPDATE on `memory_content_objects` exists
+/// only because `CockroachDB` requires it for the `SELECT ... FOR UPDATE` a
+/// deduplicating governed-content append takes. Keep this in step with that
+/// file.
 pub const RUNTIME_EVIDENCE_GRANTS: [(&str, &str); 3] = [
     (
         "SELECT, INSERT",
-        "public.memory_evidence_events, public.memory_evidence_quarantine, \
-         public.memory_content_objects",
+        "public.memory_evidence_events, public.memory_evidence_quarantine",
     ),
     (
         "SELECT, INSERT, UPDATE",
         "public.memory_evidence_shard_heads, public.memory_relation_projection_v1, \
-         public.memory_relation_projection_watermarks_v1",
+         public.memory_relation_projection_watermarks_v1, public.memory_content_objects",
     ),
     ("SELECT", "public.memory_writer_authority_v1"),
 ];

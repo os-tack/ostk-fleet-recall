@@ -227,12 +227,14 @@ claim, claim-support, and conflict ID sequences, `SELECT` on
 and `memory_content_objects`, and `SELECT`/`INSERT`/`UPDATE` on
 `memory_evidence_shard_heads`, `memory_relation_projection_v1`, and
 `memory_relation_projection_watermarks_v1`), `SELECT` on the
-migrator-owned view `memory_writer_authority_v1`, and `SELECT`/`INSERT` (no
+migrator-owned view `memory_writer_authority_v1`, `SELECT`/`INSERT` (no
 `UPDATE` or `DELETE`) on the migration-29 conflict lifecycle log
-`memory_conflict_lifecycle_events_v1`
-(see [MIGRATIONS.md](MIGRATIONS.md)). The policy refuses to run before
-migration 29 has succeeded, and the writer serves the conflict lifecycle only
-after a restart that follows the policy; the policy itself
+`memory_conflict_lifecycle_events_v1`, and the append-only, advance, and
+read-only rows on the tables of migrations 19 through 27, 30, and 31, plus
+`UPDATE` on `memory_content_objects` for its row lock
+(see [MIGRATIONS.md](MIGRATIONS.md)). The policy refuses to run until every
+migration from 1 through 31 has succeeded, and the writer serves the conflict
+lifecycle only after a restart that follows the policy; the policy itself
 installs the sole `fleet_writer` membership edge. Never use `ON ALL TABLES`, and never grant the
 writer, publication reader, or `public` role access to `memory_control_bootstraps`,
 `memory_control_log_epochs`, `memory_control_shard_heads`, or

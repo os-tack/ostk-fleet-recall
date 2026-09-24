@@ -1,13 +1,12 @@
 -- Long-lived runtime-writer role boundary for the dedicated fleet_recall
 -- database.
 --
--- Run only after the complete successful migration prefix 1 through 18 and the
--- successful conflict-lifecycle migration 29. Other later successful migrations
--- are compatible and cannot mask a missing or failed row in that bounded
--- prefix. Run only as a cluster admin; database ownership alone
--- is insufficient. This policy is independent of the private control,
--- activation, successor, and reconciliation ceremonies and neither requires nor
--- creates their roles.
+-- Run only after the complete successful migration prefix 1 through 31 (version
+-- 25 is permanently unused). Other later successful migrations are compatible
+-- and cannot mask a missing or failed row in that bounded prefix. Run only as
+-- a cluster admin; database ownership alone is insufficient. This policy is
+-- independent of the private control, activation, successor, and
+-- reconciliation ceremonies and neither requires nor creates their roles.
 --
 -- The exact application principal fleet_writer, including its password or
 -- identity-provider binding, is provisioned outside this file. Before every
@@ -64,42 +63,29 @@ $$;
 
 -- Fail closed before role creation, option changes, revocations, or grants. A
 -- missing or failed prerequisite cannot be masked by a later successful row.
+-- One gate covers the whole bounded prefix whose tables are granted below:
+-- the legacy corpus and claim surface, the Stage-4 evidence plane (18), the
+-- Stage-5 body, coverage, recall, transcript, and visibility tables (19-23),
+-- normative activation (24), the CI connector (26), the discrepancy ledger
+-- (27), the conflict lifecycle log (29), worker source status (30), and spec
+-- conformance (31). A policy applied before any of them fails here, before any
+-- change, rather than on a GRANT.
 DO $$
 DECLARE
     runtime_schema_ready BOOL;
 BEGIN
-    SELECT count(*) = 18
+    SELECT count(*) = 30
        AND min(version) = 1
-       AND max(version) = 18
+       AND max(version) = 31
        AND COALESCE(bool_and(success), false)
     INTO runtime_schema_ready
     FROM public._sqlx_migrations
-    WHERE version BETWEEN 1 AND 18;
+    WHERE version BETWEEN 1 AND 31;
 
     IF runtime_schema_ready IS DISTINCT FROM true THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
-            MESSAGE = 'runtime writer role requires the complete successful migration prefix through 18';
-    END IF;
-END
-$$;
-
--- Serving conflict lifecycle (ADR 0004): its log table exists only from
--- migration 29, and this policy grants on it below. A policy applied before
--- migration 29 must fail here, before any change, rather than on the GRANT.
-DO $$
-DECLARE
-    lifecycle_schema_ready BOOL;
-BEGIN
-    SELECT count(*) = 1 AND COALESCE(bool_and(success), false)
-    INTO lifecycle_schema_ready
-    FROM public._sqlx_migrations
-    WHERE version = 29;
-
-    IF lifecycle_schema_ready IS DISTINCT FROM true THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '55000',
-            MESSAGE = 'runtime writer role requires successful migration 29 (conflict lifecycle events)';
+            MESSAGE = 'runtime writer role requires successful migrations 1 through 31 (25 is permanently unused)';
     END IF;
 END
 $$;
@@ -802,6 +788,61 @@ TO fleet_runtime;
 -- grant the D4 witness would otherwise need.
 GRANT SELECT ON TABLE public.memory_writer_authority_v1 TO fleet_runtime;
 
+-- The Stage-5 body, coverage, recall, and transcript planes (migrations 19
+-- through 23), normative activation (24), the CI connector (26), the
+-- discrepancy ledger (27), worker source status (30, ADR 0006), and spec
+-- conformance (31, ADR 0007). Logs, statements, checks, receipts, bodies,
+-- occurrences, manifests, and measured windows are append-only by privilege
+-- (SELECT and INSERT, no UPDATE or DELETE). The discrepancy relations table
+-- is read-only: nothing served appends a relation yet. UPDATE on heads,
+-- cursors, pointers, watermarks, projections, the transcript outbox's drain
+-- state, and worker status covers CockroachDB's SELECT ... FOR UPDATE and
+-- each compare-and-set advance or upsert; none of those rows is an accepted
+-- envelope, a log entry, or a receipt. No table in this block receives
+-- DELETE. None of these tables has a foreign key, so no parent grant is
+-- needed, and none is ever granted to the publication reader. Migration 23's
+-- publication views and migration 28's bootstrap import rows are deliberately
+-- absent.
+GRANT SELECT, INSERT ON TABLE
+    public.memory_body_objects_v1,
+    public.memory_chunk_occurrences_v1,
+    public.memory_chunk_occurrence_spans_v1,
+    public.memory_parse_run_manifests_v1,
+    public.memory_source_commit_membership_v1,
+    public.memory_coverage_receipts_v1,
+    public.memory_ci_measured_windows_v1,
+    public.memory_normative_log_v1,
+    public.memory_discrepancy_log_v1,
+    public.memory_normative_statements_v1,
+    public.memory_spec_checks_v1
+TO fleet_runtime;
+
+GRANT SELECT, INSERT, UPDATE ON TABLE
+    public.memory_generation_pointers_v1,
+    public.memory_body_projection_watermarks_v1,
+    public.memory_body_visibility_v1,
+    public.memory_coverage_cursors_v1,
+    public.memory_body_lexical_projection_v1,
+    public.memory_body_dense_projection_v1,
+    public.memory_recall_projection_cursors_v1,
+    public.memory_transcript_outbox_v1,
+    public.memory_transcript_cursors_v1,
+    public.memory_normative_heads_v1,
+    public.memory_normative_projections_v1,
+    public.memory_discrepancy_heads_v1,
+    public.memory_discrepancy_projections_v1,
+    public.memory_worker_sources_v1
+TO fleet_runtime;
+
+GRANT SELECT ON TABLE public.memory_discrepancy_relations_v1 TO fleet_runtime;
+
+-- CockroachDB v26.2.3 requires UPDATE for SELECT ... FOR UPDATE. The governed
+-- content store takes that lock (LOCK_CONTENT_OBJECT_SQL in
+-- src/evidence_ledger/content_store.rs) whenever an append deduplicates onto
+-- an existing content object, to compare it against the admitted bytes. No
+-- runtime statement issues UPDATE on this table.
+GRANT UPDATE ON TABLE public.memory_content_objects TO fleet_runtime;
+
 GRANT USAGE ON SEQUENCE
     public.memory_claim_id_seq,
     public.memory_claim_support_id_seq,
@@ -815,11 +856,11 @@ TO fleet_runtime;
 GRANT fleet_runtime TO fleet_writer;
 
 -- Exact direct logical-role surface: database CONNECT, public-schema USAGE,
--- forty-four table-privilege rows, and three sequence-USAGE rows. Because
+-- one hundred ten table-privilege rows, and three sequence-USAGE rows. Because
 -- SHOW GRANTS FOR also exposes cluster-global external connections, the exact
 -- count rejects those and every function/type/differently privileged row.
 SELECT IF(
-    count(*) = 49
+    count(*) = 115
         AND COALESCE(bool_and(
             NOT is_grantable
             AND (
@@ -854,7 +895,33 @@ SELECT IF(
                                 'memory_relation_projection_v1',
                                 'memory_relation_projection_watermarks_v1',
                                 'memory_writer_authority_v1',
-                                'memory_conflict_lifecycle_events_v1'
+                                'memory_conflict_lifecycle_events_v1',
+                                'memory_body_objects_v1',
+                                'memory_chunk_occurrences_v1',
+                                'memory_chunk_occurrence_spans_v1',
+                                'memory_parse_run_manifests_v1',
+                                'memory_source_commit_membership_v1',
+                                'memory_coverage_receipts_v1',
+                                'memory_ci_measured_windows_v1',
+                                'memory_normative_log_v1',
+                                'memory_discrepancy_log_v1',
+                                'memory_normative_statements_v1',
+                                'memory_spec_checks_v1',
+                                'memory_generation_pointers_v1',
+                                'memory_body_projection_watermarks_v1',
+                                'memory_body_visibility_v1',
+                                'memory_coverage_cursors_v1',
+                                'memory_body_lexical_projection_v1',
+                                'memory_body_dense_projection_v1',
+                                'memory_recall_projection_cursors_v1',
+                                'memory_transcript_outbox_v1',
+                                'memory_transcript_cursors_v1',
+                                'memory_normative_heads_v1',
+                                'memory_normative_projections_v1',
+                                'memory_discrepancy_heads_v1',
+                                'memory_discrepancy_projections_v1',
+                                'memory_worker_sources_v1',
+                                'memory_discrepancy_relations_v1'
                             ))
                         OR (privilege_type = 'INSERT'
                             AND object_name IN (
@@ -874,7 +941,32 @@ SELECT IF(
                                 'memory_content_objects',
                                 'memory_relation_projection_v1',
                                 'memory_relation_projection_watermarks_v1',
-                                'memory_conflict_lifecycle_events_v1'
+                                'memory_conflict_lifecycle_events_v1',
+                                'memory_body_objects_v1',
+                                'memory_chunk_occurrences_v1',
+                                'memory_chunk_occurrence_spans_v1',
+                                'memory_parse_run_manifests_v1',
+                                'memory_source_commit_membership_v1',
+                                'memory_coverage_receipts_v1',
+                                'memory_ci_measured_windows_v1',
+                                'memory_normative_log_v1',
+                                'memory_discrepancy_log_v1',
+                                'memory_normative_statements_v1',
+                                'memory_spec_checks_v1',
+                                'memory_generation_pointers_v1',
+                                'memory_body_projection_watermarks_v1',
+                                'memory_body_visibility_v1',
+                                'memory_coverage_cursors_v1',
+                                'memory_body_lexical_projection_v1',
+                                'memory_body_dense_projection_v1',
+                                'memory_recall_projection_cursors_v1',
+                                'memory_transcript_outbox_v1',
+                                'memory_transcript_cursors_v1',
+                                'memory_normative_heads_v1',
+                                'memory_normative_projections_v1',
+                                'memory_discrepancy_heads_v1',
+                                'memory_discrepancy_projections_v1',
+                                'memory_worker_sources_v1'
                             ))
                         OR (privilege_type = 'UPDATE'
                             AND object_name IN (
@@ -884,7 +976,22 @@ SELECT IF(
                                 'memory_mutation_receipts',
                                 'memory_evidence_shard_heads',
                                 'memory_relation_projection_v1',
-                                'memory_relation_projection_watermarks_v1'
+                                'memory_relation_projection_watermarks_v1',
+                                'memory_generation_pointers_v1',
+                                'memory_body_projection_watermarks_v1',
+                                'memory_body_visibility_v1',
+                                'memory_coverage_cursors_v1',
+                                'memory_body_lexical_projection_v1',
+                                'memory_body_dense_projection_v1',
+                                'memory_recall_projection_cursors_v1',
+                                'memory_transcript_outbox_v1',
+                                'memory_transcript_cursors_v1',
+                                'memory_normative_heads_v1',
+                                'memory_normative_projections_v1',
+                                'memory_discrepancy_heads_v1',
+                                'memory_discrepancy_projections_v1',
+                                'memory_worker_sources_v1',
+                                'memory_content_objects'
                             ))
                         OR (privilege_type = 'DELETE'
                             AND object_name = 'memory_chunk_history')
@@ -903,7 +1010,7 @@ SELECT IF(
     1:::INT8,
     CAST(
         concat(
-            'runtime writer direct-grant postcondition differs from exact forty-nine-row matrix: observed=',
+            'runtime writer direct-grant postcondition differs from exact one-hundred-fifteen-row matrix: observed=',
             count(*)::STRING
         )
         AS INT8

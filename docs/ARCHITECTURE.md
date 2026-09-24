@@ -426,8 +426,8 @@ log inside a rolled-back transaction must pass the privilege check. Without
 it, the surface stays at `record|supersede|retract`, closes are audited in
 `memory_events` only, and `MINIMUM_RECALL_SCHEMA_VERSION` stays 18, so every
 binary runs on a schema without migration 29. The rollout is deploy the
-binary, migrate, re-apply the runtime policy (its migration-29 gate and 49-row
-grant matrix), then restart `serve`.
+binary, migrate, re-apply the runtime policy (its single migration 1-31 gate
+and exact grant matrix), then restart `serve`.
 
 ## Trust and isolation invariants
 

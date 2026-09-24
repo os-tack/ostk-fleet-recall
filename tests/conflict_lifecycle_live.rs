@@ -1710,8 +1710,12 @@ async fn live_private_search_refills_page_past_retracted_hits_when_configured() 
     fleet.cleanup().await;
 }
 
-/// The runtime writer's exact table grants from
-/// `deploy/cockroach/runtime-role-grants.sql`, with no lifecycle additions.
+/// The runtime writer's table grants from
+/// `deploy/cockroach/runtime-role-grants.sql` on the legacy corpus and claim
+/// tables and the Stage-4 evidence plane, without the lifecycle log. The
+/// policy's Stage-5 and Stage-6 rows and its UPDATE on
+/// `memory_content_objects` are left out: no conflict lifecycle path needs
+/// them.
 const RUNTIME_GRANTS: &[(&str, &[&str])] = &[
     (
         "SELECT",
@@ -4234,7 +4238,8 @@ async fn run_conflict_lifecycle_as(
             return Err(format!("probe {label} close was not logged"));
         }
     }
-    // Adjudication needs no grant beyond the same 49 rows.
+    // Adjudication needs no grant beyond the runtime policy's lifecycle-log
+    // SELECT and INSERT.
     let adjudicator = || ledger(AGENT_C).with_conflict_adjudication();
     record(AGENT_A, "probe-dismiss", "x").await?;
     let dismissed = record(AGENT_B, "probe-dismiss", "y")
@@ -4326,7 +4331,7 @@ async fn live_capability_probe_false_without_grants_true_with_them_when_configur
         pool.close().await;
         assert!(matches!(select_only, Ok(None)), "{select_only:?}");
 
-        // The 49-row runtime policy: SELECT and INSERT.
+        // The runtime policy's lifecycle-log grant: SELECT and INSERT.
         sqlx::query(&format!(
             "GRANT INSERT ON TABLE public.memory_conflict_lifecycle_events_v1 TO {role}"
         ))
@@ -4337,7 +4342,7 @@ async fn live_capability_probe_false_without_grants_true_with_them_when_configur
         let capability = probe_conflict_lifecycle(&pool, &capabilities)
             .await
             .expect("the probe runs")
-            .expect("the 49-row policy may use the lifecycle log");
+            .expect("the runtime policy's lifecycle grant may use the lifecycle log");
         // The probe wrote nothing.
         assert_eq!(fleet.tenant_lifecycle_rows().await, 0);
         let actions = run_conflict_lifecycle_as(&fleet, &pool, capability).await;
