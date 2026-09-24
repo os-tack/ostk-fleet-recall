@@ -666,11 +666,11 @@ pub struct RevisionGap {
     pub to_revision: i64,
 }
 
-/// A conflict's lifecycle log, oldest first.
+/// A conflict's newest lifecycle events, in event order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictHistory {
     pub events: Vec<ConflictLifecycleEvent>,
-    /// True when more events exist than the bounded history returns.
+    /// True when older events exist than the bounded history returns.
     pub truncated: bool,
 }
 

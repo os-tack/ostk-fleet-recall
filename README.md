@@ -454,7 +454,10 @@ delivery; after an ambiguous response, retry the same full request and key.
 To retire a claim it authored, an agent sends `remember(retract)` with the
 claim id and the revision it last read, for example from `recall` `get` with
 `kind=claim`. `reason` is an optional private audit note of at most 1,000
-characters:
+characters. On a writer that serves the conflict lifecycle log (below), a
+retract or supersede that closes a conflict also records the note as the
+close's cause in that conflict's history, which every agent in the project can
+read:
 
 ```json
 {"action":"retract","idempotency_key":"readme/retract/v1","claim_id":41,"expected_revision":2,"reason":"superseded by the migration review"}
@@ -562,11 +565,22 @@ describes, `acknowledged_by` (at most 16, with `acknowledgers_truncated`),
 the log. `conflict_coverage.lifecycle_overlay` is `evaluated`; if the overlay
 read fails it is `unavailable`, a `lifecycle_overlay_unavailable` warning is
 added, and the conflicts are still returned. `recall` `get` with
-`kind=conflict` adds `history` (at most 256 events, oldest first, with
-`history_truncated`) and `unlogged_transitions`, the revision ranges the
-conflict passed through without a logged event, such as a reopen by `record`.
-Retract and supersede closes are logged too, attributed to the detector with
-the caller's operation and reason as the cause.
+`kind=conflict` adds `history`, the conflict's newest events in order (at most
+256, and fewer when their notes and payloads would not fit one response), with
+`history_truncated` when older events were left out, and
+`unlogged_transitions`, the revision ranges the conflict passed through
+without a logged event, such as a reopen by `record`. Retract and supersede
+closes are logged too, attributed to the detector with the caller's operation
+and reason as the cause.
+
+The log holds at most 4,096 events per conflict, and an event records at most
+4,096 members. `acknowledge`, whose only effect is its event, is refused as
+`bound_exceeded` when the log cannot hold it, and so are `acknowledge` and
+`resolve` on a conflict with more than 4,096 members. A close is never refused
+for the log's capacity: a retract, supersede, or resolve that closes such a
+conflict commits without its event (a `resolve` response's `lifecycle_event`
+is then null), and the conflict reads `closed_unlogged` with the close as an
+unlogged transition.
 
 A writer that does not serve an action, such as one started with
 `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` or one whose probe found no

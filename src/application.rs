@@ -15,7 +15,8 @@ use crate::ledger::{
     ConflictTarget, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LifecycleMutation,
     LifecycleReplayRequest, MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT,
     MAX_OVERLAY_EPISODE_EVENTS, SemanticClaimHit, SupportedClaimCoordinate, derive_overlay,
-    overlay_episode_revision, unlogged_transitions, validate_lifecycle_reason,
+    history_within_bytes, overlay_episode_revision, unlogged_transitions,
+    validate_lifecycle_reason,
 };
 use crate::service::{
     ConflictCoverage, FleetMemoryService, RecallAction, RecallRequest, RecallResult, Refusal,
@@ -36,6 +37,12 @@ const MAX_TSVECTOR_QUERY_LEXEME_BYTES: usize = 16_000;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 /// Source of the corpus projection record writes for every claim.
 const SYNTHETIC_CLAIM_SOURCE: &str = "ostk_memory";
+/// Serialized bytes `recall(get, kind=conflict)` spends on the conflict, which
+/// it returns twice (`data.conflict` and `conflicts`), and its lifecycle
+/// history together. History gets what the conflict leaves, so the lookup
+/// stays well inside the MCP edge's 768 KiB tool-result budget however long
+/// the conflict's log grows.
+const MAX_CONFLICT_LOOKUP_BYTES: usize = 576 * 1024;
 
 /// Which lifecycle behaviour a service instance serves. The default is the
 /// historical record-only surface with unfiltered search, which the public
@@ -525,6 +532,13 @@ impl CockroachMemoryService {
         if let (Some(_), Some(conflict)) = (overlay, conflicts.first()) {
             match self.ledger.conflict_lifecycle_history(scope, id).await {
                 Ok(history) => {
+                    let conflict_bytes = serialized
+                        .first()
+                        .map_or(0, |conflict| json_bytes(conflict).saturating_mul(2));
+                    let history = history_within_bytes(
+                        history,
+                        MAX_CONFLICT_LOOKUP_BYTES.saturating_sub(conflict_bytes),
+                    );
                     let gaps = unlogged_transitions(
                         &history.events,
                         conflict.revision,
@@ -1786,6 +1800,12 @@ fn serialize_conflicts(conflicts: &[Conflict]) -> ServiceResult<Vec<Value>> {
                 .map_err(|error| ServiceError::Internal(format!("serialize conflict: {error}")))
         })
         .collect()
+}
+
+/// A value's serialized size; one that cannot be serialized counts as
+/// unbounded.
+fn json_bytes(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 fn compact_claim_hits(mut hits: Vec<SemanticClaimHit>) -> Vec<SemanticClaimHit> {

@@ -274,10 +274,12 @@ uses the database clock. A pure derivation turns those events into the
 overlay's `state`, ADR 0003's `read_side`, the acknowledgers, and the closing
 event. A failure of that read never fails the response: coverage reports
 `lifecycle_overlay: unavailable` and the conflicts come back without it.
-`get` with `kind=conflict` reads the log once more, oldest first and bounded
-to 256 events, and derives `unlogged_transitions` from the revisions the
-events do not cover, such as a reopen by `record`. The publication reader has
-no grant on the log and never attaches the overlay.
+`get` with `kind=conflict` reads the log once more, its newest 256 events,
+keeps the newest of those that fit a byte budget beside the conflict (so a
+long-lived conflict's lookup always fits one MCP response), and derives
+`unlogged_transitions` from the revisions the events do not cover, such as a
+reopen by `record` or a close the full log could not hold. The publication
+reader has no grant on the log and never attaches the overlay.
 
 ## Deliberate-memory write path
 
@@ -421,8 +423,9 @@ grant matrix), then restart `serve`.
    Acknowledgement changes only the lifecycle log. That log is append-only:
    each conflict's events are numbered without gaps, at most one close is
    logged per resulting revision, and every event belongs to a committed
-   receipt. A refused lifecycle request rolls back completely and leaves no
-   receipt.
+   receipt. Its bounds can refuse `acknowledge` and `resolve` but never a
+   verified close: a close the full log cannot hold commits unlogged. A
+   refused lifecycle request rolls back completely and leaves no receipt.
 
 ## Scaling and failure behavior
 

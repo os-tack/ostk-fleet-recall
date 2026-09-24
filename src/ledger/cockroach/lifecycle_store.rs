@@ -17,7 +17,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{Row, Transaction};
 
 use super::conflict_store::{
-    self, LifecycleEventDraft, acknowledge_request, append_lifecycle_event, resolve_request,
+    self, LifecycleEventDraft, acknowledge_request, append_close_event, resolve_request,
 };
 use super::{
     ClaimPassage, CockroachClaimLedger, MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON, MAX_LEDGER_RESULTS,
@@ -1117,36 +1117,36 @@ pub(super) async fn apply_verified_close(
         audit.key,
     )
     .await?;
+    // The log records the close when it can; its capacity never refuses it.
     let lifecycle_event = if audit.log {
-        let member_count = conflict_store::member_count(transaction, scope, conflict_id).await?;
+        let member_count =
+            conflict_store::bounded_member_count(transaction, scope, conflict_id).await?;
         let mut remaining = current.iter().map(|claim| claim.id).collect::<Vec<_>>();
         remaining.sort_unstable();
-        Some(
-            append_lifecycle_event(
-                transaction,
-                scope,
-                LifecycleEventDraft {
-                    conflict_id,
-                    kind: "resolved",
-                    episode_revision: conflict_revision,
-                    result_revision: closed_revision,
-                    to_state: "resolved",
-                    actor_kind: "detector",
-                    actor: FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
-                    operation: audit.operation,
-                    key: audit.key,
-                    member_count,
-                    reason_kind: Some(NO_CURRENT_INCOMPATIBILITY),
-                    rationale: None,
-                    payload: json!({
-                        "cause": audit.cause,
-                        "restored_claim_ids": claims_restored,
-                        "remaining_current_claim_ids": remaining,
-                    }),
-                },
-            )
-            .await?,
+        append_close_event(
+            transaction,
+            scope,
+            LifecycleEventDraft {
+                conflict_id,
+                kind: "resolved",
+                episode_revision: conflict_revision,
+                result_revision: closed_revision,
+                to_state: "resolved",
+                actor_kind: "detector",
+                actor: FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+                operation: audit.operation,
+                key: audit.key,
+                member_count,
+                reason_kind: Some(NO_CURRENT_INCOMPATIBILITY),
+                rationale: None,
+                payload: json!({
+                    "cause": audit.cause,
+                    "restored_claim_ids": claims_restored,
+                    "remaining_current_claim_ids": remaining,
+                }),
+            },
         )
+        .await?
     } else {
         None
     };

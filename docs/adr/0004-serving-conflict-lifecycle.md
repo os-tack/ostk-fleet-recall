@@ -141,14 +141,28 @@ attributed to the detector (`actor_kind = detector`, actor
 with the triggering operation, idempotency key, and a `cause` payload naming
 the agent and the claims it retracted or superseded.
 
+The log's CHECK constraints bound it at 4,096 events per conflict and 4,096
+members per event, and neither count ever shrinks: the log is append-only and
+members are never deleted. The bounds therefore refuse only the conflict
+actions: `acknowledge`, whose only effect is its event, is refused
+`bound_exceeded` when the log is full, and `acknowledge` and `resolve` are
+refused on a conflict with more than 4,096 members, a count neither an event
+nor `resolve`'s member-count check can carry. A detector-verified close is
+never refused for the log's capacity: it commits without its event, reads
+`closed_unlogged`, and history reports it as an unlogged transition. So the
+owner's retract and supersede work on every conflict, exactly as without the
+capability (D7).
+
 Reads attach a `lifecycle` overlay derived from the episode's newest events
 with a separate autocommit statement after the main read, so a failure only
 degrades coverage to `lifecycle_overlay: unavailable`. Its `read_side` follows
 ADR 0003's addendum exactly: `open` and `acknowledged` read `open`, an active
 unexpired waiver whose member count still matches reads `waived`, and
 `resolved` and `dismissed` read `clear`. `recall(get, kind=conflict)` also
-returns the log (at most 256 events) and reports the revision ranges no event
-covers as `unlogged_transitions`. `record` still opens and reopens conflicts
+returns the log's newest events (at most 256, and only as many as fit the
+lookup's byte budget beside the conflict itself, with `history_truncated`
+when older ones are left out) and reports the revision ranges no event covers
+as `unlogged_transitions`. `record` still opens and reopens conflicts
 without logging, and closes made before migration 29 were not logged; both
 show up there, and a close without its event reads `closed_unlogged`.
 

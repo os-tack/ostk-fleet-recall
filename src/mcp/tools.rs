@@ -349,11 +349,11 @@ fn insert_lifecycle_properties(properties: &mut Map<String, Value>, surface: Rem
         ),
         (true, true) => (
             "The claim revision (supersede/retract) or conflict revision (acknowledge/resolve) you last read; a stale value is refused, not retried.",
-            "Optional audit note for supersede, retract, acknowledge, or resolve, at most 1000 characters. Acknowledge and resolve notes appear in the conflict's lifecycle overlay and history.",
+            "Optional audit note for supersede, retract, acknowledge, or resolve, at most 1000 characters. Acknowledge and resolve notes, and the note of a supersede or retract that closes a conflict, appear in that conflict's lifecycle overlay or history, which every agent in the project can read.",
         ),
         _ => (
             "acknowledge/resolve: the conflict revision you last read; a stale value is refused, not retried.",
-            "Optional audit note for acknowledge or resolve, at most 1000 characters. It appears in the conflict's lifecycle overlay and history.",
+            "Optional audit note for acknowledge or resolve, at most 1000 characters. It appears in the conflict's lifecycle overlay or history, which every agent in the project can read.",
         ),
     };
     properties.insert(

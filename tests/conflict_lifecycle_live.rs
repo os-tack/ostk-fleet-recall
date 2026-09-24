@@ -18,8 +18,10 @@ use ostk_fleet_recall::application::LifecycleServing;
 use ostk_fleet_recall::ledger::{
     ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget,
     CockroachClaimLedger, CockroachConflictReconciliationRepository, ConflictMutation,
-    ConflictTarget, LifecycleRefusal, RefusalCode, SupersededClaim,
+    ConflictTarget, LifecycleRefusal, MAX_CONFLICT_LIFECYCLE_EVENTS, MAX_CONFLICT_MEMBER_COUNT,
+    RefusalCode, SupersededClaim,
 };
+use ostk_fleet_recall::mcp::McpServer;
 use ostk_fleet_recall::service::{
     FleetMemoryService, RecallAction, RecallRequest, RecallResult, RememberAction, RememberRequest,
     RememberResult, RememberSurface, ServiceError,
@@ -2976,6 +2978,251 @@ async fn get_conflict(
     )
     .await
     .expect("conflict lookup succeeds")
+}
+
+/// Fill `conflict_id`'s lifecycle log with `count` acknowledgements of its
+/// episode `revision` by distinct agents, as a long-lived busy conflict
+/// accumulates them.
+async fn seed_acknowledgements(
+    fleet: &Fleet,
+    conflict_id: i64,
+    revision: i64,
+    count: i64,
+    rationale: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO memory_conflict_lifecycle_events_v1 (\
+             tenant_id, project, conflict_id, event_seq, event_kind, episode_revision, \
+             result_revision, from_state, to_state, actor_kind, actor, operation, \
+             idempotency_key, member_count, rationale\
+         ) SELECT $1, $2, $3, seq, 'acknowledged', $4, $4, 'open', 'open', 'agent', \
+                  'seeded-agent-' || seq::STRING, 'conflict_acknowledge', \
+                  $5 || '/seeded-ack/' || seq::STRING, 2, $6 \
+           FROM generate_series(1, $7::INT8) AS seq",
+    )
+    .bind(fleet.tenant)
+    .bind(&fleet.project)
+    .bind(conflict_id)
+    .bind(revision)
+    .bind(&fleet.project)
+    .bind(rationale)
+    .bind(count)
+    .execute(fleet.pool())
+    .await
+    .unwrap();
+}
+
+/// Add `count` retracted members to `conflict_id` on `claim_key`, as years of
+/// supersedes on a hot key leave behind: membership is never deleted.
+async fn seed_retired_members(fleet: &Fleet, claim_key: &str, conflict_id: i64, count: i64) {
+    let retired: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO memory_claims (\
+             tenant_id, project, kind, claim_key, subject, predicate, value, text, \
+             polarity, state, origin, actor, conflict_eligible\
+         ) SELECT $1, $2, 'decision', $3, 'retired', 'database-choice', \
+                  to_jsonb('retired-' || n::STRING), 'retired lifecycle fixture', 1, \
+                  'retracted', 'operator_asserted', $4, true \
+           FROM generate_series(1, $5::INT8) AS n \
+         RETURNING id",
+    )
+    .bind(fleet.tenant)
+    .bind(&fleet.project)
+    .bind(claim_key)
+    .bind(AGENT_A)
+    .bind(count)
+    .fetch_all(fleet.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_conflict_members (tenant_id, project, conflict_id, claim_id) \
+         SELECT $1, $2, $3, claim_id FROM unnest($4::INT8[]) AS members(claim_id)",
+    )
+    .bind(fleet.tenant)
+    .bind(&fleet.project)
+    .bind(conflict_id)
+    .bind(&retired)
+    .execute(fleet.pool())
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // a full log and a crowded conflict, each closed by its owner
+async fn live_log_bounds_never_refuse_a_verified_close_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "log-bounds").await;
+    let service = fleet.full_service(AGENT_C);
+    let scope = fleet.scope(AGENT_C);
+
+    // A conflict whose log is full: acknowledge, which writes nothing but its
+    // event, is refused and leaves the key free.
+    let (x, y, full) = two_party(&fleet, "bounds-full").await;
+    let revision = fleet.conflict_row(full).await.1;
+    seed_acknowledgements(&fleet, full, revision, MAX_CONFLICT_LIFECYCLE_EVENTS, None).await;
+    let refused = refusal(
+        fleet
+            .acknowledge(AGENT_C, full, revision, "c/ack-full")
+            .await,
+    );
+    assert_eq!(refused.code, RefusalCode::BoundExceeded);
+    fleet.assert_key_unconsumed("c/ack-full").await;
+
+    // The owner's retract still closes it, as on a writer without the log.
+    let retracted = fleet
+        .conflict_ledger(AGENT_A)
+        .retract_claim(
+            &fleet.scope(AGENT_A),
+            ClaimTarget {
+                claim_id: x.claim.id,
+                expected_revision: fleet.claim(x.claim.id).await.revision,
+            },
+            Some("wrong database"),
+            &fleet.key("a/retract-full"),
+        )
+        .await
+        .expect("a full lifecycle log never refuses the owner's retract");
+    assert_eq!(retracted.conflicts_resolved, [full]);
+    assert_eq!(retracted.claims_restored, [y.claim.id]);
+    assert_eq!(
+        fleet.conflict_row(full).await,
+        ("resolved".to_owned(), revision + 1)
+    );
+    assert_eq!(fleet.claim_state(y.claim.id).await, "active");
+    assert!(
+        fleet
+            .lifecycle_log(full)
+            .await
+            .iter()
+            .all(|event| event.1 == "acknowledged"),
+        "the close commits without an event the log cannot hold"
+    );
+    // Reads report the close as unlogged, and history shows the newest events.
+    let lookup = get_conflict(&service, &scope, full).await;
+    let lifecycle = &lookup.data["conflict"]["lifecycle"];
+    assert_eq!(lifecycle["state"], "resolved");
+    assert_eq!(lifecycle["read_side"], "clear");
+    assert_eq!(lifecycle["closed_unlogged"], true);
+    assert_eq!(lookup.data["history_truncated"], true);
+    assert_eq!(
+        lookup.data["history"].as_array().unwrap().last().unwrap()["seq"],
+        MAX_CONFLICT_LIFECYCLE_EVENTS
+    );
+    assert_eq!(
+        lookup.data["unlogged_transitions"],
+        json!([{ "from_revision": revision, "to_revision": revision + 1 }])
+    );
+
+    // A concession on a full log closes the same way, with no event.
+    let (kept, conceding, conceded) = two_party(&fleet, "bounds-concede").await;
+    let view = fleet.conflict_view(conceded).await;
+    seed_acknowledgements(
+        &fleet,
+        conceded,
+        view.1,
+        MAX_CONFLICT_LIFECYCLE_EVENTS,
+        None,
+    )
+    .await;
+    let resolved = fleet
+        .resolve(AGENT_B, view, &[conceding.claim.id], "b/concede-full")
+        .await
+        .expect("a full lifecycle log never refuses a verified concession");
+    assert_eq!(resolved.conflict_state, "resolved");
+    assert_eq!(resolved.claims_restored, [kept.claim.id]);
+    assert!(resolved.lifecycle_event.is_none());
+    assert_eq!(fleet.conflict_row(conceded).await.0, "resolved");
+
+    // A conflict with more members than an event records: acknowledge is
+    // refused, and the owner's supersede to the peer's value still closes it.
+    let (author, peer, crowded) = two_party(&fleet, "bounds-members").await;
+    let claim_key = author.claim.claim_key.clone().expect("a keyed decision");
+    seed_retired_members(&fleet, &claim_key, crowded, MAX_CONFLICT_MEMBER_COUNT).await;
+    let view = fleet.conflict_view(crowded).await;
+    assert!(view.2 > MAX_CONFLICT_MEMBER_COUNT);
+    let refused = refusal(
+        fleet
+            .acknowledge(AGENT_C, crowded, view.1, "c/ack-crowded")
+            .await,
+    );
+    assert_eq!(refused.code, RefusalCode::BoundExceeded);
+    fleet.assert_key_unconsumed("c/ack-crowded").await;
+    let successor = fleet
+        .conflict_ledger(AGENT_A)
+        .supersede_claim(
+            &fleet.scope(AGENT_A),
+            ClaimTarget {
+                claim_id: author.claim.id,
+                expected_revision: fleet.claim(author.claim.id).await.revision,
+            },
+            None,
+            &decision("bounds-members", &json!("y"), 1),
+            &fleet.key("a/supersede-crowded"),
+        )
+        .await
+        .expect("a crowded conflict never refuses the owner's supersede");
+    assert_eq!(successor.conflicts_resolved, [crowded]);
+    assert_eq!(successor.claims_restored, [peer.claim.id]);
+    assert!(fleet.lifecycle_log(crowded).await.is_empty());
+    let lookup = get_conflict(&service, &scope, crowded).await;
+    assert_eq!(
+        lookup.data["conflict"]["lifecycle"]["closed_unlogged"],
+        true
+    );
+    assert_eq!(
+        lookup.data["unlogged_transitions"],
+        json!([{ "from_revision": 1, "to_revision": view.1 + 1 }])
+    );
+
+    fleet.cleanup().await;
+}
+
+#[tokio::test]
+async fn live_long_conflict_history_fits_one_mcp_response_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "history-budget").await;
+    let (_, _, conflict_id) = two_party(&fleet, "history-budget").await;
+    let revision = fleet.conflict_row(conflict_id).await.1;
+    // More schema-valid notes of 1,000 three-byte characters than one
+    // response can carry.
+    let note = "\u{8a3c}".repeat(1_000);
+    seed_acknowledgements(&fleet, conflict_id, revision, 300, Some(&note)).await;
+
+    let server =
+        McpServer::new(Arc::new(fleet.full_service(AGENT_C)), fleet.scope(AGENT_C)).unwrap();
+    let response = server
+        .handle_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "recall",
+                "arguments": { "action": "get", "kind": "conflict", "id": conflict_id },
+            },
+        }))
+        .await
+        .expect("a request has a response");
+    let result = response.result.expect("tools/call answers");
+    assert_eq!(result["isError"], false, "{}", result["content"][0]["text"]);
+    let data = &result["structuredContent"]["data"];
+    assert_eq!(data["conflict"]["id"], conflict_id);
+    assert_eq!(data["history_truncated"], true);
+    // The newest events are kept, in order, with their notes intact.
+    let history = data["history"].as_array().unwrap();
+    assert!(!history.is_empty());
+    assert_eq!(history.last().unwrap()["seq"], 300);
+    assert!(
+        history
+            .windows(2)
+            .all(|pair| pair[0]["seq"].as_i64() < pair[1]["seq"].as_i64())
+    );
+    assert!(history.iter().all(|event| event["rationale"] == note));
+    assert_eq!(data["unlogged_transitions"], json!([]));
+
+    fleet.cleanup().await;
 }
 
 #[tokio::test]

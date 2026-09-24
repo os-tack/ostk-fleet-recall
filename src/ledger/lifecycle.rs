@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::ledger::{
-    Acknowledgement, ClaimKind, ClaimState, ClosureView, ConflictLifecycleEvent,
+    Acknowledgement, ClaimKind, ClaimState, ClosureView, ConflictHistory, ConflictLifecycleEvent,
     ConflictLifecycleOverlay, RevisionGap, WaiverView, functional_values_are_incompatible,
     intervals_overlap,
 };
@@ -31,8 +31,8 @@ pub const MAX_LIFECYCLE_REASON_CHARS: usize = 1_000;
 pub const MAX_REPORTED_REMAINING_PAIRS: usize = 32;
 /// Claims one concession `resolve` may retract.
 pub const MAX_CONCESSION_CLAIMS: usize = 32;
-/// Durable members a conflict lifecycle mutation may count; the lifecycle
-/// log's CHECK admits no more.
+/// Durable members a lifecycle event can record; the lifecycle log's CHECK
+/// admits no more.
 pub const MAX_CONFLICT_MEMBER_COUNT: i64 = 4_096;
 /// Events one conflict's lifecycle log may hold (its `event_seq` CHECK).
 pub const MAX_CONFLICT_LIFECYCLE_EVENTS: i64 = 4_096;
@@ -41,8 +41,8 @@ pub const MAX_CONFLICT_LIFECYCLE_EVENTS: i64 = 4_096;
 pub const MAX_OVERLAY_EPISODE_EVENTS: usize = 32;
 /// Acknowledgers the overlay lists; the rest are reported as truncated.
 pub const MAX_OVERLAY_ACKNOWLEDGERS: usize = 16;
-/// Events `recall(get, kind=conflict)` returns as history; one more is
-/// fetched as a sentinel.
+/// The newest events `recall(get, kind=conflict)` reads as history; one more
+/// is fetched as a sentinel.
 pub const MAX_HISTORY_EVENTS: usize = 256;
 /// Characters of a waiver rationale the overlay echoes.
 const MAX_OVERLAY_RATIONALE_CHARS: usize = 1_000;
@@ -564,6 +564,22 @@ pub fn plan_concession(
     })
 }
 
+/// Whether the lifecycle log can hold an event at `seq` recording
+/// `member_count` members: both are bounded by the log's CHECK constraints.
+///
+/// An `acknowledge`, whose only effect is its event, is refused
+/// `bound_exceeded` when this is false. A detector-verified close is never
+/// refused for it: the close commits without its event and reads as
+/// `closed_unlogged`, so the log's capacity never takes away an owner's
+/// retract or supersede.
+#[must_use]
+pub const fn event_fits_log(seq: i64, member_count: i64) -> bool {
+    seq >= 1
+        && seq <= MAX_CONFLICT_LIFECYCLE_EVENTS
+        && member_count >= 0
+        && member_count <= MAX_CONFLICT_MEMBER_COUNT
+}
+
 /// The conflict revision whose lifecycle events describe the row: the current
 /// revision of an open conflict, and the episode a close ended otherwise
 /// (a close always advances the revision by one).
@@ -701,17 +717,26 @@ pub fn derive_overlay(
 /// A conflict is created open at revision 1. Each logged event starts at its
 /// `episode_revision` and leaves `result_revision`; a later event, or the
 /// current row, at a higher revision means something unlogged moved the
-/// conflict in between (a reopen by `record`, or a close from before the
-/// lifecycle log). `events` are in `seq` order; `complete` is false when the
-/// history was truncated, so no trailing gap can be inferred.
+/// conflict in between (a reopen by `record`, a close from before the
+/// lifecycle log, or a close the full log could not hold). `events` are the
+/// log's newest events in `seq` order; `from_first_event` is false when older
+/// events were left out, so no gap before the first returned event can be
+/// inferred.
 #[must_use]
 pub fn unlogged_transitions(
     events: &[ConflictLifecycleEvent],
     current_revision: i64,
-    complete: bool,
+    from_first_event: bool,
 ) -> Vec<RevisionGap> {
     let mut gaps = Vec::new();
-    let mut cursor = 1_i64;
+    let mut cursor = if from_first_event {
+        1_i64
+    } else {
+        match events.first() {
+            Some(first) => first.episode_revision,
+            None => return gaps,
+        }
+    };
     for event in events {
         if event.episode_revision > cursor {
             gaps.push(RevisionGap {
@@ -721,13 +746,41 @@ pub fn unlogged_transitions(
         }
         cursor = cursor.max(event.result_revision);
     }
-    if complete && current_revision > cursor {
+    if current_revision > cursor {
         gaps.push(RevisionGap {
             from_revision: cursor,
             to_revision: current_revision,
         });
     }
     gaps
+}
+
+/// Keep the newest events of `history` that fit in `byte_budget`.
+///
+/// Older events are dropped first and the history is marked truncated, so a
+/// long-lived conflict's lookup stays within one bounded response however
+/// large its events' notes and payloads are.
+#[must_use]
+pub fn history_within_bytes(mut history: ConflictHistory, byte_budget: usize) -> ConflictHistory {
+    let mut used = 0_usize;
+    let mut kept = 0_usize;
+    for event in history.events.iter().rev() {
+        // One separator byte per array element.
+        let size = serde_json::to_vec(event)
+            .map_or(usize::MAX, |bytes| bytes.len())
+            .saturating_add(1);
+        used = used.saturating_add(size);
+        if used > byte_budget {
+            break;
+        }
+        kept += 1;
+    }
+    let dropped = history.events.len() - kept;
+    if dropped > 0 {
+        history.events.drain(..dropped);
+        history.truncated = true;
+    }
+    history
 }
 
 /// Canonical idempotency identity for a lifecycle mutation. It binds the
@@ -1552,8 +1605,6 @@ mod tests {
         assert!(unlogged_transitions(&logged, 2, true).is_empty());
         // record reopened it (2 -> 3): an unlogged transition.
         assert_eq!(unlogged_transitions(&logged, 3, true), [gap(2, 3)]);
-        // A truncated history cannot see its own tail.
-        assert!(unlogged_transitions(&logged, 3, false).is_empty());
         // An unlogged close and reopen before the first logged event.
         let later = [
             event(1, "acknowledged", 3, "agent-a"),
@@ -1564,9 +1615,49 @@ mod tests {
             unlogged_transitions(&later, 5, true),
             [gap(1, 3), gap(4, 5)]
         );
+        // A history that left out its oldest events cannot see what came
+        // before them, but still sees everything after them.
+        assert_eq!(unlogged_transitions(&later, 5, false), [gap(4, 5)]);
+        assert_eq!(
+            unlogged_transitions(&later[1..], 6, false),
+            [gap(4, 5), gap(5, 6)]
+        );
+        assert!(unlogged_transitions(&[], 3, false).is_empty());
         // No log at all: every revision after creation is unlogged.
         assert_eq!(unlogged_transitions(&[], 3, true), [gap(1, 3)]);
         assert!(unlogged_transitions(&[], 1, true).is_empty());
+    }
+
+    #[test]
+    fn history_keeps_its_newest_events_within_a_byte_budget() {
+        let mut events = (1..=6)
+            .map(|seq| event(seq, "acknowledged", 1, &format!("agent-{seq}")))
+            .collect::<Vec<_>>();
+        // Long notes in a three-byte script, as the reason schema allows.
+        for event in &mut events {
+            event.rationale = Some("\u{8a3c}".repeat(MAX_LIFECYCLE_REASON_CHARS));
+        }
+        let size = |events: &[ConflictLifecycleEvent]| serde_json::to_vec(events).unwrap().len();
+        let whole = ConflictHistory {
+            events: events.clone(),
+            truncated: false,
+        };
+        assert_eq!(history_within_bytes(whole.clone(), size(&events)), whole);
+
+        let budget = size(&events[3..]);
+        let bounded = history_within_bytes(whole.clone(), budget);
+        assert!(bounded.truncated);
+        assert_eq!(bounded.events, events[3..]);
+        assert!(size(&bounded.events) <= budget);
+        // A history already cut at its event bound stays truncated.
+        let cut = ConflictHistory {
+            truncated: true,
+            ..whole.clone()
+        };
+        assert!(history_within_bytes(cut, usize::MAX).truncated);
+        // Too small a budget keeps nothing rather than overrunning it.
+        let empty = history_within_bytes(whole, 10);
+        assert!(empty.truncated && empty.events.is_empty());
     }
 
     #[test]

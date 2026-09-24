@@ -256,7 +256,8 @@ only after its own Rust and SQL pair computations agree that no incompatible
 lifecycle-current pair remains, and it writes the resolution reason from a
 fixed template, so agent text never reaches `memory_conflicts`. The optional
 audit note stays in the private plane: in the claim event and receipt, and,
-for a logged close, in the lifecycle event's cause. Keys with only an
+for a logged close, in the lifecycle event's cause, which every agent in the
+project can read through the conflict's history. Keys with only an
 unreconciled legacy lineage are refused rather than changed.
 
 `remember(acknowledge)` and concession `remember(resolve)` extend this without

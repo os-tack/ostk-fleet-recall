@@ -25,8 +25,8 @@ use super::{CockroachClaimLedger, MAX_LEDGER_RESULTS, parse_claim_state, protoco
 use crate::ledger::lifecycle::{
     ConflictRowState, LifecycleRefusal, MAX_CONCESSION_CLAIMS, MAX_CONFLICT_LIFECYCLE_EVENTS,
     MAX_CONFLICT_MEMBER_COUNT, MAX_HISTORY_EVENTS, MAX_OVERLAY_EPISODE_EVENTS,
-    MAX_REPORTED_REMAINING_PAIRS, Reevaluation, RefusalCode, V2Lineage, lifecycle_request_identity,
-    plan_concession, plan_reevaluation, validate_reason,
+    MAX_REPORTED_REMAINING_PAIRS, Reevaluation, RefusalCode, V2Lineage, event_fits_log,
+    lifecycle_request_identity, plan_concession, plan_reevaluation, validate_reason,
 };
 use crate::ledger::{
     ClaimState, ConflictHistory, ConflictLifecycleEvent, ConflictLifecycleRows, ConflictMutation,
@@ -37,8 +37,8 @@ use crate::{FleetError, FleetScope, Result};
 
 const ACKNOWLEDGE_ACTION: &str = "acknowledge";
 const RESOLVE_ACTION: &str = "resolve";
-/// History payloads above this many bytes are elided, so a bounded history
-/// stays within one tool response.
+/// History payloads above this many bytes are elided, so no single event
+/// dominates a history; the service bounds the whole history by bytes.
 const MAX_HISTORY_PAYLOAD_BYTES: usize = 4_096;
 
 const CONFLICT_TARGET_SQL: &str = "SELECT id, claim_key, CASE detector \
@@ -47,7 +47,7 @@ const CONFLICT_TARGET_SQL: &str = "SELECT id, claim_key, CASE detector \
               ELSE 0::INT8 END AS detector_class, \
             state, revision \
      FROM memory_conflicts@primary WHERE tenant_id = $1 AND project = $2 AND id = $3";
-/// Durable members, counted up to one sentinel past the log's bound.
+/// Durable members, counted up to one sentinel past what an event records.
 const MEMBER_COUNT_SQL: &str = "SELECT count(*)::INT8 FROM (\
        SELECT claim_id FROM memory_conflict_members@primary \
        WHERE tenant_id = $1 AND project = $2 AND conflict_id = $3 LIMIT $4\
@@ -103,6 +103,7 @@ const LIFECYCLE_OVERLAY_SQL: &str = "SELECT wanted.conflict_id AS wanted_conflic
          AND episode_revision = wanted.episode_revision \
        ORDER BY event_seq DESC LIMIT $5\
      ) AS e ON true";
+/// The log's newest events, newest first; the reader returns them in order.
 const LIFECYCLE_HISTORY_SQL: &str = "SELECT event_seq, event_kind, episode_revision, \
             result_revision, actor_kind, actor, operation, reason_kind, rationale, expires_at, \
             review_by, member_count, created_at, \
@@ -110,7 +111,7 @@ const LIFECYCLE_HISTORY_SQL: &str = "SELECT event_seq, event_kind, episode_revis
             octet_length(payload::STRING) > $5 AS payload_elided \
      FROM memory_conflict_lifecycle_events_v1@primary \
      WHERE tenant_id = $1 AND project = $2 AND conflict_id = $3 \
-     ORDER BY event_seq LIMIT $4";
+     ORDER BY event_seq DESC LIMIT $4";
 
 const V2_DETECTOR_CLASS: i64 = 2;
 const LEGACY_DETECTOR_CLASS: i64 = 1;
@@ -715,21 +716,32 @@ async fn lock_open_conflict(
     })
 }
 
-/// The conflict's durable member count, refused past the log's bound.
-pub(super) async fn member_count(
+/// The conflict's durable member count, up to one past what a lifecycle
+/// event can record.
+pub(super) async fn bounded_member_count(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     conflict_id: i64,
 ) -> Result<i64> {
     let bound = usize::try_from(MAX_CONFLICT_MEMBER_COUNT)
         .map_err(|_| protocol_error("conflict member bound is outside usize range"))?;
-    let count = sqlx::query_scalar::<_, i64>(MEMBER_COUNT_SQL)
+    Ok(sqlx::query_scalar::<_, i64>(MEMBER_COUNT_SQL)
         .bind(scope.tenant_id)
         .bind(&scope.project)
         .bind(conflict_id)
         .bind(sentinel_limit(bound)?)
         .fetch_one(&mut **transaction)
-        .await?;
+        .await?)
+}
+
+/// The member count `acknowledge` and `resolve` check and record, refused
+/// when a lifecycle event could not record it.
+async fn member_count(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    conflict_id: i64,
+) -> Result<i64> {
+    let count = bounded_member_count(transaction, scope, conflict_id).await?;
     if count > MAX_CONFLICT_MEMBER_COUNT {
         return Err(LifecycleRefusal::new(
             RefusalCode::BoundExceeded,
@@ -762,23 +774,33 @@ async fn members_among(
         .collect()
 }
 
-/// Append one event to a conflict's lifecycle log at the next sequence. The
-/// caller holds the conflict row lock, so no other writer can take the same
-/// sequence; the primary key backstops that.
-pub(super) async fn append_lifecycle_event(
+/// The sequence the conflict's next lifecycle event takes. The caller holds
+/// the conflict row lock, so no other writer can take the same sequence; the
+/// primary key backstops that.
+async fn next_event_seq(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    conflict_id: i64,
+) -> Result<i64> {
+    let last = sqlx::query_scalar::<_, i64>(LAST_EVENT_SEQ_SQL)
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(conflict_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .unwrap_or(0);
+    Ok(last + 1)
+}
+
+/// Append an agent's event, whose only effect is the event itself, so a log
+/// that cannot hold it refuses the whole request as `bound_exceeded`.
+async fn append_lifecycle_event(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     draft: LifecycleEventDraft<'_>,
 ) -> Result<ConflictLifecycleEvent> {
-    let last = sqlx::query_scalar::<_, i64>(LAST_EVENT_SEQ_SQL)
-        .bind(scope.tenant_id)
-        .bind(&scope.project)
-        .bind(draft.conflict_id)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .unwrap_or(0);
-    let seq = last + 1;
-    if seq > MAX_CONFLICT_LIFECYCLE_EVENTS {
+    let seq = next_event_seq(transaction, scope, draft.conflict_id).await?;
+    if !event_fits_log(seq, draft.member_count) {
         return Err(LifecycleRefusal::new(
             RefusalCode::BoundExceeded,
             format!(
@@ -792,6 +814,41 @@ pub(super) async fn append_lifecycle_event(
         )
         .into());
     }
+    insert_lifecycle_event(transaction, scope, seq, draft).await
+}
+
+/// Append a detector-verified close when the log can hold it. The log never
+/// vetoes a verified close: when the conflict already has as many events as
+/// the log admits, or more members than an event can record, the close still
+/// commits without its event, and reads report it as `closed_unlogged` and as
+/// an unlogged transition.
+pub(super) async fn append_close_event(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    draft: LifecycleEventDraft<'_>,
+) -> Result<Option<ConflictLifecycleEvent>> {
+    let seq = next_event_seq(transaction, scope, draft.conflict_id).await?;
+    if !event_fits_log(seq, draft.member_count) {
+        tracing::warn!(
+            conflict_id = draft.conflict_id,
+            event_seq = seq,
+            member_count = draft.member_count,
+            operation = draft.operation,
+            "the conflict lifecycle log cannot hold this verified close; it commits unlogged"
+        );
+        return Ok(None);
+    }
+    insert_lifecycle_event(transaction, scope, seq, draft)
+        .await
+        .map(Some)
+}
+
+async fn insert_lifecycle_event(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    seq: i64,
+    draft: LifecycleEventDraft<'_>,
+) -> Result<ConflictLifecycleEvent> {
     let row = sqlx::query(INSERT_LIFECYCLE_EVENT_SQL)
         .bind(scope.tenant_id)
         .bind(&scope.project)
@@ -935,7 +992,7 @@ pub(super) async fn conflict_lifecycle_rows(
     })
 }
 
-/// A conflict's lifecycle log, oldest first, bounded to 256 events.
+/// A conflict's newest lifecycle events, at most 256, in event order.
 pub(super) async fn conflict_lifecycle_history(
     ledger: &CockroachClaimLedger,
     scope: &FleetScope,
@@ -960,11 +1017,12 @@ pub(super) async fn conflict_lifecycle_history(
         .fetch_all(&ledger.pool)
         .await?;
     let truncated = rows.len() > MAX_HISTORY_EVENTS;
-    let events = rows
+    let mut events = rows
         .iter()
         .take(MAX_HISTORY_EVENTS)
         .map(|row| decode_lifecycle_event(row, true))
         .collect::<Result<Vec<_>>>()?;
+    events.reverse();
     if events.windows(2).any(|pair| pair[0].seq >= pair[1].seq) {
         return Err(protocol_error("lifecycle history was not in event order"));
     }

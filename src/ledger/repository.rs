@@ -134,7 +134,7 @@ pub trait ClaimLedger: Send + Sync {
         episodes: &[(i64, i64)],
     ) -> Result<ConflictLifecycleRows>;
 
-    /// One conflict's lifecycle log, oldest first, bounded to 256 events.
+    /// One conflict's newest lifecycle events, at most 256, in event order.
     async fn conflict_lifecycle_history(
         &self,
         scope: &FleetScope,
