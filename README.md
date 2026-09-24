@@ -24,7 +24,9 @@ The `ostk-fleet-recall` binary has these commands:
 - `serve` speaks newline-delimited JSON-RPC/MCP on stdin/stdout with two tools:
   - `recall(search|get|conflicts|status)` reads the hybrid vector/lexical
     corpus and typed-claim state. `get` with `kind=conflict` returns one
-    conflict by id in any state, with its members.
+    conflict by id in any state, with its members and its lifecycle history.
+    Every conflict the private writer returns carries a `lifecycle` overlay:
+    who acknowledged it, and who closed it and how.
   - `remember(record)` records a deliberate typed claim with provenance,
     idempotent mutation receipts, and conflict detection.
   - `remember(retract)` retires a claim the calling agent authored. When no
@@ -36,6 +38,11 @@ The `ostk-fleet-recall` binary has these commands:
     becomes `superseded` and names its successor, which the detector checks
     like any recorded claim: a compatible successor lets the key's conflict
     close, and an incompatible one takes its predecessor's place in it.
+  - `remember(acknowledge)` records that the calling agent has seen a
+    conflict's current episode. It changes no claim and no conflict.
+  - `remember(resolve)` concedes a conflict: it retracts the calling agent's
+    own member claims it names, and closes the conflict only if the detector
+    then finds no incompatible current pair. Otherwise nothing changes.
 - `demo` serves a bounded, read-only HTTP surface (`/`, `/healthz`,
   `/api/status`, and `POST /api/recall`). It exposes no mutation route.
 - `migrate` applies the embedded CockroachDB schema migrations.
@@ -60,10 +67,15 @@ conflict with the exact members that caused it instead of silently choosing
 one. The detector compares typed propositions; it performs no natural-language
 inference.
 
-A conflict is never resolved by fiat. An agent can retract or supersede only
-its own claims, and a conflict closes only when the detector re-checks the key
-and finds no incompatible current pair left
-([ADR 0004](docs/adr/0004-serving-conflict-lifecycle.md)).
+A conflict is never resolved by fiat. An agent can retract, supersede, or
+concede only its own claims, and a conflict closes only when the detector
+re-checks the key and finds no incompatible current pair left
+([ADR 0004](docs/adr/0004-serving-conflict-lifecycle.md)). Acknowledgements
+and detector-verified closes are appended to a per-conflict lifecycle log
+(migration 0029). The writer serves `acknowledge`, `resolve`, the overlay, and
+history only when its startup probe finds that log and the runtime grants on
+it; otherwise it serves `retract` and `supersede` alone and closes are audited
+in `memory_events` only.
 On the private writer, chunk search also drops the synthetic `claim:{id}` hits of
 claims that are no longer current, lists them in
 `diagnostics.retrieval.lifecycle_hidden_claim_ids`, and refills the page from
@@ -73,7 +85,7 @@ default is `enabled`) restores the record-only surface: the historical
 surface.
 
 The service contract also reserves further Recall actions (for example
-`remember` resolve and `recall` surface/discover) and an attention
+`remember` forget/relate and `recall` surface/discover) and an attention
 schema. These return an error or are unused today; see the
 [roadmap](docs/ARCHITECTURE.md#roadmap-and-open-work).
 
@@ -139,8 +151,9 @@ Wiring this plane into the product needs, at minimum:
 - a worker or CLI that runs the connectors and projectors;
 - a production embedding provider behind the dense projection's
   `EmbeddingProvider` seam;
-- runtime-role grants on the tables from migrations 19–27 (the runtime policy
-  in `deploy/cockroach/runtime-role-grants.sql` grants nothing on them yet),
+- runtime-role grants on the tables from migrations 19–28 (the runtime policy
+  in `deploy/cockroach/runtime-role-grants.sql` grants nothing on them yet; of
+  the later tables it covers only migration 29's conflict lifecycle log),
   the publication grant on the filtered views from migration 23, and a content
   key-encryption key for the governed content store;
 - MCP recall reading the new projections (`CockroachRecallReader`);
@@ -502,11 +515,65 @@ successor changes the kind (`successor_kind_mismatch`), the normalized key
 (`successor_eligibility_mismatch`). A malformed successor is an ordinary
 `invalid_params` error, exactly as for `record`.
 
-A writer that does not serve `retract` or `supersede`, such as one started with
-`FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`, checks the key's receipt first: a
-request that already committed under the key replays its stored result, any
-other use of the key is an idempotency conflict, and only an unused key is
-refused as `lifecycle_unavailable`.
+To mark a conflict as seen, any agent in the project, including one whose
+claim is in it, sends `remember(acknowledge)` with the conflict id and the
+revision it last read, for example from `recall` `conflicts` or `get` with
+`kind=conflict`:
+
+```json
+{"action":"acknowledge","idempotency_key":"readme/ack/v1","conflict_id":9,"expected_revision":1,"reason":"checking the migration runbook"}
+```
+
+An acknowledgement belongs to the conflict's current episode, its revision.
+It never changes the conflict, its members, or its read side: an acknowledged
+conflict still reads `open`. An agent's second acknowledgement of the same
+episode commits with `applied:false` and `status:"already_acknowledged"`.
+When `record` later reopens a closed conflict, the new episode starts with no
+acknowledgements.
+
+To concede, an agent sends `remember(resolve)` with the conflict's revision
+and `member_count` as it read them, and `retract_claim_ids`, its own current
+member claims to retract:
+
+```json
+{"action":"resolve","idempotency_key":"readme/resolve/v1","conflict_id":9,"expected_revision":1,"expected_member_count":2,"retract_claim_ids":[41],"reason":"the other value is the reviewed one"}
+```
+
+In one transaction the server retracts those claims exactly as `retract` would,
+then asks the detector, in Rust and in SQL, whether any incompatible current
+pair is left. If none is, the conflict is `resolved`, its remaining disputed
+members return to `active`, and the response carries `claims_retracted`,
+`claims_restored`, `conflicts_resolved`, and the detector-attributed
+`lifecycle_event`. If a pair is left, for example in a three-way conflict, the
+whole request is refused as `still_incompatible` with the remaining `pairs`
+and nothing is retracted. Omitting `retract_claim_ids` only asks the detector
+to re-verify the conflict, which any agent may do. `resolve` never changes
+another agent's claim: naming one is refused as `not_owner`. It is also
+refused when a named claim is not a member (`not_member`) or no longer current
+(`not_current`), when the conflict is closed (`not_open`), and when its
+revision or member count moved (`stale_revision`, `stale_member_count`; an
+open conflict gains members without a revision change).
+
+With the lifecycle log available, every conflict `recall` returns carries a
+`lifecycle` object: `state` (`open`, `acknowledged`, `resolved`, or
+`dismissed`), `read_side` (`open` or `clear`), the `episode_revision` it
+describes, `acknowledged_by` (at most 16, with `acknowledgers_truncated`),
+`closed_by` for a closed conflict, or `closed_unlogged` when the close predates
+the log. `conflict_coverage.lifecycle_overlay` is `evaluated`; if the overlay
+read fails it is `unavailable`, a `lifecycle_overlay_unavailable` warning is
+added, and the conflicts are still returned. `recall` `get` with
+`kind=conflict` adds `history` (at most 256 events, oldest first, with
+`history_truncated`) and `unlogged_transitions`, the revision ranges the
+conflict passed through without a logged event, such as a reopen by `record`.
+Retract and supersede closes are logged too, attributed to the detector with
+the caller's operation and reason as the cause.
+
+A writer that does not serve an action, such as one started with
+`FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` or one whose probe found no
+lifecycle log, checks the key's receipt first: a request that already
+committed under the key replays its stored result, any other use of the key is
+an idempotency conflict, and only an unused key is refused as
+`lifecycle_unavailable`.
 
 Most stdio MCP clients use a configuration shaped like the following. Replace
 the absolute paths and digest; this example deliberately contains only local,
@@ -582,15 +649,18 @@ the remaining rows.
   owner/tier row visibility is not implemented yet.
 - Actor provenance is derived from the trusted deployment agent. A supplied
   `remember.actor` is only an exact assertion and is stripped at the MCP edge.
-- Lifecycle authority is owner-only: `remember(retract)` and
-  `remember(supersede)` change only an `operator_asserted` claim whose stored
-  actor is the trusted deployment agent, at the exact revision the caller
-  read, and a successor keeps its predecessor's kind, key, and detector
-  eligibility. No agent can resolve a conflict or retire another agent's
-  claim; a conflict closes only when the detector finds no incompatible
-  lifecycle-current pair. Every refusal rolls the whole transaction back.
-  This authority is as strong as the deployment's `FLEET_RECALL_AGENT` binding
-  over the shared writer credential.
+- Lifecycle authority is owner-only: `remember(retract)`,
+  `remember(supersede)`, and the retractions of `remember(resolve)` change
+  only an `operator_asserted` claim whose stored actor is the trusted
+  deployment agent, and a successor keeps its predecessor's kind, key, and
+  detector eligibility. No agent can retire another agent's claim or declare
+  a conflict's outcome; a conflict closes only when the detector finds no
+  incompatible lifecycle-current pair. `remember(acknowledge)` is open to
+  every agent because it changes nothing but the overlay. Every refusal rolls
+  the whole transaction back. The lifecycle log is append-only for the runtime
+  role and never granted to the publication reader. This authority is as
+  strong as the deployment's `FLEET_RECALL_AGENT` binding over the shared
+  writer credential.
 - MCP frames, tool results, searches, conflict projections, claim passages,
   ingestion, and HTTP bodies/results are bounded. Backend details are redacted
   from protocol errors.

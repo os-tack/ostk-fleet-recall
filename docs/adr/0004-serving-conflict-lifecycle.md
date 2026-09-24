@@ -1,15 +1,16 @@
 # ADR 0004: Serving conflict lifecycle on the legacy ledger
 
-- Status: accepted. The first two slices are implemented:
-  `remember(retract)`, detector-verified conflict close with member restore,
-  `recall(get)` with `kind=conflict`, private search hiding retired claims'
-  synthetic chunks, and `remember(supersede)`. Acknowledgement, concession
-  resolve, and adjudication are later slices and are not served.
+- Status: accepted. Three slices are implemented: `remember(retract)`,
+  detector-verified conflict close with member restore, `recall(get)` with
+  `kind=conflict`, private search hiding retired claims' synthetic chunks,
+  `remember(supersede)`, and, with migration 29, the per-conflict lifecycle
+  log, `remember(acknowledge)`, concession `remember(resolve)`, logged
+  closes, and the lifecycle overlay and history on reads. Adjudication
+  (`dismiss` and `waive`) is a later slice and is not served.
 - Date: 2026-09-24
 - Scope: how the serving writer lets agents retire their own claims and how a
-  `same_key_functional_value_v2` conflict leaves the `open` state. Decisions
-  D4, D5, and D7 are reserved for the later slices (lifecycle log and
-  acknowledgement, adjudication, and rollout).
+  `same_key_functional_value_v2` conflict leaves the `open` state. Decision
+  D5 is reserved for the adjudication slice.
 
 ## Context
 
@@ -109,27 +110,106 @@ least one open current lineage (its key's v2 lineage when one exists,
 otherwise an unreconciled legacy one), and every open v2 conflict keeps at
 least one incompatible current pair.
 
+## D4 — Acknowledgements and closes are events; `memory_conflicts` stays byte-stable
+
+**Decision.** Migration 29 adds one append-only table,
+`memory_conflict_lifecycle_events_v1`, keyed by `(tenant_id, project,
+conflict_id, event_seq)` with no foreign key. It admits four event kinds:
+`acknowledged` and `waived`, which leave the conflict row alone
+(`result_revision = episode_revision`), and `resolved` and `dismissed`, which
+record a close that moved the row one revision on. An episode is one
+`(conflict_id, revision)` of an open conflict, so a `record` reopen, which
+bumps the revision, starts a new episode with no acknowledgements. The table,
+its CHECK constraints, and three indexes (one event per mutation and conflict,
+one acknowledgement per actor and episode, and a covering per-episode read
+index) are the only schema change; `memory_conflicts`,
+`memory_conflict_members`, and migrations 1 through 28 are unchanged.
+
+`remember(acknowledge)` appends an `acknowledged` event for the caller's view
+of an open v2 conflict (revision checked under the lineage lock) and never
+updates `memory_conflicts`. An agent's second acknowledgement of the same
+episode commits with `applied = false`. `remember(resolve)` is a concession:
+it takes the conflict's revision and member count, retracts only the caller's
+own current member claims it names (D2), and closes the conflict only through
+D3's verification. If any incompatible pair remains, or the Rust and SQL pair
+sets disagree, the whole request is refused (`still_incompatible`,
+`verification_divergence`) and the retractions roll back. With no claims
+named it only re-verifies, which anyone may ask for. Every close by the
+serving writer (retract, supersede, or resolve) appends a `resolved` event
+attributed to the detector (`actor_kind = detector`, actor
+`same_key_functional_value_v2`, reason kind `no_current_incompatibility`),
+with the triggering operation, idempotency key, and a `cause` payload naming
+the agent and the claims it retracted or superseded.
+
+Reads attach a `lifecycle` overlay derived from the episode's newest events
+with a separate autocommit statement after the main read, so a failure only
+degrades coverage to `lifecycle_overlay: unavailable`. Its `read_side` follows
+ADR 0003's addendum exactly: `open` and `acknowledged` read `open`, an active
+unexpired waiver whose member count still matches reads `waived`, and
+`resolved` and `dismissed` read `clear`. `recall(get, kind=conflict)` also
+returns the log (at most 256 events) and reports the revision ranges no event
+covers as `unlogged_transitions`. `record` still opens and reopens conflicts
+without logging, and closes made before migration 29 were not logged; both
+show up there, and a close without its event reads `closed_unlogged`.
+
+**Why.** Acknowledgement is triage metadata that must not change severity or
+surfacing, and ADR 0003 keeps `memory_conflicts` byte-stable. An append-only
+log gives every transition an attributed, replay-safe record without touching
+the record hot path or the publication tables. No foreign key keeps bulk
+deletes of `memory_conflicts` working and means no new parent grant. A
+concession that could leave an incompatible pair behind would let one agent
+declare a dispute over; refusing it keeps `resolved` meaning "no live
+incompatibility".
+
 ## D6 — Refusals are typed and roll back
 
 **Decision.** A lifecycle precondition failure is a typed refusal with a
 closed code (`not_found`, `not_owner`, `not_operator_asserted`,
-`not_current`, `stale_revision`, `legacy_lineage`, `bound_exceeded`,
-`successor_kind_mismatch`, `successor_key_mismatch`,
-`successor_eligibility_mismatch`, `lifecycle_unavailable`, and codes reserved
-for later slices), a message, and
+`not_current`, `stale_revision`, `stale_member_count`, `not_open`,
+`not_member`, `still_incompatible`, `verification_divergence`,
+`legacy_lineage`, `bound_exceeded`, `successor_kind_mismatch`,
+`successor_key_mismatch`, `successor_eligibility_mismatch`,
+`lifecycle_unavailable`, and codes reserved for adjudication), a message, and
 bounded details. It is returned from inside the serializable closure, so the
 transaction and its receipt reservation roll back: nothing is committed and
 the idempotency key stays free. MCP reports it as JSON-RPC `invalid_params`
 with `data.outcome = "not_applied"`, never through the outcome-unknown path.
 A committed request replays before any precondition, so retrying a
-committed retract or supersede returns its stored result rather than
-`not_current`. That includes the surface check: a writer that no longer
-serves `retract` or `supersede` (for example after
-`FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`) reads the key's receipt before
-refusing. It replays a committed identical request, reports any
+committed lifecycle request returns its stored result rather than
+`not_current` or `not_open`. That includes the surface check: a writer that
+no longer serves an action (for example after
+`FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`, or after a restart whose probe
+found no lifecycle grants) reads the key's receipt before refusing. It replays a committed identical request, reports any
 other use of the key as an idempotency conflict, and refuses with
 `lifecycle_unavailable` only when no receipt holds the key, so the refusal's
 promise that the key was not consumed stays true.
+
+## D7 — The conflict lifecycle is gated on a startup capability
+
+**Decision.** `MINIMUM_RECALL_SCHEMA_VERSION` stays 18. At startup the private
+writer checks that the schema prefix reaches 29 and runs an
+`INSERT ... SELECT ... WHERE false` on the lifecycle log in a transaction it
+rolls back. Privileges are checked when the statement is planned, including
+ones held through role membership, and nothing is written. Only a pass mints
+the capability that lets the ledger serve `acknowledge` and `resolve`, log
+closes, and read the overlay and history; SQLSTATE 42501 means "not served",
+and any other error stops startup. The runtime policy gains a separate
+migration-29 gate and `SELECT`/`INSERT` on the log, so its exact grant matrix
+grows from 47 to 49 rows. The publication policy, its eight tables, and
+`PUBLICATION_READ_TABLES` do not change.
+
+The rollout is four independently safe steps: deploy the binary (the probe
+finds nothing and only the claim lifecycle is served), `migrate`, drain
+`fleet_writer` and re-apply the runtime policy, then restart `serve`. The
+probe runs only at startup, so a restart must follow any later grant change.
+Rolling back means running the previous `serve` binary; an older `migrate`
+binary refuses the database with `VersionMissing(29)`.
+
+**Why.** Coupling every binary to migration 29 would make a missing grant
+fail every conflicting `record` as an unknown outcome. Gating on a probed
+capability keeps `record` and the claim lifecycle byte-for-byte unchanged on
+every schema and grant state, and a writer never advertises an action its
+role cannot perform.
 
 ## Clarification of ADR 0002 D3
 
@@ -146,7 +226,13 @@ restores on the private writer, emits the historical tool list byte for byte.
 - Authority is only as strong as `FLEET_RECALL_AGENT` over the shared
   `fleet_writer` credential; authenticated workload identity remains future
   work (see `docs/SECURITY.md`).
-- Closes are audited in `memory_events` and `memory_claim_events` only; a
-  per-conflict lifecycle log is a later slice.
+- Closes are audited in `memory_events` and `memory_claim_events`, and, once
+  the capability is present, in the per-conflict lifecycle log. `record`
+  opens and reopens are not logged; history reports them as unlogged
+  transitions.
+- Agents can acknowledge a conflict and concede their own side of it, but no
+  agent can yet close a conflict whose remaining sides it did not author;
+  that needs adjudication by a non-implicated agent (D5, a later slice).
 - Publication reads are unchanged: the public demo still returns retired
-  claims' synthetic chunks and does not serve conflict lookup by id.
+  claims' synthetic chunks, does not serve conflict lookup by id, and never
+  reads the lifecycle log.

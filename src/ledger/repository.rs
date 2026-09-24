@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 
 use crate::ledger::{
-    Claim, ClaimInput, ClaimMutation, ClaimState, ClaimTarget, Conflict, LifecycleReplayRequest,
-    SemanticClaimHit,
+    Claim, ClaimInput, ClaimMutation, ClaimState, ClaimTarget, Conflict, ConflictHistory,
+    ConflictLifecycleRows, ConflictMutation, ConflictTarget, LifecycleMutation,
+    LifecycleReplayRequest, SemanticClaimHit,
 };
 use crate::{FleetScope, Result};
 
@@ -93,7 +94,52 @@ pub trait ClaimLedger: Send + Sync {
         scope: &FleetScope,
         idempotency_key: &str,
         request: Option<LifecycleReplayRequest<'_>>,
-    ) -> Result<Option<ClaimMutation>>;
+    ) -> Result<Option<LifecycleMutation>>;
+
+    /// Acknowledge the current episode of an open v2 conflict, at the
+    /// revision the caller read. Any agent in scope may acknowledge,
+    /// implicated ones included. It appends an `acknowledged` lifecycle event
+    /// and never changes `memory_conflicts`; an agent's second
+    /// acknowledgement of the same episode commits with `applied = false`.
+    /// Refused as `lifecycle_unavailable` without the lifecycle capability.
+    async fn acknowledge_conflict(
+        &self,
+        scope: &FleetScope,
+        target: ConflictTarget,
+        reason: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<ConflictMutation>;
+
+    /// Concede an open v2 conflict: retract the caller's own current member
+    /// claims named in `retract_claim_ids` (possibly none), then close the
+    /// conflict only if the detector verifies no incompatible current pair
+    /// remains. Otherwise the whole request is refused (`still_incompatible`
+    /// or `verification_divergence`) and nothing changes. Another agent's
+    /// claim is never touched (DISC-03). The conflict revision and member
+    /// count the caller read are both checked.
+    async fn resolve_conflict(
+        &self,
+        scope: &FleetScope,
+        target: ConflictTarget,
+        retract_claim_ids: &[i64],
+        reason: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<ConflictMutation>;
+
+    /// The newest lifecycle events of each `(conflict_id, episode_revision)`
+    /// (at most 100), read in one autocommit statement for the overlay.
+    async fn conflict_lifecycle_rows(
+        &self,
+        scope: &FleetScope,
+        episodes: &[(i64, i64)],
+    ) -> Result<ConflictLifecycleRows>;
+
+    /// One conflict's lifecycle log, oldest first, bounded to 256 events.
+    async fn conflict_lifecycle_history(
+        &self,
+        scope: &FleetScope,
+        conflict_id: i64,
+    ) -> Result<ConflictHistory>;
 
     async fn get_claim(&self, scope: &FleetScope, id: i64) -> Result<Option<Claim>>;
 

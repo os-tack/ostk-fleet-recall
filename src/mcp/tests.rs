@@ -734,6 +734,7 @@ async fn lifecycle_surface_advertises_supersede_and_retract_record_only_does_not
     let lifecycle = Arc::new(FakeService {
         surface: RememberSurface {
             claim_lifecycle: true,
+            ..RememberSurface::RECORD_ONLY
         },
         ..FakeService::default()
     });
@@ -748,6 +749,76 @@ async fn lifecycle_surface_advertises_supersede_and_retract_record_only_does_not
             .as_array()
             .unwrap()
             .contains(&json!("conflict"))
+    );
+}
+
+#[tokio::test]
+async fn conflict_lifecycle_surface_advertises_and_routes_acknowledge_and_resolve() {
+    let fake = Arc::new(FakeService {
+        surface: RememberSurface {
+            claim_lifecycle: true,
+            conflict_lifecycle: true,
+        },
+        ..FakeService::default()
+    });
+    let response = server(&fake)
+        .handle_value(json!({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"}))
+        .await
+        .unwrap();
+    let tools = response.result.unwrap()["tools"].clone();
+    assert_eq!(
+        tools[1]["inputSchema"]["properties"]["action"]["enum"],
+        json!(["record", "supersede", "retract", "acknowledge", "resolve"])
+    );
+
+    for (id, arguments) in [
+        (
+            81,
+            json!({
+                "action": "acknowledge",
+                "idempotency_key": "ack/81",
+                "conflict_id": 9,
+                "expected_revision": 3,
+                "reason": "looking into it"
+            }),
+        ),
+        (
+            82,
+            json!({
+                "action": "resolve",
+                "idempotency_key": "resolve/82",
+                "conflict_id": 9,
+                "expected_revision": 3,
+                "expected_member_count": 2,
+                "retract_claim_ids": [41]
+            }),
+        ),
+    ] {
+        let response = server(&fake)
+            .handle_value(json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "remember", "arguments": arguments}
+            }))
+            .await
+            .unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+    }
+    let calls = fake.calls();
+    let observed = calls
+        .iter()
+        .map(|call| match call {
+            ObservedCall::Remember {
+                action, arguments, ..
+            } => (action.clone(), arguments["conflict_id"].clone()),
+            ObservedCall::Recall { .. } => panic!("remember reached the read path"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        [
+            ("acknowledge".to_owned(), json!(9)),
+            ("resolve".to_owned(), json!(9))
+        ]
     );
 }
 

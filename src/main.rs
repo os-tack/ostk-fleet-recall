@@ -26,7 +26,7 @@ use ostk_fleet_recall::service::{
 };
 use ostk_fleet_recall::store::cockroach::{
     CockroachStore, EMBEDDING_DIMENSION, PoolConfig, RetryPolicy, ScopedChunk,
-    active_embedding_model,
+    active_embedding_model, probe_conflict_lifecycle,
 };
 use ostk_fleet_recall::{CockroachMemoryService, FleetConfig, FleetScope};
 use ostk_recall_core::{
@@ -362,26 +362,45 @@ async fn build_memory_service(
     let embedder: Arc<dyn ChunkEmbedder> = Arc::new(load_pinned_embedder(config)?);
     let store = Arc::new(connect_store(config).await?);
     store.health_check().await?;
-    let ledger = Arc::new(CockroachClaimLedger::new(
+    // The conflict lifecycle is served only when migration 29 is applied and
+    // this role holds its grants; otherwise the claim lifecycle is served
+    // alone. The probe runs once, so a later grant change needs a restart.
+    let conflict_lifecycle = if config.lifecycle.remember_lifecycle {
+        let capabilities = store.capabilities().await?;
+        probe_conflict_lifecycle(store.pool(), &capabilities).await?
+    } else {
+        None
+    };
+    let mut ledger = CockroachClaimLedger::new(
         store.pool().clone(),
         config.default_scope.clone(),
         embedder.clone(),
         RetryPolicy::default(),
-    )?);
+    )?;
+    if let Some(capability) = conflict_lifecycle {
+        ledger = ledger.with_conflict_lifecycle(capability);
+    }
     let mut service = CockroachMemoryService::new(
         config.default_scope.clone(),
         store.clone(),
-        ledger,
+        Arc::new(ledger),
         embedder,
     )?;
     if config.lifecycle.remember_lifecycle {
         let lifecycle = LifecycleServing {
             surface: RememberSurface {
                 claim_lifecycle: true,
+                conflict_lifecycle: conflict_lifecycle.is_some(),
             },
             hide_non_current_claim_chunks: true,
+            lifecycle_overlay: conflict_lifecycle.is_some(),
         };
         tracing::info!(surface = ?lifecycle.surface, "serving the remember lifecycle surface");
+        if conflict_lifecycle.is_none() {
+            tracing::info!(
+                "conflict lifecycle not served: migration 29 or its runtime grants are absent"
+            );
+        }
         service = service.with_lifecycle(lifecycle);
     } else {
         tracing::info!("serving the record-only remember surface");

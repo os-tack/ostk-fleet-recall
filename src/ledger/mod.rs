@@ -14,13 +14,18 @@ pub use conflict::{
     normalize_key_part,
 };
 pub(crate) use lifecycle::validate_reason as validate_lifecycle_reason;
-pub use lifecycle::{LifecycleRefusal, RefusalCode};
+pub use lifecycle::{
+    LifecycleRefusal, MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT, MAX_OVERLAY_EPISODE_EVENTS,
+    RefusalCode, derive_overlay, overlay_episode_revision, unlogged_transitions,
+};
 pub use reconciliation::{
     CockroachConflictReconciliationRepository, ConflictDetectorReconciliation,
 };
 pub use repository::{ClaimLedger, SupportedClaimCoordinate, SupportedClaimIds};
 pub use types::{
-    Claim, ClaimInput, ClaimKind, ClaimMutation, ClaimState, ClaimSupport, ClaimSupportInput,
-    ClaimTarget, Conflict, ConflictCoverage, ConflictReevaluation, LifecycleReplayRequest,
-    SemanticClaimHit, SupersededClaim,
+    Acknowledgement, Claim, ClaimInput, ClaimKind, ClaimMutation, ClaimState, ClaimSupport,
+    ClaimSupportInput, ClaimTarget, ClosureView, Conflict, ConflictCoverage, ConflictHistory,
+    ConflictLifecycleEvent, ConflictLifecycleOverlay, ConflictLifecycleRows, ConflictMutation,
+    ConflictReevaluation, ConflictTarget, LifecycleMutation, LifecycleReplayRequest, RevisionGap,
+    SemanticClaimHit, SupersededClaim, WaiverView,
 };

@@ -1,27 +1,33 @@
-//! Connected proof for the serving claim lifecycle (ADR 0004, slices 1 and 2):
+//! Connected proof for the serving claim and conflict lifecycle (ADR 0004):
 //! owner `retract` and `supersede`, detector-verified conflict close with
-//! member restore, conflict lookup by id, and private search hiding retired
-//! claim chunks.
+//! member restore, conflict lookup by id, private search hiding retired claim
+//! chunks, and (with the migration-29 lifecycle log) `acknowledge`,
+//! concession `resolve`, logged closes, the lifecycle overlay, and history.
 //!
 //! Set `FLEET_RECALL_TEST_DATABASE_URL` to a disposable `CockroachDB` 26.2
 //! database; every test is inert otherwise. Each test migrates, works in a
 //! fresh tenant and project, and deletes every row it wrote.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
+
+use futures::FutureExt as _;
 
 use ostk_fleet_recall::application::LifecycleServing;
 use ostk_fleet_recall::ledger::{
     ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget,
-    CockroachClaimLedger, CockroachConflictReconciliationRepository, LifecycleRefusal, RefusalCode,
-    SupersededClaim,
+    CockroachClaimLedger, CockroachConflictReconciliationRepository, ConflictMutation,
+    ConflictTarget, LifecycleRefusal, RefusalCode, SupersededClaim,
 };
 use ostk_fleet_recall::service::{
     FleetMemoryService, RecallAction, RecallRequest, RecallResult, RememberAction, RememberRequest,
     RememberResult, RememberSurface, ServiceError,
 };
 use ostk_fleet_recall::store::cockroach::{
-    CockroachStore, EMBEDDING_DIMENSION, PoolConfig, RetryPolicy,
+    CONFLICT_LIFECYCLE_SCHEMA_VERSION, CockroachStore, ConflictLifecycleCapability,
+    EMBEDDING_DIMENSION, PUBLICATION_READ_TABLES, PoolConfig, RetryPolicy,
+    probe_conflict_lifecycle,
 };
 use ostk_fleet_recall::{CockroachMemoryService, FleetError, FleetScope};
 use ostk_recall_core::{ChunkEmbedder, PrivacyTier};
@@ -36,12 +42,27 @@ const AGENT_A: &str = "agent-a";
 const AGENT_B: &str = "agent-b";
 const AGENT_C: &str = "agent-c";
 
-/// What the private writer serves unless `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`.
+/// What the private writer serves unless `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`,
+/// when its startup probe finds no conflict lifecycle log (a schema before
+/// migration 29, or grants applied before it).
 const PRIVATE_WRITER: LifecycleServing = LifecycleServing {
     surface: RememberSurface {
         claim_lifecycle: true,
+        conflict_lifecycle: false,
     },
     hide_non_current_claim_chunks: true,
+    lifecycle_overlay: false,
+};
+
+/// What the private writer serves once its startup probe finds the
+/// migration-29 lifecycle log and its grants.
+const FULL_WRITER: LifecycleServing = LifecycleServing {
+    surface: RememberSurface {
+        claim_lifecycle: true,
+        conflict_lifecycle: true,
+    },
+    hide_non_current_claim_chunks: true,
+    lifecycle_overlay: true,
 };
 
 /// The schema is shared, so migration runs once per test process.
@@ -106,6 +127,8 @@ struct Fleet {
     store: CockroachStore,
     tenant: Uuid,
     project: String,
+    /// The disposable database's root role may use the lifecycle log.
+    conflict_lifecycle: ConflictLifecycleCapability,
 }
 
 impl Fleet {
@@ -135,10 +158,16 @@ impl Fleet {
             .initialize_embedding_model(MODEL)
             .await
             .expect("register the fixture embedding model");
+        let capabilities = store.capabilities().await.expect("capabilities");
+        let conflict_lifecycle = probe_conflict_lifecycle(store.pool(), &capabilities)
+            .await
+            .expect("the capability probe runs")
+            .expect("a migrated database's root role may use the lifecycle log");
         Self {
             store,
             tenant,
             project,
+            conflict_lifecycle,
         }
     }
 
@@ -171,9 +200,107 @@ impl Fleet {
         .expect("agent ledger")
     }
 
+    /// `agent`'s ledger holding the conflict lifecycle capability.
+    fn conflict_ledger(&self, agent: &str) -> CockroachClaimLedger {
+        self.ledger(agent)
+            .with_conflict_lifecycle(self.conflict_lifecycle)
+    }
+
     /// The memory service `agent`'s writer composes, serving `lifecycle`.
     fn service(&self, agent: &str, lifecycle: LifecycleServing) -> CockroachMemoryService {
         self.service_embedding(agent, lifecycle, Arc::new(UnitEmbedder))
+    }
+
+    /// The fully probed private writer: conflict lifecycle and overlay on.
+    fn full_service(&self, agent: &str) -> CockroachMemoryService {
+        CockroachMemoryService::new(
+            self.scope(agent),
+            Arc::new(self.store.clone()),
+            Arc::new(self.conflict_ledger(agent)),
+            Arc::new(UnitEmbedder),
+        )
+        .expect("memory service")
+        .with_lifecycle(FULL_WRITER)
+    }
+
+    async fn acknowledge(
+        &self,
+        agent: &str,
+        conflict_id: i64,
+        expected_revision: i64,
+        key: &str,
+    ) -> ostk_fleet_recall::Result<ConflictMutation> {
+        self.conflict_ledger(agent)
+            .acknowledge_conflict(
+                &self.scope(agent),
+                ConflictTarget {
+                    conflict_id,
+                    expected_revision,
+                    expected_member_count: None,
+                },
+                Some(&format!("{agent} is looking")),
+                &self.key(key),
+            )
+            .await
+    }
+
+    async fn resolve(
+        &self,
+        agent: &str,
+        conflict: (i64, i64, i64),
+        retract_claim_ids: &[i64],
+        key: &str,
+    ) -> ostk_fleet_recall::Result<ConflictMutation> {
+        let (conflict_id, expected_revision, expected_member_count) = conflict;
+        self.conflict_ledger(agent)
+            .resolve_conflict(
+                &self.scope(agent),
+                ConflictTarget {
+                    conflict_id,
+                    expected_revision,
+                    expected_member_count: Some(expected_member_count),
+                },
+                retract_claim_ids,
+                Some("conceding"),
+                &self.key(key),
+            )
+            .await
+    }
+
+    /// `(id, revision, member_count)` of a conflict as a caller reads it.
+    async fn conflict_view(&self, conflict_id: i64) -> (i64, i64, i64) {
+        let conflict = self.conflict(conflict_id).await;
+        (
+            conflict.id,
+            conflict.revision,
+            i64::try_from(conflict.member_count).unwrap(),
+        )
+    }
+
+    /// The conflict's lifecycle log, oldest first.
+    async fn lifecycle_log(&self, conflict_id: i64) -> Vec<LoggedEvent> {
+        sqlx::query_as(
+            "SELECT event_seq, event_kind, episode_revision, result_revision, actor_kind, \
+                    actor, operation, idempotency_key, payload \
+             FROM memory_conflict_lifecycle_events_v1 \
+             WHERE tenant_id = $1 AND project = $2 AND conflict_id = $3 ORDER BY event_seq",
+        )
+        .bind(self.tenant)
+        .bind(&self.project)
+        .bind(conflict_id)
+        .fetch_all(self.pool())
+        .await
+        .unwrap()
+    }
+
+    async fn tenant_lifecycle_rows(&self) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*)::INT8 FROM memory_conflict_lifecycle_events_v1 WHERE tenant_id = $1",
+        )
+        .bind(self.tenant)
+        .fetch_one(self.pool())
+        .await
+        .unwrap()
     }
 
     fn service_embedding(
@@ -461,6 +588,7 @@ impl Fleet {
     ///
     /// A key's lineage follows the read side's precedence: once the key has a
     /// v2 lineage, its preserved legacy row is history, not a current lineage.
+    #[allow(clippy::too_many_lines)] // one SQL check per invariant
     async fn assert_lifecycle_invariants(&self) {
         let orphaned_disputes: Vec<i64> = sqlx::query_scalar(
             "SELECT c.id FROM memory_claims AS c \
@@ -557,10 +685,50 @@ impl Fleet {
             broken_links.is_empty(),
             "superseded claims without a same-shape successor: {broken_links:?}"
         );
+
+        // The lifecycle log numbers each conflict's events from 1 without
+        // gaps, logs at most one close per resulting revision, never runs
+        // ahead of the conflict row, and every event belongs to a committed
+        // receipt.
+        let broken_logs: Vec<String> = sqlx::query_scalar(
+            "SELECT 'sequence ' || conflict_id::STRING \
+             FROM memory_conflict_lifecycle_events_v1 \
+             WHERE tenant_id = $1 AND project = $2 \
+             GROUP BY conflict_id HAVING min(event_seq) <> 1 OR max(event_seq) <> count(*) \
+             UNION ALL \
+             SELECT 'double close ' || conflict_id::STRING \
+             FROM memory_conflict_lifecycle_events_v1 \
+             WHERE tenant_id = $1 AND project = $2 AND event_kind IN ('resolved', 'dismissed') \
+             GROUP BY conflict_id, result_revision HAVING count(*) > 1 \
+             UNION ALL \
+             SELECT 'ahead of row ' || e.conflict_id::STRING \
+             FROM memory_conflict_lifecycle_events_v1 AS e \
+             JOIN memory_conflicts AS k \
+               ON k.tenant_id = e.tenant_id AND k.project = e.project AND k.id = e.conflict_id \
+             WHERE e.tenant_id = $1 AND e.project = $2 AND e.result_revision > k.revision \
+             UNION ALL \
+             SELECT 'unreceipted ' || e.idempotency_key \
+             FROM memory_conflict_lifecycle_events_v1 AS e \
+             WHERE e.tenant_id = $1 AND e.project = $2 AND NOT EXISTS (\
+               SELECT 1 FROM memory_mutation_receipts AS r \
+               WHERE r.tenant_id = e.tenant_id AND r.idempotency_key = e.idempotency_key \
+                 AND r.response IS NOT NULL)",
+        )
+        .bind(self.tenant)
+        .bind(&self.project)
+        .fetch_all(self.pool())
+        .await
+        .unwrap();
+        assert!(
+            broken_logs.is_empty(),
+            "lifecycle log violations: {broken_logs:?}"
+        );
     }
 
     async fn cleanup(self) {
         for statement in [
+            // No foreign key cascades into the lifecycle log.
+            "DELETE FROM memory_conflict_lifecycle_events_v1 WHERE tenant_id = $1",
             "DELETE FROM memory_mutation_receipts WHERE tenant_id = $1",
             "DELETE FROM memory_events WHERE tenant_id = $1",
             "DELETE FROM memory_conflicts WHERE tenant_id = $1",
@@ -584,7 +752,8 @@ impl Fleet {
                  (SELECT count(*) FROM memory_conflicts WHERE tenant_id = $1) + \
                  (SELECT count(*) FROM memory_claims WHERE tenant_id = $1) + \
                  (SELECT count(*) FROM memory_chunks WHERE tenant_id = $1) + \
-                 (SELECT count(*) FROM memory_corpus_models WHERE tenant_id = $1)",
+                 (SELECT count(*) FROM memory_corpus_models WHERE tenant_id = $1) + \
+                 (SELECT count(*) FROM memory_conflict_lifecycle_events_v1 WHERE tenant_id = $1)",
         )
         .bind(self.tenant)
         .fetch_one(self.pool())
@@ -593,6 +762,10 @@ impl Fleet {
         assert_eq!(residue, 0, "lifecycle test leaked tenant rows");
     }
 }
+
+/// One lifecycle log row: `(seq, kind, episode_revision, result_revision,
+/// actor_kind, actor, operation, idempotency_key, payload)`.
+type LoggedEvent = (i64, String, i64, i64, String, String, String, String, Value);
 
 fn decision(subject: &str, value: &Value, polarity: i16) -> ClaimInput {
     ClaimInput {
@@ -628,7 +801,7 @@ fn note(text: &str) -> ClaimInput {
     }
 }
 
-fn refusal(result: ostk_fleet_recall::Result<ClaimMutation>) -> LifecycleRefusal {
+fn refusal<T: std::fmt::Debug>(result: ostk_fleet_recall::Result<T>) -> LifecycleRefusal {
     match result {
         Err(FleetError::LifecycleRefused(refusal)) => *refusal,
         other => panic!("expected a typed lifecycle refusal, got {other:?}"),
@@ -2759,6 +2932,1380 @@ async fn live_supersede_vs_concurrent_record_converges_when_configured() {
             assert_eq!(fleet.conflict(conflict_id).await.state, "resolved");
         }
     }
+    fleet.assert_lifecycle_invariants().await;
+
+    second.pool().close().await;
+    fleet.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Slice 3: the conflict lifecycle log (migration 29), acknowledge, concession
+// resolve, logged closes, and the lifecycle overlay and history.
+// ---------------------------------------------------------------------------
+
+/// A two-party conflict on `{subject}::database-choice`: A's x against B's y.
+async fn two_party(fleet: &Fleet, subject: &str) -> (ClaimMutation, ClaimMutation, i64) {
+    let x = fleet
+        .record(
+            AGENT_A,
+            &decision(subject, &json!("x"), 1),
+            &format!("{subject}/a/x"),
+        )
+        .await;
+    let y = fleet
+        .record(
+            AGENT_B,
+            &decision(subject, &json!("y"), 1),
+            &format!("{subject}/b/y"),
+        )
+        .await;
+    let conflict_id = y.claim.conflict_ids[0];
+    (x, y, conflict_id)
+}
+
+async fn get_conflict(
+    service: &CockroachMemoryService,
+    scope: &FleetScope,
+    conflict_id: i64,
+) -> RecallResult {
+    recall(
+        service,
+        scope,
+        RecallAction::Get,
+        json!({ "kind": "conflict", "id": conflict_id }),
+    )
+    .await
+    .expect("conflict lookup succeeds")
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one episode's acknowledgements from open through reopen
+async fn live_acknowledge_is_episode_bound_and_deduplicated_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "acknowledge").await;
+    let (x, _y, conflict_id) = two_party(&fleet, "acknowledge").await;
+    let before = fleet.conflict_row(conflict_id).await;
+    assert_eq!(before.0, "open");
+    let revision = before.1;
+
+    let first = fleet
+        .acknowledge(AGENT_A, conflict_id, revision, "a/ack")
+        .await
+        .expect("an implicated agent may acknowledge");
+    assert_eq!(first.operation, "acknowledge");
+    assert!(first.applied);
+    assert_eq!(first.status.as_deref(), Some("acknowledged"));
+    assert_eq!(
+        (first.conflict_state.as_str(), first.conflict_revision),
+        ("open", revision)
+    );
+    assert_eq!(first.member_count, 2);
+    let event = first
+        .lifecycle_event
+        .as_ref()
+        .expect("an acknowledged event");
+    assert_eq!(
+        (event.seq, event.kind.as_str(), event.actor.as_str()),
+        (1, "acknowledged", AGENT_A)
+    );
+    assert_eq!(
+        (event.episode_revision, event.result_revision),
+        (revision, revision)
+    );
+    assert_eq!(event.rationale.as_deref(), Some("agent-a is looking"));
+    // Acknowledgement is overlay metadata: the conflict row never changes.
+    assert_eq!(fleet.conflict_row(conflict_id).await, before);
+    assert_eq!(fleet.keyed_events("a/ack").await.len(), 1);
+    assert_eq!(
+        fleet.keyed_events("a/ack").await[0].0,
+        "conflict_acknowledged"
+    );
+
+    // A second acknowledgement of the same episode commits and changes nothing.
+    let again = fleet
+        .acknowledge(AGENT_A, conflict_id, revision, "a/ack-again")
+        .await
+        .unwrap();
+    assert!(!again.applied);
+    assert_eq!(again.status.as_deref(), Some("already_acknowledged"));
+    assert!(again.lifecycle_event.is_none());
+    assert_eq!(fleet.receipt_count("a/ack-again").await, 1);
+    assert_eq!(fleet.keyed_events("a/ack-again").await.len(), 1);
+    // The first key replays its stored result.
+    let replay = fleet
+        .acknowledge(AGENT_A, conflict_id, revision, "a/ack")
+        .await
+        .unwrap();
+    assert!(replay.idempotent_replay);
+    assert_eq!(
+        ConflictMutation {
+            idempotent_replay: false,
+            ..replay
+        },
+        first
+    );
+    // Other agents acknowledge the same episode independently.
+    for (agent, key) in [(AGENT_B, "b/ack"), (AGENT_C, "c/ack")] {
+        assert!(
+            fleet
+                .acknowledge(agent, conflict_id, revision, key)
+                .await
+                .unwrap()
+                .applied
+        );
+    }
+    assert_eq!(fleet.lifecycle_log(conflict_id).await.len(), 3);
+
+    // Refusals leave nothing behind and keep the key free.
+    let stale = refusal(
+        fleet
+            .acknowledge(AGENT_C, conflict_id, revision + 1, "c/stale")
+            .await,
+    );
+    assert_eq!(stale.code, RefusalCode::StaleRevision);
+    assert_eq!(stale.details["current_revision"], revision);
+    fleet.assert_key_unconsumed("c/stale").await;
+    let missing = refusal(
+        fleet
+            .acknowledge(AGENT_C, 9_007_199_254_740_990, 1, "c/missing")
+            .await,
+    );
+    assert_eq!(missing.code, RefusalCode::NotFound);
+    fleet.assert_key_unconsumed("c/missing").await;
+    let legacy_claim = fleet
+        .legacy_disputed_decision("acknowledge-legacy", "x", AGENT_A)
+        .await;
+    let legacy = fleet
+        .legacy_conflict("acknowledge-legacy::database-choice", &[legacy_claim])
+        .await;
+    let legacy_refusal = refusal(fleet.acknowledge(AGENT_C, legacy, 1, "c/legacy").await);
+    assert_eq!(legacy_refusal.code, RefusalCode::LegacyLineage);
+    fleet.assert_key_unconsumed("c/legacy").await;
+
+    // The overlay reads the episode's acknowledgers; the read side stays open.
+    let service = fleet.full_service(AGENT_C);
+    let scope = fleet.scope(AGENT_C);
+    let lookup = get_conflict(&service, &scope, conflict_id).await;
+    let lifecycle = &lookup.data["conflict"]["lifecycle"];
+    assert_eq!(lifecycle["state"], "acknowledged");
+    assert_eq!(lifecycle["read_side"], "open");
+    assert_eq!(lifecycle["episode_revision"], revision);
+    assert_eq!(
+        lifecycle["acknowledged_by"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|ack| ack["actor"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [AGENT_A, AGENT_B, AGENT_C]
+    );
+    assert_eq!(
+        lookup.conflict_coverage.details["lifecycle_overlay"],
+        "evaluated"
+    );
+
+    // A closed conflict cannot be acknowledged.
+    let x_revision = fleet.claim(x.claim.id).await.revision;
+    fleet
+        .retract(AGENT_A, x.claim.id, x_revision, "a/retract")
+        .await
+        .unwrap();
+    let closed = fleet.conflict_row(conflict_id).await;
+    assert_eq!(closed.0, "resolved");
+    let not_open = refusal(
+        fleet
+            .acknowledge(AGENT_B, conflict_id, closed.1, "b/closed")
+            .await,
+    );
+    assert_eq!(not_open.code, RefusalCode::NotOpen);
+    assert_eq!(not_open.details["current_state"], "resolved");
+    fleet.assert_key_unconsumed("b/closed").await;
+
+    // Once record reopens the lineage, the earlier acknowledgements belong
+    // to the previous episode and no longer apply.
+    fleet
+        .record(AGENT_C, &decision("acknowledge", &json!("z"), 1), "c/z")
+        .await;
+    let reopened = fleet.conflict_row(conflict_id).await;
+    assert_eq!(reopened.0, "open");
+    assert_eq!(reopened.1, closed.1 + 1);
+    let lookup = get_conflict(&service, &scope, conflict_id).await;
+    let lifecycle = &lookup.data["conflict"]["lifecycle"];
+    assert_eq!(lifecycle["state"], "open");
+    assert_eq!(lifecycle["episode_revision"], reopened.1);
+    assert_eq!(lifecycle["acknowledged_by"], json!([]));
+    let renewed = fleet
+        .acknowledge(AGENT_A, conflict_id, reopened.1, "a/ack-reopened")
+        .await
+        .unwrap();
+    assert!(renewed.applied, "a new episode takes a new acknowledgement");
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // concession outcomes and every refusal on one fixture
+async fn live_resolve_by_concession_closes_or_refuses_still_incompatible_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "concede").await;
+
+    // Two-party: B concedes y, so x is the only current value left.
+    let (x, y, conflict_id) = two_party(&fleet, "concede-two").await;
+    let view = fleet.conflict_view(conflict_id).await;
+    let x_before = fleet.claim(x.claim.id).await;
+    let y_before = fleet.claim(y.claim.id).await;
+
+    // Refusals first: each leaves every row and the key as they were.
+    let not_owner = refusal(
+        fleet
+            .resolve(AGENT_A, view, &[y.claim.id], "a/not-owner")
+            .await,
+    );
+    assert_eq!(not_owner.code, RefusalCode::NotOwner, "DISC-03");
+    assert_eq!(fleet.claim(y.claim.id).await, y_before);
+    fleet.assert_key_unconsumed("a/not-owner").await;
+    let stale_count = refusal(
+        fleet
+            .resolve(
+                AGENT_B,
+                (view.0, view.1, view.2 + 1),
+                &[y.claim.id],
+                "b/count",
+            )
+            .await,
+    );
+    assert_eq!(stale_count.code, RefusalCode::StaleMemberCount);
+    assert_eq!(stale_count.details["current_member_count"], view.2);
+    fleet.assert_key_unconsumed("b/count").await;
+    let stale_revision = refusal(
+        fleet
+            .resolve(
+                AGENT_B,
+                (view.0, view.1 + 1, view.2),
+                &[y.claim.id],
+                "b/revision",
+            )
+            .await,
+    );
+    assert_eq!(stale_revision.code, RefusalCode::StaleRevision);
+    fleet.assert_key_unconsumed("b/revision").await;
+    let elsewhere = fleet
+        .record(AGENT_B, &decision("concede-other", &json!("w"), 1), "b/w")
+        .await;
+    let not_member = refusal(
+        fleet
+            .resolve(AGENT_B, view, &[elsewhere.claim.id], "b/not-member")
+            .await,
+    );
+    assert_eq!(not_member.code, RefusalCode::NotMember);
+    fleet.assert_key_unconsumed("b/not-member").await;
+    // Re-verification alone cannot close a live incompatibility.
+    let live = refusal(fleet.resolve(AGENT_C, view, &[], "c/verify").await);
+    assert_eq!(live.code, RefusalCode::StillIncompatible);
+    assert_eq!(live.details["pairs"], json!([[x.claim.id, y.claim.id]]));
+    fleet.assert_key_unconsumed("c/verify").await;
+    // No refusal changed a claim, the conflict, or the log.
+    assert_eq!(fleet.claim(x.claim.id).await, x_before);
+    assert_eq!(fleet.claim(y.claim.id).await, y_before);
+    assert_eq!(fleet.conflict_view(conflict_id).await, view);
+    assert_eq!(fleet.conflict_row(conflict_id).await.0, "open");
+    assert!(fleet.lifecycle_log(conflict_id).await.is_empty());
+
+    let conceded = fleet
+        .resolve(AGENT_B, view, &[y.claim.id], "b/concede")
+        .await
+        .expect("the author concedes its own claim");
+    assert_eq!(conceded.operation, "resolve");
+    assert!(conceded.applied);
+    assert_eq!(conceded.conflict_state, "resolved");
+    assert_eq!(conceded.conflict_revision, view.1 + 1);
+    assert_eq!(conceded.claims_retracted, [y.claim.id]);
+    assert_eq!(conceded.claims_restored, [x.claim.id]);
+    assert_eq!(conceded.conflicts_resolved, [conflict_id]);
+    let event = conceded.lifecycle_event.as_ref().expect("a logged close");
+    assert_eq!(
+        (
+            event.kind.as_str(),
+            event.actor_kind.as_str(),
+            event.actor.as_str()
+        ),
+        ("resolved", "detector", "same_key_functional_value_v2")
+    );
+    assert_eq!(event.operation, "conflict_resolve");
+    assert_eq!(
+        event.reason_kind.as_deref(),
+        Some("no_current_incompatibility")
+    );
+    let payload = event.payload.as_ref().unwrap();
+    assert_eq!(payload["cause"]["agent"], AGENT_B);
+    assert_eq!(payload["cause"]["claims_retracted"], json!([y.claim.id]));
+    assert_eq!(payload["restored_claim_ids"], json!([x.claim.id]));
+    assert_eq!(fleet.claim(y.claim.id).await.state, ClaimState::Retracted);
+    assert_eq!(fleet.claim(x.claim.id).await.state, ClaimState::Active);
+    let row = fleet.conflict(conflict_id).await;
+    assert_eq!(row.state, "resolved");
+    assert_eq!(
+        row.resolution_kind.as_deref(),
+        Some("no_current_incompatibility")
+    );
+    assert_eq!(
+        row.resolution_reason.as_deref(),
+        Some(
+            format!(
+                "no lifecycle-current incompatible pair remains after concession retracting claims {}",
+                y.claim.id
+            )
+            .as_str()
+        )
+    );
+    let keyed = fleet.keyed_events("b/concede").await;
+    assert_eq!(keyed.len(), 1);
+    assert_eq!(keyed[0].0, "conflict_resolved");
+    let receipt_conflict: Option<i64> = sqlx::query_scalar(
+        "SELECT conflict_id FROM memory_mutation_receipts \
+         WHERE tenant_id = $1 AND idempotency_key = $2",
+    )
+    .bind(fleet.tenant)
+    .bind(fleet.key("b/concede"))
+    .fetch_one(fleet.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipt_conflict, Some(conflict_id));
+    // A retry after later changes returns the stored result.
+    let replay = fleet
+        .resolve(AGENT_B, view, &[y.claim.id], "b/concede")
+        .await
+        .unwrap();
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.claims_retracted, conceded.claims_retracted);
+
+    // Three-way: conceding x leaves y against z, so nothing changes at all.
+    let x3 = fleet
+        .record(AGENT_A, &decision("concede-three", &json!("x"), 1), "a/x3")
+        .await;
+    let y3 = fleet
+        .record(AGENT_B, &decision("concede-three", &json!("y"), 1), "b/y3")
+        .await;
+    let z3 = fleet
+        .record(AGENT_C, &decision("concede-three", &json!("z"), 1), "c/z3")
+        .await;
+    let three = y3.claim.conflict_ids[0];
+    let three_view = fleet.conflict_view(three).await;
+    assert_eq!(three_view.2, 3);
+    let conceded_before = fleet.claim(x3.claim.id).await;
+    let still = refusal(
+        fleet
+            .resolve(AGENT_A, three_view, &[x3.claim.id], "a/concede-three")
+            .await,
+    );
+    assert_eq!(still.code, RefusalCode::StillIncompatible);
+    assert_eq!(still.details["pair_count"], 1);
+    assert_eq!(still.details["pairs"], json!([[y3.claim.id, z3.claim.id]]));
+    assert_eq!(
+        fleet.claim(x3.claim.id).await,
+        conceded_before,
+        "rolled back"
+    );
+    assert_eq!(fleet.conflict_view(three).await, three_view);
+    assert!(fleet.lifecycle_log(three).await.is_empty());
+    fleet.assert_key_unconsumed("a/concede-three").await;
+
+    // When the data already agrees (here z stopped being current outside the
+    // lifecycle), any agent may have the detector verify and close.
+    sqlx::query(
+        "UPDATE memory_claims SET state = 'expired', revision = revision + 1 \
+         WHERE tenant_id = $1 AND project = $2 AND id = ANY($3)",
+    )
+    .bind(fleet.tenant)
+    .bind(&fleet.project)
+    .bind(vec![x3.claim.id, z3.claim.id])
+    .execute(fleet.pool())
+    .await
+    .unwrap();
+    let verified = fleet
+        .resolve(AGENT_C, three_view, &[], "c/verify-three")
+        .await
+        .expect("an uninvolved agent may trigger the verified close");
+    assert!(verified.claims_retracted.is_empty());
+    assert_eq!(verified.claims_restored, [y3.claim.id]);
+    assert_eq!(fleet.conflict_row(three).await.0, "resolved");
+    assert_eq!(
+        fleet.conflict(three).await.resolution_reason.as_deref(),
+        Some("no lifecycle-current incompatible pair remains on re-verification")
+    );
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}
+
+#[tokio::test]
+async fn live_derived_close_logs_detector_event_with_capability_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "derived-close").await;
+
+    // Retract through a ledger that holds the capability.
+    let (x, y, conflict_id) = two_party(&fleet, "derived-retract").await;
+    let revision = fleet.conflict_row(conflict_id).await.1;
+    let retracted = fleet
+        .conflict_ledger(AGENT_A)
+        .retract_claim(
+            &fleet.scope(AGENT_A),
+            ClaimTarget {
+                claim_id: x.claim.id,
+                expected_revision: fleet.claim(x.claim.id).await.revision,
+            },
+            Some("wrong database"),
+            &fleet.key("a/retract"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retracted.conflicts_resolved, [conflict_id]);
+    let log = fleet.lifecycle_log(conflict_id).await;
+    assert_eq!(log.len(), 1);
+    let (seq, kind, episode, result, actor_kind, actor, operation, key, payload) = &log[0];
+    assert_eq!((*seq, kind.as_str()), (1, "resolved"));
+    assert_eq!((*episode, *result), (revision, revision + 1));
+    assert_eq!(
+        (actor_kind.as_str(), actor.as_str(), operation.as_str()),
+        ("detector", "same_key_functional_value_v2", "retract")
+    );
+    assert_eq!(*key, fleet.key("a/retract"));
+    assert_eq!(payload["cause"]["agent"], AGENT_A);
+    assert_eq!(payload["cause"]["claims_retracted"], json!([x.claim.id]));
+    assert_eq!(payload["cause"]["reason"], "wrong database");
+    assert_eq!(payload["restored_claim_ids"], json!([y.claim.id]));
+    assert_eq!(payload["remaining_current_claim_ids"], json!([y.claim.id]));
+
+    // Supersede to the peer's value: the logged close names both claims.
+    let (predecessor, peer, supersede_conflict) = two_party(&fleet, "derived-supersede").await;
+    let successor = fleet
+        .conflict_ledger(AGENT_A)
+        .supersede_claim(
+            &fleet.scope(AGENT_A),
+            ClaimTarget {
+                claim_id: predecessor.claim.id,
+                expected_revision: fleet.claim(predecessor.claim.id).await.revision,
+            },
+            None,
+            &decision("derived-supersede", &json!("y"), 1),
+            &fleet.key("a/supersede"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(successor.conflicts_resolved, [supersede_conflict]);
+    let log = fleet.lifecycle_log(supersede_conflict).await;
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].6, "supersede");
+    assert_eq!(log[0].8["cause"]["claim_superseded"], predecessor.claim.id);
+    assert_eq!(log[0].8["cause"]["successor_claim_id"], successor.claim.id);
+    assert_eq!(log[0].8["restored_claim_ids"], json!([peer.claim.id]));
+
+    // Without the capability a close is audited in memory_events only, as
+    // before migration 29.
+    let (author, _, unlogged) = two_party(&fleet, "derived-unlogged").await;
+    fleet
+        .retract(
+            AGENT_A,
+            author.claim.id,
+            fleet.claim(author.claim.id).await.revision,
+            "a/retract-unlogged",
+        )
+        .await
+        .unwrap();
+    assert_eq!(fleet.conflict_row(unlogged).await.0, "resolved");
+    assert!(fleet.lifecycle_log(unlogged).await.is_empty());
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one conflict's log across a logged close and an unlogged reopen
+async fn live_overlay_and_history_report_unlogged_reopen_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "history").await;
+    let service = fleet.full_service(AGENT_C);
+    let scope = fleet.scope(AGENT_C);
+    let (x, y, conflict_id) = two_party(&fleet, "history").await;
+    let first = fleet.conflict_row(conflict_id).await.1;
+
+    fleet
+        .acknowledge(AGENT_A, conflict_id, first, "a/ack")
+        .await
+        .unwrap();
+    // A logged close by the author's retract...
+    fleet
+        .conflict_ledger(AGENT_A)
+        .retract_claim(
+            &fleet.scope(AGENT_A),
+            ClaimTarget {
+                claim_id: x.claim.id,
+                expected_revision: fleet.claim(x.claim.id).await.revision,
+            },
+            None,
+            &fleet.key("a/retract"),
+        )
+        .await
+        .unwrap();
+    // ...then an old-style reopen through record, which is never logged.
+    fleet
+        .record(AGENT_C, &decision("history", &json!("z"), 1), "c/z")
+        .await;
+    let reopened = fleet.conflict_row(conflict_id).await.1;
+    assert_eq!(reopened, first + 2);
+    fleet
+        .acknowledge(AGENT_B, conflict_id, reopened, "b/ack")
+        .await
+        .unwrap();
+
+    let lookup = get_conflict(&service, &scope, conflict_id).await;
+    let history = lookup.data["history"].as_array().unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .map(|event| (
+                event["seq"].as_i64().unwrap(),
+                event["kind"].as_str().unwrap(),
+                event["episode_revision"].as_i64().unwrap(),
+                event["result_revision"].as_i64().unwrap(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (1, "acknowledged", first, first),
+            (2, "resolved", first, first + 1),
+            (3, "acknowledged", reopened, reopened),
+        ]
+    );
+    assert_eq!(
+        history[1]["payload"]["cause"]["claims_retracted"],
+        json!([x.claim.id])
+    );
+    assert!(history[0].get("idempotency_key").is_none());
+    assert_eq!(lookup.data["history_truncated"], false);
+    assert_eq!(
+        lookup.data["unlogged_transitions"],
+        json!([{ "from_revision": first + 1, "to_revision": reopened }])
+    );
+    let lifecycle = &lookup.data["conflict"]["lifecycle"];
+    assert_eq!(lifecycle["state"], "acknowledged");
+    assert_eq!(lifecycle["acknowledged_by"][0]["actor"], AGENT_B);
+    assert_eq!(lookup.conflicts[0]["lifecycle"], *lifecycle);
+
+    // A conflict closed without the log reads clear and reports the gap.
+    let (u, _v, unlogged) = two_party(&fleet, "history-unlogged").await;
+    fleet
+        .retract(
+            AGENT_A,
+            u.claim.id,
+            fleet.claim(u.claim.id).await.revision,
+            "a/retract-unlogged",
+        )
+        .await
+        .unwrap();
+    let closed = get_conflict(&service, &scope, unlogged).await;
+    let lifecycle = &closed.data["conflict"]["lifecycle"];
+    assert_eq!(lifecycle["state"], "resolved");
+    assert_eq!(lifecycle["read_side"], "clear");
+    assert_eq!(lifecycle["closed_unlogged"], true);
+    assert_eq!(lifecycle["closed_by"], Value::Null);
+    assert_eq!(closed.data["history"], json!([]));
+    assert_eq!(
+        closed.data["unlogged_transitions"],
+        json!([{ "from_revision": 1, "to_revision": 2 }])
+    );
+
+    // Every read path on the private writer carries the overlay.
+    let listed = recall(
+        &service,
+        &scope,
+        RecallAction::Conflicts,
+        json!({ "include_resolved": true, "limit": 10 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        listed.conflict_coverage.details["lifecycle_overlay"],
+        "evaluated"
+    );
+    let by_id = |id: i64| {
+        listed
+            .conflicts
+            .iter()
+            .find(|conflict| conflict["id"] == id)
+            .unwrap_or_else(|| panic!("conflict {id} is listed"))
+            .clone()
+    };
+    assert_eq!(by_id(conflict_id)["lifecycle"]["state"], "acknowledged");
+    assert_eq!(by_id(unlogged)["lifecycle"]["state"], "resolved");
+    let claim = recall(
+        &service,
+        &scope,
+        RecallAction::Get,
+        json!({ "kind": "claim", "id": y.claim.id }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(claim.conflicts[0]["lifecycle"]["state"], "acknowledged");
+    let search = recall(
+        &service,
+        &scope,
+        RecallAction::Search,
+        json!({ "query": "history", "kind": "claim", "limit": 10 }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        search
+            .conflicts
+            .iter()
+            .any(|conflict| conflict["lifecycle"]["state"] == "acknowledged")
+    );
+    assert_eq!(
+        search.conflict_coverage.details["lifecycle_overlay"],
+        "evaluated"
+    );
+    let chunks = recall(
+        &service,
+        &scope,
+        RecallAction::Search,
+        json!({ "query": "history", "kind": "chunk", "limit": 10 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        chunks.conflict_coverage.details["lifecycle_overlay"],
+        "evaluated"
+    );
+    assert!(
+        chunks
+            .conflicts
+            .iter()
+            .all(|conflict| conflict.get("lifecycle").is_some())
+    );
+
+    // So do remember responses, and the acknowledge response itself.
+    let remembered = FleetMemoryService::remember(
+        &service,
+        scope.clone(),
+        RememberRequest::new(
+            RememberAction::Acknowledge,
+            Some(fleet.key("c/ack-service")),
+            Map::from_iter([
+                ("conflict_id".into(), json!(conflict_id)),
+                ("expected_revision".into(), json!(reopened)),
+            ]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(remembered.data["applied"], true);
+    assert_eq!(
+        remembered.conflicts[0]["lifecycle"]["acknowledged_by"][1]["actor"],
+        AGENT_C
+    );
+    assert_eq!(remembered.conflict_coverage.status, "complete");
+    assert_eq!(
+        remembered.conflict_coverage.details["lifecycle_overlay"],
+        "evaluated"
+    );
+    let recorded = FleetMemoryService::remember(
+        &service,
+        scope.clone(),
+        RememberRequest::new(
+            RememberAction::Record,
+            Some(fleet.key("c/w")),
+            serde_json::to_value(decision("history", &json!("w"), 1))
+                .unwrap()
+                .as_object()
+                .cloned()
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recorded.conflicts[0]["lifecycle"]["state"], "acknowledged");
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // publication, record-only, and unprobed writers over one log
+async fn live_publication_and_unprobed_writers_are_unchanged_with_lifecycle_rows_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "unchanged").await;
+    let (x, _y, conflict_id) = two_party(&fleet, "unchanged").await;
+    let revision = fleet.conflict_row(conflict_id).await.1;
+    fleet
+        .acknowledge(AGENT_A, conflict_id, revision, "a/ack")
+        .await
+        .unwrap();
+    let scope = fleet.scope(AGENT_A);
+    let lifecycle_rows = fleet.tenant_lifecycle_rows().await;
+    assert_eq!(lifecycle_rows, 1);
+
+    // The publication surface and a writer whose probe found no lifecycle
+    // log (PRIVATE_WRITER) never show a lifecycle key or overlay coverage.
+    for (label, serving) in [
+        ("record-only", LifecycleServing::default()),
+        ("unprobed", PRIVATE_WRITER),
+    ] {
+        let service = fleet.service(AGENT_A, serving);
+        for (action, arguments) in [
+            (RecallAction::Conflicts, json!({ "include_resolved": true })),
+            (
+                RecallAction::Get,
+                json!({ "kind": "claim", "id": x.claim.id }),
+            ),
+            (
+                RecallAction::Search,
+                json!({ "query": "unchanged", "kind": "chunk" }),
+            ),
+            (
+                RecallAction::Search,
+                json!({ "query": "unchanged", "kind": "claim" }),
+            ),
+        ] {
+            let result = recall(&service, &scope, action, arguments.clone())
+                .await
+                .unwrap();
+            assert!(!result.conflicts.is_empty(), "{arguments}");
+            assert!(
+                result
+                    .conflicts
+                    .iter()
+                    .all(|conflict| conflict.get("lifecycle").is_none()),
+                "{serving:?} {arguments}"
+            );
+            assert!(
+                result
+                    .conflict_coverage
+                    .details
+                    .get("lifecycle_overlay")
+                    .is_none()
+            );
+            assert!(
+                !serde_json::to_string(&result.data)
+                    .unwrap()
+                    .contains("lifecycle\"")
+            );
+        }
+        let status = recall(&service, &scope, RecallAction::Status, json!({}))
+            .await
+            .unwrap();
+        if serving == PRIVATE_WRITER {
+            assert_eq!(status.data["remember_surface"]["conflict_lifecycle"], false);
+        } else {
+            assert!(status.data.get("remember_surface").is_none());
+        }
+        // Neither surface serves the conflict actions; an unused key stays free.
+        let unserved = format!("a/unserved-{label}");
+        let refused = FleetMemoryService::remember(
+            &service,
+            scope.clone(),
+            RememberRequest::new(
+                RememberAction::Acknowledge,
+                Some(fleet.key(&unserved)),
+                Map::from_iter([
+                    ("conflict_id".into(), json!(conflict_id)),
+                    ("expected_revision".into(), json!(revision)),
+                ]),
+            ),
+        )
+        .await;
+        assert_eq!(refusal_code(refused), "lifecycle_unavailable");
+        fleet.assert_key_unconsumed(&unserved).await;
+    }
+
+    // A committed acknowledgement still replays where it is no longer served.
+    let unprobed = fleet.service(AGENT_A, PRIVATE_WRITER);
+    let replay = FleetMemoryService::remember(
+        &unprobed,
+        scope.clone(),
+        RememberRequest::new(
+            RememberAction::Acknowledge,
+            Some(fleet.key("a/ack")),
+            Map::from_iter([
+                ("conflict_id".into(), json!(conflict_id)),
+                ("expected_revision".into(), json!(revision)),
+                ("reason".into(), json!("agent-a is looking")),
+            ]),
+        ),
+    )
+    .await
+    .expect("a committed acknowledgement replays");
+    assert_eq!(replay.data["idempotent_replay"], true);
+    assert_eq!(replay.data["applied"], true);
+    assert!(replay.conflicts[0].get("lifecycle").is_none());
+
+    // A ledger without the capability refuses before writing anything, and
+    // its closes add nothing to the log.
+    let unprobed_ledger = fleet.ledger(AGENT_B);
+    let refused = unprobed_ledger
+        .acknowledge_conflict(
+            &fleet.scope(AGENT_B),
+            ConflictTarget {
+                conflict_id,
+                expected_revision: revision,
+                expected_member_count: None,
+            },
+            None,
+            &fleet.key("b/unprobed"),
+        )
+        .await;
+    assert_eq!(refusal(refused).code, RefusalCode::LifecycleUnavailable);
+    fleet.assert_key_unconsumed("b/unprobed").await;
+    fleet
+        .retract(
+            AGENT_A,
+            x.claim.id,
+            fleet.claim(x.claim.id).await.revision,
+            "a/retract",
+        )
+        .await
+        .unwrap();
+    assert_eq!(fleet.conflict_row(conflict_id).await.0, "resolved");
+    assert_eq!(fleet.tenant_lifecycle_rows().await, lifecycle_rows);
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}
+
+/// Grant `role` the runtime writer's table, sequence, schema, and database
+/// privileges, without the lifecycle log.
+async fn grant_runtime_matrix(fleet: &Fleet, role: &str) {
+    for (privilege, tables) in RUNTIME_GRANTS {
+        sqlx::query(&format!(
+            "GRANT {privilege} ON TABLE {} TO {role}",
+            qualified(tables)
+        ))
+        .execute(fleet.pool())
+        .await
+        .unwrap();
+    }
+    for statement in [
+        format!("GRANT CONNECT ON DATABASE fleet_recall TO {role}"),
+        format!("GRANT USAGE ON SCHEMA public TO {role}"),
+        format!(
+            "GRANT USAGE ON SEQUENCE {} TO {role}",
+            qualified(RUNTIME_SEQUENCES)
+        ),
+    ] {
+        sqlx::query(&statement).execute(fleet.pool()).await.unwrap();
+    }
+}
+
+async fn create_probe_role(fleet: &Fleet, label: &str) -> (String, String) {
+    let role = format!("lifecycle_{label}_{}", Uuid::now_v7().simple());
+    let password = format!("probe-{}", Uuid::now_v7().simple());
+    sqlx::query(&format!(
+        "CREATE ROLE {role} WITH LOGIN PASSWORD '{password}'"
+    ))
+    .execute(fleet.pool())
+    .await
+    .unwrap();
+    (role, password)
+}
+
+async fn drop_probe_role(fleet: &Fleet, role: &str) {
+    let mut tables = RUNTIME_GRANTS
+        .iter()
+        .flat_map(|(_, tables)| tables.iter().copied())
+        .chain(PUBLICATION_READ_TABLES)
+        .chain(["memory_conflict_lifecycle_events_v1"])
+        .collect::<Vec<_>>();
+    tables.sort_unstable();
+    tables.dedup();
+    for statement in [
+        format!("REVOKE ALL ON TABLE {} FROM {role}", qualified(&tables)),
+        format!(
+            "REVOKE ALL ON SEQUENCE {} FROM {role}",
+            qualified(RUNTIME_SEQUENCES)
+        ),
+        format!("REVOKE ALL ON SCHEMA public FROM {role}"),
+        format!("REVOKE ALL ON DATABASE fleet_recall FROM {role}"),
+        format!("DROP ROLE IF EXISTS {role}"),
+    ] {
+        sqlx::query(&statement).execute(fleet.pool()).await.unwrap();
+    }
+}
+
+async fn probe_pool(database_url: &str, role: &str, password: &str) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&probe_database_url(database_url, role, password))
+        .await
+        .expect("the probe role connects")
+}
+
+fn sqlstate(error: &sqlx::Error) -> Option<String> {
+    match error {
+        sqlx::Error::Database(error) => error.code().map(std::borrow::Cow::into_owned),
+        _ => None,
+    }
+}
+
+/// Every lifecycle action and read, under exactly the probed role's grants.
+#[allow(clippy::too_many_lines)] // the whole lifecycle surface under one role
+async fn run_conflict_lifecycle_as(
+    fleet: &Fleet,
+    pool: &PgPool,
+    capability: ConflictLifecycleCapability,
+) -> Result<(), String> {
+    let ledger = |agent| {
+        fleet
+            .ledger_on(pool, agent, RetryPolicy::default())
+            .with_conflict_lifecycle(capability)
+    };
+    let record = |agent: &'static str, subject: &'static str, value: &'static str| {
+        let ledger = ledger(agent);
+        let scope = fleet.scope(agent);
+        let key = fleet.key(&format!("probe/{agent}/{subject}/{value}"));
+        async move {
+            ledger
+                .record_claim(&scope, &decision(subject, &json!(value), 1), &key)
+                .await
+                .map_err(|error| format!("probe record: {error}"))
+        }
+    };
+    let x = record(AGENT_A, "probe-concede", "x").await?;
+    let y = record(AGENT_B, "probe-concede", "y").await?;
+    let conflict_id = y.claim.conflict_ids[0];
+    let view = fleet.conflict_view(conflict_id).await;
+    let target = |expected_member_count| ConflictTarget {
+        conflict_id,
+        expected_revision: view.1,
+        expected_member_count,
+    };
+    let acknowledged = ledger(AGENT_C)
+        .acknowledge_conflict(
+            &fleet.scope(AGENT_C),
+            target(None),
+            None,
+            &fleet.key("probe/ack"),
+        )
+        .await
+        .map_err(|error| format!("probe acknowledge: {error}"))?;
+    if !acknowledged.applied {
+        return Err(format!("probe acknowledge did not apply: {acknowledged:?}"));
+    }
+    let resolved = ledger(AGENT_B)
+        .resolve_conflict(
+            &fleet.scope(AGENT_B),
+            target(Some(view.2)),
+            &[y.claim.id],
+            None,
+            &fleet.key("probe/resolve"),
+        )
+        .await
+        .map_err(|error| format!("probe resolve: {error}"))?;
+    if resolved.claims_restored != [x.claim.id] {
+        return Err(format!("probe resolve did not restore: {resolved:?}"));
+    }
+    let history = ledger(AGENT_C)
+        .conflict_lifecycle_history(&fleet.scope(AGENT_C), conflict_id)
+        .await
+        .map_err(|error| format!("probe history: {error}"))?;
+    if history.events.len() != 2 {
+        return Err(format!("probe history is incomplete: {history:?}"));
+    }
+    let overlay = ledger(AGENT_C)
+        .conflict_lifecycle_rows(&fleet.scope(AGENT_C), &[(conflict_id, view.1)])
+        .await
+        .map_err(|error| format!("probe overlay: {error}"))?;
+    if overlay.events.get(&conflict_id).map(Vec::len) != Some(2) {
+        return Err(format!("probe overlay is incomplete: {overlay:?}"));
+    }
+    // Logged closes from retract and supersede under the same grants.
+    let p = record(AGENT_A, "probe-retract", "x").await?;
+    record(AGENT_B, "probe-retract", "y").await?;
+    let retracted = ledger(AGENT_A)
+        .retract_claim(
+            &fleet.scope(AGENT_A),
+            ClaimTarget {
+                claim_id: p.claim.id,
+                expected_revision: fleet.claim(p.claim.id).await.revision,
+            },
+            None,
+            &fleet.key("probe/retract"),
+        )
+        .await
+        .map_err(|error| format!("probe retract: {error}"))?;
+    let s = record(AGENT_A, "probe-supersede", "x").await?;
+    record(AGENT_B, "probe-supersede", "y").await?;
+    let superseded = ledger(AGENT_A)
+        .supersede_claim(
+            &fleet.scope(AGENT_A),
+            ClaimTarget {
+                claim_id: s.claim.id,
+                expected_revision: fleet.claim(s.claim.id).await.revision,
+            },
+            None,
+            &decision("probe-supersede", &json!("y"), 1),
+            &fleet.key("probe/supersede"),
+        )
+        .await
+        .map_err(|error| format!("probe supersede: {error}"))?;
+    for (label, closed) in [
+        ("retract", &retracted.conflicts_resolved),
+        ("supersede", &superseded.conflicts_resolved),
+    ] {
+        let [conflict] = closed.as_slice() else {
+            return Err(format!("probe {label} did not close: {closed:?}"));
+        };
+        if fleet.lifecycle_log(*conflict).await.len() != 1 {
+            return Err(format!("probe {label} close was not logged"));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // probe outcomes across grant sets, then every action under them
+async fn live_capability_probe_false_without_grants_true_with_them_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "capability").await;
+    let capabilities = fleet.store.capabilities().await.unwrap();
+    assert!(capabilities.supports_schema_version(CONFLICT_LIFECYCLE_SCHEMA_VERSION));
+    // A schema before migration 29 is never probed.
+    let mut before_29 = capabilities.clone();
+    before_29.schema_version = CONFLICT_LIFECYCLE_SCHEMA_VERSION - 1;
+    assert!(
+        probe_conflict_lifecycle(fleet.pool(), &before_29)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let (role, password) = create_probe_role(&fleet, "capability").await;
+    let outcome = AssertUnwindSafe(async {
+        // The runtime grants of a policy applied before migration 29.
+        grant_runtime_matrix(&fleet, &role).await;
+        let pool = probe_pool(&database_url, &role, &password).await;
+        let without = probe_conflict_lifecycle(&pool, &capabilities).await;
+        pool.close().await;
+        assert!(
+            matches!(without, Ok(None)),
+            "no lifecycle grants: {without:?}"
+        );
+
+        // SELECT alone is not enough to append.
+        sqlx::query(&format!(
+            "GRANT SELECT ON TABLE public.memory_conflict_lifecycle_events_v1 TO {role}"
+        ))
+        .execute(fleet.pool())
+        .await
+        .unwrap();
+        let pool = probe_pool(&database_url, &role, &password).await;
+        let select_only = probe_conflict_lifecycle(&pool, &capabilities).await;
+        pool.close().await;
+        assert!(matches!(select_only, Ok(None)), "{select_only:?}");
+
+        // The 49-row runtime policy: SELECT and INSERT.
+        sqlx::query(&format!(
+            "GRANT INSERT ON TABLE public.memory_conflict_lifecycle_events_v1 TO {role}"
+        ))
+        .execute(fleet.pool())
+        .await
+        .unwrap();
+        let pool = probe_pool(&database_url, &role, &password).await;
+        let capability = probe_conflict_lifecycle(&pool, &capabilities)
+            .await
+            .expect("the probe runs")
+            .expect("the 49-row policy may use the lifecycle log");
+        // The probe wrote nothing.
+        assert_eq!(fleet.tenant_lifecycle_rows().await, 0);
+        let actions = run_conflict_lifecycle_as(&fleet, &pool, capability).await;
+        pool.close().await;
+        actions
+    })
+    .catch_unwind()
+    .await;
+    drop_probe_role(&fleet, &role).await;
+    let outcome = outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    fleet.assert_lifecycle_invariants().await;
+    fleet.cleanup().await;
+    outcome.unwrap();
+}
+
+#[tokio::test]
+async fn live_lifecycle_log_is_append_only_and_private_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "append-only").await;
+    let (_x, _y, conflict_id) = two_party(&fleet, "append-only").await;
+    let revision = fleet.conflict_row(conflict_id).await.1;
+    fleet
+        .acknowledge(AGENT_A, conflict_id, revision, "a/ack")
+        .await
+        .unwrap();
+
+    let (runtime, runtime_password) = create_probe_role(&fleet, "runtime").await;
+    let (reader, reader_password) = create_probe_role(&fleet, "reader").await;
+    let outcome = AssertUnwindSafe(async {
+        grant_runtime_matrix(&fleet, &runtime).await;
+        sqlx::query(&format!(
+            "GRANT SELECT, INSERT ON TABLE public.memory_conflict_lifecycle_events_v1 TO {runtime}"
+        ))
+        .execute(fleet.pool())
+        .await
+        .unwrap();
+        // The publication reader's exact table surface.
+        for statement in [
+            format!(
+                "GRANT SELECT ON TABLE {} TO {reader}",
+                qualified(&PUBLICATION_READ_TABLES)
+            ),
+            format!("GRANT CONNECT ON DATABASE fleet_recall TO {reader}"),
+            format!("GRANT USAGE ON SCHEMA public TO {reader}"),
+        ] {
+            sqlx::query(&statement).execute(fleet.pool()).await.unwrap();
+        }
+
+        let runtime_pool = probe_pool(&database_url, &runtime, &runtime_password).await;
+        let visible: i64 = sqlx::query_scalar(
+            "SELECT count(*)::INT8 FROM public.memory_conflict_lifecycle_events_v1 \
+             WHERE tenant_id = $1",
+        )
+        .bind(fleet.tenant)
+        .fetch_one(&runtime_pool)
+        .await
+        .expect("the runtime reads the log");
+        assert_eq!(visible, 1);
+        for statement in [
+            "UPDATE public.memory_conflict_lifecycle_events_v1 SET rationale = 'rewritten' \
+             WHERE tenant_id = $1",
+            "DELETE FROM public.memory_conflict_lifecycle_events_v1 WHERE tenant_id = $1",
+        ] {
+            let error = sqlx::query(statement)
+                .bind(fleet.tenant)
+                .execute(&runtime_pool)
+                .await
+                .expect_err("the log is append-only for the runtime");
+            assert_eq!(sqlstate(&error).as_deref(), Some("42501"), "{statement}");
+        }
+        runtime_pool.close().await;
+
+        let reader_pool = probe_pool(&database_url, &reader, &reader_password).await;
+        let error = sqlx::query("SELECT 1 FROM public.memory_conflict_lifecycle_events_v1 LIMIT 1")
+            .fetch_optional(&reader_pool)
+            .await
+            .expect_err("the publication reader never sees the log");
+        assert_eq!(sqlstate(&error).as_deref(), Some("42501"));
+        reader_pool.close().await;
+    })
+    .catch_unwind()
+    .await;
+    drop_probe_role(&fleet, &runtime).await;
+    drop_probe_role(&fleet, &reader).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    assert_eq!(fleet.lifecycle_log(conflict_id).await.len(), 1);
+    fleet.cleanup().await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConcessionRace {
+    /// The concession committed first; the racing record reopened the lineage.
+    ConcededThenReopened,
+    /// The record joined first; the concession saw a stale member count.
+    JoinedFirst,
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // three race shapes share one fixture and one invariant check
+async fn live_concurrent_conflict_lifecycle_serializes_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "lifecycle-race").await;
+    let second = CockroachStore::connect(
+        &database_url,
+        fleet.scope(AGENT_B),
+        PoolConfig {
+            max_connections: 8,
+            ..PoolConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let policy = RetryPolicy {
+        max_attempts: 32,
+        ..RetryPolicy::default()
+    };
+    let on = |pool: &PgPool, agent| {
+        fleet
+            .ledger_on(pool, agent, policy)
+            .with_conflict_lifecycle(fleet.conflict_lifecycle)
+    };
+    let (author_a, author_b) = (on(fleet.pool(), AGENT_A), on(second.pool(), AGENT_B));
+    let (author_c, author_a2) = (on(second.pool(), AGENT_C), on(second.pool(), AGENT_A));
+    let (scope_a, scope_b, scope_c) = (
+        fleet.scope(AGENT_A),
+        fleet.scope(AGENT_B),
+        fleet.scope(AGENT_C),
+    );
+    let mut outcomes = Vec::new();
+
+    for round in 0..30 {
+        let subject = format!("lifecycle-race-{round}");
+        let (x, y, conflict_id) = two_party(&fleet, &subject).await;
+        let view = fleet.conflict_view(conflict_id).await;
+        let target = |expected_member_count| ConflictTarget {
+            conflict_id,
+            expected_revision: view.1,
+            expected_member_count,
+        };
+        let barrier = Barrier::new(2);
+        match round % 3 {
+            0 => {
+                // B concedes y while C records a third value. Record does
+                // more work before its lineage lock, so every other round
+                // starts the concession late to let the join land first.
+                let stagger = Duration::from_millis(if round % 6 == 3 { 250 } else { 0 });
+                let concede = async {
+                    barrier.wait().await;
+                    tokio::time::sleep(stagger).await;
+                    author_b
+                        .resolve_conflict(
+                            &scope_b,
+                            target(Some(view.2)),
+                            &[y.claim.id],
+                            None,
+                            &fleet.key(&format!("{round}/concede")),
+                        )
+                        .await
+                };
+                let record_z = async {
+                    barrier.wait().await;
+                    author_c
+                        .record_claim(
+                            &scope_c,
+                            &decision(&subject, &json!("z"), 1),
+                            &fleet.key(&format!("{round}/z")),
+                        )
+                        .await
+                };
+                let (conceded, recorded) = tokio::join!(concede, record_z);
+                let z = recorded.expect("the racing record commits");
+                let outcome = match conceded {
+                    Ok(mutation) => {
+                        assert_eq!(mutation.claims_retracted, [y.claim.id]);
+                        assert_eq!(fleet.claim(y.claim.id).await.state, ClaimState::Retracted);
+                        ConcessionRace::ConcededThenReopened
+                    }
+                    Err(FleetError::LifecycleRefused(refusal))
+                        if refusal.code == RefusalCode::StaleMemberCount =>
+                    {
+                        assert_eq!(fleet.claim(y.claim.id).await.state, ClaimState::Disputed);
+                        ConcessionRace::JoinedFirst
+                    }
+                    Err(error) => panic!("round {round}: unexpected concession failure: {error}"),
+                };
+                outcomes.push(outcome);
+                // Either order leaves x and z disagreeing in the open lineage.
+                assert_eq!(fleet.conflict_row(conflict_id).await.0, "open");
+                assert_eq!(fleet.claim(x.claim.id).await.state, ClaimState::Disputed);
+                assert_eq!(fleet.claim(z.claim.id).await.state, ClaimState::Disputed);
+            }
+            1 => {
+                // The same agent acknowledges twice at once under two keys.
+                let first = async {
+                    barrier.wait().await;
+                    author_a
+                        .acknowledge_conflict(
+                            &scope_a,
+                            target(None),
+                            None,
+                            &fleet.key(&format!("{round}/ack-1")),
+                        )
+                        .await
+                };
+                let again = async {
+                    barrier.wait().await;
+                    author_a2
+                        .acknowledge_conflict(
+                            &scope_a,
+                            target(None),
+                            None,
+                            &fleet.key(&format!("{round}/ack-2")),
+                        )
+                        .await
+                };
+                let (first, again) = tokio::join!(first, again);
+                let applied = [first.unwrap(), again.unwrap()]
+                    .iter()
+                    .filter(|mutation| mutation.applied)
+                    .count();
+                assert_eq!(applied, 1, "round {round}: one acknowledgement per episode");
+                assert_eq!(fleet.lifecycle_log(conflict_id).await.len(), 1);
+            }
+            _ => {
+                // C acknowledges while B concedes: the acknowledgement either
+                // lands in the open episode or is refused as not open.
+                let acknowledge = async {
+                    barrier.wait().await;
+                    author_c
+                        .acknowledge_conflict(
+                            &scope_c,
+                            target(None),
+                            None,
+                            &fleet.key(&format!("{round}/ack")),
+                        )
+                        .await
+                };
+                let concede = async {
+                    barrier.wait().await;
+                    author_b
+                        .resolve_conflict(
+                            &scope_b,
+                            target(Some(view.2)),
+                            &[y.claim.id],
+                            None,
+                            &fleet.key(&format!("{round}/concede")),
+                        )
+                        .await
+                };
+                let (acknowledged, conceded) = tokio::join!(acknowledge, concede);
+                conceded.expect("an acknowledgement never blocks a concession");
+                let log = fleet.lifecycle_log(conflict_id).await;
+                match acknowledged {
+                    Ok(mutation) => {
+                        assert!(mutation.applied);
+                        assert_eq!(
+                            log.iter().map(|event| event.1.as_str()).collect::<Vec<_>>(),
+                            ["acknowledged", "resolved"]
+                        );
+                    }
+                    Err(FleetError::LifecycleRefused(refusal))
+                        if refusal.code == RefusalCode::NotOpen =>
+                    {
+                        assert_eq!(log.len(), 1);
+                        assert_eq!(log[0].1, "resolved");
+                    }
+                    Err(error) => panic!("round {round}: unexpected acknowledge failure: {error}"),
+                }
+                assert_eq!(fleet.conflict_row(conflict_id).await.0, "resolved");
+            }
+        }
+    }
+    assert!(!outcomes.is_empty());
     fleet.assert_lifecycle_invariants().await;
 
     second.pool().close().await;

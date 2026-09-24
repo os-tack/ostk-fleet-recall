@@ -62,6 +62,9 @@ pub enum RememberAction {
     Focus,
     Track,
     Consolidate,
+    /// Acknowledge the current episode of a conflict (ADR 0004). Overlay
+    /// metadata only: it never changes the conflict or any claim.
+    Acknowledge,
 }
 
 impl RememberAction {
@@ -80,6 +83,7 @@ impl RememberAction {
             Self::Focus => "focus",
             Self::Track => "track",
             Self::Consolidate => "consolidate",
+            Self::Acknowledge => "acknowledge",
         }
     }
 }
@@ -262,11 +266,16 @@ pub type ServiceResult<T> = std::result::Result<T, ServiceError>;
 pub struct RememberSurface {
     /// Owner lifecycle of authored claims (`retract` and `supersede`).
     pub claim_lifecycle: bool,
+    /// Conflict lifecycle (`acknowledge` and concession `resolve`), served
+    /// only when the startup probe found the migration-29 lifecycle log and
+    /// its grants.
+    pub conflict_lifecycle: bool,
 }
 
 impl RememberSurface {
     pub const RECORD_ONLY: Self = Self {
         claim_lifecycle: false,
+        conflict_lifecycle: false,
     };
 
     /// Whether this surface serves `action`. `record` is always served; the
@@ -276,6 +285,7 @@ impl RememberSurface {
         match action {
             RememberAction::Record => true,
             RememberAction::Retract | RememberAction::Supersede => self.claim_lifecycle,
+            RememberAction::Acknowledge | RememberAction::Resolve => self.conflict_lifecycle,
             _ => false,
         }
     }
@@ -288,7 +298,10 @@ impl RememberSurface {
 pub fn authorize_surface(surface: RememberSurface, action: RememberAction) -> ServiceResult<()> {
     let lifecycle_action = matches!(
         action,
-        RememberAction::Retract | RememberAction::Supersede | RememberAction::Resolve
+        RememberAction::Retract
+            | RememberAction::Supersede
+            | RememberAction::Resolve
+            | RememberAction::Acknowledge
     );
     if !lifecycle_action || surface.allows(action) {
         return Ok(());
@@ -397,6 +410,7 @@ mod tests {
             RememberAction::Retract,
             RememberAction::Supersede,
             RememberAction::Resolve,
+            RememberAction::Acknowledge,
         ] {
             let Err(ServiceError::Refused(refusal)) =
                 authorize_surface(RememberSurface::RECORD_ONLY, action)
@@ -411,13 +425,28 @@ mod tests {
         }
         let lifecycle = RememberSurface {
             claim_lifecycle: true,
+            ..RememberSurface::RECORD_ONLY
         };
         assert!(authorize_surface(lifecycle, RememberAction::Retract).is_ok());
         assert!(authorize_surface(lifecycle, RememberAction::Supersede).is_ok());
-        // Conflict resolve is not served by this surface yet.
-        assert!(authorize_surface(lifecycle, RememberAction::Resolve).is_err());
+        // The conflict actions need the probed conflict-lifecycle capability.
+        for action in [RememberAction::Resolve, RememberAction::Acknowledge] {
+            assert!(authorize_surface(lifecycle, action).is_err());
+        }
+        let conflicts = RememberSurface {
+            conflict_lifecycle: true,
+            ..lifecycle
+        };
+        for action in [
+            RememberAction::Retract,
+            RememberAction::Supersede,
+            RememberAction::Resolve,
+            RememberAction::Acknowledge,
+        ] {
+            assert!(authorize_surface(conflicts, action).is_ok());
+        }
         // Record and non-lifecycle actions keep their own dispatch outcome.
-        for surface in [RememberSurface::RECORD_ONLY, lifecycle] {
+        for surface in [RememberSurface::RECORD_ONLY, lifecycle, conflicts] {
             for action in [
                 RememberAction::Record,
                 RememberAction::Assert,

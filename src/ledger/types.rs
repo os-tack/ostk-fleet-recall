@@ -448,6 +448,11 @@ pub struct Conflict {
     /// diagnostics, so it never appears in the public conflict envelope.
     #[serde(skip)]
     pub(crate) trigger_claim_ids: Vec<i64>,
+    /// The serving lifecycle overlay (ADR 0004), attached only on the private
+    /// writer after a separate post-read. Absent everywhere else, so
+    /// publication bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<ConflictLifecycleOverlay>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -502,6 +507,181 @@ pub enum LifecycleReplayRequest<'a> {
         reason: Option<&'a str>,
         successor: &'a ClaimInput,
     },
+    Acknowledge {
+        target: ConflictTarget,
+        reason: Option<&'a str>,
+    },
+    Resolve {
+        target: ConflictTarget,
+        retract_claim_ids: &'a [i64],
+        reason: Option<&'a str>,
+    },
+}
+
+/// A replayed lifecycle result: a claim mutation for `retract`/`supersede`,
+/// a conflict mutation for `acknowledge`/`resolve`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LifecycleMutation {
+    Claim(ClaimMutation),
+    Conflict(ConflictMutation),
+}
+
+/// A conflict lifecycle target and the view the caller last read.
+///
+/// `expected_member_count` is required for `resolve`: an open conflict gains
+/// members without a revision change, so the count guards the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictTarget {
+    pub conflict_id: i64,
+    pub expected_revision: i64,
+    pub expected_member_count: Option<i64>,
+}
+
+/// One row of the per-conflict lifecycle log (migration 0029).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictLifecycleEvent {
+    /// Position in this conflict's log, from 1 without gaps.
+    pub seq: i64,
+    /// `acknowledged`, `waived`, `resolved`, or `dismissed`.
+    pub kind: String,
+    /// `agent`, or `detector` for a detector-verified close.
+    pub actor_kind: String,
+    pub actor: String,
+    /// The mutation that wrote it, e.g. `conflict_acknowledge` or `retract`.
+    pub operation: String,
+    /// The conflict revision the event was decided against.
+    pub episode_revision: i64,
+    /// The conflict revision the event left: the same for an overlay event,
+    /// one more for a close.
+    pub result_revision: i64,
+    pub reason_kind: Option<String>,
+    pub rationale: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub review_by: Option<DateTime<Utc>>,
+    /// The conflict's durable member count when the event was written.
+    pub member_count: i64,
+    pub created_at: DateTime<Utc>,
+    /// The bounded event detail (for a close, its cause and restored claims).
+    /// Present on a mutation's own event and in history; omitted from the
+    /// overlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+    /// True when history omitted an oversized payload.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub payload_elided: bool,
+}
+
+/// What an `acknowledge` or concession `resolve` did to one conflict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictMutation {
+    /// The remember action: `acknowledge` or `resolve`.
+    pub operation: String,
+    pub conflict_id: i64,
+    /// The conflict's state after the mutation.
+    pub conflict_state: String,
+    /// The conflict's revision after the mutation.
+    pub conflict_revision: i64,
+    pub member_count: i64,
+    /// False when the request committed but changed nothing (an agent's
+    /// second acknowledgement of the same episode).
+    pub applied: bool,
+    /// `acknowledged`, `already_acknowledged`, or `resolved`.
+    pub status: Option<String>,
+    /// The lifecycle event this mutation appended, when it appended one.
+    pub lifecycle_event: Option<ConflictLifecycleEvent>,
+    /// The caller's own claims a concession retracted.
+    #[serde(default)]
+    pub claims_retracted: Vec<i64>,
+    /// Disputed members the verified close returned to `active`.
+    #[serde(default)]
+    pub claims_restored: Vec<i64>,
+    #[serde(default)]
+    pub conflicts_resolved: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reevaluation: Option<ConflictReevaluation>,
+    pub idempotent_replay: bool,
+}
+
+/// An agent's acknowledgement of the current conflict episode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Acknowledgement {
+    pub actor: String,
+    pub at: DateTime<Utc>,
+    pub reason: Option<String>,
+}
+
+/// The latest waiver of the current episode and whether it still applies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaiverView {
+    pub actor: String,
+    pub reason_kind: Option<String>,
+    pub rationale: Option<String>,
+    pub expires_at: DateTime<Utc>,
+    pub review_by: Option<DateTime<Utc>>,
+    /// The review time has passed while the waiver is still active.
+    pub review_due: bool,
+    /// The member count the waiver was granted against.
+    pub member_count: i64,
+    pub active: bool,
+    /// `expired` or `membership_changed` when the waiver no longer applies.
+    pub void_reason: Option<String>,
+}
+
+/// Who closed a closed conflict, from its logged close event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureView {
+    pub actor_kind: String,
+    pub actor: String,
+    pub operation: String,
+    pub reason_kind: Option<String>,
+    pub at: DateTime<Utc>,
+}
+
+/// The lifecycle state an agent reads beside a conflict row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictLifecycleOverlay {
+    /// `open`, `acknowledged`, `waived`, `resolved`, or `dismissed`.
+    pub state: String,
+    /// ADR 0003's read-side state: `open`, `waived`, or `clear`.
+    pub read_side: String,
+    /// The conflict revision whose events this overlay reads: the current
+    /// revision of an open conflict, the closed episode's otherwise.
+    pub episode_revision: i64,
+    pub acknowledged_by: Vec<Acknowledgement>,
+    pub acknowledgers_truncated: bool,
+    pub waiver: Option<WaiverView>,
+    pub closed_by: Option<ClosureView>,
+    /// A closed conflict whose close was not logged (for example one closed
+    /// before the lifecycle log existed).
+    pub closed_unlogged: bool,
+    /// The database time the overlay was evaluated at.
+    pub evaluated_at: DateTime<Utc>,
+}
+
+/// Revisions the conflict passed through without a logged event, such as a
+/// reopen by `record` or a close before the lifecycle log existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevisionGap {
+    pub from_revision: i64,
+    pub to_revision: i64,
+}
+
+/// A conflict's lifecycle log, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictHistory {
+    pub events: Vec<ConflictLifecycleEvent>,
+    /// True when more events exist than the bounded history returns.
+    pub truncated: bool,
+}
+
+/// The lifecycle events of several conflict episodes, read in one statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictLifecycleRows {
+    /// The newest events (at most 33) of each requested episode, newest
+    /// first, keyed by conflict id.
+    pub events: std::collections::HashMap<i64, Vec<ConflictLifecycleEvent>>,
+    /// The database time of the read.
+    pub evaluated_at: DateTime<Utc>,
 }
 
 /// The detector's verdict on a key's open v2 conflict after a lifecycle change.

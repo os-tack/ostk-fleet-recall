@@ -1,5 +1,6 @@
-//! Serializable lifecycle transactions (`retract`, `supersede`) for the
-//! `CockroachDB` claim ledger.
+//! Serializable claim lifecycle transactions (`retract`, `supersede`) for the
+//! `CockroachDB` claim ledger, and the receipt, lock, and verified-close steps
+//! the conflict lifecycle (`conflict_store`) shares with them.
 //!
 //! Every statement is keyed on the trusted `(tenant_id, project)` and locks in
 //! the record path's order: the key's conflict lineage rows first, then its
@@ -15,6 +16,9 @@ use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
 use sqlx::{Row, Transaction};
 
+use super::conflict_store::{
+    self, LifecycleEventDraft, acknowledge_request, append_lifecycle_event, resolve_request,
+};
 use super::{
     ClaimPassage, CockroachClaimLedger, MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON, MAX_LEDGER_RESULTS,
     claim_recorded_event_payload, detect_and_observe, fetch_claim, hydrate_conflicts,
@@ -29,16 +33,20 @@ use crate::ledger::lifecycle::{
 };
 use crate::ledger::types::PreparedClaim;
 use crate::ledger::{
-    ClaimInput, ClaimKind, ClaimMutation, ClaimState, ClaimTarget, Conflict, ConflictReevaluation,
-    LifecycleReplayRequest, SupersededClaim,
+    ClaimInput, ClaimKind, ClaimMutation, ClaimState, ClaimTarget, Conflict,
+    ConflictLifecycleEvent, ConflictMutation, ConflictReevaluation,
+    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LifecycleMutation, LifecycleReplayRequest,
+    SupersededClaim,
 };
 use crate::store::cockroach::with_serializable_retry;
 use crate::{FleetError, FleetScope, Result};
 
 const RETRACT_OPERATION: &str = "retract";
 const SUPERSEDE_OPERATION: &str = "supersede";
+pub(super) const ACKNOWLEDGE_OPERATION: &str = "conflict_acknowledge";
+pub(super) const RESOLVE_OPERATION: &str = "conflict_resolve";
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
-const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+pub(super) const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 /// Every pair among 256 locked claims plus one sentinel row.
 const MAX_KEY_INCOMPATIBLE_PAIRS: usize =
     MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON * (MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON - 1) / 2;
@@ -178,6 +186,12 @@ impl Replayable for ClaimMutation {
     }
 }
 
+impl Replayable for ConflictMutation {
+    fn mark_replayed(&mut self) {
+        self.idempotent_replay = true;
+    }
+}
+
 struct TargetRow {
     claim: LockedKeyClaim,
     kind: ClaimKind,
@@ -215,10 +229,26 @@ struct ReevaluationScope<'a> {
 
 /// What R8 changed and what it reports.
 #[derive(Debug, Default)]
-struct ReevaluationEffect {
-    conflicts_resolved: Vec<i64>,
-    claims_restored: Vec<i64>,
-    reevaluation: Option<ConflictReevaluation>,
+pub(super) struct ReevaluationEffect {
+    pub(super) conflicts_resolved: Vec<i64>,
+    pub(super) claims_restored: Vec<i64>,
+    pub(super) reevaluation: Option<ConflictReevaluation>,
+    /// The detector-attributed `resolved` event a logged close appended.
+    pub(super) lifecycle_event: Option<ConflictLifecycleEvent>,
+}
+
+/// How a detector-verified close is audited. Every close writes its fixed
+/// `resolution_reason` template; with the conflict lifecycle capability it
+/// also appends a detector-attributed `resolved` event to the lifecycle log.
+pub(super) struct CloseAudit<'a> {
+    /// The mutation that caused the close: `retract`, `supersede`, or
+    /// `conflict_resolve`.
+    pub(super) operation: &'a str,
+    pub(super) key: &'a str,
+    /// Why the key's incompatibility ended, as the event payload's `cause`.
+    pub(super) cause: Value,
+    /// Append to the lifecycle log (the ledger holds the capability).
+    pub(super) log: bool,
 }
 
 pub(super) async fn retract_claim(
@@ -238,6 +268,7 @@ pub(super) async fn retract_claim(
     let scope = scope.clone();
     let reason = reason.map(str::to_owned);
     let key = key.to_owned();
+    let log_closes = ledger.serves_conflict_lifecycle();
     with_serializable_retry(&ledger.pool, ledger.retry_policy, move |transaction| {
         let scope = scope.clone();
         let reason = reason.clone();
@@ -247,15 +278,27 @@ pub(super) async fn retract_claim(
             retract_once(
                 transaction,
                 &scope,
-                target,
-                reason.as_deref(),
-                &key,
-                &request,
+                RetractWrite {
+                    target,
+                    reason: reason.as_deref(),
+                    key: &key,
+                    request: &request,
+                    log_closes,
+                },
             )
             .await
         })
     })
     .await
+}
+
+/// One retract request, as the retried transaction body sees it.
+struct RetractWrite<'a> {
+    target: ClaimTarget,
+    reason: Option<&'a str>,
+    key: &'a str,
+    request: &'a Value,
+    log_closes: bool,
 }
 
 /// The canonical request identity a `retract` receipt stores.
@@ -299,7 +342,7 @@ pub(super) async fn replay_unserved_lifecycle(
     scope: &FleetScope,
     idempotency_key: &str,
     request: Option<LifecycleReplayRequest<'_>>,
-) -> Result<Option<ClaimMutation>> {
+) -> Result<Option<LifecycleMutation>> {
     ledger.ensure_scope(scope)?;
     // A key no mutation accepts can hold no receipt.
     let Ok(key) = validated_idempotency_key(idempotency_key) else {
@@ -319,30 +362,53 @@ pub(super) async fn replay_unserved_lifecycle(
             "idempotency key was already used for a different mutation".into(),
         ));
     };
-    let (operation, identity) = match request {
+    let claim = |operation, identity: Value| {
+        decode_receipt_parts(&row, scope, operation, &identity).map(LifecycleMutation::Claim)
+    };
+    let conflict = |operation, identity: Value| {
+        decode_receipt_parts(&row, scope, operation, &identity).map(LifecycleMutation::Conflict)
+    };
+    match request {
         LifecycleReplayRequest::Retract { target, reason } => {
-            (RETRACT_OPERATION, retract_request(scope, target, reason))
+            claim(RETRACT_OPERATION, retract_request(scope, target, reason))
         }
         LifecycleReplayRequest::Supersede {
             target,
             reason,
             successor,
-        } => (
+        } => claim(
             SUPERSEDE_OPERATION,
             supersede_request(scope, target, reason, successor),
         ),
-    };
-    decode_receipt_parts(&row, scope, operation, &identity).map(Some)
+        LifecycleReplayRequest::Acknowledge { target, reason } => conflict(
+            ACKNOWLEDGE_OPERATION,
+            acknowledge_request(scope, target, reason),
+        ),
+        LifecycleReplayRequest::Resolve {
+            target,
+            retract_claim_ids,
+            reason,
+        } => conflict(
+            RESOLVE_OPERATION,
+            resolve_request(scope, target, retract_claim_ids, reason),
+        ),
+    }
+    .map(Some)
 }
 
+#[allow(clippy::too_many_lines)] // one serializable unit, kept in its lock order
 async fn retract_once(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
-    target: ClaimTarget,
-    reason: Option<&str>,
-    key: &str,
-    request: &Value,
+    write: RetractWrite<'_>,
 ) -> Result<ClaimMutation> {
+    let RetractWrite {
+        target,
+        reason,
+        key,
+        request,
+        log_closes,
+    } = write;
     // R1/R2: a committed request replays before any precondition, so a
     // retried retract returns its stored result rather than `not_current`.
     if let Some(replay) =
@@ -392,7 +458,17 @@ async fn retract_once(
                     "no lifecycle-current incompatible pair remains after retract of claim {}",
                     locked.claim.id
                 ),
-                key,
+                &CloseAudit {
+                    operation: RETRACT_OPERATION,
+                    key,
+                    cause: json!({
+                        "agent": scope.agent,
+                        "operation": RETRACT_OPERATION,
+                        "claims_retracted": [locked.claim.id],
+                        "reason": reason,
+                    }),
+                    log: log_closes,
+                },
             )
             .await?
         }
@@ -458,6 +534,7 @@ struct SupersedeWrite {
     model: String,
     key: String,
     request: Value,
+    log_closes: bool,
 }
 
 pub(super) async fn supersede_claim(
@@ -510,6 +587,7 @@ pub(super) async fn supersede_claim(
         model: ledger.claim_model.clone(),
         key: key.to_owned(),
         request,
+        log_closes: ledger.serves_conflict_lifecycle(),
     });
     let scope = scope.clone();
     with_serializable_retry(&ledger.pool, ledger.retry_policy, move |transaction| {
@@ -535,6 +613,7 @@ async fn supersede_once(
         model,
         key,
         request,
+        log_closes,
     } = write;
     let (target, reason, key) = (*target, reason.as_deref(), key.as_str());
 
@@ -644,7 +723,18 @@ async fn supersede_once(
                     "no lifecycle-current incompatible pair remains after supersede of claim {} by claim {}",
                     predecessor.id, claim.id
                 ),
-                key,
+                &CloseAudit {
+                    operation: SUPERSEDE_OPERATION,
+                    key,
+                    cause: json!({
+                        "agent": scope.agent,
+                        "operation": SUPERSEDE_OPERATION,
+                        "claim_superseded": predecessor.id,
+                        "successor_claim_id": claim.id,
+                        "reason": reason,
+                    }),
+                    log: *log_closes,
+                },
             )
             .await?
         }
@@ -789,7 +879,7 @@ pub(super) fn decode_receipt_parts<T: DeserializeOwned + Replayable>(
     )
 }
 
-fn decode_receipt_values<T: DeserializeOwned + Replayable>(
+pub(super) fn decode_receipt_values<T: DeserializeOwned + Replayable>(
     receipt_project: &str,
     receipt_operation: &str,
     original_request: &Value,
@@ -817,13 +907,13 @@ fn decode_receipt_values<T: DeserializeOwned + Replayable>(
 /// R1/R2: replay a receipt committed under the key, or reserve the key for
 /// this mutation. `Some` is the stored result; `None` means this transaction
 /// now holds the reservation.
-async fn replay_or_reserve(
+pub(super) async fn replay_or_reserve<T: DeserializeOwned + Replayable>(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     key: &str,
     request: &Value,
     operation: &str,
-) -> Result<Option<ClaimMutation>> {
+) -> Result<Option<T>> {
     if let Some(row) = select_receipt(transaction, scope, key).await? {
         return decode_receipt_parts(&row, scope, operation, request).map(Some);
     }
@@ -879,7 +969,7 @@ async fn lock_owned_target(
 }
 
 /// R7: move a locked, owner-checked claim out of the current states.
-async fn transition_owned_claim(
+pub(super) async fn transition_owned_claim(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     claim: &LockedKeyClaim,
@@ -906,7 +996,7 @@ async fn reevaluate_key(
     scope: &FleetScope,
     key_scope: ReevaluationScope<'_>,
     resolution_reason: &str,
-    key: &str,
+    audit: &CloseAudit<'_>,
 ) -> Result<ReevaluationEffect> {
     let ReevaluationScope {
         lineage,
@@ -923,36 +1013,20 @@ async fn reevaluate_key(
             revision: conflict_revision,
             restore_candidates,
         } => {
-            let closed_revision = close_conflict(
+            apply_verified_close(
                 transaction,
                 scope,
-                conflict_id,
-                conflict_revision,
-                resolution_reason,
-            )
-            .await?;
-            let claims_restored = restore_disputed_members(
-                transaction,
-                scope,
-                RestoreScope {
+                VerifiedClose {
                     conflict_id,
-                    conflict_revision: closed_revision,
+                    conflict_revision,
                     claim_key,
+                    restore_candidates: &restore_candidates,
+                    current,
+                    resolution_reason,
                 },
-                &restore_candidates,
-                key,
+                audit,
             )
-            .await?;
-            Ok(ReevaluationEffect {
-                conflicts_resolved: vec![conflict_id],
-                claims_restored,
-                reevaluation: Some(reevaluation_report(
-                    conflict_id,
-                    "closed",
-                    closed_revision,
-                    &[],
-                )),
-            })
+            .await
         }
         Reevaluation::StillOpen {
             conflict_id,
@@ -991,6 +1065,102 @@ async fn reevaluate_key(
         }
         Reevaluation::NoLineage | Reevaluation::NotOpen => Ok(ReevaluationEffect::default()),
     }
+}
+
+/// A close the detector verified over the key's locked current claims.
+pub(super) struct VerifiedClose<'a> {
+    pub(super) conflict_id: i64,
+    /// The open revision the close is decided against.
+    pub(super) conflict_revision: i64,
+    pub(super) claim_key: &'a str,
+    /// The remaining disputed claims, ascending.
+    pub(super) restore_candidates: &'a [i64],
+    /// The key's remaining lifecycle-current claims.
+    pub(super) current: &'a [LockedKeyClaim],
+    pub(super) resolution_reason: &'a str,
+}
+
+/// Close the key's v2 conflict as `resolved`, restore the disputed members no
+/// other open conflict holds, and, with the capability, log the close as a
+/// detector-attributed `resolved` event.
+pub(super) async fn apply_verified_close(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    close: VerifiedClose<'_>,
+    audit: &CloseAudit<'_>,
+) -> Result<ReevaluationEffect> {
+    let VerifiedClose {
+        conflict_id,
+        conflict_revision,
+        claim_key,
+        restore_candidates,
+        current,
+        resolution_reason,
+    } = close;
+    let closed_revision = close_conflict(
+        transaction,
+        scope,
+        conflict_id,
+        conflict_revision,
+        resolution_reason,
+    )
+    .await?;
+    let claims_restored = restore_disputed_members(
+        transaction,
+        scope,
+        RestoreScope {
+            conflict_id,
+            conflict_revision: closed_revision,
+            claim_key,
+        },
+        restore_candidates,
+        audit.key,
+    )
+    .await?;
+    let lifecycle_event = if audit.log {
+        let member_count = conflict_store::member_count(transaction, scope, conflict_id).await?;
+        let mut remaining = current.iter().map(|claim| claim.id).collect::<Vec<_>>();
+        remaining.sort_unstable();
+        Some(
+            append_lifecycle_event(
+                transaction,
+                scope,
+                LifecycleEventDraft {
+                    conflict_id,
+                    kind: "resolved",
+                    episode_revision: conflict_revision,
+                    result_revision: closed_revision,
+                    to_state: "resolved",
+                    actor_kind: "detector",
+                    actor: FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+                    operation: audit.operation,
+                    key: audit.key,
+                    member_count,
+                    reason_kind: Some(NO_CURRENT_INCOMPATIBILITY),
+                    rationale: None,
+                    payload: json!({
+                        "cause": audit.cause,
+                        "restored_claim_ids": claims_restored,
+                        "remaining_current_claim_ids": remaining,
+                    }),
+                },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    Ok(ReevaluationEffect {
+        conflicts_resolved: vec![conflict_id],
+        claims_restored,
+        reevaluation: Some(reevaluation_report(
+            conflict_id,
+            "closed",
+            closed_revision,
+            &[],
+        )),
+        lifecycle_event,
+    })
 }
 
 /// The one keyed `memory_events` row of a claim lifecycle mutation.
@@ -1102,7 +1272,7 @@ async fn read_target(
     }))
 }
 
-async fn lock_lineages(
+pub(super) async fn lock_lineages(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     claim_key: &str,
@@ -1116,7 +1286,7 @@ async fn lock_lineages(
     classify_lineages(&rows)
 }
 
-async fn lock_current_claims(
+pub(super) async fn lock_current_claims(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     claim_key: &str,
@@ -1152,7 +1322,7 @@ async fn lock_current_claims(
     Ok(claims)
 }
 
-async fn key_incompatible_pairs(
+pub(super) async fn key_incompatible_pairs(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     claim_key: &str,
@@ -1248,7 +1418,7 @@ async fn restore_disputed_members(
     Ok(restored_ids)
 }
 
-async fn insert_transition_event(
+pub(super) async fn insert_transition_event(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     claim_id: i64,
@@ -1314,7 +1484,7 @@ fn not_found(claim_id: i64) -> LifecycleRefusal {
     )
 }
 
-fn validated_idempotency_key(key: &str) -> Result<&str> {
+pub(super) fn validated_idempotency_key(key: &str) -> Result<&str> {
     let key = key.trim();
     if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
         return Err(FleetError::Memory(format!(
@@ -1352,7 +1522,7 @@ fn bounded_ids(ids: &[i64], label: &str) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
-fn sentinel_limit(bound: usize) -> Result<i64> {
+pub(super) fn sentinel_limit(bound: usize) -> Result<i64> {
     bound
         .checked_add(1)
         .and_then(|limit| i64::try_from(limit).ok())

@@ -255,20 +255,39 @@ out of the detector's view. No request can name a conflict outcome: the server c
 only after its own Rust and SQL pair computations agree that no incompatible
 lifecycle-current pair remains, and it writes the resolution reason from a
 fixed template, so agent text never reaches `memory_conflicts`. The optional
-audit note stays in the private-plane claim event and receipt. Keys with only
-an unreconciled legacy lineage are refused rather than changed.
+audit note stays in the private plane: in the claim event and receipt, and,
+for a logged close, in the lifecycle event's cause. Keys with only an
+unreconciled legacy lineage are refused rather than changed.
 
-The feature adds no migration and no grant: the runtime role's existing
-`SELECT`/`UPDATE` on `memory_claims` and `memory_conflicts`, `SELECT` on
-`memory_conflict_members`, `INSERT` on the two event tables, and its receipt
-privileges cover it, and a supersede successor uses exactly the inserts
-`remember(record)` already holds. Every agent in one deployment shares one `fleet_writer`
-credential, so this is authority over agents that run the reviewed binary with
-their own `FLEET_RECALL_AGENT`, not cryptographic workload identity. A holder
-of that credential can issue the same SQL directly (see below).
-`FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` withdraws both actions and
-restores the record-only tool surface; a retract or supersede committed
-before the switch still replays when its identical request is retried.
+`remember(acknowledge)` and concession `remember(resolve)` extend this without
+widening it. Any agent in the project may acknowledge a conflict, including an
+implicated one, because an acknowledgement changes only the lifecycle overlay,
+never a claim, a conflict row, or the read side. `resolve` retracts only
+claims that pass the same owner checks, and it closes the conflict only
+through the same detector verification; a pair left anywhere refuses the whole
+request, so no agent can end a dispute by retiring another agent's claim
+(DISC-03). Anyone may ask the detector to re-verify, since the outcome depends
+on data alone (AUTH-03).
+
+Retract and supersede need no migration and no new grant: the runtime role's
+existing `SELECT`/`UPDATE` on `memory_claims` and `memory_conflicts`, `SELECT`
+on `memory_conflict_members`, `INSERT` on the two event tables, and its
+receipt privileges cover them, and a supersede successor uses exactly the
+inserts `remember(record)` already holds. The conflict actions and the
+lifecycle overlay also need migration 29's `memory_conflict_lifecycle_events_v1`,
+on which the runtime policy grants `SELECT` and `INSERT` only. With no
+`UPDATE` or `DELETE`, the runtime cannot rewrite or remove a logged event, and
+the publication reader has no grant on the table at all. The writer probes
+those two privileges once at startup and serves the conflict lifecycle only
+when both are present. Every agent in one deployment shares one
+`fleet_writer` credential, so this is authority over agents that run the
+reviewed binary with their own `FLEET_RECALL_AGENT`, not cryptographic
+workload identity. A holder of that credential can issue the same SQL
+directly (see below), including appending lifecycle events with arbitrary
+attribution. `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` withdraws every
+lifecycle action and restores the record-only tool surface; a lifecycle
+request committed before the switch still replays when its identical request
+is retried.
 
 ## Residual SQL authority and recovery
 

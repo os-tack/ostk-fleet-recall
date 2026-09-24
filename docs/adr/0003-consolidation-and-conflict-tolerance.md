@@ -196,6 +196,11 @@ Amendments to this ADR:
 - §"Schema evolution" is deferred: `memory_conflicts` stays byte-stable and
   its evolution is not scheduled in Waves 0–3. The waiver columns described
   there land when they are scheduled.
+- The serving writer records acknowledgements and detector-verified closes
+  in an append-only per-conflict lifecycle log (migration 29) rather than in
+  new `memory_conflicts` columns, and derives each conflict's read-side state
+  from it with exactly the mapping in the addendum below
+  ([ADR 0004](0004-serving-conflict-lifecycle.md) D4).
 - The consolidation contract implements only the read side of tolerance:
   `ConsolidationSourceConflictStateV1` mirrors `open`/`waived` from the live
   conflict projection at the repository seam, and CONS-04 makes both states

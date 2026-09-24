@@ -39,6 +39,9 @@ pub const MAX_PUBLIC_NUMERIC_ID: i64 = 9_007_199_254_740_991;
 /// Oldest complete additive database schema supported by the current recall,
 /// remember, conflict-projection, ingestion, and public-demo paths.
 pub const MINIMUM_RECALL_SCHEMA_VERSION: i64 = 18;
+/// First schema with the serving conflict lifecycle log (migration 0029).
+/// Below it the conflict lifecycle is simply not served.
+pub const CONFLICT_LIFECYCLE_SCHEMA_VERSION: i64 = 29;
 
 /// Exact application tables reachable from public health/status/recall SQL.
 ///
@@ -280,6 +283,8 @@ const DISCREPANCY_LEDGER_MIGRATION_SQL: &str =
     include_str!("../../migrations/0027_discrepancy_ledger.sql");
 const BOOTSTRAP_IMPORT_ROWS_MIGRATION_SQL: &str =
     include_str!("../../migrations/0028_bootstrap_import_rows.sql");
+const CONFLICT_LIFECYCLE_EVENTS_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0029_conflict_lifecycle_events.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -321,7 +326,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
     ]
 }
 
-fn post_transactional_online_migrations() -> [Migration; 13] {
+fn post_transactional_online_migrations() -> [Migration; 14] {
     [
         Migration::new(
             15,
@@ -443,6 +448,18 @@ fn post_transactional_online_migrations() -> [Migration; 13] {
             // W1-IMPORT. Additive: the side table the bootstrap-manifest
             // import projection writes, plus one index. Runs outside SQLx's
             // transaction wrapper like migrations 0018-0027.
+            true,
+        ),
+        Migration::new(
+            29,
+            Cow::Borrowed("serving conflict lifecycle events"),
+            MigrationType::Simple,
+            Cow::Borrowed(CONFLICT_LIFECYCLE_EVENTS_MIGRATION_SQL),
+            // ADR 0004. Additive: one append-only table with no foreign key
+            // and three indexes. Runs outside SQLx's transaction wrapper like
+            // migrations 0018-0028. The serving runtime never requires it:
+            // MINIMUM_RECALL_SCHEMA_VERSION stays 18, and the conflict
+            // lifecycle is served only when the startup probe finds it.
             true,
         ),
     ]
@@ -849,6 +866,53 @@ impl DatabaseCapabilities {
     pub const fn supports_schema_version(&self, minimum: i64) -> bool {
         self.schema_version >= minimum
     }
+}
+
+/// Proof that this role may read and append the conflict lifecycle log.
+///
+/// Only [`probe_conflict_lifecycle`] mints it (ADR 0004), so a ledger serves
+/// `acknowledge`, concession `resolve`, and the lifecycle overlay only after
+/// the startup probe succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictLifecycleCapability(());
+
+/// Privileges are checked when the statement is planned, so this reads and
+/// writes nothing, and it runs inside a transaction that is rolled back. It
+/// also covers privileges the role holds only through membership.
+const CONFLICT_LIFECYCLE_PRIVILEGE_PROBE_SQL: &str = "INSERT INTO public.memory_conflict_lifecycle_events_v1 \
+     SELECT * FROM public.memory_conflict_lifecycle_events_v1 WHERE false";
+const INSUFFICIENT_PRIVILEGE_SQLSTATE: &str = "42501";
+
+/// Whether this deployment may serve the conflict lifecycle.
+///
+/// It may when the schema has reached migration 29 and the connected role
+/// may SELECT and INSERT the lifecycle log. `None` means the lifecycle is not
+/// served (an older schema, or a runtime policy applied before migration
+/// 29); any other failure is an error. The probe runs once at startup, so a
+/// grant change needs a restart.
+pub async fn probe_conflict_lifecycle(
+    pool: &PgPool,
+    capabilities: &DatabaseCapabilities,
+) -> Result<Option<ConflictLifecycleCapability>> {
+    if !capabilities.supports_schema_version(CONFLICT_LIFECYCLE_SCHEMA_VERSION) {
+        return Ok(None);
+    }
+    let mut transaction = pool.begin().await?;
+    let probe = sqlx::query(CONFLICT_LIFECYCLE_PRIVILEGE_PROBE_SQL)
+        .execute(&mut *transaction)
+        .await;
+    let outcome = match probe {
+        Ok(_) => Ok(Some(ConflictLifecycleCapability(()))),
+        Err(sqlx::Error::Database(error))
+            if error.code().as_deref() == Some(INSUFFICIENT_PRIVILEGE_SQLSTATE) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    };
+    // The probe wrote nothing; roll back regardless of its outcome.
+    transaction.rollback().await?;
+    outcome
 }
 
 /// The model coordinate registered for this trusted corpus, if ingestion has

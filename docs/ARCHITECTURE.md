@@ -147,13 +147,16 @@ than caller-controlled JSON.
 | Relation projection | `memory_relation_projection_v1`, `memory_relation_projection_watermarks_v1` | Disposable current relation state with a per-`(ledger_family, shard)` cursor advanced in the same transaction |
 | Writer authority witness | `memory_writer_authority_v1` (view) | Read-only bootstrap/epoch/registry-head projection; the writer's only authority read path |
 
-Later migrations (19 onward, see [`migrations/`](../migrations)) add
+Later migrations (19 through 28, see [`migrations/`](../migrations)) add
 private-plane tables for the dynamic-memory runtimes: content-addressed body
 projection, coverage cursors and receipts, the lexical/dense recall projection
 and its visibility class, the transcript and CI connector state, normative
-activation, and the discrepancy ledger. The serving path does not read or
-write them yet; see
+activation, the discrepancy ledger, and the bootstrap-manifest import rows.
+The serving path does not read or write them yet; see
 [Dynamic corpus and causal runtime architecture](DYNAMIC_MEMORY_ARCHITECTURE.md).
+Migration 29 adds the one later table serving does use:
+`memory_conflict_lifecycle_events_v1`, the append-only per-conflict lifecycle
+log described under the write path below.
 
 Serving accepts an uninterrupted successful migration prefix through at least
 version 18, and later additive migrations remain compatible. The private
@@ -260,6 +263,22 @@ and a page still short there carries a `lifecycle_hidden_hits_underfilled`
 warning. The publication reader is unchanged. Claim search already filters by
 lifecycle state unless `include_history` is set.
 
+When the writer serves the conflict lifecycle, every read that returns
+conflicts (`search` of either kind, `get` of a claim or conflict, and
+`conflicts`) attaches a `lifecycle` overlay after its main read transaction
+has finished. The overlay is one separate autocommit statement against the
+migration-29 lifecycle log, reading at most 33 newest events of each
+conflict's episode (the current revision of an open conflict, the closed
+episode's revision otherwise) through its covering episode index, and it
+uses the database clock. A pure derivation turns those events into the
+overlay's `state`, ADR 0003's `read_side`, the acknowledgers, and the closing
+event. A failure of that read never fails the response: coverage reports
+`lifecycle_overlay: unavailable` and the conflicts come back without it.
+`get` with `kind=conflict` reads the log once more, oldest first and bounded
+to 256 events, and derives `unlogged_transitions` from the revisions the
+events do not cover, such as a reopen by `record`. The publication reader has
+no grant on the log and never attaches the overlay.
+
 ## Deliberate-memory write path
 
 ```mermaid
@@ -343,6 +362,35 @@ successor as a member in its predecessor's place. The one keyed event is
 `claim_superseded`, and the receipt names the successor. The record path's
 SQL, statement order, and responses are unchanged by this sharing.
 
+The conflict actions use the same receipt protocol and lock order and write
+the append-only `memory_conflict_lifecycle_events_v1` table (migration 0029),
+whose `event_seq` numbers each conflict's events from 1 without gaps; an event
+is appended only while the conflict row is locked. `remember(acknowledge)`
+reads the conflict, locks its key's lineage rows, requires the open v2
+conflict at the caller's revision, and appends an `acknowledged` event for
+that episode unless the agent already acknowledged it. It never updates
+`memory_conflicts` or any claim. `remember(resolve)` also checks the member
+count the caller read, because an open conflict gains members without a
+revision change, then locks the key's current claims. It retracts only the
+caller's own current member claims, exactly as a retract would, and asks the
+detector (in Rust and in SQL) for the remaining incompatible pairs. None left
+means the verified close: `resolved`, restored members, and a
+detector-attributed `resolved` event. Any pair left, or a disagreement between
+the two computations, refuses the request, so the retractions roll back with
+everything else. With the lifecycle capability, retract and supersede closes
+append the same detector-attributed event, with the caller's operation and key
+and a cause payload. Each conflict action writes exactly one keyed
+`memory_events` row and a receipt naming the conflict.
+
+The writer serves these actions only after a startup probe: the schema must
+have reached migration 29, and an `INSERT ... SELECT ... WHERE false` on the
+log inside a rolled-back transaction must pass the privilege check. Without
+it, the surface stays at `record|supersede|retract`, closes are audited in
+`memory_events` only, and `MINIMUM_RECALL_SCHEMA_VERSION` stays 18, so every
+binary runs on a schema without migration 29. The rollout is deploy the
+binary, migrate, re-apply the runtime policy (its migration-29 gate and 49-row
+grant matrix), then restart `serve`.
+
 ## Trust and isolation invariants
 
 1. A process is configured for exactly one tenant/project. SQL predicates and
@@ -360,17 +408,21 @@ SQL, statement order, and responses are unchanged by this sharing.
 6. Backend failures are logged server-side but database details are redacted
    from MCP clients.
 7. Retirement is owner-only and resolution is detector-verified. An agent can
-   retract or supersede only an `operator_asserted` claim it authored, at the
-   revision it read, and a successor keeps its predecessor's kind, key, and
-   conflict eligibility. A supersede points its predecessor's `superseded_by`
-   at that later successor, written by the same author. No request names
-   a conflict outcome: a conflict closes only when the
-   detector finds no incompatible lifecycle-current pair on its key, and a
+   retract, supersede, or concede (through `resolve`) only an
+   `operator_asserted` claim it authored, and a successor keeps its
+   predecessor's kind, key, and conflict eligibility. A supersede points its
+   predecessor's `superseded_by` at that later successor, written by the same
+   author. No request names a conflict outcome: a conflict closes only when
+   the detector finds no incompatible lifecycle-current pair on its key, and a
    disputed claim is restored only when no other open conflict holds it. Every
    disputed claim therefore stays a member of at least one open current
    lineage (v2 when its key has one, otherwise legacy), and
-   every open v2 conflict keeps at least one incompatible current pair. A
-   refused lifecycle request rolls back completely and leaves no receipt.
+   every open v2 conflict keeps at least one incompatible current pair.
+   Acknowledgement changes only the lifecycle log. That log is append-only:
+   each conflict's events are numbered without gaps, at most one close is
+   logged per resulting revision, and every event belongs to a committed
+   receipt. A refused lifecycle request rolls back completely and leaves no
+   receipt.
 
 ## Scaling and failure behavior
 
@@ -409,11 +461,14 @@ SQL, statement order, and responses are unchanged by this sharing.
 - Implement the reserved Recall actions. The service contract already names
   `remember` forget, restore, resolve, relate, split, focus, track, and
   consolidate, and `recall` surface, discover, synthesize, and audit;
-  today `remember(record|supersede|retract)` and
+  today `remember(record|supersede|retract|acknowledge|resolve)` and
   `recall(search|get|conflicts|status)` are served (with `get` covering claims,
-  chunks, and, on the private writer, conflicts), and the others return an
-  error. Conflict acknowledgement and concession resolve are the next
-  lifecycle steps in [ADR 0004](adr/0004-serving-conflict-lifecycle.md).
+  chunks, and, on the private writer, conflicts; `acknowledge` and `resolve`
+  need the migration-29 lifecycle log), and the others return an error.
+  Adjudication (`dismiss` and `waive` by a non-implicated agent) is the next
+  lifecycle step in [ADR 0004](adr/0004-serving-conflict-lifecycle.md), and
+  `record` reopens are not logged yet; history reports them as unlogged
+  transitions.
 - Wire the dynamic-memory runtimes that already exist as library code into a
   worker or CLI and into MCP recall; the README's
   [built but not yet wired](../README.md#built-but-not-yet-wired) section lists

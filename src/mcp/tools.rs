@@ -20,6 +20,9 @@ const CLAIM_FIELDS: [&str; 11] = [
 ];
 /// Owner-lifecycle `remember` properties that `record` must not carry.
 const CLAIM_LIFECYCLE_FIELDS: [&str; 3] = ["claim_id", "expected_revision", "reason"];
+/// Conflict-lifecycle `remember` properties that the claim actions must not
+/// carry. A property the surface does not declare is never named.
+const CONFLICT_FIELDS: [&str; 3] = ["conflict_id", "expected_member_count", "retract_claim_ids"];
 
 fn output_schema(tool: &str) -> Value {
     json!({
@@ -213,9 +216,15 @@ pub fn recall_tool_for(surface: RememberSurface) -> Value {
     if surface == RememberSurface::RECORD_ONLY {
         return tool;
     }
-    tool["description"] = json!(
-        "Read fleet memory without changing semantic state. Search combines lexical and dense retrieval and reports conflict coverage. get with kind=conflict returns one conflict by id in any state, with its members."
-    );
+    tool["description"] = if surface.conflict_lifecycle {
+        json!(
+            "Read fleet memory without changing semantic state. Search combines lexical and dense retrieval and reports conflict coverage. Every conflict carries its lifecycle (open, acknowledged, resolved, ...) and who acknowledged or closed it. get with kind=conflict returns one conflict by id in any state, with its members and its lifecycle history."
+        )
+    } else {
+        json!(
+            "Read fleet memory without changing semantic state. Search combines lexical and dense retrieval and reports conflict coverage. get with kind=conflict returns one conflict by id in any state, with its members."
+        )
+    };
     let schema = &mut tool["inputSchema"];
     schema["properties"]["kind"]["enum"] = json!(["chunk", "claim", "assertion", "conflict"]);
     if let Some(all_of) = schema["allOf"].as_array_mut() {
@@ -235,15 +244,91 @@ pub fn recall_tool_for(surface: RememberSurface) -> Value {
 #[must_use]
 pub fn remember_tool_for(surface: RememberSurface) -> Value {
     let mut tool = remember_tool();
-    if !surface.claim_lifecycle {
+    if !surface.claim_lifecycle && !surface.conflict_lifecycle {
         return tool;
     }
-    tool["description"] = json!(
-        "Deliberately record fleet memory, or supersede or retract claims you authored. A successor keeps its predecessor's kind, subject/predicate key, and conflict eligibility: a keyed decision, fact, constraint, preference, or procedure keeps carrying a value, and a valueless one gains none. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
-    );
+    tool["description"] = json!(remember_description(surface));
     let schema = &mut tool["inputSchema"];
-    schema["properties"]["action"]["enum"] = json!(["record", "supersede", "retract"]);
+    let mut actions = vec!["record"];
+    if surface.claim_lifecycle {
+        actions.extend(["supersede", "retract"]);
+    }
+    if surface.conflict_lifecycle {
+        actions.extend(["acknowledge", "resolve"]);
+    }
+    schema["properties"]["action"]["enum"] = json!(actions);
     if let Some(properties) = schema["properties"].as_object_mut() {
+        insert_lifecycle_properties(properties, surface);
+    }
+    let properties = schema["properties"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let mut branches = vec![branch(
+        &properties,
+        "record",
+        &["kind", "text"],
+        &named(&[&CLAIM_LIFECYCLE_FIELDS, &CONFLICT_FIELDS]),
+    )];
+    if surface.claim_lifecycle {
+        // The successor carries record's claim fields; the server refuses one
+        // whose kind, normalized key, or conflict eligibility differs.
+        branches.push(branch(
+            &properties,
+            "supersede",
+            &["claim_id", "expected_revision", "kind", "text"],
+            &CONFLICT_FIELDS,
+        ));
+        branches.push(branch(
+            &properties,
+            "retract",
+            &["claim_id", "expected_revision"],
+            &named(&[&CLAIM_FIELDS, &CONFLICT_FIELDS]),
+        ));
+    }
+    if surface.conflict_lifecycle {
+        branches.push(branch(
+            &properties,
+            "acknowledge",
+            &["conflict_id", "expected_revision"],
+            &named(&[
+                &CLAIM_FIELDS,
+                &["claim_id", "expected_member_count", "retract_claim_ids"],
+            ]),
+        ));
+        branches.push(branch(
+            &properties,
+            "resolve",
+            &["conflict_id", "expected_revision", "expected_member_count"],
+            &named(&[&CLAIM_FIELDS, &["claim_id"]]),
+        ));
+    }
+    schema["required"] = json!(["action", "idempotency_key"]);
+    schema["allOf"] = Value::Array(branches);
+    tool
+}
+
+/// Property names from several groups, in order.
+fn named(groups: &[&[&'static str]]) -> Vec<&'static str> {
+    groups.concat()
+}
+
+const fn remember_description(surface: RememberSurface) -> &'static str {
+    match (surface.claim_lifecycle, surface.conflict_lifecycle) {
+        (true, false) => {
+            "Deliberately record fleet memory, or supersede or retract claims you authored. A successor keeps its predecessor's kind, subject/predicate key, and conflict eligibility: a keyed decision, fact, constraint, preference, or procedure keeps carrying a value, and a valueless one gains none. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
+        }
+        (true, true) => {
+            "Deliberately record fleet memory, supersede or retract claims you authored, and acknowledge or resolve conflicts. A successor keeps its predecessor's kind, subject/predicate key, and conflict eligibility: a keyed decision, fact, constraint, preference, or procedure keeps carrying a value, and a valueless one gains none. acknowledge marks a conflict's current episode as seen and changes nothing else. resolve concedes: it retracts only your own member claims named in retract_claim_ids, and the conflict closes only if no incompatible current pair remains; otherwise nothing changes. No action changes another agent's claim. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
+        }
+        _ => {
+            "Deliberately record fleet memory, and acknowledge or resolve conflicts. acknowledge marks a conflict's current episode as seen and changes nothing else. resolve concedes: it retracts only your own member claims named in retract_claim_ids, and the conflict closes only if no incompatible current pair remains; otherwise nothing changes. No action changes another agent's claim. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
+        }
+    }
+}
+
+fn insert_lifecycle_properties(properties: &mut Map<String, Value>, surface: RememberSurface) {
+    if surface.claim_lifecycle {
         properties.insert(
             "claim_id".into(),
             json!({
@@ -253,53 +338,100 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
                 "description": "supersede/retract: a claim you authored (origin operator_asserted) in state active or disputed."
             }),
         );
+    }
+    let (revision_description, reason_description) = match (
+        surface.claim_lifecycle,
+        surface.conflict_lifecycle,
+    ) {
+        (true, false) => (
+            "supersede/retract: the claim revision you last read; a stale value is refused, not retried.",
+            "Optional private audit note for supersede or retract, at most 1000 characters.",
+        ),
+        (true, true) => (
+            "The claim revision (supersede/retract) or conflict revision (acknowledge/resolve) you last read; a stale value is refused, not retried.",
+            "Optional audit note for supersede, retract, acknowledge, or resolve, at most 1000 characters. Acknowledge and resolve notes appear in the conflict's lifecycle overlay and history.",
+        ),
+        _ => (
+            "acknowledge/resolve: the conflict revision you last read; a stale value is refused, not retried.",
+            "Optional audit note for acknowledge or resolve, at most 1000 characters. It appears in the conflict's lifecycle overlay and history.",
+        ),
+    };
+    properties.insert(
+        "expected_revision".into(),
+        json!({
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9_007_199_254_740_991_i64,
+            "description": revision_description
+        }),
+    );
+    properties.insert(
+        "reason".into(),
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000,
+            "description": reason_description
+        }),
+    );
+    if surface.conflict_lifecycle {
         properties.insert(
-            "expected_revision".into(),
+            "conflict_id".into(),
             json!({
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9_007_199_254_740_991_i64,
-                "description": "supersede/retract: the claim revision you last read; a stale value is refused, not retried."
+                "description": "acknowledge/resolve: a same_key_functional_value_v2 conflict id from recall, in state open."
             }),
         );
         properties.insert(
-            "reason".into(),
+            "expected_member_count".into(),
             json!({
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 1000,
-                "description": "Optional private audit note for supersede or retract, at most 1000 characters."
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4096,
+                "description": "resolve: the conflict member_count you last read; a conflict gains members without a revision change."
+            }),
+        );
+        properties.insert(
+            "retract_claim_ids".into(),
+            json!({
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 32,
+                "uniqueItems": true,
+                "items": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9_007_199_254_740_991_i64
+                },
+                "description": "resolve: your own current member claims to retract atomically; the conflict closes only if no incompatible current pair remains. Omit it to only re-verify the conflict."
             }),
         );
     }
-    let properties = schema["properties"]
+}
+
+/// One `allOf` branch: the action's required fields, and `false` for each
+/// named property the schema declares. An empty forbid list adds no
+/// `properties` object.
+fn branch(
+    properties: &Map<String, Value>,
+    action: &str,
+    required: &[&str],
+    forbidden: &[&str],
+) -> Value {
+    let mut then = json!({ "required": required });
+    let forbidden = forbid(properties, forbidden);
+    if forbidden
         .as_object()
-        .cloned()
-        .unwrap_or_default();
-    schema["required"] = json!(["action", "idempotency_key"]);
-    schema["allOf"] = json!([
-        {
-            "if": { "properties": { "action": { "const": "record" } } },
-            "then": {
-                "required": ["kind", "text"],
-                "properties": forbid(&properties, &CLAIM_LIFECYCLE_FIELDS)
-            }
-        },
-        {
-            // The successor carries record's claim fields; the server refuses
-            // one whose kind, normalized key, or conflict eligibility differs.
-            "if": { "properties": { "action": { "const": "supersede" } } },
-            "then": { "required": ["claim_id", "expected_revision", "kind", "text"] }
-        },
-        {
-            "if": { "properties": { "action": { "const": "retract" } } },
-            "then": {
-                "required": ["claim_id", "expected_revision"],
-                "properties": forbid(&properties, &CLAIM_FIELDS)
-            }
-        }
-    ]);
-    tool
+        .is_some_and(|forbidden| !forbidden.is_empty())
+    {
+        then["properties"] = forbidden;
+    }
+    json!({
+        "if": { "properties": { "action": { "const": action } } },
+        "then": then
+    })
 }
 
 /// The agent-facing surface for one remember surface. The record-only
@@ -392,6 +524,14 @@ mod tests {
     fn lifecycle_surface() -> RememberSurface {
         RememberSurface {
             claim_lifecycle: true,
+            ..RememberSurface::RECORD_ONLY
+        }
+    }
+
+    fn conflict_surface() -> RememberSurface {
+        RememberSurface {
+            claim_lifecycle: true,
+            conflict_lifecycle: true,
         }
     }
 
@@ -483,6 +623,110 @@ mod tests {
                 assert!(properties.contains_key(name), "{name} is undeclared");
             }
         }
+    }
+
+    #[test]
+    fn conflict_lifecycle_surface_branches_are_exact() {
+        let tool = remember_tool_for(conflict_surface());
+        let schema = &tool["inputSchema"];
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!(["record", "supersede", "retract", "acknowledge", "resolve"])
+        );
+        assert_eq!(schema["required"], json!(["action", "idempotency_key"]));
+        for field in CLAIM_LIFECYCLE_FIELDS.iter().chain(&CONFLICT_FIELDS) {
+            assert!(properties.contains_key(*field), "{field} is declared");
+        }
+        let ids = &schema["properties"]["retract_claim_ids"];
+        assert_eq!(ids["maxItems"], 32);
+        assert_eq!(ids["uniqueItems"], true);
+        assert_eq!(
+            schema["properties"]["expected_member_count"]["maximum"],
+            4096
+        );
+
+        let branches = schema["allOf"].as_array().unwrap();
+        let by_action = |action: &str| {
+            branches
+                .iter()
+                .find(|branch| branch["if"]["properties"]["action"]["const"] == action)
+                .unwrap_or_else(|| panic!("{action} has a branch"))
+        };
+        assert_eq!(branches.len(), 5);
+        let forbidden = |action: &str| {
+            by_action(action)["then"]["properties"]
+                .as_object()
+                .map(|forbidden| {
+                    forbidden
+                        .iter()
+                        .map(|(name, value)| {
+                            assert_eq!(*value, false);
+                            name.as_str()
+                        })
+                        .collect::<std::collections::BTreeSet<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let set = |names: &[&'static str]| {
+            names
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+
+        // Record and the claim actions never carry a conflict field.
+        assert_eq!(
+            forbidden("record"),
+            set(&[
+                "claim_id",
+                "expected_revision",
+                "reason",
+                "conflict_id",
+                "expected_member_count",
+                "retract_claim_ids"
+            ])
+        );
+        assert_eq!(forbidden("supersede"), set(&CONFLICT_FIELDS));
+        let mut retract = set(&CLAIM_FIELDS);
+        retract.extend(CONFLICT_FIELDS);
+        assert_eq!(forbidden("retract"), retract);
+
+        // acknowledge names a conflict and its revision only.
+        assert_eq!(
+            by_action("acknowledge")["then"]["required"],
+            json!(["conflict_id", "expected_revision"])
+        );
+        let mut acknowledge = set(&CLAIM_FIELDS);
+        acknowledge.extend(["claim_id", "expected_member_count", "retract_claim_ids"]);
+        assert_eq!(forbidden("acknowledge"), acknowledge);
+
+        // resolve also pins the member count, and may name the caller's claims.
+        assert_eq!(
+            by_action("resolve")["then"]["required"],
+            json!(["conflict_id", "expected_revision", "expected_member_count"])
+        );
+        let mut resolve = set(&CLAIM_FIELDS);
+        resolve.insert("claim_id");
+        assert_eq!(forbidden("resolve"), resolve);
+        // The transport-only actor assertion and scope stay valid everywhere.
+        for action in ["acknowledge", "resolve"] {
+            assert!(!forbidden(action).contains("actor"));
+            assert!(!forbidden(action).contains("scope"));
+        }
+
+        // Adding the conflict actions leaves the claim-only surface as it was.
+        let claim_only = remember_tool_for(lifecycle_surface());
+        assert!(
+            claim_only["inputSchema"]["properties"]
+                .get("conflict_id")
+                .is_none()
+        );
+        let recall = recall_tool_for(conflict_surface());
+        assert_eq!(
+            recall["inputSchema"],
+            recall_tool_for(lifecycle_surface())["inputSchema"]
+        );
     }
 
     #[test]

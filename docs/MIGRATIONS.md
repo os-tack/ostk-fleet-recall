@@ -26,12 +26,27 @@ tables, the nullable `accepted_event_id` columns on `memory_claims` and
 `memory_mutation_receipts`, and the read-only `memory_writer_authority_v1`
 head-witness view.
 
-Migrations from 19 onward add private-plane tables for the dynamic-memory
+Migrations 19 through 28 add private-plane tables for the dynamic-memory
 runtimes: the content-addressed body projection, the coverage runtime, the
 recall projection and its per-row visibility class, transcript and CI
-connector state, normative activation, and the discrepancy ledger. Version 25
-is a deliberate, permanent gap. No serving path reads these tables yet, and
-the runtime role policy does not grant them.
+connector state, normative activation, the discrepancy ledger, and the
+bootstrap-manifest import rows. Version 25 is a deliberate, permanent gap. No
+serving path reads these tables yet, and the runtime role policy does not
+grant them.
+
+Migration 29 is the exception: it adds `memory_conflict_lifecycle_events_v1`,
+the append-only per-conflict lifecycle log the serving writer reads and appends
+([ADR 0004](adr/0004-serving-conflict-lifecycle.md)). It carries no foreign key,
+so bulk deletes of `memory_conflicts` are unaffected, and it changes no
+existing table. Serving does not require it: `MINIMUM_RECALL_SCHEMA_VERSION`
+stays 18, and the writer serves `acknowledge`, concession `resolve`, and the
+lifecycle overlay only when a startup probe finds version 29 and the runtime
+grants on the table. Roll it out as: deploy the new binary (the probe finds
+nothing and the claim lifecycle alone is served), `migrate`, drain
+`fleet_writer` and re-apply the runtime policy, then restart `serve` so the
+probe sees the grants. A migrate binary older than version 29 then refuses
+the database with `VersionMissing(29)`, so a rollback runs the old `serve`
+binary only.
 
 ## Transaction policy: versions 1–11, 12–14, and 15 onward
 
@@ -250,10 +265,16 @@ It is deliberately narrower than the reusable library surface: per-table verbs
 only (for example `memory_chunk_history` receives `SELECT`/`DELETE` only, and
 `memory_attention` and `memory_claim_link_events` receive nothing), `USAGE` on
 only the claim, claim-support, and conflict ID sequences, and `SELECT` on
-`_sqlx_migrations`. The SQL file is the row-by-row reference. It grants
-nothing on the tables from migration 19 onward yet; when a runtime starts
-using them, extend the policy together with its migration-prefix gate and its
-closing grant-count postcondition.
+`_sqlx_migrations`. The SQL file is the row-by-row reference. Of the tables
+from migration 19 onward it grants only `SELECT` and `INSERT` on migration
+29's conflict lifecycle log, never `UPDATE` or `DELETE`, so the log is
+append-only for the runtime; that grant is why the policy also requires a
+successful migration 29 (a separate gate beside the 1-through-18 prefix) and
+closes with a 49-row grant count. It grants nothing on the tables from
+migrations 19 through 28 yet; when a runtime starts using them, extend the
+policy the same way, together with a migration gate and the closing
+grant-count postcondition. The writer probes its grants only at startup, so
+restart `serve` after any policy change.
 
 Grant the external private-writer login only membership in `fleet_runtime`; do
 not copy these DML/sequence grants onto the fixed publication login.

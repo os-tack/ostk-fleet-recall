@@ -470,6 +470,54 @@ fn result_within_budget(result: &Value) -> bool {
 
 fn compact_committed_remember_envelope(envelope: &Value) -> Value {
     let data = &envelope["data"];
+    let compact_data = if data.get("claim").is_none() && data.get("conflict_id").is_some() {
+        compact_conflict_mutation(data)
+    } else {
+        compact_claim_mutation(data)
+    };
+    json!({
+        "schema_version": envelope["schema_version"],
+        "tool": "remember",
+        "action": envelope["action"],
+        "data": compact_data,
+        "conflicts": [],
+        "conflict_coverage": {
+            "status": "partial",
+            "complete": false,
+            "reason": "output_projection_truncated",
+        },
+        "warnings": [{
+            "code": "output_projection_truncated",
+            "message": "the mutation committed, but its response projection exceeded the output budget; the durable receipt and mutation coordinates are preserved"
+        }],
+        "diagnostics": {
+            "transaction": envelope.pointer("/diagnostics/transaction"),
+            "output_truncated": true,
+        },
+    })
+}
+
+/// A conflict mutation's bounded coordinates: its conflict, outcome, and the
+/// claims it changed (at most 32 retracted; restored claims are bounded by
+/// the key's 256 current claims).
+fn compact_conflict_mutation(data: &Value) -> Value {
+    json!({
+        "operation": data["operation"],
+        "conflict_id": data["conflict_id"],
+        "conflict_state": data["conflict_state"],
+        "conflict_revision": data["conflict_revision"],
+        "member_count": data["member_count"],
+        "applied": data["applied"],
+        "status": data["status"],
+        "idempotent_replay": data["idempotent_replay"],
+        "claims_retracted": data["claims_retracted"],
+        "claims_restored": data["claims_restored"],
+        "conflicts_resolved": data["conflicts_resolved"],
+        "receipt": data["receipt"],
+    })
+}
+
+fn compact_claim_mutation(data: &Value) -> Value {
     let claim = &data["claim"];
     let mut compact_data = json!({
         "operation": data["operation"],
@@ -492,26 +540,7 @@ fn compact_committed_remember_envelope(envelope: &Value) -> Value {
             }
         }
     }
-    json!({
-        "schema_version": envelope["schema_version"],
-        "tool": "remember",
-        "action": envelope["action"],
-        "data": compact_data,
-        "conflicts": [],
-        "conflict_coverage": {
-            "status": "partial",
-            "complete": false,
-            "reason": "output_projection_truncated",
-        },
-        "warnings": [{
-            "code": "output_projection_truncated",
-            "message": "the mutation committed, but its response projection exceeded the output budget; the durable receipt and mutation coordinates are preserved"
-        }],
-        "diagnostics": {
-            "transaction": envelope.pointer("/diagnostics/transaction"),
-            "output_truncated": true,
-        },
-    })
+    compact_data
 }
 
 fn parse_request_line(line: &str) -> std::result::Result<JsonRpcRequest, Box<JsonRpcResponse>> {
@@ -872,6 +901,54 @@ mod tests {
         let compact = oversized_remember(&supersede);
         assert_eq!(compact["data"]["superseded"]["superseded_by"], 42);
         assert_eq!(compact["data"]["claim"]["id"], 42);
+    }
+
+    #[test]
+    fn conflict_compact_envelope_within_budget() {
+        let lifecycle_event = json!({
+            "seq": 3, "kind": "resolved", "actor_kind": "detector",
+            "actor": "same_key_functional_value_v2", "operation": "conflict_resolve",
+            "episode_revision": 4, "result_revision": 5,
+            "reason_kind": "no_current_incompatibility", "rationale": null,
+            "expires_at": null, "review_by": null, "member_count": 3,
+            "created_at": "2026-09-24T00:00:00Z",
+            "payload": { "cause": { "reason": "x".repeat(MAX_MCP_TOOL_RESULT_BYTES) } },
+        });
+        let resolve = json!({
+            "operation": "resolve", "conflict_id": 9, "conflict_state": "resolved",
+            "conflict_revision": 5, "member_count": 3, "applied": true,
+            "status": "resolved", "lifecycle_event": lifecycle_event,
+            "claims_retracted": [41], "claims_restored": [42],
+            "conflicts_resolved": [9], "idempotent_replay": false,
+        });
+        let compact = oversized_remember(&resolve);
+        let data = &compact["data"];
+        assert_eq!(data["operation"], "resolve");
+        assert_eq!(data["conflict_id"], 9);
+        assert_eq!(data["conflict_state"], "resolved");
+        assert_eq!(data["conflict_revision"], 5);
+        assert_eq!(data["applied"], true);
+        assert_eq!(data["claims_retracted"], json!([41]));
+        assert_eq!(data["claims_restored"], json!([42]));
+        assert_eq!(data["receipt"]["idempotency_key"], "turn-7/key");
+        assert!(data.get("claim").is_none());
+        assert!(data.get("lifecycle_event").is_none());
+        assert_eq!(compact["diagnostics"]["output_truncated"], true);
+        assert!(serde_json::to_vec(&compact).unwrap().len() < 4_096);
+
+        let summary = compact_summary(&compact);
+        assert_eq!(
+            summary,
+            "remember.resolve: applied. Full result is in structuredContent."
+        );
+        let mut duplicate = compact;
+        duplicate["data"]["applied"] = json!(false);
+        duplicate["data"]["status"] = json!("already_acknowledged");
+        duplicate["action"] = json!("acknowledge");
+        assert_eq!(
+            compact_summary(&duplicate),
+            "remember.acknowledge: not applied (already_acknowledged). Full result is in structuredContent."
+        );
     }
 
     #[test]

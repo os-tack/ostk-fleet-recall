@@ -686,9 +686,12 @@ impl WriterAuthorityConfig {
 pub struct LifecycleConfig {
     /// Serve the owner lifecycle of authored claims (`remember(retract)` and
     /// `remember(supersede)`) and hide retired claims' synthetic chunks from
-    /// private search.
+    /// private search. When the startup probe also finds the migration-29
+    /// lifecycle log and its runtime grants, serve the conflict lifecycle
+    /// (`remember(acknowledge)`, concession `remember(resolve)`, and the
+    /// lifecycle overlay and history on reads).
     /// `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` restores the record-only
-    /// surface and its byte-identical `tools/list`.
+    /// surface and its byte-identical `tools/list`, and skips the probe.
     pub remember_lifecycle: bool,
 }
 

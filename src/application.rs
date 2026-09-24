@@ -11,9 +11,11 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::ledger::{
-    ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict,
-    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LifecycleReplayRequest, SemanticClaimHit,
-    SupportedClaimCoordinate, validate_lifecycle_reason,
+    ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict, ConflictMutation,
+    ConflictTarget, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LifecycleMutation,
+    LifecycleReplayRequest, MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT,
+    MAX_OVERLAY_EPISODE_EVENTS, SemanticClaimHit, SupportedClaimCoordinate, derive_overlay,
+    overlay_episode_revision, unlogged_transitions, validate_lifecycle_reason,
 };
 use crate::service::{
     ConflictCoverage, FleetMemoryService, RecallAction, RecallRequest, RecallResult, Refusal,
@@ -45,6 +47,18 @@ pub struct LifecycleServing {
     /// Drop synthetic `claim:{id}` chunk hits whose claim is no longer
     /// lifecycle-current from `recall(search, kind=chunk)`.
     pub hide_non_current_claim_chunks: bool,
+    /// Attach the conflict lifecycle overlay (and, for `recall(get,
+    /// kind=conflict)`, the lifecycle history) through a separate read after
+    /// each main read. It needs the ledger's conflict lifecycle capability.
+    pub lifecycle_overlay: bool,
+}
+
+/// Whether a response's conflicts carry the lifecycle overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayOutcome {
+    Evaluated,
+    /// The overlay read failed; the main result is returned without it.
+    Unavailable,
 }
 
 /// The executable service composition: shared hybrid corpus reads plus the
@@ -328,15 +342,19 @@ impl CockroachMemoryService {
             (self.retrieve_chunks(&params).await?, None)
         };
         let metadata_elided = self.hydrate_retrieval_metadata(&mut hits).await?;
-        let projection = self.project_chunk_conflicts(scope, &hits).await?;
+        let mut projection = self.project_chunk_conflicts(scope, &hits).await?;
         let conflict_matches = conflict_match_diagnostics(
             &projection.conflicts,
             &hits,
             &projection.support_coordinates,
         )?;
+        let overlay = self
+            .overlay_conflicts(scope, &mut projection.conflicts)
+            .await;
         let mut result = RecallResult::new(json!({ "hits": hits }));
         result.conflicts = serialize_conflicts(&projection.conflicts)?;
         result.conflict_coverage = conflict_coverage(false, &projection.conflicts);
+        mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
         if projection.support_claims_truncated {
             result.warnings.push(json!({
                 "code": "support_claim_projection_truncated",
@@ -395,17 +413,23 @@ impl CockroachMemoryService {
                     .await
                     .map_err(service_error)?;
                 let claim_ids = hits.iter().map(|hit| hit.claim.id).collect::<Vec<_>>();
-                let conflicts = self
+                let mut conflicts = self
                     .ledger
                     .conflicts_for_claim_ids(scope, &claim_ids, MAX_TOOL_RESULTS)
                     .await
                     .map_err(service_error)?;
                 let coverage_complete = conflicts.len() < MAX_TOOL_RESULTS
                     && conflicts.iter().all(conflict_projection_complete);
+                let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
                 let hits = compact_claim_hits(hits);
                 let mut result = RecallResult::new(json!({ "hits": hits }));
                 result.conflicts = serialize_conflicts(&conflicts)?;
                 result.conflict_coverage = conflict_coverage(coverage_complete, &conflicts);
+                mark_lifecycle_overlay(
+                    &mut result.conflict_coverage,
+                    &mut result.warnings,
+                    overlay,
+                );
                 result.diagnostics.insert(
                     "retrieval".into(),
                     json!({ "lane": "claim_passage_dense", "model": self.embedder.model_id() }),
@@ -433,15 +457,21 @@ impl CockroachMemoryService {
                     .await
                     .map_err(service_error)?;
                 let mut result = RecallResult::new(json!({ "claim": claim }));
-                let conflicts = self
+                let mut conflicts = self
                     .ledger
                     .conflicts_for_claim_ids(scope, &[id], MAX_TOOL_RESULTS)
                     .await
                     .map_err(service_error)?;
                 let coverage_complete = conflicts.len() < MAX_TOOL_RESULTS
                     && conflicts.iter().all(conflict_projection_complete);
+                let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
                 result.conflicts = serialize_conflicts(&conflicts)?;
                 result.conflict_coverage = conflict_coverage(coverage_complete, &conflicts);
+                mark_lifecycle_overlay(
+                    &mut result.conflict_coverage,
+                    &mut result.warnings,
+                    overlay,
+                );
                 Ok(result)
             }
             "chunk" => {
@@ -470,24 +500,55 @@ impl CockroachMemoryService {
             // Conflict lookup by id is part of the lifecycle surface; the
             // record-only (publication) surface keeps its historical kinds.
             "conflict" if self.lifecycle.surface != RememberSurface::RECORD_ONLY => {
-                let id = parse_safe_id(&args.id)?;
-                let conflicts = self
-                    .ledger
-                    .get_conflicts(scope, &[id])
-                    .await
-                    .map_err(service_error)?;
-                let serialized = serialize_conflicts(&conflicts)?;
-                let mut result =
-                    RecallResult::new(json!({ "conflict": serialized.first().cloned() }));
-                result.conflict_coverage =
-                    conflict_coverage(lifecycle_coverage_complete(&[id], &conflicts), &conflicts);
-                result.conflicts = serialized;
-                Ok(result)
+                self.recall_conflict(scope, &args.id).await
             }
             other => Err(ServiceError::InvalidRequest(format!(
                 "recall get kind {other:?} is not supported"
             ))),
         }
+    }
+
+    /// `recall(get, kind=conflict)`: one conflict in any state, with its
+    /// members and, where the overlay is served, its lifecycle overlay and
+    /// its lifecycle history.
+    async fn recall_conflict(&self, scope: &FleetScope, id: &Value) -> ServiceResult<RecallResult> {
+        let id = parse_safe_id(id)?;
+        let mut conflicts = self
+            .ledger
+            .get_conflicts(scope, &[id])
+            .await
+            .map_err(service_error)?;
+        let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
+        let serialized = serialize_conflicts(&conflicts)?;
+        let mut result = RecallResult::new(json!({ "conflict": serialized.first().cloned() }));
+        // History is a second read of the same log, after the overlay's.
+        if let (Some(_), Some(conflict)) = (overlay, conflicts.first()) {
+            match self.ledger.conflict_lifecycle_history(scope, id).await {
+                Ok(history) => {
+                    let gaps = unlogged_transitions(
+                        &history.events,
+                        conflict.revision,
+                        !history.truncated,
+                    );
+                    result.data["history"] = json!(history.events);
+                    result.data["history_truncated"] = json!(history.truncated);
+                    result.data["unlogged_transitions"] = json!(gaps);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, conflict_id = id, "conflict lifecycle history read failed");
+                    result.data["history"] = Value::Null;
+                    result.warnings.push(json!({
+                        "code": "lifecycle_history_unavailable",
+                        "message": "the conflict's lifecycle history could not be read; the conflict itself is current"
+                    }));
+                }
+            }
+        }
+        result.conflict_coverage =
+            conflict_coverage(lifecycle_coverage_complete(&[id], &conflicts), &conflicts);
+        result.conflicts = serialized;
+        mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
+        Ok(result)
     }
 
     async fn recall_conflicts(
@@ -497,18 +558,93 @@ impl CockroachMemoryService {
     ) -> ServiceResult<RecallResult> {
         let args: ConflictArgs = from_arguments(arguments, "recall conflicts")?;
         let limit = bounded_limit(args.limit)?;
-        let conflicts = self
+        let mut conflicts = self
             .ledger
             .list_conflicts(scope, args.include_resolved, limit)
             .await
             .map_err(service_error)?;
         let coverage_complete =
             conflicts.len() < limit && conflicts.iter().all(conflict_projection_complete);
+        let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
         let serialized = serialize_conflicts(&conflicts)?;
         let mut result = RecallResult::new(json!({ "conflicts": serialized }));
         result.conflicts = serialized;
         result.conflict_coverage = conflict_coverage(coverage_complete, &conflicts);
+        mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
         Ok(result)
+    }
+
+    /// Attach the lifecycle overlay to `conflicts` with one autocommit read
+    /// after the main read, which has already committed. `None` when the
+    /// overlay is not served. A failed read leaves the conflicts as they are
+    /// and reports `Unavailable`; it never fails the response.
+    async fn overlay_conflicts(
+        &self,
+        scope: &FleetScope,
+        conflicts: &mut [Conflict],
+    ) -> Option<OverlayOutcome> {
+        if !self.lifecycle.lifecycle_overlay {
+            return None;
+        }
+        let mut episodes = conflicts
+            .iter()
+            .map(|conflict| {
+                (
+                    conflict.id,
+                    overlay_episode_revision(&conflict.state, conflict.revision),
+                )
+            })
+            .collect::<Vec<_>>();
+        episodes.sort_unstable();
+        episodes.dedup();
+        if episodes.is_empty() {
+            return Some(OverlayOutcome::Evaluated);
+        }
+        match self.ledger.conflict_lifecycle_rows(scope, &episodes).await {
+            Ok(rows) => {
+                for conflict in conflicts.iter_mut() {
+                    let events = rows.events.get(&conflict.id).map_or(&[][..], Vec::as_slice);
+                    let truncated = events.len() > MAX_OVERLAY_EPISODE_EVENTS;
+                    let shown = &events[..events.len().min(MAX_OVERLAY_EPISODE_EVENTS)];
+                    let member_count = i64::try_from(conflict.member_count).unwrap_or(i64::MAX);
+                    conflict.lifecycle = Some(derive_overlay(
+                        &conflict.state,
+                        conflict.revision,
+                        member_count,
+                        shown,
+                        truncated,
+                        rows.evaluated_at,
+                    ));
+                }
+                Some(OverlayOutcome::Evaluated)
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "conflict lifecycle overlay read failed");
+                Some(OverlayOutcome::Unavailable)
+            }
+        }
+    }
+
+    /// The overlay for a committed mutation's conflict projection. A
+    /// projection that already failed carries no overlay.
+    async fn overlay_projection(
+        &self,
+        scope: &FleetScope,
+        conflicts: crate::Result<Vec<Conflict>>,
+    ) -> (crate::Result<Vec<Conflict>>, Option<OverlayOutcome>) {
+        match conflicts {
+            Ok(mut conflicts) => {
+                let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
+                (Ok(conflicts), overlay)
+            }
+            Err(error) => {
+                let overlay = self
+                    .lifecycle
+                    .lifecycle_overlay
+                    .then_some(OverlayOutcome::Unavailable);
+                (Err(error), overlay)
+            }
+        }
     }
 
     async fn recall_status(&self, arguments: Map<String, Value>) -> ServiceResult<RecallResult> {
@@ -551,7 +687,10 @@ impl CockroachMemoryService {
             .ledger
             .conflicts_for_claim_ids(scope, &[mutation.claim.id], MAX_TOOL_RESULTS)
             .await;
-        Ok(committed_remember_result(&mutation, conflicts))
+        let (conflicts, overlay) = self.overlay_projection(scope, conflicts).await;
+        let mut result = committed_remember_result(&mutation, conflicts);
+        mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
+        Ok(result)
     }
 
     async fn remember_retract(
@@ -596,6 +735,42 @@ impl CockroachMemoryService {
         Ok(self.lifecycle_result(scope, &mutation).await)
     }
 
+    async fn remember_acknowledge(
+        &self,
+        scope: &FleetScope,
+        request: RememberRequest,
+    ) -> ServiceResult<RememberResult> {
+        let idempotency_key = required_idempotency_key(request.action, request.idempotency_key)?;
+        let (target, reason) = parse_acknowledge_arguments(request.arguments)?;
+        let mutation = self
+            .ledger
+            .acknowledge_conflict(scope, target, reason.as_deref(), &idempotency_key)
+            .await
+            .map_err(service_error)?;
+        Ok(self.conflict_result(scope, &mutation).await)
+    }
+
+    async fn remember_resolve(
+        &self,
+        scope: &FleetScope,
+        request: RememberRequest,
+    ) -> ServiceResult<RememberResult> {
+        let idempotency_key = required_idempotency_key(request.action, request.idempotency_key)?;
+        let (target, retract_claim_ids, reason) = parse_resolve_arguments(request.arguments)?;
+        let mutation = self
+            .ledger
+            .resolve_conflict(
+                scope,
+                target,
+                &retract_claim_ids,
+                reason.as_deref(),
+                &idempotency_key,
+            )
+            .await
+            .map_err(service_error)?;
+        Ok(self.conflict_result(scope, &mutation).await)
+    }
+
     /// Project a committed (or replayed) lifecycle mutation: every conflict it
     /// touched, in any state, from the claim's lineage membership plus
     /// whatever the detector re-evaluated.
@@ -610,7 +785,43 @@ impl CockroachMemoryService {
         } else {
             self.ledger.get_conflicts(scope, &requested).await
         };
-        committed_lifecycle_result(mutation, &requested, conflicts)
+        let (conflicts, overlay) = self.overlay_projection(scope, conflicts).await;
+        let mut result = committed_lifecycle_result(mutation, &requested, conflicts);
+        mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
+        result
+    }
+
+    /// Project a committed (or replayed) conflict mutation with the conflict
+    /// it acted on, in its current state.
+    async fn conflict_result(
+        &self,
+        scope: &FleetScope,
+        mutation: &ConflictMutation,
+    ) -> RememberResult {
+        let mut requested = mutation
+            .conflicts_resolved
+            .iter()
+            .copied()
+            .chain([mutation.conflict_id])
+            .collect::<Vec<_>>();
+        requested.sort_unstable();
+        requested.dedup();
+        let conflicts = self.ledger.get_conflicts(scope, &requested).await;
+        let (conflicts, overlay) = self.overlay_projection(scope, conflicts).await;
+        let mut result = committed_conflict_result(mutation, &requested, conflicts);
+        mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
+        result
+    }
+
+    async fn replayed_result(
+        &self,
+        scope: &FleetScope,
+        mutation: &LifecycleMutation,
+    ) -> RememberResult {
+        match mutation {
+            LifecycleMutation::Claim(mutation) => self.lifecycle_result(scope, mutation).await,
+            LifecycleMutation::Conflict(mutation) => self.conflict_result(scope, mutation).await,
+        }
     }
 
     /// A committed request replays before any precondition, the surface
@@ -639,6 +850,16 @@ impl CockroachMemoryService {
                     successor: Box::new(successor),
                 },
             ),
+            RememberAction::Acknowledge => parse_acknowledge_arguments(request.arguments)
+                .ok()
+                .map(|(target, reason)| UnservedLifecycle::Acknowledge { target, reason }),
+            RememberAction::Resolve => parse_resolve_arguments(request.arguments).ok().map(
+                |(target, retract_claim_ids, reason)| UnservedLifecycle::Resolve {
+                    target,
+                    retract_claim_ids,
+                    reason,
+                },
+            ),
             _ => None,
         };
         let replay = self
@@ -651,7 +872,7 @@ impl CockroachMemoryService {
             .await
             .map_err(service_error)?;
         match replay {
-            Some(mutation) => Ok(self.lifecycle_result(scope, &mutation).await),
+            Some(mutation) => Ok(self.replayed_result(scope, &mutation).await),
             None => Err(refusal),
         }
     }
@@ -703,7 +924,7 @@ fn committed_remember_result(
 ) -> RememberResult {
     let expected_conflict_ids = &mutation.claim.conflict_ids;
     let replay = mutation.idempotent_replay;
-    project_committed_conflicts(mutation, conflicts, |conflicts| {
+    project_committed_conflicts(claim_mutation_data(mutation), conflicts, |conflicts| {
         // A fresh record's projected open conflicts are exactly its lineage
         // memberships. A replayed receipt carries the claim as it was then;
         // a membership it lists may have closed since, so only an open
@@ -727,9 +948,61 @@ fn committed_lifecycle_result(
     requested: &[i64],
     conflicts: crate::Result<Vec<Conflict>>,
 ) -> RememberResult {
-    project_committed_conflicts(mutation, conflicts, |conflicts| {
+    project_committed_conflicts(claim_mutation_data(mutation), conflicts, |conflicts| {
         lifecycle_coverage_complete(requested, conflicts)
     })
+}
+
+/// Build a conflict mutation's response after commit, with the same coverage
+/// rule as a claim lifecycle mutation.
+fn committed_conflict_result(
+    mutation: &ConflictMutation,
+    requested: &[i64],
+    conflicts: crate::Result<Vec<Conflict>>,
+) -> RememberResult {
+    let data = serde_json::to_value(mutation).unwrap_or_else(|error| {
+        tracing::error!(
+            error = %error,
+            conflict_id = mutation.conflict_id,
+            "committed conflict mutation could not be fully serialized"
+        );
+        json!({
+            "operation": mutation.operation.as_str(),
+            "conflict_id": mutation.conflict_id,
+            "conflict_state": mutation.conflict_state.as_str(),
+            "conflict_revision": mutation.conflict_revision,
+            "applied": mutation.applied,
+            "idempotent_replay": mutation.idempotent_replay,
+        })
+    });
+    project_committed_conflicts(data, conflicts, |conflicts| {
+        lifecycle_coverage_complete(requested, conflicts)
+    })
+}
+
+/// Record the overlay outcome on a response's conflict coverage. An
+/// unavailable overlay adds a warning but never fails the response.
+fn mark_lifecycle_overlay(
+    coverage: &mut ConflictCoverage,
+    warnings: &mut Vec<Value>,
+    outcome: Option<OverlayOutcome>,
+) {
+    let Some(outcome) = outcome else {
+        return;
+    };
+    let status = match outcome {
+        OverlayOutcome::Evaluated => "evaluated",
+        OverlayOutcome::Unavailable => "unavailable",
+    };
+    coverage
+        .details
+        .insert("lifecycle_overlay".into(), Value::String(status.into()));
+    if outcome == OverlayOutcome::Unavailable {
+        warnings.push(json!({
+            "code": "lifecycle_overlay_unavailable",
+            "message": "conflict lifecycle state (acknowledgements, closes, and history) could not be read; the conflicts themselves are current"
+        }));
+    }
 }
 
 fn lifecycle_coverage_complete(requested: &[i64], conflicts: &[Conflict]) -> bool {
@@ -761,16 +1034,11 @@ fn affected_conflict_ids(mutation: &ClaimMutation) -> Vec<i64> {
     ids
 }
 
-fn project_committed_conflicts(
-    mutation: &ClaimMutation,
-    conflicts: crate::Result<Vec<Conflict>>,
-    coverage_complete: impl FnOnce(&[Conflict]) -> bool,
-) -> RememberResult {
-    let claim_id = mutation.claim.id;
-    let data = serde_json::to_value(mutation).unwrap_or_else(|error| {
+fn claim_mutation_data(mutation: &ClaimMutation) -> Value {
+    serde_json::to_value(mutation).unwrap_or_else(|error| {
         tracing::error!(
             error = %error,
-            claim_id,
+            claim_id = mutation.claim.id,
             "committed remember mutation could not be fully serialized"
         );
         json!({
@@ -784,7 +1052,14 @@ fn project_committed_conflicts(
             "conflicts_opened": &mutation.conflicts_opened,
             "conflicts_resolved": &mutation.conflicts_resolved,
         })
-    });
+    })
+}
+
+fn project_committed_conflicts(
+    data: Value,
+    conflicts: crate::Result<Vec<Conflict>>,
+    coverage_complete: impl FnOnce(&[Conflict]) -> bool,
+) -> RememberResult {
     let mut result = RememberResult::new(data);
     result
         .diagnostics
@@ -797,12 +1072,11 @@ fn project_committed_conflicts(
                 result.conflict_coverage =
                     conflict_coverage(coverage_complete(&conflicts), &conflicts);
             }
-            Err(error) => mark_post_commit_projection_unavailable(&mut result, claim_id, &error),
+            Err(error) => mark_post_commit_projection_unavailable(&mut result, &error),
         },
         Err(error) => {
             tracing::error!(
                 error = %error,
-                claim_id,
                 "committed remember conflict projection failed"
             );
             mark_post_commit_projection_unavailable_without_error(&mut result);
@@ -811,14 +1085,9 @@ fn project_committed_conflicts(
     result
 }
 
-fn mark_post_commit_projection_unavailable(
-    result: &mut RememberResult,
-    claim_id: i64,
-    error: &ServiceError,
-) {
+fn mark_post_commit_projection_unavailable(result: &mut RememberResult, error: &ServiceError) {
     tracing::error!(
         error = %error,
-        claim_id,
         "committed remember conflict projection serialization failed"
     );
     mark_post_commit_projection_unavailable_without_error(result);
@@ -1022,6 +1291,8 @@ impl FleetMemoryService for CockroachMemoryService {
             RememberAction::Assert => Err(Self::assert_route_disabled()),
             RememberAction::Retract => self.remember_retract(&scope, request).await,
             RememberAction::Supersede => self.remember_supersede(&scope, request).await,
+            RememberAction::Acknowledge => self.remember_acknowledge(&scope, request).await,
+            RememberAction::Resolve => self.remember_resolve(&scope, request).await,
             action => Err(ServiceError::InvalidRequest(format!(
                 "remember({}) is not implemented yet",
                 action.as_str()
@@ -1074,6 +1345,15 @@ enum UnservedLifecycle {
         reason: Option<String>,
         successor: Box<ClaimInput>,
     },
+    Acknowledge {
+        target: ConflictTarget,
+        reason: Option<String>,
+    },
+    Resolve {
+        target: ConflictTarget,
+        retract_claim_ids: Vec<i64>,
+        reason: Option<String>,
+    },
 }
 
 impl UnservedLifecycle {
@@ -1091,6 +1371,19 @@ impl UnservedLifecycle {
                 target: *target,
                 reason: reason.as_deref(),
                 successor,
+            },
+            Self::Acknowledge { target, reason } => LifecycleReplayRequest::Acknowledge {
+                target: *target,
+                reason: reason.as_deref(),
+            },
+            Self::Resolve {
+                target,
+                retract_claim_ids,
+                reason,
+            } => LifecycleReplayRequest::Resolve {
+                target: *target,
+                retract_claim_ids,
+                reason: reason.as_deref(),
             },
         }
     }
@@ -1154,6 +1447,106 @@ fn parse_claim_target_arguments(
         },
         args.reason,
     ))
+}
+
+/// `remember(acknowledge)` arguments.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgeArgs {
+    conflict_id: Value,
+    expected_revision: i64,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `remember(resolve)` arguments: a concession of the caller's own claims.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveArgs {
+    conflict_id: Value,
+    expected_revision: i64,
+    expected_member_count: i64,
+    #[serde(default)]
+    retract_claim_ids: Vec<Value>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn parse_acknowledge_arguments(
+    arguments: Map<String, Value>,
+) -> ServiceResult<(ConflictTarget, Option<String>)> {
+    let args: AcknowledgeArgs = from_arguments(arguments, "remember acknowledge")?;
+    let target = conflict_target(&args.conflict_id, args.expected_revision, None)?;
+    validate_optional_reason(args.reason.as_deref())?;
+    Ok((target, args.reason))
+}
+
+fn parse_resolve_arguments(
+    arguments: Map<String, Value>,
+) -> ServiceResult<(ConflictTarget, Vec<i64>, Option<String>)> {
+    let args: ResolveArgs = from_arguments(arguments, "remember resolve")?;
+    let target = conflict_target(
+        &args.conflict_id,
+        args.expected_revision,
+        Some(args.expected_member_count),
+    )?;
+    if args.retract_claim_ids.len() > MAX_CONCESSION_CLAIMS {
+        return Err(ServiceError::InvalidRequest(format!(
+            "retract_claim_ids accepts at most {MAX_CONCESSION_CLAIMS} claims"
+        )));
+    }
+    let mut retract_claim_ids = Vec::with_capacity(args.retract_claim_ids.len());
+    for value in &args.retract_claim_ids {
+        let id = parse_safe_id(value).map_err(|_| {
+            ServiceError::InvalidRequest(format!(
+                "retract_claim_ids must be integers between 1 and {MAX_SAFE_INTEGER}"
+            ))
+        })?;
+        if retract_claim_ids.contains(&id) {
+            return Err(ServiceError::InvalidRequest(
+                "retract_claim_ids must not repeat a claim".into(),
+            ));
+        }
+        retract_claim_ids.push(id);
+    }
+    retract_claim_ids.sort_unstable();
+    validate_optional_reason(args.reason.as_deref())?;
+    Ok((target, retract_claim_ids, args.reason))
+}
+
+fn conflict_target(
+    conflict_id: &Value,
+    expected_revision: i64,
+    expected_member_count: Option<i64>,
+) -> ServiceResult<ConflictTarget> {
+    let conflict_id = parse_safe_id(conflict_id).map_err(|_| {
+        ServiceError::InvalidRequest(format!(
+            "conflict_id must be an integer between 1 and {MAX_SAFE_INTEGER}"
+        ))
+    })?;
+    if !(1..=MAX_SAFE_INTEGER).contains(&expected_revision) {
+        return Err(ServiceError::InvalidRequest(format!(
+            "expected_revision must be between 1 and {MAX_SAFE_INTEGER}"
+        )));
+    }
+    if expected_member_count.is_some_and(|count| !(1..=MAX_CONFLICT_MEMBER_COUNT).contains(&count))
+    {
+        return Err(ServiceError::InvalidRequest(format!(
+            "expected_member_count must be between 1 and {MAX_CONFLICT_MEMBER_COUNT}"
+        )));
+    }
+    Ok(ConflictTarget {
+        conflict_id,
+        expected_revision,
+        expected_member_count,
+    })
+}
+
+fn validate_optional_reason(reason: Option<&str>) -> ServiceResult<()> {
+    if let Some(reason) = reason {
+        validate_lifecycle_reason(reason).map_err(ServiceError::InvalidRequest)?;
+    }
+    Ok(())
 }
 
 fn required_idempotency_key(action: RememberAction, key: Option<String>) -> ServiceResult<String> {
@@ -2012,11 +2405,18 @@ mod tests {
             .with_lifecycle(LifecycleServing {
                 surface,
                 hide_non_current_claim_chunks: surface.claim_lifecycle,
+                lifecycle_overlay: surface.conflict_lifecycle,
             })
     }
 
     const CLAIM_LIFECYCLE: RememberSurface = RememberSurface {
         claim_lifecycle: true,
+        conflict_lifecycle: false,
+    };
+
+    const CONFLICT_LIFECYCLE: RememberSurface = RememberSurface {
+        claim_lifecycle: true,
+        conflict_lifecycle: true,
     };
 
     fn retract_arguments(value: &Value) -> Map<String, Value> {
@@ -2392,6 +2792,207 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, ServiceError::InvalidRequest(_)), "{error}");
+    }
+
+    fn conflict_arguments(extra: &Value) -> Map<String, Value> {
+        let mut arguments = retract_arguments(&json!({
+            "conflict_id": 9,
+            "expected_revision": 3,
+        }));
+        arguments.extend(retract_arguments(extra));
+        arguments
+    }
+
+    #[test]
+    fn acknowledge_resolve_args_reject_unknown_and_bounds() {
+        let (target, reason) =
+            parse_acknowledge_arguments(conflict_arguments(&json!({ "reason": "on it" }))).unwrap();
+        assert_eq!(
+            target,
+            ConflictTarget {
+                conflict_id: 9,
+                expected_revision: 3,
+                expected_member_count: None,
+            }
+        );
+        assert_eq!(reason.as_deref(), Some("on it"));
+
+        let (target, ids, reason) = parse_resolve_arguments(conflict_arguments(&json!({
+            "conflict_id": "9",
+            "expected_member_count": 2,
+            "retract_claim_ids": [43, "41"],
+        })))
+        .unwrap();
+        assert_eq!(target.conflict_id, 9);
+        assert_eq!(target.expected_member_count, Some(2));
+        assert_eq!(ids, [41, 43], "ids are sorted");
+        assert!(reason.is_none());
+        // With no claims named, resolve only re-verifies the conflict.
+        let (_, ids, _) =
+            parse_resolve_arguments(conflict_arguments(&json!({ "expected_member_count": 2 })))
+                .unwrap();
+        assert!(ids.is_empty());
+
+        let too_many = (1..=33).collect::<Vec<i64>>();
+        for rejected in [
+            json!({ "claim_id": 41 }),
+            json!({ "expected_member_count": 2 }),
+            json!({ "retract_claim_ids": [41] }),
+            json!({ "text": "smuggled" }),
+            json!({ "conflict_id": 0 }),
+            json!({ "conflict_id": 9_007_199_254_740_992_i64 }),
+            json!({ "expected_revision": 0 }),
+            json!({ "reason": " " }),
+        ] {
+            assert!(
+                matches!(
+                    parse_acknowledge_arguments(conflict_arguments(&rejected)),
+                    Err(ServiceError::InvalidRequest(_))
+                ),
+                "acknowledge {rejected}"
+            );
+        }
+        for rejected in [
+            json!({}),
+            json!({ "expected_member_count": 0 }),
+            json!({ "expected_member_count": 4_097 }),
+            json!({ "expected_member_count": 2, "retract_claim_ids": [41, 41] }),
+            json!({ "expected_member_count": 2, "retract_claim_ids": [0] }),
+            json!({ "expected_member_count": 2, "retract_claim_ids": too_many }),
+            json!({ "expected_member_count": 2, "claim_id": 41 }),
+            json!({ "expected_member_count": 2, "winner": 41 }),
+            json!({ "expected_member_count": 2, "reason": "" }),
+        ] {
+            assert!(
+                matches!(
+                    parse_resolve_arguments(conflict_arguments(&rejected)),
+                    Err(ServiceError::InvalidRequest(_))
+                ),
+                "resolve {rejected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conflict_actions_are_gated_before_io() {
+        let resolve = || conflict_arguments(&json!({ "expected_member_count": 2 }));
+        // Without the conflict surface there is no key to replay, so the
+        // refusal needs no I/O.
+        for (action, arguments) in [
+            (RememberAction::Acknowledge, conflict_arguments(&json!({}))),
+            (RememberAction::Resolve, resolve()),
+        ] {
+            let error = FleetMemoryService::remember(
+                &offline_service(CLAIM_LIFECYCLE),
+                offline_scope(),
+                RememberRequest::new(action, None, arguments),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&error, ServiceError::Refused(refusal) if refusal.code == "lifecycle_unavailable"),
+                "{error}"
+            );
+        }
+
+        let served = offline_service(CONFLICT_LIFECYCLE);
+        for (action, arguments) in [
+            (RememberAction::Acknowledge, conflict_arguments(&json!({}))),
+            (RememberAction::Resolve, resolve()),
+        ] {
+            let error = FleetMemoryService::remember(
+                &served,
+                offline_scope(),
+                RememberRequest::new(action, None, arguments.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&error, ServiceError::InvalidRequest(message)
+                    if *message == format!("remember({}) requires idempotency_key", action.as_str())),
+                "{error}"
+            );
+            // A ledger that never passed the startup probe refuses before it
+            // touches the database, whatever the surface says.
+            let error = FleetMemoryService::remember(
+                &served,
+                offline_scope(),
+                RememberRequest::new(action, Some("conflict/9".into()), arguments),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&error, ServiceError::Refused(refusal) if refusal.code == "lifecycle_unavailable"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_overlay_outcome_marks_coverage_without_failing() {
+        let mut coverage = conflict_coverage(true, &[]);
+        let mut warnings = Vec::new();
+        mark_lifecycle_overlay(&mut coverage, &mut warnings, None);
+        assert!(coverage.details.get("lifecycle_overlay").is_none());
+        assert!(warnings.is_empty());
+
+        mark_lifecycle_overlay(
+            &mut coverage,
+            &mut warnings,
+            Some(OverlayOutcome::Evaluated),
+        );
+        assert_eq!(coverage.details["lifecycle_overlay"], "evaluated");
+        assert!(warnings.is_empty());
+
+        mark_lifecycle_overlay(
+            &mut coverage,
+            &mut warnings,
+            Some(OverlayOutcome::Unavailable),
+        );
+        assert_eq!(coverage.details["lifecycle_overlay"], "unavailable");
+        assert_eq!(
+            coverage.status, "complete",
+            "the conflicts are still complete"
+        );
+        assert_eq!(warnings[0]["code"], "lifecycle_overlay_unavailable");
+    }
+
+    #[test]
+    fn conflict_mutation_response_projects_its_conflict() {
+        let mutation = ConflictMutation {
+            operation: "acknowledge".into(),
+            conflict_id: 9,
+            conflict_state: "open".into(),
+            conflict_revision: 2,
+            member_count: 2,
+            applied: false,
+            status: Some("already_acknowledged".into()),
+            lifecycle_event: None,
+            claims_retracted: Vec::new(),
+            claims_restored: Vec::new(),
+            conflicts_resolved: Vec::new(),
+            reevaluation: None,
+            idempotent_replay: true,
+        };
+        let v2 = fixture_conflict(9, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2);
+        let result = committed_conflict_result(&mutation, &[9], Ok(vec![v2]));
+        assert_eq!(result.data["conflict_id"], 9);
+        assert_eq!(result.data["applied"], false);
+        assert_eq!(result.data["status"], "already_acknowledged");
+        assert_eq!(result.conflict_coverage.status, "complete");
+        assert_eq!(result.conflicts[0]["id"], 9);
+        let missing = committed_conflict_result(&mutation, &[9], Ok(Vec::new()));
+        assert_eq!(missing.conflict_coverage.status, "partial");
+        let degraded = committed_conflict_result(
+            &mutation,
+            &[9],
+            Err(FleetError::Memory("sensitive backend detail".into())),
+        );
+        assert_eq!(
+            degraded.conflict_coverage.details["reason"],
+            "post_commit_projection_unavailable"
+        );
+        assert_eq!(degraded.data["conflict_id"], 9);
     }
 
     #[test]

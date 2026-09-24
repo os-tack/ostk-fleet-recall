@@ -1,9 +1,10 @@
 -- Long-lived runtime-writer role boundary for the dedicated fleet_recall
 -- database.
 --
--- Run only after the complete successful migration prefix 1 through 18. Later
--- successful migrations are compatible and cannot mask a missing or failed row
--- in that bounded prefix. Run only as a cluster admin; database ownership alone
+-- Run only after the complete successful migration prefix 1 through 18 and the
+-- successful conflict-lifecycle migration 29. Other later successful migrations
+-- are compatible and cannot mask a missing or failed row in that bounded
+-- prefix. Run only as a cluster admin; database ownership alone
 -- is insufficient. This policy is independent of the private control,
 -- activation, successor, and reconciliation ceremonies and neither requires nor
 -- creates their roles.
@@ -79,6 +80,26 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
             MESSAGE = 'runtime writer role requires the complete successful migration prefix through 18';
+    END IF;
+END
+$$;
+
+-- Serving conflict lifecycle (ADR 0004): its log table exists only from
+-- migration 29, and this policy grants on it below. A policy applied before
+-- migration 29 must fail here, before any change, rather than on the GRANT.
+DO $$
+DECLARE
+    lifecycle_schema_ready BOOL;
+BEGIN
+    SELECT count(*) = 1 AND COALESCE(bool_and(success), false)
+    INTO lifecycle_schema_ready
+    FROM public._sqlx_migrations
+    WHERE version = 29;
+
+    IF lifecycle_schema_ready IS DISTINCT FROM true THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'runtime writer role requires successful migration 29 (conflict lifecycle events)';
     END IF;
 END
 $$;
@@ -730,6 +751,15 @@ TO fleet_runtime;
 
 GRANT DELETE ON TABLE public.memory_chunk_history TO fleet_runtime;
 
+-- Serving conflict lifecycle log (ADR 0004, migration 29). Append-only by
+-- privilege: no UPDATE and no DELETE, so a committed acknowledgement or close
+-- event can never be rewritten by the runtime. The table has no foreign key,
+-- so no parent grant is needed. Never granted to the publication reader. The
+-- writer's startup probe serves acknowledge, concession resolve, and the
+-- lifecycle overlay only once both privileges are present, so restart serve
+-- after applying this policy.
+GRANT SELECT, INSERT ON TABLE public.memory_conflict_lifecycle_events_v1 TO fleet_runtime;
+
 -- Exact Stage-4 evidence-plane surface (ADR 0002 D2). `remember` must commit
 -- its accepted event and its projection in ONE serializable transaction, so
 -- the appending identity is this same logical role. It receives append and
@@ -785,11 +815,11 @@ TO fleet_runtime;
 GRANT fleet_runtime TO fleet_writer;
 
 -- Exact direct logical-role surface: database CONNECT, public-schema USAGE,
--- forty-two table-privilege rows, and three sequence-USAGE rows. Because
+-- forty-four table-privilege rows, and three sequence-USAGE rows. Because
 -- SHOW GRANTS FOR also exposes cluster-global external connections, the exact
 -- count rejects those and every function/type/differently privileged row.
 SELECT IF(
-    count(*) = 47
+    count(*) = 49
         AND COALESCE(bool_and(
             NOT is_grantable
             AND (
@@ -823,7 +853,8 @@ SELECT IF(
                                 'memory_content_objects',
                                 'memory_relation_projection_v1',
                                 'memory_relation_projection_watermarks_v1',
-                                'memory_writer_authority_v1'
+                                'memory_writer_authority_v1',
+                                'memory_conflict_lifecycle_events_v1'
                             ))
                         OR (privilege_type = 'INSERT'
                             AND object_name IN (
@@ -842,7 +873,8 @@ SELECT IF(
                                 'memory_evidence_shard_heads',
                                 'memory_content_objects',
                                 'memory_relation_projection_v1',
-                                'memory_relation_projection_watermarks_v1'
+                                'memory_relation_projection_watermarks_v1',
+                                'memory_conflict_lifecycle_events_v1'
                             ))
                         OR (privilege_type = 'UPDATE'
                             AND object_name IN (
@@ -871,7 +903,7 @@ SELECT IF(
     1:::INT8,
     CAST(
         concat(
-            'runtime writer direct-grant postcondition differs from exact forty-seven-row matrix: observed=',
+            'runtime writer direct-grant postcondition differs from exact forty-nine-row matrix: observed=',
             count(*)::STRING
         )
         AS INT8

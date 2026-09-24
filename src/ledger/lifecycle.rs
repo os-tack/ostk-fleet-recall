@@ -6,13 +6,18 @@
 //! and whether the key's v2 conflict may be closed. The store module only
 //! reads, locks, and applies what these functions decide.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::ledger::{ClaimKind, ClaimState, functional_values_are_incompatible, intervals_overlap};
+use crate::ledger::{
+    Acknowledgement, ClaimKind, ClaimState, ClosureView, ConflictLifecycleEvent,
+    ConflictLifecycleOverlay, RevisionGap, WaiverView, functional_values_are_incompatible,
+    intervals_overlap,
+};
 use crate::memory_contracts::discrepancy::is_blank_rationale;
 use crate::{FleetError, FleetScope, Result};
 
@@ -24,6 +29,23 @@ pub const OPERATOR_ASSERTED_ORIGIN: &str = "operator_asserted";
 pub const MAX_LIFECYCLE_REASON_CHARS: usize = 1_000;
 /// Remaining incompatible pairs echoed in a reevaluation; the count is exact.
 pub const MAX_REPORTED_REMAINING_PAIRS: usize = 32;
+/// Claims one concession `resolve` may retract.
+pub const MAX_CONCESSION_CLAIMS: usize = 32;
+/// Durable members a conflict lifecycle mutation may count; the lifecycle
+/// log's CHECK admits no more.
+pub const MAX_CONFLICT_MEMBER_COUNT: i64 = 4_096;
+/// Events one conflict's lifecycle log may hold (its `event_seq` CHECK).
+pub const MAX_CONFLICT_LIFECYCLE_EVENTS: i64 = 4_096;
+/// Events the overlay reads per episode, newest first; one more is fetched
+/// as a sentinel.
+pub const MAX_OVERLAY_EPISODE_EVENTS: usize = 32;
+/// Acknowledgers the overlay lists; the rest are reported as truncated.
+pub const MAX_OVERLAY_ACKNOWLEDGERS: usize = 16;
+/// Events `recall(get, kind=conflict)` returns as history; one more is
+/// fetched as a sentinel.
+pub const MAX_HISTORY_EVENTS: usize = 256;
+/// Characters of a waiver rationale the overlay echoes.
+const MAX_OVERLAY_RATIONALE_CHARS: usize = 1_000;
 
 const V2_DETECTOR_CLASS: i64 = 2;
 const LEGACY_DETECTOR_CLASS: i64 = 1;
@@ -466,6 +488,246 @@ pub fn plan_reevaluation(
         revision: lineage.revision,
         pairs: rust_pairs,
     }
+}
+
+/// A concession's split of the key's locked current claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Concession {
+    /// The caller's own member claims to retract, ascending by id.
+    pub retracted: Vec<LockedKeyClaim>,
+    /// Every other locked current claim of the key, ascending by id.
+    pub remaining: Vec<LockedKeyClaim>,
+}
+
+/// Check a concession `resolve`: every claim it names must be a member of
+/// the conflict, lifecycle-current, and the caller's own operator assertion.
+/// It never touches another agent's claim (DISC-03).
+///
+/// `retract_claim_ids` is sorted and deduplicated. `members` are the named
+/// ids that are members of the conflict, with their plain-read state and
+/// revision. `current` is the key's lifecycle-current claims, locked in
+/// ascending id order.
+pub fn plan_concession(
+    conflict_id: i64,
+    agent: &str,
+    retract_claim_ids: &[i64],
+    members: &[(i64, ClaimState, i64)],
+    current: Vec<LockedKeyClaim>,
+) -> Result<Concession> {
+    let members = members
+        .iter()
+        .map(|(id, state, revision)| (*id, (*state, *revision)))
+        .collect::<BTreeMap<_, _>>();
+    let mut retracted = Vec::with_capacity(retract_claim_ids.len());
+    for claim_id in retract_claim_ids {
+        let Some((state, revision)) = members.get(claim_id) else {
+            return Err(LifecycleRefusal::new(
+                RefusalCode::NotMember,
+                format!("claim {claim_id} is not a member of conflict {conflict_id}"),
+                json!({ "conflict_id": conflict_id, "claim_id": claim_id }),
+            )
+            .into());
+        };
+        let Some(locked) = current.iter().find(|claim| claim.id == *claim_id) else {
+            if state.is_current() {
+                // A current member always carries the conflict's own key.
+                return Err(FleetError::Memory(
+                    "a current conflict member was missing from its key's locked claims".into(),
+                ));
+            }
+            return Err(LifecycleRefusal::new(
+                RefusalCode::NotCurrent,
+                format!(
+                    "claim {claim_id} is {}, not active or disputed",
+                    state.as_str()
+                ),
+                json!({
+                    "claim_id": claim_id,
+                    "current_revision": revision,
+                    "current_state": state.as_str(),
+                }),
+            )
+            .into());
+        };
+        // The conflict's revision and member count guard the caller's view,
+        // so each claim is checked at its locked revision.
+        check_owner_transition(locked, agent, locked.revision)?;
+        retracted.push(locked.clone());
+    }
+    let remaining = current
+        .into_iter()
+        .filter(|claim| retract_claim_ids.binary_search(&claim.id).is_err())
+        .collect();
+    Ok(Concession {
+        retracted,
+        remaining,
+    })
+}
+
+/// The conflict revision whose lifecycle events describe the row: the current
+/// revision of an open conflict, and the episode a close ended otherwise
+/// (a close always advances the revision by one).
+#[must_use]
+pub fn overlay_episode_revision(state: &str, revision: i64) -> i64 {
+    if is_closed_state(state) {
+        (revision - 1).max(1)
+    } else {
+        revision
+    }
+}
+
+fn is_closed_state(state: &str) -> bool {
+    matches!(state, "resolved" | "dismissed")
+}
+
+/// Derive the lifecycle overlay of one conflict row from its episode's
+/// events, evaluated at the database time `evaluated_at`.
+///
+/// A closed row reads `clear` and names its logged close, if any. An open
+/// row reads `waived` only while its latest waiver is unexpired and the
+/// conflict still has the members it was waived with; otherwise it reads
+/// `acknowledged` when an agent acknowledged this episode, and `open`
+/// otherwise. Acknowledgement never changes the read side (ADR 0003).
+#[must_use]
+pub fn derive_overlay(
+    state: &str,
+    revision: i64,
+    member_count: i64,
+    events: &[ConflictLifecycleEvent],
+    events_truncated: bool,
+    evaluated_at: DateTime<Utc>,
+) -> ConflictLifecycleOverlay {
+    let episode_revision = overlay_episode_revision(state, revision);
+    let mut episode = events
+        .iter()
+        .filter(|event| event.episode_revision == episode_revision)
+        .collect::<Vec<_>>();
+    episode.sort_by_key(|event| event.seq);
+    let acknowledgements = episode
+        .iter()
+        .filter(|event| event.kind == "acknowledged")
+        .collect::<Vec<_>>();
+    let acknowledged_by = acknowledgements
+        .iter()
+        .take(MAX_OVERLAY_ACKNOWLEDGERS)
+        .map(|event| Acknowledgement {
+            actor: event.actor.clone(),
+            at: event.created_at,
+            reason: event.rationale.clone(),
+        })
+        .collect::<Vec<_>>();
+    let acknowledgers_truncated =
+        acknowledgements.len() > MAX_OVERLAY_ACKNOWLEDGERS || events_truncated;
+
+    if is_closed_state(state) {
+        let closed_by = episode
+            .iter()
+            .rev()
+            .find(|event| is_closed_state(&event.kind) && event.result_revision == revision)
+            .map(|event| ClosureView {
+                actor_kind: event.actor_kind.clone(),
+                actor: event.actor.clone(),
+                operation: event.operation.clone(),
+                reason_kind: event.reason_kind.clone(),
+                at: event.created_at,
+            });
+        return ConflictLifecycleOverlay {
+            state: state.to_owned(),
+            read_side: "clear".into(),
+            episode_revision,
+            acknowledged_by,
+            acknowledgers_truncated,
+            waiver: None,
+            closed_unlogged: closed_by.is_none(),
+            closed_by,
+            evaluated_at,
+        };
+    }
+
+    let waiver = episode
+        .iter()
+        .rev()
+        .find(|event| event.kind == "waived")
+        .and_then(|event| {
+            let expires_at = event.expires_at?;
+            let void_reason = if expires_at <= evaluated_at {
+                Some("expired")
+            } else if event.member_count != member_count {
+                Some("membership_changed")
+            } else {
+                None
+            };
+            let active = void_reason.is_none();
+            Some(WaiverView {
+                actor: event.actor.clone(),
+                reason_kind: event.reason_kind.clone(),
+                rationale: event.rationale.as_deref().map(|rationale| {
+                    rationale
+                        .chars()
+                        .take(MAX_OVERLAY_RATIONALE_CHARS)
+                        .collect()
+                }),
+                expires_at,
+                review_by: event.review_by,
+                review_due: active && event.review_by.is_some_and(|at| at <= evaluated_at),
+                member_count: event.member_count,
+                active,
+                void_reason: void_reason.map(str::to_owned),
+            })
+        });
+    let waiver_active = waiver.as_ref().is_some_and(|waiver| waiver.active);
+    let overlay_state = if waiver_active {
+        "waived"
+    } else if acknowledged_by.is_empty() {
+        "open"
+    } else {
+        "acknowledged"
+    };
+    ConflictLifecycleOverlay {
+        state: overlay_state.into(),
+        read_side: if waiver_active { "waived" } else { "open" }.into(),
+        episode_revision,
+        acknowledged_by,
+        acknowledgers_truncated,
+        waiver,
+        closed_by: None,
+        closed_unlogged: false,
+        evaluated_at,
+    }
+}
+
+/// The revision ranges a conflict passed through without a logged event.
+///
+/// A conflict is created open at revision 1. Each logged event starts at its
+/// `episode_revision` and leaves `result_revision`; a later event, or the
+/// current row, at a higher revision means something unlogged moved the
+/// conflict in between (a reopen by `record`, or a close from before the
+/// lifecycle log). `events` are in `seq` order; `complete` is false when the
+/// history was truncated, so no trailing gap can be inferred.
+#[must_use]
+pub fn unlogged_transitions(
+    events: &[ConflictLifecycleEvent],
+    current_revision: i64,
+    complete: bool,
+) -> Vec<RevisionGap> {
+    let mut gaps = Vec::new();
+    let mut cursor = 1_i64;
+    for event in events {
+        if event.episode_revision > cursor {
+            gaps.push(RevisionGap {
+                from_revision: cursor,
+                to_revision: event.episode_revision,
+            });
+        }
+        cursor = cursor.max(event.result_revision);
+    }
+    if complete && current_revision > cursor {
+        gaps.push(RevisionGap {
+            from_revision: cursor,
+            to_revision: current_revision,
+        });
+    }
+    gaps
 }
 
 /// Canonical idempotency identity for a lifecycle mutation. It binds the
@@ -991,6 +1253,320 @@ mod tests {
         ] {
             assert!(validate_reason(&rejected).is_err(), "{rejected:?}");
         }
+    }
+
+    fn owned(id: i64, actor: &str, value: &str, state: ClaimState) -> LockedKeyClaim {
+        LockedKeyClaim {
+            actor: Some(actor.into()),
+            state,
+            revision: 4,
+            ..locked(id, json!(value), 1)
+        }
+    }
+
+    #[test]
+    fn plan_concession_refusals() {
+        let mine = owned(41, "agent-a", "x", ClaimState::Disputed);
+        let theirs = owned(42, "agent-b", "y", ClaimState::Disputed);
+        let third = owned(43, "agent-c", "z", ClaimState::Disputed);
+        let current = vec![mine.clone(), theirs.clone(), third.clone()];
+        let members = [
+            (41, ClaimState::Disputed, 4),
+            (42, ClaimState::Disputed, 4),
+            (44, ClaimState::Retracted, 5),
+        ];
+
+        let concession = plan_concession(9, "agent-a", &[41], &members, current.clone()).unwrap();
+        assert_eq!(concession.retracted, std::slice::from_ref(&mine));
+        assert_eq!(concession.remaining, [theirs.clone(), third.clone()]);
+        // Re-verification alone retracts nothing.
+        let verify = plan_concession(9, "agent-a", &[], &[], current.clone()).unwrap();
+        assert!(verify.retracted.is_empty());
+        assert_eq!(verify.remaining.len(), 3);
+
+        let refused = |ids: &[i64], agent: &str| match plan_concession(
+            9,
+            agent,
+            ids,
+            &members,
+            current.clone(),
+        ) {
+            Err(FleetError::LifecycleRefused(refusal)) => *refusal,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        // Another agent's member is never retracted on its behalf (DISC-03).
+        let not_owner = refused(&[41, 42], "agent-a");
+        assert_eq!(not_owner.code, RefusalCode::NotOwner);
+        assert_eq!(not_owner.details["claim_id"], 42);
+        // A current claim on the key that is not in this conflict.
+        let not_member = refused(&[43], "agent-c");
+        assert_eq!(not_member.code, RefusalCode::NotMember);
+        assert_eq!(
+            not_member.details,
+            json!({ "conflict_id": 9, "claim_id": 43 })
+        );
+        // A member that is no longer current.
+        let not_current = refused(&[44], "agent-a");
+        assert_eq!(not_current.code, RefusalCode::NotCurrent);
+        assert_eq!(not_current.details["current_state"], "retracted");
+        assert_eq!(not_current.details["current_revision"], 5);
+        // Ownership also requires an operator assertion.
+        let mut derived = mine;
+        derived.origin = "source_derived".into();
+        let refusal =
+            plan_concession(9, "agent-a", &[41], &members, vec![derived, theirs]).unwrap_err();
+        assert!(matches!(
+            refusal,
+            FleetError::LifecycleRefused(refusal) if refusal.code == RefusalCode::NotOperatorAsserted
+        ));
+        // A current member missing from its key's locked claims is corruption.
+        assert!(matches!(
+            plan_concession(9, "agent-a", &[41], &members, vec![third]),
+            Err(FleetError::Memory(_))
+        ));
+    }
+
+    #[test]
+    fn concession_verification_is_the_detector_verdict() {
+        let lineage = Some(open_lineage());
+        let x = owned(41, "agent-a", "x", ClaimState::Disputed);
+        let y = owned(42, "agent-b", "y", ClaimState::Disputed);
+        let z = owned(43, "agent-c", "z", ClaimState::Disputed);
+        let members = [
+            (41, ClaimState::Disputed, 4),
+            (42, ClaimState::Disputed, 4),
+            (43, ClaimState::Disputed, 4),
+        ];
+        // Two-party: conceding x leaves y alone, so the detector closes.
+        let two =
+            plan_concession(9, "agent-a", &[41], &members, vec![x.clone(), y.clone()]).unwrap();
+        assert!(matches!(
+            plan_reevaluation(lineage, &two.remaining, &[]),
+            Reevaluation::Close { ref restore_candidates, .. } if *restore_candidates == [42]
+        ));
+        // Three-way: y and z still disagree, so the concession is refused.
+        let three = plan_concession(9, "agent-a", &[41], &members, vec![x, y, z]).unwrap();
+        let Reevaluation::StillOpen { pairs, .. } =
+            plan_reevaluation(lineage, &three.remaining, &[(42, 43)])
+        else {
+            panic!("y and z keep the conflict open");
+        };
+        assert_eq!(pairs, [(42, 43)]);
+    }
+
+    fn event(seq: i64, kind: &str, episode: i64, actor: &str) -> ConflictLifecycleEvent {
+        let at = DateTime::parse_from_rfc3339("2026-09-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let closes = matches!(kind, "resolved" | "dismissed");
+        ConflictLifecycleEvent {
+            seq,
+            kind: kind.into(),
+            actor_kind: if kind == "resolved" {
+                "detector"
+            } else {
+                "agent"
+            }
+            .into(),
+            actor: actor.into(),
+            operation: match kind {
+                "acknowledged" => "conflict_acknowledge",
+                "waived" => "conflict_waive",
+                "dismissed" => "conflict_dismiss",
+                _ => "retract",
+            }
+            .into(),
+            episode_revision: episode,
+            result_revision: episode + i64::from(closes),
+            reason_kind: None,
+            rationale: Some(format!("{actor} note")),
+            expires_at: None,
+            review_by: None,
+            member_count: 2,
+            created_at: at + chrono::Duration::seconds(seq),
+            payload: None,
+            payload_elided: false,
+        }
+    }
+
+    fn waiver(
+        seq: i64,
+        episode: i64,
+        expires_at: DateTime<Utc>,
+        members: i64,
+    ) -> ConflictLifecycleEvent {
+        ConflictLifecycleEvent {
+            expires_at: Some(expires_at),
+            member_count: members,
+            reason_kind: Some("capacity_deferred".into()),
+            ..event(seq, "waived", episode, "agent-c")
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // one table of overlay rules
+    fn derive_overlay_rules() {
+        let now = DateTime::parse_from_rfc3339("2026-09-24T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let later = now + chrono::Duration::hours(1);
+        let earlier = now - chrono::Duration::hours(1);
+
+        // No events: open, read side open.
+        let open = derive_overlay("open", 3, 2, &[], false, now);
+        assert_eq!(
+            (open.state.as_str(), open.read_side.as_str()),
+            ("open", "open")
+        );
+        assert_eq!(open.episode_revision, 3);
+        assert_eq!(open.evaluated_at, now);
+
+        // Acknowledgement is triage only: it never changes the read side.
+        let acks = [
+            event(1, "acknowledged", 3, "agent-a"),
+            event(2, "acknowledged", 3, "agent-b"),
+        ];
+        let acknowledged = derive_overlay("open", 3, 2, &acks, false, now);
+        assert_eq!(acknowledged.state, "acknowledged");
+        assert_eq!(acknowledged.read_side, "open");
+        assert_eq!(
+            acknowledged
+                .acknowledged_by
+                .iter()
+                .map(|ack| (ack.actor.as_str(), ack.reason.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("agent-a", Some("agent-a note")),
+                ("agent-b", Some("agent-b note"))
+            ]
+        );
+        assert!(!acknowledged.acknowledgers_truncated);
+
+        // Events of an older episode (before a reopen) are ignored.
+        let stale = derive_overlay("open", 5, 2, &acks, false, now);
+        assert_eq!(stale.state, "open");
+        assert!(stale.acknowledged_by.is_empty());
+
+        // An active waiver reads waived; review becomes due at review_by.
+        let mut active = waiver(3, 3, later, 2);
+        active.review_by = Some(earlier);
+        let mut events = acks.to_vec();
+        events.push(active);
+        let waived = derive_overlay("open", 3, 2, &events, false, now);
+        assert_eq!(
+            (waived.state.as_str(), waived.read_side.as_str()),
+            ("waived", "waived")
+        );
+        let view = waived.waiver.unwrap();
+        assert!(view.active && view.review_due);
+        assert_eq!(view.void_reason, None);
+
+        // An expired waiver reads open again, keeping its context.
+        let expired = derive_overlay("open", 3, 2, &[waiver(1, 3, earlier, 2)], false, now);
+        assert_eq!(
+            (expired.state.as_str(), expired.read_side.as_str()),
+            ("open", "open")
+        );
+        let view = expired.waiver.unwrap();
+        assert!(!view.active);
+        assert_eq!(view.void_reason.as_deref(), Some("expired"));
+        // A waiver ends exactly at its expiry.
+        let boundary = derive_overlay("open", 3, 2, &[waiver(1, 3, now, 2)], false, now);
+        assert_eq!(
+            boundary.waiver.unwrap().void_reason.as_deref(),
+            Some("expired")
+        );
+
+        // A member joined after the waiver: it no longer covers the conflict.
+        let joined = derive_overlay("open", 3, 3, &[waiver(1, 3, later, 2)], false, now);
+        assert_eq!(joined.state, "open");
+        assert_eq!(
+            joined.waiver.unwrap().void_reason.as_deref(),
+            Some("membership_changed")
+        );
+        // Only the latest waiver counts.
+        let replaced = derive_overlay(
+            "open",
+            3,
+            2,
+            &[waiver(1, 3, later, 2), waiver(2, 3, earlier, 2)],
+            false,
+            now,
+        );
+        assert_eq!(replaced.state, "open");
+
+        // Closed rows read clear and name their logged close.
+        let mut close = event(3, "resolved", 3, "same_key_functional_value_v2");
+        close.reason_kind = Some("no_current_incompatibility".into());
+        let mut closed_events = acks.to_vec();
+        closed_events.push(close);
+        let resolved = derive_overlay("resolved", 4, 2, &closed_events, false, now);
+        assert_eq!(
+            (resolved.state.as_str(), resolved.read_side.as_str()),
+            ("resolved", "clear")
+        );
+        assert_eq!(resolved.episode_revision, 3);
+        let closed_by = resolved.closed_by.unwrap();
+        assert_eq!(closed_by.actor_kind, "detector");
+        assert_eq!(closed_by.operation, "retract");
+        assert_eq!(
+            closed_by.reason_kind.as_deref(),
+            Some("no_current_incompatibility")
+        );
+        assert!(!resolved.closed_unlogged);
+        assert!(resolved.waiver.is_none());
+        assert_eq!(resolved.acknowledged_by.len(), 2);
+        // A close before the lifecycle log existed is reported as unlogged.
+        let unlogged = derive_overlay("resolved", 2, 2, &[], false, now);
+        assert_eq!(unlogged.read_side, "clear");
+        assert!(unlogged.closed_unlogged && unlogged.closed_by.is_none());
+        let dismissed = derive_overlay("dismissed", 4, 2, &[], false, now);
+        assert_eq!(
+            (dismissed.state.as_str(), dismissed.read_side.as_str()),
+            ("dismissed", "clear")
+        );
+
+        // More acknowledgers than the overlay lists are reported, not dropped
+        // silently, and so is an episode with more events than were read.
+        let many = (1..=17)
+            .map(|seq| event(seq, "acknowledged", 3, &format!("agent-{seq}")))
+            .collect::<Vec<_>>();
+        let crowded = derive_overlay("open", 3, 2, &many, false, now);
+        assert_eq!(crowded.acknowledged_by.len(), MAX_OVERLAY_ACKNOWLEDGERS);
+        assert_eq!(crowded.acknowledged_by[0].actor, "agent-1");
+        assert!(crowded.acknowledgers_truncated);
+        assert!(derive_overlay("open", 3, 2, &acks, true, now).acknowledgers_truncated);
+    }
+
+    #[test]
+    fn unlogged_transition_gaps() {
+        let gap = |from_revision, to_revision| RevisionGap {
+            from_revision,
+            to_revision,
+        };
+        // Created open at 1, acknowledged and closed by a logged retract.
+        let logged = [
+            event(1, "acknowledged", 1, "agent-a"),
+            event(2, "resolved", 1, "same_key_functional_value_v2"),
+        ];
+        assert!(unlogged_transitions(&logged, 2, true).is_empty());
+        // record reopened it (2 -> 3): an unlogged transition.
+        assert_eq!(unlogged_transitions(&logged, 3, true), [gap(2, 3)]);
+        // A truncated history cannot see its own tail.
+        assert!(unlogged_transitions(&logged, 3, false).is_empty());
+        // An unlogged close and reopen before the first logged event.
+        let later = [
+            event(1, "acknowledged", 3, "agent-a"),
+            event(2, "resolved", 3, "same_key_functional_value_v2"),
+            event(3, "acknowledged", 5, "agent-b"),
+        ];
+        assert_eq!(
+            unlogged_transitions(&later, 5, true),
+            [gap(1, 3), gap(4, 5)]
+        );
+        // No log at all: every revision after creation is unlogged.
+        assert_eq!(unlogged_transitions(&[], 3, true), [gap(1, 3)]);
+        assert!(unlogged_transitions(&[], 1, true).is_empty());
     }
 
     #[test]

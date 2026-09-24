@@ -14,15 +14,18 @@ use sqlx::{Row, Transaction};
 use crate::ledger::types::PreparedClaim;
 use crate::ledger::{
     Claim, ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimSupport,
-    ClaimTarget, Conflict, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
-    FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2, LifecycleReplayRequest, SemanticClaimHit,
-    SupportedClaimCoordinate, SupportedClaimIds,
+    ClaimTarget, Conflict, ConflictHistory, ConflictLifecycleRows, ConflictMutation,
+    ConflictTarget, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2,
+    LifecycleMutation, LifecycleReplayRequest, SemanticClaimHit, SupportedClaimCoordinate,
+    SupportedClaimIds,
 };
 use crate::store::cockroach::{
-    EMBEDDING_DIMENSION, RetryPolicy, serialize_vector, with_serializable_retry,
+    ConflictLifecycleCapability, EMBEDDING_DIMENSION, RetryPolicy, serialize_vector,
+    with_serializable_retry,
 };
 use crate::{FleetError, FleetScope, Result};
 
+mod conflict_store;
 mod lifecycle_store;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
@@ -307,6 +310,10 @@ pub struct CockroachClaimLedger {
     embedder: Arc<dyn ChunkEmbedder>,
     claim_model: String,
     retry_policy: RetryPolicy,
+    /// Set only from a successful startup probe; without it the conflict
+    /// lifecycle is refused as `lifecycle_unavailable` and closes are audited
+    /// in `memory_events` only.
+    conflict_lifecycle: Option<ConflictLifecycleCapability>,
 }
 
 impl std::fmt::Debug for CockroachClaimLedger {
@@ -317,6 +324,7 @@ impl std::fmt::Debug for CockroachClaimLedger {
             .field("embedding_model", &self.claim_model)
             .field("embedding_dim", &self.embedder.dim())
             .field("retry_policy", &self.retry_policy)
+            .field("conflict_lifecycle", &self.conflict_lifecycle.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -346,7 +354,26 @@ impl CockroachClaimLedger {
             claim_model: embedder.model_id().to_string(),
             embedder,
             retry_policy,
+            conflict_lifecycle: None,
         })
+    }
+
+    /// Serve the conflict lifecycle (`acknowledge`, concession `resolve`, the
+    /// lifecycle overlay and history) and log detector-verified closes, as the
+    /// startup probe established this role may.
+    #[must_use]
+    pub const fn with_conflict_lifecycle(
+        mut self,
+        capability: ConflictLifecycleCapability,
+    ) -> Self {
+        self.conflict_lifecycle = Some(capability);
+        self
+    }
+
+    /// Whether this ledger holds the conflict lifecycle capability.
+    #[must_use]
+    pub const fn serves_conflict_lifecycle(&self) -> bool {
+        self.conflict_lifecycle.is_some()
     }
 
     fn ensure_scope(&self, scope: &FleetScope) -> Result<()> {
@@ -608,8 +635,53 @@ impl ClaimLedger for CockroachClaimLedger {
         scope: &FleetScope,
         idempotency_key: &str,
         request: Option<LifecycleReplayRequest<'_>>,
-    ) -> Result<Option<ClaimMutation>> {
+    ) -> Result<Option<LifecycleMutation>> {
         lifecycle_store::replay_unserved_lifecycle(self, scope, idempotency_key, request).await
+    }
+
+    async fn acknowledge_conflict(
+        &self,
+        scope: &FleetScope,
+        target: ConflictTarget,
+        reason: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<ConflictMutation> {
+        conflict_store::acknowledge_conflict(self, scope, target, reason, idempotency_key).await
+    }
+
+    async fn resolve_conflict(
+        &self,
+        scope: &FleetScope,
+        target: ConflictTarget,
+        retract_claim_ids: &[i64],
+        reason: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<ConflictMutation> {
+        conflict_store::resolve_conflict(
+            self,
+            scope,
+            target,
+            retract_claim_ids,
+            reason,
+            idempotency_key,
+        )
+        .await
+    }
+
+    async fn conflict_lifecycle_rows(
+        &self,
+        scope: &FleetScope,
+        episodes: &[(i64, i64)],
+    ) -> Result<ConflictLifecycleRows> {
+        conflict_store::conflict_lifecycle_rows(self, scope, episodes).await
+    }
+
+    async fn conflict_lifecycle_history(
+        &self,
+        scope: &FleetScope,
+        conflict_id: i64,
+    ) -> Result<ConflictHistory> {
+        conflict_store::conflict_lifecycle_history(self, scope, conflict_id).await
     }
 
     async fn get_conflicts(
@@ -2481,6 +2553,7 @@ fn decode_conflict(
         member_values_elided,
         members,
         trigger_claim_ids: Vec::new(),
+        lifecycle: None,
     })
 }
 
