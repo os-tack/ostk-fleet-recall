@@ -24,9 +24,11 @@ use super::{CockroachEvidenceRecall, EvidenceDenseLaneV1, EvidenceRecall, probe_
 ///
 /// `embedding_model_sha256` is the pinned model's digest
 /// (`FLEET_RECALL_EMBEDDING_MODEL_SHA256`), the one the worker's dense rows
-/// record; the dense lane is served only while every dense row in the scope
-/// was embedded with it. The probe runs once, so a later grant, migration,
-/// or model change needs a restart.
+/// record. Every dense query compares the query vector only with rows that
+/// model embedded, so rows another model writes after startup are skipped,
+/// never compared. The dense lane is off for the process when, at startup,
+/// the scope's dense tier already holds rows of another model. The probe runs
+/// once, so a later grant, migration, or model change needs a restart.
 ///
 /// A missing migration or grant is logged at info level. A digest that does
 /// not parse or a probe that fails is logged at error level. Either way
@@ -47,7 +49,7 @@ pub async fn start_evidence_recall(
         Ok(Some(capability)) => {
             if capability.dense_lane() == EvidenceDenseLaneV1::DisabledForeignModel {
                 tracing::warn!(
-                    "evidence recall serves its lexical lane only: the scope's dense tier holds vectors of another embedding model; re-embed with this model and restart to serve the dense lane"
+                    "evidence recall serves its lexical lane only: the scope's dense tier holds vectors of another embedding model than FLEET_RECALL_EMBEDDING_MODEL_SHA256; the worker's embed step does not re-embed them, so the dense lane stays off until serve and the worker run the model those rows were embedded with"
                 );
             }
             tracing::info!("serving recall(kind=evidence)");

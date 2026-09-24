@@ -125,6 +125,9 @@ const GET_SQL: &str = "SELECT body.media_type, body.first_accepted_event_id, \
 pub struct EvidenceRecallCapability {
     tenant_id: Uuid,
     project: String,
+    /// The model this process embeds queries with; the dense lane compares
+    /// query vectors only with vectors it embedded.
+    model_digest: Sha256Digest,
     dense_served: bool,
 }
 
@@ -159,11 +162,15 @@ fn sqlstate(error: &sqlx::Error) -> Option<String> {
 /// any other failure is an error. The privilege check plans one statement over
 /// every table in a transaction that is rolled back, so it reads nothing.
 ///
-/// The probe also reads, once, whether the scope's dense tier holds a vector
-/// from a model other than `model_digest`, the model this process embeds
-/// queries with. If it does, the capability disables the dense lane: a query
-/// vector cannot be compared with another model's vectors. It runs once at
-/// startup, so a grant or model change needs a restart.
+/// `model_digest` is the model this process embeds queries with. Every dense
+/// query of the recall this capability builds is restricted to vectors that
+/// model embedded ([`CockroachRecallReader::with_dense_model`]), so a vector
+/// another model writes later, while this process runs, is never compared
+/// with a query vector. The probe also reads, once, whether the scope's dense
+/// tier already holds a vector of another model; if it does, the capability
+/// turns the dense lane off for the process and every answer says so, since
+/// such a tier is only partly searchable by this model. That read runs once
+/// at startup, so a grant or model change needs a restart.
 ///
 /// # Errors
 ///
@@ -203,6 +210,7 @@ pub async fn probe_evidence_recall(
     Ok(Some(EvidenceRecallCapability {
         tenant_id: scope.tenant_id,
         project: scope.project.clone(),
+        model_digest,
         dense_served: foreign.is_none(),
     }))
 }
@@ -235,10 +243,12 @@ impl CockroachEvidenceRecall {
         let EvidenceRecallCapability {
             tenant_id,
             project,
+            model_digest,
             dense_served,
         } = capability;
         Self {
-            reader: CockroachRecallReader::new(pool.clone(), tenant_id, project.clone()),
+            reader: CockroachRecallReader::new(pool.clone(), tenant_id, project.clone())
+                .with_dense_model(model_digest),
             pool,
             tenant_id,
             project,

@@ -13,10 +13,12 @@
 //! is healthy, fresh, and completely covered, and turns `unknown`, naming why,
 //! when evidence is waiting for projection, a source fails, or a source's
 //! last check goes stale; a query of stopwords or punctuation is an `unknown`
-//! answer, not an error; a body's full text comes back by id and nothing comes
-//! back for an id that is not in the scope; and the startup probe refuses a
-//! login that cannot read the Stage-5 tables while the runtime grants suffice
-//! for every read.
+//! answer, not an error; a decomposed or control-interrupted spelling of an
+//! indexed word is `present`; the dense lane never compares a query vector
+//! with a vector another model wrote; a body's full text comes back by id and
+//! nothing comes back for an id that is not in the scope; and the startup
+//! probe refuses a login that cannot read the Stage-5 tables while the
+//! runtime grants suffice for every read.
 //!
 //! Served over MCP (ADR 0006), composed as `serve` composes it: `tools/list`
 //! advertises `kind=evidence` exactly where the probe finds the Stage-5 tables
@@ -247,6 +249,58 @@ async fn live_evidence_search_hydrates_hits_when_configured() {
             .iter()
             .all(|hit| hit.matched_by == EvidenceMatchV1::Lexical)
     );
+}
+
+#[tokio::test]
+async fn live_dense_lane_never_compares_another_models_vectors_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let capabilities = capabilities(&database_url).await;
+    let fixture = WorkerFixture::install(&pool, "evidence-dense-model").await;
+    tick(&fixture, &pool, "all").await;
+    let recall = evidence(&pool, &capabilities, &fixture.installed.scope).await;
+
+    // A process that started while every vector was its model's never
+    // compares its query vector with one another model writes later. A query
+    // vector equal to a body's own is that body's nearest neighbour...
+    let mut commit = None;
+    for hit in &search(&recall, COMMIT_WORD).await.hits {
+        let body = recall.get(hit.id).await.unwrap().unwrap();
+        if body.text.contains(COMMIT_WORD) {
+            commit = Some(body);
+        }
+    }
+    let commit = commit.expect("the commit is recalled");
+    let exact = query_vector(&commit.text);
+    let answer = recall
+        .search(NONSENSE, Some(exact.clone()), 10)
+        .await
+        .unwrap();
+    assert!(
+        answer
+            .hits
+            .iter()
+            .any(|hit| hit.id == commit.id && hit.matched_by == EvidenceMatchV1::Dense),
+        "{:?}",
+        answer.hits
+    );
+    // ...until a worker running another model has written the scope's
+    // vectors: then nothing the dense lane could return is comparable.
+    sqlx::query(
+        "UPDATE memory_body_dense_projection_v1 SET model_digest = $3 \
+         WHERE tenant_id = $1 AND project = $2",
+    )
+    .bind(fixture.installed.scope.tenant_id)
+    .bind(&fixture.installed.scope.project)
+    .bind([0x11_u8; 32].as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let answer = recall.search(NONSENSE, Some(exact), 10).await.unwrap();
+    assert!(answer.hits.is_empty(), "{:?}", answer.hits);
+    assert_eq!(answer.absence.verdict, AbsenceVerdictV1::Absent);
 }
 
 #[tokio::test]

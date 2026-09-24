@@ -224,6 +224,23 @@ const DENSE_RECALL_SQL: &str = "SELECT body_content_id, \
      WHERE tenant_id = $1 AND project = $2 \
      ORDER BY embedding <=> $3::VECTOR(512) LIMIT $4";
 
+// The dense lane restricted to the vectors of one embedding model, for a
+// reader bound to one with `with_dense_model`. The model filter sits OUTSIDE
+// the nearest-neighbour subquery on purpose: inside it, `model_digest` would
+// be a predicate the C-SPANN index cannot serve (it is not an equality prefix
+// column), and CockroachDB would scan every vector in the project instead.
+// Outside, the ANN plan stays, and a neighbour embedded by another model is
+// dropped from the top-k rather than compared with a query vector it shares
+// no space with. With one model per scope the filter drops nothing.
+const DENSE_RECALL_MODEL_SQL: &str = "SELECT nearest.body_content_id, nearest.distance FROM (\
+     SELECT body_content_id, model_digest, \
+     (embedding <=> $3::VECTOR(512))::FLOAT4 AS distance \
+     FROM public.memory_body_dense_projection_v1 \
+     WHERE tenant_id = $1 AND project = $2 \
+     ORDER BY embedding <=> $3::VECTOR(512) LIMIT $4) AS nearest \
+     WHERE nearest.model_digest = $5 \
+     ORDER BY nearest.distance, nearest.body_content_id";
+
 // The publication plane's dense lane. Inlining the view adds
 // `visibility_class = 'publication_safe'`, which is why migration 0023 builds
 // memory_body_dense_projection_publication_idx with visibility_class in the
@@ -234,6 +251,17 @@ const DENSE_RECALL_PUBLICATION_SQL: &str = "SELECT body_content_id, \
      FROM public.memory_body_dense_publication_v1 \
      WHERE tenant_id = $1 AND project = $2 \
      ORDER BY embedding <=> $3::VECTOR(512) LIMIT $4";
+
+// DENSE_RECALL_MODEL_SQL over the publication view.
+const DENSE_RECALL_PUBLICATION_MODEL_SQL: &str = "SELECT nearest.body_content_id, \
+     nearest.distance FROM (\
+     SELECT body_content_id, model_digest, \
+     (embedding <=> $3::VECTOR(512))::FLOAT4 AS distance \
+     FROM public.memory_body_dense_publication_v1 \
+     WHERE tenant_id = $1 AND project = $2 \
+     ORDER BY embedding <=> $3::VECTOR(512) LIMIT $4) AS nearest \
+     WHERE nearest.model_digest = $5 \
+     ORDER BY nearest.distance, nearest.body_content_id";
 
 const COMPLETENESS_SQL: &str = "SELECT \
      (SELECT count(*) FROM public.memory_body_objects_v1 \
@@ -994,6 +1022,9 @@ impl DenseProjector for CockroachDenseProjector {
 pub struct CockroachRecallReader {
     scope: ScopeBinding,
     plane: RecallPlaneV1,
+    /// When set, the dense lane compares a query vector only with vectors
+    /// this model embedded.
+    dense_model: Option<Sha256Digest>,
 }
 
 impl std::fmt::Debug for CockroachRecallReader {
@@ -1002,6 +1033,7 @@ impl std::fmt::Debug for CockroachRecallReader {
             .debug_struct("CockroachRecallReader")
             .field("tenant_id", &self.scope.tenant_id)
             .field("project", &self.scope.project)
+            .field("dense_model", &self.dense_model)
             .finish_non_exhaustive()
     }
 }
@@ -1018,6 +1050,7 @@ impl CockroachRecallReader {
                 project,
             },
             plane: RecallPlaneV1::Private,
+            dense_model: None,
         }
     }
 
@@ -1038,7 +1071,22 @@ impl CockroachRecallReader {
                 project,
             },
             plane: RecallPlaneV1::Publication,
+            dense_model: None,
         }
+    }
+
+    /// Restrict the dense lane to vectors `model_digest` embedded.
+    ///
+    /// A query vector is only comparable with vectors of the model that made
+    /// it. Without this, the dense lane ranks every vector in the scope,
+    /// whichever model wrote it; with it, a neighbour of another model is
+    /// dropped from the nearest-neighbour top-k, so a mixed tier yields fewer
+    /// dense hits, never a comparison across models. The lexical lane and the
+    /// readiness counts are unaffected.
+    #[must_use]
+    pub const fn with_dense_model(mut self, model_digest: Sha256Digest) -> Self {
+        self.dense_model = Some(model_digest);
+        self
     }
 
     /// Which read plane this reader answers for.
@@ -1197,17 +1245,21 @@ impl CockroachRecallReader {
             )));
         }
         let encoded = serialize_vector(query_vector)?;
-        let statement = match self.plane {
-            RecallPlaneV1::Private => DENSE_RECALL_SQL,
-            RecallPlaneV1::Publication => DENSE_RECALL_PUBLICATION_SQL,
+        let statement = match (self.plane, self.dense_model.is_some()) {
+            (RecallPlaneV1::Private, false) => DENSE_RECALL_SQL,
+            (RecallPlaneV1::Private, true) => DENSE_RECALL_MODEL_SQL,
+            (RecallPlaneV1::Publication, false) => DENSE_RECALL_PUBLICATION_SQL,
+            (RecallPlaneV1::Publication, true) => DENSE_RECALL_PUBLICATION_MODEL_SQL,
         };
-        let rows: Vec<PgRow> = sqlx::query(statement)
+        let mut query = sqlx::query(statement)
             .bind(self.scope.tenant_id)
             .bind(&self.scope.project)
             .bind(encoded)
-            .bind(limit)
-            .fetch_all(&self.scope.pool)
-            .await?;
+            .bind(limit);
+        if let Some(model) = self.dense_model {
+            query = query.bind(model.as_bytes().to_vec());
+        }
+        let rows: Vec<PgRow> = query.fetch_all(&self.scope.pool).await?;
         rows.iter()
             .map(|row| {
                 Ok((
@@ -1316,6 +1368,8 @@ mod tests {
             LEXICAL_RECALL_PUBLICATION_SQL,
             DENSE_RECALL_SQL,
             DENSE_RECALL_PUBLICATION_SQL,
+            DENSE_RECALL_MODEL_SQL,
+            DENSE_RECALL_PUBLICATION_MODEL_SQL,
             COMPLETENESS_SQL,
             COMPLETENESS_PUBLICATION_SQL,
         ] {
@@ -1358,7 +1412,12 @@ mod tests {
         // only serve the ANN portion when every column ahead of the vector is
         // an equality predicate, so the dense query must never grow a range
         // filter or an extra prefix column.
-        for statement in [DENSE_RECALL_SQL, DENSE_RECALL_PUBLICATION_SQL] {
+        for statement in [
+            DENSE_RECALL_SQL,
+            DENSE_RECALL_PUBLICATION_SQL,
+            DENSE_RECALL_MODEL_SQL,
+            DENSE_RECALL_PUBLICATION_MODEL_SQL,
+        ] {
             assert!(statement.contains("WHERE tenant_id = $1 AND project = $2 "));
             assert!(statement.contains("ORDER BY embedding <=> $3::VECTOR(512)"));
             assert!(!statement.contains(" AND ("));
@@ -1378,6 +1437,7 @@ mod tests {
         for statement in [
             LEXICAL_RECALL_PUBLICATION_SQL,
             DENSE_RECALL_PUBLICATION_SQL,
+            DENSE_RECALL_PUBLICATION_MODEL_SQL,
             COMPLETENESS_PUBLICATION_SQL,
         ] {
             // Every publication statement reads publication views only. A base

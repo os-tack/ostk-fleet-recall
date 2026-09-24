@@ -68,10 +68,15 @@
 //! [`CockroachEvidenceRecall`] needs, once, at startup. It checks the schema
 //! has reached migration 30 and that the login may read every table this
 //! module reads, and it disables the dense lane for the process when the
-//! scope's dense tier holds vectors of a model other than the one the process
-//! embeds queries with. A deployment therefore runs one embedding model; a
-//! model change needs a re-embed and a restart. Evidence recall reads private
-//! base tables only, so the publication process never builds it.
+//! scope's dense tier already holds vectors of a model other than the one the
+//! process embeds queries with. Whether or not it does, every dense query
+//! compares the query vector only with vectors that model embedded, so a
+//! worker that starts writing another model's vectors later never makes a
+//! cross-model comparison. A deployment therefore runs one embedding model.
+//! The worker's embed step only embeds bodies that have no vector, so a
+//! model change leaves the old vectors in place: re-embedding them is not
+//! shipped yet. Evidence recall reads private base tables only, so the
+//! publication process never builds it.
 
 mod cockroach;
 mod serve;

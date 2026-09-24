@@ -194,14 +194,24 @@ before it is written.
 
 **Decision.** Every dense row records the digest of the model that embedded
 it (the operator's `FLEET_RECALL_EMBEDDING_MODEL_SHA256`), and `serve` embeds
-queries with the same pinned bundle. The startup probe checks once whether the
-scope's dense tier holds a vector of any other model; if it does, the dense
-lane is off for the process (`dense_lane: "disabled_foreign_model"`, logged at
-startup and warned on every answer) and the lexical lane still serves. A
-model change therefore needs a re-embed and a `serve` restart. Evidence
-search is not gated on the chunk corpus's embedding generation, which
-concerns a different table; the probe's check is the one that matters for
-its dense lane.
+queries with the same pinned bundle. Every evidence dense query compares the
+query vector only with rows whose `model_digest` is `serve`'s own: the filter
+sits outside the nearest-neighbour subquery, so the vector index still serves
+the scan, and a neighbour of another model is dropped rather than compared.
+A worker that starts writing another model's vectors while `serve` runs (the
+worker upgraded first, or host and container disagreeing on the digest)
+therefore costs dense hits, never a false `present`. The startup probe also
+checks once whether the scope's dense tier already holds a vector of another
+model; if it does, the dense lane is off for the process
+(`dense_lane: "disabled_foreign_model"`, logged at startup and warned on every
+answer) and the lexical lane still serves.
+
+A model change therefore needs `serve` and the worker to move together, and
+a restart. The worker's `embed` step only embeds bodies that have no vector
+yet, so it does not re-embed the old model's rows, and no re-embed step
+ships. Evidence search is
+not gated on the chunk corpus's embedding generation, which concerns a
+different table.
 
 ## D7 — UPDATE on `memory_content_objects`, for `SELECT ... FOR UPDATE`
 
