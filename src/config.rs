@@ -693,12 +693,19 @@ pub struct LifecycleConfig {
     /// `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` restores the record-only
     /// surface and its byte-identical `tools/list`, and skips the probe.
     pub remember_lifecycle: bool,
+    /// Serve adjudication: `remember(dismiss)` and `remember(waive)` by an
+    /// agent that authored none of a conflict's members (ADR 0004 D5). Off
+    /// unless `FLEET_RECALL_CONFLICT_ADJUDICATION=enabled`, and served only
+    /// when the conflict lifecycle is too; otherwise startup logs an error
+    /// and keeps it off.
+    pub conflict_adjudication: bool,
 }
 
 impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {
             remember_lifecycle: true,
+            conflict_adjudication: false,
         }
     }
 }
@@ -937,6 +944,15 @@ fn fleet_config_from_lookup(
             Some(_) => {
                 return Err(FleetError::Configuration(
                     "FLEET_RECALL_REMEMBER_LIFECYCLE must be enabled or disabled".into(),
+                ));
+            }
+        },
+        conflict_adjudication: match lookup("FLEET_RECALL_CONFLICT_ADJUDICATION").as_deref() {
+            None | Some("disabled") => false,
+            Some("enabled") => true,
+            Some(_) => {
+                return Err(FleetError::Configuration(
+                    "FLEET_RECALL_CONFLICT_ADJUDICATION must be enabled or disabled".into(),
                 ));
             }
         },

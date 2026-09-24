@@ -26,7 +26,7 @@ The `ostk-fleet-recall` binary has these commands:
     corpus and typed-claim state. `get` with `kind=conflict` returns one
     conflict by id in any state, with its members and its lifecycle history.
     Every conflict the private writer returns carries a `lifecycle` overlay:
-    who acknowledged it, and who closed it and how.
+    who acknowledged or waived it, and who closed it and how.
   - `remember(record)` records a deliberate typed claim with provenance,
     idempotent mutation receipts, and conflict detection.
   - `remember(retract)` retires a claim the calling agent authored. When no
@@ -43,6 +43,12 @@ The `ostk-fleet-recall` binary has these commands:
   - `remember(resolve)` concedes a conflict: it retracts the calling agent's
     own member claims it names, and closes the conflict only if the detector
     then finds no incompatible current pair. Otherwise nothing changes.
+  - `remember(dismiss)` and `remember(waive)` are adjudication, off unless
+    the deployment sets `FLEET_RECALL_CONFLICT_ADJUDICATION=enabled`. Only an
+    agent that authored none of a conflict's member claims may use them.
+    `dismiss` closes the conflict as not a real disagreement and returns its
+    members to `active`; `waive` accepts its current episode until an expiry,
+    and the conflict stays open and visible, reading `waived`.
 - `demo` serves a bounded, read-only HTTP surface (`/`, `/healthz`,
   `/api/status`, and `POST /api/recall`). It exposes no mutation route.
 - `migrate` applies the embedded CockroachDB schema migrations.
@@ -70,12 +76,16 @@ inference.
 A conflict is never resolved by fiat. An agent can retract, supersede, or
 concede only its own claims, and a conflict closes only when the detector
 re-checks the key and finds no incompatible current pair left
-([ADR 0004](docs/adr/0004-serving-conflict-lifecycle.md)). Acknowledgements
-and detector-verified closes are appended to a per-conflict lifecycle log
-(migration 0029). The writer serves `acknowledge`, `resolve`, the overlay, and
-history only when its startup probe finds that log and the runtime grants on
-it; otherwise it serves `retract` and `supersede` alone and closes are audited
-in `memory_events` only.
+([ADR 0004](docs/adr/0004-serving-conflict-lifecycle.md)). The one exception
+is adjudication, which a deployment must enable: an agent that authored none
+of a conflict's members may dismiss it as not a real disagreement, and the
+pairs it judged never keep that conflict open again. No action changes
+another agent's claim. Acknowledgements, waivers, dismissals, and
+detector-verified closes are appended to a per-conflict lifecycle log
+(migration 0029). The writer serves `acknowledge`, `resolve`, adjudication, the
+overlay, and history only when its startup probe finds that log and the
+runtime grants on it; otherwise it serves `retract` and `supersede` alone and
+closes are audited in `memory_events` only.
 On the private writer, chunk search also drops the synthetic `claim:{id}` hits of
 claims that are no longer current, lists them in
 `diagnostics.retrieval.lifecycle_hidden_claim_ids`, and refills the page from
@@ -558,9 +568,10 @@ revision or member count moved (`stale_revision`, `stale_member_count`; an
 open conflict gains members without a revision change).
 
 With the lifecycle log available, every conflict `recall` returns carries a
-`lifecycle` object: `state` (`open`, `acknowledged`, `resolved`, or
-`dismissed`), `read_side` (`open` or `clear`), the `episode_revision` it
-describes, `acknowledged_by` (at most 16, with `acknowledgers_truncated`),
+`lifecycle` object: `state` (`open`, `acknowledged`, `waived`, `resolved`, or
+`dismissed`), `read_side` (`open`, `waived`, or `clear`), the
+`episode_revision` it describes, `acknowledged_by` (at most 16, with
+`acknowledgers_truncated`), `waiver` for the episode's latest waiver (below),
 `closed_by` for a closed conflict, or `closed_unlogged` when the close predates
 the log. `conflict_coverage.lifecycle_overlay` is `evaluated`; if the overlay
 read fails it is `unavailable`, a `lifecycle_overlay_unavailable` warning is
@@ -573,21 +584,73 @@ without a logged event, such as a reopen by `record`. Retract and supersede
 closes are logged too, attributed to the detector with the caller's operation
 and reason as the cause.
 
+Adjudication is off unless the writer is started with
+`FLEET_RECALL_CONFLICT_ADJUDICATION=enabled` (the default is `disabled`) and
+its probe found the lifecycle log; with the switch set but no log, startup
+logs an error and keeps it off. Then `tools/list` adds `dismiss` and `waive`,
+for an agent that authored none of the conflict's member claims in any
+episode. An author of any member is refused as `implicated`, and a conflict
+with a member whose author was never recorded is refused as
+`unattributed_member` for everyone, since no agent can be shown to be
+uninvolved. Both actions take the conflict's revision and `member_count` as
+the adjudicator read them, a `reason_kind` from the discrepancy contract's
+closed vocabulary, and a required `rationale` of at most 1,000 characters,
+which is kept in the conflict's lifecycle log (readable by every agent in the
+project through the overlay and history) and never in the conflict row:
+
+```json
+{"action":"dismiss","idempotency_key":"readme/dismiss/v1","conflict_id":9,"expected_revision":1,"expected_member_count":2,"reason_kind":"false_positive","rationale":"the two values name different deployments of the migrator"}
+```
+
+A dismissal's `reason_kind` is `false_positive`, `duplicate_of_other_episode`,
+`out_of_scope`, or `not_reproducible`. The conflict becomes `dismissed` with
+`resolution_kind` `dismissed:<reason_kind>` and a fixed resolution reason, its
+disputed members that no other open conflict holds return to `active`
+(`claims_restored`), and a `dismissed` lifecycle event records every
+incompatible current pair it judged (at most 1,024, or `bound_exceeded`). No
+claim's value, author, or applicability changes. If `record` later reopens the
+conflict with a new incompatible claim, the judged pairs no longer count: a
+retract, supersede, or concession that leaves only dismissed pairs closes the
+conflict, and its `reevaluation.excluded_dismissed_pairs` and close event
+report how many were left out. A pair nobody dismissed still keeps it open.
+
+```json
+{"action":"waive","idempotency_key":"readme/waive/v1","conflict_id":9,"expected_revision":1,"expected_member_count":2,"reason_kind":"capacity_deferred","rationale":"the migrator review is scheduled for the next release","expires_in_hours":72,"review_in_hours":24}
+```
+
+A waiver's `reason_kind` is `capacity_deferred`, `cost_exceeds_risk`,
+`upstream_blocked`, `policy_exception`, or `scheduled_remediation`, and it
+lasts `expires_in_hours` (1 to 2,160, by the database clock), with an optional
+`review_in_hours` no later than that. It changes no row: the conflict and its
+members stay as they are, and the conflict keeps surfacing in every read with
+its `lifecycle.waiver` context (`actor`, `reason_kind`, `rationale`,
+`expires_at`, `review_by`, `review_due`, `member_count`, `active`, and
+`void_reason`). It reads `waived` only while the waiver is unexpired and the
+conflict still has the members it was waived with; after expiry
+(`void_reason:"expired"`) or once a member joins
+(`void_reason:"membership_changed"`) the same episode reads `open` again, with
+the waiver kept as context. A later waiver replaces an earlier one. Both
+actions are refused as `not_open` on a closed conflict and as
+`stale_revision` or `stale_member_count` when the caller's view moved, and a
+writer that does not serve them refuses them as `adjudication_disabled` (or
+`lifecycle_unavailable` without the log) after the usual receipt check.
+
 The log holds at most 4,096 events per conflict, and an event records at most
-4,096 members. `acknowledge`, whose only effect is its event, is refused as
-`bound_exceeded` when the log cannot hold it, and so are `acknowledge` and
-`resolve` on a conflict with more than 4,096 members. A close is never refused
-for the log's capacity: a retract, supersede, or resolve that closes such a
-conflict commits without its event (a `resolve` response's `lifecycle_event`
-is then null), and the conflict reads `closed_unlogged` with the close as an
-unlogged transition.
+4,096 members. `acknowledge`, `dismiss`, and `waive`, whose record is their
+event, are refused as `bound_exceeded` when the log cannot hold it, and so are
+the conflict actions on a conflict with more than 4,096 members. A
+detector-verified close is never refused for the log's capacity: a retract,
+supersede, or resolve that closes such a conflict commits without its event (a
+`resolve` response's `lifecycle_event` is then null), and the conflict reads
+`closed_unlogged` with the close as an unlogged transition.
 
 A writer that does not serve an action, such as one started with
 `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` or one whose probe found no
 lifecycle log, checks the key's receipt first: a request that already
 committed under the key replays its stored result, any other use of the key is
 an idempotency conflict, and only an unused key is refused as
-`lifecycle_unavailable`.
+`lifecycle_unavailable` (or, for `dismiss` and `waive` on a writer that serves
+the conflict lifecycle, `adjudication_disabled`).
 
 Most stdio MCP clients use a configuration shaped like the following. Replace
 the absolute paths and digest; this example deliberately contains only local,
@@ -667,11 +730,16 @@ the remaining rows.
   `remember(supersede)`, and the retractions of `remember(resolve)` change
   only an `operator_asserted` claim whose stored actor is the trusted
   deployment agent, and a successor keeps its predecessor's kind, key, and
-  detector eligibility. No agent can retire another agent's claim or declare
-  a conflict's outcome; a conflict closes only when the detector finds no
-  incompatible lifecycle-current pair. `remember(acknowledge)` is open to
-  every agent because it changes nothing but the overlay. Every refusal rolls
-  the whole transaction back. The lifecycle log is append-only for the runtime
+  detector eligibility. No agent can retire another agent's claim. A
+  conflict closes only when the detector finds no incompatible
+  lifecycle-current pair, or when an adjudicator dismisses it:
+  `remember(dismiss)` and `remember(waive)` are off unless
+  `FLEET_RECALL_CONFLICT_ADJUDICATION=enabled`, are refused to any author of
+  any of the conflict's members, and fail closed when a member has no
+  recorded author. A dismissal changes no claim's applicability, and a waiver
+  changes no row at all. `remember(acknowledge)` is open to every agent
+  because it changes nothing but the overlay. Every refusal rolls the whole
+  transaction back. The lifecycle log is append-only for the runtime
   role and never granted to the publication reader. This authority is as
   strong as the deployment's `FLEET_RECALL_AGENT` binding over the shared
   writer credential.

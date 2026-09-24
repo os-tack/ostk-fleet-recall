@@ -23,6 +23,28 @@ const CLAIM_LIFECYCLE_FIELDS: [&str; 3] = ["claim_id", "expected_revision", "rea
 /// Conflict-lifecycle `remember` properties that the claim actions must not
 /// carry. A property the surface does not declare is never named.
 const CONFLICT_FIELDS: [&str; 3] = ["conflict_id", "expected_member_count", "retract_claim_ids"];
+/// Adjudication `remember` properties that only `dismiss` and `waive` carry.
+const ADJUDICATION_FIELDS: [&str; 4] = [
+    "reason_kind",
+    "rationale",
+    "expires_in_hours",
+    "review_in_hours",
+];
+/// The discrepancy contract's closed dismissal reasons (`DismissalReasonKindV1`).
+const DISMISSAL_REASON_KINDS: [&str; 4] = [
+    "false_positive",
+    "duplicate_of_other_episode",
+    "out_of_scope",
+    "not_reproducible",
+];
+/// The discrepancy contract's closed waiver reasons (`WaiverReasonKindV1`).
+const WAIVER_REASON_KINDS: [&str; 5] = [
+    "capacity_deferred",
+    "cost_exceeds_risk",
+    "upstream_blocked",
+    "policy_exception",
+    "scheduled_remediation",
+];
 
 fn output_schema(tool: &str) -> Value {
     json!({
@@ -216,7 +238,11 @@ pub fn recall_tool_for(surface: RememberSurface) -> Value {
     if surface == RememberSurface::RECORD_ONLY {
         return tool;
     }
-    tool["description"] = if surface.conflict_lifecycle {
+    tool["description"] = if surface.serves_adjudication() {
+        json!(
+            "Read fleet memory without changing semantic state. Search combines lexical and dense retrieval and reports conflict coverage. Every conflict carries its lifecycle (open, acknowledged, waived, resolved, dismissed) and who acknowledged, waived, or closed it; a waived conflict is still returned, with its waiver's reason, expiry, and whether it still applies. get with kind=conflict returns one conflict by id in any state, with its members and its lifecycle history."
+        )
+    } else if surface.conflict_lifecycle {
         json!(
             "Read fleet memory without changing semantic state. Search combines lexical and dense retrieval and reports conflict coverage. Every conflict carries its lifecycle (open, acknowledged, resolved, ...) and who acknowledged or closed it. get with kind=conflict returns one conflict by id in any state, with its members and its lifecycle history."
         )
@@ -256,6 +282,9 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
     if surface.conflict_lifecycle {
         actions.extend(["acknowledge", "resolve"]);
     }
+    if surface.serves_adjudication() {
+        actions.extend(["dismiss", "waive"]);
+    }
     schema["properties"]["action"]["enum"] = json!(actions);
     if let Some(properties) = schema["properties"].as_object_mut() {
         insert_lifecycle_properties(properties, surface);
@@ -264,48 +293,97 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
         .as_object()
         .cloned()
         .unwrap_or_default();
+    schema["required"] = json!(["action", "idempotency_key"]);
+    schema["allOf"] = Value::Array(remember_branches(&properties, surface));
+    tool
+}
+
+/// One `allOf` branch per served action. Each forbids only properties the
+/// surface declares.
+fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) -> Vec<Value> {
     let mut branches = vec![branch(
-        &properties,
+        properties,
         "record",
         &["kind", "text"],
-        &named(&[&CLAIM_LIFECYCLE_FIELDS, &CONFLICT_FIELDS]),
+        &named(&[
+            &CLAIM_LIFECYCLE_FIELDS,
+            &CONFLICT_FIELDS,
+            &ADJUDICATION_FIELDS,
+        ]),
     )];
     if surface.claim_lifecycle {
         // The successor carries record's claim fields; the server refuses one
         // whose kind, normalized key, or conflict eligibility differs.
         branches.push(branch(
-            &properties,
+            properties,
             "supersede",
             &["claim_id", "expected_revision", "kind", "text"],
-            &CONFLICT_FIELDS,
+            &named(&[&CONFLICT_FIELDS, &ADJUDICATION_FIELDS]),
         ));
         branches.push(branch(
-            &properties,
+            properties,
             "retract",
             &["claim_id", "expected_revision"],
-            &named(&[&CLAIM_FIELDS, &CONFLICT_FIELDS]),
+            &named(&[&CLAIM_FIELDS, &CONFLICT_FIELDS, &ADJUDICATION_FIELDS]),
         ));
     }
     if surface.conflict_lifecycle {
         branches.push(branch(
-            &properties,
+            properties,
             "acknowledge",
             &["conflict_id", "expected_revision"],
             &named(&[
                 &CLAIM_FIELDS,
                 &["claim_id", "expected_member_count", "retract_claim_ids"],
+                &ADJUDICATION_FIELDS,
             ]),
         ));
         branches.push(branch(
-            &properties,
+            properties,
             "resolve",
             &["conflict_id", "expected_revision", "expected_member_count"],
-            &named(&[&CLAIM_FIELDS, &["claim_id"]]),
+            &named(&[&CLAIM_FIELDS, &["claim_id"], &ADJUDICATION_FIELDS]),
         ));
     }
-    schema["required"] = json!(["action", "idempotency_key"]);
-    schema["allOf"] = Value::Array(branches);
-    tool
+    if surface.serves_adjudication() {
+        branches.push(adjudication_branch(
+            properties,
+            "dismiss",
+            &[
+                "conflict_id",
+                "expected_revision",
+                "expected_member_count",
+                "reason_kind",
+                "rationale",
+            ],
+            &DISMISSAL_REASON_KINDS,
+            &named(&[
+                &CLAIM_FIELDS,
+                &[
+                    "claim_id",
+                    "retract_claim_ids",
+                    "reason",
+                    "expires_in_hours",
+                    "review_in_hours",
+                ],
+            ]),
+        ));
+        branches.push(adjudication_branch(
+            properties,
+            "waive",
+            &[
+                "conflict_id",
+                "expected_revision",
+                "expected_member_count",
+                "reason_kind",
+                "rationale",
+                "expires_in_hours",
+            ],
+            &WAIVER_REASON_KINDS,
+            &named(&[&CLAIM_FIELDS, &["claim_id", "retract_claim_ids", "reason"]]),
+        ));
+    }
+    branches
 }
 
 /// Property names from several groups, in order.
@@ -313,7 +391,26 @@ fn named(groups: &[&[&'static str]]) -> Vec<&'static str> {
     groups.concat()
 }
 
-const fn remember_description(surface: RememberSurface) -> &'static str {
+fn remember_description(surface: RememberSurface) -> String {
+    if surface.serves_adjudication() {
+        let claims = if surface.claim_lifecycle {
+            "supersede or retract claims you authored, "
+        } else {
+            ""
+        };
+        return format!(
+            "Deliberately record fleet memory, {claims}acknowledge or resolve conflicts, and, as an adjudicator, dismiss or waive them. {}acknowledge marks a conflict's current episode as seen and changes nothing else. resolve concedes: it retracts only your own member claims named in retract_claim_ids, and the conflict closes only if no incompatible current pair remains; otherwise nothing changes. dismiss and waive are refused (implicated) when you authored any member claim of the conflict, in any episode. dismiss judges the conflict not a real disagreement: it closes as dismissed, its disputed members return to active, and the pairs it judged never keep it open again. waive accepts the current episode until expires_in_hours: the conflict stays open and visible and reads waived until the waiver expires or a member joins. No action changes another agent's claim. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key.",
+            if surface.claim_lifecycle {
+                "A successor keeps its predecessor's kind, subject/predicate key, and conflict eligibility: a keyed decision, fact, constraint, preference, or procedure keeps carrying a value, and a valueless one gains none. "
+            } else {
+                ""
+            }
+        );
+    }
+    legacy_remember_description(surface).to_owned()
+}
+
+const fn legacy_remember_description(surface: RememberSurface) -> &'static str {
     match (surface.claim_lifecycle, surface.conflict_lifecycle) {
         (true, false) => {
             "Deliberately record fleet memory, or supersede or retract claims you authored. A successor keeps its predecessor's kind, subject/predicate key, and conflict eligibility: a keyed decision, fact, constraint, preference, or procedure keeps carrying a value, and a valueless one gains none. Writes are scoped, audited, revision-checked, and replay-safe. A refused write returns invalid_params with data.outcome=\"not_applied\" and does not consume the idempotency_key."
@@ -343,6 +440,10 @@ fn insert_lifecycle_properties(properties: &mut Map<String, Value>, surface: Rem
         surface.claim_lifecycle,
         surface.conflict_lifecycle,
     ) {
+        _ if surface.serves_adjudication() => (
+            "The claim revision (supersede/retract) or conflict revision (acknowledge/resolve/dismiss/waive) you last read; a stale value is refused, not retried.",
+            "Optional audit note for supersede, retract, acknowledge, or resolve, at most 1000 characters; dismiss and waive take rationale instead. Acknowledge and resolve notes, and the note of a supersede or retract that closes a conflict, appear in that conflict's lifecycle overlay or history, which every agent in the project can read.",
+        ),
         (true, false) => (
             "supersede/retract: the claim revision you last read; a stale value is refused, not retried.",
             "Optional private audit note for supersede or retract, at most 1000 characters.",
@@ -374,6 +475,7 @@ fn insert_lifecycle_properties(properties: &mut Map<String, Value>, surface: Rem
             "description": reason_description
         }),
     );
+    let adjudication = surface.serves_adjudication();
     if surface.conflict_lifecycle {
         properties.insert(
             "conflict_id".into(),
@@ -381,7 +483,11 @@ fn insert_lifecycle_properties(properties: &mut Map<String, Value>, surface: Rem
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9_007_199_254_740_991_i64,
-                "description": "acknowledge/resolve: a same_key_functional_value_v2 conflict id from recall, in state open."
+                "description": if adjudication {
+                    "acknowledge/resolve/dismiss/waive: a same_key_functional_value_v2 conflict id from recall, in state open."
+                } else {
+                    "acknowledge/resolve: a same_key_functional_value_v2 conflict id from recall, in state open."
+                }
             }),
         );
         properties.insert(
@@ -390,7 +496,11 @@ fn insert_lifecycle_properties(properties: &mut Map<String, Value>, surface: Rem
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 4096,
-                "description": "resolve: the conflict member_count you last read; a conflict gains members without a revision change."
+                "description": if adjudication {
+                    "resolve/dismiss/waive: the conflict member_count you last read; a conflict gains members without a revision change."
+                } else {
+                    "resolve: the conflict member_count you last read; a conflict gains members without a revision change."
+                }
             }),
         );
         properties.insert(
@@ -409,6 +519,47 @@ fn insert_lifecycle_properties(properties: &mut Map<String, Value>, surface: Rem
             }),
         );
     }
+    if adjudication {
+        insert_adjudication_properties(properties);
+    }
+}
+
+fn insert_adjudication_properties(properties: &mut Map<String, Value>) {
+    properties.insert(
+        "reason_kind".into(),
+        json!({
+            "type": "string",
+            "enum": named(&[&DISMISSAL_REASON_KINDS, &WAIVER_REASON_KINDS]),
+            "description": "dismiss: false_positive, duplicate_of_other_episode, out_of_scope, or not_reproducible. waive: capacity_deferred, cost_exceeds_risk, upstream_blocked, policy_exception, or scheduled_remediation."
+        }),
+    );
+    properties.insert(
+        "rationale".into(),
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000,
+            "description": "dismiss/waive: the required justification, at most 1000 characters. It is kept in the conflict's lifecycle log, which every agent in the project can read through the overlay and history, and never in the conflict row itself."
+        }),
+    );
+    properties.insert(
+        "expires_in_hours".into(),
+        json!({
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2160,
+            "description": "waive: hours until the waiver lapses (at most 90 days), measured by the database clock. The conflict then reads open again, with the waiver kept as context."
+        }),
+    );
+    properties.insert(
+        "review_in_hours".into(),
+        json!({
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2160,
+            "description": "waive: optional hours until a review is due; at most expires_in_hours. The overlay reports review_due once it passes."
+        }),
+    );
 }
 
 /// One `allOf` branch: the action's required fields, and `false` for each
@@ -432,6 +583,20 @@ fn branch(
         "if": { "properties": { "action": { "const": action } } },
         "then": then
     })
+}
+
+/// A `dismiss` or `waive` branch: [`branch`], with `reason_kind` narrowed to
+/// the action's own closed vocabulary.
+fn adjudication_branch(
+    properties: &Map<String, Value>,
+    action: &str,
+    required: &[&str],
+    reason_kinds: &[&str],
+    forbidden: &[&str],
+) -> Value {
+    let mut adjudication = branch(properties, action, required, forbidden);
+    adjudication["then"]["properties"]["reason_kind"] = json!({ "enum": reason_kinds });
+    adjudication
 }
 
 /// The agent-facing surface for one remember surface. The record-only
@@ -532,6 +697,14 @@ mod tests {
         RememberSurface {
             claim_lifecycle: true,
             conflict_lifecycle: true,
+            adjudication: false,
+        }
+    }
+
+    fn adjudication_surface() -> RememberSurface {
+        RememberSurface {
+            adjudication: true,
+            ..conflict_surface()
         }
     }
 
@@ -727,6 +900,169 @@ mod tests {
             recall["inputSchema"],
             recall_tool_for(lifecycle_surface())["inputSchema"]
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // every branch of the full surface, checked once
+    fn adjudication_surface_branches_are_exact() {
+        let tool = remember_tool_for(adjudication_surface());
+        let schema = &tool["inputSchema"];
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!([
+                "record",
+                "supersede",
+                "retract",
+                "acknowledge",
+                "resolve",
+                "dismiss",
+                "waive"
+            ])
+        );
+        assert_eq!(schema["required"], json!(["action", "idempotency_key"]));
+        for field in ADJUDICATION_FIELDS {
+            assert!(properties.contains_key(field), "{field} is declared");
+        }
+        assert_eq!(properties["rationale"]["maxLength"], 1000);
+        assert_eq!(properties["expires_in_hours"]["maximum"], 2160);
+        assert_eq!(properties["review_in_hours"]["maximum"], 2160);
+
+        let branches = schema["allOf"].as_array().unwrap();
+        assert_eq!(branches.len(), 7);
+        let by_action = |action: &str| {
+            branches
+                .iter()
+                .find(|branch| branch["if"]["properties"]["action"]["const"] == action)
+                .unwrap_or_else(|| panic!("{action} has a branch"))
+        };
+        let forbidden = |action: &str| {
+            by_action(action)["then"]["properties"]
+                .as_object()
+                .map(|properties| {
+                    properties
+                        .iter()
+                        .filter(|(_, value)| **value == Value::Bool(false))
+                        .map(|(name, _)| name.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                })
+                .unwrap_or_default()
+        };
+        // Every action but dismiss and waive forbids every adjudication field.
+        for action in ["record", "supersede", "retract", "acknowledge", "resolve"] {
+            for field in ADJUDICATION_FIELDS {
+                assert!(
+                    forbidden(action).contains(field),
+                    "{action} forbids {field}"
+                );
+            }
+        }
+
+        let dismiss = by_action("dismiss");
+        assert_eq!(
+            dismiss["then"]["required"],
+            json!([
+                "conflict_id",
+                "expected_revision",
+                "expected_member_count",
+                "reason_kind",
+                "rationale"
+            ])
+        );
+        assert_eq!(
+            dismiss["then"]["properties"]["reason_kind"]["enum"],
+            json!(DISMISSAL_REASON_KINDS)
+        );
+        let mut dismiss_forbids = CLAIM_FIELDS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        dismiss_forbids.extend([
+            "claim_id",
+            "retract_claim_ids",
+            "reason",
+            "expires_in_hours",
+            "review_in_hours",
+        ]);
+        assert_eq!(forbidden("dismiss"), dismiss_forbids);
+
+        let waive = by_action("waive");
+        assert_eq!(
+            waive["then"]["required"],
+            json!([
+                "conflict_id",
+                "expected_revision",
+                "expected_member_count",
+                "reason_kind",
+                "rationale",
+                "expires_in_hours"
+            ])
+        );
+        assert_eq!(
+            waive["then"]["properties"]["reason_kind"]["enum"],
+            json!(WAIVER_REASON_KINDS)
+        );
+        let mut waive_forbids = CLAIM_FIELDS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        waive_forbids.extend(["claim_id", "retract_claim_ids", "reason"]);
+        assert_eq!(forbidden("waive"), waive_forbids);
+        // The transport-only actor assertion and scope stay valid everywhere.
+        for action in ["dismiss", "waive"] {
+            assert!(!forbidden(action).contains("actor"));
+            assert!(!forbidden(action).contains("scope"));
+        }
+        // Every branch names only declared properties.
+        for branch in branches {
+            let named = branch["then"]["properties"]
+                .as_object()
+                .into_iter()
+                .flat_map(Map::keys)
+                .map(String::as_str)
+                .chain(
+                    branch["then"]["required"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(Value::as_str),
+                );
+            for name in named {
+                assert!(properties.contains_key(name), "{name} is undeclared");
+            }
+        }
+
+        // Adjudication adds nothing to the surfaces that do not serve it,
+        // including a switch set without the conflict lifecycle beneath it.
+        assert_eq!(
+            remember_tool_for(conflict_surface())["inputSchema"],
+            remember_tool_for(RememberSurface {
+                adjudication: false,
+                ..adjudication_surface()
+            })["inputSchema"]
+        );
+        let switch_only = RememberSurface {
+            adjudication: true,
+            ..lifecycle_surface()
+        };
+        assert_eq!(
+            remember_tool_for(switch_only),
+            remember_tool_for(lifecycle_surface())
+        );
+    }
+
+    #[test]
+    fn adjudication_reason_kinds_are_the_contract_vocabularies() {
+        use crate::memory_contracts::discrepancy::{DismissalReasonKindV1, WaiverReasonKindV1};
+        for kind in DISMISSAL_REASON_KINDS {
+            let parsed: DismissalReasonKindV1 = serde_json::from_value(json!(kind)).unwrap();
+            assert_eq!(crate::ledger::dismissal_reason_kind(parsed), kind);
+            assert!(serde_json::from_value::<WaiverReasonKindV1>(json!(kind)).is_err());
+        }
+        for kind in WAIVER_REASON_KINDS {
+            let parsed: WaiverReasonKindV1 = serde_json::from_value(json!(kind)).unwrap();
+            assert_eq!(crate::ledger::waiver_reason_kind(parsed), kind);
+        }
     }
 
     #[test]

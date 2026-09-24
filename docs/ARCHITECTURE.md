@@ -269,10 +269,13 @@ conflicts (`search` of either kind, `get` of a claim or conflict, and
 has finished. The overlay is one separate autocommit statement against the
 migration-29 lifecycle log, reading at most 33 newest events of each
 conflict's episode (the current revision of an open conflict, the closed
-episode's revision otherwise) through its covering episode index, and it
-uses the database clock. A pure derivation turns those events into the
-overlay's `state`, ADR 0003's `read_side`, the acknowledgers, and the closing
-event. A failure of that read never fails the response: coverage reports
+episode's revision otherwise) through its covering episode index, plus the
+episode's latest waiver when newer events pushed it out of that window, and
+it uses the database clock. A pure derivation turns those events into the
+overlay's `state`, ADR 0003's `read_side`, the acknowledgers, the waiver and
+whether it still applies (unexpired, with the member count it was granted
+against), and the closing event. A waived conflict is never filtered out: it
+surfaces wherever an open one would, carrying its waiver's context. A failure of that read never fails the response: coverage reports
 `lifecycle_overlay: unavailable` and the conflicts come back without it.
 `get` with `kind=conflict` reads the log once more, its newest 256 events,
 keeps the newest of those that fit a byte budget beside the conflict (so a
@@ -384,6 +387,29 @@ append the same detector-attributed event, with the caller's operation and key
 and a cause payload. Each conflict action writes exactly one keyed
 `memory_events` row and a receipt naming the conflict.
 
+Adjudication (`remember(dismiss)` and `remember(waive)`) is served only when
+the deployment sets `FLEET_RECALL_CONFLICT_ADJUDICATION=enabled` and the probe
+passed; the ledger refuses it as `adjudication_disabled` otherwise, whatever
+the surface says. Both take the resolve path's receipt, lineage lock, and
+revision and member-count checks, then read every durable member of the
+conflict (all episodes) joined to its claim's actor: an adjudicator that
+authored any member is refused as `implicated`, and a member with no recorded
+actor refuses everyone as `unattributed_member`. A dismissal then locks the
+key's current claims, requires the Rust and SQL pair computations to agree
+(`verification_divergence` otherwise), closes the row as `dismissed` with
+`resolution_kind = dismissed:<reason_kind>` and a fixed reason, restores the
+disputed members no other open conflict holds (claim-event reason
+`conflict_dismissed`), and appends a `dismissed` event whose payload lists the
+judged pairs. Every later re-evaluation of that conflict (retract, supersede,
+and concession `resolve`) reads the pairs of its newest 64 dismissals and
+checks the raw Rust and SQL pair sets before leaving those pairs out, so a
+dismissed pair cannot keep a conflict that `record` reopened open forever,
+while a new pair still does. A writer without the capability excludes
+nothing, which can only keep a conflict open. A waiver writes only its
+`waived` event, with `expires_at` and `review_by` computed from the database
+clock and the member count it covers; `memory_conflicts` and every claim stay
+as they were.
+
 The writer serves these actions only after a startup probe: the schema must
 have reached migration 29, and an `INSERT ... SELECT ... WHERE false` on the
 log inside a rolled-back transaction must pass the privilege check. Without
@@ -415,17 +441,20 @@ grant matrix), then restart `serve`.
    predecessor's kind, key, and conflict eligibility. A supersede points its
    predecessor's `superseded_by` at that later successor, written by the same
    author. No request names a conflict outcome: a conflict closes only when
-   the detector finds no incompatible lifecycle-current pair on its key, and a
-   disputed claim is restored only when no other open conflict holds it. Every
-   disputed claim therefore stays a member of at least one open current
-   lineage (v2 when its key has one, otherwise legacy), and
-   every open v2 conflict keeps at least one incompatible current pair.
-   Acknowledgement changes only the lifecycle log. That log is append-only:
+   the detector finds no incompatible lifecycle-current pair on its key
+   (leaving out pairs an adjudicator dismissed in that conflict), or when an
+   adjudicator that authored none of its members, in any episode, dismisses
+   it on a deployment that enabled adjudication. A disputed claim is restored
+   only when no other open conflict holds it. Every disputed claim therefore
+   stays a member of at least one open current lineage (v2 when its key has
+   one, otherwise legacy), and every open v2 conflict keeps at least one
+   incompatible current pair. Acknowledgement and waiver change only the
+   lifecycle log, and no action changes another agent's claim. That log is append-only:
    each conflict's events are numbered without gaps, at most one close is
    logged per resulting revision, and every event belongs to a committed
-   receipt. Its bounds can refuse `acknowledge` and `resolve` but never a
-   verified close: a close the full log cannot hold commits unlogged. A
-   refused lifecycle request rolls back completely and leaves no receipt.
+   receipt. Its bounds can refuse the conflict actions but never a verified
+   close: a close the full log cannot hold commits unlogged. A refused
+   lifecycle request rolls back completely and leaves no receipt.
 
 ## Scaling and failure behavior
 
@@ -467,11 +496,13 @@ grant matrix), then restart `serve`.
   today `remember(record|supersede|retract|acknowledge|resolve)` and
   `recall(search|get|conflicts|status)` are served (with `get` covering claims,
   chunks, and, on the private writer, conflicts; `acknowledge` and `resolve`
-  need the migration-29 lifecycle log), and the others return an error.
-  Adjudication (`dismiss` and `waive` by a non-implicated agent) is the next
-  lifecycle step in [ADR 0004](adr/0004-serving-conflict-lifecycle.md), and
-  `record` reopens are not logged yet; history reports them as unlogged
-  transitions.
+  need the migration-29 lifecycle log), `remember(dismiss|waive)` is served
+  where the deployment enables adjudication, and the others return an error.
+  In [ADR 0004](adr/0004-serving-conflict-lifecycle.md)'s lifecycle, `record`
+  reopens are not logged yet (history reports them as unlogged transitions),
+  `record` itself still re-disputes the members of a dismissed pair when a new
+  incompatible claim reopens their conflict, and waivers are unsigned and
+  cannot be revoked early.
 - Wire the dynamic-memory runtimes that already exist as library code into a
   worker or CLI and into MCP recall; the README's
   [built but not yet wired](../README.md#built-but-not-yet-wired) section lists

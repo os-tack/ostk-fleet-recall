@@ -2,7 +2,9 @@
 //! owner `retract` and `supersede`, detector-verified conflict close with
 //! member restore, conflict lookup by id, private search hiding retired claim
 //! chunks, and (with the migration-29 lifecycle log) `acknowledge`,
-//! concession `resolve`, logged closes, the lifecycle overlay, and history.
+//! concession `resolve`, logged closes, the lifecycle overlay, and history,
+//! and (with adjudication enabled) `dismiss`, `waive`, and dismissed-pair
+//! exclusion.
 //!
 //! Set `FLEET_RECALL_TEST_DATABASE_URL` to a disposable `CockroachDB` 26.2
 //! database; every test is inert otherwise. Each test migrates, works in a
@@ -18,10 +20,11 @@ use ostk_fleet_recall::application::LifecycleServing;
 use ostk_fleet_recall::ledger::{
     ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget,
     CockroachClaimLedger, CockroachConflictReconciliationRepository, ConflictMutation,
-    ConflictTarget, LifecycleRefusal, MAX_CONFLICT_LIFECYCLE_EVENTS, MAX_CONFLICT_MEMBER_COUNT,
-    RefusalCode, SupersededClaim,
+    ConflictTarget, DismissalTerms, LifecycleRefusal, MAX_CONFLICT_LIFECYCLE_EVENTS,
+    MAX_CONFLICT_MEMBER_COUNT, RefusalCode, SupersededClaim, WaiverTerms,
 };
 use ostk_fleet_recall::mcp::McpServer;
+use ostk_fleet_recall::memory_contracts::discrepancy::{DismissalReasonKindV1, WaiverReasonKindV1};
 use ostk_fleet_recall::service::{
     FleetMemoryService, RecallAction, RecallRequest, RecallResult, RememberAction, RememberRequest,
     RememberResult, RememberSurface, ServiceError,
@@ -43,6 +46,7 @@ const MODEL: &str = "lifecycle-live-512";
 const AGENT_A: &str = "agent-a";
 const AGENT_B: &str = "agent-b";
 const AGENT_C: &str = "agent-c";
+const AGENT_D: &str = "agent-d";
 
 /// What the private writer serves unless `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`,
 /// when its startup probe finds no conflict lifecycle log (a schema before
@@ -51,6 +55,7 @@ const PRIVATE_WRITER: LifecycleServing = LifecycleServing {
     surface: RememberSurface {
         claim_lifecycle: true,
         conflict_lifecycle: false,
+        adjudication: false,
     },
     hide_non_current_claim_chunks: true,
     lifecycle_overlay: false,
@@ -62,6 +67,19 @@ const FULL_WRITER: LifecycleServing = LifecycleServing {
     surface: RememberSurface {
         claim_lifecycle: true,
         conflict_lifecycle: true,
+        adjudication: false,
+    },
+    hide_non_current_claim_chunks: true,
+    lifecycle_overlay: true,
+};
+
+/// The fully probed private writer of a deployment that also enables
+/// adjudication (`FLEET_RECALL_CONFLICT_ADJUDICATION=enabled`).
+const ADJUDICATING_WRITER: LifecycleServing = LifecycleServing {
+    surface: RememberSurface {
+        claim_lifecycle: true,
+        conflict_lifecycle: true,
+        adjudication: true,
     },
     hide_non_current_claim_chunks: true,
     lifecycle_overlay: true,
@@ -4216,6 +4234,52 @@ async fn run_conflict_lifecycle_as(
             return Err(format!("probe {label} close was not logged"));
         }
     }
+    // Adjudication needs no grant beyond the same 49 rows.
+    let adjudicator = || ledger(AGENT_C).with_conflict_adjudication();
+    record(AGENT_A, "probe-dismiss", "x").await?;
+    let dismissed = record(AGENT_B, "probe-dismiss", "y")
+        .await?
+        .claim
+        .conflict_ids[0];
+    let view = fleet.conflict_view(dismissed).await;
+    let dismissal = adjudicator()
+        .dismiss_conflict(
+            &fleet.scope(AGENT_C),
+            ConflictTarget {
+                conflict_id: dismissed,
+                expected_revision: view.1,
+                expected_member_count: Some(view.2),
+            },
+            false_positive("probe dismissal"),
+            &fleet.key("probe/dismiss"),
+        )
+        .await
+        .map_err(|error| format!("probe dismiss: {error}"))?;
+    if dismissal.conflict_state != "dismissed" || dismissal.claims_restored.len() != 2 {
+        return Err(format!("probe dismiss did not close: {dismissal:?}"));
+    }
+    record(AGENT_A, "probe-waive", "x").await?;
+    let probe_waive = record(AGENT_B, "probe-waive", "y")
+        .await?
+        .claim
+        .conflict_ids[0];
+    let view = fleet.conflict_view(probe_waive).await;
+    let waiver = adjudicator()
+        .waive_conflict(
+            &fleet.scope(AGENT_C),
+            ConflictTarget {
+                conflict_id: probe_waive,
+                expected_revision: view.1,
+                expected_member_count: Some(view.2),
+            },
+            capacity_deferred("probe waiver", 24, None),
+            &fleet.key("probe/waive"),
+        )
+        .await
+        .map_err(|error| format!("probe waive: {error}"))?;
+    if waiver.status.as_deref() != Some("waived") {
+        return Err(format!("probe waive did not apply: {waiver:?}"));
+    }
     Ok(())
 }
 
@@ -4553,6 +4617,879 @@ async fn live_concurrent_conflict_lifecycle_serializes_when_configured() {
         }
     }
     assert!(!outcomes.is_empty());
+    fleet.assert_lifecycle_invariants().await;
+
+    second.pool().close().await;
+    fleet.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Slice 4: adjudication (`dismiss` and `waive` by an agent that authored none
+// of a conflict's members) and dismissed-pair exclusion.
+// ---------------------------------------------------------------------------
+
+const fn false_positive(rationale: &str) -> DismissalTerms<'_> {
+    DismissalTerms {
+        reason_kind: DismissalReasonKindV1::FalsePositive,
+        rationale,
+    }
+}
+
+const fn capacity_deferred(
+    rationale: &str,
+    expires_in_hours: u16,
+    review_in_hours: Option<u16>,
+) -> WaiverTerms<'_> {
+    WaiverTerms {
+        reason_kind: WaiverReasonKindV1::CapacityDeferred,
+        rationale,
+        expires_in_hours,
+        review_in_hours,
+    }
+}
+
+const DISMISSAL_RATIONALE: &str = "the two values describe different deployments";
+const WAIVER_RATIONALE: &str = "the migration review is scheduled for the next window";
+
+impl Fleet {
+    /// `agent`'s ledger on a deployment that enabled adjudication.
+    fn adjudicating_ledger(&self, agent: &str) -> CockroachClaimLedger {
+        self.conflict_ledger(agent).with_conflict_adjudication()
+    }
+
+    /// The private writer of a deployment that enabled adjudication.
+    fn adjudicating_service(&self, agent: &str) -> CockroachMemoryService {
+        CockroachMemoryService::new(
+            self.scope(agent),
+            Arc::new(self.store.clone()),
+            Arc::new(self.adjudicating_ledger(agent)),
+            Arc::new(UnitEmbedder),
+        )
+        .expect("memory service")
+        .with_lifecycle(ADJUDICATING_WRITER)
+    }
+
+    const fn conflict_target(conflict: (i64, i64, i64)) -> ConflictTarget {
+        let (conflict_id, expected_revision, expected_member_count) = conflict;
+        ConflictTarget {
+            conflict_id,
+            expected_revision,
+            expected_member_count: Some(expected_member_count),
+        }
+    }
+
+    async fn dismiss(
+        &self,
+        agent: &str,
+        conflict: (i64, i64, i64),
+        key: &str,
+    ) -> ostk_fleet_recall::Result<ConflictMutation> {
+        self.adjudicating_ledger(agent)
+            .dismiss_conflict(
+                &self.scope(agent),
+                Self::conflict_target(conflict),
+                false_positive(DISMISSAL_RATIONALE),
+                &self.key(key),
+            )
+            .await
+    }
+
+    async fn waive(
+        &self,
+        agent: &str,
+        conflict: (i64, i64, i64),
+        expires_in_hours: u16,
+        key: &str,
+    ) -> ostk_fleet_recall::Result<ConflictMutation> {
+        self.adjudicating_ledger(agent)
+            .waive_conflict(
+                &self.scope(agent),
+                Self::conflict_target(conflict),
+                capacity_deferred(WAIVER_RATIONALE, expires_in_hours, Some(1)),
+                &self.key(key),
+            )
+            .await
+    }
+
+    /// `(state, revision, resolution_kind, resolution_reason)` of a conflict row.
+    async fn conflict_resolution(
+        &self,
+        conflict_id: i64,
+    ) -> (String, i64, Option<String>, Option<String>) {
+        sqlx::query_as(
+            "SELECT state, revision, resolution_kind, resolution_reason FROM memory_conflicts \
+             WHERE tenant_id = $1 AND project = $2 AND id = $3",
+        )
+        .bind(self.tenant)
+        .bind(&self.project)
+        .bind(conflict_id)
+        .fetch_one(self.pool())
+        .await
+        .unwrap()
+    }
+
+    async fn add_member(&self, conflict_id: i64, claim_id: i64) {
+        sqlx::query(
+            "INSERT INTO memory_conflict_members (tenant_id, project, conflict_id, claim_id) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(self.tenant)
+        .bind(&self.project)
+        .bind(conflict_id)
+        .bind(claim_id)
+        .execute(self.pool())
+        .await
+        .unwrap();
+    }
+}
+
+fn dismiss_arguments(conflict: (i64, i64, i64)) -> Map<String, Value> {
+    let (conflict_id, expected_revision, expected_member_count) = conflict;
+    Map::from_iter([
+        ("conflict_id".into(), json!(conflict_id)),
+        ("expected_revision".into(), json!(expected_revision)),
+        ("expected_member_count".into(), json!(expected_member_count)),
+        ("reason_kind".into(), json!("false_positive")),
+        ("rationale".into(), json!(DISMISSAL_RATIONALE)),
+    ])
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // the gates, the dismissal, and its reads on one fixture
+async fn live_dismiss_requires_enabled_non_implicated_adjudicator_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "dismiss").await;
+    let (x, y, conflict_id) = two_party(&fleet, "dismiss").await;
+    let view = fleet.conflict_view(conflict_id).await;
+    let before = fleet.conflict_resolution(conflict_id).await;
+    let scope_c = fleet.scope(AGENT_C);
+
+    // Adjudication is off by default: the fully probed writer refuses it,
+    // with or without a key, and so does a ledger the deployment did not
+    // enable. Nothing is written and the key stays free.
+    let full = fleet.full_service(AGENT_C);
+    for key in [None, Some(fleet.key("c/disabled"))] {
+        let result = FleetMemoryService::remember(
+            &full,
+            scope_c.clone(),
+            RememberRequest::new(RememberAction::Dismiss, key, dismiss_arguments(view)),
+        )
+        .await;
+        assert_eq!(refusal_code(result), "adjudication_disabled");
+    }
+    let disabled = refusal(
+        fleet
+            .conflict_ledger(AGENT_C)
+            .dismiss_conflict(
+                &scope_c,
+                Fleet::conflict_target(view),
+                false_positive(DISMISSAL_RATIONALE),
+                &fleet.key("c/disabled"),
+            )
+            .await,
+    );
+    assert_eq!(disabled.code, RefusalCode::AdjudicationDisabled);
+    fleet.assert_key_unconsumed("c/disabled").await;
+
+    // An author of any member is implicated and may neither dismiss nor
+    // waive (AUTH-03).
+    for (agent, key) in [(AGENT_A, "a/adjudicate"), (AGENT_B, "b/adjudicate")] {
+        let implicated = refusal(fleet.dismiss(agent, view, key).await);
+        assert_eq!(implicated.code, RefusalCode::Implicated);
+        assert_eq!(implicated.details["implicated_members"], 1);
+        let implicated = refusal(fleet.waive(agent, view, 24, key).await);
+        assert_eq!(implicated.code, RefusalCode::Implicated);
+        fleet.assert_key_unconsumed(key).await;
+    }
+    // The caller's view of the conflict is checked.
+    let stale = refusal(
+        fleet
+            .dismiss(AGENT_C, (view.0, view.1 + 1, view.2), "c/stale")
+            .await,
+    );
+    assert_eq!(stale.code, RefusalCode::StaleRevision);
+    let stale_count = refusal(
+        fleet
+            .dismiss(AGENT_C, (view.0, view.1, view.2 + 1), "c/stale")
+            .await,
+    );
+    assert_eq!(stale_count.code, RefusalCode::StaleMemberCount);
+    assert_eq!(stale_count.details["current_member_count"], view.2);
+    fleet.assert_key_unconsumed("c/stale").await;
+    assert_eq!(fleet.conflict_resolution(conflict_id).await, before);
+    assert!(fleet.lifecycle_log(conflict_id).await.is_empty());
+
+    // An uninvolved agent dismisses the conflict.
+    let dismissed = fleet
+        .dismiss(AGENT_C, view, "c/dismiss")
+        .await
+        .expect("an uninvolved adjudicator may dismiss");
+    assert_eq!(dismissed.operation, "dismiss");
+    assert_eq!(
+        (
+            dismissed.conflict_state.as_str(),
+            dismissed.conflict_revision
+        ),
+        ("dismissed", view.1 + 1)
+    );
+    assert_eq!(dismissed.status.as_deref(), Some("dismissed"));
+    assert!(dismissed.applied);
+    assert_eq!(dismissed.member_count, view.2);
+    assert_eq!(dismissed.claims_restored, [x.claim.id, y.claim.id]);
+    assert!(dismissed.claims_retracted.is_empty());
+    let event = dismissed
+        .lifecycle_event
+        .as_ref()
+        .expect("a dismissed event");
+    assert_eq!(
+        (
+            event.kind.as_str(),
+            event.actor_kind.as_str(),
+            event.actor.as_str(),
+            event.operation.as_str()
+        ),
+        ("dismissed", "agent", AGENT_C, "conflict_dismiss")
+    );
+    assert_eq!(event.reason_kind.as_deref(), Some("false_positive"));
+    assert_eq!(event.rationale.as_deref(), Some(DISMISSAL_RATIONALE));
+    assert_eq!(
+        (event.episode_revision, event.result_revision),
+        (view.1, view.1 + 1)
+    );
+    assert_eq!(
+        event.payload.as_ref().unwrap()["dismissed_pairs"],
+        json!([[x.claim.id, y.claim.id]])
+    );
+    // The conflict row names the closed reason vocabulary; the rationale
+    // stays in the private lifecycle log.
+    let (row_state, revision, kind, reason) = fleet.conflict_resolution(conflict_id).await;
+    assert_eq!((row_state.as_str(), revision), ("dismissed", view.1 + 1));
+    assert_eq!(kind.as_deref(), Some("dismissed:false_positive"));
+    assert!(!reason.unwrap().contains(DISMISSAL_RATIONALE));
+    // Both members return to active, and nothing else about them changes
+    // (DISC-03).
+    for claim in [&x.claim, &y.claim] {
+        let now = fleet.claim(claim.id).await;
+        assert_eq!(now.state, ClaimState::Active);
+        assert_eq!(
+            (now.value.as_ref(), now.actor.as_deref(), now.superseded_by),
+            (claim.value.as_ref(), claim.actor.as_deref(), None)
+        );
+        let transitions = fleet.transitions(claim.id).await;
+        let last = transitions.last().unwrap();
+        assert_eq!(
+            (last.0.as_str(), last.1.as_str(), last.2.as_str()),
+            ("conflict_dismissed", "disputed", "active")
+        );
+    }
+    let keyed = fleet.keyed_events("c/dismiss").await;
+    assert_eq!(keyed.len(), 1);
+    assert_eq!(keyed[0].0, "conflict_dismissed");
+
+    // The key replays its stored result, and serves no other mutation.
+    let replay = fleet.dismiss(AGENT_C, view, "c/dismiss").await.unwrap();
+    assert!(replay.idempotent_replay);
+    assert_eq!(
+        ConflictMutation {
+            idempotent_replay: false,
+            ..replay
+        },
+        dismissed
+    );
+    assert!(matches!(
+        fleet.waive(AGENT_C, view, 24, "c/dismiss").await,
+        Err(FleetError::IdempotencyConflict(_))
+    ));
+    // A writer that no longer serves adjudication still replays it.
+    let replayed = FleetMemoryService::remember(
+        &full,
+        scope_c.clone(),
+        RememberRequest::new(
+            RememberAction::Dismiss,
+            Some(fleet.key("c/dismiss")),
+            dismiss_arguments(view),
+        ),
+    )
+    .await
+    .expect("a committed dismissal replays where adjudication is off");
+    assert_eq!(replayed.data["idempotent_replay"], true);
+    assert_eq!(replayed.data["conflict_state"], "dismissed");
+    assert_eq!(replayed.conflicts[0]["lifecycle"]["state"], "dismissed");
+    // A dismissed conflict is closed to further adjudication.
+    let closed = (view.0, view.1 + 1, view.2);
+    for result in [
+        fleet.dismiss(AGENT_C, closed, "c/again").await,
+        fleet.waive(AGENT_C, closed, 24, "c/again").await,
+    ] {
+        let refused = refusal(result);
+        assert_eq!(refused.code, RefusalCode::NotOpen);
+        assert_eq!(refused.details["current_state"], "dismissed");
+    }
+    fleet.assert_key_unconsumed("c/again").await;
+
+    // Reads name the adjudicator and keep the rationale in history.
+    let service = fleet.adjudicating_service(AGENT_C);
+    let lookup = get_conflict(&service, &scope_c, conflict_id).await;
+    let lifecycle = &lookup.data["conflict"]["lifecycle"];
+    assert_eq!(lifecycle["state"], "dismissed");
+    assert_eq!(lifecycle["read_side"], "clear");
+    assert_eq!(lifecycle["closed_unlogged"], false);
+    assert_eq!(
+        lifecycle["closed_by"],
+        json!({
+            "actor_kind": "agent",
+            "actor": AGENT_C,
+            "operation": "conflict_dismiss",
+            "reason_kind": "false_positive",
+            "at": lifecycle["closed_by"]["at"],
+        })
+    );
+    let history = lookup.data["history"].as_array().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["rationale"], DISMISSAL_RATIONALE);
+    assert_eq!(lookup.data["unlogged_transitions"], json!([]));
+
+    // A member with no recorded author could be anyone's, so no agent can be
+    // shown to be uninvolved: the adjudication fails closed.
+    let (_, _, anonymous_conflict) = two_party(&fleet, "dismiss-unattributed").await;
+    let anonymous = fleet
+        .raw_claim(
+            &fleet.project,
+            "dismiss-unattributed",
+            "note",
+            "operator_asserted",
+            None,
+        )
+        .await;
+    fleet.add_member(anonymous_conflict, anonymous).await;
+    let anonymous_view = fleet.conflict_view(anonymous_conflict).await;
+    assert_eq!(anonymous_view.2, 3);
+    let unattributed = refusal(
+        fleet
+            .dismiss(AGENT_C, anonymous_view, "c/unattributed")
+            .await,
+    );
+    assert_eq!(unattributed.code, RefusalCode::UnattributedMember);
+    assert_eq!(unattributed.details["unattributed_members"], 1);
+    let unattributed = refusal(
+        fleet
+            .waive(AGENT_C, anonymous_view, 24, "c/unattributed")
+            .await,
+    );
+    assert_eq!(unattributed.code, RefusalCode::UnattributedMember);
+    fleet.assert_key_unconsumed("c/unattributed").await;
+
+    // Over MCP, an adjudicating writer advertises both actions, and an
+    // implicated author's dismissal is invalid_params and not applied.
+    let server = McpServer::new(
+        Arc::new(fleet.adjudicating_service(AGENT_A)),
+        fleet.scope(AGENT_A),
+    )
+    .unwrap();
+    let listed = server
+        .handle_value(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let actions = &listed["tools"][1]["inputSchema"]["properties"]["action"]["enum"];
+    assert!(actions.as_array().unwrap().contains(&json!("dismiss")));
+    assert!(actions.as_array().unwrap().contains(&json!("waive")));
+    let mut arguments = dismiss_arguments(anonymous_view);
+    arguments.insert("action".into(), json!("dismiss"));
+    arguments.insert("idempotency_key".into(), json!(fleet.key("a/mcp-dismiss")));
+    let response = server
+        .handle_value(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "remember", "arguments": arguments },
+        }))
+        .await
+        .unwrap();
+    let error = response.error.expect("an implicated dismissal is refused");
+    assert_eq!(error.code, -32602);
+    let data = error.data.unwrap();
+    assert_eq!(data["code"], "implicated");
+    assert_eq!(data["outcome"], "not_applied");
+    fleet.assert_key_unconsumed("a/mcp-dismiss").await;
+
+    fleet.assert_lifecycle_invariants().await;
+    fleet.cleanup().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // three reopen shapes after one dismissal each
+async fn live_dismissed_pair_does_not_keep_reopened_conflict_open_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "dismissed-pair").await;
+
+    // Dismiss x/y, then D's z reopens the conflict and disputes x and y again.
+    let (x, y, conflict_id) = two_party(&fleet, "dismissed-retract").await;
+    let view = fleet.conflict_view(conflict_id).await;
+    fleet.dismiss(AGENT_C, view, "c/dismiss").await.unwrap();
+    let z = fleet
+        .record(
+            AGENT_D,
+            &decision("dismissed-retract", &json!("z"), 1),
+            "d/z",
+        )
+        .await;
+    assert_eq!(z.conflicts_opened, [conflict_id]);
+    let reopened = fleet.conflict_row(conflict_id).await;
+    assert_eq!(reopened, ("open".to_owned(), view.1 + 2));
+    assert_eq!(fleet.claim(x.claim.id).await.state, ClaimState::Disputed);
+
+    // Once D retracts z, only the dismissed pair is left, so the detector
+    // closes the conflict instead of re-arguing it.
+    let retracted = fleet
+        .conflict_ledger(AGENT_D)
+        .retract_claim(
+            &fleet.scope(AGENT_D),
+            ClaimTarget {
+                claim_id: z.claim.id,
+                expected_revision: fleet.claim(z.claim.id).await.revision,
+            },
+            None,
+            &fleet.key("d/retract"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retracted.conflicts_resolved, [conflict_id]);
+    assert_eq!(retracted.claims_restored, [x.claim.id, y.claim.id]);
+    let reevaluation = retracted.reevaluation.as_ref().unwrap();
+    assert_eq!(reevaluation.outcome, "closed");
+    assert_eq!(reevaluation.excluded_dismissed_pairs, 1);
+    let (state, _, kind, reason) = fleet.conflict_resolution(conflict_id).await;
+    assert_eq!(state, "resolved");
+    assert_eq!(kind.as_deref(), Some("no_current_incompatibility"));
+    assert!(
+        reason
+            .unwrap()
+            .contains("1 pair(s) an adjudicator dismissed")
+    );
+    let log = fleet.lifecycle_log(conflict_id).await;
+    assert_eq!(
+        log.iter().map(|event| event.1.as_str()).collect::<Vec<_>>(),
+        ["dismissed", "resolved"]
+    );
+    assert_eq!(log[1].8["excluded_dismissed_pairs"], 1);
+
+    // A pair nobody dismissed still keeps the conflict open: after the same
+    // reopen, A's retract of x leaves y against z.
+    let (x, y, conflict_id) = two_party(&fleet, "dismissed-new-pair").await;
+    let view = fleet.conflict_view(conflict_id).await;
+    fleet.dismiss(AGENT_C, view, "c/dismiss-2").await.unwrap();
+    let z = fleet
+        .record(
+            AGENT_D,
+            &decision("dismissed-new-pair", &json!("z"), 1),
+            "d/z-2",
+        )
+        .await;
+    let still_open = fleet
+        .conflict_ledger(AGENT_A)
+        .retract_claim(
+            &fleet.scope(AGENT_A),
+            ClaimTarget {
+                claim_id: x.claim.id,
+                expected_revision: fleet.claim(x.claim.id).await.revision,
+            },
+            None,
+            &fleet.key("a/retract-2"),
+        )
+        .await
+        .unwrap();
+    let reevaluation = still_open.reevaluation.as_ref().unwrap();
+    assert_eq!(reevaluation.outcome, "still_open");
+    assert_eq!(reevaluation.remaining_pairs, [[y.claim.id, z.claim.id]]);
+    assert_eq!(reevaluation.excluded_dismissed_pairs, 0);
+    assert_eq!(fleet.conflict_row(conflict_id).await.0, "open");
+
+    // A writer without the lifecycle log cannot read dismissals, so it
+    // excludes none: the conservative outcome keeps the conflict open. A
+    // re-verification on the full writer then closes it.
+    let (_, _, conflict_id) = two_party(&fleet, "dismissed-unprobed").await;
+    let view = fleet.conflict_view(conflict_id).await;
+    fleet.dismiss(AGENT_C, view, "c/dismiss-3").await.unwrap();
+    let z = fleet
+        .record(
+            AGENT_D,
+            &decision("dismissed-unprobed", &json!("z"), 1),
+            "d/z-3",
+        )
+        .await;
+    let unprobed = fleet
+        .retract(
+            AGENT_D,
+            z.claim.id,
+            fleet.claim(z.claim.id).await.revision,
+            "d/retract-3",
+        )
+        .await
+        .unwrap();
+    let reevaluation = unprobed.reevaluation.as_ref().unwrap();
+    assert_eq!(reevaluation.outcome, "still_open");
+    assert_eq!(reevaluation.excluded_dismissed_pairs, 0);
+    let reopened = fleet.conflict_view(conflict_id).await;
+    let verified = fleet
+        .resolve(AGENT_C, reopened, &[], "c/verify-3")
+        .await
+        .expect("re-verification leaves out the dismissed pair");
+    assert_eq!(verified.conflict_state, "resolved");
+    assert_eq!(
+        verified
+            .reevaluation
+            .as_ref()
+            .unwrap()
+            .excluded_dismissed_pairs,
+        1
+    );
+    let event = verified.lifecycle_event.as_ref().unwrap();
+    assert_eq!(
+        event.payload.as_ref().unwrap()["excluded_dismissed_pairs"],
+        1
+    );
+
+    fleet.assert_lifecycle_invariants().await;
+    fleet.cleanup().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one waiver's whole read-side life
+async fn live_waiver_expires_and_voids_on_member_join_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "waive").await;
+    let (x, y, conflict_id) = two_party(&fleet, "waive").await;
+    let view = fleet.conflict_view(conflict_id).await;
+    let before = fleet.conflict_resolution(conflict_id).await;
+    let x_before = fleet.claim(x.claim.id).await;
+
+    let waived = fleet
+        .adjudicating_ledger(AGENT_C)
+        .waive_conflict(
+            &fleet.scope(AGENT_C),
+            Fleet::conflict_target(view),
+            capacity_deferred(WAIVER_RATIONALE, 72, Some(24)),
+            &fleet.key("c/waive"),
+        )
+        .await
+        .expect("an uninvolved adjudicator may waive");
+    assert_eq!(waived.operation, "waive");
+    assert_eq!(waived.status.as_deref(), Some("waived"));
+    assert_eq!(
+        (waived.conflict_state.as_str(), waived.conflict_revision),
+        ("open", view.1)
+    );
+    let event = waived.lifecycle_event.as_ref().unwrap();
+    assert_eq!(event.kind, "waived");
+    assert_eq!(event.reason_kind.as_deref(), Some("capacity_deferred"));
+    assert_eq!(event.member_count, view.2);
+    // The database clock sets the expiry and review time.
+    assert_eq!(
+        event.expires_at.unwrap() - event.created_at,
+        chrono::Duration::hours(72)
+    );
+    assert_eq!(
+        event.review_by.unwrap() - event.created_at,
+        chrono::Duration::hours(24)
+    );
+    // A waiver changes no row: the conflict and its members are as they were.
+    assert_eq!(fleet.conflict_resolution(conflict_id).await, before);
+    assert_eq!(fleet.claim(x.claim.id).await, x_before);
+    assert_eq!(fleet.keyed_events("c/waive").await[0].0, "conflict_waived");
+
+    // A waived conflict still surfaces, with its waiver's context (DISC-04).
+    let service = fleet.adjudicating_service(AGENT_C);
+    let scope = fleet.scope(AGENT_C);
+    let listed = recall(&service, &scope, RecallAction::Conflicts, json!({}))
+        .await
+        .unwrap();
+    let lifecycle = &listed.conflicts[0]["lifecycle"];
+    assert_eq!(listed.conflicts[0]["id"], conflict_id);
+    assert_eq!(lifecycle["state"], "waived");
+    assert_eq!(lifecycle["read_side"], "waived");
+    let context = &lifecycle["waiver"];
+    assert_eq!(context["actor"], AGENT_C);
+    assert_eq!(context["reason_kind"], "capacity_deferred");
+    assert_eq!(context["rationale"], WAIVER_RATIONALE);
+    assert_eq!(context["active"], true);
+    assert_eq!(context["review_due"], false);
+    assert_eq!(context["void_reason"], Value::Null);
+    let searched = recall(
+        &service,
+        &scope,
+        RecallAction::Search,
+        json!({ "query": "lifecycle fixture waive", "kind": "claim" }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        searched
+            .conflicts
+            .iter()
+            .any(|conflict| conflict["id"] == conflict_id
+                && conflict["lifecycle"]["read_side"] == "waived"),
+        "claim search surfaces the waived conflict"
+    );
+    let claim_lookup = recall(
+        &service,
+        &scope,
+        RecallAction::Get,
+        json!({ "kind": "claim", "id": y.claim.id }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(claim_lookup.conflicts[0]["lifecycle"]["state"], "waived");
+
+    // Seventy-three hours later the waiver has lapsed: the same episode reads
+    // open again, and the waiver stays as context.
+    sqlx::query(
+        "UPDATE memory_conflict_lifecycle_events_v1 \
+         SET created_at = created_at - INTERVAL '73 hours', \
+             expires_at = expires_at - INTERVAL '73 hours', \
+             review_by = review_by - INTERVAL '73 hours' \
+         WHERE tenant_id = $1 AND project = $2 AND conflict_id = $3",
+    )
+    .bind(fleet.tenant)
+    .bind(&fleet.project)
+    .bind(conflict_id)
+    .execute(fleet.pool())
+    .await
+    .unwrap();
+    let lookup = get_conflict(&service, &scope, conflict_id).await;
+    let lifecycle = &lookup.data["conflict"]["lifecycle"];
+    assert_eq!(lifecycle["state"], "open");
+    assert_eq!(lifecycle["read_side"], "open");
+    assert_eq!(lifecycle["episode_revision"], view.1);
+    assert_eq!(lifecycle["waiver"]["active"], false);
+    assert_eq!(lifecycle["waiver"]["void_reason"], "expired");
+    assert_eq!(lifecycle["waiver"]["reason_kind"], "capacity_deferred");
+
+    // A new waiver applies again, until a member joins: the waiver covered
+    // the members it was granted against, not the newcomer.
+    fleet
+        .waive(AGENT_C, view, 72, "c/waive-again")
+        .await
+        .unwrap();
+    let lookup = get_conflict(&service, &scope, conflict_id).await;
+    assert_eq!(lookup.data["conflict"]["lifecycle"]["state"], "waived");
+    fleet
+        .record(AGENT_D, &decision("waive", &json!("z"), 1), "d/z")
+        .await;
+    let joined = fleet.conflict_view(conflict_id).await;
+    assert_eq!((joined.1, joined.2), (view.1, view.2 + 1));
+    let lookup = get_conflict(&service, &scope, conflict_id).await;
+    let lifecycle = &lookup.data["conflict"]["lifecycle"];
+    assert_eq!(lifecycle["state"], "open");
+    assert_eq!(lifecycle["read_side"], "open");
+    assert_eq!(lifecycle["waiver"]["active"], false);
+    assert_eq!(lifecycle["waiver"]["void_reason"], "membership_changed");
+    assert_eq!(lifecycle["waiver"]["member_count"], view.2);
+
+    // D is now implicated too; the stale view is refused either way.
+    let implicated = refusal(fleet.waive(AGENT_D, joined, 24, "d/waive").await);
+    assert_eq!(implicated.code, RefusalCode::Implicated);
+    let stale = refusal(fleet.waive(AGENT_C, view, 24, "c/stale").await);
+    assert_eq!(stale.code, RefusalCode::StaleMemberCount);
+    fleet.assert_key_unconsumed("d/waive").await;
+    fleet.assert_key_unconsumed("c/stale").await;
+    fleet.assert_lifecycle_invariants().await;
+
+    // More acknowledgements than the overlay reads, all newer than the
+    // waiver, do not hide it: the conflict still reads waived.
+    let (_, _, crowded) = two_party(&fleet, "waive-crowded").await;
+    let crowded_view = fleet.conflict_view(crowded).await;
+    fleet
+        .waive(AGENT_C, crowded_view, 72, "c/waive-crowded")
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_conflict_lifecycle_events_v1 (\
+             tenant_id, project, conflict_id, event_seq, event_kind, episode_revision, \
+             result_revision, from_state, to_state, actor_kind, actor, operation, \
+             idempotency_key, member_count\
+         ) SELECT $1, $2, $3, seq, 'acknowledged', $4, $4, 'open', 'open', 'agent', \
+                  'seeded-agent-' || seq::STRING, 'conflict_acknowledge', \
+                  $2 || '/seeded-crowd/' || seq::STRING, 2 \
+           FROM generate_series(2, 41) AS seq",
+    )
+    .bind(fleet.tenant)
+    .bind(&fleet.project)
+    .bind(crowded)
+    .bind(crowded_view.1)
+    .execute(fleet.pool())
+    .await
+    .unwrap();
+    let lookup = get_conflict(&service, &scope, crowded).await;
+    let lifecycle = &lookup.data["conflict"]["lifecycle"];
+    assert_eq!(lifecycle["state"], "waived");
+    assert_eq!(lifecycle["read_side"], "waived");
+    assert_eq!(lifecycle["waiver"]["actor"], AGENT_C);
+    assert_eq!(lifecycle["acknowledgers_truncated"], true);
+
+    fleet.cleanup().await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdjudicationRace {
+    /// The dismissal committed first; the racing record reopened the lineage.
+    DismissedThenReopened,
+    /// The record joined first; the dismissal saw a stale member count.
+    JoinedFirst,
+    /// The dismissal committed first; the owner's retract read a revision
+    /// the dismissal's restore had moved.
+    DismissedThenRetracted,
+    /// The retract closed the conflict first; the dismissal found it closed.
+    RetractedFirst,
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // two race shapes share one fixture and one invariant check
+async fn live_concurrent_dismiss_and_join_refuses_stale_member_count_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "adjudication-race").await;
+    let second = CockroachStore::connect(
+        &database_url,
+        fleet.scope(AGENT_B),
+        PoolConfig {
+            max_connections: 8,
+            ..PoolConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let policy = RetryPolicy {
+        max_attempts: 32,
+        ..RetryPolicy::default()
+    };
+    let adjudicator = fleet
+        .ledger_on(fleet.pool(), AGENT_C, policy)
+        .with_conflict_lifecycle(fleet.conflict_lifecycle)
+        .with_conflict_adjudication();
+    let (joiner, owner) = (
+        fleet.ledger_on(second.pool(), AGENT_D, policy),
+        fleet
+            .ledger_on(second.pool(), AGENT_A, policy)
+            .with_conflict_lifecycle(fleet.conflict_lifecycle),
+    );
+    let (scope_a, scope_c, scope_d) = (
+        fleet.scope(AGENT_A),
+        fleet.scope(AGENT_C),
+        fleet.scope(AGENT_D),
+    );
+    let mut outcomes = Vec::new();
+
+    for round in 0..24 {
+        let subject = format!("adjudication-race-{round}");
+        let (x, y, conflict_id) = two_party(&fleet, &subject).await;
+        let view = fleet.conflict_view(conflict_id).await;
+        let barrier = Barrier::new(2);
+        // Record and retract do more work before their lineage lock, so
+        // every other round of each shape starts the dismissal late.
+        let stagger = Duration::from_millis(if round % 4 >= 2 { 250 } else { 0 });
+        let dismiss = async {
+            barrier.wait().await;
+            tokio::time::sleep(stagger).await;
+            adjudicator
+                .dismiss_conflict(
+                    &scope_c,
+                    Fleet::conflict_target(view),
+                    false_positive(DISMISSAL_RATIONALE),
+                    &fleet.key(&format!("{round}/dismiss")),
+                )
+                .await
+        };
+        if round % 2 == 0 {
+            // D records a third value while C dismisses.
+            let record_z = async {
+                barrier.wait().await;
+                joiner
+                    .record_claim(
+                        &scope_d,
+                        &decision(&subject, &json!("z"), 1),
+                        &fleet.key(&format!("{round}/z")),
+                    )
+                    .await
+            };
+            let (dismissed, recorded) = tokio::join!(dismiss, record_z);
+            let z = recorded.expect("the racing record commits");
+            let (state, revision) = fleet.conflict_row(conflict_id).await;
+            assert_eq!(state, "open", "round {round}: z keeps the lineage open");
+            let outcome = match dismissed {
+                Ok(mutation) => {
+                    assert_eq!(mutation.conflict_revision, view.1 + 1);
+                    assert_eq!(revision, view.1 + 2, "round {round}: z reopened it");
+                    assert_eq!(z.conflicts_opened, [conflict_id]);
+                    AdjudicationRace::DismissedThenReopened
+                }
+                Err(FleetError::LifecycleRefused(refusal))
+                    if refusal.code == RefusalCode::StaleMemberCount =>
+                {
+                    assert_eq!(revision, view.1, "round {round}: z joined the open episode");
+                    assert!(fleet.lifecycle_log(conflict_id).await.is_empty());
+                    AdjudicationRace::JoinedFirst
+                }
+                Err(error) => panic!("round {round}: unexpected dismissal failure: {error}"),
+            };
+            outcomes.push(outcome);
+            for claim in [x.claim.id, y.claim.id, z.claim.id] {
+                assert_eq!(fleet.claim(claim).await.state, ClaimState::Disputed);
+            }
+        } else {
+            // A retracts x while C dismisses: exactly one of them commits.
+            // A dismissal first restores x, which moves the revision A read.
+            let x_revision = fleet.claim(x.claim.id).await.revision;
+            let retract = async {
+                barrier.wait().await;
+                owner
+                    .retract_claim(
+                        &scope_a,
+                        ClaimTarget {
+                            claim_id: x.claim.id,
+                            expected_revision: x_revision,
+                        },
+                        None,
+                        &fleet.key(&format!("{round}/retract")),
+                    )
+                    .await
+            };
+            let (dismissed, retracted) = tokio::join!(dismiss, retract);
+            let (state, _) = fleet.conflict_row(conflict_id).await;
+            let outcome = match (dismissed, retracted) {
+                (Ok(_), Err(FleetError::LifecycleRefused(refusal)))
+                    if refusal.code == RefusalCode::StaleRevision =>
+                {
+                    assert_eq!(state, "dismissed");
+                    assert_eq!(fleet.claim(x.claim.id).await.state, ClaimState::Active);
+                    fleet
+                        .assert_key_unconsumed(&format!("{round}/retract"))
+                        .await;
+                    AdjudicationRace::DismissedThenRetracted
+                }
+                (Err(FleetError::LifecycleRefused(refusal)), Ok(retracted))
+                    if refusal.code == RefusalCode::NotOpen =>
+                {
+                    assert_eq!(state, "resolved");
+                    assert_eq!(retracted.conflicts_resolved, [conflict_id]);
+                    assert_eq!(fleet.claim(x.claim.id).await.state, ClaimState::Retracted);
+                    AdjudicationRace::RetractedFirst
+                }
+                (dismissed, retracted) => panic!(
+                    "round {round}: exactly one of dismiss and retract commits: {dismissed:?} / {retracted:?}"
+                ),
+            };
+            outcomes.push(outcome);
+            assert_eq!(fleet.claim(y.claim.id).await.state, ClaimState::Active);
+        }
+    }
+    assert_eq!(outcomes.len(), 24);
     fleet.assert_lifecycle_invariants().await;
 
     second.pool().close().await;

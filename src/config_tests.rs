@@ -258,6 +258,37 @@ fn remember_lifecycle_flag_defaults_enabled_and_rejects_unknown() {
 }
 
 #[test]
+fn conflict_adjudication_flag_defaults_disabled_and_rejects_unknown() {
+    let mut values = serving_values();
+    values.insert(
+        "FLEET_RECALL_DATABASE_URL",
+        "postgresql://fleet_writer:writer-secret@cluster.example:26257/fleet_recall?sslmode=verify-full"
+            .into(),
+    );
+    let config = FleetConfig::from_lookup(|name| values.get(name).cloned()).expect("default");
+    assert!(!config.lifecycle.conflict_adjudication);
+
+    for (value, expected) in [("enabled", true), ("disabled", false)] {
+        values.insert("FLEET_RECALL_CONFLICT_ADJUDICATION", value.into());
+        let config = FleetConfig::from_lookup(|name| values.get(name).cloned()).expect(value);
+        assert_eq!(config.lifecycle.conflict_adjudication, expected);
+        // The switch is independent of the claim lifecycle switch.
+        assert!(config.lifecycle.remember_lifecycle);
+    }
+
+    for rejected in ["", "true", "Enabled", "enabled ", "on"] {
+        values.insert("FLEET_RECALL_CONFLICT_ADJUDICATION", rejected.into());
+        let error = FleetConfig::from_lookup(|name| values.get(name).cloned())
+            .expect_err("unknown adjudication switch must fail closed")
+            .to_string();
+        assert!(
+            error.contains("FLEET_RECALL_CONFLICT_ADJUDICATION"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn writer_and_migrator_configs_require_distinct_decoded_users() {
     let mut writer_values = serving_values();
     writer_values.insert(

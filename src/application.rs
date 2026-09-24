@@ -12,12 +12,13 @@ use serde_json::{Map, Value, json};
 
 use crate::ledger::{
     ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict, ConflictMutation,
-    ConflictTarget, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LifecycleMutation,
-    LifecycleReplayRequest, MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT,
-    MAX_OVERLAY_EPISODE_EVENTS, SemanticClaimHit, SupportedClaimCoordinate, derive_overlay,
-    history_within_bytes, overlay_episode_revision, unlogged_transitions,
-    validate_lifecycle_reason,
+    ConflictTarget, DismissalTerms, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LifecycleMutation,
+    LifecycleReplayRequest, MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT, SemanticClaimHit,
+    SupportedClaimCoordinate, WaiverTerms, derive_overlay, history_within_bytes,
+    overlay_episode_revision, unlogged_transitions, validate_lifecycle_reason, validate_rationale,
+    validate_waiver_hours,
 };
+use crate::memory_contracts::discrepancy::{DismissalReasonKindV1, WaiverReasonKindV1};
 use crate::service::{
     ConflictCoverage, FleetMemoryService, RecallAction, RecallRequest, RecallResult, Refusal,
     RememberAction, RememberRequest, RememberResult, RememberSurface, ServiceError, ServiceResult,
@@ -618,15 +619,13 @@ impl CockroachMemoryService {
             Ok(rows) => {
                 for conflict in conflicts.iter_mut() {
                     let events = rows.events.get(&conflict.id).map_or(&[][..], Vec::as_slice);
-                    let truncated = events.len() > MAX_OVERLAY_EPISODE_EVENTS;
-                    let shown = &events[..events.len().min(MAX_OVERLAY_EPISODE_EVENTS)];
                     let member_count = i64::try_from(conflict.member_count).unwrap_or(i64::MAX);
                     conflict.lifecycle = Some(derive_overlay(
                         &conflict.state,
                         conflict.revision,
                         member_count,
-                        shown,
-                        truncated,
+                        events,
+                        rows.truncated.contains(&conflict.id),
                         rows.evaluated_at,
                     ));
                 }
@@ -785,6 +784,36 @@ impl CockroachMemoryService {
         Ok(self.conflict_result(scope, &mutation).await)
     }
 
+    async fn remember_dismiss(
+        &self,
+        scope: &FleetScope,
+        request: RememberRequest,
+    ) -> ServiceResult<RememberResult> {
+        let idempotency_key = required_idempotency_key(request.action, request.idempotency_key)?;
+        let (target, dismissal) = parse_dismiss_arguments(request.arguments)?;
+        let mutation = self
+            .ledger
+            .dismiss_conflict(scope, target, dismissal.terms(), &idempotency_key)
+            .await
+            .map_err(service_error)?;
+        Ok(self.conflict_result(scope, &mutation).await)
+    }
+
+    async fn remember_waive(
+        &self,
+        scope: &FleetScope,
+        request: RememberRequest,
+    ) -> ServiceResult<RememberResult> {
+        let idempotency_key = required_idempotency_key(request.action, request.idempotency_key)?;
+        let (target, waiver) = parse_waive_arguments(request.arguments)?;
+        let mutation = self
+            .ledger
+            .waive_conflict(scope, target, waiver.terms(), &idempotency_key)
+            .await
+            .map_err(service_error)?;
+        Ok(self.conflict_result(scope, &mutation).await)
+    }
+
     /// Project a committed (or replayed) lifecycle mutation: every conflict it
     /// touched, in any state, from the claim's lineage membership plus
     /// whatever the detector re-evaluated.
@@ -874,6 +903,12 @@ impl CockroachMemoryService {
                     reason,
                 },
             ),
+            RememberAction::Dismiss => parse_dismiss_arguments(request.arguments)
+                .ok()
+                .map(|(target, dismissal)| UnservedLifecycle::Dismiss { target, dismissal }),
+            RememberAction::Waive => parse_waive_arguments(request.arguments)
+                .ok()
+                .map(|(target, waiver)| UnservedLifecycle::Waive { target, waiver }),
             _ => None,
         };
         let replay = self
@@ -1307,6 +1342,8 @@ impl FleetMemoryService for CockroachMemoryService {
             RememberAction::Supersede => self.remember_supersede(&scope, request).await,
             RememberAction::Acknowledge => self.remember_acknowledge(&scope, request).await,
             RememberAction::Resolve => self.remember_resolve(&scope, request).await,
+            RememberAction::Dismiss => self.remember_dismiss(&scope, request).await,
+            RememberAction::Waive => self.remember_waive(&scope, request).await,
             action => Err(ServiceError::InvalidRequest(format!(
                 "remember({}) is not implemented yet",
                 action.as_str()
@@ -1368,6 +1405,14 @@ enum UnservedLifecycle {
         retract_claim_ids: Vec<i64>,
         reason: Option<String>,
     },
+    Dismiss {
+        target: ConflictTarget,
+        dismissal: Dismissal,
+    },
+    Waive {
+        target: ConflictTarget,
+        waiver: Waiver,
+    },
 }
 
 impl UnservedLifecycle {
@@ -1398,6 +1443,14 @@ impl UnservedLifecycle {
                 target: *target,
                 retract_claim_ids,
                 reason: reason.as_deref(),
+            },
+            Self::Dismiss { target, dismissal } => LifecycleReplayRequest::Dismiss {
+                target: *target,
+                terms: dismissal.terms(),
+            },
+            Self::Waive { target, waiver } => LifecycleReplayRequest::Waive {
+                target: *target,
+                terms: waiver.terms(),
             },
         }
     }
@@ -1526,6 +1579,122 @@ fn parse_resolve_arguments(
     retract_claim_ids.sort_unstable();
     validate_optional_reason(args.reason.as_deref())?;
     Ok((target, retract_claim_ids, args.reason))
+}
+
+/// `remember(dismiss)` arguments: an adjudicator's judgement that a conflict
+/// is not a real disagreement.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DismissArgs {
+    conflict_id: Value,
+    expected_revision: i64,
+    expected_member_count: i64,
+    reason_kind: DismissalReasonKindV1,
+    rationale: String,
+}
+
+/// `remember(waive)` arguments: an adjudicator's time-boxed acceptance of a
+/// conflict's current episode.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaiveArgs {
+    conflict_id: Value,
+    expected_revision: i64,
+    expected_member_count: i64,
+    reason_kind: WaiverReasonKindV1,
+    rationale: String,
+    expires_in_hours: i64,
+    #[serde(default)]
+    review_in_hours: Option<i64>,
+}
+
+/// A parsed, validated dismissal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Dismissal {
+    reason_kind: DismissalReasonKindV1,
+    rationale: String,
+}
+
+impl Dismissal {
+    fn terms(&self) -> DismissalTerms<'_> {
+        DismissalTerms {
+            reason_kind: self.reason_kind,
+            rationale: &self.rationale,
+        }
+    }
+}
+
+/// A parsed, validated waiver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Waiver {
+    reason_kind: WaiverReasonKindV1,
+    rationale: String,
+    expires_in_hours: u16,
+    review_in_hours: Option<u16>,
+}
+
+impl Waiver {
+    fn terms(&self) -> WaiverTerms<'_> {
+        WaiverTerms {
+            reason_kind: self.reason_kind,
+            rationale: &self.rationale,
+            expires_in_hours: self.expires_in_hours,
+            review_in_hours: self.review_in_hours,
+        }
+    }
+}
+
+fn parse_dismiss_arguments(
+    arguments: Map<String, Value>,
+) -> ServiceResult<(ConflictTarget, Dismissal)> {
+    let args: DismissArgs = from_arguments(arguments, "remember dismiss")?;
+    let target = conflict_target(
+        &args.conflict_id,
+        args.expected_revision,
+        Some(args.expected_member_count),
+    )?;
+    validate_rationale(&args.rationale).map_err(ServiceError::InvalidRequest)?;
+    Ok((
+        target,
+        Dismissal {
+            reason_kind: args.reason_kind,
+            rationale: args.rationale,
+        },
+    ))
+}
+
+fn parse_waive_arguments(arguments: Map<String, Value>) -> ServiceResult<(ConflictTarget, Waiver)> {
+    let args: WaiveArgs = from_arguments(arguments, "remember waive")?;
+    let target = conflict_target(
+        &args.conflict_id,
+        args.expected_revision,
+        Some(args.expected_member_count),
+    )?;
+    validate_rationale(&args.rationale).map_err(ServiceError::InvalidRequest)?;
+    let hours = |value: i64, field: &str| {
+        u16::try_from(value).map_err(|_| {
+            ServiceError::InvalidRequest(format!(
+                "{field} must be between 1 and {}",
+                crate::ledger::MAX_WAIVER_HOURS
+            ))
+        })
+    };
+    let expires_in_hours = hours(args.expires_in_hours, "expires_in_hours")?;
+    let review_in_hours = args
+        .review_in_hours
+        .map(|review| hours(review, "review_in_hours"))
+        .transpose()?;
+    validate_waiver_hours(expires_in_hours, review_in_hours)
+        .map_err(ServiceError::InvalidRequest)?;
+    Ok((
+        target,
+        Waiver {
+            reason_kind: args.reason_kind,
+            rationale: args.rationale,
+            expires_in_hours,
+            review_in_hours,
+        },
+    ))
 }
 
 fn conflict_target(
@@ -2432,11 +2601,18 @@ mod tests {
     const CLAIM_LIFECYCLE: RememberSurface = RememberSurface {
         claim_lifecycle: true,
         conflict_lifecycle: false,
+        adjudication: false,
     };
 
     const CONFLICT_LIFECYCLE: RememberSurface = RememberSurface {
         claim_lifecycle: true,
         conflict_lifecycle: true,
+        adjudication: false,
+    };
+
+    const ADJUDICATING: RememberSurface = RememberSurface {
+        adjudication: true,
+        ..CONFLICT_LIFECYCLE
     };
 
     fn retract_arguments(value: &Value) -> Map<String, Value> {
@@ -2948,6 +3124,212 @@ mod tests {
         }
     }
 
+    fn dismiss_arguments(extra: &Value) -> Map<String, Value> {
+        conflict_arguments(&json!({
+            "expected_member_count": 2,
+            "reason_kind": "false_positive",
+            "rationale": "the two values name different deployments",
+        }))
+        .into_iter()
+        .chain(retract_arguments(extra))
+        .collect()
+    }
+
+    fn waive_arguments(extra: &Value) -> Map<String, Value> {
+        conflict_arguments(&json!({
+            "expected_member_count": 2,
+            "reason_kind": "capacity_deferred",
+            "rationale": "the migration review is scheduled for next sprint",
+            "expires_in_hours": 72,
+        }))
+        .into_iter()
+        .chain(retract_arguments(extra))
+        .collect()
+    }
+
+    #[test]
+    fn dismiss_waive_args_reject_unknown_and_bounds() {
+        let (target, dismissal) =
+            parse_dismiss_arguments(dismiss_arguments(&json!({ "conflict_id": "9" }))).unwrap();
+        assert_eq!(
+            target,
+            ConflictTarget {
+                conflict_id: 9,
+                expected_revision: 3,
+                expected_member_count: Some(2),
+            }
+        );
+        assert_eq!(dismissal.reason_kind, DismissalReasonKindV1::FalsePositive);
+        assert_eq!(
+            dismissal.terms().rationale,
+            "the two values name different deployments"
+        );
+        let (_, waiver) =
+            parse_waive_arguments(waive_arguments(&json!({ "review_in_hours": 24 }))).unwrap();
+        assert_eq!(waiver.reason_kind, WaiverReasonKindV1::CapacityDeferred);
+        assert_eq!(
+            (waiver.expires_in_hours, waiver.review_in_hours),
+            (72, Some(24))
+        );
+        assert_eq!(
+            parse_waive_arguments(waive_arguments(&json!({})))
+                .unwrap()
+                .1
+                .review_in_hours,
+            None
+        );
+
+        let mut without_rationale = dismiss_arguments(&json!({}));
+        without_rationale.remove("rationale");
+        let mut without_count = dismiss_arguments(&json!({}));
+        without_count.remove("expected_member_count");
+        let mut without_kind = dismiss_arguments(&json!({}));
+        without_kind.remove("reason_kind");
+        for rejected in [
+            without_rationale,
+            without_count,
+            without_kind,
+            // A waiver's reason is not a dismissal's, and the vocabulary is closed.
+            dismiss_arguments(&json!({ "reason_kind": "capacity_deferred" })),
+            dismiss_arguments(&json!({ "reason_kind": "wrong" })),
+            dismiss_arguments(&json!({ "rationale": " \u{200B} " })),
+            dismiss_arguments(&json!({ "rationale": "x".repeat(1_001) })),
+            dismiss_arguments(&json!({ "reason": "a note is not a rationale" })),
+            dismiss_arguments(&json!({ "expires_in_hours": 1 })),
+            dismiss_arguments(&json!({ "retract_claim_ids": [41] })),
+            dismiss_arguments(&json!({ "winner": 41 })),
+            dismiss_arguments(&json!({ "expected_member_count": 0 })),
+            dismiss_arguments(&json!({ "conflict_id": 0 })),
+        ] {
+            let rendered = Value::Object(rejected.clone());
+            assert!(
+                matches!(
+                    parse_dismiss_arguments(rejected),
+                    Err(ServiceError::InvalidRequest(_))
+                ),
+                "dismiss {rendered}"
+            );
+        }
+
+        let mut without_expiry = waive_arguments(&json!({}));
+        without_expiry.remove("expires_in_hours");
+        for rejected in [
+            without_expiry,
+            waive_arguments(&json!({ "reason_kind": "false_positive" })),
+            waive_arguments(&json!({ "expires_in_hours": 0 })),
+            waive_arguments(&json!({ "expires_in_hours": 2_161 })),
+            waive_arguments(&json!({ "expires_in_hours": 70_000 })),
+            waive_arguments(&json!({ "expires_in_hours": -1 })),
+            waive_arguments(&json!({ "review_in_hours": 73 })),
+            waive_arguments(&json!({ "review_in_hours": 0 })),
+            waive_arguments(&json!({ "rationale": "" })),
+            waive_arguments(&json!({ "reason": "note" })),
+            waive_arguments(&json!({ "claim_id": 41 })),
+        ] {
+            let rendered = Value::Object(rejected.clone());
+            assert!(
+                matches!(
+                    parse_waive_arguments(rejected),
+                    Err(ServiceError::InvalidRequest(_))
+                ),
+                "waive {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_rationale_the_adjudication_schema_admits_is_accepted() {
+        let tool = crate::mcp::remember_tool_for(ADJUDICATING);
+        let rationale = &tool["inputSchema"]["properties"]["rationale"];
+        let max = usize::try_from(rationale["maxLength"].as_u64().unwrap()).unwrap();
+        let dismiss = |rationale: String| {
+            parse_dismiss_arguments(dismiss_arguments(&json!({ "rationale": rationale })))
+        };
+        for admitted in ["\u{1F4DD}".repeat(max), "\u{7406}".repeat(max), "x".into()] {
+            assert!(dismiss(admitted).is_ok());
+        }
+        assert!(dismiss("\u{7406}".repeat(max + 1)).is_err());
+        let expires = &tool["inputSchema"]["properties"]["expires_in_hours"];
+        let longest = expires["maximum"].as_i64().unwrap();
+        assert!(
+            parse_waive_arguments(waive_arguments(
+                &json!({ "expires_in_hours": longest, "review_in_hours": longest })
+            ))
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn adjudication_is_gated_before_io() {
+        let remember = |service: CockroachMemoryService,
+                        action,
+                        key: Option<&'static str>,
+                        arguments| async move {
+            FleetMemoryService::remember(
+                &service,
+                offline_scope(),
+                RememberRequest::new(action, key.map(str::to_owned), arguments),
+            )
+            .await
+            .unwrap_err()
+        };
+        for (action, arguments) in [
+            (RememberAction::Dismiss, dismiss_arguments(&json!({}))),
+            (RememberAction::Waive, waive_arguments(&json!({}))),
+        ] {
+            // Off by default: the conflict-lifecycle writer refuses before
+            // any I/O (with no key there is no receipt to replay).
+            let error = remember(
+                offline_service(CONFLICT_LIFECYCLE),
+                action,
+                None,
+                arguments.clone(),
+            )
+            .await;
+            assert!(
+                matches!(&error, ServiceError::Refused(refusal) if refusal.code == "adjudication_disabled"),
+                "{error}"
+            );
+            // Without the conflict lifecycle there is nothing to adjudicate.
+            let error = remember(
+                offline_service(CLAIM_LIFECYCLE),
+                action,
+                None,
+                arguments.clone(),
+            )
+            .await;
+            assert!(
+                matches!(&error, ServiceError::Refused(refusal) if refusal.code == "lifecycle_unavailable"),
+                "{error}"
+            );
+            // Served: the key is required, then a ledger that never passed
+            // the startup probe refuses before it touches the database.
+            let error = remember(
+                offline_service(ADJUDICATING),
+                action,
+                None,
+                arguments.clone(),
+            )
+            .await;
+            assert!(
+                matches!(&error, ServiceError::InvalidRequest(message)
+                    if *message == format!("remember({}) requires idempotency_key", action.as_str())),
+                "{error}"
+            );
+            let error = remember(
+                offline_service(ADJUDICATING),
+                action,
+                Some("adjudicate/9"),
+                arguments,
+            )
+            .await;
+            assert!(
+                matches!(&error, ServiceError::Refused(refusal) if refusal.code == "lifecycle_unavailable"),
+                "{error}"
+            );
+        }
+    }
+
     #[test]
     fn lifecycle_overlay_outcome_marks_coverage_without_failing() {
         let mut coverage = conflict_coverage(true, &[]);
@@ -3095,6 +3477,7 @@ mod tests {
             conflict_revision: 2,
             remaining_pair_count: 0,
             remaining_pairs: Vec::new(),
+            excluded_dismissed_pairs: 0,
         });
         assert_eq!(affected_conflict_ids(&retract), [9]);
         let result = committed_lifecycle_result(&retract, &[9], Ok(vec![v2]));

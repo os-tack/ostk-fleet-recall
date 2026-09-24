@@ -9,6 +9,7 @@
 //! inside the retried closure, so the transaction rolls back with its receipt
 //! reservation and the idempotency key stays free.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
@@ -17,7 +18,8 @@ use sqlx::postgres::PgRow;
 use sqlx::{Row, Transaction};
 
 use super::conflict_store::{
-    self, LifecycleEventDraft, acknowledge_request, append_close_event, resolve_request,
+    self, LifecycleEventDraft, acknowledge_request, append_close_event, dismiss_request,
+    excluded_dismissed_pairs, resolve_request, waive_request,
 };
 use super::{
     ClaimPassage, CockroachClaimLedger, MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON, MAX_LEDGER_RESULTS,
@@ -45,6 +47,8 @@ const RETRACT_OPERATION: &str = "retract";
 const SUPERSEDE_OPERATION: &str = "supersede";
 pub(super) const ACKNOWLEDGE_OPERATION: &str = "conflict_acknowledge";
 pub(super) const RESOLVE_OPERATION: &str = "conflict_resolve";
+pub(super) const DISMISS_OPERATION: &str = "conflict_dismiss";
+pub(super) const WAIVE_OPERATION: &str = "conflict_waive";
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 pub(super) const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 /// Every pair among 256 locked claims plus one sentinel row.
@@ -52,6 +56,8 @@ const MAX_KEY_INCOMPATIBLE_PAIRS: usize =
     MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON * (MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON - 1) / 2;
 const RESOLVED_STATE: &str = "resolved";
 const NO_CURRENT_INCOMPATIBILITY: &str = "no_current_incompatibility";
+/// The claim-event reason of a disputed member a verified close restored.
+const RESOLVED_RESTORE_REASON: &str = "conflict_resolved";
 
 const SELECT_RECEIPT_SQL: &str = "SELECT project, operation, request, response \
      FROM memory_mutation_receipts \
@@ -392,6 +398,12 @@ pub(super) async fn replay_unserved_lifecycle(
             RESOLVE_OPERATION,
             resolve_request(scope, target, retract_claim_ids, reason),
         ),
+        LifecycleReplayRequest::Dismiss { target, terms } => {
+            conflict(DISMISS_OPERATION, dismiss_request(scope, target, terms))
+        }
+        LifecycleReplayRequest::Waive { target, terms } => {
+            conflict(WAIVE_OPERATION, waive_request(scope, target, terms))
+        }
     }
     .map(Some)
 }
@@ -1007,11 +1019,20 @@ async fn reevaluate_key(
         return Ok(ReevaluationEffect::default());
     };
     let sql_pairs = key_incompatible_pairs(transaction, scope, claim_key).await?;
-    match plan_reevaluation(Some(lineage), current, &sql_pairs) {
+    // Pairs an adjudicator dismissed are read from the lifecycle log, so a
+    // ledger without the capability excludes none, which only keeps a
+    // conflict open.
+    let excluded = if audit.log {
+        excluded_dismissed_pairs(transaction, scope, lineage.id).await?
+    } else {
+        BTreeSet::new()
+    };
+    match plan_reevaluation(Some(lineage), current, &sql_pairs, &excluded) {
         Reevaluation::Close {
             conflict_id,
             revision: conflict_revision,
             restore_candidates,
+            excluded_pairs,
         } => {
             apply_verified_close(
                 transaction,
@@ -1023,6 +1044,7 @@ async fn reevaluate_key(
                     restore_candidates: &restore_candidates,
                     current,
                     resolution_reason,
+                    excluded_dismissed_pairs: excluded_pairs,
                 },
                 audit,
             )
@@ -1032,12 +1054,14 @@ async fn reevaluate_key(
             conflict_id,
             revision: conflict_revision,
             pairs,
+            excluded_pairs,
         } => Ok(ReevaluationEffect {
             reevaluation: Some(reevaluation_report(
                 conflict_id,
                 "still_open",
                 conflict_revision,
                 &pairs,
+                excluded_pairs,
             )),
             ..ReevaluationEffect::default()
         }),
@@ -1059,6 +1083,7 @@ async fn reevaluate_key(
                     "divergent",
                     conflict_revision,
                     &sql_pairs,
+                    0,
                 )),
                 ..ReevaluationEffect::default()
             })
@@ -1078,6 +1103,9 @@ pub(super) struct VerifiedClose<'a> {
     /// The key's remaining lifecycle-current claims.
     pub(super) current: &'a [LockedKeyClaim],
     pub(super) resolution_reason: &'a str,
+    /// Current incompatible pairs left out because an adjudicator dismissed
+    /// them in this conflict.
+    pub(super) excluded_dismissed_pairs: usize,
 }
 
 /// Close the key's v2 conflict as `resolved`, restore the disputed members no
@@ -1096,13 +1124,27 @@ pub(super) async fn apply_verified_close(
         restore_candidates,
         current,
         resolution_reason,
+        excluded_dismissed_pairs,
     } = close;
+    // The reason stays a server template: only the count of excluded pairs
+    // is added, never agent text.
+    let resolution_reason = if excluded_dismissed_pairs == 0 {
+        resolution_reason.to_owned()
+    } else {
+        format!(
+            "{resolution_reason}, leaving out {excluded_dismissed_pairs} pair(s) an adjudicator dismissed"
+        )
+    };
     let closed_revision = close_conflict(
         transaction,
         scope,
-        conflict_id,
-        conflict_revision,
-        resolution_reason,
+        ConflictClose {
+            conflict_id,
+            expected_revision: conflict_revision,
+            state: RESOLVED_STATE,
+            resolution_kind: NO_CURRENT_INCOMPATIBILITY,
+            resolution_reason: &resolution_reason,
+        },
     )
     .await?;
     let claims_restored = restore_disputed_members(
@@ -1112,6 +1154,7 @@ pub(super) async fn apply_verified_close(
             conflict_id,
             conflict_revision: closed_revision,
             claim_key,
+            transition_reason: RESOLVED_RESTORE_REASON,
         },
         restore_candidates,
         audit.key,
@@ -1143,7 +1186,10 @@ pub(super) async fn apply_verified_close(
                     "cause": audit.cause,
                     "restored_claim_ids": claims_restored,
                     "remaining_current_claim_ids": remaining,
+                    "excluded_dismissed_pairs": excluded_dismissed_pairs,
                 }),
+                expires_in_hours: None,
+                review_in_hours: None,
             },
         )
         .await?
@@ -1158,6 +1204,7 @@ pub(super) async fn apply_verified_close(
             "closed",
             closed_revision,
             &[],
+            excluded_dismissed_pairs,
         )),
         lifecycle_event,
     })
@@ -1343,34 +1390,44 @@ pub(super) async fn key_incompatible_pairs(
     Ok(pairs)
 }
 
-async fn close_conflict(
+/// One close of a locked open v2 conflict: `resolved` by the detector, or
+/// `dismissed` by an adjudicator. The reason is always a server template.
+pub(super) struct ConflictClose<'a> {
+    pub(super) conflict_id: i64,
+    pub(super) expected_revision: i64,
+    pub(super) state: &'a str,
+    pub(super) resolution_kind: &'a str,
+    pub(super) resolution_reason: &'a str,
+}
+
+pub(super) async fn close_conflict(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
-    conflict_id: i64,
-    expected_revision: i64,
-    resolution_reason: &str,
+    close: ConflictClose<'_>,
 ) -> Result<i64> {
     sqlx::query_scalar::<_, i64>(CLOSE_CONFLICT_SQL)
         .bind(scope.tenant_id)
         .bind(&scope.project)
-        .bind(conflict_id)
-        .bind(expected_revision)
-        .bind(RESOLVED_STATE)
-        .bind(NO_CURRENT_INCOMPATIBILITY)
-        .bind(resolution_reason)
+        .bind(close.conflict_id)
+        .bind(close.expected_revision)
+        .bind(close.state)
+        .bind(close.resolution_kind)
+        .bind(close.resolution_reason)
         .fetch_optional(&mut **transaction)
         .await?
-        .ok_or_else(|| protocol_error("locked open conflict changed before its verified close"))
+        .ok_or_else(|| protocol_error("locked open conflict changed before its close"))
 }
 
-/// The closed v2 lineage whose disputed members a verified close restores.
-struct RestoreScope<'a> {
-    conflict_id: i64,
-    conflict_revision: i64,
-    claim_key: &'a str,
+/// The closed v2 lineage whose disputed members a close restores.
+pub(super) struct RestoreScope<'a> {
+    pub(super) conflict_id: i64,
+    pub(super) conflict_revision: i64,
+    pub(super) claim_key: &'a str,
+    /// The claim-event reason of each restore, e.g. `conflict_resolved`.
+    pub(super) transition_reason: &'a str,
 }
 
-async fn restore_disputed_members(
+pub(super) async fn restore_disputed_members(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     lineage: RestoreScope<'_>,
@@ -1381,6 +1438,7 @@ async fn restore_disputed_members(
         conflict_id,
         conflict_revision,
         claim_key,
+        transition_reason,
     } = lineage;
     if candidates.is_empty() {
         return Ok(Vec::new());
@@ -1402,7 +1460,7 @@ async fn restore_disputed_members(
             transaction,
             scope,
             claim_id,
-            "conflict_resolved",
+            transition_reason,
             ClaimState::Disputed,
             ClaimState::Active,
             json!({
@@ -1462,6 +1520,7 @@ fn reevaluation_report(
     outcome: &str,
     conflict_revision: i64,
     pairs: &[(i64, i64)],
+    excluded_dismissed_pairs: usize,
 ) -> ConflictReevaluation {
     ConflictReevaluation {
         conflict_id,
@@ -1473,6 +1532,7 @@ fn reevaluation_report(
             .take(MAX_REPORTED_REMAINING_PAIRS)
             .map(|(left, right)| [*left, *right])
             .collect(),
+        excluded_dismissed_pairs,
     }
 }
 

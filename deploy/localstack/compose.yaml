@@ -20,6 +20,11 @@ x-fleet-environment: &fleet-environment
   FLEET_RECALL_EMBEDDING_MODEL_SHA256: ${FLEET_RECALL_EMBEDDING_MODEL_SHA256:?run deploy/localstack/smoke.sh}
   FLEET_RECALL_MODEL_S3_URI: s3://fleet-recall-local-models/bundles/demo
   RUST_LOG: ostk_fleet_recall=info
+  # The private writer's `serve` also reads two optional lifecycle switches,
+  # left unset here so they keep their defaults:
+  # FLEET_RECALL_REMEMBER_LIFECYCLE=enabled and
+  # FLEET_RECALL_CONFLICT_ADJUDICATION=disabled. Read the adjudication section
+  # of docs/SECURITY.md before enabling remember(dismiss) and remember(waive).
 
 # The AWS-CLI-bearing target is confined to one-shot/private helpers. The
 # externally reachable app below is built from the exact production target.

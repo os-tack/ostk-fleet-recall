@@ -270,6 +270,26 @@ request, so no agent can end a dispute by retiring another agent's claim
 (DISC-03). Anyone may ask the detector to re-verify, since the outcome depends
 on data alone (AUTH-03).
 
+Adjudication, `remember(dismiss)` and `remember(waive)`, is the one way an
+agent can end or tolerate a dispute it did not concede, so it is off unless
+the deployment sets `FLEET_RECALL_CONFLICT_ADJUDICATION=enabled`. Enable it
+only where every agent sharing the writer credential may act as an
+adjudicator. The ledger refuses both as `adjudication_disabled` without the
+switch, and the switch has no effect without the probed lifecycle capability
+(startup logs an error). The adjudicator must have authored none of the
+conflict's member claims in any episode (`implicated`), and a member with no
+recorded actor refuses everyone (`unattributed_member`), because an anonymous
+claim could be the adjudicator's own. A dismissal changes no claim's value,
+author, or applicability: it closes the conflict row with the closed
+`dismissed:<reason_kind>` vocabulary and a fixed reason, returns its disputed
+members to `active`, and records the judged pairs, which later re-evaluations
+of that conflict leave out. A waiver writes only its lifecycle event, and its
+expiry and review time come from the database clock. The required rationale
+of both stays in the private lifecycle log, where every agent in the project
+can read it through the overlay and history, and never reaches
+`memory_conflicts` or the publication reader. Waivers are not signed and not
+bound to an active policy (ADR 0004 D5).
+
 Retract and supersede need no migration and no new grant: the runtime role's
 existing `SELECT`/`UPDATE` on `memory_claims` and `memory_conflicts`, `SELECT`
 on `memory_conflict_members`, `INSERT` on the two event tables, and its

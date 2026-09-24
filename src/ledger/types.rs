@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ledger::{canonical_json, normalize_key_part};
+use crate::memory_contracts::discrepancy::{DismissalReasonKindV1, WaiverReasonKindV1};
 use crate::{FleetError, Result};
 
 // `memory_claims` are projected into `memory_chunks`, whose generated
@@ -516,10 +517,38 @@ pub enum LifecycleReplayRequest<'a> {
         retract_claim_ids: &'a [i64],
         reason: Option<&'a str>,
     },
+    Dismiss {
+        target: ConflictTarget,
+        terms: DismissalTerms<'a>,
+    },
+    Waive {
+        target: ConflictTarget,
+        terms: WaiverTerms<'a>,
+    },
+}
+
+/// An adjudicator's dismissal of a conflict: the closed reason vocabulary of
+/// the discrepancy contract and a required, bounded rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DismissalTerms<'a> {
+    pub reason_kind: DismissalReasonKindV1,
+    pub rationale: &'a str,
+}
+
+/// An adjudicator's waiver of a conflict's current episode. The database
+/// clock turns the hours into its expiry and optional review time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaiverTerms<'a> {
+    pub reason_kind: WaiverReasonKindV1,
+    pub rationale: &'a str,
+    /// 1..=2160.
+    pub expires_in_hours: u16,
+    /// 1..=`expires_in_hours` when present.
+    pub review_in_hours: Option<u16>,
 }
 
 /// A replayed lifecycle result: a claim mutation for `retract`/`supersede`,
-/// a conflict mutation for `acknowledge`/`resolve`.
+/// a conflict mutation for the conflict actions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LifecycleMutation {
     Claim(ClaimMutation),
@@ -571,10 +600,11 @@ pub struct ConflictLifecycleEvent {
     pub payload_elided: bool,
 }
 
-/// What an `acknowledge` or concession `resolve` did to one conflict.
+/// What a conflict action (`acknowledge`, concession `resolve`, or an
+/// adjudicator's `dismiss` or `waive`) did to one conflict.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictMutation {
-    /// The remember action: `acknowledge` or `resolve`.
+    /// The remember action: `acknowledge`, `resolve`, `dismiss`, or `waive`.
     pub operation: String,
     pub conflict_id: i64,
     /// The conflict's state after the mutation.
@@ -585,14 +615,15 @@ pub struct ConflictMutation {
     /// False when the request committed but changed nothing (an agent's
     /// second acknowledgement of the same episode).
     pub applied: bool,
-    /// `acknowledged`, `already_acknowledged`, or `resolved`.
+    /// `acknowledged`, `already_acknowledged`, `resolved`, `dismissed`, or
+    /// `waived`.
     pub status: Option<String>,
     /// The lifecycle event this mutation appended, when it appended one.
     pub lifecycle_event: Option<ConflictLifecycleEvent>,
     /// The caller's own claims a concession retracted.
     #[serde(default)]
     pub claims_retracted: Vec<i64>,
-    /// Disputed members the verified close returned to `active`.
+    /// Disputed members a verified close or a dismissal returned to `active`.
     #[serde(default)]
     pub claims_restored: Vec<i64>,
     #[serde(default)]
@@ -677,9 +708,12 @@ pub struct ConflictHistory {
 /// The lifecycle events of several conflict episodes, read in one statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictLifecycleRows {
-    /// The newest events (at most 33) of each requested episode, newest
-    /// first, keyed by conflict id.
+    /// The newest events (at most 32) of each requested episode, newest
+    /// first, then the episode's latest waiver when it is older than those,
+    /// keyed by conflict id.
     pub events: std::collections::HashMap<i64, Vec<ConflictLifecycleEvent>>,
+    /// The conflicts whose episode has more events than the overlay reads.
+    pub truncated: std::collections::BTreeSet<i64>,
     /// The database time of the read.
     pub evaluated_at: DateTime<Utc>,
 }
@@ -696,6 +730,16 @@ pub struct ConflictReevaluation {
     pub remaining_pair_count: usize,
     /// At most 32 remaining incompatible `[lower, higher]` claim id pairs.
     pub remaining_pairs: Vec<[i64; 2]>,
+    /// Current incompatible pairs left out because an adjudicator already
+    /// dismissed them in this conflict. Omitted when zero, so responses and
+    /// stored receipts from before adjudication keep their bytes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub excluded_dismissed_pairs: usize,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
+const fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -795,10 +839,30 @@ mod tests {
             conflict_revision: 4,
             remaining_pair_count: 0,
             remaining_pairs: Vec::new(),
+            excluded_dismissed_pairs: 0,
         });
         let encoded = serde_json::to_value(&retract).unwrap();
         assert_eq!(encoded["claims_restored"], serde_json::json!([42]));
         assert_eq!(encoded["reevaluation"]["outcome"], "closed");
+        assert!(
+            encoded["reevaluation"]
+                .get("excluded_dismissed_pairs")
+                .is_none(),
+            "no exclusion keeps the pre-adjudication reevaluation bytes"
+        );
+        let mut excluding = retract.clone();
+        if let Some(reevaluation) = excluding.reevaluation.as_mut() {
+            reevaluation.excluded_dismissed_pairs = 2;
+        }
+        let encoded_excluding = serde_json::to_value(&excluding).unwrap();
+        assert_eq!(
+            encoded_excluding["reevaluation"]["excluded_dismissed_pairs"],
+            2
+        );
+        assert_eq!(
+            serde_json::from_value::<ClaimMutation>(encoded_excluding).unwrap(),
+            excluding
+        );
         assert!(encoded.get("superseded").is_none());
         assert_eq!(
             serde_json::from_value::<ClaimMutation>(encoded).unwrap(),

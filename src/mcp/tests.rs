@@ -758,6 +758,7 @@ async fn conflict_lifecycle_surface_advertises_and_routes_acknowledge_and_resolv
         surface: RememberSurface {
             claim_lifecycle: true,
             conflict_lifecycle: true,
+            adjudication: false,
         },
         ..FakeService::default()
     });
@@ -818,6 +819,90 @@ async fn conflict_lifecycle_surface_advertises_and_routes_acknowledge_and_resolv
         [
             ("acknowledge".to_owned(), json!(9)),
             ("resolve".to_owned(), json!(9))
+        ]
+    );
+}
+
+#[tokio::test]
+async fn adjudication_surface_advertises_and_routes_dismiss_and_waive() {
+    let fake = Arc::new(FakeService {
+        surface: RememberSurface {
+            claim_lifecycle: true,
+            conflict_lifecycle: true,
+            adjudication: true,
+        },
+        ..FakeService::default()
+    });
+    let response = server(&fake)
+        .handle_value(json!({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"}))
+        .await
+        .unwrap();
+    let tools = response.result.unwrap()["tools"].clone();
+    assert_eq!(
+        tools[1]["inputSchema"]["properties"]["action"]["enum"],
+        json!([
+            "record",
+            "supersede",
+            "retract",
+            "acknowledge",
+            "resolve",
+            "dismiss",
+            "waive"
+        ])
+    );
+
+    for (id, arguments) in [
+        (
+            91,
+            json!({
+                "action": "dismiss",
+                "idempotency_key": "dismiss/91",
+                "conflict_id": 9,
+                "expected_revision": 3,
+                "expected_member_count": 2,
+                "reason_kind": "false_positive",
+                "rationale": "the values name different deployments"
+            }),
+        ),
+        (
+            92,
+            json!({
+                "action": "waive",
+                "idempotency_key": "waive/92",
+                "conflict_id": 9,
+                "expected_revision": 3,
+                "expected_member_count": 2,
+                "reason_kind": "capacity_deferred",
+                "rationale": "scheduled for the next migration window",
+                "expires_in_hours": 72,
+                "review_in_hours": 24
+            }),
+        ),
+    ] {
+        let response = server(&fake)
+            .handle_value(json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "remember", "arguments": arguments}
+            }))
+            .await
+            .unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+    }
+    let calls = fake.calls();
+    let observed = calls
+        .iter()
+        .map(|call| match call {
+            ObservedCall::Remember {
+                action, arguments, ..
+            } => (action.clone(), arguments["reason_kind"].clone()),
+            ObservedCall::Recall { .. } => panic!("remember reached the read path"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        [
+            ("dismiss".to_owned(), json!("false_positive")),
+            ("waive".to_owned(), json!("capacity_deferred"))
         ]
     );
 }

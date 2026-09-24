@@ -15,9 +15,9 @@ use crate::ledger::types::PreparedClaim;
 use crate::ledger::{
     Claim, ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState, ClaimSupport,
     ClaimTarget, Conflict, ConflictHistory, ConflictLifecycleRows, ConflictMutation,
-    ConflictTarget, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2,
-    LifecycleMutation, LifecycleReplayRequest, SemanticClaimHit, SupportedClaimCoordinate,
-    SupportedClaimIds,
+    ConflictTarget, DismissalTerms, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+    FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2, LifecycleMutation, LifecycleReplayRequest,
+    SemanticClaimHit, SupportedClaimCoordinate, SupportedClaimIds, WaiverTerms,
 };
 use crate::store::cockroach::{
     ConflictLifecycleCapability, EMBEDDING_DIMENSION, RetryPolicy, serialize_vector,
@@ -314,6 +314,9 @@ pub struct CockroachClaimLedger {
     /// lifecycle is refused as `lifecycle_unavailable` and closes are audited
     /// in `memory_events` only.
     conflict_lifecycle: Option<ConflictLifecycleCapability>,
+    /// The deployment enabled adjudication (`dismiss` and `waive`). It takes
+    /// effect only together with the conflict lifecycle capability.
+    conflict_adjudication: bool,
 }
 
 impl std::fmt::Debug for CockroachClaimLedger {
@@ -325,6 +328,10 @@ impl std::fmt::Debug for CockroachClaimLedger {
             .field("embedding_dim", &self.embedder.dim())
             .field("retry_policy", &self.retry_policy)
             .field("conflict_lifecycle", &self.conflict_lifecycle.is_some())
+            .field(
+                "conflict_adjudication",
+                &self.serves_conflict_adjudication(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -355,6 +362,7 @@ impl CockroachClaimLedger {
             embedder,
             retry_policy,
             conflict_lifecycle: None,
+            conflict_adjudication: false,
         })
     }
 
@@ -374,6 +382,22 @@ impl CockroachClaimLedger {
     #[must_use]
     pub const fn serves_conflict_lifecycle(&self) -> bool {
         self.conflict_lifecycle.is_some()
+    }
+
+    /// Serve adjudication (`dismiss` and `waive` by an agent that authored
+    /// none of a conflict's members), as the deployment's
+    /// `FLEET_RECALL_CONFLICT_ADJUDICATION=enabled` asks. It is off by default
+    /// and has no effect without the conflict lifecycle capability.
+    #[must_use]
+    pub const fn with_conflict_adjudication(mut self) -> Self {
+        self.conflict_adjudication = true;
+        self
+    }
+
+    /// Whether this ledger serves `dismiss` and `waive`.
+    #[must_use]
+    pub const fn serves_conflict_adjudication(&self) -> bool {
+        self.conflict_adjudication && self.conflict_lifecycle.is_some()
     }
 
     fn ensure_scope(&self, scope: &FleetScope) -> Result<()> {
@@ -666,6 +690,26 @@ impl ClaimLedger for CockroachClaimLedger {
             idempotency_key,
         )
         .await
+    }
+
+    async fn dismiss_conflict(
+        &self,
+        scope: &FleetScope,
+        target: ConflictTarget,
+        terms: DismissalTerms<'_>,
+        idempotency_key: &str,
+    ) -> Result<ConflictMutation> {
+        conflict_store::dismiss_conflict(self, scope, target, terms, idempotency_key).await
+    }
+
+    async fn waive_conflict(
+        &self,
+        scope: &FleetScope,
+        target: ConflictTarget,
+        terms: WaiverTerms<'_>,
+        idempotency_key: &str,
+    ) -> Result<ConflictMutation> {
+        conflict_store::waive_conflict(self, scope, target, terms, idempotency_key).await
     }
 
     async fn conflict_lifecycle_rows(

@@ -65,6 +65,14 @@ pub enum RememberAction {
     /// Acknowledge the current episode of a conflict (ADR 0004). Overlay
     /// metadata only: it never changes the conflict or any claim.
     Acknowledge,
+    /// Dismiss a conflict as not a real disagreement, by an adjudicator that
+    /// authored none of its members (ADR 0004 D5). Off unless the deployment
+    /// enables adjudication.
+    Dismiss,
+    /// Waive a conflict's current episode until an expiry, by an adjudicator
+    /// that authored none of its members (ADR 0004 D5). Off unless the
+    /// deployment enables adjudication.
+    Waive,
 }
 
 impl RememberAction {
@@ -84,6 +92,8 @@ impl RememberAction {
             Self::Track => "track",
             Self::Consolidate => "consolidate",
             Self::Acknowledge => "acknowledge",
+            Self::Dismiss => "dismiss",
+            Self::Waive => "waive",
         }
     }
 }
@@ -270,13 +280,25 @@ pub struct RememberSurface {
     /// only when the startup probe found the migration-29 lifecycle log and
     /// its grants.
     pub conflict_lifecycle: bool,
+    /// Adjudication (`dismiss` and `waive` by an agent that authored none of
+    /// a conflict's members), served only with the conflict lifecycle and
+    /// `FLEET_RECALL_CONFLICT_ADJUDICATION=enabled`.
+    pub adjudication: bool,
 }
 
 impl RememberSurface {
     pub const RECORD_ONLY: Self = Self {
         claim_lifecycle: false,
         conflict_lifecycle: false,
+        adjudication: false,
     };
+
+    /// Whether `dismiss` and `waive` are served: adjudication needs the
+    /// conflict lifecycle beneath it.
+    #[must_use]
+    pub const fn serves_adjudication(self) -> bool {
+        self.conflict_lifecycle && self.adjudication
+    }
 
     /// Whether this surface serves `action`. `record` is always served; the
     /// remaining non-lifecycle actions keep their own dispatch outcome.
@@ -286,6 +308,7 @@ impl RememberSurface {
             RememberAction::Record => true,
             RememberAction::Retract | RememberAction::Supersede => self.claim_lifecycle,
             RememberAction::Acknowledge | RememberAction::Resolve => self.conflict_lifecycle,
+            RememberAction::Dismiss | RememberAction::Waive => self.serves_adjudication(),
             _ => false,
         }
     }
@@ -293,18 +316,34 @@ impl RememberSurface {
 
 /// Refuse a lifecycle action the surface does not serve, before any I/O.
 ///
-/// Actions outside the lifecycle vocabulary pass through unchanged so their
-/// existing outcomes (for example the fenced `assert` route) are preserved.
+/// `dismiss` and `waive` on a writer that serves the conflict lifecycle but
+/// not adjudication are refused as `adjudication_disabled`; every other
+/// unserved lifecycle action as `lifecycle_unavailable`. Actions outside the
+/// lifecycle vocabulary pass through unchanged so their existing outcomes
+/// (for example the fenced `assert` route) are preserved.
 pub fn authorize_surface(surface: RememberSurface, action: RememberAction) -> ServiceResult<()> {
-    let lifecycle_action = matches!(
-        action,
-        RememberAction::Retract
-            | RememberAction::Supersede
-            | RememberAction::Resolve
-            | RememberAction::Acknowledge
-    );
+    let adjudication_action = matches!(action, RememberAction::Dismiss | RememberAction::Waive);
+    let lifecycle_action = adjudication_action
+        || matches!(
+            action,
+            RememberAction::Retract
+                | RememberAction::Supersede
+                | RememberAction::Resolve
+                | RememberAction::Acknowledge
+        );
     if !lifecycle_action || surface.allows(action) {
         return Ok(());
+    }
+    let details = serde_json::json!({ "action": action.as_str() });
+    if adjudication_action && surface.conflict_lifecycle {
+        return Err(ServiceError::Refused(Refusal {
+            code: "adjudication_disabled",
+            message: format!(
+                "remember({}) is not enabled on this deployment: conflict adjudication is off",
+                action.as_str()
+            ),
+            details,
+        }));
     }
     Err(ServiceError::Refused(Refusal {
         code: "lifecycle_unavailable",
@@ -312,7 +351,7 @@ pub fn authorize_surface(surface: RememberSurface, action: RememberAction) -> Se
             "remember({}) is not served by this deployment",
             action.as_str()
         ),
-        details: serde_json::json!({ "action": action.as_str() }),
+        details,
     }))
 }
 
@@ -411,6 +450,8 @@ mod tests {
             RememberAction::Supersede,
             RememberAction::Resolve,
             RememberAction::Acknowledge,
+            RememberAction::Dismiss,
+            RememberAction::Waive,
         ] {
             let Err(ServiceError::Refused(refusal)) =
                 authorize_surface(RememberSurface::RECORD_ONLY, action)
@@ -430,8 +471,16 @@ mod tests {
         assert!(authorize_surface(lifecycle, RememberAction::Retract).is_ok());
         assert!(authorize_surface(lifecycle, RememberAction::Supersede).is_ok());
         // The conflict actions need the probed conflict-lifecycle capability.
-        for action in [RememberAction::Resolve, RememberAction::Acknowledge] {
-            assert!(authorize_surface(lifecycle, action).is_err());
+        for action in [
+            RememberAction::Resolve,
+            RememberAction::Acknowledge,
+            RememberAction::Dismiss,
+            RememberAction::Waive,
+        ] {
+            let Err(ServiceError::Refused(refusal)) = authorize_surface(lifecycle, action) else {
+                panic!("{} needs the conflict lifecycle", action.as_str());
+            };
+            assert_eq!(refusal.code, "lifecycle_unavailable");
         }
         let conflicts = RememberSurface {
             conflict_lifecycle: true,
@@ -445,8 +494,36 @@ mod tests {
         ] {
             assert!(authorize_surface(conflicts, action).is_ok());
         }
+        // Adjudication is off by default: a writer serving the conflict
+        // lifecycle refuses dismiss and waive as disabled, not unavailable.
+        for action in [RememberAction::Dismiss, RememberAction::Waive] {
+            let Err(ServiceError::Refused(refusal)) = authorize_surface(conflicts, action) else {
+                panic!("{} needs adjudication enabled", action.as_str());
+            };
+            assert_eq!(refusal.code, "adjudication_disabled");
+            assert_eq!(refusal.details["action"], action.as_str());
+        }
+        let adjudicating = RememberSurface {
+            adjudication: true,
+            ..conflicts
+        };
+        for action in [RememberAction::Dismiss, RememberAction::Waive] {
+            assert!(authorize_surface(adjudicating, action).is_ok());
+        }
+        // The switch alone never serves adjudication without the lifecycle log.
+        let switch_only = RememberSurface {
+            adjudication: true,
+            ..lifecycle
+        };
+        assert!(!switch_only.serves_adjudication());
+        assert!(authorize_surface(switch_only, RememberAction::Dismiss).is_err());
         // Record and non-lifecycle actions keep their own dispatch outcome.
-        for surface in [RememberSurface::RECORD_ONLY, lifecycle, conflicts] {
+        for surface in [
+            RememberSurface::RECORD_ONLY,
+            lifecycle,
+            conflicts,
+            adjudicating,
+        ] {
             for action in [
                 RememberAction::Record,
                 RememberAction::Assert,

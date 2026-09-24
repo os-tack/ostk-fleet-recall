@@ -1,14 +1,18 @@
-//! Serializable conflict lifecycle transactions (`acknowledge` and concession
-//! `resolve`) and the lifecycle log reads (overlay and history) for the
-//! `CockroachDB` claim ledger (ADR 0004, migration 0029).
+//! Serializable conflict lifecycle transactions (`acknowledge`, concession
+//! `resolve`, and an adjudicator's `dismiss` and `waive`) and the lifecycle
+//! log reads (overlay and history) for the `CockroachDB` claim ledger (ADR
+//! 0004, migration 0029).
 //!
 //! Every mutation replays or reserves its receipt first, then locks in the
-//! record path's order: the key's conflict lineage rows, then (for `resolve`)
-//! the key's lifecycle-current claims in ascending id order. The lifecycle
-//! log is appended only while the conflict row is locked, so its `event_seq`
-//! has no gaps. `memory_conflicts` changes only through a detector-verified
-//! close. Reads of the log are single autocommit statements, kept out of
-//! every read transaction so a failure can only degrade the overlay.
+//! record path's order: the key's conflict lineage rows, then (for `resolve`
+//! and `dismiss`) the key's lifecycle-current claims in ascending id order.
+//! The lifecycle log is appended only while the conflict row is locked, so
+//! its `event_seq` has no gaps. `memory_conflicts` changes only through a
+//! detector-verified close or an adjudicator's dismissal. Reads of the log are
+//! single autocommit statements, kept out of every read transaction so a
+//! failure can only degrade the overlay.
+
+use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -16,27 +20,40 @@ use sqlx::postgres::PgRow;
 use sqlx::{Row, Transaction};
 
 use super::lifecycle_store::{
-    ACKNOWLEDGE_OPERATION, CloseAudit, MAX_SAFE_INTEGER, RESOLVE_OPERATION, VerifiedClose,
-    apply_verified_close, insert_transition_event, key_incompatible_pairs, lock_current_claims,
-    lock_lineages, replay_or_reserve, sentinel_limit, transition_owned_claim,
-    validated_idempotency_key,
+    ACKNOWLEDGE_OPERATION, CloseAudit, ConflictClose, DISMISS_OPERATION, MAX_SAFE_INTEGER,
+    RESOLVE_OPERATION, RestoreScope, VerifiedClose, WAIVE_OPERATION, apply_verified_close,
+    close_conflict, insert_transition_event, key_incompatible_pairs, lock_current_claims,
+    lock_lineages, replay_or_reserve, restore_disputed_members, sentinel_limit,
+    transition_owned_claim, validated_idempotency_key,
 };
 use super::{CockroachClaimLedger, MAX_LEDGER_RESULTS, parse_claim_state, protocol_error};
 use crate::ledger::lifecycle::{
     ConflictRowState, LifecycleRefusal, MAX_CONCESSION_CLAIMS, MAX_CONFLICT_LIFECYCLE_EVENTS,
-    MAX_CONFLICT_MEMBER_COUNT, MAX_HISTORY_EVENTS, MAX_OVERLAY_EPISODE_EVENTS,
-    MAX_REPORTED_REMAINING_PAIRS, Reevaluation, RefusalCode, V2Lineage, event_fits_log,
-    lifecycle_request_identity, plan_concession, plan_reevaluation, validate_reason,
+    MAX_CONFLICT_MEMBER_COUNT, MAX_EXCLUDED_DISMISSALS, MAX_HISTORY_EVENTS,
+    MAX_OVERLAY_EPISODE_EVENTS, MAX_REPORTED_REMAINING_PAIRS, MemberAuthorship, Reevaluation,
+    RefusalCode, V2Lineage, check_adjudicator, dismissal_reason_kind, dismissed_pairs,
+    event_fits_log, lifecycle_request_identity, plan_concession, plan_dismissal, plan_reevaluation,
+    validate_rationale, validate_reason, validate_waiver_hours, waiver_reason_kind,
 };
 use crate::ledger::{
     ClaimState, ConflictHistory, ConflictLifecycleEvent, ConflictLifecycleRows, ConflictMutation,
-    ConflictTarget,
+    ConflictTarget, DismissalTerms, WaiverTerms,
 };
 use crate::store::cockroach::with_serializable_retry;
 use crate::{FleetError, FleetScope, Result};
 
 const ACKNOWLEDGE_ACTION: &str = "acknowledge";
 const RESOLVE_ACTION: &str = "resolve";
+const DISMISS_ACTION: &str = "dismiss";
+const WAIVE_ACTION: &str = "waive";
+const DISMISSED_STATE: &str = "dismissed";
+/// The claim-event reason of a disputed member a dismissal restored.
+const DISMISSED_RESTORE_REASON: &str = "conflict_dismissed";
+/// The fixed `memory_conflicts.resolution_reason` of a dismissal. The
+/// adjudicator's rationale stays in the private lifecycle log; the conflict
+/// row, which the publication reader can see, carries only this template and
+/// the closed reason vocabulary.
+const DISMISSAL_RESOLUTION_REASON: &str = "dismissed by an adjudicator who authored none of its members; the rationale is in the private lifecycle log";
 /// History payloads above this many bytes are elided, so no single event
 /// dominates a history; the service bounds the whole history by bytes.
 const MAX_HISTORY_PAYLOAD_BYTES: usize = 4_096;
@@ -88,20 +105,35 @@ const FINISH_CONFLICT_RECEIPT_SQL: &str = "UPDATE memory_mutation_receipts \
      SET conflict_id = $6, response = $7 \
      WHERE tenant_id = $1 AND idempotency_key = $2 \
        AND project = $3 AND request = $4 AND operation = $5";
-/// The newest events of each requested episode. The outer join keeps a row
-/// for an episode with no events, so the read always reports its time.
+/// The newest events of each requested episode (`in_window`), plus the
+/// episode's latest waiver even when newer events pushed it out of that
+/// window, so a waived conflict still reads `waived`. The outer join keeps a
+/// row for an episode with no events, so the read always reports its time.
 const LIFECYCLE_OVERLAY_SQL: &str = "SELECT wanted.conflict_id AS wanted_conflict_id, \
-            e.event_seq, e.event_kind, e.episode_revision, e.result_revision, e.actor_kind, \
-            e.actor, e.operation, e.reason_kind, e.rationale, e.expires_at, e.review_by, \
-            e.member_count, e.created_at, now() AS evaluated_at \
+            e.in_window, e.event_seq, e.event_kind, e.episode_revision, e.result_revision, \
+            e.actor_kind, e.actor, e.operation, e.reason_kind, e.rationale, e.expires_at, \
+            e.review_by, e.member_count, e.created_at, now() AS evaluated_at \
      FROM unnest($3::INT8[], $4::INT8[]) AS wanted (conflict_id, episode_revision) \
      LEFT JOIN LATERAL (\
-       SELECT event_seq, event_kind, episode_revision, result_revision, actor_kind, actor, \
-              operation, reason_kind, rationale, expires_at, review_by, member_count, created_at \
-       FROM memory_conflict_lifecycle_events_v1@memory_conflict_lifecycle_v1_episode_idx \
-       WHERE tenant_id = $1 AND project = $2 AND conflict_id = wanted.conflict_id \
-         AND episode_revision = wanted.episode_revision \
-       ORDER BY event_seq DESC LIMIT $5\
+       SELECT true AS in_window, newest.* FROM (\
+         SELECT event_seq, event_kind, episode_revision, result_revision, actor_kind, actor, \
+                operation, reason_kind, rationale, expires_at, review_by, member_count, \
+                created_at \
+         FROM memory_conflict_lifecycle_events_v1@memory_conflict_lifecycle_v1_episode_idx \
+         WHERE tenant_id = $1 AND project = $2 AND conflict_id = wanted.conflict_id \
+           AND episode_revision = wanted.episode_revision \
+         ORDER BY event_seq DESC LIMIT $5\
+       ) AS newest \
+       UNION ALL \
+       SELECT false AS in_window, latest_waiver.* FROM (\
+         SELECT event_seq, event_kind, episode_revision, result_revision, actor_kind, actor, \
+                operation, reason_kind, rationale, expires_at, review_by, member_count, \
+                created_at \
+         FROM memory_conflict_lifecycle_events_v1@memory_conflict_lifecycle_v1_episode_idx \
+         WHERE tenant_id = $1 AND project = $2 AND conflict_id = wanted.conflict_id \
+           AND episode_revision = wanted.episode_revision AND event_kind = 'waived' \
+         ORDER BY event_seq DESC LIMIT 1\
+       ) AS latest_waiver\
      ) AS e ON true";
 /// The log's newest events, newest first; the reader returns them in order.
 const LIFECYCLE_HISTORY_SQL: &str = "SELECT event_seq, event_kind, episode_revision, \
@@ -111,6 +143,25 @@ const LIFECYCLE_HISTORY_SQL: &str = "SELECT event_seq, event_kind, episode_revis
             octet_length(payload::STRING) > $5 AS payload_elided \
      FROM memory_conflict_lifecycle_events_v1@primary \
      WHERE tenant_id = $1 AND project = $2 AND conflict_id = $3 \
+     ORDER BY event_seq DESC LIMIT $4";
+
+/// Who authored the conflict's members, over every episode: members are
+/// never deleted, so this is AUTH-03's full set of implicated authors. The
+/// member scan reads one sentinel past what an event can record.
+const MEMBER_AUTHORSHIP_SQL: &str = "SELECT count(*)::INT8 AS members_checked, \
+            count(*) FILTER (WHERE c.actor = $4)::INT8 AS implicated_members, \
+            count(*) FILTER (WHERE c.actor IS NULL)::INT8 AS unattributed_members \
+     FROM (\
+       SELECT claim_id FROM memory_conflict_members@primary \
+       WHERE tenant_id = $1 AND project = $2 AND conflict_id = $3 \
+       ORDER BY claim_id LIMIT $5\
+     ) AS m \
+     JOIN memory_claims@primary AS c \
+       ON c.tenant_id = $1 AND c.project = $2 AND c.id = m.claim_id";
+/// The pairs the conflict's newest dismissals judged.
+const DISMISSED_PAIRS_SQL: &str = "SELECT payload->'dismissed_pairs' \
+     FROM memory_conflict_lifecycle_events_v1@primary \
+     WHERE tenant_id = $1 AND project = $2 AND conflict_id = $3 AND event_kind = 'dismissed' \
      ORDER BY event_seq DESC LIMIT $4";
 
 const V2_DETECTOR_CLASS: i64 = 2;
@@ -131,6 +182,10 @@ pub(super) struct LifecycleEventDraft<'a> {
     pub(super) reason_kind: Option<&'a str>,
     pub(super) rationale: Option<&'a str>,
     pub(super) payload: Value,
+    /// A waiver's lifetime and optional review, in hours from the database
+    /// clock; `None` for every other event.
+    pub(super) expires_in_hours: Option<i64>,
+    pub(super) review_in_hours: Option<i64>,
 }
 
 /// An open v2 conflict locked in record's order and checked against the
@@ -179,6 +234,46 @@ pub(super) fn resolve_request(
     )
 }
 
+/// The canonical request identity a `dismiss` receipt stores.
+pub(super) fn dismiss_request(
+    scope: &FleetScope,
+    target: ConflictTarget,
+    terms: DismissalTerms<'_>,
+) -> Value {
+    lifecycle_request_identity(
+        DISMISS_OPERATION,
+        scope,
+        &json!({
+            "conflict_id": target.conflict_id,
+            "expected_revision": target.expected_revision,
+            "expected_member_count": target.expected_member_count,
+            "reason_kind": dismissal_reason_kind(terms.reason_kind),
+            "rationale": terms.rationale,
+        }),
+    )
+}
+
+/// The canonical request identity a `waive` receipt stores.
+pub(super) fn waive_request(
+    scope: &FleetScope,
+    target: ConflictTarget,
+    terms: WaiverTerms<'_>,
+) -> Value {
+    lifecycle_request_identity(
+        WAIVE_OPERATION,
+        scope,
+        &json!({
+            "conflict_id": target.conflict_id,
+            "expected_revision": target.expected_revision,
+            "expected_member_count": target.expected_member_count,
+            "reason_kind": waiver_reason_kind(terms.reason_kind),
+            "rationale": terms.rationale,
+            "expires_in_hours": terms.expires_in_hours,
+            "review_in_hours": terms.review_in_hours,
+        }),
+    )
+}
+
 fn normalized_ids(ids: &[i64]) -> Vec<i64> {
     let mut ids = ids.to_vec();
     ids.sort_unstable();
@@ -193,6 +288,21 @@ fn require_capability(ledger: &CockroachClaimLedger) -> Result<()> {
     Err(LifecycleRefusal::new(
         RefusalCode::LifecycleUnavailable,
         "the conflict lifecycle log is not available to this deployment",
+        json!({}),
+    )
+    .into())
+}
+
+/// Adjudication is off unless the deployment enabled it; the capability is
+/// checked first, so a writer without the lifecycle log reports that.
+fn require_adjudication(ledger: &CockroachClaimLedger) -> Result<()> {
+    require_capability(ledger)?;
+    if ledger.serves_conflict_adjudication() {
+        return Ok(());
+    }
+    Err(LifecycleRefusal::new(
+        RefusalCode::AdjudicationDisabled,
+        "conflict adjudication (dismiss and waive) is not enabled on this deployment",
         json!({}),
     )
     .into())
@@ -304,6 +414,8 @@ async fn acknowledge_once(
                     reason_kind: None,
                     rationale: reason,
                     payload: json!({}),
+                    expires_in_hours: None,
+                    review_in_hours: None,
                 },
             )
             .await?,
@@ -477,17 +589,26 @@ async fn resolve_once(
         .collect::<Vec<_>>();
 
     // The conflict closes only when the detector, in Rust and in SQL, finds
-    // no incompatible current pair left; otherwise everything rolls back.
+    // no incompatible current pair left beyond those an adjudicator already
+    // dismissed in this conflict; otherwise everything rolls back.
     let sql_pairs = key_incompatible_pairs(transaction, scope, &locked.claim_key).await?;
-    let restore_candidates = match plan_reevaluation(
+    let excluded = excluded_dismissed_pairs(transaction, scope, conflict_id).await?;
+    let (restore_candidates, excluded_pairs) = match plan_reevaluation(
         Some(locked.lineage),
         &concession.remaining,
         &sql_pairs,
+        &excluded,
     ) {
         Reevaluation::Close {
-            restore_candidates, ..
-        } => restore_candidates,
-        Reevaluation::StillOpen { pairs, .. } => {
+            restore_candidates,
+            excluded_pairs,
+            ..
+        } => (restore_candidates, excluded_pairs),
+        Reevaluation::StillOpen {
+            pairs,
+            excluded_pairs,
+            ..
+        } => {
             return Err(LifecycleRefusal::new(
                     RefusalCode::StillIncompatible,
                     format!(
@@ -502,6 +623,7 @@ async fn resolve_once(
                             .take(MAX_REPORTED_REMAINING_PAIRS)
                             .map(|(left, right)| [*left, *right])
                             .collect::<Vec<_>>(),
+                        "excluded_dismissed_pairs": excluded_pairs,
                     }),
                 )
                 .into());
@@ -554,6 +676,7 @@ async fn resolve_once(
             restore_candidates: &restore_candidates,
             current: &concession.remaining,
             resolution_reason: &resolution_reason,
+            excluded_dismissed_pairs: excluded_pairs,
         },
         &CloseAudit {
             operation: RESOLVE_OPERATION,
@@ -614,6 +737,383 @@ async fn resolve_once(
     )
     .await?;
     Ok(mutation)
+}
+
+/// One adjudication request, as the retried transaction sees it.
+struct AdjudicationWrite<'a, T> {
+    target: ConflictTarget,
+    terms: T,
+    key: &'a str,
+    request: &'a Value,
+}
+
+/// Checks shared by `dismiss` and `waive` before any I/O.
+fn validate_adjudication(
+    ledger: &CockroachClaimLedger,
+    scope: &FleetScope,
+    target: ConflictTarget,
+    rationale: &str,
+    idempotency_key: &str,
+) -> Result<String> {
+    ledger.ensure_scope(scope)?;
+    require_adjudication(ledger)?;
+    let key = validated_idempotency_key(idempotency_key)?.to_owned();
+    validate_conflict_target(target, true)?;
+    validate_rationale(rationale).map_err(FleetError::Memory)?;
+    Ok(key)
+}
+
+pub(super) async fn dismiss_conflict(
+    ledger: &CockroachClaimLedger,
+    scope: &FleetScope,
+    target: ConflictTarget,
+    terms: DismissalTerms<'_>,
+    idempotency_key: &str,
+) -> Result<ConflictMutation> {
+    let key = validate_adjudication(ledger, scope, target, terms.rationale, idempotency_key)?;
+    let request = dismiss_request(scope, target, terms);
+    let scope = scope.clone();
+    let reason_kind = terms.reason_kind;
+    let rationale = terms.rationale.to_owned();
+    with_serializable_retry(&ledger.pool, ledger.retry_policy, move |transaction| {
+        let scope = scope.clone();
+        let rationale = rationale.clone();
+        let key = key.clone();
+        let request = request.clone();
+        Box::pin(async move {
+            dismiss_once(
+                transaction,
+                &scope,
+                AdjudicationWrite {
+                    target,
+                    terms: DismissalTerms {
+                        reason_kind,
+                        rationale: &rationale,
+                    },
+                    key: &key,
+                    request: &request,
+                },
+            )
+            .await
+        })
+    })
+    .await
+}
+
+#[allow(clippy::too_many_lines)] // one serializable unit, kept in its lock order
+async fn dismiss_once(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    write: AdjudicationWrite<'_, DismissalTerms<'_>>,
+) -> Result<ConflictMutation> {
+    let AdjudicationWrite {
+        target,
+        terms,
+        key,
+        request,
+    } = write;
+    if let Some(replay) =
+        replay_or_reserve(transaction, scope, key, request, DISMISS_OPERATION).await?
+    {
+        return Ok(replay);
+    }
+    // Lineage first (with the revision and member count the caller read),
+    // then who authored the members, then the key's current claims in id
+    // order, as record locks them.
+    let locked = lock_open_conflict(transaction, scope, target).await?;
+    let conflict_id = locked.lineage.id;
+    let episode_revision = locked.lineage.revision;
+    let authorship = member_authorship(transaction, scope, conflict_id).await?;
+    check_adjudicator(conflict_id, locked.member_count, authorship)?;
+    let current = lock_current_claims(transaction, scope, &locked.claim_key).await?;
+    let sql_pairs = key_incompatible_pairs(transaction, scope, &locked.claim_key).await?;
+    let plan = plan_dismissal(conflict_id, &current, &sql_pairs)?;
+
+    let reason_kind = dismissal_reason_kind(terms.reason_kind);
+    let closed_revision = close_conflict(
+        transaction,
+        scope,
+        ConflictClose {
+            conflict_id,
+            expected_revision: episode_revision,
+            state: DISMISSED_STATE,
+            resolution_kind: &format!("dismissed:{reason_kind}"),
+            resolution_reason: DISMISSAL_RESOLUTION_REASON,
+        },
+    )
+    .await?;
+    // A dismissed conflict holds no claim: its disputed members return to
+    // active unless another open conflict still holds them. No claim's
+    // applicability changes (DISC-03).
+    let claims_restored = restore_disputed_members(
+        transaction,
+        scope,
+        RestoreScope {
+            conflict_id,
+            conflict_revision: closed_revision,
+            claim_key: &locked.claim_key,
+            transition_reason: DISMISSED_RESTORE_REASON,
+        },
+        &plan.restore_candidates,
+        key,
+    )
+    .await?;
+    let dismissed_pairs = plan
+        .dismissed_pairs
+        .iter()
+        .map(|(left, right)| [*left, *right])
+        .collect::<Vec<_>>();
+    let current_claim_ids = current.iter().map(|claim| claim.id).collect::<Vec<_>>();
+    // The dismissal is the adjudication's only record, so a log that cannot
+    // hold it refuses the whole request.
+    let event = append_lifecycle_event(
+        transaction,
+        scope,
+        LifecycleEventDraft {
+            conflict_id,
+            kind: DISMISSED_STATE,
+            episode_revision,
+            result_revision: closed_revision,
+            to_state: DISMISSED_STATE,
+            actor_kind: "agent",
+            actor: &scope.agent,
+            operation: DISMISS_OPERATION,
+            key,
+            member_count: locked.member_count,
+            reason_kind: Some(reason_kind),
+            rationale: Some(terms.rationale),
+            payload: json!({
+                "dismissed_pairs": dismissed_pairs,
+                "restored_claim_ids": claims_restored,
+                "members_checked": authorship.members_checked,
+                "current_claim_ids": current_claim_ids,
+            }),
+            expires_in_hours: None,
+            review_in_hours: None,
+        },
+    )
+    .await?;
+    insert_keyed_conflict_event(
+        transaction,
+        scope,
+        "conflict_dismissed",
+        conflict_id,
+        key,
+        json!({
+            "claim_key": locked.claim_key,
+            "episode_revision": episode_revision,
+            "conflict_revision": closed_revision,
+            "reason_kind": reason_kind,
+            "dismissed_pair_count": dismissed_pairs.len(),
+            "claims_restored": claims_restored,
+            "event_seq": event.seq,
+        }),
+    )
+    .await?;
+
+    let mutation = ConflictMutation {
+        operation: DISMISS_ACTION.into(),
+        conflict_id,
+        conflict_state: DISMISSED_STATE.into(),
+        conflict_revision: closed_revision,
+        member_count: locked.member_count,
+        applied: true,
+        status: Some(DISMISSED_STATE.into()),
+        lifecycle_event: Some(event),
+        claims_retracted: Vec::new(),
+        claims_restored,
+        conflicts_resolved: Vec::new(),
+        reevaluation: None,
+        idempotent_replay: false,
+    };
+    finish_conflict_receipt(
+        transaction,
+        scope,
+        key,
+        request,
+        DISMISS_OPERATION,
+        &mutation,
+    )
+    .await?;
+    Ok(mutation)
+}
+
+pub(super) async fn waive_conflict(
+    ledger: &CockroachClaimLedger,
+    scope: &FleetScope,
+    target: ConflictTarget,
+    terms: WaiverTerms<'_>,
+    idempotency_key: &str,
+) -> Result<ConflictMutation> {
+    let key = validate_adjudication(ledger, scope, target, terms.rationale, idempotency_key)?;
+    validate_waiver_hours(terms.expires_in_hours, terms.review_in_hours)
+        .map_err(FleetError::Memory)?;
+    let request = waive_request(scope, target, terms);
+    let scope = scope.clone();
+    let (reason_kind, expires_in_hours, review_in_hours) = (
+        terms.reason_kind,
+        terms.expires_in_hours,
+        terms.review_in_hours,
+    );
+    let rationale = terms.rationale.to_owned();
+    with_serializable_retry(&ledger.pool, ledger.retry_policy, move |transaction| {
+        let scope = scope.clone();
+        let rationale = rationale.clone();
+        let key = key.clone();
+        let request = request.clone();
+        Box::pin(async move {
+            waive_once(
+                transaction,
+                &scope,
+                AdjudicationWrite {
+                    target,
+                    terms: WaiverTerms {
+                        reason_kind,
+                        rationale: &rationale,
+                        expires_in_hours,
+                        review_in_hours,
+                    },
+                    key: &key,
+                    request: &request,
+                },
+            )
+            .await
+        })
+    })
+    .await
+}
+
+async fn waive_once(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    write: AdjudicationWrite<'_, WaiverTerms<'_>>,
+) -> Result<ConflictMutation> {
+    let AdjudicationWrite {
+        target,
+        terms,
+        key,
+        request,
+    } = write;
+    if let Some(replay) =
+        replay_or_reserve(transaction, scope, key, request, WAIVE_OPERATION).await?
+    {
+        return Ok(replay);
+    }
+    // The same lineage lock and checks as a dismissal. A waiver changes no
+    // row: the conflict stays open and the waiver lives in the log alone.
+    let locked = lock_open_conflict(transaction, scope, target).await?;
+    let conflict_id = locked.lineage.id;
+    let revision = locked.lineage.revision;
+    check_adjudicator(
+        conflict_id,
+        locked.member_count,
+        member_authorship(transaction, scope, conflict_id).await?,
+    )?;
+    let reason_kind = waiver_reason_kind(terms.reason_kind);
+    let event = append_lifecycle_event(
+        transaction,
+        scope,
+        LifecycleEventDraft {
+            conflict_id,
+            kind: "waived",
+            episode_revision: revision,
+            result_revision: revision,
+            to_state: "open",
+            actor_kind: "agent",
+            actor: &scope.agent,
+            operation: WAIVE_OPERATION,
+            key,
+            member_count: locked.member_count,
+            reason_kind: Some(reason_kind),
+            rationale: Some(terms.rationale),
+            payload: json!({}),
+            expires_in_hours: Some(i64::from(terms.expires_in_hours)),
+            review_in_hours: terms.review_in_hours.map(i64::from),
+        },
+    )
+    .await?;
+    insert_keyed_conflict_event(
+        transaction,
+        scope,
+        "conflict_waived",
+        conflict_id,
+        key,
+        json!({
+            "claim_key": locked.claim_key,
+            "episode_revision": revision,
+            "reason_kind": reason_kind,
+            "expires_at": event.expires_at,
+            "review_by": event.review_by,
+            "event_seq": event.seq,
+        }),
+    )
+    .await?;
+
+    let mutation = ConflictMutation {
+        operation: WAIVE_ACTION.into(),
+        conflict_id,
+        conflict_state: "open".into(),
+        conflict_revision: revision,
+        member_count: locked.member_count,
+        applied: true,
+        status: Some("waived".into()),
+        lifecycle_event: Some(event),
+        claims_retracted: Vec::new(),
+        claims_restored: Vec::new(),
+        conflicts_resolved: Vec::new(),
+        reevaluation: None,
+        idempotent_replay: false,
+    };
+    finish_conflict_receipt(transaction, scope, key, request, WAIVE_OPERATION, &mutation).await?;
+    Ok(mutation)
+}
+
+/// Who authored the conflict's durable members, in every episode.
+async fn member_authorship(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    conflict_id: i64,
+) -> Result<MemberAuthorship> {
+    let bound = usize::try_from(MAX_CONFLICT_MEMBER_COUNT)
+        .map_err(|_| protocol_error("conflict member bound is outside usize range"))?;
+    let (members_checked, implicated_members, unattributed_members) =
+        sqlx::query_as::<_, (i64, i64, i64)>(MEMBER_AUTHORSHIP_SQL)
+            .bind(scope.tenant_id)
+            .bind(&scope.project)
+            .bind(conflict_id)
+            .bind(&scope.agent)
+            .bind(sentinel_limit(bound)?)
+            .fetch_one(&mut **transaction)
+            .await?;
+    Ok(MemberAuthorship {
+        members_checked,
+        implicated_members,
+        unattributed_members,
+    })
+}
+
+/// The pairs this conflict's newest dismissals judged, which re-evaluation
+/// leaves out. Only the newest [`MAX_EXCLUDED_DISMISSALS`] count: ignoring
+/// an older one only keeps the conflict open.
+pub(super) async fn excluded_dismissed_pairs(
+    transaction: &mut Transaction<'_, sqlx::Postgres>,
+    scope: &FleetScope,
+    conflict_id: i64,
+) -> Result<BTreeSet<(i64, i64)>> {
+    let payloads = sqlx::query_scalar::<_, Option<Value>>(DISMISSED_PAIRS_SQL)
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(conflict_id)
+        .bind(
+            i64::try_from(MAX_EXCLUDED_DISMISSALS)
+                .map_err(|_| protocol_error("dismissal bound is outside INT8 range"))?,
+        )
+        .fetch_all(&mut **transaction)
+        .await?
+        .into_iter()
+        .map(|payload| payload.unwrap_or(Value::Null))
+        .collect::<Vec<_>>();
+    dismissed_pairs(&payloads)
 }
 
 /// Plain-read the target conflict, lock its key's lineage rows as record
@@ -866,9 +1366,8 @@ async fn insert_lifecycle_event(
         .bind(draft.member_count)
         .bind(draft.reason_kind)
         .bind(draft.rationale)
-        // Waiver expiry and review hours; this slice appends no waiver.
-        .bind(None::<i64>)
-        .bind(None::<i64>)
+        .bind(draft.expires_in_hours)
+        .bind(draft.review_in_hours)
         .bind(&draft.payload)
         .fetch_one(&mut **transaction)
         .await?;
@@ -972,13 +1471,20 @@ pub(super) async fn conflict_lifecycle_rows(
         .fetch_all(&ledger.pool)
         .await?;
     let mut evaluated_at = None;
-    let mut events = std::collections::HashMap::<i64, Vec<ConflictLifecycleEvent>>::new();
+    let mut windows = std::collections::HashMap::<i64, Vec<ConflictLifecycleEvent>>::new();
+    let mut waivers = std::collections::HashMap::<i64, ConflictLifecycleEvent>::new();
     for row in &rows {
         evaluated_at = Some(row.try_get::<DateTime<Utc>, _>("evaluated_at")?);
         let conflict_id: i64 = row.try_get("wanted_conflict_id")?;
-        let entry = events.entry(conflict_id).or_default();
-        if row.try_get::<Option<i64>, _>("event_seq")?.is_some() {
-            entry.push(decode_lifecycle_event(row, false)?);
+        let window = windows.entry(conflict_id).or_default();
+        if row.try_get::<Option<i64>, _>("event_seq")?.is_none() {
+            continue;
+        }
+        let event = decode_lifecycle_event(row, false)?;
+        if row.try_get::<Option<bool>, _>("in_window")? == Some(true) {
+            window.push(event);
+        } else {
+            waivers.insert(conflict_id, event);
         }
     }
     let evaluated_at = match evaluated_at {
@@ -986,10 +1492,40 @@ pub(super) async fn conflict_lifecycle_rows(
         None if episodes.is_empty() => Utc::now(),
         None => return Err(protocol_error("lifecycle overlay returned no rows")),
     };
+    let mut events = std::collections::HashMap::with_capacity(windows.len());
+    let mut truncated = BTreeSet::new();
+    for (conflict_id, window) in windows {
+        let (shown, cut) = overlay_events(window, waivers.remove(&conflict_id));
+        if cut {
+            truncated.insert(conflict_id);
+        }
+        events.insert(conflict_id, shown);
+    }
     Ok(ConflictLifecycleRows {
         events,
+        truncated,
         evaluated_at,
     })
+}
+
+/// The events the overlay derives an episode's state from: its newest
+/// events, newest first and at most [`MAX_OVERLAY_EPISODE_EVENTS`] (whether
+/// more exist is returned beside them), plus its latest waiver when newer
+/// events pushed that out of the window. Rows arrive in no particular order.
+fn overlay_events(
+    mut window: Vec<ConflictLifecycleEvent>,
+    latest_waiver: Option<ConflictLifecycleEvent>,
+) -> (Vec<ConflictLifecycleEvent>, bool) {
+    window.sort_by(|left, right| right.seq.cmp(&left.seq));
+    window.dedup_by_key(|event| event.seq);
+    let truncated = window.len() > MAX_OVERLAY_EPISODE_EVENTS;
+    window.truncate(MAX_OVERLAY_EPISODE_EVENTS);
+    if let Some(waiver) = latest_waiver
+        && !window.iter().any(|event| event.seq == waiver.seq)
+    {
+        window.push(waiver);
+    }
+    (window, truncated)
 }
 
 /// A conflict's newest lifecycle events, at most 256, in event order.
@@ -1146,6 +1682,116 @@ mod tests {
             ),
             Err(FleetError::IdempotencyConflict(_))
         ));
+    }
+
+    fn dismissal() -> DismissalTerms<'static> {
+        DismissalTerms {
+            reason_kind: crate::memory_contracts::discrepancy::DismissalReasonKindV1::FalsePositive,
+            rationale: "different deployments",
+        }
+    }
+
+    fn waiver(expires_in_hours: u16, review_in_hours: Option<u16>) -> WaiverTerms<'static> {
+        WaiverTerms {
+            reason_kind: crate::memory_contracts::discrepancy::WaiverReasonKindV1::UpstreamBlocked,
+            rationale: "waiting on the vendor fix",
+            expires_in_hours,
+            review_in_hours,
+        }
+    }
+
+    #[test]
+    fn adjudication_identities_bind_their_terms_and_operation() {
+        let scope = scope();
+        let dismiss = dismiss_request(&scope, target(Some(2)), dismissal());
+        assert_eq!(dismiss["action"], DISMISS_OPERATION);
+        assert_eq!(dismiss["input"]["reason_kind"], "false_positive");
+        assert_eq!(dismiss["input"]["rationale"], "different deployments");
+        assert_eq!(dismiss["input"]["expected_member_count"], 2);
+        let waive = waive_request(&scope, target(Some(2)), waiver(72, Some(24)));
+        assert_eq!(waive["action"], WAIVE_OPERATION);
+        assert_eq!(waive["input"]["reason_kind"], "upstream_blocked");
+        assert_eq!(waive["input"]["expires_in_hours"], 72);
+        assert_eq!(waive["input"]["review_in_hours"], 24);
+
+        // Any change of terms, target, or operation is a different request.
+        let other_kind = DismissalTerms {
+            reason_kind: crate::memory_contracts::discrepancy::DismissalReasonKindV1::OutOfScope,
+            ..dismissal()
+        };
+        let other_rationale = DismissalTerms {
+            rationale: "another reason",
+            ..dismissal()
+        };
+        for other in [
+            dismiss_request(&scope, target(Some(3)), dismissal()),
+            dismiss_request(&scope, target(Some(2)), other_kind),
+            dismiss_request(&scope, target(Some(2)), other_rationale),
+            waive_request(&scope, target(Some(2)), waiver(72, None)),
+            resolve_request(&scope, target(Some(2)), &[], None),
+        ] {
+            assert_ne!(other, dismiss);
+        }
+        assert_ne!(
+            waive_request(&scope, target(Some(2)), waiver(48, Some(24))),
+            waive
+        );
+    }
+
+    fn overlay_event(seq: i64, kind: &str) -> ConflictLifecycleEvent {
+        let at = DateTime::parse_from_rfc3339("2026-09-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        ConflictLifecycleEvent {
+            seq,
+            kind: kind.into(),
+            actor_kind: "agent".into(),
+            actor: format!("agent-{seq}"),
+            operation: "conflict_acknowledge".into(),
+            episode_revision: 2,
+            result_revision: 2,
+            reason_kind: None,
+            rationale: None,
+            expires_at: None,
+            review_by: None,
+            member_count: 2,
+            created_at: at,
+            payload: None,
+            payload_elided: false,
+        }
+    }
+
+    #[test]
+    fn overlay_keeps_the_newest_window_and_the_latest_waiver() {
+        let limit = i64::try_from(MAX_OVERLAY_EPISODE_EVENTS).unwrap();
+        // The statement returns its rows in no particular order.
+        let mut window = (1..=limit + 1)
+            .map(|seq| overlay_event(seq + 1, "acknowledged"))
+            .collect::<Vec<_>>();
+        window.reverse();
+        window.swap(0, 7);
+        let (shown, truncated) = overlay_events(window.clone(), None);
+        assert!(truncated);
+        assert_eq!(shown.len(), MAX_OVERLAY_EPISODE_EVENTS);
+        // Only the oldest row, the sentinel, is left out.
+        assert_eq!(shown.first().unwrap().seq, limit + 2);
+        assert_eq!(shown.last().unwrap().seq, 3);
+
+        // A waiver that newer acknowledgements pushed out of the window is
+        // still shown, so the conflict still reads waived.
+        let (shown, truncated) = overlay_events(window, Some(overlay_event(1, "waived")));
+        assert!(truncated);
+        assert_eq!(shown.len(), MAX_OVERLAY_EPISODE_EVENTS + 1);
+        assert_eq!(shown.last().unwrap().kind, "waived");
+
+        // A waiver already in the window is not repeated.
+        let small = vec![overlay_event(2, "acknowledged"), overlay_event(1, "waived")];
+        let (shown, truncated) = overlay_events(small, Some(overlay_event(1, "waived")));
+        assert!(!truncated);
+        assert_eq!(
+            shown.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            [2, 1]
+        );
     }
 
     #[test]

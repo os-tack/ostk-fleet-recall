@@ -2,8 +2,8 @@ use async_trait::async_trait;
 
 use crate::ledger::{
     Claim, ClaimInput, ClaimMutation, ClaimState, ClaimTarget, Conflict, ConflictHistory,
-    ConflictLifecycleRows, ConflictMutation, ConflictTarget, LifecycleMutation,
-    LifecycleReplayRequest, SemanticClaimHit,
+    ConflictLifecycleRows, ConflictMutation, ConflictTarget, DismissalTerms, LifecycleMutation,
+    LifecycleReplayRequest, SemanticClaimHit, WaiverTerms,
 };
 use crate::{FleetScope, Result};
 
@@ -123,6 +123,39 @@ pub trait ClaimLedger: Send + Sync {
         target: ConflictTarget,
         retract_claim_ids: &[i64],
         reason: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<ConflictMutation>;
+
+    /// Dismiss an open v2 conflict as not a real disagreement. Served only
+    /// with the lifecycle capability and the deployment's adjudication switch
+    /// (`adjudication_disabled` otherwise), and only to an agent that authored
+    /// none of the conflict's members in any episode (`implicated`); a member
+    /// with no recorded author refuses it (`unattributed_member`). The
+    /// conflict revision and member count the caller read are both checked.
+    /// The conflict moves to `dismissed`, its disputed members that no other
+    /// open conflict holds return to `active`, and a `dismissed` lifecycle
+    /// event records the reason, rationale, and every incompatible current
+    /// pair judged, which later re-evaluations of the conflict leave out. No
+    /// claim changes applicability (DISC-03).
+    async fn dismiss_conflict(
+        &self,
+        scope: &FleetScope,
+        target: ConflictTarget,
+        terms: DismissalTerms<'_>,
+        idempotency_key: &str,
+    ) -> Result<ConflictMutation>;
+
+    /// Waive an open v2 conflict's current episode until an expiry the
+    /// database clock computes. The same gates and checks as
+    /// [`Self::dismiss_conflict`] apply, but nothing but the `waived`
+    /// lifecycle event is written: the conflict stays open, reads `waived`
+    /// while the waiver is unexpired and its member count unchanged, and
+    /// reads `open` again, with the waiver's context, afterwards.
+    async fn waive_conflict(
+        &self,
+        scope: &FleetScope,
+        target: ConflictTarget,
+        terms: WaiverTerms<'_>,
         idempotency_key: &str,
     ) -> Result<ConflictMutation>;
 

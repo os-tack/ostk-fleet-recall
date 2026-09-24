@@ -6,7 +6,7 @@
 //! and whether the key's v2 conflict may be closed. The store module only
 //! reads, locks, and applies what these functions decide.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use chrono::{DateTime, Utc};
@@ -18,7 +18,9 @@ use crate::ledger::{
     ConflictLifecycleOverlay, RevisionGap, WaiverView, functional_values_are_incompatible,
     intervals_overlap,
 };
-use crate::memory_contracts::discrepancy::is_blank_rationale;
+use crate::memory_contracts::discrepancy::{
+    DismissalReasonKindV1, MAX_RATIONALE_BYTES, WaiverReasonKindV1, is_blank_rationale,
+};
 use crate::{FleetError, FleetScope, Result};
 
 /// Only authored claims may be retired by the serving writer.
@@ -46,6 +48,19 @@ pub const MAX_OVERLAY_ACKNOWLEDGERS: usize = 16;
 pub const MAX_HISTORY_EVENTS: usize = 256;
 /// Characters of a waiver rationale the overlay echoes.
 const MAX_OVERLAY_RATIONALE_CHARS: usize = 1_000;
+/// Upper bound, in Unicode characters, on a dismissal or waiver rationale.
+///
+/// It counts characters as the advertised JSON Schema `maxLength` does, and
+/// 1,000 characters of at most four bytes each stay within the contract's
+/// 4,096-byte rationale bound and the lifecycle log's CHECK.
+pub const MAX_ADJUDICATION_RATIONALE_CHARS: usize = 1_000;
+/// Longest waiver, and latest review, in hours (90 days).
+pub const MAX_WAIVER_HOURS: u16 = 2_160;
+/// Incompatible pairs one dismissal may record.
+pub const MAX_DISMISSED_PAIRS: usize = 1_024;
+/// The newest dismissals of a conflict whose pairs re-evaluation excludes.
+/// Older ones are ignored: fewer exclusions only keep a conflict open.
+pub const MAX_EXCLUDED_DISMISSALS: usize = 64;
 
 const V2_DETECTOR_CLASS: i64 = 2;
 const LEGACY_DETECTOR_CLASS: i64 = 1;
@@ -418,18 +433,24 @@ pub fn incompatible_pairs(claims: &[LockedKeyClaim]) -> Vec<(i64, i64)> {
 pub enum Reevaluation {
     NoLineage,
     NotOpen,
-    /// Incompatible current pairs remain, so the conflict stays open.
+    /// Incompatible current pairs that no adjudicator dismissed remain, so
+    /// the conflict stays open.
     StillOpen {
         conflict_id: i64,
         revision: i64,
         pairs: Vec<(i64, i64)>,
+        /// Current incompatible pairs left out because a dismissal of this
+        /// conflict already judged them.
+        excluded_pairs: usize,
     },
-    /// No incompatible current pair remains: the detector verifies the close.
-    /// `restore_candidates` are the remaining disputed claim ids.
+    /// No incompatible current pair remains beyond those an adjudicator
+    /// dismissed: the detector verifies the close. `restore_candidates` are
+    /// the remaining disputed claim ids.
     Close {
         conflict_id: i64,
         revision: i64,
         restore_candidates: Vec<i64>,
+        excluded_pairs: usize,
     },
     /// The Rust and SQL pair sets disagree. Nothing is closed.
     Divergent {
@@ -440,13 +461,40 @@ pub enum Reevaluation {
     },
 }
 
+/// `(lower id, higher id)` pairs, ascending and deduplicated.
+fn normalized_pairs(pairs: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut pairs = pairs
+        .iter()
+        .map(|(left, right)| (*left.min(right), *left.max(right)))
+        .collect::<Vec<_>>();
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
+}
+
+/// The remaining disputed claims a close may return to `active`, ascending.
+fn disputed_ids(claims: &[LockedKeyClaim]) -> Vec<i64> {
+    let mut ids = claims
+        .iter()
+        .filter(|claim| claim.state == ClaimState::Disputed)
+        .map(|claim| claim.id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// Decide whether the key's v2 conflict closes, given the locked remaining
 /// current claims and the database's own pair computation over the same rows.
-/// The two pair sets must agree exactly before anything is closed.
+/// The two raw pair sets must agree exactly before anything is decided;
+/// only then are the pairs in `excluded` (those a dismissal of this conflict
+/// already judged) left out, so a dismissed pair cannot keep a reopened
+/// conflict open forever.
 pub fn plan_reevaluation(
     lineage: Option<V2Lineage>,
     remaining: &[LockedKeyClaim],
     sql_pairs: &[(i64, i64)],
+    excluded: &BTreeSet<(i64, i64)>,
 ) -> Reevaluation {
     let Some(lineage) = lineage else {
         return Reevaluation::NoLineage;
@@ -455,12 +503,7 @@ pub fn plan_reevaluation(
         return Reevaluation::NotOpen;
     }
     let rust_pairs = incompatible_pairs(remaining);
-    let mut sql_pairs = sql_pairs
-        .iter()
-        .map(|(left, right)| (*left.min(right), *left.max(right)))
-        .collect::<Vec<_>>();
-    sql_pairs.sort_unstable();
-    sql_pairs.dedup();
+    let sql_pairs = normalized_pairs(sql_pairs);
     if rust_pairs != sql_pairs {
         return Reevaluation::Divergent {
             conflict_id: lineage.id,
@@ -469,24 +512,228 @@ pub fn plan_reevaluation(
             sql_pairs,
         };
     }
-    if rust_pairs.is_empty() {
-        let mut restore_candidates = remaining
-            .iter()
-            .filter(|claim| claim.state == ClaimState::Disputed)
-            .map(|claim| claim.id)
-            .collect::<Vec<_>>();
-        restore_candidates.sort_unstable();
-        restore_candidates.dedup();
+    let raw_count = rust_pairs.len();
+    let pairs = rust_pairs
+        .into_iter()
+        .filter(|pair| !excluded.contains(pair))
+        .collect::<Vec<_>>();
+    let excluded_pairs = raw_count - pairs.len();
+    if pairs.is_empty() {
         return Reevaluation::Close {
             conflict_id: lineage.id,
             revision: lineage.revision,
-            restore_candidates,
+            restore_candidates: disputed_ids(remaining),
+            excluded_pairs,
         };
     }
     Reevaluation::StillOpen {
         conflict_id: lineage.id,
         revision: lineage.revision,
-        pairs: rust_pairs,
+        pairs,
+        excluded_pairs,
+    }
+}
+
+/// The wire name of a dismissal reason kind, exactly its contract serde name.
+#[must_use]
+pub const fn dismissal_reason_kind(kind: DismissalReasonKindV1) -> &'static str {
+    match kind {
+        DismissalReasonKindV1::FalsePositive => "false_positive",
+        DismissalReasonKindV1::DuplicateOfOtherEpisode => "duplicate_of_other_episode",
+        DismissalReasonKindV1::OutOfScope => "out_of_scope",
+        DismissalReasonKindV1::NotReproducible => "not_reproducible",
+    }
+}
+
+/// The wire name of a waiver reason kind, exactly its contract serde name.
+#[must_use]
+pub const fn waiver_reason_kind(kind: WaiverReasonKindV1) -> &'static str {
+    match kind {
+        WaiverReasonKindV1::CapacityDeferred => "capacity_deferred",
+        WaiverReasonKindV1::CostExceedsRisk => "cost_exceeds_risk",
+        WaiverReasonKindV1::UpstreamBlocked => "upstream_blocked",
+        WaiverReasonKindV1::PolicyException => "policy_exception",
+        WaiverReasonKindV1::ScheduledRemediation => "scheduled_remediation",
+    }
+}
+
+/// The member authorship an adjudication is checked against: every durable
+/// member of the conflict, in every episode, joined to its claim's actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberAuthorship {
+    /// Members read, up to one past the bound an event can record.
+    pub members_checked: i64,
+    /// Members the adjudicating agent authored.
+    pub implicated_members: i64,
+    /// Members with no recorded actor.
+    pub unattributed_members: i64,
+}
+
+/// A dismissal or waiver is decided only by an agent that authored none of
+/// the conflict's members, in any episode (AUTH-03). A member with no
+/// recorded actor could be the adjudicator's own, so it fails closed.
+///
+/// `member_count` is the durable member count the caller's view was checked
+/// against; every one of those members must have been joined to its claim.
+pub fn check_adjudicator(
+    conflict_id: i64,
+    member_count: i64,
+    authorship: MemberAuthorship,
+) -> Result<()> {
+    if authorship.members_checked > MAX_CONFLICT_MEMBER_COUNT {
+        return Err(LifecycleRefusal::new(
+            RefusalCode::BoundExceeded,
+            format!("conflict {conflict_id} has more than {MAX_CONFLICT_MEMBER_COUNT} members"),
+            json!({ "conflict_id": conflict_id, "bound": MAX_CONFLICT_MEMBER_COUNT }),
+        )
+        .into());
+    }
+    if authorship.members_checked != member_count
+        || authorship.implicated_members < 0
+        || authorship.unattributed_members < 0
+        || authorship.implicated_members + authorship.unattributed_members
+            > authorship.members_checked
+    {
+        return Err(FleetError::Memory(
+            "conflict member authorship did not match its locked member count".into(),
+        ));
+    }
+    if authorship.implicated_members > 0 {
+        return Err(LifecycleRefusal::new(
+            RefusalCode::Implicated,
+            format!(
+                "this agent authored {} member claim(s) of conflict {conflict_id}; only an agent that authored none may dismiss or waive it",
+                authorship.implicated_members
+            ),
+            json!({
+                "conflict_id": conflict_id,
+                "implicated_members": authorship.implicated_members,
+            }),
+        )
+        .into());
+    }
+    if authorship.unattributed_members > 0 {
+        return Err(LifecycleRefusal::new(
+            RefusalCode::UnattributedMember,
+            format!(
+                "conflict {conflict_id} has {} member claim(s) with no recorded author, so no agent can be shown to be uninvolved",
+                authorship.unattributed_members
+            ),
+            json!({
+                "conflict_id": conflict_id,
+                "unattributed_members": authorship.unattributed_members,
+            }),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// What a dismissal records and changes, decided over the key's locked
+/// current claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DismissalPlan {
+    /// Every current incompatible pair the adjudicator judged, ascending.
+    /// Later re-evaluations of this conflict leave them out.
+    pub dismissed_pairs: Vec<(i64, i64)>,
+    /// The remaining disputed claims the dismissal may return to `active`.
+    pub restore_candidates: Vec<i64>,
+}
+
+/// Plan a dismissal: the Rust and SQL pair computations must agree, and the
+/// judged pairs must fit one lifecycle event.
+pub fn plan_dismissal(
+    conflict_id: i64,
+    current: &[LockedKeyClaim],
+    sql_pairs: &[(i64, i64)],
+) -> std::result::Result<DismissalPlan, LifecycleRefusal> {
+    let rust_pairs = incompatible_pairs(current);
+    if rust_pairs != normalized_pairs(sql_pairs) {
+        return Err(LifecycleRefusal::new(
+            RefusalCode::VerificationDivergence,
+            format!(
+                "the detector could not verify conflict {conflict_id}'s pairs consistently; nothing was changed"
+            ),
+            json!({ "conflict_id": conflict_id }),
+        ));
+    }
+    if rust_pairs.len() > MAX_DISMISSED_PAIRS {
+        return Err(LifecycleRefusal::new(
+            RefusalCode::BoundExceeded,
+            format!(
+                "conflict {conflict_id} has {} incompatible current pairs; one dismissal records at most {MAX_DISMISSED_PAIRS}",
+                rust_pairs.len()
+            ),
+            json!({
+                "conflict_id": conflict_id,
+                "pair_count": rust_pairs.len(),
+                "bound": MAX_DISMISSED_PAIRS,
+            }),
+        ));
+    }
+    Ok(DismissalPlan {
+        dismissed_pairs: rust_pairs,
+        restore_candidates: disputed_ids(current),
+    })
+}
+
+/// The union of the pairs recorded by a conflict's newest dismissals, from
+/// each `dismissed` event's `payload.dismissed_pairs`. The log is written only
+/// by the serving writer, so a malformed entry is corruption, not input.
+pub fn dismissed_pairs(payloads: &[Value]) -> Result<BTreeSet<(i64, i64)>> {
+    let corrupt =
+        || FleetError::Memory("a dismissal event recorded malformed dismissed pairs".into());
+    let mut pairs = BTreeSet::new();
+    for payload in payloads {
+        let entries = payload.as_array().ok_or_else(corrupt)?;
+        if entries.len() > MAX_DISMISSED_PAIRS {
+            return Err(corrupt());
+        }
+        for entry in entries {
+            let [left, right] = entry.as_array().map(Vec::as_slice).ok_or_else(corrupt)? else {
+                return Err(corrupt());
+            };
+            let (Some(left), Some(right)) = (left.as_i64(), right.as_i64()) else {
+                return Err(corrupt());
+            };
+            if left < 1 || left >= right {
+                return Err(corrupt());
+            }
+            pairs.insert((left, right));
+        }
+    }
+    Ok(pairs)
+}
+
+/// A dismissal or waiver rationale: 1..=1000 characters of visible text with
+/// no control characters other than newline and tab, within the contract's
+/// byte bound.
+pub fn validate_rationale(rationale: &str) -> std::result::Result<(), String> {
+    validate_note("rationale", rationale, MAX_ADJUDICATION_RATIONALE_CHARS)?;
+    if rationale.len() > MAX_RATIONALE_BYTES {
+        return Err(format!(
+            "rationale must be at most {MAX_RATIONALE_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+/// A waiver lasts 1..=2160 hours, and its optional review falls due no later
+/// than it expires.
+pub fn validate_waiver_hours(
+    expires_in_hours: u16,
+    review_in_hours: Option<u16>,
+) -> std::result::Result<(), String> {
+    if !(1..=MAX_WAIVER_HOURS).contains(&expires_in_hours) {
+        return Err(format!(
+            "expires_in_hours must be between 1 and {MAX_WAIVER_HOURS}"
+        ));
+    }
+    match review_in_hours {
+        Some(review) if !(1..=expires_in_hours).contains(&review) => Err(format!(
+            "review_in_hours must be between 1 and expires_in_hours ({expires_in_hours})"
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -802,19 +1049,25 @@ pub fn lifecycle_request_identity(action: &str, scope: &FleetScope, input: &Valu
 /// A lifecycle audit note is 1..=1000 characters of visible text with no
 /// control characters other than newline and tab.
 pub fn validate_reason(reason: &str) -> std::result::Result<(), String> {
-    if reason.is_empty() || reason.chars().count() > MAX_LIFECYCLE_REASON_CHARS {
+    validate_note("reason", reason, MAX_LIFECYCLE_REASON_CHARS)
+}
+
+fn validate_note(label: &str, note: &str, max_chars: usize) -> std::result::Result<(), String> {
+    if note.is_empty() || note.chars().count() > max_chars {
         return Err(format!(
-            "reason must be between 1 and {MAX_LIFECYCLE_REASON_CHARS} characters"
+            "{label} must be between 1 and {max_chars} characters"
         ));
     }
-    if is_blank_rationale(reason) {
-        return Err("reason must contain visible text".into());
+    if is_blank_rationale(note) {
+        return Err(format!("{label} must contain visible text"));
     }
-    if reason
+    if note
         .chars()
         .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
     {
-        return Err("reason must not contain control characters other than newline and tab".into());
+        return Err(format!(
+            "{label} must not contain control characters other than newline and tab"
+        ));
     }
     Ok(())
 }
@@ -1003,21 +1256,28 @@ mod tests {
 
         // Two-party x vs y: retracting x leaves only y, which is restorable.
         assert_eq!(
-            plan_reevaluation(lineage, std::slice::from_ref(&y), &[]),
+            plan_reevaluation(lineage, std::slice::from_ref(&y), &[], &BTreeSet::new()),
             Reevaluation::Close {
                 conflict_id: 9,
                 revision: 3,
                 restore_candidates: vec![2],
+                excluded_pairs: 0,
             }
         );
 
         // Three-way x/y/z: retracting x leaves y vs z open.
         assert_eq!(
-            plan_reevaluation(lineage, &[y.clone(), z.clone()], &[(3, 2)]),
+            plan_reevaluation(
+                lineage,
+                &[y.clone(), z.clone()],
+                &[(3, 2)],
+                &BTreeSet::new()
+            ),
             Reevaluation::StillOpen {
                 conflict_id: 9,
                 revision: 3,
                 pairs: vec![(2, 3)],
+                excluded_pairs: 0,
             }
         );
 
@@ -1026,12 +1286,17 @@ mod tests {
         let positive_y = locked(5, json!("y"), 1);
         assert!(!incompatible_pairs(&[x, negative_x.clone(), positive_y.clone()]).is_empty());
         assert!(matches!(
-            plan_reevaluation(lineage, &[negative_x.clone(), positive_y.clone()], &[]),
+            plan_reevaluation(
+                lineage,
+                &[negative_x.clone(), positive_y.clone()],
+                &[],
+                &BTreeSet::new()
+            ),
             Reevaluation::Close { .. }
         ));
 
         assert_eq!(
-            plan_reevaluation(None, std::slice::from_ref(&y), &[]),
+            plan_reevaluation(None, std::slice::from_ref(&y), &[], &BTreeSet::new()),
             Reevaluation::NoLineage
         );
         for state in [ConflictRowState::Resolved, ConflictRowState::Dismissed] {
@@ -1040,14 +1305,19 @@ mod tests {
                 ..open_lineage()
             });
             assert_eq!(
-                plan_reevaluation(closed, std::slice::from_ref(&y), &[]),
+                plan_reevaluation(closed, std::slice::from_ref(&y), &[], &BTreeSet::new()),
                 Reevaluation::NotOpen
             );
         }
 
         // The database found a pair Rust did not: nothing may close.
         assert_eq!(
-            plan_reevaluation(lineage, &[negative_x, positive_y], &[(4, 5)]),
+            plan_reevaluation(
+                lineage,
+                &[negative_x, positive_y],
+                &[(4, 5)],
+                &BTreeSet::new()
+            ),
             Reevaluation::Divergent {
                 conflict_id: 9,
                 revision: 3,
@@ -1057,7 +1327,7 @@ mod tests {
         );
         // And Rust found a pair the database did not.
         assert!(matches!(
-            plan_reevaluation(lineage, &[y, z], &[]),
+            plan_reevaluation(lineage, &[y, z], &[], &BTreeSet::new()),
             Reevaluation::Divergent { .. }
         ));
     }
@@ -1394,13 +1664,13 @@ mod tests {
         let two =
             plan_concession(9, "agent-a", &[41], &members, vec![x.clone(), y.clone()]).unwrap();
         assert!(matches!(
-            plan_reevaluation(lineage, &two.remaining, &[]),
+            plan_reevaluation(lineage, &two.remaining, &[], &BTreeSet::new()),
             Reevaluation::Close { ref restore_candidates, .. } if *restore_candidates == [42]
         ));
         // Three-way: y and z still disagree, so the concession is refused.
         let three = plan_concession(9, "agent-a", &[41], &members, vec![x, y, z]).unwrap();
         let Reevaluation::StillOpen { pairs, .. } =
-            plan_reevaluation(lineage, &three.remaining, &[(42, 43)])
+            plan_reevaluation(lineage, &three.remaining, &[(42, 43)], &BTreeSet::new())
         else {
             panic!("y and z keep the conflict open");
         };
@@ -1684,6 +1954,233 @@ mod tests {
             RefusalCode::AdjudicationDisabled,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), json!(code.as_str()));
+        }
+    }
+
+    #[test]
+    fn dismissed_pairs_excluded_only_when_exact() {
+        let lineage = Some(open_lineage());
+        let x = owned(41, "agent-a", "x", ClaimState::Disputed);
+        let y = owned(42, "agent-b", "y", ClaimState::Disputed);
+        let z = owned(43, "agent-d", "z", ClaimState::Disputed);
+        let raw = [(41, 42), (41, 43), (42, 43)];
+
+        // A dismissed x/y pair, reopened by z: z's pairs keep it open.
+        let dismissed = BTreeSet::from([(41, 42)]);
+        let Reevaluation::StillOpen {
+            pairs,
+            excluded_pairs,
+            ..
+        } = plan_reevaluation(lineage, &[x.clone(), y.clone(), z], &raw, &dismissed)
+        else {
+            panic!("z's pairs are not dismissed");
+        };
+        assert_eq!(pairs, [(41, 43), (42, 43)]);
+        assert_eq!(excluded_pairs, 1);
+
+        // Once z is gone, only the dismissed pair is left: the conflict closes
+        // and both of its members may return to active.
+        assert_eq!(
+            plan_reevaluation(lineage, &[x.clone(), y.clone()], &[(42, 41)], &dismissed),
+            Reevaluation::Close {
+                conflict_id: 9,
+                revision: 3,
+                restore_candidates: vec![41, 42],
+                excluded_pairs: 1,
+            }
+        );
+
+        // Only the exact pair is excluded: a pair sharing one claim, a pair of
+        // the same claims under other ids, or no dismissal at all keeps it open.
+        for other in [
+            BTreeSet::new(),
+            BTreeSet::from([(41, 43)]),
+            BTreeSet::from([(40, 42)]),
+            BTreeSet::from([(42, 41)]),
+        ] {
+            assert!(
+                matches!(
+                    plan_reevaluation(lineage, &[x.clone(), y.clone()], &[(41, 42)], &other),
+                    Reevaluation::StillOpen {
+                        excluded_pairs: 0,
+                        ..
+                    }
+                ),
+                "{other:?}"
+            );
+        }
+
+        // Exclusion never hides a disagreement between Rust and SQL.
+        assert!(matches!(
+            plan_reevaluation(lineage, &[x, y], &[], &dismissed),
+            Reevaluation::Divergent { .. }
+        ));
+    }
+
+    #[test]
+    fn dismissed_pairs_parse_strictly_from_dismissal_payloads() {
+        let pairs =
+            dismissed_pairs(&[json!([[41, 42], [42, 43]]), json!([[41, 42]]), json!([])]).unwrap();
+        assert_eq!(pairs, BTreeSet::from([(41, 42), (42, 43)]));
+        assert!(dismissed_pairs(&[]).unwrap().is_empty());
+        for corrupt in [
+            Value::Null,
+            json!({"pairs": []}),
+            json!([[41]]),
+            json!([[41, 42, 43]]),
+            json!([[42, 41]]),
+            json!([[41, 41]]),
+            json!([[0, 41]]),
+            json!([["41", 42]]),
+            json!([[41.5, 42]]),
+        ] {
+            assert!(
+                matches!(
+                    dismissed_pairs(std::slice::from_ref(&corrupt)),
+                    Err(FleetError::Memory(_))
+                ),
+                "{corrupt}"
+            );
+        }
+    }
+
+    #[test]
+    fn dismissal_plans_record_verified_bounded_pairs() {
+        let x = owned(41, "agent-a", "x", ClaimState::Disputed);
+        let y = owned(42, "agent-b", "y", ClaimState::Disputed);
+        let active = owned(43, "agent-c", "x", ClaimState::Active);
+        let plan =
+            plan_dismissal(9, &[x.clone(), y.clone(), active], &[(42, 43), (41, 42)]).unwrap();
+        assert_eq!(plan.dismissed_pairs, [(41, 42), (42, 43)]);
+        assert_eq!(plan.restore_candidates, [41, 42]);
+
+        let divergent = plan_dismissal(9, &[x, y], &[]).unwrap_err();
+        assert_eq!(divergent.code, RefusalCode::VerificationDivergence);
+
+        // 46 distinct values are 1,035 pairs, more than one event records.
+        let crowded = (1..=46)
+            .map(|id| owned(id, "agent-a", &format!("value-{id}"), ClaimState::Disputed))
+            .collect::<Vec<_>>();
+        let sql = incompatible_pairs(&crowded);
+        assert!(sql.len() > MAX_DISMISSED_PAIRS);
+        let bound = plan_dismissal(9, &crowded, &sql).unwrap_err();
+        assert_eq!(bound.code, RefusalCode::BoundExceeded);
+        assert_eq!(bound.details["pair_count"], sql.len());
+        let fitting = &crowded[..45];
+        assert_eq!(
+            plan_dismissal(9, fitting, &incompatible_pairs(fitting))
+                .unwrap()
+                .dismissed_pairs
+                .len(),
+            990
+        );
+    }
+
+    #[test]
+    fn adjudicator_checks() {
+        let authorship =
+            |members_checked, implicated_members, unattributed_members| MemberAuthorship {
+                members_checked,
+                implicated_members,
+                unattributed_members,
+            };
+        let refused = |member_count, check| match check_adjudicator(9, member_count, check) {
+            Err(FleetError::LifecycleRefused(refusal)) => *refusal,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(check_adjudicator(9, 2, authorship(2, 0, 0)).is_ok());
+
+        let implicated = refused(3, authorship(3, 1, 0));
+        assert_eq!(implicated.code, RefusalCode::Implicated);
+        assert_eq!(implicated.details["implicated_members"], 1);
+        // Implication is reported first: it is about the caller.
+        assert_eq!(
+            refused(3, authorship(3, 1, 1)).code,
+            RefusalCode::Implicated
+        );
+        let unattributed = refused(3, authorship(3, 0, 1));
+        assert_eq!(unattributed.code, RefusalCode::UnattributedMember);
+        assert_eq!(unattributed.details["unattributed_members"], 1);
+
+        let bound = MAX_CONFLICT_MEMBER_COUNT + 1;
+        assert_eq!(
+            refused(bound, authorship(bound, 0, 0)).code,
+            RefusalCode::BoundExceeded
+        );
+        // A member missing from its join, or counts that cannot add up, are
+        // corruption rather than a refusal.
+        for check in [
+            authorship(1, 0, 0),
+            authorship(2, 2, 1),
+            authorship(2, -1, 0),
+        ] {
+            assert!(
+                matches!(check_adjudicator(9, 2, check), Err(FleetError::Memory(_))),
+                "{check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn waiver_bounds() {
+        assert!(validate_waiver_hours(1, None).is_ok());
+        assert!(validate_waiver_hours(MAX_WAIVER_HOURS, Some(MAX_WAIVER_HOURS)).is_ok());
+        assert!(validate_waiver_hours(24, Some(1)).is_ok());
+        for (expires, review) in [
+            (0, None),
+            (MAX_WAIVER_HOURS + 1, None),
+            (24, Some(0)),
+            (24, Some(25)),
+            (MAX_WAIVER_HOURS + 1, Some(1)),
+        ] {
+            assert!(
+                validate_waiver_hours(expires, review).is_err(),
+                "{expires}/{review:?}"
+            );
+        }
+
+        assert!(validate_rationale("the detector compares unrelated deployments").is_ok());
+        assert!(validate_rationale(&"x".repeat(MAX_ADJUDICATION_RATIONALE_CHARS)).is_ok());
+        // Every rationale the schema admits fits the contract's byte bound.
+        let widest = "\u{1F4DD}".repeat(MAX_ADJUDICATION_RATIONALE_CHARS);
+        assert!(widest.len() <= MAX_RATIONALE_BYTES);
+        assert!(validate_rationale(&widest).is_ok());
+        for rejected in [
+            String::new(),
+            " \t ".into(),
+            "\u{2060}\u{200D}".into(),
+            "x".repeat(MAX_ADJUDICATION_RATIONALE_CHARS + 1),
+            "nul\u{0}".into(),
+        ] {
+            let error = validate_rationale(&rejected).unwrap_err();
+            assert!(error.starts_with("rationale"), "{error}");
+        }
+    }
+
+    #[test]
+    fn reason_kind_enums_match_contract_serde_names() {
+        for kind in [
+            DismissalReasonKindV1::FalsePositive,
+            DismissalReasonKindV1::DuplicateOfOtherEpisode,
+            DismissalReasonKindV1::OutOfScope,
+            DismissalReasonKindV1::NotReproducible,
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                json!(dismissal_reason_kind(kind))
+            );
+        }
+        for kind in [
+            WaiverReasonKindV1::CapacityDeferred,
+            WaiverReasonKindV1::CostExceedsRisk,
+            WaiverReasonKindV1::UpstreamBlocked,
+            WaiverReasonKindV1::PolicyException,
+            WaiverReasonKindV1::ScheduledRemediation,
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                json!(waiver_reason_kind(kind))
+            );
         }
     }
 }

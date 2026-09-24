@@ -377,8 +377,20 @@ async fn build_memory_service(
         embedder.clone(),
         RetryPolicy::default(),
     )?;
+    // Adjudication (dismiss and waive) is opt-in per deployment and needs the
+    // conflict lifecycle beneath it; a switch that cannot take effect is an
+    // operator error worth a loud log, not a startup failure.
+    let adjudication = config.lifecycle.conflict_adjudication && conflict_lifecycle.is_some();
+    if config.lifecycle.conflict_adjudication && !adjudication {
+        tracing::error!(
+            "FLEET_RECALL_CONFLICT_ADJUDICATION=enabled is ignored: the conflict lifecycle is not served (FLEET_RECALL_REMEMBER_LIFECYCLE=disabled, or migration 29 or its runtime grants are absent); dismiss and waive stay off"
+        );
+    }
     if let Some(capability) = conflict_lifecycle {
         ledger = ledger.with_conflict_lifecycle(capability);
+        if adjudication {
+            ledger = ledger.with_conflict_adjudication();
+        }
     }
     let mut service = CockroachMemoryService::new(
         config.default_scope.clone(),
@@ -391,6 +403,7 @@ async fn build_memory_service(
             surface: RememberSurface {
                 claim_lifecycle: true,
                 conflict_lifecycle: conflict_lifecycle.is_some(),
+                adjudication,
             },
             hide_non_current_claim_chunks: true,
             lifecycle_overlay: conflict_lifecycle.is_some(),

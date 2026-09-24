@@ -57,7 +57,7 @@ const MAX_CONTINUITY_KEY_DIMENSIONS: usize = 32;
 const MAX_EVIDENCE_EVENT_IDS: usize = 256;
 const MAX_IMPLICATED_ACTORS: usize = 64;
 const MAX_MODALITY_COMPATIBILITY_RULES: usize = 16;
-const MAX_RATIONALE_BYTES: usize = 4_096;
+pub(crate) const MAX_RATIONALE_BYTES: usize = 4_096;
 
 macro_rules! fingerprint_newtype {
     ($name:ident) => {

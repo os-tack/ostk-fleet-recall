@@ -1,16 +1,17 @@
 # ADR 0004: Serving conflict lifecycle on the legacy ledger
 
-- Status: accepted. Three slices are implemented: `remember(retract)`,
+- Status: accepted. All four slices are implemented: `remember(retract)`,
   detector-verified conflict close with member restore, `recall(get)` with
   `kind=conflict`, private search hiding retired claims' synthetic chunks,
   `remember(supersede)`, and, with migration 29, the per-conflict lifecycle
   log, `remember(acknowledge)`, concession `remember(resolve)`, logged
-  closes, and the lifecycle overlay and history on reads. Adjudication
-  (`dismiss` and `waive`) is a later slice and is not served.
+  closes, the lifecycle overlay and history on reads, and, where a deployment
+  enables it, adjudication (`remember(dismiss)` and `remember(waive)`) with
+  dismissed-pair exclusion.
 - Date: 2026-09-24
 - Scope: how the serving writer lets agents retire their own claims and how a
-  `same_key_functional_value_v2` conflict leaves the `open` state. Decision
-  D5 is reserved for the adjudication slice.
+  `same_key_functional_value_v2` conflict leaves the `open` state or is
+  tolerated while open.
 
 ## Context
 
@@ -175,6 +176,74 @@ concession that could leave an incompatible pair behind would let one agent
 declare a dispute over; refusing it keeps `resolved` meaning "no live
 incompatibility".
 
+## D5 — Adjudication is opt-in and belongs to uninvolved agents
+
+**Decision.** `remember(dismiss)` and `remember(waive)` are served only when
+the deployment sets `FLEET_RECALL_CONFLICT_ADJUDICATION=enabled` (the default
+is `disabled`) and the D7 probe passed; the switch without the capability
+logs an error at startup and stays off, and the ledger itself refuses both as
+`adjudication_disabled` unless it was built with the switch. Both require an
+adjudicator in AUTH-03's sense: the set of implicated agents is every author
+of every durable member of the conflict, over all its episodes (membership is
+never deleted), and an adjudicator in that set is refused as `implicated`. A
+member whose claim has no recorded actor could be anyone's, including the
+caller's, so it fails closed as `unattributed_member` for every agent. Both
+check the conflict's revision and member count under the lineage lock, take
+a `reason_kind` from the discrepancy contract's closed vocabularies
+(`DismissalReasonKindV1`, `WaiverReasonKindV1`) and a required rationale of
+visible text (at most 1,000 characters, within the contract's 4,096-byte
+bound), and write exactly one lifecycle event, so a full log refuses them as
+`bound_exceeded`.
+
+A dismissal asserts the finding is not real. It locks the key's current
+claims, requires the Rust and SQL pair sets to agree
+(`verification_divergence` otherwise, at most 1,024 pairs or
+`bound_exceeded`), moves the conflict to `dismissed` with `resolution_kind =
+dismissed:<reason_kind>` and a fixed reason (the rationale stays in the
+private log, never in `memory_conflicts`), restores its disputed members that
+no other open conflict holds, and appends a `dismissed` event whose payload
+records every judged pair. No claim's state beyond that restore, value,
+author, or applicability changes (DISC-03). Claim ids never change, so a
+judged pair keeps its identity: every later D3 re-evaluation of the same
+conflict (retract, supersede, concession `resolve`) reads the pairs of its
+newest 64 dismissals and, after the raw Rust and SQL pair sets agree, leaves
+those pairs out. A dismissed pair therefore cannot keep a conflict open once
+`record` reopens it with a new incompatible claim and that claim is retired,
+while any pair nobody dismissed still does. Such a close is still `resolved`
+by the detector; its reason, its `reevaluation`, and its event payload report
+how many dismissed pairs were left out. Ignoring older dismissals, or all of
+them on a writer without the capability, can only keep a conflict open.
+
+A waiver is a scoped, expiring risk acceptance (DISC-05). It appends a
+`waived` event with `expires_at` and an optional `review_by` computed from the
+database clock (1 to 2,160 hours, review no later than expiry) and the member
+count it covers, and changes no row. The overlay reads `waived` only while the
+episode's latest waiver is unexpired and the conflict still has that member
+count; expiry or a joining member returns the same episode to `open` with the
+waiver kept as context (`void_reason`), and a `record` reopen starts a new
+episode without it. A waived conflict is never filtered from a read: it
+surfaces wherever an open one would, with its context (DISC-04). The overlay
+reads the episode's latest waiver even when more than its 32 newest events
+came after it.
+
+**Why.** A conflict whose remaining sides nobody will concede, or that the
+detector raises between claims that do not really disagree, needs a way out
+that no party to it controls. Restricting adjudication to agents that authored
+none of the members is the separation of duties AUTH-03 and ADR 0003 require,
+and failing closed on an unattributed member keeps an agent from adjudicating
+its own anonymous claim. Keeping it off by default means a deployment decides
+that its agents may adjudicate. Recording the judged pairs, rather than the
+conflict id, keeps a dismissal from silencing a disagreement it never saw.
+
+**Limits.** Waivers are unsigned lifecycle events, not the signed, policy-bound
+waivers of the 0027 discrepancy ledger: they are not governed by an active
+policy, `applicability_scope` does not apply (a waiver covers the whole
+episode), and there is no early revocation, only a later waiver or expiry.
+`record` itself is unchanged, so it still re-disputes the members of a
+dismissed pair when a new incompatible claim reopens their conflict; the next
+re-evaluation then leaves the pair out. Adjudication authority is only as
+strong as `FLEET_RECALL_AGENT` over the shared writer credential.
+
 ## D6 — Refusals are typed and roll back
 
 **Decision.** A lifecycle precondition failure is a typed refusal with a
@@ -183,8 +252,9 @@ closed code (`not_found`, `not_owner`, `not_operator_asserted`,
 `not_member`, `still_incompatible`, `verification_divergence`,
 `legacy_lineage`, `bound_exceeded`, `successor_kind_mismatch`,
 `successor_key_mismatch`, `successor_eligibility_mismatch`,
-`lifecycle_unavailable`, and codes reserved for adjudication), a message, and
-bounded details. It is returned from inside the serializable closure, so the
+`lifecycle_unavailable`, and, for adjudication, `implicated`,
+`unattributed_member`, and `adjudication_disabled`), a message, and bounded
+details. It is returned from inside the serializable closure, so the
 transaction and its receipt reservation roll back: nothing is committed and
 the idempotency key stays free. MCP reports it as JSON-RPC `invalid_params`
 with `data.outcome = "not_applied"`, never through the outcome-unknown path.
@@ -195,8 +265,9 @@ no longer serves an action (for example after
 `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`, or after a restart whose probe
 found no lifecycle grants) reads the key's receipt before refusing. It replays a committed identical request, reports any
 other use of the key as an idempotency conflict, and refuses with
-`lifecycle_unavailable` only when no receipt holds the key, so the refusal's
-promise that the key was not consumed stays true.
+`lifecycle_unavailable` (or `adjudication_disabled`) only when no receipt
+holds the key, so the refusal's promise that the key was not consumed stays
+true.
 
 ## D7 — The conflict lifecycle is gated on a startup capability
 
@@ -205,7 +276,8 @@ writer checks that the schema prefix reaches 29 and runs an
 `INSERT ... SELECT ... WHERE false` on the lifecycle log in a transaction it
 rolls back. Privileges are checked when the statement is planned, including
 ones held through role membership, and nothing is written. Only a pass mints
-the capability that lets the ledger serve `acknowledge` and `resolve`, log
+the capability that lets the ledger serve `acknowledge` and `resolve` (and,
+with D5's switch, `dismiss` and `waive`, which need no further grant), log
 closes, and read the overlay and history; SQLSTATE 42501 means "not served",
 and any other error stops startup. The runtime policy gains a separate
 migration-29 gate and `SELECT`/`INSERT` on the log, so its exact grant matrix
@@ -244,9 +316,10 @@ restores on the private writer, emits the historical tool list byte for byte.
   the capability is present, in the per-conflict lifecycle log. `record`
   opens and reopens are not logged; history reports them as unlogged
   transitions.
-- Agents can acknowledge a conflict and concede their own side of it, but no
-  agent can yet close a conflict whose remaining sides it did not author;
-  that needs adjudication by a non-implicated agent (D5, a later slice).
+- Agents can acknowledge a conflict and concede their own side of it. Where a
+  deployment enables adjudication, an agent uninvolved in a conflict can
+  dismiss it or waive it for a while (D5); nobody can close a conflict whose
+  remaining sides they authored without conceding them.
 - Publication reads are unchanged: the public demo still returns retired
   claims' synthetic chunks, does not serve conflict lookup by id, and never
   reads the lifecycle log.
