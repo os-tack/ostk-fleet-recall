@@ -691,3 +691,56 @@ fn the_shared_entity_helper_matches_admission_and_checks_the_recipe_digest() {
         );
     });
 }
+
+/// A string or string-set value inside the canonical per-item and set bounds
+/// can still be too large for the claim row. Admission refuses it as a typed
+/// `value_invalid` before anything is embedded, where the claim row alone
+/// would have refused it only afterwards, as an internal error.
+#[test]
+fn a_value_the_claim_row_cannot_store_is_refused_as_value_invalid() {
+    let oversized = [
+        serde_json::json!({
+            "kind": "string_set",
+            "values": ["a".repeat(60_000), "b".repeat(60_000)],
+        }),
+        // JSON escaping doubles every quote.
+        serde_json::json!({ "kind": "string", "value": "\"".repeat(60_000) }),
+    ];
+    for value in oversized {
+        let value: CanonicalClaimValueV2 =
+            serde_json::from_value(value).expect("a canonical claim value");
+        let row = ClaimInput {
+            value: Some(canonical_json(&serde_json::to_value(&value).unwrap())),
+            ..input_claim_row()
+        };
+        assert!(row.validate().is_err(), "the claim row refuses it");
+        let refusal = check_projected_value(&value).unwrap_err();
+        assert_eq!(refusal.reason, RememberAdmissionRefusalReason::ValueInvalid);
+    }
+    for value in [
+        serde_json::json!({ "kind": "boolean", "value": true }),
+        serde_json::json!({ "kind": "string_set", "values": ["a".repeat(40_000), "b".repeat(40_000)] }),
+    ] {
+        let value: CanonicalClaimValueV2 =
+            serde_json::from_value(value).expect("a canonical claim value");
+        check_projected_value(&value).expect("a value the claim row stores");
+    }
+}
+
+/// A claim row that the projection accepts, apart from its value.
+fn input_claim_row() -> ClaimInput {
+    ClaimInput {
+        kind: ClaimKind::Decision,
+        text: "a claim".into(),
+        subject: None,
+        predicate: None,
+        value: None,
+        polarity: 1,
+        origin: OPERATOR_ASSERTED_ORIGIN.to_owned(),
+        actor: None,
+        confidence: 1.0,
+        valid_from: None,
+        valid_to: None,
+        support: Vec::new(),
+    }
+}

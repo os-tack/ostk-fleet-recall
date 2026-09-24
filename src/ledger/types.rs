@@ -13,6 +13,8 @@ use crate::{FleetError, Result};
 // the domain boundary so a schema-valid remember call cannot fail only after
 // embedding and entering its serializable mutation.
 const MAX_TSVECTOR_INPUT_LEXEME_BYTES: usize = 16_000;
+/// Largest compact serialized claim value a claim row stores.
+pub const MAX_CLAIM_VALUE_SERIALIZED_BYTES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -210,7 +212,7 @@ impl ClaimInput {
         if self
             .value
             .as_ref()
-            .is_some_and(|value| value.to_string().len() > 100_000)
+            .is_some_and(|value| value.to_string().len() > MAX_CLAIM_VALUE_SERIALIZED_BYTES)
         {
             return Err(FleetError::Memory(
                 "claim value must not exceed 100,000 serialized bytes".into(),

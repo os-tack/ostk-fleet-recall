@@ -59,7 +59,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::FleetError;
-use crate::ledger::{ClaimInput, ClaimKind};
+use crate::ledger::{ClaimInput, ClaimKind, MAX_CLAIM_VALUE_SERIALIZED_BYTES, canonical_json};
 use crate::memory_contracts::common::{
     AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId, RegistryReferenceV1,
 };
@@ -748,7 +748,26 @@ fn check_claim_shape(
             ),
         ));
     }
-    Ok(())
+    check_projected_value(&input.value)
+}
+
+/// Refuse a value the legacy claim row cannot store. A string or string-set
+/// predicate's own bounds admit values whose canonical JSON exceeds the row's
+/// [`MAX_CLAIM_VALUE_SERIALIZED_BYTES`], so this is checked here, as a typed
+/// `value_invalid`, rather than after embedding.
+pub(super) fn check_projected_value(
+    value: &CanonicalClaimValueV2,
+) -> Result<(), RememberAdmissionRefusal> {
+    let fits = serde_json::to_value(value).is_ok_and(|value| {
+        canonical_json(&value).to_string().len() <= MAX_CLAIM_VALUE_SERIALIZED_BYTES
+    });
+    if fits {
+        return Ok(());
+    }
+    Err(RememberAdmissionRefusal::new(
+        RememberAdmissionRefusalReason::ValueInvalid,
+        format!("value must not exceed {MAX_CLAIM_VALUE_SERIALIZED_BYTES} serialized JSON bytes"),
+    ))
 }
 
 /// Rederive the subject and every applicability URI from their components.

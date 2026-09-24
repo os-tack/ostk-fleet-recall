@@ -27,6 +27,7 @@ pub use reconciliation::{
 };
 pub(crate) use repository::assert_unavailable;
 pub use repository::{ClaimLedger, SupportedClaimCoordinate, SupportedClaimIds};
+pub(crate) use types::MAX_CLAIM_VALUE_SERIALIZED_BYTES;
 pub use types::{
     AcceptedEventRefV1, Acknowledgement, AssertedClaimMutation, Claim, ClaimInput, ClaimKind,
     ClaimMutation, ClaimState, ClaimSupport, ClaimSupportInput, ClaimTarget, ClosureView, Conflict,
