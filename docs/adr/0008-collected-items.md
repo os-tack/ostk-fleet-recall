@@ -366,7 +366,13 @@ same rules, and suppression applies. When it may not, evidence recall is
 still served, but it cannot tell deleted text from current text or a pending
 item from none: every collected body is dropped from the answer and from
 `get` (fail closed), and an empty answer is `unknown` with
-`collector_state_unreadable`, never `absent`.
+`collector_state_unreadable`, never `absent`. The startup probe is only a
+starting point: until the collector state is readable, every search, `get`,
+and status read checks it again, and withholds collected bodies until it is.
+A `serve` started before migration 33 (step 1 of the D2 rollout ships
+binaries before step 2 migrates) therefore suppresses deleted and withdrawn
+items and counts pending ones from the first read after the migration and
+the grants, with no restart.
 
 ## D6 — Audience: server-derived, whole project only
 

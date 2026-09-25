@@ -66,6 +66,12 @@
 //! closed), and an empty answer is `unknown` with
 //! [`AbsenceReasonV1::CollectorStateUnreadable`], never `absent`.
 //!
+//! Until the collector state is readable it is checked again on every read,
+//! not only at startup: a `serve` started before migration 33, or before the
+//! collector grants were applied, reads it as soon as it can, and withholds
+//! every collected body until then. A process never serves collected text it
+//! cannot suppress.
+//!
 //! # What the text is
 //!
 //! A snippet and a fetched body carry the lexical tier's recall text, never

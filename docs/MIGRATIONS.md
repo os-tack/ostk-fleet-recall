@@ -659,7 +659,9 @@ physical scope that is to collect items:
    collected-item tables, which the runtime policy grants (its gate is now
    migrations 1 through 33). A worker whose schema predates migration 33
    skips its `collect` step, and fails it, naming `migrate`, when a collector
-   is configured.
+   is configured. A `serve` started before this step needs no restart: its
+   evidence recall checks the collector state again on every read until it is
+   readable, and withholds every collected body until then.
 3. Run `ostk-authority-install apply --target generation-3` as the schema
    owner/migrator login. The printed pins are unchanged, so no writer is
    reconfigured. The run then rebases every normative binding family onto

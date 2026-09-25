@@ -839,6 +839,79 @@ async fn live_tombstone_at_the_live_order_hides_every_item_when_configured() {
     }
 }
 
+#[tokio::test]
+async fn live_recall_probed_before_migration_33_reads_the_collector_state_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = fixture_at(&pool, "collected-stale-probe").await;
+    let scope = &fixture.installed.scope;
+    // A serve that started before migration 33: its startup probe saw no
+    // collector state. The rollout migrates, installs, and configures
+    // collectors while it keeps running.
+    let mut before = capabilities(&pool, scope).await;
+    before.schema_version = COLLECTED_ITEMS_SCHEMA_VERSION - 1;
+    let capability = probe_evidence_recall(
+        &pool,
+        &before,
+        scope,
+        Sha256Digest::from_bytes(STUB_MODEL_DIGEST),
+    )
+    .await
+    .unwrap()
+    .expect("evidence recall is served before migration 33");
+    let early = CockroachEvidenceRecall::new(capability, pool.clone());
+
+    stage(
+        &pool,
+        &fixture,
+        &docs(),
+        vec![doc(
+            "numbat.md",
+            "the numbat roster",
+            1_000,
+            ItemLifecycleV1::Live,
+        )],
+    )
+    .await;
+    let pending = early.search("numbat", None, 10).await.unwrap();
+    assert_eq!(pending.readiness.items_awaiting_admission, Some(1));
+    assert!(
+        pending
+            .absence
+            .reasons
+            .contains(&AbsenceReasonV1::IngestOutboxPending),
+        "{:?}",
+        pending.absence
+    );
+
+    drain(&fixture, &pool, "collect,project").await;
+    let found = early.search("numbat", None, 10).await.unwrap();
+    assert_eq!(found.hits.len(), 1);
+    let body = found.hits[0].id;
+    assert!(early.get(body).await.unwrap().is_some());
+
+    stage(
+        &pool,
+        &fixture,
+        &docs(),
+        vec![doc("numbat.md", "", 2_000, ItemLifecycleV1::Deleted)],
+    )
+    .await;
+    drain(&fixture, &pool, "collect,project").await;
+    assert!(
+        early
+            .search("numbat", None, 10)
+            .await
+            .unwrap()
+            .hits
+            .is_empty(),
+        "the deleted text is hidden from the early process too"
+    );
+    assert!(early.get(body).await.unwrap().is_none());
+}
+
 /// Fake credentials, assembled at runtime so no credential-shaped literal
 /// sits in the source.
 fn planted_secrets() -> Vec<String> {

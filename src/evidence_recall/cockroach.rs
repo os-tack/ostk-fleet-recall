@@ -5,7 +5,8 @@
 //! [`CockroachRecallReader`]'s, on the private plane.
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -35,6 +36,9 @@ use super::{
 };
 
 const INSUFFICIENT_PRIVILEGE_SQLSTATE: &str = "42501";
+
+/// A relation the statement names does not exist.
+const UNDEFINED_TABLE_SQLSTATE: &str = "42P01";
 
 /// `plainto_tsquery` raises this for a query with no lexeme, such as one made
 /// only of stopwords.
@@ -159,15 +163,40 @@ const GET_SQL: &str = "SELECT body.media_type, body.first_accepted_event_id, \
      WHERE body.tenant_id = $1 AND body.project = $2 AND body.content_sha256 = $3";
 
 /// What evidence recall can know about collected items in one scope.
+///
+/// Only [`Self::Readable`] is settled for the life of the process. The other
+/// two are checked again on every read ([`CockroachEvidenceRecall`]), so a
+/// `serve` started before migration 33 or before the collector grants were
+/// applied reads the collector state as soon as it can, with no restart. In
+/// either of them every collected body is withheld (fail closed): a body that
+/// exists while this process believed there were none is one it cannot tell
+/// deleted from current.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 enum CollectorStateV1 {
-    /// The schema predates migration 33: there are none.
-    Absent,
+    /// The collector tables do not exist (the schema predates migration 33).
+    Absent = 0,
     /// The login may read every collector table recall needs.
-    Readable,
+    Readable = 1,
     /// The schema has them and the login may not read them: collected bodies
     /// are dropped and absence cannot be shown.
-    Unreadable,
+    Unreadable = 2,
+}
+
+impl CollectorStateV1 {
+    const fn from_stored(value: u8) -> Self {
+        match value {
+            1 => Self::Readable,
+            2 => Self::Unreadable,
+            _ => Self::Absent,
+        }
+    }
+
+    /// Whether suppression can be applied, so collected bodies may be
+    /// recalled at all.
+    const fn readable(self) -> bool {
+        matches!(self, Self::Readable)
+    }
 }
 
 /// Proof that this login may read every evidence-recall table in one scope,
@@ -231,7 +260,9 @@ fn sqlstate(error: &sqlx::Error) -> Option<String> {
 /// tier already holds a vector of another model; if it does, the capability
 /// turns the dense lane off for the process and every answer says so, since
 /// such a tier is only partly searchable by this model. That read runs once
-/// at startup, so a grant or model change needs a restart.
+/// at startup, so a Stage-5 grant or model change needs a restart. The
+/// collector state it records is only a starting point: a recall built from
+/// it checks again on every read until the state is readable.
 ///
 /// # Errors
 ///
@@ -249,12 +280,14 @@ pub async fn probe_evidence_recall(
     if !may_read(pool, &EVIDENCE_RECALL_TABLES).await? {
         return Ok(None);
     }
-    let collectors = if !capabilities.supports_schema_version(COLLECTED_ITEMS_SCHEMA_VERSION) {
-        CollectorStateV1::Absent
-    } else if may_read(pool, &COLLECTOR_RECALL_TABLES).await? {
-        CollectorStateV1::Readable
+    let collectors = if capabilities.supports_schema_version(COLLECTED_ITEMS_SCHEMA_VERSION) {
+        if may_read(pool, &COLLECTOR_RECALL_TABLES).await? {
+            CollectorStateV1::Readable
+        } else {
+            CollectorStateV1::Unreadable
+        }
     } else {
-        CollectorStateV1::Unreadable
+        CollectorStateV1::Absent
     };
     let foreign: Option<i64> = sqlx::query_scalar(FOREIGN_DENSE_MODEL_SQL)
         .bind(scope.tenant_id)
@@ -291,6 +324,23 @@ async fn may_read(pool: &PgPool, tables: &[&str]) -> Result<bool> {
     readable
 }
 
+/// The collector state as it stands now, for a process that last saw it
+/// absent or unreadable: one statement that plans a read of every collector
+/// table recall needs, outside any transaction, so it reads nothing.
+async fn current_collector_state(pool: &PgPool) -> Result<CollectorStateV1> {
+    match sqlx::query(&privilege_probe_sql(&COLLECTOR_RECALL_TABLES))
+        .execute(pool)
+        .await
+    {
+        Ok(_) => Ok(CollectorStateV1::Readable),
+        Err(error) => match sqlstate(&error).as_deref() {
+            Some(INSUFFICIENT_PRIVILEGE_SQLSTATE) => Ok(CollectorStateV1::Unreadable),
+            Some(UNDEFINED_TABLE_SQLSTATE) => Ok(CollectorStateV1::Absent),
+            _ => Err(FleetError::from(error)),
+        },
+    }
+}
+
 /// [`EvidenceRecall`] over one scope's private plane.
 #[derive(Clone)]
 pub struct CockroachEvidenceRecall {
@@ -298,8 +348,13 @@ pub struct CockroachEvidenceRecall {
     tenant_id: Uuid,
     project: String,
     dense_served: bool,
-    collectors: CollectorStateV1,
+    /// The last [`CollectorStateV1`] seen, shared by every clone.
+    collectors: Arc<AtomicU8>,
+    /// The lanes with no collected-item suppression, for a read that cannot
+    /// read the collector state and drops every collected body instead.
     reader: CockroachRecallReader,
+    /// The same lanes withholding deleted and withdrawn collected bodies.
+    suppressed_reader: CockroachRecallReader,
 }
 
 impl std::fmt::Debug for CockroachEvidenceRecall {
@@ -309,7 +364,10 @@ impl std::fmt::Debug for CockroachEvidenceRecall {
             .field("tenant_id", &self.tenant_id)
             .field("project", &self.project)
             .field("dense_served", &self.dense_served)
-            .field("collectors", &self.collectors)
+            .field(
+                "collectors",
+                &CollectorStateV1::from_stored(self.collectors.load(Ordering::Acquire)),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -328,23 +386,45 @@ impl CockroachEvidenceRecall {
         let reader = CockroachRecallReader::new(pool.clone(), tenant_id, project.clone())
             .with_dense_model(model_digest);
         Self {
-            reader: if collectors == CollectorStateV1::Readable {
-                reader.with_collected_suppression()
-            } else {
-                reader
-            },
+            suppressed_reader: reader.clone().with_collected_suppression(),
+            reader,
             pool,
             tenant_id,
             project,
             dense_served,
-            collectors,
+            collectors: Arc::new(AtomicU8::new(collectors as u8)),
+        }
+    }
+
+    /// The collector state for one read. Once readable it stays so; until
+    /// then it is checked again, so migration 33 and the collector grants
+    /// take effect in a running process, and every read before they do
+    /// withholds collected bodies.
+    async fn collector_state(&self) -> Result<CollectorStateV1> {
+        let known = CollectorStateV1::from_stored(self.collectors.load(Ordering::Acquire));
+        if known.readable() {
+            return Ok(known);
+        }
+        let current = current_collector_state(&self.pool).await?;
+        if current != known {
+            self.collectors.store(current as u8, Ordering::Release);
+        }
+        Ok(current)
+    }
+
+    /// The lanes for a read under `state`.
+    const fn reader(&self, state: CollectorStateV1) -> &CockroachRecallReader {
+        if state.readable() {
+            &self.suppressed_reader
+        } else {
+            &self.reader
         }
     }
 
     /// The active sources and each one's newest coverage cursor: the
     /// worker's, and, when the collector state is readable, the live and
     /// snapshot collectors', in instance order and capped together.
-    async fn read_sources(&self) -> Result<EvidenceSourcesV1> {
+    async fn read_sources(&self, state: CollectorStateV1) -> Result<EvidenceSourcesV1> {
         let rows: Vec<PgRow> = sqlx::query(SOURCES_SQL)
             .bind(self.tenant_id)
             .bind(&self.project)
@@ -355,7 +435,7 @@ impl CockroachEvidenceRecall {
             .iter()
             .map(decode_source_row)
             .collect::<Result<Vec<_>>>()?;
-        if self.collectors == CollectorStateV1::Readable {
+        if state.readable() {
             let rows: Vec<PgRow> = sqlx::query(COLLECTOR_SOURCES_SQL)
                 .bind(self.tenant_id)
                 .bind(&self.project)
@@ -414,13 +494,17 @@ impl CockroachEvidenceRecall {
 
     /// Ingestion and projection lag. Read after the sources and before the
     /// lanes; see the module documentation.
-    async fn read_readiness(&self, dense_lane: EvidenceDenseLaneV1) -> Result<EvidenceReadinessV1> {
+    async fn read_readiness(
+        &self,
+        dense_lane: EvidenceDenseLaneV1,
+        state: CollectorStateV1,
+    ) -> Result<EvidenceReadinessV1> {
         let row: PgRow = sqlx::query(READINESS_SQL)
             .bind(self.tenant_id)
             .bind(&self.project)
             .fetch_one(&self.pool)
             .await?;
-        let items_awaiting_admission = match self.collectors {
+        let items_awaiting_admission = match state {
             CollectorStateV1::Readable => {
                 let pending: i64 = sqlx::query_scalar(COUNT_PENDING_SQL)
                     .bind(self.tenant_id)
@@ -433,12 +517,12 @@ impl CockroachEvidenceRecall {
             }
             CollectorStateV1::Absent | CollectorStateV1::Unreadable => None,
         };
-        let completeness = self.reader.completeness().await?;
+        let completeness = self.reader(state).completeness().await?;
         Ok(EvidenceReadinessV1 {
             events_awaiting_body_projection: count(&row, "events_awaiting_bodies")?,
             transcript_turns_awaiting_admission: count(&row, "turns_awaiting_admission")?,
             items_awaiting_admission,
-            collector_state_unreadable: self.collectors == CollectorStateV1::Unreadable,
+            collector_state_unreadable: state == CollectorStateV1::Unreadable,
             lexical_current: completeness.lexical_complete(),
             dense_current: completeness.dense_complete(),
             dense_lane,
@@ -463,7 +547,11 @@ impl CockroachEvidenceRecall {
     }
 
     /// Attach each scored hit's body, keeping the lanes' order.
-    async fn hydrate(&self, scored: Vec<ScoredHitV1>) -> Result<Vec<EvidenceHitV1>> {
+    async fn hydrate(
+        &self,
+        scored: Vec<ScoredHitV1>,
+        state: CollectorStateV1,
+    ) -> Result<Vec<EvidenceHitV1>> {
         if scored.is_empty() {
             return Ok(Vec::new());
         }
@@ -518,12 +606,12 @@ impl CockroachEvidenceRecall {
         // Fail closed: without the collector state a deleted item's text is
         // indistinguishable from a current one's, so no collected body is
         // recalled.
-        Ok(if self.collectors == CollectorStateV1::Unreadable {
+        Ok(if state.readable() {
+            hits
+        } else {
             hits.into_iter()
                 .filter(|hit| hit.media_type != COLLECTED_ITEM_MEDIA_TYPE)
                 .collect()
-        } else {
-            hits
         })
     }
 }
@@ -554,14 +642,15 @@ impl EvidenceRecall for CockroachEvidenceRecall {
         }
         let lexical_text = lexical_query_text(query);
         let lane = dense_lane(self.dense_served, Some(query_vector.is_some()));
+        let state = self.collector_state().await?;
         // Sources, then readiness, then the lanes: the order that makes an
         // absent verdict sound (module documentation).
-        let sources = self.read_sources().await?;
-        let readiness = self.read_readiness(lane).await?;
+        let sources = self.read_sources(state).await?;
+        let readiness = self.read_readiness(lane, state).await?;
         let lexical_terms = self.has_lexical_terms(&lexical_text).await?;
         let vector = query_vector.filter(|_| lane == EvidenceDenseLaneV1::Used);
         let (hits, _tier) = self
-            .reader
+            .reader(state)
             .recall_hits(
                 if lexical_terms { &lexical_text } else { "" },
                 vector.as_deref(),
@@ -569,10 +658,10 @@ impl EvidenceRecall for CockroachEvidenceRecall {
             )
             .await?;
         let hits = self
-            .hydrate(apply_dense_floor(
-                &hits,
-                RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
-            ))
+            .hydrate(
+                apply_dense_floor(&hits, RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY),
+                state,
+            )
             .await?;
         let absence = absence_verdict(hits.len(), lexical_terms, &readiness, &sources);
         Ok(EvidenceSearchV1 {
@@ -584,9 +673,11 @@ impl EvidenceRecall for CockroachEvidenceRecall {
     }
 
     async fn get(&self, id: Sha256Digest) -> Result<Option<EvidenceBodyV1>> {
-        let statement = match self.collectors {
-            CollectorStateV1::Readable => GET_COLLECTED_SQL.as_str(),
-            CollectorStateV1::Absent | CollectorStateV1::Unreadable => GET_SQL,
+        let state = self.collector_state().await?;
+        let statement = if state.readable() {
+            GET_COLLECTED_SQL.as_str()
+        } else {
+            GET_SQL
         };
         let row: Option<PgRow> = sqlx::query(statement)
             .bind(self.tenant_id)
@@ -595,7 +686,7 @@ impl EvidenceRecall for CockroachEvidenceRecall {
             .fetch_optional(&self.pool)
             .await?;
         let row = row.filter(|row| {
-            self.collectors != CollectorStateV1::Unreadable
+            state.readable()
                 || row
                     .try_get::<String, _>("media_type")
                     .is_ok_and(|media_type| media_type != COLLECTED_ITEM_MEDIA_TYPE)
@@ -616,9 +707,10 @@ impl EvidenceRecall for CockroachEvidenceRecall {
     }
 
     async fn status(&self) -> Result<EvidenceStatusV1> {
-        let sources = self.read_sources().await?;
+        let state = self.collector_state().await?;
+        let sources = self.read_sources(state).await?;
         let readiness = self
-            .read_readiness(dense_lane(self.dense_served, None))
+            .read_readiness(dense_lane(self.dense_served, None), state)
             .await?;
         Ok(EvidenceStatusV1 { readiness, sources })
     }
