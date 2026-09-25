@@ -167,7 +167,13 @@ of the serving one.
   genesis-admitted observer, records one check (`conforming`,
   `nonconforming`, or `unknown` with reasons), and opens a
   `spec_nonconformance` discrepancy episode only for a verified
-  nonconformance. `draft`, `activate`, and `check` run as `fleet_writer`
+  nonconformance. No check closes an episode (a fixing commit checks as
+  `unknown`), so `episode resolve` lets an operator resolve one, citing
+  accepted events or by default the latest check of the violated statement,
+  and `episode dismiss` dismisses one with a reason and a rationale; either
+  appends a lifecycle event to the episode's history, after which
+  `recall(discrepancies)` lists it only with `include_resolved`.
+  `draft`, `activate`, `check`, and `episode` run as `fleet_writer`
   (`FLEET_RECALL_DATABASE_URL`) with the writer-authority pins
   `ostk-authority-install apply` prints, and `check` also needs
   `FLEET_RECALL_CONTENT_KEK_HEX`; `approve` reads no environment.

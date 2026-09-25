@@ -41,7 +41,8 @@
 //! verified. So "must be absent" is the only expectation a commit can be
 //! verified to violate, an absent member is `unknown` rather than
 //! `conforming`, and a commit that fixes a violation never verifies the fix:
-//! no check closes an episode. An operator does.
+//! no check closes an episode. An operator does, with
+//! `ostk-spec episode resolve|dismiss` ([`super::lifecycle`]).
 //!
 //! The discrepancy write is fenced by the witnessed registry binding, not by
 //! the append transaction's head read, and the opening rule is read before

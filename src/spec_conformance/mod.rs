@@ -36,6 +36,12 @@
 //!   identity, compare both sides with their coverage bounds
 //!   ([`providers`]), open a `spec_nonconformance` episode only for a
 //!   verified nonconformance ([`envelope`]), and record every comparison.
+//! * [`lifecycle`] — [`append_episode_lifecycle`], behind
+//!   `ostk-spec episode resolve|dismiss`: an operator closes a spec episode,
+//!   since no check ever verifies a fix. A resolution cites evidence, by
+//!   default the latest check of the violated statement; a dismissal gives a
+//!   reason and a rationale. The event is appended to the episode's log and
+//!   checked by the discrepancy contract against the stored envelope.
 //! * [`registry`] — the compiled-in comparator lineage and episode policy
 //!   spec episodes are judged and grouped under. They are not
 //!   package-admitted (a DISC-06 deferral) and never change in place.
@@ -58,6 +64,7 @@ pub mod cockroach;
 pub mod draft;
 pub mod envelope;
 pub mod expectation;
+pub mod lifecycle;
 pub mod providers;
 pub mod read;
 pub mod record;
@@ -94,6 +101,10 @@ pub use expectation::{
     ExpectedMembershipV1, MAX_RUST_IDENTIFIER_BYTES, MAX_SOURCE_PATH_BYTES,
     REMEMBER_ACTION_EXPECTATION_SCHEMA_VERSION, REPOSITORY_SELECTOR_KEY,
     RememberActionExpectationV1, membership_value_digest, repository_selector,
+};
+pub use lifecycle::{
+    SpecEpisodeLifecycleV1, SpecEpisodeTransitionV1, append_episode_lifecycle,
+    default_resolution_evidence, spec_episode_statement, spec_lifecycle_event,
 };
 pub use providers::{
     NormativeStatementSide, OPEN_ENDED_AT, ObservedMembershipSide, compare_spec_sides,

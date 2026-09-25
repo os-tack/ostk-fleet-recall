@@ -37,6 +37,16 @@
 //! `recall(status)`'s block, exactly when the login may SELECT every table it
 //! reads, while an unserved deployment keeps its tools and status as they
 //! were.
+//!
+//! And it proves `ostk-spec check` and `ostk-spec episode resolve|dismiss`
+//! over a memory worker's git source: a commit that declares a forbidden
+//! member opens an episode, a commit that drops it checks as `unknown` and
+//! leaves the episode standing, an operator resolves the episode citing that
+//! later check's observer event by default (never the nonconformance
+//! itself), after which `recall(discrepancies)` lists it only with
+//! `include_resolved` and a re-check of the offending commit joins it as
+//! already judged instead of re-opening; a dismissal without a rationale is
+//! refused and appends nothing.
 
 mod common;
 
@@ -47,10 +57,11 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use common::authority::{install_generation_two, retry_policy, semantic_scope};
+use common::authority::{InstalledAuthority, install_generation_two, retry_policy, semantic_scope};
 use common::runtime_role::RuntimeProbeRole;
 use common::worker::{
-    FIRST_COMMIT_DATE, INSTALLATION_ID, SECOND_COMMIT_DATE, ScratchRepository, StubEmbedder,
+    FIRST_COMMIT_DATE, INSTALLATION_ID, RecordedCi, SECOND_COMMIT_DATE, ScratchRepository,
+    StubEmbedder,
 };
 use futures::FutureExt as _;
 use ostk_fleet_recall::connectors::git::GitObjectId;
@@ -58,6 +69,7 @@ use ostk_fleet_recall::discrepancy_runtime::{
     CockroachDiscrepancyLedgerRepository, ComparisonIndeterminacyV1, ComparisonVerdictV1,
     DiscrepancyLedgerRepository as _, DiscrepancyRegistryBindingV1,
 };
+use ostk_fleet_recall::evidence_ledger::ContentKeyEncryptionKey;
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::{tool_list, tool_list_for_surfaces};
 use ostk_fleet_recall::memory_contracts::ContractError;
@@ -72,7 +84,7 @@ use ostk_fleet_recall::memory_contracts::digest::{
 use ostk_fleet_recall::memory_contracts::discrepancy::{
     DiscrepancyActorV1, DiscrepancyEnvelopeV1, DiscrepancyEpisodeFingerprintV1,
     DiscrepancyFamilyFingerprintV1, DiscrepancyLifecycleEventV1, DiscrepancySeverityV1,
-    LifecycleState, LifecycleTransitionV1,
+    DismissalReasonKindV1, LifecycleState, LifecycleTransitionV1,
 };
 use ostk_fleet_recall::memory_contracts::evidence::{AcceptedEventId, SourceFactId};
 use ostk_fleet_recall::memory_contracts::evidence_v2::RegistryHeadBindingV1;
@@ -95,16 +107,18 @@ use ostk_fleet_recall::service::{
 };
 use ostk_fleet_recall::spec_conformance::{
     CockroachSpecRepository, DraftStatementRequestV1, ExpectedMembershipV1,
-    RememberActionExpectationV1, SpecActivationOutcomeV1, SpecCheckRecordV1,
-    SpecConformanceAnswerV1, SpecConformanceRead, SpecDetectionV1, SpecRowWriteV1, SpecSummaryV1,
-    SpecVerdictV1, activate_spec_statement, build_spec_envelope, database_now,
+    RememberActionExpectationV1, SpecActivationOutcomeV1, SpecCheckOutcomeV1, SpecCheckRecordV1,
+    SpecCheckRequestV1, SpecConformanceAnswerV1, SpecConformanceRead, SpecDetectionV1,
+    SpecDiscrepancyActionV1, SpecEpisodeTransitionV1, SpecRowWriteV1, SpecSummaryV1, SpecVerdictV1,
+    activate_spec_statement, append_episode_lifecycle, build_spec_envelope, database_now,
     draft_spec_statement, normative_repository, repository_selector, repository_subject,
-    require_spec_statement, spec_predicate, spec_repository as runtime_spec_repository,
-    spec_span_digest, start_spec_conformance,
+    require_spec_statement, run_spec_check, spec_predicate,
+    spec_repository as runtime_spec_repository, spec_span_digest, start_spec_conformance,
 };
 use ostk_fleet_recall::store::cockroach::{
     CockroachStore, DatabaseCapabilities, SPEC_CONFORMANCE_SCHEMA_VERSION, probe_spec_conformance,
 };
+use ostk_fleet_recall::worker::{MemoryWorker, WorkerDeps, WorkerSourcesV1, parse_steps};
 use ostk_fleet_recall::{CockroachMemoryService, FleetError, FleetScope, TrustedControlScope};
 use ostk_recall_core::{ChunkEmbedder, PrivacyTier};
 use serde_json::{Map, json};
@@ -1536,10 +1550,19 @@ async fn recall(
     scope: &FleetScope,
     action: RecallAction,
 ) -> Result<RecallResult, ServiceError> {
+    recall_with(service, scope, action, Map::new()).await
+}
+
+async fn recall_with(
+    service: &CockroachMemoryService,
+    scope: &FleetScope,
+    action: RecallAction,
+    arguments: Map<String, serde_json::Value>,
+) -> Result<RecallResult, ServiceError> {
     FleetMemoryService::recall(
         service,
         scope.clone(),
-        RecallRequest::new(action, Map::new()),
+        RecallRequest::new(action, arguments),
     )
     .await
 }
@@ -1646,4 +1669,326 @@ async fn live_the_probe_serves_discrepancies_only_with_select_grants_when_config
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+// --- ostk-spec check and ostk-spec episode resolve|dismiss ---
+
+/// The service source once `Forget` is removed.
+const FIXED_SERVICE_SOURCE: &[u8] = b"pub enum RememberAction {\n    Record,\n}\n";
+/// The memory worker's git source over the spec repository.
+const SPEC_GIT_SOURCE: &str = "connector.git.spec";
+/// The operator who closes episodes; implicated in none.
+const OPERATOR: &str = "principal.on_call";
+
+/// A scratch repository whose main declares `Forget` at its first commit
+/// (C0) and no longer at its second (C1); both carry the spec document.
+/// Returns both ids.
+fn spec_repository_fixing_forget() -> (ScratchRepository, String, String) {
+    let repository = ScratchRepository::empty();
+    let c0 = repository.commit_files(
+        None,
+        &[
+            (SPEC_PATH, SPEC_DOCUMENT),
+            ("src/service.rs", SERVICE_SOURCE),
+        ],
+        "specify the remember actions",
+        FIRST_COMMIT_DATE,
+    );
+    let c1 = repository.commit_files(
+        Some(&c0),
+        &[
+            (SPEC_PATH, SPEC_DOCUMENT),
+            ("src/service.rs", FIXED_SERVICE_SOURCE),
+        ],
+        "drop the forget action",
+        SECOND_COMMIT_DATE,
+    );
+    (repository, c0, c1)
+}
+
+/// The memory worker's sources file over `repository`, as an operator writes
+/// it for `ostk-spec check`: a git source naming the spec repository's
+/// provider id, and the observer identity observer runs are appended under.
+fn spec_sources(repository: &ScratchRepository) -> WorkerSourcesV1 {
+    let sources = json!({
+        "schema_version": 1,
+        "coverage_since": "2025-01-01T00:00:00Z",
+        "git": [{
+            "connector_principal": "connector.git",
+            "connector_instance": SPEC_GIT_SOURCE,
+            "installation_id": INSTALLATION_ID,
+            "repository_id": SPEC_REPOSITORY_ID,
+            "git_dir": repository.path(),
+            "ref_name": "refs/heads/main",
+            "provider_repository_id": PROVIDER_REPOSITORY_ID
+        }],
+        "observer": {
+            "connector_principal": "connector.observer",
+            "connector_instance": "connector.observer.spec"
+        }
+    });
+    WorkerSourcesV1::from_json_slice(&serde_json::to_vec(&sources).unwrap())
+        .expect("the spec sources file is valid")
+}
+
+/// One memory-worker tick of the ingest step over `sources`, as `pool`: the
+/// git source gets the coverage receipt a check binds.
+async fn cover_git(installed: &InstalledAuthority, pool: &PgPool, sources: &WorkerSourcesV1) {
+    let worker = MemoryWorker::new(
+        WorkerDeps {
+            pool: pool.clone(),
+            scope: installed.scope.clone(),
+            authority: Some(installed.runtime(pool).await),
+            sources: sources.clone(),
+            embedding: None,
+            ci_providers: Arc::new(RecordedCi),
+            retry: retry_policy(),
+        },
+        parse_steps("ingest").unwrap(),
+        Some(installed.kek()),
+        None,
+    )
+    .expect("the ingest step has its inputs");
+    let tick = worker.run_tick().await;
+    assert!(!tick.failed(), "{tick:#?}");
+}
+
+/// Draft "`Forget` must be absent" citing the spec at `commit`, sign it with
+/// both approvers, and activate it, taking effect 60 seconds from the
+/// database's time. Returns the proposal and the instant it takes effect.
+async fn activate_no_forget(
+    runtime: &WriterAuthorityRuntime,
+    repository: &ScratchRepository,
+    commit: &str,
+) -> (NormativeBindingProposalV2, DateTime<Utc>) {
+    let now = database_now(runtime.pool()).await.unwrap();
+    let effective_from = now + TimeDelta::seconds(60);
+    let request = draft_request(repository, commit, instant(effective_from));
+    let (proposal, expectation) = draft_spec_statement(runtime, &request).await.unwrap();
+    let activated = activate_signed(runtime, &proposal, &expectation, &instant(now))
+        .await
+        .unwrap();
+    assert!(activated.is_live(), "{activated:?}");
+    (proposal, effective_from)
+}
+
+/// A check of `commit` against the no-`Forget` family, selecting the
+/// statement in force at `evaluated_through`.
+fn check_request(
+    sources: &WorkerSourcesV1,
+    commit: &str,
+    evaluated_through: &CanonicalTimestamp,
+) -> SpecCheckRequestV1 {
+    SpecCheckRequestV1 {
+        binding_family_id: id(SPEC_FAMILY),
+        sources: sources.clone(),
+        git_source: id(SPEC_GIT_SOURCE),
+        commit: GitObjectId::parse_hex(commit).unwrap(),
+        member_bound: 64,
+        evaluated_through: Some(evaluated_through.clone()),
+    }
+}
+
+/// Check one commit, as `ostk-spec check` does.
+async fn check(
+    runtime: &WriterAuthorityRuntime,
+    kek: &ContentKeyEncryptionKey,
+    request: &SpecCheckRequestV1,
+) -> SpecCheckOutcomeV1 {
+    Box::pin(run_spec_check(runtime, kek, request))
+        .await
+        .expect("the check runs")
+}
+
+/// The episode ids `recall(discrepancies)` answers with `arguments`.
+async fn recalled_episodes(
+    service: &CockroachMemoryService,
+    scope: &FleetScope,
+    arguments: &serde_json::Value,
+) -> Vec<DiscrepancyEpisodeFingerprintV1> {
+    let answer = recall_with(
+        service,
+        scope,
+        RecallAction::Discrepancies,
+        arguments.as_object().unwrap().clone(),
+    )
+    .await
+    .unwrap();
+    answer.data["discrepancies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|episode| serde_json::from_value(episode["episode_id"].clone()).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one episode's life, from opening to a replayed check
+async fn live_an_operator_can_close_an_episode_and_recall_hides_it_by_default_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let owner = common::migrated_pool(&database_url).await;
+    let installed = install_generation_two(&owner, "spec-episode").await;
+    let (repository, c0, c1) = spec_repository_fixing_forget();
+    let sources = spec_sources(&repository);
+    let (installed, repository, sources, owner_pool) = (&installed, &repository, &sources, &owner);
+    Box::pin(as_runtime_role(&owner, &database_url, |pool| async move {
+        let runtime = installed.runtime(&pool).await;
+        let kek = installed.kek();
+        let scope = &installed.scope;
+        cover_git(installed, &pool, sources).await;
+        let (proposal, effective_from) = activate_no_forget(&runtime, repository, &c0).await;
+        let statement_id = proposal.statement_id().unwrap();
+        let through = instant(effective_from + TimeDelta::seconds(1));
+        let operator = id(OPERATOR);
+        let resolve = SpecEpisodeTransitionV1::Resolve {
+            evidence: Vec::new(),
+        };
+
+        // C0 declares Forget: a verified nonconformance opens an episode.
+        let opened = check(&runtime, &kek, &check_request(sources, &c0, &through)).await;
+        let SpecDiscrepancyActionV1::Opened { episode } = opened.discrepancy else {
+            panic!("C0 must open an episode: {opened:?}");
+        };
+
+        // Nothing shows a fix yet: the latest check is the nonconformance
+        // itself, so a resolution has no evidence to cite by default.
+        assert_refused(
+            append_episode_lifecycle(&runtime, episode, &operator, &resolve).await,
+            "a resolution citing the standing nonconformance",
+        );
+
+        // C1 no longer declares Forget. The observer cannot verify an
+        // absence, so the check is unknown and the episode stands.
+        let fixed = check(&runtime, &kek, &check_request(sources, &c1, &through)).await;
+        assert_eq!(fixed.verdict, SpecVerdictV1::Unknown);
+        assert_eq!(fixed.discrepancy, SpecDiscrepancyActionV1::NotOpened);
+        let fix_evidence = fixed.observer_event.expect("C1 was observed");
+
+        let served = serve_with(
+            owner_pool,
+            scope,
+            Some(spec_reader(owner_pool, scope).await),
+        );
+        let by_default = json!({});
+        let with_resolved = json!({"include_resolved": true});
+        assert_eq!(
+            recalled_episodes(&served, scope, &by_default).await,
+            [episode]
+        );
+
+        // A dismissal needs a rationale; a refused one appends nothing.
+        for blank in ["", " \n\t"] {
+            assert_refused(
+                append_episode_lifecycle(
+                    &runtime,
+                    episode,
+                    &operator,
+                    &SpecEpisodeTransitionV1::Dismiss {
+                        reason: DismissalReasonKindV1::FalsePositive,
+                        rationale: blank.into(),
+                    },
+                )
+                .await,
+                "a dismissal without a rationale",
+            );
+        }
+        let looked_up = recall_with(
+            &served,
+            scope,
+            RecallAction::Discrepancies,
+            json!({"id": episode}).as_object().unwrap().clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(looked_up.data["discrepancies"][0]["history"], json!([]));
+        assert_eq!(
+            looked_up.data["discrepancies"][0]["lifecycle_state"],
+            "open"
+        );
+
+        // The operator resolves it. By default the resolution cites the
+        // observer event of the later check, the one of the fixing commit.
+        let resolved = append_episode_lifecycle(&runtime, episode, &operator, &resolve)
+            .await
+            .unwrap();
+        assert_eq!(resolved.episode_id, episode);
+        assert_eq!(resolved.statement_id, statement_id);
+        assert_eq!(
+            (resolved.previous_state, resolved.lifecycle_state),
+            (LifecycleState::Open, LifecycleState::Resolved)
+        );
+        assert!(
+            matches!(
+                &resolved.transition,
+                LifecycleTransitionV1::Resolve { actor, resolution_evidence_ids }
+                    if actor.principal_id == operator
+                        && resolution_evidence_ids == &[fix_evidence]
+            ),
+            "{resolved:?}"
+        );
+
+        // recall hides the closed episode by default and lists it, resolved,
+        // with include_resolved; by id, its history shows who closed it and
+        // on what evidence.
+        assert!(
+            recalled_episodes(&served, scope, &by_default)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            recalled_episodes(&served, scope, &with_resolved).await,
+            [episode]
+        );
+        let looked_up = recall_with(
+            &served,
+            scope,
+            RecallAction::Discrepancies,
+            json!({"id": episode}).as_object().unwrap().clone(),
+        )
+        .await
+        .unwrap();
+        let closed = &looked_up.data["discrepancies"][0];
+        assert_eq!(closed["lifecycle_state"], "resolved");
+        let transition = &closed["history"][0]["lifecycle_transition"];
+        assert_eq!(transition["transition"], "resolve");
+        assert_eq!(transition["actor"]["principal_id"], OPERATOR);
+        assert_eq!(transition["resolution_evidence_ids"], json!([fix_evidence]));
+        assert!(closed["history"].get(1).is_none(), "{closed}");
+
+        // Re-checking C0 replays its check into the closed episode as
+        // already judged: the family opens nothing new.
+        let rechecked = check(&runtime, &kek, &check_request(sources, &c0, &through)).await;
+        assert_eq!(rechecked.verdict, SpecVerdictV1::Nonconforming);
+        assert_eq!(
+            rechecked.discrepancy,
+            SpecDiscrepancyActionV1::AlreadyJudged { episode }
+        );
+        assert_eq!(rechecked.check_id, opened.check_id);
+        assert!(
+            recalled_episodes(&served, scope, &by_default)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            recalled_episodes(&served, scope, &with_resolved).await,
+            [episode]
+        );
+
+        // An episode this project does not have cannot be closed.
+        assert_refused(
+            append_episode_lifecycle(
+                &runtime,
+                DiscrepancyEpisodeFingerprintV1::from_digest(label("no such episode")),
+                &operator,
+                &SpecEpisodeTransitionV1::Resolve {
+                    evidence: vec![fix_evidence],
+                },
+            )
+            .await,
+            "an unknown episode",
+        );
+    }))
+    .await;
 }

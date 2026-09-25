@@ -32,10 +32,23 @@
 //! an answer, not a failure. Run it after the worker's git step has covered
 //! the commit.
 //!
+//! No check ever closes an episode: under the observer's positive-only
+//! admission a fixing commit checks as `unknown`. An operator closes one with
+//! `ostk-spec episode resolve --episode HEX --actor ID [--evidence HEX...]`,
+//! which cites the given accepted events, or by default the observer event of
+//! the latest check of the violated statement (refused when that check is
+//! itself nonconforming, or there is none), or with
+//! `ostk-spec episode dismiss --episode HEX --actor ID --reason REASON
+//! --rationale TEXT`. Either appends one lifecycle event to the episode's
+//! log, effective at the database's time, and prints the episode's state
+//! before and after. `recall(action="discrepancies")` then lists the episode
+//! only with `include_resolved`, and re-checking a commit already judged
+//! nonconforming never re-opens it.
+//!
 //! See `ostk_fleet_recall::spec_conformance` for what each step checks.
 //!
-//! Environment for `draft`, `activate`, and `check` (nothing else, and no CLI
-//! authority override):
+//! Environment for `draft`, `activate`, `check`, and `episode` (nothing else,
+//! and no CLI authority override):
 //!
 //! - `FLEET_RECALL_DATABASE_URL` as the private writer login (`fleet_writer`,
 //!   a member of `fleet_runtime`), with the
@@ -67,7 +80,10 @@ use ostk_fleet_recall::evidence_ledger::{CONTENT_KEY_ENCRYPTION_KEY_ENV, content
 use ostk_fleet_recall::memory_contracts::canonical::{decode_typed_canonical, encode_canonical};
 use ostk_fleet_recall::memory_contracts::common::{CanonicalTimestamp, ContractId};
 use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
-use ostk_fleet_recall::memory_contracts::discrepancy::DiscrepancySeverityV1;
+use ostk_fleet_recall::memory_contracts::discrepancy::{
+    DiscrepancyEpisodeFingerprintV1, DiscrepancySeverityV1, DismissalReasonKindV1,
+};
+use ostk_fleet_recall::memory_contracts::evidence::AcceptedEventId;
 use ostk_fleet_recall::memory_contracts::normative_v2::{
     ApprovalAttestationV1, NormativeBindingProposalV2,
 };
@@ -75,8 +91,9 @@ use ostk_fleet_recall::normative_runtime::{normative_approval_message, sign_norm
 use ostk_fleet_recall::registry_witness::WriterAuthorityRuntime;
 use ostk_fleet_recall::spec_conformance::{
     DEFAULT_SPEC_MEMBER_BOUND, DraftStatementRequestV1, ExpectedMembershipV1,
-    RememberActionExpectationV1, SpecCheckRequestV1, activate_spec_statement, database_now,
-    draft_spec_statement, run_spec_check,
+    RememberActionExpectationV1, SpecCheckRequestV1, SpecEpisodeTransitionV1,
+    activate_spec_statement, append_episode_lifecycle, database_now, draft_spec_statement,
+    run_spec_check,
 };
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig, RetryPolicy};
 use ostk_fleet_recall::worker::WorkerSourcesV1;
@@ -98,7 +115,7 @@ const EXPECTATION_FILE: &str = "expectation.jsonl";
 #[command(
     name = "ostk-spec",
     version,
-    about = "Private, workstation-only spec statement CLI: draft, approve, activate, check"
+    about = "Private, workstation-only spec statement CLI: draft, approve, activate, check, episode"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -116,6 +133,17 @@ enum Command {
     Activate(ActivateArgs),
     /// Check one commit against the statement in force in a binding family.
     Check(CheckArgs),
+    /// Close a spec nonconformance episode as an operator.
+    #[command(subcommand)]
+    Episode(EpisodeCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum EpisodeCommand {
+    /// Resolve an episode: the nonconformance is fixed.
+    Resolve(ResolveArgs),
+    /// Dismiss an episode: it should not stand.
+    Dismiss(DismissArgs),
 }
 
 #[derive(Debug, Args)]
@@ -248,6 +276,58 @@ struct CheckArgs {
     member_bound: usize,
 }
 
+#[derive(Debug, Args)]
+struct ResolveArgs {
+    /// The episode (64 hex), as `recall(action="discrepancies")` lists it.
+    #[arg(long, value_parser = parse_episode)]
+    episode: DiscrepancyEpisodeFingerprintV1,
+    /// The principal resolving it. May not be implicated in the finding.
+    #[arg(long, value_parser = parse_contract_id)]
+    actor: ContractId,
+    /// An accepted event (64 hex) that shows the fix. Repeat for several.
+    /// Defaults to the observer event of the latest check of the statement
+    /// the episode violates, which must not be nonconforming.
+    #[arg(long = "evidence", value_parser = parse_event)]
+    evidence: Vec<AcceptedEventId>,
+}
+
+#[derive(Debug, Args)]
+struct DismissArgs {
+    /// The episode (64 hex), as `recall(action="discrepancies")` lists it.
+    #[arg(long, value_parser = parse_episode)]
+    episode: DiscrepancyEpisodeFingerprintV1,
+    /// The principal dismissing it. May not be implicated in the finding.
+    #[arg(long, value_parser = parse_contract_id)]
+    actor: ContractId,
+    /// Why the episode should not stand.
+    #[arg(long, value_enum)]
+    reason: DismissReason,
+    /// The justification, recorded in the episode's history. Must not be
+    /// blank.
+    #[arg(long)]
+    rationale: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum DismissReason {
+    FalsePositive,
+    DuplicateOfOtherEpisode,
+    OutOfScope,
+    NotReproducible,
+}
+
+impl From<DismissReason> for DismissalReasonKindV1 {
+    fn from(value: DismissReason) -> Self {
+        match value {
+            DismissReason::FalsePositive => Self::FalsePositive,
+            DismissReason::DuplicateOfOtherEpisode => Self::DuplicateOfOtherEpisode,
+            DismissReason::OutOfScope => Self::OutOfScope,
+            DismissReason::NotReproducible => Self::NotReproducible,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Expected {
     Present,
@@ -315,6 +395,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         Command::Approve(args) => approve(&args).map(|()| ExitCode::SUCCESS),
         Command::Activate(args) => activate(args).await,
         Command::Check(args) => check(args).await.map(|()| ExitCode::SUCCESS),
+        Command::Episode(command) => episode(command).await.map(|()| ExitCode::SUCCESS),
     }
 }
 
@@ -426,6 +507,29 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
     print_json(&outcome)
 }
 
+async fn episode(command: EpisodeCommand) -> anyhow::Result<()> {
+    let (episode, actor, transition) = match command {
+        EpisodeCommand::Resolve(args) => (
+            args.episode,
+            args.actor,
+            SpecEpisodeTransitionV1::Resolve {
+                evidence: args.evidence,
+            },
+        ),
+        EpisodeCommand::Dismiss(args) => (
+            args.episode,
+            args.actor,
+            SpecEpisodeTransitionV1::Dismiss {
+                reason: args.reason.into(),
+                rationale: args.rationale,
+            },
+        ),
+    };
+    let runtime = connect_runtime().await?;
+    let report = append_episode_lifecycle(&runtime, episode, &actor, &transition).await?;
+    print_json(&report)
+}
+
 /// Connect as the writer login and verify the pinned head once.
 async fn connect_runtime() -> anyhow::Result<WriterAuthorityRuntime> {
     let process = WriterProcessConfig::from_env(APPLICATION_NAME)?;
@@ -506,6 +610,14 @@ fn parse_digest(value: &str) -> Result<Sha256Digest, String> {
     Sha256Digest::from_str(value).map_err(|error| error.to_string())
 }
 
+fn parse_episode(value: &str) -> Result<DiscrepancyEpisodeFingerprintV1, String> {
+    parse_digest(value).map(DiscrepancyEpisodeFingerprintV1::from_digest)
+}
+
+fn parse_event(value: &str) -> Result<AcceptedEventId, String> {
+    parse_digest(value).map(AcceptedEventId::from_digest)
+}
+
 fn parse_timestamp(value: &str) -> Result<CanonicalTimestamp, String> {
     let parsed = DateTime::parse_from_rfc3339(value).map_err(|error| error.to_string())?;
     CanonicalTimestamp::from_datetime(&parsed.with_timezone(&Utc))
@@ -552,5 +664,68 @@ mod tests {
         assert_eq!(parse_seed(&[0x02; 32]).unwrap(), [0x02; 32]);
         assert!(parse_seed(b"0101").is_err());
         assert!(parse_seed(&[0x02; 31]).is_err());
+    }
+
+    #[test]
+    fn an_episode_is_resolved_with_evidence_or_dismissed_with_a_rationale() {
+        let episode = "ab".repeat(32);
+        let evidence = ["01".repeat(32), "02".repeat(32)];
+        let episode_args = |subcommand: &'static str, extra: &[&str]| {
+            let mut args = vec![
+                "ostk-spec",
+                "episode",
+                subcommand,
+                "--episode",
+                &episode,
+                "--actor",
+                "principal.on_call",
+            ];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args).map(|cli| cli.command)
+        };
+
+        let Ok(Command::Episode(EpisodeCommand::Resolve(defaulted))) = episode_args("resolve", &[])
+        else {
+            panic!("a resolve command");
+        };
+        assert!(defaulted.evidence.is_empty());
+        let Ok(Command::Episode(EpisodeCommand::Resolve(cited))) = episode_args(
+            "resolve",
+            &["--evidence", &evidence[0], "--evidence", &evidence[1]],
+        ) else {
+            panic!("a resolve command");
+        };
+        assert_eq!(
+            cited.evidence,
+            evidence
+                .iter()
+                .map(|hex| parse_event(hex).unwrap())
+                .collect::<Vec<_>>()
+        );
+        assert!(episode_args("resolve", &["--evidence", "not-hex"]).is_err());
+
+        let Ok(Command::Episode(EpisodeCommand::Dismiss(dismissed))) = episode_args(
+            "dismiss",
+            &[
+                "--reason",
+                "duplicate_of_other_episode",
+                "--rationale",
+                "the same finding as another episode",
+            ],
+        ) else {
+            panic!("a dismiss command");
+        };
+        assert_eq!(
+            DismissalReasonKindV1::from(dismissed.reason),
+            DismissalReasonKindV1::DuplicateOfOtherEpisode
+        );
+        assert!(
+            episode_args("dismiss", &["--reason", "false_positive"]).is_err(),
+            "a dismissal without a rationale"
+        );
+        assert!(
+            episode_args("dismiss", &["--reason", "wont_fix", "--rationale", "later"]).is_err(),
+            "a reason outside the contract's taxonomy"
+        );
     }
 }
