@@ -30,26 +30,56 @@ Migrations 19 through 28 add private-plane tables for the dynamic-memory
 runtimes: the content-addressed body projection, the coverage runtime, the
 recall projection and its per-row visibility class, transcript and CI
 connector state, normative activation, the discrepancy ledger, and the
-bootstrap-manifest import rows. Version 25 is a deliberate, permanent gap. No
-serving path reads these tables yet. The runtime role policy nonetheless
-grants `fleet_runtime` the tables of migrations 19 through 24, 26, and 27, as
-it does those of 29 through 31; it grants nothing on migration 23's
-publication views or migration 28's import rows (see
+bootstrap-manifest import rows. Version 25 is a deliberate, permanent gap.
+Migrations 29 through 31 add the conflict lifecycle log, the worker source
+status, and spec conformance (described below and under
 [Privilege separation](#privilege-separation)).
 
-Migration 29 is the exception: it adds `memory_conflict_lifecycle_events_v1`,
-the append-only per-conflict lifecycle log the serving writer reads and appends
-([ADR 0004](adr/0004-serving-conflict-lifecycle.md)). It carries no foreign key,
-so bulk deletes of `memory_conflicts` are unaffected, and it changes no
-existing table. Serving does not require it: `MINIMUM_RECALL_SCHEMA_VERSION`
-stays 18, and the writer serves `acknowledge`, concession `resolve`, and the
-lifecycle overlay only when a startup probe finds version 29 and the runtime
-grants on the table. Roll it out as: deploy the new binary (the probe finds
-nothing and the claim lifecycle alone is served), `migrate`, drain
-`fleet_writer` and re-apply the runtime policy, then restart `serve` so the
-probe sees the grants. A migrate binary older than version 29 then refuses
-the database with `VersionMissing(29)`, so a rollback runs the old `serve`
-binary only.
+Each private runtime uses its own part of these tables:
+
+- The memory worker writes the tables of migrations 19 through 22, 26, and
+  30, and migration 23's body-visibility table.
+- `ostk-spec` writes the tables of migrations 24, 27, and 31.
+- `serve` reads the tables of migrations 19 through 22 and 30 (with the
+  visibility class migration 23 adds to the recall tiers) for
+  `recall(kind=evidence)`, and those of migrations 24, 27, and 31 for
+  `recall(action="discrepancies")`. The `evidence` and `spec_conformance`
+  blocks of `recall(status)` read the same tables. `serve` writes none of
+  them. Of the tables from migration 19 onward, it writes only migration 29's
+  lifecycle log.
+- Only the private import CLI writes migration 28's rows. No served path
+  reads them or migration 23's publication views.
+
+The runtime role policy grants `fleet_runtime` the tables of migrations 19
+through 24, 26, and 27, as it does those of 29 through 31. It grants nothing
+on migration 23's publication views or migration 28's import rows.
+
+Serving requires none of these migrations: `MINIMUM_RECALL_SCHEMA_VERSION`
+stays 18. `serve` serves each surface built on them only when its startup
+probe finds the schema version and the runtime grants on every table the
+surface reads. Migration 29 gates the conflict lifecycle, 30 gates
+`recall(kind=evidence)`, and 31 gates `recall(action="discrepancies")`. A
+surface whose probe fails is left out of `tools/list`, and `serve` logs why;
+every other surface is unchanged. The probes run only at startup, so
+roll each of these migrations out the same way:
+
+1. Deploy the new binary. The probe finds nothing and the surface is not
+   served.
+2. Run `migrate`.
+3. Drain `fleet_writer` and re-apply the runtime policy.
+4. Restart `serve` so the probe sees the grants.
+
+An older `migrate` binary refuses the database with `VersionMissing` for the
+first applied version it does not embed (`VersionMissing(29)` for one built
+before migration 29), so a rollback runs the older `serve` binary only.
+
+Migration 29 adds `memory_conflict_lifecycle_events_v1`, the append-only
+per-conflict lifecycle log that the serving writer reads and appends
+([ADR 0004](adr/0004-serving-conflict-lifecycle.md)). It carries no foreign
+key, so bulk deletes of `memory_conflicts` are unaffected, and it changes no
+existing table. Without it, or without the runtime grants on it, the writer
+serves the claim lifecycle alone: no `acknowledge`, concession `resolve`, or
+lifecycle overlay.
 
 ## Transaction policy: versions 1–11, 12–14, and 15 onward
 
