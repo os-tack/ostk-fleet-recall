@@ -19,6 +19,17 @@
 //! * [`cockroach`] — [`CockroachSpecRepository`], the insert-only store over
 //!   migration 0031's `memory_normative_statements_v1` and
 //!   `memory_spec_checks_v1`, which re-verifies every row it reads.
+//! * [`draft`] — [`draft_statement`], which builds a normative proposal and
+//!   its expectation from a fresh witness and a local git reader: the spec
+//!   document bound at an exact commit, its cited byte spans digested, the
+//!   repository subject derived through the active package's recipe, and the
+//!   registry head exactly the witnessed one.
+//! * [`activation`] — [`activate_spec_statement`], the only path from a draft
+//!   to a normative statement: exact witnessed head, a genesis-checkable
+//!   expectation, approvals verified under the ACTIVE policy with a receipt
+//!   minted at server time, then the statement row and the normative
+//!   compare-and-set. `ostk-spec draft|approve|activate` is a thin shell over
+//!   these two and [`crate::normative_runtime::sign_normative_approval`].
 //!
 //! Nothing here grants authority. A statement is normative only once the
 //! normative runtime has activated it under verified approvals; recording its
@@ -26,17 +37,29 @@
 //! statement means, and a stored row that no longer derives its own identity
 //! is refused rather than re-interpreted.
 
+pub mod activation;
 pub mod cockroach;
+pub mod draft;
 pub mod expectation;
 pub mod record;
 
 #[cfg(test)]
 pub(crate) mod testkit;
 
+pub use activation::{
+    SpecActivationOutcomeV1, SpecActivationV1, activate_spec_statement, database_now,
+    normative_repository, require_spec_statement, spec_repository,
+};
 pub use cockroach::{
     CockroachSpecRepository, MAX_CANONICAL_PROPOSAL_BYTES, MAX_CANONICAL_SPEC_RECORD_BYTES,
     MAX_LATEST_CHECK_STATEMENTS, RecordedSpecStatementV1, SpecCheckWriteV1, SpecRowWriteV1,
     SpecStatementWriteV1, StoredSpecCheckV1,
+};
+pub use draft::{
+    DraftStatementRequestV1, MAX_SPEC_DOCUMENT_BYTES, REPOSITORY_IDENTITY_RECIPE_ID,
+    REPOSITORY_LOCATOR_KEY, SPEC_OBSERVER_ID, SPEC_OBSERVER_VERSION, draft_spec_statement,
+    draft_statement, repository_subject, select_spans, spec_applicability_evaluator,
+    spec_parser_artifact_id, spec_predicate, spec_span_digest,
 };
 pub use expectation::{
     ExpectedMembershipV1, MAX_RUST_IDENTIFIER_BYTES, MAX_SOURCE_PATH_BYTES,

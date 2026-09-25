@@ -247,7 +247,7 @@ pub(crate) fn is_plain_rust_identifier(value: &str) -> bool {
 /// A git tree path: `/`-separated, relative, with no empty, `.` or `..`
 /// segment, no control character or backslash, and no leading `-` that a git
 /// command line could read as an option.
-fn is_normalized_relative_path(value: &str) -> bool {
+pub(crate) fn is_normalized_relative_path(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_SOURCE_PATH_BYTES
         && !value.starts_with('-')

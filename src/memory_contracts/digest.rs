@@ -411,6 +411,10 @@ pub enum DigestDomain {
     /// Stage 6. Content identity of one spec conformance check record, so a
     /// replayed check appends nothing new.
     SpecCheckRecordV1,
+    /// Stage 6. Identity of the parser artifact a drafted spec statement
+    /// names: the `ostk-spec draft` expectation parser at one expectation
+    /// schema version, never a build or host.
+    SpecDraftParserArtifactV1,
 }
 
 impl DigestDomain {
@@ -581,6 +585,7 @@ impl DigestDomain {
             Self::NormativeSourceSpanBytesV1 => "ostk-normative-source-span-bytes-v1",
             Self::SpecMembershipValueV1 => "ostk-spec-membership-value-v1",
             Self::SpecCheckRecordV1 => "ostk-spec-check-record-v1",
+            Self::SpecDraftParserArtifactV1 => "ostk-spec-draft-parser-artifact-v1",
         }
     }
 }

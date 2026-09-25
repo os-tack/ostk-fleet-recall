@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 use ring::signature;
 
 use crate::memory_contracts::canonical::encode_canonical;
-use crate::memory_contracts::common::{CanonicalTimestamp, ContractId};
+use crate::memory_contracts::common::{CanonicalTimestamp, ContractId, HexBytes};
 use crate::memory_contracts::digest::{DigestDomain, Sha256Digest, domain_separated_digest};
 use crate::memory_contracts::normative_v2::{
     ApprovalAttestationV1, NormativeActivationReceiptV2, NormativeActivationSeparationOfDutyV2,
@@ -59,6 +59,58 @@ pub fn normative_approval_message(statement_id: Sha256Digest) -> Vec<u8> {
     message.extend_from_slice(NORMATIVE_APPROVAL_SIGNATURE_PREFIX);
     message.extend_from_slice(statement_id.as_bytes());
     message
+}
+
+/// `schema_version` of the approval attestation wire shape (unchanged from
+/// normative binding v1).
+const APPROVAL_ATTESTATION_SCHEMA_VERSION: u32 = 1;
+
+/// The only signature algorithm an approval attestation names.
+const ED25519_ALGORITHM: &str = "ed25519";
+
+/// Sign one normative statement as `principal_id` with the Ed25519 key whose
+/// 32-byte seed is `seed`, at `signed_at`.
+///
+/// This is the offline half of [`verify_normative_approvals`]: the message is
+/// [`normative_approval_message`] and the `signer_key_id` is derived from the
+/// public key exactly as an activation policy derives it
+/// (`ed25519.<public key hex>`). Signing proves nothing on its own; the
+/// approval counts only if the ACTIVE policy lists `principal_id` with this
+/// key when the statement is activated.
+///
+/// # Errors
+///
+/// A schema error when the proposal is invalid or the seed is not an Ed25519
+/// key.
+pub fn sign_normative_approval(
+    proposal: &NormativeBindingProposalV2,
+    principal_id: ContractId,
+    seed: &[u8; 32],
+    signed_at: CanonicalTimestamp,
+) -> ContractResult<ApprovalAttestationV1> {
+    let statement_id = proposal.statement_id()?;
+    let key_pair = signature::Ed25519KeyPair::from_seed_unchecked(seed)
+        .map_err(|_| ContractError::Schema("the approval seed is not an Ed25519 key".into()))?;
+    let signer_key_id = ContractId::new(format!(
+        "ed25519.{}",
+        hex::encode(signature::KeyPair::public_key(&key_pair).as_ref())
+    ))?;
+    let attestation = ApprovalAttestationV1 {
+        schema_version: APPROVAL_ATTESTATION_SCHEMA_VERSION,
+        statement_id,
+        principal_id,
+        signer_key_id,
+        signed_at,
+        signature_algorithm: ContractId::new(ED25519_ALGORITHM)?,
+        signature_hex: HexBytes::new(
+            key_pair
+                .sign(&normative_approval_message(statement_id))
+                .as_ref()
+                .to_vec(),
+        )?,
+    };
+    attestation.validate_shape()?;
+    Ok(attestation)
 }
 
 /// Content identity of one approval attestation, signature included. It is

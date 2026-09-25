@@ -92,6 +92,7 @@ jobs:
             test ! -e /usr/local/bin/ostk-conflict-reconcile &&
             test ! -e /usr/local/bin/ostk-bootstrap-manifest-import &&
             test ! -e /usr/local/bin/ostk-authority-install &&
+            test ! -e /usr/local/bin/ostk-spec &&
             test -x /usr/bin/curl &&
             test -r /opt/ostk/demo/demo.ndjson &&
             test -r /usr/share/licenses/s5cmd/s5cmd-LICENSE &&

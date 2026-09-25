@@ -143,6 +143,16 @@ of the serving one.
   it reads `FLEET_RECALL_DATABASE_URL` as the schema owner/migrator login,
   the same convention as `migrate`. Its fixture-key signatures are nominal; see
   [writer-authority installer](docs/CONTROL_BOOTSTRAP.md#writer-authority-installer).
+- `ostk-spec` makes a spec statement normative (Stage 6): `draft` binds exact
+  byte spans of a spec document at one commit to a typed expectation (an enum
+  in a Rust source file must or must not declare a member) under the active
+  registry head; `approve` signs the draft offline with one approver's
+  Ed25519 seed; `activate` verifies the approvals under the active activation
+  policy, with `accepted_at` taken from the database clock, and
+  compare-and-sets the statement into its binding family. `draft` and
+  `activate` run as `fleet_writer` (`FLEET_RECALL_DATABASE_URL`) with the
+  writer-authority pins `ostk-authority-install apply` prints; `approve` reads
+  no environment.
 
 The grants and gates these tools rely on are described in
 [migration operations](docs/MIGRATIONS.md) and

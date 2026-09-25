@@ -4,6 +4,8 @@
 //! real `MemoryWorker` tick can ingest, project, and embed all three
 //! connectors.
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -55,7 +57,8 @@ pub struct ScratchRepository {
 }
 
 impl ScratchRepository {
-    pub fn with_two_commits() -> Self {
+    /// A bare repository with no commits and no refs.
+    pub fn empty() -> Self {
         let directory = tempfile::tempdir().expect("scratch repository directory");
         let status = Command::new("git")
             .args(["init", "--bare", "--quiet"])
@@ -63,7 +66,11 @@ impl ScratchRepository {
             .status()
             .expect("git must be on PATH for the memory worker proof");
         assert!(status.success(), "git init --bare must succeed");
-        let repository = Self { directory };
+        Self { directory }
+    }
+
+    pub fn with_two_commits() -> Self {
+        let repository = Self::empty();
         let first = repository.commit(None, "seed the worker fixture", FIRST_COMMIT_DATE);
         repository.commit(
             Some(&first),
@@ -94,6 +101,53 @@ impl ScratchRepository {
         let commit = self.git(&args, None, Some(date));
         self.git(&["update-ref", "refs/heads/main", &commit], None, None);
         commit
+    }
+
+    /// Commit a tree holding exactly `files` (`/`-separated repository paths
+    /// and their bytes) on top of `parent` at `date`, move main to it, and
+    /// return its id.
+    pub fn commit_files(
+        &self,
+        parent: Option<&str>,
+        files: &[(&str, &[u8])],
+        message: &str,
+        date: &str,
+    ) -> String {
+        let tree = self.write_tree(files);
+        let mut args = vec!["commit-tree", tree.as_str(), "-m", message];
+        if let Some(parent) = parent {
+            args.extend(["-p", parent]);
+        }
+        let commit = self.git(&args, None, Some(date));
+        self.git(&["update-ref", "refs/heads/main", &commit], None, None);
+        commit
+    }
+
+    /// Write the tree object holding exactly `files`, one subtree per
+    /// directory, and return its id.
+    fn write_tree(&self, files: &[(&str, &[u8])]) -> String {
+        let mut blobs = BTreeMap::new();
+        let mut directories: BTreeMap<&str, Vec<(&str, &[u8])>> = BTreeMap::new();
+        for (path, bytes) in files {
+            if let Some((directory, rest)) = path.split_once('/') {
+                directories
+                    .entry(directory)
+                    .or_default()
+                    .push((rest, bytes));
+            } else {
+                let blob = self.git(&["hash-object", "-w", "--stdin"], Some(bytes), None);
+                blobs.insert(*path, blob);
+            }
+        }
+        let mut listing = String::new();
+        for (name, blob) in &blobs {
+            writeln!(listing, "100644 blob {blob}\t{name}").expect("writing to a String");
+        }
+        for (name, entries) in &directories {
+            let tree = self.write_tree(entries);
+            writeln!(listing, "040000 tree {tree}\t{name}").expect("writing to a String");
+        }
+        self.git(&["mktree"], Some(listing.as_bytes()), None)
     }
 
     /// The commit `refs/heads/main` names.

@@ -18,17 +18,29 @@
 //! same statement, never see each other's statements or checks. The writes
 //! run under a login holding only the runtime role's grants, which give
 //! these tables `SELECT` and `INSERT` and nothing more.
+//!
+//! It also proves `ostk-spec draft|approve|activate`'s library path over an
+//! installed generation-2 writer authority and a scratch git repository: a
+//! draft cites exactly the spec bytes it selects and names the repository its
+//! provider id derives; a statement signed by the active policy's approvers
+//! activates under the witnessed head, reads back, and activates again as
+//! `already_active` with nothing appended; and a proposal drafted under
+//! another head activates nothing.
 
 mod common;
 
 use std::future::Future;
+use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 
-use common::authority::{retry_policy, semantic_scope};
+use chrono::{DateTime, TimeDelta, Utc};
+use common::authority::{install_generation_two, retry_policy, semantic_scope};
 use common::runtime_role::RuntimeProbeRole;
+use common::worker::{FIRST_COMMIT_DATE, INSTALLATION_ID, SECOND_COMMIT_DATE, ScratchRepository};
 use futures::FutureExt as _;
 use ostk_fleet_recall::connectors::git::GitObjectId;
 use ostk_fleet_recall::discrepancy_runtime::ComparisonIndeterminacyV1;
+use ostk_fleet_recall::memory_contracts::ContractError;
 use ostk_fleet_recall::memory_contracts::canonical::CanonicalValue;
 use ostk_fleet_recall::memory_contracts::common::{
     AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId, HexBytes, RegistryReferenceV1,
@@ -44,12 +56,21 @@ use ostk_fleet_recall::memory_contracts::evidence::AcceptedEventId;
 use ostk_fleet_recall::memory_contracts::evidence_v2::RegistryHeadBindingV1;
 use ostk_fleet_recall::memory_contracts::identity::ResourceUri;
 use ostk_fleet_recall::memory_contracts::normative::{NormativePropositionV1, SourceByteSpanV1};
-use ostk_fleet_recall::memory_contracts::normative_v2::NormativeBindingProposalV2;
+use ostk_fleet_recall::memory_contracts::normative_v2::{
+    ApprovalAttestationV1, NormativeBindingProposalV2,
+};
 use ostk_fleet_recall::memory_contracts::observer::{EvaluatedConditionV1, VerificationOutcomeV1};
 use ostk_fleet_recall::memory_contracts::registry::RegistryHeadV1;
+use ostk_fleet_recall::normative_runtime::{
+    NormativeActivationRepository as _, NormativeResolutionV1, sign_normative_approval,
+};
+use ostk_fleet_recall::registry_witness::WriterAuthorityRuntime;
 use ostk_fleet_recall::spec_conformance::{
-    CockroachSpecRepository, ExpectedMembershipV1, RememberActionExpectationV1, SpecCheckRecordV1,
-    SpecRowWriteV1, SpecVerdictV1, repository_selector,
+    CockroachSpecRepository, DraftStatementRequestV1, ExpectedMembershipV1,
+    RememberActionExpectationV1, SpecActivationOutcomeV1, SpecCheckRecordV1, SpecRowWriteV1,
+    SpecVerdictV1, activate_spec_statement, database_now, draft_spec_statement,
+    normative_repository, repository_selector, repository_subject, require_spec_statement,
+    spec_predicate, spec_repository as runtime_spec_repository, spec_span_digest,
 };
 use ostk_fleet_recall::{FleetError, FleetScope, TrustedControlScope};
 use ostk_recall_core::PrivacyTier;
@@ -611,4 +632,404 @@ async fn live_two_projects_cannot_see_each_others_spec_rows_when_configured() {
             .unwrap()
             .is_none()
     );
+}
+
+// --- ostk-spec draft, approve, activate ---
+
+/// The spec document the scratch repository carries at its first commit.
+const SPEC_DOCUMENT: &[u8] =
+    b"# Remember actions\n\nForget must not be a remember action.\n\nRecord stays.\n";
+/// The sentence every drafted statement cites.
+const SPEC_SENTENCE: &str = "Forget must not be a remember action.";
+/// The same document revised at the second commit: the cited byte range now
+/// selects other bytes.
+const REVISED_SPEC_DOCUMENT: &[u8] =
+    b"# Remember actions\n\nForget may never be a remember action.\n\nRecord stays.\n";
+const SPEC_PATH: &str = "docs/spec.md";
+const SERVICE_SOURCE: &[u8] = b"pub enum RememberAction {\n    Record,\n    Forget,\n}\n";
+const SPEC_REPOSITORY_ID: &str = "git.repo.spec";
+const PROVIDER_REPOSITORY_ID: u64 = 908_172_635;
+const SPEC_FAMILY: &str = "spec.remember.no_forget";
+
+/// The active activation policy's approvers and their public fixture seeds
+/// (D4: nominal keys). Carol authors the spec and Dave proposes it, so
+/// neither may approve.
+const APPROVERS: [(&str, u8); 2] = [("principal.alice", 0x01), ("principal.bob", 0x02)];
+const AUTHOR: &str = "principal.carol";
+const PROPOSER: &str = "principal.dave";
+
+fn id(value: &str) -> ContractId {
+    ContractId::new(value).unwrap()
+}
+
+fn instant(at: DateTime<Utc>) -> CanonicalTimestamp {
+    CanonicalTimestamp::from_datetime(&at).unwrap()
+}
+
+/// The half-open byte range `sentence` occupies in `document`.
+fn span_of(document: &[u8], sentence: &str) -> Range<u64> {
+    let start = document
+        .windows(sentence.len())
+        .position(|window| window == sentence.as_bytes())
+        .expect("the sentence is in the document");
+    u64::try_from(start).unwrap()..u64::try_from(start + sentence.len()).unwrap()
+}
+
+/// A scratch repository whose main has two commits: the spec document and
+/// the service source, then the revised spec document. Returns both ids.
+fn spec_repository_with_two_commits() -> (ScratchRepository, String, String) {
+    let repository = ScratchRepository::empty();
+    let first = repository.commit_files(
+        None,
+        &[
+            (SPEC_PATH, SPEC_DOCUMENT),
+            ("src/service.rs", SERVICE_SOURCE),
+        ],
+        "specify the remember actions",
+        FIRST_COMMIT_DATE,
+    );
+    let second = repository.commit_files(
+        Some(&first),
+        &[
+            (SPEC_PATH, REVISED_SPEC_DOCUMENT),
+            ("src/service.rs", SERVICE_SOURCE),
+        ],
+        "revise the remember actions spec",
+        SECOND_COMMIT_DATE,
+    );
+    (repository, first, second)
+}
+
+/// "`RememberAction` in `src/service.rs` must not declare `Forget`", citing
+/// the spec sentence at `commit`.
+fn draft_request(
+    repository: &ScratchRepository,
+    commit: &str,
+    effective_from: CanonicalTimestamp,
+) -> DraftStatementRequestV1 {
+    DraftStatementRequestV1 {
+        git_dir: repository.path().to_path_buf(),
+        repository_id: id(SPEC_REPOSITORY_ID),
+        installation_id: INSTALLATION_ID,
+        provider_repository_id: PROVIDER_REPOSITORY_ID,
+        commit: GitObjectId::parse_hex(commit).unwrap(),
+        spec_path: SPEC_PATH.into(),
+        spans: vec![span_of(SPEC_DOCUMENT, SPEC_SENTENCE)],
+        binding_family_id: id(SPEC_FAMILY),
+        source_path: "src/service.rs".into(),
+        enum_name: "RememberAction".into(),
+        member: "Forget".into(),
+        expected: ExpectedMembershipV1::Absent,
+        severity: DiscrepancySeverityV1::High,
+        effective_from,
+        effective_until: None,
+        supersedes: None,
+        proposer: id(PROPOSER),
+        author: id(AUTHOR),
+    }
+}
+
+/// Both approvers' signatures over `proposal`, made at `signed_at`.
+fn approvals(
+    proposal: &NormativeBindingProposalV2,
+    signed_at: &CanonicalTimestamp,
+) -> Vec<ApprovalAttestationV1> {
+    APPROVERS
+        .iter()
+        .map(|(principal, seed)| {
+            sign_normative_approval(proposal, id(principal), &[*seed; 32], signed_at.clone())
+                .unwrap()
+        })
+        .collect()
+}
+
+/// Activate `proposal` with both approvals, accepted at the database's time
+/// now.
+async fn activate_signed(
+    runtime: &WriterAuthorityRuntime,
+    proposal: &NormativeBindingProposalV2,
+    expectation: &RememberActionExpectationV1,
+    signed_at: &CanonicalTimestamp,
+) -> ostk_fleet_recall::Result<ostk_fleet_recall::spec_conformance::SpecActivationV1> {
+    let accepted_at = instant(database_now(runtime.pool()).await.unwrap());
+    activate_spec_statement(
+        runtime,
+        proposal,
+        expectation,
+        &approvals(proposal, signed_at),
+        &accepted_at,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn live_a_signed_statement_activates_under_the_witnessed_head_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let owner = common::migrated_pool(&database_url).await;
+    let installed = install_generation_two(&owner, "spec-activate").await;
+    let (repository, first, _) = spec_repository_with_two_commits();
+    let (installed, repository) = (&installed, &repository);
+    as_runtime_role(&owner, &database_url, |pool| async move {
+        let runtime = installed.runtime(&pool).await;
+        let now = database_now(&pool).await.unwrap();
+        // Activation must precede the statement's effect; 60 seconds is
+        // ample for a slow runner.
+        let effective_from = instant(now + TimeDelta::seconds(60));
+        let request = draft_request(repository, &first, effective_from.clone());
+        let (proposal, expectation) = draft_spec_statement(&runtime, &request).await.unwrap();
+        let statement_id = proposal.statement_id().unwrap();
+        let family = &proposal.binding_family_id;
+
+        let activated = activate_signed(&runtime, &proposal, &expectation, &instant(now))
+            .await
+            .unwrap();
+        assert!(
+            matches!(activated.outcome, SpecActivationOutcomeV1::Installed { .. }),
+            "{activated:?}"
+        );
+        assert_eq!(activated.statement_id, statement_id);
+        assert_eq!(activated.statement_row, SpecRowWriteV1::Inserted);
+
+        let verified = runtime.verify().await.unwrap();
+        let normative = normative_repository(&runtime, verified.witness()).unwrap();
+        let projection = normative
+            .read_projection(family)
+            .await
+            .unwrap()
+            .expect("an activated family has a projection");
+        assert_eq!(
+            projection.resolution,
+            NormativeResolutionV1::Active { statement_id }
+        );
+        let stored = runtime_spec_repository(&runtime)
+            .read_statement(statement_id)
+            .await
+            .unwrap()
+            .expect("an activated statement is recorded");
+        assert_eq!(stored.proposal, proposal);
+        assert_eq!(stored.expectation, expectation);
+
+        // Activating it again appends nothing and moves nothing.
+        let log = normative.read_log(family).await.unwrap();
+        let head = normative.read_head(family).await.unwrap();
+        let again = activate_signed(&runtime, &proposal, &expectation, &instant(now))
+            .await
+            .unwrap();
+        assert_eq!(again.outcome, SpecActivationOutcomeV1::AlreadyActive);
+        assert_eq!(again.statement_row, SpecRowWriteV1::AlreadyRecorded);
+        assert_eq!(normative.read_log(family).await.unwrap(), log);
+        assert_eq!(normative.read_head(family).await.unwrap(), head);
+
+        // A later draft in the family expects the binding set the
+        // activation installed.
+        let (next, _) = draft_spec_statement(&runtime, &request).await.unwrap();
+        assert_eq!(
+            next.expected_active_binding_set_digest,
+            head.expect("an activated family has a head")
+                .active_binding_set_digest
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn live_a_stale_head_proposal_activates_nothing_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let owner = common::migrated_pool(&database_url).await;
+    let installed = install_generation_two(&owner, "spec-stale-head").await;
+    let (repository, first, _) = spec_repository_with_two_commits();
+    let (installed, repository) = (&installed, &repository);
+    as_runtime_role(&owner, &database_url, |pool| async move {
+        let runtime = installed.runtime(&pool).await;
+        let now = database_now(&pool).await.unwrap();
+        let request = draft_request(repository, &first, instant(now + TimeDelta::seconds(60)));
+        let (proposal, expectation) = draft_spec_statement(&runtime, &request).await.unwrap();
+
+        // The same package and policy digests, which is all the normative
+        // runtime's own admission compares: only the witnessed head's exact
+        // activation and interval tell these apart.
+        let mut earlier_activation = proposal.clone();
+        earlier_activation.registry_head.head.activation_id = label("an earlier activation");
+        let mut other_interval = proposal.clone();
+        let head_from =
+            DateTime::parse_from_rfc3339(proposal.registry_head.effective_from.as_str())
+                .unwrap()
+                .with_timezone(&Utc);
+        other_interval.registry_head.effective_from = instant(head_from - TimeDelta::seconds(1));
+
+        for (stale, why) in [
+            (
+                &earlier_activation,
+                "another activation of the same package",
+            ),
+            (&other_interval, "another effective interval of the head"),
+        ] {
+            match activate_signed(&runtime, stale, &expectation, &instant(now)).await {
+                Err(FleetError::ControlContract(ContractError::StaleRegistryHead)) => {}
+                other => panic!("{why} must be a stale head: {other:?}"),
+            }
+            assert!(
+                runtime_spec_repository(&runtime)
+                    .read_statement(stale.statement_id().unwrap())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{why}: a stale proposal must leave no statement row"
+            );
+        }
+        let verified = runtime.verify().await.unwrap();
+        let normative = normative_repository(&runtime, verified.witness()).unwrap();
+        assert!(
+            normative
+                .read_head(&proposal.binding_family_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            normative
+                .read_log(&proposal.binding_family_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    })
+    .await;
+}
+
+/// A span past the end of the spec document, a spec path the commit does not
+/// have, and an author who proposes their own spec are refused.
+async fn refuses_drafts_it_cannot_bind(
+    runtime: &WriterAuthorityRuntime,
+    request: &DraftStatementRequestV1,
+) {
+    let document_length = u64::try_from(SPEC_DOCUMENT.len()).unwrap();
+    for (refused, why) in [
+        (
+            DraftStatementRequestV1 {
+                spans: vec![Range {
+                    start: 0,
+                    end: document_length + 1,
+                }],
+                ..request.clone()
+            },
+            "a span past the end of the document",
+        ),
+        (
+            DraftStatementRequestV1 {
+                spec_path: "docs/absent.md".into(),
+                ..request.clone()
+            },
+            "a spec path the commit does not have",
+        ),
+        (
+            DraftStatementRequestV1 {
+                proposer: id(AUTHOR),
+                ..request.clone()
+            },
+            "an author who is also the proposer",
+        ),
+    ] {
+        assert!(
+            draft_spec_statement(runtime, &refused).await.is_err(),
+            "{why} must be refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn live_a_draft_binds_the_spec_span_and_the_repository_subject_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let owner = common::migrated_pool(&database_url).await;
+    let installed = install_generation_two(&owner, "spec-draft").await;
+    let (repository, first, second) = spec_repository_with_two_commits();
+    let (installed, repository) = (&installed, &repository);
+    as_runtime_role(&owner, &database_url, |pool| async move {
+        let runtime = installed.runtime(&pool).await;
+        let effective_from = instant(database_now(&pool).await.unwrap() + TimeDelta::seconds(60));
+        let request = draft_request(repository, &first, effective_from);
+        let (proposal, expectation) = draft_spec_statement(&runtime, &request).await.unwrap();
+        let verified = runtime.verify().await.unwrap();
+        let witness = verified.witness();
+
+        // The cited span records exactly the bytes it selects.
+        let [span] = proposal.source_spans.as_slice() else {
+            panic!("one cited span");
+        };
+        assert_eq!(span.start..span.end, request.spans[0]);
+        assert_eq!(
+            span.selected_bytes_digest,
+            spec_span_digest(SPEC_SENTENCE.as_bytes())
+        );
+        assert_eq!(proposal.exact_path_bytes.as_bytes(), SPEC_PATH.as_bytes());
+
+        // It is a spec statement under the witnessed head and scope.
+        assert_eq!(&proposal.registry_head, witness.head_binding());
+        assert_eq!(&proposal.scope, runtime.semantic_scope());
+        assert_eq!(proposal.expected_active_binding_set_digest, None);
+        assert_eq!(
+            expectation.predicate,
+            spec_predicate(witness.genesis_package()).unwrap()
+        );
+        require_spec_statement(witness.genesis_package(), &proposal, &expectation).unwrap();
+
+        // The subject is the repository the provider id names.
+        assert_eq!(
+            proposal.repository_entity_id,
+            repository_subject(
+                witness.package(),
+                runtime.semantic_scope(),
+                PROVIDER_REPOSITORY_ID
+            )
+            .unwrap()
+        );
+        let other_repository = DraftStatementRequestV1 {
+            provider_repository_id: PROVIDER_REPOSITORY_ID + 1,
+            ..request.clone()
+        };
+        let (elsewhere, _) = draft_spec_statement(&runtime, &other_repository)
+            .await
+            .unwrap();
+        assert_ne!(
+            elsewhere.repository_entity_id,
+            proposal.repository_entity_id
+        );
+
+        // The same range at the revised commit is the same subject, but
+        // another version of the document, another blob, and other bytes.
+        let revised = DraftStatementRequestV1 {
+            commit: GitObjectId::parse_hex(&second).unwrap(),
+            ..request.clone()
+        };
+        let (at_revision, _) = draft_spec_statement(&runtime, &revised).await.unwrap();
+        assert_eq!(
+            at_revision.repository_entity_id,
+            proposal.repository_entity_id
+        );
+        assert_ne!(
+            at_revision.repository_version_id,
+            proposal.repository_version_id
+        );
+        assert_ne!(at_revision.blob_id, proposal.blob_id);
+        assert_ne!(
+            at_revision.source_spans[0].selected_bytes_digest,
+            span.selected_bytes_digest
+        );
+
+        // Drafting is deterministic.
+        let (redrafted, _) = draft_spec_statement(&runtime, &request).await.unwrap();
+        assert_eq!(
+            redrafted.statement_id().unwrap(),
+            proposal.statement_id().unwrap()
+        );
+
+        refuses_drafts_it_cannot_bind(&runtime, &request).await;
+    })
+    .await;
 }

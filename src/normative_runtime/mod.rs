@@ -20,6 +20,8 @@
 //!   [`repository::admit_activation`] consumes. The receipt is derived, never
 //!   supplied: its principals are keys the live policy lists, its threshold is
 //!   the policy's, and its `accepted_at` is the caller's server time.
+//!   [`approvals::sign_normative_approval`] is its offline counterpart, for an
+//!   approver holding a key seed.
 //!
 //! A caller holding a strict writer-authority witness takes the registry
 //! binding from it ([`repository::NormativeRegistryBindingV1::from_witness`])
@@ -66,7 +68,7 @@ mod repository;
 
 pub use approvals::{
     NORMATIVE_APPROVAL_SIGNATURE_PREFIX, approval_attestation_id, normative_approval_message,
-    verify_normative_approvals,
+    sign_normative_approval, verify_normative_approvals,
 };
 pub use cockroach::{CockroachNormativeActivationRepository, NormativeFaultInjection};
 pub use projection::{

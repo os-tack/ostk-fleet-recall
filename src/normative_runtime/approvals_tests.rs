@@ -255,6 +255,30 @@ fn a_valid_two_of_two_approval_mints_a_receipt_the_runtime_admits() {
 }
 
 #[test]
+fn the_offline_signer_produces_approvals_the_live_policy_verifies() {
+    let proposal = proposal();
+    let signed: Vec<ApprovalAttestationV1> = [(ALICE, ALICE_SEED), (BOB, BOB_SEED)]
+        .into_iter()
+        .map(|(principal, seed)| {
+            sign_normative_approval(&proposal, id(principal), &[seed; 32], timestamp(SIGNED_AT))
+                .unwrap()
+        })
+        .collect();
+    // Ed25519 is deterministic, so the offline signer and a hand-built
+    // attestation are the same bytes.
+    assert_eq!(signed, both_approvals(&proposal));
+    verify(&proposal, &signed).unwrap();
+
+    // A seed the policy does not list for the principal signs, but never
+    // verifies.
+    let wrong_key = vec![
+        sign_normative_approval(&proposal, id(ALICE), &[0x03; 32], timestamp(SIGNED_AT)).unwrap(),
+        signed[1].clone(),
+    ];
+    expect_signature_refusal(&proposal, &wrong_key, "a key the policy does not list");
+}
+
+#[test]
 fn the_receipt_does_not_depend_on_the_order_approvals_arrive_in() {
     let proposal = proposal();
     let mut reversed = both_approvals(&proposal);

@@ -127,6 +127,7 @@ pub struct WriterAuthorityRuntime {
     config: WriterAuthorityConfig,
     control_scope: TrustedControlScope,
     ledger: Arc<CockroachAcceptedEventRepository>,
+    retry: RetryPolicy,
 }
 
 impl std::fmt::Debug for WriterAuthorityRuntime {
@@ -174,6 +175,7 @@ impl WriterAuthorityRuntime {
             config,
             control_scope,
             ledger,
+            retry,
         };
         let verified = runtime.verify().await?;
         let startup = WriterAuthorityStartupV1::of(verified.witness());
@@ -264,6 +266,14 @@ impl WriterAuthorityRuntime {
     #[must_use]
     pub const fn ledger(&self) -> &Arc<CockroachAcceptedEventRepository> {
         &self.ledger
+    }
+
+    /// The serializable retry policy this runtime was started with (retried
+    /// only on 40001), for the other repositories a caller binds to the same
+    /// scope.
+    #[must_use]
+    pub const fn retry_policy(&self) -> RetryPolicy {
+        self.retry
     }
 }
 
