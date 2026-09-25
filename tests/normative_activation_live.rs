@@ -12,7 +12,13 @@
 //! * a contested overlap projects `unknown`;
 //! * an actor implicated in the change is refused closed;
 //! * retirement and supersession append without erasing history;
-//! * the projection rebuilds byte-identically from the event log.
+//! * the projection rebuilds byte-identically from the event log;
+//! * a family whose head names an older registry head refuses every
+//!   activation until it is rebased (ADR 0007 D11), a rebase whose target does
+//!   not carry an entry a live statement depends on writes nothing, and a
+//!   lawful rebase appends one `rebase` row, moves only the head's registry
+//!   digests, is idempotent, and lets a supersession in under the new head
+//!   (ADR 0008 D3).
 //!
 //! The normative tables are keyed by the trusted `(tenant, project)` pair; a
 //! fresh unique project per test isolates them. The semantic scope is decoded
@@ -25,6 +31,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ostk_fleet_recall::FleetError;
 use ostk_fleet_recall::FleetScope;
 use ostk_fleet_recall::control_log::TrustedControlScope;
 use ostk_fleet_recall::memory_contracts::bootstrap::BootstrapReceiptV1;
@@ -47,13 +54,14 @@ use ostk_fleet_recall::memory_contracts::registry::{EligibleApprovalV1, Registry
 use ostk_fleet_recall::normative_runtime::{
     CockroachNormativeActivationRepository, NormativeActivationCandidateV1,
     NormativeActivationOutcomeV1, NormativeActivationRepository, NormativeFaultInjection,
-    NormativeLifecycleRequestV1, NormativeLogRecordV1, NormativeRegistryBindingV1,
+    NormativeLifecycleRequestV1, NormativeLogRecordV1, NormativeRebaseOutcomeV1,
+    NormativeRebaseRequestV1, NormativeRebaseTargetV1, NormativeRegistryBindingV1,
     NormativeResolutionV1, active_binding_set_digest,
 };
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig, RetryPolicy};
 use ostk_recall_core::PrivacyTier;
 use sqlx::PgPool;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -903,4 +911,259 @@ async fn live_two_projects_cannot_see_each_others_normative_state() {
             .unwrap(),
         NormativeActivationOutcomeV1::Installed(_)
     ));
+}
+
+// --- head rebase (ADR 0008 D3) ---
+
+/// The registry head a scope moves to: another package under the same
+/// activation policy, as generation 2 -> 3 is.
+fn next_binding() -> NormativeRegistryBindingV1 {
+    NormativeRegistryBindingV1 {
+        registry_package_digest: label("registry-package-next"),
+        activation_policy_digest: registry_binding().activation_policy_digest,
+    }
+}
+
+fn next_head() -> RegistryHeadBindingV1 {
+    RegistryHeadBindingV1 {
+        head: RegistryHeadV1 {
+            activation_id: label("activation-next"),
+            package_digest: next_binding().registry_package_digest,
+            activation_policy_digest: next_binding().activation_policy_digest,
+        },
+        effective_from: timestamp("2026-08-01T00:00:00.000000000Z"),
+        effective_until: None,
+    }
+}
+
+/// The runtime for `scope` bound to the next registry head, as a writer
+/// verifying the moved head builds it.
+fn rebound(pool: &PgPool, scope: &NormativeScope) -> CockroachNormativeActivationRepository {
+    let trusted =
+        TrustedControlScope::from_trusted_context(&scope.physical, scope.scope.clone()).unwrap();
+    CockroachNormativeActivationRepository::new(
+        pool.clone(),
+        trusted,
+        next_binding(),
+        retry_policy(),
+    )
+    .unwrap()
+}
+
+/// The next head as a rebase target that carries `entries`.
+fn next_target(entries: &[&str]) -> NormativeRebaseTargetV1 {
+    NormativeRebaseTargetV1::new(
+        next_binding(),
+        next_head().head.activation_id,
+        entries.iter().copied().map(reference),
+    )
+    .unwrap()
+}
+
+/// A rebase of `scope`'s family whose one live statement, `statement_id`,
+/// depends on what [`proposal`] names, resolved at `head_revision`.
+fn rebase_request(
+    scope: &NormativeScope,
+    statement_id: Sha256Digest,
+    head_revision: u64,
+) -> NormativeRebaseRequestV1 {
+    NormativeRebaseRequestV1 {
+        binding_family_id: scope.family.clone(),
+        expected_head_revision: head_revision,
+        live_statement_dependencies: BTreeMap::from([(
+            statement_id,
+            BTreeSet::from([
+                reference("environment.selector"),
+                reference("slo.error_rate"),
+            ]),
+        )]),
+    }
+}
+
+/// A supersession of `superseded` drafted under the next head.
+fn superseding_under_next_head(
+    scope: &NormativeScope,
+    superseded: Sha256Digest,
+) -> NormativeActivationCandidateV1 {
+    let mut proposal = proposal(scope, "superseding", "2026-08-25T00:00:00.000000000Z");
+    proposal.registry_head = next_head();
+    proposal.explicitly_supersedes_statement_id = Some(superseded);
+    proposal.expected_active_binding_set_digest =
+        active_binding_set_digest(&scope.family, &[superseded]);
+    candidate(proposal)
+}
+
+async fn record_kinds(pool: &PgPool, scope: &NormativeScope) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT record_kind FROM public.memory_normative_log_v1 \
+         WHERE tenant_id = $1 AND project = $2 AND binding_family_id = $3 ORDER BY seq",
+    )
+    .bind(scope.physical.tenant_id)
+    .bind(scope.physical.project.as_str())
+    .bind(scope.family.as_str())
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one family's whole stranded -> refused -> rebased -> superseded path
+async fn live_a_family_is_rebased_onto_a_new_registry_head_only_when_its_dependencies_carry_when_configured()
+ {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = live_pool(&database_url).await;
+    let scope = normative_scope(&pool, "rebase");
+    let first_id = install_first(&scope).await;
+    let moved = rebound(&pool, &scope);
+    let head_before = moved.read_head(&scope.family).await.unwrap().unwrap();
+
+    // Before any rebase the family is stranded: a supersession drafted under
+    // the new head loses the compare-and-set and writes nothing (ADR 0007 D11).
+    let superseding = superseding_under_next_head(&scope, first_id);
+    assert!(matches!(
+        moved.activate(&superseding).await.unwrap(),
+        NormativeActivationOutcomeV1::Lost { .. }
+    ));
+
+    // A target missing an entry the live statement depends on is refused, and
+    // so is a target the runtime is not bound to; neither writes anything.
+    let missing = moved
+        .rebase_family(
+            &next_target(&["environment.selector"]),
+            &rebase_request(&scope, first_id, 1),
+        )
+        .await;
+    assert!(
+        matches!(missing, Err(FleetError::ControlContract(_))),
+        "{missing:?}"
+    );
+    let carried = next_target(&["environment.selector", "slo.error_rate", "unrelated"]);
+    assert!(
+        scope
+            .repository
+            .rebase_family(&carried, &rebase_request(&scope, first_id, 1))
+            .await
+            .is_err(),
+        "a runtime bound to the old head cannot rebase onto the new one"
+    );
+    // A request resolved at another head revision is stale, not rebased over.
+    assert_eq!(
+        moved
+            .rebase_family(&carried, &rebase_request(&scope, first_id, 0))
+            .await
+            .unwrap(),
+        NormativeRebaseOutcomeV1::Stale {
+            observed_head_revision: 1
+        }
+    );
+    assert_eq!(
+        moved.read_head(&scope.family).await.unwrap().unwrap(),
+        head_before
+    );
+    assert_eq!(record_kinds(&pool, &scope).await, ["lifecycle"]);
+
+    // The lawful rebase: one `rebase` row, the head moved onto the new
+    // registry digests with its binding set unchanged, the resolution intact.
+    let NormativeRebaseOutcomeV1::Rebased { transition, rebase } = moved
+        .rebase_family(&carried, &rebase_request(&scope, first_id, 1))
+        .await
+        .unwrap()
+    else {
+        panic!("a family whose dependencies carry must rebase");
+    };
+    assert_eq!(transition.head_revision, 2);
+    assert_eq!(transition.log_seq, 2);
+    assert_eq!(transition.statement_id, None);
+    assert_eq!(
+        transition.active_binding_set_digest,
+        head_before.active_binding_set_digest
+    );
+    assert_eq!(
+        rebase.from_registry_package_digest,
+        registry_binding().registry_package_digest
+    );
+    assert_eq!(
+        rebase.to_registry_package_digest,
+        next_binding().registry_package_digest
+    );
+    assert_eq!(
+        rebase.registry_activation_id,
+        next_head().head.activation_id
+    );
+    assert_eq!(rebase.carried_entry_digests.len(), 2);
+    let head = moved.read_head(&scope.family).await.unwrap().unwrap();
+    assert_eq!(
+        head.registry_package_digest,
+        next_binding().registry_package_digest
+    );
+    assert_eq!(
+        head.active_binding_set_digest,
+        head_before.active_binding_set_digest
+    );
+    assert_eq!((head.head_revision, head.log_seq), (2, 2));
+    assert_eq!(record_kinds(&pool, &scope).await, ["lifecycle", "rebase"]);
+    let log = moved.read_log(&scope.family).await.unwrap();
+    assert_eq!(log[1].record_id, transition.event_id);
+    let stored = moved.read_projection(&scope.family).await.unwrap().unwrap();
+    assert_eq!(stored.cursor_seq, 2);
+    assert_eq!(
+        stored.resolution,
+        NormativeResolutionV1::Active {
+            statement_id: first_id
+        }
+    );
+    assert_eq!(
+        moved
+            .rebuild_projection(&scope.family)
+            .await
+            .unwrap()
+            .canonical_bytes()
+            .unwrap(),
+        stored.canonical_bytes().unwrap(),
+        "the rebased projection rebuilds byte-identically from the log"
+    );
+
+    // A re-run rebases nothing twice.
+    assert_eq!(
+        moved
+            .rebase_family(&carried, &rebase_request(&scope, first_id, 2))
+            .await
+            .unwrap(),
+        NormativeRebaseOutcomeV1::AlreadyCurrent { head_revision: 2 }
+    );
+    assert_eq!(moved.read_log(&scope.family).await.unwrap().len(), 2);
+
+    // The family now takes activations under the new head, and only there.
+    assert!(matches!(
+        scope
+            .repository
+            .activate(&candidate(proposal(
+                &scope,
+                "old-head",
+                "2026-08-25T00:00:00.000000000Z"
+            )))
+            .await
+            .unwrap(),
+        NormativeActivationOutcomeV1::Lost { .. }
+    ));
+    let second_id = superseding.proposal.statement_id().unwrap();
+    let NormativeActivationOutcomeV1::Installed(transition) =
+        moved.activate(&superseding).await.unwrap()
+    else {
+        panic!("a supersession under the new head must install once rebased");
+    };
+    assert_eq!((transition.head_revision, transition.log_seq), (3, 3));
+    assert_eq!(
+        moved
+            .read_projection(&scope.family)
+            .await
+            .unwrap()
+            .unwrap()
+            .resolution,
+        NormativeResolutionV1::Active {
+            statement_id: second_id
+        }
+    );
 }

@@ -33,13 +33,19 @@ connector state, normative activation, the discrepancy ledger, and the
 bootstrap-manifest import rows. Version 25 is a deliberate, permanent gap.
 Migrations 29 through 31 add the conflict lifecycle log, the worker source
 status, and spec conformance (described below and under
-[Privilege separation](#privilege-separation)).
+[Privilege separation](#privilege-separation)). Migration 32 adds no table:
+it widens migration 24's normative-log record-kind check to admit `rebase`
+rows, which the writer-authority installer appends when it moves a scope to
+generation 3 ([ADR 0008](adr/0008-collected-items.md) D3).
 
 Each private runtime uses its own part of these tables:
 
 - The memory worker writes the tables of migrations 19 through 22, 26, and
   30, and migration 23's body-visibility table.
 - `ostk-spec` writes the tables of migrations 24, 27, and 31.
+  `ostk-authority-install apply --target generation-3`, as the migrator,
+  appends migration 32's `rebase` rows to migration 24's log and moves those
+  families' heads.
 - `serve` reads the tables of migrations 19 through 22 and 30 (with the
   visibility class migration 23 adds to the recall tiers) for
   `recall(kind=evidence)`, and those of migrations 24, 27, and 31 for
@@ -58,7 +64,8 @@ Serving requires none of these migrations: `MINIMUM_RECALL_SCHEMA_VERSION`
 stays 18. `serve` serves each surface built on them only when its startup
 probe finds the schema version and the runtime grants on every table the
 surface reads. Migration 29 gates the conflict lifecycle, 30 gates
-`recall(kind=evidence)`, and 31 gates `recall(action="discrepancies")`. A
+`recall(kind=evidence)`, and 31 gates `recall(action="discrepancies")`;
+migration 32 gates nothing served. A
 surface whose probe fails is left out of `tools/list`, and `serve` logs why;
 every other surface is unchanged. The probes run only at startup, so
 roll each of these migrations out the same way:
@@ -382,7 +389,9 @@ table-privilege rows, and three sequence-`USAGE` rows.
 A single gate guards all of it. Before any change, the policy requires a
 successful SQLx row for every migration from 1 through 31 (version 25 is
 permanently unused); a later successful migration cannot mask a missing or
-failed one in that prefix. When a later migration adds tables a runtime
+failed one in that prefix. Migration 32 adds no table and needs no grant (the
+runtime already holds `INSERT` on the normative log), so the gate stays at
+31. When a later migration adds tables a runtime
 needs, extend the policy in one edit: the gate, the grants, and the closing
 count together. The writer probes its grants only at startup, so after
 `migrate`, drain `fleet_writer`, reapply this policy, and then restart
@@ -605,25 +614,30 @@ against a real CockroachDB database.
 ### Generation-3 rollout order ([ADR 0008](adr/0008-collected-items.md) D2)
 
 The generation-3 collected-items package is a `2 -> 3` generic successor. It
-needs no migration and no new grant, and a binary that does not compile it in
-refuses any head that activates it as `UnknownActivePackage`. So the order is
-fixed, per physical scope that is to collect items:
+needs no new grant, and a binary that does not compile it in refuses any head
+that activates it as `UnknownActivePackage`. So the order is fixed, per
+physical scope that is to collect items:
 
 1. Ship a binary that recognizes generation 3 to every process that verifies
    a head for that scope: every event-first writer, every `serve`, the worker
    on its ingest host, and the projector container.
 2. Apply the release's migrations, then re-apply the grant files. This release
-   adds neither.
+   adds migration 32, which lets a spec family be rebased, and no grant.
 3. Run `ostk-authority-install apply --target generation-3` as the schema
    owner/migrator login. The printed pins are unchanged, so no writer is
-   reconfigured; a re-run is a no-op, and the default `--target generation-2`
-   never moves a generation-3 head back.
+   reconfigured. The run then rebases every normative binding family onto
+   the new head (ADR 0008 D3) and lists each in the report's
+   `normative_families`: `rebased`, `already_current`, or `stranded` with the
+   reason. A re-run is a no-op, and the default `--target generation-2` never
+   moves a generation-3 head back. The installer refuses, before any write, to
+   rebase a scope that holds families without migration 32;
+   `--no-normative-rebase` skips the rebase and leaves every family stranded
+   (ADR 0007 D11).
 4. Only then configure collectors, agent capture, or webhook ingress.
 
 Moving a scope re-keys what is read afterwards (a re-read source fact becomes
-a second representation under the new head) and strands spec families last
-advanced under generation 2 (ADR 0007 D11), so move a scope before activating
-specs in it.
+a second representation under the new head). A spec draft names the exact
+head it was made under, so redraft any draft made before the move.
 
 ### Conflict-detector reconciliation gate
 
@@ -740,6 +754,16 @@ exact failed version:
   normal migrator retry is the reviewed recovery after an interruption, and a
   `55000` from a closing assertion means a same-name object has another shape
   and needs a separately reviewed forward repair.
+- v32 is two committed constraint changes on `memory_normative_log_v1`: it
+  adds `memory_normative_log_kind_v2` (admitting `rebase`), then drops
+  migration 24's `memory_normative_log_kind`. Either interruption point leaves
+  a kind check in force, and while both exist a `rebase` row is still refused.
+  The normal migrator retry resumes it: `ADD CONSTRAINT IF NOT EXISTS` keeps a
+  committed new constraint and `DROP CONSTRAINT IF EXISTS` skips a dropped
+  old one. Its closing assertion requires the exact committed definition of
+  the new constraint and the absence of the old one; a `55000` means a
+  same-name constraint of another definition and needs a separately reviewed
+  forward repair.
 
 1. Leave the application service at zero.
 2. Preserve the migration task logs and exact CockroachDB error.

@@ -292,6 +292,17 @@ commits from re-opening episodes. Install the writer authority to generation 2
 (`ostk-authority-install apply`) before activating any spec; rebasing a
 normative head after a transition is deferred.
 
+**Amended by [ADR 0008](0008-collected-items.md) D3.** Moving a scope with
+`ostk-authority-install apply --target generation-3` now rebases every binding
+family whose live statements' registry dependencies the new head carries byte
+for byte, which is every spec family: it appends a `rebase` row to the
+family's log (migration 32) and moves the head's registry digests, so the
+family takes activations and supersessions under generation 3. A draft made
+before the move is still refused as a stale head and must be redrafted. A
+family the rebase cannot verify, and every family after a move made without
+it (`--no-normative-rebase`, or a hand-run generic successor ceremony), strands
+exactly as described above until a later generation-3 install run rebases it.
+
 ## D12 — Spec commit URIs are not joinable with asserted ones
 
 **Decision.** A check records the raw commit object id and the observer's
@@ -324,7 +335,8 @@ comparator lineage and episode policy (D5); scope-exit dismissal in the
 ledger; statements with more than one proposition; re-verifying source spans
 at activate time; relations, contests, retroactive corrections, and waivers;
 an in-transaction evidence-id existence check in 0027 (D8); rebasing normative
-heads after a registry transition (D11); measuring the observer binary against
+heads after a registry transition other than the installer's move to
+generation 3 (D11, ADR 0008 D3); measuring the observer binary against
 its pinned executable digest (D10); binding a re-check to the coverage receipt
 of the commit's first check (D2); a spec-check worker step; other finding
 types, predicates, and observers.

@@ -24,6 +24,17 @@
 //! unit (EVENT-03), so the projection cursor can never sit ahead of or behind
 //! the log it was folded from.
 //!
+//! # Rebase
+//!
+//! [`CockroachNormativeActivationRepository::rebase_family`] is the one path
+//! that moves a family's head to another registry head without an activation
+//! (ADR 0008 D3). It runs the same lock -> judge -> append -> advance sequence:
+//! the head is locked, [`admit_rebase`] judges it and the durable live set
+//! against the caller's resolved dependencies, and a `rebase` log row, the
+//! head's compare-and-set onto the target's package and policy digests, and
+//! the projection's cursor advance commit together. It never seeds a head: a
+//! family nothing was ever proposed into has nothing to rebase.
+//!
 //! # Nothing is ever rewritten
 //!
 //! Retirement and supersession APPEND. There is no `UPDATE` or `DELETE` against
@@ -41,7 +52,7 @@ use crate::Result;
 use crate::control_log::TrustedControlScope;
 use crate::error::FleetError;
 use crate::memory_contracts::canonical::{decode_strict, encode_canonical};
-use crate::memory_contracts::common::ContractId;
+use crate::memory_contracts::common::{CanonicalTimestamp, ContractId};
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::normative_v2::ContestedBindingV1;
 use crate::store::cockroach::{RetryPolicy, with_serializable_retry};
@@ -53,9 +64,15 @@ use super::projection::{
 use super::repository::{
     AdmittedNormativeActivationV1, NormativeActivationCandidateV1, NormativeActivationOutcomeV1,
     NormativeActivationRepository, NormativeHeadRowV1, NormativeLifecycleRequestV1,
-    NormativeRegistryBindingV1, NormativeTransitionV1, active_binding_set_digest, admit_activation,
-    admit_contest, admit_lifecycle, require_non_conflicting_against_live,
+    NormativeRebaseAdmissionV1, NormativeRebaseOutcomeV1, NormativeRebaseRequestV1,
+    NormativeRebaseTargetV1, NormativeRegistryBindingV1, NormativeTransitionV1,
+    active_binding_set_digest, admit_activation, admit_contest, admit_lifecycle, admit_rebase,
+    require_non_conflicting_against_live,
 };
+
+/// Upper bound on the binding families one scope lists for a rebase. More is
+/// refused, never truncated: a family left out would stay stranded unreported.
+pub const MAX_LISTED_FAMILY_HEADS: usize = 4096;
 
 const SEED_HEAD_SQL: &str = "INSERT INTO public.memory_normative_heads_v1 (\
      tenant_id, project, binding_family_id, active_binding_set_digest, \
@@ -72,6 +89,13 @@ const SELECT_HEAD_SQL: &str = "SELECT active_binding_set_digest, registry_packag
      activation_policy_digest, head_revision, log_seq \
      FROM public.memory_normative_heads_v1 \
      WHERE tenant_id = $1 AND project = $2 AND binding_family_id = $3";
+
+/// Every family head of the scope, one more than the bound so an overflow is
+/// seen rather than truncated.
+const SELECT_FAMILY_HEADS_SQL: &str = "SELECT binding_family_id, active_binding_set_digest, \
+     registry_package_digest, activation_policy_digest, head_revision, log_seq \
+     FROM public.memory_normative_heads_v1 \
+     WHERE tenant_id = $1 AND project = $2 ORDER BY binding_family_id LIMIT $3";
 
 /// The head advance is itself a compare-and-set on the exact revision and
 /// binding-set digest observed under the lock, so even a lock-free replay of
@@ -164,6 +188,77 @@ impl CockroachNormativeActivationRepository {
     #[must_use]
     pub const fn registry_binding(&self) -> NormativeRegistryBindingV1 {
         self.registry_binding
+    }
+
+    /// Every binding family head in this scope, ordered by family id.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Memory`] when the scope holds more than
+    /// [`MAX_LISTED_FAMILY_HEADS`] families or a stored head does not decode;
+    /// any database error.
+    pub async fn list_heads(&self) -> Result<Vec<NormativeHeadRowV1>> {
+        let limit = i64::try_from(MAX_LISTED_FAMILY_HEADS + 1).unwrap_or(i64::MAX);
+        let rows: Vec<PgRow> = sqlx::query(SELECT_FAMILY_HEADS_SQL)
+            .bind(self.trusted_scope.tenant_id())
+            .bind(self.trusted_scope.project())
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        if rows.len() > MAX_LISTED_FAMILY_HEADS {
+            return Err(FleetError::Memory(format!(
+                "the scope holds more than {MAX_LISTED_FAMILY_HEADS} normative binding families"
+            )));
+        }
+        rows.iter()
+            .map(|row| {
+                let family: String = row.try_get("binding_family_id")?;
+                decode_head_row(&ContractId::new(family)?, row)
+            })
+            .collect()
+    }
+
+    /// Move one family's head onto `target` with its live statements unchanged
+    /// (ADR 0008 D3).
+    ///
+    /// `target` must be the registry head this runtime is bound to. Under the
+    /// head lock [`admit_rebase`] judges the durable head and live set against
+    /// `request`; a rebase appends one `rebase` log row, compare-and-sets the
+    /// head's package and policy digests with `head_revision + 1`, and advances
+    /// the projection's cursor, all in one serializable transaction. A head
+    /// already at the target is [`NormativeRebaseOutcomeV1::AlreadyCurrent`],
+    /// one that moved since `request` was resolved is
+    /// [`NormativeRebaseOutcomeV1::Stale`], and neither writes anything.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::ControlContract`] for a rebase [`admit_rebase`] refuses,
+    /// including a live statement that depends on an entry the target does not
+    /// carry; [`FleetError::Memory`] for a target other than the bound head or a
+    /// family with no head; any database error. A refusal writes nothing.
+    pub async fn rebase_family(
+        &self,
+        target: &NormativeRebaseTargetV1,
+        request: &NormativeRebaseRequestV1,
+    ) -> Result<NormativeRebaseOutcomeV1> {
+        if target.binding() != self.registry_binding {
+            return Err(FleetError::Memory(
+                "a normative rebase target must be the registry head the runtime is bound to"
+                    .into(),
+            ));
+        }
+        let scope = self.trusted_scope.clone();
+        let target = target.clone();
+        let request = request.clone();
+        with_serializable_retry(&self.pool, self.retry_policy, move |transaction| {
+            let scope = scope.clone();
+            let target = target.clone();
+            let request = request.clone();
+            Box::pin(
+                async move { rebase_in_transaction(transaction, &scope, &target, &request).await },
+            )
+        })
+        .await
     }
 
     /// Apply one activation, optionally forcing a fault to prove atomicity.
@@ -472,6 +567,66 @@ async fn contest_in_transaction(
     .await
 }
 
+async fn rebase_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &TrustedControlScope,
+    target: &NormativeRebaseTargetV1,
+    request: &NormativeRebaseRequestV1,
+) -> Result<NormativeRebaseOutcomeV1> {
+    let now = statement_timestamp(transaction).await?;
+    // Lock without seeding: a rebase never creates a family.
+    let row: Option<PgRow> = sqlx::query(LOCK_HEAD_SQL)
+        .bind(scope.tenant_id())
+        .bind(scope.project())
+        .bind(request.binding_family_id.as_str())
+        .fetch_optional(&mut **transaction)
+        .await?;
+    let Some(row) = row else {
+        return Err(FleetError::Memory(format!(
+            "binding family {} has no normative head to rebase",
+            request.binding_family_id
+        )));
+    };
+    let head = decode_head_row(&request.binding_family_id, &row)?;
+    let projection = load_projection(transaction, scope, &request.binding_family_id).await?;
+    match admit_rebase(
+        &head,
+        &projection,
+        target,
+        request,
+        CanonicalTimestamp::from_datetime(&now)?,
+    )? {
+        NormativeRebaseAdmissionV1::AlreadyCurrent => {
+            Ok(NormativeRebaseOutcomeV1::AlreadyCurrent {
+                head_revision: head.head_revision,
+            })
+        }
+        NormativeRebaseAdmissionV1::Stale => Ok(NormativeRebaseOutcomeV1::Stale {
+            observed_head_revision: head.head_revision,
+        }),
+        NormativeRebaseAdmissionV1::Rebase { record_id, record } => {
+            let NormativeLogRecordV1::Rebase { rebase } = record.as_ref() else {
+                return Err(FleetError::Memory(
+                    "a normative rebase admitted a record that is not a rebase".into(),
+                ));
+            };
+            let rebase = Box::new(rebase.clone());
+            let transition = commit_record(
+                transaction,
+                scope,
+                &target.binding(),
+                &head,
+                &projection,
+                record_id,
+                &record,
+                now,
+            )
+            .await?;
+            Ok(NormativeRebaseOutcomeV1::Rebased { transition, rebase })
+        }
+    }
+}
+
 /// Append one record and advance the head and the projection with it — the
 /// atomic unit every write path funnels through.
 #[allow(clippy::too_many_arguments)] // the whole point is that these move together.
@@ -517,7 +672,7 @@ async fn commit_record(
                 .supersedes_statement_id
                 .map(|id| id.as_bytes().to_vec()),
         ),
-        NormativeLogRecordV1::Contest { .. } => (None, None),
+        NormativeLogRecordV1::Contest { .. } | NormativeLogRecordV1::Rebase { .. } => (None, None),
     };
 
     sqlx::query(APPEND_LOG_SQL)
@@ -585,7 +740,7 @@ async fn commit_record(
         event_id: record_id,
         statement_id: match record {
             NormativeLogRecordV1::Lifecycle { event, .. } => Some(event.statement_id),
-            NormativeLogRecordV1::Contest { .. } => None,
+            NormativeLogRecordV1::Contest { .. } | NormativeLogRecordV1::Rebase { .. } => None,
         },
         head_revision: next_revision,
         log_seq: next_seq,

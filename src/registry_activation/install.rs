@@ -1,6 +1,6 @@
 //! Writer-authority installer: one physical `(tenant_id, project)` to an
 //! active generation-2 registry head, or to generation 3 when asked,
-//! idempotently (ADR 0002, AUTH-04, ADR 0008 D2).
+//! idempotently (ADR 0002, AUTH-04, ADR 0008 D2 and D3).
 //!
 //! Every writer that appends event-first — `remember(assert)`, the Stage-5
 //! worker, `ostk-spec`, the observer — needs the strict witness
@@ -31,6 +31,16 @@
 //!    [`InstallTargetV1::Generation3`]: the compiled generation-3
 //!    collected-items package ([`compiled_generation_three_package`]), minted
 //!    and signed exactly like step 4.
+//! 6. **Normative rebase**, only for [`InstallTargetV1::Generation3`] and
+//!    unless [`NormativeRebaseModeV1::Skip`] is asked for: every normative
+//!    binding family of the scope whose head names another registry head is
+//!    rebased onto the generation-3 head
+//!    ([`rebase_spec_families`], ADR 0008 D3), so the move strands no spec
+//!    family (ADR 0007 D11). A family already at generation 3 is left alone,
+//!    and one whose statements' registry dependencies cannot be verified is
+//!    reported stranded rather than rebased. Each family is its own
+//!    serializable transaction; the step needs migration 32 wherever a family
+//!    exists, and is refused before any write otherwise.
 //!
 //! Steps 4 and 5 are one loop over the lineage the installer knows
 //! (`SUCCESSOR_LINEAGE`), stopping at the requested target. A head already at
@@ -140,7 +150,10 @@ use crate::registry_witness::{
     WriterAuthorityWitness, compiled_generation_three_package, compiled_generation_two_package,
     compiled_genesis_package, compiled_stage4_package, load_and_verify,
 };
-use crate::store::cockroach::RetryPolicy;
+use crate::spec_conformance::{
+    NormativeFamilyRebaseOutcomeV1, NormativeFamilyRebaseV1, rebase_spec_families,
+};
+use crate::store::cockroach::{NORMATIVE_REBASE_SCHEMA_VERSION, RetryPolicy};
 use crate::{FleetError, FleetScope, Result};
 
 // ---------------------------------------------------------------------------
@@ -201,6 +214,10 @@ const GENERIC_APPROVAL_PREFIX: &[u8] =
 /// Domain of the per-physical-scope partition seed.
 const PARTITION_SEED_DOMAIN: &str = "ostk-authority-install-partition-seed-v1";
 
+/// The migration that creates the normative binding-family tables. Below it a
+/// scope has no family to rebase.
+const NORMATIVE_ACTIVATION_SCHEMA_VERSION: i64 = 24;
+
 /// Pause before reading the server clock for a successor statement, so its
 /// `effective_from` is strictly after the predecessor's (the contracts require
 /// a strictly later instant at microsecond resolution).
@@ -255,6 +272,27 @@ pub struct AuthorityInstallRequestV1 {
     pub target: InstallTargetV1,
 }
 
+/// Whether an install to generation 3 rebases the scope's normative binding
+/// families onto the new head (ADR 0008 D3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormativeRebaseModeV1 {
+    /// Rebase every family whose head names another registry head. The
+    /// default.
+    #[default]
+    Rebase,
+    /// Leave every family where it is, stranded as ADR 0007 D11 describes:
+    /// `--no-normative-rebase`.
+    Skip,
+}
+
+/// How to install, beyond what [`AuthorityInstallRequestV1`] installs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuthorityInstallOptionsV1 {
+    /// Only consulted for [`InstallTargetV1::Generation3`].
+    pub normative_rebase: NormativeRebaseModeV1,
+}
+
 /// One installer step, in the order they run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -265,6 +303,12 @@ pub enum InstallStepV1 {
     GenerationTwo,
     /// `2 -> 3`; reported only for [`InstallTargetV1::Generation3`].
     GenerationThree,
+    /// Every normative binding family rebased onto the generation-3 head;
+    /// reported only for [`InstallTargetV1::Generation3`] without
+    /// [`NormativeRebaseModeV1::Skip`]. `inserted` when this run rebased at
+    /// least one family, `already_present` otherwise; the report's
+    /// `normative_families` says what happened to each.
+    NormativeRebase,
 }
 
 /// Whether a step wrote anything.
@@ -329,6 +373,10 @@ pub struct AuthorityInstallReportV1 {
     pub activation_id: Sha256Digest,
     pub package: KnownRegistryPackage,
     pub pins: WriterAuthorityPinsV1,
+    /// What the normative rebase did to each binding family of the scope:
+    /// empty unless [`InstallStepV1::NormativeRebase`] ran. A `stranded`
+    /// family still names its old registry head.
+    pub normative_families: Vec<NormativeFamilyRebaseV1>,
 }
 
 /// The governance keys every installer signature is made with.
@@ -406,16 +454,35 @@ impl FixtureGovernanceKeys {
 // The installer.
 // ---------------------------------------------------------------------------
 
+/// [`install_writer_authority_with`] under the default
+/// [`AuthorityInstallOptionsV1`].
+///
+/// An install to generation 3 therefore rebases the scope's normative
+/// families.
+///
+/// # Errors
+///
+/// As [`install_writer_authority_with`].
+pub async fn install_writer_authority(
+    pool: &PgPool,
+    request: &AuthorityInstallRequestV1,
+    retry: RetryPolicy,
+) -> Result<AuthorityInstallReportV1> {
+    install_writer_authority_with(pool, request, AuthorityInstallOptionsV1::default(), retry).await
+}
+
 /// Give `request.physical_scope` an active head at `request.target` (or past
 /// it) bound to `request.semantic_scope`, skipping whatever is already
 /// durable.
 ///
-/// Runs as the schema owner/migrator login: it writes the control and
-/// registry tables, which no application role may. It is safe to re-run; a
-/// second run reports every step [`InstallStepOutcomeV1::AlreadyPresent`] with
-/// the same pins and activation. Two concurrent runs against one physical
-/// scope are not coordinated beyond the repositories' own serializable
-/// compare-and-swaps, so the loser fails closed and a re-run completes it.
+/// For generation 3 it then rebases the scope's normative families as
+/// `options` says. It runs as the schema owner/migrator login: it writes the
+/// control and registry tables, which no application role may. It is safe to
+/// re-run; a second run reports every step
+/// [`InstallStepOutcomeV1::AlreadyPresent`] with the same pins and activation.
+/// Two concurrent runs against one physical scope are not coordinated beyond
+/// the repositories' own serializable compare-and-swaps, so the loser fails
+/// closed and a re-run completes it.
 ///
 /// # Errors
 ///
@@ -423,11 +490,15 @@ impl FixtureGovernanceKeys {
 /// request does not describe (another bootstrap receipt, other namespaces, an
 /// unknown package, or a package re-activated at a generation the installer's
 /// own lineage would not have put it at), with or without a registry head
-/// above that bootstrap, and any repository, contract, or database error from
-/// a step.
-pub async fn install_writer_authority(
+/// above that bootstrap; a configuration error, before any write, for a
+/// normative rebase over a scope that holds binding families but lacks
+/// migration 32; and any repository, contract, or database error from a
+/// step. A family the rebase cannot verify is not an error: it is reported
+/// `stranded`.
+pub async fn install_writer_authority_with(
     pool: &PgPool,
     request: &AuthorityInstallRequestV1,
+    options: AuthorityInstallOptionsV1,
     retry: RetryPolicy,
 ) -> Result<AuthorityInstallReportV1> {
     let control = TrustedControlScope::from_trusted_context(
@@ -436,7 +507,17 @@ pub async fn install_writer_authority(
     )?;
     let artifacts = InstallArtifacts::compile(request)?;
     let config = artifacts.pins.writer_authority_config();
-    let mut steps = Vec::with_capacity(5);
+    let mut steps = Vec::with_capacity(6);
+
+    // A rebase needs migration 32 wherever a family exists. Refuse before the
+    // first write rather than after the registry head has moved.
+    let rebase = request.target == InstallTargetV1::Generation3
+        && options.normative_rebase == NormativeRebaseModeV1::Rebase;
+    let normative_tables = if rebase {
+        require_normative_rebase_schema(pool, &request.physical_scope).await?
+    } else {
+        false
+    };
 
     // Read the view before writing anything: it refuses authority this
     // request does not describe, and it fails before step 1 on a schema that
@@ -489,41 +570,23 @@ pub async fn install_writer_authority(
         });
     }
 
-    // 4 and 5. Walk the lineage up to the target, reading the head again
-    // before each step: a head at or past the step's package reports it
-    // present, a head holding the step's predecessor moves forward, and
-    // anything else is authority the installer did not put there.
+    // 4 and 5.
     let target_rank = lineage_rank(request.target.package());
     for successor in SUCCESSOR_LINEAGE
         .iter()
         .take_while(|successor| lineage_rank(successor.to) <= target_rank)
     {
-        let head = read_installed_head(pool, &request.physical_scope, &config)
-            .await?
-            .ok_or_else(|| {
-                FleetError::RegistryActivationCorrupt(
-                    "the first successor committed but the writer-authority view projects no head"
-                        .into(),
-                )
-            })?;
-        let known = head.active_package().known();
-        let outcome = if lineage_rank(known) >= lineage_rank(successor.to) {
-            InstallStepOutcomeV1::AlreadyPresent
-        } else if known == successor.from
-            && head.generation() == u64::from(lineage_rank(successor.from))
-        {
-            activate_known_successor(pool, &control, retry, &artifacts, &head, successor).await?
-        } else {
-            return Err(refused(&format!(
-                "generation {} activates the {} package; the installer only drives the heads its \
-                 own lineage installs (1 -> 2 -> 3)",
-                head.generation(),
-                package_name(known)
-            )));
-        };
         steps.push(InstallStepReportV1 {
             step: successor.step,
-            outcome,
+            outcome: advance_lineage(
+                pool,
+                &control,
+                retry,
+                &artifacts,
+                (&request.physical_scope, &config),
+                successor,
+            )
+            .await?,
         });
     }
 
@@ -536,13 +599,132 @@ pub async fn install_writer_authority(
             package_name(request.target.package())
         )));
     }
+
+    // 6. Move every normative family onto the head the witness just accepted.
+    let normative_families = if rebase {
+        let (step, families) =
+            rebase_normative_families(pool, &control, &witness, retry, normative_tables).await?;
+        steps.push(step);
+        families
+    } else {
+        Vec::new()
+    };
     Ok(AuthorityInstallReportV1 {
         steps,
         generation: witness.generation(),
         activation_id: witness.activation_id(),
         package: witness.active_package().known(),
         pins: artifacts.pins,
+        normative_families,
     })
+}
+
+/// Steps 4 and 5: one step of the lineage, reading the head again first. A
+/// head at or past the step's package reports it present, a head holding the
+/// step's predecessor moves forward, and anything else is authority the
+/// installer did not put there.
+async fn advance_lineage(
+    pool: &PgPool,
+    control: &TrustedControlScope,
+    retry: RetryPolicy,
+    artifacts: &InstallArtifacts,
+    (physical_scope, config): (&FleetScope, &WriterAuthorityConfig),
+    successor: &SuccessorStepV1,
+) -> Result<InstallStepOutcomeV1> {
+    let head = read_installed_head(pool, physical_scope, config)
+        .await?
+        .ok_or_else(|| {
+            FleetError::RegistryActivationCorrupt(
+                "the first successor committed but the writer-authority view projects no head"
+                    .into(),
+            )
+        })?;
+    let known = head.active_package().known();
+    if lineage_rank(known) >= lineage_rank(successor.to) {
+        Ok(InstallStepOutcomeV1::AlreadyPresent)
+    } else if known == successor.from
+        && head.generation() == u64::from(lineage_rank(successor.from))
+    {
+        activate_known_successor(pool, control, retry, artifacts, &head, successor).await
+    } else {
+        Err(refused(&format!(
+            "generation {} activates the {} package; the installer only drives the heads its \
+             own lineage installs (1 -> 2 -> 3)",
+            head.generation(),
+            package_name(known)
+        )))
+    }
+}
+
+/// Step 6: rebase every normative family onto the head `witness` accepted,
+/// when the schema has any (`normative_tables`). The step is `inserted` when
+/// it moved at least one family, `already_present` when every family was
+/// current or stranded.
+async fn rebase_normative_families(
+    pool: &PgPool,
+    control: &TrustedControlScope,
+    witness: &WriterAuthorityWitness,
+    retry: RetryPolicy,
+    normative_tables: bool,
+) -> Result<(InstallStepReportV1, Vec<NormativeFamilyRebaseV1>)> {
+    let families = if normative_tables {
+        rebase_spec_families(pool, control, witness, retry).await?
+    } else {
+        Vec::new()
+    };
+    let rebased = families.iter().any(|family| {
+        matches!(
+            family.outcome,
+            NormativeFamilyRebaseOutcomeV1::Rebased { .. }
+        )
+    });
+    let step = InstallStepReportV1 {
+        step: InstallStepV1::NormativeRebase,
+        outcome: if rebased {
+            InstallStepOutcomeV1::Inserted
+        } else {
+            InstallStepOutcomeV1::AlreadyPresent
+        },
+    };
+    Ok((step, families))
+}
+
+/// Whether the schema has the normative family tables (migration 24), after
+/// refusing a scope that holds a family but not migration 32's `rebase` log
+/// kind, which the rebase would need.
+async fn require_normative_rebase_schema(
+    pool: &PgPool,
+    physical_scope: &FleetScope,
+) -> Result<bool> {
+    let applied: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM public._sqlx_migrations WHERE success AND version IN ($1, $2)",
+    )
+    .bind(NORMATIVE_ACTIVATION_SCHEMA_VERSION)
+    .bind(NORMATIVE_REBASE_SCHEMA_VERSION)
+    .fetch_all(pool)
+    .await?;
+    if !applied.contains(&NORMATIVE_ACTIVATION_SCHEMA_VERSION) {
+        return Ok(false);
+    }
+    if applied.contains(&NORMATIVE_REBASE_SCHEMA_VERSION) {
+        return Ok(true);
+    }
+    let families: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.memory_normative_heads_v1 \
+         WHERE tenant_id = $1 AND project = $2",
+    )
+    .bind(physical_scope.tenant_id)
+    .bind(&physical_scope.project)
+    .fetch_one(pool)
+    .await?;
+    if families == 0 {
+        return Ok(true);
+    }
+    Err(refused(&format!(
+        "rebasing its normative binding families needs migration \
+         {NORMATIVE_REBASE_SCHEMA_VERSION}; run `ostk-fleet-recall migrate` first, or pass \
+         --no-normative-rebase to leave them stranded (ADR 0007 D11)"
+    )))
 }
 
 /// Everything the four steps sign or bind, closed before any database write.

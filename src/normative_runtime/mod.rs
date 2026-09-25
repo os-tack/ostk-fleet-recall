@@ -13,7 +13,8 @@
 //! * [`repository`] — the admission rules (the whole fail-closed boundary, all
 //!   pure), the request/outcome shapes, and the
 //!   [`repository::NormativeActivationRepository`] trait.
-//! * [`cockroach`] — the `CockroachDB` implementation over migration 0024.
+//! * [`cockroach`] — the `CockroachDB` implementation over migration 0024 (and
+//!   0032's `rebase` log kind).
 //! * [`approvals`] — pure. Verifies Ed25519 approvals against the active
 //!   activation policy's keys, under a normative-only signature domain, and
 //!   mints the [`crate::memory_contracts::normative_v2::NormativeActivationReceiptV2`]
@@ -55,6 +56,12 @@
 //!   scope the repository was constructed for, and every SQL statement is keyed
 //!   by the trusted `(tenant_id, project)` pair. A proposal minted for another
 //!   tenant or project is refused before a transaction opens.
+//! * **Rebase (ADR 0008 D3)** — a family's head moves to another registry head
+//!   only through [`repository::admit_rebase`], under the head lock, and only
+//!   when every registry entry its live statements depend on is byte-identical
+//!   under the target. The `rebase` log row, the head's move, and the cursor
+//!   advance are one transaction; the fold treats the row as a no-op for
+//!   resolution.
 //! * **Contested ⇒ unknown** — a contested overlap resolves to
 //!   [`projection::NormativeResolutionV1::Unknown`]. There is no arm anywhere in
 //!   [`projection`] that breaks a tie by recency or insertion order; the fold
@@ -70,7 +77,9 @@ pub use approvals::{
     NORMATIVE_APPROVAL_SIGNATURE_PREFIX, approval_attestation_id, normative_approval_message,
     sign_normative_approval, verify_normative_approvals,
 };
-pub use cockroach::{CockroachNormativeActivationRepository, NormativeFaultInjection};
+pub use cockroach::{
+    CockroachNormativeActivationRepository, MAX_LISTED_FAMILY_HEADS, NormativeFaultInjection,
+};
 pub use projection::{
     MAX_FAMILY_LOG_ENTRIES, NORMATIVE_PROJECTION_SCHEMA_VERSION, NormativeFamilyProjectionV1,
     NormativeLogEntryV1, NormativeLogRecordV1, NormativePointResolutionV1, NormativeResolutionV1,
@@ -79,6 +88,8 @@ pub use projection::{
 pub use repository::{
     AdmittedNormativeActivationV1, NormativeActivationCandidateV1, NormativeActivationOutcomeV1,
     NormativeActivationRepository, NormativeHeadRowV1, NormativeLifecycleRequestV1,
-    NormativeRegistryBindingV1, NormativeTransitionV1, active_binding_set_digest, admit_activation,
-    admit_contest, admit_lifecycle, require_non_conflicting_against_live, require_witnessed_head,
+    NormativeRebaseAdmissionV1, NormativeRebaseOutcomeV1, NormativeRebaseRequestV1,
+    NormativeRebaseTargetV1, NormativeRegistryBindingV1, NormativeTransitionV1,
+    active_binding_set_digest, admit_activation, admit_contest, admit_lifecycle, admit_rebase,
+    require_non_conflicting_against_live, require_witnessed_head,
 };

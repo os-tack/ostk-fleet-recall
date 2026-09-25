@@ -1418,7 +1418,10 @@ activation policy with the database's clock as `accepted_at`. That policy's
 signers are the public fixture keys, so approval is nominal and the real gate
 is the writer credential. A family's head keeps the registry digests it was
 last advanced under, so after a registry transition no further statement can
-be activated into it; rebasing is deferred (ADR 0007 D10 and D11).
+be activated into it (ADR 0007 D10 and D11) until it is rebased: moving a
+scope with `ostk-authority-install apply --target generation-3` rebases every
+family whose statements' registry dependencies generation 3 carries byte for
+byte, appending a `rebase` row to its normative log (ADR 0008 D3).
 Retirement, waivers, and retroactive corrections are not implemented.
 
 ### Evidence ledger, retention, archive, and erasure

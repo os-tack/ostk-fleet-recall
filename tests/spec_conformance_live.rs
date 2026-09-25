@@ -69,6 +69,15 @@
 //!
 //! On a scope installed straight to generation 3 (ADR 0008), the same chain
 //! drafts, activates, and judges a commit as a verified nonconformance.
+//!
+//! And it proves the normative head rebase of ADR 0008 D3: moving a scope with
+//! an active spec from generation 2 to 3 appends one `rebase` row to the spec
+//! family's log and moves its head, after which a draft made before the move
+//! is refused as a stale head while a redraft supersedes the statement; a
+//! family whose live statement `ostk-spec` never recorded is reported stranded
+//! and left on its old head; a re-run rebases nothing twice; and a move that
+//! skips the rebase keeps the family stranded (ADR 0007 D11), refusing drafts
+//! and losing the compare-and-set, until a later run rebases it.
 
 mod common;
 
@@ -123,8 +132,13 @@ use ostk_fleet_recall::memory_contracts::observer::{EvaluatedConditionV1, Verifi
 use ostk_fleet_recall::memory_contracts::registry::{EligibleApprovalV1, RegistryHeadV1};
 use ostk_fleet_recall::normative_runtime::{
     CockroachNormativeActivationRepository, NormativeActivationCandidateV1,
-    NormativeActivationOutcomeV1, NormativeActivationRepository as _, NormativeRegistryBindingV1,
-    NormativeResolutionV1, sign_normative_approval,
+    NormativeActivationOutcomeV1, NormativeActivationRepository as _, NormativeLogRecordV1,
+    NormativeRegistryBindingV1, NormativeResolutionV1, sign_normative_approval,
+};
+use ostk_fleet_recall::registry_activation::install::{
+    AuthorityInstallOptionsV1, AuthorityInstallReportV1, InstallStepOutcomeV1, InstallStepV1,
+    InstallTargetV1, NormativeRebaseModeV1, install_writer_authority,
+    install_writer_authority_with,
 };
 use ostk_fleet_recall::registry_witness::{KnownRegistryPackage, WriterAuthorityRuntime};
 use ostk_fleet_recall::service::{
@@ -132,11 +146,12 @@ use ostk_fleet_recall::service::{
 };
 use ostk_fleet_recall::spec_conformance::{
     CockroachSpecRepository, DraftStatementRequestV1, ExpectedMembershipV1,
-    RememberActionExpectationV1, SpecActivationOutcomeV1, SpecCheckOutcomeV1, SpecCheckRecordV1,
-    SpecCheckRequestV1, SpecConformanceAnswerV1, SpecConformanceRead, SpecDetectionV1,
-    SpecDiscrepancyActionV1, SpecEffectV1, SpecEpisodeTransitionV1, SpecRowWriteV1, SpecSummaryV1,
-    SpecVerdictV1, activate_spec_statement, append_episode_lifecycle, build_spec_envelope,
-    database_now, draft_spec_statement, normative_repository, repository_selector,
+    NormativeFamilyRebaseOutcomeV1, NormativeFamilyRebaseV1, RememberActionExpectationV1,
+    SpecActivationOutcomeV1, SpecCheckOutcomeV1, SpecCheckRecordV1, SpecCheckRequestV1,
+    SpecConformanceAnswerV1, SpecConformanceRead, SpecDetectionV1, SpecDiscrepancyActionV1,
+    SpecEffectV1, SpecEpisodeTransitionV1, SpecRowWriteV1, SpecSummaryV1, SpecVerdictV1,
+    activate_spec_statement, append_episode_lifecycle, build_spec_envelope, database_now,
+    draft_spec_statement, draft_statement, normative_repository, repository_selector,
     repository_subject, require_spec_statement, run_spec_check, spec_predicate,
     spec_repository as runtime_spec_repository, spec_span_digest, start_spec_conformance,
 };
@@ -2688,4 +2703,399 @@ async fn live_the_spec_plane_runs_under_a_runtime_member_role_when_configured() 
         reader.status().await.unwrap();
     }))
     .await;
+}
+
+// --- normative head rebase on 2 -> 3 (ADR 0008 D3) ---
+
+/// A generation-2 scope whose no-`Forget` spec is active, taking effect 120
+/// seconds after the database's time; the draft of a supersession of it; and
+/// the instant the approvals are signed at.
+struct ActiveSpecScope {
+    installed: InstalledAuthority,
+    runtime: WriterAuthorityRuntime,
+    _repository: ScratchRepository,
+    statement_id: Sha256Digest,
+    /// "`Purge` must be absent", superseding the active statement.
+    superseding: DraftStatementRequestV1,
+    signed_at: CanonicalTimestamp,
+}
+
+async fn active_spec_scope(owner: &PgPool, label: &str) -> ActiveSpecScope {
+    let installed = install_generation_two(owner, label).await;
+    let (repository, first, _) = spec_repository_with_two_commits();
+    let runtime = installed.runtime(owner).await;
+    let now = database_now(owner).await.unwrap();
+    let effective_from = instant(now + TimeDelta::seconds(120));
+    let request = draft_request(&repository, &first, effective_from);
+    let (proposal, expectation) = draft_spec_statement(&runtime, &request).await.unwrap();
+    let statement_id = proposal.statement_id().unwrap();
+    let activated = activate_signed(&runtime, &proposal, &expectation, &instant(now))
+        .await
+        .unwrap();
+    assert!(activated.is_live(), "{activated:?}");
+    let superseding = DraftStatementRequestV1 {
+        member: "Purge".into(),
+        supersedes: Some(statement_id),
+        ..request
+    };
+    ActiveSpecScope {
+        installed,
+        runtime,
+        _repository: repository,
+        statement_id,
+        superseding,
+        signed_at: instant(now),
+    }
+}
+
+impl ActiveSpecScope {
+    /// The installer request that moves this scope to generation 3.
+    fn to_generation_three(
+        &self,
+    ) -> ostk_fleet_recall::registry_activation::install::AuthorityInstallRequestV1 {
+        let mut request = self.installed.request();
+        request.target = InstallTargetV1::Generation3;
+        request
+    }
+
+    /// The spec family's head, log, and projection under a fresh witness.
+    async fn family(
+        &self,
+    ) -> (
+        ostk_fleet_recall::normative_runtime::NormativeHeadRowV1,
+        Vec<ostk_fleet_recall::normative_runtime::NormativeLogEntryV1>,
+        NormativeResolutionV1,
+    ) {
+        let verified = self.runtime.verify().await.unwrap();
+        let normative = normative_repository(&self.runtime, verified.witness()).unwrap();
+        let family = id(SPEC_FAMILY);
+        (
+            normative.read_head(&family).await.unwrap().unwrap(),
+            normative.read_log(&family).await.unwrap(),
+            normative
+                .read_projection(&family)
+                .await
+                .unwrap()
+                .unwrap()
+                .resolution,
+        )
+    }
+}
+
+fn install_steps(report: &AuthorityInstallReportV1) -> Vec<(InstallStepV1, InstallStepOutcomeV1)> {
+    report
+        .steps
+        .iter()
+        .map(|step| (step.step, step.outcome))
+        .collect()
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one move, read back from the report, the log, and the next drafts
+async fn live_moving_to_generation_three_rebases_an_active_spec_family_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let owner = common::migrated_pool(&database_url).await;
+    let scope = active_spec_scope(&owner, "spec-rebase").await;
+    let runtime = &scope.runtime;
+    let generation_two = runtime.verify().await.unwrap().head_binding().clone();
+
+    // A supersession drafted before the move names the generation-2 head.
+    let (drafted_before, drafted_before_expectation) =
+        draft_spec_statement(runtime, &scope.superseding)
+            .await
+            .unwrap();
+
+    // A second family whose live statement ostk-spec never recorded: nothing
+    // tells the rebase what it depends on.
+    let unrecorded = {
+        let verified = runtime.verify().await.unwrap();
+        let mut proposal = proposal_for(
+            &expectation("Unrecorded", ExpectedMembershipV1::Absent),
+            semantic_scope(),
+        );
+        proposal.registry_head = verified.head_binding().clone();
+        let outcome = normative_repository(runtime, verified.witness())
+            .unwrap()
+            .activate(&NormativeActivationCandidateV1 {
+                receipt: receipt_for(&proposal),
+                proposal: proposal.clone(),
+                retroactive_correction: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, NormativeActivationOutcomeV1::Installed(_)),
+            "{outcome:?}"
+        );
+        proposal.binding_family_id
+    };
+
+    let moved = install_writer_authority(&owner, &scope.to_generation_three(), retry_policy())
+        .await
+        .expect("the scope moves to generation 3");
+    assert_eq!(
+        install_steps(&moved)[4..],
+        [
+            (
+                InstallStepV1::GenerationThree,
+                InstallStepOutcomeV1::Inserted
+            ),
+            (
+                InstallStepV1::NormativeRebase,
+                InstallStepOutcomeV1::Inserted
+            ),
+        ]
+    );
+    let verified = runtime.verify().await.unwrap();
+    let witness = verified.witness();
+    assert_eq!(
+        witness.active_package().known(),
+        KnownRegistryPackage::CollectedItemsGeneration3
+    );
+
+    // The spec family is rebased; the unrecorded one is reported and left.
+    assert_eq!(
+        moved.normative_families.len(),
+        2,
+        "{:?}",
+        moved.normative_families
+    );
+    let spec_family = moved
+        .normative_families
+        .iter()
+        .find(|family| family.binding_family_id == id(SPEC_FAMILY))
+        .expect("the spec family is reported");
+    let NormativeFamilyRebaseOutcomeV1::Rebased {
+        record_id,
+        from_registry_package_digest,
+        carried_entries,
+        ..
+    } = &spec_family.outcome
+    else {
+        panic!("the spec family must be rebased: {spec_family:?}");
+    };
+    assert_eq!(
+        *from_registry_package_digest,
+        generation_two.head.package_digest
+    );
+    assert_eq!(
+        *carried_entries, 3,
+        "its predicate, applicability evaluator, and repository recipe"
+    );
+    let stranded = moved
+        .normative_families
+        .iter()
+        .find(|family| family.binding_family_id == unrecorded)
+        .expect("the unrecorded family is reported");
+    assert!(
+        matches!(
+            &stranded.outcome,
+            NormativeFamilyRebaseOutcomeV1::Stranded { reason }
+                if reason.contains("no recorded spec proposal")
+        ),
+        "{stranded:?}"
+    );
+    let stranded_head = normative_repository(runtime, witness)
+        .unwrap()
+        .read_head(&unrecorded)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stranded_head.registry_package_digest, generation_two.head.package_digest,
+        "a stranded family keeps its old head"
+    );
+
+    // The spec family's head moved; its log gained exactly the rebase row;
+    // the statement in force did not change.
+    let (head, log, resolution) = scope.family().await;
+    assert_eq!(head.registry_package_digest, witness.package_digest());
+    assert_eq!(
+        head.activation_policy_digest,
+        witness.activation_policy_digest()
+    );
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[1].record_id, *record_id);
+    let NormativeLogRecordV1::Rebase { rebase } = &log[1].record else {
+        panic!("the move appends a rebase row: {:?}", log[1]);
+    };
+    assert_eq!(rebase.to_registry_package_digest, witness.package_digest());
+    assert_eq!(rebase.registry_activation_id, witness.activation_id());
+    assert_eq!(
+        resolution,
+        NormativeResolutionV1::Active {
+            statement_id: scope.statement_id
+        }
+    );
+
+    // A draft made before the move names the old head: it is stale, as
+    // documented, and activates nothing.
+    match activate_signed(
+        runtime,
+        &drafted_before,
+        &drafted_before_expectation,
+        &scope.signed_at,
+    )
+    .await
+    {
+        Err(FleetError::ControlContract(ContractError::StaleRegistryHead)) => {}
+        other => panic!("a draft made before the move must be a stale head: {other:?}"),
+    }
+
+    // Redrafted under generation 3, the supersession activates.
+    let (redrafted, redrafted_expectation) = draft_spec_statement(runtime, &scope.superseding)
+        .await
+        .unwrap();
+    assert_eq!(&redrafted.registry_head, witness.head_binding());
+    let superseded = activate_signed(
+        runtime,
+        &redrafted,
+        &redrafted_expectation,
+        &scope.signed_at,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            superseded.outcome,
+            SpecActivationOutcomeV1::Installed { .. }
+        ),
+        "{superseded:?}"
+    );
+    let (_, log, resolution) = scope.family().await;
+    assert_eq!(log.len(), 3);
+    assert_eq!(
+        resolution,
+        NormativeResolutionV1::Active {
+            statement_id: redrafted.statement_id().unwrap()
+        }
+    );
+
+    // A re-run rebases nothing twice.
+    let again = install_writer_authority(&owner, &scope.to_generation_three(), retry_policy())
+        .await
+        .unwrap();
+    assert!(
+        again
+            .steps
+            .iter()
+            .all(|step| step.outcome == InstallStepOutcomeV1::AlreadyPresent),
+        "{:?}",
+        again.steps
+    );
+    assert!(again.normative_families.contains(&NormativeFamilyRebaseV1 {
+        binding_family_id: id(SPEC_FAMILY),
+        outcome: NormativeFamilyRebaseOutcomeV1::AlreadyCurrent,
+    }));
+    assert_eq!(scope.family().await.1.len(), 3);
+}
+
+#[tokio::test]
+async fn live_a_move_without_the_rebase_strands_the_family_until_a_rebase_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let owner = common::migrated_pool(&database_url).await;
+    let scope = active_spec_scope(&owner, "spec-no-rebase").await;
+    let runtime = &scope.runtime;
+
+    let moved = install_writer_authority_with(
+        &owner,
+        &scope.to_generation_three(),
+        AuthorityInstallOptionsV1 {
+            normative_rebase: NormativeRebaseModeV1::Skip,
+        },
+        retry_policy(),
+    )
+    .await
+    .expect("the scope moves to generation 3");
+    assert_eq!(
+        install_steps(&moved).last(),
+        Some(&(
+            InstallStepV1::GenerationThree,
+            InstallStepOutcomeV1::Inserted
+        )),
+        "a skipped rebase is not a step"
+    );
+    assert!(moved.normative_families.is_empty());
+
+    // The family still names generation 2: drafting into it is refused...
+    match draft_spec_statement(runtime, &scope.superseding).await {
+        Err(FleetError::Memory(message)) if message.contains("another registry head") => {}
+        other => panic!("a stranded family must refuse a draft: {other:?}"),
+    }
+    // ...and a statement drafted under generation 3 regardless loses the
+    // compare-and-set and appends nothing (ADR 0007 D11).
+    let (hand_drafted, hand_drafted_expectation) = {
+        let verified = runtime.verify().await.unwrap();
+        let head = normative_repository(runtime, verified.witness())
+            .unwrap()
+            .read_head(&id(SPEC_FAMILY))
+            .await
+            .unwrap()
+            .unwrap();
+        draft_statement(
+            verified.witness(),
+            head.active_binding_set_digest,
+            &scope.superseding.reader().unwrap(),
+            &scope.superseding,
+        )
+        .unwrap()
+    };
+    let lost = activate_signed(
+        runtime,
+        &hand_drafted,
+        &hand_drafted_expectation,
+        &scope.signed_at,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(lost.outcome, SpecActivationOutcomeV1::Lost { .. }),
+        "{lost:?}"
+    );
+    assert_eq!(scope.family().await.1.len(), 1);
+
+    // A later run rebases the family, and the same statement then activates.
+    let rebased = install_writer_authority(&owner, &scope.to_generation_three(), retry_policy())
+        .await
+        .unwrap();
+    assert_eq!(
+        install_steps(&rebased).last(),
+        Some(&(
+            InstallStepV1::NormativeRebase,
+            InstallStepOutcomeV1::Inserted
+        ))
+    );
+    assert!(
+        matches!(
+            rebased.normative_families.as_slice(),
+            [NormativeFamilyRebaseV1 {
+                outcome: NormativeFamilyRebaseOutcomeV1::Rebased { .. },
+                ..
+            }]
+        ),
+        "{:?}",
+        rebased.normative_families
+    );
+    let activated = activate_signed(
+        runtime,
+        &hand_drafted,
+        &hand_drafted_expectation,
+        &scope.signed_at,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(activated.outcome, SpecActivationOutcomeV1::Installed { .. }),
+        "{activated:?}"
+    );
+    assert_eq!(
+        scope.family().await.2,
+        NormativeResolutionV1::Active {
+            statement_id: hand_drafted.statement_id().unwrap()
+        }
+    );
 }

@@ -441,7 +441,11 @@ through them against a local node.
 7. **Make specs normative and check commits.** Activate specs only once the
    scope has its generation-2 head from step 2: a later registry head change
    strands every family activated under the old head
-   ([ADR 0007 D11](docs/adr/0007-spec-conformance-chain.md)). Then:
+   ([ADR 0007 D11](docs/adr/0007-spec-conformance-chain.md)), except that
+   `ostk-authority-install apply --target generation-3` rebases every spec
+   family onto the generation-3 head as it moves the scope
+   ([ADR 0008 D3](docs/adr/0008-collected-items.md)); redraft any draft made
+   before the move. Then:
    - `ostk-spec draft` binds byte spans of a spec document at one commit to
      one expectation and writes `proposal.jsonl` and `expectation.jsonl`;
    - `ostk-spec approve`, once per approver, signs the draft offline. The

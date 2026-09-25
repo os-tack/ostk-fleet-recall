@@ -43,7 +43,7 @@ use ostk_fleet_recall::memory_contracts::common::ContractId;
 use ostk_fleet_recall::memory_contracts::coverage::CoverageCompletenessV1;
 use ostk_fleet_recall::memory_contracts::evidence_v2::EvidenceStatementV2;
 use ostk_fleet_recall::registry_activation::install::{
-    InstallStepOutcomeV1, InstallTargetV1, install_writer_authority,
+    InstallStepOutcomeV1, InstallStepV1, InstallTargetV1, install_writer_authority,
 };
 use ostk_fleet_recall::registry_witness::KnownRegistryPackage;
 use ostk_fleet_recall::store::cockroach::{CockroachStore, DatabaseCapabilities, PoolConfig};
@@ -793,7 +793,11 @@ async fn live_worker_keeps_its_sources_across_a_move_to_generation_three_when_co
         .expect("the scope moves to generation 3");
     assert_eq!(moved.pins, fixture.installed.report.pins);
     assert_eq!(
-        moved.steps.last().map(|step| step.outcome),
+        moved
+            .steps
+            .iter()
+            .find(|step| step.step == InstallStepV1::GenerationThree)
+            .map(|step| step.outcome),
         Some(InstallStepOutcomeV1::Inserted)
     );
 

@@ -45,6 +45,12 @@
 //! * [`registry`] — the compiled-in comparator lineage and episode policy
 //!   spec episodes are judged and grouped under. They are not
 //!   package-admitted (a DISC-06 deferral) and never change in place.
+//! * [`rebase`] — [`rebase_spec_families`], which moves every binding family
+//!   of a scope onto a new registry head after a registry transition, each
+//!   only when every registry entry its live statements depend on
+//!   ([`spec_statement_dependencies`]) is byte-identical under that head, so
+//!   a transition strands no family (ADR 0008 D3). `ostk-authority-install
+//!   apply --target generation-3` runs it.
 //! * [`read`] — [`CockroachSpecConformanceReader`], the SELECT-only read
 //!   behind `recall(action="discrepancies")` and `recall(status)`'s
 //!   `spec_conformance` block: the standing episodes of live specs (or every
@@ -67,6 +73,7 @@ pub mod expectation;
 pub mod lifecycle;
 pub mod providers;
 pub mod read;
+pub mod rebase;
 pub mod record;
 pub mod registry;
 
@@ -89,8 +96,8 @@ pub use cockroach::{
 pub use draft::{
     DraftStatementRequestV1, MAX_SPEC_DOCUMENT_BYTES, REPOSITORY_IDENTITY_RECIPE_ID,
     REPOSITORY_LOCATOR_KEY, SPEC_OBSERVER_ID, SPEC_OBSERVER_VERSION, draft_spec_statement,
-    draft_statement, repository_subject, select_spans, spec_applicability_evaluator,
-    spec_parser_artifact_id, spec_predicate, spec_span_digest,
+    draft_statement, repository_recipe, repository_subject, select_spans,
+    spec_applicability_evaluator, spec_parser_artifact_id, spec_predicate, spec_span_digest,
 };
 pub use envelope::{
     SPEC_EXPECTATION_POLICY_VERSION, SPEC_OPENING_PROVIDER_ORDER, SpecDetectionV1,
@@ -116,6 +123,10 @@ pub use read::{
     SpecConformanceWarningV1, SpecCoverageV1, SpecDiscrepancyV1, SpecEffectV1, SpecEpisodeEventV1,
     SpecEvidenceV1, SpecExpectationViewV1, SpecLastCheckV1, SpecObservationV1, SpecStatementViewV1,
     SpecSummaryV1, start_spec_conformance,
+};
+pub use rebase::{
+    NormativeFamilyRebaseOutcomeV1, NormativeFamilyRebaseV1, rebase_spec_families,
+    spec_statement_dependencies,
 };
 pub use record::{
     MAX_SPEC_CHECK_REASONS, SPEC_CHECK_RECORD_SCHEMA_VERSION, SpecCheckRecordV1, SpecVerdictV1,

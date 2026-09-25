@@ -1,10 +1,10 @@
 # ADR 0008: Collected items from any source
 
-- Status: accepted; D1 and D2 implemented. The generation-3 registry package
+- Status: accepted; D1 to D3 implemented. The generation-3 registry package
   is checked in, the strict witness recognizes it, and
-  `ostk-authority-install apply --target generation-3` activates it. No
-  collector, sink, or recall surface uses it yet; those land with their own
-  decisions.
+  `ostk-authority-install apply --target generation-3` activates it and
+  rebases the scope's normative families onto it. No collector, sink, or
+  recall surface uses it yet; those land with their own decisions.
 - Date: 2026-09-25
 - Scope: how specs and documents, Slack conversations, Linear tickets,
   Granola meetings, and anything else a collector can read become evidence
@@ -100,10 +100,11 @@ Rollout order, for every physical scope that is to collect items:
    a head: every event-first writer, every `serve`, the worker on its ingest
    host, and the projector container (ADR 0006 D1). A binary without the
    generation-3 row refuses a generation-3 head as `UnknownActivePackage`.
-2. Apply the release's migrations and re-apply the grant files. This release
-   adds none.
+2. Apply the release's migrations and re-apply the grant files. Migration 32
+   (D3) lets a spec family be rebased; it adds no grant.
 3. Run `ostk-authority-install apply --target generation-3`. The pins do not
-   change, so no writer is reconfigured.
+   change, so no writer is reconfigured, and the run rebases every spec
+   family onto the new head (D3).
 4. Only then configure collectors, agent capture, or webhook ingress.
 
 **Consequences an operator sees after the move.**
@@ -118,8 +119,87 @@ Rollout order, for every physical scope that is to collect items:
 - **Claims keep their keys.** Every recipe an asserted claim key is derived
   under is carried byte for byte, so the same assertion keys identically
   under generation 2 and 3 and the conflict lifecycle is unchanged.
-- **Spec families strand.** A binding family last advanced under the
-  generation-2 package loses every compare-and-set after the move, exactly as
-  ADR 0007 D11 describes for `1 -> 2`. Until a normative rebase exists, move a
-  scope before activating any spec in it, or accept that its families can
-  only be checked, not superseded.
+- **Spec families are rebased, drafts are not.** The move rebases every
+  binding family whose statements' registry dependencies generation 3
+  carries, which is every spec family (D3). A draft names the exact head it
+  was made under, so one made before the move is refused as a stale head and
+  must be redrafted after it.
+
+## D3 — Moving a scope to generation 3 rebases its normative families
+
+**Decision.** A binding family's head records the registry package and
+activation policy it was last advanced under, and every activation into the
+family compare-and-sets against them, so a registry transition strands the
+family (ADR 0007 D11). `ostk-authority-install apply --target generation-3`
+therefore ends with a normative rebase step. For every binding family of the
+scope whose head names another registry head than the one the run leaves
+active, it resolves what each live statement depends on, then, in one
+serializable transaction per family
+(`CockroachNormativeActivationRepository::rebase_family`):
+
+1. it locks the family's head;
+2. it requires the head's package digest to differ from the active one; a
+   head already there is `already_current`, and nothing is written;
+3. it requires the head to be at the revision the dependencies were resolved
+   at, and the dependencies to describe exactly the family's durable live
+   statements; a head that moved is re-read and resolved again;
+4. it requires every registry entry a live statement depends on to be present,
+   with the same id, version, and digest, in the active head's authority: its
+   package, or the genesis package the scope's pinned bootstrap binds, which
+   no successor transition changes;
+5. it appends one `rebase` record at `log_seq + 1`;
+6. it compare-and-sets the head's package and activation-policy digests with
+   `head_revision + 1`, leaving the binding set as it was;
+7. it advances the projection's cursor. The fold treats a `rebase` record as
+   a no-op for resolution, so the statement in force does not change.
+
+A spec statement depends on three entries: its applicability evaluator and
+its predicate, which resolve in the genesis package (ADR 0007 D1), and the
+`identity.github.repository` recipe of the package it was drafted under, which
+a check re-derives the statement's subject with. Generation 3 carries all
+three byte for byte, so every spec family moves.
+
+The record is `NormativeHeadRebaseV1`
+(`src/memory_contracts/normative_v2.rs`): the family, the from and to package
+and policy digests, the new head's exact `registry_activation_id` (an
+A -> B -> A rollback is a different activation), the sorted digests of the
+carried entries, and `rebased_at`, the database's time. Its identity is a
+digest under its own domain, `ostk-normative-head-rebase-v1`, so a family's
+log shows when and onto what it moved, and a rebuilt projection replays it.
+
+**A family that cannot be verified stays where it is.** A live statement
+`ostk-spec` never recorded, one drafted under a package this build does not
+recognize, or a dependency the new head does not carry, leaves the family on
+its old head. The report's `normative_families` lists it as `stranded` with
+the reason, and the CLI names it on stderr; the authority install itself
+succeeds. ADR 0007 D11 then applies to that family.
+
+**Opting out.** `--no-normative-rebase` skips the step and leaves every family
+stranded, as an explicit choice. A later run without the flag rebases them,
+and a re-run rebases nothing twice.
+
+**Migration 32.** Migration 0024 constrains the log's `record_kind` to
+`lifecycle` and `contest`. Migration 0032 adds `memory_normative_log_kind_v2`,
+which also admits `rebase`, commits it, and only then drops the old
+constraint, so every interruption leaves a kind check in force and 0024 stays
+byte-identical. The installer refuses, before any write, to rebase a scope
+that holds a family on a schema without migration 32. No grant changes: the
+installer runs as the migrator, the runtime role already holds `INSERT` on the
+log, and the runtime policy's schema gate stays at migrations 1 to 31, since
+nothing served needs 32.
+
+**What stays as ADR 0007 D11 describes.**
+
+- A draft names the exact witnessed head, so a draft made before the move is
+  refused as a stale head. The rebase moves families, never proposals.
+- A move made any other way, such as a hand-run generic successor ceremony or
+  `--no-normative-rebase`, rebases nothing, and the family's compare-and-set
+  keeps refusing until a rebase.
+- The rebase is nominal authority in the same sense as the installer's
+  signatures (ADR 0005 D2): the gate is the migrator credential. The record
+  proves only that the dependencies carried, which the runtime checked under
+  the head lock.
+
+**Deferred.** A rebase outside the installer's generation-3 run (an
+`ostk-spec rebase`, or a rebase onto generation 2), and rebasing families whose
+statements were not recorded by `ostk-spec`.

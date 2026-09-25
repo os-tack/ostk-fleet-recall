@@ -249,9 +249,11 @@ pub fn draft_statement(
 /// # Errors
 ///
 /// Whatever the strict witness or [`draft_statement`] refuses, and
-/// [`FleetError::Memory`] for a family whose head was seeded under another
-/// registry package or activation policy: normative families do not follow a
-/// registry head change, so nothing drafted now could activate there.
+/// [`FleetError::Memory`] for a family whose head was last advanced under
+/// another registry package or activation policy: nothing drafted now could
+/// activate there until the family is rebased onto the active head
+/// (`ostk-authority-install apply --target generation-3` rebases every family
+/// it moves a scope past; ADR 0008 D3).
 pub async fn draft_spec_statement(
     runtime: &WriterAuthorityRuntime,
     request: &DraftStatementRequestV1,
@@ -267,7 +269,8 @@ pub async fn draft_spec_statement(
             || head.activation_policy_digest != witness.activation_policy_digest())
     {
         return Err(FleetError::Memory(format!(
-            "binding family {} is bound to another registry head than the active one",
+            "binding family {} is bound to another registry head than the active one; rebase \
+             it onto the active head before drafting into it (ADR 0008 D3)",
             request.binding_family_id
         )));
     }
@@ -350,30 +353,49 @@ pub fn repository_subject(
     scope: &AuthenticatedProjectScopeV1,
     provider_repository_id: u64,
 ) -> ContractResult<ResourceUri> {
-    let manifest = package.manifest_verified_package();
+    let recipe = repository_recipe(package)?;
+    let components = BTreeMap::from([(
+        REPOSITORY_LOCATOR_KEY.to_owned(),
+        provider_repository_id.to_string(),
+    )]);
+    Ok(derive_entity_from_components(
+        package.manifest_verified_package(),
+        &recipe,
+        scope,
+        &components,
+    )?
+    .uri()
+    .clone())
+}
+
+/// The exact [`REPOSITORY_IDENTITY_RECIPE_ID`] entry of `package` that
+/// [`repository_subject`] derives a spec statement's subject under.
+///
+/// # Errors
+///
+/// A contract error when the package does not carry exactly one such recipe.
+pub fn repository_recipe(
+    package: &SemanticallyClosedSuccessorPackage,
+) -> ContractResult<RegistryReferenceV1> {
     let recipe_id = ContractId::new(REPOSITORY_IDENTITY_RECIPE_ID)?;
-    let mut recipes = manifest.package().entries.iter().filter(|entry| {
-        entry.kind == RegistryEntryKind::IdentityRecipe && entry.entry_id == recipe_id
-    });
+    let mut recipes = package
+        .manifest_verified_package()
+        .package()
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.kind == RegistryEntryKind::IdentityRecipe && entry.entry_id == recipe_id
+        });
     let (Some(entry), None) = (recipes.next(), recipes.next()) else {
         return Err(ContractError::InvalidIdentityRecipe(format!(
             "the active package must carry exactly one {REPOSITORY_IDENTITY_RECIPE_ID} recipe"
         )));
     };
-    let recipe = RegistryReferenceV1 {
+    Ok(RegistryReferenceV1 {
         entry_id: entry.entry_id.clone(),
         version: entry.version,
         entry_digest: entry.digest()?,
-    };
-    let components = BTreeMap::from([(
-        REPOSITORY_LOCATOR_KEY.to_owned(),
-        provider_repository_id.to_string(),
-    )]);
-    Ok(
-        derive_entity_from_components(manifest, &recipe, scope, &components)?
-            .uri()
-            .clone(),
-    )
+    })
 }
 
 /// The digest one cited span records: exactly the bytes it selects, under

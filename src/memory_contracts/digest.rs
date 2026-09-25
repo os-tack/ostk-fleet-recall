@@ -421,6 +421,11 @@ pub enum DigestDomain {
     /// are not package-admitted, so there is no vector manifest to digest:
     /// the label names the unit tests that prove them.
     SpecCompiledEntryVectorsV1,
+    // --- Collected items (ADR 0008) domains ---
+    /// ADR 0008 D3. Identity of one `NormativeHeadRebaseV1` record: a binding
+    /// family's composite head moved from one registry head to another with
+    /// its live statements unchanged, framed over its canonical bytes.
+    NormativeHeadRebaseV1,
 }
 
 impl DigestDomain {
@@ -593,6 +598,8 @@ impl DigestDomain {
             Self::SpecCheckRecordV1 => "ostk-spec-check-record-v1",
             Self::SpecDraftParserArtifactV1 => "ostk-spec-draft-parser-artifact-v1",
             Self::SpecCompiledEntryVectorsV1 => "ostk-spec-compiled-entry-vectors-v1",
+            // --- Collected items (ADR 0008) prefixes ---
+            Self::NormativeHeadRebaseV1 => "ostk-normative-head-rebase-v1",
         }
     }
 }

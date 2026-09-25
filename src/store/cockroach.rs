@@ -48,6 +48,10 @@ pub const MEMORY_WORKER_SCHEMA_VERSION: i64 = 30;
 /// First schema with the spec conformance statement and check tables
 /// (migration 0031, ADR 0007).
 pub const SPEC_CONFORMANCE_SCHEMA_VERSION: i64 = 31;
+/// First schema whose normative log admits `rebase` rows (migration 0032,
+/// ADR 0008 D3). Below it a binding family cannot be rebased onto a new
+/// registry head; no served surface requires it.
+pub const NORMATIVE_REBASE_SCHEMA_VERSION: i64 = 32;
 
 /// Exact application tables reachable from public health/status/recall SQL.
 ///
@@ -355,6 +359,8 @@ const WORKER_SOURCE_STATUS_MIGRATION_SQL: &str =
     include_str!("../../migrations/0030_worker_source_status.sql");
 const SPEC_CONFORMANCE_MIGRATION_SQL: &str =
     include_str!("../../migrations/0031_spec_conformance.sql");
+const NORMATIVE_REBASE_KIND_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0032_normative_rebase_kind.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -397,7 +403,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
 }
 
 #[allow(clippy::too_many_lines)] // one registration per migration file, in version order
-fn post_transactional_online_migrations() -> [Migration; 16] {
+fn post_transactional_online_migrations() -> [Migration; 17] {
     [
         Migration::new(
             15,
@@ -551,6 +557,18 @@ fn post_transactional_online_migrations() -> [Migration; 16] {
             // ADR 0007. Additive: two insert-only private-plane tables and
             // two indexes, with no foreign key. Runs outside SQLx's
             // transaction wrapper like migrations 0018-0030.
+            true,
+        ),
+        Migration::new(
+            NORMATIVE_REBASE_SCHEMA_VERSION,
+            Cow::Borrowed("normative head rebase kind"),
+            MigrationType::Simple,
+            Cow::Borrowed(NORMATIVE_REBASE_KIND_MIGRATION_SQL),
+            // ADR 0008 D3. Widens migration 0024's normative-log kind check
+            // to admit 'rebase': the new constraint is added and committed
+            // before the old one is dropped, so every interruption leaves a
+            // kind check in force. Runs outside SQLx's transaction wrapper
+            // like migrations 0018-0031.
             true,
         ),
     ]
@@ -3069,6 +3087,106 @@ mod tests {
         store.migrate().await.unwrap();
         assert_exact_successful_migration_prefix(store.pool()).await;
         assert_online_projection_indexes_are_covering(store.pool()).await;
+    }
+
+    /// The committed CHECK constraints on the normative log's `record_kind`,
+    /// as `name:definition`, sorted.
+    async fn normative_log_kind_constraints(pool: &PgPool) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT constraint_object.conname || ':' \
+                    || pg_catalog.pg_get_constraintdef(constraint_object.oid) \
+             FROM pg_catalog.pg_constraint AS constraint_object \
+             JOIN pg_catalog.pg_class AS relation_object \
+                 ON relation_object.oid = constraint_object.conrelid \
+             WHERE relation_object.relname = 'memory_normative_log_v1' \
+               AND constraint_object.conname LIKE 'memory_normative_log_kind%' \
+             ORDER BY constraint_object.conname",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Migration 32 widens the normative log's kind check without editing
+    /// migration 24: a run interrupted after its ADD resumes, and a same-name
+    /// constraint of another definition fails closed before `SQLx` records
+    /// success. The configured database must be disposable.
+    #[tokio::test]
+    async fn live_normative_rebase_kind_migration_resumes_and_rejects_drift_when_configured() {
+        let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _live_database_guard = LIVE_DATABASE_TEST_LOCK.lock().await;
+        let store = CockroachStore::connect(
+            &database_url,
+            scope("live-normative-rebase-kind-migration-test"),
+            PoolConfig::default(),
+        )
+        .await
+        .unwrap();
+        let pool = store.pool();
+        store.migrate().await.unwrap();
+        assert_exact_successful_migration_prefix(pool).await;
+        let widened = vec![
+            "memory_normative_log_kind_v2:CHECK ((record_kind IN ('lifecycle'::STRING, \
+             'contest'::STRING, 'rebase'::STRING)))"
+                .to_owned(),
+        ];
+        assert_eq!(normative_log_kind_constraints(pool).await, widened);
+
+        // Process death after the widened constraint committed and before the
+        // old one was dropped or SQLx recorded success. (NOT VALID only because
+        // the shared database may already hold rebase rows.)
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+            .bind(NORMATIVE_REBASE_SCHEMA_VERSION)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE memory_normative_log_v1 ADD CONSTRAINT memory_normative_log_kind \
+             CHECK (record_kind IN ('lifecycle', 'contest')) NOT VALID",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        store.migrate().await.unwrap();
+        assert_exact_successful_migration_prefix(pool).await;
+        assert_eq!(normative_log_kind_constraints(pool).await, widened);
+
+        // A same-name constraint of another definition is drift, not adoption.
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+            .bind(NORMATIVE_REBASE_SCHEMA_VERSION)
+            .execute(pool)
+            .await
+            .unwrap();
+        for statement in [
+            "ALTER TABLE memory_normative_log_v1 DROP CONSTRAINT memory_normative_log_kind_v2",
+            "ALTER TABLE memory_normative_log_v1 ADD CONSTRAINT memory_normative_log_kind_v2 \
+             CHECK (record_kind IN ('lifecycle', 'contest', 'rebase', 'other'))",
+        ] {
+            sqlx::query(statement).execute(pool).await.unwrap();
+        }
+        let drift = store.migrate().await.unwrap_err();
+        assert!(drift.to_string().contains("migration 0032"), "{drift}");
+        let history_count: i64 =
+            sqlx::query_scalar("SELECT count(*)::INT8 FROM _sqlx_migrations WHERE version = $1")
+                .bind(NORMATIVE_REBASE_SCHEMA_VERSION)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(history_count, 0);
+
+        // Removing the drifted object is the reviewed repair; the retry
+        // completes the migration.
+        sqlx::query(
+            "ALTER TABLE memory_normative_log_v1 DROP CONSTRAINT memory_normative_log_kind_v2",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        store.migrate().await.unwrap();
+        assert_exact_successful_migration_prefix(pool).await;
+        assert_eq!(normative_log_kind_constraints(pool).await, widened);
     }
 
     /// `SQLx` must commit each transactional successor table and its migration

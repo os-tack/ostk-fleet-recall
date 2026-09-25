@@ -660,3 +660,196 @@ fn a_head_differing_only_in_effective_from_is_stale() {
         Err(ContractError::StaleRegistryHead)
     );
 }
+
+// --- head rebase (ADR 0008 D3) ---
+
+const REBASED_AT: &str = "2026-09-25T12:00:00.000000000Z";
+
+fn rebase_target_binding() -> NormativeRegistryBindingV1 {
+    NormativeRegistryBindingV1 {
+        registry_package_digest: label("registry-package-3"),
+        activation_policy_digest: label("activation-policy"),
+    }
+}
+
+/// A family head last advanced under [`binding`], at revision 1 and log
+/// sequence 1.
+fn head_under_binding() -> NormativeHeadRowV1 {
+    NormativeHeadRowV1 {
+        binding_family_id: proposal().binding_family_id,
+        active_binding_set_digest: active_binding_set_digest(
+            &proposal().binding_family_id,
+            &[label("live")],
+        ),
+        registry_package_digest: binding().registry_package_digest,
+        activation_policy_digest: binding().activation_policy_digest,
+        head_revision: 1,
+        log_seq: 1,
+    }
+}
+
+fn projection_at_head() -> NormativeFamilyProjectionV1 {
+    let mut projection = projection_with(&[(label("live"), EFFECTIVE_FROM, None)]);
+    projection.cursor_seq = 1;
+    projection
+}
+
+/// A target carrying `entries`.
+fn rebase_target(entries: &[&str]) -> NormativeRebaseTargetV1 {
+    NormativeRebaseTargetV1::new(
+        rebase_target_binding(),
+        label("activation-3"),
+        entries.iter().copied().map(reference),
+    )
+    .unwrap()
+}
+
+/// The live statement depending on `dependencies`, at the head's revision.
+fn rebase_request(dependencies: &[&str]) -> NormativeRebaseRequestV1 {
+    NormativeRebaseRequestV1 {
+        binding_family_id: proposal().binding_family_id,
+        expected_head_revision: 1,
+        live_statement_dependencies: BTreeMap::from([(
+            label("live"),
+            dependencies.iter().copied().map(reference).collect(),
+        )]),
+    }
+}
+
+fn admit_rebase_of(
+    target: &NormativeRebaseTargetV1,
+    request: &NormativeRebaseRequestV1,
+) -> ContractResult<NormativeRebaseAdmissionV1> {
+    admit_rebase(
+        &head_under_binding(),
+        &projection_at_head(),
+        target,
+        request,
+        timestamp(REBASED_AT),
+    )
+}
+
+#[test]
+fn a_family_whose_dependencies_are_carried_is_rebased_onto_the_target() {
+    let target = rebase_target(&["environment.selector", "slo.error_rate", "unrelated"]);
+    let request = rebase_request(&["environment.selector", "slo.error_rate"]);
+    let NormativeRebaseAdmissionV1::Rebase { record_id, record } =
+        admit_rebase_of(&target, &request).unwrap()
+    else {
+        panic!("a carried family must be rebased");
+    };
+    let NormativeLogRecordV1::Rebase { rebase } = record.as_ref() else {
+        panic!("a rebase admits a rebase record");
+    };
+    assert_eq!(record_id, rebase.record_id().unwrap());
+    assert_eq!(
+        rebase.from_registry_package_digest,
+        binding().registry_package_digest
+    );
+    assert_eq!(
+        rebase.to_registry_package_digest,
+        rebase_target_binding().registry_package_digest
+    );
+    assert_eq!(rebase.registry_activation_id, label("activation-3"));
+    let mut carried = vec![label("environment.selector"), label("slo.error_rate")];
+    carried.sort_unstable();
+    assert_eq!(
+        rebase.carried_entry_digests, carried,
+        "only what the live statements depend on is recorded as carried"
+    );
+}
+
+#[test]
+fn a_family_whose_statement_references_an_entry_missing_from_the_target_is_refused() {
+    let target = rebase_target(&["environment.selector"]);
+    let refused = admit_rebase_of(
+        &target,
+        &rebase_request(&["environment.selector", "slo.error_rate"]),
+    )
+    .expect_err("a dependency the target does not carry must refuse the rebase");
+    assert!(refused.to_string().contains("slo.error_rate"), "{refused}");
+
+    // The same id and version under another digest is not carried either.
+    let mut changed = reference("slo.error_rate");
+    changed.entry_digest = label("slo.error_rate, edited");
+    let target = NormativeRebaseTargetV1::new(
+        rebase_target_binding(),
+        label("activation-3"),
+        [reference("environment.selector"), changed],
+    )
+    .unwrap();
+    assert!(
+        admit_rebase_of(
+            &target,
+            &rebase_request(&["environment.selector", "slo.error_rate"])
+        )
+        .is_err(),
+        "an entry changed in place is not carried"
+    );
+}
+
+#[test]
+fn a_head_already_at_the_target_is_current_and_one_that_moved_is_stale() {
+    let target = rebase_target(&["environment.selector"]);
+    let request = rebase_request(&["environment.selector"]);
+
+    let mut current = head_under_binding();
+    current.registry_package_digest = rebase_target_binding().registry_package_digest;
+    assert_eq!(
+        admit_rebase(
+            &current,
+            &projection_at_head(),
+            &target,
+            &request,
+            timestamp(REBASED_AT)
+        ),
+        Ok(NormativeRebaseAdmissionV1::AlreadyCurrent)
+    );
+
+    // The target's package under another activation policy is not the target.
+    current.activation_policy_digest = label("another activation policy");
+    assert!(
+        admit_rebase(
+            &current,
+            &projection_at_head(),
+            &target,
+            &request,
+            timestamp(REBASED_AT)
+        )
+        .is_err()
+    );
+
+    let mut moved = request;
+    moved.expected_head_revision = 0;
+    assert_eq!(
+        admit_rebase_of(&target, &moved),
+        Ok(NormativeRebaseAdmissionV1::Stale)
+    );
+}
+
+#[test]
+fn a_request_that_does_not_describe_the_live_statements_is_refused() {
+    let target = rebase_target(&["environment.selector"]);
+
+    let mut omitted = rebase_request(&["environment.selector"]);
+    omitted.live_statement_dependencies.clear();
+    assert!(
+        admit_rebase_of(&target, &omitted).is_err(),
+        "a live statement left out would be rebased unchecked"
+    );
+
+    let mut extra = rebase_request(&["environment.selector"]);
+    extra
+        .live_statement_dependencies
+        .insert(label("not live"), std::collections::BTreeSet::new());
+    assert!(admit_rebase_of(&target, &extra).is_err());
+
+    let mut other_family = rebase_request(&["environment.selector"]);
+    other_family.binding_family_id = ContractId::new("slo.other").unwrap();
+    assert!(admit_rebase_of(&target, &other_family).is_err());
+}
+
+#[test]
+fn a_rebase_target_must_name_its_exact_activation() {
+    assert!(NormativeRebaseTargetV1::new(rebase_target_binding(), Sha256Digest::ZERO, []).is_err());
+}

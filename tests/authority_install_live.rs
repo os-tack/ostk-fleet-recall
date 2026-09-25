@@ -451,9 +451,17 @@ async fn live_install_generation_three_reaches_it_in_one_run_on_a_fresh_scope_wh
             InstallStepV1::GenerationTwo,
             InstallStepV1::GenerationThree,
         ]
-        .map(|step| (step, InstallStepOutcomeV1::Inserted)),
+        .map(|step| (step, InstallStepOutcomeV1::Inserted))
+        .into_iter()
+        // A fresh scope has no normative family to rebase.
+        .chain([(
+            InstallStepV1::NormativeRebase,
+            InstallStepOutcomeV1::AlreadyPresent
+        )])
+        .collect::<Vec<_>>(),
         "a fresh physical scope runs every step up to generation 3"
     );
+    assert!(installed.report.normative_families.is_empty());
     assert_eq!(
         installed.report.package,
         KnownRegistryPackage::CollectedItemsGeneration3
@@ -528,6 +536,10 @@ async fn live_install_generation_three_moves_a_generation_two_head_when_configur
             (
                 InstallStepV1::GenerationThree,
                 InstallStepOutcomeV1::Inserted
+            ),
+            (
+                InstallStepV1::NormativeRebase,
+                InstallStepOutcomeV1::AlreadyPresent
             ),
         ]
     );

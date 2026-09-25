@@ -487,3 +487,76 @@ fn incremental_folding_equals_a_full_rebuild() {
         rebuilt.canonical_bytes().unwrap()
     );
 }
+
+// --- head rebase (ADR 0008 D3) ---
+
+fn rebase(binding_family_id: ContractId) -> NormativeLogRecordV1 {
+    NormativeLogRecordV1::Rebase {
+        rebase: NormativeHeadRebaseV1 {
+            schema_version: 1,
+            binding_family_id,
+            from_registry_package_digest: label("registry-package"),
+            from_activation_policy_digest: label("activation-policy"),
+            to_registry_package_digest: label("registry-package-3"),
+            to_activation_policy_digest: label("activation-policy"),
+            registry_activation_id: label("activation-3"),
+            carried_entry_digests: vec![label("carried")],
+            rebased_at: timestamp("2026-09-25T12:00:00.000000000Z"),
+        },
+    }
+}
+
+#[test]
+fn the_fold_ignores_a_rebase_but_for_its_cursor() {
+    for prior in [
+        vec![activation("a", "2026-08-20T00:00:00.000000000Z", None)],
+        // A contested family stays contested across a rebase.
+        vec![
+            activation("a", "2026-08-20T00:00:00.000000000Z", None),
+            activation("b", "2026-09-20T00:00:00.000000000Z", None),
+            contest(&["a", "b"]),
+        ],
+        // So does a family nothing is live in.
+        Vec::new(),
+    ] {
+        let mut entries: Vec<NormativeLogEntryV1> = prior
+            .into_iter()
+            .zip(1..)
+            .map(|(record, seq)| entry(seq, record))
+            .collect();
+        let before = project_family(&family(), &entries).unwrap();
+        let seq = before.cursor_seq + 1;
+        entries.push(entry(seq, rebase(family())));
+        let after = project_family(&family(), &entries).unwrap();
+        assert_eq!(after.cursor_seq, seq);
+        assert_eq!(after.live, before.live);
+        assert_eq!(after.declared_contested, before.declared_contested);
+        assert_eq!(after.resolution, before.resolution);
+        assert_eq!(
+            apply_entry(&before, entries.last().unwrap()).unwrap(),
+            after,
+            "the incremental fold and the rebuild agree"
+        );
+    }
+    assert_eq!(rebase(family()).record_kind(), "rebase");
+}
+
+#[test]
+fn a_rebase_of_another_family_or_out_of_sequence_is_rejected() {
+    let projection = project_family(
+        &family(),
+        &[entry(
+            1,
+            activation("a", "2026-08-20T00:00:00.000000000Z", None),
+        )],
+    )
+    .unwrap();
+    assert!(
+        apply_entry(
+            &projection,
+            &entry(2, rebase(ContractId::new("slo.other").unwrap()))
+        )
+        .is_err()
+    );
+    assert!(apply_entry(&projection, &entry(3, rebase(family()))).is_err());
+}

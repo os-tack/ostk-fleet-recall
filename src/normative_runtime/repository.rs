@@ -3,22 +3,26 @@
 //!
 //! [`admit_activation`] is the whole fail-closed boundary, and it is pure: it
 //! runs before any transaction opens, so a rejected activation never touches the
-//! database. Every check below is an ordinary negative test in
-//! `repository_tests.rs`.
+//! database. [`admit_rebase`] is the same boundary for a head rebase, pure too,
+//! but judged under the head lock against the durable head and live set. Every
+//! check below is an ordinary negative test in `repository_tests.rs`.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
 use crate::Result;
 use crate::memory_contracts::common::{
-    AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId,
+    AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId, RegistryReferenceV1,
 };
 use crate::memory_contracts::digest::{DigestDomain, Sha256Digest, framed_digest};
 use crate::memory_contracts::evidence_v2::RegistryHeadBindingV1;
 use crate::memory_contracts::normative_v2::{
     ContestedBindingV1, NormativeActivationReceiptV2, NormativeBindingProposalV2,
-    NormativeCompositeHeadV2, NormativeLifecycleEventV1, NormativeLifecycleKindV1,
-    RetroactiveCorrectionV1, require_effective_not_before_accepted,
+    NormativeCompositeHeadV2, NormativeHeadRebaseV1, NormativeLifecycleEventV1,
+    NormativeLifecycleKindV1, RetroactiveCorrectionV1, require_effective_not_before_accepted,
 };
+use crate::memory_contracts::registry::RegistryPackageV1;
 use crate::memory_contracts::{ContractError, ContractResult};
 use crate::registry_witness::WriterAuthorityWitness;
 
@@ -465,6 +469,243 @@ pub fn admit_contest(
     };
     record.validate()?;
     Ok((contested_id, record))
+}
+
+/// The registry head a rebase moves binding families onto, and every registry
+/// entry that head's authority resolves (ADR 0008 D3).
+///
+/// A family's live statements name registry entries in two places: in the
+/// active successor package (a spec statement's subject is derived under its
+/// `identity.github.repository` recipe) and in the genesis package the
+/// scope's pinned bootstrap binds (its predicate and applicability evaluator,
+/// ADR 0007 D1). A successor transition never changes the genesis package, so
+/// the entries a head resolves are its own package's and the genesis
+/// package's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormativeRebaseTargetV1 {
+    binding: NormativeRegistryBindingV1,
+    registry_activation_id: Sha256Digest,
+    entries: BTreeSet<RegistryReferenceV1>,
+}
+
+impl NormativeRebaseTargetV1 {
+    /// A target over an explicit entry set.
+    ///
+    /// # Errors
+    ///
+    /// [`ContractError::Schema`] for a zero package, policy, or activation
+    /// digest.
+    pub fn new(
+        binding: NormativeRegistryBindingV1,
+        registry_activation_id: Sha256Digest,
+        entries: impl IntoIterator<Item = RegistryReferenceV1>,
+    ) -> ContractResult<Self> {
+        binding.validate()?;
+        if registry_activation_id == Sha256Digest::ZERO {
+            return Err(ContractError::Schema(
+                "a normative rebase target must name its exact registry activation".into(),
+            ));
+        }
+        Ok(Self {
+            binding,
+            registry_activation_id,
+            entries: entries.into_iter().collect(),
+        })
+    }
+
+    /// The head a strict writer-authority witness certifies: its package and
+    /// activation-policy digests, its exact activation, and every entry of its
+    /// package and of the genesis package it descends from, each named by its
+    /// manifest's verified digest.
+    ///
+    /// # Errors
+    ///
+    /// [`ContractError::Schema`] for a zero digest, which a verified witness
+    /// never has.
+    pub fn from_witness(witness: &WriterAuthorityWitness) -> ContractResult<Self> {
+        let successor = witness.package().manifest_verified_package().package();
+        let genesis = witness
+            .genesis_package()
+            .manifest_verified_package()
+            .package();
+        Self::new(
+            NormativeRegistryBindingV1::from_witness(witness),
+            witness.activation_id(),
+            package_references(successor).chain(package_references(genesis)),
+        )
+    }
+
+    /// The package and activation-policy digests a rebased head carries.
+    #[must_use]
+    pub const fn binding(&self) -> NormativeRegistryBindingV1 {
+        self.binding
+    }
+
+    /// The exact activation of the target head.
+    #[must_use]
+    pub const fn registry_activation_id(&self) -> Sha256Digest {
+        self.registry_activation_id
+    }
+
+    /// Whether the target resolves `reference` to the very same entry: same
+    /// id, same version, byte-identical digest.
+    #[must_use]
+    pub fn carries(&self, reference: &RegistryReferenceV1) -> bool {
+        self.entries.contains(reference)
+    }
+}
+
+/// Every entry of `package`, as the reference its verified manifest names.
+fn package_references(
+    package: &RegistryPackageV1,
+) -> impl Iterator<Item = RegistryReferenceV1> + '_ {
+    package.manifest.iter().map(|manifest| RegistryReferenceV1 {
+        entry_id: manifest.entry_id.clone(),
+        version: manifest.version,
+        entry_digest: manifest.entry_digest,
+    })
+}
+
+/// One family's rebase, with the dependencies its caller resolved.
+///
+/// The normative log holds each statement's interval but not its proposal, so
+/// the caller resolves what every live statement depends on (for a spec
+/// statement, `crate::spec_conformance::spec_statement_dependencies`) and the
+/// runtime checks, under the head lock, that it described exactly the durable
+/// live set at exactly the head revision it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormativeRebaseRequestV1 {
+    pub binding_family_id: ContractId,
+    /// The head revision the dependencies were resolved at. A head that moved
+    /// since is [`NormativeRebaseOutcomeV1::Stale`], never rebased over.
+    pub expected_head_revision: u64,
+    /// Every live statement of the family, each with the registry entries it
+    /// depends on.
+    pub live_statement_dependencies: BTreeMap<Sha256Digest, BTreeSet<RegistryReferenceV1>>,
+}
+
+/// What one rebase attempt did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NormativeRebaseOutcomeV1 {
+    /// The rebase row, the head's move, and the projection's cursor advance
+    /// committed together.
+    Rebased {
+        transition: NormativeTransitionV1,
+        rebase: Box<NormativeHeadRebaseV1>,
+    },
+    /// The head already names the target package and policy. Nothing was
+    /// written.
+    AlreadyCurrent { head_revision: u64 },
+    /// The head moved since the request was resolved. Nothing was written; the
+    /// caller re-reads the family and resolves again.
+    Stale { observed_head_revision: u64 },
+}
+
+/// What [`admit_rebase`] decided under the head lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NormativeRebaseAdmissionV1 {
+    /// The head already names the target.
+    AlreadyCurrent,
+    /// The head is not at the revision the request was resolved at.
+    Stale,
+    /// Append this record and move the head to the target.
+    Rebase {
+        record_id: Sha256Digest,
+        record: Box<NormativeLogRecordV1>,
+    },
+}
+
+/// Every pure check a head rebase must pass, judged against the durable head
+/// and projection read under the head lock.
+///
+/// A head already at the target is [`NormativeRebaseAdmissionV1::AlreadyCurrent`]
+/// (a rebase is idempotent), and one at another revision than the request was
+/// resolved at is [`NormativeRebaseAdmissionV1::Stale`]. Otherwise the request
+/// must describe exactly the family's live statements, and the target must
+/// carry every registry entry any of them depends on, byte for byte; only then
+/// is the rebase record derived, with `rebased_at` the caller's server time.
+///
+/// # Errors
+///
+/// [`ContractError::Schema`] for a request about another family, a head that
+/// names the target package under another activation policy, a projection
+/// whose cursor disagrees with its head, a request that does not describe the
+/// live set, and a dependency the target does not carry.
+pub fn admit_rebase(
+    head: &NormativeHeadRowV1,
+    projection: &NormativeFamilyProjectionV1,
+    target: &NormativeRebaseTargetV1,
+    request: &NormativeRebaseRequestV1,
+    rebased_at: CanonicalTimestamp,
+) -> ContractResult<NormativeRebaseAdmissionV1> {
+    let binding = target.binding();
+    binding.validate()?;
+    if head.binding_family_id != request.binding_family_id
+        || projection.binding_family_id != request.binding_family_id
+    {
+        return Err(ContractError::Schema(
+            "normative rebase request names a different binding family".into(),
+        ));
+    }
+    if head.registry_package_digest == binding.registry_package_digest {
+        if head.activation_policy_digest == binding.activation_policy_digest {
+            return Ok(NormativeRebaseAdmissionV1::AlreadyCurrent);
+        }
+        return Err(ContractError::Schema(
+            "normative head names the target package under another activation policy".into(),
+        ));
+    }
+    if head.head_revision != request.expected_head_revision {
+        return Ok(NormativeRebaseAdmissionV1::Stale);
+    }
+    if projection.cursor_seq != head.log_seq {
+        return Err(ContractError::Schema(
+            "normative projection cursor disagrees with its head log sequence".into(),
+        ));
+    }
+    let live: BTreeSet<Sha256Digest> = projection.live_statement_ids().into_iter().collect();
+    if request
+        .live_statement_dependencies
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        != live
+    {
+        return Err(ContractError::Schema(
+            "normative rebase request does not describe the family's live statements".into(),
+        ));
+    }
+    let mut carried = BTreeSet::new();
+    for (statement_id, dependencies) in &request.live_statement_dependencies {
+        for dependency in dependencies {
+            if !target.carries(dependency) {
+                return Err(ContractError::Schema(format!(
+                    "live statement {statement_id} depends on registry entry {} v{} ({}), which \
+                     the target head does not carry byte for byte",
+                    dependency.entry_id, dependency.version, dependency.entry_digest
+                )));
+            }
+            carried.insert(dependency.entry_digest);
+        }
+    }
+    let rebase = NormativeHeadRebaseV1 {
+        schema_version: 1,
+        binding_family_id: request.binding_family_id.clone(),
+        from_registry_package_digest: head.registry_package_digest,
+        from_activation_policy_digest: head.activation_policy_digest,
+        to_registry_package_digest: binding.registry_package_digest,
+        to_activation_policy_digest: binding.activation_policy_digest,
+        registry_activation_id: target.registry_activation_id(),
+        carried_entry_digests: carried.into_iter().collect(),
+        rebased_at,
+    };
+    let record_id = rebase.record_id()?;
+    let record = NormativeLogRecordV1::Rebase { rebase };
+    record.validate()?;
+    Ok(NormativeRebaseAdmissionV1::Rebase {
+        record_id,
+        record: Box::new(record),
+    })
 }
 
 /// Append and read surface for the normative activation runtime, bound once to

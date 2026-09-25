@@ -1531,3 +1531,99 @@ fn regenerate_normative_v2_contract_artifacts() {
         contested_positive.contested_id().unwrap()
     );
 }
+
+// --- NormativeHeadRebaseV1 (ADR 0008 D3) ---
+
+/// Pinned identity of [`head_rebase`]. A change here means a stored rebase
+/// row no longer derives its own `record_id`.
+const EXPECTED_HEAD_REBASE_RECORD_ID: &str =
+    "9616bc792a86417e05741ea388775fd2632163b6da83057449322f260f152161";
+
+fn head_rebase() -> NormativeHeadRebaseV1 {
+    NormativeHeadRebaseV1 {
+        schema_version: 1,
+        binding_family_id: ContractId::new("spec.remember.no_forget").unwrap(),
+        from_registry_package_digest: label_digest("generation-2"),
+        from_activation_policy_digest: label_digest("activation.default"),
+        to_registry_package_digest: label_digest("generation-3"),
+        to_activation_policy_digest: label_digest("activation.default"),
+        registry_activation_id: label_digest("activation-3"),
+        carried_entry_digests: sorted_label_digests(&[
+            "applicability.default",
+            "identity.github.repository",
+            "mcp.remember.allowed_actions",
+        ]),
+        rebased_at: CanonicalTimestamp::parse("2026-09-25T12:00:00.000000000Z").unwrap(),
+    }
+}
+
+#[test]
+fn head_rebase_record_id_is_golden() {
+    let rebase = head_rebase();
+    assert_eq!(
+        rebase.record_id().unwrap(),
+        digest(EXPECTED_HEAD_REBASE_RECORD_ID)
+    );
+    let canonical = encode_canonical(&rebase).unwrap();
+    let decoded: NormativeHeadRebaseV1 = decode_strict(&canonical).unwrap();
+    assert_eq!(decoded, rebase);
+}
+
+#[test]
+fn head_rebase_identity_binds_the_move_and_its_instant() {
+    let base = head_rebase().record_id().unwrap();
+    let mut later = head_rebase();
+    later.rebased_at = CanonicalTimestamp::parse("2026-09-25T12:00:01.000000000Z").unwrap();
+    let mut other_activation = head_rebase();
+    other_activation.registry_activation_id = label_digest("another activation-3");
+    let mut fewer = head_rebase();
+    fewer.carried_entry_digests.pop();
+    for changed in [later, other_activation, fewer] {
+        assert_ne!(changed.record_id().unwrap(), base);
+    }
+}
+
+#[test]
+fn head_rebase_shape_fails_closed() {
+    let mut same_package = head_rebase();
+    same_package.to_registry_package_digest = same_package.from_registry_package_digest;
+    let mut unsorted = head_rebase();
+    unsorted.carried_entry_digests.reverse();
+    let mut duplicated = head_rebase();
+    duplicated
+        .carried_entry_digests
+        .push(*duplicated.carried_entry_digests.last().unwrap());
+    let mut zero_activation = head_rebase();
+    zero_activation.registry_activation_id = Sha256Digest::ZERO;
+    let mut zero_carried = head_rebase();
+    zero_carried
+        .carried_entry_digests
+        .insert(0, Sha256Digest::ZERO);
+    let mut schema = head_rebase();
+    schema.schema_version = 2;
+    let mut too_many = head_rebase();
+    too_many.carried_entry_digests = (0..=MAX_REBASE_CARRIED_ENTRIES)
+        .map(|index| label_digest(&index.to_string()))
+        .collect();
+    too_many.carried_entry_digests.sort_unstable();
+    for (rebase, why) in [
+        (
+            same_package,
+            "a rebase onto the package the head already names",
+        ),
+        (unsorted, "an unsorted carried set"),
+        (duplicated, "a duplicated carried entry"),
+        (zero_activation, "no target activation"),
+        (zero_carried, "a zero carried digest"),
+        (schema, "an unknown schema version"),
+        (too_many, "an unbounded carried set"),
+    ] {
+        assert!(rebase.validate().is_err(), "{why} must be refused");
+        assert!(rebase.record_id().is_err(), "{why} has no identity");
+    }
+
+    // A family nothing is live in carries nothing, and still rebases.
+    let mut empty = head_rebase();
+    empty.carried_entry_digests.clear();
+    empty.validate().unwrap();
+}

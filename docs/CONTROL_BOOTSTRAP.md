@@ -245,8 +245,9 @@ the compiled Stage-4 package, and the generic `1 -> 2` transition to the
 compiled generation-2 connector package. It then prints the writer-authority
 pins. Generation 2 is its default target; `apply --target generation-3` adds
 the generic `2 -> 3` transition to the compiled generation-3 collected-items
-package ([ADR 0008](adr/0008-collected-items.md) D2), and no target moves a
-head backwards. Like the other ceremony binaries, it is
+package ([ADR 0008](adr/0008-collected-items.md) D2) and then rebases the
+scope's normative binding families onto it (D3; `--no-normative-rebase` skips
+that), and no target moves a head backwards. Like the other ceremony binaries, it is
 a workstation tool: it is not in the production image, and the CI image job
 asserts that it is absent.
 
@@ -281,7 +282,9 @@ cargo run --locked --bin ostk-authority-install -- apply
   credential afterward, as you would after `migrate`.
 - **Output.** One JSON report: each step with `inserted` or
   `already_present`, the active `generation`, its `activation_id`, the
-  activated `package`, and `pins`. The `pins` object's keys are the
+  activated `package`, `pins`, and `normative_families`, which after a
+  generation-3 run lists each binding family as `rebased`, `already_current`,
+  or `stranded` with the reason (a stranded family is also named on stderr). The `pins` object's keys are the
   environment variables `FLEET_RECALL_CONTRACT_TENANT_NAMESPACE`,
   `FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE`, and
   `FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST`. Export them to every event-first

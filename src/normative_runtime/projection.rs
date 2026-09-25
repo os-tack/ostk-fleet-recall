@@ -26,7 +26,7 @@ use crate::memory_contracts::canonical::encode_canonical;
 use crate::memory_contracts::common::{CanonicalTimestamp, ContractId};
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::normative_v2::{
-    ContestedBindingV1, NormativeLifecycleEventV1, NormativeLifecycleKindV1,
+    ContestedBindingV1, NormativeHeadRebaseV1, NormativeLifecycleEventV1, NormativeLifecycleKindV1,
 };
 use crate::memory_contracts::{ContractError, ContractResult};
 
@@ -79,8 +79,8 @@ impl NormativeStatementIntervalV1 {
     }
 }
 
-/// One durable normative-log record. Lifecycle events and contest records share
-/// one stream so a rebuild has exactly one ordered source.
+/// One durable normative-log record. Lifecycle events, contest records, and head
+/// rebases share one stream so a rebuild has exactly one ordered source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 // Both variants are canonical contract records handled one at a time and stored
@@ -98,6 +98,10 @@ pub enum NormativeLogRecordV1 {
     /// established. Recording one is the only way a family becomes `Unknown`
     /// without an overlap already being visible in the log.
     Contest { contest: ContestedBindingV1 },
+    /// The family's head moved to another registry head with its live
+    /// statements unchanged (ADR 0008 D3). A no-op for resolution: the fold
+    /// only advances its cursor over it.
+    Rebase { rebase: NormativeHeadRebaseV1 },
 }
 
 impl NormativeLogRecordV1 {
@@ -107,6 +111,7 @@ impl NormativeLogRecordV1 {
         match self {
             Self::Lifecycle { event, .. } => &event.binding_family_id,
             Self::Contest { contest } => &contest.binding_family_id,
+            Self::Rebase { rebase } => &rebase.binding_family_id,
         }
     }
 
@@ -115,15 +120,18 @@ impl NormativeLogRecordV1 {
         match self {
             Self::Lifecycle { event, .. } => event.event_id(),
             Self::Contest { contest } => contest.contested_id(),
+            Self::Rebase { rebase } => rebase.record_id(),
         }
     }
 
-    /// `'lifecycle'` or `'contest'`, matching the migration-0024 column check.
+    /// `'lifecycle'`, `'contest'`, or `'rebase'`, matching the log's kind
+    /// check (migration 0024, widened by migration 0032).
     #[must_use]
     pub const fn record_kind(&self) -> &'static str {
         match self {
             Self::Lifecycle { .. } => "lifecycle",
             Self::Contest { .. } => "contest",
+            Self::Rebase { .. } => "rebase",
         }
     }
 
@@ -143,6 +151,7 @@ impl NormativeLogRecordV1 {
                 Ok(())
             }
             Self::Contest { contest } => contest.validate(),
+            Self::Rebase { rebase } => rebase.validate(),
         }
     }
 }
@@ -367,7 +376,8 @@ fn resolve(
 ///
 /// Fails closed on a non-contiguous sequence, on a record naming a different
 /// binding family, on a supersession or retirement whose target is not live, and
-/// on an activation whose statement is already live.
+/// on an activation whose statement is already live. A rebase changes nothing
+/// but the cursor.
 pub fn apply_entry(
     projection: &NormativeFamilyProjectionV1,
     entry: &NormativeLogEntryV1,
@@ -432,6 +442,10 @@ pub fn apply_entry(
         NormativeLogRecordV1::Contest { contest } => {
             declared_contested.extend(contest.contested_statement_ids.iter().copied());
         }
+        // A rebase moves the head's registry digests, which the projection does
+        // not hold: the live set, the declared contests, and so the resolution
+        // are exactly what they were. Only the cursor advances.
+        NormativeLogRecordV1::Rebase { .. } => {}
     }
 
     Ok(NormativeFamilyProjectionV1::from_state(

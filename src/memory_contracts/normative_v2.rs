@@ -31,6 +31,12 @@
 //!   that must name a distinct prior as-known conclusion and a separately
 //!   named higher-threshold authorizing policy. It never rewrites the prior
 //!   conclusion's bytes.
+//! - [`NormativeHeadRebaseV1`] records that one binding family's composite
+//!   head moved from one registry head to another with its live statements
+//!   unchanged, naming every registry entry those statements depend on that
+//!   the new head carries byte for byte (ADR 0008 D3). It proves shape only;
+//!   the runtime checks the carried entries against the live statements
+//!   under the head lock.
 //!
 //! Invariants enforced: **AUTH-04** (normativity is event-derived, never a
 //! path convention — activation is a separate signed event from the source
@@ -67,10 +73,16 @@ const BINDING_SCHEMA_VERSION_V2: u32 = 2;
 const LIFECYCLE_SCHEMA_VERSION: u32 = 1;
 const CONTESTED_SCHEMA_VERSION: u32 = 1;
 const RETROACTIVE_SCHEMA_VERSION: u32 = 1;
+const REBASE_SCHEMA_VERSION: u32 = 1;
 const MAX_PROPOSITIONS: usize = 256;
 const MAX_SPANS: usize = 256;
 const MAX_APPROVALS: usize = 64;
 const MAX_CONTESTED_STATEMENTS: usize = 16;
+
+/// Upper bound on the registry entries one [`NormativeHeadRebaseV1`] records
+/// as carried. A package holds a few dozen entries, so this bounds the record
+/// without ever truncating a real dependency set.
+pub const MAX_REBASE_CARRIED_ENTRIES: usize = 1024;
 
 /// Exact current state a normative activation compare-and-swap must match.
 ///
@@ -503,6 +515,76 @@ impl RetroactiveCorrectionV1 {
             ));
         }
         Ok(())
+    }
+}
+
+/// One binding family's composite head moved from one registry head to
+/// another, with its live statements unchanged (ADR 0008 D3).
+///
+/// A family's head records the registry package and activation-policy digests
+/// it was last advanced under, and every activation compare-and-sets against
+/// them, so a registry transition otherwise strands the family (ADR 0007 D11).
+/// A rebase is the one sanctioned way across: it moves only those two digests,
+/// never the binding set, and it is appended to the family's normative log so
+/// the move is part of the family's own history. The fold treats it as a
+/// no-op for resolution.
+///
+/// `carried_entry_digests` names every registry entry the family's live
+/// statements depend on, each of which the runtime found byte-identical under
+/// the new head before it moved anything; it is empty for a family nothing is
+/// live in. `registry_activation_id` is the exact activation of the new head
+/// (ABA safety: an A -> B -> A rollback is a different activation), and
+/// `rebased_at` is the database's time, so two rebases of one family are
+/// never the same record.
+///
+/// Structural validation proves shape only: that the record moves the head to
+/// another package, and that its carried set is strictly sorted and bounded.
+/// It does not prove the carried entries are the ones the live statements
+/// need; [`crate::normative_runtime::admit_rebase`] is that check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormativeHeadRebaseV1 {
+    pub schema_version: u32,
+    pub binding_family_id: ContractId,
+    pub from_registry_package_digest: Sha256Digest,
+    pub from_activation_policy_digest: Sha256Digest,
+    pub to_registry_package_digest: Sha256Digest,
+    pub to_activation_policy_digest: Sha256Digest,
+    pub registry_activation_id: Sha256Digest,
+    pub carried_entry_digests: Vec<Sha256Digest>,
+    pub rebased_at: CanonicalTimestamp,
+}
+
+impl NormativeHeadRebaseV1 {
+    pub fn validate(&self) -> ContractResult<()> {
+        let digests = [
+            self.from_registry_package_digest,
+            self.from_activation_policy_digest,
+            self.to_registry_package_digest,
+            self.to_activation_policy_digest,
+            self.registry_activation_id,
+        ];
+        if self.schema_version != REBASE_SCHEMA_VERSION
+            || digests.contains(&Sha256Digest::ZERO)
+            || self.from_registry_package_digest == self.to_registry_package_digest
+            || self.carried_entry_digests.len() > MAX_REBASE_CARRIED_ENTRIES
+            || !strictly_sorted(&self.carried_entry_digests)
+            || self.carried_entry_digests.contains(&Sha256Digest::ZERO)
+        {
+            return Err(ContractError::Schema(
+                "invalid normative head rebase v1".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The record's identity, as the normative log stores it.
+    pub fn record_id(&self) -> ContractResult<Sha256Digest> {
+        self.validate()?;
+        Ok(domain_separated_digest(
+            DigestDomain::NormativeHeadRebaseV1,
+            &encode_canonical(self)?,
+        ))
     }
 }
 

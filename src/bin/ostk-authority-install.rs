@@ -14,6 +14,16 @@
 //! is not an authority override, and a head already at or past the target is
 //! left where it is: a generation-3 head is never moved back to generation 2.
 //!
+//! With `--target generation-3` the run then rebases every normative binding
+//! family of the scope onto the generation-3 head (ADR 0008 D3), so moving a
+//! scope strands no spec family (ADR 0007 D11). A family is rebased only when
+//! every registry entry its live statements depend on is byte-identical under
+//! generation 3; one that cannot be verified keeps its old head, is listed
+//! `stranded` in the report's `normative_families`, and is named on stderr.
+//! A re-run rebases nothing twice. `--no-normative-rebase` skips the step and
+//! leaves every family stranded, as an explicit choice. The rebase needs
+//! migration 32 wherever a family exists.
+//!
 //! Environment (nothing else, and no CLI authority override):
 //!
 //! - `FLEET_RECALL_DATABASE_URL`: the schema owner/migrator login, the same
@@ -31,8 +41,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use ostk_fleet_recall::config::{WriterProcessConfig, contract_semantic_scope_from_env};
 use ostk_fleet_recall::registry_activation::install::{
-    AuthorityInstallRequestV1, InstallTargetV1, install_writer_authority,
+    AuthorityInstallOptionsV1, AuthorityInstallRequestV1, InstallTargetV1, NormativeRebaseModeV1,
+    install_writer_authority_with,
 };
+use ostk_fleet_recall::spec_conformance::NormativeFamilyRebaseOutcomeV1;
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig, RetryPolicy};
 
 const APPLICATION_NAME: &str = "ostk-authority-install";
@@ -64,6 +76,10 @@ enum Command {
         /// it is left where it is.
         #[arg(long, value_enum, default_value_t = Target::Generation2)]
         target: Target,
+        /// With `--target generation-3`, leave every normative binding family
+        /// on its old registry head instead of rebasing it (ADR 0007 D11).
+        #[arg(long)]
+        no_normative_rebase: bool,
     },
 }
 
@@ -91,7 +107,10 @@ impl From<Target> for InstallTargetV1 {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let Cli {
-        command: Command::Apply { target },
+        command: Command::Apply {
+            target,
+            no_normative_rebase,
+        },
     } = Cli::parse();
     let process = WriterProcessConfig::from_migrator_env(APPLICATION_NAME)?;
     let semantic_scope = contract_semantic_scope_from_env()?;
@@ -105,18 +124,38 @@ async fn main() -> anyhow::Result<()> {
         },
     )
     .await?;
-    let report = install_writer_authority(
+    let report = install_writer_authority_with(
         store.pool(),
         &AuthorityInstallRequestV1 {
             physical_scope: process.physical_scope().clone(),
             semantic_scope,
             target: target.into(),
         },
+        options(no_normative_rebase),
         RETRY,
     )
     .await?;
+    for family in &report.normative_families {
+        if let NormativeFamilyRebaseOutcomeV1::Stranded { reason } = &family.outcome {
+            eprintln!(
+                "ostk-authority-install: binding family {} was not rebased and stays on its old \
+                 registry head: {reason}",
+                family.binding_family_id
+            );
+        }
+    }
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+const fn options(no_normative_rebase: bool) -> AuthorityInstallOptionsV1 {
+    AuthorityInstallOptionsV1 {
+        normative_rebase: if no_normative_rebase {
+            NormativeRebaseModeV1::Skip
+        } else {
+            NormativeRebaseModeV1::Rebase
+        },
+    }
 }
 
 #[cfg(test)]
@@ -124,12 +163,41 @@ mod tests {
     use super::*;
 
     fn parse(arguments: &[&str]) -> Result<Target, clap::Error> {
+        Ok(parse_apply(arguments)?.0)
+    }
+
+    fn parse_apply(arguments: &[&str]) -> Result<(Target, AuthorityInstallOptionsV1), clap::Error> {
         let Cli {
-            command: Command::Apply { target },
+            command:
+                Command::Apply {
+                    target,
+                    no_normative_rebase,
+                },
         } = Cli::try_parse_from(
             std::iter::once("ostk-authority-install").chain(arguments.iter().copied()),
         )?;
-        Ok(target)
+        Ok((target, options(no_normative_rebase)))
+    }
+
+    #[test]
+    fn apply_rebases_normative_families_unless_told_not_to() {
+        assert_eq!(
+            parse_apply(&["apply", "--target", "generation-3"])
+                .unwrap()
+                .1,
+            AuthorityInstallOptionsV1::default()
+        );
+        assert_eq!(
+            AuthorityInstallOptionsV1::default().normative_rebase,
+            NormativeRebaseModeV1::Rebase
+        );
+        assert_eq!(
+            parse_apply(&["apply", "--target", "generation-3", "--no-normative-rebase"])
+                .unwrap()
+                .1
+                .normative_rebase,
+            NormativeRebaseModeV1::Skip
+        );
     }
 
     #[test]
