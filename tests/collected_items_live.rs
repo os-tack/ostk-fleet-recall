@@ -29,8 +29,8 @@ use ostk_fleet_recall::collectors::status::{
     CollectorOutcomeV1, CollectorOwnerV1, CollectorSourceStatusV1, CoverageRoleV1,
 };
 use ostk_fleet_recall::evidence_recall::{
-    AbsenceReasonV1, AbsenceVerdictV1, CockroachEvidenceRecall, EvidenceRecall as _,
-    EvidenceSourceKindV1, probe_evidence_recall,
+    AbsenceReasonV1, AbsenceVerdictV1, CockroachEvidenceRecall, ContentTrustV1,
+    EvidenceRecall as _, EvidenceSourceKindV1, probe_evidence_recall,
 };
 use ostk_fleet_recall::memory_contracts::collected_item::{
     BoundedTextV1, COLLECTED_ITEM_MEDIA_TYPE, CollectedItemInputV1, CollectionModeV1,
@@ -621,12 +621,10 @@ async fn live_stage_drain_project_recall_when_configured() {
         .await
         .unwrap();
     assert_eq!(answer.absence.verdict, AbsenceVerdictV1::Present);
-    assert!(
-        answer
-            .hits
-            .iter()
-            .all(|hit| hit.media_type == COLLECTED_ITEM_MEDIA_TYPE)
-    );
+    assert!(answer.hits.iter().all(|hit| {
+        hit.media_type == COLLECTED_ITEM_MEDIA_TYPE
+            && hit.content_trust == Some(ContentTrustV1::UntrustedThirdParty)
+    }));
     let bodies: Vec<Sha256Digest> = answer.hits.iter().map(|hit| hit.id).collect();
     let providers = providers_of(&pool, &fixture, &bodies).await;
     assert!(
@@ -857,7 +855,12 @@ async fn live_tombstone_suppresses_in_evidence_lexical_dense_and_get_when_config
     let found = recall.search("narwhal", None, 10).await.unwrap();
     assert_eq!(found.hits.len(), 1);
     let body = found.hits[0].id;
-    assert!(recall.get(body).await.unwrap().is_some());
+    let got = recall
+        .get(body)
+        .await
+        .unwrap()
+        .expect("the body is recalled");
+    assert_eq!(got.content_trust, Some(ContentTrustV1::UntrustedThirdParty));
     let vector = body_vector(&pool, &fixture, body).await;
     let dense = recall
         .search("zyzzyva quixotic", Some(vector.clone()), 10)

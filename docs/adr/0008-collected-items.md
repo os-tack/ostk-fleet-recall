@@ -383,6 +383,15 @@ binaries before step 2 migrates) therefore suppresses deleted and withdrawn
 items and counts pending ones from the first read after the migration and
 the grants, with no restart.
 
+**Collected text is labelled untrusted.** A hit or `get` body whose media type
+is `application.ostk-collected-item-v1` carries `content_trust:
+untrusted_third_party`: text another system's users wrote, which an agent
+reads as data and never follows as instructions, however it looks beside the
+project's own git, CI, and transcript evidence (which carries no label). The
+tool description says so. The trust tier, provenance, and advisory
+injection signals of each item are left to the item annotation and the item
+recall surface, which read the item history.
+
 ## D6 — Audience: server-derived, whole project only
 
 **Decision.** In v1 every admitted item is visible to the whole project, so

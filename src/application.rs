@@ -4490,6 +4490,7 @@ mod tests {
                     matched_by: EvidenceMatchV1::Lexical,
                     lexical_score: Some(0.5),
                     dense_similarity: None,
+                    content_trust: None,
                     media_type: "application.git-commit-v1".into(),
                     snippet: "document the zephyrine cache eviction".into(),
                     snippet_truncated: false,
@@ -4514,6 +4515,7 @@ mod tests {
                 crate::evidence_recall::EvidenceBodyV1 {
                     id,
                     media_type: "application.git-commit-v1".into(),
+                    content_trust: None,
                     text: "document the zephyrine cache eviction".into(),
                     text_bytes: 37,
                     visibility_class: crate::projectors::RowVisibilityClassV1::Private,

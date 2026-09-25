@@ -28,9 +28,9 @@ use crate::worker::WorkerSourceOutcomeV1;
 
 use super::verdict::{ScoredHitV1, absence_verdict, apply_dense_floor};
 use super::{
-    EVIDENCE_RECALL_SCHEMA_VERSION, EVIDENCE_SNIPPET_CHARS, EvidenceBodyV1, EvidenceCoverageV1,
-    EvidenceDenseLaneV1, EvidenceHitV1, EvidenceReadinessV1, EvidenceRecall, EvidenceSearchV1,
-    EvidenceSourceKindV1, EvidenceSourceV1, EvidenceSourcesV1, EvidenceStatusV1,
+    ContentTrustV1, EVIDENCE_RECALL_SCHEMA_VERSION, EVIDENCE_SNIPPET_CHARS, EvidenceBodyV1,
+    EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceHitV1, EvidenceReadinessV1, EvidenceRecall,
+    EvidenceSearchV1, EvidenceSourceKindV1, EvidenceSourceV1, EvidenceSourcesV1, EvidenceStatusV1,
     MAX_EVIDENCE_SEARCH_LIMIT, MAX_EVIDENCE_SOURCE_ERROR_BYTES, MAX_EVIDENCE_SOURCES,
     lexical_query_text,
 };
@@ -597,6 +597,7 @@ impl CockroachEvidenceRecall {
                     matched_by: hit.matched_by,
                     lexical_score: hit.lexical_score,
                     dense_similarity: hit.dense_similarity,
+                    content_trust: ContentTrustV1::of_media_type(&media_type),
                     media_type,
                     snippet,
                     snippet_truncated,
@@ -693,9 +694,11 @@ impl EvidenceRecall for CockroachEvidenceRecall {
                     .is_ok_and(|media_type| media_type != COLLECTED_ITEM_MEDIA_TYPE)
         });
         row.map(|row| {
+            let media_type: String = row.try_get("media_type")?;
             Ok(EvidenceBodyV1 {
                 id,
-                media_type: row.try_get("media_type")?,
+                content_trust: ContentTrustV1::of_media_type(&media_type),
+                media_type,
                 text: row.try_get("lexical_text")?,
                 text_bytes: count(&row, "text_bytes")?,
                 visibility_class: RowVisibilityClassV1::parse(
