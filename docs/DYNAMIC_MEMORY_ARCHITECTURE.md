@@ -1041,8 +1041,15 @@ This does not require or authorize dynamic ingestion.
    signer set, and threshold.
 3. **Checked in, private only:** genesis and first-successor activation
    repositories with compare-and-swap heads, replay, stale-candidate, and
-   contested-history tests. No deployment or serving path consumes those
-   accepted heads yet.
+   contested-history tests. The accepted heads are now consumed:
+   `ostk-authority-install` drives these repositories (and the generic
+   `1 -> 2` successor) to give one physical scope its active head, and the
+   strict writer-authority witness reads that head for `serve`'s
+   `remember(assert)`, the memory worker, and `ostk-spec`
+   ([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md)).
+   `serve` turns assert off, and the worker and `ostk-spec` refuse to run,
+   when the head does not verify against their pins. The witness recognizes
+   only the compiled generation-1 and generation-2 packages.
 4. Add general accepted-evidence and relation-attestation events. Make
    synchronous `remember` atomically append its event and projection. Prove
    immutability, scope binding, replay, and verified-versus-declared behavior.
