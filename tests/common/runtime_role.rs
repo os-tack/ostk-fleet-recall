@@ -1,7 +1,9 @@
 //! A disposable login that holds exactly the runtime role's evidence-plane
 //! grants, and optionally its claim-plane grants, so a connected test proves a
 //! writer path runs without the owner's privileges; or exactly the publication
-//! reader's grants, so it proves a public read runs with nothing more.
+//! reader's grants, so it proves a public read runs with nothing more. The
+//! grants are held directly by the login, or, as the deployment holds them, by
+//! a group role the login is only a member of.
 
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PUBLICATION_READ_TABLES, PoolConfig};
 use sqlx::PgPool;
@@ -98,6 +100,9 @@ pub const RUNTIME_SEQUENCES: &str = "public.memory_claim_id_seq, \
 /// shared test database otherwise keeps the role and its grants.
 pub struct RuntimeProbeRole {
     name: String,
+    /// The `NOLOGIN` role holding the grants when the login holds none
+    /// itself, only its membership in this role.
+    group: Option<String>,
     database: String,
     grants: Vec<(&'static str, String)>,
     sequences: bool,
@@ -108,7 +113,14 @@ impl RuntimeProbeRole {
     /// Create the role through `owner` and connect as it over the same TLS
     /// settings as `database_url`, without its client certificate.
     pub async fn create(owner: &PgPool, database_url: &str) -> Self {
-        Self::create_with(owner, database_url, owned(&RUNTIME_EVIDENCE_GRANTS), false).await
+        Self::create_with(
+            owner,
+            database_url,
+            owned(&RUNTIME_EVIDENCE_GRANTS),
+            false,
+            false,
+        )
+        .await
     }
 
     /// A login holding only `SELECT` on the publication reader's exact
@@ -120,7 +132,7 @@ impl RuntimeProbeRole {
             .map(|table| format!("public.{table}"))
             .collect::<Vec<_>>()
             .join(", ");
-        Self::create_with(owner, database_url, vec![("SELECT", tables)], false).await
+        Self::create_with(owner, database_url, vec![("SELECT", tables)], false, false).await
     }
 
     /// [`Self::create`], plus the runtime role's claim-plane table and
@@ -129,7 +141,7 @@ impl RuntimeProbeRole {
     pub async fn create_claim_writer(owner: &PgPool, database_url: &str) -> Self {
         let mut grants = owned(&RUNTIME_EVIDENCE_GRANTS);
         grants.extend(owned(&RUNTIME_CLAIM_GRANTS));
-        Self::create_with(owner, database_url, grants, true).await
+        Self::create_with(owner, database_url, grants, true, false).await
     }
 
     /// [`Self::create`], plus [`STAGE5_RUNTIME_GRANTS`] when `stage5` is set:
@@ -140,7 +152,18 @@ impl RuntimeProbeRole {
         if stage5 {
             grants.extend(owned(&STAGE5_RUNTIME_GRANTS));
         }
-        Self::create_with(owner, database_url, grants, false).await
+        Self::create_with(owner, database_url, grants, false, false).await
+    }
+
+    /// [`Self::create_worker`] with the Stage-5 block, shaped as
+    /// `deploy/cockroach/runtime-role-grants.sql` shapes the deployment: every
+    /// grant goes to a `NOLOGIN` group role, as the policy gives them to
+    /// `fleet_runtime`, and the login holds nothing but its membership in that
+    /// group, as `fleet_writer` does.
+    pub async fn create_worker_member(owner: &PgPool, database_url: &str) -> Self {
+        let mut grants = owned(&RUNTIME_EVIDENCE_GRANTS);
+        grants.extend(owned(&STAGE5_RUNTIME_GRANTS));
+        Self::create_with(owner, database_url, grants, false, true).await
     }
 
     async fn create_with(
@@ -148,23 +171,34 @@ impl RuntimeProbeRole {
         database_url: &str,
         grants: Vec<(&'static str, String)>,
         sequences: bool,
+        member: bool,
     ) -> Self {
         let name = format!("runtime_probe_{}", Uuid::now_v7().simple());
+        let group = member.then(|| format!("runtime_group_{}", Uuid::now_v7().simple()));
+        let grantee = group.as_deref().unwrap_or(&name);
         let password = Uuid::now_v7().simple().to_string();
         let parsed = Url::parse(database_url).expect("the test database URL parses");
         let database = parsed.path().trim_start_matches('/').to_owned();
-        let mut statements = vec![
-            format!("CREATE ROLE {name} WITH LOGIN PASSWORD '{password}'"),
-            format!("GRANT CONNECT ON DATABASE {database} TO {name}"),
-            format!("GRANT USAGE ON SCHEMA public TO {name}"),
-        ];
+        let mut statements = vec![format!(
+            "CREATE ROLE {name} WITH LOGIN PASSWORD '{password}'"
+        )];
+        if let Some(group) = &group {
+            statements.push(format!("CREATE ROLE {group} WITH NOLOGIN"));
+        }
+        statements.extend([
+            format!("GRANT CONNECT ON DATABASE {database} TO {grantee}"),
+            format!("GRANT USAGE ON SCHEMA public TO {grantee}"),
+        ]);
         statements.extend(grants.iter().map(|(privileges, relations)| {
-            format!("GRANT {privileges} ON TABLE {relations} TO {name}")
+            format!("GRANT {privileges} ON TABLE {relations} TO {grantee}")
         }));
         if sequences {
             statements.push(format!(
-                "GRANT USAGE ON SEQUENCE {RUNTIME_SEQUENCES} TO {name}"
+                "GRANT USAGE ON SEQUENCE {RUNTIME_SEQUENCES} TO {grantee}"
             ));
+        }
+        if let Some(group) = &group {
+            statements.push(format!("GRANT {group} TO {name}"));
         }
         for statement in statements {
             sqlx::query(&statement)
@@ -186,6 +220,7 @@ impl RuntimeProbeRole {
         .clone();
         Self {
             name,
+            group,
             database,
             grants,
             sequences,
@@ -198,26 +233,33 @@ impl RuntimeProbeRole {
         &self.name
     }
 
-    /// Close the pool, revoke every grant, and drop the role. `CockroachDB`
-    /// refuses to drop a role that still holds a grant.
+    /// Close the pool, revoke every grant, and drop the role (and its group).
+    /// `CockroachDB` refuses to drop a role that still holds a grant.
     pub async fn drop_role(self, owner: &PgPool) {
         self.pool.close().await;
         let name = &self.name;
+        let grantee = self.group.as_deref().unwrap_or(name);
         let mut statements = self
             .grants
             .iter()
-            .map(|(_, relations)| format!("REVOKE ALL ON TABLE {relations} FROM {name}"))
+            .map(|(_, relations)| format!("REVOKE ALL ON TABLE {relations} FROM {grantee}"))
             .collect::<Vec<_>>();
         if self.sequences {
             statements.push(format!(
-                "REVOKE ALL ON SEQUENCE {RUNTIME_SEQUENCES} FROM {name}"
+                "REVOKE ALL ON SEQUENCE {RUNTIME_SEQUENCES} FROM {grantee}"
             ));
         }
         statements.extend([
-            format!("REVOKE ALL ON SCHEMA public FROM {name}"),
-            format!("REVOKE ALL ON DATABASE {} FROM {name}", self.database),
-            format!("DROP ROLE IF EXISTS {name}"),
+            format!("REVOKE ALL ON SCHEMA public FROM {grantee}"),
+            format!("REVOKE ALL ON DATABASE {} FROM {grantee}", self.database),
         ]);
+        if let Some(group) = &self.group {
+            statements.push(format!("REVOKE {group} FROM {name}"));
+        }
+        statements.push(format!("DROP ROLE IF EXISTS {name}"));
+        if let Some(group) = &self.group {
+            statements.push(format!("DROP ROLE IF EXISTS {group}"));
+        }
         for statement in statements {
             sqlx::query(&statement)
                 .execute(owner)

@@ -256,7 +256,10 @@ episode), and there is no early revocation, only a later waiver or expiry.
 `record` itself is unchanged, so it still re-disputes the members of a
 dismissed pair when a new incompatible claim reopens their conflict; the next
 re-evaluation then leaves the pair out. Adjudication authority is only as
-strong as `FLEET_RECALL_AGENT` over the shared writer credential.
+strong as `FLEET_RECALL_AGENT` over the shared writer credential. The 0027
+ledger's spec-nonconformance episodes are a separate read,
+`recall(action="discrepancies")`, never bridged into this lifecycle or
+`recall(conflicts)` ([ADR 0007](0007-spec-conformance-chain.md) D9).
 
 ## D6 — Refusals are typed and roll back
 

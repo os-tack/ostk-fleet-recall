@@ -48,7 +48,8 @@ The `ostk-fleet-recall` binary has these commands:
     only: an empty list is not proof of conformance. It is served wherever
     migration 31 is applied and the writer login may read the discrepancy,
     normative, and spec tables; elsewhere `tools/list` is unchanged.
-    `recall(status)` then adds a `spec_conformance` block.
+    `recall(status)` then adds a `spec_conformance` block
+    ([ADR 0007](docs/adr/0007-spec-conformance-chain.md)).
   - `remember(record)` records a deliberate typed claim with provenance,
     idempotent mutation receipts, and conflict detection.
   - `remember(retract)` retires a claim the calling agent authored. When no
@@ -1036,8 +1037,10 @@ is `#[ignore]` and documents its environment at the top of the file.
 - Decision records: [product/backend boundary](docs/adr/0001-product-and-backend-boundary.md),
   [Stage-4 runtime foundations](docs/adr/0002-stage4-runtime-foundations.md),
   [consolidation and conflict tolerance](docs/adr/0003-consolidation-and-conflict-tolerance.md),
-  [serving conflict lifecycle](docs/adr/0004-serving-conflict-lifecycle.md), and
-  [event-first assert and writer authority](docs/adr/0005-event-first-assert-and-writer-authority.md).
+  [serving conflict lifecycle](docs/adr/0004-serving-conflict-lifecycle.md),
+  [event-first assert and writer authority](docs/adr/0005-event-first-assert-and-writer-authority.md),
+  [the Stage-5 worker and evidence recall](docs/adr/0006-stage5-worker-and-evidence-recall.md), and
+  [the spec conformance chain](docs/adr/0007-spec-conformance-chain.md).
 - [Dynamic memory contract corpus](contracts/dynamic-memory/README.md).
 
 ## Cleanup
