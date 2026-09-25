@@ -415,6 +415,12 @@ pub enum DigestDomain {
     /// names: the `ostk-spec draft` expectation parser at one expectation
     /// schema version, never a build or host.
     SpecDraftParserArtifactV1,
+    /// Stage 6. Label of the conformance vectors a compiled-in spec registry
+    /// entry (the spec comparator lineage and episode policy) names, framed
+    /// over the entry id, its version, and the vector polarity. Those entries
+    /// are not package-admitted, so there is no vector manifest to digest:
+    /// the label names the unit tests that prove them.
+    SpecCompiledEntryVectorsV1,
 }
 
 impl DigestDomain {
@@ -586,6 +592,7 @@ impl DigestDomain {
             Self::SpecMembershipValueV1 => "ostk-spec-membership-value-v1",
             Self::SpecCheckRecordV1 => "ostk-spec-check-record-v1",
             Self::SpecDraftParserArtifactV1 => "ostk-spec-draft-parser-artifact-v1",
+            Self::SpecCompiledEntryVectorsV1 => "ostk-spec-compiled-entry-vectors-v1",
         }
     }
 }

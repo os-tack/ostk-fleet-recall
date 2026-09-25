@@ -149,10 +149,16 @@ of the serving one.
   registry head; `approve` signs the draft offline with one approver's
   Ed25519 seed; `activate` verifies the approvals under the active activation
   policy, with `accepted_at` taken from the database clock, and
-  compare-and-sets the statement into its binding family. `draft` and
-  `activate` run as `fleet_writer` (`FLEET_RECALL_DATABASE_URL`) with the
-  writer-authority pins `ostk-authority-install apply` prints; `approve` reads
-  no environment.
+  compare-and-sets the statement into its binding family; `check` judges one
+  commit against the statement in force: it reads the source file the
+  statement names through a memory-worker git source, runs the
+  genesis-admitted observer, records one check (`conforming`,
+  `nonconforming`, or `unknown` with reasons), and opens a
+  `spec_nonconformance` discrepancy episode only for a verified
+  nonconformance. `draft`, `activate`, and `check` run as `fleet_writer`
+  (`FLEET_RECALL_DATABASE_URL`) with the writer-authority pins
+  `ostk-authority-install apply` prints, and `check` also needs
+  `FLEET_RECALL_CONTENT_KEK_HEX`; `approve` reads no environment.
 
 The grants and gates these tools rely on are described in
 [migration operations](docs/MIGRATIONS.md) and

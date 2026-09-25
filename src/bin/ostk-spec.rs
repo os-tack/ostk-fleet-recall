@@ -18,10 +18,24 @@
 //!    binding family. It exits 1 when the compare-and-set lost and the
 //!    statement is not live.
 //!
+//! Once a statement is in force, `ostk-spec check` judges one commit against
+//! it: it reads the source file the expectation names at `--commit` through
+//! the memory worker's git source `--git-source` (from the worker's sources
+//! file `--sources`, whose `provider_repository_id` must derive the
+//! statement's repository and whose latest coverage receipt the observer
+//! binds), runs the genesis-admitted observer over the enum, appends the blob
+//! fact and the observer result, and compares. A verified nonconformance
+//! opens (or joins) a `spec_nonconformance` discrepancy episode; every
+//! comparison records one spec check. It prints the check (statement,
+//! commit, verdict and reasons, both appended events, the discrepancy action
+//! and episode, and the check id) and exits 0 for every verdict: `unknown` is
+//! an answer, not a failure. Run it after the worker's git step has covered
+//! the commit.
+//!
 //! See `ostk_fleet_recall::spec_conformance` for what each step checks.
 //!
-//! Environment for `draft` and `activate` (nothing else, and no CLI authority
-//! override):
+//! Environment for `draft`, `activate`, and `check` (nothing else, and no CLI
+//! authority override):
 //!
 //! - `FLEET_RECALL_DATABASE_URL` as the private writer login (`fleet_writer`,
 //!   a member of `fleet_runtime`), with the
@@ -31,7 +45,9 @@
 //!   (`FLEET_RECALL_CONTRACT_TENANT_NAMESPACE`,
 //!   `FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE`,
 //!   `FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST`, and optionally
-//!   `FLEET_RECALL_EXPECTED_ACTIVATION_ID`), which is required.
+//!   `FLEET_RECALL_EXPECTED_ACTIVATION_ID`), which is required;
+//! - for `check` only, `FLEET_RECALL_CONTENT_KEK_HEX`: the blob fact and the
+//!   observer run record are governed content.
 //!
 //! Every command prints one JSON document. Like the other operator CLIs, this
 //! binary is not in the production image.
@@ -47,6 +63,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ostk_fleet_recall::config::WriterProcessConfig;
 use ostk_fleet_recall::connectors::git::GitObjectId;
+use ostk_fleet_recall::evidence_ledger::{CONTENT_KEY_ENCRYPTION_KEY_ENV, content_kek_from_env};
 use ostk_fleet_recall::memory_contracts::canonical::{decode_typed_canonical, encode_canonical};
 use ostk_fleet_recall::memory_contracts::common::{CanonicalTimestamp, ContractId};
 use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
@@ -57,10 +74,12 @@ use ostk_fleet_recall::memory_contracts::normative_v2::{
 use ostk_fleet_recall::normative_runtime::{normative_approval_message, sign_normative_approval};
 use ostk_fleet_recall::registry_witness::WriterAuthorityRuntime;
 use ostk_fleet_recall::spec_conformance::{
-    DraftStatementRequestV1, ExpectedMembershipV1, RememberActionExpectationV1,
-    activate_spec_statement, database_now, draft_spec_statement,
+    DEFAULT_SPEC_MEMBER_BOUND, DraftStatementRequestV1, ExpectedMembershipV1,
+    RememberActionExpectationV1, SpecCheckRequestV1, activate_spec_statement, database_now,
+    draft_spec_statement, run_spec_check,
 };
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig, RetryPolicy};
+use ostk_fleet_recall::worker::WorkerSourcesV1;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -79,7 +98,7 @@ const EXPECTATION_FILE: &str = "expectation.jsonl";
 #[command(
     name = "ostk-spec",
     version,
-    about = "Private, workstation-only spec statement CLI: draft, approve, activate"
+    about = "Private, workstation-only spec statement CLI: draft, approve, activate, check"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -95,6 +114,8 @@ enum Command {
     Approve(ApproveArgs),
     /// Verify approvals and activate a drafted statement.
     Activate(ActivateArgs),
+    /// Check one commit against the statement in force in a binding family.
+    Check(CheckArgs),
 }
 
 #[derive(Debug, Args)]
@@ -204,6 +225,29 @@ struct ActivateArgs {
     approvals: Vec<PathBuf>,
 }
 
+#[derive(Debug, Args)]
+struct CheckArgs {
+    /// The binding family whose statement in force the commit is judged
+    /// against.
+    #[arg(long = "family", value_parser = parse_contract_id)]
+    binding_family_id: ContractId,
+    /// The memory worker's sources file: the git source to read and the
+    /// observer identity to append under.
+    #[arg(long)]
+    sources: PathBuf,
+    /// The connector instance of the git source in `--sources` that reads the
+    /// statement's repository.
+    #[arg(long, value_parser = parse_contract_id)]
+    git_source: ContractId,
+    /// The exact commit (full object id) to check.
+    #[arg(long, value_parser = parse_commit)]
+    commit: GitObjectId,
+    /// Hard cap on enumerated enum members. Reaching it makes the read
+    /// non-exhaustive, so a missing member stays unknown.
+    #[arg(long, default_value_t = DEFAULT_SPEC_MEMBER_BOUND)]
+    member_bound: usize,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Expected {
     Present,
@@ -270,6 +314,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         Command::Draft(args) => draft(*args).await.map(|()| ExitCode::SUCCESS),
         Command::Approve(args) => approve(&args).map(|()| ExitCode::SUCCESS),
         Command::Activate(args) => activate(args).await,
+        Command::Check(args) => check(args).await.map(|()| ExitCode::SUCCESS),
     }
 }
 
@@ -361,6 +406,24 @@ async fn activate(args: ActivateArgs) -> anyhow::Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+async fn check(args: CheckArgs) -> anyhow::Result<()> {
+    let sources = WorkerSourcesV1::load(&args.sources)?;
+    let kek = content_kek_from_env()?.ok_or_else(|| {
+        anyhow!("{CONTENT_KEY_ENCRYPTION_KEY_ENV} must carry the governed-content key")
+    })?;
+    let runtime = connect_runtime().await?;
+    let request = SpecCheckRequestV1 {
+        binding_family_id: args.binding_family_id,
+        sources,
+        git_source: args.git_source,
+        commit: args.commit,
+        member_bound: args.member_bound,
+        evaluated_through: None,
+    };
+    let outcome = Box::pin(run_spec_check(&runtime, &kek, &request)).await?;
+    print_json(&outcome)
 }
 
 /// Connect as the writer login and verify the pinned head once.

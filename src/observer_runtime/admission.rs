@@ -33,7 +33,15 @@
 //! diagnostics, the vector digests — come from the runtime's own declaration
 //! and are bound into the admission's digest, which the result event carries.
 //! They are therefore auditable even though the generation-1 entry shape does
-//! not enumerate them.
+//! not enumerate them. They describe this code, not a deployment, so they are
+//! the public constants below ([`CLOSED_INPUT_BOUNDARY`], the toolchain ids,
+//! the vector digests), shared by `ostk-observer-run` and `ostk-spec check`.
+//!
+//! [`ObserverRuntimeDeclarationV1::from_activated_genesis`] builds the whole
+//! declaration without operator input: every governance-decided field read
+//! out of the activated genesis entry, every code-decided field from those
+//! constants. [`ObserverAdmissionBindingV1::resolve`] still checks it, so the
+//! two paths cannot drift apart silently.
 //!
 //! # Why a run can never flip the remember basis
 //!
@@ -46,12 +54,14 @@
 //! leaves no receipt and no event.
 
 use crate::evidence_ledger::ActiveStage4Package;
+use crate::memory_contracts::ContractError;
 use crate::memory_contracts::bootstrap::VerifiedBootstrapReceipt;
 use crate::memory_contracts::common::{ContractId, RegistryReferenceV1};
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::genesis::{
-    ObserverAdmissionEntryV1, ObserverAdmissionModeV1 as GenesisObserverAdmissionModeV1,
-    SemanticallyClosedGenesisPackage, SemanticallyDecodedGenesisEntryV1,
+    CoverageRequirementV1, ObserverAdmissionEntryV1,
+    ObserverAdmissionModeV1 as GenesisObserverAdmissionModeV1, SemanticallyClosedGenesisPackage,
+    SemanticallyDecodedGenesisEntryV1,
 };
 use crate::memory_contracts::observer::{
     AdmittedObserverV1, ObserverAdmissionModeV1, ObserverAdmissionV2,
@@ -69,6 +79,66 @@ use super::error::{ObserverRuntimeError, ObserverRuntimeResult};
 /// Kept beside the admission binding so a reader can see in one place that the
 /// algorithm the receipt names is the algorithm the code implements.
 pub const ADMISSION_ENUMERATION_ALGORITHM: &str = ENUMERATION_ALGORITHM_ID;
+
+/// The observer kind this runtime is: it enumerates one Rust enum. The
+/// generation-1 admission entry does not carry a kind, so the code states it.
+pub const OBSERVER_KIND: &str = "rust_enum";
+
+/// The closed input boundary this runtime reads. A property of the code: it
+/// reads git blobs and enumerates Rust enums, and nothing else.
+pub const CLOSED_INPUT_BOUNDARY: &str = "boundary.crate-source";
+
+/// The one source kind inside [`CLOSED_INPUT_BOUNDARY`]: a git blob.
+pub const SUPPORTED_SOURCE_KIND: &str = "git.blob";
+
+/// The one resource kind inside [`CLOSED_INPUT_BOUNDARY`]: a Rust enum.
+pub const SUPPORTED_RESOURCE_KIND: &str = "rust.enum";
+
+/// The applicability dimension every run must bind concretely: the exact
+/// source revision it read.
+pub const REQUIRED_APPLICABILITY_DIMENSION: &str = "repository_commit";
+
+/// The connector schema an observer run is delivered as.
+///
+/// Every package the strict witness admits carries it: generation 1 has it as
+/// its only connector, and generation 2 carries every generation-1 entry
+/// forward byte for byte.
+pub const OBSERVER_CONNECTOR_SCHEMA: &str = "connector.github.push";
+
+/// The toolchain identifiers closed into the admission proof.
+pub const TOOLCHAIN_LANGUAGE_VERSION: &str = "rust-1.94";
+pub const TOOLCHAIN_SCHEMA_VERSION: &str = "schema-v1";
+pub const TOOLCHAIN_COMPILER_VERSION: &str = "rustc-1.94.0";
+pub const TOOLCHAIN_API_VERSION: &str = "api-v1";
+
+/// Conformance vector digests for this build. They say which vectors this
+/// executable was proven against, so they belong to the code and not to a
+/// deployment flag.
+pub const POSITIVE_VECTOR_DIGEST: [u8; 32] = [0xa1; 32];
+pub const NEGATIVE_VECTOR_DIGEST: [u8; 32] = [0xa2; 32];
+pub const MUTATION_VECTOR_DIGEST: [u8; 32] = [0xa3; 32];
+pub const ADVERSARIAL_VECTOR_DIGEST: [u8; 32] = [0xa4; 32];
+
+/// The closed input boundary [`CLOSED_INPUT_BOUNDARY`] and its kinds, as the
+/// admission body carries them.
+pub fn observer_input_domain() -> ObserverRuntimeResult<ObserverInputDomainV1> {
+    Ok(ObserverInputDomainV1 {
+        closed_input_boundary_id: ContractId::new(CLOSED_INPUT_BOUNDARY)?,
+        supported_source_kinds: vec![ContractId::new(SUPPORTED_SOURCE_KIND)?],
+        supported_resource_kinds: vec![ContractId::new(SUPPORTED_RESOURCE_KIND)?],
+        required_applicability_dimensions: vec![ContractId::new(REQUIRED_APPLICABILITY_DIMENSION)?],
+    })
+}
+
+/// The toolchain identifiers, as the admission body carries them.
+pub fn observer_toolchain_versions() -> ObserverRuntimeResult<ObserverToolchainVersionsV1> {
+    Ok(ObserverToolchainVersionsV1 {
+        language_version: ContractId::new(TOOLCHAIN_LANGUAGE_VERSION)?,
+        schema_version: ContractId::new(TOOLCHAIN_SCHEMA_VERSION)?,
+        compiler_version: ContractId::new(TOOLCHAIN_COMPILER_VERSION)?,
+        api_version: ContractId::new(TOOLCHAIN_API_VERSION)?,
+    })
+}
 
 /// One observer admission, proven to be the activated one.
 #[derive(Debug)]
@@ -220,6 +290,59 @@ pub struct ObserverRuntimeDeclarationV1 {
 }
 
 impl ObserverRuntimeDeclarationV1 {
+    /// The declaration the activated genesis entry admitting
+    /// `admission_id` v`version` decides, completed by this code's own
+    /// constants.
+    ///
+    /// Every field governance decided — the executable, dependency closure,
+    /// and configuration digests, the admission mode, the predicate, and the
+    /// coverage proof the run receipt's witness is built under — is read out
+    /// of that one entry; every field that describes this code
+    /// ([`OBSERVER_KIND`], [`observer_input_domain`],
+    /// [`observer_toolchain_versions`], the vector digests) is a constant. No
+    /// operator input is involved, so a caller holding the genesis package a
+    /// verified witness names runs exactly the observer it admitted.
+    /// [`ObserverAdmissionBindingV1::resolve`] still checks the result
+    /// against the same entry.
+    ///
+    /// # Errors
+    ///
+    /// [`ObserverRuntimeError::ObserverNotAdmitted`] unless exactly one entry
+    /// admits that id and version; a contract error when the entry requires
+    /// no coverage proof (a candidate-only admission, which this runtime's
+    /// verified modes never run under).
+    pub fn from_activated_genesis(
+        genesis: &SemanticallyClosedGenesisPackage,
+        admission_id: &ContractId,
+        version: u32,
+    ) -> ObserverRuntimeResult<Self> {
+        let activated = unique_observer_body(genesis, admission_id, version)?;
+        let CoverageRequirementV1::Required { proof } = activated.coverage() else {
+            return Err(ContractError::Schema(format!(
+                "observer admission {admission_id} v{version} requires no coverage proof, so \
+                 it names no coverage-receipt recipe to run under"
+            ))
+            .into());
+        };
+        Ok(Self {
+            admission_id: activated.observer_id().clone(),
+            version: activated.version(),
+            observer_kind: ContractId::new(OBSERVER_KIND)?,
+            executable_digest: activated.executable_artifact_digest(),
+            dependency_closure_pin: activated.dependency_closure_digest(),
+            configuration_context_digest: activated.configuration_digest(),
+            mode: map_admission_mode(activated.admission_mode()),
+            predicate: activated.predicate_schema().clone(),
+            input_domain: observer_input_domain()?,
+            toolchain_versions: observer_toolchain_versions()?,
+            coverage_receipt_recipe: proof.clone(),
+            positive_vector_digest: Sha256Digest::from_bytes(POSITIVE_VECTOR_DIGEST),
+            negative_vector_digest: Sha256Digest::from_bytes(NEGATIVE_VECTOR_DIGEST),
+            mutation_vector_digest: Sha256Digest::from_bytes(MUTATION_VECTOR_DIGEST),
+            adversarial_vector_digest: Sha256Digest::from_bytes(ADVERSARIAL_VECTOR_DIGEST),
+        })
+    }
+
     /// Render the declaration as the v2 admission body.
     ///
     /// The enumeration algorithm id and its registered diagnostics come from
@@ -508,6 +631,56 @@ mod tests {
         rule_entry.body =
             decode_strict(br#"{"unrelated":true}"#.as_slice()).expect("canonical object");
         remember_basis_is_package_governed(&entries).unwrap();
+    }
+
+    #[test]
+    fn the_declaration_read_from_the_activated_genesis_resolves_against_it() {
+        use crate::memory_contracts::bootstrap::{
+            BootstrapPin, BootstrapReceiptDigest, BootstrapReceiptV1, verify_pinned_bootstrap,
+        };
+        use crate::memory_contracts::common::frozen_profile_reference_v1;
+        use crate::memory_contracts::digest::{DigestDomain, domain_separated_digest};
+
+        const BOOTSTRAP_RECEIPT: &[u8] =
+            include_bytes!("../../contracts/dynamic-memory/v1/bootstrap-receipt.jsonl");
+        let genesis = crate::registry_witness::compiled_genesis_package().unwrap();
+        let bytes = BOOTSTRAP_RECEIPT.strip_suffix(b"\n").unwrap();
+        let receipt: BootstrapReceiptV1 = decode_strict(bytes).unwrap();
+        let bootstrap = verify_pinned_bootstrap(
+            bytes,
+            BootstrapPin::from_trusted_config(BootstrapReceiptDigest::from_digest(
+                domain_separated_digest(DigestDomain::BootstrapReceipt, bytes),
+            )),
+            &frozen_profile_reference_v1(),
+            &receipt.statement.scope,
+            genesis,
+        )
+        .unwrap();
+
+        let observer = ContractId::new("observer.rust_enum").unwrap();
+        let declared =
+            ObserverRuntimeDeclarationV1::from_activated_genesis(genesis, &observer, 1).unwrap();
+        let binding = ObserverAdmissionBindingV1::resolve(
+            &bootstrap,
+            genesis,
+            declared.to_admission().unwrap(),
+        )
+        .expect("the genesis-read declaration is the admitted observer");
+        assert_eq!(binding.entry_reference().entry_id, observer);
+        assert_eq!(
+            binding.admission().mode,
+            ObserverAdmissionModeV1::PositiveVerified
+        );
+
+        let unadmitted =
+            ObserverRuntimeDeclarationV1::from_activated_genesis(genesis, &observer, 2);
+        assert!(
+            matches!(
+                unadmitted,
+                Err(ObserverRuntimeError::ObserverNotAdmitted { .. })
+            ),
+            "{unadmitted:?}"
+        );
     }
 
     #[test]

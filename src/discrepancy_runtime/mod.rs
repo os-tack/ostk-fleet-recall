@@ -58,7 +58,7 @@ mod repository;
 #[cfg(test)]
 pub(crate) mod testbed;
 
-pub use cockroach::CockroachDiscrepancyLedgerRepository;
+pub use cockroach::{CockroachDiscrepancyLedgerRepository, MAX_FAMILY_EPISODES};
 pub use projection::{
     ComparisonIndeterminacyV1, ComparisonSideProvider, ComparisonSideRoleV1, ComparisonVerdictV1,
     DISCREPANCY_RUNTIME_SCHEMA_VERSION, MAX_EPISODE_LOG_ENTRIES, MAX_FAMILY_RELATIONS,

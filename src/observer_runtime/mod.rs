@@ -77,8 +77,13 @@ pub mod receipt;
 pub mod source;
 
 pub use admission::{
-    ADMISSION_ENUMERATION_ALGORITHM, ObserverAdmissionBindingV1, ObserverRuntimeDeclarationV1,
-    dependency_closure_digest, remember_basis_is_package_governed,
+    ADMISSION_ENUMERATION_ALGORITHM, ADVERSARIAL_VECTOR_DIGEST, CLOSED_INPUT_BOUNDARY,
+    MUTATION_VECTOR_DIGEST, NEGATIVE_VECTOR_DIGEST, OBSERVER_CONNECTOR_SCHEMA, OBSERVER_KIND,
+    ObserverAdmissionBindingV1, ObserverRuntimeDeclarationV1, POSITIVE_VECTOR_DIGEST,
+    REQUIRED_APPLICABILITY_DIMENSION, SUPPORTED_RESOURCE_KIND, SUPPORTED_SOURCE_KIND,
+    TOOLCHAIN_API_VERSION, TOOLCHAIN_COMPILER_VERSION, TOOLCHAIN_LANGUAGE_VERSION,
+    TOOLCHAIN_SCHEMA_VERSION, dependency_closure_digest, observer_input_domain,
+    observer_toolchain_versions, remember_basis_is_package_governed,
     require_remember_basis_is_package_governed,
 };
 pub use drain::{

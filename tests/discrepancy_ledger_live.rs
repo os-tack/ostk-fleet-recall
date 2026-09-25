@@ -18,7 +18,9 @@
 //! * fail-closed paths write nothing: an event without an envelope, a
 //!   self-implicated dismissal (AUTH-03), a foreign-scope payload, and a
 //!   cross-family relation are all refused;
-//! * a superseding relation freezes its source episode's projection.
+//! * a superseding relation freezes its source episode's projection;
+//! * a family read returns each of that family's episodes with its stored
+//!   state and seeding envelope, and nothing of another family or scope.
 //!
 //! The ledger tables are keyed by the trusted `(tenant, project)` pair; a
 //! fresh unique physical scope per test isolates them. The semantic scope is
@@ -959,4 +961,65 @@ async fn live_a_relation_claiming_another_family_for_a_seeded_episode_is_refused
         .unwrap()
         .unwrap();
     assert_eq!(stored.lifecycle_state, LifecycleState::Open);
+}
+
+#[tokio::test]
+async fn live_a_family_read_returns_that_familys_episodes_only_when_configured() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = live_pool(&database_url).await;
+    let repository = ledger(&pool, "family-read");
+    let closed = envelope('5');
+    let standing = envelope('6');
+    for detection in [&closed, &standing] {
+        repository
+            .admit_envelope(&candidate(detection.clone()))
+            .await
+            .unwrap();
+    }
+    repository
+        .append_lifecycle_event(&dismiss_event(
+            &closed,
+            "2026-08-15T05:00:00.000000000Z",
+            "principal.on_call",
+        ))
+        .await
+        .unwrap();
+
+    let family = repository
+        .read_family_episodes(closed.family_fingerprint)
+        .await
+        .unwrap();
+    let mut expected = vec![
+        (closed.clone(), LifecycleState::Dismissed),
+        (standing.clone(), LifecycleState::Open),
+    ];
+    expected.sort_by_key(|(envelope, _)| envelope.episode_fingerprint);
+    let read: Vec<(DiscrepancyEnvelopeV1, LifecycleState)> = family
+        .into_iter()
+        .map(|(stored, envelope)| {
+            assert_eq!(stored.episode_fingerprint, envelope.episode_fingerprint);
+            (envelope, stored.lifecycle_state)
+        })
+        .collect();
+    assert_eq!(read, expected);
+
+    // Another family in the same scope, and the same family in another
+    // physical scope, hold none of them.
+    let alien_family = DiscrepancyFamilyFingerprintV1::from_digest(digest(&"7".repeat(64)));
+    assert!(
+        repository
+            .read_family_episodes(alien_family)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        ledger(&pool, "family-read-other")
+            .read_family_episodes(closed.family_fingerprint)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

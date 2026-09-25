@@ -454,16 +454,27 @@ pub fn spec_parser_artifact_id() -> ContractResult<ResourceUri> {
     ResourceUri::from_str(&format!("urn:ostk:occurrence:v1:artifact:sha256:{digest}"))
 }
 
-/// Bind the spec document at `path` in `commit`: the blob the path resolves
-/// to, re-read and checked against its git object name and content digest.
+/// Bind the spec document at `path` in `commit`.
 fn bind_spec_document(
     reader: &GitRepositoryReader,
     commit: &GitObjectId,
     path: &str,
 ) -> Result<ObservedSourceV1> {
+    bind_blob_at(reader, commit, path, "spec document")
+}
+
+/// Bind the blob `path` resolves to in `commit`: re-read and checked against
+/// its git object name and content digest, and refused over
+/// [`MAX_OBSERVED_SOURCE_BYTES`]. `what` names the file in a refusal.
+pub(crate) fn bind_blob_at(
+    reader: &GitRepositoryReader,
+    commit: &GitObjectId,
+    path: &str,
+    what: &str,
+) -> Result<ObservedSourceV1> {
     let unreadable = |error: &dyn std::fmt::Display| {
         FleetError::Memory(format!(
-            "spec document {path} cannot be bound at commit {}: {error}",
+            "{what} {path} cannot be bound at commit {}: {error}",
             commit.to_hex()
         ))
     };
@@ -479,7 +490,8 @@ fn bind_spec_document(
         blob_id: entry.blob_id,
         content_digest: source_content_digest(&bytes),
     };
-    bind_observed_source(reader, &pin, MAX_SPEC_DOCUMENT_BYTES).map_err(|error| unreadable(&error))
+    bind_observed_source(reader, &pin, MAX_OBSERVED_SOURCE_BYTES)
+        .map_err(|error| unreadable(&error))
 }
 
 fn schema(message: &str) -> ContractError {

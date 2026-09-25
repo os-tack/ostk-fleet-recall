@@ -111,6 +111,31 @@ const SELECT_PROJECTION_SQL: &str = "SELECT cursor_seq, lifecycle_state, verific
      FROM public.memory_discrepancy_projections_v1 \
      WHERE tenant_id = $1 AND project = $2 AND episode_fingerprint = $3";
 
+/// Every episode of one family: its head, its stored projection, and the
+/// envelope that seeded it (log sequence 1). The heads table has no family
+/// index, so this scans the scope's heads; one scope holds few episodes, and
+/// the read is bounded by `$4`.
+const SELECT_FAMILY_EPISODES_SQL: &str = "SELECT h.episode_fingerprint, p.cursor_seq, \
+     p.lifecycle_state, p.verification_state, p.evaluated_at, p.canonical_projection, \
+     l.canonical_record \
+     FROM public.memory_discrepancy_heads_v1 AS h \
+     JOIN public.memory_discrepancy_projections_v1 AS p \
+       ON p.tenant_id = h.tenant_id AND p.project = h.project \
+      AND p.episode_fingerprint = h.episode_fingerprint \
+     JOIN public.memory_discrepancy_log_v1 AS l \
+       ON l.tenant_id = h.tenant_id AND l.project = h.project \
+      AND l.episode_fingerprint = h.episode_fingerprint AND l.seq = 1 \
+     WHERE h.tenant_id = $1 AND h.project = $2 AND h.family_fingerprint = $3 \
+     ORDER BY h.episode_fingerprint \
+     LIMIT $4";
+
+/// Upper bound on the episodes one family read returns.
+///
+/// A family opens a new episode only after its previous one closed, so
+/// reaching this is a sign of corruption, and the read fails closed rather
+/// than returning a prefix.
+pub const MAX_FAMILY_EPISODES: usize = 4096;
+
 /// Discrepancy ledger runtime bound once to physical scope, semantic scope,
 /// and the active registry head.
 #[derive(Clone)]
@@ -154,6 +179,42 @@ impl CockroachDiscrepancyLedgerRepository {
     #[must_use]
     pub const fn registry_binding(&self) -> DiscrepancyRegistryBindingV1 {
         self.registry_binding
+    }
+
+    /// Every episode of `family_fingerprint` in this scope, ordered by
+    /// episode fingerprint: each one's stored projection with the envelope
+    /// that seeded it.
+    ///
+    /// A deriver reads this to learn whether a family already has an episode
+    /// that is not closed before it opens another. Every row is checked: the
+    /// seed record must be an envelope of this family and of the episode it
+    /// is stored under.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Memory`] for more than [`MAX_FAMILY_EPISODES`] episodes
+    /// or a row that fails those checks; a database error.
+    pub async fn read_family_episodes(
+        &self,
+        family_fingerprint: DiscrepancyFamilyFingerprintV1,
+    ) -> Result<Vec<(StoredDiscrepancyProjectionV1, DiscrepancyEnvelopeV1)>> {
+        let bound = i64::try_from(MAX_FAMILY_EPISODES + 1)
+            .map_err(|_| FleetError::Memory("family episode bound exceeds INT8".into()))?;
+        let rows: Vec<PgRow> = sqlx::query(SELECT_FAMILY_EPISODES_SQL)
+            .bind(self.trusted_scope.tenant_id())
+            .bind(self.trusted_scope.project())
+            .bind(family_fingerprint.digest().as_bytes().to_vec())
+            .bind(bound)
+            .fetch_all(&self.pool)
+            .await?;
+        if rows.len() > MAX_FAMILY_EPISODES {
+            return Err(FleetError::Memory(
+                "discrepancy family holds more episodes than one read returns".into(),
+            ));
+        }
+        rows.iter()
+            .map(|row| decode_family_episode_row(family_fingerprint, row))
+            .collect()
     }
 }
 
@@ -706,6 +767,31 @@ fn decode_projection_row(
         verification_state: verification_state_from_str(&verification_state)?,
         canonical_projection,
     })
+}
+
+/// One row of [`SELECT_FAMILY_EPISODES_SQL`]: the stored projection and the
+/// seeding envelope, which must belong to `family` and to the row's episode.
+fn decode_family_episode_row(
+    family: DiscrepancyFamilyFingerprintV1,
+    row: &PgRow,
+) -> Result<(StoredDiscrepancyProjectionV1, DiscrepancyEnvelopeV1)> {
+    let episode = DiscrepancyEpisodeFingerprintV1::from_digest(digest_from(
+        &row.try_get::<Vec<u8>, _>("episode_fingerprint")?,
+    )?);
+    let stored = decode_projection_row(episode, row)?;
+    let record: DiscrepancyLogRecordV1 =
+        decode_strict(&row.try_get::<Vec<u8>, _>("canonical_record")?)?;
+    let DiscrepancyLogRecordV1::Envelope { envelope } = record else {
+        return Err(FleetError::Memory(
+            "discrepancy log sequence 1 is not an envelope record".into(),
+        ));
+    };
+    if envelope.episode_fingerprint != episode || envelope.family_fingerprint != family {
+        return Err(FleetError::Memory(
+            "a discrepancy envelope is stored under another episode or family than it names".into(),
+        ));
+    }
+    Ok((stored, envelope))
 }
 
 async fn statement_timestamp(transaction: &mut Transaction<'_, Postgres>) -> Result<DateTime<Utc>> {

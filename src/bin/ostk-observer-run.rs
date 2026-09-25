@@ -29,8 +29,9 @@
 //! Values that describe THIS BINARY rather than the deployment — the
 //! enumeration algorithm, its registered diagnostics, the closed input
 //! boundary, the toolchain identifiers, and the conformance vector digests —
-//! are compiled in. An operator flag for them would let a deployment claim
-//! more exhaustiveness than the code can deliver.
+//! are compiled in, as the `observer_runtime` constants `ostk-spec check` also
+//! runs under. An operator flag for them would let a deployment claim more
+//! exhaustiveness than the code can deliver.
 //!
 //! # The source is pinned, not discovered
 //!
@@ -55,16 +56,18 @@ use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
 use ostk_fleet_recall::memory_contracts::evidence::AcceptedEventId;
 use ostk_fleet_recall::memory_contracts::genesis::SemanticallyClosedGenesisPackage;
 use ostk_fleet_recall::memory_contracts::observer::{
-    ObserverAdmissionModeV1, ObserverCoverageContinuityV1, ObserverInputDomainV1,
-    ObserverToolchainVersionsV1,
+    ObserverAdmissionModeV1, ObserverCoverageContinuityV1,
 };
 use ostk_fleet_recall::memory_contracts::registry::ManifestVerifiedRegistryPackage;
 use ostk_fleet_recall::memory_contracts::relation::ConcreteApplicabilityDimensionV1;
 use ostk_fleet_recall::observer_runtime::{
-    MAX_OBSERVED_SOURCE_BYTES, ObserverAdmissionBindingV1, ObserverConnectorBindingV1,
-    ObserverDrainContextV1, ObserverIngressClocksV1, ObserverQuestionV1, ObserverRunPlanV1,
-    ObserverRunRecordV1, ObserverRuntimeDeclarationV1, ObserverSourcePinV1, bind_observed_source,
-    build_observer_run, drain_observer_run, enumerate_rust_enum,
+    ADVERSARIAL_VECTOR_DIGEST, MAX_OBSERVED_SOURCE_BYTES, MUTATION_VECTOR_DIGEST,
+    NEGATIVE_VECTOR_DIGEST, OBSERVER_CONNECTOR_SCHEMA, OBSERVER_KIND, ObserverAdmissionBindingV1,
+    ObserverConnectorBindingV1, ObserverDrainContextV1, ObserverIngressClocksV1,
+    ObserverQuestionV1, ObserverRunPlanV1, ObserverRunRecordV1, ObserverRuntimeDeclarationV1,
+    ObserverSourcePinV1, POSITIVE_VECTOR_DIGEST, REQUIRED_APPLICABILITY_DIMENSION,
+    bind_observed_source, build_observer_run, drain_observer_run, enumerate_rust_enum,
+    observer_input_domain, observer_toolchain_versions,
 };
 use ostk_fleet_recall::private_postgres::{
     PrivatePostgresSslPolicy, private_postgres_connect_options,
@@ -78,25 +81,6 @@ use uuid::Uuid;
 const APPLICATION_NAME: &str = "ostk-observer-run";
 const MAX_CONNECTIONS: u32 = 2;
 const DATABASE_URL_ENV: &str = "FLEET_RECALL_OBSERVER_DATABASE_URL";
-
-/// The closed input boundary this binary reads. A property of the code: it
-/// reads git blobs and enumerates Rust enums, and nothing else.
-const CLOSED_INPUT_BOUNDARY: &str = "boundary.crate-source";
-const SUPPORTED_SOURCE_KIND: &str = "git.blob";
-const SUPPORTED_RESOURCE_KIND: &str = "rust.enum";
-const REQUIRED_APPLICABILITY_DIMENSION: &str = "repository_commit";
-/// The connector schema an observer run delivers as. Every package the strict
-/// witness admits carries it: generation 1 has it as its only connector, and
-/// generation 2 carries every generation-1 entry forward byte for byte.
-const OBSERVER_CONNECTOR_SCHEMA: &str = "connector.github.push";
-
-/// Conformance vector digests for this build. These describe which vectors
-/// this executable was proven against, so they belong to the binary and not
-/// to a deployment flag.
-const POSITIVE_VECTOR_DIGEST: [u8; 32] = [0xa1; 32];
-const NEGATIVE_VECTOR_DIGEST: [u8; 32] = [0xa2; 32];
-const MUTATION_VECTOR_DIGEST: [u8; 32] = [0xa3; 32];
-const ADVERSARIAL_VECTOR_DIGEST: [u8; 32] = [0xa4; 32];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -210,7 +194,7 @@ struct AdmissionArgs {
     #[arg(long, value_name = "N")]
     observer_version: u32,
     /// The observer kind.
-    #[arg(long, value_name = "ID", default_value = "rust_enum")]
+    #[arg(long, value_name = "ID", default_value = OBSERVER_KIND)]
     observer_kind: String,
     /// The executable artifact digest governance pinned.
     #[arg(long, value_name = "HEX")]
@@ -459,20 +443,8 @@ fn declaration(args: &AdmissionArgs) -> anyhow::Result<ObserverRuntimeDeclaratio
             version: args.predicate_version,
             entry_digest: parse_digest(&args.predicate_digest, "--predicate-digest")?,
         },
-        input_domain: ObserverInputDomainV1 {
-            closed_input_boundary_id: ContractId::new(CLOSED_INPUT_BOUNDARY)?,
-            supported_source_kinds: vec![ContractId::new(SUPPORTED_SOURCE_KIND)?],
-            supported_resource_kinds: vec![ContractId::new(SUPPORTED_RESOURCE_KIND)?],
-            required_applicability_dimensions: vec![ContractId::new(
-                REQUIRED_APPLICABILITY_DIMENSION,
-            )?],
-        },
-        toolchain_versions: ObserverToolchainVersionsV1 {
-            language_version: ContractId::new("rust-1.94")?,
-            schema_version: ContractId::new("schema-v1")?,
-            compiler_version: ContractId::new("rustc-1.94.0")?,
-            api_version: ContractId::new("api-v1")?,
-        },
+        input_domain: observer_input_domain()?,
+        toolchain_versions: observer_toolchain_versions()?,
         coverage_receipt_recipe: RegistryReferenceV1 {
             entry_id: ContractId::new(args.coverage_recipe_entry.clone())?,
             version: args.coverage_recipe_version,
