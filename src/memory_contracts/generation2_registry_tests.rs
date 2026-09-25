@@ -46,6 +46,28 @@ fn every_generation_one_entry_is_carried_forward_byte_for_byte() {
     assert_ne!(two.package_digest(), one.package_digest());
 }
 
+/// The generation-2 package digest as of be8b798, the digest every installed
+/// generation-2 head names.
+const FROZEN_GENERATION_TWO_PACKAGE_DIGEST: &str =
+    "bd64f2d18854e483a2201f4e55e2fced14b89e5e77d733cef1ee3c25eff6619e";
+
+#[test]
+fn generation_two_package_digest_is_frozen() {
+    // Determinism alone would not notice an edit to the composition: both
+    // sides of the comparison would move together. Installed heads name this
+    // exact digest, so any drift strands every generation-2 writer as
+    // `UnknownActivePackage`; a later generation composes its own package
+    // instead of editing this one.
+    let compiled = crate::registry_witness::compiled_generation_two_package()
+        .expect("the compiled generation-2 package closes");
+    assert_eq!(
+        compiled.package_digest().to_string(),
+        FROZEN_GENERATION_TWO_PACKAGE_DIGEST,
+        "the generation-2 package bytes changed"
+    );
+    assert_eq!(generation_two().package_digest(), compiled.package_digest());
+}
+
 #[test]
 fn the_composition_is_deterministic() {
     assert_eq!(

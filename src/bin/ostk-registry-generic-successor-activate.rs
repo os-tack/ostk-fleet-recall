@@ -17,6 +17,14 @@
 //! before any database URL is parsed. The repository independently rebuilds the
 //! same policy from durable bytes under its stream lock, and the expected-head
 //! artifact binds the two together: its package digest is the active package's.
+//!
+//! The repository activates any structurally closed successor package; it is
+//! the generic ceremony and stays generic. This CLI is narrower: it refuses,
+//! offline and before any connection, a target package this build does not
+//! recognize (`materialize_active_package`, AUTH-04). A head naming such a
+//! package would make every writer fail closed as `UnknownActivePackage`
+//! until a binary that compiles the package in is deployed, so installing one
+//! can only strand the scope.
 
 use std::fs::File;
 use std::io::Read;
@@ -34,6 +42,7 @@ use ostk_fleet_recall::memory_contracts::common::{
     AuthenticatedProjectScopeV1, CanonicalTimestamp, ProfileReferenceV1, RegistryReferenceV1,
     frozen_profile_reference_v1,
 };
+use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
 use ostk_fleet_recall::memory_contracts::evidence_v2::RegistryHeadBindingV1;
 use ostk_fleet_recall::memory_contracts::registry::ManifestVerifiedRegistryPackage;
 use ostk_fleet_recall::memory_contracts::successor_generic::{
@@ -50,6 +59,10 @@ use ostk_fleet_recall::registry_activation::{
     AcceptedGenericSuccessorActivation, CockroachGenericSuccessorRepository,
     GenericSuccessorActivationCandidate, GenericSuccessorActivationInspection,
     GenericSuccessorActivationOutcome, GenericSuccessorRepository, ReadyGenericSuccessor,
+};
+use ostk_fleet_recall::registry_witness::{
+    KnownRegistryPackage, WriterAuthorityError, WriterAuthorityRejection,
+    materialize_active_package,
 };
 use ostk_fleet_recall::store::cockroach::RetryPolicy;
 use ring::signature;
@@ -122,6 +135,7 @@ impl<'a> ArtifactAuthority<'a> {
 
 struct VerifiedArtifacts {
     canonical_target_package: Vec<u8>,
+    target_package_digest: Sha256Digest,
     canonical_target_test_result: Vec<u8>,
     expected_head: RegistryHeadBindingV1,
     target_generation: u32,
@@ -147,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
     // against the installed policy before sqlx options are parsed.
     let prepared = prepare_execution(args, &authority, config.database_url())?;
     let artifacts = prepared.artifacts;
+    require_recognized_target(artifacts.target_package_digest)?;
     let pool = PgPoolOptions::new()
         .max_connections(MAX_CONNECTIONS)
         .min_connections(0)
@@ -284,11 +299,33 @@ fn verify_artifacts(
 
     Ok(VerifiedArtifacts {
         canonical_target_package: target_package_bytes,
+        target_package_digest: target.package_digest(),
         canonical_target_test_result: target_test_result_bytes,
         expected_head,
         target_generation,
         candidate,
     })
+}
+
+/// Refuse a target package this build would not recognize as an active head.
+///
+/// Offline, and run before any connection: a head is only usable when every
+/// writer can materialize its package digest, so a package outside the
+/// compiled-in table would strand the scope rather than advance it. The
+/// repository is deliberately not asked; it stays generic.
+fn require_recognized_target(
+    target_package_digest: Sha256Digest,
+) -> anyhow::Result<KnownRegistryPackage> {
+    match materialize_active_package(target_package_digest) {
+        Ok(active) => Ok(active.known()),
+        Err(WriterAuthorityError::Rejected(WriterAuthorityRejection::UnknownActivePackage)) => {
+            Err(anyhow!(
+                "target package {target_package_digest} is not a registry package this build \
+                 recognizes; activating it would install a head no writer can act under"
+            ))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Close the whole ceremony offline and return its target generation.
@@ -604,6 +641,36 @@ mod tests {
         assert_eq!(
             target.target_package_digest.to_string(),
             GENERATION_2_PACKAGE_DIGEST
+        );
+    }
+
+    #[test]
+    fn a_target_this_build_does_not_recognize_is_refused_offline() {
+        let scope = fixture_scope();
+        // The frozen generic fixture closes as a ceremony, but its package is
+        // not one any writer of this build can act under.
+        let verified = verify_artifacts(&artifact_args(), &fixture_authority(&scope)).unwrap();
+        let error = require_recognized_target(verified.target_package_digest)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("not a registry package this build recognizes"));
+        assert!(error.contains(GENERATION_2_PACKAGE_DIGEST));
+    }
+
+    #[test]
+    fn every_compiled_in_package_is_a_recognized_target() {
+        use ostk_fleet_recall::registry_witness::{
+            compiled_generation_two_package, compiled_stage4_package,
+        };
+        assert_eq!(
+            require_recognized_target(compiled_stage4_package().unwrap().package_digest()).unwrap(),
+            KnownRegistryPackage::Stage4Generation1
+        );
+        assert_eq!(
+            require_recognized_target(compiled_generation_two_package().unwrap().package_digest())
+                .unwrap(),
+            KnownRegistryPackage::ConnectorGeneration2
         );
     }
 

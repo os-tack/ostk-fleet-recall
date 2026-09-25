@@ -62,12 +62,11 @@ use std::borrow::Cow;
 
 use unicode_normalization::UnicodeNormalization as _;
 
-// The secret scanner and its replacement discipline live beside the transcript
-// connector, which is where they were first needed. They are not
-// transcript-specific: the shapes they match are credentials wherever they
-// appear, and the recall plane needs exactly the same refusal.
-use crate::connectors::transcript::{REDACTION_PLACEHOLDER, RedactionDispositionV1, redact};
 use crate::memory_contracts::digest::{DigestDomain, Sha256Digest, body_digest, framed_digest};
+// The crate's one secret scanner and its replacement discipline: the shapes it
+// matches are credentials wherever they appear, and the recall plane needs
+// exactly the same refusal as every collector.
+use crate::redaction::{REDACTION_PLACEHOLDER, RedactionDispositionV1, redact};
 
 use super::error::{RecallProjectionError, RecallProjectionResult};
 

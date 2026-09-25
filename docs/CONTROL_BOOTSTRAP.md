@@ -188,7 +188,10 @@ production SQL surface reaches only `memory_control_events`,
 which the first-successor role already covers. At generation `N >= 1` there is
 no key bridge: the authorizing keys come from the package the current head
 installs, which the ceremony supplies as an artifact so its whole approval
-closure is checked offline before any database URL is parsed. Like the
+closure is checked offline before any database URL is parsed. The CLI also
+refuses, before it connects, a target package this build does not recognize as
+an active head (ADR 0005 D1), because installing one would leave every writer
+failing closed. Like the
 first-successor CLI it has no Terraform, production-image, ECS, MCP, HTTP, or
 serving-runtime wiring, and the production image does not contain it.
 

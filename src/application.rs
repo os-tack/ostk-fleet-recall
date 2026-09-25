@@ -4372,9 +4372,8 @@ mod tests {
     /// A git source whose last attempt failed and a transcript source whose
     /// last check is stale.
     fn evidence_sources() -> EvidenceSourcesV1 {
-        use crate::evidence_recall::EvidenceCoverageV1;
+        use crate::evidence_recall::{EvidenceCoverageV1, EvidenceSourceKindV1};
         use crate::memory_contracts::coverage::CoverageCompletenessV1;
-        use crate::worker::WorkerSourceKindV1;
         let coverage = Some(EvidenceCoverageV1 {
             completeness: CoverageCompletenessV1::Complete,
             observed: vec![[1, 2]],
@@ -4385,7 +4384,7 @@ mod tests {
             active: vec![
                 EvidenceSourceV1 {
                     connector_instance: GIT_SOURCE.into(),
-                    kind: WorkerSourceKindV1::Git,
+                    kind: EvidenceSourceKindV1::Git,
                     state: "active".into(),
                     last_outcome: WorkerSourceOutcomeV1::Failed,
                     last_checked_at: Some(Utc::now()),
@@ -4395,7 +4394,7 @@ mod tests {
                 },
                 EvidenceSourceV1 {
                     connector_instance: TRANSCRIPT_SOURCE.into(),
-                    kind: WorkerSourceKindV1::Transcript,
+                    kind: EvidenceSourceKindV1::Transcript,
                     state: "active".into(),
                     last_outcome: WorkerSourceOutcomeV1::Ok,
                     last_checked_at: Some(Utc::now()),

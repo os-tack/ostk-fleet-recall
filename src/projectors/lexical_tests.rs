@@ -5,12 +5,12 @@
 //! fixture and a private-key header — because that is how you test a
 //! redaction boundary. They therefore match the publication corpus's
 //! sensitive-pattern gate, exactly like `src/config_tests.rs` and
-//! `src/connectors/transcript/redactor_tests.rs`, and are excluded from the
+//! `src/redaction/secrets_tests.rs`, and are excluded from the
 //! corpus for the same reason. Keeping them here leaves the production
 //! module itself publication-safe.
 
 use super::*;
-use crate::connectors::transcript::scan_secrets;
+use crate::redaction::scan_secrets;
 
 /// An undeclared media type: raw-byte normalization, the version-1 path.
 const OPAQUE: &str = "application.octet-stream";
@@ -277,5 +277,70 @@ fn the_normalization_version_is_part_of_the_identity() {
     assert_ne!(
         lexical_text_digest(1, LexicalStateV1::Indexed, text),
         lexical_text_digest(2, LexicalStateV1::Indexed, text)
+    );
+}
+
+/// Golden lexical rows for the two declared media types.
+///
+/// `LEXICAL_NORMALIZATION_VERSION` is what keeps two normalizers from claiming
+/// one identity, but nothing forces it to move: a change to rendering, folding,
+/// or redaction that forgets to bump it would silently re-key every lexical row
+/// a replay rebuilds. These pin the exact text and digest one body of each
+/// declared media type projects to, so any such change is seen, and either
+/// bumps the version or is reverted. A later media-type branch leaves them
+/// unchanged.
+fn assert_golden(media_type: &str, body: &[u8], text: &str, digest: &str) {
+    let derived = projection_of(media_type, body);
+    assert_eq!(derived.normalization_version, LEXICAL_NORMALIZATION_VERSION);
+    assert_eq!(derived.state, LexicalStateV1::Indexed);
+    assert_eq!(derived.text, text, "{media_type} text moved");
+    assert_eq!(
+        derived.text_digest.to_string(),
+        digest,
+        "{media_type} text digest moved"
+    );
+}
+
+#[test]
+fn a_git_fact_body_projects_to_its_golden_lexical_text() {
+    let body = format!(
+        concat!(
+            "{{\"author\":{{\"email\":\"{email}\",\"name\":\"{name}\"}},",
+            "\"commit_id\":\"4b825dc642cb6eb9a060e54bf8d69288fbee4904\",",
+            "\"kind\":\"commit\",\"message\":\"{message}\",",
+            "\"parents\":[\"9fceb02d0ae598e95dc970b74767f19372d61af8\"],",
+            "\"schema_version\":1}}"
+        ),
+        email = hex::encode("ada@example.com"),
+        name = hex::encode("Ada Lovelace"),
+        message = hex::encode(
+            "fix(recall): fold the query\n\nA cafe\u{301} test, PGPASSWORD=hunter22\tdone\n"
+        ),
+    );
+    assert_golden(
+        GIT_FACT_MEDIA_TYPE,
+        body.as_bytes(),
+        concat!(
+            "ada@example.com Ada Lovelace 4b825dc642cb6eb9a060e54bf8d69288fbee4904 commit ",
+            "fix(recall): fold the query A caf\u{e9} test, PGPASSWORD=[REDACTED] done ",
+            "9fceb02d0ae598e95dc970b74767f19372d61af8 1"
+        ),
+        "6f1676261823ce9f9d7d2c236cb3c3e5d728e5a2f54ed7accf526c738f3a5c0b",
+    );
+}
+
+#[test]
+fn a_canonical_json_body_projects_to_its_golden_lexical_text() {
+    let body = concat!(
+        "{\"role\":\"assistant\",\"schema_version\":1,",
+        "\"session_id\":\"01931f2c-0000-7000-8000-000000000002\",",
+        "\"text\":\"D\u{e9}ploiement  termin\u{e9}; token: sk-abcdefghijklmnop\"}"
+    );
+    assert_golden(
+        CANONICAL_JSON_MEDIA_TYPE,
+        body.as_bytes(),
+        "assistant 1 01931f2c-0000-7000-8000-000000000002 D\u{e9}ploiement termin\u{e9}; \
+         token: [REDACTED]",
+        "5dda1dcef6e53c4fe287de13dcdda30a0966c6c17fcf4ba89a2aa35f3a070be6",
     );
 }

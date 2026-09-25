@@ -2,7 +2,6 @@
 //! secret-shaped content never becomes an outbox row.
 
 use super::super::parser::transcript_parser_key_v1;
-use super::super::redactor::{RedactionGuaranteeV1, SecretClassV1};
 use super::super::test_fixture::{
     PLANTED_KEY_MATERIAL, PLANTED_REDACTABLE_SECRET, active_package, binding, clean_transcript,
     clocks, line, secret_transcript,
@@ -11,6 +10,7 @@ use super::*;
 use crate::connectors::transcript::{
     TranscriptConnectorError, TranscriptCursorRowV1, TranscriptOutboxStateV1,
 };
+use crate::redaction::{RedactionGuaranteeV1, SecretClassV1};
 
 const SESSION: &str = "01931f2c-0000-7000-8000-000000000002";
 

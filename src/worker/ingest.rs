@@ -27,8 +27,8 @@ use crate::connectors::git::{
     drain_git_facts, git_coverage_observation,
 };
 use crate::connectors::transcript::{
-    CockroachTranscriptOutboxRepository, MAX_TRANSCRIPT_BYTES, RedactionGuaranteeV1,
-    TranscriptCollectionRequestV1, TranscriptConnectorBindingV1, TranscriptCoverageBindingV1,
+    CockroachTranscriptOutboxRepository, MAX_TRANSCRIPT_BYTES, TranscriptCollectionRequestV1,
+    TranscriptConnectorBindingV1, TranscriptConnectorError, TranscriptCoverageBindingV1,
     TranscriptDrainModeV1, TranscriptDrainRequest, TranscriptEnqueueOutcome,
     TranscriptIngressClocksV1, TranscriptOutboxRepository as _, collect_batch, drain_source_outbox,
     transcript_parser_key_v3,
@@ -52,6 +52,7 @@ use crate::memory_contracts::evidence_v2::EvidenceIngressCandidateV2;
 use crate::memory_contracts::generation2_registry::{
     CI_CONNECTOR, GIT_CONNECTOR, Generation2ConnectorIds, TRANSCRIPT_CONNECTOR,
 };
+use crate::redaction::RedactionGuaranteeV1;
 use crate::registry_witness::{VerifiedWriterAuthority, WriterAuthorityRuntime};
 use crate::store::cockroach::{RetryPolicy, with_serializable_retry};
 
@@ -456,7 +457,10 @@ impl Ingest<'_> {
             *inventory = None;
         }
         let bound = Self::bind(verified, &TRANSCRIPT_CONNECTOR).and_then(|(active, verified)| {
-            let guarantee = RedactionGuaranteeV1::from_active_package(&active).map_err(describe)?;
+            // Spelled as the transcript connector's own refusal, so a missing
+            // guarantee reads as it always has in the step's error.
+            let guarantee = RedactionGuaranteeV1::from_active_package(&active)
+                .map_err(|error| describe(TranscriptConnectorError::from(error)))?;
             Ok((active, verified, guarantee))
         });
         let mut reports = Vec::with_capacity(discovered.files.len());

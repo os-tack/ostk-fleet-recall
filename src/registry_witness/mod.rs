@@ -14,16 +14,18 @@
 //! - **AUTH-04** — normativity is designated. Nothing is treated as an active
 //!   registry unless the deployment-pinned bootstrap receipt, the durable log
 //!   epoch, and the active head all agree, and the head's package digest
-//!   materializes to a compiled-in semantically closed package. Exactly two
-//!   packages are compiled in ([`KnownRegistryPackage`]): the frozen
-//!   generation-1 Stage-4 package, and the generation-2 connector package
-//!   composed from those same bytes by
-//!   [`generation_two_registry_package`]. Both are build inputs, never
+//!   materializes to a compiled-in semantically closed package. The packages
+//!   this build recognizes are the rows of one static table, `KNOWN_PACKAGES`,
+//!   each a [`KnownRegistryPackage`] tag, the closure that builds it from
+//!   compiled-in bytes, and whether it keeps the Stage-4 narrowing. Today the
+//!   table holds the frozen generation-1 Stage-4 package and the generation-2
+//!   connector package composed from those same bytes by
+//!   [`generation_two_registry_package`]. Every row is a build input, never
 //!   database state, so admitting a head's digest runs only admission rules
-//!   this process has itself closed. Every other digest, including any
-//!   generation-3 package, fails closed as
-//!   [`WriterAuthorityRejection::UnknownActivePackage`] until its bytes are
-//!   compiled in here.
+//!   this process has itself closed. Every other digest fails closed as
+//!   [`WriterAuthorityRejection::UnknownActivePackage`] until a row for it is
+//!   compiled in; recognizing a later generation is one new tag and one new
+//!   row, and changes nothing about how the existing rows are recognized.
 //! - **ABA safety** — the comparison is on the exact `activation_id`, never on
 //!   the package or policy digest, so an A -> B -> A rollback that restores a
 //!   previous package cannot be mistaken for the head the caller observed.
@@ -847,9 +849,46 @@ fn verify_head_binding(
     Ok(())
 }
 
+/// Builds one compiled-in package closure. A failure is a build defect, never
+/// a verdict about a database.
+type CompiledClosure<T> = fn() -> WitnessResult<Arc<T>>;
+
+/// One registry package this build compiles in.
+struct KnownPackage {
+    /// The tag a head that activates this package is recognized as.
+    known: KnownRegistryPackage,
+    /// The package as a generic successor closure; every row has one.
+    successor: CompiledClosure<SemanticallyClosedSuccessorPackage>,
+    /// The Stage-4 narrowing of the same package, for the one row that closes
+    /// under it.
+    stage4: Option<CompiledClosure<SemanticallyClosedStage4Package>>,
+}
+
+/// Every registry package this build recognizes, in the order a head's digest
+/// is compared against them (AUTH-04).
+///
+/// Each row is built only from compiled-in bytes, and no two rows share a
+/// digest (`every_known_package_row_materializes_as_its_own_tag`). A later
+/// generation is recognized by appending one tag and one row; the existing
+/// rows, and so every head that already activated one of them, are
+/// untouched.
+static KNOWN_PACKAGES: [KnownPackage; 2] = [
+    KnownPackage {
+        known: KnownRegistryPackage::Stage4Generation1,
+        successor: compiled_stage4_successor_package,
+        stage4: Some(compiled_stage4_package),
+    },
+    KnownPackage {
+        known: KnownRegistryPackage::ConnectorGeneration2,
+        successor: compiled_generation_two_package,
+        stage4: None,
+    },
+];
+
 /// Map the head's package digest to a compiled-in semantically closed package.
 ///
-/// Exactly two digests materialize:
+/// A digest materializes exactly when it is the digest of one row of
+/// `KNOWN_PACKAGES`:
 ///
 /// - the frozen first Stage-4 package, as
 ///   [`KnownRegistryPackage::Stage4Generation1`] with its Stage-4 narrowing;
@@ -859,29 +898,22 @@ fn verify_head_binding(
 ///   narrowing.
 ///
 /// Any other digest fails closed: the view deliberately exposes no
-/// `canonical_package` column, so a later package (generation 3 and beyond is
-/// deferred) needs either its own compiled-in bytes here or an additive
-/// migration that exposes the canonical package through
-/// `memory_writer_authority_v1`. Guessing is not an option — the writer would
-/// otherwise run admission rules it has never verified.
+/// `canonical_package` column, so a later package needs either its own
+/// compiled-in row here or an additive migration that exposes the canonical
+/// package through `memory_writer_authority_v1`. Guessing is not an option —
+/// the writer would otherwise run admission rules it has never verified.
 pub fn materialize_active_package(
     package_digest: Sha256Digest,
 ) -> WitnessResult<ActiveRegistryPackage> {
-    let stage4 = compiled_stage4()?;
-    if stage4.stage4.package_digest() == package_digest {
-        return Ok(ActiveRegistryPackage {
-            known: KnownRegistryPackage::Stage4Generation1,
-            successor: Arc::clone(&stage4.successor),
-            stage4: Some(Arc::clone(&stage4.stage4)),
-        });
-    }
-    let generation_two = compiled_generation_two_package()?;
-    if generation_two.package_digest() == package_digest {
-        return Ok(ActiveRegistryPackage {
-            known: KnownRegistryPackage::ConnectorGeneration2,
-            successor: generation_two,
-            stage4: None,
-        });
+    for row in &KNOWN_PACKAGES {
+        let successor = (row.successor)()?;
+        if successor.package_digest() == package_digest {
+            return Ok(ActiveRegistryPackage {
+                known: row.known,
+                successor,
+                stage4: row.stage4.map(|stage4| stage4()).transpose()?,
+            });
+        }
     }
     Err(WriterAuthorityRejection::UnknownActivePackage.into())
 }
@@ -992,6 +1024,12 @@ fn closed_stage4_package() -> ContractResult<CompiledStage4> {
 /// defect rather than a verdict about any database.
 pub fn compiled_stage4_package() -> WitnessResult<Arc<SemanticallyClosedStage4Package>> {
     compiled_stage4().map(|compiled| Arc::clone(&compiled.stage4))
+}
+
+/// The same frozen generation-1 package as a generic successor closure, shared
+/// with [`compiled_stage4_package`] rather than closed a second time.
+fn compiled_stage4_successor_package() -> WitnessResult<Arc<SemanticallyClosedSuccessorPackage>> {
+    compiled_stage4().map(|compiled| Arc::clone(&compiled.successor))
 }
 
 /// The compiled-in generation-2 connector package.
@@ -1423,6 +1461,39 @@ mod tests {
             serde_json::to_value(active.known()).expect("tag serializes"),
             serde_json::json!("connector_generation2")
         );
+    }
+
+    #[test]
+    fn every_known_package_row_materializes_as_its_own_tag() {
+        let mut digests = std::collections::BTreeSet::new();
+        let mut tags = std::collections::HashSet::new();
+        for row in &KNOWN_PACKAGES {
+            let digest = (row.successor)()
+                .expect("every known row closes")
+                .package_digest();
+            assert!(digests.insert(digest), "two rows share digest {digest}");
+            assert!(
+                tags.insert(row.known),
+                "two rows share the tag {:?}",
+                row.known
+            );
+            let active = materialize_active_package(digest).expect("a known row materializes");
+            assert_eq!(active.known(), row.known);
+            assert_eq!(active.package_digest(), digest);
+            assert_eq!(
+                active
+                    .stage4()
+                    .map(SemanticallyClosedStage4Package::package_digest),
+                row.stage4.map(|_| digest),
+                "a row keeps a Stage-4 narrowing exactly when it declares one, of the same package"
+            );
+        }
+        assert!(matches!(
+            materialize_active_package(Sha256Digest::from_bytes([0xa5; 32])),
+            Err(WriterAuthorityError::Rejected(
+                WriterAuthorityRejection::UnknownActivePackage
+            ))
+        ));
     }
 
     #[test]

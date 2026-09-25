@@ -30,6 +30,24 @@ composed from those same bytes. A head is recognized by its package digest,
 never by its generation, so a rollback cannot change which admission rules run.
 Any other digest is `UnknownActivePackage`.
 
+**The known-packages table.** The recognized packages are the rows of one
+static table, `KNOWN_PACKAGES` in `src/registry_witness/mod.rs`. Each row is a
+`KnownRegistryPackage` tag, the function that closes the package from
+compiled-in bytes, and, for the generation-1 row only, its Stage-4 narrowing.
+`materialize_active_package` compares a head's digest with each row in turn.
+Recognizing a later generation means adding one tag and one row; the existing
+rows, and every head that already activated one of them, do not change. Two
+guards keep the table honest:
+
+- The generation-2 digest is frozen. `generation_two_package_digest_is_frozen`
+  pins it (`bd64f2d18854e483a2201f4e55e2fced14b89e5e77d733cef1ee3c25eff6619e`),
+  because installed heads name it: an edit to the generation-2 composition
+  would otherwise move the digest silently and strand every writer.
+- `ostk-registry-generic-successor-activate` refuses, offline and before any
+  connection, a target package no row recognizes. A head naming such a package
+  would make every writer fail closed. The generic repository behind the CLI
+  still activates any structurally closed successor.
+
 **Deferred.** A generation-3 or later package. `memory_writer_authority_v1`
 does not expose `memory_registry_transitions.canonical_package`, so a later
 package needs either its own compiled-in bytes or an additive migration that

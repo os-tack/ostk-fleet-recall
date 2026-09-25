@@ -166,6 +166,14 @@ pub const CI_CONNECTOR: Generation2ConnectorIds = Generation2ConnectorIds {
 };
 
 /// Every connector chain, in the order they are appended.
+///
+/// **Frozen.** The generation-2 package digest is a pure function of these
+/// three chains, their order, and every id in them, and live heads already
+/// name that digest. Adding, removing, reordering, or renaming a connector here
+/// mints a different package that no installed head activates, so every
+/// writer would fail closed as `UnknownActivePackage`. A new connector belongs
+/// in a later generation's own composition, never here;
+/// `generation_two_package_digest_is_frozen` pins the result.
 pub const GENERATION_TWO_CONNECTORS: [Generation2ConnectorIds; 3] =
     [GIT_CONNECTOR, TRANSCRIPT_CONNECTOR, CI_CONNECTOR];
 
@@ -228,6 +236,11 @@ fn mint_entry<Body: serde::Serialize>(
 }
 
 /// The carried-forward references one generation-2 connector chain binds.
+///
+/// **Frozen.** Which generation-1 entries are carried forward, and how each is
+/// resolved, is part of the generation-2 package bytes. A later generation may
+/// reuse this resolution but must not change it;
+/// `generation_two_package_digest_is_frozen` pins the result.
 struct CarryForward {
     provider_instance_recipe: RegistryReferenceV1,
     provider_namespace: RegistryReferenceV1,
@@ -270,6 +283,12 @@ impl CarryForward {
 
 /// Mint the seven entries that close one connector's generation-2 identity
 /// chain.
+///
+/// **Frozen.** Every entry body, id, version, and vector digest this function
+/// mints is part of the generation-2 package bytes, so an edit here moves the
+/// generation-2 digest out from under every installed head. A later generation
+/// composes its own chains beside these rather than changing this function;
+/// `generation_two_package_digest_is_frozen` pins the result.
 // One linear composition of seven registry entries; the length is the entry
 // count, not branching.
 #[allow(clippy::too_many_lines)]

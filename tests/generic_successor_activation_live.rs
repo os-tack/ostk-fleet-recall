@@ -70,6 +70,9 @@ use ostk_fleet_recall::registry_activation::{
     GenesisActivationRepository, SuccessorActivationCandidate, SuccessorActivationOutcome,
     SuccessorActivationRepository,
 };
+use ostk_fleet_recall::registry_witness::{
+    WriterAuthorityError, WriterAuthorityRejection, materialize_active_package,
+};
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig, RetryPolicy};
 use ostk_fleet_recall::{FleetError, FleetScope};
 use ostk_recall_core::PrivacyTier;
@@ -1507,4 +1510,256 @@ async fn live_generic_successor_activation_when_configured() {
     ] {
         cleanup_scope(&pool, &registry.physical_scope).await;
     }
+}
+
+/// One canonical record plus its single framing LF, as the CLI reads it.
+fn framed<T: serde::Serialize>(value: &T) -> Vec<u8> {
+    let mut bytes = encode_canonical(value).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+/// A successor URL for the same cluster that passes the CLI's closed endpoint
+/// policy. Its credential is a placeholder: the refusal under test happens
+/// offline, before the CLI opens any connection, so it is never presented.
+fn successor_url(test_database_url: &str) -> String {
+    let parsed = url::Url::parse(test_database_url).unwrap();
+    format!(
+        "postgresql://fleet_successor:never-presented@{}:{}/fleet_recall?sslmode=verify-full",
+        parsed.host_str().unwrap(),
+        parsed.port().unwrap_or(26257)
+    )
+}
+
+/// Write the six ceremony artifacts of a `1 -> 2` apply to `directory`, and
+/// return the CLI arguments that name them.
+fn write_cli_artifacts(
+    directory: &std::path::Path,
+    registry: &ActivatedRegistry,
+    statement: &GenericSuccessorActivationStatementV2,
+) -> Vec<String> {
+    let approval_set = GenericSuccessorActivationApprovalSetV2 {
+        schema_version: 2,
+        statement_id: statement.statement_id().unwrap(),
+        approvals: quorum(statement),
+    };
+    let artifacts: [(&str, Vec<u8>); 6] = [
+        ("current-package", GENERATION_1_PACKAGE.to_vec()),
+        ("expected-head", framed(&registry.generation_1_head)),
+        ("target-package", GENERATION_2_PACKAGE.to_vec()),
+        ("target-test-result", GENERATION_2_TEST_RESULT.to_vec()),
+        ("activation-statement", framed(statement)),
+        ("activation-approval-set", framed(&approval_set)),
+    ];
+    let mut arguments = vec!["apply".to_owned()];
+    for (flag, bytes) in artifacts {
+        let path = directory.join(format!("{flag}.jsonl"));
+        std::fs::write(&path, bytes).unwrap();
+        arguments.push(format!("--{flag}"));
+        arguments.push(path.to_str().unwrap().to_owned());
+    }
+    arguments
+}
+
+async fn current_canonical_head(pool: &PgPool, scope: &FleetScope) -> Vec<u8> {
+    sqlx::query_scalar(
+        "SELECT canonical_head FROM memory_registry_current_heads_v2 \
+         WHERE tenant_id = $1 AND project = $2",
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Run the real `ostk-registry-generic-successor-activate` binary with exactly
+/// `environment` and nothing inherited.
+fn run_generic_successor_cli(
+    arguments: &[String],
+    environment: Vec<(String, String)>,
+) -> std::process::Output {
+    std::process::Command::new(env!(
+        "CARGO_BIN_EXE_ostk-registry-generic-successor-activate"
+    ))
+    .args(arguments)
+    .env_clear()
+    .envs(environment)
+    .output()
+    .unwrap()
+}
+
+/// The successor process namespace the CLI reads, bound to one activated
+/// scope. Nothing else is inherited: the CLI refuses ambient `PG*` variables.
+fn successor_cli_environment(
+    database_url: &str,
+    fixture: &ContractFixture,
+    registry: &ActivatedRegistry,
+) -> Vec<(String, String)> {
+    [
+        ("DATABASE_URL", successor_url(database_url)),
+        ("TENANT_ID", registry.physical_scope.tenant_id.to_string()),
+        ("PROJECT", registry.physical_scope.project.clone()),
+        (
+            "TENANT_NAMESPACE",
+            fixture.semantic_scope.tenant_namespace.as_str().to_owned(),
+        ),
+        (
+            "PROJECT_NAMESPACE",
+            fixture.semantic_scope.project_namespace.as_str().to_owned(),
+        ),
+        (
+            "BOOTSTRAP_RECEIPT_DIGEST",
+            registry.bootstrap_receipt_digest.to_string(),
+        ),
+        (
+            "GENESIS_TEST_RESULT_DIGEST",
+            GENESIS_TEST_RESULT_DIGEST.to_owned(),
+        ),
+        (
+            "GENESIS_TEST_RUNNER_ARTIFACT_DIGEST",
+            GENESIS_RUNNER_ARTIFACT.to_owned(),
+        ),
+        (
+            "GENESIS_TEST_RUNNER_CONFIGURATION_DIGEST",
+            GENESIS_RUNNER_CONFIGURATION.to_owned(),
+        ),
+        (
+            "TARGET_TEST_RESULT_DIGEST",
+            GENERATION_2_TEST_RESULT_DIGEST.to_owned(),
+        ),
+        (
+            "TARGET_TEST_RUNNER_ARTIFACT_DIGEST",
+            SUCCESSOR_RUNNER_ARTIFACT.to_owned(),
+        ),
+        (
+            "TARGET_TEST_RUNNER_CONFIGURATION_DIGEST",
+            SUCCESSOR_RUNNER_CONFIGURATION.to_owned(),
+        ),
+        // The bridge is only read by the 0 -> 1 ceremony; any digest parses.
+        ("GENESIS_KEY_BRIDGE_DIGEST", "b".repeat(64)),
+        (
+            "GENESIS_PROPOSER_PRINCIPAL_ID",
+            "principal.operator".to_owned(),
+        ),
+        ("GENESIS_PACKAGE_AUTHOR_PRINCIPAL_ID", AUTHOR.to_owned()),
+        ("PROPOSER_PRINCIPAL_ID", PROPOSER.to_owned()),
+        ("PACKAGE_AUTHOR_PRINCIPAL_ID", AUTHOR.to_owned()),
+    ]
+    .into_iter()
+    .map(|(name, value)| (format!("FLEET_RECALL_SUCCESSOR_{name}"), value))
+    .collect()
+}
+
+/// The CLI is narrower than the repository it drives: it refuses, before any
+/// connection, a structurally closed target package that no writer of this
+/// build could act under once it were the head. The frozen generic fixture's
+/// generation-2 package is exactly that: a complete, correctly signed
+/// ceremony the generic repository would accept (the chain test above
+/// accepts one), but not a compiled-in package. The scope it was aimed at is
+/// left exactly as it was.
+#[tokio::test]
+async fn live_generic_successor_cli_refuses_unrecognized_target_when_configured() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let fixture = fixture();
+    let store = CockroachStore::connect(
+        &database_url,
+        physical_scope("cli-migration"),
+        PoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    store.migrate().await.unwrap();
+    let pool = store.pool().clone();
+
+    // The premise: the target closes, and this build does not recognize it.
+    assert!(matches!(
+        materialize_active_package(fixture.generation_2.package_digest()),
+        Err(WriterAuthorityError::Rejected(
+            WriterAuthorityRejection::UnknownActivePackage
+        ))
+    ));
+
+    let registry = activate_through_generation_one(&pool, &fixture, "cli-unrecognized", 47).await;
+    let generation_2 = generation_2_ceremony(&fixture);
+    let installed_policy = fixture
+        .generation_1
+        .activation_policy()
+        .registry_reference()
+        .clone();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let statement = generic_statement(
+        &fixture,
+        &generation_2,
+        &installed_policy,
+        &registry.generation_1_head,
+        1,
+        canonical_time(server_time(&pool).await),
+        AUTHOR,
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let arguments = write_cli_artifacts(directory.path(), &registry, &statement);
+
+    let head_before = current_canonical_head(&pool, &registry.physical_scope).await;
+    let transitions_before = scoped_count(
+        &pool,
+        "memory_registry_transitions",
+        &registry.physical_scope,
+    )
+    .await;
+    let events_before =
+        scoped_count(&pool, "memory_control_events", &registry.physical_scope).await;
+    let output = run_generic_successor_cli(
+        &arguments,
+        successor_cli_environment(&database_url, &fixture, &registry),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "the CLI must refuse: {stderr}");
+    assert!(
+        stderr.contains("not a registry package this build recognizes"),
+        "the refusal must be the recognition gate, not an earlier one: {stderr}"
+    );
+    assert!(stderr.contains(&fixture.generation_2.package_digest().to_string()));
+    assert!(output.stdout.is_empty());
+
+    // Nothing was written: the scope still sits at generation 1, under the
+    // same head, and the target is still ready to be activated.
+    assert_eq!(
+        scoped_count(
+            &pool,
+            "memory_registry_transitions",
+            &registry.physical_scope
+        )
+        .await,
+        transitions_before
+    );
+    assert_eq!(
+        scoped_count(&pool, "memory_control_events", &registry.physical_scope).await,
+        events_before
+    );
+    assert_eq!(
+        current_canonical_head(&pool, &registry.physical_scope).await,
+        head_before
+    );
+    assert_eq!(
+        head_before,
+        encode_canonical(&registry.generation_1_head).unwrap()
+    );
+    let repository = generic_repository(
+        &pool,
+        &fixture,
+        &registry,
+        &generation_2,
+        &registry.generation_1_head,
+        AUTHOR,
+    );
+    assert!(matches!(
+        repository.inspect_generic_successor(2).await.unwrap(),
+        GenericSuccessorActivationInspection::Ready(_)
+    ));
+
+    cleanup_scope(&pool, &registry.physical_scope).await;
 }

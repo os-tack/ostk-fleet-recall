@@ -195,6 +195,10 @@ are unchanged, and no evidence hit enters them.
   their instances), a cut listing, and a query the model could not embed;
   `diagnostics.retrieval` is `{tier: "evidence", lanes, dense_lane,
   dense_min_cosine_similarity}`; `conflict_coverage` is `not_evaluated`.
+  A listed source's `kind` is its status row's stored `source_kind`. A kind
+  this build does not know is listed as stored rather than failing the read,
+  and it still counts toward the failed, stale, never-checked, and incomplete
+  reasons of the absence verdict.
 - **get** takes a hit's id and returns `data.evidence`: the body's full recall
   text (at most 256 KiB), its media type, visibility class, and first accepted
   event, or `null`.

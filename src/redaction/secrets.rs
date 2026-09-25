@@ -1,30 +1,18 @@
-//! Redaction and secret classification, applied BEFORE anything durable.
-//!
-//! This module is the security boundary of the transcript connector. Every turn
-//! passes through [`redact`] before it is canonicalized, so secret-shaped
-//! content can never reach an outbox row, an accepted event, the governed
-//! content store, or any downstream projection: the connector has no code path
-//! that stages a turn's raw text.
+//! The secret matchers and the replacement discipline every redaction in this
+//! crate runs (EVID-05, PRED-03).
 //!
 //! # Fail closed, twice
 //!
 //! 1. [`scan_secrets`] finds every match of the closed [`SecretClassV1`] set. If
 //!    any match is an UNREDACTABLE class ([`SecretClassV1::is_redactable`]), the
-//!    turn is withheld whole and no body is built for it at all. Otherwise
-//!    [`redact`] replaces those byte ranges with [`REDACTION_PLACEHOLDER`].
+//!    text is withheld whole and no redacted body is built for it at all.
+//!    Otherwise [`redact`] replaces those byte ranges with
+//!    [`REDACTION_PLACEHOLDER`].
 //! 2. The redacted text is then RE-SCANNED. A residual finding means the
-//!    redactor did not fully neutralize what it detected, and the turn is
+//!    redactor did not fully neutralize what it detected, and the text is
 //!    withheld entirely ([`RedactionDispositionV1::Withhold`]) rather than
-//!    staged with a partial redaction. There is no path that stages a turn the
+//!    staged with a partial redaction. There is no path that stages a text the
 //!    re-scan still flags.
-//!
-//! The disposition is not a connector-side choice: it is derived from the
-//! ACTIVATED redaction policy body through
-//! [`RedactionGuaranteeV1::from_active_package`], which refuses to run at all
-//! unless the active package's policy declares `redact_before_durable_outbox`
-//! and forbids secrets in recall. A package that does not make that promise
-//! produces no redaction guarantee, and with no guarantee the collector cannot
-//! build a batch (EVID-05, PRED-03).
 //!
 //! # Why hand-written matchers
 //!
@@ -34,13 +22,6 @@
 //! unit test.
 
 use serde::Serialize;
-
-use crate::evidence_ledger::ActiveStage4Package;
-use crate::memory_contracts::canonical::{decode_strict, encode_canonical};
-use crate::memory_contracts::common::ContractId;
-use crate::memory_contracts::registry::{RegistryEntryKind, RegistryEntryV1};
-
-use super::error::{TranscriptConnectorError, TranscriptConnectorResult};
 
 /// The exact text every redacted range is replaced with.
 ///
@@ -58,7 +39,7 @@ const MIN_PASSWORD_LEN: usize = 6;
 /// Length of the alphanumeric tail of an AWS access key ID.
 const AWS_KEY_TAIL_LEN: usize = 16;
 
-/// Closed set of secret shapes this connector refuses to persist.
+/// Closed set of secret shapes no redacting caller persists.
 ///
 /// Closed on purpose: an unclassifiable shape is not a new enum arm invented at
 /// runtime, it is simply not detected, and the residual re-scan is what keeps a
@@ -81,13 +62,13 @@ pub enum SecretClassV1 {
 }
 
 impl SecretClassV1 {
-    /// Whether a turn carrying this class can be salvaged by replacing the
+    /// Whether a text carrying this class can be salvaged by replacing the
     /// matched range, or must be withheld whole.
     ///
     /// [`Self::PrivateKeyBlock`] is the one unredactable class. A PEM block's
     /// extent is only as reliable as its footer, and a truncated or
     /// re-wrapped block has no dependable end marker — so a "redaction" of it
-    /// is a guess about where the key material stops. A turn that contains one
+    /// is a guess about where the key material stops. A text that contains one
     /// is key material rather than prose that mentions a key, and EVID-05's
     /// fail-closed disposition says the answer to an ambiguous secret is to
     /// withhold, not to publish a body that might still carry half a key.
@@ -121,15 +102,16 @@ pub struct SecretFindingV1 {
     pub byte_end: usize,
 }
 
-/// What the redactor decided about one turn.
+/// What the redactor decided about one text (a transcript turn, a recall
+/// text, a collected item part).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedactionDispositionV1 {
-    /// The turn is clean or was fully redacted; `text` is safe to stage.
+    /// The text is clean or was fully redacted; `text` is safe to stage.
     Stage {
         /// The redacted body. Equal to the input when nothing matched.
         text: String,
     },
-    /// The turn must not be staged at all: the post-redaction re-scan still
+    /// The text must not be staged at all: the post-redaction re-scan still
     /// found a secret shape, so no partially-redacted body is durable.
     Withhold {
         /// The residual class that forced the refusal.
@@ -137,10 +119,10 @@ pub enum RedactionDispositionV1 {
     },
 }
 
-/// The outcome of running the redactor over one turn.
+/// The outcome of running the redactor over one text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedactionOutcomeV1 {
-    /// What to do with the turn.
+    /// What to do with the text.
     pub disposition: RedactionDispositionV1,
     /// Classes detected in the ORIGINAL text, sorted and deduplicated. Metadata
     /// only: it never carries matched bytes.
@@ -150,95 +132,13 @@ pub struct RedactionOutcomeV1 {
 }
 
 impl RedactionOutcomeV1 {
-    /// The body to stage, or `None` when the turn is withheld.
+    /// The body to stage, or `None` when the text is withheld.
     #[must_use]
     pub fn staged_text(&self) -> Option<&str> {
         match &self.disposition {
             RedactionDispositionV1::Stage { text } => Some(text),
             RedactionDispositionV1::Withhold { .. } => None,
         }
-    }
-}
-
-/// Proof that the ACTIVE package's redaction policy promises redaction before
-/// the durable outbox and forbids secrets in recall.
-///
-/// The collector cannot build a batch without one, so "redact before outbox" is
-/// enforced by construction rather than by remembering to call the redactor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RedactionGuaranteeV1 {
-    policy_id: ContractId,
-    policy_version: u32,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ActivatedRedactionPolicyBodyV1 {
-    schema_version: u32,
-    policy_id: ContractId,
-    version: u32,
-    failure_outcome: ActivatedFailureOutcomeV1,
-    redact_before_durable_outbox: bool,
-    secrets_allowed_in_recall: bool,
-}
-
-/// Single-variant on purpose: a policy that says anything but `withhold` fails
-/// to deserialize, so "fail open" is not expressible in the wire form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ActivatedFailureOutcomeV1 {
-    Withhold,
-}
-
-impl RedactionGuaranteeV1 {
-    /// Read the activated redaction policy out of the active package and prove
-    /// it makes the guarantee this connector depends on (EVID-05).
-    pub fn from_active_package(active: &ActiveStage4Package) -> TranscriptConnectorResult<Self> {
-        let entries = active.registry_entries();
-        let mut matching = entries
-            .iter()
-            .filter(|entry| entry.kind == RegistryEntryKind::RedactionPolicy);
-        let entry: &RegistryEntryV1 = matching
-            .next()
-            .ok_or(TranscriptConnectorError::RedactionPolicyNotGuaranteed)?;
-        if matching.next().is_some() {
-            return Err(TranscriptConnectorError::RedactionPolicyNotGuaranteed);
-        }
-        let body: ActivatedRedactionPolicyBodyV1 = decode_strict(&encode_canonical(&entry.body)?)?;
-        if body.schema_version != 1
-            || body.policy_id != entry.entry_id
-            || body.version != entry.version
-            || body.failure_outcome != ActivatedFailureOutcomeV1::Withhold
-            || !body.redact_before_durable_outbox
-            || body.secrets_allowed_in_recall
-        {
-            return Err(TranscriptConnectorError::RedactionPolicyNotGuaranteed);
-        }
-        Ok(Self {
-            policy_id: body.policy_id,
-            policy_version: body.version,
-        })
-    }
-
-    /// The activated policy this guarantee was read from.
-    #[must_use]
-    pub const fn policy_id(&self) -> &ContractId {
-        &self.policy_id
-    }
-
-    /// The activated policy's version.
-    #[must_use]
-    pub const fn policy_version(&self) -> u32 {
-        self.policy_version
-    }
-
-    /// Redact one turn under this guarantee.
-    ///
-    /// Taking `&self` is the point: there is no free function the collector can
-    /// call without first having proven the active package makes the promise.
-    #[must_use]
-    pub fn apply(&self, text: &str) -> RedactionOutcomeV1 {
-        redact(text)
     }
 }
 
@@ -509,7 +409,7 @@ pub fn redact(text: &str) -> RedactionOutcomeV1 {
     classes.dedup();
     let redacted_ranges = u32::try_from(findings.len()).unwrap_or(u32::MAX);
 
-    // The first fence: an unredactable class withholds the whole turn before a
+    // The first fence: an unredactable class withholds the whole text before a
     // partially-redacted body is even built, so there is no intermediate value
     // a later stage could accidentally stage (EVID-05).
     if let Some(unredactable) = findings
@@ -558,7 +458,7 @@ pub fn redact(text: &str) -> RedactionOutcomeV1 {
     redacted.push_str(tail);
 
     // The second fence: if anything still matches after redaction, refuse the
-    // turn outright rather than stage a partial redaction (EVID-05, PRED-03).
+    // text outright rather than stage a partial redaction (EVID-05, PRED-03).
     if let Some(residual) = scan_secrets(&redacted).first() {
         return RedactionOutcomeV1 {
             disposition: RedactionDispositionV1::Withhold {
@@ -576,5 +476,5 @@ pub fn redact(text: &str) -> RedactionOutcomeV1 {
 }
 
 #[cfg(test)]
-#[path = "redactor_tests.rs"]
+#[path = "secrets_tests.rs"]
 mod tests;

@@ -124,10 +124,10 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::super::{
-        EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceSourceV1, EvidenceSourcesV1,
+        EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceSourceKindV1, EvidenceSourceV1,
+        EvidenceSourcesV1,
     };
     use super::*;
-    use crate::worker::WorkerSourceKindV1;
 
     fn instant(seconds: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_790_000_000 + seconds, 0).unwrap()
@@ -147,7 +147,7 @@ mod tests {
     fn healthy(instance: &str, checked: i64) -> EvidenceSourceV1 {
         EvidenceSourceV1 {
             connector_instance: instance.to_owned(),
-            kind: WorkerSourceKindV1::Git,
+            kind: EvidenceSourceKindV1::Git,
             state: "active".to_owned(),
             last_outcome: WorkerSourceOutcomeV1::Unchanged,
             last_checked_at: Some(instant(checked)),
@@ -320,6 +320,52 @@ mod tests {
                 [AbsenceReasonV1::IncompleteCoverage]
             );
         }
+    }
+
+    #[test]
+    fn a_source_of_a_kind_this_build_does_not_know_still_gates_absence() {
+        let other = || EvidenceSourceKindV1::Other("collected.slack".to_owned());
+        let mut sources = two_healthy();
+        sources.active[1].kind = other();
+        // Healthy, it is one more fresh, complete source.
+        assert!(reasons(true, &current(), &sources).is_empty());
+
+        let mut failed = sources.clone();
+        failed.active[1].last_outcome = WorkerSourceOutcomeV1::Failed;
+        assert_eq!(
+            reasons(true, &current(), &failed),
+            [AbsenceReasonV1::SourceFailed]
+        );
+
+        let mut stale = sources.clone();
+        stale.active[1].stale = true;
+        assert_eq!(
+            reasons(true, &current(), &stale),
+            [AbsenceReasonV1::SourceStale]
+        );
+
+        let mut never = sources.clone();
+        never.active[1].last_checked_at = None;
+        assert_eq!(
+            reasons(true, &current(), &never),
+            [AbsenceReasonV1::SourceNeverChecked]
+        );
+
+        let mut incomplete = sources;
+        incomplete.active[1].coverage.as_mut().unwrap().completeness =
+            CoverageCompletenessV1::Partial;
+        let absence = absence_verdict(0, true, &current(), &incomplete);
+        assert_eq!(absence.verdict, AbsenceVerdictV1::Unknown);
+        assert_eq!(absence.reasons, [AbsenceReasonV1::IncompleteCoverage]);
+
+        // And alone in the listing it is still a registered source.
+        let mut alone = listing(vec![healthy("collected.slack.acme", 50)]);
+        alone.active[0].kind = other();
+        alone.active[0].stale = true;
+        assert_eq!(
+            reasons(true, &current(), &alone),
+            [AbsenceReasonV1::SourceStale]
+        );
     }
 
     #[test]

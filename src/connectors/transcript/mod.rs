@@ -9,7 +9,7 @@
 //! ```text
 //! transcript JSONL
 //!   -> parser        bespoke line parser; the parser key is part of identity
-//!   -> redactor      REDACT + classify, BEFORE anything durable exists
+//!   -> redaction     REDACT + classify, BEFORE anything durable exists
 //!   -> canonicalizer candidate + locators, derived from the ACTIVE package
 //!   -> outbox        rows + per-source cursor, advanced in ONE transaction
 //!   -> drain         admit_evidence -> AcceptedEventRepository::append
@@ -26,7 +26,7 @@
 //!
 //! 1. [`collector::collect_batch`] is the ONLY way to build a
 //!    [`outbox::TranscriptBatchV1`], and it requires a
-//!    [`redactor::RedactionGuaranteeV1`], which exists only if the ACTIVE
+//!    [`crate::redaction::RedactionGuaranteeV1`], which exists only if the ACTIVE
 //!    package's redaction policy declares `redact_before_durable_outbox` and
 //!    forbids secrets in recall (EVID-05).
 //! 2. [`canonicalizer::canonicalize_turn`] takes the redacted text as a separate
@@ -65,7 +65,6 @@ mod drain;
 mod error;
 mod outbox;
 mod parser;
-mod redactor;
 #[cfg(test)]
 mod test_fixture;
 
@@ -92,7 +91,10 @@ pub use parser::{
     TRANSCRIPT_PARSER_VERSION, TranscriptRoleV1, parse_transcript, transcript_parser_key_v1,
     transcript_parser_key_v2, transcript_parser_key_v3,
 };
-pub use redactor::{
+// The redactor is the crate's one secret boundary (`crate::redaction`); it is
+// re-exported here because the transcript connector is where it was first
+// needed and callers still name it through this module.
+pub use crate::redaction::{
     REDACTION_PLACEHOLDER, RedactionDispositionV1, RedactionGuaranteeV1, RedactionOutcomeV1,
     SecretClassV1, SecretFindingV1, redact, scan_secrets,
 };

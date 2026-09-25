@@ -18,14 +18,15 @@ use crate::error::{FleetError, Result};
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::projectors::{CockroachRecallReader, RowVisibilityClassV1};
 use crate::store::cockroach::{DatabaseCapabilities, RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY};
-use crate::worker::{WorkerSourceKindV1, WorkerSourceOutcomeV1};
+use crate::worker::WorkerSourceOutcomeV1;
 
 use super::verdict::{ScoredHitV1, absence_verdict, apply_dense_floor};
 use super::{
     EVIDENCE_RECALL_SCHEMA_VERSION, EVIDENCE_SNIPPET_CHARS, EvidenceBodyV1, EvidenceCoverageV1,
     EvidenceDenseLaneV1, EvidenceHitV1, EvidenceReadinessV1, EvidenceRecall, EvidenceSearchV1,
-    EvidenceSourceV1, EvidenceSourcesV1, EvidenceStatusV1, MAX_EVIDENCE_SEARCH_LIMIT,
-    MAX_EVIDENCE_SOURCE_ERROR_BYTES, MAX_EVIDENCE_SOURCES, lexical_query_text,
+    EvidenceSourceKindV1, EvidenceSourceV1, EvidenceSourcesV1, EvidenceStatusV1,
+    MAX_EVIDENCE_SEARCH_LIMIT, MAX_EVIDENCE_SOURCE_ERROR_BYTES, MAX_EVIDENCE_SOURCES,
+    lexical_query_text,
 };
 
 const INSUFFICIENT_PRIVILEGE_SQLSTATE: &str = "42501";
@@ -493,16 +494,7 @@ fn decode_source_row(row: &PgRow) -> Result<EvidenceSourceV1> {
     let last_error: Option<String> = row.try_get("last_error")?;
     Ok(EvidenceSourceV1 {
         connector_instance: row.try_get("connector_instance_id")?,
-        kind: match kind.as_str() {
-            "git" => WorkerSourceKindV1::Git,
-            "transcript" => WorkerSourceKindV1::Transcript,
-            "ci" => WorkerSourceKindV1::Ci,
-            other => {
-                return Err(FleetError::Memory(format!(
-                    "stored worker source kind {other:?} is not a known kind"
-                )));
-            }
-        },
+        kind: EvidenceSourceKindV1::from_stored(&kind),
         state: row.try_get("state")?,
         last_outcome: match outcome.as_str() {
             "ok" => WorkerSourceOutcomeV1::Ok,

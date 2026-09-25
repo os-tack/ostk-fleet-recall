@@ -25,6 +25,7 @@ pub mod normative_runtime;
 pub mod observer_runtime;
 pub mod private_postgres;
 pub mod projectors;
+pub mod redaction;
 pub mod registry_activation;
 pub mod registry_witness;
 pub mod relation_projection;

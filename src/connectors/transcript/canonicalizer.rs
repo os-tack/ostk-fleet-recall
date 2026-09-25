@@ -321,7 +321,7 @@ fn derive_identities(
 /// package's connector schema.
 ///
 /// `redacted_text` must already have passed
-/// [`super::redactor::RedactionGuaranteeV1::apply`]; this function has no access
+/// [`crate::redaction::RedactionGuaranteeV1::apply`]; this function has no access
 /// to a turn's raw text, which is why nothing unredacted can reach the outbox
 /// through it.
 pub fn canonicalize_turn(

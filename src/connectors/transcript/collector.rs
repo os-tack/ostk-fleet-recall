@@ -29,7 +29,7 @@ use super::outbox::{
     TranscriptBatchV1, TranscriptCursorRowV1, TranscriptOutboxRowV1, TranscriptOutboxStateV1,
 };
 use super::parser::parse_transcript;
-use super::redactor::{RedactionGuaranteeV1, SecretClassV1};
+use crate::redaction::{RedactionGuaranteeV1, SecretClassV1};
 
 /// The ingress clocks one batch is stamped with.
 ///

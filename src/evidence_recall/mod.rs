@@ -194,11 +194,72 @@ pub struct EvidenceCoverageV1 {
     pub as_of: DateTime<Utc>,
 }
 
+/// Which connector a listed source belongs to. The wire value is the status
+/// row's stored `source_kind`, exactly as stored.
+///
+/// Decoded tolerantly: a kind this build does not know (one a later collector
+/// writes, or one a newer binary's migration admits) decodes to
+/// [`Self::Other`] rather than failing the read. Refusing it would fail every
+/// evidence search in the scope over one label, and an unknown kind is not a
+/// reason to trust its source any more or less: it still counts toward the
+/// failed, stale, never-checked, and incomplete reasons of the absence
+/// verdict exactly like a known one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvidenceSourceKindV1 {
+    Git,
+    Transcript,
+    Ci,
+    /// A kind this build does not know, carrying the stored string.
+    Other(String),
+}
+
+impl EvidenceSourceKindV1 {
+    /// Decode a stored `source_kind`; an unknown value is [`Self::Other`].
+    #[must_use]
+    pub fn from_stored(stored: &str) -> Self {
+        [
+            WorkerSourceKindV1::Git,
+            WorkerSourceKindV1::Transcript,
+            WorkerSourceKindV1::Ci,
+        ]
+        .into_iter()
+        .find(|kind| kind.as_str() == stored)
+        .map_or_else(|| Self::Other(stored.to_owned()), Self::from)
+    }
+
+    /// The stored `source_kind` this kind was decoded from.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Git => WorkerSourceKindV1::Git.as_str(),
+            Self::Transcript => WorkerSourceKindV1::Transcript.as_str(),
+            Self::Ci => WorkerSourceKindV1::Ci.as_str(),
+            Self::Other(stored) => stored,
+        }
+    }
+}
+
+impl From<WorkerSourceKindV1> for EvidenceSourceKindV1 {
+    fn from(kind: WorkerSourceKindV1) -> Self {
+        match kind {
+            WorkerSourceKindV1::Git => Self::Git,
+            WorkerSourceKindV1::Transcript => Self::Transcript,
+            WorkerSourceKindV1::Ci => Self::Ci,
+        }
+    }
+}
+
+impl Serialize for EvidenceSourceKindV1 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// One active source, as the worker last reported it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EvidenceSourceV1 {
     pub connector_instance: String,
-    pub kind: WorkerSourceKindV1,
+    pub kind: EvidenceSourceKindV1,
     /// The status row's state; only `active` sources are listed.
     pub state: String,
     pub last_outcome: WorkerSourceOutcomeV1,
@@ -408,6 +469,32 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_stored_source_kind_decodes_tolerantly_and_serializes_as_stored() {
+        for (stored, kind) in [
+            ("git", EvidenceSourceKindV1::Git),
+            ("transcript", EvidenceSourceKindV1::Transcript),
+            ("ci", EvidenceSourceKindV1::Ci),
+            (
+                "collected.slack",
+                EvidenceSourceKindV1::Other("collected.slack".to_owned()),
+            ),
+        ] {
+            let decoded = EvidenceSourceKindV1::from_stored(stored);
+            assert_eq!(decoded, kind);
+            assert_eq!(decoded.as_str(), stored);
+            assert_eq!(
+                serde_json::to_value(&decoded).unwrap(),
+                serde_json::json!(stored)
+            );
+        }
+        // A known kind is only ever its own variant, never `Other`.
+        assert_eq!(
+            EvidenceSourceKindV1::from_stored(WorkerSourceKindV1::Ci.as_str()),
+            EvidenceSourceKindV1::from(WorkerSourceKindV1::Ci)
+        );
     }
 
     #[test]

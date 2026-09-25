@@ -9,7 +9,7 @@ use crate::FleetError;
 use crate::evidence_ledger::{EvidenceAdmissionError, EvidenceAppendError};
 use crate::memory_contracts::ContractError;
 
-use super::redactor::SecretClassV1;
+use crate::redaction::{RedactionPolicyError, SecretClassV1};
 
 /// Closed rejection taxonomy of the transcript connector.
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +109,18 @@ pub enum TranscriptConnectorError {
     /// Underlying storage, pool, or transaction failure.
     #[error("transcript connector storage failure: {0}")]
     Storage(#[from] FleetError),
+}
+
+impl From<RedactionPolicyError> for TranscriptConnectorError {
+    /// The transcript connector's own spelling of a missing redaction
+    /// guarantee, so its refusals read exactly as before the redactor moved to
+    /// `crate::redaction`.
+    fn from(error: RedactionPolicyError) -> Self {
+        match error {
+            RedactionPolicyError::NotGuaranteed => Self::RedactionPolicyNotGuaranteed,
+            RedactionPolicyError::Contract(error) => Self::Contract(error),
+        }
+    }
 }
 
 impl From<sqlx::Error> for TranscriptConnectorError {
