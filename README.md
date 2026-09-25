@@ -47,13 +47,23 @@ The `ostk-fleet-recall` binary has these commands:
     Every answer also carries each live spec's latest check (`nonconforming`,
     `conforming`, or `unknown` with reasons) and whether it is in force,
     scheduled, or expired at the database's time, because episodes record
-    verified nonconformance only: an empty list is not proof of conformance. It is served wherever
-    migration 31 is applied and the writer login may read the discrepancy,
-    normative, and spec tables; elsewhere `tools/list` is unchanged.
+    verified nonconformance only: an empty list is not proof of conformance.
+    It is served wherever migration 31 is applied and the writer login may
+    read the discrepancy, normative, and spec tables; elsewhere `tools/list`
+    is unchanged.
     `recall(status)` then adds a `spec_conformance` block
     ([ADR 0007](docs/adr/0007-spec-conformance-chain.md)).
   - `remember(record)` records a deliberate typed claim with provenance,
     idempotent mutation receipts, and conflict detection.
+  - `remember(assert)` records a typed claim event-first: one serializable
+    transaction appends an accepted `memory.claim.accepted` event under the
+    verified writer authority and writes the same claim projection, conflict
+    detection, and receipt `record` writes. Today it admits one predicate. It
+    is served and advertised only where the writer-authority pins verify at
+    startup; elsewhere `tools/list` is unchanged and an assert is refused as
+    `assert_unavailable`. `recall(status)` then adds a `remember_assert`
+    block. See [asserting a claim](#asserting-a-claim) and
+    [ADR 0005](docs/adr/0005-event-first-assert-and-writer-authority.md).
   - `remember(retract)` retires a claim the calling agent authored. When no
     incompatible lifecycle-current pair remains on the claim's key, the
     detector closes that key's conflict and returns its disputed members to
@@ -87,14 +97,24 @@ The `ostk-fleet-recall` binary has these commands:
   recall tiers.
 - `model-digest` prints the versioned digest of a local model bundle.
 
+Two [private operator CLIs](#private-operator-clis) complete the event-first
+plane: `ostk-authority-install` gives a physical `(tenant, project)` the
+writer authority that assert, the worker, and the spec chain run under, and
+`ostk-spec` makes a spec statement normative, checks commits against it, and
+closes the discrepancy episodes a check opens. The
+[runbook](#runbook-the-event-first-plane) puts the commands in order.
+
 Recall is hybrid: CockroachDB `VECTOR(512)` C-SPANN search and a stored
 `TSVECTOR` inverted index, fused with reciprocal-rank fusion, over embeddings
 from a pinned local model2vec model. Every claim mutation commits its claim,
 support, conflict, receipt, corpus projection, and audit events in one
-serializable transaction.
+serializable transaction; an assert also appends its accepted event in that
+transaction.
 
 Conflict detection uses the `same_key_functional_value_v2` detector. A claim
-key (`subject::predicate`) is functional over overlapping effective intervals:
+key (`subject::predicate` for a recorded claim, and
+`claim-v2:<coordinate>:<modality>` for an asserted one) is functional over
+overlapping effective intervals:
 two affirmations conflict when their typed values differ, an affirmation and a
 negation conflict only when they name the same value, and two negations are
 compatible. Conflicting claims become `disputed`, and recall surfaces the open
@@ -115,17 +135,19 @@ claim value, author, or applicability, but every close returns the conflict's
 disputed members, whoever wrote them, to `active` at a new revision (unless
 another open conflict still holds them). Acknowledgements, waivers,
 dismissals, and detector-verified closes are appended to a per-conflict
-lifecycle log (migration 0029). The writer serves `acknowledge`, `resolve`, adjudication, the
-overlay, and history only when its startup probe finds that log and the
-runtime grants on it; otherwise it serves `retract` and `supersede` alone and
-closes are audited in `memory_events` only.
-On the private writer, chunk search also drops the synthetic `claim:{id}` hits of
-claims that are no longer current, lists them in
+lifecycle log (migration 0029). The writer serves `acknowledge`, `resolve`,
+adjudication, the overlay, and history only when its startup probe finds that
+log and the runtime grants on it; otherwise it serves `retract` and
+`supersede` alone and closes are audited in `memory_events` only.
+On the private writer, chunk search also drops the synthetic `claim:{id}`
+hits of claims that are no longer current, lists them in
 `diagnostics.retrieval.lifecycle_hidden_claim_ids`, and refills the page from
 lower-ranked results. Setting `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` (the
-default is `enabled`) restores the record-only surface: the historical
-`tools/list` byte for byte and unfiltered chunk search. The public demo always serves that record-only
-surface.
+default is `enabled`) restores the record-only lifecycle surface and
+unfiltered chunk search. `assert`, evidence recall, and discrepancies do not
+depend on that switch, so on a writer that serves none of them `tools/list`
+is then the historical one byte for byte. The public demo always serves the
+record-only surface.
 
 The service contract also reserves further Recall actions (for example
 `remember` forget/relate and `recall` surface/discover) and an attention
@@ -136,8 +158,11 @@ schema. These return an error or are unused today; see the
 
 `src/bin` holds private workstation tools. None is copied into the production
 image or wired into Terraform, ECS, the public HTTP service, or normal
-MCP/runtime startup, and each reads a dedicated private database URL instead
-of the serving one.
+MCP/runtime startup. Each of the first seven below reads a dedicated private
+database URL instead of the serving one. The last two,
+`ostk-authority-install` and `ostk-spec`, read `FLEET_RECALL_DATABASE_URL`
+like the `ostk-fleet-recall` commands: the installer as the migrator, like
+`migrate`, and `ostk-spec` as the writer login, like `serve`.
 
 - `ostk-control-bootstrap` accepts the out-of-band-pinned genesis bootstrap
   receipt into the append-only control ledger (Stage 2); see
@@ -154,41 +179,44 @@ of the serving one.
 - `ostk-observer-run` runs the exhaustive observer over one enum at one exact
   commit and emits a run receipt and typed observer result.
 - `ostk-authority-install` takes one physical scope to an active generation-2
-  registry head and prints the writer-authority pins. Unlike the tools above,
-  it reads `FLEET_RECALL_DATABASE_URL` as the schema owner/migrator login,
-  the same convention as `migrate`. Its fixture-key signatures are nominal; see
+  registry head and prints the writer-authority pins. It runs as the schema
+  owner/migrator, like `migrate`, and its fixture-key signatures are nominal;
+  see the
   [writer-authority installer](docs/CONTROL_BOOTSTRAP.md#writer-authority-installer).
-- `ostk-spec` makes a spec statement normative (Stage 6): `draft` binds exact
-  byte spans of a spec document at one commit to a typed expectation (an enum
-  in a Rust source file must or must not declare a member) under the active
-  registry head; `approve` signs the draft offline with one approver's
-  Ed25519 seed; `activate` verifies the approvals under the active activation
-  policy, with `accepted_at` taken from the database clock, and
-  compare-and-sets the statement into its binding family; `check` judges one
-  commit against the statement in force: it reads the source file the
-  statement names through a memory-worker git source, runs the
-  genesis-admitted observer, records one check (`conforming`,
-  `nonconforming`, or `unknown` with reasons), and opens a
-  `spec_nonconformance` discrepancy episode only for a verified
-  nonconformance. No check closes an episode (a fixing commit checks as
-  `unknown`), so `episode resolve` lets an operator resolve one, citing
-  accepted events or by default the latest check of the violated statement
-  when that check can stand for a fix (an exhaustive check, not
-  nonconforming, of a commit never judged nonconforming, recorded after the
-  check that opened the episode), and `episode dismiss` dismisses one with a
-  reason and a rationale; either appends a lifecycle event to the episode's
-  history once (a retried closure reports the recorded one, and a closed
-  episode is not closed again), after which `recall(discrepancies)` lists it
-  only with `include_resolved`.
-  `draft`, `activate`, `check`, and `episode` run as `fleet_writer`
-  (`FLEET_RECALL_DATABASE_URL`) with the writer-authority pins
+- `ostk-spec` runs the spec conformance chain (Stage 6):
+  - `draft` binds exact byte spans of a spec document at one commit to a
+    typed expectation (an enum in a Rust source file must or must not declare
+    a member) under the active registry head;
+  - `approve` signs the draft offline with one approver's Ed25519 seed;
+  - `activate` verifies the approvals under the active activation policy,
+    with `accepted_at` taken from the database clock, and compare-and-sets
+    the statement into its binding family;
+  - `check` judges one commit against the statement in force: it reads the
+    source file the statement names through a memory-worker git source, runs
+    the genesis-admitted observer, records one check (`conforming`,
+    `nonconforming`, or `unknown` with reasons), and opens a
+    `spec_nonconformance` discrepancy episode only for a verified
+    nonconformance;
+  - `episode resolve` and `episode dismiss` close an episode, which no check
+    does (a fixing commit checks as `unknown`). `resolve` cites accepted
+    events, or by default the latest check of the violated statement when
+    that check can stand for a fix (an exhaustive check, not nonconforming,
+    of a commit never judged nonconforming, recorded after the check that
+    opened the episode). `dismiss` takes a reason and a rationale. Either
+    appends a lifecycle event to the episode's history once (a retried
+    closure reports the recorded one, and a closed episode is not closed
+    again), after which `recall(discrepancies)` lists the episode only with
+    `include_resolved`.
+
+  Every subcommand except `approve`, which reads no environment, runs as
+  `fleet_writer` (`FLEET_RECALL_DATABASE_URL`) with the writer-authority pins
   `ostk-authority-install apply` prints, and `check` also needs
-  `FLEET_RECALL_CONTENT_KEK_HEX`; `approve` reads no environment. Its
-  approvals are nominal: the active policy names the public fixture keys
-  (seeds `0x01`/`0x02`), so anyone can produce both approvals, and the real
-  gate is the `fleet_writer` credential `activate` needs. The observer
-  `check` runs is attested only nominally too: its admitted executable
-  digest is copied from the admission, never measured from the binary. See
+  `FLEET_RECALL_CONTENT_KEK_HEX`. Its approvals are nominal: the active
+  policy names the public fixture keys (seeds `0x01`/`0x02`), so anyone can
+  produce both approvals, and the real gate is the `fleet_writer` credential
+  `activate` needs. The observer `check` runs is attested only nominally too:
+  its admitted executable digest is copied from the admission, never measured
+  from the binary. See
   [ADR 0007 D10](docs/adr/0007-spec-conformance-chain.md).
 
 The grants and gates these tools rely on are described in
@@ -223,7 +251,8 @@ The command reads:
   `fleet_writer`, `FLEET_RECALL_TENANT_ID`, `FLEET_RECALL_PROJECT`,
   `FLEET_RECALL_AGENT`, and the model bundle variables;
 - for `ingest` and `project`: the writer-authority pins that
-  `ostk-authority-install apply` prints, and `FLEET_RECALL_CONTENT_KEK_HEX`;
+  `ostk-authority-install apply` prints, and `FLEET_RECALL_CONTENT_KEK_HEX`,
+  the same key on every run and host of the scope;
 - for `embed`: the pinned model bundle. Every dense row records
   `FLEET_RECALL_EMBEDDING_MODEL_SHA256`.
 
@@ -236,7 +265,12 @@ credential). The production image has neither, so run the ingest steps on a
 host that has both tools, the repositories, and the transcript files.
 `--steps project,embed` needs neither and is safe to run in the container.
 [`examples/worker-sources.json`](examples/worker-sources.json) shows a sources
-file with one source of each kind.
+file with one source of each kind. `ostk-spec check` reads the same file: the
+git source it reads through must also carry `provider_repository_id` (the
+provider's numeric repository id, from which a spec statement's subject is
+derived), and the file must name an `observer` identity
+(`connector_principal` and `connector_instance`) to append observer runs
+under. The worker reads neither; quickstart step 8 shows both.
 
 Each transcript file is read in windows of its group's `window_bytes` (4 MiB
 by default, at most 8 MiB) behind a durable cursor. A line longer than the
@@ -278,64 +312,184 @@ at a time. For example, with the environment above in the crontab:
 */15 * * * * ostk-fleet-recall worker --once --sources /etc/fleet-recall/worker-sources.json >>/var/log/fleet-recall/worker.jsonl
 ```
 
-## Built but not yet wired
+## Asserting a claim
 
-A larger dynamic-memory plane, specified in
-[Dynamic corpus and causal runtime architecture](docs/DYNAMIC_MEMORY_ARCHITECTURE.md),
-exists as library code with live CockroachDB tests, but no serving binary runs
-it:
+`remember(assert)` is the event-first counterpart of `record`
+([ADR 0005](docs/adr/0005-event-first-assert-and-writer-authority.md)). An
+agent sends one `assertion` object. It never sends a URI, a registry
+reference, an actor, or a scope: it names the claim's subject and each
+applicability dimension by their locator components, and the server
+rederives every identity under the active registry package, admits the
+statement, and appends it.
 
-- the Stage-4 evidence ledger (`src/evidence_ledger`): accepted-event append,
-  ingress quarantine, the envelope-encrypted governed content store (whose
-  protection ends at projection: the worker's `project` step writes bodies in
-  plaintext, see [memory worker](#memory-worker)), and the writer-authority
-  witness;
-- relation projection (`src/relation_projection`);
-- connectors for git history, agent transcripts, and CI runs
-  (`src/connectors`);
-- the content-addressed body store and projector (`src/body_store`) and the
-  lexical-first/dense-later recall projectors with per-row visibility
-  (`src/projectors`), including `ChunkEmbedderProvider`, the production
-  embedding provider that puts the pinned model2vec embedder behind the dense
-  projection's `EmbeddingProvider` seam;
-- the coverage runtime (`src/coverage_runtime`);
-- the memory worker (`src/worker`), which the `worker --once` subcommand runs
-  (see [memory worker](#memory-worker)). `serve` reads its projections
-  through evidence recall;
-- the evidence recall read library (`src/evidence_recall`) over those
-  projections: a search returns hits with a snippet of recall text, readiness
-  (evidence waiting for projection, transcript turns waiting in the outbox,
-  lexical and dense currency), every active source's status and newest
-  coverage cursor, and an absence verdict that is `absent` only when nothing
-  matched over a current lexical tier with every source healthy, fresh, and
-  completely covered, and `unknown`, with reasons, otherwise.
-  `probe_evidence_recall` gates it on migration 30 and SELECT on every table
-  it reads. `serve` answers `recall(kind=evidence)` through it wherever the
-  probe passes ([ADR 0006](docs/adr/0006-stage5-worker-and-evidence-recall.md));
-- the normative activation, observer, and discrepancy runtimes
-  (`src/normative_runtime`, `src/observer_runtime`,
-  `src/discrepancy_runtime`); only the observer has a runner, the private
-  `ostk-observer-run`;
-- `remember(action="assert")`, which the service routes but rejects because
-  serving does not load a writer-authority configuration yet;
-- the bootstrap-manifest import (`ostk-bootstrap-manifest-import`), which
-  admits legacy chunks, claims, conflicts, and receipts as one signed event
-  and records each imported row in `memory_bootstrap_import_rows`
-  (migration 0028);
+The scope is deliberately narrow. The active package admits exactly one
+predicate, `mcp.remember.allowed_actions` (version 3): a boolean about one
+GitHub repository (`subject.provider_repository_id`) at one commit
+(`applicability.repository_commit.commit_oid`, 40 lowercase hex characters)
+in one runtime environment
+(`applicability.runtime_environment.environment_id`). Its modality is
+`attested` (what the agent reports holds) or `intended` (what it plans), and
+its `kind` is `decision`, `fact`, `constraint`, `preference`, or `procedure`.
+`polarity` defaults to `affirms`, and `effective_from` defaults to the
+server's clock and may not be in the future. `recall(status)` reports this
+route under `remember_assert.route`, so an agent can read it rather than
+assume it. Other predicates, resource-valued claims, and other admission
+bases need a new compiled package and are deferred.
+
+This call is the one the MCP live test makes
+(`tests/remember_assert_live.rs`):
+
+```json
+{"action":"assert","idempotency_key":"readme/assert/v1","assertion":{"kind":"decision","text":"remember(assert) allowed is true at this commit in production.","modality":"attested","value":{"kind":"boolean","value":true},"subject":{"provider_repository_id":"908172635"},"applicability":{"repository_commit":{"commit_oid":"3d99ec111a583e80533cbbc0c06798bb628e0979"},"runtime_environment":{"environment_id":"production"}}}}
+```
+
+The response's `data.claim` is the claim projection, shaped as `record`
+returns it, and `data.accepted_event` names the appended event (`event_id`,
+`epoch_id`, `shard`, and `committed_offset`). `recall(get, kind=claim)` adds
+`accepted_event_id` for an asserted claim. The claim key is
+`claim-v2:<coordinate>:<modality>`. The coordinate binds the subject,
+predicate, and applicability but not the value, so two agents asserting about
+the same repository, commit, and environment share a key and the unchanged
+detector compares them: different values open a conflict, and an `intended`
+claim never conflicts with an `attested` one. The ADR 0004 lifecycle acts on
+an asserted claim's projection exactly as on a recorded claim and leaves the
+accepted event as it is. `supersede` cannot replace an asserted claim,
+because no `record` successor can carry its `claim-v2:` key.
+
+Replays follow `record`'s rules: the same key and request return the stored
+result, and a changed request under a used key is an idempotency conflict.
+Every refusal writes nothing, leaves the key unused, and is `invalid_params`
+with `data.outcome` `not_applied` and one `data.code`:
+`assert_unavailable` (this writer does not serve assert),
+`writer_authority_unavailable`, `assertion_not_admitted` (with
+`details.reason`, such as `text_invalid` or `locator_invalid`),
+`support_event_unknown`, `registry_head_changed`, or `already_asserted` (the
+identical statement, possible only with a pinned `effective_from`, is already
+accepted under another key). ADR 0005 D10 says when each applies.
+
+`serve` serves assert only when its writer-authority pins verify at startup
+(see the [runbook](#runbook-the-event-first-plane)), whatever
+`FLEET_RECALL_REMEMBER_LIFECYCLE` says. The actor is
+`agent.<FLEET_RECALL_AGENT>`, so the agent name must be a contract id:
+lowercase letters, digits, `_`, `-`, and `.`. Without pins, nothing changes.
+With pins that do not verify, `serve` logs the reason, starts with assert off,
+and `recall(status).remember_assert` reports `served: false` and the reason.
+Each assert re-verifies the head, and its append re-reads it in the same
+transaction.
+
+The public demo withholds every asserted claim, its synthetic chunk, and its
+conflicts, because the predicate's publication default is denied. That is a
+property of the reviewed binary: the publication credential can still select
+those rows (see [security policy](docs/SECURITY.md)).
+
+## Runbook: the event-first plane
+
+Assert, the memory worker, and the spec chain all append to the accepted-event
+ledger under one writer authority per physical `(tenant, project)`. Run them
+in this order; [local quickstart](#local-quickstart) steps 3 and 7 to 9 walk
+through them against a local node.
+
+1. **Migrate.** `ostk-fleet-recall migrate` as the migrator, through
+   migration 31.
+2. **Install the writer authority, once per physical scope.** Before you
+   retire the migrator credential, run `ostk-authority-install apply` as the
+   migrator with `FLEET_RECALL_TENANT_ID`, `FLEET_RECALL_PROJECT`,
+   `FLEET_RECALL_CONTRACT_TENANT_NAMESPACE`, and
+   `FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE`. It takes the scope to an active
+   generation-2 registry head and prints one JSON report. Keep its `pins`.
+   Its signatures use public fixture keys and prove nothing; what protects
+   the scope is who holds the migrator credential and the pins each writer
+   loads. See the
+   [writer-authority installer](docs/CONTROL_BOOTSTRAP.md#writer-authority-installer).
+3. **Apply the runtime policy.**
+   [`deploy/cockroach/runtime-role-grants.sql`](deploy/cockroach/runtime-role-grants.sql)
+   gives `fleet_runtime`, the role of the `fleet_writer` login, everything
+   assert, the worker, evidence recall, and the spec chain use; see
+   [migration operations](docs/MIGRATIONS.md#privilege-separation). The
+   publication reader gains nothing.
+4. **Export the pins to every event-first writer.** Set
+   `FLEET_RECALL_CONTRACT_TENANT_NAMESPACE`,
+   `FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE`, and
+   `FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST` from the report (and optionally
+   `FLEET_RECALL_EXPECTED_ACTIVATION_ID` from its `activation_id`) for
+   `serve`, the worker, and `ostk-spec`. The worker's `ingest` and `project`
+   steps and `ostk-spec check` also need `FLEET_RECALL_CONTENT_KEK_HEX`, a
+   64-hex-character key. Generate it once per scope and keep it: `project`
+   unwraps every object with the key `ingest` wrapped it under.
+5. **Restart `serve`.** It probes once at startup. It serves assert when the
+   pins verify, `recall(kind=evidence)` when migration 30 is applied and the
+   login may read the Stage-5 tables, and `recall(discrepancies)` when
+   migration 31 is applied and the login may read the discrepancy, normative,
+   and spec tables. Anything it does not serve stays out of `tools/list`.
+6. **Schedule the worker.** Run the [memory worker](#memory-worker) with one
+   sources file per scope. The `ingest` steps run on a host with `git`, `gh`,
+   the repositories, and the transcript files, which also holds the content
+   key and the writer login. `--steps project,embed` can run in the
+   container. Schedule it with cron or a scheduled task, one run per scope at
+   a time.
+7. **Make specs normative and check commits.** Activate specs only once the
+   scope has its generation-2 head from step 2: a later registry head change
+   strands every family activated under the old head
+   ([ADR 0007 D11](docs/adr/0007-spec-conformance-chain.md)). Then:
+   - `ostk-spec draft` binds byte spans of a spec document at one commit to
+     one expectation and writes `proposal.jsonl` and `expectation.jsonl`;
+   - `ostk-spec approve`, once per approver, signs the draft offline. The
+     active policy's approvers are `principal.alice` and `principal.bob`,
+     whose keys come from the public fixture seeds `0x01` and `0x02`, so
+     approval is nominal;
+   - `ostk-spec activate` verifies the approvals and makes the statement
+     normative from its `effective_from`;
+   - once the statement is in force and the worker's git step has covered
+     the commit, `ostk-spec check` judges it through the worker's sources
+     file (see [memory worker](#memory-worker)). A verified nonconformance opens
+     an episode that `recall(discrepancies)` lists. A check appends the spec
+     blob and the observer run as evidence events, which the next worker
+     `project` step makes searchable;
+   - `ostk-spec episode resolve` or `ostk-spec episode dismiss` closes an
+     episode. No check closes one.
+
+## Not built yet
+
+The design in
+[Dynamic corpus and causal runtime architecture](docs/DYNAMIC_MEMORY_ARCHITECTURE.md)
+goes well beyond what runs. Two pieces of library code in `src` still have no
+runner:
+
+- relation projection (`src/relation_projection`): nothing emits relation
+  attestations yet;
 - contract vectors and pure contract modules for later stages (for example
   action, causal, consolidation, erasure, telemetry, and ledger epochs) under
   `contracts/dynamic-memory/v3` and `src/memory_contracts`.
 
-Wiring this plane into the product needs, at minimum:
+ADRs 0005 to 0007 record everything else deferred. The main items are:
 
-- the publication grant on the filtered views from migration 23 (the runtime
-  policy in `deploy/cockroach/runtime-role-grants.sql` already grants
-  `fleet_runtime` the tables from migrations 19–27 and 29–31; see
-  [MIGRATIONS.md](docs/MIGRATIONS.md#privilege-separation)), and a content
-  key-encryption key for the governed content store;
-- a lighter writer-authority seam: evidence appends are authorized through the
-  `memory_writer_authority_v1` view, whose rows only the signed registry
-  ceremony writes today.
+- **Writer authority and governance.** A generation-3 or later registry
+  package (the strict witness knows only the compiled generation-1 and
+  generation-2 packages); deployment-keyed governance signers, since every
+  successor from generation 1 on is signed with the public fixture keys; an
+  `ostk-authority-install inspect` command and a generation-1 target; moving
+  `ostk-bootstrap-manifest-import` onto the shared writer-authority runtime;
+  and a separate worker role.
+- **Assert.** Event-first retraction, supersession, and correction; more
+  predicates, resource-valued claims, and other admission bases; replaying a
+  committed assert receipt after assert is turned off; publishing an
+  assertion whose predicate allows it; `accepted_event_id` in search and
+  conflict projections.
+- **Worker and evidence recall.** A long-running `--interval` loop and
+  managed scheduling; `git` and `gh` in the production image; changed-path and
+  incremental git scans and a git ingress redactor; transcript tool-use,
+  tool-result, and thinking records; publication-plane evidence recall (and
+  the publication grant on migration 23's filtered views); fusing evidence
+  into chunk recall; registering the coverage labels in a package; dense or
+  semantic absence verdicts; a body plane that stays encrypted after
+  projection; a re-embed step; remote ingress, queues, and Arrow transport.
+- **Spec conformance.** `ostk-spec retire` and `inspect`; episode
+  `acknowledge` and `waive`; any episode lifecycle over MCP; a
+  `closed_world_verified` observer that can verify absence and so
+  auto-resolve an episode; statements with more than one proposition;
+  measuring the observer binary against its admitted digest; rebasing
+  normative heads after a registry transition; a spec-check worker step;
+  other finding types, predicates, and observers.
 
 ## Deployment
 
@@ -349,14 +503,19 @@ its Terraform tests, but its current form has not been applied. See the
 [cloud onboarding](docs/CLOUD_ONBOARDING.md), and the
 [LocalStack harness](deploy/localstack/README.md), which builds the real image
 and exercises its S3 and Secrets Manager interfaces against a local
-CockroachDB.
+CockroachDB. Terraform runs no `serve`, memory worker, or operator CLI and
+provisions no writer-authority pins or content key; the
+[runbook](#runbook-the-event-first-plane) steps run outside it.
 
 ## Local quickstart
 
 This path starts one disposable CockroachDB node, loads the pinned 512-dimension
 model, ingests the synthetic demo corpus, exercises HTTP recall, and makes real
-MCP calls. A single node is useful for application development; it does not
-demonstrate CockroachDB's production availability or distributed topology.
+MCP calls. Steps 7 to 9 then run the event-first plane: two agents assert
+conflicting claims, the memory worker ingests a scratch git repository, and a
+spec check records a nonconformance that recall reports. A single node is
+useful for application development; it does not demonstrate CockroachDB's
+production availability or distributed topology.
 
 ### Prerequisites
 
@@ -369,7 +528,8 @@ demonstrate CockroachDB's production availability or distributed topology.
   required.
 - The official Hugging Face
   [`hf` CLI](https://huggingface.co/docs/huggingface_hub/main/en/guides/cli).
-- `curl` and `jq` for the HTTP smoke calls.
+- `curl` and `jq` for the HTTP and MCP smoke calls, and `git` 2.28 or newer
+  for the memory worker in step 8.
 - Approximately 3 GB free for Rust dependencies, the CockroachDB image/data,
   and the 129 MB model weights.
 
@@ -524,6 +684,24 @@ applies the embedded schema. Do not start the public demo yet:
 "$FLEET_RECALL_BIN" migrate
 ```
 
+While the migrator is still the only capability, give this physical scope its
+writer authority. The installer takes `(tenant, project)` to an active
+generation-2 registry head under the contract namespaces you choose and prints
+the pins every event-first writer exports; keep the report for step 7. It is
+idempotent, and its fixture-key signatures are nominal (see the
+[writer-authority installer](docs/CONTROL_BOOTSTRAP.md#writer-authority-installer)).
+Steps 1 to 6 do not use it:
+
+```bash
+export FLEET_RECALL_QUICKSTART_DIR="$PWD/.fleet-recall/quickstart"
+mkdir -p "$FLEET_RECALL_QUICKSTART_DIR"
+FLEET_RECALL_CONTRACT_TENANT_NAMESPACE=tenant.quickstart \
+FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE=project.quickstart \
+  "$PWD/target/debug/ostk-authority-install" apply \
+  > "$FLEET_RECALL_QUICKSTART_DIR/authority.json"
+jq '{generation, package, pins}' "$FLEET_RECALL_QUICKSTART_DIR/authority.json"
+```
+
 `migrate` applies every embedded migration in [`migrations/`](migrations) in
 order. Most run without a wrapping SQL transaction because of CockroachDB
 schema-changer and schema-lock constraints, so an interruption can leave
@@ -534,9 +712,10 @@ substitute for that policy. See
 [migration and recovery rules](docs/MIGRATIONS.md) before recovering a failed
 migration.
 
-`migrate` is the only command that authenticates as `fleet_migrator`.
-`ingest`, `health`, and `serve` accept only the private `fleet_writer` login,
-which does not exist until the next step provisions it.
+`migrate` and `ostk-authority-install` are the only commands that
+authenticate as `fleet_migrator`. `ingest`, `health`, `serve`, the worker, and
+`ostk-spec` accept only the private `fleet_writer` login, which does not exist
+until the next step provisions it.
 
 ### 4. Establish the database boundary and load the corpus as the writer
 
@@ -883,6 +1062,189 @@ top-level keys vary.
 Do not put a production CockroachDB URL into a checked-in MCP configuration.
 Use the client's secret/environment facility and a TLS URL instead.
 
+### 7. Assert a claim from two agents
+
+Export the pins from the step 3 report. `serve` verifies them at startup,
+serves `remember(assert)`, and adds it to `tools/list`. Each assert then
+re-verifies the head:
+
+```bash
+for pin in FLEET_RECALL_CONTRACT_TENANT_NAMESPACE \
+           FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE \
+           FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST; do
+  export "$pin=$(jq --exit-status --raw-output --arg pin "$pin" '.pins[$pin]' \
+    "$FLEET_RECALL_QUICKSTART_DIR/authority.json")"
+done
+
+"$FLEET_RECALL_BIN" serve <<'JSONRPC' | jq --compact-output 'select(.id > 1) | .result.structuredContent.data // .error'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"readme-smoke","version":"1.0.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"action":"status"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"remember","arguments":{"action":"assert","idempotency_key":"readme/assert/v1","assertion":{"kind":"decision","text":"remember(assert) allowed is true at this commit in production.","modality":"attested","value":{"kind":"boolean","value":true},"subject":{"provider_repository_id":"908172635"},"applicability":{"repository_commit":{"commit_oid":"3d99ec111a583e80533cbbc0c06798bb628e0979"},"runtime_environment":{"environment_id":"production"}}}}}}
+JSONRPC
+```
+
+The status's `remember_assert` block reports `served: true`, the verified
+head (`generation` 2 and the `connector_generation2` package), and the route
+described under [asserting a claim](#asserting-a-claim). It also carries
+`evidence` and `spec_conformance` blocks, because the runtime policy that
+step 4 applied lets this login read the Stage-5 and Stage-6 tables. The assert's
+`data` holds the claim and its `accepted_event`.
+
+A second agent, which is another process with its own `FLEET_RECALL_AGENT`,
+asserts the opposite value about the same repository, commit, and
+environment:
+
+```bash
+FLEET_RECALL_AGENT=quickstart-reviewer "$FLEET_RECALL_BIN" serve <<'JSONRPC' | jq --compact-output 'select(.id > 1) | .result.structuredContent.data // .error'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"readme-smoke","version":"1.0.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember","arguments":{"action":"assert","idempotency_key":"readme/assert-reviewer/v1","assertion":{"kind":"decision","text":"remember(assert) allowed is false at this commit in production.","modality":"attested","value":{"kind":"boolean","value":false},"subject":{"provider_repository_id":"908172635"},"applicability":{"repository_commit":{"commit_oid":"3d99ec111a583e80533cbbc0c06798bb628e0979"},"runtime_environment":{"environment_id":"production"}}}}}}
+JSONRPC
+```
+
+Its response lists the conflict in `conflicts_opened`, and both claims now
+read `disputed`. `recall(conflicts)` and the conflict lifecycle of step 6
+treat this conflict like any other.
+
+### 8. Run the memory worker over a scratch repository
+
+The worker's `ingest` and `project` steps need the pins exported above and a
+content key-encryption key. Generate the key once and keep it for step 9:
+`project` unwraps with it everything `ingest` wrapped. The scratch repository
+holds a one-sentence spec document and a Rust enum, and the sources file names
+one git source plus the observer identity that step 9 appends under:
+
+```bash
+export FLEET_RECALL_CONTENT_KEK_HEX=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+export FLEET_RECALL_QUICKSTART_REPO="$FLEET_RECALL_QUICKSTART_DIR/repo"
+git init --quiet -b main "$FLEET_RECALL_QUICKSTART_REPO"
+mkdir -p "$FLEET_RECALL_QUICKSTART_REPO/docs" "$FLEET_RECALL_QUICKSTART_REPO/src"
+printf '# Remember actions\n\nForget must not be a remember action.\n' \
+  > "$FLEET_RECALL_QUICKSTART_REPO/docs/spec.md"
+printf 'pub enum RememberAction {\n    Record,\n    Forget,\n}\n' \
+  > "$FLEET_RECALL_QUICKSTART_REPO/src/service.rs"
+git -C "$FLEET_RECALL_QUICKSTART_REPO" add docs src
+git -C "$FLEET_RECALL_QUICKSTART_REPO" \
+  -c user.name=Quickstart -c user.email=quickstart@example.invalid \
+  commit --quiet --message 'Declare the Forget remember action'
+export FLEET_RECALL_QUICKSTART_COMMIT=$(git -C "$FLEET_RECALL_QUICKSTART_REPO" rev-parse HEAD)
+
+export FLEET_RECALL_QUICKSTART_SOURCES="$FLEET_RECALL_QUICKSTART_DIR/worker-sources.json"
+cat > "$FLEET_RECALL_QUICKSTART_SOURCES" <<JSON
+{
+  "schema_version": 1,
+  "git": [
+    {
+      "connector_principal": "connector.git",
+      "connector_instance": "connector.git.quickstart",
+      "installation_id": 1,
+      "repository_id": "git.repo.quickstart",
+      "git_dir": "$FLEET_RECALL_QUICKSTART_REPO/.git",
+      "ref_name": "refs/heads/main",
+      "provider_repository_id": 908172635
+    }
+  ],
+  "observer": {
+    "connector_principal": "connector.observer",
+    "connector_instance": "connector.observer.quickstart"
+  }
+}
+JSON
+
+"$FLEET_RECALL_BIN" worker --once --sources "$FLEET_RECALL_QUICKSTART_SOURCES" |
+  jq '.steps | map_values(.status)'
+```
+
+Every step reports `ok`; the transcript and CI steps have no sources. Search
+the evidence the tick admitted, once for the commit and once for a word that
+appears nowhere:
+
+```bash
+"$FLEET_RECALL_BIN" serve <<'JSONRPC' | jq --compact-output 'select(.id > 1) | .result.structuredContent.data | {absence, hits: [.hits[] | {matched_by, media_type, snippet}]}'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"readme-smoke","version":"1.0.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"action":"search","kind":"evidence","query":"Forget remember action","limit":5}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"action":"search","kind":"evidence","query":"zeppelin","limit":5}}}
+JSONRPC
+```
+
+The first search finds the commit and reads `present`. The second reads
+`absent`, which evidence recall says only because the one source's last check
+succeeded, is fresh, and covered its whole range, and nothing awaits
+projection. Stop the worker from running and, after a day, the same search
+reads `unknown` with the reason `source_stale`.
+
+### 9. Make a spec normative and check the commit
+
+Bytes 20 to 57 of `docs/spec.md` are its sentence "Forget must not be a
+remember action." Draft a statement that binds that span to the expectation
+that `RememberAction` in `src/service.rs` does not declare `Forget`, have the
+two approvers the active policy names sign it, and activate it. The approvers'
+Ed25519 seeds are the public fixture seeds `0x01` and `0x02`, so these
+approvals are nominal: the real gate is the `fleet_writer` credential that
+`activate` runs under. The statement takes effect 30 seconds after the draft:
+
+```bash
+export FLEET_RECALL_SPEC_BIN="$PWD/target/debug/ostk-spec"
+spec_dir="$FLEET_RECALL_QUICKSTART_DIR/spec"
+"$FLEET_RECALL_SPEC_BIN" draft \
+  --git-dir "$FLEET_RECALL_QUICKSTART_REPO/.git" \
+  --repository-id git.repo.quickstart --installation-id 1 \
+  --provider-repository-id 908172635 \
+  --commit "$FLEET_RECALL_QUICKSTART_COMMIT" \
+  --spec-path docs/spec.md --span 20..57 \
+  --family spec.quickstart.no_forget \
+  --member Forget --expected absent \
+  --effective-in-seconds 30 \
+  --proposer principal.dave --author principal.carol \
+  --out "$spec_dir" | jq '{statement_id}'
+printf '01%.0s' $(seq 32) > "$spec_dir/alice.seed"
+printf '02%.0s' $(seq 32) > "$spec_dir/bob.seed"
+for approver in alice bob; do
+  "$FLEET_RECALL_SPEC_BIN" approve --proposal "$spec_dir/proposal.jsonl" \
+    --principal "principal.$approver" --seed-file "$spec_dir/$approver.seed" \
+    --out "$spec_dir/$approver.jsonl" >/dev/null
+done
+"$FLEET_RECALL_SPEC_BIN" activate \
+  --proposal "$spec_dir/proposal.jsonl" \
+  --expectation "$spec_dir/expectation.jsonl" \
+  --approval "$spec_dir/alice.jsonl" --approval "$spec_dir/bob.jsonl" \
+  | jq '{outcome, statement_id}'
+```
+
+Once the statement is in force, check the commit. `check` reads
+`src/service.rs` at the commit through the worker's git source, runs the
+genesis-admitted observer over the enum, and compares:
+
+```bash
+sleep 30
+"$FLEET_RECALL_SPEC_BIN" check \
+  --family spec.quickstart.no_forget \
+  --sources "$FLEET_RECALL_QUICKSTART_SOURCES" \
+  --git-source connector.git.quickstart \
+  --commit "$FLEET_RECALL_QUICKSTART_COMMIT" \
+  | jq '{verdict, observed_condition, discrepancy}'
+
+"$FLEET_RECALL_BIN" serve <<'JSONRPC' | jq 'select(.id > 1) | .result.structuredContent.data | {discrepancies: [.discrepancies[] | {episode_id, lifecycle_state, observed, expectation: .spec.expectation}], specs: [.specs[] | {binding_family_id, effect, last_check}]}'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"readme-smoke","version":"1.0.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"action":"discrepancies"}}}
+JSONRPC
+```
+
+The observer verified `Forget` present, so the check is `nonconforming` and
+opened a `spec_nonconformance` episode, which `recall(discrepancies)` lists
+with the statement it violates and the commit it observed. Had the commit not
+declared `Forget`, the check would read `unknown`, not `conforming`: the
+observer can verify a member present but never absent, so an empty episode
+list is not proof of conformance, and the list's `specs[].last_check` says
+what each spec's latest check found. For the same reason no later check closes
+this episode; `ostk-spec episode resolve` or `ostk-spec episode dismiss` does
+([ADR 0007](docs/adr/0007-spec-conformance-chain.md)). The check appended the
+spec blob and the observer run as evidence; the next worker tick projects them
+into evidence recall.
+
 ## Ingestion contract
 
 `ingest --input PATH` reads NDJSON; `--input -` (the default) reads stdin:
@@ -946,6 +1308,15 @@ the remaining rows.
   role and never granted to the publication reader. This authority is as
   strong as the deployment's `FLEET_RECALL_AGENT` binding over the shared
   writer credential.
+- Event-first writes (`remember(assert)`, the memory worker, and `ostk-spec`)
+  append accepted events only under the registry head their pins verify,
+  re-verified for every request, tick, or command. That head's governance
+  signatures and `ostk-spec`'s approvals use public fixture keys and are
+  nominal: the real gates are the migrator credential that installs a head
+  and the shared `fleet_writer` credential every writer uses. The worker's
+  `project` step writes governed content in plaintext to the body plane, which
+  the writer login reads without the content key. See
+  [security policy](docs/SECURITY.md#event-first-writers-and-the-content-key).
 - MCP frames, tool results, searches, conflict projections, claim passages,
   ingestion, and HTTP bodies/results are bounded. Backend details are redacted
   from protocol errors.
@@ -1065,7 +1436,10 @@ docker stop ostk-fleet-recall-crdb
 
 Restart it later with `docker start ostk-fleet-recall-crdb`. Removing the
 container or volume is intentionally left as an explicit operator decision
-because the volume contains the local memory corpus.
+because the volume contains the local memory corpus. Steps 3 and 7 to 9 also
+leave the installer report, the scratch repository, the sources file, and the
+spec files under `.fleet-recall/quickstart`, which git ignores; they belong to
+that database, so remove them with it.
 
 ## License
 

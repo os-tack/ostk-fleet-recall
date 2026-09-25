@@ -30,7 +30,8 @@ That role can select every claim and chunk row, so the public
 process itself withholds each claim written by `remember(assert)`, whose
 predicate's publication default is denied: the claim, its synthetic chunk,
 and its conflicts read as absent (ADR 0005 D8). That is a property of the
-reviewed binary; the credential alone can still select those rows.
+reviewed binary; the credential alone can still select those rows (see
+[event-first writers](#event-first-writers-and-the-content-key)).
 CloudFront-to-ALB transport and viewer-TLS limitations are documented without
 stronger claims in the [AWS runbook](../deploy/aws/README.md).
 
@@ -86,9 +87,13 @@ private-plane tables for the dynamic-memory runtimes (see
 [MIGRATIONS.md](MIGRATIONS.md)). Normal recall, remember, ingest, MCP, health,
 and public-demo paths require an uninterrupted successful prefix through at
 least version 18 and remain compatible with later additive migrations. The
-private compatibility gates remain control 3, genesis 9, successor repository
-14, and conflict reconciliation 16. A later successful row cannot mask a
-missing or failed prerequisite in any gate.
+private writer serves evidence recall only after a startup probe finds
+migration 30 and its read grants, and discrepancies only after one finds 31
+and theirs; the memory worker checks migration 30 and every privilege its
+steps use before each tick. The private compatibility gates remain control
+3, genesis 9, successor repository 14, and conflict reconciliation 16. A
+later successful row cannot mask a missing or failed prerequisite in any
+gate.
 
 Versions 1 through 11 are nontransactional schema changes; v10 and v11 recover
 an interrupted exact index through `IF NOT EXISTS` plus a fail-closed catalog
@@ -324,6 +329,79 @@ attribution. `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` withdraws every
 lifecycle action and restores the record-only tool surface; a lifecycle
 request committed before the switch still replays when its identical request
 is retried.
+
+## Event-first writers and the content key
+
+`remember(assert)`, the memory worker, and `ostk-spec` append accepted events
+under the writer authority that `ostk-authority-install` installs
+([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md)).
+
+**The installer credential.** `ostk-authority-install` runs the control
+bootstrap, genesis activation, and both successor ceremonies once per physical
+`(tenant_id, project)` as the schema owner/migrator login, like `migrate`. Its
+signatures use the public Ed25519 fixture keys (seeds `0x01` and `0x02`) and
+authenticate nothing (ADR 0005 D2; see the
+[writer-authority installer](CONTROL_BOOTSTRAP.md#writer-authority-installer)),
+so the migrator credential is what decides which registry head a scope gets.
+Withdraw it after the run, as after `migrate`. The pins it prints are
+integrity anchors, not secrets: each writer verifies the head against its
+receipt-digest pin, and a writer given the wrong pins refuses it (`serve`
+starts with assert off; the worker's `ingest` and `project` steps and every
+`ostk-spec` command but the offline `approve` refuse to run). Distribute them
+as configuration nobody else may change.
+
+**One runtime role for every writer.** `serve`, the worker, and `ostk-spec`
+all authenticate as `fleet_writer` and so run as `fleet_runtime`; there is no
+worker or spec role. A holder of that credential can therefore do anything
+any of them does, directly in SQL: append evidence events, write spec
+statements, checks, and episode lifecycle events under any principal name,
+and upsert worker status rows. A leaked writer login can make an evidence
+absence verdict or the spec plane lie, for example by writing a fresh `ok`
+status row. The runtime policy keeps the Stage-5 and Stage-6 logs,
+statements, checks, receipts, and bodies append-only by privilege (`SELECT`
+and `INSERT`, no `UPDATE` or `DELETE`), grants `UPDATE` only on heads,
+cursors, projections, the transcript outbox's drain state, and worker status
+for their compare-and-set advances and `SELECT ... FOR UPDATE` locks, and
+grants `DELETE` on none of them. It also grants table-level `UPDATE` on
+`memory_content_objects`, because CockroachDB v26.2.3 requires it for the
+content store's `SELECT ... FOR UPDATE` dedupe lock, which the worker's
+transcript path takes whenever a resumed session file repeats a turn. No
+runtime statement updates that table, but the grant lets the writer login
+rewrite any governed content row (see
+[residual SQL authority](#residual-sql-authority-and-recovery)).
+
+**The worker host.** The host that runs the worker's `ingest` steps holds the
+writer login, the content key-encryption key (`FLEET_RECALL_CONTENT_KEK_HEX`),
+the `gh` credential its CI step uses, the repositories, and the transcript
+files, and is as sensitive as all of them together. The key wraps each
+governed content object's data key. The `project` step unwraps them and
+writes the bodies in plaintext to `memory_body_objects_v1`, which the writer
+login, and so `serve`, reads without the key. Once a body is projected, the
+key no longer limits who can read it, and destroying the key no longer erases
+it: erasure must also purge the body rows and the lexical and dense rows
+derived from them (ADR 0006 D9). Git ingress redaction is deferred, so git
+bodies are raw commit text; the lexical recall text that evidence recall
+returns is redacted. `ostk-spec check` needs the key too. `serve` never does.
+
+**The publication reader gains nothing.** The event-first plane changes only
+the runtime policy. `fleet_publication_reader` keeps `SELECT` on exactly its
+eight tables and receives nothing on the accepted-event ledger, the content
+store, the body, recall-projection, coverage, connector, worker, normative,
+spec, or discrepancy tables, or migration 23's filtered views, whose
+publication grant is still deferred. The publication process serves no
+assert, evidence recall, or discrepancies.
+
+**Asserted claims and the public demo.** The publication reader does hold
+table-level `SELECT` on `memory_claims` and `memory_chunks`, where an
+asserted claim's projection and synthetic chunk live, and the only assertable
+predicate's publication default is denied. The reviewed demo binary
+therefore withholds every claim with an `accepted_event_id`, its synthetic
+chunk, and every conflict it belongs to, so the demo may read a physical
+project where assert is enabled (ADR 0005 D8). The grant does not enforce
+that: the `fleet_publication` credential can select every claim and chunk row
+in the database, in every project, asserted ones included. Where asserted
+claims must stay unreadable to the holder of that credential, do not serve
+the public demo from the same database.
 
 ## Residual SQL authority and recovery
 

@@ -8,15 +8,22 @@ that must coordinate across process, host, and availability-zone boundaries;
 using OSTK is optional.
 
 This document describes the serving system: the MCP server, the read-only
-HTTP demo, the CockroachDB schema they use, and the checked-in AWS topology,
-including the bounded PUBLIC-03 database and task-input separation described
-below. The broader event-driven corpus, provider-evidenced provenance graph,
-separately graded causal hypotheses, runtime observation model, and private
-control plane are specified in
+HTTP demo, the memory worker, the CockroachDB schema they use, and the
+checked-in AWS topology, including the bounded PUBLIC-03 database and
+task-input separation described below. The broader event-driven corpus,
+provider-evidenced provenance graph, separately graded causal hypotheses,
+runtime observation model, and private control plane are specified in
 [Dynamic corpus and causal runtime architecture](DYNAMIC_MEMORY_ARCHITECTURE.md).
-Much of that design exists as library code with live database tests, but no
-serving binary runs it yet; see the README's
-[built but not yet wired](../README.md#built-but-not-yet-wired) section.
+Its event-first slice runs today. `remember(assert)` appends accepted claim
+events ([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md)).
+The memory worker ingests git history, agent transcripts, and CI runs, which
+`recall(kind=evidence)` searches
+([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)). The private
+`ostk-spec` CLI checks commits against normative spec statements, and
+`recall(discrepancies)` lists what it finds
+([ADR 0007](adr/0007-spec-conformance-chain.md)). The README's
+[not built yet](../README.md#not-built-yet) section lists what the rest of the
+design still lacks.
 
 ## Current checked-in topology
 
@@ -103,6 +110,14 @@ Both depend on a separate cross-database/PUBLIC-authority audit and an exclusive
 temporary member window; database ownership alone is insufficient, and neither
 policy is Terraform or runtime wiring.
 
+The event-first plane's operator processes are outside this topology too.
+`ostk-authority-install` (run once per physical scope as the migrator) and
+`ostk-spec` (run as the private writer) are workstation binaries absent from
+the production image. The memory worker is `ostk-fleet-recall worker --once`,
+scheduled by the operator: its git and CI steps shell out to `git` and `gh`,
+which the image does not carry, so ingest runs on a host that holds the
+repositories, the transcripts, the writer login, and the content key.
+
 ECS containers are stateless. Replacing or scaling a task does not move memory:
 the corpus, typed claims, idempotency receipts, conflict ledger, and events
 remain in CockroachDB Cloud. A private S3 prefix supplies the same
@@ -141,22 +156,31 @@ than caller-controlled JSON.
 | Idempotent mutation receipts | `memory_mutation_receipts` | At most one committed mutation per tenant-wide key and identical canonical request |
 | Fleet events | `memory_events` | Durable audit and future projection/CDC seam |
 | Reserved attention (future) | `memory_attention` | Schema seam only; not read or written by the current serving path |
-| General accepted-event ledger | `memory_evidence_events`, `memory_evidence_shard_heads` | Append-only general events under the control ledger's single log epoch; carries no governance kind |
+| General accepted-event ledger | `memory_evidence_events`, `memory_evidence_shard_heads` | Append-only general events under the control ledger's single log epoch, written by `remember(assert)`, the memory worker, and `ostk-spec`; carries no governance kind |
 | Ingress quarantine | `memory_evidence_quarantine` | Bounded integrity receipt for a rejected delivery: digest and diagnostic only, never payload bytes |
 | Governed content store | `memory_content_objects` | Envelope-encrypted governed bytes addressed by storage identity and indexed for erasure |
 | Relation projection | `memory_relation_projection_v1`, `memory_relation_projection_watermarks_v1` | Disposable current relation state with a per-`(ledger_family, shard)` cursor advanced in the same transaction |
 | Writer authority witness | `memory_writer_authority_v1` (view) | Read-only bootstrap/epoch/registry-head projection; the writer's only authority read path |
+| Evidence bodies and recall tiers | `memory_body_objects_v1` and the other body-projection tables, `memory_body_lexical_projection_v1`, `memory_body_dense_projection_v1`, `memory_body_visibility_v1` | Content-addressed connector evidence, lexically searchable first and densely later, for `recall(kind=evidence)` |
+| Connector and coverage state | `memory_transcript_outbox_v1`, `memory_transcript_cursors_v1`, `memory_ci_measured_windows_v1`, `memory_coverage_cursors_v1`, `memory_coverage_receipts_v1` | Each connector instance's resume point and a receipt for exactly the range it read |
+| Worker source status | `memory_worker_sources_v1` | Each source's last outcome and last completed check, which an evidence absence verdict trusts |
+| Normative statements | `memory_normative_heads_v1`, `memory_normative_log_v1`, `memory_normative_projections_v1`, `memory_normative_statements_v1` | Spec statements activated per binding family, with their canonical proposal and expectation |
+| Spec checks | `memory_spec_checks_v1` | Every check of a commit against a statement: `nonconforming`, `conforming`, or `unknown` with reasons |
+| Discrepancy ledger | `memory_discrepancy_heads_v1`, `memory_discrepancy_log_v1`, `memory_discrepancy_projections_v1`, `memory_discrepancy_relations_v1` | `spec_nonconformance` episodes and their append-only lifecycle |
 
-Later migrations (19 through 28, see [`migrations/`](../migrations)) add
-private-plane tables for the dynamic-memory runtimes: content-addressed body
-projection, coverage cursors and receipts, the lexical/dense recall projection
-and its visibility class, the transcript and CI connector state, normative
-activation, the discrepancy ledger, and the bootstrap-manifest import rows.
-The serving path does not read or write them yet; see
-[Dynamic corpus and causal runtime architecture](DYNAMIC_MEMORY_ARCHITECTURE.md).
-Migration 29 adds the one later table serving does use:
-`memory_conflict_lifecycle_events_v1`, the append-only per-conflict lifecycle
-log described under the write path below.
+Later migrations (19 through 31, see [`migrations/`](../migrations); 25 is
+permanently unused) add the private-plane tables listed above:
+content-addressed body projection (19), coverage cursors and receipts (20),
+the lexical/dense recall projection (21) and its visibility class (23), the
+transcript (22) and CI (26) connector state, normative activation (24), the
+discrepancy ledger (27), the bootstrap-manifest import rows (28), worker
+source status (30), and the spec statements and checks (31). Migration 29
+adds `memory_conflict_lifecycle_events_v1`, the append-only per-conflict
+lifecycle log described under the write path below. The memory worker writes
+the body, connector, coverage, recall-projection, and status tables;
+`ostk-spec` writes the normative, spec, and discrepancy tables; and `serve`
+reads them for `recall(kind=evidence)` and `recall(discrepancies)` without
+writing any of them. Only the private import CLI writes migration 28's rows.
 
 Serving accepts an uninterrupted successful migration prefix through at least
 version 18, and later additive migrations remain compatible. The private
@@ -174,6 +198,13 @@ floors:
   workstation CLI plus database-local one-shot role policy. Its cross-database
   authority audit remains external.
 - Recall, remember, ingest, health, and the public demo require prefix 1–18.
+  `remember(assert)` needs nothing later: its evidence plane and authority
+  view are migration 18's.
+- The memory worker and `recall(kind=evidence)` require migration 30, and
+  `recall(discrepancies)` requires 31. `serve` probes each at startup and
+  serves it only when the schema and the login's grants allow, so every other
+  surface still runs on a prefix through 18. The runtime policy that grants
+  all of this requires the complete prefix 1–31.
 
 Later additive rows cannot compensate for a missing or failed row inside a
 required prefix. Migrations 15 through 17 do not add successor tables: they
@@ -283,6 +314,71 @@ long-lived conflict's lookup always fits one MCP response), and derives
 `unlogged_transitions` from the revisions the events do not cover, such as a
 reopen by `record` or a close the full log could not hold. The publication
 reader has no grant on the log and never attaches the overlay.
+
+### Evidence recall
+
+`recall(search|get, kind=evidence)` reads the Stage-5 tiers the memory worker
+writes, never the chunk corpus, and nothing from it enters chunk search's
+reciprocal-rank fusion ([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)).
+`serve` probes once at startup: the schema must have reached migration 30, and
+a `SELECT ... WHERE false` over every table evidence recall reads must pass
+inside a rolled-back transaction. Without that, `tools/list` and every
+response stay as they were and the kind is refused like any unsupported kind.
+
+```mermaid
+sequenceDiagram
+    participant A as Fleet agent
+    participant M as Fleet Recall service
+    participant E as Pinned local embedder
+    participant C as CockroachDB
+
+    A->>M: recall(search, kind=evidence, query)
+    M->>E: encode query outside SQL transaction
+    M->>C: active sources' status rows + newest coverage cursors
+    M->>C: readiness: unprojected events, pending turns, tier currency
+    M->>C: lexical lane, then dense lane over this model's vectors only
+    M->>C: hydrate hits with redacted recall-text snippets
+    M->>M: absence verdict over what was read
+    M-->>A: hits + readiness + sources + absence
+```
+
+The reads run in that order so a verdict never rests on a projection newer
+than the one readiness counted. The dense lane compares the query only with
+vectors the serving model embedded, and a dense-only match below the chunk
+lane's 0.18 cosine floor is dropped. Snippets and fetched text are the lexical
+tier's redacted recall text, never the stored body bytes. The verdict is
+`present` when anything matched. It is `absent` only when the query has
+lexical terms, nothing awaits body projection or transcript admission, the
+lexical tier is current, and every active source's last attempt succeeded,
+its last completed check is within its `stale_after_seconds`, and its
+newest coverage cursor is complete. Otherwise it is `unknown`, naming every
+reason. Dense lag never blocks `absent`. `get` returns one body's full recall
+text (at most 256 KiB) by its content id.
+
+### Spec discrepancies
+
+`recall(action="discrepancies")` reads the spec plane that `ostk-spec` writes
+([ADR 0007](adr/0007-spec-conformance-chain.md)). `serve` probes once at
+startup for migration 31 and `SELECT` on the discrepancy projections, heads,
+and log, the normative projections, and both migration-31 tables; without
+them, `tools/list` and `recall(status)` are unchanged and the action is
+refused before any read. One read transaction returns the episodes (by
+default the standing episodes of live specs that have not expired; with
+`include_resolved`, closed episodes and those of specs no longer in force;
+with `id`, one episode and its lifecycle history), the statement each
+violates and the commit its opening check observed, every live spec's latest
+check, and each spec's effect (`in_force`, `scheduled`, or `expired`) at the
+transaction's `statement_timestamp()`. Episodes are not ADR 0004 conflicts:
+`RecallResult.conflicts` stays empty and `recall(conflicts)` is unchanged.
+The observer verifies presence only, so a check of a compliant commit reads
+`unknown`, and an empty episode list is not proof of conformance; the answer
+says so and carries every spec's latest check.
+
+`recall(status)` adds an `evidence` block and a `spec_conformance` block
+(active, scheduled, expired, never-checked, and unknown specs, and open
+discrepancies) only when each is served. It reads both concurrently under one
+10-second deadline, and a block that fails or runs out of time becomes a
+warning, never a failed status.
 
 ## Deliberate-memory write path
 
@@ -427,7 +523,71 @@ it, the surface stays at `record|supersede|retract`, closes are audited in
 `memory_events` only, and `MINIMUM_RECALL_SCHEMA_VERSION` stays 18, so every
 binary runs on a schema without migration 29. The rollout is deploy the
 binary, migrate, re-apply the runtime policy (its single migration 1-31 gate
-and exact grant matrix), then restart `serve`.
+and exact grant matrix), then restart `serve`. The same restart re-runs the
+evidence-recall and discrepancy probes, and the memory worker checks every
+privilege its selected steps use before each tick, naming the first one
+missing.
+
+### Event-first `remember(assert)`
+
+`remember(assert)` ([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md))
+writes the same claim projection as `record`, but only after appending an
+accepted `memory.claim.accepted` event in the same transaction:
+
+```mermaid
+sequenceDiagram
+    participant A as Fleet agent
+    participant M as Memory service
+    participant W as Writer-authority witness
+    participant E as Pinned embedder
+    participant C as CockroachDB Cloud
+
+    A->>M: remember(assert, assertion, idempotency key)
+    M->>C: fast receipt lookup
+    alt first execution
+        M->>W: re-verify the pinned registry head
+        M->>M: route, rederive identities, admit the statement
+        M->>E: encode claim passages outside transaction
+        loop only on SQLSTATE 40001
+            M->>C: fresh SERIALIZABLE transaction
+            Note over C: re-read head + append memory.claim.accepted<br/>+ re-audit support events + reserve receipt<br/>+ claim projection + detector + audit events + complete receipt
+            C-->>M: commit or retryable serialization failure
+        end
+        M-->>A: claim, accepted event, related conflicts
+    else replay
+        C-->>M: stored receipt
+        M-->>A: stored result marked replayed
+    end
+```
+
+The agent sends locator components, never URIs, references, an actor, or a
+scope. Before any transaction, the server re-verifies the strict writer
+authority from its pins, routes the active package's one authenticated-actor
+remember rule, rederives the subject and every applicability URI, stamps a
+missing `effective_from` from its own clock, enforces the whole
+effective-interval rule, and embeds the claim's passages. The append then
+re-reads the head inside the serializable transaction, and a head that moved
+since admission refuses the request as `registry_head_changed` rather than
+re-admitting it. In that transaction, the claim projection carries
+`accepted_event_id`, the receipt names the event, and every support event ID
+is re-checked in this project. The claim key,
+`claim-v2:<coordinate>:<modality>`, leaves out the value, so assertions by
+different agents about the same subject, predicate, and applicability meet
+the unchanged `same_key_functional_value_v2` detector, and the lifecycle
+above acts on their projections. `record`'s SQL, requests, and receipts are
+untouched.
+
+Assert needs no grant beyond what `fleet_runtime` already holds: the
+evidence-plane appends and the writer-authority view from migration 18, and
+table access on claims, events, and receipts. An assertion carries no
+governed content, so it needs no content key. `serve` serves assert only
+when its pins verify at startup. Without pins, every surface is byte for
+byte what it was. With pins that fail, the reason is logged and
+`recall(status).remember_assert` reports it, and assert stays off. The
+memory worker and `ostk-spec` append under the same authority, verified
+afresh for every tick or command. The public reader withholds every asserted
+claim, its synthetic chunk, and its conflicts, because the only predicate's
+publication default is denied.
 
 ## Trust and isolation invariants
 
@@ -467,6 +627,18 @@ and exact grant matrix), then restart `serve`.
    receipt. Its bounds can refuse the conflict actions but never a verified
    close: a close the full log cannot hold commits unlogged. A refused
    lifecycle request rolls back completely and leaves no receipt.
+8. Every accepted-event append is authorized by the registry head, not by the
+   process. `remember(assert)`, the memory worker, and `ostk-spec` load the
+   writer-authority pins, re-verify the strict witness for every request,
+   tick, or command, and append inside a serializable transaction that
+   re-reads the head; a moved head refuses the append instead of re-admitting
+   it. That authority is only as strong as the migrator credential that
+   installed the head and the pins each writer holds: every governance
+   signature from generation 1 on uses public fixture keys (ADR 0005 D2).
+9. Absence is never inferred from silence. An evidence search reads `absent`
+   only over a current lexical tier with every active source recently and
+   completely checked, and a spec check never reads `conforming` for a member
+   the observer did not find; both say `unknown`, with reasons, instead.
 
 ## Scaling and failure behavior
 
@@ -486,6 +658,12 @@ and exact grant matrix), then restart `serve`.
 - The initial vector-index migration is non-transactional and deliberately run
   by one dormant-service migration task. Later schema changes are roll-forward
   operations monitored as CockroachDB schema-change jobs.
+- The memory worker is a scheduled one-shot command, one run per scope at a
+  time. A failure stays inside its source or step, and a worker that stops
+  running turns every empty evidence answer `unknown` once its sources pass
+  their `stale_after_seconds`. Evidence search and status count readiness
+  over the scope's whole evidence tier, so their cost grows with it; the
+  status read is bounded at 10 seconds (ADR 0006 D5).
 
 ## Deliberate boundaries
 
@@ -505,24 +683,34 @@ and exact grant matrix), then restart `serve`.
 - Implement the reserved Recall actions. The service contract already names
   `remember` forget, restore, resolve, relate, split, focus, track, and
   consolidate, and `recall` surface, discover, synthesize, and audit;
-  today `remember(record|supersede|retract|acknowledge|resolve)` and
-  `recall(search|get|conflicts|status)` are served (with `get` covering claims,
-  chunks, and, on the private writer, conflicts; `acknowledge` and `resolve`
-  need the migration-29 lifecycle log), `remember(dismiss|waive)` is served
+  today `remember(record|assert|supersede|retract|acknowledge|resolve)` and
+  `recall(search|get|conflicts|status|discrepancies)` are served (with `get`
+  covering claims, chunks, and, on the private writer, conflicts and
+  evidence; `assert` needs verified writer-authority pins, `acknowledge` and
+  `resolve` the migration-29 lifecycle log, `kind=evidence` migration 30, and
+  `discrepancies` migration 31), `remember(dismiss|waive)` is served
   where the deployment enables adjudication, and the others return an error.
   In [ADR 0004](adr/0004-serving-conflict-lifecycle.md)'s lifecycle, `record`
   reopens are not logged yet (history reports them as unlogged transitions),
   `record` itself still re-disputes the members of a dismissed pair when a new
   incompatible claim reopens their conflict, and waivers are unsigned and
   cannot be revoked early.
+- Extend assert beyond its one predicate
+  ([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md)): more
+  predicates and resource-valued claims through a new compiled package,
+  event-first retraction and supersession, and deployment-keyed governance
+  in place of the public fixture keys.
 - Extend evidence recall. The `ostk-fleet-recall worker --once` subcommand
   runs the Stage-5 connectors and projectors, and `serve` answers
   `recall(kind=evidence)` over what they write, with readiness, coverage, and
   an absence verdict ([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)).
-  Publication-plane evidence recall, fusing evidence into chunk recall, and
-  the rest of ADR 0006's deferred list remain; the README's
-  [built but not yet wired](../README.md#built-but-not-yet-wired) section
-  lists what the rest of the plane needs.
+  Managed scheduling, publication-plane evidence recall, fusing evidence into
+  chunk recall, and the rest of ADR 0006's deferred list remain.
+- Extend the spec chain ([ADR 0007](adr/0007-spec-conformance-chain.md)): an
+  observer admitted to verify absence, so a fixing commit can resolve an
+  episode; episode lifecycle over MCP; `retire` and `inspect`; and other
+  finding types. The README's [not built yet](../README.md#not-built-yet)
+  section collects every deferred item.
 - Package Fleet Recall as an optional OSTK Recall plugin/backend.
 - Add authenticated workload identity and dynamic multi-project routing
   without trusting MCP parameters.

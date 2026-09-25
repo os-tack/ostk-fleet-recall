@@ -1,6 +1,6 @@
 # Dynamic corpus and causal runtime architecture
 
-Status: **target architecture; stages 1–3 implemented, private only; stage 4 partially implemented; stage 5 connectors and projectors and the stage 6 normative, observer, and discrepancy runtimes implemented as private-plane library runtimes with live CockroachDB tests, reachable from no serving path; stage 8 partially implemented (CI connector); stage 7 not started; stages 9–10 contract vectors only**
+Status: **target architecture; stages 1–3 implemented, private only; stage 4 implemented on the private writer (`remember(assert)` appends its event and projection in one transaction; nothing emits relation attestations yet); stage 5 implemented on the private plane (the memory worker runs the connectors and projectors, and `serve` answers evidence recall); stage 6 implemented for one finding type (`ostk-spec` activates spec statements and records verified spec nonconformance, which `serve` lists); stage 8 partially implemented (CI connector); stage 7 not started; stages 9–10 contract vectors only**
 
 Fleet Recall currently serves a statically generated, revision-linked corpus
 and a deliberate typed-claim ledger. This document defines the target model in
@@ -13,21 +13,32 @@ documented in [ARCHITECTURE.md](ARCHITECTURE.md), its security boundary in
 [ADR 0001](adr/0001-product-and-backend-boundary.md).
 
 No webhook, transport queue, remote ingress, incident controller, or public
-mutation route exists today. Two local connectors (agent transcripts and git
-history), a CI workflow-run connector, the content-addressed body projector,
-the coverage runtime, the lexical-first/dense-later recall projectors, the
-embedding worker's provider seam, the evidence recall read library over those
-projections, and the Stage-6 normative activation,
-observer, and discrepancy runtimes are implemented as private-plane library
-modules with live CockroachDB tests. No serving path constructs any of them.
-Two commands run some of them. The private `ostk-observer-run` binary runs the
-observer. The `ostk-fleet-recall worker --once` subcommand runs the memory
-worker (`src/worker`), which runs every connector and projector for one scope,
-one tick per invocation. It embeds the dense tier through
-`ChunkEmbedderProvider`, the production provider for that seam, over the
-pinned model2vec embedder. The current source does implement the bounded PUBLIC-03 publication identity and
-planned AWS task input separation; those Terraform changes have not been
-applied.
+mutation route exists today. What runs is private and reads local material:
+
+- `ostk-authority-install` gives one physical scope an active generation-2
+  registry head and prints the writer-authority pins that every event-first
+  writer loads ([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md)).
+- The private writer's `serve` answers `remember(assert)`, which appends a
+  `memory.claim.accepted` event and its claim projection in one serializable
+  transaction under that authority (ADR 0005).
+- The memory worker, `ostk-fleet-recall worker --once`, runs two local
+  connectors (agent transcripts and git history), a CI workflow-run connector,
+  the content-addressed body projector, the coverage runtime, and the
+  lexical-first/dense-later recall projectors for one scope, one tick per
+  invocation. It embeds the dense tier through `ChunkEmbedderProvider`, the
+  production provider for that seam, over the pinned model2vec embedder.
+  `serve` reads what it writes as `recall(kind=evidence)`
+  ([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)).
+- The private `ostk-spec` CLI runs the Stage-6 normative activation,
+  observer, and discrepancy runtimes, and `serve` lists the episodes it opens
+  as `recall(discrepancies)`
+  ([ADR 0007](adr/0007-spec-conformance-chain.md)). The private
+  `ostk-observer-run` binary also runs the observer.
+
+Relation projection has an append path and live tests, but nothing emits
+relation attestations. The current source does implement the bounded
+PUBLIC-03 publication identity and planned AWS task input separation; those
+Terraform changes have not been applied.
 
 ## Purpose
 
@@ -59,12 +70,12 @@ specification.
 |---|---|---|
 | Corpus | Bounded NDJSON is synchronously embedded and upserted through a trusted seed path | Bootstrap plus projections from an immutable event stream |
 | Repository | Current coordinate-addressed chunks with exact source links | Content-addressed versions plus commit/ref membership |
-| Evidence | Searchable chunks and exact hash-bound claim support | First-class immutable provider and collector evidence |
-| Claims | Deliberate typed claims with validity and source support | Propositions with modality, authority, applicability, and derivation |
-| Conflicts | Versioned functional-key exact-value/polarity conflicts | A generalized, non-destructive discrepancy ledger |
+| Evidence | Searchable chunks, exact hash-bound claim support, and accepted git, transcript, and CI evidence searchable as `recall(kind=evidence)` | First-class immutable provider and collector evidence |
+| Claims | Deliberate typed claims with validity and source support; one predicate can be asserted event-first with modality and applicability | Propositions with modality, authority, applicability, and derivation |
+| Conflicts | Versioned functional-key exact-value/polarity conflicts, plus verified `spec_nonconformance` episodes in a separate discrepancy ledger | A generalized, non-destructive discrepancy ledger |
 | Links | Claim-to-claim relationships are reserved in the schema | Heterogeneous provenance links and separately graded causal hypotheses |
-| Events | Claim mutation audit events | Authenticated, versioned, replayable evidence inbox and outbox |
-| Availability | Embedding completes before a corpus row is searchable | Lexical availability first; dense projection asynchronously follows |
+| Events | Claim mutation audit events, plus an append-only accepted-event ledger for asserted claims, connector evidence, and observer runs | Authenticated, versioned, replayable evidence inbox and outbox |
+| Availability | Embedding completes before a corpus row is searchable; connector evidence is searchable lexically before its dense projection | Lexical availability first; dense projection asynchronously follows |
 | Runtime | CloudWatch application logs and deployment receipts outside memory | Bounded observation, alert, incident, action, and verification receipts |
 | Public surface | Read-only routes plus a source-enforced publication database/IAM input boundary | Permanently isolated, least-privilege publication plane across the broader dynamic system |
 
@@ -730,9 +741,11 @@ command (cron or a scheduled task). The git and CI steps shell out to `git` and
 projection and embedding can run in the container.
 
 Apart from evidence recall, which `serve` reads, none of these modules is
-reachable from the serving process; outside tests, only the worker subcommand
-and `ostk-observer-run` run any of them. The accepted-event append seam
-they use is the Stage-4 one, unchanged. There
+reachable from the serving process. Outside tests, only the worker
+subcommand, `ostk-spec check` (which appends a spec blob through the git
+connector's drain and an observer run), and `ostk-observer-run` run any of
+them. The accepted-event append seam they use is the Stage-4 one, unchanged.
+There
 is still no webhook, no transport queue, no remote connector cursor, no
 dead-letter path for a remote delivery, and no acknowledgement protocol:
 everything here reads local material on the private plane.
@@ -854,6 +867,15 @@ Late or corrective evidence about the same effective interval appends to the
 same episode. A recurrence after a resolved interval creates a new occurrence
 linked by the stable discrepancy-family fingerprint. Verification state is
 separate from lifecycle and changes without erasing lifecycle events.
+
+**Implemented (Stage 6).** Only `spec_nonconformance` is derived, by
+`ostk-spec check`, into the migration-0027 ledger
+([ADR 0007](adr/0007-spec-conformance-chain.md)). `claim_conflict` stays in
+the ADR 0004 conflict ledger with no bridge into 0027, and
+`recall(discrepancies)` is a separate read from `recall(conflicts)`. Of the
+lifecycle transitions, only `resolved` and `dismissed` have an operator path
+(`ostk-spec episode resolve|dismiss`); acknowledgement and waiver are
+deferred.
 
 ## Runtime observations and incidents
 
@@ -1025,40 +1047,44 @@ This does not require or authorize dynamic ingestion.
    synchronous `remember` atomically append its event and projection. Prove
    immutability, scope binding, replay, and verified-versus-declared behavior.
 
-   Partially implemented. Landed: migration 0018 (the evidence event/head pair,
-   the quarantine table, the governed content table, the relation-projection
-   pair, and the read-only writer-authority view); the generic accepted-event
-   append seam with quarantine on integrity collision and preimage
-   disagreement, exact-replay no-op, and per-shard chain audit; the
-   writer-authority head witness read inside the append transaction; evidence
-   v2 admission against the witnessed active package with a governed,
-   content-addressed, per-object-encrypted content object committed in the same
-   serializable transaction; relation-attestation append with an atomic durable
-   projection and a monotonic per-edge watermark; the
-   `remember(action="assert")` event-first route, wired beside the
-   byte-identical `record` path but fenced off — it fails closed until the
-   deployment carries the writer-authority configuration pins and a non-stub
-   in-transaction witness (ADR 0002 D3/D4); the private bootstrap-manifest
-   import CLI that admits legacy chunks, claims, conflicts, and receipts as one
-   signed, content-addressed event; and the repeatable generic `N -> N+1`
-   registry activation runtime with its private workstation CLI. These
-   evidence, content, relation, and witness modules compile into the library
-   but are not yet reachable from the running server; each has live
-   CockroachDB tests. Still absent: enabling the `assert` route so synchronous
-   `remember` itself appends-and-projects in one transaction (the configuration
-   pins plus a witness loader that mints accepted events); and wiring any of these
-   dormant modules into a serving path. The Stage-5 connectors and projectors
-   below have since landed on those same dormant terms.
+   Implemented on the private writer. Landed: migration 0018 (the evidence
+   event/head pair, the quarantine table, the governed content table, the
+   relation-projection pair, and the read-only writer-authority view); the
+   generic accepted-event append seam with quarantine on integrity collision
+   and preimage disagreement, exact-replay no-op, and per-shard chain audit;
+   the writer-authority head witness read inside the append transaction,
+   which recognizes exactly the compiled generation-1 and generation-2
+   packages by digest; evidence v2 admission against the witnessed active
+   package with a governed, content-addressed, per-object-encrypted content
+   object committed in the same serializable transaction;
+   relation-attestation append with an atomic durable projection and a
+   monotonic per-edge watermark; `ostk-authority-install`, which takes one
+   physical scope to an active generation-2 head and prints the pins every
+   event-first writer loads through `WriterAuthorityRuntime`; the
+   `remember(action="assert")` route, which `serve` serves when those pins
+   verify: one serializable transaction re-reads the head, appends
+   `memory.claim.accepted`, and writes the claim projection, conflict
+   detection, and receipt of the byte-identical `record` path (ADR 0002 D3/D4
+   as amended by ADR 0005); the private bootstrap-manifest import CLI that
+   admits legacy chunks, claims, conflicts, and receipts as one signed,
+   content-addressed event; and the repeatable generic `N -> N+1` registry
+   activation runtime with its private workstation CLI. Each has live
+   CockroachDB tests. Still absent: any emitter of relation attestations;
+   event-first retraction, supersession, and correction (the lifecycle acts on
+   an asserted claim's projection only); more than one assertable predicate;
+   and deployment-keyed governance, because every signature from generation 1
+   on is made with public fixture keys and is nominal (ADR 0005 D2).
 5. Project one local transcript connector and one Git history connector into
    content-addressed repository membership and lexical-first/dense-later evidence
    with local cursors and coverage receipts. Arrow IPC may carry bounded batches
    between collectors, projectors, embedding workers, and replay scanners, but
    canonical accepted-event bytes remain the identity and signature authority.
 
-   Implemented, private only. Landed: a generation-2 semantically-closed target
-   package that binds two connector instances, a connector-instance-cursor
-   coverage proof, and a parser contract by content digest, together with its
-   live `1 -> 2` activation through the Wave-1 generic successor runtime;
+   Implemented on the private plane. Landed: a generation-2
+   semantically-closed target package that binds two connector instances, a
+   connector-instance-cursor coverage proof, and a parser contract by content
+   digest, together with its live `1 -> 2` activation through the Wave-1
+   generic successor runtime;
    migration 0019 and the body projector (content-addressed bodies, chunk
    occurrences and spans, parse-run manifests, commit/ref membership, and
    compare-and-swap parser generation pointers) with a per-shard cursor that
@@ -1072,7 +1098,12 @@ This does not require or authorize dynamic ingestion.
    matches a secret shape; the git history connector, whose ref-observation log
    is append-only and whose ancestry claim type carries exactly one variant; and
    migration 0023's per-row visibility class, enforced inside the recall SQL and
-   behind two filtered publication views.
+   behind two filtered publication views; the memory worker
+   (`ostk-fleet-recall worker --once`), with migration 0030's per-source status
+   rows and the production `ChunkEmbedderProvider`; and evidence recall, which
+   `serve` answers as `recall(kind=evidence)` with readiness, each source's
+   status and newest coverage cursor, and an absence verdict defined over the
+   lexical tier (ADR 0006).
 
    Still absent at this stage: any Arrow IPC transport — the registry reserves
    an `arrow_batch_schema` entry kind, but no Arrow encoder, decoder, or
@@ -1084,18 +1115,29 @@ This does not require or authorize dynamic ingestion.
    which is a deployment action that has not been performed.
 6. Admit one exhaustive code/spec observer and add basic discrepancy derivation.
 
-   Implemented, private only. Landed: migration 0024 and the normative
-   activation runtime (a per-binding-family composite compare-and-set head, an
-   append-only normative log of lifecycle events and contest records, and the
-   active-normative projection advanced atomically with its cursor); the
-   exhaustive observer runtime and its private `ostk-observer-run` worker,
+   Implemented for `spec_nonconformance`. Landed: migration 0024 and the
+   normative activation runtime (a per-binding-family composite compare-and-set
+   head, an append-only normative log of lifecycle events and contest records,
+   and the active-normative projection advanced atomically with its cursor);
+   the exhaustive observer runtime and its private `ostk-observer-run` worker,
    which evaluates one enum at one exact commit and blob and admits a run
    receipt plus a typed observer result through the evidence admission seam;
-   and migration 0027 and the discrepancy ledger runtime (a per-episode head,
-   an append-only episode log, family-keyed episode relations, and a
-   deterministic episode projection advanced atomically with its log). Still
-   absent: glue that feeds observer results and active normative bindings into
-   discrepancy derivation, and any serving path.
+   migration 0027 and the discrepancy ledger runtime (a per-episode head, an
+   append-only episode log, family-keyed episode relations, and a
+   deterministic episode projection advanced atomically with its log); and the
+   spec conformance chain that connects them (ADR 0007). `ostk-spec draft`,
+   `approve`, and `activate` make one expectation (an enum in a Rust source
+   file must or must not declare a member) normative under the witnessed
+   registry head, recording the canonical statement in migration 0031.
+   `ostk-spec check` reads a commit through the memory worker's git source,
+   runs the genesis-admitted observer, records every comparison in migration
+   0031's check history, and opens a `spec_nonconformance` episode only for a
+   verified nonconformance. `ostk-spec episode resolve|dismiss` closes one,
+   and `serve` lists episodes and each spec's latest check as
+   `recall(discrepancies)`. Still absent: a `closed_world_verified` observer
+   admission, without which no check verifies absence or closes an episode;
+   package admission of the compiled comparator lineage and episode policy
+   (DISC-06); discrepancy lifecycle over MCP; and every other finding type.
 7. Add authenticated private ingress, durable queueing, remote connector
    cursors, and dead-letter/quarantine behavior.
 8. Add provider-verified PR, CI, artifact, and deployment relations.
@@ -1354,6 +1396,18 @@ events governed by the same active policy. Normal policy forbids effective time
 before accepted time; an exceptional retroactive correction requires a
 separately named higher-threshold policy, appends a new bitemporal
 interpretation, and preserves every prior as-known conclusion.
+
+**Implemented (Stage 6).** `ostk-spec draft|approve|activate` implements this
+for one proposition shape: exact byte spans of a spec document at one commit,
+bound to the expectation that an enum in a Rust source file declares, or does
+not declare, one member. The proposal must name the exact witnessed registry
+head, and activation verifies the approvals under the active package's
+activation policy with the database's clock as `accepted_at`. That policy's
+signers are the public fixture keys, so approval is nominal and the real gate
+is the writer credential. A family's head keeps the registry digests it was
+last advanced under, so after a registry transition no further statement can
+be activated into it; rebasing is deferred (ADR 0007 D10 and D11).
+Retirement, waivers, and retroactive corrections are not implemented.
 
 ### Evidence ledger, retention, archive, and erasure
 
@@ -1622,6 +1676,17 @@ Updating observer code, dependencies, parser, build features, admitted domain,
 or coverage method requires a new admission and activation; the observer cannot
 admit itself.
 
+**Implemented (Stage 6).** The genesis package admits one observer, the Rust
+enum-membership observer for `mcp.remember.allowed_actions`, as
+`positive_verified`, and no `closed_world_verified` admission exists.
+`ostk-observer-run` and `ostk-spec check` run it. A spec check therefore
+verifies a member present but never absent: an expectation that a member be
+absent can be found violated, never satisfied, and a missing member checks
+as `unknown`. `ostk-spec check` copies the observer's runtime declaration
+from the admission instead of measuring the running binary (`ostk-observer-run`
+at least takes the executable digest from its operator), so the provenance
+its results name is nominal (ADR 0007 D6 and D10).
+
 ### Discrepancy families and episodes
 
 A discrepancy-family fingerprint binds tenant/project, finding type, canonical
@@ -1675,6 +1740,21 @@ compatibility, supersession, retirement, or scope exit records a resolved end.
   a separate deployment-scoped regression candidate or causal hypothesis.
 
 Lifecycle state and verification state therefore never define episode identity.
+
+**Implemented (Stage 6, `spec_nonconformance` only).** A family is one
+statement about one repository, with applicability `repository_commit: any`,
+so every commit judged against one statement falls in one family. A new
+episode's opening source fact is the observer event of the check that opens
+it, but a family holds at most one standing episode: a check first joins the
+episode that a prior nonconforming check of the same commit named, then the
+family's standing episode, and only then opens one, deciding the last two
+inside the append transaction. A re-check of a commit already judged
+nonconforming therefore never reopens a closed episode, even after a registry
+head change mints new events for it. The episode policy is
+non-windowed, and because no admitted observer verifies compatibility, only
+an operator closes an episode. The comparator lineage and episode policy are
+compiled in rather than package-admitted (the DISC-06 deferral) and are never
+edited in place (ADR 0007 D3, D5, and D7).
 
 ### Telemetry receipts and bounded exemplars
 
