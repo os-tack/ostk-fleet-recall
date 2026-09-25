@@ -10,6 +10,7 @@ pub mod bootstrap_manifest;
 pub mod canonical;
 pub mod causal;
 pub mod chunk_identity;
+pub mod collected_item;
 pub mod common;
 pub mod consolidation;
 pub mod control;

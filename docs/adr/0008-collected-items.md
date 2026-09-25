@@ -3,8 +3,12 @@
 - Status: accepted; D1 to D3 implemented. The generation-3 registry package
   is checked in, the strict witness recognizes it, and
   `ostk-authority-install apply --target generation-3` activates it and
-  rebases the scope's normative families onto it. No collector, sink, or
-  recall surface uses it yet; those land with their own decisions.
+  rebases the scope's normative families onto it. The collected-item
+  envelope, its identity digests, and the pure collector pipeline (sanitizer,
+  redactor, audience decision, splitter, and the `connector.collected.<mode>`
+  binding) exist and are unit-tested (see "The envelope" below), but no sink,
+  collector, or recall surface uses them yet; those land with their own
+  decisions.
 - Date: 2026-09-25
 - Scope: how specs and documents, Slack conversations, Linear tickets,
   Granola meetings, and anything else a collector can read become evidence
@@ -80,6 +84,25 @@ package, so the composition can never drift from what heads name.
 **What would need a generation 4.** A new trust channel, per-connector
 governance, an identity change that allows continuing-entity URIs, or a
 change to any carried entry. Nothing a new provider needs.
+
+**The envelope.** Every collector produces the same
+`CollectedItemEnvelopeV1` (`src/memory_contracts/collected_item.rs`), media
+type `application.ostk-collected-item-v1`: canonical JSON with no scope field,
+whose title and text are the lowercase hex of sanitized, redacted UTF-8, so a
+canonical envelope has no raw newline and the body projector reads it as
+exactly one body. Identity keeps the generation-2 pattern: `item_key` (provider,
+scope, object kind, external id) gives continuity across versions;
+`version_key` adds the version marker, lifecycle, and content digest; and the
+`immutable_revision`, which is also the staging id and the only locator
+coordinate of `identity.collected.item_version`, adds the channel, a capture's
+attesting principal, and the part. A capture and a pull of one message are
+therefore separate source facts, two agents' captures are two attestations,
+and renaming a channel or a team mints nothing. Where a provider has no version
+marker of its own, the marker is `o<order_micros>:sha256:<content digest>`, so
+reverting content from A to B and back to A is a third version. Golden vectors
+are checked in beside the package (`vectors.jsonl`). The collected lexical
+rendering indexes the title, text, author display name, container label, and
+link labels, never an id or a digest, and a tombstone indexes nothing.
 
 ## D2 — Generation 3 is opt-in, and the rollout order is fixed
 

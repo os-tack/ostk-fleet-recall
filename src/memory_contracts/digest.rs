@@ -426,6 +426,29 @@ pub enum DigestDomain {
     /// family's composite head moved from one registry head to another with
     /// its live statements unchanged, framed over its canonical bytes.
     NormativeHeadRebaseV1,
+    /// ADR 0008. `item_key`: the provider, the provider's scope, the object
+    /// kind, and the provider-stable external id of one collected item. Every
+    /// version of the item shares it, and no mutable label enters it.
+    CollectedItemKeyV1,
+    /// ADR 0008. Content identity of one collected item version: its redacted,
+    /// sanitized title and text. A part's own digest is the same framing over
+    /// the part's text, so a one-part item's part digest is its content digest.
+    CollectedItemContentV1,
+    /// ADR 0008. `version_key`: the item key, the version marker, the
+    /// lifecycle, and the content digest. New content under an unchanged
+    /// marker is a new version.
+    CollectedItemVersionV1,
+    /// ADR 0008. `immutable_revision`, which is also the staging id: one part of
+    /// one version, collected through one channel, attested by one principal
+    /// when the channel is capture.
+    CollectedItemRevisionV1,
+    /// ADR 0008. `container_key`: the provider, the provider's scope, and the
+    /// container's kind and provider-stable id. A container's label is not in it.
+    CollectedContainerKeyV1,
+    /// ADR 0008. Content address of exactly which item versions one collector
+    /// reconciliation pass admitted, in order: the `source_digest` a coverage
+    /// receipt records.
+    CollectedObservationManifestV1,
 }
 
 impl DigestDomain {
@@ -600,6 +623,12 @@ impl DigestDomain {
             Self::SpecCompiledEntryVectorsV1 => "ostk-spec-compiled-entry-vectors-v1",
             // --- Collected items (ADR 0008) prefixes ---
             Self::NormativeHeadRebaseV1 => "ostk-normative-head-rebase-v1",
+            Self::CollectedItemKeyV1 => "ostk-collected-item-key-v1",
+            Self::CollectedItemContentV1 => "ostk-collected-item-content-v1",
+            Self::CollectedItemVersionV1 => "ostk-collected-item-version-v1",
+            Self::CollectedItemRevisionV1 => "ostk-collected-item-revision-v1",
+            Self::CollectedContainerKeyV1 => "ostk-collected-container-key-v1",
+            Self::CollectedObservationManifestV1 => "ostk-collected-observation-manifest-v1",
         }
     }
 }

@@ -344,3 +344,133 @@ fn a_canonical_json_body_projects_to_its_golden_lexical_text() {
         "5dda1dcef6e53c4fe287de13dcdda30a0966c6c17fcf4ba89a2aa35f3a070be6",
     );
 }
+
+// --- Collected items (ADR 0008) ---
+
+fn collected_envelope(
+    lifecycle: crate::memory_contracts::collected_item::ItemLifecycleV1,
+) -> Vec<u8> {
+    use crate::collectors::draft::{
+        CollectedItemDraftV1, DraftAuthorV1, DraftContainerV1, DraftLinkV1, DraftSectionV1,
+        SealContextV1, collection_record, seal,
+    };
+    use crate::memory_contracts::collected_item::{
+        AudienceBasisV1, AuthorKindV1, CollectionModeV1, ContainerKindV1, LinkRelV1, ObjectKindV1,
+        ProviderKindV1, TextFormatV1,
+    };
+    use crate::memory_contracts::common::ContractId;
+
+    let draft = CollectedItemDraftV1 {
+        provider: ProviderKindV1::new("linear").unwrap(),
+        provider_scope_id: "0a9c0000-0000-4000-8000-0000000ac3e1".into(),
+        object_kind: ObjectKindV1::new("issue").unwrap(),
+        external_id: "7c3e1a52-9b4d-4f6e-8a21-3d5c7e9f1b20".into(),
+        marker: Some("2026-09-22T09:41:07.113Z".into()),
+        order_micros: 1_790_070_067_113_000,
+        lifecycle,
+        container: Some(DraftContainerV1 {
+            kind: ContainerKindV1::new("linear.team").unwrap(),
+            id: "4e6b8d0f-1a2b-4c3d-9e8f-7a6b5c4d3e2f".into(),
+            label: Some("ENG".into()),
+        }),
+        thread: None,
+        author: Some(DraftAuthorV1 {
+            id: "a11ce000-0000-4000-8000-000000000001".into(),
+            display: Some("alice".into()),
+            kind: AuthorKindV1::Human,
+        }),
+        created_at: None,
+        updated_at: None,
+        title: Some("Cap worker retries".into()),
+        sections: vec![DraftSectionV1::whole(
+            "Retry budget is **5**\nwith full jitter.".into(),
+        )],
+        text_format: TextFormatV1::Markdown,
+        links: vec![DraftLinkV1 {
+            rel: LinkRelV1::new("project").unwrap(),
+            target: "linear.project:9e0b1c2d-0000-4000-8000-0000000000a1".into(),
+            label: Some("Ingest reliability".into()),
+        }],
+        provider_url: Some("https://linear.app/acme-robotics/issue/ENG-412".into()),
+        visibility: None,
+    };
+    let redactor = crate::collectors::test_support::redactor();
+    let collection = collection_record(
+        CollectionModeV1::Pull,
+        ContractId::new("linear.acme").unwrap(),
+        None,
+        None,
+    )
+    .unwrap();
+    let sealed = seal(
+        &draft,
+        &SealContextV1 {
+            redactor: &redactor,
+            audience: AudienceBasisV1::TeamPublic,
+            collection: &collection,
+        },
+    )
+    .unwrap();
+    sealed.parts[0].canonical_envelope.clone()
+}
+
+#[test]
+fn a_collected_item_renders_text_first_and_skips_its_identity() {
+    use crate::memory_contracts::collected_item::{COLLECTED_ITEM_MEDIA_TYPE, ItemLifecycleV1};
+    let body = collected_envelope(ItemLifecycleV1::Live);
+    let projection = projection_of(COLLECTED_ITEM_MEDIA_TYPE, &body);
+    assert_eq!(projection.state, LexicalStateV1::Indexed);
+    assert_eq!(
+        projection.text,
+        "Cap worker retries Retry budget is **5** with full jitter. alice ENG Ingest reliability"
+    );
+    let envelope = String::from_utf8(body).unwrap();
+    for identity in [
+        "7c3e1a52",
+        "0a9c0000",
+        "4e6b8d0f",
+        "a11ce000",
+        "9e0b1c2d",
+        "linear.acme",
+        "team_public",
+        "https://linear.app",
+    ] {
+        assert!(
+            envelope.contains(identity),
+            "the envelope carries {identity}"
+        );
+        assert!(
+            !projection.text.contains(identity),
+            "the searchable text indexed {identity}"
+        );
+    }
+}
+
+#[test]
+fn a_collected_tombstone_carries_no_searchable_text() {
+    use crate::memory_contracts::collected_item::{COLLECTED_ITEM_MEDIA_TYPE, ItemLifecycleV1};
+    let body = collected_envelope(ItemLifecycleV1::Deleted);
+    let projection = projection_of(COLLECTED_ITEM_MEDIA_TYPE, &body);
+    assert_eq!(
+        projection.state,
+        LexicalStateV1::Unindexable(LexicalUnindexableReasonV1::EmptyAfterNormalization)
+    );
+}
+
+#[test]
+fn a_collected_render_leaves_every_other_media_type_alone() {
+    use crate::memory_contracts::collected_item::{COLLECTED_ITEM_MEDIA_TYPE, ItemLifecycleV1};
+    // The same bytes under an undeclared media type normalize raw, exactly as
+    // before: the branch is selected by the media type, never by the body.
+    let body = collected_envelope(ItemLifecycleV1::Live);
+    assert_ne!(
+        projection_of(COLLECTED_ITEM_MEDIA_TYPE, &body).text,
+        projection(&body).text
+    );
+    // A collected media type over a body that is not an envelope falls back
+    // to raw normalization rather than failing.
+    assert_eq!(
+        projection_of(COLLECTED_ITEM_MEDIA_TYPE, b"not json at all").text,
+        "not json at all"
+    );
+}

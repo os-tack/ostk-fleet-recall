@@ -41,3 +41,26 @@ cargo test --lib -- --ignored regenerate_generation_three_package
 
 which rewrites this file and prints the new digest to pin in the tests and in
 ADR 0008.
+
+## Golden identity vectors
+
+`vectors.jsonl` holds one canonical record per line, each one part of one
+collected item sealed through the collector pipeline
+(`src/collectors/draft.rs`): the exact `CollectedItemEnvelopeV1` and the
+digests it must derive (`item_key`, `version_key`, `immutable_revision`, and
+`container_key`), under the domains `ostk-collected-item-key-v1`,
+`ostk-collected-item-content-v1`, `ostk-collected-item-version-v1`,
+`ostk-collected-item-revision-v1`, and `ostk-collected-container-key-v1`. The
+cases cover a pulled Slack message, the same message captured by two agents
+(one version, three revisions), an imported Linear issue with its provider
+marker, a two-part document under the default marker, and a revoked tombstone.
+
+Two tests hold them: the contract test re-derives every digest from the
+envelope alone, and the pipeline test seals the same drafts again and requires
+these exact bytes. An envelope stored as evidence is identity-bearing, so a
+deliberate change is a new envelope schema or redaction profile, regenerated
+with
+
+```bash
+cargo test --lib -- --ignored regenerate_collected_item_vectors
+```

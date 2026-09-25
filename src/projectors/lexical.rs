@@ -62,6 +62,7 @@ use std::borrow::Cow;
 
 use unicode_normalization::UnicodeNormalization as _;
 
+use crate::memory_contracts::collected_item::{COLLECTED_ITEM_MEDIA_TYPE, ItemLifecycleV1};
 use crate::memory_contracts::digest::{DigestDomain, Sha256Digest, body_digest, framed_digest};
 // The crate's one secret scanner and its replacement discipline: the shapes it
 // matches are credentials wherever they appear, and the recall plane needs
@@ -91,6 +92,9 @@ pub const CANONICAL_JSON_MEDIA_TYPE: &str = "application.json";
 /// normalization rather than recursing.
 const MAX_RENDER_DEPTH: u32 = 32;
 
+/// A collected-item envelope ([`COLLECTED_ITEM_MEDIA_TYPE`]) is rendered by
+/// its own branch, [`render_collected_item`]: text first, identity skipped.
+///
 /// Keys whose JSON string value is lowercase hex of verbatim provider bytes,
 /// per media type, sorted so lookup is a binary search.
 ///
@@ -168,6 +172,69 @@ fn render_value(
     true
 }
 
+/// One hex-encoded collected text field, decoded; lossy on purpose, as the
+/// declared git fields are, so a body this build did not write still yields
+/// deterministic text.
+fn collected_text(value: Option<&serde_json::Value>) -> Option<String> {
+    let bytes = hex::decode(value?.as_str()?).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The searchable text of one collected-item envelope, text first.
+///
+/// A collected body is an envelope, and most of an envelope is identity:
+/// digests, ids, a marker, the audience basis, the collector instance.
+/// Indexing those would let a digest outweigh a word, so the render keeps only
+/// what a reader would type: the title and the text (both hex-decoded), then
+/// the author's display name, the container label, and the link labels. Ids,
+/// digests, kinds, and link targets are skipped.
+///
+/// `None` when the body is not a JSON object, which falls back to raw-byte
+/// normalization like any undeclared body.
+fn render_collected_item(body_bytes: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(body_bytes).ok()?;
+    let envelope = value.as_object()?;
+    let mut rendered = String::new();
+    // A tombstone is metadata only; it contributes no searchable text, so a
+    // deleted item's author and container never answer a query as if they
+    // were its content.
+    if envelope
+        .get("lifecycle")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|lifecycle| ItemLifecycleV1::parse(lifecycle).ok())
+        .is_some_and(ItemLifecycleV1::is_tombstone)
+    {
+        return Some(rendered);
+    }
+    for field in ["title", "text"] {
+        if let Some(text) = collected_text(envelope.get(field)) {
+            push_word(&mut rendered, &text);
+        }
+    }
+    let display = envelope
+        .get("author")
+        .and_then(|author| author.get("display"))
+        .and_then(serde_json::Value::as_str);
+    let label = envelope
+        .get("container")
+        .and_then(|container| container.get("label"))
+        .and_then(serde_json::Value::as_str);
+    for word in [display, label].into_iter().flatten() {
+        push_word(&mut rendered, word);
+    }
+    let links = envelope
+        .get("links")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten();
+    for link in links {
+        if let Some(label) = link.get("label").and_then(serde_json::Value::as_str) {
+            push_word(&mut rendered, label);
+        }
+    }
+    Some(rendered)
+}
+
 /// The bytes the normalizer runs over for one body.
 ///
 /// A declared media type whose body parses as JSON is rendered; anything else —
@@ -175,6 +242,11 @@ fn render_value(
 /// [`MAX_RENDER_DEPTH`] — falls back to the raw body bytes, which is the
 /// version-1 behaviour and never loses a body.
 fn searchable_source<'body>(media_type: &str, body_bytes: &'body [u8]) -> Cow<'body, [u8]> {
+    if media_type == COLLECTED_ITEM_MEDIA_TYPE {
+        return render_collected_item(body_bytes).map_or(Cow::Borrowed(body_bytes), |rendered| {
+            Cow::Owned(rendered.into_bytes())
+        });
+    }
     let Some(fields) = declared_text_fields(media_type) else {
         return Cow::Borrowed(body_bytes);
     };

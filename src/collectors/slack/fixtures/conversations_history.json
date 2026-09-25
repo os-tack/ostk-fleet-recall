@@ -1,0 +1,109 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "type": "message",
+      "subtype": "file_share",
+      "user": "U07BOB0002",
+      "ts": "1790068531.002000",
+      "client_msg_id": "5b0c2f7e-2a61-4f0e-9f7a-0c1d2e3f4a5b",
+      "text": "Retry budget spec draft attached",
+      "files": [
+        {
+          "id": "F07SPEC0001",
+          "name": "retry-budget.md",
+          "title": "retry-budget.md",
+          "mimetype": "text/markdown",
+          "filetype": "markdown",
+          "size": 2211,
+          "url_private": "https://files.slack.com/files-pri/T07ACME0001-F07SPEC0001/retry-budget.md",
+          "permalink": "https://acme-robotics.slack.com/files/U07BOB0002/F07SPEC0001/retry-budget.md"
+        }
+      ],
+      "upload": false,
+      "team": "T07ACME0001"
+    },
+    {
+      "type": "message",
+      "subtype": "bot_message",
+      "bot_id": "B07LINEAR01",
+      "app_id": "A07LINEARAP",
+      "username": "Linear",
+      "ts": "1790011800.000900",
+      "text": "",
+      "attachments": [
+        {
+          "fallback": "ENG-412 Cap worker retries",
+          "title": "ENG-412 Cap worker retries",
+          "title_link": "https://linear.app/acme-robotics/issue/ENG-412/cap-worker-retries",
+          "text": "Status: In Progress"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "subtype": "thread_broadcast",
+      "user": "U07CAROL003",
+      "ts": "1790007122.004300",
+      "thread_ts": "1790006645.000200",
+      "text": "Decision: retry budget is 5 attempts with jitter; <@U07ALICE001> will update ENG-412",
+      "root": {
+        "type": "message",
+        "user": "U07ALICE001",
+        "ts": "1790006645.000200",
+        "text": "Should the ingest worker retry budget be 3 or 5?"
+      },
+      "team": "T07ACME0001"
+    },
+    {
+      "type": "message",
+      "user": "U07ALICE001",
+      "ts": "1790006645.000200",
+      "client_msg_id": "0f9d8c7b-6a5e-4d3c-2b1a-0e9f8d7c6b5a",
+      "text": "Should the ingest worker retry budget be 3 or 5? cc <!subteam^S07PLAT001>",
+      "thread_ts": "1790006645.000200",
+      "reply_count": 2,
+      "reply_users_count": 2,
+      "latest_reply": "1790007122.004300",
+      "reply_users": [
+        "U07BOB0002",
+        "U07CAROL003"
+      ],
+      "is_locked": false,
+      "subscribed": false,
+      "edited": {
+        "user": "U07ALICE001",
+        "ts": "1790007611.000000"
+      },
+      "team": "T07ACME0001",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "a1B2c",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "Should the ingest worker retry budget be 3 or 5? cc "
+                },
+                {
+                  "type": "usergroup",
+                  "usergroup_id": "S07PLAT001"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "has_more": false,
+  "pin_count": 0,
+  "channel_actions_ts": null,
+  "channel_actions_count": 0,
+  "response_metadata": {
+    "next_cursor": ""
+  }
+}

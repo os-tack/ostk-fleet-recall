@@ -1,0 +1,152 @@
+{
+  "data": {
+    "organization": {
+      "id": "0a9c0000-0000-4000-8000-0000000ac3e1",
+      "urlKey": "acme-robotics",
+      "name": "Acme Robotics"
+    },
+    "issues": {
+      "nodes": [
+        {
+          "id": "7c3e1a52-9b4d-4f6e-8a21-3d5c7e9f1b20",
+          "identifier": "ENG-412",
+          "number": 412,
+          "title": "Cap worker retries",
+          "description": "Retry budget for the ingest worker is **3** attempts, exponential backoff.\n\nSee #plat-eng thread.",
+          "priority": 2,
+          "url": "https://linear.app/acme-robotics/issue/ENG-412/cap-worker-retries",
+          "createdAt": "2026-09-18T10:02:11.482Z",
+          "updatedAt": "2026-09-22T09:41:07.113Z",
+          "archivedAt": null,
+          "canceledAt": null,
+          "completedAt": null,
+          "trashed": null,
+          "state": {
+            "id": "b1f0c2d3-0000-4000-8000-00000000a502",
+            "name": "In Progress",
+            "type": "started"
+          },
+          "team": {
+            "id": "4e6b8d0f-1a2b-4c3d-9e8f-7a6b5c4d3e2f",
+            "key": "ENG",
+            "name": "Engineering",
+            "visibility": "public"
+          },
+          "creator": {
+            "id": "a11ce000-0000-4000-8000-000000000001",
+            "displayName": "alice",
+            "email": "alice@acme-robotics.example"
+          },
+          "assignee": {
+            "id": "b0b00000-0000-4000-8000-000000000002",
+            "displayName": "bob"
+          },
+          "project": {
+            "id": "9e0b1c2d-0000-4000-8000-0000000000a1",
+            "name": "Ingest reliability"
+          },
+          "cycle": {
+            "id": "c7c1e000-0000-4000-8000-000000000014",
+            "number": 14
+          },
+          "parent": null,
+          "labels": {
+            "nodes": [
+              {
+                "id": "1abe1000-0000-4000-8000-000000000001",
+                "name": "reliability"
+              }
+            ]
+          },
+          "previousIdentifiers": [],
+          "comments": {
+            "nodes": [
+              {
+                "id": "d4e5f6a7-0000-4000-8000-00000000c001",
+                "body": "Slack thread concluded 5 with jitter — updating.",
+                "createdAt": "2026-09-21T16:40:00.000Z",
+                "updatedAt": "2026-09-21T16:40:00.000Z",
+                "editedAt": null,
+                "url": "https://linear.app/acme-robotics/issue/ENG-412/cap-worker-retries#comment-d4e5f6a7",
+                "user": {
+                  "id": "a11ce000-0000-4000-8000-000000000001",
+                  "displayName": "alice"
+                },
+                "parent": null,
+                "resolvedAt": null,
+                "botActor": null,
+                "externalUser": null
+              },
+              {
+                "id": "d4e5f6a7-0000-4000-8000-00000000c002",
+                "body": "Disagree, 3 keeps p99 under SLO. Let's discuss Monday.",
+                "createdAt": "2026-09-21T17:05:12.000Z",
+                "updatedAt": "2026-09-21T17:06:00.000Z",
+                "editedAt": "2026-09-21T17:06:00.000Z",
+                "url": "https://linear.app/acme-robotics/issue/ENG-412/cap-worker-retries#comment-d4e5f6a7",
+                "user": {
+                  "id": "b0b00000-0000-4000-8000-000000000002",
+                  "displayName": "bob"
+                },
+                "parent": {
+                  "id": "d4e5f6a7-0000-4000-8000-00000000c001"
+                },
+                "resolvedAt": null,
+                "botActor": null,
+                "externalUser": null
+              }
+            ],
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": "ZDRlNWY2YTctY20wMg"
+            }
+          },
+          "history": {
+            "nodes": [
+              {
+                "id": "4a570000-0000-4000-8000-000000000002",
+                "createdAt": "2026-09-22T09:41:07.113Z",
+                "actor": {
+                  "id": "a11ce000-0000-4000-8000-000000000001"
+                },
+                "fromStateId": null,
+                "toStateId": null,
+                "updatedDescription": true,
+                "fromTitle": null,
+                "toTitle": null,
+                "fromAssigneeId": null,
+                "toAssigneeId": null,
+                "addedLabelIds": null,
+                "removedLabelIds": null
+              },
+              {
+                "id": "4a570000-0000-4000-8000-000000000001",
+                "createdAt": "2026-09-19T08:00:00.000Z",
+                "actor": {
+                  "id": "b0b00000-0000-4000-8000-000000000002"
+                },
+                "fromStateId": "b1f0c2d3-0000-4000-8000-00000000a501",
+                "toStateId": "b1f0c2d3-0000-4000-8000-00000000a502",
+                "updatedDescription": null,
+                "fromTitle": null,
+                "toTitle": null,
+                "fromAssigneeId": null,
+                "toAssigneeId": "b0b00000-0000-4000-8000-000000000002",
+                "addedLabelIds": null,
+                "removedLabelIds": null
+              }
+            ],
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": "aDAwMDAwMDAtaHMwMQ"
+            }
+          }
+        }
+      ],
+      "pageInfo": {
+        "hasNextPage": true,
+        "endCursor": "N2MzZTFhNTItOWI0ZC00ZjZlLThhMjEtM2Q1YzdlOWYxYjIw"
+      }
+    }
+  }
+}

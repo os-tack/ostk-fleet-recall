@@ -1,0 +1,17 @@
+{
+  "notes": [
+    {
+      "id": "not_1d3tmYTlCICgjy",
+      "object": "note",
+      "title": "Ingest reliability sync",
+      "owner": {
+        "name": "Carol Diaz",
+        "email": "carol@acme-robotics.example"
+      },
+      "created_at": "2026-09-21T15:00:12.345Z",
+      "updated_at": "2026-09-21T15:41:09.001Z"
+    }
+  ],
+  "hasMore": false,
+  "cursor": null
+}

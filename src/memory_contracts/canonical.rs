@@ -450,7 +450,10 @@ fn validate_string(value: &str) -> ContractResult<()> {
     Ok(())
 }
 
-fn is_forbidden_scalar(value: char) -> bool {
+/// Whether the canonical profile refuses `value` inside any string: controls,
+/// noncharacters, and private-use scalars. Shared with the collected-item
+/// contract, whose bounded text fields must survive canonical encoding.
+pub(crate) fn is_forbidden_scalar(value: char) -> bool {
     let code = u32::from(value);
     value.is_control()
         || (0xfdd0..=0xfdef).contains(&code)

@@ -1,0 +1,10 @@
+{
+  "headers": {
+    "webhook-id": "msg_2mKr8fQxLp7Ta3Vb9Zc1",
+    "webhook-timestamp": "1790075101",
+    "webhook-signature": "v1,+xa5Twsvivw925js0HZafAYDkR+Kw6XweSENPUDE0KI=",
+    "Content-Type": "application/json"
+  },
+  "signing_secret": "whsec_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "raw_body": "{\"event_id\":\"evt_01J8ZC7Q2M5N8P3R6T9V1W4X7Y\",\"event_type\":\"note.edited\",\"note_id\":\"not_1d3tmYTlCICgjy\",\"occurred_at\":\"2026-09-22T11:05:00Z\",\"data\":{\"changed_fields\":[\"summary\"]}}"
+}

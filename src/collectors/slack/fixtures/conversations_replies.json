@@ -1,0 +1,40 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "type": "message",
+      "user": "U07ALICE001",
+      "ts": "1790006645.000200",
+      "thread_ts": "1790006645.000200",
+      "reply_count": 2,
+      "latest_reply": "1790007122.004300",
+      "text": "Should the ingest worker retry budget be 3 or 5? cc <!subteam^S07PLAT001>",
+      "edited": {
+        "user": "U07ALICE001",
+        "ts": "1790007611.000000"
+      }
+    },
+    {
+      "type": "message",
+      "user": "U07BOB0002",
+      "ts": "1790006860.001100",
+      "thread_ts": "1790006645.000200",
+      "parent_user_id": "U07ALICE001",
+      "client_msg_id": "9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b",
+      "text": "3 — see <https://linear.app/acme-robotics/issue/ENG-412|ENG-412>"
+    },
+    {
+      "type": "message",
+      "subtype": "thread_broadcast",
+      "user": "U07CAROL003",
+      "ts": "1790007122.004300",
+      "thread_ts": "1790006645.000200",
+      "parent_user_id": "U07ALICE001",
+      "text": "Decision: retry budget is 5 attempts with jitter; <@U07ALICE001> will update ENG-412"
+    }
+  ],
+  "has_more": false,
+  "response_metadata": {
+    "next_cursor": ""
+  }
+}

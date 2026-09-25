@@ -1,0 +1,25 @@
+{
+  "transcript": [
+    {
+      "speaker": {
+        "source": "microphone",
+        "attribution": "me",
+        "name": "Carol Diaz"
+      },
+      "text": "Okay, retry budget. Alice, you wanted five?",
+      "start_time": "2026-09-21T15:02:10.120Z",
+      "end_time": "2026-09-21T15:02:13.900Z"
+    },
+    {
+      "speaker": {
+        "source": "speaker",
+        "attribution": "them"
+      },
+      "text": "Five with jitter, three was too aggressive on flaky runners.",
+      "start_time": "2026-09-21T15:02:14.300Z",
+      "end_time": "2026-09-21T15:02:19.050Z"
+    }
+  ],
+  "hasMore": true,
+  "cursor": "eyJvZmZzZXQiOjJ9"
+}

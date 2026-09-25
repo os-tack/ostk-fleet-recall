@@ -9,6 +9,7 @@
 
 pub mod application;
 pub mod body_store;
+pub mod collectors;
 pub mod config;
 pub mod connectors;
 pub mod context;
