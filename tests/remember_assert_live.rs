@@ -14,7 +14,10 @@
 //! incompatible assertions open one conflict that the unchanged lifecycle
 //! acknowledges, while an intention never conflicts with an attestation; a
 //! refusal writes nothing and leaves its key free; the runtime role's
-//! existing grants suffice; and `record` is unchanged.
+//! existing grants suffice; and `record` is unchanged. On a generation-3 head
+//! (ADR 0008) an assertion appends the same way, keys to exactly the claim key
+//! the same input gets under generation 2, and conflicts and acknowledges
+//! through the unchanged lifecycle.
 //!
 //! Over MCP, composed as `serve` composes it, assert is advertised and served
 //! only where the writer-authority pins verify, beside or without the
@@ -29,7 +32,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, SubsecRound as _, Utc};
-use common::authority::{InstalledAuthority, install_generation_two, retry_policy};
+use common::authority::{InstalledAuthority, install_at, retry_policy};
 use common::runtime_role::RuntimeProbeRole;
 use ostk_fleet_recall::application::LifecycleServing;
 use ostk_fleet_recall::ledger::{
@@ -37,6 +40,8 @@ use ostk_fleet_recall::ledger::{
     ConflictTarget, LifecycleRefusal, RefusalCode,
 };
 use ostk_fleet_recall::mcp::{JsonRpcError, McpServer, tool_list_for};
+use ostk_fleet_recall::registry_activation::install::InstallTargetV1;
+use ostk_fleet_recall::registry_witness::KnownRegistryPackage;
 use ostk_fleet_recall::remember_runtime::{
     EventFirstAssert, RememberAssertInputV1, start_event_first_assert_with,
 };
@@ -89,8 +94,13 @@ struct AssertFleet {
 
 impl AssertFleet {
     async fn new(database_url: &str, label: &str) -> Self {
+        Self::new_at(database_url, label, InstallTargetV1::Generation2).await
+    }
+
+    /// The fleet over a fresh scope installed at `target`.
+    async fn new_at(database_url: &str, label: &str, target: InstallTargetV1) -> Self {
         let owner = common::migrated_pool(database_url).await;
-        let authority = install_generation_two(&owner, label).await;
+        let authority = install_at(&owner, label, target).await;
         let store = CockroachStore::from_pool(owner.clone(), authority.scope.clone())
             .expect("the installed scope is a valid store scope");
         store
@@ -653,6 +663,85 @@ async fn live_incompatible_assertions_by_two_agents_open_one_conflict_when_confi
         )
         .await
         .expect("an implicated agent may acknowledge");
+    assert!(acknowledged.applied);
+    assert_eq!(acknowledged.conflict_state, "open");
+}
+
+#[tokio::test]
+async fn live_assert_on_a_generation_three_head_keeps_its_key_and_lifecycle_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let two = AssertFleet::new(&database_url, "assert-generation-two-key").await;
+    let three = AssertFleet::new_at(
+        &database_url,
+        "assert-generation-three",
+        InstallTargetV1::Generation3,
+    )
+    .await;
+    assert_eq!(
+        three.authority.report.package,
+        KnownRegistryPackage::CollectedItemsGeneration3
+    );
+
+    let under_two = two
+        .ledger(AGENT_A)
+        .await
+        .assert_claim(&two.scope(AGENT_A), &attested(true), "assert-g2-a")
+        .await
+        .expect("an admissible assertion commits under generation 2");
+    let (scope_a, scope_b) = (three.scope(AGENT_A), three.scope(AGENT_B));
+    let (ledger_a, ledger_b) = (three.ledger(AGENT_A).await, three.ledger(AGENT_B).await);
+    let yes = ledger_a
+        .assert_claim(&scope_a, &attested(true), "assert-g3-a")
+        .await
+        .expect("an admissible assertion commits under generation 3");
+    assert_eq!(
+        ledger_a
+            .claim_accepted_event_id(&scope_a, yes.mutation.claim.id)
+            .await
+            .unwrap(),
+        Some(yes.accepted_event.event_id),
+        "the claim projects the event generation 3 accepted"
+    );
+    // Every recipe the key is derived under is carried byte for byte, so the
+    // same assertion keys identically on either generation.
+    assert_eq!(
+        yes.mutation.claim.claim_key, under_two.mutation.claim.claim_key,
+        "the claim key must not change with the generation"
+    );
+
+    let no = ledger_b
+        .assert_claim(&scope_b, &attested(false), "assert-g3-b")
+        .await
+        .expect("the incompatible assertion commits");
+    let [conflict_id] = no.mutation.conflicts_opened.as_slice() else {
+        panic!(
+            "the incompatible assertion opens one conflict: {:?}",
+            no.mutation.conflicts_opened
+        );
+    };
+    let conflicts = ledger_a
+        .conflicts_for_claim_ids(&scope_a, &[yes.mutation.claim.id, no.mutation.claim.id], 10)
+        .await
+        .unwrap();
+    let [conflict] = conflicts.as_slice() else {
+        panic!("both claims belong to one conflict: {conflicts:?}");
+    };
+    assert_eq!(conflict.id, *conflict_id);
+    let acknowledged = ledger_b
+        .acknowledge_conflict(
+            &scope_b,
+            ConflictTarget {
+                conflict_id: conflict.id,
+                expected_revision: conflict.revision,
+                expected_member_count: None,
+            },
+            Some("checking which environment is right"),
+            "assert-g3-ack",
+        )
+        .await
+        .expect("an implicated agent may acknowledge under generation 3");
     assert!(acknowledged.applied);
     assert_eq!(acknowledged.conflict_state, "open");
 }

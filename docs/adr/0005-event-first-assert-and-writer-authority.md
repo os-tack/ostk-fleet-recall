@@ -54,6 +54,17 @@ package needs either its own compiled-in bytes or an additive migration that
 exposes the canonical package through the view. Guessing would run admission
 rules the writer has never verified.
 
+**Amended by [ADR 0008](0008-collected-items.md) D1 and D2.** Generation 3
+took the first route: its canonical bytes are checked in at
+`contracts/dynamic-memory/v3/collected-items/registry-package.jsonl` and
+compiled in, and `KNOWN_PACKAGES` has a third row,
+`KnownRegistryPackage::CollectedItemsGeneration3`, so the witness now admits
+three packages. Generation 3 carries every generation-2 entry byte for byte,
+including every recipe a claim key (D5) is derived under, so a key survives
+that upgrade too. The installer (D2) reaches it only with
+`ostk-authority-install apply --target generation-3`; the default target
+stays generation 2, and no target moves a head backwards.
+
 ## D2 — The installer, and what its signatures are worth
 
 **Decision.** `ostk-authority-install apply` (workstation only, not in the

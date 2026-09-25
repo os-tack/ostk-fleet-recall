@@ -184,9 +184,10 @@ like the `ostk-fleet-recall` commands: the installer as the migrator, like
 - `ostk-observer-run` runs the exhaustive observer over one enum at one exact
   commit and emits a run receipt and typed observer result.
 - `ostk-authority-install` takes one physical scope to an active generation-2
-  registry head and prints the writer-authority pins. It runs as the schema
-  owner/migrator, like `migrate`, and its fixture-key signatures are nominal;
-  see the
+  registry head, or with `apply --target generation-3` to the generation-3
+  collected-items package ([ADR 0008](docs/adr/0008-collected-items.md)), and
+  prints the writer-authority pins. It runs as the schema owner/migrator, like
+  `migrate`, and its fixture-key signatures are nominal; see the
   [writer-authority installer](docs/CONTROL_BOOTSTRAP.md#writer-authority-installer).
 - `ostk-spec` runs the spec conformance chain (Stage 6):
   - `draft` binds exact byte spans of a spec document at one commit to a
@@ -1437,8 +1438,9 @@ is `#[ignore]` and documents its environment at the top of the file.
   [consolidation and conflict tolerance](docs/adr/0003-consolidation-and-conflict-tolerance.md),
   [serving conflict lifecycle](docs/adr/0004-serving-conflict-lifecycle.md),
   [event-first assert and writer authority](docs/adr/0005-event-first-assert-and-writer-authority.md),
-  [the Stage-5 worker and evidence recall](docs/adr/0006-stage5-worker-and-evidence-recall.md), and
-  [the spec conformance chain](docs/adr/0007-spec-conformance-chain.md).
+  [the Stage-5 worker and evidence recall](docs/adr/0006-stage5-worker-and-evidence-recall.md),
+  [the spec conformance chain](docs/adr/0007-spec-conformance-chain.md), and
+  [collected items from any source](docs/adr/0008-collected-items.md).
 - [Dynamic memory contract corpus](contracts/dynamic-memory/README.md).
 
 ## Cleanup

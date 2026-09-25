@@ -17,17 +17,26 @@
 //! from those pins: it starts and binds connectors under nothing but the
 //! runtime role's grants, refuses pins the head does not honor, and re-reads
 //! the head on every verification instead of trusting its startup read.
+//!
+//! And it proves generation 3 is opt-in and one-way (ADR 0008 D2): a fresh
+//! scope reaches it in one run with `--target generation-3`, a generation-2
+//! head that cannot bind a collected-item connector moves to it and then can,
+//! a re-run changes nothing, and the default target leaves a generation-3
+//! head where it is.
 
 mod common;
 
-use common::authority::{install_generation_two, retry_policy, semantic_scope};
+use common::authority::{
+    InstalledAuthority, install_generation_three, install_generation_two, retry_policy,
+    semantic_scope,
+};
 use common::runtime_role::RuntimeProbeRole;
 use ostk_fleet_recall::FleetError;
 use ostk_fleet_recall::config::WriterAuthorityConfig;
 use ostk_fleet_recall::control_log::{
     CockroachGenesisRepository, GenesisInspection, GenesisRepository as _, TrustedControlScope,
 };
-use ostk_fleet_recall::evidence_ledger::ActiveStage4Package;
+use ostk_fleet_recall::evidence_ledger::{ActiveStage4Package, EvidenceAdmissionError};
 use ostk_fleet_recall::memory_contracts::bootstrap::{
     BootstrapPin, BootstrapReceiptDigest, verify_pinned_bootstrap,
 };
@@ -38,13 +47,16 @@ use ostk_fleet_recall::memory_contracts::digest::{
     DigestDomain, Sha256Digest, domain_separated_digest,
 };
 use ostk_fleet_recall::memory_contracts::generation2_registry::GIT_CONNECTOR;
+use ostk_fleet_recall::memory_contracts::generation3_registry::COLLECTED_ITEM_FAMILY;
 use ostk_fleet_recall::registry_activation::install::{
-    AuthorityInstallRequestV1, InstallStepOutcomeV1, install_writer_authority,
+    AuthorityInstallRequestV1, InstallStepOutcomeV1, InstallStepV1, InstallTargetV1,
+    install_writer_authority,
 };
 use ostk_fleet_recall::registry_witness::{
     KnownRegistryPackage, WriterAuthorityError, WriterAuthorityRejection, WriterAuthorityRuntime,
-    WriterAuthorityStartError, compiled_genesis_package, load_and_verify,
+    WriterAuthorityStartError, WriterAuthorityWitness, compiled_genesis_package, load_and_verify,
 };
+use sqlx::PgPool;
 
 /// The one connector the frozen generation-1 package carries, which
 /// generation 2 carries forward.
@@ -74,6 +86,7 @@ async fn live_install_reaches_generation_two_and_the_strict_witness_accepts_it_w
         &AuthorityInstallRequestV1 {
             physical_scope: physical.clone(),
             semantic_scope: semantic.clone(),
+            target: InstallTargetV1::Generation2,
         },
         retry_policy(),
     )
@@ -249,6 +262,7 @@ async fn live_install_refuses_a_physical_scope_bootstrapped_without_a_head_when_
         let request = AuthorityInstallRequestV1 {
             physical_scope: physical.clone(),
             semantic_scope: semantic.clone(),
+            target: InstallTargetV1::Generation2,
         };
         let refusal = install_writer_authority(&pool, &request, retry_policy())
             .await
@@ -383,4 +397,229 @@ async fn live_runtime_bundle_starts_and_binds_connectors_when_configured() {
     assert_eq!(code.as_deref(), Some("42501"), "unexpected error: {error}");
 
     probe.drop_role(&pool).await;
+}
+
+// ---------------------------------------------------------------------------
+// Generation 3 (ADR 0008 D2).
+// ---------------------------------------------------------------------------
+
+/// Bind `connector` for admission out of `witness`'s head.
+fn bind(witness: &WriterAuthorityWitness, connector: &str) -> Result<(), EvidenceAdmissionError> {
+    let append_witness = witness
+        .to_append_witness()
+        .expect("the strict witness adapts to the append witness");
+    ActiveStage4Package::bind_connector(
+        witness.package().clone(),
+        &ContractId::new(connector).unwrap(),
+        witness.head_binding().clone(),
+        &append_witness,
+    )
+    .map(|_| ())
+}
+
+/// The strict witness under the pins `installed` printed.
+async fn witness(pool: &PgPool, installed: &InstalledAuthority) -> WriterAuthorityWitness {
+    load_and_verify(pool, &installed.scope, &installed.config)
+        .await
+        .expect("the strict witness must accept the installed head under the printed pins")
+}
+
+/// The steps a run reported, with their outcomes.
+fn steps(
+    report: &ostk_fleet_recall::registry_activation::install::AuthorityInstallReportV1,
+) -> Vec<(InstallStepV1, InstallStepOutcomeV1)> {
+    report
+        .steps
+        .iter()
+        .map(|step| (step.step, step.outcome))
+        .collect()
+}
+
+#[tokio::test]
+async fn live_install_generation_three_reaches_it_in_one_run_on_a_fresh_scope_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let installed = install_generation_three(&pool, "authority-generation-three").await;
+    assert_eq!(
+        steps(&installed.report),
+        [
+            InstallStepV1::ControlBootstrap,
+            InstallStepV1::GenesisActivation,
+            InstallStepV1::FirstSuccessor,
+            InstallStepV1::GenerationTwo,
+            InstallStepV1::GenerationThree,
+        ]
+        .map(|step| (step, InstallStepOutcomeV1::Inserted)),
+        "a fresh physical scope runs every step up to generation 3"
+    );
+    assert_eq!(
+        installed.report.package,
+        KnownRegistryPackage::CollectedItemsGeneration3
+    );
+    assert_eq!(installed.report.generation, 3);
+
+    let witness = witness(&pool, &installed).await;
+    assert_eq!(
+        witness.active_package().known(),
+        KnownRegistryPackage::CollectedItemsGeneration3
+    );
+    assert_eq!(witness.activation_id(), installed.report.activation_id);
+    assert!(witness.certifies_scope(&installed.scope));
+    // Every collected-item channel is admissible, and every connector
+    // generation 2 served still is.
+    for connector in COLLECTED_ITEM_FAMILY
+        .connectors()
+        .into_iter()
+        .chain([GIT_CONNECTOR.connector_schema, GITHUB_PUSH_CONNECTOR])
+    {
+        bind(&witness, connector).unwrap_or_else(|error| {
+            panic!("the generation-3 head must bind {connector} for admission: {error}")
+        });
+    }
+}
+
+#[tokio::test]
+async fn live_install_generation_three_moves_a_generation_two_head_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let installed = install_generation_two(&pool, "authority-two-to-three").await;
+
+    // Generation 2 is not opted in: a collected item has no connector to
+    // admit it under.
+    let before = witness(&pool, &installed).await;
+    for connector in COLLECTED_ITEM_FAMILY.connectors() {
+        assert!(
+            matches!(
+                bind(&before, connector),
+                Err(EvidenceAdmissionError::ConnectorNotInActivePackage)
+            ),
+            "a generation-2 head must not bind {connector}"
+        );
+    }
+
+    let mut request = installed.request();
+    request.target = InstallTargetV1::Generation3;
+    let moved = install_writer_authority(&pool, &request, retry_policy())
+        .await
+        .expect("a generation-2 head must move to generation 3");
+    assert_eq!(
+        steps(&moved),
+        [
+            (
+                InstallStepV1::ControlBootstrap,
+                InstallStepOutcomeV1::AlreadyPresent
+            ),
+            (
+                InstallStepV1::GenesisActivation,
+                InstallStepOutcomeV1::AlreadyPresent
+            ),
+            (
+                InstallStepV1::FirstSuccessor,
+                InstallStepOutcomeV1::AlreadyPresent
+            ),
+            (
+                InstallStepV1::GenerationTwo,
+                InstallStepOutcomeV1::AlreadyPresent
+            ),
+            (
+                InstallStepV1::GenerationThree,
+                InstallStepOutcomeV1::Inserted
+            ),
+        ]
+    );
+    assert_eq!(
+        moved.package,
+        KnownRegistryPackage::CollectedItemsGeneration3
+    );
+    assert_eq!(moved.generation, 3);
+    assert_eq!(
+        moved.pins, installed.report.pins,
+        "a writer keeps its pins across the move; only the head changes"
+    );
+    assert_ne!(moved.activation_id, installed.report.activation_id);
+
+    let after = witness(&pool, &installed).await;
+    assert_eq!(after.activation_id(), moved.activation_id);
+    for connector in COLLECTED_ITEM_FAMILY
+        .connectors()
+        .into_iter()
+        .chain([GIT_CONNECTOR.connector_schema])
+    {
+        bind(&after, connector).unwrap_or_else(|error| {
+            panic!("the moved head must bind {connector} for admission: {error}")
+        });
+    }
+}
+
+#[tokio::test]
+async fn live_install_generation_three_rerun_is_already_present_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let installed = install_generation_three(&pool, "authority-three-rerun").await;
+
+    let again = install_writer_authority(&pool, &installed.request(), retry_policy())
+        .await
+        .expect("a re-run over a generation-3 scope must succeed");
+    assert_eq!(
+        steps(&again),
+        steps(&installed.report)
+            .into_iter()
+            .map(|(step, _)| (step, InstallStepOutcomeV1::AlreadyPresent))
+            .collect::<Vec<_>>(),
+        "a re-run walks the same steps and writes nothing"
+    );
+    assert_eq!(again.pins, installed.report.pins);
+    assert_eq!(again.activation_id, installed.report.activation_id);
+    assert_eq!(again.generation, 3);
+    assert_eq!(
+        again.package,
+        KnownRegistryPackage::CollectedItemsGeneration3
+    );
+}
+
+#[tokio::test]
+async fn live_install_generation_three_is_not_downgraded_by_the_default_target_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let installed = install_generation_three(&pool, "authority-no-downgrade").await;
+
+    let mut request = installed.request();
+    request.target = InstallTargetV1::default();
+    let report = install_writer_authority(&pool, &request, retry_policy())
+        .await
+        .expect("the default target over a generation-3 head must succeed");
+    assert!(
+        report
+            .steps
+            .iter()
+            .all(|step| step.outcome == InstallStepOutcomeV1::AlreadyPresent),
+        "the default target must write nothing over a generation-3 head: {:?}",
+        report.steps
+    );
+    assert!(
+        report
+            .steps
+            .iter()
+            .any(|step| step.step == InstallStepV1::GenerationTwo),
+        "generation 2 is reported present, because the head is past it"
+    );
+    assert_eq!(
+        report.package,
+        KnownRegistryPackage::CollectedItemsGeneration3
+    );
+    assert_eq!(report.generation, 3);
+    assert_eq!(report.activation_id, installed.report.activation_id);
+
+    let witness = witness(&pool, &installed).await;
+    assert_eq!(witness.activation_id(), installed.report.activation_id);
+    bind(&witness, COLLECTED_ITEM_FAMILY.pull_connector)
+        .expect("the head still admits collected items");
 }

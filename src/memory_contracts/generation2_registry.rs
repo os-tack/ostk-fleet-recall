@@ -75,13 +75,13 @@ use super::{
 };
 
 /// Entry-body schema version every v1 registry body uses.
-const ENTRY_BODY_SCHEMA_VERSION: u32 = 1;
+pub(super) const ENTRY_BODY_SCHEMA_VERSION: u32 = 1;
 /// Registry-entry envelope schema version.
 const ENTRY_SCHEMA_VERSION: u32 = 1;
 /// Version every generation-2-only entry this module mints declares.
-const GENERATION_TWO_ENTRY_VERSION: u32 = 1;
+pub(super) const GENERATION_TWO_ENTRY_VERSION: u32 = 1;
 /// Connector schema v2 entry-body schema version.
-const CONNECTOR_ENTRY_SCHEMA_VERSION: u32 = 2;
+pub(super) const CONNECTOR_ENTRY_SCHEMA_VERSION: u32 = 2;
 
 /// The one coordinate every generation-2 source-object recipe hashes.
 ///
@@ -92,11 +92,11 @@ pub const SOURCE_OBJECT_COORDINATE: &str = "immutable_revision";
 /// Generation-1 entry ids this composition carries forward and depends on.
 const GEN1_PROVIDER_INSTANCE_RECIPE: &str = "identity.github.provider_instance";
 const GEN1_PROVIDER_NAMESPACE: &str = "namespace.github.provider_instance";
-const GEN1_CONNECTOR_SCHEMA: &str = "connector.github.push";
-const GEN1_REDACTION_POLICY: &str = "redaction.default";
-const GEN1_CLASSIFIER_POLICY: &str = "classifier.default";
-const GEN1_RETENTION_POLICY: &str = "retention.default";
-const GEN1_PUBLICATION_RULE: &str = "publication.default";
+pub(super) const GEN1_CONNECTOR_SCHEMA: &str = "connector.github.push";
+pub(super) const GEN1_REDACTION_POLICY: &str = "redaction.default";
+pub(super) const GEN1_CLASSIFIER_POLICY: &str = "classifier.default";
+pub(super) const GEN1_RETENTION_POLICY: &str = "retention.default";
+pub(super) const GEN1_PUBLICATION_RULE: &str = "publication.default";
 /// Generation-1's underivable version recipe, named only as the negative case.
 pub const GEN1_COMMIT_RECIPE: &str = "identity.github.commit";
 
@@ -179,11 +179,11 @@ pub const GENERATION_TWO_CONNECTORS: [Generation2ConnectorIds; 3] =
 
 fn missing(entry_id: &str) -> ContractError {
     ContractError::Schema(format!(
-        "generation-1 package does not carry the entry {entry_id}"
+        "the carried-forward package does not carry the entry {entry_id}"
     ))
 }
 
-fn find_entry<'package>(
+pub(super) fn find_entry<'package>(
     package: &'package RegistryPackageV1,
     entry_id: &str,
 ) -> ContractResult<&'package RegistryEntryV1> {
@@ -195,14 +195,15 @@ fn find_entry<'package>(
 }
 
 /// Exact reference (id, version, digest) of one carried-forward entry.
-fn reference_to(
+pub(super) fn reference_to(
     package: &RegistryPackageV1,
     entry_id: &str,
 ) -> ContractResult<RegistryReferenceV1> {
     reference_for(find_entry(package, entry_id)?)
 }
 
-fn reference_for(entry: &RegistryEntryV1) -> ContractResult<RegistryReferenceV1> {
+/// Exact reference (id, version, digest) of one entry this composition holds.
+pub(super) fn reference_for(entry: &RegistryEntryV1) -> ContractResult<RegistryReferenceV1> {
     Ok(RegistryReferenceV1 {
         entry_id: entry.entry_id.clone(),
         version: entry.version,
@@ -212,7 +213,11 @@ fn reference_for(entry: &RegistryEntryV1) -> ContractResult<RegistryReferenceV1>
 
 /// Build one registry entry from a typed body, reusing the vector digests of a
 /// carried-forward sibling.
-fn mint_entry<Body: serde::Serialize>(
+///
+/// Every entry it mints declares entry version 1. A later generation mints its
+/// own entries through this same function, so a new entry is built exactly the
+/// way every generation-2 entry was.
+pub(super) fn mint_entry<Body: serde::Serialize>(
     kind: RegistryEntryKind,
     entry_id: &str,
     entry_schema_id: &str,
@@ -462,7 +467,20 @@ pub fn generation_two_registry_package(
     for connector in GENERATION_TWO_CONNECTORS {
         entries.extend(connector_chain(connector, &carry)?);
     }
+    assemble_package(source, entries)
+}
 
+/// Close a composed entry set into a manifest-verified package that keeps
+/// `source`'s schema version, profile, and vector-suite digests.
+///
+/// Entries are sorted by `(kind, entry_id, version)` and the manifest is
+/// rebuilt from them in that order. This is how the generation-2 package was
+/// always assembled, and a later generation assembles its own package the same
+/// way; `generation_two_package_digest_is_frozen` pins the result.
+pub(super) fn assemble_package(
+    source: &RegistryPackageV1,
+    mut entries: Vec<RegistryEntryV1>,
+) -> ContractResult<ManifestVerifiedRegistryPackage> {
     entries.sort_by(|left, right| {
         (left.kind.as_str(), left.entry_id.as_str(), left.version).cmp(&(
             right.kind.as_str(),
@@ -525,18 +543,18 @@ pub fn resolve_connector_schema(
 /// closure rather than producing an entry the runtime silently misreads.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EvidenceSchemaBodyV1 {
-    schema_version: u32,
-    evidence_schema_id: ContractId,
-    version: u32,
-    evidence_kind: ContractId,
-    identity_recipe: RegistryReferenceV1,
-    redaction_policy: RegistryReferenceV1,
-    classifier_policy: RegistryReferenceV1,
-    retention_policy: RegistryReferenceV1,
-    publication_rule: RegistryReferenceV1,
-    canonical_payload_required: bool,
-    private_raw_default_enabled: bool,
+pub(super) struct EvidenceSchemaBodyV1 {
+    pub(super) schema_version: u32,
+    pub(super) evidence_schema_id: ContractId,
+    pub(super) version: u32,
+    pub(super) evidence_kind: ContractId,
+    pub(super) identity_recipe: RegistryReferenceV1,
+    pub(super) redaction_policy: RegistryReferenceV1,
+    pub(super) classifier_policy: RegistryReferenceV1,
+    pub(super) retention_policy: RegistryReferenceV1,
+    pub(super) publication_rule: RegistryReferenceV1,
+    pub(super) canonical_payload_required: bool,
+    pub(super) private_raw_default_enabled: bool,
 }
 
 #[cfg(test)]

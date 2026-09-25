@@ -11,6 +11,8 @@ its records and what each vector proves.
   event.
 - `causal/`: causal hypotheses, interventions, and ratification.
 - `chunk-identity/`: chunk and embedding identity across parser versions.
+- `collected-items/`: the generation-3 registry package with the generic
+  collected-item family (ADR 0008).
 - `consolidation/`: derive one durable claim from an explicit set of source
   claims (ADR 0003, CONS-01..10).
 - `coverage/`: coverage receipts.

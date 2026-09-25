@@ -1,6 +1,7 @@
-//! A real generation-2 writer authority for a connected test, installed by the
-//! production installer (`registry_activation::install`) rather than by a
-//! ceremony copied into the test.
+//! A real generation-2 (or, on request, generation-3) writer authority for a
+//! connected test, installed by the production installer
+//! (`registry_activation::install`) rather than by a ceremony copied into the
+//! test.
 
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use ostk_fleet_recall::config::WriterAuthorityConfig;
 use ostk_fleet_recall::evidence_ledger::ContentKeyEncryptionKey;
 use ostk_fleet_recall::memory_contracts::common::{AuthenticatedProjectScopeV1, ContractId};
 use ostk_fleet_recall::registry_activation::install::{
-    AuthorityInstallReportV1, AuthorityInstallRequestV1, install_writer_authority,
+    AuthorityInstallReportV1, AuthorityInstallRequestV1, InstallTargetV1, install_writer_authority,
 };
 use ostk_fleet_recall::registry_witness::WriterAuthorityRuntime;
 use ostk_fleet_recall::store::cockroach::RetryPolicy;
@@ -24,11 +25,13 @@ use super::fresh_scope;
 pub const SEMANTIC_TENANT_NAMESPACE: &str = "tenant.acme";
 pub const SEMANTIC_PROJECT_NAMESPACE: &str = "project.recall";
 
-/// One physical scope with an active generation-2 head.
+/// One physical scope with an active generation-2 or generation-3 head.
 pub struct InstalledAuthority {
     /// The physical scope: a fresh tenant, `project` = the caller's label.
     pub scope: FleetScope,
     pub semantic_scope: AuthenticatedProjectScopeV1,
+    /// The target the install was asked for.
+    pub target: InstallTargetV1,
     /// The writer-authority pin group the installer printed.
     pub config: WriterAuthorityConfig,
     /// What the install reported, pins and activation included.
@@ -64,6 +67,7 @@ impl InstalledAuthority {
         AuthorityInstallRequestV1 {
             physical_scope: self.scope.clone(),
             semantic_scope: self.semantic_scope.clone(),
+            target: self.target,
         }
     }
 }
@@ -88,6 +92,18 @@ pub fn semantic_scope() -> AuthenticatedProjectScopeV1 {
 /// Install a generation-2 writer authority into a fresh physical scope whose
 /// project is `label`. `pool` must already be migrated.
 pub async fn install_generation_two(pool: &PgPool, label: &str) -> InstalledAuthority {
+    install_at(pool, label, InstallTargetV1::Generation2).await
+}
+
+/// Install a generation-3 writer authority into a fresh physical scope whose
+/// project is `label`, in one installer run. `pool` must already be migrated.
+pub async fn install_generation_three(pool: &PgPool, label: &str) -> InstalledAuthority {
+    install_at(pool, label, InstallTargetV1::Generation3).await
+}
+
+/// Install a writer authority at `target` into a fresh physical scope whose
+/// project is `label`. `pool` must already be migrated.
+pub async fn install_at(pool: &PgPool, label: &str, target: InstallTargetV1) -> InstalledAuthority {
     let scope = fresh_scope(label);
     let semantic_scope = semantic_scope();
     let report = install_writer_authority(
@@ -95,14 +111,18 @@ pub async fn install_generation_two(pool: &PgPool, label: &str) -> InstalledAuth
         &AuthorityInstallRequestV1 {
             physical_scope: scope.clone(),
             semantic_scope: semantic_scope.clone(),
+            target,
         },
         retry_policy(),
     )
     .await
-    .expect("the installer must reach generation 2 on a fresh physical scope");
+    .unwrap_or_else(|error| {
+        panic!("the installer must reach {target:?} on a fresh physical scope: {error}")
+    });
     InstalledAuthority {
         scope,
         semantic_scope,
+        target,
         config: report.pins.writer_authority_config(),
         report,
         kek_hex: fresh_kek_hex(),

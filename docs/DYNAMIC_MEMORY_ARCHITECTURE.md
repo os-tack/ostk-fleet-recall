@@ -16,8 +16,10 @@ No webhook, transport queue, remote ingress, incident controller, or public
 mutation route exists today. What runs is private and reads local material:
 
 - `ostk-authority-install` gives one physical scope an active generation-2
-  registry head and prints the writer-authority pins that every event-first
-  writer loads ([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md)).
+  registry head, or on request the generation-3 collected-items package
+  ([ADR 0008](adr/0008-collected-items.md)), and prints the writer-authority
+  pins that every event-first writer loads
+  ([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md)).
 - The private writer's `serve` answers `remember(assert)`, which appends a
   `memory.claim.accepted` event and its claim projection in one serializable
   transaction under that authority (ADR 0005).

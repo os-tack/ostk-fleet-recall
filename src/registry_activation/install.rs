@@ -1,14 +1,17 @@
 //! Writer-authority installer: one physical `(tenant_id, project)` to an
-//! active generation-2 registry head, idempotently (ADR 0002, AUTH-04).
+//! active generation-2 registry head, or to generation 3 when asked,
+//! idempotently (ADR 0002, AUTH-04, ADR 0008 D2).
 //!
 //! Every writer that appends event-first — `remember(assert)`, the Stage-5
 //! worker, `ostk-spec`, the observer — needs the strict witness
 //! ([`crate::registry_witness::load_and_verify`]) to accept the physical
-//! scope's active head, and every connector needs that head to activate the
-//! generation-2 connector package. Before this module the only way to get
-//! there was a hand-authored, hand-signed ceremony of four workstation CLIs, or
-//! a 250-600-line helper copied into each live test. This drives the same
-//! four signed repositories in order, under one call:
+//! scope's active head, and every connector needs that head to activate a
+//! package that carries it: generation 2 for the git, transcript, and CI
+//! connectors, generation 3 for the collected-item connectors as well. Before
+//! this module the only way to get there was a hand-authored, hand-signed
+//! ceremony of four workstation CLIs, or a 250-600-line helper copied into each
+//! live test. This drives the same signed repositories in order, under one
+//! call:
 //!
 //! 1. **Control bootstrap** ([`CockroachGenesisRepository::bootstrap_genesis`]):
 //!    the frozen `bootstrap-receipt.jsonl` statement with its scope rewritten
@@ -24,8 +27,19 @@
 //! 4. **Generation two** (`1 -> 2`): the compiled generation-2 connector
 //!    package ([`compiled_generation_two_package`]) with a conformance result
 //!    this module mints itself.
+//! 5. **Generation three** (`2 -> 3`), only for
+//!    [`InstallTargetV1::Generation3`]: the compiled generation-3
+//!    collected-items package ([`compiled_generation_three_package`]), minted
+//!    and signed exactly like step 4.
 //!
-//! Steps 2 through 4 sign fresh statements at server time, so they cannot be
+//! Steps 4 and 5 are one loop over the lineage the installer knows
+//! (`SUCCESSOR_LINEAGE`), stopping at the requested target. A head already at
+//! or past a step's package reports that step
+//! [`InstallStepOutcomeV1::AlreadyPresent`], so the installer never moves a
+//! head backwards: a generation-3 head stays at generation 3 under the default
+//! target.
+//!
+//! Steps 2 through 5 sign fresh statements at server time, so they cannot be
 //! replayed byte for byte. Before each of them the installer reads the
 //! writer-authority view `memory_writer_authority_v1` through the strict
 //! witness and skips what is already durable; the genesis step, which the
@@ -46,14 +60,15 @@
 //! conformance result is self-attested. Anyone can produce these signatures.
 //!
 //! Signing by hand would not change that past generation 1. The strict
-//! witness admits only the two compiled packages, generation 2 carries the
+//! witness admits only the compiled packages, generations 2 and 3 carry the
 //! generation-1 activation policy forward, and a successor activation is
 //! verified only against the installed policy's eligible signers: the fixture
-//! keys. So `1 -> 2`, and every later successor from a head a writer can run
-//! under, can be signed by anyone, whoever signed the earlier steps. Only the
-//! control bootstrap, the genesis activation, and the `0 -> 1` key bridge can
-//! carry deployment keys. Non-nominal successor governance needs a compiled
-//! package whose activation policy names deployment keys, and none exists yet.
+//! keys. So `1 -> 2`, `2 -> 3`, and every later successor from a head a writer
+//! can run under, can be signed by anyone, whoever signed the earlier steps.
+//! Only the control bootstrap, the genesis activation, and the `0 -> 1` key
+//! bridge can carry deployment keys. Non-nominal successor governance needs a
+//! compiled package whose activation policy names deployment keys, and none
+//! exists yet.
 //!
 //! The real gates are database role separation and the out-of-band
 //! receipt-digest pin the reported [`WriterAuthorityPinsV1`] hands each writer
@@ -121,9 +136,9 @@ use crate::memory_contracts::successor_policy::{
     GenesisSuccessorKeyBridgeV1,
 };
 use crate::registry_witness::{
-    KnownRegistryPackage, WriterAuthorityError, WriterAuthorityRejection, WriterAuthorityWitness,
-    compiled_generation_two_package, compiled_genesis_package, compiled_stage4_package,
-    load_and_verify,
+    KnownRegistryPackage, WitnessResult, WriterAuthorityError, WriterAuthorityRejection,
+    WriterAuthorityWitness, compiled_generation_three_package, compiled_generation_two_package,
+    compiled_genesis_package, compiled_stage4_package, load_and_verify,
 };
 use crate::store::cockroach::RetryPolicy;
 use crate::{FleetError, FleetScope, Result};
@@ -166,6 +181,10 @@ const SUCCESSOR_RUNNER_CONFIGURATION: &str =
 /// Fixed rather than a wall clock so the result, and so its digest, is the
 /// same on every run; the `1 -> 2` statement must be effective no earlier.
 const GENERATION_2_TEST_COMPLETED_AT: &str = "2026-08-22T04:00:00.000000000Z";
+/// Completion instant the minted generation-3 conformance result declares,
+/// fixed for the same reason; the `2 -> 3` statement must be effective no
+/// earlier.
+const GENERATION_3_TEST_COMPLETED_AT: &str = "2026-09-25T00:00:00.000000000Z";
 
 /// Ceremony principals. Neither holds a governance key, which is what the
 /// separation-of-duty rules require of a proposer and a package author.
@@ -191,10 +210,38 @@ const SUCCESSOR_CLOCK_GAP: Duration = Duration::from_millis(2);
 // Request and report.
 // ---------------------------------------------------------------------------
 
-/// What to install: one physical scope bound to one semantic scope.
+/// Which compiled package an install leaves the physical scope's head at, at
+/// least.
 ///
-/// The target is always the compiled generation-2 connector package
-/// ([`KnownRegistryPackage::ConnectorGeneration2`]); there is no other.
+/// Generation 3 is opt-in (ADR 0008 D2): upgrading a binary never moves a
+/// scope, and only a request that names generation 3 activates it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallTargetV1 {
+    /// The generation-2 connector package
+    /// ([`KnownRegistryPackage::ConnectorGeneration2`]). The default in this
+    /// release.
+    #[default]
+    Generation2,
+    /// The generation-3 collected-items package
+    /// ([`KnownRegistryPackage::CollectedItemsGeneration3`]).
+    Generation3,
+}
+
+impl InstallTargetV1 {
+    /// The package a head must activate, or have moved past, for this target
+    /// to be reached.
+    #[must_use]
+    pub const fn package(self) -> KnownRegistryPackage {
+        match self {
+            Self::Generation2 => KnownRegistryPackage::ConnectorGeneration2,
+            Self::Generation3 => KnownRegistryPackage::CollectedItemsGeneration3,
+        }
+    }
+}
+
+/// What to install: one physical scope bound to one semantic scope, taken to
+/// one target package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorityInstallRequestV1 {
     /// The physical `(tenant_id, project)` every row is keyed by. The agent and
@@ -203,6 +250,9 @@ pub struct AuthorityInstallRequestV1 {
     /// The contract tenant/project namespaces the head will carry, which every
     /// writer then pins.
     pub semantic_scope: AuthenticatedProjectScopeV1,
+    /// The package the head ends at. A head already past it is left where it
+    /// is, never moved back.
+    pub target: InstallTargetV1,
 }
 
 /// One installer step, in the order they run.
@@ -213,6 +263,8 @@ pub enum InstallStepV1 {
     GenesisActivation,
     FirstSuccessor,
     GenerationTwo,
+    /// `2 -> 3`; reported only for [`InstallTargetV1::Generation3`].
+    GenerationThree,
 }
 
 /// Whether a step wrote anything.
@@ -354,8 +406,9 @@ impl FixtureGovernanceKeys {
 // The installer.
 // ---------------------------------------------------------------------------
 
-/// Give `request.physical_scope` an active generation-2 head bound to
-/// `request.semantic_scope`, skipping whatever is already durable.
+/// Give `request.physical_scope` an active head at `request.target` (or past
+/// it) bound to `request.semantic_scope`, skipping whatever is already
+/// durable.
 ///
 /// Runs as the schema owner/migrator login: it writes the control and
 /// registry tables, which no application role may. It is safe to re-run; a
@@ -368,9 +421,10 @@ impl FixtureGovernanceKeys {
 ///
 /// A configuration error when the physical scope already holds authority the
 /// request does not describe (another bootstrap receipt, other namespaces, an
-/// unknown package, or a generation-1 package re-activated past generation 1),
-/// with or without a registry head above that bootstrap, and any repository,
-/// contract, or database error from a step.
+/// unknown package, or a package re-activated at a generation the installer's
+/// own lineage would not have put it at), with or without a registry head
+/// above that bootstrap, and any repository, contract, or database error from
+/// a step.
 pub async fn install_writer_authority(
     pool: &PgPool,
     request: &AuthorityInstallRequestV1,
@@ -382,7 +436,7 @@ pub async fn install_writer_authority(
     )?;
     let artifacts = InstallArtifacts::compile(request)?;
     let config = artifacts.pins.writer_authority_config();
-    let mut steps = Vec::with_capacity(4);
+    let mut steps = Vec::with_capacity(5);
 
     // Read the view before writing anything: it refuses authority this
     // request does not describe, and it fails before step 1 on a schema that
@@ -435,39 +489,52 @@ pub async fn install_writer_authority(
         });
     }
 
-    // 4. Read the head again: only a generation-1 Stage-4 head moves forward.
-    let head = read_installed_head(pool, &request.physical_scope, &config)
-        .await?
-        .ok_or_else(|| {
-            FleetError::RegistryActivationCorrupt(
-                "the first successor committed but the writer-authority view projects no head"
-                    .into(),
-            )
-        })?;
-    let outcome = match head.active_package().known() {
-        KnownRegistryPackage::ConnectorGeneration2 => InstallStepOutcomeV1::AlreadyPresent,
-        KnownRegistryPackage::Stage4Generation1 if head.generation() == 1 => {
-            activate_generation_two(pool, &control, retry, &artifacts, &head).await?
-        }
-        KnownRegistryPackage::Stage4Generation1 => {
+    // 4 and 5. Walk the lineage up to the target, reading the head again
+    // before each step: a head at or past the step's package reports it
+    // present, a head holding the step's predecessor moves forward, and
+    // anything else is authority the installer did not put there.
+    let target_rank = lineage_rank(request.target.package());
+    for successor in SUCCESSOR_LINEAGE
+        .iter()
+        .take_while(|successor| lineage_rank(successor.to) <= target_rank)
+    {
+        let head = read_installed_head(pool, &request.physical_scope, &config)
+            .await?
+            .ok_or_else(|| {
+                FleetError::RegistryActivationCorrupt(
+                    "the first successor committed but the writer-authority view projects no head"
+                        .into(),
+                )
+            })?;
+        let known = head.active_package().known();
+        let outcome = if lineage_rank(known) >= lineage_rank(successor.to) {
+            InstallStepOutcomeV1::AlreadyPresent
+        } else if known == successor.from
+            && head.generation() == u64::from(lineage_rank(successor.from))
+        {
+            activate_known_successor(pool, &control, retry, &artifacts, &head, successor).await?
+        } else {
             return Err(refused(&format!(
-                "generation {} re-activated the generation-1 package; the installer only drives 1 -> 2",
-                head.generation()
+                "generation {} activates the {} package; the installer only drives the heads its \
+                 own lineage installs (1 -> 2 -> 3)",
+                head.generation(),
+                package_name(known)
             )));
-        }
-    };
-    steps.push(InstallStepReportV1 {
-        step: InstallStepV1::GenerationTwo,
-        outcome,
-    });
+        };
+        steps.push(InstallStepReportV1 {
+            step: successor.step,
+            outcome,
+        });
+    }
 
     // Finish exactly as every writer will start: the strict witness under the
     // pins this report prints.
     let witness = load_and_verify(pool, &request.physical_scope, &config).await?;
-    if witness.active_package().known() != KnownRegistryPackage::ConnectorGeneration2 {
-        return Err(FleetError::RegistryActivationCorrupt(
-            "the installed head does not activate the generation-2 connector package".into(),
-        ));
+    if lineage_rank(witness.active_package().known()) < target_rank {
+        return Err(FleetError::RegistryActivationCorrupt(format!(
+            "the installed head does not activate the {} package or a later one",
+            package_name(request.target.package())
+        )));
     }
     Ok(AuthorityInstallReportV1 {
         steps,
@@ -830,17 +897,76 @@ async fn activate_first_successor(
     )
 }
 
-/// Step 4: move the generation-1 head to the compiled generation-2 connector
-/// package under the policy that head installed.
-async fn activate_generation_two(
+/// One `N -> N+1` step of the lineage the installer drives, after the frozen
+/// `0 -> 1`.
+struct SuccessorStepV1 {
+    /// How the step is reported.
+    step: InstallStepV1,
+    /// The package a head must activate for this step to move it.
+    from: KnownRegistryPackage,
+    /// The package the step activates.
+    to: KnownRegistryPackage,
+    /// The compiled bytes of `to`.
+    package: fn() -> WitnessResult<Arc<SemanticallyClosedSuccessorPackage>>,
+    /// Fixed completion instant of the conformance result the step mints.
+    test_completed_at: &'static str,
+}
+
+/// Every successor step the installer can take, in lineage order.
+static SUCCESSOR_LINEAGE: [SuccessorStepV1; 2] = [
+    SuccessorStepV1 {
+        step: InstallStepV1::GenerationTwo,
+        from: KnownRegistryPackage::Stage4Generation1,
+        to: KnownRegistryPackage::ConnectorGeneration2,
+        package: compiled_generation_two_package,
+        test_completed_at: GENERATION_2_TEST_COMPLETED_AT,
+    },
+    SuccessorStepV1 {
+        step: InstallStepV1::GenerationThree,
+        from: KnownRegistryPackage::ConnectorGeneration2,
+        to: KnownRegistryPackage::CollectedItemsGeneration3,
+        package: compiled_generation_three_package,
+        test_completed_at: GENERATION_3_TEST_COMPLETED_AT,
+    },
+];
+
+/// A package's place in the installer's lineage, which is also the generation
+/// the installer activates it at.
+const fn lineage_rank(known: KnownRegistryPackage) -> u8 {
+    match known {
+        KnownRegistryPackage::Stage4Generation1 => 1,
+        KnownRegistryPackage::ConnectorGeneration2 => 2,
+        KnownRegistryPackage::CollectedItemsGeneration3 => 3,
+    }
+}
+
+const fn package_name(known: KnownRegistryPackage) -> &'static str {
+    match known {
+        KnownRegistryPackage::Stage4Generation1 => "generation-1",
+        KnownRegistryPackage::ConnectorGeneration2 => "generation-2",
+        KnownRegistryPackage::CollectedItemsGeneration3 => "generation-3",
+    }
+}
+
+/// Steps 4 and 5: move the head to `successor`'s compiled package under the
+/// policy the head installed, as generation `from + 1`.
+async fn activate_known_successor(
     pool: &PgPool,
     control: &TrustedControlScope,
     retry: RetryPolicy,
     artifacts: &InstallArtifacts,
     current: &WriterAuthorityWitness,
+    successor: &SuccessorStepV1,
 ) -> Result<InstallStepOutcomeV1> {
-    let target = compiled_generation_two_package()?;
-    let test_result = generation_two_test_result(&artifacts.profile, &target)?;
+    let from_generation = u32::try_from(current.generation()).map_err(|_| {
+        FleetError::RegistryActivationCorrupt("the head generation does not fit a u32".into())
+    })?;
+    let to_generation = from_generation.checked_add(1).ok_or_else(|| {
+        FleetError::RegistryActivationCorrupt("the head generation has no successor".into())
+    })?;
+    let target = (successor.package)()?;
+    let test_result =
+        successor_test_result(&artifacts.profile, &target, successor.test_completed_at)?;
     let test_result_digest = RegistryTestResultDigest::from_digest(domain_separated_digest(
         DigestDomain::RegistryTestResult,
         &test_result,
@@ -877,8 +1003,8 @@ async fn activate_generation_two(
         target_package_digest: target.package_digest(),
         target_activation_policy: target.activation_policy().registry_reference().clone(),
         test_vector_result_digest: test_result_digest,
-        from_generation: 1,
-        to_generation: 2,
+        from_generation,
+        to_generation,
         effective_from: successor_effective_from(pool).await?,
         effective_until: None,
         proposer_principal_id: ContractId::new(PROPOSER)?,
@@ -918,12 +1044,13 @@ async fn activate_generation_two(
     )
 }
 
-/// The self-attested conformance result the `1 -> 2` statement names. It
-/// declares the frozen successor runner and a fixed completion instant, so it
-/// is the same bytes on every run.
-fn generation_two_test_result(
+/// The self-attested conformance result a successor statement names. It
+/// declares the frozen successor runner and the step's fixed completion
+/// instant, so it is the same bytes on every run.
+fn successor_test_result(
     profile: &ProfileReferenceV1,
     target: &SemanticallyClosedSuccessorPackage,
+    completed_at: &str,
 ) -> Result<Vec<u8>> {
     let package = target.manifest_verified_package().package();
     Ok(encode_canonical(&RegistryTestResultV1 {
@@ -938,7 +1065,7 @@ fn generation_two_test_result(
         passed_case_count: 1,
         failed_case_count: 0,
         outcome: RegistryTestOutcomeV1::Passed,
-        completed_at: CanonicalTimestamp::parse(GENERATION_2_TEST_COMPLETED_AT)?,
+        completed_at: CanonicalTimestamp::parse(completed_at)?,
     })?)
 }
 
@@ -1032,6 +1159,7 @@ mod tests {
                 ContractId::new("tenant.acme").unwrap(),
                 ContractId::new("project.recall").unwrap(),
             ),
+            target: InstallTargetV1::default(),
         }
     }
 
@@ -1199,16 +1327,48 @@ mod tests {
     }
 
     #[test]
-    fn the_minted_generation_two_result_is_stable_and_names_the_target() {
+    fn every_minted_successor_result_is_stable_and_names_its_target() {
         let profile = frozen_profile_reference_v1();
-        let target = compiled_generation_two_package().unwrap();
-        let first = generation_two_test_result(&profile, &target).unwrap();
-        assert_eq!(
-            first,
-            generation_two_test_result(&profile, &target).unwrap()
-        );
-        let decoded: RegistryTestResultV1 = decode_strict(&first).unwrap();
-        assert_eq!(decoded.package_digest, target.package_digest());
-        assert_eq!(decoded.outcome, RegistryTestOutcomeV1::Passed);
+        for successor in &SUCCESSOR_LINEAGE {
+            let target = (successor.package)().unwrap();
+            let first =
+                successor_test_result(&profile, &target, successor.test_completed_at).unwrap();
+            assert_eq!(
+                first,
+                successor_test_result(&profile, &target, successor.test_completed_at).unwrap()
+            );
+            let decoded: RegistryTestResultV1 = decode_strict(&first).unwrap();
+            assert_eq!(decoded.package_digest, target.package_digest());
+            assert_eq!(decoded.outcome, RegistryTestOutcomeV1::Passed);
+        }
+    }
+
+    #[test]
+    fn the_lineage_walks_one_generation_at_a_time_to_each_target() {
+        // Each step starts where the previous one ended, each compiled package
+        // is the package its step names, and every target is the end of some
+        // prefix of the lineage, so a loop over the lineage reaches it.
+        let mut previous = KnownRegistryPackage::Stage4Generation1;
+        for successor in &SUCCESSOR_LINEAGE {
+            assert_eq!(successor.from, previous);
+            assert_eq!(lineage_rank(successor.to), lineage_rank(successor.from) + 1);
+            let package = (successor.package)().unwrap();
+            assert_eq!(
+                crate::registry_witness::materialize_active_package(package.package_digest())
+                    .unwrap()
+                    .known(),
+                successor.to
+            );
+            previous = successor.to;
+        }
+        for target in [InstallTargetV1::Generation2, InstallTargetV1::Generation3] {
+            assert!(
+                SUCCESSOR_LINEAGE
+                    .iter()
+                    .any(|successor| successor.to == target.package()),
+                "{target:?} must be reachable"
+            );
+        }
+        assert_eq!(InstallTargetV1::default(), InstallTargetV1::Generation2);
     }
 }

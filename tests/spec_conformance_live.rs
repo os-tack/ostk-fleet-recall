@@ -66,6 +66,9 @@
 //! And a login that holds no grant itself, only membership in a role holding
 //! the runtime grants, as `fleet_writer` is a member of `fleet_runtime`, runs
 //! the worker tick, the activation, the check, and the read.
+//!
+//! On a scope installed straight to generation 3 (ADR 0008), the same chain
+//! drafts, activates, and judges a commit as a verified nonconformance.
 
 mod common;
 
@@ -76,7 +79,10 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use common::authority::{InstalledAuthority, install_generation_two, retry_policy, semantic_scope};
+use common::authority::{
+    InstalledAuthority, install_generation_three, install_generation_two, retry_policy,
+    semantic_scope,
+};
 use common::runtime_role::RuntimeProbeRole;
 use common::worker::{
     FIRST_COMMIT_DATE, INSTALLATION_ID, RecordedCi, SECOND_COMMIT_DATE, ScratchRepository,
@@ -120,7 +126,7 @@ use ostk_fleet_recall::normative_runtime::{
     NormativeActivationOutcomeV1, NormativeActivationRepository as _, NormativeRegistryBindingV1,
     NormativeResolutionV1, sign_normative_approval,
 };
-use ostk_fleet_recall::registry_witness::WriterAuthorityRuntime;
+use ostk_fleet_recall::registry_witness::{KnownRegistryPackage, WriterAuthorityRuntime};
 use ostk_fleet_recall::service::{
     FleetMemoryService, RecallAction, RecallRequest, RecallResult, ServiceError,
 };
@@ -2464,6 +2470,58 @@ async fn live_spec_chain_records_a_verified_nonconformance_and_recall_reports_it
     let block = &status["data"]["spec_conformance"];
     assert_eq!(block["served"], true, "{status}");
     assert_eq!(block["open_discrepancies"], 1, "{status}");
+}
+
+#[tokio::test]
+async fn live_spec_check_judges_a_commit_on_a_generation_three_head_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let owner = common::migrated_pool(&database_url).await;
+    let installed = install_generation_three(&owner, "spec-generation-three").await;
+    assert_eq!(
+        installed.report.package,
+        KnownRegistryPackage::CollectedItemsGeneration3
+    );
+    let (repository, c0, _) = observed_repository();
+    let sources = spec_sources(&repository);
+    let runtime = installed.runtime(&owner).await;
+    let kek = installed.kek();
+
+    // The worker covers the repository and the spec activates under the
+    // generation-3 head, exactly as under generation 2.
+    cover_git(&installed, &owner, &sources).await;
+    let (proposal, effective_from) = activate_no_forget(&runtime, &repository, &c0).await;
+    assert_eq!(
+        proposal.registry_head.head.package_digest,
+        runtime
+            .verify()
+            .await
+            .unwrap()
+            .head_binding()
+            .head
+            .package_digest,
+        "the statement is drafted under the generation-3 head"
+    );
+
+    // C0 declares Forget: the check verifies it present and opens an episode.
+    let request = check_request(
+        &sources,
+        &c0,
+        &instant(effective_from + TimeDelta::seconds(1)),
+    );
+    let opened = check(&runtime, &kek, &request).await;
+    assert_eq!(opened.statement_id, Some(proposal.statement_id().unwrap()));
+    assert_eq!(opened.verdict, SpecVerdictV1::Nonconforming);
+    assert!(opened.reasons.is_empty(), "{:?}", opened.reasons);
+    assert_eq!(
+        opened.verification_outcome,
+        Some(VerificationOutcomeV1::VerifiedPositive)
+    );
+    assert!(
+        matches!(opened.discrepancy, SpecDiscrepancyActionV1::Opened { .. }),
+        "{opened:?}"
+    );
 }
 
 #[tokio::test]

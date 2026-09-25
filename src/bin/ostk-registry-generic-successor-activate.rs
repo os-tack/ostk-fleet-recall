@@ -661,7 +661,8 @@ mod tests {
     #[test]
     fn every_compiled_in_package_is_a_recognized_target() {
         use ostk_fleet_recall::registry_witness::{
-            compiled_generation_two_package, compiled_stage4_package,
+            compiled_generation_three_package, compiled_generation_two_package,
+            compiled_stage4_package,
         };
         assert_eq!(
             require_recognized_target(compiled_stage4_package().unwrap().package_digest()).unwrap(),
@@ -671,6 +672,15 @@ mod tests {
             require_recognized_target(compiled_generation_two_package().unwrap().package_digest())
                 .unwrap(),
             KnownRegistryPackage::ConnectorGeneration2
+        );
+        assert_eq!(
+            require_recognized_target(
+                compiled_generation_three_package()
+                    .unwrap()
+                    .package_digest()
+            )
+            .unwrap(),
+            KnownRegistryPackage::CollectedItemsGeneration3
         );
     }
 

@@ -17,6 +17,11 @@
 //! (`worker::run_command`, the code path `ostk-fleet-recall worker` runs) reads
 //! its pins and key from its environment, prints each tick's report as one
 //! JSON line, and earns exit status 1 exactly when a step failed.
+//!
+//! A generation-3 head (ADR 0008) changes none of that: a tick on a scope
+//! installed straight to generation 3 ingests, projects, and embeds all three
+//! connectors, and a scope moved from generation 2 to 3 keeps its sources,
+//! cursors, and recall, and ingests what arrives after the move.
 
 mod common;
 
@@ -28,7 +33,8 @@ use common::authority::retry_policy;
 use common::runtime_role::RuntimeProbeRole;
 use common::worker::{
     BROKEN_TRANSCRIPT_LINE, CI_INSTANCE, COMMIT_WORD, FAILING_STEP_WORD, GIT_INSTANCE, RecordedCi,
-    RecordedCiSettledThrough, StubEmbedder, TRANSCRIPT_WORD, WorkerFixture as Fixture, line,
+    RecordedCiSettledThrough, SECOND_COMMIT_DATE, StubEmbedder, TRANSCRIPT_WORD,
+    WorkerFixture as Fixture, line,
 };
 use ostk_fleet_recall::FleetError;
 use ostk_fleet_recall::connectors::ci::MAX_CI_WINDOW_RUNS;
@@ -36,6 +42,10 @@ use ostk_fleet_recall::memory_contracts::canonical::decode_strict;
 use ostk_fleet_recall::memory_contracts::common::ContractId;
 use ostk_fleet_recall::memory_contracts::coverage::CoverageCompletenessV1;
 use ostk_fleet_recall::memory_contracts::evidence_v2::EvidenceStatementV2;
+use ostk_fleet_recall::registry_activation::install::{
+    InstallStepOutcomeV1, InstallTargetV1, install_writer_authority,
+};
+use ostk_fleet_recall::registry_witness::KnownRegistryPackage;
 use ostk_fleet_recall::store::cockroach::{CockroachStore, DatabaseCapabilities, PoolConfig};
 use ostk_fleet_recall::worker::{
     WorkerCommandV1, WorkerProcessV1, WorkerSourceOutcomeV1, WorkerStepStatusV1, WorkerStepV1,
@@ -709,4 +719,119 @@ async fn live_worker_command_once_writes_one_report_when_configured() {
     for step in ["git", "ci", "bodies", "lexical", "dense"] {
         assert_eq!(parsed["steps"][step]["status"], "ok", "{step}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generation 3 (ADR 0008).
+// ---------------------------------------------------------------------------
+
+/// A word that occurs only in a commit made after a scope moved to
+/// generation 3.
+const AFTER_MOVE_WORD: &str = "tessellate";
+
+#[tokio::test]
+async fn live_worker_tick_on_a_generation_three_head_ingests_projects_and_embeds_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = Fixture::install_at(
+        &pool,
+        "worker-generation-three",
+        InstallTargetV1::Generation3,
+    )
+    .await;
+    assert_eq!(
+        fixture.installed.report.package,
+        KnownRegistryPackage::CollectedItemsGeneration3
+    );
+    let report = fixture.worker(&pool, "all").await.run_tick().await;
+
+    assert_all_ok(&report);
+    let authority = report.authority.expect("the tick verified a head");
+    assert_eq!(authority.generation, 3);
+    for step in WorkerStepV1::INGEST {
+        assert!(
+            counter(&report, step, "appended") > 0,
+            "{step:?} must append evidence under generation 3"
+        );
+    }
+    let kinds = fixture.evidence_kinds(&pool).await;
+    for kind in [
+        "git_source_object_version",
+        "transcript_turn_version",
+        "ci_workflow_run_version",
+    ] {
+        assert!(kinds.contains(kind), "no {kind} event: {kinds:?}");
+    }
+
+    let reader = fixture.reader(&pool);
+    let completeness = reader.completeness().await.unwrap();
+    assert!(completeness.lexical_complete(), "{completeness:?}");
+    assert!(completeness.dense_complete(), "{completeness:?}");
+    assert!(completeness.densely_embedded > 0);
+    for word in [COMMIT_WORD, TRANSCRIPT_WORD, FAILING_STEP_WORD] {
+        let hits = reader.recall(word, None, 10).await.unwrap();
+        assert!(!hits.hits.is_empty(), "recall must find {word:?}");
+    }
+}
+
+#[tokio::test]
+async fn live_worker_keeps_its_sources_across_a_move_to_generation_three_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = Fixture::install(&pool, "worker-two-to-three").await;
+    assert_all_ok(&fixture.worker(&pool, "all").await.run_tick().await);
+
+    // The operator moves the scope; the writer's pins do not change.
+    let mut request = fixture.installed.request();
+    request.target = InstallTargetV1::Generation3;
+    let moved = install_writer_authority(&pool, &request, retry_policy())
+        .await
+        .expect("the scope moves to generation 3");
+    assert_eq!(moved.pins, fixture.installed.report.pins);
+    assert_eq!(
+        moved.steps.last().map(|step| step.outcome),
+        Some(InstallStepOutcomeV1::Inserted)
+    );
+
+    // The durable cursors still hold: nothing already read is read again.
+    let after_move = fixture.worker(&pool, "all").await.run_tick().await;
+    assert_all_ok(&after_move);
+    assert_eq!(after_move.authority.expect("a verified head").generation, 3);
+    for step in WorkerStepV1::INGEST {
+        assert_eq!(counter(&after_move, step, "appended"), 0, "{step:?}");
+    }
+    let reader = fixture.reader(&pool);
+    for word in [COMMIT_WORD, TRANSCRIPT_WORD, FAILING_STEP_WORD] {
+        assert!(
+            !reader.recall(word, None, 10).await.unwrap().hits.is_empty(),
+            "evidence admitted under generation 2 must stay recallable: {word:?}"
+        );
+    }
+
+    // What arrives after the move is admitted under generation 3.
+    let head = fixture.repository.head();
+    fixture.repository.commit(
+        Some(&head),
+        &format!("record the {AFTER_MOVE_WORD} rollout"),
+        SECOND_COMMIT_DATE,
+    );
+    let later = fixture.worker(&pool, "all").await.run_tick().await;
+    assert_all_ok(&later);
+    assert!(counter(&later, WorkerStepV1::Git, "appended") > 0);
+    let completeness = reader.completeness().await.unwrap();
+    assert!(completeness.lexical_complete(), "{completeness:?}");
+    assert!(completeness.dense_complete(), "{completeness:?}");
+    assert!(
+        !reader
+            .recall(AFTER_MOVE_WORD, None, 10)
+            .await
+            .unwrap()
+            .hits
+            .is_empty(),
+        "a commit made after the move must be recallable"
+    );
 }

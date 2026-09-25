@@ -602,6 +602,29 @@ The live suites `tests/registry_activation_live.rs`,
 `tests/generic_successor_activation_live.rs` exercise these repositories
 against a real CockroachDB database.
 
+### Generation-3 rollout order ([ADR 0008](adr/0008-collected-items.md) D2)
+
+The generation-3 collected-items package is a `2 -> 3` generic successor. It
+needs no migration and no new grant, and a binary that does not compile it in
+refuses any head that activates it as `UnknownActivePackage`. So the order is
+fixed, per physical scope that is to collect items:
+
+1. Ship a binary that recognizes generation 3 to every process that verifies
+   a head for that scope: every event-first writer, every `serve`, the worker
+   on its ingest host, and the projector container.
+2. Apply the release's migrations, then re-apply the grant files. This release
+   adds neither.
+3. Run `ostk-authority-install apply --target generation-3` as the schema
+   owner/migrator login. The printed pins are unchanged, so no writer is
+   reconfigured; a re-run is a no-op, and the default `--target generation-2`
+   never moves a generation-3 head back.
+4. Only then configure collectors, agent capture, or webhook ingress.
+
+Moving a scope re-keys what is read afterwards (a re-read source fact becomes
+a second representation under the new head) and strands spec families last
+advanced under generation 2 (ADR 0007 D11), so move a scope before activating
+specs in it.
+
 ### Conflict-detector reconciliation gate
 
 The steady-state v2 detector is proposition-aware for one functional claim key

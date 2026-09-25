@@ -243,7 +243,10 @@ instead. It drives the same four signed repositories in order, idempotently:
 the control bootstrap, the genesis activation, the `0 -> 1` first successor to
 the compiled Stage-4 package, and the generic `1 -> 2` transition to the
 compiled generation-2 connector package. It then prints the writer-authority
-pins. Generation 2 is its only target. Like the other ceremony binaries, it is
+pins. Generation 2 is its default target; `apply --target generation-3` adds
+the generic `2 -> 3` transition to the compiled generation-3 collected-items
+package ([ADR 0008](adr/0008-collected-items.md) D2), and no target moves a
+head backwards. Like the other ceremony binaries, it is
 a workstation tool: it is not in the production image, and the CI image job
 asserts that it is absent.
 

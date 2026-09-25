@@ -18,9 +18,10 @@
 //!   this build recognizes are the rows of one static table, `KNOWN_PACKAGES`,
 //!   each a [`KnownRegistryPackage`] tag, the closure that builds it from
 //!   compiled-in bytes, and whether it keeps the Stage-4 narrowing. Today the
-//!   table holds the frozen generation-1 Stage-4 package and the generation-2
+//!   table holds the frozen generation-1 Stage-4 package, the generation-2
 //!   connector package composed from those same bytes by
-//!   [`generation_two_registry_package`]. Every row is a build input, never
+//!   [`generation_two_registry_package`], and the checked-in generation-3
+//!   collected-items package (ADR 0008 D1). Every row is a build input, never
 //!   database state, so admitting a head's digest runs only admission rules
 //!   this process has itself closed. Every other digest fails closed as
 //!   [`WriterAuthorityRejection::UnknownActivePackage`] until a row for it is
@@ -124,6 +125,14 @@ const GENESIS_PACKAGE: &[u8] =
 /// connector package is composed from these same bytes.
 const STAGE4_PACKAGE: &[u8] =
     include_bytes!("../../contracts/dynamic-memory/v2/stage4-successor/registry-package.jsonl");
+
+/// Exact canonical bytes of the generation-3 collected-items package:
+/// generation 2 carried forward byte for byte plus the generic collected-item
+/// family (ADR 0008 D1). A test proves
+/// [`generation_three_registry_package`](crate::memory_contracts::generation3_registry::generation_three_registry_package)
+/// reproduces them from the compiled generation-2 package.
+const COLLECTED_ITEMS_PACKAGE: &[u8] =
+    include_bytes!("../../contracts/dynamic-memory/v3/collected-items/registry-package.jsonl");
 
 /// Only head state the projection admits; migration 0014 also CHECKs it.
 const ACTIVE_HEAD_STATE: &str = "active";
@@ -231,6 +240,12 @@ pub enum KnownRegistryPackage {
     /// connector (`connector.git.history`, `connector.transcript.session`,
     /// `connector.ci.workflow_run`).
     ConnectorGeneration2,
+    /// The generation-3 collected-items package: every generation-2 entry
+    /// carried forward byte for byte, plus one generic collected-item family
+    /// with a connector schema per trust channel (`connector.collected.pull`,
+    /// `.push`, `.capture`, `.import`). A scope reaches it only by asking
+    /// (`ostk-authority-install apply --target generation-3`).
+    CollectedItemsGeneration3,
 }
 
 /// The compiled-in, semantically closed package an active head's digest
@@ -239,8 +254,8 @@ pub enum KnownRegistryPackage {
 /// Every known package is a [`SemanticallyClosedSuccessorPackage`], which is
 /// what connector binding and remember-route resolution read. Only the frozen
 /// generation-1 package also closes under the narrower Stage-4 target, so
-/// [`Self::stage4`] is `None` for generation 2 rather than a narrowing that
-/// would have to pretend the extra connectors do not exist.
+/// [`Self::stage4`] is `None` for generations 2 and 3 rather than a narrowing
+/// that would have to pretend the extra connectors do not exist.
 ///
 /// There is no public constructor: the only way to hold one is
 /// [`materialize_active_package`], which admits exactly the compiled-in
@@ -872,7 +887,7 @@ struct KnownPackage {
 /// generation is recognized by appending one tag and one row; the existing
 /// rows, and so every head that already activated one of them, are
 /// untouched.
-static KNOWN_PACKAGES: [KnownPackage; 2] = [
+static KNOWN_PACKAGES: [KnownPackage; 3] = [
     KnownPackage {
         known: KnownRegistryPackage::Stage4Generation1,
         successor: compiled_stage4_successor_package,
@@ -881,6 +896,11 @@ static KNOWN_PACKAGES: [KnownPackage; 2] = [
     KnownPackage {
         known: KnownRegistryPackage::ConnectorGeneration2,
         successor: compiled_generation_two_package,
+        stage4: None,
+    },
+    KnownPackage {
+        known: KnownRegistryPackage::CollectedItemsGeneration3,
+        successor: compiled_generation_three_package,
         stage4: None,
     },
 ];
@@ -895,6 +915,9 @@ static KNOWN_PACKAGES: [KnownPackage; 2] = [
 /// - the generation-2 connector package that
 ///   [`generation_two_registry_package`] composes from those same frozen bytes,
 ///   as [`KnownRegistryPackage::ConnectorGeneration2`] with no Stage-4
+///   narrowing;
+/// - the checked-in generation-3 collected-items package, as
+///   [`KnownRegistryPackage::CollectedItemsGeneration3`] with no Stage-4
 ///   narrowing.
 ///
 /// Any other digest fails closed: the view deliberately exposes no
@@ -1061,6 +1084,37 @@ fn closed_generation_two_package() -> ContractResult<Arc<SemanticallyClosedSucce
         ManifestVerifiedRegistryPackage::decode(framed_record(STAGE4_PACKAGE)?, &profile)?;
     let composed = generation_two_registry_package(&generation_one)?;
     SemanticallyClosedSuccessorPackage::from_manifest_verified(composed).map(Arc::new)
+}
+
+/// The compiled-in generation-3 collected-items package.
+///
+/// This is [`KnownRegistryPackage::CollectedItemsGeneration3`]: the
+/// checked-in canonical bytes, decoded under the frozen profile and closed as
+/// a successor package. Like generation 1, the bytes are the artifact
+/// (AUTH-04); the composition that produced them is proven to reproduce them
+/// by a test, not re-run here.
+///
+/// # Errors
+///
+/// A contract error when the compiled-in bytes do not close, which is a build
+/// defect rather than a verdict about any database.
+pub fn compiled_generation_three_package() -> WitnessResult<Arc<SemanticallyClosedSuccessorPackage>>
+{
+    static PACKAGE: OnceLock<Result<Arc<SemanticallyClosedSuccessorPackage>, String>> =
+        OnceLock::new();
+    memoized(
+        &PACKAGE,
+        "generation-3 collected-items package",
+        closed_generation_three_package,
+    )
+    .map(Arc::clone)
+}
+
+fn closed_generation_three_package() -> ContractResult<Arc<SemanticallyClosedSuccessorPackage>> {
+    let profile = frozen_profile_reference_v1();
+    let manifest =
+        ManifestVerifiedRegistryPackage::decode(framed_record(COLLECTED_ITEMS_PACKAGE)?, &profile)?;
+    SemanticallyClosedSuccessorPackage::from_manifest_verified(manifest).map(Arc::new)
 }
 
 /// Frozen contract artifacts carry exactly one trailing LF frame.
@@ -1358,9 +1412,16 @@ mod tests {
         let stage4 = compiled_stage4_package().expect("Stage-4 package closure");
         let generation_two =
             compiled_generation_two_package().expect("generation-2 package closure");
-        assert_ne!(genesis.package_digest(), stage4.package_digest());
-        assert_ne!(genesis.package_digest(), generation_two.package_digest());
-        assert_ne!(stage4.package_digest(), generation_two.package_digest());
+        let generation_three =
+            compiled_generation_three_package().expect("generation-3 package closure");
+        let digests = [
+            genesis.package_digest(),
+            stage4.package_digest(),
+            generation_two.package_digest(),
+            generation_three.package_digest(),
+        ];
+        let distinct: std::collections::BTreeSet<_> = digests.iter().collect();
+        assert_eq!(distinct.len(), digests.len(), "{digests:?}");
     }
 
     /// Exact reference to the one entry of `kind` named `entry_id`, so a test
@@ -1460,6 +1521,43 @@ mod tests {
         assert_eq!(
             serde_json::to_value(active.known()).expect("tag serializes"),
             serde_json::json!("connector_generation2")
+        );
+    }
+
+    #[test]
+    fn the_generation_three_digest_materializes_the_collected_items_package() {
+        let generation_three =
+            compiled_generation_three_package().expect("generation-3 package closure");
+        let active = materialize_active_package(generation_three.package_digest())
+            .expect("the checked-in generation-3 digest materializes");
+
+        assert_eq!(
+            active.known(),
+            KnownRegistryPackage::CollectedItemsGeneration3
+        );
+        assert_eq!(active.package_digest(), generation_three.package_digest());
+        assert!(active.stage4().is_none());
+        let package = active.successor();
+        for connector in [
+            "connector.github.push",
+            "connector.git.history",
+            "connector.transcript.session",
+            "connector.ci.workflow_run",
+            "connector.collected.pull",
+            "connector.collected.push",
+            "connector.collected.capture",
+            "connector.collected.import",
+        ] {
+            let reference = reference_in(package, RegistryEntryKind::ConnectorSchema, connector);
+            assert!(
+                package.connector_schema(&reference).is_some(),
+                "{connector} must resolve as a connector schema of the generation-3 package"
+            );
+        }
+        assert_serves_the_remember_route(package);
+        assert_eq!(
+            serde_json::to_value(active.known()).expect("tag serializes"),
+            serde_json::json!("collected_items_generation3")
         );
     }
 

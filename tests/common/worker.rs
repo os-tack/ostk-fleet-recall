@@ -1,5 +1,5 @@
-//! A memory-worker scope for a connected test: an installed generation-2
-//! writer authority, a scratch git repository, a scratch transcript
+//! A memory-worker scope for a connected test: an installed generation-2 (or
+//! generation-3) writer authority, a scratch git repository, a scratch transcript
 //! directory, the recorded CI corpus, and a deterministic stub embedder, so a
 //! real `MemoryWorker` tick can ingest, project, and embed all three
 //! connectors.
@@ -27,7 +27,9 @@ use ostk_recall_core::ChunkEmbedder;
 use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
 
-use super::authority::{InstalledAuthority, install_generation_two, retry_policy};
+use ostk_fleet_recall::registry_activation::install::InstallTargetV1;
+
+use super::authority::{InstalledAuthority, install_at, retry_policy};
 
 /// The provider-installation coordinate every source is configured with.
 pub const INSTALLATION_ID: u64 = 4242;
@@ -319,8 +321,13 @@ pub struct WorkerFixture {
 
 impl WorkerFixture {
     pub async fn install(pool: &PgPool, label: &str) -> Self {
+        Self::install_at(pool, label, InstallTargetV1::Generation2).await
+    }
+
+    /// The fixture over a fresh scope installed at `target`.
+    pub async fn install_at(pool: &PgPool, label: &str, target: InstallTargetV1) -> Self {
         Self {
-            installed: install_generation_two(pool, label).await,
+            installed: install_at(pool, label, target).await,
             repository: ScratchRepository::with_two_commits(),
             transcripts: transcript_directory(),
         }
