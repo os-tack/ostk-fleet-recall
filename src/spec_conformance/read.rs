@@ -92,8 +92,8 @@ const MAX_OPENING_CHECK_ROWS: usize = 1024;
 /// What every answer says about reading it.
 pub const SPEC_CONFORMANCE_NOTE: &str = "Episodes record verified nonconformance only. No episode does not mean the code conforms: read specs[].last_check. 'unknown' means the observer could not verify either way; absence cannot be verified under the activated positive_verified admission, so a fixed commit never auto-resolves an episode.";
 
-/// The lifecycle states of an episode that still stands, as
-/// [`super::check::is_not_closed`] defines them.
+/// The lifecycle states of an episode that still stands,
+/// [`crate::discrepancy_runtime::STANDING_LIFECYCLE_STATES`].
 macro_rules! standing_states {
     () => {
         "('open', 'acknowledged', 'waived')"

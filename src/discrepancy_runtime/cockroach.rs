@@ -54,9 +54,10 @@ use super::repository::{
     AdmittedDiscrepancyEnvelopeV1, AdmittedDiscrepancyLifecycleEventV1,
     AdmittedDiscrepancyRelationV1, DiscrepancyAppendOutcomeV1, DiscrepancyEnvelopeCandidateV1,
     DiscrepancyLedgerRepository, DiscrepancyLedgerTransitionV1, DiscrepancyLogEntryV1,
-    DiscrepancyLogRecordV1, DiscrepancyRegistryBindingV1, StoredDiscrepancyProjectionV1,
-    admit_envelope, admit_lifecycle_event, admit_relation, lifecycle_state_from_str,
-    lifecycle_state_str, verification_state_from_str, verification_state_str,
+    DiscrepancyLogRecordV1, DiscrepancyOpeningOutcomeV1, DiscrepancyRegistryBindingV1,
+    STANDING_LIFECYCLE_STATES, StoredDiscrepancyProjectionV1, admit_envelope,
+    admit_lifecycle_event, admit_relation, lifecycle_state_from_str, lifecycle_state_str,
+    verification_state_from_str, verification_state_str,
 };
 
 const LOCK_HEAD_SQL: &str = "SELECT family_fingerprint, envelope_id, log_seq \
@@ -129,11 +130,31 @@ const SELECT_FAMILY_EPISODES_SQL: &str = "SELECT h.episode_fingerprint, p.cursor
      ORDER BY h.episode_fingerprint \
      LIMIT $4";
 
+/// The lowest-keyed standing episode of one family, if any: the read
+/// [`CockroachDiscrepancyLedgerRepository::admit_opening_envelope`] makes
+/// inside its append transaction. `$4` is the standing lifecycle states.
+///
+/// Where no episode stands, the scan reads the scope's whole heads prefix,
+/// so a concurrent admission that inserts a head into it conflicts with this
+/// transaction under serializable isolation and one of the two retries (and
+/// then sees the other's episode).
+const SELECT_STANDING_FAMILY_EPISODE_SQL: &str = "SELECT h.episode_fingerprint \
+     FROM public.memory_discrepancy_heads_v1 AS h \
+     JOIN public.memory_discrepancy_projections_v1 AS p \
+       ON p.tenant_id = h.tenant_id AND p.project = h.project \
+      AND p.episode_fingerprint = h.episode_fingerprint \
+     WHERE h.tenant_id = $1 AND h.project = $2 AND h.family_fingerprint = $3 \
+       AND p.lifecycle_state = ANY($4::STRING[]) \
+     ORDER BY h.episode_fingerprint \
+     LIMIT 1";
+
 /// Upper bound on the episodes one family read returns.
 ///
-/// A family opens a new episode only after its previous one closed, so
-/// reaching this is a sign of corruption, and the read fails closed rather
-/// than returning a prefix.
+/// A family grows by one episode per detection admitted while none of its
+/// episodes stands (every earlier one resolved, dismissed, or superseded),
+/// or per unguarded [`DiscrepancyLedgerRepository::admit_envelope`], so
+/// reaching this is a sign of corruption or abuse, and the read fails closed
+/// rather than returning a prefix.
 pub const MAX_FAMILY_EPISODES: usize = 4096;
 
 /// Discrepancy ledger runtime bound once to physical scope, semantic scope,
@@ -185,10 +206,11 @@ impl CockroachDiscrepancyLedgerRepository {
     /// episode fingerprint: each one's stored projection with the envelope
     /// that seeded it.
     ///
-    /// A deriver reads this to learn whether a family already has an episode
-    /// that is not closed before it opens another. Every row is checked: the
-    /// seed record must be an envelope of this family and of the episode it
-    /// is stored under.
+    /// Every row is checked: the seed record must be an envelope of this
+    /// family and of the episode it is stored under. The read runs outside
+    /// any append transaction, so a deriver that must not open a second
+    /// standing episode decides that with [`Self::admit_opening_envelope`],
+    /// not with this.
     ///
     /// # Errors
     ///
@@ -215,6 +237,58 @@ impl CockroachDiscrepancyLedgerRepository {
         rows.iter()
             .map(|row| decode_family_episode_row(family_fingerprint, row))
             .collect()
+    }
+
+    /// Admit one detection envelope unless its family already has a
+    /// standing (open, acknowledged, or waived) episode: a family opens at
+    /// most one standing episode, even under concurrent admissions.
+    ///
+    /// Inside ONE serializable transaction it first treats this exact
+    /// envelope as [`DiscrepancyLedgerRepository::admit_envelope`] does (a
+    /// byte-identical replay is [`DiscrepancyAppendOutcomeV1::AlreadyRecorded`]
+    /// whatever the family holds, a divergent envelope for the episode is
+    /// refused), then reads the family's lowest-keyed standing episode and
+    /// returns [`DiscrepancyOpeningOutcomeV1::FamilyStands`] with it, writing
+    /// nothing, and only then seeds the episode. The family read and the seed
+    /// commit together, so of two concurrent admissions into a family with no
+    /// standing episode one opens it and the other, retried on its
+    /// serialization failure, reports that episode.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`DiscrepancyLedgerRepository::admit_envelope`] refuses; a
+    /// database error.
+    pub async fn admit_opening_envelope(
+        &self,
+        candidate: &DiscrepancyEnvelopeCandidateV1,
+    ) -> Result<DiscrepancyOpeningOutcomeV1> {
+        let admitted = admit_envelope(
+            candidate,
+            &self.registry_binding,
+            self.trusted_scope.semantic_scope(),
+        )?;
+        let envelope = candidate.envelope.clone();
+        let scope = self.trusted_scope.clone();
+        with_serializable_retry(&self.pool, self.retry_policy, move |transaction| {
+            let scope = scope.clone();
+            let envelope = envelope.clone();
+            let admitted = admitted.clone();
+            Box::pin(async move {
+                if let Some(replayed) = replayed_envelope(transaction, &scope, &admitted).await? {
+                    return Ok(DiscrepancyOpeningOutcomeV1::Admitted(replayed));
+                }
+                if let Some(standing) =
+                    standing_family_episode(transaction, &scope, admitted.family_fingerprint)
+                        .await?
+                {
+                    return Ok(DiscrepancyOpeningOutcomeV1::FamilyStands(standing));
+                }
+                seed_episode(transaction, &scope, &envelope, &admitted)
+                    .await
+                    .map(DiscrepancyOpeningOutcomeV1::Admitted)
+            })
+        })
+        .await
     }
 }
 
@@ -346,8 +420,80 @@ impl DiscrepancyLedgerRepository for CockroachDiscrepancyLedgerRepository {
     }
 }
 
-/// Seed one episode: head row, log sequence 1, and the initial projection.
+/// Seed one episode, unless this exact envelope already seeded it.
 async fn admit_envelope_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &TrustedControlScope,
+    envelope: &DiscrepancyEnvelopeV1,
+    admitted: &AdmittedDiscrepancyEnvelopeV1,
+) -> Result<DiscrepancyAppendOutcomeV1> {
+    if let Some(replayed) = replayed_envelope(transaction, scope, admitted).await? {
+        return Ok(replayed);
+    }
+    seed_episode(transaction, scope, envelope, admitted).await
+}
+
+/// `AlreadyRecorded` when this exact envelope already seeded its episode,
+/// `None` when the episode has no head yet; locks the head row it finds.
+///
+/// # Errors
+///
+/// [`FleetError::Memory`] when a DIFFERENT envelope seeded the episode:
+/// per-detection identity is immutable.
+async fn replayed_envelope(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &TrustedControlScope,
+    admitted: &AdmittedDiscrepancyEnvelopeV1,
+) -> Result<Option<DiscrepancyAppendOutcomeV1>> {
+    let head: Option<PgRow> = sqlx::query(LOCK_HEAD_SQL)
+        .bind(scope.tenant_id())
+        .bind(scope.project())
+        .bind(admitted.episode_fingerprint.digest().as_bytes().to_vec())
+        .fetch_optional(&mut **transaction)
+        .await?;
+    let Some(head) = head else {
+        return Ok(None);
+    };
+    let stored_envelope_id: Vec<u8> = head.try_get("envelope_id")?;
+    if stored_envelope_id == admitted.envelope_id.digest().as_bytes() {
+        // A byte-identical envelope replayed: idempotent, nothing written.
+        return Ok(Some(DiscrepancyAppendOutcomeV1::AlreadyRecorded {
+            record_id: admitted.envelope_id.digest(),
+        }));
+    }
+    // Per-detection identity is immutable: a DIFFERENT envelope may not
+    // re-seed an episode another detection already opened.
+    Err(FleetError::Memory(
+        "a different detection envelope is already seeded for this episode".into(),
+    ))
+}
+
+/// The lowest-keyed standing episode of `family`, read inside the append
+/// transaction ([`SELECT_STANDING_FAMILY_EPISODE_SQL`]).
+async fn standing_family_episode(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &TrustedControlScope,
+    family: DiscrepancyFamilyFingerprintV1,
+) -> Result<Option<DiscrepancyEpisodeFingerprintV1>> {
+    let standing: Vec<&str> = STANDING_LIFECYCLE_STATES
+        .into_iter()
+        .map(lifecycle_state_str)
+        .collect();
+    let episode: Option<Vec<u8>> = sqlx::query_scalar(SELECT_STANDING_FAMILY_EPISODE_SQL)
+        .bind(scope.tenant_id())
+        .bind(scope.project())
+        .bind(family.digest().as_bytes().to_vec())
+        .bind(standing)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    episode
+        .map(|bytes| digest_from(&bytes).map(DiscrepancyEpisodeFingerprintV1::from_digest))
+        .transpose()
+}
+
+/// Seed one episode that has no head yet: head row, log sequence 1, and the
+/// initial projection.
+async fn seed_episode(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
     envelope: &DiscrepancyEnvelopeV1,
@@ -355,27 +501,6 @@ async fn admit_envelope_in_transaction(
 ) -> Result<DiscrepancyAppendOutcomeV1> {
     let now = statement_timestamp(transaction).await?;
     let episode_bytes = admitted.episode_fingerprint.digest().as_bytes().to_vec();
-
-    let head: Option<PgRow> = sqlx::query(LOCK_HEAD_SQL)
-        .bind(scope.tenant_id())
-        .bind(scope.project())
-        .bind(episode_bytes.clone())
-        .fetch_optional(&mut **transaction)
-        .await?;
-    if let Some(head) = head {
-        let stored_envelope_id: Vec<u8> = head.try_get("envelope_id")?;
-        if stored_envelope_id == admitted.envelope_id.digest().as_bytes() {
-            // A byte-identical envelope replayed: idempotent, nothing written.
-            return Ok(DiscrepancyAppendOutcomeV1::AlreadyRecorded {
-                record_id: admitted.envelope_id.digest(),
-            });
-        }
-        // Per-detection identity is immutable: a DIFFERENT envelope may not
-        // re-seed an episode another detection already opened.
-        return Err(FleetError::Memory(
-            "a different detection envelope is already seeded for this episode".into(),
-        ));
-    }
 
     sqlx::query(INSERT_HEAD_SQL)
         .bind(scope.tenant_id())

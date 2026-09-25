@@ -168,9 +168,12 @@ on what evidence.
 A re-check of an already-judged commit therefore never re-opens an episode an
 operator closed, even after a registry head change mints new blob and
 observer events for that commit. Only a commit newly found nonconforming after
-a closure opens another episode. The rule is read before the write, not
-inside it, so two concurrent checks of different commits can each open an
-episode in one family.
+a closure opens another episode. The prior judgement is read from the check
+history before the write; steps 2 and 3 are decided inside the append
+transaction, which reads the family's standing episode and seeds the new one
+only when none stands. Two concurrent checks of different commits therefore
+conflict under serializable isolation: one opens the episode and the other,
+retried, joins it, so a family never holds two standing episodes.
 
 ## D8 — Discrepancy writes are fenced by the witness binding
 

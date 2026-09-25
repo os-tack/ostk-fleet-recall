@@ -27,15 +27,23 @@
 //! 5. It compares the two sides at `t = max(statement effective_from, commit
 //!    instant)` ([`super::providers`]).
 //! 6. Only a discrepant comparison touches the discrepancy ledger, under the
-//!    opening rule ([`spec_opening_decision`]), which is keyed on the
-//!    statement and the commit: a commit already judged nonconforming under
-//!    this statement joins the episode it was judged into, even after a
-//!    registry head change mints new blob and observer events for it;
-//!    otherwise a family that already has an episode that is not closed
-//!    (open, acknowledged, or waived) keeps it; otherwise the check opens a
-//!    new episode ([`super::envelope::build_spec_envelope`]).
+//!    opening rule, which is keyed on the statement and the commit: a commit
+//!    already judged nonconforming under this statement joins the episode it
+//!    was judged into, even after a registry head change mints new blob and
+//!    observer events for it; otherwise a family that already has a standing
+//!    episode (open, acknowledged, or waived) keeps it; otherwise the check
+//!    opens a new episode ([`super::envelope::build_spec_envelope`]). The
+//!    family part is decided inside the append transaction
+//!    ([`CockroachDiscrepancyLedgerRepository::admit_opening_envelope`]), so
+//!    concurrent checks of different commits never open two standing
+//!    episodes in one family.
 //! 7. Every comparison, whatever its verdict, records one
-//!    [`SpecCheckRecordV1`]. A replay of the same check writes nothing new.
+//!    [`SpecCheckRecordV1`]. A replay of the same check under the same
+//!    coverage receipt writes nothing new. Once the worker's git step has
+//!    written a newer receipt for the source, a re-check of the same commit
+//!    binds that receipt, so it appends a new observer event and records a
+//!    new check (which becomes the statement's latest), while the opening
+//!    rule still joins the episode the commit was judged into.
 //!
 //! Under the genesis `positive_verified` admission only presence is ever
 //! verified. So "must be absent" is the only expectation a commit can be
@@ -45,9 +53,7 @@
 //! `ostk-spec episode resolve|dismiss` ([`super::lifecycle`]).
 //!
 //! The discrepancy write is fenced by the witnessed registry binding, not by
-//! the append transaction's head read, and the opening rule is read before
-//! the write rather than inside it: two concurrent checks of different
-//! commits can each open an episode in one family.
+//! the append transaction's head read.
 
 use serde::Serialize;
 
@@ -59,13 +65,13 @@ use crate::connectors::git::{
 use crate::coverage_runtime::CockroachCoverageRuntimeRepository;
 use crate::discrepancy_runtime::{
     CockroachDiscrepancyLedgerRepository, ComparisonIndeterminacyV1, ComparisonVerdictV1,
-    DiscrepancyAppendOutcomeV1, DiscrepancyLedgerRepository as _, DiscrepancyRegistryBindingV1,
+    DiscrepancyAppendOutcomeV1, DiscrepancyOpeningOutcomeV1, DiscrepancyRegistryBindingV1,
 };
 use crate::error::FleetError;
 use crate::evidence_ledger::ContentKeyEncryptionKey;
 use crate::memory_contracts::common::{CanonicalTimestamp, ContractId};
 use crate::memory_contracts::digest::Sha256Digest;
-use crate::memory_contracts::discrepancy::{DiscrepancyEpisodeFingerprintV1, LifecycleState};
+use crate::memory_contracts::discrepancy::DiscrepancyEpisodeFingerprintV1;
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::memory_contracts::generation2_registry::GIT_CONNECTOR;
 use crate::memory_contracts::observer::{
@@ -212,56 +218,6 @@ impl SpecDiscrepancyActionV1 {
             Self::NotOpened => None,
         }
     }
-}
-
-/// What [`spec_opening_decision`] decided for a discrepant comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpecOpeningDecisionV1 {
-    /// The commit was already judged nonconforming into this episode.
-    AlreadyJudged(DiscrepancyEpisodeFingerprintV1),
-    /// The family already has this episode that is not closed.
-    AlreadyOpen(DiscrepancyEpisodeFingerprintV1),
-    /// Open a new episode.
-    Open,
-}
-
-/// The opening rule, keyed on (statement, commit) first.
-///
-/// `prior_nonconforming` is the episode a previous nonconforming check of the
-/// same statement at the same commit named; `family_episodes` are the
-/// family's episodes with their lifecycle states. A prior judgement wins, so
-/// a registry head change, which mints new events for the same commit, can
-/// never re-open an episode an operator closed. Otherwise the lowest-keyed
-/// episode that is still open, acknowledged, or waived is joined, and only a
-/// family with none opens a new one.
-#[must_use]
-pub fn spec_opening_decision(
-    prior_nonconforming: Option<DiscrepancyEpisodeFingerprintV1>,
-    family_episodes: &[(DiscrepancyEpisodeFingerprintV1, LifecycleState)],
-) -> SpecOpeningDecisionV1 {
-    if let Some(episode) = prior_nonconforming {
-        return SpecOpeningDecisionV1::AlreadyJudged(episode);
-    }
-    family_episodes
-        .iter()
-        .filter(|(_, state)| is_not_closed(*state))
-        .map(|(episode, _)| *episode)
-        .min()
-        .map_or(
-            SpecOpeningDecisionV1::Open,
-            SpecOpeningDecisionV1::AlreadyOpen,
-        )
-}
-
-/// Whether an episode in `state` still stands: open, acknowledged, or waived
-/// (a waiver expires back to open). Resolved, dismissed, and superseded
-/// episodes are closed.
-#[must_use]
-pub const fn is_not_closed(state: LifecycleState) -> bool {
-    matches!(
-        state,
-        LifecycleState::Open | LifecycleState::Acknowledged | LifecycleState::Waived
-    )
 }
 
 /// The report of one [`run_spec_check`] call; what `ostk-spec check` prints.
@@ -577,67 +533,55 @@ pub async fn run_spec_check(
         expectation,
     )?;
 
-    // Only a verified nonconformance touches the discrepancy ledger.
-    let discrepancy = if comparison == ComparisonVerdictV1::Discrepant {
-        let prior = specs
-            .nonconforming_check_for(statement_id, &request.commit)
-            .await?
-            .and_then(|check| check.record.episode);
+    // Only a verified nonconformance touches the discrepancy ledger. A commit
+    // already judged under this statement joins the episode it was judged
+    // into, so a closed episode is never re-opened.
+    let discrepancy = if comparison != ComparisonVerdictV1::Discrepant {
+        SpecDiscrepancyActionV1::NotOpened
+    } else if let Some(episode) = specs
+        .nonconforming_check_for(statement_id, &request.commit)
+        .await?
+        .and_then(|check| check.record.episode)
+    {
+        SpecDiscrepancyActionV1::AlreadyJudged { episode }
+    } else {
+        let ingress = observer_binding
+            .build_ingress(&record, &clocks, 1)
+            .map_err(|error| refused("the observer result has no source fact", &error))?;
+        let source_fact_id = observer_source_fact_id(&ingress.candidate)?;
+        let candidate = build_spec_envelope(&SpecDetectionV1 {
+            registry: witness.head_binding(),
+            statement_id,
+            proposal,
+            expectation,
+            extractor: admission.entry_reference(),
+            observer_event,
+            blob_event,
+            source_fact_id,
+            compared_at: &compared_at,
+            verdict: &comparison,
+        })?;
+        let episode = candidate.envelope.episode_fingerprint;
         let ledger = CockroachDiscrepancyLedgerRepository::new(
             runtime.pool().clone(),
             runtime.control_scope().clone(),
             DiscrepancyRegistryBindingV1::from_witness(witness),
             runtime.retry_policy(),
         )?;
-        let family_episodes = if prior.is_some() {
-            Vec::new()
-        } else {
-            ledger
-                .read_family_episodes(family_fingerprint)
-                .await?
-                .into_iter()
-                .map(|(stored, _)| (stored.episode_fingerprint, stored.lifecycle_state))
-                .collect()
-        };
-        match spec_opening_decision(prior, &family_episodes) {
-            SpecOpeningDecisionV1::AlreadyJudged(episode) => {
-                SpecDiscrepancyActionV1::AlreadyJudged { episode }
+        // The family's standing episode is read in the append transaction.
+        match ledger.admit_opening_envelope(&candidate).await? {
+            DiscrepancyOpeningOutcomeV1::Admitted(DiscrepancyAppendOutcomeV1::Appended(_)) => {
+                SpecDiscrepancyActionV1::Opened { episode }
             }
-            SpecOpeningDecisionV1::AlreadyOpen(episode) => {
-                SpecDiscrepancyActionV1::AlreadyOpen { episode }
-            }
-            SpecOpeningDecisionV1::Open => {
-                let ingress = observer_binding
-                    .build_ingress(&record, &clocks, 1)
-                    .map_err(|error| refused("the observer result has no source fact", &error))?;
-                let source_fact_id = observer_source_fact_id(&ingress.candidate)?;
-                let candidate = build_spec_envelope(&SpecDetectionV1 {
-                    registry: witness.head_binding(),
-                    statement_id,
-                    proposal,
-                    expectation,
-                    extractor: admission.entry_reference(),
-                    observer_event,
-                    blob_event,
-                    source_fact_id,
-                    compared_at: &compared_at,
-                    verdict: &comparison,
-                })?;
-                let episode = candidate.envelope.episode_fingerprint;
-                match ledger.admit_envelope(&candidate).await? {
-                    DiscrepancyAppendOutcomeV1::Appended(_) => {
-                        SpecDiscrepancyActionV1::Opened { episode }
-                    }
-                    // This very detection is already durable (a check that
-                    // died before recording itself): the commit was judged.
-                    DiscrepancyAppendOutcomeV1::AlreadyRecorded { .. } => {
-                        SpecDiscrepancyActionV1::AlreadyJudged { episode }
-                    }
-                }
+            // This very detection is already durable (a check that died
+            // before recording itself): the commit was judged.
+            DiscrepancyOpeningOutcomeV1::Admitted(
+                DiscrepancyAppendOutcomeV1::AlreadyRecorded { .. },
+            ) => SpecDiscrepancyActionV1::AlreadyJudged { episode },
+            DiscrepancyOpeningOutcomeV1::FamilyStands(standing) => {
+                SpecDiscrepancyActionV1::AlreadyOpen { episode: standing }
             }
         }
-    } else {
-        SpecDiscrepancyActionV1::NotOpened
     };
 
     let check = SpecCheckRecordV1 {

@@ -79,7 +79,7 @@ pub use activation::{
 };
 pub use check::{
     DEFAULT_SPEC_MEMBER_BOUND, SpecCheckOutcomeV1, SpecCheckRequestV1, SpecDiscrepancyActionV1,
-    SpecOpeningDecisionV1, SpecSelectionV1, is_not_closed, run_spec_check, spec_opening_decision,
+    SpecSelectionV1, run_spec_check,
 };
 pub use cockroach::{
     CockroachSpecRepository, MAX_CANONICAL_PROPOSAL_BYTES, MAX_CANONICAL_SPEC_RECORD_BYTES,

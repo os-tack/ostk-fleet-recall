@@ -20,7 +20,9 @@
 //!   cross-family relation are all refused;
 //! * a superseding relation freezes its source episode's projection;
 //! * a family read returns each of that family's episodes with its stored
-//!   state and seeding envelope, and nothing of another family or scope.
+//!   state and seeding envelope, and nothing of another family or scope;
+//! * an opening admission seeds a family's episode only while none of its
+//!   episodes stands, even when two admissions race.
 //!
 //! The ledger tables are keyed by the trusted `(tenant, project)` pair; a
 //! fresh unique physical scope per test isolates them. The semantic scope is
@@ -36,7 +38,8 @@ use ostk_fleet_recall::FleetScope;
 use ostk_fleet_recall::control_log::TrustedControlScope;
 use ostk_fleet_recall::discrepancy_runtime::{
     CockroachDiscrepancyLedgerRepository, DiscrepancyAppendOutcomeV1,
-    DiscrepancyEnvelopeCandidateV1, DiscrepancyLedgerRepository, DiscrepancyRegistryBindingV1,
+    DiscrepancyEnvelopeCandidateV1, DiscrepancyLedgerRepository, DiscrepancyOpeningOutcomeV1,
+    DiscrepancyRegistryBindingV1,
 };
 use ostk_fleet_recall::memory_contracts::bootstrap::BootstrapReceiptV1;
 use ostk_fleet_recall::memory_contracts::canonical::{
@@ -1021,5 +1024,136 @@ async fn live_a_family_read_returns_that_familys_episodes_only_when_configured()
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+/// Whether `outcome` seeded a new episode.
+const fn opened(outcome: &DiscrepancyOpeningOutcomeV1) -> bool {
+    matches!(
+        outcome,
+        DiscrepancyOpeningOutcomeV1::Admitted(DiscrepancyAppendOutcomeV1::Appended(_))
+    )
+}
+
+#[tokio::test]
+async fn live_a_family_opens_one_standing_episode_even_when_admissions_race_when_configured() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = live_pool(&database_url).await;
+    let repository = ledger(&pool, "opening");
+    let (first, second) = (envelope('1'), envelope('2'));
+    assert_eq!(first.family_fingerprint, second.family_fingerprint);
+
+    // The first detection opens the family's episode; a second joins it
+    // while it stands, open or acknowledged, and writes nothing; a replay of
+    // the first is recorded, not re-opened.
+    assert!(opened(
+        &repository
+            .admit_opening_envelope(&candidate(first.clone()))
+            .await
+            .unwrap()
+    ));
+    let joins_first = DiscrepancyOpeningOutcomeV1::FamilyStands(first.episode_fingerprint);
+    assert_eq!(
+        repository
+            .admit_opening_envelope(&candidate(second.clone()))
+            .await
+            .unwrap(),
+        joins_first
+    );
+    assert!(matches!(
+        repository
+            .admit_opening_envelope(&candidate(first.clone()))
+            .await
+            .unwrap(),
+        DiscrepancyOpeningOutcomeV1::Admitted(DiscrepancyAppendOutcomeV1::AlreadyRecorded { .. })
+    ));
+    repository
+        .append_lifecycle_event(&acknowledge_event(&first, "2026-08-15T05:00:00.000000000Z"))
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .admit_opening_envelope(&candidate(second.clone()))
+            .await
+            .unwrap(),
+        joins_first
+    );
+    assert!(
+        repository
+            .read_projection(second.episode_fingerprint)
+            .await
+            .unwrap()
+            .is_none(),
+        "a joined detection seeds nothing"
+    );
+
+    // Once the first episode is closed, the next detection opens another.
+    repository
+        .append_lifecycle_event(&dismiss_event(
+            &first,
+            "2026-08-15T06:00:00.000000000Z",
+            "principal.on_call",
+        ))
+        .await
+        .unwrap();
+    assert!(opened(
+        &repository
+            .admit_opening_envelope(&candidate(second.clone()))
+            .await
+            .unwrap()
+    ));
+
+    // Two detections racing into a family where nothing stands: exactly one
+    // opens its episode, and the other reports that episode.
+    for round in 0..8 {
+        race_two_detections(&pool, round).await;
+    }
+}
+
+/// Race two detections of one family into a fresh scope where nothing
+/// stands: exactly one opens its episode, the other reports that episode,
+/// and the family holds that one episode.
+async fn race_two_detections(pool: &PgPool, round: u32) {
+    let racing = ledger(pool, &format!("opening-race-{round}"));
+    let (left, right) = (envelope('3'), envelope('4'));
+    let (left_candidate, right_candidate) = (candidate(left.clone()), candidate(right.clone()));
+    let (left_outcome, right_outcome) = tokio::join!(
+        racing.admit_opening_envelope(&left_candidate),
+        racing.admit_opening_envelope(&right_candidate),
+    );
+    let outcomes = [
+        (left.episode_fingerprint, left_outcome.unwrap()),
+        (right.episode_fingerprint, right_outcome.unwrap()),
+    ];
+    let winners: Vec<DiscrepancyEpisodeFingerprintV1> = outcomes
+        .iter()
+        .filter(|(_, outcome)| opened(outcome))
+        .map(|(episode, _)| *episode)
+        .collect();
+    let [winner] = winners.as_slice() else {
+        panic!("round {round}: exactly one racing detection opens: {outcomes:?}");
+    };
+    for (episode, outcome) in &outcomes {
+        if episode != winner {
+            assert_eq!(
+                outcome,
+                &DiscrepancyOpeningOutcomeV1::FamilyStands(*winner),
+                "round {round}"
+            );
+        }
+    }
+    let family = racing
+        .read_family_episodes(left.family_fingerprint)
+        .await
+        .unwrap();
+    assert_eq!(
+        family
+            .iter()
+            .map(|(stored, _)| stored.episode_fingerprint)
+            .collect::<Vec<_>>(),
+        [*winner],
+        "round {round}"
     );
 }

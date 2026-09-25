@@ -295,6 +295,36 @@ pub enum DiscrepancyAppendOutcomeV1 {
     AlreadyRecorded { record_id: Sha256Digest },
 }
 
+/// The lifecycle states of an episode that still stands: open,
+/// acknowledged, or waived (a waiver expires back to open). Resolved,
+/// dismissed, and superseded episodes are closed.
+pub const STANDING_LIFECYCLE_STATES: [LifecycleState; 3] = [
+    LifecycleState::Open,
+    LifecycleState::Acknowledged,
+    LifecycleState::Waived,
+];
+
+/// Whether an episode in `state` still stands
+/// ([`STANDING_LIFECYCLE_STATES`]).
+#[must_use]
+pub const fn is_standing(state: LifecycleState) -> bool {
+    matches!(
+        state,
+        LifecycleState::Open | LifecycleState::Acknowledged | LifecycleState::Waived
+    )
+}
+
+/// What an admission that opens at most one standing episode per family did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscrepancyOpeningOutcomeV1 {
+    /// The envelope seeded its episode, or this exact envelope was already
+    /// durable.
+    Admitted(DiscrepancyAppendOutcomeV1),
+    /// The envelope's family already has this standing episode, the lowest
+    /// keyed one if several stand. Nothing was written.
+    FamilyStands(DiscrepancyEpisodeFingerprintV1),
+}
+
 /// Append and read surface for the discrepancy ledger, bound once to
 /// physical scope, semantic scope, and the active registry head.
 #[async_trait]

@@ -69,7 +69,8 @@ pub use repository::{
     AdmittedDiscrepancyEnvelopeV1, AdmittedDiscrepancyLifecycleEventV1,
     AdmittedDiscrepancyRelationV1, DiscrepancyAppendOutcomeV1, DiscrepancyEnvelopeCandidateV1,
     DiscrepancyLedgerRepository, DiscrepancyLedgerTransitionV1, DiscrepancyLogEntryV1,
-    DiscrepancyLogRecordV1, DiscrepancyRegistryBindingV1, StoredDiscrepancyProjectionV1,
-    admit_envelope, admit_lifecycle_event, admit_relation, lifecycle_state_from_str,
+    DiscrepancyLogRecordV1, DiscrepancyOpeningOutcomeV1, DiscrepancyRegistryBindingV1,
+    STANDING_LIFECYCLE_STATES, StoredDiscrepancyProjectionV1, admit_envelope,
+    admit_lifecycle_event, admit_relation, is_standing, lifecycle_state_from_str,
     lifecycle_state_str, verification_state_from_str, verification_state_str,
 };
