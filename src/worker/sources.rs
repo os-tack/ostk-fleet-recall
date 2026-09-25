@@ -12,6 +12,14 @@
 //!   instance, `<instance_prefix>.<sanitized file stem>`
 //!   ([`transcript_instance_id`]).
 //! * **ci** — one instance per `(provider repository, workflow, branch)`.
+//! * **collectors** — one instance per provider scope (a Slack workspace, a
+//!   Linear organization, a documents root): the provider, the pinned scope,
+//!   the audience the operator declares, and the provider's own settings
+//!   (ADR 0008). Parsed and validated here; the worker's `collect` step drains
+//!   what collectors staged, and each provider's adapter reads its settings.
+//!   Settings name credentials by environment variable, never inline: a
+//!   secret-shaped value, or an inline value under a credential-named key, is
+//!   refused.
 //! * **observer** — the identity `ostk-spec check` appends observer runs under.
 //!   The worker does not read it.
 //!
@@ -28,10 +36,13 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::collectors::audience::AudiencePolicyV1;
+use crate::collectors::redaction::scan_collected_secrets;
 use crate::connectors::ci::{CiRepositoryIdV1, CiScanRequestV1};
 use crate::connectors::git::{GitRefName, GitRepositoryIdV1};
 use crate::connectors::transcript::MAX_TRANSCRIPT_BYTES;
 use crate::error::{FleetError, Result};
+use crate::memory_contracts::collected_item::{BoundedTextV1, MAX_SCOPE_ID_BYTES, ProviderKindV1};
 use crate::memory_contracts::common::{CanonicalTimestamp, ContractId};
 
 /// The only `schema_version` a sources file may declare.
@@ -121,6 +132,9 @@ pub struct WorkerSourcesV1 {
     pub transcripts: Vec<TranscriptSourceGroupV1>,
     #[serde(default)]
     pub ci: Vec<CiSourceV1>,
+    /// Collector instances (ADR 0008).
+    #[serde(default)]
+    pub collectors: Vec<CollectorSourceV1>,
     /// Read by `ostk-spec check`, never by the worker.
     #[serde(default)]
     pub observer: Option<ObserverSourceV1>,
@@ -193,6 +207,116 @@ pub struct CiSourceV1 {
     pub stale_after_seconds: Option<u64>,
 }
 
+/// One collector instance: one provider scope, read by one provider adapter
+/// (ADR 0008).
+///
+/// The provider is data (`docs`, `slack`, `linear`, `granola`, and any later
+/// one), so a new provider needs no registry change. `settings` belong to the
+/// provider's adapter, which validates them; this file only refuses a
+/// credential written inline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorSourceV1 {
+    /// The provider kind.
+    pub provider: ProviderKindV1,
+    /// Authenticated ingress principal the items are delivered as.
+    pub connector_principal: ContractId,
+    /// This collector's instance: its outbox rows, cursors, status row, and
+    /// coverage domains.
+    pub connector_instance: ContractId,
+    /// The operator-pinned provider scope: a Slack `team_id`, a Linear
+    /// organization id, a Granola workspace pin, a documents root id.
+    pub provider_scope_id: BoundedTextV1<MAX_SCOPE_ID_BYTES>,
+    /// What the operator declares visible to the whole project.
+    #[serde(default)]
+    pub audience: AudiencePolicyV1,
+    /// The provider adapter's settings.
+    #[serde(default)]
+    pub settings: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub stale_after_seconds: Option<u64>,
+}
+
+/// Settings keys that name a credential; their value must be the name of an
+/// environment variable, under a key ending in `_env`.
+const CREDENTIAL_KEY_SUFFIXES: [&str; 6] = [
+    "token",
+    "secret",
+    "password",
+    "api_key",
+    "apikey",
+    "credential",
+];
+
+impl CollectorSourceV1 {
+    fn validate(&self) -> Result<()> {
+        let instance = &self.connector_instance;
+        if !scan_collected_secrets(self.provider_scope_id.as_str()).is_empty() {
+            return Err(invalid(&format!(
+                "collector {instance}: provider_scope_id holds a secret shape"
+            )));
+        }
+        for container in &self.audience.private_containers {
+            if container.is_empty() || !scan_collected_secrets(container).is_empty() {
+                return Err(invalid(&format!(
+                    "collector {instance}: a private container id is empty or secret-shaped"
+                )));
+            }
+        }
+        refuse_inline_credentials(instance, "settings", &self.settings)?;
+        validate_stale_after(
+            &format!("collector {instance} stale_after_seconds"),
+            self.stale_after_seconds
+                .unwrap_or(DEFAULT_STALE_AFTER_SECONDS),
+        )
+    }
+}
+
+/// Refuse a credential written into the sources file: any secret-shaped
+/// string, and any inline string under a credential-named key.
+fn refuse_inline_credentials(
+    instance: &ContractId,
+    path: &str,
+    settings: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    for (key, value) in settings {
+        let field = format!("{path}.{key}");
+        let lowered = key.to_ascii_lowercase();
+        if value.is_string()
+            && !lowered.ends_with("_env")
+            && CREDENTIAL_KEY_SUFFIXES
+                .iter()
+                .any(|suffix| lowered.ends_with(suffix))
+        {
+            return Err(invalid(&format!(
+                "collector {instance}: {field} holds a credential inline; name an environment \
+                 variable under {key}_env instead"
+            )));
+        }
+        refuse_secret_values(instance, &field, value)?;
+    }
+    Ok(())
+}
+
+fn refuse_secret_values(
+    instance: &ContractId,
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<()> {
+    match value {
+        serde_json::Value::String(text) if !scan_collected_secrets(text).is_empty() => {
+            Err(invalid(&format!(
+                "collector {instance}: {field} holds a secret-shaped value"
+            )))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .try_for_each(|value| refuse_secret_values(instance, field, value)),
+        serde_json::Value::Object(map) => refuse_inline_credentials(instance, field, map),
+        _ => Ok(()),
+    }
+}
+
 /// The identity observer runs are appended under (`ostk-spec check`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -238,7 +362,8 @@ impl WorkerSourcesV1 {
     /// schema version, the coverage start, every staleness bound, every scan
     /// bound, every git ref and CI coordinate, and that no two configured
     /// sources share a connector instance (a transcript prefix counts as the
-    /// instances it can derive). Transcript file names are only known at tick
+    /// instances it can derive, and collectors count), and that no collector
+    /// writes a credential inline. Transcript file names are only known at tick
     /// time, so a collision between two files is refused then, per file.
     ///
     /// # Errors
@@ -270,6 +395,10 @@ impl WorkerSourcesV1 {
         for source in &self.ci {
             source.validate()?;
             claim(&source.connector_instance, "ci")?;
+        }
+        for source in &self.collectors {
+            source.validate()?;
+            claim(&source.connector_instance, "collector")?;
         }
         if let Some(observer) = &self.observer {
             claim(&observer.connector_instance, "observer")?;
@@ -720,6 +849,82 @@ mod tests {
         let longest_prefix = ContractId::new("p".repeat(MAX_INSTANCE_PREFIX_BYTES)).unwrap();
         let fallback = transcript_instance_id(&longest_prefix, &long).unwrap();
         assert_eq!(fallback.as_str().len(), MAX_INSTANCE_ID_BYTES);
+    }
+
+    fn with_collector(settings: &serde_json::Value) -> serde_json::Value {
+        let mut value = minimal();
+        value["collectors"] = serde_json::json!([{
+            "provider": "slack",
+            "connector_principal": "principal.slack",
+            "connector_instance": "slack.acme",
+            "provider_scope_id": "T07ACME0001",
+            "audience": {"operator_declared": false, "private_containers": ["C07PRIVATE1"]},
+            "settings": settings.clone()
+        }]);
+        value
+    }
+
+    #[test]
+    fn a_collector_parses_with_its_provider_scope_and_settings() {
+        let sources = parse(&with_collector(&serde_json::json!({
+            "token_env": "FLEET_RECALL_SLACK_BOT_TOKEN",
+            "channels": ["C07PLATENG1"],
+            "api_base": "https://slack.com/api"
+        })))
+        .expect("a collector with an env-named token is valid");
+        let collector = &sources.collectors[0];
+        assert_eq!(collector.provider.as_str(), "slack");
+        assert_eq!(collector.provider_scope_id.as_str(), "T07ACME0001");
+        assert_eq!(collector.audience.private_containers, ["C07PRIVATE1"]);
+        assert_eq!(collector.settings["channels"][0], "C07PLATENG1");
+        // A file with no collectors keeps parsing exactly as before.
+        assert!(parse(&minimal()).unwrap().collectors.is_empty());
+    }
+
+    #[test]
+    fn a_collector_credential_written_inline_is_refused() {
+        let token = ["xox", "b-", "1234567890-", "abcdefghijklmnop"].concat();
+        let message = refusal(&with_collector(&serde_json::json!({ "token": token })));
+        assert!(message.contains("token_env"), "{message}");
+
+        let message = refusal(&with_collector(&serde_json::json!({
+            "headers": {"x-extra": token}
+        })));
+        assert!(message.contains("secret-shaped"), "{message}");
+        assert!(
+            !message.contains(&token),
+            "the refusal never repeats the value"
+        );
+
+        let message = refusal(&with_collector(&serde_json::json!({
+            "channels": ["C07PLATENG1", token]
+        })));
+        assert!(message.contains("settings.channels"), "{message}");
+
+        let message = refusal(&with_collector(
+            &serde_json::json!({ "signing_secret": "hunter2" }),
+        ));
+        assert!(message.contains("signing_secret_env"), "{message}");
+    }
+
+    #[test]
+    fn a_collector_instance_is_unique_across_every_connector() {
+        let mut value = with_collector(&serde_json::json!({}));
+        value["collectors"][0]["connector_instance"] = serde_json::json!("connector.ci.main");
+        assert!(refusal(&value).contains("configured twice"));
+
+        let mut value = with_collector(&serde_json::json!({}));
+        value["collectors"][0]["connector_instance"] =
+            serde_json::json!("connector.transcript.slack");
+        assert!(refusal(&value).contains("transcript prefix"));
+
+        let mut value = with_collector(&serde_json::json!({}));
+        value["collectors"][0]["provider"] = serde_json::json!("Slack");
+        assert!(refusal(&value).contains("provider"));
+
+        let mut value = with_collector(&serde_json::json!({}));
+        value["collectors"][0]["stale_after_seconds"] = serde_json::json!(30);
+        assert!(refusal(&value).contains("slack.acme"));
     }
 
     #[test]

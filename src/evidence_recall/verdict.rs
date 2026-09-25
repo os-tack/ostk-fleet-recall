@@ -79,8 +79,15 @@ pub fn absence_verdict(
     if readiness.events_awaiting_body_projection > 0 {
         reasons.insert(AbsenceReasonV1::BodyProjectionLag);
     }
-    if readiness.transcript_turns_awaiting_admission > 0 {
+    if readiness.transcript_turns_awaiting_admission > 0
+        || readiness
+            .items_awaiting_admission
+            .is_some_and(|pending| pending > 0)
+    {
         reasons.insert(AbsenceReasonV1::IngestOutboxPending);
+    }
+    if readiness.collector_state_unreadable {
+        reasons.insert(AbsenceReasonV1::CollectorStateUnreadable);
     }
     if !readiness.lexical_current {
         reasons.insert(AbsenceReasonV1::LexicalProjectionLag);
@@ -137,6 +144,8 @@ mod tests {
         EvidenceReadinessV1 {
             events_awaiting_body_projection: 0,
             transcript_turns_awaiting_admission: 0,
+            items_awaiting_admission: None,
+            collector_state_unreadable: false,
             lexical_current: true,
             dense_current: true,
             dense_lane: EvidenceDenseLaneV1::NoQueryVector,
@@ -148,6 +157,7 @@ mod tests {
         EvidenceSourceV1 {
             connector_instance: instance.to_owned(),
             kind: EvidenceSourceKindV1::Git,
+            provider: None,
             state: "active".to_owned(),
             last_outcome: WorkerSourceOutcomeV1::Unchanged,
             last_checked_at: Some(instant(checked)),
@@ -365,6 +375,48 @@ mod tests {
         assert_eq!(
             reasons(true, &current(), &alone),
             [AbsenceReasonV1::SourceStale]
+        );
+    }
+
+    #[test]
+    fn pending_collected_items_make_an_empty_answer_unknown() {
+        let mut readiness = current();
+        readiness.items_awaiting_admission = Some(0);
+        assert!(reasons(true, &readiness, &two_healthy()).is_empty());
+        readiness.items_awaiting_admission = Some(3);
+        assert_eq!(
+            reasons(true, &readiness, &two_healthy()),
+            [AbsenceReasonV1::IngestOutboxPending]
+        );
+    }
+
+    #[test]
+    fn unreadable_collector_state_is_unknown_never_absent() {
+        let mut readiness = current();
+        readiness.collector_state_unreadable = true;
+        assert_eq!(
+            reasons(true, &readiness, &two_healthy()),
+            [AbsenceReasonV1::CollectorStateUnreadable]
+        );
+        // A hit is still present: only the empty answer loses its meaning.
+        assert_eq!(
+            absence_verdict(1, true, &readiness, &two_healthy()).verdict,
+            AbsenceVerdictV1::Present
+        );
+    }
+
+    #[test]
+    fn a_collector_source_gates_absence_like_any_other() {
+        let mut sources = two_healthy();
+        let mut collector = healthy("docs.specs", 45);
+        collector.kind = EvidenceSourceKindV1::Collector;
+        collector.provider = Some("docs".to_owned());
+        sources.active.push(collector);
+        assert!(reasons(true, &current(), &sources).is_empty());
+        sources.active[2].coverage = None;
+        assert_eq!(
+            reasons(true, &current(), &sources),
+            [AbsenceReasonV1::IncompleteCoverage]
         );
     }
 

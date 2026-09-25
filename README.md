@@ -241,6 +241,11 @@ admitted, in this order:
   evidence under a freshly verified generation-2 head, writes coverage
   receipts for what it read, and updates each source's status row in
   `memory_worker_sources_v1`.
+- `collect`: drains the collector outbox (migration 0033,
+  [ADR 0008](docs/adr/0008-collected-items.md) D4): items a collector staged
+  are admitted under `connector.collected.<mode>` of the verified head, which
+  needs a scope moved to generation 3. Below migration 33 it is skipped. No
+  provider collector stages items yet.
 - `project`: the body projector, then the lexical tier.
 - `embed`: the dense tier, through the pinned model2vec embedder.
 
@@ -256,7 +261,7 @@ The command reads:
 - the same writer configuration as `serve`: `FLEET_RECALL_DATABASE_URL` as
   `fleet_writer`, `FLEET_RECALL_TENANT_ID`, `FLEET_RECALL_PROJECT`,
   `FLEET_RECALL_AGENT`, and the model bundle variables;
-- for `ingest` and `project`: the writer-authority pins that
+- for `ingest`, `collect`, and `project`: the writer-authority pins that
   `ostk-authority-install apply` prints, and `FLEET_RECALL_CONTENT_KEK_HEX`,
   the same key on every run and host of the scope;
 - for `embed`: the pinned model bundle. Every dense row records

@@ -1,7 +1,7 @@
 -- Long-lived runtime-writer role boundary for the dedicated fleet_recall
 -- database.
 --
--- Run only after the complete successful migration prefix 1 through 31 (version
+-- Run only after the complete successful migration prefix 1 through 33 (version
 -- 25 is permanently unused). Other later successful migrations are compatible
 -- and cannot mask a missing or failed row in that bounded prefix. Run only as
 -- a cluster admin; database ownership alone is insufficient. This policy is
@@ -67,25 +67,26 @@ $$;
 -- the legacy corpus and claim surface, the Stage-4 evidence plane (18), the
 -- Stage-5 body, coverage, recall, transcript, and visibility tables (19-23),
 -- normative activation (24), the CI connector (26), the discrepancy ledger
--- (27), the conflict lifecycle log (29), worker source status (30), and spec
--- conformance (31). A policy applied before any of them fails here, before any
--- change, rather than on a GRANT.
+-- (27), the conflict lifecycle log (29), worker source status (30), spec
+-- conformance (31), and collected items (33). Migration 32 adds no table and
+-- no grant, but lies inside the bounded prefix. A policy applied before any of
+-- them fails here, before any change, rather than on a GRANT.
 DO $$
 DECLARE
     runtime_schema_ready BOOL;
 BEGIN
-    SELECT count(*) = 30
+    SELECT count(*) = 32
        AND min(version) = 1
-       AND max(version) = 31
+       AND max(version) = 33
        AND COALESCE(bool_and(success), false)
     INTO runtime_schema_ready
     FROM public._sqlx_migrations
-    WHERE version BETWEEN 1 AND 31;
+    WHERE version BETWEEN 1 AND 33;
 
     IF runtime_schema_ready IS DISTINCT FROM true THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
-            MESSAGE = 'runtime writer role requires successful migrations 1 through 31 (25 is permanently unused)';
+            MESSAGE = 'runtime writer role requires successful migrations 1 through 33 (25 is permanently unused)';
     END IF;
 END
 $$;
@@ -790,15 +791,17 @@ GRANT SELECT ON TABLE public.memory_writer_authority_v1 TO fleet_runtime;
 
 -- The Stage-5 body, coverage, recall, and transcript planes (migrations 19
 -- through 23), normative activation (24), the CI connector (26), the
--- discrepancy ledger (27), worker source status (30, ADR 0006), and spec
--- conformance (31, ADR 0007). Logs, statements, checks, receipts, bodies,
--- occurrences, manifests, and measured windows are append-only by privilege
--- (SELECT and INSERT, no UPDATE or DELETE). The discrepancy relations table
--- is read-only: nothing served appends a relation yet. UPDATE on heads,
--- cursors, pointers, watermarks, projections, the transcript outbox's drain
--- state, and worker status covers CockroachDB's SELECT ... FOR UPDATE and
--- each compare-and-set advance or upsert; none of those rows is an accepted
--- envelope, a log entry, or a receipt. No table in this block receives
+-- discrepancy ledger (27), worker source status (30, ADR 0006), spec
+-- conformance (31, ADR 0007), and collected items (33, ADR 0008). Logs,
+-- statements, checks, receipts, bodies, occurrences, manifests, measured
+-- windows, collected item history, item links, and collector dead letters are
+-- append-only by privilege (SELECT and INSERT, no UPDATE or DELETE). The
+-- discrepancy relations table is read-only: nothing served appends a relation
+-- yet. UPDATE on heads, cursors, pointers, watermarks, projections, the
+-- transcript and collector outboxes' drain state, worker and collector
+-- status, and collector containers covers CockroachDB's SELECT ... FOR UPDATE
+-- and each compare-and-set advance or upsert; none of those rows is an
+-- accepted envelope, a log entry, or a receipt. No table in this block receives
 -- DELETE. None of these tables has a foreign key, so no parent grant is
 -- needed, and none is ever granted to the publication reader. Migration 23's
 -- publication views and migration 28's bootstrap import rows are deliberately
@@ -814,7 +817,10 @@ GRANT SELECT, INSERT ON TABLE
     public.memory_normative_log_v1,
     public.memory_discrepancy_log_v1,
     public.memory_normative_statements_v1,
-    public.memory_spec_checks_v1
+    public.memory_spec_checks_v1,
+    public.memory_collected_items_v1,
+    public.memory_collected_item_links_v1,
+    public.memory_collector_dead_letters_v1
 TO fleet_runtime;
 
 GRANT SELECT, INSERT, UPDATE ON TABLE
@@ -831,7 +837,12 @@ GRANT SELECT, INSERT, UPDATE ON TABLE
     public.memory_normative_projections_v1,
     public.memory_discrepancy_heads_v1,
     public.memory_discrepancy_projections_v1,
-    public.memory_worker_sources_v1
+    public.memory_worker_sources_v1,
+    public.memory_collector_outbox_v1,
+    public.memory_collected_item_heads_v1,
+    public.memory_collector_sources_v1,
+    public.memory_collector_cursors_v1,
+    public.memory_collector_containers_v1
 TO fleet_runtime;
 
 GRANT SELECT ON TABLE public.memory_discrepancy_relations_v1 TO fleet_runtime;
@@ -858,11 +869,11 @@ TO fleet_runtime;
 GRANT fleet_runtime TO fleet_writer;
 
 -- Exact direct logical-role surface: database CONNECT, public-schema USAGE,
--- one hundred ten table-privilege rows, and three sequence-USAGE rows. Because
+-- one hundred thirty-one table-privilege rows, and three sequence-USAGE rows. Because
 -- SHOW GRANTS FOR also exposes cluster-global external connections, the exact
 -- count rejects those and every function/type/differently privileged row.
 SELECT IF(
-    count(*) = 115
+    count(*) = 136
         AND COALESCE(bool_and(
             NOT is_grantable
             AND (
@@ -923,7 +934,15 @@ SELECT IF(
                                 'memory_discrepancy_heads_v1',
                                 'memory_discrepancy_projections_v1',
                                 'memory_worker_sources_v1',
-                                'memory_discrepancy_relations_v1'
+                                'memory_discrepancy_relations_v1',
+                                'memory_collected_items_v1',
+                                'memory_collected_item_links_v1',
+                                'memory_collector_dead_letters_v1',
+                                'memory_collector_outbox_v1',
+                                'memory_collected_item_heads_v1',
+                                'memory_collector_sources_v1',
+                                'memory_collector_cursors_v1',
+                                'memory_collector_containers_v1'
                             ))
                         OR (privilege_type = 'INSERT'
                             AND object_name IN (
@@ -968,7 +987,15 @@ SELECT IF(
                                 'memory_normative_projections_v1',
                                 'memory_discrepancy_heads_v1',
                                 'memory_discrepancy_projections_v1',
-                                'memory_worker_sources_v1'
+                                'memory_worker_sources_v1',
+                                'memory_collected_items_v1',
+                                'memory_collected_item_links_v1',
+                                'memory_collector_dead_letters_v1',
+                                'memory_collector_outbox_v1',
+                                'memory_collected_item_heads_v1',
+                                'memory_collector_sources_v1',
+                                'memory_collector_cursors_v1',
+                                'memory_collector_containers_v1'
                             ))
                         OR (privilege_type = 'UPDATE'
                             AND object_name IN (
@@ -993,6 +1020,11 @@ SELECT IF(
                                 'memory_discrepancy_heads_v1',
                                 'memory_discrepancy_projections_v1',
                                 'memory_worker_sources_v1',
+                                'memory_collector_outbox_v1',
+                                'memory_collected_item_heads_v1',
+                                'memory_collector_sources_v1',
+                                'memory_collector_cursors_v1',
+                                'memory_collector_containers_v1',
                                 'memory_content_objects'
                             ))
                         OR (privilege_type = 'DELETE'

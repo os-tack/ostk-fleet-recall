@@ -2609,6 +2609,23 @@ fn evidence_warnings(readiness: &EvidenceReadinessV1, sources: &EvidenceSourcesV
             ),
         }));
     }
+    if let Some(pending) = readiness
+        .items_awaiting_admission
+        .filter(|pending| *pending > 0)
+    {
+        warnings.push(json!({
+            "code": "evidence_items_pending",
+            "message": format!(
+                "{pending} collected item parts are staged and not yet admitted as evidence; the worker's collect step admits them"
+            ),
+        }));
+    }
+    if readiness.collector_state_unreadable {
+        warnings.push(json!({
+            "code": "evidence_collector_state_unreadable",
+            "message": "this login cannot read the collector tables, so no collected item is recalled and an empty answer is unknown; re-apply the runtime grants"
+        }));
+    }
     if !readiness.lexical_current {
         warnings.push(json!({
             "code": "evidence_lexical_projection_lag",
@@ -4362,6 +4379,8 @@ mod tests {
         EvidenceReadinessV1 {
             events_awaiting_body_projection: 2,
             transcript_turns_awaiting_admission: 0,
+            items_awaiting_admission: None,
+            collector_state_unreadable: false,
             lexical_current: true,
             dense_current: true,
             dense_lane,
@@ -4385,6 +4404,7 @@ mod tests {
                 EvidenceSourceV1 {
                     connector_instance: GIT_SOURCE.into(),
                     kind: EvidenceSourceKindV1::Git,
+                    provider: None,
                     state: "active".into(),
                     last_outcome: WorkerSourceOutcomeV1::Failed,
                     last_checked_at: Some(Utc::now()),
@@ -4395,6 +4415,7 @@ mod tests {
                 EvidenceSourceV1 {
                     connector_instance: TRANSCRIPT_SOURCE.into(),
                     kind: EvidenceSourceKindV1::Transcript,
+                    provider: None,
                     state: "active".into(),
                     last_outcome: WorkerSourceOutcomeV1::Ok,
                     last_checked_at: Some(Utc::now()),
@@ -4884,6 +4905,37 @@ mod tests {
         assert_eq!(
             warning_codes(&evidence_warnings(&foreign, &healthy)),
             ["evidence_dense_lane_disabled"]
+        );
+    }
+
+    #[test]
+    fn evidence_warnings_name_pending_and_unreadable_collected_items() {
+        let healthy = EvidenceSourcesV1 {
+            active: Vec::new(),
+            truncated: false,
+        };
+        let current = EvidenceReadinessV1 {
+            events_awaiting_body_projection: 0,
+            items_awaiting_admission: Some(0),
+            ..evidence_readiness(EvidenceDenseLaneV1::Available)
+        };
+        assert!(evidence_warnings(&current, &healthy).is_empty());
+        let pending = EvidenceReadinessV1 {
+            items_awaiting_admission: Some(4),
+            ..current
+        };
+        assert_eq!(
+            warning_codes(&evidence_warnings(&pending, &healthy)),
+            ["evidence_items_pending"]
+        );
+        let unreadable = EvidenceReadinessV1 {
+            items_awaiting_admission: None,
+            collector_state_unreadable: true,
+            ..current
+        };
+        assert_eq!(
+            warning_codes(&evidence_warnings(&unreadable, &healthy)),
+            ["evidence_collector_state_unreadable"]
         );
     }
 

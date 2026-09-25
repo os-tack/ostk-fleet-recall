@@ -20,7 +20,9 @@ use std::collections::BTreeSet;
 use sqlx::PgPool;
 
 use crate::error::{FleetError, Result};
-use crate::store::cockroach::{DatabaseCapabilities, MEMORY_WORKER_SCHEMA_VERSION};
+use crate::store::cockroach::{
+    COLLECTED_ITEMS_SCHEMA_VERSION, DatabaseCapabilities, MEMORY_WORKER_SCHEMA_VERSION,
+};
 
 use super::WorkerStepV1;
 
@@ -79,6 +81,27 @@ const TRANSCRIPT_PROBES: &[Probe] = &[
 ];
 
 const CI_PROBES: &[Probe] = &[("memory_ci_measured_windows_v1", ProbeKind::Insert, None)];
+
+/// The collected-item sink (migration 0033): the schema version the step reads
+/// at tick time, the outbox the drain settles, the item history, heads, and
+/// links its projection writes, and the containers, status, cursors, and dead
+/// letters staging writes. Probed only on a schema that has the tables.
+const COLLECT_PROBES: &[Probe] = &[
+    ("memory_collector_outbox_v1", ProbeKind::Insert, None),
+    ("memory_collector_outbox_v1", ProbeKind::Lock, None),
+    ("memory_collected_items_v1", ProbeKind::Insert, None),
+    ("memory_collected_item_heads_v1", ProbeKind::Insert, None),
+    ("memory_collected_item_heads_v1", ProbeKind::Lock, None),
+    ("memory_collected_item_links_v1", ProbeKind::Insert, None),
+    ("memory_collector_containers_v1", ProbeKind::Insert, None),
+    ("memory_collector_containers_v1", ProbeKind::Lock, None),
+    ("memory_collector_sources_v1", ProbeKind::Insert, None),
+    ("memory_collector_sources_v1", ProbeKind::Lock, None),
+    ("memory_collector_cursors_v1", ProbeKind::Insert, None),
+    ("memory_collector_cursors_v1", ProbeKind::Lock, None),
+    ("memory_collector_dead_letters_v1", ProbeKind::Insert, None),
+    ("_sqlx_migrations", ProbeKind::Read, None),
+];
 
 const BODY_PROBES: &[Probe] = &[
     ("memory_evidence_events", ProbeKind::Read, None),
@@ -153,6 +176,9 @@ fn probes_for(steps: &BTreeSet<WorkerStepV1>) -> Vec<Probe> {
     if steps.contains(&WorkerStepV1::Ci) {
         groups.push(CI_PROBES);
     }
+    if steps.contains(&WorkerStepV1::Collect) {
+        groups.push(COLLECT_PROBES);
+    }
     if steps.contains(&WorkerStepV1::Bodies) {
         groups.push(BODY_PROBES);
     }
@@ -189,6 +215,10 @@ fn probe_statement((table, kind, columns): Probe) -> String {
 ///
 /// Requires the schema to have reached migration 30
 /// ([`MEMORY_WORKER_SCHEMA_VERSION`]), which creates the worker status table.
+/// The collect step's privileges are probed only from migration 33
+/// ([`COLLECTED_ITEMS_SCHEMA_VERSION`]) on: before it the step has nothing to
+/// drain and is skipped, so neither its probes nor the ingest probes it alone
+/// would add are run.
 ///
 /// # Errors
 ///
@@ -207,9 +237,16 @@ pub async fn probe_worker_privileges(
             capabilities.schema_version
         )));
     }
+    let probes = if capabilities.supports_schema_version(COLLECTED_ITEMS_SCHEMA_VERSION) {
+        probes_for(steps)
+    } else {
+        let mut older = steps.clone();
+        older.remove(&WorkerStepV1::Collect);
+        probes_for(&older)
+    };
     let mut transaction = pool.begin().await?;
     let mut outcome = Ok(());
-    for probe in probes_for(steps) {
+    for probe in probes {
         match sqlx::query(&probe_statement(probe))
             .execute(&mut *transaction)
             .await
@@ -272,6 +309,20 @@ mod tests {
             assert!(probes.contains(&("memory_worker_sources_v1", ProbeKind::Lock, None)));
             assert!(probes.contains(&("memory_content_objects", ProbeKind::Lock, None)));
         }
+    }
+
+    #[test]
+    fn the_collect_step_probes_the_ingest_tables_and_the_collector_tables() {
+        let probes = probes_for(&steps(&[WorkerStepV1::Collect]));
+        assert!(probes.contains(&("memory_content_objects", ProbeKind::Lock, None)));
+        assert!(probes.contains(&("memory_collected_item_heads_v1", ProbeKind::Lock, None)));
+        assert!(probes.contains(&("memory_collector_dead_letters_v1", ProbeKind::Insert, None)));
+        // The ingest group alone never reaches a collector table.
+        assert!(
+            probes_for(&WorkerStepV1::INGEST.into_iter().collect())
+                .iter()
+                .all(|(table, _, _)| !table.starts_with("memory_collect"))
+        );
     }
 
     #[test]

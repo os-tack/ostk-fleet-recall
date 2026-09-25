@@ -15,6 +15,12 @@
 //! whose contents are an admin setup URL using a principal distinct from
 //! `fleet_publication`; that identity may seed and clean up only the unique
 //! test scope.
+//!
+//! `live_publication_reader_denied_collector_tables_when_configured` is not
+//! ignored: it needs only `FLEET_RECALL_TEST_DATABASE_URL`, and proves the
+//! publication reader's exact grants reach no collected-item table.
+
+mod common;
 
 use std::env;
 use std::fs;
@@ -459,4 +465,54 @@ async fn publication_reader_executes_the_real_recall_surface() -> anyhow::Result
     proof?;
     cleanup?;
     Ok(())
+}
+
+/// Every table migration 0033 adds (ADR 0008). None is a publication table.
+const COLLECTOR_TABLES: [&str; 8] = [
+    "memory_collector_outbox_v1",
+    "memory_collected_items_v1",
+    "memory_collected_item_heads_v1",
+    "memory_collected_item_links_v1",
+    "memory_collector_containers_v1",
+    "memory_collector_sources_v1",
+    "memory_collector_cursors_v1",
+    "memory_collector_dead_letters_v1",
+];
+
+#[tokio::test]
+async fn live_publication_reader_denied_collector_tables_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    assert!(
+        COLLECTOR_TABLES
+            .iter()
+            .all(|table| !PUBLICATION_READ_TABLES.contains(table))
+    );
+    let owner = common::migrated_pool(&database_url).await;
+    let reader =
+        common::runtime_role::RuntimeProbeRole::create_publication_reader(&owner, &database_url)
+            .await;
+    let mut refusals = Vec::new();
+    for table in COLLECTOR_TABLES {
+        let outcome = sqlx::query(&format!("SELECT 1 FROM public.{table} LIMIT 1"))
+            .execute(&reader.pool)
+            .await;
+        refusals.push((
+            table,
+            match outcome {
+                Err(sqlx::Error::Database(error)) => error.code().map(std::borrow::Cow::into_owned),
+                Err(other) => Some(other.to_string()),
+                Ok(_) => None,
+            },
+        ));
+    }
+    reader.drop_role(&owner).await;
+    for (table, code) in refusals {
+        assert_eq!(
+            code.as_deref(),
+            Some("42501"),
+            "the publication reader must not read {table}"
+        );
+    }
 }

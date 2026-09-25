@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! transcript -> git -> ci          ingest: provider material -> accepted events
+//!   -> collect                     staged collected items -> accepted events
 //!   -> bodies -> lexical -> dense  project: accepted events -> recall tiers
 //! ```
 //!
@@ -50,6 +51,20 @@
 //! ingest steps run and every configured source was enumerated, rows for
 //! instances no longer configured are marked `retired`.
 //!
+//! # Collected items
+//!
+//! The `collect` step drains the collector outbox (migration 0033, ADR 0008
+//! D4): at most [`COLLECT_DRAIN_LIMIT`] staged parts per tick, each admitted
+//! under `connector.collected.<mode>` of this tick's head, with its item
+//! history and head move in the append's own transaction. On a schema before
+//! migration 33 the step is skipped when no collector is configured, and
+//! fails, naming `ostk-fleet-recall migrate`, when one is. Rows whose channel
+//! the active package does not admit stay pending, and the step fails naming
+//! `ostk-authority-install apply --target generation-3`. The step appends, so
+//! it needs the writer authority and the content key, like the ingest steps,
+//! but it is not one of them: `--steps ingest` and source retirement are
+//! unchanged, and `--steps collect` selects it alone.
+//!
 //! # Failure isolation
 //!
 //! A failure is recorded and the tick continues: one source's failure never
@@ -75,6 +90,7 @@
 //! of the active package: no package registers them yet, and the coverage
 //! runtime does not resolve them.
 
+mod collect;
 mod command;
 mod ingest;
 mod privileges;
@@ -103,12 +119,13 @@ use crate::projectors::EmbeddingProvider;
 use crate::registry_witness::WriterAuthorityRuntime;
 use crate::store::cockroach::RetryPolicy;
 
+pub use collect::COLLECT_DRAIN_LIMIT;
 pub use command::{WorkerCommandV1, WorkerProcessV1, run_command};
 pub use ingest::{COVERAGE_FRESHNESS_LABEL, COVERAGE_PROOF_LABEL, TRANSCRIPT_DRAIN_LIMIT};
 pub use privileges::{RUNTIME_GRANTS_POLICY, probe_worker_privileges};
 pub use sources::{
-    CiSourceV1, DEFAULT_COVERAGE_SINCE, DEFAULT_GIT_MAX_COMMITS, DEFAULT_GIT_MAX_FACTS,
-    DEFAULT_STALE_AFTER_SECONDS, DEFAULT_TRANSCRIPT_INSTANCE_PREFIX,
+    CiSourceV1, CollectorSourceV1, DEFAULT_COVERAGE_SINCE, DEFAULT_GIT_MAX_COMMITS,
+    DEFAULT_GIT_MAX_FACTS, DEFAULT_STALE_AFTER_SECONDS, DEFAULT_TRANSCRIPT_INSTANCE_PREFIX,
     DEFAULT_TRANSCRIPT_WINDOW_BYTES, GitSourceV1, MAX_STALE_AFTER_SECONDS, MIN_STALE_AFTER_SECONDS,
     ObserverSourceV1, TranscriptSourceGroupV1, WORKER_SOURCES_SCHEMA_VERSION, WorkerSourcesV1,
     transcript_instance_id,
@@ -127,6 +144,7 @@ pub enum WorkerStepV1 {
     Transcript,
     Git,
     Ci,
+    Collect,
     Bodies,
     Lexical,
     Dense,
@@ -134,22 +152,30 @@ pub enum WorkerStepV1 {
 
 impl WorkerStepV1 {
     /// Every step, in execution order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Transcript,
         Self::Git,
         Self::Ci,
+        Self::Collect,
         Self::Bodies,
         Self::Lexical,
         Self::Dense,
     ];
 
-    /// The ingest steps, which append accepted evidence.
+    /// The ingest steps of the `ingest` group: the worker's own connectors,
+    /// whose sources a complete tick retires when they are no longer
+    /// configured.
     pub const INGEST: [Self; 3] = [Self::Transcript, Self::Git, Self::Ci];
 
-    /// Whether this step appends accepted evidence.
+    /// Whether this step appends accepted evidence, and so needs the writer
+    /// authority, the content key, and the ingest privileges: the `ingest`
+    /// group and `collect`.
     #[must_use]
     pub const fn is_ingest(self) -> bool {
-        matches!(self, Self::Transcript | Self::Git | Self::Ci)
+        matches!(
+            self,
+            Self::Transcript | Self::Git | Self::Ci | Self::Collect
+        )
     }
 
     #[must_use]
@@ -158,6 +184,7 @@ impl WorkerStepV1 {
             Self::Transcript => "transcript",
             Self::Git => "git",
             Self::Ci => "ci",
+            Self::Collect => "collect",
             Self::Bodies => "bodies",
             Self::Lexical => "lexical",
             Self::Dense => "dense",
@@ -167,9 +194,10 @@ impl WorkerStepV1 {
 
 /// Parse a `--steps` value: a comma-separated list of step groups.
 ///
-/// The groups are `all`; `ingest` (transcript, git, ci); `project` (bodies,
-/// lexical); and `embed` (dense). Single steps are not selectable: a group is
-/// the smallest unit whose inputs and outputs line up.
+/// The groups are `all`; `ingest` (transcript, git, ci); `collect` (the
+/// collector outbox's drain); `project` (bodies, lexical); and `embed`
+/// (dense). Single steps are not selectable: a group is the smallest unit
+/// whose inputs and outputs line up.
 ///
 /// # Errors
 ///
@@ -180,6 +208,9 @@ pub fn parse_steps(value: &str) -> Result<BTreeSet<WorkerStepV1>> {
         match group {
             "all" => steps.extend(WorkerStepV1::ALL),
             "ingest" => steps.extend(WorkerStepV1::INGEST),
+            "collect" => {
+                steps.insert(WorkerStepV1::Collect);
+            }
             "project" => steps.extend([WorkerStepV1::Bodies, WorkerStepV1::Lexical]),
             "embed" => {
                 steps.insert(WorkerStepV1::Dense);
@@ -187,7 +218,8 @@ pub fn parse_steps(value: &str) -> Result<BTreeSet<WorkerStepV1>> {
             other => {
                 return Err(FleetError::Configuration(format!(
                     "unknown worker step group {other:?}; use a comma-separated list of \
-                     all, ingest, project, and embed"
+                     all, ingest, project, and embed (or collect, which drains staged \
+                     collected items)"
                 )));
             }
         }
@@ -675,6 +707,24 @@ mod tests {
                 WorkerStepV1::Lexical
             ])
         );
+    }
+
+    #[test]
+    fn the_collect_group_selects_the_outbox_drain_alone() {
+        assert_eq!(
+            parse_steps("collect").unwrap(),
+            steps(&[WorkerStepV1::Collect])
+        );
+        assert!(parse_steps("all").unwrap().contains(&WorkerStepV1::Collect));
+        assert!(
+            !parse_steps("ingest")
+                .unwrap()
+                .contains(&WorkerStepV1::Collect)
+        );
+        // It appends, so it needs what the ingest steps need, without joining
+        // the group whose sources a complete tick retires.
+        assert!(WorkerStepV1::Collect.is_ingest());
+        assert!(!WorkerStepV1::INGEST.contains(&WorkerStepV1::Collect));
     }
 
     #[test]

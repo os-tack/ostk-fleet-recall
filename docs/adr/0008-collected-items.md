@@ -1,14 +1,17 @@
 # ADR 0008: Collected items from any source
 
-- Status: accepted; D1 to D3 implemented. The generation-3 registry package
+- Status: accepted; D1 to D6 implemented. The generation-3 registry package
   is checked in, the strict witness recognizes it, and
   `ostk-authority-install apply --target generation-3` activates it and
   rebases the scope's normative families onto it. The collected-item
   envelope, its identity digests, and the pure collector pipeline (sanitizer,
   redactor, audience decision, splitter, and the `connector.collected.<mode>`
-  binding) exist and are unit-tested (see "The envelope" below), but no sink,
-  collector, or recall surface uses them yet; those land with their own
-  decisions.
+  binding) exist (see "The envelope" below). Migration 33 adds the sink: the
+  staging outbox, the drain the worker's `collect` step runs, the item
+  history and current-view heads, container audiences, and collector status
+  (D4 to D6), and evidence recall withholds deleted and withdrawn items. No
+  provider collector, agent capture, or item recall surface stages or reads
+  items yet; those land with their own decisions.
 - Date: 2026-09-25
 - Scope: how specs and documents, Slack conversations, Linear tickets,
   Granola meetings, and anything else a collector can read become evidence
@@ -124,7 +127,8 @@ Rollout order, for every physical scope that is to collect items:
    host, and the projector container (ADR 0006 D1). A binary without the
    generation-3 row refuses a generation-3 head as `UnknownActivePackage`.
 2. Apply the release's migrations and re-apply the grant files. Migration 32
-   (D3) lets a spec family be rebased; it adds no grant.
+   (D3) lets a spec family be rebased; it adds no grant. Migration 33 (D4)
+   adds the collected-item tables, which the runtime policy grants.
 3. Run `ostk-authority-install apply --target generation-3`. The pins do not
    change, so no writer is reconfigured, and the run rebases every spec
    family onto the new head (D3).
@@ -208,8 +212,8 @@ constraint, so every interruption leaves a kind check in force and 0024 stays
 byte-identical. The installer refuses, before any write, to rebase a scope
 that holds a family on a schema without migration 32. No grant changes: the
 installer runs as the migrator, the runtime role already holds `INSERT` on the
-log, and the runtime policy's schema gate stays at migrations 1 to 31, since
-nothing served needs 32.
+log, and the runtime policy's schema gate stayed at migrations 1 to 31, since
+nothing served needs 32. (Migration 33, D4, later moved the gate to 1 to 33.)
 
 **What stays as ADR 0007 D11 describes.**
 
@@ -226,3 +230,163 @@ nothing served needs 32.
 **Deferred.** A rebase outside the installer's generation-3 run (an
 `ostk-spec rebase`, or a rebase onto generation 2), and rebasing families whose
 statements were not recorded by `ostk-spec`.
+
+## D4 — One sink: staging, clocks, and the drain
+
+**Decision.** Every collector hands drafts to one sink
+(`src/collectors/sink.rs`), and nothing else writes the collector tables.
+
+**Staging** (`CollectedItemSink::stage`) is one serializable transaction
+(retried only on 40001), and every statement binds `(tenant_id, project)`
+first:
+
+1. It reads `statement_timestamp()` once: every row it stages is observed and
+   received at that instant.
+2. It records the container observations the collector made: a container
+   whose audience is admissible is upserted with `access = 'ok'` and its basis;
+   one whose audience no longer is (a channel made private and not listed) is
+   set to `access = 'withdrawn'`, never deleted.
+3. For each draft, in order: the provider and scope must be the instance's
+   (else a `validation_failed` dead letter, `provider_scope_mismatch`); the
+   audience is decided by the server (D6; a refusal is an `audience_refused`
+   dead letter); the draft is sealed (sanitize, redact, split at most 32 KiB
+   per part, one canonical envelope and stage id per part; a refusal is a
+   `validation_failed`, `oversize`, or `redaction_withheld` dead letter); an
+   item whose provider clock is ahead of the observation is a `clock_ahead`
+   dead letter; and each part is inserted with `ON CONFLICT DO NOTHING` on its
+   stage id, so re-reading an unchanged item stages nothing.
+4. The collector's cursor advances and its status row are written in the same
+   transaction (REPLAY-02), except that no cursor advances when an item was
+   `clock_ahead`: the page is read again and what did stage replays.
+
+A dead letter holds a closed reason, the digest of the draft (or of the
+envelope), the stage id when there is one, the delivery id, and a static
+diagnostic; never text. Its key is a digest of the instance, the reason, the
+payload digest, and the stage id, so the same refusal on every tick is one
+row.
+
+**Clocks.** `observed_at = received_at` is the staging transaction's clock and
+`occurred_at` is the envelope's provider clock (its `updated_at`, else its
+`created_at`, else the observation). All three are stored on the row, so a
+drain rebuilds a byte-identical candidate however often it runs, and a replay
+is recognized rather than quarantined as a preimage disagreement.
+
+**The drain** (`CollectedItemSink::drain`, `drain_stage_ids`) reads pending
+rows oldest first and, for each, binds `connector.collected.<mode>` from the
+tick's verified head, builds the candidate with the D1 binding (which refuses
+an envelope whose provider, scope, channel, or instance is not the row's),
+admits it, and appends it with `CollectedDrainProjection`: the governed
+content object, the outbox row settled as `admitted` with its envelope set to
+NULL, one `memory_collected_items_v1` row for the part, its link rows, and,
+when the part completes its version, the head move (D5). All of it is one
+transaction (EVENT-03).
+
+| Outcome | Row |
+|---|---|
+| appended, or replayed because a concurrent drain admitted it | `admitted` |
+| the ledger quarantined the event | `quarantined`, with its quarantine id |
+| the binding or admission refused the candidate | `dead_lettered`, an `admission_refused` dead letter; the drain goes on |
+| the head moved, the authority was unavailable, or storage failed | `attempts + 1`, retried by a later drain; the eighth failure is a `retry_exhausted` dead letter |
+| the active package does not carry `connector.collected.<mode>` | stays `pending`; the worker's step fails naming `ostk-authority-install apply --target generation-3` |
+
+A settled row keeps no text: a CHECK ties `state = 'pending'` to a non-NULL
+envelope, and `envelope_sha256` remains. The redacted text lives only in the
+governed content store and the body plane. Purging settled rows is deferred
+(no runtime holds `DELETE`).
+
+**The worker.** `worker --steps collect` (and `all`) runs a `collect` step
+after `ci`: it drains at most 1,024 pending parts per tick under the head the
+tick verified, then bodies, lexical, and dense project them like any other
+evidence. The step needs the writer authority and the content key, like the
+ingest steps, and its privileges are probed before the tick, but it is not
+in the `ingest` group, so `--steps ingest` and source retirement are
+unchanged. On a schema before migration 33 the step is `skipped`
+(`schema_below_33`) and probes nothing when no collector is configured, and
+fails, naming `ostk-fleet-recall migrate`, when one is. The sources file
+gains `collectors`: one instance per provider scope, with its principal,
+pinned scope, audience policy, and the provider adapter's settings. Instance
+ids are unique across every connector, and a credential written inline (a
+secret-shaped value, or a string under a credential-named key) is refused;
+settings name environment variables. No provider adapter runs yet.
+
+## D5 — The current view, supersession, and suppression
+
+**Decision.** `memory_collected_items_v1` is append-only history, and
+`memory_collected_item_heads_v1` holds one head per item and trust tier:
+`verified` (pull, push) and `reported` (capture, import). The move rule is
+pure (`src/collectors/heads.rs`) and runs under `SELECT ... FOR UPDATE` over
+both tier rows in the drain's projection:
+
+- **Only a complete version heads a tier.** A version completes when the last
+  of its distinct part ordinals is admitted through that tier; a partially
+  admitted version never becomes a head, and a second attester's copy of an
+  admitted part completes nothing.
+- **Forward only.** A complete version replaces the head only when its
+  `(provider_order, redaction_profile)` is strictly greater: the provider's
+  order decides what is newer, never the arrival order, and a strictly newer
+  redaction profile at the same order moves the head to the better-redacted
+  rendering. An older version arriving late is counted (`version_count`) and
+  the head stays.
+- **Ties are counted and broken by the version key.** Two different versions
+  at the same order and profile increment `order_ties`, and the greater
+  version key heads the tier, so the head is a function of the set of
+  complete versions, whatever order they arrived in.
+- **A report never displaces a verification.** Exactly one row per item is
+  presented (a partial unique index): the verified head when one exists, else
+  the reported one. The row that stops being presented is updated before the
+  one that starts, inside the same transaction.
+- **Disagreement.** The presented row is marked `disagreement` when the
+  reported head is newer than the verified head and its content differs.
+
+**Edits supersede, deletes hide.** An edit is a new version and moves the
+head; older versions stay in the history and in `recall(kind=evidence)`. A
+provider delete, trash, or revoke, or an absence-based tombstone, is a
+version with empty text that becomes the head.
+
+**Read-time suppression.** A collected body is withheld from recall when its
+item's presented head is a tombstone or its container is `withdrawn`: inside
+the lexical lane's `WHERE`, before ranking and before the `LIMIT`; as a
+post-filter of the dense lane's nearest neighbours; and in evidence `get`. It
+reads `memory_collected_items_body_idx`, so the cost is one index probe per
+candidate. Deleted text stops being recallable at once, with no `DELETE`
+grant and no projection rewritten. Physical erasure is deferred (ADR 0006 D9
+applies).
+
+**Evidence recall stays sound.** From migration 33 on, evidence recall probes
+`SELECT` on the outbox, items, heads, containers, and collector status. When
+the login may read them, readiness reports `items_awaiting_admission` (any
+pending part makes an empty answer `unknown`, `ingest_outbox_pending`), live
+and snapshot collectors are listed beside the worker's sources (kind
+`collector`, with their provider, capped at 256 together) and judged by the
+same rules, and suppression applies. When it may not, evidence recall is
+still served, but it cannot tell deleted text from current text or a pending
+item from none: every collected body is dropped from the answer and from
+`get` (fail closed), and an empty answer is `unknown` with
+`collector_state_unreadable`, never `absent`.
+
+## D6 — Audience: server-derived, whole project only
+
+**Decision.** In v1 every admitted item is visible to the whole project, so
+the audience decision (`src/collectors/audience.rs`) only decides whether an
+item may be admitted at all, and on what basis, from provider facts and
+operator configuration, never from a pulled payload or an agent:
+
+- a direct or group-direct conversation, and a container shared with another
+  organization, are refused always;
+- a public, unshared container is `provider_public`, and a public team
+  `team_public`;
+- a restricted container is admitted `operator_declared` only when the
+  operator listed it; an operator-scoped source (a documents root, a Granola
+  key, an import) only when the instance declares it;
+- a capture is admitted `verified_container` only into a container a verified
+  collector or an operator import recorded as readable, else
+  `operator_capture_scope` when the operator listed the scope, else refused;
+- a visibility hint from an importer or an agent can only narrow: `private`
+  and `dm` refuse the item.
+
+A refused item is a digest-only `audience_refused` dead letter. The package's
+private/denied classification still applies to every admitted item, so none
+becomes publishable, and the publication plane gains nothing: no collector
+table is a publication table or granted to the publication reader, which a
+connected test proves by reading each one and getting SQLSTATE `42501`.
+Per-principal audiences, with clearance checked inside SQL, are deferred.

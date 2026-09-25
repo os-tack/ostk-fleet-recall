@@ -10,12 +10,13 @@
 //!   bounded snippet of its recall text, its media type, and the accepted event
 //!   that first produced it.
 //! * [`EvidenceReadinessV1`]: how far ingestion and projection have caught up
-//!   (events still waiting for the body projector, transcript turns still
-//!   waiting in the outbox, whether the lexical and dense tiers cover every
-//!   body).
-//! * [`EvidenceSourcesV1`]: every active source the worker reports on, with
-//!   its last outcome, whether its last completed check is stale, and its
-//!   newest coverage cursor.
+//!   (events still waiting for the body projector, transcript turns and
+//!   collected items still waiting in their outboxes, whether the lexical and
+//!   dense tiers cover every body).
+//! * [`EvidenceSourcesV1`]: every active source the worker reports on, and
+//!   every live or snapshot collector (ADR 0008), with its last outcome,
+//!   whether its last completed check is stale, and its newest coverage
+//!   cursor.
 //! * [`AbsenceV1`]: whether an empty answer means the evidence is absent, or
 //!   only that nothing was found.
 //!
@@ -27,7 +28,8 @@
 //! * the query has lexical terms, because absence is defined over the lexical
 //!   tier;
 //! * no accepted evidence event is waiting for the body projector, and no
-//!   transcript turn is waiting in the outbox;
+//!   transcript turn or collected item is waiting in its outbox;
+//! * the collector state could be read, when the schema has it;
 //! * every body has been through the lexical projector;
 //! * at least one source is active, and every active source's last outcome is
 //!   not `failed`, its last completed check exists and is not older than its
@@ -50,6 +52,19 @@
 //! pending or projected, and the lanes then search a lexical tier at least as
 //! new as the one readiness counted. Reading readiness after the lanes could
 //! count a body the lanes never searched.
+//!
+//! # Collected items
+//!
+//! From migration 33 on, the startup probe also checks SELECT on
+//! [`COLLECTOR_RECALL_TABLES`]. When the login may read them, readiness counts
+//! the collector outbox's pending parts, the listing adds live and snapshot
+//! collectors (kind `collector`, with their provider), and both lanes and
+//! `get` withhold a collected body whose item's presented head is a tombstone
+//! or whose container was withdrawn (ADR 0008 D5). When it may not, recall is
+//! still served, but it cannot tell deleted text from current text or pending
+//! items from none: every collected body is dropped from the answer (fail
+//! closed), and an empty answer is `unknown` with
+//! [`AbsenceReasonV1::CollectorStateUnreadable`], never `absent`.
 //!
 //! # What the text is
 //!
@@ -95,8 +110,8 @@ use crate::store::cockroach::MEMORY_WORKER_SCHEMA_VERSION;
 use crate::worker::{WorkerSourceKindV1, WorkerSourceOutcomeV1};
 
 pub use cockroach::{
-    CockroachEvidenceRecall, EVIDENCE_RECALL_TABLES, EvidenceRecallCapability,
-    probe_evidence_recall,
+    COLLECTOR_RECALL_TABLES, CockroachEvidenceRecall, EVIDENCE_RECALL_TABLES,
+    EvidenceRecallCapability, probe_evidence_recall,
 };
 pub use serve::start_evidence_recall;
 pub use verdict::absence_verdict;
@@ -173,6 +188,15 @@ pub struct EvidenceReadinessV1 {
     pub events_awaiting_body_projection: u64,
     /// Transcript turns staged in the outbox and not yet admitted.
     pub transcript_turns_awaiting_admission: u64,
+    /// Collected item parts staged in the collector outbox and not yet
+    /// admitted; absent before migration 33, or when the collector state
+    /// cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items_awaiting_admission: Option<u64>,
+    /// The schema has collector state this login cannot read: collected bodies
+    /// are withheld from the answer, and absence cannot be shown.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub collector_state_unreadable: bool,
     /// Every body has been through the lexical projector.
     pub lexical_current: bool,
     /// Every lexically searchable body also has an embedding.
@@ -195,7 +219,8 @@ pub struct EvidenceCoverageV1 {
 }
 
 /// Which connector a listed source belongs to. The wire value is the status
-/// row's stored `source_kind`, exactly as stored.
+/// row's stored `source_kind`, exactly as stored, or `collector` for a
+/// collector's row.
 ///
 /// Decoded tolerantly: a kind this build does not know (one a later collector
 /// writes, or one a newer binary's migration admits) decodes to
@@ -209,14 +234,22 @@ pub enum EvidenceSourceKindV1 {
     Git,
     Transcript,
     Ci,
+    /// A collector instance (ADR 0008); its provider is on the source.
+    Collector,
     /// A kind this build does not know, carrying the stored string.
     Other(String),
 }
+
+/// The wire value of [`EvidenceSourceKindV1::Collector`].
+const COLLECTOR_SOURCE_KIND: &str = "collector";
 
 impl EvidenceSourceKindV1 {
     /// Decode a stored `source_kind`; an unknown value is [`Self::Other`].
     #[must_use]
     pub fn from_stored(stored: &str) -> Self {
+        if stored == COLLECTOR_SOURCE_KIND {
+            return Self::Collector;
+        }
         [
             WorkerSourceKindV1::Git,
             WorkerSourceKindV1::Transcript,
@@ -234,6 +267,7 @@ impl EvidenceSourceKindV1 {
             Self::Git => WorkerSourceKindV1::Git.as_str(),
             Self::Transcript => WorkerSourceKindV1::Transcript.as_str(),
             Self::Ci => WorkerSourceKindV1::Ci.as_str(),
+            Self::Collector => COLLECTOR_SOURCE_KIND,
             Self::Other(stored) => stored,
         }
     }
@@ -255,11 +289,15 @@ impl Serialize for EvidenceSourceKindV1 {
     }
 }
 
-/// One active source, as the worker last reported it.
+/// One active source, as the worker (or a collector) last reported it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EvidenceSourceV1 {
     pub connector_instance: String,
     pub kind: EvidenceSourceKindV1,
+    /// A collector's provider kind (`docs`, `slack`, ...); absent for the
+    /// worker's own sources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// The status row's state; only `active` sources are listed.
     pub state: String,
     pub last_outcome: WorkerSourceOutcomeV1,
@@ -359,7 +397,7 @@ pub enum AbsenceReasonV1 {
     QueryHasNoLexicalTerms,
     /// Accepted evidence is waiting for the body projector.
     BodyProjectionLag,
-    /// Transcript turns are waiting in the outbox.
+    /// Transcript turns or collected items are waiting in an outbox.
     IngestOutboxPending,
     /// Some body has not been through the lexical projector.
     LexicalProjectionLag,
@@ -375,6 +413,9 @@ pub enum AbsenceReasonV1 {
     IncompleteCoverage,
     /// Not every active source was listed.
     ListingTruncated,
+    /// The schema has collector state this login cannot read, so a
+    /// collected item could be pending, deleted, or present unseen.
+    CollectorStateUnreadable,
 }
 
 /// The absence verdict of one search.
@@ -494,6 +535,44 @@ mod tests {
         assert_eq!(
             EvidenceSourceKindV1::from_stored(WorkerSourceKindV1::Ci.as_str()),
             EvidenceSourceKindV1::from(WorkerSourceKindV1::Ci)
+        );
+    }
+
+    #[test]
+    fn a_collector_source_serializes_as_collector_with_its_provider() {
+        assert_eq!(
+            EvidenceSourceKindV1::from_stored("collector"),
+            EvidenceSourceKindV1::Collector
+        );
+        assert_eq!(
+            serde_json::to_value(EvidenceSourceKindV1::Collector).unwrap(),
+            serde_json::json!("collector")
+        );
+        let source = EvidenceSourceV1 {
+            connector_instance: "docs.specs".to_owned(),
+            kind: EvidenceSourceKindV1::Collector,
+            provider: Some("docs".to_owned()),
+            state: "active".to_owned(),
+            last_outcome: WorkerSourceOutcomeV1::Ok,
+            last_checked_at: None,
+            last_error: None,
+            stale: false,
+            coverage: None,
+        };
+        let value = serde_json::to_value(&source).unwrap();
+        assert_eq!(value["kind"], "collector");
+        assert_eq!(value["provider"], "docs");
+        let worker = EvidenceSourceV1 {
+            kind: EvidenceSourceKindV1::Git,
+            provider: None,
+            ..source
+        };
+        assert!(
+            serde_json::to_value(&worker)
+                .unwrap()
+                .get("provider")
+                .is_none(),
+            "a worker source's answer is unchanged"
         );
     }
 

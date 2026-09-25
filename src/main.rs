@@ -167,7 +167,7 @@ enum Command {
         /// long-running loop, so schedule it (cron or a scheduled task).
         #[arg(long)]
         once: bool,
-        /// Comma-separated step groups: all, ingest, project, embed.
+        /// Comma-separated step groups: all, ingest, collect, project, embed.
         #[arg(long, default_value = "all", value_name = "GROUPS")]
         steps: String,
     },

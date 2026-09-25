@@ -89,6 +89,27 @@ pub const STAGE5_RUNTIME_GRANTS: [(&str, &str); 4] = [
     ("UPDATE", "public.memory_content_objects"),
 ];
 
+/// The collected-item tables of the same block (migration 33, ADR 0008): the
+/// item history, links, and dead letters are append-only; the outbox, heads,
+/// collector status, cursors, and containers take `SELECT ... FOR UPDATE` and
+/// compare-and-set upserts. The collect step also reads the schema version,
+/// through the `SELECT` on `_sqlx_migrations` the policy's claim block gives.
+/// Keep this in step with that file.
+pub const COLLECTOR_RUNTIME_GRANTS: [(&str, &str); 3] = [
+    ("SELECT", "public._sqlx_migrations"),
+    (
+        "SELECT, INSERT",
+        "public.memory_collected_items_v1, public.memory_collected_item_links_v1, \
+         public.memory_collector_dead_letters_v1",
+    ),
+    (
+        "SELECT, INSERT, UPDATE",
+        "public.memory_collector_outbox_v1, public.memory_collected_item_heads_v1, \
+         public.memory_collector_sources_v1, public.memory_collector_cursors_v1, \
+         public.memory_collector_containers_v1",
+    ),
+];
+
 /// The sequences the same policy lets `fleet_runtime` draw claim, support,
 /// and conflict IDs from.
 pub const RUNTIME_SEQUENCES: &str = "public.memory_claim_id_seq, \
@@ -144,18 +165,34 @@ impl RuntimeProbeRole {
         Self::create_with(owner, database_url, grants, true, false).await
     }
 
-    /// [`Self::create`], plus [`STAGE5_RUNTIME_GRANTS`] when `stage5` is set:
-    /// what the memory worker runs with, or, without the Stage-5 block, a
-    /// login that holds only the Stage-4 evidence grants.
+    /// [`Self::create`], plus [`STAGE5_RUNTIME_GRANTS`] and
+    /// [`COLLECTOR_RUNTIME_GRANTS`] when `stage5` is set: what the memory
+    /// worker runs with, or, without the Stage-5 block, a login that holds only
+    /// the Stage-4 evidence grants.
     pub async fn create_worker(owner: &PgPool, database_url: &str, stage5: bool) -> Self {
+        Self::create_worker_with(owner, database_url, stage5, stage5).await
+    }
+
+    /// [`Self::create`], plus [`STAGE5_RUNTIME_GRANTS`] when `stage5` is set and
+    /// [`COLLECTOR_RUNTIME_GRANTS`] when `collectors` is set: a worker login
+    /// that predates the collector grants, or one that holds only them.
+    pub async fn create_worker_with(
+        owner: &PgPool,
+        database_url: &str,
+        stage5: bool,
+        collectors: bool,
+    ) -> Self {
         let mut grants = owned(&RUNTIME_EVIDENCE_GRANTS);
         if stage5 {
             grants.extend(owned(&STAGE5_RUNTIME_GRANTS));
         }
+        if collectors {
+            grants.extend(owned(&COLLECTOR_RUNTIME_GRANTS));
+        }
         Self::create_with(owner, database_url, grants, false, false).await
     }
 
-    /// [`Self::create_worker`] with the Stage-5 block, shaped as
+    /// [`Self::create_worker`] with the Stage-5 and collector blocks, shaped as
     /// `deploy/cockroach/runtime-role-grants.sql` shapes the deployment: every
     /// grant goes to a `NOLOGIN` group role, as the policy gives them to
     /// `fleet_runtime`, and the login holds nothing but its membership in that
@@ -163,6 +200,7 @@ impl RuntimeProbeRole {
     pub async fn create_worker_member(owner: &PgPool, database_url: &str) -> Self {
         let mut grants = owned(&RUNTIME_EVIDENCE_GRANTS);
         grants.extend(owned(&STAGE5_RUNTIME_GRANTS));
+        grants.extend(owned(&COLLECTOR_RUNTIME_GRANTS));
         Self::create_with(owner, database_url, grants, false, true).await
     }
 

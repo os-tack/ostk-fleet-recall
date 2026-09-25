@@ -52,6 +52,11 @@ pub async fn start_evidence_recall(
                     "evidence recall serves its lexical lane only: the scope's dense tier holds vectors of another embedding model than FLEET_RECALL_EMBEDDING_MODEL_SHA256; the worker's embed step does not re-embed them, so the dense lane stays off until serve and the worker run the model those rows were embedded with"
                 );
             }
+            if capability.collector_state_unreadable() {
+                tracing::warn!(
+                    "evidence recall withholds every collected item: the schema has the collector tables (migration 33) and this login cannot read them; re-apply deploy/cockroach/runtime-role-grants.sql and restart, and until then an empty answer is unknown (collector_state_unreadable)"
+                );
+            }
             tracing::info!("serving recall(kind=evidence)");
             Some(Arc::new(CockroachEvidenceRecall::new(
                 capability,

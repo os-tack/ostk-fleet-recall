@@ -52,6 +52,12 @@ pub const SPEC_CONFORMANCE_SCHEMA_VERSION: i64 = 31;
 /// ADR 0008 D3). Below it a binding family cannot be rebased onto a new
 /// registry head; no served surface requires it.
 pub const NORMATIVE_REBASE_SCHEMA_VERSION: i64 = 32;
+/// First schema with the collected-item sink (migration 0033, ADR 0008 D4-D6).
+///
+/// It adds the staging outbox, the current view, and collector status. Below
+/// it the worker's collect step is skipped and evidence recall reads no
+/// collector state.
+pub const COLLECTED_ITEMS_SCHEMA_VERSION: i64 = 33;
 
 /// Exact application tables reachable from public health/status/recall SQL.
 ///
@@ -273,6 +279,25 @@ static EMBEDDED_MIGRATION_VERSIONS: LazyLock<Vec<i64>> = LazyLock::new(|| {
         .collect()
 });
 
+/// The schema version [`CockroachStore::capabilities`] reports, read on its
+/// own: the highest embedded version whose whole embedded prefix is applied.
+///
+/// For a runtime that holds a pool rather than a store, such as the worker
+/// deciding at tick time whether its collect step can run.
+///
+/// # Errors
+///
+/// A database failure reading `_sqlx_migrations`.
+pub async fn read_schema_version(pool: &PgPool) -> Result<i64> {
+    let applied = sqlx::query_as::<_, (i64, bool)>(APPLIED_MIGRATIONS_SQL)
+        .fetch_all(pool)
+        .await?;
+    Ok(contiguous_schema_version(
+        &EMBEDDED_MIGRATION_VERSIONS,
+        &applied,
+    ))
+}
+
 /// Highest embedded version whose whole embedded prefix is applied
 /// successfully.
 ///
@@ -361,6 +386,8 @@ const SPEC_CONFORMANCE_MIGRATION_SQL: &str =
     include_str!("../../migrations/0031_spec_conformance.sql");
 const NORMATIVE_REBASE_KIND_MIGRATION_SQL: &str =
     include_str!("../../migrations/0032_normative_rebase_kind.sql");
+const COLLECTED_ITEMS_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0033_collected_items.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -403,7 +430,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
 }
 
 #[allow(clippy::too_many_lines)] // one registration per migration file, in version order
-fn post_transactional_online_migrations() -> [Migration; 17] {
+fn post_transactional_online_migrations() -> [Migration; 18] {
     [
         Migration::new(
             15,
@@ -569,6 +596,18 @@ fn post_transactional_online_migrations() -> [Migration; 17] {
             // before the old one is dropped, so every interruption leaves a
             // kind check in force. Runs outside SQLx's transaction wrapper
             // like migrations 0018-0031.
+            true,
+        ),
+        Migration::new(
+            COLLECTED_ITEMS_SCHEMA_VERSION,
+            Cow::Borrowed("collected items"),
+            MigrationType::Simple,
+            Cow::Borrowed(COLLECTED_ITEMS_MIGRATION_SQL),
+            // ADR 0008 D4-D6. Additive: eight private-plane tables with no
+            // foreign key (the staging outbox, item history, heads, links,
+            // containers, collector status, cursors, and dead letters) and
+            // their indexes. Runs outside SQLx's transaction wrapper like
+            // migrations 0018-0032; MINIMUM_RECALL_SCHEMA_VERSION stays 18.
             true,
         ),
     ]

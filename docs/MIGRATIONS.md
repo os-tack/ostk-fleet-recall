@@ -36,18 +36,26 @@ status, and spec conformance (described below and under
 [Privilege separation](#privilege-separation)). Migration 32 adds no table:
 it widens migration 24's normative-log record-kind check to admit `rebase`
 rows, which the writer-authority installer appends when it moves a scope to
-generation 3 ([ADR 0008](adr/0008-collected-items.md) D3).
+generation 3 ([ADR 0008](adr/0008-collected-items.md) D3). Migration 33 adds
+the collected-item sink (ADR 0008 D4 to D6): the staging outbox, the
+append-only item history and its links, the current-view heads, container
+audiences, collector status, per-domain cursors, and digest-only dead
+letters.
 
 Each private runtime uses its own part of these tables:
 
-- The memory worker writes the tables of migrations 19 through 22, 26, and
-  30, and migration 23's body-visibility table.
+- The memory worker writes the tables of migrations 19 through 22, 26, 30,
+  and 33, and migration 23's body-visibility table. Its `collect` step drains
+  migration 33's outbox and writes the item history, links, and heads; the
+  collectors that stage into the outbox (later slices) write its containers,
+  status, cursors, and dead letters.
 - `ostk-spec` writes the tables of migrations 24, 27, and 31.
   `ostk-authority-install apply --target generation-3`, as the migrator,
   appends migration 32's `rebase` rows to migration 24's log and moves those
   families' heads.
 - `serve` reads the tables of migrations 19 through 22 and 30 (with the
-  visibility class migration 23 adds to the recall tiers) for
+  visibility class migration 23 adds to the recall tiers), and from migration
+  33 on its outbox, items, heads, containers, and collector status, for
   `recall(kind=evidence)`, and those of migrations 24, 27, and 31 for
   `recall(action="discrepancies")`. The `evidence` and `spec_conformance`
   blocks of `recall(status)` read the same tables. `serve` writes none of
@@ -57,7 +65,7 @@ Each private runtime uses its own part of these tables:
   reads them or migration 23's publication views.
 
 The runtime role policy grants `fleet_runtime` the tables of migrations 19
-through 24, 26, and 27, as it does those of 29 through 31. It grants nothing
+through 24, 26, and 27, as it does those of 29 through 31 and 33. It grants nothing
 on migration 23's publication views or migration 28's import rows.
 
 Serving requires none of these migrations: `MINIMUM_RECALL_SCHEMA_VERSION`
@@ -65,7 +73,9 @@ stays 18. `serve` serves each surface built on them only when its startup
 probe finds the schema version and the runtime grants on every table the
 surface reads. Migration 29 gates the conflict lifecycle, 30 gates
 `recall(kind=evidence)`, and 31 gates `recall(action="discrepancies")`;
-migration 32 gates nothing served. A
+migration 32 gates nothing served, and migration 33 gates no surface either:
+evidence recall reads its collector state when the probe finds it readable,
+and is still served, fail-closed, when it does not (ADR 0008 D5). A
 surface whose probe fails is left out of `tools/list`, and `serve` logs why;
 every other surface is unchanged. The probes run only at startup, so
 roll each of these migrations out the same way:
@@ -304,9 +314,9 @@ separately provisioned private-writer login is a member only of the hardened
   `memory_control_*` or `memory_registry_*` base table;
 - append and advance privileges on the body, coverage, recall, transcript,
   and CI connector tables, normative activation, the discrepancy ledger, the
-  conflict lifecycle log, worker source status, and spec conformance (the
-  tables of migrations 19 through 24, 26, 27, and 29 through 31), described
-  below;
+  conflict lifecycle log, worker source status, spec conformance, and the
+  collected-item sink (the tables of migrations 19 through 24, 26, 27, 29
+  through 31, and 33), described below;
 - `SELECT` on the migrator-owned `memory_writer_authority_v1` view, which is
   the writer's only registry/bootstrap read path;
 - read access to SQLx migration metadata for health checks;
@@ -342,22 +352,42 @@ private-plane tables with no foreign key; each migration follows the
 resumable pattern above and closes with a same-name drift guard (the column
 shape, plus migration 31's two indexes).
 
+Migration 33 (ADR 0008 D4 to D6) adds eight private-plane tables, none with a
+foreign key and none ever granted to the publication reader:
+`memory_collector_outbox_v1` (one row per staged part, keyed by its stage id,
+holding the redacted canonical envelope only while it is pending: a CHECK ties
+`state = 'pending'` to a non-NULL envelope, so settling a row drops its text
+and keeps its SHA-256), `memory_collected_items_v1` (append-only history, one
+row per admitted part, keyed by its accepted event),
+`memory_collected_item_links_v1`, `memory_collected_item_heads_v1` (one head
+per item and trust tier, with a partial unique index that keeps exactly one
+presented head per item), `memory_collector_containers_v1` (the audience a
+container was admitted on, and whether it was withdrawn),
+`memory_collector_sources_v1` (collector status, apart from the worker's own
+table), `memory_collector_cursors_v1`, and `memory_collector_dead_letters_v1`
+(a closed reason, digests, and a static diagnostic, never content). It closes
+with a drift guard over every table's column shape and the presented-head
+index.
+
 For the tables from migration 19 onward the policy grants one of three
 shapes, and never `DELETE`:
 
 - **Append-only (`SELECT`, `INSERT`):** the Stage-5 body objects, chunk
   occurrences and their spans, parse-run manifests, source-commit membership,
   and coverage receipts; the CI connector's measured windows; the normative
-  and discrepancy logs; migration 29's conflict lifecycle log; and migration 31's normative
-  statements and spec checks. The runtime can add a logged event, receipt,
-  statement, or check but never rewrite or remove one.
+  and discrepancy logs; migration 29's conflict lifecycle log; migration 31's normative
+  statements and spec checks; and migration 33's collected item history, item
+  links, and collector dead letters. The runtime can add a logged event,
+  receipt, statement, check, history row, or dead letter but never rewrite or
+  remove one.
 - **Advanced state (`SELECT`, `INSERT`, `UPDATE`):** generation pointers, the
   body projection watermarks, body visibility, coverage cursors, the lexical
   and dense recall projections and their cursors, the transcript outbox and
-  cursors, the normative and discrepancy heads and projections, and migration
-  30's worker source status. None of these rows is a logged event or a
-  receipt: they are heads, cursors, pointers, projections, the outbox's drain
-  state, and operational status. `UPDATE` covers each compare-and-set advance
+  cursors, the normative and discrepancy heads and projections, migration
+  30's worker source status, and migration 33's collector outbox, item heads,
+  collector status, cursors, and containers. None of these rows is a logged
+  event or a receipt: they are heads, cursors, pointers, projections, the
+  outboxes' drain state, container audiences, and operational status. `UPDATE` covers each compare-and-set advance
   or upsert, and the `SELECT ... FOR UPDATE` that locks a head or cursor.
 - **Read-only (`SELECT`):** `memory_discrepancy_relations_v1`. Nothing served
   appends a relation yet.
@@ -383,15 +413,18 @@ writer login (see
 grants nothing on migration 23's publication views or on migration 28's
 bootstrap-import rows, and the publication reader gains nothing from any of
 these rows. The policy closes by
-checking the exact 115-row matrix: database `CONNECT`, schema `USAGE`, 110
-table-privilege rows, and three sequence-`USAGE` rows.
+checking the exact 136-row matrix: database `CONNECT`, schema `USAGE`, 131
+table-privilege rows, and three sequence-`USAGE` rows. Migration 33 added 21
+of them: `SELECT` and `INSERT` on its three append-only tables, and `SELECT`,
+`INSERT`, and `UPDATE` on its five advanced-state tables (the matrix was 115
+rows, 110 of them on tables, before it).
 
 A single gate guards all of it. Before any change, the policy requires a
-successful SQLx row for every migration from 1 through 31 (version 25 is
+successful SQLx row for every migration from 1 through 33 (version 25 is
 permanently unused); a later successful migration cannot mask a missing or
 failed one in that prefix. Migration 32 adds no table and needs no grant (the
-runtime already holds `INSERT` on the normative log), so the gate stays at
-31. When a later migration adds tables a runtime
+runtime already holds `INSERT` on the normative log); it is inside the gate
+only because migration 33 is. When a later migration adds tables a runtime
 needs, extend the policy in one edit: the gate, the grants, and the closing
 count together. The writer probes its grants only at startup, so after
 `migrate`, drain `fleet_writer`, reapply this policy, and then restart
@@ -613,16 +646,20 @@ against a real CockroachDB database.
 
 ### Generation-3 rollout order ([ADR 0008](adr/0008-collected-items.md) D2)
 
-The generation-3 collected-items package is a `2 -> 3` generic successor. It
-needs no new grant, and a binary that does not compile it in refuses any head
-that activates it as `UnknownActivePackage`. So the order is fixed, per
+The generation-3 collected-items package is a `2 -> 3` generic successor. The
+package itself needs no new grant, and a binary that does not compile it in
+refuses any head that activates it as `UnknownActivePackage`. So the order is fixed, per
 physical scope that is to collect items:
 
 1. Ship a binary that recognizes generation 3 to every process that verifies
    a head for that scope: every event-first writer, every `serve`, the worker
    on its ingest host, and the projector container.
-2. Apply the release's migrations, then re-apply the grant files. This release
-   adds migration 32, which lets a spec family be rebased, and no grant.
+2. Apply the release's migrations, then re-apply the grant files. Migration
+   32 lets a spec family be rebased and adds no grant; migration 33 adds the
+   collected-item tables, which the runtime policy grants (its gate is now
+   migrations 1 through 33). A worker whose schema predates migration 33
+   skips its `collect` step, and fails it, naming `migrate`, when a collector
+   is configured.
 3. Run `ostk-authority-install apply --target generation-3` as the schema
    owner/migrator login. The printed pins are unchanged, so no writer is
    reconfigured. The run then rebases every normative binding family onto
@@ -764,6 +801,12 @@ exact failed version:
   the new constraint and the absence of the old one; a `55000` means a
   same-name constraint of another definition and needs a separately reviewed
   forward repair.
+- v33 creates eight tables and their indexes with `IF NOT EXISTS`, commits,
+  and then asserts every table's exact column shape and the exact definition
+  of the partial unique index that keeps one presented head per item. The
+  normal migrator retry resumes an interrupted run; a `55000` means a
+  same-name table or index of another shape and needs a separately reviewed
+  forward repair. It rewrites no existing row.
 
 1. Leave the application service at zero.
 2. Preserve the migration task logs and exact CockroachDB error.

@@ -41,9 +41,15 @@
 //!   project.
 //! * **Private plane.** Migration 0021 adds none of these tables to the
 //!   publication grant list, and no public route reaches the dense worker.
+//! * **Collected-item suppression (ADR 0008 D5).** A private-plane reader
+//!   bound with [`CockroachRecallReader::with_collected_suppression`] withholds
+//!   every collected body whose item's presented head is a tombstone or whose
+//!   container was withdrawn: inside the lexical lane's `WHERE`, before
+//!   ranking, and as a post-filter of the dense lane's nearest neighbours.
+//!   Deleted text stops being recallable at once, with no row rewritten.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -52,6 +58,7 @@ use sqlx::{Postgres, Row as _, Transaction};
 use uuid::Uuid;
 
 use crate::FleetError;
+use crate::collectors::cockroach::suppressed_body_predicate;
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::store::cockroach::{
     RetryPolicy, is_retryable, is_retryable_fleet_error, serialize_vector,
@@ -201,6 +208,36 @@ const LEXICAL_RECALL_SQL: &str = "SELECT body_content_id, \
      WHERE tenant_id = $1 AND project = $2 \
        AND search_document @@ plainto_tsquery('english', $3) \
      ORDER BY score DESC, body_content_id LIMIT $4";
+
+// LEXICAL_RECALL_SQL for a reader bound with collected-item suppression: a
+// collected body whose item's presented head is a tombstone, or whose
+// container was withdrawn, is excluded inside the WHERE, before ts_rank orders
+// anything and before the LIMIT (ADR 0008 D5). The subquery reads
+// memory_collected_items_body_idx, so it costs one index probe per candidate.
+static LEXICAL_RECALL_COLLECTED_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT lex.body_content_id, \
+         ts_rank(lex.search_document, plainto_tsquery('english', $3))::FLOAT4 AS score \
+         FROM public.memory_body_lexical_projection_v1 AS lex \
+         WHERE lex.tenant_id = $1 AND lex.project = $2 \
+           AND lex.search_document @@ plainto_tsquery('english', $3) \
+           AND NOT {} \
+         ORDER BY score DESC, lex.body_content_id LIMIT $4",
+        suppressed_body_predicate("lex.body_content_id")
+    )
+});
+
+// Which of a dense lane's nearest neighbours are suppressed collected bodies.
+// The ANN index cannot serve the suppression predicate, so the dense lane
+// post-filters its top-k through this instead.
+static SUPPRESSED_BODIES_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT candidate.body_content_id \
+         FROM unnest($3::BYTES[]) AS candidate (body_content_id) \
+         WHERE {}",
+        suppressed_body_predicate("candidate.body_content_id")
+    )
+});
 
 // The publication plane's lexical lane. It reads the VIEW, whose own WHERE
 // clause is the visibility predicate, so the restriction is applied before
@@ -1025,6 +1062,9 @@ pub struct CockroachRecallReader {
     /// When set, the dense lane compares a query vector only with vectors
     /// this model embedded.
     dense_model: Option<Sha256Digest>,
+    /// When set, a collected body that is deleted or withdrawn is withheld
+    /// from both lanes.
+    collected_suppression: bool,
 }
 
 impl std::fmt::Debug for CockroachRecallReader {
@@ -1051,6 +1091,7 @@ impl CockroachRecallReader {
             },
             plane: RecallPlaneV1::Private,
             dense_model: None,
+            collected_suppression: false,
         }
     }
 
@@ -1072,6 +1113,7 @@ impl CockroachRecallReader {
             },
             plane: RecallPlaneV1::Publication,
             dense_model: None,
+            collected_suppression: false,
         }
     }
 
@@ -1086,6 +1128,19 @@ impl CockroachRecallReader {
     #[must_use]
     pub const fn with_dense_model(mut self, model_digest: Sha256Digest) -> Self {
         self.dense_model = Some(model_digest);
+        self
+    }
+
+    /// Withhold, from both lanes, every collected body whose item's presented
+    /// head is a tombstone or whose container was withdrawn (ADR 0008 D5).
+    ///
+    /// Only for a private-plane reader whose login may read the collector
+    /// tables (migration 0033): evidence recall binds it when its startup
+    /// probe found them readable. The publication plane never needs it,
+    /// because a collected body is never publication-safe.
+    #[must_use]
+    pub const fn with_collected_suppression(mut self) -> Self {
+        self.collected_suppression = matches!(self.plane, RecallPlaneV1::Private);
         self
     }
 
@@ -1212,9 +1267,10 @@ impl CockroachRecallReader {
         if query_text.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let statement = match self.plane {
-            RecallPlaneV1::Private => LEXICAL_RECALL_SQL,
-            RecallPlaneV1::Publication => LEXICAL_RECALL_PUBLICATION_SQL,
+        let statement = match (self.plane, self.collected_suppression) {
+            (RecallPlaneV1::Private, false) => LEXICAL_RECALL_SQL,
+            (RecallPlaneV1::Private, true) => LEXICAL_RECALL_COLLECTED_SQL.as_str(),
+            (RecallPlaneV1::Publication, _) => LEXICAL_RECALL_PUBLICATION_SQL,
         };
         let rows: Vec<PgRow> = sqlx::query(statement)
             .bind(self.scope.tenant_id)
@@ -1260,14 +1316,35 @@ impl CockroachRecallReader {
             query = query.bind(model.as_bytes().to_vec());
         }
         let rows: Vec<PgRow> = query.fetch_all(&self.scope.pool).await?;
-        rows.iter()
+        let neighbours = rows
+            .iter()
             .map(|row| {
                 Ok((
                     digest32(row.try_get("body_content_id")?)?,
                     row.try_get("distance")?,
                 ))
             })
-            .collect()
+            .collect::<RecallProjectionResult<Vec<(Sha256Digest, f32)>>>()?;
+        if !self.collected_suppression || neighbours.is_empty() {
+            return Ok(neighbours);
+        }
+        let candidates: Vec<Vec<u8>> = neighbours
+            .iter()
+            .map(|(body, _)| body.as_bytes().to_vec())
+            .collect();
+        let suppressed: HashSet<Sha256Digest> = sqlx::query(SUPPRESSED_BODIES_SQL.as_str())
+            .bind(self.scope.tenant_id)
+            .bind(&self.scope.project)
+            .bind(&candidates)
+            .fetch_all(&self.scope.pool)
+            .await?
+            .iter()
+            .map(|row| digest32(row.try_get("body_content_id")?))
+            .collect::<RecallProjectionResult<_>>()?;
+        Ok(neighbours
+            .into_iter()
+            .filter(|(body, _)| !suppressed.contains(body))
+            .collect())
     }
 
     /// Read the full, deterministically ordered projection snapshot for this

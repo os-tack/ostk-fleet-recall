@@ -1,5 +1,6 @@
 //! The ingest steps: transcript, git, and CI sources to accepted evidence,
-//! coverage receipts, and one status row per source.
+//! coverage receipts, and one status row per source; then, when selected, the
+//! collect step, under the same verified head.
 //!
 //! Each step is glue over its connector's library, called in the same order
 //! the connector's own connected tests call it. Nothing here re-derives an
@@ -199,7 +200,7 @@ fn producer(principal: &ContractId) -> ProducerIdentityV1 {
     }
 }
 
-fn zeroed(keys: &[&'static str]) -> WorkerCountersV1 {
+pub(super) fn zeroed(keys: &[&'static str]) -> WorkerCountersV1 {
     keys.iter().map(|key| (*key, 0)).collect()
 }
 
@@ -223,18 +224,20 @@ fn bounded_error(error: &str) -> String {
     error[..end].to_owned()
 }
 
-/// Run the selected ingest steps.
+/// Run the selected ingest steps, then the collect step when it is selected.
 pub(super) async fn run_ingest(worker: &MemoryWorker) -> IngestOutcome {
     let selected: Vec<WorkerStepV1> = WorkerStepV1::INGEST
         .into_iter()
         .filter(|step| worker.steps.contains(step))
         .collect();
+    let collect = worker.steps.contains(&WorkerStepV1::Collect);
     let (Some(runtime), Some(kek)) = (&worker.deps.authority, &worker.drain_kek) else {
         // `MemoryWorker::new` refuses this combination; fail closed anyway.
         return IngestOutcome {
             authority: None,
             steps: selected
                 .into_iter()
+                .chain(collect.then_some(WorkerStepV1::Collect))
                 .map(|step| {
                     (
                         step,
@@ -281,6 +284,14 @@ pub(super) async fn run_ingest(worker: &MemoryWorker) -> IngestOutcome {
             _ => continue,
         };
         steps.push((*step, report));
+    }
+    if collect {
+        // Boxed: the drain's future is large, and every caller of a tick would
+        // otherwise carry it inline.
+        steps.push((
+            WorkerStepV1::Collect,
+            Box::pin(super::collect::run_collect(worker, runtime, kek, &verified)).await,
+        ));
     }
 
     // Retire only from a complete inventory: a directory that could not be
