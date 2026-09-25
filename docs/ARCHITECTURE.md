@@ -169,20 +169,20 @@ than caller-controlled JSON.
 | Discrepancy ledger | `memory_discrepancy_heads_v1`, `memory_discrepancy_log_v1`, `memory_discrepancy_projections_v1`, `memory_discrepancy_relations_v1` | `spec_nonconformance` episodes and their append-only lifecycle |
 | Collected items | `memory_collector_outbox_v1`, `memory_collected_items_v1`, `memory_collected_item_links_v1`, `memory_collected_item_heads_v1`, `memory_collector_containers_v1`, `memory_collected_item_withdrawals_v1`, `memory_collector_sources_v1`, `memory_collector_cursors_v1`, `memory_collector_dead_letters_v1` | Items staged by any collector, their append-only history and current heads, container audiences and withdrawals, items whose own audience narrowed, collector status and cursors, and digest-only dead letters ([ADR 0008](adr/0008-collected-items.md)) |
 
-Later migrations (19 through 33, see [`migrations/`](../migrations); 25 is
-permanently unused) add the private-plane tables listed above:
-content-addressed body projection (19), coverage cursors and receipts (20),
-the lexical/dense recall projection (21) and its visibility class (23), the
-transcript (22) and CI (26) connector state, normative activation (24), the
-discrepancy ledger (27), the bootstrap-manifest import rows (28), worker
-source status (30), the spec statements and checks (31), and the
-collected-item sink (33); migration 32 only widens a check. Migration 29
-adds `memory_conflict_lifecycle_events_v1`, the append-only per-conflict
-lifecycle log described under the write path below. The memory worker writes
-the body, connector, coverage, recall-projection, and status tables;
-`ostk-spec` writes the normative, spec, and discrepancy tables; and `serve`
-reads them for `recall(kind=evidence)` and `recall(discrepancies)` without
-writing any of them. Only the private import CLI writes migration 28's rows.
+Later migrations (19 through 34, see [`migrations/`](../migrations); 25 is
+permanently unused) add the private-plane tables listed above: content-addressed
+body projection (19), coverage cursors and receipts (20), the lexical/dense
+recall projection (21) and its visibility class (23), the transcript (22) and CI
+(26) connector state, normative activation (24), the discrepancy ledger (27),
+the bootstrap-manifest import rows (28), worker source status (30), the spec
+statements and checks (31), and the collected-item sink (33) and its withdrawals
+(34); migration 32 only widens a check. Migration 29 adds
+`memory_conflict_lifecycle_events_v1`, the append-only per-conflict lifecycle
+log described under the write path below. The memory worker writes the body,
+connector, coverage, recall-projection, and status tables; `ostk-spec` writes
+the normative, spec, and discrepancy tables; and `serve` reads them for
+`recall(kind=evidence)` and `recall(discrepancies)` without writing any of them.
+Only the private import CLI writes migration 28's rows.
 
 Serving accepts an uninterrupted successful migration prefix through at least
 version 18, and later additive migrations remain compatible. The private

@@ -230,11 +230,12 @@ and `memory_content_objects`, and `SELECT`/`INSERT`/`UPDATE` on
 migrator-owned view `memory_writer_authority_v1`, `SELECT`/`INSERT` (no
 `UPDATE` or `DELETE`) on the migration-29 conflict lifecycle log
 `memory_conflict_lifecycle_events_v1`, and the append-only, advance, and
-read-only rows on the tables of migrations 19 through 27, 30, 31, and 33 (the
-collected-item sink), plus `UPDATE` on `memory_content_objects` for its row
-lock (see [MIGRATIONS.md](MIGRATIONS.md)). The policy refuses to run until
-every migration from 1 through 33 has succeeded, and the writer serves the conflict
-lifecycle only after a restart that follows the policy; the policy itself
+read-only rows on the tables of migrations 19 through 27, 30, 31, 33, and 34
+(the collected-item sink and its withdrawals), plus `UPDATE` on
+`memory_content_objects` for its row lock (see [MIGRATIONS.md](MIGRATIONS.md)).
+The policy refuses to run until every migration from 1 through 34 has
+succeeded, and the writer serves the conflict lifecycle only after a restart
+that follows the policy; the policy itself
 installs the sole `fleet_writer` membership edge. Never use `ON ALL TABLES`, and never grant the
 writer, publication reader, or `public` role access to `memory_control_bootstraps`,
 `memory_control_log_epochs`, `memory_control_shard_heads`, or

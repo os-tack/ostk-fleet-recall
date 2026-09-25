@@ -247,9 +247,9 @@ pins. Generation 2 is its default target; `apply --target generation-3` adds
 the generic `2 -> 3` transition to the compiled generation-3 collected-items
 package ([ADR 0008](adr/0008-collected-items.md) D2) and then rebases the
 scope's normative binding families onto it (D3; `--no-normative-rebase` skips
-that), and no target moves a head backwards. Like the other ceremony binaries, it is
-a workstation tool: it is not in the production image, and the CI image job
-asserts that it is absent.
+that), and no target moves a head backwards. Like the other ceremony
+binaries, it is a workstation tool: it is not in the production image, and
+the CI image job asserts that it is absent.
 
 ### Runbook
 
@@ -301,9 +301,12 @@ cargo run --locked --bin ostk-authority-install -- apply
   installers against one physical scope at the same time. The loser fails
   closed, and running it again completes the install.
 - **Refusals.** The installer never repairs anything. It refuses a physical
-  scope that already holds another bootstrap receipt, other contract
-  namespaces, a package the strict witness does not know, or the generation-1
-  package re-activated past generation 1. It reads the stored control
+  scope that already holds another bootstrap receipt, other contract namespaces,
+  a package the strict witness does not know, the generation-1 package
+  re-activated past generation 1, or, for `--target generation-3`, the
+  generation-2 package held at any generation other than 2 (a hand-run revert
+  that activated it again as a later generation): the installer only drives the
+  heads its own `1 -> 2 -> 3` lineage installs. It reads the stored control
   bootstrap as well as the writer-authority view, so a scope bootstrapped by a
   hand-run `ostk-control-bootstrap`, or by an install for another request that
   stopped before `0 -> 1`, is refused the same way as an installed one. Every
@@ -322,22 +325,22 @@ Every signature the installer makes uses the public Ed25519 test fixture keys:
 seeds `0x01` and `0x02`. The frozen receipt names these keys `principal.1` and
 `principal.2`, and the compiled activation policy names them `principal.alice`
 and `principal.bob`. The installer also mints the generation-2 conformance
-result itself. Anyone can reproduce these signatures, so they authenticate
-nothing.
+result itself, and with `--target generation-3` the generation-3 one too.
+Anyone can reproduce these signatures, so they authenticate nothing.
 
-Signing the ceremonies by hand does not fix this from generation 1 onward.
-The strict witness admits only two packages: the compiled generation-1
-Stage-4 package, and the generation-2 package composed from it, which
-carries its activation policy forward unchanged. That policy's eligible
-signers are the fixture keys, and a successor activation is verified only
-against the installed policy's eligible signers. So `1 -> 2`, and every later
-successor from any head a writer can run under, can be signed by anyone,
-whatever an operator signed for the earlier steps. Only the control
-bootstrap, the genesis activation, and the `0 -> 1` key bridge can carry
-deployment keys, through the four CLIs above. No deployment of the compiled
-packages has non-nominal successor governance until a package whose
-activation policy names deployment keys is compiled in, and that work is
-deferred.
+Signing the ceremonies by hand does not fix this from generation 1 onward. The
+strict witness admits three packages: the compiled generation-1 Stage-4 package,
+the generation-2 package composed from it, and the generation-3 collected-items
+package composed from that. Generations 2 and 3 carry the generation-1
+activation policy forward unchanged. That policy's eligible signers are the
+fixture keys, and a successor activation is verified only against the installed
+policy's eligible signers. So `1 -> 2` and `2 -> 3`, and every later successor
+from any head a writer can run under, can be signed by anyone, whatever an
+operator signed for the earlier steps. Only the control bootstrap, the genesis
+activation, and the `0 -> 1` key bridge can carry deployment keys, through the
+four CLIs above. No deployment of the compiled packages has non-nominal
+successor governance until a package whose activation policy names deployment
+keys is compiled in, and that work is deferred.
 
 Two things carry the authority. First, database role separation: only the
 schema owner/migrator login and the provisioned ceremony roles

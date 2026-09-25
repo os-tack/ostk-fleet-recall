@@ -57,19 +57,19 @@ Each private runtime uses its own part of these tables:
   appends migration 32's `rebase` rows to migration 24's log and moves those
   families' heads.
 - `serve` reads the tables of migrations 19 through 22 and 30 (with the
-  visibility class migration 23 adds to the recall tiers), and from migration
-  34 on the collector outbox, items, heads, containers, item withdrawals, and
-  collector status, for `recall(kind=evidence)`, and those of migrations 24, 27, and 31 for
-  `recall(action="discrepancies")`. The `evidence` and `spec_conformance`
-  blocks of `recall(status)` read the same tables. `serve` writes none of
-  them. Of the tables from migration 19 onward, it writes only migration 29's
-  lifecycle log.
+  visibility class migration 23 adds to the recall tiers), and from migration 34
+  on the collector outbox, items, heads, containers, item withdrawals, and
+  collector status, for `recall(kind=evidence)`, and those of migrations 24, 27,
+  and 31 for `recall(action="discrepancies")`. The `evidence` and
+  `spec_conformance` blocks of `recall(status)` read the same tables. `serve`
+  writes none of them. Of the tables from migration 19 onward, it writes only
+  migration 29's lifecycle log.
 - Only the private import CLI writes migration 28's rows. No served path
   reads them or migration 23's publication views.
 
 The runtime role policy grants `fleet_runtime` the tables of migrations 19
-through 24, 26, and 27, as it does those of 29 through 31, 33, and 34. It grants nothing
-on migration 23's publication views or migration 28's import rows.
+through 24, 26, and 27, as it does those of 29 through 31, 33, and 34. It grants
+nothing on migration 23's publication views or migration 28's import rows.
 
 Serving requires none of these migrations: `MINIMUM_RECALL_SCHEMA_VERSION`
 stays 18. `serve` serves each surface built on them only when its startup
@@ -444,12 +444,11 @@ A single gate guards all of it. Before any change, the policy requires a
 successful SQLx row for every migration from 1 through 34 (version 25 is
 permanently unused); a later successful migration cannot mask a missing or
 failed one in that prefix. Migration 32 adds no table and needs no grant (the
-runtime already holds `INSERT` on the normative log); it is inside the gate
-only because migrations 33 and 34 are. When a later migration adds tables a runtime
+runtime already holds `INSERT` on the normative log); it is inside the gate only
+because migrations 33 and 34 are. When a later migration adds tables a runtime
 needs, extend the policy in one edit: the gate, the grants, and the closing
 count together. The writer probes its grants only at startup, so after
-`migrate`, drain `fleet_writer`, reapply this policy, and then restart
-`serve`.
+`migrate`, drain `fleet_writer`, reapply this policy, and then restart `serve`.
 
 Grant the external private-writer login only membership in `fleet_runtime`; do
 not copy these DML/sequence grants onto the fixed publication login.
@@ -675,14 +674,14 @@ physical scope that is to collect items:
 1. Ship a binary that recognizes generation 3 to every process that verifies
    a head for that scope: every event-first writer, every `serve`, the worker
    on its ingest host, and the projector container.
-2. Apply the release's migrations, then re-apply the grant files. Migration
-   32 lets a spec family be rebased and adds no grant; migrations 33 and 34
-   add the collected-item tables and their withdrawals, which the runtime
-   policy grants (its gate is now migrations 1 through 34). A worker whose
-   schema predates migration 34 skips its `collect` step, and fails it,
-   naming `migrate`, when a collector is configured. A `serve` started before this step needs no restart: its
-   evidence recall checks the collector state again on every read until it is
-   readable, and withholds every collected body until then.
+2. Apply the release's migrations, then re-apply the grant files. Migration 32
+   lets a spec family be rebased and adds no grant; migrations 33 and 34 add the
+   collected-item tables and their withdrawals, which the runtime policy grants
+   (its gate is now migrations 1 through 34). A worker whose schema predates
+   migration 34 skips its `collect` step, and fails it, naming `migrate`, when a
+   collector is configured. A `serve` started before this step needs no restart:
+   its evidence recall checks the collector state again on every read until it
+   is readable, and withholds every collected body until then.
 3. Run `ostk-authority-install apply --target generation-3` as the schema
    owner/migrator login. The printed pins are unchanged, so no writer is
    reconfigured. The run then rebases every normative binding family onto

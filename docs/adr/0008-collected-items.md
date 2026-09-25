@@ -251,16 +251,16 @@ first:
    is (a channel made private and not listed) is set to `access =
    'withdrawn'`, never deleted; and a report never re-opens what a
    verification withdrew.
-3. For each draft, in order: the provider and scope must be the instance's
-   (else a `validation_failed` dead letter, `provider_scope_mismatch`); the
-   audience is decided by the server (D6; a refusal is an `audience_refused`
-   dead letter, and a refusal that narrows an item the memory already holds
-   withdraws the item); the draft is sealed (sanitize, redact, split at most 32 KiB
-   per part, one canonical envelope and stage id per part; a refusal is a
+3. For each draft, in order: the provider and scope must be the instance's (else
+   a `validation_failed` dead letter, `provider_scope_mismatch`); the audience
+   is decided by the server (D6; a refusal is an `audience_refused` dead letter,
+   and a refusal that narrows an item the memory already holds withdraws the
+   item); the draft is sealed (sanitize, redact, split at most 32 KiB per part,
+   one canonical envelope and stage id per part; a refusal is a
    `validation_failed`, `oversize`, or `redaction_withheld` dead letter); an
-   item whose provider clock is ahead of the observation is a `clock_ahead`
-   dead letter; and each part is inserted with `ON CONFLICT DO NOTHING` on its
-   stage id, so re-reading an unchanged item stages nothing.
+   item whose provider clock is ahead of the observation is a `clock_ahead` dead
+   letter; and each part is inserted with `ON CONFLICT DO NOTHING` on its stage
+   id, so re-reading an unchanged item stages nothing.
 4. The collector's cursor advances and its status row are written in the same
    transaction (REPLAY-02), except that no cursor advances when an item was
    `clock_ahead`: the page is read again and what did stage replays.
@@ -355,14 +355,14 @@ provider delete, trash, or revoke, or an absence-based tombstone, is a
 version with empty text that becomes the head.
 
 **Read-time suppression.** A collected body is withheld from recall when its
-item's presented head is a tombstone, its container is `withdrawn`, or the
-item itself is withdrawn for either tier (D6): inside the lexical lane's
-`WHERE`, before ranking and before the `LIMIT`; as a post-filter of the dense
-lane's nearest neighbours; and in evidence `get`. It reads
+item's presented head is a tombstone, its container is `withdrawn`, or the item
+itself is withdrawn for either tier (D6): inside the lexical lane's `WHERE`,
+before ranking and before the `LIMIT`; as a post-filter of the dense lane's
+nearest neighbours; and in evidence `get`. It reads
 `memory_collected_items_body_idx` and two primary keys, so the cost is a few
-index probes per candidate. Deleted text stops being recallable at once, with no `DELETE`
-grant and no projection rewritten. Physical erasure is deferred (ADR 0006 D9
-applies).
+index probes per candidate. Deleted text stops being recallable at once, with no
+`DELETE` grant and no projection rewritten. Physical erasure is deferred (ADR
+0006 D9 applies).
 
 **Evidence recall stays sound.** From migration 34 on, evidence recall probes
 `SELECT` on the outbox, items, heads, containers, item withdrawals, and

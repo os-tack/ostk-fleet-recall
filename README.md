@@ -238,8 +238,8 @@ admitted, in this order:
 
 - `ingest`: each transcript file, git ref, and CI workflow becomes its own
   connector instance. The worker admits new provider material as accepted
-  evidence under a freshly verified generation-2 head, writes coverage
-  receipts for what it read, and updates each source's status row in
+  evidence under a freshly verified generation-2 or generation-3 head, writes
+  coverage receipts for what it read, and updates each source's status row in
   `memory_worker_sources_v1`.
 - `collect`: drains the collector outbox (migrations 0033 and 0034,
   [ADR 0008](docs/adr/0008-collected-items.md) D4): items a collector staged
@@ -484,15 +484,15 @@ runner:
   action, causal, consolidation, erasure, telemetry, and ledger epochs) under
   `contracts/dynamic-memory/v3` and `src/memory_contracts`.
 
-ADRs 0005 to 0007 record everything else deferred. The main items are:
+ADRs 0005 to 0008 record everything else deferred. The main items are:
 
-- **Writer authority and governance.** A generation-3 or later registry
-  package (the strict witness knows only the compiled generation-1 and
-  generation-2 packages); deployment-keyed governance signers, since every
-  successor from generation 1 on is signed with the public fixture keys; an
-  `ostk-authority-install inspect` command and a generation-1 target; moving
-  `ostk-bootstrap-manifest-import` onto the shared writer-authority runtime;
-  and a separate worker role.
+- **Writer authority and governance.** A registry package past generation 3
+  (the strict witness knows only the compiled generation-1, generation-2,
+  and generation-3 packages); deployment-keyed governance signers, since
+  every successor from generation 1 on is signed with the public fixture
+  keys; an `ostk-authority-install inspect` command and a generation-1
+  target; moving `ostk-bootstrap-manifest-import` onto the shared
+  writer-authority runtime; and a separate worker role.
 - **Assert.** Event-first retraction, supersession, and correction; more
   predicates, resource-valued claims, and other admission bases; replaying a
   committed assert receipt after assert is turned off; publishing an
@@ -511,8 +511,9 @@ ADRs 0005 to 0007 record everything else deferred. The main items are:
   `closed_world_verified` observer that can verify absence and so
   auto-resolve an episode; statements with more than one proposition;
   measuring the observer binary against its admitted digest; rebasing
-  normative heads after a registry transition; a spec-check worker step;
-  other finding types, predicates, and observers.
+  normative heads outside the installer's generation-3 run (an `ostk-spec
+  rebase`, or a rebase onto generation 2); a spec-check worker step; other
+  finding types, predicates, and observers.
 
 ## Deployment
 
