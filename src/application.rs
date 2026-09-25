@@ -966,15 +966,20 @@ impl CockroachMemoryService {
         if let Some(status) = &self.assert_status {
             result.data["remember_assert"] = json!(status);
         }
-        if let Some(evidence) = self.evidence.as_deref() {
-            let (block, warnings) = evidence_status(evidence).await;
-            result.data["evidence"] = block;
-            result.warnings.extend(warnings);
-        }
-        if let Some(reader) = self.spec_conformance.as_deref() {
-            let (block, warnings) = spec_conformance_status(reader).await;
-            result.data["spec_conformance"] = block;
-            result.warnings.extend(warnings);
+        let (evidence, spec_conformance) = optional_status_blocks(
+            self.evidence.as_deref(),
+            self.spec_conformance.as_deref(),
+            OPTIONAL_STATUS_DEADLINE,
+        )
+        .await;
+        for (name, block) in [
+            ("evidence", evidence),
+            ("spec_conformance", spec_conformance),
+        ] {
+            if let Some((block, warnings)) = block {
+                result.data[name] = block;
+                result.warnings.extend(warnings);
+            }
         }
         result.conflict_coverage = ConflictCoverage::not_evaluated();
         Ok(result)
@@ -2424,25 +2429,46 @@ fn evidence_search_result(search: EvidenceSearchV1) -> RecallResult {
     result
 }
 
-/// How long `recall(status)` waits for its evidence block.
+/// How long `recall(status)` waits for its optional blocks (evidence and
+/// spec conformance).
 ///
 /// The evidence read counts the scope's projection tiers, which grows with the
 /// evidence, while `status` is the cheap health check clients poll. Bounded
-/// well inside the MCP server's 30-second request deadline, a slow evidence
-/// read degrades to the `evidence_status_unavailable` warning instead of
-/// failing the whole status call.
-const EVIDENCE_STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// well inside the MCP server's 30-second request deadline, a slow block read
+/// degrades to its `*_status_unavailable` warning instead of failing the
+/// whole status call. The blocks are read concurrently
+/// ([`optional_status_blocks`]), so together they cost at most one deadline
+/// however many are served.
+const OPTIONAL_STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long `recall(status)` waits for its spec conformance block, for the
-/// same reason as [`EVIDENCE_STATUS_DEADLINE`].
-const SPEC_CONFORMANCE_STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// A block of `recall(status)` and the warnings it adds.
+type StatusBlock = (Value, Vec<Value>);
+
+/// The evidence and spec conformance blocks of `recall(status)`, each read
+/// only where it is served and each bounded by `deadline`. The two reads run
+/// concurrently, so a slow pair costs one deadline, not two.
+async fn optional_status_blocks(
+    evidence: Option<&dyn EvidenceRecall>,
+    spec_conformance: Option<&dyn SpecConformanceRead>,
+    deadline: std::time::Duration,
+) -> (Option<StatusBlock>, Option<StatusBlock>) {
+    let evidence = async {
+        match evidence {
+            Some(evidence) => Some(evidence_status_within(evidence, deadline).await),
+            None => None,
+        }
+    };
+    let spec_conformance = async {
+        match spec_conformance {
+            Some(reader) => Some(spec_conformance_status_within(reader, deadline).await),
+            None => None,
+        }
+    };
+    tokio::join!(evidence, spec_conformance)
+}
 
 /// `recall(status).spec_conformance` and the warnings it adds. A failed or
 /// slow read is a warning, never a failed status.
-async fn spec_conformance_status(reader: &dyn SpecConformanceRead) -> (Value, Vec<Value>) {
-    spec_conformance_status_within(reader, SPEC_CONFORMANCE_STATUS_DEADLINE).await
-}
-
 async fn spec_conformance_status_within(
     reader: &dyn SpecConformanceRead,
     deadline: std::time::Duration,
@@ -2495,10 +2521,6 @@ async fn spec_conformance_status_within(
 
 /// `recall(status).evidence` and the warnings it adds. A failed or slow read
 /// is a warning, never a failed status.
-async fn evidence_status(evidence: &dyn EvidenceRecall) -> (Value, Vec<Value>) {
-    evidence_status_within(evidence, EVIDENCE_STATUS_DEADLINE).await
-}
-
 async fn evidence_status_within(
     evidence: &dyn EvidenceRecall,
     deadline: std::time::Duration,
@@ -4756,7 +4778,8 @@ mod tests {
 
     #[tokio::test]
     async fn evidence_status_reports_or_warns_but_never_fails() {
-        let (block, warnings) = evidence_status(&FakeEvidence::default()).await;
+        let (block, warnings) =
+            evidence_status_within(&FakeEvidence::default(), OPTIONAL_STATUS_DEADLINE).await;
         assert_eq!(block["served"], true);
         assert_eq!(block["readiness"]["dense_lane"], "available");
         assert_eq!(
@@ -4772,7 +4795,8 @@ mod tests {
             ]
         );
 
-        let (block, warnings) = evidence_status(&FakeEvidence::failing()).await;
+        let (block, warnings) =
+            evidence_status_within(&FakeEvidence::failing(), OPTIONAL_STATUS_DEADLINE).await;
         assert_eq!(
             block,
             json!({ "served": true, "readiness": null, "sources": null })
@@ -5047,7 +5071,11 @@ mod tests {
 
     #[tokio::test]
     async fn spec_conformance_status_reports_or_warns_but_never_fails() {
-        let (block, warnings) = spec_conformance_status(&FakeSpecConformance::default()).await;
+        let (block, warnings) = spec_conformance_status_within(
+            &FakeSpecConformance::default(),
+            OPTIONAL_STATUS_DEADLINE,
+        )
+        .await;
         assert_eq!(
             block,
             json!({
@@ -5071,7 +5099,11 @@ mod tests {
             "unknown_specs": null,
             "never_checked_specs": null,
         });
-        let (block, warnings) = spec_conformance_status(&FakeSpecConformance::failing()).await;
+        let (block, warnings) = spec_conformance_status_within(
+            &FakeSpecConformance::failing(),
+            OPTIONAL_STATUS_DEADLINE,
+        )
+        .await;
         assert_eq!(block, unavailable);
         assert_eq!(
             warning_codes(&warnings),
@@ -5087,6 +5119,43 @@ mod tests {
         assert_eq!(block, unavailable);
         assert_eq!(
             warning_codes(&warnings),
+            ["spec_conformance_status_unavailable"]
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_status_blocks_are_read_concurrently_under_one_deadline() {
+        // Nothing served, nothing read.
+        let deadline = std::time::Duration::from_millis(500);
+        assert_eq!(
+            optional_status_blocks(None, None, deadline).await,
+            (None, None)
+        );
+
+        // Both reads hang: each degrades to its warning, and together they
+        // cost one deadline, so recall(status) stays inside the MCP request
+        // deadline however many optional blocks are served.
+        let slow_evidence = FakeEvidence {
+            status_delay: Some(std::time::Duration::from_secs(600)),
+            ..FakeEvidence::default()
+        };
+        let slow_spec = FakeSpecConformance {
+            status_delay: Some(std::time::Duration::from_secs(600)),
+            ..FakeSpecConformance::default()
+        };
+        let started = std::time::Instant::now();
+        let (evidence, spec_conformance) =
+            optional_status_blocks(Some(&slow_evidence), Some(&slow_spec), deadline).await;
+        let elapsed = started.elapsed();
+        assert!(elapsed < deadline * 2, "two slow blocks took {elapsed:?}");
+        let (_, evidence_warnings) = evidence.expect("evidence is served");
+        assert_eq!(
+            warning_codes(&evidence_warnings),
+            ["evidence_status_unavailable"]
+        );
+        let (_, spec_warnings) = spec_conformance.expect("spec conformance is served");
+        assert_eq!(
+            warning_codes(&spec_warnings),
             ["spec_conformance_status_unavailable"]
         );
     }
