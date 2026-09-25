@@ -56,9 +56,10 @@
 //! A snippet and a fetched body carry the lexical tier's recall text, never
 //! the stored body bytes: that text is normalized and has every secret-shaped
 //! range replaced before it is written, and the body keeps the provider's
-//! exact bytes. The body plane holds every `evidence.accepted` event in the
-//! scope, so observer-run records are recalled too; their media type
-//! (`application.ostk-observer-run-record-v1`) says so.
+//! exact bytes. The body plane holds every projectable `evidence.accepted`
+//! event in the scope, so a spec check's git blob fact is recalled like the
+//! worker's. An observer-run record names no source-object version, so it has
+//! no body and is never recalled (ADR 0006 D8).
 //!
 //! # Serving
 //!

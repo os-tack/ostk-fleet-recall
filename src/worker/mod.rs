@@ -61,10 +61,11 @@
 //!
 //! The body projector consumes every `evidence.accepted` event in the scope,
 //! not only this worker's. Observer-run records (`ostk-observer-run`,
-//! `ostk-spec`) are such events with version-form resources, so they become
-//! bodies too, indexed lexically over their raw bytes; recall exposes their
-//! media type (`application.ostk-observer-run-record-v1`) so a reader can tell
-//! them apart. `memory.claim.accepted` events are not evidence events and never
+//! `ostk-spec check`) are such events, but their resource is an occurrence
+//! (`provider_event`), not a source-object version, so the projector counts
+//! each in `events_unprojectable` and writes no body for it (ADR 0006 D8). The
+//! git blob fact a check appends is version-form and is projected like any git
+//! fact. `memory.claim.accepted` events are not evidence events and never
 //! reach the body plane.
 //!
 //! # Coverage references are labels

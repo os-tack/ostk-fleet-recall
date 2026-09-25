@@ -705,8 +705,11 @@ outcome, attempt time, and last completed check land in
 failed or went stale from one that is current. Its receipts name the
 unregistered compile-time labels `coverage.freshness.worker_tick` and
 `coverage.proof.enumerated_snapshot`. The body projector consumes every
-`evidence.accepted` event in the scope, so observer-run records become bodies
-as well, indexed over their raw bytes.
+`evidence.accepted` event in the scope, not only the worker's. An observer-run
+record (from `ostk-observer-run` or `ostk-spec check`) is such an event, but
+its resource is an occurrence (`provider_event`), not a source-object version,
+so the projector cannot chunk it: it counts the event as unprojectable and
+moves past it, and evidence recall never returns it.
 
 Evidence recall (`src/evidence_recall`) is the read side of this plane, which
 `serve` answers as `recall(kind=evidence)` wherever migration 30 is applied

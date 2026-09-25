@@ -249,16 +249,26 @@ of `deploy/cockroach/runtime-role-grants.sql`. No runtime statement updates
 that table, but the grant is table-wide: a holder of the writer login could
 rewrite a content row directly. The publication role gains nothing.
 
-## D8 — Observer-run records appear as evidence
+## D8 — The projector reads every evidence event; observer runs are counted, not recalled
 
 **Decision.** The body projector consumes every `evidence.accepted` event in
 the scope, not only the worker's. Observer-run records (from
-`ostk-observer-run` and `ostk-spec`) are such events with version-form
-resources, so they become bodies, are indexed lexically over their raw bytes,
-and can be recalled; their media type,
-`application.ostk-observer-run-record-v1`, lets a reader tell them apart.
-`memory.claim.accepted` events are not evidence events and never reach the
-body plane.
+`ostk-observer-run` and `ostk-spec check`) are such events, but their
+resource, under the `identity.github.push` recipe both known packages use, is
+an occurrence (`urn:ostk:occurrence:v1:provider_event:…`), not a source-object
+version. The projector chunks only version-form resources, so it counts each
+observer run in the `bodies` step's `events_unprojectable`, advances its
+watermark past it, and writes no body; evidence recall never returns one.
+`recall(discrepancies)` cites an observer run by `observer_event_id` instead.
+The git blob fact `ostk-spec check` appends beside it is version-form and is
+projected like the worker's git facts: its recall text is the fact (commit,
+path, and blob id), not the blob's bytes. `memory.claim.accepted` events are
+not evidence events and never reach the body plane.
+
+This section first said observer runs became bodies with the media type
+`application.ostk-observer-run-record-v1`. The end-to-end run against a fresh
+database showed otherwise: a nonzero `events_unprojectable` after each
+`ostk-spec check` is these records, and it is expected.
 
 ## D9 — Projection writes governed content in plaintext
 

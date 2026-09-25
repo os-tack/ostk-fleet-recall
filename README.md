@@ -448,8 +448,11 @@ through them against a local node.
      the commit, `ostk-spec check` judges it through the worker's sources
      file (see [memory worker](#memory-worker)). A verified nonconformance opens
      an episode that `recall(discrepancies)` lists. A check appends the spec
-     blob and the observer run as evidence events, which the next worker
-     `project` step makes searchable;
+     blob's git fact and the observer run as evidence events. The next worker
+     `project` step makes the blob fact searchable like any git fact (its
+     commit, path, and blob id, not the file's text); the observer run names
+     no source version, so the step counts it under `events_unprojectable`
+     and it is never recalled as evidence;
    - `ostk-spec episode resolve` or `ostk-spec episode dismiss` closes an
      episode. No check closes one.
 
@@ -1247,8 +1250,10 @@ list is not proof of conformance, and the list's `specs[].last_check` says
 what each spec's latest check found. For the same reason no later check closes
 this episode; `ostk-spec episode resolve` or `ostk-spec episode dismiss` does
 ([ADR 0007](docs/adr/0007-spec-conformance-chain.md)). The check appended the
-spec blob and the observer run as evidence; the next worker tick projects them
-into evidence recall.
+spec blob's git fact and the observer run as evidence. The next worker tick
+projects the blob fact into evidence recall and counts the observer run, which
+names no source version, under the `bodies` step's `events_unprojectable`;
+`recall(discrepancies)` cites it as `observer_event_id`.
 
 ## Ingestion contract
 
