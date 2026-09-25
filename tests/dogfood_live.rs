@@ -58,7 +58,7 @@ use ostk_fleet_recall::connectors::transcript::{
     TranscriptCollectionRequestV1, TranscriptConnectorBindingV1, TranscriptCoverageBindingV1,
     TranscriptDrainModeV1, TranscriptDrainRequest, TranscriptEnqueueOutcome,
     TranscriptIngressClocksV1, TranscriptOutboxRepository, collect_batch, drain_outbox,
-    scan_secrets, transcript_parser_key_v2,
+    scan_secrets, transcript_parser_key_v3,
 };
 use ostk_fleet_recall::control_log::{
     CockroachGenesisRepository, GenesisRepository, TrustedControlScope,
@@ -956,7 +956,7 @@ async fn ingest_transcript(memory: &ActivatedMemory, path: &Path) -> TranscriptI
     );
     let guarantee = RedactionGuaranteeV1::from_active_package(&memory.active_transcript)
         .expect("the activated package must promise redaction before the durable outbox");
-    let parser_key = transcript_parser_key_v2();
+    let parser_key = transcript_parser_key_v3();
     let mut instance_coordinates = BTreeMap::new();
     instance_coordinates.insert(
         ContractId::new("provider_installation_id").unwrap(),

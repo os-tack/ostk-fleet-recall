@@ -98,12 +98,68 @@ fn an_unparseable_line_fails_the_whole_batch_closed() {
 
 #[test]
 fn an_unknown_record_type_is_refused_rather_than_skipped() {
-    let bytes = r#"{"type":"telemetry","sessionId":"s","uuid":"u"}"#.to_owned() + "\n";
+    let bytes = format!(
+        "{}\n{}\n",
+        line("user", "turn-1", "2026-08-15T12:30:00.000Z", "hello"),
+        r#"{"type":"telemetry","sessionId":"s","uuid":"u"}"#
+    );
     let error = parse_transcript("s", bytes.as_bytes(), 0, 0).unwrap_err();
+    // The refusal names the kind, so an operator can see which new record
+    // type stopped the source rather than a bare "malformed".
+    match &error {
+        TranscriptConnectorError::UnknownRecordKind {
+            line_ordinal, kind, ..
+        } => {
+            assert_eq!(*line_ordinal, 2);
+            assert_eq!(kind, "telemetry");
+        }
+        other => panic!("expected an unknown record kind, got {other:?}"),
+    }
+    assert!(error.to_string().contains("\"telemetry\""));
+}
+
+#[test]
+fn an_unknown_record_type_is_quoted_within_a_bound() {
+    let long = "x".repeat(10_000);
+    let bytes = format!(r#"{{"type":"{long}"}}"#) + "\n";
+    let error = parse_transcript("s", bytes.as_bytes(), 0, 0).unwrap_err();
+    let TranscriptConnectorError::UnknownRecordKind { kind, .. } = error else {
+        panic!("expected an unknown record kind, got {error:?}");
+    };
+    assert!(kind.len() <= 64);
+}
+
+#[test]
+fn a_known_record_type_that_does_not_decode_is_still_malformed() {
+    // Only a type outside the closed set is an unknown kind; a known type
+    // whose body is the wrong shape stays malformed.
+    let bytes =
+        r#"{"type":"user","sessionId":"s","uuid":"u","message":{"content":7}}"#.to_owned() + "\n";
     assert!(matches!(
-        error,
-        TranscriptConnectorError::MalformedTranscript { .. }
+        parse_transcript("s", bytes.as_bytes(), 0, 0).unwrap_err(),
+        TranscriptConnectorError::MalformedTranscript {
+            reason: "line is not a transcript record",
+            ..
+        }
     ));
+}
+
+#[test]
+fn a_cost_state_record_between_turns_is_counted_and_numbering_continues() {
+    // The shape the agent runtime writes today: the session's running cost and
+    // token totals, with no message. Generation 2 refused the whole file at
+    // the first one.
+    let cost_state = r#"{"type":"cost-state","sessionId":"s","totalCostUSD":1.25,"totalAPIDuration":42,"modelUsage":{"model":{"inputTokens":3,"outputTokens":4}},"hasUnknownModelCost":false}"#;
+    let bytes = format!(
+        "{}\n{cost_state}\n{}\n",
+        line("user", "turn-1", "2026-08-15T12:30:00.000Z", "hello"),
+        line("assistant", "turn-2", "2026-08-15T12:30:01.000Z", "hi")
+    );
+    let parsed = parse_transcript("s", bytes.as_bytes(), 0, 0).unwrap();
+    assert_eq!(parsed.turns.len(), 2);
+    assert_eq!(parsed.turns[1].ordinal, 1);
+    assert_eq!(parsed.skipped_records, 1);
+    assert_eq!(parsed.consumed_bytes, bytes.len() as u64);
 }
 
 #[test]
@@ -196,6 +252,7 @@ fn every_session_runtime_record_kind_is_counted_and_none_is_a_turn() {
         "attachment",
         "file-history-snapshot",
         "file-history-delta",
+        "cost-state",
         "system",
         "summary",
     ];
@@ -334,23 +391,32 @@ fn ostk_fleet_recall_canonical_probe(text: &str) {
 }
 
 #[test]
-fn both_parser_keys_validate_and_are_distinct_identities() {
+fn every_parser_key_validates_and_is_a_distinct_identity() {
     let first = transcript_parser_key_v1();
     let second = transcript_parser_key_v2();
-    first.validate().unwrap();
-    second.validate().unwrap();
-    assert_ne!(first, second);
-    assert_ne!(
-        first.key_digest().unwrap().digest(),
-        second.key_digest().unwrap().digest()
-    );
+    let third = transcript_parser_key_v3();
+    for key in [&first, &second, &third] {
+        key.validate().unwrap();
+    }
+    for (older, newer) in [(&first, &second), (&first, &third), (&second, &third)] {
+        assert_ne!(older, newer);
+        assert_ne!(
+            older.key_digest().unwrap().digest(),
+            newer.key_digest().unwrap().digest()
+        );
+        assert_ne!(older.configuration_digest, newer.configuration_digest);
+    }
     assert_eq!(first.declared_normalization_rules.len(), 2);
-    // The retired generation-1 key keeps its own version; the production key is
-    // the parser's current one, so a behaviour change is visible as an identity
+    assert_eq!(
+        second.declared_normalization_rules,
+        third.declared_normalization_rules
+    );
+    // The retired keys keep their own versions; the production key is the
+    // parser's current one, so a behaviour change is visible as an identity
     // change rather than happening underneath the old identity.
     assert_eq!(first.parser_version, 1);
-    assert_eq!(second.parser_version, TRANSCRIPT_PARSER_VERSION);
-    assert_ne!(first.configuration_digest, second.configuration_digest);
+    assert_eq!(second.parser_version, 2);
+    assert_eq!(third.parser_version, TRANSCRIPT_PARSER_VERSION);
 }
 
 #[test]

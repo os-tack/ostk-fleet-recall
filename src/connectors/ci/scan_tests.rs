@@ -598,3 +598,11 @@ fn a_hostile_coordinate_never_reaches_the_high_water_listing() {
         );
     }
 }
+
+#[test]
+fn a_provider_that_cannot_start_names_gh() {
+    // The production image has no `gh`: the source's last_error must say
+    // which program is missing, not only the OS error.
+    let error = CiScanError::Spawn("No such file or directory (os error 2)".into());
+    assert!(error.to_string().starts_with("could not run gh"));
+}

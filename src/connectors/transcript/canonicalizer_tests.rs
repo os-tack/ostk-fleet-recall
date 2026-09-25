@@ -1,7 +1,9 @@
 //! Unit tests for the canonicalizer: identity derivation and every fail-closed
 //! rejection path.
 
-use super::super::parser::{parse_transcript, transcript_parser_key_v1, transcript_parser_key_v2};
+use super::super::parser::{
+    parse_transcript, transcript_parser_key_v1, transcript_parser_key_v2, transcript_parser_key_v3,
+};
 use super::super::test_fixture::{
     INSTALLATION_COORDINATE, active_package, binding, binding_without_coordinates,
     clean_transcript, clocks, line,
@@ -124,16 +126,19 @@ fn a_different_parser_key_is_a_different_representation() {
     };
     let first = derive(&transcript_parser_key_v1());
     let second = derive(&transcript_parser_key_v2());
+    let third = derive(&transcript_parser_key_v3());
 
-    assert_ne!(first.revision, second.revision);
-    assert_ne!(
-        first.candidate.source_fact.canonical_resource_id,
-        second.candidate.source_fact.canonical_resource_id
-    );
-    assert_ne!(
-        derive_source_fact_id_v2(&first.candidate.source_fact).unwrap(),
-        derive_source_fact_id_v2(&second.candidate.source_fact).unwrap()
-    );
+    for (older, newer) in [(&first, &second), (&first, &third), (&second, &third)] {
+        assert_ne!(older.revision, newer.revision);
+        assert_ne!(
+            older.candidate.source_fact.canonical_resource_id,
+            newer.candidate.source_fact.canonical_resource_id
+        );
+        assert_ne!(
+            derive_source_fact_id_v2(&older.candidate.source_fact).unwrap(),
+            derive_source_fact_id_v2(&newer.candidate.source_fact).unwrap()
+        );
+    }
 }
 
 #[test]
@@ -410,5 +415,9 @@ fn the_representation_key_changes_with_the_parser_key() {
     assert_ne!(
         key_for(&transcript_parser_key_v1()),
         key_for(&transcript_parser_key_v2())
+    );
+    assert_ne!(
+        key_for(&transcript_parser_key_v2()),
+        key_for(&transcript_parser_key_v3())
     );
 }

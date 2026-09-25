@@ -26,11 +26,12 @@
 //!
 //! # Fail-closed parsing
 //!
-//! An unparseable line, an unknown record `type`, a malformed timestamp, or a
-//! record missing a field the identity needs is a
-//! [`TranscriptConnectorError::MalformedTranscript`] that aborts the whole
-//! batch. Nothing partial is staged: a batch that cannot be parsed in full
-//! advances no cursor and writes no outbox row.
+//! An unparseable line, a malformed timestamp, or a record missing a field the
+//! identity needs is a [`TranscriptConnectorError::MalformedTranscript`], and a
+//! record `type` outside the closed set is a
+//! [`TranscriptConnectorError::UnknownRecordKind`] that names the type. Either
+//! aborts the whole batch. Nothing partial is staged: a batch that cannot be
+//! parsed in full advances no cursor and writes no outbox row.
 
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -54,8 +55,16 @@ const CHUNK_IDENTITY_SCHEMA_VERSION: u32 = 1;
 /// It went from 1 to 2 when the parser was first pointed at a real Claude
 /// session file rather than a hand-written fixture. Two behaviours changed, and
 /// both change which turns exist, so the identity had to change with them —
-/// see [`transcript_parser_key_v2`].
-pub const TRANSCRIPT_PARSER_VERSION: u32 = 2;
+/// see [`transcript_parser_key_v2`]. It went from 2 to 3 when the agent runtime
+/// began writing `cost-state` records, which generation 2 refused — see
+/// [`transcript_parser_key_v3`].
+pub const TRANSCRIPT_PARSER_VERSION: u32 = 3;
+
+/// The retired generation-2 parser version.
+///
+/// Kept, like generation 1's, so [`transcript_parser_key_v2`] still mints its
+/// exact original bytes.
+const TRANSCRIPT_PARSER_GENERATION_2_VERSION: u32 = 2;
 
 /// The retired generation-1 parser version.
 ///
@@ -71,15 +80,27 @@ const TRANSCRIPT_PARSER_CONFIGURATION_V1: &str = "ostk-transcript-jsonl:v1;recor
      keys=sessionId|session_id,uuid,timestamp,message.content;\
      blocks=text-only;join=lf;normalize=newline_lf,trailing_whitespace_trim";
 
-/// Exact configuration label whose digest becomes the CURRENT parser key's
-/// `configuration_digest`. It names every choice that changes output bytes,
-/// including the two that generation 2 changed: the full closed set of
-/// non-turn record kinds a Claude session file actually contains, and the
-/// treatment of a `user`/`assistant` record whose content carries no text
-/// block at all (a tool call or a tool result).
+/// Exact configuration label of the RETIRED generation-2 parser. Frozen: its
+/// digest is part of every generation-2 turn's identity. It named every choice
+/// that changes output bytes, including the two that generation 2 changed: the
+/// full closed set of non-turn record kinds a Claude session file then
+/// contained, and the treatment of a `user`/`assistant` record whose content
+/// carries no text block at all (a tool call or a tool result).
 const TRANSCRIPT_PARSER_CONFIGURATION_V2: &str = "ostk-transcript-jsonl:v2;records=user,assistant;\
      skips=system,summary,mode,permission-mode,atis-latch,bridge-session,ai-title,last-prompt,\
      queue-operation,attachment,file-history-snapshot,file-history-delta;\
+     text_free_turn_records=skipped;keys=sessionId>session_id,uuid,timestamp,message.content;\
+     blocks=text-only;join=lf;\
+     normalize=newline_lf,unicode_nfc,whitespace_collapse,trailing_whitespace_trim,\
+     control_character_strip;batch_bound=unconsumed_remainder";
+
+/// Exact configuration label whose digest becomes the CURRENT parser key's
+/// `configuration_digest`. It is generation 2's label with one more non-turn
+/// record kind, `cost-state`, in the closed skip set; every other choice is
+/// unchanged, so a file generation 2 could read parses to the same turns.
+const TRANSCRIPT_PARSER_CONFIGURATION_V3: &str = "ostk-transcript-jsonl:v3;records=user,assistant;\
+     skips=system,summary,mode,permission-mode,atis-latch,bridge-session,ai-title,last-prompt,\
+     queue-operation,attachment,file-history-snapshot,file-history-delta,cost-state;\
      text_free_turn_records=skipped;keys=sessionId>session_id,uuid,timestamp,message.content;\
      blocks=text-only;join=lf;\
      normalize=newline_lf,unicode_nfc,whitespace_collapse,trailing_whitespace_trim,\
@@ -131,7 +152,7 @@ pub fn transcript_parser_key_v1() -> ParserKeyV1 {
     }
 }
 
-/// The CURRENT production parser key.
+/// The RETIRED generation-2 parser key, frozen at its original bytes.
 ///
 /// Generation 2 exists because generation 1 could not read a real Claude
 /// session file at all. Two behaviours changed, and each one changes which
@@ -167,11 +188,41 @@ pub fn transcript_parser_key_v2() -> ParserKeyV1 {
     ParserKeyV1 {
         schema_version: CHUNK_IDENTITY_SCHEMA_VERSION,
         parser_artifact_digest: label_digest(TRANSCRIPT_PARSER_ARTIFACT),
-        parser_version: TRANSCRIPT_PARSER_VERSION,
+        parser_version: TRANSCRIPT_PARSER_GENERATION_2_VERSION,
         configuration_digest: label_digest(TRANSCRIPT_PARSER_CONFIGURATION_V2),
         // Strictly sorted, as ParserKeyV1::validate requires: declaration order
         // in NormalizationRuleV1 is NewlineLf, UnicodeNfc, WhitespaceCollapse,
         // TrailingWhitespaceTrim, ControlCharacterStrip.
+        declared_normalization_rules: vec![
+            NormalizationRuleV1::NewlineLf,
+            NormalizationRuleV1::UnicodeNfc,
+            NormalizationRuleV1::WhitespaceCollapse,
+            NormalizationRuleV1::TrailingWhitespaceTrim,
+            NormalizationRuleV1::ControlCharacterStrip,
+        ],
+    }
+}
+
+/// The CURRENT production parser key.
+///
+/// Generation 3 exists because generation 2 could not read a current Claude
+/// session file either: the agent runtime now appends `cost-state` records
+/// (the session's running cost and token totals), and generation 2's closed
+/// record-kind set refused the batch at the first one. Generation 3 adds that
+/// one kind to the skip set and changes nothing else, so every file generation
+/// 2 could read parses to byte-identical turns; only the parser identity those
+/// turns carry is new. The set stays CLOSED: the next kind the runtime adds
+/// fails its file as [`TranscriptConnectorError::UnknownRecordKind`], naming
+/// the type, until a parser release admits it.
+#[must_use]
+pub fn transcript_parser_key_v3() -> ParserKeyV1 {
+    ParserKeyV1 {
+        schema_version: CHUNK_IDENTITY_SCHEMA_VERSION,
+        parser_artifact_digest: label_digest(TRANSCRIPT_PARSER_ARTIFACT),
+        parser_version: TRANSCRIPT_PARSER_VERSION,
+        configuration_digest: label_digest(TRANSCRIPT_PARSER_CONFIGURATION_V3),
+        // The same five rules as generation 2, in the same strictly sorted
+        // order.
         declared_normalization_rules: vec![
             NormalizationRuleV1::NewlineLf,
             NormalizationRuleV1::UnicodeNfc,
@@ -220,6 +271,8 @@ enum TranscriptRecordKind {
     FileHistorySnapshot,
     /// Tracked-file backup delta.
     FileHistoryDelta,
+    /// Running session cost and token totals (generation 3).
+    CostState,
 }
 
 /// Which side of the conversation a turn came from.
@@ -485,15 +538,52 @@ enum LineKind {
     Turn(Box<ParsedTurnV1>),
 }
 
-/// Decode one framed line and decide what it is.
-fn classify_line(context: &LineContext<'_>, line: &[u8]) -> TranscriptConnectorResult<LineKind> {
-    let record: TranscriptRecordV1 = serde_json::from_slice(line).map_err(|_| {
-        malformed(
+/// Longest record `type` an [`TranscriptConnectorError::UnknownRecordKind`]
+/// quotes, in characters. The type comes from the file, so it is bounded.
+const MAX_QUOTED_RECORD_KIND_CHARS: usize = 64;
+
+/// Just the `type` of a line, read to explain why the line was refused.
+#[derive(Deserialize)]
+struct TranscriptRecordKindProbe {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// Why a line that did not decode as a transcript record was refused: an
+/// object whose `type` names no kind in the closed set is an unknown record
+/// kind, named so an operator can see which kind stopped the source; anything
+/// else is malformed.
+fn refuse_line(context: &LineContext<'_>, line: &[u8]) -> TranscriptConnectorError {
+    let unknown_kind = serde_json::from_slice::<TranscriptRecordKindProbe>(line)
+        .ok()
+        .filter(|probe| {
+            serde_json::from_value::<TranscriptRecordKind>(serde_json::Value::String(
+                probe.kind.clone(),
+            ))
+            .is_err()
+        });
+    match unknown_kind {
+        Some(probe) => TranscriptConnectorError::UnknownRecordKind {
+            source_id: context.source_id.to_owned(),
+            line_ordinal: context.line_ordinal,
+            kind: probe
+                .kind
+                .chars()
+                .take(MAX_QUOTED_RECORD_KIND_CHARS)
+                .collect(),
+        },
+        None => malformed(
             context.source_id,
             context.line_ordinal,
             "line is not a transcript record",
-        )
-    })?;
+        ),
+    }
+}
+
+/// Decode one framed line and decide what it is.
+fn classify_line(context: &LineContext<'_>, line: &[u8]) -> TranscriptConnectorResult<LineKind> {
+    let record: TranscriptRecordV1 =
+        serde_json::from_slice(line).map_err(|_| refuse_line(context, line))?;
     let role = match record.kind {
         TranscriptRecordKind::User => TranscriptRoleV1::User,
         TranscriptRecordKind::Assistant => TranscriptRoleV1::Assistant,
@@ -508,7 +598,8 @@ fn classify_line(context: &LineContext<'_>, line: &[u8]) -> TranscriptConnectorR
         | TranscriptRecordKind::QueueOperation
         | TranscriptRecordKind::Attachment
         | TranscriptRecordKind::FileHistorySnapshot
-        | TranscriptRecordKind::FileHistoryDelta => return Ok(LineKind::Skipped),
+        | TranscriptRecordKind::FileHistoryDelta
+        | TranscriptRecordKind::CostState => return Ok(LineKind::Skipped),
     };
     Ok(build_turn(context, record, role)?
         .map_or(LineKind::Skipped, |turn| LineKind::Turn(Box::new(turn))))

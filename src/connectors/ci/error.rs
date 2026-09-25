@@ -68,11 +68,12 @@ pub enum CiScanError {
     /// A fact the scan produced is not structurally valid.
     #[error("ci scan produced an inadmissible fact: {0}")]
     Fact(#[from] CiFactError),
-    /// The provider process could not be started.
-    #[error("could not run the ci provider command: {0}")]
+    /// The provider process (`gh`) could not be started, typically because
+    /// `gh` is not installed on the host.
+    #[error("could not run gh, the ci provider command: {0}")]
     Spawn(String),
     /// The provider process exited non-zero.
-    #[error("ci provider command {command} failed with status {status}: {stderr}")]
+    #[error("gh {command} failed with status {status}: {stderr}")]
     Command {
         /// The provider subcommand that failed.
         command: &'static str,

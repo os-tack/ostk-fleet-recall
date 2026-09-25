@@ -90,7 +90,7 @@ pub use outbox::{
 pub use parser::{
     MAX_TRANSCRIPT_BYTES, MAX_TURNS_PER_BATCH, ParsedTranscriptV1, ParsedTurnV1,
     TRANSCRIPT_PARSER_VERSION, TranscriptRoleV1, parse_transcript, transcript_parser_key_v1,
-    transcript_parser_key_v2,
+    transcript_parser_key_v2, transcript_parser_key_v3,
 };
 pub use redactor::{
     REDACTION_PLACEHOLDER, RedactionDispositionV1, RedactionGuaranteeV1, RedactionOutcomeV1,

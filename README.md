@@ -276,7 +276,12 @@ Each transcript file is read in windows of its group's `window_bytes` (4 MiB
 by default, at most 8 MiB) behind a durable cursor. A line longer than the
 window fails that file's source, naming the byte offset, until the group's
 `window_bytes` is raised past the line; nothing after it is read meanwhile.
-Turns staged from earlier windows are still admitted.
+Turns staged from earlier windows are still admitted. The parser admits the
+`user` and `assistant` turns of a Claude session file and counts every
+bookkeeping record kind it knows (such as `system`, `attachment`, and
+`cost-state`) as skipped. A record of any other `type` fails that file's
+source the same way, naming the type, until a release of the parser admits
+it.
 
 A CI source reads at most 512 settled runs per tick, starting after its
 highest recorded window, or at its `first_run_number` (1 by default) when that

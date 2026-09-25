@@ -28,6 +28,22 @@ pub enum TranscriptConnectorError {
         /// Why the line was refused.
         reason: &'static str,
     },
+    /// A transcript line is a record whose `type` is outside the parser's
+    /// closed record-kind set, typically one the agent runtime added after this
+    /// parser generation. The whole batch is refused, so the source reads no
+    /// further until a parser release admits the kind.
+    #[error(
+        "transcript {source_id} line {line_ordinal} is a {kind:?} record, a type this parser does \
+         not read; the file is read no further until a parser release admits it"
+    )]
+    UnknownRecordKind {
+        /// The transcript source that failed.
+        source_id: String,
+        /// One-based line ordinal within that source.
+        line_ordinal: u32,
+        /// The record's `type`, as the line spells it (at most 64 characters).
+        kind: String,
+    },
     /// The active package's redaction policy does not promise redaction before
     /// the durable outbox, so no batch may be staged at all (EVID-05).
     #[error("the active package does not guarantee redaction before the durable outbox")]

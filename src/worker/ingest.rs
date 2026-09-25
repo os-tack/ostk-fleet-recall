@@ -31,7 +31,7 @@ use crate::connectors::transcript::{
     TranscriptCollectionRequestV1, TranscriptConnectorBindingV1, TranscriptCoverageBindingV1,
     TranscriptDrainModeV1, TranscriptDrainRequest, TranscriptEnqueueOutcome,
     TranscriptIngressClocksV1, TranscriptOutboxRepository as _, collect_batch, drain_source_outbox,
-    transcript_parser_key_v2,
+    transcript_parser_key_v3,
 };
 use crate::coverage_runtime::{
     CockroachCoverageRuntimeRepository, CoverageObservationOutcome, CoverageRuntimeRepository as _,
@@ -726,7 +726,7 @@ impl Ingest<'_> {
                 group.installation_id.to_string(),
             )]),
         };
-        let parser_key = transcript_parser_key_v2();
+        let parser_key = transcript_parser_key_v3();
         let mut progressed = false;
         let mut bytes: Option<Vec<u8>> = None;
 

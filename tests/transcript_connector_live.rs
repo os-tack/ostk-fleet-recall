@@ -39,7 +39,7 @@ use ostk_fleet_recall::connectors::transcript::{
     TranscriptDrainRequest, TranscriptDrainSummaryV1, TranscriptEnqueueOutcome,
     TranscriptFaultInjection, TranscriptIngressClocksV1, TranscriptOutboxRepository,
     TranscriptOutboxStateV1, collect_batch, drain_outbox, drain_source_outbox,
-    transcript_parser_key_v2,
+    transcript_parser_key_v3,
 };
 use ostk_fleet_recall::control_log::{
     CockroachGenesisRepository, GenesisRepository, TrustedControlScope,
@@ -780,7 +780,7 @@ impl LiveConnector {
         let guarantee = RedactionGuaranteeV1::from_active_package(&self.active)
             .expect("the activated package must promise redaction before the durable outbox");
         let binding = binding(source_id);
-        let parser_key = transcript_parser_key_v2();
+        let parser_key = transcript_parser_key_v3();
         let clocks = self.clocks().await;
         collect_batch(&TranscriptCollectionRequestV1 {
             active: &self.active,
