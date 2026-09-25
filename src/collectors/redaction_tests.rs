@@ -28,8 +28,8 @@ fn staged(text: &str) -> String {
     }
 }
 
-/// One positive credential per provider class, built at runtime.
-fn positives() -> Vec<(ProviderSecretClassV1, String)> {
+/// One positive credential per Slack class, built at runtime.
+fn slack_positives() -> Vec<(ProviderSecretClassV1, String)> {
     vec![
         (
             ProviderSecretClassV1::SlackToken,
@@ -59,12 +59,38 @@ fn positives() -> Vec<(ProviderSecretClassV1, String)> {
             ]),
         ),
         (
+            ProviderSecretClassV1::SlackToken,
+            fake_credential(&joined(&["xo", "xc-"]), 48),
+        ),
+        (
+            ProviderSecretClassV1::SlackToken,
+            joined(&[
+                "xo",
+                "xd-",
+                &fake_credential("", 20),
+                "%2F",
+                &fake_credential("", 20),
+                "%3D",
+            ]),
+        ),
+    ]
+}
+
+/// One positive credential per provider class, built at runtime.
+fn positives() -> Vec<(ProviderSecretClassV1, String)> {
+    let mut positives = slack_positives();
+    positives.extend([
+        (
             ProviderSecretClassV1::LinearApiKey,
             fake_credential(&joined(&["lin", "_api_"]), 40),
         ),
         (
             ProviderSecretClassV1::LinearOauthToken,
             fake_credential(&joined(&["lin", "_oauth_"]), 40),
+        ),
+        (
+            ProviderSecretClassV1::LinearWebhookSecret,
+            fake_credential(&joined(&["lin", "_wh_"]), 40),
         ),
         (
             ProviderSecretClassV1::GranolaApiKey,
@@ -112,7 +138,8 @@ fn positives() -> Vec<(ProviderSecretClassV1, String)> {
                 &fake_credential("s", 30),
             ]),
         ),
-    ]
+    ]);
+    positives
 }
 
 #[test]
@@ -142,6 +169,8 @@ fn look_alikes_are_not_findings() {
         "tokens look like xoxb-... in the docs",
         "the xapp- prefix",
         "lin_api_ is the key prefix",
+        "lin_wh_ is the webhook secret prefix, lin_wh_short is not one",
+        "session tokens start xoxc- or xoxd- and xoxd-short is not one",
         "grn_short",
         "whsec_ is a prefix",
         "ghp_short and github_pat_short",

@@ -34,7 +34,12 @@ use crate::redaction::{
 };
 
 /// The collector redaction profile every envelope records.
-pub const COLLECTOR_REDACTION_PROFILE_VERSION: u32 = 1;
+///
+/// Profile 2 adds a Linear webhook signing secret (`lin_wh_`) and Slack's
+/// browser-session tokens (`xoxc-`, `xoxd-`) to profile 1's set. A version
+/// sealed under profile 1 at the same provider order is an older rendering,
+/// so a re-read moves the head to the profile-2 one (ADR 0008 D5).
+pub const COLLECTOR_REDACTION_PROFILE_VERSION: u32 = 2;
 
 /// Credential shapes collected sources carry, beyond the shared set.
 ///
@@ -43,8 +48,8 @@ pub const COLLECTOR_REDACTION_PROFILE_VERSION: u32 = 1;
 /// staged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProviderSecretClassV1 {
-    /// A Slack token: `xoxa-`, `xoxb-`, `xoxe-`, `xoxo-`, `xoxp-`, `xoxr-`,
-    /// `xoxs-`.
+    /// A Slack token: `xoxa-`, `xoxb-`, `xoxc-`, `xoxe-`, `xoxo-`, `xoxp-`,
+    /// `xoxr-`, `xoxs-`, and the `xoxd-` session cookie (URL-encoded).
     SlackToken,
     /// A Slack app-level token, `xapp-`.
     SlackAppToken,
@@ -57,6 +62,8 @@ pub enum ProviderSecretClassV1 {
     LinearApiKey,
     /// A Linear OAuth token, `lin_oauth_`.
     LinearOauthToken,
+    /// A Linear webhook signing secret, `lin_wh_`.
+    LinearWebhookSecret,
     /// A Granola API key, `grn_`.
     GranolaApiKey,
     /// A Standard Webhooks signing secret, `whsec_`.
@@ -85,6 +92,7 @@ impl ProviderSecretClassV1 {
             Self::SlackFileToken => "slack_file_token",
             Self::LinearApiKey => "linear_api_key",
             Self::LinearOauthToken => "linear_oauth_token",
+            Self::LinearWebhookSecret => "linear_webhook_secret",
             Self::GranolaApiKey => "granola_api_key",
             Self::WebhookSigningSecret => "webhook_signing_secret",
             Self::GithubToken => "github_token",
@@ -336,6 +344,8 @@ enum TokenBytes {
     Base64,
     /// Alphanumerics, `/`, `_`, `-` (a URL path).
     UrlPath,
+    /// Alphanumerics, `-`, `%`, `/`, `+`, `=` (a URL-encoded cookie value).
+    CookieValue,
 }
 
 impl TokenBytes {
@@ -348,6 +358,7 @@ impl TokenBytes {
                 Self::AlphanumericUnderscore => byte == b'_',
                 Self::Base64 => matches!(byte, b'+' | b'/' | b'='),
                 Self::UrlPath => matches!(byte, b'/' | b'_' | b'-'),
+                Self::CookieValue => matches!(byte, b'-' | b'%' | b'/' | b'+' | b'='),
             }
     }
 }
@@ -374,9 +385,18 @@ const PREFIX_RULES: &[PrefixRule] = &[
     PrefixRule {
         class: ProviderSecretClassV1::SlackToken,
         prefixes: &[
-            b"xoxa-", b"xoxb-", b"xoxe-", b"xoxo-", b"xoxp-", b"xoxr-", b"xoxs-",
+            b"xoxa-", b"xoxb-", b"xoxc-", b"xoxe-", b"xoxo-", b"xoxp-", b"xoxr-", b"xoxs-",
         ],
         body: TokenBytes::AlphanumericDash,
+        min_body: 8,
+        word_boundary: true,
+        keep_prefix: 0,
+        mixed: false,
+    },
+    PrefixRule {
+        class: ProviderSecretClassV1::SlackToken,
+        prefixes: &[b"xoxd-"],
+        body: TokenBytes::CookieValue,
         min_body: 8,
         word_boundary: true,
         keep_prefix: 0,
@@ -421,6 +441,15 @@ const PREFIX_RULES: &[PrefixRule] = &[
     PrefixRule {
         class: ProviderSecretClassV1::LinearOauthToken,
         prefixes: &[b"lin_oauth_"],
+        body: TokenBytes::Alphanumeric,
+        min_body: 16,
+        word_boundary: true,
+        keep_prefix: 0,
+        mixed: false,
+    },
+    PrefixRule {
+        class: ProviderSecretClassV1::LinearWebhookSecret,
+        prefixes: &[b"lin_wh_"],
         body: TokenBytes::Alphanumeric,
         min_body: 16,
         word_boundary: true,

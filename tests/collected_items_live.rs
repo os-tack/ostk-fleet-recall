@@ -1310,6 +1310,8 @@ fn planted_secrets() -> Vec<String> {
         ["grn", "_", &body(24)].concat(),
         ["AKI", "A", "Z7Q2X9W4R6T1Y8U3"].concat(),
         ["whs", "ec_", &body(24)].concat(),
+        ["lin_", "wh_", &body(32)].concat(),
+        ["xox", "c-", &body(40)].concat(),
     ]
 }
 
