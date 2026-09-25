@@ -9,6 +9,13 @@
 //! names are ones the live policy actually admits, and the threshold it
 //! records is the policy's, not the caller's.
 //!
+//! That is only as strong as the policy's keys, and they are nominal: every
+//! package the installer activates names the public fixture keys (seeds
+//! `0x01`/`0x02`), so anyone can produce a valid approval set. The real gate
+//! on which statements become normative is the `fleet_writer` credential
+//! that records and activates them (ADR 0007 D10), and the approver
+//! principals are unauthenticated payload.
+//!
 //! The pattern mirrors `verify_generic_successor_activation` in
 //! `memory_contracts::successor_generic`, with its own signature domain
 //! ([`NORMATIVE_APPROVAL_SIGNATURE_PREFIX`]): an approval of a normative

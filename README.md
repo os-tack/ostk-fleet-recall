@@ -183,7 +183,13 @@ of the serving one.
   `draft`, `activate`, `check`, and `episode` run as `fleet_writer`
   (`FLEET_RECALL_DATABASE_URL`) with the writer-authority pins
   `ostk-authority-install apply` prints, and `check` also needs
-  `FLEET_RECALL_CONTENT_KEK_HEX`; `approve` reads no environment.
+  `FLEET_RECALL_CONTENT_KEK_HEX`; `approve` reads no environment. Its
+  approvals are nominal: the active policy names the public fixture keys
+  (seeds `0x01`/`0x02`), so anyone can produce both approvals, and the real
+  gate is the `fleet_writer` credential `activate` needs. The observer
+  `check` runs is attested only nominally too: its admitted executable
+  digest is copied from the admission, never measured from the binary. See
+  [ADR 0007 D10](docs/adr/0007-spec-conformance-chain.md).
 
 The grants and gates these tools rely on are described in
 [migration operations](docs/MIGRATIONS.md) and

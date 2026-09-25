@@ -67,6 +67,15 @@
 //! - for `check` only, `FLEET_RECALL_CONTENT_KEK_HEX`: the blob fact and the
 //!   observer run record are governed content.
 //!
+//! Its approvals are nominal: the active activation policy names the public
+//! fixture keys (seeds `0x01`/`0x02`), so anyone can sign both approvals,
+//! and the real gate is the `fleet_writer` credential `activate` runs under.
+//! The author, proposer, approver, and episode actor principals are
+//! unauthenticated payload. The observer `check` runs is attested only
+//! nominally as well: the executable, dependency-closure, and configuration
+//! digests its results name are copied from the genesis admission, never
+//! measured from this binary. See ADR 0007 D10.
+//!
 //! Every command prints one JSON document. Like the other operator CLIs, this
 //! binary is not in the production image.
 

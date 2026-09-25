@@ -362,6 +362,16 @@ credentials, plus each writer's receipt-digest pin. Deployments that need
 separated ceremony credentials run the four ceremony CLIs, each under its own
 role.
 
+The same holds for spec statements. `ostk-spec activate` verifies approvals
+under the active package's activation policy, whose eligible signers are the
+fixture keys, so the gate on which specs become normative is the
+`fleet_writer` credential, and the author, proposer, approver, and episode
+actor principals are unauthenticated payload. `ostk-spec check` runs the
+observer under a declaration copied from the genesis admission, so the
+executable, dependency-closure, and configuration digests its results and
+episodes name are not measured from the binary that ran
+([ADR 0007 D10](adr/0007-spec-conformance-chain.md)).
+
 The successor role necessarily has raw `INSERT` and `UPDATE` table authority,
 including table-level `UPDATE` for its `FOR UPDATE`/compare-and-swap paths.
 CockroachDB RBAC cannot limit that credential to the repository's prepared

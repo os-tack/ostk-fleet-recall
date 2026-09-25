@@ -299,11 +299,20 @@ impl ObserverRuntimeDeclarationV1 {
     /// coverage proof the run receipt's witness is built under — is read out
     /// of that one entry; every field that describes this code
     /// ([`OBSERVER_KIND`], [`observer_input_domain`],
-    /// [`observer_toolchain_versions`], the vector digests) is a constant. No
-    /// operator input is involved, so a caller holding the genesis package a
-    /// verified witness names runs exactly the observer it admitted.
+    /// [`observer_toolchain_versions`], the vector digests) is a constant.
     /// [`ObserverAdmissionBindingV1::resolve`] still checks the result
     /// against the same entry.
+    ///
+    /// That check therefore cannot fail on the pinned digests, and it proves
+    /// nothing about the running code: the executable, dependency-closure,
+    /// and configuration digests are copied from the admission, never
+    /// measured from this binary, and the vector digests are placeholder
+    /// constants no conformance run produced. They are nominal
+    /// self-attestations, as the public fixture governance keys are (ADR
+    /// 0007 D10): an observer result appended under this declaration names
+    /// the admitted executable whatever binary actually ran. Unlike
+    /// `ostk-observer-run`, whose operator passes the executable digest, no
+    /// one attests it here.
     ///
     /// # Errors
     ///

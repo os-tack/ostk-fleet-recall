@@ -69,8 +69,14 @@ statement, the commit, the observer and blob events, the observed condition
 and verification outcome, the verdict (`nonconforming`, `conforming`, or
 `unknown` with reasons), and the episode it opened or joined. The record is
 content-addressed and written with `ON CONFLICT DO NOTHING`, so a replayed
-check writes nothing new; the runtime holds `SELECT` and `INSERT` on the
-table and nothing more.
+check under the same coverage receipt writes nothing new; the runtime holds
+`SELECT` and `INSERT` on the table and nothing more. The observer event binds
+the git source's latest coverage receipt (D4), and that receipt's digest is
+part of the event's identity and so of the check's. Once the worker's git step
+has written a newer receipt, a re-check of the same commit therefore appends a
+new observer event and records a new check, which becomes the statement's
+latest; the opening rule (D7) still joins the episode the commit was judged
+into, so only the evidence and the check history grow.
 
 **Why.** Episodes are findings, and a finding must be verified. Keeping the
 check history (owner decision D3) is what lets an agent tell "checked and
@@ -256,6 +262,20 @@ author, proposer, approver, and episode-operator principals are payload
 principals, not authenticated identities; each is only as strong as the
 writer credential.
 
+The observer's provenance is nominal in the same way. `check` builds the
+observer's runtime declaration from the activated genesis entry itself
+(`ObserverRuntimeDeclarationV1::from_activated_genesis`): the executable,
+dependency-closure, and configuration digests are copied from that entry, and
+the conformance-vector digests are placeholder constants. The admission seam
+then compares the declaration with the same entry, so the comparison cannot
+fail, and nothing measures the running `ostk-spec` binary. Every observer
+result `check` appends, and every episode opened from one, therefore names
+the admitted executable (`481cdae…`) and the fixture vector digests whatever
+binary ran; a `verified_positive` outcome is as trustworthy as the build and
+the host that ran `check`, not more. `ostk-observer-run` at least makes its
+operator pass `--executable-digest`. Measuring the binary against the pinned
+digest is deferred.
+
 ## D11 — Normative families strand after a registry head change
 
 **Decision, stated so operators order their steps.** A binding family's head
@@ -304,5 +324,7 @@ comparator lineage and episode policy (D5); scope-exit dismissal in the
 ledger; statements with more than one proposition; re-verifying source spans
 at activate time; relations, contests, retroactive corrections, and waivers;
 an in-transaction evidence-id existence check in 0027 (D8); rebasing normative
-heads after a registry transition (D11); a spec-check worker step; other
-finding types, predicates, and observers.
+heads after a registry transition (D11); measuring the observer binary against
+its pinned executable digest (D10); binding a re-check to the coverage receipt
+of the commit's first check (D2); a spec-check worker step; other finding
+types, predicates, and observers.
