@@ -49,9 +49,11 @@ Each private runtime uses its own part of these tables:
 
 - The memory worker writes the tables of migrations 19 through 22, 26, 30,
   33, and 34, and migration 23's body-visibility table. Its `collect` step
-  drains migration 33's outbox and writes the item history, links, and heads;
-  the collectors that stage into the outbox (later slices) write its
-  containers, item withdrawals, status, cursors, and dead letters.
+  runs the configured collectors (the documents directory; ADR 0008 D8),
+  which stage into migration 33's outbox and write its containers, item
+  withdrawals, status, cursors, and dead letters, drains the outbox into the
+  item history, links, and heads, and records each reconciliation pass in
+  migration 20's coverage tables. No migration or grant is added for it.
 - `ostk-spec` writes the tables of migrations 24, 27, and 31.
   `ostk-authority-install apply --target generation-3`, as the migrator,
   appends migration 32's `rebase` rows to migration 24's log and moves those

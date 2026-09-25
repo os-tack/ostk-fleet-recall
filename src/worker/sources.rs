@@ -15,11 +15,13 @@
 //! * **collectors** — one instance per provider scope (a Slack workspace, a
 //!   Linear organization, a documents root): the provider, the pinned scope,
 //!   the audience the operator declares, and the provider's own settings
-//!   (ADR 0008). Parsed and validated here; the worker's `collect` step drains
-//!   what collectors staged, and each provider's adapter reads its settings.
-//!   Settings name credentials by environment variable, never inline: a
-//!   secret-shaped value, or an inline value under a credential-named key, is
-//!   refused.
+//!   (ADR 0008). The provider's adapter ([`crate::collectors::ADAPTERS`])
+//!   validates its settings, which are closed, and the audience policy it
+//!   needs, when the file is loaded; the worker's `collect` step runs each
+//!   collector's pass. A provider this build has no adapter for is accepted
+//!   here and reported as a failed source at tick time. Settings name
+//!   credentials by environment variable, never inline: a secret-shaped
+//!   value, or an inline value under a credential-named key, is refused.
 //! * **observer** — the identity `ostk-spec check` appends observer runs under.
 //!   The worker does not read it.
 //!
@@ -264,6 +266,11 @@ impl CollectorSourceV1 {
             }
         }
         refuse_inline_credentials(instance, "settings", &self.settings)?;
+        if let Some(adapter) = crate::collectors::adapter(self.provider.as_str()) {
+            adapter
+                .validate(self)
+                .map_err(|message| invalid(&format!("collector {instance}: {message}")))?;
+        }
         validate_stale_after(
             &format!("collector {instance} stale_after_seconds"),
             self.stale_after_seconds
@@ -396,9 +403,18 @@ impl WorkerSourcesV1 {
             source.validate()?;
             claim(&source.connector_instance, "ci")?;
         }
+        let mut scopes = BTreeSet::new();
         for source in &self.collectors {
             source.validate()?;
             claim(&source.connector_instance, "collector")?;
+            // One instance per provider scope: two would each see the other's
+            // items as missing from their own reads.
+            if !scopes.insert((source.provider.as_str(), source.provider_scope_id.as_str())) {
+                return Err(invalid(&format!(
+                    "collector {}: another collector already reads {} scope {}",
+                    source.connector_instance, source.provider, source.provider_scope_id
+                )));
+            }
         }
         if let Some(observer) = &self.observer {
             claim(&observer.connector_instance, "observer")?;
@@ -925,6 +941,56 @@ mod tests {
         let mut value = with_collector(&serde_json::json!({}));
         value["collectors"][0]["stale_after_seconds"] = serde_json::json!(30);
         assert!(refusal(&value).contains("slack.acme"));
+    }
+
+    #[test]
+    fn one_provider_scope_has_one_collector() {
+        let mut value = with_collector(&serde_json::json!({}));
+        let mut second = value["collectors"][0].clone();
+        second["connector_instance"] = serde_json::json!("slack.acme.second");
+        value["collectors"]
+            .as_array_mut()
+            .unwrap()
+            .push(second.clone());
+        assert!(refusal(&value).contains("already reads slack scope T07ACME0001"));
+
+        second["provider_scope_id"] = serde_json::json!("T07OTHER001");
+        value["collectors"][1] = second;
+        assert_eq!(parse(&value).unwrap().collectors.len(), 2);
+    }
+
+    #[test]
+    fn a_docs_collector_is_validated_by_its_adapter() {
+        let docs = |settings: serde_json::Value, declared: bool| {
+            let mut value = minimal();
+            value["collectors"] = serde_json::json!([{
+                "provider": "docs",
+                "connector_principal": "principal.docs",
+                "connector_instance": "docs.specs",
+                "provider_scope_id": "specs",
+                "audience": {"operator_declared": declared},
+                "settings": settings
+            }]);
+            value
+        };
+        let sources = parse(&docs(
+            serde_json::json!({"root": "/work/specs", "extensions": ["md"],
+                               "max_file_bytes": 1_048_576, "max_files": 5_000}),
+            true,
+        ))
+        .expect("a declared root with closed settings is valid");
+        assert_eq!(sources.collectors[0].provider.as_str(), "docs");
+
+        let message = refusal(&docs(serde_json::json!({"root": "/work/specs"}), false));
+        assert!(message.contains("docs.specs"), "{message}");
+        assert!(message.contains("operator_declared"), "{message}");
+        let message = refusal(&docs(
+            serde_json::json!({"root": "/work/specs", "recurse": false}),
+            true,
+        ));
+        assert!(message.contains("recurse"), "{message}");
+        let message = refusal(&docs(serde_json::json!({}), true));
+        assert!(message.contains("root"), "{message}");
     }
 
     #[test]

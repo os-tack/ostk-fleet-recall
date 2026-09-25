@@ -1810,7 +1810,8 @@ async fn live_steps_all_skips_collect_below_the_collector_schema_when_configured
                 "connector_principal": "principal.docs",
                 "connector_instance": "docs.specs",
                 "provider_scope_id": DOCS_ROOT,
-                "audience": {"operator_declared": true}
+                "audience": {"operator_declared": true},
+                "settings": {"root": "/srv/specs"}
             }]);
             let report = fixture
                 .worker_with(&pool, "collect", &sources, Arc::new(RecordedCi))

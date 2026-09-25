@@ -253,6 +253,28 @@ pub(super) const UPDATE_HEAD_PRESENTATION_SQL: &str = "UPDATE public.memory_coll
      SET presented = $5, disagreement = $6, revision = revision + 1, updated_at = $7 \
      WHERE tenant_id = $1 AND project = $2 AND item_key_digest = $3 AND trust_tier = $4";
 
+/// The heads of one provider scope's items of one object kind, in one tier:
+/// what a pull collector compares a fresh read with.
+pub(super) const SCOPE_HEADS_SQL: &str = "SELECT item_key_digest, external_id, \
+     version_key_digest, content_digest, lifecycle, provider_order \
+     FROM public.memory_collected_item_heads_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND provider = $3 AND provider_scope_id = $4 \
+       AND object_kind = $5 AND trust_tier = $6";
+
+/// The pending rows of one provider scope staged through the channels in
+/// `$5`, with their envelopes, which name each row's item.
+pub(super) const SCOPE_PENDING_SQL: &str = "SELECT stage_id, version_key_digest, \
+     provider_order, canonical_envelope \
+     FROM public.memory_collector_outbox_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND state = 'pending' AND provider = $3 \
+       AND provider_scope_id = $4 AND collection_mode = ANY($5::STRING[]) \
+     ORDER BY created_at, stage_id";
+
+/// The state of each named row.
+pub(super) const ROW_STATES_SQL: &str = "SELECT stage_id, state, accepted_event_id \
+     FROM public.memory_collector_outbox_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND stage_id = ANY($3::BYTES[])";
+
 /// Pending staged parts in one scope: what readiness reports as awaiting
 /// admission.
 pub const COUNT_PENDING_SQL: &str = "SELECT count(*)::INT8 \

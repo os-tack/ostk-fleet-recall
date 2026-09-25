@@ -44,17 +44,75 @@
 //! withdrawn, or whose container was withdrawn. The envelope itself, its
 //! identity digests, and the plain-text input an import line or a capture
 //! carries are contracts, in [`crate::memory_contracts::collected_item`].
+//!
+//! The collectors (ADR 0008 D8):
+//!
+//! * [`ADAPTERS`] is the static table of provider adapters: one
+//!   [`CollectorAdapterV1`] per provider, which validates a configured
+//!   source's settings and builds its collectors. A new provider is one module
+//!   and one row here: no registry generation, migration, or recall surface.
+//! * [`pull`] is the pull framework: a [`pull::PullCollectorV1`] runs one pass
+//!   and stages it page by page through a [`pull::PageStager`], stating how
+//!   far it read each container ([`pull::ListingBoundV1`], which has no
+//!   default);
+//! * [`coverage`] turns a settled reconciliation pass into its
+//!   `collector_observation` item and its coverage receipt;
+//! * [`docs`] is the documents-directory collector.
 
 pub mod audience;
 pub mod binding;
 pub mod cockroach;
+pub mod coverage;
+pub mod docs;
 pub mod draft;
 pub mod heads;
+pub mod pull;
 pub mod redaction;
 pub mod sink;
 pub mod status;
 pub mod text;
 pub mod withdrawal;
+
+use crate::worker::CollectorSourceV1;
+
+/// One provider's adapter: what a configured collector of that provider
+/// runs.
+pub trait CollectorAdapterV1: Send + Sync {
+    /// The provider kind it reads.
+    fn provider(&self) -> &'static str;
+
+    /// Refuse a configured source the adapter could not run exactly as
+    /// written: its settings (closed, `deny_unknown_fields`), and the audience
+    /// policy the provider needs.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the first refused value.
+    fn validate(&self, source: &CollectorSourceV1) -> Result<(), String>;
+
+    /// The pull collector of one configured source, or `None` when the
+    /// provider has no pull mode.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::validate`].
+    fn pull(
+        &self,
+        source: &CollectorSourceV1,
+    ) -> Result<Option<Box<dyn pull::PullCollectorV1>>, String>;
+}
+
+/// Every provider adapter this build carries.
+pub static ADAPTERS: [&dyn CollectorAdapterV1; 1] = [&docs::DocsAdapterV1];
+
+/// The adapter of `provider`, when this build carries one.
+#[must_use]
+pub fn adapter(provider: &str) -> Option<&'static dyn CollectorAdapterV1> {
+    ADAPTERS
+        .iter()
+        .copied()
+        .find(|adapter| adapter.provider() == provider)
+}
 
 #[cfg(test)]
 pub(crate) mod test_support;

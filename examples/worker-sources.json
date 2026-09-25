@@ -32,5 +32,20 @@
       "branch": "main",
       "first_run_number": 1
     }
+  ],
+  "collectors": [
+    {
+      "provider": "docs",
+      "connector_principal": "principal.docs",
+      "connector_instance": "docs.specs",
+      "provider_scope_id": "specs",
+      "audience": {"operator_declared": true},
+      "settings": {
+        "root": "/srv/fleet-recall/specs",
+        "extensions": ["md"],
+        "max_file_bytes": 1048576,
+        "max_files": 5000
+      }
+    }
   ]
 }

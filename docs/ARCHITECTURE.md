@@ -18,8 +18,9 @@ Its event-first slice runs today. `remember(assert)` appends accepted claim
 events ([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md)).
 The memory worker ingests git history, agent transcripts, and CI runs, which
 `recall(kind=evidence)` searches
-([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)), and drains
-collected items, which `recall(kind=item)` searches as items
+([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)), runs its
+collectors (a documents directory so far) and drains collected items, which
+`recall(kind=item)` searches as items
 ([ADR 0008](adr/0008-collected-items.md)). The private
 `ostk-spec` CLI checks commits against normative spec statements, and
 `recall(discrepancies)` lists what it finds

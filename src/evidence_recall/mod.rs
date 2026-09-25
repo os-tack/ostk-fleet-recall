@@ -259,20 +259,15 @@ pub enum EvidenceSourceKindV1 {
     Other(String),
 }
 
-/// The wire value of [`EvidenceSourceKindV1::Collector`].
-const COLLECTOR_SOURCE_KIND: &str = "collector";
-
 impl EvidenceSourceKindV1 {
     /// Decode a stored `source_kind`; an unknown value is [`Self::Other`].
     #[must_use]
     pub fn from_stored(stored: &str) -> Self {
-        if stored == COLLECTOR_SOURCE_KIND {
-            return Self::Collector;
-        }
         [
             WorkerSourceKindV1::Git,
             WorkerSourceKindV1::Transcript,
             WorkerSourceKindV1::Ci,
+            WorkerSourceKindV1::Collector,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == stored)
@@ -286,7 +281,7 @@ impl EvidenceSourceKindV1 {
             Self::Git => WorkerSourceKindV1::Git.as_str(),
             Self::Transcript => WorkerSourceKindV1::Transcript.as_str(),
             Self::Ci => WorkerSourceKindV1::Ci.as_str(),
-            Self::Collector => COLLECTOR_SOURCE_KIND,
+            Self::Collector => WorkerSourceKindV1::Collector.as_str(),
             Self::Other(stored) => stored,
         }
     }
@@ -298,6 +293,7 @@ impl From<WorkerSourceKindV1> for EvidenceSourceKindV1 {
             WorkerSourceKindV1::Git => Self::Git,
             WorkerSourceKindV1::Transcript => Self::Transcript,
             WorkerSourceKindV1::Ci => Self::Ci,
+            WorkerSourceKindV1::Collector => Self::Collector,
         }
     }
 }

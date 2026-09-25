@@ -258,11 +258,15 @@ admitted, in this order:
   evidence under a freshly verified generation-2 or generation-3 head, writes
   coverage receipts for what it read, and updates each source's status row in
   `memory_worker_sources_v1`.
-- `collect`: drains the collector outbox (migrations 0033 and 0034,
-  [ADR 0008](docs/adr/0008-collected-items.md) D4): items a collector staged
-  are admitted under `connector.collected.<mode>` of the verified head, which
-  needs a scope moved to generation 3. Below migration 34 it is skipped. No
-  provider collector stages items yet. `serve` reads what it admits as
+- `collect`: runs each configured collector's pass, then drains the
+  collector outbox (migrations 0033 and 0034,
+  [ADR 0008](docs/adr/0008-collected-items.md) D4 and D8): items a collector
+  staged are admitted under `connector.collected.<mode>` of the verified
+  head, which needs a scope moved to generation 3. Below migration 34 it is
+  skipped. The documents-directory collector (provider `docs`) is the first:
+  each pass lists one root, stages the files whose content changed as
+  sectioned parts, tombstones the ones that disappeared, and records coverage
+  only when it read the whole root. `serve` reads what it admits as
   `recall(kind=item)` and `recall(kind=evidence)`.
 - `project`: the body projector, then the lexical tier.
 - `embed`: the dense tier, through the pinned model2vec embedder.
@@ -294,7 +298,23 @@ credential). The production image has neither, so run the ingest steps on a
 host that has both tools, the repositories, and the transcript files.
 `--steps project,embed` needs neither and is safe to run in the container.
 [`examples/worker-sources.json`](examples/worker-sources.json) shows a sources
-file with one source of each kind. `ostk-spec check` reads the same file: the
+file with one source of each kind, including a documents root:
+
+```json
+{"provider": "docs", "connector_principal": "principal.docs",
+ "connector_instance": "docs.specs", "provider_scope_id": "specs",
+ "audience": {"operator_declared": true},
+ "settings": {"root": "/srv/fleet-recall/specs", "extensions": ["md"],
+              "max_file_bytes": 1048576, "max_files": 5000}}
+```
+
+The operator declares the root visible to the whole project; the collector
+refuses a root without that declaration. `extensions` is a subset of `md`,
+`markdown`, `txt`, `rst`, and `adoc`; names beginning with `.` and symlinks
+leading out of the root are skipped. A listing cut short by `max_files`, a
+file over `max_file_bytes`, or one that is not UTF-8 leaves the root's
+coverage partial, so an empty answer stays `unknown` until the next complete
+pass. `ostk-spec check` reads the same file: the
 git source it reads through must also carry `provider_repository_id` (the
 provider's numeric repository id, from which a spec statement's subject is
 derived), and the file must name an `observer` identity

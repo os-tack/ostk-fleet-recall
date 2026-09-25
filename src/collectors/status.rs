@@ -50,6 +50,13 @@ const UPSERT_COLLECTOR_SOURCE_SQL: &str = "INSERT INTO public.memory_collector_s
      last_error = excluded.last_error, updated_at = excluded.updated_at \
      WHERE public.memory_collector_sources_v1.owner = excluded.owner";
 
+/// Retire every worker-owned collector row whose instance is not in `$3`.
+/// Rows an import or a capture owns are never touched.
+const RETIRE_WORKER_COLLECTORS_SQL: &str = "UPDATE public.memory_collector_sources_v1 SET \
+     state = 'retired', updated_at = pg_catalog.statement_timestamp() \
+     WHERE tenant_id = $1 AND project = $2 AND owner = 'worker' AND state = 'active' \
+       AND collector_instance_id <> ALL($3::STRING[])";
+
 /// What a collector's source is to the absence verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoverageRoleV1 {
@@ -225,4 +232,25 @@ pub async fn upsert_collector_source(
         )));
     }
     Ok(())
+}
+
+/// Mark `retired` every active collector row the worker owns whose instance
+/// is not in `configured`, inside `transaction`; the number retired.
+///
+/// # Errors
+///
+/// Any database failure.
+pub async fn retire_worker_collectors(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    project: &str,
+    configured: &[String],
+) -> Result<u64> {
+    Ok(sqlx::query(RETIRE_WORKER_COLLECTORS_SQL)
+        .bind(tenant_id)
+        .bind(project)
+        .bind(configured)
+        .execute(&mut **transaction)
+        .await?
+        .rows_affected())
 }

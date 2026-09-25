@@ -2229,6 +2229,11 @@ impl AppendProjection for CollectedDrainProjection {
     }
 }
 
+#[path = "sink_reads.rs"]
+mod reads;
+
+pub use reads::{CollectorDeadLetterV1, KnownVersionV1, OutboxRowStateV1};
+
 #[cfg(test)]
 #[path = "sink_tests.rs"]
 mod tests;

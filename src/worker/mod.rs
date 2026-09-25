@@ -244,6 +244,9 @@ pub enum WorkerSourceKindV1 {
     Git,
     Transcript,
     Ci,
+    /// A collector instance (ADR 0008); its status row is in
+    /// `memory_collector_sources_v1`, never in the worker's table.
+    Collector,
 }
 
 impl WorkerSourceKindV1 {
@@ -253,6 +256,7 @@ impl WorkerSourceKindV1 {
             Self::Git => "git",
             Self::Transcript => "transcript",
             Self::Ci => "ci",
+            Self::Collector => "collector",
         }
     }
 }

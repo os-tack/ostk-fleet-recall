@@ -1,6 +1,6 @@
 # ADR 0008: Collected items from any source
 
-- Status: accepted; D1 to D7 implemented. The generation-3 registry package
+- Status: accepted; D1 to D8 implemented. The generation-3 registry package
   is checked in, the strict witness recognizes it, and
   `ostk-authority-install apply --target generation-3` activates it and
   rebases the scope's normative families onto it. The collected-item
@@ -11,8 +11,10 @@
   history and current-view heads, container audiences, and collector status
   (D4 to D6); migration 34 adds withdrawals (D5, D6), and evidence recall
   withholds deleted and withdrawn items. `recall(kind=item)` reads items back
-  as items (D7). No provider collector or agent capture stages items yet;
-  those land with their own decisions.
+  as items (D7). The worker runs pull collectors through one pull framework,
+  and the documents-directory collector is the first (D8). No API collector,
+  import, or agent capture stages items yet; those land with their own
+  decisions.
 - Date: 2026-09-25
 - Scope: how specs and documents, Slack conversations, Linear tickets,
   Granola meetings, and anything else a collector can read become evidence
@@ -314,7 +316,8 @@ gains `collectors`: one instance per provider scope, with its principal,
 pinned scope, audience policy, and the provider adapter's settings. Instance
 ids are unique across every connector, and a credential written inline (a
 secret-shaped value, or a string under a credential-named key) is refused;
-settings name environment variables. No provider adapter runs yet.
+settings name environment variables. Each provider's adapter validates its
+own settings and runs its collector (D8).
 
 ## D5 — The current view, supersession, and suppression
 
@@ -536,3 +539,117 @@ suppression rule. Resolving a version URI through a new index: migration 33
 indexes the provider URL but not `canonical_resource_id`, so a get by version
 URI reads the scope's item history; it is an explicit lookup, and an index
 would need a migration of its own.
+
+## D8 — Pull collectors, their coverage, and the documents directory
+
+**Decision.** A worker collector is a thin adapter over one pull framework
+(`src/collectors/pull.rs`), and only a reconciliation pass writes coverage.
+
+**Adapters.** `src/collectors/mod.rs` holds a static table, `ADAPTERS`, of one
+`CollectorAdapterV1` per provider: its provider kind, `validate`, which the
+sources file calls when it is loaded (the settings are closed, with
+`deny_unknown_fields`, and the adapter refuses an audience policy its provider
+cannot use), and `pull`, which builds the source's `PullCollectorV1`. A new
+provider is one module and one row: no registry generation, migration, or
+recall surface. A configured provider this build has no adapter for is
+accepted by the file and reported as a failed source at tick time, so its
+status row makes evidence recall's absence `unknown` rather than leaving the
+source silently unread. The file also refuses two collectors over one
+provider scope: each would read the other's items as missing and tombstone
+them. Webhook verification and hinted fetches join the adapter when their
+slices define them.
+
+**A pass.** For each configured collector, in order, the `collect` step binds
+`connector.collected.pull` from the tick's verified head (a generation-2 head
+fails the source, naming `--target generation-3`), reads the pass instant from
+the database, and runs the collector's pass. The collector stages page by
+page through a `PageStager`: each page, its cursor advances, and its
+container observations are one sink transaction (D4, REPLAY-02). The stager
+remembers, per container, the item versions the pass holds current (staged,
+or kept because unchanged) and the items it refused. A pass returns one
+outcome per container it listed, ordinals `0..N`, each with a
+`ListingBoundV1` that has no default (`complete`, or `truncated` for a
+listing bound, a rate limit, an unreadable page or directory, or a provider
+refusal), exactly as a CI provider states its listing bound (ADR 0006).
+
+The step then drains, in the tick, every row the pass staged or holds current
+(so a pass after a killed tick admits what the killed one staged, once) and
+settles the pass against the rows' states: a container is complete only when
+its listing was read to exhaustion and every version the pass holds current
+in it was admitted. A dead-lettered, withheld, or unadmitted item leaves its
+container partial; an audience refusal does not, since an item the project
+may not read is outside the domain by definition.
+
+**Coverage** (`src/collectors/coverage.rs`). The settled pass stages its own
+`collector_observation` item through the same sink: external id the
+collector instance, version marker `m:<manifest digest>` (the digest over the
+admitted version keys the pass holds current, sorted), and a rendered
+summary as text (how many items are current, which containers were partial
+and why; no item and no provider text). The summary is a function of the
+manifest and the outcomes alone, so an unchanged pass re-stages the same
+version and its receipt cites the same event. The pass cursor
+(`collector.pass`) advances in the same transaction. Once the observation
+is admitted, a reconciliation pass records one coverage domain through the
+coverage runtime: scope the provider-scope URI, revision the manifest
+digest, window `[coverage_since, observed_through)`, target `[0, N + 1)`
+where `0..N` are the containers and `N` is the pass itself, and observed the
+pass's ordinal plus every complete container. The pass's own ordinal is what
+lets a pass that completed no container still record a partial receipt: a
+coverage observation cannot be empty, and without a receipt the instance's
+newest cursor would still be an earlier pass's complete one. The receipt
+names the freshness rule `coverage.freshness.worker_tick` and the proof
+method `coverage.proof.enumerated_snapshot` (a directory) or
+`coverage.proof.closed_provider_query` (an API listing); all stay
+unregistered labels (ADR 0006 D2). If the observation is not admitted, no
+receipt is written and the source fails.
+
+**Status and retirement.** The collector's row in
+`memory_collector_sources_v1` (`owner = worker`, `live`) records `ok` when
+the pass staged or admitted anything, else `unchanged`, or `failed` with its
+error; only a reconciliation whose receipt was recorded sets
+`last_checked_at`. On a complete tick (every ingest step and `collect`
+selected), once every configured collector recorded its row, the rows the
+worker owns for instances no longer configured are `retired`; an import's or
+a capture's rows are never touched, and a narrower tick (`--steps collect`)
+retires nothing, as the worker's own retirement.
+
+**The documents directory** (`src/collectors/docs`, provider `docs`). One
+instance reads one root, one container (`docs.root`, id the provider scope
+id), declared visible by the operator (`audience.operator_declared`,
+required). Settings: `root`, `extensions` (a subset of `md`, `markdown`,
+`txt`, `rst`, `adoc`), `max_file_bytes` (at most 2 MiB), `max_files`. Every
+pass is a full enumeration:
+
+- a depth-first walk in name order that skips names beginning with `.`,
+  follows a symlink only to a regular file inside the root, and never
+  descends a symlinked directory; it stops at `max_files`, and a listing that
+  stops there, or could not read a directory or a name, is partial;
+- one item per file, object kind `document`, external id the relative path
+  (`/`-separated, NFC). A file is staged only when its content digest
+  differs from the newest version the memory knows (the verified head, or a
+  newer version still pending); its marker is `o<pass instant>:sha256:
+  <digest>` and its order the pass instant, so an unchanged root stages
+  nothing and reverting content mints a new version. File times are never
+  read;
+- markdown is split at ATX and setext headings outside code fences, each
+  part anchored at its heading path with the exact byte span it came from;
+  larger sections are split at blank lines outside fences, and a document
+  with more than 64 sections is packed under the part bound. Front matter
+  gives the title (`title`, with its `status` appended) and stays in the
+  first part's text; other text is split at blank lines;
+- a file over `max_file_bytes` is an `oversize` dead letter and one that is
+  not UTF-8 a `parse_failed` one, digest only, and either leaves the root
+  partial; an empty file is skipped, and one the memory held text for is
+  hidden like a deleted one;
+- a live document missing from a complete enumeration gets a `deleted`
+  tombstone at the pass instant; a partial listing tombstones nothing.
+
+A root that cannot be resolved is a failed pass, never an empty listing that
+would tombstone every document. Specs in a git worktree are covered by path
+and content digest and stay non-normative (AUTH-04).
+
+**Rejected.** A per-container cursor for documents: a full enumeration
+compared with the heads resumes by construction, and a pass instant as the
+order keeps it independent of file times. Following every symlink inside the
+root: a symlinked directory can form a cycle, and following one only to
+reach the same files again buys nothing.

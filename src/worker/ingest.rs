@@ -140,7 +140,7 @@ const RETIRE_SOURCES_SQL: &str = "UPDATE public.memory_worker_sources_v1 SET \
 /// A per-source failure, already rendered for the report and the status row.
 type SourceResult<T> = std::result::Result<T, String>;
 
-fn describe(error: impl Display) -> String {
+pub(super) fn describe(error: impl Display) -> String {
     error.to_string()
 }
 
@@ -161,7 +161,7 @@ pub(super) async fn server_time(pool: &PgPool) -> Result<DateTime<Utc>> {
     )
 }
 
-async fn server_instant(pool: &PgPool) -> SourceResult<CanonicalTimestamp> {
+pub(super) async fn server_instant(pool: &PgPool) -> SourceResult<CanonicalTimestamp> {
     let now = server_time(pool).await.map_err(describe)?;
     CanonicalTimestamp::from_datetime(&now).map_err(describe)
 }
@@ -213,7 +213,7 @@ fn count(value: usize) -> u64 {
 }
 
 /// `error` cut to what migration 0030 stores, on a character boundary.
-fn bounded_error(error: &str) -> String {
+pub(super) fn bounded_error(error: &str) -> String {
     if error.len() <= MAX_LAST_ERROR_BYTES {
         return error.to_owned();
     }
