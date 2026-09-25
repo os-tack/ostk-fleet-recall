@@ -105,7 +105,9 @@ use super::cockroach::{
     lock_item_withdrawals, optional_digest_column, select_pending_by_id_sql, select_pending_sql,
     statement_time,
 };
-use super::draft::{CollectedItemDraftV1, ItemRefusalV1, SealContextV1, collection_record, seal};
+use super::draft::{
+    CollectedItemDraftV1, ItemRefusalV1, SealContextV1, collection_record, has_hidden_scalar, seal,
+};
 use super::heads::{
     CompletedVersionV1, TierHeadV1, advance_tier_head, part_completes_version, present,
 };
@@ -1733,6 +1735,11 @@ fn prepare_container(
     context: &StageContextV1<'_>,
     observation: &ContainerObservationV1,
 ) -> Result<PreparedContainerV1> {
+    if has_hidden_scalar(&observation.id) {
+        return Err(FleetError::Configuration(
+            "a container id holds a hidden scalar".to_owned(),
+        ));
+    }
     let id = BoundedTextV1::<MAX_LABEL_BYTES>::new(observation.id.clone())
         .map_err(|_| {
             FleetError::Configuration("a container id is not a bounded NFC line".to_owned())

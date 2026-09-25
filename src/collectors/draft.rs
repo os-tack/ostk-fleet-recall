@@ -28,15 +28,15 @@ use std::ops::Range;
 
 use crate::memory_contracts::collected_item::{
     AudienceBasisV1, AuthorKindV1, BoundedTextV1, COLLECTED_ITEM_SCHEMA_VERSION,
-    CollectedItemEnvelopeV1, CollectedItemInputV1, CollectedTextV1, CollectedTitleV1,
-    CollectionModeV1, ContainerKindV1, ItemAudienceV1, ItemAuthorV1, ItemCollectionV1,
-    ItemContainerV1, ItemLifecycleV1, ItemLinkV1, ItemPartV1, ItemRedactionV1, ItemThreadV1,
-    ItemVersionV1, LinkRelV1, MAX_ANCHOR_BYTES, MAX_EXTERNAL_ID_BYTES, MAX_LABEL_BYTES,
-    MAX_LINK_TARGET_BYTES, MAX_LINKS, MAX_MARKER_BYTES, MAX_PART_TEXT_BYTES, MAX_PARTS,
-    MAX_PROVIDER_URL_BYTES, MAX_SCOPE_ID_BYTES, MAX_TITLE_BYTES, ObjectKindV1, ProviderKindV1,
-    RedactionClassLabelV1, TextFormatV1, VisibilityHintV1, default_version_marker,
-    derive_container_key, derive_content_digest, derive_item_key, derive_version_key,
-    provider_timestamp, timestamp_micros,
+    CollectedItemEnvelopeV1, CollectedItemInputV1, CollectedScalarClassV1, CollectedTextV1,
+    CollectedTitleV1, CollectionModeV1, ContainerKindV1, ItemAudienceV1, ItemAuthorV1,
+    ItemCollectionV1, ItemContainerV1, ItemLifecycleV1, ItemLinkV1, ItemPartV1, ItemRedactionV1,
+    ItemThreadV1, ItemVersionV1, LinkRelV1, MAX_ANCHOR_BYTES, MAX_EXTERNAL_ID_BYTES,
+    MAX_LABEL_BYTES, MAX_LINK_TARGET_BYTES, MAX_LINKS, MAX_MARKER_BYTES, MAX_PART_TEXT_BYTES,
+    MAX_PARTS, MAX_PROVIDER_URL_BYTES, MAX_SCOPE_ID_BYTES, MAX_TITLE_BYTES, ObjectKindV1,
+    ProviderKindV1, RedactionClassLabelV1, TextFormatV1, VisibilityHintV1,
+    classify_collected_scalar, default_version_marker, derive_container_key, derive_content_digest,
+    derive_item_key, derive_version_key, provider_timestamp, timestamp_micros,
 };
 use crate::memory_contracts::common::CanonicalTimestamp;
 use crate::memory_contracts::digest::Sha256Digest;
@@ -742,12 +742,19 @@ impl<'a> Sealer<'a> {
     }
 
     /// An exact provider id: refused when it is not a bounded canonical line,
-    /// and refused when it holds a secret shape, since it cannot be redacted.
+    /// when it holds a hidden scalar (a TAG-block, bidi, or zero-width
+    /// character the sanitizer would strip from text), and when it holds a
+    /// secret shape, since an id can be neither altered nor redacted.
     fn exact<const MAX: usize>(
         &self,
         field: &'static str,
         raw: &str,
     ) -> SealResult<BoundedTextV1<MAX>> {
+        if has_hidden_scalar(raw) {
+            return Err(ItemRefusalV1::Validation(
+                "an id or marker holds a hidden scalar",
+            ));
+        }
         let value = BoundedTextV1::new(raw)
             .map_err(|_| ItemRefusalV1::Validation("an id or marker is not a bounded NFC line"))?;
         if let Some(finding) = self.redactor.scan(raw).first() {
@@ -865,6 +872,16 @@ impl<'a> Sealer<'a> {
             replaced_scalars: self.replaced_scalars,
         })
     }
+}
+
+/// Whether `value` holds a scalar the sanitizer strips as hidden: invisible
+/// text that would make an id read differently from what it is, or hide a
+/// secret shape from the scan.
+#[must_use]
+pub fn has_hidden_scalar(value: &str) -> bool {
+    value
+        .chars()
+        .any(|scalar| classify_collected_scalar(scalar) == CollectedScalarClassV1::Hidden)
 }
 
 /// The collection record a sink hands to [`seal`] for one channel.

@@ -520,6 +520,46 @@ fn refused_ids_and_urls_are_validation_failures() {
     }
 }
 
+#[test]
+fn a_hidden_scalar_in_an_id_or_marker_is_refused_not_stripped() {
+    // TAG-block letters spelling "IGN", a right-to-left override, and a
+    // zero-width space: invisible to a reader, and able to break up a secret
+    // shape the id scan would otherwise catch.
+    for hidden in ["\u{e0049}\u{e0047}\u{e004e}", "\u{202e}", "\u{200b}"] {
+        let mut in_external_id = message("x");
+        in_external_id.external_id = format!("C07PLATENG1:1790006645.000200{hidden}");
+        let mut in_author = message("x");
+        if let Some(author) = in_author.author.as_mut() {
+            author.id = format!("U07{hidden}AUTHOR");
+        }
+        let mut in_container = message("x");
+        if let Some(container) = in_container.container.as_mut() {
+            container.id = format!("C07{hidden}PLATENG1");
+        }
+        let mut in_thread = message("x");
+        in_thread.thread = Some(DraftThreadV1 {
+            root_external_id: format!("C07PLATENG1:1790006645.0002{hidden}00"),
+            parent_external_id: None,
+        });
+        let mut in_marker = message("x");
+        in_marker.marker = Some(format!("1790007122.004300{hidden}"));
+        for draft in [
+            in_external_id,
+            in_author,
+            in_container,
+            in_thread,
+            in_marker,
+        ] {
+            assert_eq!(
+                seal_as(&draft, CollectionModeV1::Pull).unwrap_err(),
+                ItemRefusalV1::Validation("an id or marker holds a hidden scalar")
+            );
+        }
+    }
+    // The same scalars in text are stripped and counted, as before.
+    assert!(seal_as(&message("x\u{200b}y"), CollectionModeV1::Pull).is_ok());
+}
+
 /// The drafts the golden vectors are sealed from.
 fn vector_cases() -> Vec<(
     &'static str,
