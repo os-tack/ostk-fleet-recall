@@ -322,6 +322,15 @@ unchanged; new response fields are omitted when empty. The MCP server derives
 which the public demo always uses and `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled`
 restores on the private writer, emits the historical tool list byte for byte.
 
+Amended by [ADR 0005](0005-event-first-assert-and-writer-authority.md) D9,
+[ADR 0006](0006-stage5-worker-and-evidence-recall.md), and
+[ADR 0007](0007-spec-conformance-chain.md): the switch restores the
+record-only lifecycle surface but does not withdraw `remember(assert)`,
+`recall(kind=evidence)`, or `recall(action="discrepancies")`, which are served
+wherever their pins verify or their startup probes pass. With the switch
+disabled, the private writer emits the historical tool list only when it
+serves none of them.
+
 ## Consequences
 
 - Agents can withdraw or correct their own mistakes, and conflicts close when

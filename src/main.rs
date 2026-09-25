@@ -19,7 +19,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use ostk_fleet_recall::application::LifecycleServing;
-use ostk_fleet_recall::config::{PublicationConfig, model_bundle_sha256};
+use ostk_fleet_recall::config::{LifecycleConfig, PublicationConfig, model_bundle_sha256};
 use ostk_fleet_recall::evidence_recall::start_evidence_recall;
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::McpServer;
@@ -500,39 +500,64 @@ async fn build_memory_service(
     if let Some(reader) = spec_conformance {
         service = service.with_spec_conformance(reader);
     }
-    if config.lifecycle.remember_lifecycle {
-        let lifecycle = LifecycleServing {
+    let serving = remember_serving(config.lifecycle, conflict_lifecycle.is_some(), assert);
+    match serving {
+        Some(lifecycle) if config.lifecycle.remember_lifecycle => {
+            tracing::info!(surface = ?lifecycle.surface, "serving the remember lifecycle surface");
+            if conflict_lifecycle.is_none() {
+                tracing::info!(
+                    "conflict lifecycle not served: migration 29 or its runtime grants are absent"
+                );
+            }
+        }
+        Some(_) => tracing::info!("serving the record and assert remember surface"),
+        None => tracing::info!("serving the record-only remember surface"),
+    }
+    if let Some(lifecycle) = serving {
+        service = service.with_lifecycle(lifecycle);
+    }
+    let service = Arc::new(service);
+    service.verify_embedding_generation().await?;
+    Ok((service, store))
+}
+
+/// The `remember` surface the private writer serves, or `None` for the
+/// historical record-only surface.
+///
+/// `conflict_lifecycle` is whether the migration-29 probe passed, and
+/// `assert` whether the writer-authority pins verified. The lifecycle switch
+/// (`FLEET_RECALL_REMEMBER_LIFECYCLE`) governs every lifecycle action but not
+/// `assert`, which is served wherever its pins verify (ADR 0005 D9); so a
+/// disabled switch restores the record-only surface only on a writer that
+/// does not serve `assert`. Adjudication needs the conflict lifecycle beneath
+/// it.
+fn remember_serving(
+    lifecycle: LifecycleConfig,
+    conflict_lifecycle: bool,
+    assert: bool,
+) -> Option<LifecycleServing> {
+    if lifecycle.remember_lifecycle {
+        Some(LifecycleServing {
             surface: RememberSurface {
                 claim_lifecycle: true,
-                conflict_lifecycle: conflict_lifecycle.is_some(),
-                adjudication,
+                conflict_lifecycle,
+                adjudication: lifecycle.conflict_adjudication && conflict_lifecycle,
                 assert,
             },
             hide_non_current_claim_chunks: true,
-            lifecycle_overlay: conflict_lifecycle.is_some(),
-        };
-        tracing::info!(surface = ?lifecycle.surface, "serving the remember lifecycle surface");
-        if conflict_lifecycle.is_none() {
-            tracing::info!(
-                "conflict lifecycle not served: migration 29 or its runtime grants are absent"
-            );
-        }
-        service = service.with_lifecycle(lifecycle);
+            lifecycle_overlay: conflict_lifecycle,
+        })
     } else if assert {
-        tracing::info!("serving the record and assert remember surface");
-        service = service.with_lifecycle(LifecycleServing {
+        Some(LifecycleServing {
             surface: RememberSurface {
                 assert: true,
                 ..RememberSurface::RECORD_ONLY
             },
             ..LifecycleServing::default()
-        });
+        })
     } else {
-        tracing::info!("serving the record-only remember surface");
+        None
     }
-    let service = Arc::new(service);
-    service.verify_embedding_generation().await?;
-    Ok((service, store))
 }
 
 async fn build_publication_service(
@@ -1626,6 +1651,62 @@ mod tests {
             PrivacyTier::T1Project,
         )
         .expect("scope")
+    }
+
+    #[test]
+    fn the_lifecycle_switch_withdraws_lifecycle_actions_but_not_assert() {
+        use ostk_fleet_recall::service::RememberAction;
+
+        const LIFECYCLE_ACTIONS: [RememberAction; 6] = [
+            RememberAction::Retract,
+            RememberAction::Supersede,
+            RememberAction::Acknowledge,
+            RememberAction::Resolve,
+            RememberAction::Dismiss,
+            RememberAction::Waive,
+        ];
+        let disabled = LifecycleConfig {
+            remember_lifecycle: false,
+            conflict_adjudication: true,
+        };
+
+        // Without verified pins, the disabled switch is the record-only
+        // surface, whatever the conflict-lifecycle probe found.
+        for conflict_lifecycle in [false, true] {
+            assert_eq!(remember_serving(disabled, conflict_lifecycle, false), None);
+        }
+
+        // With them, the disabled switch still serves assert beside record,
+        // and nothing else.
+        for conflict_lifecycle in [false, true] {
+            let serving = remember_serving(disabled, conflict_lifecycle, true)
+                .expect("verified pins serve assert with the switch disabled");
+            assert!(serving.surface.allows(RememberAction::Record));
+            assert!(serving.surface.allows(RememberAction::Assert));
+            for action in LIFECYCLE_ACTIONS {
+                assert!(!serving.surface.allows(action), "{action:?} is withdrawn");
+            }
+            assert!(!serving.hide_non_current_claim_chunks);
+            assert!(!serving.lifecycle_overlay);
+        }
+
+        // The enabled switch serves the lifecycle beside assert, and
+        // adjudication only over the conflict lifecycle.
+        let enabled = LifecycleConfig {
+            remember_lifecycle: true,
+            conflict_adjudication: true,
+        };
+        let full = remember_serving(enabled, true, true).expect("the lifecycle is served");
+        assert!(full.surface.allows(RememberAction::Assert));
+        for action in LIFECYCLE_ACTIONS {
+            assert!(full.surface.allows(action), "{action:?} is served");
+        }
+        let claim_only = remember_serving(enabled, false, false).expect("the lifecycle is served");
+        assert!(!claim_only.surface.allows(RememberAction::Assert));
+        assert!(claim_only.surface.allows(RememberAction::Retract));
+        assert!(!claim_only.surface.allows(RememberAction::Acknowledge));
+        assert!(!claim_only.surface.allows(RememberAction::Dismiss));
+        assert!(!claim_only.lifecycle_overlay);
     }
 
     #[test]

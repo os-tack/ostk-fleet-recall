@@ -831,8 +831,10 @@ pub struct LifecycleConfig {
     /// lifecycle log and its runtime grants, serve the conflict lifecycle
     /// (`remember(acknowledge)`, concession `remember(resolve)`, and the
     /// lifecycle overlay and history on reads).
-    /// `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` restores the record-only
-    /// surface and its byte-identical `tools/list`, and skips the probe.
+    /// `FLEET_RECALL_REMEMBER_LIFECYCLE=disabled` withdraws every lifecycle
+    /// action and skips the probe. It does not withdraw `remember(assert)`
+    /// (ADR 0005 D9), evidence recall, or discrepancies, so `tools/list` is
+    /// the historical one only on a writer that serves none of them.
     pub remember_lifecycle: bool,
     /// Serve adjudication: `remember(dismiss)` and `remember(waive)` by an
     /// agent that authored none of a conflict's members (ADR 0004 D5). Off
