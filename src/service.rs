@@ -353,12 +353,19 @@ pub struct RecallSurface {
     /// `recall(action=discrepancies)` over spec-nonconformance episodes and
     /// the latest spec checks.
     pub discrepancies: bool,
+    /// `recall(kind=item)` over collected items (ADR 0008 D7): current
+    /// versions with provenance, trust tier, and supersession, and an absence
+    /// verdict over the collectors. Omitted from JSON when off, so every
+    /// surface without it serializes exactly as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub items: bool,
 }
 
 impl RecallSurface {
     pub const NONE: Self = Self {
         evidence: false,
         discrepancies: false,
+        items: false,
     };
 }
 

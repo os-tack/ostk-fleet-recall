@@ -59,10 +59,12 @@ Each private runtime uses its own part of these tables:
 - `serve` reads the tables of migrations 19 through 22 and 30 (with the
   visibility class migration 23 adds to the recall tiers), and from migration 34
   on the collector outbox, items, heads, containers, item withdrawals, and
-  collector status, for `recall(kind=evidence)`, and those of migrations 24, 27,
-  and 31 for `recall(action="discrepancies")`. The `evidence` and
-  `spec_conformance` blocks of `recall(status)` read the same tables. `serve`
-  writes none of them. Of the tables from migration 19 onward, it writes only
+  collector status, for `recall(kind=evidence)`; those tables, the item links,
+  and migration 20's coverage cursors for `recall(kind=item)`; and those of
+  migrations 24, 27, and 31 for `recall(action="discrepancies")`. The
+  `evidence` and `spec_conformance` blocks of `recall(status)` read the same
+  tables, and the evidence block's `collectors` count also reads the
+  collector dead letters. `serve` writes none of them. Of the tables from migration 19 onward, it writes only
   migration 29's lifecycle log.
 - Only the private import CLI writes migration 28's rows. No served path
   reads them or migration 23's publication views.
@@ -75,11 +77,12 @@ Serving requires none of these migrations: `MINIMUM_RECALL_SCHEMA_VERSION`
 stays 18. `serve` serves each surface built on them only when its startup
 probe finds the schema version and the runtime grants on every table the
 surface reads. Migration 29 gates the conflict lifecycle, 30 gates
-`recall(kind=evidence)`, and 31 gates `recall(action="discrepancies")`;
-migration 32 gates nothing served, and migrations 33 and 34 gate no surface
-either: evidence recall reads its collector state when it finds it readable,
-and is still served, fail-closed, when it does not; until it is readable it
-checks again on every read, so they need no restart (ADR 0008 D5). A
+`recall(kind=evidence)`, 31 gates `recall(action="discrepancies")`, and 34
+gates `recall(kind=item)` (ADR 0008 D7); migration 32 gates nothing served.
+Evidence recall reads its collector state (migrations 33 and 34) when it
+finds it readable, and is still served, fail-closed, when it does not; until
+it is readable it checks again on every read, so they need no restart for
+it (ADR 0008 D5). `recall(kind=item)` is probed at startup like the others. A
 surface whose probe fails is left out of `tools/list`, and `serve` logs why;
 every other surface is unchanged. The probes run only at startup, so
 roll each of these migrations out the same way:

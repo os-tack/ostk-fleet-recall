@@ -18,7 +18,9 @@ use crate::collectors::cockroach::{COUNT_PENDING_SQL, suppressed_body_predicate}
 use crate::context::FleetScope;
 use crate::coverage_runtime::decode_cursor_row;
 use crate::error::{FleetError, Result};
-use crate::memory_contracts::collected_item::COLLECTED_ITEM_MEDIA_TYPE;
+use crate::memory_contracts::collected_item::{
+    COLLECTED_ITEM_MEDIA_TYPE, ItemLifecycleV1, TrustTierV1,
+};
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::projectors::{CockroachRecallReader, RowVisibilityClassV1};
 use crate::store::cockroach::{
@@ -29,10 +31,10 @@ use crate::worker::WorkerSourceOutcomeV1;
 use super::verdict::{ScoredHitV1, absence_verdict, apply_dense_floor};
 use super::{
     ContentTrustV1, EVIDENCE_RECALL_SCHEMA_VERSION, EVIDENCE_SNIPPET_CHARS, EvidenceBodyV1,
-    EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceHitV1, EvidenceReadinessV1, EvidenceRecall,
-    EvidenceSearchV1, EvidenceSourceKindV1, EvidenceSourceV1, EvidenceSourcesV1, EvidenceStatusV1,
-    MAX_EVIDENCE_SEARCH_LIMIT, MAX_EVIDENCE_SOURCE_ERROR_BYTES, MAX_EVIDENCE_SOURCES,
-    lexical_query_text,
+    EvidenceCollectorsV1, EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceHitV1, EvidenceItemV1,
+    EvidenceReadinessV1, EvidenceRecall, EvidenceSearchV1, EvidenceSourceKindV1, EvidenceSourceV1,
+    EvidenceSourcesV1, EvidenceStatusV1, MAX_EVIDENCE_SEARCH_LIMIT,
+    MAX_EVIDENCE_SOURCE_ERROR_BYTES, MAX_EVIDENCE_SOURCES, lexical_query_text,
 };
 
 const INSUFFICIENT_PRIVILEGE_SQLSTATE: &str = "42501";
@@ -84,7 +86,7 @@ const COLLECTOR_SOURCES_SQL: &str = "SELECT collector_instance_id, provider, sta
      ORDER BY collector_instance_id LIMIT $3";
 
 /// Whether the scope's dense tier holds a vector from any other model.
-const FOREIGN_DENSE_MODEL_SQL: &str = "SELECT 1 FROM public.memory_body_dense_projection_v1 \
+pub const FOREIGN_DENSE_MODEL_SQL: &str = "SELECT 1 FROM public.memory_body_dense_projection_v1 \
      WHERE tenant_id = $1 AND project = $2 AND model_digest <> $3 LIMIT 1";
 
 /// Active sources, one row past the listing bound so truncation shows.
@@ -107,14 +109,16 @@ const COVERAGE_SQL: &str = "SELECT DISTINCT ON (connector_instance_id) connector
      WHERE tenant_id = $1 AND project = $2 AND connector_instance_id = ANY($3::STRING[]) \
      ORDER BY connector_instance_id, updated_at DESC, coverage_key_digest LIMIT $4";
 
-/// Events the body projector has not consumed, and turns still in the outbox.
+/// Accepted evidence events the body projector has not consumed, as a scalar
+/// subquery over the scope `$1`/`$2`.
 ///
 /// The body projector keeps one watermark per shard (across epochs) and
 /// consumes `evidence.accepted` events past it. Each shard head drives a
 /// lookup into the events' primary key past that watermark, so the count
-/// reads only pending events, not every event in the scope.
-const READINESS_SQL: &str = "SELECT \
-     (SELECT count(*) FROM public.memory_evidence_shard_heads AS head \
+/// reads only pending events, not every event in the scope. Item recall
+/// (`src/item_recall`) reads the same count.
+pub const EVENTS_AWAITING_BODIES_SQL: &str = "(SELECT count(*) \
+        FROM public.memory_evidence_shard_heads AS head \
         LEFT JOIN public.memory_body_projection_watermarks_v1 AS watermark \
           ON watermark.tenant_id = head.tenant_id AND watermark.project = head.project \
          AND watermark.ledger_family = 'evidence' AND watermark.shard = head.shard \
@@ -123,10 +127,18 @@ const READINESS_SQL: &str = "SELECT \
          AND event.epoch_id = head.epoch_id AND event.shard = head.shard \
          AND event.committed_offset > COALESCE(watermark.last_committed_offset, 0) \
         WHERE head.tenant_id = $1 AND head.project = $2 \
-          AND event.event_kind = 'evidence.accepted') AS events_awaiting_bodies, \
-     (SELECT count(*) FROM public.memory_transcript_outbox_v1 \
-        WHERE tenant_id = $1 AND project = $2 AND state = 'pending') AS turns_awaiting_admission, \
-     pg_catalog.statement_timestamp() AS as_of";
+          AND event.event_kind = 'evidence.accepted')";
+
+/// Events the body projector has not consumed, and turns still in the outbox.
+static READINESS_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {EVENTS_AWAITING_BODIES_SQL} AS events_awaiting_bodies, \
+         (SELECT count(*) FROM public.memory_transcript_outbox_v1 \
+            WHERE tenant_id = $1 AND project = $2 AND state = 'pending') \
+            AS turns_awaiting_admission, \
+         pg_catalog.statement_timestamp() AS as_of"
+    )
+});
 
 /// Whether a query has any lexeme. `$1` is already [`lexical_query_text`].
 const LEXICAL_TERMS_SQL: &str = "SELECT plainto_tsquery('english', $1)::STRING";
@@ -142,6 +154,31 @@ const HYDRATE_SQL: &str = "SELECT body.content_sha256, body.media_type, \
       AND lexical.body_content_id = body.content_sha256 \
      WHERE body.tenant_id = $1 AND body.project = $2 \
        AND body.content_sha256 = ANY($3::BYTES[])";
+
+/// The collected item each of a set of bodies belongs to, and whether the
+/// body's version is the item's presented head. Reads
+/// `memory_collected_items_body_idx`.
+const HIT_ITEMS_SQL: &str = "SELECT item.body_content_id, item.item_key_digest, item.provider, \
+     item.trust_tier, item.lifecycle, \
+     COALESCE(head.version_key_digest = item.version_key_digest, false) AS current \
+     FROM public.memory_collected_items_v1 AS item \
+     LEFT JOIN public.memory_collected_item_heads_v1 AS head \
+       ON head.tenant_id = item.tenant_id AND head.project = item.project \
+      AND head.item_key_digest = item.item_key_digest AND head.presented \
+     WHERE item.tenant_id = $1 AND item.project = $2 \
+       AND item.body_content_id = ANY($3::BYTES[])";
+
+/// The collectors of one scope at a glance: active instances, pending parts,
+/// and the dead letters of the last day (`memory_collector_dead_letters_time_idx`).
+const COLLECTORS_STATUS_SQL: &str = "SELECT \
+     (SELECT count(*) FROM public.memory_collector_sources_v1 \
+        WHERE tenant_id = $1 AND project = $2 AND state = 'active') AS sources, \
+     (SELECT count(*) FROM public.memory_collector_outbox_v1 \
+        WHERE tenant_id = $1 AND project = $2 AND state = 'pending') AS outbox_pending, \
+     (SELECT count(*) FROM public.memory_collector_dead_letters_v1 \
+        WHERE tenant_id = $1 AND project = $2 \
+          AND created_at > pg_catalog.statement_timestamp() - INTERVAL '24 hours') \
+        AS dead_letters_24h";
 
 /// [`GET_SQL`] for a reader that can read the collector state: a collected
 /// body whose item was deleted or withdrawn, or whose container was
@@ -308,7 +345,7 @@ pub async fn probe_evidence_recall(
 /// Whether this login may SELECT every table in `tables`. The check plans one
 /// statement over them in a transaction that is rolled back, so it reads
 /// nothing.
-async fn may_read(pool: &PgPool, tables: &[&str]) -> Result<bool> {
+pub async fn may_read(pool: &PgPool, tables: &[&str]) -> Result<bool> {
     let mut transaction = pool.begin().await?;
     let probe = sqlx::query(&privilege_probe_sql(tables))
         .execute(&mut *transaction)
@@ -457,39 +494,7 @@ impl CockroachEvidenceRecall {
             return Ok(EvidenceSourcesV1 { active, truncated });
         }
 
-        let instances: Vec<String> = active
-            .iter()
-            .map(|source| source.connector_instance.clone())
-            .collect();
-        let rows: Vec<PgRow> = sqlx::query(COVERAGE_SQL)
-            .bind(self.tenant_id)
-            .bind(&self.project)
-            .bind(&instances)
-            .bind(listing_limit(MAX_EVIDENCE_SOURCES))
-            .fetch_all(&self.pool)
-            .await?;
-        let mut coverage = HashMap::with_capacity(rows.len());
-        for row in &rows {
-            let instance: String = row.try_get("connector_instance_id")?;
-            let cursor = decode_cursor_row(row)?;
-            coverage.insert(
-                instance,
-                EvidenceCoverageV1 {
-                    completeness: cursor.last_completeness,
-                    observed: cursor
-                        .observed
-                        .intervals()
-                        .iter()
-                        .map(|interval| [interval.start, interval.end])
-                        .collect(),
-                    target: [cursor.target.start, cursor.target.end],
-                    as_of: cursor.updated_at,
-                },
-            );
-        }
-        for source in &mut active {
-            source.coverage = coverage.remove(&source.connector_instance);
-        }
+        attach_coverage(&self.pool, self.tenant_id, &self.project, &mut active).await?;
         Ok(EvidenceSourcesV1 { active, truncated })
     }
 
@@ -500,7 +505,7 @@ impl CockroachEvidenceRecall {
         dense_lane: EvidenceDenseLaneV1,
         state: CollectorStateV1,
     ) -> Result<EvidenceReadinessV1> {
-        let row: PgRow = sqlx::query(READINESS_SQL)
+        let row: PgRow = sqlx::query(READINESS_SQL.as_str())
             .bind(self.tenant_id)
             .bind(&self.project)
             .fetch_one(&self.pool)
@@ -529,22 +534,6 @@ impl CockroachEvidenceRecall {
             dense_lane,
             as_of: row.try_get::<DateTime<Utc>, _>("as_of")?,
         })
-    }
-
-    /// Whether `lexical_text` has a lexeme.
-    async fn has_lexical_terms(&self, lexical_text: &str) -> Result<bool> {
-        if lexical_text.is_empty() {
-            return Ok(false);
-        }
-        match sqlx::query_scalar::<_, String>(LEXICAL_TERMS_SQL)
-            .bind(lexical_text)
-            .fetch_one(&self.pool)
-            .await
-        {
-            Ok(terms) => Ok(!terms.is_empty()),
-            Err(error) if sqlstate(&error).as_deref() == Some(NO_LEXEMES_SQLSTATE) => Ok(false),
-            Err(error) => Err(error.into()),
-        }
     }
 
     /// Attach each scored hit's body, keeping the lanes' order.
@@ -602,25 +591,147 @@ impl CockroachEvidenceRecall {
                     snippet,
                     snippet_truncated,
                     first_accepted_event_id,
+                    item: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         // Fail closed: without the collector state a deleted item's text is
         // indistinguishable from a current one's, so no collected body is
         // recalled.
-        Ok(if state.readable() {
-            hits
-        } else {
-            hits.into_iter()
+        if !state.readable() {
+            return Ok(hits
+                .into_iter()
                 .filter(|hit| hit.media_type != COLLECTED_ITEM_MEDIA_TYPE)
-                .collect()
-        })
+                .collect());
+        }
+        self.annotate_items(hits).await
     }
+
+    /// Attach to each collected hit the item it belongs to.
+    async fn annotate_items(&self, mut hits: Vec<EvidenceHitV1>) -> Result<Vec<EvidenceHitV1>> {
+        let collected: Vec<Vec<u8>> = hits
+            .iter()
+            .filter(|hit| hit.media_type == COLLECTED_ITEM_MEDIA_TYPE)
+            .map(|hit| hit.id.as_bytes().to_vec())
+            .collect();
+        if collected.is_empty() {
+            return Ok(hits);
+        }
+        let rows: Vec<PgRow> = sqlx::query(HIT_ITEMS_SQL)
+            .bind(self.tenant_id)
+            .bind(&self.project)
+            .bind(&collected)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut items = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let trust: String = row.try_get("trust_tier")?;
+            let lifecycle: String = row.try_get("lifecycle")?;
+            items.insert(
+                digest(row, "body_content_id")?,
+                EvidenceItemV1 {
+                    item_id: digest(row, "item_key_digest")?,
+                    provider: row.try_get("provider")?,
+                    trust: TrustTierV1::parse(&trust)?,
+                    current: row.try_get("current")?,
+                    lifecycle: ItemLifecycleV1::parse(&lifecycle)?,
+                },
+            );
+        }
+        for hit in &mut hits {
+            hit.item = items.remove(&hit.id);
+        }
+        Ok(hits)
+    }
+
+    /// The collectors block of a status read; `None` when this login may not
+    /// read every table it counts.
+    async fn read_collectors(&self) -> Result<Option<EvidenceCollectorsV1>> {
+        let row = match sqlx::query(COLLECTORS_STATUS_SQL)
+            .bind(self.tenant_id)
+            .bind(&self.project)
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(error) if sqlstate(&error).as_deref() == Some(INSUFFICIENT_PRIVILEGE_SQLSTATE) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(EvidenceCollectorsV1 {
+            sources: count(&row, "sources")?,
+            outbox_pending: count(&row, "outbox_pending")?,
+            dead_letters_24h: count(&row, "dead_letters_24h")?,
+        }))
+    }
+}
+
+/// Whether `lexical_text` (already [`lexical_query_text`]) has a lexeme.
+pub async fn has_lexical_terms(pool: &PgPool, lexical_text: &str) -> Result<bool> {
+    if lexical_text.is_empty() {
+        return Ok(false);
+    }
+    match sqlx::query_scalar::<_, String>(LEXICAL_TERMS_SQL)
+        .bind(lexical_text)
+        .fetch_one(pool)
+        .await
+    {
+        Ok(terms) => Ok(!terms.is_empty()),
+        Err(error) if sqlstate(&error).as_deref() == Some(NO_LEXEMES_SQLSTATE) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Attach each listed source's newest coverage cursor, read in one statement.
+pub async fn attach_coverage(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    project: &str,
+    active: &mut [EvidenceSourceV1],
+) -> Result<()> {
+    if active.is_empty() {
+        return Ok(());
+    }
+    let instances: Vec<String> = active
+        .iter()
+        .map(|source| source.connector_instance.clone())
+        .collect();
+    let rows: Vec<PgRow> = sqlx::query(COVERAGE_SQL)
+        .bind(tenant_id)
+        .bind(project)
+        .bind(&instances)
+        .bind(listing_limit(MAX_EVIDENCE_SOURCES))
+        .fetch_all(pool)
+        .await?;
+    let mut coverage = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let instance: String = row.try_get("connector_instance_id")?;
+        let cursor = decode_cursor_row(row)?;
+        coverage.insert(
+            instance,
+            EvidenceCoverageV1 {
+                completeness: cursor.last_completeness,
+                observed: cursor
+                    .observed
+                    .intervals()
+                    .iter()
+                    .map(|interval| [interval.start, interval.end])
+                    .collect(),
+                target: [cursor.target.start, cursor.target.end],
+                as_of: cursor.updated_at,
+            },
+        );
+    }
+    for source in active {
+        source.coverage = coverage.remove(&source.connector_instance);
+    }
+    Ok(())
 }
 
 /// The dense lane's state for one read. `query_vector` is `None` for a read
 /// that runs no query, otherwise whether the search carried a vector.
-const fn dense_lane(served: bool, query_vector: Option<bool>) -> EvidenceDenseLaneV1 {
+pub const fn dense_lane(served: bool, query_vector: Option<bool>) -> EvidenceDenseLaneV1 {
     match (served, query_vector) {
         (false, _) => EvidenceDenseLaneV1::DisabledForeignModel,
         (true, None) => EvidenceDenseLaneV1::Available,
@@ -649,7 +760,7 @@ impl EvidenceRecall for CockroachEvidenceRecall {
         // absent verdict sound (module documentation).
         let sources = self.read_sources(state).await?;
         let readiness = self.read_readiness(lane, state).await?;
-        let lexical_terms = self.has_lexical_terms(&lexical_text).await?;
+        let lexical_terms = has_lexical_terms(&self.pool, &lexical_text).await?;
         let vector = query_vector.filter(|_| lane == EvidenceDenseLaneV1::Used);
         let (hits, _tier) = self
             .reader(state)
@@ -716,7 +827,16 @@ impl EvidenceRecall for CockroachEvidenceRecall {
         let readiness = self
             .read_readiness(dense_lane(self.dense_served, None), state)
             .await?;
-        Ok(EvidenceStatusV1 { readiness, sources })
+        let collectors = if state.readable() {
+            self.read_collectors().await?
+        } else {
+            None
+        };
+        Ok(EvidenceStatusV1 {
+            readiness,
+            sources,
+            collectors,
+        })
     }
 }
 
@@ -730,7 +850,7 @@ fn decode_source_row(row: &PgRow) -> Result<EvidenceSourceV1> {
     )
 }
 
-fn decode_collector_source_row(row: &PgRow) -> Result<EvidenceSourceV1> {
+pub fn decode_collector_source_row(row: &PgRow) -> Result<EvidenceSourceV1> {
     decode_status(
         row,
         row.try_get("collector_instance_id")?,
@@ -787,17 +907,17 @@ fn cut(text: &str, limit: usize) -> String {
     text[..end].to_owned()
 }
 
-fn listing_limit(limit: usize) -> i64 {
+pub fn listing_limit(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
-fn count(row: &PgRow, column: &str) -> Result<u64> {
+pub fn count(row: &PgRow, column: &str) -> Result<u64> {
     let value: i64 = row.try_get(column)?;
     u64::try_from(value)
         .map_err(|_| FleetError::Memory(format!("{column} returned a negative count")))
 }
 
-fn digest(row: &PgRow, column: &str) -> Result<Sha256Digest> {
+pub fn digest(row: &PgRow, column: &str) -> Result<Sha256Digest> {
     let bytes: Vec<u8> = row.try_get(column)?;
     let bytes: [u8; 32] = bytes
         .try_into()

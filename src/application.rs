@@ -15,6 +15,9 @@ use crate::evidence_recall::{
     EvidenceDenseLaneV1, EvidenceReadinessV1, EvidenceRecall, EvidenceSearchV1, EvidenceSourceV1,
     EvidenceSourcesV1, MAX_EVIDENCE_SEARCH_LIMIT, MAX_EVIDENCE_SOURCES,
 };
+use crate::item_recall::{
+    ItemRecall, ItemReferenceV1, ItemSearchRequestV1, ItemSearchV1, MAX_ITEM_SEARCH_LIMIT,
+};
 use crate::ledger::{
     ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict, ConflictMutation,
     ConflictTarget, DismissalTerms, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LifecycleMutation,
@@ -23,6 +26,7 @@ use crate::ledger::{
     overlay_episode_revision, unlogged_transitions, validate_lifecycle_reason, validate_rationale,
     validate_waiver_hours,
 };
+use crate::memory_contracts::collected_item::ProviderKindV1;
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::discrepancy::{
     DiscrepancyEpisodeFingerprintV1, DismissalReasonKindV1, WaiverReasonKindV1,
@@ -44,8 +48,9 @@ use crate::{FleetError, FleetScope};
 
 const MAX_TOOL_RESULTS: usize = 100;
 const DEFAULT_TOOL_RESULTS: usize = 10;
-// `recall(kind=evidence)` shares the tool's limit bound.
+// `recall(kind=evidence)` and `recall(kind=item)` share the tool's limit bound.
 const _: () = assert!(MAX_TOOL_RESULTS == MAX_EVIDENCE_SEARCH_LIMIT);
+const _: () = assert!(MAX_TOOL_RESULTS == MAX_ITEM_SEARCH_LIMIT);
 // Chunk search passes this query to CockroachDB's `plainto_tsquery`; keep every
 // token below the same conservative bound enforced for indexed corpus text.
 const MAX_TSVECTOR_QUERY_LEXEME_BYTES: usize = 16_000;
@@ -105,6 +110,9 @@ pub struct CockroachMemoryService {
     /// `recall(action=discrepancies)` over the Stage-6 spec conformance
     /// chain (ADR 0007); `None` when this instance does not serve it.
     spec_conformance: Option<Arc<dyn SpecConformanceRead>>,
+    /// `recall(kind=item)` over collected items (ADR 0008 D7); `None` when
+    /// this instance does not serve it.
+    items: Option<Arc<dyn ItemRecall>>,
 }
 
 struct ChunkConflictProjection {
@@ -150,6 +158,7 @@ impl std::fmt::Debug for CockroachMemoryService {
             .field("withhold_asserted_claims", &self.withhold_asserted_claims)
             .field("evidence_recall", &self.evidence.is_some())
             .field("spec_conformance", &self.spec_conformance.is_some())
+            .field("item_recall", &self.items.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -179,6 +188,7 @@ impl CockroachMemoryService {
             withhold_asserted_claims: false,
             evidence: None,
             spec_conformance: None,
+            items: None,
         })
     }
 
@@ -247,6 +257,17 @@ impl CockroachMemoryService {
     #[must_use]
     pub fn with_spec_conformance(mut self, reader: Arc<dyn SpecConformanceRead>) -> Self {
         self.spec_conformance = Some(reader);
+        self
+    }
+
+    /// Serve `recall(kind=item)` (ADR 0008 D7) through `items`: `search` and
+    /// `get` with `kind=item`, advertised in `tools/list`. Only the private
+    /// writer composition calls this, and only where
+    /// [`crate::item_recall::start_item_recall`] found the scope's collector
+    /// and Stage-5 tables readable; the publication reader never serves it.
+    #[must_use]
+    pub fn with_item_recall(mut self, items: Arc<dyn ItemRecall>) -> Self {
+        self.items = Some(items);
         self
     }
 
@@ -621,6 +642,12 @@ impl CockroachMemoryService {
         {
             return self.search_evidence(evidence, arguments).await;
         }
+        // Item recall reads the same tiers, through the collector tables.
+        if let Some(items) = self.items.as_deref()
+            && arguments.get("kind").and_then(Value::as_str) == Some("item")
+        {
+            return self.search_items(items, arguments).await;
+        }
         self.verify_embedding_generation()
             .await
             .map_err(service_error)?;
@@ -693,6 +720,52 @@ impl CockroachMemoryService {
         Ok(evidence_search_result(search))
     }
 
+    /// `recall(search, kind=item)`: one item search, with the query's
+    /// embedding for the dense lane, an optional provider (`source`), and
+    /// `include_history`.
+    async fn search_items(
+        &self,
+        items: &dyn ItemRecall,
+        arguments: Map<String, Value>,
+    ) -> ServiceResult<RecallResult> {
+        let args: SearchArgs = from_arguments(arguments, "recall search")?;
+        validate_query_and_source(&args)?;
+        if args.max_per_source_id.is_some() || args.min_score.is_some() || args.intent.is_some() {
+            return Err(ServiceError::InvalidRequest(
+                "item search does not support max_per_source_id, min_score, or intent; source \
+                 filters by provider"
+                    .into(),
+            ));
+        }
+        let provider = args
+            .source
+            .as_deref()
+            .map(ProviderKindV1::new)
+            .transpose()
+            .map_err(|_| {
+                ServiceError::InvalidRequest(
+                    "item search source must be a provider kind such as slack, linear, granola, \
+                     or docs"
+                        .into(),
+                )
+            })?;
+        let limit = bounded_limit(args.limit)?;
+        let vector = self.embed_evidence_query(&args.query).await;
+        let search = items
+            .search(
+                &ItemSearchRequestV1 {
+                    query: args.query,
+                    provider,
+                    include_history: args.include_history,
+                    limit,
+                },
+                vector,
+            )
+            .await
+            .map_err(service_error)?;
+        Ok(item_search_result(search))
+    }
+
     /// Whether the process embedder gives `query` no direction at all: the
     /// zero vector a query made only of tokens the model does not know
     /// encodes to (model2vec drops unknown tokens). Chunk and claim search
@@ -734,11 +807,12 @@ impl CockroachMemoryService {
         if let Some(evidence) = self.evidence.as_deref()
             && args.kind.as_deref() == Some("evidence")
         {
-            let id = parse_evidence_id(&args.id)?;
-            let body = evidence.get(id).await.map_err(service_error)?;
-            let mut result = RecallResult::new(json!({ "evidence": body }));
-            result.conflict_coverage = ConflictCoverage::not_evaluated();
-            return Ok(result);
+            return get_evidence(evidence, &args.id).await;
+        }
+        if let Some(items) = self.items.as_deref()
+            && args.kind.as_deref() == Some("item")
+        {
+            return get_item(items, &args.id).await;
         }
         match args.kind.as_deref().unwrap_or("chunk") {
             "claim" | "assertion" => {
@@ -1723,6 +1797,7 @@ impl FleetMemoryService for CockroachMemoryService {
         RecallSurface {
             evidence: self.evidence.is_some(),
             discrepancies: self.spec_conformance.is_some(),
+            items: self.items.is_some(),
         }
     }
 }
@@ -2332,6 +2407,17 @@ fn bounded_limit(limit: Option<usize>) -> ServiceResult<usize> {
 }
 
 fn validate_search_args(args: &SearchArgs) -> ServiceResult<()> {
+    validate_query_and_source(args)?;
+    if args.include_history && !matches!(args.kind.as_deref(), Some("claim" | "assertion")) {
+        return Err(ServiceError::InvalidRequest(
+            "include_history is supported only for kind=claim or kind=assertion".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The query and `source` bounds every search kind shares.
+fn validate_query_and_source(args: &SearchArgs) -> ServiceResult<()> {
     if args.query.trim().is_empty() || args.query.len() > 100_000 {
         return Err(ServiceError::InvalidRequest(
             "query must be between 1 and 100,000 bytes".into(),
@@ -2354,11 +2440,6 @@ fn validate_search_args(args: &SearchArgs) -> ServiceResult<()> {
     {
         return Err(ServiceError::InvalidRequest(
             "source must be between 1 and 256 bytes when present".into(),
-        ));
-    }
-    if args.include_history && !matches!(args.kind.as_deref(), Some("claim" | "assertion")) {
-        return Err(ServiceError::InvalidRequest(
-            "include_history is supported only for kind=claim or kind=assertion".into(),
         ));
     }
     Ok(())
@@ -2448,6 +2529,71 @@ fn evidence_search_result(search: EvidenceSearchV1) -> RecallResult {
         "retrieval".into(),
         json!({
             "tier": "evidence",
+            "lanes": lanes,
+            "dense_lane": dense_lane,
+            "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
+        }),
+    );
+    result
+}
+
+/// `recall(get, kind=evidence)`: one body's recall text by a hit's id.
+async fn get_evidence(evidence: &dyn EvidenceRecall, id: &Value) -> ServiceResult<RecallResult> {
+    let id = parse_evidence_id(id)?;
+    let body = evidence.get(id).await.map_err(service_error)?;
+    let mut result = RecallResult::new(json!({ "evidence": body }));
+    result.conflict_coverage = ConflictCoverage::not_evaluated();
+    Ok(result)
+}
+
+/// `recall(get, kind=item)`: one item by its id, a version URI, or its
+/// provider URL. An item no presented head matches is `null`.
+async fn get_item(items: &dyn ItemRecall, id: &Value) -> ServiceResult<RecallResult> {
+    let reference = id
+        .as_str()
+        .ok_or("an item id must be a string")
+        .and_then(ItemReferenceV1::parse)
+        .map_err(|message| ServiceError::InvalidRequest(message.into()))?;
+    let item = items.get(&reference).await.map_err(service_error)?;
+    let mut result = RecallResult::new(json!({ "item": item }));
+    result.conflict_coverage = ConflictCoverage::not_evaluated();
+    Ok(result)
+}
+
+/// The recall result of one item search: the evidence answer's shape, with
+/// the evidence warnings over the collectors' readiness and sources.
+fn item_search_result(search: ItemSearchV1) -> RecallResult {
+    let ItemSearchV1 {
+        hits,
+        readiness,
+        sources,
+        absence,
+    } = search;
+    let mut warnings = evidence_warnings(&readiness.as_evidence(), &sources);
+    if readiness.dense_lane == EvidenceDenseLaneV1::NoQueryVector {
+        warnings.push(json!({
+            "code": "item_query_not_embedded",
+            "message": "the query has no usable embedding under the pinned model, so only the lexical lane ran"
+        }));
+    }
+    let lanes = if readiness.dense_lane == EvidenceDenseLaneV1::Used {
+        json!(["lexical", "dense"])
+    } else {
+        json!(["lexical"])
+    };
+    let dense_lane = readiness.dense_lane;
+    let mut result = RecallResult::new(json!({
+        "hits": hits,
+        "readiness": readiness,
+        "sources": sources,
+        "absence": absence,
+    }));
+    result.conflict_coverage = ConflictCoverage::not_evaluated();
+    result.warnings = warnings;
+    result.diagnostics.insert(
+        "retrieval".into(),
+        json!({
+            "tier": "item",
             "lanes": lanes,
             "dense_lane": dense_lane,
             "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
@@ -2562,15 +2708,25 @@ async fn evidence_status_within(
         });
     match status {
         Ok(status) => {
-            let warnings = evidence_warnings(&status.readiness, &status.sources);
-            (
-                json!({
-                    "served": true,
-                    "readiness": status.readiness,
-                    "sources": status.sources,
-                }),
-                warnings,
-            )
+            let mut warnings = evidence_warnings(&status.readiness, &status.sources);
+            let mut block = json!({
+                "served": true,
+                "readiness": status.readiness,
+                "sources": status.sources,
+            });
+            if let Some(collectors) = status.collectors {
+                block["collectors"] = json!(collectors);
+                if collectors.dead_letters_24h > 0 {
+                    warnings.push(json!({
+                        "code": "evidence_collector_dead_letters",
+                        "message": format!(
+                            "{} collected items or staged parts were dead-lettered in the last 24 hours; memory_collector_dead_letters_v1 holds each one's reason and digests, never its content",
+                            collectors.dead_letters_24h
+                        ),
+                    }));
+                }
+            }
+            (block, warnings)
         }
         Err(error) => {
             tracing::warn!(error = %error, "evidence recall status read failed");
@@ -4495,6 +4651,7 @@ mod tests {
                     snippet: "document the zephyrine cache eviction".into(),
                     snippet_truncated: false,
                     first_accepted_event_id: Sha256Digest::from_bytes([0xcd; 32]),
+                    item: None,
                 }],
                 readiness: evidence_readiness(dense_lane),
                 sources: evidence_sources(),
@@ -4533,6 +4690,7 @@ mod tests {
             self.outcome(crate::evidence_recall::EvidenceStatusV1 {
                 readiness: evidence_readiness(EvidenceDenseLaneV1::Available),
                 sources: evidence_sources(),
+                collectors: None,
             })
         }
     }

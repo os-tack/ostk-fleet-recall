@@ -410,7 +410,11 @@ pub fn lexical_text_digest(
 /// match after replacement) collapses to the placeholder alone: the recall
 /// plane's answer to "this could not be made safe" is to carry no searchable
 /// text from it, never a partial redaction.
-fn redact_for_recall(text: &str) -> String {
+///
+/// Item recall (`src/item_recall`) passes every collected title and text it
+/// returns through this again, after decoding it from the body envelope.
+#[must_use]
+pub fn redact_for_recall(text: &str) -> String {
     match redact(text).disposition {
         RedactionDispositionV1::Stage { text } => text,
         RedactionDispositionV1::Withhold { .. } => REDACTION_PLACEHOLDER.to_owned(),

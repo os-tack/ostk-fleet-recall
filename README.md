@@ -36,7 +36,24 @@ The `ostk-fleet-recall` binary has these commands:
     current lexical tier with every source healthy, fresh, and completely
     covered, otherwise `unknown` with the reasons. `recall(status)` then adds
     an `evidence` block
-    ([ADR 0006](docs/adr/0006-stage5-worker-and-evidence-recall.md)).
+    ([ADR 0006](docs/adr/0006-stage5-worker-and-evidence-recall.md)), with a
+    `collectors` count once migration 34 is applied. A hit on a collected
+    item's body names the item, its trust tier, and whether its version is
+    still current.
+  - `recall(search|get, kind=item)` searches the items collectors admit
+    (Slack, Linear, Granola, documents, ...) as items: each item's current
+    version, with its provider, container, attested author, trust tier
+    (`verified` pull or push, `reported` capture or import), the versions it
+    superseded, whether a newer report disagrees, and advisory
+    `injection_signals`. `source` filters by provider and `include_history`
+    adds superseded versions; a deleted or withdrawn item is never recalled.
+    `get` takes an item id, a version URI, or the item's provider URL and
+    returns its versions with provenance and its links. Item text is
+    third-party content, labelled `untrusted_third_party`, with markdown
+    images defanged. The absence verdict is judged over the collectors alone.
+    It is served wherever migration 34 is applied and the writer login holds
+    the collector grants
+    ([ADR 0008 D7](docs/adr/0008-collected-items.md)).
   - `recall(discrepancies)` lists the `spec_nonconformance` episodes
     `ostk-spec check` opened: by default those still open, acknowledged, or
     waived for a spec in force or scheduled to take effect, each with the
@@ -245,7 +262,8 @@ admitted, in this order:
   [ADR 0008](docs/adr/0008-collected-items.md) D4): items a collector staged
   are admitted under `connector.collected.<mode>` of the verified head, which
   needs a scope moved to generation 3. Below migration 34 it is skipped. No
-  provider collector stages items yet.
+  provider collector stages items yet. `serve` reads what it admits as
+  `recall(kind=item)` and `recall(kind=evidence)`.
 - `project`: the body projector, then the lexical tier.
 - `embed`: the dense tier, through the pinned model2vec embedder.
 
@@ -434,9 +452,11 @@ through them against a local node.
    unwraps every object with the key `ingest` wrapped it under.
 5. **Restart `serve`.** It probes once at startup. It serves assert when the
    pins verify, `recall(kind=evidence)` when migration 30 is applied and the
-   login may read the Stage-5 tables, and `recall(discrepancies)` when
+   login may read the Stage-5 tables, `recall(discrepancies)` when
    migration 31 is applied and the login may read the discrepancy, normative,
-   and spec tables. Anything it does not serve stays out of `tools/list`.
+   and spec tables, and `recall(kind=item)` when migration 34 is applied and
+   the login may read the collector tables. Anything it does not serve stays
+   out of `tools/list`.
 6. **Schedule the worker.** Run the [memory worker](#memory-worker) with one
    sources file per scope. The `ingest` steps run on a host with `git`, `gh`,
    the repositories, and the transcript files, which also holds the content

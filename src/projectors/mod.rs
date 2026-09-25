@@ -83,7 +83,7 @@ pub use error::{RecallProjectionError, RecallProjectionResult};
 pub use lexical::{
     LEXICAL_NORMALIZATION_VERSION, LexicalProjectionV1, LexicalStateV1, LexicalUnindexableReasonV1,
     MAX_LEXICAL_TEXT_BYTES, derive_lexical_projection, fold_lexical_characters,
-    lexical_text_digest,
+    lexical_text_digest, redact_for_recall,
 };
 pub use repository::{
     BodyPositionV1, DenseProjector, LexicalProjector, ProjectionCursorV1, ProjectionPassSummaryV1,

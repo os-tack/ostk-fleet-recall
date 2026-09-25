@@ -331,8 +331,9 @@ request committed before the switch still replays when its identical request
 is retried. The switch does not withdraw `remember(assert)`, which is served
 whenever its writer-authority pins verify
 ([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md) D9), or
-`recall(kind=evidence)` and `recall(action="discrepancies")`, which are served
-whenever their startup probes pass. With the switch disabled, a writer whose
+`recall(kind=evidence)`, `recall(kind=item)`, and
+`recall(action="discrepancies")`, which are served whenever their startup
+probes pass. With the switch disabled, a writer whose
 pins verify therefore still serves `remember` with the actions `record` and
 `assert`, and `assert` still appends `memory.claim.accepted` events.
 `tools/list` is the historical record-only list only on a writer that serves

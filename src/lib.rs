@@ -19,6 +19,7 @@ pub mod discrepancy_runtime;
 pub mod error;
 pub mod evidence_ledger;
 pub mod evidence_recall;
+pub mod item_recall;
 pub mod ledger;
 pub mod mcp;
 pub mod memory_contracts;

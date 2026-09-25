@@ -30,7 +30,12 @@ mutation route exists today. What runs is private and reads local material:
   invocation. It embeds the dense tier through `ChunkEmbedderProvider`, the
   production provider for that seam, over the pinned model2vec embedder.
   `serve` reads what it writes as `recall(kind=evidence)`
-  ([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)).
+  ([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)). Its `collect`
+  step drains the items collectors stage (ADR 0008 D4), and `serve` also
+  reads those as `recall(kind=item)`: each item's current version with its
+  provenance, trust tier, and superseded versions, and never a deleted or
+  withdrawn item's text (ADR 0008 D7). No provider collector stages items
+  yet.
 - The private `ostk-spec` CLI runs the Stage-6 normative activation,
   observer, and discrepancy runtimes, and `serve` lists the episodes it opens
   as `recall(discrepancies)`
@@ -72,7 +77,7 @@ specification.
 |---|---|---|
 | Corpus | Bounded NDJSON is synchronously embedded and upserted through a trusted seed path | Bootstrap plus projections from an immutable event stream |
 | Repository | Current coordinate-addressed chunks with exact source links | Content-addressed versions plus commit/ref membership |
-| Evidence | Searchable chunks, exact hash-bound claim support, and accepted git, transcript, and CI evidence searchable as `recall(kind=evidence)` | First-class immutable provider and collector evidence |
+| Evidence | Searchable chunks, exact hash-bound claim support, accepted git, transcript, and CI evidence searchable as `recall(kind=evidence)`, and collected items searchable as `recall(kind=item)` | First-class immutable provider and collector evidence |
 | Claims | Deliberate typed claims with validity and source support; one predicate can be asserted event-first with modality and applicability | Propositions with modality, authority, applicability, and derivation |
 | Conflicts | Versioned functional-key exact-value/polarity conflicts, plus verified `spec_nonconformance` episodes in a separate discrepancy ledger | A generalized, non-destructive discrepancy ledger |
 | Links | Claim-to-claim relationships are reserved in the schema | Heterogeneous provenance links and separately graded causal hypotheses |

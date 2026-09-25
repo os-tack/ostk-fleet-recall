@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 use ostk_fleet_recall::application::LifecycleServing;
 use ostk_fleet_recall::config::{LifecycleConfig, PublicationConfig, model_bundle_sha256};
 use ostk_fleet_recall::evidence_recall::start_evidence_recall;
+use ostk_fleet_recall::item_recall::start_item_recall;
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::McpServer;
 use ostk_fleet_recall::remember_runtime::start_event_first_assert;
@@ -487,6 +488,16 @@ async fn build_memory_service(
     // failed probe turns it off with a log line and changes no tool schema.
     let spec_conformance =
         start_spec_conformance(store.pool(), &capabilities, &config.default_scope).await;
+    // recall(kind=item) is served wherever migration 34 is applied and this
+    // login may read the collector and Stage-5 tables (ADR 0008 D7), and is
+    // additive in the same way.
+    let items = start_item_recall(
+        store.pool(),
+        &capabilities,
+        &config.default_scope,
+        &config.embedding_model_sha256,
+    )
+    .await;
     let mut service = CockroachMemoryService::new(
         config.default_scope.clone(),
         store.clone(),
@@ -499,6 +510,9 @@ async fn build_memory_service(
     }
     if let Some(reader) = spec_conformance {
         service = service.with_spec_conformance(reader);
+    }
+    if let Some(items) = items {
+        service = service.with_item_recall(items);
     }
     let serving = remember_serving(config.lifecycle, conflict_lifecycle.is_some(), assert);
     match serving {

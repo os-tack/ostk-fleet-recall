@@ -18,7 +18,9 @@ Its event-first slice runs today. `remember(assert)` appends accepted claim
 events ([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md)).
 The memory worker ingests git history, agent transcripts, and CI runs, which
 `recall(kind=evidence)` searches
-([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)). The private
+([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)), and drains
+collected items, which `recall(kind=item)` searches as items
+([ADR 0008](adr/0008-collected-items.md)). The private
 `ostk-spec` CLI checks commits against normative spec statements, and
 `recall(discrepancies)` lists what it finds
 ([ADR 0007](adr/0007-spec-conformance-chain.md)). The README's
@@ -181,7 +183,8 @@ statements and checks (31), and the collected-item sink (33) and its withdrawals
 log described under the write path below. The memory worker writes the body,
 connector, coverage, recall-projection, and status tables; `ostk-spec` writes
 the normative, spec, and discrepancy tables; and `serve` reads them for
-`recall(kind=evidence)` and `recall(discrepancies)` without writing any of them.
+`recall(kind=evidence)`, `recall(kind=item)`, and `recall(discrepancies)`
+without writing any of them.
 Only the private import CLI writes migration 28's rows.
 
 Serving accepts an uninterrupted successful migration prefix through at least
@@ -202,8 +205,9 @@ floors:
 - Recall, remember, ingest, health, and the public demo require prefix 1–18.
   `remember(assert)` needs nothing later: its evidence plane and authority
   view are migration 18's.
-- The memory worker and `recall(kind=evidence)` require migration 30, and
-  `recall(discrepancies)` requires 31. `serve` probes each at startup and
+- The memory worker and `recall(kind=evidence)` require migration 30,
+  `recall(discrepancies)` requires 31, and `recall(kind=item)` requires 34.
+  `serve` probes each at startup and
   serves it only when the schema and the login's grants allow, so every other
   surface still runs on a prefix through 18. The runtime policy that grants
   all of this requires the complete prefix 1–31.
@@ -355,7 +359,37 @@ lexical tier is current, and every active source's last attempt succeeded,
 its last completed check is within its `stale_after_seconds`, and its
 newest coverage cursor is complete. Otherwise it is `unknown`, naming every
 reason. Dense lag never blocks `absent`. `get` returns one body's full recall
-text (at most 256 KiB) by its content id.
+text (at most 256 KiB) by its content id. From migration 34 on, a hit on a
+collected item's body also names the item (`item_id`, provider, trust tier,
+lifecycle, and whether its version is the item's presented head), and
+deleted or withdrawn items' bodies are withheld from both lanes and `get`
+([ADR 0008 D5](adr/0008-collected-items.md)).
+
+### Item recall
+
+`recall(search|get, kind=item)` reads the same tiers through the collector
+tables ([ADR 0008 D7](adr/0008-collected-items.md)). `serve` probes once at
+startup for migration 34 and `SELECT` on the item history, heads, links,
+containers, withdrawals, outbox, collector status, coverage cursors, and the
+body, lexical, and dense tiers; without them `tools/list` is unchanged and
+the kind is refused like any unsupported kind. Search reads the collector
+sources (of the `source` provider, when given), then readiness (pending
+collected parts of that provider, unprojected events, tier currency), then
+the lanes. Both lanes join each body to its item and keep only visible items,
+inside the `WHERE`: the item's presented head is not a tombstone, its
+container is not withdrawn, and the item is not withdrawn. Without
+`include_history` only the presented head's version matches. Each lane keeps
+one best part per item version (`DISTINCT ON`), and the dense lane
+post-filters an approximate nearest-neighbour subquery of five candidates
+per hit asked for. A hit's title and snippet are decoded from the part's
+body envelope, redacted again, and have markdown images defanged; its
+advisory `injection_signals` are computed then. The absence verdict is
+evidence recall's over the collectors alone, so a provider with no live or
+snapshot source is `unknown` (`no_sources_registered`). `get` takes an item
+id, a part's version URI, or the provider URL, and returns the presented
+version's parts, every other version (tombstones without text), each part's
+provenance, and the item's links out and in, spending at most 384 KiB on
+text; a hidden item's answer is metadata only.
 
 ### Spec discrepancies
 
@@ -687,10 +721,11 @@ publication default is denied.
   consolidate, and `recall` surface, discover, synthesize, and audit;
   today `remember(record|assert|supersede|retract|acknowledge|resolve)` and
   `recall(search|get|conflicts|status|discrepancies)` are served (with `get`
-  covering claims, chunks, and, on the private writer, conflicts and
-  evidence; `assert` needs verified writer-authority pins, `acknowledge` and
-  `resolve` the migration-29 lifecycle log, `kind=evidence` migration 30, and
-  `discrepancies` migration 31), `remember(dismiss|waive)` is served
+  covering claims, chunks, and, on the private writer, conflicts, evidence,
+  and items; `assert` needs verified writer-authority pins, `acknowledge` and
+  `resolve` the migration-29 lifecycle log, `kind=evidence` migration 30,
+  `discrepancies` migration 31, and `kind=item` migration 34),
+  `remember(dismiss|waive)` is served
   where the deployment enables adjudication, and the others return an error.
   In [ADR 0004](adr/0004-serving-conflict-lifecycle.md)'s lifecycle, `record`
   reopens are not logged yet (history reports them as unlogged transitions),
