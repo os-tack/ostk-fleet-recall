@@ -270,6 +270,9 @@ pub fn recall_tool_for(surface: RememberSurface) -> Value {
 /// What `recall`'s description adds when evidence recall is served.
 const EVIDENCE_DESCRIPTION: &str = "kind=evidence searches connector evidence (git history, agent transcripts, CI runs); every answer carries readiness, per-source status and coverage, and an absence verdict: absent only when nothing matched over a current projection with every source fresh and complete, otherwise unknown. get with kind=evidence takes a hit's 64-hex id.";
 
+/// What `recall`'s description adds when spec conformance is served.
+const DISCREPANCIES_DESCRIPTION: &str = "action=discrepancies lists recorded spec-nonconformance episodes, each with the spec statement it violates and the commit observed, beside every active spec's latest check (nonconforming, conforming, or unknown); an empty list is not proof of conformance. Pass id (an episode id) for one episode in any state with its lifecycle history; include_resolved adds closed episodes and episodes of specs no longer in force.";
+
 /// `recall` as served beside the given remember and recall surfaces.
 ///
 /// It is the [`recall_tool_for`] schema of the remember surface, widened by
@@ -279,19 +282,56 @@ const EVIDENCE_DESCRIPTION: &str = "kind=evidence searches connector evidence (g
 /// Evidence recall (ADR 0006) adds `evidence` to the `kind` enum, one
 /// sentence to the description, and a branch that limits `kind=evidence` to
 /// `search` and `get` without the chunk-only filters.
+///
+/// Spec conformance (ADR 0007) adds `discrepancies` to the `action` enum, one
+/// sentence to the description, and a branch that gives that action only
+/// `limit`, `include_resolved`, and an optional 64-hex episode `id`.
 #[must_use]
 pub fn recall_tool_for_surfaces(remember: RememberSurface, recall: RecallSurface) -> Value {
     // Naming every field keeps a new capability from compiling until this
-    // schema advertises it. Discrepancies are not advertised yet.
+    // schema advertises it.
     let RecallSurface {
         evidence,
-        discrepancies: _,
+        discrepancies,
     } = recall;
     let mut tool = recall_tool_for(remember);
     if evidence {
         add_evidence_kind(&mut tool);
     }
+    if discrepancies {
+        add_discrepancies_action(&mut tool);
+    }
     tool
+}
+
+fn add_discrepancies_action(tool: &mut Value) {
+    if let Some(description) = tool["description"].as_str() {
+        tool["description"] = json!(format!("{description} {DISCREPANCIES_DESCRIPTION}"));
+    }
+    let schema = &mut tool["inputSchema"];
+    if let Some(actions) = schema["properties"]["action"]["enum"].as_array_mut() {
+        actions.push(json!("discrepancies"));
+    }
+    if let Some(all_of) = schema["allOf"].as_array_mut() {
+        all_of.push(json!({
+            "if": {
+                "properties": { "action": { "const": "discrepancies" } },
+                "required": ["action"]
+            },
+            "then": {
+                "properties": {
+                    "query": false,
+                    "kind": false,
+                    "include_history": false,
+                    "intent": false,
+                    "source": false,
+                    "max_per_source_id": false,
+                    "min_score": false,
+                    "id": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+                }
+            }
+        }));
+    }
 }
 
 fn add_evidence_kind(tool: &mut Value) {
@@ -1019,6 +1059,104 @@ mod tests {
         // The historical shortcut applies only when nothing is added.
         assert_ne!(
             tool_list_for_surfaces(RememberSurface::RECORD_ONLY, evidence),
+            tool_list()
+        );
+    }
+
+    #[test]
+    fn discrepancies_add_one_action_and_one_branch_to_recall_only() {
+        for evidence in [false, true] {
+            let without = RecallSurface {
+                evidence,
+                ..RecallSurface::NONE
+            };
+            let with = RecallSurface {
+                discrepancies: true,
+                ..without
+            };
+            for surface in [
+                RememberSurface::RECORD_ONLY,
+                lifecycle_surface(),
+                conflict_surface(),
+                adjudication_surface(),
+                asserting(RememberSurface::RECORD_ONLY),
+            ] {
+                let listed = tool_list_for_surfaces(surface, with);
+                assert_eq!(listed.len(), 2, "{surface:?}");
+                assert_eq!(
+                    serde_json::to_vec(&listed[1]).unwrap(),
+                    serde_json::to_vec(&remember_tool_for(surface)).unwrap(),
+                    "{surface:?}"
+                );
+
+                let base = recall_tool_for_surfaces(surface, without);
+                let recall = &listed[0];
+                let schema = &recall["inputSchema"];
+                let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+                assert_eq!(actions.last(), Some(&json!("discrepancies")), "{surface:?}");
+                let description = recall["description"].as_str().unwrap();
+                assert!(
+                    description.contains("an empty list is not proof of conformance"),
+                    "{description}"
+                );
+
+                let branch = schema["allOf"].as_array().unwrap().last().unwrap();
+                assert_eq!(
+                    branch["if"]["properties"]["action"]["const"],
+                    "discrepancies"
+                );
+                assert_eq!(branch["if"]["required"], json!(["action"]));
+                let properties = schema["properties"].as_object().unwrap();
+                for forbidden in [
+                    "query",
+                    "kind",
+                    "include_history",
+                    "intent",
+                    "source",
+                    "max_per_source_id",
+                    "min_score",
+                ] {
+                    assert_eq!(
+                        branch["then"]["properties"][forbidden], false,
+                        "{forbidden}"
+                    );
+                    assert!(
+                        properties.contains_key(forbidden),
+                        "{forbidden} is declared"
+                    );
+                }
+                // `limit` and `include_resolved` are the declared properties.
+                for reused in ["limit", "include_resolved"] {
+                    assert!(branch["then"]["properties"].get(reused).is_none());
+                    assert!(properties.contains_key(reused), "{reused} is declared");
+                }
+                assert_eq!(
+                    branch["then"]["properties"]["id"]["pattern"],
+                    "^[0-9a-f]{64}$"
+                );
+
+                // Take the three additions back out and the rest is untouched.
+                let mut stripped = recall.clone();
+                stripped["description"] = base["description"].clone();
+                stripped["inputSchema"]["properties"]["action"]["enum"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+                stripped["inputSchema"]["allOf"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+                assert_eq!(stripped, base, "{surface:?}");
+            }
+        }
+        assert_ne!(
+            tool_list_for_surfaces(
+                RememberSurface::RECORD_ONLY,
+                RecallSurface {
+                    discrepancies: true,
+                    ..RecallSurface::NONE
+                }
+            ),
             tool_list()
         );
     }

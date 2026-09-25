@@ -27,6 +27,7 @@ use ostk_fleet_recall::remember_runtime::start_event_first_assert;
 use ostk_fleet_recall::service::{
     FleetRecallService, RecallAction, RecallRequest, RecallResult, RememberSurface, ServiceError,
 };
+use ostk_fleet_recall::spec_conformance::start_spec_conformance;
 use ostk_fleet_recall::store::cockroach::{
     CockroachStore, EMBEDDING_DIMENSION, PoolConfig, RetryPolicy, ScopedChunk,
     active_embedding_model, probe_conflict_lifecycle,
@@ -480,6 +481,12 @@ async fn build_memory_service(
         &config.embedding_model_sha256,
     )
     .await;
+    // recall(action=discrepancies) is served wherever migration 31 is applied
+    // and this login may read the discrepancy, normative, and spec tables
+    // (ADR 0007). It is additive in the same way: a missing grant or a
+    // failed probe turns it off with a log line and changes no tool schema.
+    let spec_conformance =
+        start_spec_conformance(store.pool(), &capabilities, &config.default_scope).await;
     let mut service = CockroachMemoryService::new(
         config.default_scope.clone(),
         store.clone(),
@@ -489,6 +496,9 @@ async fn build_memory_service(
     .with_assert_status(assert_status);
     if let Some(evidence) = evidence {
         service = service.with_evidence_recall(evidence);
+    }
+    if let Some(reader) = spec_conformance {
+        service = service.with_spec_conformance(reader);
     }
     if config.lifecycle.remember_lifecycle {
         let lifecycle = LifecycleServing {

@@ -723,6 +723,8 @@ fn compact_summary(envelope: &Value) -> String {
         ("claims", "claims"),
         ("active_claims", "active claims"),
         ("records", "records"),
+        ("discrepancies", "discrepancies"),
+        ("specs", "specs"),
     ] {
         if let Some(count) = data.get(key).and_then(Value::as_array).map(Vec::len) {
             counts.push(format!("{count} {label}"));

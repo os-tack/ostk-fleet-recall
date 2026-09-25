@@ -22,6 +22,9 @@ pub enum RecallAction {
     Synthesize,
     Status,
     Audit,
+    /// Spec-nonconformance episodes and every active spec's latest check
+    /// (ADR 0007); served only where [`RecallSurface::discrepancies`] is.
+    Discrepancies,
 }
 
 impl RecallAction {
@@ -36,6 +39,7 @@ impl RecallAction {
             Self::Synthesize => "synthesize",
             Self::Status => "status",
             Self::Audit => "audit",
+            Self::Discrepancies => "discrepancies",
         }
     }
 }
@@ -502,6 +506,16 @@ mod tests {
         assert_eq!(
             serde_json::to_value(RememberAction::Assert).unwrap(),
             Value::String("assert".into())
+        );
+    }
+
+    #[test]
+    fn discrepancies_action_wire_string_round_trips() {
+        let decoded: RecallAction = serde_json::from_str("\"discrepancies\"").unwrap();
+        assert_eq!(decoded, RecallAction::Discrepancies);
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            Value::String(decoded.as_str().into())
         );
     }
 

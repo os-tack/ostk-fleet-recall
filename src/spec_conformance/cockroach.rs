@@ -65,11 +65,6 @@ const INSERT_STATEMENT_SQL: &str = "INSERT INTO public.memory_normative_statemen
      ON CONFLICT (tenant_id, project, statement_id) DO NOTHING \
      RETURNING statement_id";
 
-const SELECT_STATEMENT_SQL: &str = "SELECT statement_id, binding_family_id, \
-     expectation_digest, canonical_proposal, canonical_expectation, created_at \
-     FROM public.memory_normative_statements_v1 \
-     WHERE tenant_id = $1 AND project = $2 AND statement_id = $3";
-
 const INSERT_CHECK_SQL: &str = "INSERT INTO public.memory_spec_checks_v1 (\
      tenant_id, project, check_id, statement_id, family_fingerprint, observer_event_id, \
      commit_oid, verdict, episode_fingerprint, canonical_check, created_at\
@@ -77,12 +72,30 @@ const INSERT_CHECK_SQL: &str = "INSERT INTO public.memory_spec_checks_v1 (\
      ON CONFLICT (tenant_id, project, check_id) DO NOTHING \
      RETURNING check_id";
 
+/// The columns [`decode_check_row`] reads.
 macro_rules! check_columns {
     () => {
         "check_id, statement_id, family_fingerprint, observer_event_id, commit_oid, \
          verdict, episode_fingerprint, canonical_check, created_at"
     };
 }
+pub(super) use check_columns;
+
+/// The columns [`decode_any_statement_row`] reads.
+macro_rules! statement_row_columns {
+    () => {
+        "statement_id, binding_family_id, expectation_digest, canonical_proposal, \
+         canonical_expectation, created_at"
+    };
+}
+pub(super) use statement_row_columns;
+
+const SELECT_STATEMENT_SQL: &str = concat!(
+    "SELECT ",
+    statement_row_columns!(),
+    " FROM public.memory_normative_statements_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND statement_id = $3"
+);
 
 const SELECT_CHECK_SQL: &str = concat!(
     "SELECT ",
@@ -93,7 +106,7 @@ const SELECT_CHECK_SQL: &str = concat!(
 
 /// The newest recorded check per statement. A replay inserts nothing, so it
 /// does not make an older check the newest again.
-const LATEST_CHECKS_SQL: &str = concat!(
+pub(super) const LATEST_CHECKS_SQL: &str = concat!(
     "SELECT DISTINCT ON (statement_id) ",
     check_columns!(),
     " FROM public.memory_spec_checks_v1 \
@@ -261,8 +274,14 @@ impl CockroachSpecRepository {
             .bind(statement_id.as_bytes().to_vec())
             .fetch_optional(&self.pool)
             .await?;
-        row.map(|row| decode_statement_row(self.trusted_scope.semantic_scope(), statement_id, &row))
-            .transpose()
+        row.map(|row| {
+            decode_statement_row(
+                Some(self.trusted_scope.semantic_scope()),
+                statement_id,
+                &row,
+            )
+        })
+        .transpose()
     }
 
     /// Record one spec check.
@@ -463,7 +482,8 @@ async fn insert_check(
             check.statement_id
         )));
     };
-    let statement = decode_statement_row(scope.semantic_scope(), check.statement_id, &statement)?;
+    let statement =
+        decode_statement_row(Some(scope.semantic_scope()), check.statement_id, &statement)?;
     require_check_matches_statement(check, &statement).map_err(|error| {
         FleetError::Memory(format!(
             "spec check does not match statement {}: {error}",
@@ -536,8 +556,17 @@ fn statement_columns(row: &PgRow) -> Result<StatementColumns> {
     })
 }
 
+/// One statement row of whatever id it holds, verified like
+/// [`CockroachSpecRepository::read_statement`] verifies one, except that its
+/// proposal's semantic scope is not compared with a bound one: a reader bound
+/// only to the physical `(tenant_id, project)` pair, as `serve` is, has none to
+/// compare it with.
+pub(super) fn decode_any_statement_row(row: &PgRow) -> Result<RecordedSpecStatementV1> {
+    decode_statement_row(None, digest_column(row, "statement_id")?, row)
+}
+
 fn decode_statement_row(
-    semantic_scope: &AuthenticatedProjectScopeV1,
+    semantic_scope: Option<&AuthenticatedProjectScopeV1>,
     requested: Sha256Digest,
     row: &PgRow,
 ) -> Result<RecordedSpecStatementV1> {
@@ -557,9 +586,10 @@ fn decode_statement_row(
     })
 }
 
-/// Every re-read check on one stored statement row, free of I/O.
+/// Every re-read check on one stored statement row, free of I/O. The
+/// proposal's scope is compared with `semantic_scope` when one is given.
 fn verify_statement_columns(
-    semantic_scope: &AuthenticatedProjectScopeV1,
+    semantic_scope: Option<&AuthenticatedProjectScopeV1>,
     requested: Sha256Digest,
     columns: &StatementColumns,
 ) -> ContractResult<(NormativeBindingProposalV2, RememberActionExpectationV1)> {
@@ -571,7 +601,7 @@ fn verify_statement_columns(
             "the stored proposal does not derive its statement id".into(),
         ));
     }
-    if &proposal.scope != semantic_scope {
+    if semantic_scope.is_some_and(|scope| &proposal.scope != scope) {
         return Err(ContractError::Schema(
             "the stored proposal belongs to another project scope".into(),
         ));
@@ -590,7 +620,7 @@ fn verify_statement_columns(
     Ok((proposal, expectation))
 }
 
-fn decode_check_row(row: &PgRow) -> Result<StoredSpecCheckV1> {
+pub(super) fn decode_check_row(row: &PgRow) -> Result<StoredSpecCheckV1> {
     let columns = CheckColumns::from_row(row)?;
     let recorded_at: DateTime<Utc> = row.try_get("created_at")?;
     let record = verify_check_columns(&columns).map_err(|error| {

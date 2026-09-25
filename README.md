@@ -37,6 +37,18 @@ The `ostk-fleet-recall` binary has these commands:
     covered, otherwise `unknown` with the reasons. `recall(status)` then adds
     an `evidence` block
     ([ADR 0006](docs/adr/0006-stage5-worker-and-evidence-recall.md)).
+  - `recall(discrepancies)` lists the `spec_nonconformance` episodes
+    `ostk-spec check` opened: by default those still open, acknowledged, or
+    waived for a spec in force, each with the statement it violates (spec
+    document, cited spans, expectation) and the commit its check observed.
+    `include_resolved` adds closed episodes and those of specs no longer in
+    force; `id` returns one episode with its lifecycle history. Every answer
+    also carries each spec's latest check (`nonconforming`, `conforming`, or
+    `unknown` with reasons), because episodes record verified nonconformance
+    only: an empty list is not proof of conformance. It is served wherever
+    migration 31 is applied and the writer login may read the discrepancy,
+    normative, and spec tables; elsewhere `tools/list` is unchanged.
+    `recall(status)` then adds a `spec_conformance` block.
   - `remember(record)` records a deliberate typed claim with provenance,
     idempotent mutation receipts, and conflict detection.
   - `remember(retract)` retires a claim the calling agent authored. When no

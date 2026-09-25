@@ -30,7 +30,7 @@ fn stored_check() -> CheckColumns {
 fn an_untouched_statement_row_verifies() {
     let columns = stored_statement();
     let (proposal, expectation) =
-        verify_statement_columns(&scope(), columns.statement_id, &columns).unwrap();
+        verify_statement_columns(Some(&scope()), columns.statement_id, &columns).unwrap();
     assert_eq!(expectation, super::super::testkit::expectation());
     assert_eq!(proposal, proposal_for(&expectation));
 }
@@ -71,10 +71,12 @@ fn a_statement_row_that_no_longer_derives_its_identity_is_refused() {
         ("non-canonical bytes", not_canonical),
         ("another row id", wrong_row_id),
     ] {
-        assert!(
-            verify_statement_columns(&scope(), columns.statement_id, &tampered).is_err(),
-            "{name} must be refused"
-        );
+        for semantic_scope in [Some(&scope()), None] {
+            assert!(
+                verify_statement_columns(semantic_scope, columns.statement_id, &tampered).is_err(),
+                "{name} must be refused"
+            );
+        }
     }
 
     let foreign_scope = AuthenticatedProjectScopeV1::from_trusted_context(
@@ -82,9 +84,12 @@ fn a_statement_row_that_no_longer_derives_its_identity_is_refused() {
         ContractId::new("project.other").unwrap(),
     );
     assert!(
-        verify_statement_columns(&foreign_scope, columns.statement_id, &columns).is_err(),
+        verify_statement_columns(Some(&foreign_scope), columns.statement_id, &columns).is_err(),
         "a statement minted for another project scope must be refused"
     );
+    // A reader bound only to the physical scope has no semantic scope to
+    // hold the row to; everything else is still checked.
+    assert!(verify_statement_columns(None, columns.statement_id, &columns).is_ok());
 }
 
 #[test]

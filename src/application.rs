@@ -24,7 +24,9 @@ use crate::ledger::{
     validate_waiver_hours,
 };
 use crate::memory_contracts::digest::Sha256Digest;
-use crate::memory_contracts::discrepancy::{DismissalReasonKindV1, WaiverReasonKindV1};
+use crate::memory_contracts::discrepancy::{
+    DiscrepancyEpisodeFingerprintV1, DismissalReasonKindV1, WaiverReasonKindV1,
+};
 use crate::projectors::EMBEDDING_DIMENSIONS;
 use crate::remember_runtime::{AssertStatusV1, RememberAssertInputV1};
 use crate::service::{
@@ -32,6 +34,7 @@ use crate::service::{
     Refusal, RememberAction, RememberRequest, RememberResult, RememberSurface, ServiceError,
     ServiceResult, authorize_surface,
 };
+use crate::spec_conformance::{SpecConformanceAnswerV1, SpecConformanceRead};
 use crate::store::cockroach::{
     CockroachStore, RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY, RetrievalHitMetadata,
     active_embedding_model,
@@ -99,6 +102,9 @@ pub struct CockroachMemoryService {
     /// `recall(kind=evidence)` over the Stage-5 tiers (ADR 0006); `None` when
     /// this instance does not serve it.
     evidence: Option<Arc<dyn EvidenceRecall>>,
+    /// `recall(action=discrepancies)` over the Stage-6 spec conformance
+    /// chain (ADR 0007); `None` when this instance does not serve it.
+    spec_conformance: Option<Arc<dyn SpecConformanceRead>>,
 }
 
 struct ChunkConflictProjection {
@@ -143,6 +149,7 @@ impl std::fmt::Debug for CockroachMemoryService {
             .field("assert_status", &self.assert_status)
             .field("withhold_asserted_claims", &self.withhold_asserted_claims)
             .field("evidence_recall", &self.evidence.is_some())
+            .field("spec_conformance", &self.spec_conformance.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -171,6 +178,7 @@ impl CockroachMemoryService {
             assert_status: None,
             withhold_asserted_claims: false,
             evidence: None,
+            spec_conformance: None,
         })
     }
 
@@ -227,6 +235,18 @@ impl CockroachMemoryService {
     #[must_use]
     pub fn with_evidence_recall(mut self, evidence: Arc<dyn EvidenceRecall>) -> Self {
         self.evidence = Some(evidence);
+        self
+    }
+
+    /// Serve `recall(action=discrepancies)` (ADR 0007) through `reader`, with
+    /// a `spec_conformance` block in `recall(status)`, both advertised in
+    /// `tools/list`. Only the private writer composition calls this, and only
+    /// where [`crate::spec_conformance::start_spec_conformance`] found the
+    /// scope's spec conformance tables readable; the publication reader never
+    /// serves it.
+    #[must_use]
+    pub fn with_spec_conformance(mut self, reader: Arc<dyn SpecConformanceRead>) -> Self {
+        self.spec_conformance = Some(reader);
         self
     }
 
@@ -951,8 +971,40 @@ impl CockroachMemoryService {
             result.data["evidence"] = block;
             result.warnings.extend(warnings);
         }
+        if let Some(reader) = self.spec_conformance.as_deref() {
+            let (block, warnings) = spec_conformance_status(reader).await;
+            result.data["spec_conformance"] = block;
+            result.warnings.extend(warnings);
+        }
         result.conflict_coverage = ConflictCoverage::not_evaluated();
         Ok(result)
+    }
+
+    /// `recall(action=discrepancies)`: the standing spec-nonconformance
+    /// episodes (or, with `include_resolved`, every episode), or one episode
+    /// by `id` with its lifecycle history, beside every live spec's latest
+    /// check. Refused before any I/O where it is not served.
+    async fn recall_discrepancies(
+        &self,
+        arguments: Map<String, Value>,
+    ) -> ServiceResult<RecallResult> {
+        let Some(reader) = self.spec_conformance.as_deref() else {
+            return Err(ServiceError::InvalidRequest(
+                "recall(discrepancies) is not served by this deployment: migration 31 or its \
+                 runtime read grants are absent"
+                    .into(),
+            ));
+        };
+        let args: DiscrepanciesArgs = from_arguments(arguments, "recall discrepancies")?;
+        let answer = if let Some(id) = args.id {
+            let episode = parse_episode_id(&id)?;
+            reader.get(episode).await
+        } else {
+            let limit = bounded_limit(args.limit)?;
+            reader.list(args.include_resolved, limit).await
+        }
+        .map_err(service_error)?;
+        discrepancies_result(&answer)
     }
 
     async fn remember_record(
@@ -1590,6 +1642,7 @@ impl FleetMemoryService for CockroachMemoryService {
             RecallAction::Get => self.recall_get(&scope, request.arguments).await,
             RecallAction::Conflicts => self.recall_conflicts(&scope, request.arguments).await,
             RecallAction::Status => self.recall_status(request.arguments).await,
+            RecallAction::Discrepancies => self.recall_discrepancies(request.arguments).await,
             action => Err(ServiceError::InvalidRequest(format!(
                 "recall({}) is not implemented yet",
                 action.as_str()
@@ -1637,7 +1690,7 @@ impl FleetMemoryService for CockroachMemoryService {
     fn recall_surface(&self) -> RecallSurface {
         RecallSurface {
             evidence: self.evidence.is_some(),
-            ..RecallSurface::NONE
+            discrepancies: self.spec_conformance.is_some(),
         }
     }
 }
@@ -2183,6 +2236,51 @@ struct ConflictArgs {
 #[serde(deny_unknown_fields)]
 struct EmptyArgs {}
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscrepanciesArgs {
+    #[serde(default)]
+    include_resolved: bool,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// One episode, in any state, with its lifecycle history.
+    #[serde(default)]
+    id: Option<String>,
+}
+
+fn parse_episode_id(id: &str) -> ServiceResult<DiscrepancyEpisodeFingerprintV1> {
+    Sha256Digest::from_str(id)
+        .map(DiscrepancyEpisodeFingerprintV1::from_digest)
+        .map_err(|_| {
+            ServiceError::InvalidRequest(
+                "recall discrepancies: id must be a 64-character lowercase hex episode id".into(),
+            )
+        })
+}
+
+/// The `recall(discrepancies)` result: `data.discrepancies`, `data.specs`,
+/// and `data.coverage`, with the read's warnings. Discrepancies are not
+/// conflicts, so the conflict fields stay empty and not evaluated.
+fn discrepancies_result(answer: &SpecConformanceAnswerV1) -> ServiceResult<RecallResult> {
+    let serialized = |value: serde_json::Result<Value>| {
+        value.map_err(|error| {
+            ServiceError::Internal(format!("failed to serialize recall discrepancies: {error}"))
+        })
+    };
+    let mut result = RecallResult::new(json!({
+        "discrepancies": serialized(serde_json::to_value(&answer.discrepancies))?,
+        "specs": serialized(serde_json::to_value(&answer.specs))?,
+        "coverage": serialized(serde_json::to_value(&answer.coverage))?,
+    }));
+    result.warnings = answer
+        .warnings
+        .iter()
+        .map(|warning| json!(warning))
+        .collect();
+    result.conflict_coverage = ConflictCoverage::not_evaluated();
+    Ok(result)
+}
+
 fn from_arguments<T: for<'de> Deserialize<'de>>(
     arguments: Map<String, Value>,
     operation: &str,
@@ -2334,6 +2432,62 @@ fn evidence_search_result(search: EvidenceSearchV1) -> RecallResult {
 /// read degrades to the `evidence_status_unavailable` warning instead of
 /// failing the whole status call.
 const EVIDENCE_STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long `recall(status)` waits for its spec conformance block, for the
+/// same reason as [`EVIDENCE_STATUS_DEADLINE`].
+const SPEC_CONFORMANCE_STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `recall(status).spec_conformance` and the warnings it adds. A failed or
+/// slow read is a warning, never a failed status.
+async fn spec_conformance_status(reader: &dyn SpecConformanceRead) -> (Value, Vec<Value>) {
+    spec_conformance_status_within(reader, SPEC_CONFORMANCE_STATUS_DEADLINE).await
+}
+
+async fn spec_conformance_status_within(
+    reader: &dyn SpecConformanceRead,
+    deadline: std::time::Duration,
+) -> (Value, Vec<Value>) {
+    let status = tokio::time::timeout(deadline, reader.status())
+        .await
+        .unwrap_or_else(|_| {
+            Err(FleetError::Memory(format!(
+                "the spec conformance status read did not finish within {}s",
+                deadline.as_secs_f32()
+            )))
+        });
+    match status {
+        Ok(status) => (
+            json!({
+                "served": true,
+                "active_specs": status.active_specs,
+                "open_discrepancies": status.open_discrepancies,
+                "unknown_specs": status.unknown_specs,
+                "never_checked_specs": status.never_checked_specs,
+            }),
+            status
+                .warnings
+                .iter()
+                .map(|warning| json!(warning))
+                .collect(),
+        ),
+        Err(error) => {
+            tracing::warn!(error = %error, "spec conformance status read failed");
+            (
+                json!({
+                    "served": true,
+                    "active_specs": null,
+                    "open_discrepancies": null,
+                    "unknown_specs": null,
+                    "never_checked_specs": null,
+                }),
+                vec![json!({
+                    "code": "spec_conformance_status_unavailable",
+                    "message": "the spec conformance counts could not be read; recall(discrepancies) is still served"
+                })],
+            )
+        }
+    }
+}
 
 /// `recall(status).evidence` and the warnings it adds. A failed or slow read
 /// is a warning, never a failed status.
@@ -4693,5 +4847,235 @@ mod tests {
         let mut infinite = unit;
         infinite[3] = f32::INFINITY;
         assert!(!dense_query_vector_usable(&infinite));
+    }
+
+    /// A [`SpecConformanceRead`] that answers from a fixture and records
+    /// every call, or fails every call.
+    #[derive(Default)]
+    struct FakeSpecConformance {
+        fail: bool,
+        /// How long `status` takes before it answers.
+        status_delay: Option<std::time::Duration>,
+        /// Each listing's `include_resolved` and limit.
+        lists: std::sync::Mutex<Vec<(bool, usize)>>,
+        gets: std::sync::Mutex<Vec<DiscrepancyEpisodeFingerprintV1>>,
+    }
+
+    impl FakeSpecConformance {
+        fn failing() -> Self {
+            Self {
+                fail: true,
+                ..Self::default()
+            }
+        }
+
+        fn outcome<T>(&self, value: T) -> crate::Result<T> {
+            if self.fail {
+                Err(FleetError::Memory("spec tables unreadable".into()))
+            } else {
+                Ok(value)
+            }
+        }
+
+        fn contested() -> Vec<crate::spec_conformance::SpecConformanceWarningV1> {
+            vec![crate::spec_conformance::SpecConformanceWarningV1 {
+                code: "spec_family_contested",
+                message: "binding family spec.remember.forget is contested".into(),
+            }]
+        }
+    }
+
+    #[async_trait]
+    impl SpecConformanceRead for FakeSpecConformance {
+        async fn list(
+            &self,
+            include_resolved: bool,
+            limit: usize,
+        ) -> crate::Result<SpecConformanceAnswerV1> {
+            self.lists.lock().unwrap().push((include_resolved, limit));
+            self.outcome(SpecConformanceAnswerV1 {
+                discrepancies: Vec::new(),
+                specs: Vec::new(),
+                coverage: crate::spec_conformance::SpecCoverageV1 {
+                    episodes_returned: 0,
+                    episodes_truncated: false,
+                    active_specs: 1,
+                    never_checked_specs: 1,
+                    unknown_specs: 0,
+                    specs_truncated: false,
+                    note: crate::spec_conformance::SPEC_CONFORMANCE_NOTE,
+                },
+                warnings: Self::contested(),
+            })
+        }
+
+        async fn get(
+            &self,
+            episode: DiscrepancyEpisodeFingerprintV1,
+        ) -> crate::Result<SpecConformanceAnswerV1> {
+            self.gets.lock().unwrap().push(episode);
+            self.list(true, 1).await
+        }
+
+        async fn status(&self) -> crate::Result<crate::spec_conformance::SpecConformanceStatusV1> {
+            if let Some(delay) = self.status_delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.outcome(crate::spec_conformance::SpecConformanceStatusV1 {
+                active_specs: 2,
+                open_discrepancies: 1,
+                unknown_specs: 1,
+                never_checked_specs: 0,
+                warnings: Self::contested(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn unserved_discrepancies_are_refused_before_io() {
+        for surface in [RememberSurface::RECORD_ONLY, CONFLICT_LIFECYCLE] {
+            let service = offline_service(surface);
+            assert!(!FleetMemoryService::recall_surface(&service).discrepancies);
+            // The offline pool fails every read, so an invalid request, even
+            // for arguments the action would refuse, proves nothing was read.
+            for arguments in [json!({}), json!({ "query": "forget" })] {
+                let error = FleetMemoryService::recall(
+                    &service,
+                    offline_scope(),
+                    recall_request(RecallAction::Discrepancies, &arguments),
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    matches!(&error, ServiceError::InvalidRequest(message) if message.contains("not served")),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn discrepancies_answer_from_the_reader_alone() {
+        let reader = Arc::new(FakeSpecConformance::default());
+        let service = offline_service(CONFLICT_LIFECYCLE)
+            .with_spec_conformance(reader.clone() as Arc<dyn SpecConformanceRead>);
+        assert_eq!(
+            FleetMemoryService::recall_surface(&service),
+            RecallSurface {
+                discrepancies: true,
+                ..RecallSurface::NONE
+            }
+        );
+        let recall = |arguments: Value| {
+            FleetMemoryService::recall(
+                &service,
+                offline_scope(),
+                recall_request(RecallAction::Discrepancies, &arguments),
+            )
+        };
+
+        // The offline pool fails every read, so an answer proves the action
+        // read nothing but the reader.
+        let listed = recall(json!({})).await.unwrap();
+        assert_eq!(listed.data["discrepancies"], json!([]));
+        assert_eq!(listed.data["specs"], json!([]));
+        assert_eq!(listed.data["coverage"]["never_checked_specs"], 1);
+        assert!(
+            listed.data["coverage"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("No episode does not mean the code conforms")
+        );
+        assert_eq!(warning_codes(&listed.warnings), ["spec_family_contested"]);
+        assert!(listed.conflicts.is_empty());
+        assert_eq!(listed.conflict_coverage, ConflictCoverage::not_evaluated());
+        recall(json!({ "include_resolved": true, "limit": 100 }))
+            .await
+            .unwrap();
+        assert_eq!(*reader.lists.lock().unwrap(), [(false, 10), (true, 100)]);
+
+        let episode = "ab".repeat(32);
+        recall(json!({ "id": episode, "include_resolved": true }))
+            .await
+            .unwrap();
+        assert_eq!(
+            *reader.gets.lock().unwrap(),
+            [DiscrepancyEpisodeFingerprintV1::from_digest(
+                Sha256Digest::from_bytes([0xab; 32])
+            )]
+        );
+
+        for arguments in [
+            json!({ "id": "AB".repeat(32) }),
+            json!({ "id": "ab".repeat(31) }),
+            json!({ "id": 42 }),
+            json!({ "limit": 0 }),
+            json!({ "limit": 101 }),
+            json!({ "query": "forget" }),
+            json!({ "kind": "claim" }),
+        ] {
+            let error = recall(arguments.clone()).await.unwrap_err();
+            assert!(
+                matches!(error, ServiceError::InvalidRequest(_)),
+                "{arguments}: {error}"
+            );
+        }
+        assert_eq!(reader.lists.lock().unwrap().len(), 3);
+
+        let failing =
+            offline_service(RememberSurface::RECORD_ONLY)
+                .with_spec_conformance(
+                    Arc::new(FakeSpecConformance::failing()) as Arc<dyn SpecConformanceRead>
+                );
+        let error = FleetMemoryService::recall(
+            &failing,
+            offline_scope(),
+            recall_request(RecallAction::Discrepancies, &json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServiceError::Internal(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn spec_conformance_status_reports_or_warns_but_never_fails() {
+        let (block, warnings) = spec_conformance_status(&FakeSpecConformance::default()).await;
+        assert_eq!(
+            block,
+            json!({
+                "served": true,
+                "active_specs": 2,
+                "open_discrepancies": 1,
+                "unknown_specs": 1,
+                "never_checked_specs": 0,
+            })
+        );
+        assert_eq!(warning_codes(&warnings), ["spec_family_contested"]);
+
+        let unavailable = json!({
+            "served": true,
+            "active_specs": null,
+            "open_discrepancies": null,
+            "unknown_specs": null,
+            "never_checked_specs": null,
+        });
+        let (block, warnings) = spec_conformance_status(&FakeSpecConformance::failing()).await;
+        assert_eq!(block, unavailable);
+        assert_eq!(
+            warning_codes(&warnings),
+            ["spec_conformance_status_unavailable"]
+        );
+
+        let slow = FakeSpecConformance {
+            status_delay: Some(std::time::Duration::from_secs(600)),
+            ..FakeSpecConformance::default()
+        };
+        let (block, warnings) =
+            spec_conformance_status_within(&slow, std::time::Duration::from_millis(20)).await;
+        assert_eq!(block, unavailable);
+        assert_eq!(
+            warning_codes(&warnings),
+            ["spec_conformance_status_unavailable"]
+        );
     }
 }

@@ -39,6 +39,12 @@
 //! * [`registry`] — the compiled-in comparator lineage and episode policy
 //!   spec episodes are judged and grouped under. They are not
 //!   package-admitted (a DISC-06 deferral) and never change in place.
+//! * [`read`] — [`CockroachSpecConformanceReader`], the SELECT-only read
+//!   behind `recall(action="discrepancies")` and `recall(status)`'s
+//!   `spec_conformance` block: the standing episodes of live specs (or every
+//!   episode), each with the statement it violates and what its opening check
+//!   observed, beside every live spec's latest check, so an agent can tell
+//!   `unknown` and "never checked" from conforming.
 //!
 //! Nothing here grants authority. A statement is normative only once the
 //! normative runtime has activated it under verified approvals; recording its
@@ -53,6 +59,7 @@ pub mod draft;
 pub mod envelope;
 pub mod expectation;
 pub mod providers;
+pub mod read;
 pub mod record;
 pub mod registry;
 
@@ -91,6 +98,13 @@ pub use expectation::{
 pub use providers::{
     NormativeStatementSide, OPEN_ENDED_AT, ObservedMembershipSide, compare_spec_sides,
     compared_window, spec_verdict,
+};
+pub use read::{
+    CockroachSpecConformanceReader, MAX_DISCREPANCY_RESULTS, MAX_EPISODE_HISTORY, MAX_LISTED_SPECS,
+    SPEC_CONFORMANCE_NOTE, SpecConformanceAnswerV1, SpecConformanceRead, SpecConformanceStatusV1,
+    SpecConformanceWarningV1, SpecCoverageV1, SpecDiscrepancyV1, SpecEpisodeEventV1,
+    SpecEvidenceV1, SpecExpectationViewV1, SpecLastCheckV1, SpecObservationV1, SpecStatementViewV1,
+    SpecSummaryV1, start_spec_conformance,
 };
 pub use record::{
     MAX_SPEC_CHECK_REASONS, SPEC_CHECK_RECORD_SCHEMA_VERSION, SpecCheckRecordV1, SpecVerdictV1,

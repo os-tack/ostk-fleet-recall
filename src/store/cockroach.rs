@@ -1006,6 +1006,56 @@ pub async fn probe_conflict_lifecycle(
     outcome
 }
 
+/// Proof that this role may read every table `recall(action="discrepancies")`
+/// reads.
+///
+/// Those are the migration-27 discrepancy ledger, the migration-24 normative
+/// projections, and migration 31's spec statements and checks. Only
+/// [`probe_spec_conformance`] mints it (ADR 0007), so `serve` builds its spec
+/// conformance reader only after the startup probe succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecConformanceReadCapability(());
+
+/// Privileges are checked when the statement is planned, so this reads
+/// nothing, and it runs inside a transaction that is rolled back. It names
+/// only the tables the reader selects from; it asks for no write.
+const SPEC_CONFORMANCE_PRIVILEGE_PROBE_SQL: &str = "SELECT 1 FROM \
+     public.memory_discrepancy_projections_v1, public.memory_discrepancy_heads_v1, \
+     public.memory_discrepancy_log_v1, public.memory_normative_projections_v1, \
+     public.memory_normative_statements_v1, public.memory_spec_checks_v1 WHERE false";
+
+/// Whether this deployment may serve `recall(action="discrepancies")`.
+///
+/// It may when the schema has reached migration 31 and the connected role may
+/// SELECT every table the spec conformance reader reads. `None` means the
+/// action is not served (an older schema, or a runtime policy applied before
+/// migration 31); any other failure is an error. The probe runs once at
+/// startup, so a grant change needs a restart.
+pub async fn probe_spec_conformance(
+    pool: &PgPool,
+    capabilities: &DatabaseCapabilities,
+) -> Result<Option<SpecConformanceReadCapability>> {
+    if !capabilities.supports_schema_version(SPEC_CONFORMANCE_SCHEMA_VERSION) {
+        return Ok(None);
+    }
+    let mut transaction = pool.begin().await?;
+    let probe = sqlx::query(SPEC_CONFORMANCE_PRIVILEGE_PROBE_SQL)
+        .execute(&mut *transaction)
+        .await;
+    let outcome = match probe {
+        Ok(_) => Ok(Some(SpecConformanceReadCapability(()))),
+        Err(sqlx::Error::Database(error))
+            if error.code().as_deref() == Some(INSUFFICIENT_PRIVILEGE_SQLSTATE) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    };
+    // The probe read nothing; roll back regardless of its outcome.
+    transaction.rollback().await?;
+    outcome
+}
+
 /// The model coordinate registered for this trusted corpus, if ingestion has
 /// initialized it. A configured service must not query with a different model.
 pub async fn active_embedding_model(pool: &PgPool, scope: &FleetScope) -> Result<Option<String>> {

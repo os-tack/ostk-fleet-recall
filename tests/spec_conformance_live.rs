@@ -26,20 +26,40 @@
 //! activates under the witnessed head, reads back, and activates again as
 //! `already_active` with nothing appended; and a proposal drafted under
 //! another head activates nothing.
+//!
+//! And it proves `recall(action="discrepancies")`'s read over seeded spec,
+//! normative, and discrepancy rows: by default only the standing episodes of
+//! specs in force, each with the statement it violates and the commit its
+//! opening check observed, beside every spec's latest check, `unknown`
+//! included; `include_resolved` adds closed episodes and episodes of specs
+//! not in force; an episode looked up by id carries its lifecycle history;
+//! another project sees none of it; and the action is served, with
+//! `recall(status)`'s block, exactly when the login may SELECT every table it
+//! reads, while an unserved deployment keeps its tools and status as they
+//! were.
 
 mod common;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use common::authority::{install_generation_two, retry_policy, semantic_scope};
 use common::runtime_role::RuntimeProbeRole;
-use common::worker::{FIRST_COMMIT_DATE, INSTALLATION_ID, SECOND_COMMIT_DATE, ScratchRepository};
+use common::worker::{
+    FIRST_COMMIT_DATE, INSTALLATION_ID, SECOND_COMMIT_DATE, ScratchRepository, StubEmbedder,
+};
 use futures::FutureExt as _;
 use ostk_fleet_recall::connectors::git::GitObjectId;
-use ostk_fleet_recall::discrepancy_runtime::ComparisonIndeterminacyV1;
+use ostk_fleet_recall::discrepancy_runtime::{
+    CockroachDiscrepancyLedgerRepository, ComparisonIndeterminacyV1, ComparisonVerdictV1,
+    DiscrepancyLedgerRepository as _, DiscrepancyRegistryBindingV1,
+};
+use ostk_fleet_recall::ledger::CockroachClaimLedger;
+use ostk_fleet_recall::mcp::{tool_list, tool_list_for_surfaces};
 use ostk_fleet_recall::memory_contracts::ContractError;
 use ostk_fleet_recall::memory_contracts::canonical::CanonicalValue;
 use ostk_fleet_recall::memory_contracts::common::{
@@ -50,30 +70,44 @@ use ostk_fleet_recall::memory_contracts::digest::{
     DigestDomain, Sha256Digest, domain_separated_digest,
 };
 use ostk_fleet_recall::memory_contracts::discrepancy::{
-    DiscrepancyEpisodeFingerprintV1, DiscrepancyFamilyFingerprintV1, DiscrepancySeverityV1,
+    DiscrepancyActorV1, DiscrepancyEnvelopeV1, DiscrepancyEpisodeFingerprintV1,
+    DiscrepancyFamilyFingerprintV1, DiscrepancyLifecycleEventV1, DiscrepancySeverityV1,
+    LifecycleState, LifecycleTransitionV1,
 };
-use ostk_fleet_recall::memory_contracts::evidence::AcceptedEventId;
+use ostk_fleet_recall::memory_contracts::evidence::{AcceptedEventId, SourceFactId};
 use ostk_fleet_recall::memory_contracts::evidence_v2::RegistryHeadBindingV1;
 use ostk_fleet_recall::memory_contracts::identity::ResourceUri;
 use ostk_fleet_recall::memory_contracts::normative::{NormativePropositionV1, SourceByteSpanV1};
 use ostk_fleet_recall::memory_contracts::normative_v2::{
-    ApprovalAttestationV1, NormativeBindingProposalV2,
+    ApprovalAttestationV1, NormativeActivationReceiptV2, NormativeActivationSeparationOfDutyV2,
+    NormativeBindingProposalV2,
 };
 use ostk_fleet_recall::memory_contracts::observer::{EvaluatedConditionV1, VerificationOutcomeV1};
-use ostk_fleet_recall::memory_contracts::registry::RegistryHeadV1;
+use ostk_fleet_recall::memory_contracts::registry::{EligibleApprovalV1, RegistryHeadV1};
 use ostk_fleet_recall::normative_runtime::{
-    NormativeActivationRepository as _, NormativeResolutionV1, sign_normative_approval,
+    CockroachNormativeActivationRepository, NormativeActivationCandidateV1,
+    NormativeActivationOutcomeV1, NormativeActivationRepository as _, NormativeRegistryBindingV1,
+    NormativeResolutionV1, sign_normative_approval,
 };
 use ostk_fleet_recall::registry_witness::WriterAuthorityRuntime;
+use ostk_fleet_recall::service::{
+    FleetMemoryService, RecallAction, RecallRequest, RecallResult, ServiceError,
+};
 use ostk_fleet_recall::spec_conformance::{
     CockroachSpecRepository, DraftStatementRequestV1, ExpectedMembershipV1,
-    RememberActionExpectationV1, SpecActivationOutcomeV1, SpecCheckRecordV1, SpecRowWriteV1,
-    SpecVerdictV1, activate_spec_statement, database_now, draft_spec_statement,
-    normative_repository, repository_selector, repository_subject, require_spec_statement,
-    spec_predicate, spec_repository as runtime_spec_repository, spec_span_digest,
+    RememberActionExpectationV1, SpecActivationOutcomeV1, SpecCheckRecordV1,
+    SpecConformanceAnswerV1, SpecConformanceRead, SpecDetectionV1, SpecRowWriteV1, SpecSummaryV1,
+    SpecVerdictV1, activate_spec_statement, build_spec_envelope, database_now,
+    draft_spec_statement, normative_repository, repository_selector, repository_subject,
+    require_spec_statement, spec_predicate, spec_repository as runtime_spec_repository,
+    spec_span_digest, start_spec_conformance,
 };
-use ostk_fleet_recall::{FleetError, FleetScope, TrustedControlScope};
-use ostk_recall_core::PrivacyTier;
+use ostk_fleet_recall::store::cockroach::{
+    CockroachStore, DatabaseCapabilities, SPEC_CONFORMANCE_SCHEMA_VERSION, probe_spec_conformance,
+};
+use ostk_fleet_recall::{CockroachMemoryService, FleetError, FleetScope, TrustedControlScope};
+use ostk_recall_core::{ChunkEmbedder, PrivacyTier};
+use serde_json::{Map, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -1032,4 +1066,584 @@ async fn live_a_draft_binds_the_spec_span_and_the_repository_subject_when_config
         refuses_drafts_it_cannot_bind(&runtime, &request).await;
     })
     .await;
+}
+
+// --- recall(action="discrepancies") ---
+
+/// One scope's spec store, normative runtime, and discrepancy ledger, the
+/// last two bound to the labelled registry head `proposal_for` names.
+struct SpecPlane {
+    specs: CockroachSpecRepository,
+    normative: CockroachNormativeActivationRepository,
+    ledger: CockroachDiscrepancyLedgerRepository,
+}
+
+/// A statement "`Action` in `src/service.rs` must (not) declare `member`",
+/// recorded as a spec.
+struct SeededSpec {
+    proposal: NormativeBindingProposalV2,
+    expectation: RememberActionExpectationV1,
+    statement_id: Sha256Digest,
+}
+
+impl SpecPlane {
+    fn new(pool: &PgPool, scope: &FleetScope) -> Self {
+        let trusted = TrustedControlScope::from_trusted_context(scope, semantic_scope()).unwrap();
+        Self {
+            specs: spec_repository(pool, scope),
+            normative: CockroachNormativeActivationRepository::new(
+                pool.clone(),
+                trusted.clone(),
+                NormativeRegistryBindingV1 {
+                    registry_package_digest: label("package"),
+                    activation_policy_digest: label("policy"),
+                },
+                retry_policy(),
+            )
+            .unwrap(),
+            ledger: CockroachDiscrepancyLedgerRepository::new(
+                pool.clone(),
+                trusted,
+                DiscrepancyRegistryBindingV1 {
+                    registry_package_digest: label("package"),
+                    activation_policy_digest: label("policy"),
+                },
+                retry_policy(),
+            )
+            .unwrap(),
+        }
+    }
+
+    /// Record `member`'s statement as a spec, and make it normative when
+    /// `live`.
+    async fn statement(
+        &self,
+        member: &str,
+        expected: ExpectedMembershipV1,
+        live: bool,
+    ) -> SeededSpec {
+        let expectation = expectation(member, expected);
+        let proposal = proposal_for(&expectation, semantic_scope());
+        let statement_id = self
+            .specs
+            .record_statement(&proposal, &expectation)
+            .await
+            .unwrap()
+            .statement_id;
+        if live {
+            let outcome = self
+                .normative
+                .activate(&NormativeActivationCandidateV1 {
+                    receipt: receipt_for(&proposal),
+                    proposal: proposal.clone(),
+                    retroactive_correction: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, NormativeActivationOutcomeV1::Installed(_)),
+                "{outcome:?}"
+            );
+        }
+        SeededSpec {
+            proposal,
+            expectation,
+            statement_id,
+        }
+    }
+
+    /// A verified nonconformance of `spec` at `commit`, compared at `at`: its
+    /// episode opened and its check recorded, as `ostk-spec check` leaves
+    /// them.
+    async fn nonconformance(
+        &self,
+        spec: &SeededSpec,
+        commit: &GitObjectId,
+        at: &str,
+    ) -> DiscrepancyEnvelopeV1 {
+        let name = format!("{} {}", spec.expectation.member, commit.to_hex());
+        let observer = AcceptedEventId::from_digest(label(&format!("observer {name}")));
+        let blob = AcceptedEventId::from_digest(label(&format!("blob {name}")));
+        let compared_at = timestamp(at);
+        let candidate = build_spec_envelope(&SpecDetectionV1 {
+            registry: &spec.proposal.registry_head,
+            statement_id: spec.statement_id,
+            proposal: &spec.proposal,
+            expectation: &spec.expectation,
+            extractor: &reference("observer.rust_enum"),
+            observer_event: observer,
+            blob_event: blob,
+            source_fact_id: SourceFactId::from_digest(label(&format!("source fact {name}"))),
+            compared_at: &compared_at,
+            verdict: &ComparisonVerdictV1::Discrepant,
+        })
+        .unwrap();
+        self.ledger.admit_envelope(&candidate).await.unwrap();
+        let envelope = candidate.envelope;
+        self.specs
+            .record_check(&SpecCheckRecordV1 {
+                binding_family_id: spec.proposal.binding_family_id.clone(),
+                family_fingerprint: envelope.family_fingerprint,
+                observer_event_id: observer,
+                blob_event_id: blob,
+                member: spec.expectation.member.clone(),
+                episode: Some(envelope.episode_fingerprint),
+                compared_at,
+                ..nonconforming(spec.statement_id, commit)
+            })
+            .await
+            .unwrap();
+        envelope
+    }
+
+    /// A check of `spec` at `commit` the observer could not settle.
+    async fn unknown_check(&self, spec: &SeededSpec, commit: &GitObjectId) {
+        self.specs
+            .record_check(&SpecCheckRecordV1 {
+                binding_family_id: spec.proposal.binding_family_id.clone(),
+                member: spec.expectation.member.clone(),
+                expected: spec.expectation.expected,
+                ..unknown(spec.statement_id, commit)
+            })
+            .await
+            .unwrap();
+    }
+
+    /// An operator acknowledging, then resolving, `envelope`'s episode.
+    async fn close(
+        &self,
+        envelope: &DiscrepancyEnvelopeV1,
+        acknowledged_at: &str,
+        resolved_at: &str,
+    ) {
+        let actor = DiscrepancyActorV1 {
+            principal_id: id("principal.on_call"),
+        };
+        let evidence = envelope.member_evidence_ids.clone();
+        for (at, transition) in [
+            (
+                acknowledged_at,
+                LifecycleTransitionV1::Acknowledge {
+                    actor: actor.clone(),
+                },
+            ),
+            (
+                resolved_at,
+                LifecycleTransitionV1::Resolve {
+                    actor: actor.clone(),
+                    resolution_evidence_ids: evidence.clone(),
+                },
+            ),
+        ] {
+            self.ledger
+                .append_lifecycle_event(&DiscrepancyLifecycleEventV1 {
+                    schema_version: 1,
+                    event_kind: id("discrepancy.lifecycle.accepted"),
+                    profile: envelope.profile.clone(),
+                    scope: envelope.scope.clone(),
+                    episode_fingerprint: envelope.episode_fingerprint,
+                    effective_at: timestamp(at),
+                    verification_update: None,
+                    lifecycle_transition: Some(transition),
+                    evidence_event_ids: evidence.clone(),
+                })
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// Two approvers independent of the author and the proposer ratified
+/// `proposal` before it takes effect.
+fn receipt_for(proposal: &NormativeBindingProposalV2) -> NormativeActivationReceiptV2 {
+    let mut eligible_approvals: Vec<EligibleApprovalV1> = APPROVERS
+        .iter()
+        .map(|(principal, _)| EligibleApprovalV1 {
+            attestation_id: label(&format!("attestation {principal}")),
+            principal_id: id(principal),
+            signer_key_id: id(&format!("key.{principal}")),
+        })
+        .collect();
+    eligible_approvals.sort();
+    NormativeActivationReceiptV2 {
+        schema_version: 2,
+        statement_id: proposal.statement_id().unwrap(),
+        source_author_principal_id: proposal.source_author_principal_id.clone(),
+        eligible_approvals,
+        required_threshold: 2,
+        separation_of_duty:
+            NormativeActivationSeparationOfDutyV2::IndependentApprovalFromSourceAuthor,
+        separation_of_duty_satisfied: true,
+        accepted_at: timestamp("2026-08-31T00:00:00.000000000Z"),
+    }
+}
+
+async fn capabilities_of(pool: &PgPool, scope: &FleetScope) -> DatabaseCapabilities {
+    CockroachStore::from_pool(pool.clone(), scope.clone())
+        .unwrap()
+        .capabilities()
+        .await
+        .unwrap()
+}
+
+/// The reader `serve` would build for `scope` over `pool`.
+async fn spec_reader(pool: &PgPool, scope: &FleetScope) -> Arc<dyn SpecConformanceRead> {
+    let capabilities = capabilities_of(pool, scope).await;
+    start_spec_conformance(pool, &capabilities, scope)
+        .await
+        .expect("the schema owner may read every spec conformance table")
+}
+
+fn episode_ids(answer: &SpecConformanceAnswerV1) -> Vec<DiscrepancyEpisodeFingerprintV1> {
+    answer
+        .discrepancies
+        .iter()
+        .map(|discrepancy| discrepancy.episode_id)
+        .collect()
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one seeded scope read every way an agent can
+async fn live_recall_discrepancies_reports_episodes_specs_and_unknowns_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let scope = common::fresh_scope("spec-recall");
+    let plane = SpecPlane::new(&pool, &scope);
+    // "Forget must be absent" and "Record must be present" are normative;
+    // "Delete must be absent" was recorded but never activated.
+    let forget = plane
+        .statement("Forget", ExpectedMembershipV1::Absent, true)
+        .await;
+    let record = plane
+        .statement("Record", ExpectedMembershipV1::Present, true)
+        .await;
+    let delete = plane
+        .statement("Delete", ExpectedMembershipV1::Absent, false)
+        .await;
+    // Forget was found at c1 and an operator closed that episode; it was
+    // found again at c2, and that episode stands. Delete's episode stands,
+    // but Delete is not in force. Record could not be judged at c2.
+    let (c1, c2) = (commit("c1"), commit("c2"));
+    let closed = plane
+        .nonconformance(&forget, &c1, "2026-09-02T00:00:00.000000000Z")
+        .await;
+    plane
+        .close(
+            &closed,
+            "2026-09-03T00:00:00.000000000Z",
+            "2026-09-03T12:00:00.000000000Z",
+        )
+        .await;
+    let not_live = plane
+        .nonconformance(&delete, &c1, "2026-09-04T00:00:00.000000000Z")
+        .await;
+    let standing = plane
+        .nonconformance(&forget, &c2, "2026-09-05T00:00:00.000000000Z")
+        .await;
+    plane.unknown_check(&record, &c2).await;
+    let reader = spec_reader(&pool, &scope).await;
+
+    // By default: the standing episode of a spec in force, with what it
+    // violates and what was observed, beside every spec's latest check.
+    let listed = reader.list(false, 10).await.unwrap();
+    assert!(listed.warnings.is_empty(), "{:?}", listed.warnings);
+    assert_eq!(episode_ids(&listed), [standing.episode_fingerprint]);
+    let episode = &listed.discrepancies[0];
+    assert_eq!(episode.finding_type, "spec_nonconformance");
+    assert_eq!(episode.lifecycle_state, LifecycleState::Open);
+    assert!(episode.spec_live);
+    assert_eq!(episode.subject, forget.proposal.repository_entity_id);
+    let spec = episode.spec.as_ref().expect("the episode names its spec");
+    assert_eq!(spec.statement_id, forget.statement_id);
+    assert_eq!(spec.spec_path, "docs/spec.md");
+    assert_eq!(spec.spans, forget.proposal.source_spans);
+    assert_eq!(
+        (spec.expectation.member.as_str(), spec.expectation.expected),
+        ("Forget", ExpectedMembershipV1::Absent)
+    );
+    let observed = episode.observed.as_ref().expect("its opening check");
+    assert_eq!(observed.commit, c2);
+    assert_eq!(observed.condition, EvaluatedConditionV1::Present);
+    assert_eq!(
+        observed.verification_outcome,
+        VerificationOutcomeV1::VerifiedPositive
+    );
+    assert_eq!(episode.evidence.member, standing.member_evidence_ids);
+    assert!(episode.history.is_none());
+
+    let specs: BTreeMap<Sha256Digest, &SpecSummaryV1> = listed
+        .specs
+        .iter()
+        .map(|spec| (spec.statement_id, spec))
+        .collect();
+    assert_eq!(
+        specs.keys().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([forget.statement_id, record.statement_id]),
+        "a statement never made normative is not a spec"
+    );
+    let forget_check = specs[&forget.statement_id]
+        .last_check
+        .as_ref()
+        .expect("Forget was checked");
+    assert_eq!(forget_check.verdict, SpecVerdictV1::Nonconforming);
+    assert_eq!(forget_check.commit, c2);
+    assert_eq!(forget_check.episode_id, Some(standing.episode_fingerprint));
+    let record_check = specs[&record.statement_id]
+        .last_check
+        .as_ref()
+        .expect("Record was checked");
+    assert_eq!(record_check.verdict, SpecVerdictV1::Unknown);
+    assert!(!record_check.reasons.is_empty());
+    assert_eq!(specs[&record.statement_id].resolution, "active");
+    assert_eq!(listed.coverage.unknown_specs, 1);
+    assert_eq!(listed.coverage.never_checked_specs, 0);
+    assert!(!listed.coverage.episodes_truncated);
+
+    // include_resolved adds the closed episode and the one whose spec is not
+    // in force, most recently changed first.
+    let everything = reader.list(true, 10).await.unwrap();
+    assert_eq!(
+        episode_ids(&everything),
+        [
+            standing.episode_fingerprint,
+            not_live.episode_fingerprint,
+            closed.episode_fingerprint
+        ]
+    );
+    assert_eq!(
+        everything.discrepancies[2].lifecycle_state,
+        LifecycleState::Resolved
+    );
+    let hidden = &everything.discrepancies[1];
+    assert_eq!(hidden.lifecycle_state, LifecycleState::Open);
+    assert!(!hidden.spec_live);
+    assert_eq!(
+        hidden.spec.as_ref().map(|spec| spec.statement_id),
+        Some(delete.statement_id)
+    );
+    let first = reader.list(true, 1).await.unwrap();
+    assert_eq!(episode_ids(&first), [standing.episode_fingerprint]);
+    assert!(first.coverage.episodes_truncated);
+
+    // One episode by id, in any state, with its lifecycle history.
+    let looked_up = reader.get(closed.episode_fingerprint).await.unwrap();
+    let [episode] = looked_up.discrepancies.as_slice() else {
+        panic!("one episode by id: {looked_up:?}");
+    };
+    assert_eq!(episode.lifecycle_state, LifecycleState::Resolved);
+    assert_eq!(
+        episode.observed.as_ref().map(|seen| &seen.commit),
+        Some(&c1)
+    );
+    let history = episode.history.as_ref().expect("a lookup carries history");
+    assert!(
+        matches!(
+            history
+                .iter()
+                .map(|event| event.lifecycle_transition.clone())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [
+                Some(LifecycleTransitionV1::Acknowledge { .. }),
+                Some(LifecycleTransitionV1::Resolve { .. })
+            ]
+        ),
+        "{history:?}"
+    );
+    assert_eq!(episode.history_truncated, Some(false));
+    assert!(
+        reader
+            .get(DiscrepancyEpisodeFingerprintV1::from_digest(label(
+                "no such episode"
+            )))
+            .await
+            .unwrap()
+            .discrepancies
+            .is_empty()
+    );
+
+    // The status counts only the standing episode of a spec in force.
+    let status = reader.status().await.unwrap();
+    assert_eq!(
+        (
+            status.active_specs,
+            status.open_discrepancies,
+            status.unknown_specs,
+            status.never_checked_specs
+        ),
+        (2, 1, 1, 0)
+    );
+
+    // Neither another project of the tenant nor the same project under
+    // another tenant sees any of it.
+    let sibling = FleetScope::new(
+        scope.tenant_id,
+        "spec-recall-sibling",
+        common::LIVE_TEST_AGENT,
+        None,
+        PrivacyTier::T1Project,
+    )
+    .unwrap();
+    for other in [sibling, common::fresh_scope("spec-recall")] {
+        let other_reader = spec_reader(&pool, &other).await;
+        let answer = other_reader.list(true, 100).await.unwrap();
+        assert!(answer.discrepancies.is_empty(), "{other:?}");
+        assert!(answer.specs.is_empty(), "{other:?}");
+        assert!(
+            other_reader
+                .get(standing.episode_fingerprint)
+                .await
+                .unwrap()
+                .discrepancies
+                .is_empty()
+        );
+        assert_eq!(other_reader.status().await.unwrap().open_discrepancies, 0);
+    }
+}
+
+/// `serve`'s memory service for `scope`, record-only, with the spec
+/// conformance reader attached when there is one.
+fn serve_with(
+    owner: &PgPool,
+    scope: &FleetScope,
+    reader: Option<Arc<dyn SpecConformanceRead>>,
+) -> CockroachMemoryService {
+    let embedder: Arc<dyn ChunkEmbedder> = Arc::new(StubEmbedder);
+    let ledger = CockroachClaimLedger::new(
+        owner.clone(),
+        scope.clone(),
+        embedder.clone(),
+        retry_policy(),
+    )
+    .unwrap();
+    let service = CockroachMemoryService::new(
+        scope.clone(),
+        Arc::new(CockroachStore::from_pool(owner.clone(), scope.clone()).unwrap()),
+        Arc::new(ledger),
+        embedder,
+    )
+    .unwrap();
+    match reader {
+        Some(reader) => service.with_spec_conformance(reader),
+        None => service,
+    }
+}
+
+async fn recall(
+    service: &CockroachMemoryService,
+    scope: &FleetScope,
+    action: RecallAction,
+) -> Result<RecallResult, ServiceError> {
+    FleetMemoryService::recall(
+        service,
+        scope.clone(),
+        RecallRequest::new(action, Map::new()),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn live_the_probe_serves_discrepancies_only_with_select_grants_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let owner = common::migrated_pool(&database_url).await;
+    let scope = common::fresh_scope("spec-recall-probe");
+    let plane = SpecPlane::new(&owner, &scope);
+    let forget = plane
+        .statement("Forget", ExpectedMembershipV1::Absent, true)
+        .await;
+    let standing = plane
+        .nonconformance(&forget, &commit("c1"), "2026-09-02T00:00:00.000000000Z")
+        .await;
+    let capabilities = capabilities_of(&owner, &scope).await;
+
+    let mut older = capabilities.clone();
+    older.schema_version = SPEC_CONFORMANCE_SCHEMA_VERSION - 1;
+    assert!(
+        probe_spec_conformance(&owner, &older)
+            .await
+            .unwrap()
+            .is_none(),
+        "a schema before migration 31 has no spec tables to read"
+    );
+
+    let role = RuntimeProbeRole::create_worker(&owner, &database_url, true).await;
+    let outcome = AssertUnwindSafe(async {
+        // The runtime grants cover every read the action makes.
+        let reader = start_spec_conformance(&role.pool, &capabilities, &scope)
+            .await
+            .expect("the runtime grants serve recall(discrepancies)");
+        let served = serve_with(&owner, &scope, Some(reader));
+        let surface = FleetMemoryService::remember_surface(&served);
+        let recall_surface = FleetMemoryService::recall_surface(&served);
+        assert!(recall_surface.discrepancies);
+        let tools = tool_list_for_surfaces(surface, recall_surface);
+        assert!(
+            tools[0]["inputSchema"]["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("discrepancies"))
+        );
+        let answer = recall(&served, &scope, RecallAction::Discrepancies)
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.data["discrepancies"][0]["episode_id"],
+            json!(standing.episode_fingerprint)
+        );
+        assert_eq!(
+            answer.data["specs"][0]["last_check"]["verdict"],
+            "nonconforming"
+        );
+        let status = recall(&served, &scope, RecallAction::Status).await.unwrap();
+        assert_eq!(status.data["spec_conformance"]["served"], true);
+        assert_eq!(status.data["spec_conformance"]["open_discrepancies"], 1);
+
+        // A login without SELECT on the check history is not served, and
+        // everything it serves stays as it was.
+        sqlx::query(&format!(
+            "REVOKE SELECT ON TABLE public.memory_spec_checks_v1 FROM {}",
+            role.name()
+        ))
+        .execute(&owner)
+        .await
+        .expect("revoke the probe's check-history grant");
+        assert!(
+            probe_spec_conformance(&role.pool, &capabilities)
+                .await
+                .expect("a missing privilege is not an error")
+                .is_none()
+        );
+        let reader = start_spec_conformance(&role.pool, &capabilities, &scope).await;
+        assert!(reader.is_none());
+        let unserved = serve_with(&owner, &scope, reader);
+        assert!(!FleetMemoryService::recall_surface(&unserved).discrepancies);
+        assert_eq!(
+            tool_list_for_surfaces(
+                FleetMemoryService::remember_surface(&unserved),
+                FleetMemoryService::recall_surface(&unserved)
+            ),
+            tool_list()
+        );
+        let refused = recall(&unserved, &scope, RecallAction::Discrepancies)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, ServiceError::InvalidRequest(message) if message.contains("not served")),
+            "{refused}"
+        );
+        let status = recall(&unserved, &scope, RecallAction::Status)
+            .await
+            .unwrap();
+        assert!(status.data.get("spec_conformance").is_none(), "{status:?}");
+    })
+    .catch_unwind()
+    .await;
+    role.drop_role(&owner).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }
