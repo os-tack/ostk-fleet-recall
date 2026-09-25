@@ -241,10 +241,10 @@ admitted, in this order:
   evidence under a freshly verified generation-2 head, writes coverage
   receipts for what it read, and updates each source's status row in
   `memory_worker_sources_v1`.
-- `collect`: drains the collector outbox (migration 0033,
+- `collect`: drains the collector outbox (migrations 0033 and 0034,
   [ADR 0008](docs/adr/0008-collected-items.md) D4): items a collector staged
   are admitted under `connector.collected.<mode>` of the verified head, which
-  needs a scope moved to generation 3. Below migration 33 it is skipped. No
+  needs a scope moved to generation 3. Below migration 34 it is skipped. No
   provider collector stages items yet.
 - `project`: the body projector, then the lexical tier.
 - `embed`: the dense tier, through the pinned model2vec embedder.

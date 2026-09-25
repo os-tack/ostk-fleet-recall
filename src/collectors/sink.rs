@@ -5,11 +5,13 @@
 //! collector (pull | hint-driven fetch | capture | import)
 //!   -> StageDraftV1 (memory only)
 //!   -> CollectedItemSink::stage       one SERIALIZABLE transaction:
-//!        container observations       recorded or withdrawn
+//!        container observations       recorded, withdrawn, or kept
 //!        per draft: scope check -> audience (server-derived) -> seal
 //!          (sanitize, redact, split, envelope, stage id) -> clock check
 //!          -> INSERT memory_collector_outbox_v1 ON CONFLICT DO NOTHING
-//!        refusals                     digest-only dead letters
+//!          -> lift the item's withdrawals this channel may lift
+//!        refusals                     digest-only dead letters; a narrowing
+//!                                     refusal of a known item withdraws it
 //!        cursor advances, status      in the same transaction (REPLAY-02)
 //!   -> CollectedItemSink::drain       per pending row:
 //!        connector.collected.<mode> -> candidate -> admit_evidence
@@ -42,6 +44,15 @@
 //! Every settled row loses its envelope: the redacted text stays in the
 //! governed content store and the body plane, and the outbox keeps only its
 //! digest.
+//!
+//! # Withdrawals
+//!
+//! What a container observation or an audience refusal does to what the
+//! memory already admitted is [`super::withdrawal`]'s: a withdrawal is lifted
+//! only by a channel at least as trusted as the one that made it, a container
+//! refused before anything was admitted through it is still recorded
+//! withdrawn, and an item whose own audience narrowed is withdrawn until an
+//! admissible observation at least as new lifts it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -66,7 +77,7 @@ use crate::evidence_ledger::{
 use crate::memory_contracts::collected_item::{
     AudienceBasisV1, BoundedTextV1, CollectedItemEnvelopeV1, CollectionModeV1, ContainerKindV1,
     ItemCollectionV1, ItemLifecycleV1, ItemRedactionV1, MAX_LABEL_BYTES, ProviderKindV1,
-    TrustTierV1, derive_container_key,
+    TrustTierV1, derive_container_key, derive_item_key,
 };
 use crate::memory_contracts::common::{CanonicalTimestamp, ContractId};
 use crate::memory_contracts::digest::{Sha256Digest, body_digest};
@@ -76,8 +87,8 @@ use crate::registry_witness::VerifiedWriterAuthority;
 use crate::store::cockroach::{RetryPolicy, with_serializable_retry};
 
 use super::audience::{
-    AudienceDecisionV1, AudienceInputV1, AudiencePolicyV1, CaptureScopeV1, KnownContainerV1,
-    ProviderAudienceV1, classify,
+    AudienceDecisionV1, AudienceInputV1, AudiencePolicyV1, AudienceRefusalV1, CaptureScopeV1,
+    KnownContainerV1, ProviderAudienceV1, classify,
 };
 use super::binding::{
     CollectedConnectorBindingV1, CollectedIngressV1, CollectedRowClocksV1, CollectorInstanceV1,
@@ -85,12 +96,13 @@ use super::binding::{
 };
 use super::cockroach::{
     BUMP_ATTEMPTS_SQL, COUNT_PENDING_SQL, INSERT_DEAD_LETTER_SQL, INSERT_ITEM_SQL, INSERT_LINK_SQL,
-    INSERT_OUTBOX_SQL, LOCK_HEADS_SQL, LOCK_PENDING_ROW_SQL, MARK_ADMITTED_SQL,
-    MARK_DEAD_LETTERED_SQL, MARK_QUARANTINED_SQL, MAX_DEAD_LETTER_DIAGNOSTIC_BYTES,
-    MAX_DRAIN_ATTEMPTS, MAX_OUTBOX_ERROR_BYTES, PART_STATE_SQL, SELECT_CURSOR_SQL,
-    SELECT_ROW_STATE_SQL, UPDATE_HEAD_PRESENTATION_SQL, UPSERT_CONTAINER_SQL, UPSERT_CURSOR_SQL,
-    UPSERT_HEAD_SQL, WITHDRAW_CONTAINER_SQL, bounded, digest_column, framed_sha256,
-    known_container, optional_digest_column, select_pending_by_id_sql, select_pending_sql,
+    INSERT_OUTBOX_SQL, ITEM_SEEN_SQL, LIFT_ITEM_SQL, LOCK_HEADS_SQL, LOCK_PENDING_ROW_SQL,
+    MARK_ADMITTED_SQL, MARK_DEAD_LETTERED_SQL, MARK_QUARANTINED_SQL,
+    MAX_DEAD_LETTER_DIAGNOSTIC_BYTES, MAX_DRAIN_ATTEMPTS, MAX_OUTBOX_ERROR_BYTES, PART_STATE_SQL,
+    RECORD_CONTAINER_SQL, RECORD_WITHDRAWN_CONTAINER_SQL, SELECT_CURSOR_SQL, SELECT_ROW_STATE_SQL,
+    UPDATE_HEAD_PRESENTATION_SQL, UPSERT_CURSOR_SQL, UPSERT_HEAD_SQL, WITHDRAW_CONTAINER_SQL,
+    WITHDRAW_ITEM_SQL, bounded, digest_column, framed_sha256, known_container, lock_container,
+    lock_item_withdrawals, optional_digest_column, select_pending_by_id_sql, select_pending_sql,
     statement_time,
 };
 use super::draft::{CollectedItemDraftV1, ItemRefusalV1, SealContextV1, collection_record, seal};
@@ -100,6 +112,13 @@ use super::heads::{
 use super::redaction::{CollectorDispositionV1, CollectorRedactorV1, scan_collected_secrets};
 use super::status::{CollectorSourceStatusV1, upsert_collector_source};
 use super::text::{sanitize_line, truncate_on_char_boundary};
+use super::withdrawal::{
+    ContainerWriteV1, ItemWithdrawalStateV1, after_admission, after_refusal, container_write,
+    may_lift, narrows_item, observes_item_audience,
+};
+
+/// Item-withdrawal rows one staging call holds, by item and tier.
+type ItemWithdrawals = BTreeMap<(Sha256Digest, TrustTierV1), ItemWithdrawalStateV1>;
 
 /// Pending rows one [`CollectedItemSink::drain`] call reads at most, when the
 /// caller asks for more.
@@ -362,10 +381,15 @@ pub struct StageOutcomeV1 {
     pub rows_already_staged: u64,
     /// Refused drafts, by reason.
     pub refused: BTreeMap<DeadLetterReasonV1, u64>,
-    /// Containers recorded as readable.
+    /// Containers recorded as readable: new, re-opened, or relabelled.
     pub containers_recorded: u64,
-    /// Containers withdrawn.
+    /// Containers withdrawn, whether recorded before or not.
     pub containers_withdrawn: u64,
+    /// Items withdrawn because a refusal narrowed an item already admitted
+    /// or staged.
+    pub items_withdrawn: u64,
+    /// Item withdrawals an admissible observation lifted.
+    pub item_withdrawals_lifted: u64,
     /// Whether the cursor advances were applied.
     pub cursors_advanced: bool,
 }
@@ -1222,16 +1246,35 @@ impl StageJob {
             refused: BTreeMap::new(),
             containers_recorded: 0,
             containers_withdrawn: 0,
+            items_withdrawn: 0,
+            item_withdrawals_lifted: 0,
             cursors_advanced: false,
         };
         for container in &self.containers {
             self.observe_container(transaction, container, now, &mut outcome)
                 .await?;
         }
+        // One locking read for every item this call may withdraw or lift.
+        let mut withdrawals = if observes_item_audience(self.mode) {
+            let keys: Vec<Sha256Digest> = self
+                .drafts
+                .iter()
+                .map(|staged| draft_item_key(&staged.draft))
+                .collect();
+            lock_item_withdrawals(transaction, self.tenant_id, &self.project, &keys).await?
+        } else {
+            ItemWithdrawals::new()
+        };
         let mut clock_ahead = false;
         for staged in &self.drafts {
             let item = self
-                .stage_one(transaction, staged, &observed_at, now, &mut outcome)
+                .stage_one(
+                    transaction,
+                    staged,
+                    (&observed_at, now),
+                    &mut withdrawals,
+                    &mut outcome,
+                )
                 .await?;
             if let StagedItemV1::Refused { reason, .. } = &item {
                 *outcome.refused.entry(*reason).or_insert(0) += 1;
@@ -1263,6 +1306,7 @@ impl StageJob {
         Ok(outcome)
     }
 
+    /// Apply one container observation under the withdrawal rules.
     async fn observe_container(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
@@ -1270,9 +1314,12 @@ impl StageJob {
         now: DateTime<Utc>,
         outcome: &mut StageOutcomeV1,
     ) -> Result<()> {
-        match container.decision {
-            AudienceDecisionV1::Admit(basis) => {
-                sqlx::query(UPSERT_CONTAINER_SQL)
+        let tier = self.mode.trust_tier();
+        let stored =
+            lock_container(transaction, self.tenant_id, &self.project, &container.key).await?;
+        match container_write(stored, container.decision, tier) {
+            ContainerWriteV1::Record(basis) => {
+                sqlx::query(RECORD_CONTAINER_SQL)
                     .bind(self.tenant_id)
                     .bind(&self.project)
                     .bind(container.key.as_bytes().as_slice())
@@ -1284,21 +1331,146 @@ impl StageJob {
                     .bind(basis.as_str())
                     .bind(self.instance.connector_instance_id.as_str())
                     .bind(now)
+                    .bind(tier.as_str())
                     .execute(&mut **transaction)
                     .await?;
                 outcome.containers_recorded += 1;
             }
-            AudienceDecisionV1::Refuse(_) => {
-                let withdrawn = sqlx::query(WITHDRAW_CONTAINER_SQL)
+            ContainerWriteV1::RecordWithdrawn => {
+                // A container never admitted keeps no label: a private
+                // channel's name is not the project's to read.
+                outcome.containers_withdrawn += sqlx::query(RECORD_WITHDRAWN_CONTAINER_SQL)
                     .bind(self.tenant_id)
                     .bind(&self.project)
                     .bind(container.key.as_bytes().as_slice())
+                    .bind(self.instance.provider.as_str())
+                    .bind(self.instance.provider_scope_id.as_str())
+                    .bind(container.kind.as_str())
+                    .bind(&container.id)
                     .bind(self.instance.connector_instance_id.as_str())
                     .bind(now)
+                    .bind(tier.as_str())
                     .execute(&mut **transaction)
                     .await?
                     .rows_affected();
-                outcome.containers_withdrawn += withdrawn;
+            }
+            write @ (ContainerWriteV1::Withdraw | ContainerWriteV1::Confirm) => {
+                sqlx::query(WITHDRAW_CONTAINER_SQL)
+                    .bind(self.tenant_id)
+                    .bind(&self.project)
+                    .bind(container.key.as_bytes().as_slice())
+                    .bind(tier.as_str())
+                    .bind(self.instance.connector_instance_id.as_str())
+                    .bind(now)
+                    .execute(&mut **transaction)
+                    .await?;
+                if write == ContainerWriteV1::Withdraw {
+                    outcome.containers_withdrawn += 1;
+                }
+            }
+            ContainerWriteV1::Keep => {}
+        }
+        Ok(())
+    }
+
+    /// A narrowing refusal of `draft`: withdraw its item for this channel's
+    /// tier, unless it is a first sighting or a stale report.
+    async fn withdraw_item(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        draft: &CollectedItemDraftV1,
+        refusal: AudienceRefusalV1,
+        now: DateTime<Utc>,
+        withdrawals: &mut ItemWithdrawals,
+        outcome: &mut StageOutcomeV1,
+    ) -> Result<()> {
+        // A draft whose order no envelope could carry is no observation.
+        let Ok(order) = i64::try_from(draft.order_micros) else {
+            return Ok(());
+        };
+        if order > crate::memory_contracts::canonical::MAX_SAFE_INTEGER {
+            return Ok(());
+        }
+        let key = draft_item_key(draft);
+        let tier = self.mode.trust_tier();
+        let stored = withdrawals.get(&(key, tier)).copied();
+        let (seen, newest_admissible) = if stored.is_some() {
+            (true, None)
+        } else {
+            // What a channel that may lift this tier's row already staged.
+            let lifting: &[&str] = match tier {
+                TrustTierV1::Verified => &["pull", "push"],
+                TrustTierV1::Reported => &["pull", "push", "import"],
+            };
+            let row: PgRow = sqlx::query(ITEM_SEEN_SQL)
+                .bind(self.tenant_id)
+                .bind(&self.project)
+                .bind(key.as_bytes().as_slice())
+                .bind(lifting)
+                .fetch_one(&mut **transaction)
+                .await?;
+            let newest: Option<i64> = row.try_get("newest_admissible")?;
+            (
+                row.try_get::<bool, _>("seen")?,
+                newest.and_then(|newest| u64::try_from(newest).ok()),
+            )
+        };
+        let Some(next) = after_refusal(stored, draft.order_micros, seen, newest_admissible) else {
+            return Ok(());
+        };
+        sqlx::query(WITHDRAW_ITEM_SQL)
+            .bind(self.tenant_id)
+            .bind(&self.project)
+            .bind(key.as_bytes().as_slice())
+            .bind(tier.as_str())
+            .bind(order_i64(next.order))
+            .bind(refusal.as_str())
+            .bind(self.mode.as_str())
+            .bind(self.instance.connector_instance_id.as_str())
+            .bind(now)
+            .execute(&mut **transaction)
+            .await?;
+        withdrawals.insert((key, tier), next);
+        outcome.items_withdrawn += 1;
+        Ok(())
+    }
+
+    /// An admissible observation of an item at `order`: lift every withdrawal
+    /// of it this channel may lift.
+    async fn lift_item(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        key: Sha256Digest,
+        order: u64,
+        now: DateTime<Utc>,
+        withdrawals: &mut ItemWithdrawals,
+        outcome: &mut StageOutcomeV1,
+    ) -> Result<()> {
+        let observer = self.mode.trust_tier();
+        for tier in [TrustTierV1::Verified, TrustTierV1::Reported] {
+            if !may_lift(observer, tier) {
+                continue;
+            }
+            let Some(stored) = withdrawals.get(&(key, tier)).copied() else {
+                continue;
+            };
+            let Some(next) = after_admission(stored, order) else {
+                continue;
+            };
+            sqlx::query(LIFT_ITEM_SQL)
+                .bind(self.tenant_id)
+                .bind(&self.project)
+                .bind(key.as_bytes().as_slice())
+                .bind(tier.as_str())
+                .bind(order_i64(next.order))
+                .bind(self.mode.as_str())
+                .bind(self.instance.connector_instance_id.as_str())
+                .bind(now)
+                .execute(&mut **transaction)
+                .await?;
+            withdrawals.insert((key, tier), next);
+            if stored.withdrawn {
+                outcome.item_withdrawals_lifted += 1;
             }
         }
         Ok(())
@@ -1310,8 +1482,8 @@ impl StageJob {
         &self,
         transaction: &mut Transaction<'_, Postgres>,
         staged: &StageDraftV1,
-        observed_at: &CanonicalTimestamp,
-        now: DateTime<Utc>,
+        (observed_at, now): (&CanonicalTimestamp, DateTime<Utc>),
+        withdrawals: &mut ItemWithdrawals,
         outcome: &mut StageOutcomeV1,
     ) -> Result<StagedItemV1> {
         let draft = &staged.draft;
@@ -1388,6 +1560,10 @@ impl StageJob {
         let basis = match decision {
             AudienceDecisionV1::Admit(basis) => basis,
             AudienceDecisionV1::Refuse(refusal) => {
+                if observes_item_audience(self.mode) && narrows_item(refusal) {
+                    self.withdraw_item(transaction, draft, refusal, now, withdrawals, outcome)
+                        .await?;
+                }
                 return self
                     .dead_letter(
                         transaction,
@@ -1484,6 +1660,17 @@ impl StageJob {
             } else {
                 outcome.rows_already_staged += 1;
             }
+        }
+        if observes_item_audience(self.mode) {
+            self.lift_item(
+                transaction,
+                sealed.item_key,
+                sealed.provider_order,
+                now,
+                withdrawals,
+                outcome,
+            )
+            .await?;
         }
         Ok(StagedItemV1::Staged {
             item_key: sealed.item_key,
@@ -1597,6 +1784,16 @@ fn prepare_container(
         provider_audience: observation.provider_audience,
         decision,
     })
+}
+
+/// The item key a draft names, derived exactly as sealing derives it.
+fn draft_item_key(draft: &CollectedItemDraftV1) -> Sha256Digest {
+    derive_item_key(
+        &draft.provider,
+        &draft.provider_scope_id,
+        &draft.object_kind,
+        &draft.external_id,
+    )
 }
 
 /// A provider order or pass sequence as `INT8`; every bound the contracts

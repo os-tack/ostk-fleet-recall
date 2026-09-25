@@ -30,7 +30,7 @@ use super::{CockroachEvidenceRecall, EvidenceDenseLaneV1, EvidenceRecall, probe_
 /// the scope's dense tier already holds rows of another model. The probe runs
 /// once, so a later Stage-5 grant, migration 30, or model change needs a
 /// restart. The collector state is the exception: until it is readable it is
-/// checked again on every read, so migration 33 and the collector grants take
+/// checked again on every read, so migration 34 and the collector grants take
 /// effect in a running `serve`, and every read before they do withholds
 /// collected bodies.
 ///
@@ -58,7 +58,7 @@ pub async fn start_evidence_recall(
             }
             if capability.collector_state_unreadable() {
                 tracing::warn!(
-                    "evidence recall withholds every collected item: the schema has the collector tables (migration 33) and this login cannot read them; re-apply deploy/cockroach/runtime-role-grants.sql; every read checks again, and until the grants are in place an empty answer is unknown (collector_state_unreadable)"
+                    "evidence recall withholds every collected item: the schema has the collector tables (migrations 33 and 34) and this login cannot read them; re-apply deploy/cockroach/runtime-role-grants.sql; every read checks again, and until the grants are in place an empty answer is unknown (collector_state_unreadable)"
                 );
             }
             tracing::info!("serving recall(kind=evidence)");

@@ -55,19 +55,20 @@
 //!
 //! # Collected items
 //!
-//! From migration 33 on, the startup probe also checks SELECT on
+//! From migration 34 on, the startup probe also checks SELECT on
 //! [`COLLECTOR_RECALL_TABLES`]. When the login may read them, readiness counts
 //! the collector outbox's pending parts, the listing adds live and snapshot
 //! collectors (kind `collector`, with their provider), and both lanes and
-//! `get` withhold a collected body whose item's presented head is a tombstone
-//! or whose container was withdrawn (ADR 0008 D5). When it may not, recall is
+//! `get` withhold a collected body whose item's presented head is a tombstone,
+//! whose item was withdrawn, or whose container was withdrawn (ADR 0008 D5,
+//! D6). When it may not, recall is
 //! still served, but it cannot tell deleted text from current text or pending
 //! items from none: every collected body is dropped from the answer (fail
 //! closed), and an empty answer is `unknown` with
 //! [`AbsenceReasonV1::CollectorStateUnreadable`], never `absent`.
 //!
 //! Until the collector state is readable it is checked again on every read,
-//! not only at startup: a `serve` started before migration 33, or before the
+//! not only at startup: a `serve` started before migration 34, or before the
 //! collector grants were applied, reads it as soon as it can, and withholds
 //! every collected body until then. A process never serves collected text it
 //! cannot suppress.
@@ -195,7 +196,7 @@ pub struct EvidenceReadinessV1 {
     /// Transcript turns staged in the outbox and not yet admitted.
     pub transcript_turns_awaiting_admission: u64,
     /// Collected item parts staged in the collector outbox and not yet
-    /// admitted; absent before migration 33, or when the collector state
+    /// admitted; absent before migration 34, or when the collector state
     /// cannot be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items_awaiting_admission: Option<u64>,

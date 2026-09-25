@@ -52,12 +52,16 @@ pub const SPEC_CONFORMANCE_SCHEMA_VERSION: i64 = 31;
 /// ADR 0008 D3). Below it a binding family cannot be rebased onto a new
 /// registry head; no served surface requires it.
 pub const NORMATIVE_REBASE_SCHEMA_VERSION: i64 = 32;
-/// First schema with the collected-item sink (migration 0033, ADR 0008 D4-D6).
+/// First schema with the whole collected-item sink (ADR 0008 D4-D6).
 ///
-/// It adds the staging outbox, the current view, and collector status. Below
-/// it the worker's collect step is skipped and evidence recall reads no
-/// collector state.
-pub const COLLECTED_ITEMS_SCHEMA_VERSION: i64 = 33;
+/// Migration 0033 adds the staging outbox, current view, containers, and
+/// collector status, and migration 0034 their withdrawals (container tiers,
+/// containers withdrawn before anything was admitted, and item withdrawals).
+///
+/// Below it the worker's collect step is skipped and evidence recall reads no
+/// collector state. The two migrations ship together; nothing runs the sink
+/// on 0033 alone.
+pub const COLLECTED_ITEMS_SCHEMA_VERSION: i64 = 34;
 
 /// Exact application tables reachable from public health/status/recall SQL.
 ///
@@ -388,6 +392,8 @@ const NORMATIVE_REBASE_KIND_MIGRATION_SQL: &str =
     include_str!("../../migrations/0032_normative_rebase_kind.sql");
 const COLLECTED_ITEMS_MIGRATION_SQL: &str =
     include_str!("../../migrations/0033_collected_items.sql");
+const COLLECTED_WITHDRAWALS_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0034_collected_withdrawals.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -430,7 +436,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
 }
 
 #[allow(clippy::too_many_lines)] // one registration per migration file, in version order
-fn post_transactional_online_migrations() -> [Migration; 18] {
+fn post_transactional_online_migrations() -> [Migration; 19] {
     [
         Migration::new(
             15,
@@ -599,7 +605,7 @@ fn post_transactional_online_migrations() -> [Migration; 18] {
             true,
         ),
         Migration::new(
-            COLLECTED_ITEMS_SCHEMA_VERSION,
+            33,
             Cow::Borrowed("collected items"),
             MigrationType::Simple,
             Cow::Borrowed(COLLECTED_ITEMS_MIGRATION_SQL),
@@ -608,6 +614,19 @@ fn post_transactional_online_migrations() -> [Migration; 18] {
             // containers, collector status, cursors, and dead letters) and
             // their indexes. Runs outside SQLx's transaction wrapper like
             // migrations 0018-0032; MINIMUM_RECALL_SCHEMA_VERSION stays 18.
+            true,
+        ),
+        Migration::new(
+            COLLECTED_ITEMS_SCHEMA_VERSION,
+            Cow::Borrowed("collected withdrawals"),
+            MigrationType::Simple,
+            Cow::Borrowed(COLLECTED_WITHDRAWALS_MIGRATION_SQL),
+            // ADR 0008 D5-D6. Adds a nullable observed_tier column to the
+            // collector containers, widens their audience check (added and
+            // committed before the old one is dropped), and adds one
+            // private-plane table of item withdrawals with no foreign key.
+            // Runs outside SQLx's transaction wrapper like migrations
+            // 0018-0033; MINIMUM_RECALL_SCHEMA_VERSION stays 18.
             true,
         ),
     ]

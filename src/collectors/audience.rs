@@ -20,7 +20,9 @@
 //! A visibility hint from an importer or an agent can only narrow: `private`
 //! and `dm` refuse the item, and no hint admits anything the server would
 //! refuse. A container the memory has recorded as withdrawn refuses a capture
-//! into it.
+//! or an import into it: an operator's export is never newer word than the
+//! withdrawal (only a verified collector re-opens a container a verified
+//! collector withdrew; see [`super::withdrawal`]).
 
 use crate::memory_contracts::collected_item::{
     AudienceBasisV1, CollectionModeV1, VisibilityHintV1,
@@ -249,10 +251,14 @@ fn classify_verified(input: &AudienceInputV1<'_>) -> AudienceDecisionV1 {
 
 /// Import: the operator's declaration is the basis, and an export's own
 /// channel list can still refuse a direct, shared, or unlisted restricted
-/// container.
+/// container. A container the memory recorded as withdrawn stays refused: an
+/// export may be older than the observation that withdrew it.
 fn classify_import(input: &AudienceInputV1<'_>) -> AudienceDecisionV1 {
     if !input.policy.operator_declared {
         return AudienceDecisionV1::Refuse(AudienceRefusalV1::OperatorDeclarationRequired);
+    }
+    if input.known_container == KnownContainerV1::Withdrawn {
+        return AudienceDecisionV1::Refuse(AudienceRefusalV1::ContainerWithdrawn);
     }
     match input.provider_audience {
         None
@@ -490,6 +496,27 @@ mod tests {
             item.known_container = KnownContainerV1::Readable(AudienceBasisV1::ProviderPublic);
             item.hint = Some(hint);
             assert_eq!(refused(classify(&item)), AudienceRefusalV1::HintRefused);
+        }
+    }
+
+    #[test]
+    fn a_withdrawn_container_refuses_an_import_whatever_the_export_says() {
+        let declared = AudiencePolicyV1 {
+            operator_declared: true,
+            private_containers: Vec::new(),
+        };
+        for export_says in [
+            None,
+            Some(ProviderAudienceV1::ScopePublic),
+            Some(ProviderAudienceV1::OperatorScoped),
+        ] {
+            let mut item = input(CollectionModeV1::Import, &declared, &[]);
+            item.provider_audience = export_says;
+            item.known_container = KnownContainerV1::Withdrawn;
+            assert_eq!(
+                refused(classify(&item)),
+                AudienceRefusalV1::ContainerWithdrawn
+            );
         }
     }
 

@@ -1,11 +1,13 @@
-//! `CockroachDB` statements of the collected-item sink (migration 0033).
+//! `CockroachDB` statements of the collected-item sink (migrations 0033 and
+//! 0034).
 //!
 //! Every statement binds `tenant_id = $1` and `project = $2` first, so no
 //! stored value and no request field can move a read or a write into another
-//! scope. The outbox, the heads, the collector status, the cursors, and the
-//! containers take locking reads and compare-and-set upserts; the item history,
-//! its links, and the dead letters are only ever inserted. Nothing here
-//! deletes. None of these tables is a publication table.
+//! scope. The outbox, the heads, the collector status, the cursors, the
+//! containers, and the item withdrawals take locking reads and
+//! compare-and-set upserts; the item history, its links, and the dead letters
+//! are only ever inserted. Nothing here deletes: a lifted withdrawal is
+//! updated. None of these tables is a publication table.
 //!
 //! The helpers run inside a caller's transaction: the sink's staging
 //! transaction, or the append transaction of the drain's projection.
@@ -19,7 +21,10 @@ use uuid::Uuid;
 use crate::memory_contracts::collected_item::AudienceBasisV1;
 use crate::memory_contracts::digest::Sha256Digest;
 
+use crate::memory_contracts::collected_item::TrustTierV1;
+
 use super::audience::KnownContainerV1;
+use super::withdrawal::{ContainerAccessV1, ItemWithdrawalStateV1, StoredContainerV1};
 
 /// Longest `last_error` an outbox row keeps.
 pub const MAX_OUTBOX_ERROR_BYTES: usize = 512;
@@ -36,20 +41,83 @@ pub(super) const SELECT_CONTAINER_SQL: &str = "SELECT audience_basis, access \
      FROM public.memory_collector_containers_v1 \
      WHERE tenant_id = $1 AND project = $2 AND container_key = $3";
 
-pub(super) const UPSERT_CONTAINER_SQL: &str = "INSERT INTO public.memory_collector_containers_v1 (\
+/// One container row, locked for [`super::withdrawal::container_write`].
+pub(super) const LOCK_CONTAINER_SQL: &str = "SELECT access, observed_tier \
+     FROM public.memory_collector_containers_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND container_key = $3 FOR UPDATE";
+
+/// Record a container as readable: a new row, or a recorded one re-opened or
+/// relabelled by a channel that may.
+pub(super) const RECORD_CONTAINER_SQL: &str = "INSERT INTO public.memory_collector_containers_v1 (\
      tenant_id, project, container_key, provider, provider_scope_id, container_kind, \
-     container_id, label, audience_basis, access, observed_by_instance, observed_at, updated_at\
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ok', $10, $11, $11) \
+     container_id, label, audience_basis, access, observed_by_instance, observed_at, updated_at, \
+     observed_tier\
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ok', $10, $11, $11, $12) \
      ON CONFLICT (tenant_id, project, container_key) DO UPDATE SET \
      label = excluded.label, audience_basis = excluded.audience_basis, access = 'ok', \
      observed_by_instance = excluded.observed_by_instance, \
-     observed_at = excluded.observed_at, updated_at = excluded.updated_at";
+     observed_at = excluded.observed_at, updated_at = excluded.updated_at, \
+     observed_tier = excluded.observed_tier";
+
+/// Record a container nothing was admitted through as withdrawn: no label,
+/// no audience basis.
+pub(super) const RECORD_WITHDRAWN_CONTAINER_SQL: &str = "INSERT INTO \
+     public.memory_collector_containers_v1 (\
+     tenant_id, project, container_key, provider, provider_scope_id, container_kind, \
+     container_id, label, audience_basis, access, observed_by_instance, observed_at, updated_at, \
+     observed_tier\
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, 'none', 'withdrawn', $8, $9, $9, $10) \
+     ON CONFLICT (tenant_id, project, container_key) DO NOTHING";
 
 /// A container whose audience is no longer admissible is withdrawn, never
-/// deleted: every item in it is then withheld at read time.
+/// deleted: every item in it is then withheld at read time. The same
+/// statement makes a report's withdrawal a verified one.
 pub(super) const WITHDRAW_CONTAINER_SQL: &str = "UPDATE public.memory_collector_containers_v1 \
-     SET access = 'withdrawn', observed_by_instance = $4, observed_at = $5, updated_at = $5 \
-     WHERE tenant_id = $1 AND project = $2 AND container_key = $3 AND access = 'ok'";
+     SET access = 'withdrawn', observed_tier = $4, observed_by_instance = $5, \
+     observed_at = $6, updated_at = $6 \
+     WHERE tenant_id = $1 AND project = $2 AND container_key = $3";
+
+/// The item-withdrawal rows of a batch of items, locked.
+pub(super) const LOCK_ITEM_WITHDRAWALS_SQL: &str = "SELECT item_key_digest, observed_tier, \
+     withdrawn, observed_order \
+     FROM public.memory_collected_item_withdrawals_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND item_key_digest = ANY($3::BYTES[]) FOR UPDATE";
+
+/// Whether the memory holds any admitted or staged part of an item, and the
+/// greatest provider order at which one of the channels in `$4` staged it.
+pub(super) const ITEM_SEEN_SQL: &str = "SELECT \
+     (EXISTS (SELECT 1 FROM public.memory_collected_items_v1 \
+        WHERE tenant_id = $1 AND project = $2 AND item_key_digest = $3) \
+      OR EXISTS (SELECT 1 FROM public.memory_collector_outbox_v1 \
+        WHERE tenant_id = $1 AND project = $2 AND item_key_digest = $3 \
+          AND state = 'pending')) AS seen, \
+     GREATEST(\
+       (SELECT max(provider_order) FROM public.memory_collected_items_v1 \
+          WHERE tenant_id = $1 AND project = $2 AND item_key_digest = $3 \
+            AND collection_mode = ANY($4::STRING[])), \
+       (SELECT max(provider_order) FROM public.memory_collector_outbox_v1 \
+          WHERE tenant_id = $1 AND project = $2 AND item_key_digest = $3 \
+            AND state = 'pending' AND collection_mode = ANY($4::STRING[]))\
+     ) AS newest_admissible";
+
+/// Withdraw an item for one tier.
+pub(super) const WITHDRAW_ITEM_SQL: &str = "INSERT INTO \
+     public.memory_collected_item_withdrawals_v1 (\
+     tenant_id, project, item_key_digest, observed_tier, withdrawn, observed_order, reason, \
+     collection_mode, observed_by_instance, observed_at, updated_at\
+     ) VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $9) \
+     ON CONFLICT (tenant_id, project, item_key_digest, observed_tier) DO UPDATE SET \
+     withdrawn = true, observed_order = excluded.observed_order, reason = excluded.reason, \
+     collection_mode = excluded.collection_mode, \
+     observed_by_instance = excluded.observed_by_instance, \
+     observed_at = excluded.observed_at, updated_at = excluded.updated_at";
+
+/// Lift one tier's item withdrawal, or move a lifted row's order forward.
+/// The reason of the last withdrawal stays.
+pub(super) const LIFT_ITEM_SQL: &str = "UPDATE public.memory_collected_item_withdrawals_v1 \
+     SET withdrawn = false, observed_order = $5, collection_mode = $6, \
+     observed_by_instance = $7, observed_at = $8, updated_at = $8 \
+     WHERE tenant_id = $1 AND project = $2 AND item_key_digest = $3 AND observed_tier = $4";
 
 pub(super) const INSERT_OUTBOX_SQL: &str = "INSERT INTO public.memory_collector_outbox_v1 (\
      tenant_id, project, stage_id, collector_instance_id, principal_id, collection_mode, \
@@ -191,9 +259,11 @@ pub const COUNT_PENDING_SQL: &str = "SELECT count(*)::INT8 \
      FROM public.memory_collector_outbox_v1 \
      WHERE tenant_id = $1 AND project = $2 AND state = 'pending'";
 
-/// Whether a collected body is withheld from recall: its item's presented head
-/// is a tombstone, or its container was withdrawn. `lex`/`body` names the
-/// outer row's body id column, `$1`/`$2` its scope.
+/// Whether a collected body is withheld from recall.
+///
+/// It is when its item's presented head is a tombstone, its container was
+/// withdrawn, or the item itself was withdrawn for either tier.
+/// `body_column` names the outer row's body id column, `$1`/`$2` its scope.
 #[must_use]
 pub fn suppressed_body_predicate(body_column: &str) -> String {
     format!(
@@ -207,8 +277,85 @@ pub fn suppressed_body_predicate(body_column: &str) -> String {
          WHERE item.tenant_id = $1 AND item.project = $2 \
            AND item.body_content_id = {body_column} \
            AND (head.lifecycle IN ('deleted', 'trashed', 'revoked') \
-                OR container.access = 'withdrawn'))"
+                OR container.access = 'withdrawn' \
+                OR EXISTS (SELECT 1 FROM public.memory_collected_item_withdrawals_v1 AS withdrawal \
+                    WHERE withdrawal.tenant_id = $1 AND withdrawal.project = $2 \
+                      AND withdrawal.item_key_digest = item.item_key_digest \
+                      AND withdrawal.withdrawn)))"
     )
+}
+
+/// One container row as the withdrawal rules read it, locked; `None` when
+/// the memory never recorded it.
+pub(super) async fn lock_container(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    project: &str,
+    container_key: &Sha256Digest,
+) -> sqlx::Result<Option<StoredContainerV1>> {
+    let row: Option<PgRow> = sqlx::query(LOCK_CONTAINER_SQL)
+        .bind(tenant_id)
+        .bind(project)
+        .bind(container_key.as_bytes().as_slice())
+        .fetch_optional(&mut **transaction)
+        .await?;
+    row.map(|row| {
+        let access: String = row.try_get("access")?;
+        let tier: Option<String> = row.try_get("observed_tier")?;
+        Ok(StoredContainerV1 {
+            access: if access == "ok" {
+                ContainerAccessV1::Ok
+            } else {
+                ContainerAccessV1::Withdrawn
+            },
+            // A row from before migration 0034 is read as verified, so no
+            // report can override it.
+            tier: match tier.as_deref() {
+                Some("reported") => TrustTierV1::Reported,
+                _ => TrustTierV1::Verified,
+            },
+        })
+    })
+    .transpose()
+}
+
+/// The locked item-withdrawal rows of `item_keys`, by item and tier.
+pub(super) async fn lock_item_withdrawals(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    project: &str,
+    item_keys: &[Sha256Digest],
+) -> sqlx::Result<std::collections::BTreeMap<(Sha256Digest, TrustTierV1), ItemWithdrawalStateV1>> {
+    let keys: Vec<Vec<u8>> = item_keys
+        .iter()
+        .map(|key| key.as_bytes().to_vec())
+        .collect();
+    let rows: Vec<PgRow> = sqlx::query(LOCK_ITEM_WITHDRAWALS_SQL)
+        .bind(tenant_id)
+        .bind(project)
+        .bind(&keys)
+        .fetch_all(&mut **transaction)
+        .await?;
+    let mut stored = std::collections::BTreeMap::new();
+    for row in &rows {
+        let tier: String = row.try_get("observed_tier")?;
+        let tier = TrustTierV1::parse(&tier).map_err(|_| sqlx::Error::ColumnDecode {
+            index: "observed_tier".to_owned(),
+            source: "a stored withdrawal tier is not known".into(),
+        })?;
+        let order: i64 = row.try_get("observed_order")?;
+        stored.insert(
+            (digest_column(row, "item_key_digest")?, tier),
+            ItemWithdrawalStateV1 {
+                withdrawn: row.try_get("withdrawn")?,
+                order: u64::try_from(order).map_err(|_| sqlx::Error::ColumnDecode {
+                    index: "observed_order".to_owned(),
+                    source: "a stored withdrawal order is negative".into(),
+                })?,
+            },
+        );
+    }
+    Ok(stored)
 }
 
 /// What the memory recorded about one container.

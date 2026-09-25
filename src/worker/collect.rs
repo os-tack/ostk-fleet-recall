@@ -12,10 +12,10 @@
 //! installer target that admits it.
 //!
 //! Whether the step can run at all is decided by the schema, read at tick
-//! time: before migration 33 there is nothing to drain, so the step is
-//! `skipped` (`schema_below_33`) when no collector is configured and adds no
-//! privilege probe, and fails, naming `ostk-fleet-recall migrate`, when one
-//! is.
+//! time: before migration 34 (the collected-item tables and their
+//! withdrawals) there is nothing to drain, so the step is `skipped`
+//! (`schema_below_34`) when no collector is configured and adds no privilege
+//! probe, and fails, naming `ostk-fleet-recall migrate`, when one is.
 
 use crate::collectors::sink::{CollectedDrainContextV1, CollectedDrainReportV1, CollectedItemSink};
 use crate::evidence_ledger::ContentKeyEncryptionKey;
@@ -29,7 +29,7 @@ use super::{MemoryWorker, WorkerStepReportV1, WorkerStepStatusV1};
 pub const COLLECT_DRAIN_LIMIT: u32 = 1_024;
 
 /// Why the step did not run on an older schema.
-const SCHEMA_BELOW_33: &str = "schema_below_33";
+const SCHEMA_BELOW_34: &str = "schema_below_34";
 
 const COLLECT_COUNTERS: [&str; 9] = [
     "rows_read",
@@ -69,7 +69,7 @@ pub(super) async fn run_collect(
                 super::RUNTIME_GRANTS_POLICY
             ));
         }
-        return WorkerStepReportV1::skipped(SCHEMA_BELOW_33);
+        return WorkerStepReportV1::skipped(SCHEMA_BELOW_34);
     }
     let verified = match verified {
         Ok(verified) => verified,

@@ -24,9 +24,12 @@
 //! * [`draft`] holds the draft, the splitter, and [`draft::seal`];
 //! * [`binding`] binds `connector.collected.<mode>` from the active package and
 //!   builds the admission candidate from a staged envelope;
-//! * [`heads`] is the current view's move rule and presentation.
+//! * [`heads`] is the current view's move rule and presentation;
+//! * [`withdrawal`] decides what a narrowed audience hides and which channel
+//!   may lift it: container observations, and items whose own audience
+//!   narrowed.
 //!
-//! The durable half (ADR 0008 D4-D6, migration 0033):
+//! The durable half (ADR 0008 D4-D6, migrations 0033 and 0034):
 //!
 //! * [`sink`] stages drafts into the collector outbox in one serializable
 //!   transaction, and drains staged rows through admission and the ledger,
@@ -37,10 +40,10 @@
 //!   `(tenant_id, project)`.
 //!
 //! The worker's `collect` step drains the outbox (`src/worker/collect.rs`), and
-//! evidence recall withholds a collected body whose item was deleted or whose
-//! container was withdrawn. The envelope itself, its identity digests, and the
-//! plain-text input an import line or a capture carries are contracts, in
-//! [`crate::memory_contracts::collected_item`].
+//! evidence recall withholds a collected body whose item was deleted or
+//! withdrawn, or whose container was withdrawn. The envelope itself, its
+//! identity digests, and the plain-text input an import line or a capture
+//! carries are contracts, in [`crate::memory_contracts::collected_item`].
 
 pub mod audience;
 pub mod binding;
@@ -51,6 +54,7 @@ pub mod redaction;
 pub mod sink;
 pub mod status;
 pub mod text;
+pub mod withdrawal;
 
 #[cfg(test)]
 pub(crate) mod test_support;

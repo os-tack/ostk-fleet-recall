@@ -82,10 +82,11 @@ const TRANSCRIPT_PROBES: &[Probe] = &[
 
 const CI_PROBES: &[Probe] = &[("memory_ci_measured_windows_v1", ProbeKind::Insert, None)];
 
-/// The collected-item sink (migration 0033): the schema version the step reads
-/// at tick time, the outbox the drain settles, the item history, heads, and
-/// links its projection writes, and the containers, status, cursors, and dead
-/// letters staging writes. Probed only on a schema that has the tables.
+/// The collected-item sink (migrations 0033 and 0034): the schema version the
+/// step reads at tick time, the outbox the drain settles, the item history,
+/// heads, and links its projection writes, and the containers, item
+/// withdrawals, status, cursors, and dead letters staging writes. Probed only
+/// on a schema that has the tables.
 const COLLECT_PROBES: &[Probe] = &[
     ("memory_collector_outbox_v1", ProbeKind::Insert, None),
     ("memory_collector_outbox_v1", ProbeKind::Lock, None),
@@ -95,6 +96,16 @@ const COLLECT_PROBES: &[Probe] = &[
     ("memory_collected_item_links_v1", ProbeKind::Insert, None),
     ("memory_collector_containers_v1", ProbeKind::Insert, None),
     ("memory_collector_containers_v1", ProbeKind::Lock, None),
+    (
+        "memory_collected_item_withdrawals_v1",
+        ProbeKind::Insert,
+        None,
+    ),
+    (
+        "memory_collected_item_withdrawals_v1",
+        ProbeKind::Lock,
+        None,
+    ),
     ("memory_collector_sources_v1", ProbeKind::Insert, None),
     ("memory_collector_sources_v1", ProbeKind::Lock, None),
     ("memory_collector_cursors_v1", ProbeKind::Insert, None),
@@ -215,7 +226,7 @@ fn probe_statement((table, kind, columns): Probe) -> String {
 ///
 /// Requires the schema to have reached migration 30
 /// ([`MEMORY_WORKER_SCHEMA_VERSION`]), which creates the worker status table.
-/// The collect step's privileges are probed only from migration 33
+/// The collect step's privileges are probed only from migration 34
 /// ([`COLLECTED_ITEMS_SCHEMA_VERSION`]) on: before it the step has nothing to
 /// drain and is skipped, so neither its probes nor the ingest probes it alone
 /// would add are run.

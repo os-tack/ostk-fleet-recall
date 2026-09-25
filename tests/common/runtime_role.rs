@@ -89,10 +89,10 @@ pub const STAGE5_RUNTIME_GRANTS: [(&str, &str); 4] = [
     ("UPDATE", "public.memory_content_objects"),
 ];
 
-/// The collected-item tables of the same block (migration 33, ADR 0008): the
-/// item history, links, and dead letters are append-only; the outbox, heads,
-/// collector status, cursors, and containers take `SELECT ... FOR UPDATE` and
-/// compare-and-set upserts. The collect step also reads the schema version,
+/// The collected-item tables of the same block (migrations 33 and 34, ADR
+/// 0008): the item history, links, and dead letters are append-only; the
+/// outbox, heads, collector status, cursors, containers, and item withdrawals
+/// take `SELECT ... FOR UPDATE` and compare-and-set upserts. The collect step also reads the schema version,
 /// through the `SELECT` on `_sqlx_migrations` the policy's claim block gives.
 /// Keep this in step with that file.
 pub const COLLECTOR_RUNTIME_GRANTS: [(&str, &str); 3] = [
@@ -106,7 +106,7 @@ pub const COLLECTOR_RUNTIME_GRANTS: [(&str, &str); 3] = [
         "SELECT, INSERT, UPDATE",
         "public.memory_collector_outbox_v1, public.memory_collected_item_heads_v1, \
          public.memory_collector_sources_v1, public.memory_collector_cursors_v1, \
-         public.memory_collector_containers_v1",
+         public.memory_collector_containers_v1, public.memory_collected_item_withdrawals_v1",
     ),
 ];
 

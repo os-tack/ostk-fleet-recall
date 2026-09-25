@@ -9,7 +9,8 @@
   binding) exist (see "The envelope" below). Migration 33 adds the sink: the
   staging outbox, the drain the worker's `collect` step runs, the item
   history and current-view heads, container audiences, and collector status
-  (D4 to D6), and evidence recall withholds deleted and withdrawn items. No
+  (D4 to D6); migration 34 adds withdrawals (D5, D6), and evidence recall
+  withholds deleted and withdrawn items. No
   provider collector, agent capture, or item recall surface stages or reads
   items yet; those land with their own decisions.
 - Date: 2026-09-25
@@ -127,8 +128,9 @@ Rollout order, for every physical scope that is to collect items:
    host, and the projector container (ADR 0006 D1). A binary without the
    generation-3 row refuses a generation-3 head as `UnknownActivePackage`.
 2. Apply the release's migrations and re-apply the grant files. Migration 32
-   (D3) lets a spec family be rebased; it adds no grant. Migration 33 (D4)
-   adds the collected-item tables, which the runtime policy grants.
+   (D3) lets a spec family be rebased; it adds no grant. Migrations 33 (D4)
+   and 34 (D5, D6) add the collected-item tables and their withdrawals,
+   which the runtime policy grants.
 3. Run `ostk-authority-install apply --target generation-3`. The pins do not
    change, so no writer is reconfigured, and the run rebases every spec
    family onto the new head (D3).
@@ -213,7 +215,8 @@ byte-identical. The installer refuses, before any write, to rebase a scope
 that holds a family on a schema without migration 32. No grant changes: the
 installer runs as the migrator, the runtime role already holds `INSERT` on the
 log, and the runtime policy's schema gate stayed at migrations 1 to 31, since
-nothing served needs 32. (Migration 33, D4, later moved the gate to 1 to 33.)
+nothing served needs 32. (Migrations 33 and 34, D4 to D6, later moved the
+gate to 1 to 34.)
 
 **What stays as ADR 0007 D11 describes.**
 
@@ -242,14 +245,17 @@ first:
 
 1. It reads `statement_timestamp()` once: every row it stages is observed and
    received at that instant.
-2. It records the container observations the collector made: a container
-   whose audience is admissible is upserted with `access = 'ok'` and its basis;
-   one whose audience no longer is (a channel made private and not listed) is
-   set to `access = 'withdrawn'`, never deleted.
+2. It records the container observations the collector made, under the
+   withdrawal rules of D6: a container whose audience is admissible is
+   recorded with `access = 'ok'` and its basis; one whose audience no longer
+   is (a channel made private and not listed) is set to `access =
+   'withdrawn'`, never deleted; and a report never re-opens what a
+   verification withdrew.
 3. For each draft, in order: the provider and scope must be the instance's
    (else a `validation_failed` dead letter, `provider_scope_mismatch`); the
    audience is decided by the server (D6; a refusal is an `audience_refused`
-   dead letter); the draft is sealed (sanitize, redact, split at most 32 KiB
+   dead letter, and a refusal that narrows an item the memory already holds
+   withdraws the item); the draft is sealed (sanitize, redact, split at most 32 KiB
    per part, one canonical envelope and stage id per part; a refusal is a
    `validation_failed`, `oversize`, or `redaction_withheld` dead letter); an
    item whose provider clock is ahead of the observation is a `clock_ahead`
@@ -300,8 +306,9 @@ tick verified, then bodies, lexical, and dense project them like any other
 evidence. The step needs the writer authority and the content key, like the
 ingest steps, and its privileges are probed before the tick, but it is not
 in the `ingest` group, so `--steps ingest` and source retirement are
-unchanged. On a schema before migration 33 the step is `skipped`
-(`schema_below_33`) and probes nothing when no collector is configured, and
+unchanged. On a schema before migration 34 (the tables of 33 and the
+withdrawals of 34 ship together) the step is `skipped` (`schema_below_34`)
+and probes nothing when no collector is configured, and
 fails, naming `ostk-fleet-recall migrate`, when one is. The sources file
 gains `collectors`: one instance per provider scope, with its principal,
 pinned scope, audience policy, and the provider adapter's settings. Instance
@@ -348,16 +355,18 @@ provider delete, trash, or revoke, or an absence-based tombstone, is a
 version with empty text that becomes the head.
 
 **Read-time suppression.** A collected body is withheld from recall when its
-item's presented head is a tombstone or its container is `withdrawn`: inside
-the lexical lane's `WHERE`, before ranking and before the `LIMIT`; as a
-post-filter of the dense lane's nearest neighbours; and in evidence `get`. It
-reads `memory_collected_items_body_idx`, so the cost is one index probe per
-candidate. Deleted text stops being recallable at once, with no `DELETE`
+item's presented head is a tombstone, its container is `withdrawn`, or the
+item itself is withdrawn for either tier (D6): inside the lexical lane's
+`WHERE`, before ranking and before the `LIMIT`; as a post-filter of the dense
+lane's nearest neighbours; and in evidence `get`. It reads
+`memory_collected_items_body_idx` and two primary keys, so the cost is a few
+index probes per candidate. Deleted text stops being recallable at once, with no `DELETE`
 grant and no projection rewritten. Physical erasure is deferred (ADR 0006 D9
 applies).
 
-**Evidence recall stays sound.** From migration 33 on, evidence recall probes
-`SELECT` on the outbox, items, heads, containers, and collector status. When
+**Evidence recall stays sound.** From migration 34 on, evidence recall probes
+`SELECT` on the outbox, items, heads, containers, item withdrawals, and
+collector status. When
 the login may read them, readiness reports `items_awaiting_admission` (any
 pending part makes an empty answer `unknown`, `ingest_outbox_pending`), live
 and snapshot collectors are listed beside the worker's sources (kind
@@ -369,7 +378,7 @@ item from none: every collected body is dropped from the answer and from
 `collector_state_unreadable`, never `absent`. The startup probe is only a
 starting point: until the collector state is readable, every search, `get`,
 and status read checks it again, and withholds collected bodies until it is.
-A `serve` started before migration 33 (step 1 of the D2 rollout ships
+A `serve` started before migration 34 (step 1 of the D2 rollout ships
 binaries before step 2 migrates) therefore suppresses deleted and withdrawn
 items and counts pending ones from the first read after the migration and
 the grants, with no restart.
@@ -392,9 +401,43 @@ operator configuration, never from a pulled payload or an agent:
   collector or an operator import recorded as readable, else
   `operator_capture_scope` when the operator listed the scope, else refused;
 - a visibility hint from an importer or an agent can only narrow: `private`
-  and `dm` refuse the item.
+  and `dm` refuse the item;
+- a container the memory recorded as withdrawn refuses a capture, an import,
+  and a verified channel that brings no provider audience of its own.
 
-A refused item is a digest-only `audience_refused` dead letter. The package's
+A refused item is a digest-only `audience_refused` dead letter.
+
+**Withdrawals (migration 34, `src/collectors/withdrawal.rs`).** An audience
+that narrows hides what was already admitted, and a withdrawal is lifted only
+by a channel at least as trusted as the one that made it:
+
+- **Containers.** Any refusing observation withdraws a readable container.
+  An admissible observation records or re-opens one, except that a report (an
+  operator import) never re-opens or relabels a container a verification (a
+  pull or a push) recorded or withdrew: each row keeps the tier of the
+  observation that last set it, and a verified refusal of a container a report
+  withdrew makes the withdrawal verified. So a stale export can never undo a
+  pull that saw a channel go private or become shared.
+- **Containers never admitted.** A refusal that is a fact about the container
+  (a direct conversation, a container shared with another organization, a
+  restricted one the operator did not list) records it withdrawn even when
+  nothing was admitted through it, with no label and audience basis `none`.
+  Captures a capture scope admitted into it are then withheld, and later ones
+  refused. A refusal that is only the instance's policy (no declaration)
+  records nothing new.
+- **Items.** A pull, a push, or an import refusing a draft for a narrowing
+  reason (a direct, shared, or unlisted restricted container, or a
+  `private`/`dm` hint) withdraws the item for its tier when the memory already
+  holds an admitted or staged part of it: a Linear issue moved into a private
+  team that is not listed is hidden, although its earlier versions sit in a
+  public team. A first sighting is only a dead letter. Each tier's row keeps
+  the provider order that last decided it: a refusal older than that, or than
+  an admissible version a lifting channel already staged, is stale and
+  changes nothing; an admissible observation at an order at least as great,
+  through a channel at least as trusted, lifts it (at an equal order the
+  later observation wins, so listing the private team shows the issue on its
+  next read). A capture neither withdraws nor lifts an item: it has no
+  audience facts of its own. The package's
 private/denied classification still applies to every admitted item, so none
 becomes publishable, and the publication plane gains nothing: no collector
 table is a publication table or granted to the publication reader, which a

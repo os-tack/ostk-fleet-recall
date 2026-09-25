@@ -13,7 +13,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ostk_fleet_recall::FleetScope;
-use ostk_fleet_recall::collectors::audience::{AudiencePolicyV1, ProviderAudienceV1};
+use ostk_fleet_recall::collectors::audience::{
+    AudiencePolicyV1, CaptureContainersV1, CaptureScopeV1, ProviderAudienceV1,
+};
 use ostk_fleet_recall::collectors::binding::CollectorInstanceV1;
 use ostk_fleet_recall::collectors::draft::{
     CollectedItemDraftV1, DraftContainerV1, DraftSectionV1,
@@ -56,6 +58,7 @@ use common::worker::{RecordedCi, STUB_MODEL_DIGEST, StubEmbedder, WorkerFixture}
 const SLACK_TEAM: &str = "T07ACME0001";
 const SLACK_CHANNEL: &str = "C07PLATENG1";
 const DOCS_ROOT: &str = "docs.acme.specs";
+const LINEAR_ORG: &str = "5a1c0de2-7f3b-4c1e-9d2a-0b6f4e8c1a37";
 
 // ---------------------------------------------------------------------------
 // Collectors, drafts, and staging
@@ -120,6 +123,135 @@ fn docs_import() -> Collector {
         mode: CollectionModeV1::Import,
         ..docs()
     }
+}
+
+/// An operator import of a Slack export that lists the channel as public.
+fn slack_import() -> Collector {
+    Collector {
+        instance: instance("slack.export", "slack", SLACK_TEAM),
+        principal: ContractId::new("principal.slack.export").unwrap(),
+        mode: CollectionModeV1::Import,
+        policy: AudiencePolicyV1 {
+            operator_declared: true,
+            private_containers: Vec::new(),
+        },
+        ..slack()
+    }
+}
+
+/// A Linear pull collector observing one team.
+fn linear(team: &str, audience: ProviderAudienceV1) -> Collector {
+    Collector {
+        instance: instance("linear.acme", "linear", LINEAR_ORG),
+        principal: ContractId::new("principal.linear").unwrap(),
+        mode: CollectionModeV1::Pull,
+        policy: AudiencePolicyV1::default(),
+        container: ContainerObservationV1 {
+            kind: ContainerKindV1::new("linear.team").unwrap(),
+            id: team.to_owned(),
+            label: None,
+            provider_audience: audience,
+        },
+    }
+}
+
+/// An operator import of a Linear export that lists `team` as public.
+fn linear_export(team: &str) -> Collector {
+    Collector {
+        instance: instance("linear.export", "linear", LINEAR_ORG),
+        mode: CollectionModeV1::Import,
+        policy: AudiencePolicyV1 {
+            operator_declared: true,
+            private_containers: Vec::new(),
+        },
+        ..linear(team, ProviderAudienceV1::TeamPublic)
+    }
+}
+
+/// A Linear issue in `team`, at `updated_at` µs.
+fn issue(id: &str, team: &str, text: &str, order: u64) -> CollectedItemDraftV1 {
+    CollectedItemDraftV1 {
+        provider: ProviderKindV1::new("linear").unwrap(),
+        provider_scope_id: LINEAR_ORG.into(),
+        object_kind: ObjectKindV1::new("issue").unwrap(),
+        external_id: id.into(),
+        marker: Some(format!("u{order}")),
+        order_micros: order,
+        lifecycle: ItemLifecycleV1::Live,
+        container: Some(DraftContainerV1 {
+            kind: ContainerKindV1::new("linear.team").unwrap(),
+            id: team.into(),
+            label: None,
+        }),
+        thread: None,
+        author: None,
+        created_at: None,
+        updated_at: None,
+        title: Some(format!("Issue {id}")),
+        sections: vec![DraftSectionV1::whole(text.into())],
+        text_format: TextFormatV1::Markdown,
+        links: Vec::new(),
+        provider_url: None,
+        visibility: None,
+    }
+}
+
+/// Stage `drafts` as agent captures under `capture_scopes`. A capture records
+/// no container.
+async fn capture(
+    pool: &PgPool,
+    fixture: &WorkerFixture,
+    drafts: Vec<CollectedItemDraftV1>,
+    capture_scopes: &[CaptureScopeV1],
+) -> StageOutcomeV1 {
+    let redactor = redactor(
+        pool,
+        fixture,
+        CollectionModeV1::Capture.connector_schema_id(),
+    )
+    .await;
+    let agent = ContractId::new("agent.scout").unwrap();
+    let staged: Vec<StageDraftV1> = drafts
+        .into_iter()
+        .map(|draft| StageDraftV1 {
+            delivery_id: Sha256::digest(draft.external_id.as_bytes()).to_vec(),
+            provider_audience: None,
+            draft,
+        })
+        .collect();
+    sink(pool, fixture)
+        .stage(
+            &staged,
+            &StageContextV1 {
+                instance: &instance("capture.scout", "slack", SLACK_TEAM),
+                principal: &agent,
+                mode: CollectionModeV1::Capture,
+                attester: Some(&agent),
+                via: None,
+                redactor: &redactor,
+                policy: &AudiencePolicyV1::default(),
+                capture_scopes,
+                pass_seq: None,
+                container_observations: &[],
+                cursor_advances: &[],
+                source_status: None,
+            },
+        )
+        .await
+        .expect("staging runs")
+}
+
+/// The one refusal a staging call made.
+fn refusal(outcome: &StageOutcomeV1) -> (DeadLetterReasonV1, String) {
+    match outcome.items.as_slice() {
+        [StagedItemV1::Refused { reason, diagnostic }] => (*reason, diagnostic.clone()),
+        other => panic!("one refused item expected: {other:?}"),
+    }
+}
+
+/// Hits for `word`.
+async fn hits(recall: &CockroachEvidenceRecall, word: &str) -> usize {
+    recall.search(word, None, 10).await.unwrap().hits.len()
 }
 
 /// The drafts of one fixture file, `tests/fixtures/collected/items-<name>.jsonl`.
@@ -840,15 +972,15 @@ async fn live_tombstone_at_the_live_order_hides_every_item_when_configured() {
 }
 
 #[tokio::test]
-async fn live_recall_probed_before_migration_33_reads_the_collector_state_when_configured() {
+async fn live_recall_probed_before_the_collector_schema_reads_it_when_configured() {
     let Some(database_url) = common::test_database_url() else {
         return;
     };
     let pool = common::migrated_pool(&database_url).await;
     let fixture = fixture_at(&pool, "collected-stale-probe").await;
     let scope = &fixture.installed.scope;
-    // A serve that started before migration 33: its startup probe saw no
-    // collector state. The rollout migrates, installs, and configures
+    // A serve that started before migrations 33 and 34: its startup probe
+    // saw no collector state. The rollout migrates, installs, and configures
     // collectors while it keeps running.
     let mut before = capabilities(&pool, scope).await;
     before.schema_version = COLLECTED_ITEMS_SCHEMA_VERSION - 1;
@@ -860,7 +992,7 @@ async fn live_recall_probed_before_migration_33_reads_the_collector_state_when_c
     )
     .await
     .unwrap()
-    .expect("evidence recall is served before migration 33");
+    .expect("evidence recall is served before the collector schema");
     let early = CockroachEvidenceRecall::new(capability, pool.clone());
 
     stage(
@@ -910,6 +1042,256 @@ async fn live_recall_probed_before_migration_33_reads_the_collector_state_when_c
         "the deleted text is hidden from the early process too"
     );
     assert!(early.get(body).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn live_import_never_reopens_a_channel_a_pull_withdrew_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = fixture_at(&pool, "collected-stale-export").await;
+    stage(
+        &pool,
+        &fixture,
+        &slack(),
+        vec![message(
+            SLACK_CHANNEL,
+            "1790000100.000100",
+            "numbat migration is scheduled",
+            1_790_000_100_000_100,
+        )],
+    )
+    .await;
+    drain(&fixture, &pool, "collect,project").await;
+    let recall = recall(&pool, &fixture).await;
+    assert_eq!(hits(&recall, "numbat").await, 1);
+
+    // The channel goes private and is not listed: the pull withdraws it.
+    let mut private = slack();
+    private.container.provider_audience = ProviderAudienceV1::Restricted;
+    assert_eq!(
+        stage(&pool, &fixture, &private, Vec::new())
+            .await
+            .containers_withdrawn,
+        1
+    );
+    assert_eq!(hits(&recall, "numbat").await, 0);
+
+    // An operator imports an older export in which it was still public. The
+    // export neither re-opens the channel nor stages into it.
+    let imported = stage(
+        &pool,
+        &fixture,
+        &slack_import(),
+        vec![message(
+            SLACK_CHANNEL,
+            "1790000050.000100",
+            "numbat rollback drill",
+            1_790_000_050_000_100,
+        )],
+    )
+    .await;
+    assert_eq!(imported.containers_recorded, 0, "{imported:?}");
+    assert_eq!(
+        refusal(&imported),
+        (
+            DeadLetterReasonV1::AudienceRefused,
+            "container_withdrawn".to_owned()
+        )
+    );
+    drain(&fixture, &pool, "collect,project").await;
+    assert_eq!(hits(&recall, "numbat").await, 0);
+
+    // The pull seeing it public again is what re-opens it.
+    assert_eq!(
+        stage(&pool, &fixture, &slack(), Vec::new())
+            .await
+            .containers_recorded,
+        1
+    );
+    assert_eq!(hits(&recall, "numbat").await, 1);
+}
+
+#[tokio::test]
+async fn live_pull_withdraws_a_channel_only_captures_reached_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = fixture_at(&pool, "collected-shared-channel").await;
+    let scopes = [CaptureScopeV1 {
+        provider: "slack".into(),
+        provider_scope_id: SLACK_TEAM.into(),
+        containers: CaptureContainersV1::All,
+    }];
+    let shared = "C07SHARED01";
+    // No collector has seen the channel; the operator's capture scope admits
+    // an agent's capture of it.
+    let captured = capture(
+        &pool,
+        &fixture,
+        vec![message(
+            shared,
+            "1790000200.000100",
+            "pangolin contract terms",
+            1_790_000_200_000_100,
+        )],
+        &scopes,
+    )
+    .await;
+    assert_eq!(captured.rows_staged, 1, "{captured:?}");
+    drain(&fixture, &pool, "collect,project").await;
+    let recall = recall(&pool, &fixture).await;
+    assert_eq!(hits(&recall, "pangolin").await, 1);
+
+    // The pull learns it is a Slack Connect channel. Nothing was ever
+    // recorded for it, and it is recorded withdrawn now.
+    let mut connect = slack();
+    connect.container.id = shared.to_owned();
+    connect.container.label = Some("acme-partner".to_owned());
+    connect.container.provider_audience = ProviderAudienceV1::ExternallyShared;
+    let observed = stage(&pool, &fixture, &connect, Vec::new()).await;
+    assert_eq!(observed.containers_withdrawn, 1, "{observed:?}");
+    assert_eq!(hits(&recall, "pangolin").await, 0);
+    let label: Option<String> = sqlx::query_scalar(
+        "SELECT label FROM memory_collector_containers_v1 \
+         WHERE tenant_id = $1 AND project = $2 AND container_id = $3",
+    )
+    .bind(fixture.installed.scope.tenant_id)
+    .bind(&fixture.installed.scope.project)
+    .bind(shared)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(label, None, "a never-admitted container keeps no label");
+
+    // The capture scope no longer admits captures into it.
+    let again = capture(
+        &pool,
+        &fixture,
+        vec![message(
+            shared,
+            "1790000300.000100",
+            "pangolin renewal",
+            1_790_000_300_000_100,
+        )],
+        &scopes,
+    )
+    .await;
+    assert_eq!(
+        refusal(&again),
+        (
+            DeadLetterReasonV1::AudienceRefused,
+            "container_withdrawn".to_owned()
+        )
+    );
+}
+
+#[tokio::test]
+async fn live_item_moved_into_an_unlisted_private_team_is_withdrawn_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = fixture_at(&pool, "collected-moved-item").await;
+    let (public_team, private_team) = ("TEAMPUB", "TEAMSEC");
+    let issue_id = "7c2e9f40-1d3b-4a55-8e6f-2b9d0c4a1e11";
+    stage(
+        &pool,
+        &fixture,
+        &linear(public_team, ProviderAudienceV1::TeamPublic),
+        vec![issue(
+            issue_id,
+            public_team,
+            "the quokka parser drops frames",
+            1_000,
+        )],
+    )
+    .await;
+    drain(&fixture, &pool, "collect,project").await;
+    let recall = recall(&pool, &fixture).await;
+    assert_eq!(hits(&recall, "quokka").await, 1);
+
+    // An issue first seen in the private team is only a dead letter.
+    let unlisted = linear(private_team, ProviderAudienceV1::Restricted);
+    let first_sighting = stage(
+        &pool,
+        &fixture,
+        &unlisted,
+        vec![issue(
+            "0d1e2f3a-4b5c-4d6e-8f70-8192a3b4c5d6",
+            private_team,
+            "the wallaby incident",
+            1_500,
+        )],
+    )
+    .await;
+    assert_eq!(first_sighting.items_withdrawn, 0);
+
+    // The issue is triaged into the private team. The public team is still
+    // public, so no container is withdrawn; the item is.
+    let moved = stage(
+        &pool,
+        &fixture,
+        &unlisted,
+        vec![issue(
+            issue_id,
+            private_team,
+            "the quokka parser leaks keys",
+            2_000,
+        )],
+    )
+    .await;
+    assert_eq!(
+        refusal(&moved),
+        (
+            DeadLetterReasonV1::AudienceRefused,
+            "restricted_unlisted".to_owned()
+        )
+    );
+    assert_eq!(
+        (moved.containers_withdrawn, moved.items_withdrawn),
+        (0, 1),
+        "{moved:?}"
+    );
+    assert_eq!(hits(&recall, "quokka").await, 0);
+    // An import of an older export cannot lift a pull's withdrawal.
+    let older = issue(
+        issue_id,
+        public_team,
+        "the quokka parser drops frames",
+        1_000,
+    );
+    let exported = stage(&pool, &fixture, &linear_export(public_team), vec![older]).await;
+    assert_eq!(exported.item_withdrawals_lifted, 0, "{exported:?}");
+    drain(&fixture, &pool, "collect,project").await;
+    assert_eq!(hits(&recall, "quokka").await, 0);
+
+    // The operator lists the private team: the next read of the issue, at
+    // the same order, admits it and lifts the withdrawal.
+    let listed = Collector {
+        policy: AudiencePolicyV1 {
+            operator_declared: false,
+            private_containers: vec![private_team.to_owned()],
+        },
+        ..linear(private_team, ProviderAudienceV1::Restricted)
+    };
+    let admitted = stage(
+        &pool,
+        &fixture,
+        &listed,
+        vec![issue(
+            issue_id,
+            private_team,
+            "the quokka parser leaks keys",
+            2_000,
+        )],
+    )
+    .await;
+    assert_eq!(admitted.item_withdrawals_lifted, 1, "{admitted:?}");
+    drain(&fixture, &pool, "collect,project").await;
+    assert_eq!(hits(&recall, "quokka leaks").await, 1);
 }
 
 /// Fake credentials, assembled at runtime so no credential-shaped literal
@@ -1323,7 +1705,8 @@ async fn live_collect_runs_under_a_runtime_member_role_when_configured() {
     // Without the collector grants the preflight names a collector table.
     let without = RuntimeProbeRole::create_worker_with(&owner, &database_url, true, false).await;
     let refusal = probe_worker_privileges(&without.pool, &capabilities, &all).await;
-    // On a schema before migration 33 the same login passes: nothing to drain.
+    // On a schema before the collector tables the same login passes: nothing
+    // to drain.
     let mut older = capabilities.clone();
     older.schema_version = COLLECTED_ITEMS_SCHEMA_VERSION - 1;
     let older_preflight = probe_worker_privileges(&without.pool, &older, &all).await;
@@ -1335,7 +1718,7 @@ async fn live_collect_runs_under_a_runtime_member_role_when_configured() {
         message.contains("memory_collect") && message.contains("runtime-role-grants.sql"),
         "{message}"
     );
-    older_preflight.expect("below migration 33 the collect step probes nothing");
+    older_preflight.expect("below the collector schema the collect step probes nothing");
 
     let member = RuntimeProbeRole::create_worker_member(&owner, &database_url).await;
     let preflight = probe_worker_privileges(&member.pool, &capabilities, &all).await;
@@ -1355,11 +1738,11 @@ async fn live_collect_runs_under_a_runtime_member_role_when_configured() {
     assert_eq!(counter(&report, WorkerStepV1::Collect, "appended"), 5);
 }
 
-/// Mark migration 33's history row failed, so the schema reads as 32 although
+/// Mark migration 34's history row failed, so the schema reads as 33 although
 /// the tables exist, run `body`, and mark it successful again whatever
 /// `body` did. The database is shared: every live test binary runs alone, and
 /// this binary runs its tests on one thread, so no other test sees the window.
-async fn with_schema_below_33<F>(pool: &PgPool, body: F)
+async fn with_schema_below_collected_items<F>(pool: &PgPool, body: F)
 where
     F: std::future::Future<Output = ()>,
 {
@@ -1380,13 +1763,13 @@ where
 }
 
 #[tokio::test]
-async fn live_steps_all_skips_collect_below_schema_33_when_configured() {
+async fn live_steps_all_skips_collect_below_the_collector_schema_when_configured() {
     let Some(database_url) = common::test_database_url() else {
         return;
     };
     let pool = common::migrated_pool(&database_url).await;
-    let fixture = WorkerFixture::install(&pool, "collected-below-33").await;
-    with_schema_below_33(
+    let fixture = WorkerFixture::install(&pool, "collected-below-schema").await;
+    with_schema_below_collected_items(
         &pool,
         Box::pin(async {
             assert_eq!(
@@ -1411,7 +1794,7 @@ async fn live_steps_all_skips_collect_below_schema_33_when_configured() {
             }
             assert_eq!(
                 step(&report, WorkerStepV1::Collect).reason.as_deref(),
-                Some("schema_below_33")
+                Some("schema_below_34")
             );
 
             // With a collector configured, the same schema is a failure that

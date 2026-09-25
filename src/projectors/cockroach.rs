@@ -1132,11 +1132,12 @@ impl CockroachRecallReader {
     }
 
     /// Withhold, from both lanes, every collected body whose item's presented
-    /// head is a tombstone or whose container was withdrawn (ADR 0008 D5).
+    /// head is a tombstone, whose item was withdrawn, or whose container was
+    /// withdrawn (ADR 0008 D5, D6).
     ///
     /// Only for a private-plane reader whose login may read the collector
-    /// tables (migration 0033): evidence recall binds it when its startup
-    /// probe found them readable. The publication plane never needs it,
+    /// tables (migrations 0033 and 0034): evidence recall reads through it
+    /// once it finds them readable. The publication plane never needs it,
     /// because a collected body is never publication-safe.
     #[must_use]
     pub const fn with_collected_suppression(mut self) -> Self {

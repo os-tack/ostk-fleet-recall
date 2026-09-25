@@ -1,7 +1,7 @@
 -- Long-lived runtime-writer role boundary for the dedicated fleet_recall
 -- database.
 --
--- Run only after the complete successful migration prefix 1 through 33 (version
+-- Run only after the complete successful migration prefix 1 through 34 (version
 -- 25 is permanently unused). Other later successful migrations are compatible
 -- and cannot mask a missing or failed row in that bounded prefix. Run only as
 -- a cluster admin; database ownership alone is insufficient. This policy is
@@ -68,25 +68,26 @@ $$;
 -- Stage-5 body, coverage, recall, transcript, and visibility tables (19-23),
 -- normative activation (24), the CI connector (26), the discrepancy ledger
 -- (27), the conflict lifecycle log (29), worker source status (30), spec
--- conformance (31), and collected items (33). Migration 32 adds no table and
--- no grant, but lies inside the bounded prefix. A policy applied before any of
--- them fails here, before any change, rather than on a GRANT.
+-- conformance (31), and collected items and their withdrawals (33, 34).
+-- Migration 32 adds no table and no grant, but lies inside the bounded prefix.
+-- A policy applied before any of them fails here, before any change, rather
+-- than on a GRANT.
 DO $$
 DECLARE
     runtime_schema_ready BOOL;
 BEGIN
-    SELECT count(*) = 32
+    SELECT count(*) = 33
        AND min(version) = 1
-       AND max(version) = 33
+       AND max(version) = 34
        AND COALESCE(bool_and(success), false)
     INTO runtime_schema_ready
     FROM public._sqlx_migrations
-    WHERE version BETWEEN 1 AND 33;
+    WHERE version BETWEEN 1 AND 34;
 
     IF runtime_schema_ready IS DISTINCT FROM true THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
-            MESSAGE = 'runtime writer role requires successful migrations 1 through 33 (25 is permanently unused)';
+            MESSAGE = 'runtime writer role requires successful migrations 1 through 34 (25 is permanently unused)';
     END IF;
 END
 $$;
@@ -792,20 +793,21 @@ GRANT SELECT ON TABLE public.memory_writer_authority_v1 TO fleet_runtime;
 -- The Stage-5 body, coverage, recall, and transcript planes (migrations 19
 -- through 23), normative activation (24), the CI connector (26), the
 -- discrepancy ledger (27), worker source status (30, ADR 0006), spec
--- conformance (31, ADR 0007), and collected items (33, ADR 0008). Logs,
--- statements, checks, receipts, bodies, occurrences, manifests, measured
--- windows, collected item history, item links, and collector dead letters are
--- append-only by privilege (SELECT and INSERT, no UPDATE or DELETE). The
--- discrepancy relations table is read-only: nothing served appends a relation
--- yet. UPDATE on heads, cursors, pointers, watermarks, projections, the
--- transcript and collector outboxes' drain state, worker and collector
--- status, and collector containers covers CockroachDB's SELECT ... FOR UPDATE
--- and each compare-and-set advance or upsert; none of those rows is an
--- accepted envelope, a log entry, or a receipt. No table in this block receives
--- DELETE. None of these tables has a foreign key, so no parent grant is
--- needed, and none is ever granted to the publication reader. Migration 23's
--- publication views and migration 28's bootstrap import rows are deliberately
--- absent.
+-- conformance (31, ADR 0007), and collected items and their withdrawals (33
+-- and 34, ADR 0008). Logs, statements, checks, receipts, bodies, occurrences,
+-- manifests, measured windows, collected item history, item links, and
+-- collector dead letters are append-only by privilege (SELECT and INSERT, no
+-- UPDATE or DELETE). The discrepancy relations table is read-only: nothing
+-- served appends a relation yet. UPDATE on heads, cursors, pointers,
+-- watermarks, projections, the transcript and collector outboxes' drain
+-- state, worker and collector status, collector containers, and item
+-- withdrawals covers CockroachDB's SELECT ... FOR UPDATE and each
+-- compare-and-set advance or upsert (a lifted withdrawal is updated, never
+-- deleted); none of those rows is an accepted envelope, a log entry, or a
+-- receipt. No table in this block receives DELETE. None of these tables has a
+-- foreign key, so no parent grant is needed, and none is ever granted to the
+-- publication reader. Migration 23's publication views and migration 28's
+-- bootstrap import rows are deliberately absent.
 GRANT SELECT, INSERT ON TABLE
     public.memory_body_objects_v1,
     public.memory_chunk_occurrences_v1,
@@ -842,7 +844,8 @@ GRANT SELECT, INSERT, UPDATE ON TABLE
     public.memory_collected_item_heads_v1,
     public.memory_collector_sources_v1,
     public.memory_collector_cursors_v1,
-    public.memory_collector_containers_v1
+    public.memory_collector_containers_v1,
+    public.memory_collected_item_withdrawals_v1
 TO fleet_runtime;
 
 GRANT SELECT ON TABLE public.memory_discrepancy_relations_v1 TO fleet_runtime;
@@ -869,11 +872,12 @@ TO fleet_runtime;
 GRANT fleet_runtime TO fleet_writer;
 
 -- Exact direct logical-role surface: database CONNECT, public-schema USAGE,
--- one hundred thirty-one table-privilege rows, and three sequence-USAGE rows. Because
--- SHOW GRANTS FOR also exposes cluster-global external connections, the exact
--- count rejects those and every function/type/differently privileged row.
+-- one hundred thirty-four table-privilege rows, and three sequence-USAGE rows.
+-- Because SHOW GRANTS FOR also exposes cluster-global external connections, the
+-- exact count rejects those and every function/type/differently privileged
+-- row.
 SELECT IF(
-    count(*) = 136
+    count(*) = 139
         AND COALESCE(bool_and(
             NOT is_grantable
             AND (
@@ -942,7 +946,8 @@ SELECT IF(
                                 'memory_collected_item_heads_v1',
                                 'memory_collector_sources_v1',
                                 'memory_collector_cursors_v1',
-                                'memory_collector_containers_v1'
+                                'memory_collector_containers_v1',
+                                'memory_collected_item_withdrawals_v1'
                             ))
                         OR (privilege_type = 'INSERT'
                             AND object_name IN (
@@ -995,7 +1000,8 @@ SELECT IF(
                                 'memory_collected_item_heads_v1',
                                 'memory_collector_sources_v1',
                                 'memory_collector_cursors_v1',
-                                'memory_collector_containers_v1'
+                                'memory_collector_containers_v1',
+                                'memory_collected_item_withdrawals_v1'
                             ))
                         OR (privilege_type = 'UPDATE'
                             AND object_name IN (
@@ -1025,6 +1031,7 @@ SELECT IF(
                                 'memory_collector_sources_v1',
                                 'memory_collector_cursors_v1',
                                 'memory_collector_containers_v1',
+                                'memory_collected_item_withdrawals_v1',
                                 'memory_content_objects'
                             ))
                         OR (privilege_type = 'DELETE'
@@ -1044,7 +1051,7 @@ SELECT IF(
     1:::INT8,
     CAST(
         concat(
-            'runtime writer direct-grant postcondition differs from exact one-hundred-fifteen-row matrix: observed=',
+            'runtime writer direct-grant postcondition differs from exact one-hundred-thirty-nine-row matrix: observed=',
             count(*)::STRING
         )
         AS INT8

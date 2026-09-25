@@ -57,17 +57,18 @@ pub const EVIDENCE_RECALL_TABLES: [&str; 9] = [
     "memory_body_dense_projection_v1",
 ];
 
-/// The collector tables evidence recall reads from migration 33 on.
+/// The collector tables evidence recall reads from migration 34 on.
 ///
 /// Pending parts, which items a body belongs to, their heads, their
-/// containers, and the collector sources. Probed separately: a login without
-/// them still serves evidence recall, fail-closed (see the module
-/// documentation).
-pub const COLLECTOR_RECALL_TABLES: [&str; 5] = [
+/// containers, item withdrawals, and the collector sources. Probed
+/// separately: a login without them still serves evidence recall,
+/// fail-closed (see the module documentation).
+pub const COLLECTOR_RECALL_TABLES: [&str; 6] = [
     "memory_collector_outbox_v1",
     "memory_collected_items_v1",
     "memory_collected_item_heads_v1",
     "memory_collector_containers_v1",
+    "memory_collected_item_withdrawals_v1",
     "memory_collector_sources_v1",
 ];
 
@@ -143,8 +144,8 @@ const HYDRATE_SQL: &str = "SELECT body.content_sha256, body.media_type, \
        AND body.content_sha256 = ANY($3::BYTES[])";
 
 /// [`GET_SQL`] for a reader that can read the collector state: a collected
-/// body whose item was deleted or whose container was withdrawn is not
-/// returned.
+/// body whose item was deleted or withdrawn, or whose container was
+/// withdrawn, is not returned.
 static GET_COLLECTED_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "{GET_SQL} AND NOT {}",
@@ -166,7 +167,7 @@ const GET_SQL: &str = "SELECT body.media_type, body.first_accepted_event_id, \
 ///
 /// Only [`Self::Readable`] is settled for the life of the process. The other
 /// two are checked again on every read ([`CockroachEvidenceRecall`]), so a
-/// `serve` started before migration 33 or before the collector grants were
+/// `serve` started before migration 34 or before the collector grants were
 /// applied reads the collector state as soon as it can, with no restart. In
 /// either of them every collected body is withheld (fail closed): a body that
 /// exists while this process believed there were none is one it cannot tell
@@ -174,7 +175,7 @@ const GET_SQL: &str = "SELECT body.media_type, body.first_accepted_event_id, \
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum CollectorStateV1 {
-    /// The collector tables do not exist (the schema predates migration 33).
+    /// The collector tables do not exist (the schema predates migration 34).
     Absent = 0,
     /// The login may read every collector table recall needs.
     Readable = 1,
@@ -397,7 +398,7 @@ impl CockroachEvidenceRecall {
     }
 
     /// The collector state for one read. Once readable it stays so; until
-    /// then it is checked again, so migration 33 and the collector grants
+    /// then it is checked again, so migration 34 and the collector grants
     /// take effect in a running process, and every read before they do
     /// withholds collected bodies.
     async fn collector_state(&self) -> Result<CollectorStateV1> {

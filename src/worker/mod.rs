@@ -53,17 +53,17 @@
 //!
 //! # Collected items
 //!
-//! The `collect` step drains the collector outbox (migration 0033, ADR 0008
-//! D4): at most [`COLLECT_DRAIN_LIMIT`] staged parts per tick, each admitted
-//! under `connector.collected.<mode>` of this tick's head, with its item
-//! history and head move in the append's own transaction. On a schema before
-//! migration 33 the step is skipped when no collector is configured, and
-//! fails, naming `ostk-fleet-recall migrate`, when one is. Rows whose channel
-//! the active package does not admit stay pending, and the step fails naming
-//! `ostk-authority-install apply --target generation-3`. The step appends, so
-//! it needs the writer authority and the content key, like the ingest steps,
-//! but it is not one of them: `--steps ingest` and source retirement are
-//! unchanged, and `--steps collect` selects it alone.
+//! The `collect` step drains the collector outbox (migrations 0033 and 0034,
+//! ADR 0008 D4): at most [`COLLECT_DRAIN_LIMIT`] staged parts per tick, each
+//! admitted under `connector.collected.<mode>` of this tick's head, with its
+//! item history and head move in the append's own transaction. On a schema
+//! before migration 34 the step is skipped when no collector is configured,
+//! and fails, naming `ostk-fleet-recall migrate`, when one is. Rows whose
+//! channel the active package does not admit stay pending, and the step fails
+//! naming `ostk-authority-install apply --target generation-3`. The step
+//! appends, so it needs the writer authority and the content key, like the
+//! ingest steps, but it is not one of them: `--steps ingest` and source
+//! retirement are unchanged, and `--steps collect` selects it alone.
 //!
 //! # Failure isolation
 //!
