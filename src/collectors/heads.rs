@@ -16,11 +16,15 @@
 //!   greater ([`advance_tier_head`]). The provider's order, never the arrival
 //!   order, says what is newer; a strictly newer redaction profile at the same
 //!   order moves the head to the better-redacted rendering.
-//! * **A tie is counted, and broken by the version key.** Two different
-//!   versions at the same order and profile are a provider anomaly:
-//!   `order_ties` counts it, and the greater version key heads the tier, so
-//!   the head is a function of the set of complete versions and never of the
-//!   order they arrived in.
+//! * **A tie is counted, and a tombstone wins it.** Two different versions at
+//!   the same order and profile are counted in `order_ties`. A tombstone
+//!   (deleted, trashed, revoked) beats a version that is not one, so a delete
+//!   that shares the live version's order (a Slack parent kept as a
+//!   `tombstone` at its own `ts`, an export that marks an item deleted without
+//!   moving its `updated_at`) always hides it; between two versions of the
+//!   same kind the greater version key wins. Either way the head is a
+//!   function of the set of complete versions and never of the order they
+//!   arrived in.
 //! * **A report never displaces a verification.** The verified head (pull,
 //!   push) is presented whenever one exists; the reported head (capture,
 //!   import) is presented only when none does ([`present`]).
@@ -58,6 +62,12 @@ impl CompletedVersionV1 {
     const fn move_key(&self) -> (u64, u32) {
         (self.provider_order, self.redaction_profile)
     }
+
+    /// How a tie is broken: a tombstone before anything that is not one,
+    /// failing toward hiding, then the version key.
+    const fn tie_key(&self) -> (bool, Sha256Digest) {
+        (self.lifecycle.is_tombstone(), self.version_key)
+    }
 }
 
 /// One tier's head row.
@@ -81,7 +91,8 @@ pub enum HeadMoveV1 {
     /// The version is newer; it heads the tier now.
     Moved,
     /// The version ties the head's order and profile; `moved` says whether
-    /// its greater version key made it the head.
+    /// it won the tie (a tombstone over a version that is not one, else the
+    /// greater version key) and heads the tier now.
     Tied {
         /// Whether the head changed.
         moved: bool,
@@ -154,7 +165,7 @@ pub fn advance_tier_head(
         }
         Ordering::Less => HeadMoveV1::Older,
         Ordering::Equal => {
-            let moved = completed.version_key > current.version.version_key;
+            let moved = completed.tie_key() > current.version.tie_key();
             next.order_ties = next.order_ties.saturating_add(1);
             if moved {
                 next.version = completed.clone();

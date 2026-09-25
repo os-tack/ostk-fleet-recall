@@ -790,6 +790,55 @@ async fn live_tombstone_suppresses_in_evidence_lexical_dense_and_get_when_config
     assert!(recall.get(okapi_body).await.unwrap().is_none());
 }
 
+#[tokio::test]
+async fn live_tombstone_at_the_live_order_hides_every_item_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = fixture_at(&pool, "collected-tied-tombstone").await;
+    // An export that marks an item deleted without moving its clock: the
+    // delete shares the live version's order. Whichever version key is the
+    // greater, the delete must head the item.
+    let words = ["bison", "ferret", "lemur", "marten", "otter", "shrew"];
+    let live: Vec<CollectedItemDraftV1> = words
+        .iter()
+        .map(|word| {
+            doc(
+                &format!("{word}.md"),
+                &format!("the {word} ledger"),
+                5_000,
+                ItemLifecycleV1::Live,
+            )
+        })
+        .collect();
+    stage(&pool, &fixture, &docs(), live).await;
+    drain(&fixture, &pool, "collect,project").await;
+    let recall = recall(&pool, &fixture).await;
+    for word in words {
+        assert_eq!(
+            recall.search(word, None, 10).await.unwrap().hits.len(),
+            1,
+            "{word} is recalled before the delete"
+        );
+    }
+
+    let deleted: Vec<CollectedItemDraftV1> = words
+        .iter()
+        .map(|word| doc(&format!("{word}.md"), "", 5_000, ItemLifecycleV1::Deleted))
+        .collect();
+    stage(&pool, &fixture, &docs(), deleted).await;
+    drain(&fixture, &pool, "collect,project").await;
+    for word in words {
+        let rows = heads(&pool, &fixture, &format!("{word}.md")).await;
+        assert_eq!(rows[0].4, "deleted", "{word}: {rows:?}");
+        assert!(
+            recall.search(word, None, 10).await.unwrap().hits.is_empty(),
+            "{word} is hidden after a delete at its own order"
+        );
+    }
+}
+
 /// Fake credentials, assembled at runtime so no credential-shaped literal
 /// sits in the source.
 fn planted_secrets() -> Vec<String> {

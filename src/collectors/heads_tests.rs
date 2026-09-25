@@ -90,6 +90,38 @@ fn a_tie_is_counted_and_broken_by_the_greater_version_key() {
 }
 
 #[test]
+fn a_tombstone_wins_a_tie_whatever_the_version_keys() {
+    let tombstone = |key: u8| CompletedVersionV1 {
+        lifecycle: ItemLifecycleV1::Deleted,
+        ..version(key, 1_000, 1)
+    };
+    // The delete's version key is the smaller one: the key alone would keep
+    // the live version presented.
+    let live = head(version(0xee, 1_000, 1));
+    let (row, change) = advance_tier_head(Some(&live), &tombstone(0x11));
+    let row = row.unwrap();
+    assert_eq!(change, HeadMoveV1::Tied { moved: true });
+    assert_eq!(row.version.lifecycle, ItemLifecycleV1::Deleted);
+    assert_eq!(row.order_ties, 1);
+
+    // A live version tied with a tombstone head never displaces it.
+    let deleted = head(tombstone(0x11));
+    let (row, change) = advance_tier_head(Some(&deleted), &version(0xee, 1_000, 1));
+    assert_eq!(change, HeadMoveV1::Tied { moved: false });
+    assert_eq!(row.unwrap().version.lifecycle, ItemLifecycleV1::Deleted);
+
+    // Between two tombstones the version key still decides.
+    let (row, change) = advance_tier_head(Some(&deleted), &tombstone(0x22));
+    assert_eq!(change, HeadMoveV1::Tied { moved: true });
+    assert_eq!(row.unwrap().version.version_key, digest(0x22));
+
+    // A newer live version (an undelete) still moves past a tombstone.
+    let (row, change) = advance_tier_head(Some(&deleted), &version(0x05, 1_001, 1));
+    assert_eq!(change, HeadMoveV1::Moved);
+    assert_eq!(row.unwrap().version.lifecycle, ItemLifecycleV1::Live);
+}
+
+#[test]
 fn the_head_version_completing_again_changes_nothing() {
     let current = head(version(3, 10, 1));
     assert_eq!(
@@ -273,6 +305,32 @@ fn arrival_order_never_decides_the_current_view() {
             );
         }
         assert_eq!(presentation, expected_presentation, "{order:?}");
+    }
+}
+
+#[test]
+fn a_tied_tombstone_heads_the_tier_in_every_arrival_order() {
+    let tombstone = CompletedVersionV1 {
+        lifecycle: ItemLifecycleV1::Trashed,
+        ..version(0x01, 1_000, 1)
+    };
+    let versions = BTreeMap::from([
+        (0x01, tombstone.clone()),
+        (0xee, version(0xee, 1_000, 1)),
+        (0x77, version(0x77, 1_000, 1)),
+    ]);
+    let arrivals: Vec<Arrival> = versions
+        .keys()
+        .map(|key| Arrival {
+            tier: TrustTierV1::Verified,
+            version: *key,
+            ordinal: 0,
+        })
+        .collect();
+    for order in permutations(&arrivals) {
+        let (heads, _) = replay(&order, &versions);
+        assert_eq!(heads["verified"].version, tombstone, "{order:?}");
+        assert_eq!(heads["verified"].order_ties, 2, "{order:?}");
     }
 }
 

@@ -327,10 +327,14 @@ both tier rows in the drain's projection:
   redaction profile at the same order moves the head to the better-redacted
   rendering. An older version arriving late is counted (`version_count`) and
   the head stays.
-- **Ties are counted and broken by the version key.** Two different versions
-  at the same order and profile increment `order_ties`, and the greater
-  version key heads the tier, so the head is a function of the set of
-  complete versions, whatever order they arrived in.
+- **Ties are counted, and a tombstone wins them.** Two different versions
+  at the same order and profile increment `order_ties`. A tombstone (deleted,
+  trashed, revoked) beats a version that is not one, so a delete that shares
+  the live version's order (a Slack parent kept as a `tombstone` at its own
+  `ts`, an export that marks an item deleted without moving its clock) always
+  hides it; between two versions of the same kind the greater version key
+  wins. Either way the head is a function of the set of complete versions,
+  whatever order they arrived in.
 - **A report never displaces a verification.** Exactly one row per item is
   presented (a partial unique index): the verified head when one exists, else
   the reported one. The row that stops being presented is updated before the
