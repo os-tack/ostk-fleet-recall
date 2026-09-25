@@ -217,17 +217,24 @@ over MCP.
   proof of conformance), and a branch that allows only `limit`,
   `include_resolved`, and an optional 64-hex episode `id`.
 - **What it answers.** `data.discrepancies[]`: by default the standing
-  episodes of live specs, most recently changed first; with
-  `include_resolved`, closed episodes and episodes of specs no longer in force
-  too; with `id`, one episode in any state with its lifecycle history. Each
-  carries the statement it violates (spec document, cited spans, effective
-  interval, expectation) and what its opening check observed (commit,
-  condition, verification outcome, observer event). `data.specs[]` carries
-  every live spec with its latest check, `unknown` included, and
-  `data.coverage` the counts and a note that episodes record verified
-  nonconformance only. `recall(status)` adds
-  `spec_conformance {served, active_specs, open_discrepancies, unknown_specs,
-  never_checked_specs}`.
+  episodes of live specs that have not expired, most recently changed first;
+  with `include_resolved`, closed episodes and episodes of specs no longer in
+  force (retired, superseded, or past their `effective_until`) too; with
+  `id`, one episode in any state with its lifecycle history. Each carries the
+  statement it violates (spec document, cited spans, effective interval,
+  expectation) and what its opening check observed (commit, condition,
+  verification outcome, observer event). `data.specs[]` carries every live
+  spec with its latest check, `unknown` included, and its `effect` at the
+  database's time: `in_force`, `scheduled`, or `expired`. The normative
+  projection's live set is not filtered by time, so the reader classifies
+  each statement against `statement_timestamp()` inside its transaction, the
+  clock `check` selects at: only specs in force count as active, never
+  checked, or unknown. The standing episodes of a scheduled spec are still
+  listed and counted, since a check evaluated through a later instant
+  verified them. `data.coverage` carries the counts and a note that episodes
+  record verified nonconformance only. `recall(status)` adds
+  `spec_conformance {served, active_specs, scheduled_specs, expired_specs,
+  open_discrepancies, unknown_specs, never_checked_specs}`.
 
 **Why.** The claim ledger's conflicts and the spec plane's episodes have
 different authorities, lifecycles, and evidence. Keeping them apart keeps

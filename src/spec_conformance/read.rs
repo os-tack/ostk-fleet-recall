@@ -9,11 +9,18 @@
 //!   [`MAX_LISTED_SPECS`] families), and for each statement still live in one
 //!   the spec statement `ostk-spec activate` recorded and its latest check. A
 //!   live statement without a recorded spec is not a spec (only `ostk-spec`
-//!   records one) and is left out;
+//!   records one) and is left out. The projection's live set is not
+//!   filtered by time, so each spec is classified against the database's
+//!   time inside the read ([`SpecEffectV1`]): in force, scheduled (not yet in
+//!   effect), or expired (past its `effective_until`). Only specs in force
+//!   count as active, as `ostk-spec check` selects at that clock;
 //! * the discrepancy episodes, most recently changed first: by default only
 //!   the ones that still stand (open, acknowledged, or waived) in the family
-//!   of a live spec, so an episode of a retired or superseded spec is hidden;
-//!   with `include_resolved`, every episode in the scope;
+//!   of a live spec that has not expired, so an episode of a retired,
+//!   superseded, or expired spec is hidden; with `include_resolved`, every
+//!   episode in the scope. An episode of a scheduled spec (a check evaluated
+//!   through an instant after the server's clock) is listed, because the
+//!   nonconformance it records was verified;
 //! * for each spec episode, its statement and the check that opened it.
 //!
 //! Episodes record verified nonconformance only, so an answer always carries
@@ -33,6 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Postgres, Row as _, Transaction};
@@ -139,7 +147,7 @@ const OPENING_CHECKS_SQL: &str = concat!(
 );
 
 /// `$3` is `include_resolved`; without it only standing episodes of the
-/// families in `$4` (the live specs') are listed.
+/// families in `$4` (the live specs' that have not expired) are listed.
 const LIST_EPISODES_SQL: &str = concat!(
     episode_select!(),
     " WHERE p.tenant_id = $1 AND p.project = $2 \
@@ -168,6 +176,37 @@ const COUNT_STANDING_SQL: &str = concat!(
     standing_states!(),
     " AND h.family_fingerprint = ANY($3::BYTES[])"
 );
+
+/// Where a live spec stands at the read's database time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpecEffectV1 {
+    /// Its effective interval contains the read's time: `ostk-spec check`
+    /// selects it now.
+    InForce,
+    /// It takes effect after the read's time.
+    Scheduled,
+    /// Its `effective_until` is at or before the read's time.
+    Expired,
+}
+
+impl SpecEffectV1 {
+    /// Where `interval` stands at `now`.
+    #[must_use]
+    pub fn at(interval: &NormativeStatementIntervalV1, now: &CanonicalTimestamp) -> Self {
+        if interval
+            .effective_until
+            .as_ref()
+            .is_some_and(|until| until <= now)
+        {
+            Self::Expired
+        } else if &interval.effective_from > now {
+            Self::Scheduled
+        } else {
+            Self::InForce
+        }
+    }
+}
 
 /// Something a read skipped or could not settle, reported beside its answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -270,8 +309,9 @@ pub struct SpecDiscrepancyV1 {
     pub severity: DiscrepancySeverityV1,
     pub lifecycle_state: LifecycleState,
     pub verification_state: VerificationState,
-    /// Whether the statement it violates is still live in its binding
-    /// family. Always false for an episode with no readable spec.
+    /// Whether the statement it violates still stands: live in its binding
+    /// family and not expired (in force, or scheduled). Always false for an
+    /// episode with no readable spec.
     pub spec_live: bool,
     pub detected_at: CanonicalTimestamp,
     pub subject: ResourceUri,
@@ -322,10 +362,14 @@ impl SpecLastCheckV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SpecSummaryV1 {
     pub binding_family_id: ContractId,
-    /// The binding family's normative resolution: `active` (one live
-    /// statement), `scheduled` (several with disjoint windows), or `unknown`
-    /// (contested: a check of it reports unknown and records nothing).
+    /// The binding family's normative resolution, which is not about time:
+    /// `active` (one live statement), `scheduled` (several with disjoint
+    /// windows), or `unknown` (contested: a check of it reports unknown and
+    /// records nothing).
     pub resolution: &'static str,
+    /// Whether this statement is in force at the read's database time,
+    /// scheduled, or expired.
+    pub effect: SpecEffectV1,
     pub statement_id: Sha256Digest,
     pub effective_from: CanonicalTimestamp,
     pub effective_until: Option<CanonicalTimestamp>,
@@ -340,9 +384,15 @@ pub struct SpecCoverageV1 {
     pub episodes_returned: usize,
     /// More episodes matched than the limit returned.
     pub episodes_truncated: bool,
+    /// Specs in force at the read's database time.
     pub active_specs: usize,
+    /// Live specs that take effect later.
+    pub scheduled_specs: usize,
+    /// Live specs past their `effective_until`.
+    pub expired_specs: usize,
+    /// Specs in force that were never checked.
     pub never_checked_specs: usize,
-    /// Live specs whose latest check is `unknown`.
+    /// Specs in force whose latest check is `unknown`.
     pub unknown_specs: usize,
     /// More binding families or live statements exist than one read
     /// considers; the specs, their counts, and the default episode filter
@@ -360,13 +410,21 @@ pub struct SpecConformanceAnswerV1 {
     pub warnings: Vec<SpecConformanceWarningV1>,
 }
 
-/// The counts `recall(status)` reports.
+/// The counts `recall(status)` reports, at the read's database time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecConformanceStatusV1 {
+    /// Specs in force.
     pub active_specs: usize,
-    /// Standing (open, acknowledged, or waived) episodes of live specs.
+    /// Live specs that take effect later.
+    pub scheduled_specs: usize,
+    /// Live specs past their `effective_until`.
+    pub expired_specs: usize,
+    /// Standing (open, acknowledged, or waived) episodes of specs in force
+    /// or scheduled: what the default listing lists.
     pub open_discrepancies: u64,
+    /// Specs in force whose latest check is `unknown`.
     pub unknown_specs: usize,
+    /// Specs in force that were never checked.
     pub never_checked_specs: usize,
     pub warnings: Vec<SpecConformanceWarningV1>,
 }
@@ -376,7 +434,8 @@ pub struct SpecConformanceStatusV1 {
 pub trait SpecConformanceRead: Send + Sync {
     /// The episodes, newest first, at most `limit` (1 to
     /// [`MAX_DISCREPANCY_RESULTS`]) of them: only standing episodes of live
-    /// specs, or every episode with `include_resolved`; and every live spec.
+    /// specs that have not expired, or every episode with
+    /// `include_resolved`; and every live spec.
     async fn list(&self, include_resolved: bool, limit: usize) -> Result<SpecConformanceAnswerV1>;
 
     /// One episode by id, in any state, with its lifecycle history; and
@@ -525,6 +584,7 @@ struct ReadScope {
 /// spec.
 struct LiveSpec {
     resolution: &'static str,
+    effect: SpecEffectV1,
     interval: NormativeStatementIntervalV1,
     binding_family_id: ContractId,
     family_fingerprint: DiscrepancyFamilyFingerprintV1,
@@ -535,8 +595,8 @@ struct LiveSpec {
 /// Everything one read learned about the scope's specs.
 struct SpecSnapshot {
     specs: Vec<LiveSpec>,
-    /// Every statement live in a family read, spec or not.
-    live_statements: BTreeSet<Sha256Digest>,
+    /// Every statement live in a family read and not expired, spec or not.
+    standing_statements: BTreeSet<Sha256Digest>,
     /// Every statement read and verified, by id.
     statements: BTreeMap<Sha256Digest, RecordedSpecStatementV1>,
     truncated: bool,
@@ -544,10 +604,13 @@ struct SpecSnapshot {
 }
 
 impl SpecSnapshot {
-    /// The live specs' discrepancy families, as the heads table stores them.
+    /// The discrepancy families of the live specs that have not expired, as
+    /// the heads table stores them: the families whose standing episodes the
+    /// default listing and the status count.
     fn family_bytes(&self) -> Vec<Vec<u8>> {
         self.specs
             .iter()
+            .filter(|spec| spec.effect != SpecEffectV1::Expired)
             .map(|spec| spec.family_fingerprint.digest())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -555,16 +618,24 @@ impl SpecSnapshot {
             .collect()
     }
 
+    fn with_effect(&self, effect: SpecEffectV1) -> impl Iterator<Item = &LiveSpec> {
+        self.specs.iter().filter(move |spec| spec.effect == effect)
+    }
+
+    fn count(&self, effect: SpecEffectV1) -> usize {
+        self.with_effect(effect).count()
+    }
+
+    /// Specs in force that were never checked.
     fn never_checked(&self) -> usize {
-        self.specs
-            .iter()
+        self.with_effect(SpecEffectV1::InForce)
             .filter(|spec| spec.last_check.is_none())
             .count()
     }
 
+    /// Specs in force whose latest check is `unknown`.
     fn unknown(&self) -> usize {
-        self.specs
-            .iter()
+        self.with_effect(SpecEffectV1::InForce)
             .filter(|spec| {
                 spec.last_check
                     .as_ref()
@@ -581,7 +652,9 @@ impl SpecSnapshot {
         let coverage = SpecCoverageV1 {
             episodes_returned: discrepancies.len(),
             episodes_truncated,
-            active_specs: self.specs.len(),
+            active_specs: self.count(SpecEffectV1::InForce),
+            scheduled_specs: self.count(SpecEffectV1::Scheduled),
+            expired_specs: self.count(SpecEffectV1::Expired),
             never_checked_specs: self.never_checked(),
             unknown_specs: self.unknown(),
             specs_truncated: self.truncated,
@@ -593,6 +666,7 @@ impl SpecSnapshot {
             .map(|spec| SpecSummaryV1 {
                 binding_family_id: spec.binding_family_id,
                 resolution: spec.resolution,
+                effect: spec.effect,
                 statement_id: spec.interval.statement_id,
                 effective_from: spec.interval.effective_from,
                 effective_until: spec.interval.effective_until,
@@ -696,7 +770,9 @@ async fn read_status(
             .await?
     };
     Ok(SpecConformanceStatusV1 {
-        active_specs: snapshot.specs.len(),
+        active_specs: snapshot.count(SpecEffectV1::InForce),
+        scheduled_specs: snapshot.count(SpecEffectV1::Scheduled),
+        expired_specs: snapshot.count(SpecEffectV1::Expired),
         open_discrepancies: u64::try_from(standing)
             .map_err(|_| FleetError::Memory("a negative episode count".into()))?,
         unknown_specs: snapshot.unknown(),
@@ -705,68 +781,33 @@ async fn read_status(
     })
 }
 
+/// One statement live in a binding family: the family's resolution, the
+/// statement's interval, and the family.
+type LiveInterval = (&'static str, NormativeStatementIntervalV1, ContractId);
+
 /// Every live spec of the first [`MAX_LISTED_SPECS`] binding families, with
-/// its latest check.
+/// its latest check and where it stands at the database's time.
 async fn read_snapshot(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &ReadScope,
 ) -> Result<SpecSnapshot> {
-    let mut warnings = Vec::new();
-    let rows: Vec<PgRow> = sqlx::query(NORMATIVE_PROJECTIONS_SQL)
-        .bind(scope.tenant_id)
-        .bind(&scope.project)
-        .bind(sql_limit(MAX_LISTED_SPECS + 1)?)
-        .fetch_all(&mut **transaction)
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT pg_catalog.statement_timestamp()")
+        .fetch_one(&mut **transaction)
         .await?;
-    let mut truncated = rows.len() > MAX_LISTED_SPECS;
-    let mut live = Vec::new();
-    for row in rows.iter().take(MAX_LISTED_SPECS) {
-        let projection = match decode_normative_projection(row) {
-            Ok(projection) => projection,
-            Err(error) => {
-                skip(
-                    &mut warnings,
-                    "spec_row_unreadable",
-                    format!("a normative projection was skipped: {error}"),
-                );
-                continue;
-            }
-        };
-        if matches!(projection.resolution, NormativeResolutionV1::Unknown { .. }) {
-            skip(
-                &mut warnings,
-                "spec_family_contested",
-                format!(
-                    "binding family {} is contested: which of its statements is in force is \
-                     unknown, so checking it reports unknown and records nothing",
-                    projection.binding_family_id
-                ),
-            );
-        }
-        let resolution = projection.resolution.as_str();
-        for interval in projection.live {
-            live.push((resolution, interval, projection.binding_family_id.clone()));
-        }
-    }
-    if live.len() > MAX_LISTED_SPECS {
-        live.truncate(MAX_LISTED_SPECS);
-        truncated = true;
-    }
-    if truncated {
-        skip(
-            &mut warnings,
-            "specs_truncated",
-            format!(
-                "only the first {MAX_LISTED_SPECS} binding families or live statements are \
-                 read; the specs, their counts, and the default episode listing cover only those"
-            ),
-        );
-    }
-    let live_statements: BTreeSet<Sha256Digest> = live
+    let now = CanonicalTimestamp::from_datetime(&now)?;
+    let mut warnings = Vec::new();
+    let (live, truncated) = read_live_intervals(transaction, scope, &mut warnings).await?;
+    let standing_statements: BTreeSet<Sha256Digest> = live
         .iter()
+        .filter(|(_, interval, _)| SpecEffectV1::at(interval, &now) != SpecEffectV1::Expired)
         .map(|(_, interval, _)| interval.statement_id)
         .collect();
-    let wanted: Vec<Sha256Digest> = live_statements.iter().copied().collect();
+    let wanted: Vec<Sha256Digest> = live
+        .iter()
+        .map(|(_, interval, _)| interval.statement_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let statements = read_statements(transaction, scope, &wanted, &mut warnings).await?;
     let mut checks = read_latest_checks(transaction, scope, &wanted, &mut warnings).await?;
 
@@ -792,6 +833,7 @@ async fn read_snapshot(
         };
         specs.push(LiveSpec {
             resolution,
+            effect: SpecEffectV1::at(&interval, &now),
             last_check: checks.remove(&interval.statement_id),
             expectation: SpecExpectationViewV1::of(&statement.expectation),
             interval,
@@ -801,11 +843,72 @@ async fn read_snapshot(
     }
     Ok(SpecSnapshot {
         specs,
-        live_statements,
+        standing_statements,
         statements,
         truncated,
         warnings,
     })
+}
+
+/// The statements live in the first [`MAX_LISTED_SPECS`] binding families,
+/// at most [`MAX_LISTED_SPECS`] of them, and whether either bound cut the
+/// read. A contested family and a cut read are warned about.
+async fn read_live_intervals(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &ReadScope,
+    warnings: &mut Vec<SpecConformanceWarningV1>,
+) -> Result<(Vec<LiveInterval>, bool)> {
+    let rows: Vec<PgRow> = sqlx::query(NORMATIVE_PROJECTIONS_SQL)
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(sql_limit(MAX_LISTED_SPECS + 1)?)
+        .fetch_all(&mut **transaction)
+        .await?;
+    let mut truncated = rows.len() > MAX_LISTED_SPECS;
+    let mut live = Vec::new();
+    for row in rows.iter().take(MAX_LISTED_SPECS) {
+        let projection = match decode_normative_projection(row) {
+            Ok(projection) => projection,
+            Err(error) => {
+                skip(
+                    warnings,
+                    "spec_row_unreadable",
+                    format!("a normative projection was skipped: {error}"),
+                );
+                continue;
+            }
+        };
+        if matches!(projection.resolution, NormativeResolutionV1::Unknown { .. }) {
+            skip(
+                warnings,
+                "spec_family_contested",
+                format!(
+                    "binding family {} is contested: which of its statements is in force is \
+                     unknown, so checking it reports unknown and records nothing",
+                    projection.binding_family_id
+                ),
+            );
+        }
+        let resolution = projection.resolution.as_str();
+        for interval in projection.live {
+            live.push((resolution, interval, projection.binding_family_id.clone()));
+        }
+    }
+    if live.len() > MAX_LISTED_SPECS {
+        live.truncate(MAX_LISTED_SPECS);
+        truncated = true;
+    }
+    if truncated {
+        skip(
+            warnings,
+            "specs_truncated",
+            format!(
+                "only the first {MAX_LISTED_SPECS} binding families or live statements are \
+                 read; the specs, their counts, and the default episode listing cover only those"
+            ),
+        );
+    }
+    Ok((live, truncated))
 }
 
 /// The discrepancy family of a statement live in `binding_family_id`.
@@ -1082,7 +1185,7 @@ fn describe_episode(
     });
     let spec_live = spec
         .as_ref()
-        .is_some_and(|spec| snapshot.live_statements.contains(&spec.statement_id));
+        .is_some_and(|spec| snapshot.standing_statements.contains(&spec.statement_id));
     let envelope = stored.envelope;
     SpecDiscrepancyV1 {
         episode_id: stored.episode,

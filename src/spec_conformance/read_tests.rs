@@ -96,10 +96,19 @@ fn check_of(statement_id: Sha256Digest, verdict: SpecVerdictV1) -> StoredSpecChe
 }
 
 fn live_spec(member: &str, last_check: Option<SpecVerdictV1>) -> LiveSpec {
+    effective_spec(member, last_check, SpecEffectV1::InForce)
+}
+
+fn effective_spec(
+    member: &str,
+    last_check: Option<SpecVerdictV1>,
+    effect: SpecEffectV1,
+) -> LiveSpec {
     let statement = statement_for(member);
     let family = &statement.proposal.binding_family_id;
     LiveSpec {
         resolution: "active",
+        effect,
         interval: NormativeStatementIntervalV1 {
             statement_id: statement.statement_id,
             effective_from: statement.proposal.effective_from.clone(),
@@ -121,7 +130,7 @@ fn every_live_spec_is_counted_by_its_latest_check() {
             live_spec("Forget", Some(SpecVerdictV1::Nonconforming)),
             live_spec("Record", Some(SpecVerdictV1::Conforming)),
         ],
-        live_statements: BTreeSet::new(),
+        standing_statements: BTreeSet::new(),
         statements: BTreeMap::new(),
         truncated: false,
         warnings: Vec::new(),
@@ -144,6 +153,99 @@ fn every_live_spec_is_counted_by_its_latest_check() {
     assert!(unknown.episode_id.is_none());
     let nonconforming = answer.specs[2].last_check.as_ref().unwrap();
     assert!(nonconforming.episode_id.is_some());
+}
+
+#[test]
+fn a_spec_is_in_force_only_inside_its_effective_interval() {
+    let interval = |from: &str, until: Option<&str>| NormativeStatementIntervalV1 {
+        statement_id: label("statement"),
+        effective_from: timestamp(from),
+        effective_until: until.map(timestamp),
+    };
+    let now = timestamp("2026-09-10T00:00:00.000000000Z");
+    for (from, until, effect) in [
+        (
+            "2026-09-01T00:00:00.000000000Z",
+            None,
+            SpecEffectV1::InForce,
+        ),
+        (
+            "2026-09-10T00:00:00.000000000Z",
+            Some("2026-09-10T00:00:00.000000001Z"),
+            SpecEffectV1::InForce,
+        ),
+        (
+            "2026-09-10T00:00:00.000000001Z",
+            None,
+            SpecEffectV1::Scheduled,
+        ),
+        (
+            "2026-09-01T00:00:00.000000000Z",
+            Some("2026-09-10T00:00:00.000000000Z"),
+            SpecEffectV1::Expired,
+        ),
+    ] {
+        assert_eq!(
+            SpecEffectV1::at(&interval(from, until), &now),
+            effect,
+            "{from} to {until:?}"
+        );
+    }
+}
+
+#[test]
+fn only_specs_in_force_count_as_active_and_expired_ones_list_no_episodes() {
+    let in_force = effective_spec("Forget", None, SpecEffectV1::InForce);
+    let scheduled = effective_spec("Record", None, SpecEffectV1::Scheduled);
+    let expired = effective_spec(
+        "Delete",
+        Some(SpecVerdictV1::Unknown),
+        SpecEffectV1::Expired,
+    );
+    let listed_families: BTreeSet<Vec<u8>> = [&in_force, &scheduled]
+        .iter()
+        .map(|spec| spec.family_fingerprint.digest().as_bytes().to_vec())
+        .collect();
+    let snapshot = SpecSnapshot {
+        specs: vec![in_force, scheduled, expired],
+        standing_statements: BTreeSet::new(),
+        statements: BTreeMap::new(),
+        truncated: false,
+        warnings: Vec::new(),
+    };
+    assert_eq!(
+        snapshot.family_bytes().into_iter().collect::<BTreeSet<_>>(),
+        listed_families,
+        "an expired spec's episodes are listed only with include_resolved"
+    );
+
+    let answer = snapshot.answer(Vec::new(), false);
+    let coverage = &answer.coverage;
+    assert_eq!(
+        (
+            coverage.active_specs,
+            coverage.scheduled_specs,
+            coverage.expired_specs
+        ),
+        (1, 1, 1)
+    );
+    // Only specs in force are counted as never checked or unknown.
+    assert_eq!(
+        (coverage.never_checked_specs, coverage.unknown_specs),
+        (1, 0)
+    );
+    assert_eq!(
+        answer
+            .specs
+            .iter()
+            .map(|spec| spec.effect)
+            .collect::<Vec<_>>(),
+        [
+            SpecEffectV1::InForce,
+            SpecEffectV1::Scheduled,
+            SpecEffectV1::Expired
+        ]
+    );
 }
 
 #[test]

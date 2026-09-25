@@ -22,7 +22,7 @@ pub enum RecallAction {
     Synthesize,
     Status,
     Audit,
-    /// Spec-nonconformance episodes and every active spec's latest check
+    /// Spec-nonconformance episodes and every live spec's latest check
     /// (ADR 0007); served only where [`RecallSurface::discrepancies`] is.
     Discrepancies,
 }

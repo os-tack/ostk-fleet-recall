@@ -113,7 +113,7 @@ pub use providers::{
 pub use read::{
     CockroachSpecConformanceReader, MAX_DISCREPANCY_RESULTS, MAX_EPISODE_HISTORY, MAX_LISTED_SPECS,
     SPEC_CONFORMANCE_NOTE, SpecConformanceAnswerV1, SpecConformanceRead, SpecConformanceStatusV1,
-    SpecConformanceWarningV1, SpecCoverageV1, SpecDiscrepancyV1, SpecEpisodeEventV1,
+    SpecConformanceWarningV1, SpecCoverageV1, SpecDiscrepancyV1, SpecEffectV1, SpecEpisodeEventV1,
     SpecEvidenceV1, SpecExpectationViewV1, SpecLastCheckV1, SpecObservationV1, SpecStatementViewV1,
     SpecSummaryV1, start_spec_conformance,
 };

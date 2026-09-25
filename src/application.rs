@@ -2460,6 +2460,8 @@ async fn spec_conformance_status_within(
             json!({
                 "served": true,
                 "active_specs": status.active_specs,
+                "scheduled_specs": status.scheduled_specs,
+                "expired_specs": status.expired_specs,
                 "open_discrepancies": status.open_discrepancies,
                 "unknown_specs": status.unknown_specs,
                 "never_checked_specs": status.never_checked_specs,
@@ -2476,6 +2478,8 @@ async fn spec_conformance_status_within(
                 json!({
                     "served": true,
                     "active_specs": null,
+                    "scheduled_specs": null,
+                    "expired_specs": null,
                     "open_discrepancies": null,
                     "unknown_specs": null,
                     "never_checked_specs": null,
@@ -4900,6 +4904,8 @@ mod tests {
                     episodes_returned: 0,
                     episodes_truncated: false,
                     active_specs: 1,
+                    scheduled_specs: 0,
+                    expired_specs: 0,
                     never_checked_specs: 1,
                     unknown_specs: 0,
                     specs_truncated: false,
@@ -4923,6 +4929,8 @@ mod tests {
             }
             self.outcome(crate::spec_conformance::SpecConformanceStatusV1 {
                 active_specs: 2,
+                scheduled_specs: 1,
+                expired_specs: 0,
                 open_discrepancies: 1,
                 unknown_specs: 1,
                 never_checked_specs: 0,
@@ -5045,6 +5053,8 @@ mod tests {
             json!({
                 "served": true,
                 "active_specs": 2,
+                "scheduled_specs": 1,
+                "expired_specs": 0,
                 "open_discrepancies": 1,
                 "unknown_specs": 1,
                 "never_checked_specs": 0,
@@ -5055,6 +5065,8 @@ mod tests {
         let unavailable = json!({
             "served": true,
             "active_specs": null,
+            "scheduled_specs": null,
+            "expired_specs": null,
             "open_discrepancies": null,
             "unknown_specs": null,
             "never_checked_specs": null,

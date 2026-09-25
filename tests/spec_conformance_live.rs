@@ -32,8 +32,10 @@
 //! specs in force, each with the statement it violates and the commit its
 //! opening check observed, beside every spec's latest check, `unknown`
 //! included; `include_resolved` adds closed episodes and episodes of specs
-//! not in force; an episode looked up by id carries its lifecycle history;
-//! another project sees none of it; and the action is served, with
+//! not in force; only specs in force at the database's time count as
+//! active, and an expired spec's episodes are hidden by default while a
+//! scheduled spec's are listed; an episode looked up by id carries its
+//! lifecycle history; another project sees none of it; and the action is served, with
 //! `recall(status)`'s block, exactly when the login may SELECT every table it
 //! reads, while an unserved deployment keeps its tools and status as they
 //! were.
@@ -126,10 +128,10 @@ use ostk_fleet_recall::spec_conformance::{
     CockroachSpecRepository, DraftStatementRequestV1, ExpectedMembershipV1,
     RememberActionExpectationV1, SpecActivationOutcomeV1, SpecCheckOutcomeV1, SpecCheckRecordV1,
     SpecCheckRequestV1, SpecConformanceAnswerV1, SpecConformanceRead, SpecDetectionV1,
-    SpecDiscrepancyActionV1, SpecEpisodeTransitionV1, SpecRowWriteV1, SpecSummaryV1, SpecVerdictV1,
-    activate_spec_statement, append_episode_lifecycle, build_spec_envelope, database_now,
-    draft_spec_statement, normative_repository, repository_selector, repository_subject,
-    require_spec_statement, run_spec_check, spec_predicate,
+    SpecDiscrepancyActionV1, SpecEffectV1, SpecEpisodeTransitionV1, SpecRowWriteV1, SpecSummaryV1,
+    SpecVerdictV1, activate_spec_statement, append_episode_lifecycle, build_spec_envelope,
+    database_now, draft_spec_statement, normative_repository, repository_selector,
+    repository_subject, require_spec_statement, run_spec_check, spec_predicate,
     spec_repository as runtime_spec_repository, spec_span_digest, start_spec_conformance,
 };
 use ostk_fleet_recall::store::cockroach::{
@@ -1165,6 +1167,32 @@ impl SpecPlane {
     ) -> SeededSpec {
         let expectation = expectation(member, expected);
         let proposal = proposal_for(&expectation, semantic_scope());
+        self.seed(proposal, expectation, live).await
+    }
+
+    /// Record "`member` must be absent" as a spec in effect over
+    /// `[effective_from, effective_until)`, and make it normative.
+    async fn statement_during(
+        &self,
+        member: &str,
+        effective_from: CanonicalTimestamp,
+        effective_until: Option<CanonicalTimestamp>,
+    ) -> SeededSpec {
+        let expectation = expectation(member, ExpectedMembershipV1::Absent);
+        let proposal = NormativeBindingProposalV2 {
+            effective_from,
+            effective_until,
+            ..proposal_for(&expectation, semantic_scope())
+        };
+        self.seed(proposal, expectation, true).await
+    }
+
+    async fn seed(
+        &self,
+        proposal: NormativeBindingProposalV2,
+        expectation: RememberActionExpectationV1,
+        live: bool,
+    ) -> SeededSpec {
         let statement_id = self
             .specs
             .record_statement(&proposal, &expectation)
@@ -1542,6 +1570,106 @@ async fn live_recall_discrepancies_reports_episodes_specs_and_unknowns_when_conf
         );
         assert_eq!(other_reader.status().await.unwrap().open_discrepancies, 0);
     }
+}
+
+#[tokio::test]
+async fn live_recall_discrepancies_counts_only_specs_in_force_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let scope = common::fresh_scope("spec-effect");
+    let plane = SpecPlane::new(&pool, &scope);
+    let now = database_now(&pool).await.unwrap();
+    // Forget's statement is in force; Delete's took effect and expired
+    // before now; Purge's takes effect tomorrow. All three stay live in the
+    // normative projection, which is not filtered by time.
+    let in_force = plane
+        .statement("Forget", ExpectedMembershipV1::Absent, true)
+        .await;
+    let expired = plane
+        .statement_during(
+            "Delete",
+            timestamp("2026-09-01T00:00:00.000000000Z"),
+            Some(timestamp("2026-09-02T00:00:00.000000000Z")),
+        )
+        .await;
+    let scheduled_from = instant(now + TimeDelta::days(1));
+    let scheduled = plane
+        .statement_during("Purge", scheduled_from.clone(), None)
+        .await;
+    // Each was found violated, the scheduled one by a check evaluated
+    // through its first instant.
+    let c1 = commit("c1");
+    let in_force_episode = plane
+        .nonconformance(&in_force, &c1, "2026-09-03T00:00:00.000000000Z")
+        .await;
+    let expired_episode = plane
+        .nonconformance(&expired, &c1, "2026-09-01T12:00:00.000000000Z")
+        .await;
+    let scheduled_episode = plane
+        .nonconformance(&scheduled, &c1, scheduled_from.as_str())
+        .await;
+    let reader = spec_reader(&pool, &scope).await;
+
+    // Only the spec in force is active; each spec says where it stands.
+    let listed = reader.list(false, 10).await.unwrap();
+    let effects: BTreeMap<Sha256Digest, SpecEffectV1> = listed
+        .specs
+        .iter()
+        .map(|spec| (spec.statement_id, spec.effect))
+        .collect();
+    assert_eq!(
+        effects,
+        BTreeMap::from([
+            (in_force.statement_id, SpecEffectV1::InForce),
+            (expired.statement_id, SpecEffectV1::Expired),
+            (scheduled.statement_id, SpecEffectV1::Scheduled),
+        ])
+    );
+    assert_eq!(
+        (
+            listed.coverage.active_specs,
+            listed.coverage.scheduled_specs,
+            listed.coverage.expired_specs
+        ),
+        (1, 1, 1)
+    );
+
+    // By default the expired spec's episode is hidden like a retired one's;
+    // the scheduled spec's verified nonconformance is listed.
+    assert_eq!(
+        episode_ids(&listed).into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            in_force_episode.episode_fingerprint,
+            scheduled_episode.episode_fingerprint
+        ])
+    );
+    let everything = reader.list(true, 10).await.unwrap();
+    let still_live: BTreeMap<DiscrepancyEpisodeFingerprintV1, bool> = everything
+        .discrepancies
+        .iter()
+        .map(|episode| (episode.episode_id, episode.spec_live))
+        .collect();
+    assert_eq!(
+        still_live,
+        BTreeMap::from([
+            (in_force_episode.episode_fingerprint, true),
+            (expired_episode.episode_fingerprint, false),
+            (scheduled_episode.episode_fingerprint, true),
+        ])
+    );
+
+    let status = reader.status().await.unwrap();
+    assert_eq!(
+        (
+            status.active_specs,
+            status.scheduled_specs,
+            status.expired_specs,
+            status.open_discrepancies
+        ),
+        (1, 1, 1, 2)
+    );
 }
 
 /// `serve`'s memory service for `scope`, record-only, with the spec
