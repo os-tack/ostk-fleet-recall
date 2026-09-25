@@ -157,7 +157,11 @@ appends one lifecycle event to the episode's 0027 log, effective at the
 database's clock, checked against the stored envelope (scope, profile,
 AUTH-03 self-implication, evidence and rationale shape) before and inside the
 append. Nothing is rewritten, so the episode's history shows who closed it and
-on what evidence.
+on what evidence. An episode is closed once: inside the append transaction, an
+episode that is already resolved, dismissed, or superseded gets nothing
+appended. The same transition (actor, and evidence or reason) is answered
+with the event that already made it, so an operator can safely retry after
+an outcome-unknown commit, and any other closure is refused.
 
 ## D7 — The opening rule is keyed on (statement, commit)
 

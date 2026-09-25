@@ -28,6 +28,13 @@
 //! the envelope and every earlier event stay as they were, so the
 //! episode's history shows the closure and who made it.
 //!
+//! An episode is closed once
+//! ([`CockroachDiscrepancyLedgerRepository::close_episode`]). Closing an
+//! episode that is already resolved, dismissed, or superseded appends
+//! nothing: the same transition (actor, and evidence or reason) is answered
+//! with the event that already made it, so a retry after an outcome-unknown
+//! commit is safe, and any other closure is refused.
+//!
 //! Only `spec_nonconformance` episodes are closed here; the statement an
 //! episode violates is read from its envelope's expectation policy. As for
 //! the deriver's opening write, each call verifies the strict witness and
@@ -44,7 +51,8 @@ use crate::Result;
 use crate::discrepancy_runtime::{
     CockroachDiscrepancyLedgerRepository, ComparisonIndeterminacyV1,
     DISCREPANCY_RUNTIME_SCHEMA_VERSION, DiscrepancyAppendOutcomeV1,
-    DiscrepancyLedgerRepository as _, DiscrepancyRegistryBindingV1, admit_lifecycle_event,
+    DiscrepancyLedgerRepository as _, DiscrepancyLogRecordV1, DiscrepancyRegistryBindingV1,
+    admit_lifecycle_event,
 };
 use crate::error::FleetError;
 use crate::memory_contracts::common::{
@@ -93,9 +101,12 @@ pub struct SpecEpisodeLifecycleV1 {
     pub statement_id: Sha256Digest,
     /// The lifecycle event's identity.
     pub event_id: Sha256Digest,
-    /// The log sequence the event landed at; absent when a byte-identical
-    /// event was already recorded and nothing was appended.
-    pub log_seq: Option<u64>,
+    /// The log sequence the event sits at.
+    pub log_seq: u64,
+    /// Whether this call appended the event; false when the episode was
+    /// already closed by exactly this transition, whose recorded event is
+    /// reported instead.
+    pub appended: bool,
     /// The database time the event takes effect at.
     pub effective_at: CanonicalTimestamp,
     /// The transition, its actor, and its evidence or reason.
@@ -116,10 +127,11 @@ pub struct SpecEpisodeLifecycleV1 {
 ///
 /// # Errors
 ///
-/// [`FleetError::Memory`] for an episode this project does not have, or a
-/// resolution without evidence whose statement's latest check cannot stand
-/// for a fix ([`default_resolution_evidence`]); a contract error for an
-/// episode that is not
+/// [`FleetError::Memory`] for an episode this project does not have, an
+/// episode already closed by another transition, or a resolution without
+/// evidence whose statement's latest check cannot stand for a fix
+/// ([`default_resolution_evidence`]); a contract error for an episode that
+/// is not
 /// a spec nonconformance or an event the contract refuses (a blank dismissal
 /// rationale, an implicated actor); whatever the strict witness or the
 /// ledger refuses.
@@ -179,31 +191,49 @@ pub async fn append_episode_lifecycle(
         effective_at,
     )?;
 
-    let (event_id, log_seq) = match ledger.append_lifecycle_event(&event).await? {
-        DiscrepancyAppendOutcomeV1::Appended(transition) => {
-            (transition.record_id, transition.log_seq)
-        }
-        DiscrepancyAppendOutcomeV1::AlreadyRecorded { record_id } => (record_id, None),
+    let (event_id, appended) = match ledger.close_episode(&event).await? {
+        DiscrepancyAppendOutcomeV1::Appended(transition) => (transition.record_id, true),
+        DiscrepancyAppendOutcomeV1::AlreadyRecorded { record_id } => (record_id, false),
     };
+    let (log_seq, recorded) = recorded_event(&ledger, episode, event_id).await?;
     let lifecycle_state = stored_state(&ledger, episode).await?;
-    let DiscrepancyLifecycleEventV1 {
-        effective_at,
-        lifecycle_transition,
-        ..
-    } = event;
     Ok(SpecEpisodeLifecycleV1 {
         episode_id: episode,
         binding_family_id,
         statement_id,
         event_id,
         log_seq,
-        effective_at,
-        transition: lifecycle_transition.ok_or_else(|| {
+        appended,
+        effective_at: recorded.effective_at,
+        transition: recorded.lifecycle_transition.ok_or_else(|| {
             FleetError::Memory("a spec lifecycle event carries its transition".into())
         })?,
         previous_state,
         lifecycle_state,
     })
+}
+
+/// The log sequence and the event `event_id` names in `episode`'s log: the
+/// event just appended, or the one that already made the transition.
+async fn recorded_event(
+    ledger: &CockroachDiscrepancyLedgerRepository,
+    episode: DiscrepancyEpisodeFingerprintV1,
+    event_id: Sha256Digest,
+) -> Result<(u64, DiscrepancyLifecycleEventV1)> {
+    ledger
+        .read_log(episode)
+        .await?
+        .into_iter()
+        .find(|entry| entry.record_id == event_id)
+        .and_then(|entry| match entry.record {
+            DiscrepancyLogRecordV1::Lifecycle { event } => Some((entry.seq, event)),
+            DiscrepancyLogRecordV1::Envelope { .. } => None,
+        })
+        .ok_or_else(|| {
+            FleetError::Memory(format!(
+                "lifecycle event {event_id} is not in episode {episode}'s log"
+            ))
+        })
 }
 
 /// The binding family and statement a spec episode's envelope names.

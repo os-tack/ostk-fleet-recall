@@ -31,6 +31,10 @@
 //! returns [`DiscrepancyAppendOutcomeV1::AlreadyRecorded`] with nothing
 //! written (backed by the per-scope unique record-id index), so an
 //! at-least-once delivery cannot double-apply.
+//! [`CockroachDiscrepancyLedgerRepository::close_episode`] goes further for
+//! an operator's closure, whose event is stamped afresh on every attempt: a
+//! closed episode gets nothing appended, and a retried closure is answered
+//! with the event that already made it.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -45,7 +49,8 @@ use crate::memory_contracts::common::CanonicalTimestamp;
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::discrepancy::{
     DiscrepancyEnvelopeV1, DiscrepancyEpisodeFingerprintV1, DiscrepancyEpisodeRelationV1,
-    DiscrepancyFamilyFingerprintV1, DiscrepancyLifecycleEventV1,
+    DiscrepancyFamilyFingerprintV1, DiscrepancyLifecycleEventV1, LifecycleState,
+    LifecycleTransitionV1,
 };
 use crate::store::cockroach::{RetryPolicy, with_serializable_retry};
 
@@ -56,8 +61,8 @@ use super::repository::{
     DiscrepancyLedgerRepository, DiscrepancyLedgerTransitionV1, DiscrepancyLogEntryV1,
     DiscrepancyLogRecordV1, DiscrepancyOpeningOutcomeV1, DiscrepancyRegistryBindingV1,
     STANDING_LIFECYCLE_STATES, StoredDiscrepancyProjectionV1, admit_envelope,
-    admit_lifecycle_event, admit_relation, lifecycle_state_from_str, lifecycle_state_str,
-    verification_state_from_str, verification_state_str,
+    admit_lifecycle_event, admit_relation, is_standing, lifecycle_state_from_str,
+    lifecycle_state_str, verification_state_from_str, verification_state_str,
 };
 
 const LOCK_HEAD_SQL: &str = "SELECT family_fingerprint, envelope_id, log_seq \
@@ -290,6 +295,54 @@ impl CockroachDiscrepancyLedgerRepository {
         })
         .await
     }
+
+    /// Append a resolution or dismissal to an episode that still stands,
+    /// exactly as [`DiscrepancyLedgerRepository::append_lifecycle_event`]
+    /// does, but never close an episode twice.
+    ///
+    /// Inside the append transaction, an episode that is already resolved,
+    /// dismissed, or superseded gets nothing appended: when the log already
+    /// holds an event making exactly this transition (the same kind, actor,
+    /// and evidence or reason, at any time), that event's id is returned as
+    /// [`DiscrepancyAppendOutcomeV1::AlreadyRecorded`], so an operator who
+    /// retries after an outcome-unknown commit gets the recorded closure
+    /// back; any other closure is refused.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Memory`] for an event that neither resolves nor
+    /// dismisses, or for a closed episode whose log holds no such event;
+    /// whatever [`DiscrepancyLedgerRepository::append_lifecycle_event`]
+    /// refuses.
+    pub async fn close_episode(
+        &self,
+        event: &DiscrepancyLifecycleEventV1,
+    ) -> Result<DiscrepancyAppendOutcomeV1> {
+        if !matches!(
+            event.lifecycle_transition,
+            Some(LifecycleTransitionV1::Resolve { .. } | LifecycleTransitionV1::Dismiss { .. })
+        ) {
+            return Err(FleetError::Memory(
+                "only a resolution or a dismissal closes a discrepancy episode".into(),
+            ));
+        }
+        let scope = self.trusted_scope.clone();
+        let event = event.clone();
+        with_serializable_retry(&self.pool, self.retry_policy, move |transaction| {
+            let scope = scope.clone();
+            let event = event.clone();
+            Box::pin(async move {
+                append_lifecycle_in_transaction(
+                    transaction,
+                    &scope,
+                    &event,
+                    ClosedEpisodeV1::ReplayOnly,
+                )
+                .await
+            })
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -327,9 +380,15 @@ impl DiscrepancyLedgerRepository for CockroachDiscrepancyLedgerRepository {
         with_serializable_retry(&self.pool, self.retry_policy, move |transaction| {
             let scope = scope.clone();
             let event = event.clone();
-            Box::pin(
-                async move { append_lifecycle_in_transaction(transaction, &scope, &event).await },
-            )
+            Box::pin(async move {
+                append_lifecycle_in_transaction(
+                    transaction,
+                    &scope,
+                    &event,
+                    ClosedEpisodeV1::Append,
+                )
+                .await
+            })
         })
         .await
     }
@@ -540,11 +599,22 @@ async fn seed_episode(
     ))
 }
 
+/// What a lifecycle append does to an episode that no longer stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosedEpisodeV1 {
+    /// Append whatever the contract allows.
+    Append,
+    /// Append nothing: answer with the recorded event that made this exact
+    /// transition, or refuse.
+    ReplayOnly,
+}
+
 /// Append one lifecycle event and advance its episode's projection.
 async fn append_lifecycle_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &TrustedControlScope,
     event: &DiscrepancyLifecycleEventV1,
+    closed: ClosedEpisodeV1,
 ) -> Result<DiscrepancyAppendOutcomeV1> {
     let now = statement_timestamp(transaction).await?;
     let episode_bytes = event.episode_fingerprint.digest().as_bytes().to_vec();
@@ -589,6 +659,14 @@ async fn append_lifecycle_in_transaction(
         });
     }
 
+    let relations = load_relations(transaction, scope, family).await?;
+    if closed == ClosedEpisodeV1::ReplayOnly {
+        let current = derive_stored_projection(&envelope, &events, &relations, head_seq)?;
+        if !is_standing(current.lifecycle_state) {
+            return replayed_closure(&entries, event, current.lifecycle_state);
+        }
+    }
+
     let next_seq = head_seq
         .checked_add(1)
         .ok_or_else(|| FleetError::Memory("discrepancy log sequence overflow".into()))?;
@@ -630,7 +708,6 @@ async fn append_lifecycle_in_transaction(
     }
 
     events.push(event.clone());
-    let relations = load_relations(transaction, scope, family).await?;
     let stored = derive_stored_projection(&envelope, &events, &relations, next_seq)?;
     upsert_projection(transaction, scope, &stored, now).await?;
 
@@ -641,6 +718,38 @@ async fn append_lifecycle_in_transaction(
             refreshed_episodes: vec![event.episode_fingerprint],
         },
     ))
+}
+
+/// The answer to closing an episode that is already `state`: the most
+/// recent recorded event that made exactly `event`'s transition (same kind,
+/// actor, and evidence or reason), which a retry after an outcome-unknown
+/// commit finds; otherwise a refusal.
+fn replayed_closure(
+    entries: &[DiscrepancyLogEntryV1],
+    event: &DiscrepancyLifecycleEventV1,
+    state: LifecycleState,
+) -> Result<DiscrepancyAppendOutcomeV1> {
+    entries
+        .iter()
+        .rev()
+        .find(|entry| {
+            matches!(
+                &entry.record,
+                DiscrepancyLogRecordV1::Lifecycle { event: recorded }
+                    if recorded.lifecycle_transition.is_some()
+                        && recorded.lifecycle_transition == event.lifecycle_transition
+            )
+        })
+        .map(|entry| DiscrepancyAppendOutcomeV1::AlreadyRecorded {
+            record_id: entry.record_id,
+        })
+        .ok_or_else(|| {
+            FleetError::Memory(format!(
+                "the discrepancy episode is already {}, and no recorded event made this exact \
+                 transition; a closed episode is not closed again",
+                lifecycle_state_str(state)
+            ))
+        })
 }
 
 /// Append one relation to its family store and refresh every in-scope

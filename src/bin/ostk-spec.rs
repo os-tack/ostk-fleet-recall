@@ -43,9 +43,12 @@
 //! `ostk-spec episode dismiss --episode HEX --actor ID --reason REASON
 //! --rationale TEXT`. Either appends one lifecycle event to the episode's
 //! log, effective at the database's time, and prints the episode's state
-//! before and after. `recall(action="discrepancies")` then lists the episode
-//! only with `include_resolved`, and re-checking a commit already judged
-//! nonconforming never re-opens it.
+//! before and after. A closed episode is not closed again: repeating the
+//! same closure (a retry after a lost connection) prints the recorded event
+//! with `appended: false`, and any other closure exits 1.
+//! `recall(action="discrepancies")` then lists the episode only with
+//! `include_resolved`, and re-checking a commit already judged nonconforming
+//! never re-opens it.
 //!
 //! See `ostk_fleet_recall::spec_conformance` for what each step checks.
 //!

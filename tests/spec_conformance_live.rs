@@ -43,9 +43,11 @@
 //! member opens an episode, a commit that drops it checks as `unknown` and
 //! leaves the episode standing, an operator resolves the episode citing that
 //! later check's observer event by default (never the nonconformance itself
-//! or a truncated re-read of the violating commit), after which `recall(discrepancies)` lists it only with
-//! `include_resolved` and a re-check of the offending commit joins it as
-//! already judged instead of re-opening; a dismissal without a rationale is
+//! or a truncated re-read of the violating commit), after which
+//! `recall(discrepancies)` lists it only with `include_resolved` and a
+//! re-check of the offending commit joins it as already judged instead of
+//! re-opening; a retried resolution answers with the recorded one and a
+//! closed episode is not closed again; a dismissal without a rationale is
 //! refused and appends nothing.
 //!
 //! And it proves the whole chain end to end, over the observer's checked-in
@@ -1986,6 +1988,33 @@ async fn live_an_operator_can_close_an_episode_and_recall_hides_it_by_default_wh
                         && resolution_evidence_ids == &[fix_evidence]
             ),
             "{resolved:?}"
+        );
+        assert!(resolved.appended);
+
+        // Retrying the same resolution, as an operator does after a lost
+        // connection, answers with the recorded closure and appends nothing;
+        // closing the resolved episode another way is refused.
+        let retried = append_episode_lifecycle(&runtime, episode, &operator, &resolve)
+            .await
+            .unwrap();
+        assert!(!retried.appended, "{retried:?}");
+        assert_eq!(
+            (retried.event_id, retried.log_seq, &retried.effective_at),
+            (resolved.event_id, resolved.log_seq, &resolved.effective_at)
+        );
+        assert_eq!(retried.lifecycle_state, LifecycleState::Resolved);
+        assert_refused(
+            append_episode_lifecycle(
+                &runtime,
+                episode,
+                &operator,
+                &SpecEpisodeTransitionV1::Dismiss {
+                    reason: DismissalReasonKindV1::DuplicateOfOtherEpisode,
+                    rationale: "closed twice".into(),
+                },
+            )
+            .await,
+            "a dismissal of a resolved episode",
         );
 
         // recall hides the closed episode by default and lists it, resolved,

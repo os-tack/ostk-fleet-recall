@@ -174,9 +174,10 @@ of the serving one.
   when that check can stand for a fix (an exhaustive check, not
   nonconforming, of a commit never judged nonconforming, recorded after the
   check that opened the episode), and `episode dismiss` dismisses one with a
-  reason and a rationale; either
-  appends a lifecycle event to the episode's history, after which
-  `recall(discrepancies)` lists it only with `include_resolved`.
+  reason and a rationale; either appends a lifecycle event to the episode's
+  history once (a retried closure reports the recorded one, and a closed
+  episode is not closed again), after which `recall(discrepancies)` lists it
+  only with `include_resolved`.
   `draft`, `activate`, `check`, and `episode` run as `fleet_writer`
   (`FLEET_RECALL_DATABASE_URL`) with the writer-authority pins
   `ostk-authority-install apply` prints, and `check` also needs
