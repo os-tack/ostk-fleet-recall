@@ -40,6 +40,7 @@ use crate::memory_contracts::canonical::{decode_typed_canonical, encode_canonica
 use crate::memory_contracts::common::{AuthenticatedProjectScopeV1, ContractId};
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::discrepancy::DiscrepancyEpisodeFingerprintV1;
+use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::memory_contracts::normative_v2::NormativeBindingProposalV2;
 use crate::memory_contracts::{ContractError, ContractResult};
 use crate::store::cockroach::{RetryPolicy, with_serializable_retry};
@@ -123,6 +124,18 @@ const NONCONFORMING_CHECK_SQL: &str = concat!(
      WHERE tenant_id = $1 AND project = $2 AND statement_id = $3 AND commit_oid = $4 \
        AND verdict = 'nonconforming' \
      ORDER BY created_at DESC, check_id LIMIT 1"
+);
+
+/// The earliest check that opened one episode: a check naming it and
+/// measured by one of its member observer events, through
+/// `memory_spec_checks_episode_idx`.
+const OPENING_CHECK_SQL: &str = concat!(
+    "SELECT ",
+    check_columns!(),
+    " FROM public.memory_spec_checks_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND episode_fingerprint = $3 \
+       AND observer_event_id = ANY($4::BYTES[]) \
+     ORDER BY created_at, check_id LIMIT 1"
 );
 
 /// Whether a write stored a new row or found the identical row already there.
@@ -376,6 +389,41 @@ impl CockroachSpecRepository {
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(decode_check_row).transpose()
+    }
+
+    /// The earliest recorded check that opened `episode`: one naming it and
+    /// measured by one of `member_events`, the observer events its envelope
+    /// cites as member evidence. `None` when that check is not recorded (a
+    /// check that died between opening the episode and recording itself).
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Memory`] for a stored check that fails verification; a
+    /// database error.
+    pub async fn opening_check_for(
+        &self,
+        episode: DiscrepancyEpisodeFingerprintV1,
+        member_events: &[AcceptedEventId],
+    ) -> Result<Option<StoredSpecCheckV1>> {
+        if member_events.is_empty() {
+            return Ok(None);
+        }
+        let events: Vec<Vec<u8>> = member_events
+            .iter()
+            .map(|event| event.digest().as_bytes().to_vec())
+            .collect();
+        let row: Option<PgRow> = sqlx::query(OPENING_CHECK_SQL)
+            .bind(self.trusted_scope.tenant_id())
+            .bind(self.trusted_scope.project())
+            .bind(episode.digest().as_bytes().to_vec())
+            .bind(events)
+            .fetch_optional(&self.pool)
+            .await?;
+        let check = row.as_ref().map(decode_check_row).transpose()?;
+        Ok(check.filter(|check| {
+            check.record.episode == Some(episode)
+                && member_events.contains(&check.record.observer_event_id)
+        }))
     }
 }
 

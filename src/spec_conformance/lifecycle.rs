@@ -9,9 +9,11 @@
 //! * **resolve**: the nonconformance is fixed. A resolution must cite
 //!   evidence (DISC-03). By default it cites the observer event of the latest
 //!   check of the statement the episode violates, typically the `unknown`
-//!   check of the fixing commit; it refuses to default to a statement that
-//!   was never checked or whose latest check is itself nonconforming, since
-//!   that check shows the violation standing.
+//!   check of the fixing commit, but only when that check can stand for a
+//!   fix ([`default_resolution_evidence`]): it is not nonconforming, it read
+//!   the whole enum, its commit was never judged nonconforming under the
+//!   statement, and it follows the check that opened the episode. Otherwise
+//!   the operator must cite evidence explicitly.
 //! * **dismiss**: the episode should not stand, for one reason of the
 //!   contract's closed taxonomy, with a non-blank rationale.
 //!
@@ -40,9 +42,9 @@ use serde::Serialize;
 
 use crate::Result;
 use crate::discrepancy_runtime::{
-    CockroachDiscrepancyLedgerRepository, DISCREPANCY_RUNTIME_SCHEMA_VERSION,
-    DiscrepancyAppendOutcomeV1, DiscrepancyLedgerRepository as _, DiscrepancyRegistryBindingV1,
-    admit_lifecycle_event,
+    CockroachDiscrepancyLedgerRepository, ComparisonIndeterminacyV1,
+    DISCREPANCY_RUNTIME_SCHEMA_VERSION, DiscrepancyAppendOutcomeV1,
+    DiscrepancyLedgerRepository as _, DiscrepancyRegistryBindingV1, admit_lifecycle_event,
 };
 use crate::error::FleetError;
 use crate::memory_contracts::common::{
@@ -59,8 +61,9 @@ use crate::memory_contracts::{ContractError, ContractResult};
 use crate::registry_witness::WriterAuthorityRuntime;
 
 use super::activation::{database_now, spec_repository};
+use super::cockroach::StoredSpecCheckV1;
 use super::envelope::SPEC_EXPECTATION_POLICY_VERSION;
-use super::record::{SpecCheckRecordV1, SpecVerdictV1};
+use super::record::SpecVerdictV1;
 
 /// The event kind of every discrepancy lifecycle event.
 const LIFECYCLE_EVENT_KIND: &str = "discrepancy.lifecycle.accepted";
@@ -70,7 +73,8 @@ const LIFECYCLE_EVENT_KIND: &str = "discrepancy.lifecycle.accepted";
 pub enum SpecEpisodeTransitionV1 {
     /// The nonconformance is fixed. `evidence` is the accepted events that
     /// show it; empty cites the observer event of the latest check of the
-    /// episode's statement ([`default_resolution_evidence`]).
+    /// episode's statement, when that check can stand for a fix
+    /// ([`default_resolution_evidence`]).
     Resolve { evidence: Vec<AcceptedEventId> },
     /// The episode should not stand. The rationale must not be blank.
     Dismiss {
@@ -113,8 +117,9 @@ pub struct SpecEpisodeLifecycleV1 {
 /// # Errors
 ///
 /// [`FleetError::Memory`] for an episode this project does not have, or a
-/// resolution without evidence whose statement was never checked or whose
-/// latest check is nonconforming; a contract error for an episode that is not
+/// resolution without evidence whose statement's latest check cannot stand
+/// for a fix ([`default_resolution_evidence`]); a contract error for an
+/// episode that is not
 /// a spec nonconformance or an event the contract refuses (a blank dismissal
 /// rationale, an implicated actor); whatever the strict witness or the
 /// ledger refuses.
@@ -144,15 +149,7 @@ pub async fn append_episode_lifecycle(
     let lifecycle_transition = match transition {
         SpecEpisodeTransitionV1::Resolve { evidence } => {
             let resolution_evidence_ids = if evidence.is_empty() {
-                let latest = spec_repository(runtime)
-                    .latest_checks(&[statement_id])
-                    .await?
-                    .into_iter()
-                    .find(|check| check.record.statement_id == statement_id);
-                vec![default_resolution_evidence(
-                    statement_id,
-                    latest.as_ref().map(|check| &check.record),
-                )?]
+                vec![default_evidence(runtime, &envelope, statement_id).await?]
             } else {
                 evidence.clone()
             };
@@ -234,32 +231,113 @@ pub fn spec_episode_statement(
     ))
 }
 
+/// What a resolution of `envelope`'s episode cites by default, read from
+/// the statement's check history ([`default_resolution_evidence`]).
+async fn default_evidence(
+    runtime: &WriterAuthorityRuntime,
+    envelope: &DiscrepancyEnvelopeV1,
+    statement_id: Sha256Digest,
+) -> Result<AcceptedEventId> {
+    let specs = spec_repository(runtime);
+    let latest = specs
+        .latest_checks(&[statement_id])
+        .await?
+        .into_iter()
+        .find(|check| check.record.statement_id == statement_id);
+    let opening = specs
+        .opening_check_for(envelope.episode_fingerprint, &envelope.member_evidence_ids)
+        .await?;
+    let latest_commit_judged_nonconforming = match &latest {
+        Some(check) => specs
+            .nonconforming_check_for(statement_id, &check.record.commit_oid)
+            .await?
+            .is_some(),
+        None => false,
+    };
+    default_resolution_evidence(
+        statement_id,
+        latest.as_ref(),
+        opening.as_ref(),
+        latest_commit_judged_nonconforming,
+    )
+}
+
 /// The evidence a resolution cites by default: the observer event of
-/// `latest`, the latest check of `statement_id`.
+/// `latest`, the latest check of `statement_id`, when that check can stand
+/// for a fix of the episode `opening` opened.
+///
+/// `latest_commit_judged_nonconforming` says whether `latest`'s commit was
+/// ever judged nonconforming under the statement. Under the observer's
+/// `positive_verified` admission no check verifies a fix, so this only keeps
+/// the default from citing a check that plainly is not one; an operator who
+/// knows better cites evidence explicitly.
 ///
 /// # Errors
 ///
-/// [`FleetError::Memory`] when the statement was never checked, or its
-/// latest check is nonconforming: that check shows the violation standing,
-/// so it cannot evidence a fix. Check the fixing commit first, or cite
-/// evidence explicitly.
+/// [`FleetError::Memory`] when:
+///
+/// * the statement was never checked;
+/// * `latest` is nonconforming: it shows the violation standing;
+/// * `latest`'s commit was judged nonconforming under the statement: a
+///   re-read of the violating commit is not a fix, whatever it found;
+/// * `latest` did not read the whole enum (`observed_partial_coverage`): a
+///   truncated read shows nothing;
+/// * the check that opened the episode is not recorded, so nothing shows
+///   that `latest` follows it;
+/// * `latest` was recorded no later than that check, or compared at an
+///   earlier instant (its commit predates the violating one).
 pub fn default_resolution_evidence(
     statement_id: Sha256Digest,
-    latest: Option<&SpecCheckRecordV1>,
+    latest: Option<&StoredSpecCheckV1>,
+    opening: Option<&StoredSpecCheckV1>,
+    latest_commit_judged_nonconforming: bool,
 ) -> Result<AcceptedEventId> {
-    let check = latest.ok_or_else(|| {
-        FleetError::Memory(format!(
-            "statement {statement_id} was never checked, so a resolution has no evidence to \
-             cite by default; check the fixing commit first or cite evidence explicitly"
-        ))
-    })?;
+    let refuse = |why: String| {
+        Err(FleetError::Memory(format!(
+            "{why}, so it cannot evidence a resolution by default; check the fixing commit \
+             first or cite evidence explicitly"
+        )))
+    };
+    let Some(stored) = latest else {
+        return refuse(format!(
+            "statement {statement_id} was never checked, so a resolution has nothing to cite"
+        ));
+    };
+    let check = &stored.record;
+    let commit = check.commit_oid.to_hex();
     if check.verdict == SpecVerdictV1::Nonconforming {
-        return Err(FleetError::Memory(format!(
-            "the latest check of statement {statement_id} (commit {}) is nonconforming, so it \
-             cannot evidence a resolution; check the fixing commit first or cite evidence \
-             explicitly",
-            check.commit_oid.to_hex()
-        )));
+        return refuse(format!(
+            "the latest check of statement {statement_id} (commit {commit}) is nonconforming"
+        ));
+    }
+    if latest_commit_judged_nonconforming {
+        return refuse(format!(
+            "the latest check of statement {statement_id} re-read commit {commit}, which was \
+             already judged nonconforming under it"
+        ));
+    }
+    if check
+        .reasons
+        .contains(&ComparisonIndeterminacyV1::ObservedPartialCoverage)
+    {
+        return refuse(format!(
+            "the latest check of statement {statement_id} (commit {commit}) did not read the \
+             whole enum"
+        ));
+    }
+    let Some(opening) = opening else {
+        return refuse(
+            "the check that opened the episode is not recorded, so no check can be shown to \
+             follow it"
+                .into(),
+        );
+    };
+    if stored.recorded_at <= opening.recorded_at || check.compared_at < opening.record.compared_at {
+        return refuse(format!(
+            "the latest check of statement {statement_id} (commit {commit}) does not follow the \
+             check that opened the episode (commit {})",
+            opening.record.commit_oid.to_hex()
+        ));
     }
     Ok(check.observer_event_id)
 }

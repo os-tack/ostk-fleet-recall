@@ -36,8 +36,10 @@
 //! admission a fixing commit checks as `unknown`. An operator closes one with
 //! `ostk-spec episode resolve --episode HEX --actor ID [--evidence HEX...]`,
 //! which cites the given accepted events, or by default the observer event of
-//! the latest check of the violated statement (refused when that check is
-//! itself nonconforming, or there is none), or with
+//! the latest check of the violated statement (refused when there is none,
+//! or that check is nonconforming, truncated by its member bound, of a
+//! commit already judged nonconforming, or not later than the check that
+//! opened the episode), or with
 //! `ostk-spec episode dismiss --episode HEX --actor ID --reason REASON
 //! --rationale TEXT`. Either appends one lifecycle event to the episode's
 //! log, effective at the database's time, and prints the episode's state
@@ -286,7 +288,9 @@ struct ResolveArgs {
     actor: ContractId,
     /// An accepted event (64 hex) that shows the fix. Repeat for several.
     /// Defaults to the observer event of the latest check of the statement
-    /// the episode violates, which must not be nonconforming.
+    /// the episode violates, which must be an exhaustive, not nonconforming
+    /// check of a commit never judged nonconforming, recorded after the
+    /// check that opened the episode.
     #[arg(long = "evidence", value_parser = parse_event)]
     evidence: Vec<AcceptedEventId>,
 }

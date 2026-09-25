@@ -170,8 +170,11 @@ of the serving one.
   `spec_nonconformance` discrepancy episode only for a verified
   nonconformance. No check closes an episode (a fixing commit checks as
   `unknown`), so `episode resolve` lets an operator resolve one, citing
-  accepted events or by default the latest check of the violated statement,
-  and `episode dismiss` dismisses one with a reason and a rationale; either
+  accepted events or by default the latest check of the violated statement
+  when that check can stand for a fix (an exhaustive check, not
+  nonconforming, of a commit never judged nonconforming, recorded after the
+  check that opened the episode), and `episode dismiss` dismisses one with a
+  reason and a rationale; either
   appends a lifecycle event to the episode's history, after which
   `recall(discrepancies)` lists it only with `include_resolved`.
   `draft`, `activate`, `check`, and `episode` run as `fleet_writer`

@@ -145,9 +145,13 @@ verifies presence only:
 So a commit that fixes a violation never verifies the fix, and no check ever
 closes an episode. An operator does: `ostk-spec episode resolve` cites
 accepted events, by default the observer event of the violated statement's
-latest check (typically the `unknown` check of the fixing commit), and
-refuses to default when that statement was never checked or its latest check
-is itself nonconforming; `ostk-spec episode dismiss` gives one
+latest check (typically the `unknown` check of the fixing commit). It refuses
+to default when that statement was never checked, or its latest check is
+nonconforming, did not read the whole enum (`observed_partial_coverage`),
+re-read a commit already judged nonconforming under the statement, or does
+not follow the check that opened the episode (recorded no later, compared at
+an earlier instant, or that check is not recorded); the operator then cites
+evidence explicitly. `ostk-spec episode dismiss` gives one
 reason from the contract's closed taxonomy and a non-blank rationale. Either
 appends one lifecycle event to the episode's 0027 log, effective at the
 database's clock, checked against the stored envelope (scope, profile,

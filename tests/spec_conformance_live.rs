@@ -42,8 +42,8 @@
 //! over a memory worker's git source: a commit that declares a forbidden
 //! member opens an episode, a commit that drops it checks as `unknown` and
 //! leaves the episode standing, an operator resolves the episode citing that
-//! later check's observer event by default (never the nonconformance
-//! itself), after which `recall(discrepancies)` lists it only with
+//! later check's observer event by default (never the nonconformance itself
+//! or a truncated re-read of the violating commit), after which `recall(discrepancies)` lists it only with
 //! `include_resolved` and a re-check of the offending commit joins it as
 //! already judged instead of re-opening; a dismissal without a rationale is
 //! refused and appends nothing.
@@ -1898,6 +1898,24 @@ async fn live_an_operator_can_close_an_episode_and_recall_hides_it_by_default_wh
         assert_refused(
             append_episode_lifecycle(&runtime, episode, &operator, &resolve).await,
             "a resolution citing the standing nonconformance",
+        );
+
+        // Re-reading C0 with too small a member bound cannot see Forget and
+        // checks as unknown, but a re-read of the violating commit is not a
+        // fix: a resolution still has nothing to cite by default.
+        let truncated = check(
+            &runtime,
+            &kek,
+            &SpecCheckRequestV1 {
+                member_bound: 1,
+                ..check_request(sources, &c0, &through)
+            },
+        )
+        .await;
+        assert_eq!(truncated.verdict, SpecVerdictV1::Unknown);
+        assert_refused(
+            append_episode_lifecycle(&runtime, episode, &operator, &resolve).await,
+            "a resolution citing a truncated re-read of the violating commit",
         );
 
         // C1 no longer declares Forget. The observer cannot verify an

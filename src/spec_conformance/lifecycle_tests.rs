@@ -1,9 +1,14 @@
+use chrono::{DateTime, Utc};
+
 use super::*;
+use crate::connectors::git::GitObjectId;
 use crate::discrepancy_runtime::ComparisonVerdictV1;
 use crate::memory_contracts::common::frozen_profile_reference_v1;
 use crate::memory_contracts::discrepancy::project_discrepancy_episode;
 use crate::memory_contracts::evidence::SourceFactId;
+use crate::memory_contracts::observer::{EvaluatedConditionV1, VerificationOutcomeV1};
 use crate::spec_conformance::envelope::{SpecDetectionV1, build_spec_envelope};
+use crate::spec_conformance::record::SpecCheckRecordV1;
 use crate::spec_conformance::testkit::{
     expectation, label, nonconforming_check, proposal_for, reference, scope, timestamp,
 };
@@ -201,23 +206,108 @@ fn an_implicated_actor_cannot_close_their_own_finding() {
     );
 }
 
-#[test]
-fn a_resolution_defaults_to_a_later_check_that_is_not_nonconforming() {
-    let standing = nonconforming_check(label("statement"));
-    let statement_id = standing.statement_id;
-    assert!(default_resolution_evidence(statement_id, None).is_err());
-    assert!(default_resolution_evidence(statement_id, Some(&standing)).is_err());
+/// `record` as stored at `recorded_at`.
+fn stored(record: SpecCheckRecordV1, recorded_at: DateTime<Utc>) -> StoredSpecCheckV1 {
+    StoredSpecCheckV1 {
+        check_id: record.check_id().unwrap(),
+        record,
+        recorded_at,
+    }
+}
 
-    for verdict in [SpecVerdictV1::Unknown, SpecVerdictV1::Conforming] {
-        let later = SpecCheckRecordV1 {
+#[test]
+fn a_resolution_defaults_only_to_a_later_exhaustive_check_of_another_commit() {
+    let opened = nonconforming_check(label("statement"));
+    let statement_id = opened.statement_id;
+    let opened_at = Utc::now();
+    let later_at = opened_at + chrono::TimeDelta::seconds(1);
+    let opening = stored(opened.clone(), opened_at);
+
+    // Nothing checked, or only the nonconformance itself.
+    assert!(default_resolution_evidence(statement_id, None, Some(&opening), false).is_err());
+    assert!(
+        default_resolution_evidence(statement_id, Some(&opening), Some(&opening), true).is_err()
+    );
+
+    let fixing_commit = GitObjectId::parse_hex(&"c1".repeat(20)).unwrap();
+    for (verdict, condition, outcome, reasons) in [
+        (
+            SpecVerdictV1::Unknown,
+            EvaluatedConditionV1::Indeterminate,
+            VerificationOutcomeV1::Indeterminate,
+            vec![
+                ComparisonIndeterminacyV1::ObservedUnmeasured,
+                ComparisonIndeterminacyV1::ObservedUnknownCoverage,
+            ],
+        ),
+        (
+            SpecVerdictV1::Conforming,
+            EvaluatedConditionV1::Absent,
+            VerificationOutcomeV1::VerifiedNegative,
+            Vec::new(),
+        ),
+    ] {
+        let fixed = SpecCheckRecordV1 {
+            commit_oid: fixing_commit.clone(),
             observer_event_id: event("c1 observer"),
+            observed_condition: condition,
+            verification_outcome: outcome,
             verdict,
-            ..standing.clone()
+            reasons,
+            episode: None,
+            ..opened.clone()
         };
+        let later = stored(fixed.clone(), later_at);
         assert_eq!(
-            default_resolution_evidence(statement_id, Some(&later)).unwrap(),
+            default_resolution_evidence(statement_id, Some(&later), Some(&opening), false).unwrap(),
             event("c1 observer"),
             "{verdict:?}"
         );
+
+        // A re-read of the commit already judged nonconforming, whatever it
+        // found, is not a fix.
+        assert!(
+            default_resolution_evidence(statement_id, Some(&later), Some(&opening), true).is_err()
+        );
+        // Without the opening check nothing shows the later one follows it.
+        assert!(default_resolution_evidence(statement_id, Some(&later), None, false).is_err());
+        // A check recorded no later than the opening one, or of a commit
+        // that predates the violating one, does not follow it.
+        let concurrent = stored(fixed.clone(), opened_at);
+        assert!(
+            default_resolution_evidence(statement_id, Some(&concurrent), Some(&opening), false)
+                .is_err()
+        );
+        let older = stored(
+            SpecCheckRecordV1 {
+                compared_at: timestamp("2026-08-31T00:00:00.000000000Z"),
+                ..fixed
+            },
+            later_at,
+        );
+        assert!(
+            default_resolution_evidence(statement_id, Some(&older), Some(&opening), false).is_err()
+        );
     }
+
+    // A read cut short by its member bound shows nothing.
+    let truncated = stored(
+        SpecCheckRecordV1 {
+            commit_oid: fixing_commit,
+            observer_event_id: event("c1 observer"),
+            observed_condition: EvaluatedConditionV1::Indeterminate,
+            verification_outcome: VerificationOutcomeV1::Indeterminate,
+            verdict: SpecVerdictV1::Unknown,
+            reasons: vec![
+                ComparisonIndeterminacyV1::ObservedUnmeasured,
+                ComparisonIndeterminacyV1::ObservedPartialCoverage,
+            ],
+            episode: None,
+            ..opened
+        },
+        later_at,
+    );
+    assert!(
+        default_resolution_evidence(statement_id, Some(&truncated), Some(&opening), false).is_err()
+    );
 }
