@@ -515,6 +515,7 @@ impl CockroachMemoryService {
         args: SearchArgs,
         limit: usize,
     ) -> ServiceResult<RecallResult> {
+        let unembedded = self.query_has_no_embedding(&args.query);
         let mut params = RecallParams {
             query: args.query,
             project: Some(scope.project.clone()),
@@ -582,8 +583,14 @@ impl CockroachMemoryService {
                 "message": "chunks of claims that are no longer current filled the bounded retrieval window, so fewer hits than the limit are returned and current memory may rank below it; narrow the query or filter by source"
             }));
         }
+        if unembedded {
+            result.warnings.push(json!({
+                "code": "query_not_embedded",
+                "message": "the query has no usable embedding under the pinned model, so only the lexical lane ran"
+            }));
+        }
         let mut retrieval = json!({
-            "lanes": ["lexical", "dense"],
+            "lanes": if unembedded { json!(["lexical"]) } else { json!(["lexical", "dense"]) },
             "fusion": "rrf",
             "metadata_elided": metadata_elided,
             "support_claims_matched": projection.support_claim_count,
@@ -624,6 +631,7 @@ impl CockroachMemoryService {
             "chunk" => self.search_chunks(scope, args, limit).await,
             "claim" | "assertion" => {
                 reject_claim_only_unsupported_filters(&args)?;
+                let unembedded = self.query_has_no_embedding(&args.query);
                 let hits = self
                     .search_visible_claims(scope, &args.query, args.include_history, limit)
                     .await?;
@@ -647,6 +655,12 @@ impl CockroachMemoryService {
                     &mut result.warnings,
                     overlay,
                 );
+                if unembedded {
+                    result.warnings.push(json!({
+                        "code": "query_not_embedded",
+                        "message": "the query has no usable embedding under the pinned model, and claim search has only a dense lane, so no claim could match"
+                    }));
+                }
                 result.diagnostics.insert(
                     "retrieval".into(),
                     json!({ "lane": "claim_passage_dense", "model": self.embedder.model_id() }),
@@ -677,6 +691,19 @@ impl CockroachMemoryService {
             .await
             .map_err(service_error)?;
         Ok(evidence_search_result(search))
+    }
+
+    /// Whether the process embedder gives `query` no direction at all: the
+    /// zero vector a query made only of tokens the model does not know
+    /// encodes to (model2vec drops unknown tokens). Chunk and claim search
+    /// then have no dense lane to run, and say so. The encode is a static
+    /// lookup, like the one retrieval makes for the same query.
+    fn query_has_no_embedding(&self, query: &str) -> bool {
+        self.embedder
+            .encode_batch(&[query.trim()])
+            .into_iter()
+            .next()
+            .is_some_and(|vector| vector.iter().all(|component| *component == 0.0))
     }
 
     /// The query's vector for the evidence dense lane, from the process

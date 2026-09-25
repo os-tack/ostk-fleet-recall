@@ -867,6 +867,14 @@ ORDER BY score DESC, chunk_id
 LIMIT $7
 ";
 
+/// Whether a chunk query has a lexeme. `$1` is already
+/// [`crate::evidence_recall::lexical_query_text`].
+const LEXICAL_TERMS_SQL: &str = "SELECT plainto_tsquery('english', $1)::STRING";
+
+/// `plainto_tsquery` raises this for a query with no lexeme, such as one made
+/// only of stopwords.
+const NO_LEXEMES_SQLSTATE: &str = "42601";
+
 const FETCH_CHUNKS_SQL_PREFIX: &str = r"
 SELECT chunk_id, source, source_id, source_config_id, chunk_index,
        source_timestamp, role, text, content_sha256,
@@ -1699,20 +1707,51 @@ impl CockroachStore {
     ) -> Result<Vec<CorpusLaneHit>> {
         enforce_filter_scope(filter, &self.scope)?;
         validate_limit(limit)?;
-        if query.trim().is_empty() {
+        // CockroachDB 26.2's `plainto_tsquery` parses `(`, `)`, `&`, `|`, `!`,
+        // `:`, and `<` as query syntax, so `remember(assert)` or `a & b` fails
+        // with SQLSTATE 42601 instead of searching for its words. Search only
+        // the query's runs of letters and digits, which is what `to_tsvector`
+        // made of the indexed text, exactly as evidence recall does.
+        let terms = crate::evidence_recall::lexical_query_text(query);
+        if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(LEXICAL_SEARCH_SQL)
+        let searched = sqlx::query(LEXICAL_SEARCH_SQL)
             .bind(self.scope.tenant_id)
             .bind(&self.scope.project)
-            .bind(query)
+            .bind(&terms)
             .bind(filter.source.as_deref())
             .bind(filter.since)
             .bind(filter.before)
             .bind(limit_as_i64(limit)?)
             .fetch_all(&self.pool)
-            .await?;
-        lane_hits(rows)
+            .await;
+        match searched {
+            Ok(rows) => lane_hits(rows),
+            // Words can still have no lexeme (every one a stopword, like
+            // `what is it`), which `plainto_tsquery` refuses rather than
+            // matching nothing. That query's lexical lane is empty.
+            Err(error)
+                if has_sqlstate(&error, NO_LEXEMES_SQLSTATE)
+                    && !self.has_lexical_terms(&terms).await? =>
+            {
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Whether `terms` has a lexeme.
+    async fn has_lexical_terms(&self, terms: &str) -> Result<bool> {
+        match sqlx::query_scalar::<_, String>(LEXICAL_TERMS_SQL)
+            .bind(terms)
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(lexemes) => Ok(!lexemes.is_empty()),
+            Err(error) if has_sqlstate(&error, NO_LEXEMES_SQLSTATE) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Fetch rows by stable Recall chunk IDs, never crossing the store scope.
@@ -2015,8 +2054,11 @@ impl CorpusReader for CockroachRetrievalReader<'_> {
     ) -> std::result::Result<Vec<CorpusLaneHit>, CorpusReadError> {
         // The portable engine uses zero to disable its optional stratified
         // code prefetch. Treat that as an empty lane instead of forwarding an
-        // invalid physical limit to CockroachDB.
-        if limit == 0 {
+        // invalid physical limit to CockroachDB. A query whose every token the
+        // model does not know embeds as the zero vector, whose cosine is
+        // undefined: nothing is near it, so its dense lane is empty too and
+        // the lexical lane answers alone.
+        if limit == 0 || embedding.iter().all(|component| *component == 0.0) {
             enforce_filter_scope(filter, &self.store.scope)
                 .map_err(|error| corpus_error("dense_search", error))?;
             return Ok(Vec::new());
@@ -2040,6 +2082,11 @@ impl CorpusReader for CockroachRetrievalReader<'_> {
             .await
             .map_err(|error| corpus_error("fetch_retrieval_chunks", error))
     }
+}
+
+/// Whether `error` is a database error with SQLSTATE `sqlstate`.
+fn has_sqlstate(error: &sqlx::Error, sqlstate: &str) -> bool {
+    matches!(error, sqlx::Error::Database(database) if database.code().as_deref() == Some(sqlstate))
 }
 
 fn corpus_error(operation: &'static str, error: impl std::fmt::Display) -> CorpusReadError {
@@ -2384,6 +2431,27 @@ mod tests {
                     embedding[0] = 1.0;
                     embedding
                 })
+                .collect()
+        }
+    }
+
+    /// Embeds every text as the zero vector, as model2vec does a text made
+    /// only of tokens its vocabulary lacks.
+    struct UnknownWordsEmbedder;
+
+    impl ChunkEmbedder for UnknownWordsEmbedder {
+        fn dim(&self) -> usize {
+            EMBEDDING_DIMENSION
+        }
+
+        fn model_id(&self) -> &'static str {
+            "live-test"
+        }
+
+        fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+            texts
+                .iter()
+                .map(|_| vec![0.0; EMBEDDING_DIMENSION])
                 .collect()
         }
     }
@@ -3276,6 +3344,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(lexical[0].chunk_id, "fleet-live-chunk");
+        // Text-search operators in a query are its punctuation, not syntax,
+        // and a query with no lexeme matches nothing instead of failing.
+        for query in [
+            "capybara(semantic)",
+            "capybara & semantic",
+            "capybara | !semantic",
+            "capybara:semantic <-> decisions",
+        ] {
+            let lexical = store
+                .lexical_search_scoped(query, &filter, 5)
+                .await
+                .unwrap_or_else(|error| panic!("{query:?}: {error}"));
+            assert_eq!(lexical[0].chunk_id, "fleet-live-chunk", "{query:?}");
+        }
+        for query in ["what is it", "?!()", "\u{1f980}"] {
+            assert!(
+                store
+                    .lexical_search_scoped(query, &filter, 5)
+                    .await
+                    .unwrap_or_else(|error| panic!("{query:?}: {error}"))
+                    .is_empty(),
+                "{query:?}"
+            );
+        }
+        // A query the model cannot embed has an empty dense lane, and hybrid
+        // recall answers from the lexical lane alone.
+        assert!(
+            store
+                .retrieval_reader()
+                .dense_search(&[0.0; EMBEDDING_DIMENSION], &filter, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let lexical_only = ostk_recall_retrieval::recall(
+            &store.retrieval_reader(),
+            &UnknownWordsEmbedder,
+            None,
+            &RecallParams {
+                query: "capybaras(semantic)".into(),
+                project: Some(scope.project.clone()),
+                limit: Some(5),
+                ..RecallParams::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(lexical_only[0].chunk_id, "fleet-live-chunk");
 
         let hydrated = store
             .fetch_chunks_scoped(&["fleet-live-chunk".into()], &filter)

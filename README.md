@@ -106,10 +106,15 @@ closes the discrepancy episodes a check opens. The
 
 Recall is hybrid: CockroachDB `VECTOR(512)` C-SPANN search and a stored
 `TSVECTOR` inverted index, fused with reciprocal-rank fusion, over embeddings
-from a pinned local model2vec model. Every claim mutation commits its claim,
-support, conflict, receipt, corpus projection, and audit events in one
-serializable transaction; an assert also appends its accepted event in that
-transaction.
+from a pinned local model2vec model. A query is searched as its words:
+punctuation, including characters CockroachDB's text search would read as
+operators, only separates them, and a query of stopwords alone has an empty
+lexical lane. A query the model cannot embed (every token outside its
+vocabulary) runs no dense lane and carries a `query_not_embedded` warning;
+claim search, which is dense only, then returns no claims. Every claim mutation
+commits its claim, support, conflict, receipt, corpus projection, and audit
+events in one serializable transaction; an assert also appends its accepted
+event in that transaction.
 
 Conflict detection uses the `same_key_functional_value_v2` detector. A claim
 key (`subject::predicate` for a recorded claim, and

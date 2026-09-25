@@ -856,6 +856,11 @@ impl ClaimLedger for CockroachClaimLedger {
             .into_iter()
             .next()
             .ok_or_else(|| FleetError::Memory("claim embedder returned no query vector".into()))?;
+        // A query whose every token the model does not know embeds as the zero
+        // vector, whose cosine is undefined: no claim passage is near it.
+        if query_vector.iter().all(|component| *component == 0.0) {
+            return Ok(Vec::new());
+        }
         let vector = serialize_vector(&query_vector)?;
         let candidate_limit = limit
             .saturating_mul(CLAIM_CANDIDATE_MULTIPLIER)

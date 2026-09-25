@@ -145,6 +145,34 @@ impl ChunkEmbedder for RankingEmbedder {
     }
 }
 
+/// Embeds every text at the query direction except one containing
+/// `zeppelin`, which it embeds as the zero vector, as model2vec does a text
+/// made only of tokens its vocabulary lacks.
+struct UnknownWordEmbedder;
+
+impl ChunkEmbedder for UnknownWordEmbedder {
+    fn dim(&self) -> usize {
+        EMBEDDING_DIMENSION
+    }
+
+    fn model_id(&self) -> &'static str {
+        MODEL
+    }
+
+    fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        texts
+            .iter()
+            .map(|text| {
+                let mut vector = vec![0.0; EMBEDDING_DIMENSION];
+                if !text.contains("zeppelin") {
+                    vector[0] = 1.0;
+                }
+                vector
+            })
+            .collect()
+    }
+}
+
 /// One fresh tenant/project with agents A, B, and C writing into it.
 struct Fleet {
     store: CockroachStore,
@@ -1481,6 +1509,84 @@ fn hit_ids(result: &RecallResult) -> Vec<String> {
         .iter()
         .map(|hit| hit["chunk_id"].as_str().unwrap().to_owned())
         .collect()
+}
+
+/// A query is words, whatever punctuation `CockroachDB`'s `plainto_tsquery`
+/// would parse as syntax, and a query the model cannot embed is answered by
+/// the lanes that can run, with a warning, rather than refused as internal.
+#[tokio::test]
+async fn live_search_answers_query_syntax_and_unembeddable_queries_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "query-text").await;
+    let scope = fleet.scope(AGENT_A);
+    let service = fleet.service_embedding(AGENT_A, PRIVATE_WRITER, Arc::new(UnknownWordEmbedder));
+    let noted = fleet
+        .record(
+            AGENT_A,
+            &note("zeppelin hangar(one) inspection note"),
+            "a/note",
+        )
+        .await;
+    let chunk = format!("claim:{}", noted.claim.id);
+    let warning_codes = |result: &RecallResult| {
+        result
+            .warnings
+            .iter()
+            .map(|warning| warning["code"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    // Operators are punctuation; the embedded query runs both lanes.
+    for query in [
+        "hangar(one) inspection",
+        "hangar & !inspection",
+        "what is it",
+    ] {
+        let found = recall(
+            &service,
+            &scope,
+            RecallAction::Search,
+            json!({ "query": query, "kind": "chunk", "limit": 5 }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{query:?}: {error:?}"));
+        assert!(hit_ids(&found).contains(&chunk), "{query:?}");
+        assert_eq!(
+            found.diagnostics["retrieval"]["lanes"],
+            json!(["lexical", "dense"])
+        );
+    }
+
+    // A query with no embedding still finds the note lexically, and says the
+    // dense lane did not run.
+    let lexical = recall(
+        &service,
+        &scope,
+        RecallAction::Search,
+        json!({ "query": "zeppelin (hangar)", "kind": "chunk", "limit": 5 }),
+    )
+    .await
+    .unwrap();
+    assert!(hit_ids(&lexical).contains(&chunk));
+    assert_eq!(
+        lexical.diagnostics["retrieval"]["lanes"],
+        json!(["lexical"])
+    );
+    assert_eq!(warning_codes(&lexical), ["query_not_embedded"]);
+
+    // Claim search is dense only, so the same query matches no claim.
+    let claims = recall(
+        &service,
+        &scope,
+        RecallAction::Search,
+        json!({ "query": "zeppelin", "kind": "claim", "limit": 5 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(claims.data["hits"], json!([]));
+    assert_eq!(warning_codes(&claims), ["query_not_embedded"]);
 }
 
 #[tokio::test]
