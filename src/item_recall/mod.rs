@@ -98,9 +98,11 @@ use crate::evidence_recall::{
     EvidenceReadinessV1, EvidenceSourcesV1, HitVoteV1,
 };
 use crate::memory_contracts::collected_item::{
-    CollectionModeV1, ItemLifecycleV1, MAX_PROVIDER_URL_BYTES, ProviderKindV1, TrustTierV1,
+    CollectionModeV1, ItemLifecycleV1, MAX_PROVIDER_URL_BYTES, ObjectKindV1, ProviderKindV1,
+    TrustTierV1, derive_item_key,
 };
 use crate::memory_contracts::digest::Sha256Digest;
+use crate::projectors::RecallRedactionV1;
 use crate::store::cockroach::COLLECTED_ITEMS_SCHEMA_VERSION;
 
 pub use cockroach::{
@@ -134,6 +136,45 @@ pub const MAX_ITEM_LINKS_IN: usize = 256;
 
 /// Claim citations of one item that one `get` lists.
 pub const MAX_ITEM_CITATIONS: usize = 256;
+
+/// Claim ids one search hit's citation marker names; the counts beside them
+/// cover every citing claim.
+pub const MAX_HIT_CITATION_IDS: usize = 8;
+
+/// The object kind of a reply's thread root under `provider`.
+///
+/// A Linear comment's root is the issue it is on, while every other
+/// provider's replies share their root's kind (a Slack reply's root is a
+/// message).
+#[must_use]
+pub fn thread_root_object_kind(
+    provider: &ProviderKindV1,
+    reply_kind: &ObjectKindV1,
+) -> ObjectKindV1 {
+    if provider.as_str() == "linear" && reply_kind.as_str() == "comment" {
+        return ObjectKindV1::new("issue")
+            .unwrap_or_else(|_| unreachable!("`issue` is a valid object kind"));
+    }
+    reply_kind.clone()
+}
+
+/// The item key of a reply's thread root: the same derivation the collectors
+/// use for every item, under the root's own object kind
+/// ([`thread_root_object_kind`]). `get` takes it.
+#[must_use]
+pub fn thread_root_item_key(
+    provider: &ProviderKindV1,
+    provider_scope_id: &str,
+    reply_kind: &ObjectKindV1,
+    root_external_id: &str,
+) -> Sha256Digest {
+    derive_item_key(
+        provider,
+        provider_scope_id,
+        &thread_root_object_kind(provider, reply_kind),
+        root_external_id,
+    )
+}
 
 /// Longest version URI `get` accepts: migration 33's bound on
 /// `canonical_resource_id`.
@@ -285,12 +326,55 @@ pub struct ItemHitV1 {
     pub dense_similarity: Option<f32>,
     /// Versions of the item other than the presented one.
     pub superseded_versions: u64,
-    /// A reported version newer than the verified head differs from it.
+    /// A reported version newer than the verified head differs from it: copy
+    /// divergence between channels, not a dispute (see `cited_by`).
     pub disagreement: bool,
     /// Always `untrusted_third_party`.
     pub content_trust: ContentTrustV1,
     /// Advisory signals about the matching part's text and title.
     pub injection_signals: Vec<InjectionSignalV1>,
+    /// The claims that cite the item, where this deployment serves claim
+    /// item links (ADR 0008 D11); absent elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cited_by: Option<ItemCitedByV1>,
+    /// For a thread reply, the external id of the thread's root item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_root_external_id: Option<String>,
+    /// For a thread reply, the root item's id ([`thread_root_item_key`]);
+    /// `get` takes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_root_item_id: Option<Sha256Digest>,
+    /// The redaction profile the matching part was admitted under
+    /// (`crate::redaction::REDACTION_PROFILE_VERSION` for a current one).
+    pub redaction_profile: u32,
+    /// What the read-time redaction removed from the matching part's text;
+    /// absent when it removed nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redacted_at_read: Option<RecallRedactionV1>,
+}
+
+/// The claims that cite one item, as a search hit carries them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ItemCitedByV1 {
+    /// Claims citing the item, in any lifecycle state.
+    pub claims: u32,
+    /// Of those, the claims a conflict holds `disputed` now.
+    pub disputed: u32,
+    /// The first [`MAX_HIT_CITATION_IDS`] citing claims, oldest citation
+    /// first; `recall(get, kind=item)` lists every citation.
+    pub claim_ids: Vec<i64>,
+}
+
+impl ItemCitedByV1 {
+    /// No claim cites the item.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            claims: 0,
+            disputed: 0,
+            claim_ids: Vec::new(),
+        }
+    }
 }
 
 impl ItemHitV1 {
@@ -416,6 +500,10 @@ pub struct ItemPartTextV1 {
     /// a hidden item, and past [`MAX_ITEM_GET_TEXT_BYTES`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// What the read-time redaction removed from `text`; absent when it
+    /// removed nothing, or when no text is carried.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redacted_at_read: Option<RecallRedactionV1>,
     pub injection_signals: Vec<InjectionSignalV1>,
 }
 
@@ -432,6 +520,11 @@ pub struct ItemProvenanceV1 {
     pub trust: TrustTierV1,
     pub admitted_at: DateTime<Utc>,
     pub accepted_event_id: Sha256Digest,
+    /// The redaction profile the part was admitted under
+    /// (`crate::redaction::REDACTION_PROFILE_VERSION` for a current one): an
+    /// older profile marks a body the at-rest supersession pass owes a
+    /// re-read.
+    pub redaction_profile: u32,
 }
 
 /// One version of the item.
@@ -497,10 +590,28 @@ pub struct ItemCitationV1 {
     pub cited_at: DateTime<Utc>,
 }
 
+/// The root of the thread a reply is in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ItemThreadRootV1 {
+    /// The root item's id ([`thread_root_item_key`]); `get` takes it.
+    pub item_id: Sha256Digest,
+    pub external_id: String,
+}
+
+/// A reply's thread: its root, reachable in one `get`. Listing the replies
+/// of a root is a follow-up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ItemThreadV1 {
+    pub root: ItemThreadRootV1,
+}
+
 /// One item, as `recall(get, kind=item)` returns it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ItemGetV1 {
     pub item: ItemSummaryV1,
+    /// For a thread reply, the thread it is in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ItemThreadV1>,
     /// Always `untrusted_third_party`.
     pub content_trust: ContentTrustV1,
     /// Why the item is withheld; when set, the answer is metadata only.
@@ -579,6 +690,45 @@ mod tests {
         ] {
             assert!(ItemReferenceV1::parse(&refused).is_err(), "{refused}");
         }
+    }
+
+    #[test]
+    fn a_thread_root_is_derived_under_the_roots_own_kind_per_provider() {
+        let slack = ProviderKindV1::new("slack").unwrap();
+        let message = ObjectKindV1::new("message").unwrap();
+        let root = "C07PLATENG1:1790006645.000200";
+        // A Slack reply's root is a message of the same channel.
+        assert_eq!(thread_root_object_kind(&slack, &message), message);
+        assert_eq!(
+            thread_root_item_key(&slack, "T07ACME0001", &message, root),
+            derive_item_key(&slack, "T07ACME0001", &message, root)
+        );
+        // A Linear comment's root is the issue it is on, not a comment.
+        let linear = ProviderKindV1::new("linear").unwrap();
+        let comment = ObjectKindV1::new("comment").unwrap();
+        let issue = ObjectKindV1::new("issue").unwrap();
+        assert_eq!(thread_root_object_kind(&linear, &comment), issue);
+        assert_eq!(
+            thread_root_item_key(&linear, "acme", &comment, "issue-1"),
+            derive_item_key(&linear, "acme", &issue, "issue-1")
+        );
+        assert_ne!(
+            thread_root_item_key(&linear, "acme", &comment, "issue-1"),
+            derive_item_key(&linear, "acme", &comment, "issue-1")
+        );
+        // Any other Linear kind, and every other provider, keeps its kind.
+        assert_eq!(thread_root_object_kind(&linear, &issue), issue);
+        let docs = ProviderKindV1::new("docs").unwrap();
+        let document = ObjectKindV1::new("document").unwrap();
+        assert_eq!(thread_root_object_kind(&docs, &document), document);
+    }
+
+    #[test]
+    fn a_hit_citation_marker_serializes_its_counts_and_ids() {
+        assert_eq!(
+            serde_json::to_value(ItemCitedByV1::none()).unwrap(),
+            serde_json::json!({ "claims": 0, "disputed": 0, "claim_ids": [] })
+        );
     }
 
     #[test]

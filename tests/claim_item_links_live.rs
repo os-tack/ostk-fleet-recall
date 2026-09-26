@@ -28,8 +28,8 @@ use ostk_fleet_recall::collectors::sink::{
     CollectedItemSink, ContainerObservationV1, StageContextV1, StageDraftV1, StagedItemV1,
 };
 use ostk_fleet_recall::item_recall::{
-    CockroachItemRecall, ItemGetV1, ItemRecall as _, ItemReferenceV1, ItemSuppressionV1,
-    probe_item_recall,
+    CockroachItemRecall, ItemCitedByV1, ItemGetV1, ItemHitV1, ItemRecall as _, ItemReferenceV1,
+    ItemSearchRequestV1, ItemSuppressionV1, probe_item_recall,
 };
 use ostk_fleet_recall::ledger::{
     AssertedClaimMutation, ClaimInput, ClaimItemSupportV1, ClaimKind, ClaimLedger as _, ClaimState,
@@ -1747,4 +1747,130 @@ async fn live_a_version_in_a_withdrawn_container_is_withheld_everywhere_when_con
     for item in &support.support_items {
         assert_eq!(item["content_trust"], "untrusted_third_party", "{got}");
     }
+}
+
+/// The hits of one lexical item search, where the reader lists citations.
+async fn item_hits(items: &CockroachItemRecall, query: &str) -> Vec<ItemHitV1> {
+    items
+        .search(
+            &ItemSearchRequestV1 {
+                query: query.to_owned(),
+                provider: None,
+                include_history: false,
+                limit: 20,
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .hits
+}
+
+/// A search hit on an item says which claims cite it and how many of those
+/// a conflict holds `disputed`, so `disagreement` (a reported copy diverging
+/// from the verified head) is never the only sign; an item no claim cites is
+/// marked as such, and a reader without the claim links attaches nothing.
+#[tokio::test]
+async fn live_a_hit_on_an_item_a_disputed_claim_cites_says_so_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "claim-links-hit-marker").await;
+    let [heron, pelican] = fleet.admit(&[&HERON, &PELICAN]).await[..] else {
+        panic!("two items are staged");
+    };
+    let items = fleet.items().await;
+    let hit_of = |hits: &[ItemHitV1], item: Sha256Digest| {
+        hits.iter()
+            .find(|hit| hit.item_id == item)
+            .cloned()
+            .unwrap_or_else(|| panic!("item {item} is recalled: {hits:?}"))
+    };
+
+    // Before any claim: served, and empty.
+    let before = hit_of(&item_hits(&items, "heron retry budget").await, heron.item);
+    assert_eq!(before.cited_by, Some(ItemCitedByV1::none()));
+    assert!(!before.disagreement);
+
+    // A cites the heron message; the marker names the claim, undisputed.
+    let scope_a = fleet.scope(AGENT_A);
+    let a = fleet
+        .ledger(AGENT_A)
+        .await
+        .assert_claim(
+            &scope_a,
+            &assertion(true, &[json!({ "item_id": heron.item })]),
+            "claim-links-hit-marker-a",
+        )
+        .await
+        .expect("A asserts");
+    let cited = hit_of(&item_hits(&items, "heron retry budget").await, heron.item);
+    assert_eq!(
+        cited.cited_by,
+        Some(ItemCitedByV1 {
+            claims: 1,
+            disputed: 0,
+            claim_ids: vec![a.mutation.claim.id],
+        })
+    );
+    let uncited = hit_of(
+        &item_hits(&items, "pelican deploy window").await,
+        pelican.item,
+    );
+    assert_eq!(uncited.cited_by, Some(ItemCitedByV1::none()));
+
+    // B disagrees: the conflict holds both claims disputed, and the heron
+    // hit says so while its copy divergence flag stays false.
+    let b = fleet
+        .ledger(AGENT_B)
+        .await
+        .assert_claim(
+            &fleet.scope(AGENT_B),
+            &assertion(false, &[]),
+            "claim-links-hit-marker-b",
+        )
+        .await
+        .expect("B asserts");
+    assert_eq!(b.mutation.conflicts_opened.len(), 1, "{b:?}");
+    let disputed = hit_of(&item_hits(&items, "heron retry budget").await, heron.item);
+    assert_eq!(
+        disputed.cited_by,
+        Some(ItemCitedByV1 {
+            claims: 1,
+            disputed: 1,
+            claim_ids: vec![a.mutation.claim.id],
+        })
+    );
+    assert!(!disputed.disagreement);
+    let value = serde_json::to_value(&disputed).unwrap();
+    assert_eq!(
+        value["cited_by"],
+        json!({ "claims": 1, "disputed": 1, "claim_ids": [a.mutation.claim.id] })
+    );
+    let got = fleet.get_item(heron.item).await;
+    let citations = got.cited_by.unwrap();
+    assert_eq!(citations.len(), 1);
+    assert_eq!(citations[0].claim_id, a.mutation.claim.id);
+    assert_eq!(citations[0].claim_state, "disputed");
+
+    // A reader composed without the claim links serves no marker at all.
+    let scope = &fleet.fixture.installed.scope;
+    let capability = probe_item_recall(
+        &fleet.pool,
+        &fleet.capabilities().await,
+        scope,
+        Sha256Digest::from_bytes(STUB_MODEL_DIGEST),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let plain = CockroachItemRecall::new(capability, fleet.pool.clone());
+    let unmarked = hit_of(&item_hits(&plain, "heron retry budget").await, heron.item);
+    assert_eq!(unmarked.cited_by, None);
+    assert!(
+        serde_json::to_value(&unmarked)
+            .unwrap()
+            .get("cited_by")
+            .is_none()
+    );
 }

@@ -55,6 +55,7 @@ use ostk_fleet_recall::memory_contracts::coverage::{
 use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
 use ostk_fleet_recall::memory_contracts::evidence::AcceptedEventId;
 use ostk_fleet_recall::memory_contracts::identity::ResourceUri;
+use ostk_fleet_recall::redaction::REDACTION_PROFILE_VERSION;
 use ostk_fleet_recall::registry_activation::install::InstallTargetV1;
 use ostk_fleet_recall::service::{
     FleetMemoryService as _, RecallAction, RecallRequest, RecallSurface, RememberSurface,
@@ -1476,4 +1477,92 @@ async fn live_a_multi_part_item_is_one_hit_per_version_with_its_parts_in_order_w
     assert!(joined.starts_with("Paragraph 0 of the capybara"));
     assert!(joined.contains("zebu cutover"));
     assert!(!got.text_truncated);
+}
+
+/// A reply hit names its thread's root, derived under the root's own kind,
+/// and that root is reachable in one `get`; the root itself names no
+/// thread. Every hit and provenance row says which redaction profile its
+/// part was admitted under, and a clean body carries no read-time marker.
+#[tokio::test]
+async fn live_a_reply_hit_reaches_its_thread_root_in_one_get_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = fixture_at(&pool, "items-thread").await;
+    stage(&pool, &fixture, &slack(), fixture_drafts("slack")).await;
+    drain(&fixture, &pool, "collect,project").await;
+    let recall = items(&pool, &fixture).await;
+
+    let root_external_id = "C07PLATENG1:1790006645.000200";
+    let reply_external_id = "C07PLATENG1:1790006860.001100";
+    let answer = search(&recall, "withdrawn").await;
+    let reply = answer
+        .hits
+        .iter()
+        .find(|hit| hit.external_id == reply_external_id)
+        .expect("the reply is recalled");
+    assert_eq!(
+        reply.thread_root_external_id.as_deref(),
+        Some(root_external_id)
+    );
+    let root_id = reply.thread_root_item_id.expect("a reply names its root");
+    assert_eq!(
+        reply.cited_by, None,
+        "a reader without claim links attaches no citation marker"
+    );
+    assert_eq!(reply.redaction_profile, REDACTION_PROFILE_VERSION);
+    assert_eq!(reply.redacted_at_read, None);
+    assert_eq!(
+        serde_json::to_value(reply).unwrap()["thread_root_item_id"],
+        json!(root_id)
+    );
+
+    // One `get` on the root id lands on the thread's root message.
+    let root = get(&recall, root_id).await;
+    assert_eq!(root.item.external_id, root_external_id);
+    assert_eq!(root.item.object_kind, "message");
+    assert_eq!(root.thread, None, "a root is in no thread of its own");
+    assert_eq!(root.item.thread_root_external_id, None);
+    assert!(
+        root.current.parts[0]
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("retry budget be 3 or 5")),
+        "{:?}",
+        root.current.parts[0].text
+    );
+
+    // And `get` on the reply names the same root.
+    let got = get(&recall, reply.item_id).await;
+    let thread = got.thread.as_ref().expect("a reply's get names its thread");
+    assert_eq!(thread.root.item_id, root_id);
+    assert_eq!(thread.root.external_id, root_external_id);
+    assert_eq!(
+        got.item.thread_root_external_id.as_deref(),
+        Some(root_external_id)
+    );
+    assert_eq!(
+        got.current.provenance[0].redaction_profile,
+        REDACTION_PROFILE_VERSION
+    );
+    assert_eq!(got.current.parts[0].redacted_at_read, None);
+    let value = serde_json::to_value(&got).unwrap();
+    assert_eq!(value["thread"]["root"]["item_id"], json!(root_id));
+    assert!(
+        value["current"]["parts"][0]
+            .get("redacted_at_read")
+            .is_none(),
+        "a clean part serializes no marker: {value}"
+    );
+
+    // The root's own hit carries no thread fields.
+    let roots = search(&recall, "retry budget be 3 or 5").await;
+    let root_hit = roots
+        .hits
+        .iter()
+        .find(|hit| hit.external_id == root_external_id)
+        .expect("the root is recalled");
+    assert_eq!(root_hit.thread_root_external_id, None);
+    assert_eq!(root_hit.thread_root_item_id, None);
 }

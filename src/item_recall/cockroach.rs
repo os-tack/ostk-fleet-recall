@@ -27,11 +27,13 @@ use crate::evidence_recall::{
     lane_match, lexical_query_text, listing_limit, may_read,
 };
 use crate::memory_contracts::collected_item::{
-    CollectedItemEnvelopeV1, CollectionModeV1, ItemLifecycleV1, ProviderKindV1, TrustTierV1,
+    CollectedItemEnvelopeV1, CollectionModeV1, ItemLifecycleV1, ObjectKindV1, ProviderKindV1,
+    TrustTierV1,
 };
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::projectors::{
-    CockroachRecallReader, EMBEDDING_DIMENSIONS, fuse_lanes, lane_depth, redact_for_recall,
+    CockroachRecallReader, EMBEDDING_DIMENSIONS, RecallRedactionV1, fuse_lanes, lane_depth,
+    redact_for_recall, redact_for_recall_marked,
 };
 use crate::store::cockroach::{
     ClaimItemLinksCapability, DatabaseCapabilities, RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
@@ -40,12 +42,13 @@ use crate::store::cockroach::{
 
 use super::signals::{InjectionSignalV1, defang_markdown_images, injection_signals};
 use super::{
-    ITEM_RECALL_SCHEMA_VERSION, ITEM_SNIPPET_CHARS, ItemAuthorRefV1, ItemCitationV1,
+    ITEM_RECALL_SCHEMA_VERSION, ITEM_SNIPPET_CHARS, ItemAuthorRefV1, ItemCitationV1, ItemCitedByV1,
     ItemContainerRefV1, ItemGetV1, ItemHitV1, ItemLinkInV1, ItemLinkOutV1, ItemPartRefV1,
     ItemPartTextV1, ItemProvenanceV1, ItemReadinessV1, ItemRecall, ItemReferenceV1,
-    ItemSearchRequestV1, ItemSearchV1, ItemSummaryV1, ItemSuppressionV1, ItemVersionRecordV1,
-    ItemVersionRefV1, MAX_ITEM_CITATIONS, MAX_ITEM_GET_ROWS, MAX_ITEM_GET_TEXT_BYTES,
-    MAX_ITEM_LINKS_IN, MAX_ITEM_SEARCH_LIMIT,
+    ItemSearchRequestV1, ItemSearchV1, ItemSummaryV1, ItemSuppressionV1, ItemThreadRootV1,
+    ItemThreadV1, ItemVersionRecordV1, ItemVersionRefV1, MAX_HIT_CITATION_IDS, MAX_ITEM_CITATIONS,
+    MAX_ITEM_GET_ROWS, MAX_ITEM_GET_TEXT_BYTES, MAX_ITEM_LINKS_IN, MAX_ITEM_SEARCH_LIMIT,
+    thread_root_item_key,
 };
 
 /// Every table item recall reads. The startup probe checks SELECT on each.
@@ -148,8 +151,9 @@ static DENSE_ITEMS_SQL: LazyLock<String> = LazyLock::new(|| {
 /// container, with the part's body envelope.
 const HYDRATE_SQL: &str = "SELECT item.accepted_event_id, item.item_key_digest, \
      item.version_key_digest, item.part_ordinal, item.part_count, item.provider, \
-     item.object_kind, item.external_id, item.trust_tier, item.lifecycle, \
-     item.version_marker, item.provider_order, item.provider_created_at, \
+     item.provider_scope_id, item.object_kind, item.external_id, item.trust_tier, \
+     item.lifecycle, item.version_marker, item.provider_order, item.redaction_profile, \
+     item.thread_root_external_id, item.provider_created_at, \
      item.provider_updated_at, item.provider_url, item.canonical_resource_id, \
      item.body_content_id, body.body_bytes, \
      head.version_key_digest AS head_version_key, head.disagreement, \
@@ -239,7 +243,8 @@ const PRESENTED_HEAD_SQL: &str = "SELECT head.trust_tier, head.version_key_diges
 const HISTORY_SQL: &str = "SELECT item.accepted_event_id, item.version_key_digest, \
      item.part_ordinal, item.part_count, item.collection_mode, item.trust_tier, \
      item.collector_instance_id, item.attester_principal_id, item.lifecycle, \
-     item.version_marker, item.provider_order, item.thread_root_external_id, \
+     item.version_marker, item.provider_order, item.redaction_profile, \
+     item.thread_root_external_id, \
      item.provider_url, item.provider_created_at, item.provider_updated_at, \
      item.canonical_resource_id, item.body_content_id, item.admitted_at, \
      COALESCE(container.access <> 'ok', false) AS container_withdrawn \
@@ -298,6 +303,25 @@ const CITATIONS_SQL: &str = "SELECT link.claim_id, link.via, link.relation, \
               claim.state \
      ORDER BY cited_at, link.claim_id, link.link_id \
      LIMIT $4";
+
+/// The citation marker of every item of a page of hits
+/// (`memory_claim_item_links_item_idx`): per item, how many claims cite it,
+/// how many of those a conflict holds `disputed` now, and the citing claims
+/// oldest citation first. A claim that cites an item through several links
+/// counts once.
+const HIT_CITATIONS_SQL: &str = "SELECT cited.item_key_digest, count(*) AS claims, \
+     count(*) FILTER (WHERE cited.claim_state = 'disputed') AS disputed, \
+     array_agg(cited.claim_id ORDER BY cited.cited_at, cited.claim_id) AS claim_ids \
+     FROM (SELECT link.item_key_digest, link.claim_id, claim.state AS claim_state, \
+             min(link.created_at) AS cited_at \
+           FROM public.memory_claim_item_links_v1 AS link \
+           JOIN public.memory_claims AS claim \
+             ON claim.tenant_id = link.tenant_id AND claim.project = link.project \
+            AND claim.id = link.claim_id \
+           WHERE link.tenant_id = $1 AND link.project = $2 \
+             AND link.item_key_digest = ANY($3::BYTES[]) \
+           GROUP BY link.item_key_digest, link.claim_id, claim.state) AS cited \
+     GROUP BY cited.item_key_digest";
 
 /// Proof that this login may read every item-recall table in one scope, and
 /// whether the dense lane is served there.
@@ -457,7 +481,54 @@ fn fuse(lexical: &[LaneRowV1], dense: &[LaneRowV1], limit: usize) -> Vec<FusedHi
 /// Text an answer may carry: the recall plane's redaction again, then
 /// markdown images defanged.
 fn recall_text(text: &str) -> String {
-    defang_markdown_images(&redact_for_recall(text))
+    recall_text_marked(text).0
+}
+
+/// [`recall_text`], with what the read-time redaction removed.
+fn recall_text_marked(text: &str) -> (String, Option<RecallRedactionV1>) {
+    let (redacted, marker) = redact_for_recall_marked(text);
+    (defang_markdown_images(&redacted), marker)
+}
+
+/// The root of the thread a reply is in, under the root's own object kind
+/// ([`thread_root_item_key`]); `None` for a channel-level item, and for a
+/// root that names itself.
+fn thread_root_of(
+    provider: &str,
+    provider_scope_id: &str,
+    object_kind: &str,
+    external_id: &str,
+    thread_root: Option<&str>,
+) -> Result<Option<ItemThreadRootV1>> {
+    thread_root
+        .filter(|root| *root != external_id)
+        .map(|root| {
+            Ok(ItemThreadRootV1 {
+                item_id: thread_root_item_key(
+                    &ProviderKindV1::new(provider)?,
+                    provider_scope_id,
+                    &ObjectKindV1::new(object_kind)?,
+                    root,
+                ),
+                external_id: root.to_owned(),
+            })
+        })
+        .transpose()
+}
+
+/// One hit's citation marker from its grouped row: the counts whole, the
+/// claim ids cut at [`MAX_HIT_CITATION_IDS`].
+fn citation_marker(claims: i64, disputed: i64, mut claim_ids: Vec<i64>) -> Result<ItemCitedByV1> {
+    let count = |value: i64, what: &str| {
+        u32::try_from(value)
+            .map_err(|_| FleetError::Memory(format!("a citation {what} count is out of range")))
+    };
+    claim_ids.truncate(MAX_HIT_CITATION_IDS);
+    Ok(ItemCitedByV1 {
+        claims: count(claims, "claim")?,
+        disputed: count(disputed, "dispute")?,
+        claim_ids,
+    })
 }
 
 /// The first `limit` characters of `text`, and whether it was cut.
@@ -572,6 +643,7 @@ struct HistoryRowV1 {
     lifecycle: ItemLifecycleV1,
     marker: String,
     order: u64,
+    redaction_profile: u32,
     thread_root: Option<String>,
     provider_url: Option<String>,
     created_at: Option<DateTime<Utc>>,
@@ -600,6 +672,7 @@ impl HistoryRowV1 {
             lifecycle: ItemLifecycleV1::parse(&lifecycle)?,
             marker: row.try_get("version_marker")?,
             order: order_of(row)?,
+            redaction_profile: small(row, "redaction_profile")?,
             thread_root: row.try_get("thread_root_external_id")?,
             provider_url: row.try_get("provider_url")?,
             created_at: row.try_get("provider_created_at")?,
@@ -711,6 +784,39 @@ impl CockroachItemRecall {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok((Some(citations), truncated))
+    }
+
+    /// The citation marker of each hit's item, when this reader lists
+    /// citations: one grouped read over the page's items, an item no claim
+    /// cites marked as such rather than left unmarked.
+    async fn attach_citations(&self, hits: &mut [ItemHitV1]) -> Result<()> {
+        if !self.claim_citations || hits.is_empty() {
+            return Ok(());
+        }
+        let items: BTreeSet<Sha256Digest> = hits.iter().map(|hit| hit.item_id).collect();
+        let rows: Vec<PgRow> = sqlx::query(HIT_CITATIONS_SQL)
+            .bind(self.tenant_id)
+            .bind(&self.project)
+            .bind(digest_list(items.iter().copied()))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut markers: HashMap<Sha256Digest, ItemCitedByV1> = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let claim_ids: Vec<i64> = row.try_get("claim_ids")?;
+            markers.insert(
+                digest(row, "item_key_digest")?,
+                citation_marker(row.try_get("claims")?, row.try_get("disputed")?, claim_ids)?,
+            );
+        }
+        for hit in hits {
+            hit.cited_by = Some(
+                markers
+                    .get(&hit.item_id)
+                    .cloned()
+                    .unwrap_or_else(ItemCitedByV1::none),
+            );
+        }
+        Ok(())
     }
 
     /// The live and snapshot collectors of `provider`, or of every provider,
@@ -827,7 +933,7 @@ impl CockroachItemRecall {
             .map(|row| digest(row, "item_key_digest"))
             .collect::<Result<_>>()?;
         let modes = self.version_modes(&items).await?;
-        fused
+        let mut hits = fused
             .into_iter()
             .map(|hit| {
                 let row = parts.remove(&hit.body).ok_or_else(|| {
@@ -838,7 +944,9 @@ impl CockroachItemRecall {
                 })?;
                 hit_from_row(&hit, &row, &modes)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        self.attach_citations(&mut hits).await?;
+        Ok(hits)
     }
 
     /// Per item, each version's admitting channels.
@@ -1085,15 +1193,27 @@ fn hit_from_row(hit: &FusedHitV1, row: &PgRow, modes: &VersionModes) -> Result<I
     let versions = item_versions.map_or(1, BTreeMap::len);
     let tier: String = row.try_get("trust_tier")?;
     let lifecycle: String = row.try_get("lifecycle")?;
-    let (snippet, snippet_truncated) =
-        snippet(&recall_text(envelope.text.as_str()), ITEM_SNIPPET_CHARS);
+    let (text, redacted_at_read) = recall_text_marked(envelope.text.as_str());
+    let (snippet, snippet_truncated) = snippet(&text, ITEM_SNIPPET_CHARS);
+    let provider: String = row.try_get("provider")?;
+    let object_kind: String = row.try_get("object_kind")?;
+    let external_id: String = row.try_get("external_id")?;
+    let thread_root: Option<String> = row.try_get("thread_root_external_id")?;
+    let provider_scope_id: String = row.try_get("provider_scope_id")?;
+    let thread_root = thread_root_of(
+        &provider,
+        &provider_scope_id,
+        &object_kind,
+        &external_id,
+        thread_root.as_deref(),
+    )?;
     Ok(ItemHitV1 {
         item_id,
         version_id,
         uri: row.try_get("canonical_resource_id")?,
-        provider: row.try_get("provider")?,
-        object_kind: row.try_get("object_kind")?,
-        external_id: row.try_get("external_id")?,
+        provider,
+        object_kind,
+        external_id,
         title: recalled_title(&envelope),
         snippet,
         snippet_truncated,
@@ -1134,6 +1254,12 @@ fn hit_from_row(hit: &FusedHitV1, row: &PgRow, modes: &VersionModes) -> Result<I
             .unwrap_or(false),
         content_trust: ContentTrustV1::UntrustedThirdParty,
         injection_signals: part_signals(&envelope),
+        // Attached after hydration, where citations are served.
+        cited_by: None,
+        thread_root_external_id: thread_root.as_ref().map(|root| root.external_id.clone()),
+        thread_root_item_id: thread_root.map(|root| root.item_id),
+        redaction_profile: small(row, "redaction_profile")?,
+        redacted_at_read,
     })
 }
 
@@ -1184,6 +1310,18 @@ fn version_record(
         .iter()
         .map(|part| {
             let envelope = envelopes.get(&part.body);
+            let (text, redacted_at_read) = match (show, envelope) {
+                (true, Some(envelope)) => {
+                    let (text, marker) = recall_text_marked(envelope.text.as_str());
+                    let text = budget.take(text);
+                    // The marker describes text the answer carries.
+                    let marker = marker.filter(|_| text.is_some());
+                    (text, marker)
+                }
+                // A body left unread is past the budget.
+                (true, None) => (budget.cut(), None),
+                (false, _) => (None, None),
+            };
             ItemPartTextV1 {
                 ordinal: part.part_ordinal,
                 count: part.part_count,
@@ -1193,12 +1331,8 @@ fn version_record(
                 uri: part.uri.clone(),
                 accepted_event_id: part.accepted_event_id,
                 body_id: part.body,
-                text: match (show, envelope) {
-                    (true, Some(envelope)) => budget.take(recall_text(envelope.text.as_str())),
-                    // A body left unread is past the budget.
-                    (true, None) => budget.cut(),
-                    (false, _) => None,
-                },
+                text,
+                redacted_at_read,
                 injection_signals: envelope
                     .filter(|_| show)
                     .map(part_signals)
@@ -1229,6 +1363,7 @@ fn version_record(
                 trust: row.tier,
                 admitted_at: row.admitted_at,
                 accepted_event_id: row.accepted_event_id,
+                redaction_profile: row.redaction_profile,
             })
             .collect(),
     }
@@ -1339,6 +1474,15 @@ impl ItemRecall for CockroachItemRecall {
         let current_record = records
             .next()
             .ok_or_else(|| FleetError::Memory("an item get lost its presented version".into()))?;
+        // A reply's thread: its root, reachable in one more `get`.
+        let thread = thread_root_of(
+            &head.provider,
+            &head.provider_scope_id,
+            &head.object_kind,
+            &head.external_id,
+            first.thread_root.as_deref(),
+        )?
+        .map(|root| ItemThreadV1 { root });
         Ok(Some(ItemGetV1 {
             item: ItemSummaryV1 {
                 item_id: item,
@@ -1354,6 +1498,7 @@ impl ItemRecall for CockroachItemRecall {
                 disagreement: head.disagreement,
                 versions: u64::try_from(versions.len()).unwrap_or(u64::MAX),
             },
+            thread,
             content_trust: ContentTrustV1::UntrustedThirdParty,
             suppressed: head.suppressed,
             requested_version_id,
@@ -1461,6 +1606,130 @@ mod tests {
     }
 
     #[test]
+    fn a_hit_citation_marker_keeps_its_counts_whole_and_cuts_its_ids() {
+        let ids: Vec<i64> = (1..=12).collect();
+        let marker = citation_marker(12, 3, ids).unwrap();
+        assert_eq!(marker.claims, 12);
+        assert_eq!(marker.disputed, 3);
+        assert_eq!(marker.claim_ids, (1..=8).collect::<Vec<i64>>());
+        assert_eq!(
+            citation_marker(0, 0, Vec::new()).unwrap(),
+            ItemCitedByV1::none()
+        );
+        assert!(citation_marker(-1, 0, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_part_carrying_redacted_text_says_what_the_read_pass_removed() {
+        let presented = PresentedHeadV1 {
+            tier: TrustTierV1::Verified,
+            version_key: key(1),
+            lifecycle: ItemLifecycleV1::Live,
+            disagreement: false,
+            provider: "docs".into(),
+            provider_scope_id: "docs.acme.specs".into(),
+            object_kind: "document".into(),
+            external_id: "creds.md".into(),
+            container_label: None,
+            suppressed: None,
+        };
+        let version = VersionRowsV1 {
+            version_key: key(1),
+            rows: vec![history_row(0, TrustTierV1::Verified, 30)],
+        };
+        // A sealed envelope is clean; a body admitted before the ingress
+        // redactors could still hold a secret at rest, which the read pass
+        // removes and marks.
+        let mut envelope = sealed_envelope("the pelican limit is ten");
+        assert!(RecallRedactionV1::of(&crate::redaction::redact(envelope.text.as_str())).is_none());
+        envelope.text = crate::memory_contracts::collected_item::CollectedTextV1::new(
+            "creds are AKIAIOSFODNN7EXAMPLE for the bucket",
+        )
+        .unwrap();
+        let envelopes: HashMap<Sha256Digest, CollectedItemEnvelopeV1> =
+            std::iter::once((key(30), envelope)).collect();
+        let mut budget = TextBudgetV1 {
+            remaining: MAX_ITEM_GET_TEXT_BYTES,
+            exhausted: false,
+        };
+        let record = version_record(&version, &presented, &envelopes, true, &mut budget);
+        let part = &record.parts[0];
+        let text = part.text.as_deref().unwrap();
+        assert!(!text.contains("AKIAIOSFODNN7EXAMPLE"), "{text}");
+        let marker = part
+            .redacted_at_read
+            .as_ref()
+            .expect("the read pass marks what it removed");
+        assert_eq!(marker.classes, ["aws_access_key_id"]);
+        assert_eq!(marker.ranges, 1);
+        assert_eq!(
+            record.provenance[0].redaction_profile,
+            crate::redaction::REDACTION_PROFILE_VERSION
+        );
+
+        // Past the text budget the part carries no text, so no marker either.
+        let mut exhausted = TextBudgetV1 {
+            remaining: 0,
+            exhausted: false,
+        };
+        let cut = version_record(&version, &presented, &envelopes, true, &mut exhausted);
+        assert_eq!(cut.parts[0].text, None);
+        assert_eq!(cut.parts[0].redacted_at_read, None);
+        assert!(exhausted.exhausted);
+    }
+
+    /// One sealed, clean document envelope carrying `text`.
+    fn sealed_envelope(text: &str) -> CollectedItemEnvelopeV1 {
+        use crate::collectors::draft::{
+            CollectedItemDraftV1, DraftSectionV1, SealContextV1, collection_record, seal,
+        };
+        use crate::memory_contracts::collected_item::{
+            AudienceBasisV1, ObjectKindV1, TextFormatV1,
+        };
+        use crate::memory_contracts::common::ContractId;
+
+        let draft = CollectedItemDraftV1 {
+            provider: ProviderKindV1::new("docs").unwrap(),
+            provider_scope_id: "docs.acme.specs".into(),
+            object_kind: ObjectKindV1::new("document").unwrap(),
+            external_id: "creds.md".into(),
+            marker: Some("m".into()),
+            order_micros: 1,
+            lifecycle: ItemLifecycleV1::Live,
+            container: None,
+            thread: None,
+            author: None,
+            created_at: None,
+            updated_at: None,
+            title: None,
+            sections: vec![DraftSectionV1::whole(text.to_owned())],
+            text_format: TextFormatV1::Markdown,
+            links: Vec::new(),
+            provider_url: None,
+            visibility: None,
+        };
+        let collection = collection_record(
+            CollectionModeV1::Pull,
+            ContractId::new("docs.specs").unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        seal(
+            &draft,
+            &SealContextV1 {
+                redactor: &crate::collectors::test_support::redactor(),
+                audience: AudienceBasisV1::TeamPublic,
+                collection: &collection,
+            },
+        )
+        .unwrap()
+        .parts
+        .remove(0)
+        .envelope
+    }
+
+    #[test]
     fn the_text_budget_cuts_whole_parts_and_says_so() {
         let mut budget = TextBudgetV1 {
             remaining: 5,
@@ -1489,6 +1758,7 @@ mod tests {
             lifecycle: ItemLifecycleV1::Live,
             marker: "m".into(),
             order: 1,
+            redaction_profile: crate::redaction::REDACTION_PROFILE_VERSION,
             thread_root: None,
             provider_url: None,
             created_at: None,

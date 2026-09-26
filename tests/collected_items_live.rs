@@ -32,6 +32,9 @@ use ostk_fleet_recall::evidence_recall::{
     AbsenceReasonV1, AbsenceVerdictV1, CockroachEvidenceRecall, ContentTrustV1,
     EvidenceRecall as _, EvidenceSourceKindV1, PresentByV1, probe_evidence_recall,
 };
+use ostk_fleet_recall::item_recall::{
+    CockroachItemRecall, ItemRecall as _, ItemReferenceV1, probe_item_recall,
+};
 use ostk_fleet_recall::memory_contracts::collected_item::{
     BoundedTextV1, COLLECTED_ITEM_MEDIA_TYPE, CollectedItemInputV1, CollectionModeV1,
     ContainerKindV1, ItemLifecycleV1, ObjectKindV1, ProviderKindV1, TextFormatV1,
@@ -39,6 +42,7 @@ use ostk_fleet_recall::memory_contracts::collected_item::{
 use ostk_fleet_recall::memory_contracts::common::ContractId;
 use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
 use ostk_fleet_recall::memory_contracts::generation2_registry::GIT_CONNECTOR;
+use ostk_fleet_recall::redaction::REDACTION_PROFILE_VERSION;
 use ostk_fleet_recall::registry_activation::install::{InstallTargetV1, install_writer_authority};
 use ostk_fleet_recall::store::cockroach::{
     COLLECTED_ITEMS_SCHEMA_VERSION, CockroachStore, DatabaseCapabilities,
@@ -1409,6 +1413,48 @@ async fn live_planted_secrets_absent_when_configured() {
         .unwrap();
     assert_eq!(answer.hits.len(), 1, "the redacted item is recalled");
     assert!(answer.hits[0].snippet.contains("pelican"));
+
+    // The item's provenance names the profile the collector redacted it
+    // under, and the read-time pass, finding nothing left to remove from a
+    // body redacted at staging, attaches no marker.
+    let StagedItemV1::Staged { item_key, .. } = staged.items[0] else {
+        panic!("the redacted item was staged");
+    };
+    let scope = &fixture.installed.scope;
+    let capability = probe_item_recall(
+        &pool,
+        &capabilities(&pool, scope).await,
+        scope,
+        Sha256Digest::from_bytes(STUB_MODEL_DIGEST),
+    )
+    .await
+    .expect("the probe runs")
+    .expect("the owner may read every item-recall table");
+    let got = CockroachItemRecall::new(capability, pool.clone())
+        .get(&ItemReferenceV1::Item(item_key))
+        .await
+        .unwrap()
+        .expect("the redacted item is presented");
+    assert_eq!(got.current.provenance.len(), 1);
+    assert_eq!(
+        got.current.provenance[0].redaction_profile,
+        REDACTION_PROFILE_VERSION
+    );
+    let part = &got.current.parts[0];
+    let text = part.text.as_deref().expect("the redacted text is carried");
+    assert!(text.contains("rotate the pelican credentials"), "{text}");
+    for secret in &secrets {
+        assert!(!text.contains(secret.as_str()), "{text}");
+    }
+    assert_eq!(
+        part.redacted_at_read, None,
+        "staging left nothing for the read pass: {part:?}"
+    );
+    let value = serde_json::to_value(&got).unwrap();
+    assert_eq!(
+        value["current"]["provenance"][0]["redaction_profile"],
+        serde_json::json!(REDACTION_PROFILE_VERSION)
+    );
 }
 
 /// `(state, canonical_envelope, envelope_sha256, accepted_event_id)`.
