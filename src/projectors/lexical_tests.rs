@@ -5,7 +5,7 @@
 //! fixture and a private-key header — because that is how you test a
 //! redaction boundary. They therefore match the publication corpus's
 //! sensitive-pattern gate, exactly like `src/config_tests.rs` and
-//! `src/redaction/secrets_tests.rs`, and are excluded from the
+//! `src/redaction/credential_shapes_tests.rs`, and are excluded from the
 //! corpus for the same reason. Keeping them here leaves the production
 //! module itself publication-safe.
 

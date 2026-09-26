@@ -9,7 +9,7 @@
 //!
 //! Two parts:
 //!
-//! * The `secrets` submodule holds the closed [`SecretClassV1`] set,
+//! * The `credential_shapes` submodule holds the closed [`SecretClassV1`] set,
 //!   [`scan_secrets`], and [`redact`], whose fail-closed discipline (withhold
 //!   an unredactable class whole; re-scan the result and withhold on any
 //!   residual) is documented there.
@@ -19,9 +19,9 @@
 //!   one unless the activated policy body makes exactly that promise, and a
 //!   collector cannot stage without one (EVID-05, PRED-03).
 
-mod secrets;
+mod credential_shapes;
 
-pub use secrets::{
+pub use credential_shapes::{
     REDACTION_PLACEHOLDER, RedactionDispositionV1, RedactionOutcomeV1, SecretClassV1,
     SecretFindingV1, redact, scan_secrets,
 };

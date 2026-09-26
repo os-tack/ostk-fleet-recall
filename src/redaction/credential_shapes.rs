@@ -476,5 +476,5 @@ pub fn redact(text: &str) -> RedactionOutcomeV1 {
 }
 
 #[cfg(test)]
-#[path = "secrets_tests.rs"]
+#[path = "credential_shapes_tests.rs"]
 mod tests;
