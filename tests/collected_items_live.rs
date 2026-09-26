@@ -1297,25 +1297,21 @@ async fn live_item_moved_into_an_unlisted_private_team_is_withdrawn_when_configu
     assert_eq!(hits(&recall, "quokka leaks").await, 1);
 }
 
-/// Fake credentials, assembled at runtime so no credential-shaped literal
-/// sits in the source.
+/// Obviously fake credentials, each in one detector's shape: placeholders no
+/// secret scanner or reader mistakes for a real key, which the redactor still
+/// catches (AWS's own documented example key for the access-key shape).
 fn planted_secrets() -> Vec<String> {
-    let body = |length: usize| -> String {
-        "A1b2C3d4E5f6G7h8J9k0"
-            .chars()
-            .cycle()
-            .take(length)
-            .collect()
-    };
-    vec![
-        ["xox", "b-", &body(24)].concat(),
-        ["lin_", "api_", &body(32)].concat(),
-        ["grn", "_", &body(24)].concat(),
-        ["AKI", "A", "Z7Q2X9W4R6T1Y8U3"].concat(),
-        ["whs", "ec_", &body(24)].concat(),
-        ["lin_", "wh_", &body(32)].concat(),
-        ["xox", "c-", &body(40)].concat(),
+    [
+        "xoxb-EXAMPLE-NOT-A-TOKEN",
+        "lin_api_EXAMPLENOTAREALKEYEXAMPLENOTAREAL",
+        "grn_EXAMPLE_NOT_A_KEY",
+        "AKIAIOSFODNN7EXAMPLE",
+        "whsec_EXAMPLENOTASECRET",
+        "lin_wh_EXAMPLENOTAREALKEYEXAMPLENOTAREAL",
+        "xoxc-EXAMPLE-NOT-A-TOKEN",
     ]
+    .map(str::to_owned)
+    .to_vec()
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

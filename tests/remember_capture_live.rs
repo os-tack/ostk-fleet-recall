@@ -480,7 +480,9 @@ async fn live_capture_admits_redacted_items_and_replays_by_key_when_configured()
     assert_eq!(identity.principal.as_str(), "agent.fleet-recall-live-test");
     assert_eq!(identity.instance.as_str(), "capture.fleet-recall-live-test");
 
-    let secret = ["xox", "b-", "A1b2C3d4E5f6G7h8J9k0A1b2"].concat();
+    // An obviously fake token in the Slack detector's shape: no scanner or
+    // reader mistakes it for a credential, and the redactor still catches it.
+    let secret = "xoxb-EXAMPLE-NOT-A-TOKEN".to_owned();
     let captured = [
         item(
             &format!("{SLACK_CHANNEL}:1790071200.000100"),
