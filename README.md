@@ -24,7 +24,10 @@ The `ostk-fleet-recall` binary has these commands:
 - `serve` speaks newline-delimited JSON-RPC/MCP on stdin/stdout with two tools:
   - `recall(search|get|conflicts|status)` reads the hybrid vector/lexical
     corpus and typed-claim state. `get` with `kind=conflict` returns one
-    conflict by id in any state, with its members and its lifecycle history.
+    conflict by id in any state, with its members and its lifecycle history;
+    `get` with `kind=claim` returns a claim with its own lifecycle history,
+    or, given `key` (or `subject` and `predicate`), every claim on that key
+    with the key's open conflict.
     Every conflict the private writer returns carries a `lifecycle` overlay:
     who acknowledged or waived it, and who closed it and how.
   - `recall(search|get, kind=evidence)` searches the connector evidence the
@@ -182,6 +185,15 @@ compatible. Conflicting claims become `disputed`, and recall surfaces the open
 conflict with the exact members that caused it instead of silently choosing
 one. The detector compares typed propositions; it performs no natural-language
 inference.
+
+An agent never disputes itself. Where the writer serves `supersede`, a
+`record` whose value would conflict with a lifecycle-current claim the same
+agent already holds on the key is refused as `own_current_claim_on_key`
+before anything is written; the refusal's `details` name the `claim_id`,
+`revision`, and `claim_key`, and the agent sends `supersede` with that
+`claim_id` and `expected_revision` instead, so its change of mind is an
+audited succession rather than an open conflict with itself. Another
+agent's disagreement still opens a conflict as before.
 
 A conflict is never resolved by fiat. An agent can retract, supersede, or
 concede only its own claims, and a conflict closes only when the detector
@@ -892,7 +904,10 @@ nothing and leaves the key unused.
 
 `recall(get, kind=claim)` then adds `support_items`: each cited item with its
 provider, ids, trust tier (`verified` or `reported`), whether the cited
-version is still current, why it is hidden if it now is, and
+version is still current, why it is hidden if it now is, the cited bytes
+themselves (`uri`, the cited version's URI, and `content_digests`, one per
+cited part beside `accepted_event_ids`; `recall(get, kind=item)` with that
+`uri` or with the `version_id` returns exactly that version), and
 `content_trust: "untrusted_third_party"`; and `independent_sources`, the
 number of distinct contents among the visible ones, counting each item once
 however many of its versions are cited, so an edit, an echo, or a cross-post
@@ -1455,6 +1470,31 @@ compatible successor let it close or an incompatible one keeps it `still_open`
 with the successor as a member. The predecessor stays a historical member of
 its conflicts, and `recall` `get` with `kind=claim` shows its `superseded_by`.
 
+**The audit trail.** On a private writer, `recall(get, kind=claim)` by id
+also returns `history`: the claim's own lifecycle log oldest first (its
+`recorded` birth, then every `state_transition` with `actor`, `reason` such
+as `conflict_detected`, `retracted_by_author`, or `superseded_by_author`,
+`from_state`, `to_state`, and what the transition named: `conflict_id`,
+`successor_claim_id`, `revision_before`, the author's `note`), cut to the
+newest events within the response budget with `history_truncated` saying so;
+a successor's claim carries `supersedes`, the predecessor's id. Instead of an
+id, `key` (the exact stored key) or `subject` and `predicate` (normalized as
+`record` normalizes them) returns every lifecycle-current claim on that key
+oldest first, each with its support and `conflict_ids`, the key's
+`open_conflict`, and with `include_history` its superseded and retracted
+claims too; `recall(conflicts)` takes the same `claim_key` filter. Claim
+search hits carry their `value` (up to 2,000 bytes; `value_elided` otherwise)
+with the claim's `revision` and `actor` repeated on the hit.
+
+`recall(status)` reports what an operator can act on: `conflicts` (`open`,
+`acknowledged`, `waived`, `oldest_open_at`; the lifecycle counts are `null`
+where the overlay is not served), `quarantine` (`by_reason` and the newest
+`preimage_disagreement_sample`, read on private writers only),
+`legacy_claim_keys` (below), and, wherever an absence verdict is served,
+`absence_contract`: the dense bound, the neighbour band floor below which a
+verdict is `unknown` rather than `absent`, the media types excluded from the
+dense vote, and that the verdict is anchored on the lexical lane.
+
 A supersede is refused for the same reasons as a retract, and also when the
 successor changes the kind (`successor_kind_mismatch`), the normalized key
 (`successor_key_mismatch`), or the conflict eligibility
@@ -1465,12 +1505,15 @@ successor changes the kind (`successor_kind_mismatch`), the normalized key
 recorded as `include_transcript_default` kept its underscores while
 `include-transcript default` did not, so the two spellings took different keys
 and no conflict between them was ever detected. No migration rewrites stored
-keys. Instead `recall(status)` reports `legacy_claim_keys`, the number of the
-project's `active` or `disputed` claims whose stored `subject` and `predicate`
-no longer normalize to their stored key (a bounded read; at 256 it is a lower
-bound), with a `legacy_claim_keys` warning while it is above zero, because a
-claim recorded since under the same words takes the current key and the two
-are not compared. The exit is `remember(supersede)` with the same `subject`
+keys. Instead `recall(status)` reports `legacy_claim_keys`: `count`, the
+number of the project's `active` or `disputed` claims whose stored `subject`
+and `predicate` no longer normalize to their stored key (a bounded read; at
+256 `bound_exceeded` marks it a lower bound), and `sample`, up to ten of them
+with `claim_id`, `claim_key`, and `actor`, with a `legacy_claim_keys` warning
+while the count is above zero, because a claim recorded since under the same
+words takes the current key and the two are not compared. A legacy claim is
+still readable by its stored key: `recall(get, kind=claim, key=…)` returns
+every claim on exactly that key. The exit is `remember(supersede)` with the same `subject`
 and `predicate`: the successor check re-normalizes the predecessor's stored
 parts, so the successor lands on the current key and goes through detection
 there, and the `claim_superseded` event records the `predecessor_claim_key`

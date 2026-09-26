@@ -183,7 +183,8 @@ pub const MAX_VERSION_URI_BYTES: usize = 256;
 /// What `recall(get, kind=item)` was asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemReferenceV1 {
-    /// A 64-hex item id: a hit's `item_id`.
+    /// A 64-hex id: a hit's `item_id`, or, when no item has that id, a
+    /// citation's `version_id` (the reader resolves the version's item).
     Item(Sha256Digest),
     /// A part's version URI: a hit's `uri`.
     VersionUri(String),
@@ -192,15 +193,16 @@ pub enum ItemReferenceV1 {
 }
 
 impl ItemReferenceV1 {
-    /// Parse a `get` id: 64 lowercase hex characters, a `urn:` version URI,
-    /// or an `https://` provider URL.
+    /// Parse a `get` id: 64 lowercase hex characters (an item id, or a
+    /// version id), a `urn:` version URI, or an `https://` provider URL.
     ///
     /// # Errors
     ///
-    /// A static message naming the three accepted forms.
+    /// A static message naming the accepted forms.
     pub fn parse(value: &str) -> std::result::Result<Self, &'static str> {
-        const FORMS: &str = "an item id must be a hit's item_id (64 lowercase hex characters), a \
-                             version URI (urn:...), or the item's https provider URL";
+        const FORMS: &str = "an item id must be a hit's item_id or a citation's version_id (64 \
+                             lowercase hex characters), a version URI (urn:...), or the item's \
+                             https provider URL";
         if let Ok(digest) = Sha256Digest::from_str(value) {
             return Ok(Self::Item(digest));
         }

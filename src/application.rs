@@ -20,12 +20,14 @@ use crate::item_recall::{
     ItemRecall, ItemReferenceV1, ItemSearchRequestV1, ItemSearchV1, MAX_ITEM_SEARCH_LIMIT,
 };
 use crate::ledger::{
-    Claim, ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict,
-    ConflictMutation, ConflictTarget, DismissalTerms, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
-    ITEM_SUPPORT_SOURCE_CONFIG_ID, LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest,
+    Claim, ClaimHistoryV1, ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget,
+    Conflict, ConflictMutation, ConflictTarget, DismissalTerms,
+    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, ITEM_SUPPORT_SOURCE_CONFIG_ID, KeyClaimV1,
+    LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest, MAX_CLAIM_HIT_VALUE_BYTES,
     MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT, SemanticClaimHit, SupportedClaimCoordinate,
-    WaiverTerms, derive_overlay, history_within_bytes, overlay_episode_revision,
-    unlogged_transitions, validate_lifecycle_reason, validate_rationale, validate_waiver_hours,
+    WaiverTerms, claim_key_from_parts, derive_overlay, history_within_bytes,
+    overlay_episode_revision, unlogged_transitions, validate_lifecycle_reason, validate_rationale,
+    validate_waiver_hours,
 };
 use crate::memory_contracts::collected_item::ProviderKindV1;
 use crate::memory_contracts::digest::Sha256Digest;
@@ -71,8 +73,9 @@ const MAX_CONFLICT_LOOKUP_BYTES: usize = 576 * 1024;
 /// Which lifecycle behaviour a service instance serves.
 ///
 /// The default is the historical record-only surface with no lifecycle
-/// filtering, which the public recall process always keeps; that process
-/// withholds only asserted claims ([`CockroachMemoryService::publication`]).
+/// filtering. The public recall process keeps that surface but hides
+/// non-current claim chunks and withholds asserted claims
+/// ([`CockroachMemoryService::publication`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LifecycleServing {
     /// The `remember` actions served and advertised in `tools/list`.
@@ -229,6 +232,12 @@ impl CockroachMemoryService {
     ) -> crate::Result<Self> {
         let mut service = Self::new(trusted_scope, corpus, ledger, embedder)?;
         service.withhold_asserted_claims = true;
+        // The public demo serves what is current: a retracted or superseded
+        // claim's synthetic chunk is dropped from chunk search (and the page
+        // refilled), as the private writer drops it, and
+        // `lifecycle_hidden_claim_ids` names what was hidden. The lifecycle
+        // surface itself stays record-only.
+        service.lifecycle.hide_non_current_claim_chunks = true;
         Ok(service)
     }
 
@@ -844,67 +853,35 @@ impl CockroachMemoryService {
         arguments: Map<String, Value>,
     ) -> ServiceResult<RecallResult> {
         let args: GetArgs = from_arguments(arguments, "recall get")?;
+        let (kind, target, include_history) = args.target()?;
+        let kind = kind.as_deref().unwrap_or("chunk");
+        let id = match target {
+            GetTarget::Id(id) => id,
+            GetTarget::ClaimKey(claim_key) => {
+                return if matches!(kind, "claim" | "assertion") {
+                    self.recall_claims_for_key(scope, &claim_key, include_history)
+                        .await
+                } else {
+                    Err(ServiceError::InvalidRequest(format!(
+                        "recall get by key is served for kind=claim, not kind={kind:?}"
+                    )))
+                };
+            }
+        };
         if let Some(evidence) = self.evidence.as_deref()
-            && args.kind.as_deref() == Some("evidence")
+            && kind == "evidence"
         {
-            return get_evidence(evidence, &args.id).await;
+            return get_evidence(evidence, &id).await;
         }
         if let Some(items) = self.items.as_deref()
-            && args.kind.as_deref() == Some("item")
+            && kind == "item"
         {
-            return get_item(items, &args.id).await;
+            return get_item(items, &id).await;
         }
-        match args.kind.as_deref().unwrap_or("chunk") {
-            "claim" | "assertion" => {
-                let id = parse_safe_id(&args.id)?;
-                // A withheld claim reads exactly as an absent one.
-                let withheld = !self.withheld_claim_ids(scope, &[id]).await?.is_empty();
-                let mut claim = if withheld {
-                    None
-                } else {
-                    self.ledger
-                        .get_claim(scope, id)
-                        .await
-                        .map_err(service_error)?
-                };
-                let mut data = self.claim_citations(scope, id, claim.as_mut()).await?;
-                data.insert("claim".into(), json!(claim));
-                let mut result = RecallResult::new(Value::Object(data));
-                // An asserted claim names the accepted event it projects; a
-                // recorded one carries no such field.
-                if claim.is_some()
-                    && let Some(event_id) = self
-                        .ledger
-                        .claim_accepted_event_id(scope, id)
-                        .await
-                        .map_err(service_error)?
-                {
-                    result.data["accepted_event_id"] = json!(event_id);
-                }
-                let mut conflicts = if withheld {
-                    Vec::new()
-                } else {
-                    self.ledger
-                        .conflicts_for_claim_ids(scope, &[id], MAX_TOOL_RESULTS)
-                        .await
-                        .map_err(service_error)?
-                };
-                let coverage_complete = conflicts.len() < MAX_TOOL_RESULTS
-                    && conflicts.iter().all(conflict_projection_complete);
-                self.withhold_asserted_conflicts(scope, &mut conflicts)
-                    .await?;
-                let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
-                result.conflicts = serialize_conflicts(&conflicts)?;
-                result.conflict_coverage = conflict_coverage(coverage_complete, &conflicts);
-                mark_lifecycle_overlay(
-                    &mut result.conflict_coverage,
-                    &mut result.warnings,
-                    overlay,
-                );
-                Ok(result)
-            }
+        match kind {
+            "claim" | "assertion" => self.recall_claim(scope, &id).await,
             "chunk" => {
-                let id = args.id.as_str().ok_or_else(|| {
+                let id = id.as_str().ok_or_else(|| {
                     ServiceError::InvalidRequest("chunk id must be a string".into())
                 })?;
                 if id.trim().is_empty() || id.len() > 256 {
@@ -940,12 +917,160 @@ impl CockroachMemoryService {
             // Conflict lookup by id is part of the lifecycle surface; the
             // record-only (publication) surface keeps its historical kinds.
             "conflict" if self.lifecycle.surface.lifecycle_served() => {
-                self.recall_conflict(scope, &args.id).await
+                self.recall_conflict(scope, &id).await
             }
             other => Err(ServiceError::InvalidRequest(format!(
                 "recall get kind {other:?} is not supported"
             ))),
         }
+    }
+
+    /// `recall(get, kind=claim)` by id: the claim with its support, item
+    /// citations, current conflicts, and (on a private composition) its
+    /// lifecycle history. A withheld claim reads exactly as an absent one.
+    async fn recall_claim(&self, scope: &FleetScope, id: &Value) -> ServiceResult<RecallResult> {
+        let id = parse_safe_id(id)?;
+        let withheld = !self.withheld_claim_ids(scope, &[id]).await?.is_empty();
+        let mut claim = if withheld {
+            None
+        } else {
+            self.ledger
+                .get_claim(scope, id)
+                .await
+                .map_err(service_error)?
+        };
+        let mut data = self.claim_citations(scope, id, claim.as_mut()).await?;
+        data.insert("claim".into(), json!(claim));
+        let mut result = RecallResult::new(Value::Object(data));
+        // An asserted claim names the accepted event it projects; a
+        // recorded one carries no such field.
+        if claim.is_some()
+            && let Some(event_id) = self
+                .ledger
+                .claim_accepted_event_id(scope, id)
+                .await
+                .map_err(service_error)?
+        {
+            result.data["accepted_event_id"] = json!(event_id);
+        }
+        // The claim's own audit trail: every logged transition with who and
+        // why, and the predecessor it superseded. A private read only; the
+        // publication reader has no grant on the log and keeps its shape. A
+        // failed read is a warning, never a failed get.
+        if claim.is_some() && !self.withhold_asserted_claims {
+            match self.ledger.claim_lifecycle_history(scope, id).await {
+                Ok(history) => {
+                    let claim_bytes = json_bytes(&result.data);
+                    let history = claim_history_within_bytes(
+                        history,
+                        MAX_CONFLICT_LOOKUP_BYTES.saturating_sub(claim_bytes),
+                    );
+                    if let Some(predecessor) = history.supersedes {
+                        result.data["claim"]["supersedes"] = json!(predecessor);
+                    }
+                    result.data["history"] = json!(history.events);
+                    result.data["history_truncated"] = json!(history.truncated);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, claim_id = id, "claim lifecycle history read failed");
+                    result.data["history"] = Value::Null;
+                    result.warnings.push(json!({
+                        "code": "lifecycle_history_unavailable",
+                        "message": "the claim's lifecycle history could not be read; the claim itself is current"
+                    }));
+                }
+            }
+        }
+        let mut conflicts = if withheld {
+            Vec::new()
+        } else {
+            self.ledger
+                .conflicts_for_claim_ids(scope, &[id], MAX_TOOL_RESULTS)
+                .await
+                .map_err(service_error)?
+        };
+        let coverage_complete = conflicts.len() < MAX_TOOL_RESULTS
+            && conflicts.iter().all(conflict_projection_complete);
+        self.withhold_asserted_conflicts(scope, &mut conflicts)
+            .await?;
+        let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
+        result.conflicts = serialize_conflicts(&conflicts)?;
+        result.conflict_coverage = conflict_coverage(coverage_complete, &conflicts);
+        mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
+        Ok(result)
+    }
+
+    /// `recall(get, kind=claim, key=…)`: every claim carrying exactly that
+    /// stored key, oldest first, each as `get` returns it (support, current
+    /// conflicts, value up to the lookup bound), with the conflicts detected
+    /// on the key and the open one named. A withheld claim reads as absent,
+    /// and the publication reader drops opaque item support as it does on
+    /// `get` by id.
+    async fn recall_claims_for_key(
+        &self,
+        scope: &FleetScope,
+        claim_key: &str,
+        include_history: bool,
+    ) -> ServiceResult<RecallResult> {
+        let lookup = self
+            .ledger
+            .claims_for_key(scope, claim_key, include_history)
+            .await
+            .map_err(service_error)?;
+        let claim_ids = lookup
+            .claims
+            .iter()
+            .map(|entry| entry.claim.id)
+            .collect::<Vec<_>>();
+        let withheld = self.withheld_claim_ids(scope, &claim_ids).await?;
+        let mut claims = lookup
+            .claims
+            .into_iter()
+            .filter(|entry| !withheld.contains(&entry.claim.id))
+            .collect::<Vec<_>>();
+        if self.withhold_asserted_claims {
+            for entry in &mut claims {
+                withhold_item_support(&mut entry.claim);
+            }
+        }
+        let (claims, cut) = key_claims_within_bytes(claims, MAX_CONFLICT_LOOKUP_BYTES);
+        let claims_truncated = lookup.truncated || cut;
+
+        let conflict_ids = self
+            .ledger
+            .conflict_ids_for_key(scope, claim_key)
+            .await
+            .map_err(service_error)?;
+        let mut conflicts = if conflict_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.ledger
+                .get_conflicts(scope, &conflict_ids)
+                .await
+                .map_err(service_error)?
+        };
+        self.withhold_asserted_conflicts(scope, &mut conflicts)
+            .await?;
+        let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
+        let serialized = serialize_conflicts(&conflicts)?;
+        let open_conflict = conflicts
+            .iter()
+            .position(|conflict| conflict.state == "open")
+            .and_then(|index| serialized.get(index).cloned());
+        let mut result = RecallResult::new(json!({
+            "claim_key": claim_key,
+            "claims": claims,
+            "claims_truncated": claims_truncated,
+            "include_history": include_history,
+            "open_conflict": open_conflict,
+        }));
+        result.conflict_coverage = conflict_coverage(
+            lifecycle_coverage_complete(&conflict_ids, &conflicts),
+            &conflicts,
+        );
+        result.conflicts = serialized;
+        mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
+        Ok(result)
     }
 
     /// A claim get's item citations (ADR 0008 D11). The publication reader
@@ -1042,13 +1167,49 @@ impl CockroachMemoryService {
     ) -> ServiceResult<RecallResult> {
         let args: ConflictArgs = from_arguments(arguments, "recall conflicts")?;
         let limit = bounded_limit(args.limit)?;
-        let mut conflicts = self
-            .ledger
-            .list_conflicts(scope, args.include_resolved, limit)
-            .await
-            .map_err(service_error)?;
-        let coverage_complete =
-            conflicts.len() < limit && conflicts.iter().all(conflict_projection_complete);
+        let claim_key = args
+            .claim_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        if args.claim_key.is_some() && claim_key.is_none() {
+            return Err(ServiceError::InvalidRequest(
+                "claim_key must not be empty".into(),
+            ));
+        }
+        let (mut conflicts, coverage_complete) = if let Some(claim_key) = claim_key {
+            // One conflict per detector on a key, in any state; the caller's
+            // include_resolved keeps or drops the closed ones.
+            let ids = self
+                .ledger
+                .conflict_ids_for_key(scope, claim_key)
+                .await
+                .map_err(service_error)?;
+            let conflicts = if ids.is_empty() {
+                Vec::new()
+            } else {
+                self.ledger
+                    .get_conflicts(scope, &ids)
+                    .await
+                    .map_err(service_error)?
+            };
+            let conflicts = conflicts
+                .into_iter()
+                .filter(|conflict| args.include_resolved || conflict.state == "open")
+                .take(limit)
+                .collect::<Vec<_>>();
+            let complete = conflicts.iter().all(conflict_projection_complete);
+            (conflicts, complete)
+        } else {
+            let conflicts = self
+                .ledger
+                .list_conflicts(scope, args.include_resolved, limit)
+                .await
+                .map_err(service_error)?;
+            let complete =
+                conflicts.len() < limit && conflicts.iter().all(conflict_projection_complete);
+            (conflicts, complete)
+        };
         self.withhold_asserted_conflicts(scope, &mut conflicts)
             .await?;
         let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
@@ -1153,17 +1314,42 @@ impl CockroachMemoryService {
         if let Some(status) = &self.capture_status {
             result.data["remember_capture"] = json!(status);
         }
-        let ((evidence, spec_conformance), (legacy_claim_keys, legacy_warnings)) = tokio::join!(
+        // The evidence quarantine is a private read: the publication role
+        // has no grant on it, and the demo's status keeps its shape.
+        let quarantine = async {
+            if self.withhold_asserted_claims {
+                None
+            } else {
+                Some(
+                    quarantine_status_within(self.corpus.pool(), scope, OPTIONAL_STATUS_DEADLINE)
+                        .await,
+                )
+            }
+        };
+        let (
+            (evidence, spec_conformance),
+            (legacy_claim_keys, legacy_warnings),
+            (conflicts, conflict_warnings),
+            quarantine,
+        ) = tokio::join!(
             optional_status_blocks(
                 self.evidence.as_deref(),
                 self.spec_conformance.as_deref(),
                 OPTIONAL_STATUS_DEADLINE,
             ),
             legacy_claim_keys_within(self.ledger.as_ref(), scope, OPTIONAL_STATUS_DEADLINE),
+            conflicts_status_within(
+                self.ledger.as_ref(),
+                scope,
+                self.lifecycle.lifecycle_overlay,
+                OPTIONAL_STATUS_DEADLINE,
+            ),
+            quarantine,
         );
         for (name, block) in [
             ("evidence", evidence),
             ("spec_conformance", spec_conformance),
+            ("quarantine", quarantine),
         ] {
             if let Some((block, warnings)) = block {
                 result.data[name] = block;
@@ -1172,6 +1358,12 @@ impl CockroachMemoryService {
         }
         result.data["legacy_claim_keys"] = legacy_claim_keys;
         result.warnings.extend(legacy_warnings);
+        result.data["conflicts"] = conflicts;
+        result.warnings.extend(conflict_warnings);
+        // What the absence verdict means, wherever a verdict is served.
+        if self.evidence.is_some() || self.items.is_some() {
+            result.data["absence_contract"] = absence_contract();
+        }
         result.conflict_coverage = ConflictCoverage::not_evaluated();
         Ok(result)
     }
@@ -2456,7 +2648,88 @@ struct AssertArgs {
 struct GetArgs {
     #[serde(default)]
     kind: Option<String>,
-    id: Value,
+    /// Absent when the request left it out; an explicit `null` is present
+    /// and refused by the kind's own id check, as before key lookups.
+    #[serde(default, deserialize_with = "present_value")]
+    id: Option<Value>,
+    /// `kind=claim` only: the exact stored key to look up.
+    #[serde(default)]
+    key: Option<String>,
+    /// `kind=claim` only: with `predicate`, the key's parts, normalized as
+    /// `record` normalizes them.
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    predicate: Option<String>,
+    /// Key lookups only: superseded and retracted claims too.
+    #[serde(default)]
+    include_history: bool,
+}
+
+/// Any present JSON value, `null` included, as `Some`.
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+/// What a `get` names: one entity by id, or every claim on a key.
+#[derive(Debug)]
+enum GetTarget {
+    Id(Value),
+    ClaimKey(String),
+}
+
+impl GetArgs {
+    /// The id or the key, refusing a request that names both or neither.
+    fn target(self) -> ServiceResult<(Option<String>, GetTarget, bool)> {
+        let key = match (self.key, self.subject, self.predicate) {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                return Err(ServiceError::InvalidRequest(
+                    "send key, or subject and predicate, not both".into(),
+                ));
+            }
+            (Some(key), None, None) => {
+                let key = key.trim().to_owned();
+                if key.is_empty() {
+                    return Err(ServiceError::InvalidRequest("key must not be empty".into()));
+                }
+                Some(key)
+            }
+            (None, Some(subject), Some(predicate)) => {
+                Some(claim_key_from_parts(&subject, &predicate).ok_or_else(|| {
+                    ServiceError::InvalidRequest(
+                        "subject and predicate normalize to an empty key".into(),
+                    )
+                })?)
+            }
+            (None, Some(_), None) | (None, None, Some(_)) => {
+                return Err(ServiceError::InvalidRequest(
+                    "a key lookup needs both subject and predicate".into(),
+                ));
+            }
+            (None, None, None) => None,
+        };
+        match (self.id, key) {
+            (Some(_), Some(_)) => Err(ServiceError::InvalidRequest(
+                "send id, or a key, not both".into(),
+            )),
+            (Some(id), None) => {
+                if self.include_history {
+                    return Err(ServiceError::InvalidRequest(
+                        "include_history on get applies to a key lookup; a claim's own \
+                         lifecycle history is returned with its id"
+                            .into(),
+                    ));
+                }
+                Ok((self.kind, GetTarget::Id(id), false))
+            }
+            (None, Some(key)) => Ok((self.kind, GetTarget::ClaimKey(key), self.include_history)),
+            (None, None) => Err(ServiceError::InvalidRequest(
+                "recall get requires id, or, for kind=claim, key or subject and predicate".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2466,6 +2739,9 @@ struct ConflictArgs {
     include_resolved: bool,
     #[serde(default)]
     limit: Option<usize>,
+    /// Only the conflicts detected on this exact stored key.
+    #[serde(default)]
+    claim_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2832,7 +3108,14 @@ fn legacy_claim_keys_block(legacy: crate::Result<LegacyClaimKeysV1>) -> (Value, 
                     ),
                 }));
             }
-            (json!(legacy.count), warnings)
+            (
+                json!({
+                    "count": legacy.count,
+                    "bound_exceeded": legacy.bound_exceeded,
+                    "sample": legacy.sample,
+                }),
+                warnings,
+            )
         }
         Err(error) => {
             tracing::warn!(error = %error, "legacy claim key read failed");
@@ -2841,6 +3124,204 @@ fn legacy_claim_keys_block(legacy: crate::Result<LegacyClaimKeysV1>) -> (Value, 
                 vec![json!({
                     "code": "legacy_claim_keys_unavailable",
                     "message": "the count of claims keyed under the earlier normalizer could not be read; remember and recall are still served",
+                })],
+            )
+        }
+    }
+}
+
+/// The lower edge of the dense neighbour band the absence verdict refuses to
+/// call `absent` in: a dense-only neighbour at or above it (and below the
+/// dense bound) makes the verdict `unknown`. The verdict's own copy lives in
+/// `evidence_recall::verdict` as `ABSENCE_NEIGHBOUR_BAND_FLOOR`; this mirror
+/// only publishes the contract in `recall(status)`.
+const ABSENCE_NEIGHBOUR_BAND_FLOOR: f32 = 0.30;
+
+/// The cosine bounds of the absence verdict, and what it is anchored on, as
+/// `recall(status).absence_contract`: what `absent` and `unknown` mean.
+fn absence_contract() -> Value {
+    json!({
+        "dense_bound": cosine_bound(crate::evidence_recall::ABSENCE_DENSE_MIN_COSINE_SIMILARITY),
+        "neighbour_band_floor": cosine_bound(ABSENCE_NEIGHBOUR_BAND_FLOOR),
+        "dense_vote_excluded": crate::evidence_recall::DENSE_VOTE_EXCLUDED_MEDIA_TYPES,
+        "anchored_on": "lexical",
+    })
+}
+
+/// A cosine bound as the decimal it was written as, not the nearest binary
+/// `f32` widened (`0.45`, not `0.44999998807907104`).
+fn cosine_bound(value: f32) -> f64 {
+    value
+        .to_string()
+        .parse()
+        .unwrap_or_else(|_| f64::from(value))
+}
+
+/// Open conflicts one overlay read covers: the ledger's episode bound.
+const STATUS_OVERLAY_EPISODES: usize = 100;
+
+/// `recall(status).conflicts` and the warnings it adds: the open conflicts
+/// (bounded, oldest first), how many of them read `acknowledged` or `waived`
+/// under the lifecycle overlay where it is served, and the oldest open
+/// one's detection time. A failed or slow read is `null` with a warning,
+/// never a failed status.
+async fn conflicts_status_within(
+    ledger: &dyn ClaimLedger,
+    scope: &FleetScope,
+    overlay_served: bool,
+    deadline: std::time::Duration,
+) -> (Value, Vec<Value>) {
+    let read = async {
+        let open = ledger.open_conflicts(scope).await?;
+        let overlay_states = if overlay_served && !open.rows.is_empty() {
+            let mut states = HashMap::with_capacity(open.rows.len());
+            for chunk in open.rows.chunks(STATUS_OVERLAY_EPISODES) {
+                let episodes = chunk
+                    .iter()
+                    .map(|row| (row.id, overlay_episode_revision("open", row.revision)))
+                    .collect::<Vec<_>>();
+                let rows = ledger.conflict_lifecycle_rows(scope, &episodes).await?;
+                for row in chunk {
+                    let events = rows.events.get(&row.id).map_or(&[][..], Vec::as_slice);
+                    let overlay = derive_overlay(
+                        "open",
+                        row.revision,
+                        row.member_count,
+                        events,
+                        rows.truncated.contains(&row.id),
+                        rows.evaluated_at,
+                    );
+                    states.insert(row.id, overlay.state);
+                }
+            }
+            Some(states)
+        } else {
+            None
+        };
+        Ok::<_, FleetError>((open, overlay_states))
+    };
+    let outcome = tokio::time::timeout(deadline, read)
+        .await
+        .unwrap_or_else(|_| {
+            Err(FleetError::Memory(format!(
+                "the open conflict read did not finish within {}s",
+                deadline.as_secs_f32()
+            )))
+        });
+    conflicts_status_block(outcome)
+}
+
+/// The status field and warnings for one open-conflict read; `overlay
+/// states` is `None` where the lifecycle overlay is not served, and then so
+/// are the `acknowledged` and `waived` counts.
+fn conflicts_status_block(
+    outcome: crate::Result<(crate::ledger::OpenConflictsV1, Option<HashMap<i64, String>>)>,
+) -> (Value, Vec<Value>) {
+    match outcome {
+        Ok((open, overlay_states)) => {
+            let counted = |state: &str| {
+                overlay_states
+                    .as_ref()
+                    .map(|states| states.values().filter(|value| *value == state).count())
+            };
+            let mut warnings = Vec::new();
+            if open.bound_exceeded {
+                warnings.push(json!({
+                    "code": "open_conflicts_bound_exceeded",
+                    "message": format!(
+                        "more than {} conflicts are open; the counts are lower bounds over the oldest ones",
+                        crate::ledger::MAX_OPEN_CONFLICT_ROWS
+                    ),
+                }));
+            }
+            (
+                json!({
+                    "open": open.rows.len(),
+                    "acknowledged": counted("acknowledged"),
+                    "waived": counted("waived"),
+                    "oldest_open_at": open.rows.first().map(|row| row.detected_at),
+                    "bound_exceeded": open.bound_exceeded,
+                }),
+                warnings,
+            )
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "open conflict status read failed");
+            (
+                Value::Null,
+                vec![json!({
+                    "code": "conflicts_status_unavailable",
+                    "message": "the open conflict counts could not be read; remember and recall are still served",
+                })],
+            )
+        }
+    }
+}
+
+/// `recall(status).quarantine` and the warnings it adds: the scope's
+/// evidence quarantine by reason and its newest preimage disagreements,
+/// read through the runtime role's grant. A failed or slow read is `null`
+/// with a warning, never a failed status.
+async fn quarantine_status_within(
+    pool: &sqlx::PgPool,
+    scope: &FleetScope,
+    deadline: std::time::Duration,
+) -> (Value, Vec<Value>) {
+    let summary = tokio::time::timeout(
+        deadline,
+        crate::evidence_ledger::quarantine_summary(pool, scope.tenant_id, &scope.project),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(FleetError::Memory(format!(
+            "the quarantine read did not finish within {}s",
+            deadline.as_secs_f32()
+        )))
+    });
+    quarantine_status_block(summary)
+}
+
+/// The status field and warnings for one quarantine read.
+fn quarantine_status_block(
+    summary: crate::Result<crate::evidence_ledger::QuarantineSummaryV1>,
+) -> (Value, Vec<Value>) {
+    match summary {
+        Ok(summary) => {
+            let mut warnings = Vec::new();
+            let disagreements = summary
+                .by_reason
+                .get("preimage_disagreement")
+                .copied()
+                .unwrap_or_default();
+            if disagreements > 0 {
+                let bound = if summary.bound_exceeded {
+                    "at least "
+                } else {
+                    ""
+                };
+                warnings.push(json!({
+                    "code": "quarantine_preimage_disagreement",
+                    "message": format!(
+                        "{bound}{disagreements} evidence deliveries were quarantined because two reports disagreed on one source fact's bytes; quarantine.preimage_disagreement_sample names the newest, and an operator reconciles them (a retry cannot)"
+                    ),
+                }));
+            }
+            (
+                json!({
+                    "by_reason": summary.by_reason,
+                    "bound_exceeded": summary.bound_exceeded,
+                    "preimage_disagreement_sample": summary.preimage_disagreement_sample,
+                }),
+                warnings,
+            )
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "quarantine status read failed");
+            (
+                Value::Null,
+                vec![json!({
+                    "code": "quarantine_unavailable",
+                    "message": "the evidence quarantine could not be read; remember and recall are still served",
                 })],
             )
         }
@@ -3113,18 +3594,81 @@ fn serialize_conflicts(conflicts: &[Conflict]) -> ServiceResult<Vec<Value>> {
         .collect()
 }
 
+/// The oldest key-lookup claims that fit `byte_budget` serialized, and
+/// whether any newer one was cut.
+fn key_claims_within_bytes(claims: Vec<KeyClaimV1>, byte_budget: usize) -> (Vec<KeyClaimV1>, bool) {
+    let mut used = 0_usize;
+    let mut kept = Vec::with_capacity(claims.len());
+    let total = claims.len();
+    for entry in claims {
+        // One separator byte per array element.
+        let size = serde_json::to_vec(&entry)
+            .map_or(usize::MAX, |bytes| bytes.len())
+            .saturating_add(1);
+        used = used.saturating_add(size);
+        if used > byte_budget {
+            break;
+        }
+        kept.push(entry);
+    }
+    let cut = kept.len() < total;
+    (kept, cut)
+}
+
+/// The newest claim lifecycle events that fit `byte_budget` serialized,
+/// oldest first; a cut marks the history truncated.
+fn claim_history_within_bytes(mut history: ClaimHistoryV1, byte_budget: usize) -> ClaimHistoryV1 {
+    let mut used = 0_usize;
+    let mut kept = 0_usize;
+    for event in history.events.iter().rev() {
+        // One separator byte per array element.
+        let size = serde_json::to_vec(event)
+            .map_or(usize::MAX, |bytes| bytes.len())
+            .saturating_add(1);
+        used = used.saturating_add(size);
+        if used > byte_budget {
+            break;
+        }
+        kept += 1;
+    }
+    let dropped = history.events.len() - kept;
+    if dropped > 0 {
+        history.events.drain(..dropped);
+        history.truncated = true;
+    }
+    history
+}
+
 /// A value's serialized size; one that cannot be serialized counts as
 /// unbounded.
 fn json_bytes(value: &Value) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
 }
 
+/// The claim search projection: text and passage cut to a page-sized bound,
+/// support left to `get`, and the value carried up to
+/// [`MAX_CLAIM_HIT_VALUE_BYTES`]. Whatever is left out is flagged on the hit
+/// (`support_elided`, `value_elided`) rather than dropped silently, and the
+/// claim's `revision` and `actor` are repeated beside it.
 fn compact_claim_hits(mut hits: Vec<SemanticClaimHit>) -> Vec<SemanticClaimHit> {
     const MAX_PASSAGE_CHARS: usize = 2_000;
     for hit in &mut hits {
         hit.claim.text = truncate_chars(&hit.claim.text, MAX_PASSAGE_CHARS);
-        hit.claim.support.clear();
-        hit.claim.value = None;
+        if !hit.claim.support.is_empty() {
+            hit.claim.support.clear();
+            hit.support_elided = true;
+        }
+        if hit
+            .claim
+            .value
+            .as_ref()
+            .is_some_and(|value| json_bytes(value) > MAX_CLAIM_HIT_VALUE_BYTES)
+        {
+            hit.claim.value = None;
+            hit.value_elided = true;
+        }
+        hit.revision = hit.claim.revision;
+        hit.actor.clone_from(&hit.claim.actor);
         hit.matched_passage = truncate_chars(&hit.matched_passage, MAX_PASSAGE_CHARS);
     }
     hits
@@ -3628,6 +4172,196 @@ mod tests {
     }
 
     #[test]
+    fn get_arguments_name_an_id_or_exactly_one_claim_key() {
+        let parse = |value: Value| {
+            from_arguments::<GetArgs>(value.as_object().cloned().unwrap(), "recall get")
+                .and_then(GetArgs::target)
+        };
+        let (kind, target, history) = parse(json!({ "kind": "claim", "id": 7 })).unwrap();
+        assert_eq!(kind.as_deref(), Some("claim"));
+        assert!(matches!(target, GetTarget::Id(Value::Number(_))));
+        assert!(!history);
+
+        // A key is looked up exactly as sent, so a legacy key stays findable.
+        let (_, target, history) =
+            parse(json!({ "kind": "claim", "key": " include_transcript_default::enabled " }))
+                .unwrap();
+        assert!(matches!(
+            target,
+            GetTarget::ClaimKey(ref key) if key == "include_transcript_default::enabled"
+        ));
+        assert!(!history);
+
+        // Parts are normalized as record normalizes them.
+        let (_, target, history) = parse(json!({
+            "kind": "claim",
+            "subject": "Merged_Build",
+            "predicate": " rollout mode",
+            "include_history": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            target,
+            GetTarget::ClaimKey(ref key) if key == "merged-build::rollout-mode"
+        ));
+        assert!(history);
+
+        for (refused, expected) in [
+            (json!({ "kind": "claim" }), "requires id"),
+            (
+                json!({ "kind": "claim", "id": 7, "key": "a::b" }),
+                "not both",
+            ),
+            (
+                json!({ "kind": "claim", "key": "a::b", "subject": "a" }),
+                "not both",
+            ),
+            (
+                json!({ "kind": "claim", "subject": "a" }),
+                "both subject and predicate",
+            ),
+            (json!({ "kind": "claim", "key": "  " }), "must not be empty"),
+            (
+                json!({ "kind": "claim", "subject": "_", "predicate": "-" }),
+                "empty key",
+            ),
+            (
+                json!({ "kind": "claim", "id": 7, "include_history": true }),
+                "applies to a key lookup",
+            ),
+        ] {
+            let error = parse(refused.clone()).unwrap_err();
+            assert!(
+                matches!(&error, ServiceError::InvalidRequest(message) if message.contains(expected)),
+                "{refused}: {error}"
+            );
+        }
+        // An explicit null id is present, for the kind's own check to refuse.
+        let (_, target, _) = parse(json!({ "kind": "chunk", "id": null })).unwrap();
+        assert!(matches!(target, GetTarget::Id(Value::Null)));
+    }
+
+    #[test]
+    fn claim_history_keeps_the_newest_events_within_the_byte_budget() {
+        use crate::ledger::ClaimLifecycleEventV1;
+        let now = Utc::now();
+        let event = |seq: i64, reason: &str| ClaimLifecycleEventV1 {
+            event_id: format!("0198a849-f6ae-7d61-9800-{seq:012}"),
+            kind: "state_transition".into(),
+            actor: Some("agent-a".into()),
+            reason: Some(reason.into()),
+            from_state: Some("active".into()),
+            to_state: Some("superseded".into()),
+            revision_before: Some(seq),
+            successor_claim_id: (reason == "superseded_by_author").then_some(99),
+            conflict_id: None,
+            supersedes: None,
+            note: Some("after review".into()),
+            created_at: now,
+            payload_elided: false,
+        };
+        let size = |event: &ClaimLifecycleEventV1| serde_json::to_vec(event).unwrap().len() + 1;
+        let history = ClaimHistoryV1 {
+            events: vec![
+                event(1, "conflict_detected"),
+                event(2, "conflict_detected"),
+                event(3, "superseded_by_author"),
+            ],
+            truncated: false,
+            supersedes: Some(7),
+        };
+        // Room for the newest two, not the oldest.
+        let budget = size(&history.events[1]) + size(&history.events[2]);
+        let cut = claim_history_within_bytes(history.clone(), budget);
+        assert_eq!(
+            cut.events
+                .iter()
+                .map(|event| event.revision_before)
+                .collect::<Vec<_>>(),
+            [Some(2), Some(3)]
+        );
+        assert!(cut.truncated);
+        assert_eq!(cut.supersedes, Some(7));
+        let whole = claim_history_within_bytes(history, usize::MAX);
+        assert_eq!(whole.events.len(), 3);
+        assert!(!whole.truncated);
+
+        // The wire shape carries only what the transition named.
+        let wire = serde_json::to_value(event(3, "superseded_by_author")).unwrap();
+        assert_eq!(wire["kind"], "state_transition");
+        assert_eq!(wire["actor"], "agent-a");
+        assert_eq!(wire["reason"], "superseded_by_author");
+        assert_eq!(wire["from_state"], "active");
+        assert_eq!(wire["to_state"], "superseded");
+        assert_eq!(wire["revision_before"], 3);
+        assert_eq!(wire["successor_claim_id"], 99);
+        assert_eq!(wire["note"], "after review");
+        assert!(wire.get("conflict_id").is_none(), "{wire}");
+        assert!(wire.get("supersedes").is_none(), "{wire}");
+        assert!(wire.get("payload_elided").is_none(), "{wire}");
+        let detected = serde_json::to_value(event(1, "conflict_detected")).unwrap();
+        assert!(detected.get("successor_claim_id").is_none(), "{detected}");
+    }
+
+    #[test]
+    fn key_lookup_claims_are_cut_oldest_first_within_the_byte_budget() {
+        let now = Utc::now();
+        let entry = |id: i64| KeyClaimV1 {
+            claim: Claim {
+                id,
+                project: "project".into(),
+                kind: ClaimKind::Decision,
+                claim_key: Some("fleet::database".into()),
+                subject: Some("fleet".into()),
+                predicate: Some("database".into()),
+                value: Some(json!("cockroachdb")),
+                text: "Use CockroachDB for shared fleet memory.".into(),
+                polarity: 1,
+                state: ClaimState::Active,
+                origin: "operator_asserted".into(),
+                actor: Some("architect".into()),
+                confidence: 1.0,
+                valid_from: None,
+                valid_to: None,
+                superseded_by: None,
+                revision: 1,
+                conflict_eligible: true,
+                created_at: now,
+                updated_at: now,
+                support: Vec::new(),
+                conflict_ids: Vec::new(),
+            },
+            value_elided: false,
+        };
+        let one = serde_json::to_vec(&entry(1)).unwrap().len() + 1;
+        let (kept, cut) = key_claims_within_bytes(vec![entry(1), entry(2), entry(3)], one * 2);
+        assert_eq!(
+            kept.iter().map(|entry| entry.claim.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(cut);
+        let (kept, cut) = key_claims_within_bytes(vec![entry(1), entry(2)], one * 2);
+        assert_eq!(kept.len(), 2);
+        assert!(!cut);
+        // The key entry serializes as the claim itself plus its elision flag.
+        let wire = serde_json::to_value(KeyClaimV1 {
+            value_elided: true,
+            ..entry(4)
+        })
+        .unwrap();
+        assert_eq!(wire["id"], 4);
+        assert_eq!(wire["claim_key"], "fleet::database");
+        assert_eq!(wire["value_elided"], true);
+        assert!(wire.get("claim").is_none());
+        assert!(
+            serde_json::to_value(entry(5))
+                .unwrap()
+                .get("value_elided")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn claim_search_projection_preserves_authored_text() {
         let now = Utc::now();
         let hit = SemanticClaimHit {
@@ -3658,15 +4392,55 @@ mod tests {
             similarity: 0.9,
             passage_index: 0,
             matched_passage: "Use CockroachDB for shared fleet memory.\nkind: decision\nsubject: fleet\npredicate: database".into(),
+            revision: 0,
+            actor: None,
+            value_elided: false,
+            support_elided: false,
         };
 
-        let projected = compact_claim_hits(vec![hit]);
+        let projected = compact_claim_hits(vec![hit.clone()]);
         assert_eq!(
             projected[0].claim.text,
             "Use CockroachDB for shared fleet memory."
         );
         assert!(projected[0].matched_passage.contains("kind: decision"));
+        // The value rides on the hit, with the claim's revision and author
+        // repeated beside it, so an agent can act on what it found.
+        assert_eq!(projected[0].claim.value, Some(json!("cockroachdb")));
+        assert!(!projected[0].value_elided);
+        assert!(!projected[0].support_elided);
+        assert_eq!(projected[0].revision, 1);
+        assert_eq!(projected[0].actor.as_deref(), Some("architect"));
+        let wire = serde_json::to_value(&projected[0]).unwrap();
+        assert_eq!(wire["revision"], 1);
+        assert_eq!(wire["actor"], "architect");
+        assert!(wire.get("value_elided").is_none(), "{wire}");
+        assert!(wire.get("support_elided").is_none(), "{wire}");
+
+        // What the projection leaves out is flagged, never dropped silently.
+        let mut oversized = hit;
+        oversized.claim.value = Some(json!("x".repeat(MAX_CLAIM_HIT_VALUE_BYTES + 1)));
+        oversized.claim.support.push(crate::ledger::ClaimSupport {
+            id: 1,
+            source_config_id: "docs".into(),
+            source: "spec".into(),
+            source_id: "adr-1".into(),
+            chunk_id: None,
+            content_sha256: None,
+            excerpt: None,
+            relation: "supports".into(),
+            state: "current".into(),
+            observed_at: now,
+            invalidated_at: None,
+        });
+        let projected = compact_claim_hits(vec![oversized]);
         assert!(projected[0].claim.value.is_none());
+        assert!(projected[0].value_elided);
+        assert!(projected[0].claim.support.is_empty());
+        assert!(projected[0].support_elided);
+        let wire = serde_json::to_value(&projected[0]).unwrap();
+        assert_eq!(wire["value_elided"], true);
+        assert_eq!(wire["support_elided"], true);
     }
 
     struct OfflineEmbedder;
@@ -5725,19 +6499,183 @@ mod tests {
         assert!(matches!(error, ServiceError::Internal(_)), "{error}");
     }
 
+    #[test]
+    fn conflicts_status_counts_open_acknowledged_and_waived_or_reports_unavailable() {
+        use crate::ledger::{OpenConflictRowV1, OpenConflictsV1};
+        let at = |seconds: i64| chrono::DateTime::<Utc>::from_timestamp(seconds, 0).unwrap();
+        let row = |id: i64, seconds: i64| OpenConflictRowV1 {
+            id,
+            revision: 1,
+            member_count: 2,
+            detected_at: at(seconds),
+        };
+
+        // Nothing open: zero counts, no oldest, no warning.
+        let (block, warnings) =
+            conflicts_status_block(Ok((OpenConflictsV1::default(), Some(HashMap::new()))));
+        assert_eq!(
+            block,
+            json!({
+                "open": 0,
+                "acknowledged": 0,
+                "waived": 0,
+                "oldest_open_at": null,
+                "bound_exceeded": false,
+            })
+        );
+        assert!(warnings.is_empty());
+
+        // Open conflicts under the overlay: counted by their overlay state,
+        // the oldest named.
+        let open = OpenConflictsV1 {
+            rows: vec![
+                row(7, 1_700_000_000),
+                row(9, 1_700_000_100),
+                row(11, 1_700_000_200),
+            ],
+            bound_exceeded: false,
+        };
+        let states = HashMap::from([
+            (7, "acknowledged".to_owned()),
+            (9, "waived".to_owned()),
+            (11, "open".to_owned()),
+        ]);
+        let (block, warnings) = conflicts_status_block(Ok((open.clone(), Some(states))));
+        assert_eq!(block["open"], 3);
+        assert_eq!(block["acknowledged"], 1);
+        assert_eq!(block["waived"], 1);
+        assert_eq!(block["oldest_open_at"], json!(at(1_700_000_000)));
+        assert_eq!(block["bound_exceeded"], false);
+        assert!(warnings.is_empty());
+
+        // Without the overlay the lifecycle counts are unknown, not zero.
+        let (block, _) = conflicts_status_block(Ok((open, None)));
+        assert_eq!(block["open"], 3);
+        assert_eq!(block["acknowledged"], Value::Null);
+        assert_eq!(block["waived"], Value::Null);
+
+        // A full scan reports lower bounds and says so.
+        let (block, warnings) = conflicts_status_block(Ok((
+            OpenConflictsV1 {
+                rows: vec![row(1, 1_700_000_000)],
+                bound_exceeded: true,
+            },
+            None,
+        )));
+        assert_eq!(block["bound_exceeded"], true);
+        assert_eq!(warning_codes(&warnings), ["open_conflicts_bound_exceeded"]);
+
+        // A failed read is null with a warning, never a failed status.
+        let (block, warnings) =
+            conflicts_status_block(Err(FleetError::Memory("database unreachable".into())));
+        assert_eq!(block, Value::Null);
+        assert_eq!(warning_codes(&warnings), ["conflicts_status_unavailable"]);
+    }
+
+    #[test]
+    fn quarantine_status_reports_reasons_and_names_preimage_disagreements() {
+        use crate::evidence_ledger::{QuarantineSummaryV1, QuarantinedFactV1};
+        let (block, warnings) = quarantine_status_block(Ok(QuarantineSummaryV1::default()));
+        assert_eq!(
+            block,
+            json!({
+                "by_reason": {},
+                "bound_exceeded": false,
+                "preimage_disagreement_sample": [],
+            })
+        );
+        assert!(warnings.is_empty());
+
+        let received_at = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let (block, warnings) = quarantine_status_block(Ok(QuarantineSummaryV1 {
+            by_reason: [
+                ("oversize".to_owned(), 3),
+                ("preimage_disagreement".to_owned(), 2),
+            ]
+            .into_iter()
+            .collect(),
+            bound_exceeded: false,
+            preimage_disagreement_sample: vec![QuarantinedFactV1 {
+                source_fact_id: Some(Sha256Digest::from_bytes([7; 32])),
+                received_at,
+            }],
+        }));
+        assert_eq!(block["by_reason"]["oversize"], 3);
+        assert_eq!(block["by_reason"]["preimage_disagreement"], 2);
+        assert_eq!(
+            block["preimage_disagreement_sample"][0]["source_fact_id"],
+            json!(Sha256Digest::from_bytes([7; 32]))
+        );
+        assert_eq!(
+            block["preimage_disagreement_sample"][0]["received_at"],
+            json!(received_at)
+        );
+        assert_eq!(
+            warning_codes(&warnings),
+            ["quarantine_preimage_disagreement"]
+        );
+        assert!(
+            warnings[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("2 evidence deliveries were quarantined")
+        );
+
+        let (block, warnings) =
+            quarantine_status_block(Err(FleetError::Memory("permission denied".into())));
+        assert_eq!(block, Value::Null);
+        assert_eq!(warning_codes(&warnings), ["quarantine_unavailable"]);
+    }
+
+    #[test]
+    fn absence_contract_publishes_the_verdict_bounds_as_written() {
+        assert_eq!(
+            absence_contract(),
+            json!({
+                "dense_bound": 0.45,
+                "neighbour_band_floor": 0.30,
+                "dense_vote_excluded": ["application.ostk-git-fact-v1"],
+                "anchored_on": "lexical",
+            })
+        );
+        assert_eq!(
+            serde_json::to_string(&absence_contract()["dense_bound"]).unwrap(),
+            "0.45"
+        );
+        assert_eq!(cosine_bound(0.3).to_string(), "0.3");
+    }
+
     #[tokio::test]
     async fn legacy_claim_keys_status_counts_warns_or_reports_unavailable() {
         // No legacy rows: the count alone, no warning.
         let (value, warnings) = legacy_claim_keys_block(Ok(LegacyClaimKeysV1::default()));
-        assert_eq!(value, json!(0));
+        assert_eq!(
+            value,
+            json!({ "count": 0, "bound_exceeded": false, "sample": [] })
+        );
         assert!(warnings.is_empty());
 
-        // Legacy rows are visible as a count and a warning naming the exit.
+        // Legacy rows are visible as a count, a sample naming what to
+        // supersede, and a warning naming the exit.
         let (value, warnings) = legacy_claim_keys_block(Ok(LegacyClaimKeysV1 {
             count: 3,
             bound_exceeded: false,
+            sample: vec![crate::ledger::LegacyClaimKeySampleV1 {
+                claim_id: 41,
+                claim_key: "include_transcript_default::enabled".into(),
+                actor: Some("agent-a".into()),
+            }],
         }));
-        assert_eq!(value, json!(3));
+        assert_eq!(value["count"], 3);
+        assert_eq!(value["bound_exceeded"], false);
+        assert_eq!(
+            value["sample"],
+            json!([{
+                "claim_id": 41,
+                "claim_key": "include_transcript_default::enabled",
+                "actor": "agent-a"
+            }])
+        );
         assert_eq!(warning_codes(&warnings), ["legacy_claim_keys"]);
         let message = warnings[0]["message"].as_str().unwrap();
         assert!(
@@ -5750,8 +6688,10 @@ mod tests {
         let (value, warnings) = legacy_claim_keys_block(Ok(LegacyClaimKeysV1 {
             count: 256,
             bound_exceeded: true,
+            sample: Vec::new(),
         }));
-        assert_eq!(value, json!(256));
+        assert_eq!(value["count"], 256);
+        assert_eq!(value["bound_exceeded"], true);
         assert_eq!(warning_codes(&warnings), ["legacy_claim_keys"]);
         assert!(
             warnings[0]["message"]

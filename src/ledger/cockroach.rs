@@ -13,14 +13,14 @@ use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Row, Transaction};
 
 use crate::ledger::lifecycle::{LifecycleRefusal, RefusalCode};
-use crate::ledger::types::PreparedClaim;
+use crate::ledger::types::{MAX_CLAIM_HIT_VALUE_BYTES, PreparedClaim};
 use crate::ledger::{
-    AssertedClaimMutation, Claim, ClaimInput, ClaimItemSupportV1, ClaimKind, ClaimLedger,
-    ClaimMutation, ClaimState, ClaimSupport, ClaimTarget, Conflict, ConflictHistory,
-    ConflictLifecycleRows, ConflictMutation, ConflictTarget, DismissalTerms,
+    AssertedClaimMutation, Claim, ClaimHistoryV1, ClaimInput, ClaimItemSupportV1, ClaimKind,
+    ClaimLedger, ClaimMutation, ClaimState, ClaimSupport, ClaimTarget, ClaimsForKeyV1, Conflict,
+    ConflictHistory, ConflictLifecycleRows, ConflictMutation, ConflictTarget, DismissalTerms,
     FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2,
-    LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest, SemanticClaimHit, SupportInputV1,
-    SupportedClaimCoordinate, SupportedClaimIds, WaiverTerms,
+    LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest, OpenConflictsV1,
+    SemanticClaimHit, SupportInputV1, SupportedClaimCoordinate, SupportedClaimIds, WaiverTerms,
 };
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::remember_runtime::{EventFirstAssert, RememberAssertInputV1, actor_for_agent};
@@ -31,6 +31,7 @@ use crate::store::cockroach::{
 use crate::{FleetError, FleetScope, Result};
 
 mod assert_store;
+mod audit_reads;
 mod conflict_store;
 mod item_links;
 mod lifecycle_store;
@@ -71,9 +72,12 @@ const CLAIM_ANN_SEARCH_SQL: &str = "SELECT claim_id, passage_index, left(passage
      FROM memory_claim_embeddings \
      WHERE tenant_id = $1 AND project = $2 AND model = $3 \
      ORDER BY vector <=> $4::VECTOR(512) LIMIT $5";
-const SEARCH_CLAIM_PROJECTION_SQL: &str = "SELECT id, project, kind, claim_key, subject, predicate, NULL::JSONB AS value, \
+const SEARCH_CLAIM_PROJECTION_SQL: &str = "SELECT id, project, kind, claim_key, subject, predicate, \
+            CASE WHEN value IS NULL OR octet_length(value::STRING) > $5 \
+                 THEN NULL ELSE value END AS value, \
             left(text, $4) AS text, polarity, state, origin, actor, confidence, valid_from, \
-            valid_to, superseded_by, revision, conflict_eligible, created_at, updated_at \
+            valid_to, superseded_by, revision, conflict_eligible, created_at, updated_at, \
+            (value IS NOT NULL AND octet_length(value::STRING) > $5) AS value_elided \
      FROM memory_claims@{NO_FULL_SCAN} \
      WHERE tenant_id = $1 AND project = $2 AND id = ANY($3)";
 const CONFLICT_CLAIM_PROJECTION_SQL: &str = "SELECT id, project, kind, claim_key, subject, predicate, \
@@ -256,13 +260,13 @@ const CURRENT_CONFLICT_DETECTOR_WRITE_PROBE_SQL: &str = "SELECT CASE detector \
      WHERE tenant_id = $1 AND project = $2 AND claim_key = $3 \
      ORDER BY detector LIMIT 3 FOR UPDATE";
 const INCOMPATIBLE_CURRENT_CLAIMS_SQL: &str = "WITH candidates AS MATERIALIZED (\
-       SELECT id, value, polarity, valid_from, valid_to, conflict_eligible \
+       SELECT id, actor, revision, value, polarity, valid_from, valid_to, conflict_eligible \
        FROM memory_claims@memory_claims_scope_key_idx \
        WHERE tenant_id = $1 AND project = $2 AND id <> $3 \
          AND claim_key = $4 AND state IN ('active', 'disputed') \
        ORDER BY state, id LIMIT $9\
      ) \
-     SELECT id, \
+     SELECT id, actor, revision, \
             (conflict_eligible \
              AND ((polarity = 1 AND $6 = 1 AND value IS DISTINCT FROM $5) \
                   OR (polarity <> $6 AND value IS NOT DISTINCT FROM $5)) \
@@ -335,6 +339,11 @@ pub struct CockroachClaimLedger {
     /// collected item is refused as `item_support_unavailable` (ADR 0008
     /// D11).
     claim_item_links: Option<ClaimItemLinksCapability>,
+    /// Refuse a `record` that would dispute a lifecycle-current claim the
+    /// caller itself holds on the key (`own_current_claim_on_key`), so the
+    /// caller supersedes it instead. Set where `supersede` is served; the
+    /// record-only surface keeps detecting a self-conflict as before.
+    refuse_self_dispute: bool,
 }
 
 impl std::fmt::Debug for CockroachClaimLedger {
@@ -385,7 +394,25 @@ impl CockroachClaimLedger {
             conflict_adjudication: false,
             event_first_assert: None,
             claim_item_links: None,
+            refuse_self_dispute: false,
         })
+    }
+
+    /// Refuse a `record` that would dispute the caller's own lifecycle-current
+    /// claim on the key (`own_current_claim_on_key`), naming the claim to
+    /// supersede. Only a writer that serves `supersede` sets this: the
+    /// refusal is the controls to supersede made unavoidable, and it has no
+    /// exit on a record-only surface.
+    #[must_use]
+    pub const fn with_self_dispute_refusal(mut self, refuse: bool) -> Self {
+        self.refuse_self_dispute = refuse;
+        self
+    }
+
+    /// Whether this ledger refuses a self-dispute on `record`.
+    #[must_use]
+    pub const fn refuses_self_dispute(&self) -> bool {
+        self.refuse_self_dispute
     }
 
     /// Serve the conflict lifecycle (`acknowledge`, concession `resolve`, the
@@ -580,6 +607,7 @@ impl ClaimLedger for CockroachClaimLedger {
         }
         let prepared = input.prepare()?;
         let item_links = self.claim_item_links;
+        let refuse_self_dispute = self.refuse_self_dispute;
         let request = serde_json::json!({
             "scope": {
                 "project": scope.project,
@@ -674,8 +702,15 @@ impl ClaimLedger for CockroachClaimLedger {
                     item_links,
                 )
                 .await?;
-                let (conflicts_opened, conflict_detection) =
-                    detect_and_observe(transaction, &scope, &mut claim, &input, &prepared).await?;
+                let (conflicts_opened, conflict_detection) = detect_and_observe(
+                    transaction,
+                    &scope,
+                    &mut claim,
+                    &input,
+                    &prepared,
+                    refuse_self_dispute.then_some(scope.agent.as_str()),
+                )
+                .await?;
 
                 let event_payload =
                     claim_recorded_event_payload(claim.claim_key.as_deref(), conflict_detection);
@@ -884,6 +919,31 @@ impl ClaimLedger for CockroachClaimLedger {
         lifecycle_store::legacy_claim_keys(self, scope).await
     }
 
+    async fn claims_for_key(
+        &self,
+        scope: &FleetScope,
+        claim_key: &str,
+        include_history: bool,
+    ) -> Result<ClaimsForKeyV1> {
+        audit_reads::claims_for_key(self, scope, claim_key, include_history).await
+    }
+
+    async fn conflict_ids_for_key(&self, scope: &FleetScope, claim_key: &str) -> Result<Vec<i64>> {
+        audit_reads::conflict_ids_for_key(self, scope, claim_key).await
+    }
+
+    async fn claim_lifecycle_history(
+        &self,
+        scope: &FleetScope,
+        claim_id: i64,
+    ) -> Result<ClaimHistoryV1> {
+        audit_reads::claim_lifecycle_history(self, scope, claim_id).await
+    }
+
+    async fn open_conflicts(&self, scope: &FleetScope) -> Result<OpenConflictsV1> {
+        audit_reads::open_conflicts(self, scope).await
+    }
+
     async fn get_claim(&self, scope: &FleetScope, id: i64) -> Result<Option<Claim>> {
         self.ensure_scope(scope)?;
         if id <= 0 {
@@ -976,16 +1036,21 @@ impl ClaimLedger for CockroachClaimLedger {
                     .iter()
                     .map(|candidate| candidate.claim_id)
                     .collect::<Vec<_>>();
-                let claims_by_id = fetch_search_claims(transaction, &scope, &candidate_ids).await?;
+                let projected = fetch_search_claims(transaction, &scope, &candidate_ids).await?;
                 let mut hits = Vec::with_capacity(limit);
                 for candidate in candidates {
-                    let Some(claim) = claims_by_id.get(&candidate.claim_id).cloned() else {
+                    let Some(claim) = projected.claims.get(&candidate.claim_id).cloned() else {
                         continue;
                     };
                     if !include_history && !claim.state.is_current() {
                         continue;
                     }
+                    let value_elided = projected.values_elided.contains(&claim.id);
                     hits.push(SemanticClaimHit {
+                        revision: claim.revision,
+                        actor: claim.actor.clone(),
+                        value_elided,
+                        support_elided: false,
                         claim,
                         similarity: candidate.similarity,
                         passage_index: candidate.passage_index,
@@ -1774,6 +1839,14 @@ async fn insert_claim_projection(
 /// exists, disputing every member. Returns the conflicts this call opened or
 /// reopened and the audit for its `claim_recorded` event (`None` when the
 /// claim is not conflict-eligible).
+///
+/// With `refuse_own_dispute` naming the calling agent, an incompatible
+/// candidate that agent authored refuses the whole mutation before anything
+/// is disputed (`own_current_claim_on_key`): the agent holds a current claim
+/// on the key and must supersede it. `record` passes the agent where the
+/// writer serves `supersede`; `supersede` and `assert` never do (a
+/// successor's predecessor is already retired, and an assertion is a new
+/// statement of its own).
 #[allow(clippy::too_many_lines)] // the detector's bounded compare-and-join is one unit
 async fn detect_and_observe(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
@@ -1781,6 +1854,7 @@ async fn detect_and_observe(
     claim: &mut Claim,
     input: &ClaimInput,
     prepared: &PreparedClaim,
+    refuse_own_dispute: Option<&str>,
 ) -> Result<(Vec<i64>, Option<ConflictDetectionAudit>)> {
     let mut conflicts_opened = Vec::new();
     let conflict_detection = if let (true, Some(claim_key), Some(value)) = (
@@ -1791,33 +1865,47 @@ async fn detect_and_observe(
         require_current_conflict_detector(transaction, scope, claim_key).await?;
         let comparison_bound = i64::try_from(MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON)
             .map_err(|_| protocol_error("conflict mutation bound is outside INT8 range"))?;
-        let candidate_rows = sqlx::query_as::<_, (i64, bool, i64)>(INCOMPATIBLE_CURRENT_CLAIMS_SQL)
-            .bind(scope.tenant_id)
-            .bind(&scope.project)
-            .bind(claim.id)
-            .bind(claim_key)
-            .bind(value)
-            .bind(input.polarity)
-            .bind(input.valid_from)
-            .bind(input.valid_to)
-            .bind(comparison_bound + 1)
-            .fetch_all(&mut **transaction)
-            .await?;
+        let candidate_rows = sqlx::query_as::<_, (i64, Option<String>, i64, bool, i64)>(
+            INCOMPATIBLE_CURRENT_CLAIMS_SQL,
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(claim.id)
+        .bind(claim_key)
+        .bind(value)
+        .bind(input.polarity)
+        .bind(input.valid_from)
+        .bind(input.valid_to)
+        .bind(comparison_bound + 1)
+        .fetch_all(&mut **transaction)
+        .await?;
 
-        let candidate_count = candidate_rows.first().map_or(0, |row| row.2);
+        let candidate_count = candidate_rows.first().map_or(0, |row| row.4);
         if candidate_count > comparison_bound {
             return Err(FleetError::Memory(format!(
                 "same-key comparison exceeds the bounded mutation limit of {MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON} lifecycle-current claims"
             )));
         }
-        if candidate_rows.iter().any(|row| row.2 != candidate_count) {
+        if candidate_rows.iter().any(|row| row.4 != candidate_count) {
             return Err(protocol_error(
                 "same-key comparison returned an inconsistent candidate count",
             ));
         }
+        // The rows arrive in id order, so the first own incompatible claim is
+        // the oldest one the caller holds.
+        if let Some(agent) = refuse_own_dispute
+            && let Some((own_id, _, own_revision, _, _)) =
+                candidate_rows
+                    .iter()
+                    .find(|(_, actor, _, incompatible, _)| {
+                        *incompatible && actor.as_deref() == Some(agent)
+                    })
+        {
+            return Err(own_current_claim_on_key(*own_id, *own_revision, claim_key).into());
+        }
         let mut incompatible_ids = candidate_rows
             .iter()
-            .filter_map(|(id, incompatible, _)| incompatible.then_some(id))
+            .filter_map(|(id, _, _, incompatible, _)| incompatible.then_some(id))
             .copied()
             .collect::<Vec<_>>();
         incompatible_ids.sort_unstable();
@@ -1882,6 +1970,24 @@ async fn detect_and_observe(
         None
     };
     Ok((conflicts_opened, conflict_detection))
+}
+
+/// The refusal of a `record` that would dispute the caller's own current
+/// claim on the key: nothing is written, and the caller is told exactly what
+/// to send instead.
+fn own_current_claim_on_key(claim_id: i64, revision: i64, claim_key: &str) -> LifecycleRefusal {
+    LifecycleRefusal::new(
+        RefusalCode::OwnCurrentClaimOnKey,
+        format!(
+            "you hold a current claim on this key; send supersede with claim_id {claim_id}, \
+             expected_revision {revision}"
+        ),
+        serde_json::json!({
+            "claim_id": claim_id,
+            "revision": revision,
+            "claim_key": claim_key,
+        }),
+    )
 }
 
 /// The `claim_recorded` audit event of a newly inserted claim. Record keys it
@@ -2106,15 +2212,20 @@ async fn hydrate_conflicts(
     Ok(conflicts)
 }
 
-/// Hydrate the bounded semantic-search projection. Values and support are not
-/// read because the public search projection always removes both fields.
+/// Hydrate the bounded semantic-search projection. SQL truncates text and
+/// carries a value only up to [`MAX_CLAIM_HIT_VALUE_BYTES`] (a larger one is
+/// reported elided); support is not read because the public search
+/// projection never carries it.
 async fn fetch_search_claims(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     claim_ids: &[i64],
-) -> Result<HashMap<i64, Claim>> {
+) -> Result<ConflictClaimSummaries> {
     if claim_ids.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(ConflictClaimSummaries {
+            claims: HashMap::new(),
+            values_elided: HashSet::new(),
+        });
     }
 
     let claim_rows = sqlx::query(SEARCH_CLAIM_PROJECTION_SQL)
@@ -2125,22 +2236,28 @@ async fn fetch_search_claims(
             i64::try_from(MAX_CLAIM_SEARCH_TEXT_CHARS + 1)
                 .map_err(|_| protocol_error("claim search projection limit exceeds INT8"))?,
         )
+        .bind(
+            i64::try_from(MAX_CLAIM_HIT_VALUE_BYTES)
+                .map_err(|_| protocol_error("claim search value projection limit exceeds INT8"))?,
+        )
         .fetch_all(&mut **transaction)
         .await?;
-    let mut claims = claim_rows
-        .iter()
-        .map(decode_claim)
-        .map(|result| {
-            result.map(|mut claim| {
-                claim.text = compact_text(&claim.text, MAX_CLAIM_SEARCH_TEXT_CHARS);
-                claim
-            })
-        })
-        .map(|result| result.map(|claim| (claim.id, claim)))
-        .collect::<Result<HashMap<_, _>>>()?;
+    let mut values_elided = HashSet::new();
+    let mut claims = HashMap::with_capacity(claim_rows.len());
+    for row in &claim_rows {
+        let mut claim = decode_claim(row)?;
+        claim.text = compact_text(&claim.text, MAX_CLAIM_SEARCH_TEXT_CHARS);
+        if row.try_get::<bool, _>("value_elided")? {
+            values_elided.insert(claim.id);
+        }
+        claims.insert(claim.id, claim);
+    }
 
     hydrate_claim_conflict_ids(transaction, scope, claim_ids, &mut claims).await?;
-    Ok(claims)
+    Ok(ConflictClaimSummaries {
+        claims,
+        values_elided,
+    })
 }
 
 struct ConflictClaimSummaries {
@@ -3211,6 +3328,33 @@ mod tests {
         assert!(
             INCOMPATIBLE_CURRENT_CLAIMS_SQL.contains("count(*) OVER ()::INT8 AS candidate_count")
         );
+        // The self-dispute check reads each candidate's author and revision
+        // from the same bounded seek, so it costs no second read.
+        assert!(INCOMPATIBLE_CURRENT_CLAIMS_SQL.contains("SELECT id, actor, revision, value"));
+        assert!(
+            INCOMPATIBLE_CURRENT_CLAIMS_SQL
+                .contains("SELECT id, actor, revision, (conflict_eligible")
+        );
+    }
+
+    #[test]
+    fn self_dispute_refusal_names_the_claim_to_supersede() {
+        let refusal = own_current_claim_on_key(41, 3, "merged-build::rollout-mode");
+        assert_eq!(refusal.code, RefusalCode::OwnCurrentClaimOnKey);
+        assert_eq!(refusal.code.as_str(), "own_current_claim_on_key");
+        assert_eq!(
+            refusal.message,
+            "you hold a current claim on this key; send supersede with claim_id 41, \
+             expected_revision 3"
+        );
+        assert_eq!(
+            refusal.details,
+            serde_json::json!({
+                "claim_id": 41,
+                "revision": 3,
+                "claim_key": "merged-build::rollout-mode",
+            })
+        );
     }
 
     #[test]
@@ -3571,7 +3715,11 @@ mod tests {
         assert!(CLAIM_ANN_SEARCH_SQL.contains("left(passage_text, $6)"));
         assert!(CLAIM_ANN_SEARCH_SQL.contains("LIMIT $5"));
 
-        assert!(SEARCH_CLAIM_PROJECTION_SQL.contains("NULL::JSONB AS value"));
+        // A hit carries its value up to the bound and says when it was
+        // elided, so an agent reads the recorded proposition, not a summary.
+        assert!(!SEARCH_CLAIM_PROJECTION_SQL.contains("NULL::JSONB AS value"));
+        assert!(SEARCH_CLAIM_PROJECTION_SQL.contains("octet_length(value::STRING) > $5"));
+        assert!(SEARCH_CLAIM_PROJECTION_SQL.contains("AS value_elided"));
         assert!(SEARCH_CLAIM_PROJECTION_SQL.contains("left(text, $4)"));
         assert!(!SEARCH_CLAIM_PROJECTION_SQL.contains("memory_claim_support"));
         assert!(!SEARCH_CLAIM_PROJECTION_SQL.contains("SELECT *"));
@@ -5445,6 +5593,11 @@ mod tests {
             LegacyClaimKeysV1 {
                 count: 1,
                 bound_exceeded: false,
+                sample: vec![crate::ledger::LegacyClaimKeySampleV1 {
+                    claim_id: legacy.claim.id,
+                    claim_key: "include_transcript_default::enabled".into(),
+                    actor: legacy.claim.actor.clone(),
+                }],
             }
         );
 

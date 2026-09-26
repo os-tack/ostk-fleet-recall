@@ -1116,6 +1116,107 @@ fn digest32(value: Vec<u8>) -> EvidenceAppendResult<Sha256Digest> {
     Ok(Sha256Digest::from_bytes(bytes))
 }
 
+/// Quarantine rows one status read counts before reporting a lower bound.
+pub const MAX_QUARANTINE_STATUS_ROWS: usize = 10_000;
+
+/// Preimage-disagreement rows `recall(status)` names.
+pub const MAX_QUARANTINE_STATUS_SAMPLE: usize = 10;
+
+/// The scope's quarantine rows by reason, bounded by the sentinel; the
+/// primary key is scope-prefixed, so this is one range read.
+const QUARANTINE_BY_REASON_SQL: &str = "SELECT reason, count(*)::INT8 AS rows \
+     FROM (SELECT reason FROM public.memory_evidence_quarantine@primary \
+           WHERE tenant_id = $1 AND project = $2 LIMIT $3) AS bounded \
+     GROUP BY reason ORDER BY reason";
+
+/// The newest preimage disagreements: the one quarantine reason that means
+/// two connectors reported different bytes under one source fact, which an
+/// operator reconciles rather than a retry.
+const QUARANTINE_PREIMAGE_SAMPLE_SQL: &str = "SELECT source_fact_id, received_at \
+     FROM public.memory_evidence_quarantine@primary \
+     WHERE tenant_id = $1 AND project = $2 AND reason = 'preimage_disagreement' \
+     ORDER BY received_at DESC, quarantine_id LIMIT $3";
+
+/// One quarantined preimage disagreement, as `recall(status)` names it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuarantinedFactV1 {
+    /// The source fact the two reports disagreed on, when the envelope
+    /// carried one.
+    pub source_fact_id: Option<Sha256Digest>,
+    pub received_at: DateTime<Utc>,
+}
+
+/// The scope's evidence quarantine, as `recall(status)` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct QuarantineSummaryV1 {
+    /// Rows per reason label (the contract wire form), in label order.
+    pub by_reason: std::collections::BTreeMap<String, i64>,
+    /// More rows exist than [`MAX_QUARANTINE_STATUS_ROWS`]; the counts are
+    /// lower bounds.
+    pub bound_exceeded: bool,
+    /// The newest preimage disagreements, at most
+    /// [`MAX_QUARANTINE_STATUS_SAMPLE`].
+    pub preimage_disagreement_sample: Vec<QuarantinedFactV1>,
+}
+
+/// Count the scope's quarantine rows by reason and name its newest preimage
+/// disagreements: what an operator can act on, read through the runtime
+/// role's `SELECT` on `memory_evidence_quarantine`.
+///
+/// # Errors
+///
+/// A database failure, including a role without the grant.
+pub async fn quarantine_summary(
+    pool: &PgPool,
+    tenant_id: uuid::Uuid,
+    project: &str,
+) -> Result<QuarantineSummaryV1> {
+    let sentinel = i64::try_from(MAX_QUARANTINE_STATUS_ROWS + 1)
+        .map_err(|_| FleetError::Memory("quarantine status bound exceeds INT8".into()))?;
+    let counted = sqlx::query_as::<_, (String, i64)>(QUARANTINE_BY_REASON_SQL)
+        .bind(tenant_id)
+        .bind(project)
+        .bind(sentinel)
+        .fetch_all(pool)
+        .await?;
+    let total: i64 = counted.iter().map(|(_, rows)| rows).sum();
+    let bound_exceeded = total > i64::try_from(MAX_QUARANTINE_STATUS_ROWS).unwrap_or(i64::MAX);
+    let by_reason = counted.into_iter().collect();
+    let sample = sqlx::query(QUARANTINE_PREIMAGE_SAMPLE_SQL)
+        .bind(tenant_id)
+        .bind(project)
+        .bind(
+            i64::try_from(MAX_QUARANTINE_STATUS_SAMPLE)
+                .map_err(|_| FleetError::Memory("quarantine sample bound exceeds INT8".into()))?,
+        )
+        .fetch_all(pool)
+        .await?;
+    let preimage_disagreement_sample = sample
+        .iter()
+        .map(|row| {
+            let source_fact_id: Option<Vec<u8>> = row.try_get("source_fact_id")?;
+            let source_fact_id = source_fact_id
+                .map(|bytes| {
+                    <[u8; 32]>::try_from(bytes)
+                        .map(Sha256Digest::from_bytes)
+                        .map_err(|_| {
+                            FleetError::Memory("stored source_fact_id is not 32 bytes".into())
+                        })
+                })
+                .transpose()?;
+            Ok(QuarantinedFactV1 {
+                source_fact_id,
+                received_at: row.try_get("received_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(QuarantineSummaryV1 {
+        by_reason,
+        bound_exceeded,
+        preimage_disagreement_sample,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,6 +1270,40 @@ mod tests {
         assert!(!SELECT_AUTHORITY_FENCE_SQL.contains("FOR UPDATE"));
         assert!(ADVANCE_SHARD_HEAD_SQL.contains("AND last_committed_offset = $8"));
         assert!(ADVANCE_SHARD_HEAD_SQL.contains("AND chain_digest = $9"));
+    }
+
+    #[test]
+    fn quarantine_status_reads_are_bounded_scope_seeks() {
+        assert!(QUARANTINE_BY_REASON_SQL.contains("memory_evidence_quarantine@primary"));
+        assert!(
+            QUARANTINE_BY_REASON_SQL.contains("WHERE tenant_id = $1 AND project = $2 LIMIT $3")
+        );
+        assert!(QUARANTINE_BY_REASON_SQL.contains("GROUP BY reason ORDER BY reason"));
+        assert!(QUARANTINE_PREIMAGE_SAMPLE_SQL.contains("memory_evidence_quarantine@primary"));
+        assert!(QUARANTINE_PREIMAGE_SAMPLE_SQL.contains("reason = 'preimage_disagreement'"));
+        assert!(
+            QUARANTINE_PREIMAGE_SAMPLE_SQL
+                .contains("ORDER BY received_at DESC, quarantine_id LIMIT $3")
+        );
+        assert_eq!(
+            quarantine_reason_label(QuarantineReasonV1::PreimageDisagreement),
+            "preimage_disagreement"
+        );
+        let summary = QuarantineSummaryV1 {
+            by_reason: std::iter::once(("preimage_disagreement".to_owned(), 2)).collect(),
+            bound_exceeded: false,
+            preimage_disagreement_sample: vec![QuarantinedFactV1 {
+                source_fact_id: None,
+                received_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            }],
+        };
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["by_reason"]["preimage_disagreement"], 2);
+        assert_eq!(
+            wire["preimage_disagreement_sample"][0]["source_fact_id"],
+            serde_json::Value::Null
+        );
+        assert!(wire["preimage_disagreement_sample"][0]["received_at"].is_string());
     }
 
     #[test]

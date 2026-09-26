@@ -2,10 +2,11 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::ledger::{
-    AssertedClaimMutation, Claim, ClaimInput, ClaimItemSupportV1, ClaimMutation, ClaimState,
-    ClaimTarget, Conflict, ConflictHistory, ConflictLifecycleRows, ConflictMutation,
-    ConflictTarget, DismissalTerms, LegacyClaimKeysV1, LifecycleMutation, LifecycleRefusal,
-    LifecycleReplayRequest, RefusalCode, SemanticClaimHit, WaiverTerms,
+    AssertedClaimMutation, Claim, ClaimHistoryV1, ClaimInput, ClaimItemSupportV1, ClaimMutation,
+    ClaimState, ClaimTarget, ClaimsForKeyV1, Conflict, ConflictHistory, ConflictLifecycleRows,
+    ConflictMutation, ConflictTarget, DismissalTerms, LegacyClaimKeysV1, LifecycleMutation,
+    LifecycleRefusal, LifecycleReplayRequest, OpenConflictsV1, RefusalCode, SemanticClaimHit,
+    WaiverTerms,
 };
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::remember_runtime::RememberAssertInputV1;
@@ -242,6 +243,36 @@ pub trait ClaimLedger: Send + Sync {
     ) -> Result<ConflictHistory>;
 
     async fn get_claim(&self, scope: &FleetScope, id: i64) -> Result<Option<Claim>>;
+
+    /// Every claim carrying exactly `claim_key` (the stored key, compared
+    /// byte for byte), oldest first, each with its support and current
+    /// conflicts: the lifecycle-current ones, or every state with
+    /// `include_history`. At most [`crate::ledger::MAX_KEY_LOOKUP_CLAIMS`]
+    /// are read, one seek of `memory_claims_scope_key_idx`.
+    async fn claims_for_key(
+        &self,
+        scope: &FleetScope,
+        claim_key: &str,
+        include_history: bool,
+    ) -> Result<ClaimsForKeyV1>;
+
+    /// The ids of the conflicts detected on exactly `claim_key`, in any
+    /// state: at most one per detector, so at most two.
+    async fn conflict_ids_for_key(&self, scope: &FleetScope, claim_key: &str) -> Result<Vec<i64>>;
+
+    /// One claim's lifecycle log (`memory_claim_events`), oldest first and at
+    /// most [`crate::ledger::MAX_CLAIM_HISTORY_EVENTS`] newest events, with
+    /// the predecessor the claim superseded when it is a successor. An
+    /// unknown claim has an empty history.
+    async fn claim_lifecycle_history(
+        &self,
+        scope: &FleetScope,
+        claim_id: i64,
+    ) -> Result<ClaimHistoryV1>;
+
+    /// The project's open conflicts as `recall(status)` counts them, oldest
+    /// first and bounded by [`crate::ledger::MAX_OPEN_CONFLICT_ROWS`].
+    async fn open_conflicts(&self, scope: &FleetScope) -> Result<OpenConflictsV1>;
 
     /// Hydrate conflicts by id in any state (at most 100 ids). Unknown ids are
     /// simply absent from the result.

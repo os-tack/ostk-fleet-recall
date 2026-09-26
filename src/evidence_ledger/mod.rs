@@ -123,7 +123,10 @@ pub use appendable::{
     AcceptedEventKindV1, AppendableAcceptedEvent, EvidenceDeliveryContextV1, SemanticIdentityRuleV1,
 };
 pub use bootstrap_import::{BootstrapImportProjection, IMPORT_ROWS_TABLE};
-pub use cockroach::CockroachAcceptedEventRepository;
+pub use cockroach::{
+    CockroachAcceptedEventRepository, MAX_QUARANTINE_STATUS_ROWS, MAX_QUARANTINE_STATUS_SAMPLE,
+    QuarantineSummaryV1, QuarantinedFactV1, quarantine_summary,
+};
 pub(crate) use content_store::content_kek_from_lookup;
 pub use content_store::{
     CONTENT_KEY_ENCRYPTION_KEY_ENV, ContentKeyEncryptionKey, ContentObjectWrite,

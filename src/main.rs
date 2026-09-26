@@ -734,6 +734,8 @@ async fn build_memory_service(
     if let Some(capability) = item_support {
         ledger = ledger.with_claim_item_links(capability);
     }
+    // Where supersede is served, a record disputing one's own claim is refused.
+    ledger = ledger.with_self_dispute_refusal(config.lifecycle.remember_lifecycle);
     // remember(assert) is served only where the writer-authority pins verify
     // (ADR 0005). Any pin or witness problem turns it off with a logged and
     // reported reason; it never stops serve (D5).

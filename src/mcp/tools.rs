@@ -144,11 +144,37 @@ pub fn recall_tool() -> Value {
                     "default": "chunk",
                     "description": KIND_DESCRIPTION
                 },
-                "id": {},
+                "id": {
+                    "description": "get: what to read. kind=chunk a chunk id; kind=claim a claim id (the answer adds the claim's lifecycle history and, for a successor, supersedes); kind=conflict a conflict id."
+                },
+                "key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2048,
+                    "description": "get with kind=claim: instead of id, the exact stored claim key (subject::predicate as record normalized it, or an assert's claim-v2: key). Returns every lifecycle-current claim on that key oldest first, each with its id, revision, value, actor, state, support, and conflict_ids, plus the key's open conflict; include_history adds superseded and retracted claims. A claim recorded before `_` became a key separator keeps its legacy key (recall(status).legacy_claim_keys names them), so look one up by its stored key, not by subject and predicate."
+                },
+                "subject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "get with kind=claim: with predicate, the key's parts; the server normalizes them exactly as record does (case, whitespace, `_` and `-` are one separator) and looks the key up."
+                },
+                "predicate": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "get with kind=claim: see subject."
+                },
+                "claim_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2048,
+                    "description": "conflicts: only the conflicts detected on this exact stored key (at most one per detector), in any state with include_resolved."
+                },
                 "include_history": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Include inactive historical claims. Valid only for kind=claim or kind=assertion."
+                    "description": "Include inactive historical claims. Valid only for kind=claim or kind=assertion (search, or get by key)."
                 },
                 "include_resolved": { "type": "boolean", "default": false },
                 "intent": { "type": "string", "enum": ["symbol", "narrative", "trace", "general"], "default": "general" }
@@ -157,7 +183,16 @@ pub fn recall_tool() -> Value {
             "additionalProperties": false,
             "allOf": [
                 { "if": { "properties": { "action": { "const": "search" } } }, "then": { "required": ["query"] } },
-                { "if": { "properties": { "action": { "const": "get" } } }, "then": { "required": ["id"] } },
+                {
+                    "if": { "properties": { "action": { "const": "get" } } },
+                    "then": {
+                        "anyOf": [
+                            { "required": ["id"] },
+                            { "required": ["key"] },
+                            { "required": ["subject", "predicate"] }
+                        ]
+                    }
+                },
                 {
                     "if": {
                         "properties": { "include_history": { "const": true } },
@@ -165,7 +200,7 @@ pub fn recall_tool() -> Value {
                     },
                     "then": {
                         "properties": {
-                            "action": { "const": "search" },
+                            "action": { "enum": ["search", "get"] },
                             "kind": { "enum": ["claim", "assertion"] }
                         },
                         "required": ["kind"]
@@ -759,6 +794,9 @@ fn named(groups: &[&[&'static str]]) -> Vec<&'static str> {
 /// The claim-lifecycle rule every surface serving supersede states.
 const SUCCESSOR_RULE: &str = "A successor keeps its predecessor's kind, subject/predicate key, and conflict eligibility: a keyed decision, fact, constraint, preference, or procedure keeps carrying a value, and a valueless one gains none. ";
 
+/// The self-dispute refusal, on every surface that serves `supersede`.
+const OWN_KEY_RULE: &str = "record is refused (own_current_claim_on_key) when you already hold a lifecycle-current claim on the key that the new value would dispute: nothing is written, and details name the claim_id and revision to send with supersede instead. ";
+
 /// When a concession closes a conflict. Recorded dismissals count on every
 /// writer that reads the lifecycle log, whether or not it serves dismiss.
 const RESOLVE_RULE: &str = "resolve concedes: it retracts only your own member claims named in retract_claim_ids, and the conflict closes only if no incompatible current pair remains other than pairs an adjudicator dismissed in this conflict; otherwise nothing changes. ";
@@ -785,10 +823,10 @@ const fn item_support_rule(surface: RememberSurface) -> &'static str {
     match (surface.item_support, surface.assert) {
         (false, _) => "",
         (true, false) => {
-            "A claim can cite items collected from other systems as support: record's support takes {\"item\": {\"item_id\"|\"version_id\"|\"url\"}, \"relation\"} entries. item_id and url cite the item's current version, version_id exactly that version; an item that is unknown, staged but not yet admitted, deleted, or withdrawn is refused, and recall get with kind=claim lists the items a claim cites. "
+            "A claim can cite items collected from other systems as support: record's support takes {\"item\": {\"item_id\"|\"version_id\"|\"url\"}, \"relation\"} entries. item_id and url cite the item's current version, version_id exactly that version; an item that is unknown, staged but not yet admitted, deleted, or withdrawn is refused, and recall get with kind=claim lists the items a claim cites: each citation names the cited version's uri and content_digests, and recall get with kind=item and that uri (or the version_id) returns exactly the cited bytes. "
         }
         (true, true) => {
-            "A claim can cite items collected from other systems as support: record's support takes {\"item\": {\"item_id\"|\"version_id\"|\"url\"}, \"relation\"} entries, and assert's assertion.support_items takes the same references, cited through their accepted evidence events. item_id and url cite the item's current version, version_id exactly that version; an item that is unknown, staged but not yet admitted, deleted, or withdrawn is refused, and recall get with kind=claim lists the items a claim cites. "
+            "A claim can cite items collected from other systems as support: record's support takes {\"item\": {\"item_id\"|\"version_id\"|\"url\"}, \"relation\"} entries, and assert's assertion.support_items takes the same references, cited through their accepted evidence events. item_id and url cite the item's current version, version_id exactly that version; an item that is unknown, staged but not yet admitted, deleted, or withdrawn is refused, and recall get with kind=claim lists the items a claim cites: each citation names the cited version's uri and content_digests, and recall get with kind=item and that uri (or the version_id) returns exactly the cited bytes. "
         }
     }
 }
@@ -816,7 +854,7 @@ fn remember_description(surface: RememberSurface) -> String {
     }
     if !surface.conflict_lifecycle {
         return format!(
-            "Deliberately record fleet memory, or supersede or retract claims you authored. {SUCCESSOR_RULE}{assert_rule}{capture_rule}{item_rule}{WRITE_GUARANTEES}"
+            "Deliberately record fleet memory, or supersede or retract claims you authored. {SUCCESSOR_RULE}{OWN_KEY_RULE}{assert_rule}{capture_rule}{item_rule}{WRITE_GUARANTEES}"
         );
     }
     let adjudication = surface.serves_adjudication();
@@ -837,13 +875,18 @@ fn remember_description(surface: RememberSurface) -> String {
     } else {
         ""
     };
+    let own_key_rule = if surface.claim_lifecycle {
+        OWN_KEY_RULE
+    } else {
+        ""
+    };
     let adjudication_rules = if adjudication {
         "dismiss and waive are refused (implicated) when you authored any member claim of the conflict, in any episode. dismiss judges the conflict not a real disagreement: it closes as dismissed, and the pairs it judged never keep it open again. waive accepts the current episode until expires_in_hours: the conflict stays open and visible and reads waived until the waiver expires or a member joins. "
     } else {
         ""
     };
     format!(
-        "Deliberately record fleet memory, {actions}. {successor_rule}acknowledge marks a conflict's current episode as seen and changes nothing else. {RESOLVE_RULE}{adjudication_rules}{CLOSE_RESTORES_MEMBERS}{assert_rule}{capture_rule}{item_rule}{WRITE_GUARANTEES}"
+        "Deliberately record fleet memory, {actions}. {successor_rule}{own_key_rule}acknowledge marks a conflict's current episode as seen and changes nothing else. {RESOLVE_RULE}{adjudication_rules}{CLOSE_RESTORES_MEMBERS}{assert_rule}{capture_rule}{item_rule}{WRITE_GUARANTEES}"
     )
 }
 
@@ -1320,10 +1363,27 @@ mod tests {
             json!(["claim", "assertion"])
         );
         assert_eq!(
-            history_constraint["then"]["properties"]["action"]["const"],
-            "search"
+            history_constraint["then"]["properties"]["action"]["enum"],
+            json!(["search", "get"])
         );
         assert_eq!(history_constraint["then"]["required"], json!(["kind"]));
+        // get takes an id, or (kind=claim) a key, or subject and predicate.
+        let get_constraint = &tools[0]["inputSchema"]["allOf"][1];
+        assert_eq!(get_constraint["if"]["properties"]["action"]["const"], "get");
+        assert_eq!(
+            get_constraint["then"]["anyOf"],
+            json!([
+                { "required": ["id"] },
+                { "required": ["key"] },
+                { "required": ["subject", "predicate"] }
+            ])
+        );
+        for property in ["key", "subject", "predicate", "claim_key"] {
+            assert!(
+                tools[0]["inputSchema"]["properties"][property].is_object(),
+                "{property} is declared"
+            );
+        }
         assert_eq!(
             tools[1]["inputSchema"]["properties"]["action"]["enum"],
             json!(["record"])
@@ -2083,6 +2143,43 @@ mod tests {
     /// or not it serves dismiss itself.
     #[test]
     fn conflict_surfaces_describe_close_effects_on_every_writer() {
+        // The self-dispute refusal is described exactly where supersede is
+        // served, beside the successor rule.
+        for surface in [
+            lifecycle_surface(),
+            conflict_surface(),
+            adjudication_surface(),
+        ] {
+            let description = remember_tool_for(surface)["description"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                description.contains("own_current_claim_on_key"),
+                "{surface:?}: {description}"
+            );
+            assert!(
+                description.find("A successor keeps")
+                    < description.find("own_current_claim_on_key"),
+                "{surface:?}: {description}"
+            );
+        }
+        for surface in [
+            RememberSurface::RECORD_ONLY,
+            RememberSurface {
+                claim_lifecycle: false,
+                ..conflict_surface()
+            },
+        ] {
+            let description = remember_tool_for(surface)["description"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                !description.contains("own_current_claim_on_key"),
+                "{surface:?}: {description}"
+            );
+        }
         for surface in [
             conflict_surface(),
             adjudication_surface(),
