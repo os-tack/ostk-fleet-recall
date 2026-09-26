@@ -86,7 +86,8 @@ use super::audience::{
 use super::cockroach::framed_sha256;
 use super::draft::CollectedItemDraftV1;
 use super::http::{
-    AuthSchemeV1, ProviderHttpV1, ProviderTokenV1, is_variable_name, validate_api_base,
+    AuthSchemeV1, ProviderHttpV1, ProviderTokenV1, validate_provider_api_base,
+    validate_token_variable,
 };
 use super::pull::{
     ContainerOutcomeV1, ListingBoundV1, PageStager, PartialReasonV1, PullCollectorV1,
@@ -102,6 +103,10 @@ use render::{
 
 /// The Web API a collector reads unless its settings say otherwise.
 pub const DEFAULT_SLACK_API_BASE: &str = "https://slack.com/api";
+
+/// The only host a collector sends its credential to, unless its base is
+/// loopback (a local fake provider).
+pub const SLACK_API_HOST: &str = "slack.com";
 
 /// The cursor domain of the reconciliation schedule.
 pub const RECONCILE_CURSOR_DOMAIN: &str = "slack.reconcile";
@@ -235,12 +240,7 @@ impl SlackSettingsV1 {
     }
 
     fn validate(&self) -> std::result::Result<(), String> {
-        if !is_variable_name(&self.token_env) {
-            return Err(
-                "settings.token_env must name an environment variable ([A-Z_][A-Z0-9_]*)"
-                    .to_owned(),
-            );
-        }
+        validate_token_variable(SLACK_PROVIDER, &self.token_env)?;
         if self.channels.is_empty() || self.channels.len() > MAX_CHANNELS {
             return Err(format!(
                 "settings.channels lists 1 to {MAX_CHANNELS} channel ids"
@@ -301,7 +301,8 @@ impl SlackSettingsV1 {
                 "settings.page_size must be between 1 and {MAX_PAGE_SIZE}"
             ));
         }
-        validate_api_base(&self.api_base).map_err(|error| format!("settings.api_base: {error}"))?;
+        validate_provider_api_base(&self.api_base, SLACK_API_HOST)
+            .map_err(|error| format!("settings.api_base: {error}"))?;
         Ok(())
     }
 

@@ -945,6 +945,43 @@ mod tests {
     }
 
     #[test]
+    fn a_sources_file_cannot_send_a_collector_credential_elsewhere() {
+        // The worker's own secrets are outside every collector's namespace.
+        for variable in [
+            "FLEET_RECALL_CONTENT_KEK_HEX",
+            "FLEET_RECALL_DATABASE_URL",
+            "FLEET_RECALL_LINEAR_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            let mut settings = slack();
+            settings["token_env"] = serde_json::json!(variable);
+            let message = refusal(&with_collector(&settings));
+            assert!(message.contains("FLEET_RECALL_SLACK_"), "{message}");
+        }
+        // A token is only ever sent to the provider's own host, or loopback.
+        let mut settings = slack();
+        settings["api_base"] = serde_json::json!("https://kek-sink.example/api");
+        let message = refusal(&with_collector(&settings));
+        assert!(message.contains("slack.com"), "{message}");
+        // A base with a password is refused without repeating it, whichever
+        // check refuses it.
+        for base in [
+            "https://svc:Pa55word@slack.com/api",
+            "https://svc:Pa55word!@relay.internal/api",
+        ] {
+            settings["api_base"] = serde_json::json!(base);
+            let message = refusal(&with_collector(&settings));
+            assert!(message.contains("settings.api_base"), "{message}");
+            assert!(
+                !message.contains("Pa55word"),
+                "the refusal echoes a password"
+            );
+        }
+        settings["api_base"] = serde_json::json!("http://127.0.0.1:8080/api");
+        assert!(parse(&with_collector(&settings)).is_ok());
+    }
+
+    #[test]
     fn a_collector_instance_is_unique_across_every_connector() {
         let mut value = with_collector(&slack());
         value["collectors"][0]["connector_instance"] = serde_json::json!("connector.ci.main");

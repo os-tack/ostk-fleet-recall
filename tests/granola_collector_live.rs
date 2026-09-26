@@ -48,7 +48,7 @@ const INSTANCE: &str = "granola.acme";
 const SCOPE: &str = "workspace.acme-robotics";
 const PLATFORM: &str = "fol_4y6LduVdwSKC27";
 const PEOPLE: &str = "fol_9pEopLeFoLdEr1";
-const TOKEN_ENV: &str = "FLEET_RECALL_TEST_GRANOLA_API_KEY";
+const TOKEN_ENV: &str = "FLEET_RECALL_GRANOLA_TEST_API_KEY";
 const MISSING: &str = "unfindable marmoset";
 
 /// The API key the fake expects: an obvious placeholder, never a real

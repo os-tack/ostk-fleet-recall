@@ -381,8 +381,12 @@ deleted. Messages keep their exact `ts`, edits supersede, mentions and links
 are rendered, and file content is never read (a file is a link, with its
 token stripped). A rate limit or `max_pages_per_tick` ends a pass partial,
 and the next pass picks it up. `api_base` (`https://slack.com/api` by
-default) must be https, or plain http to a loopback address. A collector's
-`stale_after_seconds` may not be shorter than its `reconcile_every_seconds`.
+default) must be on Slack's own host over https, or a loopback address (a
+local fake), and `token_env` must name a variable under
+`FLEET_RECALL_SLACK_`: a sources file can send the token nowhere else, and
+can never point a collector at a variable the worker holds for itself (the
+content key, a database URL). A collector's `stale_after_seconds` may not be
+shorter than its `reconcile_every_seconds`.
 
 A Linear collector reads one organization's teams with a personal API key
 (`lin_api_...`, sent as the `Authorization` header itself) or an OAuth access
@@ -417,8 +421,9 @@ searchable. A rate limit or `max_pages_per_tick` leaves a team partial, and
 the next pass resumes its sweep from the page after the last one staged. The
 report counts the fewest requests and complexity points Linear's
 `x-ratelimit-*` headers said were left. `api_url`
-(`https://api.linear.app/graphql` by default) must be https, or plain http to
-a loopback address.
+(`https://api.linear.app/graphql` by default) must be on `api.linear.app`
+over https, or a loopback address, and `token_env` must name a variable under
+`FLEET_RECALL_LINEAR_`.
 
 A Granola collector reads the meeting notes one API key (`grn_...`, from a
 Business or Enterprise workspace, sent as `Bearer`) can read, through the
@@ -454,8 +459,9 @@ two consecutive complete listings is hidden as revoked; a `404` for one note
 never hides it. Requests are paced at five a second; a rate limit, a failed
 request, or `max_pages_per_tick` ends a pass partial, and the next pass
 resumes after the last note it settled. `api_base`
-(`https://public-api.granola.ai/v1` by default) must be https, or plain http
-to a loopback address.
+(`https://public-api.granola.ai/v1` by default) must be on
+`public-api.granola.ai` over https, or a loopback address, and `token_env`
+must name a variable under `FLEET_RECALL_GRANOLA_`.
 
 Each transcript file is read in windows of its group's `window_bytes` (4 MiB
 by default, at most 8 MiB) behind a durable cursor. A line longer than the

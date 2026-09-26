@@ -50,7 +50,7 @@ use common::worker::{RecordedCi, STUB_MODEL_DIGEST, WorkerFixture};
 
 const INSTANCE: &str = "slack.acme";
 const TEAM: &str = "T07ACME0001";
-const TOKEN_ENV: &str = "FLEET_RECALL_TEST_SLACK_TOKEN";
+const TOKEN_ENV: &str = "FLEET_RECALL_SLACK_TEST_TOKEN";
 const PLATENG: &str = "C07PLATENG1";
 const RANDOM: &str = "C07RANDOM01";
 const MISSING: &str = "unfindable marmoset";

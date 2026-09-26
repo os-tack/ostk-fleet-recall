@@ -47,7 +47,7 @@ const INSTANCE: &str = "linear.acme";
 const ORG: &str = "0a9c0000-0000-4000-8000-0000000ac3e1";
 const ENG: &str = "4e6b8d0f-1a2b-4c3d-9e8f-7a6b5c4d3e2f";
 const SEC: &str = "5f7c9e10-2b3c-4d4e-8f90-8b7c6d5e4f30";
-const TOKEN_ENV: &str = "FLEET_RECALL_TEST_LINEAR_API_KEY";
+const TOKEN_ENV: &str = "FLEET_RECALL_LINEAR_TEST_API_KEY";
 const MISSING: &str = "unfindable marmoset";
 
 /// The personal API key the fake expects: an obvious placeholder, never a

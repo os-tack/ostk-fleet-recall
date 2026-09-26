@@ -28,6 +28,13 @@
 //!   ([`ProviderTokenV1::from_environment`]); it is only ever an
 //!   `Authorization` header marked sensitive, and neither the token type nor
 //!   the client prints it.
+//! * **The sources file cannot redirect a credential.** The variable must be
+//!   in the provider's own namespace, `FLEET_RECALL_<PROVIDER>_...`
+//!   ([`validate_token_variable`]), so a sources file cannot name the
+//!   worker's content key or a database URL; and a collector's API base must
+//!   be its provider's own host, or loopback
+//!   ([`validate_provider_api_base`]), so it cannot send a token anywhere
+//!   else. A refused base is described by its origin, never echoed.
 //! * **Errors are scrubbed.** An error never carries a response body, and its
 //!   text is passed through the collector redactor's scan
 //!   ([`scrub_diagnostic`]) before anything records it, so a provider that
@@ -215,6 +222,47 @@ pub fn is_variable_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+/// The prefix of every variable a `provider` collector may read its
+/// credential from: `FLEET_RECALL_<PROVIDER>_` (`FLEET_RECALL_SLACK_`).
+#[must_use]
+pub fn token_variable_prefix(provider: &str) -> String {
+    format!(
+        "FLEET_RECALL_{}_",
+        provider.to_ascii_uppercase().replace(['-', '.'], "_")
+    )
+}
+
+/// Check the variable a `provider` collector's settings name for its
+/// credential (`settings.token_env`).
+///
+/// The sources file is less trusted than the environment: it may never
+/// hold a credential, and it may not point a collector at one the worker
+/// holds for itself. A collector reads only a variable in its provider's own
+/// namespace ([`token_variable_prefix`]), so no edit of the sources file can
+/// send the content key, a database URL, or another provider's token to an
+/// API as an `Authorization` header.
+///
+/// # Errors
+///
+/// A message naming the refused setting and the namespace.
+pub fn validate_token_variable(provider: &str, name: &str) -> Result<(), String> {
+    if !is_variable_name(name) {
+        return Err(
+            "settings.token_env must name an environment variable ([A-Z_][A-Z0-9_]*)".to_owned(),
+        );
+    }
+    let prefix = token_variable_prefix(provider);
+    let reserved = name.ends_with("DATABASE_URL") || name.contains("_KEK");
+    if !name.starts_with(&prefix) || name.len() == prefix.len() || reserved {
+        return Err(format!(
+            "settings.token_env must name a variable in the collector's own namespace, \
+             {prefix}... (such as {prefix}API_TOKEN): a collector never reads a variable the \
+             worker holds for itself"
+        ));
+    }
+    Ok(())
+}
+
 /// Whether a URL's host is loopback: `localhost`, `127.0.0.0/8`, or `::1`.
 #[must_use]
 pub fn is_loopback(url: &url::Url) -> bool {
@@ -226,37 +274,76 @@ pub fn is_loopback(url: &url::Url) -> bool {
     }
 }
 
+/// A URL's origin for a message: scheme, host, and port, never its
+/// credentials, path, or query.
+fn origin(url: &url::Url) -> String {
+    let host = url.host_str().unwrap_or("no host");
+    url.port().map_or_else(
+        || format!("{}://{host}", url.scheme()),
+        |port| format!("{}://{host}:{port}", url.scheme()),
+    )
+}
+
 /// Parse and check an API base: `https`, or `http` on a loopback host; no
 /// credentials, query, or fragment. The returned base ends in `/`, so a
 /// method path joins under it.
 ///
 /// # Errors
 ///
-/// A message naming what is refused.
+/// A message naming what is refused. It names at most the base's scheme,
+/// host, and port: never the raw value, which may hold a password.
 pub fn validate_api_base(raw: &str) -> Result<url::Url, String> {
-    let mut url = url::Url::parse(raw).map_err(|error| format!("api base {raw:?}: {error}"))?;
+    let mut url =
+        url::Url::parse(raw).map_err(|error| format!("the api base is not a URL ({error})"))?;
+    if url.host().is_none() {
+        return Err("the api base names no host".to_owned());
+    }
+    let shown = origin(&url);
     match url.scheme() {
         "https" => {}
         "http" if is_loopback(&url) => {}
         "http" => {
             return Err(format!(
-                "api base {raw:?} is plain http to a host that is not loopback; use https"
+                "api base {shown} is plain http to a host that is not loopback; use https"
             ));
         }
-        other => return Err(format!("api base {raw:?} has scheme {other}; use https")),
-    }
-    if url.host().is_none() {
-        return Err(format!("api base {raw:?} names no host"));
+        other => return Err(format!("api base {shown} has scheme {other}; use https")),
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(format!("api base {raw:?} carries credentials"));
+        return Err(format!(
+            "api base {shown} carries credentials; a credential is only ever named by token_env"
+        ));
     }
     if url.query().is_some() || url.fragment().is_some() {
-        return Err(format!("api base {raw:?} carries a query or a fragment"));
+        return Err(format!("api base {shown} carries a query or a fragment"));
     }
     if !url.path().ends_with('/') {
         let path = format!("{}/", url.path());
         url.set_path(&path);
+    }
+    Ok(url)
+}
+
+/// [`validate_api_base`] for a collector: the host must be its provider's.
+///
+/// The base's host must be `pinned_host`, the provider's own API host,
+/// unless it is loopback (a local fake provider, a relay on the same host): a
+/// collector's credential is only ever sent to the provider that issued it.
+///
+/// # Errors
+///
+/// What [`validate_api_base`] refuses, and any other host.
+pub fn validate_provider_api_base(raw: &str, pinned_host: &str) -> Result<url::Url, String> {
+    let url = validate_api_base(raw)?;
+    let pinned = url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case(pinned_host));
+    if !pinned && !is_loopback(&url) {
+        return Err(format!(
+            "api base {} is not the provider's own API host {pinned_host}; the credential is \
+             only ever sent there, or to a loopback host",
+            origin(&url)
+        ));
     }
     Ok(url)
 }
@@ -561,12 +648,73 @@ mod tests {
             ("http://10.0.0.1/api", "not loopback"),
             ("ftp://slack.com/api", "scheme ftp"),
             ("https://user:pw@slack.com/api", "credentials"),
+            ("https://svc:Pa55word@relay.internal/api", "credentials"),
             ("https://slack.com/api?token=x", "query"),
             ("https://slack.com/api#x", "fragment"),
             ("not a url", "api base"),
         ] {
             let message = validate_api_base(bad).unwrap_err();
             assert!(message.contains(needle), "{bad}: {message}");
+            for part in ["pw@", "Pa55word", "token=x", "#x"] {
+                assert!(!message.contains(part), "{bad}: the message echoes {part}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_provider_base_is_the_providers_own_host_or_loopback() {
+        for good in [
+            "https://slack.com/api",
+            "https://SLACK.com/api/",
+            "http://127.0.0.1:8080/api",
+            "https://localhost:9/api",
+        ] {
+            validate_provider_api_base(good, "slack.com")
+                .unwrap_or_else(|error| panic!("{good}: {error}"));
+        }
+        for bad in [
+            "https://kek-sink.example/api",
+            "https://slack.com.evil.example/api",
+            "https://api.linear.app/graphql",
+        ] {
+            let message = validate_provider_api_base(bad, "slack.com").unwrap_err();
+            assert!(message.contains("slack.com"), "{bad}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_credential_variable_is_in_its_providers_own_namespace() {
+        for good in [
+            ("slack", "FLEET_RECALL_SLACK_BOT_TOKEN"),
+            ("linear", "FLEET_RECALL_LINEAR_API_KEY"),
+            ("granola", "FLEET_RECALL_GRANOLA_API_KEY"),
+        ] {
+            validate_token_variable(good.0, good.1).unwrap_or_else(|error| panic!("{error}"));
+        }
+        for (provider, bad) in [
+            ("slack", "FLEET_RECALL_CONTENT_KEK_HEX"),
+            ("slack", "FLEET_RECALL_DATABASE_URL"),
+            ("linear", "FLEET_RECALL_SLACK_BOT_TOKEN"),
+            ("granola", "GITHUB_TOKEN"),
+            ("slack", "FLEET_RECALL_SLACK_"),
+            ("slack", "FLEET_RECALL_SLACK_CONTROL_DATABASE_URL"),
+            ("slack", "FLEET_RECALL_SLACK_KEK_COPY"),
+            ("slack", "lower"),
+        ] {
+            let message = validate_token_variable(provider, bad).unwrap_err();
+            assert!(message.contains("settings.token_env"), "{bad}: {message}");
+        }
+        // No variable the worker reads for itself is in any collector's
+        // namespace.
+        for provider in ["slack", "linear", "granola", "docs"] {
+            for reserved in [
+                "FLEET_RECALL_CONTENT_KEK_HEX",
+                "FLEET_RECALL_DATABASE_URL",
+                "FLEET_RECALL_CONTROL_DATABASE_URL",
+                "FLEET_RECALL_PUBLICATION_DATABASE_URL",
+            ] {
+                assert!(validate_token_variable(provider, reserved).is_err());
+            }
         }
     }
 

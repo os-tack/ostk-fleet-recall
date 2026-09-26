@@ -84,7 +84,8 @@ use super::audience::{
 use super::cockroach::framed_sha256;
 use super::draft::CollectedItemDraftV1;
 use super::http::{
-    AuthSchemeV1, ProviderHttpV1, ProviderTokenV1, is_variable_name, validate_api_base,
+    AuthSchemeV1, ProviderHttpV1, ProviderTokenV1, validate_provider_api_base,
+    validate_token_variable,
 };
 use super::pull::{
     ContainerOutcomeV1, ListingBoundV1, PageStager, PartialReasonV1, PullCollectorV1,
@@ -102,6 +103,10 @@ use render::{
 
 /// The GraphQL endpoint a collector reads unless its settings say otherwise.
 pub const DEFAULT_LINEAR_API_URL: &str = "https://api.linear.app/graphql";
+
+/// The only host a collector sends its credential to, unless its base is
+/// loopback (a local fake provider).
+pub const LINEAR_API_HOST: &str = "api.linear.app";
 
 /// Seconds a sweep re-reads before its high-water mark, unless the settings
 /// say otherwise: what a change committed late with an earlier `updatedAt`
@@ -205,15 +210,14 @@ pub struct LinearSettingsV1 {
 ///
 /// # Errors
 ///
-/// What [`validate_api_base`] refuses, and an endpoint with no path.
+/// What [`validate_provider_api_base`] refuses, and an endpoint with no
+/// path.
 pub fn split_endpoint(raw: &str) -> std::result::Result<(String, String), String> {
-    let url = validate_api_base(raw)?;
+    let url = validate_provider_api_base(raw, LINEAR_API_HOST)?;
     let path = url.path().trim_end_matches('/').to_owned();
     let (parent, method) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
     if method.is_empty() {
-        return Err(format!(
-            "api url {raw:?} names no GraphQL endpoint path (such as /graphql)"
-        ));
+        return Err("the api url names no GraphQL endpoint path (such as /graphql)".to_owned());
     }
     let mut base = url;
     base.set_path(&format!("{parent}/"));
@@ -235,12 +239,7 @@ impl LinearSettingsV1 {
     }
 
     fn validate(&self) -> std::result::Result<(), String> {
-        if !is_variable_name(&self.token_env) {
-            return Err(
-                "settings.token_env must name an environment variable ([A-Z_][A-Z0-9_]*)"
-                    .to_owned(),
-            );
-        }
+        validate_token_variable(LINEAR_PROVIDER, &self.token_env)?;
         if self.teams.is_empty() || self.teams.len() > MAX_TEAMS {
             return Err(format!("settings.teams lists 1 to {MAX_TEAMS} team ids"));
         }

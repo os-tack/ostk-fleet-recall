@@ -686,10 +686,18 @@ and `NO_PROXY`:
   credential is never replayed to another origin;
 - the API base must be `https`, or `http` to a loopback host (a local fake
   provider, a relay on the same host), with no credentials, query, or
-  fragment, and a loopback base bypasses the proxy;
+  fragment, and a loopback base bypasses the proxy; a collector's base must
+  also be its provider's own API host (`slack.com`, `api.linear.app`,
+  `public-api.granola.ai`) unless it is loopback, and a refused base is
+  described by its origin, never echoed (it may hold a password);
 - the token is read from the environment variable the settings name
-  (`token_env`); it travels only as a sensitive `Authorization` header, and
-  neither the token nor the client prints it;
+  (`token_env`), which must be in the provider's own namespace
+  (`FLEET_RECALL_SLACK_...`, `FLEET_RECALL_LINEAR_...`,
+  `FLEET_RECALL_GRANOLA_...`): the sources file is less trusted than the
+  environment, so it can neither send a token to another host nor name a
+  variable the worker holds for itself (the content key, a database URL) as
+  a collector's credential; the token travels only as a sensitive
+  `Authorization` header, and neither the token nor the client prints it;
 - `post_graphql` returns a `4xx` other than `429` as an answer rather than
   an error, since a GraphQL API reports a refused credential or a rate limit
   in the body of a `400` or `401`; the collector reads the error codes and

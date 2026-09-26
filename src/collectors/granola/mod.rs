@@ -84,7 +84,8 @@ use super::audience::ProviderAudienceV1;
 use super::cockroach::framed_sha256;
 use super::draft::{CollectedItemDraftV1, DraftContainerV1};
 use super::http::{
-    AuthSchemeV1, ProviderHttpV1, ProviderTokenV1, is_variable_name, validate_api_base,
+    AuthSchemeV1, ProviderHttpV1, ProviderTokenV1, validate_provider_api_base,
+    validate_token_variable,
 };
 use super::pull::{
     ContainerOutcomeV1, ListingBoundV1, PageStager, PartialReasonV1, PullCollectorV1,
@@ -100,6 +101,10 @@ use render::{
 
 /// The API a collector reads unless its settings say otherwise.
 pub const DEFAULT_GRANOLA_API_BASE: &str = "https://public-api.granola.ai/v1";
+
+/// The only host a collector sends its credential to, unless its base is
+/// loopback (a local fake provider).
+pub const GRANOLA_API_HOST: &str = "public-api.granola.ai";
 
 /// The cursor domain of the notes sweep.
 pub const NOTES_CURSOR_DOMAIN: &str = "granola.notes";
@@ -225,12 +230,7 @@ impl GranolaSettingsV1 {
     }
 
     fn validate(&self) -> std::result::Result<(), String> {
-        if !is_variable_name(&self.token_env) {
-            return Err(
-                "settings.token_env must name an environment variable ([A-Z_][A-Z0-9_]*)"
-                    .to_owned(),
-            );
-        }
+        validate_token_variable(GRANOLA_PROVIDER, &self.token_env)?;
         match (self.folders.is_empty(), self.all_notes_visible_to_key) {
             (true, false) => {
                 return Err(
@@ -285,7 +285,8 @@ impl GranolaSettingsV1 {
                 "settings.page_size must be between 1 and {MAX_PAGE_SIZE}"
             ));
         }
-        validate_api_base(&self.api_base).map_err(|error| format!("settings.api_base: {error}"))?;
+        validate_provider_api_base(&self.api_base, GRANOLA_API_HOST)
+            .map_err(|error| format!("settings.api_base: {error}"))?;
         Ok(())
     }
 }
