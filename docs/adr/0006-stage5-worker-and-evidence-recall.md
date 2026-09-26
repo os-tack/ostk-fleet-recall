@@ -168,6 +168,13 @@ loosely related neighbour clears 0.18 depends on the model; a floor of its
 own for evidence, or a verdict over lexical hits alone, is an open
 calibration decision.
 
+**Consequence for lexical matches.** The lexical twin of the floor: a
+lexical row whose `ts_rank` is below 0.001 is a co-occurrence (the query's
+terms ten or more words apart), not a match, and does not count. A query
+whose only lexical matches rank below that cutoff has no hits and follows
+the readiness rules above, so its empty answer is `absent` or `unknown`
+exactly as a query with no lexical row at all.
+
 ## D5 — `kind=evidence` is additive, not fused into chunk RRF
 
 **Decision.** Evidence recall is a separate `kind` of the existing `recall`
@@ -188,12 +195,16 @@ are unchanged, and no evidence hit enters them.
   `min_score`, and `intent`; the server also refuses those and
   `include_history`. The `remember` tool is unchanged.
 - **search** returns `data {hits, readiness, sources, absence}`. A hit carries
-  its 64-hex content id, the lanes that matched it and their scores, its media
-  type, a 600-character snippet of the lexical tier's redacted recall text,
-  and the accepted event that first produced it. `warnings` name projection
-  lag, pending ingest, a disabled dense lane, failed or stale sources (with
-  their instances), a cut listing, and a query the model could not embed;
-  `diagnostics.retrieval` is `{tier: "evidence", lanes, dense_lane,
+  its 64-hex content id, the lanes that matched it and their scores and the
+  fused score, its media type, a 600-character snippet of the lexical tier's
+  redacted recall text, and the accepted event that first produced it. The
+  two lanes are each read five rows deep per hit asked for and fused by
+  reciprocal rank (K = 60, the chunk lanes' constant, applied to the
+  evidence lanes alone), so the hits are in fused order, highest `score`
+  first. `warnings` name projection lag, pending ingest, a disabled dense
+  lane, failed or stale sources (with their instances), a cut listing, and a
+  query the model could not embed; `diagnostics.retrieval` is `{tier:
+  "evidence", lanes, fusion: "rrf", dense_lane,
   dense_min_cosine_similarity}`; `conflict_coverage` is `not_evaluated`.
   A listed source's `kind` is its status row's stored `source_kind`. A kind
   this build does not know is listed as stored rather than failing the read,

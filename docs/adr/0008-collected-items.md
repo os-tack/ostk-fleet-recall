@@ -499,16 +499,21 @@ Per-principal audiences, with clearance checked inside SQL, are deferred.
   never is. Each lane keeps each version's best part (`DISTINCT ON`, the
   presented tier's copy first on a tie). The dense lane follows evidence
   recall's model-restricted pattern: an approximate nearest-neighbour
-  subquery over five candidates per hit asked for, then the join, the model
-  filter, and the visibility filter outside it; a dense match below the
-  0.18 cosine floor does not count. A hit carries the item and version ids,
+  subquery, then the join, the model filter, and the visibility filter
+  outside it; a dense match below the 0.18 cosine floor does not count.
+  Each lane is read five rows deep per hit asked for, a lexical row whose
+  `ts_rank` is below 0.001 is a co-occurrence rather than a match and does
+  not count, and the two lanes are fused by reciprocal rank (K = 60, the
+  chunk lanes' constant), normalized so a version first in both lanes
+  scores 1.0; the hits are served in fused order and each carries that
+  `score`. A hit carries the item and version ids,
   the part's version URI, provider, object kind, external id, title,
   snippet, container (with its current label), the attested author,
   provider times, version marker, order, and lifecycle, the part, the
   provider URL, the trust tier the part came through, every channel that
   admitted the version, whether it is current, the accepted event and body,
-  both lane scores, how many other versions the item has, and the head's
-  `disagreement`.
+  both lane scores and the fused score, how many other versions the item
+  has, and the head's `disagreement`.
 - **Get** (`action=get`, `kind=item`) takes a hit's `item_id` (64 hex), a
   part's version URI (`uri`), or the item's provider URL, and returns the
   item: the presented version's parts in order, every other version the

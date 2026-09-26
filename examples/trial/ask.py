@@ -22,6 +22,7 @@ def compact_hit(hit):
         "container": ((src.get("container") or item.get("container") or {}).get("label")),
         "author": author,
         "title": title,
+        "score": src.get("score"),
         "matched_by": src.get("matched_by"),
         "lex": src.get("lexical_score"),
         "dense": src.get("dense_similarity"),
