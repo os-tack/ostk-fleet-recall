@@ -794,7 +794,8 @@ impl EvidenceRecall for CockroachEvidenceRecall {
         let hits = self
             .hydrate(fused.into_iter().map(ScoredHitV1::from).collect(), state)
             .await?;
-        let absence = absence_verdict(hits.len(), lexical_terms, &readiness, &sources);
+        let votes: Vec<_> = hits.iter().map(EvidenceHitV1::vote).collect();
+        let absence = absence_verdict(&votes, lexical_terms, &readiness, &sources);
         Ok(EvidenceSearchV1 {
             hits,
             readiness,

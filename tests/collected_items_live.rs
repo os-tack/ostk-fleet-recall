@@ -30,7 +30,7 @@ use ostk_fleet_recall::collectors::status::{
 };
 use ostk_fleet_recall::evidence_recall::{
     AbsenceReasonV1, AbsenceVerdictV1, CockroachEvidenceRecall, ContentTrustV1,
-    EvidenceRecall as _, EvidenceSourceKindV1, probe_evidence_recall,
+    EvidenceRecall as _, EvidenceSourceKindV1, PresentByV1, probe_evidence_recall,
 };
 use ostk_fleet_recall::memory_contracts::collected_item::{
     BoundedTextV1, COLLECTED_ITEM_MEDIA_TYPE, CollectedItemInputV1, CollectionModeV1,
@@ -621,6 +621,7 @@ async fn live_stage_drain_project_recall_when_configured() {
         .await
         .unwrap();
     assert_eq!(answer.absence.verdict, AbsenceVerdictV1::Present);
+    assert_eq!(answer.absence.present_by, Some(PresentByV1::Lexical));
     assert!(answer.hits.iter().all(|hit| {
         hit.media_type == COLLECTED_ITEM_MEDIA_TYPE
             && hit.content_trust == Some(ContentTrustV1::UntrustedThirdParty)

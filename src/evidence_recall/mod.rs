@@ -24,8 +24,16 @@
 //!
 //! # The absence verdict
 //!
-//! Any hit makes the verdict `present`. With no hit, the verdict is `absent`
-//! only when all of these hold (see [`absence_verdict`]):
+//! The verdict is anchored on the lexical lane. A hit that matched the
+//! query's terms makes it `present` (`present_by: lexical`); a dense-only
+//! hit makes it `present` only when its cosine similarity reaches
+//! [`ABSENCE_DENSE_MIN_COSINE_SIMILARITY`] and its body may vote that way
+//! (a raw git fact, [`DENSE_VOTE_EXCLUDED_MEDIA_TYPES`], never does;
+//! `present_by: dense`, or `both`). Any other hit is a weak neighbour: it is
+//! listed, counted in `weak_neighbours`, and its similarity is reported in
+//! `strongest_dense_similarity`, but it decides nothing and hides no
+//! reason. With no voting hit, the verdict is `absent` only when all of
+//! these hold (see [`absence_verdict`]):
 //!
 //! * the query has lexical terms, because absence is defined over the lexical
 //!   tier;
@@ -144,7 +152,10 @@ pub(crate) use cockroach::{
     decode_collector_source_row, dense_lane, digest, has_lexical_terms, listing_limit, may_read,
 };
 pub use serve::start_evidence_recall;
-pub use verdict::{absence_verdict, lane_match};
+pub use verdict::{
+    ABSENCE_DENSE_MIN_COSINE_SIMILARITY, DENSE_VOTE_EXCLUDED_MEDIA_TYPES, HitVoteV1,
+    absence_verdict, lane_match,
+};
 
 /// First schema evidence recall can read: migration 30 creates the worker
 /// status table the absence verdict depends on.
@@ -443,6 +454,16 @@ pub struct EvidenceHitV1 {
     pub item: Option<EvidenceItemV1>,
 }
 
+impl EvidenceHitV1 {
+    /// What this hit contributes to the absence verdict: its lanes, its
+    /// dense similarity, and whether its media type may vote on a dense-only
+    /// match ([`DENSE_VOTE_EXCLUDED_MEDIA_TYPES`]).
+    #[must_use]
+    pub fn vote(&self) -> HitVoteV1 {
+        HitVoteV1::for_media_type(self.matched_by, self.dense_similarity, &self.media_type)
+    }
+}
+
 /// One body's full recall text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EvidenceBodyV1 {
@@ -511,8 +532,21 @@ pub enum AbsenceReasonV1 {
     CollectorStateUnreadable,
 }
 
+/// Which lane made a `present` verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresentByV1 {
+    /// A hit matched the query's terms.
+    Lexical,
+    /// No hit matched lexically, but a dense-only neighbour whose body may
+    /// vote reached [`ABSENCE_DENSE_MIN_COSINE_SIMILARITY`].
+    Dense,
+    /// Both.
+    Both,
+}
+
 /// The absence verdict of one search.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AbsenceV1 {
     pub verdict: AbsenceVerdictV1,
     /// Empty unless the verdict is `unknown`.
@@ -520,6 +554,22 @@ pub struct AbsenceV1 {
     /// The oldest last completed check among the active sources: what the
     /// answer can be no newer than. `None` when no source has completed one.
     pub as_of: Option<DateTime<Utc>>,
+    /// Which lane made the verdict `present`; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub present_by: Option<PresentByV1>,
+    /// The highest dense similarity among the hits, voting or not, so an
+    /// agent can judge a neighbourhood the verdict did not count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strongest_dense_similarity: Option<f32>,
+    /// Hits that voted for nothing: dense-only neighbours below the bound,
+    /// or of a body that may not vote. They are still listed as hits.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub weak_neighbours: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
+const fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 /// One search's answer.

@@ -1264,12 +1264,8 @@ impl ItemRecall for CockroachItemRecall {
             None => Vec::new(),
         };
         let hits = self.hydrate(fuse(&lexical, &dense, request.limit)).await?;
-        let absence = absence_verdict(
-            hits.len(),
-            lexical_terms,
-            &readiness.as_evidence(),
-            &sources,
-        );
+        let votes: Vec<_> = hits.iter().map(ItemHitV1::vote).collect();
+        let absence = absence_verdict(&votes, lexical_terms, &readiness.as_evidence(), &sources);
         Ok(ItemSearchV1 {
             hits,
             readiness,

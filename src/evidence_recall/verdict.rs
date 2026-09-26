@@ -1,17 +1,97 @@
 //! The pure parts of an evidence answer: what the fused lanes said about a
-//! hit, and what an empty answer means.
+//! hit, which hits vote `present`, and what an answer nothing voted for
+//! means.
 
 use std::collections::BTreeSet;
 
 use crate::memory_contracts::coverage::CoverageCompletenessV1;
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::projectors::FusedHitV1;
+use crate::projectors::lexical::GIT_FACT_MEDIA_TYPE;
 use crate::worker::WorkerSourceOutcomeV1;
 
 use super::{
     AbsenceReasonV1, AbsenceV1, AbsenceVerdictV1, EvidenceMatchV1, EvidenceReadinessV1,
-    EvidenceSourcesV1,
+    EvidenceSourcesV1, PresentByV1,
 };
+
+/// The cosine similarity a dense-only hit needs before it votes `present`.
+///
+/// The retrieval floor (0.18, [`crate::store::cockroach::RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY`])
+/// decides what is returned; this bound decides what a returned neighbour
+/// proves. Measured with `potion-retrieval-32M` over the trial corpus
+/// (`docs/TRIAL_RETEST_2026-09-26.md`, issue 8): correct answers to the
+/// trial questions scored 0.45 to 0.78, loose in-domain neighbours of
+/// never-discussed topics 0.22 to 0.40 (Helm 0.257, Oracle 0.269, GDPR
+/// 0.400, tokio 0.403), and raw git facts attract nonsense at about 0.29.
+/// Re-measured on 2026-09-26 with this bound in place, on the same stack
+/// with more documents collected: the never-discussed neighbours read
+/// 0.257, 0.269, 0.430 (GDPR), 0.427 (tokio) and 0.291 (the git fact), all
+/// `absent`; the natural phrasings of Q1 and Q3 found their answers
+/// dense-only at 0.492 and 0.496 (`present_by: dense`); the natural
+/// phrasings of Q5 (0.338, over `source: linear`) and Q10 (0.411) read
+/// `absent` with the right answer listed as a weak neighbour, and `present`
+/// on their retry wording, which matches lexically. Lowering the bound to
+/// 0.42 would rescue neither of those and would call GDPR and tokio
+/// `present`, so it stays at 0.45. No single value separates a correct
+/// answer's dense neighbourhood from a never-discussed topic's, which is
+/// why the verdict is anchored on the lexical lane and this bound only lets
+/// a strong dense-only neighbour add to it.
+pub const ABSENCE_DENSE_MIN_COSINE_SIMILARITY: f32 = 0.45;
+
+/// Media types whose bodies never vote `present` on a dense-only match.
+///
+/// A raw git fact (a commit's author, message, and paths as one record) is
+/// the neighbour a nonsense query lands on at about 0.29, and on a real
+/// question it is rarely the answer a document or a message is; it still
+/// votes lexically, and it is still returned as a hit.
+pub const DENSE_VOTE_EXCLUDED_MEDIA_TYPES: &[&str] = &[GIT_FACT_MEDIA_TYPE];
+
+/// What one hit contributes to the absence verdict.
+///
+/// [`super::EvidenceHitV1::vote`] and [`crate::item_recall::ItemHitV1::vote`]
+/// derive it from a hit; the verdict never reads a hit's text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HitVoteV1 {
+    /// The lanes that matched the hit after the lexical cutoff and the dense
+    /// floor.
+    pub matched_by: EvidenceMatchV1,
+    /// The dense lane's cosine similarity, when it matched.
+    pub dense_similarity: Option<f32>,
+    /// Whether the body's media type may vote on a dense-only match
+    /// ([`DENSE_VOTE_EXCLUDED_MEDIA_TYPES`]).
+    pub dense_may_vote: bool,
+}
+
+impl HitVoteV1 {
+    /// A hit's vote for a body of `media_type`.
+    #[must_use]
+    pub fn for_media_type(
+        matched_by: EvidenceMatchV1,
+        dense_similarity: Option<f32>,
+        media_type: &str,
+    ) -> Self {
+        Self {
+            matched_by,
+            dense_similarity,
+            dense_may_vote: !DENSE_VOTE_EXCLUDED_MEDIA_TYPES.contains(&media_type),
+        }
+    }
+
+    const fn votes_lexically(self) -> bool {
+        matches!(
+            self.matched_by,
+            EvidenceMatchV1::Lexical | EvidenceMatchV1::LexicalAndDense
+        )
+    }
+
+    fn votes_densely(self) -> bool {
+        self.dense_may_vote
+            && self
+                .dense_similarity
+                .is_some_and(|similarity| similarity >= ABSENCE_DENSE_MIN_COSINE_SIMILARITY)
+    }
+}
 
 /// A fused hit before hydration: the body, the lanes that matched it after
 /// the lexical cutoff and the dense floor (both applied by
@@ -51,11 +131,19 @@ pub const fn lane_match(lexical: bool, dense: bool) -> EvidenceMatchV1 {
     }
 }
 
-/// What an answer with `hit_count` hits means, given what was read before the
-/// lanes ran. See the module documentation of `evidence_recall` for the rule.
+/// What an answer whose hits cast `votes` means, given what was read before
+/// the lanes ran. See the module documentation of `evidence_recall` for the
+/// rule.
+///
+/// The verdict is `present` when any hit matched lexically, or when a
+/// dense-only hit whose body may vote reached
+/// [`ABSENCE_DENSE_MIN_COSINE_SIMILARITY`]; `present_by` says which. A hit
+/// that did neither is a weak neighbour: it is counted, its similarity is
+/// reported, and it neither makes the answer `present` nor hides a reason
+/// the answer is `unknown`.
 #[must_use]
 pub fn absence_verdict(
-    hit_count: usize,
+    votes: &[HitVoteV1],
     lexical_terms: bool,
     readiness: &EvidenceReadinessV1,
     sources: &EvidenceSourcesV1,
@@ -65,11 +153,32 @@ pub fn absence_verdict(
         .iter()
         .filter_map(|source| source.last_checked_at)
         .min();
-    if hit_count > 0 {
+    let lexical = votes.iter().any(|vote| vote.votes_lexically());
+    let dense = votes.iter().any(|vote| vote.votes_densely());
+    let present_by = match (lexical, dense) {
+        (true, true) => Some(PresentByV1::Both),
+        (true, false) => Some(PresentByV1::Lexical),
+        (false, true) => Some(PresentByV1::Dense),
+        (false, false) => None,
+    };
+    let strongest_dense_similarity = votes
+        .iter()
+        .filter_map(|vote| vote.dense_similarity)
+        .filter(|similarity| !similarity.is_nan())
+        .reduce(f32::max);
+    let weak_neighbours = votes
+        .iter()
+        .filter(|vote| !(vote.votes_lexically() || vote.votes_densely()))
+        .count();
+    let weak_neighbours = u32::try_from(weak_neighbours).unwrap_or(u32::MAX);
+    if present_by.is_some() {
         return AbsenceV1 {
             verdict: AbsenceVerdictV1::Present,
             reasons: Vec::new(),
             as_of,
+            present_by,
+            strongest_dense_similarity,
+            weak_neighbours,
         };
     }
     let mut reasons = BTreeSet::new();
@@ -128,6 +237,9 @@ pub fn absence_verdict(
         },
         reasons: reasons.into_iter().collect(),
         as_of,
+        present_by: None,
+        strongest_dense_similarity,
+        weak_neighbours,
     }
 }
 
@@ -198,7 +310,7 @@ mod tests {
         readiness: &EvidenceReadinessV1,
         sources: &EvidenceSourcesV1,
     ) -> Vec<AbsenceReasonV1> {
-        let absence = absence_verdict(0, lexical_terms, readiness, sources);
+        let absence = absence_verdict(&[], lexical_terms, readiness, sources);
         assert_eq!(
             absence.verdict == AbsenceVerdictV1::Absent,
             absence.reasons.is_empty(),
@@ -207,19 +319,150 @@ mod tests {
         absence.reasons
     }
 
+    /// A vote of a body that may vote densely.
+    const fn vote(matched_by: EvidenceMatchV1, dense_similarity: Option<f32>) -> HitVoteV1 {
+        HitVoteV1 {
+            matched_by,
+            dense_similarity,
+            dense_may_vote: true,
+        }
+    }
+
+    fn lexical() -> HitVoteV1 {
+        vote(EvidenceMatchV1::Lexical, None)
+    }
+
+    fn dense(similarity: f32) -> HitVoteV1 {
+        vote(EvidenceMatchV1::Dense, Some(similarity))
+    }
+
+    fn verdict(votes: &[HitVoteV1]) -> AbsenceV1 {
+        absence_verdict(votes, true, &current(), &two_healthy())
+    }
+
     #[test]
-    fn a_hit_is_present_whatever_else_holds() {
+    fn a_lexical_hit_is_present_whatever_else_holds() {
         let mut lagging = current();
         lagging.events_awaiting_body_projection = 3;
         lagging.lexical_current = false;
-        let absence = absence_verdict(1, false, &lagging, &listing(Vec::new()));
+        let absence = absence_verdict(&[lexical()], false, &lagging, &listing(Vec::new()));
         assert_eq!(absence.verdict, AbsenceVerdictV1::Present);
+        assert_eq!(absence.present_by, Some(PresentByV1::Lexical));
         assert!(absence.reasons.is_empty());
+        assert_eq!(absence.strongest_dense_similarity, None);
+        assert_eq!(absence.weak_neighbours, 0);
+    }
+
+    #[test]
+    fn a_dense_only_neighbour_below_the_bound_is_a_weak_neighbour() {
+        let absence = verdict(&[dense(0.30)]);
+        assert_eq!(absence.verdict, AbsenceVerdictV1::Absent);
+        assert_eq!(absence.present_by, None);
+        assert!(absence.reasons.is_empty());
+        assert_eq!(absence.strongest_dense_similarity, Some(0.30));
+        assert_eq!(absence.weak_neighbours, 1);
+    }
+
+    #[test]
+    fn a_dense_only_neighbour_at_the_bound_is_present_by_dense() {
+        let absence = verdict(&[dense(0.60)]);
+        assert_eq!(absence.verdict, AbsenceVerdictV1::Present);
+        assert_eq!(absence.present_by, Some(PresentByV1::Dense));
+        assert_eq!(absence.strongest_dense_similarity, Some(0.60));
+        assert_eq!(absence.weak_neighbours, 0);
+
+        let exactly = verdict(&[dense(ABSENCE_DENSE_MIN_COSINE_SIMILARITY)]);
+        assert_eq!(exactly.present_by, Some(PresentByV1::Dense));
+        let just_under = verdict(&[dense(0.4499)]);
+        assert_eq!(just_under.verdict, AbsenceVerdictV1::Absent);
+        assert_eq!(just_under.weak_neighbours, 1);
+    }
+
+    #[test]
+    fn a_both_lane_hit_is_present_by_both_only_when_its_dense_part_votes() {
+        let both = verdict(&[vote(EvidenceMatchV1::LexicalAndDense, Some(0.60))]);
+        assert_eq!(both.present_by, Some(PresentByV1::Both));
+        assert_eq!(both.weak_neighbours, 0);
+        let lexical_only = verdict(&[vote(EvidenceMatchV1::LexicalAndDense, Some(0.30))]);
+        assert_eq!(lexical_only.present_by, Some(PresentByV1::Lexical));
+        assert_eq!(lexical_only.strongest_dense_similarity, Some(0.30));
+        assert_eq!(
+            lexical_only.weak_neighbours, 0,
+            "a lexical voter is never weak"
+        );
+        // Voters of each lane in different hits are still both.
+        let mixed = verdict(&[lexical(), dense(0.60), dense(0.30)]);
+        assert_eq!(mixed.present_by, Some(PresentByV1::Both));
+        assert_eq!(mixed.strongest_dense_similarity, Some(0.60));
+        assert_eq!(mixed.weak_neighbours, 1);
+    }
+
+    #[test]
+    fn a_git_fact_never_votes_on_a_dense_match_but_still_votes_lexically() {
+        assert!(DENSE_VOTE_EXCLUDED_MEDIA_TYPES.contains(&GIT_FACT_MEDIA_TYPE));
+        let fact =
+            HitVoteV1::for_media_type(EvidenceMatchV1::Dense, Some(0.60), GIT_FACT_MEDIA_TYPE);
+        assert!(!fact.dense_may_vote);
+        let absence = verdict(&[fact]);
+        assert_eq!(absence.verdict, AbsenceVerdictV1::Absent);
+        assert_eq!(absence.present_by, None);
+        assert_eq!(absence.strongest_dense_similarity, Some(0.60));
+        assert_eq!(absence.weak_neighbours, 1);
+
+        let lexical_fact =
+            HitVoteV1::for_media_type(EvidenceMatchV1::Lexical, None, GIT_FACT_MEDIA_TYPE);
+        assert_eq!(
+            verdict(&[lexical_fact]).present_by,
+            Some(PresentByV1::Lexical)
+        );
+        let document = HitVoteV1::for_media_type(
+            EvidenceMatchV1::Dense,
+            Some(0.60),
+            "application.transcript-turn-v1",
+        );
+        assert!(document.dense_may_vote);
+        assert_eq!(verdict(&[document]).present_by, Some(PresentByV1::Dense));
+    }
+
+    #[test]
+    fn a_weak_neighbour_never_hides_a_reason() {
+        let mut lagging = current();
+        lagging.events_awaiting_body_projection = 1;
+        let absence = absence_verdict(&[dense(0.30)], true, &lagging, &two_healthy());
+        assert_eq!(absence.verdict, AbsenceVerdictV1::Unknown);
+        assert_eq!(absence.reasons, [AbsenceReasonV1::BodyProjectionLag]);
+        assert_eq!(absence.present_by, None);
+        assert_eq!(absence.strongest_dense_similarity, Some(0.30));
+        assert_eq!(absence.weak_neighbours, 1);
+    }
+
+    #[test]
+    fn an_empty_absent_answer_serializes_as_it_always_did() {
+        let absence = verdict(&[]);
+        assert_eq!(absence.verdict, AbsenceVerdictV1::Absent);
+        let value = serde_json::to_value(&absence).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["as_of", "reasons", "verdict"]);
+
+        let weak = serde_json::to_value(verdict(&[dense(0.30)])).unwrap();
+        assert_eq!(weak["verdict"], "absent");
+        assert_eq!(weak["weak_neighbours"], 1);
+        assert!((weak["strongest_dense_similarity"].as_f64().unwrap() - 0.30).abs() < 1e-6);
+        assert!(weak.get("present_by").is_none());
+        let present = serde_json::to_value(verdict(&[lexical()])).unwrap();
+        assert_eq!(present["present_by"], "lexical");
+        assert!(present.get("weak_neighbours").is_none());
     }
 
     #[test]
     fn no_hit_over_a_current_fresh_complete_scope_is_absent() {
-        let absence = absence_verdict(0, true, &current(), &two_healthy());
+        let absence = absence_verdict(&[], true, &current(), &two_healthy());
         assert_eq!(absence.verdict, AbsenceVerdictV1::Absent);
         assert_eq!(
             absence.as_of,
@@ -311,7 +554,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            absence_verdict(0, true, &current(), &sources).as_of,
+            absence_verdict(&[], true, &current(), &sources).as_of,
             Some(instant(40)),
             "a source never checked does not set as_of"
         );
@@ -371,7 +614,7 @@ mod tests {
         let mut incomplete = sources;
         incomplete.active[1].coverage.as_mut().unwrap().completeness =
             CoverageCompletenessV1::Partial;
-        let absence = absence_verdict(0, true, &current(), &incomplete);
+        let absence = absence_verdict(&[], true, &current(), &incomplete);
         assert_eq!(absence.verdict, AbsenceVerdictV1::Unknown);
         assert_eq!(absence.reasons, [AbsenceReasonV1::IncompleteCoverage]);
 
@@ -427,9 +670,10 @@ mod tests {
             reasons(true, &readiness, &two_healthy()),
             [AbsenceReasonV1::CollectorStateUnreadable]
         );
-        // A hit is still present: only the empty answer loses its meaning.
+        // A lexical hit is still present: only the empty answer loses its
+        // meaning.
         assert_eq!(
-            absence_verdict(1, true, &readiness, &two_healthy()).verdict,
+            absence_verdict(&[lexical()], true, &readiness, &two_healthy()).verdict,
             AbsenceVerdictV1::Present
         );
     }

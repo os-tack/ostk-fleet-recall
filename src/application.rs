@@ -12,8 +12,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::evidence_recall::{
-    EvidenceDenseLaneV1, EvidenceReadinessV1, EvidenceRecall, EvidenceSearchV1, EvidenceSourceV1,
-    EvidenceSourcesV1, MAX_EVIDENCE_SEARCH_LIMIT, MAX_EVIDENCE_SOURCES,
+    ABSENCE_DENSE_MIN_COSINE_SIMILARITY, EvidenceDenseLaneV1, EvidenceReadinessV1, EvidenceRecall,
+    EvidenceSearchV1, EvidenceSourceV1, EvidenceSourcesV1, MAX_EVIDENCE_SEARCH_LIMIT,
+    MAX_EVIDENCE_SOURCES,
 };
 use crate::item_recall::{
     ItemRecall, ItemReferenceV1, ItemSearchRequestV1, ItemSearchV1, MAX_ITEM_SEARCH_LIMIT,
@@ -2646,6 +2647,7 @@ fn evidence_search_result(search: EvidenceSearchV1) -> RecallResult {
             "fusion": "rrf",
             "dense_lane": dense_lane,
             "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
+            "absence_dense_min_cosine_similarity": ABSENCE_DENSE_MIN_COSINE_SIMILARITY,
         }),
     );
     result
@@ -2712,6 +2714,7 @@ fn item_search_result(search: ItemSearchV1) -> RecallResult {
             "fusion": "rrf",
             "dense_lane": dense_lane,
             "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
+            "absence_dense_min_cosine_similarity": ABSENCE_DENSE_MIN_COSINE_SIMILARITY,
         }),
     );
     result
@@ -4774,7 +4777,7 @@ mod tests {
             limit: usize,
         ) -> crate::Result<EvidenceSearchV1> {
             use crate::evidence_recall::{
-                AbsenceV1, AbsenceVerdictV1, EvidenceHitV1, EvidenceMatchV1,
+                AbsenceV1, AbsenceVerdictV1, EvidenceHitV1, EvidenceMatchV1, PresentByV1,
             };
             self.searches
                 .lock()
@@ -4805,6 +4808,9 @@ mod tests {
                     verdict: AbsenceVerdictV1::Present,
                     reasons: Vec::new(),
                     as_of: Some(Utc::now()),
+                    present_by: Some(PresentByV1::Lexical),
+                    strongest_dense_similarity: None,
+                    weak_neighbours: 0,
                 },
             })
         }
@@ -4894,6 +4900,11 @@ mod tests {
         assert_eq!(result.data["hits"][0]["id"], "ab".repeat(32));
         assert_eq!(result.data["hits"][0]["matched_by"], "lexical");
         assert_eq!(result.data["absence"]["verdict"], "present");
+        assert_eq!(result.data["absence"]["present_by"], "lexical");
+        assert!(
+            result.data["absence"].get("weak_neighbours").is_none(),
+            "no weak neighbour, no field"
+        );
         assert_eq!(result.data["readiness"]["dense_lane"], "used");
         assert_eq!(
             result.data["sources"]["active"][0]["last_outcome"],
@@ -4907,6 +4918,10 @@ mod tests {
         assert_eq!(
             retrieval["dense_min_cosine_similarity"],
             json!(RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY)
+        );
+        assert_eq!(
+            retrieval["absence_dense_min_cosine_similarity"],
+            json!(ABSENCE_DENSE_MIN_COSINE_SIMILARITY)
         );
         assert_eq!(
             warning_codes(&result.warnings),

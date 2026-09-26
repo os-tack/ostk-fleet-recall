@@ -312,6 +312,28 @@ impl ChunkEmbedder for StubEmbedder {
     }
 }
 
+/// A query vector whose cosine similarity with `target` is exactly `cosine`:
+/// the target's direction mixed with a fixed direction made orthogonal to it
+/// (Gram-Schmidt), so a test can land a dense-only neighbour at a chosen
+/// similarity, between the retrieval floor and the absence bound.
+#[must_use]
+pub fn vector_toward(target: &[f32], cosine: f32) -> Vec<f32> {
+    let norm = |vector: &[f32]| vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let target_norm = norm(target);
+    let unit: Vec<f32> = target.iter().map(|x| x / target_norm).collect();
+    let base: Vec<f32> = (0..target.len())
+        .map(|index| if index % 3 == 0 { 1.0 } else { -0.5 })
+        .collect();
+    let dot: f32 = base.iter().zip(&unit).map(|(b, u)| b * u).sum();
+    let orthogonal: Vec<f32> = base.iter().zip(&unit).map(|(b, u)| b - dot * u).collect();
+    let orthogonal_norm = norm(&orthogonal);
+    let rest = cosine.mul_add(-cosine, 1.0).sqrt();
+    unit.iter()
+        .zip(&orthogonal)
+        .map(|(u, o)| cosine * u + rest * o / orthogonal_norm)
+        .collect()
+}
+
 /// One installed scope and the sources a worker runs for it.
 pub struct WorkerFixture {
     pub installed: InstalledAuthority,
