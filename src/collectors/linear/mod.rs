@@ -20,8 +20,12 @@
 //!    visibility is admitted `operator_declared` only when
 //!    `audience.private_containers` lists the team, else the team is never
 //!    read and its observation withdraws what was admitted through it (it is
-//!    then outside the pass's domain). A configured team the credential cannot
-//!    see is partial.
+//!    then outside the pass's domain). A configured team the credential
+//!    cannot see (deleted, or made private to people the credential's user is
+//!    not among) is a narrowing too, unless listed: it is observed as
+//!    restricted, which withdraws it, and is outside the domain. A listed one
+//!    the credential cannot see is partial. Nothing either held is held
+//!    current.
 //! 3. The team's issues, then the comments on its issues, are each swept with
 //!    `updatedAt` after the sweep's high-water mark less `overlap_seconds`
 //!    (the whole team the first time), `orderBy: updatedAt`,
@@ -33,20 +37,40 @@
 //!    newest `updatedAt` it read (never past the pass's instant), unless it
 //!    read a node it could not stage: then it is read again from where it
 //!    started.
-//! 4. Every issue and comment becomes a draft ([`render`]). One whose content
-//!    and lifecycle the memory already holds is kept at its known version,
-//!    even when its `updatedAt` moved (a label or an assignee changed), so an
-//!    overlap re-read, or a change that is not content, mints nothing. Every
-//!    item the memory holds in a team the pass read, and that the sweeps did
-//!    not return, is unchanged since the sweeps' start and is held current
-//!    too, so the pass's manifest names every current item.
-//! 5. A team is complete when both sweeps reached their end and everything
-//!    the pass holds current in it was admitted.
+//! 4. Every issue and comment becomes a draft ([`render`]). One whose
+//!    content, lifecycle, and team the memory already holds, and that is not
+//!    withdrawn, is kept at its known version, even when its `updatedAt`
+//!    moved (a label or an assignee changed), so an overlap re-read, or a
+//!    change that is not content, mints nothing.
+//! 5. **Moves in.** An issue staged live that the memory held in another
+//!    team, in the trash, withdrawn, or never (when it is older than the
+//!    comment sweep's mark) has comments whose `updatedAt` the comment sweep
+//!    has passed: the team's cursor queues it, and after the sweeps each
+//!    queued issue's comments are read whole (`issue: { id }`, no time
+//!    bound). Past [`MAX_BACKFILL`] queued issues, the team's comment sweep
+//!    reads every comment instead.
+//! 6. **Moves out.** The sweeps are filtered by team, so they never return an
+//!    issue moved into a team the pass does not admit, or one the credential
+//!    can no longer see. Each pass checks a rotating batch of the issues the
+//!    memory holds in the teams it read that the sweeps did not return
+//!    (`FleetRecallLinearIssueTeams`, [`VERIFY_CURSOR_DOMAIN`]): each one now
+//!    in a team the pass does not admit, or missing from the answer, is
+//!    withdrawn with every comment the memory holds on it, with content-free
+//!    observations ([`super::pull::withdrawal`]); a later read of it in an
+//!    admitted team lifts that.
+//! 7. Every item the memory holds in a team the pass read, and that the
+//!    sweeps did not return, is unchanged since the sweeps' start and is held
+//!    current too, unless it is withdrawn, so the pass's manifest names every
+//!    current item.
+//! 8. A team is complete when both sweeps and its queued comment reads
+//!    reached their end and everything the pass holds current in it was
+//!    admitted.
 //!
-//! A trashed issue is a `trashed` tombstone, which hides it; an archived one
-//! stays searchable. An issue moved into a team the collector does not read
-//! keeps its last version until a hint (a webhook) re-fetches it; a
-//! permanently deleted comment is only seen by a webhook.
+//! A trashed issue is a `trashed` tombstone, which hides it, and Linear's
+//! trash hides everything on it: the comments the memory holds on it are
+//! withdrawn, a comment on it is never staged, and restoring it reads its
+//! comments whole again, which lifts them. An archived issue stays
+//! searchable. A permanently deleted comment is only seen by a webhook.
 //!
 //! # Partial reads
 //!
@@ -71,7 +95,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{FleetError, Result};
 use crate::memory_contracts::collected_item::{
-    CollectionModeV1, ContainerKindV1, ObjectKindV1, ProviderKindV1,
+    CollectionModeV1, ContainerKindV1, ObjectKindV1, ProviderKindV1, timestamp_micros,
 };
 use crate::memory_contracts::coverage::CoverageProofMethodV1;
 use crate::memory_contracts::digest::Sha256Digest;
@@ -89,16 +113,17 @@ use super::http::{
 };
 use super::pull::{
     ContainerOutcomeV1, ListingBoundV1, PageStager, PartialReasonV1, PullCollectorV1,
-    PullPassInputV1, PullPassOutcomeV1, PulledItemV1,
+    PullPassInputV1, PullPassOutcomeV1, PulledItemV1, WithdrawnItemV1, withdrawal,
 };
 use super::sink::{ContainerObservationV1, CursorAdvanceV1, DeadLetterReasonV1, KnownVersionV1};
 use graphql::{
-    LinearApiV1, LinearCallErrorV1, LinearCommentV1, LinearIssueV1, LinearTeamV1, PageNodeV1,
-    RateLimitV1,
+    LinearApiV1, LinearCallErrorV1, LinearCommentV1, LinearIssueV1, LinearTeamV1,
+    MAX_ISSUE_TEAMS_BATCH, PageNodeV1, RateLimitV1,
 };
 use render::{
     COMMENT_OBJECT_KIND, CommentDraftV1, ISSUE_OBJECT_KIND, LINEAR_PROVIDER, LinearTeamContextV1,
-    TEAM_CONTAINER_KIND, comment_draft, is_lowercase_uuid, issue_draft,
+    TEAM_CONTAINER_KIND, comment_draft, is_lowercase_uuid, issue_draft, linear_object_kind,
+    linear_order,
 };
 
 /// The GraphQL endpoint a collector reads unless its settings say otherwise.
@@ -140,11 +165,23 @@ pub fn team_cursor_domain(team: &str) -> String {
     format!("linear.team:{team}")
 }
 
+/// The cursor domain of the rotation that checks where held issues are now.
+pub const VERIFY_CURSOR_DOMAIN: &str = "linear.verify";
+
+/// Issues a team's cursor queues for a whole read of their comments, at
+/// most; past it, the team's comment sweep reads every comment instead.
+const MAX_BACKFILL: usize = 64;
+
 /// Every counter a Linear pass reports.
-pub const LINEAR_COUNTERS: [&str; 21] = [
+pub const LINEAR_COUNTERS: [&str; 26] = [
     "api_calls",
     "teams_refused",
     "teams_missing",
+    "issues_verified",
+    "issues_withdrawn",
+    "comments_withdrawn",
+    "comment_backfills",
+    "comment_sweeps_widened",
     "issues_read",
     "issues_staged",
     "issues_unchanged",
@@ -379,6 +416,21 @@ struct TeamCursorV1 {
     issues: SweepCursorV1,
     #[serde(default)]
     comments: SweepCursorV1,
+    /// Issues whose comments must be read whole, by id: an issue that moved
+    /// into the team, came back from the trash, or was withdrawn, since its
+    /// comments kept an `updatedAt` the comment sweep has passed.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    backfill: BTreeSet<String>,
+}
+
+/// Where the rotation that checks held issues stands.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifyCursorV1 {
+    schema_version: u32,
+    /// The last issue id the rotation checked; the next pass starts after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    after: Option<String>,
 }
 
 impl TeamCursorV1 {
@@ -413,6 +465,22 @@ impl TeamCursorV1 {
             *counters.entry("cursors_reset").or_insert(0) += 1;
         }
         decoded
+    }
+
+    /// Queue issues for a whole read of their comments; whether the queue
+    /// changed. Past [`MAX_BACKFILL`], the team's comment sweep reads every
+    /// comment instead, from this pass on.
+    fn queue(&mut self, issues: &[String], state: &mut PassStateV1) -> bool {
+        let mut queued = false;
+        for issue in issues {
+            queued |= self.backfill.insert(issue.clone());
+        }
+        if self.backfill.len() > MAX_BACKFILL {
+            self.backfill.clear();
+            self.comments = SweepCursorV1::default();
+            state.bump("comment_sweeps_widened");
+        }
+        queued
     }
 
     fn advance(&self, domain_key: &str, pass_seq: u64) -> Result<CursorAdvanceV1> {
@@ -501,6 +569,10 @@ struct PassStateV1 {
     /// Issues and comments the sweeps returned, by id.
     seen_issues: BTreeSet<String>,
     seen_comments: BTreeSet<String>,
+    /// Issues in the trash, as far as the memory and this pass know.
+    trashed_issues: BTreeSet<String>,
+    /// Items this pass withdrew: never held current.
+    withdrawn_now: BTreeSet<String>,
 }
 
 impl PassStateV1 {
@@ -511,6 +583,8 @@ impl PassStateV1 {
             counters: LINEAR_COUNTERS.iter().map(|key| (*key, 0)).collect(),
             seen_issues: BTreeSet::new(),
             seen_comments: BTreeSet::new(),
+            trashed_issues: BTreeSet::new(),
+            withdrawn_now: BTreeSet::new(),
         }
     }
 
@@ -579,6 +653,69 @@ struct PageItemsV1 {
     items: Vec<PulledItemV1>,
     newest: Option<u64>,
     blemished: bool,
+    /// Issues whose comments must be read whole.
+    backfill: Vec<String>,
+}
+
+/// What the memory holds, as one pass reads it.
+struct HeldV1<'k> {
+    issues: &'k BTreeMap<String, KnownVersionV1>,
+    comments: &'k BTreeMap<String, KnownVersionV1>,
+    /// The comments the memory holds on each issue, by issue id.
+    comments_by_issue: &'k BTreeMap<String, Vec<String>>,
+    /// Every configured team the pass admits, by id.
+    admitted_teams: &'k BTreeSet<String>,
+}
+
+impl HeldV1<'_> {
+    /// A content-free withdrawal of one comment the memory holds, unless it
+    /// is withdrawn already; whether one was added.
+    fn withdraw_comment(
+        &self,
+        provider: &ProviderKindV1,
+        scope: &str,
+        comment: &str,
+        state: &mut PassStateV1,
+        items: &mut Vec<PulledItemV1>,
+    ) -> bool {
+        let Some(known) = self
+            .comments
+            .get(comment)
+            .filter(|known| !known.lifecycle.is_tombstone() && !known.withdrawn)
+        else {
+            return false;
+        };
+        if !state.withdrawn_now.insert(comment.to_owned()) {
+            return false;
+        }
+        state.bump("comments_withdrawn");
+        items.push(withdrawal(
+            &WithdrawnItemV1 {
+                provider,
+                provider_scope_id: scope,
+                object_kind: &linear_object_kind(COMMENT_OBJECT_KIND),
+                external_id: comment,
+                order_micros: known.provider_order,
+            },
+            None,
+        ));
+        true
+    }
+
+    /// Content-free withdrawals of every comment the memory holds on
+    /// `issue`.
+    fn withdraw_comments(
+        &self,
+        provider: &ProviderKindV1,
+        scope: &str,
+        issue: &str,
+        state: &mut PassStateV1,
+        items: &mut Vec<PulledItemV1>,
+    ) {
+        for comment in self.comments_by_issue.get(issue).into_iter().flatten() {
+            self.withdraw_comment(provider, scope, comment, state, items);
+        }
+    }
 }
 
 /// One team's read in one pass.
@@ -589,8 +726,10 @@ struct TeamReadV1<'k> {
     label: Option<String>,
     key: Sha256Digest,
     audience: ProviderAudienceV1,
-    known_issues: &'k BTreeMap<String, KnownVersionV1>,
-    known_comments: &'k BTreeMap<String, KnownVersionV1>,
+    held: &'k HeldV1<'k>,
+    /// The comment sweep's lower bound this pass (microseconds), when it
+    /// reads only what changed.
+    comments_since: Option<u64>,
 }
 
 impl TeamReadV1<'_> {
@@ -600,7 +739,31 @@ impl TeamReadV1<'_> {
             provider_scope_id: &self.scope,
             team_id: &self.team,
             team_key: self.label.as_deref(),
+            admitted_teams: self.held.admitted_teams,
         }
+    }
+
+    /// Whether an issue staged live in this team needs its comments read
+    /// whole: the memory held it in another team, in the trash, withdrawn, or
+    /// never, while the comment sweep reads only what changed since a mark
+    /// its comments may be older than.
+    fn needs_backfill(&self, held: Option<&KnownVersionV1>, draft: &CollectedItemDraftV1) -> bool {
+        held.map_or_else(
+            || {
+                self.comments_since.is_some_and(|since| {
+                    draft
+                        .created_at
+                        .as_ref()
+                        .and_then(|created| timestamp_micros(created).ok())
+                        .is_none_or(|created| created <= since)
+                })
+            },
+            |known| {
+                known.container_key != Some(self.key)
+                    || known.lifecycle.is_tombstone()
+                    || known.withdrawn
+            },
+        )
     }
 
     /// Dead-letter a node that did not become a draft; the team is partial.
@@ -620,8 +783,15 @@ impl TeamReadV1<'_> {
             .await
     }
 
-    /// Stage a draft, or keep the version the memory holds when its content
-    /// and lifecycle are unchanged.
+    /// Stage a draft, or keep the version the memory holds when its content,
+    /// lifecycle, and team are unchanged and it is not withdrawn (staging is
+    /// what lifts a withdrawal).
+    ///
+    /// Linear's trash hides an issue with everything on it: an issue staged
+    /// into the trash withdraws the comments the memory holds on it, and a
+    /// comment on an issue in the trash is never staged. An issue staged
+    /// live that [`TeamReadV1::needs_backfill`] queues its comments for a
+    /// whole read.
     fn consider(
         &self,
         draft: CollectedItemDraftV1,
@@ -635,21 +805,38 @@ impl TeamReadV1<'_> {
         let known = match sweep {
             SweepV1::Issues => {
                 state.seen_issues.insert(draft.external_id.clone());
-                self.known_issues
+                self.held.issues
             }
             SweepV1::Comments => {
                 state.seen_comments.insert(draft.external_id.clone());
-                self.known_comments
+                self.held.comments
             }
         };
+        if sweep == SweepV1::Comments
+            && let Some(thread) = &draft.thread
+            && state.trashed_issues.contains(&thread.root_external_id)
+        {
+            if !self.held.withdraw_comment(
+                &self.provider,
+                &self.scope,
+                &draft.external_id,
+                state,
+                &mut page.items,
+            ) {
+                state.bump("comments_skipped");
+            }
+            return;
+        }
         let digest = stager.content_digest(&draft);
         if digest.is_none() {
             // Staging will refuse it: the sweep must read it again.
             page.blemished = true;
         }
-        if let Some(known) = known.get(&draft.external_id)
+        let held = known.get(&draft.external_id);
+        if let Some(known) = held
             && !known.withdrawn
             && known.lifecycle == draft.lifecycle
+            && known.container_key == Some(self.key)
             && digest == Some(known.content_digest)
         {
             state.bump(kept_counter);
@@ -657,6 +844,23 @@ impl TeamReadV1<'_> {
             return;
         }
         state.bump(staged_counter);
+        if sweep == SweepV1::Issues {
+            if draft.lifecycle.is_tombstone() {
+                state.trashed_issues.insert(draft.external_id.clone());
+                self.held.withdraw_comments(
+                    &self.provider,
+                    &self.scope,
+                    &draft.external_id,
+                    state,
+                    &mut page.items,
+                );
+            } else {
+                state.trashed_issues.remove(&draft.external_id);
+                if self.needs_backfill(held, &draft) {
+                    page.backfill.push(draft.external_id.clone());
+                }
+            }
+        }
         if draft.lifecycle.is_tombstone() {
             state.bump("tombstones");
         }
@@ -779,8 +983,7 @@ struct TeamInputV1<'a> {
     id: &'a str,
     info: &'a LinearTeamV1,
     key: Sha256Digest,
-    known_issues: &'a BTreeMap<String, KnownVersionV1>,
-    known_comments: &'a BTreeMap<String, KnownVersionV1>,
+    held: &'a HeldV1<'a>,
 }
 
 /// One page of either listing, fetched and turned into items.
@@ -902,6 +1105,7 @@ impl LinearPullV1 {
             };
             newest = newest.max(page.items.newest);
             blemished |= page.items.blemished;
+            let queued = cursor.queue(&page.items.backfill, state);
             let oversized = page
                 .next_cursor
                 .as_ref()
@@ -909,6 +1113,11 @@ impl LinearPullV1 {
             let next = page.next_cursor.filter(|_| !oversized);
             let finished = next.is_none() && !page.unfinished && !oversized;
             let readable = finished || next.is_some();
+            if finished && sweep == SweepV1::Comments && start.since.is_none() {
+                // Every comment of the team's issues was read: none is owed
+                // a whole read any more.
+                cursor.backfill.clear();
+            }
             let position = cursor.sweep_mut(sweep);
             if finished {
                 if !blemished {
@@ -924,7 +1133,7 @@ impl LinearPullV1 {
                     blemished,
                 });
             }
-            let advances = if readable {
+            let advances = if readable || queued {
                 vec![cursor.advance(domain, input.pass_seq)?]
             } else {
                 Vec::new()
@@ -947,6 +1156,56 @@ impl LinearPullV1 {
         }
     }
 
+    /// Read every comment of each issue the team's cursor queued
+    /// ([`TeamCursorV1::backfill`]), each page one sink transaction; an issue
+    /// read to its end leaves the queue with its last page.
+    #[allow(clippy::too_many_arguments)] // one team's read, cursor, and pass state
+    async fn backfill(
+        &self,
+        read: &TeamReadV1<'_>,
+        cursor: &mut TeamCursorV1,
+        domain: &str,
+        input: &PullPassInputV1<'_>,
+        state: &mut PassStateV1,
+        stager: &mut PageStager<'_>,
+    ) -> Result<ListingBoundV1> {
+        let issues: Vec<String> = cursor.backfill.iter().cloned().collect();
+        for issue in issues {
+            let mut after: Option<String> = None;
+            loop {
+                if !state.take_call() {
+                    return Ok(ListingBoundV1::Truncated(PartialReasonV1::ListingBound));
+                }
+                let page = match self.api.issue_comments_page(&issue, after.as_deref()).await {
+                    Ok(page) => page,
+                    Err(error) => return Ok(ListingBoundV1::Truncated(state.refusal(error)?)),
+                };
+                state.rate(page.rate);
+                let items = read.comments(page.nodes, stager, state).await?;
+                let next = page
+                    .next_cursor
+                    .filter(|next| next.len() <= MAX_PAGE_CURSOR_BYTES);
+                let finished = next.is_none() && !page.unfinished;
+                let advances = if finished && !items.blemished {
+                    cursor.backfill.remove(&issue);
+                    state.bump("comment_backfills");
+                    vec![cursor.advance(domain, input.pass_seq)?]
+                } else {
+                    Vec::new()
+                };
+                stager.stage_page(items.items, &advances, &[]).await?;
+                if finished {
+                    break;
+                }
+                let Some(next) = next else {
+                    return Ok(ListingBoundV1::Truncated(PartialReasonV1::Unreadable));
+                };
+                after = Some(next);
+            }
+        }
+        Ok(ListingBoundV1::Complete)
+    }
+
     /// Read one team. See the module documentation.
     async fn team(
         &self,
@@ -955,11 +1214,7 @@ impl LinearPullV1 {
         stager: &mut PageStager<'_>,
     ) -> Result<TeamEndV1> {
         let id = team.id.to_owned();
-        let audience = if team.info.is_public() {
-            ProviderAudienceV1::TeamPublic
-        } else {
-            ProviderAudienceV1::Restricted
-        };
+        let (audience, decision) = team_decision(team.input, &id, team.info);
         let observation = ContainerObservationV1 {
             kind: ContainerKindV1::new(TEAM_CONTAINER_KIND)?,
             id: id.clone(),
@@ -967,17 +1222,6 @@ impl LinearPullV1 {
             provider_audience: audience,
         };
         let scope = team.input.instance.provider_scope_id.as_str();
-        let decision = classify(&AudienceInputV1 {
-            mode: CollectionModeV1::Pull,
-            provider: LINEAR_PROVIDER,
-            provider_scope_id: scope,
-            container_id: Some(&id),
-            provider_audience: Some(audience),
-            hint: None,
-            policy: &team.input.source.audience,
-            capture_scopes: &[],
-            known_container: KnownContainerV1::Unknown,
-        });
         if let AudienceDecisionV1::Refuse(_) = decision {
             // Never read; the observation withdraws what was admitted.
             stager.stage_page(Vec::new(), &[], &[observation]).await?;
@@ -997,8 +1241,11 @@ impl LinearPullV1 {
             label: team.info.key.clone(),
             key: team.key,
             audience,
-            known_issues: team.known_issues,
-            known_comments: team.known_comments,
+            held: team.held,
+            comments_since: cursor
+                .comments
+                .start(self.settings.overlap_seconds.saturating_mul(1_000_000))
+                .since,
         };
         let mut observation = Some(observation);
         let mut bound = ListingBoundV1::Complete;
@@ -1026,20 +1273,250 @@ impl LinearPullV1 {
         if let Some(observation) = observation.take() {
             stager.stage_page(Vec::new(), &[], &[observation]).await?;
         }
+        if bound == ListingBoundV1::Complete && !cursor.backfill.is_empty() {
+            bound = self
+                .backfill(&read, &mut cursor, &domain, team.input, state, stager)
+                .await?;
+        }
         Ok(TeamEndV1::Listed(bound))
+    }
+
+    /// A configured team the credential cannot see: deleted, or made private
+    /// to people the credential's user is not among. Unless the operator
+    /// listed it, that is a narrowing, not a partial read: its observation
+    /// as restricted withdraws what was admitted through it, and it is
+    /// outside the pass's domain. A listed one stays in the domain, partial.
+    /// Either way nothing it held is vouched for.
+    async fn missing_team(
+        &self,
+        input: &PullPassInputV1<'_>,
+        team: &str,
+        state: &mut PassStateV1,
+        stager: &mut PageStager<'_>,
+    ) -> Result<TeamEndV1> {
+        state.bump("teams_missing");
+        let listed = input
+            .source
+            .audience
+            .private_containers
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(team));
+        if listed {
+            return Ok(TeamEndV1::Listed(ListingBoundV1::Truncated(
+                PartialReasonV1::ProviderRefused,
+            )));
+        }
+        let observation = ContainerObservationV1 {
+            kind: ContainerKindV1::new(TEAM_CONTAINER_KIND)?,
+            id: team.to_owned(),
+            label: None,
+            provider_audience: ProviderAudienceV1::Restricted,
+        };
+        stager.stage_page(Vec::new(), &[], &[observation]).await?;
+        Ok(TeamEndV1::Outside)
+    }
+
+    /// Check where a rotating batch of held issues is now
+    /// ([`VERIFY_CURSOR_DOMAIN`]): issues the memory holds in a team the pass
+    /// read that its sweeps did not return. The sweeps are filtered by team,
+    /// so an issue moved into a team the pass does not admit, or one the
+    /// credential can no longer see, is never returned by them: each such
+    /// issue, and every comment the memory holds on it, is withdrawn
+    /// ([`super::pull::withdrawal`]). One call per pass.
+    #[allow(clippy::too_many_arguments)] // the pass's held state and its read
+    async fn verify(
+        &self,
+        input: &PullPassInputV1<'_>,
+        held: &HeldV1<'_>,
+        read_teams: &BTreeSet<Sha256Digest>,
+        provider: &ProviderKindV1,
+        state: &mut PassStateV1,
+        stager: &mut PageStager<'_>,
+    ) -> Result<()> {
+        let candidates: Vec<&String> = held
+            .issues
+            .iter()
+            .filter(|(id, version)| {
+                !version.lifecycle.is_tombstone()
+                    && !version.withdrawn
+                    && version
+                        .container_key
+                        .is_some_and(|key| read_teams.contains(&key))
+                    && !state.seen_issues.contains(*id)
+                    && !state.withdrawn_now.contains(*id)
+            })
+            .map(|(id, _)| id)
+            .collect();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let after = match stager.read_cursor(VERIFY_CURSOR_DOMAIN).await? {
+            Some(stored) => serde_json::from_slice::<VerifyCursorV1>(&stored.cursor_state)
+                .ok()
+                .filter(|cursor| cursor.schema_version == CURSOR_SCHEMA_VERSION)
+                .and_then(|cursor| cursor.after),
+            None => None,
+        };
+        let (batch, next) = rotation(&candidates, after.as_deref());
+        if !state.take_call() {
+            return Ok(());
+        }
+        let places = match self.api.issue_places(&batch).await {
+            Ok((places, rate)) => {
+                state.rate(rate);
+                places
+            }
+            Err(error) => {
+                state.refusal(error)?;
+                return Ok(());
+            }
+        };
+        *state.counters.entry("issues_verified").or_insert(0) +=
+            u64::try_from(batch.len()).unwrap_or(u64::MAX);
+        let scope = input.instance.provider_scope_id.as_str();
+        let kind = linear_object_kind(ISSUE_OBJECT_KIND);
+        let mut items = Vec::new();
+        for id in &batch {
+            let place = places
+                .iter()
+                .find(|place| place.id.eq_ignore_ascii_case(id));
+            let stays = place
+                .and_then(|place| place.team.as_ref())
+                .is_some_and(|team| {
+                    held.admitted_teams
+                        .iter()
+                        .any(|admitted| admitted.eq_ignore_ascii_case(&team.id))
+                });
+            let Some(known) = held.issues.get(id).filter(|_| !stays) else {
+                continue;
+            };
+            let observed = place
+                .and_then(|place| place.updated_at.as_deref())
+                .and_then(linear_order)
+                .unwrap_or(0);
+            state.withdrawn_now.insert(id.clone());
+            state.bump("issues_withdrawn");
+            items.push(withdrawal(
+                &WithdrawnItemV1 {
+                    provider,
+                    provider_scope_id: scope,
+                    object_kind: &kind,
+                    external_id: id,
+                    order_micros: known.provider_order.max(observed),
+                },
+                None,
+            ));
+            held.withdraw_comments(provider, scope, id, state, &mut items);
+        }
+        let advance = CursorAdvanceV1 {
+            domain_key: VERIFY_CURSOR_DOMAIN.to_owned(),
+            cursor_state: serde_json::to_vec(&VerifyCursorV1 {
+                schema_version: CURSOR_SCHEMA_VERSION,
+                after: next,
+            })
+            .map_err(|error| FleetError::Memory(format!("a Linear cursor: {error}")))?,
+            high_water_order: None,
+            pass_seq: input.pass_seq,
+        };
+        stager.stage_page(items, &[advance], &[]).await?;
+        Ok(())
     }
 }
 
+/// The next batch of a rotation over sorted `candidates` after `after`
+/// (from the start when nothing is after it), and where the rotation stands
+/// after it: `None` when it reached the end.
+fn rotation(candidates: &[&String], after: Option<&str>) -> (Vec<String>, Option<String>) {
+    let mut start = after.map_or(0, |after| {
+        candidates.partition_point(|id| id.as_str() <= after)
+    });
+    if start >= candidates.len() {
+        start = 0;
+    }
+    let batch: Vec<String> = candidates[start..]
+        .iter()
+        .take(MAX_ISSUE_TEAMS_BATCH)
+        .map(|id| (*id).clone())
+        .collect();
+    let next = (start + batch.len() < candidates.len())
+        .then(|| batch.last().cloned())
+        .flatten();
+    (batch, next)
+}
+
+/// A team's provider audience, and what the instance's policy decides of it.
+fn team_decision(
+    input: &PullPassInputV1<'_>,
+    team: &str,
+    info: &LinearTeamV1,
+) -> (ProviderAudienceV1, AudienceDecisionV1) {
+    let audience = if info.is_public() {
+        ProviderAudienceV1::TeamPublic
+    } else {
+        ProviderAudienceV1::Restricted
+    };
+    let decision = classify(&AudienceInputV1 {
+        mode: CollectionModeV1::Pull,
+        provider: LINEAR_PROVIDER,
+        provider_scope_id: input.instance.provider_scope_id.as_str(),
+        container_id: Some(team),
+        provider_audience: Some(audience),
+        hint: None,
+        policy: &input.source.audience,
+        capture_scopes: &[],
+        known_container: KnownContainerV1::Unknown,
+    });
+    (audience, decision)
+}
+
+/// The comments the memory holds on each issue, by issue id.
+fn comments_by_issue(
+    known_comments: &BTreeMap<String, KnownVersionV1>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut by_issue: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (comment, version) in known_comments {
+        if let Some(issue) = &version.thread_root {
+            by_issue
+                .entry(issue.clone())
+                .or_default()
+                .push(comment.clone());
+        }
+    }
+    by_issue
+}
+
+/// Every configured team the credential sees and the policy admits, by id.
+fn admitted_teams(
+    input: &PullPassInputV1<'_>,
+    teams: &[String],
+    scope: &graphql::LinearScopeV1,
+) -> BTreeSet<String> {
+    teams
+        .iter()
+        .filter(|team| {
+            scope.team(team).is_some_and(|info| {
+                matches!(
+                    team_decision(input, team, info).1,
+                    AudienceDecisionV1::Admit(_)
+                )
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Hold current what the memory knows in a team the pass read and the
-/// sweeps did not return: it has not changed since the sweeps' start.
+/// sweeps did not return: it has not changed since the sweeps' start. A
+/// withdrawn item is not current, nor one this pass withdrew.
 fn hold_unseen(
     known: &BTreeMap<String, KnownVersionV1>,
     seen: &BTreeSet<String>,
+    withdrawn: &BTreeSet<String>,
     listed: &BTreeSet<Sha256Digest>,
     stager: &mut PageStager<'_>,
 ) {
     for (external_id, version) in known {
-        if seen.contains(external_id) {
+        if seen.contains(external_id) || version.withdrawn || withdrawn.contains(external_id) {
             continue;
         }
         if let Some(key) = version.container_key
@@ -1066,6 +1543,7 @@ impl PullCollectorV1 for LinearPullV1 {
         ProviderAudienceV1::ScopePublic
     }
 
+    #[allow(clippy::too_many_lines)] // one linear scope -> teams -> verify -> hold pass
     async fn pass(
         &self,
         input: &PullPassInputV1<'_>,
@@ -1125,33 +1603,51 @@ impl PullCollectorV1 for LinearPullV1 {
         let known_comments = stager
             .known_versions(&ObjectKindV1::new(COMMENT_OBJECT_KIND)?)
             .await?;
+        let comments_by_issue = comments_by_issue(&known_comments);
+        state.trashed_issues = known_issues
+            .iter()
+            .filter(|(_, version)| version.lifecycle.is_tombstone())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let admitted_teams = admitted_teams(input, &teams, &scope);
+        let held = HeldV1 {
+            issues: &known_issues,
+            comments: &known_comments,
+            comments_by_issue: &comments_by_issue,
+            admitted_teams: &admitted_teams,
+        };
         let mut containers = Vec::with_capacity(teams.len());
         let mut listed = BTreeSet::new();
+        let mut read_teams = BTreeSet::new();
         for (team, key) in teams.iter().zip(keys) {
             let end = match (state.stop, scope.team(team)) {
-                (Some(reason), _) => TeamEndV1::Listed(ListingBoundV1::Truncated(reason)),
-                (None, None) => {
-                    state.bump("teams_missing");
-                    TeamEndV1::Listed(ListingBoundV1::Truncated(PartialReasonV1::ProviderRefused))
+                (Some(reason), _) => {
+                    listed.insert(key);
+                    TeamEndV1::Listed(ListingBoundV1::Truncated(reason))
                 }
+                (None, None) => self.missing_team(input, team, &mut state, stager).await?,
                 (None, Some(info)) => {
-                    self.team(
-                        TeamInputV1 {
-                            input,
-                            id: team,
-                            info,
-                            key,
-                            known_issues: &known_issues,
-                            known_comments: &known_comments,
-                        },
-                        &mut state,
-                        stager,
-                    )
-                    .await?
+                    let end = self
+                        .team(
+                            TeamInputV1 {
+                                input,
+                                id: team,
+                                info,
+                                key,
+                                held: &held,
+                            },
+                            &mut state,
+                            stager,
+                        )
+                        .await?;
+                    if matches!(end, TeamEndV1::Listed(_)) {
+                        listed.insert(key);
+                        read_teams.insert(key);
+                    }
+                    end
                 }
             };
             if let TeamEndV1::Listed(listing) = end {
-                listed.insert(key);
                 containers.push(ContainerOutcomeV1 {
                     ordinal: u32::try_from(containers.len()).unwrap_or(u32::MAX),
                     container_key: Some(key),
@@ -1159,9 +1655,26 @@ impl PullCollectorV1 for LinearPullV1 {
                 });
             }
         }
+        if state.stop.is_none() {
+            let provider = ProviderKindV1::new(LINEAR_PROVIDER)?;
+            self.verify(input, &held, &read_teams, &provider, &mut state, stager)
+                .await?;
+        }
 
-        hold_unseen(&known_issues, &state.seen_issues, &listed, stager);
-        hold_unseen(&known_comments, &state.seen_comments, &listed, stager);
+        hold_unseen(
+            &known_issues,
+            &state.seen_issues,
+            &state.withdrawn_now,
+            &listed,
+            stager,
+        );
+        hold_unseen(
+            &known_comments,
+            &state.seen_comments,
+            &state.withdrawn_now,
+            &listed,
+            stager,
+        );
         Ok(outcome(containers, state))
     }
 }

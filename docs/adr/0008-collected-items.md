@@ -768,7 +768,7 @@ Reactions, reply counts, unfurls, presence, and file content are never read.
 token (sent as `Bearer`), named by `token_env`, reads one organization, pinned
 by its id (the provider scope id, a lowercase UUID). Each configured team
 (`teams`, by id; a team key such as `ENG` is a mutable label, refused as an
-id) is one `linear.team` container, labelled with its key. Three named
+id) is one `linear.team` container, labelled with its key. Four named
 queries are posted to `api_url` (`https://api.linear.app/graphql` by
 default), every filter a variable:
 
@@ -778,8 +778,12 @@ default), every filter a variable:
   `team_public`; any other visibility is admitted `operator_declared` only
   when `audience.private_containers` lists the team; an unlisted one is never
   read, its observation withdraws what was admitted through it, and it is
-  outside the pass's domain. A configured team the credential cannot see is
-  partial.
+  outside the pass's domain. A configured team the credential cannot see
+  (deleted, or made private to people the credential's user is not among) is
+  a narrowing too, not a partial read, unless the operator listed it: it is
+  observed as restricted, which withdraws it, and is outside the domain. A
+  listed one the credential cannot see is partial. Neither's items are held
+  current.
 - **Every pass is a reconciliation.** For each team, `issues`, then the
   `comments` on its issues, are swept with `updatedAt` after the sweep's
   high-water mark less `overlap_seconds` (300 by default; the whole team the
@@ -799,19 +803,44 @@ default), every filter a variable:
   its markdown text its state, then its description; a comment's text is its
   body, its thread root its issue, and its parent the comment it answers, else
   the issue. The parent issue, the project, and every `http(s)` link in the
-  markdown are outbound links by URL. A person is kept by id only; a bot by
-  its id (else its kind) with its name.
-- An item the memory holds at the same content and lifecycle is kept at its
-  known version even when its `updatedAt` moved, so an overlap re-read, or a
-  change that is not content (a label, an assignee, a priority), mints
-  nothing. Every item the memory holds in a team the pass read and that the
-  sweeps did not return is unchanged since the sweeps' start and is held
-  current as well (known versions carry their container key for this), so
-  the pass's manifest names every current item and a team is complete only
-  when all of them are admitted.
-- `trashed` is a `trashed` tombstone, which hides the issue; `archivedAt` is
-  an `archived` version that stays searchable; a comment with `editedAt` is
-  `edited`.
+  markdown are outbound links by URL; a parent is linked only when its team
+  is one the pass admits, and a project only when every one of its teams is
+  (a parent's URL carries its identifier and a slug of its title, a
+  project's link its name). A person is kept by id only; a bot by its id
+  (else its kind) with its name.
+- An item the memory holds at the same content, lifecycle, and team, and
+  not withdrawn, is kept at its known version even when its `updatedAt`
+  moved, so an overlap re-read, or a change that is not content (a label, an
+  assignee, a priority), mints nothing. Every item the memory holds in a team
+  the pass read and that the sweeps did not return is unchanged since the
+  sweeps' start and is held current as well, unless withdrawn (known
+  versions carry their container key for this), so the pass's manifest names
+  every current item and a team is complete only when all of them are
+  admitted.
+- **Moves in.** An issue that moves into a team keeps its comments'
+  `updatedAt`, which the team's comment sweep has passed. An issue staged
+  live that the memory held in another team, in the trash, withdrawn, or
+  never (when it was created before the comment sweep's mark) is queued in
+  the team's cursor, and after the sweeps every queued issue's comments are
+  read whole (`FleetRecallLinearComments` with `issue: { id }` and no time
+  bound); the team is complete only when the queue is empty. Past 64 queued
+  issues the team's comment sweep reads every comment instead.
+- **Moves out.** The sweeps are filtered by team, so an issue moved into a
+  team the pass does not admit, or one the credential can no longer see, is
+  never returned by them. `FleetRecallLinearIssueTeams` checks a rotating
+  batch of up to 100 of the issues the memory holds in the teams the pass
+  read that the sweeps did not return (`linear.verify`), one call a pass:
+  each one now in a team the pass does not admit, or missing from the
+  answer, is withdrawn with every comment the memory holds on it, by
+  content-free observations marked private (D6); a later read of it in an
+  admitted team lifts that. A move is caught within one rotation of the held
+  issues.
+- `trashed` is a `trashed` tombstone, which hides the issue, and Linear's
+  trash hides everything on it: the comments the memory holds on it are
+  withdrawn in the same transaction, a comment on it is never staged, and
+  restoring the issue reads its comments whole, which lifts them.
+  `archivedAt` is an `archived` version that stays searchable; a comment
+  with `editedAt` is `edited`.
 - **Partial reads.** Every call counts against `max_pages_per_tick`. A rate
   limit (HTTP 429, or `RATELIMITED` in the GraphQL errors) or the page budget
   ends the pass: the team in progress and every later one are partial, and
@@ -823,10 +852,11 @@ default), every filter a variable:
   `x-ratelimit-complexity-remaining` headers of every answer are reported as
   the fewest the pass saw.
 
-A permanently deleted comment, and an issue moved into a team the collector
-does not read, are invisible to a sweep; they are left to the webhook hints of
-stage 7. Reactions, subscribers, history entries, and attachments' content are
-never read.
+A permanently deleted comment is invisible to a sweep; it is left to the
+webhook hints of stage 7. An issue withdrawn because the credential could no
+longer see it, and that becomes visible again without changing, stays
+withdrawn until it next changes (fail closed). Reactions, subscribers,
+history entries, and attachments' content are never read.
 
 **Granola** (`src/collectors/granola`, provider `granola`). An API key
 (`grn_...`, Business or Enterprise, sent as `Bearer`), named by `token_env`,

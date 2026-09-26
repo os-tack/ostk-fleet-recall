@@ -58,6 +58,7 @@ const API_KEY: &str = "lin_api_EXAMPLENOTAREALKEYEXAMPLENOTAREAL";
 const ISSUES: &str = "FleetRecallLinearIssues";
 const COMMENTS: &str = "FleetRecallLinearComments";
 const SCOPE: &str = "FleetRecallLinearScope";
+const ISSUE_TEAMS: &str = "FleetRecallLinearIssueTeams";
 
 // ---------------------------------------------------------------------------
 // The fake organization
@@ -180,6 +181,27 @@ impl World {
     fn issue_mut(&mut self, index: u32) -> &mut Value {
         &mut self.issues.get_mut(&issue_id(index)).unwrap().1
     }
+
+    /// Move an issue to another team, as Linear does: a new identifier and
+    /// a newer `updatedAt`.
+    fn move_issue(&mut self, index: u32, team: &str, updated: &str) {
+        let key = self
+            .teams
+            .get(team)
+            .map_or("X", |team| team.key.as_str())
+            .to_owned();
+        let (owner, node) = self.issues.get_mut(&issue_id(index)).unwrap();
+        team.clone_into(owner);
+        node["identifier"] = json!(format!("{key}-{}", 400 + index));
+        node["updatedAt"] = json!(updated);
+    }
+
+    /// Whether the key can see an issue: its team is one the key sees.
+    fn visible(&self, issue: &str) -> bool {
+        self.issues
+            .get(issue)
+            .is_some_and(|(owner, _)| self.teams.contains_key(owner))
+    }
 }
 
 /// A request's GraphQL operation and variables.
@@ -267,27 +289,53 @@ fn respond(world: &mut World, request: &FakeRequest) -> FakeReply {
                 .issues
                 .values()
                 .filter(|(owner, node)| owner == team && after_since(node, filter))
-                .map(|(_, node)| node.clone())
+                .map(|(owner, node)| {
+                    let mut node = node.clone();
+                    node["team"] = json!({"id": owner});
+                    node
+                })
                 .collect();
             connection("issues", nodes, &variables)
         }
         COMMENTS => {
+            // Every comment on one issue, or the comments on a team's issues.
+            let one = filter["issue"]["id"]["eq"].as_str();
             let team = filter["issue"]["team"]["id"]["eq"]
                 .as_str()
                 .unwrap_or_default();
             let nodes = world
                 .comments
                 .values()
-                .filter(|(issue, node)| {
-                    world
-                        .issues
-                        .get(issue)
-                        .is_some_and(|(owner, _)| owner == team)
-                        && after_since(node, filter)
+                .filter(|(issue, node)| match one {
+                    Some(one) => issue == one && world.visible(issue),
+                    None => {
+                        world
+                            .issues
+                            .get(issue)
+                            .is_some_and(|(owner, _)| owner == team)
+                            && after_since(node, filter)
+                    }
                 })
                 .map(|(_, node)| node.clone())
                 .collect();
             connection("comments", nodes, &variables)
+        }
+        ISSUE_TEAMS => {
+            let wanted: Vec<&str> = filter["id"]["in"]
+                .as_array()
+                .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let nodes: Vec<Value> = wanted
+                .iter()
+                .filter(|id| world.visible(id))
+                .map(|id| {
+                    let (owner, node) = &world.issues[*id];
+                    json!({"id": id, "updatedAt": node["updatedAt"], "trashed": node["trashed"],
+                           "team": {"id": owner}})
+                })
+                .collect();
+            json!({"data": {"issues": {"nodes": nodes,
+                                       "pageInfo": {"hasNextPage": false, "endCursor": null}}}})
         }
         _ => return graphql_error("GRAPHQL_VALIDATION_FAILED"),
     };
@@ -963,6 +1011,177 @@ async fn live_linear_a_trashed_issue_is_hidden_and_an_archived_one_stays_when_co
     assert_eq!(
         harness.get("issue", &issue_id(51)).await.suppressed,
         Some(ItemSuppressionV1::Deleted)
+    );
+}
+
+/// Engineering holds issue 60 with its comment; Security, private and not
+/// listed, holds issue 61 with an older comment.
+fn moving_world(base: i64) -> World {
+    let mut world = World::new();
+    world.issue(
+        ENG,
+        60,
+        "Heron rollout",
+        "The heron rollout plan.",
+        &at(base, 800),
+    );
+    world.comment(60, 10, "The pelican checklist is done.", &at(base, 900));
+    world.issue(
+        SEC,
+        61,
+        "Petrel migration",
+        "Move the petrel service.",
+        &at(base, 0),
+    );
+    world.comment(61, 11, "The albatross runbook is ready.", &at(base, 1));
+    world
+}
+
+#[tokio::test]
+async fn live_linear_an_issue_moved_into_a_read_team_brings_its_older_comments_when_configured() {
+    let base = base_seconds();
+    let Some(harness) = Harness::new("linear-moved-in", moving_world(base)).await else {
+        return;
+    };
+    let sources = harness.sources(&[ENG, SEC], &[], &json!({}));
+    harness.ok_tick(&sources).await;
+    assert!(harness.search("albatross").await.hits.is_empty());
+
+    // Issue 61 moves into Engineering: its updatedAt moves, its comment's
+    // does not, and the comment sweep reads only what changed.
+    harness.world().move_issue(61, ENG, &at(base, 950));
+    let report = harness.ok_tick(&sources).await;
+    let source = Harness::source(&report);
+    assert_eq!(source.counters["comment_backfills"], 1);
+    assert_eq!(source.counters["containers_complete"], 1);
+    assert_eq!(
+        hits(&harness.search("petrel").await),
+        [issue_id(61).as_str()]
+    );
+    assert_eq!(
+        hits(&harness.search("albatross").await),
+        [comment_id(11).as_str()],
+        "the moved issue's older comment is read"
+    );
+    assert_eq!(
+        harness.search(MISSING).await.absence.verdict,
+        AbsenceVerdictV1::Absent
+    );
+
+    // Read once, it is not read whole again.
+    let report = harness.ok_tick(&sources).await;
+    assert_eq!(Harness::source(&report).counters["comment_backfills"], 0);
+}
+
+#[tokio::test]
+async fn live_linear_an_issue_moved_out_of_the_read_teams_is_withdrawn_with_its_comments_when_configured()
+ {
+    let base = base_seconds();
+    let Some(harness) = Harness::new("linear-moved-out", moving_world(base)).await else {
+        return;
+    };
+    let sources = harness.sources(&[ENG, SEC], &[], &json!({}));
+    harness.ok_tick(&sources).await;
+    assert_eq!(hits(&harness.search("heron").await).len(), 1);
+    assert_eq!(hits(&harness.search("pelican").await).len(), 1);
+
+    // Issue 60 moves into Security, which is private and not listed, and
+    // gains confidential text.
+    harness.world().move_issue(60, SEC, &at(base, 960));
+    harness.edit_issue(60, |issue| {
+        issue["description"] = json!("The heron rollout is paused for the audit.");
+    });
+    let report = harness.ok_tick(&sources).await;
+    let source = Harness::source(&report);
+    assert_eq!(source.counters["issues_withdrawn"], 1);
+    assert_eq!(source.counters["comments_withdrawn"], 1);
+    for word in ["heron", "pelican"] {
+        assert!(harness.search(word).await.hits.is_empty(), "{word}");
+        assert!(harness.evidence(word).await.hits.is_empty(), "{word}");
+    }
+    assert_eq!(
+        harness.get("issue", &issue_id(60)).await.suppressed,
+        Some(ItemSuppressionV1::ItemWithdrawn)
+    );
+    assert!(
+        harness
+            .calls(ISSUES)
+            .iter()
+            .chain(&harness.calls(COMMENTS))
+            .all(|variables| !variables["filter"].to_string().contains(SEC)),
+        "the private team is still never read"
+    );
+
+    // Back in Engineering, both are read again and lifted.
+    harness.world().move_issue(60, ENG, &at(base, 980));
+    harness.ok_tick(&sources).await;
+    assert_eq!(hits(&harness.search("heron").await).len(), 1);
+    assert_eq!(hits(&harness.search("pelican").await).len(), 1);
+    assert_eq!(harness.get("issue", &issue_id(60)).await.suppressed, None);
+}
+
+#[tokio::test]
+async fn live_linear_a_team_the_key_can_no_longer_see_is_withdrawn_when_configured() {
+    let base = base_seconds();
+    let Some(harness) = Harness::new("linear-team-gone", moving_world(base)).await else {
+        return;
+    };
+    let sources = harness.sources(&[ENG], &[], &json!({}));
+    harness.ok_tick(&sources).await;
+    assert_eq!(hits(&harness.search("heron").await).len(), 1);
+
+    // Engineering is made private to people the key's user is not among.
+    harness.world().teams.remove(ENG);
+    let report = harness.ok_tick(&sources).await;
+    let source = Harness::source(&report);
+    assert_eq!(source.counters["teams_missing"], 1);
+    assert_eq!(source.counters["containers"], 0, "it is outside the domain");
+    assert_eq!(harness.container(ENG).await, "withdrawn");
+    for word in ["heron", "pelican"] {
+        assert!(harness.search(word).await.hits.is_empty(), "{word}");
+        assert!(harness.evidence(word).await.hits.is_empty(), "{word}");
+    }
+}
+
+#[tokio::test]
+async fn live_linear_the_comments_of_a_trashed_issue_are_hidden_and_come_back_with_it_when_configured()
+ {
+    let base = base_seconds();
+    let Some(harness) = Harness::new("linear-trash", moving_world(base)).await else {
+        return;
+    };
+    let sources = harness.sources(&[ENG], &[], &json!({}));
+    harness.ok_tick(&sources).await;
+    assert_eq!(hits(&harness.search("pelican").await).len(), 1);
+
+    harness.edit_issue(60, |issue| {
+        issue["trashed"] = json!(true);
+        issue["archivedAt"] = json!(at(base, 960));
+        issue["updatedAt"] = json!(at(base, 960));
+    });
+    let report = harness.ok_tick(&sources).await;
+    assert_eq!(Harness::source(&report).counters["comments_withdrawn"], 1);
+    assert_eq!(harness.head(&issue_id(60)).await.0, "trashed");
+    assert!(harness.search("pelican").await.hits.is_empty());
+    assert!(harness.evidence("pelican").await.hits.is_empty());
+    assert_eq!(
+        harness.get("comment", &comment_id(10)).await.suppressed,
+        Some(ItemSuppressionV1::ItemWithdrawn)
+    );
+
+    // Restored from the trash, the issue brings its comment back.
+    harness.edit_issue(60, |issue| {
+        issue["trashed"] = json!(null);
+        issue["archivedAt"] = json!(null);
+        issue["updatedAt"] = json!(at(base, 980));
+    });
+    let report = harness.ok_tick(&sources).await;
+    assert_eq!(Harness::source(&report).counters["comment_backfills"], 1);
+    assert_eq!(hits(&harness.search("heron").await).len(), 1);
+    assert_eq!(hits(&harness.search("pelican").await).len(), 1);
+    assert_eq!(
+        harness.get("comment", &comment_id(10)).await.suppressed,
+        None
     );
 }
 

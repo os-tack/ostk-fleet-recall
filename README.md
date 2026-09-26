@@ -416,8 +416,13 @@ archived and trashed issues included, and records coverage. An issue is its
 title (with its `ENG-412` identifier), state, and markdown description; a
 comment is threaded on its issue. A newer `updatedAt` with new content is a
 new version that supersedes; a change that is not content (a label, an
-assignee) stages nothing. A trashed issue is hidden; an archived one stays
-searchable. A rate limit or `max_pages_per_tick` leaves a team partial, and
+assignee) stages nothing. A trashed issue is hidden with its comments; an
+archived one stays searchable. An issue that moves into a read team brings
+its older comments; one that moves into a team the collector does not
+admit, or that the key can no longer see, is withdrawn with its comments, as
+is a configured team the key can no longer see (unless listed). A parent
+issue or a project is linked only when every team it belongs to is
+admitted. A rate limit or `max_pages_per_tick` leaves a team partial, and
 the next pass resumes its sweep from the page after the last one staged. The
 report counts the fewest requests and complexity points Linear's
 `x-ratelimit-*` headers said were left. `api_url`

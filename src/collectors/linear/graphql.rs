@@ -10,7 +10,12 @@
 //!   issues updated after an instant, `orderBy: updatedAt`, archived and
 //!   trashed ones included;
 //! * `FleetRecallLinearComments` ([`COMMENTS_QUERY`]): one page of the
-//!   comments on one team's issues, the same way.
+//!   comments on one team's issues, the same way, or of every comment on one
+//!   issue (an issue that moved into a team the collector reads, whose
+//!   comments kept their old `updatedAt`);
+//! * `FleetRecallLinearIssueTeams` ([`ISSUE_TEAMS_QUERY`]): where a batch of
+//!   issues the memory holds is now, by id: each one's team and `updatedAt`,
+//!   or nothing for an issue the credential can no longer see.
 //!
 //! Every filter is a variable (`IssueFilter`, `CommentFilter`), so no value
 //! is ever spliced into a query's text. Linear reports most failures in a
@@ -42,9 +47,23 @@ pub const ISSUES_QUERY: &str = "query FleetRecallLinearIssues($filter: IssueFilt
      issues(filter: $filter, orderBy: updatedAt, includeArchived: true, first: $first, \
      after: $after) { \
      nodes { id identifier title description url createdAt updatedAt archivedAt trashed \
-     state { name type } creator { id } botActor { id name type } \
-     externalUserCreator { id } parent { id url } project { id name url } } \
+     state { name type } team { id } creator { id } botActor { id name type } \
+     externalUserCreator { id } parent { id url team { id } } \
+     project { id name url teams(first: 50) { nodes { id } } } } \
      pageInfo { hasNextPage endCursor } } }";
+
+/// Where a batch of issues is now: each one's team and `updatedAt`, by id.
+pub const ISSUE_TEAMS_QUERY: &str = "query FleetRecallLinearIssueTeams($filter: IssueFilter!, \
+     $first: Int!) { \
+     issues(filter: $filter, includeArchived: true, first: $first) { \
+     nodes { id updatedAt trashed team { id } } pageInfo { hasNextPage endCursor } } }";
+
+/// The most issues one [`ISSUE_TEAMS_QUERY`] asks about.
+pub const MAX_ISSUE_TEAMS_BATCH: usize = 100;
+
+/// The most teams a project may have for its link to be kept: a project
+/// whose teams could not all be read is not linked.
+pub const MAX_PROJECT_TEAMS: usize = 50;
 
 /// One page of the comments on one team's issues.
 pub const COMMENTS_QUERY: &str = "query FleetRecallLinearComments($filter: CommentFilter!, \
@@ -275,6 +294,21 @@ impl LinearScopeV1 {
     }
 }
 
+/// A node named by its id only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct LinearIdV1 {
+    /// Its id.
+    pub id: String,
+}
+
+/// The ids of a connection's nodes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct LinearIdsV1 {
+    /// The nodes.
+    #[serde(default)]
+    pub nodes: Vec<LinearIdV1>,
+}
+
 /// A reference to another node.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct LinearRefV1 {
@@ -286,6 +320,12 @@ pub struct LinearRefV1 {
     /// Its name, when asked for.
     #[serde(default)]
     pub name: Option<String>,
+    /// Its team, when asked for (an issue's parent).
+    #[serde(default)]
+    pub team: Option<LinearIdV1>,
+    /// Its teams, when asked for (a project).
+    #[serde(default)]
+    pub teams: Option<LinearIdsV1>,
 }
 
 /// A bot or integration that acted.
@@ -342,6 +382,9 @@ pub struct LinearIssueV1 {
     /// Its workflow state.
     #[serde(default)]
     pub state: Option<LinearStateV1>,
+    /// Its team.
+    #[serde(default)]
+    pub team: Option<LinearIdV1>,
     /// The person who created it.
     #[serde(default)]
     pub creator: Option<LinearRefV1>,
@@ -461,6 +504,31 @@ struct CommentsAnswerV1 {
     comments: ConnectionV1,
 }
 
+/// Where one issue the memory holds is now.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinearIssuePlaceV1 {
+    /// Its id.
+    pub id: String,
+    /// When it last changed.
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// Its team.
+    #[serde(default)]
+    pub team: Option<LinearIdV1>,
+}
+
+#[derive(Deserialize)]
+struct IssueTeamsNodesV1 {
+    #[serde(default)]
+    nodes: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct IssueTeamsAnswerV1 {
+    issues: IssueTeamsNodesV1,
+}
+
 /// One page of a listing.
 #[derive(Debug, Clone)]
 pub struct LinearPageV1<T> {
@@ -514,6 +582,18 @@ pub fn issue_filter(team: &str, since: Option<&str>) -> serde_json::Value {
         filter["updatedAt"] = serde_json::json!({"gt": since});
     }
     filter
+}
+
+/// The filter of a listing of every comment on one issue.
+#[must_use]
+pub fn issue_comment_filter(issue: &str) -> serde_json::Value {
+    serde_json::json!({"issue": {"id": {"eq": issue}}})
+}
+
+/// The filter of a lookup of issues by id.
+#[must_use]
+pub fn issue_id_filter(ids: &[String]) -> serde_json::Value {
+    serde_json::json!({"id": {"in": ids}})
 }
 
 /// The filter of a listing of the comments on a team's issues.
@@ -641,6 +721,69 @@ impl LinearApiV1 {
             "ostk-linear-comment-v1",
             RateLimitV1::of(&response),
         ))
+    }
+
+    /// One page of every comment on `issue`, whatever its `updatedAt`,
+    /// from `after`.
+    ///
+    /// # Errors
+    ///
+    /// Every [`LinearCallErrorV1`].
+    pub async fn issue_comments_page(
+        &self,
+        issue: &str,
+        after: Option<&str>,
+    ) -> Result<LinearPageV1<LinearCommentV1>, LinearCallErrorV1> {
+        let response = self
+            .call(
+                "FleetRecallLinearComments",
+                COMMENTS_QUERY,
+                serde_json::json!({
+                    "filter": issue_comment_filter(issue),
+                    "first": self.page_size,
+                    "after": after,
+                }),
+            )
+            .await?;
+        let answer: CommentsAnswerV1 = decode(&response)?;
+        Ok(page(
+            answer.comments,
+            "ostk-linear-comment-v1",
+            RateLimitV1::of(&response),
+        ))
+    }
+
+    /// Where each of `ids` (at most [`MAX_ISSUE_TEAMS_BATCH`]) is now: the
+    /// issues the credential can see, by id. An issue missing from the answer
+    /// is one it cannot see. A node that does not parse is left out, as if
+    /// unseen.
+    ///
+    /// # Errors
+    ///
+    /// Every [`LinearCallErrorV1`].
+    pub async fn issue_places(
+        &self,
+        ids: &[String],
+    ) -> Result<(Vec<LinearIssuePlaceV1>, RateLimitV1), LinearCallErrorV1> {
+        let ids = &ids[..ids.len().min(MAX_ISSUE_TEAMS_BATCH)];
+        let response = self
+            .call(
+                "FleetRecallLinearIssueTeams",
+                ISSUE_TEAMS_QUERY,
+                serde_json::json!({
+                    "filter": issue_id_filter(ids),
+                    "first": ids.len(),
+                }),
+            )
+            .await?;
+        let answer: IssueTeamsAnswerV1 = decode(&response)?;
+        let places = answer
+            .issues
+            .nodes
+            .into_iter()
+            .filter_map(|value| serde_json::from_value(value).ok())
+            .collect();
+        Ok((places, RateLimitV1::of(&response)))
     }
 }
 

@@ -19,11 +19,18 @@
 //! * **Links.** An issue links its parent issue (`parent`) and its project
 //!   (`project`) by their Linear URLs, and every `http(s)` link in the
 //!   markdown is an outbound `url` link, labelled when it is `[label](url)`.
+//!   A parent issue's URL carries its identifier and a slug of its title, and
+//!   a project's link carries its name, so each is kept only when the pass
+//!   admits every team it belongs to: a public issue never carries the key
+//!   and title of a sub-issue parent in a private team, or a project shared
+//!   with one.
 //!   Links are exact strings, so a Slack message that links an issue's URL is
 //!   found among the issue's inbound links.
 //! * **Authors.** A person (`creator`, `user`) is kept by id only (a display
 //!   name is a mutable profile field); a bot (`botActor`) by its id, else its
 //!   kind, with its name; an external user by id.
+
+use std::collections::BTreeSet;
 
 use crate::collectors::draft::{
     CollectedItemDraftV1, DraftAuthorV1, DraftContainerV1, DraftLinkV1, DraftSectionV1,
@@ -35,7 +42,7 @@ use crate::memory_contracts::collected_item::{
 };
 use crate::memory_contracts::common::CanonicalTimestamp;
 
-use super::graphql::{LinearBotV1, LinearCommentV1, LinearIssueV1, LinearRefV1};
+use super::graphql::{LinearBotV1, LinearCommentV1, LinearIssueV1, LinearRefV1, MAX_PROJECT_TEAMS};
 
 /// The provider kind.
 pub const LINEAR_PROVIDER: &str = "linear";
@@ -63,6 +70,37 @@ pub struct LinearTeamContextV1<'a> {
     pub team_id: &'a str,
     /// The team's key (`ENG`).
     pub team_key: Option<&'a str>,
+    /// Every team the pass admits, by id: what a link to another node
+    /// (a parent issue, a project) may belong to.
+    pub admitted_teams: &'a BTreeSet<String>,
+}
+
+impl LinearTeamContextV1<'_> {
+    fn admits(&self, team: &str) -> bool {
+        team.eq_ignore_ascii_case(self.team_id)
+            || self
+                .admitted_teams
+                .iter()
+                .any(|admitted| admitted.eq_ignore_ascii_case(team))
+    }
+
+    /// Whether a parent issue may be linked: its team is admitted.
+    fn admits_parent(&self, parent: &LinearRefV1) -> bool {
+        parent
+            .team
+            .as_ref()
+            .is_some_and(|team| self.admits(&team.id))
+    }
+
+    /// Whether a project may be linked: every one of its teams is admitted,
+    /// and the answer named them all.
+    fn admits_project(&self, project: &LinearRefV1) -> bool {
+        project.teams.as_ref().is_some_and(|teams| {
+            !teams.nodes.is_empty()
+                && teams.nodes.len() < MAX_PROJECT_TEAMS
+                && teams.nodes.iter().all(|team| self.admits(&team.id))
+        })
+    }
 }
 
 /// Whether `value` can be a Linear id: 1 to 64 ASCII letters, digits, and
@@ -99,12 +137,24 @@ fn container(context: &LinearTeamContextV1<'_>) -> DraftContainerV1 {
     }
 }
 
+/// The object kind of an issue or a comment.
+#[must_use]
+pub fn linear_object_kind(kind: &'static str) -> ObjectKindV1 {
+    token(ObjectKindV1::new(kind))
+}
+
 /// A Linear clock, and its order in microseconds.
 fn clock(value: &str) -> Result<(CanonicalTimestamp, u64), &'static str> {
     let timestamp =
         provider_timestamp(value).map_err(|_| "a Linear clock is not an RFC 3339 timestamp")?;
     let micros = timestamp_micros(&timestamp).map_err(|_| "a Linear clock has no order")?;
     Ok((timestamp, micros))
+}
+
+/// A Linear clock's order in microseconds, when it is one.
+#[must_use]
+pub fn linear_order(value: &str) -> Option<u64> {
+    clock(value).ok().map(|(_, micros)| micros)
 }
 
 /// Every `http(s)` link in markdown, in order, with its label when it is
@@ -241,11 +291,13 @@ pub fn issue_draft(
         let mut links = Vec::new();
         if let Some(parent) = &issue.parent
             && let Some(url) = &parent.url
+            && context.admits_parent(parent)
         {
             push_link(&mut links, "parent", url, None);
         }
         if let Some(project) = &issue.project
             && let Some(url) = &project.url
+            && context.admits_project(project)
         {
             push_link(&mut links, "project", url, project.name.as_deref());
         }
@@ -380,6 +432,7 @@ pub fn comment_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collectors::linear::graphql::{LinearIdV1, LinearIdsV1};
     use crate::memory_contracts::collected_item::derive_item_key;
 
     const ORG: &str = "0a9c0000-0000-4000-8000-0000000ac3e1";
@@ -392,13 +445,23 @@ mod tests {
     }
 
     fn draft(issue: &LinearIssueV1, team_key: &str) -> CollectedItemDraftV1 {
+        draft_admitting(issue, team_key, &[])
+    }
+
+    fn draft_admitting(
+        issue: &LinearIssueV1,
+        team_key: &str,
+        admitted: &[&str],
+    ) -> CollectedItemDraftV1 {
         let provider = ProviderKindV1::new(LINEAR_PROVIDER).unwrap();
+        let admitted: BTreeSet<String> = admitted.iter().map(|team| (*team).to_owned()).collect();
         issue_draft(
             &LinearTeamContextV1 {
                 provider: &provider,
                 provider_scope_id: ORG,
                 team_id: TEAM,
                 team_key: Some(team_key),
+                admitted_teams: &admitted,
             },
             issue,
         )
@@ -481,12 +544,17 @@ mod tests {
         issue.parent = Some(LinearRefV1 {
             id: "p1".into(),
             url: Some("https://linear.app/acme-robotics/issue/ENG-400/parent".into()),
-            name: None,
+            team: Some(LinearIdV1 { id: TEAM.into() }),
+            ..LinearRefV1::default()
         });
         issue.project = Some(LinearRefV1 {
             id: "9e0b1c2d-0000-4000-8000-0000000000a1".into(),
             url: Some("https://linear.app/acme-robotics/project/ingest-reliability".into()),
             name: Some("Ingest reliability".into()),
+            teams: Some(LinearIdsV1 {
+                nodes: vec![LinearIdV1 { id: TEAM.into() }],
+            }),
+            ..LinearRefV1::default()
         });
         issue.description = Some(
             "See [the thread](https://acme.slack.com/archives/C1/p1790006645000200) and \
@@ -536,17 +604,64 @@ mod tests {
     }
 
     #[test]
+    fn a_parent_or_project_in_a_team_the_pass_does_not_admit_is_not_linked() {
+        const SEC: &str = "5f7c9e10-2b3c-4d4e-8f90-8b7c6d5e4f30";
+        let mut issue = fixture_issue();
+        issue.description = None;
+        issue.parent = Some(LinearRefV1 {
+            id: "p1".into(),
+            url: Some("https://linear.app/acme-robotics/issue/SEC-12/acquire-contoso".into()),
+            team: Some(LinearIdV1 { id: SEC.into() }),
+            ..LinearRefV1::default()
+        });
+        issue.project = Some(LinearRefV1 {
+            id: "9e0b1c2d-0000-4000-8000-0000000000a2".into(),
+            url: Some("https://linear.app/acme-robotics/project/contoso".into()),
+            name: Some("Contoso".into()),
+            teams: Some(LinearIdsV1 {
+                nodes: vec![
+                    LinearIdV1 { id: TEAM.into() },
+                    LinearIdV1 { id: SEC.into() },
+                ],
+            }),
+            ..LinearRefV1::default()
+        });
+        let hidden = draft(&issue, "ENG");
+        assert!(hidden.links.is_empty(), "{} links", hidden.links.len());
+        let rendered: String = hidden
+            .sections
+            .iter()
+            .map(|section| section.text.as_str())
+            .chain(hidden.title.as_deref())
+            .collect();
+        assert!(!rendered.contains("SEC-12") && !rendered.contains("Contoso"));
+
+        // A parent or project whose teams are unknown is not linked either.
+        let mut unknown = issue.clone();
+        unknown.parent.as_mut().unwrap().team = None;
+        unknown.project.as_mut().unwrap().teams = None;
+        assert!(draft(&unknown, "ENG").links.is_empty());
+
+        // Admitted, both are linked.
+        let shown = draft_admitting(&issue, "ENG", &[SEC]);
+        let rels: Vec<&str> = shown.links.iter().map(|link| link.rel.as_str()).collect();
+        assert_eq!(rels, ["parent", "project"]);
+    }
+
+    #[test]
     fn a_comment_is_threaded_on_its_issue_and_parent() {
         let page: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/comments_page.json")).unwrap();
         let comment: LinearCommentV1 =
             serde_json::from_value(page["data"]["comments"]["nodes"][1].clone()).unwrap();
         let provider = ProviderKindV1::new(LINEAR_PROVIDER).unwrap();
+        let admitted = BTreeSet::new();
         let context = LinearTeamContextV1 {
             provider: &provider,
             provider_scope_id: ORG,
             team_id: TEAM,
             team_key: Some("ENG"),
+            admitted_teams: &admitted,
         };
         let CommentDraftV1::Item(draft) = comment_draft(&context, &comment).unwrap() else {
             panic!("a comment with a body is an item");
