@@ -114,13 +114,36 @@ Webhooks only shorten the pull interval: each is kept as a hint (provider ids,
 no content), and the next tick re-reads the object through the collector's
 own token, or hides a deleted one.
 
-1. **The login.** Create `fleet_ingress` `NOLOGIN` (with its password),
-   apply
-   [`ingress-receiver-role-grants.sql`](../deploy/cockroach/ingress-receiver-role-grants.sql)
-   after migration 36, clean its PUBLIC defaults, and enable it:
-   `deploy/localstack/ingress-boundary.sh` does all of that on a local node,
-   and [cloud onboarding](CLOUD_ONBOARDING.md) step 6 describes the audit
-   around it elsewhere.
+1. **The login.** After migration 36, a cluster admin runs these in order.
+   The policy's PUBLIC future-default gate refuses to apply while the
+   principal still holds the routine default its creation left, so the
+   cleanup comes before the policy, not after it:
+   1. Create `fleet_ingress` `NOLOGIN` with its password and without
+      `admin` (on a rerun, set it back to `NOLOGIN` first).
+   2. Clean its PUBLIC defaults: `GRANT fleet_ingress TO root`, then in each
+      of `fleet_recall`, `defaultdb`, and `postgres` run the statements
+      below, then `REVOKE fleet_ingress FROM root`.
+   3. Apply
+      [`ingress-receiver-role-grants.sql`](../deploy/cockroach/ingress-receiver-role-grants.sql)
+      in `fleet_recall`.
+   4. Clean the PUBLIC defaults of the `fleet_ingress_receiver` role it
+      created the same way (`FOR ROLE fleet_ingress_receiver, fleet_ingress`,
+      under a temporary membership in both).
+   5. Enable the login: `ALTER USER fleet_ingress WITH LOGIN`.
+
+   ```sql
+   ALTER DEFAULT PRIVILEGES FOR ROLE fleet_ingress
+       REVOKE EXECUTE ON ROUTINES FROM public;
+   ALTER DEFAULT PRIVILEGES FOR ALL ROLES
+       REVOKE EXECUTE ON ROUTINES FROM public;
+   REVOKE CREATE ON SCHEMA public FROM public;
+   ```
+
+   `deploy/localstack/ingress-boundary.sh` runs exactly these steps on the
+   quickstart's insecure node. It connects with `cockroach sql --insecure`
+   to `cockroach:26257`, so on a node with TLS and passwords run the
+   statements yourself; [cloud onboarding](CLOUD_ONBOARDING.md) step 6
+   describes the audit around them on a shared cluster.
 2. **The signing secrets.** Add `"push": {"signing_secret_env": ...}` to each
    collector that takes webhooks, naming a variable in the collector's own
    namespace (`FLEET_RECALL_SLACK_SIGNING_SECRET`,

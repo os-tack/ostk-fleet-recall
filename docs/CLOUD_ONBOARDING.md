@@ -283,7 +283,11 @@ and outside the AWS module: run it only where Slack, Linear, or Granola
 webhooks should shorten the worker's pull interval. It needs one more SQL
 user, `fleet_ingress`, created exact `NOLOGIN`
 (`CREATE USER fleet_ingress WITH NOLOGIN`) and without `admin`. After the
-complete successful prefix 1 through 36, a cluster admin applies
+complete successful prefix 1 through 36, a cluster admin revokes the PUBLIC
+routine default that creating the user left (the policy refuses to apply
+while it remains; the
+[collected-items runbook](COLLECTED_ITEMS_RUNBOOK.md#5-receive-webhooks)
+gives the statements and their order), then applies
 [`ingress-receiver-role-grants.sql`](../deploy/cockroach/ingress-receiver-role-grants.sql),
 which hardens the logical `fleet_ingress_receiver` role to `NOLOGIN` and
 grants it only `CONNECT`, `USAGE` on `public`, `SELECT` on
