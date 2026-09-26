@@ -721,16 +721,37 @@ conversation is refused in the settings) is one `slack.channel` container:
   externally shared (Slack Connect) conversation never is. An inadmissible
   channel is never read, its observation withdraws the container (which
   hides what was admitted through it), and it is outside the pass's domain;
-  listing it later re-opens it on the next read.
-- A pass is a **reconciliation** when none has run to its end within
-  `reconcile_every_seconds` (86,400 by default, the `slack.reconcile`
-  cursor); only a reconciliation writes coverage and `last_checked_at`. It
-  pages `conversations.history` over `[backfill_since, now)` (unset: the
-  whole history) on `next_cursor`, and `conversations.replies` for every
-  thread in it. An **incremental** pass reads the trailing `rescan_days` (7
-  by default) or from the channel's high-water mark when that is older, and
-  the replies of every thread whose `latest_reply` is past the channel's
-  reply cursor, so it picks up new messages, new replies, and edits.
+  listing it later re-opens it on the next read. A channel Slack no longer
+  finds (`channel_not_found`: deleted, or made private and the app removed,
+  the usual lockdown) is a narrowing, not a partial read, unless the
+  operator listed it: it is observed as restricted, which withdraws it until
+  a later `conversations.info` finds it readable again.
+- A pass is a **reconciliation** when one is under way, or none has run to
+  its end within `reconcile_every_seconds` (86,400 by default, the
+  `slack.reconcile` cursor); only a reconciliation writes coverage and
+  `last_checked_at`. It pages `conversations.history` over
+  `[backfill_since, now)` (unset: the whole history) on `next_cursor`, and
+  `conversations.replies` for every thread in it. An **incremental** pass
+  reads the trailing `rescan_days` (7 by default) or from the channel's
+  high-water mark when that is older, and the replies of every thread whose
+  `latest_reply` is past the channel's reply cursor, so it picks up new
+  messages, new replies, and edits.
+- **A read resumes.** A history page's threads are read, newest first,
+  before the next page, so every channel-level message and root at or after
+  the last root whose thread was read (the page's oldest message, once all
+  its threads are) has been read whole. A read cut short by the budget or a
+  rate limit records that `ts` in the channel's cursor with the read's kind,
+  and the next read of the same kind resumes before it (`latest`); a read of
+  the other kind starts over. A reconciliation is continued by the passes
+  after it until it reads its last channel: a channel its earlier passes read
+  to its end (its cursor names the reconciliation's start) is not read again
+  and what the memory holds of it is held current, so the manifest names
+  every current item, and the reconciliation records its start as the last
+  complete one when it ends. Each pass takes the channels in id order from
+  the one the last pass was cut short at (`resume_at`), so a budget or a
+  Tier-3 rate limit spent on the first channels never starves the later
+  ones. (Linear resumes from its stored `endCursor`, Granola from its stored
+  position; this is Slack's.)
 - A message is object kind `message`, external id `<channel>:<ts>` with the
   `ts` kept as Slack's exact string, marker `edited.ts` else `ts`, order the
   marker's microseconds; an edit is a new version that supersedes. A reply's
@@ -741,27 +762,37 @@ conversation is refused in the settings) is one `slack.channel` container:
   `file` link, never its content, with its own `t=xox...` token stripped.
   Membership and housekeeping messages are not items. A message the memory
   already holds at the same version and content is kept, not staged.
-- **Deletions need two complete reads.** A message the memory holds inside
-  what a complete read of its channel could see (a channel-level message or
-  root in the history window, or a reply in a thread read to its end) and
-  that the read did not return is counted in the channel's cursor; missing
-  from two consecutive complete reads, it gets a `deleted` tombstone at its
-  own order, which wins the tie. A `tombstone` message (a root deleted while
-  its replies remain) hides the root at once.
+- **Deletions need two reads that saw them missing.** A message the memory
+  holds inside what a read saw whole and that the read did not return is
+  counted in the channel's cursor; missing from two consecutive such reads,
+  it gets a `deleted` tombstone at its own order, which wins the tie. A read
+  sees whole the channel-level messages and roots of its window (a read cut
+  short: from where it got to, and a resumed one: before where it began),
+  and a reply when its thread was read to its end, or when its root is in
+  that range and was returned with no replies left, or not returned at all.
+  The last rule is what counts the replies of a thread whose every reply was
+  deleted: Slack reports its root with `reply_count` 0, so the thread is
+  never read again. A `tombstone` message (a root deleted while its replies
+  remain) hides the root at once.
 - **Partial reads.** Every call counts against `max_pages_per_tick`. An
-  `ok: false` for a channel (`not_in_channel`, `missing_scope`,
-  `channel_not_found`) leaves that channel partial and the pass goes on. A
+  `ok: false` for a channel (`not_in_channel`, `missing_scope`, a listed
+  channel not found) leaves that channel partial and the pass goes on. A
   rate limit or the page budget ends the pass: the channel in progress and
-  every later one are partial, their cursors are held (what was staged stays
-  staged, and a re-read stages nothing twice), and a reconciliation cut short
-  runs again on the next pass. A refused credential fails the pass. A
-  channel's cursor advances only with its last page, when the channel was
-  read to its end.
+  every later one are partial, what was staged stays staged, and the next
+  pass resumes where this one stopped. A refused credential fails the pass.
+  A channel's high-water marks advance only with its last page, when the
+  channel was read to its end.
 - A reconciliation's receipt window starts at `backfill_since` when that is
   later than the sources file's `coverage_since`: the pass covers only what
   it read.
 
-Reactions, reply counts, unfurls, presence, and file content are never read.
+Reactions, reply counts, unfurl text, presence, and file content are never
+content: a link unfurl (an attachment with `from_url`, `original_url`, or
+`is_app_unfurl`) is at most a link, since Slack adds, changes, and removes it
+without an edit, so it would mint a version at the same order, and its text
+is the linked page's, not the author's. A bot's own attachment is content.
+Requests are not paced: a Tier-3 rate limit ends the pass, and the next pass
+resumes.
 
 **Linear** (`src/collectors/linear`, provider `linear`). A personal API key
 (`lin_api_...`, sent as the `Authorization` header itself) or an OAuth access

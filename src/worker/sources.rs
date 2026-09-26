@@ -905,7 +905,7 @@ mod tests {
     fn a_collector_parses_with_its_provider_scope_and_settings() {
         let sources = parse(&with_collector(&serde_json::json!({
             "token_env": "FLEET_RECALL_SLACK_BOT_TOKEN",
-            "channels": ["C07PLATENG1"],
+            "channels": ["C07PLATENG1", "C07PRIVATE1"],
             "api_base": "https://slack.com/api"
         })))
         .expect("a collector with an env-named token is valid");
@@ -1021,7 +1021,7 @@ mod tests {
     fn a_collector_is_never_stale_between_its_reconciliations() {
         let mut value = with_collector(&serde_json::json!({
             "token_env": "FLEET_RECALL_SLACK_BOT_TOKEN",
-            "channels": ["C07PLATENG1"],
+            "channels": ["C07PLATENG1", "C07PRIVATE1"],
             "reconcile_every_seconds": 172_800
         }));
         let message = refusal(&value);

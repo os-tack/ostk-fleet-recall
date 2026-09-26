@@ -191,10 +191,14 @@ fn respond(world: &World, request: &FakeRequest) -> FakeReply {
                 return FakeReply::json(&json!({"ok": false, "error": error}));
             }
             let oldest = request.param("oldest").map(ts_micros);
+            let latest = request.param("latest").map(ts_micros);
             let mut messages: Vec<Value> = channel
                 .top
                 .iter()
-                .filter(|message| oldest.is_none_or(|oldest| message_ts(message) > oldest))
+                .filter(|message| {
+                    oldest.is_none_or(|oldest| message_ts(message) > oldest)
+                        && latest.is_none_or(|latest| message_ts(message) < latest)
+                })
                 .cloned()
                 .collect();
             messages.sort_by_key(|message| std::cmp::Reverse(message_ts(message)));
@@ -809,7 +813,7 @@ async fn live_slack_a_channel_the_bot_is_not_in_is_partial_when_configured() {
 }
 
 #[tokio::test]
-async fn live_slack_a_rate_limit_on_page_two_keeps_page_one_holds_the_cursor_and_the_next_tick_completes_when_configured()
+async fn live_slack_a_rate_limit_on_page_two_keeps_page_one_and_the_next_tick_resumes_after_it_when_configured()
  {
     let base = base_seconds();
     let mut world = World::new();
@@ -841,10 +845,9 @@ async fn live_slack_a_rate_limit_on_page_two_keeps_page_one_holds_the_cursor_and
     assert!(harness.search("alpha").await.hits.is_empty());
     assert_eq!(
         harness.cursors(&format!("slack.channel:{PLATENG}")).await,
-        0,
-        "the channel's cursor is held"
+        1,
+        "the channel's read records where it got to"
     );
-    assert_eq!(harness.cursors("slack.reconcile").await, 0);
     let partial = harness.search(MISSING).await;
     assert_eq!(partial.absence.verdict, AbsenceVerdictV1::Unknown);
     assert_eq!(
@@ -852,16 +855,27 @@ async fn live_slack_a_rate_limit_on_page_two_keeps_page_one_holds_the_cursor_and
         [AbsenceReasonV1::IncompleteCoverage]
     );
 
+    harness.fake.clear_requests();
     let report = harness.ok_tick(&sources).await;
     let source = Harness::source(&report);
     assert_eq!(
         source.counters["reconcile"], 1,
-        "the cut reconciliation runs again"
+        "the cut reconciliation continues"
     );
+    assert_eq!(source.counters["channels_resumed"], 1);
     assert_eq!(source.counters["containers_complete"], 1);
     assert_eq!(
-        source.counters["messages_unchanged"], 2,
-        "page one is not staged twice"
+        source.counters["messages_read"], 3,
+        "page one is not read again"
+    );
+    assert!(
+        harness
+            .fake
+            .requests()
+            .iter()
+            .filter(|request| request.path.ends_with("/conversations.history"))
+            .all(|request| request.param("latest") == Some(ts(base, 3).as_str())),
+        "the history resumes before the last message page one settled"
     );
     for word in ["alpha", "bravo", "charlie"] {
         assert_eq!(hits(&harness.search(word).await).len(), 1, "{word}");
@@ -957,6 +971,141 @@ async fn live_slack_a_channel_made_private_and_unlisted_is_withdrawn_and_hidden_
     // Listing it re-opens it: a pull may lift what a pull withdrew.
     let listed = harness.sources(&[PLATENG], &json!({"listed": [PLATENG]}));
     harness.ok_tick(&listed).await;
+    assert_eq!(harness.container(PLATENG).await.0, "ok");
+    assert_eq!(hits(&harness.search("heron").await).len(), 1);
+}
+
+#[tokio::test]
+async fn live_slack_a_reconciliation_cut_short_resumes_where_it_stopped_when_configured() {
+    let base = base_seconds();
+    let mut world = World::new();
+    let platform = world.channel(PLATENG, "plat-eng");
+    for (index, word) in [(0_u64, "alpha"), (10, "bravo"), (20, "charlie")] {
+        let (root_ts, reply_ts) = (ts(base, index), ts(base, index + 1));
+        platform
+            .top
+            .push(root(&root_ts, &format!("The {word} thread"), &reply_ts, 1));
+        platform.threads.insert(
+            root_ts.clone(),
+            vec![reply(
+                &reply_ts,
+                &root_ts,
+                &format!("A {word} gannet reply"),
+            )],
+        );
+    }
+    world.channel(RANDOM, "random").top = vec![message(&ts(base, 40), "The wombat note")];
+    let Some(harness) = Harness::new("slack-resume", world).await else {
+        return;
+    };
+    // Five calls a pass: less than one reconciliation needs.
+    let sources = harness.sources(&[PLATENG, RANDOM], &json!({"max_pages_per_tick": 5}));
+    let report = harness.ok_tick(&sources).await;
+    let source = Harness::source(&report);
+    assert_eq!(source.counters["reconcile"], 1);
+    assert_eq!(source.counters["page_budget_exhausted"], 1);
+    assert_eq!(source.counters["containers_complete"], 0);
+    assert!(harness.search("wombat").await.hits.is_empty());
+
+    // The next pass continues the same reconciliation from where it
+    // stopped, and reaches the channel the first never got to.
+    let report = harness.ok_tick(&sources).await;
+    let source = Harness::source(&report);
+    assert_eq!(source.counters["reconcile"], 1);
+    assert_eq!(source.counters["channels_resumed"], 1);
+    assert_eq!(source.counters["containers_complete"], 2);
+    assert_eq!(hits(&harness.search("wombat").await).len(), 1);
+    for word in ["alpha", "bravo", "charlie"] {
+        assert_eq!(
+            hits(&harness.search(&format!("{word} gannet")).await).len(),
+            1,
+            "{word}"
+        );
+    }
+    assert_eq!(
+        harness.search(MISSING).await.absence.verdict,
+        AbsenceVerdictV1::Absent,
+        "the reconciliation completed across two passes"
+    );
+    assert!(harness.last_checked_at().await.is_some());
+
+    // It ended: the next pass is incremental.
+    let report = harness.ok_tick(&sources).await;
+    assert_eq!(Harness::source(&report).counters["reconcile"], 0);
+}
+
+#[tokio::test]
+async fn live_slack_a_deleted_sole_reply_is_tombstoned_when_configured() {
+    let base = base_seconds();
+    let mut world = World::new();
+    let channel = world.channel(PLATENG, "plat-eng");
+    let (root_ts, reply_ts) = (ts(base, 0), ts(base, 5));
+    channel.top = vec![root(
+        &root_ts,
+        "Who owns the cormorant rollout?",
+        &reply_ts,
+        1,
+    )];
+    channel.threads.insert(
+        root_ts.clone(),
+        vec![reply(&reply_ts, &root_ts, "The puffin team does")],
+    );
+    let Some(harness) = Harness::new("slack-sole-reply", world).await else {
+        return;
+    };
+    let sources = harness.sources(&[PLATENG], &json!({}));
+    harness.ok_tick(&sources).await;
+    assert_eq!(hits(&harness.search("puffin").await).len(), 1);
+
+    // The only reply is deleted: the root reports no replies left.
+    harness
+        .world()
+        .channels
+        .get_mut(PLATENG)
+        .unwrap()
+        .threads
+        .clear();
+    harness.edit(PLATENG, 0, |root| {
+        root["reply_count"] = json!(0);
+        root.as_object_mut().unwrap().remove("latest_reply");
+    });
+    let first = harness.ok_tick(&sources).await;
+    assert_eq!(Harness::source(&first).counters["missing_once"], 1);
+    assert_eq!(hits(&harness.search("puffin").await).len(), 1);
+    let second = harness.ok_tick(&sources).await;
+    assert_eq!(Harness::source(&second).counters["tombstones"], 1);
+    assert!(harness.search("puffin").await.hits.is_empty());
+    assert!(harness.evidence("puffin").await.hits.is_empty());
+    assert_eq!(
+        harness.head(&external(PLATENG, &reply_ts)).await,
+        ("deleted".to_owned(), 2)
+    );
+    assert_eq!(hits(&harness.search("cormorant").await).len(), 1);
+}
+
+#[tokio::test]
+async fn live_slack_a_channel_that_is_gone_is_withdrawn_unless_listed_when_configured() {
+    let base = base_seconds();
+    let Some(harness) = Harness::new("slack-gone", thread_world(base)).await else {
+        return;
+    };
+    let sources = harness.sources(&[PLATENG], &json!({}));
+    harness.ok_tick(&sources).await;
+    assert_eq!(hits(&harness.search("heron").await).len(), 1);
+
+    // Deleted, or made private without the app: Slack says it is not found.
+    let kept = harness.world().channels.remove(PLATENG).unwrap();
+    let report = harness.ok_tick(&sources).await;
+    let source = Harness::source(&report);
+    assert_eq!(source.counters["channels_gone"], 1);
+    assert_eq!(source.counters["containers"], 0, "it is outside the domain");
+    assert_eq!(harness.container(PLATENG).await.0, "withdrawn");
+    assert!(harness.search("heron").await.hits.is_empty());
+    assert!(harness.evidence("heron").await.hits.is_empty());
+
+    // Readable again, it is re-opened.
+    harness.world().channels.insert(PLATENG.to_owned(), kept);
+    harness.ok_tick(&sources).await;
     assert_eq!(harness.container(PLATENG).await.0, "ok");
     assert_eq!(hits(&harness.search("heron").await).len(), 1);
 }

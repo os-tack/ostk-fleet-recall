@@ -380,7 +380,14 @@ and edits. A message missing from two consecutive complete reads is hidden as
 deleted. Messages keep their exact `ts`, edits supersede, mentions and links
 are rendered, and file content is never read (a file is a link, with its
 token stripped). A rate limit or `max_pages_per_tick` ends a pass partial,
-and the next pass picks it up. `api_base` (`https://slack.com/api` by
+and the next pass resumes where it stopped: a channel's read continues
+before the last message it settled, a reconciliation cut short is continued
+rather than started over, and the next pass starts at the channel the last
+one stopped at. A thread whose every reply was deleted has those replies
+hidden too. A channel Slack no longer finds (deleted, or made private without
+the app) is withdrawn and hidden unless listed.
+`audience.private_containers` must name channel ids that `channels` lists.
+Link unfurls are never message text. `api_base` (`https://slack.com/api` by
 default) must be on Slack's own host over https, or a loopback address (a
 local fake), and `token_env` must name a variable under
 `FLEET_RECALL_SLACK_`: a sources file can send the token nowhere else, and

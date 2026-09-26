@@ -12,54 +12,75 @@
 //! 1. `auth.test`: the token's `team_id` (and `enterprise_id`, when
 //!    `settings.enterprise_id` pins one) must equal the pin, or the pass fails
 //!    before it reads anything.
-//! 2. The pass is a **reconciliation** when none has finished within
-//!    `reconcile_every_seconds` (the `slack.reconcile` cursor), else an
-//!    **incremental** pass. Only a reconciliation writes coverage and the
-//!    status row's `last_checked_at`.
-//! 3. For each channel, in id order, `conversations.info` gives its name and
-//!    audience ([`api::SlackChannelInfoV1::audience`]), recorded as a
-//!    container observation. A direct, group-direct, or externally shared
-//!    conversation, and a private or org-shared one the operator did not list
-//!    in `audience.private_containers`, is never read: its observation
-//!    withdraws the container, which hides what was admitted through it, and
-//!    it is outside the pass's domain.
+//! 2. The pass is a **reconciliation** when one is under way, or none has
+//!    finished within `reconcile_every_seconds` (the `slack.reconcile`
+//!    cursor), else an **incremental** pass. Only a reconciliation writes
+//!    coverage and the status row's `last_checked_at`. A reconciliation cut
+//!    short is continued by the next pass, never started over: a channel its
+//!    earlier passes read to its end (its cursor records the reconciliation)
+//!    is not read again, and what the memory holds of it is held current, so
+//!    the manifest names every current item. It ends, and records its start
+//!    as the last complete one, in the pass that reads its last channel.
+//! 3. The channels are taken in id order, from the one the last pass was cut
+//!    short at, so the budget never starves the later ones. For each,
+//!    `conversations.info` gives its name and audience
+//!    ([`api::SlackChannelInfoV1::audience`]), recorded as a container
+//!    observation. A direct, group-direct, or externally shared conversation,
+//!    and a private or org-shared one the operator did not list in
+//!    `audience.private_containers`, is never read: its observation withdraws
+//!    the container, which hides what was admitted through it, and it is
+//!    outside the pass's domain. A channel Slack no longer finds
+//!    (`channel_not_found`: deleted, or made private without the app) is a
+//!    narrowing too, unless listed: it is observed as restricted, which
+//!    withdraws it until a later read finds it readable again.
 //! 4. `conversations.history` is paged on `next_cursor` from the window's
 //!    start (exclusive): `backfill_since` (else the channel's whole history)
 //!    for a reconciliation; for an incremental pass, the trailing
 //!    `rescan_days` or the channel's high-water mark, whichever is older, so a
 //!    rescan picks up edits (a new `edited.ts`) and a long outage is caught up.
-//! 5. `conversations.replies` reads every thread in the window on a
-//!    reconciliation, and on an incremental pass every thread whose
-//!    `latest_reply` is past the channel's reply cursor.
+//! 5. After each history page, `conversations.replies` reads that page's
+//!    threads, newest first: every thread on a reconciliation, and on an
+//!    incremental pass every thread whose `latest_reply` is past the
+//!    channel's reply cursor. Every channel-level message and root at or
+//!    after the last root whose thread was read (or the page's oldest
+//!    message, once its threads are read) is then read whole: that `ts` is
+//!    where a read cut short resumes (`latest`, exclusive), recorded in the
+//!    channel's cursor with the read's kind. A read of the other kind starts
+//!    over.
 //! 6. Every message becomes a draft ([`render::message_draft`]); one the
-//!    memory already holds at the same version and content is kept rather
-//!    than staged. Each API page is one sink transaction.
-//! 7. **Deletions.** A message the memory holds, inside what a complete read
-//!    of the channel could see (a channel-level message or root in the
-//!    history window, a reply in a thread read to its end), that the read did
-//!    not return is counted in the channel's cursor; missing from two
-//!    consecutive complete reads, it gets a `deleted` tombstone at its own
-//!    order (a tombstone wins the tie). A read that returned a message it
-//!    could not parse counts nothing missing. A `tombstone` message (a root
-//!    deleted while its replies remain) hides the root at once.
+//!    memory already holds at the same version and content, and not
+//!    withdrawn, is kept rather than staged. Each API page is one sink
+//!    transaction.
+//! 7. **Deletions.** A message the memory holds, inside what a read saw
+//!    whole, that the read did not return is counted in the channel's
+//!    cursor; missing from two consecutive such reads, it gets a `deleted`
+//!    tombstone at its own order (a tombstone wins the tie). A read saw whole
+//!    the channel-level messages and roots in its window (for a read cut
+//!    short, from where it got to), and a reply when its thread was read to
+//!    its end, or when its root is in that range and the read returned the
+//!    root with no replies left, or did not return the root at all: a thread
+//!    whose every reply was deleted is never read again, so its replies are
+//!    counted from the root. A read that returned a message it could not
+//!    parse counts nothing missing. A `tombstone` message (a root deleted
+//!    while its replies remain) hides the root at once.
 //! 8. The channel's cursor (high-water marks and missing counts) advances
-//!    with its last page, only when the channel was read to its end.
+//!    with its last page when the channel was read to its end, and records
+//!    where the read got to when the budget or a rate limit cut it short.
 //!
 //! # Partial reads
 //!
 //! Every call counts against `max_pages_per_tick`. `ok: false` for a channel
-//! (`not_in_channel`, `missing_scope`, `channel_not_found`) leaves that
+//! (`not_in_channel`, `missing_scope`, a listed channel not found) leaves that
 //! channel partial and the pass goes on. A rate limit (HTTP 429, or
 //! `ratelimited`) or the page budget ends the pass: the channel in progress
-//! and every later one are partial, their cursors are held (what was staged
-//! stays staged), and a reconciliation cut short is run again on the next
-//! pass. An unusable credential (`invalid_auth`, `token_revoked`, ...) fails
-//! the pass.
+//! and every later one are partial, what was staged stays staged, and the
+//! next pass resumes the channel in progress where it stopped. An unusable
+//! credential (`invalid_auth`, `token_revoked`, ...) fails the pass.
 //!
 //! # Deliberately absent
 //!
-//! Reactions, reply counts, unfurls, and presence are never read, and a file
-//! is a link, never its content. Direct and group-direct conversations are
+//! Reactions, reply counts, unfurl text, and presence are never content (an
+//! unfurl is at most a link), and a file is a link, never its content. Direct and group-direct conversations are
 //! never listed, fetched, or staged.
 
 pub mod api;
@@ -93,7 +114,9 @@ use super::pull::{
     ContainerOutcomeV1, ListingBoundV1, PageStager, PartialReasonV1, PullCollectorV1,
     PullPassInputV1, PullPassOutcomeV1, PulledItemV1,
 };
-use super::sink::{ContainerObservationV1, CursorAdvanceV1, DeadLetterReasonV1, KnownVersionV1};
+use super::sink::{
+    ContainerObservationV1, CursorAdvanceV1, DeadLetterReasonV1, KnownVersionV1, StagedItemV1,
+};
 use api::{PageMessageV1, SlackApiV1, SlackCallErrorV1};
 use render::{
     CHANNEL_CONTAINER_KIND, MESSAGE_OBJECT_KIND, MessageDraftV1, SLACK_PROVIDER,
@@ -143,10 +166,13 @@ const CURSOR_SCHEMA_VERSION: u32 = 1;
 const MICROS_PER_DAY: u64 = 86_400_000_000;
 
 /// Every counter a Slack pass reports.
-pub const SLACK_COUNTERS: [&str; 16] = [
+pub const SLACK_COUNTERS: [&str; 19] = [
     "reconcile",
     "api_calls",
     "channels_refused",
+    "channels_gone",
+    "channels_resumed",
+    "channels_already_reconciled",
     "messages_read",
     "messages_staged",
     "messages_unchanged",
@@ -322,7 +348,21 @@ impl CollectorAdapterV1 for SlackAdapterV1 {
     }
 
     fn validate(&self, source: &CollectorSourceV1) -> std::result::Result<(), String> {
-        SlackSettingsV1::from_source(source)?;
+        let settings = SlackSettingsV1::from_source(source)?;
+        for listed in &source.audience.private_containers {
+            if !is_slack_id(listed, &['C', 'G']) {
+                return Err(format!(
+                    "audience.private_containers: {listed:?} is not a channel id (C... or G...; \
+                     a channel's name is a label, not an id)"
+                ));
+            }
+            if !settings.channels.contains(listed) {
+                return Err(format!(
+                    "audience.private_containers lists {listed}, which settings.channels does \
+                     not"
+                ));
+            }
+        }
         if source.audience.operator_declared {
             return Err(
                 "a Slack workspace has an audience per channel: leave audience.operator_declared \
@@ -356,15 +396,48 @@ impl CollectorAdapterV1 for SlackAdapterV1 {
     }
 }
 
-/// When the last reconciliation that ran to its end started.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The reconciliation schedule, and where the last pass stopped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReconcileCursorV1 {
     schema_version: u32,
-    last_complete_micros: u64,
+    /// When the last reconciliation that ran to its end started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_complete_micros: Option<u64>,
+    /// When the reconciliation under way started. Every pass continues it
+    /// until it ends, and none reads again a channel it read to its end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    under_way: Option<u64>,
+    /// The channel the last pass was cut short at: the next pass starts
+    /// there, so a budget spent on the first channels never starves the
+    /// later ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_at: Option<String>,
 }
 
-/// What one channel's complete reads left behind.
+/// A channel read cut short by the page budget or a rate limit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelProgressV1 {
+    /// When the reconciliation the read belongs to started; `None` for an
+    /// incremental read. A read of another kind starts over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run: Option<u64>,
+    /// Every channel-level message and root at or after this `ts`, and the
+    /// thread of each, was read: the history resumes before it (`latest`).
+    latest: String,
+    /// The newest channel-level message or root the read saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    newest_top: Option<String>,
+    /// The newest `latest_reply` of a root the read saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    newest_reply: Option<String>,
+    /// The read refused an item, so the channel is partial when it ends.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    refused: bool,
+}
+
+/// What one channel's reads left behind.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChannelCursorV1 {
@@ -379,6 +452,16 @@ struct ChannelCursorV1 {
     /// `ts`: how many consecutive complete reads missed them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     missing: BTreeMap<String, u8>,
+    /// When the reconciliation that last read the channel to its end
+    /// started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reconciled: Option<u64>,
+    /// That reconciliation's read refused an item.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reconciled_refused: bool,
+    /// A read cut short, and where it resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    progress: Option<ChannelProgressV1>,
 }
 
 fn encode_cursor(
@@ -483,6 +566,40 @@ enum ListingV1 {
     Replies,
 }
 
+/// Where the channel-level messages a read saw every one of start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LowerV1 {
+    /// None: the read saw no range whole.
+    Nothing,
+    /// The channel's whole history.
+    All,
+    /// After this `ts` (exclusive): the window's start.
+    After(u64),
+    /// From this `ts` (inclusive): where a read cut short got to.
+    From(u64),
+}
+
+/// The channel-level messages and roots a read saw every one of, by `ts`
+/// in microseconds: those from `lower`, and before `before` (where a resumed
+/// read began), with the thread of each root that has replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewV1 {
+    lower: LowerV1,
+    before: Option<u64>,
+}
+
+impl ViewV1 {
+    fn contains(&self, micros: u64) -> bool {
+        let lower = match self.lower {
+            LowerV1::Nothing => false,
+            LowerV1::All => true,
+            LowerV1::After(start) => micros > start,
+            LowerV1::From(start) => micros >= start,
+        };
+        lower && self.before.is_none_or(|before| micros < before)
+    }
+}
+
 /// One channel's read in one pass.
 struct ChannelReadV1<'k> {
     provider: ProviderKindV1,
@@ -495,15 +612,25 @@ struct ChannelReadV1<'k> {
     known: &'k BTreeMap<String, KnownVersionV1>,
     /// Every `ts` the read returned.
     seen: BTreeSet<String>,
-    /// Roots with replies, and their newest reply.
-    roots: Vec<(SlackTsV1, SlackTsV1)>,
+    /// Roots the history returned with no replies left: a reply the memory
+    /// holds on one is missing.
+    childless: BTreeSet<String>,
+    /// The roots with replies on the history page being read, newest first,
+    /// with their newest reply.
+    page_roots: Vec<(SlackTsV1, SlackTsV1)>,
+    /// The oldest `ts` on the history page being read.
+    page_oldest: Option<SlackTsV1>,
     /// The newest channel-level message or root.
     newest_top: Option<SlackTsV1>,
+    /// The newest `latest_reply` of a root.
+    newest_reply: Option<SlackTsV1>,
     /// Threads read to their end.
     threads_read: BTreeSet<String>,
     /// A message the read returned was not the documented shape: its `ts`
     /// is unknown, so nothing is counted missing.
     malformed: bool,
+    /// The read refused an item: the channel is partial.
+    refused: bool,
 }
 
 impl ChannelReadV1<'_> {
@@ -524,6 +651,53 @@ impl ChannelReadV1<'_> {
         }
     }
 
+    /// Stage one page, and remember whether it refused an item.
+    async fn stage(
+        &mut self,
+        stager: &mut PageStager<'_>,
+        items: Vec<PulledItemV1>,
+        advances: &[CursorAdvanceV1],
+        observations: &[ContainerObservationV1],
+    ) -> Result<()> {
+        let outcome = stager.stage_page(items, advances, observations).await?;
+        self.refused |= outcome.items.iter().any(|item| {
+            matches!(
+                item,
+                StagedItemV1::Refused { reason, .. } if *reason != DeadLetterReasonV1::AudienceRefused
+            )
+        });
+        Ok(())
+    }
+
+    /// Remember what one history message says about the channel: the
+    /// page's oldest `ts`, the newest message, and each root's replies.
+    fn note_history(&mut self, message: &SlackMessageV1, ts: &SlackTsV1) {
+        if self.page_oldest.as_ref().is_none_or(|oldest| ts < oldest) {
+            self.page_oldest = Some(ts.clone());
+        }
+        if message.is_reply() {
+            return;
+        }
+        if self.newest_top.as_ref().is_none_or(|newest| ts > newest) {
+            self.newest_top = Some(ts.clone());
+        }
+        match message.latest_reply() {
+            Some(latest) => {
+                if self
+                    .newest_reply
+                    .as_ref()
+                    .is_none_or(|newest| latest > *newest)
+                {
+                    self.newest_reply = Some(latest.clone());
+                }
+                self.page_roots.push((ts.clone(), latest));
+            }
+            None => {
+                self.childless.insert(ts.as_str().to_owned());
+            }
+        }
+    }
+
     /// The items of one page to stage; unchanged messages are kept, and
     /// malformed ones dead-lettered.
     async fn page(
@@ -539,6 +713,7 @@ impl ChannelReadV1<'_> {
                 PageMessageV1::Message(message) => *message,
                 PageMessageV1::Malformed(digest) => {
                     self.malformed = true;
+                    self.refused = true;
                     state.bump("messages_dead_lettered");
                     stager
                         .dead_letter(
@@ -553,6 +728,7 @@ impl ChannelReadV1<'_> {
             };
             let Some(ts) = SlackTsV1::parse(&message.ts) else {
                 self.malformed = true;
+                self.refused = true;
                 state.bump("messages_dead_lettered");
                 stager
                     .dead_letter(
@@ -567,7 +743,9 @@ impl ChannelReadV1<'_> {
                     .await?;
                 continue;
             };
-            if listing == ListingV1::Replies && !message.is_reply() {
+            if listing == ListingV1::History {
+                self.note_history(&message, &ts);
+            } else if !message.is_reply() {
                 // The thread's root, which the history already returned.
                 continue;
             }
@@ -576,14 +754,6 @@ impl ChannelReadV1<'_> {
                 continue;
             }
             state.bump("messages_read");
-            if !message.is_reply() {
-                if self.newest_top.as_ref().is_none_or(|newest| ts > *newest) {
-                    self.newest_top = Some(ts.clone());
-                }
-                if let Some(latest) = message.latest_reply() {
-                    self.roots.push((ts.clone(), latest));
-                }
-            }
             let external_id = message_external_id(&self.channel, ts.as_str());
             let known = self
                 .known
@@ -622,12 +792,34 @@ impl ChannelReadV1<'_> {
         Ok(items)
     }
 
-    /// After a complete read: tombstones for what two consecutive complete
-    /// reads missed, and the missing counts to keep.
+    /// Whether a message the memory holds was one the read could see: a
+    /// channel-level message or root in `view`; a reply in a thread read to
+    /// its end, or on a root in `view` that the read returned with no
+    /// replies left, or did not return at all.
+    fn in_view(
+        &self,
+        external_id: &str,
+        known: &KnownVersionV1,
+        ts: &SlackTsV1,
+        view: ViewV1,
+    ) -> bool {
+        let prefix_len = self.channel.len() + 1;
+        match known.thread_root.as_deref() {
+            Some(root) if root != external_id => root.get(prefix_len..).is_some_and(|root| {
+                self.threads_read.contains(root)
+                    || (SlackTsV1::parse(root).is_some_and(|root| view.contains(root.micros()))
+                        && (self.childless.contains(root) || !self.seen.contains(root)))
+            }),
+            _ => view.contains(ts.micros()),
+        }
+    }
+
+    /// After a read of `view`: tombstones for what two consecutive reads
+    /// that could see it missed, and the missing counts to keep.
     fn missing(
         &self,
         stored: &BTreeMap<String, u8>,
-        oldest: Option<&SlackTsV1>,
+        view: ViewV1,
         state: &mut PassStateV1,
     ) -> (Vec<PulledItemV1>, BTreeMap<String, u8>) {
         let prefix = format!("{}:", self.channel);
@@ -645,14 +837,8 @@ impl ChannelReadV1<'_> {
             let Some(ts) = SlackTsV1::parse(ts_text) else {
                 continue;
             };
-            let in_view = match known.thread_root.as_deref() {
-                Some(root) if root != external_id => root
-                    .strip_prefix(&prefix)
-                    .is_some_and(|root| self.threads_read.contains(root)),
-                _ => oldest.is_none_or(|oldest| ts.micros() > oldest.micros()),
-            };
             let before = stored.get(ts_text).copied().unwrap_or(0);
-            if !in_view {
+            if !self.in_view(external_id, known, &ts, view) {
                 if before > 0 {
                     kept.insert(ts_text.to_owned(), before);
                 }
@@ -679,14 +865,48 @@ impl ChannelReadV1<'_> {
     }
 }
 
+/// Hold current what the memory holds of `channel`: every message whose
+/// channel-level message or root is at or after `from` (every one, with no
+/// bound), unless it is a tombstone or withdrawn. What a reconciliation read
+/// in an earlier pass, so its manifest names every current item.
+fn hold_channel(
+    known: &BTreeMap<String, KnownVersionV1>,
+    channel: &str,
+    key: Sha256Digest,
+    from: Option<&SlackTsV1>,
+    stager: &mut PageStager<'_>,
+) {
+    let prefix = format!("{channel}:");
+    for (external_id, version) in known
+        .range(prefix.clone()..)
+        .take_while(|(external_id, _)| external_id.starts_with(&prefix))
+    {
+        if version.lifecycle.is_tombstone() || version.withdrawn {
+            continue;
+        }
+        let top = match version.thread_root.as_deref() {
+            Some(root) if root != external_id => root,
+            _ => external_id.as_str(),
+        };
+        let at = top.strip_prefix(&prefix).and_then(SlackTsV1::parse);
+        if from.is_none_or(|from| at.is_some_and(|at| at.micros() >= from.micros())) {
+            stager.keep(Some(key), version);
+        }
+    }
+}
+
 /// Everything one channel's read is given.
 struct ChannelInputV1<'a> {
     input: &'a PullPassInputV1<'a>,
     channel: &'a str,
     key: Sha256Digest,
     workspace: Option<&'a str>,
-    reconcile: bool,
+    /// When the reconciliation this read belongs to started; `None` for an
+    /// incremental read.
+    run: Option<u64>,
     known: &'a BTreeMap<String, KnownVersionV1>,
+    /// The channel's cursor.
+    cursor: ChannelCursorV1,
 }
 
 impl SlackPullV1 {
@@ -724,8 +944,67 @@ impl SlackPullV1 {
         .map(SlackTsV1::from_micros)
     }
 
+    /// One channel's cursor.
+    async fn channel_cursor(
+        stager: &PageStager<'_>,
+        channel: &str,
+        state: &mut PassStateV1,
+    ) -> Result<ChannelCursorV1> {
+        Ok(
+            match stager.read_cursor(&channel_cursor_domain(channel)).await? {
+                Some(stored) => decode_cursor(
+                    &stored.cursor_state,
+                    |cursor: &ChannelCursorV1| cursor.schema_version,
+                    &mut state.counters,
+                )
+                .unwrap_or_default(),
+                None => ChannelCursorV1::default(),
+            },
+        )
+    }
+
+    /// Read one thread to its end: `None` when it was, else why it stopped.
+    async fn thread(
+        &self,
+        read: &mut ChannelReadV1<'_>,
+        root: &SlackTsV1,
+        state: &mut PassStateV1,
+        stager: &mut PageStager<'_>,
+    ) -> Result<Option<PartialReasonV1>> {
+        let mut page_cursor: Option<String> = None;
+        loop {
+            if !state.take_call() {
+                return Ok(Some(PartialReasonV1::ListingBound));
+            }
+            let page = match self
+                .api
+                .replies_page(&read.channel, root.as_str(), page_cursor.as_deref())
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => return Ok(Some(state.refusal(error)?)),
+            };
+            let items = read
+                .page(stager, page.messages, ListingV1::Replies, state)
+                .await?;
+            if !items.is_empty() {
+                read.stage(stager, items, &[], &[]).await?;
+            }
+            if page.unfinished {
+                return Ok(Some(PartialReasonV1::Unreadable));
+            }
+            match page.next_cursor {
+                Some(next) => page_cursor = Some(next),
+                None => break,
+            }
+        }
+        read.threads_read.insert(root.as_str().to_owned());
+        state.bump("threads_read");
+        Ok(None)
+    }
+
     /// Read one channel. See the module documentation.
-    #[allow(clippy::too_many_lines)] // one linear info -> history -> replies -> settle read
+    #[allow(clippy::too_many_lines)] // one linear info -> history and threads -> settle read
     async fn channel(
         &self,
         channel: ChannelInputV1<'_>,
@@ -733,6 +1012,14 @@ impl SlackPullV1 {
         stager: &mut PageStager<'_>,
     ) -> Result<ChannelEndV1> {
         let name = channel.channel;
+        let kind = ContainerKindV1::new(CHANNEL_CONTAINER_KIND)?;
+        let listed = channel
+            .input
+            .source
+            .audience
+            .private_containers
+            .iter()
+            .any(|listed| listed == name);
         if !state.take_call() {
             return Ok(ChannelEndV1::Listed(ListingBoundV1::Truncated(
                 PartialReasonV1::ListingBound,
@@ -740,6 +1027,26 @@ impl SlackPullV1 {
         }
         let info = match self.api.conversation_info(name).await {
             Ok(info) => info,
+            Err(SlackCallErrorV1::Refused(code)) if code == "channel_not_found" && !listed => {
+                // Deleted, or made private without the app in it: a
+                // narrowing, never a partial read. Observed as restricted,
+                // it withdraws what was admitted through it until a later
+                // read finds it readable again.
+                stager
+                    .stage_page(
+                        Vec::new(),
+                        &[],
+                        &[ContainerObservationV1 {
+                            kind,
+                            id: name.to_owned(),
+                            label: None,
+                            provider_audience: ProviderAudienceV1::Restricted,
+                        }],
+                    )
+                    .await?;
+                state.bump("channels_gone");
+                return Ok(ChannelEndV1::Outside);
+            }
             Err(error) => {
                 return Ok(ChannelEndV1::Listed(ListingBoundV1::Truncated(
                     state.refusal(error)?,
@@ -747,7 +1054,6 @@ impl SlackPullV1 {
             }
         };
         let audience = info.audience();
-        let kind = ContainerKindV1::new(CHANNEL_CONTAINER_KIND)?;
         let observation = ContainerObservationV1 {
             kind,
             id: name.to_owned(),
@@ -772,17 +1078,24 @@ impl SlackPullV1 {
             state.bump("channels_refused");
             return Ok(ChannelEndV1::Outside);
         }
-        let domain = channel_cursor_domain(name);
-        let cursor: ChannelCursorV1 = match stager.read_cursor(&domain).await? {
-            Some(stored) => decode_cursor(
-                &stored.cursor_state,
-                |cursor: &ChannelCursorV1| cursor.schema_version,
-                &mut state.counters,
-            )
-            .unwrap_or_default(),
-            None => ChannelCursorV1::default(),
-        };
-        let oldest = self.window(channel.reconcile, &cursor, channel.input.pass_order_micros);
+        let cursor = channel.cursor;
+        let run = channel.run;
+        let oldest = self.window(run.is_some(), &cursor, channel.input.pass_order_micros);
+        // A read of the same kind cut short resumes before where it got to.
+        let resumed = cursor
+            .progress
+            .clone()
+            .filter(|progress| progress.run == run);
+        let before = resumed
+            .as_ref()
+            .and_then(|progress| SlackTsV1::parse(&progress.latest));
+        if let Some(before) = &before {
+            state.bump("channels_resumed");
+            if run.is_some() {
+                hold_channel(channel.known, name, channel.key, Some(before), stager);
+            }
+        }
+        let parsed = |value: Option<&String>| value.and_then(|value| SlackTsV1::parse(value));
         let mut read = ChannelReadV1 {
             provider: ProviderKindV1::new(SLACK_PROVIDER)?,
             scope: scope.to_owned(),
@@ -793,17 +1106,26 @@ impl SlackPullV1 {
             audience,
             known: channel.known,
             seen: BTreeSet::new(),
-            roots: Vec::new(),
-            newest_top: None,
+            childless: BTreeSet::new(),
+            page_roots: Vec::new(),
+            page_oldest: None,
+            newest_top: parsed(resumed.as_ref().and_then(|p| p.newest_top.as_ref())),
+            newest_reply: parsed(resumed.as_ref().and_then(|p| p.newest_reply.as_ref())),
             threads_read: BTreeSet::new(),
             malformed: false,
+            refused: resumed.as_ref().is_some_and(|progress| progress.refused),
         };
+        let reply_mark = cursor.reply_ts.as_deref().and_then(SlackTsV1::parse);
         let mut observation = Some(observation);
         let mut bound = ListingBoundV1::Complete;
+        // Every channel-level message and root at or after it, with its
+        // thread, has been read.
+        let mut boundary = before.clone();
 
-        // The history, newest first.
+        // The history, newest first, each page's threads read before the
+        // next page.
         let mut page_cursor: Option<String> = None;
-        loop {
+        'history: loop {
             if !state.take_call() {
                 bound = ListingBoundV1::Truncated(PartialReasonV1::ListingBound);
                 break;
@@ -813,6 +1135,7 @@ impl SlackPullV1 {
                 .history_page(
                     name,
                     oldest.as_ref().map(SlackTsV1::as_str),
+                    before.as_ref().map(SlackTsV1::as_str),
                     page_cursor.as_deref(),
                 )
                 .await
@@ -823,12 +1146,31 @@ impl SlackPullV1 {
                     break;
                 }
             };
+            read.page_roots.clear();
+            read.page_oldest = None;
             let items = read
                 .page(stager, page.messages, ListingV1::History, state)
                 .await?;
             let observations: Vec<ContainerObservationV1> =
                 observation.take().into_iter().collect();
-            stager.stage_page(items, &[], &observations).await?;
+            read.stage(stager, items, &[], &observations).await?;
+            let roots: Vec<SlackTsV1> = std::mem::take(&mut read.page_roots)
+                .into_iter()
+                .filter(|(_, latest)| {
+                    run.is_some() || reply_mark.as_ref().is_none_or(|mark| latest > mark)
+                })
+                .map(|(root, _)| root)
+                .collect();
+            for root in roots {
+                if let Some(reason) = self.thread(&mut read, &root, state, stager).await? {
+                    bound = ListingBoundV1::Truncated(reason);
+                    break 'history;
+                }
+                boundary = Some(root);
+            }
+            if let Some(oldest_on_page) = read.page_oldest.clone() {
+                boundary = Some(oldest_on_page);
+            }
             if page.unfinished {
                 bound = ListingBoundV1::Truncated(PartialReasonV1::Unreadable);
                 break;
@@ -839,63 +1181,25 @@ impl SlackPullV1 {
             }
         }
 
-        // The threads.
-        let reply_mark = cursor.reply_ts.as_deref().and_then(SlackTsV1::parse);
-        if bound == ListingBoundV1::Complete {
-            let threads: Vec<SlackTsV1> = read
-                .roots
-                .iter()
-                .filter(|(_, latest)| {
-                    channel.reconcile || reply_mark.as_ref().is_none_or(|mark| latest > mark)
-                })
-                .map(|(root, _)| root.clone())
-                .collect();
-            'threads: for root in threads {
-                let mut page_cursor: Option<String> = None;
-                loop {
-                    if !state.take_call() {
-                        bound = ListingBoundV1::Truncated(PartialReasonV1::ListingBound);
-                        break 'threads;
-                    }
-                    let page = match self
-                        .api
-                        .replies_page(name, root.as_str(), page_cursor.as_deref())
-                        .await
-                    {
-                        Ok(page) => page,
-                        Err(error) => {
-                            bound = ListingBoundV1::Truncated(state.refusal(error)?);
-                            break 'threads;
-                        }
-                    };
-                    let items = read
-                        .page(stager, page.messages, ListingV1::Replies, state)
-                        .await?;
-                    if !items.is_empty() {
-                        stager.stage_page(items, &[], &[]).await?;
-                    }
-                    if page.unfinished {
-                        bound = ListingBoundV1::Truncated(PartialReasonV1::Unreadable);
-                        break 'threads;
-                    }
-                    match page.next_cursor {
-                        Some(next) => page_cursor = Some(next),
-                        None => break,
-                    }
-                }
-                read.threads_read.insert(root.as_str().to_owned());
-                state.bump("threads_read");
-            }
-        }
-
-        // A complete read tombstones what two complete reads missed and
-        // advances the cursor; a partial one holds it.
+        // A read that reached its end, or that the budget or a rate limit
+        // cut short, settles what it saw whole: tombstones for what two reads
+        // that could see it missed, and the cursor. Any other read holds it.
         let observations: Vec<ContainerObservationV1> = observation.take().into_iter().collect();
-        if bound == ListingBoundV1::Complete {
+        let stopped = bound != ListingBoundV1::Complete && state.stop.is_some();
+        if bound == ListingBoundV1::Complete || stopped {
+            let view = ViewV1 {
+                lower: match (stopped, &boundary, &oldest) {
+                    (true, Some(boundary), _) => LowerV1::From(boundary.micros()),
+                    (true, None, _) => LowerV1::Nothing,
+                    (false, _, Some(oldest)) => LowerV1::After(oldest.micros()),
+                    (false, _, None) => LowerV1::All,
+                },
+                before: before.as_ref().map(SlackTsV1::micros),
+            };
             let (tombstones, missing) = if read.malformed {
                 (Vec::new(), cursor.missing.clone())
             } else {
-                read.missing(&cursor.missing, oldest.as_ref(), state)
+                read.missing(&cursor.missing, view, state)
             };
             let newest = |stored: Option<&str>, read: Option<&SlackTsV1>| -> Option<SlackTsV1> {
                 let stored = stored.and_then(SlackTsV1::parse);
@@ -904,24 +1208,44 @@ impl SlackPullV1 {
                     (stored, read) => stored.or_else(|| read.cloned()),
                 }
             };
-            let history_ts = newest(cursor.history_ts.as_deref(), read.newest_top.as_ref());
-            let reply_ts = newest(
-                cursor.reply_ts.as_deref(),
-                read.roots.iter().map(|(_, latest)| latest).max(),
-            );
+            let mut next = cursor.clone();
+            next.schema_version = CURSOR_SCHEMA_VERSION;
+            next.missing = missing;
+            if stopped {
+                next.progress = boundary.map(|boundary| ChannelProgressV1 {
+                    run,
+                    latest: boundary.as_str().to_owned(),
+                    newest_top: read.newest_top.as_ref().map(|ts| ts.as_str().to_owned()),
+                    newest_reply: read.newest_reply.as_ref().map(|ts| ts.as_str().to_owned()),
+                    refused: read.refused,
+                });
+            } else {
+                let history_ts = newest(cursor.history_ts.as_deref(), read.newest_top.as_ref());
+                next.history_ts = history_ts.as_ref().map(|ts| ts.as_str().to_owned());
+                next.reply_ts = newest(cursor.reply_ts.as_deref(), read.newest_reply.as_ref())
+                    .map(|ts| ts.as_str().to_owned());
+                next.progress = None;
+                if let Some(started) = run {
+                    next.reconciled = Some(started);
+                    next.reconciled_refused = read.refused;
+                }
+                if read.refused {
+                    // A refusal in an earlier pass of this read.
+                    stager.mark_partial(Some(channel.key), PartialReasonV1::ItemRefused);
+                }
+            }
+            let high_water = next
+                .history_ts
+                .as_deref()
+                .and_then(SlackTsV1::parse)
+                .map(|ts| ts.micros());
             let advance = encode_cursor(
-                &ChannelCursorV1 {
-                    schema_version: CURSOR_SCHEMA_VERSION,
-                    history_ts: history_ts.as_ref().map(|ts| ts.as_str().to_owned()),
-                    reply_ts: reply_ts.map(|ts| ts.as_str().to_owned()),
-                    missing,
-                },
-                domain,
-                history_ts.map(|ts| ts.micros()),
+                &next,
+                channel_cursor_domain(name),
+                high_water,
                 channel.input.pass_seq,
             )?;
-            stager
-                .stage_page(tombstones, &[advance], &observations)
+            read.stage(stager, tombstones, &[advance], &observations)
                 .await?;
         } else if !observations.is_empty() {
             stager.stage_page(Vec::new(), &[], &observations).await?;
@@ -1001,21 +1325,30 @@ impl PullCollectorV1 for SlackPullV1 {
         }
         let workspace = workspace_origin(auth.url.as_deref());
 
-        let last_complete = match stager.read_cursor(RECONCILE_CURSOR_DOMAIN).await? {
+        let stored = match stager.read_cursor(RECONCILE_CURSOR_DOMAIN).await? {
             Some(stored) => decode_cursor(
                 &stored.cursor_state,
                 |cursor: &ReconcileCursorV1| cursor.schema_version,
                 &mut state.counters,
-            )
-            .map(|cursor| cursor.last_complete_micros),
+            ),
             None => None,
         };
+        let schedule = stored.clone().unwrap_or_else(|| ReconcileCursorV1 {
+            schema_version: CURSOR_SCHEMA_VERSION,
+            ..ReconcileCursorV1::default()
+        });
         let every = self
             .settings
             .reconcile_every_seconds
             .saturating_mul(1_000_000);
-        let reconcile =
-            last_complete.is_none_or(|last| input.pass_order_micros.saturating_sub(last) >= every);
+        let due = schedule
+            .last_complete_micros
+            .is_none_or(|last| input.pass_order_micros.saturating_sub(last) >= every);
+        // A reconciliation under way is continued; one that is due starts.
+        let run = schedule
+            .under_way
+            .or_else(|| due.then_some(input.pass_order_micros));
+        let reconcile = run.is_some();
         state.counters.insert("reconcile", u64::from(reconcile));
 
         let known = stager
@@ -1024,27 +1357,60 @@ impl PullCollectorV1 for SlackPullV1 {
         let kind = ContainerKindV1::new(CHANNEL_CONTAINER_KIND)?;
         let mut channels = self.settings.channels.clone();
         channels.sort();
-        let mut containers = Vec::with_capacity(channels.len());
-        for name in &channels {
+        // Start where the last pass was cut short, so every channel gets its
+        // turn at the budget; outcomes keep the channels' sorted order.
+        let first = schedule
+            .resume_at
+            .as_ref()
+            .and_then(|at| channels.iter().position(|channel| channel == at))
+            .unwrap_or(0);
+        let mut ends: Vec<(usize, Sha256Digest, ChannelEndV1)> = Vec::with_capacity(channels.len());
+        let mut resume_at: Option<String> = None;
+        for index in (first..channels.len()).chain(0..first) {
+            let name = &channels[index];
             let key = stager.container_key(&kind, name);
-            let end = match state.stop {
-                Some(reason) => ChannelEndV1::Listed(ListingBoundV1::Truncated(reason)),
-                None => {
-                    self.channel(
-                        ChannelInputV1 {
-                            input,
-                            channel: name,
-                            key,
-                            workspace: workspace.as_deref(),
-                            reconcile,
-                            known: &known,
-                        },
-                        &mut state,
-                        stager,
-                    )
-                    .await?
+            let end = if let Some(reason) = state.stop {
+                resume_at.get_or_insert_with(|| name.clone());
+                ChannelEndV1::Listed(ListingBoundV1::Truncated(reason))
+            } else {
+                let cursor = Self::channel_cursor(stager, name, &mut state).await?;
+                if let Some(started) = run
+                    && cursor.reconciled == Some(started)
+                {
+                    // Read to its end earlier in this reconciliation.
+                    state.bump("channels_already_reconciled");
+                    hold_channel(&known, name, key, None, stager);
+                    if cursor.reconciled_refused {
+                        stager.mark_partial(Some(key), PartialReasonV1::ItemRefused);
+                    }
+                    ChannelEndV1::Listed(ListingBoundV1::Complete)
+                } else {
+                    let end = self
+                        .channel(
+                            ChannelInputV1 {
+                                input,
+                                channel: name,
+                                key,
+                                workspace: workspace.as_deref(),
+                                run,
+                                known: &known,
+                                cursor,
+                            },
+                            &mut state,
+                            stager,
+                        )
+                        .await?;
+                    if state.stop.is_some() {
+                        resume_at.get_or_insert_with(|| name.clone());
+                    }
+                    end
                 }
             };
+            ends.push((index, key, end));
+        }
+        ends.sort_by_key(|(index, _, _)| *index);
+        let mut containers = Vec::with_capacity(ends.len());
+        for (_, key, end) in ends {
             if let ChannelEndV1::Listed(listing) = end {
                 containers.push(ContainerOutcomeV1 {
                     ordinal: u32::try_from(containers.len()).unwrap_or(u32::MAX),
@@ -1053,14 +1419,23 @@ impl PullCollectorV1 for SlackPullV1 {
                 });
             }
         }
-        if reconcile && state.stop.is_none() {
+
+        let mut next = schedule;
+        next.schema_version = CURSOR_SCHEMA_VERSION;
+        if let Some(started) = run {
+            if state.stop.is_none() {
+                next.last_complete_micros = Some(started);
+                next.under_way = None;
+            } else {
+                next.under_way = Some(started);
+            }
+        }
+        next.resume_at = resume_at;
+        if stored.as_ref() != Some(&next) {
             let advance = encode_cursor(
-                &ReconcileCursorV1 {
-                    schema_version: CURSOR_SCHEMA_VERSION,
-                    last_complete_micros: input.pass_order_micros,
-                },
+                &next,
                 RECONCILE_CURSOR_DOMAIN.to_owned(),
-                Some(input.pass_order_micros),
+                next.last_complete_micros,
                 input.pass_seq,
             )?;
             stager.stage_page(Vec::new(), &[advance], &[]).await?;
@@ -1295,28 +1670,19 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let mut read = ChannelReadV1 {
-            provider: ProviderKindV1::new("slack").unwrap(),
-            scope: "T1".into(),
-            channel: "C1".into(),
-            label: None,
-            workspace: None,
-            key: Sha256Digest::from_bytes([9; 32]),
-            audience: ProviderAudienceV1::ScopePublic,
-            known: &known,
-            seen: BTreeSet::from(["1790000020.000000".to_owned()]),
-            roots: Vec::new(),
-            newest_top: None,
-            threads_read: BTreeSet::from(["1790000020.000000".to_owned()]),
-            malformed: false,
+        let mut read = read_of("C1", &known);
+        // Root 99 was returned with replies, but its thread was not read.
+        read.seen = BTreeSet::from([
+            "1790000020.000000".to_owned(),
+            "1790000099.000000".to_owned(),
+        ]);
+        read.threads_read = BTreeSet::from(["1790000020.000000".to_owned()]);
+        let mut state = state();
+        let oldest = ViewV1 {
+            lower: LowerV1::After(1_780_000_000_000_000),
+            before: None,
         };
-        let mut state = PassStateV1 {
-            budget: 1,
-            stop: None,
-            counters: BTreeMap::new(),
-        };
-        let oldest = SlackTsV1::parse("1780000000.000000");
-        let (tombstones, missing) = read.missing(&BTreeMap::new(), oldest.as_ref(), &mut state);
+        let (tombstones, missing) = read.missing(&BTreeMap::new(), oldest, &mut state);
         assert!(tombstones.is_empty(), "one miss hides nothing");
         assert_eq!(
             missing.keys().collect::<Vec<_>>(),
@@ -1325,7 +1691,7 @@ mod tests {
              thread, a tombstone, a message before the window, or another channel's"
         );
 
-        let (tombstones, missing) = read.missing(&missing, oldest.as_ref(), &mut state);
+        let (tombstones, missing) = read.missing(&missing, oldest, &mut state);
         assert!(missing.is_empty());
         let ids: Vec<&str> = tombstones
             .iter()
@@ -1349,7 +1715,7 @@ mod tests {
         // Seen again before the second miss: the count starts over.
         read.seen.insert("1790000010.000000".to_owned());
         let once = BTreeMap::from([("1790000010.000000".to_owned(), 1)]);
-        let (tombstones, missing) = read.missing(&once, oldest.as_ref(), &mut state);
+        let (tombstones, missing) = read.missing(&once, oldest, &mut state);
         assert!(
             tombstones
                 .iter()
@@ -1359,9 +1725,99 @@ mod tests {
         // Out of view, a count is kept, neither advanced nor cleared.
         read.threads_read.clear();
         let held = BTreeMap::from([("1790000030.000000".to_owned(), 1)]);
-        let (tombstones, missing) = read.missing(&held, oldest.as_ref(), &mut state);
+        let (tombstones, missing) = read.missing(&held, oldest, &mut state);
         assert!(tombstones.is_empty());
         assert_eq!(missing.get("1790000030.000000"), Some(&1));
+    }
+
+    fn read_of<'k>(
+        channel: &str,
+        known: &'k BTreeMap<String, KnownVersionV1>,
+    ) -> ChannelReadV1<'k> {
+        ChannelReadV1 {
+            provider: ProviderKindV1::new("slack").unwrap(),
+            scope: "T1".into(),
+            channel: channel.into(),
+            label: None,
+            workspace: None,
+            key: Sha256Digest::from_bytes([9; 32]),
+            audience: ProviderAudienceV1::ScopePublic,
+            known,
+            seen: BTreeSet::new(),
+            childless: BTreeSet::new(),
+            page_roots: Vec::new(),
+            page_oldest: None,
+            newest_top: None,
+            newest_reply: None,
+            threads_read: BTreeSet::new(),
+            malformed: false,
+            refused: false,
+        }
+    }
+
+    fn state() -> PassStateV1 {
+        PassStateV1 {
+            budget: 1,
+            stop: None,
+            counters: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn the_replies_of_a_root_left_with_none_or_gone_are_missing() {
+        use crate::memory_contracts::collected_item::ItemLifecycleV1::Live;
+        let known: BTreeMap<String, KnownVersionV1> = [
+            known("C1:1790000020.000000", None, Live),
+            known("C1:1790000021.000000", Some("C1:1790000020.000000"), Live),
+            known("C1:1790000030.000000", None, Live),
+            known("C1:1790000031.000000", Some("C1:1790000030.000000"), Live),
+            known("C1:1790000040.000000", None, Live),
+            known("C1:1790000041.000000", Some("C1:1790000040.000000"), Live),
+            known("C1:1790000051.000000", Some("C1:1690000050.000000"), Live),
+        ]
+        .into_iter()
+        .collect();
+        let mut read = read_of("C1", &known);
+        // The history returned root 20 with no replies left, root 40 with
+        // replies (its thread not read this time), and not root 30 at all.
+        read.seen = BTreeSet::from([
+            "1790000020.000000".to_owned(),
+            "1790000040.000000".to_owned(),
+        ]);
+        read.childless = BTreeSet::from(["1790000020.000000".to_owned()]);
+        let view = ViewV1 {
+            lower: LowerV1::After(1_780_000_000_000_000),
+            before: None,
+        };
+        let (_, missing) = read.missing(&BTreeMap::new(), view, &mut state());
+        assert_eq!(
+            missing.keys().collect::<Vec<_>>(),
+            [
+                "1790000021.000000",
+                "1790000030.000000",
+                "1790000031.000000"
+            ],
+            "the reply of a childless root, and a gone root with its reply; not the reply \
+             of a root whose thread was not read, nor one on a root before the window"
+        );
+
+        // A read cut short sees only from where it got to, and before where a
+        // resumed read began.
+        let cut = ViewV1 {
+            lower: LowerV1::From(1_790_000_030_000_000),
+            before: Some(1_790_000_040_000_000),
+        };
+        let (_, missing) = read.missing(&BTreeMap::new(), cut, &mut state());
+        assert_eq!(
+            missing.keys().collect::<Vec<_>>(),
+            ["1790000030.000000", "1790000031.000000"]
+        );
+        let nothing = ViewV1 {
+            lower: LowerV1::Nothing,
+            before: None,
+        };
+        let (_, missing) = read.missing(&BTreeMap::new(), nothing, &mut state());
+        assert!(missing.is_empty());
     }
 
     #[test]
@@ -1372,6 +1828,7 @@ mod tests {
             history_ts: Some("1790000000.000100".into()),
             reply_ts: None,
             missing: BTreeMap::from([("1790000000.000200".into(), 1)]),
+            ..ChannelCursorV1::default()
         };
         let bytes = serde_json::to_vec(&cursor).unwrap();
         assert_eq!(
@@ -1406,8 +1863,44 @@ mod tests {
             missing: (0..MAX_MISSING)
                 .map(|index| (format!("{index:012}.{index:06}"), 1))
                 .collect(),
+            reconciled: Some(u64::MAX),
+            reconciled_refused: true,
+            progress: Some(ChannelProgressV1 {
+                run: Some(u64::MAX),
+                latest: "999999999999.999999".into(),
+                newest_top: Some("999999999999.999999".into()),
+                newest_reply: Some("999999999999.999999".into()),
+                refused: true,
+            }),
         };
         assert!(serde_json::to_vec(&largest).unwrap().len() < 16_384);
+        // A cursor written before reconciliations could resume still reads.
+        let older: ReconcileCursorV1 =
+            serde_json::from_slice(br#"{"schema_version":1,"last_complete_micros":42}"#).unwrap();
+        assert_eq!(older.last_complete_micros, Some(42));
+        assert_eq!(older.under_way, None);
+    }
+
+    #[test]
+    fn a_listed_private_channel_is_a_configured_channel_id() {
+        let adapter = SlackAdapterV1;
+        for (listed, needle) in [
+            (serde_json::json!(["secret-team"]), "not a channel id"),
+            (serde_json::json!(["#plat-sec"]), "not a channel id"),
+            (serde_json::json!(["c07private1"]), "not a channel id"),
+            (
+                serde_json::json!(["C07OTHER001"]),
+                "settings.channels does not",
+            ),
+        ] {
+            let message = adapter
+                .validate(&source(
+                    &settings(&serde_json::json!({})),
+                    &serde_json::json!({"private_containers": listed}),
+                ))
+                .unwrap_err();
+            assert!(message.contains(needle), "{listed}: {message}");
+        }
     }
 
     #[test]

@@ -17,7 +17,10 @@
 //!   becomes `@U123`, `<!subteam^S1|@team>` becomes `@S1`, `<#C1|name>`
 //!   becomes `#name`, `<url|label>` becomes the label and an outbound link,
 //!   `<!here>` becomes `@here`, and `&amp;`, `&lt;`, `&gt;` are unescaped. An
-//!   attachment adds its title and text (or its fallback) and its title link.
+//!   attachment adds its title and text (or its fallback) and its title link;
+//!   a link unfurl (an attachment with `from_url`, `original_url`, or
+//!   `is_app_unfurl`) adds only its link, since Slack adds, changes, and
+//!   removes it without an edit and its text is the linked page's.
 //! * **Files are links only.** A file adds an outbound `file` link to its
 //!   permalink, never its content, and a file link's own access token (a
 //!   `t=xox...` query parameter, [`strip_file_token`]) is stripped. A message
@@ -183,6 +186,22 @@ pub struct SlackAttachmentV1 {
     /// The URL it unfurls.
     #[serde(default)]
     pub from_url: Option<String>,
+    /// The URL as it was written, on an unfurl.
+    #[serde(default)]
+    pub original_url: Option<String>,
+    /// An app's unfurl.
+    #[serde(default)]
+    pub is_app_unfurl: bool,
+}
+
+impl SlackAttachmentV1 {
+    /// Whether it is a link unfurl: a preview Slack or an app attached to a
+    /// link, which can appear, change, or vanish without the message being
+    /// edited. Its text is a third party's, never the author's.
+    #[must_use]
+    pub const fn is_unfurl(&self) -> bool {
+        self.from_url.is_some() || self.original_url.is_some() || self.is_app_unfurl
+    }
 }
 
 /// A bot's profile.
@@ -499,6 +518,16 @@ fn body(message: &SlackMessageV1) -> (String, Vec<DraftLinkV1>) {
         push_link(&mut links, "url", &target, label);
     }
     for attachment in &message.attachments {
+        if attachment.is_unfurl() {
+            // Volatile and not the author's: at most its link is kept.
+            for link in [&attachment.from_url, &attachment.original_url]
+                .into_iter()
+                .flatten()
+            {
+                push_link(&mut links, "url", link, None);
+            }
+            continue;
+        }
         let title = attachment
             .title
             .as_deref()
@@ -528,10 +557,7 @@ fn body(message: &SlackMessageV1) -> (String, Vec<DraftLinkV1>) {
         {
             paragraphs.push(render_mrkdwn(fallback).text.trim_end().to_owned());
         }
-        for link in [&attachment.title_link, &attachment.from_url]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(link) = &attachment.title_link {
             push_link(&mut links, "url", link, title.clone());
         }
     }
@@ -804,6 +830,55 @@ mod tests {
             Some(1_790_007_122_004_300)
         );
         assert_eq!(history[2].latest_reply(), None, "a broadcast is a reply");
+    }
+
+    #[test]
+    fn an_unfurl_is_never_content_and_a_bot_attachment_is() {
+        let provider = ProviderKindV1::new(SLACK_PROVIDER).unwrap();
+        let plain: SlackMessageV1 = serde_json::from_value(serde_json::json!({
+            "type": "message", "user": "U07ALICE001", "ts": "1790000000.000100",
+            "text": "see <https://example.com/post|the post>"
+        }))
+        .unwrap();
+        let mut unfurled = plain.clone();
+        unfurled.attachments = vec![
+            SlackAttachmentV1 {
+                title: Some("Unfurled headline guillemot".into()),
+                text: Some("A third party's preview text".into()),
+                fallback: Some("preview".into()),
+                from_url: Some("https://example.com/post".into()),
+                ..SlackAttachmentV1::default()
+            },
+            SlackAttachmentV1 {
+                title: Some("An app's card".into()),
+                original_url: Some("https://example.com/other".into()),
+                is_app_unfurl: true,
+                ..SlackAttachmentV1::default()
+            },
+        ];
+        let before = item(message_draft(&context(&provider), &plain));
+        let after = item(message_draft(&context(&provider), &unfurled));
+        assert_eq!(after.sections[0].text, before.sections[0].text);
+        assert!(!after.sections[0].text.contains("guillemot"));
+        assert_eq!(after.order_micros, before.order_micros);
+        let targets: Vec<&str> = after
+            .links
+            .iter()
+            .map(|link| link.target.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            ["https://example.com/post", "https://example.com/other"]
+        );
+
+        // A bot's own attachment, with no URL it unfurls, is its content.
+        let history = messages(HISTORY);
+        let bot = history
+            .iter()
+            .find(|message| message.subtype.as_deref() == Some("bot_message"))
+            .unwrap();
+        let card = item(message_draft(&context(&provider), bot));
+        assert!(card.sections[0].text.contains("Status: In Progress"));
     }
 
     #[test]

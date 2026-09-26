@@ -290,7 +290,7 @@ impl SlackApiV1 {
     }
 
     /// One page of `conversations.history`, newest first, of messages after
-    /// `oldest` (exclusive).
+    /// `oldest` and before `latest` (both exclusive).
     ///
     /// # Errors
     ///
@@ -299,11 +299,15 @@ impl SlackApiV1 {
         &self,
         channel: &str,
         oldest: Option<&str>,
+        latest: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<SlackPageV1, SlackCallErrorV1> {
         let mut query = vec![("channel", channel), ("limit", self.page_size.as_str())];
         if let Some(oldest) = oldest {
             query.push(("oldest", oldest));
+        }
+        if let Some(latest) = latest {
+            query.push(("latest", latest));
         }
         if let Some(cursor) = cursor {
             query.push(("cursor", cursor));
