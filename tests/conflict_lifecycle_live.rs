@@ -5719,7 +5719,10 @@ async fn live_underscore_and_space_spellings_share_one_claim_key_when_configured
     )
     .await
     .expect("status is served");
-    assert_eq!(status.data["legacy_claim_keys"], json!(0));
+    assert_eq!(
+        status.data["legacy_claim_keys"],
+        json!({ "count": 0, "bound_exceeded": false, "sample": [] })
+    );
     assert!(
         !status
             .warnings

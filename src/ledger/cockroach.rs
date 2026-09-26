@@ -13,14 +13,14 @@ use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Row, Transaction};
 
 use crate::ledger::lifecycle::{LifecycleRefusal, RefusalCode};
-use crate::ledger::types::PreparedClaim;
+use crate::ledger::types::{MAX_CLAIM_HIT_VALUE_BYTES, PreparedClaim};
 use crate::ledger::{
-    AssertedClaimMutation, Claim, ClaimInput, ClaimItemSupportV1, ClaimKind, ClaimLedger,
-    ClaimMutation, ClaimState, ClaimSupport, ClaimTarget, Conflict, ConflictHistory,
-    ConflictLifecycleRows, ConflictMutation, ConflictTarget, DismissalTerms,
+    AssertedClaimMutation, Claim, ClaimHistoryV1, ClaimInput, ClaimItemSupportV1, ClaimKind,
+    ClaimLedger, ClaimMutation, ClaimState, ClaimSupport, ClaimTarget, ClaimsForKeyV1, Conflict,
+    ConflictHistory, ConflictLifecycleRows, ConflictMutation, ConflictTarget, DismissalTerms,
     FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2,
-    LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest, SemanticClaimHit, SupportInputV1,
-    SupportedClaimCoordinate, SupportedClaimIds, WaiverTerms,
+    LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest, OpenConflictsV1,
+    SemanticClaimHit, SupportInputV1, SupportedClaimCoordinate, SupportedClaimIds, WaiverTerms,
 };
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::remember_runtime::{EventFirstAssert, RememberAssertInputV1, actor_for_agent};
@@ -31,6 +31,7 @@ use crate::store::cockroach::{
 use crate::{FleetError, FleetScope, Result};
 
 mod assert_store;
+mod audit_reads;
 mod conflict_store;
 mod item_links;
 mod lifecycle_store;
@@ -71,9 +72,12 @@ const CLAIM_ANN_SEARCH_SQL: &str = "SELECT claim_id, passage_index, left(passage
      FROM memory_claim_embeddings \
      WHERE tenant_id = $1 AND project = $2 AND model = $3 \
      ORDER BY vector <=> $4::VECTOR(512) LIMIT $5";
-const SEARCH_CLAIM_PROJECTION_SQL: &str = "SELECT id, project, kind, claim_key, subject, predicate, NULL::JSONB AS value, \
+const SEARCH_CLAIM_PROJECTION_SQL: &str = "SELECT id, project, kind, claim_key, subject, predicate, \
+            CASE WHEN value IS NULL OR octet_length(value::STRING) > $5 \
+                 THEN NULL ELSE value END AS value, \
             left(text, $4) AS text, polarity, state, origin, actor, confidence, valid_from, \
-            valid_to, superseded_by, revision, conflict_eligible, created_at, updated_at \
+            valid_to, superseded_by, revision, conflict_eligible, created_at, updated_at, \
+            (value IS NOT NULL AND octet_length(value::STRING) > $5) AS value_elided \
      FROM memory_claims@{NO_FULL_SCAN} \
      WHERE tenant_id = $1 AND project = $2 AND id = ANY($3)";
 const CONFLICT_CLAIM_PROJECTION_SQL: &str = "SELECT id, project, kind, claim_key, subject, predicate, \
@@ -884,6 +888,31 @@ impl ClaimLedger for CockroachClaimLedger {
         lifecycle_store::legacy_claim_keys(self, scope).await
     }
 
+    async fn claims_for_key(
+        &self,
+        scope: &FleetScope,
+        claim_key: &str,
+        include_history: bool,
+    ) -> Result<ClaimsForKeyV1> {
+        audit_reads::claims_for_key(self, scope, claim_key, include_history).await
+    }
+
+    async fn conflict_ids_for_key(&self, scope: &FleetScope, claim_key: &str) -> Result<Vec<i64>> {
+        audit_reads::conflict_ids_for_key(self, scope, claim_key).await
+    }
+
+    async fn claim_lifecycle_history(
+        &self,
+        scope: &FleetScope,
+        claim_id: i64,
+    ) -> Result<ClaimHistoryV1> {
+        audit_reads::claim_lifecycle_history(self, scope, claim_id).await
+    }
+
+    async fn open_conflicts(&self, scope: &FleetScope) -> Result<OpenConflictsV1> {
+        audit_reads::open_conflicts(self, scope).await
+    }
+
     async fn get_claim(&self, scope: &FleetScope, id: i64) -> Result<Option<Claim>> {
         self.ensure_scope(scope)?;
         if id <= 0 {
@@ -976,16 +1005,21 @@ impl ClaimLedger for CockroachClaimLedger {
                     .iter()
                     .map(|candidate| candidate.claim_id)
                     .collect::<Vec<_>>();
-                let claims_by_id = fetch_search_claims(transaction, &scope, &candidate_ids).await?;
+                let projected = fetch_search_claims(transaction, &scope, &candidate_ids).await?;
                 let mut hits = Vec::with_capacity(limit);
                 for candidate in candidates {
-                    let Some(claim) = claims_by_id.get(&candidate.claim_id).cloned() else {
+                    let Some(claim) = projected.claims.get(&candidate.claim_id).cloned() else {
                         continue;
                     };
                     if !include_history && !claim.state.is_current() {
                         continue;
                     }
+                    let value_elided = projected.values_elided.contains(&claim.id);
                     hits.push(SemanticClaimHit {
+                        revision: claim.revision,
+                        actor: claim.actor.clone(),
+                        value_elided,
+                        support_elided: false,
                         claim,
                         similarity: candidate.similarity,
                         passage_index: candidate.passage_index,
@@ -2106,15 +2140,20 @@ async fn hydrate_conflicts(
     Ok(conflicts)
 }
 
-/// Hydrate the bounded semantic-search projection. Values and support are not
-/// read because the public search projection always removes both fields.
+/// Hydrate the bounded semantic-search projection. SQL truncates text and
+/// carries a value only up to [`MAX_CLAIM_HIT_VALUE_BYTES`] (a larger one is
+/// reported elided); support is not read because the public search
+/// projection never carries it.
 async fn fetch_search_claims(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     claim_ids: &[i64],
-) -> Result<HashMap<i64, Claim>> {
+) -> Result<ConflictClaimSummaries> {
     if claim_ids.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(ConflictClaimSummaries {
+            claims: HashMap::new(),
+            values_elided: HashSet::new(),
+        });
     }
 
     let claim_rows = sqlx::query(SEARCH_CLAIM_PROJECTION_SQL)
@@ -2125,22 +2164,28 @@ async fn fetch_search_claims(
             i64::try_from(MAX_CLAIM_SEARCH_TEXT_CHARS + 1)
                 .map_err(|_| protocol_error("claim search projection limit exceeds INT8"))?,
         )
+        .bind(
+            i64::try_from(MAX_CLAIM_HIT_VALUE_BYTES)
+                .map_err(|_| protocol_error("claim search value projection limit exceeds INT8"))?,
+        )
         .fetch_all(&mut **transaction)
         .await?;
-    let mut claims = claim_rows
-        .iter()
-        .map(decode_claim)
-        .map(|result| {
-            result.map(|mut claim| {
-                claim.text = compact_text(&claim.text, MAX_CLAIM_SEARCH_TEXT_CHARS);
-                claim
-            })
-        })
-        .map(|result| result.map(|claim| (claim.id, claim)))
-        .collect::<Result<HashMap<_, _>>>()?;
+    let mut values_elided = HashSet::new();
+    let mut claims = HashMap::with_capacity(claim_rows.len());
+    for row in &claim_rows {
+        let mut claim = decode_claim(row)?;
+        claim.text = compact_text(&claim.text, MAX_CLAIM_SEARCH_TEXT_CHARS);
+        if row.try_get::<bool, _>("value_elided")? {
+            values_elided.insert(claim.id);
+        }
+        claims.insert(claim.id, claim);
+    }
 
     hydrate_claim_conflict_ids(transaction, scope, claim_ids, &mut claims).await?;
-    Ok(claims)
+    Ok(ConflictClaimSummaries {
+        claims,
+        values_elided,
+    })
 }
 
 struct ConflictClaimSummaries {
@@ -3571,7 +3616,11 @@ mod tests {
         assert!(CLAIM_ANN_SEARCH_SQL.contains("left(passage_text, $6)"));
         assert!(CLAIM_ANN_SEARCH_SQL.contains("LIMIT $5"));
 
-        assert!(SEARCH_CLAIM_PROJECTION_SQL.contains("NULL::JSONB AS value"));
+        // A hit carries its value up to the bound and says when it was
+        // elided, so an agent reads the recorded proposition, not a summary.
+        assert!(!SEARCH_CLAIM_PROJECTION_SQL.contains("NULL::JSONB AS value"));
+        assert!(SEARCH_CLAIM_PROJECTION_SQL.contains("octet_length(value::STRING) > $5"));
+        assert!(SEARCH_CLAIM_PROJECTION_SQL.contains("AS value_elided"));
         assert!(SEARCH_CLAIM_PROJECTION_SQL.contains("left(text, $4)"));
         assert!(!SEARCH_CLAIM_PROJECTION_SQL.contains("memory_claim_support"));
         assert!(!SEARCH_CLAIM_PROJECTION_SQL.contains("SELECT *"));
@@ -5445,6 +5494,11 @@ mod tests {
             LegacyClaimKeysV1 {
                 count: 1,
                 bound_exceeded: false,
+                sample: vec![crate::ledger::LegacyClaimKeySampleV1 {
+                    claim_id: legacy.claim.id,
+                    claim_key: "include_transcript_default::enabled".into(),
+                    actor: legacy.claim.actor.clone(),
+                }],
             }
         );
 

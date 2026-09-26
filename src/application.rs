@@ -22,9 +22,10 @@ use crate::item_recall::{
 use crate::ledger::{
     Claim, ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict,
     ConflictMutation, ConflictTarget, DismissalTerms, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
-    ITEM_SUPPORT_SOURCE_CONFIG_ID, LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest,
-    MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT, SemanticClaimHit, SupportedClaimCoordinate,
-    WaiverTerms, derive_overlay, history_within_bytes, overlay_episode_revision,
+    ITEM_SUPPORT_SOURCE_CONFIG_ID, KeyClaimV1, LegacyClaimKeysV1, LifecycleMutation,
+    LifecycleReplayRequest, MAX_CLAIM_HIT_VALUE_BYTES, MAX_CONCESSION_CLAIMS,
+    MAX_CONFLICT_MEMBER_COUNT, SemanticClaimHit, SupportedClaimCoordinate, WaiverTerms,
+    claim_key_from_parts, derive_overlay, history_within_bytes, overlay_episode_revision,
     unlogged_transitions, validate_lifecycle_reason, validate_rationale, validate_waiver_hours,
 };
 use crate::memory_contracts::collected_item::ProviderKindV1;
@@ -837,67 +838,35 @@ impl CockroachMemoryService {
         arguments: Map<String, Value>,
     ) -> ServiceResult<RecallResult> {
         let args: GetArgs = from_arguments(arguments, "recall get")?;
+        let (kind, target, include_history) = args.target()?;
+        let kind = kind.as_deref().unwrap_or("chunk");
+        let id = match target {
+            GetTarget::Id(id) => id,
+            GetTarget::ClaimKey(claim_key) => {
+                return if matches!(kind, "claim" | "assertion") {
+                    self.recall_claims_for_key(scope, &claim_key, include_history)
+                        .await
+                } else {
+                    Err(ServiceError::InvalidRequest(format!(
+                        "recall get by key is served for kind=claim, not kind={kind:?}"
+                    )))
+                };
+            }
+        };
         if let Some(evidence) = self.evidence.as_deref()
-            && args.kind.as_deref() == Some("evidence")
+            && kind == "evidence"
         {
-            return get_evidence(evidence, &args.id).await;
+            return get_evidence(evidence, &id).await;
         }
         if let Some(items) = self.items.as_deref()
-            && args.kind.as_deref() == Some("item")
+            && kind == "item"
         {
-            return get_item(items, &args.id).await;
+            return get_item(items, &id).await;
         }
-        match args.kind.as_deref().unwrap_or("chunk") {
-            "claim" | "assertion" => {
-                let id = parse_safe_id(&args.id)?;
-                // A withheld claim reads exactly as an absent one.
-                let withheld = !self.withheld_claim_ids(scope, &[id]).await?.is_empty();
-                let mut claim = if withheld {
-                    None
-                } else {
-                    self.ledger
-                        .get_claim(scope, id)
-                        .await
-                        .map_err(service_error)?
-                };
-                let mut data = self.claim_citations(scope, id, claim.as_mut()).await?;
-                data.insert("claim".into(), json!(claim));
-                let mut result = RecallResult::new(Value::Object(data));
-                // An asserted claim names the accepted event it projects; a
-                // recorded one carries no such field.
-                if claim.is_some()
-                    && let Some(event_id) = self
-                        .ledger
-                        .claim_accepted_event_id(scope, id)
-                        .await
-                        .map_err(service_error)?
-                {
-                    result.data["accepted_event_id"] = json!(event_id);
-                }
-                let mut conflicts = if withheld {
-                    Vec::new()
-                } else {
-                    self.ledger
-                        .conflicts_for_claim_ids(scope, &[id], MAX_TOOL_RESULTS)
-                        .await
-                        .map_err(service_error)?
-                };
-                let coverage_complete = conflicts.len() < MAX_TOOL_RESULTS
-                    && conflicts.iter().all(conflict_projection_complete);
-                self.withhold_asserted_conflicts(scope, &mut conflicts)
-                    .await?;
-                let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
-                result.conflicts = serialize_conflicts(&conflicts)?;
-                result.conflict_coverage = conflict_coverage(coverage_complete, &conflicts);
-                mark_lifecycle_overlay(
-                    &mut result.conflict_coverage,
-                    &mut result.warnings,
-                    overlay,
-                );
-                Ok(result)
-            }
+        match kind {
+            "claim" | "assertion" => self.recall_claim(scope, &id).await,
             "chunk" => {
-                let id = args.id.as_str().ok_or_else(|| {
+                let id = id.as_str().ok_or_else(|| {
                     ServiceError::InvalidRequest("chunk id must be a string".into())
                 })?;
                 if id.trim().is_empty() || id.len() > 256 {
@@ -933,12 +902,132 @@ impl CockroachMemoryService {
             // Conflict lookup by id is part of the lifecycle surface; the
             // record-only (publication) surface keeps its historical kinds.
             "conflict" if self.lifecycle.surface.lifecycle_served() => {
-                self.recall_conflict(scope, &args.id).await
+                self.recall_conflict(scope, &id).await
             }
             other => Err(ServiceError::InvalidRequest(format!(
                 "recall get kind {other:?} is not supported"
             ))),
         }
+    }
+
+    /// `recall(get, kind=claim)` by id: the claim with its support, item
+    /// citations, current conflicts, and (on a private composition) its
+    /// lifecycle history. A withheld claim reads exactly as an absent one.
+    async fn recall_claim(&self, scope: &FleetScope, id: &Value) -> ServiceResult<RecallResult> {
+        let id = parse_safe_id(id)?;
+        let withheld = !self.withheld_claim_ids(scope, &[id]).await?.is_empty();
+        let mut claim = if withheld {
+            None
+        } else {
+            self.ledger
+                .get_claim(scope, id)
+                .await
+                .map_err(service_error)?
+        };
+        let mut data = self.claim_citations(scope, id, claim.as_mut()).await?;
+        data.insert("claim".into(), json!(claim));
+        let mut result = RecallResult::new(Value::Object(data));
+        // An asserted claim names the accepted event it projects; a
+        // recorded one carries no such field.
+        if claim.is_some()
+            && let Some(event_id) = self
+                .ledger
+                .claim_accepted_event_id(scope, id)
+                .await
+                .map_err(service_error)?
+        {
+            result.data["accepted_event_id"] = json!(event_id);
+        }
+        let mut conflicts = if withheld {
+            Vec::new()
+        } else {
+            self.ledger
+                .conflicts_for_claim_ids(scope, &[id], MAX_TOOL_RESULTS)
+                .await
+                .map_err(service_error)?
+        };
+        let coverage_complete = conflicts.len() < MAX_TOOL_RESULTS
+            && conflicts.iter().all(conflict_projection_complete);
+        self.withhold_asserted_conflicts(scope, &mut conflicts)
+            .await?;
+        let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
+        result.conflicts = serialize_conflicts(&conflicts)?;
+        result.conflict_coverage = conflict_coverage(coverage_complete, &conflicts);
+        mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
+        Ok(result)
+    }
+
+    /// `recall(get, kind=claim, key=…)`: every claim carrying exactly that
+    /// stored key, oldest first, each as `get` returns it (support, current
+    /// conflicts, value up to the lookup bound), with the conflicts detected
+    /// on the key and the open one named. A withheld claim reads as absent,
+    /// and the publication reader drops opaque item support as it does on
+    /// `get` by id.
+    async fn recall_claims_for_key(
+        &self,
+        scope: &FleetScope,
+        claim_key: &str,
+        include_history: bool,
+    ) -> ServiceResult<RecallResult> {
+        let lookup = self
+            .ledger
+            .claims_for_key(scope, claim_key, include_history)
+            .await
+            .map_err(service_error)?;
+        let claim_ids = lookup
+            .claims
+            .iter()
+            .map(|entry| entry.claim.id)
+            .collect::<Vec<_>>();
+        let withheld = self.withheld_claim_ids(scope, &claim_ids).await?;
+        let mut claims = lookup
+            .claims
+            .into_iter()
+            .filter(|entry| !withheld.contains(&entry.claim.id))
+            .collect::<Vec<_>>();
+        if self.withhold_asserted_claims {
+            for entry in &mut claims {
+                withhold_item_support(&mut entry.claim);
+            }
+        }
+        let (claims, cut) = key_claims_within_bytes(claims, MAX_CONFLICT_LOOKUP_BYTES);
+        let claims_truncated = lookup.truncated || cut;
+
+        let conflict_ids = self
+            .ledger
+            .conflict_ids_for_key(scope, claim_key)
+            .await
+            .map_err(service_error)?;
+        let mut conflicts = if conflict_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.ledger
+                .get_conflicts(scope, &conflict_ids)
+                .await
+                .map_err(service_error)?
+        };
+        self.withhold_asserted_conflicts(scope, &mut conflicts)
+            .await?;
+        let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
+        let serialized = serialize_conflicts(&conflicts)?;
+        let open_conflict = conflicts
+            .iter()
+            .position(|conflict| conflict.state == "open")
+            .and_then(|index| serialized.get(index).cloned());
+        let mut result = RecallResult::new(json!({
+            "claim_key": claim_key,
+            "claims": claims,
+            "claims_truncated": claims_truncated,
+            "include_history": include_history,
+            "open_conflict": open_conflict,
+        }));
+        result.conflict_coverage = conflict_coverage(
+            lifecycle_coverage_complete(&conflict_ids, &conflicts),
+            &conflicts,
+        );
+        result.conflicts = serialized;
+        mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
+        Ok(result)
     }
 
     /// A claim get's item citations (ADR 0008 D11). The publication reader
@@ -1035,13 +1124,49 @@ impl CockroachMemoryService {
     ) -> ServiceResult<RecallResult> {
         let args: ConflictArgs = from_arguments(arguments, "recall conflicts")?;
         let limit = bounded_limit(args.limit)?;
-        let mut conflicts = self
-            .ledger
-            .list_conflicts(scope, args.include_resolved, limit)
-            .await
-            .map_err(service_error)?;
-        let coverage_complete =
-            conflicts.len() < limit && conflicts.iter().all(conflict_projection_complete);
+        let claim_key = args
+            .claim_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        if args.claim_key.is_some() && claim_key.is_none() {
+            return Err(ServiceError::InvalidRequest(
+                "claim_key must not be empty".into(),
+            ));
+        }
+        let (mut conflicts, coverage_complete) = if let Some(claim_key) = claim_key {
+            // One conflict per detector on a key, in any state; the caller's
+            // include_resolved keeps or drops the closed ones.
+            let ids = self
+                .ledger
+                .conflict_ids_for_key(scope, claim_key)
+                .await
+                .map_err(service_error)?;
+            let conflicts = if ids.is_empty() {
+                Vec::new()
+            } else {
+                self.ledger
+                    .get_conflicts(scope, &ids)
+                    .await
+                    .map_err(service_error)?
+            };
+            let conflicts = conflicts
+                .into_iter()
+                .filter(|conflict| args.include_resolved || conflict.state == "open")
+                .take(limit)
+                .collect::<Vec<_>>();
+            let complete = conflicts.iter().all(conflict_projection_complete);
+            (conflicts, complete)
+        } else {
+            let conflicts = self
+                .ledger
+                .list_conflicts(scope, args.include_resolved, limit)
+                .await
+                .map_err(service_error)?;
+            let complete =
+                conflicts.len() < limit && conflicts.iter().all(conflict_projection_complete);
+            (conflicts, complete)
+        };
         self.withhold_asserted_conflicts(scope, &mut conflicts)
             .await?;
         let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
@@ -2449,7 +2574,88 @@ struct AssertArgs {
 struct GetArgs {
     #[serde(default)]
     kind: Option<String>,
-    id: Value,
+    /// Absent when the request left it out; an explicit `null` is present
+    /// and refused by the kind's own id check, as before key lookups.
+    #[serde(default, deserialize_with = "present_value")]
+    id: Option<Value>,
+    /// `kind=claim` only: the exact stored key to look up.
+    #[serde(default)]
+    key: Option<String>,
+    /// `kind=claim` only: with `predicate`, the key's parts, normalized as
+    /// `record` normalizes them.
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    predicate: Option<String>,
+    /// Key lookups only: superseded and retracted claims too.
+    #[serde(default)]
+    include_history: bool,
+}
+
+/// Any present JSON value, `null` included, as `Some`.
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+/// What a `get` names: one entity by id, or every claim on a key.
+#[derive(Debug)]
+enum GetTarget {
+    Id(Value),
+    ClaimKey(String),
+}
+
+impl GetArgs {
+    /// The id or the key, refusing a request that names both or neither.
+    fn target(self) -> ServiceResult<(Option<String>, GetTarget, bool)> {
+        let key = match (self.key, self.subject, self.predicate) {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                return Err(ServiceError::InvalidRequest(
+                    "send key, or subject and predicate, not both".into(),
+                ));
+            }
+            (Some(key), None, None) => {
+                let key = key.trim().to_owned();
+                if key.is_empty() {
+                    return Err(ServiceError::InvalidRequest("key must not be empty".into()));
+                }
+                Some(key)
+            }
+            (None, Some(subject), Some(predicate)) => {
+                Some(claim_key_from_parts(&subject, &predicate).ok_or_else(|| {
+                    ServiceError::InvalidRequest(
+                        "subject and predicate normalize to an empty key".into(),
+                    )
+                })?)
+            }
+            (None, Some(_), None) | (None, None, Some(_)) => {
+                return Err(ServiceError::InvalidRequest(
+                    "a key lookup needs both subject and predicate".into(),
+                ));
+            }
+            (None, None, None) => None,
+        };
+        match (self.id, key) {
+            (Some(_), Some(_)) => Err(ServiceError::InvalidRequest(
+                "send id, or a key, not both".into(),
+            )),
+            (Some(id), None) => {
+                if self.include_history {
+                    return Err(ServiceError::InvalidRequest(
+                        "include_history on get applies to a key lookup; a claim's own \
+                         lifecycle history is returned with its id"
+                            .into(),
+                    ));
+                }
+                Ok((self.kind, GetTarget::Id(id), false))
+            }
+            (None, Some(key)) => Ok((self.kind, GetTarget::ClaimKey(key), self.include_history)),
+            (None, None) => Err(ServiceError::InvalidRequest(
+                "recall get requires id, or, for kind=claim, key or subject and predicate".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2459,6 +2665,9 @@ struct ConflictArgs {
     include_resolved: bool,
     #[serde(default)]
     limit: Option<usize>,
+    /// Only the conflicts detected on this exact stored key.
+    #[serde(default)]
+    claim_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2807,7 +3016,14 @@ fn legacy_claim_keys_block(legacy: crate::Result<LegacyClaimKeysV1>) -> (Value, 
                     ),
                 }));
             }
-            (json!(legacy.count), warnings)
+            (
+                json!({
+                    "count": legacy.count,
+                    "bound_exceeded": legacy.bound_exceeded,
+                    "sample": legacy.sample,
+                }),
+                warnings,
+            )
         }
         Err(error) => {
             tracing::warn!(error = %error, "legacy claim key read failed");
@@ -3063,18 +3279,57 @@ fn serialize_conflicts(conflicts: &[Conflict]) -> ServiceResult<Vec<Value>> {
         .collect()
 }
 
+/// The oldest key-lookup claims that fit `byte_budget` serialized, and
+/// whether any newer one was cut.
+fn key_claims_within_bytes(claims: Vec<KeyClaimV1>, byte_budget: usize) -> (Vec<KeyClaimV1>, bool) {
+    let mut used = 0_usize;
+    let mut kept = Vec::with_capacity(claims.len());
+    let total = claims.len();
+    for entry in claims {
+        // One separator byte per array element.
+        let size = serde_json::to_vec(&entry)
+            .map_or(usize::MAX, |bytes| bytes.len())
+            .saturating_add(1);
+        used = used.saturating_add(size);
+        if used > byte_budget {
+            break;
+        }
+        kept.push(entry);
+    }
+    let cut = kept.len() < total;
+    (kept, cut)
+}
+
 /// A value's serialized size; one that cannot be serialized counts as
 /// unbounded.
 fn json_bytes(value: &Value) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
 }
 
+/// The claim search projection: text and passage cut to a page-sized bound,
+/// support left to `get`, and the value carried up to
+/// [`MAX_CLAIM_HIT_VALUE_BYTES`]. Whatever is left out is flagged on the hit
+/// (`support_elided`, `value_elided`) rather than dropped silently, and the
+/// claim's `revision` and `actor` are repeated beside it.
 fn compact_claim_hits(mut hits: Vec<SemanticClaimHit>) -> Vec<SemanticClaimHit> {
     const MAX_PASSAGE_CHARS: usize = 2_000;
     for hit in &mut hits {
         hit.claim.text = truncate_chars(&hit.claim.text, MAX_PASSAGE_CHARS);
-        hit.claim.support.clear();
-        hit.claim.value = None;
+        if !hit.claim.support.is_empty() {
+            hit.claim.support.clear();
+            hit.support_elided = true;
+        }
+        if hit
+            .claim
+            .value
+            .as_ref()
+            .is_some_and(|value| json_bytes(value) > MAX_CLAIM_HIT_VALUE_BYTES)
+        {
+            hit.claim.value = None;
+            hit.value_elided = true;
+        }
+        hit.revision = hit.claim.revision;
+        hit.actor.clone_from(&hit.claim.actor);
         hit.matched_passage = truncate_chars(&hit.matched_passage, MAX_PASSAGE_CHARS);
     }
     hits
@@ -3578,6 +3833,134 @@ mod tests {
     }
 
     #[test]
+    fn get_arguments_name_an_id_or_exactly_one_claim_key() {
+        let parse = |value: Value| {
+            from_arguments::<GetArgs>(value.as_object().cloned().unwrap(), "recall get")
+                .and_then(GetArgs::target)
+        };
+        let (kind, target, history) = parse(json!({ "kind": "claim", "id": 7 })).unwrap();
+        assert_eq!(kind.as_deref(), Some("claim"));
+        assert!(matches!(target, GetTarget::Id(Value::Number(_))));
+        assert!(!history);
+
+        // A key is looked up exactly as sent, so a legacy key stays findable.
+        let (_, target, history) =
+            parse(json!({ "kind": "claim", "key": " include_transcript_default::enabled " }))
+                .unwrap();
+        assert!(matches!(
+            target,
+            GetTarget::ClaimKey(ref key) if key == "include_transcript_default::enabled"
+        ));
+        assert!(!history);
+
+        // Parts are normalized as record normalizes them.
+        let (_, target, history) = parse(json!({
+            "kind": "claim",
+            "subject": "Merged_Build",
+            "predicate": " rollout mode",
+            "include_history": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            target,
+            GetTarget::ClaimKey(ref key) if key == "merged-build::rollout-mode"
+        ));
+        assert!(history);
+
+        for (refused, expected) in [
+            (json!({ "kind": "claim" }), "requires id"),
+            (
+                json!({ "kind": "claim", "id": 7, "key": "a::b" }),
+                "not both",
+            ),
+            (
+                json!({ "kind": "claim", "key": "a::b", "subject": "a" }),
+                "not both",
+            ),
+            (
+                json!({ "kind": "claim", "subject": "a" }),
+                "both subject and predicate",
+            ),
+            (json!({ "kind": "claim", "key": "  " }), "must not be empty"),
+            (
+                json!({ "kind": "claim", "subject": "_", "predicate": "-" }),
+                "empty key",
+            ),
+            (
+                json!({ "kind": "claim", "id": 7, "include_history": true }),
+                "applies to a key lookup",
+            ),
+        ] {
+            let error = parse(refused.clone()).unwrap_err();
+            assert!(
+                matches!(&error, ServiceError::InvalidRequest(message) if message.contains(expected)),
+                "{refused}: {error}"
+            );
+        }
+        // An explicit null id is present, for the kind's own check to refuse.
+        let (_, target, _) = parse(json!({ "kind": "chunk", "id": null })).unwrap();
+        assert!(matches!(target, GetTarget::Id(Value::Null)));
+    }
+
+    #[test]
+    fn key_lookup_claims_are_cut_oldest_first_within_the_byte_budget() {
+        let now = Utc::now();
+        let entry = |id: i64| KeyClaimV1 {
+            claim: Claim {
+                id,
+                project: "project".into(),
+                kind: ClaimKind::Decision,
+                claim_key: Some("fleet::database".into()),
+                subject: Some("fleet".into()),
+                predicate: Some("database".into()),
+                value: Some(json!("cockroachdb")),
+                text: "Use CockroachDB for shared fleet memory.".into(),
+                polarity: 1,
+                state: ClaimState::Active,
+                origin: "operator_asserted".into(),
+                actor: Some("architect".into()),
+                confidence: 1.0,
+                valid_from: None,
+                valid_to: None,
+                superseded_by: None,
+                revision: 1,
+                conflict_eligible: true,
+                created_at: now,
+                updated_at: now,
+                support: Vec::new(),
+                conflict_ids: Vec::new(),
+            },
+            value_elided: false,
+        };
+        let one = serde_json::to_vec(&entry(1)).unwrap().len() + 1;
+        let (kept, cut) = key_claims_within_bytes(vec![entry(1), entry(2), entry(3)], one * 2);
+        assert_eq!(
+            kept.iter().map(|entry| entry.claim.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(cut);
+        let (kept, cut) = key_claims_within_bytes(vec![entry(1), entry(2)], one * 2);
+        assert_eq!(kept.len(), 2);
+        assert!(!cut);
+        // The key entry serializes as the claim itself plus its elision flag.
+        let wire = serde_json::to_value(KeyClaimV1 {
+            value_elided: true,
+            ..entry(4)
+        })
+        .unwrap();
+        assert_eq!(wire["id"], 4);
+        assert_eq!(wire["claim_key"], "fleet::database");
+        assert_eq!(wire["value_elided"], true);
+        assert!(wire.get("claim").is_none());
+        assert!(
+            serde_json::to_value(entry(5))
+                .unwrap()
+                .get("value_elided")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn claim_search_projection_preserves_authored_text() {
         let now = Utc::now();
         let hit = SemanticClaimHit {
@@ -3608,15 +3991,55 @@ mod tests {
             similarity: 0.9,
             passage_index: 0,
             matched_passage: "Use CockroachDB for shared fleet memory.\nkind: decision\nsubject: fleet\npredicate: database".into(),
+            revision: 0,
+            actor: None,
+            value_elided: false,
+            support_elided: false,
         };
 
-        let projected = compact_claim_hits(vec![hit]);
+        let projected = compact_claim_hits(vec![hit.clone()]);
         assert_eq!(
             projected[0].claim.text,
             "Use CockroachDB for shared fleet memory."
         );
         assert!(projected[0].matched_passage.contains("kind: decision"));
+        // The value rides on the hit, with the claim's revision and author
+        // repeated beside it, so an agent can act on what it found.
+        assert_eq!(projected[0].claim.value, Some(json!("cockroachdb")));
+        assert!(!projected[0].value_elided);
+        assert!(!projected[0].support_elided);
+        assert_eq!(projected[0].revision, 1);
+        assert_eq!(projected[0].actor.as_deref(), Some("architect"));
+        let wire = serde_json::to_value(&projected[0]).unwrap();
+        assert_eq!(wire["revision"], 1);
+        assert_eq!(wire["actor"], "architect");
+        assert!(wire.get("value_elided").is_none(), "{wire}");
+        assert!(wire.get("support_elided").is_none(), "{wire}");
+
+        // What the projection leaves out is flagged, never dropped silently.
+        let mut oversized = hit;
+        oversized.claim.value = Some(json!("x".repeat(MAX_CLAIM_HIT_VALUE_BYTES + 1)));
+        oversized.claim.support.push(crate::ledger::ClaimSupport {
+            id: 1,
+            source_config_id: "docs".into(),
+            source: "spec".into(),
+            source_id: "adr-1".into(),
+            chunk_id: None,
+            content_sha256: None,
+            excerpt: None,
+            relation: "supports".into(),
+            state: "current".into(),
+            observed_at: now,
+            invalidated_at: None,
+        });
+        let projected = compact_claim_hits(vec![oversized]);
         assert!(projected[0].claim.value.is_none());
+        assert!(projected[0].value_elided);
+        assert!(projected[0].claim.support.is_empty());
+        assert!(projected[0].support_elided);
+        let wire = serde_json::to_value(&projected[0]).unwrap();
+        assert_eq!(wire["value_elided"], true);
+        assert_eq!(wire["support_elided"], true);
     }
 
     struct OfflineEmbedder;
@@ -5552,15 +5975,33 @@ mod tests {
     async fn legacy_claim_keys_status_counts_warns_or_reports_unavailable() {
         // No legacy rows: the count alone, no warning.
         let (value, warnings) = legacy_claim_keys_block(Ok(LegacyClaimKeysV1::default()));
-        assert_eq!(value, json!(0));
+        assert_eq!(
+            value,
+            json!({ "count": 0, "bound_exceeded": false, "sample": [] })
+        );
         assert!(warnings.is_empty());
 
-        // Legacy rows are visible as a count and a warning naming the exit.
+        // Legacy rows are visible as a count, a sample naming what to
+        // supersede, and a warning naming the exit.
         let (value, warnings) = legacy_claim_keys_block(Ok(LegacyClaimKeysV1 {
             count: 3,
             bound_exceeded: false,
+            sample: vec![crate::ledger::LegacyClaimKeySampleV1 {
+                claim_id: 41,
+                claim_key: "include_transcript_default::enabled".into(),
+                actor: Some("agent-a".into()),
+            }],
         }));
-        assert_eq!(value, json!(3));
+        assert_eq!(value["count"], 3);
+        assert_eq!(value["bound_exceeded"], false);
+        assert_eq!(
+            value["sample"],
+            json!([{
+                "claim_id": 41,
+                "claim_key": "include_transcript_default::enabled",
+                "actor": "agent-a"
+            }])
+        );
         assert_eq!(warning_codes(&warnings), ["legacy_claim_keys"]);
         let message = warnings[0]["message"].as_str().unwrap();
         assert!(
@@ -5573,8 +6014,10 @@ mod tests {
         let (value, warnings) = legacy_claim_keys_block(Ok(LegacyClaimKeysV1 {
             count: 256,
             bound_exceeded: true,
+            sample: Vec::new(),
         }));
-        assert_eq!(value, json!(256));
+        assert_eq!(value["count"], 256);
+        assert_eq!(value["bound_exceeded"], true);
         assert_eq!(warning_codes(&warnings), ["legacy_claim_keys"]);
         assert!(
             warnings[0]["message"]

@@ -139,11 +139,37 @@ pub fn recall_tool() -> Value {
                 "max_per_source_id": { "type": "integer", "default": 3, "minimum": 0 },
                 "min_score": { "type": "number", "default": 0.0 },
                 "kind": { "type": "string", "enum": ["chunk", "claim", "assertion"] },
-                "id": {},
+                "id": {
+                    "description": "get: what to read. kind=chunk a chunk id; kind=claim a claim id (the answer adds the claim's lifecycle history and, for a successor, supersedes); kind=conflict a conflict id."
+                },
+                "key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2048,
+                    "description": "get with kind=claim: instead of id, the exact stored claim key (subject::predicate as record normalized it, or an assert's claim-v2: key). Returns every lifecycle-current claim on that key oldest first, each with its id, revision, value, actor, state, support, and conflict_ids, plus the key's open conflict; include_history adds superseded and retracted claims. A claim recorded before `_` became a key separator keeps its legacy key (recall(status).legacy_claim_keys names them), so look one up by its stored key, not by subject and predicate."
+                },
+                "subject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "get with kind=claim: with predicate, the key's parts; the server normalizes them exactly as record does (case, whitespace, `_` and `-` are one separator) and looks the key up."
+                },
+                "predicate": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "get with kind=claim: see subject."
+                },
+                "claim_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2048,
+                    "description": "conflicts: only the conflicts detected on this exact stored key (at most one per detector), in any state with include_resolved."
+                },
                 "include_history": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Include inactive historical claims. Valid only for kind=claim or kind=assertion."
+                    "description": "Include inactive historical claims. Valid only for kind=claim or kind=assertion (search, or get by key)."
                 },
                 "include_resolved": { "type": "boolean", "default": false },
                 "intent": { "type": "string", "enum": ["symbol", "narrative", "trace", "general"], "default": "general" }
@@ -152,7 +178,16 @@ pub fn recall_tool() -> Value {
             "additionalProperties": false,
             "allOf": [
                 { "if": { "properties": { "action": { "const": "search" } } }, "then": { "required": ["query"] } },
-                { "if": { "properties": { "action": { "const": "get" } } }, "then": { "required": ["id"] } },
+                {
+                    "if": { "properties": { "action": { "const": "get" } } },
+                    "then": {
+                        "anyOf": [
+                            { "required": ["id"] },
+                            { "required": ["key"] },
+                            { "required": ["subject", "predicate"] }
+                        ]
+                    }
+                },
                 {
                     "if": {
                         "properties": { "include_history": { "const": true } },
@@ -160,7 +195,7 @@ pub fn recall_tool() -> Value {
                     },
                     "then": {
                         "properties": {
-                            "action": { "const": "search" },
+                            "action": { "enum": ["search", "get"] },
                             "kind": { "enum": ["claim", "assertion"] }
                         },
                         "required": ["kind"]
@@ -1291,10 +1326,27 @@ mod tests {
             json!(["claim", "assertion"])
         );
         assert_eq!(
-            history_constraint["then"]["properties"]["action"]["const"],
-            "search"
+            history_constraint["then"]["properties"]["action"]["enum"],
+            json!(["search", "get"])
         );
         assert_eq!(history_constraint["then"]["required"], json!(["kind"]));
+        // get takes an id, or (kind=claim) a key, or subject and predicate.
+        let get_constraint = &tools[0]["inputSchema"]["allOf"][1];
+        assert_eq!(get_constraint["if"]["properties"]["action"]["const"], "get");
+        assert_eq!(
+            get_constraint["then"]["anyOf"],
+            json!([
+                { "required": ["id"] },
+                { "required": ["key"] },
+                { "required": ["subject", "predicate"] }
+            ])
+        );
+        for property in ["key", "subject", "predicate", "claim_key"] {
+            assert!(
+                tools[0]["inputSchema"]["properties"][property].is_object(),
+                "{property} is declared"
+            );
+        }
         assert_eq!(
             tools[1]["inputSchema"]["properties"]["action"]["enum"],
             json!(["record"])

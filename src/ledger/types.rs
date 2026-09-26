@@ -541,11 +541,129 @@ pub struct PreparedClaim {
 /// rewrites keys: a supersede moves a legacy claim onto its current key, and
 /// `recall(status)` reports this count so the detection gap is visible until
 /// then.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LegacyClaimKeysV1 {
     /// Legacy rows found, at most the scan bound.
     pub count: usize,
     /// The bounded scan filled up, so `count` is a lower bound.
+    pub bound_exceeded: bool,
+    /// The first legacy rows found (at most [`MAX_LEGACY_CLAIM_KEY_SAMPLE`]),
+    /// so an operator can name what to supersede.
+    pub sample: Vec<LegacyClaimKeySampleV1>,
+}
+
+/// Legacy-key rows `recall(status)` names.
+pub const MAX_LEGACY_CLAIM_KEY_SAMPLE: usize = 10;
+
+/// One lifecycle-current claim still keyed under the earlier normalizer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyClaimKeySampleV1 {
+    pub claim_id: i64,
+    /// The stored key, as the detector compares it.
+    pub claim_key: String,
+    pub actor: Option<String>,
+}
+
+/// Claims one exact-key lookup (`recall(get, kind=claim, key=…)`) reads
+/// before reporting a cut: the detector's own comparison bound.
+pub const MAX_KEY_LOOKUP_CLAIMS: usize = 256;
+
+/// Largest canonical `value` an exact-key lookup carries per claim; a larger
+/// one is reported elided and read whole by `get` with the claim's id.
+pub const MAX_KEY_LOOKUP_VALUE_BYTES: usize = 16 * 1024;
+
+/// One claim of an exact-key lookup: the claim as `get` returns it, with its
+/// support and current conflicts, plus whether its value was elided.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyClaimV1 {
+    #[serde(flatten)]
+    pub claim: Claim,
+    /// The claim's canonical value was larger than
+    /// [`MAX_KEY_LOOKUP_VALUE_BYTES`] and is left out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub value_elided: bool,
+}
+
+/// Every claim on one exact key, oldest first: the lifecycle-current ones,
+/// or every state with `include_history`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClaimsForKeyV1 {
+    pub claims: Vec<KeyClaimV1>,
+    /// More claims carry the key than [`MAX_KEY_LOOKUP_CLAIMS`]; the ones
+    /// returned are the oldest.
+    pub truncated: bool,
+}
+
+/// Lifecycle events one claim `get` reads before reporting a cut.
+pub const MAX_CLAIM_HISTORY_EVENTS: usize = 256;
+
+/// One row of a claim's lifecycle log (`memory_claim_events`), as
+/// `recall(get, kind=claim)` returns it: who moved the claim between which
+/// states, why, and what the transition named.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimLifecycleEventV1 {
+    pub event_id: String,
+    /// The event kind, `state_transition` for every logged transition.
+    pub kind: String,
+    /// The agent whose mutation wrote it: the author for a retract or
+    /// supersede, the recording agent for a detected conflict, the closer
+    /// for a restore.
+    pub actor: Option<String>,
+    /// `conflict_detected`, `retracted_by_author`, `superseded_by_author`,
+    /// or a close's restore reason.
+    pub reason: Option<String>,
+    pub from_state: Option<String>,
+    pub to_state: Option<String>,
+    /// The claim revision the transition left behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_before: Option<i64>,
+    /// For `superseded_by_author`, the successor the author wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_claim_id: Option<i64>,
+    /// For `conflict_detected` and a close's restore, the conflict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_id: Option<i64>,
+    /// The audit note the author sent with the mutation, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
+    /// The stored payload was larger than the read bound, so the fields
+    /// above that come from it are absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub payload_elided: bool,
+}
+
+/// A claim's lifecycle history, in event order, with the predecessor it
+/// superseded when it is a successor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimHistoryV1 {
+    pub events: Vec<ClaimLifecycleEventV1>,
+    /// Older events exist than the bounded history returns.
+    pub truncated: bool,
+    /// The claim this one superseded: the same key's claim whose
+    /// `superseded_by` names it.
+    pub supersedes: Option<i64>,
+}
+
+/// Open conflicts `recall(status)` counts before reporting a lower bound.
+pub const MAX_OPEN_CONFLICT_ROWS: usize = 256;
+
+/// One open conflict as the status read sees it: what the lifecycle overlay
+/// needs to say whether it is acknowledged or waived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenConflictRowV1 {
+    pub id: i64,
+    pub revision: i64,
+    pub member_count: i64,
+    pub detected_at: DateTime<Utc>,
+}
+
+/// The project's open conflicts, oldest first, bounded by
+/// [`MAX_OPEN_CONFLICT_ROWS`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OpenConflictsV1 {
+    pub rows: Vec<OpenConflictRowV1>,
+    /// More conflicts are open than the bound; the counts are lower bounds.
     pub bound_exceeded: bool,
 }
 
@@ -656,12 +774,30 @@ fn split_passage(text: &str, max_chars: usize) -> Vec<String> {
         .collect()
 }
 
+/// Largest canonical `value` a claim search hit carries; a larger one is
+/// elided with `value_elided: true` and read whole by `get`.
+pub const MAX_CLAIM_HIT_VALUE_BYTES: usize = 2_000;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticClaimHit {
     pub claim: Claim,
     pub similarity: f64,
     pub passage_index: i32,
     pub matched_passage: String,
+    /// The claim's revision, repeated beside the claim so a hit can be
+    /// superseded or retracted without a second read.
+    #[serde(default)]
+    pub revision: i64,
+    /// The claim's author, repeated beside the claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// The claim's canonical value was larger than
+    /// [`MAX_CLAIM_HIT_VALUE_BYTES`] and is left out; `get` returns it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub value_elided: bool,
+    /// The claim's support rows are left out of the hit; `get` returns them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub support_elided: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

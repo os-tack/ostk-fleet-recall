@@ -29,12 +29,15 @@ pub(crate) use repository::assert_unavailable;
 pub use repository::{ClaimLedger, SupportedClaimCoordinate, SupportedClaimIds};
 pub(crate) use types::MAX_CLAIM_VALUE_SERIALIZED_BYTES;
 pub use types::{
-    AcceptedEventRefV1, Acknowledgement, AssertedClaimMutation, CitedItemV1, Claim, ClaimInput,
-    ClaimItemSupportV1, ClaimKind, ClaimMutation, ClaimState, ClaimSupport, ClaimSupportInput,
-    ClaimTarget, ClosureView, Conflict, ConflictCoverage, ConflictHistory, ConflictLifecycleEvent,
-    ConflictLifecycleOverlay, ConflictLifecycleRows, ConflictMutation, ConflictReevaluation,
-    ConflictTarget, DismissalTerms, ITEM_SUPPORT_SOURCE, ITEM_SUPPORT_SOURCE_CONFIG_ID, ItemRefV1,
-    ItemSupportInputV1, LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest,
-    MAX_SUPPORT_ITEMS, RevisionGap, SemanticClaimHit, SupersededClaim, SupportInputV1, WaiverTerms,
-    WaiverView,
+    AcceptedEventRefV1, Acknowledgement, AssertedClaimMutation, CitedItemV1, Claim, ClaimHistoryV1,
+    ClaimInput, ClaimItemSupportV1, ClaimKind, ClaimLifecycleEventV1, ClaimMutation, ClaimState,
+    ClaimSupport, ClaimSupportInput, ClaimTarget, ClaimsForKeyV1, ClosureView, Conflict,
+    ConflictCoverage, ConflictHistory, ConflictLifecycleEvent, ConflictLifecycleOverlay,
+    ConflictLifecycleRows, ConflictMutation, ConflictReevaluation, ConflictTarget, DismissalTerms,
+    ITEM_SUPPORT_SOURCE, ITEM_SUPPORT_SOURCE_CONFIG_ID, ItemRefV1, ItemSupportInputV1, KeyClaimV1,
+    LegacyClaimKeySampleV1, LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest,
+    MAX_CLAIM_HISTORY_EVENTS, MAX_CLAIM_HIT_VALUE_BYTES, MAX_KEY_LOOKUP_CLAIMS,
+    MAX_KEY_LOOKUP_VALUE_BYTES, MAX_LEGACY_CLAIM_KEY_SAMPLE, MAX_OPEN_CONFLICT_ROWS,
+    MAX_SUPPORT_ITEMS, OpenConflictRowV1, OpenConflictsV1, RevisionGap, SemanticClaimHit,
+    SupersededClaim, SupportInputV1, WaiverTerms, WaiverView,
 };

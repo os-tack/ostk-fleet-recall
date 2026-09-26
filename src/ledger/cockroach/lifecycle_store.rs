@@ -38,8 +38,9 @@ use crate::ledger::types::PreparedClaim;
 use crate::ledger::{
     ClaimInput, ClaimKind, ClaimMutation, ClaimState, ClaimTarget, Conflict,
     ConflictLifecycleEvent, ConflictMutation, ConflictReevaluation,
-    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LegacyClaimKeysV1, LifecycleMutation,
-    LifecycleReplayRequest, SupersededClaim, claim_key_from_parts,
+    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LegacyClaimKeySampleV1, LegacyClaimKeysV1,
+    LifecycleMutation, LifecycleReplayRequest, MAX_LEGACY_CLAIM_KEY_SAMPLE, SupersededClaim,
+    claim_key_from_parts,
 };
 use crate::store::cockroach::{ClaimItemLinksCapability, with_serializable_retry};
 use crate::{FleetError, FleetScope, Result};
@@ -189,7 +190,7 @@ const CLAIM_STATES_SQL: &str = "SELECT id, state FROM memory_claims@primary \
 /// [`claim_key_from_parts`](crate::ledger::claim_key_from_parts) derivation.
 /// `remember(assert)` keys are derived, not built from parts, and are
 /// excluded. Bounded by one sentinel row over the reported limit.
-const LEGACY_CLAIM_KEY_CANDIDATES_SQL: &str = "SELECT id, claim_key, subject, predicate \
+const LEGACY_CLAIM_KEY_CANDIDATES_SQL: &str = "SELECT id, claim_key, subject, predicate, actor \
      FROM memory_claims@primary \
      WHERE tenant_id = $1 AND project = $2 \
        AND state IN ('active', 'disputed') \
@@ -925,24 +926,38 @@ pub(super) async fn legacy_claim_keys(
     scope: &FleetScope,
 ) -> Result<LegacyClaimKeysV1> {
     ledger.ensure_scope(scope)?;
-    let rows = sqlx::query_as::<_, (i64, String, String, String)>(LEGACY_CLAIM_KEY_CANDIDATES_SQL)
-        .bind(scope.tenant_id)
-        .bind(&scope.project)
-        .bind(sentinel_limit(MAX_LEGACY_CLAIM_KEY_CANDIDATES)?)
-        .fetch_all(&ledger.pool)
-        .await?;
+    let rows = sqlx::query_as::<_, (i64, String, String, String, Option<String>)>(
+        LEGACY_CLAIM_KEY_CANDIDATES_SQL,
+    )
+    .bind(scope.tenant_id)
+    .bind(&scope.project)
+    .bind(sentinel_limit(MAX_LEGACY_CLAIM_KEY_CANDIDATES)?)
+    .fetch_all(&ledger.pool)
+    .await?;
     let bound_exceeded = rows.len() > MAX_LEGACY_CLAIM_KEY_CANDIDATES;
-    let count = rows
-        .iter()
-        .take(MAX_LEGACY_CLAIM_KEY_CANDIDATES)
-        .filter(|(_, claim_key, subject, predicate)| {
-            !claim_key.starts_with("claim-v2:")
-                && claim_key_from_parts(subject, predicate).as_deref() != Some(claim_key.as_str())
-        })
-        .count();
+    let mut count = 0;
+    let mut sample = Vec::new();
+    for (id, claim_key, subject, predicate, actor) in
+        rows.iter().take(MAX_LEGACY_CLAIM_KEY_CANDIDATES)
+    {
+        if claim_key.starts_with("claim-v2:")
+            || claim_key_from_parts(subject, predicate).as_deref() == Some(claim_key.as_str())
+        {
+            continue;
+        }
+        count += 1;
+        if sample.len() < MAX_LEGACY_CLAIM_KEY_SAMPLE {
+            sample.push(LegacyClaimKeySampleV1 {
+                claim_id: *id,
+                claim_key: claim_key.clone(),
+                actor: actor.clone(),
+            });
+        }
+    }
     Ok(LegacyClaimKeysV1 {
         count,
         bound_exceeded,
+        sample,
     })
 }
 
