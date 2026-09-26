@@ -98,15 +98,23 @@ impl IngressInstancesV1 {
     /// signing key read from the variable its `push.signing_secret_env`
     /// names. `environment` is the process environment in production.
     ///
+    /// The receiver holds no provider credential: it fails closed when any
+    /// variable a collector's settings name for its API credential (a
+    /// `settings.*_env` key, such as `token_env`) is set, since the sources
+    /// file it shares with the worker names them. A compromised receiver then
+    /// has no read access to the providers' content.
+    ///
     /// # Errors
     ///
-    /// [`FleetError::Configuration`] when no collector configures a webhook,
-    /// a provider has no webhook this build receives, or a secret is missing
-    /// or gives no key. The error names the variable, never its value.
+    /// [`FleetError::Configuration`] when a provider credential is set, no
+    /// collector configures a webhook, a provider has no webhook this build
+    /// receives, or a secret is missing or gives no key. The error names the
+    /// variable, never its value.
     pub fn from_sources(
         sources: &WorkerSourcesV1,
         environment: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Self> {
+        refuse_provider_credentials(sources, environment)?;
         let mut instances = BTreeMap::new();
         for source in &sources.collectors {
             let Some(push) = &source.push else {
@@ -164,6 +172,40 @@ impl IngressInstancesV1 {
     fn get(&self, instance: &str) -> Option<&IngressInstanceV1> {
         self.instances.get(instance)
     }
+}
+
+/// Fail closed when a variable any collector's settings name for a provider
+/// credential (`settings.<key>_env`) is set, unless it is also a webhook's
+/// signing secret variable. The error names the variable, never its value.
+fn refuse_provider_credentials(
+    sources: &WorkerSourcesV1,
+    environment: &dyn Fn(&str) -> Option<String>,
+) -> Result<()> {
+    let secrets: Vec<&str> = sources
+        .collectors
+        .iter()
+        .filter_map(|source| source.push.as_ref())
+        .map(|push| push.signing_secret_env.as_str())
+        .collect();
+    for source in &sources.collectors {
+        for (key, value) in &source.settings {
+            let Some(variable) = value.as_str() else {
+                continue;
+            };
+            if key.ends_with("_env")
+                && !secrets.contains(&variable)
+                && environment(variable).is_some()
+            {
+                return Err(FleetError::Configuration(format!(
+                    "the ingress forbids {variable} (collector {}'s settings.{key}): the \
+                     receiver never holds a provider API credential; unset it in the \
+                     ingress's environment; value is redacted",
+                    source.connector_instance
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a listen address that is not loopback unless the operator allows
@@ -447,5 +489,27 @@ mod tests {
             missing.contains("FLEET_RECALL_SLACK_SIGNING_SECRET"),
             "{missing}"
         );
+    }
+
+    #[test]
+    fn the_receiver_refuses_to_start_beside_a_provider_api_credential() {
+        let configured = sources(
+            &serde_json::json!({"signing_secret_env": "FLEET_RECALL_SLACK_SIGNING_SECRET"}),
+        );
+        let environment = |name: &str| match name {
+            "FLEET_RECALL_SLACK_SIGNING_SECRET" => Some("EXAMPLE-NOT-A-SIGNING-SECRET".to_owned()),
+            "FLEET_RECALL_SLACK_BOT_TOKEN" => Some("xoxb-EXAMPLE-NOT-A-TOKEN".to_owned()),
+            _ => None,
+        };
+        let refused = IngressInstancesV1::from_sources(&configured, &environment)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("FLEET_RECALL_SLACK_BOT_TOKEN"),
+            "{refused}"
+        );
+        assert!(refused.contains("settings.token_env"), "{refused}");
+        assert!(!refused.contains("xoxb-"), "{refused}");
+        assert!(!refused.contains("  "), "{refused}");
     }
 }

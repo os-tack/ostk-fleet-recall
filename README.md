@@ -713,8 +713,11 @@ counts as coverage: only a pass's complete reads do.
 The receiver runs as its own login, `fleet_ingress`, which may only read and
 insert deliveries and dead letters
 ([`ingress-receiver-role-grants.sql`](deploy/cockroach/ingress-receiver-role-grants.sql));
-it refuses to start beside the writer's or any other database URL or the
-content key. It listens on loopback unless `--allow-non-loopback` says
+it refuses to start beside the writer's or any other database URL (any
+variable whose name ends in `DATABASE_URL`), the content key, or a provider
+API credential the sources file names (`settings.token_env`), so run it from
+an environment of its own, holding only its URL and the signing secrets. It
+listens on loopback unless `--allow-non-loopback` says
 otherwise (`FLEET_RECALL_INGRESS_LISTEN`): Linear and Granola need a public
 HTTPS endpoint, which is a relay you run in front of it.
 

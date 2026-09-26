@@ -1457,7 +1457,9 @@ any pull; a deletion becomes a push-mode tombstone.
   `USAGE`, `SELECT` on `_sqlx_migrations`, and `SELECT` and `INSERT` on the
   queue and the dead letters, seven rows. It reads the URL
   `FLEET_RECALL_INGRESS_DATABASE_URL`, refuses to start beside any other
-  identity's database URL or the content key, holds no writer pins, and
+  database URL (any variable whose name ends in `DATABASE_URL`), the content
+  key, or a provider API credential a collector's `settings.*_env` names,
+  holds no writer pins, and
   probes its inserts before it listens. It binds loopback
   (`FLEET_RECALL_INGRESS_LISTEN`, `127.0.0.1:8787` by default) unless
   `--allow-non-loopback`: providers reach it through a relay the operator

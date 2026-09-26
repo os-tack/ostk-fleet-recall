@@ -1173,19 +1173,40 @@ impl PublicationConfig {
 }
 
 /// What the ingress receiver refuses to start beside: every other
-/// identity's database URL, and the content key it never holds.
-const INGRESS_FORBIDDEN_ENV_NAMES: [&str; 10] = [
+/// identity's database URL, and the content key it never holds. Beyond these
+/// names, [`IngressConfig::from_env`] refuses any other variable whose name
+/// ends in `DATABASE_URL` ([`ingress_forbids`]).
+const INGRESS_FORBIDDEN_ENV_NAMES: [&str; 12] = [
     "FLEET_RECALL_DATABASE_URL",
     "FLEET_RECALL_CONTROL_DATABASE_URL",
     "FLEET_RECALL_REGISTRY_DATABASE_URL",
     "FLEET_RECALL_SUCCESSOR_DATABASE_URL",
     "FLEET_RECALL_RECONCILIATION_DATABASE_URL",
     "FLEET_RECALL_PUBLICATION_DATABASE_URL",
+    "FLEET_RECALL_OBSERVER_DATABASE_URL",
+    "FLEET_RECALL_BOOTSTRAP_IMPORT_DATABASE_URL",
     "FLEET_RECALL_TEST_DATABASE_URL",
     "FLEET_RECONCILIATION_TEST_DATABASE_URL",
     "FLEET_RECALL_PUBLICATION_TEST_ADMIN_DATABASE_URL",
     "FLEET_RECALL_CONTENT_KEK_HEX",
 ];
+
+/// The one database URL the ingress reads.
+const INGRESS_DATABASE_URL_ENV: &str = "FLEET_RECALL_INGRESS_DATABASE_URL";
+
+/// Whether the ingress refuses to start with `name` set: a name above, or
+/// any other database URL, whatever identity it belongs to.
+fn ingress_forbids(name: &str) -> bool {
+    INGRESS_FORBIDDEN_ENV_NAMES.contains(&name)
+        || (name.ends_with("DATABASE_URL") && name != INGRESS_DATABASE_URL_ENV)
+}
+
+fn ingress_forbidden(name: &str) -> FleetError {
+    FleetError::Configuration(format!(
+        "the ingress forbids {name}; configure only {INGRESS_DATABASE_URL_ENV}; value is \
+         redacted"
+    ))
+}
 
 /// Pool connections the ingress opens unless told otherwise.
 const DEFAULT_INGRESS_MAX_CONNECTIONS: u32 = 4;
@@ -1194,10 +1215,12 @@ const DEFAULT_INGRESS_MAX_CONNECTIONS: u32 = 4;
 ///
 /// The receiver has a database identity of its own, `fleet_ingress`, which
 /// may only read and insert deliveries and dead letters. It fails closed when
-/// any other identity's database URL, or the content key, is in its
-/// environment, so a task definition cannot hand the public-facing receiver a
-/// credential it must never hold. It reads the physical scope, never an
-/// agent, model, or writer pin.
+/// any other database URL (any variable whose name ends in `DATABASE_URL`),
+/// or the content key, is in its environment, so a task definition cannot
+/// hand the public-facing receiver a credential it must never hold; the
+/// sources file's provider API credentials are refused where the sources are
+/// read ([`crate::collectors::ingress::server::IngressInstancesV1`]). It reads
+/// the physical scope, never an agent, model, or writer pin.
 #[derive(Clone)]
 pub struct IngressConfig {
     database_url: String,
@@ -1223,8 +1246,15 @@ impl std::fmt::Debug for IngressConfig {
 }
 
 impl IngressConfig {
-    /// Load the receiver's configuration from the process environment.
+    /// Load the receiver's configuration from the process environment,
+    /// refusing to start when any variable [`ingress_forbids`] is set.
     pub fn from_env() -> Result<Self> {
+        if let Some(name) = env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .find(|name| ingress_forbids(name))
+        {
+            return Err(ingress_forbidden(&name));
+        }
         Self::from_lookup(|name| env::var(name).ok())
     }
 
@@ -1234,17 +1264,14 @@ impl IngressConfig {
             .copied()
             .find(|name| lookup(name).is_some())
         {
-            return Err(FleetError::Configuration(format!(
-                "the ingress forbids {name}; configure only \
-                 FLEET_RECALL_INGRESS_DATABASE_URL; value is redacted"
-            )));
+            return Err(ingress_forbidden(name));
         }
-        let database_url = required_from(&mut lookup, "FLEET_RECALL_INGRESS_DATABASE_URL")?;
+        let database_url = required_from(&mut lookup, INGRESS_DATABASE_URL_ENV)?;
         let allow_insecure_local =
             lookup("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE").is_some_and(|value| value == "1");
         let database_ssl_policy = validate_dedicated_database_url(
             &database_url,
-            "FLEET_RECALL_INGRESS_DATABASE_URL",
+            INGRESS_DATABASE_URL_ENV,
             INGRESS_POSTGRES_USER,
             allow_insecure_local,
         )?;

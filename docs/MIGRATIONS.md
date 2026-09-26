@@ -570,9 +570,9 @@ write what the memory holds. Create the principal `NOLOGIN`
 as a cluster admin after prefix 1 through 36 (its own gate), audit it as the
 publication principal is audited, and only then enable its login. The
 receiver reads its URL from `FLEET_RECALL_INGRESS_DATABASE_URL`, pinned to
-`fleet_ingress`, and refuses to start beside any other identity's database
-URL or the content key; at startup it probes `INSERT` on both tables in a
-rolled-back transaction.
+`fleet_ingress`, and refuses to start beside any other database URL, the
+content key, or a provider API credential the sources file names; at
+startup it probes `INSERT` on both tables in a rolled-back transaction.
 
 Then apply and verify the exact control-plane exclusions and one-shot bootstrap
 grants in [the private control bootstrap policy](CONTROL_BOOTSTRAP.md). The

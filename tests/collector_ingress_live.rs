@@ -103,11 +103,21 @@ const SLACK_SECRET: &str = "EXAMPLE-NOT-A-SIGNING-SECRET";
 const LINEAR_SECRET: &str = "lin_wh_EXAMPLENOTASIGNINGSECRET";
 const GRANOLA_SECRET: &str = "whsec_EXAMPLEEXAMPLEEXAMPLEEXAMPLE";
 
+/// The worker's collector environment: the provider API credentials.
 fn environment(name: &str) -> Option<String> {
     let value = match name {
         SLACK_TOKEN_ENV => SLACK_TOKEN,
         LINEAR_TOKEN_ENV => LINEAR_KEY,
         GRANOLA_TOKEN_ENV => GRANOLA_KEY,
+        _ => return ingress_environment(name),
+    };
+    Some(value.to_owned())
+}
+
+/// The receiver's environment: the signing secrets, and no provider
+/// credential, which it refuses to start beside.
+fn ingress_environment(name: &str) -> Option<String> {
+    let value = match name {
         SLACK_SECRET_ENV => SLACK_SECRET,
         LINEAR_SECRET_ENV => LINEAR_SECRET,
         GRANOLA_SECRET_ENV => GRANOLA_SECRET,
@@ -443,7 +453,7 @@ impl Harness {
             &serde_json::to_vec(&self.sources(&[SLACK, LINEAR, GRANOLA])).unwrap(),
         )
         .unwrap();
-        let instances = IngressInstancesV1::from_sources(&sources, &environment).unwrap();
+        let instances = IngressInstancesV1::from_sources(&sources, &ingress_environment).unwrap();
         let now = self.now;
         router(store, instances, Arc::new(move || now), limit)
     }

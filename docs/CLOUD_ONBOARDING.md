@@ -291,7 +291,8 @@ grants it only `CONNECT`, `USAGE` on `public`, `SELECT` on
 and `memory_collector_dead_letters_v1`; audit it as the publication
 principals are audited, then enable the login. The receiver reads its URL
 from `FLEET_RECALL_INGRESS_DATABASE_URL` (same TLS rules), refuses to start
-beside any other database URL or the content key, and listens on loopback
+beside any other database URL, the content key, or a provider API credential
+the sources file names, and listens on loopback
 unless `--allow-non-loopback` is given; the relay that forwards the
 providers' requests to it is the operator's (see the README's
 [receiving provider webhooks](../README.md#receiving-provider-webhooks)).

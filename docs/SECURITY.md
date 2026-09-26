@@ -252,8 +252,10 @@ private database URL variables are rejected from its environment.
 `tests/publication_reader_live.rs` exercises that boundary against a real
 CockroachDB database. The ingress receiver likewise requires `fleet_ingress`
 on its own `FLEET_RECALL_INGRESS_DATABASE_URL`, pinned on every connection,
-and refuses to start beside any other database URL or
-`FLEET_RECALL_CONTENT_KEK_HEX`. A push signing secret is named in the sources
+and refuses to start beside any other database URL (any variable whose name
+ends in `DATABASE_URL`), `FLEET_RECALL_CONTENT_KEK_HEX`, or a provider API
+credential a collector's `settings.*_env` names in the sources file it shares
+with the worker. A push signing secret is named in the sources
 file by an environment variable in the provider's own
 `FLEET_RECALL_<PROVIDER>_` namespace, never inline, and never the variable
 that holds the provider's API token.

@@ -1939,3 +1939,24 @@ fn ingress_config_refuses_every_other_identity_and_the_content_key() {
     values.insert("FLEET_RECALL_INGRESS_MAX_BODY_BYTES", "0".to_owned());
     assert!(IngressConfig::from_lookup(|name| values.get(name).cloned()).is_err());
 }
+
+#[test]
+fn the_ingress_refuses_every_database_url_but_its_own() {
+    for identity in [
+        "FLEET_RECALL_OBSERVER_DATABASE_URL",
+        "FLEET_RECALL_BOOTSTRAP_IMPORT_DATABASE_URL",
+        "FLEET_RECALL_SLACK_CONTROL_DATABASE_URL",
+        "DATABASE_URL",
+        "SOME_FUTURE_DATABASE_URL",
+    ] {
+        assert!(ingress_forbids(identity), "{identity}");
+    }
+    assert!(!ingress_forbids("FLEET_RECALL_INGRESS_DATABASE_URL"));
+    assert!(!ingress_forbids("FLEET_RECALL_TENANT_ID"));
+    let message = ingress_forbidden("FLEET_RECALL_OBSERVER_DATABASE_URL").to_string();
+    assert!(
+        message.contains("FLEET_RECALL_OBSERVER_DATABASE_URL"),
+        "{message}"
+    );
+    assert!(!message.contains("  "), "{message}");
+}
