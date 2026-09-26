@@ -62,7 +62,9 @@
 //!   read from the environment and kept in its header, errors scrubbed;
 //! * [`docs`] is the documents-directory collector;
 //! * [`slack`] is the Slack collector: channels pulled through the Web API
-//!   with a bot token.
+//!   with a bot token;
+//! * [`linear`] is the Linear collector: teams' issues and comments pulled
+//!   through the GraphQL API with a personal API key or an OAuth token.
 //!
 //! Operator imports (ADR 0008 D9):
 //!
@@ -83,6 +85,7 @@ pub mod draft;
 pub mod heads;
 pub mod http;
 pub mod import;
+pub mod linear;
 pub mod pull;
 pub mod redaction;
 pub mod sink;
@@ -132,7 +135,11 @@ pub trait CollectorAdapterV1: Send + Sync {
 }
 
 /// Every provider adapter this build carries.
-pub static ADAPTERS: [&dyn CollectorAdapterV1; 2] = [&docs::DocsAdapterV1, &slack::SlackAdapterV1];
+pub static ADAPTERS: [&dyn CollectorAdapterV1; 3] = [
+    &docs::DocsAdapterV1,
+    &slack::SlackAdapterV1,
+    &linear::LinearAdapterV1,
+];
 
 /// The adapter of `provider`, when this build carries one.
 #[must_use]

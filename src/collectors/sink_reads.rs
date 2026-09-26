@@ -49,6 +49,10 @@ pub struct KnownVersionV1 {
     /// The external id of the version's thread root, when it is a reply:
     /// what tells a collector which of its reads could have seen the item.
     pub thread_root: Option<String>,
+    /// The version's container key, when it has a container: what tells a
+    /// collector whose items carry no container in their id (a Linear issue)
+    /// which of its reads the item belongs to.
+    pub container_key: Option<Sha256Digest>,
 }
 
 /// Where one staged row stands.
@@ -156,6 +160,7 @@ impl CollectedItemSink {
                     })?,
                     pending: Vec::new(),
                     thread_root: row.try_get("thread_root_external_id")?,
+                    container_key: optional_digest_column(row, "container_key")?,
                 },
             );
         }
@@ -205,6 +210,7 @@ impl CollectedItemSink {
                             .thread
                             .as_ref()
                             .map(|thread| thread.root_external_id.as_str().to_owned()),
+                        container_key: envelope.audience.container_key,
                     },
                 },
             );

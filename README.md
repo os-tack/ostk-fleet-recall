@@ -289,8 +289,10 @@ admitted, in this order:
   each pass lists one root, stages the files whose content changed as
   sectioned parts, tombstones the ones that disappeared, and records coverage
   only when it read the whole root. The Slack collector (provider `slack`)
-  pulls a workspace's channels through the Web API with a bot token. Last,
-  it records the snapshot of every
+  pulls a workspace's channels through the Web API with a bot token, and the
+  Linear collector (provider `linear`) an organization's teams' issues and
+  comments through the GraphQL API with an API key. Last, it records the
+  snapshot of every
   [import](#importing-collected-items) whose rows it admitted. `serve` reads
   what it admits as `recall(kind=item)` and `recall(kind=evidence)`.
 - `project`: the body projector, then the lexical tier.
@@ -379,6 +381,42 @@ token stripped). A rate limit or `max_pages_per_tick` ends a pass partial,
 and the next pass picks it up. `api_base` (`https://slack.com/api` by
 default) must be https, or plain http to a loopback address. A collector's
 `stale_after_seconds` may not be shorter than its `reconcile_every_seconds`.
+
+A Linear collector reads one organization's teams with a personal API key
+(`lin_api_...`, sent as the `Authorization` header itself) or an OAuth access
+token (sent as `Bearer`); again the file names only the variable:
+
+```json
+{"provider": "linear", "connector_principal": "principal.linear",
+ "connector_instance": "linear.acme",
+ "provider_scope_id": "0a9c0000-0000-4000-8000-0000000ac3e1",
+ "audience": {"private_containers": ["5f7c9e10-2b3c-4d4e-8f90-8b7c6d5e4f30"]},
+ "settings": {"token_env": "FLEET_RECALL_LINEAR_API_KEY",
+              "teams": ["4e6b8d0f-1a2b-4c3d-9e8f-7a6b5c4d3e2f",
+                        "5f7c9e10-2b3c-4d4e-8f90-8b7c6d5e4f30"],
+              "overlap_seconds": 300, "max_pages_per_tick": 500}}
+```
+
+`provider_scope_id` is the organization's id, and `teams` and
+`audience.private_containers` name teams by id (lowercase UUIDs; a team key
+such as `ENG` is a label that changes, never an id): a key of another
+organization reads nothing and fails the source. A public team is visible to
+the whole project; a private or restricted team only when
+`audience.private_containers` lists it, and otherwise it is never read and
+whatever was admitted from it is withdrawn and hidden. Every pass sweeps each
+team's issues, then the comments on them, for what changed since the last
+complete sweep less `overlap_seconds` (the whole team the first time),
+archived and trashed issues included, and records coverage. An issue is its
+title (with its `ENG-412` identifier), state, and markdown description; a
+comment is threaded on its issue. A newer `updatedAt` with new content is a
+new version that supersedes; a change that is not content (a label, an
+assignee) stages nothing. A trashed issue is hidden; an archived one stays
+searchable. A rate limit or `max_pages_per_tick` leaves a team partial, and
+the next pass resumes its sweep from the page after the last one staged. The
+report counts the fewest requests and complexity points Linear's
+`x-ratelimit-*` headers said were left. `api_url`
+(`https://api.linear.app/graphql` by default) must be https, or plain http to
+a loopback address.
 
 Each transcript file is read in windows of its group's `window_bytes` (4 MiB
 by default, at most 8 MiB) behind a durable cursor. A line longer than the

@@ -257,7 +257,7 @@ pub(super) const UPDATE_HEAD_PRESENTATION_SQL: &str = "UPDATE public.memory_coll
 /// what a pull collector compares a fresh read with, with each head
 /// version's thread root from its first admitted part.
 pub(super) const SCOPE_HEADS_SQL: &str = "SELECT h.item_key_digest, h.external_id, \
-     h.version_key_digest, h.content_digest, h.lifecycle, h.provider_order, \
+     h.version_key_digest, h.content_digest, h.lifecycle, h.provider_order, h.container_key, \
      (SELECT i.thread_root_external_id FROM public.memory_collected_items_v1 AS i \
        WHERE i.tenant_id = h.tenant_id AND i.project = h.project \
          AND i.item_key_digest = h.item_key_digest \

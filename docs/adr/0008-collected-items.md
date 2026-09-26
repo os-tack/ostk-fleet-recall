@@ -13,8 +13,9 @@
   withholds deleted and withdrawn items. `recall(kind=item)` reads items back
   as items (D7). The worker runs pull collectors through one pull framework,
   and the documents-directory collector is the first (D8). The Slack
-  collector pulls channels through the Web API over the provider HTTP seam
-  (D8). `ostk-fleet-recall collect` imports a file of items, or a Slack
+  collector pulls channels through the Web API, and the Linear collector
+  teams' issues and comments through the GraphQL API, over the provider HTTP
+  seam (D8). `ostk-fleet-recall collect` imports a file of items, or a Slack
   export, as a snapshot of one provider scope and lists, dead-letters, and
   retires what the collectors hold (D9). An agent relays items it read
   through its own connectors with `remember(action="capture")`, a reported
@@ -22,8 +23,7 @@
   `FLEET_RECALL_COLLECTED_CAPTURE` turns it on (D10). A claim cites the items
   it rests on: `remember(assert)`'s `support_items` and `record`'s item
   support entries link it to them through migration 35, privately (D11). No
-  Linear or Granola collector stages items yet; those land with their own
-  decisions.
+  Granola collector stages items yet; it lands with its own decision.
 - Date: 2026-09-25
 - Scope: how specs and documents, Slack conversations, Linear tickets,
   Granola meetings, and anything else a collector can read become evidence
@@ -672,7 +672,8 @@ would tombstone every document. Specs in a git worktree are covered by path
 and content digest and stay non-normative (AUTH-04).
 
 **The provider HTTP seam** (`src/collectors/http.rs`). Every API collector
-talks to its provider through `ProviderHttpV1` (`get`, `post_json`), over
+talks to its provider through `ProviderHttpV1` (`get`, `post_json`,
+`post_graphql`), over
 `reqwest` with rustls and no default features, which honours `HTTPS_PROXY`
 and `NO_PROXY`:
 
@@ -688,6 +689,10 @@ and `NO_PROXY`:
 - the token is read from the environment variable the settings name
   (`token_env`); it travels only as a sensitive `Authorization` header, and
   neither the token nor the client prints it;
+- `post_graphql` returns a `4xx` other than `429` as an answer rather than
+  an error, since a GraphQL API reports a refused credential or a rate limit
+  in the body of a `400` or `401`; the collector reads the error codes and
+  nothing else from it;
 - an error never carries a response body, and every error a collector
   records is passed through the collector redactor's scan first
   (`scrub_diagnostic`), so a provider echoing a credential cannot write it
@@ -749,6 +754,71 @@ conversation is refused in the settings) is one `slack.channel` container:
 
 Reactions, reply counts, unfurls, presence, and file content are never read.
 
+**Linear** (`src/collectors/linear`, provider `linear`). A personal API key
+(`lin_api_...`, sent as the `Authorization` header itself) or an OAuth access
+token (sent as `Bearer`), named by `token_env`, reads one organization, pinned
+by its id (the provider scope id, a lowercase UUID). Each configured team
+(`teams`, by id; a team key such as `ENG` is a mutable label, refused as an
+id) is one `linear.team` container, labelled with its key. Three named
+queries are posted to `api_url` (`https://api.linear.app/graphql` by
+default), every filter a variable:
+
+- `FleetRecallLinearScope` reads `organization { id }`, which must be the
+  pin or the pass fails before it reads anything, and the configured teams'
+  keys and visibility, recorded as container observations: a `public` team is
+  `team_public`; any other visibility is admitted `operator_declared` only
+  when `audience.private_containers` lists the team; an unlisted one is never
+  read, its observation withdraws what was admitted through it, and it is
+  outside the pass's domain. A configured team the credential cannot see is
+  partial.
+- **Every pass is a reconciliation.** For each team, `issues`, then the
+  `comments` on its issues, are swept with `updatedAt` after the sweep's
+  high-water mark less `overlap_seconds` (300 by default; the whole team the
+  first time), `orderBy: updatedAt`, `includeArchived: true`, paged on
+  `endCursor` to `hasNextPage: false`. Each page is one sink transaction with
+  the team's cursor (`linear.team:<id>`): a sweep cut short resumes on the
+  next pass from the page after the last one staged, under the same filter,
+  and a sweep that reached its end moves the high-water mark to the newest
+  `updatedAt` it read, never past the pass's instant. A sweep that read a
+  node it could not stage (a dead letter, a redaction withholding) does not
+  move the mark, so it is read again, and its team stays partial, until the
+  node changes.
+- An issue is object kind `issue`, a comment `comment`, each with its Linear
+  id as external id; the marker is `updatedAt` exactly as sent, and the order
+  its microseconds. An issue's title is `<identifier> <title>` (the identifier
+  changes when the issue moves team, so it is a label, never identity) and
+  its markdown text its state, then its description; a comment's text is its
+  body, its thread root its issue, and its parent the comment it answers, else
+  the issue. The parent issue, the project, and every `http(s)` link in the
+  markdown are outbound links by URL. A person is kept by id only; a bot by
+  its id (else its kind) with its name.
+- An item the memory holds at the same content and lifecycle is kept at its
+  known version even when its `updatedAt` moved, so an overlap re-read, or a
+  change that is not content (a label, an assignee, a priority), mints
+  nothing. Every item the memory holds in a team the pass read and that the
+  sweeps did not return is unchanged since the sweeps' start and is held
+  current as well (known versions carry their container key for this), so
+  the pass's manifest names every current item and a team is complete only
+  when all of them are admitted.
+- `trashed` is a `trashed` tombstone, which hides the issue; `archivedAt` is
+  an `archived` version that stays searchable; a comment with `editedAt` is
+  `edited`.
+- **Partial reads.** Every call counts against `max_pages_per_tick`. A rate
+  limit (HTTP 429, or `RATELIMITED` in the GraphQL errors) or the page budget
+  ends the pass: the team in progress and every later one are partial, and
+  their sweeps resume on the next pass. Any other refusal of a page leaves
+  its team partial and starts that sweep over on the next pass (a cursor
+  Linear refuses will not be accepted later); a failed request (`5xx`) leaves
+  it partial and resumable. `AUTHENTICATION_ERROR`, or HTTP 401 or 403, fails
+  the pass. The `x-ratelimit-requests-remaining` and
+  `x-ratelimit-complexity-remaining` headers of every answer are reported as
+  the fewest the pass saw.
+
+A permanently deleted comment, and an issue moved into a team the collector
+does not read, are invisible to a sweep; they are left to the webhook hints of
+stage 7. Reactions, subscribers, history entries, and attachments' content are
+never read.
+
 **Rejected.** A per-container cursor for documents: a full enumeration
 compared with the heads resumes by construction, and a pass instant as the
 order keeps it independent of file times. Following every symlink inside the
@@ -758,6 +828,13 @@ missing from one read (a listing that raced an edit, or a transient provider
 gap, would hide it for good, since a message that reappears at its own order
 cannot displace the tombstone), and resuming a cut reconciliation from a
 saved Slack cursor (Slack cursors expire; a re-read stages nothing twice).
+For Linear: restarting a cut sweep from its high-water mark (under a rate
+limit or a page budget, a long backfill would re-read its first pages every
+pass and might never finish; a Relay cursor under the same filter resumes
+it), minting a version for every `updatedAt` (label and assignee churn would
+bury the content changes in history), and one sweep over every team (a rate
+limit would leave every team partial, and one team's cursor could not advance
+without the others).
 
 ## D9 — Operator imports and the `collect` command
 

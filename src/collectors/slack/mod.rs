@@ -85,7 +85,9 @@ use super::audience::{
 };
 use super::cockroach::framed_sha256;
 use super::draft::CollectedItemDraftV1;
-use super::http::{AuthSchemeV1, ProviderHttpV1, ProviderTokenV1, validate_api_base};
+use super::http::{
+    AuthSchemeV1, ProviderHttpV1, ProviderTokenV1, is_variable_name, validate_api_base,
+};
 use super::pull::{
     ContainerOutcomeV1, ListingBoundV1, PageStager, PartialReasonV1, PullCollectorV1,
     PullPassInputV1, PullPassOutcomeV1, PulledItemV1,
@@ -216,16 +218,6 @@ fn is_slack_id(value: &str, prefixes: &[char]) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-}
-
-/// Whether `value` names an environment variable: `[A-Z_][A-Z0-9_]*`.
-fn is_variable_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && !value.starts_with(|scalar: char| scalar.is_ascii_digit())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 impl SlackSettingsV1 {
@@ -1281,6 +1273,7 @@ mod tests {
                 provider_order: 42,
                 pending: Vec::new(),
                 thread_root: thread_root.map(str::to_owned),
+                container_key: None,
             },
         )
     }

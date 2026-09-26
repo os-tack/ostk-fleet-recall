@@ -60,6 +60,19 @@
         "reconcile_every_seconds": 86400,
         "max_pages_per_tick": 500
       }
+    },
+    {
+      "provider": "linear",
+      "connector_principal": "principal.linear",
+      "connector_instance": "linear.acme",
+      "provider_scope_id": "0a9c0000-0000-4000-8000-0000000ac3e1",
+      "audience": {"private_containers": []},
+      "settings": {
+        "token_env": "FLEET_RECALL_LINEAR_API_KEY",
+        "teams": ["4e6b8d0f-1a2b-4c3d-9e8f-7a6b5c4d3e2f"],
+        "overlap_seconds": 300,
+        "max_pages_per_tick": 500
+      }
     }
   ]
 }

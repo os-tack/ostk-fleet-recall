@@ -8,6 +8,10 @@
 //!   ([`PROVIDER_HTTP_TIMEOUT`]) and every response body is read up to 8 MiB
 //!   ([`MAX_PROVIDER_RESPONSE_BYTES`]); a longer one is an error, never a
 //!   truncated page.
+//! * **GraphQL errors are answers.** [`ProviderHttpV1::post_graphql`] returns a
+//!   `4xx` other than `429` as a response, since a GraphQL API reports a
+//!   refused credential or a rate limit in the body of a `400` or `401`; the
+//!   collector reads the error codes and nothing else from it.
 //! * **Rate limits are an answer, not a failure.** A `429` is returned as
 //!   [`ProviderHttpErrorV1::RateLimited`] with its `Retry-After`, so a
 //!   collector ends its pass partial with its cursor held rather than
@@ -199,6 +203,18 @@ impl ProviderTokenV1 {
     }
 }
 
+/// Whether `value` can name the environment variable a collector's
+/// credential is read from: `[A-Z_][A-Z0-9_]*`, at most 128 bytes.
+#[must_use]
+pub fn is_variable_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with(|scalar: char| scalar.is_ascii_digit())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 /// Whether a URL's host is loopback: `localhost`, `127.0.0.0/8`, or `::1`.
 #[must_use]
 pub fn is_loopback(url: &url::Url) -> bool {
@@ -248,7 +264,8 @@ pub fn validate_api_base(raw: &str) -> Result<url::Url, String> {
 /// One response: its status, the rate-limit headers, and the body.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderResponseV1 {
-    /// The HTTP status (always `2xx`).
+    /// The HTTP status: `2xx`, or, from [`ProviderHttpV1::post_graphql`], a
+    /// `4xx` other than `429`.
     pub status: u16,
     /// `x-ratelimit-*` and `retry-after`, lowercased.
     pub headers: Vec<(String, String)>,
@@ -377,7 +394,7 @@ impl ProviderHttpV1 {
             .get(self.url(path)?)
             .header(AUTHORIZATION, self.authorization.clone())
             .query(query);
-        read(request).await
+        read(request, AnswerV1::Success).await
     }
 
     /// `POST <base><path>` with a JSON body.
@@ -395,8 +412,41 @@ impl ProviderHttpV1 {
             .post(self.url(path)?)
             .header(AUTHORIZATION, self.authorization.clone())
             .json(body);
-        read(request).await
+        read(request, AnswerV1::Success).await
     }
+
+    /// `POST <base><path>` with a JSON body, to a GraphQL endpoint. A GraphQL
+    /// API answers its errors (a refused credential, a rate limit, a field
+    /// the key may not read) in the body of a `400` or `401` as often as in a
+    /// `200`, so a `4xx` other than `429` is returned as a response, read
+    /// within the same bound, for the collector to read its `errors`. A `429`
+    /// is still [`ProviderHttpErrorV1::RateLimited`], and anything else
+    /// outside `2xx` and `4xx` is still an error.
+    ///
+    /// # Errors
+    ///
+    /// Every [`ProviderHttpErrorV1`] but the construction ones.
+    pub async fn post_graphql(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<ProviderResponseV1, ProviderHttpErrorV1> {
+        let request = self
+            .client
+            .post(self.url(path)?)
+            .header(AUTHORIZATION, self.authorization.clone())
+            .json(body);
+        read(request, AnswerV1::ClientErrorsToo).await
+    }
+}
+
+/// Which statuses a request reads as an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnswerV1 {
+    /// `2xx` only.
+    Success,
+    /// `2xx`, and `4xx` other than `429`: a GraphQL API's errors.
+    ClientErrorsToo,
 }
 
 /// A transport error's text, without its URL, scrubbed.
@@ -437,7 +487,10 @@ fn kept_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 }
 
 /// Send `request` and read its answer within the bounds.
-async fn read(request: reqwest::RequestBuilder) -> Result<ProviderResponseV1, ProviderHttpErrorV1> {
+async fn read(
+    request: reqwest::RequestBuilder,
+    answer: AnswerV1,
+) -> Result<ProviderResponseV1, ProviderHttpErrorV1> {
     let mut response = request.send().await.map_err(transport)?;
     let status = response.status();
     let headers = kept_headers(response.headers());
@@ -450,7 +503,9 @@ async fn read(request: reqwest::RequestBuilder) -> Result<ProviderResponseV1, Pr
             retry_after_seconds,
         });
     }
-    if !status.is_success() {
+    let answered =
+        status.is_success() || (answer == AnswerV1::ClientErrorsToo && status.is_client_error());
+    if !answered {
         return Err(ProviderHttpErrorV1::Status {
             status: status.as_u16(),
         });
@@ -584,6 +639,12 @@ mod tests {
                 )
                     .into_response(),
                 "/api/broken" => (StatusCode::BAD_GATEWAY, authorization).into_response(),
+                "/api/refused" => (
+                    StatusCode::BAD_REQUEST,
+                    [("x-ratelimit-requests-remaining", "7")],
+                    r#"{"errors":[{"extensions":{"code":"INPUT_ERROR"}}]}"#,
+                )
+                    .into_response(),
                 "/api/huge" => vec![b'x'; MAX_PROVIDER_RESPONSE_BYTES + 1].into_response(),
                 "/api/moved" => (
                     StatusCode::FOUND,
@@ -654,6 +715,40 @@ mod tests {
         assert!(
             matches!(refused, ProviderHttpErrorV1::Transport(_)),
             "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_graphql_post_reads_a_client_error_as_an_answer_and_nothing_else() {
+        let base = serve().await;
+        let token =
+            ProviderTokenV1::from_environment("T", &|_: &str| Some("s3cr3t".into())).unwrap();
+        let client = ProviderHttpV1::new(&base, &token, AuthSchemeV1::Plain).unwrap();
+        let query = serde_json::json!({"query": "{ organization { id } }"});
+        assert_eq!(
+            client.post_json("refused", &query).await.unwrap_err(),
+            ProviderHttpErrorV1::Status { status: 400 },
+            "a plain post keeps a 400 an error"
+        );
+        let refused = client.post_graphql("refused", &query).await.unwrap();
+        assert_eq!(refused.status, 400);
+        assert_eq!(refused.header("x-ratelimit-requests-remaining"), Some("7"));
+        let body: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
+        assert_eq!(body["errors"][0]["extensions"]["code"], "INPUT_ERROR");
+        assert_eq!(client.post_graphql("ok", &query).await.unwrap().status, 200);
+        assert_eq!(
+            client.post_graphql("slow-down", &query).await.unwrap_err(),
+            ProviderHttpErrorV1::RateLimited {
+                retry_after_seconds: Some(30)
+            }
+        );
+        assert_eq!(
+            client.post_graphql("broken", &query).await.unwrap_err(),
+            ProviderHttpErrorV1::Status { status: 502 }
+        );
+        assert_eq!(
+            client.post_graphql("huge", &query).await.unwrap_err(),
+            ProviderHttpErrorV1::TooLarge
         );
     }
 
