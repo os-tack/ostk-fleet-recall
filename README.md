@@ -24,7 +24,10 @@ The `ostk-fleet-recall` binary has these commands:
 - `serve` speaks newline-delimited JSON-RPC/MCP on stdin/stdout with two tools:
   - `recall(search|get|conflicts|status)` reads the hybrid vector/lexical
     corpus and typed-claim state. `get` with `kind=conflict` returns one
-    conflict by id in any state, with its members and its lifecycle history.
+    conflict by id in any state, with its members and its lifecycle history;
+    `get` with `kind=claim` returns a claim with its own lifecycle history,
+    or, given `key` (or `subject` and `predicate`), every claim on that key
+    with the key's open conflict.
     Every conflict the private writer returns carries a `lifecycle` overlay:
     who acknowledged or waived it, and who closed it and how.
   - `recall(search|get, kind=evidence)` searches the connector evidence the
@@ -1459,6 +1462,31 @@ Then the key's open conflict is re-evaluated exactly as for a retract:
 compatible successor let it close or an incompatible one keeps it `still_open`
 with the successor as a member. The predecessor stays a historical member of
 its conflicts, and `recall` `get` with `kind=claim` shows its `superseded_by`.
+
+**The audit trail.** On a private writer, `recall(get, kind=claim)` by id
+also returns `history`: the claim's own lifecycle log oldest first (its
+`recorded` birth, then every `state_transition` with `actor`, `reason` such
+as `conflict_detected`, `retracted_by_author`, or `superseded_by_author`,
+`from_state`, `to_state`, and what the transition named: `conflict_id`,
+`successor_claim_id`, `revision_before`, the author's `note`), cut to the
+newest events within the response budget with `history_truncated` saying so;
+a successor's claim carries `supersedes`, the predecessor's id. Instead of an
+id, `key` (the exact stored key) or `subject` and `predicate` (normalized as
+`record` normalizes them) returns every lifecycle-current claim on that key
+oldest first, each with its support and `conflict_ids`, the key's
+`open_conflict`, and with `include_history` its superseded and retracted
+claims too; `recall(conflicts)` takes the same `claim_key` filter. Claim
+search hits carry their `value` (up to 2,000 bytes; `value_elided` otherwise)
+with the claim's `revision` and `actor` repeated on the hit.
+
+`recall(status)` reports what an operator can act on: `conflicts` (`open`,
+`acknowledged`, `waived`, `oldest_open_at`; the lifecycle counts are `null`
+where the overlay is not served), `quarantine` (`by_reason` and the newest
+`preimage_disagreement_sample`, read on private writers only),
+`legacy_claim_keys` (below), and, wherever an absence verdict is served,
+`absence_contract`: the dense bound, the neighbour band floor below which a
+verdict is `unknown` rather than `absent`, the media types excluded from the
+dense vote, and that the verdict is anchored on the lexical lane.
 
 A supersede is refused for the same reasons as a retract, and also when the
 successor changes the kind (`successor_kind_mismatch`), the normalized key
