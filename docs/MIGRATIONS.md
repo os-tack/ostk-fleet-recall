@@ -70,8 +70,13 @@ Each private runtime uses its own part of these tables:
   migrations 24, 27, and 31 for `recall(action="discrepancies")`. The
   `evidence` and `spec_conformance` blocks of `recall(status)` read the same
   tables, and the evidence block's `collectors` count also reads the
-  collector dead letters. `serve` writes none of them. Of the tables from migration 19 onward, it writes only
-  migration 29's lifecycle log.
+  collector dead letters. `serve` writes none of them unless agent capture is
+  turned on (ADR 0008 D10): then `remember(capture)` stages into migration
+  33's outbox and writes its capture instance's status row and dead letters,
+  and, when `enabled`, drains its own rows into the item history, links, and
+  heads as the worker's step does. Of the other tables from migration 19
+  onward, it writes only migration 29's lifecycle log. Capture adds no
+  migration or grant.
 - Only the private import CLI writes migration 28's rows. No served path
   reads them or migration 23's publication views.
 

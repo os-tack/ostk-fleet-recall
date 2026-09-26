@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sqlx::Row as _;
 use sqlx::postgres::PgRow;
+use sqlx::{Postgres, Row as _, Transaction};
 
 use crate::error::{FleetError, Result};
 use crate::memory_contracts::collected_item::{
@@ -75,6 +75,35 @@ pub struct CollectorDeadLetterV1 {
     pub delivery_id: Option<Vec<u8>>,
     /// A static diagnostic; never provider content.
     pub diagnostic: String,
+}
+
+/// Decode `ROW_STATES_SQL` rows into `states`.
+fn decode_row_states(
+    rows: &[PgRow],
+    states: &mut BTreeMap<Sha256Digest, OutboxRowStateV1>,
+) -> Result<()> {
+    for row in rows {
+        let state: String = row.try_get("state")?;
+        let state = match state.as_str() {
+            "pending" => OutboxRowStateV1::Pending,
+            "admitted" => OutboxRowStateV1::Admitted(
+                optional_digest_column(row, "accepted_event_id")?.ok_or_else(|| {
+                    FleetError::Memory(
+                        "an admitted collector row names no accepted event".to_owned(),
+                    )
+                })?,
+            ),
+            "quarantined" => OutboxRowStateV1::Quarantined,
+            "dead_lettered" => OutboxRowStateV1::DeadLettered,
+            other => {
+                return Err(FleetError::Memory(format!(
+                    "a collector row is in an unknown state {other:?}"
+                )));
+            }
+        };
+        states.insert(digest_column(row, "stage_id")?, state);
+    }
+    Ok(())
 }
 
 /// One version seen in the outbox, while reading pending rows.
@@ -209,27 +238,33 @@ impl CollectedItemSink {
                 .bind(&ids)
                 .fetch_all(&self.pool)
                 .await?;
-            for row in &rows {
-                let state: String = row.try_get("state")?;
-                let state = match state.as_str() {
-                    "pending" => OutboxRowStateV1::Pending,
-                    "admitted" => OutboxRowStateV1::Admitted(
-                        optional_digest_column(row, "accepted_event_id")?.ok_or_else(|| {
-                            FleetError::Memory(
-                                "an admitted collector row names no accepted event".to_owned(),
-                            )
-                        })?,
-                    ),
-                    "quarantined" => OutboxRowStateV1::Quarantined,
-                    "dead_lettered" => OutboxRowStateV1::DeadLettered,
-                    other => {
-                        return Err(FleetError::Memory(format!(
-                            "a collector row is in an unknown state {other:?}"
-                        )));
-                    }
-                };
-                states.insert(digest_column(row, "stage_id")?, state);
-            }
+            decode_row_states(&rows, &mut states)?;
+        }
+        Ok(states)
+    }
+
+    /// [`Self::row_states`], read inside `transaction`: what a caller that
+    /// stages in its own transaction ([`super::PreparedStageV1`]) sees of the
+    /// rows it just staged or found.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::row_states`].
+    pub async fn row_states_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        stage_ids: &[Sha256Digest],
+    ) -> Result<BTreeMap<Sha256Digest, OutboxRowStateV1>> {
+        let mut states = BTreeMap::new();
+        for chunk in stage_ids.chunks(1_024) {
+            let ids: Vec<Vec<u8>> = chunk.iter().map(|id| id.as_bytes().to_vec()).collect();
+            let rows: Vec<PgRow> = sqlx::query(ROW_STATES_SQL)
+                .bind(self.tenant_id)
+                .bind(&self.project)
+                .bind(&ids)
+                .fetch_all(&mut **transaction)
+                .await?;
+            decode_row_states(&rows, &mut states)?;
         }
         Ok(states)
     }

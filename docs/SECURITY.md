@@ -330,15 +330,18 @@ lifecycle action and restores the record-only lifecycle surface; a lifecycle
 request committed before the switch still replays when its identical request
 is retried. The switch does not withdraw `remember(assert)`, which is served
 whenever its writer-authority pins verify
-([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md) D9), or
+([ADR 0005](adr/0005-event-first-assert-and-writer-authority.md) D9),
+`remember(capture)`, which `FLEET_RECALL_COLLECTED_CAPTURE` governs
+([ADR 0008](adr/0008-collected-items.md) D10), or
 `recall(kind=evidence)`, `recall(kind=item)`, and
 `recall(action="discrepancies")`, which are served whenever their startup
 probes pass. With the switch disabled, a writer whose
 pins verify therefore still serves `remember` with the actions `record` and
 `assert`, and `assert` still appends `memory.claim.accepted` events.
 `tools/list` is the historical record-only list only on a writer that serves
-none of the three. To withdraw assert, unset the pin group and restart
-`serve`.
+none of them. To withdraw assert, unset the pin group and restart `serve`;
+to withdraw capture, set `FLEET_RECALL_COLLECTED_CAPTURE=disabled` (the
+default) and restart it.
 
 ## Event-first writers and the content key
 
@@ -391,7 +394,25 @@ key no longer limits who can read it, and destroying the key no longer erases
 it: erasure must also purge the body rows and the lexical and dense rows
 derived from them (ADR 0006 D9). Git ingress redaction is deferred, so git
 bodies are raw commit text; the lexical recall text that evidence recall
-returns is redacted. `ostk-spec check` needs the key too. `serve` never does.
+returns is redacted. `ostk-spec check` needs the key too. `serve` needs it
+only with `FLEET_RECALL_COLLECTED_CAPTURE=enabled`, which admits captures in
+the call; `stage_only` leaves admission to the worker and keeps the key out
+of `serve`.
+
+**Agent capture.** `remember(capture)` stores text an agent says it read
+elsewhere ([ADR 0008](adr/0008-collected-items.md) D10). Nothing in it is
+provider proof: every captured item is `reported`, attested by the
+deployment-bound `agent.<FLEET_RECALL_AGENT>` (a claim of the reviewed binary,
+not cryptographic workload identity, since every agent shares the writer
+credential), never presented over a verified collector's copy, and recalled
+as `untrusted_third_party` text. The agent never decides who may read it:
+the server admits an item only into a container a verified collector or an
+operator import recorded as readable by the project, or into a scope the
+operator lists in `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES`, and an agent's
+`private` or `dm` hint withholds it. The collector redactor scrubs every
+item before it is staged, a refusal keeps only a digest, and the capture's
+receipt keeps the request's digest, never its text. A capture cannot
+withdraw, re-open, or delete anything.
 
 **The publication reader gains nothing.** The event-first plane changes only
 the runtime policy. `fleet_publication_reader` keeps `SELECT` on exactly its
@@ -399,7 +420,7 @@ eight tables and receives nothing on the accepted-event ledger, the content
 store, the body, recall-projection, coverage, connector, worker, normative,
 spec, or discrepancy tables, or migration 23's filtered views, whose
 publication grant is still deferred. The publication process serves no
-assert, evidence recall, or discrepancies.
+assert, capture, evidence recall, or discrepancies.
 
 **Asserted claims and the public demo.** The publication reader does hold
 table-level `SELECT` on `memory_claims` and `memory_chunks`, where an

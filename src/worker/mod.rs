@@ -122,7 +122,7 @@ use crate::store::cockroach::RetryPolicy;
 pub use collect::COLLECT_DRAIN_LIMIT;
 pub use command::{WorkerCommandV1, WorkerProcessV1, run_command};
 pub use ingest::{COVERAGE_FRESHNESS_LABEL, COVERAGE_PROOF_LABEL, TRANSCRIPT_DRAIN_LIMIT};
-pub use privileges::{RUNTIME_GRANTS_POLICY, probe_worker_privileges};
+pub use privileges::{RUNTIME_GRANTS_POLICY, probe_capture_privileges, probe_worker_privileges};
 pub use sources::{
     CiSourceV1, CollectorSourceV1, DEFAULT_COVERAGE_SINCE, DEFAULT_GIT_MAX_COMMITS,
     DEFAULT_GIT_MAX_FACTS, DEFAULT_STALE_AFTER_SECONDS, DEFAULT_TRANSCRIPT_INSTANCE_PREFIX,

@@ -81,6 +81,17 @@ The `ostk-fleet-recall` binary has these commands:
     `assert_unavailable`. `recall(status)` then adds a `remember_assert`
     block. See [asserting a claim](#asserting-a-claim) and
     [ADR 0005](docs/adr/0005-event-first-assert-and-writer-authority.md).
+  - `remember(capture)` relays items the calling agent read through its own
+    connectors (a Slack thread, a Linear issue, a Granola note) into the
+    collected-item sink as `reported` items it attests, so the fleet recalls
+    them with `recall(kind=item)` and a claim can cite their accepted events.
+    The server decides who may read each item and redacts secrets. It is
+    served only where `FLEET_RECALL_COLLECTED_CAPTURE` turns it on and its
+    startup checks pass; elsewhere `tools/list` is unchanged and a capture is
+    refused as `capture_unavailable`. `recall(status)` then adds a
+    `remember_capture` block. See
+    [capturing items an agent read](#capturing-items-an-agent-read) and
+    [ADR 0008 D10](docs/adr/0008-collected-items.md).
   - `remember(retract)` retires a claim the calling agent authored. When no
     incompatible lifecycle-current pair remains on the claim's key, the
     detector closes that key's conflict and returns its disputed members to
@@ -424,6 +435,63 @@ their digests, reasons, and static diagnostics, never provider text, and
 snapshot no longer counts toward absence; its items stay recallable, and
 importing again re-activates it. An import never takes the name of a worker
 source or a worker collector, and `retire` touches an import's row only.
+
+## Capturing items an agent read
+
+`remember(capture)` lets an agent relay what it read through its own MCP
+connectors into the same sink every collector uses, bound to
+`connector.collected.capture`
+([ADR 0008 D10](docs/adr/0008-collected-items.md)). One call carries 1 to 32
+items in the shape an [import](#importing-collected-items) line has, each
+with its `https` provider `url`, `updated_at` (or `created_at`), and the text
+as read (at most 256 KiB; the server splits it); `via` optionally names the
+tool it came through:
+
+```json
+{"action":"capture","idempotency_key":"readme/capture/v1","via":"slack.conversations_history","items":[{"provider":"slack","provider_scope_id":"T07ACME0001","object_kind":"message","external_id":"C07PLATENG1:1790006860.001100","container":{"kind":"slack.channel","id":"C07PLATENG1"},"author":{"id":"U07ALICE","kind":"human"},"updated_at":"2026-09-21T16:07:40Z","text":"the retry budget is five","url":"https://acme.slack.com/archives/C07PLATENG1/p1790006860001100"}]}
+```
+
+Each item answers, in order, with its `item_id` (what `recall(get,
+kind=item)` takes), `version_id`, the version `uri`, `redacted_ranges`, its
+`accepted_event_ids` (what an assertion cites as
+`support_evidence_event_ids`), and a disposition: `admitted`, `staged` (the
+worker's `collect` step admits it), `replayed` (the same item, already
+admitted from this agent under another key), or `withheld` with a
+`withheld_reason`. The same key replays the stored answer; a different
+request under a used key is an idempotency conflict. The receipt keeps the
+request's digest, never an item's text.
+
+The server, not the agent, decides who may read an item: it is admitted only
+into a container a verified collector or an operator import already recorded
+as readable by the project, or into a provider scope or container the
+operator lists in `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES`. Anything else is
+withheld (`audience_unverified`), as is a container since withdrawn
+(`container_withdrawn`) and an item whose `visibility` is `private` or `dm`
+(`audience_refused`); nothing an agent sends widens an audience. A captured
+item is `reported` and attested by `agent.<FLEET_RECALL_AGENT>`: two agents'
+captures are two attestations, a collector's own copy of the item is always
+presented over it, and a newer captured version that differs sets the item's
+`disagreement`. A deletion is never captured; only a collector or an import
+reports one.
+
+`serve` configures capture with:
+
+- `FLEET_RECALL_COLLECTED_CAPTURE`: `disabled` (the default; nothing changes
+  and nothing else is read), `stage_only` (captures are staged, and the
+  worker's `collect` step admits them; `serve` needs no content key), or
+  `enabled` (captures are admitted in the call, which needs
+  `FLEET_RECALL_CONTENT_KEK_HEX` in `serve`);
+- `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES`: a JSON array of `{"provider",
+  "provider_scope_id", "containers": "*" | ["<container id>", ...]}` the
+  operator declares visible to the whole project, default `[]`;
+- the writer-authority pins, over a generation-3 head (run
+  `ostk-authority-install apply --target generation-3`), migration 34, and
+  the runtime grants.
+
+If any of them is missing or does not verify, `serve` logs why, starts
+without capture, and `recall(status).remember_capture` reports `served:
+false` with the reason. `FLEET_RECALL_REMEMBER_LIFECYCLE` does not govern
+capture.
 
 ## Asserting a claim
 

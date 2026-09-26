@@ -853,6 +853,203 @@ impl Default for LifecycleConfig {
     }
 }
 
+/// `FLEET_RECALL_COLLECTED_CAPTURE`: whether `serve` answers
+/// `remember(action=capture)` (ADR 0008 D10), and how far.
+pub const COLLECTED_CAPTURE_ENV: &str = "FLEET_RECALL_COLLECTED_CAPTURE";
+
+/// `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES`: the provider scopes, or
+/// containers of them, the operator declares visible to the whole project for
+/// agent capture (ADR 0008 D6, D10).
+pub const COLLECTED_CAPTURE_SCOPES_ENV: &str = "FLEET_RECALL_COLLECTED_CAPTURE_SCOPES";
+
+/// Most capture scopes one deployment declares.
+pub const MAX_COLLECTED_CAPTURE_SCOPES: usize = 256;
+
+/// Most containers one capture scope lists.
+pub const MAX_COLLECTED_CAPTURE_SCOPE_CONTAINERS: usize = 1_024;
+
+/// How `serve` answers `remember(action=capture)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectedCaptureModeV1 {
+    /// Not served, and not advertised: every tool schema is what it was.
+    #[default]
+    Disabled,
+    /// Captured items are staged in the collector outbox and left for the
+    /// worker's `collect` step to admit; `serve` never holds the content key.
+    StageOnly,
+    /// Captured items are staged and admitted in the call, which needs
+    /// `FLEET_RECALL_CONTENT_KEK_HEX` in `serve`.
+    Enabled,
+}
+
+impl CollectedCaptureModeV1 {
+    /// The variable's value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::StageOnly => "stage_only",
+            Self::Enabled => "enabled",
+        }
+    }
+}
+
+/// The capture switch and the operator's capture scopes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CollectedCaptureConfig {
+    /// `FLEET_RECALL_COLLECTED_CAPTURE`: `disabled` (the default),
+    /// `stage_only`, or `enabled`.
+    pub mode: CollectedCaptureModeV1,
+    /// `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES`, read only when capture is not
+    /// disabled: a JSON array of `{"provider", "provider_scope_id",
+    /// "containers": "*" | ["<container id>", ...]}`, default `[]`.
+    pub scopes: Vec<crate::collectors::audience::CaptureScopeV1>,
+}
+
+/// One capture scope as `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES` writes it.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureScopeWire {
+    provider: String,
+    provider_scope_id: String,
+    containers: CaptureContainersWire,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum CaptureContainersWire {
+    All(String),
+    Listed(Vec<String>),
+}
+
+impl CollectedCaptureConfig {
+    /// Read the capture configuration from the process environment.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_lookup`].
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    /// Read the capture configuration through `lookup`. A disabled capture
+    /// reads nothing else, so its scopes can never stop a process.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Configuration`] for a switch that is not `disabled`,
+    /// `stage_only`, or `enabled`, or scopes that are not the documented JSON:
+    /// a provider kind, a provider scope id of 1 to 256 bytes holding no
+    /// secret shape or hidden scalar, and `"*"` or 1 to 1,024 container ids;
+    /// at most 256 scopes, each `(provider, provider_scope_id)` once.
+    pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        let mode = match lookup(COLLECTED_CAPTURE_ENV).as_deref() {
+            None | Some("disabled") => CollectedCaptureModeV1::Disabled,
+            Some("stage_only") => CollectedCaptureModeV1::StageOnly,
+            Some("enabled") => CollectedCaptureModeV1::Enabled,
+            Some(_) => {
+                return Err(FleetError::Configuration(format!(
+                    "{COLLECTED_CAPTURE_ENV} must be disabled, stage_only, or enabled"
+                )));
+            }
+        };
+        if mode == CollectedCaptureModeV1::Disabled {
+            return Ok(Self::default());
+        }
+        let scopes = match lookup(COLLECTED_CAPTURE_SCOPES_ENV) {
+            None => Vec::new(),
+            Some(json) => parse_capture_scopes(&json)?,
+        };
+        Ok(Self { mode, scopes })
+    }
+}
+
+fn parse_capture_scopes(json: &str) -> Result<Vec<crate::collectors::audience::CaptureScopeV1>> {
+    use crate::collectors::audience::{CaptureContainersV1, CaptureScopeV1};
+    use crate::collectors::draft::has_hidden_scalar;
+    use crate::collectors::redaction::scan_collected_secrets;
+    use crate::memory_contracts::collected_item::{
+        BoundedTextV1, MAX_LABEL_BYTES, MAX_SCOPE_ID_BYTES, ProviderKindV1,
+    };
+
+    let invalid = |message: &str| {
+        FleetError::Configuration(format!("{COLLECTED_CAPTURE_SCOPES_ENV}: {message}"))
+    };
+    let wire: Vec<CaptureScopeWire> = serde_json::from_str(json).map_err(|error| {
+        invalid(&format!(
+            "must be a JSON array of {{\"provider\", \"provider_scope_id\", \"containers\"}} \
+             objects: {error}"
+        ))
+    })?;
+    if wire.len() > MAX_COLLECTED_CAPTURE_SCOPES {
+        return Err(invalid(&format!(
+            "declares at most {MAX_COLLECTED_CAPTURE_SCOPES} scopes"
+        )));
+    }
+    // A provider scope id and a container id are the bounded NFC lines the
+    // envelope carries them as; `bounded` is that type's own check.
+    let bounded_id = |value: &str, what: &str, max: usize, bounded: fn(&str) -> bool| {
+        let valid = value.len() <= max
+            && bounded(value)
+            && !has_hidden_scalar(value)
+            && scan_collected_secrets(value).is_empty();
+        if valid {
+            Ok(value.to_owned())
+        } else {
+            Err(invalid(&format!(
+                "a {what} is 1 to {max} bytes of NFC text with no control, hidden scalar, or \
+                 secret shape"
+            )))
+        }
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut scopes = Vec::with_capacity(wire.len());
+    for scope in wire {
+        let provider = ProviderKindV1::new(scope.provider)
+            .map_err(|_| invalid("a provider must match ^[a-z][a-z0-9_-]{0,31}$"))?;
+        let provider_scope_id = bounded_id(
+            &scope.provider_scope_id,
+            "provider_scope_id",
+            MAX_SCOPE_ID_BYTES,
+            |value| BoundedTextV1::<MAX_SCOPE_ID_BYTES>::new(value).is_ok(),
+        )?;
+        if !seen.insert((provider.as_str().to_owned(), provider_scope_id.clone())) {
+            return Err(invalid(&format!(
+                "declares provider {provider} scope {provider_scope_id} twice"
+            )));
+        }
+        let containers = match scope.containers {
+            CaptureContainersWire::All(all) if all == "*" => CaptureContainersV1::All,
+            CaptureContainersWire::All(_) => {
+                return Err(invalid("containers is \"*\" or an array of container ids"));
+            }
+            CaptureContainersWire::Listed(ids) => {
+                if ids.is_empty() || ids.len() > MAX_COLLECTED_CAPTURE_SCOPE_CONTAINERS {
+                    return Err(invalid(&format!(
+                        "a container list holds 1 to {MAX_COLLECTED_CAPTURE_SCOPE_CONTAINERS} ids"
+                    )));
+                }
+                CaptureContainersV1::Listed(
+                    ids.iter()
+                        .map(|id| {
+                            bounded_id(id, "container id", MAX_LABEL_BYTES, |value| {
+                                BoundedTextV1::<MAX_LABEL_BYTES>::new(value).is_ok()
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            }
+        };
+        scopes.push(CaptureScopeV1 {
+            provider: provider.as_str().to_owned(),
+            provider_scope_id,
+            containers,
+        });
+    }
+    Ok(scopes)
+}
+
 #[derive(Clone)]
 pub struct FleetConfig {
     pub database_url: String,

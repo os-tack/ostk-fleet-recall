@@ -192,6 +192,18 @@ impl RuntimeProbeRole {
         Self::create_with(owner, database_url, grants, false, false).await
     }
 
+    /// Every block a `serve` writer's login holds under
+    /// `deploy/cockroach/runtime-role-grants.sql`: [`Self::create_claim_writer`]
+    /// plus [`STAGE5_RUNTIME_GRANTS`] and [`COLLECTOR_RUNTIME_GRANTS`], what
+    /// agent capture stages, admits, and keeps its receipts with.
+    pub async fn create_serve_writer(owner: &PgPool, database_url: &str) -> Self {
+        let mut grants = owned(&RUNTIME_EVIDENCE_GRANTS);
+        grants.extend(owned(&RUNTIME_CLAIM_GRANTS));
+        grants.extend(owned(&STAGE5_RUNTIME_GRANTS));
+        grants.extend(owned(&COLLECTOR_RUNTIME_GRANTS));
+        Self::create_with(owner, database_url, grants, true, false).await
+    }
+
     /// [`Self::create_worker`] with the Stage-5 and collector blocks, shaped as
     /// `deploy/cockroach/runtime-role-grants.sql` shapes the deployment: every
     /// grant goes to a `NOLOGIN` group role, as the policy gives them to

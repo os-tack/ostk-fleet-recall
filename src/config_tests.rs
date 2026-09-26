@@ -1779,3 +1779,101 @@ fn contract_semantic_scope_names_each_missing_namespace() {
         );
     }
 }
+
+#[test]
+fn collected_capture_is_disabled_by_default_and_reads_nothing_else() {
+    use std::collections::HashMap;
+
+    let read = |variables: &[(&str, &str)]| {
+        let variables: HashMap<String, String> = variables
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        CollectedCaptureConfig::from_lookup(|name| variables.get(name).cloned())
+    };
+    assert_eq!(read(&[]).unwrap(), CollectedCaptureConfig::default());
+    assert_eq!(
+        read(&[("FLEET_RECALL_COLLECTED_CAPTURE", "disabled")])
+            .unwrap()
+            .mode,
+        CollectedCaptureModeV1::Disabled
+    );
+    // A disabled capture never reads its scopes, however malformed.
+    assert_eq!(
+        read(&[
+            ("FLEET_RECALL_COLLECTED_CAPTURE", "disabled"),
+            ("FLEET_RECALL_COLLECTED_CAPTURE_SCOPES", "not json"),
+        ])
+        .unwrap(),
+        CollectedCaptureConfig::default()
+    );
+    let staged = read(&[("FLEET_RECALL_COLLECTED_CAPTURE", "stage_only")]).unwrap();
+    assert_eq!(staged.mode, CollectedCaptureModeV1::StageOnly);
+    assert!(staged.scopes.is_empty());
+    assert_eq!(
+        read(&[("FLEET_RECALL_COLLECTED_CAPTURE", "enabled")])
+            .unwrap()
+            .mode,
+        CollectedCaptureModeV1::Enabled
+    );
+    let error = read(&[("FLEET_RECALL_COLLECTED_CAPTURE", "on")]).unwrap_err();
+    assert!(
+        error.to_string().contains("FLEET_RECALL_COLLECTED_CAPTURE"),
+        "{error}"
+    );
+}
+
+#[test]
+fn collected_capture_scopes_are_closed_json() {
+    use std::collections::HashMap;
+
+    use crate::collectors::audience::{CaptureContainersV1, CaptureScopeV1};
+
+    let read = |scopes: &str| {
+        let variables = HashMap::from([
+            ("FLEET_RECALL_COLLECTED_CAPTURE", "enabled".to_owned()),
+            ("FLEET_RECALL_COLLECTED_CAPTURE_SCOPES", scopes.to_owned()),
+        ]);
+        CollectedCaptureConfig::from_lookup(|name| variables.get(name).cloned())
+    };
+    let config = read(
+        r#"[{"provider":"slack","provider_scope_id":"T07ACME0001","containers":["C07PLATENG1"]},
+            {"provider":"linear","provider_scope_id":"acme","containers":"*"}]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.scopes,
+        [
+            CaptureScopeV1 {
+                provider: "slack".into(),
+                provider_scope_id: "T07ACME0001".into(),
+                containers: CaptureContainersV1::Listed(vec!["C07PLATENG1".into()]),
+            },
+            CaptureScopeV1 {
+                provider: "linear".into(),
+                provider_scope_id: "acme".into(),
+                containers: CaptureContainersV1::All,
+            },
+        ]
+    );
+    for refused in [
+        "{}",
+        r#"[{"provider":"Slack","provider_scope_id":"T1","containers":"*"}]"#,
+        r#"[{"provider":"slack","provider_scope_id":"","containers":"*"}]"#,
+        r#"[{"provider":"slack","provider_scope_id":"T1","containers":"all"}]"#,
+        r#"[{"provider":"slack","provider_scope_id":"T1","containers":[]}]"#,
+        r#"[{"provider":"slack","provider_scope_id":"T1","containers":"*","extra":1}]"#,
+        r#"[{"provider":"slack","provider_scope_id":"T1","containers":"*"},
+            {"provider":"slack","provider_scope_id":"T1","containers":["C1"]}]"#,
+        r#"[{"provider":"slack","provider_scope_id":"xoxb-EXAMPLE-NOT-A-TOKEN","containers":"*"}]"#,
+        "[{\"provider\":\"slack\",\"provider_scope_id\":\"T1\",\"containers\":[\"C\u{200b}1\"]}]",
+    ] {
+        let error = read(refused).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("FLEET_RECALL_COLLECTED_CAPTURE_SCOPES"),
+            "{refused}: {error}"
+        );
+    }
+}

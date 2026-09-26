@@ -2,6 +2,12 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::memory_contracts::collected_item::{
+    AuthorKindV1, ItemLifecycleV1, MAX_EXTERNAL_ID_BYTES, MAX_LABEL_BYTES, MAX_LINK_TARGET_BYTES,
+    MAX_LINKS, MAX_MARKER_BYTES, MAX_PROVIDER_URL_BYTES, MAX_SCOPE_ID_BYTES, MAX_TITLE_BYTES,
+    TextFormatV1, VisibilityHintV1,
+};
+use crate::remember_runtime::{MAX_CAPTURE_ITEMS, MAX_CAPTURE_TEXT_BYTES};
 use crate::service::{RecallSurface, RememberSurface};
 
 /// Claim-shaped `remember` properties that a non-record action must not carry.
@@ -25,6 +31,8 @@ const CLAIM_LIFECYCLE_FIELDS: [&str; 3] = ["claim_id", "expected_revision", "rea
 const CONFLICT_FIELDS: [&str; 3] = ["conflict_id", "expected_member_count", "retract_claim_ids"];
 /// The event-first `remember` property that only `assert` carries.
 const ASSERT_FIELDS: [&str; 1] = ["assertion"];
+/// The `remember` properties that only `capture` carries.
+const CAPTURE_FIELDS: [&str; 2] = ["items", "via"];
 /// Adjudication `remember` properties that only `dismiss` and `waive` carry.
 const ADJUDICATION_FIELDS: [&str; 4] = [
     "reason_kind",
@@ -414,12 +422,16 @@ fn add_evidence_kind(tool: &mut Value) {
 }
 
 /// `remember` restricted to the actions the surface serves. The record-only
-/// surface is exactly [`remember_tool`], and a surface without `assert` is
-/// exactly what it was before `assert` existed.
+/// surface is exactly [`remember_tool`], and a surface without `assert` or
+/// `capture` is exactly what it was before each existed.
 #[must_use]
 pub fn remember_tool_for(surface: RememberSurface) -> Value {
     let mut tool = remember_tool();
-    if !surface.claim_lifecycle && !surface.conflict_lifecycle && !surface.assert {
+    if !surface.claim_lifecycle
+        && !surface.conflict_lifecycle
+        && !surface.assert
+        && !surface.capture
+    {
         return tool;
     }
     tool["description"] = json!(remember_description(surface));
@@ -427,6 +439,9 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
     let mut actions = vec!["record"];
     if surface.assert {
         actions.push("assert");
+    }
+    if surface.capture {
+        actions.push("capture");
     }
     if surface.claim_lifecycle {
         actions.extend(["supersede", "retract"]);
@@ -445,6 +460,10 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
         if surface.assert {
             properties.insert("assertion".into(), assertion_schema());
         }
+        if surface.capture {
+            properties.insert("items".into(), capture_items_schema());
+            properties.insert("via".into(), capture_via_schema());
+        }
     }
     let properties = schema["properties"]
         .as_object()
@@ -458,8 +477,9 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
 /// One `allOf` branch per served action. Each forbids only properties the
 /// surface declares.
 fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) -> Vec<Value> {
-    // `assertion` is named last in every other action's forbid list; it is
-    // declared, and so forbidden, only where assert is served.
+    // `assertion`, then capture's `items` and `via`, are named last in every
+    // other action's forbid list; each is declared, and so forbidden, only
+    // where its action is served.
     let mut branches = vec![branch(
         properties,
         "record",
@@ -469,10 +489,14 @@ fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) 
             &CONFLICT_FIELDS,
             &ADJUDICATION_FIELDS,
             &ASSERT_FIELDS,
+            &CAPTURE_FIELDS,
         ]),
     )];
     if surface.assert {
         branches.push(assert_branch(properties));
+    }
+    if surface.capture {
+        branches.push(capture_branch(properties));
     }
     if surface.claim_lifecycle {
         // The successor carries record's claim fields; the server refuses one
@@ -481,7 +505,12 @@ fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) 
             properties,
             "supersede",
             &["claim_id", "expected_revision", "kind", "text"],
-            &named(&[&CONFLICT_FIELDS, &ADJUDICATION_FIELDS, &ASSERT_FIELDS]),
+            &named(&[
+                &CONFLICT_FIELDS,
+                &ADJUDICATION_FIELDS,
+                &ASSERT_FIELDS,
+                &CAPTURE_FIELDS,
+            ]),
         ));
         branches.push(branch(
             properties,
@@ -492,6 +521,7 @@ fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) 
                 &CONFLICT_FIELDS,
                 &ADJUDICATION_FIELDS,
                 &ASSERT_FIELDS,
+                &CAPTURE_FIELDS,
             ]),
         ));
     }
@@ -505,6 +535,7 @@ fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) 
                 &["claim_id", "expected_member_count", "retract_claim_ids"],
                 &ADJUDICATION_FIELDS,
                 &ASSERT_FIELDS,
+                &CAPTURE_FIELDS,
             ]),
         ));
         branches.push(branch(
@@ -516,6 +547,7 @@ fn remember_branches(properties: &Map<String, Value>, surface: RememberSurface) 
                 &["claim_id"],
                 &ADJUDICATION_FIELDS,
                 &ASSERT_FIELDS,
+                &CAPTURE_FIELDS,
             ]),
         ));
     }
@@ -549,6 +581,7 @@ fn adjudication_branches(properties: &Map<String, Value>) -> [Value; 2] {
                     "review_in_hours",
                 ],
                 &ASSERT_FIELDS,
+                &CAPTURE_FIELDS,
             ]),
         ),
         adjudication_branch(
@@ -567,6 +600,7 @@ fn adjudication_branches(properties: &Map<String, Value>) -> [Value; 2] {
                 &CLAIM_FIELDS,
                 &["claim_id", "retract_claim_ids", "reason"],
                 &ASSERT_FIELDS,
+                &CAPTURE_FIELDS,
             ]),
         ),
     ]
@@ -585,6 +619,24 @@ fn assert_branch(properties: &Map<String, Value>) -> Value {
             &CLAIM_LIFECYCLE_FIELDS,
             &CONFLICT_FIELDS,
             &ADJUDICATION_FIELDS,
+            &CAPTURE_FIELDS,
+        ]),
+    )
+}
+
+/// The `capture` branch. A capture relays items and records no claim, so no
+/// claim, lifecycle, or assertion field may ride beside its items.
+fn capture_branch(properties: &Map<String, Value>) -> Value {
+    branch(
+        properties,
+        "capture",
+        &["items"],
+        &named(&[
+            &CLAIM_FIELDS,
+            &CLAIM_LIFECYCLE_FIELDS,
+            &CONFLICT_FIELDS,
+            &ADJUDICATION_FIELDS,
+            &ASSERT_FIELDS,
         ]),
     )
 }
@@ -610,16 +662,25 @@ const WRITE_GUARANTEES: &str = "Writes are scoped, audited, revision-checked, an
 /// What `assert` does, on every surface that serves it.
 const ASSERT_RULE: &str = "assert admits one claim through this deployment's active registry route, event first: recall(status).remember_assert.route names the predicate, its value kind and modalities, and the locator component keys of the subject and of each applicability dimension. Send those components, never URIs; the server derives every identity, stamps effective_from (never in the future) when omitted, and returns the accepted event with the claim. Agents asserting about the same subject and applicability share a claim_key and are checked for conflict; an intention never conflicts with an attestation. An identical assertion with the same explicit effective_from under another idempotency_key is refused as already_asserted; with effective_from omitted every call is a new assertion, so retry an unknown outcome only under the same idempotency_key. ";
 
+/// What `capture` does, on every surface that serves it.
+const CAPTURE_RULE: &str = "capture relays up to 32 items you read through your own connectors (Slack, Linear, Granola, a browser) into fleet memory as reported evidence that you attest; it records no claim. Send each item as you read it: its provider, provider_scope_id (the workspace, organization, or key it belongs to), object_kind, the provider's stable external_id (never a display label), its https url, updated_at or created_at, and its text; container, thread, author, title, and links when you know them. The server decides who may read an item: it is admitted only into a container a verified collector or an operator import recorded as visible to the project, or into a scope the operator listed for capture; visibility private or dm withholds it, and nothing you send widens it. Secrets are redacted, a collector's own copy of an item is always presented over yours, and item text is recalled as untrusted third-party content. Each item answers with its item_id, version_id, disposition (admitted, staged, replayed, or withheld with withheld_reason), and accepted_event_ids, which a claim can cite as support evidence; recall(status).remember_capture says whether items are admitted in the call or later by the worker. ";
+
 fn remember_description(surface: RememberSurface) -> String {
     let assert_rule = if surface.assert { ASSERT_RULE } else { "" };
+    let capture_rule = if surface.capture { CAPTURE_RULE } else { "" };
     if !surface.lifecycle_served() {
+        let actions = match (surface.assert, surface.capture) {
+            (_, false) => "or assert a claim",
+            (false, true) => "or capture items you read elsewhere",
+            (true, true) => "assert a claim, or capture items you read elsewhere",
+        };
         return format!(
-            "Deliberately record fleet memory, or assert a claim. {assert_rule}{WRITE_GUARANTEES}"
+            "Deliberately record fleet memory, {actions}. {assert_rule}{capture_rule}{WRITE_GUARANTEES}"
         );
     }
     if !surface.conflict_lifecycle {
         return format!(
-            "Deliberately record fleet memory, or supersede or retract claims you authored. {SUCCESSOR_RULE}{assert_rule}{WRITE_GUARANTEES}"
+            "Deliberately record fleet memory, or supersede or retract claims you authored. {SUCCESSOR_RULE}{assert_rule}{capture_rule}{WRITE_GUARANTEES}"
         );
     }
     let adjudication = surface.serves_adjudication();
@@ -646,8 +707,165 @@ fn remember_description(surface: RememberSurface) -> String {
         ""
     };
     format!(
-        "Deliberately record fleet memory, {actions}. {successor_rule}acknowledge marks a conflict's current episode as seen and changes nothing else. {RESOLVE_RULE}{adjudication_rules}{CLOSE_RESTORES_MEMBERS}{assert_rule}{WRITE_GUARANTEES}"
+        "Deliberately record fleet memory, {actions}. {successor_rule}acknowledge marks a conflict's current episode as seen and changes nothing else. {RESOLVE_RULE}{adjudication_rules}{CLOSE_RESTORES_MEMBERS}{assert_rule}{capture_rule}{WRITE_GUARANTEES}"
     )
+}
+
+/// The labels of a closed vocabulary, for a schema `enum`.
+fn labels<T: Copy>(values: &[T], label: fn(T) -> &'static str) -> Value {
+    json!(values.iter().map(|value| label(*value)).collect::<Vec<_>>())
+}
+
+/// The `capture` items: `CollectedItemInputV1` as an agent writes it, which
+/// the server parses with unknown fields denied, plus the provider `url` and
+/// the text capture requires. A tombstone lifecycle is not offered: an agent
+/// relays what it read, and only a collector or an import reports a deletion.
+#[allow(clippy::too_many_lines)] // one declarative schema, property by property
+fn capture_items_schema() -> Value {
+    let line = |max: usize| json!({ "type": "string", "minLength": 1, "maxLength": max });
+    let token = |pattern: &str| json!({ "type": "string", "pattern": pattern });
+    let kind = "^[a-z][a-z0-9_.-]{0,63}$";
+    let lifecycles: Vec<ItemLifecycleV1> = ItemLifecycleV1::ALL
+        .iter()
+        .copied()
+        .filter(|lifecycle| !lifecycle.is_tombstone())
+        .collect();
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": MAX_CAPTURE_ITEMS,
+        "description": "capture: the items, each as you read it from its provider. The server splits long text, derives every identity, and decides the audience.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+                    "description": "The provider kind: slack, linear, granola, docs, notion, ..."
+                },
+                "provider_scope_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_SCOPE_ID_BYTES,
+                    "description": "The provider scope the item belongs to: a Slack team id, a Linear organization id, a Granola workspace."
+                },
+                "object_kind": {
+                    "type": "string",
+                    "pattern": kind,
+                    "description": "message, issue, comment, note_summary, transcript, document, ..."
+                },
+                "external_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_EXTERNAL_ID_BYTES,
+                    "description": "The provider's stable id for the item (a Slack channel:ts, a Linear issue UUID), never a display label."
+                },
+                "version": {
+                    "type": "object",
+                    "properties": {
+                        "marker": line(MAX_MARKER_BYTES),
+                        "order_micros": { "type": "integer", "minimum": 0 }
+                    },
+                    "additionalProperties": false,
+                    "description": "The provider's own version marker and order, when you know them; otherwise the server derives them from updated_at or created_at and the text."
+                },
+                "lifecycle": {
+                    "type": "string",
+                    "enum": labels(&lifecycles, ItemLifecycleV1::as_str),
+                    "default": "live"
+                },
+                "container": {
+                    "type": "object",
+                    "properties": {
+                        "kind": token(kind),
+                        "id": line(MAX_LABEL_BYTES),
+                        "label": line(MAX_LABEL_BYTES)
+                    },
+                    "required": ["kind", "id"],
+                    "additionalProperties": false,
+                    "description": "Where the item lives: a Slack channel (kind slack.channel, id C...), a Linear team, a Granola folder."
+                },
+                "thread": {
+                    "type": "object",
+                    "properties": {
+                        "root_external_id": line(MAX_EXTERNAL_ID_BYTES),
+                        "parent_external_id": line(MAX_EXTERNAL_ID_BYTES)
+                    },
+                    "required": ["root_external_id"],
+                    "additionalProperties": false
+                },
+                "author": {
+                    "type": "object",
+                    "properties": {
+                        "id": line(MAX_LABEL_BYTES),
+                        "display": line(MAX_LABEL_BYTES),
+                        "kind": {
+                            "type": "string",
+                            "enum": labels(AuthorKindV1::ALL, AuthorKindV1::as_str)
+                        }
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false,
+                    "description": "Who the provider says wrote it. Recorded as reported, never as authenticated."
+                },
+                "created_at": { "type": "string", "format": "date-time" },
+                "updated_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "When this version was made at the provider; created_at is used when it is absent, and one of them is required."
+                },
+                "title": { "type": "string", "maxLength": MAX_TITLE_BYTES },
+                "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_CAPTURE_TEXT_BYTES,
+                    "description": "The item as you read it."
+                },
+                "text_format": {
+                    "type": "string",
+                    "enum": labels(TextFormatV1::ALL, TextFormatV1::as_str),
+                    "default": "plain"
+                },
+                "links": {
+                    "type": "array",
+                    "maxItems": MAX_LINKS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "rel": token(kind),
+                            "target": line(MAX_LINK_TARGET_BYTES),
+                            "label": line(MAX_LABEL_BYTES)
+                        },
+                        "required": ["rel", "target"],
+                        "additionalProperties": false
+                    }
+                },
+                "url": {
+                    "type": "string",
+                    "pattern": "^https://",
+                    "maxLength": MAX_PROVIDER_URL_BYTES,
+                    "description": "The item's https link at its provider."
+                },
+                "visibility": {
+                    "type": "string",
+                    "enum": labels(VisibilityHintV1::ALL, VisibilityHintV1::as_str),
+                    "description": "Who you saw could read it. It can only narrow: private and dm withhold the item."
+                }
+            },
+            "required": ["provider", "provider_scope_id", "object_kind", "external_id", "text", "url"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// The `capture` tool label: provenance, never authority.
+fn capture_via_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": MAX_LABEL_BYTES,
+        "description": "capture: the tool you read the items through (an MCP tool name), recorded with each item."
+    })
 }
 
 /// The `assert` input: one claim as locator components. It mirrors
@@ -989,6 +1207,7 @@ mod tests {
             conflict_lifecycle: true,
             adjudication: false,
             assert: false,
+            capture: false,
         }
     }
 
@@ -1954,6 +2173,207 @@ mod tests {
                 serde_json::from_value::<RememberAssertInputV1>(missing).is_err(),
                 "{required} is required by the server too"
             );
+        }
+    }
+
+    fn capturing(surface: RememberSurface) -> RememberSurface {
+        RememberSurface {
+            capture: true,
+            ..surface
+        }
+    }
+
+    /// Every remember surface without capture, beside every recall surface.
+    fn surfaces_without_capture() -> Vec<(RememberSurface, RecallSurface)> {
+        let mut surfaces = Vec::new();
+        for bits in 0_u8..16 {
+            let remember = RememberSurface {
+                claim_lifecycle: bits & 1 != 0,
+                conflict_lifecycle: bits & 2 != 0,
+                adjudication: bits & 4 != 0,
+                assert: bits & 8 != 0,
+                capture: false,
+            };
+            for recall in 0_u8..8 {
+                surfaces.push((
+                    remember,
+                    RecallSurface {
+                        evidence: recall & 1 != 0,
+                        discrepancies: recall & 2 != 0,
+                        items: recall & 4 != 0,
+                    },
+                ));
+            }
+        }
+        surfaces
+    }
+
+    #[test]
+    fn surfaces_without_capture_never_mention_it() {
+        for (remember, recall) in surfaces_without_capture() {
+            let tools = tool_list_for_surfaces(remember, recall);
+            let schema = &tools[1]["inputSchema"];
+            assert!(
+                !schema["properties"]["action"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("capture")),
+                "{remember:?}"
+            );
+            for field in CAPTURE_FIELDS {
+                assert!(
+                    schema["properties"].get(field).is_none(),
+                    "{remember:?} declares {field}"
+                );
+            }
+            let listed = serde_json::to_string(&tools).unwrap();
+            assert!(!listed.contains("remember_capture"), "{remember:?}");
+            assert!(!listed.contains("\"capture\""), "{remember:?}");
+        }
+    }
+
+    #[test]
+    fn capture_adds_one_action_its_properties_and_one_branch() {
+        for (remember, recall) in surfaces_without_capture() {
+            let without = tool_list_for_surfaces(remember, recall);
+            let with = tool_list_for_surfaces(capturing(remember), recall);
+            // The recall tool never changes: capture serves no read.
+            assert_eq!(with[0], without[0], "{remember:?}");
+            let schema = &with[1]["inputSchema"];
+            let mut actions = without[1]["inputSchema"]["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .clone();
+            actions.insert(if remember.assert { 2 } else { 1 }, json!("capture"));
+            assert_eq!(schema["properties"]["action"]["enum"], json!(actions));
+            assert_eq!(schema["required"], json!(["action", "idempotency_key"]));
+            // Every property another action declares is unchanged.
+            let before = without[1]["inputSchema"]["properties"].as_object().unwrap();
+            let after = schema["properties"].as_object().unwrap();
+            for (name, property) in before {
+                if name != "action" {
+                    assert_eq!(&after[name], property, "{name}");
+                }
+            }
+            assert_eq!(after.len(), before.len() + CAPTURE_FIELDS.len());
+            // Capture requires its items and refuses every claim, lifecycle,
+            // and assertion field the surface declares.
+            let capture = branch_for(&with[1], "capture");
+            assert_eq!(capture["then"]["required"], json!(["items"]));
+            let forbidden = forbidden_by(capture);
+            for field in CLAIM_FIELDS
+                .iter()
+                .chain(&CLAIM_LIFECYCLE_FIELDS)
+                .chain(&CONFLICT_FIELDS)
+                .chain(&ADJUDICATION_FIELDS)
+                .chain(&ASSERT_FIELDS)
+            {
+                assert_eq!(
+                    forbidden.contains(field),
+                    after.contains_key(*field),
+                    "capture forbids exactly the declared {field}"
+                );
+            }
+            assert!(!forbidden.contains("items") && !forbidden.contains("via"));
+            // Every other action refuses the capture fields.
+            for other in schema["allOf"].as_array().unwrap() {
+                let action = other["if"]["properties"]["action"]["const"]
+                    .as_str()
+                    .unwrap();
+                if action != "capture" {
+                    let forbidden = forbidden_by(other);
+                    assert!(
+                        forbidden.contains("items") && forbidden.contains("via"),
+                        "{action} forbids the capture fields"
+                    );
+                }
+            }
+            let description = with[1]["description"].as_str().unwrap();
+            assert!(description.contains("capture relays"), "{description}");
+            assert!(description.contains("recall(status).remember_capture"));
+            assert!(description.contains("records no claim"));
+            assert_eq!(
+                description.contains("recall(status).remember_assert"),
+                remember.assert
+            );
+        }
+    }
+
+    #[test]
+    fn capture_items_schema_mirrors_the_server_input() {
+        use crate::memory_contracts::collected_item::CollectedItemInputV1;
+        use crate::remember_runtime::{CaptureRequestV1, PreparedCaptureV1};
+
+        fn keys(value: &Value) -> Vec<&String> {
+            value.as_object().unwrap().keys().collect()
+        }
+
+        let tool = remember_tool_for(capturing(RememberSurface::RECORD_ONLY));
+        let items = &tool["inputSchema"]["properties"]["items"];
+        assert_eq!(items["maxItems"], json!(MAX_CAPTURE_ITEMS));
+        let item = &items["items"];
+        assert_eq!(item["additionalProperties"], false);
+        let example = json!({
+            "provider": "slack",
+            "provider_scope_id": "T07ACME0001",
+            "object_kind": "message",
+            "external_id": "C07PLATENG1:1790006860.001100",
+            "version": { "marker": "1790006860.001100", "order_micros": 1_790_006_860_001_100_u64 },
+            "lifecycle": "edited",
+            "container": { "kind": "slack.channel", "id": "C07PLATENG1", "label": "plat-eng" },
+            "thread": { "root_external_id": "C07PLATENG1:1790006800.000100", "parent_external_id": "C07PLATENG1:1790006800.000100" },
+            "author": { "id": "U07ALICE", "display": "Alice", "kind": "human" },
+            "created_at": "2026-09-20T10:00:00Z",
+            "updated_at": "2026-09-20T10:05:00Z",
+            "title": "retry budget",
+            "text": "the retry budget is five",
+            "text_format": "slack_mrkdwn_rendered",
+            "links": [{ "rel": "url", "target": "https://acme.example/runbook", "label": "runbook" }],
+            "url": "https://acme.slack.com/archives/C07PLATENG1/p1790006860001100",
+            "visibility": "public_channel"
+        });
+        // Every property the schema declares, at every level, is one the
+        // server parses, and it declares every one the server parses.
+        let parsed = CollectedItemInputV1::parse(example.to_string().as_bytes()).unwrap();
+        let reparsed = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(keys(&item["properties"]), keys(&reparsed));
+        for nested in ["version", "container", "thread", "author"] {
+            assert_eq!(
+                keys(&item["properties"][nested]["properties"]),
+                keys(&reparsed[nested]),
+                "{nested}"
+            );
+        }
+        assert_eq!(
+            keys(&item["properties"]["links"]["items"]["properties"]),
+            keys(&reparsed["links"][0])
+        );
+        let accepted = |item: Value| {
+            let request: CaptureRequestV1 =
+                serde_json::from_value(json!({ "items": [item] })).map_err(|_| ())?;
+            PreparedCaptureV1::prepare(&request)
+                .map(|_| ())
+                .map_err(|_| ())
+        };
+        assert!(accepted(example.clone()).is_ok());
+        // What the schema requires, the server refuses without.
+        for required in item["required"].as_array().unwrap() {
+            let mut missing = example.clone();
+            missing
+                .as_object_mut()
+                .unwrap()
+                .remove(required.as_str().unwrap());
+            assert!(accepted(missing).is_err(), "{required} is required");
+        }
+        // The lifecycles offered are exactly the ones a capture admits.
+        for lifecycle in ItemLifecycleV1::ALL {
+            let offered = item["properties"]["lifecycle"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(lifecycle.as_str()));
+            let mut example = example.clone();
+            example["lifecycle"] = json!(lifecycle.as_str());
+            assert_eq!(offered, accepted(example).is_ok(), "{}", lifecycle.as_str());
         }
     }
 }

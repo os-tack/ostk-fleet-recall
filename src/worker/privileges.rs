@@ -175,6 +175,25 @@ const DENSE_PROBES: &[Probe] = &[
     ("memory_recall_projection_cursors_v1", ProbeKind::Lock, None),
 ];
 
+/// The idempotency receipts `remember(action="capture")` reserves, and
+/// finalizes, its key in (ADR 0008 D10).
+const RECEIPT_PROBES: &[Probe] = &[
+    ("memory_mutation_receipts", ProbeKind::Insert, None),
+    ("memory_mutation_receipts", ProbeKind::Lock, None),
+];
+
+/// Every probe of `groups`, each `(table, privilege)` once, in order.
+fn unique_probes(groups: &[&[Probe]]) -> Vec<Probe> {
+    let mut seen = BTreeSet::new();
+    groups
+        .iter()
+        .copied()
+        .flatten()
+        .filter(|(table, kind, _)| seen.insert((*table, *kind)))
+        .copied()
+        .collect()
+}
+
 /// The probes `steps` need, each once, in step order.
 fn probes_for(steps: &BTreeSet<WorkerStepV1>) -> Vec<Probe> {
     let mut groups: Vec<&[Probe]> = Vec::new();
@@ -199,13 +218,14 @@ fn probes_for(steps: &BTreeSet<WorkerStepV1>) -> Vec<Probe> {
     if steps.contains(&WorkerStepV1::Dense) {
         groups.push(DENSE_PROBES);
     }
-    let mut seen = BTreeSet::new();
-    groups
-        .into_iter()
-        .flatten()
-        .filter(|(table, kind, _)| seen.insert((*table, *kind)))
-        .copied()
-        .collect()
+    unique_probes(&groups)
+}
+
+/// What `remember(action="capture")` writes: the collect step's tables (it
+/// stages through the same sink and, when enabled, drains through the same
+/// append) and the mutation receipts.
+fn capture_probes() -> Vec<Probe> {
+    unique_probes(&[INGEST_PROBES, COLLECT_PROBES, RECEIPT_PROBES])
 }
 
 fn probe_statement((table, kind, columns): Probe) -> String {
@@ -255,10 +275,44 @@ pub async fn probe_worker_privileges(
         older.remove(&WorkerStepV1::Collect);
         probes_for(&older)
     };
+    run_probes(pool, &probes, "the worker's database login", "the worker").await
+}
+
+/// Check that `serve`'s login holds every privilege agent capture uses.
+///
+/// That is the collect step's (capture stages through the same sink, and,
+/// when enabled, drains through the same append) plus SELECT, INSERT, and
+/// UPDATE on the mutation receipts. `remember(action="capture")` is served
+/// only where this passes (ADR 0008 D10).
+///
+/// # Errors
+///
+/// [`FleetError::Configuration`] for a schema before migration 34
+/// ([`COLLECTED_ITEMS_SCHEMA_VERSION`]), or naming the first table the login
+/// lacks a privilege on and the policy file that grants it; any other
+/// database failure as itself.
+pub async fn probe_capture_privileges(
+    pool: &PgPool,
+    capabilities: &DatabaseCapabilities,
+) -> Result<()> {
+    if !capabilities.supports_schema_version(COLLECTED_ITEMS_SCHEMA_VERSION) {
+        return Err(FleetError::Configuration(format!(
+            "agent capture needs the schema through migration \
+             {COLLECTED_ITEMS_SCHEMA_VERSION}, but this database has reached {}; run \
+             `ostk-fleet-recall migrate`",
+            capabilities.schema_version
+        )));
+    }
+    run_probes(pool, &capture_probes(), "serve's database login", "serve").await
+}
+
+/// Run `probes` in one transaction that is rolled back whatever happens,
+/// naming the first missing privilege of `login`, which `process` needs.
+async fn run_probes(pool: &PgPool, probes: &[Probe], login: &str, process: &str) -> Result<()> {
     let mut transaction = pool.begin().await?;
     let mut outcome = Ok(());
     for probe in probes {
-        match sqlx::query(&probe_statement(probe))
+        match sqlx::query(&probe_statement(*probe))
             .execute(&mut *transaction)
             .await
         {
@@ -267,8 +321,8 @@ pub async fn probe_worker_privileges(
                 if error.code().as_deref() == Some(INSUFFICIENT_PRIVILEGE_SQLSTATE) =>
             {
                 outcome = Err(FleetError::Configuration(format!(
-                    "the worker's database login lacks {} on public.{}; apply \
-                     {RUNTIME_GRANTS_POLICY} after `migrate`, then restart the worker",
+                    "{login} lacks {} on public.{}; apply {RUNTIME_GRANTS_POLICY} after \
+                     `migrate`, then restart {process}",
                     probe.1.privileges(),
                     probe.0
                 )));
@@ -334,6 +388,21 @@ mod tests {
                 .iter()
                 .all(|(table, _, _)| !table.starts_with("memory_collect"))
         );
+    }
+
+    #[test]
+    fn capture_probes_the_collect_step_and_the_receipts() {
+        let probes = capture_probes();
+        for step in probes_for(&steps(&[WorkerStepV1::Collect])) {
+            assert!(probes.contains(&step), "{step:?}");
+        }
+        assert!(probes.contains(&("memory_mutation_receipts", ProbeKind::Insert, None)));
+        assert!(probes.contains(&("memory_mutation_receipts", ProbeKind::Lock, None)));
+        let unique: BTreeSet<_> = probes
+            .iter()
+            .map(|(table, kind, _)| (table, kind))
+            .collect();
+        assert_eq!(unique.len(), probes.len());
     }
 
     #[test]

@@ -22,7 +22,9 @@ The memory worker ingests git history, agent transcripts, and CI runs, which
 collectors (a documents directory so far) and drains collected items, which
 `recall(kind=item)` searches as items
 ([ADR 0008](adr/0008-collected-items.md)); `ostk-fleet-recall collect
-import` imports a file of items as a snapshot of one provider scope. The private
+import` imports a file of items as a snapshot of one provider scope, and
+`remember(capture)` relays items an agent read through its own connectors
+into the same sink. The private
 `ostk-spec` CLI checks commits against normative spec statements, and
 `recall(discrepancies)` lists what it finds
 ([ADR 0007](adr/0007-spec-conformance-chain.md)). The README's
@@ -208,7 +210,8 @@ floors:
   `remember(assert)` needs nothing later: its evidence plane and authority
   view are migration 18's.
 - The memory worker and `recall(kind=evidence)` require migration 30,
-  `recall(discrepancies)` requires 31, and `recall(kind=item)` requires 34.
+  `recall(discrepancies)` requires 31, and `recall(kind=item)` and
+  `remember(capture)` require 34.
   `serve` probes each at startup and
   serves it only when the schema and the login's grants allow, so every other
   surface still runs on a prefix through 18. The runtime policy that grants
@@ -392,6 +395,27 @@ id, a part's version URI, or the provider URL, and returns the presented
 version's parts, every other version (tombstones without text), each part's
 provenance, and the item's links out and in, spending at most 384 KiB on
 text; a hidden item's answer is metadata only.
+
+### Agent capture
+
+`remember(action="capture")` ([ADR 0008 D10](adr/0008-collected-items.md))
+stages up to 32 items an agent read through its own connectors through the
+collected-item sink, under `connector.collected.capture`, as the agent's
+reported attestations: principal and attester `agent.<FLEET_RECALL_AGENT>`,
+collector instance `capture.<agent>`, status row `owner = capture` with no
+coverage role. `FLEET_RECALL_COLLECTED_CAPTURE` is `disabled` by default;
+`stage_only` or `enabled` starts it only when migration 34, the pins, a head
+that binds the capture connector, the grants (probed once in a rolled-back
+transaction), and for `enabled` the content key are all present, and
+otherwise `recall(status).remember_capture` says why and every schema is
+unchanged. The request is checked before any I/O. After a fast receipt
+lookup and a verified head, one serializable transaction reserves the key,
+stages every item (the server decides each audience, D6), and records a
+provisional response naming the staged rows; `enabled` then drains each row
+in its own append, `stage_only` leaves them to the worker, and the response
+is finalized once with each item's ids, events, and disposition. A retry of
+a capture that stopped after staging drains and finalizes it. The receipt
+holds the request's digest and never the text.
 
 ### Spec discrepancies
 

@@ -202,7 +202,7 @@ pub async fn start_event_first_assert_with(
     AssertStartup::Served(Arc::new(assert), status)
 }
 
-fn start_reason(error: &WriterAuthorityStartError) -> String {
+pub(super) fn start_reason(error: &WriterAuthorityStartError) -> String {
     match error {
         WriterAuthorityStartError::Config(error) => {
             format!("the writer-authority pins are invalid: {error}")
@@ -217,7 +217,7 @@ fn start_reason(error: &WriterAuthorityStartError) -> String {
     }
 }
 
-fn verify_reason(error: &WriterAuthorityError) -> String {
+pub(super) fn verify_reason(error: &WriterAuthorityError) -> String {
     match error {
         WriterAuthorityError::Rejected(rejection) => {
             format!("the writer authority did not verify: {rejection}")

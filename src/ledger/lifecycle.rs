@@ -110,6 +110,9 @@ pub enum RefusalCode {
     /// This exact accepted statement is already in the ledger, committed
     /// under another idempotency key.
     AlreadyAsserted,
+    /// This writer does not serve agent capture, or the active registry
+    /// package does not bind `connector.collected.capture` (ADR 0008 D10).
+    CaptureUnavailable,
 }
 
 impl RefusalCode {
@@ -141,6 +144,7 @@ impl RefusalCode {
             Self::SupportEventUnknown => "support_event_unknown",
             Self::RegistryHeadChanged => "registry_head_changed",
             Self::AlreadyAsserted => "already_asserted",
+            Self::CaptureUnavailable => "capture_unavailable",
         }
     }
 }

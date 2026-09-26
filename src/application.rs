@@ -32,11 +32,14 @@ use crate::memory_contracts::discrepancy::{
     DiscrepancyEpisodeFingerprintV1, DismissalReasonKindV1, WaiverReasonKindV1,
 };
 use crate::projectors::EMBEDDING_DIMENSIONS;
-use crate::remember_runtime::{AssertStatusV1, RememberAssertInputV1};
+use crate::remember_runtime::{
+    AssertStatusV1, CaptureRequestV1, CaptureStatusV1, ItemCapture, PreparedCaptureV1,
+    RememberAssertInputV1,
+};
 use crate::service::{
     ConflictCoverage, FleetMemoryService, RecallAction, RecallRequest, RecallResult, RecallSurface,
     Refusal, RememberAction, RememberRequest, RememberResult, RememberSurface, ServiceError,
-    ServiceResult, authorize_surface,
+    ServiceResult, authorize_surface, capture_unavailable,
 };
 use crate::spec_conformance::{SpecConformanceAnswerV1, SpecConformanceRead};
 use crate::store::cockroach::{
@@ -113,6 +116,12 @@ pub struct CockroachMemoryService {
     /// `recall(kind=item)` over collected items (ADR 0008 D7); `None` when
     /// this instance does not serve it.
     items: Option<Arc<dyn ItemRecall>>,
+    /// `remember(action=capture)` into the collected-item sink (ADR 0008
+    /// D10); `None` when this instance does not serve it.
+    capture: Option<Arc<dyn ItemCapture>>,
+    /// What startup decided about `remember(capture)`, reported by
+    /// `recall(status)`; `None` when capture is not configured.
+    capture_status: Option<CaptureStatusV1>,
 }
 
 struct ChunkConflictProjection {
@@ -159,6 +168,8 @@ impl std::fmt::Debug for CockroachMemoryService {
             .field("evidence_recall", &self.evidence.is_some())
             .field("spec_conformance", &self.spec_conformance.is_some())
             .field("item_recall", &self.items.is_some())
+            .field("capture", &self.capture.is_some())
+            .field("capture_status", &self.capture_status)
             .finish_non_exhaustive()
     }
 }
@@ -189,6 +200,8 @@ impl CockroachMemoryService {
             evidence: None,
             spec_conformance: None,
             items: None,
+            capture: None,
+            capture_status: None,
         })
     }
 
@@ -268,6 +281,25 @@ impl CockroachMemoryService {
     #[must_use]
     pub fn with_item_recall(mut self, items: Arc<dyn ItemRecall>) -> Self {
         self.items = Some(items);
+        self
+    }
+
+    /// Serve `remember(action=capture)` (ADR 0008 D10) through `capture`, and
+    /// report `status` in `recall(status)` as `remember_capture`. Whether
+    /// capture is advertised is the surface's [`RememberSurface::capture`],
+    /// set with [`Self::with_lifecycle`]; a surface that names it without a
+    /// runtime refuses it as `capture_unavailable`. Only the private writer
+    /// composition calls this, with what
+    /// [`crate::remember_runtime::start_collected_capture`] decided; the
+    /// publication reader never serves it.
+    #[must_use]
+    pub fn with_capture(
+        mut self,
+        capture: Option<Arc<dyn ItemCapture>>,
+        status: Option<CaptureStatusV1>,
+    ) -> Self {
+        self.capture = capture;
+        self.capture_status = status;
         self
     }
 
@@ -1067,6 +1099,9 @@ impl CockroachMemoryService {
         if let Some(status) = &self.assert_status {
             result.data["remember_assert"] = json!(status);
         }
+        if let Some(status) = &self.capture_status {
+            result.data["remember_capture"] = json!(status);
+        }
         let (evidence, spec_conformance) = optional_status_blocks(
             self.evidence.as_deref(),
             self.spec_conformance.as_deref(),
@@ -1170,6 +1205,30 @@ impl CockroachMemoryService {
         result.data["accepted_event"] = json!(asserted.accepted_event);
         mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
         Ok(result)
+    }
+
+    /// `remember(capture)`: relay items the agent read through its own
+    /// connectors into the collected-item sink (ADR 0008 D10). The request is
+    /// checked before any I/O; the answer is the capture receipt's response,
+    /// and a capture evaluates no conflict.
+    async fn remember_capture(
+        &self,
+        scope: &FleetScope,
+        request: RememberRequest,
+    ) -> ServiceResult<RememberResult> {
+        let Some(capture) = self.capture.as_deref() else {
+            return Err(capture_unavailable());
+        };
+        let idempotency_key = required_idempotency_key(request.action, request.idempotency_key)?;
+        let input: CaptureRequestV1 = from_arguments(request.arguments, "remember capture")?;
+        let prepared = PreparedCaptureV1::prepare(&input).map_err(|message| {
+            ServiceError::InvalidRequest(format!("remember capture: {message}"))
+        })?;
+        let outcome = capture
+            .capture(scope, &prepared, &idempotency_key)
+            .await
+            .map_err(service_error)?;
+        Ok(RememberResult::new(outcome.response))
     }
 
     async fn remember_retract(
@@ -1763,10 +1822,14 @@ impl FleetMemoryService for CockroachMemoryService {
     ) -> ServiceResult<RememberResult> {
         self.ensure_scope(&scope)?;
         if let Err(refusal) = authorize_surface(self.lifecycle.surface, request.action) {
-            // An unserved assert is refused before any I/O. Replaying a
-            // committed assert receipt once assert is turned off is deferred
-            // (ADR 0005); only the lifecycle actions replay here.
-            if request.action == RememberAction::Assert {
+            // An unserved assert or capture is refused before any I/O.
+            // Replaying a committed assert or capture receipt once it is
+            // turned off is deferred (ADR 0005, ADR 0008 D10); only the
+            // lifecycle actions replay here.
+            if matches!(
+                request.action,
+                RememberAction::Assert | RememberAction::Capture
+            ) {
                 return Err(refusal);
             }
             return self
@@ -1782,6 +1845,7 @@ impl FleetMemoryService for CockroachMemoryService {
             RememberAction::Resolve => self.remember_resolve(&scope, request).await,
             RememberAction::Dismiss => self.remember_dismiss(&scope, request).await,
             RememberAction::Waive => self.remember_waive(&scope, request).await,
+            RememberAction::Capture => self.remember_capture(&scope, request).await,
             action => Err(ServiceError::InvalidRequest(format!(
                 "remember({}) is not implemented yet",
                 action.as_str()
@@ -3483,6 +3547,7 @@ mod tests {
         conflict_lifecycle: false,
         adjudication: false,
         assert: false,
+        capture: false,
     };
 
     const CONFLICT_LIFECYCLE: RememberSurface = RememberSurface {
@@ -3490,6 +3555,7 @@ mod tests {
         conflict_lifecycle: true,
         adjudication: false,
         assert: false,
+        capture: false,
     };
 
     const ADJUDICATING: RememberSurface = RememberSurface {

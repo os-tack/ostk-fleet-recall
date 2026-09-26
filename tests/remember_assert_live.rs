@@ -265,6 +265,7 @@ impl AssertFleet {
                     conflict_lifecycle: true,
                     adjudication: false,
                     assert,
+                    capture: false,
                 },
                 hide_non_current_claim_chunks: true,
                 lifecycle_overlay: true,
@@ -1411,6 +1412,7 @@ async fn live_mcp_without_pins_is_byte_stable_when_configured() {
         conflict_lifecycle: true,
         adjudication: false,
         assert: false,
+        capture: false,
     };
 
     // No pins: every tool is what the lifecycle writer always listed, recall

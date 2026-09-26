@@ -79,6 +79,13 @@ pub enum RememberAction {
     /// that authored none of its members (ADR 0004 D5). Off unless the
     /// deployment enables adjudication.
     Waive,
+    /// Relay items the agent read through its own connectors into the
+    /// collected-item sink, as reported items it attests (ADR 0008 D10).
+    /// Served, and advertised, only where
+    /// `FLEET_RECALL_COLLECTED_CAPTURE` turns it on and its startup checks
+    /// pass ([`RememberSurface::capture`]); anywhere else it is refused before
+    /// any I/O as `capture_unavailable`.
+    Capture,
 }
 
 impl RememberAction {
@@ -100,6 +107,7 @@ impl RememberAction {
             Self::Acknowledge => "acknowledge",
             Self::Dismiss => "dismiss",
             Self::Waive => "waive",
+            Self::Capture => "capture",
         }
     }
 }
@@ -298,6 +306,15 @@ pub struct RememberSurface {
     /// serializes exactly as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub assert: bool,
+    /// Agent capture (ADR 0008 D10), served only when
+    /// `FLEET_RECALL_COLLECTED_CAPTURE` is `stage_only` or `enabled` and its
+    /// startup checks pass (writer-authority pins that verify and bind
+    /// `connector.collected.capture`, migration 34, and capture's grants: the
+    /// collect step's and the mutation receipts').
+    /// Independent of every other capability. Omitted from JSON when off, so
+    /// every surface without it serializes exactly as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capture: bool,
 }
 
 impl RememberSurface {
@@ -306,6 +323,7 @@ impl RememberSurface {
         conflict_lifecycle: false,
         adjudication: false,
         assert: false,
+        capture: false,
     };
 
     /// Whether any lifecycle is served: the claim lifecycle, the conflict
@@ -332,6 +350,7 @@ impl RememberSurface {
         match action {
             RememberAction::Record => true,
             RememberAction::Assert => self.assert,
+            RememberAction::Capture => self.capture,
             RememberAction::Retract | RememberAction::Supersede => self.claim_lifecycle,
             RememberAction::Acknowledge | RememberAction::Resolve => self.conflict_lifecycle,
             RememberAction::Dismiss | RememberAction::Waive => self.serves_adjudication(),
@@ -369,9 +388,23 @@ impl RecallSurface {
     };
 }
 
+/// The refusal of `remember(capture)` by a writer that does not serve it.
+#[must_use]
+pub fn capture_unavailable() -> ServiceError {
+    ServiceError::Refused(Refusal {
+        code: "capture_unavailable",
+        message: "remember(capture) is not served by this deployment: \
+                  FLEET_RECALL_COLLECTED_CAPTURE is disabled, or its startup checks did not \
+                  pass; recall(status).remember_capture says why when it is configured"
+            .into(),
+        details: serde_json::json!({ "action": RememberAction::Capture.as_str() }),
+    })
+}
+
 /// Refuse an action the surface does not serve, before any I/O.
 ///
-/// An unserved `assert` is refused as `assert_unavailable`. `dismiss` and
+/// An unserved `assert` is refused as `assert_unavailable`, and an unserved
+/// `capture` as `capture_unavailable`. `dismiss` and
 /// `waive` on a writer that serves the conflict lifecycle but not
 /// adjudication are refused as `adjudication_disabled`; every other unserved
 /// lifecycle action as `lifecycle_unavailable`. Actions outside both
@@ -387,6 +420,9 @@ pub fn authorize_surface(surface: RememberSurface, action: RememberAction) -> Se
                 .into(),
             details: serde_json::json!({ "action": action.as_str() }),
         }));
+    }
+    if action == RememberAction::Capture && !surface.capture {
+        return Err(capture_unavailable());
     }
     let adjudication_action = matches!(action, RememberAction::Dismiss | RememberAction::Waive);
     let lifecycle_action = adjudication_action
@@ -675,6 +711,7 @@ mod tests {
             conflict_lifecycle: true,
             adjudication: false,
             assert: false,
+            capture: false,
         };
         assert_eq!(
             serde_json::to_value(conflicts).unwrap(),
@@ -689,6 +726,56 @@ mod tests {
             ..conflicts
         };
         assert_eq!(serde_json::to_value(asserting).unwrap()["assert"], true);
+    }
+
+    #[test]
+    fn capture_is_refused_unless_served_and_serves_nothing_else() {
+        let decoded: RememberAction = serde_json::from_str("\"capture\"").unwrap();
+        assert_eq!(decoded, RememberAction::Capture);
+        assert_eq!(RememberAction::Capture.as_str(), "capture");
+        let asserting_lifecycle = RememberSurface {
+            claim_lifecycle: true,
+            conflict_lifecycle: true,
+            adjudication: true,
+            assert: true,
+            capture: false,
+        };
+        for surface in [RememberSurface::RECORD_ONLY, asserting_lifecycle] {
+            let Err(ServiceError::Refused(refusal)) =
+                authorize_surface(surface, RememberAction::Capture)
+            else {
+                panic!("{surface:?} does not serve capture");
+            };
+            assert_eq!(refusal.code, "capture_unavailable");
+            assert_eq!(refusal.details["action"], "capture");
+        }
+        let capture_only = RememberSurface {
+            capture: true,
+            ..RememberSurface::RECORD_ONLY
+        };
+        assert!(authorize_surface(capture_only, RememberAction::Capture).is_ok());
+        assert!(authorize_surface(capture_only, RememberAction::Record).is_ok());
+        assert!(!capture_only.lifecycle_served());
+        for action in [
+            RememberAction::Assert,
+            RememberAction::Retract,
+            RememberAction::Acknowledge,
+            RememberAction::Dismiss,
+        ] {
+            assert!(
+                authorize_surface(capture_only, action).is_err(),
+                "capture alone does not serve {}",
+                action.as_str()
+            );
+        }
+        // Named in JSON only when served.
+        assert!(
+            serde_json::to_value(RememberSurface::RECORD_ONLY)
+                .unwrap()
+                .get("capture")
+                .is_none()
+        );
+        assert_eq!(serde_json::to_value(capture_only).unwrap()["capture"], true);
     }
 
     #[test]

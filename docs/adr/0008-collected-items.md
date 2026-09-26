@@ -1,6 +1,6 @@
 # ADR 0008: Collected items from any source
 
-- Status: accepted; D1 to D9 implemented. The generation-3 registry package
+- Status: accepted; D1 to D10 implemented. The generation-3 registry package
   is checked in, the strict witness recognizes it, and
   `ostk-authority-install apply --target generation-3` activates it and
   rebases the scope's normative families onto it. The collected-item
@@ -14,9 +14,11 @@
   as items (D7). The worker runs pull collectors through one pull framework,
   and the documents-directory collector is the first (D8). `ostk-fleet-recall
   collect` imports a file of items as a snapshot of one provider scope and
-  lists, dead-letters, and retires what the collectors hold (D9). No API
-  collector or agent capture stages items yet; those land with their own
-  decisions.
+  lists, dead-letters, and retires what the collectors hold (D9). An agent
+  relays items it read through its own connectors with
+  `remember(action="capture")`, a reported channel through the same sink,
+  served only where `FLEET_RECALL_COLLECTED_CAPTURE` turns it on (D10). No
+  API collector stages items yet; those land with their own decisions.
 - Date: 2026-09-25
 - Scope: how specs and documents, Slack conversations, Linear tickets,
   Granola meetings, and anything else a collector can read become evidence
@@ -735,3 +737,112 @@ finalize an import by re-reading the file: the worker does not hold it, and
 the plan is enough. Naming every row an import relies on in its plan: a
 pass-tagged row set is checked with one statement, and the plan stays within
 one cursor.
+
+## D10 — Agent capture: `remember(action="capture")`
+
+**Decision.** An agent often reads items through connectors of its own (a
+Slack, Linear, or Granola MCP server, a browser) while it works. It relays
+them into the same sink every collector uses, as a *reported* channel bound
+to `connector.collected.capture`, with `remember(action="capture")`
+(`src/remember_runtime/capture.rs`), so the fleet can recall them and the
+agent can cite them at once.
+
+- **The request.** `{action: "capture", idempotency_key, items, via?}`: 1 to
+  32 items, each a `CollectedItemInputV1` (an import line's shape, D9) whose
+  `https` provider `url` is required, with a provider clock (`updated_at`,
+  else `created_at`, or `version.order_micros`) and text of at most 256 KiB
+  that the server splits into parts of at most 32 KiB. `via` names the tool
+  the agent read them through; it is recorded with each item as a label,
+  never as authority. A tombstone lifecycle is refused: an agent relays what
+  it read, and only a verified collector or an operator import reports a
+  deletion. The request is checked before any I/O, and a refusal names the
+  item and the rule it broke (`items[1]: url is required ...`). No claim,
+  lifecycle, or assertion field may ride beside the items.
+- **Who captures.** Every capture a `serve` process makes is its agent's: the
+  ingress principal and attester are `agent.<FLEET_RECALL_AGENT>` (the actor
+  `assert` uses) and the collector instance is `capture.<agent>`. An agent
+  name that is not a contract-id tail of at most 120 bytes is lowercased, has
+  every other byte replaced by `-`, is cut, and is suffixed with `.` and 16
+  hex characters of its SHA-256, so two agents never share an identity. The
+  attester is inside every staged revision (D1), so two agents' captures of
+  one item are two attestations and a capture never collapses onto a pull.
+  The instance's status row is `owner = capture`, `coverage_role = none`: a
+  capture establishes no coverage and is never a source of an absence
+  verdict. The row names the provider scope the agent last captured into.
+- **The audience is the server's** (D6), decided per item inside the staging
+  transaction: `verified_container` only into a container a verified
+  collector or an operator import recorded as readable, else
+  `operator_capture_scope` when the operator lists the scope or container in
+  `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES` (a JSON array of `{provider,
+  provider_scope_id, containers: "*" | [ids]}`, default `[]`). A withdrawn
+  container, a `private` or `dm` hint, and anything else are refused as
+  digest-only `audience_refused` dead letters under the capture instance. A
+  capture records, withdraws, and lifts nothing.
+- **One capture.**
+  1. A receipt already committed under the key is answered first (below).
+  2. The writer authority is verified, and its active package must bind
+     `connector.collected.capture`; a generation-2 head is refused as
+     `capture_unavailable`, naming `--target generation-3`.
+  3. One serializable transaction, retried only on `40001`, reserves the
+     tenant-wide key in `memory_mutation_receipts` (operation `capture`),
+     stages every item through the sink (one staging per provider scope, run
+     in this transaction), writes the instance's status row, and records a
+     **provisional** response that names each item's stage ids.
+  4. `enabled`: each staged row is drained in its own append, as the
+     worker's step drains (D4). `stage_only`: the rows wait for the worker's
+     `collect` step, and `serve` never holds the content key.
+  5. The response is finalized, once, with each item's `item_id`,
+     `version_id`, first part's version `uri`, `redacted_ranges`,
+     `accepted_event_ids` (one per admitted part, in order: what an
+     assertion cites as `support_evidence_event_ids`), and disposition:
+     `admitted`; `staged` (a part still waits for a drain); `replayed` (every
+     part was already admitted before this capture: the same item, attested
+     by the same agent, under another key); or `withheld` with a
+     `withheld_reason` (the audience refusal's label, such as
+     `audience_refused` for a hint, `audience_unverified`, or
+     `container_withdrawn`, else `redaction_withheld`, `validation_failed`,
+     `oversize`, `clock_ahead`, `admission_refused`, or `quarantined`).
+- **Replays.** The same key and request return the final response, marked
+  `idempotent_replay`; another request under a used key is an idempotency
+  conflict. A receipt still provisional, from a capture that stopped after
+  its staging committed, is finished by the retry: its listed rows are
+  drained and the response finalized by whichever call gets there first.
+  Because the key is spent, a head that no longer verifies then is an
+  unknown outcome to retry, never a refusal. The same items under a new key
+  stage nothing (their stage ids exist) and append nothing.
+- **The receipt keeps no text.** Its request is `{scope, request_digest}`,
+  the digest of the canonical request; its response holds identities,
+  digests, dispositions, and counts. The redacted text lives only in the
+  governed content store and the body plane, like every collected item's.
+- **Precedence.** A captured version is presented under the `reported` tier,
+  so a verified head of the same item is always presented instead, and a
+  newer captured version whose content differs sets `disagreement` (D5).
+- **Served only where it can be.** `FLEET_RECALL_COLLECTED_CAPTURE` is
+  `disabled` (the default), `stage_only`, or `enabled`. Disabled, `serve`
+  reads nothing else about capture, `recall(status)` reports nothing, and
+  every tool schema is byte for byte what it was. Otherwise capture starts
+  only when the switch and scopes parse, the agent names an identity, the
+  schema reaches migration 34, `enabled` has `FLEET_RECALL_CONTENT_KEK_HEX`
+  (only `enabled` reads it), the writer-authority pins are configured, the
+  login holds the collect step's privileges and `SELECT`, `INSERT`, and
+  `UPDATE` on the receipts (probed in a rolled-back transaction), no worker
+  source or other owner's collector holds the capture instance, and the head
+  verifies and binds the capture connector. Then `RememberSurface.capture`
+  holds; `tools/list` adds the `capture` action, its `items` and `via`
+  properties, and a branch that requires `items` and forbids every claim,
+  lifecycle, and assertion field (every other action forbids `items` and
+  `via`); and `recall(status).remember_capture` reports `{served, mode,
+  identity, capture_scopes}`. A failed check turns capture off with a logged
+  reason, which `remember_capture` reports as `{served: false, mode,
+  reason}`; it never stops `serve`. An unserved capture is refused before any
+  I/O as `capture_unavailable`. `FLEET_RECALL_REMEMBER_LIFECYCLE` does not
+  govern capture. The publication process never builds it, and no migration
+  or grant is added: `fleet_runtime` already holds everything it writes.
+
+**Rejected.** One transaction for the receipt and every append: the append
+API commits one event per transaction (D4), so the provisional response names
+the rows and a retry re-drives them. Trusting an agent's audience: a capture
+is reported provenance, and the agent's `visibility` can only narrow.
+Letting a capture withdraw or lift anything: it carries no audience facts of
+its own. Replaying a committed capture after capture is turned off, and a
+rate limit on capture, are deferred.

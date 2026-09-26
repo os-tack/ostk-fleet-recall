@@ -513,12 +513,31 @@ impl CollectedItemSink {
         drafts: &[StageDraftV1],
         context: &StageContextV1<'_>,
     ) -> Result<StageOutcomeV1> {
-        let job = Arc::new(StageJob::prepare(self, drafts, context)?);
+        let prepared = Arc::new(self.prepare_stage(drafts, context)?);
         with_serializable_retry(&self.pool, self.retry, move |transaction| {
-            let job = Arc::clone(&job);
-            Box::pin(async move { job.run(transaction).await })
+            let prepared = Arc::clone(&prepared);
+            Box::pin(async move { prepared.run(transaction).await })
         })
         .await
+    }
+
+    /// Prepare `drafts` for staging inside a caller's own serializable
+    /// transaction, beside writes the caller must commit with them: an agent
+    /// capture reserves its idempotency receipt in the transaction that
+    /// stages its items (ADR 0008 D10). [`Self::stage`] is exactly this, run
+    /// in a transaction of its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::stage`], for a context the sink cannot stage under.
+    pub fn prepare_stage(
+        &self,
+        drafts: &[StageDraftV1],
+        context: &StageContextV1<'_>,
+    ) -> Result<PreparedStageV1> {
+        Ok(PreparedStageV1 {
+            job: StageJob::prepare(self, drafts, context)?,
+        })
     }
 
     /// Drain at most `limit` pending rows, oldest first.
@@ -936,6 +955,42 @@ impl CollectedItemSink {
             Some(true) => RowOutcome::RetryExhausted(error),
             Some(false) => RowOutcome::Retried(error),
         })
+    }
+}
+
+/// One staging call, prepared outside any transaction
+/// ([`CollectedItemSink::prepare_stage`]) and run inside a caller's.
+///
+/// It owns every input, so a serialization retry runs it again, from the same
+/// inputs, in a fresh transaction; every write it makes is idempotent.
+pub struct PreparedStageV1 {
+    job: StageJob,
+}
+
+/// Identity and counts only: the drafts are provider content.
+impl std::fmt::Debug for PreparedStageV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedStageV1")
+            .field("instance", &self.job.instance.connector_instance_id)
+            .field("mode", &self.job.mode.as_str())
+            .field("drafts", &self.job.drafts.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedStageV1 {
+    /// Stage the prepared drafts in `transaction`, which must be a
+    /// serializable transaction on the sink's database. Everything
+    /// [`CollectedItemSink::stage`] does in its own transaction happens here,
+    /// and commits or rolls back with the caller's other writes.
+    ///
+    /// # Errors
+    ///
+    /// Any database failure, and a status row another owner holds. A refused
+    /// draft is not an error: it is dead-lettered and reported in the outcome.
+    pub async fn run(&self, transaction: &mut Transaction<'_, Postgres>) -> Result<StageOutcomeV1> {
+        self.job.run(transaction).await
     }
 }
 
