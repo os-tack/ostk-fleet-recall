@@ -32,9 +32,14 @@ The `ostk-fleet-recall` binary has these commands:
     CI runs). It is served wherever migration 30 is applied and the writer
     login holds the Stage-5 grants; elsewhere `tools/list` is unchanged.
     Every answer carries readiness, each source's status and newest coverage
-    cursor, and an absence verdict: `absent` only when nothing matched over a
-    current lexical tier with every source healthy, fresh, and completely
-    covered, otherwise `unknown` with the reasons. `recall(status)` then adds
+    cursor, and an absence verdict: `present` when a hit matched the query's
+    words or a dense-only neighbour reached cosine 0.45 (`present_by` names
+    the lane; a raw git fact never counts that way), `absent` only when
+    neither held over a current lexical tier with every source healthy,
+    fresh, and completely covered, otherwise `unknown` with the reasons. A
+    dense neighbour below the bound is still listed, counted in
+    `weak_neighbours`, with `strongest_dense_similarity` reported, so an
+    agent can judge it. `recall(status)` then adds
     an `evidence` block
     ([ADR 0006](docs/adr/0006-stage5-worker-and-evidence-recall.md)), with a
     `collectors` count once migration 34 is applied. A hit on a collected
@@ -51,7 +56,8 @@ The `ostk-fleet-recall` binary has these commands:
     returns its versions with provenance and its links; a version admitted
     in a container since withdrawn shows no text. Item text is
     third-party content, labelled `untrusted_third_party`, with markdown
-    images defanged. The absence verdict is judged over the collectors alone.
+    images defanged. The absence verdict is judged over the collectors alone,
+    with the same lexical anchor and 0.45 dense bound as evidence.
     It is served wherever migration 34 is applied and the writer login holds
     the collector grants
     ([ADR 0008 D7](docs/adr/0008-collected-items.md)).
@@ -628,7 +634,14 @@ kind=item)` takes), `version_id`, the version `uri`, `redacted_ranges`, its
 `support_evidence_event_ids`), and a disposition: `admitted`, `staged` (the
 worker's `collect` step admits it), `replayed` (the same item, already
 admitted from this agent under another key), or `withheld` with a
-`withheld_reason`. The same key replays the stored answer; a different
+`withheld_reason`. An `enabled` capture that admitted something also
+reports its `projection` (`{bodies, lexical, dense, complete}`): the items
+were projected in the call, by the worker's own projectors within a
+ten-second budget, so `recall(search, kind=item)` finds them at once and the
+scope's absence verdict does not read `body_projection_lag` for them; a
+tier that ran out of budget or failed leaves `complete: false` and what it
+committed, and the worker's next `project` and `embed` steps finish the
+rest. The same key replays the stored answer; a different
 request under a used key is an idempotency conflict. The receipt keeps the
 request's digest, never an item's text, and that digest is taken with every
 secret the redactor finds replaced, so it confirms no guess of one; two
@@ -654,8 +667,9 @@ reports one.
 - `FLEET_RECALL_COLLECTED_CAPTURE`: `disabled` (the default; nothing changes
   and nothing else is read), `stage_only` (captures are staged, and the
   worker's `collect` step admits them; `serve` needs no content key), or
-  `enabled` (captures are admitted in the call, which needs
-  `FLEET_RECALL_CONTENT_KEK_HEX` in `serve`);
+  `enabled` (captures are admitted and projected in the call, which needs
+  `FLEET_RECALL_CONTENT_KEK_HEX` in `serve` and the bodies, lexical, and
+  dense steps' grants on its login);
 - `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES`: a JSON array of `{"provider",
   "provider_scope_id", "containers": "*" | ["<container id>", ...]}` the
   operator declares visible to the whole project, default `[]`;
@@ -1007,8 +1021,9 @@ ADRs 0005 to 0008 record everything else deferred. The main items are:
   incremental git scans and a git ingress redactor; transcript tool-use,
   tool-result, and thinking records; publication-plane evidence recall (and
   the publication grant on migration 23's filtered views); fusing evidence
-  into chunk recall; registering the coverage labels in a package; dense or
-  semantic absence verdicts; a body plane that stays encrypted after
+  into chunk recall; registering the coverage labels in a package; scoping
+  the body-projection lag count to the searched kind; a body plane that
+  stays encrypted after
   projection; a re-embed step; content-bearing webhooks (Slack Socket Mode,
   Linear history), a public relay, and Arrow transport.
 - **Spec conformance.** `ostk-spec retire` and `inspect`; episode

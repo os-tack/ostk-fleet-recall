@@ -385,7 +385,11 @@ than the one readiness counted. The dense lane compares the query only with
 vectors the serving model embedded, and a dense-only match below the chunk
 lane's 0.18 cosine floor is dropped. Snippets and fetched text are the lexical
 tier's redacted recall text, never the stored body bytes. The verdict is
-`present` when anything matched. It is `absent` only when the query has
+`present` when a hit matched the query's words, or when a dense-only
+neighbour reached cosine 0.45 and its body is not a raw git fact
+(`present_by` names the lane); a weaker neighbour is listed and counted in
+`weak_neighbours`, with `strongest_dense_similarity` reported, but decides
+nothing. It is `absent` only when no hit voted, the query has
 lexical terms, nothing awaits body projection or transcript admission, the
 lexical tier is current, and every active source's last attempt succeeded,
 its last completed check is within its `stale_after_seconds`, and its

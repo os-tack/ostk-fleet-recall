@@ -101,8 +101,10 @@ snapshot out of the absence verdict and keeps its items recallable.
 ## 4. Let agents capture what they read
 
 `serve` takes `FLEET_RECALL_COLLECTED_CAPTURE=stage_only` (the worker admits
-captures; `serve` holds no content key) or `enabled` (admitted in the call,
-with the content key in `serve`), and optionally
+captures; `serve` holds no content key) or `enabled` (admitted and projected
+in the call, with the content key in `serve` and the projection steps'
+grants on its login, so the agent recalls what it captured at once and the
+scope's absence verdict never waits on a tick for it), and optionally
 `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES`, the scopes or containers the operator
 declares readable by the whole project beyond those a collector or import
 already recorded. `recall(status).remember_capture` says whether it is

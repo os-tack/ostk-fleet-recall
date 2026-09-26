@@ -748,12 +748,16 @@ produced its body. Every answer carries readiness (accepted events the body
 projector has not consumed, transcript turns still in the outbox, whether the
 lexical and dense tiers cover every body), each active source's status row and
 newest coverage cursor, and an absence verdict. The verdict is `present` when
-anything matched; `absent` only when the query has lexical terms, nothing is
-waiting for projection or admission, the lexical tier is current, and every
-active source's last attempt succeeded, its last completed check is within its
-`stale_after_seconds`, and its newest cursor is `complete`; and otherwise
-`unknown`, naming each reason. Absence is defined over the lexical tier, so
-dense lag never blocks it. For a transcript, `complete` describes its latest
+a hit matched the query's words, or when a dense-only neighbour reached
+cosine 0.45 and its body is not a raw git fact (`present_by` says which; a
+weaker neighbour is listed and counted in `weak_neighbours` but decides
+nothing); `absent` only when no hit voted, the query has lexical terms,
+nothing is waiting for projection or admission, the lexical tier is current,
+and every active source's last attempt succeeded, its last completed check
+is within its `stale_after_seconds`, and its newest cursor is `complete`;
+and otherwise `unknown`, naming each reason. Absence is anchored on the
+lexical tier, so dense lag never blocks it. For a transcript, `complete`
+describes its latest
 drained slice; freshness comes from the status row. The sources are read before
 readiness, and readiness before the lanes, so a verdict never rests on a
 projection newer than the one it counted. A startup probe gates the library on
