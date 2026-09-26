@@ -12,6 +12,12 @@ Linear, and Granola.
   claim can be contested between sources. Each file is also a valid
   `ostk-fleet-recall collect import --format items-jsonl` input for its
   provider scope (ADR 0008 D9).
+- `slack-export/`: a Slack workspace export as a directory, for
+  `collect import --format slack-export` (the README quickstart's step 10
+  imports it): one public channel holding the same retry-budget thread, a
+  private channel no `--private-container` lists, and a direct conversation,
+  so an import reads the public channel only; its file link carries a
+  placeholder `?t=xoxe-EXAMPLE-NOT-A-FILE-TOKEN` that the import strips.
 - `src/collectors/{slack,linear,granola}/fixtures/*.json`: provider API pages
   and signed webhook deliveries in each provider's documented shape, for the
   provider collectors. Every signing secret in them is an obvious placeholder

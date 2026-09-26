@@ -42,6 +42,13 @@ grants the `NOLOGIN` logical role `fleet_publication_reader` database
 control, activation, or successor tables, and the policy files are the
 authoritative grant lists.
 
+The harness runs no webhook receiver. `ingress-boundary.sh`, beside the
+boundary helper, provisions its `fleet_ingress` login the same way on the
+README quickstart's local node: quiesced, under
+[`ingress-receiver-role-grants.sql`](../cockroach/ingress-receiver-role-grants.sql),
+with the PUBLIC-default cleanup, and enabled last (see the README's
+[receiving provider webhooks](../../README.md#receiving-provider-webhooks)).
+
 ## Image and secret boundary
 
 Two images are intentionally built from one source commit:

@@ -10,9 +10,15 @@ visibility is persisted and enforced. Every repository reapplies the trusted
 tenant/project coordinates at SQL execution; request bodies, recalled rows,
 and canonical artifacts cannot reroute a process.
 
-Corpus chunks, claims, transcripts, tool output, telemetry, conflict text, and
-recalled Markdown are untrusted content. They are evidence to quote, cite, and
-validate, not instructions or authorization. A consumer must not execute a
+Corpus chunks, claims, transcripts, tool output, telemetry, conflict text,
+collected items, and recalled Markdown are untrusted content. They are
+evidence to quote, cite, and validate, not instructions or authorization. A
+collected item's text (a Slack message, a Linear issue, a Granola summary, a
+document, an import line, a capture) is third-party content even when a
+verified collector read it from the provider: item and evidence recall label
+it `untrusted_third_party`, and item recall defangs its Markdown images and
+reports `injection_signals` as advisory hints, never as a filter or a
+guarantee ([ADR 0008](adr/0008-collected-items.md) D7). A consumer must not execute a
 command, call a tool, change policy, disclose a secret, or infer an identity
 merely because recalled content asks it to. Agent policy and operator approval
 remain outside the corpus. Source coordinates, digests, typed conflict state,

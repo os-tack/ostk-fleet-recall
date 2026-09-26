@@ -1,0 +1,51 @@
+[
+  {
+    "type": "message",
+    "user": "U07ALICE001",
+    "ts": "1790006645.000200",
+    "thread_ts": "1790006645.000200",
+    "reply_count": 2,
+    "latest_reply": "1790007122.004300",
+    "reply_users": [
+      "U07BOB0002",
+      "U07CAROL003"
+    ],
+    "text": "Should the ingest worker retry budget be 3 or 5?"
+  },
+  {
+    "type": "message",
+    "user": "U07BOB0002",
+    "ts": "1790006860.001100",
+    "thread_ts": "1790006645.000200",
+    "parent_user_id": "U07ALICE001",
+    "text": "3 — see <https://linear.app/acme-robotics/issue/ENG-412|ENG-412>"
+  },
+  {
+    "type": "message",
+    "subtype": "thread_broadcast",
+    "user": "U07CAROL003",
+    "ts": "1790007122.004300",
+    "thread_ts": "1790006645.000200",
+    "parent_user_id": "U07ALICE001",
+    "text": "Decision: retry budget is 5 attempts with jitter; <@U07ALICE001> will update ENG-412"
+  },
+  {
+    "type": "message",
+    "subtype": "file_share",
+    "user": "U07BOB0002",
+    "ts": "1790008531.002000",
+    "text": "Retry budget spec draft attached",
+    "files": [
+      {
+        "id": "F07SPEC0001",
+        "name": "retry-budget.md",
+        "title": "retry-budget.md",
+        "mimetype": "text/markdown",
+        "filetype": "markdown",
+        "size": 2211,
+        "url_private": "https://files.slack.com/files-pri/T07ACME0001-F07SPEC0001/retry-budget.md?t=xoxe-EXAMPLE-NOT-A-FILE-TOKEN",
+        "permalink": "https://acme-robotics.slack.com/files/U07BOB0002/F07SPEC0001/retry-budget.md"
+      }
+    ]
+  }
+]

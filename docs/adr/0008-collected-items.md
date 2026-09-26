@@ -144,8 +144,10 @@ Rollout order, for every physical scope that is to collect items:
    generation-3 row refuses a generation-3 head as `UnknownActivePackage`.
 2. Apply the release's migrations and re-apply the grant files. Migration 32
    (D3) lets a spec family be rebased; it adds no grant. Migrations 33 (D4)
-   and 34 (D5, D6) add the collected-item tables and their withdrawals, and
-   migration 35 (D11) the claim item links, which the runtime policy grants.
+   and 34 (D5, D6) add the collected-item tables and their withdrawals,
+   migration 35 (D11) the claim item links, and migration 36 (D12) the
+   webhook hint queue, which the runtime policy grants; the ingress receiver's
+   own policy is applied only where webhooks are received.
 3. Run `ostk-authority-install apply --target generation-3`. The pins do not
    change, so no writer is reconfigured, and the run rebases every spec
    family onto the new head (D3).
@@ -1484,3 +1486,39 @@ could then lose an edit it had acknowledged. Trusting `Linear-Delivery` as
 identity: it is not signed. Tombstoning a hinted object the provider no longer
 returns: a `404` or a missing message can be a transient or an audience
 change, which only a pass's complete reads decide.
+
+## What stays deferred
+
+Beyond what each decision above leaves out, the collected-item plane defers:
+
+- **Per-principal audiences.** Clearance bound inside the lexical and ANN SQL
+  before ranking, grants per audience, and per-agent logins with row-level
+  security. Until then every admitted item is visible to the whole project,
+  direct and group-direct conversations and Slack Connect channels are never
+  admitted, and a restricted container needs the operator's listing (D6).
+- **Physical erasure.** Deletion and withdrawal hide at read time only; the
+  earlier text stays in the body plane and its lexical and dense rows until
+  an erasure runtime purges them (D5, ADR 0006 D9). Settled outbox rows,
+  already without payload, are not purged either (D4).
+- **What would need a generation 4** (D1): a new trust channel,
+  per-connector governance (retention, visibility, redaction policy), a
+  continuing-entity URI (continuity stays `item_key` and the heads), or a
+  change to any carried entry.
+- **Signature-verified integrity.** A webhook delivery stays a hint, so no
+  collected fact is admitted above `transport_authenticated` on its word.
+- **Content-bearing push and file content.** Slack Socket Mode and Linear
+  history reconstruction (D12), and the text of Slack files, Linear
+  attachments, or PDFs, which every collector links and never reads (D8).
+- **More adapters.** Notion, Google Docs, GitHub Issues, and others: each is
+  one adapter module and one row of the adapter table, with no registry
+  change.
+- **Relations across sources** (a Slack thread to `ENG-412` to a commit), and
+  echo detection beyond counting identical contents once (D11).
+- **Registering the coverage labels** in a package; they stay unregistered
+  (D8, ADR 0006 D2).
+- **PII redaction** beyond the secret shapes the collector redactor finds.
+- **Capture's remainder:** replaying a committed capture after capture is
+  turned off, and a rate limit on capture (D10).
+- **Scheduling and the relay.** The worker stays `--once`; only the ingress
+  runs long, and the public HTTPS relay in front of it is the operator's
+  (D12).

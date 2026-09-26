@@ -896,6 +896,38 @@ mod tests {
         );
     }
 
+    /// The export the README quickstart imports
+    /// (`tests/fixtures/collected/slack-export`) reads its public channel's
+    /// thread, and never its unlisted private channel or its direct
+    /// conversation, and its file link loses the export's token.
+    #[test]
+    fn the_quickstart_export_fixture_reads_only_its_public_channel() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/collected/slack-export");
+        let mut records = SlackExportRecordsV1::open(&root, &instance(), &[]).unwrap();
+        let mut all = Vec::new();
+        while let Some(record) = records.next_record().unwrap() {
+            all.push(record);
+        }
+        let channels: Vec<&str> = records.channels().iter().map(|c| c.id.as_str()).collect();
+        let withheld: Vec<&str> = records.withheld().iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            (channels.as_slice(), withheld.as_slice()),
+            (&["C07PLATENG1"][..], &["G07PLATSEC1"][..])
+        );
+        let texts = texts(&all);
+        assert_eq!(texts.len(), 4, "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("retry budget is 5 attempts"))
+        );
+        let everything = format!("{all:?}");
+        for never in ["Private channel", "Direct message", "xoxe-"] {
+            assert!(!everything.contains(never), "{never}");
+        }
+    }
+
     #[test]
     fn a_day_file_name_is_a_date() {
         assert!(is_day_file("2026-09-21.json"));

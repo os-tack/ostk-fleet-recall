@@ -1,0 +1,17 @@
+[
+  {
+    "id": "U07ALICE001",
+    "name": "alice",
+    "real_name": "Alice Nguyen"
+  },
+  {
+    "id": "U07BOB0002",
+    "name": "bob",
+    "real_name": "Bob Okafor"
+  },
+  {
+    "id": "U07CAROL003",
+    "name": "carol",
+    "real_name": "Carol Diaz"
+  }
+]

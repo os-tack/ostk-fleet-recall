@@ -1,0 +1,13 @@
+[
+  {
+    "id": "G07PLATSEC1",
+    "name": "plat-sec",
+    "created": 1780000000,
+    "creator": "U07ALICE001",
+    "is_archived": false,
+    "members": [
+      "U07ALICE001",
+      "U07CAROL003"
+    ]
+  }
+]

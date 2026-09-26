@@ -24,7 +24,12 @@ operator escalation.
 
 `worker-sources.json` is an example sources file for
 `ostk-fleet-recall worker --once`, with one git ref, one transcript directory,
-and one CI workflow. Each source is its own connector instance. Replace the
-paths and repository coordinates with your own. See
+and one CI workflow, and one collector of each provider: a documents root,
+a Slack workspace, a Linear organization, and a Granola account. Each source
+and collector is its own connector instance. Replace the paths, repository
+coordinates, provider ids, and token variables with your own, and drop the
+collectors you do not run; a collector needs the scope at generation 3. See
 [memory worker](../README.md#memory-worker) for the environment the command
-reads and where each step can run.
+reads and where each step can run, and
+[receiving provider webhooks](../README.md#receiving-provider-webhooks) for
+the `push` entry a collector adds to take webhooks.

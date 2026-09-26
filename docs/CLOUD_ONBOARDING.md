@@ -295,7 +295,8 @@ beside any other database URL, the content key, or a provider API credential
 the sources file names, and listens on loopback
 unless `--allow-non-loopback` is given; the relay that forwards the
 providers' requests to it is the operator's (see the README's
-[receiving provider webhooks](../README.md#receiving-provider-webhooks)).
+[receiving provider webhooks](../README.md#receiving-provider-webhooks) and
+the [collected-items runbook](COLLECTED_ITEMS_RUNBOOK.md)).
 
 For each user, obtain a URL-encoded raw connection URL for `fleet_recall` with
 exactly one `sslmode=verify-full`. Do not copy a workstation-only

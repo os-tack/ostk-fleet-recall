@@ -1,0 +1,21 @@
+[
+  {
+    "id": "C07PLATENG1",
+    "name": "plat-eng",
+    "created": 1780000000,
+    "creator": "U07ALICE001",
+    "is_archived": false,
+    "is_general": false,
+    "members": [
+      "U07ALICE001",
+      "U07BOB0002",
+      "U07CAROL003"
+    ],
+    "topic": {
+      "value": "Platform engineering"
+    },
+    "purpose": {
+      "value": "Ingest and worker reliability"
+    }
+  }
+]

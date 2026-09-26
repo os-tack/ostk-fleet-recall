@@ -761,7 +761,15 @@ physical scope that is to collect items:
 
 1. Ship a binary that recognizes generation 3 to every process that verifies
    a head for that scope: every event-first writer, every `serve`, the worker
-   on its ingest host, and the projector container.
+   on its ingest host, and the projector container. Keep the projector
+   container on the ingest host's release. One whose binary predates
+   generation 3 refuses the head at startup, so nothing is projected (every
+   source's, not only the collectors') and evidence answers read `unknown`
+   with `body_projection_lag` until it is upgraded. And only the release that
+   admits collected items renders their envelopes for the lexical tier: a
+   projector built before it would index a collected body as raw envelope
+   JSON, its text hex-encoded, so word searches would miss the item, and the
+   lexical projector never revisits a body it has consumed.
 2. Apply the release's migrations, then re-apply the grant files. Migration 32
    lets a spec family be rebased and adds no grant; migrations 33 and 34 add the
    collected-item tables and their withdrawals, migration 35 the claim item
@@ -773,8 +781,22 @@ physical scope that is to collect items:
    its evidence recall checks the collector state again on every read until it
    is readable, and withholds every collected body until then.
 3. Run `ostk-authority-install apply --target generation-3` as the schema
-   owner/migrator login. The printed pins are unchanged, so no writer is
-   reconfigured. The run then rebases every normative binding family onto
+   owner/migrator login. Where the database boundary retired the migrator
+   (`NOLOGIN`, no `admin`), enable it for this one run and retire it again
+   afterwards; on a local node rerunning
+   `deploy/localstack/database-boundary.sh` does that and reapplies the
+   runtime and publication policies unchanged:
+
+   ```bash
+   docker exec ostk-fleet-recall-crdb cockroach sql --insecure --host=127.0.0.1:26257 \
+     --execute='ALTER USER fleet_migrator WITH LOGIN; GRANT admin TO fleet_migrator;'
+   FLEET_RECALL_DATABASE_URL="$MIGRATOR_URL" \
+     FLEET_RECALL_CONTRACT_TENANT_NAMESPACE=... FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE=... \
+     ostk-authority-install apply --target generation-3
+   docker exec --interactive ostk-fleet-recall-crdb /bin/sh -s < deploy/localstack/database-boundary.sh
+   ```
+
+   The printed pins are unchanged, so no writer is reconfigured. The run then rebases every normative binding family onto
    the new head (ADR 0008 D3) and lists each in the report's
    `normative_families`: `rebased`, `already_current`, or `stranded` with the
    reason. A re-run is a no-op, and the default `--target generation-2` never

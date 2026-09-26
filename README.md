@@ -322,9 +322,12 @@ The command reads:
 - for `embed`: the pinned model bundle. Every dense row records
   `FLEET_RECALL_EMBEDDING_MODEL_SHA256`.
 
-It needs migrations through 0030 and `deploy/cockroach/runtime-role-grants.sql`.
-Before the tick it checks every privilege the selected steps use and names
-the first one missing.
+It needs migrations through 0030 and `deploy/cockroach/runtime-role-grants.sql`;
+the `collect` step needs migration 34 and a generation-3 head, and reads the
+webhook hints of migration 36 where it is applied. Before the tick it checks
+every privilege the selected steps use and names the first one missing. Each
+collector's provider token comes from the variable its `settings.token_env`
+names, in the worker's environment.
 
 The git step runs `git` and the CI step runs `gh` (with the operator's `gh`
 credential). The production image has neither, so run the ingest steps on a
@@ -590,7 +593,8 @@ file links lose the `?t=xoxe-...` token exports carry. A zip holds at most
 100,000 entries of at most 64 MiB each, 2 GiB in all.
 
 `collect status` lists every collector instance of the scope (its status row,
-outbox rows by state, cursors, and dead letters by reason), `collect
+outbox rows by state, cursors, webhook hints by state, and dead letters by
+reason), `collect
 dead-letters [--since <RFC 3339>] [--instance <id>]` lists dead letters with
 their digests, reasons, and static diagnostics, never provider text (the
 webhook receiver's refusals among them), and
@@ -721,6 +725,31 @@ listens on loopback unless `--allow-non-loopback` says
 otherwise (`FLEET_RECALL_INGRESS_LISTEN`): Linear and Granola need a public
 HTTPS endpoint, which is a relay you run in front of it.
 
+On the quickstart's local node, after the
+[database boundary](#4-establish-the-database-boundary-and-load-the-corpus-as-the-writer),
+the checked-in helper creates the login quiesced, applies the policy, and
+only then enables it; on a node with authentication, create
+`fleet_ingress` `NOLOGIN` with its password first, and on a shared or
+production cluster follow [cloud onboarding](docs/CLOUD_ONBOARDING.md)
+instead. The receiver then starts from an environment of its own:
+
+```text
+docker exec --interactive ostk-fleet-recall-crdb /bin/sh -s < deploy/localstack/ingress-boundary.sh
+env -i PATH="$PATH" \
+  FLEET_RECALL_INGRESS_DATABASE_URL=postgresql://fleet_ingress:local-ingress-only@127.0.0.1:26257/fleet_recall?sslmode=disable \
+  FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1 \
+  FLEET_RECALL_TENANT_ID=... FLEET_RECALL_PROJECT=... FLEET_RECALL_SLACK_SIGNING_SECRET=... \
+  ostk-fleet-recall ingress --sources worker-sources.json
+```
+
+Then give each provider the relay's URL for `/v1/hooks/<connector_instance>`
+and the signing secret: Slack's Event Subscriptions request URL (it verifies
+the URL with a signed challenge the receiver answers; subscribe the app to the
+channel message events it reads), a Linear webhook for the `Issue` and
+`Comment` resources, and a Granola webhook for its note events.
+`collect dead-letters --instance <id>` lists what the receiver refused, and
+`collect status` counts each instance's hints by state.
+
 ## Asserting a claim
 
 `remember(assert)` is the event-first counterpart of `record`
@@ -840,19 +869,26 @@ place (probed once at startup); elsewhere every tool schema is what it was.
 
 ## Runbook: the event-first plane
 
-Assert, the memory worker, and the spec chain all append to the accepted-event
-ledger under one writer authority per physical `(tenant, project)`. Run them
-in this order; [local quickstart](#local-quickstart) steps 3 and 7 to 9 walk
-through them against a local node.
+Assert, the memory worker, the collectors, and the spec chain all append to
+the accepted-event ledger under one writer authority per physical
+`(tenant, project)`. Run them in this order; [local quickstart](#local-quickstart)
+steps 3 and 7 to 10 walk through them against a local node, and the
+[collected-items runbook](docs/COLLECTED_ITEMS_RUNBOOK.md) adds what running
+the collectors and the webhook receiver for real takes.
 
 1. **Migrate.** `ostk-fleet-recall migrate` as the migrator, through
-   migration 31.
+   migration 36.
 2. **Install the writer authority, once per physical scope.** Before you
    retire the migrator credential, run `ostk-authority-install apply` as the
    migrator with `FLEET_RECALL_TENANT_ID`, `FLEET_RECALL_PROJECT`,
    `FLEET_RECALL_CONTRACT_TENANT_NAMESPACE`, and
    `FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE`. It takes the scope to an active
-   generation-2 registry head and prints one JSON report. Keep its `pins`.
+   generation-2 registry head, or with `--target generation-3` to the
+   generation-3 collected-items package that collectors, imports, capture,
+   and item citations need, and prints one JSON report. Keep its `pins`.
+   A scope already at generation 2 moves later with the same command and the
+   same pins, which rebases its spec families
+   ([Generation-3 rollout order](docs/MIGRATIONS.md#generation-3-rollout-order-adr-0008-d2)).
    Its signatures use public fixture keys and prove nothing; what protects
    the scope is who holds the migrator credential and the pins each writer
    loads. See the
@@ -860,33 +896,44 @@ through them against a local node.
 3. **Apply the runtime policy.**
    [`deploy/cockroach/runtime-role-grants.sql`](deploy/cockroach/runtime-role-grants.sql)
    gives `fleet_runtime`, the role of the `fleet_writer` login, everything
-   assert, the worker, evidence recall, and the spec chain use; see
+   assert, the worker and its collectors, `collect`, evidence and item
+   recall, capture, and the spec chain use; see
    [migration operations](docs/MIGRATIONS.md#privilege-separation). The
-   publication reader gains nothing.
+   publication reader gains nothing. Where provider webhooks are received,
+   also provision the `fleet_ingress` login under
+   [`ingress-receiver-role-grants.sql`](deploy/cockroach/ingress-receiver-role-grants.sql)
+   (`deploy/localstack/ingress-boundary.sh` does it on a local node; see
+   [receiving provider webhooks](#receiving-provider-webhooks)).
 4. **Export the pins to every event-first writer.** Set
    `FLEET_RECALL_CONTRACT_TENANT_NAMESPACE`,
    `FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE`, and
    `FLEET_RECALL_BOOTSTRAP_RECEIPT_DIGEST` from the report (and optionally
    `FLEET_RECALL_EXPECTED_ACTIVATION_ID` from its `activation_id`) for
-   `serve`, the worker, and `ostk-spec`. The worker's `ingest` and `project`
-   steps and `ostk-spec check` also need `FLEET_RECALL_CONTENT_KEK_HEX`, a
+   `serve`, the worker, `collect`, and `ostk-spec`. The worker's `ingest`,
+   `collect`, and `project` steps, `collect import` (unless `--no-drain`),
+   `serve` with `FLEET_RECALL_COLLECTED_CAPTURE=enabled`, and
+   `ostk-spec check` also need `FLEET_RECALL_CONTENT_KEK_HEX`, a
    64-hex-character key. Generate it once per scope and keep it: `project`
-   unwraps every object with the key `ingest` wrapped it under.
+   unwraps every object with the key `ingest` or the sink wrapped it under.
 5. **Restart `serve`.** It probes once at startup. It serves assert when the
    pins verify, `recall(kind=evidence)` when migration 30 is applied and the
    login may read the Stage-5 tables, `recall(discrepancies)` when
    migration 31 is applied and the login may read the discrepancy, normative,
-   and spec tables, and `recall(kind=item)` when migration 34 is applied and
-   the login may read the collector tables. Anything it does not serve stays
-   out of `tools/list`.
+   and spec tables, `recall(kind=item)` when migration 34 is applied and
+   the login may read the collector tables, item citations when migration 35
+   is, and `remember(capture)` when `FLEET_RECALL_COLLECTED_CAPTURE` turns it
+   on over a generation-3 head. Anything it does not serve stays out of
+   `tools/list`.
 6. **Schedule the worker.** Run the [memory worker](#memory-worker) with one
    sources file per scope. The `ingest` steps run on a host with `git`, `gh`,
    the repositories, and the transcript files, which also holds the content
-   key and the writer login. `--steps project,embed` can run in the
-   container. Schedule it with cron or a scheduled task, one run per scope at
-   a time.
+   key and the writer login; the `collect` step reads each collector's
+   provider token from the variable its `settings.token_env` names, in the
+   worker's environment. `--steps project,embed` can run in the container,
+   on the same release as the ingest host. Schedule it with cron or a
+   scheduled task, one run per scope at a time.
 7. **Make specs normative and check commits.** Activate specs only once the
-   scope has its generation-2 head from step 2: a later registry head change
+   scope has its head from step 2: a later registry head change
    strands every family activated under the old head
    ([ADR 0007 D11](docs/adr/0007-spec-conformance-chain.md)), except that
    `ostk-authority-install apply --target generation-3` rebases every spec
@@ -912,6 +959,12 @@ through them against a local node.
      and it is never recalled as evidence;
    - `ostk-spec episode resolve` or `ostk-spec episode dismiss` closes an
      episode. No check closes one.
+8. **Receive webhooks, optionally.** Run
+   [`ostk-fleet-recall ingress`](#receiving-provider-webhooks) from an
+   environment of its own, holding only `FLEET_RECALL_INGRESS_DATABASE_URL`
+   (the `fleet_ingress` login), the scope, and the signing secrets the sources
+   file names, behind a relay you run for the providers. The next worker tick
+   whose steps include `collect` settles what it received.
 
 ## Not built yet
 
@@ -980,7 +1033,10 @@ This path starts one disposable CockroachDB node, loads the pinned 512-dimension
 model, ingests the synthetic demo corpus, exercises HTTP recall, and makes real
 MCP calls. Steps 7 to 9 then run the event-first plane: two agents assert
 conflicting claims, the memory worker ingests a scratch git repository, and a
-spec check records a nonconformance that recall reports. A single node is
+spec check records a nonconformance that recall reports. Step 10 moves the
+scope to generation 3 and collects items: a documents root, two operator
+imports (a file of items and a Slack export), and an agent's capture that a
+claim cites. A single node is
 useful for application development; it does not demonstrate CockroachDB's
 production availability or distributed topology.
 
@@ -1714,6 +1770,110 @@ projects the blob fact into evidence recall and counts the observer run, which
 names no source version, under the `bodies` step's `events_unprojectable`;
 `recall(discrepancies)` cites it as `observer_event_id`.
 
+### 10. Collect documents, an import, and a Slack export
+
+Collected items need the scope at generation 3
+([ADR 0008](docs/adr/0008-collected-items.md)). Moving a scope is the
+migrator's job, and step 4 retired the migrator, so enable it for this one
+command and retire it again by rerunning the boundary helper, which leaves
+every other grant as it was. The move keeps the pins, so nothing above is
+reconfigured, and it rebases the spec family step 9 activated onto the new
+head:
+
+```bash
+docker exec ostk-fleet-recall-crdb \
+  cockroach sql --insecure --host=127.0.0.1:26257 \
+  --execute='ALTER USER fleet_migrator WITH LOGIN; GRANT admin TO fleet_migrator;'
+FLEET_RECALL_DATABASE_URL="${local_pg_scheme}://fleet_migrator:${local_migrator_password}@127.0.0.1:26257/fleet_recall?sslmode=disable" \
+FLEET_RECALL_CONTRACT_TENANT_NAMESPACE=tenant.quickstart \
+FLEET_RECALL_CONTRACT_PROJECT_NAMESPACE=project.quickstart \
+  "$PWD/target/debug/ostk-authority-install" apply --target generation-3 \
+  > "$FLEET_RECALL_QUICKSTART_DIR/authority-generation3.json"
+jq '{generation, package, normative_families: [.normative_families[] | {binding_family_id, outcome}]}' \
+  "$FLEET_RECALL_QUICKSTART_DIR/authority-generation3.json"
+docker exec --interactive ostk-fleet-recall-crdb \
+  /bin/sh -s < deploy/localstack/database-boundary.sh
+```
+
+The report reads `generation` 3, the `collected_items_generation3` package,
+and `spec.quickstart.no_forget` `rebased`. Now add a documents collector over
+this repository's `docs/` to the scope's one sources file and run a tick. The
+operator declares the root visible to the whole project:
+
+```bash
+jq --arg root "$PWD/docs" '.collectors = [{
+    "provider": "docs", "connector_principal": "principal.docs",
+    "connector_instance": "docs.quickstart", "provider_scope_id": "quickstart-docs",
+    "audience": {"operator_declared": true},
+    "settings": {"root": $root, "extensions": ["md"]}}]' \
+  "$FLEET_RECALL_QUICKSTART_SOURCES" > "$FLEET_RECALL_QUICKSTART_SOURCES.new"
+mv "$FLEET_RECALL_QUICKSTART_SOURCES.new" "$FLEET_RECALL_QUICKSTART_SOURCES"
+"$FLEET_RECALL_BIN" worker --once --sources "$FLEET_RECALL_QUICKSTART_SOURCES" |
+  jq '{steps: (.steps | map_values(.status)), docs: [.steps.collect.sources[] | {connector_instance, outcome, files_staged: .counters.files_staged}]}'
+```
+
+Import two snapshots as the operator: a file of Linear items, and a Slack
+workspace export (a directory here; a zip works the same). The export's
+public channel is imported; its private channel is not listed with
+`--private-container`, so it is never opened, and its direct conversation is
+never read:
+
+```bash
+"$FLEET_RECALL_BIN" collect import --instance import.linear --principal principal.import \
+  --provider linear --provider-scope 0a9c0000-0000-4000-8000-0000000ac3e1 \
+  --audience operator-declared --format items-jsonl \
+  --path tests/fixtures/collected/items-linear.jsonl | jq '{items_staged, refused, snapshot}'
+"$FLEET_RECALL_BIN" collect import --instance import.slack --principal principal.import \
+  --provider slack --provider-scope T07ACME0001 --audience operator-declared \
+  --format slack-export --path tests/fixtures/collected/slack-export | jq '{items_staged, refused, snapshot}'
+```
+
+An agent can relay what it read through its own connectors. With capture
+enabled (the content key from step 8 lets `serve` admit in the call), the
+agent captures a message of the channel the export recorded as readable, and
+records a claim that cites it:
+
+```bash
+FLEET_RECALL_COLLECTED_CAPTURE=enabled "$FLEET_RECALL_BIN" serve <<'JSONRPC' | jq --compact-output 'select(.id > 1) | .result.structuredContent.data // .error | .items // .claim // . | if type == "array" then [.[] | {disposition, item_id}] else {id, state, text} end'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"readme-smoke","version":"1.0.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember","arguments":{"action":"capture","idempotency_key":"readme/capture/v1","via":"slack.conversations_history","items":[{"provider":"slack","provider_scope_id":"T07ACME0001","object_kind":"message","external_id":"C07PLATENG1:1790009400.000100","container":{"kind":"slack.channel","id":"C07PLATENG1"},"author":{"id":"U07BOB0002","kind":"human"},"created_at":"2026-09-21T16:50:00.000100Z","text":"p99 stays under the SLO with a retry budget of 5 and full jitter.","url":"https://acme-robotics.slack.com/archives/C07PLATENG1/p1790009400000100"}]}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"remember","arguments":{"action":"record","idempotency_key":"readme/record-cites/v1","kind":"fact","text":"The ingest worker retry budget is five attempts with full jitter.","subject":"ingest worker","predicate":"retry-budget","value":5,"support":[{"item":{"url":"https://acme-robotics.slack.com/archives/C07PLATENG1/p1790009400000100"},"relation":"supports"}]}}}
+JSONRPC
+```
+
+The capture answers `admitted`, and the claim is `active`. Project what was
+admitted, then recall it as items, get the captured one, and search the same
+words as evidence:
+
+```bash
+"$FLEET_RECALL_BIN" worker --once --sources "$FLEET_RECALL_QUICKSTART_SOURCES" --steps project,embed |
+  jq '.steps | map_values(.status)'
+"$FLEET_RECALL_BIN" serve <<'JSONRPC' | jq --compact-output 'select(.id > 1) | .result.structuredContent.data | if .item then {item: .item.item | {provider, external_id, trust, lifecycle}, cited_by: [.item.cited_by[] | .claim_id]} else {absence: .absence.verdict, hits: [.hits[] | {provider: (.provider // .item.provider), trust: (.trust // .item.trust), current: (.current // .item.current), snippet: .snippet[:60]}]} end'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"readme-smoke","version":"1.0.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"action":"search","kind":"item","query":"retry budget jitter","limit":5}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"action":"get","kind":"item","id":"https://acme-robotics.slack.com/archives/C07PLATENG1/p1790009400000100"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"recall","arguments":{"action":"search","kind":"evidence","query":"retry budget jitter","limit":5}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"recall","arguments":{"action":"search","kind":"item","query":"zeppelin","limit":5}}}
+JSONRPC
+```
+
+Item search finds the Slack thread, the Linear issue, and the capture, each
+`reported` (an import and a capture are the operator's and the agent's word,
+not a provider's), with its text labelled `untrusted_third_party`. The get
+names the capture's item and the claim that cites it. The evidence search
+returns the same bodies, each annotated with its item. The last search reads
+`absent`: every collector and import covered its whole scope and nothing
+awaits projection. Pulling a live Slack workspace, Linear organization, or
+Granola account is a sources-file entry with the provider's token in the
+worker's environment (see [memory worker](#memory-worker)), and webhooks
+shorten its interval (see
+[receiving provider webhooks](#receiving-provider-webhooks)); the
+[collected-items runbook](docs/COLLECTED_ITEMS_RUNBOOK.md) puts every step in
+order and records an end-to-end run against local stand-ins for the three
+providers.
+
 ## Ingestion contract
 
 `ingest --input PATH` reads NDJSON; `--input -` (the default) reads stdin:
@@ -1878,6 +2038,9 @@ is `#[ignore]` and documents its environment at the top of the file.
 - [Project primer](docs/PROJECT_PRIMER.md).
 - [Migration operations](docs/MIGRATIONS.md) and
   [security policy](docs/SECURITY.md).
+- [Collected-items runbook](docs/COLLECTED_ITEMS_RUNBOOK.md): collectors,
+  imports, capture, and webhook ingress in order, the first live run against
+  each provider, and a recorded end-to-end run.
 - [Private control-ledger bootstrap](docs/CONTROL_BOOTSTRAP.md).
 - [Cloud onboarding](docs/CLOUD_ONBOARDING.md): AWS/CockroachDB account,
   approval, cost, identity, TLS, model, and teardown steps.
@@ -1906,7 +2069,7 @@ docker stop ostk-fleet-recall-crdb
 
 Restart it later with `docker start ostk-fleet-recall-crdb`. Removing the
 container or volume is intentionally left as an explicit operator decision
-because the volume contains the local memory corpus. Steps 3 and 7 to 9 also
+because the volume contains the local memory corpus. Steps 3 and 7 to 10 also
 leave the installer report, the scratch repository, the sources file, and the
 spec files under `.fleet-recall/quickstart`, which git ignores; they belong to
 that database, so remove them with it.

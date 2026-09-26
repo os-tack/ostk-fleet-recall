@@ -2165,18 +2165,44 @@ mod tests {
     /// exported assignments with `${name}` expansion, `unset`, and whether the
     /// checked-in boundary helper has run. That helper retires
     /// `fleet_migrator`, and only then provisions and enables `fleet_writer`
-    /// and `fleet_publication`.
+    /// and `fleet_publication`. Lines continued with `\` are one command,
+    /// and the `NAME=value` words that open a command hold for that command
+    /// only, as in the shell.
     #[derive(Default)]
     struct QuickstartShell {
         variables: HashMap<String, String>,
+        /// The current command's own `NAME=value` prefixes.
+        scoped: HashMap<String, String>,
         boundary_established: bool,
     }
 
+    /// `NAME=value` at the start of `words`: the name, the value without its
+    /// quotes, and the words after it. `None` when `words` does not start
+    /// with an assignment.
+    fn split_assignment(words: &str) -> Option<(&str, &str, &str)> {
+        let (name, rest) = words.split_once('=')?;
+        if name.is_empty() || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        let (value, tail) = match rest.chars().next() {
+            Some(quote @ ('"' | '\'')) => {
+                let body = &rest[1..];
+                let end = body.find(quote).unwrap_or(body.len());
+                (&body[..end], body.get(end + 1..).unwrap_or_default())
+            }
+            _ => rest.split_at(rest.find(char::is_whitespace).unwrap_or(rest.len())),
+        };
+        Some((name, value, tail.trim_start()))
+    }
+
     impl QuickstartShell {
-        fn run(&mut self, line: &str) {
+        /// Replay one command (continued lines joined) and return the words
+        /// it runs after its `NAME=value` prefixes, which stay in force for
+        /// it until [`Self::finish`].
+        fn run(&mut self, line: &str) -> Option<String> {
             let line = line.trim();
-            if line.starts_with('#') {
-                return;
+            if line.is_empty() || line.starts_with('#') {
+                return None;
             }
             if line.contains("deploy/localstack/database-boundary.sh") {
                 self.boundary_established = true;
@@ -2185,16 +2211,33 @@ mod tests {
                 for name in names.split_whitespace() {
                     self.variables.remove(name);
                 }
-                return;
+                return None;
             }
-            let assignment = line.strip_prefix("export ").unwrap_or(line);
-            if let Some((name, value)) = assignment.split_once('=')
-                && !name.is_empty()
-                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
-            {
-                let value = self.expand(value.trim_matches(['"', '\'']));
-                self.variables.insert(name.to_owned(), value);
+            if let Some(assignment) = line.strip_prefix("export ") {
+                if let Some((name, value, _)) = split_assignment(assignment) {
+                    let value = self.expand(value);
+                    self.variables.insert(name.to_owned(), value);
+                }
+                return None;
             }
+            let mut words = line;
+            let mut prefixes = Vec::new();
+            while let Some((name, value, rest)) = split_assignment(words) {
+                prefixes.push((name.to_owned(), self.expand(value)));
+                words = rest;
+            }
+            if words.is_empty() {
+                // Plain assignments: shell variables from here on.
+                self.variables.extend(prefixes);
+                return None;
+            }
+            self.scoped.extend(prefixes);
+            Some(words.to_owned())
+        }
+
+        /// End the current command: its prefixes no longer hold.
+        fn finish(&mut self) {
+            self.scoped.clear();
         }
 
         fn expand(&self, value: &str) -> String {
@@ -2214,7 +2257,10 @@ mod tests {
 
         /// The login the database URL in `variable` authenticates as.
         fn login(&self, variable: &str) -> Option<String> {
-            let url = self.variables.get(variable)?;
+            let url = self
+                .scoped
+                .get(variable)
+                .or_else(|| self.variables.get(variable))?;
             let options = url
                 .parse::<sqlx::postgres::PgConnectOptions>()
                 .unwrap_or_else(|error| panic!("{variable} is not a PostgreSQL URL: {error}"));
@@ -2241,6 +2287,7 @@ mod tests {
         let mut shell = QuickstartShell::default();
         let mut identities_run = Vec::new();
         let mut fence: Option<&str> = None;
+        let mut command = String::new();
         for (index, line) in include_str!("../README.md").lines().enumerate() {
             let line_number = index + 1;
             if let Some(info) = line.strip_prefix("```") {
@@ -2250,8 +2297,18 @@ mod tests {
             if fence != Some("bash") {
                 continue;
             }
-            shell.run(line);
-            let Some(arguments) = line.trim().strip_prefix("\"$FLEET_RECALL_BIN\" ") else {
+            if let Some(continued) = line.trim_end().strip_suffix('\\') {
+                command.push_str(continued);
+                command.push(' ');
+                continue;
+            }
+            command.push_str(line);
+            let words = shell.run(&std::mem::take(&mut command));
+            let Some(arguments) = words
+                .as_deref()
+                .and_then(|words| words.strip_prefix("\"$FLEET_RECALL_BIN\" "))
+            else {
+                shell.finish();
                 continue;
             };
             let arguments = arguments
@@ -2261,7 +2318,10 @@ mod tests {
                 .unwrap_or_else(|error| panic!("README line {line_number}: {error}"));
             let identity = cli.command.runtime_database_identity();
             let (variable, login) = match identity {
-                RuntimeDatabaseIdentity::None => continue,
+                RuntimeDatabaseIdentity::None => {
+                    shell.finish();
+                    continue;
+                }
                 RuntimeDatabaseIdentity::Migrator => {
                     ("FLEET_RECALL_DATABASE_URL", MIGRATOR_POSTGRES_USER)
                 }
@@ -2298,6 +2358,7 @@ mod tests {
                 "README line {line_number}: {login} cannot authenticate at this step"
             );
             identities_run.push(identity);
+            shell.finish();
         }
         for identity in [
             RuntimeDatabaseIdentity::Migrator,
