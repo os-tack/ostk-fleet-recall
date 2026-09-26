@@ -602,6 +602,20 @@ pub struct ClaimsForKeyV1 {
     pub truncated: bool,
 }
 
+/// Claims one brief (`recall(brief)`) lists at most, whether the scope's
+/// most recent or a subject's: the bound of `limit`.
+pub const MAX_BRIEF_CLAIMS: usize = 64;
+
+/// The scope's most recently changed lifecycle-current claims, newest first,
+/// each with its support and current conflicts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecentClaimsV1 {
+    pub claims: Vec<KeyClaimV1>,
+    /// More lifecycle-current claims exist than the bound; the ones
+    /// returned are the most recently changed.
+    pub truncated: bool,
+}
+
 /// Lifecycle events one claim `get` reads before reporting a cut.
 pub const MAX_CLAIM_HISTORY_EVENTS: usize = 256;
 

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -5,8 +7,8 @@ use crate::ledger::{
     AssertedClaimMutation, Claim, ClaimHistoryV1, ClaimInput, ClaimItemSupportV1, ClaimMutation,
     ClaimState, ClaimTarget, ClaimsForKeyV1, Conflict, ConflictHistory, ConflictLifecycleRows,
     ConflictMutation, ConflictTarget, DismissalTerms, LegacyClaimKeysV1, LifecycleMutation,
-    LifecycleRefusal, LifecycleReplayRequest, OpenConflictsV1, RefusalCode, SemanticClaimHit,
-    WaiverTerms,
+    LifecycleRefusal, LifecycleReplayRequest, OpenConflictsV1, RecentClaimsV1, RefusalCode,
+    SemanticClaimHit, WaiverTerms,
 };
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::remember_runtime::RememberAssertInputV1;
@@ -255,6 +257,40 @@ pub trait ClaimLedger: Send + Sync {
         claim_key: &str,
         include_history: bool,
     ) -> Result<ClaimsForKeyV1>;
+
+    /// The project's most recently changed lifecycle-current claims, newest
+    /// first and at most `limit` (bounded by
+    /// [`crate::ledger::MAX_BRIEF_CLAIMS`]), each with its support and
+    /// current conflicts as [`Self::claims_for_key`] attaches them: one seek
+    /// of `memory_claims_scope_state_idx` per current state.
+    async fn recent_claims(&self, scope: &FleetScope, limit: usize) -> Result<RecentClaimsV1>;
+
+    /// Every lifecycle-current claim whose stored key begins with `subject`,
+    /// normalized as `record` normalizes it, followed by `::` (the
+    /// subject's own keys) or `-` (a subject that continues its words),
+    /// in key then recording order and at most `limit` (bounded by
+    /// [`crate::ledger::MAX_BRIEF_CLAIMS`]), each with its support and
+    /// current conflicts: two spans of `memory_claims_scope_key_idx`. An
+    /// asserted claim's `claim-v2:` key never matches.
+    async fn claims_for_subject(
+        &self,
+        scope: &FleetScope,
+        subject: &str,
+        limit: usize,
+    ) -> Result<ClaimsForKeyV1>;
+
+    /// For at most 64 `claim_ids`, each collected-item provider (`slack`,
+    /// `docs`, ...) at least one of them cites through the private claim
+    /// item links, with how many of the claims cite it: digests and counts,
+    /// never an item. Empty where this ledger does not serve claim item
+    /// links, which is this default.
+    async fn claim_cited_providers(
+        &self,
+        _scope: &FleetScope,
+        _claim_ids: &[i64],
+    ) -> Result<BTreeMap<String, u32>> {
+        Ok(BTreeMap::new())
+    }
 
     /// The ids of the conflicts detected on exactly `claim_key`, in any
     /// state: at most one per detector, so at most two.

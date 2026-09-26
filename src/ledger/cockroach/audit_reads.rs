@@ -1,6 +1,8 @@
 //! Audit-trail reads beside the ledger's mutations: the claims on one exact
-//! key, the conflicts detected on it, one claim's lifecycle history, and the
-//! open conflicts `recall(status)` counts.
+//! key, the conflicts detected on it, one claim's lifecycle history, the
+//! open conflicts `recall(status)` counts, and the two claim listings
+//! `recall(brief)` composes: the scope's most recently changed claims and a
+//! subject's claims.
 //!
 //! Every read is bounded before transfer, seeks an existing index, and
 //! projects only what its public answer carries. None of them writes.
@@ -8,8 +10,8 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use sqlx::Row;
 use sqlx::postgres::PgRow;
+use sqlx::{Postgres, Row, Transaction};
 
 use super::lifecycle_store::{MAX_SAFE_INTEGER, sentinel_limit};
 use super::{
@@ -17,9 +19,9 @@ use super::{
     protocol_error,
 };
 use crate::ledger::{
-    ClaimHistoryV1, ClaimLifecycleEventV1, ClaimsForKeyV1, KeyClaimV1, MAX_CLAIM_HISTORY_EVENTS,
-    MAX_KEY_LOOKUP_CLAIMS, MAX_KEY_LOOKUP_VALUE_BYTES, MAX_OPEN_CONFLICT_ROWS, OpenConflictRowV1,
-    OpenConflictsV1,
+    ClaimHistoryV1, ClaimLifecycleEventV1, ClaimsForKeyV1, KeyClaimV1, MAX_BRIEF_CLAIMS,
+    MAX_CLAIM_HISTORY_EVENTS, MAX_KEY_LOOKUP_CLAIMS, MAX_KEY_LOOKUP_VALUE_BYTES,
+    MAX_OPEN_CONFLICT_ROWS, OpenConflictRowV1, OpenConflictsV1, RecentClaimsV1, normalize_key_part,
 };
 use crate::store::cockroach::with_serializable_retry;
 use crate::{FleetError, FleetScope, Result};
@@ -56,6 +58,54 @@ const KEY_SUPPORT_SQL: &str = "SELECT claim_id, id, source_config_id, source, so
      FROM memory_claim_support \
      WHERE tenant_id = $1 AND project = $2 AND claim_id = ANY($3) \
      ORDER BY claim_id, observed_at, id LIMIT $4";
+
+/// The scope's most recently changed lifecycle-current claims: one bounded
+/// seek of the scoped state index per current state, in the index's own
+/// `updated_at DESC` order, merged and cut to the bound, then each claim's
+/// projection through the primary. Values are projected only up to the
+/// lookup's bound.
+const RECENT_CLAIMS_SQL: &str = "WITH active_rows AS MATERIALIZED (\
+       SELECT id, updated_at FROM memory_claims@memory_claims_scope_state_idx \
+       WHERE tenant_id = $1 AND project = $2 AND state = 'active' \
+       ORDER BY updated_at DESC, id LIMIT $3\
+     ), disputed_rows AS MATERIALIZED (\
+       SELECT id, updated_at FROM memory_claims@memory_claims_scope_state_idx \
+       WHERE tenant_id = $1 AND project = $2 AND state = 'disputed' \
+       ORDER BY updated_at DESC, id LIMIT $3\
+     ), recent AS (\
+       SELECT id, updated_at FROM (\
+         SELECT id, updated_at FROM active_rows \
+         UNION ALL SELECT id, updated_at FROM disputed_rows\
+       ) AS merged ORDER BY updated_at DESC, id LIMIT $3\
+     ) \
+     SELECT claim.id, claim.project, claim.kind, claim.claim_key, claim.subject, \
+            claim.predicate, \
+            CASE WHEN claim.value IS NULL OR octet_length(claim.value::STRING) > $4 \
+                 THEN NULL ELSE claim.value END AS value, \
+            claim.text, claim.polarity, claim.state, claim.origin, claim.actor, \
+            claim.confidence, claim.valid_from, claim.valid_to, claim.superseded_by, \
+            claim.revision, claim.conflict_eligible, claim.created_at, claim.updated_at, \
+            (claim.value IS NOT NULL AND octet_length(claim.value::STRING) > $4) AS value_elided \
+     FROM recent \
+     JOIN memory_claims@primary AS claim \
+       ON claim.tenant_id = $1 AND claim.project = $2 AND claim.id = recent.id \
+     ORDER BY recent.updated_at DESC, recent.id";
+
+/// A subject's lifecycle-current claims: the keys in the two half-open
+/// spans `[subject::, subject::\u{10FFFF})` and `[subject-, subject-\u{10FFFF})`
+/// of the scoped key index (`$3..$6`), in key then recording order. Values
+/// are projected only up to the lookup's bound.
+const SUBJECT_CLAIMS_SQL: &str = "SELECT id, project, kind, claim_key, subject, predicate, \
+            CASE WHEN value IS NULL OR octet_length(value::STRING) > $8 \
+                 THEN NULL ELSE value END AS value, \
+            text, polarity, state, origin, actor, confidence, valid_from, valid_to, \
+            superseded_by, revision, conflict_eligible, created_at, updated_at, \
+            (value IS NOT NULL AND octet_length(value::STRING) > $8) AS value_elided \
+     FROM memory_claims@memory_claims_scope_key_idx \
+     WHERE tenant_id = $1 AND project = $2 \
+       AND ((claim_key >= $3 AND claim_key < $4) OR (claim_key >= $5 AND claim_key < $6)) \
+       AND state IN ('active', 'disputed') \
+     ORDER BY claim_key, id LIMIT $7";
 
 /// The conflicts detected on one key: one per detector through the v15
 /// unique index, so a third row is an unknown lineage the read reports.
@@ -153,51 +203,186 @@ pub(super) async fn claims_for_key(
             let mut truncated = rows.len() > MAX_KEY_LOOKUP_CLAIMS;
             let mut claims = Vec::with_capacity(rows.len().min(MAX_KEY_LOOKUP_CLAIMS));
             for row in rows.iter().take(MAX_KEY_LOOKUP_CLAIMS) {
-                let claim = decode_claim(row)?;
-                if claim.claim_key.as_deref() != Some(claim_key.as_str()) {
+                let entry = decode_key_claim(row)?;
+                if entry.claim.claim_key.as_deref() != Some(claim_key.as_str()) {
                     return Err(protocol_error(
                         "key lookup returned a claim carrying another key",
                     ));
                 }
-                claims.push(KeyClaimV1 {
-                    value_elided: row.try_get("value_elided")?,
-                    claim,
-                });
+                claims.push(entry);
             }
-            let claim_ids = claims
-                .iter()
-                .map(|entry| entry.claim.id)
-                .collect::<Vec<_>>();
-            if claim_ids.is_empty() {
-                return Ok(ClaimsForKeyV1 { claims, truncated });
-            }
+            truncated |= attach_support_and_conflicts(transaction, &scope, &mut claims).await?;
+            Ok(ClaimsForKeyV1 { claims, truncated })
+        })
+    })
+    .await
+}
 
-            let support_rows = sqlx::query(KEY_SUPPORT_SQL)
+/// One projected claim row with its `value_elided` flag.
+fn decode_key_claim(row: &PgRow) -> Result<KeyClaimV1> {
+    Ok(KeyClaimV1 {
+        value_elided: row.try_get("value_elided")?,
+        claim: decode_claim(row)?,
+    })
+}
+
+/// Attach each claim's support rows (`KEY_SUPPORT_SQL`, in `get` order) and
+/// current conflict ids, in the lookup's own transaction; `true` when more
+/// support rows existed than the bound transfers.
+async fn attach_support_and_conflicts(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &FleetScope,
+    claims: &mut [KeyClaimV1],
+) -> Result<bool> {
+    let claim_ids = claims
+        .iter()
+        .map(|entry| entry.claim.id)
+        .collect::<Vec<_>>();
+    if claim_ids.is_empty() {
+        return Ok(false);
+    }
+    let support_rows = sqlx::query(KEY_SUPPORT_SQL)
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(&claim_ids)
+        .bind(sentinel_limit(MAX_KEY_LOOKUP_SUPPORT_ROWS)?)
+        .fetch_all(&mut **transaction)
+        .await?;
+    let truncated = support_rows.len() > MAX_KEY_LOOKUP_SUPPORT_ROWS;
+    let mut support_by_claim: HashMap<i64, Vec<_>> = HashMap::new();
+    for row in support_rows.iter().take(MAX_KEY_LOOKUP_SUPPORT_ROWS) {
+        let claim_id: i64 = row.try_get("claim_id")?;
+        support_by_claim
+            .entry(claim_id)
+            .or_default()
+            .push(decode_support(row)?);
+    }
+    let mut conflict_ids = fetch_current_claim_conflict_ids(transaction, scope, &claim_ids).await?;
+    for entry in claims.iter_mut() {
+        if let Some(support) = support_by_claim.remove(&entry.claim.id) {
+            entry.claim.support = support;
+        }
+        if let Some(ids) = conflict_ids.remove(&entry.claim.id) {
+            entry.claim.conflict_ids = ids;
+        }
+    }
+    Ok(truncated)
+}
+
+/// A brief's claim bound: `1..=MAX_BRIEF_CLAIMS`.
+fn validated_brief_limit(limit: usize) -> Result<usize> {
+    if !(1..=MAX_BRIEF_CLAIMS).contains(&limit) {
+        return Err(FleetError::Memory(format!(
+            "brief claim limit must be between 1 and {MAX_BRIEF_CLAIMS}"
+        )));
+    }
+    Ok(limit)
+}
+
+/// The value bound of a claim projection, as `INT8`.
+fn lookup_value_bound() -> Result<i64> {
+    i64::try_from(MAX_KEY_LOOKUP_VALUE_BYTES)
+        .map_err(|_| protocol_error("key lookup value bound exceeds INT8"))
+}
+
+/// The scope's most recently changed current claims (see
+/// [`crate::ledger::ClaimLedger::recent_claims`]).
+pub(super) async fn recent_claims(
+    ledger: &CockroachClaimLedger,
+    scope: &FleetScope,
+    limit: usize,
+) -> Result<RecentClaimsV1> {
+    ledger.ensure_scope(scope)?;
+    let limit = validated_brief_limit(limit)?;
+    let scope = scope.clone();
+    with_serializable_retry(&ledger.pool, ledger.retry_policy, move |transaction| {
+        let scope = scope.clone();
+        Box::pin(async move {
+            let rows = sqlx::query(RECENT_CLAIMS_SQL)
                 .bind(scope.tenant_id)
                 .bind(&scope.project)
-                .bind(&claim_ids)
-                .bind(sentinel_limit(MAX_KEY_LOOKUP_SUPPORT_ROWS)?)
+                .bind(sentinel_limit(limit)?)
+                .bind(lookup_value_bound()?)
                 .fetch_all(&mut **transaction)
                 .await?;
-            truncated |= support_rows.len() > MAX_KEY_LOOKUP_SUPPORT_ROWS;
-            let mut support_by_claim: HashMap<i64, Vec<_>> = HashMap::new();
-            for row in support_rows.iter().take(MAX_KEY_LOOKUP_SUPPORT_ROWS) {
-                let claim_id: i64 = row.try_get("claim_id")?;
-                support_by_claim
-                    .entry(claim_id)
-                    .or_default()
-                    .push(decode_support(row)?);
-            }
-            let mut conflict_ids =
-                fetch_current_claim_conflict_ids(transaction, &scope, &claim_ids).await?;
-            for entry in &mut claims {
-                if let Some(support) = support_by_claim.remove(&entry.claim.id) {
-                    entry.claim.support = support;
+            let mut truncated = rows.len() > limit;
+            let mut claims = rows
+                .iter()
+                .take(limit)
+                .map(decode_key_claim)
+                .collect::<Result<Vec<_>>>()?;
+            truncated |= attach_support_and_conflicts(transaction, &scope, &mut claims).await?;
+            Ok(RecentClaimsV1 { claims, truncated })
+        })
+    })
+    .await
+}
+
+/// The two half-open key spans a subject's claims lie in: the subject's own
+/// keys (`subject::…`) and the keys of subjects that continue its words
+/// (`subject-…`), each `[lower, upper)` with `\u{10FFFF}`, the largest
+/// scalar, closing it in UTF-8 byte order. `None` when the subject
+/// normalizes to nothing.
+fn subject_spans(subject: &str) -> Option<[(String, String); 2]> {
+    let subject = normalize_key_part(subject);
+    if subject.is_empty() {
+        return None;
+    }
+    Some(["::", "-"].map(|separator| {
+        (
+            format!("{subject}{separator}"),
+            format!("{subject}{separator}\u{10FFFF}"),
+        )
+    }))
+}
+
+/// A subject's lifecycle-current claims (see
+/// [`crate::ledger::ClaimLedger::claims_for_subject`]).
+pub(super) async fn claims_for_subject(
+    ledger: &CockroachClaimLedger,
+    scope: &FleetScope,
+    subject: &str,
+    limit: usize,
+) -> Result<ClaimsForKeyV1> {
+    ledger.ensure_scope(scope)?;
+    let limit = validated_brief_limit(limit)?;
+    let spans = subject_spans(subject)
+        .ok_or_else(|| FleetError::Memory("subject must contain at least one word".into()))?;
+    for (lower, _) in &spans {
+        validated_claim_key(lower)?;
+    }
+    let scope = scope.clone();
+    with_serializable_retry(&ledger.pool, ledger.retry_policy, move |transaction| {
+        let scope = scope.clone();
+        let spans = spans.clone();
+        Box::pin(async move {
+            let [(own_lower, own_upper), (continued_lower, continued_upper)] = spans;
+            let rows = sqlx::query(SUBJECT_CLAIMS_SQL)
+                .bind(scope.tenant_id)
+                .bind(&scope.project)
+                .bind(&own_lower)
+                .bind(&own_upper)
+                .bind(&continued_lower)
+                .bind(&continued_upper)
+                .bind(sentinel_limit(limit)?)
+                .bind(lookup_value_bound()?)
+                .fetch_all(&mut **transaction)
+                .await?;
+            let mut truncated = rows.len() > limit;
+            let mut claims = Vec::with_capacity(rows.len().min(limit));
+            for row in rows.iter().take(limit) {
+                let entry = decode_key_claim(row)?;
+                let within = entry.claim.claim_key.as_deref().is_some_and(|key| {
+                    key.starts_with(own_lower.as_str()) || key.starts_with(continued_lower.as_str())
+                });
+                if !within {
+                    return Err(protocol_error(
+                        "subject lookup returned a claim outside the subject's spans",
+                    ));
                 }
-                if let Some(ids) = conflict_ids.remove(&entry.claim.id) {
-                    entry.claim.conflict_ids = ids;
-                }
+                claims.push(entry);
             }
+            truncated |= attach_support_and_conflicts(transaction, &scope, &mut claims).await?;
             Ok(ClaimsForKeyV1 { claims, truncated })
         })
     })
@@ -391,6 +576,78 @@ mod tests {
         );
         assert!(OPEN_CONFLICTS_SQL.contains("memory_conflict_members@primary"));
         assert!(OPEN_CONFLICTS_SQL.contains("ORDER BY detected_at, id LIMIT $3"));
+    }
+
+    #[test]
+    fn brief_reads_seek_indexes_and_bound_transfer() {
+        // The recency listing: one seek of the scoped state index per
+        // current state, each in the index's order and bounded, merged
+        // under the same bound, then the primary for the projection.
+        assert_eq!(
+            RECENT_CLAIMS_SQL
+                .matches("FROM memory_claims@memory_claims_scope_state_idx")
+                .count(),
+            2
+        );
+        assert!(
+            RECENT_CLAIMS_SQL
+                .contains("AND state = 'active' ORDER BY updated_at DESC, id LIMIT $3")
+        );
+        assert!(
+            RECENT_CLAIMS_SQL
+                .contains("AND state = 'disputed' ORDER BY updated_at DESC, id LIMIT $3")
+        );
+        assert!(RECENT_CLAIMS_SQL.contains(") AS merged ORDER BY updated_at DESC, id LIMIT $3"));
+        assert!(RECENT_CLAIMS_SQL.contains("JOIN memory_claims@primary AS claim"));
+        assert!(
+            RECENT_CLAIMS_SQL
+                .contains("claim.tenant_id = $1 AND claim.project = $2 AND claim.id = recent.id")
+        );
+        assert!(RECENT_CLAIMS_SQL.contains("octet_length(claim.value::STRING) > $4"));
+        assert!(RECENT_CLAIMS_SQL.contains("AS value_elided"));
+        assert!(RECENT_CLAIMS_SQL.contains("ORDER BY recent.updated_at DESC, recent.id"));
+        assert!(!RECENT_CLAIMS_SQL.contains("SELECT *"));
+        assert!(!RECENT_CLAIMS_SQL.contains("state IN"));
+
+        // The subject listing: two key spans of the scoped key index,
+        // current states, key then recording order, bounded.
+        assert!(SUBJECT_CLAIMS_SQL.contains("memory_claims@memory_claims_scope_key_idx"));
+        assert!(SUBJECT_CLAIMS_SQL.contains(
+            "((claim_key >= $3 AND claim_key < $4) OR (claim_key >= $5 AND claim_key < $6))"
+        ));
+        assert!(SUBJECT_CLAIMS_SQL.contains("AND state IN ('active', 'disputed')"));
+        assert!(SUBJECT_CLAIMS_SQL.contains("ORDER BY claim_key, id LIMIT $7"));
+        assert!(SUBJECT_CLAIMS_SQL.contains("octet_length(value::STRING) > $8"));
+        assert!(SUBJECT_CLAIMS_SQL.contains("AS value_elided"));
+        assert!(!SUBJECT_CLAIMS_SQL.contains("LIKE"));
+        assert!(!SUBJECT_CLAIMS_SQL.contains("SELECT *"));
+    }
+
+    #[test]
+    fn subject_spans_cover_the_subject_and_its_continuations_only() {
+        let spans = subject_spans(" Final Round ").unwrap();
+        assert_eq!(spans[0].0, "final-round::");
+        assert_eq!(spans[0].1, "final-round::\u{10FFFF}");
+        assert_eq!(spans[1].0, "final-round-");
+        assert_eq!(spans[1].1, "final-round-\u{10FFFF}");
+        let within = |key: &str| {
+            spans
+                .iter()
+                .any(|(lower, upper)| lower.as_str() <= key && key < upper.as_str())
+        };
+        assert!(within("final-round::batch-size"));
+        assert!(within("final-round::\u{10FFFE}"));
+        assert!(within("final-round-2::x"));
+        assert!(!within("final::x"));
+        assert!(!within("final-roundabout::x"));
+        assert!(!within("final-round"));
+        assert!(!within("claim-v2:final-round"));
+        assert_eq!(subject_spans(" _- "), None);
+        assert_eq!(subject_spans(""), None);
+
+        assert!(validated_brief_limit(0).is_err());
+        assert!(validated_brief_limit(MAX_BRIEF_CLAIMS + 1).is_err());
+        assert_eq!(validated_brief_limit(MAX_BRIEF_CLAIMS).unwrap(), 64);
     }
 
     #[test]

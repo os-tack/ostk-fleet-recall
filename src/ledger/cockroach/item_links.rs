@@ -65,6 +65,24 @@ const ASSERT_RELATION: &str = "supports";
 /// at most 64 parts each, plus one row to tell a cut read.
 const MAX_CLAIM_LINK_ROWS: i64 = 32 * 64 + 1;
 
+/// Claims one cited-provider read takes: a brief's claim bound.
+const MAX_CITED_PROVIDER_CLAIMS: usize = 64;
+
+/// Provider rows one cited-provider read returns before it is a protocol
+/// error: the provider kinds a build knows, generously, plus a sentinel.
+const MAX_CITED_PROVIDER_ROWS: i64 = 64 + 1;
+
+/// For each provider at least one of `$3`'s claims cites, how many of them
+/// do: the join of `CLAIM_LINKS_SQL` cut to the provider, grouped. A claim
+/// citing two items of one provider counts once for it.
+const CITED_PROVIDERS_SQL: &str = "SELECT item.provider, count(DISTINCT link.claim_id)::INT8 AS claims \
+     FROM public.memory_claim_item_links_v1 AS link \
+     JOIN public.memory_collected_items_v1 AS item \
+       ON item.tenant_id = link.tenant_id AND item.project = link.project \
+      AND item.accepted_event_id = link.support_event_id \
+     WHERE link.tenant_id = $1 AND link.project = $2 AND link.claim_id = ANY($3) \
+     GROUP BY item.provider ORDER BY item.provider LIMIT $4";
+
 /// The item a provider URL names (`memory_collected_items_url_idx`), as
 /// `recall(get, kind=item)` resolves it: an item a verified channel admitted
 /// under that URL first, then the greatest provider order. A capture's URL is
@@ -745,6 +763,56 @@ struct CitationRowsV1 {
 
 /// Every citation of `claim_id`, oldest first, with its item's current state
 /// and the count of distinct contents among the visible ones.
+/// The providers `claim_ids` (at most [`MAX_CITED_PROVIDER_CLAIMS`]) cite,
+/// each with how many of the claims cite it (see
+/// [`crate::ledger::ClaimLedger::claim_cited_providers`]): counts over the
+/// private links, never an item.
+///
+/// # Errors
+///
+/// More ids than the bound, a database failure, or more provider rows than
+/// any build knows.
+pub(super) async fn claim_cited_providers(
+    pool: &PgPool,
+    scope: &FleetScope,
+    claim_ids: &[i64],
+) -> Result<BTreeMap<String, u32>> {
+    if claim_ids.len() > MAX_CITED_PROVIDER_CLAIMS {
+        return Err(FleetError::Memory(format!(
+            "cited providers are read for at most {MAX_CITED_PROVIDER_CLAIMS} claims"
+        )));
+    }
+    let mut ids = claim_ids
+        .iter()
+        .copied()
+        .filter(|id| *id > 0)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let rows: Vec<(String, i64)> = sqlx::query_as(CITED_PROVIDERS_SQL)
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(&ids)
+        .bind(MAX_CITED_PROVIDER_ROWS)
+        .fetch_all(pool)
+        .await?;
+    if i64::try_from(rows.len()).unwrap_or(i64::MAX) >= MAX_CITED_PROVIDER_ROWS {
+        return Err(protocol_error(
+            "the cited claims name more providers than the bound",
+        ));
+    }
+    rows.into_iter()
+        .map(|(provider, claims)| {
+            u32::try_from(claims)
+                .map(|claims| (provider, claims))
+                .map_err(|_| protocol_error("a cited provider's claim count is outside u32"))
+        })
+        .collect()
+}
+
 ///
 /// # Errors
 ///

@@ -1,6 +1,6 @@
 //! `CockroachDB` implementation of the durable claim and conflict ledger.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ use crate::ledger::{
     ClaimLedger, ClaimMutation, ClaimState, ClaimSupport, ClaimTarget, ClaimsForKeyV1, Conflict,
     ConflictHistory, ConflictLifecycleRows, ConflictMutation, ConflictTarget, DismissalTerms,
     FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2,
-    LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest, OpenConflictsV1,
+    LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest, OpenConflictsV1, RecentClaimsV1,
     SemanticClaimHit, SupportInputV1, SupportedClaimCoordinate, SupportedClaimIds, WaiverTerms,
 };
 use crate::memory_contracts::evidence::AcceptedEventId;
@@ -926,6 +926,31 @@ impl ClaimLedger for CockroachClaimLedger {
         include_history: bool,
     ) -> Result<ClaimsForKeyV1> {
         audit_reads::claims_for_key(self, scope, claim_key, include_history).await
+    }
+
+    async fn recent_claims(&self, scope: &FleetScope, limit: usize) -> Result<RecentClaimsV1> {
+        audit_reads::recent_claims(self, scope, limit).await
+    }
+
+    async fn claims_for_subject(
+        &self,
+        scope: &FleetScope,
+        subject: &str,
+        limit: usize,
+    ) -> Result<ClaimsForKeyV1> {
+        audit_reads::claims_for_subject(self, scope, subject, limit).await
+    }
+
+    async fn claim_cited_providers(
+        &self,
+        scope: &FleetScope,
+        claim_ids: &[i64],
+    ) -> Result<BTreeMap<String, u32>> {
+        self.ensure_scope(scope)?;
+        if self.claim_item_links.is_none() {
+            return Ok(BTreeMap::new());
+        }
+        item_links::claim_cited_providers(&self.pool, scope, claim_ids).await
     }
 
     async fn conflict_ids_for_key(&self, scope: &FleetScope, claim_key: &str) -> Result<Vec<i64>> {
@@ -3017,6 +3042,7 @@ mod tests {
     use ostk_recall_core::{FacetSet, Links, PrivacyTier, Source};
     use uuid::Uuid;
 
+    use crate::ledger::{KeyClaimV1, MAX_BRIEF_CLAIMS};
     use crate::store::cockroach::ScopedChunk;
 
     struct TestEmbedder;
@@ -5750,5 +5776,226 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(residue, 0, "connected legacy key test leaked scoped rows");
+    }
+
+    /// The two brief listings over a seeded scope: three subjects, claims in
+    /// both current states, one superseded (excluded), a disputed pair with
+    /// its conflict ids attached, the recency order, the subject spans, and
+    /// each read's truncation.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one seeded scope proves both listings
+    async fn live_brief_reads_list_recent_and_subject_claims_when_configured() {
+        let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+            return;
+        };
+        let project = format!("live-brief-reads-{}", Uuid::now_v7());
+        let scope = scope(&project);
+        let store = crate::store::cockroach::CockroachStore::connect(
+            &database_url,
+            scope.clone(),
+            crate::store::cockroach::PoolConfig::default(),
+        )
+        .await
+        .unwrap();
+        store.migrate().await.unwrap();
+        store
+            .initialize_embedding_model(TestEmbedder.model_id())
+            .await
+            .unwrap();
+        let ledger = CockroachClaimLedger::new(
+            store.pool().clone(),
+            scope.clone(),
+            Arc::new(TestEmbedder),
+            RetryPolicy::default(),
+        )
+        .unwrap();
+        let claim = |subject: &str, predicate: &str, value: i64| ClaimInput {
+            kind: ClaimKind::Decision,
+            text: format!("{subject} {predicate} is {value}"),
+            subject: Some(subject.into()),
+            predicate: Some(predicate.into()),
+            value: Some(Value::from(value)),
+            polarity: 1,
+            origin: "operator_asserted".into(),
+            actor: None,
+            confidence: 1.0,
+            valid_from: None,
+            valid_to: None,
+            support: vec![SupportInputV1::Corpus(crate::ledger::ClaimSupportInput {
+                source_config_id: "runbooks".into(),
+                source: "markdown".into(),
+                source_id: format!("runbooks/{subject}.md"),
+                chunk_id: None,
+                content_sha256: None,
+                excerpt: None,
+                relation: "supports".into(),
+            })],
+        };
+        let record = |input: ClaimInput, key: &str| {
+            let ledger = &ledger;
+            let scope = &scope;
+            let key = format!("live-brief-reads/{key}");
+            async move { ledger.record_claim(scope, &input, &key).await.unwrap() }
+        };
+
+        // An empty scope lists nothing.
+        let empty = ledger.recent_claims(&scope, 8).await.unwrap();
+        assert!(empty.claims.is_empty());
+        assert!(!empty.truncated);
+        let none = ledger
+            .claims_for_subject(&scope, "final round", 8)
+            .await
+            .unwrap();
+        assert!(none.claims.is_empty());
+        assert!(!none.truncated);
+
+        // Three subjects: the subject, one continuing its words, and a
+        // shorter one; a disputed pair on the subject's batch size; and a
+        // timeout the author supersedes.
+        let batch_32 = record(claim("final round", "batch-size", 32), "batch-32").await;
+        let continued = record(claim("final-round-2", "batch-size", 8), "continued").await;
+        let shorter = record(claim("final", "batch-size", 1), "shorter").await;
+        let timeout = record(claim("Final Round", "timeout", 5), "timeout").await;
+        let batch_64 = record(claim("final_round", "batch-size", 64), "batch-64").await;
+        let conflict_id = batch_64.claim.conflict_ids[0];
+        assert_eq!(batch_64.conflicts_opened, [conflict_id]);
+        let successor = ledger
+            .supersede_claim(
+                &scope,
+                ClaimTarget {
+                    claim_id: timeout.claim.id,
+                    expected_revision: timeout.claim.revision,
+                },
+                None,
+                &claim("final round", "timeout", 6),
+                "live-brief-reads/timeout-2",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            successor.claim.claim_key.as_deref(),
+            Some("final-round::timeout")
+        );
+        let ids = |claims: &[KeyClaimV1]| {
+            claims
+                .iter()
+                .map(|entry| entry.claim.id)
+                .collect::<Vec<_>>()
+        };
+
+        // Recency: the successor changed last, then the pair the dispute
+        // touched, then the untouched ones; the superseded claim is absent.
+        let recent = ledger
+            .recent_claims(&scope, MAX_BRIEF_CLAIMS)
+            .await
+            .unwrap();
+        assert!(!recent.truncated);
+        let listed = ids(&recent.claims);
+        assert_eq!(listed.len(), 5, "{listed:?}");
+        assert_eq!(listed[0], successor.claim.id);
+        let mut disputed = listed[1..3].to_vec();
+        disputed.sort_unstable();
+        assert_eq!(disputed, [batch_32.claim.id, batch_64.claim.id]);
+        assert_eq!(listed[3], shorter.claim.id);
+        assert_eq!(listed[4], continued.claim.id);
+        assert!(!listed.contains(&timeout.claim.id));
+        for entry in &recent.claims {
+            assert!(matches!(
+                entry.claim.state,
+                ClaimState::Active | ClaimState::Disputed
+            ));
+            assert_eq!(entry.claim.support.len(), 1, "{entry:?}");
+            assert_eq!(entry.claim.support[0].source_config_id, "runbooks");
+            assert!(!entry.value_elided);
+            let expected_conflicts = if entry.claim.state == ClaimState::Disputed {
+                vec![conflict_id]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(entry.claim.conflict_ids, expected_conflicts, "{entry:?}");
+        }
+        let cut = ledger.recent_claims(&scope, 2).await.unwrap();
+        assert!(cut.truncated);
+        assert_eq!(ids(&cut.claims), listed[..2]);
+        assert!(ledger.recent_claims(&scope, 0).await.is_err());
+        assert!(
+            ledger
+                .recent_claims(&scope, MAX_BRIEF_CLAIMS + 1)
+                .await
+                .is_err()
+        );
+
+        // The subject: its own keys and the continuing subject's, in key
+        // then recording order; not the shorter subject's.
+        let subject = ledger
+            .claims_for_subject(&scope, " Final Round ", MAX_BRIEF_CLAIMS)
+            .await
+            .unwrap();
+        assert!(!subject.truncated);
+        assert_eq!(
+            ids(&subject.claims),
+            [
+                continued.claim.id,
+                batch_32.claim.id,
+                batch_64.claim.id,
+                successor.claim.id
+            ]
+        );
+        assert_eq!(subject.claims[1].claim.conflict_ids, [conflict_id]);
+        assert_eq!(subject.claims[1].claim.state, ClaimState::Disputed);
+        assert_eq!(subject.claims[3].claim.support.len(), 1);
+        let cut = ledger
+            .claims_for_subject(&scope, "final round", 1)
+            .await
+            .unwrap();
+        assert!(cut.truncated);
+        assert_eq!(ids(&cut.claims), [continued.claim.id]);
+        // The shorter subject's brief covers every subject continuing it.
+        let shorter_subject = ledger
+            .claims_for_subject(&scope, "final", MAX_BRIEF_CLAIMS)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&shorter_subject.claims),
+            [
+                continued.claim.id,
+                batch_32.claim.id,
+                batch_64.claim.id,
+                successor.claim.id,
+                shorter.claim.id
+            ]
+        );
+        // A subject with no claims, or no words, reads as such.
+        let other = ledger
+            .claims_for_subject(&scope, "final rounds", 8)
+            .await
+            .unwrap();
+        assert!(other.claims.is_empty());
+        assert!(ledger.claims_for_subject(&scope, " _ ", 8).await.is_err());
+        assert!(ledger.claims_for_subject(&scope, "x", 0).await.is_err());
+        // Without claim item links, nothing is cited and nothing is read.
+        assert!(
+            ledger
+                .claim_cited_providers(&scope, &listed)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        for statement in [
+            "DELETE FROM memory_mutation_receipts WHERE tenant_id = $1 AND project = $2",
+            "DELETE FROM memory_events WHERE tenant_id = $1 AND project = $2",
+            "DELETE FROM memory_conflicts WHERE tenant_id = $1 AND project = $2",
+            "DELETE FROM memory_claims WHERE tenant_id = $1 AND project = $2",
+            "DELETE FROM memory_chunks WHERE tenant_id = $1 AND project = $2",
+            "DELETE FROM memory_corpus_models WHERE tenant_id = $1 AND project = $2",
+        ] {
+            sqlx::query(statement)
+                .bind(scope.tenant_id)
+                .bind(&scope.project)
+                .execute(store.pool())
+                .await
+                .unwrap();
+        }
     }
 }
