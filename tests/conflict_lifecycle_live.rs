@@ -5638,3 +5638,98 @@ async fn live_concurrent_dismiss_and_join_refuses_stale_member_count_when_config
     second.pool().close().await;
     fleet.cleanup().await;
 }
+
+/// `include_transcript_default` and `include-transcript default` are one
+/// key: two agents affirming different values for them open one v2 conflict
+/// (the trial's conflict scenario, steps 1 and 4), and `recall(status)` counts
+/// no legacy key in the project.
+#[tokio::test]
+async fn live_underscore_and_space_spellings_share_one_claim_key_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "underscore-key").await;
+    let setting = |subject: &str, value: bool| ClaimInput {
+        kind: ClaimKind::Decision,
+        text: format!("the transcript setting {subject} is {value}"),
+        subject: Some(subject.into()),
+        predicate: Some("enabled".into()),
+        value: Some(json!(value)),
+        polarity: 1,
+        origin: "operator_asserted".into(),
+        actor: None,
+        confidence: 1.0,
+        valid_from: None,
+        valid_to: None,
+        support: Vec::new(),
+    };
+
+    let underscored = fleet
+        .record(
+            AGENT_A,
+            &setting("include_transcript_default", true),
+            "a/underscored",
+        )
+        .await;
+    assert_eq!(
+        underscored.claim.claim_key.as_deref(),
+        Some("include-transcript-default::enabled")
+    );
+    assert!(underscored.conflicts_opened.is_empty());
+
+    let spaced = fleet
+        .record(
+            AGENT_B,
+            &setting("include-transcript default", false),
+            "b/spaced",
+        )
+        .await;
+    assert_eq!(spaced.claim.claim_key, underscored.claim.claim_key);
+    assert_eq!(spaced.conflicts_opened.len(), 1);
+    let conflict_id = spaced.conflicts_opened[0];
+    let conflict = fleet.conflict(conflict_id).await;
+    assert_eq!(conflict.state, "open");
+    assert_eq!(conflict.detector, "same_key_functional_value_v2");
+    assert_eq!(conflict.claim_key, "include-transcript-default::enabled");
+    let mut members = conflict
+        .members
+        .iter()
+        .map(|member| member.id)
+        .collect::<Vec<_>>();
+    members.sort_unstable();
+    let mut expected = vec![underscored.claim.id, spaced.claim.id];
+    expected.sort_unstable();
+    assert_eq!(members, expected);
+    assert_eq!(
+        fleet.claim(underscored.claim.id).await.state,
+        ClaimState::Disputed
+    );
+    assert_eq!(
+        fleet.claim(spaced.claim.id).await.state,
+        ClaimState::Disputed
+    );
+
+    // Every key in this project was written under the current rule.
+    let service = fleet.full_service(AGENT_A);
+    let status = recall(
+        &service,
+        &fleet.scope(AGENT_A),
+        RecallAction::Status,
+        json!({}),
+    )
+    .await
+    .expect("status is served");
+    assert_eq!(status.data["legacy_claim_keys"], json!(0));
+    assert!(
+        !status
+            .warnings
+            .iter()
+            .any(|warning| warning["code"] == "legacy_claim_keys"
+                || warning["code"] == "legacy_claim_keys_unavailable"),
+        "{:?}",
+        status.warnings
+    );
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}

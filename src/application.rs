@@ -21,7 +21,7 @@ use crate::item_recall::{
 use crate::ledger::{
     Claim, ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict,
     ConflictMutation, ConflictTarget, DismissalTerms, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
-    ITEM_SUPPORT_SOURCE_CONFIG_ID, LifecycleMutation, LifecycleReplayRequest,
+    ITEM_SUPPORT_SOURCE_CONFIG_ID, LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest,
     MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT, SemanticClaimHit, SupportedClaimCoordinate,
     WaiverTerms, derive_overlay, history_within_bytes, overlay_episode_revision,
     unlogged_transitions, validate_lifecycle_reason, validate_rationale, validate_waiver_hours,
@@ -1123,7 +1123,11 @@ impl CockroachMemoryService {
         }
     }
 
-    async fn recall_status(&self, arguments: Map<String, Value>) -> ServiceResult<RecallResult> {
+    async fn recall_status(
+        &self,
+        scope: &FleetScope,
+        arguments: Map<String, Value>,
+    ) -> ServiceResult<RecallResult> {
         let _: EmptyArgs = from_arguments(arguments, "recall status")?;
         let capabilities = self.corpus.capabilities().await.map_err(service_error)?;
         let mut result = RecallResult::new(json!({
@@ -1141,12 +1145,14 @@ impl CockroachMemoryService {
         if let Some(status) = &self.capture_status {
             result.data["remember_capture"] = json!(status);
         }
-        let (evidence, spec_conformance) = optional_status_blocks(
-            self.evidence.as_deref(),
-            self.spec_conformance.as_deref(),
-            OPTIONAL_STATUS_DEADLINE,
-        )
-        .await;
+        let ((evidence, spec_conformance), (legacy_claim_keys, legacy_warnings)) = tokio::join!(
+            optional_status_blocks(
+                self.evidence.as_deref(),
+                self.spec_conformance.as_deref(),
+                OPTIONAL_STATUS_DEADLINE,
+            ),
+            legacy_claim_keys_within(self.ledger.as_ref(), scope, OPTIONAL_STATUS_DEADLINE),
+        );
         for (name, block) in [
             ("evidence", evidence),
             ("spec_conformance", spec_conformance),
@@ -1156,6 +1162,8 @@ impl CockroachMemoryService {
                 result.warnings.extend(warnings);
             }
         }
+        result.data["legacy_claim_keys"] = legacy_claim_keys;
+        result.warnings.extend(legacy_warnings);
         result.conflict_coverage = ConflictCoverage::not_evaluated();
         Ok(result)
     }
@@ -1845,7 +1853,7 @@ impl FleetMemoryService for CockroachMemoryService {
             RecallAction::Search => self.recall_search(&scope, request.arguments).await,
             RecallAction::Get => self.recall_get(&scope, request.arguments).await,
             RecallAction::Conflicts => self.recall_conflicts(&scope, request.arguments).await,
-            RecallAction::Status => self.recall_status(request.arguments).await,
+            RecallAction::Status => self.recall_status(&scope, request.arguments).await,
             RecallAction::Discrepancies => self.recall_discrepancies(request.arguments).await,
             action => Err(ServiceError::InvalidRequest(format!(
                 "recall({}) is not implemented yet",
@@ -2751,6 +2759,62 @@ async fn optional_status_blocks(
         }
     };
     tokio::join!(evidence, spec_conformance)
+}
+
+/// `recall(status).legacy_claim_keys` and the warnings it adds: how many of
+/// the project's lifecycle-current claims still carry a key written before
+/// `_` became a key separator, so the conflicts the old keys hide are visible
+/// rather than silent. The count is a lower bound once the bounded scan
+/// fills up, and a failed or slow read is `null` with a warning, never a
+/// failed status.
+async fn legacy_claim_keys_within(
+    ledger: &dyn ClaimLedger,
+    scope: &FleetScope,
+    deadline: std::time::Duration,
+) -> (Value, Vec<Value>) {
+    let legacy = tokio::time::timeout(deadline, ledger.legacy_claim_keys(scope))
+        .await
+        .unwrap_or_else(|_| {
+            Err(FleetError::Memory(format!(
+                "the legacy claim key read did not finish within {}s",
+                deadline.as_secs_f32()
+            )))
+        });
+    legacy_claim_keys_block(legacy)
+}
+
+/// The status field and warnings for one legacy claim key read.
+fn legacy_claim_keys_block(legacy: crate::Result<LegacyClaimKeysV1>) -> (Value, Vec<Value>) {
+    match legacy {
+        Ok(legacy) => {
+            let mut warnings = Vec::new();
+            if legacy.count > 0 {
+                let bound = if legacy.bound_exceeded {
+                    "at least "
+                } else {
+                    ""
+                };
+                warnings.push(json!({
+                    "code": "legacy_claim_keys",
+                    "message": format!(
+                        "{bound}{} lifecycle-current claims carry a key written before `_` became a key separator, so a claim recorded since under the same words takes another key and no conflict between them is detected; supersede each with the same subject and predicate to move it onto its current key",
+                        legacy.count
+                    ),
+                }));
+            }
+            (json!(legacy.count), warnings)
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "legacy claim key read failed");
+            (
+                Value::Null,
+                vec![json!({
+                    "code": "legacy_claim_keys_unavailable",
+                    "message": "the count of claims keyed under the earlier normalizer could not be read; remember and recall are still served",
+                })],
+            )
+        }
+    }
 }
 
 /// `recall(status).spec_conformance` and the warnings it adds. A failed or
@@ -5464,6 +5528,67 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, ServiceError::Internal(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn legacy_claim_keys_status_counts_warns_or_reports_unavailable() {
+        // No legacy rows: the count alone, no warning.
+        let (value, warnings) = legacy_claim_keys_block(Ok(LegacyClaimKeysV1::default()));
+        assert_eq!(value, json!(0));
+        assert!(warnings.is_empty());
+
+        // Legacy rows are visible as a count and a warning naming the exit.
+        let (value, warnings) = legacy_claim_keys_block(Ok(LegacyClaimKeysV1 {
+            count: 3,
+            bound_exceeded: false,
+        }));
+        assert_eq!(value, json!(3));
+        assert_eq!(warning_codes(&warnings), ["legacy_claim_keys"]);
+        let message = warnings[0]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("3 lifecycle-current claims"),
+            "{message}"
+        );
+        assert!(message.contains("supersede"), "{message}");
+
+        // A full scan reports a lower bound.
+        let (value, warnings) = legacy_claim_keys_block(Ok(LegacyClaimKeysV1 {
+            count: 256,
+            bound_exceeded: true,
+        }));
+        assert_eq!(value, json!(256));
+        assert_eq!(warning_codes(&warnings), ["legacy_claim_keys"]);
+        assert!(
+            warnings[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("at least 256 lifecycle-current claims")
+        );
+
+        // A failed read is null with a warning, never a failed status.
+        let (value, warnings) =
+            legacy_claim_keys_block(Err(FleetError::Memory("database unreachable".into())));
+        assert_eq!(value, Value::Null);
+        assert_eq!(warning_codes(&warnings), ["legacy_claim_keys_unavailable"]);
+
+        // And so is one against an unreachable database, inside the deadline.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgresql://root@127.0.0.1:1/offline")
+            .unwrap();
+        let ledger = CockroachClaimLedger::new(
+            pool,
+            offline_scope(),
+            Arc::new(UnitEmbedder),
+            RetryPolicy::default(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let (value, warnings) =
+            legacy_claim_keys_within(&ledger, &offline_scope(), OPTIONAL_STATUS_DEADLINE).await;
+        assert!(started.elapsed() < OPTIONAL_STATUS_DEADLINE);
+        assert_eq!(value, Value::Null);
+        assert_eq!(warning_codes(&warnings), ["legacy_claim_keys_unavailable"]);
     }
 
     #[tokio::test]
