@@ -1596,9 +1596,8 @@ async fn live_search_answers_query_syntax_and_unembeddable_queries_when_configur
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)] // private and publication surfaces over one corpus
-async fn live_private_search_hides_retracted_synthetic_chunk_publication_unchanged_when_configured()
-{
+#[allow(clippy::too_many_lines)] // private, record-only, and publication surfaces over one corpus
+async fn live_private_and_publication_search_hide_retracted_synthetic_chunk_when_configured() {
     let Some(database_url) = database_url() else {
         return;
     };
@@ -1606,6 +1605,13 @@ async fn live_private_search_hides_retracted_synthetic_chunk_publication_unchang
     let scope = fleet.scope(AGENT_A);
     let private = fleet.service(AGENT_A, PRIVATE_WRITER);
     let record_only = fleet.service(AGENT_A, LifecycleServing::default());
+    let publication = CockroachMemoryService::publication(
+        fleet.scope("demo"),
+        Arc::new(fleet.store.clone()),
+        Arc::new(fleet.ledger("demo")),
+        Arc::new(UnitEmbedder),
+    )
+    .expect("publication service");
 
     let x = fleet
         .record(AGENT_A, &decision("quokkaledger", &json!("x"), 1), "a/x")
@@ -1662,15 +1668,47 @@ async fn live_private_search_hides_retracted_synthetic_chunk_publication_unchang
     );
     assert!(after.conflicts.is_empty(), "no open conflict is projected");
 
-    let publication = recall(&record_only, &scope, RecallAction::Search, query)
+    // An unprobed record-only writer keeps serving the retracted chunk; the
+    // public demo drops it like the private writer and says what it hid.
+    let unfiltered = recall(&record_only, &scope, RecallAction::Search, query.clone())
         .await
         .unwrap();
-    assert!(hit_ids(&publication).contains(&x_chunk));
+    assert!(hit_ids(&unfiltered).contains(&x_chunk));
     assert!(
-        publication.diagnostics["retrieval"]
+        unfiltered.diagnostics["retrieval"]
             .get("lifecycle_hidden_claim_ids")
             .is_none()
     );
+    let public = recall(
+        &publication,
+        &fleet.scope("demo"),
+        RecallAction::Search,
+        query,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !hit_ids(&public).contains(&x_chunk),
+        "{:?}",
+        hit_ids(&public)
+    );
+    assert!(hit_ids(&public).contains(&y_chunk));
+    assert_eq!(
+        public.diagnostics["retrieval"]["lifecycle_hidden_claim_ids"],
+        json!([x.claim.id])
+    );
+    // And the retracted claim itself still reads by id, as history.
+    let public_claim = recall(
+        &publication,
+        &fleet.scope("demo"),
+        RecallAction::Get,
+        json!({ "kind": "claim", "id": x.claim.id }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(public_claim.data["claim"]["state"], "retracted");
+    assert!(public_claim.data.get("history").is_none());
+    assert!(public_claim.data.get("remember_surface").is_none());
 
     // Conflict lookup by id is part of the lifecycle surface only.
     let lookup = recall(

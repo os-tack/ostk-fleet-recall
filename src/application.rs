@@ -73,8 +73,9 @@ const MAX_CONFLICT_LOOKUP_BYTES: usize = 576 * 1024;
 /// Which lifecycle behaviour a service instance serves.
 ///
 /// The default is the historical record-only surface with no lifecycle
-/// filtering, which the public recall process always keeps; that process
-/// withholds only asserted claims ([`CockroachMemoryService::publication`]).
+/// filtering. The public recall process keeps that surface but hides
+/// non-current claim chunks and withholds asserted claims
+/// ([`CockroachMemoryService::publication`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LifecycleServing {
     /// The `remember` actions served and advertised in `tools/list`.
@@ -231,6 +232,12 @@ impl CockroachMemoryService {
     ) -> crate::Result<Self> {
         let mut service = Self::new(trusted_scope, corpus, ledger, embedder)?;
         service.withhold_asserted_claims = true;
+        // The public demo serves what is current: a retracted or superseded
+        // claim's synthetic chunk is dropped from chunk search (and the page
+        // refilled), as the private writer drops it, and
+        // `lifecycle_hidden_claim_ids` names what was hidden. The lifecycle
+        // surface itself stays record-only.
+        service.lifecycle.hide_non_current_claim_chunks = true;
         Ok(service)
     }
 
