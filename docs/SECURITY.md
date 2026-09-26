@@ -436,9 +436,21 @@ writes the bodies in plaintext to `memory_body_objects_v1`, which the writer
 login, and so `serve`, reads without the key. Once a body is projected, the
 key no longer limits who can read it, and destroying the key no longer erases
 it: erasure must also purge the body rows and the lexical and dense rows
-derived from them (ADR 0006 D9). Git ingress redaction is deferred, so git
-bodies are raw commit text; the lexical recall text that evidence recall
-returns is redacted. `ostk-spec check` needs the key too. `serve` needs it
+derived from them (ADR 0006 D9). Every ingress redacts under one profile
+(`REDACTION_PROFILE_VERSION`, profile 3: the six shared shapes plus the
+provider shapes, Stripe included): a transcript turn is redacted before the
+outbox, a git fact's message, author, committer, and path before its ingress
+is built, and the lexical recall text that evidence recall returns is
+redacted again before the row is written. Residual: facts are
+content-addressed, so a body admitted before profile 3 stays raw at rest;
+only its recall text is redacted, on the first worker tick after deploy,
+which re-projects every lexical row stored under an older normalization
+version (`rows_reprojected`). On that tick the git step also re-walks each
+ref from the root, and every historical commit whose text is now redacted
+re-presents with a different payload under the same source-fact identity
+and lands in quarantine as a `PreimageDisagreement`: expect a one-time
+`quarantined` count equal to the number of such commits. Closing that
+residual needs supersession or erasure. `ostk-spec check` needs the key too. `serve` needs it
 only with `FLEET_RECALL_COLLECTED_CAPTURE=enabled`, which admits captures in
 the call; `stage_only` leaves admission to the worker and keeps the key out
 of `serve`.
