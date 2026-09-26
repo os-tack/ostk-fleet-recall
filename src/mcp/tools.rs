@@ -124,13 +124,13 @@ fn scope_schema() -> Value {
 pub fn recall_tool() -> Value {
     json!({
         "name": "recall",
-        "description": "Read fleet memory without changing semantic state. Search combines lexical and dense retrieval and reports conflict coverage.",
+        "description": with_brief("Read fleet memory without changing semantic state. Search combines lexical and dense retrieval and reports conflict coverage."),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["search", "get", "conflicts", "status"]
+                    "enum": ["search", "get", "conflicts", "status", "brief"]
                 },
                 "scope": scope_schema(),
                 "query": { "type": "string", "minLength": 1, "maxLength": 100_000 },
@@ -157,7 +157,7 @@ pub fn recall_tool() -> Value {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 4096,
-                    "description": "get with kind=claim: with predicate, the key's parts; the server normalizes them exactly as record does (case, whitespace, `_` and `-` are one separator) and looks the key up."
+                    "description": "get with kind=claim: with predicate, the key's parts; the server normalizes them exactly as record does (case, whitespace, `_` and `-` are one separator) and looks the key up. brief: the subject to brief on."
                 },
                 "predicate": {
                     "type": "string",
@@ -205,11 +205,60 @@ pub fn recall_tool() -> Value {
                         },
                         "required": ["kind"]
                     }
-                }
+                },
+                brief_branch()
             ]
         },
         "outputSchema": output_schema("recall")
     })
+}
+
+/// The base schema's `brief` branch: only `subject` and a claim bound of
+/// its own; every search, get, and conflicts field is forbidden.
+fn brief_branch() -> Value {
+    json!({
+        "if": {
+            "properties": { "action": { "const": "brief" } },
+            "required": ["action"]
+        },
+        "then": {
+            "properties": {
+                "query": false,
+                "kind": false,
+                "id": false,
+                "key": false,
+                "predicate": false,
+                "claim_key": false,
+                "include_history": false,
+                "include_resolved": false,
+                "source": false,
+                "intent": false,
+                "max_per_source_id": false,
+                "min_score": false,
+                "subject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "brief: the subject to brief on, normalized as record normalizes a key part; without it, the scope at a glance."
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 32,
+                    "minimum": 1,
+                    "maximum": 64,
+                    "description": "brief: how many claims to list."
+                }
+            }
+        }
+    })
+}
+
+/// What `recall`'s description says about `brief` on every surface.
+const BRIEF_DESCRIPTION: &str = "brief: call it first. With subject, every current claim whose key starts with that subject, the open conflicts on them, and the health of the sources those claims cite. Without subject, the scope at a glance: the most recently changed current claims, every open conflict, stale or failed sources, projection lag, legacy keys, quarantine, and the absence contract. Nothing in a brief is third-party text.";
+
+/// A `recall` description with the `brief` sentence appended.
+fn with_brief(description: &str) -> String {
+    format!("{description} {BRIEF_DESCRIPTION}")
 }
 
 #[must_use]
@@ -292,17 +341,17 @@ pub fn recall_tool_for(surface: RememberSurface) -> Value {
         return tool;
     }
     tool["description"] = if surface.serves_adjudication() {
-        json!(
+        json!(with_brief(
             "Read fleet memory without changing semantic state. Search combines lexical and dense retrieval and reports conflict coverage. Every conflict carries its lifecycle (open, acknowledged, waived, resolved, dismissed) and who acknowledged, waived, or closed it; a waived conflict is still returned, with its waiver's reason, expiry, and whether it still applies. get with kind=conflict returns one conflict by id in any state, with its members and its lifecycle history."
-        )
+        ))
     } else if surface.conflict_lifecycle {
-        json!(
+        json!(with_brief(
             "Read fleet memory without changing semantic state. Search combines lexical and dense retrieval and reports conflict coverage. Every conflict carries its lifecycle (open, acknowledged, resolved, ...) and who acknowledged or closed it. get with kind=conflict returns one conflict by id in any state, with its members and its lifecycle history."
-        )
+        ))
     } else {
-        json!(
+        json!(with_brief(
             "Read fleet memory without changing semantic state. Search combines lexical and dense retrieval and reports conflict coverage. get with kind=conflict returns one conflict by id in any state, with its members."
-        )
+        ))
     };
     let schema = &mut tool["inputSchema"];
     schema["properties"]["kind"]["enum"] = json!(["chunk", "claim", "assertion", "conflict"]);
@@ -1351,7 +1400,7 @@ mod tests {
         assert!(tools[0]["inputSchema"]["properties"].get("actor").is_none());
         assert_eq!(
             tools[0]["inputSchema"]["properties"]["action"]["enum"],
-            json!(["search", "get", "conflicts", "status"])
+            json!(["search", "get", "conflicts", "status", "brief"])
         );
         let history_constraint = &tools[0]["inputSchema"]["allOf"][2];
         assert_eq!(
@@ -1385,9 +1434,101 @@ mod tests {
             );
         }
         assert_eq!(
+            tools[0]["inputSchema"]["allOf"].as_array().unwrap().len(),
+            4
+        );
+        assert_eq!(
             tools[1]["inputSchema"]["properties"]["action"]["enum"],
             json!(["record"])
         );
+    }
+
+    #[test]
+    fn brief_takes_only_a_subject_and_a_claim_bound_and_says_call_it_first() {
+        let tool = recall_tool();
+        let brief_constraint = &tool["inputSchema"]["allOf"][3];
+        assert_eq!(
+            brief_constraint["if"]["properties"]["action"]["const"],
+            "brief"
+        );
+        assert_eq!(brief_constraint["if"]["required"], json!(["action"]));
+        assert_eq!(
+            forbidden_by(brief_constraint),
+            [
+                "claim_key",
+                "id",
+                "include_history",
+                "include_resolved",
+                "intent",
+                "key",
+                "kind",
+                "max_per_source_id",
+                "min_score",
+                "predicate",
+                "query",
+                "source",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            brief_constraint["then"]["properties"]["subject"]["type"],
+            "string"
+        );
+        assert_eq!(
+            brief_constraint["then"]["properties"]["limit"]["default"],
+            32
+        );
+        assert_eq!(
+            brief_constraint["then"]["properties"]["limit"]["maximum"],
+            64
+        );
+        assert!(brief_constraint["then"].get("required").is_none());
+        assert!(
+            tool["inputSchema"]["properties"]["subject"]["description"]
+                .as_str()
+                .is_some_and(|description| description.ends_with("brief: the subject to brief on."))
+        );
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.ends_with(BRIEF_DESCRIPTION), "{description}");
+        assert!(description.contains("brief: call it first."));
+        assert!(description.ends_with("Nothing in a brief is third-party text."));
+    }
+
+    #[test]
+    fn brief_is_served_and_described_on_every_surface() {
+        for remember in [
+            RememberSurface::RECORD_ONLY,
+            lifecycle_surface(),
+            conflict_surface(),
+            adjudication_surface(),
+            asserting(conflict_surface()),
+        ] {
+            for recall in [
+                RecallSurface::NONE,
+                RecallSurface {
+                    evidence: true,
+                    discrepancies: true,
+                    items: true,
+                },
+            ] {
+                let tool = recall_tool_for_surfaces(remember, recall);
+                let actions = tool["inputSchema"]["properties"]["action"]["enum"]
+                    .as_array()
+                    .unwrap();
+                assert!(actions.contains(&json!("brief")), "{remember:?} {recall:?}");
+                assert_eq!(actions[4], "brief");
+                let description = tool["description"].as_str().unwrap();
+                assert!(
+                    description.contains(BRIEF_DESCRIPTION),
+                    "{remember:?} {recall:?}: {description}"
+                );
+                assert_eq!(description.matches("brief: call it first.").count(), 1);
+                let branch = branch_for(&tool, "brief");
+                assert!(forbidden_by(branch).contains("query"));
+                assert_eq!(branch["then"]["properties"]["limit"]["maximum"], 64);
+            }
+        }
     }
 
     fn lifecycle_surface() -> RememberSurface {
@@ -2235,10 +2376,10 @@ mod tests {
         );
         let branches = schema["allOf"].as_array().unwrap();
         assert_eq!(
-            branches[..3],
+            branches[..4],
             recall_tool()["inputSchema"]["allOf"].as_array().unwrap()[..]
         );
-        let conflict = &branches[3];
+        let conflict = &branches[4];
         assert_eq!(conflict["if"]["properties"]["kind"]["const"], "conflict");
         assert_eq!(conflict["if"]["required"], json!(["kind"]));
         assert_eq!(conflict["then"]["properties"]["action"]["const"], "get");

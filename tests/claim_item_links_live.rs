@@ -1910,3 +1910,166 @@ async fn live_a_hit_on_an_item_a_disputed_claim_cites_says_so_when_configured() 
             .is_none()
     );
 }
+
+/// A subject brief on the private writer names the providers its claims
+/// cite, as counts; the publication reader's brief withholds asserted
+/// claims, strips item support, and names no provider. Neither carries
+/// item text.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one citing claim followed through both readers
+async fn live_brief_names_cited_providers_privately_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "claim-links-brief").await;
+    let [heron] = fleet.admit(&[&HERON]).await[..] else {
+        panic!("one item is staged");
+    };
+    let scope = fleet.scope(AGENT_A);
+    let service = fleet.service(AGENT_A).await;
+
+    // A records a claim citing the heron message, and asserts another.
+    let recorded = service
+        .remember(
+            scope.clone(),
+            RememberRequest::new(
+                RememberAction::Record,
+                Some("claim-links-brief-record".into()),
+                arguments(json!({
+                    "kind": "fact",
+                    "text": "The heron retry budget is four attempts.",
+                    "subject": "heron",
+                    "predicate": "retry-budget",
+                    "value": 4,
+                    "support": [
+                        { "item": { "url": permalink(HERON.ts) }, "relation": "quotes" }
+                    ]
+                })),
+            ),
+        )
+        .await
+        .expect("a record citing an admitted item is written");
+    let claim_id = recorded.data["claim"]["id"].as_i64().unwrap();
+    let asserted = fleet
+        .ledger(AGENT_A)
+        .await
+        .assert_claim(&scope, &assertion(true, &[]), "claim-links-brief-assert")
+        .await
+        .expect("A asserts");
+    let asserted_id = asserted.mutation.claim.id;
+    let ids = |claims: &Value| -> Vec<i64> {
+        claims
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|claim| claim["id"].as_i64().unwrap())
+            .collect()
+    };
+    let secrets = [
+        heron.item.to_string(),
+        HERON.ts.to_owned(),
+        SLACK_CHANNEL.to_owned(),
+        HERON.text.to_owned(),
+    ];
+
+    // The private subject brief: the claim, its opaque support row, and
+    // the provider it cites, counted.
+    let brief = service
+        .recall(
+            scope.clone(),
+            RecallRequest::new(
+                RecallAction::Brief,
+                arguments(json!({ "subject": "Heron" })),
+            ),
+        )
+        .await
+        .expect("the subject brief is served");
+    assert_eq!(brief.data["subject"], "heron");
+    assert_eq!(ids(&brief.data["claims"]), [claim_id]);
+    let support = brief.data["claims"][0]["support"].as_array().unwrap();
+    assert_eq!(support.len(), 1);
+    assert_eq!(support[0]["source_config_id"], "fleet.item");
+    assert_eq!(brief.data["cited_providers"], json!({ "slack": 1 }));
+    assert!(brief.data["absence_contract"].is_object());
+    assert!(brief.data.get("sources").is_none());
+    assert!(brief.warnings.is_empty(), "{:?}", brief.warnings);
+    let wire = serde_json::to_string(&brief.data).unwrap();
+    for secret in &secrets {
+        assert!(!wire.contains(secret), "{wire}");
+    }
+    // An unrelated subject cites nothing.
+    let other = service
+        .recall(
+            scope.clone(),
+            RecallRequest::new(
+                RecallAction::Brief,
+                arguments(json!({ "subject": "pelican" })),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(other.data["claims"].as_array().unwrap().is_empty());
+    assert_eq!(other.data["cited_providers"], json!({}));
+
+    // The private scope brief lists the asserted claim too, and names no
+    // provider: citations are a subject's question.
+    let brief = service
+        .recall(
+            scope.clone(),
+            RecallRequest::new(RecallAction::Brief, arguments(json!({}))),
+        )
+        .await
+        .unwrap();
+    let mut recent = ids(&brief.data["recent_claims"]);
+    recent.sort_unstable();
+    assert_eq!(recent, [claim_id, asserted_id]);
+    assert!(brief.data.get("cited_providers").is_none());
+
+    // The publication reader: no asserted claim, no item support row, no
+    // provider, no quarantine.
+    let publication = CockroachMemoryService::publication(
+        scope.clone(),
+        Arc::new(CockroachStore::from_pool(fleet.pool.clone(), scope.clone()).unwrap()),
+        Arc::new(fleet.ledger_over(&fleet.pool, AGENT_A, None).await),
+        Arc::new(StubEmbedder),
+    )
+    .expect("publication service");
+    let brief = publication
+        .recall(
+            scope.clone(),
+            RecallRequest::new(RecallAction::Brief, arguments(json!({}))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&brief.data["recent_claims"]), [claim_id]);
+    assert!(
+        brief.data["recent_claims"][0]["support"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(brief.data.get("quarantine").is_none());
+    assert!(brief.data.get("cited_providers").is_none());
+    let brief = publication
+        .recall(
+            scope.clone(),
+            RecallRequest::new(
+                RecallAction::Brief,
+                arguments(json!({ "subject": "heron" })),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&brief.data["claims"]), [claim_id]);
+    assert!(
+        brief.data["claims"][0]["support"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(brief.data.get("cited_providers").is_none());
+    let wire = serde_json::to_string(&brief.data).unwrap();
+    for secret in &secrets {
+        assert!(!wire.contains(secret), "{wire}");
+    }
+}

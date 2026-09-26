@@ -25,6 +25,10 @@ pub enum RecallAction {
     /// Spec-nonconformance episodes and every live spec's latest check
     /// (ADR 0007); served only where [`RecallSurface::discrepancies`] is.
     Discrepancies,
+    /// One call to orient an agent: what the fleet currently believes about
+    /// a subject (`subject`), or the scope at a glance. Served on every
+    /// surface, like `status`.
+    Brief,
 }
 
 impl RecallAction {
@@ -40,6 +44,7 @@ impl RecallAction {
             Self::Status => "status",
             Self::Audit => "audit",
             Self::Discrepancies => "discrepancies",
+            Self::Brief => "brief",
         }
     }
 }

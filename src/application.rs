@@ -1,6 +1,7 @@
 //! Cockroach-backed implementation of the backend-neutral memory service.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::str::FromStr as _;
 use std::sync::Arc;
 
@@ -8,13 +9,14 @@ use async_trait::async_trait;
 use ostk_recall_core::{
     ChunkEmbedder, CorpusFilter, RankingOverrides, RecallHit, RecallIntent, RecallParams,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::evidence_recall::{
     ABSENCE_DENSE_MIN_COSINE_SIMILARITY, ABSENCE_NEIGHBOUR_BAND_FLOOR, EvidenceDenseLaneV1,
     EvidenceReadinessV1, EvidenceRecall, EvidenceSearchV1, EvidenceSourceFilterV1,
-    EvidenceSourceV1, EvidenceSourcesV1, MAX_EVIDENCE_SEARCH_LIMIT, MAX_EVIDENCE_SOURCES,
+    EvidenceSourceV1, EvidenceSourcesV1, EvidenceStatusV1, MAX_EVIDENCE_SEARCH_LIMIT,
+    MAX_EVIDENCE_SOURCES,
 };
 use crate::item_recall::{
     ItemRecall, ItemReferenceV1, ItemSearchRequestV1, ItemSearchV1, MAX_ITEM_SEARCH_LIMIT,
@@ -23,11 +25,11 @@ use crate::ledger::{
     Claim, ClaimHistoryV1, ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget,
     Conflict, ConflictMutation, ConflictTarget, DismissalTerms,
     FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, ITEM_SUPPORT_SOURCE_CONFIG_ID, KeyClaimV1,
-    LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest, MAX_CLAIM_HIT_VALUE_BYTES,
-    MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT, SemanticClaimHit, SupportedClaimCoordinate,
-    WaiverTerms, claim_key_from_parts, derive_overlay, history_within_bytes,
-    overlay_episode_revision, unlogged_transitions, validate_lifecycle_reason, validate_rationale,
-    validate_waiver_hours,
+    LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest, MAX_BRIEF_CLAIMS,
+    MAX_CLAIM_HIT_VALUE_BYTES, MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT, OpenConflictsV1,
+    SemanticClaimHit, SupportedClaimCoordinate, WaiverTerms, claim_key_from_parts, derive_overlay,
+    history_within_bytes, normalize_key_part, overlay_episode_revision, unlogged_transitions,
+    validate_lifecycle_reason, validate_rationale, validate_waiver_hours,
 };
 use crate::memory_contracts::collected_item::ProviderKindV1;
 use crate::memory_contracts::digest::Sha256Digest;
@@ -69,6 +71,10 @@ const SYNTHETIC_CLAIM_SOURCE: &str = "ostk_memory";
 /// stays well inside the MCP edge's 768 KiB tool-result budget however long
 /// the conflict's log grows.
 const MAX_CONFLICT_LOOKUP_BYTES: usize = 576 * 1024;
+/// Claims `recall(brief)` lists unless `limit` says otherwise.
+const DEFAULT_BRIEF_CLAIMS: usize = 32;
+// A brief's claims fit one conflict lookup by claim ids.
+const _: () = assert!(MAX_BRIEF_CLAIMS <= MAX_TOOL_RESULTS);
 
 /// Which lifecycle behaviour a service instance serves.
 ///
@@ -95,6 +101,22 @@ enum OverlayOutcome {
     Evaluated,
     /// The overlay read failed; the main result is returned without it.
     Unavailable,
+}
+
+/// Conflicts one brief lists: the hydrated conflicts (withheld and
+/// overlaid as every other read withholds and overlays them), whether more
+/// existed than the read's bound, and the overlay's outcome.
+struct BriefConflicts {
+    conflicts: Vec<Conflict>,
+    truncated: bool,
+    overlay: Option<OverlayOutcome>,
+}
+
+/// The scope brief's open conflicts: [`BriefConflicts`] over the rows
+/// `recall(status)` counts, which the counts block is derived from.
+struct OpenConflictsBrief {
+    open: OpenConflictsV1,
+    listed: BriefConflicts,
 }
 
 /// The executable service composition: shared hybrid corpus reads plus the
@@ -1368,6 +1390,438 @@ impl CockroachMemoryService {
         Ok(result)
     }
 
+    /// `recall(brief)`: one call to orient an agent. With `subject`, what
+    /// the fleet currently believes about it ([`Self::subject_brief`]);
+    /// without, the scope at a glance ([`Self::scope_brief`]). Every block
+    /// is read under [`OPTIONAL_STATUS_DEADLINE`], and a failed or slow one
+    /// is `null` with its `*_unavailable` warning, so a brief never fails
+    /// because one read did. Nothing in a brief is third-party text: a
+    /// claim's support rows carry digests, ids, and the citing link, never
+    /// an item, and the sources block is the worker's own status.
+    async fn recall_brief(
+        &self,
+        scope: &FleetScope,
+        arguments: Map<String, Value>,
+    ) -> ServiceResult<RecallResult> {
+        let args: BriefArgs = from_arguments(arguments, "recall brief")?;
+        let limit = brief_limit(args.limit)?;
+        match args.subject.as_deref() {
+            Some(subject) => {
+                let subject = brief_subject(subject)?;
+                self.subject_brief(scope, &subject, limit).await
+            }
+            None => self.scope_brief(scope, limit).await,
+        }
+    }
+
+    /// `recall(brief, subject=…)`: every current claim whose key starts
+    /// with the subject, the open conflicts on them (with the overlay where
+    /// it is served), which collected-item providers they cite (private
+    /// writer only), and the health of the sources behind those providers.
+    async fn subject_brief(
+        &self,
+        scope: &FleetScope,
+        subject: &str,
+        limit: usize,
+    ) -> ServiceResult<RecallResult> {
+        let (claims, mut warnings) = self
+            .brief_claims_within(
+                scope,
+                "claims",
+                async {
+                    self.ledger
+                        .claims_for_subject(scope, subject, limit)
+                        .await
+                        .map(|lookup| (lookup.claims, lookup.truncated))
+                },
+                OPTIONAL_STATUS_DEADLINE,
+            )
+            .await;
+        let claim_ids = claims.as_ref().map_or_else(Vec::new, |(claims, _)| {
+            claims.iter().map(|entry| entry.claim.id).collect()
+        });
+        // The conflicts and citations are on the claims read, so they are
+        // not read when it failed; the evidence status is independent.
+        let conflicts = async {
+            match &claims {
+                Some(_) => {
+                    self.brief_conflicts_on_within(scope, &claim_ids, OPTIONAL_STATUS_DEADLINE)
+                        .await
+                }
+                None => (None, Vec::new()),
+            }
+        };
+        let cited = async {
+            if claims.is_none() || self.withhold_asserted_claims {
+                return (None, Vec::new());
+            }
+            let read = tokio::time::timeout(
+                OPTIONAL_STATUS_DEADLINE,
+                self.ledger.claim_cited_providers(scope, &claim_ids),
+            )
+            .await;
+            match read {
+                Ok(Ok(cited)) => (Some(cited), Vec::new()),
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "brief cited provider read failed");
+                    (None, vec![brief_unavailable("cited_providers")])
+                }
+                Err(_) => {
+                    tracing::warn!("brief cited provider read did not finish within the deadline");
+                    (None, vec![brief_unavailable("cited_providers")])
+                }
+            }
+        };
+        let evidence = async {
+            match self.evidence.as_deref() {
+                Some(evidence) => {
+                    Some(evidence_status_outcome(evidence, OPTIONAL_STATUS_DEADLINE).await)
+                }
+                None => None,
+            }
+        };
+        let ((conflicts, conflict_warnings), (cited, cited_warnings), evidence) =
+            tokio::join!(conflicts, cited, evidence);
+        warnings.extend(conflict_warnings);
+        warnings.extend(cited_warnings);
+
+        let mut data = json!({
+            "subject": subject,
+            "as_of": chrono::Utc::now(),
+        });
+        if let Some(cited) = &cited {
+            data["cited_providers"] = json!(cited);
+        }
+        match evidence {
+            Some(Ok(status)) => {
+                let listed = brief_subject_sources(
+                    &status.sources,
+                    cited.as_ref().unwrap_or(&BTreeMap::new()),
+                );
+                warnings.extend(evidence_warnings(&status.readiness, &listed));
+                data["sources"] = json!(listed.active);
+                data["readiness"] = json!(status.readiness);
+            }
+            Some(Err(error)) => {
+                tracing::warn!(error = %error, "brief evidence status read failed");
+                data["sources"] = Value::Null;
+                data["readiness"] = Value::Null;
+                warnings.push(evidence_status_unavailable());
+            }
+            None => {}
+        }
+        if self.evidence.is_some() || self.items.is_some() {
+            data["absence_contract"] = absence_contract();
+        }
+        Self::finish_brief(data, warnings, "claims", claims, "conflicts", conflicts)
+    }
+
+    /// `recall(brief)`: the scope at a glance. The most recently changed
+    /// current claims, every open conflict (with the overlay where it is
+    /// served) and the counts `recall(status)` reports over them, the stale
+    /// or failed sources and the projection readiness, the legacy claim
+    /// keys, the evidence quarantine (private reads only), and the absence
+    /// contract.
+    async fn scope_brief(&self, scope: &FleetScope, limit: usize) -> ServiceResult<RecallResult> {
+        let recent = self.brief_claims_within(
+            scope,
+            "recent_claims",
+            async {
+                self.ledger
+                    .recent_claims(scope, limit)
+                    .await
+                    .map(|recent| (recent.claims, recent.truncated))
+            },
+            OPTIONAL_STATUS_DEADLINE,
+        );
+        let open = self.brief_open_conflicts_within(scope, OPTIONAL_STATUS_DEADLINE);
+        let evidence = async {
+            match self.evidence.as_deref() {
+                Some(evidence) => {
+                    Some(evidence_status_outcome(evidence, OPTIONAL_STATUS_DEADLINE).await)
+                }
+                None => None,
+            }
+        };
+        let legacy =
+            legacy_claim_keys_within(self.ledger.as_ref(), scope, OPTIONAL_STATUS_DEADLINE);
+        // The evidence quarantine is a private read, as in `recall(status)`.
+        let quarantine = async {
+            if self.withhold_asserted_claims {
+                None
+            } else {
+                Some(
+                    quarantine_status_within(self.corpus.pool(), scope, OPTIONAL_STATUS_DEADLINE)
+                        .await,
+                )
+            }
+        };
+        let (
+            (recent, mut warnings),
+            (open, open_warnings),
+            evidence,
+            (legacy, legacy_warnings),
+            quarantine,
+        ) = tokio::join!(recent, open, evidence, legacy, quarantine);
+        warnings.extend(open_warnings);
+
+        let mut data = json!({ "as_of": chrono::Utc::now() });
+        let listed = if let Some(OpenConflictsBrief { open, listed }) = open {
+            // The counts `recall(status)` reports, over the same rows.
+            let states = match listed.overlay {
+                Some(OverlayOutcome::Evaluated) => Some(
+                    listed
+                        .conflicts
+                        .iter()
+                        .filter_map(|conflict| {
+                            conflict
+                                .lifecycle
+                                .as_ref()
+                                .map(|overlay| (conflict.id, overlay.state.clone()))
+                        })
+                        .collect::<HashMap<_, _>>(),
+                ),
+                Some(OverlayOutcome::Unavailable) | None => None,
+            };
+            let (counts, count_warnings) = conflicts_status_block(Ok((open, states)));
+            data["conflicts"] = counts;
+            warnings.extend(count_warnings);
+            Some(listed)
+        } else {
+            data["conflicts"] = Value::Null;
+            None
+        };
+        match evidence {
+            Some(Ok(status)) => {
+                warnings.extend(evidence_warnings(&status.readiness, &status.sources));
+                data["sources"] = brief_scope_sources(&status.sources);
+                data["readiness"] = json!(status.readiness);
+            }
+            Some(Err(error)) => {
+                tracing::warn!(error = %error, "brief evidence status read failed");
+                data["sources"] = Value::Null;
+                data["readiness"] = Value::Null;
+                warnings.push(evidence_status_unavailable());
+            }
+            None => {}
+        }
+        data["legacy_claim_keys"] = legacy;
+        warnings.extend(legacy_warnings);
+        if let Some((quarantine, quarantine_warnings)) = quarantine {
+            data["quarantine"] = quarantine;
+            warnings.extend(quarantine_warnings);
+        }
+        if self.evidence.is_some() || self.items.is_some() {
+            data["absence_contract"] = absence_contract();
+        }
+        Self::finish_brief(
+            data,
+            warnings,
+            "recent_claims",
+            recent,
+            "open_conflicts",
+            listed,
+        )
+    }
+
+    /// Place a brief's claims and conflicts into `data` within the response
+    /// budget, with the envelope's conflicts and coverage. A block that was
+    /// not read is `null`; its warning is already in `warnings`.
+    fn finish_brief(
+        mut data: Value,
+        warnings: Vec<Value>,
+        claims_key: &str,
+        claims: Option<(Vec<KeyClaimV1>, bool)>,
+        conflicts_key: &str,
+        conflicts: Option<BriefConflicts>,
+    ) -> ServiceResult<RecallResult> {
+        let truncated_key = |key: &str| format!("{key}_truncated");
+        let (claims, claims_truncated) = claims
+            .map_or((Vec::new(), None), |(claims, truncated)| {
+                (claims, Some(truncated))
+            });
+        let (serialized, conflicts_truncated, overlay, typed) = match conflicts {
+            Some(listed) => (
+                serialize_conflicts(&listed.conflicts)?,
+                Some(listed.truncated),
+                listed.overlay,
+                listed.conflicts,
+            ),
+            None => (Vec::new(), None, None, Vec::new()),
+        };
+        let ((claims, claims_cut), (serialized, conflicts_cut)) =
+            brief_within_bytes(&data, claims, serialized);
+        if let Some(truncated) = claims_truncated {
+            data[claims_key] = json!(claims);
+            data[truncated_key(claims_key)] = json!(truncated || claims_cut);
+        } else {
+            data[claims_key] = Value::Null;
+        }
+        let mut result = RecallResult::new(data);
+        result.warnings = warnings;
+        if let Some(truncated) = conflicts_truncated {
+            let kept = &typed[..serialized.len()];
+            let complete =
+                !truncated && !conflicts_cut && kept.iter().all(conflict_projection_complete);
+            result.data[conflicts_key] = json!(serialized);
+            result.data[truncated_key(conflicts_key)] = json!(truncated || conflicts_cut);
+            result.conflict_coverage = conflict_coverage(complete, kept);
+            result.conflicts = serialized;
+        } else {
+            result.data[conflicts_key] = Value::Null;
+            let mut coverage = ConflictCoverage::new("unavailable");
+            coverage.details.insert(
+                "reason".into(),
+                Value::String(format!("{conflicts_key}_unavailable")),
+            );
+            result.conflict_coverage = coverage;
+        }
+        mark_lifecycle_overlay(&mut result.conflict_coverage, &mut result.warnings, overlay);
+        Ok(result)
+    }
+
+    /// One brief's claim listing, read by `read` under `deadline`, with the
+    /// publication reader's withholding and item-support stripping applied
+    /// as `recall(get, kind=claim, key=…)` applies them. `None` with a
+    /// `{name}_unavailable` warning when the read failed or timed out.
+    async fn brief_claims_within<F>(
+        &self,
+        scope: &FleetScope,
+        name: &str,
+        read: F,
+        deadline: std::time::Duration,
+    ) -> (Option<(Vec<KeyClaimV1>, bool)>, Vec<Value>)
+    where
+        F: Future<Output = crate::Result<(Vec<KeyClaimV1>, bool)>>,
+    {
+        let listing = async {
+            let (claims, truncated) = read.await.map_err(service_error)?;
+            let claim_ids = claims
+                .iter()
+                .map(|entry| entry.claim.id)
+                .collect::<Vec<_>>();
+            let withheld = self.withheld_claim_ids(scope, &claim_ids).await?;
+            let mut claims = claims
+                .into_iter()
+                .filter(|entry| !withheld.contains(&entry.claim.id))
+                .collect::<Vec<_>>();
+            if self.withhold_asserted_claims {
+                for entry in &mut claims {
+                    withhold_item_support(&mut entry.claim);
+                }
+            }
+            Ok::<_, ServiceError>((claims, truncated))
+        };
+        match tokio::time::timeout(deadline, listing).await {
+            Ok(Ok(listing)) => (Some(listing), Vec::new()),
+            Ok(Err(error)) => {
+                tracing::warn!(error = ?error, block = name, "brief claim read failed");
+                (None, vec![brief_unavailable(name)])
+            }
+            Err(_) => {
+                tracing::warn!(
+                    block = name,
+                    "brief claim read did not finish within the deadline"
+                );
+                (None, vec![brief_unavailable(name)])
+            }
+        }
+    }
+
+    /// The open conflicts on `claim_ids` (at most [`MAX_BRIEF_CLAIMS`]),
+    /// withheld and overlaid, under `deadline`.
+    async fn brief_conflicts_on_within(
+        &self,
+        scope: &FleetScope,
+        claim_ids: &[i64],
+        deadline: std::time::Duration,
+    ) -> (Option<BriefConflicts>, Vec<Value>) {
+        let read = async {
+            let mut conflicts = self
+                .ledger
+                .conflicts_for_claim_ids(scope, claim_ids, MAX_TOOL_RESULTS)
+                .await
+                .map_err(service_error)?;
+            let truncated = conflicts.len() >= MAX_TOOL_RESULTS;
+            self.withhold_asserted_conflicts(scope, &mut conflicts)
+                .await?;
+            let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
+            Ok::<_, ServiceError>(BriefConflicts {
+                conflicts,
+                truncated,
+                overlay,
+            })
+        };
+        match tokio::time::timeout(deadline, read).await {
+            Ok(Ok(listed)) => (Some(listed), Vec::new()),
+            Ok(Err(error)) => {
+                tracing::warn!(error = ?error, "brief conflict read failed");
+                (None, vec![brief_unavailable("conflicts")])
+            }
+            Err(_) => {
+                tracing::warn!("brief conflict read did not finish within the deadline");
+                (None, vec![brief_unavailable("conflicts")])
+            }
+        }
+    }
+
+    /// The scope's open conflicts as `recall(status)` counts them, hydrated
+    /// in the counting read's order (oldest first), withheld and overlaid,
+    /// under `deadline`.
+    async fn brief_open_conflicts_within(
+        &self,
+        scope: &FleetScope,
+        deadline: std::time::Duration,
+    ) -> (Option<OpenConflictsBrief>, Vec<Value>) {
+        let read = async {
+            let open = self
+                .ledger
+                .open_conflicts(scope)
+                .await
+                .map_err(service_error)?;
+            let mut conflicts = Vec::with_capacity(open.rows.len());
+            for chunk in open.rows.chunks(STATUS_OVERLAY_EPISODES) {
+                let ids = chunk.iter().map(|row| row.id).collect::<Vec<_>>();
+                conflicts.extend(
+                    self.ledger
+                        .get_conflicts(scope, &ids)
+                        .await
+                        .map_err(service_error)?,
+                );
+            }
+            let order = open
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (row.id, index))
+                .collect::<HashMap<_, _>>();
+            conflicts
+                .sort_by_key(|conflict| order.get(&conflict.id).copied().unwrap_or(usize::MAX));
+            self.withhold_asserted_conflicts(scope, &mut conflicts)
+                .await?;
+            let overlay = self.overlay_conflicts(scope, &mut conflicts).await;
+            Ok::<_, ServiceError>(OpenConflictsBrief {
+                listed: BriefConflicts {
+                    conflicts,
+                    truncated: open.bound_exceeded,
+                    overlay,
+                },
+                open,
+            })
+        };
+        match tokio::time::timeout(deadline, read).await {
+            Ok(Ok(open)) => (Some(open), Vec::new()),
+            Ok(Err(error)) => {
+                tracing::warn!(error = ?error, "brief open conflict read failed");
+                (None, vec![brief_unavailable("open_conflicts")])
+            }
+            Err(_) => {
+                tracing::warn!("brief open conflict read did not finish within the deadline");
+                (None, vec![brief_unavailable("open_conflicts")])
+            }
+        }
+    }
+
     /// `recall(action=discrepancies)`: the standing spec-nonconformance
     /// episodes (or, with `include_resolved`, every episode), or one episode
     /// by `id` with its lifecycle history, beside every live spec's latest
@@ -2055,6 +2509,7 @@ impl FleetMemoryService for CockroachMemoryService {
             RecallAction::Conflicts => self.recall_conflicts(&scope, request.arguments).await,
             RecallAction::Status => self.recall_status(&scope, request.arguments).await,
             RecallAction::Discrepancies => self.recall_discrepancies(request.arguments).await,
+            RecallAction::Brief => self.recall_brief(&scope, request.arguments).await,
             action => Err(ServiceError::InvalidRequest(format!(
                 "recall({}) is not implemented yet",
                 action.as_str()
@@ -2750,6 +3205,58 @@ struct EmptyArgs {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct BriefArgs {
+    /// The subject to brief on; without it, the scope at a glance.
+    #[serde(default)]
+    subject: Option<String>,
+    /// How many claims to list (default [`DEFAULT_BRIEF_CLAIMS`], at most
+    /// [`MAX_BRIEF_CLAIMS`]).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// A brief's claim bound.
+fn brief_limit(limit: Option<usize>) -> ServiceResult<usize> {
+    let limit = limit.unwrap_or(DEFAULT_BRIEF_CLAIMS);
+    if !(1..=MAX_BRIEF_CLAIMS).contains(&limit) {
+        return Err(ServiceError::InvalidRequest(format!(
+            "recall brief: limit must be between 1 and {MAX_BRIEF_CLAIMS}"
+        )));
+    }
+    Ok(limit)
+}
+
+/// The subject a brief is about, normalized exactly as `record` normalizes
+/// a key part, so `Final Round`, `final_round`, and `final-round` are one
+/// subject.
+fn brief_subject(subject: &str) -> ServiceResult<String> {
+    let subject = normalize_key_part(subject);
+    if subject.is_empty() {
+        return Err(ServiceError::InvalidRequest(
+            "recall brief: subject must contain at least one word".into(),
+        ));
+    }
+    Ok(subject)
+}
+
+/// The warning a brief carries for one block it could not read.
+fn brief_unavailable(block: &str) -> Value {
+    let what = match block {
+        "claims" => "the subject's current claims",
+        "recent_claims" => "the most recently changed claims",
+        "conflicts" => "the open conflicts on the subject's claims",
+        "open_conflicts" => "the open conflicts and their counts",
+        "cited_providers" => "the providers the subject's claims cite",
+        other => other,
+    };
+    json!({
+        "code": format!("{block}_unavailable"),
+        "message": format!("{what} could not be read; the rest of the brief is current"),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DiscrepanciesArgs {
     #[serde(default)]
     include_resolved: bool,
@@ -3379,15 +3886,7 @@ async fn evidence_status_within(
     evidence: &dyn EvidenceRecall,
     deadline: std::time::Duration,
 ) -> (Value, Vec<Value>) {
-    let status = tokio::time::timeout(deadline, evidence.status())
-        .await
-        .unwrap_or_else(|_| {
-            Err(FleetError::Memory(format!(
-                "the evidence status read did not finish within {}s",
-                deadline.as_secs_f32()
-            )))
-        });
-    match status {
+    match evidence_status_outcome(evidence, deadline).await {
         Ok(status) => {
             let mut warnings = evidence_warnings(&status.readiness, &status.sources);
             let mut block = json!({
@@ -3413,12 +3912,73 @@ async fn evidence_status_within(
             tracing::warn!(error = %error, "evidence recall status read failed");
             (
                 json!({ "served": true, "readiness": null, "sources": null }),
-                vec![json!({
-                    "code": "evidence_status_unavailable",
-                    "message": "evidence readiness and sources could not be read; recall(kind=evidence) is still served"
-                })],
+                vec![evidence_status_unavailable()],
             )
         }
+    }
+}
+
+/// One evidence status read bounded by `deadline`: a slow read is an error
+/// like a failed one.
+async fn evidence_status_outcome(
+    evidence: &dyn EvidenceRecall,
+    deadline: std::time::Duration,
+) -> crate::Result<EvidenceStatusV1> {
+    tokio::time::timeout(deadline, evidence.status())
+        .await
+        .unwrap_or_else(|_| {
+            Err(FleetError::Memory(format!(
+                "the evidence status read did not finish within {}s",
+                deadline.as_secs_f32()
+            )))
+        })
+}
+
+/// The warning `recall(status)` and `recall(brief)` carry when the evidence
+/// status read failed or timed out.
+fn evidence_status_unavailable() -> Value {
+    json!({
+        "code": "evidence_status_unavailable",
+        "message": "evidence readiness and sources could not be read; recall(kind=evidence) is still served"
+    })
+}
+
+/// The scope brief's `sources`: the stale or failed sources in full, and
+/// how many are active.
+fn brief_scope_sources(sources: &EvidenceSourcesV1) -> Value {
+    let stale_or_failed = sources
+        .active
+        .iter()
+        .filter(|source| source.stale || source.last_outcome == WorkerSourceOutcomeV1::Failed)
+        .collect::<Vec<_>>();
+    json!({
+        "stale_or_failed": stale_or_failed,
+        "active": sources.active.len(),
+        "truncated": sources.truncated,
+    })
+}
+
+/// The subject brief's `sources`: the collectors of the providers the
+/// subject's claims cite, or, when they cite none, the worker's own
+/// sources (git, transcripts, CI), which have no provider.
+fn brief_subject_sources(
+    sources: &EvidenceSourcesV1,
+    cited: &BTreeMap<String, u32>,
+) -> EvidenceSourcesV1 {
+    let active = sources
+        .active
+        .iter()
+        .filter(|source| {
+            source
+                .provider
+                .as_ref()
+                .map_or(cited.is_empty(), |provider| cited.contains_key(provider))
+        })
+        .cloned()
+        .collect();
+    EvidenceSourcesV1 {
+        active,
+        truncated: sources.truncated,
     }
 }
 
@@ -3587,25 +4147,54 @@ fn serialize_conflicts(conflicts: &[Conflict]) -> ServiceResult<Vec<Value>> {
         .collect()
 }
 
-/// The oldest key-lookup claims that fit `byte_budget` serialized, and
-/// whether any newer one was cut.
+/// The first key-lookup claims that fit `byte_budget` serialized (the
+/// oldest of a key lookup, the newest of a brief's recency listing), and
+/// whether any later one was cut.
 fn key_claims_within_bytes(claims: Vec<KeyClaimV1>, byte_budget: usize) -> (Vec<KeyClaimV1>, bool) {
+    serialized_within_bytes(claims, byte_budget)
+}
+
+/// The leading `items` that fit `byte_budget` serialized as array elements,
+/// and whether any later one was cut.
+fn serialized_within_bytes<T: Serialize>(items: Vec<T>, byte_budget: usize) -> (Vec<T>, bool) {
     let mut used = 0_usize;
-    let mut kept = Vec::with_capacity(claims.len());
-    let total = claims.len();
-    for entry in claims {
+    let mut kept = Vec::with_capacity(items.len());
+    let total = items.len();
+    for item in items {
         // One separator byte per array element.
-        let size = serde_json::to_vec(&entry)
+        let size = serde_json::to_vec(&item)
             .map_or(usize::MAX, |bytes| bytes.len())
             .saturating_add(1);
         used = used.saturating_add(size);
         if used > byte_budget {
             break;
         }
-        kept.push(entry);
+        kept.push(item);
     }
     let cut = kept.len() < total;
     (kept, cut)
+}
+
+/// Cut a brief's claim and conflict arrays to the response budget: what
+/// `fixed` (every other block) leaves goes to the claims first, then, each
+/// conflict counted twice (it is returned in `data` and in the envelope's
+/// `conflicts`), to the conflicts.
+fn brief_within_bytes(
+    fixed: &Value,
+    claims: Vec<KeyClaimV1>,
+    conflicts: Vec<Value>,
+) -> ((Vec<KeyClaimV1>, bool), (Vec<Value>, bool)) {
+    let fixed_bytes = json_bytes(fixed);
+    let claims = key_claims_within_bytes(
+        claims,
+        MAX_CONFLICT_LOOKUP_BYTES.saturating_sub(fixed_bytes),
+    );
+    let used = fixed_bytes.saturating_add(json_bytes(&json!(claims.0)));
+    let conflicts = serialized_within_bytes(
+        conflicts,
+        MAX_CONFLICT_LOOKUP_BYTES.saturating_sub(used) / 2,
+    );
+    (claims, conflicts)
 }
 
 /// The newest claim lifecycle events that fit `byte_budget` serialized,
@@ -6808,5 +7397,402 @@ mod tests {
             warning_codes(&spec_warnings),
             ["spec_conformance_status_unavailable"]
         );
+    }
+
+    #[test]
+    fn brief_arguments_are_a_subject_and_a_claim_bound() {
+        let parse = |value: Value| -> ServiceResult<BriefArgs> {
+            from_arguments(value.as_object().cloned().unwrap(), "recall brief")
+        };
+        let args = parse(json!({})).unwrap();
+        assert_eq!(args.subject, None);
+        assert_eq!(args.limit, None);
+        let args = parse(json!({ "subject": "Final Round", "limit": 5 })).unwrap();
+        assert_eq!(args.subject.as_deref(), Some("Final Round"));
+        assert_eq!(args.limit, Some(5));
+        for unknown in [
+            json!({ "query": "x" }),
+            json!({ "kind": "claim" }),
+            json!({ "predicate": "batch-size" }),
+            json!({ "include_history": true }),
+        ] {
+            assert!(
+                matches!(parse(unknown.clone()), Err(ServiceError::InvalidRequest(_))),
+                "{unknown}"
+            );
+        }
+
+        assert_eq!(brief_limit(None).unwrap(), DEFAULT_BRIEF_CLAIMS);
+        assert_eq!(brief_limit(Some(1)).unwrap(), 1);
+        assert_eq!(
+            brief_limit(Some(MAX_BRIEF_CLAIMS)).unwrap(),
+            MAX_BRIEF_CLAIMS
+        );
+        assert!(matches!(
+            brief_limit(Some(0)),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            brief_limit(Some(MAX_BRIEF_CLAIMS + 1)),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+
+        // The subject is one key part, normalized as record normalizes it.
+        assert_eq!(brief_subject(" Final Round ").unwrap(), "final-round");
+        assert_eq!(brief_subject("final_round").unwrap(), "final-round");
+        assert!(matches!(
+            brief_subject(" _- "),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn scope_brief_reports_every_block_unavailable_but_never_fails() {
+        let service = offline_service(CONFLICT_LIFECYCLE);
+        let started = std::time::Instant::now();
+        let result = FleetMemoryService::recall(
+            &service,
+            offline_scope(),
+            recall_request(RecallAction::Brief, &json!({})),
+        )
+        .await
+        .expect("a brief with every read failed is still an answer");
+        assert!(started.elapsed() < OPTIONAL_STATUS_DEADLINE);
+        assert!(result.data["as_of"].is_string());
+        for block in [
+            "recent_claims",
+            "open_conflicts",
+            "conflicts",
+            "legacy_claim_keys",
+            "quarantine",
+        ] {
+            assert_eq!(result.data[block], Value::Null, "{block}");
+        }
+        assert!(result.data.get("recent_claims_truncated").is_none());
+        assert!(result.data.get("open_conflicts_truncated").is_none());
+        // No evidence or items are served here, so neither is the absence
+        // contract nor a sources block.
+        for absent in [
+            "sources",
+            "readiness",
+            "absence_contract",
+            "subject",
+            "claims",
+        ] {
+            assert!(result.data.get(absent).is_none(), "{absent}");
+        }
+        assert_eq!(
+            warning_codes(&result.warnings),
+            [
+                "recent_claims_unavailable",
+                "open_conflicts_unavailable",
+                "legacy_claim_keys_unavailable",
+                "quarantine_unavailable",
+            ]
+        );
+        assert!(result.conflicts.is_empty());
+        assert_eq!(result.conflict_coverage.status, "unavailable");
+        assert_eq!(
+            result.conflict_coverage.details["reason"],
+            "open_conflicts_unavailable"
+        );
+        assert!(
+            result
+                .conflict_coverage
+                .details
+                .get("lifecycle_overlay")
+                .is_none()
+        );
+
+        // The publication reader never reads the quarantine.
+        let publication = CockroachMemoryService::publication(
+            offline_scope(),
+            service.corpus.clone(),
+            service.ledger.clone(),
+            service.embedder.clone(),
+        )
+        .unwrap();
+        let result = FleetMemoryService::recall(
+            &publication,
+            offline_scope(),
+            recall_request(RecallAction::Brief, &json!({ "limit": 64 })),
+        )
+        .await
+        .unwrap();
+        assert!(result.data.get("quarantine").is_none());
+        assert_eq!(
+            warning_codes(&result.warnings),
+            [
+                "recent_claims_unavailable",
+                "open_conflicts_unavailable",
+                "legacy_claim_keys_unavailable",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn subject_brief_reports_its_blocks_unavailable_but_never_fails() {
+        let service = offline_service(CONFLICT_LIFECYCLE);
+        let result = FleetMemoryService::recall(
+            &service,
+            offline_scope(),
+            recall_request(RecallAction::Brief, &json!({ "subject": "Final Round" })),
+        )
+        .await
+        .expect("a subject brief with the claims read failed is still an answer");
+        assert_eq!(result.data["subject"], "final-round");
+        assert!(result.data["as_of"].is_string());
+        assert_eq!(result.data["claims"], Value::Null);
+        assert!(result.data.get("claims_truncated").is_none());
+        // The conflicts and citations are on the claims, so neither is read
+        // when the claims were not.
+        assert_eq!(result.data["conflicts"], Value::Null);
+        for absent in [
+            "cited_providers",
+            "sources",
+            "readiness",
+            "absence_contract",
+            "recent_claims",
+            "open_conflicts",
+        ] {
+            assert!(result.data.get(absent).is_none(), "{absent}");
+        }
+        assert_eq!(warning_codes(&result.warnings), ["claims_unavailable"]);
+        assert_eq!(result.conflict_coverage.status, "unavailable");
+        assert_eq!(
+            result.conflict_coverage.details["reason"],
+            "conflicts_unavailable"
+        );
+
+        // Refusals happen before any I/O.
+        for (arguments, message) in [
+            (json!({ "subject": " - " }), "at least one word"),
+            (json!({ "subject": "x", "limit": 0 }), "between 1 and 64"),
+            (json!({ "limit": 65 }), "between 1 and 64"),
+            (json!({ "query": "x" }), "unknown field"),
+        ] {
+            let error = FleetMemoryService::recall(
+                &service,
+                offline_scope(),
+                recall_request(RecallAction::Brief, &arguments),
+            )
+            .await
+            .expect_err("refused");
+            match error {
+                ServiceError::InvalidRequest(text) => {
+                    assert!(text.contains(message), "{arguments}: {text}");
+                }
+                other => panic!("{arguments}: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn briefs_carry_the_evidence_sources_and_readiness_where_served() {
+        let evidence = Arc::new(FakeEvidence::default());
+        let service = offline_service(CONFLICT_LIFECYCLE)
+            .with_evidence_recall(evidence.clone() as Arc<dyn EvidenceRecall>);
+
+        // The scope brief lists only the stale or failed sources in full.
+        let result = FleetMemoryService::recall(
+            &service,
+            offline_scope(),
+            recall_request(RecallAction::Brief, &json!({})),
+        )
+        .await
+        .unwrap();
+        let sources = &result.data["sources"];
+        assert_eq!(sources["active"], 2);
+        assert_eq!(sources["truncated"], false);
+        let listed = sources["stale_or_failed"].as_array().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0]["connector_instance"], GIT_SOURCE);
+        assert_eq!(listed[0]["last_outcome"], "failed");
+        assert_eq!(listed[1]["connector_instance"], TRANSCRIPT_SOURCE);
+        assert_eq!(listed[1]["stale"], true);
+        assert_eq!(result.data["readiness"]["dense_lane"], "available");
+        assert!(result.data["absence_contract"].is_object());
+        assert_eq!(
+            warning_codes(&result.warnings),
+            [
+                "recent_claims_unavailable",
+                "open_conflicts_unavailable",
+                "evidence_body_projection_lag",
+                "evidence_source_failed",
+                "evidence_source_stale",
+                "legacy_claim_keys_unavailable",
+                "quarantine_unavailable",
+            ]
+        );
+
+        // The subject brief's claims read failed, so nothing is cited and
+        // the worker's own provider-less sources are listed.
+        let result = FleetMemoryService::recall(
+            &service,
+            offline_scope(),
+            recall_request(RecallAction::Brief, &json!({ "subject": "heron" })),
+        )
+        .await
+        .unwrap();
+        let listed = result.data["sources"].as_array().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(result.data["readiness"].is_object());
+        assert!(result.data["absence_contract"].is_object());
+        assert_eq!(
+            warning_codes(&result.warnings),
+            [
+                "claims_unavailable",
+                "evidence_body_projection_lag",
+                "evidence_source_failed",
+                "evidence_source_stale",
+            ]
+        );
+        assert_eq!(
+            evidence.statuses.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+
+        // A failed evidence read is null with its warning, like every block.
+        let failing = offline_service(CONFLICT_LIFECYCLE)
+            .with_evidence_recall(Arc::new(FakeEvidence::failing()) as Arc<dyn EvidenceRecall>);
+        let result = FleetMemoryService::recall(
+            &failing,
+            offline_scope(),
+            recall_request(RecallAction::Brief, &json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.data["sources"], Value::Null);
+        assert_eq!(result.data["readiness"], Value::Null);
+        assert!(warning_codes(&result.warnings).contains(&"evidence_status_unavailable"));
+    }
+
+    #[test]
+    fn subject_brief_sources_follow_the_cited_providers() {
+        use crate::evidence_recall::EvidenceSourceKindV1;
+        let mut sources = evidence_sources();
+        sources.active.push(EvidenceSourceV1 {
+            connector_instance: "collector.slack.fixture".into(),
+            kind: EvidenceSourceKindV1::Collector,
+            provider: Some("slack".into()),
+            state: "active".into(),
+            last_outcome: WorkerSourceOutcomeV1::Ok,
+            last_checked_at: None,
+            last_error: None,
+            stale: false,
+            coverage: None,
+        });
+        sources.active.push(EvidenceSourceV1 {
+            connector_instance: "collector.linear.fixture".into(),
+            kind: EvidenceSourceKindV1::Collector,
+            provider: Some("linear".into()),
+            state: "active".into(),
+            last_outcome: WorkerSourceOutcomeV1::Failed,
+            last_checked_at: None,
+            last_error: Some("token expired".into()),
+            stale: false,
+            coverage: None,
+        });
+
+        // Cited providers select their collectors, and only them.
+        let cited = BTreeMap::from([("slack".to_owned(), 2)]);
+        let listed = brief_subject_sources(&sources, &cited);
+        assert_eq!(listed.active.len(), 1);
+        assert_eq!(
+            listed.active[0].connector_instance,
+            "collector.slack.fixture"
+        );
+        assert!(
+            evidence_warnings(&evidence_readiness(EvidenceDenseLaneV1::Available), &listed)
+                .iter()
+                .all(|warning| warning["code"] != "evidence_source_failed")
+        );
+
+        // Nothing cited: the worker's own sources, which have no provider.
+        let listed = brief_subject_sources(&sources, &BTreeMap::new());
+        assert_eq!(
+            listed
+                .active
+                .iter()
+                .map(|source| source.connector_instance.as_str())
+                .collect::<Vec<_>>(),
+            [GIT_SOURCE, TRANSCRIPT_SOURCE]
+        );
+
+        // The scope brief names the stale or failed ones and counts the rest.
+        let block = brief_scope_sources(&sources);
+        assert_eq!(block["active"], 4);
+        let names = block["stale_or_failed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| source["connector_instance"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [GIT_SOURCE, TRANSCRIPT_SOURCE, "collector.linear.fixture"]
+        );
+    }
+
+    #[test]
+    fn brief_budget_cuts_claims_then_conflicts() {
+        let entry = |id: i64| KeyClaimV1 {
+            claim: Claim {
+                id,
+                project: "project".into(),
+                kind: ClaimKind::Decision,
+                claim_key: Some("final-round::batch-size".into()),
+                subject: Some("final-round".into()),
+                predicate: Some("batch-size".into()),
+                value: Some(json!(id)),
+                text: "x".repeat(64),
+                polarity: 1,
+                state: ClaimState::Active,
+                origin: "operator_asserted".into(),
+                actor: Some("agent".into()),
+                confidence: 1.0,
+                valid_from: None,
+                valid_to: None,
+                superseded_by: None,
+                revision: 1,
+                conflict_eligible: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                support: Vec::new(),
+                conflict_ids: Vec::new(),
+            },
+            value_elided: false,
+        };
+        let conflict = |id: i64| json!({ "id": id, "text": "c".repeat(64) });
+        let fixed = json!({ "as_of": Utc::now() });
+        let ((claims, claims_cut), (conflicts, conflicts_cut)) = brief_within_bytes(
+            &fixed,
+            vec![entry(1), entry(2)],
+            vec![conflict(1), conflict(2)],
+        );
+        assert_eq!(claims.len(), 2);
+        assert!(!claims_cut);
+        assert_eq!(conflicts.len(), 2);
+        assert!(!conflicts_cut);
+
+        // A fixed part near the budget leaves room for nothing.
+        let fixed = json!({ "padding": "p".repeat(MAX_CONFLICT_LOOKUP_BYTES) });
+        let ((claims, claims_cut), (conflicts, conflicts_cut)) =
+            brief_within_bytes(&fixed, vec![entry(1)], vec![conflict(1)]);
+        assert!(claims.is_empty());
+        assert!(claims_cut);
+        assert!(conflicts.is_empty());
+        assert!(conflicts_cut);
+
+        // The conflicts get what the claims leave, counted twice.
+        let one_claim = json_bytes(&json!(entry(1))) + 1;
+        let fixed = json!({
+            "padding": "p".repeat(MAX_CONFLICT_LOOKUP_BYTES - one_claim - 2 * (json_bytes(&conflict(1)) + 1) - 40)
+        });
+        let ((claims, _), (conflicts, conflicts_cut)) =
+            brief_within_bytes(&fixed, vec![entry(1)], vec![conflict(1), conflict(2)]);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts_cut);
     }
 }

@@ -723,19 +723,31 @@ fn compact_summary(envelope: &Value) -> String {
     for (key, label) in [
         ("hits", "hits"),
         ("claims", "claims"),
+        ("recent_claims", "recent claims"),
         ("active_claims", "active claims"),
         ("records", "records"),
         ("discrepancies", "discrepancies"),
         ("specs", "specs"),
+        ("open_conflicts", "open conflicts"),
     ] {
         if let Some(count) = data.get(key).and_then(Value::as_array).map(Vec::len) {
             counts.push(format!("{count} {label}"));
         }
     }
+    // A scope brief's envelope conflicts are its open_conflicts, counted above.
     if let Some(count) = envelope["conflicts"].as_array().map(Vec::len)
         && count > 0
+        && data.get("open_conflicts").is_none()
     {
         counts.push(format!("{count} conflicts"));
+    }
+    if let Some(count) = data
+        .pointer("/sources/stale_or_failed")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        && count > 0
+    {
+        counts.push(format!("{count} stale or failed sources"));
     }
 
     let mut summary = format!("{tool}.{action}: {outcome}");
@@ -821,6 +833,58 @@ mod tests {
             "recall.search: completed; 1 hits. Full result is in structuredContent."
         );
         assert!(!summary.contains("large"));
+    }
+
+    #[test]
+    fn summary_counts_a_brief_once_and_names_its_unhealthy_sources() {
+        // The scope brief: its envelope conflicts are its open_conflicts.
+        let scope = json!({
+            "tool": "recall",
+            "action": "brief",
+            "data": {
+                "recent_claims": [{}, {}, {}],
+                "open_conflicts": [{}, {}],
+                "conflicts": { "open": 2 },
+                "sources": { "stale_or_failed": [{}], "active": 3 },
+            },
+            "conflicts": [{}, {}],
+            "conflict_coverage": {"status": "complete"}
+        });
+        assert_eq!(
+            compact_summary(&scope),
+            "recall.brief: completed; 3 recent claims, 2 open conflicts, 1 stale or failed sources. Full result is in structuredContent."
+        );
+
+        // The subject brief: its claims and the conflicts on them.
+        let subject = json!({
+            "tool": "recall",
+            "action": "brief",
+            "data": {
+                "subject": "final-round",
+                "claims": [{}, {}],
+                "conflicts": [{}],
+                "sources": [],
+            },
+            "conflicts": [{}],
+            "conflict_coverage": {"status": "complete"}
+        });
+        assert_eq!(
+            compact_summary(&subject),
+            "recall.brief: completed; 2 claims, 1 conflicts. Full result is in structuredContent."
+        );
+
+        // Every block unavailable: nothing to count, and the coverage says so.
+        let offline = json!({
+            "tool": "recall",
+            "action": "brief",
+            "data": { "recent_claims": null, "open_conflicts": null, "sources": null },
+            "conflicts": [],
+            "conflict_coverage": {"status": "unavailable"}
+        });
+        assert_eq!(
+            compact_summary(&offline),
+            "recall.brief: completed; conflict coverage unavailable. Full result is in structuredContent."
+        );
     }
 
     #[test]

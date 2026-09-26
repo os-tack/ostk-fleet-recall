@@ -6226,3 +6226,213 @@ async fn live_self_dispute_is_refused_and_key_lookup_shows_the_chain_when_config
 
     fleet.cleanup().await;
 }
+
+/// `recall(brief)` orients an agent in one call: with a subject, that
+/// subject's current claims (and the claims of subjects continuing its
+/// words), the open conflicts on them with the overlay, and what they cite;
+/// without, the scope's most recently changed claims, every open conflict,
+/// and the status blocks. `limit` truncates, and the publication reader's
+/// brief carries no overlay and no private block.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // both shapes over one fleet, then the publication reader
+async fn live_brief_orients_an_agent_from_one_call_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "brief").await;
+    // Four agents, two subjects: A and B disagree on brief-alpha, C decides
+    // brief-beta, and D decides a subject that continues alpha's words.
+    let x = fleet
+        .record(AGENT_A, &decision("brief-alpha", &json!("x"), 1), "a/x")
+        .await;
+    let y = fleet
+        .record(AGENT_B, &decision("brief-alpha", &json!("y"), 1), "b/y")
+        .await;
+    let conflict_id = y.claim.conflict_ids[0];
+    let z = fleet
+        .record(AGENT_C, &decision("brief-beta", &json!("z"), 1), "c/z")
+        .await;
+    let w = fleet
+        .record(AGENT_D, &decision("brief alpha 2", &json!("w"), 1), "d/w")
+        .await;
+    assert_eq!(
+        w.claim.claim_key.as_deref(),
+        Some("brief-alpha-2::database-choice")
+    );
+    let revision = fleet.conflict_row(conflict_id).await.1;
+    fleet
+        .acknowledge(AGENT_A, conflict_id, revision, "a/ack")
+        .await
+        .unwrap();
+    let private = fleet.full_service(AGENT_C);
+    let scope = fleet.scope(AGENT_C);
+    let ids = |claims: &Value| -> Vec<i64> {
+        claims
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|claim| claim["id"].as_i64().unwrap())
+            .collect()
+    };
+
+    // The subject brief: alpha's claims and alpha-2's (key order), the
+    // open conflict on them with its overlay, and nothing cited.
+    let brief = recall(
+        &private,
+        &scope,
+        RecallAction::Brief,
+        json!({ "subject": "Brief Alpha" }),
+    )
+    .await
+    .expect("the subject brief is served");
+    assert_eq!(brief.data["subject"], "brief-alpha");
+    assert!(brief.data["as_of"].is_string());
+    assert_eq!(
+        ids(&brief.data["claims"]),
+        [w.claim.id, x.claim.id, y.claim.id]
+    );
+    assert_eq!(brief.data["claims"][0]["state"], "active");
+    assert_eq!(brief.data["claims"][1]["state"], "disputed");
+    assert_eq!(
+        brief.data["claims"][1]["conflict_ids"],
+        json!([conflict_id])
+    );
+    assert_eq!(brief.data["claims_truncated"], false);
+    assert_eq!(brief.data["conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(brief.data["conflicts"][0]["id"], conflict_id);
+    assert_eq!(brief.data["conflicts"][0]["state"], "open");
+    assert_eq!(
+        brief.data["conflicts"][0]["lifecycle"]["state"],
+        "acknowledged"
+    );
+    assert_eq!(brief.data["conflicts_truncated"], false);
+    assert_eq!(brief.data["cited_providers"], json!({}));
+    for absent in ["sources", "readiness", "absence_contract", "recent_claims"] {
+        assert!(brief.data.get(absent).is_none(), "{absent}");
+    }
+    assert!(brief.warnings.is_empty(), "{:?}", brief.warnings);
+    assert_eq!(brief.conflicts.len(), 1);
+    assert_eq!(brief.conflict_coverage.status, "complete");
+    assert_eq!(
+        brief.conflict_coverage.details["lifecycle_overlay"],
+        "evaluated"
+    );
+    // Another subject sees only its own claim; a bound cuts the listing.
+    let beta = recall(
+        &private,
+        &scope,
+        RecallAction::Brief,
+        json!({ "subject": "brief_beta" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&beta.data["claims"]), [z.claim.id]);
+    assert!(beta.data["conflicts"].as_array().unwrap().is_empty());
+    let cut = recall(
+        &private,
+        &scope,
+        RecallAction::Brief,
+        json!({ "subject": "brief alpha", "limit": 1 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&cut.data["claims"]), [w.claim.id]);
+    assert_eq!(cut.data["claims_truncated"], true);
+
+    // The scope brief: the claims newest first, the open conflict with its
+    // overlay and the counts over it, and the status blocks.
+    let brief = recall(&private, &scope, RecallAction::Brief, json!({}))
+        .await
+        .expect("the scope brief is served");
+    let recent = ids(&brief.data["recent_claims"]);
+    assert_eq!(recent.len(), 4);
+    assert_eq!(recent[..2], [w.claim.id, z.claim.id]);
+    let mut disputed = recent[2..].to_vec();
+    disputed.sort_unstable();
+    assert_eq!(disputed, [x.claim.id, y.claim.id]);
+    assert_eq!(brief.data["recent_claims_truncated"], false);
+    assert_eq!(brief.data["open_conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(brief.data["open_conflicts"][0]["id"], conflict_id);
+    assert_eq!(
+        brief.data["open_conflicts"][0]["lifecycle"]["state"],
+        "acknowledged"
+    );
+    assert_eq!(brief.data["open_conflicts_truncated"], false);
+    assert_eq!(brief.data["conflicts"]["open"], 1);
+    assert_eq!(brief.data["conflicts"]["acknowledged"], 1);
+    assert_eq!(brief.data["conflicts"]["waived"], 0);
+    assert!(brief.data["conflicts"]["oldest_open_at"].is_string());
+    assert_eq!(brief.data["conflicts"]["bound_exceeded"], false);
+    assert_eq!(brief.data["legacy_claim_keys"]["count"], 0);
+    assert!(brief.data["quarantine"]["by_reason"].is_object());
+    for absent in [
+        "sources",
+        "readiness",
+        "absence_contract",
+        "subject",
+        "claims",
+    ] {
+        assert!(brief.data.get(absent).is_none(), "{absent}");
+    }
+    assert!(brief.warnings.is_empty(), "{:?}", brief.warnings);
+    assert_eq!(brief.conflicts.len(), 1);
+    assert_eq!(brief.conflict_coverage.status, "complete");
+    let cut = recall(&private, &scope, RecallAction::Brief, json!({ "limit": 1 }))
+        .await
+        .unwrap();
+    assert_eq!(ids(&cut.data["recent_claims"]), [w.claim.id]);
+    assert_eq!(cut.data["recent_claims_truncated"], true);
+    // Nothing in a brief is third-party text: only the fixture's own words.
+    let wire = serde_json::to_string(&brief.data).unwrap();
+    assert!(wire.contains("lifecycle fixture brief-alpha chooses"));
+
+    // The publication reader: the same claims and conflicts, no overlay,
+    // no quarantine, and no citations.
+    let publication = CockroachMemoryService::publication(
+        fleet.scope("demo"),
+        Arc::new(fleet.store.clone()),
+        Arc::new(fleet.ledger("demo")),
+        Arc::new(UnitEmbedder),
+    )
+    .expect("publication service");
+    let demo = fleet.scope("demo");
+    let brief = recall(&publication, &demo, RecallAction::Brief, json!({}))
+        .await
+        .unwrap();
+    assert_eq!(ids(&brief.data["recent_claims"]).len(), 4);
+    assert_eq!(brief.data["open_conflicts"][0]["id"], conflict_id);
+    assert!(brief.data["open_conflicts"][0].get("lifecycle").is_none());
+    assert_eq!(brief.data["conflicts"]["open"], 1);
+    assert!(brief.data["conflicts"]["acknowledged"].is_null());
+    assert!(brief.data.get("quarantine").is_none());
+    assert!(
+        !serde_json::to_string(&brief.data)
+            .unwrap()
+            .contains("lifecycle\"")
+    );
+    assert!(
+        brief
+            .conflict_coverage
+            .details
+            .get("lifecycle_overlay")
+            .is_none()
+    );
+    assert!(brief.warnings.is_empty(), "{:?}", brief.warnings);
+    let brief = recall(
+        &publication,
+        &demo,
+        RecallAction::Brief,
+        json!({ "subject": "brief-alpha" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ids(&brief.data["claims"]),
+        [w.claim.id, x.claim.id, y.claim.id]
+    );
+    assert!(brief.data.get("cited_providers").is_none());
+    assert!(brief.data["conflicts"][0].get("lifecycle").is_none());
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}
