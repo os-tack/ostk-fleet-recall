@@ -355,3 +355,11 @@ serves none of them.
 - Publication reads are unchanged: the public demo still returns retired
   claims' synthetic chunks, does not serve conflict lookup by id, and never
   reads the lifecycle log.
+- `recall(brief)` composes these serving reads for one call: a subject's or
+  the scope's current claims, the open conflicts on them with this overlay,
+  and the source health behind them. It reads the lifecycle log only through
+  the overlay, so the publication reader's brief carries no overlay and no
+  private block, and a failed overlay read degrades to
+  `lifecycle_overlay_unavailable` as it does on every other read; every other
+  block of a brief degrades to its own `*_unavailable` warning, so a brief
+  never fails because one read did.

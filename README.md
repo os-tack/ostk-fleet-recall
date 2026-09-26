@@ -22,7 +22,7 @@ started as a CockroachDB AI Agents Hackathon entry.
 The `ostk-fleet-recall` binary has these commands:
 
 - `serve` speaks newline-delimited JSON-RPC/MCP on stdin/stdout with two tools:
-  - `recall(search|get|conflicts|status)` reads the hybrid vector/lexical
+  - `recall(search|get|conflicts|status|brief)` reads the hybrid vector/lexical
     corpus and typed-claim state. `get` with `kind=conflict` returns one
     conflict by id in any state, with its members and its lifecycle history;
     `get` with `kind=claim` returns a claim with its own lifecycle history,
@@ -30,6 +30,13 @@ The `ostk-fleet-recall` binary has these commands:
     with the key's open conflict.
     Every conflict the private writer returns carries a `lifecycle` overlay:
     who acknowledged or waived it, and who closed it and how.
+  - `recall(brief)` is the first call of an agent session: with `subject`,
+    every current claim whose key starts with that subject, the open
+    conflicts on them, and the health of the sources those claims cite;
+    without, the scope at a glance (the most recently changed claims, every
+    open conflict, stale or failed sources, projection lag, legacy keys,
+    quarantine, and the absence contract). Nothing in a brief is third-party
+    text. See [Start with a brief](#6-exercise-the-mcp-server).
   - `recall(search|get, kind=evidence)` searches the connector evidence the
     [memory worker](#memory-worker) admits (git history, agent transcripts,
     CI runs). It is served wherever migration 30 is applied and the writer
@@ -1469,6 +1476,53 @@ Then the key's open conflict is re-evaluated exactly as for a retract:
 compatible successor let it close or an incompatible one keeps it `still_open`
 with the successor as a member. The predecessor stays a historical member of
 its conflicts, and `recall` `get` with `kind=claim` shows its `superseded_by`.
+
+**Start with a brief.** Call `recall(brief)` first: it composes, in one
+call, what an agent otherwise assembles from four to six. With `subject`
+(normalized as `record` normalizes a key part, so `Final Round` and
+`final_round` are one subject), it lists every lifecycle-current claim whose
+key starts with that subject followed by `::` or `-` (so `final round` covers
+`final-round::batch-size` and `final-round-2::x`, not `final::x`), oldest
+first within each key, with each claim's support rows and `conflict_ids`; the
+open conflicts on those claims (with the lifecycle overlay where it is
+served); on a private writer `cited_providers`, how many of the claims cite
+items of each collected-item provider; and, where evidence recall is served,
+the `sources` behind those providers (or the worker's own git, transcript,
+and CI sources when nothing is cited) with the projection `readiness`:
+
+```json
+{"action":"brief","subject":"final round","limit":32}
+```
+
+```json
+{"subject":"final-round","as_of":"…","claims":[…],"claims_truncated":false,"conflicts":[…],"conflicts_truncated":false,"cited_providers":{"slack":1},"sources":[…],"readiness":{…},"absence_contract":{…}}
+```
+
+Without `subject`, it is the scope at a glance: `recent_claims`, the most
+recently changed lifecycle-current claims newest first; `open_conflicts`,
+every open conflict oldest first (bounded at 256) with the overlay, beside the
+`conflicts` counts `recall(status)` reports; `sources`, the stale or failed
+sources in full with a count of the active ones, and `readiness`; and the
+`legacy_claim_keys`, `quarantine` (private reads only), and
+`absence_contract` blocks of `recall(status)`:
+
+```json
+{"action":"brief"}
+```
+
+```json
+{"as_of":"…","recent_claims":[…],"recent_claims_truncated":false,"open_conflicts":[…],"open_conflicts_truncated":false,"conflicts":{"open":2,"acknowledged":0,"waived":0,"oldest_open_at":"…","bound_exceeded":false},"sources":{"stale_or_failed":[…],"active":4,"truncated":false},"readiness":{…},"legacy_claim_keys":{…},"quarantine":{…},"absence_contract":{…}}
+```
+
+`limit` bounds the claims (default 32, at most 64), and the answer is cut to
+the same response budget as `get`, with the `*_truncated` flags saying so.
+Every block is read under the same deadline as `recall(status)`'s blocks, so a
+failed or slow read is `null` with its `*_unavailable` warning and the brief
+still answers; the answer carries the warnings of every read it composes. The
+publication reader's brief withholds asserted claims and item support rows,
+never reads the quarantine or the claim item links, and carries no overlay.
+Nothing in a brief is third-party text: claim support carries digests, ids,
+and the citing link, never an item.
 
 **The audit trail.** On a private writer, `recall(get, kind=claim)` by id
 also returns `history`: the claim's own lifecycle log oldest first (its
