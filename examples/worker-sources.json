@@ -73,6 +73,20 @@
         "overlap_seconds": 300,
         "max_pages_per_tick": 500
       }
+    },
+    {
+      "provider": "granola",
+      "connector_principal": "principal.granola",
+      "connector_instance": "granola.acme",
+      "provider_scope_id": "workspace.acme-robotics",
+      "audience": {"operator_declared": true},
+      "settings": {
+        "token_env": "FLEET_RECALL_GRANOLA_API_KEY",
+        "folders": ["fol_4y6LduVdwSKC27"],
+        "include_transcript": false,
+        "reconcile_every_seconds": 86400,
+        "max_pages_per_tick": 500
+      }
     }
   ]
 }

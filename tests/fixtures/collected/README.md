@@ -24,5 +24,10 @@ Linear, and Granola.
   serves a provider's API pages to a collector under test, with scripted rate
   limits and failures, and records every request so a test can prove the
   credential travels only in the `Authorization` header
-  (`tests/slack_collector_live.rs` serves a Slack workspace through it, and
-  `tests/linear_collector_live.rs` a Linear organization's GraphQL API).
+  (`tests/slack_collector_live.rs` serves a Slack workspace through it,
+  `tests/linear_collector_live.rs` a Linear organization's GraphQL API, and
+  `tests/granola_collector_live.rs` a Granola account's public API, with a
+  planted private note and attendee that no table may hold). The only
+  credentials the live tests present are obvious placeholders
+  (`xoxb-EXAMPLE-NOT-A-TOKEN`, `lin_api_EXAMPLENOTAREALKEYEXAMPLENOTAREAL`,
+  `grn_EXAMPLE_NOT_A_KEY`) that keep the shape the redactor catches.

@@ -13,17 +13,18 @@
   withholds deleted and withdrawn items. `recall(kind=item)` reads items back
   as items (D7). The worker runs pull collectors through one pull framework,
   and the documents-directory collector is the first (D8). The Slack
-  collector pulls channels through the Web API, and the Linear collector
-  teams' issues and comments through the GraphQL API, over the provider HTTP
-  seam (D8). `ostk-fleet-recall collect` imports a file of items, or a Slack
-  export, as a snapshot of one provider scope and lists, dead-letters, and
-  retires what the collectors hold (D9). An agent relays items it read
-  through its own connectors with `remember(action="capture")`, a reported
-  channel through the same sink, served only where
-  `FLEET_RECALL_COLLECTED_CAPTURE` turns it on (D10). A claim cites the items
-  it rests on: `remember(assert)`'s `support_items` and `record`'s item
-  support entries link it to them through migration 35, privately (D11). No
-  Granola collector stages items yet; it lands with its own decision.
+  collector pulls channels through the Web API, the Linear collector teams'
+  issues and comments through the GraphQL API, and the Granola collector
+  meeting notes' AI summaries and, when asked, transcripts through the public
+  API, over the provider HTTP seam (D8). `ostk-fleet-recall collect` imports
+  a file of items, or a Slack export, as a snapshot of one provider scope and
+  lists, dead-letters, and retires what the collectors hold (D9). An agent
+  relays items it read through its own connectors with
+  `remember(action="capture")`, a reported channel through the same sink,
+  served only where `FLEET_RECALL_COLLECTED_CAPTURE` turns it on (D10). A
+  claim cites the items it rests on: `remember(assert)`'s `support_items`
+  and `record`'s item support entries link it to them through migration 35,
+  privately (D11).
 - Date: 2026-09-25
 - Scope: how specs and documents, Slack conversations, Linear tickets,
   Granola meetings, and anything else a collector can read become evidence
@@ -819,6 +820,79 @@ does not read, are invisible to a sweep; they are left to the webhook hints of
 stage 7. Reactions, subscribers, history entries, and attachments' content are
 never read.
 
+**Granola** (`src/collectors/granola`, provider `granola`). An API key
+(`grn_...`, Business or Enterprise, sent as `Bearer`), named by `token_env`,
+reads the notes it can read through the official public API (`api_base`,
+`https://public-api.granola.ai/v1` by default); the encrypted desktop cache
+and the private API are never read, and the Granola MCP is reachable only
+through an agent's capture. The API names no workspace, so the provider scope
+id is the operator's own pin, and nothing is checked against it.
+
+- **Audience.** A key has no provider audience, so the instance must declare
+  itself (`audience.operator_declared`; `audience.private_containers` is
+  refused) and say which notes, exactly one of: `folders` (folder ids,
+  `fol_...`; a folder's name is a label), each one `granola.folder`
+  container, labelled with its name when a note in it is read; or
+  `all_notes_visible_to_key`, one `granola.workspace` container (the
+  provider scope id). A note is staged in the listed folder with the least id
+  it is in, `operator_declared`. A note in no listed folder is never staged;
+  one the memory already holds is staged once more as a restricted draft in
+  its own folder, which the sink refuses and which withdraws the item (D6),
+  and the notes cursor remembers it, so a later read in a listed folder
+  stages it again even unchanged, which lifts the withdrawal at its equal
+  order.
+- **Items.** A note is up to two items, each with the note id as external
+  id: its AI summary (`note_summary`: `summary_markdown`, else
+  `summary_text`; author the owner by email, kind `ai_summary`; the calendar
+  event by its calendar id and every `http(s)` link in the summary as
+  outbound links; `web_url` the provider url) and, only with
+  `include_transcript` (false by default), its transcript (`transcript`: one
+  `[hh:mm:ss] speaker: text` line per segment, the segment's start in UTC and
+  the speaker's name, else its diarization label, else `Me` or `Them`, packed
+  into sections of at most 32 KiB cut only between segments and anchored at
+  their first segment's time; author the owner, kind `human`). Private notes
+  and attendees are not fields of the note the collector parses. There is no
+  marker: the default rule makes it `updated_at` (the order) with the content
+  digest, so a summary regenerated under the same `updated_at` is a new
+  version too. An item whose content, lifecycle, and container the memory
+  holds is kept, not staged.
+- **A pass** is a reconciliation when none has run to its end within
+  `reconcile_every_seconds` (86,400 by default, the `granola.reconcile`
+  cursor) or one is under way, else incremental; only a reconciliation writes
+  coverage and `last_checked_at`. `notes` is listed to its end first (every
+  note on a reconciliation; on an incremental pass, those updated after the
+  sweep's position less 300 seconds), and a listing cut short reads nothing
+  more. Then the listed notes are swept in `(updated_at, id)` order from the
+  sweep's position, one `notes/{id}` each (with `include=transcript` when
+  transcripts are read; a `413` reads the note without it and pages
+  `notes/{id}/transcript`): a reconciliation re-reads every note, since folder
+  membership and summaries are not in the listing; an incremental pass reads
+  the notes past its position, and any in the overlap that neither the memory
+  holds at its listed `updated_at` nor the cursor remembers settling there.
+  A note with something to stage is one sink transaction with the cursor
+  (`granola.notes`) at its position; the others move the cursor in batches.
+  A reconciliation cut short resumes on the next pass after its last settled
+  note, and holds current what earlier passes of it settled, so its manifest
+  names every current item; when it reaches its end it records its start in
+  `granola.reconcile` and moves the incremental position to where it ended.
+  A note updated after the pass began is left to the next pass.
+- **Deletions need two complete listings.** On a reconciliation whose listing
+  parsed whole, a note the memory holds that the listing did not return is
+  counted in the cursor; missing from two consecutive complete listings, each
+  of its items gets a `revoked` tombstone at the order the memory holds,
+  which wins the tie. A `404` for one listed note never tombstones anything:
+  the note is settled and its container partial.
+- **Partial reads.** Every request counts against `max_pages_per_tick` and
+  waits for a client-side pace of five a second. A rate limit (`429`), a
+  failed request (`5xx`), or the page budget ends the pass partial with the
+  cursor at the last note settled. A `404`, a note that does not parse, a
+  transcript longer than 64 parts, or an item the sink refuses leaves its
+  container partial. A refused key (`401`, `403`) fails the pass.
+
+A note reappearing unchanged after its tombstone stays hidden until it next
+changes, as a Slack message does; the stage-7 hints (`note.access_granted`)
+re-fetch it, but only a newer `updated_at` displaces the tombstone.
+
 **Rejected.** A per-container cursor for documents: a full enumeration
 compared with the heads resumes by construction, and a pass instant as the
 order keeps it independent of file times. Following every symlink inside the
@@ -834,7 +908,15 @@ pass and might never finish; a Relay cursor under the same filter resumes
 it), minting a version for every `updatedAt` (label and assignee churn would
 bury the content changes in history), and one sweep over every team (a rate
 limit would leave every team partial, and one team's cursor could not advance
-without the others).
+without the others). For Granola: the folder allowlist in
+`audience.private_containers` (a key's notes have no provider audience to
+narrow, so the folders are the instance's own declaration, in its settings),
+reading only the notes whose listed `updated_at` moved on a reconciliation (a
+note moved into or out of a listed folder, or a regenerated summary, does not
+move it), resuming a listing from a saved Granola cursor (a listing is cheap
+and its cursors are not documented to last; the position in the sorted
+listing is what resumes), and a tombstone for a `404` (a note the key reads
+again tomorrow would stay hidden at its own order).
 
 ## D9 — Operator imports and the `collect` command
 

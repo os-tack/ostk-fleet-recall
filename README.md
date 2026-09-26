@@ -289,10 +289,12 @@ admitted, in this order:
   each pass lists one root, stages the files whose content changed as
   sectioned parts, tombstones the ones that disappeared, and records coverage
   only when it read the whole root. The Slack collector (provider `slack`)
-  pulls a workspace's channels through the Web API with a bot token, and the
+  pulls a workspace's channels through the Web API with a bot token, the
   Linear collector (provider `linear`) an organization's teams' issues and
-  comments through the GraphQL API with an API key. Last, it records the
-  snapshot of every
+  comments through the GraphQL API with an API key, and the Granola
+  collector (provider `granola`) meeting notes' AI summaries (and, when
+  asked, transcripts) through the public API with an API key. Last, it
+  records the snapshot of every
   [import](#importing-collected-items) whose rows it admitted. `serve` reads
   what it admits as `recall(kind=item)` and `recall(kind=evidence)`.
 - `project`: the body projector, then the lexical tier.
@@ -417,6 +419,43 @@ report counts the fewest requests and complexity points Linear's
 `x-ratelimit-*` headers said were left. `api_url`
 (`https://api.linear.app/graphql` by default) must be https, or plain http to
 a loopback address.
+
+A Granola collector reads the meeting notes one API key (`grn_...`, from a
+Business or Enterprise workspace, sent as `Bearer`) can read, through the
+official public API; Granola's encrypted desktop cache and its private API
+are never read. The file names the variable, and declares which notes the
+project may see, since a key has no audience of its own:
+
+```json
+{"provider": "granola", "connector_principal": "principal.granola",
+ "connector_instance": "granola.acme",
+ "provider_scope_id": "workspace.acme-robotics",
+ "audience": {"operator_declared": true},
+ "settings": {"token_env": "FLEET_RECALL_GRANOLA_API_KEY",
+              "folders": ["fol_4y6LduVdwSKC27"],
+              "include_transcript": false,
+              "reconcile_every_seconds": 86400, "max_pages_per_tick": 500}}
+```
+
+The API names no workspace, so `provider_scope_id` is the operator's own pin
+for it. `audience.operator_declared` is required, and so is exactly one of
+`folders` (folder ids, `fol_...`: only a note in a listed folder is staged,
+and one that leaves them is withdrawn and hidden until it returns) and
+`all_notes_visible_to_key: true` (every note the key reads). Each note
+becomes its AI summary (`summary_markdown`, author kind `ai_summary`) and,
+only with `include_transcript` (off by default), its transcript, one
+`[hh:mm:ss] speaker: text` line per segment, split between segments; a note's
+private notes and attendees are never read. The marker is the note's
+`updated_at` with the content digest, so a regenerated summary supersedes.
+Once every `reconcile_every_seconds` a pass lists every note and re-reads each
+one, and only that reconciliation records coverage; the passes between list
+the notes updated since the last one read and read those. A note missing from
+two consecutive complete listings is hidden as revoked; a `404` for one note
+never hides it. Requests are paced at five a second; a rate limit, a failed
+request, or `max_pages_per_tick` ends a pass partial, and the next pass
+resumes after the last note it settled. `api_base`
+(`https://public-api.granola.ai/v1` by default) must be https, or plain http
+to a loopback address.
 
 Each transcript file is read in windows of its group's `window_bytes` (4 MiB
 by default, at most 8 MiB) behind a durable cursor. A line longer than the

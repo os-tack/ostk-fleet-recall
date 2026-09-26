@@ -64,7 +64,10 @@
 //! * [`slack`] is the Slack collector: channels pulled through the Web API
 //!   with a bot token;
 //! * [`linear`] is the Linear collector: teams' issues and comments pulled
-//!   through the GraphQL API with a personal API key or an OAuth token.
+//!   through the GraphQL API with a personal API key or an OAuth token;
+//! * [`granola`] is the Granola collector: meeting notes' AI summaries (and,
+//!   when the operator asks, their transcripts) pulled through the public API
+//!   with an API key, from the folders the operator declares.
 //!
 //! Operator imports (ADR 0008 D9):
 //!
@@ -82,6 +85,7 @@ pub mod command;
 pub mod coverage;
 pub mod docs;
 pub mod draft;
+pub mod granola;
 pub mod heads;
 pub mod http;
 pub mod import;
@@ -135,10 +139,11 @@ pub trait CollectorAdapterV1: Send + Sync {
 }
 
 /// Every provider adapter this build carries.
-pub static ADAPTERS: [&dyn CollectorAdapterV1; 3] = [
+pub static ADAPTERS: [&dyn CollectorAdapterV1; 4] = [
     &docs::DocsAdapterV1,
     &slack::SlackAdapterV1,
     &linear::LinearAdapterV1,
+    &granola::GranolaAdapterV1,
 ];
 
 /// The adapter of `provider`, when this build carries one.
