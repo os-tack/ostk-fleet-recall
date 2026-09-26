@@ -388,8 +388,14 @@ tier's redacted recall text, never the stored body bytes. The verdict is
 `present` when a hit matched the query's words, or when a dense-only
 neighbour reached cosine 0.45 and its body is not a raw git fact
 (`present_by` names the lane); a weaker neighbour is listed and counted in
-`weak_neighbours`, with `strongest_dense_similarity` reported, but decides
-nothing. It is `absent` only when no hit voted, the query has
+`weak_neighbours`, with `strongest_dense_similarity` and `strongest_hit`
+reported. Such a neighbour never makes the answer `present`, but one whose
+body may vote and that scored at least 0.30 refuses `absent`: the verdict is
+then `unknown` with `dense_neighbour_below_bound`, naming the candidate at
+`hits[strongest_hit]`. An evidence search may be scoped with `source`
+(`git`, `items`, `sessions`); both lanes are then restricted to that media
+type and the verdict carries `scope.source`. It is `absent` only when no hit
+voted, no voting-eligible neighbour reached the band, the query has
 lexical terms, nothing awaits body projection or transcript admission, the
 lexical tier is current, and every active source's last attempt succeeded,
 its last completed check is within its `stale_after_seconds`, and its
