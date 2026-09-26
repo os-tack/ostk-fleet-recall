@@ -60,10 +60,12 @@ use crate::memory_contracts::digest::{DigestDomain, Sha256Digest, framed_digest}
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::memory_contracts::evidence_v2::RepresentationLineageV2;
 use crate::memory_contracts::identity::ResourceUri;
+use crate::redaction::{CollectedSecretClassV1, RedactionGuaranteeV1};
 
 use super::error::{GitDrainError, GitDrainResult};
 use super::fact::{GitFactV1, GitObjectId};
 use super::ingress::{GitConnectorBindingV1, GitIngressClocksV1};
+use super::redaction::redact_git_fact;
 
 /// What one drain did, in the ledger's own vocabulary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -92,6 +94,16 @@ pub struct GitDrainReportV1 {
     /// voids this scan's coverage claim: the newest view of the ref is not in
     /// the ledger, so no receipt for the scope may be minted.
     pub quarantined_ref_observations: u64,
+    /// Facts at least one text field of which was redacted before its ingress
+    /// was built (message, author or committer name or email, tree-entry
+    /// path).
+    pub facts_redacted: u64,
+    /// Fields that became the placeholder alone: withheld by the redactor,
+    /// undecodable around a finding, or over their bound after replacement.
+    pub fields_withheld: u64,
+    /// Secret classes detected across the batch, sorted and deduplicated.
+    /// Metadata only: never the matched bytes.
+    pub classes: Vec<CollectedSecretClassV1>,
 }
 
 impl GitDrainReportV1 {
@@ -138,6 +150,11 @@ pub struct GitDrainContextV1<'drain> {
     pub kek: &'drain ContentKeyEncryptionKey,
     /// The connector's own observation and receipt clocks.
     pub clocks: &'drain GitIngressClocksV1,
+    /// Proof the active package promises redaction before the durable outbox:
+    /// every fact's text fields are redacted under it before its ingress is
+    /// built. A required field, like the transcript collector's, so a drain
+    /// cannot be assembled without one.
+    pub guarantee: &'drain RedactionGuaranteeV1,
 }
 
 impl std::fmt::Debug for GitDrainContextV1<'_> {
@@ -155,6 +172,21 @@ pub async fn drain_git_facts(
 ) -> GitDrainResult<GitDrainReportV1> {
     let mut report = GitDrainReportV1::default();
     for fact in facts {
+        // Redaction first, and the redacted fact is what every later step
+        // sees: the ingress, the admission, the governed content, and the
+        // report's event keys all name the rendering the ledger keeps.
+        let (redacted, redaction) =
+            redact_git_fact(context.guarantee, fact).map_err(GitDrainError::Redaction)?;
+        let fact = &redacted;
+        if redaction.redacted() {
+            report.facts_redacted += 1;
+        }
+        report.fields_withheld += u64::from(redaction.fields_withheld);
+        for class in redaction.classes {
+            if !report.classes.contains(&class) {
+                report.classes.push(class);
+            }
+        }
         let ingress = context.binding.build_ingress(fact, context.clocks, 1)?;
         let admitted = admit_evidence(
             context.active,
@@ -197,6 +229,7 @@ pub async fn drain_git_facts(
             }
         }
     }
+    report.classes.sort_unstable();
     Ok(report)
 }
 

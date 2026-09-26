@@ -296,8 +296,22 @@ read bodies, not ciphertext. That table is readable by the writer login
 
 - Once a body is projected, the key no longer limits who can read that
   evidence. The writer login alone can read every projected git, CI, and
-  transcript body, including anything secret-shaped in it: git ingress
-  redaction is deferred, so git bodies are raw commit text.
+  transcript body. Since redaction profile 3 every ingress redacts under the
+  crate's one redactor (`crate::redaction`: the six shared shapes plus the
+  provider shapes, Stripe included): a transcript turn before the outbox, a
+  git fact's message, author, committer, and path before its ingress is
+  built. Residual: facts are content-addressed, so a body admitted before
+  profile 3 stays raw at rest, and only its recall text is redacted, once the
+  worker's lexical step re-projects every row stored under an older
+  `LEXICAL_NORMALIZATION_VERSION` (`rows_reprojected` on the first tick after
+  deploy, zero afterwards; the dense step of the same tick re-embeds). On
+  that tick the git step re-walks each ref from the root, and every
+  historical commit whose text is now redacted re-presents with a different
+  payload under the same source-fact identity and is quarantined as a
+  `PreimageDisagreement`: a one-time `quarantined` count equal to the number
+  of such commits, visible in the report rather than a silent rewrite.
+  Closing that residual needs supersession or erasure, which this ADR does
+  not provide.
 - Destroying the key no longer erases projected evidence. Erasure must also
   purge `memory_body_objects_v1` and the lexical and dense rows derived from
   it.
@@ -323,8 +337,10 @@ holds no `DELETE` on them.
   turns every empty answer `unknown` once its sources go stale.
 
 **Deferred.** An `--interval` loop and managed scheduling; `git` and `gh` in
-the production image; changed-path and incremental git scans and a git ingress
-redactor; transcript tool-use, tool-result, and thinking records;
+the production image; changed-path and incremental git scans; supersession
+or erasure of bodies admitted before redaction profile 3 (the git ingress
+redactor itself landed with profile 3, see D9); transcript tool-use,
+tool-result, and thinking records;
 publication-plane evidence recall; fusing evidence into chunk recall;
 registering the coverage labels in a package; dense or semantic absence
 verdicts and an evidence-specific dense floor; query-centred snippets;

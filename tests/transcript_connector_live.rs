@@ -601,11 +601,21 @@ fn clean_transcript(session: &str) -> String {
     )
 }
 
-/// Four turns: two clean, one carrying unredactable PEM key material (withheld
-/// whole), and one carrying a redactable AWS access key id (staged redacted).
+/// The literal provider tokens planted in [`secret_transcript`]: a Slack bot
+/// token and a Stripe key, the shapes the trial found stored in plaintext
+/// (issue 1). Literal copies of the placeholders in
+/// `src/collectors/test_support.rs`, which proves neither matches a
+/// push-protection pattern; they are copied rather than imported because
+/// that module is `cfg(test)` inside the crate.
+const PLANTED_SLACK_TOKEN: &str = "xoxb-EXAMPLE-NOT-A-TOKEN";
+const PLANTED_STRIPE_KEY: &str = "sk_live_EXAMPLENOTAKEY00";
+
+/// Six turns: two clean, one carrying unredactable PEM key material (withheld
+/// whole), one carrying a redactable AWS access key id, and two carrying
+/// provider tokens (a Slack bot token, a Stripe key), each staged redacted.
 fn secret_transcript(session: &str) -> String {
     format!(
-        "{}\n{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n{}\n{}\n",
         line(
             "user",
             session,
@@ -635,6 +645,20 @@ fn secret_transcript(session: &str) -> String {
             "turn-4",
             "2026-08-15T12:30:03.000Z",
             "understood, moving on"
+        ),
+        line(
+            "user",
+            session,
+            "turn-5",
+            "2026-08-15T12:30:04.000Z",
+            &format!("the bot posts with {PLANTED_SLACK_TOKEN}, rotate it")
+        ),
+        line(
+            "assistant",
+            session,
+            "turn-6",
+            "2026-08-15T12:30:05.000Z",
+            &format!("and the billing key {PLANTED_STRIPE_KEY} too")
         )
     )
 }
@@ -1177,47 +1201,54 @@ async fn live_a_planted_secret_never_reaches_the_outbox_the_ledger_or_the_conten
     );
 
     let (outcome, stats) = connector.stage(&source_id, &bytes).await;
-    assert_eq!(stats.turns_parsed, 4);
+    assert_eq!(stats.turns_parsed, 6);
     assert_eq!(
-        stats.turns_staged, 3,
+        stats.turns_staged, 5,
         "the PEM key-material turn is withheld whole"
     );
     assert_eq!(stats.turns_withheld, 1);
-    assert_eq!(stats.turns_redacted, 1);
+    assert_eq!(
+        stats.turns_redacted, 3,
+        "the AWS key, the Slack token, and the Stripe key are each redacted"
+    );
     assert_eq!(
         outcome,
         TranscriptEnqueueOutcome::Enqueued {
-            rows_written: 3,
+            rows_written: 5,
             batch_seq: 1,
         }
     );
 
     // The secret is already absent BEFORE the drain: redaction happens before
     // anything durable exists, not on the way out of the outbox.
-    connector
-        .assert_never_durable(PLANTED_REDACTABLE_SECRET)
-        .await;
-    connector.assert_never_durable(PLANTED_KEY_MATERIAL).await;
-    connector
-        .assert_never_durable("BEGIN RSA PRIVATE KEY")
-        .await;
+    for planted in [
+        PLANTED_REDACTABLE_SECRET,
+        PLANTED_KEY_MATERIAL,
+        "BEGIN RSA PRIVATE KEY",
+        PLANTED_SLACK_TOKEN,
+        PLANTED_STRIPE_KEY,
+    ] {
+        connector.assert_never_durable(planted).await;
+    }
 
     let summary = connector
         .drain(TranscriptDrainModeV1::Pending)
         .await
         .unwrap();
-    assert_eq!(summary.appended, 3);
-    assert_eq!(summary.receipts, 3);
+    assert_eq!(summary.appended, 5);
+    assert_eq!(summary.receipts, 5);
 
     // And absent after it, through the accepted events and the content store,
     // ciphertext and decrypted plaintext alike.
-    connector
-        .assert_never_durable(PLANTED_REDACTABLE_SECRET)
-        .await;
-    connector.assert_never_durable(PLANTED_KEY_MATERIAL).await;
-    connector
-        .assert_never_durable("BEGIN RSA PRIVATE KEY")
-        .await;
+    for planted in [
+        PLANTED_REDACTABLE_SECRET,
+        PLANTED_KEY_MATERIAL,
+        "BEGIN RSA PRIVATE KEY",
+        PLANTED_SLACK_TOKEN,
+        PLANTED_STRIPE_KEY,
+    ] {
+        connector.assert_never_durable(planted).await;
+    }
 
     // The redactable turn IS present — with a placeholder where the secret was.
     // This is what separates "redacted" from "silently dropped everything".
@@ -1234,6 +1265,21 @@ async fn live_a_planted_secret_never_reaches_the_outbox_the_ledger_or_the_conten
     );
     assert!(body.contains("the access key is"));
     assert!(body.contains("in the env"));
+    // The provider-token turns too: the prose around each token survives.
+    for (ordinal, kept) in [(4, "the bot posts with"), (5, "and the billing key")] {
+        let candidate = connector.staged_candidate(ordinal).await;
+        let body = String::from_utf8(
+            connector
+                .governed_content(candidate.canonical_payload.storage_identity)
+                .await,
+        )
+        .unwrap();
+        assert!(
+            body.contains(REDACTION_PLACEHOLDER),
+            "turn {ordinal}: {body}"
+        );
+        assert!(body.contains(kept), "turn {ordinal}: {body}");
+    }
 
     // The withheld turn left a HOLE in the ordinals rather than renumbering the
     // stream: a withheld turn is a visible absence, not an invisible shift.
@@ -1246,9 +1292,9 @@ async fn live_a_planted_secret_never_reaches_the_outbox_the_ledger_or_the_conten
         .map(|row| row.turn_ordinal)
         .collect();
     ordinals.sort_unstable();
-    assert_eq!(ordinals, vec![0, 2, 3]);
-    assert_eq!(connector.scoped_count("memory_evidence_events").await, 3);
-    assert_eq!(connector.scoped_count("memory_content_objects").await, 3);
+    assert_eq!(ordinals, vec![0, 2, 3, 4, 5]);
+    assert_eq!(connector.scoped_count("memory_evidence_events").await, 5);
+    assert_eq!(connector.scoped_count("memory_content_objects").await, 5);
 }
 
 #[tokio::test]

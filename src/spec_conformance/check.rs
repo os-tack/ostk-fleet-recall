@@ -87,6 +87,7 @@ use crate::observer_runtime::{
     ObserverRuntimeDeclarationV1, REQUIRED_APPLICABILITY_DIMENSION, build_observer_run,
     drain_observer_run, enumerate_rust_enum,
 };
+use crate::redaction::RedactionGuaranteeV1;
 use crate::registry_witness::WriterAuthorityRuntime;
 use crate::worker::{GitSourceV1, ObserverSourceV1, WorkerSourcesV1};
 
@@ -434,6 +435,12 @@ pub async fn run_spec_check(
         git.installation_id,
     )
     .map_err(|error| refused("the git source does not bind", &error))?;
+    let guarantee = RedactionGuaranteeV1::from_active_package(&git_active).map_err(|error| {
+        refused(
+            "the active package does not guarantee redaction before the durable outbox",
+            &error,
+        )
+    })?;
     let drained = drain_git_facts(
         &GitDrainContextV1 {
             binding: &git_binding,
@@ -445,6 +452,7 @@ pub async fn run_spec_check(
             clocks: &GitIngressClocksV1 {
                 received_at: now.clone(),
             },
+            guarantee: &guarantee,
         },
         &[source.git_fact()],
     )

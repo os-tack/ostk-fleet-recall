@@ -126,6 +126,11 @@ pub enum GitDrainError {
     /// A fact handed to the drain is not structurally valid.
     #[error("git drain fact failure: {0}")]
     Fact(#[from] GitFactError),
+    /// Redacting a fact's text fields produced a rendering the fact schema
+    /// refuses. Nothing of the batch is admitted: a fact whose redaction
+    /// failed is never admitted raw.
+    #[error("git drain redaction failure: {0}")]
+    Redaction(GitFactError),
     /// Admission refused the candidate.
     #[error("git drain admission failure: {0}")]
     Admission(#[from] crate::evidence_ledger::EvidenceAdmissionError),

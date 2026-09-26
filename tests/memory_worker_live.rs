@@ -312,6 +312,127 @@ async fn live_worker_second_tick_is_a_replay_when_configured() {
     }
 }
 
+/// The literal provider tokens the redaction tick plants: a Slack bot token in
+/// a commit message and a GitHub token in a transcript turn, the shapes the
+/// trial found stored and served in plaintext (issue 1). Literal copies of
+/// the placeholders in `src/collectors/test_support.rs`, which proves neither
+/// matches a push-protection pattern; copied because that module is
+/// `cfg(test)` inside the crate.
+const PLANTED_SLACK_TOKEN: &str = "xoxb-EXAMPLE-NOT-A-TOKEN";
+const PLANTED_GITHUB_TOKEN: &str = "ghp_EXAMPLENOTAREALTOKENEXAMPLENOTAREAL";
+/// A fixed instant after the fixture's second commit.
+const THIRD_COMMIT_DATE: &str = "1755432000 +0000";
+
+/// Every stored byte string of the scope's body and lexical planes.
+async fn body_and_lexical_bytes(pool: &PgPool, fixture: &Fixture) -> Vec<Vec<u8>> {
+    let mut stored = Vec::new();
+    for sql in [
+        "SELECT body_bytes FROM memory_body_objects_v1 WHERE tenant_id = $1 AND project = $2",
+        "SELECT lexical_text::BYTES FROM memory_body_lexical_projection_v1 \
+         WHERE tenant_id = $1 AND project = $2",
+    ] {
+        let rows: Vec<Vec<u8>> = sqlx::query_scalar(sql)
+            .bind(fixture.installed.scope.tenant_id)
+            .bind(&fixture.installed.scope.project)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        stored.extend(rows);
+    }
+    stored
+}
+
+/// Issue 1 of the trial, end to end through one tick: a commit whose message
+/// quotes a Slack token and a transcript turn quoting a GitHub token are
+/// admitted with the placeholder, counted, unfindable by evidence recall, and
+/// absent, as bytes and as the hex a git fact carries, from every body and
+/// every lexical text.
+#[tokio::test]
+async fn live_worker_redacts_provider_tokens_at_git_and_transcript_ingress_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = Fixture::install(&pool, "worker-redaction").await;
+    let head = fixture.repository.head();
+    fixture.repository.commit(
+        Some(&head),
+        &format!("ops: rotate {PLANTED_SLACK_TOKEN} before the release"),
+        THIRD_COMMIT_DATE,
+    );
+    append_transcript(
+        &fixture,
+        "session.jsonl",
+        &[line(
+            "assistant",
+            "turn-3",
+            "2026-08-15T12:30:02.000Z",
+            &format!("push with {PLANTED_GITHUB_TOKEN} and then rotate it"),
+        )],
+    );
+
+    let report = fixture.worker(&pool, "all").await.run_tick().await;
+    assert_all_ok(&report);
+    assert_eq!(report.redaction_profile, 3, "the tick names its profile");
+    assert_eq!(counter(&report, WorkerStepV1::Git, "facts_redacted"), 1);
+    assert_eq!(counter(&report, WorkerStepV1::Git, "fields_withheld"), 0);
+    assert_eq!(counter(&report, WorkerStepV1::Git, "quarantined"), 0);
+    assert!(counter(&report, WorkerStepV1::Transcript, "turns_redacted") >= 1);
+    assert_eq!(
+        counter(&report, WorkerStepV1::Transcript, "turns_withheld"),
+        0
+    );
+    // A fresh scope stores nothing under an older normalization version.
+    for step in [WorkerStepV1::Lexical, WorkerStepV1::Dense] {
+        assert_eq!(counter(&report, step, "rows_reprojected"), 0, "{step:?}");
+    }
+
+    let reader = fixture.reader(&pool);
+    for literal in [PLANTED_SLACK_TOKEN, PLANTED_GITHUB_TOKEN] {
+        let hits = reader.recall(literal, None, 10).await.unwrap();
+        assert!(
+            hits.hits.is_empty(),
+            "{literal} must not be recallable: {hits:?}"
+        );
+    }
+    // The commit and the turn ARE there, with the placeholder where the token
+    // was: a redaction, not a drop.
+    for word in ["release", "rotate"] {
+        let hits = reader.recall(word, None, 10).await.unwrap();
+        assert!(!hits.hits.is_empty(), "recall must find {word:?}");
+    }
+
+    let stored = body_and_lexical_bytes(&pool, &fixture).await;
+    assert!(!stored.is_empty());
+    let mut placeholders = 0_usize;
+    for literal in [PLANTED_SLACK_TOKEN, PLANTED_GITHUB_TOKEN] {
+        for needle in [
+            literal.as_bytes().to_vec(),
+            hex::encode(literal).into_bytes(),
+        ] {
+            for (index, bytes) in stored.iter().enumerate() {
+                assert!(
+                    !bytes.windows(needle.len()).any(|window| window == needle),
+                    "stored text {index} carries {literal} (as bytes or hex)"
+                );
+            }
+        }
+    }
+    for needle in [
+        b"[REDACTED]".to_vec(),
+        hex::encode("[REDACTED]").into_bytes(),
+    ] {
+        placeholders += stored
+            .iter()
+            .filter(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+            .count();
+    }
+    assert!(
+        placeholders >= 2,
+        "the commit body (hex) and the turn body carry the placeholder"
+    );
+}
+
 #[tokio::test]
 async fn live_worker_isolates_step_failures_when_configured() {
     let Some(database_url) = common::test_database_url() else {

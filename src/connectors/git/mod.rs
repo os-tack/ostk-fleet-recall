@@ -43,6 +43,9 @@
 //!   [`crate::memory_contracts::evidence_v2::EvidenceIngressCandidateV2`]s
 //!   whose scope comes from the witness and whose locator coordinates come from
 //!   the activated recipe.
+//! * [`redaction`] — redacting a fact's text fields (message, author and
+//!   committer name and email, tree-entry path) under the active package's
+//!   redaction guarantee, before any ingress is built.
 //! * [`drain`] — admitting and appending a batch through the W1-EVID seam, plus
 //!   the coverage observation and the repository+ref resume cursor.
 //!
@@ -65,7 +68,12 @@
 //!   observation rather than a mutation of the old one.
 //! * **EVID-05** — no private raw artifact is ever emitted: the private plane
 //!   would need its own key, retention, and publication boundary, which this
-//!   connector does not have.
+//!   connector does not have. Since redaction profile 3 the drain also
+//!   redacts every fact's text fields under the active package's redaction
+//!   guarantee before building its ingress ([`redaction`]), so a commit
+//!   message quoting a credential is admitted with the placeholder in its
+//!   governed body. A fact admitted before that keeps its raw body at rest;
+//!   only its recall text is redacted, once the worker re-projects it.
 //! * **COVER-03** — a coverage receipt is only built when the drain produced a
 //!   ref-observation accepted event to bind, and only from facts the ledger
 //!   made durable. A quarantine writes a dead-letter receipt and no event row,
@@ -78,6 +86,7 @@ pub mod drain;
 pub mod error;
 pub mod fact;
 pub mod ingress;
+pub mod redaction;
 pub mod scan;
 
 pub use drain::{
@@ -96,6 +105,7 @@ pub use fact::{
     GitRefObservationLogV1, GitRepositoryIdV1, MAX_GIT_MESSAGE_BYTES, MAX_GIT_PATH_BYTES,
 };
 pub use ingress::{GIT_FACT_MEDIA_TYPE, GitConnectorBindingV1, GitIngressClocksV1, GitIngressV1};
+pub use redaction::{GitFactRedactionV1, redact_git_fact};
 pub use scan::{
     GitRepositoryReader, GitScanRequestV1, GitScanV1, GitTreeEntryV1, GitTreeScanModeV1,
 };

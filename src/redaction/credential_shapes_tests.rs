@@ -1,7 +1,16 @@
-//! Unit tests for the redactor: every detector positive and negative, and every
-//! fail-closed path as an ordinary test.
+//! Unit tests for the six shared shapes and the replacement discipline: every
+//! detector positive and negative, and every fail-closed path as an ordinary
+//! test. The shapes are scanned through the merged [`redact`], so each
+//! reported class is `Shared(..)`.
 
 use super::*;
+use crate::redaction::{
+    CollectedSecretClassV1, REDACTION_PLACEHOLDER, RedactionDispositionV1, redact, scan_secrets,
+};
+
+const fn shared(class: SecretClassV1) -> CollectedSecretClassV1 {
+    CollectedSecretClassV1::Shared(class)
+}
 
 fn staged(text: &str) -> String {
     match redact(text).disposition {
@@ -15,7 +24,7 @@ fn staged(text: &str) -> String {
     }
 }
 
-fn classes(text: &str) -> Vec<SecretClassV1> {
+fn classes(text: &str) -> Vec<CollectedSecretClassV1> {
     redact(text).classes
 }
 
@@ -31,7 +40,7 @@ fn clean_text_passes_through_byte_identical() {
 #[test]
 fn an_aws_access_key_id_is_detected_and_replaced() {
     let text = "creds are AKIAIOSFODNN7EXAMPLE for the bucket";
-    assert_eq!(classes(text), vec![SecretClassV1::AwsAccessKeyId]);
+    assert_eq!(classes(text), vec![shared(SecretClassV1::AwsAccessKeyId)]);
     let redacted = staged(text);
     assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"));
     assert_eq!(redacted, "creds are [REDACTED] for the bucket");
@@ -40,22 +49,22 @@ fn an_aws_access_key_id_is_detected_and_replaced() {
 #[test]
 fn a_short_akia_lookalike_is_not_a_finding() {
     // Fewer than the 16 required tail characters: a real negative.
-    assert!(scan_secrets("AKIASHORT").is_empty());
+    assert!(scan_shared_secrets("AKIASHORT").is_empty());
     // The tail must be uppercase alphanumeric only.
-    assert!(scan_secrets("AKIAiosfodnn7example").is_empty());
+    assert!(scan_shared_secrets("AKIAiosfodnn7example").is_empty());
 }
 
 #[test]
 fn a_bearer_token_is_detected_case_insensitively() {
     let text = "Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz01";
-    assert!(classes(text).contains(&SecretClassV1::BearerToken));
+    assert!(classes(text).contains(&shared(SecretClassV1::BearerToken)));
     let redacted = staged(text);
     assert!(!redacted.contains("sk-abcdefghijklmnopqrstuvwxyz01"));
 }
 
 #[test]
 fn a_short_bearer_value_is_not_a_finding() {
-    assert!(scan_secrets("bearer short").is_empty());
+    assert!(scan_shared_secrets("bearer short").is_empty());
 }
 
 #[test]
@@ -67,7 +76,7 @@ fn an_api_key_assignment_is_detected_in_both_json_and_env_form() {
         "SLACK_TOKEN=xoxb-abcdefghijklmnop",
     ] {
         assert!(
-            classes(text).contains(&SecretClassV1::ApiKeyAssignment),
+            classes(text).contains(&shared(SecretClassV1::ApiKeyAssignment)),
             "expected an api-key finding in {text}"
         );
         assert!(!staged(text).contains("abcdefghijklmnop"));
@@ -78,21 +87,21 @@ fn an_api_key_assignment_is_detected_in_both_json_and_env_form() {
 fn a_short_api_key_value_is_not_a_finding() {
     // Below the minimum assigned-secret length: a real negative, so ordinary
     // prose mentioning a key name is not redacted into uselessness.
-    assert!(scan_secrets("api_key=short").is_empty());
-    assert!(scan_secrets("the token is unset").is_empty());
+    assert!(scan_shared_secrets("api_key=short").is_empty());
+    assert!(scan_shared_secrets("the token is unset").is_empty());
 }
 
 #[test]
 fn a_password_assignment_is_detected_at_a_shorter_length() {
     let text = "PGPASSWORD=hunter22";
-    assert!(classes(text).contains(&SecretClassV1::PasswordAssignment));
+    assert!(classes(text).contains(&shared(SecretClassV1::PasswordAssignment)));
     assert!(!staged(text).contains("hunter22"));
 }
 
 #[test]
 fn a_url_embedded_credential_is_detected() {
     let text = "postgres://admin:s3cr3tpass@db.internal:26257/fleet";
-    assert!(classes(text).contains(&SecretClassV1::UrlEmbeddedCredential));
+    assert!(classes(text).contains(&shared(SecretClassV1::UrlEmbeddedCredential)));
     let redacted = staged(text);
     assert!(!redacted.contains("s3cr3tpass"));
     assert!(!redacted.contains("admin:s3cr3tpass"));
@@ -100,8 +109,8 @@ fn a_url_embedded_credential_is_detected() {
 
 #[test]
 fn a_credential_free_url_is_not_a_finding() {
-    assert!(scan_secrets("https://example.com/path?q=1").is_empty());
-    assert!(scan_secrets("postgres://db.internal:26257/fleet").is_empty());
+    assert!(scan_shared_secrets("https://example.com/path?q=1").is_empty());
+    assert!(scan_shared_secrets("postgres://db.internal:26257/fleet").is_empty());
 }
 
 #[test]
@@ -113,11 +122,15 @@ fn a_private_key_block_withholds_the_whole_turn() {
     assert_eq!(
         outcome.disposition,
         RedactionDispositionV1::Withhold {
-            class: SecretClassV1::PrivateKeyBlock
+            class: shared(SecretClassV1::PrivateKeyBlock)
         }
     );
     assert_eq!(outcome.staged_text(), None);
-    assert!(outcome.classes.contains(&SecretClassV1::PrivateKeyBlock));
+    assert!(
+        outcome
+            .classes
+            .contains(&shared(SecretClassV1::PrivateKeyBlock))
+    );
 }
 
 #[test]
@@ -128,7 +141,7 @@ fn a_truncated_private_key_block_also_withholds() {
     assert!(matches!(
         redact(text).disposition,
         RedactionDispositionV1::Withhold {
-            class: SecretClassV1::PrivateKeyBlock
+            class: CollectedSecretClassV1::Shared(SecretClassV1::PrivateKeyBlock)
         }
     ));
 }
@@ -139,8 +152,16 @@ fn one_unredactable_class_withholds_a_turn_that_also_has_redactable_ones() {
     let text = "AKIAIOSFODNN7EXAMPLE\n-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----";
     let outcome = redact(text);
     assert_eq!(outcome.staged_text(), None);
-    assert!(outcome.classes.contains(&SecretClassV1::AwsAccessKeyId));
-    assert!(outcome.classes.contains(&SecretClassV1::PrivateKeyBlock));
+    assert!(
+        outcome
+            .classes
+            .contains(&shared(SecretClassV1::AwsAccessKeyId))
+    );
+    assert!(
+        outcome
+            .classes
+            .contains(&shared(SecretClassV1::PrivateKeyBlock))
+    );
 }
 
 #[test]
@@ -164,7 +185,7 @@ fn exactly_one_secret_class_is_unredactable() {
 fn a_public_key_header_is_not_a_private_key_finding() {
     let text = "-----BEGIN PUBLIC KEY-----\nMFkwEw\n-----END PUBLIC KEY-----";
     assert!(
-        !classes(text).contains(&SecretClassV1::PrivateKeyBlock),
+        !classes(text).contains(&shared(SecretClassV1::PrivateKeyBlock)),
         "a public key block is not a private key"
     );
 }
@@ -205,9 +226,9 @@ fn multiple_secrets_in_one_turn_are_all_replaced() {
         outcome.classes,
         {
             let mut expected = vec![
-                SecretClassV1::AwsAccessKeyId,
-                SecretClassV1::BearerToken,
-                SecretClassV1::PasswordAssignment,
+                shared(SecretClassV1::AwsAccessKeyId),
+                shared(SecretClassV1::BearerToken),
+                shared(SecretClassV1::PasswordAssignment),
             ];
             expected.sort_unstable();
             expected

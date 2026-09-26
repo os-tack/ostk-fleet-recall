@@ -130,18 +130,37 @@ const SELECT_BODIES_AFTER_SQL: &str = "SELECT body.content_sha256, body.body_byt
        AND (body.created_at, body.content_sha256) > ($3, $4) \
      ORDER BY body.created_at, body.content_sha256 LIMIT $5";
 
-// The conflict arm is a DOWNGRADE-ONLY reconciliation: a body whose recorded
-// decision has since collapsed to private demotes its already-written lexical
-// row, and no arm here ever writes 'publication_safe' over a stored row.
-const INSERT_LEXICAL_SQL: &str = "INSERT INTO public.memory_body_lexical_projection_v1 (\
+// The conflict arm does two things and nothing else. Visibility is a
+// DOWNGRADE-ONLY reconciliation: a body whose recorded decision has since
+// collapsed to private demotes its already-written lexical row, and no arm
+// here ever writes 'publication_safe' over a stored row. The text columns are
+// rewritten ONLY when the stored row was derived under an OLDER normalization
+// version: that is the worker's re-projection after a version bump (a
+// stricter redaction profile, for one), and the only case in which the same
+// body legitimately projects to different text. At the same version the text
+// columns are untouched, so `write_lexical`'s digest check still refuses a
+// normalizer that disagrees with a stored row without having moved the
+// version.
+const INSERT_LEXICAL_SQL: &str = "INSERT INTO public.memory_body_lexical_projection_v1 AS lexical (\
      tenant_id, project, body_content_id, body_created_at, lexical_state, \
      unindexable_reason, normalization_version, lexical_text, lexical_text_digest, \
      visibility_class\
      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
      ON CONFLICT (tenant_id, project, body_content_id) DO UPDATE SET \
-     visibility_class = 'private' \
-     WHERE public.memory_body_lexical_projection_v1.visibility_class \
-         IS DISTINCT FROM excluded.visibility_class";
+     lexical_state = CASE WHEN lexical.normalization_version < excluded.normalization_version \
+         THEN excluded.lexical_state ELSE lexical.lexical_state END, \
+     unindexable_reason = CASE WHEN lexical.normalization_version < excluded.normalization_version \
+         THEN excluded.unindexable_reason ELSE lexical.unindexable_reason END, \
+     lexical_text = CASE WHEN lexical.normalization_version < excluded.normalization_version \
+         THEN excluded.lexical_text ELSE lexical.lexical_text END, \
+     lexical_text_digest = CASE WHEN lexical.normalization_version < excluded.normalization_version \
+         THEN excluded.lexical_text_digest ELSE lexical.lexical_text_digest END, \
+     normalization_version = GREATEST(lexical.normalization_version, \
+         excluded.normalization_version), \
+     visibility_class = CASE WHEN lexical.visibility_class IS DISTINCT FROM excluded.visibility_class \
+         THEN 'private' ELSE lexical.visibility_class END \
+     WHERE lexical.normalization_version < excluded.normalization_version \
+        OR lexical.visibility_class IS DISTINCT FROM excluded.visibility_class";
 
 const SELECT_LEXICAL_DIGEST_SQL: &str = "SELECT lexical_text_digest \
      FROM public.memory_body_lexical_projection_v1 \
@@ -162,15 +181,23 @@ const SELECT_LEXICAL_AFTER_SQL: &str = "SELECT body_content_id, body_created_at,
        AND (body_created_at, body_content_id) > ($3, $4) \
      ORDER BY body_created_at, body_content_id LIMIT $5";
 
-const INSERT_DENSE_SQL: &str = "INSERT INTO public.memory_body_dense_projection_v1 (\
+// The dense conflict arm re-writes the vector when the stored row was embedded
+// under the same identity (same model, same body): the embedding identity
+// closes over the descriptor and the body, not the lexical text, so a re-embed
+// after the lexical text moved (a normalization version bump) would otherwise
+// leave the old vector in place. A row under a different identity keeps its
+// vector, and the identity check that follows the statement refuses it.
+// Visibility is downgrade-only, as in the lexical arm.
+const INSERT_DENSE_SQL: &str = "INSERT INTO public.memory_body_dense_projection_v1 AS dense (\
      tenant_id, project, body_content_id, body_created_at, embedding_identity_id, \
      model_digest, tokenization_version, preprocessing_version, distance_metric, \
      dimensions, embedding, visibility_class\
      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::VECTOR(512), $12) \
      ON CONFLICT (tenant_id, project, body_content_id) DO UPDATE SET \
-     visibility_class = 'private' \
-     WHERE public.memory_body_dense_projection_v1.visibility_class \
-         IS DISTINCT FROM excluded.visibility_class";
+     embedding = CASE WHEN dense.embedding_identity_id = excluded.embedding_identity_id \
+         THEN excluded.embedding ELSE dense.embedding END, \
+     visibility_class = CASE WHEN dense.visibility_class IS DISTINCT FROM excluded.visibility_class \
+         THEN 'private' ELSE dense.visibility_class END";
 
 // Downgrade-only reconciliation, run at the end of every pass. A body whose
 // recorded decision collapsed to private AFTER its projection row was written
@@ -1579,18 +1606,27 @@ mod tests {
     #[test]
     fn every_visibility_write_can_only_demote() {
         // The projection's class is never widened by any statement here: the
-        // two conflict arms and the two reconciliation statements assign the
-        // literal 'private' and nothing else.
+        // two reconciliation statements assign the literal 'private' and
+        // nothing else, and the two conflict arms assign 'private' or write
+        // the stored class back unchanged.
+        for statement in [DEMOTE_LEXICAL_SQL, DEMOTE_DENSE_SQL] {
+            assert!(
+                statement.contains("visibility_class = 'private'"),
+                "{statement}"
+            );
+        }
+        for (statement, alias) in [(INSERT_LEXICAL_SQL, "lexical"), (INSERT_DENSE_SQL, "dense")] {
+            assert!(
+                statement.contains(&format!("THEN 'private' ELSE {alias}.visibility_class END")),
+                "{statement}"
+            );
+        }
         for statement in [
             INSERT_LEXICAL_SQL,
             INSERT_DENSE_SQL,
             DEMOTE_LEXICAL_SQL,
             DEMOTE_DENSE_SQL,
         ] {
-            assert!(
-                statement.contains("visibility_class = 'private'"),
-                "{statement}"
-            );
             // The only assignment either statement makes is to 'private': the
             // SET clause is `visibility_class = 'private'` and no SET clause
             // anywhere mentions the publication class.

@@ -53,8 +53,9 @@ use ostk_fleet_recall::memory_contracts::identity::{IdentityForm, ResourceUri};
 use ostk_fleet_recall::memory_contracts::registry::RegistryHeadV1;
 use ostk_fleet_recall::projectors::{
     CockroachDenseProjector, CockroachLexicalProjector, CockroachRecallReader, DenseProjector,
-    EMBEDDING_DIMENSIONS, EmbeddingModelDescriptorV1, EmbeddingProvider, LexicalProjector,
-    RecallProjectionError, RecallProjectionResult, RecallTierV1,
+    EMBEDDING_DIMENSIONS, EmbeddingModelDescriptorV1, EmbeddingProvider,
+    LEXICAL_NORMALIZATION_VERSION, LexicalProjector, RecallProjectionError, RecallProjectionResult,
+    RecallTierV1,
 };
 use ostk_fleet_recall::store::cockroach::{CockroachStore, PoolConfig, RetryPolicy};
 use ostk_recall_core::PrivacyTier;
@@ -942,6 +943,125 @@ async fn live_replay_from_the_body_tables_rebuilds_byte_identical_projections() 
     lexical.reproject_all().await.unwrap();
     dense.reembed_all().await.unwrap();
     assert_eq!(reader.snapshot().await.unwrap(), second);
+}
+
+/// Lexical rows of the scope stored under an older normalization version than
+/// this build's: the count the worker's tick reads before its lexical step.
+async fn stale_lexical_rows(pool: &PgPool, tenant_id: Uuid, project: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM public.memory_body_lexical_projection_v1 \
+         WHERE tenant_id = $1 AND project = $2 AND normalization_version < $3",
+    )
+    .bind(tenant_id)
+    .bind(project)
+    .bind(i64::from(LEXICAL_NORMALIZATION_VERSION))
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A lexical row stored under an older normalization version is left alone by
+/// a cursor pass and rewritten in place by a full re-projection, and a full
+/// re-embed then replaces its vector: the path the worker takes on the first
+/// tick after a version bump (`rows_reprojected`), which is what redacts the
+/// served copy of a body admitted before redaction profile 3.
+#[tokio::test]
+async fn live_a_row_at_an_older_normalization_version_is_rewritten_and_re_embedded() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let project = format!("stale-{}", Uuid::now_v7());
+    let scope = physical_scope(&project);
+    let tenant_id = scope.tenant_id;
+    let pool = live_pool(&database_url, scope).await;
+    seed_body_plane(&pool, tenant_id, &project, &[SOURCE_A, SOURCE_B]).await;
+
+    let lexical = lexical_projector(&pool, tenant_id, &project);
+    let dense = dense_projector(&pool, tenant_id, &project, FixtureProvider::healthy());
+    let reader = reader(&pool, tenant_id, &project);
+    lexical.project_pending().await.unwrap();
+    dense.embed_pending().await.unwrap();
+    let fresh = reader.snapshot().await.unwrap();
+    let bodies = count(&pool, "memory_body_objects_v1", tenant_id, &project).await;
+    assert_eq!(i64::try_from(fresh.lexical.len()).unwrap(), bodies);
+
+    // Age one row to what a version-2 normalizer would have stored: the raw
+    // text, a provider token (a literal placeholder) still in it, and the
+    // vector of that text. The literal is `xoxb-EXAMPLE-NOT-A-TOKEN` from
+    // `src/collectors/test_support.rs`, which proves it never matches a
+    // push-protection pattern.
+    let aged = fresh.lexical[0].0.clone();
+    let stale_text = "stale rendering with xoxb-EXAMPLE-NOT-A-TOKEN still in it";
+    let older_version = i64::from(LEXICAL_NORMALIZATION_VERSION) - 1;
+    sqlx::query(
+        "UPDATE public.memory_body_lexical_projection_v1 \
+         SET normalization_version = $4, lexical_text = $5, lexical_text_digest = $6 \
+         WHERE tenant_id = $1 AND project = $2 AND body_content_id = $3",
+    )
+    .bind(tenant_id)
+    .bind(&project)
+    .bind(&aged)
+    .bind(older_version)
+    .bind(stale_text)
+    .bind(vec![0x77_u8; 32])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let stale_vector = format!(
+        "[{}]",
+        fixture_vector(stale_text)
+            .iter()
+            .map(f32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    sqlx::query(
+        "UPDATE public.memory_body_dense_projection_v1 SET embedding = $4::VECTOR(512) \
+         WHERE tenant_id = $1 AND project = $2 AND body_content_id = $3",
+    )
+    .bind(tenant_id)
+    .bind(&project)
+    .bind(&aged)
+    .bind(&stale_vector)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stale_lexical_rows(&pool, tenant_id, &project).await, 1);
+    let aged_snapshot = reader.snapshot().await.unwrap();
+    assert_ne!(aged_snapshot, fresh);
+    assert!(
+        aged_snapshot
+            .lexical
+            .iter()
+            .any(|row| row.4.contains("xoxb-EXAMPLE-NOT-A-TOKEN")),
+        "the served copy really does carry the token before re-projection"
+    );
+
+    // A cursor pass sees nothing new and leaves the stale row as it is.
+    let pass = lexical.project_pending().await.unwrap();
+    assert_eq!(pass.bodies_consumed, 0);
+    assert_eq!(stale_lexical_rows(&pool, tenant_id, &project).await, 1);
+    assert_eq!(dense.embed_pending().await.unwrap().bodies_consumed, 0);
+
+    // The full pass rewrites the row in place: version, text, and digest are
+    // the fresh derivation's again, and every other row is untouched.
+    let pass = lexical.reproject_all().await.unwrap();
+    assert_eq!(i64::try_from(pass.bodies_consumed).unwrap(), bodies);
+    assert_eq!(stale_lexical_rows(&pool, tenant_id, &project).await, 0);
+    let rewritten = reader.snapshot().await.unwrap();
+    assert_eq!(rewritten.lexical, fresh.lexical);
+    assert!(
+        !rewritten
+            .lexical
+            .iter()
+            .any(|row| row.4.contains("xoxb-EXAMPLE-NOT-A-TOKEN"))
+    );
+    // The dense row still holds the stale vector until the tier re-embeds.
+    assert_ne!(rewritten.dense, fresh.dense);
+
+    let pass = dense.reembed_all().await.unwrap();
+    assert_eq!(i64::try_from(pass.bodies_consumed).unwrap(), bodies);
+    assert_eq!(reader.snapshot().await.unwrap(), fresh);
 }
 
 /// The lexical batch's rows and its cursor advance are one transaction.

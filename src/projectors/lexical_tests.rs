@@ -325,7 +325,29 @@ fn a_git_fact_body_projects_to_its_golden_lexical_text() {
             "fix(recall): fold the query A caf\u{e9} test, PGPASSWORD=[REDACTED] done ",
             "9fceb02d0ae598e95dc970b74767f19372d61af8 1"
         ),
-        "6f1676261823ce9f9d7d2c236cb3c3e5d728e5a2f54ed7accf526c738f3a5c0b",
+        "eec8cb779aa91aca33903ee8f32a91d6455977f4260b145276804bf8f0e870c2",
+    );
+}
+
+/// Version 3: a commit message quoting a provider token projects to the
+/// placeholder. Under version 2 the six shared shapes left `xoxb-…` in the
+/// recall text (trial issue 1); this golden pins both the text and the
+/// digest, so a normalizer that stops redacting it is seen.
+#[test]
+fn a_git_fact_body_with_a_provider_token_projects_to_its_golden_lexical_text() {
+    let body = format!(
+        concat!(
+            "{{\"commit_id\":\"4b825dc642cb6eb9a060e54bf8d69288fbee4904\",",
+            "\"kind\":\"commit\",\"message\":\"{message}\",\"schema_version\":1}}"
+        ),
+        message = hex::encode("ops: rotate xoxb-EXAMPLE-NOT-A-TOKEN before the release\n"),
+    );
+    assert_golden(
+        GIT_FACT_MEDIA_TYPE,
+        body.as_bytes(),
+        "4b825dc642cb6eb9a060e54bf8d69288fbee4904 commit ops: rotate [REDACTED] before the \
+         release 1",
+        "a4daae25c2c87ab487435809fe8ae4ebc8afd0825b829ef66330998417ba284b",
     );
 }
 
@@ -341,7 +363,7 @@ fn a_canonical_json_body_projects_to_its_golden_lexical_text() {
         body.as_bytes(),
         "assistant 1 01931f2c-0000-7000-8000-000000000002 D\u{e9}ploiement termin\u{e9}; \
          token: [REDACTED]",
-        "5dda1dcef6e53c4fe287de13dcdda30a0966c6c17fcf4ba89a2aa35f3a070be6",
+        "ed2a9bd919be4c5055e2da792369f92615607f7d868d88321ce51dd91ae45754",
     );
 }
 

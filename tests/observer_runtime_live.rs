@@ -933,6 +933,10 @@ async fn drain_observed_blob(
             control_scope: &scope.trusted_scope,
             kek: &key,
             clocks: &GitIngressClocksV1 { received_at: now },
+            guarantee: &ostk_fleet_recall::redaction::RedactionGuaranteeV1::from_active_package(
+                &active,
+            )
+            .expect("the package promises redaction"),
         },
         &[GitFactV1::BlobSource(source.fact().clone())],
     )

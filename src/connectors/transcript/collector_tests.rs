@@ -7,10 +7,14 @@ use super::super::test_fixture::{
     clocks, line, secret_transcript,
 };
 use super::*;
+use crate::collectors::test_support::{PLACEHOLDERS, STRIPE_PLACEHOLDER};
 use crate::connectors::transcript::{
     TranscriptConnectorError, TranscriptCursorRowV1, TranscriptOutboxStateV1,
 };
-use crate::redaction::{RedactionGuaranteeV1, SecretClassV1};
+use crate::redaction::{
+    CollectedSecretClassV1, ProviderSecretClassV1, REDACTION_PROFILE_VERSION, RedactionGuaranteeV1,
+    SecretClassV1,
+};
 
 const SESSION: &str = "01931f2c-0000-7000-8000-000000000002";
 
@@ -81,12 +85,16 @@ fn a_planted_secret_never_reaches_a_staged_row() {
     assert!(
         stats
             .classes_detected
-            .contains(&SecretClassV1::PrivateKeyBlock)
+            .contains(&CollectedSecretClassV1::Shared(
+                SecretClassV1::PrivateKeyBlock
+            ))
     );
     assert!(
         stats
             .classes_detected
-            .contains(&SecretClassV1::AwsAccessKeyId)
+            .contains(&CollectedSecretClassV1::Shared(
+                SecretClassV1::AwsAccessKeyId
+            ))
     );
 
     for planted in [PLANTED_KEY_MATERIAL, PLANTED_REDACTABLE_SECRET] {
@@ -143,12 +151,124 @@ fn a_turn_whose_secret_can_be_redacted_is_staged_with_the_placeholder() {
     assert_eq!(stats.turns_redacted, 1);
     assert_eq!(
         stats.classes_detected,
-        vec![SecretClassV1::PasswordAssignment]
+        vec![CollectedSecretClassV1::Shared(
+            SecretClassV1::PasswordAssignment
+        )]
     );
     let payload = String::from_utf8(batch.rows[0].canonical_payload.clone()).unwrap();
     assert!(!payload.contains("hunter22"));
     assert!(payload.contains("[REDACTED]"));
     assert!(payload.contains("before running the migration"));
+}
+
+/// Issue 1 of the trial: a transcript turn quoting a provider token (Slack,
+/// GitHub, Linear, Granola, Stripe) was staged in plaintext because only
+/// collected items ran the provider shapes. Since profile 3 every placeholder
+/// in the table is redacted from a turn, and a turn that is nothing but a
+/// signed JWT is redacted to the placeholder alone.
+#[test]
+fn every_provider_placeholder_is_redacted_from_a_turn() {
+    assert_eq!(guarantee().profile_version(), REDACTION_PROFILE_VERSION);
+    let redactable: Vec<&crate::collectors::test_support::Placeholder> = PLACEHOLDERS
+        .iter()
+        .filter(|placeholder| placeholder.class.is_redactable())
+        .collect();
+    let lines: Vec<String> = redactable
+        .iter()
+        .enumerate()
+        .map(|(index, placeholder)| {
+            line(
+                "user",
+                SESSION,
+                &format!("turn-{index}"),
+                "2026-08-15T12:30:00.000Z",
+                &format!("rotate {} before merge", placeholder.literal),
+            )
+        })
+        .collect();
+    let transcript = format!("{}\n", lines.join("\n"));
+    let (batch, stats) = collect(&transcript, None);
+
+    let expected = u32::try_from(redactable.len()).unwrap();
+    assert_eq!(stats.turns_parsed, expected);
+    assert_eq!(
+        stats.turns_staged, expected,
+        "no redactable turn is dropped"
+    );
+    assert_eq!(stats.turns_withheld, 0);
+    assert_eq!(stats.turns_redacted, expected, "every turn was redacted");
+    for placeholder in &redactable {
+        assert!(
+            stats.classes_detected.contains(&placeholder.class),
+            "{} was not reported",
+            placeholder.class.as_str()
+        );
+        let needle = placeholder.literal.as_bytes();
+        for row in &batch.rows {
+            for field in [
+                &row.canonical_candidate,
+                &row.canonical_locators,
+                &row.canonical_payload,
+            ] {
+                assert!(
+                    !field.windows(needle.len()).any(|window| window == needle),
+                    "a staged row field contains the {} placeholder",
+                    placeholder.class.as_str()
+                );
+            }
+        }
+    }
+    assert!(
+        stats
+            .classes_detected
+            .contains(&CollectedSecretClassV1::Provider(
+                ProviderSecretClassV1::StripeKey
+            )),
+        "{STRIPE_PLACEHOLDER} is the shape the earlier attempt could not test"
+    );
+    for row in &batch.rows {
+        // A redaction, not a drop: the prose around the credential survives.
+        // Some placeholders keep a visible prefix (a bearer header, a webhook
+        // host), so only the credential itself is asserted gone, above.
+        let payload = String::from_utf8(row.canonical_payload.clone()).unwrap();
+        assert!(payload.contains("rotate "), "{payload}");
+        assert!(payload.contains("[REDACTED]"), "{payload}");
+        assert!(payload.contains(" before merge"), "{payload}");
+    }
+}
+
+#[test]
+fn a_turn_that_is_only_a_signed_jwt_is_staged_as_the_placeholder() {
+    let jwt = PLACEHOLDERS
+        .iter()
+        .find(|placeholder| {
+            placeholder.class
+                == CollectedSecretClassV1::Provider(ProviderSecretClassV1::JsonWebToken)
+        })
+        .expect("the table has a JWT placeholder")
+        .literal;
+    let transcript = format!(
+        "{}\n",
+        line(
+            "assistant",
+            SESSION,
+            "turn-1",
+            "2026-08-15T12:30:00.000Z",
+            jwt
+        )
+    );
+    let (batch, stats) = collect(&transcript, None);
+    assert_eq!(stats.turns_staged, 1);
+    assert_eq!(stats.turns_redacted, 1);
+    assert_eq!(
+        stats.classes_detected,
+        vec![CollectedSecretClassV1::Provider(
+            ProviderSecretClassV1::JsonWebToken
+        )]
+    );
+    let payload = String::from_utf8(batch.rows[0].canonical_payload.clone()).unwrap();
+    assert!(!payload.contains("eyJ"));
+    assert!(payload.contains("\"text\":\"[REDACTED]\""), "{payload}");
 }
 
 #[test]

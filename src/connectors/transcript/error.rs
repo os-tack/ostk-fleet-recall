@@ -9,7 +9,7 @@ use crate::FleetError;
 use crate::evidence_ledger::{EvidenceAdmissionError, EvidenceAppendError};
 use crate::memory_contracts::ContractError;
 
-use crate::redaction::{RedactionPolicyError, SecretClassV1};
+use crate::redaction::{CollectedSecretClassV1, RedactionPolicyError};
 
 /// Closed rejection taxonomy of the transcript connector.
 #[derive(Debug, thiserror::Error)]
@@ -54,7 +54,7 @@ pub enum TranscriptConnectorError {
     #[error("turn withheld: residual {} content survived redaction", .class.as_str())]
     SecretWithheld {
         /// The residual class that forced the refusal.
-        class: SecretClassV1,
+        class: CollectedSecretClassV1,
     },
     /// An identity recipe in the active package names a locator coordinate the
     /// connector binding does not supply. Fail closed rather than invent one.

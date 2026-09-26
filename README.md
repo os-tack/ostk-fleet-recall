@@ -518,9 +518,18 @@ The `project` step decrypts each governed content object with
 table without the key. Once a body is projected, the key no longer limits
 who can read it, and destroying the key no longer erases it: erasure must
 also purge the body rows and the lexical and dense rows derived from them.
-Git ingress redaction is deferred, so git bodies are raw commit text. The
-lexical tier's recall text, which is all evidence recall returns, is
-redacted; the body bytes are not.
+Every ingress redacts under one profile (redaction profile 3: the shared
+shapes plus the provider shapes, Stripe included): a transcript turn before
+the outbox, a git fact's message, author, committer, and path before its
+ingress is built, and the lexical tier's recall text, which is all evidence
+recall returns, once more before the row is written. A body admitted before
+profile 3 keeps its raw bytes at rest; only its recall text is redacted, on
+the first tick after deploy, which re-projects every lexical row stored
+under an older normalization version (`rows_reprojected` in the `lexical`
+and `dense` steps). That tick's git step also re-walks each ref from the
+root, so every historical commit whose text is now redacted lands in
+quarantine as a preimage disagreement once: expect a one-time `quarantined`
+count equal to the number of such commits (ADR 0006 D9).
 
 There is no long-running loop, so `--once` is required. Schedule the command
 with cron, a systemd timer, or a scheduled task, and run one worker per scope
@@ -1004,7 +1013,9 @@ ADRs 0005 to 0008 record everything else deferred. The main items are:
   conflict projections.
 - **Worker and evidence recall.** A long-running `--interval` loop and
   managed scheduling; `git` and `gh` in the production image; changed-path and
-  incremental git scans and a git ingress redactor; transcript tool-use,
+  incremental git scans; supersession or erasure of bodies admitted before
+  redaction profile 3 (their bodies stay raw at rest; only the recall text is
+  redacted); transcript tool-use,
   tool-result, and thinking records; publication-plane evidence recall (and
   the publication grant on migration 23's filtered views); fusing evidence
   into chunk recall; registering the coverage labels in a package; dense or
