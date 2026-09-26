@@ -27,8 +27,8 @@ use ostk_fleet_recall::collectors::sink::{
 };
 use ostk_fleet_recall::config::CollectedCaptureModeV1;
 use ostk_fleet_recall::evidence_recall::{
-    AbsenceReasonV1, AbsenceVerdictV1, CockroachEvidenceRecall, EvidenceRecall as _,
-    probe_evidence_recall,
+    AbsenceReasonV1, AbsenceVerdictV1, CockroachEvidenceRecall, EvidenceMatchV1,
+    EvidenceRecall as _, PresentByV1, probe_evidence_recall,
 };
 use ostk_fleet_recall::item_recall::{
     CockroachItemRecall, ItemGetV1, ItemRecall as _, ItemReferenceV1, ItemSearchRequestV1,
@@ -42,16 +42,19 @@ use ostk_fleet_recall::memory_contracts::collected_item::{
 };
 use ostk_fleet_recall::memory_contracts::common::ContractId;
 use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
+use ostk_fleet_recall::projectors::ChunkEmbedderProvider;
 use ostk_fleet_recall::registry_activation::install::InstallTargetV1;
 use ostk_fleet_recall::remember_runtime::{
-    CaptureDispositionV1, CaptureRequestV1, CaptureResponseV1, CaptureStartup, CaptureStatusV1,
-    CockroachCapture, ItemCapture as _, PreparedCaptureV1, start_collected_capture_with,
+    CaptureDispositionV1, CaptureProjectionV1, CaptureRequestV1, CaptureResponseV1, CaptureStartup,
+    CaptureStatusV1, CockroachCapture, ItemCapture as _, PreparedCaptureV1,
+    start_collected_capture_with,
 };
 use ostk_fleet_recall::service::{
     FleetMemoryService as _, RecallAction, RecallRequest, RememberAction, RememberRequest,
     RememberSurface, ServiceError,
 };
 use ostk_fleet_recall::store::cockroach::{CockroachStore, DatabaseCapabilities};
+use ostk_fleet_recall::worker::{WorkerStepV1, WorkerTickReportV1};
 use ostk_fleet_recall::{CockroachMemoryService, FleetError, FleetScope};
 use ostk_recall_core::PrivacyTier;
 use serde_json::{Value, json};
@@ -262,9 +265,21 @@ async fn start_over(
     variables: &HashMap<String, String>,
 ) -> CaptureStartup {
     let capabilities = capabilities(owner, scope).await;
-    start_collected_capture_with(pool.clone(), &capabilities, scope, retry_policy(), |name| {
-        variables.get(name).cloned()
-    })
+    // The stub model the fixture's worker embeds with, so an `enabled`
+    // capture's dense rows are the worker's equal.
+    let embedding = ChunkEmbedderProvider::new(
+        Arc::new(StubEmbedder),
+        Sha256Digest::from_bytes(STUB_MODEL_DIGEST),
+    )
+    .expect("the stub embedder is 512 wide");
+    start_collected_capture_with(
+        pool.clone(),
+        &capabilities,
+        scope,
+        retry_policy(),
+        Some(Arc::new(embedding)),
+        |name| variables.get(name).cloned(),
+    )
     .await
 }
 
@@ -327,7 +342,7 @@ async fn fixture_at(pool: &PgPool, label: &str) -> WorkerFixture {
 }
 
 /// A worker tick over no sources but the collector outbox, that must succeed.
-async fn drain(fixture: &WorkerFixture, pool: &PgPool, steps: &str) {
+async fn drain(fixture: &WorkerFixture, pool: &PgPool, steps: &str) -> WorkerTickReportV1 {
     let report = fixture
         .worker_with(
             pool,
@@ -343,7 +358,26 @@ async fn drain(fixture: &WorkerFixture, pool: &PgPool, steps: &str) {
         "the {steps} tick must succeed: {}",
         serde_json::to_string_pretty(&report).unwrap()
     );
+    report
 }
+
+/// One counter of one step of a tick report, zero when absent.
+fn counter(report: &WorkerTickReportV1, step: WorkerStepV1, key: &str) -> u64 {
+    report
+        .step(step)
+        .unwrap_or_else(|| panic!("the tick ran {step:?}"))
+        .counters
+        .get(key)
+        .copied()
+        .unwrap_or(0)
+}
+
+const BODIES_SQL: &str = "SELECT count(*)::INT8 FROM memory_body_objects_v1 \
+     WHERE tenant_id = $1 AND project = $2";
+const LEXICAL_SQL: &str = "SELECT count(*)::INT8 FROM memory_body_lexical_projection_v1 \
+     WHERE tenant_id = $1 AND project = $2";
+const DENSE_SQL: &str = "SELECT count(*)::INT8 FROM memory_body_dense_projection_v1 \
+     WHERE tenant_id = $1 AND project = $2";
 
 /// A scope-bound count.
 async fn count(pool: &PgPool, fixture: &WorkerFixture, sql: &str) -> i64 {
@@ -517,6 +551,64 @@ async fn live_capture_admits_redacted_items_and_replays_by_key_when_configured()
     assert!(first.items[1].redacted_ranges >= 1, "the token is redacted");
     let events_after = count(&pool, &fixture, EVENTS_SQL).await;
     assert_eq!(events_after - events_before, 2);
+
+    // An enabled capture projects what it admitted before answering: the
+    // items are recalled at once, lexically, and the scope's absence verdict
+    // never reads body_projection_lag for them.
+    assert_eq!(
+        first.projection,
+        Some(CaptureProjectionV1 {
+            bodies: 2,
+            lexical: 2,
+            dense: 2,
+            complete: true,
+        })
+    );
+    let before_any_tick = evidence(&pool, &fixture)
+        .await
+        .search("pelican", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(before_any_tick.readiness.events_awaiting_body_projection, 0);
+    assert!(before_any_tick.readiness.lexical_current);
+    assert!(
+        !before_any_tick
+            .absence
+            .reasons
+            .contains(&AbsenceReasonV1::BodyProjectionLag)
+    );
+    assert_eq!(
+        before_any_tick.absence.present_by,
+        Some(PresentByV1::Lexical)
+    );
+    let found = items(&pool, &fixture)
+        .await
+        .search(
+            &ItemSearchRequestV1 {
+                query: "pelican".to_owned(),
+                provider: None,
+                include_history: false,
+                limit: 10,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        found
+            .hits
+            .iter()
+            .any(|hit| hit.item_id == first.items[1].item_id
+                && hit.matched_by == EvidenceMatchV1::Lexical),
+        "{:?}",
+        found.hits
+    );
+    assert_eq!(found.readiness.events_awaiting_body_projection, 0);
+    // A later tick has nothing of the capture left to project.
+    let later = drain(&fixture, &pool, "project,embed").await;
+    assert_eq!(counter(&later, WorkerStepV1::Bodies, "events_projected"), 0);
+    assert_eq!(counter(&later, WorkerStepV1::Lexical, "rows_indexed"), 0);
+    assert_eq!(counter(&later, WorkerStepV1::Dense, "rows_indexed"), 0);
 
     // The receipt keeps the trusted scope and a digest, never an item's text.
     let (operation, stored_request, stored_response): (String, Value, Value) = sqlx::query_as(
@@ -1241,4 +1333,134 @@ async fn live_a_replay_finishes_a_capture_interrupted_after_staging_when_configu
     let mut expected = finished_value;
     expected["idempotent_replay"] = json!(true);
     assert_eq!(replay, expected);
+}
+
+#[tokio::test]
+async fn live_a_capture_projects_safely_beside_a_worker_tick_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = fixture_at(&pool, "capture-beside-tick").await;
+    pull(&pool, &fixture, Vec::new(), ProviderAudienceV1::ScopePublic).await;
+    let scope = fixture.installed.scope.clone();
+    let (runtime, _) = served(start(&pool, &scope, &variables(&fixture, "enabled")).await);
+    let captured: Vec<Value> = (0..6)
+        .map(|index| {
+            item(
+                &format!("{SLACK_CHANNEL}:17900712{index:02}.000100"),
+                &format!("the kestrel budget line {index}"),
+                &json!({}),
+            )
+        })
+        .collect();
+
+    // The capture's projectors and the worker's projection steps run at
+    // once over the same scope: each row is projected exactly once, by
+    // whichever gets there first, and neither fails.
+    let ((answer, _, _), report) = tokio::join!(
+        capture(&runtime, &scope, &captured, "capture/kestrel"),
+        drain(&fixture, &pool, "project,embed"),
+    );
+    assert!(
+        answer
+            .items
+            .iter()
+            .all(|item| item.disposition == CaptureDispositionV1::Admitted),
+        "{:?}",
+        dispositions(&answer)
+    );
+    let projection = answer.projection.expect("an enabled capture projects");
+    assert!(projection.complete, "{projection:?}");
+    let events = count(&pool, &fixture, EVENTS_SQL).await;
+    assert_eq!(events, 6);
+    assert_eq!(count(&pool, &fixture, BODIES_SQL).await, events);
+    assert_eq!(count(&pool, &fixture, LEXICAL_SQL).await, events);
+    assert_eq!(count(&pool, &fixture, DENSE_SQL).await, events);
+    let by_capture = projection.bodies;
+    let by_worker = counter(&report, WorkerStepV1::Bodies, "events_projected");
+    assert_eq!(by_capture + by_worker, 6, "{projection:?} {report:?}");
+    assert_eq!(
+        projection.lexical + counter(&report, WorkerStepV1::Lexical, "rows_indexed"),
+        6
+    );
+    assert_eq!(
+        projection.dense + counter(&report, WorkerStepV1::Dense, "rows_indexed"),
+        6
+    );
+    // The body watermark is at the head: nothing awaits projection.
+    let readiness = evidence(&pool, &fixture)
+        .await
+        .search("kestrel", None, 10)
+        .await
+        .unwrap()
+        .readiness;
+    assert_eq!(readiness.events_awaiting_body_projection, 0);
+    assert!(readiness.lexical_current && readiness.dense_current);
+}
+
+#[tokio::test]
+async fn live_projection_lag_is_counted_over_the_scope_not_the_kind_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = fixture_at(&pool, "capture-lag-scope").await;
+    pull(&pool, &fixture, Vec::new(), ProviderAudienceV1::ScopePublic).await;
+    let scope = fixture.installed.scope.clone();
+    let (runtime, _) = served(start(&pool, &scope, &variables(&fixture, "enabled")).await);
+    let captured = [item(
+        &format!("{SLACK_CHANNEL}:1790071200.000100"),
+        "the lapwing budget is six",
+        &json!({}),
+    )];
+    let (answer, _, _) = capture(&runtime, &scope, &captured, "capture/lapwing").await;
+    assert!(
+        answer
+            .projection
+            .is_some_and(|projection| projection.complete)
+    );
+    let recall = items(&pool, &fixture).await;
+    let request = |query: &str| ItemSearchRequestV1 {
+        query: query.to_owned(),
+        provider: None,
+        include_history: false,
+        limit: 10,
+    };
+    let found = recall.search(&request("lapwing"), None).await.unwrap();
+    assert_eq!(found.readiness.events_awaiting_body_projection, 0);
+    assert_eq!(found.absence.present_by, Some(PresentByV1::Lexical));
+
+    // A git commit the worker admitted but has not projected is the scope's
+    // lag, and item search counts it too: the count is not scoped to the
+    // kind searched (a documented follow-up), so an empty item answer is
+    // unknown until a project tick, while the captured item stays present.
+    let head = fixture.repository.head();
+    fixture.repository.commit(
+        Some(&head),
+        "retire the ptarmigan fallback",
+        "1755432000 +0000",
+    );
+    let report = fixture.worker(&pool, "ingest").await.run_tick().await;
+    assert!(
+        !report.failed(),
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap()
+    );
+    let lagging = recall.search(&request("lapwing"), None).await.unwrap();
+    assert!(lagging.readiness.events_awaiting_body_projection >= 1);
+    assert_eq!(lagging.absence.verdict, AbsenceVerdictV1::Present);
+    let empty = recall
+        .search(&request("unfindable marmoset"), None)
+        .await
+        .unwrap();
+    assert_eq!(empty.absence.verdict, AbsenceVerdictV1::Unknown);
+    assert!(
+        empty
+            .absence
+            .reasons
+            .contains(&AbsenceReasonV1::BodyProjectionLag),
+        "{:?}",
+        empty.absence
+    );
 }

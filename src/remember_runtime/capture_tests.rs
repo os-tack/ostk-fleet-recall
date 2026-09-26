@@ -360,6 +360,7 @@ fn a_replay_is_the_stored_response_marked_as_a_replay() {
         operation: "capture".into(),
         items: Vec::new(),
         idempotent_replay: false,
+        projection: None,
     })
     .unwrap();
     let outcome = replayed(stored.clone());
@@ -424,6 +425,7 @@ async fn start(schema_version: i64, variables: &[(&str, &str)]) -> CaptureStartu
         &capabilities(schema_version),
         &scope,
         RetryPolicy::default(),
+        None,
         |name| variables.get(name).cloned(),
     )
     .await

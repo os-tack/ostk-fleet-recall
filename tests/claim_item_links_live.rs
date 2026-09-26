@@ -779,6 +779,7 @@ async fn live_uncitable_items_are_refused_and_nothing_is_written_when_configured
         &capabilities,
         &scope,
         retry_policy(),
+        None,
         |name| variables.get(name).cloned(),
     )
     .await
@@ -1427,6 +1428,7 @@ async fn live_a_captured_permalink_never_displaces_the_collected_item_when_confi
         &capabilities,
         &scope_b,
         retry_policy(),
+        None,
         |name| variables.get(name).cloned(),
     )
     .await

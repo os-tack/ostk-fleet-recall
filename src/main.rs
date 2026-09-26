@@ -4,6 +4,7 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +36,8 @@ use ostk_fleet_recall::evidence_recall::start_evidence_recall;
 use ostk_fleet_recall::item_recall::{ItemRecall, start_item_recall_citing};
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::McpServer;
+use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
+use ostk_fleet_recall::projectors::{ChunkEmbedderProvider, EmbeddingProvider};
 use ostk_fleet_recall::remember_runtime::{start_collected_capture, start_event_first_assert};
 use ostk_fleet_recall::service::{
     FleetRecallService, RecallAction, RecallRequest, RecallResult, RememberSurface, ServiceError,
@@ -764,12 +767,17 @@ async fn build_memory_service(
     // capture's grants, the writer-authority pins, a head that binds
     // connector.collected.capture, and, for `enabled`, the content key. Like
     // assert, a problem turns it off with a logged and reported reason and
-    // never stops serve; disabled, every tool schema is what it was.
+    // never stops serve; disabled, every tool schema is what it was. An
+    // `enabled` capture projects what it admits in the call, embedding with
+    // the same pinned model the worker's embed step uses; a provider that
+    // cannot be built leaves the dense rows to the worker, never stops serve.
+    let capture_embedding = capture_embedding_provider(embedder.clone(), config);
     let (capture, capture_status) = start_collected_capture(
         store.pool().clone(),
         &capabilities,
         &config.default_scope,
         RetryPolicy::default(),
+        capture_embedding,
     )
     .await
     .into_parts();
@@ -830,6 +838,32 @@ fn log_remember_serving(
         }
         Some(serving) => tracing::info!(surface = ?serving.surface, "serving the remember surface"),
         None => tracing::info!("serving the record-only remember surface"),
+    }
+}
+
+/// The dense tier's provider for an `enabled` capture: the process's pinned
+/// embedder under its configured model digest, as the worker's embed step
+/// builds it. `None`, with a logged reason, when the digest or the embedder
+/// cannot name the dense tier's model; capture then leaves its dense rows to
+/// the worker and reports its projection incomplete.
+fn capture_embedding_provider(
+    embedder: Arc<dyn ChunkEmbedder>,
+    config: &FleetConfig,
+) -> Option<Arc<dyn EmbeddingProvider>> {
+    let provider = Sha256Digest::from_str(&config.embedding_model_sha256)
+        .map_err(|error| error.to_string())
+        .and_then(|digest| {
+            ChunkEmbedderProvider::new(embedder, digest).map_err(|error| error.to_string())
+        });
+    match provider {
+        Ok(provider) => Some(Arc::new(provider)),
+        Err(reason) => {
+            tracing::warn!(
+                reason,
+                "remember(capture) cannot embed what it admits under the pinned model; its dense rows wait for the worker's embed step"
+            );
+            None
+        }
     }
 }
 

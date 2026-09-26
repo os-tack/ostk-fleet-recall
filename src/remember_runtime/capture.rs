@@ -52,14 +52,21 @@
 //!    [`PreparedStageV1`] per provider scope, and writes a **provisional**
 //!    response naming every item's stage ids.
 //! 5. `enabled`: each staged row is drained in its own append
-//!    ([`CollectedItemSink::drain_stage_ids`]). `stage_only`: the rows wait
+//!    ([`CollectedItemSink::drain_stage_ids`]), and the admitted rows are
+//!    then projected in the call, bodies, lexical, and dense, by the same
+//!    projectors the worker runs, within a ten-second budget
+//!    ([`CAPTURE_PROJECTION_BUDGET`]): the agent can recall what it captured
+//!    at once, and the scope's absence verdict does not read
+//!    `body_projection_lag` until a worker tick. `stage_only`: the rows wait
 //!    for the worker's `collect` step, and `serve` holds no content key.
 //! 6. The receipt's response is finalized with each item's disposition:
 //!    `admitted` (with its accepted event ids, one per part, in order),
 //!    `staged` (a row still waits for a drain), `replayed` (every part was
 //!    already admitted before this capture), or `withheld` with the reason
 //!    (the audience refusal, `redaction_withheld`, `validation_failed`,
-//!    `oversize`, `admission_refused`, or `quarantined`).
+//!    `oversize`, `admission_refused`, or `quarantined`); an `enabled`
+//!    capture that admitted something also reports its `projection`
+//!    ([`CaptureProjectionV1`]).
 //!
 //! # Replays
 //!
@@ -82,6 +89,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -90,6 +98,10 @@ use sha2::{Digest as _, Sha256};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row as _, Transaction};
 
+use crate::body_store::{
+    BodyProjectionRepository as _, CockroachBodyProjectionRepository, GovernedContentResolver,
+    reference_parser_key_v1,
+};
 use crate::collectors::audience::{AudiencePolicyV1, CaptureScopeV1};
 use crate::collectors::binding::{CollectedConnectorBindingV1, CollectorInstanceV1};
 use crate::collectors::cockroach::framed_sha256;
@@ -113,6 +125,10 @@ use crate::memory_contracts::collected_item::{
 };
 use crate::memory_contracts::common::ContractId;
 use crate::memory_contracts::digest::Sha256Digest;
+use crate::projectors::{
+    CockroachDenseProjector, CockroachLexicalProjector, DEFAULT_PROJECTION_BATCH,
+    DenseProjector as _, EmbeddingProvider, LexicalProjector as _,
+};
 use crate::redaction::REDACTION_PLACEHOLDER;
 use crate::registry_witness::{
     VerifiedWriterAuthority, WriterAuthorityError, WriterAuthorityRuntime,
@@ -545,6 +561,30 @@ pub struct CapturedItemV1 {
     pub redacted_ranges: u32,
 }
 
+/// What an `enabled` capture projected before answering, so the items it
+/// admitted are recalled in the same call and the scope's absence verdict
+/// never waits on a worker tick for them (ADR 0008 D10).
+///
+/// Each projector consumes the scope's pending rows from its own cursor,
+/// this capture's among them, so the counts can exceed the capture's parts
+/// when a worker left rows behind; they are what the pass did, not a
+/// per-item receipt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureProjectionV1 {
+    /// Accepted events the body projector consumed into bodies.
+    pub bodies: u64,
+    /// Bodies the lexical projector made searchable.
+    pub lexical: u64,
+    /// Lexical rows the dense projector embedded.
+    pub dense: u64,
+    /// Every tier ran to its end within [`CAPTURE_PROJECTION_BUDGET`]. When
+    /// false, a tier failed, was not configured, or ran out of budget; what
+    /// it committed stands, and the worker's `project` and `embed` steps
+    /// finish the rest.
+    pub complete: bool,
+}
+
 /// A capture's answer: the receipt's final response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -554,6 +594,134 @@ pub struct CaptureResponseV1 {
     pub items: Vec<CapturedItemV1>,
     /// Whether this answer replays a committed receipt.
     pub idempotent_replay: bool,
+    /// What the call projected after admitting the items; only an `enabled`
+    /// capture that admitted something carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<CaptureProjectionV1>,
+}
+
+/// How long an `enabled` capture spends projecting its admitted rows before
+/// answering: the whole of the MCP edge's 30-second request deadline is not
+/// spent on a step the worker will finish anyway.
+pub const CAPTURE_PROJECTION_BUDGET: Duration = Duration::from_secs(10);
+
+/// The projectors an `enabled` capture runs over its admitted rows: the same
+/// three the worker's `project` and `embed` steps run, bound to the same
+/// scope, so a capture's bodies are recalled before the next tick. Their
+/// writes are per-event serializable transactions with compare-and-set
+/// cursors, so running them beside a worker tick is safe: each row is
+/// projected once, by whichever gets there first.
+struct CaptureProjectorsV1 {
+    bodies: Arc<CockroachBodyProjectionRepository>,
+    lexical: CockroachLexicalProjector,
+    dense: Option<CockroachDenseProjector>,
+}
+
+impl CaptureProjectorsV1 {
+    /// Bind the projectors for `scope` under the writer authority `serve`
+    /// verified: the body projector opens the governed content store with
+    /// `kek` under the authority's semantic scope, as the worker's does.
+    fn new(
+        pool: PgPool,
+        scope: &FleetScope,
+        authority: &WriterAuthorityRuntime,
+        kek: ContentKeyEncryptionKey,
+        embedding: Option<Arc<dyn EmbeddingProvider>>,
+        retry: RetryPolicy,
+    ) -> Self {
+        let resolver = GovernedContentResolver::new(
+            pool.clone(),
+            scope.tenant_id,
+            scope.project.clone(),
+            authority.semantic_scope().clone(),
+            kek,
+        );
+        let bodies = Arc::new(CockroachBodyProjectionRepository::new(
+            pool.clone(),
+            scope.tenant_id,
+            scope.project.clone(),
+            reference_parser_key_v1(),
+            Arc::new(resolver),
+            retry,
+        ));
+        let lexical = CockroachLexicalProjector::new(
+            pool.clone(),
+            scope.tenant_id,
+            scope.project.clone(),
+            DEFAULT_PROJECTION_BATCH,
+            retry,
+        );
+        let dense = embedding.map(|provider| {
+            CockroachDenseProjector::new(
+                pool,
+                scope.tenant_id,
+                scope.project.clone(),
+                provider,
+                DEFAULT_PROJECTION_BATCH,
+                retry,
+            )
+        });
+        Self {
+            bodies,
+            lexical,
+            dense,
+        }
+    }
+
+    /// Run bodies, then lexical, then dense, each from its own cursor, within
+    /// one shared budget. A tier that fails is logged and leaves the
+    /// projection incomplete; the tiers after it still run, since each keeps
+    /// its own cursor. A tier that runs out of budget is dropped mid-pass:
+    /// every event it committed stands, and the rest is the worker's.
+    async fn project(&self) -> CaptureProjectionV1 {
+        let deadline = tokio::time::Instant::now() + CAPTURE_PROJECTION_BUDGET;
+        let mut projection = CaptureProjectionV1 {
+            complete: true,
+            ..CaptureProjectionV1::default()
+        };
+        match tokio::time::timeout_at(deadline, self.bodies.project_pending()).await {
+            Ok(Ok(summary)) => projection.bodies = summary.events_projected,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "a capture could not project its bodies; the worker will");
+                projection.complete = false;
+            }
+            Err(_) => return Self::out_of_budget("bodies", projection),
+        }
+        match tokio::time::timeout_at(deadline, self.lexical.project_pending()).await {
+            Ok(Ok(summary)) => projection.lexical = summary.rows_indexed,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "a capture could not project its lexical rows; the worker will");
+                projection.complete = false;
+            }
+            Err(_) => return Self::out_of_budget("lexical", projection),
+        }
+        let Some(dense) = &self.dense else {
+            tracing::warn!(
+                "a capture has no embedding provider, so its dense rows wait for the worker"
+            );
+            projection.complete = false;
+            return projection;
+        };
+        match tokio::time::timeout_at(deadline, dense.embed_pending()).await {
+            Ok(Ok(summary)) => projection.dense = summary.rows_indexed,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "a capture could not embed its dense rows; the worker will");
+                projection.complete = false;
+            }
+            Err(_) => return Self::out_of_budget("dense", projection),
+        }
+        projection
+    }
+
+    fn out_of_budget(tier: &str, mut projection: CaptureProjectionV1) -> CaptureProjectionV1 {
+        tracing::warn!(
+            tier,
+            budget_seconds = CAPTURE_PROJECTION_BUDGET.as_secs(),
+            "a capture ran out of projection budget; what it committed stands and the worker finishes the rest"
+        );
+        projection.complete = false;
+        projection
+    }
 }
 
 /// What [`ItemCapture::capture`] returns.
@@ -672,6 +840,7 @@ fn settle(
         operation: CAPTURE_OPERATION.to_owned(),
         items,
         idempotent_replay: false,
+        projection: None,
     }
 }
 
@@ -932,6 +1101,9 @@ pub struct CockroachCapture {
     mode: CollectedCaptureModeV1,
     scopes: Vec<CaptureScopeV1>,
     kek: Option<ContentKeyEncryptionKey>,
+    /// The projectors an `enabled` capture runs after its drain; `None` in
+    /// `stage_only`, where the worker admits and projects.
+    projectors: Option<CaptureProjectorsV1>,
     retry: RetryPolicy,
 }
 
@@ -943,6 +1115,7 @@ impl std::fmt::Debug for CockroachCapture {
             .field("identity", &self.identity)
             .field("mode", &self.mode)
             .field("capture_scopes", &self.scopes.len())
+            .field("projects", &self.projectors.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1141,8 +1314,18 @@ impl CockroachCapture {
             };
             self.sink.drain_stage_ids(&context, &stage_ids).await?;
         }
+        // Project what the drain admitted before answering, so the items are
+        // recalled in this call and the scope's absence verdict does not
+        // wait on a worker tick for them. A row the drain refused leaves
+        // nothing to project; the pass is cheap then.
+        let projection = match &self.projectors {
+            Some(projectors) if !stage_ids.is_empty() => Some(projectors.project().await),
+            _ => None,
+        };
         let states = self.sink.row_states(&stage_ids).await?;
-        let response = serde_json::to_value(settle(provisional, &states)).map_err(|error| {
+        let mut settled = settle(provisional, &states);
+        settled.projection = projection;
+        let response = serde_json::to_value(settled).map_err(|error| {
             FleetError::Protocol(format!("a capture response does not serialize: {error}"))
         })?;
         let (tenant_id, project, key_owned, request_owned, response_owned) = (
@@ -1313,8 +1496,9 @@ pub async fn start_collected_capture(
     capabilities: &DatabaseCapabilities,
     scope: &FleetScope,
     retry: RetryPolicy,
+    embedding: Option<Arc<dyn EmbeddingProvider>>,
 ) -> CaptureStartup {
-    start_collected_capture_with(pool, capabilities, scope, retry, |name| {
+    start_collected_capture_with(pool, capabilities, scope, retry, embedding, |name| {
         std::env::var(name).ok()
     })
     .await
@@ -1327,14 +1511,21 @@ pub async fn start_collected_capture(
 /// [`CaptureStartup::Off`] with its reason: a switch or scope list that does
 /// not parse, a schema before migration 34, `enabled` without
 /// `FLEET_RECALL_CONTENT_KEK_HEX` (only `enabled` reads it), missing or
-/// unusable writer-authority pins, a login without capture's privileges, an
-/// active package without `connector.collected.capture`, or a capture
-/// instance another owner already reports under.
+/// unusable writer-authority pins, a login without capture's privileges
+/// (for `enabled`, the projectors' too), an active package without
+/// `connector.collected.capture`, or a capture instance another owner
+/// already reports under.
+///
+/// `embedding` is the dense tier's provider under the process's pinned
+/// model; an `enabled` capture embeds its admitted rows with it before
+/// answering, and without one leaves them for the worker's `embed` step
+/// (its projection then reports `complete: false`). `stage_only` ignores it.
 pub async fn start_collected_capture_with(
     pool: PgPool,
     capabilities: &DatabaseCapabilities,
     scope: &FleetScope,
     retry: RetryPolicy,
+    embedding: Option<Arc<dyn EmbeddingProvider>>,
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> CaptureStartup {
     let config = match CollectedCaptureConfig::from_lookup(&mut lookup) {
@@ -1350,11 +1541,15 @@ pub async fn start_collected_capture_with(
         Ok(identity) => identity,
         Err(error) => return off(error.to_string()),
     };
-    let (kek, pins) = match inputs_before_io(mode, capabilities, &mut lookup) {
+    let CaptureInputsV1 {
+        drain_kek,
+        body_kek,
+        pins,
+    } = match inputs_before_io(mode, capabilities, &mut lookup) {
         Ok(inputs) => inputs,
         Err(reason) => return off(reason),
     };
-    if let Err(error) = probe_capture_privileges(&pool, capabilities).await {
+    if let Err(error) = probe_capture_privileges(&pool, capabilities, mode).await {
         return off(startup_reason("capture's privileges did not verify", error));
     }
     let sink = match CollectedItemSink::new(pool.clone(), scope, retry) {
@@ -1375,10 +1570,16 @@ pub async fn start_collected_capture_with(
         Ok(authority) => authority,
         Err(reason) => return off(reason),
     };
+    // `enabled` projects what it admits in the call; the body projector
+    // needs its own copy of the content key, which is not `Clone`.
+    let projectors = body_kek.map(|kek| {
+        CaptureProjectorsV1::new(pool.clone(), scope, &authority, kek, embedding, retry)
+    });
     tracing::info!(
         mode = mode.as_str(),
         principal = %identity.principal,
         instance = %identity.instance,
+        projects = projectors.is_some(),
         "serving remember(capture) under the verified writer authority"
     );
     let status = CaptureStatusV1 {
@@ -1397,11 +1598,22 @@ pub async fn start_collected_capture_with(
             identity,
             mode,
             scopes: config.scopes,
-            kek,
+            kek: drain_kek,
+            projectors,
             retry,
         }),
         status,
     )
+}
+
+/// What capture startup reads before any I/O.
+struct CaptureInputsV1 {
+    /// The content key the drain seals with; `enabled` only.
+    drain_kek: Option<ContentKeyEncryptionKey>,
+    /// The same key, parsed again for the body projector (the key is not
+    /// `Clone`); `enabled` only.
+    body_kek: Option<ContentKeyEncryptionKey>,
+    pins: WriterAuthorityConfig,
 }
 
 /// What capture startup decides before any I/O: the schema is recent enough,
@@ -1411,7 +1623,7 @@ fn inputs_before_io(
     mode: CollectedCaptureModeV1,
     capabilities: &DatabaseCapabilities,
     mut lookup: impl FnMut(&str) -> Option<String>,
-) -> std::result::Result<(Option<ContentKeyEncryptionKey>, WriterAuthorityConfig), String> {
+) -> std::result::Result<CaptureInputsV1, String> {
     if !capabilities.supports_schema_version(COLLECTED_ITEMS_SCHEMA_VERSION) {
         return Err(format!(
             "capture needs the schema through migration {COLLECTED_ITEMS_SCHEMA_VERSION}, but \
@@ -1419,19 +1631,23 @@ fn inputs_before_io(
             capabilities.schema_version
         ));
     }
-    let kek = if mode == CollectedCaptureModeV1::Enabled {
-        Some(
-            content_kek_from_lookup(&mut lookup)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    "FLEET_RECALL_COLLECTED_CAPTURE=enabled admits captures in serve, which needs \
-                     FLEET_RECALL_CONTENT_KEK_HEX; stage_only leaves admission to the worker and \
-                     needs no key"
-                        .to_owned()
-                })?,
-        )
+    let mut kek = || -> std::result::Result<ContentKeyEncryptionKey, String> {
+        content_kek_from_lookup(&mut lookup)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "FLEET_RECALL_COLLECTED_CAPTURE=enabled admits and projects captures in serve, \
+                 which needs FLEET_RECALL_CONTENT_KEK_HEX; stage_only leaves admission to the \
+                 worker and needs no key"
+                    .to_owned()
+            })
+    };
+    // The drain seals with one copy and the body projector opens with
+    // another: the key is not `Clone`, so it is parsed twice, as the worker
+    // parses it for its ingest and bodies steps.
+    let (drain_kek, body_kek) = if mode == CollectedCaptureModeV1::Enabled {
+        (Some(kek()?), Some(kek()?))
     } else {
-        None
+        (None, None)
     };
     let pins = WriterAuthorityConfig::from_lookup(&mut lookup)
         .map_err(|error| format!("the writer-authority pins are invalid: {error}"))?
@@ -1439,7 +1655,11 @@ fn inputs_before_io(
             "capture needs the writer-authority pins that `ostk-authority-install apply` prints"
                 .to_owned()
         })?;
-    Ok((kek, pins))
+    Ok(CaptureInputsV1 {
+        drain_kek,
+        body_kek,
+        pins,
+    })
 }
 
 /// Start the writer authority under `pins`, and check that its active package
