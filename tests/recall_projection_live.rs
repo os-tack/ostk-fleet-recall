@@ -291,6 +291,16 @@ impl FixtureProvider {
             called: AtomicBool::new(false),
         })
     }
+
+    /// The healthy fixture model under another descriptor: a later
+    /// preprocessing version, or another model altogether.
+    fn with_descriptor(descriptor: EmbeddingModelDescriptorV1) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor,
+            failure: None,
+            called: AtomicBool::new(false),
+        })
+    }
 }
 
 #[async_trait]
@@ -947,6 +957,55 @@ async fn live_replay_from_the_body_tables_rebuilds_byte_identical_projections() 
 
 /// Lexical rows of the scope stored under an older normalization version than
 /// this build's: the count the worker's tick reads before its lexical step.
+/// Age one body's rows to what the previous normalization version stored: the
+/// stale lexical text and digest under that version, and the dense vector of
+/// that text. The dense row's identity and version stay what the version-1
+/// provider wrote, exactly as a real corpus looks after a deploy, so a
+/// re-embed under a provider one preprocessing version newer has to move
+/// every row's identity.
+async fn age_rows_to_older_version(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    project: &str,
+    body: &[u8],
+    stale_text: &str,
+) {
+    let older_version = i64::from(LEXICAL_NORMALIZATION_VERSION) - 1;
+    sqlx::query(
+        "UPDATE public.memory_body_lexical_projection_v1 \
+         SET normalization_version = $4, lexical_text = $5, lexical_text_digest = $6 \
+         WHERE tenant_id = $1 AND project = $2 AND body_content_id = $3",
+    )
+    .bind(tenant_id)
+    .bind(project)
+    .bind(body)
+    .bind(older_version)
+    .bind(stale_text)
+    .bind(vec![0x77_u8; 32])
+    .execute(pool)
+    .await
+    .unwrap();
+    let stale_vector = format!(
+        "[{}]",
+        fixture_vector(stale_text)
+            .iter()
+            .map(f32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    sqlx::query(
+        "UPDATE public.memory_body_dense_projection_v1 SET embedding = $4::VECTOR(512) \
+         WHERE tenant_id = $1 AND project = $2 AND body_content_id = $3",
+    )
+    .bind(tenant_id)
+    .bind(project)
+    .bind(body)
+    .bind(&stale_vector)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn stale_lexical_rows(pool: &PgPool, tenant_id: Uuid, project: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM public.memory_body_lexical_projection_v1 \
@@ -992,40 +1051,7 @@ async fn live_a_row_at_an_older_normalization_version_is_rewritten_and_re_embedd
     // push-protection pattern.
     let aged = fresh.lexical[0].0.clone();
     let stale_text = "stale rendering with xoxb-EXAMPLE-NOT-A-TOKEN still in it";
-    let older_version = i64::from(LEXICAL_NORMALIZATION_VERSION) - 1;
-    sqlx::query(
-        "UPDATE public.memory_body_lexical_projection_v1 \
-         SET normalization_version = $4, lexical_text = $5, lexical_text_digest = $6 \
-         WHERE tenant_id = $1 AND project = $2 AND body_content_id = $3",
-    )
-    .bind(tenant_id)
-    .bind(&project)
-    .bind(&aged)
-    .bind(older_version)
-    .bind(stale_text)
-    .bind(vec![0x77_u8; 32])
-    .execute(&pool)
-    .await
-    .unwrap();
-    let stale_vector = format!(
-        "[{}]",
-        fixture_vector(stale_text)
-            .iter()
-            .map(f32::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    sqlx::query(
-        "UPDATE public.memory_body_dense_projection_v1 SET embedding = $4::VECTOR(512) \
-         WHERE tenant_id = $1 AND project = $2 AND body_content_id = $3",
-    )
-    .bind(tenant_id)
-    .bind(&project)
-    .bind(&aged)
-    .bind(&stale_vector)
-    .execute(&pool)
-    .await
-    .unwrap();
+    age_rows_to_older_version(&pool, tenant_id, &project, &aged, stale_text).await;
     assert_eq!(stale_lexical_rows(&pool, tenant_id, &project).await, 1);
     let aged_snapshot = reader.snapshot().await.unwrap();
     assert_ne!(aged_snapshot, fresh);
@@ -1059,9 +1085,76 @@ async fn live_a_row_at_an_older_normalization_version_is_rewritten_and_re_embedd
     // The dense row still holds the stale vector until the tier re-embeds.
     assert_ne!(rewritten.dense, fresh.dense);
 
+    // The deployed build derives one preprocessing version newer, so every
+    // stored row's identity is now older than the derived one. The re-embed
+    // rewrites vector, identity, and version in place instead of refusing the
+    // rows as a collision.
+    let mut bumped = descriptor();
+    bumped.preprocessing_version += 1;
+    let dense = dense_projector(
+        &pool,
+        tenant_id,
+        &project,
+        FixtureProvider::with_descriptor(bumped.clone()),
+    );
     let pass = dense.reembed_all().await.unwrap();
     assert_eq!(i64::try_from(pass.bodies_consumed).unwrap(), bodies);
-    assert_eq!(reader.snapshot().await.unwrap(), fresh);
+    let reembedded = reader.snapshot().await.unwrap();
+    assert_eq!(reembedded.lexical, fresh.lexical);
+    assert_eq!(reembedded.dense.len(), fresh.dense.len());
+    for (after, before) in reembedded.dense.iter().zip(&fresh.dense) {
+        assert_eq!(after.0, before.0, "the same bodies, in the same order");
+        assert_ne!(after.1, before.1, "the identity moved with the version");
+        assert_eq!(after.5, before.5, "the vector is the fresh text's again");
+    }
+    let stale_dense: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.memory_body_dense_projection_v1 \
+         WHERE tenant_id = $1 AND project = $2 AND preprocessing_version < $3",
+    )
+    .bind(tenant_id)
+    .bind(&project)
+    .bind(i64::from(bumped.preprocessing_version))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stale_dense, 0);
+}
+
+/// Only the preprocessing version may move a stored dense row: a re-embed
+/// under another model over the same bodies is still a collision, and it
+/// rewrites nothing.
+#[tokio::test]
+async fn live_a_re_embed_under_another_model_is_refused_as_a_collision() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let project = format!("foreign-{}", Uuid::now_v7());
+    let scope = physical_scope(&project);
+    let tenant_id = scope.tenant_id;
+    let pool = live_pool(&database_url, scope).await;
+    seed_body_plane(&pool, tenant_id, &project, &[SOURCE_A, SOURCE_B]).await;
+    let lexical = lexical_projector(&pool, tenant_id, &project);
+    let dense = dense_projector(&pool, tenant_id, &project, FixtureProvider::healthy());
+    let reader = reader(&pool, tenant_id, &project);
+    lexical.project_pending().await.unwrap();
+    dense.embed_pending().await.unwrap();
+    let embedded = reader.snapshot().await.unwrap();
+
+    let mut other_model = descriptor();
+    other_model.preprocessing_version += 1;
+    other_model.model_digest =
+        domain_separated_digest(DigestDomain::RegistryEntry, b"fixture-model-v2");
+    let foreign = dense_projector(
+        &pool,
+        tenant_id,
+        &project,
+        FixtureProvider::with_descriptor(other_model),
+    );
+    assert!(matches!(
+        foreign.reembed_all().await,
+        Err(RecallProjectionError::EmbeddingIdentityCollision)
+    ));
+    assert_eq!(reader.snapshot().await.unwrap(), embedded);
 }
 
 /// The lexical batch's rows and its cursor advance are one transaction.

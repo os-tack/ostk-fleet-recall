@@ -20,10 +20,13 @@
 //! moved the version and zero afterwards. This is what redacts the served copy
 //! of a transcript turn or a git fact admitted before redaction profile 3.
 //!
-//! The dense tier follows the lexical tier's re-projection within one tick:
-//! a `project`-only tick followed by an `embed`-only tick would re-derive the
-//! lexical rows and then embed nothing new, so a version bump is applied by a
-//! tick that selects both (`all`, or `project,embed`).
+//! The dense tier keeps its own count: the dense rows stored under an older
+//! preprocessing version than the configured provider derives. A tick whose
+//! dense step finds any, or whose lexical step re-projected, re-embeds every
+//! row. The count is what makes the re-embed survive a failed or skipped
+//! dense pass: a `project`-only tick re-derives the lexical rows, and the next
+//! `embed` tick still sees the older dense rows and rewrites them, so a
+//! version bump is never left half applied.
 
 use std::sync::Arc;
 
@@ -48,6 +51,27 @@ pub(super) async fn stale_lexical_rows(worker: &MemoryWorker) -> Result<u64> {
         .bind(deps.scope.tenant_id)
         .bind(&deps.scope.project)
         .bind(i64::from(LEXICAL_NORMALIZATION_VERSION))
+        .fetch_one(&deps.pool)
+        .await?;
+    Ok(u64::try_from(stale).unwrap_or(0))
+}
+
+const STALE_DENSE_ROWS_SQL: &str = "SELECT count(*) \
+     FROM public.memory_body_dense_projection_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND preprocessing_version < $3";
+
+/// Dense rows of this scope embedded under an older preprocessing version
+/// than the configured provider derives: the rows a full re-embed will
+/// rewrite. Zero when no provider is configured, since no dense pass runs.
+pub(super) async fn stale_dense_rows(worker: &MemoryWorker) -> Result<u64> {
+    let deps = &worker.deps;
+    let Some(provider) = &deps.embedding else {
+        return Ok(0);
+    };
+    let stale: i64 = sqlx::query_scalar(STALE_DENSE_ROWS_SQL)
+        .bind(deps.scope.tenant_id)
+        .bind(&deps.scope.project)
+        .bind(i64::from(provider.descriptor().preprocessing_version))
         .fetch_one(&deps.pool)
         .await?;
     Ok(u64::try_from(stale).unwrap_or(0))
@@ -90,7 +114,8 @@ pub(super) async fn run_lexical(worker: &MemoryWorker, stale: u64) -> WorkerStep
 }
 
 /// The dense step: a pass from the cursor, or, when `reembed` (the lexical
-/// tier re-projected in this tick), a full re-embed.
+/// tier re-projected in this tick, or dense rows are stored under an older
+/// preprocessing version), a full re-embed.
 pub(super) async fn run_dense(worker: &MemoryWorker, reembed: bool) -> WorkerStepReportV1 {
     let deps = &worker.deps;
     let Some(provider) = &deps.embedding else {

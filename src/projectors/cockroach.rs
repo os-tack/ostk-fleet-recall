@@ -182,12 +182,16 @@ const SELECT_LEXICAL_AFTER_SQL: &str = "SELECT body_content_id, body_created_at,
      ORDER BY body_created_at, body_content_id LIMIT $5";
 
 // The dense conflict arm re-writes the vector when the stored row was embedded
-// under the same identity (same model, same body): the embedding identity
-// closes over the descriptor and the body, not the lexical text, so a re-embed
-// after the lexical text moved (a normalization version bump) would otherwise
-// leave the old vector in place. A row under a different identity keeps its
-// vector, and the identity check that follows the statement refuses it.
-// Visibility is downgrade-only, as in the lexical arm.
+// under the same identity (same model, same body), or when the only thing
+// that moved is the preprocessing version under the same model, tokenizer,
+// metric, and dimensions: the embedding identity closes over the descriptor
+// and the body, and the descriptor carries the lexical normalization version,
+// so a re-embed after the lexical text moved (a normalization version bump)
+// derives a new identity for every existing row. That row is rewritten in
+// place, vector, identity, and version together, exactly as the lexical arm
+// rewrites its text. A row under any other identity (another model, tokenizer,
+// metric, or width) keeps its vector, and the identity check that follows the
+// statement refuses it. Visibility is downgrade-only, as in the lexical arm.
 const INSERT_DENSE_SQL: &str = "INSERT INTO public.memory_body_dense_projection_v1 AS dense (\
      tenant_id, project, body_content_id, body_created_at, embedding_identity_id, \
      model_digest, tokenization_version, preprocessing_version, distance_metric, \
@@ -195,7 +199,26 @@ const INSERT_DENSE_SQL: &str = "INSERT INTO public.memory_body_dense_projection_
      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::VECTOR(512), $12) \
      ON CONFLICT (tenant_id, project, body_content_id) DO UPDATE SET \
      embedding = CASE WHEN dense.embedding_identity_id = excluded.embedding_identity_id \
+         OR (dense.model_digest = excluded.model_digest \
+             AND dense.tokenization_version = excluded.tokenization_version \
+             AND dense.distance_metric = excluded.distance_metric \
+             AND dense.dimensions = excluded.dimensions \
+             AND dense.preprocessing_version < excluded.preprocessing_version) \
          THEN excluded.embedding ELSE dense.embedding END, \
+     embedding_identity_id = CASE WHEN dense.embedding_identity_id = excluded.embedding_identity_id \
+         OR (dense.model_digest = excluded.model_digest \
+             AND dense.tokenization_version = excluded.tokenization_version \
+             AND dense.distance_metric = excluded.distance_metric \
+             AND dense.dimensions = excluded.dimensions \
+             AND dense.preprocessing_version < excluded.preprocessing_version) \
+         THEN excluded.embedding_identity_id ELSE dense.embedding_identity_id END, \
+     preprocessing_version = CASE WHEN dense.embedding_identity_id = excluded.embedding_identity_id \
+         OR (dense.model_digest = excluded.model_digest \
+             AND dense.tokenization_version = excluded.tokenization_version \
+             AND dense.distance_metric = excluded.distance_metric \
+             AND dense.dimensions = excluded.dimensions \
+             AND dense.preprocessing_version < excluded.preprocessing_version) \
+         THEN excluded.preprocessing_version ELSE dense.preprocessing_version END, \
      visibility_class = CASE WHEN dense.visibility_class IS DISTINCT FROM excluded.visibility_class \
          THEN 'private' ELSE dense.visibility_class END";
 

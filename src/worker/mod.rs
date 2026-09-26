@@ -636,9 +636,18 @@ impl MemoryWorker {
             steps.insert(WorkerStepV1::Lexical, report);
         }
         if self.steps.contains(&WorkerStepV1::Dense) {
-            let report = match &stale {
-                Ok(_) => project::run_dense(self, reembed).await,
-                Err(reason) => WorkerStepReportV1::failed(reason.clone()),
+            // The dense tier's own count makes a re-embed survive a failed or
+            // skipped dense pass: rows still under the older preprocessing
+            // version are rewritten by whichever later tick selects `embed`.
+            let stale_dense = match &stale {
+                Ok(_) => project::stale_dense_rows(self)
+                    .await
+                    .map_err(|error| format!("the stale dense row count was not read: {error}")),
+                Err(reason) => Err(reason.clone()),
+            };
+            let report = match stale_dense {
+                Ok(stale_dense) => project::run_dense(self, reembed || stale_dense > 0).await,
+                Err(reason) => WorkerStepReportV1::failed(reason),
             };
             steps.insert(WorkerStepV1::Dense, report);
         }
