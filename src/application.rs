@@ -4891,6 +4891,7 @@ mod tests {
                     content_trust: None,
                     text: "document the zephyrine cache eviction".into(),
                     text_bytes: 37,
+                    redacted_at_read: None,
                     visibility_class: crate::projectors::RowVisibilityClassV1::Private,
                     first_accepted_event_id: Sha256Digest::from_bytes([0xcd; 32]),
                 }

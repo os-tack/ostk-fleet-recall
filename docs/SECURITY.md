@@ -450,7 +450,15 @@ ref from the root, and every historical commit whose text is now redacted
 re-presents with a different payload under the same source-fact identity
 and lands in quarantine as a `PreimageDisagreement`: expect a one-time
 `quarantined` count equal to the number of such commits. Closing that
-residual needs supersession or erasure. `ostk-spec check` needs the key too. `serve` needs it
+residual needs supersession or erasure. Until then it is visible per body
+rather than hidden: every text an answer carries runs through the recall
+plane's redaction again at read, and a body that pass removed something
+from says so (`redacted_at_read: {classes, ranges}` on an evidence body and
+on each item part, `withheld: true` when the text collapsed to the
+placeholder), while every item hit and provenance row names the
+`redaction_profile` its part was admitted under. A marker, or a profile
+below `REDACTION_PROFILE_VERSION`, is a body still raw at rest: that set is
+the worklist of the at-rest supersession pass. `ostk-spec check` needs the key too. `serve` needs it
 only with `FLEET_RECALL_COLLECTED_CAPTURE=enabled`, which admits captures in
 the call; `stage_only` leaves admission to the worker and keeps the key out
 of `serve`.

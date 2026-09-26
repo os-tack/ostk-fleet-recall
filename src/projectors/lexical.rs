@@ -67,7 +67,7 @@ use crate::memory_contracts::digest::{DigestDomain, Sha256Digest, body_digest, f
 // The crate's one secret scanner and its replacement discipline: the shapes it
 // matches are credentials wherever they appear, and the recall plane needs
 // exactly the same refusal as every collector.
-use crate::redaction::{REDACTION_PLACEHOLDER, RedactionDispositionV1, redact};
+use crate::redaction::{REDACTION_PLACEHOLDER, RedactionDispositionV1, RedactionOutcomeV1, redact};
 
 use super::error::{RecallProjectionError, RecallProjectionResult};
 
@@ -423,10 +423,57 @@ pub fn lexical_text_digest(
 /// returns through this again, after decoding it from the body envelope.
 #[must_use]
 pub fn redact_for_recall(text: &str) -> String {
-    match redact(text).disposition {
+    redact_for_recall_marked(text).0
+}
+
+/// What the recall plane's read-time redaction ([`redact_for_recall`])
+/// removed from one text.
+///
+/// The residual `docs/SECURITY.md` records (a body admitted before the
+/// ingress redactors stays raw at rest) made visible per body, and the
+/// worklist of the future at-rest supersession pass. Absent from an answer
+/// when the pass removed nothing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RecallRedactionV1 {
+    /// The secret classes detected in the stored text, sorted and
+    /// deduplicated: labels only, never the matched bytes.
+    pub classes: Vec<&'static str>,
+    /// Ranges replaced with the placeholder.
+    pub ranges: u32,
+    /// The text could not be made safe (an unredactable class, or a residual
+    /// match after replacement), so the answer carries the placeholder alone.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub withheld: bool,
+}
+
+impl RecallRedactionV1 {
+    /// The marker of one redaction outcome, or `None` when nothing was
+    /// detected and nothing replaced.
+    #[must_use]
+    pub fn of(outcome: &RedactionOutcomeV1) -> Option<Self> {
+        let withheld = matches!(outcome.disposition, RedactionDispositionV1::Withhold { .. });
+        if outcome.classes.is_empty() && outcome.redacted_ranges == 0 && !withheld {
+            return None;
+        }
+        Some(Self {
+            classes: outcome.classes.iter().map(|class| class.as_str()).collect(),
+            ranges: outcome.redacted_ranges,
+            withheld,
+        })
+    }
+}
+
+/// [`redact_for_recall`], with what it removed: the text an answer may
+/// carry, and a marker when the pass detected or replaced anything.
+#[must_use]
+pub fn redact_for_recall_marked(text: &str) -> (String, Option<RecallRedactionV1>) {
+    let outcome = redact(text);
+    let marker = RecallRedactionV1::of(&outcome);
+    let text = match outcome.disposition {
         RedactionDispositionV1::Stage { text } => text,
         RedactionDispositionV1::Withhold { .. } => REDACTION_PLACEHOLDER.to_owned(),
-    }
+    };
+    (text, marker)
 }
 
 /// Steps 2 to 4 of the lexical normalization pipeline (see [`normalize`]).

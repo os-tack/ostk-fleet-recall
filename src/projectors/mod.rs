@@ -86,8 +86,8 @@ pub use error::{RecallProjectionError, RecallProjectionResult};
 pub use fusion::{FusedHitV1, LANE_DEPTH, LEXICAL_MIN_TS_RANK, fuse_lanes, lane_depth};
 pub use lexical::{
     LEXICAL_NORMALIZATION_VERSION, LexicalProjectionV1, LexicalStateV1, LexicalUnindexableReasonV1,
-    MAX_LEXICAL_TEXT_BYTES, derive_lexical_projection, fold_lexical_characters,
-    lexical_text_digest, redact_for_recall,
+    MAX_LEXICAL_TEXT_BYTES, RecallRedactionV1, derive_lexical_projection, fold_lexical_characters,
+    lexical_text_digest, redact_for_recall, redact_for_recall_marked,
 };
 pub use repository::{
     BodyPositionV1, DenseProjector, LexicalProjector, ProjectionCursorV1, ProjectionPassSummaryV1,

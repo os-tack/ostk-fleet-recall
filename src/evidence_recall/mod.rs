@@ -472,10 +472,16 @@ pub struct EvidenceBodyV1 {
     /// As [`EvidenceHitV1::content_trust`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_trust: Option<ContentTrustV1>,
-    /// The lexical tier's recall text (at most 256 KiB); empty for a body with
-    /// no derivable text.
+    /// The lexical tier's recall text (at most 256 KiB), through the recall
+    /// plane's redaction again at read; empty for a body with no derivable
+    /// text.
     pub text: String,
     pub text_bytes: u64,
+    /// What the read-time redaction removed from `text`: a lexical row
+    /// projected before the current redaction still held it. Absent when
+    /// the pass removed nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redacted_at_read: Option<crate::projectors::RecallRedactionV1>,
     #[serde(serialize_with = "visibility_label")]
     pub visibility_class: RowVisibilityClassV1,
     pub first_accepted_event_id: Sha256Digest,

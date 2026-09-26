@@ -496,3 +496,40 @@ fn a_collected_render_leaves_every_other_media_type_alone() {
         "not json at all"
     );
 }
+
+#[test]
+fn the_marked_redaction_names_what_the_read_pass_removed_and_nothing_when_clean() {
+    let (text, marker) = redact_for_recall_marked("the retry budget is five attempts");
+    assert_eq!(text, "the retry budget is five attempts");
+    assert_eq!(marker, None, "a clean text carries no marker");
+
+    let (text, marker) = redact_for_recall_marked("creds are AKIAIOSFODNN7EXAMPLE for the bucket");
+    assert!(!text.contains("AKIAIOSFODNN7EXAMPLE"), "{text}");
+    assert!(text.contains(REDACTION_PLACEHOLDER), "{text}");
+    let marker = marker.expect("a replaced range is marked");
+    assert_eq!(marker.classes, ["aws_access_key_id"]);
+    assert_eq!(marker.ranges, 1);
+    assert!(!marker.withheld);
+    assert_eq!(
+        serde_json::to_value(&marker).unwrap(),
+        serde_json::json!({ "classes": ["aws_access_key_id"], "ranges": 1 })
+    );
+
+    // An unredactable class collapses the text to the placeholder alone, and
+    // the marker says the text was withheld rather than partially redacted.
+    let pem = "here it is\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\ndone";
+    let (text, marker) = redact_for_recall_marked(pem);
+    assert_eq!(text, REDACTION_PLACEHOLDER);
+    assert_eq!(
+        redact_for_recall(pem),
+        text,
+        "the sibling carries the same text"
+    );
+    let marker = marker.expect("a withheld text is marked");
+    assert!(marker.withheld);
+    assert!(marker.classes.contains(&"private_key_block"), "{marker:?}");
+    assert_eq!(
+        serde_json::to_value(&marker).unwrap()["withheld"],
+        serde_json::json!(true)
+    );
+}

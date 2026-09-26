@@ -825,12 +825,23 @@ impl EvidenceRecall for CockroachEvidenceRecall {
         });
         row.map(|row| {
             let media_type: String = row.try_get("media_type")?;
+            // The lexical row was redacted when it was projected; the pass
+            // runs again at read so a row projected before the current
+            // redaction carries no secret out, and says what it removed.
+            let stored: String = row.try_get("lexical_text")?;
+            let (text, redacted_at_read) = crate::projectors::redact_for_recall_marked(&stored);
+            let text_bytes = if redacted_at_read.is_some() {
+                u64::try_from(text.len()).unwrap_or(u64::MAX)
+            } else {
+                count(&row, "text_bytes")?
+            };
             Ok(EvidenceBodyV1 {
                 id,
                 content_trust: ContentTrustV1::of_media_type(&media_type),
                 media_type,
-                text: row.try_get("lexical_text")?,
-                text_bytes: count(&row, "text_bytes")?,
+                text,
+                text_bytes,
+                redacted_at_read,
                 visibility_class: RowVisibilityClassV1::parse(
                     &row.try_get::<String, _>("visibility_class")?,
                 )?,
