@@ -226,6 +226,14 @@ provider on `127.0.0.1` that answered the Web API, GraphQL, and REST calls
 from the recorded fixtures in `src/collectors/{slack,linear,granola}/fixtures`
 and accepted only the placeholder credentials `xoxb-EXAMPLE-NOT-A-TOKEN`,
 `lin_api_EXAMPLENOTAREALKEYEXAMPLENOTAREAL`, and `grn_EXAMPLE_NOT_A_KEY`.
+The two boundary helpers in `deploy/localstack` always run
+`cockroach sql --insecure --host=cockroach:26257`, which a secure node
+refuses. To run them unchanged there, the run put a wrapper named
+`cockroach` first on the container's `PATH` (`docker exec --env PATH=...`).
+The wrapper replaced `--insecure` with `--certs-dir=/cockroach/certs` and
+`--host=cockroach:26257` with `--host=127.0.0.1:26257`, then ran
+`/cockroach/cockroach`. The logins' passwords were set outside the helpers
+with `CREATE USER ... WITH NOLOGIN PASSWORD ...` before each helper ran.
 
 | Step | What ran | What held |
 |---|---|---|

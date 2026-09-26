@@ -727,19 +727,28 @@ HTTPS endpoint, which is a relay you run in front of it.
 
 On the quickstart's local node, after the
 [database boundary](#4-establish-the-database-boundary-and-load-the-corpus-as-the-writer),
-the checked-in helper creates the login quiesced, applies the policy, and
-only then enables it; on a node with authentication, create
-`fleet_ingress` `NOLOGIN` with its password first, and on a shared or
-production cluster follow [cloud onboarding](docs/CLOUD_ONBOARDING.md)
-instead. The receiver then starts from an environment of its own:
+the checked-in helper creates the login quiesced, clears the PUBLIC routine
+defaults its creation leaves, applies the policy, and only then enables it.
+The helper speaks only to that insecure node (`cockroach sql --insecure` at
+`cockroach:26257`): on a node with TLS and passwords, a cluster admin runs
+the same statements in the order the
+[collected-items runbook](docs/COLLECTED_ITEMS_RUNBOOK.md#5-receive-webhooks)
+gives, and a shared or production cluster follows
+[cloud onboarding](docs/CLOUD_ONBOARDING.md). The receiver serves only the
+collectors whose entry has a `push`, and the quickstart's sources file has
+none: add a collector like the Slack one above, with its `push`, to
+`$FLEET_RECALL_QUICKSTART_SOURCES` and pass that file. The outer shell
+expands the binary, the scope, and the secret before `env -i` clears the rest
+of the environment:
 
 ```text
 docker exec --interactive ostk-fleet-recall-crdb /bin/sh -s < deploy/localstack/ingress-boundary.sh
 env -i PATH="$PATH" \
-  FLEET_RECALL_INGRESS_DATABASE_URL=postgresql://fleet_ingress:local-ingress-only@127.0.0.1:26257/fleet_recall?sslmode=disable \
+  FLEET_RECALL_INGRESS_DATABASE_URL="postgresql://fleet_ingress:local-ingress-only@127.0.0.1:26257/fleet_recall?sslmode=disable" \
   FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE=1 \
-  FLEET_RECALL_TENANT_ID=... FLEET_RECALL_PROJECT=... FLEET_RECALL_SLACK_SIGNING_SECRET=... \
-  ostk-fleet-recall ingress --sources worker-sources.json
+  FLEET_RECALL_TENANT_ID="$FLEET_RECALL_TENANT_ID" FLEET_RECALL_PROJECT="$FLEET_RECALL_PROJECT" \
+  FLEET_RECALL_SLACK_SIGNING_SECRET="$FLEET_RECALL_SLACK_SIGNING_SECRET" \
+  "$FLEET_RECALL_BIN" ingress --sources "$FLEET_RECALL_QUICKSTART_SOURCES"
 ```
 
 Then give each provider the relay's URL for `/v1/hooks/<connector_instance>`
