@@ -9,12 +9,16 @@
 //! | Delivery | Maps to |
 //! |---|---|
 //! | `Issue` or `Comment`, `create` or `update` | upsert the issue or comment by its id |
-//! | `Issue` or `Comment`, `remove` | delete it, at the signed `webhookTimestamp` |
+//! | `Issue` or `Comment`, `remove` | delete it, at the signed action time (`createdAt`) |
 //! | anything else | ignored |
 //!
 //! The signed id is the digest of the body: the `Linear-Delivery` header is
-//! not signed, so it is never trusted as identity. The data's text (a title,
-//! a body) is never kept; the worker re-reads the object through the API.
+//! not signed, so it is never trusted as identity. A hint's event time is the
+//! body's `createdAt`, when the action happened (else `data.updatedAt`), never
+//! `webhookTimestamp`, which only says when this attempt was sent: a retry
+//! re-sent after a restore must not order the removal after it. The data's
+//! text (a title, a body) is never kept; the worker re-reads the object
+//! through the API.
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -41,8 +45,12 @@ struct DeliveryV1 {
     action: String,
     #[serde(rename = "type")]
     kind: String,
+    /// When the action happened: the same in every retry of the delivery.
+    #[serde(default)]
+    created_at: Option<String>,
     #[serde(default)]
     organization_id: Option<String>,
+    /// When this attempt was sent: fresh in every retry.
     webhook_timestamp: i64,
     #[serde(default)]
     data: Option<DataV1>,
@@ -55,6 +63,15 @@ struct DataV1 {
     id: Option<String>,
     #[serde(default)]
     team_id: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+/// An RFC 3339 instant, in UTC.
+fn instant(text: Option<&str>) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(text?)
+        .ok()
+        .map(|instant| instant.with_timezone(&Utc))
 }
 
 impl PushVerifierV1 for LinearPushV1 {
@@ -105,7 +122,12 @@ impl PushVerifierV1 for LinearPushV1 {
             .id
             .filter(|id| is_linear_id(id))
             .ok_or(DeliveryRefusalV1::Malformed)?;
-        let provider_event_at = DateTime::<Utc>::from_timestamp_millis(delivery.webhook_timestamp)
+        // The action's own time orders a removal's tombstone: a retry of the
+        // delivery carries a fresh webhookTimestamp (it must, to be fresh),
+        // which would order the removal after a restore that came between.
+        let provider_event_at = instant(delivery.created_at.as_deref())
+            .or_else(|| instant(data.updated_at.as_deref()))
+            .or_else(|| DateTime::<Utc>::from_timestamp_millis(delivery.webhook_timestamp))
             .ok_or(DeliveryRefusalV1::Malformed)?;
         Ok(VerifiedDeliveryV1 {
             signed_id,
@@ -198,14 +220,52 @@ mod tests {
     }
 
     #[test]
-    fn the_recorded_comment_removal_is_a_delete_at_the_signed_time() {
+    fn the_recorded_comment_removal_is_a_delete_at_the_signed_action_time() {
         let delivery = accept_fixture(REMOVE, ORG).unwrap();
         let hint = hint(&delivery);
         assert_eq!(hint.kind, HintKindV1::Delete);
         assert_eq!(hint.object_kind, "comment");
         assert_eq!(hint.external_id, "d4e5f6a7-0000-4000-8000-00000000c002");
         assert_eq!(hint.container_id, None);
-        assert_eq!(hint.provider_event_at.timestamp_millis(), 1_790_071_200_250);
+        // The body's createdAt, not the 250 ms later webhookTimestamp.
+        assert_eq!(hint.provider_event_at.timestamp_millis(), 1_790_071_200_000);
+    }
+
+    #[test]
+    fn a_retried_removal_keeps_the_time_of_the_action() {
+        let action = "2026-09-22T10:00:00.000Z";
+        let removal = |webhook_timestamp: i64| {
+            json!({"action": "remove", "type": "Issue", "createdAt": action,
+                   "organizationId": ORG, "webhookTimestamp": webhook_timestamp,
+                   "data": {"id": "7c3e1a52-9b4d-4f6e-8a21-3d5c7e9f1b20", "updatedAt": action}})
+        };
+        let first = 1_790_071_200_250_i64;
+        // Linear retries an hour later, after the issue was restored.
+        let retry = first + 3_600_000;
+        let times: Vec<i64> = [first, retry]
+            .into_iter()
+            .map(|sent| {
+                let body = serde_json::to_vec(&removal(sent)).unwrap();
+                let signature = hex::encode(sign(SECRET.as_bytes(), &body));
+                hint(&accept_body(&body, &signature, ORG, sent).unwrap())
+                    .provider_event_at
+                    .timestamp_millis()
+            })
+            .collect();
+        assert_eq!(times, [1_790_071_200_000, 1_790_071_200_000]);
+        // With no action time at all, the attempt's own time is the last
+        // resort.
+        let bare = json!({"action": "remove", "type": "Issue", "organizationId": ORG,
+                          "webhookTimestamp": first,
+                          "data": {"id": "7c3e1a52-9b4d-4f6e-8a21-3d5c7e9f1b20"}});
+        let body = serde_json::to_vec(&bare).unwrap();
+        let signature = hex::encode(sign(SECRET.as_bytes(), &body));
+        assert_eq!(
+            hint(&accept_body(&body, &signature, ORG, first).unwrap())
+                .provider_event_at
+                .timestamp_millis(),
+            first
+        );
     }
 
     #[test]

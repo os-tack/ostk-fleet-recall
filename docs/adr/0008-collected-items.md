@@ -1380,7 +1380,7 @@ any pull; a deletion becomes a push-mode tombstone.
   | Slack event of another `team_id` | refused, `unauthorized_scope` |
   | Slack message in an `im` or `mpim` | ignored, kept with no ids |
   | Linear `Issue` or `Comment` `create` or `update` | upsert by id; another `organizationId` is refused |
-  | Linear `Issue` or `Comment` `remove` | delete by id, at the signed `webhookTimestamp` |
+  | Linear `Issue` or `Comment` `remove` | delete by id, at the signed action time (`createdAt`, else `data.updatedAt`), never `webhookTimestamp`, which a retry renews |
   | Granola `note.generated`, `note.edited`, `note.access_granted` | upsert the note |
   | anything else | ignored |
 
