@@ -33,3 +33,10 @@ collectors you do not run; a collector needs the scope at generation 3. See
 reads and where each step can run, and
 [receiving provider webhooks](../README.md#receiving-provider-webhooks) for
 the `push` entry a collector adds to take webhooks.
+
+# Recall trial kit
+
+[`trial/`](trial/README.md) holds the question set, synthetic Slack and
+Linear data, and scripts from the hands-on trial in
+[`docs/TRIAL_FINDINGS_2026-09-26.md`](../docs/TRIAL_FINDINGS_2026-09-26.md),
+for rerunning it with the real embedding model.

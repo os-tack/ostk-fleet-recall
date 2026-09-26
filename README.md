@@ -2050,6 +2050,10 @@ is `#[ignore]` and documents its environment at the top of the file.
 - [Collected-items runbook](docs/COLLECTED_ITEMS_RUNBOOK.md): collectors,
   imports, capture, and webhook ingress in order, the first live run against
   each provider, and a recorded end-to-end run.
+- [Hands-on trial findings, 2026-09-26](docs/TRIAL_FINDINGS_2026-09-26.md):
+  what worked when the binaries were driven end to end, graded recall
+  questions, known issues, and how to rerun the trial with the real model
+  ([trial kit](examples/trial/README.md)).
 - [Private control-ledger bootstrap](docs/CONTROL_BOOTSTRAP.md).
 - [Cloud onboarding](docs/CLOUD_ONBOARDING.md): AWS/CockroachDB account,
   approval, cost, identity, TLS, model, and teardown steps.
