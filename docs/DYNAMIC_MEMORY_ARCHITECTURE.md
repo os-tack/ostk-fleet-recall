@@ -51,8 +51,10 @@ APIs, and receives provider webhooks only as hints:
   verifies Slack, Linear, and Granola webhook signatures and keeps each
   delivery only as a hint of provider ids in a durable queue; the worker's
   `collect` step re-reads each hinted object through the provider's API and
-  settles the hint in the transaction that stages what it read, backing it
-  off, or dead-lettering it after eight failed attempts (ADR 0008 D12).
+  settles the hint in the transaction that stages what it read (or, for a
+  change only a pass reads, once the pass has read its container
+  completely), backing it off, or dead-lettering it after eight failed
+  attempts (ADR 0008 D12).
 - The private `ostk-spec` CLI runs the Stage-6 normative activation,
   observer, and discrepancy runtimes, and `serve` lists the episodes it opens
   as `recall(discrepancies)`

@@ -11,11 +11,15 @@
 //! echoed; a direct message is kept with no ids; a Granola edit leaves an
 //! empty answer unknown until the worker reads the note; only the hints of a
 //! collector the worker runs count, and a login that cannot read the queue
-//! gets `unknown`, never `absent`; a hint whose fetch keeps failing dies after
-//! eight attempts and `collect retry` reopens it; a hint never writes
-//! coverage; the receiver cannot read evidence, content, items, or the
-//! outbox; a database failure answers 503; and the binary refuses a listen
-//! address that is not loopback unless allowed.
+//! gets `unknown`, never `absent`; a signed deletion hides an item only a
+//! capture holds, and one in a withdrawn channel for good; a Slack hint never
+//! reads before `backfill_since`; a Linear hint left to the pass waits for a
+//! complete read of its team; a rate-limited provider ends the tick's hints
+//! at the first; a hint whose fetch keeps failing dies after eight attempts
+//! and `collect retry` reopens it; a hint never writes coverage; the receiver
+//! cannot read evidence, content, items, or the outbox; a database failure
+//! answers 503; and the binary refuses a listen address that is not loopback
+//! unless allowed.
 //!
 //! Every connected test needs `FLEET_RECALL_TEST_DATABASE_URL` and returns at
 //! once without it. No test reaches a provider.
@@ -29,13 +33,22 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
 use chrono::{DateTime, SecondsFormat, TimeZone as _, Utc};
+use ostk_fleet_recall::collectors::audience::{
+    AudiencePolicyV1, CaptureContainersV1, CaptureScopeV1,
+};
+use ostk_fleet_recall::collectors::binding::CollectorInstanceV1;
 use ostk_fleet_recall::collectors::command::{
     CollectCommandV1, CollectProcessV1, run_collect_command,
+};
+use ostk_fleet_recall::collectors::draft::{
+    CollectedItemDraftV1, DraftContainerV1, DraftSectionV1,
 };
 use ostk_fleet_recall::collectors::ingress::base64;
 use ostk_fleet_recall::collectors::ingress::deliveries::IngressStoreV1;
 use ostk_fleet_recall::collectors::ingress::server::{IngressInstancesV1, router, validate_listen};
 use ostk_fleet_recall::collectors::ingress::signature::{sign, standard_webhooks_key};
+use ostk_fleet_recall::collectors::redaction::CollectorRedactorV1;
+use ostk_fleet_recall::collectors::sink::{CollectedItemSink, StageContextV1, StageDraftV1};
 use ostk_fleet_recall::evidence_recall::{
     AbsenceReasonV1, AbsenceVerdictV1, CockroachEvidenceRecall, EvidenceRecall as _,
     EvidenceSearchV1, probe_evidence_recall,
@@ -43,7 +56,11 @@ use ostk_fleet_recall::evidence_recall::{
 use ostk_fleet_recall::item_recall::{
     CockroachItemRecall, ItemRecall as _, ItemSearchRequestV1, ItemSearchV1, probe_item_recall,
 };
-use ostk_fleet_recall::memory_contracts::collected_item::ProviderKindV1;
+use ostk_fleet_recall::memory_contracts::collected_item::{
+    BoundedTextV1, CollectionModeV1, ContainerKindV1, ItemLifecycleV1, ObjectKindV1,
+    ProviderKindV1, TextFormatV1,
+};
+use ostk_fleet_recall::memory_contracts::common::ContractId;
 use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
 use ostk_fleet_recall::registry_activation::install::InstallTargetV1;
 use ostk_fleet_recall::store::cockroach::{CockroachStore, DatabaseCapabilities, RetryPolicy};
@@ -124,6 +141,7 @@ fn iso(seconds: i64) -> String {
         .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent switches of one fake world
 #[derive(Debug, Default)]
 struct World {
     /// Slack: the channel's messages.
@@ -131,8 +149,16 @@ struct World {
     /// Slack: answer a read bounded to one `ts` (what only a hint sends)
     /// with a 500.
     fail_hinted_reads: bool,
+    /// Slack: the channel is private (and the operator never listed it).
+    private_channel: bool,
+    /// Slack: rate-limit every call.
+    slack_rate_limited: bool,
     /// Linear: the issue and its comments.
     issue: Option<Value>,
+    /// Linear: more issues in the same team.
+    more_issues: Vec<Value>,
+    /// Linear: rate-limit every sweep (a read not filtered to one id).
+    linear_sweeps_rate_limited: bool,
     comments: Vec<Value>,
     /// Granola: notes by id.
     notes: BTreeMap<String, Value>,
@@ -209,6 +235,9 @@ fn window(world: &World, request: &FakeRequest) -> Vec<Value> {
 }
 
 fn slack(world: &World, request: &FakeRequest) -> FakeReply {
+    if world.slack_rate_limited {
+        return FakeReply::rate_limited(30);
+    }
     let method = request.path.rsplit('/').next().unwrap_or_default();
     if method.starts_with("conversations.") && request.param("channel") != Some(PLATENG) {
         return FakeReply::json(&json!({"ok": false, "error": "channel_not_found"}));
@@ -221,8 +250,9 @@ fn slack(world: &World, request: &FakeRequest) -> FakeReply {
         "conversations.info" => FakeReply::json(&json!({
             "ok": true,
             "channel": {"id": PLATENG, "name": "plat-eng", "is_channel": true, "is_im": false,
-                        "is_mpim": false, "is_private": false, "is_ext_shared": false,
-                        "is_org_shared": false, "is_pending_ext_shared": false}
+                        "is_mpim": false, "is_private": world.private_channel,
+                        "is_ext_shared": false, "is_org_shared": false,
+                        "is_pending_ext_shared": false}
         })),
         "conversations.history" => {
             if world.fail_hinted_reads && request.param("inclusive") == Some("true") {
@@ -255,8 +285,23 @@ fn connection(field: &str, nodes: &[Value]) -> FakeReply {
 fn linear(world: &World, request: &FakeRequest) -> FakeReply {
     let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
     let filter = &body["variables"]["filter"];
-    let issues: Vec<Value> = world.issue.iter().cloned().collect();
-    match body["operationName"].as_str().unwrap_or_default() {
+    let issues: Vec<Value> = world
+        .issue
+        .iter()
+        .chain(&world.more_issues)
+        .cloned()
+        .collect();
+    let operation = body["operationName"].as_str().unwrap_or_default();
+    if world.linear_sweeps_rate_limited
+        && matches!(
+            operation,
+            "FleetRecallLinearIssues" | "FleetRecallLinearComments"
+        )
+        && filter["id"]["eq"].is_null()
+    {
+        return FakeReply::rate_limited(30);
+    }
+    match operation {
         "FleetRecallLinearScope" => FakeReply::json(&json!({"data": {
             "organization": {"id": ORG},
             "teams": {"nodes": [{"id": ENG, "key": "ENG", "name": "Engineering",
@@ -348,6 +393,8 @@ struct Harness {
     /// reason falls in one minute.
     now: DateTime<Utc>,
     base: i64,
+    /// Settings added to the Slack collector's.
+    slack_settings: Value,
 }
 
 impl Harness {
@@ -372,6 +419,7 @@ impl Harness {
             router: Router::new(),
             now,
             base,
+            slack_settings: json!({}),
         };
         harness.router = harness.router_with_limit(1_048_576);
         Some(harness)
@@ -405,11 +453,15 @@ impl Harness {
         let base = &self.fake.base;
         let mut collectors = Vec::new();
         if instances.contains(&SLACK) {
+            let mut settings = json!({"token_env": SLACK_TOKEN_ENV, "channels": [PLATENG],
+                                      "api_base": format!("{base}/api")});
+            for (key, value) in self.slack_settings.as_object().unwrap() {
+                settings[key] = value.clone();
+            }
             collectors.push(json!({
                 "provider": "slack", "connector_principal": "principal.slack",
                 "connector_instance": SLACK, "provider_scope_id": TEAM,
-                "settings": {"token_env": SLACK_TOKEN_ENV, "channels": [PLATENG],
-                             "api_base": format!("{base}/api")},
+                "settings": settings,
                 "push": {"signing_secret_env": SLACK_SECRET_ENV}
             }));
         }
@@ -436,9 +488,9 @@ impl Harness {
                "collectors": collectors})
     }
 
-    async fn tick_as(&self, pool: &PgPool, instances: &[&str]) -> WorkerTickReportV1 {
-        let report = self
-            .fixture
+    /// One tick, whether or not a collector failed.
+    async fn run_tick(&self, pool: &PgPool, instances: &[&str]) -> WorkerTickReportV1 {
+        self.fixture
             .worker_with(
                 pool,
                 "collect,project",
@@ -448,7 +500,11 @@ impl Harness {
             .await
             .with_collector_environment(Arc::new(environment))
             .run_tick()
-            .await;
+            .await
+    }
+
+    async fn tick_as(&self, pool: &PgPool, instances: &[&str]) -> WorkerTickReportV1 {
+        let report = self.run_tick(pool, instances).await;
         assert!(
             !report.failed(),
             "the tick must succeed: {}",
@@ -632,6 +688,21 @@ impl Harness {
             .capabilities()
             .await
             .unwrap()
+    }
+
+    /// How many heads the memory holds of one item, in either tier.
+    async fn heads(&self, object_kind: &str, external_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM memory_collected_item_heads_v1 \
+             WHERE tenant_id = $1 AND project = $2 AND object_kind = $3 AND external_id = $4",
+        )
+        .bind(self.fixture.installed.scope.tenant_id)
+        .bind(&self.fixture.installed.scope.project)
+        .bind(object_kind)
+        .bind(external_id)
+        .fetch_one(&self.owner)
+        .await
+        .unwrap()
     }
 
     async fn items(&self, provider: &str, query: &str) -> ItemSearchV1 {
@@ -1368,6 +1439,368 @@ async fn live_hint_readiness_counts_worker_collectors_and_fails_closed_when_conf
         items.absence
     );
     serve.drop_role(&harness.owner).await;
+    harness.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// A signed deletion hides what it names, whatever the container
+// ---------------------------------------------------------------------------
+
+/// Stage one Slack message as an agent capture: capture records no
+/// container.
+async fn capture_message(harness: &Harness, channel: &str, ts: &str, text: &str) {
+    let pool = &harness.owner;
+    let verified = harness
+        .fixture
+        .installed
+        .runtime(pool)
+        .await
+        .verify()
+        .await
+        .expect("the installed head verifies");
+    let active = verified
+        .bind_connector(&ContractId::new(CollectionModeV1::Capture.connector_schema_id()).unwrap())
+        .expect("the active package carries the capture connector");
+    let redactor = CollectorRedactorV1::from_active_package(&active).unwrap();
+    let agent = ContractId::new("agent.scout").unwrap();
+    let external_id = format!("{channel}:{ts}");
+    let draft = CollectedItemDraftV1 {
+        provider: ProviderKindV1::new("slack").unwrap(),
+        provider_scope_id: TEAM.into(),
+        object_kind: ObjectKindV1::new("message").unwrap(),
+        external_id: external_id.clone(),
+        marker: Some(ts.to_owned()),
+        order_micros: u64::try_from(ts_micros(ts)).unwrap(),
+        lifecycle: ItemLifecycleV1::Live,
+        container: Some(DraftContainerV1 {
+            kind: ContainerKindV1::new("slack.channel").unwrap(),
+            id: channel.into(),
+            label: None,
+        }),
+        thread: None,
+        author: None,
+        created_at: None,
+        updated_at: None,
+        title: None,
+        sections: vec![DraftSectionV1::whole(text.into())],
+        text_format: TextFormatV1::Plain,
+        links: Vec::new(),
+        provider_url: None,
+        visibility: None,
+    };
+    let outcome = CollectedItemSink::new(
+        pool.clone(),
+        &harness.fixture.installed.scope,
+        RetryPolicy::default(),
+    )
+    .unwrap()
+    .stage(
+        &[StageDraftV1 {
+            delivery_id: external_id.into_bytes(),
+            provider_audience: None,
+            draft,
+        }],
+        &StageContextV1 {
+            instance: &CollectorInstanceV1 {
+                connector_instance_id: ContractId::new("capture.scout").unwrap(),
+                provider: ProviderKindV1::new("slack").unwrap(),
+                provider_scope_id: BoundedTextV1::new(TEAM).unwrap(),
+            },
+            principal: &agent,
+            mode: CollectionModeV1::Capture,
+            attester: Some(&agent),
+            via: None,
+            redactor: &redactor,
+            policy: &AudiencePolicyV1::default(),
+            capture_scopes: &[CaptureScopeV1 {
+                provider: "slack".into(),
+                provider_scope_id: TEAM.into(),
+                containers: CaptureContainersV1::All,
+            }],
+            pass_seq: None,
+            container_observations: &[],
+            cursor_advances: &[],
+            source_status: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.rows_staged, 1, "{outcome:?}");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // two containers, each deleted, each checked
+async fn live_a_signed_deletion_hides_an_item_whatever_its_container_when_configured() {
+    let Some(harness) = Harness::new("ingress-deletion-audience").await else {
+        return;
+    };
+    // An agent captured a message in a channel no collector reads; the next
+    // tick admits it.
+    let captured_ts = slack_ts(harness.base + 50, 700);
+    let captured = format!("C07CAPTURE1:{captured_ts}");
+    capture_message(
+        &harness,
+        "C07CAPTURE1",
+        &captured_ts,
+        "the gecko migration runs on friday",
+    )
+    .await;
+    harness.tick(&[SLACK]).await;
+    assert_eq!(
+        hits(&harness.items("slack", "gecko").await),
+        [captured.as_str()]
+    );
+    // Slack deletes it: the tombstone needs no container it could be
+    // refused for.
+    let deleted = slack_ts(harness.now.timestamp(), 200);
+    let removal = |id: &str, channel: &str, ts: &str| {
+        harness.slack_event(
+            id,
+            TEAM,
+            &json!({"type": "message", "subtype": "message_deleted", "hidden": true,
+                    "channel": channel, "channel_type": "channel", "ts": deleted,
+                    "event_ts": deleted, "deleted_ts": ts}),
+        )
+    };
+    assert_eq!(
+        harness
+            .post_slack(&removal("Ev07DEL00010", "C07CAPTURE1", &captured_ts))
+            .await,
+        200
+    );
+    let report = harness.tick(&[SLACK]).await;
+    assert_eq!(counter(&report, SLACK, "hints_tombstones"), 1);
+    assert_eq!(harness.dead_letters(SLACK, "audience_refused").await, 0);
+    assert!(harness.items("slack", "gecko").await.hits.is_empty());
+    assert!(harness.evidence("gecko").await.hits.is_empty());
+
+    // A pulled message whose channel became private (and unlisted): the
+    // channel is withdrawn, and Slack deletes the message meanwhile.
+    let ts = harness.message_ts();
+    let pulled = format!("{PLATENG}:{ts}");
+    assert_eq!(
+        hits(&harness.items("slack", "ingest retry budget").await),
+        [pulled.as_str()]
+    );
+    harness.change(|world| world.private_channel = true);
+    harness.tick(&[SLACK]).await;
+    assert!(
+        harness
+            .items("slack", "ingest retry budget")
+            .await
+            .hits
+            .is_empty()
+    );
+    assert_eq!(
+        harness
+            .post_slack(&removal("Ev07DEL00011", PLATENG, &ts))
+            .await,
+        200
+    );
+    harness.change(|world| world.messages.clear());
+    let report = harness.tick(&[SLACK]).await;
+    assert_eq!(counter(&report, SLACK, "hints_tombstones"), 1);
+    assert_eq!(harness.head("message", &pulled).await.0, "deleted");
+    assert!(
+        harness
+            .rows(SLACK)
+            .await
+            .iter()
+            .all(|row| row.2 == "settled")
+    );
+    // The channel reopens: the deleted message does not come back with it.
+    harness.change(|world| world.private_channel = false);
+    harness.tick(&[SLACK]).await;
+    assert_eq!(harness.head("message", &pulled).await.0, "deleted");
+    assert!(
+        harness
+            .items("slack", "ingest retry budget")
+            .await
+            .hits
+            .is_empty()
+    );
+    harness.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// A hint never reads before the collector's backfill window
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn live_a_slack_hint_never_reads_before_backfill_since_when_configured() {
+    let Some(mut harness) = Harness::new("ingress-backfill").await else {
+        return;
+    };
+    harness.slack_settings = json!({"backfill_since": iso(harness.base - 86_400)});
+    let old = slack_ts(harness.base - 20 * 86_400, 500);
+    harness.change(|world| {
+        world.messages.push(json!({
+            "type": "message", "user": "U07ALICE001", "ts": old,
+            "text": "an aardvark wrote this long before the backfill"
+        }));
+    });
+    let external = format!("{PLATENG}:{old}");
+    harness.tick(&[SLACK]).await;
+    assert_eq!(harness.heads("message", &external).await, 0);
+    assert_eq!(
+        harness
+            .heads("message", &format!("{PLATENG}:{}", harness.message_ts()))
+            .await,
+        1
+    );
+
+    // Someone edits the old message, and Slack says so.
+    let edited = slack_ts(harness.base + 700, 1);
+    harness.change(|world| {
+        let message = world
+            .messages
+            .iter_mut()
+            .find(|message| message["ts"] == old.as_str())
+            .unwrap();
+        message["text"] = json!("an aardvark edited this long before the backfill");
+        message["edited"] = json!({"user": "U07ALICE001", "ts": edited});
+    });
+    let changed = harness.slack_event(
+        "Ev07CHG00020",
+        TEAM,
+        &json!({"type": "message", "subtype": "message_changed", "channel": PLATENG,
+                "channel_type": "channel", "ts": edited, "event_ts": edited,
+                "message": {"type": "message", "ts": old, "text": "x",
+                            "edited": {"user": "U07ALICE001", "ts": edited}}}),
+    );
+    assert_eq!(harness.post_slack(&changed).await, 200);
+    let report = harness.tick(&[SLACK]).await;
+    assert_eq!(counter(&report, SLACK, "hints_settled"), 1);
+    assert_eq!(counter(&report, SLACK, "hints_staged"), 0);
+    assert_eq!(harness.heads("message", &external).await, 0);
+    assert!(harness.items("slack", "aardvark").await.hits.is_empty());
+    harness.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// A Linear change only the pass reads stays pending until the pass reads it
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn live_a_linear_hint_left_to_the_pass_waits_for_a_complete_team_when_configured() {
+    let Some(harness) = Harness::new("ingress-linear-pass").await else {
+        return;
+    };
+    harness.tick(&[LINEAR]).await;
+    // A new issue: the memory never held it, so only the sweep reads it.
+    let created = iso(harness.base + 900);
+    let issue = "1550e000-0000-4000-8000-000000000002";
+    harness.change(|world| {
+        world.more_issues.push(json!({
+            "id": issue, "identifier": "ENG-413", "number": 413,
+            "title": "Budget the okapi retries", "description": "An okapi keeps retrying.",
+            "priority": 2, "url": "https://linear.app/acme-robotics/issue/ENG-413/okapi",
+            "createdAt": created, "updatedAt": created, "archivedAt": null, "trashed": null,
+            "state": {"name": "Todo", "type": "unstarted"}, "team": {"id": ENG},
+            "creator": {"id": "a11ce000-0000-4000-8000-000000000001"}, "botActor": null,
+            "externalUserCreator": null, "parent": null, "project": null
+        }));
+        world.linear_sweeps_rate_limited = true;
+    });
+    let create = json!({"action": "create", "type": "Issue", "createdAt": created,
+                        "organizationId": ORG, "webhookTimestamp": harness.now.timestamp_millis(),
+                        "data": {"id": issue, "identifier": "ENG-413", "teamId": ENG,
+                                 "title": "Budget the okapi retries", "updatedAt": created}});
+    assert_eq!(harness.post_linear(&create).await, 200);
+
+    // The sweep is rate-limited: the team is partial, so the hint waits,
+    // uncounted, and readiness still counts it.
+    let report = harness.tick(&[LINEAR]).await;
+    assert_eq!(counter(&report, LINEAR, "hints_left_to_pass"), 1);
+    assert_eq!(counter(&report, LINEAR, "hints_settled"), 0);
+    let (_, _, state, attempts, _, _) = harness.rows(LINEAR).await[0].clone();
+    assert_eq!((state.as_str(), attempts), ("pending", 0));
+    assert_eq!(harness.heads("issue", issue).await, 0);
+    assert_eq!(
+        harness
+            .items("linear", "okapi")
+            .await
+            .readiness
+            .hints_awaiting_fetch,
+        Some(1)
+    );
+
+    // The next pass reads the team to its end: the issue is staged, and the
+    // hint settles.
+    harness.change(|world| world.linear_sweeps_rate_limited = false);
+    let report = harness.tick(&[LINEAR]).await;
+    assert_eq!(counter(&report, LINEAR, "hints_settled"), 1);
+    assert_eq!(harness.rows(LINEAR).await[0].2, "settled");
+    assert_eq!(harness.head("issue", issue).await.0, "live");
+    assert_eq!(hits(&harness.items("linear", "okapi").await), [issue]);
+    harness.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// A provider that cannot be read ends the tick's hints at the first
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn live_a_rate_limited_provider_ends_the_hint_run_at_the_first_hint_when_configured() {
+    let Some(harness) = Harness::new("ingress-outage").await else {
+        return;
+    };
+    harness.tick(&[SLACK]).await;
+    let ts = harness.message_ts();
+    for index in 0..3 {
+        let changed = harness.slack_event(
+            &format!("Ev07OUT0000{index}"),
+            TEAM,
+            &json!({"type": "message", "subtype": "message_changed", "channel": PLATENG,
+                    "channel_type": "channel", "ts": slack_ts(harness.base + 600, index),
+                    "message": {"type": "message", "ts": ts, "text": "x"}}),
+        );
+        assert_eq!(harness.post_slack(&changed).await, 200);
+    }
+    harness.change(|world| world.slack_rate_limited = true);
+    harness.fake.clear_requests();
+    let report = harness.run_tick(&harness.owner, &[SLACK]).await;
+    assert_eq!(counter(&report, SLACK, "hints_read"), 1);
+    assert_eq!(counter(&report, SLACK, "hints_retried"), 1);
+    assert_eq!(counter(&report, SLACK, "hints_postponed"), 2);
+    let mut attempts: Vec<(String, i64)> = harness
+        .rows(SLACK)
+        .await
+        .into_iter()
+        .map(|row| (row.2, row.3))
+        .collect();
+    attempts.sort();
+    assert_eq!(
+        attempts,
+        [
+            ("pending".to_owned(), 0),
+            ("pending".to_owned(), 0),
+            ("pending".to_owned(), 1)
+        ]
+    );
+    // One call found the outage for the hints, not one per hint.
+    let calls = harness
+        .fake
+        .requests()
+        .iter()
+        .filter(|request| request.path.ends_with("auth.test"))
+        .count();
+    assert!(calls <= 2, "{calls} auth.test calls");
+
+    // Slack is back: every hint is read.
+    harness.change(|world| world.slack_rate_limited = false);
+    sqlx::query(
+        "UPDATE memory_ingress_deliveries_v1 SET next_attempt_at = NULL \
+         WHERE tenant_id = $1 AND project = $2 AND collector_instance_id = $3",
+    )
+    .bind(harness.fixture.installed.scope.tenant_id)
+    .bind(&harness.fixture.installed.scope.project)
+    .bind(SLACK)
+    .execute(&harness.owner)
+    .await
+    .unwrap();
+    let report = harness.tick(&[SLACK]).await;
+    assert_eq!(counter(&report, SLACK, "hints_settled"), 3);
     harness.finish().await;
 }
 

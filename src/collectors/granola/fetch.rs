@@ -8,7 +8,8 @@
 //! it is, and a note outside the listed folders withdrawing what the memory
 //! holds of it. A `404` stages nothing and tombstones nothing: only two
 //! complete listings without the note do. A rate limit, a failed request, or
-//! a refused key backs the hint off.
+//! a refused key backs the hint off and ends the tick's hints; a note that
+//! needs more requests than one hint may take backs off this hint only.
 
 use std::collections::BTreeMap;
 
@@ -21,7 +22,7 @@ use super::render::{GRANOLA_PROVIDER, SUMMARY_OBJECT_KIND, TRANSCRIPT_OBJECT_KIN
 use super::{GranolaPassV1, GranolaPullV1, NoteEndV1, NotesCursorV1};
 use crate::collectors::audience::ProviderAudienceV1;
 use crate::collectors::pull::{
-    FetchedObjectV1, HintedObjectV1, ObjectFetcherV1, PageStager, PullPassInputV1,
+    FetchedObjectV1, HintedObjectV1, ObjectFetcherV1, PageStager, PartialReasonV1, PullPassInputV1,
 };
 use crate::collectors::sink::ContainerObservationV1;
 
@@ -99,11 +100,16 @@ impl ObjectFetcherV1 for GranolaFetchV1 {
                 items,
                 observations: pass.observations,
             }),
-            Ok(NoteEndV1::Stop(reason)) => Ok(FetchedObjectV1::Failed(format!(
+            // The hint's own request budget is this note's; a rate limit or a
+            // failed request is the whole provider's.
+            Ok(NoteEndV1::Stop(PartialReasonV1::ListingBound)) => Ok(FetchedObjectV1::Failed(
+                "the Granola note needed more requests than one hint may take".to_owned(),
+            )),
+            Ok(NoteEndV1::Stop(reason)) => Ok(FetchedObjectV1::Unavailable(format!(
                 "Granola could not be read now ({})",
                 reason.as_str()
             ))),
-            Err(FleetError::Configuration(message)) => Ok(FetchedObjectV1::Failed(message)),
+            Err(FleetError::Configuration(message)) => Ok(FetchedObjectV1::Unavailable(message)),
             Err(error) => Err(error),
         }
     }

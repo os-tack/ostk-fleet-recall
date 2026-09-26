@@ -1405,22 +1405,39 @@ any pull; a deletion becomes a push-mode tombstone.
   once, so the pass that follows sees it as the memory's version. A delete of
   an item the memory holds becomes a tombstone staged through
   `connector.collected.push` at the provider's event time, in the container
-  and thread its head records; one the memory never held, or holds as a
-  tombstone, settles with nothing staged, as does an upsert whose object is
-  gone or outside what the instance admits. A hint therefore settles only
+  and thread its head records. It carries no text, so it can only hide: it is
+  admitted whatever that container's recorded audience (an item only a
+  capture holds, whose container nothing verified recorded, or one in a
+  container since withdrawn, which would otherwise come back when the
+  container reopens), on the operator's configuration of the instance
+  (`operator_declared`), and lifts no withdrawal; a direct conversation's
+  never. A refused tombstone settles nothing and counts as a failure. One
+  the memory never held, or holds as a tombstone, settles with nothing
+  staged, as does an upsert whose object is gone or outside what the
+  instance admits. A hint therefore settles only
   once what it caused is durable (docs/DYNAMIC_MEMORY_ARCHITECTURE.md, the
   acknowledgement rule of "Ingestion and projections").
 - **What only a pass decides.** A hint never establishes coverage and never
-  tombstones on absence. A Linear issue the memory holds in another team, in
-  the trash, or withdrawn, one it never held, and a comment on an issue in
-  the trash are left to the sweep, which runs right after the hints and reads
-  what they imply (a move's comments, the trash's withdrawals).
+  tombstones on absence, and never reads what no pass would: a Slack message,
+  or a reply whose thread root, at or before the collector's
+  `backfill_since` settles with nothing staged, so a provider event never
+  widens the configured window or holds what no reconciliation could
+  tombstone. A Linear issue the memory holds in another team, in the trash,
+  or withdrawn, one it never held, and a comment on an issue in the trash are
+  left to the sweep, which runs right after the hints and reads what they
+  imply (a move's comments, the trash's withdrawals): such a hint stays
+  pending, with no failure counted, and settles once a pass has read its team
+  completely, so readiness counts it until then.
 - **Failures.** A provider failure (a rate limit, a failed request, a refused
   credential, a pinned scope the credential does not belong to) backs the
   hint off, `60 s * 2^n` after the `n+1`-th failure; the eighth makes it
   `dead` with a `retry_exhausted` dead letter whose delivery id is the key.
-  `collect retry --delivery <hex>` reopens a dead hint, due at once. An item
-  refused as `clock_ahead` settles nothing and counts as a failure.
+  `collect retry --delivery <hex>` reopens a dead hint, due at once. A
+  failure of the whole provider (its setup call, a rate limit, a request that
+  failed below its answer, a refused credential) also ends that collector's
+  hints for the tick: the rest wait, uncounted, and the pass keeps its
+  budget. An item refused as `clock_ahead` settles nothing and counts as a
+  failure.
 - **Readiness.** Evidence and item recall report `hints_awaiting_fetch`
   (item recall, of the requested provider) where the queue is readable,
   counting the hints of collectors with an active worker source (a retired

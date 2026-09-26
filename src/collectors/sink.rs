@@ -550,7 +550,8 @@ impl CollectedItemSink {
     /// hint is the queue's acknowledgement, so it happens only where what the
     /// hint caused is durable. A hint no longer pending (another worker
     /// settled it) is left as it is. When an item is refused as
-    /// `clock_ahead`, no hint settles, as no cursor advances: the hint is read
+    /// `clock_ahead`, no hint settles, as no cursor advances, and when a push
+    /// deletion is refused, its hint does not settle either: the hint is read
     /// again.
     ///
     /// # Errors
@@ -1373,6 +1374,7 @@ impl StageJob {
             ItemWithdrawals::new()
         };
         let mut clock_ahead = false;
+        let mut deletion_refused = false;
         for staged in &self.drafts {
             let item = self
                 .stage_one(
@@ -1386,6 +1388,9 @@ impl StageJob {
             if let StagedItemV1::Refused { reason, .. } = &item {
                 *outcome.refused.entry(*reason).or_insert(0) += 1;
                 clock_ahead |= *reason == DeadLetterReasonV1::ClockAhead;
+                // A push stages only deletions: a hint whose deletion was
+                // refused has not hidden what it names, so it stays pending.
+                deletion_refused |= self.mode == CollectionModeV1::Push;
             }
             outcome.items.push(item);
         }
@@ -1406,6 +1411,8 @@ impl StageJob {
                     .await?;
             }
             outcome.cursors_advanced = !self.cursors.is_empty();
+        }
+        if !clock_ahead && !deletion_refused {
             for settlement in &self.settlements {
                 outcome.hints_settled +=
                     settle_hint(transaction, self.tenant_id, &self.project, settlement, now)
@@ -1681,6 +1688,20 @@ impl StageJob {
             capture_scopes: &self.capture_scopes,
             known_container: known,
         });
+        // A signed deletion carries no text: it can only hide, so no audience
+        // it could be refused for protects anything. One whose container is
+        // not recorded readable (an item only a capture holds, a container
+        // since withdrawn) is admitted on the operator's configuration of the
+        // instance, and lifts no withdrawal; a direct conversation is never.
+        let (decision, lifts) = match decision {
+            AudienceDecisionV1::Refuse(
+                AudienceRefusalV1::AudienceUnknown | AudienceRefusalV1::ContainerWithdrawn,
+            ) if !direct && is_signed_deletion(self.mode, draft) => (
+                AudienceDecisionV1::Admit(AudienceBasisV1::OperatorDeclared),
+                false,
+            ),
+            decision => (decision, true),
+        };
         let basis = match decision {
             AudienceDecisionV1::Admit(basis) => basis,
             AudienceDecisionV1::Refuse(refusal) => {
@@ -1805,7 +1826,7 @@ impl StageJob {
                 outcome.rows_already_staged += 1;
             }
         }
-        if observes_item_audience(self.mode) {
+        if lifts && observes_item_audience(self.mode) {
             self.lift_item(
                 transaction,
                 sealed.item_key,
@@ -1933,6 +1954,19 @@ fn prepare_container(
         provider_audience: observation.provider_audience,
         decision,
     })
+}
+
+/// Whether `draft` is a push deletion with nothing in it: a tombstone with no
+/// text, title, author, link, or display link, which is all a signed
+/// deletion hint stages (ADR 0008 D12).
+fn is_signed_deletion(mode: CollectionModeV1, draft: &CollectedItemDraftV1) -> bool {
+    mode == CollectionModeV1::Push
+        && draft.lifecycle.is_tombstone()
+        && draft.sections.is_empty()
+        && draft.title.is_none()
+        && draft.author.is_none()
+        && draft.links.is_empty()
+        && draft.provider_url.is_none()
 }
 
 /// The item key a draft names, derived exactly as sealing derives it.

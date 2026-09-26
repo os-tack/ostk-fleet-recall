@@ -13,12 +13,23 @@
 //!   nothing staged.
 //! * **Delete.** An item the memory already holds gets a push-mode tombstone
 //!   at the provider's signed event time, in the container and thread its
-//!   head records; one the memory never held, or holds as a tombstone,
-//!   settles the hint with nothing staged. A deletion never mints an item.
+//!   head records, whatever that container's recorded audience (a tombstone
+//!   carries no text, so it can only hide: an item only a capture holds, or
+//!   one in a container since withdrawn, is hidden too); one the memory never
+//!   held, or holds as a tombstone, settles the hint with nothing staged. A
+//!   deletion never mints an item, and a refused one settles nothing and
+//!   counts as a failure.
+//! * **Left to the pass.** A change only a pass may read (a Linear issue the
+//!   memory never held, or holds elsewhere) stages nothing and stays pending,
+//!   with no failure counted; it settles once the pass that follows has read
+//!   the hint's container completely, and waits for a later pass otherwise.
 //! * **Failure.** A provider failure (a rate limit, a failed request, a
 //!   refused credential) backs the hint off, `60 s * 2^n`; the eighth makes
 //!   it `dead` with a `retry_exhausted` dead letter, which
-//!   `collect retry --delivery` reopens. A staged item refused as
+//!   `collect retry --delivery` reopens. A failure of the whole provider (its
+//!   setup call, a rate limit, a request that failed below its answer, a
+//!   refused credential) also ends the run: the other hints wait for the next
+//!   tick, uncounted, and the pass keeps its budget. A staged item refused as
 //!   `clock_ahead` settles nothing and counts as a failure, so it is read
 //!   again.
 //!
@@ -31,7 +42,7 @@ use crate::collectors::http::scrub_diagnostic;
 use crate::collectors::ingress::HintKindV1;
 use crate::collectors::pull::{
     FetchedObjectV1, HintedObjectV1, ObjectFetcherV1, PageStager, PageStagerContextV1,
-    PullPassInputV1,
+    PassSettlementV1, PullPassInputV1,
 };
 use crate::collectors::sink::{
     CollectedDrainContextV1, CollectedDrainReportV1, CollectedItemSink, DeadLetterReasonV1,
@@ -52,13 +63,15 @@ pub const MAX_HINTS_PER_TICK: u32 = 256;
 
 /// What a collector that takes webhooks reports about its hints, beside its
 /// pass's counters, once the schema has the hint queue.
-pub(super) const HINT_COUNTERS: [&str; 6] = [
+pub(super) const HINT_COUNTERS: [&str; 8] = [
     "hints_read",
     "hints_settled",
     "hints_staged",
     "hints_tombstones",
     "hints_retried",
     "hints_dead",
+    "hints_left_to_pass",
+    "hints_postponed",
 ];
 
 /// Everything one collector's hints are read under: the pass's own binding.
@@ -78,8 +91,59 @@ enum HintEndV1 {
         stage_ids: Vec<Sha256Digest>,
         tombstone: bool,
     },
+    /// Not settled: left pending until a pass reads this container
+    /// completely.
+    LeftToThePass(Sha256Digest),
     /// Not settled: counted as a failed fetch.
     Failed(String),
+    /// Not settled: counted as a failed fetch, and the provider cannot be
+    /// read now, so the tick's other hints wait.
+    Unavailable(String),
+}
+
+/// A hint left to the pass: settled once the pass has read its container
+/// completely.
+pub(super) struct DeferredHintV1 {
+    /// The hint's settlement.
+    pub settlement: HintSettlementV1,
+    /// The container the pass must read completely.
+    pub container: Sha256Digest,
+}
+
+/// What one collector's hint run did.
+#[derive(Default)]
+pub(super) struct HintRunOutcomeV1 {
+    /// Whether any hint staged a row.
+    pub changed: bool,
+    /// The hints left to the pass.
+    pub deferred: Vec<DeferredHintV1>,
+}
+
+impl HintRunOutcomeV1 {
+    /// Settle every hint left to the pass whose container the pass read
+    /// completely; the others stay pending, with no failure counted, for a
+    /// later pass.
+    pub(super) async fn settle_deferred(
+        &self,
+        sink: &CollectedItemSink,
+        settlement: &PassSettlementV1,
+        counters: &mut WorkerCountersV1,
+    ) -> std::result::Result<(), String> {
+        for deferred in &self.deferred {
+            let complete = settlement.containers.iter().any(|container| {
+                container.container_key == Some(deferred.container) && container.complete()
+            });
+            if complete
+                && sink
+                    .settle_hint(&deferred.settlement)
+                    .await
+                    .map_err(describe)?
+            {
+                bump(counters, "hints_settled", 1);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn bump(counters: &mut WorkerCountersV1, key: &'static str, by: u64) {
@@ -87,7 +151,7 @@ fn bump(counters: &mut WorkerCountersV1, key: &'static str, by: u64) {
 }
 
 /// The stage ids a staging call staged, and whether it settled without an
-/// item refused as `clock_ahead`.
+/// item refused as `clock_ahead`, or a deletion refused at all.
 fn staged(outcome: &StageOutcomeV1, tombstone: bool) -> HintEndV1 {
     if outcome
         .refused
@@ -96,6 +160,12 @@ fn staged(outcome: &StageOutcomeV1, tombstone: bool) -> HintEndV1 {
         return HintEndV1::Failed(
             "the provider's clock is ahead of the observation; the hint is read again".to_owned(),
         );
+    }
+    if tombstone && let Some(reason) = outcome.refused.keys().next() {
+        return HintEndV1::Failed(format!(
+            "the deletion's tombstone was refused ({}); the hint is read again",
+            reason.as_str()
+        ));
     }
     HintEndV1::Settled {
         stage_ids: outcome
@@ -246,7 +316,11 @@ impl HintRunV1<'_> {
             .map_err(describe)?;
         match read {
             FetchedObjectV1::Nothing(_) => self.nothing(hint).await,
+            FetchedObjectV1::LeftToThePass { container } => Ok(HintEndV1::LeftToThePass(container)),
             FetchedObjectV1::Failed(message) => Ok(HintEndV1::Failed(scrub_diagnostic(&message))),
+            FetchedObjectV1::Unavailable(message) => {
+                Ok(HintEndV1::Unavailable(scrub_diagnostic(&message)))
+            }
             FetchedObjectV1::Stage {
                 items,
                 observations,
@@ -260,12 +334,37 @@ impl HintRunV1<'_> {
         }
     }
 
-    /// Read and settle the instance's due hints; whether any staged a row.
+    /// Record one failed fetch of `hint`.
+    async fn failed(
+        &self,
+        hint: &PendingHintV1,
+        error: &str,
+        counters: &mut WorkerCountersV1,
+    ) -> std::result::Result<(), String> {
+        let instance = &self.stager.instance.connector_instance_id;
+        match self
+            .sink
+            .hint_failed(instance, hint, error)
+            .await
+            .map_err(describe)?
+        {
+            HintFailureV1::Retried { .. } => bump(counters, "hints_retried", 1),
+            HintFailureV1::Dead => bump(counters, "hints_dead", 1),
+            HintFailureV1::Gone => {}
+        }
+        Ok(())
+    }
+
+    /// Read and settle the instance's due hints: whether any staged a row,
+    /// and which are left to the pass. A provider that cannot be read at
+    /// all ends the run: the hint that found it so backs off, and the rest
+    /// wait for the next tick uncounted, so an outage costs one call, not one
+    /// per hint, and leaves the pass its budget.
     pub(super) async fn run(
         &self,
         counters: &mut WorkerCountersV1,
         total: &mut CollectedDrainReportV1,
-    ) -> std::result::Result<bool, String> {
+    ) -> std::result::Result<HintRunOutcomeV1, String> {
         let instance = &self.stager.instance.connector_instance_id;
         let pending = self
             .sink
@@ -273,8 +372,10 @@ impl HintRunV1<'_> {
             .await
             .map_err(describe)?;
         let mut stager = PageStager::new(self.sink, &self.stager).map_err(describe)?;
-        let mut changed = false;
+        let mut outcome = HintRunOutcomeV1::default();
+        let mut remaining = pending.len();
         for hint in pending {
+            remaining -= 1;
             bump(counters, "hints_read", 1);
             let end = match hint.kind {
                 HintKindV1::Delete => self.delete(&hint).await?,
@@ -289,7 +390,7 @@ impl HintRunV1<'_> {
                     if stage_ids.is_empty() {
                         continue;
                     }
-                    changed = true;
+                    outcome.changed = true;
                     bump(
                         counters,
                         if tombstone {
@@ -308,20 +409,25 @@ impl HintRunV1<'_> {
                     bump(counters, "replayed", drained.replayed);
                     super::collect::merge(total, &drained);
                 }
-                HintEndV1::Failed(error) => {
-                    match self
-                        .sink
-                        .hint_failed(instance, &hint, &error)
-                        .await
-                        .map_err(describe)?
-                    {
-                        HintFailureV1::Retried { .. } => bump(counters, "hints_retried", 1),
-                        HintFailureV1::Dead => bump(counters, "hints_dead", 1),
-                        HintFailureV1::Gone => {}
-                    }
+                HintEndV1::LeftToThePass(container) => {
+                    bump(counters, "hints_left_to_pass", 1);
+                    outcome.deferred.push(DeferredHintV1 {
+                        settlement: self.settlement(&hint),
+                        container,
+                    });
+                }
+                HintEndV1::Failed(error) => self.failed(&hint, &error, counters).await?,
+                HintEndV1::Unavailable(error) => {
+                    self.failed(&hint, &error, counters).await?;
+                    bump(
+                        counters,
+                        "hints_postponed",
+                        u64::try_from(remaining).unwrap_or(u64::MAX),
+                    );
+                    break;
                 }
             }
         }
-        Ok(changed)
+        Ok(outcome)
     }
 }

@@ -19,7 +19,8 @@
 //!    becomes a push tombstone of an item already held) and settled in the
 //!    transaction that stages what it caused, or backed off, or after eight
 //!    attempts killed with a `retry_exhausted` dead letter (ADR 0008 D12); a
-//!    hint writes no coverage, so the pass still runs;
+//!    hint writes no coverage, so the pass still runs; a hint left to the pass
+//!    settles after it, once the pass read the hint's container completely;
 //! 3. the pass runs at a pass instant read from the database, staging page by
 //!    page through a [`PageStager`];
 //! 4. what the pass staged or relied on is drained, and the pass is settled
@@ -103,7 +104,7 @@ use crate::store::cockroach::{
     COLLECTED_ITEMS_SCHEMA_VERSION, COLLECTOR_INGRESS_SCHEMA_VERSION, read_schema_version,
 };
 
-use super::hints::{HINT_COUNTERS, HintRunV1};
+use super::hints::{HINT_COUNTERS, HintRunOutcomeV1, HintRunV1};
 use super::ingest::{bounded_error, describe, server_instant, zeroed};
 use super::sources::CollectorSourceV1;
 use super::{
@@ -482,7 +483,7 @@ impl CollectorPasses<'_> {
 
         // The instance's ingress hints first, so the pass sees what they
         // staged as the memory's version (ADR 0008 D12).
-        let hinted = if self.hints && adapter.push().is_some() {
+        let hints = if self.hints && adapter.push().is_some() {
             counters.extend(HINT_COUNTERS.iter().map(|key| (*key, 0)));
             let fetcher = adapter.fetch_object(source, &*self.worker.collector_environment)?;
             HintRunV1 {
@@ -496,7 +497,7 @@ impl CollectorPasses<'_> {
             .run(counters, total)
             .await?
         } else {
-            false
+            HintRunOutcomeV1::default()
         };
 
         let mut stager = PageStager::new(self.sink, &stager_context).map_err(describe)?;
@@ -532,11 +533,16 @@ impl CollectorPasses<'_> {
         merge(total, &drained);
         *counters.entry("appended").or_insert(0) += drained.appended;
         *counters.entry("replayed").or_insert(0) += drained.replayed;
-        let changed = hinted || pages.rows_staged > 0 || drained.appended > 0;
+        let changed = hints.changed || pages.rows_staged > 0 || drained.appended > 0;
         let row_states = self.sink.row_states(&held).await.map_err(describe)?;
         let settlement = stager
             .settle(&outcome.containers, &row_states)
             .map_err(describe)?;
+        // The hints left to this pass settle where it read their container
+        // completely.
+        hints
+            .settle_deferred(self.sink, &settlement, counters)
+            .await?;
         counters.insert(
             "containers",
             u64::try_from(settlement.containers.len()).unwrap_or(u64::MAX),

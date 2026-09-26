@@ -18,8 +18,10 @@
 //! imply: an issue the memory holds in another team, in the trash, or
 //! withdrawn, and one it never held (their comments need a whole read the
 //! sweep queues), and a comment on an issue in the trash (the trash hides
-//! everything on the issue). For those the hint stages nothing and the next
-//! pass, which runs right after the hints in the same tick, settles them.
+//! everything on the issue). For those the hint stages nothing and stays
+//! pending ([`FetchedObjectV1::LeftToThePass`]): it settles once a pass,
+//! which runs right after the hints in the same tick, has read the team
+//! completely, so readiness counts it until what it announced is read.
 
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
@@ -48,8 +50,20 @@ pub struct LinearFetchV1 {
     scope: OnceCell<LinearScopeV1>,
 }
 
+/// A failed query, as the hint run takes it: one Linear refused for this
+/// node, or answered in a shape it does not document, fails this hint; a rate
+/// limit, a refused credential, or a request that failed below Linear's
+/// answer is the whole provider's.
 fn failed(what: &str, error: &LinearCallErrorV1) -> FetchedObjectV1 {
-    FetchedObjectV1::Failed(format!("the Linear {what} query failed: {error}"))
+    let message = format!("the Linear {what} query failed: {error}");
+    match error {
+        LinearCallErrorV1::Refused(_) | LinearCallErrorV1::Malformed(_) => {
+            FetchedObjectV1::Failed(message)
+        }
+        LinearCallErrorV1::RateLimited
+        | LinearCallErrorV1::Credential(_)
+        | LinearCallErrorV1::Http(_) => FetchedObjectV1::Unavailable(message),
+    }
 }
 
 impl LinearFetchV1 {
@@ -68,13 +82,13 @@ impl LinearFetchV1 {
             .get_or_try_init(|| async {
                 let mut teams = self.settings.teams.clone();
                 teams.sort();
-                let scope = self
-                    .api
-                    .scope(&teams)
-                    .await
-                    .map_err(|error| failed("organization", &error))?;
+                let scope = self.api.scope(&teams).await.map_err(|error| {
+                    FetchedObjectV1::Unavailable(format!(
+                        "the Linear organization query failed: {error}"
+                    ))
+                })?;
                 if !scope.organization.id.eq_ignore_ascii_case(pinned) {
-                    return Err(FetchedObjectV1::Failed(format!(
+                    return Err(FetchedObjectV1::Unavailable(format!(
                         "the Linear credential belongs to organization {}, but the collector is \
                          pinned to organization {pinned}",
                         shown_id(&scope.organization.id)
@@ -150,17 +164,15 @@ impl ObjectFetcherV1 for LinearFetchV1 {
             Ok(None) => return Ok(FetchedObjectV1::Nothing("not_found")),
             Err(error) => return Ok(failed("issue", &error)),
         };
-        let Some(team) = issue
-            .team
-            .as_ref()
-            .map(|team| team.id.clone())
-            .filter(|team| {
-                self.settings
-                    .teams
-                    .iter()
-                    .any(|listed| listed.eq_ignore_ascii_case(team))
-            })
-        else {
+        // The team as the settings list it, so its container is the one the
+        // pass keys.
+        let Some(team) = issue.team.as_ref().and_then(|team| {
+            self.settings
+                .teams
+                .iter()
+                .find(|listed| listed.eq_ignore_ascii_case(&team.id))
+                .cloned()
+        }) else {
             return Ok(FetchedObjectV1::Nothing("team_not_read"));
         };
         let Some(info) = scope.team(&team) else {
@@ -199,10 +211,7 @@ impl ObjectFetcherV1 for LinearFetchV1 {
             !settled_here
         };
         if left_to_the_pass {
-            return Ok(FetchedObjectV1::Stage {
-                items: Vec::new(),
-                observations: vec![observation],
-            });
+            return Ok(FetchedObjectV1::LeftToThePass { container: key });
         }
         let mut teams = self.settings.teams.clone();
         teams.sort();

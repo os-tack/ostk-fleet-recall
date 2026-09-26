@@ -4,7 +4,11 @@
 //! would, under the collector's own token and audience rules:
 //!
 //! 1. The channel must be one `settings.channels` lists; any other is not
-//!    this collector's to read.
+//!    this collector's to read. A message, or a reply whose thread root, is
+//!    at or before `settings.backfill_since` is outside every pass's window,
+//!    so it is not read either: a provider event never widens what the
+//!    operator configured, and nothing is held that no reconciliation could
+//!    tombstone.
 //! 2. `auth.test` (once per tick): the token's team must be the pin, and its
 //!    workspace URL gives permalinks, so a hinted message is the same
 //!    envelope a pass stages.
@@ -40,6 +44,22 @@ use crate::collectors::pull::{
     FetchedObjectV1, HintedObjectV1, ObjectFetcherV1, PageStager, PullPassInputV1, PulledItemV1,
 };
 use crate::collectors::sink::ContainerObservationV1;
+
+/// A failed call, as the hint run takes it: one the provider refused for
+/// this channel or message fails this hint; a rate limit, a refused
+/// credential, or a request that failed below Slack's answer is the whole
+/// provider's.
+fn call_failed(what: &str, error: &SlackCallErrorV1) -> FetchedObjectV1 {
+    let message = format!("{what}: {error}");
+    match error {
+        SlackCallErrorV1::Refused(_) | SlackCallErrorV1::Malformed(_) => {
+            FetchedObjectV1::Failed(message)
+        }
+        SlackCallErrorV1::RateLimited
+        | SlackCallErrorV1::Credential(_)
+        | SlackCallErrorV1::Http(_) => FetchedObjectV1::Unavailable(message),
+    }
+}
 
 /// Re-reads hinted messages of one configured workspace.
 #[derive(Debug)]
@@ -89,6 +109,15 @@ impl SlackFetchV1 {
             .await
             .cloned()
     }
+
+    /// Whether `ts` is at or before `settings.backfill_since`, where every
+    /// pass's window starts (exclusive): what no pass reads, and so what no
+    /// reconciliation could ever tombstone, is never read for a hint either.
+    fn before_backfill(&self, ts: &SlackTsV1) -> bool {
+        self.settings
+            .backfill_micros()
+            .is_some_and(|backfill| ts.micros() <= backfill)
+    }
 }
 
 #[async_trait]
@@ -118,10 +147,13 @@ impl ObjectFetcherV1 for SlackFetchV1 {
         {
             return Ok(FetchedObjectV1::Nothing("channel_not_read"));
         }
+        if self.before_backfill(&ts) {
+            return Ok(FetchedObjectV1::Nothing("before_backfill"));
+        }
         let scope = input.instance.provider_scope_id.as_str();
         let workspace = match self.workspace(scope).await {
             Ok(workspace) => workspace,
-            Err(message) => return Ok(FetchedObjectV1::Failed(message)),
+            Err(message) => return Ok(FetchedObjectV1::Unavailable(message)),
         };
         let kind = ContainerKindV1::new(CHANNEL_CONTAINER_KIND)?;
         let listed = input
@@ -144,11 +176,7 @@ impl ObjectFetcherV1 for SlackFetchV1 {
                     }],
                 });
             }
-            Err(error) => {
-                return Ok(FetchedObjectV1::Failed(format!(
-                    "Slack conversations.info failed: {error}"
-                )));
-            }
+            Err(error) => return Ok(call_failed("Slack conversations.info failed", &error)),
         };
         let audience = info.audience();
         let observation = ContainerObservationV1 {
@@ -183,11 +211,19 @@ impl ObjectFetcherV1 for SlackFetchV1 {
                 });
             }
             Err(error) => {
-                return Ok(FetchedObjectV1::Failed(format!(
-                    "Slack could not return the message: {error}"
-                )));
+                return Ok(call_failed("Slack could not return the message", &error));
             }
         };
+        // A reply in a thread whose root is before the window: no pass reads
+        // that thread.
+        if message
+            .thread_ts
+            .as_deref()
+            .and_then(SlackTsV1::parse)
+            .is_some_and(|root| self.before_backfill(&root))
+        {
+            return Ok(FetchedObjectV1::Nothing("before_backfill"));
+        }
         let provider = ProviderKindV1::new(SLACK_PROVIDER)?;
         let context = SlackChannelContextV1 {
             provider: &provider,

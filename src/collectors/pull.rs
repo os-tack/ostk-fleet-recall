@@ -192,9 +192,24 @@ pub enum FetchedObjectV1 {
     /// admits (a channel it does not read, a team it does not admit). The
     /// label says which; the next reconciliation decides what absence means.
     Nothing(&'static str),
-    /// The provider could not be read now (a rate limit, a failed request, a
-    /// refused credential): the hint backs off and is read again.
+    /// What the change implies only a pass may read (a Linear issue the
+    /// memory never held, or holds in another team, in the trash, or
+    /// withdrawn; a comment on an issue in the trash). The hint stays
+    /// pending, with no failure counted, and settles once a pass has read
+    /// `container` completely: until then readiness still counts it.
+    LeftToThePass {
+        /// The container the pass must read completely.
+        container: Sha256Digest,
+    },
+    /// This object could not be read now (the provider refused this one
+    /// read, or answered it in a shape it does not document): the hint backs
+    /// off and is read again.
     Failed(String),
+    /// The provider could not be read at all now (its setup call failed, it
+    /// rate-limited the collector, a request failed below its answer, it
+    /// refused the credential): the hint backs off, and the tick's other
+    /// hints wait for the next tick rather than spend the pass's budget.
+    Unavailable(String),
 }
 
 /// How one provider re-reads the object an upsert hint names, through its
