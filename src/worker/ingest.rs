@@ -101,9 +101,11 @@ const TRANSCRIPT_COUNTERS: [&str; 9] = [
     "replayed",
     "receipts",
 ];
-const GIT_COUNTERS: [&str; 6] = [
+const GIT_COUNTERS: [&str; 8] = [
     "commits_walked",
     "facts",
+    "facts_redacted",
+    "fields_withheld",
     "appended",
     "replayed",
     "quarantined",
@@ -516,13 +518,21 @@ impl Ingest<'_> {
         verified: &std::result::Result<VerifiedWriterAuthority, String>,
         inventory: &mut Option<BTreeSet<String>>,
     ) -> WorkerStepReportV1 {
-        let bound = Self::bind(verified, &GIT_CONNECTOR);
+        // The git drain redacts every fact's text fields under the active
+        // package's guarantee, minted once per tick like the transcript
+        // step's; a head that does not promise redaction fails every git
+        // source closed.
+        let bound = Self::bind(verified, &GIT_CONNECTOR).and_then(|(active, verified)| {
+            let guarantee = RedactionGuaranteeV1::from_active_package(&active)
+                .map_err(|error| describe(TranscriptConnectorError::from(error)))?;
+            Ok((active, verified, guarantee))
+        });
         let mut reports = Vec::with_capacity(self.sources().git.len());
         for source in &self.sources().git {
             let mut counters = zeroed(&GIT_COUNTERS);
             let result = match &bound {
-                Ok((active, verified)) => {
-                    self.ingest_git(active, verified, source, &mut counters)
+                Ok((active, verified, guarantee)) => {
+                    self.ingest_git(active, verified, guarantee, source, &mut counters)
                         .await
                 }
                 Err(error) => Err(error.clone()),
@@ -914,6 +924,7 @@ impl Ingest<'_> {
         &self,
         active: &ActiveStage4Package,
         verified: &VerifiedWriterAuthority,
+        guarantee: &RedactionGuaranteeV1,
         source: &GitSourceV1,
         counters: &mut WorkerCountersV1,
     ) -> SourceResult<WorkerSourceOutcomeV1> {
@@ -995,11 +1006,14 @@ impl Ingest<'_> {
                 clocks: &GitIngressClocksV1 {
                     received_at: now.clone(),
                 },
+                guarantee,
             },
             &facts,
         )
         .await
         .map_err(describe)?;
+        add(counters, "facts_redacted", report.facts_redacted);
+        add(counters, "fields_withheld", report.fields_withheld);
         add(counters, "appended", report.appended);
         add(counters, "replayed", report.replayed);
         add(counters, "quarantined", report.quarantined);

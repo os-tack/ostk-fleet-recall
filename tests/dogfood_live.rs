@@ -848,6 +848,8 @@ async fn ingest_git(memory: &ActivatedMemory, git_dir: &Path, ref_name: &str) ->
             clocks: &GitIngressClocksV1 {
                 received_at: now.clone(),
             },
+            guarantee: &RedactionGuaranteeV1::from_active_package(&memory.active_git)
+                .expect("the package promises redaction"),
         },
         &facts,
     )

@@ -86,6 +86,7 @@ use ostk_fleet_recall::memory_contracts::successor_policy::{
     ActivationSignatureAlgorithmV2, ActivationSignerBindingV2, GenesisSuccessorKeyBridgeDigest,
     GenesisSuccessorKeyBridgePin, GenesisSuccessorKeyBridgeV1,
 };
+use ostk_fleet_recall::redaction::RedactionGuaranteeV1;
 use ostk_fleet_recall::registry_activation::{
     CockroachGenesisActivationRepository, CockroachSuccessorActivationRepository,
     GenesisActivationOutcome, GenesisActivationRepository, SuccessorActivationCandidate,
@@ -717,6 +718,13 @@ fn clocks(now: &CanonicalTimestamp) -> GitIngressClocksV1 {
     }
 }
 
+/// The active package's redaction guarantee: every drain redacts each fact's
+/// text fields under it before building an ingress.
+fn guarantee(active: &ActiveStage4Package) -> RedactionGuaranteeV1 {
+    RedactionGuaranteeV1::from_active_package(active)
+        .expect("the Stage-4 package promises redaction before the durable outbox")
+}
+
 fn scan_request(ref_name: &str) -> GitScanRequestV1 {
     GitScanRequestV1 {
         ref_name: GitRefName::parse(ref_name).unwrap(),
@@ -908,6 +916,7 @@ async fn live_a_scratch_repository_flows_to_accepted_events_when_configured() {
         control_scope: &scope.trusted_scope,
         kek: &key,
         clocks: &clocks(&now),
+        guarantee: &guarantee(&active),
     };
     let report = drain_git_facts(&context, &facts).await.unwrap();
 
@@ -971,6 +980,7 @@ async fn live_a_force_push_produces_a_new_observation_and_preserves_history_when
         control_scope: &scope.trusted_scope,
         kek: &key,
         clocks: &first_clocks,
+        guarantee: &guarantee(&active),
     };
 
     let first_batch = observation_fact(
@@ -1084,6 +1094,7 @@ async fn live_a_tag_and_a_rename_are_covered_when_configured() {
         control_scope: &scope.trusted_scope,
         kek: &key,
         clocks: &clocks(&now),
+        guarantee: &guarantee(&active),
     };
     let report = drain_git_facts(&context, &facts).await.unwrap();
     assert_eq!(report.appended, 5, "{report:?}");
@@ -1137,6 +1148,7 @@ async fn live_a_re_scan_is_an_exact_replay_when_configured() {
         control_scope: &scope.trusted_scope,
         kek: &key,
         clocks: &clocks(&now),
+        guarantee: &guarantee(&active),
     };
     let first = drain_git_facts(&context, &scan.facts).await.unwrap();
     assert_eq!(first.appended, 4);
@@ -1314,6 +1326,7 @@ async fn live_a_coverage_receipt_binds_the_ref_observation_and_is_idempotent_whe
         control_scope: &scope.trusted_scope,
         kek: &key,
         clocks: &clocks(&now),
+        guarantee: &guarantee(&active),
     };
     let report = drain_git_facts(&context, &facts).await.unwrap();
     assert_eq!(report.appended, 5);
@@ -1476,6 +1489,7 @@ async fn live_a_quarantined_ref_observation_cannot_anchor_a_receipt_when_configu
         control_scope: &scope.trusted_scope,
         kek: &key,
         clocks: &clocks(&now),
+        guarantee: &guarantee(&active),
     };
     let anchored = drain_git_facts(&context, &observed).await.unwrap();
     assert_eq!(anchored.appended, 1, "{anchored:?}");
