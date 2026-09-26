@@ -290,7 +290,8 @@ impl CollectorSourceV1 {
                 .is_none()
             {
                 return Err(invalid(&format!(
-                    "collector {instance}: provider {} has no webhook this build receives;                      remove push",
+                    "collector {instance}: provider {} has no webhook this build receives; \
+                     remove push",
                     self.provider
                 )));
             }
@@ -303,7 +304,8 @@ impl CollectorSourceV1 {
                 == Some(push.signing_secret_env.as_str())
             {
                 return Err(invalid(&format!(
-                    "collector {instance}: push.signing_secret_env names the collector's API                      token variable; the signing secret is a variable of its own"
+                    "collector {instance}: push.signing_secret_env names the collector's API \
+                     token variable; the signing secret is a variable of its own"
                 )));
             }
         }
@@ -1002,6 +1004,16 @@ mod tests {
             &serde_json::json!({ "signing_secret": "hunter2" }),
         ));
         assert!(message.contains("signing_secret_env"), "{message}");
+    }
+
+    #[test]
+    fn a_webhook_secret_that_is_the_api_token_is_refused_in_one_readable_line() {
+        let mut value = with_collector(&slack());
+        value["collectors"][0]["push"] =
+            serde_json::json!({"signing_secret_env": "FLEET_RECALL_SLACK_BOT_TOKEN"});
+        let message = refusal(&value);
+        assert!(message.contains("a variable of its own"), "{message}");
+        assert!(!message.contains("  "), "{message}");
     }
 
     #[test]
