@@ -434,6 +434,22 @@ in the database, in every project, asserted ones included. Where asserted
 claims must stay unreadable to the holder of that credential, do not serve
 the public demo from the same database.
 
+**Claims that cite collected items.** A claim's item citations
+([ADR 0008](adr/0008-collected-items.md) D11) are private. Which item,
+version, and part a claim cites lives only in `memory_claim_item_links_v1`,
+which the runtime role may read and append (never update or delete) and the
+publication reader cannot read at all. A `record` citation also writes a
+`memory_claim_support` row, which the publication reader can select; that
+row holds only `fleet.item`, `item-link`, and a random link id, never an item
+id, provider, URL, excerpt, or digest, and the reviewed demo binary drops it
+from every claim it returns. An `assert` citation adds the cited parts'
+accepted events to the claim's accepted event, which the publication reader
+cannot read either. A citation is resolved in the claim's own project only,
+so a claim cannot rest on another project's item, and an item the project may
+not read (deleted, or its container or itself withdrawn) is refused rather
+than cited; one hidden later stays cited, and the private claim get says it
+is hidden, without its text.
+
 ## Residual SQL authority and recovery
 
 CockroachDB grants table operations, not prepared-statement identities. A

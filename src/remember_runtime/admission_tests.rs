@@ -101,6 +101,7 @@ fn input() -> RememberAssertInputV1 {
         effective_from: None,
         effective_until: None,
         support_evidence_event_ids: Vec::new(),
+        support_items: Vec::new(),
     }
 }
 

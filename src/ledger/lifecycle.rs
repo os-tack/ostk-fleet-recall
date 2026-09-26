@@ -113,6 +113,21 @@ pub enum RefusalCode {
     /// This writer does not serve agent capture, or the active registry
     /// package does not bind `connector.collected.capture` (ADR 0008 D10).
     CaptureUnavailable,
+    /// This writer does not let claims cite collected items: the schema
+    /// predates migration 35, its grants are absent, or item recall is not
+    /// served (ADR 0008 D11).
+    ItemSupportUnavailable,
+    /// A cited item, version, or provider URL names no admitted item in this
+    /// scope, and nothing staged for it is pending.
+    SupportItemUnknown,
+    /// A cited item or version is staged but not yet admitted; a drain
+    /// (the worker's `collect` step) admits it.
+    SupportItemPending,
+    /// A cited item is hidden from recall: its presented head is a
+    /// tombstone, or its container or the item itself was withdrawn.
+    SupportItemWithdrawn,
+    /// Two support entries cite one version of one collected item.
+    SupportItemDuplicate,
 }
 
 impl RefusalCode {
@@ -145,6 +160,11 @@ impl RefusalCode {
             Self::RegistryHeadChanged => "registry_head_changed",
             Self::AlreadyAsserted => "already_asserted",
             Self::CaptureUnavailable => "capture_unavailable",
+            Self::ItemSupportUnavailable => "item_support_unavailable",
+            Self::SupportItemUnknown => "support_item_unknown",
+            Self::SupportItemPending => "support_item_pending",
+            Self::SupportItemWithdrawn => "support_item_withdrawn",
+            Self::SupportItemDuplicate => "support_item_duplicate",
         }
     }
 }

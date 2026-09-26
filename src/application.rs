@@ -19,12 +19,12 @@ use crate::item_recall::{
     ItemRecall, ItemReferenceV1, ItemSearchRequestV1, ItemSearchV1, MAX_ITEM_SEARCH_LIMIT,
 };
 use crate::ledger::{
-    ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict, ConflictMutation,
-    ConflictTarget, DismissalTerms, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LifecycleMutation,
-    LifecycleReplayRequest, MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT, SemanticClaimHit,
-    SupportedClaimCoordinate, WaiverTerms, derive_overlay, history_within_bytes,
-    overlay_episode_revision, unlogged_transitions, validate_lifecycle_reason, validate_rationale,
-    validate_waiver_hours,
+    Claim, ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict,
+    ConflictMutation, ConflictTarget, DismissalTerms, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
+    ITEM_SUPPORT_SOURCE_CONFIG_ID, LifecycleMutation, LifecycleReplayRequest,
+    MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT, SemanticClaimHit, SupportedClaimCoordinate,
+    WaiverTerms, derive_overlay, history_within_bytes, overlay_episode_revision,
+    unlogged_transitions, validate_lifecycle_reason, validate_rationale, validate_waiver_hours,
 };
 use crate::memory_contracts::collected_item::ProviderKindV1;
 use crate::memory_contracts::digest::Sha256Digest;
@@ -851,7 +851,7 @@ impl CockroachMemoryService {
                 let id = parse_safe_id(&args.id)?;
                 // A withheld claim reads exactly as an absent one.
                 let withheld = !self.withheld_claim_ids(scope, &[id]).await?.is_empty();
-                let claim = if withheld {
+                let mut claim = if withheld {
                     None
                 } else {
                     self.ledger
@@ -859,7 +859,9 @@ impl CockroachMemoryService {
                         .await
                         .map_err(service_error)?
                 };
-                let mut result = RecallResult::new(json!({ "claim": claim }));
+                let mut data = self.claim_citations(scope, id, claim.as_mut()).await?;
+                data.insert("claim".into(), json!(claim));
+                let mut result = RecallResult::new(Value::Object(data));
                 // An asserted claim names the accepted event it projects; a
                 // recorded one carries no such field.
                 if claim.is_some()
@@ -936,6 +938,43 @@ impl CockroachMemoryService {
                 "recall get kind {other:?} is not supported"
             ))),
         }
+    }
+
+    /// A claim get's item citations (ADR 0008 D11). The publication reader
+    /// drops the claim's opaque `fleet.item` support rows and never reads the
+    /// links; the private writer expands the items it cites into
+    /// `support_items` and `independent_sources`. Empty for a claim that
+    /// cites none, which reads as before.
+    async fn claim_citations(
+        &self,
+        scope: &FleetScope,
+        id: i64,
+        claim: Option<&mut Claim>,
+    ) -> ServiceResult<Map<String, Value>> {
+        let mut citations = Map::new();
+        let Some(claim) = claim else {
+            return Ok(citations);
+        };
+        if self.withhold_asserted_claims {
+            withhold_item_support(claim);
+            return Ok(citations);
+        }
+        let support = self
+            .ledger
+            .claim_item_support(scope, id)
+            .await
+            .map_err(service_error)?;
+        if let Some(support) = support.filter(|support| !support.items.is_empty()) {
+            citations.insert("support_items".into(), json!(support.items));
+            citations.insert(
+                "independent_sources".into(),
+                json!(support.independent_sources),
+            );
+            if support.truncated {
+                citations.insert("support_items_truncated".into(), json!(true));
+            }
+        }
+        Ok(citations)
     }
 
     /// `recall(get, kind=conflict)`: one conflict in any state, with its
@@ -1864,6 +1903,16 @@ impl FleetMemoryService for CockroachMemoryService {
             items: self.items.is_some(),
         }
     }
+}
+
+/// Drop a claim's opaque item-citation support rows (`fleet.item`, ADR 0008
+/// D11) on the publication reader. Which item a row cites lives only in the
+/// private links, but the public reader does not even say that the claim
+/// cites one, as it says nothing about an asserted claim (ADR 0005 D8).
+fn withhold_item_support(claim: &mut Claim) {
+    claim
+        .support
+        .retain(|support| support.source_config_id != ITEM_SUPPORT_SOURCE_CONFIG_ID);
 }
 
 /// Validate a claim an agent writes through `record` or as a `supersede`
@@ -3548,6 +3597,7 @@ mod tests {
         adjudication: false,
         assert: false,
         capture: false,
+        item_support: false,
     };
 
     const CONFLICT_LIFECYCLE: RememberSurface = RememberSurface {
@@ -3556,6 +3606,7 @@ mod tests {
         adjudication: false,
         assert: false,
         capture: false,
+        item_support: false,
     };
 
     const ADJUDICATING: RememberSurface = RememberSurface {

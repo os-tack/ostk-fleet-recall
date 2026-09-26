@@ -1,9 +1,12 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 
+use crate::item_recall::ItemSuppressionV1;
 use crate::ledger::{canonical_json, normalize_key_part};
 use crate::memory_contracts::bootstrap::EpochId;
+use crate::memory_contracts::collected_item::{MAX_PROVIDER_URL_BYTES, TrustTierV1};
+use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::discrepancy::{DismissalReasonKindV1, WaiverReasonKindV1};
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::{FleetError, Result};
@@ -102,6 +105,204 @@ fn default_support_relation() -> String {
     "supports".into()
 }
 
+/// Most collected items one claim cites: `record`'s item support entries
+/// share [`ClaimInput`]'s 32-entry support bound, and `assert` takes at most
+/// this many `support_items` (ADR 0008 D11).
+pub const MAX_SUPPORT_ITEMS: usize = 32;
+
+/// The `source_config_id` of a `record` item citation's opaque support row.
+///
+/// Its `source` is [`ITEM_SUPPORT_SOURCE`] and its `source_id` the lowercase
+/// hex of the citation's random link id; which item it cites lives only in
+/// the private `memory_claim_item_links_v1`, never in a publication table
+/// (ADR 0008 D11).
+pub const ITEM_SUPPORT_SOURCE_CONFIG_ID: &str = "fleet.item";
+/// The `source` of the opaque support row an item citation writes.
+pub const ITEM_SUPPORT_SOURCE: &str = "item-link";
+
+/// A collected item a claim cites (ADR 0008 D11).
+///
+/// Exactly one of the item's id (its presented version is cited), one exact
+/// version's id, or the item's `https` provider URL (its presented version is
+/// cited). The ids are what `recall(kind=item)` and `remember(capture)`
+/// return.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ItemRefV1 {
+    /// `{"item_id": "<64 hex>"}`: the item's presented version.
+    ItemId(Sha256Digest),
+    /// `{"version_id": "<64 hex>"}`: exactly this version.
+    VersionId(Sha256Digest),
+    /// `{"url": "https://..."}`: the presented version of the item whose
+    /// provider URL this is.
+    Url(String),
+}
+
+impl ItemRefV1 {
+    /// Check the reference's shape before any I/O.
+    ///
+    /// # Errors
+    ///
+    /// A URL that is not `https://`, is longer than a stored provider URL may
+    /// be, or holds whitespace or a control character.
+    pub fn validate(&self) -> Result<()> {
+        let Self::Url(url) = self else {
+            return Ok(());
+        };
+        if !url.starts_with("https://")
+            || url.len() > MAX_PROVIDER_URL_BYTES
+            || url
+                .chars()
+                .any(|scalar| scalar.is_whitespace() || scalar.is_control())
+        {
+            return Err(FleetError::Memory(format!(
+                "a support item url must be an https URL of at most {MAX_PROVIDER_URL_BYTES} bytes \
+                 with no whitespace"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One `record` support entry that cites a collected item instead of a
+/// corpus chunk (ADR 0008 D11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemSupportInputV1 {
+    pub item: ItemRefV1,
+    #[serde(default = "default_support_relation")]
+    pub relation: String,
+}
+
+impl ItemSupportInputV1 {
+    /// Check the reference and the relation before any I/O.
+    ///
+    /// # Errors
+    ///
+    /// As [`ItemRefV1::validate`], or a relation that is empty, has leading
+    /// or trailing whitespace, or exceeds 64 bytes.
+    pub fn validate(&self) -> Result<()> {
+        self.item.validate()?;
+        if self.relation.trim().is_empty()
+            || self.relation != self.relation.trim()
+            || self.relation.len() > 64
+        {
+            return Err(FleetError::Memory(
+                "an item support relation must be 1 to 64 bytes with no leading or trailing \
+                 whitespace"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One collected item a claim cites, expanded (ADR 0008 D11).
+///
+/// It is read through the private claim item links: only the private
+/// writer's `recall(get, kind=claim)` returns it, and the publication reader
+/// never reads the links.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CitedItemV1 {
+    /// The citation's link id, 32 lowercase hex characters: the `source_id`
+    /// of the opaque support row a `record` citation wrote.
+    pub link_id: String,
+    /// The claim action that cited the item: `assert` or `record`.
+    pub via: String,
+    pub relation: String,
+    pub item_id: Sha256Digest,
+    /// The version cited.
+    pub version_id: Sha256Digest,
+    pub provider: String,
+    pub object_kind: String,
+    pub external_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_url: Option<String>,
+    /// The tier the cited parts were admitted through: `verified` (pull,
+    /// push), or `reported` (capture, import) when any part was reported.
+    pub trust: TrustTierV1,
+    /// Whether the cited version is still the item's presented version.
+    pub current: bool,
+    /// Why the item is withheld from recall now, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppressed: Option<ItemSuppressionV1>,
+    /// The accepted evidence events of the cited parts, in part order.
+    pub accepted_event_ids: Vec<Sha256Digest>,
+}
+
+/// The collected items one claim cites (ADR 0008 D11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClaimItemSupportV1 {
+    /// Each citation, oldest first.
+    pub items: Vec<CitedItemV1>,
+    /// Distinct contents among the cited items still visible: items with
+    /// identical text (an echo, a cross-post, a copy) count once.
+    pub independent_sources: u64,
+    /// The claim has more link rows than one read returns.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+/// One `record` support entry: a corpus snapshot, exactly as before, or a
+/// collected item.
+///
+/// It serializes untagged, so a corpus entry's bytes (and so every stored
+/// `record` receipt's request) are exactly a [`ClaimSupportInput`]'s. It
+/// deserializes an object that names `item` as an [`ItemSupportInputV1`] and
+/// every other value as a [`ClaimSupportInput`], each with unknown fields
+/// denied, so a corpus entry is checked exactly as strictly, and refused with
+/// exactly the message, as before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum SupportInputV1 {
+    Corpus(ClaimSupportInput),
+    Item(ItemSupportInputV1),
+}
+
+impl<'de> Deserialize<'de> for SupportInputV1 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let cites_item = value
+            .as_object()
+            .is_some_and(|fields| fields.contains_key("item"));
+        if cites_item {
+            serde_json::from_value(value).map(Self::Item)
+        } else {
+            serde_json::from_value(value).map(Self::Corpus)
+        }
+        .map_err(de::Error::custom)
+    }
+}
+
+impl From<ClaimSupportInput> for SupportInputV1 {
+    fn from(support: ClaimSupportInput) -> Self {
+        Self::Corpus(support)
+    }
+}
+
+impl SupportInputV1 {
+    /// The corpus snapshot, when this entry is one.
+    #[must_use]
+    pub const fn as_corpus(&self) -> Option<&ClaimSupportInput> {
+        match self {
+            Self::Corpus(support) => Some(support),
+            Self::Item(_) => None,
+        }
+    }
+
+    /// The item citation, when this entry is one.
+    #[must_use]
+    pub const fn as_item(&self) -> Option<&ItemSupportInputV1> {
+        match self {
+            Self::Item(support) => Some(support),
+            Self::Corpus(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimInput {
@@ -119,8 +320,10 @@ pub struct ClaimInput {
     pub confidence: f64,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
+    /// Corpus snapshots and, where the deployment serves claim item links,
+    /// collected items (ADR 0008 D11); at most 32 in all.
     #[serde(default)]
-    pub support: Vec<ClaimSupportInput>,
+    pub support: Vec<SupportInputV1>,
 }
 
 const fn default_polarity() -> i16 {
@@ -233,6 +436,13 @@ impl ClaimInput {
             ));
         }
         for support in &self.support {
+            let support = match support {
+                SupportInputV1::Corpus(support) => support,
+                SupportInputV1::Item(item) => {
+                    item.validate()?;
+                    continue;
+                }
+            };
             if support.source.trim().is_empty()
                 || support.source_id.trim().is_empty()
                 || support.source_config_id.trim().is_empty()
@@ -272,6 +482,17 @@ impl ClaimInput {
             }
         }
         Ok(())
+    }
+
+    /// The collected items this claim's support cites, in order.
+    pub fn item_support(&self) -> impl Iterator<Item = &ItemSupportInputV1> {
+        self.support.iter().filter_map(SupportInputV1::as_item)
+    }
+
+    /// Whether any support entry cites a collected item.
+    #[must_use]
+    pub fn cites_items(&self) -> bool {
+        self.item_support().next().is_some()
     }
 
     pub(crate) fn prepare(&self) -> Result<PreparedClaim> {
@@ -782,6 +1003,8 @@ pub struct ConflictCoverage {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn input() -> ClaimInput {
@@ -974,8 +1197,7 @@ mod tests {
 
     #[test]
     fn chunk_backed_support_requires_bounded_identity_and_sha256_shape() {
-        let mut value = input();
-        value.support.push(ClaimSupportInput {
+        let support = ClaimSupportInput {
             source_config_id: "rich-demo:docs:v1".into(),
             source: "markdown".into(),
             source_id: "docs/ARCHITECTURE.md".into(),
@@ -983,20 +1205,133 @@ mod tests {
             content_sha256: Some("a".repeat(64)),
             excerpt: Some("source-backed claim".into()),
             relation: "supports".into(),
-        });
-        assert!(value.validate().is_ok());
-
-        value.support[0].chunk_id = Some(" ".into());
-        assert!(value.validate().is_err());
-        value.support[0].chunk_id = Some("chunk-1".into());
-        value.support[0].content_sha256 = Some("not-a-sha256".into());
-        assert!(value.validate().is_err());
-        value.support[0].content_sha256 = None;
-        assert!(value.validate().is_err());
+        };
+        let with = |edit: &dyn Fn(&mut ClaimSupportInput)| {
+            let mut edited = support.clone();
+            edit(&mut edited);
+            let mut value = input();
+            value.support.push(edited.into());
+            value
+        };
+        assert!(with(&|_| {}).validate().is_ok());
+        assert!(
+            with(&|support| support.chunk_id = Some(" ".into()))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            with(&|support| support.content_sha256 = Some("not-a-sha256".into()))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            with(&|support| support.content_sha256 = None)
+                .validate()
+                .is_err()
+        );
 
         // External citations remain compatible when no local chunk identity
         // is asserted; their provider-specific digest is not reinterpreted.
-        value.support[0].chunk_id = None;
+        assert!(with(&|support| support.chunk_id = None).validate().is_ok());
+    }
+
+    #[test]
+    fn a_corpus_support_entry_keeps_its_bytes_and_its_strictness() {
+        let corpus = json!({
+            "source_config_id": "rich-demo:docs:v1",
+            "source": "markdown",
+            "source_id": "docs/ARCHITECTURE.md",
+            "chunk_id": null,
+            "content_sha256": null,
+            "excerpt": null,
+            "relation": "supports"
+        });
+        let parsed: SupportInputV1 = serde_json::from_value(corpus.clone()).unwrap();
+        assert!(matches!(parsed, SupportInputV1::Corpus(_)));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), corpus);
+        // A corpus entry is refused exactly as a ClaimSupportInput is.
+        let mut unknown = corpus;
+        unknown["extra"] = json!(1);
+        let refused = serde_json::from_value::<SupportInputV1>(unknown.clone()).unwrap_err();
+        let legacy = serde_json::from_value::<ClaimSupportInput>(unknown).unwrap_err();
+        assert_eq!(refused.to_string(), legacy.to_string());
+        let missing = json!({ "source": "markdown" });
+        assert_eq!(
+            serde_json::from_value::<SupportInputV1>(missing.clone())
+                .unwrap_err()
+                .to_string(),
+            serde_json::from_value::<ClaimSupportInput>(missing)
+                .unwrap_err()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn an_item_support_entry_names_exactly_one_reference() {
+        let id = "ab".repeat(32);
+        for (reference, expected) in [
+            (
+                json!({ "item_id": id }),
+                ItemRefV1::ItemId(id.parse().unwrap()),
+            ),
+            (
+                json!({ "version_id": id }),
+                ItemRefV1::VersionId(id.parse().unwrap()),
+            ),
+            (
+                json!({ "url": "https://acme.slack.com/archives/C1/p1" }),
+                ItemRefV1::Url("https://acme.slack.com/archives/C1/p1".into()),
+            ),
+        ] {
+            let parsed: SupportInputV1 =
+                serde_json::from_value(json!({ "item": reference })).unwrap();
+            let SupportInputV1::Item(item) = &parsed else {
+                panic!("an item entry parses as one");
+            };
+            assert_eq!(item.item, expected);
+            assert_eq!(item.relation, "supports");
+            assert!(item.validate().is_ok());
+        }
+        for refused in [
+            json!({ "item": { "item_id": id, "url": "https://a.example/x" } }),
+            json!({ "item": { "item_key": id } }),
+            json!({ "item": { "item_id": id }, "source": "markdown" }),
+            json!({ "item": { "item_id": "AB".repeat(32) } }),
+        ] {
+            assert!(
+                serde_json::from_value::<SupportInputV1>(refused.clone()).is_err(),
+                "{refused}"
+            );
+        }
+        for invalid in [
+            ItemSupportInputV1 {
+                item: ItemRefV1::Url("http://acme.example/x".into()),
+                relation: "supports".into(),
+            },
+            ItemSupportInputV1 {
+                item: ItemRefV1::Url("https://acme.example/a b".into()),
+                relation: "supports".into(),
+            },
+            ItemSupportInputV1 {
+                item: ItemRefV1::ItemId(id.parse().unwrap()),
+                relation: " supports".into(),
+            },
+            ItemSupportInputV1 {
+                item: ItemRefV1::ItemId(id.parse().unwrap()),
+                relation: "r".repeat(65),
+            },
+        ] {
+            let mut value = input();
+            value.support.push(SupportInputV1::Item(invalid.clone()));
+            assert!(value.validate().is_err(), "{invalid:?}");
+        }
+        let mut value = input();
+        value.support.push(SupportInputV1::Item(ItemSupportInputV1 {
+            item: ItemRefV1::ItemId(id.parse().unwrap()),
+            relation: "supports".into(),
+        }));
         assert!(value.validate().is_ok());
+        assert!(value.cites_items());
+        assert!(!input().cites_items());
     }
 }

@@ -62,6 +62,12 @@ pub const NORMATIVE_REBASE_SCHEMA_VERSION: i64 = 32;
 /// collector state. The two migrations ship together; nothing runs the sink
 /// on 0033 alone.
 pub const COLLECTED_ITEMS_SCHEMA_VERSION: i64 = 34;
+/// First schema with claim-to-item links (migration 0035, ADR 0008 D11).
+///
+/// Below it no claim may cite a collected item: `assert`'s `support_items`
+/// and `record`'s item support entries are neither served nor advertised,
+/// and item recall lists no citing claims.
+pub const CLAIM_ITEM_LINKS_SCHEMA_VERSION: i64 = 35;
 
 /// Exact application tables reachable from public health/status/recall SQL.
 ///
@@ -394,6 +400,8 @@ const COLLECTED_ITEMS_MIGRATION_SQL: &str =
     include_str!("../../migrations/0033_collected_items.sql");
 const COLLECTED_WITHDRAWALS_MIGRATION_SQL: &str =
     include_str!("../../migrations/0034_collected_withdrawals.sql");
+const CLAIM_ITEM_LINKS_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0035_claim_item_links.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -436,7 +444,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
 }
 
 #[allow(clippy::too_many_lines)] // one registration per migration file, in version order
-fn post_transactional_online_migrations() -> [Migration; 19] {
+fn post_transactional_online_migrations() -> [Migration; 20] {
     [
         Migration::new(
             15,
@@ -627,6 +635,17 @@ fn post_transactional_online_migrations() -> [Migration; 19] {
             // private-plane table of item withdrawals with no foreign key.
             // Runs outside SQLx's transaction wrapper like migrations
             // 0018-0033; MINIMUM_RECALL_SCHEMA_VERSION stays 18.
+            true,
+        ),
+        Migration::new(
+            CLAIM_ITEM_LINKS_SCHEMA_VERSION,
+            Cow::Borrowed("claim item links"),
+            MigrationType::Simple,
+            Cow::Borrowed(CLAIM_ITEM_LINKS_MIGRATION_SQL),
+            // ADR 0008 D11. Additive: one append-only private-plane table
+            // with no foreign key and two indexes. Runs outside SQLx's
+            // transaction wrapper like migrations 0018-0034;
+            // MINIMUM_RECALL_SCHEMA_VERSION stays 18.
             true,
         ),
     ]
@@ -1136,6 +1155,60 @@ pub async fn probe_spec_conformance(
         Err(error) => Err(error.into()),
     };
     // The probe read nothing; roll back regardless of its outcome.
+    transaction.rollback().await?;
+    outcome
+}
+
+/// Proof that this role may let claims cite collected items (ADR 0008 D11).
+///
+/// Only [`probe_claim_item_links`] mints it, so a claim ledger resolves
+/// `support_items` and item support entries, and writes their links, only
+/// after the startup probe succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimItemLinksCapability(());
+
+/// Privileges are checked when the statement is planned, so this reads and
+/// writes nothing, and it runs inside a transaction that is rolled back. One
+/// statement needs INSERT on the links and SELECT on every table resolving a
+/// cited item reads (the item history, the heads, the containers, the item
+/// withdrawals, and the staging outbox, for a pending item) and on the claims
+/// an item's citations are listed with.
+const CLAIM_ITEM_LINKS_PRIVILEGE_PROBE_SQL: &str = "INSERT INTO public.memory_claim_item_links_v1 \
+     SELECT link.* FROM public.memory_claim_item_links_v1 AS link, \
+     public.memory_collected_items_v1, public.memory_collected_item_heads_v1, \
+     public.memory_collector_containers_v1, public.memory_collected_item_withdrawals_v1, \
+     public.memory_collector_outbox_v1, public.memory_claims WHERE false";
+
+/// Whether this deployment may let claims cite collected items.
+///
+/// It may when the schema has reached migration 35
+/// ([`CLAIM_ITEM_LINKS_SCHEMA_VERSION`]) and the connected role may INSERT
+/// claim item links and SELECT every collector table a citation resolves
+/// through, and the claims. `None` means claims cite no items (an older
+/// schema, or a runtime policy applied before migration 35); any other
+/// failure is an error. The probe runs once at startup, so a grant change
+/// needs a restart.
+pub async fn probe_claim_item_links(
+    pool: &PgPool,
+    capabilities: &DatabaseCapabilities,
+) -> Result<Option<ClaimItemLinksCapability>> {
+    if !capabilities.supports_schema_version(CLAIM_ITEM_LINKS_SCHEMA_VERSION) {
+        return Ok(None);
+    }
+    let mut transaction = pool.begin().await?;
+    let probe = sqlx::query(CLAIM_ITEM_LINKS_PRIVILEGE_PROBE_SQL)
+        .execute(&mut *transaction)
+        .await;
+    let outcome = match probe {
+        Ok(_) => Ok(Some(ClaimItemLinksCapability(()))),
+        Err(sqlx::Error::Database(error))
+            if error.code().as_deref() == Some(INSUFFICIENT_PRIVILEGE_SQLSTATE) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    };
+    // The probe wrote nothing; roll back regardless of its outcome.
     transaction.rollback().await?;
     outcome
 }

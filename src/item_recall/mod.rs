@@ -22,8 +22,9 @@
 //!   the item's provider URL, and returns the item ([`ItemGetV1`]): its
 //!   presented version's parts in order, every other version (superseded
 //!   versions with their text, tombstones with metadata only), the
-//!   provenance of each admitted part, its outbound links, and the visible
-//!   items that link to it.
+//!   provenance of each admitted part, its outbound links, the visible
+//!   items that link to it, and, where claims may cite items (migration 35),
+//!   the claims that cite it.
 //!
 //! # Untrusted text
 //!
@@ -96,7 +97,7 @@ use crate::store::cockroach::COLLECTED_ITEMS_SCHEMA_VERSION;
 pub use cockroach::{
     CockroachItemRecall, ITEM_RECALL_TABLES, ItemRecallCapability, probe_item_recall,
 };
-pub use serve::start_item_recall;
+pub use serve::{start_item_recall, start_item_recall_citing};
 pub use signals::{InjectionSignalV1, defang_markdown_images, injection_signals};
 
 /// First schema item recall can read: migration 34 completes the collector
@@ -121,6 +122,9 @@ pub const MAX_ITEM_GET_ROWS: usize = 4_096;
 
 /// Items linking to one item that one `get` lists.
 pub const MAX_ITEM_LINKS_IN: usize = 256;
+
+/// Claim citations of one item that one `get` lists.
+pub const MAX_ITEM_CITATIONS: usize = 256;
 
 /// Longest version URI `get` accepts: migration 33's bound on
 /// `canonical_resource_id`.
@@ -433,6 +437,22 @@ pub struct ItemLinkInV1 {
     pub rel: String,
 }
 
+/// A claim that cites the item (ADR 0008 D11): `remember(assert)`'s
+/// `support_items` or a `record` support entry `{item: ...}` named it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ItemCitationV1 {
+    pub claim_id: i64,
+    /// The claim action that cited the item: `assert` or `record`.
+    pub via: String,
+    pub relation: String,
+    /// The version the claim cites.
+    pub version_id: Sha256Digest,
+    /// The claim's lifecycle state now (`active`, `disputed`, `superseded`,
+    /// `retracted`, ...).
+    pub claim_state: String,
+    pub cited_at: DateTime<Utc>,
+}
+
 /// One item, as `recall(get, kind=item)` returns it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ItemGetV1 {
@@ -459,6 +479,14 @@ pub struct ItemGetV1 {
     pub links_out: Vec<ItemLinkOutV1>,
     /// Visible items linking to this item's provider URL.
     pub links_in: Vec<ItemLinkInV1>,
+    /// The claims that cite the item, oldest citation first, where this
+    /// deployment serves claim item links (ADR 0008 D11); absent elsewhere,
+    /// so the answer keeps its bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cited_by: Option<Vec<ItemCitationV1>>,
+    /// More claims cite the item than [`MAX_ITEM_CITATIONS`].
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cited_by_truncated: bool,
 }
 
 /// Item recall over one scope.

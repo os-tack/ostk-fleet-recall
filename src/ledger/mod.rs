@@ -29,10 +29,11 @@ pub(crate) use repository::assert_unavailable;
 pub use repository::{ClaimLedger, SupportedClaimCoordinate, SupportedClaimIds};
 pub(crate) use types::MAX_CLAIM_VALUE_SERIALIZED_BYTES;
 pub use types::{
-    AcceptedEventRefV1, Acknowledgement, AssertedClaimMutation, Claim, ClaimInput, ClaimKind,
-    ClaimMutation, ClaimState, ClaimSupport, ClaimSupportInput, ClaimTarget, ClosureView, Conflict,
-    ConflictCoverage, ConflictHistory, ConflictLifecycleEvent, ConflictLifecycleOverlay,
-    ConflictLifecycleRows, ConflictMutation, ConflictReevaluation, ConflictTarget, DismissalTerms,
-    LifecycleMutation, LifecycleReplayRequest, RevisionGap, SemanticClaimHit, SupersededClaim,
-    WaiverTerms, WaiverView,
+    AcceptedEventRefV1, Acknowledgement, AssertedClaimMutation, CitedItemV1, Claim, ClaimInput,
+    ClaimItemSupportV1, ClaimKind, ClaimMutation, ClaimState, ClaimSupport, ClaimSupportInput,
+    ClaimTarget, ClosureView, Conflict, ConflictCoverage, ConflictHistory, ConflictLifecycleEvent,
+    ConflictLifecycleOverlay, ConflictLifecycleRows, ConflictMutation, ConflictReevaluation,
+    ConflictTarget, DismissalTerms, ITEM_SUPPORT_SOURCE, ITEM_SUPPORT_SOURCE_CONFIG_ID, ItemRefV1,
+    ItemSupportInputV1, LifecycleMutation, LifecycleReplayRequest, MAX_SUPPORT_ITEMS, RevisionGap,
+    SemanticClaimHit, SupersededClaim, SupportInputV1, WaiverTerms, WaiverView,
 };

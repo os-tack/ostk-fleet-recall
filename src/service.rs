@@ -315,6 +315,14 @@ pub struct RememberSurface {
     /// every surface without it serializes exactly as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub capture: bool,
+    /// Claims that cite collected items (ADR 0008 D11): `record`'s support
+    /// takes `{item: ...}` entries and, where `assert` is served, the
+    /// assertion takes `support_items`. Served only where item recall is
+    /// served and the claim item links probe (migration 35 and its grants)
+    /// passed. Independent of every other capability. Omitted from JSON when
+    /// off, so every surface without it serializes exactly as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub item_support: bool,
 }
 
 impl RememberSurface {
@@ -324,6 +332,7 @@ impl RememberSurface {
         adjudication: false,
         assert: false,
         capture: false,
+        item_support: false,
     };
 
     /// Whether any lifecycle is served: the claim lifecycle, the conflict
@@ -712,6 +721,7 @@ mod tests {
             adjudication: false,
             assert: false,
             capture: false,
+            item_support: false,
         };
         assert_eq!(
             serde_json::to_value(conflicts).unwrap(),
@@ -739,6 +749,7 @@ mod tests {
             adjudication: true,
             assert: true,
             capture: false,
+            item_support: false,
         };
         for surface in [RememberSurface::RECORD_ONLY, asserting_lifecycle] {
             let Err(ServiceError::Refused(refusal)) =

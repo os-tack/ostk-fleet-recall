@@ -467,9 +467,9 @@ async fn publication_reader_executes_the_real_recall_surface() -> anyhow::Result
     Ok(())
 }
 
-/// Every table migrations 0033 and 0034 add (ADR 0008). None is a
+/// Every table migrations 0033 through 0035 add (ADR 0008). None is a
 /// publication table.
-const COLLECTOR_TABLES: [&str; 9] = [
+const COLLECTOR_TABLES: [&str; 10] = [
     "memory_collector_outbox_v1",
     "memory_collected_items_v1",
     "memory_collected_item_heads_v1",
@@ -479,6 +479,7 @@ const COLLECTOR_TABLES: [&str; 9] = [
     "memory_collector_cursors_v1",
     "memory_collector_dead_letters_v1",
     "memory_collected_item_withdrawals_v1",
+    "memory_claim_item_links_v1",
 ];
 
 #[tokio::test]

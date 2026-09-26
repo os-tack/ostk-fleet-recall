@@ -25,7 +25,7 @@ use ostk_fleet_recall::collectors::command::{
 };
 use ostk_fleet_recall::config::{LifecycleConfig, PublicationConfig, model_bundle_sha256};
 use ostk_fleet_recall::evidence_recall::start_evidence_recall;
-use ostk_fleet_recall::item_recall::start_item_recall;
+use ostk_fleet_recall::item_recall::{ItemRecall, start_item_recall_citing};
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::McpServer;
 use ostk_fleet_recall::remember_runtime::{start_collected_capture, start_event_first_assert};
@@ -34,8 +34,9 @@ use ostk_fleet_recall::service::{
 };
 use ostk_fleet_recall::spec_conformance::start_spec_conformance;
 use ostk_fleet_recall::store::cockroach::{
-    CockroachStore, EMBEDDING_DIMENSION, PoolConfig, RetryPolicy, ScopedChunk,
-    active_embedding_model, probe_conflict_lifecycle,
+    ClaimItemLinksCapability, CockroachStore, DatabaseCapabilities, EMBEDDING_DIMENSION,
+    PoolConfig, RetryPolicy, ScopedChunk, active_embedding_model, probe_claim_item_links,
+    probe_conflict_lifecycle,
 };
 use ostk_fleet_recall::worker::{GhCliProviderFactory, WorkerCommandV1, WorkerProcessV1};
 use ostk_fleet_recall::{CockroachMemoryService, FleetConfig, FleetError, FleetScope};
@@ -582,6 +583,8 @@ async fn build_memory_service(
     } else {
         None
     };
+    // recall(kind=item) and claims that cite items (ADR 0008 D7, D11).
+    let (items, item_support) = start_items(store.pool(), &capabilities, config).await;
     let mut ledger = CockroachClaimLedger::new(
         store.pool().clone(),
         config.default_scope.clone(),
@@ -602,6 +605,9 @@ async fn build_memory_service(
         if adjudication {
             ledger = ledger.with_conflict_adjudication();
         }
+    }
+    if let Some(capability) = item_support {
+        ledger = ledger.with_claim_item_links(capability);
     }
     // remember(assert) is served only where the writer-authority pins verify
     // (ADR 0005). Any pin or witness problem turns it off with a logged and
@@ -631,16 +637,6 @@ async fn build_memory_service(
     // failed probe turns it off with a log line and changes no tool schema.
     let spec_conformance =
         start_spec_conformance(store.pool(), &capabilities, &config.default_scope).await;
-    // recall(kind=item) is served wherever migration 34 is applied and this
-    // login may read the collector and Stage-5 tables (ADR 0008 D7), and is
-    // additive in the same way.
-    let items = start_item_recall(
-        store.pool(),
-        &capabilities,
-        &config.default_scope,
-        &config.embedding_model_sha256,
-    )
-    .await;
     // remember(capture) is served only where FLEET_RECALL_COLLECTED_CAPTURE
     // turns it on and its startup checks pass (ADR 0008 D10): migration 34,
     // capture's grants, the writer-authority pins, a head that binds
@@ -673,11 +669,14 @@ async fn build_memory_service(
     if let Some(items) = items {
         service = service.with_item_recall(items);
     }
-    let serving = remember_serving(
-        config.lifecycle,
-        conflict_lifecycle.is_some(),
-        assert,
-        captures,
+    let serving = with_item_support(
+        remember_serving(
+            config.lifecycle,
+            conflict_lifecycle.is_some(),
+            assert,
+            captures,
+        ),
+        item_support.is_some(),
     );
     log_remember_serving(
         serving.as_ref(),
@@ -737,6 +736,7 @@ fn remember_serving(
                 adjudication: lifecycle.conflict_adjudication && conflict_lifecycle,
                 assert,
                 capture,
+                item_support: false,
             },
             hide_non_current_claim_chunks: true,
             lifecycle_overlay: conflict_lifecycle,
@@ -752,6 +752,82 @@ fn remember_serving(
         })
     } else {
         None
+    }
+}
+
+/// `serving`, with claims that cite collected items (ADR 0008 D11) added to
+/// its surface when `item_support`: a record-only writer then serves a
+/// surface of its own, whose `record` support takes item citations.
+fn with_item_support(
+    serving: Option<LifecycleServing>,
+    item_support: bool,
+) -> Option<LifecycleServing> {
+    if !item_support {
+        return serving;
+    }
+    let mut serving = serving.unwrap_or_default();
+    serving.surface.item_support = true;
+    Some(serving)
+}
+
+/// `recall(kind=item)`, and whether claims may cite collected items.
+///
+/// Item recall is served wherever migration 34 is applied and this login may
+/// read the collector and Stage-5 tables (ADR 0008 D7). Claims cite items
+/// wherever migration 35 is applied, this login holds its grants, and item
+/// recall is served, so every cited item can be read back (D11). Both are
+/// additive: a missing migration or grant turns them off with a log line and
+/// leaves every tool schema as it was.
+async fn start_items(
+    pool: &sqlx::PgPool,
+    capabilities: &DatabaseCapabilities,
+    config: &FleetConfig,
+) -> (
+    Option<Arc<dyn ItemRecall>>,
+    Option<ClaimItemLinksCapability>,
+) {
+    let claim_item_links = start_claim_item_links(pool, capabilities).await;
+    let items = start_item_recall_citing(
+        pool,
+        capabilities,
+        &config.default_scope,
+        &config.embedding_model_sha256,
+        claim_item_links,
+    )
+    .await;
+    let item_support = claim_item_links.filter(|_| items.is_some());
+    if claim_item_links.is_some() && item_support.is_none() {
+        tracing::info!(
+            "claims do not cite collected items: recall(kind=item) is not served, so no cited item could be read back"
+        );
+    }
+    (items, item_support)
+}
+
+/// Whether claims may cite collected items: migration 35 is applied and this
+/// login may write claim item links and read every table a citation resolves
+/// through (ADR 0008 D11). A missing migration or grant is logged at info
+/// level, a failed probe at error level; either way it is off and `serve`
+/// goes on without it. The probe runs once, so a later grant needs a restart.
+async fn start_claim_item_links(
+    pool: &sqlx::PgPool,
+    capabilities: &DatabaseCapabilities,
+) -> Option<ClaimItemLinksCapability> {
+    match probe_claim_item_links(pool, capabilities).await {
+        Ok(Some(capability)) => Some(capability),
+        Ok(None) => {
+            tracing::info!(
+                "claims do not cite collected items: migration 35 or its runtime grants are absent"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "claims do not cite collected items: the claim item links probe failed; serving remember without it"
+            );
+            None
+        }
     }
 }
 

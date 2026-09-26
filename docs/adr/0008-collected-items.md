@@ -1,6 +1,6 @@
 # ADR 0008: Collected items from any source
 
-- Status: accepted; D1 to D10 implemented. The generation-3 registry package
+- Status: accepted; D1 to D11 implemented. The generation-3 registry package
   is checked in, the strict witness recognizes it, and
   `ostk-authority-install apply --target generation-3` activates it and
   rebases the scope's normative families onto it. The collected-item
@@ -17,8 +17,11 @@
   lists, dead-letters, and retires what the collectors hold (D9). An agent
   relays items it read through its own connectors with
   `remember(action="capture")`, a reported channel through the same sink,
-  served only where `FLEET_RECALL_COLLECTED_CAPTURE` turns it on (D10). No
-  API collector stages items yet; those land with their own decisions.
+  served only where `FLEET_RECALL_COLLECTED_CAPTURE` turns it on (D10). A
+  claim cites the items it rests on: `remember(assert)`'s `support_items`
+  and `record`'s item support entries link it to them through migration 35,
+  privately (D11). No API collector stages items yet; those land with their
+  own decisions.
 - Date: 2026-09-25
 - Scope: how specs and documents, Slack conversations, Linear tickets,
   Granola meetings, and anything else a collector can read become evidence
@@ -135,8 +138,8 @@ Rollout order, for every physical scope that is to collect items:
    generation-3 row refuses a generation-3 head as `UnknownActivePackage`.
 2. Apply the release's migrations and re-apply the grant files. Migration 32
    (D3) lets a spec family be rebased; it adds no grant. Migrations 33 (D4)
-   and 34 (D5, D6) add the collected-item tables and their withdrawals,
-   which the runtime policy grants.
+   and 34 (D5, D6) add the collected-item tables and their withdrawals, and
+   migration 35 (D11) the claim item links, which the runtime policy grants.
 3. Run `ostk-authority-install apply --target generation-3`. The pins do not
    change, so no writer is reconfigured, and the run rebases every spec
    family onto the new head (D3).
@@ -221,8 +224,8 @@ byte-identical. The installer refuses, before any write, to rebase a scope
 that holds a family on a schema without migration 32. No grant changes: the
 installer runs as the migrator, the runtime role already holds `INSERT` on the
 log, and the runtime policy's schema gate stayed at migrations 1 to 31, since
-nothing served needs 32. (Migrations 33 and 34, D4 to D6, later moved the
-gate to 1 to 34.)
+nothing served needs 32. (Migrations 33 to 35, D4 to D6 and D11, later
+moved the gate to 1 to 35.)
 
 **What stays as ADR 0007 D11 describes.**
 
@@ -846,3 +849,96 @@ is reported provenance, and the agent's `visibility` can only narrow.
 Letting a capture withdraw or lift anything: it carries no audience facts of
 its own. Replaying a committed capture after capture is turned off, and a
 rate limit on capture, are deferred.
+
+## D11 — Claims that cite collected items
+
+**Decision.** A claim rests on the items it was drawn from: an agent that
+captured a Slack thread (D10), or recalled a Linear issue (D7), cites it as
+the claim's support, and the fleet can see which claims an item supports and
+what a claim rests on (`src/ledger/cockroach/item_links.rs`, migration 35).
+
+- **Citing.** `remember(assert)`'s assertion takes `support_items`, and a
+  `record` (or a `supersede` successor) takes, in `support` beside the corpus
+  snapshots it always took, an entry `{item, relation}`. A reference is
+  exactly one of `{item_id}` (the item's presented version is cited),
+  `{version_id}` (exactly that version), or `{url}` (the presented version of
+  the item whose `https` provider URL it is), as `recall(kind=item)` and
+  `remember(capture)` return them; at most 32 per claim.
+- **Resolution,** always in the claim's own `(tenant_id, project)`: the
+  version's parts, one admitted part per ordinal (the presented tier's copy
+  first, then the earliest admitted), and only a whole version. A reference
+  that names nothing admitted and nothing pending is refused as
+  `support_item_unknown`; one whose item or version is staged but not yet
+  admitted (a `stage_only` capture, a drain still to run) as
+  `support_item_pending`; one whose item is hidden from recall (its presented
+  head a tombstone, its container or the item withdrawn; D5, D6), or that
+  names a tombstone version, as `support_item_withdrawn`, with
+  `details.suppressed`. A collector's own coverage observation is never an
+  item, so it is unknown. A ledger that does not serve claim item links
+  refuses any citation as `item_support_unavailable`. Every refusal names the
+  request field and writes nothing.
+- **Assert** resolves the citations before admission and merges their events
+  into `support_evidence_event_ids` (sorted, without duplicates, within the
+  route's bound of 256), so the accepted statement cites events only and the
+  claim contract does not change. The append transaction runs the unchanged
+  audit (every support event accepted in this scope) and checks again that no
+  cited item was hidden since it was resolved; the projection then writes one
+  link per cited part (`via = 'assert'`, naming the claim's own accepted
+  event). Citing one version twice is one citation. The receipt binds the
+  assertion as sent, `support_items` included; an assertion without them
+  serializes, and binds its receipt, exactly as before.
+- **Record** resolves the citations inside its serializable transaction.
+  Each writes one opaque `memory_claim_support` row (`source_config_id`
+  `fleet.item`, `source` `item-link`, `source_id` the lowercase hex of a
+  random 16-byte link id, and no chunk, digest, or excerpt) and one link row
+  per cited part sharing that link id (`via = 'record'`). Citing one version
+  twice in one claim is refused as `support_item_duplicate`: each citation has
+  its own support row and relation, and a part's event links to a claim once.
+  A corpus entry deserializes, is checked, and serializes exactly as before,
+  so every record receipt keeps its bytes.
+- **Reading.** The private writer's `recall(get, kind=claim)` expands a
+  claim's citations into `support_items`: each with its link id, `via`,
+  relation, item and version ids, provider, object kind, external id,
+  provider URL, the trust tier its parts came through, whether the version
+  cited is still the item's presented one, why the item is hidden now if it
+  is, and the accepted events; and `independent_sources`, the count of
+  distinct content digests among the visible cited items, so an echo or a
+  cross-post counts once. A claim that cites nothing reads as before.
+  `recall(get, kind=item)` lists the claims that cite the item (`cited_by`:
+  claim id, `via`, relation, version, the claim's state, and when; at most
+  256). A superseded or retracted claim keeps its citations: the links are
+  append-only history, and retract, supersede, and resolve are unchanged.
+- **The publication plane gains nothing.** `memory_claim_support` is a
+  publication table, so a citation's row carries only its opaque link id,
+  and the publication service drops `fleet.item` rows from every claim it
+  returns, as it withholds asserted claims (ADR 0005 D8). The link table is
+  not a publication table and is never granted to the publication reader,
+  which reads it only as SQLSTATE `42501`.
+- **Served only where it can be.** `serve` probes once at startup, in a
+  rolled-back transaction: migration 35, `INSERT` on the links, and `SELECT`
+  on every table a citation resolves through (the item history, heads,
+  containers, item withdrawals, outbox) and on the claims. Claims cite items
+  only where that probe passes and `recall(kind=item)` is served, so every
+  item a claim cites can be read back. Then `RememberSurface.item_support`
+  holds; `tools/list` widens `record`'s support entries to also take
+  `{item, relation}`, adds `assertion.support_items` where `assert` is
+  served, and says so in one sentence. Anywhere else every schema is byte for
+  byte what it was. The runtime policy grants `SELECT` and `INSERT` on
+  `memory_claim_item_links_v1` (its gate is migrations 1 through 35, its
+  matrix 141 rows).
+
+**Migration 35** creates `memory_claim_item_links_v1`, keyed by
+`(tenant_id, project, claim_id, support_event_id)`, with the link id, `via`,
+the claim's event (non-NULL exactly for `assert`), the item and version
+digests, the part ordinal, the relation, and the time; an index by item for
+`cited_by` and one by link id. No foreign key, append-only by privilege,
+closed by a drift guard.
+
+**Rejected.** Naming the item in the support row: `memory_claim_support` is
+readable by the publication reader, which would then learn which private
+item a claim rests on. Citing a partially admitted version: its missing parts
+may never be admitted, and a claim would rest on text no one can read back.
+Re-checking every directly cited event for a hidden item: the audit of
+`support_evidence_event_ids` stays what it was, and only citations made
+through items are checked again. Per-principal audiences on citations are
+deferred with the item audiences they would follow.

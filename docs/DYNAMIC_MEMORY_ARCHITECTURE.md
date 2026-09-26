@@ -43,7 +43,9 @@ mutation route exists today. What runs is private and reads local material:
   admitted (ADR 0008 D9). An agent relays items it read through its own
   connectors with `remember(action="capture")`, another reported channel
   through the same sink, whose audience the server decides; `serve` admits
-  them in the call or leaves them to the worker (ADR 0008 D10).
+  them in the call or leaves them to the worker (ADR 0008 D10). A claim
+  written by `record` or `assert` cites the items it rests on, resolved in its
+  own project to their accepted events and linked privately (ADR 0008 D11).
 - The private `ostk-spec` CLI runs the Stage-6 normative activation,
   observer, and discrepancy runtimes, and `serve` lists the episodes it opens
   as `recall(discrepancies)`

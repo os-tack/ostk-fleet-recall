@@ -12,24 +12,27 @@ use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Row, Transaction};
 
+use crate::ledger::lifecycle::{LifecycleRefusal, RefusalCode};
 use crate::ledger::types::PreparedClaim;
 use crate::ledger::{
-    AssertedClaimMutation, Claim, ClaimInput, ClaimKind, ClaimLedger, ClaimMutation, ClaimState,
-    ClaimSupport, ClaimTarget, Conflict, ConflictHistory, ConflictLifecycleRows, ConflictMutation,
-    ConflictTarget, DismissalTerms, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
-    FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2, LifecycleMutation, LifecycleReplayRequest,
-    SemanticClaimHit, SupportedClaimCoordinate, SupportedClaimIds, WaiverTerms,
+    AssertedClaimMutation, Claim, ClaimInput, ClaimItemSupportV1, ClaimKind, ClaimLedger,
+    ClaimMutation, ClaimState, ClaimSupport, ClaimTarget, Conflict, ConflictHistory,
+    ConflictLifecycleRows, ConflictMutation, ConflictTarget, DismissalTerms,
+    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2,
+    LifecycleMutation, LifecycleReplayRequest, SemanticClaimHit, SupportInputV1,
+    SupportedClaimCoordinate, SupportedClaimIds, WaiverTerms,
 };
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::remember_runtime::{EventFirstAssert, RememberAssertInputV1, actor_for_agent};
 use crate::store::cockroach::{
-    ConflictLifecycleCapability, EMBEDDING_DIMENSION, RetryPolicy, serialize_vector,
-    with_serializable_retry,
+    ClaimItemLinksCapability, ConflictLifecycleCapability, EMBEDDING_DIMENSION, RetryPolicy,
+    serialize_vector, with_serializable_retry,
 };
 use crate::{FleetError, FleetScope, Result};
 
 mod assert_store;
 mod conflict_store;
+mod item_links;
 mod lifecycle_store;
 
 use lifecycle_store::Replayable;
@@ -327,6 +330,11 @@ pub struct CockroachClaimLedger {
     /// Set only when the writer-authority pins verified at startup; without
     /// it every assert is refused as `assert_unavailable`.
     event_first_assert: Option<Arc<EventFirstAssert>>,
+    /// Set only from a successful startup probe of migration 35 and its
+    /// grants, where item recall is served; without it a claim that cites a
+    /// collected item is refused as `item_support_unavailable` (ADR 0008
+    /// D11).
+    claim_item_links: Option<ClaimItemLinksCapability>,
 }
 
 impl std::fmt::Debug for CockroachClaimLedger {
@@ -343,6 +351,7 @@ impl std::fmt::Debug for CockroachClaimLedger {
                 &self.serves_conflict_adjudication(),
             )
             .field("event_first_assert", &self.serves_event_first_assert())
+            .field("claim_item_links", &self.serves_claim_item_links())
             .finish_non_exhaustive()
     }
 }
@@ -375,6 +384,7 @@ impl CockroachClaimLedger {
             conflict_lifecycle: None,
             conflict_adjudication: false,
             event_first_assert: None,
+            claim_item_links: None,
         })
     }
 
@@ -452,6 +462,25 @@ impl CockroachClaimLedger {
     #[must_use]
     pub const fn serves_event_first_assert(&self) -> bool {
         self.event_first_assert.is_some()
+    }
+
+    /// Let claims cite collected items (ADR 0008 D11): `assert`'s
+    /// `support_items` and `record`'s (and a `supersede` successor's) item
+    /// support entries are resolved in this ledger's scope and linked in the
+    /// private `memory_claim_item_links_v1`, and a claim's citations are
+    /// expanded for the private reader. Only the private writer composition
+    /// calls this, with what the startup probe found and only where item
+    /// recall is served.
+    #[must_use]
+    pub const fn with_claim_item_links(mut self, capability: ClaimItemLinksCapability) -> Self {
+        self.claim_item_links = Some(capability);
+        self
+    }
+
+    /// Whether claims written through this ledger may cite collected items.
+    #[must_use]
+    pub const fn serves_claim_item_links(&self) -> bool {
+        self.claim_item_links.is_some()
     }
 
     fn ensure_scope(&self, scope: &FleetScope) -> Result<()> {
@@ -550,6 +579,7 @@ impl ClaimLedger for CockroachClaimLedger {
             ));
         }
         let prepared = input.prepare()?;
+        let item_links = self.claim_item_links;
         let request = serde_json::json!({
             "scope": {
                 "project": scope.project,
@@ -567,6 +597,11 @@ impl ClaimLedger for CockroachClaimLedger {
                 .await?
         {
             return Ok(mutation);
+        }
+        // A committed citation replays above; a new one needs claim item
+        // links (ADR 0008 D11).
+        if input.cites_items() && item_links.is_none() {
+            return Err(item_links::item_support_unavailable());
         }
         let passages = self.embed_claim_passages(scope, input, &prepared)?;
 
@@ -636,6 +671,7 @@ impl ClaimLedger for CockroachClaimLedger {
                     &model,
                     serde_json::json!({ "idempotency_key": key }),
                     None,
+                    item_links,
                 )
                 .await?;
                 let (conflicts_opened, conflict_detection) =
@@ -709,6 +745,27 @@ impl ClaimLedger for CockroachClaimLedger {
 
     async fn asserted_claim_ids(&self, scope: &FleetScope, claim_ids: &[i64]) -> Result<Vec<i64>> {
         assert_store::asserted_claim_ids(self, scope, claim_ids).await
+    }
+
+    async fn claim_item_support(
+        &self,
+        scope: &FleetScope,
+        claim_id: i64,
+    ) -> Result<Option<ClaimItemSupportV1>> {
+        self.ensure_scope(scope)?;
+        if self.claim_item_links.is_none() {
+            return Ok(None);
+        }
+        if claim_id <= 0 {
+            return Ok(Some(ClaimItemSupportV1 {
+                items: Vec::new(),
+                independent_sources: 0,
+                truncated: false,
+            }));
+        }
+        item_links::claim_item_support(&self.pool, scope, claim_id)
+            .await
+            .map(Some)
     }
 
     async fn retract_claim(
@@ -1613,6 +1670,8 @@ async fn require_active_model(
 ///
 /// `accepted_event_id` is the accepted event an assert projects; record and
 /// supersede pass `None`, which stores NULL as they always have.
+/// `item_links` lets the claim's support cite collected items (ADR 0008 D11);
+/// without it such a support entry is refused.
 #[allow(clippy::too_many_arguments)] // one claim projection; every caller supplies each part
 async fn insert_claim_projection(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
@@ -1623,9 +1682,10 @@ async fn insert_claim_projection(
     model: &str,
     recorded_payload: Value,
     accepted_event_id: Option<&[u8]>,
+    item_links: Option<ClaimItemLinksCapability>,
 ) -> Result<Claim> {
     let mut claim = insert_claim(transaction, scope, input, prepared, accepted_event_id).await?;
-    claim.support = insert_support(transaction, scope, claim.id, input).await?;
+    claim.support = insert_support(transaction, scope, claim.id, input, item_links).await?;
 
     for (passage_index, passage_text, vector) in passages {
         sqlx::query(
@@ -2515,14 +2575,64 @@ async fn insert_claim(
     decode_claim(&row)
 }
 
+/// Insert a claim's support rows in order: each corpus snapshot as before,
+/// and each collected item it cites (ADR 0008 D11) as an opaque support row
+/// plus its private links. Every cited item is resolved in this transaction
+/// first, so an unknown, pending, withdrawn, or twice-cited item refuses the
+/// claim before any support row is written, and the transaction rolls back.
 async fn insert_support(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     scope: &FleetScope,
     claim_id: i64,
     input: &ClaimInput,
+    item_links: Option<ClaimItemLinksCapability>,
 ) -> Result<Vec<ClaimSupport>> {
+    let fields: Vec<(String, &crate::ledger::ItemRefV1)> = input
+        .support
+        .iter()
+        .enumerate()
+        .filter_map(|(index, support)| {
+            support
+                .as_item()
+                .map(|item| (format!("support[{index}].item"), &item.item))
+        })
+        .collect();
+    let mut cited = if fields.is_empty() {
+        Vec::new()
+    } else {
+        if item_links.is_none() {
+            return Err(item_links::item_support_unavailable());
+        }
+        let citations: Vec<item_links::CitationV1<'_>> = fields
+            .iter()
+            .map(|(field, reference)| item_links::CitationV1 { field, reference })
+            .collect();
+        let resolved = item_links::resolve_citations(transaction, scope, &citations).await?;
+        refuse_twice_cited(&citations, &resolved)?;
+        resolved
+    }
+    .into_iter();
     let mut support_rows = Vec::with_capacity(input.support.len());
     for support in &input.support {
+        let support = match support {
+            SupportInputV1::Corpus(support) => support,
+            SupportInputV1::Item(item) => {
+                let resolved = cited
+                    .next()
+                    .ok_or_else(|| protocol_error("a cited item was not resolved"))?;
+                support_rows.push(
+                    item_links::insert_record_citation(
+                        transaction,
+                        scope,
+                        claim_id,
+                        &item.relation,
+                        &resolved,
+                    )
+                    .await?,
+                );
+                continue;
+            }
+        };
         if support.source.trim().is_empty() || support.source_id.trim().is_empty() {
             return Err(protocol_error(
                 "claim support source and source_id must not be empty",
@@ -2568,6 +2678,30 @@ async fn insert_support(
         support_rows.push(decode_support(&row)?);
     }
     Ok(support_rows)
+}
+
+/// Refuse a claim whose support cites one version of one item twice: each
+/// citation has its own support row and relation, and a part's event links
+/// to a claim once.
+fn refuse_twice_cited(
+    citations: &[item_links::CitationV1<'_>],
+    resolved: &[item_links::ResolvedItemV1],
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    for (citation, item) in citations.iter().zip(resolved) {
+        if !seen.insert(item.version_key) {
+            return Err(LifecycleRefusal::new(
+                RefusalCode::SupportItemDuplicate,
+                format!(
+                    "{} cites a version of a collected item another support entry already cites",
+                    citation.field
+                ),
+                serde_json::json!({ "field": citation.field, "item": citation.reference }),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 async fn fetch_claim(
@@ -4606,18 +4740,23 @@ mod tests {
             confidence: 1.0,
             valid_from: None,
             valid_to: None,
-            support: vec![crate::ledger::ClaimSupportInput {
-                source_config_id: "live-docs-v1".into(),
-                source: "markdown".into(),
-                source_id: "docs/live-migration.md".into(),
-                chunk_id: Some(support_chunk_id.clone()),
-                content_sha256: Some(support_sha256.clone()),
-                excerpt: Some(support_text.into()),
-                relation: "supports".into(),
-            }],
+            support: vec![
+                crate::ledger::ClaimSupportInput {
+                    source_config_id: "live-docs-v1".into(),
+                    source: "markdown".into(),
+                    source_id: "docs/live-migration.md".into(),
+                    chunk_id: Some(support_chunk_id.clone()),
+                    content_sha256: Some(support_sha256.clone()),
+                    excerpt: Some(support_text.into()),
+                    relation: "supports".into(),
+                }
+                .into(),
+            ],
         };
         let mut mismatched_support = first.clone();
-        mismatched_support.support[0].content_sha256 = Some("0".repeat(64));
+        if let SupportInputV1::Corpus(support) = &mut mismatched_support.support[0] {
+            support.content_sha256 = Some("0".repeat(64));
+        }
         let mismatch_key = format!("live-ledger/mismatched-support/{}", Uuid::now_v7());
         let mismatch_error = ledger
             .record_claim(&scope, &mismatched_support, &mismatch_key)

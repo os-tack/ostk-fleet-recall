@@ -2,10 +2,10 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::ledger::{
-    AssertedClaimMutation, Claim, ClaimInput, ClaimMutation, ClaimState, ClaimTarget, Conflict,
-    ConflictHistory, ConflictLifecycleRows, ConflictMutation, ConflictTarget, DismissalTerms,
-    LifecycleMutation, LifecycleRefusal, LifecycleReplayRequest, RefusalCode, SemanticClaimHit,
-    WaiverTerms,
+    AssertedClaimMutation, Claim, ClaimInput, ClaimItemSupportV1, ClaimMutation, ClaimState,
+    ClaimTarget, Conflict, ConflictHistory, ConflictLifecycleRows, ConflictMutation,
+    ConflictTarget, DismissalTerms, LifecycleMutation, LifecycleRefusal, LifecycleReplayRequest,
+    RefusalCode, SemanticClaimHit, WaiverTerms,
 };
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::remember_runtime::RememberAssertInputV1;
@@ -98,6 +98,19 @@ pub trait ClaimLedger: Send + Sync {
             }
         }
         Ok(asserted)
+    }
+
+    /// The collected items `claim_id` cites (ADR 0008 D11), expanded through
+    /// the private claim item links: what `assert`'s `support_items` and
+    /// `record`'s item support entries linked. `None` when this ledger does
+    /// not serve claim item links, which is this default; an unknown claim
+    /// or one that cites no item has no items.
+    async fn claim_item_support(
+        &self,
+        _scope: &FleetScope,
+        _claim_id: i64,
+    ) -> Result<Option<ClaimItemSupportV1>> {
+        Ok(None)
     }
 
     /// Retract a lifecycle-current operator assertion the caller authored.

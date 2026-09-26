@@ -1,7 +1,7 @@
 -- Long-lived runtime-writer role boundary for the dedicated fleet_recall
 -- database.
 --
--- Run only after the complete successful migration prefix 1 through 34 (version
+-- Run only after the complete successful migration prefix 1 through 35 (version
 -- 25 is permanently unused). Other later successful migrations are compatible
 -- and cannot mask a missing or failed row in that bounded prefix. Run only as
 -- a cluster admin; database ownership alone is insufficient. This policy is
@@ -68,26 +68,26 @@ $$;
 -- Stage-5 body, coverage, recall, transcript, and visibility tables (19-23),
 -- normative activation (24), the CI connector (26), the discrepancy ledger
 -- (27), the conflict lifecycle log (29), worker source status (30), spec
--- conformance (31), and collected items and their withdrawals (33, 34).
--- Migration 32 adds no table and no grant, but lies inside the bounded prefix.
--- A policy applied before any of them fails here, before any change, rather
--- than on a GRANT.
+-- conformance (31), collected items and their withdrawals (33, 34), and claim
+-- item links (35). Migration 32 adds no table and no grant, but lies inside
+-- the bounded prefix. A policy applied before any of them fails here, before
+-- any change, rather than on a GRANT.
 DO $$
 DECLARE
     runtime_schema_ready BOOL;
 BEGIN
-    SELECT count(*) = 33
+    SELECT count(*) = 34
        AND min(version) = 1
-       AND max(version) = 34
+       AND max(version) = 35
        AND COALESCE(bool_and(success), false)
     INTO runtime_schema_ready
     FROM public._sqlx_migrations
-    WHERE version BETWEEN 1 AND 34;
+    WHERE version BETWEEN 1 AND 35;
 
     IF runtime_schema_ready IS DISTINCT FROM true THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
-            MESSAGE = 'runtime writer role requires successful migrations 1 through 34 (25 is permanently unused)';
+            MESSAGE = 'runtime writer role requires successful migrations 1 through 35 (25 is permanently unused)';
     END IF;
 END
 $$;
@@ -748,6 +748,15 @@ GRANT DELETE ON TABLE public.memory_chunk_history TO fleet_runtime;
 -- after applying this policy.
 GRANT SELECT, INSERT ON TABLE public.memory_conflict_lifecycle_events_v1 TO fleet_runtime;
 
+-- Claim item links (ADR 0008 D11, migration 35): which collected item a
+-- claim's support cites, one row per cited part. Append-only by privilege: no
+-- UPDATE and no DELETE, so a citation, once committed with its claim, is
+-- never rewritten. The table has no foreign key, so no parent grant is
+-- needed, and it is never granted to the publication reader, which sees only
+-- a record citation's opaque memory_claim_support row. Serve probes both
+-- privileges at startup before it lets a claim cite an item.
+GRANT SELECT, INSERT ON TABLE public.memory_claim_item_links_v1 TO fleet_runtime;
+
 -- Exact Stage-4 evidence-plane surface (ADR 0002 D2). `remember` must commit
 -- its accepted event and its projection in ONE serializable transaction, so
 -- the appending identity is this same logical role. It receives append and
@@ -872,12 +881,12 @@ TO fleet_runtime;
 GRANT fleet_runtime TO fleet_writer;
 
 -- Exact direct logical-role surface: database CONNECT, public-schema USAGE,
--- one hundred thirty-four table-privilege rows, and three sequence-USAGE rows.
+-- one hundred thirty-six table-privilege rows, and three sequence-USAGE rows.
 -- Because SHOW GRANTS FOR also exposes cluster-global external connections, the
 -- exact count rejects those and every function/type/differently privileged
 -- row.
 SELECT IF(
-    count(*) = 139
+    count(*) = 141
         AND COALESCE(bool_and(
             NOT is_grantable
             AND (
@@ -913,6 +922,7 @@ SELECT IF(
                                 'memory_relation_projection_watermarks_v1',
                                 'memory_writer_authority_v1',
                                 'memory_conflict_lifecycle_events_v1',
+                                'memory_claim_item_links_v1',
                                 'memory_body_objects_v1',
                                 'memory_chunk_occurrences_v1',
                                 'memory_chunk_occurrence_spans_v1',
@@ -968,6 +978,7 @@ SELECT IF(
                                 'memory_relation_projection_v1',
                                 'memory_relation_projection_watermarks_v1',
                                 'memory_conflict_lifecycle_events_v1',
+                                'memory_claim_item_links_v1',
                                 'memory_body_objects_v1',
                                 'memory_chunk_occurrences_v1',
                                 'memory_chunk_occurrence_spans_v1',
@@ -1051,7 +1062,7 @@ SELECT IF(
     1:::INT8,
     CAST(
         concat(
-            'runtime writer direct-grant postcondition differs from exact one-hundred-thirty-nine-row matrix: observed=',
+            'runtime writer direct-grant postcondition differs from exact one-hundred-forty-one-row matrix: observed=',
             count(*)::STRING
         )
         AS INT8

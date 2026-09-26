@@ -43,7 +43,10 @@ audiences, collector status, per-domain cursors, and digest-only dead
 letters. Migration 34 adds its withdrawals (ADR 0008 D5 and D6): the trust
 tier of each container observation, containers recorded withdrawn before
 anything was admitted through them, and items whose own audience narrowed.
-The two ship together, and the collector runtime needs both.
+The two ship together, and the collector runtime needs both. Migration 35
+adds claim item links (ADR 0008 D11): which collected item, version, and
+part each claim's support cites, a private-plane table the publication
+reader never reads.
 
 Each private runtime uses its own part of these tables:
 
@@ -74,22 +77,28 @@ Each private runtime uses its own part of these tables:
   turned on (ADR 0008 D10): then `remember(capture)` stages into migration
   33's outbox and writes its capture instance's status row and dead letters,
   and, when `enabled`, drains its own rows into the item history, links, and
-  heads as the worker's step does. Of the other tables from migration 19
-  onward, it writes only migration 29's lifecycle log. Capture adds no
-  migration or grant.
+  heads as the worker's step does. From migration 35 on, where item recall is
+  served, `record` and `assert` append migration 35's claim item links when a
+  claim cites a collected item, and `recall(get)` reads them to expand what a
+  claim cites and to list the claims that cite an item (ADR 0008 D11). Of
+  the other tables from migration 19 onward, it writes only migration 29's
+  lifecycle log. Capture adds no migration or grant.
 - Only the private import CLI writes migration 28's rows. No served path
   reads them or migration 23's publication views.
 
 The runtime role policy grants `fleet_runtime` the tables of migrations 19
-through 24, 26, and 27, as it does those of 29 through 31, 33, and 34. It grants
-nothing on migration 23's publication views or migration 28's import rows.
+through 24, 26, and 27, as it does those of 29 through 31 and 33 through 35.
+It grants nothing on migration 23's publication views or migration 28's
+import rows.
 
 Serving requires none of these migrations: `MINIMUM_RECALL_SCHEMA_VERSION`
 stays 18. `serve` serves each surface built on them only when its startup
 probe finds the schema version and the runtime grants on every table the
 surface reads. Migration 29 gates the conflict lifecycle, 30 gates
-`recall(kind=evidence)`, 31 gates `recall(action="discrepancies")`, and 34
-gates `recall(kind=item)` (ADR 0008 D7); migration 32 gates nothing served.
+`recall(kind=evidence)`, 31 gates `recall(action="discrepancies")`, 34
+gates `recall(kind=item)` (ADR 0008 D7), and 35 gates claims that cite
+collected items, which `serve` offers only where `recall(kind=item)` is
+served too (ADR 0008 D11); migration 32 gates nothing served.
 Evidence recall reads its collector state (migrations 33 and 34) when it
 finds it readable, and is still served, fail-closed, when it does not; until
 it is readable it checks again on every read, so they need no restart for
@@ -332,9 +341,9 @@ separately provisioned private-writer login is a member only of the hardened
   `memory_control_*` or `memory_registry_*` base table;
 - append and advance privileges on the body, coverage, recall, transcript,
   and CI connector tables, normative activation, the discrepancy ledger, the
-  conflict lifecycle log, worker source status, spec conformance, and the
-  collected-item sink (the tables of migrations 19 through 24, 26, 27, 29
-  through 31, 33, and 34), described below;
+  conflict lifecycle log, worker source status, spec conformance, the
+  collected-item sink, and claim item links (the tables of migrations 19
+  through 24, 26, 27, 29 through 31, and 33 through 35), described below;
 - `SELECT` on the migrator-owned `memory_writer_authority_v1` view, which is
   the writer's only registry/bootstrap read path;
 - read access to SQLx migration metadata for health checks;
@@ -401,6 +410,15 @@ decided it; a lifted withdrawal is updated, never deleted. It closes with a
 drift guard over both tables' column shapes, the two new constraints, and the
 absence of the old one.
 
+Migration 35 (ADR 0008 D11) adds `memory_claim_item_links_v1`, again with no
+foreign key and nothing for the publication reader: one row per cited part
+of a collected item a claim's support cites, keyed by the claim and the
+part's accepted event, with the item, version, and part it admitted, the
+relation, and `via` (`assert`, whose rows name the claim's own accepted event,
+or `record`, whose rows share the random link id the claim's opaque
+`memory_claim_support` row names). A CHECK ties `via = 'assert'` to a
+non-NULL claim event. It closes with a drift guard over the column shape.
+
 For the tables from migration 19 onward the policy grants one of three
 shapes, and never `DELETE`:
 
@@ -408,10 +426,10 @@ shapes, and never `DELETE`:
   occurrences and their spans, parse-run manifests, source-commit membership,
   and coverage receipts; the CI connector's measured windows; the normative
   and discrepancy logs; migration 29's conflict lifecycle log; migration 31's normative
-  statements and spec checks; and migration 33's collected item history, item
-  links, and collector dead letters. The runtime can add a logged event,
-  receipt, statement, check, history row, or dead letter but never rewrite or
-  remove one.
+  statements and spec checks; migration 33's collected item history, item
+  links, and collector dead letters; and migration 35's claim item links. The
+  runtime can add a logged event, receipt, statement, check, history row,
+  dead letter, or citation but never rewrite or remove one.
 - **Advanced state (`SELECT`, `INSERT`, `UPDATE`):** generation pointers, the
   body projection watermarks, body visibility, coverage cursors, the lexical
   and dense recall projections and their cursors, the transcript outbox and
@@ -447,21 +465,22 @@ writer login (see
 grants nothing on migration 23's publication views or on migration 28's
 bootstrap-import rows, and the publication reader gains nothing from any of
 these rows. The policy closes by
-checking the exact 139-row matrix: database `CONNECT`, schema `USAGE`, 134
+checking the exact 141-row matrix: database `CONNECT`, schema `USAGE`, 136
 table-privilege rows, and three sequence-`USAGE` rows. Migration 33 added 21
 of them: `SELECT` and `INSERT` on its three append-only tables, and `SELECT`,
 `INSERT`, and `UPDATE` on its five advanced-state tables (the matrix was 115
 rows, 110 of them on tables, before it). Migration 34 added three: `SELECT`,
-`INSERT`, and `UPDATE` on the item withdrawals.
+`INSERT`, and `UPDATE` on the item withdrawals. Migration 35 added two:
+`SELECT` and `INSERT` on the claim item links.
 
 A single gate guards all of it. Before any change, the policy requires a
-successful SQLx row for every migration from 1 through 34 (version 25 is
+successful SQLx row for every migration from 1 through 35 (version 25 is
 permanently unused); a later successful migration cannot mask a missing or
 failed one in that prefix. Migration 32 adds no table and needs no grant (the
 runtime already holds `INSERT` on the normative log); it is inside the gate only
-because migrations 33 and 34 are. When a later migration adds tables a runtime
-needs, extend the policy in one edit: the gate, the grants, and the closing
-count together. The writer probes its grants only at startup, so after
+because migrations 33 through 35 are. When a later migration adds tables a
+runtime needs, extend the policy in one edit: the gate, the grants, and the
+closing count together. The writer probes its grants only at startup, so after
 `migrate`, drain `fleet_writer`, reapply this policy, and then restart `serve`.
 
 Grant the external private-writer login only membership in `fleet_runtime`; do
@@ -690,8 +709,9 @@ physical scope that is to collect items:
    on its ingest host, and the projector container.
 2. Apply the release's migrations, then re-apply the grant files. Migration 32
    lets a spec family be rebased and adds no grant; migrations 33 and 34 add the
-   collected-item tables and their withdrawals, which the runtime policy grants
-   (its gate is now migrations 1 through 34). A worker whose schema predates
+   collected-item tables and their withdrawals, and migration 35 the claim
+   item links, which the runtime policy grants (its gate is now migrations 1
+   through 35). A worker whose schema predates
    migration 34 skips its `collect` step, and fails it, naming `migrate`, when a
    collector is configured. A `serve` started before this step needs no restart:
    its evidence recall checks the collector state again on every read until it
@@ -856,6 +876,11 @@ exact failed version:
   same-name object of another shape and needs a separately reviewed forward
   repair. It rewrites no existing row: the new column is NULL on every row
   migration 33's runtime wrote.
+- v35 creates `memory_claim_item_links_v1` and its two indexes with
+  `IF NOT EXISTS`, commits, and then asserts the table's exact column shape.
+  The normal migrator retry resumes an interrupted run; a `55000` means a
+  same-name table of another shape and needs a separately reviewed forward
+  repair. It rewrites no existing row.
 
 1. Leave the application service at zero.
 2. Preserve the migration task logs and exact CockroachDB error.

@@ -2,6 +2,7 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::ledger::MAX_SUPPORT_ITEMS;
 use crate::memory_contracts::collected_item::{
     AuthorKindV1, ItemLifecycleV1, MAX_EXTERNAL_ID_BYTES, MAX_LABEL_BYTES, MAX_LINK_TARGET_BYTES,
     MAX_LINKS, MAX_MARKER_BYTES, MAX_PROVIDER_URL_BYTES, MAX_SCOPE_ID_BYTES, MAX_TITLE_BYTES,
@@ -431,6 +432,7 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
         && !surface.conflict_lifecycle
         && !surface.assert
         && !surface.capture
+        && !surface.item_support
     {
         return tool;
     }
@@ -463,6 +465,9 @@ pub fn remember_tool_for(surface: RememberSurface) -> Value {
         if surface.capture {
             properties.insert("items".into(), capture_items_schema());
             properties.insert("via".into(), capture_via_schema());
+        }
+        if surface.item_support {
+            add_item_support(properties);
         }
     }
     let properties = schema["properties"]
@@ -641,6 +646,80 @@ fn capture_branch(properties: &Map<String, Value>) -> Value {
     )
 }
 
+/// Claims that cite collected items (ADR 0008 D11): `record`'s support
+/// takes an `{item, relation}` entry beside a corpus snapshot, and the
+/// assertion, where `assert` is declared, takes `support_items`.
+fn add_item_support(properties: &mut Map<String, Value>) {
+    if let Some(support) = properties.get_mut("support") {
+        let corpus = support["items"].take();
+        support["items"] = json!({ "anyOf": [corpus, item_support_schema()] });
+        support["description"] = json!(
+            "Exact source evidence snapshots, or collected items that support the claim ({\"item\": {\"item_id\"|\"version_id\"|\"url\"}, \"relation\"})."
+        );
+    }
+    if let Some(assertion) = properties.get_mut("assertion")
+        && let Some(assertion_properties) = assertion["properties"].as_object_mut()
+    {
+        assertion_properties.insert(
+            "support_items".into(),
+            json!({
+                "type": "array",
+                "maxItems": MAX_SUPPORT_ITEMS,
+                "items": item_reference_schema(),
+                "description": "Collected items that support the claim; each is resolved to the accepted evidence events of its current version (or of the exact version named) and cited with support_evidence_event_ids."
+            }),
+        );
+    }
+}
+
+/// One collected item a claim cites: exactly one of its `item_id`, one
+/// `version_id`, or its `https` provider `url`. It mirrors `ItemRefV1`,
+/// which the server parses with unknown fields denied.
+fn item_reference_schema() -> Value {
+    let digest = json!({ "type": "string", "pattern": "^[0-9a-f]{64}$" });
+    json!({
+        "type": "object",
+        "description": "A collected item, as recall(kind=item) or capture returned it: item_id or url cite its current version, version_id exactly that version.",
+        "oneOf": [
+            {
+                "properties": { "item_id": digest },
+                "required": ["item_id"],
+                "additionalProperties": false
+            },
+            {
+                "properties": { "version_id": digest },
+                "required": ["version_id"],
+                "additionalProperties": false
+            },
+            {
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "pattern": "^https://",
+                        "maxLength": MAX_PROVIDER_URL_BYTES
+                    }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+/// A `record` support entry that cites a collected item. It mirrors
+/// `ItemSupportInputV1`.
+fn item_support_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "item": item_reference_schema(),
+            "relation": { "type": "string", "default": "supports", "minLength": 1, "maxLength": 64 }
+        },
+        "required": ["item"],
+        "additionalProperties": false
+    })
+}
+
 /// Property names from several groups, in order.
 fn named(groups: &[&[&'static str]]) -> Vec<&'static str> {
     groups.concat()
@@ -665,22 +744,39 @@ const ASSERT_RULE: &str = "assert admits one claim through this deployment's act
 /// What `capture` does, on every surface that serves it.
 const CAPTURE_RULE: &str = "capture relays up to 32 items you read through your own connectors (Slack, Linear, Granola, a browser) into fleet memory as reported evidence that you attest; it records no claim. Send each item as you read it: its provider, provider_scope_id (the workspace, organization, or key it belongs to), object_kind, the provider's stable external_id (never a display label), its https url, updated_at or created_at, and its text; container, thread, author, title, and links when you know them. The server decides who may read an item: it is admitted only into a container a verified collector or an operator import recorded as visible to the project, or into a scope the operator listed for capture; visibility private or dm withholds it, and nothing you send widens it. Secrets are redacted, a collector's own copy of an item is always presented over yours, and item text is recalled as untrusted third-party content. Each item answers with its item_id, version_id, disposition (admitted, staged, replayed, or withheld with withheld_reason), and accepted_event_ids, which a claim can cite as support evidence; recall(status).remember_capture says whether items are admitted in the call or later by the worker. ";
 
+/// What citing collected items does, on every surface that serves it.
+const fn item_support_rule(surface: RememberSurface) -> &'static str {
+    match (surface.item_support, surface.assert) {
+        (false, _) => "",
+        (true, false) => {
+            "A claim can cite items collected from other systems as support: record's support takes {\"item\": {\"item_id\"|\"version_id\"|\"url\"}, \"relation\"} entries. item_id and url cite the item's current version, version_id exactly that version; an item that is unknown, staged but not yet admitted, deleted, or withdrawn is refused, and recall get with kind=claim lists the items a claim cites. "
+        }
+        (true, true) => {
+            "A claim can cite items collected from other systems as support: record's support takes {\"item\": {\"item_id\"|\"version_id\"|\"url\"}, \"relation\"} entries, and assert's assertion.support_items takes the same references, cited through their accepted evidence events. item_id and url cite the item's current version, version_id exactly that version; an item that is unknown, staged but not yet admitted, deleted, or withdrawn is refused, and recall get with kind=claim lists the items a claim cites. "
+        }
+    }
+}
+
 fn remember_description(surface: RememberSurface) -> String {
     let assert_rule = if surface.assert { ASSERT_RULE } else { "" };
     let capture_rule = if surface.capture { CAPTURE_RULE } else { "" };
+    let item_rule = item_support_rule(surface);
     if !surface.lifecycle_served() {
-        let actions = match (surface.assert, surface.capture) {
-            (_, false) => "or assert a claim",
-            (false, true) => "or capture items you read elsewhere",
-            (true, true) => "assert a claim, or capture items you read elsewhere",
+        let lead = match (surface.assert, surface.capture) {
+            (false, false) => "Deliberately record fleet memory.",
+            (true, false) => "Deliberately record fleet memory, or assert a claim.",
+            (false, true) => {
+                "Deliberately record fleet memory, or capture items you read elsewhere."
+            }
+            (true, true) => {
+                "Deliberately record fleet memory, assert a claim, or capture items you read elsewhere."
+            }
         };
-        return format!(
-            "Deliberately record fleet memory, {actions}. {assert_rule}{capture_rule}{WRITE_GUARANTEES}"
-        );
+        return format!("{lead} {assert_rule}{capture_rule}{item_rule}{WRITE_GUARANTEES}");
     }
     if !surface.conflict_lifecycle {
         return format!(
-            "Deliberately record fleet memory, or supersede or retract claims you authored. {SUCCESSOR_RULE}{assert_rule}{capture_rule}{WRITE_GUARANTEES}"
+            "Deliberately record fleet memory, or supersede or retract claims you authored. {SUCCESSOR_RULE}{assert_rule}{capture_rule}{item_rule}{WRITE_GUARANTEES}"
         );
     }
     let adjudication = surface.serves_adjudication();
@@ -707,7 +803,7 @@ fn remember_description(surface: RememberSurface) -> String {
         ""
     };
     format!(
-        "Deliberately record fleet memory, {actions}. {successor_rule}acknowledge marks a conflict's current episode as seen and changes nothing else. {RESOLVE_RULE}{adjudication_rules}{CLOSE_RESTORES_MEMBERS}{assert_rule}{capture_rule}{WRITE_GUARANTEES}"
+        "Deliberately record fleet memory, {actions}. {successor_rule}acknowledge marks a conflict's current episode as seen and changes nothing else. {RESOLVE_RULE}{adjudication_rules}{CLOSE_RESTORES_MEMBERS}{assert_rule}{capture_rule}{item_rule}{WRITE_GUARANTEES}"
     )
 }
 
@@ -1208,6 +1304,7 @@ mod tests {
             adjudication: false,
             assert: false,
             capture: false,
+            item_support: false,
         }
     }
 
@@ -2193,6 +2290,7 @@ mod tests {
                 adjudication: bits & 4 != 0,
                 assert: bits & 8 != 0,
                 capture: false,
+                item_support: false,
             };
             for recall in 0_u8..8 {
                 surfaces.push((
@@ -2375,5 +2473,126 @@ mod tests {
             example["lifecycle"] = json!(lifecycle.as_str());
             assert_eq!(offered, accepted(example).is_ok(), "{}", lifecycle.as_str());
         }
+    }
+
+    fn citing(surface: RememberSurface) -> RememberSurface {
+        RememberSurface {
+            item_support: true,
+            ..surface
+        }
+    }
+
+    #[test]
+    fn item_support_adds_item_citations_only_where_served() {
+        for (remember, recall) in surfaces_without_capture() {
+            let without = tool_list_for_surfaces(remember, recall);
+            let listed = serde_json::to_string(&without).unwrap();
+            assert!(!listed.contains("support_items"), "{remember:?}");
+            assert!(!listed.contains("\"item_id\""), "{remember:?}");
+
+            let with = tool_list_for_surfaces(citing(remember), recall);
+            // The recall tool never changes: citing serves no read of its own.
+            assert_eq!(with[0], without[0]);
+            let schema = &with[1]["inputSchema"];
+            // Every action and branch is what it was.
+            assert_eq!(
+                schema["properties"]["action"]["enum"],
+                without[1]["inputSchema"]["properties"]["action"]["enum"]
+            );
+            let support = &schema["properties"]["support"];
+            let alternatives = support["items"]["anyOf"].as_array().unwrap();
+            assert_eq!(
+                alternatives[0],
+                without[1]["inputSchema"]["properties"]["support"]["items"]
+            );
+            assert_eq!(alternatives[1]["required"], json!(["item"]));
+            let assertion_items = &schema["properties"]["assertion"]["properties"]["support_items"];
+            assert_eq!(assertion_items.is_null(), !remember.assert, "{remember:?}");
+            let description = with[1]["description"].as_str().unwrap();
+            assert!(
+                description.contains("cite items collected"),
+                "{description}"
+            );
+            assert!(description.starts_with("Deliberately record fleet memory"));
+        }
+        // Citing alone widens the record-only surface and nothing else.
+        let alone = remember_tool_for(citing(RememberSurface::RECORD_ONLY));
+        assert_eq!(
+            alone["inputSchema"]["properties"]["action"]["enum"],
+            json!(["record"])
+        );
+        assert!(
+            alone["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("Deliberately record fleet memory. A claim can cite")
+        );
+    }
+
+    #[test]
+    fn item_citation_schemas_mirror_the_server_input() {
+        use crate::ledger::{ClaimInput, SupportInputV1};
+        use crate::remember_runtime::RememberAssertInputV1;
+
+        let tool = remember_tool_for(citing(RememberSurface {
+            assert: true,
+            ..RememberSurface::RECORD_ONLY
+        }));
+        let properties = &tool["inputSchema"]["properties"];
+        let reference = &properties["support"]["items"]["anyOf"][1]["properties"]["item"];
+        let forms = reference["oneOf"].as_array().unwrap();
+        let id = "ab".repeat(32);
+        let examples = [
+            json!({ "item_id": id }),
+            json!({ "version_id": id }),
+            json!({ "url": "https://acme.slack.com/archives/C07PLATENG1/p1790006860001100" }),
+        ];
+        assert_eq!(forms.len(), examples.len());
+        for (form, example) in forms.iter().zip(&examples) {
+            // Each form declares exactly the one key it requires.
+            let key = example.as_object().unwrap().keys().next().unwrap();
+            assert_eq!(form["required"], json!([key]));
+            assert_eq!(form["additionalProperties"], json!(false));
+            let parsed: SupportInputV1 =
+                serde_json::from_value(json!({ "item": example, "relation": "supports" })).unwrap();
+            assert!(parsed.as_item().is_some());
+        }
+        // A record's support and an assertion's support_items both parse.
+        let record: ClaimInput = serde_json::from_value(json!({
+            "kind": "fact",
+            "text": "the heron retry budget is four",
+            "support": [
+                { "item": examples[0] },
+                { "source_config_id": "docs", "source": "markdown", "source_id": "a.md" }
+            ]
+        }))
+        .unwrap();
+        assert!(record.cites_items());
+        assert!(record.validate().is_ok());
+        let assertion = &properties["assertion"];
+        assert_eq!(
+            assertion["properties"]["support_items"]["items"],
+            reference.clone()
+        );
+        let parsed: RememberAssertInputV1 = serde_json::from_value(json!({
+            "kind": "decision",
+            "text": "remember(assert) is allowed at this commit in production.",
+            "modality": "attested",
+            "value": { "kind": "boolean", "value": true },
+            "subject": { "provider_repository_id": "908172635" },
+            "applicability": {},
+            "support_items": examples
+        }))
+        .unwrap();
+        assert_eq!(parsed.support_items.len(), 3);
+        // Without citations the assertion serializes as it always did.
+        let mut plain = parsed;
+        plain.support_items.clear();
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("support_items")
+                .is_none()
+        );
     }
 }

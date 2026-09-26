@@ -31,16 +31,18 @@ use crate::memory_contracts::collected_item::{
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::projectors::{CockroachRecallReader, EMBEDDING_DIMENSIONS, redact_for_recall};
 use crate::store::cockroach::{
-    DatabaseCapabilities, RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY, serialize_vector,
+    ClaimItemLinksCapability, DatabaseCapabilities, RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
+    serialize_vector,
 };
 
 use super::signals::{InjectionSignalV1, defang_markdown_images, injection_signals};
 use super::{
-    ITEM_RECALL_SCHEMA_VERSION, ITEM_SNIPPET_CHARS, ItemAuthorRefV1, ItemContainerRefV1, ItemGetV1,
-    ItemHitV1, ItemLinkInV1, ItemLinkOutV1, ItemPartRefV1, ItemPartTextV1, ItemProvenanceV1,
-    ItemReadinessV1, ItemRecall, ItemReferenceV1, ItemSearchRequestV1, ItemSearchV1, ItemSummaryV1,
-    ItemSuppressionV1, ItemVersionRecordV1, ItemVersionRefV1, MAX_ITEM_GET_ROWS,
-    MAX_ITEM_GET_TEXT_BYTES, MAX_ITEM_LINKS_IN, MAX_ITEM_SEARCH_LIMIT,
+    ITEM_RECALL_SCHEMA_VERSION, ITEM_SNIPPET_CHARS, ItemAuthorRefV1, ItemCitationV1,
+    ItemContainerRefV1, ItemGetV1, ItemHitV1, ItemLinkInV1, ItemLinkOutV1, ItemPartRefV1,
+    ItemPartTextV1, ItemProvenanceV1, ItemReadinessV1, ItemRecall, ItemReferenceV1,
+    ItemSearchRequestV1, ItemSearchV1, ItemSummaryV1, ItemSuppressionV1, ItemVersionRecordV1,
+    ItemVersionRefV1, MAX_ITEM_CITATIONS, MAX_ITEM_GET_ROWS, MAX_ITEM_GET_TEXT_BYTES,
+    MAX_ITEM_LINKS_IN, MAX_ITEM_SEARCH_LIMIT,
 };
 
 /// Every table item recall reads. The startup probe checks SELECT on each.
@@ -271,6 +273,20 @@ static LINKS_IN_SQL: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// The claims that cite item `$3` (`memory_claim_item_links_item_idx`): one
+/// row per citation, oldest first, one row past the bound (`$4`).
+const CITATIONS_SQL: &str = "SELECT link.claim_id, link.via, link.relation, \
+     link.version_key_digest, min(link.created_at) AS cited_at, claim.state AS claim_state \
+     FROM public.memory_claim_item_links_v1 AS link \
+     JOIN public.memory_claims AS claim \
+       ON claim.tenant_id = link.tenant_id AND claim.project = link.project \
+      AND claim.id = link.claim_id \
+     WHERE link.tenant_id = $1 AND link.project = $2 AND link.item_key_digest = $3 \
+     GROUP BY link.claim_id, link.link_id, link.via, link.relation, link.version_key_digest, \
+              claim.state \
+     ORDER BY cited_at, link.claim_id, link.link_id \
+     LIMIT $4";
+
 /// Proof that this login may read every item-recall table in one scope, and
 /// whether the dense lane is served there.
 ///
@@ -339,6 +355,9 @@ pub struct CockroachItemRecall {
     project: String,
     model_digest: Sha256Digest,
     dense_served: bool,
+    /// Whether `get` lists the claims that cite an item: set only from the
+    /// claim item links probe (migration 35, ADR 0008 D11).
+    claim_citations: bool,
     /// The projection readiness counts.
     reader: CockroachRecallReader,
 }
@@ -350,6 +369,7 @@ impl std::fmt::Debug for CockroachItemRecall {
             .field("tenant_id", &self.tenant_id)
             .field("project", &self.project)
             .field("dense_served", &self.dense_served)
+            .field("claim_citations", &self.claim_citations)
             .finish_non_exhaustive()
     }
 }
@@ -636,7 +656,47 @@ impl CockroachItemRecall {
             project,
             model_digest,
             dense_served,
+            claim_citations: false,
         }
+    }
+
+    /// List, in each `get`, the claims that cite the item (ADR 0008 D11), as
+    /// the claim item links probe found this login may read them.
+    #[must_use]
+    pub const fn with_claim_citations(mut self, _capability: ClaimItemLinksCapability) -> Self {
+        self.claim_citations = true;
+        self
+    }
+
+    /// The claims that cite `item`, when this reader lists them; and
+    /// whether more cite it than one answer lists.
+    async fn citations(&self, item: Sha256Digest) -> Result<(Option<Vec<ItemCitationV1>>, bool)> {
+        if !self.claim_citations {
+            return Ok((None, false));
+        }
+        let rows: Vec<PgRow> = sqlx::query(CITATIONS_SQL)
+            .bind(self.tenant_id)
+            .bind(&self.project)
+            .bind(item.as_bytes().as_slice())
+            .bind(listing_limit(MAX_ITEM_CITATIONS + 1))
+            .fetch_all(&self.pool)
+            .await?;
+        let truncated = rows.len() > MAX_ITEM_CITATIONS;
+        let citations = rows
+            .iter()
+            .take(MAX_ITEM_CITATIONS)
+            .map(|row| {
+                Ok(ItemCitationV1 {
+                    claim_id: row.try_get("claim_id")?,
+                    via: row.try_get("via")?,
+                    relation: row.try_get("relation")?,
+                    version_id: digest(row, "version_key_digest")?,
+                    claim_state: row.try_get("claim_state")?,
+                    cited_at: row.try_get("cited_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((Some(citations), truncated))
     }
 
     /// The live and snapshot collectors of `provider`, or of every provider,
@@ -1247,6 +1307,7 @@ impl ItemRecall for CockroachItemRecall {
             self.links_out(&current_parts).await?
         };
         let links_in = self.links_in(item, &provider_urls).await?;
+        let (cited_by, cited_by_truncated) = self.citations(item).await?;
         let first = current_parts[0];
         let mut records = records.into_iter();
         let current_record = records
@@ -1276,6 +1337,8 @@ impl ItemRecall for CockroachItemRecall {
             text_truncated: budget.exhausted,
             links_out,
             links_in,
+            cited_by,
+            cited_by_truncated,
         }))
     }
 }

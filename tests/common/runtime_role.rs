@@ -110,6 +110,12 @@ pub const COLLECTOR_RUNTIME_GRANTS: [(&str, &str); 3] = [
     ),
 ];
 
+/// The claim item links of the same policy (migration 35, ADR 0008 D11):
+/// append-only, as `record` and `assert` link the collected items a claim
+/// cites. Keep this in step with that file.
+pub const CLAIM_ITEM_LINK_RUNTIME_GRANTS: [(&str, &str); 1] =
+    [("SELECT, INSERT", "public.memory_claim_item_links_v1")];
+
 /// The sequences the same policy lets `fleet_runtime` draw claim, support,
 /// and conflict IDs from.
 pub const RUNTIME_SEQUENCES: &str = "public.memory_claim_id_seq, \
@@ -194,13 +200,15 @@ impl RuntimeProbeRole {
 
     /// Every block a `serve` writer's login holds under
     /// `deploy/cockroach/runtime-role-grants.sql`: [`Self::create_claim_writer`]
-    /// plus [`STAGE5_RUNTIME_GRANTS`] and [`COLLECTOR_RUNTIME_GRANTS`], what
-    /// agent capture stages, admits, and keeps its receipts with.
+    /// plus [`STAGE5_RUNTIME_GRANTS`], [`COLLECTOR_RUNTIME_GRANTS`], and
+    /// [`CLAIM_ITEM_LINK_RUNTIME_GRANTS`], what agent capture stages, admits,
+    /// and keeps its receipts with, and what a claim cites items with.
     pub async fn create_serve_writer(owner: &PgPool, database_url: &str) -> Self {
         let mut grants = owned(&RUNTIME_EVIDENCE_GRANTS);
         grants.extend(owned(&RUNTIME_CLAIM_GRANTS));
         grants.extend(owned(&STAGE5_RUNTIME_GRANTS));
         grants.extend(owned(&COLLECTOR_RUNTIME_GRANTS));
+        grants.extend(owned(&CLAIM_ITEM_LINK_RUNTIME_GRANTS));
         Self::create_with(owner, database_url, grants, true, false).await
     }
 

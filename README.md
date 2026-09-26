@@ -84,7 +84,7 @@ The `ostk-fleet-recall` binary has these commands:
   - `remember(capture)` relays items the calling agent read through its own
     connectors (a Slack thread, a Linear issue, a Granola note) into the
     collected-item sink as `reported` items it attests, so the fleet recalls
-    them with `recall(kind=item)` and a claim can cite their accepted events.
+    them with `recall(kind=item)` and a claim can cite them.
     The server decides who may read each item and redacts secrets. It is
     served only where `FLEET_RECALL_COLLECTED_CAPTURE` turns it on and its
     startup checks pass; elsewhere `tools/list` is unchanged and a capture is
@@ -92,6 +92,13 @@ The `ostk-fleet-recall` binary has these commands:
     `remember_capture` block. See
     [capturing items an agent read](#capturing-items-an-agent-read) and
     [ADR 0008 D10](docs/adr/0008-collected-items.md).
+  - A claim written by `record` or `assert` can cite the collected items it
+    rests on, by item id, version id, or provider URL; `recall(get)` shows a
+    claim's cited items and an item's citing claims. It is offered only where
+    `recall(kind=item)` is served and migration 35 and its grants are in
+    place; elsewhere every tool schema is unchanged. See
+    [citing collected items in a claim](#citing-collected-items-in-a-claim)
+    and [ADR 0008 D11](docs/adr/0008-collected-items.md).
   - `remember(retract)` retires a claim the calling agent authored. When no
     incompatible lifecycle-current pair remains on the claim's key, the
     detector closes that key's conflict and returns its disputed members to
@@ -562,6 +569,46 @@ The public demo withholds every asserted claim, its synthetic chunk, and its
 conflicts, because the predicate's publication default is denied. That is a
 property of the reviewed binary: the publication credential can still select
 those rows (see [security policy](docs/SECURITY.md)).
+
+## Citing collected items in a claim
+
+A claim can rest on the collected items it was drawn from
+([ADR 0008 D11](docs/adr/0008-collected-items.md)). `record`'s `support`
+takes an entry `{"item": {...}, "relation": "supports"}` beside its corpus
+snapshots, and `assert`'s `assertion.support_items` takes the same
+references: `{"item_id": ...}` or `{"url": "https://..."}` cite the item's
+current version and `{"version_id": ...}` exactly that version, at most 32 per
+claim, as `recall(kind=item)` and `remember(capture)` return them:
+
+```json
+{"action":"record","idempotency_key":"readme/record-cites/v1","kind":"fact","text":"The heron retry budget is four attempts.","subject":"heron","predicate":"retry-budget","value":4,"support":[{"item":{"url":"https://acme.slack.com/archives/C07PLATENG1/p1790006860001100"},"relation":"quotes"}]}
+```
+
+The server resolves each reference in the claim's own project to the
+accepted events of that version's parts: `assert` cites them among its
+accepted event's `support_evidence_event_ids`, and `record` writes a support
+row that names only a random link id (`source_config_id` `fleet.item`,
+`source` `item-link`). A reference that names nothing admitted is refused as
+`support_item_unknown`, an item staged but not yet admitted (a `stage_only`
+capture the worker has not drained) as `support_item_pending`, and one
+deleted or withdrawn as `support_item_withdrawn`; citing one version twice in
+a record is `support_item_duplicate`, and a writer that does not serve
+citations refuses them as `item_support_unavailable`. A refusal writes
+nothing and leaves the key unused.
+
+`recall(get, kind=claim)` then adds `support_items`: each cited item with its
+provider, ids, trust tier (`verified` or `reported`), whether the cited
+version is still current, and why it is hidden if it now is; and
+`independent_sources`, the number of distinct contents among the visible
+ones, so an echo or a cross-post counts once. `recall(get, kind=item)` adds
+`cited_by`, the claims that cite the item and their state. Supersede,
+retract, and resolve are unchanged, and a retired claim keeps its citations.
+The public demo drops the `fleet.item` support rows and cannot read which
+item a claim cites.
+
+`serve` offers citations only where `recall(kind=item)` is served and
+migration 35 and the runtime grants on `memory_claim_item_links_v1` are in
+place (probed once at startup); elsewhere every tool schema is what it was.
 
 ## Runbook: the event-first plane
 

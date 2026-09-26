@@ -59,7 +59,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::FleetError;
-use crate::ledger::{ClaimInput, ClaimKind, MAX_CLAIM_VALUE_SERIALIZED_BYTES, canonical_json};
+use crate::ledger::{
+    ClaimInput, ClaimKind, ItemRefV1, MAX_CLAIM_VALUE_SERIALIZED_BYTES, canonical_json,
+};
 use crate::memory_contracts::common::{
     AuthenticatedProjectScopeV1, CanonicalTimestamp, ContractId, RegistryReferenceV1,
 };
@@ -119,6 +121,15 @@ pub struct RememberAssertInputV1 {
     pub effective_until: Option<DateTime<Utc>>,
     #[serde(default)]
     pub support_evidence_event_ids: Vec<AcceptedEventId>,
+    /// Collected items the claim cites (ADR 0008 D11), at most
+    /// [`crate::ledger::MAX_SUPPORT_ITEMS`]. The claim ledger resolves each,
+    /// in this scope, to the accepted evidence events of the item's presented
+    /// version (or of the exact version named) and merges them into
+    /// `support_evidence_event_ids` before admission, so the admitted
+    /// statement cites events only. Omitted from JSON when empty, so every
+    /// assertion without it, and every receipt it binds, keeps its bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub support_items: Vec<ItemRefV1>,
 }
 
 const fn affirms() -> ClaimPolarityV2 {
@@ -532,6 +543,15 @@ pub fn admit_remember_assertion(
     }
     let rederived = rederive(route, scope, input)?;
     check_claim_shape(route, input)?;
+    if !input.support_items.is_empty() {
+        // The claim ledger resolves cited items to their events in its scope
+        // and merges them into the event ids first; admission never drops a
+        // citation it cannot see.
+        return Err(RememberAdmissionRefusal::new(
+            RememberAdmissionRefusalReason::SupportInvalid,
+            "support_items must be resolved to support evidence event IDs before admission",
+        ));
+    }
     let support_evidence_event_ids = admit_support(route, &input.support_evidence_event_ids)?;
     let now = truncate_to_microseconds(now)?;
     let effective_interval = admit_interval(&admission.effective_interval_rule, input, &now)?;

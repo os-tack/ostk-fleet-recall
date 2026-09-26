@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use crate::context::FleetScope;
 use crate::evidence_recall::EvidenceDenseLaneV1;
 use crate::memory_contracts::digest::Sha256Digest;
-use crate::store::cockroach::DatabaseCapabilities;
+use crate::store::cockroach::{ClaimItemLinksCapability, DatabaseCapabilities};
 
 use super::{CockroachItemRecall, ItemRecall, probe_item_recall};
 
@@ -39,6 +39,19 @@ pub async fn start_item_recall(
     scope: &FleetScope,
     embedding_model_sha256: &str,
 ) -> Option<Arc<dyn ItemRecall>> {
+    start_item_recall_citing(pool, capabilities, scope, embedding_model_sha256, None).await
+}
+
+/// [`start_item_recall`], whose `get` also lists the claims that cite an item
+/// when `claim_links` holds: the claim item links probe (migration 35, ADR
+/// 0008 D11) passed for this login.
+pub async fn start_item_recall_citing(
+    pool: &PgPool,
+    capabilities: &DatabaseCapabilities,
+    scope: &FleetScope,
+    embedding_model_sha256: &str,
+    claim_links: Option<ClaimItemLinksCapability>,
+) -> Option<Arc<dyn ItemRecall>> {
     let Ok(model_digest) = Sha256Digest::from_str(embedding_model_sha256) else {
         tracing::error!(
             "item recall is off: the embedding model digest is not a lowercase 64-character hex digest"
@@ -53,7 +66,11 @@ pub async fn start_item_recall(
                 );
             }
             tracing::info!("serving recall(kind=item)");
-            Some(Arc::new(CockroachItemRecall::new(capability, pool.clone())))
+            let mut items = CockroachItemRecall::new(capability, pool.clone());
+            if let Some(claim_links) = claim_links {
+                items = items.with_claim_citations(claim_links);
+            }
+            Some(Arc::new(items))
         }
         Ok(None) => {
             tracing::info!(

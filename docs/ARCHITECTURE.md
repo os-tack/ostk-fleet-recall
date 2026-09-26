@@ -24,7 +24,8 @@ collectors (a documents directory so far) and drains collected items, which
 ([ADR 0008](adr/0008-collected-items.md)); `ostk-fleet-recall collect
 import` imports a file of items as a snapshot of one provider scope, and
 `remember(capture)` relays items an agent read through its own connectors
-into the same sink. The private
+into the same sink; a claim cites the items it rests on through private
+claim item links. The private
 `ostk-spec` CLI checks commits against normative spec statements, and
 `recall(discrepancies)` lists what it finds
 ([ADR 0007](adr/0007-spec-conformance-chain.md)). The README's
@@ -210,12 +211,13 @@ floors:
   `remember(assert)` needs nothing later: its evidence plane and authority
   view are migration 18's.
 - The memory worker and `recall(kind=evidence)` require migration 30,
-  `recall(discrepancies)` requires 31, and `recall(kind=item)` and
-  `remember(capture)` require 34.
+  `recall(discrepancies)` requires 31, `recall(kind=item)` and
+  `remember(capture)` require 34, and claims that cite collected items
+  require 35.
   `serve` probes each at startup and
   serves it only when the schema and the login's grants allow, so every other
   surface still runs on a prefix through 18. The runtime policy that grants
-  all of this requires the complete prefix 1–31.
+  all of this requires the complete prefix 1–35.
 
 Later additive rows cannot compensate for a missing or failed row inside a
 required prefix. Migrations 15 through 17 do not add successor tables: they
@@ -416,6 +418,30 @@ in its own append, `stage_only` leaves them to the worker, and the response
 is finalized once with each item's ids, events, and disposition. A retry of
 a capture that stopped after staging drains and finalizes it. The receipt
 holds the request's digest and never the text.
+
+### Claims that cite collected items
+
+A claim rests on the items it was drawn from
+([ADR 0008 D11](adr/0008-collected-items.md)): `remember(assert)`'s
+`assertion.support_items` and a `record` (or `supersede` successor) support
+entry `{item, relation}` name an item by `item_id` or provider `url` (its
+presented version) or one `version_id`. The claim ledger resolves each in the
+claim's own scope to one admitted part per ordinal of that version, and
+refuses one that is unknown, still pending, or hidden
+(`support_item_unknown`, `support_item_pending`, `support_item_withdrawn`),
+writing nothing. `assert` resolves before admission and merges the parts'
+events into `support_evidence_event_ids`, so the accepted statement cites
+events only, and checks again in its append transaction that no cited item
+was hidden since; `record` resolves inside its own transaction. Each cited
+part gets a row in the private, append-only `memory_claim_item_links_v1`
+(migration 35); a record citation also writes an opaque `memory_claim_support`
+row (`fleet.item`, `item-link`, a random link id) that says nothing about the
+item. The private `recall(get, kind=claim)` expands the citations with their
+trust tier and currency and counts distinct content once
+(`independent_sources`), `recall(get, kind=item)` lists the citing claims,
+and the publication reader drops the opaque rows and cannot read the links.
+`serve` offers citations only where migration 35 and its grants probe and
+`recall(kind=item)` is served; elsewhere every schema is unchanged.
 
 ### Spec discrepancies
 
@@ -750,7 +776,8 @@ publication default is denied.
   covering claims, chunks, and, on the private writer, conflicts, evidence,
   and items; `assert` needs verified writer-authority pins, `acknowledge` and
   `resolve` the migration-29 lifecycle log, `kind=evidence` migration 30,
-  `discrepancies` migration 31, and `kind=item` migration 34),
+  `discrepancies` migration 31, `kind=item` migration 34, and item citations
+  migration 35),
   `remember(dismiss|waive)` is served
   where the deployment enables adjudication, and the others return an error.
   In [ADR 0004](adr/0004-serving-conflict-lifecycle.md)'s lifecycle, `record`

@@ -21,6 +21,7 @@ use super::conflict_store::{
     self, LifecycleEventDraft, acknowledge_request, append_close_event, dismiss_request,
     excluded_dismissed_pairs, resolve_request, waive_request,
 };
+use super::item_links::item_support_unavailable;
 use super::{
     ClaimPassage, CockroachClaimLedger, MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON, MAX_LEDGER_RESULTS,
     claim_recorded_event_payload, detect_and_observe, fetch_claim, hydrate_conflicts,
@@ -40,7 +41,7 @@ use crate::ledger::{
     FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LifecycleMutation, LifecycleReplayRequest,
     SupersededClaim,
 };
-use crate::store::cockroach::with_serializable_retry;
+use crate::store::cockroach::{ClaimItemLinksCapability, with_serializable_retry};
 use crate::{FleetError, FleetScope, Result};
 
 const RETRACT_OPERATION: &str = "retract";
@@ -546,6 +547,8 @@ struct SupersedeWrite {
     key: String,
     request: Value,
     log_closes: bool,
+    /// Lets the successor's support cite collected items (ADR 0008 D11).
+    item_links: Option<ClaimItemLinksCapability>,
 }
 
 pub(super) async fn supersede_claim(
@@ -588,6 +591,11 @@ pub(super) async fn supersede_claim(
     {
         return decode_receipt_parts(&row, scope, SUPERSEDE_OPERATION, &request);
     }
+    // A committed citation replays above; a new one needs claim item links
+    // (ADR 0008 D11).
+    if successor.cites_items() && ledger.claim_item_links.is_none() {
+        return Err(item_support_unavailable());
+    }
     let passages = ledger.embed_claim_passages(scope, successor, &prepared)?;
     let write = Arc::new(SupersedeWrite {
         target,
@@ -599,6 +607,7 @@ pub(super) async fn supersede_claim(
         key: key.to_owned(),
         request,
         log_closes: ledger.serves_conflict_lifecycle(),
+        item_links: ledger.claim_item_links,
     });
     let scope = scope.clone();
     with_serializable_retry(&ledger.pool, ledger.retry_policy, move |transaction| {
@@ -625,6 +634,7 @@ async fn supersede_once(
         key,
         request,
         log_closes,
+        item_links,
     } = write;
     let (target, reason, key) = (*target, reason.as_deref(), key.as_str());
 
@@ -670,6 +680,7 @@ async fn supersede_once(
         model,
         json!({ "idempotency_key": key, "supersedes": predecessor.id }),
         None,
+        *item_links,
     )
     .await?;
     let (conflicts_opened, detection) =

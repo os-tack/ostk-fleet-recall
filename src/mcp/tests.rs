@@ -761,6 +761,7 @@ async fn conflict_lifecycle_surface_advertises_and_routes_acknowledge_and_resolv
             adjudication: false,
             assert: false,
             capture: false,
+            item_support: false,
         },
         ..FakeService::default()
     });
@@ -834,6 +835,7 @@ async fn adjudication_surface_advertises_and_routes_dismiss_and_waive() {
             adjudication: true,
             assert: false,
             capture: false,
+            item_support: false,
         },
         ..FakeService::default()
     });

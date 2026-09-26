@@ -8,18 +8,23 @@
 //! 1. replays a receipt already committed under its idempotency key;
 //! 2. re-verifies the pinned writer authority
 //!    ([`WriterAuthorityRuntime::verify`](crate::registry_witness::WriterAuthorityRuntime::verify));
-//! 3. routes and admits the assertion against the package that head
+//! 3. resolves the collected items the assertion cites (`support_items`,
+//!    ADR 0008 D11) in this scope and merges their parts' events into its
+//!    support event IDs;
+//! 4. routes and admits the assertion against the package that head
 //!    activates ([`admit_remember_assertion`]), with the server clock;
-//! 4. embeds the claim passages, so no model call holds a SQL lock.
+//! 5. embeds the claim passages, so no model call holds a SQL lock.
 //!
 //! Then ONE serializable transaction, the accepted-event append, re-reads the
 //! head, inserts the `memory.claim.accepted` event, and runs
 //! [`ClaimAssertProjection`], which in that same transaction:
 //!
-//! 1. re-audits every support event ID against this scope's ledger;
+//! 1. re-audits every support event ID against this scope's ledger, and
+//!    refuses a cited item hidden since it was resolved;
 //! 2. reserves the idempotency receipt, naming the event;
 //! 3. checks the active embedding model;
-//! 4. writes the claim projection `record` writes, plus the event's ID;
+//! 4. writes the claim projection `record` writes, plus the event's ID, and
+//!    one private link per cited item part;
 //! 5. runs the unchanged functional-value conflict detector;
 //! 6. writes the `claim_recorded` audit event, naming the event;
 //! 7. completes the receipt with the committed response.
@@ -61,6 +66,10 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
 
+use super::item_links::{
+    CitationV1, ResolvedItemV1, audit_cited_items, insert_assert_links, item_support_unavailable,
+    resolve_citations,
+};
 use super::lifecycle_store::{Replayable, bounded_ids};
 use super::{
     ClaimPassage, CockroachClaimLedger, MAX_IDEMPOTENCY_KEY_BYTES, claim_recorded_event_payload,
@@ -75,7 +84,7 @@ use crate::ledger::lifecycle::OPERATOR_ASSERTED_ORIGIN;
 use crate::ledger::types::PreparedClaim;
 use crate::ledger::{
     AcceptedEventRefV1, AssertedClaimMutation, ClaimInput, ClaimMutation, LifecycleRefusal,
-    RefusalCode, assert_unavailable, canonical_json,
+    MAX_SUPPORT_ITEMS, RefusalCode, assert_unavailable, canonical_json,
 };
 use crate::memory_contracts::common::CanonicalTimestamp;
 use crate::memory_contracts::digest::Sha256Digest;
@@ -144,6 +153,9 @@ pub(super) async fn assert_claim(
     {
         return Ok(replayed);
     }
+    if !input.support_items.is_empty() && ledger.claim_item_links.is_none() {
+        return Err(item_support_unavailable());
+    }
 
     let verified = assert
         .authority()
@@ -158,13 +170,16 @@ pub(super) async fn assert_claim(
             json!({}),
         )
     })?;
+    // Cited items resolve to their events before admission, so the admitted
+    // statement cites events only; the append transaction audits them again.
+    let (cited_items, resolved_input) = resolve_support_items(ledger, scope, input).await?;
     let admitted = admit_remember_assertion(
         &route,
         package,
         verified.head_binding(),
         assert.authority().semantic_scope(),
         assert.actor(),
-        input,
+        resolved_input.as_ref().unwrap_or(input),
         Utc::now(),
     )
     .map_err(admission_refused)?;
@@ -190,6 +205,7 @@ pub(super) async fn assert_claim(
             .statement()
             .support_evidence_event_ids
             .clone(),
+        cited_items,
         outcome: Mutex::new(None),
     });
     let appended = assert
@@ -213,6 +229,62 @@ pub(super) async fn assert_claim(
         }
         AppendResolution::Fail(error) => Err(error),
     }
+}
+
+/// Resolve the assertion's `support_items` in this ledger's scope (ADR 0008
+/// D11): the cited items, and the assertion with their events merged into
+/// `support_evidence_event_ids` (sorted, without duplicates) and the items
+/// removed, which is what admission takes. `None` when it cites no item.
+async fn resolve_support_items(
+    ledger: &CockroachClaimLedger,
+    scope: &FleetScope,
+    input: &RememberAssertInputV1,
+) -> Result<(Vec<ResolvedItemV1>, Option<RememberAssertInputV1>)> {
+    if input.support_items.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let support_invalid = |message: String| {
+        refusal(
+            RefusalCode::AssertionNotAdmitted,
+            message,
+            json!({ "reason": RememberAdmissionRefusalReason::SupportInvalid.as_str() }),
+        )
+    };
+    if input.support_items.len() > MAX_SUPPORT_ITEMS {
+        return Err(support_invalid(format!(
+            "at most {MAX_SUPPORT_ITEMS} support_items are admitted"
+        )));
+    }
+    for (index, reference) in input.support_items.iter().enumerate() {
+        reference.validate().map_err(|error| {
+            support_invalid(match error {
+                FleetError::Memory(message) => format!("support_items[{index}]: {message}"),
+                other => format!("support_items[{index}]: {other}"),
+            })
+        })?;
+    }
+    let fields: Vec<String> = (0..input.support_items.len())
+        .map(|index| format!("support_items[{index}]"))
+        .collect();
+    let citations: Vec<CitationV1<'_>> = fields
+        .iter()
+        .zip(&input.support_items)
+        .map(|(field, reference)| CitationV1 { field, reference })
+        .collect();
+    let mut connection = ledger.pool.acquire().await?;
+    let cited = resolve_citations(&mut connection, scope, &citations).await?;
+    drop(connection);
+    let mut resolved = input.clone();
+    resolved.support_evidence_event_ids = input
+        .support_evidence_event_ids
+        .iter()
+        .copied()
+        .chain(cited.iter().flat_map(ResolvedItemV1::event_ids))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    resolved.support_items.clear();
+    Ok((cited, Some(resolved)))
 }
 
 /// The canonical request a receipt binds: the trusted scope attribution and
@@ -388,6 +460,9 @@ struct ClaimAssertProjection {
     model: String,
     accepted_event_id: AcceptedEventId,
     support_event_ids: Vec<AcceptedEventId>,
+    /// The collected items the assertion cites, resolved before admission;
+    /// their events are among `support_event_ids`.
+    cited_items: Vec<ResolvedItemV1>,
     outcome: Mutex<Option<ProjectionOutcome>>,
 }
 
@@ -419,8 +494,10 @@ impl ClaimAssertProjection {
         let event_id = context.accepted_event_id;
         let event_bytes = digest_bytes(event_id.digest());
 
-        // 1. Every support event must already be accepted in this scope.
+        // 1. Every support event must already be accepted in this scope, and
+        //    no cited item may have been hidden since it was resolved.
         self.audit_support(transaction).await?;
+        audit_cited_items(transaction, scope, &self.cited_items).await?;
 
         // 2. Reserve the key. A conflict means another transaction holds it.
         let reserved = sqlx::query_scalar::<_, String>(RESERVE_ASSERT_RECEIPT_SQL)
@@ -446,6 +523,15 @@ impl ClaimAssertProjection {
             &self.model,
             json!({ "idempotency_key": self.key, "accepted_event_id": event_id }),
             Some(&event_bytes),
+            None,
+        )
+        .await?;
+        insert_assert_links(
+            transaction,
+            scope,
+            claim.id,
+            event_id.digest(),
+            &self.cited_items,
         )
         .await?;
         let (conflicts_opened, conflict_detection) =
