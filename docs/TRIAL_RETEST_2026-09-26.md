@@ -221,3 +221,44 @@ stale count. 859 rows re-embedded on the stack.
 **Still open from this list:** issues 3 (any-term lexical ranking), 4
 (thread context), 5 (evidence `source` filter, default kind hint: Q17 and
 Q20 unchanged), 6 for worker-ingested lag, and the smaller observations.
+
+## Final round, 2026-09-26: what agents asked for
+
+Three agents argued as users of the product (a coding agent, a fleet
+coordinator, an after-the-fact auditor) over what remained, with the
+framing that memory is best effort with evidence: an audit trail of what
+was recorded and when, with controls to supersede it. Everything at least
+two of them asked for landed on `main` after `ae6d2e4`, in three streams
+merged at `891b1ff` (items), `16060f7` (recall answers), `6b445dd`
+(ledger), plus `4424a40` and `4321e69`.
+
+| Ask | Change | Re-measured on the stack |
+| --- | --- | --- |
+| A verdict an agent cannot misread | A dense-only neighbour between 0.30 and 0.45 makes the verdict `unknown` with `dense_neighbour_below_bound` and `strongest_hit` names the candidate; the text summary carries the verdict; descriptions say what to do | Q5 and Q10 natural read `unknown`, `strongest_hit: 0`; GDPR and tokio `unknown`; Helm and the off-topic probes `absent` |
+| Find what I recorded by its key | `recall(get, kind=claim, key=…)` or `subject`+`predicate`; `recall(conflicts, claim_key=…)` | `final-round::batch-size` returns the chain with values, actors and states |
+| Do not let me dispute myself | `record` on a key the same agent already holds a current claim on is refused with `own_current_claim_on_key`, naming the claim and revision to supersede | Refused as designed; `supersede` accepted |
+| Show me who did what, when | `get` by id serves `history` (recorded, disputed, retracted, superseded, with actor, reason, note, successor) and `supersedes` on a successor | Both ends of the supersede show the chain. Needed a policy fix: the runtime role had only INSERT on the claim log (`4321e69`) |
+| Claim hits without a silent null | Values up to 2,000 bytes carried; `value_elided`, `support_elided`, `revision`, `actor` on every hit | Q18 hits carry `single dedicated migrator` |
+| Tell me which kind to search | `kind` described with a default; an empty chunk answer warns `other_kinds_available` and the summary says `try kind=item or kind=evidence` | Q20 carries the hint |
+| Evidence by source | `source: git \| items \| sessions` on `kind=evidence`, verdict scoped with it | Q8 and Q17 with `source: git` return commits only |
+| Lag that names its cause | `lag_by_kind {items, other}` on readiness; a provider-filtered item search counts only that provider's pending events | An ingest-only commit lags an unfiltered search, not `source: slack` |
+| Cited items that say they are contested | `cited_by {claims, disputed, claim_ids}` on item hits; citations carry `uri` and `content_digests`; `get` accepts a version id | The FR-131 item shows `cited_by.claims: 1` |
+| Redaction I can see | `redaction_profile` on provenance and hits; `redacted_at_read` on any text the read pass changed | Provenance on the stack reads profile 2 for pre-fix items, 3 for new ones |
+| A reply's root in one call | `thread_root_item_id` on hits, `thread.root` on `get` | Resolves on the trial's Slack replies |
+| Status I can act on | `conflicts {open, acknowledged, waived, oldest_open_at}`, `legacy_claim_keys {count, sample}`, `quarantine {by_reason, sample}`, `absence_contract` | Open 2, legacy 0, ten preimage disagreements from the redaction re-walk, the contract as written |
+| Public surface honesty | The demo hides retracted and superseded claims | Only claim 5 is served for the Granola query; 6 and 10 are hidden |
+| Small fixes | The transcript clock refusal names the turn and clocks; the dogfood commit bound is 2,000 | |
+
+**Decided against, with reasons.** Any-term lexical ranking (CockroachDB
+26.2 has no `ts_rank_cd`, "decide" and "decision" stem apart so it would
+not fix its own example, and one shared word would flip the lexical-anchored
+verdict); readable git snippets (another normalization bump; the auditor
+prefers the raw fact); display names and export permalinks (deliberate);
+replies listed on `get` (needs an index).
+
+**Next steps.** `recall(brief, subject)` composing current claims, open
+conflicts and source health in one call; replies on `get` behind an index
+on `thread_root_external_id`; the at-rest supersession pass that rewrites
+pre-profile-3 bodies, for which `redacted_at_read` and the quarantine
+sample are now the worklist; scoping worker-ingested lag per kind on
+evidence searches.
