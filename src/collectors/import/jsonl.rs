@@ -32,6 +32,7 @@ use std::io::{self, BufRead};
 use sha2::{Digest as _, Sha256};
 
 use crate::collectors::audience::ProviderAudienceV1;
+pub use crate::collectors::audience::is_direct_container_kind;
 use crate::collectors::binding::CollectorInstanceV1;
 use crate::collectors::draft::{CollectedItemDraftV1, has_hidden_scalar};
 use crate::collectors::redaction::scan_collected_secrets;
@@ -54,9 +55,6 @@ pub const MAX_IMPORT_LINES: u64 = 100_000;
 /// The diagnostic of a line that names another provider scope.
 pub const PROVIDER_SCOPE_MISMATCH: &str =
     "provider_scope_mismatch: the item's provider scope is not the collector instance's";
-
-/// Last container-kind segments that name a direct conversation.
-const DIRECT_CONTAINER_SEGMENTS: [&str; 5] = ["im", "mpim", "dm", "group_dm", "direct_message"];
 
 /// One line of an import file.
 #[derive(Clone, PartialEq, Eq)]
@@ -190,15 +188,6 @@ impl<R: BufRead> LineReader<R> {
 #[must_use]
 pub fn line_digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::from_bytes(Sha256::digest(bytes).into())
-}
-
-/// Whether a container kind names a direct conversation.
-#[must_use]
-pub fn is_direct_container_kind(kind: &ContainerKindV1) -> bool {
-    kind.as_str()
-        .rsplit('.')
-        .next()
-        .is_some_and(|segment| DIRECT_CONTAINER_SEGMENTS.contains(&segment))
 }
 
 /// One item line, ready to stage.

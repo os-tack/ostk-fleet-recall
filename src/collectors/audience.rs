@@ -17,6 +17,12 @@
 //! | an operator-scoped source (documents root, Granola key, import) | `operator_declared` only when the instance declares it, else refused |
 //! | an agent capture | `verified_container` when a verified collector or an operator import recorded the container as readable, else `operator_capture_scope` when the operator listed the scope, else refused |
 //!
+//! A container whose kind names a direct conversation
+//! ([`is_direct_container_kind`]: `slack.im`, `slack.mpim`, ...) is a direct
+//! message whatever channel the item arrives through: the sink derives that
+//! audience from the kind before it classifies, so no capture scope, operator
+//! declaration, or recorded container admits one.
+//!
 //! A visibility hint from an importer or an agent can only narrow: `private`
 //! and `dm` refuse the item, and no hint admits anything the server would
 //! refuse. A container the memory has recorded as withdrawn refuses a capture
@@ -25,8 +31,22 @@
 //! collector withdrew; see [`super::withdrawal`]).
 
 use crate::memory_contracts::collected_item::{
-    AudienceBasisV1, CollectionModeV1, VisibilityHintV1,
+    AudienceBasisV1, CollectionModeV1, ContainerKindV1, VisibilityHintV1,
 };
+
+/// Last container-kind segments that name a direct conversation.
+const DIRECT_CONTAINER_SEGMENTS: [&str; 5] = ["im", "mpim", "dm", "group_dm", "direct_message"];
+
+/// Whether a container kind names a direct or group-direct conversation
+/// (`slack.im`, `slack.mpim`, `teams.group_dm`, `x.dm`): its last segment
+/// says so, whatever channel the item arrives through.
+#[must_use]
+pub fn is_direct_container_kind(kind: &ContainerKindV1) -> bool {
+    kind.as_str()
+        .rsplit('.')
+        .next()
+        .is_some_and(|segment| DIRECT_CONTAINER_SEGMENTS.contains(&segment))
+}
 
 /// What a collector learned from the provider about the item's container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,7 +298,19 @@ fn classify_import(input: &AudienceInputV1<'_>) -> AudienceDecisionV1 {
 
 /// Capture: never the agent's word. A container recorded readable by a
 /// verified collector or an operator import, else an operator capture scope.
+/// A direct or externally shared container is refused first: no capture
+/// scope, not even `"*"`, admits one. Any other provider audience is ignored,
+/// since nothing a capture carries may widen what the server decides.
 fn classify_capture(input: &AudienceInputV1<'_>) -> AudienceDecisionV1 {
+    match input.provider_audience {
+        Some(ProviderAudienceV1::DirectMessage) => {
+            return AudienceDecisionV1::Refuse(AudienceRefusalV1::DirectMessage);
+        }
+        Some(ProviderAudienceV1::ExternallyShared) => {
+            return AudienceDecisionV1::Refuse(AudienceRefusalV1::ExternallyShared);
+        }
+        _ => {}
+    }
     match input.known_container {
         KnownContainerV1::Withdrawn => {
             AudienceDecisionV1::Refuse(AudienceRefusalV1::ContainerWithdrawn)
@@ -347,6 +379,69 @@ mod tests {
                 refused(classify(&item)),
                 AudienceRefusalV1::ExternallyShared
             );
+        }
+    }
+
+    #[test]
+    fn a_direct_capture_is_refused_whatever_scope_or_container_admits_it() {
+        let policy = AudiencePolicyV1::default();
+        let everything = [CaptureScopeV1 {
+            provider: "slack".into(),
+            provider_scope_id: "T07ACME0001".into(),
+            containers: CaptureContainersV1::All,
+        }];
+        for (audience, reason) in [
+            (
+                ProviderAudienceV1::DirectMessage,
+                AudienceRefusalV1::DirectMessage,
+            ),
+            (
+                ProviderAudienceV1::ExternallyShared,
+                AudienceRefusalV1::ExternallyShared,
+            ),
+        ] {
+            for known in [
+                KnownContainerV1::Unknown,
+                KnownContainerV1::Readable(AudienceBasisV1::ProviderPublic),
+            ] {
+                let mut item = input(CollectionModeV1::Capture, &policy, &everything);
+                item.provider_audience = Some(audience);
+                item.known_container = known;
+                assert_eq!(refused(classify(&item)), reason);
+            }
+        }
+        // A provider audience never widens a capture.
+        let mut item = input(CollectionModeV1::Capture, &policy, &[]);
+        item.provider_audience = Some(ProviderAudienceV1::ScopePublic);
+        assert_eq!(
+            refused(classify(&item)),
+            AudienceRefusalV1::CaptureUnverified
+        );
+    }
+
+    #[test]
+    fn a_direct_conversation_kind_is_recognized_by_its_last_segment() {
+        for kind in [
+            "slack.im",
+            "slack.mpim",
+            "teams.group_dm",
+            "x.dm",
+            "y.direct_message",
+        ] {
+            assert!(is_direct_container_kind(
+                &ContainerKindV1::new(kind).unwrap()
+            ));
+        }
+        for kind in [
+            "slack.channel",
+            "linear.team",
+            "docs.root",
+            "slack.image",
+            "im.channel",
+        ] {
+            assert!(!is_direct_container_kind(
+                &ContainerKindV1::new(kind).unwrap()
+            ));
         }
     }
 

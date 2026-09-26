@@ -27,9 +27,12 @@
 //! admitted only into a container a verified collector or an operator import
 //! recorded as visible to the project (`verified_container`), or into a scope
 //! the operator lists in `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES`
-//! (`operator_capture_scope`); a withdrawn container refuses it; and the
-//! agent's `visibility` can only narrow: `private` and `dm` withhold the item.
-//! A capture neither records, withdraws, nor lifts anything.
+//! (`operator_capture_scope`); a withdrawn container refuses it; a container
+//! whose kind names a direct conversation (`slack.im`, `slack.mpim`, ...) is
+//! refused as `direct_message` whatever scope the operator listed, even
+//! `"*"`; and the agent's `visibility` can only narrow: `private` and `dm`
+//! withhold the item. A capture neither records, withdraws, nor lifts
+//! anything.
 //!
 //! # One capture
 //!
@@ -950,6 +953,8 @@ impl CockroachCapture {
                 .iter()
                 .map(|index| StageDraftV1 {
                     draft: prepared.items[*index].draft.clone(),
+                    // Never the agent's word: the sink derives a direct
+                    // conversation's audience from the container kind.
                     provider_audience: None,
                     delivery_id: prepared.items[*index].delivery_id.clone(),
                 })

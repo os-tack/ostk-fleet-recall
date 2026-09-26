@@ -29,7 +29,10 @@
 //! row rebuilds a byte-identical candidate and replays rather than minting a
 //! second event. An item whose provider clock is ahead of the observation is
 //! not staged (`clock_ahead`), and the page's cursor advances are not applied,
-//! so the next read sees it again.
+//! so the next read sees it again. A capture's or an import's order is the
+//! caller's word, not the provider's, so one ahead of the observation is
+//! refused the same way: a head only moves to a greater order, and a
+//! far-future one would otherwise stay presented for good.
 //!
 //! # Drain outcomes
 //!
@@ -77,7 +80,7 @@ use crate::evidence_ledger::{
 use crate::memory_contracts::collected_item::{
     AudienceBasisV1, BoundedTextV1, CollectedItemEnvelopeV1, CollectionModeV1, ContainerKindV1,
     ItemCollectionV1, ItemLifecycleV1, ItemRedactionV1, MAX_LABEL_BYTES, ProviderKindV1,
-    TrustTierV1, derive_container_key, derive_item_key,
+    TrustTierV1, derive_container_key, derive_item_key, timestamp_micros,
 };
 use crate::memory_contracts::common::{CanonicalTimestamp, ContractId};
 use crate::memory_contracts::digest::{Sha256Digest, body_digest};
@@ -88,7 +91,7 @@ use crate::store::cockroach::{RetryPolicy, with_serializable_retry};
 
 use super::audience::{
     AudienceDecisionV1, AudienceInputV1, AudiencePolicyV1, AudienceRefusalV1, CaptureScopeV1,
-    KnownContainerV1, ProviderAudienceV1, classify,
+    KnownContainerV1, ProviderAudienceV1, classify, is_direct_container_kind,
 };
 use super::binding::{
     CollectedConnectorBindingV1, CollectedIngressV1, CollectedRowClocksV1, CollectorInstanceV1,
@@ -1595,14 +1598,26 @@ impl StageJob {
             Some(key) => known_container(transaction, self.tenant_id, &self.project, key).await?,
             None => KnownContainerV1::Unknown,
         };
-        let provider_audience = staged.provider_audience.or_else(|| {
-            draft.container.as_ref().and_then(|container| {
-                self.containers
-                    .iter()
-                    .find(|observed| observed.kind == container.kind && observed.id == container.id)
-                    .map(|observed| observed.provider_audience)
+        // A direct conversation is one by its kind, whatever the channel or
+        // the caller said: no scope, declaration, or record admits it.
+        let direct = draft
+            .container
+            .as_ref()
+            .is_some_and(|container| is_direct_container_kind(&container.kind));
+        let provider_audience = if direct {
+            Some(ProviderAudienceV1::DirectMessage)
+        } else {
+            staged.provider_audience.or_else(|| {
+                draft.container.as_ref().and_then(|container| {
+                    self.containers
+                        .iter()
+                        .find(|observed| {
+                            observed.kind == container.kind && observed.id == container.id
+                        })
+                        .map(|observed| observed.provider_audience)
+                })
             })
-        });
+        };
         let decision = classify(&AudienceInputV1 {
             mode: self.mode,
             provider: draft.provider.as_str(),
@@ -1655,6 +1670,26 @@ impl StageJob {
                     .await;
             }
         };
+        // A reported order is the agent's or the importer's word, and the head
+        // only ever moves to a greater one: an order ahead of the observation
+        // would present that version for good. It is refused as the provider
+        // clock is, never clamped.
+        if self.mode.trust_tier() == TrustTierV1::Reported
+            && sealed.provider_order > observed_micros(observed_at)?
+        {
+            return self
+                .dead_letter(
+                    transaction,
+                    staged,
+                    letter(
+                        DeadLetterReasonV1::ClockAhead,
+                        "the reported order is ahead of the observation",
+                        sealed.parts.first().map(|part| part.stage_id),
+                    ),
+                    now,
+                )
+                .await;
+        }
         for part in &sealed.parts {
             let refusal = if part.envelope.occurred_at(observed_at) > *observed_at {
                 Some((
@@ -1868,6 +1903,12 @@ fn parse_timestamp(value: &CanonicalTimestamp) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value.as_str())
         .ok()
         .map(|parsed| parsed.with_timezone(&Utc))
+}
+
+/// The staging clock in microseconds, on the provider order's axis.
+fn observed_micros(observed_at: &CanonicalTimestamp) -> Result<u64> {
+    timestamp_micros(observed_at)
+        .map_err(|error| FleetError::Memory(format!("the staging clock has no order: {error}")))
 }
 
 // ---------------------------------------------------------------------------

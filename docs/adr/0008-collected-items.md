@@ -268,8 +268,11 @@ first:
    one canonical envelope and stage id per part; a refusal is a
    `validation_failed`, `oversize`, or `redaction_withheld` dead letter); an
    item whose provider clock is ahead of the observation is a `clock_ahead` dead
-   letter; and each part is inserted with `ON CONFLICT DO NOTHING` on its stage
-   id, so re-reading an unchanged item stages nothing.
+   letter, and so is a capture or an import whose order (the caller's word,
+   an explicit `version.order_micros` included) is ahead of it, since a head
+   only moves to a greater order and a far-future one would stay presented
+   for good; and each part is inserted with `ON CONFLICT DO NOTHING` on its
+   stage id, so re-reading an unchanged item stages nothing.
 4. The collector's cursor advances and its status row are written in the same
    transaction (REPLAY-02), except that no cursor advances when an item was
    `clock_ahead`: the page is read again and what did stage replays.
@@ -415,7 +418,11 @@ item may be admitted at all, and on what basis, from provider facts and
 operator configuration, never from a pulled payload or an agent:
 
 - a direct or group-direct conversation, and a container shared with another
-  organization, are refused always;
+  organization, are refused always; a container whose kind names a direct
+  conversation (its last segment `im`, `mpim`, `dm`, `group_dm`, or
+  `direct_message`: `slack.im`, `slack.mpim`) is one whatever channel the item
+  arrives through, so the sink refuses it before any capture scope (even
+  `"*"`), declaration, or recorded container is consulted;
 - a public, unshared container is `provider_public`, and a public team
   `team_public`;
 - a restricted container is admitted `operator_declared` only when the
@@ -777,10 +784,13 @@ agent can cite them at once.
   collector or an operator import recorded as readable, else
   `operator_capture_scope` when the operator lists the scope or container in
   `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES` (a JSON array of `{provider,
-  provider_scope_id, containers: "*" | [ids]}`, default `[]`). A withdrawn
-  container, a `private` or `dm` hint, and anything else are refused as
-  digest-only `audience_refused` dead letters under the capture instance. A
-  capture records, withdraws, and lifts nothing.
+  provider_scope_id, containers: "*" | [ids]}`, default `[]`). A container
+  whose kind names a direct conversation (`slack.im`, `slack.mpim`) is
+  refused as `direct_message` whatever the scopes list, `"*"` included, as
+  an import refuses it. A withdrawn container, a `private` or `dm` hint, and
+  anything else are refused as digest-only `audience_refused` dead letters
+  under the capture instance. A capture records, withdraws, and lifts
+  nothing.
 - **One capture.**
   1. A receipt already committed under the key is answered first (below).
   2. The writer authority is verified, and its active package must bind

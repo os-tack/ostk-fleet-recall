@@ -754,6 +754,97 @@ async fn live_capture_audience_is_the_servers_when_configured() {
     );
 }
 
+/// A capture scope of every container still admits no direct conversation,
+/// and a reported order ahead of the clock is refused, so it can never pin
+/// the item's head: the genuine next edit is presented.
+#[tokio::test]
+async fn live_no_capture_scope_admits_a_direct_message_or_a_future_order_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = fixture_at(&pool, "capture-direct").await;
+    let scope = fixture.installed.scope.clone();
+    let mut variables = variables(&fixture, "enabled");
+    variables.insert(
+        SCOPES_ENV.into(),
+        json!([{ "provider": "slack", "provider_scope_id": SLACK_TEAM, "containers": "*" }])
+            .to_string(),
+    );
+    let (runtime, _) = served(start(&pool, &scope, &variables).await);
+
+    let external_id = format!("{SLACK_CHANNEL}:1790071400.000100");
+    let captured = [
+        item(
+            "D07DIRECT01:1790071400.000100",
+            "the stork budget, from a direct message",
+            &json!({ "container": { "kind": "slack.im", "id": "D07DIRECT01" } }),
+        ),
+        item(
+            "G07GROUPDM1:1790071400.000100",
+            "the stork budget, from a group direct message",
+            &json!({ "container": { "kind": "slack.mpim", "id": "G07GROUPDM1" } }),
+        ),
+        // A mistaken unit, or a hostile agent: an order in 2096.
+        item(
+            &external_id,
+            "the stork budget is ten",
+            &json!({ "version": { "order_micros": 4_000_000_000_000_000_u64 } }),
+        ),
+    ];
+    let (answer, _, _) = capture(&runtime, &scope, &captured, "capture/direct").await;
+    assert_eq!(
+        dispositions(&answer),
+        [
+            (CaptureDispositionV1::Withheld, Some("direct_message")),
+            (CaptureDispositionV1::Withheld, Some("direct_message")),
+            (CaptureDispositionV1::Withheld, Some("clock_ahead")),
+        ]
+    );
+    for withheld in &answer.items {
+        assert!(withheld.accepted_event_ids.is_empty());
+    }
+
+    // The item as it really was, then its genuine next edit: the edit is
+    // presented, since nothing ahead of the clock was ever admitted.
+    let (first, _, _) = capture(
+        &runtime,
+        &scope,
+        &[item(
+            &external_id,
+            "the stork budget is six",
+            &json!({ "updated_at": "2026-09-22T10:00:00Z" }),
+        )],
+        "capture/stork-1",
+    )
+    .await;
+    let (edit, _, _) = capture(
+        &runtime,
+        &scope,
+        &[item(
+            &external_id,
+            "the stork budget is seven",
+            &json!({ "updated_at": "2026-09-23T10:00:00Z", "lifecycle": "edited" }),
+        )],
+        "capture/stork-2",
+    )
+    .await;
+    assert_eq!(
+        [dispositions(&first), dispositions(&edit)].concat(),
+        [
+            (CaptureDispositionV1::Admitted, None),
+            (CaptureDispositionV1::Admitted, None),
+        ]
+    );
+    drain(&fixture, &pool, "project").await;
+    let got = get(&pool, &fixture, edit.items[0].item_id).await;
+    assert_eq!(Some(got.current.version_id), edit.items[0].version_id);
+    assert_eq!(
+        got.current.parts[0].text.as_deref(),
+        Some("the stork budget is seven")
+    );
+}
+
 #[tokio::test]
 async fn live_a_capture_never_displaces_a_verified_head_when_configured() {
     let Some(database_url) = common::test_database_url() else {
