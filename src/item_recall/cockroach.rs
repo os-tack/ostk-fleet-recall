@@ -21,8 +21,8 @@ use crate::collectors::ingress::deliveries::count_pending_hints;
 use crate::context::FleetScope;
 use crate::error::{FleetError, Result};
 use crate::evidence_recall::{
-    ContentTrustV1, EVENTS_AWAITING_BODIES_SQL, EvidenceDenseLaneV1, EvidenceMatchV1,
-    EvidenceSourcesV1, FOREIGN_DENSE_MODEL_SQL, MAX_EVIDENCE_SOURCES, absence_verdict,
+    ContentTrustV1, EVENTS_AWAITING_BODIES_BY_KIND_FROM_SQL, EvidenceDenseLaneV1, EvidenceMatchV1,
+    EvidenceSourcesV1, FOREIGN_DENSE_MODEL_SQL, LagByKindV1, MAX_EVIDENCE_SOURCES, absence_verdict,
     attach_coverage, count, decode_collector_source_row, dense_lane, digest, has_lexical_terms,
     lane_match, lexical_query_text, listing_limit, may_read,
 };
@@ -178,14 +178,21 @@ const VERSION_MODES_SQL: &str = "SELECT item_key_digest, version_key_digest, col
      GROUP BY item_key_digest, version_key_digest, collection_mode";
 
 /// Collected parts staged and not yet admitted (of provider `$3`, or all),
-/// events awaiting the body projector, and the read's clock.
+/// the events awaiting the body projector (every one in the scope, those
+/// that are collected parts, and those of provider `$3`, in one scan of the
+/// pending events), and the read's clock.
 static READINESS_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "SELECT (SELECT count(*) FROM public.memory_collector_outbox_v1 \
                    WHERE tenant_id = $1 AND project = $2 AND state = 'pending' \
                      AND ($3::STRING IS NULL OR provider = $3)) AS items_pending, \
-                {EVENTS_AWAITING_BODIES_SQL} AS events_awaiting_bodies, \
-                pg_catalog.statement_timestamp() AS as_of"
+                pending.total AS events_awaiting_bodies, \
+                pending.items AS items_awaiting_bodies, \
+                pending.of_provider AS provider_items_awaiting_bodies, \
+                pg_catalog.statement_timestamp() AS as_of \
+         FROM (SELECT count(*) AS total, count(item.accepted_event_id) AS items, \
+                      count(CASE WHEN item.provider = $3::STRING THEN 1 END) AS of_provider \
+               {EVENTS_AWAITING_BODIES_BY_KIND_FROM_SQL}) AS pending"
     )
 });
 
@@ -857,11 +864,27 @@ impl CockroachItemRecall {
             .fetch_one(&self.pool)
             .await?;
         let completeness = self.reader.completeness().await?;
+        // With a provider, only that provider's pending parts bear on the
+        // answer; without one, the scope's whole lag does, split by kind.
+        let lag_by_kind = if provider.is_some() {
+            LagByKindV1 {
+                items: count(&row, "provider_items_awaiting_bodies")?,
+                other: 0,
+            }
+        } else {
+            let total = count(&row, "events_awaiting_bodies")?;
+            let items = count(&row, "items_awaiting_bodies")?;
+            LagByKindV1 {
+                items,
+                other: total.saturating_sub(items),
+            }
+        };
         Ok(ItemReadinessV1 {
             items_awaiting_admission: count(&row, "items_pending")?,
             hints_awaiting_fetch: hints.count(),
             hints_unreadable: hints.unreadable(),
-            events_awaiting_body_projection: count(&row, "events_awaiting_bodies")?,
+            events_awaiting_body_projection: lag_by_kind.total(),
+            lag_by_kind,
             lexical_current: completeness.lexical_complete(),
             dense_current: completeness.dense_complete(),
             dense_lane,

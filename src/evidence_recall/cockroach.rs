@@ -31,11 +31,12 @@ use crate::worker::WorkerSourceOutcomeV1;
 
 use super::verdict::{ScoredHitV1, absence_verdict};
 use super::{
-    ContentTrustV1, EVIDENCE_RECALL_SCHEMA_VERSION, EVIDENCE_SNIPPET_CHARS, EvidenceBodyV1,
-    EvidenceCollectorsV1, EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceHitV1, EvidenceItemV1,
-    EvidenceReadinessV1, EvidenceRecall, EvidenceSearchV1, EvidenceSourceKindV1, EvidenceSourceV1,
-    EvidenceSourcesV1, EvidenceStatusV1, MAX_EVIDENCE_SEARCH_LIMIT,
-    MAX_EVIDENCE_SOURCE_ERROR_BYTES, MAX_EVIDENCE_SOURCES, lexical_query_text,
+    AbsenceScopeV1, ContentTrustV1, EVIDENCE_RECALL_SCHEMA_VERSION, EVIDENCE_SNIPPET_CHARS,
+    EvidenceBodyV1, EvidenceCollectorsV1, EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceHitV1,
+    EvidenceItemV1, EvidenceReadinessV1, EvidenceRecall, EvidenceSearchV1, EvidenceSourceFilterV1,
+    EvidenceSourceKindV1, EvidenceSourceV1, EvidenceSourcesV1, EvidenceStatusV1, LagByKindV1,
+    MAX_EVIDENCE_SEARCH_LIMIT, MAX_EVIDENCE_SOURCE_ERROR_BYTES, MAX_EVIDENCE_SOURCES,
+    lexical_query_text,
 };
 
 const INSUFFICIENT_PRIVILEGE_SQLSTATE: &str = "42501";
@@ -130,7 +131,30 @@ pub const EVENTS_AWAITING_BODIES_SQL: &str = "(SELECT count(*) \
         WHERE head.tenant_id = $1 AND head.project = $2 \
           AND event.event_kind = 'evidence.accepted')";
 
-/// Events the body projector has not consumed, and turns still in the outbox.
+/// The pending events of [`EVENTS_AWAITING_BODIES_SQL`], each joined to the
+/// collected item part it carries, if it carries one: the `FROM` clause of
+/// a count split by kind. A collected part's `accepted_event_id` is the
+/// event's id and the primary key of `memory_collected_items_v1`, so the
+/// join is one key probe per pending event and never multiplies a row. An
+/// event that joins nothing is the project's own evidence (a git fact, a
+/// transcript turn, a CI run). Readable only where the collector tables are
+/// (migration 34 and the collector grants).
+pub const EVENTS_AWAITING_BODIES_BY_KIND_FROM_SQL: &str = "FROM public.memory_evidence_shard_heads AS head \
+        LEFT JOIN public.memory_body_projection_watermarks_v1 AS watermark \
+          ON watermark.tenant_id = head.tenant_id AND watermark.project = head.project \
+         AND watermark.ledger_family = 'evidence' AND watermark.shard = head.shard \
+        INNER LOOKUP JOIN public.memory_evidence_events AS event \
+          ON event.tenant_id = head.tenant_id AND event.project = head.project \
+         AND event.epoch_id = head.epoch_id AND event.shard = head.shard \
+         AND event.committed_offset > COALESCE(watermark.last_committed_offset, 0) \
+        LEFT JOIN public.memory_collected_items_v1 AS item \
+          ON item.tenant_id = event.tenant_id AND item.project = event.project \
+         AND item.accepted_event_id = event.event_id \
+        WHERE head.tenant_id = $1 AND head.project = $2 \
+          AND event.event_kind = 'evidence.accepted'";
+
+/// Events the body projector has not consumed, and turns still in the outbox,
+/// for a read that cannot tell a collected part from other evidence.
 static READINESS_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "SELECT {EVENTS_AWAITING_BODIES_SQL} AS events_awaiting_bodies, \
@@ -138,6 +162,21 @@ static READINESS_SQL: LazyLock<String> = LazyLock::new(|| {
             WHERE tenant_id = $1 AND project = $2 AND state = 'pending') \
             AS turns_awaiting_admission, \
          pg_catalog.statement_timestamp() AS as_of"
+    )
+});
+
+/// [`READINESS_SQL`] with the pending events split by kind, in one scan of
+/// them, for a read that can read the collector tables.
+static READINESS_BY_KIND_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT pending.total AS events_awaiting_bodies, \
+         pending.items AS items_awaiting_bodies, \
+         (SELECT count(*) FROM public.memory_transcript_outbox_v1 \
+            WHERE tenant_id = $1 AND project = $2 AND state = 'pending') \
+            AS turns_awaiting_admission, \
+         pg_catalog.statement_timestamp() AS as_of \
+         FROM (SELECT count(*) AS total, count(item.accepted_event_id) AS items \
+               {EVENTS_AWAITING_BODIES_BY_KIND_FROM_SQL}) AS pending"
     )
 });
 
@@ -527,14 +566,32 @@ impl CockroachEvidenceRecall {
             }
             CollectorStateV1::Absent | CollectorStateV1::Unreadable => None,
         };
-        let row: PgRow = sqlx::query(READINESS_SQL.as_str())
+        // The split by kind joins the collector tables, so it is read only
+        // where they can be.
+        let statement = if state.readable() {
+            READINESS_BY_KIND_SQL.as_str()
+        } else {
+            READINESS_SQL.as_str()
+        };
+        let row: PgRow = sqlx::query(statement)
             .bind(self.tenant_id)
             .bind(&self.project)
             .fetch_one(&self.pool)
             .await?;
         let completeness = self.reader(state).completeness().await?;
+        let events_awaiting_body_projection = count(&row, "events_awaiting_bodies")?;
+        let lag_by_kind = if state.readable() {
+            let items = count(&row, "items_awaiting_bodies")?;
+            Some(LagByKindV1 {
+                items,
+                other: events_awaiting_body_projection.saturating_sub(items),
+            })
+        } else {
+            None
+        };
         Ok(EvidenceReadinessV1 {
-            events_awaiting_body_projection: count(&row, "events_awaiting_bodies")?,
+            events_awaiting_body_projection,
+            lag_by_kind,
             transcript_turns_awaiting_admission: count(&row, "turns_awaiting_admission")?,
             items_awaiting_admission,
             hints_awaiting_fetch: hints.count(),
@@ -754,11 +811,12 @@ pub const fn dense_lane(served: bool, query_vector: Option<bool>) -> EvidenceDen
 
 #[async_trait]
 impl EvidenceRecall for CockroachEvidenceRecall {
-    async fn search(
+    async fn search_from(
         &self,
         query: &str,
         query_vector: Option<Vec<f32>>,
         limit: usize,
+        source: Option<EvidenceSourceFilterV1>,
     ) -> Result<EvidenceSearchV1> {
         if limit == 0 || limit > MAX_EVIDENCE_SEARCH_LIMIT {
             return Err(FleetError::Memory(format!(
@@ -774,11 +832,21 @@ impl EvidenceRecall for CockroachEvidenceRecall {
         let readiness = self.read_readiness(lane, state).await?;
         let lexical_terms = has_lexical_terms(&self.pool, &lexical_text).await?;
         let vector = query_vector.filter(|_| lane == EvidenceDenseLaneV1::Used);
+        // A source filter restricts both lanes to its media type; the
+        // readiness and the listing stay scope-wide, and the verdict says
+        // which source it speaks for.
+        let reader = source.map_or_else(
+            || self.reader(state).clone(),
+            |source| {
+                self.reader(state)
+                    .clone()
+                    .with_media_type(source.media_type())
+            },
+        );
         // Each lane is read deeper than the answer, then the two are fused by
         // reciprocal rank (the lexical cutoff and the dense floor applied
         // inside the fusion) and cut to `limit`.
-        let lanes = self
-            .reader(state)
+        let lanes = reader
             .recall_lanes(
                 if lexical_terms { &lexical_text } else { "" },
                 vector.as_deref(),
@@ -795,7 +863,8 @@ impl EvidenceRecall for CockroachEvidenceRecall {
             .hydrate(fused.into_iter().map(ScoredHitV1::from).collect(), state)
             .await?;
         let votes: Vec<_> = hits.iter().map(EvidenceHitV1::vote).collect();
-        let absence = absence_verdict(&votes, lexical_terms, &readiness, &sources);
+        let mut absence = absence_verdict(&votes, lexical_terms, &readiness, &sources);
+        absence.scope = source.map(|source| AbsenceScopeV1 { source });
         Ok(EvidenceSearchV1 {
             hits,
             readiness,

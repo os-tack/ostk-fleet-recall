@@ -289,6 +289,63 @@ static SUPPRESSED_BODIES_SQL: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// Whether the outer row's body (`body_column`) has the media type bound at
+/// `placeholder`. The lexical and dense tables carry no media type; it is on
+/// the body row, one primary-key probe away.
+fn media_type_predicate(body_column: &str, placeholder: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM public.memory_body_objects_v1 AS typed \
+         WHERE typed.tenant_id = $1 AND typed.project = $2 \
+           AND typed.content_sha256 = {body_column} \
+           AND typed.media_type = {placeholder})"
+    )
+}
+
+// LEXICAL_RECALL_SQL restricted to bodies of the media type bound at `$5`,
+// inside the WHERE like the suppression predicate: a body of another type
+// never occupies a rank slot.
+static LEXICAL_RECALL_MEDIA_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT lex.body_content_id, \
+         ts_rank(lex.search_document, plainto_tsquery('english', $3))::FLOAT4 AS score \
+         FROM public.memory_body_lexical_projection_v1 AS lex \
+         WHERE lex.tenant_id = $1 AND lex.project = $2 \
+           AND lex.search_document @@ plainto_tsquery('english', $3) \
+           AND {} \
+         ORDER BY score DESC, lex.body_content_id LIMIT $4",
+        media_type_predicate("lex.body_content_id", "$5")
+    )
+});
+
+// LEXICAL_RECALL_COLLECTED_SQL restricted to the media type bound at `$5`.
+static LEXICAL_RECALL_COLLECTED_MEDIA_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT lex.body_content_id, \
+         ts_rank(lex.search_document, plainto_tsquery('english', $3))::FLOAT4 AS score \
+         FROM public.memory_body_lexical_projection_v1 AS lex \
+         WHERE lex.tenant_id = $1 AND lex.project = $2 \
+           AND lex.search_document @@ plainto_tsquery('english', $3) \
+           AND NOT {} \
+           AND {} \
+         ORDER BY score DESC, lex.body_content_id LIMIT $4",
+        suppressed_body_predicate("lex.body_content_id"),
+        media_type_predicate("lex.body_content_id", "$5")
+    )
+});
+
+// Which of a dense lane's nearest neighbours have the media type bound at
+// `$4`. Like the suppression predicate, the media type is not in the ANN
+// index's equality prefix, so the dense lane post-filters its top-k, read
+// twice as deep to limit the under-fill.
+static MEDIA_TYPE_BODIES_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT candidate.body_content_id \
+         FROM unnest($3::BYTES[]) AS candidate (body_content_id) \
+         WHERE {}",
+        media_type_predicate("candidate.body_content_id", "$4")
+    )
+});
+
 // The publication plane's lexical lane. It reads the VIEW, whose own WHERE
 // clause is the visibility predicate, so the restriction is applied before
 // ts_rank orders anything: a private row never occupies a rank slot, never
@@ -1115,6 +1172,8 @@ pub struct CockroachRecallReader {
     /// When set, a collected body that is deleted or withdrawn is withheld
     /// from both lanes.
     collected_suppression: bool,
+    /// When set, both lanes return only bodies of this media type.
+    media_type: Option<String>,
 }
 
 impl std::fmt::Debug for CockroachRecallReader {
@@ -1124,6 +1183,7 @@ impl std::fmt::Debug for CockroachRecallReader {
             .field("tenant_id", &self.scope.tenant_id)
             .field("project", &self.scope.project)
             .field("dense_model", &self.dense_model)
+            .field("media_type", &self.media_type)
             .finish_non_exhaustive()
     }
 }
@@ -1142,6 +1202,7 @@ impl CockroachRecallReader {
             plane: RecallPlaneV1::Private,
             dense_model: None,
             collected_suppression: false,
+            media_type: None,
         }
     }
 
@@ -1164,6 +1225,7 @@ impl CockroachRecallReader {
             plane: RecallPlaneV1::Publication,
             dense_model: None,
             collected_suppression: false,
+            media_type: None,
         }
     }
 
@@ -1193,6 +1255,36 @@ impl CockroachRecallReader {
     pub const fn with_collected_suppression(mut self) -> Self {
         self.collected_suppression = matches!(self.plane, RecallPlaneV1::Private);
         self
+    }
+
+    /// Return, from both lanes, only bodies whose row on the body plane
+    /// carries `media_type`.
+    ///
+    /// The lexical lane applies it inside its WHERE, so a body of another
+    /// type never takes a rank slot; the dense lane reads its top-k twice as
+    /// deep and post-filters it, since the media type is not in the ANN
+    /// index's prefix. Private plane only: the lanes refuse to run a filtered
+    /// read on the publication plane rather than drop the filter.
+    #[must_use]
+    pub fn with_media_type(mut self, media_type: &str) -> Self {
+        self.media_type = Some(media_type.to_owned());
+        self
+    }
+
+    /// The media type both lanes are restricted to, when one is set.
+    #[must_use]
+    pub fn media_type(&self) -> Option<&str> {
+        self.media_type.as_deref()
+    }
+
+    /// The media filter, or the error a publication reader raises for one.
+    fn media_filter(&self) -> RecallProjectionResult<Option<&str>> {
+        match (self.plane, self.media_type.as_deref()) {
+            (RecallPlaneV1::Publication, Some(_)) => Err(RecallProjectionError::InvalidRequest(
+                "the publication plane cannot filter recall by media type".into(),
+            )),
+            (_, media_type) => Ok(media_type),
+        }
     }
 
     /// Which read plane this reader answers for.
@@ -1332,18 +1424,23 @@ impl CockroachRecallReader {
         if query_text.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let statement = match (self.plane, self.collected_suppression) {
-            (RecallPlaneV1::Private, false) => LEXICAL_RECALL_SQL,
-            (RecallPlaneV1::Private, true) => LEXICAL_RECALL_COLLECTED_SQL.as_str(),
-            (RecallPlaneV1::Publication, _) => LEXICAL_RECALL_PUBLICATION_SQL,
+        let media_type = self.media_filter()?;
+        let statement = match (self.plane, self.collected_suppression, media_type) {
+            (RecallPlaneV1::Private, false, None) => LEXICAL_RECALL_SQL,
+            (RecallPlaneV1::Private, true, None) => LEXICAL_RECALL_COLLECTED_SQL.as_str(),
+            (RecallPlaneV1::Private, false, Some(_)) => LEXICAL_RECALL_MEDIA_SQL.as_str(),
+            (RecallPlaneV1::Private, true, Some(_)) => LEXICAL_RECALL_COLLECTED_MEDIA_SQL.as_str(),
+            (RecallPlaneV1::Publication, _, _) => LEXICAL_RECALL_PUBLICATION_SQL,
         };
-        let rows: Vec<PgRow> = sqlx::query(statement)
+        let mut query = sqlx::query(statement)
             .bind(self.scope.tenant_id)
             .bind(&self.scope.project)
             .bind(query_text)
-            .bind(limit)
-            .fetch_all(&self.scope.pool)
-            .await?;
+            .bind(limit);
+        if let Some(media_type) = media_type {
+            query = query.bind(media_type);
+        }
+        let rows: Vec<PgRow> = query.fetch_all(&self.scope.pool).await?;
         rows.iter()
             .map(|row| {
                 Ok((
@@ -1366,22 +1463,30 @@ impl CockroachRecallReader {
             )));
         }
         let encoded = serialize_vector(query_vector)?;
+        let media_type = self.media_filter()?;
         let statement = match (self.plane, self.dense_model.is_some()) {
             (RecallPlaneV1::Private, false) => DENSE_RECALL_SQL,
             (RecallPlaneV1::Private, true) => DENSE_RECALL_MODEL_SQL,
             (RecallPlaneV1::Publication, false) => DENSE_RECALL_PUBLICATION_SQL,
             (RecallPlaneV1::Publication, true) => DENSE_RECALL_PUBLICATION_MODEL_SQL,
         };
+        // A media filter is applied after the ANN read, so the read goes
+        // twice as deep to leave the lane filled.
+        let depth = if media_type.is_some() {
+            limit.saturating_mul(2)
+        } else {
+            limit
+        };
         let mut query = sqlx::query(statement)
             .bind(self.scope.tenant_id)
             .bind(&self.scope.project)
             .bind(encoded)
-            .bind(limit);
+            .bind(depth);
         if let Some(model) = self.dense_model {
             query = query.bind(model.as_bytes().to_vec());
         }
         let rows: Vec<PgRow> = query.fetch_all(&self.scope.pool).await?;
-        let neighbours = rows
+        let mut neighbours = rows
             .iter()
             .map(|row| {
                 Ok((
@@ -1390,6 +1495,27 @@ impl CockroachRecallReader {
                 ))
             })
             .collect::<RecallProjectionResult<Vec<(Sha256Digest, f32)>>>()?;
+        if neighbours.is_empty() {
+            return Ok(neighbours);
+        }
+        if let Some(media_type) = media_type {
+            let candidates: Vec<Vec<u8>> = neighbours
+                .iter()
+                .map(|(body, _)| body.as_bytes().to_vec())
+                .collect();
+            let typed: HashSet<Sha256Digest> = sqlx::query(MEDIA_TYPE_BODIES_SQL.as_str())
+                .bind(self.scope.tenant_id)
+                .bind(&self.scope.project)
+                .bind(&candidates)
+                .bind(media_type)
+                .fetch_all(&self.scope.pool)
+                .await?
+                .iter()
+                .map(|row| digest32(row.try_get("body_content_id")?))
+                .collect::<RecallProjectionResult<_>>()?;
+            neighbours.retain(|(body, _)| typed.contains(body));
+            neighbours.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
         if !self.collected_suppression || neighbours.is_empty() {
             return Ok(neighbours);
         }
@@ -1545,6 +1671,51 @@ mod tests {
                 "{statement}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_media_filter_binds_scope_and_sits_inside_the_lexical_where() {
+        // The filtered lexical lanes apply the media type before ts_rank
+        // orders anything and before the LIMIT, through the body row, whose
+        // scope columns are bound like every other statement's.
+        for statement in [
+            LEXICAL_RECALL_MEDIA_SQL.as_str(),
+            LEXICAL_RECALL_COLLECTED_MEDIA_SQL.as_str(),
+        ] {
+            assert!(statement.contains("lex.tenant_id = $1 AND lex.project = $2"));
+            assert!(statement.contains("typed.tenant_id = $1 AND typed.project = $2"));
+            assert!(statement.contains("typed.media_type = $5"));
+            let filter = statement.find("typed.media_type").unwrap();
+            assert!(filter < statement.find("ORDER BY").unwrap(), "{statement}");
+            assert!(filter < statement.find("LIMIT $4").unwrap(), "{statement}");
+        }
+        assert!(LEXICAL_RECALL_COLLECTED_MEDIA_SQL.contains("AND NOT EXISTS"));
+        // The dense post-filter reads the same body row for each candidate.
+        assert!(MEDIA_TYPE_BODIES_SQL.contains("unnest($3::BYTES[])"));
+        assert!(MEDIA_TYPE_BODIES_SQL.contains("typed.media_type = $4"));
+        // A reader without the filter still runs the statements it always did.
+        let reader = CockroachRecallReader::new(
+            PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
+            Uuid::nil(),
+            "p".to_owned(),
+        );
+        assert_eq!(reader.media_type(), None);
+        assert_eq!(
+            reader
+                .with_media_type("application.ostk-git-fact-v1")
+                .media_type(),
+            Some("application.ostk-git-fact-v1")
+        );
+        let publication = CockroachRecallReader::publication(
+            PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
+            Uuid::nil(),
+            "p".to_owned(),
+        )
+        .with_media_type("application.json");
+        assert!(matches!(
+            publication.media_filter(),
+            Err(RecallProjectionError::InvalidRequest(_))
+        ));
     }
 
     #[test]

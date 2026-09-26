@@ -38,8 +38,15 @@ The `ostk-fleet-recall` binary has these commands:
     neither held over a current lexical tier with every source healthy,
     fresh, and completely covered, otherwise `unknown` with the reasons. A
     dense neighbour below the bound is still listed, counted in
-    `weak_neighbours`, with `strongest_dense_similarity` reported, so an
-    agent can judge it. `recall(status)` then adds
+    `weak_neighbours`, with `strongest_dense_similarity` and `strongest_hit`
+    (its index into the hits) reported; one that scored 0.30 or more makes
+    the verdict `unknown` with `dense_neighbour_below_bound` rather than
+    `absent`, because memory then holds a candidate it cannot confirm: read
+    `hits[strongest_hit]`, and if it answers, retry with its own words.
+    `absent` is the strongest negative memory can give, not proof. `source`
+    narrows an evidence search to `git`, `items`, or `sessions` (transcripts
+    and CI runs), and the verdict then carries `scope.source`.
+    `recall(status)` then adds
     an `evidence` block
     ([ADR 0006](docs/adr/0006-stage5-worker-and-evidence-recall.md)), with a
     `collectors` count once migration 34 is applied. A hit on a collected

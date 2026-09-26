@@ -39,6 +39,24 @@ use super::{
 /// a strong dense-only neighbour add to it.
 pub const ABSENCE_DENSE_MIN_COSINE_SIMILARITY: f32 = 0.45;
 
+/// The cosine similarity from which a dense-only neighbour that cannot vote
+/// `present` still refuses `absent`.
+///
+/// Measured on the same stack as the bound above (`docs/TRIAL_RETEST_2026-09-26.md`):
+/// the correct answers to the trial questions asked in natural wording
+/// scored 0.34 to 0.41 dense-only (Q5 0.338 over `source: linear`, Q10
+/// 0.411), while in-domain noise for never-discussed topics scored 0.22 to
+/// 0.43 (Helm 0.257, Oracle 0.269, GDPR 0.430, tokio 0.427). The band
+/// `[0.30, 0.45)` is therefore where memory has a candidate it cannot
+/// confirm: the answer may be listed, or the neighbour may be noise, and no
+/// similarity separates the two. In the band the verdict is `unknown` with
+/// [`super::AbsenceReasonV1::DenseNeighbourBelowBound`] and names the
+/// candidate (`strongest_hit`), so an agent reads it rather than recording a
+/// negative claim from an `absent` whose first hit was the answer. Below the
+/// floor a neighbour is only counted (`weak_neighbours`), and `absent`
+/// stands.
+pub const ABSENCE_NEIGHBOUR_BAND_FLOOR: f32 = 0.30;
+
 /// Media types whose bodies never vote `present` on a dense-only match.
 ///
 /// A raw git fact (a commit's author, message, and paths as one record) is
@@ -91,6 +109,18 @@ impl HitVoteV1 {
                 .dense_similarity
                 .is_some_and(|similarity| similarity >= ABSENCE_DENSE_MIN_COSINE_SIMILARITY)
     }
+
+    /// A dense-only neighbour whose body may vote, too weak to vote and too
+    /// close to dismiss: in `[ABSENCE_NEIGHBOUR_BAND_FLOOR,
+    /// ABSENCE_DENSE_MIN_COSINE_SIMILARITY)`.
+    fn in_neighbour_band(self) -> bool {
+        self.dense_may_vote
+            && matches!(self.matched_by, EvidenceMatchV1::Dense)
+            && self.dense_similarity.is_some_and(|similarity| {
+                (ABSENCE_NEIGHBOUR_BAND_FLOOR..ABSENCE_DENSE_MIN_COSINE_SIMILARITY)
+                    .contains(&similarity)
+            })
+    }
 }
 
 /// A fused hit before hydration: the body, the lanes that matched it after
@@ -131,6 +161,23 @@ pub const fn lane_match(lexical: bool, dense: bool) -> EvidenceMatchV1 {
     }
 }
 
+/// The first hit at the highest dense similarity, voting or not, and that
+/// similarity: ties keep the fused order.
+fn strongest_neighbour(votes: &[HitVoteV1]) -> Option<(usize, f32)> {
+    votes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, vote)| Some((index, vote.dense_similarity?)))
+        .filter(|(_, similarity)| !similarity.is_nan())
+        .fold(
+            None,
+            |best: Option<(usize, f32)>, (index, similarity)| match best {
+                Some((_, strongest)) if strongest >= similarity => best,
+                _ => Some((index, similarity)),
+            },
+        )
+}
+
 /// What an answer whose hits cast `votes` means, given what was read before
 /// the lanes ran. See the module documentation of `evidence_recall` for the
 /// rule.
@@ -139,8 +186,14 @@ pub const fn lane_match(lexical: bool, dense: bool) -> EvidenceMatchV1 {
 /// dense-only hit whose body may vote reached
 /// [`ABSENCE_DENSE_MIN_COSINE_SIMILARITY`]; `present_by` says which. A hit
 /// that did neither is a weak neighbour: it is counted, its similarity is
-/// reported, and it neither makes the answer `present` nor hides a reason
-/// the answer is `unknown`.
+/// reported, and it never makes the answer `present`. A weak neighbour
+/// whose body may vote and that reached [`ABSENCE_NEIGHBOUR_BAND_FLOOR`]
+/// refuses `absent` (reason `dense_neighbour_below_bound`); one below the
+/// floor decides nothing and hides no reason.
+///
+/// `votes` are in hit order, so `strongest_hit` indexes the caller's hits.
+/// The verdict's `scope` is the caller's to set: it depends on the request,
+/// not on the votes.
 #[must_use]
 pub fn absence_verdict(
     votes: &[HitVoteV1],
@@ -161,11 +214,9 @@ pub fn absence_verdict(
         (false, true) => Some(PresentByV1::Dense),
         (false, false) => None,
     };
-    let strongest_dense_similarity = votes
-        .iter()
-        .filter_map(|vote| vote.dense_similarity)
-        .filter(|similarity| !similarity.is_nan())
-        .reduce(f32::max);
+    let strongest = strongest_neighbour(votes);
+    let strongest_hit = strongest.map(|(index, _)| index);
+    let strongest_dense_similarity = strongest.map(|(_, similarity)| similarity);
     let weak_neighbours = votes
         .iter()
         .filter(|vote| !(vote.votes_lexically() || vote.votes_densely()))
@@ -178,12 +229,17 @@ pub fn absence_verdict(
             as_of,
             present_by,
             strongest_dense_similarity,
+            strongest_hit,
             weak_neighbours,
+            scope: None,
         };
     }
     let mut reasons = BTreeSet::new();
     if !lexical_terms {
         reasons.insert(AbsenceReasonV1::QueryHasNoLexicalTerms);
+    }
+    if votes.iter().any(|vote| vote.in_neighbour_band()) {
+        reasons.insert(AbsenceReasonV1::DenseNeighbourBelowBound);
     }
     if readiness.events_awaiting_body_projection > 0 {
         reasons.insert(AbsenceReasonV1::BodyProjectionLag);
@@ -239,13 +295,16 @@ pub fn absence_verdict(
         as_of,
         present_by: None,
         strongest_dense_similarity,
+        strongest_hit,
         weak_neighbours,
+        scope: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
+    use serde_json::json;
 
     use super::super::{
         EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceSourceKindV1, EvidenceSourceV1,
@@ -260,6 +319,7 @@ mod tests {
     fn current() -> EvidenceReadinessV1 {
         EvidenceReadinessV1 {
             events_awaiting_body_projection: 0,
+            lag_by_kind: None,
             transcript_turns_awaiting_admission: 0,
             items_awaiting_admission: None,
             hints_awaiting_fetch: None,
@@ -354,12 +414,73 @@ mod tests {
     }
 
     #[test]
-    fn a_dense_only_neighbour_below_the_bound_is_a_weak_neighbour() {
-        let absence = verdict(&[dense(0.30)]);
+    fn a_dense_only_neighbour_below_the_band_is_a_weak_neighbour() {
+        let absence = verdict(&[dense(0.25)]);
         assert_eq!(absence.verdict, AbsenceVerdictV1::Absent);
         assert_eq!(absence.present_by, None);
         assert!(absence.reasons.is_empty());
-        assert_eq!(absence.strongest_dense_similarity, Some(0.30));
+        assert_eq!(absence.strongest_dense_similarity, Some(0.25));
+        assert_eq!(absence.strongest_hit, Some(0));
+        assert_eq!(absence.weak_neighbours, 1);
+        // Just under the floor it is still only counted.
+        let just_under = verdict(&[dense(0.2999)]);
+        assert_eq!(just_under.verdict, AbsenceVerdictV1::Absent);
+        assert!(just_under.reasons.is_empty());
+        assert_eq!(just_under.weak_neighbours, 1);
+    }
+
+    #[test]
+    fn a_dense_only_neighbour_in_the_band_refuses_absent() {
+        for similarity in [ABSENCE_NEIGHBOUR_BAND_FLOOR, 0.35, 0.41, 0.4499] {
+            let absence = verdict(&[dense(similarity)]);
+            assert_eq!(
+                absence.verdict,
+                AbsenceVerdictV1::Unknown,
+                "{similarity}: {absence:?}"
+            );
+            assert_eq!(
+                absence.reasons,
+                [AbsenceReasonV1::DenseNeighbourBelowBound],
+                "{similarity}"
+            );
+            assert_eq!(absence.present_by, None);
+            assert_eq!(absence.strongest_dense_similarity, Some(similarity));
+            assert_eq!(absence.strongest_hit, Some(0));
+            assert_eq!(absence.weak_neighbours, 1, "still a weak neighbour");
+        }
+        // The candidate is named wherever it ranks.
+        let second = verdict(&[dense(0.25), dense(0.41), dense(0.33)]);
+        assert_eq!(second.verdict, AbsenceVerdictV1::Unknown);
+        assert_eq!(second.strongest_hit, Some(1));
+        assert_eq!(second.strongest_dense_similarity, Some(0.41));
+        assert_eq!(second.weak_neighbours, 3);
+        // A tie names the first, which the fused order ranked higher.
+        assert_eq!(verdict(&[dense(0.41), dense(0.41)]).strongest_hit, Some(0));
+    }
+
+    #[test]
+    fn a_lexical_vote_overrides_the_band() {
+        let absence = verdict(&[dense(0.41), lexical()]);
+        assert_eq!(absence.verdict, AbsenceVerdictV1::Present);
+        assert_eq!(absence.present_by, Some(PresentByV1::Lexical));
+        assert!(absence.reasons.is_empty());
+        assert_eq!(absence.strongest_hit, Some(0));
+        assert_eq!(absence.weak_neighbours, 1);
+        // A hit both lanes matched votes lexically whatever its similarity.
+        let both = verdict(&[vote(EvidenceMatchV1::LexicalAndDense, Some(0.35))]);
+        assert_eq!(both.verdict, AbsenceVerdictV1::Present);
+        assert!(both.reasons.is_empty());
+    }
+
+    #[test]
+    fn a_body_that_may_not_vote_is_never_in_the_band() {
+        let fact =
+            HitVoteV1::for_media_type(EvidenceMatchV1::Dense, Some(0.41), GIT_FACT_MEDIA_TYPE);
+        let absence = verdict(&[fact]);
+        assert_eq!(absence.verdict, AbsenceVerdictV1::Absent);
+        assert!(absence.reasons.is_empty());
+        assert_eq!(absence.strongest_dense_similarity, Some(0.41));
+        assert_eq!(absence.strongest_hit, Some(0));
         assert_eq!(absence.weak_neighbours, 1);
     }
 
@@ -369,12 +490,17 @@ mod tests {
         assert_eq!(absence.verdict, AbsenceVerdictV1::Present);
         assert_eq!(absence.present_by, Some(PresentByV1::Dense));
         assert_eq!(absence.strongest_dense_similarity, Some(0.60));
+        assert_eq!(absence.strongest_hit, Some(0));
         assert_eq!(absence.weak_neighbours, 0);
 
         let exactly = verdict(&[dense(ABSENCE_DENSE_MIN_COSINE_SIMILARITY)]);
         assert_eq!(exactly.present_by, Some(PresentByV1::Dense));
         let just_under = verdict(&[dense(0.4499)]);
-        assert_eq!(just_under.verdict, AbsenceVerdictV1::Absent);
+        assert_eq!(just_under.verdict, AbsenceVerdictV1::Unknown);
+        assert_eq!(
+            just_under.reasons,
+            [AbsenceReasonV1::DenseNeighbourBelowBound]
+        );
         assert_eq!(just_under.weak_neighbours, 1);
     }
 
@@ -428,12 +554,21 @@ mod tests {
     fn a_weak_neighbour_never_hides_a_reason() {
         let mut lagging = current();
         lagging.events_awaiting_body_projection = 1;
-        let absence = absence_verdict(&[dense(0.30)], true, &lagging, &two_healthy());
+        let absence = absence_verdict(&[dense(0.25)], true, &lagging, &two_healthy());
         assert_eq!(absence.verdict, AbsenceVerdictV1::Unknown);
         assert_eq!(absence.reasons, [AbsenceReasonV1::BodyProjectionLag]);
         assert_eq!(absence.present_by, None);
-        assert_eq!(absence.strongest_dense_similarity, Some(0.30));
+        assert_eq!(absence.strongest_dense_similarity, Some(0.25));
         assert_eq!(absence.weak_neighbours, 1);
+        // In the band, the candidate is one more reason beside the lag.
+        let banded = absence_verdict(&[dense(0.41)], true, &lagging, &two_healthy());
+        assert_eq!(
+            banded.reasons,
+            [
+                AbsenceReasonV1::BodyProjectionLag,
+                AbsenceReasonV1::DenseNeighbourBelowBound
+            ]
+        );
     }
 
     #[test]
@@ -450,14 +585,34 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(keys, ["as_of", "reasons", "verdict"]);
 
-        let weak = serde_json::to_value(verdict(&[dense(0.30)])).unwrap();
+        let weak = serde_json::to_value(verdict(&[dense(0.25)])).unwrap();
         assert_eq!(weak["verdict"], "absent");
         assert_eq!(weak["weak_neighbours"], 1);
-        assert!((weak["strongest_dense_similarity"].as_f64().unwrap() - 0.30).abs() < 1e-6);
+        assert!((weak["strongest_dense_similarity"].as_f64().unwrap() - 0.25).abs() < 1e-6);
+        assert_eq!(weak["strongest_hit"], 0);
         assert!(weak.get("present_by").is_none());
+        assert!(weak.get("scope").is_none());
         let present = serde_json::to_value(verdict(&[lexical()])).unwrap();
         assert_eq!(present["present_by"], "lexical");
         assert!(present.get("weak_neighbours").is_none());
+        assert!(present.get("strongest_hit").is_none());
+        // The band, as an agent reads it.
+        let banded = serde_json::to_value(verdict(&[dense(0.41)])).unwrap();
+        assert_eq!(banded["verdict"], "unknown");
+        assert_eq!(banded["reasons"], json!(["dense_neighbour_below_bound"]));
+        assert_eq!(banded["strongest_hit"], 0);
+        assert!((banded["strongest_dense_similarity"].as_f64().unwrap() - 0.41).abs() < 1e-6);
+        assert_eq!(banded["weak_neighbours"], 1);
+        assert!(banded.get("present_by").is_none());
+        // A scoped verdict names its source.
+        let mut scoped = verdict(&[]);
+        scoped.scope = Some(super::super::AbsenceScopeV1 {
+            source: super::super::EvidenceSourceFilterV1::Git,
+        });
+        assert_eq!(
+            serde_json::to_value(&scoped).unwrap()["scope"],
+            json!({ "source": "git" })
+        );
     }
 
     #[test]

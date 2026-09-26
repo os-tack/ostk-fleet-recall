@@ -95,7 +95,7 @@ use serde::Serialize;
 use crate::error::Result;
 use crate::evidence_recall::{
     AbsenceV1, ContentTrustV1, EVIDENCE_SNIPPET_CHARS, EvidenceDenseLaneV1, EvidenceMatchV1,
-    EvidenceReadinessV1, EvidenceSourcesV1, HitVoteV1,
+    EvidenceReadinessV1, EvidenceSourcesV1, HitVoteV1, LagByKindV1,
 };
 use crate::memory_contracts::collected_item::{
     CollectionModeV1, ItemLifecycleV1, MAX_PROVIDER_URL_BYTES, ObjectKindV1, ProviderKindV1,
@@ -407,7 +407,13 @@ pub struct ItemReadinessV1 {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub hints_unreadable: bool,
     /// Accepted evidence events the body projector has not consumed yet.
+    /// With a provider filter, only the pending collected parts of that
+    /// provider: pending evidence of another kind cannot hold one of its
+    /// items. Without one, every pending event in the scope.
     pub events_awaiting_body_projection: u64,
+    /// The same count split by kind: collected parts against the rest. With
+    /// a provider filter, `other` is zero by definition.
+    pub lag_by_kind: LagByKindV1,
     /// Every body has been through the lexical projector.
     pub lexical_current: bool,
     /// Every lexically searchable body also has an embedding.
@@ -424,6 +430,7 @@ impl ItemReadinessV1 {
     pub const fn as_evidence(&self) -> EvidenceReadinessV1 {
         EvidenceReadinessV1 {
             events_awaiting_body_projection: self.events_awaiting_body_projection,
+            lag_by_kind: Some(self.lag_by_kind),
             transcript_turns_awaiting_admission: 0,
             items_awaiting_admission: Some(self.items_awaiting_admission),
             hints_awaiting_fetch: self.hints_awaiting_fetch,
@@ -738,6 +745,7 @@ mod tests {
             hints_awaiting_fetch: Some(3),
             hints_unreadable: false,
             events_awaiting_body_projection: 1,
+            lag_by_kind: LagByKindV1 { items: 1, other: 0 },
             lexical_current: true,
             dense_current: false,
             dense_lane: EvidenceDenseLaneV1::Used,
@@ -748,6 +756,15 @@ mod tests {
         assert_eq!(evidence.hints_awaiting_fetch, Some(3));
         assert_eq!(evidence.transcript_turns_awaiting_admission, 0);
         assert_eq!(evidence.events_awaiting_body_projection, 1);
+        assert_eq!(
+            evidence.lag_by_kind,
+            Some(LagByKindV1 { items: 1, other: 0 }),
+            "an item search always knows the split"
+        );
+        assert_eq!(
+            serde_json::to_value(&readiness).unwrap()["lag_by_kind"],
+            serde_json::json!({ "items": 1, "other": 0 })
+        );
         assert!(!evidence.collector_state_unreadable);
         assert!(!evidence.hints_unreadable);
         let unreadable = ItemReadinessV1 {
