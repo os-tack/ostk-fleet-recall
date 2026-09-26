@@ -193,6 +193,9 @@ exact old-only, old-plus-new, or new-only detector-index transition states. It
 creates and commits the new detector-versioned unique index, verifies both
 catalog shapes, drops the legacy constraint-backed index with `CASCADE`,
 commits, and verifies the exact final state; it rewrites no conflict rows.
+No migration rewrites claim keys either: claims keyed before `_` became a key
+separator keep their stored key, `recall(status).legacy_claim_keys` counts
+them, and `remember(supersede)` moves one onto its current key (ADR 0004).
 Migrations 16 and 17 each use `CREATE INDEX IF NOT EXISTS`, commit the online
 backfill, and assert the complete public catalog definition including stored
 columns. Same-name drift fails with SQLSTATE `55000` before SQLx can record
