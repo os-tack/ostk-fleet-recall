@@ -176,6 +176,15 @@ conflict with the exact members that caused it instead of silently choosing
 one. The detector compares typed propositions; it performs no natural-language
 inference.
 
+An agent never disputes itself. Where the writer serves `supersede`, a
+`record` whose value would conflict with a lifecycle-current claim the same
+agent already holds on the key is refused as `own_current_claim_on_key`
+before anything is written; the refusal's `details` name the `claim_id`,
+`revision`, and `claim_key`, and the agent sends `supersede` with that
+`claim_id` and `expected_revision` instead, so its change of mind is an
+audited succession rather than an open conflict with itself. Another
+agent's disagreement still opens a conflict as before.
+
 A conflict is never resolved by fiat. An agent can retract, supersede, or
 concede only its own claims, and a conflict closes only when the detector
 re-checks the key and finds no incompatible current pair left

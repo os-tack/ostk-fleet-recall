@@ -20,13 +20,14 @@ use crate::item_recall::{
     ItemRecall, ItemReferenceV1, ItemSearchRequestV1, ItemSearchV1, MAX_ITEM_SEARCH_LIMIT,
 };
 use crate::ledger::{
-    Claim, ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget, Conflict,
-    ConflictMutation, ConflictTarget, DismissalTerms, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2,
-    ITEM_SUPPORT_SOURCE_CONFIG_ID, KeyClaimV1, LegacyClaimKeysV1, LifecycleMutation,
-    LifecycleReplayRequest, MAX_CLAIM_HIT_VALUE_BYTES, MAX_CONCESSION_CLAIMS,
-    MAX_CONFLICT_MEMBER_COUNT, SemanticClaimHit, SupportedClaimCoordinate, WaiverTerms,
-    claim_key_from_parts, derive_overlay, history_within_bytes, overlay_episode_revision,
-    unlogged_transitions, validate_lifecycle_reason, validate_rationale, validate_waiver_hours,
+    Claim, ClaimHistoryV1, ClaimInput, ClaimLedger, ClaimMutation, ClaimState, ClaimTarget,
+    Conflict, ConflictMutation, ConflictTarget, DismissalTerms,
+    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, ITEM_SUPPORT_SOURCE_CONFIG_ID, KeyClaimV1,
+    LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest, MAX_CLAIM_HIT_VALUE_BYTES,
+    MAX_CONCESSION_CLAIMS, MAX_CONFLICT_MEMBER_COUNT, SemanticClaimHit, SupportedClaimCoordinate,
+    WaiverTerms, claim_key_from_parts, derive_overlay, history_within_bytes,
+    overlay_episode_revision, unlogged_transitions, validate_lifecycle_reason, validate_rationale,
+    validate_waiver_hours,
 };
 use crate::memory_contracts::collected_item::ProviderKindV1;
 use crate::memory_contracts::digest::Sha256Digest;
@@ -937,6 +938,34 @@ impl CockroachMemoryService {
                 .map_err(service_error)?
         {
             result.data["accepted_event_id"] = json!(event_id);
+        }
+        // The claim's own audit trail: every logged transition with who and
+        // why, and the predecessor it superseded. A private read only; the
+        // publication reader has no grant on the log and keeps its shape. A
+        // failed read is a warning, never a failed get.
+        if claim.is_some() && !self.withhold_asserted_claims {
+            match self.ledger.claim_lifecycle_history(scope, id).await {
+                Ok(history) => {
+                    let claim_bytes = json_bytes(&result.data);
+                    let history = claim_history_within_bytes(
+                        history,
+                        MAX_CONFLICT_LOOKUP_BYTES.saturating_sub(claim_bytes),
+                    );
+                    if let Some(predecessor) = history.supersedes {
+                        result.data["claim"]["supersedes"] = json!(predecessor);
+                    }
+                    result.data["history"] = json!(history.events);
+                    result.data["history_truncated"] = json!(history.truncated);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, claim_id = id, "claim lifecycle history read failed");
+                    result.data["history"] = Value::Null;
+                    result.warnings.push(json!({
+                        "code": "lifecycle_history_unavailable",
+                        "message": "the claim's lifecycle history could not be read; the claim itself is current"
+                    }));
+                }
+            }
         }
         let mut conflicts = if withheld {
             Vec::new()
@@ -3300,6 +3329,30 @@ fn key_claims_within_bytes(claims: Vec<KeyClaimV1>, byte_budget: usize) -> (Vec<
     (kept, cut)
 }
 
+/// The newest claim lifecycle events that fit `byte_budget` serialized,
+/// oldest first; a cut marks the history truncated.
+fn claim_history_within_bytes(mut history: ClaimHistoryV1, byte_budget: usize) -> ClaimHistoryV1 {
+    let mut used = 0_usize;
+    let mut kept = 0_usize;
+    for event in history.events.iter().rev() {
+        // One separator byte per array element.
+        let size = serde_json::to_vec(event)
+            .map_or(usize::MAX, |bytes| bytes.len())
+            .saturating_add(1);
+        used = used.saturating_add(size);
+        if used > byte_budget {
+            break;
+        }
+        kept += 1;
+    }
+    let dropped = history.events.len() - kept;
+    if dropped > 0 {
+        history.events.drain(..dropped);
+        history.truncated = true;
+    }
+    history
+}
+
 /// A value's serialized size; one that cannot be serialized counts as
 /// unbounded.
 fn json_bytes(value: &Value) -> usize {
@@ -3900,6 +3953,68 @@ mod tests {
         // An explicit null id is present, for the kind's own check to refuse.
         let (_, target, _) = parse(json!({ "kind": "chunk", "id": null })).unwrap();
         assert!(matches!(target, GetTarget::Id(Value::Null)));
+    }
+
+    #[test]
+    fn claim_history_keeps_the_newest_events_within_the_byte_budget() {
+        use crate::ledger::ClaimLifecycleEventV1;
+        let now = Utc::now();
+        let event = |seq: i64, reason: &str| ClaimLifecycleEventV1 {
+            event_id: format!("0198a849-f6ae-7d61-9800-{seq:012}"),
+            kind: "state_transition".into(),
+            actor: Some("agent-a".into()),
+            reason: Some(reason.into()),
+            from_state: Some("active".into()),
+            to_state: Some("superseded".into()),
+            revision_before: Some(seq),
+            successor_claim_id: (reason == "superseded_by_author").then_some(99),
+            conflict_id: None,
+            supersedes: None,
+            note: Some("after review".into()),
+            created_at: now,
+            payload_elided: false,
+        };
+        let size = |event: &ClaimLifecycleEventV1| serde_json::to_vec(event).unwrap().len() + 1;
+        let history = ClaimHistoryV1 {
+            events: vec![
+                event(1, "conflict_detected"),
+                event(2, "conflict_detected"),
+                event(3, "superseded_by_author"),
+            ],
+            truncated: false,
+            supersedes: Some(7),
+        };
+        // Room for the newest two, not the oldest.
+        let budget = size(&history.events[1]) + size(&history.events[2]);
+        let cut = claim_history_within_bytes(history.clone(), budget);
+        assert_eq!(
+            cut.events
+                .iter()
+                .map(|event| event.revision_before)
+                .collect::<Vec<_>>(),
+            [Some(2), Some(3)]
+        );
+        assert!(cut.truncated);
+        assert_eq!(cut.supersedes, Some(7));
+        let whole = claim_history_within_bytes(history, usize::MAX);
+        assert_eq!(whole.events.len(), 3);
+        assert!(!whole.truncated);
+
+        // The wire shape carries only what the transition named.
+        let wire = serde_json::to_value(event(3, "superseded_by_author")).unwrap();
+        assert_eq!(wire["kind"], "state_transition");
+        assert_eq!(wire["actor"], "agent-a");
+        assert_eq!(wire["reason"], "superseded_by_author");
+        assert_eq!(wire["from_state"], "active");
+        assert_eq!(wire["to_state"], "superseded");
+        assert_eq!(wire["revision_before"], 3);
+        assert_eq!(wire["successor_claim_id"], 99);
+        assert_eq!(wire["note"], "after review");
+        assert!(wire.get("conflict_id").is_none(), "{wire}");
+        assert!(wire.get("supersedes").is_none(), "{wire}");
+        assert!(wire.get("payload_elided").is_none(), "{wire}");
+        let detected = serde_json::to_value(event(1, "conflict_detected")).unwrap();
+        assert!(detected.get("successor_claim_id").is_none(), "{detected}");
     }
 
     #[test]

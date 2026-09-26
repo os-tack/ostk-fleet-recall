@@ -603,7 +603,8 @@ pub const MAX_CLAIM_HISTORY_EVENTS: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimLifecycleEventV1 {
     pub event_id: String,
-    /// The event kind, `state_transition` for every logged transition.
+    /// `recorded` for the claim's birth (`to_state` active, no reason), then
+    /// `state_transition` for every logged transition.
     pub kind: String,
     /// The agent whose mutation wrote it: the author for a retract or
     /// supersede, the recording agent for a detected conflict, the closer
@@ -623,6 +624,9 @@ pub struct ClaimLifecycleEventV1 {
     /// For `conflict_detected` and a close's restore, the conflict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_id: Option<i64>,
+    /// For a successor's `recorded` event, the predecessor it superseded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<i64>,
     /// The audit note the author sent with the mutation, when any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,

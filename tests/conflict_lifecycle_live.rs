@@ -5736,3 +5736,386 @@ async fn live_underscore_and_space_spellings_share_one_claim_key_when_configured
 
     fleet.cleanup().await;
 }
+
+/// An agent never disputes itself: a `record` that would dispute the
+/// caller's own current claim on the key is refused with the claim to
+/// supersede and writes nothing; the supersede is accepted and joins the
+/// conflict; the exact-key lookup then shows both agents' current claims and
+/// the open conflict (and, with history, the superseded predecessor); and a
+/// claim's `get` carries its lifecycle history with actor and reason and
+/// names what it superseded.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one key followed through refusal, succession, lookup, and history
+async fn live_self_dispute_is_refused_and_key_lookup_shows_the_chain_when_configured() {
+    let Some(database_url) = database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "self-dispute").await;
+    let scope_a = fleet.scope(AGENT_A);
+    let refusing = fleet.ledger(AGENT_A).with_self_dispute_refusal(true);
+    assert!(refusing.refuses_self_dispute());
+    assert!(!fleet.ledger(AGENT_A).refuses_self_dispute());
+    let subject = "self-dispute";
+    let claim_key = "self-dispute::database-choice";
+
+    let x = refusing
+        .record_claim(
+            &scope_a,
+            &decision(subject, &json!("x"), 1),
+            &fleet.key("a/x"),
+        )
+        .await
+        .expect("the first claim on a key is recorded");
+    assert_eq!(x.claim.claim_key.as_deref(), Some(claim_key));
+    let y = fleet
+        .record(AGENT_B, &decision(subject, &json!("y"), 1), "b/y")
+        .await;
+    let conflict_id = y.claim.conflict_ids[0];
+    let x_disputed = fleet.claim(x.claim.id).await;
+    assert_eq!(x_disputed.state, ClaimState::Disputed);
+    let claims_before = fleet.tenant_claim_count().await;
+
+    // The same agent, another value: refused, naming exactly what to send.
+    let refused = refusal(
+        refusing
+            .record_claim(
+                &scope_a,
+                &decision(subject, &json!("z"), 1),
+                &fleet.key("a/z"),
+            )
+            .await,
+    );
+    assert_eq!(refused.code, RefusalCode::OwnCurrentClaimOnKey);
+    assert_eq!(
+        refused.details,
+        json!({
+            "claim_id": x.claim.id,
+            "revision": x_disputed.revision,
+            "claim_key": claim_key,
+        })
+    );
+    assert_eq!(
+        refused.message,
+        format!(
+            "you hold a current claim on this key; send supersede with claim_id {}, \
+             expected_revision {}",
+            x.claim.id, x_disputed.revision
+        )
+    );
+    assert_eq!(fleet.tenant_claim_count().await, claims_before);
+    assert_eq!(fleet.receipt_count("a/z").await, 0);
+    assert!(fleet.keyed_events("a/z").await.is_empty());
+    // The same value again is not a dispute, so it is not refused; and the
+    // record-only writer keeps detecting a self-conflict as before.
+    let same = refusing
+        .record_claim(
+            &scope_a,
+            &decision(subject, &json!("x"), 1),
+            &fleet.key("a/x-again"),
+        )
+        .await
+        .expect("a compatible own claim is recorded");
+    assert_eq!(same.claim.state, ClaimState::Disputed);
+    let retracted = fleet
+        .retract(
+            AGENT_A,
+            same.claim.id,
+            same.claim.revision,
+            "a/x-again/retract",
+        )
+        .await
+        .expect("the duplicate is retracted again");
+    assert_eq!(retracted.claim.state, ClaimState::Retracted);
+    let other_subject = "self-dispute-record-only";
+    let p = fleet
+        .record(AGENT_A, &decision(other_subject, &json!("p"), 1), "a/p")
+        .await;
+    let q = fleet
+        .record(AGENT_A, &decision(other_subject, &json!("q"), 1), "a/q")
+        .await;
+    assert_eq!(q.claim.conflict_ids.len(), 1);
+    assert_eq!(fleet.claim(p.claim.id).await.state, ClaimState::Disputed);
+
+    // The exit the refusal named: supersede, through the service.
+    let private = fleet.full_service(AGENT_A);
+    let mut successor = decision(subject, &json!("z"), 1);
+    successor.text = "lifecycle fixture changes its mind to z".into();
+    let superseded = FleetMemoryService::remember(
+        &private,
+        scope_a.clone(),
+        supersede_request(
+            fleet.key("a/supersede"),
+            x.claim.id,
+            x_disputed.revision,
+            &successor,
+        ),
+    )
+    .await
+    .expect("the owner supersede commits");
+    let mutation: ClaimMutation = serde_json::from_value(superseded.data.clone()).unwrap();
+    let z_id = mutation.claim.id;
+    assert_eq!(mutation.claim.state, ClaimState::Disputed);
+    assert_eq!(mutation.claim.conflict_ids, [conflict_id]);
+    assert_eq!(fleet.claim(x.claim.id).await.superseded_by, Some(z_id));
+
+    // Exact-key lookup, by parts and by the stored key.
+    let by_parts = recall(
+        &private,
+        &scope_a,
+        RecallAction::Get,
+        json!({ "kind": "claim", "subject": " Self_Dispute ", "predicate": "database choice" }),
+    )
+    .await
+    .expect("the key lookup is served");
+    assert_eq!(by_parts.data["claim_key"], claim_key);
+    assert_eq!(by_parts.data["include_history"], false);
+    assert_eq!(by_parts.data["claims_truncated"], false);
+    let current = by_parts.data["claims"].as_array().unwrap();
+    assert_eq!(
+        current
+            .iter()
+            .map(|claim| (
+                claim["id"].as_i64().unwrap(),
+                claim["actor"].as_str().unwrap().to_owned(),
+                claim["state"].as_str().unwrap().to_owned(),
+                claim["value"].clone(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                y.claim.id,
+                AGENT_B.to_owned(),
+                "disputed".to_owned(),
+                json!("y")
+            ),
+            (z_id, AGENT_A.to_owned(), "disputed".to_owned(), json!("z")),
+        ]
+    );
+    for claim in current {
+        assert_eq!(claim["conflict_ids"], json!([conflict_id]));
+        assert_eq!(claim["revision"], 2);
+        assert!(claim["support"].is_array());
+        assert!(claim.get("value_elided").is_none(), "{claim}");
+        assert!(claim["created_at"].is_string());
+    }
+    assert_eq!(by_parts.data["open_conflict"]["id"], conflict_id);
+    assert_eq!(by_parts.data["open_conflict"]["state"], "open");
+    assert_eq!(by_parts.conflicts.len(), 1);
+    assert_eq!(by_parts.conflicts[0]["id"], conflict_id);
+    assert_eq!(by_parts.conflict_coverage.status, "complete");
+    assert!(by_parts.conflicts[0]["lifecycle"].is_object());
+
+    let with_history = recall(
+        &private,
+        &scope_a,
+        RecallAction::Get,
+        json!({ "kind": "claim", "key": claim_key, "include_history": true }),
+    )
+    .await
+    .expect("the key lookup is served");
+    let history_ids = with_history.data["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|claim| {
+            (
+                claim["id"].as_i64().unwrap(),
+                claim["state"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        history_ids,
+        [
+            (x.claim.id, "superseded".to_owned()),
+            (y.claim.id, "disputed".to_owned()),
+            (same.claim.id, "retracted".to_owned()),
+            (z_id, "disputed".to_owned()),
+        ]
+    );
+    assert_eq!(with_history.data["claims"][0]["superseded_by"], json!(z_id));
+    // A key nobody recorded is empty, not an error.
+    let empty = recall(
+        &private,
+        &scope_a,
+        RecallAction::Get,
+        json!({ "kind": "claim", "key": "nobody::recorded-this" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(empty.data["claims"], json!([]));
+    assert!(empty.data["open_conflict"].is_null());
+    assert!(empty.conflicts.is_empty());
+    // The same key filter on the conflict list.
+    let listed = recall(
+        &private,
+        &scope_a,
+        RecallAction::Conflicts,
+        json!({ "claim_key": claim_key }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed.data["conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(listed.data["conflicts"][0]["id"], conflict_id);
+    let none = recall(
+        &private,
+        &scope_a,
+        RecallAction::Conflicts,
+        json!({ "claim_key": "nobody::recorded-this", "include_resolved": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(none.data["conflicts"], json!([]));
+
+    // Retract the successor with a reason, then read both histories.
+    let z_revision = fleet.claim(z_id).await.revision;
+    FleetMemoryService::remember(
+        &private,
+        scope_a.clone(),
+        RememberRequest::new(
+            RememberAction::Retract,
+            Some(fleet.key("a/z/retract")),
+            Map::from_iter([
+                ("claim_id".into(), json!(z_id)),
+                ("expected_revision".into(), json!(z_revision)),
+                ("reason".into(), json!("the storage review chose y")),
+            ]),
+        ),
+    )
+    .await
+    .expect("the owner retract commits");
+
+    let x_get = recall(
+        &private,
+        &scope_a,
+        RecallAction::Get,
+        json!({ "kind": "claim", "id": x.claim.id }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        x_get.data["claim"].get("supersedes").is_none(),
+        "{}",
+        x_get.data
+    );
+    assert_eq!(x_get.data["history_truncated"], false);
+    let x_history = x_get.data["history"].as_array().unwrap();
+    let transitions = |events: &[Value]| {
+        events
+            .iter()
+            .map(|event| {
+                (
+                    event["reason"].as_str().unwrap_or_default().to_owned(),
+                    event["actor"].as_str().unwrap_or_default().to_owned(),
+                    event["from_state"].as_str().unwrap_or_default().to_owned(),
+                    event["to_state"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // Birth, then every transition, each with who and why.
+    assert_eq!(
+        transitions(x_history),
+        [
+            (
+                String::new(),
+                AGENT_A.to_owned(),
+                String::new(),
+                "active".to_owned()
+            ),
+            (
+                "conflict_detected".to_owned(),
+                AGENT_B.to_owned(),
+                "active".to_owned(),
+                "disputed".to_owned()
+            ),
+            (
+                "superseded_by_author".to_owned(),
+                AGENT_A.to_owned(),
+                "disputed".to_owned(),
+                "superseded".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(x_history[0]["kind"], "recorded");
+    assert!(x_history[0].get("supersedes").is_none(), "{}", x_history[0]);
+    assert_eq!(x_history[1]["kind"], "state_transition");
+    assert_eq!(x_history[1]["conflict_id"], conflict_id);
+    assert_eq!(x_history[2]["successor_claim_id"], z_id);
+    assert_eq!(x_history[2]["revision_before"], x_disputed.revision);
+    assert!(x_history[2]["event_id"].is_string());
+    assert!(x_history[2]["created_at"].is_string());
+
+    let z_get = recall(
+        &private,
+        &scope_a,
+        RecallAction::Get,
+        json!({ "kind": "claim", "id": z_id }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(z_get.data["claim"]["supersedes"], json!(x.claim.id));
+    assert_eq!(z_get.data["claim"]["state"], "retracted");
+    let z_history = z_get.data["history"].as_array().unwrap();
+    assert_eq!(
+        transitions(z_history),
+        [
+            (
+                String::new(),
+                AGENT_A.to_owned(),
+                String::new(),
+                "active".to_owned()
+            ),
+            (
+                "conflict_detected".to_owned(),
+                AGENT_A.to_owned(),
+                "active".to_owned(),
+                "disputed".to_owned()
+            ),
+            (
+                "retracted_by_author".to_owned(),
+                AGENT_A.to_owned(),
+                "disputed".to_owned(),
+                "retracted".to_owned()
+            ),
+        ]
+    );
+    // A successor's birth names its predecessor.
+    assert_eq!(z_history[0]["kind"], "recorded");
+    assert_eq!(z_history[0]["supersedes"], json!(x.claim.id));
+    assert_eq!(z_history[2]["note"], "the storage review chose y");
+    assert!(z_history[1].get("note").is_none(), "{}", z_history[1]);
+    // The conflict closed behind the retract, and y was restored: its
+    // history says so too.
+    let y_get = recall(
+        &private,
+        &scope_a,
+        RecallAction::Get,
+        json!({ "kind": "claim", "id": y.claim.id }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(y_get.data["claim"]["state"], "active");
+    let y_history = y_get.data["history"].as_array().unwrap();
+    assert_eq!(y_history.len(), 3, "{y_history:?}");
+    assert_eq!(y_history[0]["kind"], "recorded");
+    assert_eq!(y_history[1]["reason"], "conflict_detected");
+    assert_eq!(y_history[2]["from_state"], "disputed");
+    assert_eq!(y_history[2]["to_state"], "active");
+    assert_eq!(y_history[2]["actor"], AGENT_A);
+    assert_eq!(y_history[2]["conflict_id"], conflict_id);
+    // An absent claim has no history field at all.
+    let missing = recall(
+        &private,
+        &scope_a,
+        RecallAction::Get,
+        json!({ "kind": "claim", "id": z_id + 1_000_000 }),
+    )
+    .await
+    .unwrap();
+    assert!(missing.data["claim"].is_null());
+    assert!(missing.data.get("history").is_none());
+    fleet.assert_lifecycle_invariants().await;
+
+    fleet.cleanup().await;
+}

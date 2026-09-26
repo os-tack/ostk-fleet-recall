@@ -765,6 +765,9 @@ fn named(groups: &[&[&'static str]]) -> Vec<&'static str> {
 /// The claim-lifecycle rule every surface serving supersede states.
 const SUCCESSOR_RULE: &str = "A successor keeps its predecessor's kind, subject/predicate key, and conflict eligibility: a keyed decision, fact, constraint, preference, or procedure keeps carrying a value, and a valueless one gains none. ";
 
+/// The self-dispute refusal, on every surface that serves `supersede`.
+const OWN_KEY_RULE: &str = "record is refused (own_current_claim_on_key) when you already hold a lifecycle-current claim on the key that the new value would dispute: nothing is written, and details name the claim_id and revision to send with supersede instead. ";
+
 /// When a concession closes a conflict. Recorded dismissals count on every
 /// writer that reads the lifecycle log, whether or not it serves dismiss.
 const RESOLVE_RULE: &str = "resolve concedes: it retracts only your own member claims named in retract_claim_ids, and the conflict closes only if no incompatible current pair remains other than pairs an adjudicator dismissed in this conflict; otherwise nothing changes. ";
@@ -822,7 +825,7 @@ fn remember_description(surface: RememberSurface) -> String {
     }
     if !surface.conflict_lifecycle {
         return format!(
-            "Deliberately record fleet memory, or supersede or retract claims you authored. {SUCCESSOR_RULE}{assert_rule}{capture_rule}{item_rule}{WRITE_GUARANTEES}"
+            "Deliberately record fleet memory, or supersede or retract claims you authored. {SUCCESSOR_RULE}{OWN_KEY_RULE}{assert_rule}{capture_rule}{item_rule}{WRITE_GUARANTEES}"
         );
     }
     let adjudication = surface.serves_adjudication();
@@ -843,13 +846,18 @@ fn remember_description(surface: RememberSurface) -> String {
     } else {
         ""
     };
+    let own_key_rule = if surface.claim_lifecycle {
+        OWN_KEY_RULE
+    } else {
+        ""
+    };
     let adjudication_rules = if adjudication {
         "dismiss and waive are refused (implicated) when you authored any member claim of the conflict, in any episode. dismiss judges the conflict not a real disagreement: it closes as dismissed, and the pairs it judged never keep it open again. waive accepts the current episode until expires_in_hours: the conflict stays open and visible and reads waived until the waiver expires or a member joins. "
     } else {
         ""
     };
     format!(
-        "Deliberately record fleet memory, {actions}. {successor_rule}acknowledge marks a conflict's current episode as seen and changes nothing else. {RESOLVE_RULE}{adjudication_rules}{CLOSE_RESTORES_MEMBERS}{assert_rule}{capture_rule}{item_rule}{WRITE_GUARANTEES}"
+        "Deliberately record fleet memory, {actions}. {successor_rule}{own_key_rule}acknowledge marks a conflict's current episode as seen and changes nothing else. {RESOLVE_RULE}{adjudication_rules}{CLOSE_RESTORES_MEMBERS}{assert_rule}{capture_rule}{item_rule}{WRITE_GUARANTEES}"
     )
 }
 
@@ -2079,6 +2087,43 @@ mod tests {
     /// or not it serves dismiss itself.
     #[test]
     fn conflict_surfaces_describe_close_effects_on_every_writer() {
+        // The self-dispute refusal is described exactly where supersede is
+        // served, beside the successor rule.
+        for surface in [
+            lifecycle_surface(),
+            conflict_surface(),
+            adjudication_surface(),
+        ] {
+            let description = remember_tool_for(surface)["description"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                description.contains("own_current_claim_on_key"),
+                "{surface:?}: {description}"
+            );
+            assert!(
+                description.find("A successor keeps")
+                    < description.find("own_current_claim_on_key"),
+                "{surface:?}: {description}"
+            );
+        }
+        for surface in [
+            RememberSurface::RECORD_ONLY,
+            RememberSurface {
+                claim_lifecycle: false,
+                ..conflict_surface()
+            },
+        ] {
+            let description = remember_tool_for(surface)["description"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                !description.contains("own_current_claim_on_key"),
+                "{surface:?}: {description}"
+            );
+        }
         for surface in [
             conflict_surface(),
             adjudication_surface(),

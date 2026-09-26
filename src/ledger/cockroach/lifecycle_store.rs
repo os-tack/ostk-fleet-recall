@@ -720,7 +720,7 @@ async fn supersede_once(
     )
     .await?;
     let (conflicts_opened, detection) =
-        detect_and_observe(transaction, scope, &mut claim, successor, prepared).await?;
+        detect_and_observe(transaction, scope, &mut claim, successor, prepared, None).await?;
 
     let linked_revision = sqlx::query_scalar::<_, i64>(SET_SUPERSEDED_BY_SQL)
         .bind(scope.tenant_id)

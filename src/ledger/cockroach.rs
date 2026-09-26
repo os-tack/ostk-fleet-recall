@@ -260,13 +260,13 @@ const CURRENT_CONFLICT_DETECTOR_WRITE_PROBE_SQL: &str = "SELECT CASE detector \
      WHERE tenant_id = $1 AND project = $2 AND claim_key = $3 \
      ORDER BY detector LIMIT 3 FOR UPDATE";
 const INCOMPATIBLE_CURRENT_CLAIMS_SQL: &str = "WITH candidates AS MATERIALIZED (\
-       SELECT id, value, polarity, valid_from, valid_to, conflict_eligible \
+       SELECT id, actor, revision, value, polarity, valid_from, valid_to, conflict_eligible \
        FROM memory_claims@memory_claims_scope_key_idx \
        WHERE tenant_id = $1 AND project = $2 AND id <> $3 \
          AND claim_key = $4 AND state IN ('active', 'disputed') \
        ORDER BY state, id LIMIT $9\
      ) \
-     SELECT id, \
+     SELECT id, actor, revision, \
             (conflict_eligible \
              AND ((polarity = 1 AND $6 = 1 AND value IS DISTINCT FROM $5) \
                   OR (polarity <> $6 AND value IS NOT DISTINCT FROM $5)) \
@@ -339,6 +339,11 @@ pub struct CockroachClaimLedger {
     /// collected item is refused as `item_support_unavailable` (ADR 0008
     /// D11).
     claim_item_links: Option<ClaimItemLinksCapability>,
+    /// Refuse a `record` that would dispute a lifecycle-current claim the
+    /// caller itself holds on the key (`own_current_claim_on_key`), so the
+    /// caller supersedes it instead. Set where `supersede` is served; the
+    /// record-only surface keeps detecting a self-conflict as before.
+    refuse_self_dispute: bool,
 }
 
 impl std::fmt::Debug for CockroachClaimLedger {
@@ -389,7 +394,25 @@ impl CockroachClaimLedger {
             conflict_adjudication: false,
             event_first_assert: None,
             claim_item_links: None,
+            refuse_self_dispute: false,
         })
+    }
+
+    /// Refuse a `record` that would dispute the caller's own lifecycle-current
+    /// claim on the key (`own_current_claim_on_key`), naming the claim to
+    /// supersede. Only a writer that serves `supersede` sets this: the
+    /// refusal is the controls to supersede made unavoidable, and it has no
+    /// exit on a record-only surface.
+    #[must_use]
+    pub const fn with_self_dispute_refusal(mut self, refuse: bool) -> Self {
+        self.refuse_self_dispute = refuse;
+        self
+    }
+
+    /// Whether this ledger refuses a self-dispute on `record`.
+    #[must_use]
+    pub const fn refuses_self_dispute(&self) -> bool {
+        self.refuse_self_dispute
     }
 
     /// Serve the conflict lifecycle (`acknowledge`, concession `resolve`, the
@@ -584,6 +607,7 @@ impl ClaimLedger for CockroachClaimLedger {
         }
         let prepared = input.prepare()?;
         let item_links = self.claim_item_links;
+        let refuse_self_dispute = self.refuse_self_dispute;
         let request = serde_json::json!({
             "scope": {
                 "project": scope.project,
@@ -678,8 +702,15 @@ impl ClaimLedger for CockroachClaimLedger {
                     item_links,
                 )
                 .await?;
-                let (conflicts_opened, conflict_detection) =
-                    detect_and_observe(transaction, &scope, &mut claim, &input, &prepared).await?;
+                let (conflicts_opened, conflict_detection) = detect_and_observe(
+                    transaction,
+                    &scope,
+                    &mut claim,
+                    &input,
+                    &prepared,
+                    refuse_self_dispute.then_some(scope.agent.as_str()),
+                )
+                .await?;
 
                 let event_payload =
                     claim_recorded_event_payload(claim.claim_key.as_deref(), conflict_detection);
@@ -1808,6 +1839,14 @@ async fn insert_claim_projection(
 /// exists, disputing every member. Returns the conflicts this call opened or
 /// reopened and the audit for its `claim_recorded` event (`None` when the
 /// claim is not conflict-eligible).
+///
+/// With `refuse_own_dispute` naming the calling agent, an incompatible
+/// candidate that agent authored refuses the whole mutation before anything
+/// is disputed (`own_current_claim_on_key`): the agent holds a current claim
+/// on the key and must supersede it. `record` passes the agent where the
+/// writer serves `supersede`; `supersede` and `assert` never do (a
+/// successor's predecessor is already retired, and an assertion is a new
+/// statement of its own).
 #[allow(clippy::too_many_lines)] // the detector's bounded compare-and-join is one unit
 async fn detect_and_observe(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
@@ -1815,6 +1854,7 @@ async fn detect_and_observe(
     claim: &mut Claim,
     input: &ClaimInput,
     prepared: &PreparedClaim,
+    refuse_own_dispute: Option<&str>,
 ) -> Result<(Vec<i64>, Option<ConflictDetectionAudit>)> {
     let mut conflicts_opened = Vec::new();
     let conflict_detection = if let (true, Some(claim_key), Some(value)) = (
@@ -1825,33 +1865,47 @@ async fn detect_and_observe(
         require_current_conflict_detector(transaction, scope, claim_key).await?;
         let comparison_bound = i64::try_from(MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON)
             .map_err(|_| protocol_error("conflict mutation bound is outside INT8 range"))?;
-        let candidate_rows = sqlx::query_as::<_, (i64, bool, i64)>(INCOMPATIBLE_CURRENT_CLAIMS_SQL)
-            .bind(scope.tenant_id)
-            .bind(&scope.project)
-            .bind(claim.id)
-            .bind(claim_key)
-            .bind(value)
-            .bind(input.polarity)
-            .bind(input.valid_from)
-            .bind(input.valid_to)
-            .bind(comparison_bound + 1)
-            .fetch_all(&mut **transaction)
-            .await?;
+        let candidate_rows = sqlx::query_as::<_, (i64, Option<String>, i64, bool, i64)>(
+            INCOMPATIBLE_CURRENT_CLAIMS_SQL,
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(claim.id)
+        .bind(claim_key)
+        .bind(value)
+        .bind(input.polarity)
+        .bind(input.valid_from)
+        .bind(input.valid_to)
+        .bind(comparison_bound + 1)
+        .fetch_all(&mut **transaction)
+        .await?;
 
-        let candidate_count = candidate_rows.first().map_or(0, |row| row.2);
+        let candidate_count = candidate_rows.first().map_or(0, |row| row.4);
         if candidate_count > comparison_bound {
             return Err(FleetError::Memory(format!(
                 "same-key comparison exceeds the bounded mutation limit of {MAX_CURRENT_CLAIMS_PER_KEY_COMPARISON} lifecycle-current claims"
             )));
         }
-        if candidate_rows.iter().any(|row| row.2 != candidate_count) {
+        if candidate_rows.iter().any(|row| row.4 != candidate_count) {
             return Err(protocol_error(
                 "same-key comparison returned an inconsistent candidate count",
             ));
         }
+        // The rows arrive in id order, so the first own incompatible claim is
+        // the oldest one the caller holds.
+        if let Some(agent) = refuse_own_dispute
+            && let Some((own_id, _, own_revision, _, _)) =
+                candidate_rows
+                    .iter()
+                    .find(|(_, actor, _, incompatible, _)| {
+                        *incompatible && actor.as_deref() == Some(agent)
+                    })
+        {
+            return Err(own_current_claim_on_key(*own_id, *own_revision, claim_key).into());
+        }
         let mut incompatible_ids = candidate_rows
             .iter()
-            .filter_map(|(id, incompatible, _)| incompatible.then_some(id))
+            .filter_map(|(id, _, _, incompatible, _)| incompatible.then_some(id))
             .copied()
             .collect::<Vec<_>>();
         incompatible_ids.sort_unstable();
@@ -1916,6 +1970,24 @@ async fn detect_and_observe(
         None
     };
     Ok((conflicts_opened, conflict_detection))
+}
+
+/// The refusal of a `record` that would dispute the caller's own current
+/// claim on the key: nothing is written, and the caller is told exactly what
+/// to send instead.
+fn own_current_claim_on_key(claim_id: i64, revision: i64, claim_key: &str) -> LifecycleRefusal {
+    LifecycleRefusal::new(
+        RefusalCode::OwnCurrentClaimOnKey,
+        format!(
+            "you hold a current claim on this key; send supersede with claim_id {claim_id}, \
+             expected_revision {revision}"
+        ),
+        serde_json::json!({
+            "claim_id": claim_id,
+            "revision": revision,
+            "claim_key": claim_key,
+        }),
+    )
 }
 
 /// The `claim_recorded` audit event of a newly inserted claim. Record keys it
@@ -3255,6 +3327,33 @@ mod tests {
         assert!(INCOMPATIBLE_CURRENT_CLAIMS_SQL.contains("candidates AS MATERIALIZED"));
         assert!(
             INCOMPATIBLE_CURRENT_CLAIMS_SQL.contains("count(*) OVER ()::INT8 AS candidate_count")
+        );
+        // The self-dispute check reads each candidate's author and revision
+        // from the same bounded seek, so it costs no second read.
+        assert!(INCOMPATIBLE_CURRENT_CLAIMS_SQL.contains("SELECT id, actor, revision, value"));
+        assert!(
+            INCOMPATIBLE_CURRENT_CLAIMS_SQL
+                .contains("SELECT id, actor, revision, (conflict_eligible")
+        );
+    }
+
+    #[test]
+    fn self_dispute_refusal_names_the_claim_to_supersede() {
+        let refusal = own_current_claim_on_key(41, 3, "merged-build::rollout-mode");
+        assert_eq!(refusal.code, RefusalCode::OwnCurrentClaimOnKey);
+        assert_eq!(refusal.code.as_str(), "own_current_claim_on_key");
+        assert_eq!(
+            refusal.message,
+            "you hold a current claim on this key; send supersede with claim_id 41, \
+             expected_revision 3"
+        );
+        assert_eq!(
+            refusal.details,
+            serde_json::json!({
+                "claim_id": 41,
+                "revision": 3,
+                "claim_key": "merged-build::rollout-mode",
+            })
         );
     }
 

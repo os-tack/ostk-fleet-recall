@@ -65,14 +65,17 @@ const CONFLICT_IDS_FOR_KEY_SQL: &str = "SELECT id \
      ORDER BY detector LIMIT 3";
 
 /// A claim's newest lifecycle events through the claim index, payload
-/// transferred only within the bound.
+/// transferred only within the bound. Events of one transaction share its
+/// `created_at`, so within a tie the claim's birth sorts before its
+/// transition (a `record` disputed in the call, a successor that joins the
+/// conflict); event ids are random and break no further tie.
 const CLAIM_HISTORY_SQL: &str = "SELECT event_id, event_kind, actor, reason, from_state, to_state, \
             created_at, \
             CASE WHEN octet_length(payload::STRING) <= $5 THEN payload END AS payload, \
             octet_length(payload::STRING) > $5 AS payload_elided \
      FROM memory_claim_events@memory_claim_events_claim_idx \
      WHERE tenant_id = $1 AND project = $2 AND claim_id = $3 \
-     ORDER BY created_at DESC, event_id DESC LIMIT $4";
+     ORDER BY created_at DESC, (event_kind = 'recorded') ASC, event_id DESC LIMIT $4";
 
 /// The stored key of one claim, for the predecessor seek below.
 const CLAIM_KEY_SQL: &str = "SELECT claim_key FROM memory_claims@primary \
@@ -303,6 +306,7 @@ fn decode_claim_event(row: &PgRow) -> Result<ClaimLifecycleEventV1> {
         revision_before: integer("revision_before"),
         successor_claim_id: integer("successor_claim_id"),
         conflict_id: integer("conflict_id"),
+        supersedes: integer("supersedes"),
         note: field("reason").and_then(Value::as_str).map(str::to_owned),
         created_at: row.try_get("created_at")?,
         payload_elided,
@@ -365,7 +369,9 @@ mod tests {
         assert!(CONFLICT_IDS_FOR_KEY_SQL.contains("ORDER BY detector LIMIT 3"));
 
         assert!(CLAIM_HISTORY_SQL.contains("memory_claim_events@memory_claim_events_claim_idx"));
-        assert!(CLAIM_HISTORY_SQL.contains("ORDER BY created_at DESC, event_id DESC LIMIT $4"));
+        assert!(CLAIM_HISTORY_SQL.contains(
+            "ORDER BY created_at DESC, (event_kind = 'recorded') ASC, event_id DESC LIMIT $4"
+        ));
         assert!(CLAIM_HISTORY_SQL.contains("octet_length(payload::STRING) <= $5"));
 
         assert!(PREDECESSOR_SQL.contains("memory_claims@memory_claims_scope_key_idx"));

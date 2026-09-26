@@ -128,6 +128,10 @@ pub enum RefusalCode {
     SupportItemWithdrawn,
     /// Two support entries cite one version of one collected item.
     SupportItemDuplicate,
+    /// `record` would dispute a lifecycle-current claim the caller itself
+    /// holds on the key; the caller must supersede that claim instead.
+    /// `details` names its `claim_id`, `revision`, and `claim_key`.
+    OwnCurrentClaimOnKey,
 }
 
 impl RefusalCode {
@@ -165,6 +169,7 @@ impl RefusalCode {
             Self::SupportItemPending => "support_item_pending",
             Self::SupportItemWithdrawn => "support_item_withdrawn",
             Self::SupportItemDuplicate => "support_item_duplicate",
+            Self::OwnCurrentClaimOnKey => "own_current_claim_on_key",
         }
     }
 }

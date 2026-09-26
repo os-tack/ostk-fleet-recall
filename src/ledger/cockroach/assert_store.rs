@@ -485,6 +485,7 @@ impl ClaimAssertProjection {
             .take()
     }
 
+    #[allow(clippy::too_many_lines)] // the event-first projection is kept visibly in one unit
     async fn write(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
@@ -553,8 +554,15 @@ impl ClaimAssertProjection {
                 .collect();
             insert_assert_links(transaction, scope, claim.id, event_id.digest(), &linked).await?;
         }
-        let (conflicts_opened, conflict_detection) =
-            detect_and_observe(transaction, scope, &mut claim, &self.input, &self.prepared).await?;
+        let (conflicts_opened, conflict_detection) = detect_and_observe(
+            transaction,
+            scope,
+            &mut claim,
+            &self.input,
+            &self.prepared,
+            None,
+        )
+        .await?;
         let mut payload =
             claim_recorded_event_payload(claim.claim_key.as_deref(), conflict_detection);
         if let Some(payload) = payload.as_object_mut() {
