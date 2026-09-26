@@ -5682,6 +5682,7 @@ async fn live_concurrent_dismiss_and_join_refuses_stale_member_count_when_config
 /// (the trial's conflict scenario, steps 1 and 4), and `recall(status)` counts
 /// no legacy key in the project.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one key across two spellings, then the status counts it feeds
 async fn live_underscore_and_space_spellings_share_one_claim_key_when_configured() {
     let Some(database_url) = database_url() else {
         return;
@@ -5770,6 +5771,74 @@ async fn live_underscore_and_space_spellings_share_one_claim_key_when_configured
         "{:?}",
         status.warnings
     );
+    // The counts an operator can act on: the one open conflict, none of it
+    // acknowledged or waived yet, the quarantine empty, and no absence
+    // contract where no verdict is served.
+    assert_eq!(status.data["conflicts"]["open"], 1);
+    assert_eq!(status.data["conflicts"]["acknowledged"], 0);
+    assert_eq!(status.data["conflicts"]["waived"], 0);
+    assert_eq!(status.data["conflicts"]["bound_exceeded"], false);
+    assert_eq!(
+        status.data["conflicts"]["oldest_open_at"],
+        json!(conflict.detected_at)
+    );
+    assert_eq!(
+        status.data["quarantine"],
+        json!({ "by_reason": {}, "bound_exceeded": false, "preimage_disagreement_sample": [] })
+    );
+    assert!(status.data.get("absence_contract").is_none());
+    assert!(
+        !status.warnings.iter().any(|warning| {
+            warning["code"] == "conflicts_status_unavailable"
+                || warning["code"] == "quarantine_unavailable"
+        }),
+        "{:?}",
+        status.warnings
+    );
+    fleet
+        .acknowledge(AGENT_C, conflict_id, conflict.revision, "c/ack")
+        .await
+        .expect("a third agent acknowledges");
+    let status = recall(
+        &service,
+        &fleet.scope(AGENT_A),
+        RecallAction::Status,
+        json!({}),
+    )
+    .await
+    .expect("status is served");
+    assert_eq!(status.data["conflicts"]["open"], 1);
+    assert_eq!(status.data["conflicts"]["acknowledged"], 1);
+    assert_eq!(status.data["conflicts"]["waived"], 0);
+    // Without the overlay the lifecycle counts are unknown, not zero, and
+    // the publication reader reads no quarantine.
+    let status = recall(
+        &fleet.service(AGENT_A, PRIVATE_WRITER),
+        &fleet.scope(AGENT_A),
+        RecallAction::Status,
+        json!({}),
+    )
+    .await
+    .expect("status is served");
+    assert_eq!(status.data["conflicts"]["open"], 1);
+    assert!(status.data["conflicts"]["acknowledged"].is_null());
+    let publication = CockroachMemoryService::publication(
+        fleet.scope("demo"),
+        Arc::new(fleet.store.clone()),
+        Arc::new(fleet.ledger("demo")),
+        Arc::new(UnitEmbedder),
+    )
+    .expect("publication service");
+    let status = recall(
+        &publication,
+        &fleet.scope("demo"),
+        RecallAction::Status,
+        json!({}),
+    )
+    .await
+    .expect("status is served");
+    assert_eq!(status.data["conflicts"]["open"], 1);
+    assert!(status.data.get("quarantine").is_none());
     fleet.assert_lifecycle_invariants().await;
 
     fleet.cleanup().await;

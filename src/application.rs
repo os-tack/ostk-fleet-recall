@@ -1307,17 +1307,42 @@ impl CockroachMemoryService {
         if let Some(status) = &self.capture_status {
             result.data["remember_capture"] = json!(status);
         }
-        let ((evidence, spec_conformance), (legacy_claim_keys, legacy_warnings)) = tokio::join!(
+        // The evidence quarantine is a private read: the publication role
+        // has no grant on it, and the demo's status keeps its shape.
+        let quarantine = async {
+            if self.withhold_asserted_claims {
+                None
+            } else {
+                Some(
+                    quarantine_status_within(self.corpus.pool(), scope, OPTIONAL_STATUS_DEADLINE)
+                        .await,
+                )
+            }
+        };
+        let (
+            (evidence, spec_conformance),
+            (legacy_claim_keys, legacy_warnings),
+            (conflicts, conflict_warnings),
+            quarantine,
+        ) = tokio::join!(
             optional_status_blocks(
                 self.evidence.as_deref(),
                 self.spec_conformance.as_deref(),
                 OPTIONAL_STATUS_DEADLINE,
             ),
             legacy_claim_keys_within(self.ledger.as_ref(), scope, OPTIONAL_STATUS_DEADLINE),
+            conflicts_status_within(
+                self.ledger.as_ref(),
+                scope,
+                self.lifecycle.lifecycle_overlay,
+                OPTIONAL_STATUS_DEADLINE,
+            ),
+            quarantine,
         );
         for (name, block) in [
             ("evidence", evidence),
             ("spec_conformance", spec_conformance),
+            ("quarantine", quarantine),
         ] {
             if let Some((block, warnings)) = block {
                 result.data[name] = block;
@@ -1326,6 +1351,12 @@ impl CockroachMemoryService {
         }
         result.data["legacy_claim_keys"] = legacy_claim_keys;
         result.warnings.extend(legacy_warnings);
+        result.data["conflicts"] = conflicts;
+        result.warnings.extend(conflict_warnings);
+        // What the absence verdict means, wherever a verdict is served.
+        if self.evidence.is_some() || self.items.is_some() {
+            result.data["absence_contract"] = absence_contract();
+        }
         result.conflict_coverage = ConflictCoverage::not_evaluated();
         Ok(result)
     }
@@ -3068,6 +3099,204 @@ fn legacy_claim_keys_block(legacy: crate::Result<LegacyClaimKeysV1>) -> (Value, 
                 vec![json!({
                     "code": "legacy_claim_keys_unavailable",
                     "message": "the count of claims keyed under the earlier normalizer could not be read; remember and recall are still served",
+                })],
+            )
+        }
+    }
+}
+
+/// The lower edge of the dense neighbour band the absence verdict refuses to
+/// call `absent` in: a dense-only neighbour at or above it (and below the
+/// dense bound) makes the verdict `unknown`. The verdict's own copy lives in
+/// `evidence_recall::verdict` as `ABSENCE_NEIGHBOUR_BAND_FLOOR`; this mirror
+/// only publishes the contract in `recall(status)`.
+const ABSENCE_NEIGHBOUR_BAND_FLOOR: f32 = 0.30;
+
+/// The cosine bounds of the absence verdict, and what it is anchored on, as
+/// `recall(status).absence_contract`: what `absent` and `unknown` mean.
+fn absence_contract() -> Value {
+    json!({
+        "dense_bound": cosine_bound(crate::evidence_recall::ABSENCE_DENSE_MIN_COSINE_SIMILARITY),
+        "neighbour_band_floor": cosine_bound(ABSENCE_NEIGHBOUR_BAND_FLOOR),
+        "dense_vote_excluded": crate::evidence_recall::DENSE_VOTE_EXCLUDED_MEDIA_TYPES,
+        "anchored_on": "lexical",
+    })
+}
+
+/// A cosine bound as the decimal it was written as, not the nearest binary
+/// `f32` widened (`0.45`, not `0.44999998807907104`).
+fn cosine_bound(value: f32) -> f64 {
+    value
+        .to_string()
+        .parse()
+        .unwrap_or_else(|_| f64::from(value))
+}
+
+/// Open conflicts one overlay read covers: the ledger's episode bound.
+const STATUS_OVERLAY_EPISODES: usize = 100;
+
+/// `recall(status).conflicts` and the warnings it adds: the open conflicts
+/// (bounded, oldest first), how many of them read `acknowledged` or `waived`
+/// under the lifecycle overlay where it is served, and the oldest open
+/// one's detection time. A failed or slow read is `null` with a warning,
+/// never a failed status.
+async fn conflicts_status_within(
+    ledger: &dyn ClaimLedger,
+    scope: &FleetScope,
+    overlay_served: bool,
+    deadline: std::time::Duration,
+) -> (Value, Vec<Value>) {
+    let read = async {
+        let open = ledger.open_conflicts(scope).await?;
+        let overlay_states = if overlay_served && !open.rows.is_empty() {
+            let mut states = HashMap::with_capacity(open.rows.len());
+            for chunk in open.rows.chunks(STATUS_OVERLAY_EPISODES) {
+                let episodes = chunk
+                    .iter()
+                    .map(|row| (row.id, overlay_episode_revision("open", row.revision)))
+                    .collect::<Vec<_>>();
+                let rows = ledger.conflict_lifecycle_rows(scope, &episodes).await?;
+                for row in chunk {
+                    let events = rows.events.get(&row.id).map_or(&[][..], Vec::as_slice);
+                    let overlay = derive_overlay(
+                        "open",
+                        row.revision,
+                        row.member_count,
+                        events,
+                        rows.truncated.contains(&row.id),
+                        rows.evaluated_at,
+                    );
+                    states.insert(row.id, overlay.state);
+                }
+            }
+            Some(states)
+        } else {
+            None
+        };
+        Ok::<_, FleetError>((open, overlay_states))
+    };
+    let outcome = tokio::time::timeout(deadline, read)
+        .await
+        .unwrap_or_else(|_| {
+            Err(FleetError::Memory(format!(
+                "the open conflict read did not finish within {}s",
+                deadline.as_secs_f32()
+            )))
+        });
+    conflicts_status_block(outcome)
+}
+
+/// The status field and warnings for one open-conflict read; `overlay
+/// states` is `None` where the lifecycle overlay is not served, and then so
+/// are the `acknowledged` and `waived` counts.
+fn conflicts_status_block(
+    outcome: crate::Result<(crate::ledger::OpenConflictsV1, Option<HashMap<i64, String>>)>,
+) -> (Value, Vec<Value>) {
+    match outcome {
+        Ok((open, overlay_states)) => {
+            let counted = |state: &str| {
+                overlay_states
+                    .as_ref()
+                    .map(|states| states.values().filter(|value| *value == state).count())
+            };
+            let mut warnings = Vec::new();
+            if open.bound_exceeded {
+                warnings.push(json!({
+                    "code": "open_conflicts_bound_exceeded",
+                    "message": format!(
+                        "more than {} conflicts are open; the counts are lower bounds over the oldest ones",
+                        crate::ledger::MAX_OPEN_CONFLICT_ROWS
+                    ),
+                }));
+            }
+            (
+                json!({
+                    "open": open.rows.len(),
+                    "acknowledged": counted("acknowledged"),
+                    "waived": counted("waived"),
+                    "oldest_open_at": open.rows.first().map(|row| row.detected_at),
+                    "bound_exceeded": open.bound_exceeded,
+                }),
+                warnings,
+            )
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "open conflict status read failed");
+            (
+                Value::Null,
+                vec![json!({
+                    "code": "conflicts_status_unavailable",
+                    "message": "the open conflict counts could not be read; remember and recall are still served",
+                })],
+            )
+        }
+    }
+}
+
+/// `recall(status).quarantine` and the warnings it adds: the scope's
+/// evidence quarantine by reason and its newest preimage disagreements,
+/// read through the runtime role's grant. A failed or slow read is `null`
+/// with a warning, never a failed status.
+async fn quarantine_status_within(
+    pool: &sqlx::PgPool,
+    scope: &FleetScope,
+    deadline: std::time::Duration,
+) -> (Value, Vec<Value>) {
+    let summary = tokio::time::timeout(
+        deadline,
+        crate::evidence_ledger::quarantine_summary(pool, scope.tenant_id, &scope.project),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(FleetError::Memory(format!(
+            "the quarantine read did not finish within {}s",
+            deadline.as_secs_f32()
+        )))
+    });
+    quarantine_status_block(summary)
+}
+
+/// The status field and warnings for one quarantine read.
+fn quarantine_status_block(
+    summary: crate::Result<crate::evidence_ledger::QuarantineSummaryV1>,
+) -> (Value, Vec<Value>) {
+    match summary {
+        Ok(summary) => {
+            let mut warnings = Vec::new();
+            let disagreements = summary
+                .by_reason
+                .get("preimage_disagreement")
+                .copied()
+                .unwrap_or_default();
+            if disagreements > 0 {
+                let bound = if summary.bound_exceeded {
+                    "at least "
+                } else {
+                    ""
+                };
+                warnings.push(json!({
+                    "code": "quarantine_preimage_disagreement",
+                    "message": format!(
+                        "{bound}{disagreements} evidence deliveries were quarantined because two reports disagreed on one source fact's bytes; quarantine.preimage_disagreement_sample names the newest, and an operator reconciles them (a retry cannot)"
+                    ),
+                }));
+            }
+            (
+                json!({
+                    "by_reason": summary.by_reason,
+                    "bound_exceeded": summary.bound_exceeded,
+                    "preimage_disagreement_sample": summary.preimage_disagreement_sample,
+                }),
+                warnings,
+            )
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "quarantine status read failed");
+            (
+                Value::Null,
+                vec![json!({
+                    "code": "quarantine_unavailable",
+                    "message": "the evidence quarantine could not be read; remember and recall are still served",
                 })],
             )
         }
@@ -6091,6 +6320,152 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, ServiceError::Internal(_)), "{error}");
+    }
+
+    #[test]
+    fn conflicts_status_counts_open_acknowledged_and_waived_or_reports_unavailable() {
+        use crate::ledger::{OpenConflictRowV1, OpenConflictsV1};
+        let at = |seconds: i64| chrono::DateTime::<Utc>::from_timestamp(seconds, 0).unwrap();
+        let row = |id: i64, seconds: i64| OpenConflictRowV1 {
+            id,
+            revision: 1,
+            member_count: 2,
+            detected_at: at(seconds),
+        };
+
+        // Nothing open: zero counts, no oldest, no warning.
+        let (block, warnings) =
+            conflicts_status_block(Ok((OpenConflictsV1::default(), Some(HashMap::new()))));
+        assert_eq!(
+            block,
+            json!({
+                "open": 0,
+                "acknowledged": 0,
+                "waived": 0,
+                "oldest_open_at": null,
+                "bound_exceeded": false,
+            })
+        );
+        assert!(warnings.is_empty());
+
+        // Open conflicts under the overlay: counted by their overlay state,
+        // the oldest named.
+        let open = OpenConflictsV1 {
+            rows: vec![
+                row(7, 1_700_000_000),
+                row(9, 1_700_000_100),
+                row(11, 1_700_000_200),
+            ],
+            bound_exceeded: false,
+        };
+        let states = HashMap::from([
+            (7, "acknowledged".to_owned()),
+            (9, "waived".to_owned()),
+            (11, "open".to_owned()),
+        ]);
+        let (block, warnings) = conflicts_status_block(Ok((open.clone(), Some(states))));
+        assert_eq!(block["open"], 3);
+        assert_eq!(block["acknowledged"], 1);
+        assert_eq!(block["waived"], 1);
+        assert_eq!(block["oldest_open_at"], json!(at(1_700_000_000)));
+        assert_eq!(block["bound_exceeded"], false);
+        assert!(warnings.is_empty());
+
+        // Without the overlay the lifecycle counts are unknown, not zero.
+        let (block, _) = conflicts_status_block(Ok((open, None)));
+        assert_eq!(block["open"], 3);
+        assert_eq!(block["acknowledged"], Value::Null);
+        assert_eq!(block["waived"], Value::Null);
+
+        // A full scan reports lower bounds and says so.
+        let (block, warnings) = conflicts_status_block(Ok((
+            OpenConflictsV1 {
+                rows: vec![row(1, 1_700_000_000)],
+                bound_exceeded: true,
+            },
+            None,
+        )));
+        assert_eq!(block["bound_exceeded"], true);
+        assert_eq!(warning_codes(&warnings), ["open_conflicts_bound_exceeded"]);
+
+        // A failed read is null with a warning, never a failed status.
+        let (block, warnings) =
+            conflicts_status_block(Err(FleetError::Memory("database unreachable".into())));
+        assert_eq!(block, Value::Null);
+        assert_eq!(warning_codes(&warnings), ["conflicts_status_unavailable"]);
+    }
+
+    #[test]
+    fn quarantine_status_reports_reasons_and_names_preimage_disagreements() {
+        use crate::evidence_ledger::{QuarantineSummaryV1, QuarantinedFactV1};
+        let (block, warnings) = quarantine_status_block(Ok(QuarantineSummaryV1::default()));
+        assert_eq!(
+            block,
+            json!({
+                "by_reason": {},
+                "bound_exceeded": false,
+                "preimage_disagreement_sample": [],
+            })
+        );
+        assert!(warnings.is_empty());
+
+        let received_at = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let (block, warnings) = quarantine_status_block(Ok(QuarantineSummaryV1 {
+            by_reason: [
+                ("oversize".to_owned(), 3),
+                ("preimage_disagreement".to_owned(), 2),
+            ]
+            .into_iter()
+            .collect(),
+            bound_exceeded: false,
+            preimage_disagreement_sample: vec![QuarantinedFactV1 {
+                source_fact_id: Some(Sha256Digest::from_bytes([7; 32])),
+                received_at,
+            }],
+        }));
+        assert_eq!(block["by_reason"]["oversize"], 3);
+        assert_eq!(block["by_reason"]["preimage_disagreement"], 2);
+        assert_eq!(
+            block["preimage_disagreement_sample"][0]["source_fact_id"],
+            json!(Sha256Digest::from_bytes([7; 32]))
+        );
+        assert_eq!(
+            block["preimage_disagreement_sample"][0]["received_at"],
+            json!(received_at)
+        );
+        assert_eq!(
+            warning_codes(&warnings),
+            ["quarantine_preimage_disagreement"]
+        );
+        assert!(
+            warnings[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("2 evidence deliveries were quarantined")
+        );
+
+        let (block, warnings) =
+            quarantine_status_block(Err(FleetError::Memory("permission denied".into())));
+        assert_eq!(block, Value::Null);
+        assert_eq!(warning_codes(&warnings), ["quarantine_unavailable"]);
+    }
+
+    #[test]
+    fn absence_contract_publishes_the_verdict_bounds_as_written() {
+        assert_eq!(
+            absence_contract(),
+            json!({
+                "dense_bound": 0.45,
+                "neighbour_band_floor": 0.30,
+                "dense_vote_excluded": ["application.ostk-git-fact-v1"],
+                "anchored_on": "lexical",
+            })
+        );
+        assert_eq!(
+            serde_json::to_string(&absence_contract()["dense_bound"]).unwrap(),
+            "0.45"
+        );
+        assert_eq!(cosine_bound(0.3).to_string(), "0.3");
     }
 
     #[tokio::test]

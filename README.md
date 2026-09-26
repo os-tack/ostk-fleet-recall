@@ -1470,12 +1470,15 @@ successor changes the kind (`successor_kind_mismatch`), the normalized key
 recorded as `include_transcript_default` kept its underscores while
 `include-transcript default` did not, so the two spellings took different keys
 and no conflict between them was ever detected. No migration rewrites stored
-keys. Instead `recall(status)` reports `legacy_claim_keys`, the number of the
-project's `active` or `disputed` claims whose stored `subject` and `predicate`
-no longer normalize to their stored key (a bounded read; at 256 it is a lower
-bound), with a `legacy_claim_keys` warning while it is above zero, because a
-claim recorded since under the same words takes the current key and the two
-are not compared. The exit is `remember(supersede)` with the same `subject`
+keys. Instead `recall(status)` reports `legacy_claim_keys`: `count`, the
+number of the project's `active` or `disputed` claims whose stored `subject`
+and `predicate` no longer normalize to their stored key (a bounded read; at
+256 `bound_exceeded` marks it a lower bound), and `sample`, up to ten of them
+with `claim_id`, `claim_key`, and `actor`, with a `legacy_claim_keys` warning
+while the count is above zero, because a claim recorded since under the same
+words takes the current key and the two are not compared. A legacy claim is
+still readable by its stored key: `recall(get, kind=claim, key=…)` returns
+every claim on exactly that key. The exit is `remember(supersede)` with the same `subject`
 and `predicate`: the successor check re-normalizes the predecessor's stored
 parts, so the successor lands on the current key and goes through detection
 there, and the `claim_superseded` event records the `predecessor_claim_key`
