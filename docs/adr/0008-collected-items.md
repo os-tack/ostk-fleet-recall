@@ -1067,7 +1067,11 @@ opened and is recorded as a withdrawn container, and `dms.json`,
 `mpims.json`, and any folder no channel names are never read. Messages
 become drafts exactly as the Slack collector makes them, so an imported
 message and the same message pulled are one item (the pull's head is
-presented), and a file link's `?t=xoxe-...` token is stripped. Each channel
+presented), and a file link's `?t=xoxe-...` token is stripped. A `tombstone`
+root (deleted while its replies remain) carries only its original `ts`, so
+it is staged at no less than the order the memory holds the message at
+through the reported tier: an edit an earlier export admitted, at its later
+`edited.ts`, is hidden by it rather than winning the order. Each channel
 read is one container of the snapshot, even with no message; a day file that
 is not an array of messages, or a message that is not the documented shape,
 is a digest-only dead letter that leaves its channel partial. A zip holds at

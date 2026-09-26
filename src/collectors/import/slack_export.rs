@@ -571,11 +571,14 @@ fn message_record(
         channel_label: Some(&channel.name),
         workspace_url: None,
     };
-    let draft = match message_draft(&context, &message) {
-        MessageDraftV1::Item(draft) => *draft,
+    let (draft, tombstone) = match message_draft(&context, &message) {
+        MessageDraftV1::Item(draft) => (*draft, false),
         MessageDraftV1::Tombstone => {
             let external_id = message_external_id(&channel.id, ts.as_str());
-            tombstone_draft(&context, &external_id, None, ts.micros())
+            (
+                tombstone_draft(&context, &external_id, None, ts.micros()),
+                true,
+            )
         }
         MessageDraftV1::Skip => return ImportLineV1::Blank,
     };
@@ -583,6 +586,9 @@ fn message_record(
         draft,
         provider_audience: Some(channel.audience()),
         container: Some(channel.key),
+        // The export's deleted root carries only its original `ts`; an
+        // earlier import may hold an edit of it at a later order.
+        at_least_held_order: tombstone,
     }))
 }
 

@@ -95,7 +95,7 @@ use crate::registry_witness::VerifiedWriterAuthority;
 use super::audience::{AudiencePolicyV1, ProviderAudienceV1};
 use super::binding::{CollectedConnectorBindingV1, CollectorInstanceV1};
 use super::coverage::{PassCoverageV1, coverage_ranges, observation_draft, receipt_observations};
-use super::draft::{SealContextV1, collection_record, seal};
+use super::draft::{CollectedItemDraftV1, SealContextV1, collection_record, seal};
 use super::pull::{PartialReasonV1, PassSettlementV1, SettledContainerV1};
 use super::redaction::{CollectorRedactorV1, scan_collected_secrets};
 use super::sink::{
@@ -730,6 +730,10 @@ struct ImportStager<'a> {
     /// A row the import relies on was staged earlier and is still pending:
     /// the import brings material the memory has not admitted yet.
     earlier_pending: bool,
+    /// The order the memory holds each item at through the import's tier,
+    /// by object kind and external id: read once per kind, when a deletion
+    /// with no order of its own first needs it.
+    held_orders: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 impl ImportStager<'_> {
@@ -809,7 +813,41 @@ impl ImportStager<'_> {
         Ok(())
     }
 
-    async fn push(&mut self, number: u64, item: ImportItemV1) -> Result<()> {
+    /// The order the memory holds `draft`'s item at through the import's
+    /// tier, if it holds it.
+    async fn held_order(&mut self, draft: &CollectedItemDraftV1) -> Result<Option<u64>> {
+        let kind = draft.object_kind.as_str().to_owned();
+        if !self.held_orders.contains_key(&kind) {
+            let known = self
+                .sink
+                .known_versions(
+                    &self.instance.provider,
+                    self.instance.provider_scope_id.as_str(),
+                    &draft.object_kind,
+                    CollectionModeV1::Import.trust_tier(),
+                )
+                .await?;
+            self.held_orders.insert(
+                kind.clone(),
+                known
+                    .into_iter()
+                    .map(|(external_id, version)| (external_id, version.provider_order))
+                    .collect(),
+            );
+        }
+        Ok(self
+            .held_orders
+            .get(&kind)
+            .and_then(|held| held.get(&draft.external_id))
+            .copied())
+    }
+
+    async fn push(&mut self, number: u64, mut item: ImportItemV1) -> Result<()> {
+        if item.at_least_held_order
+            && let Some(held) = self.held_order(&item.draft).await?
+        {
+            item.draft.order_micros = item.draft.order_micros.max(held);
+        }
         let parts: usize = item
             .draft
             .sections
@@ -1033,6 +1071,7 @@ pub async fn import_items(
         partial: BTreeMap::new(),
         counts: ImportCountsV1::default(),
         earlier_pending: false,
+        held_orders: BTreeMap::new(),
     };
     stager.observe(&prepared.standing).await?;
     let mut reader = records(request, &instance)?;

@@ -199,6 +199,12 @@ pub struct ImportItemV1 {
     pub provider_audience: Option<ProviderAudienceV1>,
     /// The container's key in the instance's scope.
     pub container: Option<Sha256Digest>,
+    /// A deletion the source reports with no order of its own (a Slack
+    /// export's `tombstone` root, at its original `ts`): staged at no less
+    /// than the order the memory holds the item at through the import's
+    /// tier, so it wins the tie against a later-ordered version (an edit)
+    /// an earlier import admitted.
+    pub at_least_held_order: bool,
 }
 
 /// One line refused before it became a draft.
@@ -290,6 +296,7 @@ pub fn classify_line(bytes: &[u8], instance: &CollectorInstanceV1) -> ImportLine
             draft,
             provider_audience: direct.then_some(ProviderAudienceV1::DirectMessage),
             container,
+            at_least_held_order: false,
         })),
         Err(refusal) => refused(
             DeadLetterReasonV1::of_refusal(refusal),

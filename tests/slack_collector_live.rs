@@ -1277,6 +1277,13 @@ fn export_zip() -> tempfile::NamedTempFile {
 /// a projecting tick.
 async fn import_export(pool: &PgPool, label: &str, path: &Path) -> (WorkerFixture, Value) {
     let fixture = WorkerFixture::install_at(pool, label, InstallTargetV1::Generation3).await;
+    let report = import_into(pool, &fixture, path).await;
+    (fixture, report)
+}
+
+/// `collect import --format slack-export` of `path` into `fixture`'s scope,
+/// then a projecting tick.
+async fn import_into(pool: &PgPool, fixture: &WorkerFixture, path: &Path) -> Value {
     let mut variables: HashMap<String, String> =
         serde_json::from_value(serde_json::to_value(&fixture.installed.report.pins).unwrap())
             .unwrap();
@@ -1326,7 +1333,70 @@ async fn import_export(pool: &PgPool, label: &str, path: &Path) -> (WorkerFixtur
         .run_tick()
         .await;
     assert!(!projected.failed());
-    (fixture, report)
+    report
+}
+
+/// A one-channel export of `messages` on 2026-09-21.
+fn one_channel_export(messages: &Value) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("channels.json"),
+        json!([{"id": PLATENG, "name": "plat-eng", "created": 1_780_000_000}]).to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join("plat-eng")).unwrap();
+    std::fs::write(
+        root.path().join("plat-eng/2026-09-21.json"),
+        messages.to_string(),
+    )
+    .unwrap();
+    root
+}
+
+#[tokio::test]
+async fn live_slack_an_exported_deletion_hides_an_edit_an_earlier_export_admitted_when_configured()
+{
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let (root_ts, reply_ts) = ("1790006645.000200", "1790006860.001100");
+    let mut edited = root(root_ts, "The kittiwake budget is five, edited", reply_ts, 1);
+    edited["edited"] = json!({"user": "U07ALICE001", "ts": "1790009000.000000"});
+    let first = one_channel_export(&json!([
+        edited,
+        reply(reply_ts, root_ts, "Five with jitter, says the skua")
+    ]));
+    let fixture =
+        WorkerFixture::install_at(&pool, "slack-export-deleted", InstallTargetV1::Generation3)
+            .await;
+    import_into(&pool, &fixture, first.path()).await;
+    let recall = items(&pool, &fixture).await;
+    assert_eq!(search(&recall, "kittiwake").await.hits.len(), 1);
+
+    // A later export: the root was deleted while its reply remains.
+    let mut tombstone = root(root_ts, "This message was deleted.", reply_ts, 1);
+    tombstone["subtype"] = json!("tombstone");
+    let second = one_channel_export(&json!([
+        tombstone,
+        reply(reply_ts, root_ts, "Five with jitter, says the skua")
+    ]));
+    import_into(&pool, &fixture, second.path()).await;
+    assert!(search(&recall, "kittiwake").await.hits.is_empty());
+    assert!(evidence(&pool, &fixture, "kittiwake").await.hits.is_empty());
+    let gone = get(&recall, &external(PLATENG, root_ts)).await;
+    assert_eq!(gone.suppressed, Some(ItemSuppressionV1::Deleted));
+    assert_eq!(
+        head(&pool, &fixture, &external(PLATENG, root_ts), "reported")
+            .await
+            .0,
+        "deleted"
+    );
+    assert_eq!(
+        search(&recall, "skua").await.hits.len(),
+        1,
+        "the reply stays"
+    );
 }
 
 #[tokio::test]
