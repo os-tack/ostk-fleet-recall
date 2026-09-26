@@ -6,7 +6,10 @@
 //! For each collector in the sources file, in order, under the head the tick
 //! verified:
 //!
-//! 1. its provider's adapter builds the pull collector, and
+//! 1. its provider's adapter builds the pull collector, reading any
+//!    credential its settings name from the worker's collector environment
+//!    (the process environment unless
+//!    [`MemoryWorker::with_collector_environment`] says otherwise), and
 //!    `connector.collected.pull` is bound from the head (a head without it
 //!    fails the source, naming `ostk-authority-install apply --target
 //!    generation-3`), with the collector redactor under the head's guarantee;
@@ -21,8 +24,11 @@
 //!    bound to that item's event ([`crate::collectors::coverage`]);
 //! 5. the collector's row in `memory_collector_sources_v1` is upserted
 //!    (`owner = worker`, `live`): `ok` when the pass staged or admitted
-//!    anything, else `unchanged`, or `failed` with its error; only a
-//!    reconciliation whose receipt was recorded sets `last_checked_at`.
+//!    anything, else `unchanged`, or `failed` with its error, scrubbed of
+//!    every secret shape; only a reconciliation whose receipt was recorded
+//!    sets `last_checked_at`. A reconciliation's receipt window starts at the
+//!    sources file's `coverage_since`, or later where the collector says it
+//!    read from later (a Slack `backfill_since`).
 //!
 //! A collector whose provider this build has no adapter for is a failed
 //! source. One collector's failure never stops the next. On a complete tick
@@ -65,6 +71,7 @@ use crate::collectors::binding::{CollectedConnectorBindingV1, CollectorInstanceV
 use crate::collectors::coverage::{
     PASS_CURSOR_DOMAIN, PassCoverageV1, coverage_observations, observation_draft, pass_cursor,
 };
+use crate::collectors::http::scrub_diagnostic;
 use crate::collectors::import::{ImportFinalizeTallyV1, finalize_pending_imports};
 use crate::collectors::pull::{
     PageStager, PageStagerContextV1, PullCollectorV1, PullPassInputV1, PulledItemV1,
@@ -344,7 +351,7 @@ impl CollectorPasses<'_> {
             Err(error) => (
                 CollectorOutcomeV1::Failed,
                 false,
-                Some(bounded_error(&error)),
+                Some(bounded_error(&scrub_diagnostic(&error))),
             ),
         };
         let status = CollectorSourceStatusV1 {
@@ -409,7 +416,7 @@ impl CollectorPasses<'_> {
             )
         })?;
         let collector: Box<dyn PullCollectorV1> = adapter
-            .pull(source)?
+            .pull(source, &*self.worker.collector_environment)?
             .ok_or_else(|| format!("provider {} has no pull collector", source.provider))?;
         counters.extend(collector.counter_keys().iter().map(|key| (*key, 0)));
         let instance = CollectorInstanceV1 {
@@ -568,7 +575,13 @@ impl CollectorPasses<'_> {
                     instance: &instance.connector_instance_id,
                     principal: &source.connector_principal,
                     scope,
-                    window_start: self.worker.coverage_since.clone(),
+                    // A collector that reads a window starting later than
+                    // the sources file's coverage start covers only that.
+                    window_start: outcome
+                        .window_start
+                        .clone()
+                        .filter(|start| *start > self.worker.coverage_since)
+                        .unwrap_or_else(|| self.worker.coverage_since.clone()),
                     observed_through: server_instant(pool).await?,
                     proof_method: collector.proof_method(),
                     evidence_id: AcceptedEventId::from_digest(evidence),

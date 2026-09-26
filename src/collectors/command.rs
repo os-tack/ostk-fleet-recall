@@ -7,8 +7,10 @@
 //! JSON document on one line.
 //!
 //! * `collect import --instance I --principal P --provider X --provider-scope S
-//!   --audience operator-declared --format items-jsonl --path F [--no-drain]
-//!   [--stale-after SECONDS]` imports one file
+//!   --audience operator-declared --format items-jsonl|slack-export --path F
+//!   [--private-container C ...] [--no-drain] [--stale-after SECONDS]` imports
+//!   one file, or one Slack export (a directory or a zip, whose private
+//!   channels are read only when `--private-container` lists them)
 //!   ([`crate::collectors::import`]). It needs the writer-authority pins, and
 //!   `FLEET_RECALL_CONTENT_KEK_HEX` unless `--no-drain` leaves the rows to the
 //!   worker. `--audience operator-declared` is the operator's declaration that
@@ -52,7 +54,8 @@ use crate::store::cockroach::{COLLECTED_ITEMS_SCHEMA_VERSION, DatabaseCapabiliti
 use crate::worker::{WorkerStepV1, probe_worker_privileges};
 
 use super::import::{
-    DEFAULT_IMPORT_STALE_AFTER_SECONDS, ImportContextV1, ItemsImportRequestV1, import_items_jsonl,
+    DEFAULT_IMPORT_STALE_AFTER_SECONDS, ImportContextV1, ImportFileFormatV1, ItemsImportRequestV1,
+    import_items,
 };
 use super::sink::{CollectedDrainContextV1, CollectedItemSink, RetireImportV1};
 
@@ -64,10 +67,15 @@ pub enum ImportAudienceV1 {
 }
 
 /// The format of an import file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportFormatV1 {
     /// One `CollectedItemInputV1` per line.
     ItemsJsonl,
+    /// A Slack workspace export: a directory or a zip.
+    SlackExport {
+        /// `--private-container`: the private channels the operator admits.
+        private_containers: Vec<String>,
+    },
 }
 
 /// The arguments of `collect import`.
@@ -96,7 +104,12 @@ pub struct CollectImportV1 {
 impl CollectImportV1 {
     fn request(&self) -> Result<ItemsImportRequestV1> {
         let ImportAudienceV1::OperatorDeclared = self.audience;
-        let ImportFormatV1::ItemsJsonl = self.format;
+        let format = match &self.format {
+            ImportFormatV1::ItemsJsonl => ImportFileFormatV1::ItemsJsonl,
+            ImportFormatV1::SlackExport { private_containers } => ImportFileFormatV1::SlackExport {
+                private_containers: private_containers.clone(),
+            },
+        };
         let field = |flag: &str, error: &dyn std::fmt::Display| {
             FleetError::Configuration(format!("{flag}: {error}"))
         };
@@ -110,6 +123,7 @@ impl CollectImportV1 {
             provider_scope_id: BoundedTextV1::new(self.provider_scope.clone())
                 .map_err(|error| field("--provider-scope", &error))?,
             path: self.path.clone(),
+            format,
             stale_after_seconds: self
                 .stale_after_seconds
                 .unwrap_or(DEFAULT_IMPORT_STALE_AFTER_SECONDS),
@@ -307,7 +321,7 @@ where
             )
         })?)
     };
-    std::fs::File::open(&request.path).map_err(|error| {
+    std::fs::metadata(&request.path).map_err(|error| {
         FleetError::Configuration(format!("cannot read {}: {error}", request.path.display()))
     })?;
 
@@ -337,7 +351,7 @@ where
         control_scope: runtime.control_scope(),
         kek,
     });
-    let report = Box::pin(import_items_jsonl(
+    let report = Box::pin(import_items(
         &request,
         &ImportContextV1 {
             sink: &sink,

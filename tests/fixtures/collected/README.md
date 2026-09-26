@@ -20,3 +20,8 @@ Linear, and Granola.
   realistic shape, and each delivery's signature header is computed from it;
   the Granola desktop cache is deliberately absent, because the collectors
   never read it.
+- `tests/common/fake_provider.rs`: a local HTTP server on `127.0.0.1:0` that
+  serves a provider's API pages to a collector under test, with scripted rate
+  limits and failures, and records every request so a test can prove the
+  credential travels only in the `Authorization` header
+  (`tests/slack_collector_live.rs` serves a Slack workspace through it).

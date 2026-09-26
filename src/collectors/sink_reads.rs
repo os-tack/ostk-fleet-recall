@@ -46,6 +46,9 @@ pub struct KnownVersionV1 {
     /// The stage ids of the version's parts that are still pending; empty
     /// when the version heads its tier, which only a complete version does.
     pub pending: Vec<Sha256Digest>,
+    /// The external id of the version's thread root, when it is a reply:
+    /// what tells a collector which of its reads could have seen the item.
+    pub thread_root: Option<String>,
 }
 
 /// Where one staged row stands.
@@ -152,6 +155,7 @@ impl CollectedItemSink {
                         FleetError::Memory("a stored head order is negative".to_owned())
                     })?,
                     pending: Vec::new(),
+                    thread_root: row.try_get("thread_root_external_id")?,
                 },
             );
         }
@@ -197,6 +201,10 @@ impl CollectedItemSink {
                             FleetError::Memory("a staged order is negative".to_owned())
                         })?,
                         pending: vec![stage_id],
+                        thread_root: envelope
+                            .thread
+                            .as_ref()
+                            .map(|thread| thread.root_external_id.as_str().to_owned()),
                     },
                 },
             );

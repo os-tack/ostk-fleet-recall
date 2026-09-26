@@ -471,6 +471,17 @@ pub struct MemoryWorker {
     drain_kek: Option<ContentKeyEncryptionKey>,
     /// Built once: the resolver owns the second key.
     bodies: Option<Arc<CockroachBodyProjectionRepository>>,
+    /// Reads the variables a collector's settings name (a provider token).
+    collector_environment: CollectorEnvironmentV1,
+}
+
+/// Reads one deployment variable a collector's settings name, such as a
+/// provider token: the process environment unless
+/// [`MemoryWorker::with_collector_environment`] says otherwise.
+pub type CollectorEnvironmentV1 = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+fn process_environment() -> CollectorEnvironmentV1 {
+    Arc::new(|name: &str| std::env::var(name).ok())
 }
 
 impl std::fmt::Debug for MemoryWorker {
@@ -554,7 +565,16 @@ impl MemoryWorker {
             steps,
             coverage_since,
             bodies,
+            collector_environment: process_environment(),
         })
+    }
+
+    /// The same worker, reading the variables its collectors' settings name
+    /// through `environment` instead of the process environment.
+    #[must_use]
+    pub fn with_collector_environment(mut self, environment: CollectorEnvironmentV1) -> Self {
+        self.collector_environment = environment;
+        self
     }
 
     /// The steps this worker runs.

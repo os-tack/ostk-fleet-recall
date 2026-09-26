@@ -254,12 +254,18 @@ pub(super) const UPDATE_HEAD_PRESENTATION_SQL: &str = "UPDATE public.memory_coll
      WHERE tenant_id = $1 AND project = $2 AND item_key_digest = $3 AND trust_tier = $4";
 
 /// The heads of one provider scope's items of one object kind, in one tier:
-/// what a pull collector compares a fresh read with.
-pub(super) const SCOPE_HEADS_SQL: &str = "SELECT item_key_digest, external_id, \
-     version_key_digest, content_digest, lifecycle, provider_order \
-     FROM public.memory_collected_item_heads_v1 \
-     WHERE tenant_id = $1 AND project = $2 AND provider = $3 AND provider_scope_id = $4 \
-       AND object_kind = $5 AND trust_tier = $6";
+/// what a pull collector compares a fresh read with, with each head
+/// version's thread root from its first admitted part.
+pub(super) const SCOPE_HEADS_SQL: &str = "SELECT h.item_key_digest, h.external_id, \
+     h.version_key_digest, h.content_digest, h.lifecycle, h.provider_order, \
+     (SELECT i.thread_root_external_id FROM public.memory_collected_items_v1 AS i \
+       WHERE i.tenant_id = h.tenant_id AND i.project = h.project \
+         AND i.item_key_digest = h.item_key_digest \
+         AND i.version_key_digest = h.version_key_digest \
+       ORDER BY i.part_ordinal LIMIT 1) AS thread_root_external_id \
+     FROM public.memory_collected_item_heads_v1 AS h \
+     WHERE h.tenant_id = $1 AND h.project = $2 AND h.provider = $3 \
+       AND h.provider_scope_id = $4 AND h.object_kind = $5 AND h.trust_tier = $6";
 
 /// The pending rows of one provider scope staged through the channels in
 /// `$5`, with their envelopes, which name each row's item.

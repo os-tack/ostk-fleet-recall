@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub mod authority;
+pub mod fake_provider;
 pub mod runtime_role;
 pub mod worker;
 

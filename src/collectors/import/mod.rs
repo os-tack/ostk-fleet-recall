@@ -7,8 +7,9 @@
 //! *reported* channel: its items are presented only where no verified
 //! collector has a head, and its containers are recorded as the operator
 //! declared them (`operator_declared`), never re-opening one a verified
-//! collector withdrew. The only format so far is [`jsonl`], one
-//! `CollectedItemInputV1` per line.
+//! collector withdrew. Two formats: [`jsonl`], one `CollectedItemInputV1`
+//! per line, and [`slack_export`], a Slack workspace export (a directory or a
+//! zip) whose channels and messages the Slack collector's renderer reads.
 //!
 //! # One import
 //!
@@ -17,13 +18,16 @@
 //!    and an import that already reports under it imports the same provider
 //!    scope. `connector.collected.import` is bound from the verified head (a
 //!    generation-2 head refuses, naming `--target generation-3`).
-//! 2. The file is read twice. The first read hashes it, counts its lines, and
-//!    learns its containers; the second stages it, in sink transactions of at
-//!    most [`MAX_IMPORT_CHUNK_ITEMS`] items and about as many parts, each with
-//!    the observations of the containers it names. A line the format refuses
-//!    is a digest-only dead letter; the delivery of every line is the file's
-//!    digest and its line number. A file that changed between the reads is
-//!    refused, and nothing is recorded as its snapshot.
+//! 2. The file is read twice. The first read hashes it, counts its records
+//!    (lines, or an export's messages), and learns its containers; the second
+//!    stages it, in sink transactions of at most [`MAX_IMPORT_CHUNK_ITEMS`]
+//!    items and about as many parts, each with the observations of the
+//!    containers it names. A record the format refuses is a digest-only dead
+//!    letter; the delivery of every record is the file's digest and its
+//!    number. A file that changed between the reads is refused, and nothing
+//!    is recorded as its snapshot. An export's channels are its containers
+//!    even when they hold no message, and are recorded before anything is
+//!    staged: a private channel the operator did not list as withdrawn.
 //! 3. Each line's version marker follows the marker rule (the line's own, else
 //!    `o<order>:sha256:<content digest>` at its `updated_at`, else its
 //!    `created_at`), so re-importing an unchanged file stages nothing, an
@@ -63,6 +67,7 @@
 //! admitted fails the source and records no receipt.
 
 pub mod jsonl;
+pub mod slack_export;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -137,7 +142,19 @@ const IMPORT_PLAN_SCHEMA_VERSION: u32 = 1;
 /// Longest cursor state migration 0033 stores.
 const MAX_PLAN_BYTES: usize = 16_384;
 
-/// One `collect import --format items-jsonl`.
+/// What an import file is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportFileFormatV1 {
+    /// `items-jsonl`: one `CollectedItemInputV1` per line.
+    ItemsJsonl,
+    /// `slack-export`: a Slack workspace export, a directory or a zip.
+    SlackExport {
+        /// The private channels (`groups.json`) the operator admits.
+        private_containers: Vec<String>,
+    },
+}
+
+/// One `collect import`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemsImportRequestV1 {
     /// The import's collector instance.
@@ -148,8 +165,10 @@ pub struct ItemsImportRequestV1 {
     pub provider: ProviderKindV1,
     /// The provider scope every line must name.
     pub provider_scope_id: BoundedTextV1<MAX_SCOPE_ID_BYTES>,
-    /// The file.
+    /// The file (or, for an export, the directory).
     pub path: PathBuf,
+    /// Its format.
+    pub format: ImportFileFormatV1,
     /// How long the snapshot stays current.
     pub stale_after_seconds: u64,
 }
@@ -248,9 +267,10 @@ pub struct ItemsImportReportV1 {
     pub pass_seq: u64,
     /// The SHA-256 of the file.
     pub file_sha256: Sha256Digest,
-    /// Lines read.
+    /// Records read: lines, or an export's messages.
     pub lines: u64,
-    /// Lines holding only whitespace.
+    /// Records holding nothing to stage: blank lines, or an export's
+    /// membership and housekeeping messages and repeats.
     pub blank_lines: u64,
     /// Items staged, newly or already.
     pub items_staged: u64,
@@ -450,7 +470,196 @@ fn validate_request(request: &ItemsImportRequestV1) -> Result<()> {
             "--provider-scope holds a secret shape".to_owned(),
         ));
     }
+    match &request.format {
+        ImportFileFormatV1::ItemsJsonl => {}
+        ImportFileFormatV1::SlackExport { private_containers } => {
+            if request.provider.as_str() != crate::collectors::slack::render::SLACK_PROVIDER {
+                return Err(FleetError::Configuration(format!(
+                    "--format {} imports provider slack only",
+                    slack_export::SLACK_EXPORT_FORMAT
+                )));
+            }
+            if let Some(bad) = private_containers.iter().find(|id| {
+                id.len() < 3
+                    || id.len() > 32
+                    || !id.starts_with(['C', 'G'])
+                    || !id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            }) {
+                return Err(FleetError::Configuration(format!(
+                    "--private-container {bad:?} is not a channel id (C... or G...)"
+                )));
+            }
+        }
+    }
     Ok(())
+}
+
+/// What the first read of an import learned, and how to read it again.
+struct PreparedImportV1 {
+    /// The digest of everything the first read read.
+    digest: Sha256Digest,
+    /// The audience policy the import stages under.
+    policy: AudiencePolicyV1,
+    /// The observations of the containers items name, by key.
+    observations: BTreeMap<Sha256Digest, ContainerObservationV1>,
+    /// Observations staged once, before any item: an export's every
+    /// channel, the ones never read recorded withdrawn.
+    standing: Vec<ContainerObservationV1>,
+    /// Containers in the snapshot's domain even with no item.
+    declared: Vec<Sha256Digest>,
+}
+
+/// The second read of an `items-jsonl` file.
+struct JsonlRecordsV1 {
+    reader: LineReader<BufReader<File>>,
+    instance: CollectorInstanceV1,
+}
+
+/// The second read of an import, record by record.
+enum ImportRecordsV1 {
+    Jsonl(Box<JsonlRecordsV1>),
+    SlackExport(Box<slack_export::SlackExportRecordsV1>),
+}
+
+impl ImportRecordsV1 {
+    /// The next record and its number, or `None` at the end.
+    fn next_record(&mut self) -> std::io::Result<Option<(u64, ImportLineV1)>> {
+        match self {
+            Self::Jsonl(jsonl) => {
+                let JsonlRecordsV1 { reader, instance } = &mut **jsonl;
+                let Some(line) = reader.next_line()? else {
+                    return Ok(None);
+                };
+                if reader.lines() > MAX_IMPORT_LINES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("an import file holds at most {MAX_IMPORT_LINES} lines"),
+                    ));
+                }
+                Ok(Some(match line {
+                    RawLineV1::Oversize { number, digest } => (
+                        number,
+                        ImportLineV1::Refused(ImportRefusalV1 {
+                            reason: DeadLetterReasonV1::ParseFailed,
+                            diagnostic: format!(
+                                "the line is longer than {} bytes",
+                                jsonl::MAX_IMPORT_LINE_BYTES
+                            ),
+                            payload_digest: digest,
+                            container: None,
+                        }),
+                    ),
+                    RawLineV1::Line { number, bytes } => {
+                        (number, jsonl::classify_line(&bytes, instance))
+                    }
+                }))
+            }
+            Self::SlackExport(records) => records.next_record(),
+        }
+    }
+
+    /// Records read so far.
+    fn records(&self) -> u64 {
+        match self {
+            Self::Jsonl(jsonl) => jsonl.reader.lines(),
+            Self::SlackExport(records) => records.records(),
+        }
+    }
+
+    /// The digest of everything read.
+    fn digest(self) -> Sha256Digest {
+        match self {
+            Self::Jsonl(jsonl) => jsonl.reader.digest(),
+            Self::SlackExport(records) => records.digest(),
+        }
+    }
+}
+
+fn read_error(path: &Path) -> impl Fn(std::io::Error) -> FleetError + '_ {
+    move |error| FleetError::Configuration(format!("cannot read {}: {error}", path.display()))
+}
+
+/// Read the import once: its digest, its containers, and its policy.
+fn prepare(
+    request: &ItemsImportRequestV1,
+    instance: &CollectorInstanceV1,
+) -> Result<PreparedImportV1> {
+    match &request.format {
+        ImportFileFormatV1::ItemsJsonl => {
+            let scan =
+                jsonl::scan(open(&request.path)?, instance).map_err(read_error(&request.path))?;
+            Ok(PreparedImportV1 {
+                digest: scan.file_sha256,
+                policy: AudiencePolicyV1 {
+                    operator_declared: true,
+                    private_containers: Vec::new(),
+                },
+                observations: scan
+                    .containers
+                    .iter()
+                    .filter_map(|(key, container)| {
+                        container
+                            .observation()
+                            .map(|observation| (*key, observation))
+                    })
+                    .collect(),
+                standing: Vec::new(),
+                declared: Vec::new(),
+            })
+        }
+        ImportFileFormatV1::SlackExport { private_containers } => {
+            let scan = slack_export::scan(&request.path, instance, private_containers)
+                .map_err(read_error(&request.path))?;
+            Ok(PreparedImportV1 {
+                digest: scan.digest,
+                policy: AudiencePolicyV1 {
+                    operator_declared: true,
+                    private_containers: private_containers.clone(),
+                },
+                observations: scan
+                    .channels
+                    .iter()
+                    .map(|channel| (channel.key, channel.observation(true)))
+                    .collect(),
+                standing: scan
+                    .channels
+                    .iter()
+                    .map(|channel| channel.observation(true))
+                    .chain(
+                        scan.withheld
+                            .iter()
+                            .map(|channel| channel.observation(false)),
+                    )
+                    .collect(),
+                declared: scan.channels.iter().map(|channel| channel.key).collect(),
+            })
+        }
+    }
+}
+
+/// Open the import's second read.
+fn records(
+    request: &ItemsImportRequestV1,
+    instance: &CollectorInstanceV1,
+) -> Result<ImportRecordsV1> {
+    Ok(match &request.format {
+        ImportFileFormatV1::ItemsJsonl => ImportRecordsV1::Jsonl(Box::new(JsonlRecordsV1 {
+            reader: LineReader::new(open(&request.path)?),
+            instance: instance.clone(),
+        })),
+        ImportFileFormatV1::SlackExport { private_containers } => {
+            ImportRecordsV1::SlackExport(Box::new(
+                slack_export::SlackExportRecordsV1::open(
+                    &request.path,
+                    instance,
+                    private_containers,
+                )
+                .map_err(read_error(&request.path))?,
+            ))
+        }
+    })
 }
 
 fn open(path: &Path) -> Result<BufReader<File>> {
@@ -555,34 +764,28 @@ impl ImportStager<'_> {
         *self.counts.refused.entry(reason).or_insert(0) += 1;
     }
 
-    async fn line(&mut self, line: RawLineV1) -> Result<()> {
-        match line {
-            RawLineV1::Oversize { number, digest } => {
-                self.refuse(
-                    number,
-                    ImportRefusalV1 {
-                        reason: DeadLetterReasonV1::ParseFailed,
-                        diagnostic: format!(
-                            "the line is longer than {} bytes",
-                            jsonl::MAX_IMPORT_LINE_BYTES
-                        ),
-                        payload_digest: digest,
-                        container: None,
-                    },
-                )
-                .await
+    async fn record(&mut self, number: u64, record: ImportLineV1) -> Result<()> {
+        match record {
+            ImportLineV1::Blank => {
+                self.counts.blank_lines += 1;
+                Ok(())
             }
-            RawLineV1::Line { number, bytes } => {
-                match jsonl::classify_line(&bytes, self.instance) {
-                    ImportLineV1::Blank => {
-                        self.counts.blank_lines += 1;
-                        Ok(())
-                    }
-                    ImportLineV1::Refused(refusal) => self.refuse(number, refusal).await,
-                    ImportLineV1::Item(item) => self.push(number, *item).await,
-                }
-            }
+            ImportLineV1::Refused(refusal) => self.refuse(number, refusal).await,
+            ImportLineV1::Item(item) => self.push(number, *item).await,
         }
+    }
+
+    /// Stage observations of the containers a format lists before any item:
+    /// an export's channels, including those no item is read from (a private
+    /// channel the operator did not list).
+    async fn observe(&self, observations: &[ContainerObservationV1]) -> Result<()> {
+        if observations.is_empty() {
+            return Ok(());
+        }
+        self.sink
+            .stage(&[], &self.context(observations, &[], None))
+            .await?;
+        Ok(())
     }
 
     /// A line refused before it became a draft: a digest-only dead letter,
@@ -776,7 +979,8 @@ impl ImportStager<'_> {
     }
 }
 
-/// Import one `items-jsonl` file. See the module documentation.
+/// Import one file (`items-jsonl`) or export (`slack-export`). See the module
+/// documentation.
 ///
 /// # Errors
 ///
@@ -784,9 +988,9 @@ impl ImportStager<'_> {
 /// instance another owner or another provider scope holds, a head without
 /// `connector.collected.import`, an unreadable file, a file past its bounds,
 /// or a file that changed while it was read; any database failure. A refused
-/// line is not an error: it is dead-lettered and counted.
+/// record is not an error: it is dead-lettered and counted.
 #[allow(clippy::too_many_lines)] // one linear claim -> scan -> stage -> observe -> drain pipeline
-pub async fn import_items_jsonl(
+pub async fn import_items(
     request: &ItemsImportRequestV1,
     context: &ImportContextV1<'_>,
 ) -> Result<ItemsImportReportV1> {
@@ -799,9 +1003,7 @@ pub async fn import_items_jsonl(
     };
     claim_instance(sink, request).await?;
     let (redactor, _) = bind_import(context.verified, &request.principal, &instance)?;
-    let scan = jsonl::scan(open(&request.path)?, &instance).map_err(|error| {
-        FleetError::Configuration(format!("cannot read {}: {error}", request.path.display()))
-    })?;
+    let prepared = prepare(request, &instance)?;
 
     let pass_seq = sink
         .read_cursor(&request.instance, IMPORT_PLAN_DOMAIN)
@@ -820,47 +1022,26 @@ pub async fn import_items_jsonl(
         instance: &instance,
         principal: &request.principal,
         redactor: &redactor,
-        policy: AudiencePolicyV1 {
-            operator_declared: true,
-            private_containers: Vec::new(),
-        },
+        policy: prepared.policy.clone(),
         pass_seq,
-        file_sha256: scan.file_sha256,
-        observations: scan
-            .containers
-            .iter()
-            .filter_map(|(key, container)| {
-                container
-                    .observation()
-                    .map(|observation| (*key, observation))
-            })
-            .collect(),
+        file_sha256: prepared.digest,
+        observations: prepared.observations.clone(),
         chunk: Vec::new(),
         chunk_parts: 0,
         tracked: Vec::new(),
-        domain: BTreeSet::new(),
+        domain: prepared.declared.iter().copied().map(Some).collect(),
         partial: BTreeMap::new(),
         counts: ImportCountsV1::default(),
         earlier_pending: false,
     };
-    let mut reader = LineReader::new(open(&request.path)?);
-    loop {
-        let line = reader.next_line().map_err(|error| {
-            FleetError::Configuration(format!("cannot read {}: {error}", request.path.display()))
-        })?;
-        let Some(line) = line else {
-            break;
-        };
-        if reader.lines() > MAX_IMPORT_LINES {
-            return Err(FleetError::Configuration(format!(
-                "an import file holds at most {MAX_IMPORT_LINES} lines"
-            )));
-        }
-        stager.line(line).await?;
+    stager.observe(&prepared.standing).await?;
+    let mut reader = records(request, &instance)?;
+    while let Some((number, record)) = reader.next_record().map_err(read_error(&request.path))? {
+        stager.record(number, record).await?;
     }
     stager.flush().await?;
-    let lines = reader.lines();
-    if reader.digest() != scan.file_sha256 {
+    let lines = reader.records();
+    if reader.digest() != prepared.digest {
         return Err(FleetError::Configuration(format!(
             "{} changed while it was imported; nothing was recorded as its snapshot, so import \
              it again",
@@ -946,7 +1127,7 @@ pub async fn import_items_jsonl(
             &[StageDraftV1 {
                 draft: observation,
                 provider_audience: Some(ProviderAudienceV1::OperatorScoped),
-                delivery_id: delivery(&scan.file_sha256, 0),
+                delivery_id: delivery(&prepared.digest, 0),
             }],
             &stager.context(&[], std::slice::from_ref(&advance), Some(&status)),
         )
@@ -997,7 +1178,7 @@ pub async fn import_items_jsonl(
         provider: request.provider.as_str().to_owned(),
         provider_scope_id: request.provider_scope_id.as_str().to_owned(),
         pass_seq,
-        file_sha256: scan.file_sha256,
+        file_sha256: prepared.digest,
         lines,
         blank_lines: stager.counts.blank_lines,
         items_staged: stager.counts.items_staged,

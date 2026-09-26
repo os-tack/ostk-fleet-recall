@@ -288,7 +288,9 @@ admitted, in this order:
   skipped. The documents-directory collector (provider `docs`) is the first:
   each pass lists one root, stages the files whose content changed as
   sectioned parts, tombstones the ones that disappeared, and records coverage
-  only when it read the whole root. Last, it records the snapshot of every
+  only when it read the whole root. The Slack collector (provider `slack`)
+  pulls a workspace's channels through the Web API with a bot token. Last,
+  it records the snapshot of every
   [import](#importing-collected-items) whose rows it admitted. `serve` reads
   what it admits as `recall(kind=item)` and `recall(kind=evidence)`.
 - `project`: the body projector, then the lexical tier.
@@ -343,6 +345,40 @@ provider's numeric repository id, from which a spec statement's subject is
 derived), and the file must name an `observer` identity
 (`connector_principal` and `connector_instance`) to append observer runs
 under. The worker reads neither; quickstart step 8 shows both.
+
+A Slack collector reads one workspace with an internal custom Slack app's
+bot token; the sources file names the environment variable that holds it,
+never the token:
+
+```json
+{"provider": "slack", "connector_principal": "principal.slack",
+ "connector_instance": "slack.acme", "provider_scope_id": "T07ACME0001",
+ "audience": {"private_containers": ["C07PRIVATE1"]},
+ "settings": {"token_env": "FLEET_RECALL_SLACK_BOT_TOKEN",
+              "channels": ["C07PLATENG1", "C07PRIVATE1"],
+              "backfill_since": "2026-01-01T00:00:00Z", "rescan_days": 7,
+              "reconcile_every_seconds": 86400, "max_pages_per_tick": 500}}
+```
+
+`provider_scope_id` pins the workspace: a token whose `auth.test` reports
+another `team_id` reads nothing and fails the source. The app needs the
+`channels:history`, `channels:read` (and `groups:history`, `groups:read` for
+private channels) scopes and must be a member of every listed channel; a
+channel it cannot read is reported partial. A public channel is visible to
+the whole project; a private channel only when `audience.private_containers`
+lists it; direct and group-direct conversations and Slack Connect channels
+never are, and a channel that becomes private or shared is withdrawn and
+hidden. Once every `reconcile_every_seconds` a pass re-reads every channel
+from `backfill_since` (or its whole history) with every thread, and only that
+reconciliation records coverage; the passes between read the trailing
+`rescan_days` and the threads with new replies, which picks up new messages
+and edits. A message missing from two consecutive complete reads is hidden as
+deleted. Messages keep their exact `ts`, edits supersede, mentions and links
+are rendered, and file content is never read (a file is a link, with its
+token stripped). A rate limit or `max_pages_per_tick` ends a pass partial,
+and the next pass picks it up. `api_base` (`https://slack.com/api` by
+default) must be https, or plain http to a loopback address. A collector's
+`stale_after_seconds` may not be shorter than its `reconcile_every_seconds`.
 
 Each transcript file is read in windows of its group's `window_bytes` (4 MiB
 by default, at most 8 MiB) behind a durable cursor. A line longer than the
@@ -434,6 +470,22 @@ what it stages, which needs `FLEET_RECALL_CONTENT_KEK_HEX`; with `--no-drain`
 it only stages, reads no key, and the next `worker` tick whose steps include
 `collect` drains the rows and records the snapshot. It prints one JSON report:
 counts, refusals by reason, the file's digest, and where the snapshot stands.
+
+A Slack workspace export backfills a Slack scope, as a directory or a zip:
+
+```text
+ostk-fleet-recall collect import --instance import.slack-export --principal principal.import \
+  --provider slack --provider-scope T07ACME0001 --audience operator-declared \
+  --format slack-export --path acme-export.zip [--private-container G07PLATSEC1 ...]
+```
+
+Every public channel in `channels.json` is imported, and a private channel in
+`groups.json` only when `--private-container` names it; the other private
+channels are recorded withdrawn and never opened, and direct conversations
+(`dms.json`, `mpims.json`) are never read. Messages become the same items the
+Slack collector pulls, so a pulled message supersedes its imported copy, and
+file links lose the `?t=xoxe-...` token exports carry. A zip holds at most
+100,000 entries of at most 64 MiB each, 2 GiB in all.
 
 `collect status` lists every collector instance of the scope (its status row,
 outbox rows by state, cursors, and dead letters by reason), `collect

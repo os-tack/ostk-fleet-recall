@@ -406,6 +406,19 @@ impl WorkerSourcesV1 {
         let mut scopes = BTreeSet::new();
         for source in &self.collectors {
             source.validate()?;
+            if let Some(every) = crate::collectors::adapter(source.provider.as_str())
+                .and_then(|adapter| adapter.reconcile_every_seconds(source))
+            {
+                let stale_after = self.stale_after(source.stale_after_seconds);
+                if stale_after < every {
+                    return Err(invalid(&format!(
+                        "collector {}: stale_after_seconds ({stale_after}) is shorter than its \
+                         reconcile interval ({every} s), so it would read as stale between \
+                         reconciliations",
+                        source.connector_instance
+                    )));
+                }
+            }
             claim(&source.connector_instance, "collector")?;
             // One instance per provider scope: two would each see the other's
             // items as missing from their own reads.
@@ -880,6 +893,14 @@ mod tests {
         value
     }
 
+    /// Settings the Slack adapter accepts.
+    fn slack() -> serde_json::Value {
+        serde_json::json!({
+            "token_env": "FLEET_RECALL_SLACK_BOT_TOKEN",
+            "channels": ["C07PLATENG1", "C07PRIVATE1"]
+        })
+    }
+
     #[test]
     fn a_collector_parses_with_its_provider_scope_and_settings() {
         let sources = parse(&with_collector(&serde_json::json!({
@@ -925,27 +946,27 @@ mod tests {
 
     #[test]
     fn a_collector_instance_is_unique_across_every_connector() {
-        let mut value = with_collector(&serde_json::json!({}));
+        let mut value = with_collector(&slack());
         value["collectors"][0]["connector_instance"] = serde_json::json!("connector.ci.main");
         assert!(refusal(&value).contains("configured twice"));
 
-        let mut value = with_collector(&serde_json::json!({}));
+        let mut value = with_collector(&slack());
         value["collectors"][0]["connector_instance"] =
             serde_json::json!("connector.transcript.slack");
         assert!(refusal(&value).contains("transcript prefix"));
 
-        let mut value = with_collector(&serde_json::json!({}));
+        let mut value = with_collector(&slack());
         value["collectors"][0]["provider"] = serde_json::json!("Slack");
         assert!(refusal(&value).contains("provider"));
 
-        let mut value = with_collector(&serde_json::json!({}));
+        let mut value = with_collector(&slack());
         value["collectors"][0]["stale_after_seconds"] = serde_json::json!(30);
         assert!(refusal(&value).contains("slack.acme"));
     }
 
     #[test]
     fn one_provider_scope_has_one_collector() {
-        let mut value = with_collector(&serde_json::json!({}));
+        let mut value = with_collector(&slack());
         let mut second = value["collectors"][0].clone();
         second["connector_instance"] = serde_json::json!("slack.acme.second");
         value["collectors"]
@@ -957,6 +978,22 @@ mod tests {
         second["provider_scope_id"] = serde_json::json!("T07OTHER001");
         value["collectors"][1] = second;
         assert_eq!(parse(&value).unwrap().collectors.len(), 2);
+    }
+
+    #[test]
+    fn a_collector_is_never_stale_between_its_reconciliations() {
+        let mut value = with_collector(&serde_json::json!({
+            "token_env": "FLEET_RECALL_SLACK_BOT_TOKEN",
+            "channels": ["C07PLATENG1"],
+            "reconcile_every_seconds": 172_800
+        }));
+        let message = refusal(&value);
+        assert!(message.contains("reconcile interval"), "{message}");
+        value["collectors"][0]["stale_after_seconds"] = serde_json::json!(172_800);
+        assert!(parse(&value).is_ok());
+        value["collectors"][0]["settings"]["api_base"] =
+            serde_json::json!("http://slack.example.com/api");
+        assert!(refusal(&value).contains("not loopback"));
     }
 
     #[test]

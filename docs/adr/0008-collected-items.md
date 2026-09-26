@@ -12,16 +12,18 @@
   (D4 to D6); migration 34 adds withdrawals (D5, D6), and evidence recall
   withholds deleted and withdrawn items. `recall(kind=item)` reads items back
   as items (D7). The worker runs pull collectors through one pull framework,
-  and the documents-directory collector is the first (D8). `ostk-fleet-recall
-  collect` imports a file of items as a snapshot of one provider scope and
-  lists, dead-letters, and retires what the collectors hold (D9). An agent
-  relays items it read through its own connectors with
-  `remember(action="capture")`, a reported channel through the same sink,
-  served only where `FLEET_RECALL_COLLECTED_CAPTURE` turns it on (D10). A
-  claim cites the items it rests on: `remember(assert)`'s `support_items`
-  and `record`'s item support entries link it to them through migration 35,
-  privately (D11). No API collector stages items yet; those land with their
-  own decisions.
+  and the documents-directory collector is the first (D8). The Slack
+  collector pulls channels through the Web API over the provider HTTP seam
+  (D8). `ostk-fleet-recall collect` imports a file of items, or a Slack
+  export, as a snapshot of one provider scope and lists, dead-letters, and
+  retires what the collectors hold (D9). An agent relays items it read
+  through its own connectors with `remember(action="capture")`, a reported
+  channel through the same sink, served only where
+  `FLEET_RECALL_COLLECTED_CAPTURE` turns it on (D10). A claim cites the items
+  it rests on: `remember(assert)`'s `support_items` and `record`'s item
+  support entries link it to them through migration 35, privately (D11). No
+  Linear or Granola collector stages items yet; those land with their own
+  decisions.
 - Date: 2026-09-25
 - Scope: how specs and documents, Slack conversations, Linear tickets,
   Granola meetings, and anything else a collector can read become evidence
@@ -567,15 +569,18 @@ would need a migration of its own.
 `CollectorAdapterV1` per provider: its provider kind, `validate`, which the
 sources file calls when it is loaded (the settings are closed, with
 `deny_unknown_fields`, and the adapter refuses an audience policy its provider
-cannot use), and `pull`, which builds the source's `PullCollectorV1`. A new
-provider is one module and one row: no registry generation, migration, or
-recall surface. A configured provider this build has no adapter for is
-accepted by the file and reported as a failed source at tick time, so its
-status row makes evidence recall's absence `unknown` rather than leaving the
-source silently unread. The file also refuses two collectors over one
-provider scope: each would read the other's items as missing and tombstone
-them. Webhook verification and hinted fetches join the adapter when their
-slices define them.
+cannot use), `pull`, which builds the source's `PullCollectorV1` and reads the
+credential its settings name from the worker's environment, and, for a
+collector that does not reconcile on every pass, its reconcile interval: the
+file refuses a `stale_after_seconds` shorter than it, which would call the
+source stale between reconciliations. A new provider is one module and one
+row: no registry generation, migration, or recall surface. A configured
+provider this build has no adapter for is accepted by the file and reported as
+a failed source at tick time, so its status row makes evidence recall's
+absence `unknown` rather than leaving the source silently unread. The file
+also refuses two collectors over one provider scope: each would read the
+other's items as missing and tombstone them. Webhook verification and hinted
+fetches join the adapter when their slices define them.
 
 **A pass.** For each configured collector, in order, the `collect` step binds
 `connector.collected.pull` from the tick's verified head (a generation-2 head
@@ -666,11 +671,93 @@ A root that cannot be resolved is a failed pass, never an empty listing that
 would tombstone every document. Specs in a git worktree are covered by path
 and content digest and stay non-normative (AUTH-04).
 
+**The provider HTTP seam** (`src/collectors/http.rs`). Every API collector
+talks to its provider through `ProviderHttpV1` (`get`, `post_json`), over
+`reqwest` with rustls and no default features, which honours `HTTPS_PROXY`
+and `NO_PROXY`:
+
+- a request has a 30 second deadline and a response body at most 8 MiB,
+  read through the bound whatever `Content-Length` says;
+- a `429` is an answer, `RateLimited` with its `Retry-After`, so a pass ends
+  partial with its cursors held instead of retrying in a loop; any other
+  status outside `2xx` is `Status`, and a redirect is never followed, so the
+  credential is never replayed to another origin;
+- the API base must be `https`, or `http` to a loopback host (a local fake
+  provider, a relay on the same host), with no credentials, query, or
+  fragment, and a loopback base bypasses the proxy;
+- the token is read from the environment variable the settings name
+  (`token_env`); it travels only as a sensitive `Authorization` header, and
+  neither the token nor the client prints it;
+- an error never carries a response body, and every error a collector
+  records is passed through the collector redactor's scan first
+  (`scrub_diagnostic`), so a provider echoing a credential cannot write it
+  into a status row.
+
+**Slack** (`src/collectors/slack`, provider `slack`). An internal custom app's
+bot token (`token_env`) reads one workspace, pinned by its `team_id` (the
+provider scope id): `auth.test` must report that team (and `enterprise_id`,
+when the settings pin one), or the pass fails before it reads anything. Each
+configured channel (`channels`, ids `C...` or `G...`; a `D...` direct
+conversation is refused in the settings) is one `slack.channel` container:
+
+- `conversations.info` gives the channel's name and audience, recorded as a
+  container observation: a public channel is `provider_public`; a private or
+  org-shared channel is admitted `operator_declared` only when
+  `audience.private_containers` lists it; a direct, group-direct, or
+  externally shared (Slack Connect) conversation never is. An inadmissible
+  channel is never read, its observation withdraws the container (which
+  hides what was admitted through it), and it is outside the pass's domain;
+  listing it later re-opens it on the next read.
+- A pass is a **reconciliation** when none has run to its end within
+  `reconcile_every_seconds` (86,400 by default, the `slack.reconcile`
+  cursor); only a reconciliation writes coverage and `last_checked_at`. It
+  pages `conversations.history` over `[backfill_since, now)` (unset: the
+  whole history) on `next_cursor`, and `conversations.replies` for every
+  thread in it. An **incremental** pass reads the trailing `rescan_days` (7
+  by default) or from the channel's high-water mark when that is older, and
+  the replies of every thread whose `latest_reply` is past the channel's
+  reply cursor, so it picks up new messages, new replies, and edits.
+- A message is object kind `message`, external id `<channel>:<ts>` with the
+  `ts` kept as Slack's exact string, marker `edited.ts` else `ts`, order the
+  marker's microseconds; an edit is a new version that supersedes. A reply's
+  thread root and parent are its root, and a thread broadcast is recorded once
+  per `(channel, ts)`. `mrkdwn` is rendered (`<@U1>` to `@U1`, `<#C1|name>` to
+  `#name`, `<url|label>` to the label and an outbound link, entities
+  unescaped), a `bot_id` makes the author a bot, and a file is an outbound
+  `file` link, never its content, with its own `t=xox...` token stripped.
+  Membership and housekeeping messages are not items. A message the memory
+  already holds at the same version and content is kept, not staged.
+- **Deletions need two complete reads.** A message the memory holds inside
+  what a complete read of its channel could see (a channel-level message or
+  root in the history window, or a reply in a thread read to its end) and
+  that the read did not return is counted in the channel's cursor; missing
+  from two consecutive complete reads, it gets a `deleted` tombstone at its
+  own order, which wins the tie. A `tombstone` message (a root deleted while
+  its replies remain) hides the root at once.
+- **Partial reads.** Every call counts against `max_pages_per_tick`. An
+  `ok: false` for a channel (`not_in_channel`, `missing_scope`,
+  `channel_not_found`) leaves that channel partial and the pass goes on. A
+  rate limit or the page budget ends the pass: the channel in progress and
+  every later one are partial, their cursors are held (what was staged stays
+  staged, and a re-read stages nothing twice), and a reconciliation cut short
+  runs again on the next pass. A refused credential fails the pass. A
+  channel's cursor advances only with its last page, when the channel was
+  read to its end.
+- A reconciliation's receipt window starts at `backfill_since` when that is
+  later than the sources file's `coverage_since`: the pass covers only what
+  it read.
+
+Reactions, reply counts, unfurls, presence, and file content are never read.
+
 **Rejected.** A per-container cursor for documents: a full enumeration
 compared with the heads resumes by construction, and a pass instant as the
 order keeps it independent of file times. Following every symlink inside the
 root: a symlinked directory can form a cycle, and following one only to
-reach the same files again buys nothing.
+reach the same files again buys nothing. For Slack: tombstoning a message
+missing from one read (a listing that raced an edit, or a transient provider
+gap, would hide it for good, since a message that reappears at its own order
+cannot displace the tombstone), and resuming a cut reconciliation from a
+saved Slack cursor (Slack cursors expire; a re-read stages nothing twice).
 
 ## D9 — Operator imports and the `collect` command
 
@@ -681,10 +768,11 @@ collector instance, `--principal` its ingress principal, `--provider` and
 `--provider-scope` pin the one provider scope every line must name,
 `--audience operator-declared` (required, and the only audience) is the
 operator's declaration that the file is visible to the whole project, and
-`--format items-jsonl` (the only format so far) reads one
-`CollectedItemInputV1` per line. The command runs as the writer login under
-the writer-authority pins, needs the schema through migration 34, probes the
-privileges the worker's `collect` step uses, and binds
+`--format` names the file's format: `items-jsonl` reads one
+`CollectedItemInputV1` per line, and `slack-export` reads a Slack workspace
+export, a directory or a zip (below). The command runs as the writer login
+under the writer-authority pins, needs the schema through migration 34, probes
+the privileges the worker's `collect` step uses, and binds
 `connector.collected.import` from the verified head.
 
 - **The instance.** An import never takes an instance a worker source (git,
@@ -735,6 +823,24 @@ privileges the worker's `collect` step uses, and binds
   every waiting plan after its drain. An observation that is not admitted
   fails the source and records no receipt; a retired import is never
   re-activated by a finalization.
+
+**A Slack export** (`--format slack-export --provider slack`,
+`src/collectors/import/slack_export.rs`). The export's `channels.json` and
+`groups.json` map each folder to its channel's id (folder names are mutable
+labels). Every public channel is read, and a private channel only when
+`--private-container <id>` lists it; an unlisted private channel is never
+opened and is recorded as a withdrawn container, and `dms.json`,
+`mpims.json`, and any folder no channel names are never read. Messages
+become drafts exactly as the Slack collector makes them, so an imported
+message and the same message pulled are one item (the pull's head is
+presented), and a file link's `?t=xoxe-...` token is stripped. Each channel
+read is one container of the snapshot, even with no message; a day file that
+is not an array of messages, or a message that is not the documented shape,
+is a digest-only dead letter that leaves its channel partial. A zip holds at
+most 100,000 entries, an entry at most 64 MiB, and one read of the export at
+most 2 GiB, whatever its headers claim; the export may sit at the archive's
+top or in one folder. The export is read twice and digested over its entries'
+names and bytes, like a file.
 
 `collect status` lists every collector instance's status row, outbox rows by
 state, cursors (never their bytes), and dead letters by reason; `collect

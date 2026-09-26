@@ -209,9 +209,13 @@ enum CollectSubcommand {
         /// The file's format.
         #[arg(long, value_enum, value_name = "FORMAT")]
         format: CollectFormatArg,
-        /// The file.
+        /// The file (for a Slack export, a directory or a zip).
         #[arg(long, value_name = "PATH")]
         path: PathBuf,
+        /// A private channel of a Slack export to admit; repeat for each.
+        /// The export's other private channels are never read.
+        #[arg(long = "private-container", value_name = "CHANNEL")]
+        private_containers: Vec<String>,
         /// Stage only, and leave the drain and the snapshot receipt to the
         /// worker's collect step.
         #[arg(long)]
@@ -250,9 +254,25 @@ enum CollectAudienceArg {
 enum CollectFormatArg {
     /// One collected-item input per line.
     ItemsJsonl,
+    /// A Slack workspace export: a directory or a zip.
+    SlackExport,
 }
 
 impl CollectSubcommand {
+    /// Refuse flags the chosen format does not read.
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Self::Import {
+            format: CollectFormatArg::ItemsJsonl,
+            private_containers,
+            ..
+        } = self
+            && !private_containers.is_empty()
+        {
+            anyhow::bail!("--private-container applies to --format slack-export only");
+        }
+        Ok(())
+    }
+
     fn into_command(self) -> CollectCommandV1 {
         match self {
             Self::Import {
@@ -263,6 +283,7 @@ impl CollectSubcommand {
                 audience,
                 format,
                 path,
+                private_containers,
                 no_drain,
                 stale_after,
             } => CollectCommandV1::Import(CollectImportV1 {
@@ -275,6 +296,9 @@ impl CollectSubcommand {
                 },
                 format: match format {
                     CollectFormatArg::ItemsJsonl => ImportFormatV1::ItemsJsonl,
+                    CollectFormatArg::SlackExport => {
+                        ImportFormatV1::SlackExport { private_containers }
+                    }
                 },
                 path,
                 no_drain,
@@ -403,6 +427,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                     return run_worker(&config, &command).await;
                 }
                 Command::Collect { command } => {
+                    command.validate()?;
                     run_collect(&config, &command.into_command()).await?;
                 }
                 Command::Demo { .. } | Command::Migrate | Command::ModelDigest { .. } => {
@@ -2577,6 +2602,64 @@ mod tests {
             .is_err(),
             "operator-declared is the only audience"
         );
+    }
+
+    #[test]
+    fn collect_cli_parses_a_slack_export_and_its_listed_private_channels() {
+        let parse = |format: &str, private: &[&str]| {
+            let mut arguments = vec![
+                "ostk-fleet-recall",
+                "collect",
+                "import",
+                "--instance",
+                "import.slack",
+                "--principal",
+                "principal.import",
+                "--provider",
+                "slack",
+                "--provider-scope",
+                "T07ACME0001",
+                "--audience",
+                "operator-declared",
+                "--format",
+                format,
+                "--path",
+                "export.zip",
+            ];
+            for channel in private {
+                arguments.extend(["--private-container", channel]);
+            }
+            let Command::Collect { command } = Cli::try_parse_from(arguments).expect("CLI").command
+            else {
+                panic!("a collect command");
+            };
+            command
+        };
+        let export = parse("slack-export", &["G07LISTED01", "C07PRIVATE1"]);
+        export.validate().expect("an export takes private channels");
+        let CollectCommandV1::Import(import) = export.into_command() else {
+            panic!("an import");
+        };
+        assert_eq!(
+            import.format,
+            ImportFormatV1::SlackExport {
+                private_containers: vec!["G07LISTED01".into(), "C07PRIVATE1".into()]
+            }
+        );
+        let CollectCommandV1::Import(bare) = parse("slack-export", &[]).into_command() else {
+            panic!("an import");
+        };
+        assert_eq!(
+            bare.format,
+            ImportFormatV1::SlackExport {
+                private_containers: Vec::new()
+            }
+        );
+        let message = parse("items-jsonl", &["G07LISTED01"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("--format slack-export"), "{message}");
     }
 
     #[test]

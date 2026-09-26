@@ -129,6 +129,11 @@ pub struct PullPassOutcomeV1 {
     pub reconcile: bool,
     /// The collector's own counters, keyed by [`PullCollectorV1::counter_keys`].
     pub counters: BTreeMap<&'static str, u64>,
+    /// The earliest provider time a reconciliation read from, when the
+    /// collector reads a time window that may start after the sources file's
+    /// `coverage_since` (a Slack `backfill_since`): the receipt's window then
+    /// starts there. `None` for a pass that reads everything.
+    pub window_start: Option<CanonicalTimestamp>,
 }
 
 /// One provider read by one pass.

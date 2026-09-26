@@ -46,6 +46,20 @@
         "max_file_bytes": 1048576,
         "max_files": 5000
       }
+    },
+    {
+      "provider": "slack",
+      "connector_principal": "principal.slack",
+      "connector_instance": "slack.acme",
+      "provider_scope_id": "T07ACME0001",
+      "audience": {"private_containers": []},
+      "settings": {
+        "token_env": "FLEET_RECALL_SLACK_BOT_TOKEN",
+        "channels": ["C07PLATENG1"],
+        "rescan_days": 7,
+        "reconcile_every_seconds": 86400,
+        "max_pages_per_tick": 500
+      }
     }
   ]
 }

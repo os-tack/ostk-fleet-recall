@@ -223,6 +223,7 @@ impl CollectorAdapterV1 for DocsAdapterV1 {
     fn pull(
         &self,
         source: &CollectorSourceV1,
+        _environment: &dyn Fn(&str) -> Option<String>,
     ) -> std::result::Result<Option<Box<dyn PullCollectorV1>>, String> {
         Ok(Some(Box::new(DocsPullV1 {
             settings: DocsSettingsV1::from_source(source)?,
@@ -698,6 +699,7 @@ impl PullCollectorV1 for DocsPullV1 {
             }],
             reconcile: true,
             counters,
+            window_start: None,
         })
     }
 }
