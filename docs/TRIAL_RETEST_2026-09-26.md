@@ -256,8 +256,14 @@ verdict); readable git snippets (another normalization bump; the auditor
 prefers the raw fact); display names and export permalinks (deliberate);
 replies listed on `get` (needs an index).
 
-**Next steps.** `recall(brief, subject)` composing current claims, open
-conflicts and source health in one call; replies on `get` behind an index
+**Done since:** `recall(brief)` (`575b971`): with a subject, every current
+claim whose key starts with it, the open conflicts on them, and the health
+of the sources they cite; without one, the scope at a glance (most recently
+changed claims, open conflicts, stale or failed sources, lag, legacy keys,
+quarantine, the absence contract). Its description tells an agent to call
+it first.
+
+**Next steps.** Replies on `get` behind an index
 on `thread_root_external_id`; the at-rest supersession pass that rewrites
 pre-profile-3 bodies, for which `redacted_at_read` and the quarantine
 sample are now the worklist; scoping worker-ingested lag per kind on
