@@ -4,8 +4,8 @@ use serde_json::json;
 use crate::ledger::{
     AssertedClaimMutation, Claim, ClaimInput, ClaimItemSupportV1, ClaimMutation, ClaimState,
     ClaimTarget, Conflict, ConflictHistory, ConflictLifecycleRows, ConflictMutation,
-    ConflictTarget, DismissalTerms, LifecycleMutation, LifecycleRefusal, LifecycleReplayRequest,
-    RefusalCode, SemanticClaimHit, WaiverTerms,
+    ConflictTarget, DismissalTerms, LegacyClaimKeysV1, LifecycleMutation, LifecycleRefusal,
+    LifecycleReplayRequest, RefusalCode, SemanticClaimHit, WaiverTerms,
 };
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::remember_runtime::RememberAssertInputV1;
@@ -257,6 +257,11 @@ pub trait ClaimLedger: Send + Sync {
         scope: &FleetScope,
         claim_ids: &[i64],
     ) -> Result<Vec<(i64, ClaimState)>>;
+
+    /// How many of the project's lifecycle-current claims still carry a key
+    /// the earlier normalizer wrote (see [`LegacyClaimKeysV1`]); a bounded
+    /// read for `recall(status)`.
+    async fn legacy_claim_keys(&self, scope: &FleetScope) -> Result<LegacyClaimKeysV1>;
 
     async fn search_claims(
         &self,

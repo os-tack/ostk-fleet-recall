@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::evidence_recall::ContentTrustV1;
 use crate::item_recall::ItemSuppressionV1;
-use crate::ledger::{canonical_json, normalize_key_part};
+use crate::ledger::{canonical_json, claim_key_from_parts, normalize_key_part};
 use crate::memory_contracts::bootstrap::EpochId;
 use crate::memory_contracts::collected_item::{MAX_PROVIDER_URL_BYTES, TrustTierV1};
 use crate::memory_contracts::digest::Sha256Digest;
@@ -506,9 +506,7 @@ impl ClaimInput {
         let subject = self.subject.as_deref().map(normalize_key_part);
         let predicate = self.predicate.as_deref().map(normalize_key_part);
         let claim_key = match (&subject, &predicate) {
-            (Some(subject), Some(predicate)) if !subject.is_empty() && !predicate.is_empty() => {
-                Some(format!("{subject}::{predicate}"))
-            }
+            (Some(subject), Some(predicate)) => claim_key_from_parts(subject, predicate),
             _ => None,
         };
         let value = self.value.as_ref().map(canonical_json);
@@ -531,6 +529,24 @@ pub struct PreparedClaim {
     pub claim_key: Option<String>,
     pub value: Option<Value>,
     pub conflict_eligible: bool,
+}
+
+/// How many lifecycle-current claims of a project still carry a claim key
+/// written under the earlier normalizer.
+///
+/// That normalizer kept `_`, so `include_transcript_default::x` never met
+/// `include-transcript-default::x`. A row is legacy iff
+/// `claim_key_from_parts(subject, predicate)` differs from its stored key;
+/// `remember(assert)`'s `claim-v2:` keys are never counted. No migration
+/// rewrites keys: a supersede moves a legacy claim onto its current key, and
+/// `recall(status)` reports this count so the detection gap is visible until
+/// then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LegacyClaimKeysV1 {
+    /// Legacy rows found, at most the scan bound.
+    pub count: usize,
+    /// The bounded scan filled up, so `count` is a lower bound.
+    pub bound_exceeded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1172,6 +1188,32 @@ mod tests {
         );
         assert!(prepared.conflict_eligible);
         assert_eq!(prepared.value.unwrap().to_string(), r#"{"a":1,"z":2}"#);
+
+        // Underscores, hyphens, and whitespace are one separator, so the two
+        // spellings of the trial's transcript setting share one key.
+        let mut underscored = input();
+        underscored.subject = Some("include_transcript_default".into());
+        underscored.predicate = Some("Enabled".into());
+        let mut spaced = input();
+        spaced.subject = Some("include-transcript default".into());
+        spaced.predicate = Some("enabled".into());
+        let underscored = underscored.prepare().unwrap();
+        let spaced = spaced.prepare().unwrap();
+        assert_eq!(
+            underscored.claim_key.as_deref(),
+            Some("include-transcript-default::enabled")
+        );
+        assert_eq!(underscored.claim_key, spaced.claim_key);
+        assert_eq!(underscored.subject, spaced.subject);
+
+        // Parts that are only separators leave the claim keyless and outside
+        // the detector.
+        let mut separators = input();
+        separators.subject = Some("_-_ ".into());
+        let separators = separators.prepare().unwrap();
+        assert_eq!(separators.subject.as_deref(), Some(""));
+        assert_eq!(separators.claim_key, None);
+        assert!(!separators.conflict_eligible);
     }
 
     #[test]

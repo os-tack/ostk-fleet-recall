@@ -1397,9 +1397,10 @@ unknown outcome, and it does not consume the idempotency key:
 To replace a claim it authored instead, an agent sends `remember(supersede)`
 with the same `claim_id`, `expected_revision`, and optional `reason`, plus the
 successor's `record` fields. The successor must keep the predecessor's `kind`,
-its `subject`/`predicate` key after normalization (so `Fleet Store` matches
-`fleet-store`), and its conflict eligibility, so a supersede can change what a
-claim says but can never move it off its key or out of the detector's view:
+its `subject`/`predicate` key after normalization (whitespace, `_`, and `-`
+are one separator, so `Fleet Store` and `fleet_store` match `fleet-store`),
+and its conflict eligibility, so a supersede can change what a claim says but
+can never move it off its key or out of the detector's view:
 
 ```json
 {"action":"supersede","idempotency_key":"readme/supersede/v1","claim_id":41,"expected_revision":2,"reason":"the migration review chose a single migrator","kind":"decision","text":"Fleet schema migration runs through one dedicated migrator job.","subject":"fleet deployment","predicate":"migration strategy","value":"single dedicated migrator job"}
@@ -1426,6 +1427,21 @@ successor changes the kind (`successor_kind_mismatch`), the normalized key
 (`successor_key_mismatch`), or the conflict eligibility
 (`successor_eligibility_mismatch`). A malformed successor is an ordinary
 `invalid_params` error, exactly as for `record`.
+
+**Legacy underscore keys.** Before `_` became a key separator, a claim
+recorded as `include_transcript_default` kept its underscores while
+`include-transcript default` did not, so the two spellings took different keys
+and no conflict between them was ever detected. No migration rewrites stored
+keys. Instead `recall(status)` reports `legacy_claim_keys`, the number of the
+project's `active` or `disputed` claims whose stored `subject` and `predicate`
+no longer normalize to their stored key (a bounded read; at 256 it is a lower
+bound), with a `legacy_claim_keys` warning while it is above zero, because a
+claim recorded since under the same words takes the current key and the two
+are not compared. The exit is `remember(supersede)` with the same `subject`
+and `predicate`: the successor check re-normalizes the predecessor's stored
+parts, so the successor lands on the current key and goes through detection
+there, and the `claim_superseded` event records the `predecessor_claim_key`
+it left. A local quickstart or trial database can also simply be reset.
 
 To mark a conflict as seen, any agent in the project, including one whose
 claim is in it, sends `remember(acknowledge)` with the conflict id and the

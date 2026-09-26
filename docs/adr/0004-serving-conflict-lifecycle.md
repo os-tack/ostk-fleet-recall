@@ -56,9 +56,15 @@ silent overwrite.
 **Supersede.** `remember(supersede)` retires a claim under the same owner
 checks and writes its successor in the same transaction. The successor must
 keep the predecessor's `kind`, its normalized `claim_key` (both may be absent),
-and its `conflict_eligible` flag. Otherwise the request is refused as
-`successor_kind_mismatch`, `successor_key_mismatch`, or
-`successor_eligibility_mismatch`. The predecessor moves to `superseded` first,
+and its `conflict_eligible` flag. The key is compared as the predecessor's
+stored `subject` and `predicate` normalize today, not as its stored string: a
+claim keyed before `_` became a separator (`include_transcript_default::x`)
+accepts a successor on `include-transcript-default::x` and nothing else, so
+a supersede with the same words is the bridge off a legacy key, and the
+`claim_superseded` event carries the `predecessor_claim_key` it left.
+Otherwise the request is refused as `successor_kind_mismatch`,
+`successor_key_mismatch` (its details name the stored key, the re-normalized
+key, and the successor's), or `successor_eligibility_mismatch`. The predecessor moves to `superseded` first,
 so the successor goes through record's own claim-writing and detection steps
 against only the claims that stay current, and may open, reopen, or join the
 key's v2 conflict. Its actor is the trusted agent, its origin must be

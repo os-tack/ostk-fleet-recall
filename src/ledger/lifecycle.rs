@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 
 use crate::ledger::{
     Acknowledgement, ClaimKind, ClaimState, ClosureView, ConflictHistory, ConflictLifecycleEvent,
-    ConflictLifecycleOverlay, RevisionGap, WaiverView, functional_values_are_incompatible,
-    intervals_overlap,
+    ConflictLifecycleOverlay, RevisionGap, WaiverView, claim_key_from_parts,
+    functional_values_are_incompatible, intervals_overlap,
 };
 use crate::memory_contracts::discrepancy::{
     DismissalReasonKindV1, MAX_RATIONALE_BYTES, WaiverReasonKindV1, is_blank_rationale,
@@ -366,17 +366,52 @@ pub fn check_owner_transition(
 }
 
 /// The detector-relevant identity of a claim: its kind, its normalized
-/// functional key, and whether the detector compares it at all.
+/// functional key with the stored parts it was built from, and whether the
+/// detector compares it at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimShape {
     pub kind: ClaimKind,
     pub claim_key: Option<String>,
+    pub subject: Option<String>,
+    pub predicate: Option<String>,
     pub conflict_eligible: bool,
 }
 
+impl ClaimShape {
+    /// The key a successor must carry: the predecessor's stored `subject`
+    /// and `predicate` re-normalized under the current rule, so a claim
+    /// written under the earlier normalizer (which kept `_`) is superseded
+    /// onto the key a fresh record of the same words gets. The parts are
+    /// used rather than the joined key, because re-normalizing the string
+    /// `a_::b` would give `a-::b` while its parts give `a::b`. A key not
+    /// built from parts (an `assert`'s `claim-v2:` key, or a row without
+    /// them) must be kept verbatim.
+    #[must_use]
+    pub fn successor_claim_key(&self) -> Option<String> {
+        match (&self.subject, &self.predicate) {
+            (Some(subject), Some(predicate)) if !self.has_assert_key() => {
+                claim_key_from_parts(subject, predicate)
+            }
+            _ => self.claim_key.clone(),
+        }
+    }
+
+    fn has_assert_key(&self) -> bool {
+        self.claim_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with(ASSERT_CLAIM_KEY_PREFIX))
+    }
+}
+
+/// The prefix of every key `remember(assert)` derives; those keys are never
+/// re-normalized from a subject and predicate.
+const ASSERT_CLAIM_KEY_PREFIX: &str = "claim-v2:";
+
 /// A successor must keep its predecessor's kind, normalized key, and conflict
 /// eligibility, so a supersede can change a claim's value or wording but can
-/// never move it out of the detector's view or onto another key.
+/// never move it out of the detector's view or onto another key. The key is
+/// compared as [`ClaimShape::successor_claim_key`] derives it from the stored
+/// parts, which is how a legacy `_` key is superseded onto its current form.
 pub fn check_successor(
     predecessor_id: i64,
     predecessor: &ClaimShape,
@@ -398,17 +433,20 @@ pub fn check_successor(
             }),
         ));
     }
-    if successor.claim_key != predecessor.claim_key {
+    let expected_key = predecessor.successor_claim_key();
+    if successor.claim_key != expected_key {
         return Err(LifecycleRefusal::new(
             RefusalCode::SuccessorKeyMismatch,
             format!(
-                "claim {predecessor_id} has claim_key {}; its successor's subject and predicate normalize to {}",
+                "claim {predecessor_id} has claim_key {} (its subject and predicate normalize to {}); its successor's subject and predicate normalize to {}",
                 display_key(predecessor.claim_key.as_deref()),
+                display_key(expected_key.as_deref()),
                 display_key(successor.claim_key.as_deref())
             ),
             json!({
                 "claim_id": predecessor_id,
                 "claim_key": predecessor.claim_key,
+                "normalized_claim_key": expected_key,
                 "successor_claim_key": successor.claim_key,
             }),
         ));
@@ -1428,7 +1466,21 @@ mod tests {
         ClaimShape {
             kind: input.kind,
             claim_key: prepared.claim_key,
+            subject: prepared.subject,
+            predicate: prepared.predicate,
             conflict_eligible: prepared.conflict_eligible,
+        }
+    }
+
+    /// A stored row as the earlier normalizer left it: lowercase parts with
+    /// `_` kept, and the key joined from exactly those parts.
+    fn legacy_shape(subject: &str, predicate: &str) -> ClaimShape {
+        ClaimShape {
+            kind: ClaimKind::Decision,
+            claim_key: Some(format!("{subject}::{predicate}")),
+            subject: Some(subject.into()),
+            predicate: Some(predicate.into()),
+            conflict_eligible: true,
         }
     }
 
@@ -1479,6 +1531,10 @@ mod tests {
         assert_eq!(moved.code, RefusalCode::SuccessorKeyMismatch);
         assert_eq!(moved.details["claim_key"], "fleet-memory::database");
         assert_eq!(
+            moved.details["normalized_claim_key"],
+            "fleet-memory::database"
+        );
+        assert_eq!(
             moved.details["successor_claim_key"],
             "fleet-store::database"
         );
@@ -1507,6 +1563,76 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(entering.code, RefusalCode::SuccessorEligibilityMismatch);
+    }
+
+    /// A predecessor stored under the earlier normalizer, which kept `_`, is
+    /// superseded onto the key its words get today, and nowhere else.
+    #[test]
+    fn legacy_key_predecessor_is_superseded_onto_its_current_key() {
+        let legacy = legacy_shape("include_transcript_default", "x");
+        assert_eq!(
+            legacy.successor_claim_key().as_deref(),
+            Some("include-transcript-default::x")
+        );
+        let mut bridged = claim_input(
+            ClaimKind::Decision,
+            Some("include-transcript default"),
+            Some(json!(false)),
+        );
+        bridged.predicate = Some("X".into());
+        let bridged = shape_of(&bridged);
+        assert_eq!(
+            bridged.claim_key.as_deref(),
+            Some("include-transcript-default::x")
+        );
+        assert!(check_successor(41, &legacy, &bridged).is_ok());
+
+        let mut elsewhere = claim_input(
+            ClaimKind::Decision,
+            Some("include-transcript"),
+            Some(json!(false)),
+        );
+        elsewhere.predicate = Some("x".into());
+        let refused = check_successor(41, &legacy, &shape_of(&elsewhere)).unwrap_err();
+        assert_eq!(refused.code, RefusalCode::SuccessorKeyMismatch);
+        assert_eq!(
+            refused.details["claim_key"],
+            "include_transcript_default::x"
+        );
+        assert_eq!(
+            refused.details["normalized_claim_key"],
+            "include-transcript-default::x"
+        );
+        assert_eq!(
+            refused.details["successor_claim_key"],
+            "include-transcript::x"
+        );
+
+        // The parts decide, not the joined string: `a_` re-keys to `a::b`.
+        let trailing = legacy_shape("a_", "b");
+        assert_eq!(trailing.successor_claim_key().as_deref(), Some("a::b"));
+        // An assert's derived key is never re-normalized from its parts.
+        let asserted = ClaimShape {
+            kind: ClaimKind::Decision,
+            claim_key: Some("claim-v2:coordinate:attested".into()),
+            subject: Some("urn:ostk:entity:v1:repository:sha256:00".into()),
+            predicate: Some("mcp.remember.allowed_actions".into()),
+            conflict_eligible: true,
+        };
+        assert_eq!(
+            asserted.successor_claim_key().as_deref(),
+            Some("claim-v2:coordinate:attested")
+        );
+        // A row without parts keeps whatever key it has.
+        let partless = ClaimShape {
+            subject: None,
+            predicate: None,
+            ..legacy_shape("fleet-memory", "database")
+        };
+        assert_eq!(
+            partless.successor_claim_key().as_deref(),
+            Some("fleet-memory::database")
+        );
     }
 
     #[test]

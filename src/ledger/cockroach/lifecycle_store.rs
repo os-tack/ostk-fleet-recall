@@ -38,8 +38,8 @@ use crate::ledger::types::PreparedClaim;
 use crate::ledger::{
     ClaimInput, ClaimKind, ClaimMutation, ClaimState, ClaimTarget, Conflict,
     ConflictLifecycleEvent, ConflictMutation, ConflictReevaluation,
-    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LifecycleMutation, LifecycleReplayRequest,
-    SupersededClaim,
+    FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, LegacyClaimKeysV1, LifecycleMutation,
+    LifecycleReplayRequest, SupersededClaim, claim_key_from_parts,
 };
 use crate::store::cockroach::{ClaimItemLinksCapability, with_serializable_retry};
 use crate::{FleetError, FleetScope, Result};
@@ -72,11 +72,13 @@ const FINISH_CLAIM_RECEIPT_SQL: &str = "UPDATE memory_mutation_receipts \
      WHERE tenant_id = $1 AND idempotency_key = $2 \
        AND project = $3 AND request = $4 AND operation = $5";
 
-const LIFECYCLE_TARGET_CLAIM_SQL: &str = "SELECT id, kind, claim_key, state, origin, actor, \
-            revision, polarity, valid_from, valid_to, conflict_eligible, value \
+const LIFECYCLE_TARGET_CLAIM_SQL: &str = "SELECT id, kind, claim_key, subject, predicate, \
+            state, origin, actor, revision, polarity, valid_from, valid_to, \
+            conflict_eligible, value \
      FROM memory_claims@primary WHERE tenant_id = $1 AND project = $2 AND id = $3";
-const LOCK_LIFECYCLE_TARGET_CLAIM_SQL: &str = "SELECT id, kind, claim_key, state, origin, actor, \
-            revision, polarity, valid_from, valid_to, conflict_eligible, value \
+const LOCK_LIFECYCLE_TARGET_CLAIM_SQL: &str = "SELECT id, kind, claim_key, subject, predicate, \
+            state, origin, actor, revision, polarity, valid_from, valid_to, \
+            conflict_eligible, value \
      FROM memory_claims@primary WHERE tenant_id = $1 AND project = $2 AND id = $3 \
      FOR UPDATE";
 /// The same row set as the record path's detector write probe, so lifecycle
@@ -180,6 +182,25 @@ const GET_CONFLICTS_BY_ID_SQL: &str = "SELECT id, project, claim_key, kind, stat
      WHERE tenant_id = $1 AND project = $2 AND id = ANY($3) ORDER BY id LIMIT $4";
 const CLAIM_STATES_SQL: &str = "SELECT id, state FROM memory_claims@primary \
      WHERE tenant_id = $1 AND project = $2 AND id = ANY($3) ORDER BY id LIMIT $4";
+/// Lifecycle-current claims whose stored key is not what their stored parts
+/// re-join to under the separator rule (whitespace, `_`, and `-` collapse to
+/// one `-`, leading and trailing ones dropped). SQL only narrows the scan;
+/// each candidate is confirmed in Rust with the exact
+/// [`claim_key_from_parts`](crate::ledger::claim_key_from_parts) derivation.
+/// `remember(assert)` keys are derived, not built from parts, and are
+/// excluded. Bounded by one sentinel row over the reported limit.
+const LEGACY_CLAIM_KEY_CANDIDATES_SQL: &str = "SELECT id, claim_key, subject, predicate \
+     FROM memory_claims@primary \
+     WHERE tenant_id = $1 AND project = $2 \
+       AND state IN ('active', 'disputed') \
+       AND claim_key IS NOT NULL AND subject IS NOT NULL AND predicate IS NOT NULL \
+       AND claim_key NOT LIKE 'claim-v2:%' \
+       AND claim_key <> \
+           btrim(regexp_replace(lower(subject), '[\\s_-]+', '-', 'g'), '-') || '::' || \
+           btrim(regexp_replace(lower(predicate), '[\\s_-]+', '-', 'g'), '-') \
+     ORDER BY id LIMIT $3";
+/// Legacy-key rows one status read counts before reporting a lower bound.
+pub(super) const MAX_LEGACY_CLAIM_KEY_CANDIDATES: usize = 256;
 
 /// A stored lifecycle response that can be returned again as a replay.
 pub(super) trait Replayable {
@@ -201,7 +222,11 @@ impl Replayable for ConflictMutation {
 struct TargetRow {
     claim: LockedKeyClaim,
     kind: ClaimKind,
+    /// The stored key, exactly as the detector compares it, with the parts
+    /// it was built from so a successor check can re-normalize them.
     claim_key: Option<String>,
+    subject: Option<String>,
+    predicate: Option<String>,
 }
 
 impl TargetRow {
@@ -209,6 +234,8 @@ impl TargetRow {
         ClaimShape {
             kind: self.kind,
             claim_key: self.claim_key.clone(),
+            subject: self.subject.clone(),
+            predicate: self.predicate.clone(),
             conflict_eligible: self.claim.conflict_eligible,
         }
     }
@@ -647,6 +674,9 @@ async fn supersede_once(
 
     // R3: plain read; the successor must keep the predecessor's kind, key,
     // and conflict eligibility, which never change after a claim is written.
+    // The key is compared from the predecessor's stored parts, so a claim
+    // keyed under the earlier normalizer (which kept `_`) is superseded onto
+    // the key its words get today.
     let Some(target_row) = read_target(transaction, scope, target.claim_id, false).await? else {
         return Err(not_found(target.claim_id).into());
     };
@@ -656,12 +686,17 @@ async fn supersede_once(
         &ClaimShape {
             kind: successor.kind,
             claim_key: prepared.claim_key.clone(),
+            subject: prepared.subject.clone(),
+            predicate: prepared.predicate.clone(),
             conflict_eligible: prepared.conflict_eligible,
         },
     )?;
 
-    // R4-R6: the same locks and owner checks as retract.
+    // R4-R6: the same locks and owner checks as retract. The predecessor's
+    // lineage is locked on its stored key, so a legacy lineage is
+    // re-evaluated there; the successor's detection locks its own key.
     let locked = lock_owned_target(transaction, scope, target, &target_row).await?;
+    let predecessor_claim_key = target_row.claim_key.clone();
     let predecessor = &locked.claim;
 
     // R7: retire the predecessor first, so the successor's detection below
@@ -772,6 +807,7 @@ async fn supersede_once(
         key,
         json!({
             "claim_key": claim.claim_key,
+            "predecessor_claim_key": predecessor_claim_key,
             "from_state": predecessor.state.as_str(),
             "to_state": ClaimState::Superseded.as_str(),
             "revision": revision,
@@ -877,6 +913,37 @@ pub(super) async fn claim_states(
     rows.into_iter()
         .map(|(id, state)| Ok((id, parse_claim_state(&state)?)))
         .collect()
+}
+
+/// Count the project's lifecycle-current claims still keyed under the earlier
+/// normalizer: rows whose stored `subject` and `predicate` re-normalize to a
+/// key other than the stored one. The scan reads at most one row past
+/// [`MAX_LEGACY_CLAIM_KEY_CANDIDATES`]; that sentinel makes the count a lower
+/// bound instead of an unbounded read.
+pub(super) async fn legacy_claim_keys(
+    ledger: &CockroachClaimLedger,
+    scope: &FleetScope,
+) -> Result<LegacyClaimKeysV1> {
+    ledger.ensure_scope(scope)?;
+    let rows = sqlx::query_as::<_, (i64, String, String, String)>(LEGACY_CLAIM_KEY_CANDIDATES_SQL)
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(sentinel_limit(MAX_LEGACY_CLAIM_KEY_CANDIDATES)?)
+        .fetch_all(&ledger.pool)
+        .await?;
+    let bound_exceeded = rows.len() > MAX_LEGACY_CLAIM_KEY_CANDIDATES;
+    let count = rows
+        .iter()
+        .take(MAX_LEGACY_CLAIM_KEY_CANDIDATES)
+        .filter(|(_, claim_key, subject, predicate)| {
+            !claim_key.starts_with("claim-v2:")
+                && claim_key_from_parts(subject, predicate).as_deref() != Some(claim_key.as_str())
+        })
+        .count();
+    Ok(LegacyClaimKeysV1 {
+        count,
+        bound_exceeded,
+    })
 }
 
 /// Decode a committed receipt for `operation`, refusing reuse of the key for
@@ -1331,6 +1398,8 @@ async fn read_target(
     Ok(Some(TargetRow {
         kind: parse_claim_kind(&kind)?,
         claim_key: row.try_get("claim_key")?,
+        subject: row.try_get("subject")?,
+        predicate: row.try_get("predicate")?,
         claim: decode_locked_claim(&row)?,
     }))
 }
