@@ -96,6 +96,8 @@ The skeptic's adjustments to these grades:
 
 ### 1. Security: the transcript connector does not redact provider tokens (major)
 
+**Fixed on 2026-09-26** (redaction profile 3, one crate-wide redactor at transcript and git ingress; see `TRIAL_RETEST_2026-09-26.md`, fix round).
+
 The transcript redactor (`src/redaction/credential_shapes.rs`, `SecretClassV1`)
 knows six shapes: a PEM private key, an AWS access key id, a Bearer header, a
 `…key`/`…token`/`…secret` assignment, a password assignment, and credentials
@@ -109,6 +111,8 @@ defers git ingress redaction, so a secret in a commit message is stored raw.
 shapes, or one shared redactor.
 
 ### 2. Conflict detection misses a spelling difference (major)
+
+**Fixed on 2026-09-26** (`_`, `-` and whitespace are one separator; legacy rows are not rewritten, `recall(status)` counts them; see the retest doc).
 
 `normalize_key_part` (`src/ledger/conflict.rs:20`) lowercases and joins
 whitespace with `-` but keeps `_`. `Rollout Mode` and `rollout mode` share a
@@ -151,6 +155,8 @@ question, so an agent cannot walk from the question to the answer (Q4).
 
 ### 6. Capture is not searchable until the next projection tick (minor)
 
+**Fixed on 2026-09-26** for `enabled` captures, which are projected in the call (see the retest doc).
+
 `remember(capture)` in `enabled` mode admits the item, but it is not
 searchable until a worker `project` tick runs. An agent that captures and then
 searches does not find what it just captured.
@@ -174,6 +180,9 @@ searches does not find what it just captured.
 - Erasure: `forget` is not implemented, and projected bodies survive key destruction (SECURITY.md).
 
 ## Retest with the real model
+
+Done on 2026-09-26: see
+[`TRIAL_RETEST_2026-09-26.md`](TRIAL_RETEST_2026-09-26.md).
 
 Follow [`examples/trial/README.md`](../examples/trial/README.md). Grade each
 answer against its `expected` field before comparing with the table above. The
