@@ -69,6 +69,7 @@ use sqlx::PgPool;
 use common::authority::retry_policy;
 use common::runtime_role::RuntimeProbeRole;
 use common::worker::{RecordedCi, STUB_MODEL_DIGEST, StubEmbedder, WorkerFixture, vector_toward};
+use ostk_fleet_recall::evidence_recall::LagByKindV1;
 
 const SLACK_TEAM: &str = "T07ACME0001";
 const SLACK_CHANNEL: &str = "C07PLATENG1";
@@ -954,16 +955,14 @@ async fn live_absence_is_absent_only_over_complete_idle_sources_when_configured(
     assert_eq!(absent.absence.present_by, None);
     assert_eq!(absent.absence.weak_neighbours, 0);
     // A dense-only neighbour above the 0.18 retrieval floor and below the
-    // 0.45 absence bound is returned and counted, and the answer stays
-    // absent: nothing matched the words, and nothing was close enough to
-    // vote.
+    // 0.45 absence bound is returned and counted. In the band from 0.30 it
+    // refuses absent: nothing matched the words, but memory holds a candidate
+    // it cannot confirm, and names it.
     drain(&fixture, &pool, "embed").await;
-    let weak = vector_toward(
-        &body_vector(&pool, &fixture, found.hits[0].body_id).await,
-        0.30,
-    );
+    let document = body_vector(&pool, &fixture, found.hits[0].body_id).await;
+    let banded = vector_toward(&document, 0.36);
     let neighbourhood = recall
-        .search(&request("unfindable marmoset", None, false), Some(weak))
+        .search(&request("unfindable marmoset", None, false), Some(banded))
         .await
         .unwrap();
     assert_eq!(neighbourhood.hits.len(), 1, "{:?}", neighbourhood.hits);
@@ -971,24 +970,51 @@ async fn live_absence_is_absent_only_over_complete_idle_sources_when_configured(
     assert!(
         neighbourhood.hits[0]
             .dense_similarity
-            .is_some_and(|similarity| (similarity - 0.30).abs() < 0.03),
+            .is_some_and(|similarity| (similarity - 0.36).abs() < 0.03),
         "{:?}",
         neighbourhood.hits[0]
     );
     assert_eq!(
         neighbourhood.absence.verdict,
-        AbsenceVerdictV1::Absent,
+        AbsenceVerdictV1::Unknown,
         "{:?}",
         neighbourhood.absence
     );
+    assert_eq!(
+        neighbourhood.absence.reasons,
+        [AbsenceReasonV1::DenseNeighbourBelowBound]
+    );
+    assert_eq!(neighbourhood.absence.strongest_hit, Some(0));
     assert_eq!(neighbourhood.absence.present_by, None);
     assert_eq!(neighbourhood.absence.weak_neighbours, 1);
     assert!(
         neighbourhood
             .absence
             .strongest_dense_similarity
-            .is_some_and(|similarity| (similarity - 0.30).abs() < 0.03)
+            .is_some_and(|similarity| (similarity - 0.36).abs() < 0.03)
     );
+    // Below the band it is only counted, and the answer is absent.
+    let faint = vector_toward(&document, 0.25);
+    let faint_neighbourhood = recall
+        .search(&request("unfindable marmoset", None, false), Some(faint))
+        .await
+        .unwrap();
+    assert_eq!(faint_neighbourhood.hits.len(), 1);
+    assert!(
+        faint_neighbourhood.hits[0]
+            .dense_similarity
+            .is_some_and(|similarity| (similarity - 0.25).abs() < 0.03),
+        "{:?}",
+        faint_neighbourhood.hits[0]
+    );
+    assert_eq!(
+        faint_neighbourhood.absence.verdict,
+        AbsenceVerdictV1::Absent,
+        "{:?}",
+        faint_neighbourhood.absence
+    );
+    assert_eq!(faint_neighbourhood.absence.strongest_hit, Some(0));
+    assert_eq!(faint_neighbourhood.absence.weak_neighbours, 1);
     let docs_only = recall
         .search(&request("unfindable marmoset", Some("docs"), false), None)
         .await
@@ -1037,6 +1063,102 @@ async fn live_absence_is_absent_only_over_complete_idle_sources_when_configured(
     );
     let every = search(&recall, "unfindable marmoset").await;
     assert_eq!(every.readiness.items_awaiting_admission, 2);
+}
+
+#[tokio::test]
+async fn live_projection_lag_is_scoped_to_the_provider_asked_for_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = fixture_at(&pool, "items-lag-by-kind").await;
+    let collector = docs();
+    let status = reconciled(&collector);
+    stage_with(
+        &pool,
+        &fixture,
+        &collector,
+        vec![doc(
+            "heron.md",
+            "the heron roster",
+            1_000,
+            ItemLifecycleV1::Live,
+        )],
+        Some(&status),
+    )
+    .await;
+    let recall = items(&pool, &fixture).await;
+    let lag = |answer: &ItemSearchV1| {
+        (
+            answer.readiness.events_awaiting_body_projection,
+            answer.readiness.lag_by_kind,
+        )
+    };
+    let lags = |answer: &ItemSearchV1| {
+        answer
+            .absence
+            .reasons
+            .contains(&AbsenceReasonV1::BodyProjectionLag)
+    };
+
+    // Admitted and not yet projected, the part is one pending collected
+    // event: it lags every search, and the docs search in particular.
+    drain(&fixture, &pool, "collect").await;
+    let every = search(&recall, "unfindable marmoset").await;
+    assert_eq!(every.readiness.items_awaiting_admission, 0);
+    assert_eq!(lag(&every), (1, LagByKindV1 { items: 1, other: 0 }));
+    assert!(lags(&every), "{:?}", every.absence);
+    let of_docs = recall
+        .search(&request("unfindable marmoset", Some("docs"), false), None)
+        .await
+        .unwrap();
+    assert_eq!(lag(&of_docs), (1, LagByKindV1 { items: 1, other: 0 }));
+    assert!(lags(&of_docs), "{:?}", of_docs.absence);
+    // A pending docs part cannot hold a Slack message: slack is not lagging.
+    let of_slack = recall
+        .search(&request("unfindable marmoset", Some("slack"), false), None)
+        .await
+        .unwrap();
+    assert_eq!(lag(&of_slack), (0, LagByKindV1 { items: 0, other: 0 }));
+    assert!(!lags(&of_slack), "{:?}", of_slack.absence);
+
+    // A git commit the worker ingested but did not project lags every
+    // unfiltered search, as other evidence, and no provider's.
+    let head = fixture.repository.head();
+    fixture.repository.commit(
+        Some(&head),
+        "retire the brindlewort fallback",
+        "1755432000 +0000",
+    );
+    let report = fixture.worker(&pool, "ingest").await.run_tick().await;
+    assert!(
+        !report.failed(),
+        "the ingest tick must succeed: {}",
+        serde_json::to_string_pretty(&report).unwrap()
+    );
+    let every = search(&recall, "unfindable marmoset").await;
+    let (total, by_kind) = lag(&every);
+    assert_eq!(by_kind.items, 1, "{:?}", every.readiness);
+    assert!(by_kind.other >= 1, "{:?}", every.readiness);
+    assert_eq!(total, by_kind.total());
+    assert!(lags(&every));
+    let of_docs = recall
+        .search(&request("unfindable marmoset", Some("docs"), false), None)
+        .await
+        .unwrap();
+    assert_eq!(lag(&of_docs), (1, LagByKindV1 { items: 1, other: 0 }));
+    let of_slack = recall
+        .search(&request("unfindable marmoset", Some("slack"), false), None)
+        .await
+        .unwrap();
+    assert_eq!(lag(&of_slack), (0, LagByKindV1 { items: 0, other: 0 }));
+    assert!(!lags(&of_slack), "{:?}", of_slack.absence);
+
+    // Projected, nothing lags anywhere.
+    drain(&fixture, &pool, "project").await;
+    let every = search(&recall, "unfindable marmoset").await;
+    assert_eq!(lag(&every), (0, LagByKindV1 { items: 0, other: 0 }));
+    assert!(!lags(&every), "{:?}", every.absence);
 }
 
 #[tokio::test]

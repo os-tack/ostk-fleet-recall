@@ -37,9 +37,10 @@ use common::worker::{
     WorkerFixture, vector_toward,
 };
 use ostk_fleet_recall::evidence_recall::{
-    ABSENCE_DENSE_MIN_COSINE_SIMILARITY, AbsenceReasonV1, AbsenceVerdictV1,
-    CockroachEvidenceRecall, DENSE_VOTE_EXCLUDED_MEDIA_TYPES, EvidenceDenseLaneV1, EvidenceMatchV1,
-    EvidenceRecall, EvidenceSearchV1, PresentByV1, probe_evidence_recall, start_evidence_recall,
+    ABSENCE_DENSE_MIN_COSINE_SIMILARITY, ABSENCE_NEIGHBOUR_BAND_FLOOR, AbsenceReasonV1,
+    AbsenceScopeV1, AbsenceVerdictV1, CockroachEvidenceRecall, DENSE_VOTE_EXCLUDED_MEDIA_TYPES,
+    EvidenceDenseLaneV1, EvidenceMatchV1, EvidenceRecall, EvidenceSearchV1, EvidenceSourceFilterV1,
+    LagByKindV1, PresentByV1, probe_evidence_recall, start_evidence_recall,
 };
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::{McpServer, tool_list, tool_list_for_surfaces};
@@ -256,6 +257,7 @@ async fn live_evidence_search_hydrates_hits_when_configured() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one turn's vector, read at four similarities
 async fn live_dense_lane_never_compares_another_models_vectors_when_configured() {
     let Some(database_url) = common::test_database_url() else {
         return;
@@ -327,9 +329,10 @@ async fn live_dense_lane_never_compares_another_models_vectors_when_configured()
     assert_eq!(answer.absence.verdict, AbsenceVerdictV1::Present);
     assert_eq!(answer.absence.present_by, Some(PresentByV1::Dense));
     // ...and a neighbour that clears the 0.18 retrieval floor but not the
-    // absence bound is returned, counted, and decides nothing.
-    let weak = vector_toward(&turn_vector, 0.30);
-    let answer = recall.search(NONSENSE, Some(weak), 10).await.unwrap();
+    // absence bound is returned and counted. In the band under the bound it
+    // refuses absent and is named as the candidate to read...
+    let banded = vector_toward(&turn_vector, 0.36);
+    let answer = recall.search(NONSENSE, Some(banded), 10).await.unwrap();
     let neighbour = answer
         .hits
         .iter()
@@ -339,20 +342,59 @@ async fn live_dense_lane_never_compares_another_models_vectors_when_configured()
     assert!(
         neighbour
             .dense_similarity
-            .is_some_and(|similarity| (similarity - 0.30).abs() < 0.03),
+            .is_some_and(|similarity| (similarity - 0.36).abs() < 0.03),
         "{neighbour:?}"
     );
     assert!(
         answer
             .absence
             .strongest_dense_similarity
-            .is_some_and(|similarity| similarity < ABSENCE_DENSE_MIN_COSINE_SIMILARITY),
+            .is_some_and(|similarity| {
+                (ABSENCE_NEIGHBOUR_BAND_FLOOR..ABSENCE_DENSE_MIN_COSINE_SIMILARITY)
+                    .contains(&similarity)
+            }),
+        "{:?}",
+        answer.absence
+    );
+    assert_eq!(answer.absence.verdict, AbsenceVerdictV1::Unknown);
+    assert_eq!(
+        answer.absence.reasons,
+        [AbsenceReasonV1::DenseNeighbourBelowBound]
+    );
+    // The candidate named is the hit the strongest similarity was read from.
+    let strongest = answer.absence.strongest_hit.expect("a candidate is named");
+    assert_eq!(
+        answer.hits[strongest].dense_similarity,
+        answer.absence.strongest_dense_similarity
+    );
+    assert_eq!(answer.absence.present_by, None);
+    assert!(answer.absence.weak_neighbours >= 1);
+    assert_eq!(answer.absence.weak_neighbours as usize, answer.hits.len());
+    // ...and below the band it is only counted: the answer is absent.
+    let faint = vector_toward(&turn_vector, 0.25);
+    let answer = recall.search(NONSENSE, Some(faint), 10).await.unwrap();
+    let neighbour = answer
+        .hits
+        .iter()
+        .find(|hit| hit.id == turn.id)
+        .expect("a neighbour above the retrieval floor is still a hit");
+    assert!(
+        neighbour
+            .dense_similarity
+            .is_some_and(|similarity| (similarity - 0.25).abs() < 0.03),
+        "{neighbour:?}"
+    );
+    assert!(
+        answer
+            .absence
+            .strongest_dense_similarity
+            .is_some_and(|similarity| similarity < ABSENCE_NEIGHBOUR_BAND_FLOOR),
         "{:?}",
         answer.absence
     );
     assert_eq!(answer.absence.verdict, AbsenceVerdictV1::Absent);
     assert_eq!(answer.absence.present_by, None);
-    assert!(answer.absence.weak_neighbours >= 1);
+    assert!(answer.absence.strongest_hit.is_some());
     assert_eq!(answer.absence.weak_neighbours as usize, answer.hits.len());
     // ...until a worker running another model has written the scope's
     // vectors: then nothing the dense lane could return is comparable.
@@ -402,9 +444,20 @@ async fn live_evidence_absent_only_when_current_covered_and_fresh_when_configure
     );
     tick(&fixture, &pool, "ingest").await;
     for query in [NONSENSE, LATE_WORD] {
-        assert_unknown_because(
-            &search(&recall, query).await,
-            &[AbsenceReasonV1::BodyProjectionLag],
+        let answer = search(&recall, query).await;
+        assert_unknown_because(&answer, &[AbsenceReasonV1::BodyProjectionLag]);
+        // The lag is the project's own evidence (the commit and its blob),
+        // not a collected part.
+        let pending = answer.readiness.events_awaiting_body_projection;
+        assert!(pending >= 1, "{:?}", answer.readiness);
+        assert_eq!(
+            answer.readiness.lag_by_kind,
+            Some(LagByKindV1 {
+                items: 0,
+                other: pending
+            }),
+            "{:?}",
+            answer.readiness
         );
     }
     tick(&fixture, &pool, "project,embed").await;
@@ -459,6 +512,136 @@ async fn live_evidence_absent_only_when_current_covered_and_fresh_when_configure
             .active
             .iter()
             .any(|source| source.connector_instance == GIT_INSTANCE && source.stale)
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // three sources, both lanes
+async fn live_evidence_source_filter_scopes_both_lanes_and_the_verdict_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let capabilities = capabilities(&database_url).await;
+    let fixture = WorkerFixture::install(&pool, "evidence-source-filter").await;
+    tick(&fixture, &pool, "all").await;
+    let recall = evidence(&pool, &capabilities, &fixture.installed.scope).await;
+    let git = EvidenceSourceFilterV1::Git;
+    let sessions = EvidenceSourceFilterV1::Sessions;
+
+    // Unfiltered, the commit's word finds the commit; filtered to git it
+    // finds only git facts, and the verdict says which source it speaks for.
+    let every = search(&recall, COMMIT_WORD).await;
+    assert!(
+        every
+            .hits
+            .iter()
+            .any(|hit| hit.media_type == git.media_type())
+    );
+    assert_eq!(every.absence.scope, None);
+    let from_git = recall
+        .search_from(COMMIT_WORD, None, 10, Some(git))
+        .await
+        .unwrap();
+    assert!(!from_git.hits.is_empty());
+    assert!(
+        from_git
+            .hits
+            .iter()
+            .all(|hit| hit.media_type == git.media_type()),
+        "{:?}",
+        from_git.hits
+    );
+    assert_eq!(from_git.absence.verdict, AbsenceVerdictV1::Present);
+    assert_eq!(from_git.absence.scope, Some(AbsenceScopeV1 { source: git }));
+    // The transcript's word is absent from git, and present in sessions.
+    let turn_from_git = recall
+        .search_from(TRANSCRIPT_WORD, None, 10, Some(git))
+        .await
+        .unwrap();
+    assert!(turn_from_git.hits.is_empty(), "{:?}", turn_from_git.hits);
+    assert_eq!(
+        turn_from_git.absence.verdict,
+        AbsenceVerdictV1::Absent,
+        "{:?}",
+        turn_from_git.absence
+    );
+    assert_eq!(
+        turn_from_git.absence.scope,
+        Some(AbsenceScopeV1 { source: git })
+    );
+    let turn_from_sessions = recall
+        .search_from(TRANSCRIPT_WORD, None, 10, Some(sessions))
+        .await
+        .unwrap();
+    assert_eq!(
+        turn_from_sessions.absence.verdict,
+        AbsenceVerdictV1::Present
+    );
+    assert!(
+        turn_from_sessions
+            .hits
+            .iter()
+            .all(|hit| hit.media_type == sessions.media_type()),
+        "{:?}",
+        turn_from_sessions.hits
+    );
+    // The readiness and the listing stay scope-wide.
+    assert_eq!(turn_from_git.sources, every.sources);
+
+    // The dense lane is filtered too: the commit's own vector finds the
+    // commit unfiltered and nothing of it when scoped to sessions.
+    let mut commit = None;
+    for hit in &every.hits {
+        let body = recall.get(hit.id).await.unwrap().unwrap();
+        if body.text.contains(COMMIT_WORD) {
+            commit = Some(body);
+        }
+    }
+    let commit = commit.expect("the commit is recalled");
+    let exact = query_vector(&commit.text);
+    let dense_from_git = recall
+        .search_from(NONSENSE, Some(exact.clone()), 10, Some(git))
+        .await
+        .unwrap();
+    assert!(
+        dense_from_git
+            .hits
+            .iter()
+            .any(|hit| hit.id == commit.id && hit.matched_by == EvidenceMatchV1::Dense),
+        "{:?}",
+        dense_from_git.hits
+    );
+    assert!(
+        dense_from_git
+            .hits
+            .iter()
+            .all(|hit| hit.media_type == git.media_type())
+    );
+    let dense_from_sessions = recall
+        .search_from(NONSENSE, Some(exact), 10, Some(sessions))
+        .await
+        .unwrap();
+    assert!(
+        dense_from_sessions
+            .hits
+            .iter()
+            .all(|hit| hit.id != commit.id && hit.media_type == sessions.media_type()),
+        "{:?}",
+        dense_from_sessions.hits
+    );
+    // No collected item was ever admitted here: items is absent, scoped.
+    let from_items = recall
+        .search_from(COMMIT_WORD, None, 10, Some(EvidenceSourceFilterV1::Items))
+        .await
+        .unwrap();
+    assert!(from_items.hits.is_empty(), "{:?}", from_items.hits);
+    assert_eq!(from_items.absence.verdict, AbsenceVerdictV1::Absent);
+    assert_eq!(
+        from_items.absence.scope,
+        Some(AbsenceScopeV1 {
+            source: EvidenceSourceFilterV1::Items
+        })
     );
 }
 
