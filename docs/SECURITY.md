@@ -359,9 +359,13 @@ on `memory_conflict_members`, `INSERT` on the two event tables, and its
 receipt privileges cover them, and a supersede successor uses exactly the
 inserts `remember(record)` already holds. The conflict actions and the
 lifecycle overlay also need migration 29's `memory_conflict_lifecycle_events_v1`,
-on which the runtime policy grants `SELECT` and `INSERT` only. With no
-`UPDATE` or `DELETE`, the runtime cannot rewrite or remove a logged event, and
-the publication reader has no grant on the table at all. The writer probes
+on which the runtime policy grants `SELECT` and `INSERT` only. The claim
+lifecycle log, `memory_claim_events`, is held the same way: the runtime
+policy grants `SELECT` and `INSERT` so `recall(get, kind=claim)` can serve a
+claim's history (who recorded, disputed, retracted, or superseded it, when,
+and why) to every agent in the project. With no `UPDATE` or `DELETE`, the
+runtime cannot rewrite or remove a logged event on either table, and the
+publication reader has no grant on them at all. The writer probes
 those two privileges once at startup and serves the conflict lifecycle only
 when both are present. Every agent in one deployment shares one
 `fleet_writer` credential, so this is authority over agents that run the

@@ -748,6 +748,14 @@ GRANT DELETE ON TABLE public.memory_chunk_history TO fleet_runtime;
 -- after applying this policy.
 GRANT SELECT, INSERT ON TABLE public.memory_conflict_lifecycle_events_v1 TO fleet_runtime;
 
+-- The claim lifecycle log (migration 1): every record, dispute, retract, and
+-- supersede transition with its actor, reason, and revision. The runtime
+-- role already appends to it; reading it lets recall(get, kind=claim) serve
+-- a claim's history to every agent in the project, the same way the conflict
+-- lifecycle log is served through the overlay. Never granted to the
+-- publication reader, which keeps the history off the public surface.
+GRANT SELECT ON TABLE public.memory_claim_events TO fleet_runtime;
+
 -- Claim item links (ADR 0008 D11, migration 35): which collected item a
 -- claim's support cites, one row per cited part. Append-only by privilege: no
 -- UPDATE and no DELETE, so a citation, once committed with its claim, is
@@ -895,7 +903,7 @@ GRANT fleet_runtime TO fleet_writer;
 -- exact count rejects those and every function/type/differently privileged
 -- row.
 SELECT IF(
-    count(*) = 143
+    count(*) = 144
         AND COALESCE(bool_and(
             NOT is_grantable
             AND (
@@ -931,6 +939,7 @@ SELECT IF(
                                 'memory_relation_projection_watermarks_v1',
                                 'memory_writer_authority_v1',
                                 'memory_conflict_lifecycle_events_v1',
+                                'memory_claim_events',
                                 'memory_claim_item_links_v1',
                                 'memory_body_objects_v1',
                                 'memory_chunk_occurrences_v1',
@@ -1073,7 +1082,7 @@ SELECT IF(
     1:::INT8,
     CAST(
         concat(
-            'runtime writer direct-grant postcondition differs from exact one-hundred-forty-three-row matrix: observed=',
+            'runtime writer direct-grant postcondition differs from exact one-hundred-forty-four-row matrix: observed=',
             count(*)::STRING
         )
         AS INT8
