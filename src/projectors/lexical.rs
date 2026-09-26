@@ -75,9 +75,14 @@ use super::error::{RecallProjectionError, RecallProjectionResult};
 ///
 /// It is part of the lexical text's digest preimage: changing the pipeline
 /// without changing this constant would let two different normalizers claim the
-/// same identity. Version 2 added the media-type-aware rendering described
-/// above; version 1 normalized raw body bytes for every media type.
-pub const LEXICAL_NORMALIZATION_VERSION: u32 = 2;
+/// same identity. Version 1 normalized raw body bytes for every media type;
+/// version 2 added the media-type-aware rendering described above; version 3
+/// redacts with redaction profile 3 (`crate::redaction`), which adds the
+/// provider credential shapes and Stripe keys to the six shared shapes the
+/// recall text was scanned with before. A row stored at an older version is
+/// re-derived by the worker's lexical step (`rows_reprojected`), which is what
+/// redacts the served copy of a body admitted before profile 3.
+pub const LEXICAL_NORMALIZATION_VERSION: u32 = 3;
 
 /// Media type of a canonical git provider fact.
 pub const GIT_FACT_MEDIA_TYPE: &str = "application.ostk-git-fact-v1";
@@ -402,9 +407,12 @@ pub fn lexical_text_digest(
 ///
 /// Residual, recorded rather than hidden: the BODY still holds those bytes, and
 /// deliberately so — a body is evidence and must reproduce the provider fact
-/// exactly. What this removes is the *retrievable* copy. Closing the gap at
-/// ingress needs a redactor on the git connector, which is a connector change,
-/// not a projector one.
+/// exactly. What this removes is the *retrievable* copy. Since redaction
+/// profile 3 the git connector redacts a commit's text fields at ingress too
+/// (`crate::connectors::git::redaction`), so a fact admitted after it carries
+/// the placeholder in its body as well; a fact admitted before it keeps its
+/// raw bytes at rest, and only this recall copy is redacted, once the worker
+/// re-projects rows stored under an older `LEXICAL_NORMALIZATION_VERSION`.
 ///
 /// A text redaction cannot neutralize (an unredactable class, or a residual
 /// match after replacement) collapses to the placeholder alone: the recall

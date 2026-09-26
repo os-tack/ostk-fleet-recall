@@ -117,6 +117,7 @@ use crate::evidence_ledger::ContentKeyEncryptionKey;
 use crate::memory_contracts::common::CanonicalTimestamp;
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::projectors::EmbeddingProvider;
+use crate::redaction::REDACTION_PROFILE_VERSION;
 use crate::registry_witness::WriterAuthorityRuntime;
 use crate::store::cockroach::RetryPolicy;
 
@@ -358,6 +359,10 @@ pub struct WorkerTickReportV1 {
     /// Server time when the tick started, or the worker host's clock when
     /// the database could not be read (every step then reports why).
     pub tick_started_at: DateTime<Utc>,
+    /// The redaction profile every ingress and projection of this tick ran
+    /// under (`crate::redaction::REDACTION_PROFILE_VERSION`): a property of
+    /// the build, reported once per tick, never a summed counter.
+    pub redaction_profile: u32,
     /// The head the ingest steps ran under; `None` when no ingest step ran or
     /// the authority did not verify.
     pub authority: Option<WorkerAuthorityReportV1>,
@@ -607,14 +612,39 @@ impl MemoryWorker {
         if self.steps.contains(&WorkerStepV1::Bodies) {
             steps.insert(WorkerStepV1::Bodies, project::run_bodies(self).await);
         }
+        // Rows stored under an older normalization version make this tick's
+        // lexical pass a full re-projection and its dense pass a full
+        // re-embed. A count that cannot be read fails both steps closed: a
+        // cursor pass would quietly leave the stale rows as they are.
+        let stale = if self.steps.contains(&WorkerStepV1::Lexical)
+            || self.steps.contains(&WorkerStepV1::Dense)
+        {
+            project::stale_lexical_rows(self)
+                .await
+                .map_err(|error| format!("the stale lexical row count was not read: {error}"))
+        } else {
+            Ok(0)
+        };
+        let mut reembed = false;
         if self.steps.contains(&WorkerStepV1::Lexical) {
-            steps.insert(WorkerStepV1::Lexical, project::run_lexical(self).await);
+            let report = match &stale {
+                Ok(stale) => project::run_lexical(self, *stale).await,
+                Err(reason) => WorkerStepReportV1::failed(reason.clone()),
+            };
+            reembed = stale.as_ref().is_ok_and(|stale| *stale > 0)
+                && report.status == WorkerStepStatusV1::Ok;
+            steps.insert(WorkerStepV1::Lexical, report);
         }
         if self.steps.contains(&WorkerStepV1::Dense) {
-            steps.insert(WorkerStepV1::Dense, project::run_dense(self).await);
+            let report = match &stale {
+                Ok(_) => project::run_dense(self, reembed).await,
+                Err(reason) => WorkerStepReportV1::failed(reason.clone()),
+            };
+            steps.insert(WorkerStepV1::Dense, report);
         }
         WorkerTickReportV1 {
             tick_started_at,
+            redaction_profile: REDACTION_PROFILE_VERSION,
             authority,
             steps,
             retired_sources,
@@ -770,6 +800,7 @@ mod tests {
             tick_started_at: DateTime::parse_from_rfc3339("2026-09-24T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
+            redaction_profile: REDACTION_PROFILE_VERSION,
             authority: None,
             steps: BTreeMap::new(),
             retired_sources: None,
