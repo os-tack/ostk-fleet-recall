@@ -13,16 +13,23 @@
 //!    `connector.collected.pull` is bound from the head (a head without it
 //!    fails the source, naming `ostk-authority-install apply --target
 //!    generation-3`), with the collector redactor under the head's guarantee;
-//! 2. the pass runs at a pass instant read from the database, staging page by
+//! 2. from schema 36 on, when the adapter verifies webhooks, the collector's
+//!    due ingress hints are read first, at most `MAX_HINTS_PER_TICK`, and
+//!    each is re-read through the adapter's object fetcher (a deletion
+//!    becomes a push tombstone of an item already held) and settled in the
+//!    transaction that stages what it caused, or backed off, or after eight
+//!    attempts killed with a `retry_exhausted` dead letter (ADR 0008 D12); a
+//!    hint writes no coverage, so the pass still runs;
+//! 3. the pass runs at a pass instant read from the database, staging page by
 //!    page through a [`PageStager`];
-//! 3. what the pass staged or relied on is drained, and the pass is settled
+//! 4. what the pass staged or relied on is drained, and the pass is settled
 //!    against the rows' states: each container is complete only when it was
 //!    read to exhaustion and everything the pass holds current in it was
 //!    admitted;
-//! 4. the pass's `collector_observation` item is staged with the pass cursor
+//! 5. the pass's `collector_observation` item is staged with the pass cursor
 //!    and drained, and a reconciliation pass records its coverage receipt,
 //!    bound to that item's event ([`crate::collectors::coverage`]);
-//! 5. the collector's row in `memory_collector_sources_v1` is upserted
+//! 6. the collector's row in `memory_collector_sources_v1` is upserted
 //!    (`owner = worker`, `live`): `ok` when the pass staged or admitted
 //!    anything, else `unchanged`, or `failed` with its error, scrubbed of
 //!    every secret shape; only a reconciliation whose receipt was recorded
@@ -92,8 +99,11 @@ use crate::memory_contracts::collected_item::{CollectionModeV1, timestamp_micros
 use crate::memory_contracts::common::ContractId;
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::registry_witness::{VerifiedWriterAuthority, WriterAuthorityRuntime};
-use crate::store::cockroach::{COLLECTED_ITEMS_SCHEMA_VERSION, read_schema_version};
+use crate::store::cockroach::{
+    COLLECTED_ITEMS_SCHEMA_VERSION, COLLECTOR_INGRESS_SCHEMA_VERSION, read_schema_version,
+};
 
+use super::hints::{HINT_COUNTERS, HintRunV1};
 use super::ingest::{bounded_error, describe, server_instant, zeroed};
 use super::sources::CollectorSourceV1;
 use super::{
@@ -193,12 +203,13 @@ pub(super) async fn run_collect(
             runtime.control_scope().clone(),
             worker.deps.retry,
         ),
+        hints: schema >= COLLECTOR_INGRESS_SCHEMA_VERSION,
     };
     let mut total = CollectedDrainReportV1::default();
     let mut sources = Vec::with_capacity(configured);
     let mut every_row_recorded = true;
     for source in &worker.deps.sources.collectors {
-        let (report, recorded) = collectors.run(source, &mut total).await;
+        let (report, recorded) = Box::pin(collectors.run(source, &mut total)).await;
         every_row_recorded &= recorded;
         sources.push(report);
     }
@@ -302,7 +313,7 @@ fn with_sources(
 }
 
 /// Add one drain's outcomes to the step's.
-fn merge(total: &mut CollectedDrainReportV1, report: &CollectedDrainReportV1) {
+pub(super) fn merge(total: &mut CollectedDrainReportV1, report: &CollectedDrainReportV1) {
     total.rows_read += report.rows_read;
     total.appended += report.appended;
     total.replayed += report.replayed;
@@ -334,6 +345,8 @@ struct CollectorPasses<'a> {
     context: &'a CollectedDrainContextV1<'a>,
     verified: &'a VerifiedWriterAuthority,
     coverage: CockroachCoverageRuntimeRepository,
+    /// Whether the schema has the ingress's hint queue (migration 36).
+    hints: bool,
 }
 
 impl CollectorPasses<'_> {
@@ -345,7 +358,7 @@ impl CollectorPasses<'_> {
         total: &mut CollectedDrainReportV1,
     ) -> (WorkerSourceReportV1, bool) {
         let mut counters = zeroed(&COLLECTOR_COUNTERS);
-        let result = self.pass(source, &mut counters, total).await;
+        let result = Box::pin(self.pass(source, &mut counters, total)).await;
         let (outcome, reconciled, mut error) = match result {
             Ok(end) => (end.outcome, end.reconciled, None),
             Err(error) => (
@@ -451,29 +464,44 @@ impl CollectorPasses<'_> {
             .map_or(1, |cursor| cursor.pass_seq.saturating_add(1));
         let pass_instant = server_instant(pool).await?;
         let pass_order_micros = timestamp_micros(&pass_instant).map_err(describe)?;
-        let mut stager = PageStager::new(
-            self.sink,
-            &PageStagerContextV1 {
-                instance: &instance,
-                principal: &source.connector_principal,
-                redactor: &redactor,
-                policy: &source.audience,
-                pass_seq,
-                pass_order_micros,
-            },
-        )
-        .map_err(describe)?;
+        let stager_context = PageStagerContextV1 {
+            instance: &instance,
+            principal: &source.connector_principal,
+            redactor: &redactor,
+            policy: &source.audience,
+            pass_seq,
+            pass_order_micros,
+        };
+        let input = PullPassInputV1 {
+            source,
+            instance: &instance,
+            pass_seq,
+            pass_instant: &pass_instant,
+            pass_order_micros,
+        };
+
+        // The instance's ingress hints first, so the pass sees what they
+        // staged as the memory's version (ADR 0008 D12).
+        let hinted = if self.hints && adapter.push().is_some() {
+            counters.extend(HINT_COUNTERS.iter().map(|key| (*key, 0)));
+            let fetcher = adapter.fetch_object(source, &*self.worker.collector_environment)?;
+            HintRunV1 {
+                sink: self.sink,
+                drain: self.context,
+                source,
+                stager: stager_context,
+                input: &input,
+                fetcher: fetcher.as_deref(),
+            }
+            .run(counters, total)
+            .await?
+        } else {
+            false
+        };
+
+        let mut stager = PageStager::new(self.sink, &stager_context).map_err(describe)?;
         let outcome = collector
-            .pass(
-                &PullPassInputV1 {
-                    source,
-                    instance: &instance,
-                    pass_seq,
-                    pass_instant: &pass_instant,
-                    pass_order_micros,
-                },
-                &mut stager,
-            )
+            .pass(&input, &mut stager)
             .await
             .map_err(describe)?;
         counters.extend(outcome.counters.iter().map(|(key, value)| (*key, *value)));
@@ -504,7 +532,7 @@ impl CollectorPasses<'_> {
         merge(total, &drained);
         *counters.entry("appended").or_insert(0) += drained.appended;
         *counters.entry("replayed").or_insert(0) += drained.replayed;
-        let changed = pages.rows_staged > 0 || drained.appended > 0;
+        let changed = hinted || pages.rows_staged > 0 || drained.appended > 0;
         let row_states = self.sink.row_states(&held).await.map_err(describe)?;
         let settlement = stager
             .settle(&outcome.containers, &row_states)

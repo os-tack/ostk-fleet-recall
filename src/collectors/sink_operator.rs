@@ -190,6 +190,9 @@ pub struct CollectorInstanceStatusV1 {
     pub cursors: Vec<CollectorCursorRowV1>,
     /// Dead letters by reason.
     pub dead_letters: BTreeMap<String, u64>,
+    /// Ingress hints by state (ADR 0008 D12); omitted when there are none.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub hints: BTreeMap<String, u64>,
 }
 
 /// `collect status`: every collector instance of the scope.
@@ -311,6 +314,7 @@ fn instance_status(
             outbox: BTreeMap::new(),
             cursors: Vec::new(),
             dead_letters: BTreeMap::new(),
+            hints: BTreeMap::new(),
         })
 }
 
@@ -682,6 +686,9 @@ impl CollectedItemSink {
             instance_status(&mut instances, row.try_get("collector_instance_id")?)
                 .dead_letters
                 .insert(row.try_get("reason")?, count);
+        }
+        for (instance, hints) in self.hint_counts().await? {
+            instance_status(&mut instances, instance).hints = hints;
         }
         let cursors: Vec<PgRow> = sqlx::query(CURSOR_ROWS_SQL)
             .bind(self.tenant_id)

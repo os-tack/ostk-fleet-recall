@@ -29,6 +29,12 @@ pub const WRITER_POSTGRES_USER: &str = "fleet_writer";
 pub const MIGRATOR_POSTGRES_APPLICATION_NAME: &str = "ostk-fleet-recall-migrator";
 /// The sole external principal admitted by the schema migrator boundary.
 pub const MIGRATOR_POSTGRES_USER: &str = "fleet_migrator";
+/// Fixed database identity reported by every ingress receiver connection.
+pub const INGRESS_POSTGRES_APPLICATION_NAME: &str = "ostk-fleet-recall-ingress";
+/// The sole external principal admitted by the ingress receiver boundary
+/// (ADR 0008 D12): a member of `fleet_ingress_receiver`, which may only read
+/// and insert deliveries and dead letters.
+pub const INGRESS_POSTGRES_USER: &str = "fleet_ingress";
 
 /// Exact TLS mode expected from a deployment-validated private database URL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +118,24 @@ pub fn migrator_postgres_connect_options(
 ) -> Result<PgConnectOptions> {
     migrator_postgres_connect_options_from_variables(
         database_url,
+        expected_ssl_policy,
+        env::vars_os(),
+    )
+}
+
+/// Build closed driver options for the ingress receiver.
+///
+/// As the runtime writer's: neither the principal, the database, nor the
+/// application name is caller-selected, and every ambient `PG*` variable is
+/// refused.
+pub fn ingress_postgres_connect_options(
+    database_url: &str,
+    expected_ssl_policy: PrivatePostgresSslPolicy,
+) -> Result<PgConnectOptions> {
+    canonical_private_runtime_connect_options_from_variables(
+        database_url,
+        INGRESS_POSTGRES_USER,
+        INGRESS_POSTGRES_APPLICATION_NAME,
         expected_ssl_policy,
         env::vars_os(),
     )

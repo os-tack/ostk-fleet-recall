@@ -17,6 +17,7 @@ use sqlx::Row as _;
 use sqlx::postgres::{PgPool, PgRow};
 use uuid::Uuid;
 
+use crate::collectors::ingress::deliveries::count_pending_hints;
 use crate::context::FleetScope;
 use crate::error::{FleetError, Result};
 use crate::evidence_recall::{
@@ -746,9 +747,12 @@ impl CockroachItemRecall {
             .bind(provider)
             .fetch_one(&self.pool)
             .await?;
+        let hints_awaiting_fetch =
+            count_pending_hints(&self.pool, self.tenant_id, &self.project, provider).await?;
         let completeness = self.reader.completeness().await?;
         Ok(ItemReadinessV1 {
             items_awaiting_admission: count(&row, "items_pending")?,
+            hints_awaiting_fetch,
             events_awaiting_body_projection: count(&row, "events_awaiting_bodies")?,
             lexical_current: completeness.lexical_complete(),
             dense_current: completeness.dense_complete(),

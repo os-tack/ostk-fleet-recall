@@ -1,6 +1,6 @@
 # Dynamic corpus and causal runtime architecture
 
-Status: **target architecture; stages 1–3 implemented, private only; stage 4 implemented on the private writer (`remember(assert)` appends its event and projection in one transaction; nothing emits relation attestations yet); stage 5 implemented on the private plane (the memory worker runs the connectors and projectors, and `serve` answers evidence recall); stage 6 implemented for one finding type (`ostk-spec` activates spec statements and records verified spec nonconformance, which `serve` lists); stage 8 partially implemented (CI connector); stage 7 not started; stages 9–10 contract vectors only**
+Status: **target architecture; stages 1–3 implemented, private only; stage 4 implemented on the private writer (`remember(assert)` appends its event and projection in one transaction; nothing emits relation attestations yet); stage 5 implemented on the private plane (the memory worker runs the connectors and projectors, and `serve` answers evidence recall); stage 6 implemented for one finding type (`ostk-spec` activates spec statements and records verified spec nonconformance, which `serve` lists); stage 8 partially implemented (CI connector); stage 7 partially implemented (signed provider webhooks kept as hints, private only); stages 9–10 contract vectors only**
 
 Fleet Recall currently serves a statically generated, revision-linked corpus
 and a deliberate typed-claim ledger. This document defines the target model in
@@ -12,8 +12,9 @@ documented in [ARCHITECTURE.md](ARCHITECTURE.md), its security boundary in
 [SECURITY.md](SECURITY.md), and the local-versus-fleet product decision in
 [ADR 0001](adr/0001-product-and-backend-boundary.md).
 
-No webhook, transport queue, remote ingress, incident controller, or public
-mutation route exists today. What runs is private and reads local material:
+No transport queue, incident controller, or public mutation route exists
+today. What runs is private: it reads local material, pulls from provider
+APIs, and receives provider webhooks only as hints:
 
 - `ostk-authority-install` gives one physical scope an active generation-2
   registry head, or on request the generation-3 collected-items package
@@ -46,6 +47,12 @@ mutation route exists today. What runs is private and reads local material:
   them in the call or leaves them to the worker (ADR 0008 D10). A claim
   written by `record` or `assert` cites the items it rests on, resolved in its
   own project to their accepted events and linked privately (ADR 0008 D11).
+- `ostk-fleet-recall ingress`, a private receiver under its own login,
+  verifies Slack, Linear, and Granola webhook signatures and keeps each
+  delivery only as a hint of provider ids in a durable queue; the worker's
+  `collect` step re-reads each hinted object through the provider's API and
+  settles the hint in the transaction that stages what it read, backing it
+  off, or dead-lettering it after eight failed attempts (ADR 0008 D12).
 - The private `ostk-spec` CLI runs the Stage-6 normative activation,
   observer, and discrepancy runtimes, and `serve` lists the episodes it opens
   as `recall(discrepancies)`
@@ -765,10 +772,9 @@ reachable from the serving process. Outside tests, only the worker
 subcommand, `ostk-spec check` (which appends a spec blob through the git
 connector's drain and an observer run), and `ostk-observer-run` run any of
 them. The accepted-event append seam they use is the Stage-4 one, unchanged.
-There
-is still no webhook, no transport queue, no remote connector cursor, no
-dead-letter path for a remote delivery, and no acknowledgement protocol:
-everything here reads local material on the private plane.
+The provider collectors, their webhook hints, and the queue that settles a
+hint only with what it caused are ADR 0008's (see stage 7 below); nothing
+here is a general transport queue, and everything runs on the private plane.
 
 ## Repository history
 
@@ -1167,6 +1173,14 @@ This does not require or authorize dynamic ingestion.
    (DISC-06); discrepancy lifecycle over MCP; and every other finding type.
 7. Add authenticated private ingress, durable queueing, remote connector
    cursors, and dead-letter/quarantine behavior.
+
+   Partially implemented, private only, for collected items (ADR 0008):
+   Slack, Linear, and Granola pull collectors with per-instance cursors and
+   digest-only dead letters, and, from migration 0036, a receiver that
+   verifies their signed webhooks and queues each only as a hint of provider
+   ids, which the worker re-reads through the provider's API and settles in
+   the transaction that stages what it read (D12). No ingress delivers
+   evidence events, and no hint carries content.
 8. Add provider-verified PR, CI, artifact, and deployment relations.
 
    Partially implemented, private only: migration 0026 and the CI-evidence

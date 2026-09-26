@@ -212,6 +212,12 @@ pub struct EvidenceReadinessV1 {
     /// cannot be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items_awaiting_admission: Option<u64>,
+    /// Signed webhook hints the ingress received and the worker's `collect`
+    /// step has not settled yet (ADR 0008 D12): an object a provider says
+    /// changed whose re-read is still to come. Absent before migration 36,
+    /// or when the collector state or the queue cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hints_awaiting_fetch: Option<u64>,
     /// The schema has collector state this login cannot read: collected bodies
     /// are withheld from the answer, and absence cannot be shown.
     #[serde(skip_serializing_if = "std::ops::Not::not")]

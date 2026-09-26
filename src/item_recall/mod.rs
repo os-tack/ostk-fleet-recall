@@ -286,6 +286,11 @@ pub struct ItemReadinessV1 {
     /// Collected item parts, of the requested provider, staged and not yet
     /// admitted.
     pub items_awaiting_admission: u64,
+    /// Signed webhook hints, of the requested provider, received and not yet
+    /// settled (ADR 0008 D12); absent before migration 36, or when this login
+    /// cannot read the queue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hints_awaiting_fetch: Option<u64>,
     /// Accepted evidence events the body projector has not consumed yet.
     pub events_awaiting_body_projection: u64,
     /// Every body has been through the lexical projector.
@@ -306,6 +311,7 @@ impl ItemReadinessV1 {
             events_awaiting_body_projection: self.events_awaiting_body_projection,
             transcript_turns_awaiting_admission: 0,
             items_awaiting_admission: Some(self.items_awaiting_admission),
+            hints_awaiting_fetch: self.hints_awaiting_fetch,
             collector_state_unreadable: false,
             lexical_current: self.lexical_current,
             dense_current: self.dense_current,
@@ -547,6 +553,7 @@ mod tests {
     fn item_readiness_feeds_the_evidence_verdict_without_transcripts() {
         let readiness = ItemReadinessV1 {
             items_awaiting_admission: 2,
+            hints_awaiting_fetch: Some(3),
             events_awaiting_body_projection: 1,
             lexical_current: true,
             dense_current: false,
@@ -555,6 +562,7 @@ mod tests {
         };
         let evidence = readiness.as_evidence();
         assert_eq!(evidence.items_awaiting_admission, Some(2));
+        assert_eq!(evidence.hints_awaiting_fetch, Some(3));
         assert_eq!(evidence.transcript_turns_awaiting_admission, 0);
         assert_eq!(evidence.events_awaiting_body_projection, 1);
         assert!(!evidence.collector_state_unreadable);

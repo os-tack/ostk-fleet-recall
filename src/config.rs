@@ -30,8 +30,8 @@ use crate::memory_contracts::successor_policy::{
     GenesisSuccessorKeyBridgeDigest, GenesisSuccessorKeyBridgePin,
 };
 use crate::private_postgres::{
-    MIGRATOR_POSTGRES_USER, PRIVATE_RUNTIME_POSTGRES_DATABASE, PUBLICATION_POSTGRES_USER,
-    PrivatePostgresSslPolicy, WRITER_POSTGRES_USER,
+    INGRESS_POSTGRES_USER, MIGRATOR_POSTGRES_USER, PRIVATE_RUNTIME_POSTGRES_DATABASE,
+    PUBLICATION_POSTGRES_USER, PrivatePostgresSslPolicy, WRITER_POSTGRES_USER,
 };
 use crate::{FleetError, FleetScope, Result};
 
@@ -1172,6 +1172,144 @@ impl PublicationConfig {
     }
 }
 
+/// What the ingress receiver refuses to start beside: every other
+/// identity's database URL, and the content key it never holds.
+const INGRESS_FORBIDDEN_ENV_NAMES: [&str; 10] = [
+    "FLEET_RECALL_DATABASE_URL",
+    "FLEET_RECALL_CONTROL_DATABASE_URL",
+    "FLEET_RECALL_REGISTRY_DATABASE_URL",
+    "FLEET_RECALL_SUCCESSOR_DATABASE_URL",
+    "FLEET_RECALL_RECONCILIATION_DATABASE_URL",
+    "FLEET_RECALL_PUBLICATION_DATABASE_URL",
+    "FLEET_RECALL_TEST_DATABASE_URL",
+    "FLEET_RECONCILIATION_TEST_DATABASE_URL",
+    "FLEET_RECALL_PUBLICATION_TEST_ADMIN_DATABASE_URL",
+    "FLEET_RECALL_CONTENT_KEK_HEX",
+];
+
+/// Pool connections the ingress opens unless told otherwise.
+const DEFAULT_INGRESS_MAX_CONNECTIONS: u32 = 4;
+
+/// Runtime configuration of `ostk-fleet-recall ingress` (ADR 0008 D12).
+///
+/// The receiver has a database identity of its own, `fleet_ingress`, which
+/// may only read and insert deliveries and dead letters. It fails closed when
+/// any other identity's database URL, or the content key, is in its
+/// environment, so a task definition cannot hand the public-facing receiver a
+/// credential it must never hold. It reads the physical scope, never an
+/// agent, model, or writer pin.
+#[derive(Clone)]
+pub struct IngressConfig {
+    database_url: String,
+    database_ssl_policy: PrivatePostgresSslPolicy,
+    tenant_id: Uuid,
+    project: String,
+    max_connections: u32,
+    max_body_bytes: usize,
+}
+
+impl std::fmt::Debug for IngressConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IngressConfig")
+            .field("database_url", &"<redacted>")
+            .field("database_ssl_policy", &self.database_ssl_policy)
+            .field("tenant_id", &self.tenant_id)
+            .field("project", &self.project)
+            .field("max_connections", &self.max_connections)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .finish()
+    }
+}
+
+impl IngressConfig {
+    /// Load the receiver's configuration from the process environment.
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        if let Some(name) = INGRESS_FORBIDDEN_ENV_NAMES
+            .iter()
+            .copied()
+            .find(|name| lookup(name).is_some())
+        {
+            return Err(FleetError::Configuration(format!(
+                "the ingress forbids {name}; configure only \
+                 FLEET_RECALL_INGRESS_DATABASE_URL; value is redacted"
+            )));
+        }
+        let database_url = required_from(&mut lookup, "FLEET_RECALL_INGRESS_DATABASE_URL")?;
+        let allow_insecure_local =
+            lookup("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE").is_some_and(|value| value == "1");
+        let database_ssl_policy = validate_dedicated_database_url(
+            &database_url,
+            "FLEET_RECALL_INGRESS_DATABASE_URL",
+            INGRESS_POSTGRES_USER,
+            allow_insecure_local,
+        )?;
+        let tenant_id = required_from(&mut lookup, "FLEET_RECALL_TENANT_ID")?
+            .parse::<Uuid>()
+            .map_err(|error| {
+                FleetError::Configuration(format!("FLEET_RECALL_TENANT_ID must be a UUID: {error}"))
+            })?;
+        let project = required_from(&mut lookup, "FLEET_RECALL_PROJECT")?;
+        let max_connections = match lookup("FLEET_RECALL_MAX_CONNECTIONS") {
+            None => DEFAULT_INGRESS_MAX_CONNECTIONS,
+            Some(value) => value
+                .parse::<u32>()
+                .ok()
+                .filter(|count| *count > 0)
+                .ok_or_else(|| {
+                    FleetError::Configuration(
+                        "FLEET_RECALL_MAX_CONNECTIONS must be an integer greater than zero".into(),
+                    )
+                })?,
+        };
+        let max_body_bytes = crate::collectors::ingress::server::max_body_bytes(
+            lookup("FLEET_RECALL_INGRESS_MAX_BODY_BYTES").as_deref(),
+        )?;
+        Ok(Self {
+            database_url,
+            database_ssl_policy,
+            tenant_id,
+            project,
+            max_connections,
+            max_body_bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    #[must_use]
+    pub const fn database_ssl_policy(&self) -> PrivatePostgresSslPolicy {
+        self.database_ssl_policy
+    }
+
+    #[must_use]
+    pub const fn tenant_id(&self) -> Uuid {
+        self.tenant_id
+    }
+
+    #[must_use]
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+
+    #[must_use]
+    pub const fn max_connections(&self) -> u32 {
+        self.max_connections
+    }
+
+    #[must_use]
+    pub const fn max_body_bytes(&self) -> usize {
+        self.max_body_bytes
+    }
+}
+
 fn reject_publication_private_database_urls(
     mut is_present: impl FnMut(&str) -> bool,
 ) -> Result<()> {
@@ -2044,32 +2182,48 @@ fn validate_publication_database_url(
     database_url: &str,
     allow_insecure_local: bool,
 ) -> Result<PrivatePostgresSslPolicy> {
-    const VARIABLE_NAME: &str = "FLEET_RECALL_PUBLICATION_DATABASE_URL";
+    validate_dedicated_database_url(
+        database_url,
+        "FLEET_RECALL_PUBLICATION_DATABASE_URL",
+        PUBLICATION_POSTGRES_USER,
+        allow_insecure_local,
+    )
+}
 
+/// Apply the publication reader's closed endpoint policy to another
+/// dedicated identity's URL: `variable_name` must authenticate exactly as
+/// `expected_user`, on an ordinary host, in the `fleet_recall` database, with
+/// an explicit TLS mode.
+fn validate_dedicated_database_url(
+    database_url: &str,
+    variable_name: &str,
+    expected_user: &str,
+    allow_insecure_local: bool,
+) -> Result<PrivatePostgresSslPolicy> {
     validate_database_url_with_local_escape(
         database_url,
-        VARIABLE_NAME,
+        variable_name,
         allow_insecure_local,
         true,
     )?;
-    validate_explicit_private_database_identity(database_url, VARIABLE_NAME)?;
+    validate_explicit_private_database_identity(database_url, variable_name)?;
     let parsed = Url::parse(database_url).map_err(|_| {
         FleetError::Configuration(format!(
-            "{VARIABLE_NAME} must be a valid PostgreSQL URL; value is redacted"
+            "{variable_name} must be a valid PostgreSQL URL; value is redacted"
         ))
     })?;
     let decoded_options = database_url.parse::<PgConnectOptions>().map_err(|_| {
         FleetError::Configuration(format!(
-            "{VARIABLE_NAME} must be a valid PostgreSQL URL; value is redacted"
+            "{variable_name} must be a valid PostgreSQL URL; value is redacted"
         ))
     })?;
-    if decoded_options.get_username() != PUBLICATION_POSTGRES_USER {
+    if decoded_options.get_username() != expected_user {
         return Err(FleetError::Configuration(format!(
-            "{VARIABLE_NAME} must authenticate exactly as {PUBLICATION_POSTGRES_USER}; value is redacted"
+            "{variable_name} must authenticate exactly as {expected_user}; value is redacted"
         )));
     }
     let host = parsed.host_str().ok_or_else(|| {
-        FleetError::Configuration(format!("{VARIABLE_NAME} must include a hostname"))
+        FleetError::Configuration(format!("{variable_name} must include a hostname"))
     })?;
     let ordinary_network_host = match parsed.host() {
         Some(Host::Ipv4(_) | Host::Ipv6(_)) => !host.contains('%'),
@@ -2078,16 +2232,16 @@ fn validate_publication_database_url(
     };
     if !ordinary_network_host || host.starts_with(['/', '\\']) {
         return Err(FleetError::Configuration(format!(
-            "{VARIABLE_NAME} must use an ordinary DNS or IP hostname, not an encoded or Unix-socket host"
+            "{variable_name} must use an ordinary DNS or IP hostname, not an encoded or Unix-socket host"
         )));
     }
     if parsed.path() != "/fleet_recall" {
         return Err(FleetError::Configuration(format!(
-            "{VARIABLE_NAME} must select exactly the fleet_recall database"
+            "{variable_name} must select exactly the fleet_recall database"
         )));
     }
 
-    explicit_private_database_ssl_policy(database_url, VARIABLE_NAME)
+    explicit_private_database_ssl_policy(database_url, variable_name)
 }
 
 fn is_ordinary_dns_host(host: &str) -> bool {

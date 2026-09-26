@@ -92,6 +92,7 @@
 
 mod collect;
 mod command;
+mod hints;
 mod ingest;
 mod privileges;
 mod project;

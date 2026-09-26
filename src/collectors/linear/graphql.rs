@@ -753,6 +753,70 @@ impl LinearApiV1 {
         ))
     }
 
+    /// The issue `id`, archived or in the trash included, as a sweep reads
+    /// it: `None` when the credential cannot see it.
+    ///
+    /// # Errors
+    ///
+    /// Every [`LinearCallErrorV1`].
+    pub async fn issue(
+        &self,
+        id: &str,
+    ) -> Result<Option<PageNodeV1<LinearIssueV1>>, LinearCallErrorV1> {
+        let response = self
+            .call(
+                "FleetRecallLinearIssues",
+                ISSUES_QUERY,
+                serde_json::json!({
+                    "filter": {"id": {"eq": id}},
+                    "first": 1,
+                    "after": null,
+                }),
+            )
+            .await?;
+        let answer: IssuesAnswerV1 = decode(&response)?;
+        Ok(page(
+            answer.issues,
+            "ostk-linear-issue-v1",
+            RateLimitV1::of(&response),
+        )
+        .nodes
+        .into_iter()
+        .next())
+    }
+
+    /// The comment `id`, archived included, as a sweep reads it: `None` when
+    /// the credential cannot see it.
+    ///
+    /// # Errors
+    ///
+    /// Every [`LinearCallErrorV1`].
+    pub async fn comment(
+        &self,
+        id: &str,
+    ) -> Result<Option<PageNodeV1<LinearCommentV1>>, LinearCallErrorV1> {
+        let response = self
+            .call(
+                "FleetRecallLinearComments",
+                COMMENTS_QUERY,
+                serde_json::json!({
+                    "filter": {"id": {"eq": id}},
+                    "first": 1,
+                    "after": null,
+                }),
+            )
+            .await?;
+        let answer: CommentsAnswerV1 = decode(&response)?;
+        Ok(page(
+            answer.comments,
+            "ostk-linear-comment-v1",
+            RateLimitV1::of(&response),
+        )
+        .nodes
+        .into_iter()
+        .next())
+    }
+
     /// Where each of `ids` (at most [`MAX_ISSUE_TEAMS_BATCH`]) is now: the
     /// issues the credential can see, by id. An issue missing from the answer
     /// is one it cannot see. A node that does not parse is left out, as if

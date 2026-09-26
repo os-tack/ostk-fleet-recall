@@ -449,6 +449,11 @@ pub enum DigestDomain {
     /// reconciliation pass admitted, in order: the `source_digest` a coverage
     /// receipt records.
     CollectedObservationManifestV1,
+    /// ADR 0008 D12. The dedupe key of one signed webhook delivery: the
+    /// provider, the collector instance it was addressed to, and the id the
+    /// provider signed (a Slack `event_id`, the digest of a Linear body, a
+    /// Standard Webhooks `webhook-id`). A replayed delivery has the same key.
+    IngressDeliveryKeyV1,
 }
 
 impl DigestDomain {
@@ -629,6 +634,7 @@ impl DigestDomain {
             Self::CollectedItemRevisionV1 => "ostk-collected-item-revision-v1",
             Self::CollectedContainerKeyV1 => "ostk-collected-container-key-v1",
             Self::CollectedObservationManifestV1 => "ostk-collected-observation-manifest-v1",
+            Self::IngressDeliveryKeyV1 => "ostk-ingress-delivery-key-v1",
         }
     }
 }

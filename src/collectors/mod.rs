@@ -76,7 +76,16 @@
 //!   `connector.collected.import` and records it as a snapshot of one
 //!   provider scope, inline or on the worker's next `collect` step;
 //! * [`command`] is `ostk-fleet-recall collect`: `import`, `status`,
-//!   `dead-letters`, and `retire`.
+//!   `dead-letters`, `retire`, and `retry`.
+//!
+//! Stage-7 ingress (ADR 0008 D12):
+//!
+//! * [`ingress`] is `ostk-fleet-recall ingress`: signed Slack, Linear, and
+//!   Granola webhooks received on the private plane and kept as hints (ids
+//!   only), which the worker's `collect` step re-reads through each
+//!   provider's pull adapter ([`pull::ObjectFetcherV1`]) or turns into a
+//!   push-mode tombstone, settling each hint in the transaction that stages
+//!   what it caused.
 
 pub mod audience;
 pub mod binding;
@@ -89,6 +98,7 @@ pub mod granola;
 pub mod heads;
 pub mod http;
 pub mod import;
+pub mod ingress;
 pub mod linear;
 pub mod pull;
 pub mod redaction;
@@ -134,6 +144,27 @@ pub trait CollectorAdapterV1: Send + Sync {
     /// not every pass: the sources file refuses a staleness bound shorter
     /// than it, which would call every source stale between reconciliations.
     fn reconcile_every_seconds(&self, _source: &CollectorSourceV1) -> Option<u64> {
+        None
+    }
+
+    /// What re-reads the object an ingress hint names, for one configured
+    /// source, or `None` when the provider takes no hints (ADR 0008 D12).
+    /// `environment` is read as for [`Self::pull`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::pull`].
+    fn fetch_object(
+        &self,
+        _source: &CollectorSourceV1,
+        _environment: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Option<Box<dyn pull::ObjectFetcherV1>>, String> {
+        Ok(None)
+    }
+
+    /// The provider's webhook, when it has one the ingress receives: how a
+    /// delivery's signature is checked and what it maps to (ADR 0008 D12).
+    fn push(&self) -> Option<&'static dyn ingress::PushVerifierV1> {
         None
     }
 }

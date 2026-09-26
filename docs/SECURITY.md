@@ -35,6 +35,35 @@ reviewed binary; the credential alone can still select those rows (see
 CloudFront-to-ALB transport and viewer-TLS limitations are documented without
 stronger claims in the [AWS runbook](../deploy/aws/README.md).
 
+The private webhook receiver, `ostk-fleet-recall ingress`, is the one private
+process that answers requests from outside the deployment, so it holds the
+least ([ADR 0008](adr/0008-collected-items.md) D12). Its router has one route,
+`POST /v1/hooks/{connector_instance}`, and it listens on loopback unless the
+operator passes `--allow-non-loopback` for a relay they run; the relay adds no
+trust, since every request is checked on its own. A body larger than
+`FLEET_RECALL_INGRESS_MAX_BODY_BYTES` is refused unread (413). Every other
+body is untrusted until the provider's HMAC over the exact raw bytes verifies
+under the instance's signing secret, compared in constant time, with a signed
+timestamp inside the provider's window (Slack and Granola ±300 s, Linear's
+signed `webhookTimestamp` ±60 s); then the delivery must name the instance's
+pinned Slack team or Linear organization (a Granola secret is its own pin). A
+refusal answers 401, 403, or 400 and records one digest-only dead letter per
+instance, reason, and minute, so a flood of bad requests cannot grow the table
+faster than that. A verified delivery is a hint, never content: the receiver
+keeps the provider's ids, the body's digest and length, and a bounded event
+label, deduplicated by the id the provider signed, and discards the text. Only
+the worker, with the provider's own API token, re-reads the object, through
+the same adapter, redactor, and audience rules as a pull, so even a hint that
+should not have been accepted can at most make the worker read what it could
+already read. A deletion hint is taken on the signed delivery's word, since
+the object is gone, but never mints an item: it tombstones only one the memory
+already holds, in the container and thread its head records. A direct or
+group-direct Slack conversation is kept only as a replay guard, without ids.
+The receiver holds its own `fleet_ingress` login and the signing secrets named
+in the sources file, never a provider token, the writer login, or the content
+key; its role can insert deliveries and dead letters and read nothing else the
+memory holds.
+
 ## Offline authority and append-only control state
 
 The private control plane is deliberately absent from normal serving
@@ -221,7 +250,13 @@ The publication process additionally requires the decoded URL username and
 the connected CockroachDB `current_user` to be exactly `fleet_publication`;
 private database URL variables are rejected from its environment.
 `tests/publication_reader_live.rs` exercises that boundary against a real
-CockroachDB database.
+CockroachDB database. The ingress receiver likewise requires `fleet_ingress`
+on its own `FLEET_RECALL_INGRESS_DATABASE_URL`, pinned on every connection,
+and refuses to start beside any other database URL or
+`FLEET_RECALL_CONTENT_KEK_HEX`. A push signing secret is named in the sources
+file by an environment variable in the provider's own
+`FLEET_RECALL_<PROVIDER>_` namespace, never inline, and never the variable
+that holds the provider's API token.
 
 Apply the exact current-object/PUBLIC policies described in
 [MIGRATIONS.md](MIGRATIONS.md) and
@@ -373,9 +408,10 @@ absence verdict or the spec plane lie, for example by writing a fresh `ok`
 status row. The runtime policy keeps the Stage-5 and Stage-6 logs,
 statements, checks, receipts, and bodies append-only by privilege (`SELECT`
 and `INSERT`, no `UPDATE` or `DELETE`), grants `UPDATE` only on heads,
-cursors, projections, the transcript outbox's drain state, and worker status
-for their compare-and-set advances and `SELECT ... FOR UPDATE` locks, and
-grants `DELETE` on none of them. It also grants table-level `UPDATE` on
+cursors, projections, the transcript outbox's drain state, the ingress hint
+queue's settlement, and worker status for their compare-and-set advances and
+`SELECT ... FOR UPDATE` locks, and grants `DELETE` on none of them. It also
+grants table-level `UPDATE` on
 `memory_content_objects`, because CockroachDB v26.2.3 requires it for the
 content store's `SELECT ... FOR UPDATE` dedupe lock, which the worker's
 transcript path takes whenever a resumed session file repeats a turn. No

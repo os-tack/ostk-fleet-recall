@@ -231,10 +231,11 @@ migrator-owned view `memory_writer_authority_v1`, `SELECT`/`INSERT` (no
 `UPDATE` or `DELETE`) on the migration-29 conflict lifecycle log
 `memory_conflict_lifecycle_events_v1`, and the append-only, advance, and
 read-only rows on the tables of migrations 19 through 27, 30, 31, and 33
-through 35 (the collected-item sink, its withdrawals, and claim item links),
-plus `UPDATE` on `memory_content_objects` for its row lock (see
-[MIGRATIONS.md](MIGRATIONS.md)). The policy refuses to run until every
-migration from 1 through 35 has
+through 36 (the collected-item sink, its withdrawals, claim item links, and
+`SELECT`/`UPDATE` on the ingress hint queue, which the runtime settles but
+never inserts into), plus `UPDATE` on `memory_content_objects` for its row
+lock (see [MIGRATIONS.md](MIGRATIONS.md)). The policy refuses to run until
+every migration from 1 through 36 has
 succeeded, and the writer serves the conflict lifecycle only after a restart
 that follows the policy; the policy itself
 installs the sole `fleet_writer` membership edge. Never use `ON ALL TABLES`, and never grant the
@@ -276,6 +277,24 @@ separate exact authentication-enable operation. Quiesce/drain the login and
 repeat that audit/reapply sequence after each migration or grant change.
 Terraform does not provision CockroachDB identities, memberships, grants, or
 authentication material.
+
+The webhook receiver (`ostk-fleet-recall ingress`, ADR 0008 D12) is optional
+and outside the AWS module: run it only where Slack, Linear, or Granola
+webhooks should shorten the worker's pull interval. It needs one more SQL
+user, `fleet_ingress`, created exact `NOLOGIN`
+(`CREATE USER fleet_ingress WITH NOLOGIN`) and without `admin`. After the
+complete successful prefix 1 through 36, a cluster admin applies
+[`ingress-receiver-role-grants.sql`](../deploy/cockroach/ingress-receiver-role-grants.sql),
+which hardens the logical `fleet_ingress_receiver` role to `NOLOGIN` and
+grants it only `CONNECT`, `USAGE` on `public`, `SELECT` on
+`_sqlx_migrations`, and `SELECT`/`INSERT` on `memory_ingress_deliveries_v1`
+and `memory_collector_dead_letters_v1`; audit it as the publication
+principals are audited, then enable the login. The receiver reads its URL
+from `FLEET_RECALL_INGRESS_DATABASE_URL` (same TLS rules), refuses to start
+beside any other database URL or the content key, and listens on loopback
+unless `--allow-non-loopback` is given; the relay that forwards the
+providers' requests to it is the operator's (see the README's
+[receiving provider webhooks](../README.md#receiving-provider-webhooks)).
 
 For each user, obtain a URL-encoded raw connection URL for `fleet_recall` with
 exactly one `sslmode=verify-full`. Do not copy a workstation-only

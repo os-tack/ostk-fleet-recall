@@ -83,6 +83,9 @@ pub fn absence_verdict(
         || readiness
             .items_awaiting_admission
             .is_some_and(|pending| pending > 0)
+        || readiness
+            .hints_awaiting_fetch
+            .is_some_and(|pending| pending > 0)
     {
         reasons.insert(AbsenceReasonV1::IngestOutboxPending);
     }
@@ -145,6 +148,7 @@ mod tests {
             events_awaiting_body_projection: 0,
             transcript_turns_awaiting_admission: 0,
             items_awaiting_admission: None,
+            hints_awaiting_fetch: None,
             collector_state_unreadable: false,
             lexical_current: true,
             dense_current: true,
@@ -384,6 +388,18 @@ mod tests {
         readiness.items_awaiting_admission = Some(0);
         assert!(reasons(true, &readiness, &two_healthy()).is_empty());
         readiness.items_awaiting_admission = Some(3);
+        assert_eq!(
+            reasons(true, &readiness, &two_healthy()),
+            [AbsenceReasonV1::IngestOutboxPending]
+        );
+    }
+
+    #[test]
+    fn a_hint_awaiting_its_fetch_makes_an_empty_answer_unknown() {
+        let mut readiness = current();
+        readiness.hints_awaiting_fetch = Some(0);
+        assert!(reasons(true, &readiness, &two_healthy()).is_empty());
+        readiness.hints_awaiting_fetch = Some(1);
         assert_eq!(
             reasons(true, &readiness, &two_healthy()),
             [AbsenceReasonV1::IngestOutboxPending]

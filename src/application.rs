@@ -2889,6 +2889,17 @@ fn evidence_warnings(readiness: &EvidenceReadinessV1, sources: &EvidenceSourcesV
             ),
         }));
     }
+    if let Some(pending) = readiness
+        .hints_awaiting_fetch
+        .filter(|pending| *pending > 0)
+    {
+        warnings.push(json!({
+            "code": "evidence_hints_pending",
+            "message": format!(
+                "{pending} signed provider webhooks name objects not yet re-read; the worker's collect step reads them"
+            ),
+        }));
+    }
     if readiness.collector_state_unreadable {
         warnings.push(json!({
             "code": "evidence_collector_state_unreadable",
@@ -4653,6 +4664,7 @@ mod tests {
             events_awaiting_body_projection: 2,
             transcript_turns_awaiting_admission: 0,
             items_awaiting_admission: None,
+            hints_awaiting_fetch: None,
             collector_state_unreadable: false,
             lexical_current: true,
             dense_current: true,
@@ -5204,6 +5216,14 @@ mod tests {
         assert_eq!(
             warning_codes(&evidence_warnings(&pending, &healthy)),
             ["evidence_items_pending"]
+        );
+        let hinted = EvidenceReadinessV1 {
+            hints_awaiting_fetch: Some(2),
+            ..current
+        };
+        assert_eq!(
+            warning_codes(&evidence_warnings(&hinted, &healthy)),
+            ["evidence_hints_pending"]
         );
         let unreadable = EvidenceReadinessV1 {
             items_awaiting_admission: None,

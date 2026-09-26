@@ -93,9 +93,10 @@ pub const STAGE5_RUNTIME_GRANTS: [(&str, &str); 4] = [
 /// 0008): the item history, links, and dead letters are append-only; the
 /// outbox, heads, collector status, cursors, containers, and item withdrawals
 /// take `SELECT ... FOR UPDATE` and compare-and-set upserts. The collect step also reads the schema version,
-/// through the `SELECT` on `_sqlx_migrations` the policy's claim block gives.
-/// Keep this in step with that file.
-pub const COLLECTOR_RUNTIME_GRANTS: [(&str, &str); 3] = [
+/// through the `SELECT` on `_sqlx_migrations` the policy's claim block gives,
+/// and reads and settles the ingress's hints (migration 36, ADR 0008 D12),
+/// which it never inserts. Keep this in step with that file.
+pub const COLLECTOR_RUNTIME_GRANTS: [(&str, &str); 4] = [
     ("SELECT", "public._sqlx_migrations"),
     (
         "SELECT, INSERT",
@@ -107,6 +108,19 @@ pub const COLLECTOR_RUNTIME_GRANTS: [(&str, &str); 3] = [
         "public.memory_collector_outbox_v1, public.memory_collected_item_heads_v1, \
          public.memory_collector_sources_v1, public.memory_collector_cursors_v1, \
          public.memory_collector_containers_v1, public.memory_collected_item_withdrawals_v1",
+    ),
+    ("SELECT, UPDATE", "public.memory_ingress_deliveries_v1"),
+];
+
+/// Exactly what `deploy/cockroach/ingress-receiver-role-grants.sql` gives
+/// `fleet_ingress_receiver` (ADR 0008 D12): the migration history, and reading
+/// and inserting deliveries and dead letters. Keep this in step with that
+/// file.
+pub const INGRESS_RECEIVER_GRANTS: [(&str, &str); 2] = [
+    ("SELECT", "public._sqlx_migrations"),
+    (
+        "SELECT, INSERT",
+        "public.memory_ingress_deliveries_v1, public.memory_collector_dead_letters_v1",
     ),
 ];
 
@@ -160,6 +174,19 @@ impl RuntimeProbeRole {
             .collect::<Vec<_>>()
             .join(", ");
         Self::create_with(owner, database_url, vec![("SELECT", tables)], false, false).await
+    }
+
+    /// A login holding exactly [`INGRESS_RECEIVER_GRANTS`], as the ingress
+    /// receiver's `fleet_ingress` login holds them through its role.
+    pub async fn create_ingress_receiver(owner: &PgPool, database_url: &str) -> Self {
+        Self::create_with(
+            owner,
+            database_url,
+            owned(&INGRESS_RECEIVER_GRANTS),
+            false,
+            true,
+        )
+        .await
     }
 
     /// [`Self::create`], plus the runtime role's claim-plane table and

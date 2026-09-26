@@ -15,6 +15,7 @@ use sqlx::postgres::{PgPool, PgRow};
 use uuid::Uuid;
 
 use crate::collectors::cockroach::{COUNT_PENDING_SQL, suppressed_body_predicate};
+use crate::collectors::ingress::deliveries::count_pending_hints;
 use crate::context::FleetScope;
 use crate::coverage_runtime::decode_cursor_row;
 use crate::error::{FleetError, Result};
@@ -523,11 +524,18 @@ impl CockroachEvidenceRecall {
             }
             CollectorStateV1::Absent | CollectorStateV1::Unreadable => None,
         };
+        let hints_awaiting_fetch = match state {
+            CollectorStateV1::Readable => {
+                count_pending_hints(&self.pool, self.tenant_id, &self.project, None).await?
+            }
+            CollectorStateV1::Absent | CollectorStateV1::Unreadable => None,
+        };
         let completeness = self.reader(state).completeness().await?;
         Ok(EvidenceReadinessV1 {
             events_awaiting_body_projection: count(&row, "events_awaiting_bodies")?,
             transcript_turns_awaiting_admission: count(&row, "turns_awaiting_admission")?,
             items_awaiting_admission,
+            hints_awaiting_fetch,
             collector_state_unreadable: state == CollectorStateV1::Unreadable,
             lexical_current: completeness.lexical_complete(),
             dense_current: completeness.dense_complete(),

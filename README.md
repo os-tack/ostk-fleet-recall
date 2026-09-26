@@ -132,8 +132,12 @@ The `ostk-fleet-recall` binary has these commands:
   accepted evidence, then projects them into the body, lexical, and dense
   recall tiers.
 - `collect` [imports collected items](#importing-collected-items) from a
-  file as a snapshot of one provider scope, and lists or retires what the
-  collectors hold.
+  file as a snapshot of one provider scope, lists or retires what the
+  collectors hold, and reopens a webhook hint the worker gave up on.
+- `ingress` [receives signed provider webhooks](#receiving-provider-webhooks)
+  (Slack, Linear, Granola) on the private plane, loopback by default, and
+  keeps each as a hint, provider ids only, that the worker's `collect` step
+  re-reads through the collector's own API credential.
 - `model-digest` prints the versioned digest of a local model bundle.
 
 Two [private operator CLIs](#private-operator-clis) complete the event-first
@@ -588,7 +592,8 @@ file links lose the `?t=xoxe-...` token exports carry. A zip holds at most
 `collect status` lists every collector instance of the scope (its status row,
 outbox rows by state, cursors, and dead letters by reason), `collect
 dead-letters [--since <RFC 3339>] [--instance <id>]` lists dead letters with
-their digests, reasons, and static diagnostics, never provider text, and
+their digests, reasons, and static diagnostics, never provider text (the
+webhook receiver's refusals among them), and
 `collect retire --instance <id>` retires an import's status row so its
 snapshot no longer counts toward absence; its items stay recallable, and
 importing again re-activates it. An import never takes the name of a worker
@@ -658,6 +663,59 @@ If any of them is missing or does not verify, `serve` logs why, starts
 without capture, and `recall(status).remember_capture` reports `served:
 false` with the reason. `FLEET_RECALL_REMEMBER_LIFECYCLE` does not govern
 capture.
+
+## Receiving provider webhooks
+
+`ostk-fleet-recall ingress` receives Slack Events API, Linear, and Granola
+webhooks and keeps each verified one as a hint: which object changed, by id,
+never its text ([ADR 0008 D12](docs/adr/0008-collected-items.md)). A
+collector takes webhooks when its entry in the worker's sources file names
+the variable holding the provider's signing secret, in the collector's own
+namespace:
+
+```json
+{"provider": "slack", "connector_principal": "principal.slack",
+ "connector_instance": "slack.acme", "provider_scope_id": "T07ACME0001",
+ "settings": {"token_env": "FLEET_RECALL_SLACK_BOT_TOKEN", "channels": ["C07PLATENG1"]},
+ "push": {"signing_secret_env": "FLEET_RECALL_SLACK_SIGNING_SECRET"}}
+```
+
+```text
+FLEET_RECALL_INGRESS_DATABASE_URL=postgresql://fleet_ingress:...@host:26257/fleet_recall?sslmode=verify-full \
+FLEET_RECALL_TENANT_ID=... FLEET_RECALL_PROJECT=... FLEET_RECALL_SLACK_SIGNING_SECRET=... \
+ostk-fleet-recall ingress --sources worker-sources.json [--listen 127.0.0.1:8787] [--allow-non-loopback]
+```
+
+Each provider posts to `/v1/hooks/<connector_instance>`. The receiver checks
+the signature over the exact bytes it received (Slack's `v0` signature within
+five minutes, Linear's `Linear-Signature` with its signed `webhookTimestamp`
+within a minute, Granola's Standard Webhooks `whsec_` signature within five
+minutes), the pinned team or organization, and a body limit
+(`FLEET_RECALL_INGRESS_MAX_BODY_BYTES`, 1 MiB by default). It answers `401`,
+`403`, `400`, or `413` to what it refuses, with at most one digest-only dead
+letter per instance, reason, and minute, and `200` once a delivery is stored,
+exactly once however often the provider retries it. It echoes Slack's URL
+verification, keeps a direct message only as a replay guard with no ids, and
+answers `503` when the database fails, so the provider retries.
+
+The next `worker` tick whose steps include `collect` reads each collector's
+pending hints before its pass: an edit or a new message, issue, comment, or
+note is re-read through the collector's API, exactly as a pass reads it, and
+staged; a Slack `message_deleted` or a Linear `remove` hides the item the
+memory holds at once. Only then is the hint settled, in the same
+transaction. A fetch that keeps failing backs off and, after eight attempts,
+becomes a `retry_exhausted` dead letter; `collect retry --delivery <hex>`
+reopens it. While a hint waits, evidence and item recall report
+`hints_awaiting_fetch` and an empty answer is `unknown`. A hint never counts
+as coverage: only a pass's complete reads do.
+
+The receiver runs as its own login, `fleet_ingress`, which may only read and
+insert deliveries and dead letters
+([`ingress-receiver-role-grants.sql`](deploy/cockroach/ingress-receiver-role-grants.sql));
+it refuses to start beside the writer's or any other database URL or the
+content key. It listens on loopback unless `--allow-non-loopback` says
+otherwise (`FLEET_RECALL_INGRESS_LISTEN`): Linear and Granola need a public
+HTTPS endpoint, which is a relay you run in front of it.
 
 ## Asserting a claim
 
@@ -885,7 +943,8 @@ ADRs 0005 to 0008 record everything else deferred. The main items are:
   the publication grant on migration 23's filtered views); fusing evidence
   into chunk recall; registering the coverage labels in a package; dense or
   semantic absence verdicts; a body plane that stays encrypted after
-  projection; a re-embed step; remote ingress, queues, and Arrow transport.
+  projection; a re-embed step; content-bearing webhooks (Slack Socket Mode,
+  Linear history), a public relay, and Arrow transport.
 - **Spec conformance.** `ostk-spec retire` and `inspect`; episode
   `acknowledge` and `waive`; any episode lifecycle over MCP; a
   `closed_world_verified` observer that can verify absence and so

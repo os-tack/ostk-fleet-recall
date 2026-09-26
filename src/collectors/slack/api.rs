@@ -316,6 +316,65 @@ impl SlackApiV1 {
         Ok(page(answer))
     }
 
+    /// The one message `ts` of `channel`, when Slack still has it: from the
+    /// history (a channel-level message, a thread's root, a broadcast), else
+    /// from its thread (a reply). Each read is bounded to that one `ts`
+    /// (`oldest` and `latest` both `ts`, inclusive); a thread's read may also
+    /// return its root, which Slack always lists first, so the message is
+    /// found by its exact `ts`. `None` when neither read returns it, or its
+    /// thread is gone.
+    ///
+    /// # Errors
+    ///
+    /// Every [`SlackCallErrorV1`].
+    pub async fn message(
+        &self,
+        channel: &str,
+        ts: &str,
+    ) -> Result<Option<Box<SlackMessageV1>>, SlackCallErrorV1> {
+        let find = |page: SlackPageV1| {
+            page.messages.into_iter().find_map(|message| match message {
+                PageMessageV1::Message(message) if message.ts == ts => Some(message),
+                _ => None,
+            })
+        };
+        let history: PageAnswerV1 = decode(
+            &self
+                .call(
+                    "conversations.history",
+                    &[
+                        ("channel", channel),
+                        ("oldest", ts),
+                        ("latest", ts),
+                        ("inclusive", "true"),
+                        ("limit", "1"),
+                    ],
+                )
+                .await?,
+        )?;
+        if let Some(message) = find(page(history)) {
+            return Ok(Some(message));
+        }
+        let replies = self
+            .call(
+                "conversations.replies",
+                &[
+                    ("channel", channel),
+                    ("ts", ts),
+                    ("oldest", ts),
+                    ("latest", ts),
+                    ("inclusive", "true"),
+                    ("limit", "2"),
+                ],
+            )
+            .await?;
+        match decode::<PageAnswerV1>(&replies) {
+            Ok(answer) => Ok(find(page(answer))),
+            Err(SlackCallErrorV1::Refused(code)) if code == "thread_not_found" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// One page of `conversations.replies`: the thread's root first, then
     /// its replies, oldest first.
     ///

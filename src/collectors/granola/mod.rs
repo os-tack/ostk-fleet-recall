@@ -64,6 +64,8 @@
 //! partial. A refused key (`401`, `403`) fails the pass.
 
 pub mod api;
+pub mod fetch;
+pub mod push;
 pub mod render;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -88,9 +90,10 @@ use super::http::{
     AuthSchemeV1, ProviderHttpV1, ProviderTokenV1, validate_provider_api_base,
     validate_token_variable,
 };
+use super::ingress::PushVerifierV1;
 use super::pull::{
-    ContainerOutcomeV1, ListingBoundV1, PageStager, PartialReasonV1, PullCollectorV1,
-    PullPassInputV1, PullPassOutcomeV1, PulledItemV1, WithdrawnItemV1, withdrawal,
+    ContainerOutcomeV1, ListingBoundV1, ObjectFetcherV1, PageStager, PartialReasonV1,
+    PullCollectorV1, PullPassInputV1, PullPassOutcomeV1, PulledItemV1, WithdrawnItemV1, withdrawal,
 };
 use super::sink::{ContainerObservationV1, CursorAdvanceV1, DeadLetterReasonV1, KnownVersionV1};
 use api::{GranolaApiV1, GranolaCallErrorV1, GranolaNoteV1, GranolaSegmentV1, ListEntryV1};
@@ -335,6 +338,27 @@ impl CollectorAdapterV1 for GranolaAdapterV1 {
         GranolaSettingsV1::from_source(source)
             .ok()
             .map(|settings| settings.reconcile_every_seconds)
+    }
+
+    fn fetch_object(
+        &self,
+        source: &CollectorSourceV1,
+        environment: &dyn Fn(&str) -> Option<String>,
+    ) -> std::result::Result<Option<Box<dyn ObjectFetcherV1>>, String> {
+        self.validate(source)?;
+        let settings = GranolaSettingsV1::from_source(source)?;
+        let token = ProviderTokenV1::from_environment(&settings.token_env, environment)
+            .map_err(|error| error.to_string())?;
+        let http = ProviderHttpV1::new(&settings.api_base, &token, AuthSchemeV1::Bearer)
+            .map_err(|error| error.to_string())?;
+        Ok(Some(Box::new(fetch::GranolaFetchV1::new(GranolaPullV1 {
+            api: GranolaApiV1::new(http, settings.page_size),
+            settings,
+        }))))
+    }
+
+    fn push(&self) -> Option<&'static dyn PushVerifierV1> {
+        Some(&push::GRANOLA_PUSH)
     }
 }
 

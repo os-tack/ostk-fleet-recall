@@ -45,8 +45,8 @@ use super::draft::{
 use super::redaction::CollectorRedactorV1;
 use super::sink::{
     CollectedItemSink, CollectorCursorV1, CollectorDeadLetterV1, ContainerObservationV1,
-    CursorAdvanceV1, DeadLetterReasonV1, KnownVersionV1, OutboxRowStateV1, StageContextV1,
-    StageDraftV1, StageOutcomeV1, StagedItemV1, draft_digest,
+    CursorAdvanceV1, DeadLetterReasonV1, HintSettlementV1, HintTargetV1, KnownVersionV1,
+    OutboxRowStateV1, StageContextV1, StageDraftV1, StageOutcomeV1, StagedItemV1, draft_digest,
 };
 
 /// Why a container's coverage in one pass is partial.
@@ -163,6 +163,58 @@ pub trait PullCollectorV1: Send + Sync {
         input: &PullPassInputV1<'_>,
         stager: &mut PageStager<'_>,
     ) -> Result<PullPassOutcomeV1>;
+}
+
+/// The object one upsert hint names (ADR 0008 D12): ids only, as the signed
+/// delivery named them.
+#[derive(Debug, Clone, Copy)]
+pub struct HintedObjectV1<'a> {
+    /// The object kind (`message`, `issue`, `comment`, `note_summary`).
+    pub object_kind: &'a str,
+    /// The external id the collector stages it under.
+    pub external_id: &'a str,
+    /// Its container, when the delivery named one.
+    pub container_id: Option<&'a str>,
+}
+
+/// What re-reading a hinted object found.
+#[derive(Debug, Clone)]
+pub enum FetchedObjectV1 {
+    /// Stage these, with these container observations; either may be empty
+    /// (an observation alone withdraws a container found inadmissible).
+    Stage {
+        /// What the read produced, in pull mode.
+        items: Vec<PulledItemV1>,
+        /// What it learned about containers.
+        observations: Vec<ContainerObservationV1>,
+    },
+    /// Nothing to stage: the object is gone, or outside what the instance
+    /// admits (a channel it does not read, a team it does not admit). The
+    /// label says which; the next reconciliation decides what absence means.
+    Nothing(&'static str),
+    /// The provider could not be read now (a rate limit, a failed request, a
+    /// refused credential): the hint backs off and is read again.
+    Failed(String),
+}
+
+/// How one provider re-reads the object an upsert hint names, through its
+/// pull adapter's own credential, API, and audience rules (ADR 0008 D12).
+#[async_trait]
+pub trait ObjectFetcherV1: Send + Sync {
+    /// Re-read `hint`'s object. `input` is the tick's, as for a pass;
+    /// `stager` reads what the memory knows and records dead letters, and the
+    /// worker stages what is returned with the hint's settlement.
+    ///
+    /// # Errors
+    ///
+    /// A database failure; a provider failure is
+    /// [`FetchedObjectV1::Failed`].
+    async fn fetch(
+        &self,
+        input: &PullPassInputV1<'_>,
+        hint: &HintedObjectV1<'_>,
+        stager: &mut PageStager<'_>,
+    ) -> Result<FetchedObjectV1>;
 }
 
 /// One item a pull read, with the provider audience of its container when the
@@ -406,6 +458,28 @@ impl<'s> PageStager<'s> {
             .await
     }
 
+    /// The presented head of one of this instance's items, with its
+    /// container, thread, and whether it is withdrawn; `None` when the memory
+    /// holds no head of it.
+    ///
+    /// # Errors
+    ///
+    /// As [`CollectedItemSink::hint_target`].
+    pub async fn held(
+        &self,
+        object_kind: &ObjectKindV1,
+        external_id: &str,
+    ) -> Result<Option<HintTargetV1>> {
+        self.sink
+            .hint_target(
+                &self.instance.provider,
+                self.instance.provider_scope_id.as_str(),
+                object_kind,
+                external_id,
+            )
+            .await
+    }
+
     /// One of this instance's cursors.
     ///
     /// # Errors
@@ -517,6 +591,51 @@ impl<'s> PageStager<'s> {
             }
         }
         Ok(outcome)
+    }
+
+    /// Stage what one hinted fetch read, and settle the hint in the same
+    /// transaction (ADR 0008 D12). The hint's key is every draft's transport
+    /// delivery id. Nothing is tracked for the pass's settlement: a hint is
+    /// not part of a listing, and never establishes coverage.
+    ///
+    /// # Errors
+    ///
+    /// As [`CollectedItemSink::stage_settling`].
+    pub async fn stage_hint(
+        &self,
+        items: Vec<PulledItemV1>,
+        container_observations: &[ContainerObservationV1],
+        settlement: &HintSettlementV1,
+    ) -> Result<StageOutcomeV1> {
+        let delivery_id = settlement.delivery_key.as_bytes().to_vec();
+        let drafts: Vec<StageDraftV1> = items
+            .into_iter()
+            .map(|item| StageDraftV1 {
+                draft: item.draft,
+                provider_audience: item.provider_audience,
+                delivery_id: delivery_id.clone(),
+            })
+            .collect();
+        self.sink
+            .stage_settling(
+                &drafts,
+                &StageContextV1 {
+                    instance: &self.instance,
+                    principal: &self.principal,
+                    mode: CollectionModeV1::Pull,
+                    attester: None,
+                    via: None,
+                    redactor: &self.redactor,
+                    policy: &self.policy,
+                    capture_scopes: &[],
+                    pass_seq: None,
+                    container_observations,
+                    cursor_advances: &[],
+                    source_status: None,
+                },
+                std::slice::from_ref(settlement),
+            )
+            .await
     }
 
     /// Hold an unchanged item current at the version the memory already

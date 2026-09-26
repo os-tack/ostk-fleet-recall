@@ -84,7 +84,9 @@
 //! `x-ratelimit-*` headers of every answer are reported in the pass's
 //! counters: the fewest requests and complexity points Linear said were left.
 
+pub mod fetch;
 pub mod graphql;
+pub mod push;
 pub mod render;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -111,9 +113,10 @@ use super::http::{
     AuthSchemeV1, ProviderHttpV1, ProviderTokenV1, validate_provider_api_base,
     validate_token_variable,
 };
+use super::ingress::PushVerifierV1;
 use super::pull::{
-    ContainerOutcomeV1, ListingBoundV1, PageStager, PartialReasonV1, PullCollectorV1,
-    PullPassInputV1, PullPassOutcomeV1, PulledItemV1, WithdrawnItemV1, withdrawal,
+    ContainerOutcomeV1, ListingBoundV1, ObjectFetcherV1, PageStager, PartialReasonV1,
+    PullCollectorV1, PullPassInputV1, PullPassOutcomeV1, PulledItemV1, WithdrawnItemV1, withdrawal,
 };
 use super::sink::{ContainerObservationV1, CursorAdvanceV1, DeadLetterReasonV1, KnownVersionV1};
 use graphql::{
@@ -373,6 +376,25 @@ impl CollectorAdapterV1 for LinearAdapterV1 {
             api: LinearApiV1::new(http, endpoint, settings.page_size),
             settings,
         })))
+    }
+
+    fn fetch_object(
+        &self,
+        source: &CollectorSourceV1,
+        environment: &dyn Fn(&str) -> Option<String>,
+    ) -> std::result::Result<Option<Box<dyn ObjectFetcherV1>>, String> {
+        let settings = LinearSettingsV1::from_source(source)?;
+        let token = ProviderTokenV1::from_environment(&settings.token_env, environment)
+            .map_err(|error| error.to_string())?;
+        let (base, endpoint) = split_endpoint(&settings.api_url)?;
+        let http = ProviderHttpV1::new(&base, &token, auth_scheme(&token))
+            .map_err(|error| error.to_string())?;
+        let api = LinearApiV1::new(http, endpoint, settings.page_size);
+        Ok(Some(Box::new(fetch::LinearFetchV1::new(settings, api))))
+    }
+
+    fn push(&self) -> Option<&'static dyn PushVerifierV1> {
+        Some(&push::LINEAR_PUSH)
     }
 }
 

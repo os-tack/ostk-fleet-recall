@@ -11,11 +11,12 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::private_postgres::{
-    MIGRATOR_POSTGRES_APPLICATION_NAME, MIGRATOR_POSTGRES_USER, PRIVATE_RUNTIME_POSTGRES_DATABASE,
+    INGRESS_POSTGRES_APPLICATION_NAME, INGRESS_POSTGRES_USER, MIGRATOR_POSTGRES_APPLICATION_NAME,
+    MIGRATOR_POSTGRES_USER, PRIVATE_RUNTIME_POSTGRES_DATABASE,
     PUBLICATION_POSTGRES_APPLICATION_NAME, PUBLICATION_POSTGRES_DATABASE,
     PUBLICATION_POSTGRES_USER, PrivatePostgresSslPolicy, WRITER_POSTGRES_APPLICATION_NAME,
-    WRITER_POSTGRES_USER, migrator_postgres_connect_options, publication_postgres_connect_options,
-    writer_postgres_connect_options,
+    WRITER_POSTGRES_USER, ingress_postgres_connect_options, migrator_postgres_connect_options,
+    publication_postgres_connect_options, writer_postgres_connect_options,
 };
 use crate::{FleetError, FleetScope, Result};
 use async_trait::async_trait;
@@ -68,6 +69,13 @@ pub const COLLECTED_ITEMS_SCHEMA_VERSION: i64 = 34;
 /// and `record`'s item support entries are neither served nor advertised,
 /// and item recall lists no citing claims.
 pub const CLAIM_ITEM_LINKS_SCHEMA_VERSION: i64 = 35;
+/// First schema with the authenticated ingress's hint queue (migration 0036,
+/// ADR 0008 D12).
+///
+/// Below it `ostk-fleet-recall ingress` refuses to start, the worker's
+/// `collect` step reads no hint, and readiness reports no
+/// `hints_awaiting_fetch`.
+pub const COLLECTOR_INGRESS_SCHEMA_VERSION: i64 = 36;
 
 /// Exact application tables reachable from public health/status/recall SQL.
 ///
@@ -170,6 +178,7 @@ const PRIVATE_RUNTIME_SCHEMA_RESOLUTION_SQL: &str =
 enum PrivateRuntimeSessionIdentity {
     Writer,
     Migrator,
+    Ingress,
 }
 
 impl PrivateRuntimeSessionIdentity {
@@ -177,6 +186,7 @@ impl PrivateRuntimeSessionIdentity {
         match self {
             Self::Writer => WRITER_POSTGRES_USER,
             Self::Migrator => MIGRATOR_POSTGRES_USER,
+            Self::Ingress => INGRESS_POSTGRES_USER,
         }
     }
 
@@ -184,12 +194,13 @@ impl PrivateRuntimeSessionIdentity {
         match self {
             Self::Writer => WRITER_POSTGRES_APPLICATION_NAME,
             Self::Migrator => MIGRATOR_POSTGRES_APPLICATION_NAME,
+            Self::Ingress => INGRESS_POSTGRES_APPLICATION_NAME,
         }
     }
 
     const fn search_path(self) -> &'static str {
         match self {
-            Self::Writer => PRIVATE_RUNTIME_SEARCH_PATH,
+            Self::Writer | Self::Ingress => PRIVATE_RUNTIME_SEARCH_PATH,
             Self::Migrator => MIGRATOR_SEARCH_PATH,
         }
     }
@@ -402,6 +413,8 @@ const COLLECTED_WITHDRAWALS_MIGRATION_SQL: &str =
     include_str!("../../migrations/0034_collected_withdrawals.sql");
 const CLAIM_ITEM_LINKS_MIGRATION_SQL: &str =
     include_str!("../../migrations/0035_claim_item_links.sql");
+const COLLECTOR_INGRESS_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0036_collector_ingress.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -444,7 +457,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
 }
 
 #[allow(clippy::too_many_lines)] // one registration per migration file, in version order
-fn post_transactional_online_migrations() -> [Migration; 20] {
+fn post_transactional_online_migrations() -> [Migration; 21] {
     [
         Migration::new(
             15,
@@ -646,6 +659,17 @@ fn post_transactional_online_migrations() -> [Migration; 20] {
             // with no foreign key and two indexes. Runs outside SQLx's
             // transaction wrapper like migrations 0018-0034;
             // MINIMUM_RECALL_SCHEMA_VERSION stays 18.
+            true,
+        ),
+        Migration::new(
+            COLLECTOR_INGRESS_SCHEMA_VERSION,
+            Cow::Borrowed("collector ingress"),
+            MigrationType::Simple,
+            Cow::Borrowed(COLLECTOR_INGRESS_MIGRATION_SQL),
+            // ADR 0008 D12. Additive: one private-plane table (the ingress's
+            // hint queue, ids and digests only) with no foreign key and one
+            // index. Runs outside SQLx's transaction wrapper like migrations
+            // 0018-0035; MINIMUM_RECALL_SCHEMA_VERSION stays 18.
             true,
         ),
     ]
@@ -1401,6 +1425,9 @@ impl CockroachStore {
             PrivateRuntimeSessionIdentity::Migrator => {
                 migrator_postgres_connect_options(database_url, database_ssl_policy)?
             }
+            PrivateRuntimeSessionIdentity::Ingress => {
+                ingress_postgres_connect_options(database_url, database_ssl_policy)?
+            }
         }
         .log_statements(tracing::log::LevelFilter::Debug)
         .log_slow_statements(tracing::log::LevelFilter::Warn, Duration::from_secs(1));
@@ -1468,6 +1495,42 @@ impl CockroachStore {
             .connect_with(options)
             .await?;
         Ok(Self { pool, scope })
+    }
+
+    /// Connect the ingress receiver as exactly `fleet_ingress` (ADR 0008
+    /// D12): a pool, pinned per session as the writer's is, with no store
+    /// around it, since the receiver reads and writes nothing a store serves.
+    pub async fn connect_ingress_pool(
+        database_url: &str,
+        database_ssl_policy: PrivatePostgresSslPolicy,
+        config: PoolConfig,
+    ) -> Result<PgPool> {
+        if config.max_connections == 0 {
+            return Err(FleetError::Configuration(
+                "database pool max_connections must be greater than zero".into(),
+            ));
+        }
+        let identity = PrivateRuntimeSessionIdentity::Ingress;
+        let options = ingress_postgres_connect_options(database_url, database_ssl_policy)?
+            .log_statements(tracing::log::LevelFilter::Debug)
+            .log_slow_statements(tracing::log::LevelFilter::Warn, Duration::from_secs(1));
+        Ok(PgPoolOptions::new()
+            .max_connections(config.max_connections)
+            .min_connections(config.min_connections.min(config.max_connections))
+            .acquire_timeout(config.acquire_timeout)
+            .idle_timeout(config.idle_timeout)
+            .max_lifetime(config.max_lifetime)
+            .after_connect(move |connection, _metadata| {
+                Box::pin(async move { pin_private_runtime_session(connection, identity).await })
+            })
+            .before_acquire(move |connection, _metadata| {
+                Box::pin(async move {
+                    pin_private_runtime_session(connection, identity).await?;
+                    Ok(true)
+                })
+            })
+            .connect_with(options)
+            .await?)
     }
 
     /// Wrap an existing pool, primarily for composed services and integration

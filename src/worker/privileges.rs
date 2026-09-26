@@ -21,7 +21,8 @@ use sqlx::PgPool;
 
 use crate::error::{FleetError, Result};
 use crate::store::cockroach::{
-    COLLECTED_ITEMS_SCHEMA_VERSION, DatabaseCapabilities, MEMORY_WORKER_SCHEMA_VERSION,
+    COLLECTED_ITEMS_SCHEMA_VERSION, COLLECTOR_INGRESS_SCHEMA_VERSION, DatabaseCapabilities,
+    MEMORY_WORKER_SCHEMA_VERSION,
 };
 
 use super::WorkerStepV1;
@@ -113,6 +114,11 @@ const COLLECT_PROBES: &[Probe] = &[
     ("memory_collector_dead_letters_v1", ProbeKind::Insert, None),
     ("_sqlx_migrations", ProbeKind::Read, None),
 ];
+
+/// The ingress's hint queue (migration 0036): the collect step reads each
+/// instance's due hints and settles, backs off, or kills them with a locking
+/// update. Probed only on a schema that has the queue.
+const HINT_PROBES: &[Probe] = &[("memory_ingress_deliveries_v1", ProbeKind::Lock, None)];
 
 const BODY_PROBES: &[Probe] = &[
     ("memory_evidence_events", ProbeKind::Read, None),
@@ -249,7 +255,9 @@ fn probe_statement((table, kind, columns): Probe) -> String {
 /// The collect step's privileges are probed only from migration 34
 /// ([`COLLECTED_ITEMS_SCHEMA_VERSION`]) on: before it the step has nothing to
 /// drain and is skipped, so neither its probes nor the ingest probes it alone
-/// would add are run.
+/// would add are run. From migration 36
+/// ([`COLLECTOR_INGRESS_SCHEMA_VERSION`]) on, the step also reads and settles
+/// the ingress's hints.
 ///
 /// # Errors
 ///
@@ -268,13 +276,18 @@ pub async fn probe_worker_privileges(
             capabilities.schema_version
         )));
     }
-    let probes = if capabilities.supports_schema_version(COLLECTED_ITEMS_SCHEMA_VERSION) {
+    let mut probes = if capabilities.supports_schema_version(COLLECTED_ITEMS_SCHEMA_VERSION) {
         probes_for(steps)
     } else {
         let mut older = steps.clone();
         older.remove(&WorkerStepV1::Collect);
         probes_for(&older)
     };
+    if steps.contains(&WorkerStepV1::Collect)
+        && capabilities.supports_schema_version(COLLECTOR_INGRESS_SCHEMA_VERSION)
+    {
+        probes.extend_from_slice(HINT_PROBES);
+    }
     run_probes(pool, &probes, "the worker's database login", "the worker").await
 }
 

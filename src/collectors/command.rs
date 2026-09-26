@@ -28,10 +28,19 @@
 //!   and item recall stop judging absence by its snapshot. Only an import's
 //!   row: the worker retires its own collectors, and capture rows are never
 //!   retired here. Its items stay recallable; re-importing re-activates it.
+//! * `collect retry --delivery <hex>` reopens an ingress hint the worker gave
+//!   up on after eight failed fetches (ADR 0008 D12): it is pending again, due
+//!   at once, with its attempts reset. The key is the `delivery_id` of its
+//!   `retry_exhausted` dead letter.
+//!
+//! `collect status` also counts each instance's ingress hints by state, and
+//! `collect dead-letters` lists the ingress's rejections (`invalid_signature`,
+//! `stale_signature`, `unauthorized_scope`, `oversize`, `parse_failed`) with
+//! every other dead letter.
 //!
 //! Every subcommand runs as the writer login and needs the schema through
-//! migration 34. `import` checks, before it stages anything, every privilege
-//! the worker's `collect` step would use.
+//! migration 34 (`retry`, migration 36). `import` checks, before it stages
+//! anything, every privilege the worker's `collect` step would use.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -49,15 +58,19 @@ use crate::error::{FleetError, Result};
 use crate::evidence_ledger::content_kek_from_lookup;
 use crate::memory_contracts::collected_item::{BoundedTextV1, ProviderKindV1};
 use crate::memory_contracts::common::ContractId;
+use crate::memory_contracts::digest::Sha256Digest;
 use crate::registry_witness::WriterAuthorityRuntime;
-use crate::store::cockroach::{COLLECTED_ITEMS_SCHEMA_VERSION, DatabaseCapabilities, RetryPolicy};
+use crate::store::cockroach::{
+    COLLECTED_ITEMS_SCHEMA_VERSION, COLLECTOR_INGRESS_SCHEMA_VERSION, DatabaseCapabilities,
+    RetryPolicy,
+};
 use crate::worker::{WorkerStepV1, probe_worker_privileges};
 
 use super::import::{
     DEFAULT_IMPORT_STALE_AFTER_SECONDS, ImportContextV1, ImportFileFormatV1, ItemsImportRequestV1,
     import_items,
 };
-use super::sink::{CollectedDrainContextV1, CollectedItemSink, RetireImportV1};
+use super::sink::{CollectedDrainContextV1, CollectedItemSink, ReopenedHintV1, RetireImportV1};
 
 /// The audience an operator declares for an import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +163,11 @@ pub enum CollectCommandV1 {
         /// `--instance`.
         instance: String,
     },
+    /// `collect retry`: reopen a dead ingress hint.
+    Retry {
+        /// `--delivery`: the hint's delivery key, 64 lowercase hex digits.
+        delivery: String,
+    },
 }
 
 /// What the process gives the command besides its arguments.
@@ -180,6 +198,17 @@ fn require_schema(capabilities: &DatabaseCapabilities) -> Result<()> {
     Err(FleetError::Configuration(format!(
         "collected items need the schema through migration {COLLECTED_ITEMS_SCHEMA_VERSION}, \
          but this database has reached {}; run `ostk-fleet-recall migrate`",
+        capabilities.schema_version
+    )))
+}
+
+fn require_ingress_schema(capabilities: &DatabaseCapabilities) -> Result<()> {
+    if capabilities.supports_schema_version(COLLECTOR_INGRESS_SCHEMA_VERSION) {
+        return Ok(());
+    }
+    Err(FleetError::Configuration(format!(
+        "ingress hints need the schema through migration {COLLECTOR_INGRESS_SCHEMA_VERSION}, but \
+         this database has reached {}; run `ostk-fleet-recall migrate`",
         capabilities.schema_version
     )))
 }
@@ -240,6 +269,33 @@ where
                 .transpose()?;
             let sink = connect_sink(&process, connect).await?;
             to_value(&sink.dead_letters(since, instance.as_ref()).await?)?
+        }
+        CollectCommandV1::Retry { delivery } => {
+            let key: Sha256Digest = delivery.parse().map_err(|_| {
+                FleetError::Configuration(
+                    "--delivery must be a delivery key: 64 lowercase hexadecimal digits, as \
+                     `collect dead-letters` prints it"
+                        .to_owned(),
+                )
+            })?;
+            let (pool, capabilities) = connect().await?;
+            require_ingress_schema(&capabilities)?;
+            let sink = CollectedItemSink::new(pool, &process.scope, process.retry)?;
+            match sink.reopen_hint(&key).await? {
+                ReopenedHintV1::Reopened { instance } => {
+                    json!({"delivery": delivery, "instance": instance, "reopened": true})
+                }
+                ReopenedHintV1::NotDead { state } => {
+                    return Err(FleetError::Configuration(format!(
+                        "delivery {delivery} is {state}; `collect retry` reopens a dead hint only"
+                    )));
+                }
+                ReopenedHintV1::Unknown => {
+                    return Err(FleetError::Configuration(format!(
+                        "no ingress delivery has key {delivery}"
+                    )));
+                }
+            }
         }
         CollectCommandV1::Retire { instance } => {
             let id = instance_id("--instance", instance)?;
@@ -513,5 +569,16 @@ mod tests {
         let (message, connected) = run(&CollectCommandV1::Status, &HashMap::new()).await;
         assert_eq!(message, CONNECTED);
         assert!(connected);
+        for delivery in ["ab", &"AB".repeat(32), &"zz".repeat(32)] {
+            let (message, connected) = run(
+                &CollectCommandV1::Retry {
+                    delivery: delivery.to_owned(),
+                },
+                &HashMap::new(),
+            )
+            .await;
+            assert!(message.starts_with("--delivery"), "{message}");
+            assert!(!connected);
+        }
     }
 }

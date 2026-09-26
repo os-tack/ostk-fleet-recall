@@ -58,7 +58,7 @@ pub const CHANNEL_CONTAINER_KIND: &str = "slack.channel";
 
 /// Subtypes that are an item: an ordinary message, a bot's, a thread
 /// broadcast, a file share, a `/me` message.
-const ITEM_SUBTYPES: [&str; 4] = [
+pub const ITEM_SUBTYPES: [&str; 4] = [
     "bot_message",
     "thread_broadcast",
     "file_share",

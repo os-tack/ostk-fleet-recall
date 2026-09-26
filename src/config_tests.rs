@@ -1877,3 +1877,65 @@ fn collected_capture_scopes_are_closed_json() {
         );
     }
 }
+
+fn ingress_values() -> BTreeMap<&'static str, String> {
+    BTreeMap::from([
+        (
+            "FLEET_RECALL_INGRESS_DATABASE_URL",
+            "postgresql://fleet_ingress:ingress-password@cluster.example:26257/fleet_recall?sslmode=verify-full"
+                .to_owned(),
+        ),
+        (
+            "FLEET_RECALL_TENANT_ID",
+            "0190f1c8-7a6b-7c2d-9e0f-123456789abc".to_owned(),
+        ),
+        ("FLEET_RECALL_PROJECT", "fleet-recall".to_owned()),
+    ])
+}
+
+#[test]
+fn ingress_config_uses_only_its_dedicated_database_identity() {
+    let values = ingress_values();
+    let config = IngressConfig::from_lookup(|name| values.get(name).cloned()).expect("ingress");
+    assert_eq!(config.project(), "fleet-recall");
+    assert_eq!(
+        config.database_ssl_policy(),
+        PrivatePostgresSslPolicy::VerifyFull
+    );
+    assert_eq!(config.max_connections(), 4);
+    assert_eq!(
+        config.max_body_bytes(),
+        crate::collectors::ingress::DEFAULT_INGRESS_MAX_BODY_BYTES
+    );
+    let debug = format!("{config:?}");
+    assert!(!debug.contains("ingress-password"));
+    assert!(debug.contains("<redacted>"));
+
+    let mut writer = ingress_values();
+    writer.insert(
+        "FLEET_RECALL_INGRESS_DATABASE_URL",
+        "postgresql://fleet_writer:writer-password@cluster.example:26257/fleet_recall?sslmode=verify-full"
+            .to_owned(),
+    );
+    let error = IngressConfig::from_lookup(|name| writer.get(name).cloned())
+        .expect_err("the ingress URL must authenticate as fleet_ingress")
+        .to_string();
+    assert!(error.contains("fleet_ingress"), "{error}");
+    assert!(!error.contains("writer-password"), "{error}");
+}
+
+#[test]
+fn ingress_config_refuses_every_other_identity_and_the_content_key() {
+    for forbidden in INGRESS_FORBIDDEN_ENV_NAMES {
+        let mut values = ingress_values();
+        values.insert(forbidden, "held-by-another-process".to_owned());
+        let error = IngressConfig::from_lookup(|name| values.get(name).cloned())
+            .expect_err("a foreign credential must fail closed")
+            .to_string();
+        assert!(error.contains(forbidden), "{error}");
+        assert!(!error.contains("held-by-another-process"), "{error}");
+    }
+    let mut values = ingress_values();
+    values.insert("FLEET_RECALL_INGRESS_MAX_BODY_BYTES", "0".to_owned());
+    assert!(IngressConfig::from_lookup(|name| values.get(name).cloned()).is_err());
+}

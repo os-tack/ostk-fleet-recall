@@ -22,7 +22,10 @@ The memory worker ingests git history, agent transcripts, and CI runs, which
 collectors (a documents directory, and the Slack, Linear, and Granola API
 pull collectors, [ADR 0008 D8](adr/0008-collected-items.md)) and drains
 collected items, which `recall(kind=item)` searches as items
-([ADR 0008](adr/0008-collected-items.md)); `ostk-fleet-recall collect
+([ADR 0008](adr/0008-collected-items.md)); `ostk-fleet-recall ingress`
+receives those three providers' signed webhooks and keeps each only as a
+hint, which the worker re-reads through the provider's API before anything is
+staged (ADR 0008 D12); `ostk-fleet-recall collect
 import` imports an `items-jsonl` file or a Slack export (a directory or a
 zip) as a snapshot of one provider scope (ADR 0008 D9), and
 `remember(capture)` relays items an agent read through its own connectors
@@ -126,6 +129,13 @@ the production image. The memory worker is `ostk-fleet-recall worker --once`,
 scheduled by the operator: its git and CI steps shell out to `git` and `gh`,
 which the image does not carry, so ingest runs on a host that holds the
 repositories, the transcripts, the writer login, and the content key.
+The webhook receiver, `ostk-fleet-recall ingress`, is an operator process
+too: no task definition, ALB rule, or route in this topology reaches it. It
+listens on loopback unless `--allow-non-loopback` is given, so a relay the
+operator runs (a tunnel or a private load balancer) delivers the providers'
+webhooks to it. It holds only its own `fleet_ingress` login and the
+providers' signing secrets, never a provider token, the writer login, or the
+content key (ADR 0008 D12).
 
 ECS containers are stateless. Replacing or scaling a task does not move memory:
 the corpus, typed claims, idempotency receipts, conflict ledger, and events
@@ -178,20 +188,23 @@ than caller-controlled JSON.
 | Discrepancy ledger | `memory_discrepancy_heads_v1`, `memory_discrepancy_log_v1`, `memory_discrepancy_projections_v1`, `memory_discrepancy_relations_v1` | `spec_nonconformance` episodes and their append-only lifecycle |
 | Collected items | `memory_collector_outbox_v1`, `memory_collected_items_v1`, `memory_collected_item_links_v1`, `memory_collected_item_heads_v1`, `memory_collector_containers_v1`, `memory_collected_item_withdrawals_v1`, `memory_collector_sources_v1`, `memory_collector_cursors_v1`, `memory_collector_dead_letters_v1` | Items staged by any collector, their append-only history and current heads, container audiences and withdrawals, items whose own audience narrowed, collector status and cursors, and digest-only dead letters ([ADR 0008](adr/0008-collected-items.md)) |
 | Claim item links | `memory_claim_item_links_v1` | Append-only private links from a claim to the collected-item parts it cites, never a publication table ([ADR 0008 D11](adr/0008-collected-items.md)) |
+| Ingress hints | `memory_ingress_deliveries_v1` | One row per verified provider webhook: provider ids and digests, never content, queued for the worker to re-read and settle ([ADR 0008 D12](adr/0008-collected-items.md)) |
 
-Later migrations (19 through 35, see [`migrations/`](../migrations); 25 is
+Later migrations (19 through 36, see [`migrations/`](../migrations); 25 is
 permanently unused) add the private-plane tables listed above: content-addressed
 body projection (19), coverage cursors and receipts (20), the lexical/dense
 recall projection (21) and its visibility class (23), the transcript (22) and CI
 (26) connector state, normative activation (24), the discrepancy ledger (27),
 the bootstrap-manifest import rows (28), worker source status (30), the spec
 statements and checks (31), the collected-item sink (33) and its withdrawals
-(34), and the claim item links (35); migration 32 only widens a check.
+(34), the claim item links (35), and the ingress hint queue (36); migration 32
+only widens a check.
 Migration 29 adds `memory_conflict_lifecycle_events_v1`, the append-only
 per-conflict lifecycle log described under the write path below. The memory
 worker writes the body, connector, coverage, recall-projection, status, and
 collected-item tables (the `collect` command writes the collected-item tables
-too); `ostk-spec` writes the normative, spec, and discrepancy tables; and
+too), and settles migration 36's hints; the ingress receiver, under its own
+login, only inserts those hints and its refusals' dead letters; `ostk-spec` writes the normative, spec, and discrepancy tables; and
 `serve` reads them for `recall(kind=evidence)`, `recall(kind=item)`, and
 `recall(discrepancies)`. `serve` writes none of them unless agent capture is
 turned on: then `remember(capture)` stages into the collector outbox and
@@ -222,12 +235,14 @@ floors:
   view are migration 18's.
 - The memory worker and `recall(kind=evidence)` require migration 30,
   `recall(discrepancies)` requires 31, `recall(kind=item)` and
-  `remember(capture)` require 34, and claims that cite collected items
-  require 35.
+  `remember(capture)` require 34, claims that cite collected items
+  require 35, and the ingress receiver and the worker's hint re-reads
+  require 36.
   `serve` probes each at startup and
   serves it only when the schema and the login's grants allow, so every other
   surface still runs on a prefix through 18. The runtime policy that grants
-  all of this requires the complete prefix 1–35.
+  all of this, and the ingress receiver's policy, require the complete prefix
+  1–36.
 
 Later additive rows cannot compensate for a missing or failed row inside a
 required prefix. Migrations 15 through 17 do not add successor tables: they

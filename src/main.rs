@@ -23,7 +23,14 @@ use ostk_fleet_recall::collectors::command::{
     CollectCommandV1, CollectImportV1, CollectProcessV1, ImportAudienceV1, ImportFormatV1,
     run_collect_command,
 };
-use ostk_fleet_recall::config::{LifecycleConfig, PublicationConfig, model_bundle_sha256};
+use ostk_fleet_recall::collectors::ingress::deliveries::IngressStoreV1;
+use ostk_fleet_recall::collectors::ingress::server::{
+    IngressInstancesV1, router as ingress_router, serve as serve_ingress, system_clock,
+    validate_listen,
+};
+use ostk_fleet_recall::config::{
+    IngressConfig, LifecycleConfig, PublicationConfig, model_bundle_sha256,
+};
 use ostk_fleet_recall::evidence_recall::start_evidence_recall;
 use ostk_fleet_recall::item_recall::{ItemRecall, start_item_recall_citing};
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
@@ -38,7 +45,9 @@ use ostk_fleet_recall::store::cockroach::{
     PoolConfig, RetryPolicy, ScopedChunk, active_embedding_model, probe_claim_item_links,
     probe_conflict_lifecycle,
 };
-use ostk_fleet_recall::worker::{GhCliProviderFactory, WorkerCommandV1, WorkerProcessV1};
+use ostk_fleet_recall::worker::{
+    GhCliProviderFactory, WorkerCommandV1, WorkerProcessV1, WorkerSourcesV1,
+};
 use ostk_fleet_recall::{CockroachMemoryService, FleetConfig, FleetError, FleetScope};
 use ostk_recall_core::{
     Chunk, ChunkEmbedder, FacetSet, Links, Source, compose_header, filter_to_allowlist,
@@ -183,6 +192,26 @@ enum Command {
         #[command(subcommand)]
         command: CollectSubcommand,
     },
+    /// Receive signed provider webhooks on the private plane and keep each
+    /// as a hint (ids only) that the worker's collect step re-reads. Runs
+    /// until interrupted.
+    Ingress {
+        /// The worker sources file (JSON): every collector that configures
+        /// `push.signing_secret_env` is received.
+        #[arg(long, value_name = "PATH")]
+        sources: PathBuf,
+        /// Address to listen on: loopback unless --allow-non-loopback.
+        #[arg(
+            long,
+            env = "FLEET_RECALL_INGRESS_LISTEN",
+            default_value = "127.0.0.1:8787",
+            value_name = "ADDRESS"
+        )]
+        listen: SocketAddr,
+        /// Listen on an address that is not loopback, behind a relay you run.
+        #[arg(long)]
+        allow_non_loopback: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -241,6 +270,14 @@ enum CollectSubcommand {
         /// The import's collector instance.
         #[arg(long, value_name = "INSTANCE")]
         instance: String,
+    },
+    /// Reopen an ingress hint the worker gave up on after eight failed
+    /// fetches.
+    Retry {
+        /// The hint's delivery key (the `delivery_id` of its
+        /// `retry_exhausted` dead letter), 64 hexadecimal digits.
+        #[arg(long, value_name = "HEX")]
+        delivery: String,
     },
 }
 
@@ -309,6 +346,7 @@ impl CollectSubcommand {
                 CollectCommandV1::DeadLetters { since, instance }
             }
             Self::Retire { instance } => CollectCommandV1::Retire { instance },
+            Self::Retry { delivery } => CollectCommandV1::Retry { delivery },
         }
     }
 }
@@ -318,6 +356,7 @@ enum RuntimeDatabaseIdentity {
     Writer,
     Migrator,
     Publication,
+    Ingress,
     None,
 }
 
@@ -325,6 +364,7 @@ impl Command {
     const fn runtime_database_identity(&self) -> RuntimeDatabaseIdentity {
         match self {
             Self::Demo { .. } => RuntimeDatabaseIdentity::Publication,
+            Self::Ingress { .. } => RuntimeDatabaseIdentity::Ingress,
             Self::Migrate => RuntimeDatabaseIdentity::Migrator,
             Self::ModelDigest { .. } => RuntimeDatabaseIdentity::None,
             Self::Serve
@@ -401,6 +441,20 @@ async fn main() -> anyhow::Result<ExitCode> {
             };
             run_demo(config, listen).await?;
         }
+        RuntimeDatabaseIdentity::Ingress => {
+            let Command::Ingress {
+                sources,
+                listen,
+                allow_non_loopback,
+            } = cli.command
+            else {
+                unreachable!("only ingress uses the ingress identity")
+            };
+            // Refused before any configuration or secret is read.
+            let listen = validate_listen(listen, allow_non_loopback)?;
+            let config = IngressConfig::from_env()?;
+            run_ingress(&config, &sources, listen).await?;
+        }
         RuntimeDatabaseIdentity::Migrator => {
             let config = FleetConfig::from_migrator_env()?;
             let Command::Migrate = cli.command else {
@@ -430,7 +484,10 @@ async fn main() -> anyhow::Result<ExitCode> {
                     command.validate()?;
                     run_collect(&config, &command.into_command()).await?;
                 }
-                Command::Demo { .. } | Command::Migrate | Command::ModelDigest { .. } => {
+                Command::Demo { .. }
+                | Command::Migrate
+                | Command::ModelDigest { .. }
+                | Command::Ingress { .. } => {
                     unreachable!("command identity was classified before configuration load")
                 }
             }
@@ -581,6 +638,46 @@ async fn run_collect(config: &FleetConfig, command: &CollectCommandV1) -> anyhow
         &mut io::stdout(),
     )
     .await?;
+    Ok(())
+}
+
+/// `ingress`: the private-plane webhook receiver (ADR 0008 D12), as the
+/// `fleet_ingress` login, until interrupted.
+///
+/// `listen` was already checked ([`validate_listen`]). It reads each
+/// webhook's signing secret from the variable the sources file names, and
+/// checks, before it listens, that the schema has the hint queue and the
+/// login may insert deliveries and dead letters. It holds no content key and
+/// no writer pins.
+async fn run_ingress(
+    config: &IngressConfig,
+    sources: &Path,
+    listen: SocketAddr,
+) -> anyhow::Result<()> {
+    let sources = WorkerSourcesV1::load(sources)?;
+    let lookup = |name: &str| std::env::var(name).ok();
+    let instances = IngressInstancesV1::from_sources(&sources, &lookup)?;
+    let pool = CockroachStore::connect_ingress_pool(
+        config.database_url(),
+        config.database_ssl_policy(),
+        PoolConfig {
+            max_connections: config.max_connections(),
+            ..PoolConfig::default()
+        },
+    )
+    .await?;
+    let store = IngressStoreV1::new(pool, config.tenant_id(), config.project())?;
+    store.probe().await?;
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("the ingress cannot listen on {listen}"))?;
+    tracing::info!(
+        address = %listen,
+        instances = ?instances.ids().collect::<Vec<_>>(),
+        "the ingress is receiving webhooks"
+    );
+    let router = ingress_router(store, instances, system_clock(), config.max_body_bytes());
+    serve_ingress(listener, router, shutdown_signal()).await?;
     Ok(())
 }
 
@@ -1929,7 +2026,8 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use ostk_fleet_recall::private_postgres::{
-        MIGRATOR_POSTGRES_USER, PUBLICATION_POSTGRES_USER, WRITER_POSTGRES_USER,
+        INGRESS_POSTGRES_USER, MIGRATOR_POSTGRES_USER, PUBLICATION_POSTGRES_USER,
+        WRITER_POSTGRES_USER,
     };
     use ostk_fleet_recall::service::ServiceResult;
     use ostk_recall_core::PrivacyTier;
@@ -2180,6 +2278,14 @@ mod tests {
                         "FLEET_RECALL_PUBLICATION_DATABASE_URL",
                         PUBLICATION_POSTGRES_USER,
                     )
+                }
+                RuntimeDatabaseIdentity::Ingress => {
+                    assert_eq!(
+                        shell.login("FLEET_RECALL_DATABASE_URL"),
+                        None,
+                        "README line {line_number}: the ingress refuses a private URL"
+                    );
+                    ("FLEET_RECALL_INGRESS_DATABASE_URL", INGRESS_POSTGRES_USER)
                 }
             };
             assert_eq!(

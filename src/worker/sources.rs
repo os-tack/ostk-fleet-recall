@@ -21,7 +21,12 @@
 //!   collector's pass. A provider this build has no adapter for is accepted
 //!   here and reported as a failed source at tick time. Settings name
 //!   credentials by environment variable, never inline: a secret-shaped
-//!   value, or an inline value under a credential-named key, is refused.
+//!   value, or an inline value under a credential-named key, is refused. An
+//!   optional `push.signing_secret_env` turns on the provider's webhooks for
+//!   the instance (ADR 0008 D12): only a provider whose adapter verifies
+//!   webhooks accepts it, and the variable must be in the provider's own
+//!   `FLEET_RECALL_<PROVIDER>_` namespace and not the one that holds its
+//!   API token. `ostk-fleet-recall ingress` reads the same file.
 //! * **observer** — the identity `ostk-spec check` appends observer runs under.
 //!   The worker does not read it.
 //!
@@ -39,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::collectors::audience::AudiencePolicyV1;
+use crate::collectors::ingress::CollectorPushV1;
 use crate::collectors::redaction::scan_collected_secrets;
 use crate::connectors::ci::{CiRepositoryIdV1, CiScanRequestV1};
 use crate::connectors::git::{GitRefName, GitRepositoryIdV1};
@@ -237,6 +243,12 @@ pub struct CollectorSourceV1 {
     pub settings: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     pub stale_after_seconds: Option<u64>,
+    /// The provider's webhook, received by `ostk-fleet-recall ingress` as
+    /// hints the worker's `collect` step re-reads (ADR 0008 D12): the
+    /// variable holding its signing secret. Absent, the ingress refuses
+    /// deliveries addressed to this instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<CollectorPushV1>,
 }
 
 /// Settings keys that name a credential; their value must be the name of an
@@ -266,10 +278,34 @@ impl CollectorSourceV1 {
             }
         }
         refuse_inline_credentials(instance, "settings", &self.settings)?;
-        if let Some(adapter) = crate::collectors::adapter(self.provider.as_str()) {
+        let adapter = crate::collectors::adapter(self.provider.as_str());
+        if let Some(adapter) = adapter {
             adapter
                 .validate(self)
                 .map_err(|message| invalid(&format!("collector {instance}: {message}")))?;
+        }
+        if let Some(push) = &self.push {
+            if adapter
+                .and_then(crate::collectors::CollectorAdapterV1::push)
+                .is_none()
+            {
+                return Err(invalid(&format!(
+                    "collector {instance}: provider {} has no webhook this build receives;                      remove push",
+                    self.provider
+                )));
+            }
+            validate_push_secret_variable(self.provider.as_str(), &push.signing_secret_env)
+                .map_err(|message| invalid(&format!("collector {instance}: {message}")))?;
+            if self
+                .settings
+                .get("token_env")
+                .and_then(serde_json::Value::as_str)
+                == Some(push.signing_secret_env.as_str())
+            {
+                return Err(invalid(&format!(
+                    "collector {instance}: push.signing_secret_env names the collector's API                      token variable; the signing secret is a variable of its own"
+                )));
+            }
         }
         validate_stale_after(
             &format!("collector {instance} stale_after_seconds"),
@@ -281,6 +317,30 @@ impl CollectorSourceV1 {
 
 /// Refuse a credential written into the sources file: any secret-shaped
 /// string, and any inline string under a credential-named key.
+/// Check the variable a collector's webhook signing secret is read from: in
+/// the provider's own namespace, as an API token's is
+/// ([`crate::collectors::http::validate_token_variable`]), so no edit of the
+/// sources file can make the ingress read the worker's content key or a
+/// database URL as a signing secret.
+fn validate_push_secret_variable(provider: &str, name: &str) -> std::result::Result<(), String> {
+    use crate::collectors::http::{is_variable_name, token_variable_prefix};
+    if !is_variable_name(name) {
+        return Err(
+            "push.signing_secret_env must name an environment variable ([A-Z_][A-Z0-9_]*)"
+                .to_owned(),
+        );
+    }
+    let prefix = token_variable_prefix(provider);
+    let reserved = name.ends_with("DATABASE_URL") || name.contains("_KEK");
+    if !name.starts_with(&prefix) || name.len() == prefix.len() || reserved {
+        return Err(format!(
+            "push.signing_secret_env must name a variable in the collector's own namespace, \
+             {prefix}... (such as {prefix}SIGNING_SECRET)"
+        ));
+    }
+    Ok(())
+}
+
 fn refuse_inline_credentials(
     instance: &ContractId,
     path: &str,

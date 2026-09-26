@@ -84,6 +84,8 @@
 //! never listed, fetched, or staged.
 
 pub mod api;
+pub mod fetch;
+pub mod push;
 pub mod render;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -110,9 +112,10 @@ use super::http::{
     AuthSchemeV1, ProviderHttpV1, ProviderTokenV1, validate_provider_api_base,
     validate_token_variable,
 };
+use super::ingress::PushVerifierV1;
 use super::pull::{
-    ContainerOutcomeV1, ListingBoundV1, PageStager, PartialReasonV1, PullCollectorV1,
-    PullPassInputV1, PullPassOutcomeV1, PulledItemV1,
+    ContainerOutcomeV1, ListingBoundV1, ObjectFetcherV1, PageStager, PartialReasonV1,
+    PullCollectorV1, PullPassInputV1, PullPassOutcomeV1, PulledItemV1,
 };
 use super::sink::{
     ContainerObservationV1, CursorAdvanceV1, DeadLetterReasonV1, KnownVersionV1, StagedItemV1,
@@ -393,6 +396,24 @@ impl CollectorAdapterV1 for SlackAdapterV1 {
         SlackSettingsV1::from_source(source)
             .ok()
             .map(|settings| settings.reconcile_every_seconds)
+    }
+
+    fn fetch_object(
+        &self,
+        source: &CollectorSourceV1,
+        environment: &dyn Fn(&str) -> Option<String>,
+    ) -> std::result::Result<Option<Box<dyn ObjectFetcherV1>>, String> {
+        let settings = SlackSettingsV1::from_source(source)?;
+        let token = ProviderTokenV1::from_environment(&settings.token_env, environment)
+            .map_err(|error| error.to_string())?;
+        let http = ProviderHttpV1::new(&settings.api_base, &token, AuthSchemeV1::Bearer)
+            .map_err(|error| error.to_string())?;
+        let api = SlackApiV1::new(http, settings.page_size);
+        Ok(Some(Box::new(fetch::SlackFetchV1::new(settings, api))))
+    }
+
+    fn push(&self) -> Option<&'static dyn PushVerifierV1> {
+        Some(&push::SLACK_PUSH)
     }
 }
 

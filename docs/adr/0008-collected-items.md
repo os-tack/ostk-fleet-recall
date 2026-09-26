@@ -1,6 +1,6 @@
 # ADR 0008: Collected items from any source
 
-- Status: accepted; D1 to D11 implemented. The generation-3 registry package
+- Status: accepted; D1 to D12 implemented. The generation-3 registry package
   is checked in, the strict witness recognizes it, and
   `ostk-authority-install apply --target generation-3` activates it and
   rebases the scope's normative families onto it. The collected-item
@@ -24,7 +24,10 @@
   served only where `FLEET_RECALL_COLLECTED_CAPTURE` turns it on (D10). A
   claim cites the items it rests on: `remember(assert)`'s `support_items`
   and `record`'s item support entries link it to them through migration 35,
-  privately (D11).
+  privately (D11). `ostk-fleet-recall ingress` receives signed Slack, Linear,
+  and Granola webhooks on the private plane as hints (ids only) in migration
+  36's queue, which the worker's `collect` step re-reads through each
+  collector's pull adapter or turns into a push-mode tombstone (D12).
 - Date: 2026-09-25
 - Scope: how specs and documents, Slack conversations, Linear tickets,
   Granola meetings, and anything else a collector can read become evidence
@@ -580,8 +583,9 @@ provider this build has no adapter for is accepted by the file and reported as
 a failed source at tick time, so its status row makes evidence recall's
 absence `unknown` rather than leaving the source silently unread. The file
 also refuses two collectors over one provider scope: each would read the
-other's items as missing and tombstone them. Webhook verification and hinted
-fetches join the adapter when their slices define them.
+other's items as missing and tombstone them. An API collector's adapter also
+maps its provider's signed webhooks and re-reads the object a hint names
+(D12).
 
 **A pass.** For each configured collector, in order, the `collect` step binds
 `connector.collected.pull` from the tick's verified head (a generation-2 head
@@ -883,8 +887,8 @@ default), every filter a variable:
   `x-ratelimit-complexity-remaining` headers of every answer are reported as
   the fewest the pass saw.
 
-A permanently deleted comment is invisible to a sweep; it is left to the
-webhook hints of stage 7. An issue withdrawn because the credential could no
+A permanently deleted comment is invisible to a sweep; a signed `remove`
+webhook tombstones it (D12). An issue withdrawn because the credential could no
 longer see it, and that becomes visible again without changing, stays
 withdrawn until it next changes (fail closed). Reactions, subscribers,
 history entries, and attachments' content are never read.
@@ -965,8 +969,8 @@ id is the operator's own pin, and nothing is checked against it.
   container partial. A refused key (`401`, `403`) fails the pass.
 
 A note reappearing unchanged after its tombstone stays hidden until it next
-changes, as a Slack message does; the stage-7 hints (`note.access_granted`)
-re-fetch it, but only a newer `updated_at` displaces the tombstone.
+changes, as a Slack message does; the ingress's hints (`note.access_granted`,
+D12) re-fetch it, but only a newer `updated_at` displaces the tombstone.
 
 **Rejected.** A per-container cursor for documents: a full enumeration
 compared with the heads resumes by construction, and a pass instant as the
@@ -1327,3 +1331,128 @@ names each item's accepted events for an assertion to cite, so a hidden
 item's event listed directly would otherwise support a new claim that
 deletion hides everywhere else. Per-principal audiences on citations are
 deferred with the item audiences they would follow.
+
+## D12 — Stage-7 ingress: signed webhooks, kept as hints
+
+**Decision.** A provider's webhook tells the memory that something changed;
+it is never the memory's word for what changed. `ostk-fleet-recall ingress`
+(`src/collectors/ingress`, migration 36) receives Slack, Linear, and Granola
+webhooks on the private plane and keeps each verified one as a **hint**: which
+provider object changed, by id, and nothing of its content. The worker's
+`collect` step re-reads the object through the collector's own pull adapter
+(its credential, audience rules, and rendering) and stages what it read like
+any pull; a deletion becomes a push-mode tombstone.
+
+- **The receiver.** One route, `POST /v1/hooks/{connector_instance}`, for
+  every collector of the sources file that names a signing secret
+  (`push.signing_secret_env`, a variable in the collector's own namespace,
+  never the secret). In order: an instance with no webhook is `404` and a log
+  line, nothing written; the body limit (`FLEET_RECALL_INGRESS_MAX_BODY_BYTES`,
+  1 MiB by default) is `413` and an `oversize` dead letter; the signature over
+  the exact bytes received, under an injected clock and with
+  `ring::hmac::verify` throughout, is `401` and an `invalid_signature` or
+  `stale_signature` dead letter; the signed body that does not parse is `400`
+  (`parse_failed`); one naming another scope than the pin is `403`
+  (`unauthorized_scope`); anything else is inserted once
+  (`INSERT ... ON CONFLICT DO NOTHING`) and answered `200` after the commit,
+  or `503` when the database failed, so the provider retries.
+
+  | Provider | Signature | Window | Signed id |
+  |---|---|---|---|
+  | Slack | `X-Slack-Signature: v0=` hex HMAC-SHA256 over `v0:{timestamp}:{body}` | ±300 s | `event_id` |
+  | Linear | `Linear-Signature`: hex HMAC-SHA256 over the body; its signed `webhookTimestamp` is the clock | ±60 s | the body's SHA-256 (`Linear-Delivery` is not signed) |
+  | Granola (Standard Webhooks) | `webhook-signature: v1,<base64>`, keyed by the decoded `whsec_` secret, over `{webhook-id}.{webhook-timestamp}.{body}`; any `v1` entry may match, a malformed one is ignored | ±300 s | `webhook-id` |
+
+  base64 is strict RFC 4648, written in the crate, so an entry is exactly one
+  tag or ignored. The dedupe key is
+  `D(IngressDeliveryKeyV1; provider, instance, signed id)`, so a retry or a
+  replay adds no row. A rejection's dead letter is keyed by
+  `sha256(instance, reason, minute)`: at most one row per instance, reason, and
+  minute, holding the digest of what was refused and a static diagnostic.
+- **What a delivery maps to** (each adapter's `push()`):
+
+  | Delivery | Hint |
+  |---|---|
+  | Slack `message`, `thread_broadcast`, `bot_message`, `file_share`, `me_message` | upsert `<channel>:<ts>` |
+  | Slack `message_changed` | upsert `<channel>:<message.ts>` |
+  | Slack `message_deleted` | delete `<channel>:<deleted_ts>`, at the event's `event_ts` |
+  | Slack `url_verification` | the challenge, echoed once its signature verifies |
+  | Slack event of another `team_id` | refused, `unauthorized_scope` |
+  | Slack message in an `im` or `mpim` | ignored, kept with no ids |
+  | Linear `Issue` or `Comment` `create` or `update` | upsert by id; another `organizationId` is refused |
+  | Linear `Issue` or `Comment` `remove` | delete by id, at the signed `webhookTimestamp` |
+  | Granola `note.generated`, `note.edited`, `note.access_granted` | upsert the note |
+  | anything else | ignored |
+
+  Granola's payload names no workspace: the key is the instance's only pin.
+- **The queue** (`memory_ingress_deliveries_v1`, migration 36) holds the
+  instance, the dedupe key, the signed id, the raw body's digest and length, a
+  bounded event label, the disposition (`hint`, `ignored`, `challenge`), and
+  for a hint its kind, object kind, external id, container id, provider event
+  time, state (`pending`, `settled`, `dead`), attempts, next attempt, and last
+  error. An ignored or answered delivery keeps no ids and no queue state; its
+  row only recognizes the replay.
+- **Settling is the acknowledgement.** Before each collector's pass, the
+  `collect` step reads that instance's due hints (at most 256 a tick, oldest
+  first). An upsert is re-read through the adapter's fetcher
+  (`ObjectFetcherV1`): Slack `auth.test` once a tick, `conversations.info`,
+  then the history bounded to the message's `ts` (`oldest` and `latest` both
+  `ts`, inclusive), else its thread; Linear the scope query once a tick, then
+  the issue or comment by id and a comment's issue; Granola `notes/{id}` as a
+  sweep reads one note. What it read is staged in pull mode with the hint's
+  key as the transport delivery, and the hint is settled in that staging
+  transaction (`FOR UPDATE` on the hint first); what was staged is drained at
+  once, so the pass that follows sees it as the memory's version. A delete of
+  an item the memory holds becomes a tombstone staged through
+  `connector.collected.push` at the provider's event time, in the container
+  and thread its head records; one the memory never held, or holds as a
+  tombstone, settles with nothing staged, as does an upsert whose object is
+  gone or outside what the instance admits. A hint therefore settles only
+  once what it caused is durable (docs/DYNAMIC_MEMORY_ARCHITECTURE.md, the
+  acknowledgement rule of "Ingestion and projections").
+- **What only a pass decides.** A hint never establishes coverage and never
+  tombstones on absence. A Linear issue the memory holds in another team, in
+  the trash, or withdrawn, one it never held, and a comment on an issue in
+  the trash are left to the sweep, which runs right after the hints and reads
+  what they imply (a move's comments, the trash's withdrawals).
+- **Failures.** A provider failure (a rate limit, a failed request, a refused
+  credential, a pinned scope the credential does not belong to) backs the
+  hint off, `60 s * 2^n` after the `n+1`-th failure; the eighth makes it
+  `dead` with a `retry_exhausted` dead letter whose delivery id is the key.
+  `collect retry --delivery <hex>` reopens a dead hint, due at once. An item
+  refused as `clock_ahead` settles nothing and counts as a failure.
+- **Readiness.** Evidence and item recall report `hints_awaiting_fetch`
+  (item recall, of the requested provider) where the queue is readable; a
+  pending hint makes an empty answer `unknown` with `ingest_outbox_pending`,
+  and `recall` warns `evidence_hints_pending`.
+- **Least privilege.** The receiver logs in as `fleet_ingress`, a member only
+  of `fleet_ingress_receiver`
+  (`deploy/cockroach/ingress-receiver-role-grants.sql`): `CONNECT`, schema
+  `USAGE`, `SELECT` on `_sqlx_migrations`, and `SELECT` and `INSERT` on the
+  queue and the dead letters, seven rows. It reads the URL
+  `FLEET_RECALL_INGRESS_DATABASE_URL`, refuses to start beside any other
+  identity's database URL or the content key, holds no writer pins, and
+  probes its inserts before it listens. It binds loopback
+  (`FLEET_RECALL_INGRESS_LISTEN`, `127.0.0.1:8787` by default) unless
+  `--allow-non-loopback`: providers reach it through a relay the operator
+  runs, and it is never mounted on the demo's public router. The runtime
+  policy grants `fleet_runtime` `SELECT` and `UPDATE` on the queue (its gate
+  is migrations 1 through 36, its matrix 143 rows); the publication reader
+  gets nothing.
+
+**Migration 36** creates `memory_ingress_deliveries_v1`, keyed by
+`(tenant_id, project, collector_instance_id, delivery_key)`, with an index
+for the worker's queue reads, CHECKs tying ids and a queue state to a hint
+and a settled time to a settled or dead one, no foreign key, and a drift
+guard.
+
+**Rejected.** Content-bearing webhooks (a Slack event's text, a Linear
+`updatedFrom`): the receiver would hold provider content under a role that
+must hold none, and an unsigned or replayed body would be the memory's word;
+Slack Socket Mode and Linear history reconstruction stay deferred, and a hint
+stages nothing but tombstones through `connector.collected.push`.
+Acknowledging a delivery when it is stored and settling nothing: the queue
+could then lose an edit it had acknowledged. Trusting `Linear-Delivery` as
+identity: it is not signed. Tombstoning a hinted object the provider no longer
+returns: a `404` or a missing message can be a transient or an audience
+change, which only a pass's complete reads decide.

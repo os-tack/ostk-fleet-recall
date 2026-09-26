@@ -1,7 +1,7 @@
 -- Long-lived runtime-writer role boundary for the dedicated fleet_recall
 -- database.
 --
--- Run only after the complete successful migration prefix 1 through 35 (version
+-- Run only after the complete successful migration prefix 1 through 36 (version
 -- 25 is permanently unused). Other later successful migrations are compatible
 -- and cannot mask a missing or failed row in that bounded prefix. Run only as
 -- a cluster admin; database ownership alone is insufficient. This policy is
@@ -68,26 +68,26 @@ $$;
 -- Stage-5 body, coverage, recall, transcript, and visibility tables (19-23),
 -- normative activation (24), the CI connector (26), the discrepancy ledger
 -- (27), the conflict lifecycle log (29), worker source status (30), spec
--- conformance (31), collected items and their withdrawals (33, 34), and claim
--- item links (35). Migration 32 adds no table and no grant, but lies inside
--- the bounded prefix. A policy applied before any of them fails here, before
+-- conformance (31), collected items and their withdrawals (33, 34), claim
+-- item links (35), and the ingress hint queue (36). Migration 32 adds no table
+-- and no grant, but lies inside the bounded prefix. A policy applied before any of them fails here, before
 -- any change, rather than on a GRANT.
 DO $$
 DECLARE
     runtime_schema_ready BOOL;
 BEGIN
-    SELECT count(*) = 34
+    SELECT count(*) = 35
        AND min(version) = 1
-       AND max(version) = 35
+       AND max(version) = 36
        AND COALESCE(bool_and(success), false)
     INTO runtime_schema_ready
     FROM public._sqlx_migrations
-    WHERE version BETWEEN 1 AND 35;
+    WHERE version BETWEEN 1 AND 36;
 
     IF runtime_schema_ready IS DISTINCT FROM true THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
-            MESSAGE = 'runtime writer role requires successful migrations 1 through 35 (25 is permanently unused)';
+            MESSAGE = 'runtime writer role requires successful migrations 1 through 36 (25 is permanently unused)';
     END IF;
 END
 $$;
@@ -757,6 +757,15 @@ GRANT SELECT, INSERT ON TABLE public.memory_conflict_lifecycle_events_v1 TO flee
 -- privileges at startup before it lets a claim cite an item.
 GRANT SELECT, INSERT ON TABLE public.memory_claim_item_links_v1 TO fleet_runtime;
 
+-- The ingress hint queue (ADR 0008 D12, migration 36). The receiver inserts
+-- hints under its own role (ingress-receiver-role-grants.sql); the runtime
+-- only reads them and settles, backs off, or kills them with a locking
+-- update, in the transaction that stages what a hint caused. No INSERT: the
+-- runtime never mints a delivery. No DELETE: a settled hint stays, so a
+-- provider's replay of it is still recognized. Serve reads the pending count
+-- for readiness. Never granted to the publication reader.
+GRANT SELECT, UPDATE ON TABLE public.memory_ingress_deliveries_v1 TO fleet_runtime;
+
 -- Exact Stage-4 evidence-plane surface (ADR 0002 D2). `remember` must commit
 -- its accepted event and its projection in ONE serializable transaction, so
 -- the appending identity is this same logical role. It receives append and
@@ -881,12 +890,12 @@ TO fleet_runtime;
 GRANT fleet_runtime TO fleet_writer;
 
 -- Exact direct logical-role surface: database CONNECT, public-schema USAGE,
--- one hundred thirty-six table-privilege rows, and three sequence-USAGE rows.
+-- one hundred thirty-eight table-privilege rows, and three sequence-USAGE rows.
 -- Because SHOW GRANTS FOR also exposes cluster-global external connections, the
 -- exact count rejects those and every function/type/differently privileged
 -- row.
 SELECT IF(
-    count(*) = 141
+    count(*) = 143
         AND COALESCE(bool_and(
             NOT is_grantable
             AND (
@@ -957,7 +966,8 @@ SELECT IF(
                                 'memory_collector_sources_v1',
                                 'memory_collector_cursors_v1',
                                 'memory_collector_containers_v1',
-                                'memory_collected_item_withdrawals_v1'
+                                'memory_collected_item_withdrawals_v1',
+                                'memory_ingress_deliveries_v1'
                             ))
                         OR (privilege_type = 'INSERT'
                             AND object_name IN (
@@ -1043,6 +1053,7 @@ SELECT IF(
                                 'memory_collector_cursors_v1',
                                 'memory_collector_containers_v1',
                                 'memory_collected_item_withdrawals_v1',
+                                'memory_ingress_deliveries_v1',
                                 'memory_content_objects'
                             ))
                         OR (privilege_type = 'DELETE'
@@ -1062,7 +1073,7 @@ SELECT IF(
     1:::INT8,
     CAST(
         concat(
-            'runtime writer direct-grant postcondition differs from exact one-hundred-forty-one-row matrix: observed=',
+            'runtime writer direct-grant postcondition differs from exact one-hundred-forty-three-row matrix: observed=',
             count(*)::STRING
         )
         AS INT8

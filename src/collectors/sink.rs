@@ -397,6 +397,8 @@ pub struct StageOutcomeV1 {
     pub item_withdrawals_lifted: u64,
     /// Whether the cursor advances were applied.
     pub cursors_advanced: bool,
+    /// Ingress hints this call settled ([`CollectedItemSink::stage_settling`]).
+    pub hints_settled: u64,
 }
 
 /// What a drain needs from the tick that runs it.
@@ -541,6 +543,42 @@ impl CollectedItemSink {
         Ok(PreparedStageV1 {
             job: StageJob::prepare(self, drafts, context)?,
         })
+    }
+
+    /// Stage `drafts` as [`Self::stage`] does, and settle the ingress hints
+    /// that caused them in the same transaction (ADR 0008 D12): settling a
+    /// hint is the queue's acknowledgement, so it happens only where what the
+    /// hint caused is durable. A hint no longer pending (another worker
+    /// settled it) is left as it is. When an item is refused as
+    /// `clock_ahead`, no hint settles, as no cursor advances: the hint is read
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::stage`], and [`FleetError::Configuration`] for a settlement
+    /// of another instance's hint.
+    pub async fn stage_settling(
+        &self,
+        drafts: &[StageDraftV1],
+        context: &StageContextV1<'_>,
+        settlements: &[HintSettlementV1],
+    ) -> Result<StageOutcomeV1> {
+        let mut job = StageJob::prepare(self, drafts, context)?;
+        if settlements
+            .iter()
+            .any(|settlement| settlement.instance != context.instance.connector_instance_id)
+        {
+            return Err(FleetError::Configuration(
+                "a staging call settles its own instance's hints only".to_owned(),
+            ));
+        }
+        job.settlements = settlements.to_vec();
+        let prepared = Arc::new(PreparedStageV1 { job });
+        with_serializable_retry(&self.pool, self.retry, move |transaction| {
+            let prepared = Arc::clone(&prepared);
+            Box::pin(async move { prepared.run(transaction).await })
+        })
+        .await
     }
 
     /// Drain at most `limit` pending rows, oldest first.
@@ -1220,6 +1258,8 @@ struct StageJob {
     containers: Vec<PreparedContainerV1>,
     cursors: Vec<CursorAdvanceV1>,
     status: Option<CollectorSourceStatusV1>,
+    /// Ingress hints settled with what the drafts stage.
+    settlements: Vec<HintSettlementV1>,
 }
 
 impl StageJob {
@@ -1291,6 +1331,7 @@ impl StageJob {
             containers,
             cursors: context.cursor_advances.to_vec(),
             status: context.source_status.cloned(),
+            settlements: Vec::new(),
         })
     }
 
@@ -1309,7 +1350,13 @@ impl StageJob {
             items_withdrawn: 0,
             item_withdrawals_lifted: 0,
             cursors_advanced: false,
+            hints_settled: 0,
         };
+        // The hints this call settles are locked first, so two workers
+        // settling one hint serialize on it.
+        for settlement in &self.settlements {
+            lock_hint(transaction, self.tenant_id, &self.project, settlement).await?;
+        }
         for container in &self.containers {
             self.observe_container(transaction, container, now, &mut outcome)
                 .await?;
@@ -1359,6 +1406,11 @@ impl StageJob {
                     .await?;
             }
             outcome.cursors_advanced = !self.cursors.is_empty();
+            for settlement in &self.settlements {
+                outcome.hints_settled +=
+                    settle_hint(transaction, self.tenant_id, &self.project, settlement, now)
+                        .await?;
+            }
         }
         if let Some(status) = &self.status {
             upsert_collector_source(transaction, self.tenant_id, &self.project, status).await?;
@@ -2332,6 +2384,14 @@ pub use reads::{CollectorDeadLetterV1, KnownVersionV1, OutboxRowStateV1};
 
 #[path = "sink_operator.rs"]
 mod operator;
+
+#[path = "sink_hints.rs"]
+mod hints;
+
+pub use hints::{
+    HintFailureV1, HintSettlementV1, HintTargetV1, MAX_HINT_ATTEMPTS, PendingHintV1, ReopenedHintV1,
+};
+use hints::{lock_hint, settle_hint};
 
 pub use operator::{
     AdoptedRowV1, CollectorCursorRowV1, CollectorInstanceStatusV1, CollectorSourceRowV1,

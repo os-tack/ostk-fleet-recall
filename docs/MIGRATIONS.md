@@ -46,7 +46,10 @@ anything was admitted through them, and items whose own audience narrowed.
 The two ship together, and the collector runtime needs both. Migration 35
 adds claim item links (ADR 0008 D11): which collected item, version, and
 part each claim's support cites, a private-plane table the publication
-reader never reads.
+reader never reads. Migration 36 adds the authenticated ingress's hint queue
+(ADR 0008 D12): one row per signed provider webhook, holding provider ids and
+digests, never content, which the ingress receiver inserts and the worker
+settles.
 
 Each private runtime uses its own part of these tables:
 
@@ -61,6 +64,14 @@ Each private runtime uses its own part of these tables:
   imports a file (ADR 0008 D9), and the step records the snapshot of an
   import staged with `--no-drain`. It reads `memory_worker_sources_v1` to keep
   an import off a worker source's instance, and adds no migration or grant.
+  From migration 36 on, the step also reads each collector's due hints in
+  migration 36's queue before that collector's pass, and settles each in the
+  transaction that stages what it caused, backs it off, or kills it with a
+  `retry_exhausted` dead letter (ADR 0008 D12); `collect retry` reopens a dead
+  one, and `collect status` counts them.
+- `ostk-fleet-recall ingress`, under its own login, inserts each verified
+  webhook into migration 36's queue and each refused request into migration
+  33's dead letters, and reads nothing else (ADR 0008 D12).
 - `ostk-spec` writes the tables of migrations 24, 27, and 31.
   `ostk-authority-install apply --target generation-3`, as the migrator,
   appends migration 32's `rebase` rows to migration 24's log and moves those
@@ -80,16 +91,19 @@ Each private runtime uses its own part of these tables:
   heads as the worker's step does. From migration 35 on, where item recall is
   served, `record` and `assert` append migration 35's claim item links when a
   claim cites a collected item, and `recall(get)` reads them to expand what a
-  claim cites and to list the claims that cite an item (ADR 0008 D11). Of
+  claim cites and to list the claims that cite an item (ADR 0008 D11). From
+  migration 36 on, evidence and item recall count the hints still awaiting
+  their fetch (`hints_awaiting_fetch`) where the queue is readable. Of
   the other tables from migration 19 onward, it writes only migration 29's
   lifecycle log. Capture adds no migration or grant.
 - Only the private import CLI writes migration 28's rows. No served path
   reads them or migration 23's publication views.
 
 The runtime role policy grants `fleet_runtime` the tables of migrations 19
-through 24, 26, and 27, as it does those of 29 through 31 and 33 through 35.
-It grants nothing on migration 23's publication views or migration 28's
-import rows.
+through 24, 26, and 27, as it does those of 29 through 31 and 33 through 36
+(migration 36's queue only `SELECT` and `UPDATE`: the ingress receiver's own
+policy grants it the inserts). It grants nothing on migration 23's
+publication views or migration 28's import rows.
 
 Serving requires none of these migrations: `MINIMUM_RECALL_SCHEMA_VERSION`
 stays 18. `serve` serves each surface built on them only when its startup
@@ -98,7 +112,8 @@ surface reads. Migration 29 gates the conflict lifecycle, 30 gates
 `recall(kind=evidence)`, 31 gates `recall(action="discrepancies")`, 34
 gates `recall(kind=item)` (ADR 0008 D7), and 35 gates claims that cite
 collected items, which `serve` offers only where `recall(kind=item)` is
-served too (ADR 0008 D11); migration 32 gates nothing served.
+served too (ADR 0008 D11); migrations 32 and 36 gate nothing served (a
+readable queue only adds `hints_awaiting_fetch` to readiness).
 Evidence recall reads its collector state (migrations 33 and 34) when it
 finds it readable, and is still served, fail-closed, when it does not; until
 it is readable it checks again on every read, so they need no restart for
@@ -342,8 +357,9 @@ separately provisioned private-writer login is a member only of the hardened
 - append and advance privileges on the body, coverage, recall, transcript,
   and CI connector tables, normative activation, the discrepancy ledger, the
   conflict lifecycle log, worker source status, spec conformance, the
-  collected-item sink, and claim item links (the tables of migrations 19
-  through 24, 26, 27, 29 through 31, and 33 through 35), described below;
+  collected-item sink, claim item links, and the ingress hint queue (the
+  tables of migrations 19 through 24, 26, 27, 29 through 31, and 33 through
+  36), described below;
 - `SELECT` on the migrator-owned `memory_writer_authority_v1` view, which is
   the writer's only registry/bootstrap read path;
 - read access to SQLx migration metadata for health checks;
@@ -419,7 +435,18 @@ or `record`, whose rows share the random link id the claim's opaque
 `memory_claim_support` row names). A CHECK ties `via = 'assert'` to a
 non-NULL claim event. It closes with a drift guard over the column shape.
 
-For the tables from migration 19 onward the policy grants one of three
+Migration 36 (ADR 0008 D12) adds `memory_ingress_deliveries_v1`, again with
+no foreign key and nothing for the publication reader: one row per signed
+webhook delivery, keyed by the collector instance and a dedupe key derived
+from the id the provider signed, with the digest and length of the raw body,
+a bounded event label, what it maps to (`hint`, `ignored`, or `challenge`),
+and for a hint the provider ids it names (upsert or delete, object kind,
+external id, container id, event time) and its queue state (`pending`,
+`settled`, or `dead`), attempts, next attempt, and last error. CHECKs tie the
+ids and a queue state to `disposition = 'hint'` and `settled_at` to a
+settled or dead hint. It closes with a drift guard over the column shape.
+
+For the tables from migration 19 onward the policy grants one of four
 shapes, and never `DELETE`:
 
 - **Append-only (`SELECT`, `INSERT`):** the Stage-5 body objects, chunk
@@ -443,6 +470,11 @@ shapes, and never `DELETE`:
   locks a head or cursor.
 - **Read-only (`SELECT`):** `memory_discrepancy_relations_v1`. Nothing served
   appends a relation yet.
+- **Settled queue (`SELECT`, `UPDATE`):** migration 36's hint queue. The
+  runtime never inserts a delivery (the ingress receiver does, under its own
+  role) and never deletes one, so a settled hint still recognizes the
+  provider's replay of it. `UPDATE` settles, backs off, or kills a hint, and
+  covers the `SELECT ... FOR UPDATE` that locks it in a staging transaction.
 
 One more row is on a Stage-4 table: `UPDATE` on `memory_content_objects`.
 CockroachDB v26.2.3 requires `UPDATE` for `SELECT ... FOR UPDATE`, and the
@@ -465,20 +497,21 @@ writer login (see
 grants nothing on migration 23's publication views or on migration 28's
 bootstrap-import rows, and the publication reader gains nothing from any of
 these rows. The policy closes by
-checking the exact 141-row matrix: database `CONNECT`, schema `USAGE`, 136
+checking the exact 143-row matrix: database `CONNECT`, schema `USAGE`, 138
 table-privilege rows, and three sequence-`USAGE` rows. Migration 33 added 21
 of them: `SELECT` and `INSERT` on its three append-only tables, and `SELECT`,
 `INSERT`, and `UPDATE` on its five advanced-state tables (the matrix was 115
 rows, 110 of them on tables, before it). Migration 34 added three: `SELECT`,
 `INSERT`, and `UPDATE` on the item withdrawals. Migration 35 added two:
-`SELECT` and `INSERT` on the claim item links.
+`SELECT` and `INSERT` on the claim item links. Migration 36 added two:
+`SELECT` and `UPDATE` on the hint queue.
 
 A single gate guards all of it. Before any change, the policy requires a
-successful SQLx row for every migration from 1 through 35 (version 25 is
+successful SQLx row for every migration from 1 through 36 (version 25 is
 permanently unused); a later successful migration cannot mask a missing or
 failed one in that prefix. Migration 32 adds no table and needs no grant (the
 runtime already holds `INSERT` on the normative log); it is inside the gate only
-because migrations 33 through 35 are. When a later migration adds tables a
+because migrations 33 through 36 are. When a later migration adds tables a
 runtime needs, extend the policy in one edit: the gate, the grants, and the
 closing count together. The writer probes its grants only at startup, so after
 `migrate`, drain `fleet_writer`, reapply this policy, and then restart `serve`.
@@ -518,6 +551,26 @@ under that freeze, and only then perform the separate exact authentication
 enable. Quiesce/drain the login and repeat the audit/reapply sequence after
 every migration or grant change. The SQL policy intentionally does not create
 the external login or its password/identity-provider binding.
+
+The ingress receiver (ADR 0008 D12) has a boundary of its own, narrower
+still. The fixed externally provisioned login `fleet_ingress` is a member
+only of the logical `fleet_ingress_receiver` role, forced to `NOLOGIN`, whose
+entire positive grant surface is seven rows: `CONNECT` on `fleet_recall`,
+`USAGE` on schema `public`, `SELECT` on `_sqlx_migrations`, and `SELECT` and
+`INSERT` on `memory_ingress_deliveries_v1` and
+`memory_collector_dead_letters_v1`. It holds no `UPDATE` or `DELETE` (only
+the runtime settles a hint), and nothing on evidence, governed content,
+collected items, the outbox, claims, or any control or registry table, so the
+one process that listens for requests from outside can neither read nor
+write what the memory holds. Create the principal `NOLOGIN`
+(`CREATE USER fleet_ingress WITH NOLOGIN`), apply
+[`ingress-receiver-role-grants.sql`](../deploy/cockroach/ingress-receiver-role-grants.sql)
+as a cluster admin after prefix 1 through 36 (its own gate), audit it as the
+publication principal is audited, and only then enable its login. The
+receiver reads its URL from `FLEET_RECALL_INGRESS_DATABASE_URL`, pinned to
+`fleet_ingress`, and refuses to start beside any other identity's database
+URL or the content key; at startup it probes `INSERT` on both tables in a
+rolled-back transaction.
 
 Then apply and verify the exact control-plane exclusions and one-shot bootstrap
 grants in [the private control bootstrap policy](CONTROL_BOOTSTRAP.md). The
@@ -709,9 +762,10 @@ physical scope that is to collect items:
    on its ingest host, and the projector container.
 2. Apply the release's migrations, then re-apply the grant files. Migration 32
    lets a spec family be rebased and adds no grant; migrations 33 and 34 add the
-   collected-item tables and their withdrawals, and migration 35 the claim
-   item links, which the runtime policy grants (its gate is now migrations 1
-   through 35). A worker whose schema predates
+   collected-item tables and their withdrawals, migration 35 the claim item
+   links, and migration 36 the ingress's hint queue, which the runtime policy
+   grants (its gate is now migrations 1 through 36); apply the ingress
+   receiver policy too before running `ostk-fleet-recall ingress`. A worker whose schema predates
    migration 34 skips its `collect` step, and fails it, naming `migrate`, when a
    collector is configured. A `serve` started before this step needs no restart:
    its evidence recall checks the collector state again on every read until it
@@ -877,6 +931,11 @@ exact failed version:
   repair. It rewrites no existing row: the new column is NULL on every row
   migration 33's runtime wrote.
 - v35 creates `memory_claim_item_links_v1` and its two indexes with
+  `IF NOT EXISTS`, commits, and then asserts the table's exact column shape.
+  The normal migrator retry resumes an interrupted run; a `55000` means a
+  same-name table of another shape and needs a separately reviewed forward
+  repair. It rewrites no existing row.
+- v36 creates `memory_ingress_deliveries_v1` and its queue index with
   `IF NOT EXISTS`, commits, and then asserts the table's exact column shape.
   The normal migrator retry resumes an interrupted run; a `55000` means a
   same-name table of another shape and needs a separately reviewed forward
