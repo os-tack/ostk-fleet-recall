@@ -1422,9 +1422,18 @@ any pull; a deletion becomes a push-mode tombstone.
   `collect retry --delivery <hex>` reopens a dead hint, due at once. An item
   refused as `clock_ahead` settles nothing and counts as a failure.
 - **Readiness.** Evidence and item recall report `hints_awaiting_fetch`
-  (item recall, of the requested provider) where the queue is readable; a
-  pending hint makes an empty answer `unknown` with `ingest_outbox_pending`,
-  and `recall` warns `evidence_hints_pending`.
+  (item recall, of the requested provider) where the queue is readable,
+  counting the hints of collectors with an active worker source (a retired
+  instance's hints are never read, so they stay pending uncounted, and count
+  again if it is configured again); a pending hint makes an empty answer
+  `unknown` with `ingest_outbox_pending`, and `recall` warns
+  `evidence_hints_pending`. A login that cannot read the queue
+  (`hints_unreadable`) fails closed as unreadable collector state does: an
+  empty answer is `unknown` with `collector_state_unreadable`, and `recall`
+  warns `evidence_hints_unreadable`. Readiness reads the pipeline upstream
+  first (hints, the collector outbox, the evidence awaiting projection, the
+  lexical tier), so a hint that moves downstream between two reads is counted
+  by the later one.
 - **Least privilege.** The receiver logs in as `fleet_ingress`, a member only
   of `fleet_ingress_receiver`
   (`deploy/cockroach/ingress-receiver-role-grants.sql`): `CONNECT`, schema

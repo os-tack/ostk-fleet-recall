@@ -31,7 +31,9 @@
 //!   tier;
 //! * no accepted evidence event is waiting for the body projector, and no
 //!   transcript turn or collected item is waiting in its outbox;
-//! * the collector state could be read, when the schema has it;
+//! * the collector state could be read, when the schema has it, and so could
+//!   the ingress's hint queue, where no hint of a collector the worker runs
+//!   is waiting;
 //! * every body has been through the lexical projector;
 //! * at least one source is active, and every active source's last outcome is
 //!   not `failed`, its last completed check exists and is not older than its
@@ -54,6 +56,15 @@
 //! pending or projected, and the lanes then search a lexical tier at least as
 //! new as the one readiness counted. Reading readiness after the lanes could
 //! count a body the lanes never searched.
+//!
+//! Readiness itself reads the pipeline upstream first, one statement per
+//! stage: the ingress's pending hints, then the collector outbox, then the
+//! transcript outbox and the events awaiting the body projector (one
+//! statement), then the lexical tier's completeness. Each move downstream
+//! commits in one transaction (a hint settles in the transaction that stages
+//! its outbox rows; a row is admitted in the transaction that appends its
+//! event), so a part that moved between two reads is counted by the later
+//! one. Read downstream first, a part could move past both reads unseen.
 //!
 //! # Collected items
 //!
@@ -201,6 +212,7 @@ pub enum EvidenceDenseLaneV1 {
 }
 
 /// How far ingestion and projection have caught up, as of one read.
+#[allow(clippy::struct_excessive_bools)] // independent readiness facts, serialized as-is
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EvidenceReadinessV1 {
     /// Accepted evidence events the body projector has not consumed yet.
@@ -218,6 +230,11 @@ pub struct EvidenceReadinessV1 {
     /// or when the collector state or the queue cannot be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hints_awaiting_fetch: Option<u64>,
+    /// The schema has the hint queue (migration 36) and this login cannot
+    /// read it: a signed change may be waiting unseen, so absence cannot be
+    /// shown.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hints_unreadable: bool,
     /// The schema has collector state this login cannot read: collected bodies
     /// are withheld from the answer, and absence cannot be shown.
     #[serde(skip_serializing_if = "std::ops::Not::not")]

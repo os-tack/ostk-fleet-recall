@@ -2854,6 +2854,46 @@ async fn evidence_status_within(
     }
 }
 
+/// The collected-item and ingress-hint warnings of one readiness read, in
+/// pipeline order: staged parts, pending hints, then what this login cannot
+/// read.
+fn collector_warnings(readiness: &EvidenceReadinessV1, warnings: &mut Vec<Value>) {
+    if let Some(pending) = readiness
+        .items_awaiting_admission
+        .filter(|pending| *pending > 0)
+    {
+        warnings.push(json!({
+            "code": "evidence_items_pending",
+            "message": format!(
+                "{pending} collected item parts are staged and not yet admitted as evidence; the worker's collect step admits them"
+            ),
+        }));
+    }
+    if let Some(pending) = readiness
+        .hints_awaiting_fetch
+        .filter(|pending| *pending > 0)
+    {
+        warnings.push(json!({
+            "code": "evidence_hints_pending",
+            "message": format!(
+                "{pending} signed provider webhooks name objects not yet re-read; the worker's collect step reads them"
+            ),
+        }));
+    }
+    if readiness.hints_unreadable {
+        warnings.push(json!({
+            "code": "evidence_hints_unreadable",
+            "message": "this login cannot read the ingress hint queue, so a signed provider change may be waiting unseen and an empty answer is unknown; re-apply the runtime grants"
+        }));
+    }
+    if readiness.collector_state_unreadable {
+        warnings.push(json!({
+            "code": "evidence_collector_state_unreadable",
+            "message": "this login cannot read the collector tables, so no collected item is recalled and an empty answer is unknown; re-apply the runtime grants"
+        }));
+    }
+}
+
 /// What an evidence answer's readiness and sources warn about: projection
 /// lag, pending ingest, a disabled dense lane, failed or stale sources, and a
 /// cut listing. The absence verdict carries the same facts as reasons; these
@@ -2878,34 +2918,7 @@ fn evidence_warnings(readiness: &EvidenceReadinessV1, sources: &EvidenceSourcesV
             ),
         }));
     }
-    if let Some(pending) = readiness
-        .items_awaiting_admission
-        .filter(|pending| *pending > 0)
-    {
-        warnings.push(json!({
-            "code": "evidence_items_pending",
-            "message": format!(
-                "{pending} collected item parts are staged and not yet admitted as evidence; the worker's collect step admits them"
-            ),
-        }));
-    }
-    if let Some(pending) = readiness
-        .hints_awaiting_fetch
-        .filter(|pending| *pending > 0)
-    {
-        warnings.push(json!({
-            "code": "evidence_hints_pending",
-            "message": format!(
-                "{pending} signed provider webhooks name objects not yet re-read; the worker's collect step reads them"
-            ),
-        }));
-    }
-    if readiness.collector_state_unreadable {
-        warnings.push(json!({
-            "code": "evidence_collector_state_unreadable",
-            "message": "this login cannot read the collector tables, so no collected item is recalled and an empty answer is unknown; re-apply the runtime grants"
-        }));
-    }
+    collector_warnings(readiness, &mut warnings);
     if !readiness.lexical_current {
         warnings.push(json!({
             "code": "evidence_lexical_projection_lag",
@@ -4665,6 +4678,7 @@ mod tests {
             transcript_turns_awaiting_admission: 0,
             items_awaiting_admission: None,
             hints_awaiting_fetch: None,
+            hints_unreadable: false,
             collector_state_unreadable: false,
             lexical_current: true,
             dense_current: true,
@@ -5233,6 +5247,14 @@ mod tests {
         assert_eq!(
             warning_codes(&evidence_warnings(&unreadable, &healthy)),
             ["evidence_collector_state_unreadable"]
+        );
+        let queue = EvidenceReadinessV1 {
+            hints_unreadable: true,
+            ..current
+        };
+        assert_eq!(
+            warning_codes(&evidence_warnings(&queue, &healthy)),
+            ["evidence_hints_unreadable"]
         );
     }
 

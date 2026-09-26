@@ -53,10 +53,16 @@ const INSERT_REJECTION_SQL: &str = "INSERT INTO public.memory_collector_dead_let
      pg_catalog.statement_timestamp()) \
      ON CONFLICT (tenant_id, project, dead_letter_id) DO NOTHING";
 
+/// Pending hints of the collectors the worker runs: an instance with an
+/// active worker source row.
 const COUNT_PENDING_HINTS_SQL: &str = "SELECT count(*)::INT8 \
-     FROM public.memory_ingress_deliveries_v1 \
-     WHERE tenant_id = $1 AND project = $2 AND state = 'pending' \
-       AND ($3::STRING IS NULL OR provider = $3)";
+     FROM public.memory_ingress_deliveries_v1 AS hint \
+     WHERE hint.tenant_id = $1 AND hint.project = $2 AND hint.state = 'pending' \
+       AND ($3::STRING IS NULL OR hint.provider = $3) \
+       AND EXISTS (SELECT 1 FROM public.memory_collector_sources_v1 AS source \
+          WHERE source.tenant_id = hint.tenant_id AND source.project = hint.project \
+            AND source.collector_instance_id = hint.collector_instance_id \
+            AND source.owner = 'worker' AND source.state = 'active')";
 
 /// What the receiver needs, probed in a transaction that is rolled back.
 const RECEIVER_PROBES: [&str; 2] = [
@@ -289,9 +295,55 @@ impl IngressStoreV1 {
     }
 }
 
+/// What one read of the hint queue found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingHintsV1 {
+    /// The schema predates migration 36: there is no queue, so no hint can
+    /// be pending.
+    Absent,
+    /// The queue exists and this login may not read it: a hint may be
+    /// pending unseen, so absence cannot be shown (fail closed).
+    Unreadable,
+    /// Hints received and not yet settled.
+    Pending(u64),
+}
+
+impl PendingHintsV1 {
+    /// The pending count, when the queue exists and could be read.
+    #[must_use]
+    pub const fn count(self) -> Option<u64> {
+        match self {
+            Self::Pending(count) => Some(count),
+            Self::Absent | Self::Unreadable => None,
+        }
+    }
+
+    /// Whether the queue exists and this login may not read it.
+    #[must_use]
+    pub const fn unreadable(self) -> bool {
+        matches!(self, Self::Unreadable)
+    }
+
+    /// What a failed count's SQLSTATE says about the queue; `None` for a
+    /// failure that says nothing about it.
+    fn of_sqlstate(code: Option<&str>) -> Option<Self> {
+        match code {
+            Some(UNDEFINED_TABLE_SQLSTATE) => Some(Self::Absent),
+            Some(INSUFFICIENT_PRIVILEGE_SQLSTATE) => Some(Self::Unreadable),
+            _ => None,
+        }
+    }
+}
+
 /// Hints received and not yet settled in one scope, of one provider or of
-/// every provider: `None` before migration 36, or when the login cannot read
-/// the queue.
+/// every provider, for a collector the worker runs.
+///
+/// A hint addressed to an instance with no active worker source (retired, or
+/// one the ingress takes webhooks for and the worker never ran) is never
+/// read, so it is not counted, and is still pending if the instance is
+/// configured again. A login that may not read the queue gets [`PendingHintsV1::Unreadable`],
+/// never a count of zero: an unreadable queue fails closed, as unreadable
+/// collector state does.
 ///
 /// # Errors
 ///
@@ -301,7 +353,7 @@ pub async fn count_pending_hints(
     tenant_id: Uuid,
     project: &str,
     provider: Option<&str>,
-) -> Result<Option<u64>> {
+) -> Result<PendingHintsV1> {
     match sqlx::query_scalar::<_, i64>(COUNT_PENDING_HINTS_SQL)
         .bind(tenant_id)
         .bind(project)
@@ -309,16 +361,12 @@ pub async fn count_pending_hints(
         .fetch_one(pool)
         .await
     {
-        Ok(count) => Ok(Some(u64::try_from(count).map_err(|_| {
-            FleetError::Memory("the pending hint count is negative".to_owned())
-        })?)),
-        Err(sqlx::Error::Database(error))
-            if matches!(
-                error.code().as_deref(),
-                Some(INSUFFICIENT_PRIVILEGE_SQLSTATE | UNDEFINED_TABLE_SQLSTATE)
-            ) =>
-        {
-            Ok(None)
+        Ok(count) => Ok(PendingHintsV1::Pending(u64::try_from(count).map_err(
+            |_| FleetError::Memory("the pending hint count is negative".to_owned()),
+        )?)),
+        Err(sqlx::Error::Database(error)) => {
+            let queue = PendingHintsV1::of_sqlstate(error.code().as_deref());
+            queue.ok_or_else(|| sqlx::Error::Database(error).into())
         }
         Err(error) => Err(error.into()),
     }
@@ -374,6 +422,21 @@ mod tests {
         ] {
             assert_ne!(first, other);
         }
+    }
+
+    #[test]
+    fn an_unreadable_queue_is_not_an_empty_one() {
+        assert_eq!(
+            PendingHintsV1::of_sqlstate(Some("42P01")),
+            Some(PendingHintsV1::Absent)
+        );
+        let unreadable = PendingHintsV1::of_sqlstate(Some("42501")).unwrap();
+        assert!(unreadable.unreadable());
+        assert_eq!(unreadable.count(), None);
+        assert_eq!(PendingHintsV1::of_sqlstate(Some("40001")), None);
+        assert_eq!(PendingHintsV1::of_sqlstate(None), None);
+        assert!(!PendingHintsV1::Absent.unreadable());
+        assert_eq!(PendingHintsV1::Pending(3).count(), Some(3));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use sqlx::postgres::{PgPool, PgRow};
 use uuid::Uuid;
 
 use crate::collectors::cockroach::{COUNT_PENDING_SQL, suppressed_body_predicate};
-use crate::collectors::ingress::deliveries::count_pending_hints;
+use crate::collectors::ingress::deliveries::{PendingHintsV1, count_pending_hints};
 use crate::context::FleetScope;
 use crate::coverage_runtime::decode_cursor_row;
 use crate::error::{FleetError, Result};
@@ -500,17 +500,20 @@ impl CockroachEvidenceRecall {
     }
 
     /// Ingestion and projection lag. Read after the sources and before the
-    /// lanes; see the module documentation.
+    /// lanes, and upstream first: hints, the collector outbox, the evidence
+    /// awaiting projection, then the lexical tier (see the module
+    /// documentation).
     async fn read_readiness(
         &self,
         dense_lane: EvidenceDenseLaneV1,
         state: CollectorStateV1,
     ) -> Result<EvidenceReadinessV1> {
-        let row: PgRow = sqlx::query(READINESS_SQL.as_str())
-            .bind(self.tenant_id)
-            .bind(&self.project)
-            .fetch_one(&self.pool)
-            .await?;
+        let hints = match state {
+            CollectorStateV1::Readable => {
+                count_pending_hints(&self.pool, self.tenant_id, &self.project, None).await?
+            }
+            CollectorStateV1::Absent | CollectorStateV1::Unreadable => PendingHintsV1::Absent,
+        };
         let items_awaiting_admission = match state {
             CollectorStateV1::Readable => {
                 let pending: i64 = sqlx::query_scalar(COUNT_PENDING_SQL)
@@ -524,18 +527,18 @@ impl CockroachEvidenceRecall {
             }
             CollectorStateV1::Absent | CollectorStateV1::Unreadable => None,
         };
-        let hints_awaiting_fetch = match state {
-            CollectorStateV1::Readable => {
-                count_pending_hints(&self.pool, self.tenant_id, &self.project, None).await?
-            }
-            CollectorStateV1::Absent | CollectorStateV1::Unreadable => None,
-        };
+        let row: PgRow = sqlx::query(READINESS_SQL.as_str())
+            .bind(self.tenant_id)
+            .bind(&self.project)
+            .fetch_one(&self.pool)
+            .await?;
         let completeness = self.reader(state).completeness().await?;
         Ok(EvidenceReadinessV1 {
             events_awaiting_body_projection: count(&row, "events_awaiting_bodies")?,
             transcript_turns_awaiting_admission: count(&row, "turns_awaiting_admission")?,
             items_awaiting_admission,
-            hints_awaiting_fetch,
+            hints_awaiting_fetch: hints.count(),
+            hints_unreadable: hints.unreadable(),
             collector_state_unreadable: state == CollectorStateV1::Unreadable,
             lexical_current: completeness.lexical_complete(),
             dense_current: completeness.dense_complete(),

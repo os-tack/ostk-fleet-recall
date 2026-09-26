@@ -735,24 +735,27 @@ impl CockroachItemRecall {
     }
 
     /// Collection and projection lag. Read after the sources and before the
-    /// lanes, as evidence recall reads it.
+    /// lanes, and upstream first, as evidence recall reads it: hints, then
+    /// the outbox and the evidence awaiting projection (one statement), then
+    /// the lexical tier.
     async fn read_readiness(
         &self,
         dense_lane: EvidenceDenseLaneV1,
         provider: Option<&str>,
     ) -> Result<ItemReadinessV1> {
+        let hints =
+            count_pending_hints(&self.pool, self.tenant_id, &self.project, provider).await?;
         let row: PgRow = sqlx::query(READINESS_SQL.as_str())
             .bind(self.tenant_id)
             .bind(&self.project)
             .bind(provider)
             .fetch_one(&self.pool)
             .await?;
-        let hints_awaiting_fetch =
-            count_pending_hints(&self.pool, self.tenant_id, &self.project, provider).await?;
         let completeness = self.reader.completeness().await?;
         Ok(ItemReadinessV1 {
             items_awaiting_admission: count(&row, "items_pending")?,
-            hints_awaiting_fetch,
+            hints_awaiting_fetch: hints.count(),
+            hints_unreadable: hints.unreadable(),
             events_awaiting_body_projection: count(&row, "events_awaiting_bodies")?,
             lexical_current: completeness.lexical_complete(),
             dense_current: completeness.dense_complete(),

@@ -706,8 +706,9 @@ memory holds at once. Only then is the hint settled, in the same
 transaction. A fetch that keeps failing backs off and, after eight attempts,
 becomes a `retry_exhausted` dead letter; `collect retry --delivery <hex>`
 reopens it. While a hint waits, evidence and item recall report
-`hints_awaiting_fetch` and an empty answer is `unknown`. A hint never counts
-as coverage: only a pass's complete reads do.
+`hints_awaiting_fetch` and an empty answer is `unknown`; so is one read by a
+login that cannot read the hint queue (`hints_unreadable`). A hint never
+counts as coverage: only a pass's complete reads do.
 
 The receiver runs as its own login, `fleet_ingress`, which may only read and
 insert deliveries and dead letters

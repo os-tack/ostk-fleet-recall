@@ -9,11 +9,13 @@
 //! delivery of another team or organization are refused with at most one
 //! dead letter per instance, reason, and minute; Slack's URL verification is
 //! echoed; a direct message is kept with no ids; a Granola edit leaves an
-//! empty answer unknown until the worker reads the note; a hint whose fetch
-//! keeps failing dies after eight attempts and `collect retry` reopens it; a
-//! hint never writes coverage; the receiver cannot read evidence, content,
-//! items, or the outbox; a database failure answers 503; and the binary
-//! refuses a listen address that is not loopback unless allowed.
+//! empty answer unknown until the worker reads the note; only the hints of a
+//! collector the worker runs count, and a login that cannot read the queue
+//! gets `unknown`, never `absent`; a hint whose fetch keeps failing dies after
+//! eight attempts and `collect retry` reopens it; a hint never writes
+//! coverage; the receiver cannot read evidence, content, items, or the
+//! outbox; a database failure answers 503; and the binary refuses a listen
+//! address that is not loopback unless allowed.
 //!
 //! Every connected test needs `FLEET_RECALL_TEST_DATABASE_URL` and returns at
 //! once without it. No test reaches a provider.
@@ -35,8 +37,8 @@ use ostk_fleet_recall::collectors::ingress::deliveries::IngressStoreV1;
 use ostk_fleet_recall::collectors::ingress::server::{IngressInstancesV1, router, validate_listen};
 use ostk_fleet_recall::collectors::ingress::signature::{sign, standard_webhooks_key};
 use ostk_fleet_recall::evidence_recall::{
-    AbsenceReasonV1, CockroachEvidenceRecall, EvidenceRecall as _, EvidenceSearchV1,
-    probe_evidence_recall,
+    AbsenceReasonV1, AbsenceVerdictV1, CockroachEvidenceRecall, EvidenceRecall as _,
+    EvidenceSearchV1, probe_evidence_recall,
 };
 use ostk_fleet_recall::item_recall::{
     CockroachItemRecall, ItemRecall as _, ItemSearchRequestV1, ItemSearchV1, probe_item_recall,
@@ -633,17 +635,21 @@ impl Harness {
     }
 
     async fn items(&self, provider: &str, query: &str) -> ItemSearchV1 {
+        self.items_as(&self.owner, provider, query).await
+    }
+
+    async fn items_as(&self, pool: &PgPool, provider: &str, query: &str) -> ItemSearchV1 {
         let scope = &self.fixture.installed.scope;
         let capability = probe_item_recall(
-            &self.owner,
+            pool,
             &self.capabilities().await,
             scope,
             Sha256Digest::from_bytes(STUB_MODEL_DIGEST),
         )
         .await
         .unwrap()
-        .expect("the owner may read every item-recall table");
-        CockroachItemRecall::new(capability, self.owner.clone())
+        .expect("the login may read every item-recall table");
+        CockroachItemRecall::new(capability, pool.clone())
             .search(
                 &ItemSearchRequestV1 {
                     query: query.to_owned(),
@@ -658,17 +664,21 @@ impl Harness {
     }
 
     async fn evidence(&self, query: &str) -> EvidenceSearchV1 {
+        self.evidence_as(&self.owner, query).await
+    }
+
+    async fn evidence_as(&self, pool: &PgPool, query: &str) -> EvidenceSearchV1 {
         let scope = &self.fixture.installed.scope;
         let capability = probe_evidence_recall(
-            &self.owner,
+            pool,
             &self.capabilities().await,
             scope,
             Sha256Digest::from_bytes(STUB_MODEL_DIGEST),
         )
         .await
         .unwrap()
-        .expect("the owner may read every evidence table");
-        CockroachEvidenceRecall::new(capability, self.owner.clone())
+        .expect("the login may read every evidence table");
+        CockroachEvidenceRecall::new(capability, pool.clone())
             .search(query, None, 20)
             .await
             .unwrap()
@@ -1248,6 +1258,116 @@ async fn live_the_receiver_refuses_what_it_cannot_verify_when_configured() {
     // The database fails before the commit: 503, so the provider retries.
     harness.receiver.pool.close().await;
     assert_eq!(harness.post_slack(&message("Ev07LATE")).await, 503);
+    harness.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// Readiness: only hints a worker collector reads count; an unreadable queue
+// is unknown
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn live_hint_readiness_counts_worker_collectors_and_fails_closed_when_configured() {
+    let Some(harness) = Harness::new("ingress-readiness").await else {
+        return;
+    };
+    harness.tick(&[SLACK]).await;
+    let ts = harness.message_ts();
+    let changed = harness.slack_event(
+        "Ev07CHG00010",
+        TEAM,
+        &json!({"type": "message", "subtype": "message_changed", "channel": PLATENG,
+                "channel_type": "channel", "ts": slack_ts(harness.base + 600, 1),
+                "message": {"type": "message", "ts": ts, "text": "x"}}),
+    );
+    assert_eq!(harness.post_slack(&changed).await, 200);
+    // A hint for an instance the worker never ran is never read: not counted.
+    let edited = json!({"event_id": "evt_01J8ZC7Q2M5N8P3R6T9V1W4X70", "event_type": "note.edited",
+                        "note_id": NOTE, "occurred_at": iso(harness.now.timestamp())});
+    assert_eq!(
+        harness
+            .post_granola("msg_EXAMPLE0000000000000010", &edited)
+            .await,
+        200
+    );
+    let waiting = harness.evidence(MISSING).await;
+    assert_eq!(waiting.readiness.hints_awaiting_fetch, Some(1));
+    assert!(!waiting.readiness.hints_unreadable);
+
+    // The worker retires the Slack collector: its hint is never read, so it
+    // no longer keeps every empty answer unknown, and still waits.
+    let retire = |state: &'static str| {
+        let owner = harness.owner.clone();
+        let scope = harness.fixture.installed.scope.clone();
+        async move {
+            sqlx::query(
+                "UPDATE memory_collector_sources_v1 SET state = $4 \
+                 WHERE tenant_id = $1 AND project = $2 AND collector_instance_id = $3",
+            )
+            .bind(scope.tenant_id)
+            .bind(&scope.project)
+            .bind(SLACK)
+            .bind(state)
+            .execute(&owner)
+            .await
+            .unwrap();
+        }
+    };
+    retire("retired").await;
+    let retired = harness.evidence(MISSING).await;
+    assert_eq!(retired.readiness.hints_awaiting_fetch, Some(0));
+    assert!(
+        !retired
+            .absence
+            .reasons
+            .contains(&AbsenceReasonV1::IngestOutboxPending),
+        "{:?}",
+        retired.absence
+    );
+    assert_eq!(harness.rows(SLACK).await[0].2, "pending");
+    retire("active").await;
+    assert_eq!(
+        harness
+            .items("slack", MISSING)
+            .await
+            .readiness
+            .hints_awaiting_fetch,
+        Some(1),
+        "configured again, it counts again"
+    );
+
+    // A login that cannot read the queue never reads it as empty.
+    let serve = RuntimeProbeRole::create_serve_writer(&harness.owner, &harness.database_url).await;
+    sqlx::query(&format!(
+        "REVOKE ALL ON TABLE public.memory_ingress_deliveries_v1 FROM {}",
+        serve.name()
+    ))
+    .execute(&harness.owner)
+    .await
+    .unwrap();
+    let blind = harness.evidence_as(&serve.pool, MISSING).await;
+    assert!(blind.readiness.hints_unreadable);
+    assert_eq!(blind.readiness.hints_awaiting_fetch, None);
+    assert_eq!(blind.absence.verdict, AbsenceVerdictV1::Unknown);
+    assert!(
+        blind
+            .absence
+            .reasons
+            .contains(&AbsenceReasonV1::CollectorStateUnreadable),
+        "{:?}",
+        blind.absence
+    );
+    let items = harness.items_as(&serve.pool, "slack", MISSING).await;
+    assert!(items.readiness.hints_unreadable);
+    assert!(
+        items
+            .absence
+            .reasons
+            .contains(&AbsenceReasonV1::CollectorStateUnreadable),
+        "{:?}",
+        items.absence
+    );
+    serve.drop_role(&harness.owner).await;
     harness.finish().await;
 }
 

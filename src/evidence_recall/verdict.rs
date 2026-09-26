@@ -89,7 +89,9 @@ pub fn absence_verdict(
     {
         reasons.insert(AbsenceReasonV1::IngestOutboxPending);
     }
-    if readiness.collector_state_unreadable {
+    // An unreadable hint queue is collector state this login cannot read: a
+    // signed change may be waiting unseen.
+    if readiness.collector_state_unreadable || readiness.hints_unreadable {
         reasons.insert(AbsenceReasonV1::CollectorStateUnreadable);
     }
     if !readiness.lexical_current {
@@ -149,6 +151,7 @@ mod tests {
             transcript_turns_awaiting_admission: 0,
             items_awaiting_admission: None,
             hints_awaiting_fetch: None,
+            hints_unreadable: false,
             collector_state_unreadable: false,
             lexical_current: true,
             dense_current: true,
@@ -403,6 +406,16 @@ mod tests {
         assert_eq!(
             reasons(true, &readiness, &two_healthy()),
             [AbsenceReasonV1::IngestOutboxPending]
+        );
+    }
+
+    #[test]
+    fn a_hint_queue_this_login_cannot_read_is_unknown_never_absent() {
+        let mut readiness = current();
+        readiness.hints_unreadable = true;
+        assert_eq!(
+            reasons(true, &readiness, &two_healthy()),
+            [AbsenceReasonV1::CollectorStateUnreadable]
         );
     }
 

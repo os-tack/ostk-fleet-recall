@@ -93,7 +93,8 @@ Each private runtime uses its own part of these tables:
   claim cites a collected item, and `recall(get)` reads them to expand what a
   claim cites and to list the claims that cite an item (ADR 0008 D11). From
   migration 36 on, evidence and item recall count the hints still awaiting
-  their fetch (`hints_awaiting_fetch`) where the queue is readable. Of
+  their fetch (`hints_awaiting_fetch`) where the queue is readable, and
+  where it is not, an empty answer is `unknown` (`hints_unreadable`). Of
   the other tables from migration 19 onward, it writes only migration 29's
   lifecycle log. Capture adds no migration or grant.
 - Only the private import CLI writes migration 28's rows. No served path
@@ -113,7 +114,8 @@ surface reads. Migration 29 gates the conflict lifecycle, 30 gates
 gates `recall(kind=item)` (ADR 0008 D7), and 35 gates claims that cite
 collected items, which `serve` offers only where `recall(kind=item)` is
 served too (ADR 0008 D11); migrations 32 and 36 gate nothing served (a
-readable queue only adds `hints_awaiting_fetch` to readiness).
+readable queue only adds `hints_awaiting_fetch` to readiness, and an
+unreadable one keeps an empty answer `unknown`).
 Evidence recall reads its collector state (migrations 33 and 34) when it
 finds it readable, and is still served, fail-closed, when it does not; until
 it is readable it checks again on every read, so they need no restart for

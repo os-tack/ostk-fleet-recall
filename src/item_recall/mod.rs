@@ -291,6 +291,10 @@ pub struct ItemReadinessV1 {
     /// cannot read the queue.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hints_awaiting_fetch: Option<u64>,
+    /// The schema has the hint queue and this login cannot read it: an empty
+    /// answer is unknown.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hints_unreadable: bool,
     /// Accepted evidence events the body projector has not consumed yet.
     pub events_awaiting_body_projection: u64,
     /// Every body has been through the lexical projector.
@@ -312,6 +316,7 @@ impl ItemReadinessV1 {
             transcript_turns_awaiting_admission: 0,
             items_awaiting_admission: Some(self.items_awaiting_admission),
             hints_awaiting_fetch: self.hints_awaiting_fetch,
+            hints_unreadable: self.hints_unreadable,
             collector_state_unreadable: false,
             lexical_current: self.lexical_current,
             dense_current: self.dense_current,
@@ -554,6 +559,7 @@ mod tests {
         let readiness = ItemReadinessV1 {
             items_awaiting_admission: 2,
             hints_awaiting_fetch: Some(3),
+            hints_unreadable: false,
             events_awaiting_body_projection: 1,
             lexical_current: true,
             dense_current: false,
@@ -566,5 +572,12 @@ mod tests {
         assert_eq!(evidence.transcript_turns_awaiting_admission, 0);
         assert_eq!(evidence.events_awaiting_body_projection, 1);
         assert!(!evidence.collector_state_unreadable);
+        assert!(!evidence.hints_unreadable);
+        let unreadable = ItemReadinessV1 {
+            hints_awaiting_fetch: None,
+            hints_unreadable: true,
+            ..readiness
+        };
+        assert!(unreadable.as_evidence().hints_unreadable);
     }
 }
