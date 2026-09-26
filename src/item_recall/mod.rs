@@ -405,6 +405,12 @@ pub struct ItemVersionRecordV1 {
     pub lifecycle: ItemLifecycleV1,
     /// Whether this is the presented head's version.
     pub current: bool,
+    /// Why this version's text is withheld when the item as a whole is not:
+    /// the container it was admitted in has since been withdrawn
+    /// (`container_withdrawn`), so its text, title, and author are not shown,
+    /// as evidence recall withholds its bodies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppressed: Option<ItemSuppressionV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -19,12 +19,15 @@
 //! head, inserts the `memory.claim.accepted` event, and runs
 //! [`ClaimAssertProjection`], which in that same transaction:
 //!
-//! 1. re-audits every support event ID against this scope's ledger, and
-//!    refuses a cited item hidden since it was resolved;
+//! 1. re-audits every support event ID against this scope's ledger, and,
+//!    where claim item links are served, refuses any support event that is a
+//!    collected item hidden from recall now (cited through `support_items`
+//!    or listed directly);
 //! 2. reserves the idempotency receipt, naming the event;
 //! 3. checks the active embedding model;
 //! 4. writes the claim projection `record` writes, plus the event's ID, and
-//!    one private link per cited item part;
+//!    one private link per cited item part, a directly listed collected-item
+//!    event included;
 //! 5. runs the unchanged functional-value conflict detector;
 //! 6. writes the `claim_recorded` audit event, naming the event;
 //! 7. completes the receipt with the committed response.
@@ -67,7 +70,7 @@ use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
 
 use super::item_links::{
-    CitationV1, ResolvedItemV1, audit_cited_items, insert_assert_links, item_support_unavailable,
+    CitationV1, ResolvedItemV1, audit_cited_events, insert_assert_links, item_support_unavailable,
     resolve_citations,
 };
 use super::lifecycle_store::{Replayable, bounded_ids};
@@ -206,6 +209,7 @@ pub(super) async fn assert_claim(
             .support_evidence_event_ids
             .clone(),
         cited_items,
+        links_served: ledger.claim_item_links.is_some(),
         outcome: Mutex::new(None),
     });
     let appended = assert
@@ -463,6 +467,9 @@ struct ClaimAssertProjection {
     /// The collected items the assertion cites, resolved before admission;
     /// their events are among `support_event_ids`.
     cited_items: Vec<ResolvedItemV1>,
+    /// This ledger serves claim item links: the collected-item tables are
+    /// readable, so every support event is audited against them and linked.
+    links_served: bool,
     outcome: Mutex<Option<ProjectionOutcome>>,
 }
 
@@ -495,9 +502,20 @@ impl ClaimAssertProjection {
         let event_bytes = digest_bytes(event_id.digest());
 
         // 1. Every support event must already be accepted in this scope, and
-        //    no cited item may have been hidden since it was resolved.
+        //    none may be a collected item hidden from recall now, whether it
+        //    was cited through support_items or listed directly.
         self.audit_support(transaction).await?;
-        audit_cited_items(transaction, scope, &self.cited_items).await?;
+        let direct_items = if self.links_served {
+            audit_cited_events(
+                transaction,
+                scope,
+                &self.support_event_ids,
+                &self.cited_items,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
 
         // 2. Reserve the key. A conflict means another transaction holds it.
         let reserved = sqlx::query_scalar::<_, String>(RESERVE_ASSERT_RECEIPT_SQL)
@@ -526,14 +544,15 @@ impl ClaimAssertProjection {
             None,
         )
         .await?;
-        insert_assert_links(
-            transaction,
-            scope,
-            claim.id,
-            event_id.digest(),
-            &self.cited_items,
-        )
-        .await?;
+        if self.links_served {
+            let linked: Vec<ResolvedItemV1> = self
+                .cited_items
+                .iter()
+                .chain(&direct_items)
+                .cloned()
+                .collect();
+            insert_assert_links(transaction, scope, claim.id, event_id.digest(), &linked).await?;
+        }
         let (conflicts_opened, conflict_detection) =
             detect_and_observe(transaction, scope, &mut claim, &self.input, &self.prepared).await?;
         let mut payload =

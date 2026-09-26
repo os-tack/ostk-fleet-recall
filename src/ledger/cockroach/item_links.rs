@@ -14,7 +14,14 @@
 //!   `stage_only` capture, a drain still to run) as `support_item_pending`;
 //! * one whose item is hidden from recall (its presented head a tombstone,
 //!   its container or the item withdrawn), or that names a tombstone
-//!   version, as `support_item_withdrawn`.
+//!   version or one admitted in a container since withdrawn, as
+//!   `support_item_withdrawn`.
+//!
+//! A URL names the item a verified channel admitted under it before any a
+//! capture or an import reported, so an agent's capture cannot take over a
+//! collected item's permalink. An assertion that lists a collected item's
+//! accepted event directly in `support_evidence_event_ids` is audited by the
+//! same rule in its append transaction, and linked like a citation.
 //!
 //! Each cited part gets one row in the private `memory_claim_item_links_v1`,
 //! keyed by the claim and the part's event: `via = 'assert'` rows name the
@@ -34,6 +41,7 @@ use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{PgConnection, Row as _};
 
 use super::protocol_error;
+use crate::evidence_recall::ContentTrustV1;
 use crate::item_recall::ItemSuppressionV1;
 use crate::ledger::lifecycle::{LifecycleRefusal, RefusalCode};
 use crate::ledger::{
@@ -57,11 +65,13 @@ const ASSERT_RELATION: &str = "supports";
 /// at most 64 parts each, plus one row to tell a cut read.
 const MAX_CLAIM_LINK_ROWS: i64 = 32 * 64 + 1;
 
-/// The item a provider URL names: the one at the greatest provider order, as
-/// `recall(get, kind=item)` resolves it (`memory_collected_items_url_idx`).
+/// The item a provider URL names (`memory_collected_items_url_idx`), as
+/// `recall(get, kind=item)` resolves it: an item a verified channel admitted
+/// under that URL first, then the greatest provider order. A capture's URL is
+/// the agent's word, so it can never take a verified item's permalink over.
 const ITEM_BY_URL_SQL: &str = "SELECT item_key_digest FROM public.memory_collected_items_v1 \
      WHERE tenant_id = $1 AND project = $2 AND provider_url = $3 \
-     ORDER BY provider_order DESC, item_key_digest LIMIT 1";
+     ORDER BY (trust_tier = 'verified') DESC, provider_order DESC, item_key_digest LIMIT 1";
 
 /// The item a version id belongs to. A version key has no index of its own,
 /// so this reads the scope's item history, as a get by version URI does.
@@ -95,12 +105,45 @@ const PRESENTED_HEAD_SQL: &str = "SELECT head.version_key_digest, head.trust_tie
        AND head.presented";
 
 /// One admitted part per ordinal of a version (`memory_collected_items_version_idx`):
-/// the tier `$5`'s copy first, then the earliest admitted.
-const VERSION_PARTS_SQL: &str = "SELECT DISTINCT ON (part_ordinal) part_ordinal, part_count, \
-     accepted_event_id, lifecycle \
-     FROM public.memory_collected_items_v1 \
-     WHERE tenant_id = $1 AND project = $2 AND item_key_digest = $3 AND version_key_digest = $4 \
-     ORDER BY part_ordinal, (trust_tier = $5) DESC, admitted_at, accepted_event_id";
+/// the tier `$5`'s copy first, then the earliest admitted; with whether the
+/// container that part was admitted in is withdrawn now.
+const VERSION_PARTS_SQL: &str = "SELECT DISTINCT ON (item.part_ordinal) item.part_ordinal, \
+     item.part_count, item.accepted_event_id, item.lifecycle, \
+     COALESCE(container.access <> 'ok', false) AS container_withdrawn \
+     FROM public.memory_collected_items_v1 AS item \
+     LEFT JOIN public.memory_collector_containers_v1 AS container \
+       ON container.tenant_id = item.tenant_id AND container.project = item.project \
+      AND container.container_key = item.container_key \
+     WHERE item.tenant_id = $1 AND item.project = $2 AND item.item_key_digest = $3 \
+       AND item.version_key_digest = $4 \
+     ORDER BY item.part_ordinal, (item.trust_tier = $5) DESC, item.admitted_at, \
+              item.accepted_event_id";
+
+/// The collected-item rows of a set of accepted events (the primary key),
+/// each with what hides it now: its item's presented head a tombstone, the
+/// head's container or its own withdrawn, or the item withdrawn. Rows of an
+/// item with no presented head carry a NULL head lifecycle.
+const CITED_EVENTS_SQL: &str = "SELECT item.accepted_event_id, item.item_key_digest, \
+     item.version_key_digest, item.part_ordinal, item.object_kind, \
+     head.lifecycle AS head_lifecycle, head_container.access AS head_container_access, \
+     COALESCE(own_container.access <> 'ok', false) AS own_container_withdrawn, \
+     EXISTS (SELECT 1 FROM public.memory_collected_item_withdrawals_v1 AS withdrawal \
+        WHERE withdrawal.tenant_id = $1 AND withdrawal.project = $2 \
+          AND withdrawal.item_key_digest = item.item_key_digest AND withdrawal.withdrawn) \
+        AS item_withdrawn \
+     FROM public.memory_collected_items_v1 AS item \
+     LEFT JOIN public.memory_collected_item_heads_v1 AS head \
+       ON head.tenant_id = item.tenant_id AND head.project = item.project \
+      AND head.item_key_digest = item.item_key_digest AND head.presented \
+     LEFT JOIN public.memory_collector_containers_v1 AS head_container \
+       ON head_container.tenant_id = head.tenant_id AND head_container.project = head.project \
+      AND head_container.container_key = head.container_key \
+     LEFT JOIN public.memory_collector_containers_v1 AS own_container \
+       ON own_container.tenant_id = item.tenant_id AND own_container.project = item.project \
+      AND own_container.container_key = item.container_key \
+     WHERE item.tenant_id = $1 AND item.project = $2 \
+       AND item.accepted_event_id = ANY($3::BYTES[]) \
+     ORDER BY item.item_key_digest, item.version_key_digest, item.part_ordinal";
 
 /// One citation's link rows: every cited part, in one statement.
 const INSERT_LINKS_SQL: &str = "INSERT INTO public.memory_claim_item_links_v1 (\
@@ -124,6 +167,7 @@ const CLAIM_LINKS_SQL: &str = "SELECT link.link_id, link.via, link.relation, \
      item.provider_url, item.lifecycle, \
      head.version_key_digest AS head_version_key, head.lifecycle AS head_lifecycle, \
      container.access AS container_access, \
+     COALESCE(own_container.access <> 'ok', false) AS own_container_withdrawn, \
      EXISTS (SELECT 1 FROM public.memory_collected_item_withdrawals_v1 AS withdrawal \
         WHERE withdrawal.tenant_id = $1 AND withdrawal.project = $2 \
           AND withdrawal.item_key_digest = link.item_key_digest AND withdrawal.withdrawn) \
@@ -138,6 +182,9 @@ const CLAIM_LINKS_SQL: &str = "SELECT link.link_id, link.via, link.relation, \
      LEFT JOIN public.memory_collector_containers_v1 AS container \
        ON container.tenant_id = head.tenant_id AND container.project = head.project \
       AND container.container_key = head.container_key \
+     LEFT JOIN public.memory_collector_containers_v1 AS own_container \
+       ON own_container.tenant_id = item.tenant_id AND own_container.project = item.project \
+      AND own_container.container_key = item.container_key \
      WHERE link.tenant_id = $1 AND link.project = $2 AND link.claim_id = $3 \
      ORDER BY link.created_at, link.link_id, link.part_ordinal \
      LIMIT $4";
@@ -367,9 +414,11 @@ async fn resolve_one(
     let mut parts = Vec::with_capacity(rows.len());
     let mut part_count = None;
     let mut tombstone = false;
+    let mut container_withdrawn = false;
     for row in &rows {
         let lifecycle: String = row.try_get("lifecycle")?;
         tombstone |= ItemLifecycleV1::parse(&lifecycle)?.is_tombstone();
+        container_withdrawn |= row.try_get::<bool, _>("container_withdrawn")?;
         part_count = Some(row.try_get::<i64, _>("part_count")?);
         parts.push((
             row.try_get::<i64, _>("part_ordinal")?,
@@ -395,6 +444,11 @@ async fn resolve_one(
     }
     if tombstone {
         return Ok(ResolutionV1::Hidden(ItemSuppressionV1::Deleted));
+    }
+    // A version admitted in a container since withdrawn is withheld from
+    // every recall lane, even when the item moved to a readable one.
+    if container_withdrawn {
+        return Ok(ResolutionV1::Hidden(ItemSuppressionV1::ContainerWithdrawn));
     }
     Ok(ResolutionV1::Resolved(ResolvedItemV1 {
         item_key,
@@ -478,41 +532,92 @@ pub(super) async fn resolve_citations(
     Ok(resolved)
 }
 
-/// Re-check, in the append transaction, that no cited item was hidden since
-/// it was resolved: a presented head that became a tombstone, or a container
-/// or item withdrawn in between, refuses the claim as
-/// `support_item_withdrawn`.
+/// Audit, in the append transaction, every support event of an assertion
+/// that a collected item admitted: whether it cites the item through
+/// `support_items` or lists the event in `support_evidence_event_ids`
+/// directly. An event whose item is hidden from recall now (its presented
+/// head a tombstone, the head's container or the event's own container
+/// withdrawn, the item withdrawn) refuses the claim as
+/// `support_item_withdrawn`, so nothing deletion or a withdrawal hides can
+/// become a claim's support by any route.
+///
+/// Returns the directly listed events that no `cited` version covers, one
+/// entry per item version, so they are linked like a citation and the item
+/// lists the claim. A collector's own observation is audited but not linked.
 ///
 /// # Errors
 ///
 /// That refusal, or a database failure.
-pub(super) async fn audit_cited_items(
+pub(super) async fn audit_cited_events(
     connection: &mut PgConnection,
     scope: &FleetScope,
-    items: &[ResolvedItemV1],
-) -> Result<()> {
-    let keys: BTreeSet<Sha256Digest> = items.iter().map(|item| item.item_key).collect();
-    for item_key in keys {
-        let suppressed = match presented_head(connection, scope, item_key).await? {
-            Some(head) => head.suppressed,
-            // Admitted parts never leave the history, and a head, once
-            // written, is only ever moved; a missing one is a contradiction.
-            None => return Err(protocol_error("a cited item lost its presented head")),
+    events: &[AcceptedEventId],
+    cited: &[ResolvedItemV1],
+) -> Result<Vec<ResolvedItemV1>> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted: Vec<Vec<u8>> = events.iter().map(|event| bytes(event.digest())).collect();
+    let rows: Vec<PgRow> = sqlx::query(CITED_EVENTS_SQL)
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(&wanted)
+        .fetch_all(&mut *connection)
+        .await?;
+    let cited_versions: BTreeSet<Sha256Digest> =
+        cited.iter().map(|item| item.version_key).collect();
+    let mut direct: Vec<ResolvedItemV1> = Vec::new();
+    for row in &rows {
+        let event = digest_of(row, "accepted_event_id")?;
+        let item_key = digest_of(row, "item_key_digest")?;
+        let item_withdrawn: bool = row.try_get("item_withdrawn")?;
+        let head_lifecycle: Option<String> = row.try_get("head_lifecycle")?;
+        let head_access: Option<String> = row.try_get("head_container_access")?;
+        // A part of a version not yet whole may have no presented head; its
+        // own container and the item's withdrawal still hide it.
+        let by_head = match head_lifecycle {
+            Some(lifecycle) => suppression(
+                ItemLifecycleV1::parse(&lifecycle)?,
+                head_access.as_deref(),
+                item_withdrawn,
+            ),
+            None => item_withdrawn.then_some(ItemSuppressionV1::ItemWithdrawn),
         };
+        let own_withdrawn: bool = row.try_get("own_container_withdrawn")?;
+        let suppressed =
+            by_head.or_else(|| own_withdrawn.then_some(ItemSuppressionV1::ContainerWithdrawn));
         if let Some(suppressed) = suppressed {
             return Err(LifecycleRefusal::new(
                 RefusalCode::SupportItemWithdrawn,
                 format!(
-                    "a cited collected item was withheld from recall ({}) before the claim was \
-                     written; nothing was written",
+                    "a support event is a collected item withheld from recall ({}); nothing was \
+                     written",
                     suppression_label(suppressed)
                 ),
-                json!({ "item_id": item_key, "suppressed": suppressed }),
+                json!({ "item_id": item_key, "event_id": event, "suppressed": suppressed }),
             )
             .into());
         }
+        let version_key = digest_of(row, "version_key_digest")?;
+        let object_kind: String = row.try_get("object_kind")?;
+        if cited_versions.contains(&version_key) || object_kind == "collector_observation" {
+            continue;
+        }
+        let part = (row.try_get::<i64, _>("part_ordinal")?, event);
+        match direct.last_mut() {
+            // Rows are sorted by item and version, so a version's rows are
+            // contiguous.
+            Some(last) if last.item_key == item_key && last.version_key == version_key => {
+                last.parts.push(part);
+            }
+            _ => direct.push(ResolvedItemV1 {
+                item_key,
+                version_key,
+                parts: vec![part],
+            }),
+        }
     }
-    Ok(())
+    Ok(direct)
 }
 
 /// A fresh random link id.
@@ -675,7 +780,7 @@ pub(super) async fn claim_item_support(
         let head_version = optional_digest(row, "head_version_key")?;
         let head_lifecycle: Option<String> = row.try_get("head_lifecycle")?;
         let access: Option<String> = row.try_get("container_access")?;
-        let suppressed = match head_lifecycle {
+        let by_head = match head_lifecycle {
             Some(lifecycle) => suppression(
                 ItemLifecycleV1::parse(&lifecycle)?,
                 access.as_deref(),
@@ -683,6 +788,12 @@ pub(super) async fn claim_item_support(
             ),
             None => None,
         };
+        // The cited version's own container, as evidence recall judges its
+        // bodies: a version admitted where the audience has since narrowed
+        // is withheld even when the item now lives somewhere readable.
+        let own_withdrawn: bool = row.try_get("own_container_withdrawn")?;
+        let suppressed =
+            by_head.or_else(|| own_withdrawn.then_some(ItemSuppressionV1::ContainerWithdrawn));
         let cited = CitedItemV1 {
             link_id: hex::encode(&link_id),
             via: row.try_get("via")?,
@@ -697,6 +808,7 @@ pub(super) async fn claim_item_support(
             current: head_version == Some(version_key),
             suppressed,
             accepted_event_ids: vec![event],
+            content_trust: ContentTrustV1::UntrustedThirdParty,
         };
         order.push(link_id.clone());
         citations.insert(
@@ -707,11 +819,29 @@ pub(super) async fn claim_item_support(
             },
         );
     }
-    let independent: BTreeSet<Sha256Digest> = citations
-        .values()
-        .filter(|citation| citation.cited.suppressed.is_none())
-        .map(|citation| citation.content_digest)
-        .collect();
+    // One source per item: two versions of one message are one source, its
+    // current version's content when that is cited. Then identical content
+    // across items (an echo, a cross-post) counts once.
+    let mut per_item: BTreeMap<Sha256Digest, (bool, Sha256Digest)> = BTreeMap::new();
+    for link_id in &order {
+        let Some(citation) = citations.get(link_id) else {
+            continue;
+        };
+        if citation.cited.suppressed.is_some() {
+            continue;
+        }
+        let candidate = (citation.cited.current, citation.content_digest);
+        per_item
+            .entry(citation.cited.item_id)
+            .and_modify(|chosen| {
+                if candidate.0 && !chosen.0 {
+                    *chosen = candidate;
+                }
+            })
+            .or_insert(candidate);
+    }
+    let independent: BTreeSet<Sha256Digest> =
+        per_item.values().map(|(_, digest)| *digest).collect();
     let items = order
         .iter()
         .filter_map(|link_id| citations.remove(link_id))

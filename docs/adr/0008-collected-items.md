@@ -509,10 +509,14 @@ Per-principal audiences, with clearance checked inside SQL, are deferred.
   instance, attester, trust tier, admission time, accepted event), the
   presented version's outbound links, and the visible items whose presented
   version links to its provider URL (`memory_collected_item_links_target_idx`).
-  A get by version URI or URL also names the version it matched. A hidden
-  item's answer says why (`deleted`, `container_withdrawn`,
-  `item_withdrawn`) and is metadata only: no title, author name, text, or
-  outbound link. At most 384 KiB of text is returned; later parts carry
+  A get by version URI or URL also names the version it matched; a URL names
+  an item a verified channel admitted under it before any a capture or an
+  import reported. A hidden item's answer says why (`deleted`,
+  `container_withdrawn`, `item_withdrawn`) and is metadata only: no title,
+  author name, text, or outbound link. A version admitted in a container
+  since withdrawn is judged by its own container, as evidence recall judges
+  its bodies: it is metadata only with `suppressed: container_withdrawn`,
+  even when the item has moved to a container that is still readable. At most 384 KiB of text is returned; later parts carry
   their metadata and the answer says it was cut.
 - **Untrusted text.** Every hit and `get` is `content_trust:
   untrusted_third_party`. The text is decoded from the body envelope, which
@@ -885,7 +889,11 @@ what a claim rests on (`src/ledger/cockroach/item_links.rs`, migration 35).
   exactly one of `{item_id}` (the item's presented version is cited),
   `{version_id}` (exactly that version), or `{url}` (the presented version of
   the item whose `https` provider URL it is), as `recall(kind=item)` and
-  `remember(capture)` return them; at most 32 per claim.
+  `remember(capture)` return them; at most 32 per claim. A URL names an item
+  a verified channel admitted under it before any a capture or an import
+  reported, then the greatest provider order, as `recall(get, kind=item)`
+  resolves it: a capture's URL is the agent's word, so a reported item can
+  never take a collected item's permalink over.
 - **Resolution,** always in the claim's own `(tenant_id, project)`: the
   version's parts, one admitted part per ordinal (the presented tier's copy
   first, then the earliest admitted), and only a whole version. A reference
@@ -894,7 +902,9 @@ what a claim rests on (`src/ledger/cockroach/item_links.rs`, migration 35).
   admitted (a `stage_only` capture, a drain still to run) as
   `support_item_pending`; one whose item is hidden from recall (its presented
   head a tombstone, its container or the item withdrawn; D5, D6), or that
-  names a tombstone version, as `support_item_withdrawn`, with
+  names a tombstone version or a version admitted in a container since
+  withdrawn (the rule evidence recall applies to that version's bodies, even
+  when the item moved somewhere readable), as `support_item_withdrawn`, with
   `details.suppressed`. A collector's own coverage observation is never an
   item, so it is unknown. A ledger that does not serve claim item links
   refuses any citation as `item_support_unavailable`. Every refusal names the
@@ -903,10 +913,14 @@ what a claim rests on (`src/ledger/cockroach/item_links.rs`, migration 35).
   into `support_evidence_event_ids` (sorted, without duplicates, within the
   route's bound of 256), so the accepted statement cites events only and the
   claim contract does not change. The append transaction runs the unchanged
-  audit (every support event accepted in this scope) and checks again that no
-  cited item was hidden since it was resolved; the projection then writes one
-  link per cited part (`via = 'assert'`, naming the claim's own accepted
-  event). Citing one version twice is one citation. The receipt binds the
+  audit (every support event accepted in this scope), then reads every
+  support event that a collected item admitted, whether it came from
+  `support_items` or was listed in `support_evidence_event_ids` directly
+  (the capture answer's `accepted_event_ids` invite that), and refuses the
+  claim as `support_item_withdrawn` when any is hidden from recall now; the
+  projection then writes one link per cited part (`via = 'assert'`, naming
+  the claim's own accepted event), a directly listed event's included, so
+  the item lists the claim. Citing one version twice is one citation. The receipt binds the
   assertion as sent, `support_items` included; an assertion without them
   serializes, and binds its receipt, exactly as before.
 - **Record** resolves the citations inside its serializable transaction.
@@ -923,9 +937,13 @@ what a claim rests on (`src/ledger/cockroach/item_links.rs`, migration 35).
   relation, item and version ids, provider, object kind, external id,
   provider URL, the trust tier its parts came through, whether the version
   cited is still the item's presented one, why the item is hidden now if it
-  is, and the accepted events; and `independent_sources`, the count of
-  distinct content digests among the visible cited items, so an echo or a
-  cross-post counts once. A claim that cites nothing reads as before.
+  is (its own container's withdrawal included), the accepted events, and
+  `content_trust: "untrusted_third_party"` (the ids and URL are a
+  provider's, an importer's, or an agent's strings); and
+  `independent_sources`: each visible cited item counts once however many of
+  its versions are cited (its current version's content when that is cited),
+  then identical content across items counts once, so an echo or a
+  cross-post does too. A claim that cites nothing reads as before.
   `recall(get, kind=item)` lists the claims that cite the item (`cited_by`:
   claim id, `via`, relation, version, the claim's state, and when; at most
   256). A superseded or retracted claim keeps its citations: the links are
@@ -960,7 +978,8 @@ closed by a drift guard.
 readable by the publication reader, which would then learn which private
 item a claim rests on. Citing a partially admitted version: its missing parts
 may never be admitted, and a claim would rest on text no one can read back.
-Re-checking every directly cited event for a hidden item: the audit of
-`support_evidence_event_ids` stays what it was, and only citations made
-through items are checked again. Per-principal audiences on citations are
+Auditing only citations made through `support_items`: the capture answer
+names each item's accepted events for an assertion to cite, so a hidden
+item's event listed directly would otherwise support a new claim that
+deletion hides everywhere else. Per-principal audiences on citations are
 deferred with the item audiences they would follow.

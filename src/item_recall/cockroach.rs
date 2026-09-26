@@ -204,11 +204,14 @@ const RESOLVE_URI_SQL: &str = "SELECT item_key_digest, version_key_digest \
      ORDER BY accepted_event_id LIMIT 1";
 
 /// The item and version a provider URL names (`memory_collected_items_url_idx`):
-/// the one at the greatest provider order.
+/// one a verified channel admitted under that URL first, then the greatest
+/// provider order. A capture's URL is the agent's word, so it never takes a
+/// collected item's permalink over (claim citations resolve URLs the same).
 const RESOLVE_URL_SQL: &str = "SELECT item_key_digest, version_key_digest \
      FROM public.memory_collected_items_v1 \
      WHERE tenant_id = $1 AND project = $2 AND provider_url = $3 \
-     ORDER BY provider_order DESC, item_key_digest, version_key_digest LIMIT 1";
+     ORDER BY (trust_tier = 'verified') DESC, provider_order DESC, item_key_digest, \
+              version_key_digest LIMIT 1";
 
 /// The presented head of one item, with its container's access and whether
 /// the item is withdrawn for either tier.
@@ -229,16 +232,24 @@ const PRESENTED_HEAD_SQL: &str = "SELECT head.trust_tier, head.version_key_diges
 /// One item's admitted parts (`memory_collected_items_version_idx`): the
 /// presented version `$5` first, so a cut at the bound only ever drops older
 /// history, then the greatest provider order; one row past the bound. Each
-/// version's rows are contiguous.
-const HISTORY_SQL: &str = "SELECT accepted_event_id, version_key_digest, part_ordinal, \
-     part_count, collection_mode, trust_tier, collector_instance_id, attester_principal_id, \
-     lifecycle, version_marker, provider_order, thread_root_external_id, provider_url, \
-     provider_created_at, provider_updated_at, canonical_resource_id, body_content_id, \
-     admitted_at \
-     FROM public.memory_collected_items_v1 \
-     WHERE tenant_id = $1 AND project = $2 AND item_key_digest = $3 \
-     ORDER BY (version_key_digest = $5) DESC, provider_order DESC, version_key_digest, \
-              part_ordinal, admitted_at, accepted_event_id \
+/// version's rows are contiguous. Each row says whether its own container
+/// (the one that version was admitted in, not the head's) is withdrawn, the
+/// rule evidence recall applies to every body.
+const HISTORY_SQL: &str = "SELECT item.accepted_event_id, item.version_key_digest, \
+     item.part_ordinal, item.part_count, item.collection_mode, item.trust_tier, \
+     item.collector_instance_id, item.attester_principal_id, item.lifecycle, \
+     item.version_marker, item.provider_order, item.thread_root_external_id, \
+     item.provider_url, item.provider_created_at, item.provider_updated_at, \
+     item.canonical_resource_id, item.body_content_id, item.admitted_at, \
+     COALESCE(container.access <> 'ok', false) AS container_withdrawn \
+     FROM public.memory_collected_items_v1 AS item \
+     LEFT JOIN public.memory_collector_containers_v1 AS container \
+       ON container.tenant_id = item.tenant_id AND container.project = item.project \
+      AND container.container_key = item.container_key \
+     WHERE item.tenant_id = $1 AND item.project = $2 AND item.item_key_digest = $3 \
+     ORDER BY (item.version_key_digest = $5) DESC, item.provider_order DESC, \
+              item.version_key_digest, item.part_ordinal, item.admitted_at, \
+              item.accepted_event_id \
      LIMIT $4";
 
 /// Bodies one `get` reads per statement while its text budget lasts.
@@ -568,6 +579,8 @@ struct HistoryRowV1 {
     uri: String,
     body: Sha256Digest,
     admitted_at: DateTime<Utc>,
+    /// The container this row was admitted in is withdrawn now.
+    container_withdrawn: bool,
 }
 
 impl HistoryRowV1 {
@@ -594,6 +607,7 @@ impl HistoryRowV1 {
             uri: row.try_get("canonical_resource_id")?,
             body: digest(row, "body_content_id")?,
             admitted_at: row.try_get("admitted_at")?,
+            container_withdrawn: row.try_get("container_withdrawn")?,
         })
     }
 }
@@ -1154,7 +1168,11 @@ fn version_record(
     let lead = representatives
         .iter()
         .find_map(|part| envelopes.get(&part.body));
-    let show = with_text && !first.lifecycle.is_tombstone();
+    // A version admitted in a container since withdrawn is withheld as
+    // evidence recall withholds its bodies, even when the item moved to a
+    // container that is still readable.
+    let withdrawn = representatives.iter().any(|part| part.container_withdrawn);
+    let show = with_text && !first.lifecycle.is_tombstone() && !withdrawn;
     let parts = representatives
         .iter()
         .map(|part| {
@@ -1187,6 +1205,7 @@ fn version_record(
         order: first.order,
         lifecycle: first.lifecycle,
         current: version.version_key == presented.version_key,
+        suppressed: withdrawn.then_some(ItemSuppressionV1::ContainerWithdrawn),
         title: lead.filter(|_| show).and_then(recalled_title),
         author: lead.filter(|_| show).and_then(author_of),
         created_at: first.created_at,
@@ -1278,7 +1297,11 @@ impl ItemRecall for CockroachItemRecall {
             bodies.extend(
                 versions
                     .iter()
-                    .flat_map(|version| version.representatives(head.tier))
+                    .map(|version| version.representatives(head.tier))
+                    // A version whose own container is withdrawn shows no
+                    // text, so none of its bodies is read.
+                    .filter(|parts| !parts.iter().any(|part| part.container_withdrawn))
+                    .flatten()
                     .filter(|part| !part.lifecycle.is_tombstone() && part.body != lead_body)
                     .map(|part| part.body),
             );
@@ -1439,7 +1462,50 @@ mod tests {
             uri: format!("urn:part:{event}"),
             body: key(event),
             admitted_at: DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+            container_withdrawn: false,
         }
+    }
+
+    #[test]
+    fn a_version_admitted_in_a_withdrawn_container_shows_no_text() {
+        let presented = PresentedHeadV1 {
+            tier: TrustTierV1::Verified,
+            version_key: key(2),
+            lifecycle: ItemLifecycleV1::Live,
+            disagreement: false,
+            provider: "slack".into(),
+            provider_scope_id: "T07ACME0001".into(),
+            object_kind: "message".into(),
+            external_id: "C07BBBBBBB2:1790006860.001100".into(),
+            container_label: None,
+            suppressed: None,
+        };
+        let mut withdrawn = history_row(0, TrustTierV1::Verified, 20);
+        withdrawn.container_withdrawn = true;
+        let version = VersionRowsV1 {
+            version_key: key(1),
+            rows: vec![withdrawn],
+        };
+        let mut budget = TextBudgetV1 {
+            remaining: MAX_ITEM_GET_TEXT_BYTES,
+            exhausted: false,
+        };
+        let record = version_record(&version, &presented, &HashMap::new(), true, &mut budget);
+        assert_eq!(
+            record.suppressed,
+            Some(ItemSuppressionV1::ContainerWithdrawn)
+        );
+        assert!(record.parts.iter().all(|part| part.text.is_none()));
+        assert!(record.title.is_none() && record.author.is_none());
+        // Withheld, not cut: the answer says why, and the budget is untouched.
+        assert!(!budget.exhausted);
+
+        let readable = VersionRowsV1 {
+            version_key: key(1),
+            rows: vec![history_row(0, TrustTierV1::Verified, 21)],
+        };
+        let record = version_record(&readable, &presented, &HashMap::new(), true, &mut budget);
+        assert_eq!(record.suppressed, None);
     }
 
     #[test]

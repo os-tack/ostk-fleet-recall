@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 
+use crate::evidence_recall::ContentTrustV1;
 use crate::item_recall::ItemSuppressionV1;
 use crate::ledger::{canonical_json, normalize_key_part};
 use crate::memory_contracts::bootstrap::EpochId;
@@ -228,6 +229,9 @@ pub struct CitedItemV1 {
     pub suppressed: Option<ItemSuppressionV1>,
     /// The accepted evidence events of the cited parts, in part order.
     pub accepted_event_ids: Vec<Sha256Digest>,
+    /// Always `untrusted_third_party`: the ids, URL, and kinds above are a
+    /// provider's, an importer's, or an agent's strings, to read as data.
+    pub content_trust: ContentTrustV1,
 }
 
 /// The collected items one claim cites (ADR 0008 D11).
@@ -235,8 +239,10 @@ pub struct CitedItemV1 {
 pub struct ClaimItemSupportV1 {
     /// Each citation, oldest first.
     pub items: Vec<CitedItemV1>,
-    /// Distinct contents among the cited items still visible: items with
-    /// identical text (an echo, a cross-post, a copy) count once.
+    /// Distinct contents among the cited items still visible: each item
+    /// counts once however many of its versions are cited (its current one's
+    /// content when that is cited), and items with identical text (an echo,
+    /// a cross-post, a copy) count once.
     pub independent_sources: u64,
     /// The claim has more link rows than one read returns.
     #[serde(skip_serializing_if = "std::ops::Not::not")]

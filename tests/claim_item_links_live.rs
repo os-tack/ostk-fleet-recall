@@ -28,7 +28,8 @@ use ostk_fleet_recall::collectors::sink::{
     CollectedItemSink, ContainerObservationV1, StageContextV1, StageDraftV1, StagedItemV1,
 };
 use ostk_fleet_recall::item_recall::{
-    CockroachItemRecall, ItemGetV1, ItemRecall as _, ItemReferenceV1, probe_item_recall,
+    CockroachItemRecall, ItemGetV1, ItemRecall as _, ItemReferenceV1, ItemSuppressionV1,
+    probe_item_recall,
 };
 use ostk_fleet_recall::ledger::{
     AssertedClaimMutation, ClaimInput, ClaimItemSupportV1, ClaimKind, ClaimLedger as _, ClaimState,
@@ -42,6 +43,7 @@ use ostk_fleet_recall::memory_contracts::collected_item::{
 };
 use ostk_fleet_recall::memory_contracts::common::ContractId;
 use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
+use ostk_fleet_recall::memory_contracts::evidence::AcceptedEventId;
 use ostk_fleet_recall::registry_activation::install::InstallTargetV1;
 use ostk_fleet_recall::remember_runtime::{
     CaptureDispositionV1, CaptureRequestV1, CaptureResponseV1, CaptureStartup, EventFirstAssert,
@@ -94,6 +96,17 @@ const PELICAN: Message = Message {
     ts: "1790006862.001300",
     order: 1_790_006_862_001_300,
     text: "the pelican deploy window closes at noon",
+};
+/// Later edits of [`HERON`] and [`PELICAN`]: the same messages, other words.
+const HERON_EDIT: Message = Message {
+    ts: "1790006860.001100",
+    order: 1_790_006_900_000_000,
+    text: "the heron retry budget is five attempts",
+};
+const PELICAN_EDIT: Message = Message {
+    ts: "1790006862.001300",
+    order: 1_790_006_950_000_000,
+    text: "the pelican deploy window closes at one",
 };
 
 fn permalink(ts: &str) -> String {
@@ -162,6 +175,23 @@ async fn pull(
     fixture: &WorkerFixture,
     drafts: Vec<CollectedItemDraftV1>,
 ) -> Vec<Staged> {
+    pull_observing(
+        pool,
+        fixture,
+        drafts,
+        &[(SLACK_CHANNEL, ProviderAudienceV1::ScopePublic)],
+    )
+    .await
+}
+
+/// Stage `drafts` through a verified Slack pull that observed each channel
+/// of `channels` at its audience.
+async fn pull_observing(
+    pool: &PgPool,
+    fixture: &WorkerFixture,
+    drafts: Vec<CollectedItemDraftV1>,
+    channels: &[(&str, ProviderAudienceV1)],
+) -> Vec<Staged> {
     let verified = fixture
         .installed
         .runtime(pool)
@@ -185,12 +215,15 @@ async fn pull(
             draft,
         })
         .collect();
-    let observations = [ContainerObservationV1 {
-        kind: ContainerKindV1::new("slack.channel").unwrap(),
-        id: SLACK_CHANNEL.to_owned(),
-        label: Some("plat-eng".to_owned()),
-        provider_audience: ProviderAudienceV1::ScopePublic,
-    }];
+    let observations: Vec<ContainerObservationV1> = channels
+        .iter()
+        .map(|(id, audience)| ContainerObservationV1 {
+            kind: ContainerKindV1::new("slack.channel").unwrap(),
+            id: (*id).to_owned(),
+            label: Some("plat-eng".to_owned()),
+            provider_audience: *audience,
+        })
+        .collect();
     let outcome = CollectedItemSink::new(pool.clone(), &fixture.installed.scope, retry_policy())
         .unwrap()
         .stage(
@@ -1356,4 +1389,360 @@ async fn live_claim_item_links_run_under_the_runtime_grants_when_configured() {
         refused.expect("the probe runs").is_none(),
         "a login without the collector and link grants is not offered claim item links"
     );
+}
+
+/// The variables `serve` runs with where capture is `enabled`.
+fn enabled_capture(fleet: &Fleet) -> HashMap<String, String> {
+    let mut variables: HashMap<String, String> =
+        serde_json::from_value(serde_json::to_value(&fleet.fixture.installed.report.pins).unwrap())
+            .unwrap();
+    variables.insert("FLEET_RECALL_COLLECTED_CAPTURE".into(), "enabled".into());
+    variables.insert(
+        "FLEET_RECALL_CONTENT_KEK_HEX".into(),
+        fleet.fixture.installed.kek_hex.clone(),
+    );
+    variables
+}
+
+/// A capture that claims a collected item's permalink never takes it over:
+/// a claim citing the URL, through assert or record, and item get by the
+/// URL still name the item the verified pull admitted under it.
+#[tokio::test]
+async fn live_a_captured_permalink_never_displaces_the_collected_item_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "claim-links-permalink").await;
+    let [heron] = fleet.admit(&[&HERON]).await[..] else {
+        panic!("one item is staged");
+    };
+
+    // Agent B relays another "message" under the real message's permalink,
+    // newer and with other words.
+    let variables = enabled_capture(&fleet);
+    let scope_b = fleet.scope(AGENT_B);
+    let capabilities = fleet.capabilities().await;
+    let CaptureStartup::Served(capture, _) = start_collected_capture_with(
+        fleet.pool.clone(),
+        &capabilities,
+        &scope_b,
+        retry_policy(),
+        |name| variables.get(name).cloned(),
+    )
+    .await
+    else {
+        panic!("enabled capture is served");
+    };
+    let request: CaptureRequestV1 = serde_json::from_value(json!({ "items": [{
+        "provider": "slack",
+        "provider_scope_id": SLACK_TEAM,
+        "object_kind": "message",
+        "external_id": format!("{SLACK_CHANNEL}:1790071999.000100"),
+        "container": { "kind": "slack.channel", "id": SLACK_CHANNEL },
+        "updated_at": "2026-09-25T10:00:00Z",
+        "text": "the heron retry budget is ninety attempts",
+        "url": permalink(HERON.ts),
+    }]}))
+    .unwrap();
+    let captured: CaptureResponseV1 = serde_json::from_value(
+        capture
+            .capture(
+                &scope_b,
+                &PreparedCaptureV1::prepare(&request).unwrap(),
+                "claim-links-permalink-capture",
+            )
+            .await
+            .expect("the capture runs")
+            .response,
+    )
+    .unwrap();
+    assert_eq!(
+        captured.items[0].disposition,
+        CaptureDispositionV1::Admitted
+    );
+    assert_ne!(captured.items[0].item_id, heron.item);
+
+    // Agent A cites the permalink.
+    let scope = fleet.scope(AGENT_A);
+    let ledger = fleet.ledger(AGENT_A).await;
+    let asserted = ledger
+        .assert_claim(
+            &scope,
+            &assertion(true, &[json!({ "url": permalink(HERON.ts) })]),
+            "claim-links-permalink-assert",
+        )
+        .await
+        .expect("the permalink is cited");
+    let links = fleet.links_of(asserted.mutation.claim.id).await;
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].item_key_digest, heron.item.as_bytes());
+    let recorded = ledger
+        .record_claim(
+            &scope,
+            &recorded(
+                "The heron retry budget is four attempts.",
+                4,
+                vec![cites(ItemRefV1::Url(permalink(HERON.ts)))],
+            ),
+            "claim-links-permalink-record",
+        )
+        .await
+        .expect("the permalink is cited");
+    let support = ledger
+        .claim_item_support(&scope, recorded.claim.id)
+        .await
+        .unwrap()
+        .expect("the ledger expands citations");
+    assert_eq!(support.items[0].item_id, heron.item);
+    assert_eq!(support.items[0].trust, TrustTierV1::Verified);
+    // Item get by the permalink names the collected item too.
+    let got = fleet
+        .items()
+        .await
+        .get(&ItemReferenceV1::ProviderUrl(permalink(HERON.ts)))
+        .await
+        .unwrap()
+        .expect("the permalink names an item");
+    assert_eq!(got.item.item_id, heron.item);
+}
+
+/// An assertion that lists a collected item's accepted event directly is
+/// audited like a citation: a deleted item's event is refused and nothing
+/// is written, and a visible item's event is linked, so the item lists the
+/// claim.
+#[tokio::test]
+async fn live_a_directly_listed_item_event_is_audited_and_linked_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "claim-links-direct").await;
+    let [heron, pelican] = fleet.admit(&[&HERON, &PELICAN]).await[..] else {
+        panic!("two items are staged");
+    };
+    let heron_event = fleet.get_item(heron.item).await.current.parts[0].accepted_event_id;
+    let pelican_event = fleet.get_item(pelican.item).await.current.parts[0].accepted_event_id;
+    // The provider deletes the pelican message.
+    pull(
+        &fleet.pool,
+        &fleet.fixture,
+        vec![draft(&PELICAN, ItemLifecycleV1::Deleted, PELICAN.order + 1)],
+    )
+    .await;
+    drain(&fleet.fixture, &fleet.pool).await;
+
+    let scope = fleet.scope(AGENT_A);
+    let ledger = fleet.ledger(AGENT_A).await;
+    let listing = |event: Sha256Digest| {
+        let mut input = assertion(true, &[]);
+        input.support_evidence_event_ids = vec![AcceptedEventId::from_digest(event)];
+        input
+    };
+    let refused = refusal(
+        ledger
+            .assert_claim(
+                &scope,
+                &listing(pelican_event),
+                "claim-links-direct-deleted",
+            )
+            .await,
+    );
+    assert_eq!(refused.code, RefusalCode::SupportItemWithdrawn);
+    assert_eq!(refused.details["suppressed"], "deleted");
+    assert_eq!(refused.details["item_id"], json!(pelican.item));
+    for sql in [
+        "SELECT count(*)::INT8 FROM memory_claims WHERE tenant_id = $1 AND project = $2",
+        "SELECT count(*)::INT8 FROM memory_claim_item_links_v1 \
+         WHERE tenant_id = $1 AND project = $2",
+        "SELECT count(*)::INT8 FROM memory_evidence_events \
+         WHERE tenant_id = $1 AND project = $2 AND event_kind = 'memory.claim.accepted'",
+    ] {
+        assert_eq!(fleet.count(sql).await, 0, "{sql}");
+    }
+
+    let asserted = ledger
+        .assert_claim(&scope, &listing(heron_event), "claim-links-direct-visible")
+        .await
+        .expect("a visible item's event is cited");
+    let links = fleet.links_of(asserted.mutation.claim.id).await;
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].support_event_id, heron_event.as_bytes());
+    assert_eq!(links[0].item_key_digest, heron.item.as_bytes());
+    assert_eq!(links[0].version_key_digest, heron.version.as_bytes());
+    assert_eq!(links[0].via, "assert");
+    let cited_by = fleet
+        .get_item(heron.item)
+        .await
+        .cited_by
+        .expect("citations are listed where claims cite items");
+    assert_eq!(cited_by.len(), 1);
+    assert_eq!(cited_by[0].claim_id, asserted.mutation.claim.id);
+}
+
+/// A version admitted in a channel since made private is withheld wherever
+/// it is read, though its item moved to a public channel: item get shows
+/// none of its text, citing it is refused, and a claim that cited it before
+/// reports it suppressed. Two versions of one visible item are one
+/// independent source, and each cited item is labelled untrusted
+/// third-party content.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one move followed through every reader, then one item cited twice
+async fn live_a_version_in_a_withdrawn_container_is_withheld_everywhere_when_configured() {
+    const CHANNEL_A: &str = "C07AAAAAAA1";
+    const CHANNEL_B: &str = "C07BBBBBBB2";
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let fleet = Fleet::new(&database_url, "claim-links-moved").await;
+    let in_channel = |message: &Message, lifecycle: ItemLifecycleV1, channel: &str| {
+        let mut moved = draft(message, lifecycle, message.order);
+        moved.container.as_mut().unwrap().id = channel.to_owned();
+        moved
+    };
+    let [v1] = pull_observing(
+        &fleet.pool,
+        &fleet.fixture,
+        vec![in_channel(&HERON, ItemLifecycleV1::Live, CHANNEL_A)],
+        &[(CHANNEL_A, ProviderAudienceV1::ScopePublic)],
+    )
+    .await[..] else {
+        panic!("one version is staged");
+    };
+    drain(&fleet.fixture, &fleet.pool).await;
+    let scope = fleet.scope(AGENT_A);
+    let ledger = fleet.ledger(AGENT_A).await;
+    let before = ledger
+        .record_claim(
+            &scope,
+            &recorded(
+                "The heron retry budget is four attempts.",
+                4,
+                vec![cites(ItemRefV1::VersionId(v1.version))],
+            ),
+            "claim-links-moved-before",
+        )
+        .await
+        .expect("the version is cited while its channel is public");
+
+    // The message is edited into channel B, and channel A goes private.
+    let [v2] = pull_observing(
+        &fleet.pool,
+        &fleet.fixture,
+        vec![in_channel(&HERON_EDIT, ItemLifecycleV1::Edited, CHANNEL_B)],
+        &[
+            (CHANNEL_A, ProviderAudienceV1::Restricted),
+            (CHANNEL_B, ProviderAudienceV1::ScopePublic),
+        ],
+    )
+    .await[..] else {
+        panic!("one version is staged");
+    };
+    drain(&fleet.fixture, &fleet.pool).await;
+    assert_eq!(v1.item, v2.item);
+
+    // Item get presents the edit and withholds the first version's text.
+    let got = fleet.get_item(v1.item).await;
+    assert_eq!(got.suppressed, None);
+    assert_eq!(got.current.version_id, v2.version);
+    assert_eq!(got.current.parts[0].text.as_deref(), Some(HERON_EDIT.text));
+    let first = got
+        .history
+        .iter()
+        .find(|version| version.version_id == v1.version)
+        .expect("the first version is in the history");
+    assert_eq!(
+        first.suppressed,
+        Some(ItemSuppressionV1::ContainerWithdrawn)
+    );
+    assert!(first.parts.iter().all(|part| part.text.is_none()));
+
+    // Citing the first version now is refused through both actions.
+    let refused = refusal(
+        ledger
+            .assert_claim(
+                &scope,
+                &assertion(true, &[json!({ "version_id": v1.version })]),
+                "claim-links-moved-assert",
+            )
+            .await,
+    );
+    assert_eq!(refused.code, RefusalCode::SupportItemWithdrawn);
+    assert_eq!(refused.details["suppressed"], "container_withdrawn");
+    let refused = refusal(
+        ledger
+            .record_claim(
+                &scope,
+                &recorded(
+                    "The heron retry budget is four attempts.",
+                    4,
+                    vec![cites(ItemRefV1::VersionId(v1.version))],
+                ),
+                "claim-links-moved-record",
+            )
+            .await,
+    );
+    assert_eq!(refused.code, RefusalCode::SupportItemWithdrawn);
+    // The claim that cited it before reports it withheld, and counts it not.
+    let support = ledger
+        .claim_item_support(&scope, before.claim.id)
+        .await
+        .unwrap()
+        .expect("the ledger expands citations");
+    assert_eq!(
+        support.items[0].suppressed,
+        Some(ItemSuppressionV1::ContainerWithdrawn)
+    );
+    assert_eq!(support.independent_sources, 0);
+
+    // One visible item cited by two of its versions is one source.
+    let [pelican] = fleet.admit(&[&PELICAN]).await[..] else {
+        panic!("one item is staged");
+    };
+    let [pelican_edit] = pull(
+        &fleet.pool,
+        &fleet.fixture,
+        vec![draft(
+            &PELICAN_EDIT,
+            ItemLifecycleV1::Edited,
+            PELICAN_EDIT.order,
+        )],
+    )
+    .await[..] else {
+        panic!("one version is staged");
+    };
+    drain(&fleet.fixture, &fleet.pool).await;
+    let twice = ledger
+        .record_claim(
+            &scope,
+            &recorded(
+                "The pelican deploy window closes at one.",
+                1,
+                vec![
+                    cites(ItemRefV1::VersionId(pelican.version)),
+                    cites(ItemRefV1::ItemId(pelican.item)),
+                ],
+            ),
+            "claim-links-moved-twice",
+        )
+        .await
+        .expect("two versions of one item are cited");
+    let service = fleet.service(AGENT_A).await;
+    let got = claim_get(&service, &scope, twice.claim.id).await;
+    let support: ClaimItemSupportV1Wire = serde_json::from_value(got.clone()).unwrap();
+    assert_eq!(support.support_items.len(), 2, "{got}");
+    assert_eq!(
+        support.independent_sources, 1,
+        "one message is one source: {got}"
+    );
+    let mut versions: Vec<&Value> = support
+        .support_items
+        .iter()
+        .map(|item| &item["version_id"])
+        .collect();
+    versions.sort_by_key(ToString::to_string);
+    let mut expected = [json!(pelican.version), json!(pelican_edit.version)];
+    expected.sort_by_key(ToString::to_string);
+    assert_eq!(versions, expected.iter().collect::<Vec<_>>());
+    for item in &support.support_items {
+        assert_eq!(item["content_trust"], "untrusted_third_party", "{got}");
+    }
 }
