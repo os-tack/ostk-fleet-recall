@@ -17,7 +17,9 @@ use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use super::tools::tool_list_for_surfaces;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
-pub(super) const MAX_MCP_FRAME_BYTES: usize = 1_048_576;
+/// The largest request frame the stdio transport reads; a longer one is
+/// answered with an error and never dispatched.
+pub const MAX_MCP_FRAME_BYTES: usize = 1_048_576;
 const MAX_MCP_TOOL_RESULT_BYTES: usize = 786_432;
 const MAX_MCP_RESPONSE_BYTES: usize = 1_048_576;
 const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);

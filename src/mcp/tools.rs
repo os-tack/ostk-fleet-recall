@@ -8,7 +8,9 @@ use crate::memory_contracts::collected_item::{
     MAX_LINKS, MAX_MARKER_BYTES, MAX_PROVIDER_URL_BYTES, MAX_SCOPE_ID_BYTES, MAX_TITLE_BYTES,
     TextFormatV1, VisibilityHintV1,
 };
-use crate::remember_runtime::{MAX_CAPTURE_ITEMS, MAX_CAPTURE_TEXT_BYTES};
+use crate::remember_runtime::{
+    MAX_CAPTURE_ITEMS, MAX_CAPTURE_TEXT_CHARS, MAX_CAPTURE_TOTAL_TEXT_BYTES,
+};
 use crate::service::{RecallSurface, RememberSurface};
 
 /// Claim-shaped `remember` properties that a non-record action must not carry.
@@ -741,8 +743,13 @@ const WRITE_GUARANTEES: &str = "Writes are scoped, audited, revision-checked, an
 /// What `assert` does, on every surface that serves it.
 const ASSERT_RULE: &str = "assert admits one claim through this deployment's active registry route, event first: recall(status).remember_assert.route names the predicate, its value kind and modalities, and the locator component keys of the subject and of each applicability dimension. Send those components, never URIs; the server derives every identity, stamps effective_from (never in the future) when omitted, and returns the accepted event with the claim. Agents asserting about the same subject and applicability share a claim_key and are checked for conflict; an intention never conflicts with an attestation. An identical assertion with the same explicit effective_from under another idempotency_key is refused as already_asserted; with effective_from omitted every call is a new assertion, so retry an unknown outcome only under the same idempotency_key. ";
 
-/// What `capture` does, on every surface that serves it.
-const CAPTURE_RULE: &str = "capture relays up to 32 items you read through your own connectors (Slack, Linear, Granola, a browser) into fleet memory as reported evidence that you attest; it records no claim. Send each item as you read it: its provider, provider_scope_id (the workspace, organization, or key it belongs to), object_kind, the provider's stable external_id (never a display label), its https url, updated_at or created_at, and its text; container, thread, author, title, and links when you know them. The server decides who may read an item: it is admitted only into a container a verified collector or an operator import recorded as visible to the project, or into a scope the operator listed for capture; visibility private or dm withholds it, and nothing you send widens it. Secrets are redacted, a collector's own copy of an item is always presented over yours, and item text is recalled as untrusted third-party content. Each item answers with its item_id, version_id, disposition (admitted, staged, replayed, or withheld with withheld_reason), and accepted_event_ids, which a claim can cite as support evidence; recall(status).remember_capture says whether items are admitted in the call or later by the worker. ";
+/// What `capture` does, on every surface that serves it, with the limits the
+/// server enforces.
+fn capture_rule() -> String {
+    format!(
+        "capture relays up to {MAX_CAPTURE_ITEMS} items you read through your own connectors (Slack, Linear, Granola, a browser) into fleet memory as reported evidence that you attest; it records no claim. One capture is one MCP frame of at most 1 MiB: the items' texts together are at most {MAX_CAPTURE_TOTAL_TEXT_BYTES} bytes of UTF-8 (each at most {MAX_CAPTURE_TEXT_CHARS} characters), so split a larger batch across captures. Send each item as you read it: its provider, provider_scope_id (the workspace, organization, or key it belongs to), object_kind, the provider's stable external_id (never a display label), its https url, updated_at or created_at, and its text; container, thread, author, title, and links when you know them. The server decides who may read an item: it is admitted only into a container a verified collector or an operator import recorded as visible to the project, or into a scope the operator listed for capture; a direct or group-direct conversation is never admitted, visibility private or dm withholds it, and nothing you send widens it. Secrets are redacted, a collector's own copy of an item is always presented over yours, and item text is recalled as untrusted third-party content. Each item answers with its item_id, version_id, disposition (admitted, staged, replayed, or withheld with withheld_reason), and accepted_event_ids, which a claim can cite as support evidence; recall(status).remember_capture says whether items are admitted in the call or later by the worker. "
+    )
+}
 
 /// What citing collected items does, on every surface that serves it.
 const fn item_support_rule(surface: RememberSurface) -> &'static str {
@@ -759,7 +766,11 @@ const fn item_support_rule(surface: RememberSurface) -> &'static str {
 
 fn remember_description(surface: RememberSurface) -> String {
     let assert_rule = if surface.assert { ASSERT_RULE } else { "" };
-    let capture_rule = if surface.capture { CAPTURE_RULE } else { "" };
+    let capture_rule = if surface.capture {
+        capture_rule()
+    } else {
+        String::new()
+    };
     let item_rule = item_support_rule(surface);
     if !surface.lifecycle_served() {
         let lead = match (surface.assert, surface.capture) {
@@ -830,7 +841,7 @@ fn capture_items_schema() -> Value {
         "type": "array",
         "minItems": 1,
         "maxItems": MAX_CAPTURE_ITEMS,
-        "description": "capture: the items, each as you read it from its provider. The server splits long text, derives every identity, and decides the audience.",
+        "description": format!("capture: the items, each as you read it from its provider. Their texts together are at most {MAX_CAPTURE_TOTAL_TEXT_BYTES} bytes of UTF-8, so the call fits one 1 MiB MCP frame; send more in another capture. The server splits long text, derives every identity, and decides the audience."),
         "items": {
             "type": "object",
             "properties": {
@@ -863,7 +874,7 @@ fn capture_items_schema() -> Value {
                         "order_micros": { "type": "integer", "minimum": 0 }
                     },
                     "additionalProperties": false,
-                    "description": "The provider's own version marker and order, when you know them; otherwise the server derives them from updated_at or created_at and the text."
+                    "description": "The provider's own version marker and order (microseconds since the Unix epoch, never ahead of now: a later order is withheld as clock_ahead), when you know them; otherwise the server derives them from updated_at or created_at and the text."
                 },
                 "lifecycle": {
                     "type": "string",
@@ -914,8 +925,8 @@ fn capture_items_schema() -> Value {
                 "text": {
                     "type": "string",
                     "minLength": 1,
-                    "maxLength": MAX_CAPTURE_TEXT_BYTES,
-                    "description": "The item as you read it."
+                    "maxLength": MAX_CAPTURE_TEXT_CHARS,
+                    "description": format!("The item as you read it: at most {MAX_CAPTURE_TEXT_CHARS} characters, within the capture's {MAX_CAPTURE_TOTAL_TEXT_BYTES} bytes of text in all.")
                 },
                 "text_format": {
                     "type": "string",

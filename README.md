@@ -451,8 +451,12 @@ connectors into the same sink every collector uses, bound to
 ([ADR 0008 D10](docs/adr/0008-collected-items.md)). One call carries 1 to 32
 items in the shape an [import](#importing-collected-items) line has, each
 with its `https` provider `url`, `updated_at` (or `created_at`), and the text
-as read (at most 256 KiB; the server splits it); `via` optionally names the
-tool it came through:
+as read (at most 262,144 characters; the server splits it); `via` optionally
+names the tool it came through. A capture is one MCP frame, which the stdio
+transport caps at 1 MiB, so the items' texts together are at most 768 KiB
+(786,432 bytes) of UTF-8: split a larger batch across captures. An explicit
+`version.order_micros` is microseconds since the Unix epoch and never ahead of
+now (a later one is withheld as `clock_ahead`):
 
 ```json
 {"action":"capture","idempotency_key":"readme/capture/v1","via":"slack.conversations_history","items":[{"provider":"slack","provider_scope_id":"T07ACME0001","object_kind":"message","external_id":"C07PLATENG1:1790006860.001100","container":{"kind":"slack.channel","id":"C07PLATENG1"},"author":{"id":"U07ALICE","kind":"human"},"updated_at":"2026-09-21T16:07:40Z","text":"the retry budget is five","url":"https://acme.slack.com/archives/C07PLATENG1/p1790006860001100"}]}
@@ -466,14 +470,18 @@ worker's `collect` step admits it), `replayed` (the same item, already
 admitted from this agent under another key), or `withheld` with a
 `withheld_reason`. The same key replays the stored answer; a different
 request under a used key is an idempotency conflict. The receipt keeps the
-request's digest, never an item's text.
+request's digest, never an item's text, and that digest is taken with every
+secret the redactor finds replaced, so it confirms no guess of one; two
+requests that differ only in a redacted secret are the same capture.
 
 The server, not the agent, decides who may read an item: it is admitted only
 into a container a verified collector or an operator import already recorded
 as readable by the project, or into a provider scope or container the
 operator lists in `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES`. Anything else is
 withheld (`audience_unverified`), as is a container since withdrawn
-(`container_withdrawn`) and an item whose `visibility` is `private` or `dm`
+(`container_withdrawn`), a direct or group-direct conversation (a container
+kind such as `slack.im` or `slack.mpim`: `direct_message`, whatever the scopes
+list, `"*"` included), and an item whose `visibility` is `private` or `dm`
 (`audience_refused`); nothing an agent sends widens an audience. A captured
 item is `reported` and attested by `agent.<FLEET_RECALL_AGENT>`: two agents'
 captures are two attestations, a collector's own copy of the item is always

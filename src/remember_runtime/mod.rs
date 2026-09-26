@@ -37,8 +37,8 @@ pub use admission::{
 pub use capture::{
     CAPTURE_OPERATION, CaptureDispositionV1, CaptureIdentityV1, CaptureOutcomeV1, CaptureRequestV1,
     CaptureResponseV1, CaptureStartup, CaptureStatusV1, CapturedItemV1, CockroachCapture,
-    ItemCapture, MAX_CAPTURE_ITEMS, MAX_CAPTURE_TEXT_BYTES, PreparedCaptureV1,
-    start_collected_capture, start_collected_capture_with,
+    ItemCapture, MAX_CAPTURE_ITEMS, MAX_CAPTURE_TEXT_CHARS, MAX_CAPTURE_TOTAL_TEXT_BYTES,
+    PreparedCaptureV1, start_collected_capture, start_collected_capture_with,
 };
 pub use event_first::{EventFirstAssert, actor_for_agent};
 pub use serve::{

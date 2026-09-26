@@ -760,8 +760,13 @@ agent can cite them at once.
 - **The request.** `{action: "capture", idempotency_key, items, via?}`: 1 to
   32 items, each a `CollectedItemInputV1` (an import line's shape, D9) whose
   `https` provider `url` is required, with a provider clock (`updated_at`,
-  else `created_at`, or `version.order_micros`) and text of at most 256 KiB
-  that the server splits into parts of at most 32 KiB. `via` names the tool
+  else `created_at`, or `version.order_micros`, never ahead of the
+  observation: D4) and text of at most 262,144 characters (what the schema's
+  `maxLength` counts) that the server splits into parts of at most 32 KiB.
+  A capture is one MCP frame, and the stdio transport drops a frame over
+  1 MiB before it is dispatched, so the items' texts together are at most
+  768 KiB of UTF-8, refused before any I/O otherwise; the schema, the tool
+  description, and this bound say the same. `via` names the tool
   the agent read them through; it is recorded with each item as a label,
   never as authority. A tombstone lifecycle is refused: an agent relays what
   it read, and only a verified collector or an operator import reports a
@@ -824,9 +829,16 @@ agent can cite them at once.
   unknown outcome to retry, never a refusal. The same items under a new key
   stage nothing (their stage ids exist) and append nothing.
 - **The receipt keeps no text.** Its request is `{scope, request_digest}`,
-  the digest of the canonical request; its response holds identities,
-  digests, dispositions, and counts. The redacted text lives only in the
-  governed content store and the body plane, like every collected item's.
+  the digest of the canonical request with every secret the collector
+  redactor finds, in any field, replaced by the placeholder (domain
+  `ostk-collected-capture-request-v2`). The digest is durable (the receipt,
+  every staged row's delivery id, every admitted event's provider delivery
+  id), so it must not let a reader of the redacted text confirm a guess of
+  what was redacted; two requests that differ only in a redacted secret stage
+  the same redacted items and are the same capture. Its response holds
+  identities, digests, dispositions, and counts. The redacted text lives only
+  in the governed content store and the body plane, like every collected
+  item's.
 - **Precedence.** A captured version is presented under the `reported` tier,
   so a verified head of the same item is always presented instead, and a
   newer captured version whose content differs sets `disagreement` (D5).

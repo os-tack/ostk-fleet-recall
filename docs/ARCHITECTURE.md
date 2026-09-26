@@ -401,7 +401,8 @@ text; a hidden item's answer is metadata only.
 ### Agent capture
 
 `remember(action="capture")` ([ADR 0008 D10](adr/0008-collected-items.md))
-stages up to 32 items an agent read through its own connectors through the
+stages up to 32 items an agent read through its own connectors (their texts
+together at most 768 KiB, so the call fits one 1 MiB MCP frame) through the
 collected-item sink, under `connector.collected.capture`, as the agent's
 reported attestations: principal and attester `agent.<FLEET_RECALL_AGENT>`,
 collector instance `capture.<agent>`, status row `owner = capture` with no

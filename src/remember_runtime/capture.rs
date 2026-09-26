@@ -37,10 +37,12 @@
 //! # One capture
 //!
 //! 1. The request is checked before any I/O ([`PreparedCaptureV1::prepare`]):
-//!    1 to 32 items, each with its `https` URL at the provider, text of at
-//!    most 256 KiB (the server splits it), a provider clock, and a lifecycle
-//!    that is not a tombstone: an agent relays what it read, and a deletion is
-//!    reported only by a verified collector or an operator import.
+//!    1 to 32 items whose texts together are at most 768 KiB of UTF-8 (a
+//!    capture is one MCP frame of at most 1 MiB), each with its `https` URL
+//!    at the provider, text of at most 262,144 characters (the server splits
+//!    it), a provider clock, and a lifecycle that is not a tombstone: an
+//!    agent relays what it read, and a deletion is reported only by a
+//!    verified collector or an operator import.
 //! 2. A receipt already committed under the key is replayed (below).
 //! 3. The writer authority is verified and must bind
 //!    `connector.collected.capture`; a generation-2 head refuses as
@@ -73,7 +75,10 @@
 //!
 //! The request is `{scope, request_digest}` and never an item's text; the
 //! response holds identities, digests, dispositions, and counts. The redacted
-//! text lives only in the governed content store and the body plane.
+//! text lives only in the governed content store and the body plane. The
+//! request digest is taken over the request with every secret the collector
+//! redactor finds replaced, so neither it nor the delivery ids derived from
+//! it let anyone who can read them confirm a guess of a redacted secret.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -108,6 +113,7 @@ use crate::memory_contracts::collected_item::{
 };
 use crate::memory_contracts::common::ContractId;
 use crate::memory_contracts::digest::Sha256Digest;
+use crate::redaction::REDACTION_PLACEHOLDER;
 use crate::registry_witness::{
     VerifiedWriterAuthority, WriterAuthorityError, WriterAuthorityRuntime,
 };
@@ -119,9 +125,29 @@ use crate::worker::probe_capture_privileges;
 /// Most items one capture carries.
 pub const MAX_CAPTURE_ITEMS: usize = 32;
 
-/// Largest text of one captured item, in bytes; the server splits it into
-/// parts of at most 32 KiB.
-pub const MAX_CAPTURE_TEXT_BYTES: usize = 256 * 1024;
+/// Longest text of one captured item, in characters (Unicode scalar values,
+/// which JSON Schema's `maxLength` counts); the server splits it into parts
+/// of at most 32 KiB.
+pub const MAX_CAPTURE_TEXT_CHARS: usize = 256 * 1024;
+
+/// Most bytes of UTF-8 text one capture's items carry together.
+///
+/// A capture is one `remember` call, and the only transport, MCP over stdio,
+/// drops any frame over 1 MiB (`MAX_MCP_FRAME_BYTES`) before it is
+/// dispatched. 768 KiB of text leaves the frame room for every other field
+/// and the JSON around it, so a request the server accepts is one the
+/// transport carries.
+pub const MAX_CAPTURE_TOTAL_TEXT_BYTES: usize = 768 * 1024;
+
+/// The digest domain of a capture's request: its canonical JSON with every
+/// secret the collector redactor finds replaced, so a digest kept in a
+/// receipt or a delivery id is never a fingerprint of a redacted secret.
+const CAPTURE_REQUEST_DIGEST_DOMAIN: &str = "ostk-collected-capture-request-v2";
+
+/// Rounds of redaction [`redacted_for_digest`] runs over one string before
+/// it replaces the whole string: a replacement that leaves a new match
+/// behind is vanishingly rare, and the bound keeps the loop finite.
+const DIGEST_REDACTION_ROUNDS: usize = 4;
 
 /// The receipt operation of a capture.
 pub const CAPTURE_OPERATION: &str = "capture";
@@ -275,11 +301,12 @@ impl PreparedCaptureV1 {
     /// # Errors
     ///
     /// A message for the caller: no items or more than
-    /// [`MAX_CAPTURE_ITEMS`]; an empty or over-long `via`; an item without an
-    /// `https` URL, with empty text or text over [`MAX_CAPTURE_TEXT_BYTES`],
-    /// with a tombstone lifecycle, with a provider scope id that is not 1 to
-    /// 256 bytes of plain text, or that the draft refuses (no provider clock,
-    /// a clock that is not RFC 3339).
+    /// [`MAX_CAPTURE_ITEMS`]; texts together over
+    /// [`MAX_CAPTURE_TOTAL_TEXT_BYTES`]; an empty or over-long `via`; an item
+    /// without an `https` URL, with empty text or text over
+    /// [`MAX_CAPTURE_TEXT_CHARS`], with a tombstone lifecycle, with a provider
+    /// scope id that is not 1 to 256 bytes of plain text, or that the draft
+    /// refuses (no provider clock, a clock that is not RFC 3339).
     pub fn prepare(request: &CaptureRequestV1) -> std::result::Result<Self, String> {
         if request.items.is_empty() || request.items.len() > MAX_CAPTURE_ITEMS {
             return Err(format!(
@@ -287,12 +314,18 @@ impl PreparedCaptureV1 {
                 request.items.len()
             ));
         }
+        let total_text: usize = request.items.iter().map(|item| item.text.len()).sum();
+        if total_text > MAX_CAPTURE_TOTAL_TEXT_BYTES {
+            return Err(format!(
+                "the items' texts together are {total_text} bytes of UTF-8; one capture carries \
+                 at most {MAX_CAPTURE_TOTAL_TEXT_BYTES}, so the call fits one 1 MiB MCP frame: \
+                 send the rest in another capture"
+            ));
+        }
         if let Some(via) = &request.via {
             check_via(via)?;
         }
-        let bytes = serde_json::to_vec(request)
-            .map_err(|error| format!("the capture request does not serialize: {error}"))?;
-        let request_digest = framed_sha256("ostk-collected-capture-request-v1", &[&bytes]);
+        let request_digest = digest_request(request)?;
         let mut items = Vec::with_capacity(request.items.len());
         for (index, input) in request.items.iter().enumerate() {
             let at = |message: &str| format!("items[{index}]: {message}");
@@ -314,9 +347,9 @@ impl PreparedCaptureV1 {
             if input.text.trim().is_empty() {
                 return Err(at("text is required: the item as you read it"));
             }
-            if input.text.len() > MAX_CAPTURE_TEXT_BYTES {
+            if input.text.chars().count() > MAX_CAPTURE_TEXT_CHARS {
                 return Err(at(&format!(
-                    "text is at most {MAX_CAPTURE_TEXT_BYTES} bytes; the server splits it"
+                    "text is at most {MAX_CAPTURE_TEXT_CHARS} characters; the server splits it"
                 )));
             }
             let scope = &input.provider_scope_id;
@@ -376,6 +409,70 @@ impl PreparedCaptureV1 {
         }
         groups
     }
+}
+
+/// The digest a receipt keeps in place of `request`: its canonical JSON with
+/// every secret the collector redactor finds, in any string, replaced by the
+/// placeholder. The sink stages only redacted text, so two requests that
+/// differ only in a secret it removes are the same capture; and the digest
+/// kept durably (the receipt, every delivery id, every admitted event's
+/// provider delivery id) confirms no guess of what was redacted.
+fn digest_request(request: &CaptureRequestV1) -> std::result::Result<Sha256Digest, String> {
+    let mut value = serde_json::to_value(request)
+        .map_err(|error| format!("the capture request does not serialize: {error}"))?;
+    redact_strings(&mut value);
+    let bytes = serde_json::to_vec(&value)
+        .map_err(|error| format!("the capture request does not serialize: {error}"))?;
+    Ok(framed_sha256(CAPTURE_REQUEST_DIGEST_DOMAIN, &[&bytes]))
+}
+
+/// Replace every secret in every string of `value`.
+fn redact_strings(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            if let Some(redacted) = redacted_for_digest(text) {
+                *text = redacted;
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(redact_strings),
+        Value::Object(fields) => fields.values_mut().for_each(redact_strings),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// `text` with every finding of the collector redactor's scan replaced by
+/// the placeholder, unredactable ones included, until none remains; `None`
+/// when it holds none.
+fn redacted_for_digest(text: &str) -> Option<String> {
+    let mut findings = scan_collected_secrets(text);
+    if findings.is_empty() {
+        return None;
+    }
+    let mut current = text.to_owned();
+    for _ in 0..DIGEST_REDACTION_ROUNDS {
+        let mut redacted = String::with_capacity(current.len());
+        let mut cursor = 0_usize;
+        for finding in &findings {
+            // Matchers stop on ASCII bytes, so every range is a char boundary;
+            // a violation replaces the whole string instead of panicking.
+            let Some(prefix) = current.get(cursor..finding.byte_start) else {
+                return Some(REDACTION_PLACEHOLDER.to_owned());
+            };
+            redacted.push_str(prefix);
+            redacted.push_str(REDACTION_PLACEHOLDER);
+            cursor = finding.byte_end;
+        }
+        let Some(tail) = current.get(cursor..) else {
+            return Some(REDACTION_PLACEHOLDER.to_owned());
+        };
+        redacted.push_str(tail);
+        findings = scan_collected_secrets(&redacted);
+        if findings.is_empty() {
+            return Some(redacted);
+        }
+        current = redacted;
+    }
+    Some(REDACTION_PLACEHOLDER.to_owned())
 }
 
 /// Refuse a tool label a capture could not record: blank, longer than

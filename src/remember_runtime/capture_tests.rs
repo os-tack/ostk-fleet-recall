@@ -84,8 +84,8 @@ fn a_capture_request_is_checked_before_any_io() {
         (json!({"url": "http://acme.example/x"}), "https"),
         (json!({"text": "  "}), "text is required"),
         (
-            json!({"text": "x".repeat(MAX_CAPTURE_TEXT_BYTES + 1)}),
-            "at most 262144 bytes",
+            json!({"text": "x".repeat(MAX_CAPTURE_TEXT_CHARS + 1)}),
+            "at most 262144 characters",
         ),
         (json!({"lifecycle": "deleted", "text": ""}), "deletion"),
         (json!({"lifecycle": "revoked"}), "deletion"),
@@ -114,6 +114,76 @@ fn a_capture_request_is_checked_before_any_io() {
     // An edited or archived item is captured like a live one.
     assert!(
         PreparedCaptureV1::prepare(&request(vec![item(&json!({"lifecycle": "edited"}))])).is_ok()
+    );
+}
+
+#[test]
+fn a_texts_limit_is_counted_as_its_schema_counts_it() {
+    // JSON Schema's maxLength counts characters: 100,000 CJK characters are
+    // 300,000 bytes and within it, so the server accepts them too.
+    let cjk = "\u{4e2d}".repeat(100_000);
+    assert_eq!(cjk.len(), 300_000);
+    assert!(PreparedCaptureV1::prepare(&request(vec![item(&json!({"text": cjk}))])).is_ok());
+    let longest = "\u{4e2d}".repeat(MAX_CAPTURE_TEXT_CHARS);
+    assert!(PreparedCaptureV1::prepare(&request(vec![item(&json!({"text": longest}))])).is_ok());
+}
+
+#[test]
+fn a_capture_that_would_not_fit_one_mcp_frame_is_refused() {
+    // Five texts of 250,000 characters are each within the per-item bound,
+    // but together they are more than one 1 MiB frame carries.
+    let text = "x".repeat(250_000);
+    let items = vec![item(&json!({ "text": text })); 5];
+    let message = refusal(&request(items));
+    assert!(message.contains("at most 786432"), "{message}");
+    assert!(message.contains("another capture"), "{message}");
+    // The same texts in two captures fit.
+    let items = vec![item(&json!({ "text": text })); 3];
+    assert!(PreparedCaptureV1::prepare(&request(items)).is_ok());
+    // What the server accepts, compact JSON carries within the frame.
+    let largest = vec![item(&json!({ "text": "x".repeat(MAX_CAPTURE_TOTAL_TEXT_BYTES / 4) })); 4];
+    let largest = request(largest);
+    assert!(PreparedCaptureV1::prepare(&largest).is_ok());
+    assert!(serde_json::to_vec(&largest).unwrap().len() < crate::mcp::MAX_MCP_FRAME_BYTES);
+}
+
+#[test]
+fn the_request_digest_confirms_no_guess_of_a_redacted_secret() {
+    let digest = |text: &str| {
+        PreparedCaptureV1::prepare(&request(vec![item(&json!({ "text": text }))]))
+            .unwrap()
+            .request_digest()
+    };
+    // The sink stages the same redacted text for either password, so the
+    // digest kept in the receipt and every delivery id is the same, and a
+    // guess can never be confirmed against it.
+    let captured = digest("heron replica login password=Summer24 rotate friday");
+    assert_eq!(
+        captured,
+        digest("heron replica login password=Winter23 rotate friday")
+    );
+    assert_eq!(
+        captured,
+        digest("heron replica login password=[REDACTED] rotate friday")
+    );
+    // A secret in any field is replaced, and text around it still counts.
+    assert_ne!(
+        captured,
+        digest("heron replica login password=Summer24 rotate monday")
+    );
+    let with_url = |url: &str| {
+        PreparedCaptureV1::prepare(&request(vec![item(&json!({ "url": url }))]))
+            .unwrap()
+            .request_digest()
+    };
+    assert_eq!(
+        with_url("https://acme.example/x?token=xoxb-EXAMPLE-NOT-A-TOKEN"),
+        with_url("https://acme.example/x?token=xoxp-EXAMPLE-NOT-A-TOKEN")
+    );
+    assert_eq!(redacted_for_digest("nothing to see"), None);
+    assert_eq!(
+        redacted_for_digest("key lin_api_EXAMPLENOTAREALKEYEXAMPLENOTAREAL").as_deref(),
+        Some("key [REDACTED]")
     );
 }
 
