@@ -1,11 +1,11 @@
-//! The pure parts of an evidence answer: which recalled hits clear the dense
-//! floor, and what an empty answer means.
+//! The pure parts of an evidence answer: what the fused lanes said about a
+//! hit, and what an empty answer means.
 
 use std::collections::BTreeSet;
 
 use crate::memory_contracts::coverage::CoverageCompletenessV1;
 use crate::memory_contracts::digest::Sha256Digest;
-use crate::projectors::RecallHitV1;
+use crate::projectors::FusedHitV1;
 use crate::worker::WorkerSourceOutcomeV1;
 
 use super::{
@@ -13,42 +13,42 @@ use super::{
     EvidenceSourcesV1,
 };
 
-/// A recalled hit that cleared the dense floor, before hydration.
+/// A fused hit before hydration: the body, the lanes that matched it after
+/// the lexical cutoff and the dense floor (both applied by
+/// [`crate::projectors::fuse_lanes`]), their scores, and the fused score.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct ScoredHitV1 {
     pub(super) id: Sha256Digest,
+    pub(super) score: f32,
     pub(super) matched_by: EvidenceMatchV1,
     pub(super) lexical_score: Option<f32>,
     pub(super) dense_similarity: Option<f32>,
 }
 
-/// Apply the dense floor to the recall lanes' hits, keeping their order.
+impl From<FusedHitV1<Sha256Digest>> for ScoredHitV1 {
+    fn from(hit: FusedHitV1<Sha256Digest>) -> Self {
+        Self {
+            id: hit.key,
+            score: hit.score,
+            matched_by: lane_match(hit.lexical_rank.is_some(), hit.dense_rank.is_some()),
+            lexical_score: hit.lexical_score,
+            dense_similarity: hit.dense_similarity,
+        }
+    }
+}
+
+/// Which lanes matched a fused hit.
 ///
-/// A dense match whose cosine similarity is below `floor` is nearest-neighbour
-/// padding, not a match: a hit only the dense lane found is dropped, and a
-/// hit the lexical lane also found keeps only its lexical match. This is the
-/// same boundary chunk recall applies to its dense lane.
-pub(super) fn apply_dense_floor(hits: &[RecallHitV1], floor: f32) -> Vec<ScoredHitV1> {
-    hits.iter()
-        .filter_map(|hit| {
-            let dense_similarity = hit
-                .dense_distance
-                .map(|distance| 1.0 - distance)
-                .filter(|similarity| *similarity >= floor);
-            let matched_by = match (hit.lexical_score.is_some(), dense_similarity.is_some()) {
-                (true, true) => EvidenceMatchV1::LexicalAndDense,
-                (true, false) => EvidenceMatchV1::Lexical,
-                (false, true) => EvidenceMatchV1::Dense,
-                (false, false) => return None,
-            };
-            Some(ScoredHitV1 {
-                id: hit.body_content_id,
-                matched_by,
-                lexical_score: hit.lexical_score,
-                dense_similarity,
-            })
-        })
-        .collect()
+/// A fused hit was matched by at least one lane, so `(false, false)` cannot
+/// arise from fusion; it is read as a lexical match rather than invented as
+/// a variant of its own.
+#[must_use]
+pub const fn lane_match(lexical: bool, dense: bool) -> EvidenceMatchV1 {
+    match (lexical, dense) {
+        (true, true) => EvidenceMatchV1::LexicalAndDense,
+        (false, true) => EvidenceMatchV1::Dense,
+        (_, false) => EvidenceMatchV1::Lexical,
+    }
 }
 
 /// What an answer with `hit_count` hits means, given what was read before the
@@ -479,58 +479,43 @@ mod tests {
         }
     }
 
-    fn digest(byte: u8) -> Sha256Digest {
-        Sha256Digest::from_bytes([byte; 32])
-    }
-
-    fn hit(byte: u8, lexical: Option<f32>, distance: Option<f32>) -> RecallHitV1 {
-        RecallHitV1 {
-            body_content_id: digest(byte),
-            lexical_score: lexical,
-            dense_distance: distance,
-        }
+    #[test]
+    fn a_lane_match_names_the_lanes_that_ranked_the_hit() {
+        assert_eq!(lane_match(true, true), EvidenceMatchV1::LexicalAndDense);
+        assert_eq!(lane_match(true, false), EvidenceMatchV1::Lexical);
+        assert_eq!(lane_match(false, true), EvidenceMatchV1::Dense);
     }
 
     #[test]
-    fn the_dense_floor_drops_padding_and_strips_weak_dense_scores() {
-        let floor = 0.18;
-        let scored = apply_dense_floor(
-            &[
-                hit(1, Some(0.5), Some(0.4)),
-                hit(2, Some(0.3), Some(0.9)),
-                hit(3, Some(0.2), None),
-                hit(4, None, Some(0.1)),
-                hit(5, None, Some(0.95)),
-            ],
-            floor,
-        );
-        let summary: Vec<_> = scored
-            .iter()
-            .map(|hit| (hit.id, hit.matched_by, hit.lexical_score.is_some()))
-            .collect();
+    fn a_fused_hit_carries_its_lanes_scores_and_the_fused_score() {
+        let id = Sha256Digest::from_bytes([7; 32]);
+        let scored = ScoredHitV1::from(FusedHitV1 {
+            key: id,
+            score: 0.983,
+            lexical_rank: Some(1),
+            lexical_score: Some(0.5),
+            dense_rank: Some(1),
+            dense_similarity: Some(0.8),
+        });
         assert_eq!(
-            summary,
-            [
-                (digest(1), EvidenceMatchV1::LexicalAndDense, true),
-                (digest(2), EvidenceMatchV1::Lexical, true),
-                (digest(3), EvidenceMatchV1::Lexical, true),
-                (digest(4), EvidenceMatchV1::Dense, false),
-            ],
-            "hit 5 is dense-only padding; hit 2's dense match is below the floor"
+            scored,
+            ScoredHitV1 {
+                id,
+                score: 0.983,
+                matched_by: EvidenceMatchV1::LexicalAndDense,
+                lexical_score: Some(0.5),
+                dense_similarity: Some(0.8),
+            }
         );
-        assert!(scored[1].dense_similarity.is_none());
-        let similarity = scored[0].dense_similarity.unwrap();
-        assert!(
-            (similarity - 0.6).abs() < 1e-6,
-            "similarity is 1 - distance"
-        );
-        assert!(scored[3].dense_similarity.unwrap() >= floor);
-    }
-
-    #[test]
-    fn a_similarity_exactly_at_the_floor_is_kept() {
-        let scored = apply_dense_floor(&[hit(1, None, Some(0.75))], 0.25);
-        assert_eq!(scored.len(), 1);
-        assert_eq!(scored[0].matched_by, EvidenceMatchV1::Dense);
+        let dense_only = ScoredHitV1::from(FusedHitV1 {
+            key: id,
+            score: 0.5,
+            lexical_rank: None,
+            lexical_score: None,
+            dense_rank: Some(0),
+            dense_similarity: Some(0.6),
+        });
+        assert_eq!(dense_only.matched_by, EvidenceMatchV1::Dense);
+        assert_eq!(dense_only.lexical_score, None);
     }
 }

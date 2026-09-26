@@ -265,6 +265,10 @@ pub struct ItemHitV1 {
     pub accepted_event_id: Sha256Digest,
     /// The matching part's body; `recall(get, kind=evidence)` takes it.
     pub body_id: Sha256Digest,
+    /// The fused reciprocal-rank score the hits are ordered by, in `[0, 1]`:
+    /// `1.0` for a version first in both lanes, `0.5` for one first in a
+    /// single lane. A rank, not a confidence.
+    pub score: f32,
     pub matched_by: EvidenceMatchV1,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lexical_score: Option<f32>,

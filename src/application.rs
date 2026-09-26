@@ -2643,6 +2643,7 @@ fn evidence_search_result(search: EvidenceSearchV1) -> RecallResult {
         json!({
             "tier": "evidence",
             "lanes": lanes,
+            "fusion": "rrf",
             "dense_lane": dense_lane,
             "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
         }),
@@ -2708,6 +2709,7 @@ fn item_search_result(search: ItemSearchV1) -> RecallResult {
         json!({
             "tier": "item",
             "lanes": lanes,
+            "fusion": "rrf",
             "dense_lane": dense_lane,
             "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
         }),
@@ -4786,6 +4788,7 @@ mod tests {
             self.outcome(EvidenceSearchV1 {
                 hits: vec![EvidenceHitV1 {
                     id: Sha256Digest::from_bytes(KNOWN_BODY),
+                    score: 0.5,
                     matched_by: EvidenceMatchV1::Lexical,
                     lexical_score: Some(0.5),
                     dense_similarity: None,

@@ -49,6 +49,8 @@
 //! * [`ChunkEmbedderProvider`] — the production provider: the fleet's pinned
 //!   model2vec embedder behind that seam.
 //! * [`repository`] — projector traits, cursor shapes, and readiness types.
+//! * [`fusion`] — the pure reciprocal-rank fusion of the two lanes that item
+//!   and evidence recall share.
 //! * [`visibility`] — the pure private/publication-safe classification and the
 //!   names of the two read planes' SQL objects (W2-VIS).
 //! * [`cockroach`] — the `CockroachDB` runtimes and the read side.
@@ -65,6 +67,7 @@ mod chunk_embedding;
 mod cockroach;
 pub mod dense;
 mod error;
+pub mod fusion;
 pub mod lexical;
 mod repository;
 pub mod visibility;
@@ -80,6 +83,7 @@ pub use dense::{
     parse_distance_metric,
 };
 pub use error::{RecallProjectionError, RecallProjectionResult};
+pub use fusion::{FusedHitV1, LANE_DEPTH, LEXICAL_MIN_TS_RANK, fuse_lanes, lane_depth};
 pub use lexical::{
     LEXICAL_NORMALIZATION_VERSION, LexicalProjectionV1, LexicalStateV1, LexicalUnindexableReasonV1,
     MAX_LEXICAL_TEXT_BYTES, derive_lexical_projection, fold_lexical_characters,
@@ -87,8 +91,8 @@ pub use lexical::{
 };
 pub use repository::{
     BodyPositionV1, DenseProjector, LexicalProjector, ProjectionCursorV1, ProjectionPassSummaryV1,
-    ProjectorKindV1, RecallCompletenessV1, RecallHitV1, RecallProjectionSnapshotV1, RecallResultV1,
-    RecallTierV1,
+    ProjectorKindV1, RecallCompletenessV1, RecallHitV1, RecallLanesV1, RecallProjectionSnapshotV1,
+    RecallResultV1, RecallTierV1,
 };
 pub use visibility::{
     BODY_VISIBILITY_TABLE, BodyVisibilityV1, PRIVATE_PLANE_RECALL_TABLES, PUBLICATION_PLANE_VIEWS,

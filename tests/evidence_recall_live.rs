@@ -168,6 +168,10 @@ async fn live_evidence_search_hydrates_hits_when_configured() {
         for hit in &answer.hits {
             assert!(!hit.media_type.is_empty());
             assert!(hit.snippet.chars().count() <= 600);
+            assert!(
+                hit.score > 0.0 && hit.score <= 1.0,
+                "{hit:?} carries a fused score"
+            );
             if let Some(similarity) = hit.dense_similarity {
                 assert!(similarity >= 0.18, "{hit:?} is below the dense floor");
             }

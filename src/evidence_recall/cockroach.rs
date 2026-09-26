@@ -23,13 +23,13 @@ use crate::memory_contracts::collected_item::{
     COLLECTED_ITEM_MEDIA_TYPE, ItemLifecycleV1, TrustTierV1,
 };
 use crate::memory_contracts::digest::Sha256Digest;
-use crate::projectors::{CockroachRecallReader, RowVisibilityClassV1};
+use crate::projectors::{CockroachRecallReader, RowVisibilityClassV1, fuse_lanes, lane_depth};
 use crate::store::cockroach::{
     COLLECTED_ITEMS_SCHEMA_VERSION, DatabaseCapabilities, RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
 };
 use crate::worker::WorkerSourceOutcomeV1;
 
-use super::verdict::{ScoredHitV1, absence_verdict, apply_dense_floor};
+use super::verdict::{ScoredHitV1, absence_verdict};
 use super::{
     ContentTrustV1, EVIDENCE_RECALL_SCHEMA_VERSION, EVIDENCE_SNIPPET_CHARS, EvidenceBodyV1,
     EvidenceCollectorsV1, EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceHitV1, EvidenceItemV1,
@@ -547,7 +547,7 @@ impl CockroachEvidenceRecall {
         })
     }
 
-    /// Attach each scored hit's body, keeping the lanes' order.
+    /// Attach each scored hit's body, keeping the fused order.
     async fn hydrate(
         &self,
         scored: Vec<ScoredHitV1>,
@@ -594,6 +594,7 @@ impl CockroachEvidenceRecall {
                     })?;
                 Ok(EvidenceHitV1 {
                     id: hit.id,
+                    score: hit.score,
                     matched_by: hit.matched_by,
                     lexical_score: hit.lexical_score,
                     dense_similarity: hit.dense_similarity,
@@ -773,19 +774,25 @@ impl EvidenceRecall for CockroachEvidenceRecall {
         let readiness = self.read_readiness(lane, state).await?;
         let lexical_terms = has_lexical_terms(&self.pool, &lexical_text).await?;
         let vector = query_vector.filter(|_| lane == EvidenceDenseLaneV1::Used);
-        let (hits, _tier) = self
+        // Each lane is read deeper than the answer, then the two are fused by
+        // reciprocal rank (the lexical cutoff and the dense floor applied
+        // inside the fusion) and cut to `limit`.
+        let lanes = self
             .reader(state)
-            .recall_hits(
+            .recall_lanes(
                 if lexical_terms { &lexical_text } else { "" },
                 vector.as_deref(),
-                limit,
+                lane_depth(limit),
             )
             .await?;
+        let fused = fuse_lanes(
+            &lanes.lexical,
+            &lanes.dense,
+            RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
+            limit,
+        );
         let hits = self
-            .hydrate(
-                apply_dense_floor(&hits, RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY),
-                state,
-            )
+            .hydrate(fused.into_iter().map(ScoredHitV1::from).collect(), state)
             .await?;
         let absence = absence_verdict(hits.len(), lexical_terms, &readiness, &sources);
         Ok(EvidenceSearchV1 {

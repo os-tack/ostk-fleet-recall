@@ -145,6 +145,34 @@ pub enum RecallTierV1 {
     Hybrid,
 }
 
+/// The two lanes' rows for one query, before any merge or fusion.
+///
+/// Each lane is in its own order, as its query returns it; a body both lanes
+/// found appears in both. Item and evidence recall fuse these by reciprocal
+/// rank ([`super::fusion`]); [`RecallResultV1`] merges them lexical-first.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RecallLanesV1 {
+    /// `(body, ts_rank)` by descending rank, ties by content address.
+    pub lexical: Vec<(Sha256Digest, f32)>,
+    /// `(body, cosine distance)` by ascending distance, ties by content
+    /// address; empty when no query vector was supplied or the dense tier
+    /// has nothing for the scope.
+    pub dense: Vec<(Sha256Digest, f32)>,
+}
+
+impl RecallLanesV1 {
+    /// Which lanes returned at least one row.
+    #[must_use]
+    pub const fn tier(&self) -> RecallTierV1 {
+        match (self.lexical.is_empty(), self.dense.is_empty()) {
+            (true, true) => RecallTierV1::None,
+            (false, true) => RecallTierV1::Lexical,
+            (true, false) => RecallTierV1::Dense,
+            (false, false) => RecallTierV1::Hybrid,
+        }
+    }
+}
+
 /// One recalled body, carrying whichever lane scores produced it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecallHitV1 {

@@ -144,7 +144,7 @@ pub(crate) use cockroach::{
     decode_collector_source_row, dense_lane, digest, has_lexical_terms, listing_limit, may_read,
 };
 pub use serve::start_evidence_recall;
-pub use verdict::absence_verdict;
+pub use verdict::{absence_verdict, lane_match};
 
 /// First schema evidence recall can read: migration 30 creates the worker
 /// status table the absence verdict depends on.
@@ -415,6 +415,10 @@ pub struct EvidenceItemV1 {
 pub struct EvidenceHitV1 {
     /// The body's content address; `get` takes it.
     pub id: Sha256Digest,
+    /// The fused reciprocal-rank score the hits are ordered by, in `[0, 1]`:
+    /// `1.0` for a body first in both lanes, `0.5` for one first in a single
+    /// lane. A rank, not a confidence.
+    pub score: f32,
     pub matched_by: EvidenceMatchV1,
     /// `ts_rank` of the lexical lane, when it matched.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -687,6 +691,7 @@ mod tests {
     fn a_collected_body_is_labelled_untrusted_and_nothing_else_is() {
         let hit = EvidenceHitV1 {
             id: Sha256Digest::from_bytes([7; 32]),
+            score: 0.5,
             matched_by: EvidenceMatchV1::Lexical,
             lexical_score: Some(0.5),
             dense_similarity: None,

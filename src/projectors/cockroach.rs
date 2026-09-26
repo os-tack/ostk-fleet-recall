@@ -72,8 +72,8 @@ use super::error::{RecallProjectionError, RecallProjectionResult};
 use super::lexical::{LexicalProjectionV1, LexicalStateV1, derive_lexical_projection};
 use super::repository::{
     BodyPositionV1, DenseProjector, LexicalProjector, ProjectionCursorV1, ProjectionPassSummaryV1,
-    ProjectorKindV1, RecallCompletenessV1, RecallHitV1, RecallProjectionSnapshotV1, RecallResultV1,
-    RecallTierV1,
+    ProjectorKindV1, RecallCompletenessV1, RecallHitV1, RecallLanesV1, RecallProjectionSnapshotV1,
+    RecallResultV1, RecallTierV1,
 };
 use super::visibility::{RecallPlaneV1, RowVisibilityClassV1};
 
@@ -1195,18 +1195,21 @@ impl CockroachRecallReader {
         })
     }
 
-    /// The hits and tier of [`Self::recall`], without its readiness read.
+    /// The two lanes' rows for `query_text` and `query_vector`, at most
+    /// `limit` each, without any merge or readiness read.
     ///
-    /// For a caller that reads [`Self::completeness`] itself, before the
-    /// lanes run: a readiness read taken after the lanes can count a row the
-    /// lanes did not see, so only one taken first says what the hits were
-    /// drawn from.
-    pub async fn recall_hits(
+    /// This is what item and evidence recall fuse by reciprocal rank
+    /// ([`super::fusion::fuse_lanes`]), reading each lane deeper than the
+    /// hits they answer with. A caller that reads [`Self::completeness`]
+    /// itself does so before the lanes run: a readiness read taken after the
+    /// lanes can count a row the lanes did not see, so only one taken first
+    /// says what the hits were drawn from.
+    pub async fn recall_lanes(
         &self,
         query_text: &str,
         query_vector: Option<&[f32]>,
         limit: usize,
-    ) -> RecallProjectionResult<(Vec<RecallHitV1>, RecallTierV1)> {
+    ) -> RecallProjectionResult<RecallLanesV1> {
         if limit == 0 || limit > MAX_RECALL_LIMIT {
             return Err(RecallProjectionError::InvalidRequest(format!(
                 "recall limit must be between 1 and {MAX_RECALL_LIMIT}"
@@ -1221,13 +1224,24 @@ impl CockroachRecallReader {
             Some(vector) => self.dense_lane(vector, limit_i64).await?,
             None => Vec::new(),
         };
+        Ok(RecallLanesV1 { lexical, dense })
+    }
 
-        let tier = match (lexical.is_empty(), dense.is_empty()) {
-            (true, true) => RecallTierV1::None,
-            (false, true) => RecallTierV1::Lexical,
-            (true, false) => RecallTierV1::Dense,
-            (false, false) => RecallTierV1::Hybrid,
-        };
+    /// The hits and tier of [`Self::recall`], without its readiness read:
+    /// the lanes of [`Self::recall_lanes`] merged lexical-first, every
+    /// lexical row by rank, then the dense-only rows by distance, cut to
+    /// `limit`. The lane scores do not affect this order; it is the
+    /// projection reader's own view, not the fused order item and evidence
+    /// recall serve.
+    pub async fn recall_hits(
+        &self,
+        query_text: &str,
+        query_vector: Option<&[f32]>,
+        limit: usize,
+    ) -> RecallProjectionResult<(Vec<RecallHitV1>, RecallTierV1)> {
+        let lanes = self.recall_lanes(query_text, query_vector, limit).await?;
+        let tier = lanes.tier();
+        let RecallLanesV1 { lexical, dense } = lanes;
 
         let dense_by_body: HashMap<[u8; 32], f32> = dense
             .iter()

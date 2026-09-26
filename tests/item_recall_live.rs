@@ -725,6 +725,7 @@ async fn live_deleted_items_and_withdrawn_containers_are_hidden_when_configured(
             .dense_similarity
             .is_some_and(|similarity| similarity > 0.99)
     );
+    assert!(found.score > 0.0 && found.score <= 1.0, "{found:?}");
     assert_eq!(dense.readiness.dense_lane, EvidenceDenseLaneV1::Used);
 
     stage(

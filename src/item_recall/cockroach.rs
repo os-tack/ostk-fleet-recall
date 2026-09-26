@@ -24,13 +24,15 @@ use crate::evidence_recall::{
     ContentTrustV1, EVENTS_AWAITING_BODIES_SQL, EvidenceDenseLaneV1, EvidenceMatchV1,
     EvidenceSourcesV1, FOREIGN_DENSE_MODEL_SQL, MAX_EVIDENCE_SOURCES, absence_verdict,
     attach_coverage, count, decode_collector_source_row, dense_lane, digest, has_lexical_terms,
-    lexical_query_text, listing_limit, may_read,
+    lane_match, lexical_query_text, listing_limit, may_read,
 };
 use crate::memory_contracts::collected_item::{
     CollectedItemEnvelopeV1, CollectionModeV1, ItemLifecycleV1, ProviderKindV1, TrustTierV1,
 };
 use crate::memory_contracts::digest::Sha256Digest;
-use crate::projectors::{CockroachRecallReader, EMBEDDING_DIMENSIONS, redact_for_recall};
+use crate::projectors::{
+    CockroachRecallReader, EMBEDDING_DIMENSIONS, fuse_lanes, lane_depth, redact_for_recall,
+};
 use crate::store::cockroach::{
     ClaimItemLinksCapability, DatabaseCapabilities, RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
     serialize_vector,
@@ -64,11 +66,6 @@ pub const ITEM_RECALL_TABLES: [&str; 14] = [
     "memory_body_dense_projection_v1",
 ];
 
-/// Candidate rows the dense lane's nearest-neighbour subquery reads per hit
-/// asked for, before the join to the item tables drops every body that is
-/// not a visible item's.
-const DENSE_OVERFETCH: usize = 5;
-
 /// The presented head of `item`, and its container, for [`VISIBLE_ITEM_FILTER`].
 const VISIBLE_ITEM_JOINS: &str = "JOIN public.memory_collected_item_heads_v1 AS head \
        ON head.tenant_id = item.tenant_id AND head.project = item.project \
@@ -94,7 +91,9 @@ const SEARCH_FILTER: &str = "($4::STRING IS NULL OR item.provider = $4) \
      AND ($5 OR item.version_key_digest = head.version_key_digest)";
 
 /// The lexical lane: each matching item version's best-ranked part, then the
-/// versions by rank. `$3` is the query text, `$6` the limit.
+/// versions by rank. `$3` is the query text, `$6` the lane depth (five rows
+/// per hit asked for, [`lane_depth`]); the fusion applies the `ts_rank`
+/// cutoff and cuts the fused list to the limit.
 static LEXICAL_ITEMS_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "SELECT best.item_key_digest, best.version_key_digest, best.body_content_id, best.score \
@@ -117,9 +116,10 @@ static LEXICAL_ITEMS_SQL: LazyLock<String> = LazyLock::new(|| {
 
 /// The dense lane, in the pattern of the evidence reader's model-restricted
 /// lane: an approximate nearest-neighbour subquery the C-SPANN index serves
-/// (`$6` candidates), then the join to the item tables, the model filter
-/// (`$7`), and the visibility and search filters outside it; each version's
-/// nearest part, then the versions by distance.
+/// (`$6` candidates, the same lane depth as the lexical lane), then the join
+/// to the item tables, the model filter (`$7`), and the visibility and
+/// search filters outside it; each version's nearest part, then the versions
+/// by distance. The fusion applies the dense floor.
 static DENSE_ITEMS_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "SELECT best.item_key_digest, best.version_key_digest, best.body_content_id, \
@@ -400,59 +400,58 @@ struct LaneRowV1 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct FusedHitV1 {
     body: Sha256Digest,
+    score: f32,
     matched_by: EvidenceMatchV1,
     lexical_score: Option<f32>,
     dense_similarity: Option<f32>,
 }
 
-/// The lanes' versions, lexical rank first, then the versions only the dense
-/// lane found at or above the dense floor; at most `limit`. A version both
-/// lanes found keeps its lexical part and gains its dense similarity.
+/// The lanes' versions fused by reciprocal rank
+/// ([`crate::projectors::fuse_lanes`]), keyed by `(item, version)`, with the
+/// lexical `ts_rank` cutoff and the dense floor applied inside the fusion;
+/// at most `limit`, highest fused score first. A version both lanes found
+/// keeps its lexical part and gains its dense similarity; a version only
+/// the dense lane ranked carries its nearest part.
 fn fuse(lexical: &[LaneRowV1], dense: &[LaneRowV1], limit: usize) -> Vec<FusedHitV1> {
-    let dense: Vec<(LaneRowV1, f32)> = dense
+    type VersionKey = (Sha256Digest, Sha256Digest);
+    let version = |row: &LaneRowV1| (row.item_key, row.version_key);
+    let parts = |rows: &[LaneRowV1]| -> HashMap<VersionKey, Sha256Digest> {
+        let mut parts = HashMap::with_capacity(rows.len());
+        for row in rows {
+            parts.entry(version(row)).or_insert(row.body);
+        }
+        parts
+    };
+    let lexical_parts = parts(lexical);
+    let dense_parts = parts(dense);
+    let lexical: Vec<(VersionKey, f32)> = lexical
         .iter()
-        .map(|row| (*row, 1.0 - row.score))
-        .filter(|(_, similarity)| *similarity >= RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY)
+        .map(|row| (version(row), row.score))
         .collect();
-    let dense_by_version: HashMap<(Sha256Digest, Sha256Digest), f32> = dense
-        .iter()
-        .map(|(row, similarity)| ((row.item_key, row.version_key), *similarity))
-        .collect();
-    let lexical_versions: BTreeSet<(Sha256Digest, Sha256Digest)> = lexical
-        .iter()
-        .map(|row| (row.item_key, row.version_key))
-        .collect();
-    let mut hits: Vec<FusedHitV1> = lexical
-        .iter()
-        .map(|row| {
-            let dense_similarity = dense_by_version
-                .get(&(row.item_key, row.version_key))
-                .copied();
-            FusedHitV1 {
-                body: row.body,
-                matched_by: if dense_similarity.is_some() {
-                    EvidenceMatchV1::LexicalAndDense
-                } else {
-                    EvidenceMatchV1::Lexical
-                },
-                lexical_score: Some(row.score),
-                dense_similarity,
-            }
-        })
-        .collect();
-    hits.extend(
-        dense
-            .iter()
-            .filter(|(row, _)| !lexical_versions.contains(&(row.item_key, row.version_key)))
-            .map(|(row, similarity)| FusedHitV1 {
-                body: row.body,
-                matched_by: EvidenceMatchV1::Dense,
-                lexical_score: None,
-                dense_similarity: Some(*similarity),
-            }),
-    );
-    hits.truncate(limit);
-    hits
+    let dense: Vec<(VersionKey, f32)> = dense.iter().map(|row| (version(row), row.score)).collect();
+    fuse_lanes(
+        &lexical,
+        &dense,
+        RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
+        limit,
+    )
+    .into_iter()
+    .map(|hit| {
+        let lexical = hit.lexical_rank.is_some();
+        let body = if lexical {
+            lexical_parts[&hit.key]
+        } else {
+            dense_parts[&hit.key]
+        };
+        FusedHitV1 {
+            body,
+            score: hit.score,
+            matched_by: lane_match(lexical, hit.dense_rank.is_some()),
+            lexical_score: hit.lexical_score,
+            dense_similarity: hit.dense_similarity,
+        }
+    })
+    .collect()
 }
 
 /// Text an answer may carry: the recall plane's redaction again, then
@@ -775,7 +774,7 @@ impl CockroachItemRecall {
             .bind(lexical_text)
             .bind(request.provider.as_ref().map(ProviderKindV1::as_str))
             .bind(request.include_history)
-            .bind(listing_limit(request.limit))
+            .bind(listing_limit(lane_depth(request.limit)))
             .fetch_all(&self.pool)
             .await?;
         rows.iter()
@@ -799,7 +798,7 @@ impl CockroachItemRecall {
             .bind(serialize_vector(vector)?)
             .bind(request.provider.as_ref().map(ProviderKindV1::as_str))
             .bind(request.include_history)
-            .bind(listing_limit(request.limit.saturating_mul(DENSE_OVERFETCH)))
+            .bind(listing_limit(lane_depth(request.limit)))
             .bind(self.model_digest.as_bytes().as_slice())
             .fetch_all(&self.pool)
             .await?;
@@ -1125,6 +1124,7 @@ fn hit_from_row(hit: &FusedHitV1, row: &PgRow, modes: &VersionModes) -> Result<I
         current: head_version == Some(version_id),
         accepted_event_id: digest(row, "accepted_event_id")?,
         body_id: hit.body,
+        score: hit.score,
         matched_by: hit.matched_by,
         lexical_score: hit.lexical_score,
         dense_similarity: hit.dense_similarity,
@@ -1391,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn fusion_keeps_lexical_rank_adds_dense_only_versions_and_applies_the_floor() {
+    fn fusion_ranks_versions_by_reciprocal_rank_over_both_lanes_and_applies_the_floor() {
         let lexical = [row(1, 10, 100, 0.9), row(2, 20, 200, 0.5)];
         let dense = [
             // The second lexical version's nearest part: similarity 0.8.
@@ -1402,16 +1402,47 @@ mod tests {
             row(4, 40, 240, 0.95),
         ];
         let fused = fuse(&lexical, &dense, 10);
+        // Second in both lanes beats first in one; the both-lane version
+        // keeps its lexical part (200), not its nearest dense part (201).
         assert_eq!(
             fused.iter().map(|hit| hit.body).collect::<Vec<_>>(),
-            [key(100), key(200), key(230)]
+            [key(200), key(100), key(230)]
         );
-        assert_eq!(fused[0].matched_by, EvidenceMatchV1::Lexical);
-        assert_eq!(fused[1].matched_by, EvidenceMatchV1::LexicalAndDense);
-        assert!((fused[1].dense_similarity.unwrap() - 0.8).abs() < 1e-6);
-        assert_eq!(fused[2].matched_by, EvidenceMatchV1::Dense);
+        assert_eq!(
+            fused.iter().map(|hit| hit.matched_by).collect::<Vec<_>>(),
+            [
+                EvidenceMatchV1::LexicalAndDense,
+                EvidenceMatchV1::Lexical,
+                EvidenceMatchV1::Dense
+            ]
+        );
+        assert!((fused[0].dense_similarity.unwrap() - 0.8).abs() < 1e-6);
+        assert_eq!(fused[0].lexical_score, Some(0.5));
+        assert!((fused[0].score - (1.0 / 61.0 + 1.0 / 60.0) / (2.0 / 60.0)).abs() < 1e-6);
+        assert!((fused[1].score - 0.5).abs() < 1e-6);
+        assert!((fused[2].score - 30.0 / 61.0).abs() < 1e-6);
         assert_eq!(fused[2].lexical_score, None);
-        assert_eq!(fuse(&lexical, &dense, 1).len(), 1);
+        assert_eq!(
+            fuse(&lexical, &dense, 1)
+                .iter()
+                .map(|hit| hit.body)
+                .collect::<Vec<_>>(),
+            [key(200)]
+        );
+    }
+
+    #[test]
+    fn a_lexical_row_below_the_cutoff_leaves_its_version_to_the_dense_lane() {
+        // The version's lexical row is a co-occurrence, not a match: the hit
+        // is dense-only and carries the dense lane's nearest part.
+        let lexical = [row(1, 10, 100, 0.0006)];
+        let dense = [row(1, 10, 101, 0.3)];
+        let fused = fuse(&lexical, &dense, 10);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].body, key(101));
+        assert_eq!(fused[0].matched_by, EvidenceMatchV1::Dense);
+        assert_eq!(fused[0].lexical_score, None);
+        assert!(fuse(&lexical, &[], 10).is_empty());
     }
 
     #[test]
