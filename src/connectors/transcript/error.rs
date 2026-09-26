@@ -71,10 +71,27 @@ pub enum TranscriptConnectorError {
         /// The coordinate key whose declared encoding is unusable.
         key: String,
     },
-    /// The three ingress clocks are not ordered occurred <= observed <= received
-    /// (EVID-03). Refused before anything is staged.
-    #[error("transcript ingress clocks are not ordered occurred <= observed <= received")]
-    ClockOrder,
+    /// The three ingress clocks are not ordered occurred <= observed <=
+    /// received, or one is not microsecond-aligned (EVID-03). Refused before
+    /// anything is staged, naming the turn and every clock so an operator
+    /// can tell a future-dated transcript line from a collector whose clock
+    /// is behind.
+    #[error(
+        "transcript turn {turn_uid} ingress clocks are not ordered ({comparison}): occurred_at \
+         {occurred_at}, observed_at {observed_at}, received_at {received_at}"
+    )]
+    ClockOrder {
+        /// The turn whose clocks disagreed.
+        turn_uid: String,
+        /// Which comparison failed.
+        comparison: &'static str,
+        /// The turn's own clock, as the transcript spells it.
+        occurred_at: String,
+        /// When the collector observed the source.
+        observed_at: String,
+        /// When ingress received the batch.
+        received_at: String,
+    },
     /// A durable cursor moved backwards, or a batch was built against a stale
     /// cursor. Fail closed: a regressed cursor would re-mint turn ordinals.
     #[error("transcript cursor for {source_id} regressed or was stale")]

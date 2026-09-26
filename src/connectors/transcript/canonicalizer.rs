@@ -317,6 +317,35 @@ fn derive_identities(
     })
 }
 
+/// EVID-03: the three ingress clocks are microsecond-aligned and ordered
+/// `occurred <= observed <= received`, or the turn is refused naming the
+/// comparison that failed and every clock.
+fn require_ordered_clocks(
+    turn: &ParsedTurnV1,
+    observed_at: &CanonicalTimestamp,
+    received_at: &CanonicalTimestamp,
+) -> TranscriptConnectorResult<()> {
+    let comparison = if !turn.occurred_at.is_microsecond_aligned()
+        || !observed_at.is_microsecond_aligned()
+        || !received_at.is_microsecond_aligned()
+    {
+        "a clock is not microsecond aligned"
+    } else if *observed_at < turn.occurred_at {
+        "observed_at precedes the turn's occurred_at"
+    } else if *received_at < *observed_at {
+        "received_at precedes observed_at"
+    } else {
+        return Ok(());
+    };
+    Err(TranscriptConnectorError::ClockOrder {
+        turn_uid: turn.turn_uid.clone(),
+        comparison,
+        occurred_at: turn.occurred_at.to_string(),
+        observed_at: observed_at.to_string(),
+        received_at: received_at.to_string(),
+    })
+}
+
 /// Canonicalize one redacted turn into an ingress candidate under the active
 /// package's connector schema.
 ///
@@ -376,14 +405,7 @@ pub fn canonicalize_turn(
     } = derive_identities(active, connector, binding, &published)?;
 
     // (5) EVID-03 clock ordering, refused here rather than at the outbox.
-    if !turn.occurred_at.is_microsecond_aligned()
-        || !observed_at.is_microsecond_aligned()
-        || !received_at.is_microsecond_aligned()
-        || *observed_at < turn.occurred_at
-        || *received_at < *observed_at
-    {
-        return Err(TranscriptConnectorError::ClockOrder);
-    }
+    require_ordered_clocks(turn, observed_at, received_at)?;
 
     // (6) The storage identity is derived from the credential-bound protection
     // domain and the body digest — the same function the admission seam

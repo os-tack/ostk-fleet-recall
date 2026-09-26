@@ -187,10 +187,11 @@ const INSTALLATION_ID: u64 = 4242;
 // coverage limit rather than left implicit.
 // ---------------------------------------------------------------------------
 
-/// Commits walked from the scanned ref. This repository has 350, so the walk
-/// covers the branch whole; a longer branch would fail the scan closed rather
-/// than truncate.
-const MAX_COMMITS: usize = 400;
+/// Commits walked from the scanned ref. This repository has 519 (2026-09-26)
+/// and grows by a few dozen per round, so the bound leaves room for the walk
+/// to cover the branch whole; a longer branch would fail the scan closed
+/// rather than truncate.
+const MAX_COMMITS: usize = 2_000;
 /// Hard bound on facts one scan renders.
 const MAX_FACTS: usize = 4_096;
 /// Bytes of transcript read per collection pass. Under the parser's 8 MiB batch

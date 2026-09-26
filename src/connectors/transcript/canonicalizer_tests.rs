@@ -228,7 +228,35 @@ fn an_observed_clock_before_the_turn_clock_is_refused() {
         &clocks().received_at,
     )
     .unwrap_err();
-    assert!(matches!(error, TranscriptConnectorError::ClockOrder));
+    // The refusal names the turn, the comparison, and every clock, so a
+    // future-dated line is told apart from a collector clock that is behind.
+    let TranscriptConnectorError::ClockOrder {
+        ref turn_uid,
+        comparison,
+        ref occurred_at,
+        ref observed_at,
+        ref received_at,
+    } = error
+    else {
+        panic!("a clock refusal: {error}");
+    };
+    assert_eq!(turn_uid, &turn.turn_uid);
+    assert_eq!(comparison, "observed_at precedes the turn's occurred_at");
+    assert_eq!(occurred_at, &turn.occurred_at.to_string());
+    assert_eq!(observed_at, "2020-01-01T00:00:00.000000000Z");
+    assert_eq!(received_at, &clocks().received_at.to_string());
+    let text = error.to_string();
+    assert_eq!(
+        text,
+        format!(
+            "transcript turn {} ingress clocks are not ordered (observed_at precedes the turn's \
+             occurred_at): occurred_at {}, observed_at 2020-01-01T00:00:00.000000000Z, \
+             received_at {}",
+            turn.turn_uid,
+            turn.occurred_at,
+            clocks().received_at
+        )
+    );
 }
 
 #[test]
@@ -250,7 +278,13 @@ fn a_received_clock_before_the_observed_clock_is_refused() {
         .unwrap(),
     )
     .unwrap_err();
-    assert!(matches!(error, TranscriptConnectorError::ClockOrder));
+    assert!(matches!(
+        error,
+        TranscriptConnectorError::ClockOrder {
+            comparison: "received_at precedes observed_at",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -271,7 +305,13 @@ fn a_clock_that_is_not_microsecond_aligned_is_refused() {
         &clocks().received_at,
     )
     .unwrap_err();
-    assert!(matches!(error, TranscriptConnectorError::ClockOrder));
+    assert!(matches!(
+        error,
+        TranscriptConnectorError::ClockOrder {
+            comparison: "a clock is not microsecond aligned",
+            ..
+        }
+    ));
 }
 
 #[test]

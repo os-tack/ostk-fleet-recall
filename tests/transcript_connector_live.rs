@@ -800,6 +800,15 @@ impl LiveConnector {
         source_id: &str,
         bytes: &[u8],
     ) -> (TranscriptBatchV1, TranscriptCollectionStatsV1) {
+        self.try_collect(source_id, bytes).await.unwrap()
+    }
+
+    /// [`Self::collect`], with the connector's refusal when it refuses.
+    async fn try_collect(
+        &self,
+        source_id: &str,
+        bytes: &[u8],
+    ) -> Result<(TranscriptBatchV1, TranscriptCollectionStatsV1), TranscriptConnectorError> {
         let cursor = self.outbox.read_cursor(source_id).await.unwrap();
         let guarantee = RedactionGuaranteeV1::from_active_package(&self.active)
             .expect("the activated package must promise redaction before the durable outbox");
@@ -816,7 +825,6 @@ impl LiveConnector {
             cursor: cursor.as_ref(),
             clocks: &clocks,
         })
-        .unwrap()
     }
 
     async fn stage(
@@ -1608,5 +1616,87 @@ async fn live_draining_one_source_leaves_the_others_pending_under_their_own_cove
             .unwrap()
             .is_empty(),
         "both sources are drained"
+    );
+}
+
+/// A turn dated after the collector's own clock is refused before anything
+/// is staged, and the refusal names the turn, the comparison, and every
+/// clock, so an operator can tell a future-dated transcript line from a
+/// collector whose clock is behind.
+#[tokio::test]
+async fn live_a_future_dated_turn_is_refused_naming_the_turn_and_its_clocks() {
+    let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = live_pool(&database_url).await;
+    let connector = live_connector(&pool, &fixture(), "future-turn").await;
+    let session = "01931f2c-0000-7000-8000-00000000000f";
+    let transcript = format!(
+        "{}\n{}\n",
+        line(
+            "user",
+            session,
+            "turn-past",
+            "2026-08-15T12:30:00.000Z",
+            "please check the failing auth test"
+        ),
+        line(
+            "assistant",
+            session,
+            "turn-future",
+            "2099-01-01T00:00:00.000Z",
+            "this turn is dated after the collector's clock"
+        )
+    );
+    let source_id = "session-future.jsonl";
+
+    let error = connector
+        .try_collect(source_id, transcript.as_bytes())
+        .await
+        .expect_err("a future-dated turn is refused");
+    let TranscriptConnectorError::ClockOrder {
+        ref turn_uid,
+        comparison,
+        ref occurred_at,
+        ref observed_at,
+        ref received_at,
+    } = error
+    else {
+        panic!("a clock refusal, not {error}");
+    };
+    assert_eq!(turn_uid, "turn-future");
+    assert_eq!(comparison, "observed_at precedes the turn's occurred_at");
+    assert!(
+        occurred_at.starts_with("2099-01-01T00:00:00"),
+        "{occurred_at}"
+    );
+    let observed = CanonicalTimestamp::parse(observed_at).expect("the observed clock is canonical");
+    let received = CanonicalTimestamp::parse(received_at).expect("the received clock is canonical");
+    assert!(observed <= received, "{observed_at} <= {received_at}");
+    assert!(
+        observed.as_str().starts_with("20") && !observed.as_str().starts_with("2099"),
+        "the collector's clock is the database's, now: {observed_at}"
+    );
+    let text = error.to_string();
+    for named in [
+        "transcript turn turn-future",
+        "observed_at precedes the turn's occurred_at",
+        "occurred_at 2099-01-01T00:00:00",
+        &format!("observed_at {observed_at}"),
+        &format!("received_at {received_at}"),
+    ] {
+        assert!(text.contains(named), "{text} names {named}");
+    }
+
+    // The whole batch is refused: nothing staged, no cursor.
+    assert_eq!(connector.outbox.count_rows(source_id).await.unwrap(), 0);
+    assert!(
+        connector
+            .outbox
+            .read_cursor(source_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused batch advances no cursor"
     );
 }
