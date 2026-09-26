@@ -163,8 +163,8 @@ const INSERT_OPAQUE_SUPPORT_SQL: &str = "INSERT INTO memory_claim_support (\
 /// A claim's links, each part with its item row and what hides its item now.
 const CLAIM_LINKS_SQL: &str = "SELECT link.link_id, link.via, link.relation, \
      link.item_key_digest, link.version_key_digest, link.part_ordinal, link.support_event_id, \
-     item.trust_tier, item.content_digest, item.provider, item.object_kind, item.external_id, \
-     item.provider_url, item.lifecycle, \
+     item.trust_tier, item.content_digest, item.canonical_resource_id, item.provider, \
+     item.object_kind, item.external_id, item.provider_url, item.lifecycle, \
      head.version_key_digest AS head_version_key, head.lifecycle AS head_lifecycle, \
      container.access AS container_access, \
      COALESCE(own_container.access <> 'ok', false) AS own_container_withdrawn, \
@@ -769,8 +769,10 @@ pub(super) async fn claim_item_support(
         let link_id: Vec<u8> = row.try_get("link_id")?;
         let event = digest_of(row, "support_event_id")?;
         let tier = TrustTierV1::parse(&row.try_get::<String, _>("trust_tier")?)?;
+        let content_digest = digest_of(row, "content_digest")?;
         if let Some(citation) = citations.get_mut(&link_id) {
             citation.cited.accepted_event_ids.push(event);
+            citation.cited.content_digests.push(content_digest);
             if tier == TrustTierV1::Reported {
                 citation.cited.trust = TrustTierV1::Reported;
             }
@@ -800,6 +802,7 @@ pub(super) async fn claim_item_support(
             relation: row.try_get("relation")?,
             item_id: digest_of(row, "item_key_digest")?,
             version_id: version_key,
+            uri: row.try_get("canonical_resource_id")?,
             provider: row.try_get("provider")?,
             object_kind: row.try_get("object_kind")?,
             external_id: row.try_get("external_id")?,
@@ -808,6 +811,7 @@ pub(super) async fn claim_item_support(
             current: head_version == Some(version_key),
             suppressed,
             accepted_event_ids: vec![event],
+            content_digests: vec![content_digest],
             content_trust: ContentTrustV1::UntrustedThirdParty,
         };
         order.push(link_id.clone());
@@ -815,7 +819,7 @@ pub(super) async fn claim_item_support(
             link_id,
             CitationRowsV1 {
                 cited,
-                content_digest: digest_of(row, "content_digest")?,
+                content_digest,
             },
         );
     }

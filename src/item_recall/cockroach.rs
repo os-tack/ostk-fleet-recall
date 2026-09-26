@@ -204,6 +204,14 @@ const RESOLVE_URI_SQL: &str = "SELECT item_key_digest, version_key_digest \
      WHERE tenant_id = $1 AND project = $2 AND canonical_resource_id = $3 \
      ORDER BY accepted_event_id LIMIT 1";
 
+/// The item a version id names, for a 64-hex `get` id that is no item's:
+/// a claim citation's `version_id`. Like the URI read, this seeks no index of
+/// its own and reads the scope's item history.
+const RESOLVE_VERSION_SQL: &str = "SELECT item_key_digest, version_key_digest \
+     FROM public.memory_collected_items_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND version_key_digest = $3 \
+     ORDER BY accepted_event_id LIMIT 1";
+
 /// The item and version a provider URL names (`memory_collected_items_url_idx`):
 /// one a verified channel admitted under that URL first, then the greatest
 /// provider order. A capture's URL is the agent's word, so it never takes a
@@ -887,6 +895,27 @@ impl CockroachItemRecall {
         .transpose()
     }
 
+    /// The item (and the version itself) a version id names, when any
+    /// admitted part carries it.
+    async fn resolve_version(
+        &self,
+        version: Sha256Digest,
+    ) -> Result<Option<(Sha256Digest, Sha256Digest)>> {
+        let row: Option<PgRow> = sqlx::query(RESOLVE_VERSION_SQL)
+            .bind(self.tenant_id)
+            .bind(&self.project)
+            .bind(version.as_bytes().as_slice())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            Ok((
+                digest(&row, "item_key_digest")?,
+                digest(&row, "version_key_digest")?,
+            ))
+        })
+        .transpose()
+    }
+
     async fn presented_head(&self, item: Sha256Digest) -> Result<Option<PresentedHeadV1>> {
         let row: Option<PgRow> = sqlx::query(PRESENTED_HEAD_SQL)
             .bind(self.tenant_id)
@@ -1275,10 +1304,21 @@ impl ItemRecall for CockroachItemRecall {
     }
 
     async fn get(&self, reference: &ItemReferenceV1) -> Result<Option<ItemGetV1>> {
-        let Some((item, requested_version_id)) = self.resolve(reference).await? else {
+        let Some((mut item, mut requested_version_id)) = self.resolve(reference).await? else {
             return Ok(None);
         };
-        let Some(head) = self.presented_head(item).await? else {
+        let mut head = self.presented_head(item).await?;
+        // A 64-hex id no item has may be a citation's version id: resolve the
+        // version's item and answer as a version URI would.
+        if head.is_none()
+            && let ItemReferenceV1::Item(version) = reference
+            && let Some((owner, version_id)) = self.resolve_version(*version).await?
+        {
+            item = owner;
+            requested_version_id = Some(version_id);
+            head = self.presented_head(item).await?;
+        }
+        let Some(head) = head else {
             return Ok(None);
         };
         let (versions, history_truncated) = self.history(item, head.version_key).await?;

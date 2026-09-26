@@ -794,10 +794,10 @@ const fn item_support_rule(surface: RememberSurface) -> &'static str {
     match (surface.item_support, surface.assert) {
         (false, _) => "",
         (true, false) => {
-            "A claim can cite items collected from other systems as support: record's support takes {\"item\": {\"item_id\"|\"version_id\"|\"url\"}, \"relation\"} entries. item_id and url cite the item's current version, version_id exactly that version; an item that is unknown, staged but not yet admitted, deleted, or withdrawn is refused, and recall get with kind=claim lists the items a claim cites. "
+            "A claim can cite items collected from other systems as support: record's support takes {\"item\": {\"item_id\"|\"version_id\"|\"url\"}, \"relation\"} entries. item_id and url cite the item's current version, version_id exactly that version; an item that is unknown, staged but not yet admitted, deleted, or withdrawn is refused, and recall get with kind=claim lists the items a claim cites: each citation names the cited version's uri and content_digests, and recall get with kind=item and that uri (or the version_id) returns exactly the cited bytes. "
         }
         (true, true) => {
-            "A claim can cite items collected from other systems as support: record's support takes {\"item\": {\"item_id\"|\"version_id\"|\"url\"}, \"relation\"} entries, and assert's assertion.support_items takes the same references, cited through their accepted evidence events. item_id and url cite the item's current version, version_id exactly that version; an item that is unknown, staged but not yet admitted, deleted, or withdrawn is refused, and recall get with kind=claim lists the items a claim cites. "
+            "A claim can cite items collected from other systems as support: record's support takes {\"item\": {\"item_id\"|\"version_id\"|\"url\"}, \"relation\"} entries, and assert's assertion.support_items takes the same references, cited through their accepted evidence events. item_id and url cite the item's current version, version_id exactly that version; an item that is unknown, staged but not yet admitted, deleted, or withdrawn is refused, and recall get with kind=claim lists the items a claim cites: each citation names the cited version's uri and content_digests, and recall get with kind=item and that uri (or the version_id) returns exactly the cited bytes. "
         }
     }
 }

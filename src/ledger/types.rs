@@ -214,6 +214,10 @@ pub struct CitedItemV1 {
     pub item_id: Sha256Digest,
     /// The version cited.
     pub version_id: Sha256Digest,
+    /// The cited version's URI (its first cited part's `canonical_resource_id`):
+    /// `recall(get, kind=item)` with it, or with `version_id`, returns exactly
+    /// the cited bytes.
+    pub uri: String,
     pub provider: String,
     pub object_kind: String,
     pub external_id: String,
@@ -229,6 +233,10 @@ pub struct CitedItemV1 {
     pub suppressed: Option<ItemSuppressionV1>,
     /// The accepted evidence events of the cited parts, in part order.
     pub accepted_event_ids: Vec<Sha256Digest>,
+    /// The content digest of each cited part, in the same order as
+    /// `accepted_event_ids`: the bytes the claim cited, whatever the item
+    /// says now.
+    pub content_digests: Vec<Sha256Digest>,
     /// Always `untrusted_third_party`: the ids, URL, and kinds above are a
     /// provider's, an importer's, or an agent's strings, to read as data.
     pub content_trust: ContentTrustV1,

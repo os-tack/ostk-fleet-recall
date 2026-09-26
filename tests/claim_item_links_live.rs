@@ -1124,6 +1124,42 @@ async fn live_record_cites_an_item_through_an_opaque_support_row_when_configured
         format!("{SLACK_CHANNEL}:{}", HERON.ts)
     );
     assert_eq!(got["independent_sources"], 1);
+    // The citation names the cited bytes: the version's uri and each cited
+    // part's content digest, and `get` with that uri or with the version id
+    // returns exactly that version.
+    let cited_uri = items[0]["uri"].as_str().unwrap().to_owned();
+    assert!(cited_uri.starts_with("urn:"), "{cited_uri}");
+    let digests = items[0]["content_digests"].as_array().unwrap();
+    assert_eq!(digests.len(), 1, "{}", items[0]);
+    assert_eq!(digests[0].as_str().unwrap().len(), 64);
+    for reference in [json!(cited_uri), json!(heron.version)] {
+        let by_version = service
+            .recall(
+                scope.clone(),
+                RecallRequest::new(
+                    RecallAction::Get,
+                    arguments(json!({ "kind": "item", "id": reference })),
+                ),
+            )
+            .await
+            .expect("item get by the cited version")
+            .data;
+        assert_eq!(
+            by_version["item"]["item"]["item_id"],
+            json!(heron.item),
+            "{reference}"
+        );
+        assert_eq!(
+            by_version["item"]["requested_version_id"],
+            json!(heron.version),
+            "{reference}"
+        );
+        assert_eq!(
+            by_version["item"]["current"]["parts"][0]["uri"],
+            json!(cited_uri),
+            "{reference}"
+        );
+    }
 
     // The public reader: its claim get keeps the claim and drops the
     // citation row, and it cannot read the links at all.

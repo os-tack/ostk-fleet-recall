@@ -894,7 +894,10 @@ nothing and leaves the key unused.
 
 `recall(get, kind=claim)` then adds `support_items`: each cited item with its
 provider, ids, trust tier (`verified` or `reported`), whether the cited
-version is still current, why it is hidden if it now is, and
+version is still current, why it is hidden if it now is, the cited bytes
+themselves (`uri`, the cited version's URI, and `content_digests`, one per
+cited part beside `accepted_event_ids`; `recall(get, kind=item)` with that
+`uri` or with the `version_id` returns exactly that version), and
 `content_trust: "untrusted_third_party"`; and `independent_sources`, the
 number of distinct contents among the visible ones, counting each item once
 however many of its versions are cited, so an edit, an echo, or a cross-post
