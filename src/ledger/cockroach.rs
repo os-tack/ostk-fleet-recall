@@ -19,7 +19,7 @@ use crate::ledger::{
     ClaimMutation, ClaimState, ClaimSupport, ClaimTarget, Conflict, ConflictHistory,
     ConflictLifecycleRows, ConflictMutation, ConflictTarget, DismissalTerms,
     FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2,
-    LifecycleMutation, LifecycleReplayRequest, SemanticClaimHit, SupportInputV1,
+    LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest, SemanticClaimHit, SupportInputV1,
     SupportedClaimCoordinate, SupportedClaimIds, WaiverTerms,
 };
 use crate::memory_contracts::evidence::AcceptedEventId;
@@ -878,6 +878,10 @@ impl ClaimLedger for CockroachClaimLedger {
         claim_ids: &[i64],
     ) -> Result<Vec<(i64, ClaimState)>> {
         lifecycle_store::claim_states(self, scope, claim_ids).await
+    }
+
+    async fn legacy_claim_keys(&self, scope: &FleetScope) -> Result<LegacyClaimKeysV1> {
+        lifecycle_store::legacy_claim_keys(self, scope).await
     }
 
     async fn get_claim(&self, scope: &FleetScope, id: i64) -> Result<Option<Claim>> {
@@ -5356,5 +5360,242 @@ mod tests {
             .unwrap();
         assert_eq!(left.state, ClaimState::Disputed);
         assert_eq!(right.state, ClaimState::Disputed);
+    }
+
+    /// A claim keyed under the earlier normalizer (which kept `_`) is invisible
+    /// to the detector for a claim recorded since under the same words; the
+    /// status count shows the gap, and a supersede with the same words moves
+    /// the claim onto its current key, where the conflict opens.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one connected lineage: seed, gap, bridge, cleanup
+    async fn live_legacy_underscore_key_is_bridged_by_supersede_when_configured() {
+        let Ok(database_url) = std::env::var("FLEET_RECALL_TEST_DATABASE_URL") else {
+            return;
+        };
+        let project = format!("live-legacy-keys-{}", Uuid::now_v7());
+        let scope = scope(&project);
+        let store = crate::store::cockroach::CockroachStore::connect(
+            &database_url,
+            scope.clone(),
+            crate::store::cockroach::PoolConfig::default(),
+        )
+        .await
+        .unwrap();
+        store.migrate().await.unwrap();
+        store
+            .initialize_embedding_model(TestEmbedder.model_id())
+            .await
+            .unwrap();
+        let ledger = CockroachClaimLedger::new(
+            store.pool().clone(),
+            scope.clone(),
+            Arc::new(TestEmbedder),
+            RetryPolicy::default(),
+        )
+        .unwrap();
+        let claim = |subject: &str, value: bool| ClaimInput {
+            kind: ClaimKind::Decision,
+            text: format!("{subject} is {value}"),
+            subject: Some(subject.into()),
+            predicate: Some("enabled".into()),
+            value: Some(Value::Bool(value)),
+            polarity: 1,
+            origin: "operator_asserted".into(),
+            actor: None,
+            confidence: 1.0,
+            valid_from: None,
+            valid_to: None,
+            support: Vec::new(),
+        };
+        assert_eq!(
+            ledger.legacy_claim_keys(&scope).await.unwrap(),
+            LegacyClaimKeysV1::default()
+        );
+
+        // Seed the legacy row as the earlier normalizer left it: record under
+        // the current rule, then rewrite the key and its parts by SQL so every
+        // ancillary row (chunk, embedding, events) stays consistent.
+        let legacy = ledger
+            .record_claim(
+                &scope,
+                &claim("include_transcript_default", true),
+                "live-legacy-keys/legacy",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            legacy.claim.claim_key.as_deref(),
+            Some("include-transcript-default::enabled")
+        );
+        let rewritten = sqlx::query(
+            "UPDATE memory_claims \
+             SET claim_key = 'include_transcript_default::enabled', \
+                 subject = 'include_transcript_default' \
+             WHERE tenant_id = $1 AND project = $2 AND id = $3",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind(legacy.claim.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(rewritten.rows_affected(), 1);
+        assert_eq!(
+            ledger.legacy_claim_keys(&scope).await.unwrap(),
+            LegacyClaimKeysV1 {
+                count: 1,
+                bound_exceeded: false,
+            }
+        );
+
+        // The gap: the opposite value under the current spelling of the same
+        // words takes another key, so no conflict opens.
+        let current = ledger
+            .record_claim(
+                &scope,
+                &claim("include-transcript default", false),
+                "live-legacy-keys/current",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            current.claim.claim_key.as_deref(),
+            Some("include-transcript-default::enabled")
+        );
+        assert!(current.conflicts_opened.is_empty());
+        assert!(current.claim.conflict_ids.is_empty());
+        assert_eq!(
+            ledger.legacy_claim_keys(&scope).await.unwrap().count,
+            1,
+            "the gap stays visible until the legacy row leaves the current set"
+        );
+
+        // A successor off the key is refused with both keys in the details.
+        let moved = ledger
+            .supersede_claim(
+                &scope,
+                ClaimTarget {
+                    claim_id: legacy.claim.id,
+                    expected_revision: legacy.claim.revision,
+                },
+                None,
+                &claim("include-transcript", true),
+                "live-legacy-keys/moved",
+            )
+            .await
+            .unwrap_err();
+        let FleetError::LifecycleRefused(refusal) = moved else {
+            panic!("expected a lifecycle refusal, got {moved:?}");
+        };
+        assert_eq!(refusal.code, RefusalCode::SuccessorKeyMismatch);
+        assert_eq!(
+            refusal.details["claim_key"],
+            "include_transcript_default::enabled"
+        );
+        assert_eq!(
+            refusal.details["normalized_claim_key"],
+            "include-transcript-default::enabled"
+        );
+
+        // The bridge: the same words move the claim onto its current key,
+        // and the conflict the legacy key hid opens against the current claim.
+        let superseded = ledger
+            .supersede_claim(
+                &scope,
+                ClaimTarget {
+                    claim_id: legacy.claim.id,
+                    expected_revision: legacy.claim.revision,
+                },
+                Some("re-key onto the current normalizer"),
+                &claim("include_transcript_default", true),
+                "live-legacy-keys/bridge",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            superseded.claim.claim_key.as_deref(),
+            Some("include-transcript-default::enabled")
+        );
+        assert_eq!(superseded.conflicts_opened.len(), 1);
+        let conflict_id = superseded.conflicts_opened[0];
+        let conflicts = ledger.get_conflicts(&scope, &[conflict_id]).await.unwrap();
+        assert_eq!(conflicts.len(), 1);
+        let conflict = &conflicts[0];
+        assert_eq!(conflict.state, "open");
+        assert_eq!(conflict.detector, FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2);
+        assert_eq!(conflict.claim_key, "include-transcript-default::enabled");
+        let mut members = conflict
+            .members
+            .iter()
+            .map(|member| member.id)
+            .collect::<Vec<_>>();
+        members.sort_unstable();
+        let mut expected = vec![current.claim.id, superseded.claim.id];
+        expected.sort_unstable();
+        assert_eq!(members, expected);
+        assert_eq!(
+            ledger.legacy_claim_keys(&scope).await.unwrap(),
+            LegacyClaimKeysV1::default()
+        );
+        let (event_kind, payload): (String, Value) = sqlx::query_as(
+            "SELECT event_kind, payload FROM memory_events \
+             WHERE tenant_id = $1 AND project = $2 AND idempotency_key = $3",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .bind("live-legacy-keys/bridge")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(event_kind, "claim_superseded");
+        assert_eq!(
+            payload["predecessor_claim_key"],
+            "include_transcript_default::enabled"
+        );
+        assert_eq!(payload["claim_key"], "include-transcript-default::enabled");
+        assert_eq!(payload["successor_claim_id"], superseded.claim.id);
+
+        for statement in [
+            "DELETE FROM memory_mutation_receipts WHERE tenant_id = $1 AND project = $2",
+            "DELETE FROM memory_events WHERE tenant_id = $1 AND project = $2",
+            "DELETE FROM memory_conflicts WHERE tenant_id = $1 AND project = $2",
+            "DELETE FROM memory_claims WHERE tenant_id = $1 AND project = $2",
+            "DELETE FROM memory_chunks WHERE tenant_id = $1 AND project = $2",
+            "DELETE FROM memory_corpus_models WHERE tenant_id = $1 AND project = $2",
+        ] {
+            sqlx::query(statement)
+                .bind(scope.tenant_id)
+                .bind(&scope.project)
+                .execute(store.pool())
+                .await
+                .unwrap();
+        }
+        let residue: i64 = sqlx::query_scalar(
+            "SELECT \
+                 (SELECT count(*) FROM memory_mutation_receipts \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_events \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_claim_events \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_claim_embeddings \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_conflict_members \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_conflicts \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_claims \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_chunks \
+                  WHERE tenant_id = $1 AND project = $2) + \
+                 (SELECT count(*) FROM memory_corpus_models \
+                  WHERE tenant_id = $1 AND project = $2)",
+        )
+        .bind(scope.tenant_id)
+        .bind(&scope.project)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(residue, 0, "connected legacy key test leaked scoped rows");
     }
 }

@@ -10,8 +10,8 @@ mod types;
 pub use cockroach::CockroachClaimLedger;
 pub use conflict::{
     FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2, FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2, canonical_json,
-    claims_are_incompatible, functional_values_are_incompatible, intervals_overlap,
-    normalize_key_part,
+    claim_key_from_parts, claims_are_incompatible, functional_values_are_incompatible,
+    intervals_overlap, normalize_key_part,
 };
 pub(crate) use lifecycle::validate_reason as validate_lifecycle_reason;
 pub use lifecycle::{
@@ -34,6 +34,7 @@ pub use types::{
     ClaimTarget, ClosureView, Conflict, ConflictCoverage, ConflictHistory, ConflictLifecycleEvent,
     ConflictLifecycleOverlay, ConflictLifecycleRows, ConflictMutation, ConflictReevaluation,
     ConflictTarget, DismissalTerms, ITEM_SUPPORT_SOURCE, ITEM_SUPPORT_SOURCE_CONFIG_ID, ItemRefV1,
-    ItemSupportInputV1, LifecycleMutation, LifecycleReplayRequest, MAX_SUPPORT_ITEMS, RevisionGap,
-    SemanticClaimHit, SupersededClaim, SupportInputV1, WaiverTerms, WaiverView,
+    ItemSupportInputV1, LegacyClaimKeysV1, LifecycleMutation, LifecycleReplayRequest,
+    MAX_SUPPORT_ITEMS, RevisionGap, SemanticClaimHit, SupersededClaim, SupportInputV1, WaiverTerms,
+    WaiverView,
 };

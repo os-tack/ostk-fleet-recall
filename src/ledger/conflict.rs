@@ -16,14 +16,37 @@ pub const FUNCTIONAL_VALUE_CONFLICT_DETECTOR_V2: &str = "same_key_functional_val
 /// Human-readable summary persisted beside every v2 conflict observation.
 pub const FUNCTIONAL_VALUE_CONFLICT_RATIONALE_V2: &str = "overlapping lifecycle-current functional-key claims affirm different values or affirm and negate the same value";
 
+/// Normalize one `subject` or `predicate` of a functional claim key.
+///
+/// The value is lowercased and split on every run of whitespace, `_`, or
+/// `-`; empty parts are dropped and the rest are joined with `-`, so
+/// `Fleet Store`, `fleet_store`, and `fleet-store` all read `fleet-store`.
+/// The rule refines the earlier one, which kept `_`, so re-normalizing a
+/// stored part reproduces exactly the key a fresh record of the same words
+/// gets (`normalize_key_part(old(x)) == normalize_key_part(x)`); that is what
+/// lets a supersede bridge a legacy `_` key onto its current spelling.
 #[must_use]
 pub fn normalize_key_part(value: &str) -> String {
     value
-        .trim()
         .to_lowercase()
-        .split_whitespace()
+        .split(|character: char| character.is_whitespace() || matches!(character, '_' | '-'))
+        .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+/// The functional claim key of a `subject` and `predicate`.
+///
+/// Each part is normalized by [`normalize_key_part`] and the two are joined
+/// as `subject::predicate`; the key is `None` when either normalizes to
+/// nothing, so a claim whose parts are only separators carries no key.
+/// Normalization is idempotent, so stored (already normalized) parts and raw
+/// input give the same key.
+#[must_use]
+pub fn claim_key_from_parts(subject: &str, predicate: &str) -> Option<String> {
+    let subject = normalize_key_part(subject);
+    let predicate = normalize_key_part(predicate);
+    (!subject.is_empty() && !predicate.is_empty()).then(|| format!("{subject}::{predicate}"))
 }
 
 #[must_use]
@@ -287,5 +310,97 @@ mod tests {
     fn half_open_intervals_touch_without_overlap() {
         let at = Utc::now();
         assert!(!intervals_overlap(None, Some(at), Some(at), None));
+    }
+
+    /// The normalizer before underscores became separators: lowercase, split
+    /// on whitespace only, joined with `-`. Kept here, privately, so the
+    /// bridge property below is checked against what the stored rows hold.
+    fn old_normalize_key_part(value: &str) -> String {
+        value
+            .trim()
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+
+    /// Raw inputs a caller may send, with the key part each must produce.
+    const KEY_PART_FIXTURES: &[(&str, &str)] = &[
+        ("include_transcript_default", "include-transcript-default"),
+        ("include-transcript default", "include-transcript-default"),
+        ("Include Transcript Default", "include-transcript-default"),
+        ("include__transcript--default", "include-transcript-default"),
+        (
+            "include _ transcript - default",
+            "include-transcript-default",
+        ),
+        ("  Fleet   Store ", "fleet-store"),
+        ("fleet_store", "fleet-store"),
+        ("_fleet_store_", "fleet-store"),
+        ("-fleet-store-", "fleet-store"),
+        ("\tfleet\u{a0}store\n", "fleet-store"),
+        ("a_", "a"),
+        ("_", ""),
+        ("-_- \t", ""),
+        ("", ""),
+        ("database-choice", "database-choice"),
+        ("ÉCOLE_Normale", "école-normale"),
+    ];
+
+    #[test]
+    fn key_parts_collapse_every_separator_run() {
+        for (raw, expected) in KEY_PART_FIXTURES {
+            assert_eq!(normalize_key_part(raw), *expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn key_part_normalization_is_idempotent() {
+        for (raw, _) in KEY_PART_FIXTURES {
+            let once = normalize_key_part(raw);
+            assert_eq!(normalize_key_part(&once), once, "{raw:?}");
+        }
+    }
+
+    /// The new rule refines the old one, so re-normalizing a stored part
+    /// gives exactly the key a fresh record of the same words gets. The
+    /// supersede bridge and the `legacy_claim_keys` status count rest on it.
+    #[test]
+    fn new_normalizer_absorbs_the_old_one() {
+        for (raw, _) in KEY_PART_FIXTURES {
+            let stored = old_normalize_key_part(raw);
+            assert_eq!(
+                normalize_key_part(&stored),
+                normalize_key_part(raw),
+                "{raw:?} stored as {stored:?}"
+            );
+        }
+        // The old rule kept underscores, which is the gap being bridged.
+        assert_eq!(
+            old_normalize_key_part("include_transcript_default"),
+            "include_transcript_default"
+        );
+        assert_eq!(
+            old_normalize_key_part("include-transcript default"),
+            "include-transcript-default"
+        );
+    }
+
+    #[test]
+    fn claim_key_from_parts_requires_both_parts() {
+        assert_eq!(
+            claim_key_from_parts("include_transcript_default", "x").as_deref(),
+            Some("include-transcript-default::x")
+        );
+        assert_eq!(
+            claim_key_from_parts(" Fleet Store ", "Database Choice").as_deref(),
+            Some("fleet-store::database-choice")
+        );
+        // A stored legacy part re-keys from its parts, never from the joined
+        // string: `a_` gives `a::b`, where the string would give `a-::b`.
+        assert_eq!(claim_key_from_parts("a_", "b").as_deref(), Some("a::b"));
+        for (subject, predicate) in [("_", "x"), ("x", "-_-"), ("", "x"), ("", "")] {
+            assert_eq!(claim_key_from_parts(subject, predicate), None);
+        }
     }
 }
