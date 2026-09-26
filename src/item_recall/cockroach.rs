@@ -1047,6 +1047,29 @@ impl CockroachItemRecall {
         .transpose()
     }
 
+    /// The item a reference names, the version it asked for, and that item's
+    /// presented head. A 64-hex id no item has may be a citation's version
+    /// id: the version's item is resolved and answered as a version URI
+    /// would be.
+    async fn resolve_presented(
+        &self,
+        reference: &ItemReferenceV1,
+    ) -> Result<Option<(Sha256Digest, Option<Sha256Digest>, PresentedHeadV1)>> {
+        let Some((mut item, mut requested_version_id)) = self.resolve(reference).await? else {
+            return Ok(None);
+        };
+        let mut head = self.presented_head(item).await?;
+        if head.is_none()
+            && let ItemReferenceV1::Item(version) = reference
+            && let Some((owner, version_id)) = self.resolve_version(*version).await?
+        {
+            item = owner;
+            requested_version_id = Some(version_id);
+            head = self.presented_head(item).await?;
+        }
+        Ok(head.map(|head| (item, requested_version_id, head)))
+    }
+
     async fn presented_head(&self, item: Sha256Digest) -> Result<Option<PresentedHeadV1>> {
         let row: Option<PgRow> = sqlx::query(PRESENTED_HEAD_SQL)
             .bind(self.tenant_id)
@@ -1462,21 +1485,8 @@ impl ItemRecall for CockroachItemRecall {
     }
 
     async fn get(&self, reference: &ItemReferenceV1) -> Result<Option<ItemGetV1>> {
-        let Some((mut item, mut requested_version_id)) = self.resolve(reference).await? else {
-            return Ok(None);
-        };
-        let mut head = self.presented_head(item).await?;
-        // A 64-hex id no item has may be a citation's version id: resolve the
-        // version's item and answer as a version URI would.
-        if head.is_none()
-            && let ItemReferenceV1::Item(version) = reference
-            && let Some((owner, version_id)) = self.resolve_version(*version).await?
-        {
-            item = owner;
-            requested_version_id = Some(version_id);
-            head = self.presented_head(item).await?;
-        }
-        let Some(head) = head else {
+        let Some((item, requested_version_id, head)) = self.resolve_presented(reference).await?
+        else {
             return Ok(None);
         };
         let (versions, history_truncated) = self.history(item, head.version_key).await?;
