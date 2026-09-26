@@ -844,11 +844,15 @@ id is the operator's own pin, and nothing is checked against it.
   `all_notes_visible_to_key`, one `granola.workspace` container (the
   provider scope id). A note is staged in the listed folder with the least id
   it is in, `operator_declared`. A note in no listed folder is never staged;
-  one the memory already holds is staged once more as a restricted draft in
-  its own folder, which the sink refuses and which withdraws the item (D6),
-  and the notes cursor remembers it, so a later read in a listed folder
-  stages it again even unchanged, which lifts the withdrawal at its equal
-  order.
+  for one the memory already holds, every item it holds (the summary, and
+  the transcript whether or not transcripts are read now) gets a
+  content-free observation marked private, at the note's listed order, which
+  the sink refuses and which withdraws the item (D6). Nothing is rebuilt from
+  the note, so an item that could not be drafted now is withdrawn all the
+  same. The memory's own withdrawal rows say which items are withdrawn
+  (`known_versions` reads them), with no bound, so a later read in a listed
+  folder stages each one again even unchanged, which lifts the withdrawal at
+  its equal order.
 - **Items.** A note is up to two items, each with the note id as external
   id: its AI summary (`note_summary`: `summary_markdown`, else
   `summary_text`; author the owner by email, kind `ai_summary`; the calendar
@@ -862,8 +866,10 @@ id is the operator's own pin, and nothing is checked against it.
   and attendees are not fields of the note the collector parses. There is no
   marker: the default rule makes it `updated_at` (the order) with the content
   digest, so a summary regenerated under the same `updated_at` is a new
-  version too. An item whose content, lifecycle, and container the memory
-  holds is kept, not staged.
+  version too. Such a version would tie with the one the memory holds, and a
+  tie at the head is broken by digest, not recency, so it is ordered at the
+  pass's instant instead: when it was first observed. An item whose content,
+  lifecycle, and container the memory holds is kept, not staged.
 - **A pass** is a reconciliation when none has run to its end within
   `reconcile_every_seconds` (86,400 by default, the `granola.reconcile`
   cursor) or one is under way, else incremental; only a reconciliation writes

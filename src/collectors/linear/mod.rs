@@ -648,6 +648,7 @@ impl TeamReadV1<'_> {
             page.blemished = true;
         }
         if let Some(known) = known.get(&draft.external_id)
+            && !known.withdrawn
             && known.lifecycle == draft.lifecycle
             && digest == Some(known.content_digest)
         {

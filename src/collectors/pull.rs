@@ -27,8 +27,9 @@ use async_trait::async_trait;
 
 use crate::error::{FleetError, Result};
 use crate::memory_contracts::collected_item::{
-    AudienceBasisV1, CollectionModeV1, ContainerKindV1, ItemCollectionV1, ObjectKindV1,
-    derive_container_key, derive_observation_manifest,
+    AudienceBasisV1, CollectionModeV1, ContainerKindV1, ItemCollectionV1, ItemLifecycleV1,
+    ObjectKindV1, ProviderKindV1, TextFormatV1, VisibilityHintV1, derive_container_key,
+    derive_observation_manifest,
 };
 use crate::memory_contracts::common::{CanonicalTimestamp, ContractId};
 use crate::memory_contracts::coverage::CoverageProofMethodV1;
@@ -38,7 +39,9 @@ use crate::worker::CollectorSourceV1;
 use super::audience::{AudiencePolicyV1, ProviderAudienceV1};
 use super::binding::CollectorInstanceV1;
 use super::cockroach::framed_sha256;
-use super::draft::{CollectedItemDraftV1, SealContextV1, collection_record, seal};
+use super::draft::{
+    CollectedItemDraftV1, DraftContainerV1, SealContextV1, collection_record, seal,
+};
 use super::redaction::CollectorRedactorV1;
 use super::sink::{
     CollectedItemSink, CollectorCursorV1, CollectorDeadLetterV1, ContainerObservationV1,
@@ -170,6 +173,60 @@ pub struct PulledItemV1 {
     pub draft: CollectedItemDraftV1,
     /// The provider audience of its container.
     pub provider_audience: Option<ProviderAudienceV1>,
+}
+
+/// One item the memory holds, to withdraw.
+#[derive(Debug, Clone, Copy)]
+pub struct WithdrawnItemV1<'a> {
+    /// The provider kind.
+    pub provider: &'a ProviderKindV1,
+    /// The provider scope.
+    pub provider_scope_id: &'a str,
+    /// The item's object kind.
+    pub object_kind: &'a ObjectKindV1,
+    /// The item's external id.
+    pub external_id: &'a str,
+    /// The order of the observation that narrowed it: at least the order the
+    /// memory holds it at, or the refusal is stale and changes nothing.
+    pub order_micros: u64,
+}
+
+/// A content-free observation that withdraws an item the memory holds.
+///
+/// For a collector that finds an item's audience narrowed without a read
+/// that could carry its content: a note that left the listed folders, an
+/// issue moved into a team the collector does not admit or can no longer
+/// see, the comments on an issue in the trash. The draft says the item is
+/// private, so the sink refuses it on its audience whatever its container,
+/// before sealing anything: it carries no text, and the refusal of an item
+/// the memory holds withdraws the item for the pull's tier, so every body of
+/// it is withheld at read time. An admissible read of the item at an order
+/// at least as great lifts the withdrawal.
+#[must_use]
+pub fn withdrawal(item: &WithdrawnItemV1<'_>, container: Option<DraftContainerV1>) -> PulledItemV1 {
+    PulledItemV1 {
+        draft: CollectedItemDraftV1 {
+            provider: item.provider.clone(),
+            provider_scope_id: item.provider_scope_id.to_owned(),
+            object_kind: item.object_kind.clone(),
+            external_id: item.external_id.to_owned(),
+            marker: None,
+            order_micros: item.order_micros,
+            lifecycle: ItemLifecycleV1::Live,
+            container,
+            thread: None,
+            author: None,
+            created_at: None,
+            updated_at: None,
+            title: None,
+            sections: Vec::new(),
+            text_format: TextFormatV1::Plain,
+            links: Vec::new(),
+            provider_url: None,
+            visibility: Some(VisibilityHintV1::Private),
+        },
+        provider_audience: Some(ProviderAudienceV1::Restricted),
+    }
 }
 
 /// What a [`PageStager`] stages under.

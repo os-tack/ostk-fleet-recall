@@ -976,6 +976,97 @@ async fn live_granola_a_note_that_leaves_the_listed_folders_is_withdrawn_and_lif
 }
 
 #[tokio::test]
+async fn live_granola_a_note_that_leaves_the_listed_folders_withdraws_every_item_it_held_and_its_return_lifts_them_without_the_cursor_when_configured()
+ {
+    let base = base_seconds();
+    let Some(harness) = Harness::new("granola-withdraw-all", meetings_world(base)).await else {
+        return;
+    };
+    harness.ok_tick(&harness.sources(&json!({}))).await;
+    assert_eq!(hits(&harness.search("platypus").await), [transcript_hit(1)]);
+
+    // Transcripts are turned off, then the note moves to People, which is
+    // not listed: its transcript is withdrawn with its summary, although the
+    // pass no longer reads transcripts.
+    let summaries_only = harness.sources(&json!({"include_transcript": false}));
+    harness.world().note_mut(1).folders = vec![(PEOPLE.to_owned(), "People".to_owned())];
+    harness.reconcile_due().await;
+    let report = harness.ok_tick(&summaries_only).await;
+    assert_eq!(Harness::source(&report).counters["notes_withdrawn"], 1);
+    assert!(harness.search("platypus").await.hits.is_empty());
+    assert!(harness.evidence("platypus").await.hits.is_empty());
+    assert!(harness.search("quokka").await.hits.is_empty());
+    for kind in ["note_summary", "transcript"] {
+        assert_eq!(
+            harness.get(kind, &note_id(1)).await.suppressed,
+            Some(ItemSuppressionV1::ItemWithdrawn),
+            "{kind}"
+        );
+    }
+
+    // The collector's cursors are lost, then the note comes back: the
+    // memory's own withdrawal rows are what make the return lift them.
+    sqlx::query(
+        "DELETE FROM memory_collector_cursors_v1 \
+         WHERE tenant_id = $1 AND project = $2 AND collector_instance_id = $3",
+    )
+    .bind(harness.fixture.installed.scope.tenant_id)
+    .bind(&harness.fixture.installed.scope.project)
+    .bind(INSTANCE)
+    .execute(&harness.pool)
+    .await
+    .unwrap();
+    harness.world().note_mut(1).folders = vec![(PLATFORM.to_owned(), "Platform".to_owned())];
+    harness.ok_tick(&harness.sources(&json!({}))).await;
+    assert_eq!(hits(&harness.search("quokka").await), [summary_hit(1)]);
+    assert_eq!(hits(&harness.search("platypus").await), [transcript_hit(1)]);
+    for kind in ["note_summary", "transcript"] {
+        assert_eq!(
+            harness.get(kind, &note_id(1)).await.suppressed,
+            None,
+            "{kind}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn live_granola_a_summary_regenerated_under_the_same_updated_at_is_presented_when_configured()
+{
+    let base = base_seconds();
+    let Some(harness) = Harness::new("granola-regenerated", meetings_world(base)).await else {
+        return;
+    };
+    let sources = harness.sources(&json!({}));
+    harness.ok_tick(&sources).await;
+    assert_eq!(hits(&harness.search("tuesday").await), [summary_hit(2)]);
+
+    // Granola regenerates the summary; updated_at does not move.
+    harness.edit(2, |note| {
+        note.summary = "The egret rollout moves to Thursday.".to_owned();
+    });
+    harness.reconcile_due().await;
+    let report = harness.ok_tick(&sources).await;
+    assert_eq!(Harness::source(&report).counters["summaries_staged"], 1);
+    assert_eq!(hits(&harness.search("egret").await), [summary_hit(2)]);
+    assert!(
+        harness.search("tuesday").await.hits.is_empty(),
+        "the regenerated summary is the one presented"
+    );
+    let regenerated = harness.get("note_summary", &note_id(2)).await;
+    assert_eq!(
+        part_text(&regenerated),
+        "The egret rollout moves to Thursday."
+    );
+    assert_eq!(regenerated.history.len(), 1);
+
+    // Read again unchanged, it is kept, not staged.
+    harness.reconcile_due().await;
+    let report = harness.ok_tick(&sources).await;
+    assert_eq!(Harness::source(&report).counters["summaries_staged"], 0);
+    assert_eq!(hits(&harness.search("egret").await), [summary_hit(2)]);
+}
+
+#[tokio::test]
 async fn live_granola_a_rate_limit_is_partial_and_the_next_pass_resumes_after_the_last_note_settled_when_configured()
  {
     let base = base_seconds();

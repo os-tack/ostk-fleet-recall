@@ -10,7 +10,10 @@
 //! * **Versions.** A note has no version marker of its own that also tells a
 //!   regenerated summary apart, so the default rule applies: the marker is
 //!   `o<order>:sha256:<content digest>`, where the order is the note's
-//!   `updated_at` in microseconds; `updated_at` plus the content digest.
+//!   `updated_at` in microseconds; `updated_at` plus the content digest. A
+//!   summary regenerated under the same `updated_at` is ordered by the
+//!   collector at the instant it was first observed, so it does not tie
+//!   with the version it replaces.
 //! * **Summary.** `summary_markdown` (markdown), else `summary_text` (plain);
 //!   a note with neither has no summary item. The title is the note's. The
 //!   author is the note's owner, by email (the only id Granola gives), with

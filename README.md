@@ -445,13 +445,16 @@ project may see, since a key has no audience of its own:
 The API names no workspace, so `provider_scope_id` is the operator's own pin
 for it. `audience.operator_declared` is required, and so is exactly one of
 `folders` (folder ids, `fol_...`: only a note in a listed folder is staged,
-and one that leaves them is withdrawn and hidden until it returns) and
+and every item of one that leaves them, its transcript too, is withdrawn and
+hidden until it returns) and
 `all_notes_visible_to_key: true` (every note the key reads). Each note
 becomes its AI summary (`summary_markdown`, author kind `ai_summary`) and,
 only with `include_transcript` (off by default), its transcript, one
 `[hh:mm:ss] speaker: text` line per segment, split between segments; a note's
 private notes and attendees are never read. The marker is the note's
-`updated_at` with the content digest, so a regenerated summary supersedes.
+`updated_at` with the content digest, so a regenerated summary supersedes
+(one regenerated under the same `updated_at` is ordered when it was first
+observed, so it never ties with the version it replaces).
 Once every `reconcile_every_seconds` a pass lists every note and re-reads each
 one, and only that reconciliation records coverage; the passes between list
 the notes updated since the last one read and read those. A note missing from

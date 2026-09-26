@@ -14,9 +14,10 @@
 //! which notes: `settings.folders` lists folders (`fol_...`), each one
 //! `granola.folder` container, and only a note in a listed folder is staged;
 //! or `settings.all_notes_visible_to_key` declares every note the key reads,
-//! in one `granola.workspace` container. A note that leaves the listed
-//! folders is withdrawn and hidden until it returns; one never in them is
-//! never staged.
+//! in one `granola.workspace` container. Every item of a note that leaves
+//! the listed folders (its transcript too, whether or not transcripts are
+//! still read) is withdrawn and hidden until the note returns; one never in
+//! them is never staged.
 //! Transcripts are read only with `settings.include_transcript` (off by
 //! default); private notes never are.
 //!
@@ -89,7 +90,7 @@ use super::http::{
 };
 use super::pull::{
     ContainerOutcomeV1, ListingBoundV1, PageStager, PartialReasonV1, PullCollectorV1,
-    PullPassInputV1, PullPassOutcomeV1, PulledItemV1,
+    PullPassInputV1, PullPassOutcomeV1, PulledItemV1, WithdrawnItemV1, withdrawal,
 };
 use super::sink::{ContainerObservationV1, CursorAdvanceV1, DeadLetterReasonV1, KnownVersionV1};
 use api::{GranolaApiV1, GranolaCallErrorV1, GranolaNoteV1, GranolaSegmentV1, ListEntryV1};
@@ -130,8 +131,6 @@ pub const LIST_OVERLAP_SECONDS: u64 = 300;
 
 /// Notes the cursor remembers as missing once, at most.
 const MAX_MISSING: usize = 128;
-/// Notes the cursor remembers as withdrawn from the listed folders, at most.
-const MAX_OUTSIDE: usize = 64;
 /// Notes the cursor remembers as lately settled, at most.
 const MAX_RECENT: usize = 64;
 /// Notes settled with nothing to stage between two cursor writes, at most.
@@ -373,9 +372,12 @@ struct NotesCursorV1 {
     /// many consecutive complete listings missed them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     missing: BTreeMap<String, u8>,
-    /// Notes withdrawn because they left the listed folders.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    outside: BTreeSet<String>,
+    /// Notes an earlier build remembered as withdrawn. A withdrawal is now
+    /// read from the memory itself ([`KnownVersionV1::withdrawn`]), which
+    /// has no bound; the field is still decoded so an older cursor keeps its
+    /// position, and is never written again.
+    #[serde(default, rename = "outside", skip_serializing)]
+    legacy_outside: BTreeSet<String>,
     /// The notes settled last, within [`LIST_OVERLAP_SECONDS`] of the newest,
     /// by id: the `updated_at` (microseconds) each was settled at. A note an
     /// incremental listing re-reads in its overlap, still at that version, is
@@ -822,7 +824,6 @@ impl GranolaPassV1<'_> {
                 continue;
             }
             self.bump("tombstones");
-            self.cursor.outside.remove(&id);
             for (kind, known) in [
                 (SUMMARY_OBJECT_KIND, &self.summaries),
                 (TRANSCRIPT_OBJECT_KIND, &self.transcripts),
@@ -858,24 +859,23 @@ impl GranolaPassV1<'_> {
         self.stage(tombstones, stager).await
     }
 
-    /// Whether the memory holds a listed note at its listed `updated_at`.
+    /// Whether the memory holds a listed note at its listed `updated_at`,
+    /// and holds none of its items withdrawn.
     fn held(&self, position: &PositionV1) -> bool {
         let at = |known: &BTreeMap<String, KnownVersionV1>| {
             known.get(&position.id).is_some_and(|version| {
-                !version.lifecycle.is_tombstone() && version.provider_order == position.order
+                !version.lifecycle.is_tombstone()
+                    && !version.withdrawn
+                    && version.provider_order == position.order
             })
         };
-        !self.cursor.outside.contains(&position.id)
-            && at(&self.summaries)
+        at(&self.summaries)
             && (!self.collector.settings.include_transcript || at(&self.transcripts))
     }
 
     /// Hold current what the memory holds of a note an earlier pass of this
-    /// reconciliation settled.
+    /// reconciliation settled; a withdrawn item is not current.
     fn keep_settled(&self, id: &str, stager: &mut PageStager<'_>) {
-        if self.cursor.outside.contains(id) {
-            return;
-        }
         let read = [
             (&self.summaries, true),
             (
@@ -886,7 +886,7 @@ impl GranolaPassV1<'_> {
         for (known, read) in read {
             if let Some(version) = known
                 .get(id)
-                .filter(|version| read && !version.lifecycle.is_tombstone())
+                .filter(|version| read && !version.lifecycle.is_tombstone() && !version.withdrawn)
             {
                 stager.keep(version.container_key, version);
             }
@@ -1038,11 +1038,8 @@ impl GranolaPassV1<'_> {
         };
         self.bump("notes_fetched");
         let Some(slot) = self.place(&note) else {
-            return Ok(NoteEndV1::Settled(self.outside(&note, segments.as_deref())));
+            return Ok(NoteEndV1::Settled(self.outside(&note)));
         };
-        // A note back from outside the listed folders is staged even when
-        // unchanged: staging it is what lifts its withdrawal.
-        let returned = self.cursor.outside.remove(&note.id);
         if self.observed.insert(slot.key) {
             self.observations.push(ContainerObservationV1 {
                 kind: slot.container.kind.clone(),
@@ -1087,22 +1084,29 @@ impl GranolaPassV1<'_> {
         }
         let mut items = Vec::new();
         match summary {
-            Some(draft) => self.consider(draft, slot.key, returned, stager, &mut items),
+            Some(draft) => self.consider(draft, slot.key, stager, &mut items),
             None => self.bump("summaries_absent"),
         }
         if let Some(draft) = transcript {
-            self.consider(draft, slot.key, returned, stager, &mut items);
+            self.consider(draft, slot.key, stager, &mut items);
         }
         Ok(NoteEndV1::Settled(items))
     }
 
     /// Stage a draft, or keep the version the memory holds when its content,
-    /// lifecycle, and container are unchanged and nothing forces it.
+    /// lifecycle, and container are unchanged and it is not withdrawn (a note
+    /// back in a listed folder is staged, which is what lifts its
+    /// withdrawal).
+    ///
+    /// Granola may regenerate a summary without moving `updated_at`. A
+    /// changed version at an order no greater than the one the memory holds
+    /// would then tie with it, and a tie at the head is broken by digest, not
+    /// recency, so the newer content might never be presented: it is ordered
+    /// at the pass's instant instead, when it was first observed.
     fn consider(
         &mut self,
-        draft: CollectedItemDraftV1,
+        mut draft: CollectedItemDraftV1,
         key: Sha256Digest,
-        force: bool,
         stager: &mut PageStager<'_>,
         items: &mut Vec<PulledItemV1>,
     ) {
@@ -1112,12 +1116,13 @@ impl GranolaPassV1<'_> {
         } else {
             self.transcripts.get(&draft.external_id)
         };
+        let digest = stager.content_digest(&draft);
         if let Some(known) = known
-            && !force
+            && !known.withdrawn
             && !known.lifecycle.is_tombstone()
             && known.lifecycle == draft.lifecycle
             && known.container_key == Some(key)
-            && stager.content_digest(&draft) == Some(known.content_digest)
+            && digest == Some(known.content_digest)
         {
             let known = known.clone();
             stager.keep(Some(key), &known);
@@ -1127,6 +1132,21 @@ impl GranolaPassV1<'_> {
                 "transcripts_unchanged"
             });
             return;
+        }
+        if let Some(known) = known
+            && !known.lifecycle.is_tombstone()
+            && draft.order_micros <= known.provider_order
+        {
+            draft.order_micros = if digest == Some(known.content_digest) {
+                // The version the memory holds, read again (a withdrawn one
+                // back in a listed folder): at its own order, so it is the
+                // same version and its staging lifts the withdrawal.
+                known.provider_order
+            } else {
+                self.input
+                    .pass_order_micros
+                    .max(known.provider_order.saturating_add(1))
+            };
         }
         self.bump(if summary {
             "summaries_staged"
@@ -1139,27 +1159,29 @@ impl GranolaPassV1<'_> {
         });
     }
 
-    /// A note in no listed folder. One the memory holds is staged once more
-    /// as a restricted draft, which the sink refuses and which withdraws the
-    /// item (a later read in a listed folder lifts it); one it never held is
-    /// not staged at all.
-    fn outside(
-        &mut self,
-        note: &GranolaNoteV1,
-        segments: Option<&[GranolaSegmentV1]>,
-    ) -> Vec<PulledItemV1> {
-        let held = [&self.summaries, &self.transcripts].iter().any(|known| {
+    /// A note in no listed folder. Every item the memory holds of it (its
+    /// summary, and its transcript whether or not transcripts are read now)
+    /// is withdrawn with a content-free observation at the note's listed
+    /// order ([`super::pull::withdrawal`]), which hides it until an
+    /// admissible read lifts it; a note it never held is not staged at all.
+    /// Nothing is rebuilt from the note, so an item whose content could not
+    /// be drafted now is withdrawn all the same.
+    fn outside(&mut self, note: &GranolaNoteV1) -> Vec<PulledItemV1> {
+        let held: Vec<(&'static str, KnownVersionV1)> = [
+            (SUMMARY_OBJECT_KIND, &self.summaries),
+            (TRANSCRIPT_OBJECT_KIND, &self.transcripts),
+        ]
+        .into_iter()
+        .filter_map(|(kind, known)| {
             known
                 .get(&note.id)
-                .is_some_and(|version| !version.lifecycle.is_tombstone())
-        });
-        if !held {
+                .filter(|version| !version.lifecycle.is_tombstone())
+                .map(|version| (kind, version.clone()))
+        })
+        .collect();
+        if held.is_empty() {
             self.bump("notes_outside_folders");
             return Vec::new();
-        }
-        self.bump("notes_withdrawn");
-        if self.cursor.outside.len() < MAX_OUTSIDE {
-            self.cursor.outside.insert(note.id.clone());
         }
         let mut folders: Vec<&api::GranolaFolderV1> = note
             .folders()
@@ -1172,18 +1194,31 @@ impl GranolaPassV1<'_> {
             id: folder.id.clone(),
             label: None,
         });
-        let context = self.context(container.as_ref());
-        let summary = summary_draft(&context, note).ok().flatten();
-        let transcript =
-            segments.and_then(|segments| transcript_draft(&context, note, segments).ok().flatten());
-        summary
-            .into_iter()
-            .chain(transcript)
-            .map(|draft| PulledItemV1 {
-                draft,
-                provider_audience: Some(ProviderAudienceV1::Restricted),
-            })
-            .collect()
+        let listed = render::clock(&note.updated_at).map_or(0, |(_, order)| order);
+        let scope = self.input.instance.provider_scope_id.as_str();
+        let mut items = Vec::new();
+        for (kind, version) in held {
+            if version.withdrawn {
+                continue;
+            }
+            let Ok(object_kind) = ObjectKindV1::new(kind) else {
+                continue;
+            };
+            items.push(withdrawal(
+                &WithdrawnItemV1 {
+                    provider: &self.provider,
+                    provider_scope_id: scope,
+                    object_kind: &object_kind,
+                    external_id: &note.id,
+                    order_micros: listed.max(version.provider_order),
+                },
+                container.clone(),
+            ));
+        }
+        if !items.is_empty() {
+            self.bump("notes_withdrawn");
+        }
+        items
     }
 
     /// List, count what is missing, and sweep. Returns why the pass stopped
@@ -1569,7 +1604,6 @@ mod tests {
             position: cursor.position.clone(),
         });
         cursor.missing = (0..MAX_MISSING).map(|index| (id(index), 1)).collect();
-        cursor.outside = (0..MAX_OUTSIDE).map(|index| id(10_000 + index)).collect();
         cursor.recent = (0..MAX_RECENT)
             .map(|index| (id(20_000 + index), u64::MAX - 1))
             .collect();

@@ -23,7 +23,8 @@ use crate::store::cockroach::with_serializable_retry;
 use super::{CollectedItemSink, DeadLetterReasonV1, MAX_DELIVERY_ID_BYTES, dead_letter_id};
 use crate::collectors::cockroach::{
     INSERT_DEAD_LETTER_SQL, MAX_DEAD_LETTER_DIAGNOSTIC_BYTES, ROW_STATES_SQL, SCOPE_HEADS_SQL,
-    SCOPE_PENDING_SQL, bounded, digest_column, optional_digest_column, statement_time,
+    SCOPE_PENDING_SQL, WITHDRAWN_ITEMS_SQL, bounded, digest_column, optional_digest_column,
+    statement_time,
 };
 use crate::collectors::status::{
     CollectorSourceStatusV1, retire_worker_collectors, upsert_collector_source,
@@ -53,6 +54,11 @@ pub struct KnownVersionV1 {
     /// collector whose items carry no container in their id (a Linear issue)
     /// which of its reads the item belongs to.
     pub container_key: Option<Sha256Digest>,
+    /// Whether the item is withdrawn for either tier. Staging an admissible
+    /// read of it is what lifts a withdrawal, so a collector that finds the
+    /// item admissible again stages it even when nothing else changed,
+    /// rather than keeping the version the memory holds.
+    pub withdrawn: bool,
 }
 
 /// Where one staged row stands.
@@ -161,6 +167,7 @@ impl CollectedItemSink {
                     pending: Vec::new(),
                     thread_root: row.try_get("thread_root_external_id")?,
                     container_key: optional_digest_column(row, "container_key")?,
+                    withdrawn: false,
                 },
             );
         }
@@ -211,6 +218,7 @@ impl CollectedItemSink {
                             .as_ref()
                             .map(|thread| thread.root_external_id.as_str().to_owned()),
                         container_key: envelope.audience.container_key,
+                        withdrawn: false,
                     },
                 },
             );
@@ -231,7 +239,32 @@ impl CollectedItemSink {
                 }
             }
         }
+        self.mark_withdrawn(&mut known).await?;
         Ok(known)
+    }
+
+    /// Mark every item of `known` that is withdrawn for either tier.
+    async fn mark_withdrawn(&self, known: &mut BTreeMap<String, KnownVersionV1>) -> Result<()> {
+        let keys: Vec<Vec<u8>> = known
+            .values()
+            .map(|version| version.item_key.as_bytes().to_vec())
+            .collect();
+        let mut withdrawn = std::collections::BTreeSet::new();
+        for chunk in keys.chunks(1_024) {
+            let rows: Vec<PgRow> = sqlx::query(WITHDRAWN_ITEMS_SQL)
+                .bind(self.tenant_id)
+                .bind(&self.project)
+                .bind(chunk)
+                .fetch_all(&self.pool)
+                .await?;
+            for row in &rows {
+                withdrawn.insert(digest_column(row, "item_key_digest")?);
+            }
+        }
+        for version in known.values_mut() {
+            version.withdrawn = withdrawn.contains(&version.item_key);
+        }
+        Ok(())
     }
 
     /// The state of each named row that exists, by stage id.

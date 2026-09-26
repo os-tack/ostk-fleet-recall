@@ -276,6 +276,12 @@ pub(super) const SCOPE_PENDING_SQL: &str = "SELECT stage_id, version_key_digest,
        AND provider_scope_id = $4 AND collection_mode = ANY($5::STRING[]) \
      ORDER BY created_at, stage_id";
 
+/// Which of a batch of items are withdrawn for either tier.
+pub(super) const WITHDRAWN_ITEMS_SQL: &str = "SELECT DISTINCT item_key_digest \
+     FROM public.memory_collected_item_withdrawals_v1 \
+     WHERE tenant_id = $1 AND project = $2 AND withdrawn \
+       AND item_key_digest = ANY($3::BYTES[])";
+
 /// The state of each named row.
 pub(super) const ROW_STATES_SQL: &str = "SELECT stage_id, state, accepted_event_id \
      FROM public.memory_collector_outbox_v1 \

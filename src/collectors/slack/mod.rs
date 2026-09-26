@@ -592,6 +592,7 @@ impl ChannelReadV1<'_> {
             match message_draft(&self.context(), &message) {
                 MessageDraftV1::Item(draft) => {
                     if let Some(known) = known
+                        && !known.withdrawn
                         && known.provider_order == draft.order_micros
                         && stager.content_digest(&draft) == Some(known.content_digest)
                     {
@@ -1275,6 +1276,7 @@ mod tests {
                 pending: Vec::new(),
                 thread_root: thread_root.map(str::to_owned),
                 container_key: None,
+                withdrawn: false,
             },
         )
     }
