@@ -504,4 +504,93 @@ mod tests {
             serde_json::from_str(r#"{"ok":true,"messages":[],"has_more":true}"#).unwrap();
         assert!(super::page(broken).unfinished);
     }
+
+    /// A loopback Slack whose channel holds the recorded thread
+    /// (`fixtures/conversations_replies.json`): the history lists only the
+    /// root, and `conversations.replies` takes the `ts` of the root or of any
+    /// reply in the thread, as Slack's does, and answers the root first.
+    async fn slack_with_the_recorded_thread() -> String {
+        async fn answer(
+            uri: axum::http::Uri,
+            axum::extract::Query(query): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+        ) -> String {
+            let thread: serde_json::Value =
+                serde_json::from_str(include_str!("fixtures/conversations_replies.json")).unwrap();
+            let messages = thread["messages"].as_array().unwrap().clone();
+            let micros = |ts: &str| ts.replace('.', "").parse::<u64>().unwrap();
+            let within = |message: &serde_json::Value| {
+                let at = micros(message["ts"].as_str().unwrap());
+                query
+                    .get("oldest")
+                    .is_none_or(|oldest| at >= micros(oldest))
+                    && query
+                        .get("latest")
+                        .is_none_or(|latest| at <= micros(latest))
+            };
+            let wanted = query.get("ts").map(String::as_str).unwrap_or_default();
+            let page = match uri.path() {
+                "/api/conversations.history" => messages[..1]
+                    .iter()
+                    .filter(|m| within(m))
+                    .cloned()
+                    .collect(),
+                "/api/conversations.replies"
+                    if messages.iter().any(|message| message["ts"] == wanted) =>
+                {
+                    std::iter::once(messages[0].clone())
+                        .chain(messages[1..].iter().filter(|m| within(m)).cloned())
+                        .collect::<Vec<_>>()
+                }
+                _ => return r#"{"ok":false,"error":"thread_not_found"}"#.to_owned(),
+            };
+            serde_json::json!({"ok": true, "messages": page, "has_more": false}).to_string()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().fallback(answer))
+                .await
+                .unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
+    /// A webhook names an edited reply by its own `ts`
+    /// (`fixtures/event_message_changed.json`); the history bounded to that
+    /// `ts` misses it, so the re-read finds it in its thread. A `ts` the
+    /// thread no longer holds is nothing to stage.
+    #[tokio::test]
+    async fn a_hinted_reply_is_read_from_its_thread() {
+        use crate::collectors::http::{AuthSchemeV1, ProviderTokenV1};
+        let base = slack_with_the_recorded_thread().await;
+        let token = ProviderTokenV1::from_environment("T", &|_: &str| {
+            Some("xoxb-EXAMPLE-NOT-A-TOKEN".into())
+        })
+        .unwrap();
+        let api = SlackApiV1::new(
+            ProviderHttpV1::new(&base, &token, AuthSchemeV1::Bearer).unwrap(),
+            100,
+        );
+        let reply = api
+            .message("C07PLATENG1", "1790006860.001100")
+            .await
+            .unwrap()
+            .expect("the reply is in its thread");
+        assert_eq!(reply.ts, "1790006860.001100");
+        assert_eq!(reply.thread_ts.as_deref(), Some("1790006645.000200"));
+        let root = api
+            .message("C07PLATENG1", "1790006645.000200")
+            .await
+            .unwrap()
+            .expect("the root is in the history");
+        assert_eq!(root.ts, "1790006645.000200");
+        assert!(
+            api.message("C07PLATENG1", "1790006999.000100")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }
