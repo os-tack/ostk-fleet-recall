@@ -58,14 +58,24 @@
 //! * [`coverage`] turns a settled reconciliation pass into its
 //!   `collector_observation` item and its coverage receipt;
 //! * [`docs`] is the documents-directory collector.
+//!
+//! Operator imports (ADR 0008 D9):
+//!
+//! * [`import`] stages a file of items (`items-jsonl`, [`import::jsonl`])
+//!   under `connector.collected.import` and records it as a snapshot of one
+//!   provider scope, inline or on the worker's next `collect` step;
+//! * [`command`] is `ostk-fleet-recall collect`: `import`, `status`,
+//!   `dead-letters`, and `retire`.
 
 pub mod audience;
 pub mod binding;
 pub mod cockroach;
+pub mod command;
 pub mod coverage;
 pub mod docs;
 pub mod draft;
 pub mod heads;
+pub mod import;
 pub mod pull;
 pub mod redaction;
 pub mod sink;

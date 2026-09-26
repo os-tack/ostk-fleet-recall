@@ -1,6 +1,6 @@
 # ADR 0008: Collected items from any source
 
-- Status: accepted; D1 to D8 implemented. The generation-3 registry package
+- Status: accepted; D1 to D9 implemented. The generation-3 registry package
   is checked in, the strict witness recognizes it, and
   `ostk-authority-install apply --target generation-3` activates it and
   rebases the scope's normative families onto it. The collected-item
@@ -12,8 +12,10 @@
   (D4 to D6); migration 34 adds withdrawals (D5, D6), and evidence recall
   withholds deleted and withdrawn items. `recall(kind=item)` reads items back
   as items (D7). The worker runs pull collectors through one pull framework,
-  and the documents-directory collector is the first (D8). No API collector,
-  import, or agent capture stages items yet; those land with their own
+  and the documents-directory collector is the first (D8). `ostk-fleet-recall
+  collect` imports a file of items as a snapshot of one provider scope and
+  lists, dead-letters, and retires what the collectors hold (D9). No API
+  collector or agent capture stages items yet; those land with their own
   decisions.
 - Date: 2026-09-25
 - Scope: how specs and documents, Slack conversations, Linear tickets,
@@ -653,3 +655,83 @@ compared with the heads resumes by construction, and a pass instant as the
 order keeps it independent of file times. Following every symlink inside the
 root: a symlinked directory can form a cycle, and following one only to
 reach the same files again buys nothing.
+
+## D9 — Operator imports and the `collect` command
+
+**Decision.** An operator imports a file of items with `ostk-fleet-recall
+collect import` (`src/collectors/import`, `src/collectors/command.rs`), a
+*reported* channel through the same sink: `--instance` names the import's
+collector instance, `--principal` its ingress principal, `--provider` and
+`--provider-scope` pin the one provider scope every line must name,
+`--audience operator-declared` (required, and the only audience) is the
+operator's declaration that the file is visible to the whole project, and
+`--format items-jsonl` (the only format so far) reads one
+`CollectedItemInputV1` per line. The command runs as the writer login under
+the writer-authority pins, needs the schema through migration 34, probes the
+privileges the worker's `collect` step uses, and binds
+`connector.collected.import` from the verified head.
+
+- **The instance.** An import never takes an instance a worker source (git,
+  transcripts, CI) or a worker or capture collector reports under, and an
+  import's instance keeps its provider scope. Its status row is `owner =
+  import`, `coverage_role = snapshot`, stale after `--stale-after` seconds
+  (30 days by default).
+- **Lines.** The file is read twice: once to hash it, count its lines (at
+  most 100,000, each at most 4 MiB), and learn its containers; once to stage
+  it, in sink transactions of at most 256 items and about as many parts. A
+  line that is not an item is a `parse_failed` dead letter; a line of another
+  provider or scope (`provider_scope_mismatch`), or with neither `updated_at`
+  nor `created_at`, is `validation_failed`; all digest only, delivered as the
+  file's digest and the line number. The sink decides the rest as for every
+  collector (D4, D6): a `private` or `dm` hint refuses the item, and a
+  container whose kind names a direct conversation (`slack.im`, `mpim`, `dm`,
+  ...) carries a direct-message audience, so an export never admits a direct
+  conversation and the container is recorded withdrawn. Every other
+  container is observed as the operator declared it, unless an item in it
+  says it is private or direct. A file that changed between the two reads is
+  refused, and nothing is recorded as its snapshot.
+- **Versions.** The marker rule holds: the line's own marker, else
+  `o<order>:sha256:<content digest>` at its `updated_at`, else its
+  `created_at`. Re-importing an unchanged file stages nothing, an edited line
+  is a new version, and a line whose lifecycle is a tombstone hides the item
+  (D5). An import never infers a deletion from a line that is missing: an
+  export can be partial or ranged.
+- **The plan.** Before the drain, the import is settled as far as it can be:
+  its domain is every container its items name, plus one more for items with
+  no container and lines no container can be named for; a container is
+  partial when a line in it was refused for anything but its audience, or a
+  version it holds was already refused by an earlier drain. Its
+  `collector_observation` item (D8's shape, over the versions the file
+  holds), its status row, and its **plan** (the `import.snapshot` cursor:
+  the receipt's shape, and the rows another instance staged first that it
+  relies on) are written in one transaction. A pending row the same instance
+  staged earlier is adopted into the import's pass, so the pass's own rows
+  are exactly the rows it must see admitted.
+- **The receipt.** Once the observation and every row the plan relies on are
+  settled, the snapshot receipt is one coverage domain like a pull pass's:
+  target `[0, N + 1)`, observed the import's ordinal and every complete
+  container, proof `coverage.proof.enumerated_snapshot`, window from the
+  earliest provider clock the file holds to the finalization, evidence the
+  admitted observation. A row the import relied on that was not admitted
+  leaves only the import's ordinal observed. The status row then records the
+  check. The command drains and finalizes inline; with `--no-drain` it only
+  stages and reads no content key, and the worker's `collect` step finalizes
+  every waiting plan after its drain. An observation that is not admitted
+  fails the source and records no receipt; a retired import is never
+  re-activated by a finalization.
+
+`collect status` lists every collector instance's status row, outbox rows by
+state, cursors (never their bytes), and dead letters by reason; `collect
+dead-letters [--since] [--instance]` lists dead letters with their digests,
+reasons, and the sink's static diagnostics, never provider text; `collect
+retire --instance` retires an import's row only, so its snapshot no longer
+counts toward absence, while its items stay recallable and a later import
+re-activates it.
+
+**Rejected.** Tombstoning an item a later file no longer holds, as the
+documents directory does: an export can be a date range or one channel, and
+reading it as complete would delete everything outside it. Letting a worker
+finalize an import by re-reading the file: the worker does not hold it, and
+the plan is enough. Naming every row an import relies on in its plan: a
+pass-tagged row set is checked with one statement, and the plan stays within
+one cursor.

@@ -37,7 +37,10 @@ mutation route exists today. What runs is private and reads local material:
   withdrawn item's text (ADR 0008 D7). The first collector, a documents
   directory, runs in the same step: each pass stages the files that changed,
   tombstones the ones that went, and records coverage only for a complete
-  enumeration (ADR 0008 D8).
+  enumeration (ADR 0008 D8). An operator imports a file of items with
+  `ostk-fleet-recall collect import`: a reported channel through the same
+  sink, recorded as a snapshot of one provider scope once its rows are
+  admitted (ADR 0008 D9).
 - The private `ostk-spec` CLI runs the Stage-6 normative activation,
   observer, and discrepancy runtimes, and `serve` lists the episodes it opens
   as `recall(discrepancies)`

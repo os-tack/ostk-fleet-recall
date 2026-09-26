@@ -44,6 +44,16 @@
 //! channel the active package does not admit stays pending, and the step
 //! fails naming the installer target that admits it.
 //!
+//! # Imports
+//!
+//! Last, the step finalizes every operator import whose plan waits for its
+//! rows (`collect import --no-drain`, or an import whose inline drain left
+//! rows pending): once the import's observation and every row it relies on
+//! are settled, its snapshot receipt is recorded and its status row checked
+//! ([`crate::collectors::import::finalize_import`]). A plan still waiting is
+//! counted (`imports_waiting`); one whose observation was not admitted, or
+//! that cannot be read, fails the step.
+//!
 //! Whether the step can run at all is decided by the schema, read at tick
 //! time: before migration 34 (the collected-item tables and their
 //! withdrawals) there is nothing to drain, so the step is `skipped`
@@ -55,6 +65,7 @@ use crate::collectors::binding::{CollectedConnectorBindingV1, CollectorInstanceV
 use crate::collectors::coverage::{
     PASS_CURSOR_DOMAIN, PassCoverageV1, coverage_observations, observation_draft, pass_cursor,
 };
+use crate::collectors::import::{ImportFinalizeTallyV1, finalize_pending_imports};
 use crate::collectors::pull::{
     PageStager, PageStagerContextV1, PullCollectorV1, PullPassInputV1, PulledItemV1,
 };
@@ -216,7 +227,43 @@ pub(super) async fn run_collect(
             WorkerStepReportV1::failed(format!("the collector outbox drain failed: {error}"))
         }
     };
-    with_sources(step, sources, retired)
+    // Then the snapshot receipt of every import whose rows are now settled.
+    let imports = finalize_pending_imports(&sink, verified, &collectors.coverage).await;
+    with_sources(with_imports(step, imports), sources, retired)
+}
+
+/// Fold the imports the step finalized into its report: a plan that could
+/// not be finalized fails the step.
+fn with_imports(
+    mut step: WorkerStepReportV1,
+    imports: crate::error::Result<ImportFinalizeTallyV1>,
+) -> WorkerStepReportV1 {
+    let tally = match imports {
+        Ok(tally) => tally,
+        Err(error) => ImportFinalizeTallyV1 {
+            failed: 1,
+            errors: vec![format!(
+                "the waiting import plans could not be read: {error}"
+            )],
+            ..ImportFinalizeTallyV1::default()
+        },
+    };
+    step.counters.insert("imports_recorded", tally.recorded);
+    step.counters.insert("imports_waiting", tally.waiting);
+    step.counters.insert("imports_failed", tally.failed);
+    if tally.failed > 0 {
+        step.status = WorkerStepStatusV1::Failed;
+        let reason = format!(
+            "{} collected-item imports could not be finalized: {}",
+            tally.failed,
+            tally.errors.join("; ")
+        );
+        step.reason = Some(match step.reason.take() {
+            Some(earlier) => format!("{earlier}; {reason}"),
+            None => reason,
+        });
+    }
+    step
 }
 
 /// Fold per-collector reports and the retirement into the drain's report.
@@ -692,6 +739,39 @@ mod tests {
         assert!(step.reason.unwrap().contains("1 of 2 collectors failed"));
         assert_eq!(step.counters["sources_failed"], 1);
         assert_eq!(step.counters["collectors_retired"], 0);
+    }
+
+    #[test]
+    fn an_import_that_cannot_be_finalized_fails_the_step_and_waiting_ones_are_counted() {
+        let clean = step_report(&CollectedDrainReportV1::default(), 0);
+        let step = with_imports(
+            clean.clone(),
+            Ok(ImportFinalizeTallyV1 {
+                recorded: 2,
+                waiting: 1,
+                ..ImportFinalizeTallyV1::default()
+            }),
+        );
+        assert_eq!(step.status, WorkerStepStatusV1::Ok);
+        assert_eq!(
+            (
+                step.counters["imports_recorded"],
+                step.counters["imports_waiting"],
+                step.counters["imports_failed"]
+            ),
+            (2, 1, 0)
+        );
+
+        let step = with_imports(
+            clean,
+            Ok(ImportFinalizeTallyV1 {
+                failed: 1,
+                errors: vec!["import import.slack: the observation was refused".to_owned()],
+                ..ImportFinalizeTallyV1::default()
+            }),
+        );
+        assert_eq!(step.status, WorkerStepStatusV1::Failed);
+        assert!(step.reason.unwrap().contains("import.slack"));
     }
 
     #[test]

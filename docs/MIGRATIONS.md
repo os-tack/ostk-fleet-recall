@@ -54,6 +54,10 @@ Each private runtime uses its own part of these tables:
   withdrawals, status, cursors, and dead letters, drains the outbox into the
   item history, links, and heads, and records each reconciliation pass in
   migration 20's coverage tables. No migration or grant is added for it.
+  `ostk-fleet-recall collect`, as the writer, writes the same tables when it
+  imports a file (ADR 0008 D9), and the step records the snapshot of an
+  import staged with `--no-drain`. It reads `memory_worker_sources_v1` to keep
+  an import off a worker source's instance, and adds no migration or grant.
 - `ostk-spec` writes the tables of migrations 24, 27, and 31.
   `ostk-authority-install apply --target generation-3`, as the migrator,
   appends migration 32's `rebase` rows to migration 24's log and moves those

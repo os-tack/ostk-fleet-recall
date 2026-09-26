@@ -253,9 +253,35 @@ pub fn coverage_observations(
 ) -> Result<Vec<CoverageObservationV1>> {
     let (target, runs) = coverage_ranges(settlement)
         .map_err(|error| FleetError::Configuration(format!("the pass's coverage: {error}")))?;
+    receipt_observations(
+        coverage,
+        target,
+        runs,
+        &settlement.manifest_digest,
+        u32::try_from(settlement.manifest.len()).unwrap_or(u32::MAX),
+    )
+}
+
+/// One coverage observation per observed run of a known target.
+///
+/// [`coverage_observations`] builds the target and runs from a settlement;
+/// an import's plan carries them until its observation is admitted
+/// ([`super::import`]).
+///
+/// # Errors
+///
+/// [`FleetError::Configuration`] for a manifest digest that is not a hex
+/// coordinate.
+pub fn receipt_observations(
+    coverage: &PassCoverageV1<'_>,
+    target: SequenceIntervalV1,
+    runs: Vec<SequenceIntervalV1>,
+    manifest_digest: &Sha256Digest,
+    source_count: u32,
+) -> Result<Vec<CoverageObservationV1>> {
     let scope = CoverageScopeV1 {
         scope: coverage.scope.clone(),
-        revision: HexBytes::new(settlement.manifest_digest.as_bytes().to_vec())?,
+        revision: HexBytes::new(manifest_digest.as_bytes().to_vec())?,
         window: CoverageWindowV1 {
             window_start: coverage.window_start.clone(),
             window_end: coverage.observed_through.clone(),
@@ -267,7 +293,6 @@ pub fn coverage_observations(
         producer_id: coverage.principal.clone(),
         version: 1,
     };
-    let source_count = u32::try_from(settlement.manifest.len()).unwrap_or(u32::MAX);
     Ok(runs
         .into_iter()
         .map(|observed| CoverageObservationV1 {
@@ -284,7 +309,7 @@ pub fn coverage_observations(
                 method: coverage.proof_method,
                 proof_method_registration: label_reference(proof_label(coverage.proof_method)),
             },
-            source_digest: settlement.manifest_digest,
+            source_digest: *manifest_digest,
             source_count,
             evidence_id: coverage.evidence_id,
             observed_through: coverage.observed_through.clone(),

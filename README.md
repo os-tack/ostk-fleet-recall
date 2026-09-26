@@ -112,6 +112,9 @@ The `ostk-fleet-recall` binary has these commands:
   ingests the configured git refs, agent transcripts, and CI workflow runs as
   accepted evidence, then projects them into the body, lexical, and dense
   recall tiers.
+- `collect` [imports collected items](#importing-collected-items) from a
+  file as a snapshot of one provider scope, and lists or retires what the
+  collectors hold.
 - `model-digest` prints the versioned digest of a local model bundle.
 
 Two [private operator CLIs](#private-operator-clis) complete the event-first
@@ -266,8 +269,9 @@ admitted, in this order:
   skipped. The documents-directory collector (provider `docs`) is the first:
   each pass lists one root, stages the files whose content changed as
   sectioned parts, tombstones the ones that disappeared, and records coverage
-  only when it read the whole root. `serve` reads what it admits as
-  `recall(kind=item)` and `recall(kind=evidence)`.
+  only when it read the whole root. Last, it records the snapshot of every
+  [import](#importing-collected-items) whose rows it admitted. `serve` reads
+  what it admits as `recall(kind=item)` and `recall(kind=evidence)`.
 - `project`: the body projector, then the lexical tier.
 - `embed`: the dense tier, through the pinned model2vec embedder.
 
@@ -365,6 +369,61 @@ at a time. For example, with the environment above in the crontab:
 ```text
 */15 * * * * ostk-fleet-recall worker --once --sources /etc/fleet-recall/worker-sources.json >>/var/log/fleet-recall/worker.jsonl
 ```
+
+## Importing collected items
+
+`ostk-fleet-recall collect import` stages one file of items for one collector
+instance through the same sink every collector uses, admits them under
+`connector.collected.import`, and records the file as a snapshot of its
+provider scope ([ADR 0008 D9](docs/adr/0008-collected-items.md)):
+
+```text
+ostk-fleet-recall collect import --instance import.slack --principal principal.import \
+  --provider slack --provider-scope T07ACME0001 --audience operator-declared \
+  --format items-jsonl --path items-slack.jsonl [--no-drain] [--stale-after 2592000]
+```
+
+Each line of an `items-jsonl` file is one item: the plain-text shape an agent
+capture carries, with `provider`, `provider_scope_id`, `object_kind`,
+`external_id`, the text, and optionally a version, lifecycle, container,
+thread, author, `created_at` and `updated_at`, title, links, URL, and a
+`visibility` hint. [`tests/fixtures/collected`](tests/fixtures/collected)
+holds one file each for a documents root, Slack, Linear, and Granola. The
+command refuses, as digest-only dead letters, a line that is not an item, a
+line of another provider or scope than the instance's
+(`provider_scope_mismatch`), and a line with neither `updated_at` nor
+`created_at`. The sink refuses the rest as it does for every collector: a
+`visibility` of `private` or `dm`, a direct conversation's container (such as
+`slack.im`), and a secret it cannot redact. `--audience operator-declared` is
+the operator's declaration that everything else in the file is visible to the
+whole project; it is required, and it is the only audience. An imported item
+is `reported`: a verified collector's head of the same item is presented
+instead.
+
+A version is the line's own marker, or `o<order>:sha256:<content digest>` at
+its `updated_at` (else `created_at`), so re-importing an unchanged file stages
+nothing, an edited line (with a newer `updated_at`) supersedes, and a line
+whose `lifecycle` is `deleted` hides the item everywhere. A line missing from
+a later file deletes nothing: an export can be partial. Once every line it
+staged is admitted, the import records a snapshot receipt, and an empty
+answer over its provider becomes `absent`; a refused line leaves the
+snapshot partial. The snapshot stays current for `--stale-after` seconds (30
+days by default).
+
+The command runs as `fleet_writer` with the writer-authority pins. It drains
+what it stages, which needs `FLEET_RECALL_CONTENT_KEK_HEX`; with `--no-drain`
+it only stages, reads no key, and the next `worker` tick whose steps include
+`collect` drains the rows and records the snapshot. It prints one JSON report:
+counts, refusals by reason, the file's digest, and where the snapshot stands.
+
+`collect status` lists every collector instance of the scope (its status row,
+outbox rows by state, cursors, and dead letters by reason), `collect
+dead-letters [--since <RFC 3339>] [--instance <id>]` lists dead letters with
+their digests, reasons, and static diagnostics, never provider text, and
+`collect retire --instance <id>` retires an import's status row so its
+snapshot no longer counts toward absence; its items stay recallable, and
+importing again re-activates it. An import never takes the name of a worker
+source or a worker collector, and `retire` touches an import's row only.
 
 ## Asserting a claim
 

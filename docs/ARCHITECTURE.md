@@ -21,7 +21,8 @@ The memory worker ingests git history, agent transcripts, and CI runs, which
 ([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)), runs its
 collectors (a documents directory so far) and drains collected items, which
 `recall(kind=item)` searches as items
-([ADR 0008](adr/0008-collected-items.md)). The private
+([ADR 0008](adr/0008-collected-items.md)); `ostk-fleet-recall collect
+import` imports a file of items as a snapshot of one provider scope. The private
 `ostk-spec` CLI checks commits against normative spec statements, and
 `recall(discrepancies)` lists what it finds
 ([ADR 0007](adr/0007-spec-conformance-chain.md)). The README's

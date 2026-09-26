@@ -2234,6 +2234,15 @@ mod reads;
 
 pub use reads::{CollectorDeadLetterV1, KnownVersionV1, OutboxRowStateV1};
 
+#[path = "sink_operator.rs"]
+mod operator;
+
+pub use operator::{
+    AdoptedRowV1, CollectorCursorRowV1, CollectorInstanceStatusV1, CollectorSourceRowV1,
+    CollectorStatusReportV1, DeadLetterListingV1, DeadLetterRowV1, ImportCompletionV1,
+    MAX_LISTED_DEAD_LETTERS, MAX_STATUS_CURSORS, PassUnsettledV1, RetireImportV1,
+};
+
 #[cfg(test)]
 #[path = "sink_tests.rs"]
 mod tests;

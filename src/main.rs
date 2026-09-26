@@ -17,8 +17,12 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use ostk_fleet_recall::application::LifecycleServing;
+use ostk_fleet_recall::collectors::command::{
+    CollectCommandV1, CollectImportV1, CollectProcessV1, ImportAudienceV1, ImportFormatV1,
+    run_collect_command,
+};
 use ostk_fleet_recall::config::{LifecycleConfig, PublicationConfig, model_bundle_sha256};
 use ostk_fleet_recall::evidence_recall::start_evidence_recall;
 use ostk_fleet_recall::item_recall::start_item_recall;
@@ -172,6 +176,116 @@ enum Command {
         #[arg(long, default_value = "all", value_name = "GROUPS")]
         steps: String,
     },
+    /// Import collected items from a file, or list and retire what the
+    /// collectors hold. Prints one JSON document.
+    Collect {
+        #[command(subcommand)]
+        command: CollectSubcommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CollectSubcommand {
+    /// Import one file of items for one collector instance, as a snapshot of
+    /// its provider scope.
+    Import {
+        /// The import's collector instance.
+        #[arg(long, value_name = "INSTANCE")]
+        instance: String,
+        /// The ingress principal the items are delivered as.
+        #[arg(long, value_name = "PRINCIPAL")]
+        principal: String,
+        /// The provider every line names (docs, slack, linear, granola, ...).
+        #[arg(long, value_name = "PROVIDER")]
+        provider: String,
+        /// The provider scope every line names.
+        #[arg(long, value_name = "SCOPE")]
+        provider_scope: String,
+        /// The operator's declaration that the file is visible to the whole
+        /// project.
+        #[arg(long, value_enum, value_name = "AUDIENCE")]
+        audience: CollectAudienceArg,
+        /// The file's format.
+        #[arg(long, value_enum, value_name = "FORMAT")]
+        format: CollectFormatArg,
+        /// The file.
+        #[arg(long, value_name = "PATH")]
+        path: PathBuf,
+        /// Stage only, and leave the drain and the snapshot receipt to the
+        /// worker's collect step.
+        #[arg(long)]
+        no_drain: bool,
+        /// How long the snapshot stays current (default 30 days).
+        #[arg(long, value_name = "SECONDS")]
+        stale_after: Option<u64>,
+    },
+    /// List every collector instance: status row, outbox, cursors, and dead
+    /// letters.
+    Status,
+    /// List dead letters: digests and reasons, never provider text.
+    DeadLetters {
+        /// Only dead letters recorded at or after this RFC 3339 instant.
+        #[arg(long, value_name = "RFC3339")]
+        since: Option<String>,
+        /// Only this collector instance's.
+        #[arg(long, value_name = "INSTANCE")]
+        instance: Option<String>,
+    },
+    /// Retire an import's status row.
+    Retire {
+        /// The import's collector instance.
+        #[arg(long, value_name = "INSTANCE")]
+        instance: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CollectAudienceArg {
+    /// Everything the file holds is visible to the whole project.
+    OperatorDeclared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CollectFormatArg {
+    /// One collected-item input per line.
+    ItemsJsonl,
+}
+
+impl CollectSubcommand {
+    fn into_command(self) -> CollectCommandV1 {
+        match self {
+            Self::Import {
+                instance,
+                principal,
+                provider,
+                provider_scope,
+                audience,
+                format,
+                path,
+                no_drain,
+                stale_after,
+            } => CollectCommandV1::Import(CollectImportV1 {
+                instance,
+                principal,
+                provider,
+                provider_scope,
+                audience: match audience {
+                    CollectAudienceArg::OperatorDeclared => ImportAudienceV1::OperatorDeclared,
+                },
+                format: match format {
+                    CollectFormatArg::ItemsJsonl => ImportFormatV1::ItemsJsonl,
+                },
+                path,
+                no_drain,
+                stale_after_seconds: stale_after,
+            }),
+            Self::Status => CollectCommandV1::Status,
+            Self::DeadLetters { since, instance } => {
+                CollectCommandV1::DeadLetters { since, instance }
+            }
+            Self::Retire { instance } => CollectCommandV1::Retire { instance },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,9 +302,11 @@ impl Command {
             Self::Demo { .. } => RuntimeDatabaseIdentity::Publication,
             Self::Migrate => RuntimeDatabaseIdentity::Migrator,
             Self::ModelDigest { .. } => RuntimeDatabaseIdentity::None,
-            Self::Serve | Self::Health | Self::Ingest { .. } | Self::Worker { .. } => {
-                RuntimeDatabaseIdentity::Writer
-            }
+            Self::Serve
+            | Self::Health
+            | Self::Ingest { .. }
+            | Self::Worker { .. }
+            | Self::Collect { .. } => RuntimeDatabaseIdentity::Writer,
         }
     }
 }
@@ -284,6 +400,9 @@ async fn main() -> anyhow::Result<ExitCode> {
                         steps,
                     };
                     return run_worker(&config, &command).await;
+                }
+                Command::Collect { command } => {
+                    run_collect(&config, &command.into_command()).await?;
                 }
                 Command::Demo { .. } | Command::Migrate | Command::ModelDigest { .. } => {
                     unreachable!("command identity was classified before configuration load")
@@ -413,6 +532,30 @@ async fn run_worker(config: &FleetConfig, command: &WorkerCommandV1) -> anyhow::
     )
     .await?;
     Ok(ExitCode::from(report.exit_code()))
+}
+
+/// `collect`: one import or listing as the writer login.
+///
+/// The library runs the whole command (`collectors::command`); this binds it
+/// to the process: its environment, the writer connection, and stdout.
+async fn run_collect(config: &FleetConfig, command: &CollectCommandV1) -> anyhow::Result<()> {
+    let lookup = |name: &str| std::env::var(name).ok();
+    run_collect_command(
+        command,
+        CollectProcessV1 {
+            scope: config.default_scope.clone(),
+            lookup: &lookup,
+            retry: RetryPolicy::default(),
+        },
+        || async {
+            let store = connect_store(config).await?;
+            let capabilities = store.capabilities().await?;
+            Ok((store.pool().clone(), capabilities))
+        },
+        &mut io::stdout(),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn run_serve(config: FleetConfig) -> anyhow::Result<()> {
@@ -1745,6 +1888,9 @@ mod tests {
                 once: true,
                 steps: "all".into(),
             },
+            Command::Collect {
+                command: CollectSubcommand::Status,
+            },
         ] {
             assert_eq!(
                 command.runtime_database_identity(),
@@ -2201,6 +2347,140 @@ mod tests {
             Cli::try_parse_from(["ostk-fleet-recall", "worker", "--once"]).is_err(),
             "the sources file is required"
         );
+    }
+
+    #[test]
+    fn collect_cli_parses_an_import_whose_audience_and_format_are_declared() {
+        let cli = Cli::try_parse_from([
+            "ostk-fleet-recall",
+            "collect",
+            "import",
+            "--instance",
+            "import.slack",
+            "--principal",
+            "principal.import",
+            "--provider",
+            "slack",
+            "--provider-scope",
+            "T07ACME0001",
+            "--audience",
+            "operator-declared",
+            "--format",
+            "items-jsonl",
+            "--path",
+            "items.jsonl",
+            "--no-drain",
+            "--stale-after",
+            "3600",
+        ])
+        .expect("CLI");
+        assert_eq!(
+            cli.command.runtime_database_identity(),
+            RuntimeDatabaseIdentity::Writer
+        );
+        let Command::Collect { command } = cli.command else {
+            panic!("a collect command");
+        };
+        let CollectCommandV1::Import(import) = command.into_command() else {
+            panic!("an import");
+        };
+        assert_eq!(import.provider_scope, "T07ACME0001");
+        assert_eq!(import.path, Path::new("items.jsonl"));
+        assert!(import.no_drain);
+        assert_eq!(import.stale_after_seconds, Some(3600));
+        assert_eq!(import.audience, ImportAudienceV1::OperatorDeclared);
+
+        // The audience and the format are declared, never implied.
+        for missing in ["--audience", "--format"] {
+            let flags = [
+                "--instance",
+                "i",
+                "--principal",
+                "p",
+                "--provider",
+                "slack",
+                "--provider-scope",
+                "T",
+                "--path",
+                "f",
+                "--audience",
+                "operator-declared",
+                "--format",
+                "items-jsonl",
+            ];
+            let arguments = ["ostk-fleet-recall", "collect", "import"]
+                .into_iter()
+                .chain(
+                    flags
+                        .chunks(2)
+                        .filter(|pair| pair[0] != missing)
+                        .flatten()
+                        .copied(),
+                );
+            assert!(
+                Cli::try_parse_from(arguments).is_err(),
+                "{missing} is required"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "ostk-fleet-recall",
+                "collect",
+                "import",
+                "--instance",
+                "i",
+                "--principal",
+                "p",
+                "--provider",
+                "slack",
+                "--provider-scope",
+                "T",
+                "--audience",
+                "project",
+                "--format",
+                "items-jsonl",
+                "--path",
+                "f",
+            ])
+            .is_err(),
+            "operator-declared is the only audience"
+        );
+    }
+
+    #[test]
+    fn collect_cli_parses_the_listings_as_the_writer() {
+        let cli = Cli::try_parse_from([
+            "ostk-fleet-recall",
+            "collect",
+            "dead-letters",
+            "--since",
+            "2026-09-01T00:00:00Z",
+            "--instance",
+            "import.slack",
+        ])
+        .expect("CLI");
+        let Command::Collect { command } = cli.command else {
+            panic!("a collect command");
+        };
+        assert_eq!(
+            command.into_command(),
+            CollectCommandV1::DeadLetters {
+                since: Some("2026-09-01T00:00:00Z".into()),
+                instance: Some("import.slack".into()),
+            }
+        );
+        for listing in [&["status"][..], &["retire", "--instance", "import.slack"]] {
+            let cli = Cli::try_parse_from(
+                ["ostk-fleet-recall", "collect"]
+                    .into_iter()
+                    .chain(listing.iter().copied()),
+            )
+            .expect("CLI");
+            assert_eq!(
+                cli.command.runtime_database_identity(),
+                RuntimeDatabaseIdentity::Writer
+            );
+        }
     }
 
     #[test]

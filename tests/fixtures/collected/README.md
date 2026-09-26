@@ -9,7 +9,9 @@ Linear, and Granola.
   and capture input, `src/memory_contracts/collected_item.rs`), one provider
   scope per file. They tell one story across four sources, the ingest worker's
   retry budget (3 or 5, with jitter), so a query can find it everywhere and a
-  claim can be contested between sources.
+  claim can be contested between sources. Each file is also a valid
+  `ostk-fleet-recall collect import --format items-jsonl` input for its
+  provider scope (ADR 0008 D9).
 - `src/collectors/{slack,linear,granola}/fixtures/*.json`: provider API pages
   and signed webhook deliveries in each provider's documented shape, for the
   provider collectors. Every signing secret in them is a fixture value, never a
