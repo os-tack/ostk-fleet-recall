@@ -3130,13 +3130,6 @@ fn legacy_claim_keys_block(legacy: crate::Result<LegacyClaimKeysV1>) -> (Value, 
     }
 }
 
-/// The lower edge of the dense neighbour band the absence verdict refuses to
-/// call `absent` in: a dense-only neighbour at or above it (and below the
-/// dense bound) makes the verdict `unknown`. The verdict's own copy lives in
-/// `evidence_recall::verdict` as `ABSENCE_NEIGHBOUR_BAND_FLOOR`; this mirror
-/// only publishes the contract in `recall(status)`.
-const ABSENCE_NEIGHBOUR_BAND_FLOOR: f32 = 0.30;
-
 /// The cosine bounds of the absence verdict, and what it is anchored on, as
 /// `recall(status).absence_contract`: what `absent` and `unknown` mean.
 fn absence_contract() -> Value {
