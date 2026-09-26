@@ -175,21 +175,29 @@ than caller-controlled JSON.
 | Spec checks | `memory_spec_checks_v1` | Every check of a commit against a statement: `nonconforming`, `conforming`, or `unknown` with reasons |
 | Discrepancy ledger | `memory_discrepancy_heads_v1`, `memory_discrepancy_log_v1`, `memory_discrepancy_projections_v1`, `memory_discrepancy_relations_v1` | `spec_nonconformance` episodes and their append-only lifecycle |
 | Collected items | `memory_collector_outbox_v1`, `memory_collected_items_v1`, `memory_collected_item_links_v1`, `memory_collected_item_heads_v1`, `memory_collector_containers_v1`, `memory_collected_item_withdrawals_v1`, `memory_collector_sources_v1`, `memory_collector_cursors_v1`, `memory_collector_dead_letters_v1` | Items staged by any collector, their append-only history and current heads, container audiences and withdrawals, items whose own audience narrowed, collector status and cursors, and digest-only dead letters ([ADR 0008](adr/0008-collected-items.md)) |
+| Claim item links | `memory_claim_item_links_v1` | Append-only private links from a claim to the collected-item parts it cites, never a publication table ([ADR 0008 D11](adr/0008-collected-items.md)) |
 
-Later migrations (19 through 34, see [`migrations/`](../migrations); 25 is
+Later migrations (19 through 35, see [`migrations/`](../migrations); 25 is
 permanently unused) add the private-plane tables listed above: content-addressed
 body projection (19), coverage cursors and receipts (20), the lexical/dense
 recall projection (21) and its visibility class (23), the transcript (22) and CI
 (26) connector state, normative activation (24), the discrepancy ledger (27),
 the bootstrap-manifest import rows (28), worker source status (30), the spec
-statements and checks (31), and the collected-item sink (33) and its withdrawals
-(34); migration 32 only widens a check. Migration 29 adds
-`memory_conflict_lifecycle_events_v1`, the append-only per-conflict lifecycle
-log described under the write path below. The memory worker writes the body,
-connector, coverage, recall-projection, and status tables; `ostk-spec` writes
-the normative, spec, and discrepancy tables; and `serve` reads them for
-`recall(kind=evidence)`, `recall(kind=item)`, and `recall(discrepancies)`
-without writing any of them.
+statements and checks (31), the collected-item sink (33) and its withdrawals
+(34), and the claim item links (35); migration 32 only widens a check.
+Migration 29 adds `memory_conflict_lifecycle_events_v1`, the append-only
+per-conflict lifecycle log described under the write path below. The memory
+worker writes the body, connector, coverage, recall-projection, status, and
+collected-item tables (the `collect` command writes the collected-item tables
+too); `ostk-spec` writes the normative, spec, and discrepancy tables; and
+`serve` reads them for `recall(kind=evidence)`, `recall(kind=item)`, and
+`recall(discrepancies)`. `serve` writes none of them unless agent capture is
+turned on: then `remember(capture)` stages into the collector outbox and
+writes its capture instance's status row and dead letters, and, when
+`enabled`, drains its own rows into the item history, links, and heads as
+the worker does. Where claims may cite collected items, `record` and
+`assert` append migration 35's claim item links. Of the other tables from
+migration 19 on, `serve` writes only migration 29's lifecycle log.
 Only the private import CLI writes migration 28's rows.
 
 Serving accepts an uninterrupted successful migration prefix through at least
@@ -611,7 +619,7 @@ log inside a rolled-back transaction must pass the privilege check. Without
 it, the surface stays at `record|supersede|retract`, closes are audited in
 `memory_events` only, and `MINIMUM_RECALL_SCHEMA_VERSION` stays 18, so every
 binary runs on a schema without migration 29. The rollout is deploy the
-binary, migrate, re-apply the runtime policy (its single migration 1-31 gate
+binary, migrate, re-apply the runtime policy (its single migration 1-35 gate
 and exact grant matrix), then restart `serve`. The same restart re-runs the
 evidence-recall and discrepancy probes, and the memory worker checks every
 privilege its selected steps use before each tick, naming the first one
