@@ -127,9 +127,17 @@ no foreign key and is never granted to the publication reader.
 
 ## D4 — Absence is defined over the lexical tier
 
-**Decision.** Every evidence answer carries a verdict. Any hit makes it
-`present`. With no hit it is `absent` only when all of these hold, and
-`unknown` otherwise, with every reason that applies:
+**Decision.** Every evidence answer carries a verdict, anchored on the
+lexical lane. A hit that matched the query's terms makes it `present`
+(`present_by: lexical`). A dense-only hit makes it `present` only when its
+cosine similarity reaches 0.45 (`present_by: dense`; `both` when a lexical
+hit stands beside it) and its body is not a raw git fact
+(`application.ostk-git-fact-v1`), which never votes on a dense-only match.
+Any other hit is a *weak neighbour*: it is still listed, counted in
+`weak_neighbours`, and its similarity reported in
+`strongest_dense_similarity` (the highest among every hit, voting or not),
+but it decides nothing. With no voting hit the verdict is `absent` only when
+all of these hold, and `unknown` otherwise, with every reason that applies:
 
 - the query has lexical terms (`query_has_no_lexical_terms`), because the
   verdict is a claim about the lexical tier, whose matching is exact and
@@ -160,13 +168,22 @@ events before readiness counted them, and the lanes search a lexical tier at
 least as new as the one readiness counted.
 
 **Consequence for dense matches.** `serve` embeds every query, so the dense
-lane runs whenever it is served. A dense neighbour whose cosine similarity
-clears the chunk-recall floor (0.18) is a hit, so it makes the answer
-`present`, flagged `matched_by: "dense"` with its similarity. `absent`
-therefore also means no dense neighbour cleared the floor. How often a
-loosely related neighbour clears 0.18 depends on the model; a floor of its
-own for evidence, or a verdict over lexical hits alone, is an open
-calibration decision.
+lane runs whenever it is served. The retrieval floor (0.18, the chunk lane's)
+decides what is returned; the absence bound (0.45,
+`ABSENCE_DENSE_MIN_COSINE_SIMILARITY`) decides what a returned neighbour
+proves. Measured with `potion-retrieval-32M` over the trial corpus
+(`docs/TRIAL_RETEST_2026-09-26.md`, issue 8), the correct answers to the
+trial questions scored 0.45 to 0.78 while loose in-domain neighbours of
+never-discussed topics scored 0.22 to 0.40 and raw git facts attracted
+nonsense queries at about 0.29; so a never-discussed topic with a
+neighbour in that band reads `absent` with the neighbour listed and
+`weak_neighbours >= 1`, and an agent can judge the neighbourhood from
+`strongest_dense_similarity`. `absent` therefore means no lexical match and
+no voting dense neighbour; it no longer means no neighbour at all. Git
+facts are excluded from dense-only voting because they are the neighbour a
+nonsense query lands on; they still vote lexically. The bound is a model
+calibration and is reported as `absence_dense_min_cosine_similarity` in the
+search diagnostics beside the floor.
 
 **Consequence for lexical matches.** The lexical twin of the floor: a
 lexical row whose `ts_rank` is below 0.001 is a co-occurrence (the query's
@@ -330,8 +347,10 @@ holds no `DELETE` on them.
   mention something, and learn from the same answer whether an empty result
   is trustworthy, and if not, which source or projection is why.
 - `absent` is a strong claim and is reported rarely: any failing, stale, or
-  never-checked source, any unprojected evidence, or a dense neighbour above
-  the floor keeps the verdict `present` or `unknown`.
+  never-checked source or any unprojected evidence keeps the verdict
+  `unknown`, and any lexical match or dense neighbour at or above the 0.45
+  bound keeps it `present`; a weaker neighbour is listed and counted but
+  decides nothing.
 - Operators schedule the worker and watch its report and exit status; the
   status table is what evidence recall trusts, so a worker that stops running
   turns every empty answer `unknown` once its sources go stale.
@@ -342,8 +361,8 @@ or erasure of bodies admitted before redaction profile 3 (the git ingress
 redactor itself landed with profile 3, see D9); transcript tool-use,
 tool-result, and thinking records;
 publication-plane evidence recall; fusing evidence into chunk recall;
-registering the coverage labels in a package; dense or semantic absence
-verdicts and an evidence-specific dense floor; query-centred snippets;
+registering the coverage labels in a package; scoping the body-projection
+lag count to the searched kind (D4); query-centred snippets;
 owner-scoped source retirement (D3); a compact search source summary and a
 verdict over every active source (D4); reporting a CI run in flight above
 the settled mark (D2); a readiness cache or counting index (D5); a re-embed

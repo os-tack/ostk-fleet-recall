@@ -878,8 +878,9 @@ pub enum CollectedCaptureModeV1 {
     /// Captured items are staged in the collector outbox and left for the
     /// worker's `collect` step to admit; `serve` never holds the content key.
     StageOnly,
-    /// Captured items are staged and admitted in the call, which needs
-    /// `FLEET_RECALL_CONTENT_KEK_HEX` in `serve`.
+    /// Captured items are staged, admitted, and projected (bodies, lexical,
+    /// dense) in the call, which needs `FLEET_RECALL_CONTENT_KEK_HEX` in
+    /// `serve`: the drain seals with it and the body projector opens with it.
     Enabled,
 }
 

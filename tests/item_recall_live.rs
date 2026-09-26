@@ -33,7 +33,7 @@ use ostk_fleet_recall::coverage_runtime::{
 };
 use ostk_fleet_recall::evidence_recall::{
     AbsenceReasonV1, AbsenceVerdictV1, CockroachEvidenceRecall, ContentTrustV1,
-    EvidenceDenseLaneV1, EvidenceMatchV1, EvidenceRecall as _, probe_evidence_recall,
+    EvidenceDenseLaneV1, EvidenceMatchV1, EvidenceRecall as _, PresentByV1, probe_evidence_recall,
 };
 use ostk_fleet_recall::item_recall::{
     CockroachItemRecall, InjectionSignalV1, ItemGetV1, ItemRecall as _, ItemReferenceV1,
@@ -68,7 +68,7 @@ use sqlx::PgPool;
 
 use common::authority::retry_policy;
 use common::runtime_role::RuntimeProbeRole;
-use common::worker::{RecordedCi, STUB_MODEL_DIGEST, StubEmbedder, WorkerFixture};
+use common::worker::{RecordedCi, STUB_MODEL_DIGEST, StubEmbedder, WorkerFixture, vector_toward};
 
 const SLACK_TEAM: &str = "T07ACME0001";
 const SLACK_CHANNEL: &str = "C07PLATENG1";
@@ -727,6 +727,9 @@ async fn live_deleted_items_and_withdrawn_containers_are_hidden_when_configured(
     );
     assert!(found.score > 0.0 && found.score <= 1.0, "{found:?}");
     assert_eq!(dense.readiness.dense_lane, EvidenceDenseLaneV1::Used);
+    // A collected body at its own vector votes: present by the dense lane.
+    assert_eq!(dense.absence.verdict, AbsenceVerdictV1::Present);
+    assert_eq!(dense.absence.present_by, Some(PresentByV1::Dense));
 
     stage(
         &pool,
@@ -889,6 +892,7 @@ async fn live_reported_head_yields_to_verified_and_a_newer_report_disagrees_when
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one scope followed from pending, through covered, to a weak dense neighbour
 async fn live_absence_is_absent_only_over_complete_idle_sources_when_configured() {
     let Some(database_url) = common::test_database_url() else {
         return;
@@ -946,6 +950,44 @@ async fn live_absence_is_absent_only_over_complete_idle_sources_when_configured(
         AbsenceVerdictV1::Absent,
         "{:?}",
         absent.absence
+    );
+    assert_eq!(absent.absence.present_by, None);
+    assert_eq!(absent.absence.weak_neighbours, 0);
+    // A dense-only neighbour above the 0.18 retrieval floor and below the
+    // 0.45 absence bound is returned and counted, and the answer stays
+    // absent: nothing matched the words, and nothing was close enough to
+    // vote.
+    drain(&fixture, &pool, "embed").await;
+    let weak = vector_toward(
+        &body_vector(&pool, &fixture, found.hits[0].body_id).await,
+        0.30,
+    );
+    let neighbourhood = recall
+        .search(&request("unfindable marmoset", None, false), Some(weak))
+        .await
+        .unwrap();
+    assert_eq!(neighbourhood.hits.len(), 1, "{:?}", neighbourhood.hits);
+    assert_eq!(neighbourhood.hits[0].matched_by, EvidenceMatchV1::Dense);
+    assert!(
+        neighbourhood.hits[0]
+            .dense_similarity
+            .is_some_and(|similarity| (similarity - 0.30).abs() < 0.03),
+        "{:?}",
+        neighbourhood.hits[0]
+    );
+    assert_eq!(
+        neighbourhood.absence.verdict,
+        AbsenceVerdictV1::Absent,
+        "{:?}",
+        neighbourhood.absence
+    );
+    assert_eq!(neighbourhood.absence.present_by, None);
+    assert_eq!(neighbourhood.absence.weak_neighbours, 1);
+    assert!(
+        neighbourhood
+            .absence
+            .strongest_dense_similarity
+            .is_some_and(|similarity| (similarity - 0.30).abs() < 0.03)
     );
     let docs_only = recall
         .search(&request("unfindable marmoset", Some("docs"), false), None)

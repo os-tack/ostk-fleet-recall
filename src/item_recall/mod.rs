@@ -57,12 +57,21 @@
 //! Absence is the evidence verdict ([`crate::evidence_recall::absence_verdict`])
 //! over the collectors alone: the live and snapshot collector sources of the
 //! scope, or of the requested provider, and the collector outbox's pending
-//! parts for that provider. It is `absent` only when the query has lexical
-//! terms, nothing is pending, every body is lexically projected, and at least
-//! one such source is active, healthy, fresh, and complete; otherwise
-//! `unknown` with every reason that applies (a provider with no source is
-//! `no_sources_registered`). Absence covers enumerated sources only: an agent
-//! capture never establishes coverage.
+//! parts for that provider. It is `present` by a lexical match, or by a
+//! dense-only neighbour at or above
+//! [`crate::evidence_recall::ABSENCE_DENSE_MIN_COSINE_SIMILARITY`] (every
+//! collected body may vote that way: [`ItemHitV1::vote`]); a weaker
+//! neighbour is listed and counted but decides nothing. It is `absent` only
+//! when no hit voted, the query has lexical terms, nothing is pending, every
+//! body is lexically projected, and at least one such source is active,
+//! healthy, fresh, and complete; otherwise `unknown` with every reason that
+//! applies (a provider with no source is `no_sources_registered`). The
+//! events awaiting the body projector are counted over the scope, not the
+//! kind searched: an unprojected git commit makes an empty item answer
+//! `unknown` too (scoping that count is deferred). Absence covers enumerated
+//! sources only: an agent capture never establishes coverage, though an
+//! `enabled` capture projects what it admits in the call, so its own items
+//! never leave the scope lagging.
 //!
 //! # Serving
 //!
@@ -86,7 +95,7 @@ use serde::Serialize;
 use crate::error::Result;
 use crate::evidence_recall::{
     AbsenceV1, ContentTrustV1, EVIDENCE_SNIPPET_CHARS, EvidenceDenseLaneV1, EvidenceMatchV1,
-    EvidenceReadinessV1, EvidenceSourcesV1,
+    EvidenceReadinessV1, EvidenceSourcesV1, HitVoteV1,
 };
 use crate::memory_contracts::collected_item::{
     CollectionModeV1, ItemLifecycleV1, MAX_PROVIDER_URL_BYTES, ProviderKindV1, TrustTierV1,
@@ -282,6 +291,20 @@ pub struct ItemHitV1 {
     pub content_trust: ContentTrustV1,
     /// Advisory signals about the matching part's text and title.
     pub injection_signals: Vec<InjectionSignalV1>,
+}
+
+impl ItemHitV1 {
+    /// What this hit contributes to the absence verdict. A collected body is
+    /// a message, a document, or a ticket someone wrote, so it always may
+    /// vote on a dense-only match.
+    #[must_use]
+    pub const fn vote(&self) -> HitVoteV1 {
+        HitVoteV1 {
+            matched_by: self.matched_by,
+            dense_similarity: self.dense_similarity,
+            dense_may_vote: true,
+        }
+    }
 }
 
 /// How far collection and projection have caught up, as of one item search.

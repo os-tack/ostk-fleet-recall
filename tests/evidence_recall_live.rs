@@ -34,12 +34,12 @@ use common::authority::retry_policy;
 use common::runtime_role::RuntimeProbeRole;
 use common::worker::{
     COMMIT_WORD, FAILING_STEP_WORD, GIT_INSTANCE, STUB_MODEL_DIGEST, StubEmbedder, TRANSCRIPT_WORD,
-    WorkerFixture,
+    WorkerFixture, vector_toward,
 };
 use ostk_fleet_recall::evidence_recall::{
-    AbsenceReasonV1, AbsenceVerdictV1, CockroachEvidenceRecall, EvidenceDenseLaneV1,
-    EvidenceMatchV1, EvidenceRecall, EvidenceSearchV1, probe_evidence_recall,
-    start_evidence_recall,
+    ABSENCE_DENSE_MIN_COSINE_SIMILARITY, AbsenceReasonV1, AbsenceVerdictV1,
+    CockroachEvidenceRecall, DENSE_VOTE_EXCLUDED_MEDIA_TYPES, EvidenceDenseLaneV1, EvidenceMatchV1,
+    EvidenceRecall, EvidenceSearchV1, PresentByV1, probe_evidence_recall, start_evidence_recall,
 };
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::{McpServer, tool_list, tool_list_for_surfaces};
@@ -290,6 +290,70 @@ async fn live_dense_lane_never_compares_another_models_vectors_when_configured()
         "{:?}",
         answer.hits
     );
+    // A git fact is returned on a dense match but never votes on one: at
+    // similarity 1.0 it is still a weak neighbour, and the answer is absent.
+    assert!(DENSE_VOTE_EXCLUDED_MEDIA_TYPES.contains(&commit.media_type.as_str()));
+    assert_eq!(answer.absence.verdict, AbsenceVerdictV1::Absent);
+    assert_eq!(answer.absence.present_by, None);
+    assert!(
+        answer
+            .absence
+            .strongest_dense_similarity
+            .is_some_and(|similarity| similarity > 0.99)
+    );
+    assert_eq!(
+        answer.absence.weak_neighbours as usize,
+        answer.hits.len(),
+        "{:?}",
+        answer.absence
+    );
+
+    // A transcript turn does vote: at its own vector it is present by the
+    // dense lane alone...
+    let mut turn = None;
+    for hit in &search(&recall, TRANSCRIPT_WORD).await.hits {
+        let body = recall.get(hit.id).await.unwrap().unwrap();
+        if body.text.contains(TRANSCRIPT_WORD) {
+            turn = Some(body);
+        }
+    }
+    let turn = turn.expect("the transcript turn is recalled");
+    assert!(!DENSE_VOTE_EXCLUDED_MEDIA_TYPES.contains(&turn.media_type.as_str()));
+    let turn_vector = query_vector(&turn.text);
+    let answer = recall
+        .search(NONSENSE, Some(turn_vector.clone()), 10)
+        .await
+        .unwrap();
+    assert_eq!(answer.absence.verdict, AbsenceVerdictV1::Present);
+    assert_eq!(answer.absence.present_by, Some(PresentByV1::Dense));
+    // ...and a neighbour that clears the 0.18 retrieval floor but not the
+    // absence bound is returned, counted, and decides nothing.
+    let weak = vector_toward(&turn_vector, 0.30);
+    let answer = recall.search(NONSENSE, Some(weak), 10).await.unwrap();
+    let neighbour = answer
+        .hits
+        .iter()
+        .find(|hit| hit.id == turn.id)
+        .expect("the weak neighbour is still a hit");
+    assert_eq!(neighbour.matched_by, EvidenceMatchV1::Dense);
+    assert!(
+        neighbour
+            .dense_similarity
+            .is_some_and(|similarity| (similarity - 0.30).abs() < 0.03),
+        "{neighbour:?}"
+    );
+    assert!(
+        answer
+            .absence
+            .strongest_dense_similarity
+            .is_some_and(|similarity| similarity < ABSENCE_DENSE_MIN_COSINE_SIMILARITY),
+        "{:?}",
+        answer.absence
+    );
+    assert_eq!(answer.absence.verdict, AbsenceVerdictV1::Absent);
+    assert_eq!(answer.absence.present_by, None);
+    assert!(answer.absence.weak_neighbours >= 1);
+    assert_eq!(answer.absence.weak_neighbours as usize, answer.hits.len());
     // ...until a worker running another model has written the scope's
     // vectors: then nothing the dense lane could return is comparable.
     sqlx::query(

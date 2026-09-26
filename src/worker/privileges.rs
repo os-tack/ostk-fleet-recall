@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 
 use sqlx::PgPool;
 
+use crate::config::CollectedCaptureModeV1;
 use crate::error::{FleetError, Result};
 use crate::store::cockroach::{
     COLLECTED_ITEMS_SCHEMA_VERSION, COLLECTOR_INGRESS_SCHEMA_VERSION, DatabaseCapabilities,
@@ -229,9 +230,23 @@ fn probes_for(steps: &BTreeSet<WorkerStepV1>) -> Vec<Probe> {
 
 /// What `remember(action="capture")` writes: the collect step's tables (it
 /// stages through the same sink and, when enabled, drains through the same
-/// append) and the mutation receipts.
-fn capture_probes() -> Vec<Probe> {
-    unique_probes(&[INGEST_PROBES, COLLECT_PROBES, RECEIPT_PROBES])
+/// append), the mutation receipts, and, when `enabled`, the three projection
+/// tiers it runs over what it admitted (the bodies, lexical, and dense
+/// steps' tables).
+fn capture_probes(mode: CollectedCaptureModeV1) -> Vec<Probe> {
+    match mode {
+        CollectedCaptureModeV1::Enabled => unique_probes(&[
+            INGEST_PROBES,
+            COLLECT_PROBES,
+            RECEIPT_PROBES,
+            BODY_PROBES,
+            LEXICAL_PROBES,
+            DENSE_PROBES,
+        ]),
+        CollectedCaptureModeV1::Disabled | CollectedCaptureModeV1::StageOnly => {
+            unique_probes(&[INGEST_PROBES, COLLECT_PROBES, RECEIPT_PROBES])
+        }
+    }
 }
 
 fn probe_statement((table, kind, columns): Probe) -> String {
@@ -291,12 +306,15 @@ pub async fn probe_worker_privileges(
     run_probes(pool, &probes, "the worker's database login", "the worker").await
 }
 
-/// Check that `serve`'s login holds every privilege agent capture uses.
+/// Check that `serve`'s login holds every privilege agent capture uses in
+/// `mode`.
 ///
 /// That is the collect step's (capture stages through the same sink, and,
 /// when enabled, drains through the same append) plus SELECT, INSERT, and
-/// UPDATE on the mutation receipts. `remember(action="capture")` is served
-/// only where this passes (ADR 0008 D10).
+/// UPDATE on the mutation receipts; `enabled` adds the bodies, lexical, and
+/// dense steps' tables, since it projects what it admits before answering.
+/// `remember(action="capture")` is served only where this passes (ADR 0008
+/// D10).
 ///
 /// # Errors
 ///
@@ -307,6 +325,7 @@ pub async fn probe_worker_privileges(
 pub async fn probe_capture_privileges(
     pool: &PgPool,
     capabilities: &DatabaseCapabilities,
+    mode: CollectedCaptureModeV1,
 ) -> Result<()> {
     if !capabilities.supports_schema_version(COLLECTED_ITEMS_SCHEMA_VERSION) {
         return Err(FleetError::Configuration(format!(
@@ -316,7 +335,13 @@ pub async fn probe_capture_privileges(
             capabilities.schema_version
         )));
     }
-    run_probes(pool, &capture_probes(), "serve's database login", "serve").await
+    run_probes(
+        pool,
+        &capture_probes(mode),
+        "serve's database login",
+        "serve",
+    )
+    .await
 }
 
 /// Run `probes` in one transaction that is rolled back whatever happens,
@@ -405,11 +430,37 @@ mod tests {
 
     #[test]
     fn capture_probes_the_collect_step_and_the_receipts() {
-        let probes = capture_probes();
+        let probes = capture_probes(CollectedCaptureModeV1::StageOnly);
         for step in probes_for(&steps(&[WorkerStepV1::Collect])) {
             assert!(probes.contains(&step), "{step:?}");
         }
         assert!(probes.contains(&("memory_mutation_receipts", ProbeKind::Insert, None)));
+        assert!(probes.contains(&("memory_mutation_receipts", ProbeKind::Lock, None)));
+        let unique: BTreeSet<_> = probes
+            .iter()
+            .map(|(table, kind, _)| (table, kind))
+            .collect();
+        assert_eq!(unique.len(), probes.len());
+        // stage_only never touches a projection table: the worker projects.
+        assert!(
+            probes
+                .iter()
+                .all(|(table, _, _)| !table.starts_with("memory_body")
+                    && !table.starts_with("memory_recall_projection"))
+        );
+    }
+
+    #[test]
+    fn an_enabled_capture_also_probes_every_projection_tier() {
+        let probes = capture_probes(CollectedCaptureModeV1::Enabled);
+        for step in probes_for(&steps(&[
+            WorkerStepV1::Collect,
+            WorkerStepV1::Bodies,
+            WorkerStepV1::Lexical,
+            WorkerStepV1::Dense,
+        ])) {
+            assert!(probes.contains(&step), "{step:?}");
+        }
         assert!(probes.contains(&("memory_mutation_receipts", ProbeKind::Lock, None)));
         let unique: BTreeSet<_> = probes
             .iter()
