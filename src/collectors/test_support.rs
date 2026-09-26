@@ -1,5 +1,9 @@
 //! Shared unit-test fixtures: a generation-3 head bound to one collected
-//! connector, and fake credentials built at runtime.
+//! connector, and the redactor under it.
+//!
+//! Tests plant credentials as literal, obviously fake placeholders in each
+//! detector's shape (`xoxb-EXAMPLE-NOT-A-TOKEN`), never as a realistic token
+//! and never assembled from fragments.
 
 use crate::evidence_ledger::{
     ActiveStage4Package, WriterAuthoritySnapshot, WriterAuthorityWitness, partition_algorithm_label,
@@ -100,21 +104,4 @@ pub fn generation_two_git_active() -> ActiveStage4Package {
 pub fn redactor() -> CollectorRedactorV1 {
     CollectorRedactorV1::from_active_package(&generation_three_active(CollectionModeV1::Pull))
         .expect("generation 3 carries generation 1's redaction guarantee")
-}
-
-/// A fake credential: `prefix` followed by `body_len` mixed alphanumerics.
-///
-/// Built at runtime so no credential-shaped literal sits in the source, where
-/// a repository secret scanner would rightly flag it.
-pub fn fake_credential(prefix: &str, body_len: usize) -> String {
-    const ALPHABET: &[u8] = b"A1b2C3d4E5f6G7h8J9k0";
-    let body: String = (0..body_len)
-        .map(|index| char::from(ALPHABET[index % ALPHABET.len()]))
-        .collect();
-    format!("{prefix}{body}")
-}
-
-/// Join fragments, so a credential prefix never appears whole in a literal.
-pub fn joined(parts: &[&str]) -> String {
-    parts.concat()
 }

@@ -2,7 +2,7 @@
 //! replaced; the shared classes still apply; a residual withholds.
 
 use super::*;
-use crate::collectors::test_support::{fake_credential, joined, redactor};
+use crate::collectors::test_support::redactor;
 
 fn provider_classes(text: &str) -> Vec<ProviderSecretClassV1> {
     redactor()
@@ -28,115 +28,98 @@ fn staged(text: &str) -> String {
     }
 }
 
-/// One positive credential per Slack class, built at runtime.
-fn slack_positives() -> Vec<(ProviderSecretClassV1, String)> {
+/// One positive credential per Slack class: an obvious placeholder in the
+/// detector's shape, never a realistic token.
+fn slack_positives() -> Vec<(ProviderSecretClassV1, &'static str)> {
     vec![
         (
             ProviderSecretClassV1::SlackToken,
-            fake_credential(&joined(&["xo", "xb-"]), 40),
+            "xoxb-EXAMPLE-NOT-A-TOKEN",
         ),
         (
             ProviderSecretClassV1::SlackToken,
-            fake_credential(&joined(&["xo", "xp-"]), 40),
+            "xoxp-EXAMPLE-NOT-A-TOKEN",
         ),
         (
             ProviderSecretClassV1::SlackAppToken,
-            fake_credential(&joined(&["xa", "pp-"]), 40),
+            "xapp-EXAMPLE-NOT-A-TOKEN",
         ),
         (
             ProviderSecretClassV1::SlackWebhookUrl,
-            joined(&[
-                "https://hooks.slack",
-                ".com/services/",
-                &fake_credential("T0/B0/", 24),
-            ]),
+            "https://hooks.slack.com/services/EXAMPLE/NOT/A-REAL-WEBHOOK",
         ),
         (
             ProviderSecretClassV1::SlackFileToken,
-            joined(&[
-                "https://files.slack.com/f/x.md?t=",
-                &fake_credential(&joined(&["xo", "xe-"]), 30),
-            ]),
+            "https://files.slack.com/f/x.md?t=xoxe-EXAMPLE-NOT-A-TOKEN",
         ),
         (
             ProviderSecretClassV1::SlackToken,
-            fake_credential(&joined(&["xo", "xc-"]), 48),
+            "xoxc-EXAMPLE-NOT-A-TOKEN",
         ),
         (
             ProviderSecretClassV1::SlackToken,
-            joined(&[
-                "xo",
-                "xd-",
-                &fake_credential("", 20),
-                "%2F",
-                &fake_credential("", 20),
-                "%3D",
-            ]),
+            "xoxd-EXAMPLE%2FNOT%2FA%2FCOOKIE%3D",
         ),
     ]
 }
 
-/// One positive credential per provider class, built at runtime.
-fn positives() -> Vec<(ProviderSecretClassV1, String)> {
+/// One positive credential per provider class: an obvious placeholder in the
+/// detector's shape, never a realistic token.
+fn positives() -> Vec<(ProviderSecretClassV1, &'static str)> {
     let mut positives = slack_positives();
     positives.extend([
         (
             ProviderSecretClassV1::LinearApiKey,
-            fake_credential(&joined(&["lin", "_api_"]), 40),
+            "lin_api_EXAMPLENOTAREALKEYEXAMPLENOTAREAL",
         ),
         (
             ProviderSecretClassV1::LinearOauthToken,
-            fake_credential(&joined(&["lin", "_oauth_"]), 40),
+            "lin_oauth_EXAMPLENOTAREALKEYEXAMPLE",
         ),
         (
             ProviderSecretClassV1::LinearWebhookSecret,
-            fake_credential(&joined(&["lin", "_wh_"]), 40),
+            "lin_wh_EXAMPLENOTAREALKEYEXAMPLENOTAREAL",
         ),
         (
             ProviderSecretClassV1::GranolaApiKey,
-            fake_credential(&joined(&["gr", "n_"]), 32),
+            "grn_EXAMPLE_NOT_A_KEY",
         ),
         (
             ProviderSecretClassV1::WebhookSigningSecret,
-            fake_credential(&joined(&["wh", "sec_"]), 44),
+            "whsec_EXAMPLENOTASECRET",
         ),
         (
             ProviderSecretClassV1::GithubToken,
-            fake_credential(&joined(&["gh", "p_"]), 36),
+            "ghp_EXAMPLENOTAREALTOKENEXAMPLENOTAREAL",
         ),
         (
             ProviderSecretClassV1::GithubToken,
-            fake_credential(&joined(&["gh", "s_"]), 36),
+            "ghs_EXAMPLENOTAREALTOKENEXAMPLENOTAREAL",
         ),
         (
             ProviderSecretClassV1::GithubToken,
-            fake_credential(&joined(&["github", "_pat_"]), 60),
+            "github_pat_EXAMPLE_NOT_A_REAL_TOKEN_EXAMPLE",
         ),
         (
             ProviderSecretClassV1::GoogleApiKey,
-            fake_credential(&joined(&["AI", "za"]), 35),
+            "AIzaEXAMPLE_NOT_A_REAL_KEY_EXAMPLE_NOT",
         ),
         (
             ProviderSecretClassV1::AnthropicApiKey,
-            fake_credential(&joined(&["sk-", "ant-"]), 60),
+            "sk-ant-EXAMPLE-NOT-A-REAL-KEY",
         ),
         (
             ProviderSecretClassV1::OpenaiApiKey,
-            fake_credential(&joined(&["sk-", "proj-"]), 60),
+            "sk-proj-EXAMPLE-NOT-A-REAL-KEY",
         ),
+        // The bare `sk-` shape needs upper case, lower case, and a digit.
         (
             ProviderSecretClassV1::OpenaiApiKey,
-            fake_credential("sk-", 48),
+            "sk-EXAMPLEnotArealKEY0000",
         ),
         (
             ProviderSecretClassV1::JsonWebToken,
-            joined(&[
-                "eyJhbGciOiJIUzI1NiJ9",
-                ".",
-                "eyJzdWIiOiJib2IifQ",
-                ".",
-                &fake_credential("s", 30),
-            ]),
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJib2IifQ.EXAMPLE-NOT-A-SIGNATURE",
         ),
     ]);
     positives
@@ -153,7 +136,7 @@ fn every_provider_class_is_detected_and_replaced() {
         );
         let redacted = staged(&text);
         assert!(
-            !redacted.contains(&credential),
+            !redacted.contains(credential),
             "{} survived redaction",
             class.as_str()
         );
@@ -196,15 +179,10 @@ fn look_alikes_are_not_findings() {
 
 #[test]
 fn a_webhook_url_and_a_file_link_keep_their_host_and_lose_their_secret() {
-    let hook = joined(&[
-        "https://hooks.slack",
-        ".com/services/",
-        &fake_credential("T0/B0/", 24),
-    ]);
-    assert_eq!(staged(&hook), "https://hooks.slack.com/services/[REDACTED]");
-    let file_token = fake_credential(&joined(&["xo", "xe-"]), 30);
-    let file = format!("https://files.slack.com/f/x.md?t={file_token}");
-    assert_eq!(staged(&file), "https://files.slack.com/f/x.md?t=[REDACTED]");
+    let hook = "https://hooks.slack.com/services/EXAMPLE/NOT/A-REAL-WEBHOOK";
+    assert_eq!(staged(hook), "https://hooks.slack.com/services/[REDACTED]");
+    let file = "https://files.slack.com/f/x.md?t=xoxe-EXAMPLE-NOT-A-TOKEN";
+    assert_eq!(staged(file), "https://files.slack.com/f/x.md?t=[REDACTED]");
 }
 
 #[test]
@@ -222,11 +200,8 @@ fn the_shared_classes_still_apply() {
 
 #[test]
 fn a_private_key_block_withholds_the_text_whole() {
-    let text = joined(&[
-        "-----BEGIN RSA ",
-        "PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----",
-    ]);
-    let outcome = redactor().redact(&text);
+    let text = "-----BEGIN RSA PRIVATE KEY-----\nEXAMPLE-NOT-A-KEY\n-----END RSA PRIVATE KEY-----";
+    let outcome = redactor().redact(text);
     assert!(matches!(
         outcome.disposition,
         CollectorDispositionV1::Withhold {
@@ -267,14 +242,14 @@ fn a_redacted_text_is_a_fixed_point() {
 
 #[test]
 fn classes_and_counts_are_metadata_only() {
-    let slack = fake_credential(&joined(&["xo", "xb-"]), 40);
-    let linear = fake_credential(&joined(&["lin", "_api_"]), 40);
+    let slack = "xoxb-EXAMPLE-NOT-A-TOKEN";
+    let linear = "lin_api_EXAMPLENOTAREALKEYEXAMPLENOTAREAL";
     let outcome = redactor().redact(&format!("{slack} and {linear}"));
     assert_eq!(outcome.redacted_ranges, 2);
     let labels: Vec<&str> = outcome.classes.iter().map(|class| class.as_str()).collect();
     assert_eq!(labels, vec!["slack_token", "linear_api_key"]);
     let debug = format!("{:?}", outcome.disposition);
-    assert!(!debug.contains("REDACTED") && !debug.contains(&slack));
+    assert!(!debug.contains("REDACTED") && !debug.contains(slack));
 }
 
 #[test]

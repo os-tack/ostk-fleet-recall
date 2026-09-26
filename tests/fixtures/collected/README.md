@@ -14,6 +14,9 @@ Linear, and Granola.
   provider scope (ADR 0008 D9).
 - `src/collectors/{slack,linear,granola}/fixtures/*.json`: provider API pages
   and signed webhook deliveries in each provider's documented shape, for the
-  provider collectors. Every signing secret in them is a fixture value, never a
-  real credential; the Granola desktop cache is deliberately absent, because
-  the collectors never read it.
+  provider collectors. Every signing secret in them is an obvious placeholder
+  (`EXAMPLE-NOT-A-SIGNING-SECRET`, `lin_wh_EXAMPLENOTASIGNINGSECRET`,
+  `whsec_EXAMPLEEXAMPLEEXAMPLEEXAMPLE`), never a real credential or one with a
+  realistic shape, and each delivery's signature header is computed from it;
+  the Granola desktop cache is deliberately absent, because the collectors
+  never read it.

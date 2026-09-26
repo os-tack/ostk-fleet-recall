@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::collectors::redaction::ProviderSecretClassV1;
-use crate::collectors::test_support::{fake_credential, joined, redactor};
+use crate::collectors::test_support::redactor;
 use crate::memory_contracts::canonical::encode_canonical;
 use crate::memory_contracts::collected_item::{
     CollectedItemInputV1, ItemCollectionV1, derive_content_digest,
@@ -264,7 +264,7 @@ fn hidden_unicode_is_stripped_and_counted_across_fields() {
 
 #[test]
 fn a_planted_credential_is_redacted_in_every_text_field() {
-    let credential = fake_credential(&joined(&["xo", "xb-"]), 40);
+    let credential = "xoxb-EXAMPLE-NOT-A-TOKEN";
     let mut draft = message(&format!("the bot token is {credential}, rotate it"));
     draft.title = Some(format!("leak {credential}"));
     draft.links = vec![DraftLinkV1 {
@@ -280,10 +280,10 @@ fn a_planted_credential_is_redacted_in_every_text_field() {
     let bytes = String::from_utf8(part.canonical_envelope.clone()).unwrap();
     let decoded_text = part.envelope.text.as_str();
     assert!(
-        !bytes.contains(&credential),
+        !bytes.contains(credential),
         "a credential reached the envelope"
     );
-    assert!(!decoded_text.contains(&credential));
+    assert!(!decoded_text.contains(credential));
     assert!(
         !part
             .envelope
@@ -291,7 +291,7 @@ fn a_planted_credential_is_redacted_in_every_text_field() {
             .as_ref()
             .unwrap()
             .as_str()
-            .contains(&credential)
+            .contains(credential)
     );
     assert!(decoded_text.contains(REDACTION_PLACEHOLDER));
     assert_eq!(part.envelope.redaction.redacted_ranges, 7);
@@ -306,20 +306,19 @@ fn a_planted_credential_is_redacted_in_every_text_field() {
 
 #[test]
 fn each_provider_class_is_redacted_in_title_url_and_link_targets() {
-    for (prefix, body_len) in [
-        (joined(&["xo", "xp-"]), 40),
-        (joined(&["xa", "pp-"]), 40),
-        (joined(&["lin", "_api_"]), 40),
-        (joined(&["lin", "_oauth_"]), 40),
-        (joined(&["gr", "n_"]), 32),
-        (joined(&["wh", "sec_"]), 44),
-        (joined(&["gh", "p_"]), 36),
-        (joined(&["github", "_pat_"]), 60),
-        (joined(&["AI", "za"]), 35),
-        (joined(&["sk-", "ant-"]), 60),
-        (joined(&["sk-", "proj-"]), 60),
+    for credential in [
+        "xoxp-EXAMPLE-NOT-A-TOKEN",
+        "xapp-EXAMPLE-NOT-A-TOKEN",
+        "lin_api_EXAMPLENOTAREALKEYEXAMPLENOTAREAL",
+        "lin_oauth_EXAMPLENOTAREALKEYEXAMPLE",
+        "grn_EXAMPLE_NOT_A_KEY",
+        "whsec_EXAMPLENOTASECRET",
+        "ghp_EXAMPLENOTAREALTOKENEXAMPLENOTAREAL",
+        "github_pat_EXAMPLE_NOT_A_REAL_TOKEN_EXAMPLE",
+        "AIzaEXAMPLE_NOT_A_REAL_KEY_EXAMPLE_NOT",
+        "sk-ant-EXAMPLE-NOT-A-REAL-KEY",
+        "sk-proj-EXAMPLE-NOT-A-REAL-KEY",
     ] {
-        let credential = fake_credential(&prefix, body_len);
         let mut draft = message("plain text");
         draft.title = Some(format!("t {credential}"));
         draft.provider_url = Some(format!("https://example.com/?v={credential}"));
@@ -328,32 +327,31 @@ fn each_provider_class_is_redacted_in_title_url_and_link_targets() {
         let bytes = String::from_utf8(only_part(&sealed).canonical_envelope.clone()).unwrap();
         let title = only_part(&sealed).envelope.title.clone().unwrap();
         assert!(
-            !bytes.contains(&credential),
-            "{prefix} reached the envelope"
+            !bytes.contains(credential),
+            "{credential} reached the envelope"
         );
         assert!(
-            !title.as_str().contains(&credential),
-            "{prefix} reached the title"
+            !title.as_str().contains(credential),
+            "{credential} reached the title"
         );
     }
 }
 
 #[test]
 fn a_credential_in_an_id_withholds_the_item() {
-    let credential = fake_credential(&joined(&["lin", "_api_"]), 40);
+    let credential = "lin_api_EXAMPLENOTAREALKEYEXAMPLENOTAREAL";
     let mut draft = message("plain text");
     draft.external_id = format!("issue:{credential}");
     let refusal = seal_as(&draft, CollectionModeV1::Pull).unwrap_err();
     assert_eq!(refusal.dead_letter_reason(), "redaction_withheld");
-    assert!(!refusal.to_string().contains(&credential));
+    assert!(!refusal.to_string().contains(credential));
 }
 
 #[test]
 fn an_unredactable_secret_withholds_the_item() {
-    let draft = message(&joined(&[
-        "key follows\n-----BEGIN RSA ",
-        "PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----",
-    ]));
+    let draft = message(
+        "key follows\n-----BEGIN RSA PRIVATE KEY-----\nEXAMPLE-NOT-A-KEY\n-----END RSA PRIVATE KEY-----",
+    );
     let refusal = seal_as(&draft, CollectionModeV1::Pull).unwrap_err();
     assert_eq!(
         refusal,

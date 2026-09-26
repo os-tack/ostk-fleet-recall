@@ -1,9 +1,9 @@
 {
   "headers": {
     "X-Slack-Request-Timestamp": "1790008201",
-    "X-Slack-Signature": "v0=fb8f1cc9a2b39a6f13e1c60f89e520a0932566f9878d516f3afaac7b46d2f219",
+    "X-Slack-Signature": "v0=7dce0209198a36cdeb46c188198e0048efc1a766f75b260d64b1e8eee55bd95b",
     "Content-Type": "application/json"
   },
-  "signing_secret": "8f742231b10e8888abcd99fixture01",
+  "signing_secret": "EXAMPLE-NOT-A-SIGNING-SECRET",
   "raw_body": "{\"token\":\"XXYYZZ-legacy-verification-token-do-not-use\",\"team_id\":\"T07ACME0001\",\"context_team_id\":\"T07ACME0001\",\"api_app_id\":\"A07RECALL01\",\"event\":{\"type\":\"message\",\"subtype\":\"message_changed\",\"hidden\":true,\"channel\":\"C07PLATENG1\",\"channel_type\":\"channel\",\"ts\":\"1790008200.000300\",\"event_ts\":\"1790008200.000300\",\"message\":{\"type\":\"message\",\"user\":\"U07BOB0002\",\"ts\":\"1790006860.001100\",\"thread_ts\":\"1790006645.000200\",\"parent_user_id\":\"U07ALICE001\",\"text\":\"3 — see <https://linear.app/acme-robotics/issue/ENG-412|ENG-412> (withdrawn, 5 is fine)\",\"edited\":{\"user\":\"U07BOB0002\",\"ts\":\"1790008200.000300\"}},\"previous_message\":{\"type\":\"message\",\"user\":\"U07BOB0002\",\"ts\":\"1790006860.001100\",\"thread_ts\":\"1790006645.000200\",\"text\":\"3 — see <https://linear.app/acme-robotics/issue/ENG-412|ENG-412>\"}},\"type\":\"event_callback\",\"event_id\":\"Ev07CHG00001\",\"event_time\":1790008200,\"authorizations\":[{\"enterprise_id\":null,\"team_id\":\"T07ACME0001\",\"user_id\":\"U07RECALLBT\",\"is_bot\":true,\"is_enterprise_install\":false}],\"is_ext_shared_channel\":false,\"event_context\":\"4-eyJldCI6Im1lc3NhZ2UifQ\"}"
 }

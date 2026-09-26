@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn a_collector_credential_written_inline_is_refused() {
-        let token = ["xox", "b-", "1234567890-", "abcdefghijklmnop"].concat();
+        let token = "xoxb-EXAMPLE-NOT-A-TOKEN";
         let message = refusal(&with_collector(&serde_json::json!({ "token": token })));
         assert!(message.contains("token_env"), "{message}");
 
@@ -908,7 +908,7 @@ mod tests {
         })));
         assert!(message.contains("secret-shaped"), "{message}");
         assert!(
-            !message.contains(&token),
+            !message.contains(token),
             "the refusal never repeats the value"
         );
 

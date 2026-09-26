@@ -1,9 +1,9 @@
 {
   "headers": {
     "X-Slack-Request-Timestamp": "1790064001",
-    "X-Slack-Signature": "v0=ce677d13d65ebf938bce276d78d36738fa8497e30eb1cb05570b0877b355b929",
+    "X-Slack-Signature": "v0=d48e4d98c22d96294ee19f0af98ea2dff651dd4fd021ab0c31d02d4fa80d1d00",
     "Content-Type": "application/json"
   },
-  "signing_secret": "8f742231b10e8888abcd99fixture01",
+  "signing_secret": "EXAMPLE-NOT-A-SIGNING-SECRET",
   "raw_body": "{\"token\":\"XXYYZZ-legacy-verification-token-do-not-use\",\"team_id\":\"T07ACME0001\",\"api_app_id\":\"A07RECALL01\",\"event\":{\"type\":\"message\",\"subtype\":\"message_deleted\",\"hidden\":true,\"channel\":\"C07PLATENG1\",\"channel_type\":\"channel\",\"ts\":\"1790064000.000100\",\"event_ts\":\"1790064000.000100\",\"deleted_ts\":\"1790011800.000900\",\"previous_message\":{\"type\":\"message\",\"subtype\":\"bot_message\",\"bot_id\":\"B07LINEAR01\",\"ts\":\"1790011800.000900\",\"text\":\"\"}},\"type\":\"event_callback\",\"event_id\":\"Ev07DEL00001\",\"event_time\":1790064000}"
 }
