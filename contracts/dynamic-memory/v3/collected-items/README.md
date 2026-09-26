@@ -58,8 +58,9 @@ marker, a two-part document under the default marker, and a revoked tombstone.
 Two tests hold them: the contract test re-derives every digest from the
 envelope alone, and the pipeline test seals the same drafts again and requires
 these exact bytes. An envelope stored as evidence is identity-bearing, so a
-deliberate change is a new envelope schema or redaction profile, regenerated
-with
+deliberate change is a new envelope schema or redaction profile (the vectors
+record profile 3, the crate-wide profile of `crate::redaction`: the shared
+shapes plus the provider shapes, Stripe included), regenerated with
 
 ```bash
 cargo test --lib -- --ignored regenerate_collected_item_vectors

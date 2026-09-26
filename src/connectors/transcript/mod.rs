@@ -93,8 +93,11 @@ pub use parser::{
 };
 // The redactor is the crate's one secret boundary (`crate::redaction`); it is
 // re-exported here because the transcript connector is where it was first
-// needed and callers still name it through this module.
+// needed and callers still name it through this module. Since profile 3 the
+// set a turn is scanned with is the full one: the six shared shapes and the
+// provider shapes.
 pub use crate::redaction::{
-    REDACTION_PLACEHOLDER, RedactionDispositionV1, RedactionGuaranteeV1, RedactionOutcomeV1,
+    CollectedSecretClassV1, CollectedSecretFindingV1, ProviderSecretClassV1, REDACTION_PLACEHOLDER,
+    REDACTION_PROFILE_VERSION, RedactionDispositionV1, RedactionGuaranteeV1, RedactionOutcomeV1,
     SecretClassV1, SecretFindingV1, redact, scan_secrets,
 };

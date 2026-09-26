@@ -29,7 +29,7 @@ use super::outbox::{
     TranscriptBatchV1, TranscriptCursorRowV1, TranscriptOutboxRowV1, TranscriptOutboxStateV1,
 };
 use super::parser::parse_transcript;
-use crate::redaction::{RedactionGuaranteeV1, SecretClassV1};
+use crate::redaction::{CollectedSecretClassV1, RedactionGuaranteeV1};
 
 /// The ingress clocks one batch is stamped with.
 ///
@@ -56,9 +56,9 @@ pub struct TranscriptCollectionStatsV1 {
     pub turns_redacted: u32,
     /// Records that carried no turn.
     pub records_skipped: u32,
-    /// Distinct secret classes detected in this pass (metadata only; never the
-    /// matched bytes).
-    pub classes_detected: Vec<SecretClassV1>,
+    /// Distinct secret classes detected in this pass, shared and provider
+    /// shapes alike (metadata only; never the matched bytes).
+    pub classes_detected: Vec<CollectedSecretClassV1>,
 }
 
 /// Everything one collection pass needs.

@@ -1,18 +1,13 @@
-//! The secret matchers and the replacement discipline every redaction in this
-//! crate runs (EVID-05, PRED-03).
+//! The six shared secret matchers every redaction in this crate runs
+//! (EVID-05, PRED-03): a PEM private-key block, an AWS access key id, a bearer
+//! token, a key/token/secret assignment, a password assignment, and a URL
+//! authority carrying a credential.
 //!
-//! # Fail closed, twice
-//!
-//! 1. [`scan_secrets`] finds every match of the closed [`SecretClassV1`] set. If
-//!    any match is an UNREDACTABLE class ([`SecretClassV1::is_redactable`]), the
-//!    text is withheld whole and no redacted body is built for it at all.
-//!    Otherwise [`redact`] replaces those byte ranges with
-//!    [`REDACTION_PLACEHOLDER`].
-//! 2. The redacted text is then RE-SCANNED. A residual finding means the
-//!    redactor did not fully neutralize what it detected, and the text is
-//!    withheld entirely ([`RedactionDispositionV1::Withhold`]) rather than
-//!    staged with a partial redaction. There is no path that stages a text the
-//!    re-scan still flags.
+//! The replacement discipline (withhold an unredactable class whole; replace
+//! every other range; re-scan and withhold on any residual) lives in
+//! [`super::redact`], where these shapes and the provider shapes of
+//! [`super::provider_shapes`] are scanned together. This module only knows how
+//! to find its six shapes.
 //!
 //! # Why hand-written matchers
 //!
@@ -100,46 +95,6 @@ pub struct SecretFindingV1 {
     pub byte_start: usize,
     /// Exclusive end byte offset into the scanned text.
     pub byte_end: usize,
-}
-
-/// What the redactor decided about one text (a transcript turn, a recall
-/// text, a collected item part).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RedactionDispositionV1 {
-    /// The text is clean or was fully redacted; `text` is safe to stage.
-    Stage {
-        /// The redacted body. Equal to the input when nothing matched.
-        text: String,
-    },
-    /// The text must not be staged at all: the post-redaction re-scan still
-    /// found a secret shape, so no partially-redacted body is durable.
-    Withhold {
-        /// The residual class that forced the refusal.
-        class: SecretClassV1,
-    },
-}
-
-/// The outcome of running the redactor over one text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RedactionOutcomeV1 {
-    /// What to do with the text.
-    pub disposition: RedactionDispositionV1,
-    /// Classes detected in the ORIGINAL text, sorted and deduplicated. Metadata
-    /// only: it never carries matched bytes.
-    pub classes: Vec<SecretClassV1>,
-    /// Number of ranges replaced.
-    pub redacted_ranges: u32,
-}
-
-impl RedactionOutcomeV1 {
-    /// The body to stage, or `None` when the text is withheld.
-    #[must_use]
-    pub fn staged_text(&self) -> Option<&str> {
-        match &self.disposition {
-            RedactionDispositionV1::Stage { text } => Some(text),
-            RedactionDispositionV1::Withhold { .. } => None,
-        }
-    }
 }
 
 const fn is_secret_value_byte(byte: u8) -> bool {
@@ -354,12 +309,11 @@ fn scan_url_credentials(bytes: &[u8], findings: &mut Vec<SecretFindingV1>) {
     }
 }
 
-/// Every secret-shaped range in `text`, sorted by start and non-overlapping.
-///
-/// Overlapping detections are merged into the widest range so a single
-/// replacement always neutralizes every class that matched there.
-#[must_use]
-pub fn scan_secrets(text: &str) -> Vec<SecretFindingV1> {
+/// Every range of the six shared shapes in `text`, as each matcher reported
+/// it: unsorted and possibly overlapping. [`super::scan_secrets`] merges them
+/// with the provider findings so one replacement neutralizes every class that
+/// matched there.
+pub fn scan_shared_secrets(text: &str) -> Vec<SecretFindingV1> {
     let bytes = text.as_bytes();
     let lower = ascii_lower(bytes);
     let mut findings = Vec::new();
@@ -383,96 +337,7 @@ pub fn scan_secrets(text: &str) -> Vec<SecretFindingV1> {
         &mut findings,
     );
     scan_url_credentials(bytes, &mut findings);
-    merge(findings)
-}
-
-fn merge(mut findings: Vec<SecretFindingV1>) -> Vec<SecretFindingV1> {
-    findings.sort_by_key(|finding| (finding.byte_start, std::cmp::Reverse(finding.byte_end)));
-    let mut merged: Vec<SecretFindingV1> = Vec::with_capacity(findings.len());
-    for finding in findings {
-        match merged.last_mut() {
-            Some(previous) if finding.byte_start < previous.byte_end => {
-                previous.byte_end = previous.byte_end.max(finding.byte_end);
-            }
-            _ => merged.push(finding),
-        }
-    }
-    merged
-}
-
-/// Redact every detected range, then prove the result is clean.
-#[must_use]
-pub fn redact(text: &str) -> RedactionOutcomeV1 {
-    let findings = scan_secrets(text);
-    let mut classes: Vec<SecretClassV1> = findings.iter().map(|finding| finding.class).collect();
-    classes.sort_unstable();
-    classes.dedup();
-    let redacted_ranges = u32::try_from(findings.len()).unwrap_or(u32::MAX);
-
-    // The first fence: an unredactable class withholds the whole text before a
-    // partially-redacted body is even built, so there is no intermediate value
-    // a later stage could accidentally stage (EVID-05).
-    if let Some(unredactable) = findings
-        .iter()
-        .find(|finding| !finding.class.is_redactable())
-    {
-        return RedactionOutcomeV1 {
-            disposition: RedactionDispositionV1::Withhold {
-                class: unredactable.class,
-            },
-            classes,
-            redacted_ranges,
-        };
-    }
-
-    let mut redacted = String::with_capacity(text.len());
-    let mut cursor = 0_usize;
-    for finding in &findings {
-        // Byte offsets come from this same &str and every matcher only ever
-        // stops on ASCII bytes, so the ranges are always char boundaries;
-        // get() rather than indexing keeps that a refusal, not a panic.
-        let Some(prefix) = text.get(cursor..finding.byte_start) else {
-            return RedactionOutcomeV1 {
-                disposition: RedactionDispositionV1::Withhold {
-                    class: finding.class,
-                },
-                classes,
-                redacted_ranges,
-            };
-        };
-        redacted.push_str(prefix);
-        redacted.push_str(REDACTION_PLACEHOLDER);
-        cursor = finding.byte_end;
-    }
-    let Some(tail) = text.get(cursor..) else {
-        return RedactionOutcomeV1 {
-            disposition: RedactionDispositionV1::Withhold {
-                class: findings
-                    .last()
-                    .map_or(SecretClassV1::ApiKeyAssignment, |finding| finding.class),
-            },
-            classes,
-            redacted_ranges,
-        };
-    };
-    redacted.push_str(tail);
-
-    // The second fence: if anything still matches after redaction, refuse the
-    // text outright rather than stage a partial redaction (EVID-05, PRED-03).
-    if let Some(residual) = scan_secrets(&redacted).first() {
-        return RedactionOutcomeV1 {
-            disposition: RedactionDispositionV1::Withhold {
-                class: residual.class,
-            },
-            classes,
-            redacted_ranges,
-        };
-    }
-    RedactionOutcomeV1 {
-        disposition: RedactionDispositionV1::Stage { text: redacted },
-        classes,
-        redacted_ranges,
-    }
+    findings
 }
 
 #[cfg(test)]
