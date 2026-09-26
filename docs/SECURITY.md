@@ -409,10 +409,16 @@ as `untrusted_third_party` text. The agent never decides who may read it:
 the server admits an item only into a container a verified collector or an
 operator import recorded as readable by the project, or into a scope the
 operator lists in `FLEET_RECALL_COLLECTED_CAPTURE_SCOPES`, and an agent's
-`private` or `dm` hint withholds it. The collector redactor scrubs every
-item before it is staged, a refusal keeps only a digest, and the capture's
-receipt keeps the request's digest, never its text. A capture cannot
-withdraw, re-open, or delete anything.
+`private` or `dm` hint withholds it. A direct or group-direct conversation
+(a container kind such as `slack.im` or `slack.mpim`) is refused whatever
+the scopes list. The collector redactor scrubs every item before it is
+staged, a refusal keeps only a digest, and the capture's receipt keeps the
+request's digest, never its text; that digest (and every delivery id derived
+from it) is taken with every secret the redactor finds replaced, so reading
+it never confirms a guess of a redacted secret. An order ahead of the clock
+is refused, so no capture pins an item's head. A capture cannot withdraw,
+re-open, or delete anything, and a URL it reports never takes over the
+permalink of an item a collector admitted.
 
 **The publication reader gains nothing.** The event-first plane changes only
 the runtime policy. `fleet_publication_reader` keeps `SELECT` on exactly its
@@ -446,8 +452,10 @@ from every claim it returns. An `assert` citation adds the cited parts'
 accepted events to the claim's accepted event, which the publication reader
 cannot read either. A citation is resolved in the claim's own project only,
 so a claim cannot rest on another project's item, and an item the project may
-not read (deleted, or its container or itself withdrawn) is refused rather
-than cited; one hidden later stays cited, and the private claim get says it
+not read (deleted, its container or itself withdrawn, or a version admitted
+in a container since withdrawn) is refused rather than cited, whether an
+assertion names it through `support_items` or lists its accepted event
+directly; one hidden later stays cited, and the private claim get says it
 is hidden, without its text.
 
 ## Residual SQL authority and recovery
