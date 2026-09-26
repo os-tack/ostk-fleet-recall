@@ -12,9 +12,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::evidence_recall::{
-    ABSENCE_DENSE_MIN_COSINE_SIMILARITY, EvidenceDenseLaneV1, EvidenceReadinessV1, EvidenceRecall,
-    EvidenceSearchV1, EvidenceSourceV1, EvidenceSourcesV1, MAX_EVIDENCE_SEARCH_LIMIT,
-    MAX_EVIDENCE_SOURCES,
+    ABSENCE_DENSE_MIN_COSINE_SIMILARITY, ABSENCE_NEIGHBOUR_BAND_FLOOR, EvidenceDenseLaneV1,
+    EvidenceReadinessV1, EvidenceRecall, EvidenceSearchV1, EvidenceSourceFilterV1,
+    EvidenceSourceV1, EvidenceSourcesV1, MAX_EVIDENCE_SEARCH_LIMIT, MAX_EVIDENCE_SOURCES,
 };
 use crate::item_recall::{
     ItemRecall, ItemReferenceV1, ItemSearchRequestV1, ItemSearchV1, MAX_ITEM_SEARCH_LIMIT,
@@ -615,6 +615,7 @@ impl CockroachMemoryService {
         let overlay = self
             .overlay_conflicts(scope, &mut projection.conflicts)
             .await;
+        let no_hits = hits.is_empty();
         let mut result = RecallResult::new(json!({ "hits": hits }));
         result.conflicts = serialize_conflicts(&projection.conflicts)?;
         result.conflict_coverage = conflict_coverage(false, &projection.conflicts);
@@ -642,6 +643,11 @@ impl CockroachMemoryService {
                 "code": "query_not_embedded",
                 "message": "the query has no usable embedding under the pinned model, so only the lexical lane ran"
             }));
+        }
+        if no_hits
+            && let Some(hint) = other_kinds_hint(self.items.is_some(), self.evidence.is_some())
+        {
+            result.warnings.push(hint);
         }
         let mut retrieval = json!({
             "lanes": if unembedded { json!(["lexical"]) } else { json!(["lexical", "dense"]) },
@@ -744,10 +750,11 @@ impl CockroachMemoryService {
         let args: SearchArgs = from_arguments(arguments, "recall search")?;
         validate_search_args(&args)?;
         reject_evidence_unsupported_filters(&args)?;
+        let source = evidence_source_filter(args.source.as_deref())?;
         let limit = bounded_limit(args.limit)?;
         let vector = self.embed_evidence_query(&args.query).await;
         let search = evidence
-            .search(&args.query, vector, limit)
+            .search_from(&args.query, vector, limit, source)
             .await
             .map_err(service_error)?;
         Ok(evidence_search_result(search))
@@ -2582,18 +2589,34 @@ fn reject_claim_only_unsupported_filters(args: &SearchArgs) -> ServiceResult<()>
 }
 
 fn reject_evidence_unsupported_filters(args: &SearchArgs) -> ServiceResult<()> {
-    if args.source.is_some()
-        || args.max_per_source_id.is_some()
+    if args.max_per_source_id.is_some()
         || args.min_score.is_some()
         || args.intent.is_some()
         || args.include_history
     {
         return Err(ServiceError::InvalidRequest(
-            "evidence search does not support source, max_per_source_id, min_score, intent, or include_history; use kind=chunk for those filters"
+            "evidence search does not support max_per_source_id, min_score, intent, or include_history; use kind=chunk for those filters"
                 .into(),
         ));
     }
     Ok(())
+}
+
+/// The evidence source an argument names: one of the closed set
+/// [`EvidenceSourceFilterV1::ALL`], or none.
+fn evidence_source_filter(source: Option<&str>) -> ServiceResult<Option<EvidenceSourceFilterV1>> {
+    source
+        .map(|source| {
+            EvidenceSourceFilterV1::parse(source).ok_or_else(|| {
+                ServiceError::InvalidRequest(format!(
+                    "evidence search source must be one of {}; {source:?} is not (kind=item takes a provider such as slack)",
+                    EvidenceSourceFilterV1::ALL
+                        .map(EvidenceSourceFilterV1::as_str)
+                        .join(", ")
+                ))
+            })
+        })
+        .transpose()
 }
 
 /// A hit's id: the lowercase hex content address `search` returned.
@@ -2656,6 +2679,7 @@ fn evidence_search_result(search: EvidenceSearchV1) -> RecallResult {
             "dense_lane": dense_lane,
             "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
             "absence_dense_min_cosine_similarity": ABSENCE_DENSE_MIN_COSINE_SIMILARITY,
+            "absence_neighbour_band_floor": ABSENCE_NEIGHBOUR_BAND_FLOOR,
         }),
     );
     result
@@ -2723,6 +2747,7 @@ fn item_search_result(search: ItemSearchV1) -> RecallResult {
             "dense_lane": dense_lane,
             "dense_min_cosine_similarity": RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
             "absence_dense_min_cosine_similarity": ABSENCE_DENSE_MIN_COSINE_SIMILARITY,
+            "absence_neighbour_band_floor": ABSENCE_NEIGHBOUR_BAND_FLOOR,
         }),
     );
     result
@@ -2963,6 +2988,27 @@ fn collector_warnings(readiness: &EvidenceReadinessV1, warnings: &mut Vec<Value>
     }
 }
 
+/// What `kind` covers, as `recall`'s schema says it; the `kind` property's
+/// description and the empty-answer hint carry the same text.
+const KIND_COVERAGE: &str = "chunk (default): the seed corpus and recorded claims. item: Slack, Linear, Granola, documents. evidence: git history, agent transcripts, CI, and items. claim: recorded claims by meaning";
+
+/// The warning an empty chunk answer carries when other kinds are served:
+/// an agent that omitted `kind` searched only the seed corpus and the claim
+/// chunks, and what it asked for may be an item or evidence.
+fn other_kinds_hint(items: bool, evidence: bool) -> Option<Value> {
+    let kinds: Vec<&str> = [(items, "item"), (evidence, "evidence")]
+        .into_iter()
+        .filter_map(|(served, kind)| served.then_some(kind))
+        .collect();
+    (!kinds.is_empty()).then(|| {
+        json!({
+            "code": "other_kinds_available",
+            "message": format!("no chunk matched; {KIND_COVERAGE}"),
+            "kinds": kinds,
+        })
+    })
+}
+
 /// What an evidence answer's readiness and sources warn about: projection
 /// lag, pending ingest, a disabled dense lane, failed or stale sources, and a
 /// cut listing. The absence verdict carries the same facts as reasons; these
@@ -2970,12 +3016,16 @@ fn collector_warnings(readiness: &EvidenceReadinessV1, warnings: &mut Vec<Value>
 fn evidence_warnings(readiness: &EvidenceReadinessV1, sources: &EvidenceSourcesV1) -> Vec<Value> {
     let mut warnings = Vec::new();
     if readiness.events_awaiting_body_projection > 0 {
+        let by_kind = readiness.lag_by_kind.map_or_else(String::new, |lag| {
+            format!(" ({} collected item parts, {} other)", lag.items, lag.other)
+        });
         warnings.push(json!({
             "code": "evidence_body_projection_lag",
             "message": format!(
-                "{} accepted evidence events are waiting for the body projector; the newest evidence is not searchable until the worker's project step runs",
+                "{} accepted evidence events are waiting for the body projector{by_kind}; the newest evidence is not searchable until the worker's project step runs",
                 readiness.events_awaiting_body_projection
             ),
+            "lag_by_kind": readiness.lag_by_kind,
         }));
     }
     if readiness.transcript_turns_awaiting_admission > 0 {
@@ -4744,6 +4794,7 @@ mod tests {
     fn evidence_readiness(dense_lane: EvidenceDenseLaneV1) -> EvidenceReadinessV1 {
         EvidenceReadinessV1 {
             events_awaiting_body_projection: 2,
+            lag_by_kind: None,
             transcript_turns_awaiting_admission: 0,
             items_awaiting_admission: None,
             hints_awaiting_fetch: None,
@@ -4805,6 +4856,8 @@ mod tests {
         status_delay: Option<std::time::Duration>,
         /// Each search's query, whether it carried a vector, and its limit.
         searches: std::sync::Mutex<Vec<(String, bool, usize)>>,
+        /// Each search's source filter.
+        sources: std::sync::Mutex<Vec<Option<EvidenceSourceFilterV1>>>,
         gets: std::sync::Mutex<Vec<Sha256Digest>>,
         statuses: std::sync::atomic::AtomicUsize,
     }
@@ -4834,19 +4887,22 @@ mod tests {
 
     #[async_trait]
     impl EvidenceRecall for FakeEvidence {
-        async fn search(
+        async fn search_from(
             &self,
             query: &str,
             query_vector: Option<Vec<f32>>,
             limit: usize,
+            source: Option<EvidenceSourceFilterV1>,
         ) -> crate::Result<EvidenceSearchV1> {
             use crate::evidence_recall::{
-                AbsenceV1, AbsenceVerdictV1, EvidenceHitV1, EvidenceMatchV1, PresentByV1,
+                AbsenceScopeV1, AbsenceV1, AbsenceVerdictV1, EvidenceHitV1, EvidenceMatchV1,
+                PresentByV1,
             };
             self.searches
                 .lock()
                 .unwrap()
                 .push((query.to_owned(), query_vector.is_some(), limit));
+            self.sources.lock().unwrap().push(source);
             let dense_lane = if query_vector.is_some() {
                 EvidenceDenseLaneV1::Used
             } else {
@@ -4874,7 +4930,9 @@ mod tests {
                     as_of: Some(Utc::now()),
                     present_by: Some(PresentByV1::Lexical),
                     strongest_dense_similarity: None,
+                    strongest_hit: None,
                     weak_neighbours: 0,
+                    scope: source.map(|source| AbsenceScopeV1 { source }),
                 },
             })
         }
@@ -5031,7 +5089,8 @@ mod tests {
         let evidence = Arc::new(FakeEvidence::default());
         let service = evidence_service(Arc::new(UnitEmbedder), &evidence);
         for arguments in [
-            json!({ "kind": "evidence", "query": "q", "source": "git" }),
+            json!({ "kind": "evidence", "query": "q", "source": "slack" }),
+            json!({ "kind": "evidence", "query": "q", "source": "Git" }),
             json!({ "kind": "evidence", "query": "q", "max_per_source_id": 3 }),
             json!({ "kind": "evidence", "query": "q", "min_score": 0.0 }),
             json!({ "kind": "evidence", "query": "q", "intent": "general" }),
@@ -5291,6 +5350,123 @@ mod tests {
             warning_codes(&evidence_warnings(&foreign, &healthy)),
             ["evidence_dense_lane_disabled"]
         );
+    }
+
+    #[test]
+    fn the_projection_lag_warning_says_which_kind_is_waiting() {
+        use crate::evidence_recall::LagByKindV1;
+        let healthy = EvidenceSourcesV1 {
+            active: Vec::new(),
+            truncated: false,
+        };
+        let unsplit = evidence_readiness(EvidenceDenseLaneV1::Available);
+        let warnings = evidence_warnings(&unsplit, &healthy);
+        assert_eq!(warning_codes(&warnings), ["evidence_body_projection_lag"]);
+        assert!(
+            warnings[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("2 accepted evidence events are waiting for the body projector;"),
+            "{}",
+            warnings[0]
+        );
+        assert_eq!(warnings[0]["lag_by_kind"], Value::Null);
+        let split = EvidenceReadinessV1 {
+            events_awaiting_body_projection: 3,
+            lag_by_kind: Some(LagByKindV1 { items: 1, other: 2 }),
+            ..unsplit
+        };
+        let warnings = evidence_warnings(&split, &healthy);
+        assert!(
+            warnings[0]["message"].as_str().unwrap().starts_with(
+                "3 accepted evidence events are waiting for the body projector (1 collected item \
+                 parts, 2 other);"
+            ),
+            "{}",
+            warnings[0]
+        );
+        assert_eq!(
+            warnings[0]["lag_by_kind"],
+            json!({ "items": 1, "other": 2 })
+        );
+    }
+
+    #[test]
+    fn an_empty_chunk_answer_hints_at_the_kinds_that_are_served() {
+        assert_eq!(other_kinds_hint(false, false), None);
+        let both = other_kinds_hint(true, true).unwrap();
+        assert_eq!(both["code"], "other_kinds_available");
+        assert_eq!(both["kinds"], json!(["item", "evidence"]));
+        assert!(
+            both["message"]
+                .as_str()
+                .unwrap()
+                .contains("evidence: git history, agent transcripts, CI, and items"),
+            "{both}"
+        );
+        assert_eq!(
+            other_kinds_hint(false, true).unwrap()["kinds"],
+            json!(["evidence"])
+        );
+        assert_eq!(
+            other_kinds_hint(true, false).unwrap()["kinds"],
+            json!(["item"])
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_search_passes_its_source_through_and_the_verdict_is_scoped() {
+        let evidence = Arc::new(FakeEvidence::default());
+        let service = evidence_service(Arc::new(UnitEmbedder), &evidence);
+        let result = FleetMemoryService::recall(
+            &service,
+            offline_scope(),
+            recall_request(
+                RecallAction::Search,
+                &json!({ "kind": "evidence", "query": "webhook ingress", "source": "git" }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *evidence.sources.lock().unwrap(),
+            [Some(EvidenceSourceFilterV1::Git)]
+        );
+        assert_eq!(result.data["absence"]["scope"], json!({ "source": "git" }));
+        assert_eq!(
+            result.diagnostics["retrieval"]["absence_neighbour_band_floor"],
+            json!(ABSENCE_NEIGHBOUR_BAND_FLOOR)
+        );
+        // Unfiltered, the verdict carries no scope.
+        let unscoped = FleetMemoryService::recall(
+            &service,
+            offline_scope(),
+            recall_request(
+                RecallAction::Search,
+                &json!({ "kind": "evidence", "query": "webhook ingress" }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*evidence.sources.lock().unwrap().last().unwrap(), None);
+        assert!(unscoped.data["absence"].get("scope").is_none());
+        // A source that is not in the closed set is refused before the read,
+        // naming the set.
+        let error = FleetMemoryService::recall(
+            &service,
+            offline_scope(),
+            recall_request(
+                RecallAction::Search,
+                &json!({ "kind": "evidence", "query": "q", "source": "slack" }),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("git, items, sessions"),
+            "{error}"
+        );
+        assert_eq!(evidence.sources.lock().unwrap().len(), 2);
     }
 
     #[test]

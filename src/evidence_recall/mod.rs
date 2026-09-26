@@ -31,9 +31,14 @@
 //! (a raw git fact, [`DENSE_VOTE_EXCLUDED_MEDIA_TYPES`], never does;
 //! `present_by: dense`, or `both`). Any other hit is a weak neighbour: it is
 //! listed, counted in `weak_neighbours`, and its similarity is reported in
-//! `strongest_dense_similarity`, but it decides nothing and hides no
-//! reason. With no voting hit, the verdict is `absent` only when all of
-//! these hold (see [`absence_verdict`]):
+//! `strongest_dense_similarity` (with `strongest_hit`, its index into the
+//! hits), but it never makes the answer `present` and hides no reason. A
+//! weak neighbour whose body may vote and whose similarity reaches
+//! [`ABSENCE_NEIGHBOUR_BAND_FLOOR`] does refuse `absent`, though: memory
+//! then has a candidate it cannot confirm, and the verdict is `unknown` with
+//! [`AbsenceReasonV1::DenseNeighbourBelowBound`], never `absent`. With no
+//! voting hit and no such candidate, the verdict is `absent` only when all
+//! of these hold (see [`absence_verdict`]):
 //!
 //! * the query has lexical terms, because absence is defined over the lexical
 //!   tier;
@@ -49,7 +54,15 @@
 //! * the source listing was not cut short.
 //!
 //! Anything else is `unknown`, with every [`AbsenceReasonV1`] that applies.
-//! The dense tier never blocks `absent`: it is reported, not required.
+//! The dense tier's lag never blocks `absent`: it is reported, not required.
+//!
+//! An evidence search may be scoped with a source filter
+//! ([`EvidenceSourceFilterV1`]: `git`, `items`, or `sessions`), which
+//! restricts both lanes to bodies of that source's media type; the verdict
+//! then carries `scope: {source}`, so `absent` reads "absent from git".
+//! Readiness and the source listing stay scope-wide, with the projection lag
+//! split by kind (`lag_by_kind`) so an answer can say whether the pending
+//! evidence is collected items or the project's own.
 //!
 //! "Complete" is the newest coverage cursor of each source. For git that is
 //! the latest observed ref target; for CI, the latest window of runs; for a
@@ -136,6 +149,7 @@ use crate::memory_contracts::collected_item::{
 };
 use crate::memory_contracts::coverage::CoverageCompletenessV1;
 use crate::memory_contracts::digest::Sha256Digest;
+use crate::projectors::lexical::{CANONICAL_JSON_MEDIA_TYPE, GIT_FACT_MEDIA_TYPE};
 use crate::projectors::{RowVisibilityClassV1, fold_lexical_characters};
 use crate::store::cockroach::MEMORY_WORKER_SCHEMA_VERSION;
 use crate::worker::{WorkerSourceKindV1, WorkerSourceOutcomeV1};
@@ -148,13 +162,13 @@ pub use cockroach::{
 // privilege probe, the readiness and coverage reads, the lexical-term check,
 // and the row decoders.
 pub(crate) use cockroach::{
-    EVENTS_AWAITING_BODIES_SQL, FOREIGN_DENSE_MODEL_SQL, attach_coverage, count,
+    EVENTS_AWAITING_BODIES_BY_KIND_FROM_SQL, FOREIGN_DENSE_MODEL_SQL, attach_coverage, count,
     decode_collector_source_row, dense_lane, digest, has_lexical_terms, listing_limit, may_read,
 };
 pub use serve::start_evidence_recall;
 pub use verdict::{
-    ABSENCE_DENSE_MIN_COSINE_SIMILARITY, DENSE_VOTE_EXCLUDED_MEDIA_TYPES, HitVoteV1,
-    absence_verdict, lane_match,
+    ABSENCE_DENSE_MIN_COSINE_SIMILARITY, ABSENCE_NEIGHBOUR_BAND_FLOOR,
+    DENSE_VOTE_EXCLUDED_MEDIA_TYPES, HitVoteV1, absence_verdict, lane_match,
 };
 
 /// First schema evidence recall can read: migration 30 creates the worker
@@ -222,12 +236,39 @@ pub enum EvidenceDenseLaneV1 {
     DisabledForeignModel,
 }
 
+/// The accepted events awaiting the body projector, split by kind.
+///
+/// A pending event carries either a collected item part (a row of
+/// `memory_collected_items_v1`) or the project's own evidence (a git fact, a
+/// transcript turn, a CI run). An item search scoped to one provider counts only that provider's pending
+/// parts, so its `other` is always zero; an unfiltered search splits the
+/// scope's whole count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct LagByKindV1 {
+    /// Pending events that are collected item parts.
+    pub items: u64,
+    /// Pending events of any other kind.
+    pub other: u64,
+}
+
+impl LagByKindV1 {
+    /// Every pending event, whatever it carries.
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.items.saturating_add(self.other)
+    }
+}
+
 /// How far ingestion and projection have caught up, as of one read.
 #[allow(clippy::struct_excessive_bools)] // independent readiness facts, serialized as-is
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EvidenceReadinessV1 {
     /// Accepted evidence events the body projector has not consumed yet.
     pub events_awaiting_body_projection: u64,
+    /// The same count split by kind; absent when the collector tables that
+    /// tell a collected part from other evidence cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lag_by_kind: Option<LagByKindV1>,
     /// Transcript turns staged in the outbox and not yet admitted.
     pub transcript_turns_awaiting_admission: u64,
     /// Collected item parts staged in the collector outbox and not yet
@@ -530,6 +571,11 @@ pub enum AbsenceReasonV1 {
     /// The schema has collector state this login cannot read, so a
     /// collected item could be pending, deleted, or present unseen.
     CollectorStateUnreadable,
+    /// No hit matched the query's words, but a dense-only neighbour whose
+    /// body may vote lies in the band `[ABSENCE_NEIGHBOUR_BAND_FLOOR,
+    /// ABSENCE_DENSE_MIN_COSINE_SIMILARITY)`: memory has a candidate it
+    /// cannot confirm, listed at `hits[strongest_hit]`.
+    DenseNeighbourBelowBound,
 }
 
 /// Which lane made a `present` verdict.
@@ -543,6 +589,62 @@ pub enum PresentByV1 {
     Dense,
     /// Both.
     Both,
+}
+
+/// The source an evidence search was scoped to: a closed set of names, each
+/// standing for one media type of the body plane.
+///
+/// Transcript turns and CI runs share the canonical JSON media type, so
+/// `sessions` covers both; there is no narrower filter without a schema
+/// change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSourceFilterV1 {
+    /// Raw git facts (`application.ostk-git-fact-v1`).
+    Git,
+    /// Collected item parts (`application.ostk-collected-item-v1`).
+    Items,
+    /// Agent transcript turns and CI runs (`application.json`).
+    Sessions,
+}
+
+impl EvidenceSourceFilterV1 {
+    /// Every filter, in the order the tool schema lists them.
+    pub const ALL: [Self; 3] = [Self::Git, Self::Items, Self::Sessions];
+
+    /// The filter a request names; `None` for any other string.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|filter| filter.as_str() == value)
+    }
+
+    /// The wire name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Items => "items",
+            Self::Sessions => "sessions",
+        }
+    }
+
+    /// The media type of the bodies this filter admits.
+    #[must_use]
+    pub const fn media_type(self) -> &'static str {
+        match self {
+            Self::Git => GIT_FACT_MEDIA_TYPE,
+            Self::Items => COLLECTED_ITEM_MEDIA_TYPE,
+            Self::Sessions => CANONICAL_JSON_MEDIA_TYPE,
+        }
+    }
+}
+
+/// What an evidence verdict was scoped to, when the search carried a filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AbsenceScopeV1 {
+    pub source: EvidenceSourceFilterV1,
 }
 
 /// The absence verdict of one search.
@@ -561,10 +663,19 @@ pub struct AbsenceV1 {
     /// agent can judge a neighbourhood the verdict did not count.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strongest_dense_similarity: Option<f32>,
+    /// The index, into the answer's hits, of the hit
+    /// `strongest_dense_similarity` was read from: the nearest candidate,
+    /// whether or not it voted. Absent when no hit matched densely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strongest_hit: Option<usize>,
     /// Hits that voted for nothing: dense-only neighbours below the bound,
     /// or of a body that may not vote. They are still listed as hits.
     #[serde(skip_serializing_if = "is_zero")]
     pub weak_neighbours: u32,
+    /// The source filter the search carried, when it carried one: the
+    /// verdict then speaks for that source's bodies only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<AbsenceScopeV1>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
@@ -611,12 +722,24 @@ pub struct EvidenceStatusV1 {
 pub trait EvidenceRecall: Send + Sync {
     /// Recall bodies for `query`, with the dense lane when `query_vector` is
     /// given and the lane is served, at most `limit` (1 to
-    /// [`MAX_EVIDENCE_SEARCH_LIMIT`]) of them.
+    /// [`MAX_EVIDENCE_SEARCH_LIMIT`]) of them, over every source.
     async fn search(
         &self,
         query: &str,
         query_vector: Option<Vec<f32>>,
         limit: usize,
+    ) -> Result<EvidenceSearchV1> {
+        self.search_from(query, query_vector, limit, None).await
+    }
+
+    /// [`Self::search`], restricted to bodies of `source` when one is given;
+    /// the verdict then carries that scope.
+    async fn search_from(
+        &self,
+        query: &str,
+        query_vector: Option<Vec<f32>>,
+        limit: usize,
+        source: Option<EvidenceSourceFilterV1>,
     ) -> Result<EvidenceSearchV1>;
 
     /// One body's recall text by its content address; `None` when no body
@@ -772,6 +895,38 @@ mod tests {
                 "the project's own evidence answer is unchanged"
             );
         }
+    }
+
+    #[test]
+    fn a_source_filter_names_one_media_type_and_round_trips_its_name() {
+        for filter in EvidenceSourceFilterV1::ALL {
+            assert_eq!(EvidenceSourceFilterV1::parse(filter.as_str()), Some(filter));
+            assert_eq!(
+                serde_json::to_value(filter).unwrap(),
+                serde_json::json!(filter.as_str())
+            );
+        }
+        assert_eq!(
+            EvidenceSourceFilterV1::Git.media_type(),
+            "application.ostk-git-fact-v1"
+        );
+        assert_eq!(
+            EvidenceSourceFilterV1::Items.media_type(),
+            COLLECTED_ITEM_MEDIA_TYPE
+        );
+        // Transcript turns and CI runs share one media type.
+        assert_eq!(
+            EvidenceSourceFilterV1::Sessions.media_type(),
+            "application.json"
+        );
+        for refused in ["slack", "Git", "", "transcript"] {
+            assert_eq!(EvidenceSourceFilterV1::parse(refused), None, "{refused}");
+        }
+        let scoped = serde_json::to_value(AbsenceScopeV1 {
+            source: EvidenceSourceFilterV1::Sessions,
+        })
+        .unwrap();
+        assert_eq!(scoped, serde_json::json!({ "source": "sessions" }));
     }
 
     #[test]

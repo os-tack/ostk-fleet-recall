@@ -749,8 +749,57 @@ fn compact_summary(envelope: &Value) -> String {
     {
         let _ = write!(summary, "; conflict coverage {status}");
     }
+    if let Some(absence) = data.get("absence").and_then(Value::as_object) {
+        summary.push_str("; absence: ");
+        summary.push_str(&absence_summary(absence));
+    }
+    if envelope["warnings"].as_array().is_some_and(|warnings| {
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "other_kinds_available")
+    }) {
+        summary.push_str("; try kind=item or kind=evidence");
+    }
     summary.push_str(". Full result is in structuredContent.");
     summary
+}
+
+/// The absence verdict in one clause: the verdict, its scope, and what
+/// decided it (the lane, or the reasons and the nearest candidate), so a
+/// client that reads only the text still sees what an empty answer means.
+fn absence_summary(absence: &serde_json::Map<String, Value>) -> String {
+    let mut clause = absence
+        .get("verdict")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    if let Some(source) = absence
+        .get("scope")
+        .and_then(|scope| scope["source"].as_str())
+    {
+        let _ = write!(clause, " from {source}");
+    }
+    let mut details = Vec::new();
+    if let Some(lane) = absence.get("present_by").and_then(Value::as_str) {
+        details.push(format!("by {lane}"));
+    }
+    if let Some(reasons) = absence.get("reasons").and_then(Value::as_array) {
+        details.extend(reasons.iter().filter_map(Value::as_str).map(str::to_owned));
+    }
+    if let Some(strongest) = absence
+        .get("strongest_dense_similarity")
+        .and_then(Value::as_f64)
+    {
+        let hit = absence
+            .get("strongest_hit")
+            .and_then(Value::as_u64)
+            .map_or_else(String::new, |index| format!(" at hit {index}"));
+        details.push(format!("strongest {strongest:.2}{hit}"));
+    }
+    if !details.is_empty() {
+        let _ = write!(clause, " ({})", details.join(", "));
+    }
+    clause
 }
 
 #[cfg(test)]
@@ -772,6 +821,71 @@ mod tests {
             "recall.search: completed; 1 hits. Full result is in structuredContent."
         );
         assert!(!summary.contains("large"));
+    }
+
+    #[test]
+    fn summary_names_the_absence_verdict_and_the_kind_hint() {
+        let banded = json!({
+            "tool": "recall",
+            "action": "search",
+            "data": {
+                "hits": [{"id": "a"}],
+                "absence": {
+                    "verdict": "unknown",
+                    "reasons": ["dense_neighbour_below_bound"],
+                    "strongest_dense_similarity": 0.41,
+                    "strongest_hit": 0,
+                    "weak_neighbours": 1
+                }
+            },
+            "conflicts": [],
+            "conflict_coverage": {"status": "not_evaluated"},
+            "warnings": []
+        });
+        assert_eq!(
+            compact_summary(&banded),
+            "recall.search: completed; 1 hits; conflict coverage not_evaluated; absence: unknown \
+             (dense_neighbour_below_bound, strongest 0.41 at hit 0). Full result is in \
+             structuredContent."
+        );
+        let scoped = json!({
+            "tool": "recall",
+            "action": "search",
+            "data": {
+                "hits": [],
+                "absence": { "verdict": "absent", "reasons": [], "scope": { "source": "git" } }
+            },
+            "conflict_coverage": {"status": "complete"}
+        });
+        assert_eq!(
+            compact_summary(&scoped),
+            "recall.search: completed; 0 hits; absence: absent from git. Full result is in \
+             structuredContent."
+        );
+        let present = json!({
+            "tool": "recall",
+            "action": "search",
+            "data": {
+                "hits": [{"id": "a"}],
+                "absence": { "verdict": "present", "reasons": [], "present_by": "lexical" }
+            },
+            "conflict_coverage": {"status": "complete"}
+        });
+        assert!(compact_summary(&present).contains("; absence: present (by lexical)."));
+        // A chunk answer with nothing in it points at the other kinds.
+        let hinted = json!({
+            "tool": "recall",
+            "action": "search",
+            "data": { "hits": [] },
+            "conflicts": [],
+            "conflict_coverage": {"status": "complete"},
+            "warnings": [{ "code": "other_kinds_available", "kinds": ["item", "evidence"] }]
+        });
+        assert_eq!(
+            compact_summary(&hinted),
+            "recall.search: completed; 0 hits; try kind=item or kind=evidence. Full result is in \
+             structuredContent."
+        );
     }
 
     #[test]
