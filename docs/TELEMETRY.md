@@ -21,6 +21,12 @@ FLEET_RECALL_METRICS_LISTEN=127.0.0.1:9091 \
   ostk-fleet-recall serve
 ```
 
+The same setting works with `serve --http 127.0.0.1:8080`. The local
+`deploy/local/bin/serve-remote.sh` launcher explicitly passes the optional
+metrics listen/non-loopback settings to HTTP serving and defaults stderr
+events to JSON. It passes a log-format override to enrollment too, but does
+not pass the service listener or worker textfile destination to enrollment.
+
 Scrape `http://127.0.0.1:9091/metrics`. The metrics listener is separate from
 the application listener, has no authentication or TLS, and exposes only the
 metrics route. For cross-host scrapes, bind a private address, set the explicit
@@ -65,8 +71,9 @@ Instrumented boundaries:
 
 | Component | Operations | What it measures |
 | --- | --- | --- |
-| `process` | CLI command names, including `serve`, `demo`, `ingress`, `worker`, `collect`, `health`, `migrate`, `ingest`, `model_digest` | Command lifetime and exit outcome after logging initialization, including metrics configuration and listener startup failures. |
+| `process` | CLI command names, including `serve`, `demo`, `ingress`, `worker`, `collect`, `health`, `migrate`, `ingest`, `model_digest`, `enroll` | Command lifetime and exit outcome after logging initialization, including metrics configuration and listener startup failures. Both stdio and HTTP serving use `serve`. |
 | `mcp` | `recall.<action>`, `remember.<action>`, protocol categories | Dispatch, refusals, tool failures, malformed frames, and request deadlines. Tool action names are from the closed service enums. |
+| `http_mcp` | `mcp`, `resource_metadata`, `grant`, `revoke`, `auth_aws`, `health`, `other` | Remote HTTP latency/outcome and response classes, including requests rejected before MCP dispatch. Grant IDs and query strings never become labels. |
 | `http_demo` | `index`, `health`, `status`, `recall`, `other` | HTTP latency/outcome and `responses_1xx` through `responses_5xx` units. |
 | `http_ingress` | `ingress`, `other` | Push ingress HTTP latency/outcome and response classes. |
 | `database` | `health_check`, `serializable_transaction` | Health checks and transactions using the shared serializable retry helper. This is not a timer for every SQL statement. |
@@ -81,6 +88,15 @@ Protocol fallback operations are fixed categories such as `protocol.unknown`,
 Notifications record `skipped`; tool-shaped notifications do not execute.
 HTTP 401/403/429 map to `refused`, 408/504 to `timeout`, other 4xx to `invalid`,
 and other 5xx to `error`.
+
+Modern discovery uses `mcp/server.discover`; protocol version and header
+validation failures are `invalid`. Requests rejected by the HTTP layer before
+dispatch have only an `http_mcp` observation. A dispatch deadline records one
+`mcp` timeout; its existing JSON-RPC error maps to HTTP 500 and therefore an
+`http_mcp` error. Authentication, grant, and AWS exchange deadlines return 503
+and likewise record an HTTP error; body-read deadlines return 408 and record
+an HTTP timeout. This preserves the wire contract and separates protocol
+outcomes from HTTP status. Do not sum MCP and HTTP counters for total requests.
 
 For `database/serializable_transaction`, `attempts` counts attempts including
 the first; `retries_body` and `retries_commit` count retries after backoff;
@@ -248,6 +264,13 @@ adds Grafana, Prometheus, Loki, Alloy, node exporter, and kube-state-metrics.
 It covers container resources, cluster state, pod logs and Kubernetes events,
 and explains activation, retention, and the distinction between live service
 counters and completed-worker snapshots.
+
+The Mac process started by `deploy/local/bin/serve-remote.sh` is outside that
+pod discovery and API log collection. Its optional loopback metrics endpoint
+and stderr require a separately configured private host scrape/forwarding
+path and host log collection. A VM or pod's loopback is not the Mac's loopback.
+See [remote HTTP operation](REMOTE_PLANE.md#operational-visibility); enabling
+the host listener alone does not add its data to the k0s dashboards.
 
 New operational metrics and completion events contain only code-owned
 categories, numeric measurements, build version, and generated operation IDs

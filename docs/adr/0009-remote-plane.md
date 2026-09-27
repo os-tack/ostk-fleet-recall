@@ -1,7 +1,8 @@
 # ADR 0009: The remote plane
 
-- Status: proposed; D1 to D9 recorded, implementation staged as M1 to M3 in
-  `deploy/local/README.md`. Nothing here changes a frozen registry generation.
+- Status: accepted; M1 and the M2 remote plane are implemented. M3 remains
+  planned. See `deploy/local/README.md` for the local checkpoint and the
+  native Claude usage-limit qualification. Nothing here changes a frozen registry generation.
 - Date: 2026-09-27
 - Scope: where the recall process, the embedding model, the writer credential,
   and the scope binding run relative to the agent; how an agent in an

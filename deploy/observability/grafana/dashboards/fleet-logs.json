@@ -128,7 +128,7 @@
         "name": "component",
         "label": "Event component",
         "type": "custom",
-        "query": "process,mcp,http_demo,http_ingress,database,embedding,worker,worker_step",
+        "query": "process,mcp,http_demo,http_ingress,http_mcp,database,embedding,worker,worker_step",
         "multi": true,
         "includeAll": true,
         "allValue": ".*",

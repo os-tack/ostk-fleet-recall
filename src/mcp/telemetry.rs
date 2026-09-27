@@ -15,6 +15,7 @@ pub(super) fn operation(request: &JsonRpcRequest) -> &'static str {
     }
     match request.method.as_str() {
         "initialize" => "initialize",
+        "server/discover" => "server.discover",
         "ping" => "ping",
         "tools/list" => "tools.list",
         "tools/call" => {
@@ -90,7 +91,9 @@ pub(super) fn outcome(response: Option<&JsonRpcResponse>) -> Outcome {
             codes::PARSE_ERROR
             | codes::INVALID_REQUEST
             | codes::METHOD_NOT_FOUND
-            | codes::INVALID_PARAMS => Outcome::Invalid,
+            | codes::INVALID_PARAMS
+            | codes::HEADER_MISMATCH
+            | codes::UNSUPPORTED_PROTOCOL_VERSION => Outcome::Invalid,
             _ => Outcome::Error,
         };
     }
@@ -198,6 +201,8 @@ mod tests {
             codes::INVALID_REQUEST,
             codes::METHOD_NOT_FOUND,
             codes::INVALID_PARAMS,
+            codes::HEADER_MISMATCH,
+            codes::UNSUPPORTED_PROTOCOL_VERSION,
         ] {
             assert_eq!(
                 outcome(Some(&JsonRpcResponse::error(

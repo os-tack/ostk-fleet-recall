@@ -8,6 +8,7 @@
 #![recursion_limit = "256"]
 
 pub mod application;
+pub mod auth;
 pub mod body_store;
 pub mod collectors;
 pub mod config;
@@ -16,6 +17,8 @@ pub mod context;
 pub mod control_log;
 pub mod coverage_runtime;
 pub mod discrepancy_runtime;
+pub mod encoding;
+pub mod enroll;
 pub mod error;
 pub mod evidence_ledger;
 pub mod evidence_recall;
@@ -33,6 +36,7 @@ pub mod registry_activation;
 pub mod registry_witness;
 pub mod relation_projection;
 pub mod remember_runtime;
+pub mod remote;
 pub mod service;
 pub mod spec_conformance;
 pub mod store;

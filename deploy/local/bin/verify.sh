@@ -3,7 +3,7 @@
 # exits non-zero if any check failed. Run from the Mac after `bootstrap.sh up`.
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-state="$here/.state"
+state=${FLEET_LOCAL_STATE:-$here/.state}
 # shellcheck source=../lib.sh
 . "$here/lib.sh"
 export KUBECONFIG="$state/kubeconfig"
@@ -114,10 +114,10 @@ check "image imported into k0s containerd" image_imported || fail
 
 echo "CockroachDB (secure, from the Mac)"
 check "verify-full SQL lists fleet_recall, hydra, kratos" bash -o pipefail -c "dbs=\$(crdb_sql --execute='SHOW DATABASES' | cut -f1) || exit 1; for d in fleet_recall hydra kratos; do echo \"\$dbs\" | grep -qx \$d || exit 1; done" || fail
-check "36 successful migrations, max version 37" bash -o pipefail -c "crdb_sql -d fleet_recall --execute='SELECT count(*), max(version) FROM _sqlx_migrations WHERE success' | tail -n1 | grep -qE '^36[[:space:]]+37\$'" || fail
+check "38 successful migrations, max version 39" bash -o pipefail -c "crdb_sql -d fleet_recall --execute='SELECT count(*), max(version) FROM _sqlx_migrations WHERE success' | tail -n1 | grep -qE '^38[[:space:]]+39\$'" || fail
 check "migrator is NOLOGIN" bash -o pipefail -c "crdb_sql --execute=\"SELECT options FROM [SHOW USERS] WHERE username = 'fleet_migrator'\" | tail -n1 | grep -q NOLOGIN" || fail
-check "writer, publication, ingress can log in" bash -o pipefail -c "crdb_sql --execute=\"SELECT username FROM [SHOW USERS] WHERE username IN ('fleet_writer','fleet_publication','fleet_ingress') AND NOT ('NOLOGIN' = ANY(options))\" | tail -n +2 | wc -l | tr -d ' ' | grep -qx 3" || fail
-check "role edges are exactly runtime/reader/receiver" bash -o pipefail -c "crdb_sql --execute=\"SELECT role_name, member FROM [SHOW GRANTS ON ROLE] WHERE member LIKE 'fleet_%' ORDER BY 1\" | tail -n +2 | tr '\t' '>' | paste -sd, - | grep -qx 'fleet_ingress_receiver>fleet_ingress,fleet_publication_reader>fleet_publication,fleet_runtime>fleet_writer'" || fail
+check "writer, publication, ingress, enrollment can log in" bash -o pipefail -c "crdb_sql --execute=\"SELECT username FROM [SHOW USERS] WHERE username IN ('fleet_writer','fleet_publication','fleet_ingress','fleet_enrollment') AND NOT ('NOLOGIN' = ANY(options))\" | tail -n +2 | wc -l | tr -d ' ' | grep -qx 4" || fail
+check "role edges are exactly enrollment/runtime/reader/receiver" bash -o pipefail -c "crdb_sql --execute=\"SELECT role_name, member FROM [SHOW GRANTS ON ROLE] WHERE member LIKE 'fleet_%' ORDER BY 1\" | tail -n +2 | tr '\t' '>' | paste -sd, - | grep -qx 'fleet_enrollment_manager>fleet_enrollment,fleet_ingress_receiver>fleet_ingress,fleet_publication_reader>fleet_publication,fleet_runtime>fleet_writer'" || fail
 
 echo "Jobs and pods"
 for j in db-bootstrap migrate boundary ory-db-bootstrap seed; do

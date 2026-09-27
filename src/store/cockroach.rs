@@ -87,6 +87,8 @@ pub const COLLECTOR_INGRESS_SCHEMA_VERSION: i64 = 36;
 /// as a replay of its successor, the body projector cannot let an erased raw
 /// representation pass, and the at-rest supersession pass refuses to run.
 pub const EVIDENCE_PREDECESSOR_KEY_SCHEMA_VERSION: i64 = 37;
+/// First complete remote-plane principal registry and session grant schema.
+pub const REMOTE_PLANE_SCHEMA_VERSION: i64 = 39;
 
 /// Exact application tables reachable from public health/status/recall SQL.
 ///
@@ -470,7 +472,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
 }
 
 #[allow(clippy::too_many_lines)] // one registration per migration file, in version order
-fn post_transactional_online_migrations() -> [Migration; 22] {
+fn post_transactional_online_migrations() -> [Migration; 24] {
     [
         Migration::new(
             15,
@@ -695,6 +697,20 @@ fn post_transactional_online_migrations() -> [Migration; 22] {
             // backfilled), its shape CHECK, and one scope-prefixed seek
             // index. Runs outside SQLx's transaction wrapper like migrations
             // 0018-0036; MINIMUM_RECALL_SCHEMA_VERSION stays 18.
+            true,
+        ),
+        Migration::new(
+            38,
+            Cow::Borrowed("principal registry"),
+            MigrationType::Simple,
+            Cow::Borrowed(include_str!("../../migrations/0038_principal_registry.sql")),
+            true,
+        ),
+        Migration::new(
+            REMOTE_PLANE_SCHEMA_VERSION,
+            Cow::Borrowed("session grants"),
+            MigrationType::Simple,
+            Cow::Borrowed(include_str!("../../migrations/0039_session_grants.sql")),
             true,
         ),
     ]

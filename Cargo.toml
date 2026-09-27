@@ -32,6 +32,9 @@ prometheus = { version = "0.14", default-features = false }
 ostk-recall-core = { version = "=0.9.5", git = "https://github.com/os-tack/ostk-recall.git", rev = "7481c5a548ba52188240735a5f57f2286ba90e95" }
 ostk-recall-embed = { version = "=0.9.5", git = "https://github.com/os-tack/ostk-recall.git", rev = "7481c5a548ba52188240735a5f57f2286ba90e95" }
 ostk-recall-retrieval = { version = "=0.9.5", git = "https://github.com/os-tack/ostk-recall.git", rev = "7481c5a548ba52188240735a5f57f2286ba90e95" }
+# STS Query responses are XML even when a signed request asks for JSON.
+# Event parsing only; no entity resolver, encodings, serde, or async features.
+quick-xml = { version = "=0.42.0", default-features = false }
 # The provider collectors' HTTP client (ADR 0008 D8): rustls only, no default
 # features (no native TLS, no cookies, no compression). Proxies from the
 # environment (HTTPS_PROXY, NO_PROXY) are honoured by default.

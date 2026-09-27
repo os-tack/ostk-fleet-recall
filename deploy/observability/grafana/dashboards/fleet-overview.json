@@ -861,7 +861,7 @@
         "w": 12,
         "h": 8
       },
-      "description": "HTTP operations and MCP calls can be nested. They must not be added together as a request total.",
+      "description": "HTTP demo, ingress and authenticated remote MCP outcomes, separated by surface. HTTP operations and MCP calls can be nested. They must not be added together as a request total.",
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
@@ -908,7 +908,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (component, outcome) (rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_.*\",outcome=~\"error|timeout|refused|invalid\"}[$__rate_interval]))",
+          "expr": "sum by (component, outcome) (rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress|http_mcp\",outcome=~\"error|timeout|refused|invalid\"}[$__rate_interval]))",
           "legendFormat": "{{component}} \u00b7 {{outcome}}",
           "instant": false,
           "range": true,

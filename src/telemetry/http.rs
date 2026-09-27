@@ -52,10 +52,13 @@ fn route(path: Option<&str>) -> &'static str {
         Some("/mcp") => "mcp",
         Some("/v1/embed") => "embed",
         Some("/v1/model") => "model",
-        Some("/.well-known/oauth-protected-resource") => "resource_metadata",
+        Some(
+            "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/mcp",
+        ) => "resource_metadata",
         Some("/.well-known/jwks.json") => "jwks",
         Some("/v1/grants") => "grant",
-        Some("/v1/grants/revoke") => "revoke",
+        Some("/v1/grants/{jti}") => "revoke",
+        Some("/v1/auth/aws") => "auth_aws",
         Some("/v1/transcripts/{instance}/{file}") => "transcript",
         Some("/v1/hooks/{connector_instance}") => "ingress",
         _ => "other",
@@ -68,7 +71,7 @@ mod tests {
     use axum::{
         body::Body,
         http::{Request, StatusCode},
-        routing::get,
+        routing::{delete, get},
     };
     use tower::ServiceExt as _;
 
@@ -84,6 +87,47 @@ mod tests {
             route(Some("/v1/transcripts/{instance}/{file}")),
             "transcript"
         );
+        for (path, expected) in [
+            ("/mcp", "mcp"),
+            ("/.well-known/oauth-protected-resource", "resource_metadata"),
+            (
+                "/.well-known/oauth-protected-resource/mcp",
+                "resource_metadata",
+            ),
+            ("/v1/grants", "grant"),
+            ("/v1/grants/{jti}", "revoke"),
+            ("/v1/auth/aws", "auth_aws"),
+            ("/v1/grants/private-grant-id", "other"),
+            ("/v1/auth/private-anchor", "other"),
+        ] {
+            assert_eq!(route(Some(path)), expected, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn matched_remote_route_excludes_grant_id_and_query() {
+        let router = instrument(
+            Router::new().route(
+                "/v1/grants/{jti}",
+                delete(|| async { StatusCode::FORBIDDEN }),
+            ),
+            "http_remote_route_test",
+        );
+        let response = router
+            .oneshot(
+                Request::delete("/v1/grants/private-grant-id?token=private-query-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let metrics = super::super::render().unwrap();
+        assert!(metrics.contains(
+            "fleet_recall_operations_total{component=\"http_remote_route_test\",operation=\"revoke\",outcome=\"refused\"} 1"
+        ));
+        assert!(!metrics.contains("private-grant-id"));
+        assert!(!metrics.contains("private-query-token"));
     }
 
     #[tokio::test]

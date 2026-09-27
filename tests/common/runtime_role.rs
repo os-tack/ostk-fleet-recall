@@ -124,6 +124,18 @@ pub const INGRESS_RECEIVER_GRANTS: [(&str, &str); 2] = [
     ),
 ];
 
+/// Exact table grants of the dedicated enrollment manager policy.
+pub const ENROLLMENT_GRANTS: [(&str, &str); 3] = [
+    ("SELECT", "public._sqlx_migrations"),
+    ("SELECT, INSERT, UPDATE", "public.memory_principals_v1"),
+    ("SELECT, INSERT", "public.memory_corpus_models"),
+];
+/// Read-only principal resolution and durable session grant management.
+pub const REMOTE_PLANE_RUNTIME_GRANTS: [(&str, &str); 2] = [
+    ("SELECT", "public.memory_principals_v1"),
+    ("SELECT, INSERT, UPDATE", "public.memory_session_grants_v1"),
+];
+
 /// The claim item links of the same policy (migration 35, ADR 0008 D11):
 /// append-only, as `record` and `assert` link the collected items a claim
 /// cites. Keep this in step with that file.
@@ -218,6 +230,20 @@ impl RuntimeProbeRole {
         .await
     }
 
+    pub async fn create_enrollment(owner: &PgPool, database_url: &str) -> Self {
+        Self::create_with(owner, database_url, owned(&ENROLLMENT_GRANTS), false, true).await
+    }
+    pub async fn create_remote_runtime(owner: &PgPool, database_url: &str) -> Self {
+        Self::create_with(
+            owner,
+            database_url,
+            owned(&REMOTE_PLANE_RUNTIME_GRANTS),
+            false,
+            true,
+        )
+        .await
+    }
+
     /// A login holding exactly [`SUPERSESSION_WITHOUT_DELETE_GRANTS`]: the
     /// supersession policy's surface with every DELETE withheld.
     pub async fn create_supersession_without_delete(owner: &PgPool, database_url: &str) -> Self {
@@ -278,6 +304,7 @@ impl RuntimeProbeRole {
         grants.extend(owned(&STAGE5_RUNTIME_GRANTS));
         grants.extend(owned(&COLLECTOR_RUNTIME_GRANTS));
         grants.extend(owned(&CLAIM_ITEM_LINK_RUNTIME_GRANTS));
+        grants.extend(owned(&REMOTE_PLANE_RUNTIME_GRANTS));
         Self::create_with(owner, database_url, grants, true, false).await
     }
 
@@ -306,9 +333,16 @@ impl RuntimeProbeRole {
         let password = Uuid::now_v7().simple().to_string();
         let parsed = Url::parse(database_url).expect("the test database URL parses");
         let database = parsed.path().trim_start_matches('/').to_owned();
-        let mut statements = vec![format!(
-            "CREATE ROLE {name} WITH LOGIN PASSWORD '{password}'"
-        )];
+        // Insecure disposable clusters reject password DDL. Their explicit
+        // sslmode=disable URL is a test-only authentication boundary.
+        let insecure = parsed
+            .query_pairs()
+            .any(|(key, value)| key == "sslmode" && value == "disable");
+        let mut statements = vec![if insecure {
+            format!("CREATE ROLE {name} WITH LOGIN")
+        } else {
+            format!("CREATE ROLE {name} WITH LOGIN PASSWORD '{password}'")
+        }];
         if let Some(group) = &group {
             statements.push(format!("CREATE ROLE {group} WITH NOLOGIN"));
         }

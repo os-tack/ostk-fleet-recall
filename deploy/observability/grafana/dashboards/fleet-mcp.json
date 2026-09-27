@@ -2000,14 +2000,14 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "These panels cover the implemented **http_demo** and **http_ingress** surfaces. The MCP **Operation** selector does not filter HTTP routes. Routing, limits, and authentication failures are measured at the HTTP boundary.\n\nHTTP outcomes describe the handler response; they do not determine the outcome of a nested MCP tool call. Response-class counts require a produced response, while outcome counts also include cancelled handlers. HTTP duration ends when the handler returns a response; it does not measure client download time."
+        "content": "These panels cover the implemented **http_demo**, **http_ingress** and authenticated remote **http_mcp** surfaces. The MCP **Operation** selector does not filter HTTP routes. Routing, limits, and authentication failures are measured at the HTTP boundary.\n\nHTTP outcomes describe the handler response; they do not determine the outcome of a nested MCP tool call. Response-class counts require a produced response, while outcome counts also include cancelled handlers. HTTP duration ends when the handler returns a response; it does not measure client download time."
       }
     },
     {
       "id": 24,
       "type": "timeseries",
       "title": "HTTP traffic by surface and route",
-      "description": "Terminal HTTP handler observations, including rejections. Current demo categories are index, health, status and recall; webhook requests use ingress. Unmatched or unsupported route patterns remain other.",
+      "description": "Terminal HTTP handler observations, including rejections. Demo categories are index, health, status and recall; webhook requests use ingress. Remote MCP uses mcp, resource_metadata, grant, revoke, auth_aws and health. Grant IDs, identity inputs and unknown paths never become labels; unmatched route patterns remain other.",
       "gridPos": {
         "x": 0,
         "y": 58,
@@ -2026,7 +2026,7 @@
             "uid": "$prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (component, operation) (rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress\"}[$__rate_interval]))",
+          "expr": "sum by (component, operation) (rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress|http_mcp\"}[$__rate_interval]))",
           "legendFormat": "{{component}} · {{operation}}",
           "range": true,
           "instant": false
@@ -2120,7 +2120,7 @@
             "uid": "$prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (component, outcome) (rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress\"}[$__rate_interval]))",
+          "expr": "sum by (component, outcome) (rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress|http_mcp\"}[$__rate_interval]))",
           "legendFormat": "{{component}} · {{outcome}}",
           "range": true,
           "instant": false
@@ -2335,7 +2335,7 @@
             "uid": "$prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (component, unit) (rate(fleet_recall_units_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress\",unit=~\"responses_[1-5]xx\"}[$__rate_interval]))",
+          "expr": "sum by (component, unit) (rate(fleet_recall_units_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress|http_mcp\",unit=~\"responses_[1-5]xx\"}[$__rate_interval]))",
           "legendFormat": "{{component}} · {{unit}}",
           "range": true,
           "instant": false
@@ -2475,7 +2475,7 @@
             "uid": "$prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, component, operation) (rate(fleet_recall_operation_duration_seconds_bucket{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, component, operation) (rate(fleet_recall_operation_duration_seconds_bucket{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress|http_mcp\"}[$__rate_interval])))",
           "legendFormat": "{{component}} · {{operation}}",
           "range": true,
           "instant": false
@@ -2569,7 +2569,7 @@
             "uid": "$prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (component, operation) (fleet_recall_operations_in_flight{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress\"})",
+          "expr": "sum by (component, operation) (fleet_recall_operations_in_flight{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress|http_mcp\"})",
           "legendFormat": "{{component}} · {{operation}}",
           "range": true,
           "instant": false
@@ -2663,7 +2663,7 @@
             "uid": "$prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (component, outcome) (increase(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress\"}[$__range]))",
+          "expr": "sum by (component, outcome) (increase(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=~\"http_demo|http_ingress|http_mcp\"}[$__range]))",
           "legendFormat": "",
           "range": false,
           "instant": true,

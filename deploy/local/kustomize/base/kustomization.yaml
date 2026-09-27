@@ -41,6 +41,7 @@ configMapGenerator:
       - runtime-role-grants.sql=../../../cockroach/runtime-role-grants.sql
       - publication-reader-role-grants.sql=../../../cockroach/publication-reader-role-grants.sql
       - ingress-receiver-role-grants.sql=../../../cockroach/ingress-receiver-role-grants.sql
+      - enrollment-role-grants.sql=../../../cockroach/enrollment-role-grants.sql
     options:
       disableNameSuffixHash: true
       labels:

@@ -127,29 +127,167 @@ for cluster networking and verified CockroachDB readiness after a VM restart.
 The authority was then installed successfully, the boundary Job passed all
 three policies, and the worker independently verified generation 3.
 
-The next checkpoint is M2: remote HTTP MCP, identity anchors, principal
-enrollment and session grants. M3 moves embedding into its own service and
-adds the shim, sandbox launcher and transcript shipping. These subcommands
-are not implemented yet; the M2 overlay remains a placeholder. The detailed
-design is ADR 0009; the original execution plan is
+M2 adds remote HTTP MCP, identity anchors, principal enrollment and session
+grants. M3 moves embedding into its own service and adds the shim, sandbox
+launcher and transcript shipping. The detailed design is ADR 0009; the
+original execution plan is
 `~/.claude/plans/structured-dancing-willow.md` from session
 `dae56076-9cff-4748-84d6-ad5f4f665b40`.
 
-Before the M2 stock-harness OAuth check, review the pinned Hydra v26.2.0
-image: [Hydra v26.3.10 fixes empty optional DCR metadata rejected by strict
-MCP clients](https://changelog.ory.com/announcements/ory-hydra-v26-3-10-released).
-The M1 form and token checks do not establish stock-harness compatibility.
+The pinned Hydra v26.2.0 returns empty optional dynamic-registration metadata
+that current Claude Code rejects. [Ory documents this strict-client bug and
+its v26.3.10 fix](https://changelog.ory.com/announcements/ory-hydra-v26-3-10-released).
+The local instructions below use a pre-registered public client, supported
+by stock Claude Code, with PKCE and no client secret.
+
+## M2 HTTP service and human enrollment
+
+The first M2 local service runs on the Mac at `http://localhost:8080/mcp`,
+using the secure k0s database and its existing Ory issuer. This keeps Hydra's
+issuer and discovery URL reachable exactly as advertised (`localhost:4444`)
+and leaves the cluster's stdio writer available. The M2/M3 Kubernetes overlay
+stays reserved until its identity routing and embedding service are deployed.
+LocalStack is not required for the OIDC human path.
+The full configuration, authorization model, and request examples are in
+[Remote plane](../../docs/REMOTE_PLANE.md).
+
+Build the Mac binary, apply the additive M2 migrations and updated role
+boundary, then launch the HTTP service in a terminal:
+
+```sh
+cargo build --locked --bin ostk-fleet-recall
+deploy/local/bin/upgrade-remote.py
+ssh -F "$HOME/.lima/k0s/ssh.config" -O cancel \
+  -L 127.0.0.1:8080:127.0.0.1:30080 lima-k0s
+deploy/local/bin/serve-remote.sh
+```
+
+The upgrade helper preserves the M1 state and restores quiesced workloads
+after installing migrations 38–39 and their role grants. This Mac-host
+checkpoint does not require a new Kubernetes image: the existing pods keep
+serving their original interfaces against the additive schema.
+
+Lima reserves Mac port 8080 for the future Kubernetes MCP endpoint. The SSH
+command cancels only that unused forward so the Mac service can bind it; the
+database, Ory, and Kubernetes API forwards remain active. Repeat cancellation
+after restarting the VM. After stopping the Mac service, restore the reserved
+forward when needed with the same command using `-O forward` instead of
+`-O cancel`.
+
+With the service running, a second terminal can exercise the full automated
+human path:
+
+```sh
+deploy/local/bin/remote-smoke.py
+```
+
+The smoke check performs an Ory OAuth login, enrolls the resulting subject,
+calls status, records and reads a claim, and verifies revocation. Its tokens
+and diagnostics stay in protected local state files. To connect your own
+Claude Code identity, follow the enrollment steps below.
+
+The launcher reads `.state/passwords.env`, `.state/authority.json`, the model
+digest and CA. It connects with `verify-full` on port 26258, loads the pinned
+model from the original checkout, and creates an idempotent, mode-0600 grant
+signing key in `.state/remote-grant-signing-key.hex`. Its child receives only
+the writer credential. The separate enrollment command receives only the
+enrollment credential; neither command inherits other database URLs or `PG*`
+variables from the terminal.
+
+For a worktree sharing the existing local cluster, set `FLEET_LOCAL_STATE` to
+the original checkout's `deploy/local/.state` and `FLEET_RECALL_BIN` to the
+compiled binary. `FLEET_RECALL_MODEL_BUNDLE` overrides the mounted model's
+Mac path when needed. Run the script with `--help` for its command forms.
+
+Enroll a Kratos identity's exact ID as an operator. Obtain the ID from the
+local Ory administration UI/API or an OAuth smoke run's protected state, then
+write a private declaration file such as `.state/human-principal.json`:
+
+```json
+{
+  "principals": [{
+    "principal_id": "0198a849-f6ae-7d61-9800-000000000101",
+    "anchor_id": "hydra",
+    "subject_pattern": "REPLACE_WITH_KRATOS_IDENTITY_ID",
+    "role": "operator",
+    "tenant_id": "0198a849-f6ae-7d61-9800-000000000001",
+    "project": "local-k0s",
+    "ceiling": "project",
+    "agent_pattern": "human-mac"
+  }]
+}
+```
+
+```sh
+deploy/local/bin/serve-remote.sh enroll apply \
+  --file deploy/local/.state/human-principal.json --bootstrap-scopes
+deploy/local/bin/serve-remote.sh enroll list
+recall_client_id=$(deploy/local/bin/register-mcp-client.py)
+claude mcp add --transport http --callback-port 43110 --client-id "$recall_client_id" recall http://localhost:8080/mcp
+claude mcp login recall
+```
+
+The registration helper prints only the public client ID and stores its full
+response privately under `.state/mcp-clients/`. Use `claude mcp login recall
+--no-browser` for a headless session, or `/mcp` within Claude Code. Log in
+through Hydra/Kratos, then call
+`recall(status)` and `remember(record)`. The subject must match the enrolled
+identity. The caller's tool arguments cannot select another tenant, project,
+or agent. To revoke that binding and its grants:
+
+```sh
+deploy/local/bin/serve-remote.sh enroll revoke 0198a849-f6ae-7d61-9800-000000000101
+```
+
+`GET /healthz` checks the HTTP listener. An unauthenticated `GET /mcp` returns
+401 with a protected-resource metadata challenge;
+`GET /.well-known/oauth-protected-resource/mcp` publishes the Hydra issuer and
+`fleet-recall` scope. Direct identity tokens re-read the registry on every
+request. For session grants, grant and principal revocation checks may be
+cached for up to five seconds.
+
+## M2 verified checkpoint (2026-09-27)
+
+The Mac HTTP service is running against secure k0s CockroachDB with migrations
+38–39 and all four audited role boundaries. The original Kubernetes workloads
+were restored after upgrade. All 34 local environment checks passed; the three
+LocalStack checks remain explicitly skipped.
+
+Public Ory registration, password login, consent, and PKCE passed. The real
+server then refused the unenrolled identity, accepted enrollment, completed
+`recall(status)` → `remember(record)` → `recall(get)`, refused a cross-project
+request, and rejected the same token immediately after revocation. Stock
+Claude Code authenticated with a pre-registered public client and reports
+**Connected**, including successful modern tool discovery. Its model-driven
+tool smoke was blocked by the account's weekly usage limit (reported reset:
+September 30, 4 p.m. America/Chicago); that final harness call has not passed.
+
+Rust 1.94 validation: 2,707 tests passed across 53 targets, 19 ignored; strict
+all-target Clippy and formatting passed. Separately, enrollment/grant tests
+and the HTTP integration scenario ran against disposable CockroachDB with
+the exact runtime/enrollment privileges. Both SQL policies applied and
+reapplied with the expected 148 runtime and eight enrollment grants. These
+connected tests were not run against the persistent k0s corpus.
+
+`ubs --staged` encountered a sparse-workspace Rust scanner limitation. The
+complete-worktree Rust scan ran instead, and changed-line findings were
+reviewed; no actionable introduced finding was identified. Existing dependency
+advisories were unchanged (including RSA under disabled `sqlx-mysql`; JWT
+verification uses `ring`). Protected run evidence stays under
+`.state/m2-upgrade-*`, `.state/remote-smoke/`, `.state/native-mcp-smoke/`, and
+`.state/verify-m2.log`. No runtime credential or token is committed.
 
 ## Notes and known limits
 
-- `serve` is stdio-only until M2 lands `serve --http`; the writer Deployment is
-  the `kubectl exec -i deploy/writer -- container-entrypoint serve` target.
+- `serve` remains the stdio target; `serve --http` runs the remote endpoint.
+  The writer Deployment remains the
+  `kubectl exec -i deploy/writer -- container-entrypoint serve` target.
 - Every recall pod mounts the model bundle because the image entrypoint
   requires it for every command; M3's embedding tier removes that.
 - The worker's ingest steps need `git` and `gh`, which the image lacks; only
   `project` and `embed` run in the cluster.
-- The boundary applies the runtime, publication and ingress policies, the set
-  the quickstart and Compose stack prove against this migration set. The
+- The local boundary applies runtime, publication, ingress and enrollment
+  policies. The
   control and registry-activation policies (ceremony roles) are not applied
   by default.
 - Kata Containers (VM-isolated pods) is optional: `helm/kata-values.yaml`
