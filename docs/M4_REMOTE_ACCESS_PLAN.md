@@ -2,8 +2,8 @@
 
 Status: implementation in progress, 2026-09-27. M4.1 is implemented. M4.2's
 single-Mac HTTPS services, native Codex CLI and container paths are deployed
-and tested; browser trust, desktop restart and a second-machine LAN/VPN check
-remain unqualified. M4.3–M4.5 remain pending. The original baseline was
+and tested, including macOS certificate trust and the restarted Codex harness.
+The second-machine LAN/VPN check remains unqualified. M4.3–M4.5 remain pending. The original baseline was
 `ea6d43d` on `main`, including M3 and merged Prometheus/Grafana telemetry.
 The original remote plan ended at M3. M4 is the follow-on described here.
 
@@ -51,9 +51,10 @@ after the denial test. Wrong trust and unknown TLS names were rejected.
 
 See the [operator runbook](../deploy/local/https/README.md) and
 [qualification record](../deploy/local/https/QUALIFICATION.md). This checkpoint
-does not close the entire M4.2 acceptance row: macOS browser trust awaits user
-authorization, the current Codex desktop process needs restart qualification,
-and LAN/VPN exposure needs a selected stable address and a second machine.
+does not close the entire M4.2 acceptance row: LAN/VPN exposure still needs a
+selected stable address and a second machine. After the user installed trust
+and restarted the harness, macOS certificate verification, system curl without
+a CA override, and native Recall status/get calls from that harness passed.
 Cloud deployment and lifecycle/restore rehearsals remain later milestones.
 
 ## Outcome and scope

@@ -1,8 +1,8 @@
 # M4.2 qualification: 2026-09-27
 
 The single-Mac service, CLI and container paths are deployed and tested.
-Interactive browser trust, the restarted Codex desktop process, and the
-second-machine LAN/VPN journey remain unqualified. This is not completion of
+macOS certificate trust and the restarted Codex harness are now verified.
+The second-machine LAN/VPN journey remains unqualified. This is not completion of
 all M4.2 acceptance criteria or a cloud deployment.
 
 ## Installed profile
@@ -44,6 +44,7 @@ outside version control. Do not publish those directories.
 | Network isolation | Retained Pods with prefix `https-network-proof-164647-dacf66`: unrelated pod reaches HTTPS but cannot reach any of eight private service sockets. Allowed controls reach the exact ready backend IP/port pairs before and after the denials; endpoint snapshots remain unchanged. Controls remain unready and tokenless. |
 | Gateway authority | Current Gateway/listener/routes report Accepted/Programmed/ResolvedRefs as applicable. Gateway SA cannot get/list/watch Secrets in Ory, Recall or PKI namespaces, including standard SA groups. Certificate issuance outside `fleet-edge` is denied by admission. Root private key stays outside the cluster. |
 | Worker and telemetry | Original worker schedule restored; subsequent scheduled Jobs completed. All 14 existing Prometheus scrape targets report up after cutover; `https-cutover-20260927T164127-a21e0d47/prometheus-targets.json`. |
+| Trust installation and harness restart | User confirmed both actions. macOS `security verify-cert` accepted the installed Fleet root; system curl reached the HTTPS login route with its expected 303 response and no CA override or verification bypass. The restarted harness's native `recall-remote` tools returned ready status and retrieved claim 13 from the real Codex sandbox proof. `https-cutover-20260927T164127-a21e0d47/harness-restart-acceptance.json`. |
 
 The cutover directory is `https-cutover-20260927T164127-a21e0d47/`. Its first
 read-only verification encountered a connection error immediately after policy
@@ -87,9 +88,12 @@ The saved native `recall-remote` client now uses the canonical HTTPS URL, with
 fresh OAuth credentials stored by Codex. The public CA path is configured in
 the macOS user launch environment for subsequently started GUI processes.
 Existing terminal shells still need the documented `CODEX_CA_CERTIFICATE`
-export. An already running Codex desktop process must be restarted and tested.
-The Keychain certificate-trust operation still awaits macOS user authorization;
-no browser certificate warning was bypassed.
+export. The user subsequently installed the root and restarted the harness;
+the system trust check and native MCP calls from that restarted harness passed.
+This confirms that harness's connection; it does not establish that every
+terminal shell inherited the CA environment variable. No certificate warning
+or TLS verification was bypassed, and no interactive browser rendering test is
+claimed by the system curl check.
 
 LAN/VPN exposure requires a selected stable Mac address, restricted HTTPS bind
 and firewall, client DNS/CA setup, and an actual second machine with fresh OAuth
