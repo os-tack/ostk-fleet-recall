@@ -2,8 +2,9 @@
 
 The single-Mac service, CLI and container paths are deployed and tested.
 macOS certificate trust and the restarted Codex harness are now verified.
-The second-machine LAN/VPN journey remains unqualified. This is not completion of
-all M4.2 acceptance criteria or a cloud deployment.
+The second-machine LAN/VPN journey is deferred because the user has no second
+machine available as of 2026-09-27. It remains unqualified. This is not completion
+of all M4.2 acceptance criteria or a cloud deployment.
 
 ## Installed profile
 
@@ -95,7 +96,9 @@ terminal shell inherited the CA environment variable. No certificate warning
 or TLS verification was bypassed, and no interactive browser rendering test is
 claimed by the system curl check.
 
-LAN/VPN exposure requires a selected stable Mac address, restricted HTTPS bind
+The second-machine check will resume when hardware is available; it does not
+block M4.3 lifecycle and recovery work on this Mac. LAN/VPN exposure requires
+a selected stable Mac address, restricted HTTPS bind
 and firewall, client DNS/CA setup, and an actual second machine with fresh OAuth
 state. The Docker test is not evidence of that journey. M4.3 restart, dependency
 failure, certificate renewal and restore rehearsals, and M4.4 cloud deployment,

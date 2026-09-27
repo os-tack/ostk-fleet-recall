@@ -3,7 +3,9 @@
 Status: implementation in progress, 2026-09-27. M4.1 is implemented. M4.2's
 single-Mac HTTPS services, native Codex CLI and container paths are deployed
 and tested, including macOS certificate trust and the restarted Codex harness.
-The second-machine LAN/VPN check remains unqualified. M4.3–M4.5 remain pending. The original baseline was
+The second-machine LAN/VPN check is deferred because no second machine is
+currently available. It remains unqualified; local M4.3 work can proceed.
+M4.3–M4.5 remain pending. The original baseline was
 `ea6d43d` on `main`, including M3 and merged Prometheus/Grafana telemetry.
 The original remote plan ended at M3. M4 is the follow-on described here.
 
@@ -56,6 +58,9 @@ selected stable address and a second machine. After the user installed trust
 and restarted the harness, macOS certificate verification, system curl without
 a CA override, and native Recall status/get calls from that harness passed.
 Cloud deployment and lifecycle/restore rehearsals remain later milestones.
+The user confirmed on 2026-09-27 that a second machine is unavailable. Defer
+that check until hardware is available; retain it as an outstanding acceptance
+requirement rather than treating same-host container tests as its replacement.
 
 ## Outcome and scope
 
@@ -431,6 +436,9 @@ claim is implied by this plan. [EKS architecture](https://docs.aws.amazon.com/ek
 
 Each slice should be independently reviewable. M4.4 infrastructure scaffolding
 can proceed alongside M4.2; its live rollout waits for M4.3 and its storage gate.
+M4.3 can proceed against the qualified single-Mac deployment while the
+second-machine LAN/VPN check is deferred. That check must still pass before
+claiming complete M4.2 acceptance or M4.5 release qualification.
 
 | Slice | Deliverable and likely files | Completion gate |
 |---|---|---|
