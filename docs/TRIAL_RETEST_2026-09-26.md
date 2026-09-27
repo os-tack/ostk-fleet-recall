@@ -333,3 +333,29 @@ own absent probes, so "kubernetes helm chart" reads `present` on the turn
 that proposed it: probes for this scope must be new words. And a session
 transcript quotes its own tool output, so the `evidence_source_failed`
 warning text and the failing file names are themselves recallable.
+
+## Follow-up round, 2026-09-27: incremental walks, supersession, lexical lag
+
+Three items from the self-ingest round, each asked for and done:
+
+| Item | What landed |
+| --- | --- |
+| The git step re-walked the whole ref on every moved-tip tick (541 commits, 9 re-quarantined facts, every 15 minutes on an active branch) | The walk is `git rev-list <target> ^<latest receipt revision>`: only the commits past the receipt after a fast-forward, only the rewritten commits down to the merge base after a rebase. A pruned revision falls back to a full walk (`full_walks`); a revision no longer an ancestor of the target is reported as `ref_rewritten` and the tick's ref observation names it as `previous_target`. Unreachable commits stay in the ledger as history |
+| Pre-profile-3 facts raw at rest, re-presented as `preimage_disagreement` on every full walk | `ostk-evidence-supersede apply --sources <file> [--dry-run]` under the new `fleet_supersession` role: for each raw git fact it appends the redacted rendering as a `supersedes` successor through the git ingress seam and, in the same transaction, removes the raw body, its occurrences, spans, lexical, dense and visibility rows, its manifest and generation pointer, and the content object when this event alone referenced it; the event row stays as the tombstone. Migration 0037 records the predecessor key so the ledger classifies a re-presented superseded fact as a replay, the body projector skips an erased raw event whose successor exists, and `recall(status).quarantine` counts `resolved_preimage_disagreements`. Transcript turns are counted (`transcript_turns_raw_at_rest`) and deferred |
+| `lexical_projection_lag` blocked every scope | Readiness carries `lexical_lag_by_source {git, items, sessions, other}`; a scoped verdict reads its own bucket, item search judges the `items` bucket |
+
+**Re-measured on the stack.** After the merges, one tick walked 12 commits
+(the merge commits), replayed 0 and quarantined 0 with `full_walks 0`; the
+next tick read `unchanged`. `recall(status)` reports
+`resolved_preimage_disagreements: 0` beside the 28 rows and a zero lexical
+split; `source: git` still reads `absent` for the never-discussed probe.
+
+**Not done on this stack.** The pass was proven end to end by its live test
+(a raw fact with a placeholder token in `body_bytes`, one quarantine, the
+pass, then a replay with nothing quarantined and status resolved), but it
+was not run against the quickstart scope: the binary keeps the one-shot
+ceremony rule of strict TLS with no loopback escape, and the quickstart node
+has no TLS. A loopback escape mirroring `ostk-authority-install` was
+written and then withheld pending a decision; without it the ten
+disagreements on this stack stay unresolved, which the incremental walk now
+leaves alone.
