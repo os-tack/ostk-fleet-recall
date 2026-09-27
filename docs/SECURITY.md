@@ -1,9 +1,48 @@
 # Security and supply-chain policy
 
+## Authenticated remote plane
+
+`serve --http` exposes MCP, protected-resource metadata, grant issue/revoke,
+and optional AWS identity exchange; it is distinct from the public demo.
+Asymmetric JWT verification establishes identity only. The enrolled principal
+or a checked, persisted grant supplies scope and role; provider claims and MCP
+arguments cannot select them. Issuers are configured trust roots, never
+discovered from arbitrary token URLs. Duplicate JSON claims, unsupported
+algorithms, wrong key families, invalid signatures, wrong audiences, and
+expired assertions fail closed. Provider reads are size/time bounded and do
+not follow redirects or environment proxies. Local public keys can assert
+only their own key identifier.
+
+Enrollment uses a separate fixed login, refuses co-resident runtime database
+credentials/content keys, and is never mounted into a runtime workload. The
+runtime cannot mutate principal bindings. A grant is persisted against the
+live principal revision before signing; edits and revocations invalidate it,
+with at most five seconds of positive-check caching. Direct principal access
+is resolved each request. A signed grant alone is insufficient without its
+live database row. Session grants cannot mint additional grants.
+
+Shippers can capture and read status/brief only; public ceilings use the
+publication read composition and refuse writes. Other served principals use
+project storage. Private/trusted ceilings remain unavailable. Scope and agent
+caches hold services rather than authorization decisions. Existing repository
+scope checks remain in force, and assert/capture require the process's pinned
+default scope. The HTTP writer credential still holds application-wide table
+access: SQL row isolation depends on the reviewed scoped repositories, not
+database row-level security. The public ceiling in this process is an
+application restriction, not a separate database credential.
+
+Production HTTP requires TLS termination; cleartext resource/issuer endpoints
+are restricted to loopback development. Origin checks, bearer challenges,
+bounded request/response sizes, concurrency limits, and request deadlines are
+enforced at the HTTP edge. Deadline expiry cannot prove a dispatched mutation
+did not commit; callers must follow the existing idempotency receipt contract.
+See [the remote runbook](REMOTE_PLANE.md) for settings and exact limitations.
+
 ## Trust boundaries
 
-Fleet Recall binds tenant, project, and agent identity from deployment
-configuration. MCP callers may select a session subdivision, but neither
+Fleet Recall binds stdio tenant, project, and agent identity from deployment
+configuration. Authenticated HTTP binds them from the principal registry or
+a checked session grant. MCP callers may select a session subdivision, but neither
 session nor the currently fixed project privacy tier is an authorization
 principal. Privacy refinement is deliberately rejected until owner/tier
 visibility is persisted and enforced. Every repository reapplies the trusted
@@ -41,8 +80,8 @@ reviewed binary; the credential alone can still select those rows (see
 CloudFront-to-ALB transport and viewer-TLS limitations are documented without
 stronger claims in the [AWS runbook](../deploy/aws/README.md).
 
-The private webhook receiver, `ostk-fleet-recall ingress`, is the one private
-process that answers requests from outside the deployment, so it holds the
+The private webhook receiver, `ostk-fleet-recall ingress`, answers requests
+from outside the deployment, so it holds the
 least ([ADR 0008](adr/0008-collected-items.md) D12). Its router has one route,
 `POST /v1/hooks/{connector_instance}`, and it listens on loopback unless the
 operator passes `--allow-non-loopback` for a relay they run; the relay adds no

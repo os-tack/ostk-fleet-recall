@@ -51,6 +51,44 @@ reader never reads. Migration 36 adds the authenticated ingress's hint queue
 digests, never content, which the ingress receiver inserts and the worker
 settles.
 
+Migrations 38 and 39 implement the [remote-plane boundary](adr/0009-remote-plane.md).
+`memory_principals_v1` is the enrollment-owned principal registry; the serving
+writer has only `SELECT`. `memory_session_grants_v1` records each delegated
+session before its token is signed and binds the issuing principal's revision.
+A principal edit or revocation invalidates its grants; grant checks may cache a
+successful result for at most five seconds (zero disables that cache). Direct
+identity resolution reads the registry on every request. Revoked exact bindings
+shadow broader wildcards, so revocation cannot silently fall back to wider access.
+Both migrations use restartable online DDL and verify the exact column,
+constraint, primary-key, and lookup-index definitions on reapplication.
+
+Apply `deploy/cockroach/runtime-role-grants.sql` after the complete successful
+prefix through 39 (38 entries; version 25 remains permanently unused). Its
+remote additions are `SELECT` on principals and `SELECT, INSERT, UPDATE` on
+session grants. The exact final role matrix now contains 148 privilege rows.
+The other policies retain their documented bounded prerequisite prefixes;
+later successful migration rows do not mask a missing prerequisite.
+
+For enrollment, provision `fleet_enrollment` with externally managed credentials
+and exact `{NOLOGIN}` options, run the same cross-database/default/PUBLIC audit
+required by the ingress policy, and apply
+`deploy/cockroach/enrollment-role-grants.sql`. It grants the sole non-admin
+membership in `fleet_enrollment_manager`: migration-history `SELECT`, principal
+`SELECT, INSERT, UPDATE`, and model-registry `SELECT, INSERT` for optional scope
+bootstrap. Its exact matrix contains eight privilege rows. Enable login only
+after that boundary audit succeeds. Enrollment has no content, evidence, claim,
+control, grant-log, deletion, sequence, or schema creation privileges.
+
+`enroll apply --file principals.json` is idempotent over each declaration's
+SHA-256 source digest; changing a declaration or reenrolling a revoked row
+increments its revision. Unknown JSON keys, duplicate IDs/bindings, unavailable
+private/trusted ceilings, and invalid agent patterns are rejected before writes.
+`--prune` makes the file authoritative for the entire registry and soft-revokes
+omitted active principals in the same transaction. `--bootstrap-scopes` first
+idempotently initializes each declared scope's immutable embedding identity;
+that bootstrap can remain if a later registry write fails. `enroll revoke`
+soft-revokes rather than deletes the audit record.
+
 Each private runtime uses its own part of these tables:
 
 - The memory worker writes the tables of migrations 19 through 22, 26, 30,
@@ -914,7 +952,7 @@ postcondition is a thirty-one-row grant matrix: SELECT on `_sqlx_migrations`,
 `memory_content_objects`, and the eight body-plane tables; INSERT on the
 events, the quarantine, the shard heads, and the content store; UPDATE on the
 shard heads and the content store; DELETE on the content store and the eight
-body-plane tables. `fleet_runtime` keeps its exact 144-row matrix and gains no
+body-plane tables. `fleet_runtime` keeps its exact 148-row matrix and gains no
 DELETE.
 
 The operator preflight, quiescence, cross-database audit, and PUBLIC-default

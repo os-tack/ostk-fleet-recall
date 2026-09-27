@@ -1,4 +1,4 @@
-//! MCP 2025-06-18 newline-delimited JSON-RPC server.
+//! Transport-neutral MCP dispatch and newline-delimited stdio framing.
 
 use std::{fmt::Write as _, sync::Arc};
 
@@ -13,16 +13,16 @@ use crate::service::{
 };
 use crate::{FleetScope, Result};
 
-use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, MODERN_PROTOCOL_VERSION};
 use super::tools::tool_list_for_surfaces;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
-/// The largest request frame the stdio transport reads; a longer one is
+/// The largest request frame either transport accepts; a longer one is
 /// answered with an error and never dispatched.
 pub const MAX_MCP_FRAME_BYTES: usize = 1_048_576;
 const MAX_MCP_TOOL_RESULT_BYTES: usize = 786_432;
 const MAX_MCP_RESPONSE_BYTES: usize = 1_048_576;
-const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+pub const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Transport-only request. The untrusted scope is consumed at the MCP edge and
 /// is never embedded in the service request passed to a backend.
@@ -150,14 +150,7 @@ impl McpServer {
             } else {
                 match String::from_utf8(frame) {
                     Ok(line) => match parse_request_line(&line) {
-                        Ok(request) if request.is_notification() => None,
-                        Ok(request) => {
-                            let id = request.id.clone().unwrap_or(Value::Null);
-                            let remember = is_remember_tool_call(&request);
-                            tokio::time::timeout(deadline, self.dispatch_request(request))
-                                .await
-                                .unwrap_or_else(|_| Some(deadline_response(id, remember)))
-                        }
+                        Ok(request) => self.handle_request_with_deadline(request, deadline).await,
                         Err(response) => Some(*response),
                     },
                     Err(_) => Some(JsonRpcResponse::error(
@@ -191,6 +184,32 @@ impl McpServer {
         self.dispatch_request(request).await
     }
 
+    /// Dispatch one decoded request with the same timeout and response budget
+    /// as stdio. A timed-out mutation reports an unknown commit outcome.
+    pub async fn handle_value_with_deadline(
+        &self,
+        value: Value,
+        deadline: std::time::Duration,
+    ) -> Option<JsonRpcResponse> {
+        match JsonRpcRequest::from_value(&value) {
+            Ok(request) => self.handle_request_with_deadline(request, deadline).await,
+            Err(response) => Some(bound_response(*response)),
+        }
+    }
+
+    async fn handle_request_with_deadline(
+        &self,
+        request: JsonRpcRequest,
+        deadline: std::time::Duration,
+    ) -> Option<JsonRpcResponse> {
+        let id = request.id.clone().unwrap_or(Value::Null);
+        let remember = is_remember_tool_call(&request);
+        tokio::time::timeout(deadline, self.dispatch_request(request))
+            .await
+            .unwrap_or_else(|_| Some(deadline_response(id, remember)))
+            .map(bound_response)
+    }
+
     async fn dispatch_request(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
         // MCP notifications are one-way. In particular, never execute a
         // notification-shaped tools/call: a hidden `remember` mutation would
@@ -199,9 +218,20 @@ impl McpServer {
             return None;
         }
 
+        let modern = match request.validate_protocol() {
+            Ok(modern) => modern,
+            Err(error) => {
+                return Some(JsonRpcResponse::error(
+                    request.id.unwrap_or(Value::Null),
+                    error,
+                ));
+            }
+        };
+
         let id = request.id.unwrap_or(Value::Null);
         let result = match request.method.as_str() {
             "initialize" => Ok(initialize_result()),
+            "server/discover" => Ok(discover_result()),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(self.tools.clone()),
             "tools/call" => self.handle_tools_call(request.params).await,
@@ -209,7 +239,19 @@ impl McpServer {
         };
 
         Some(match result {
-            Ok(result) => JsonRpcResponse::success(id, result),
+            Ok(mut result) => {
+                if modern {
+                    result["resultType"] = json!("complete");
+                    result["_meta"]["io.modelcontextprotocol/serverInfo"] = server_info();
+                    if request.method == "tools/list" {
+                        // Modern cacheable results require both hints. The
+                        // tool surface depends on the caller's scoped service.
+                        result["ttlMs"] = json!(0);
+                        result["cacheScope"] = json!("private");
+                    }
+                }
+                JsonRpcResponse::success(id, result)
+            }
             Err(error) => JsonRpcResponse::error(id, error),
         })
     }
@@ -302,6 +344,12 @@ impl McpServer {
             .resolve_requested(requested)
             .map_err(|error| JsonRpcError::invalid_params(error.to_string()))
     }
+
+    /// HTTP can distinguish an attempted authorization change from malformed
+    /// arguments without altering historical stdio error envelopes.
+    pub(super) fn permits_requested_scope(&self, requested: &RequestedScope) -> bool {
+        self.trusted_scope.resolve_requested(requested).is_ok()
+    }
 }
 
 fn validate_actor_assertion(
@@ -326,6 +374,21 @@ fn initialize_result() -> Value {
             "name": "ostk-fleet-recall",
             "version": env!("CARGO_PKG_VERSION")
         }
+    })
+}
+
+fn server_info() -> Value {
+    json!({ "name": "ostk-fleet-recall", "version": env!("CARGO_PKG_VERSION") })
+}
+
+fn discover_result() -> Value {
+    json!({
+        "resultType": "complete",
+        "ttlMs": 0,
+        "cacheScope": "private",
+        "supportedVersions": [MODERN_PROTOCOL_VERSION, PROTOCOL_VERSION],
+        "capabilities": { "tools": {} },
+        "_meta": { "io.modelcontextprotocol/serverInfo": server_info() },
     })
 }
 
@@ -583,21 +646,34 @@ fn bounded_untrusted_label(value: &str) -> String {
     }
 }
 
-fn encode_bounded_response(response: &JsonRpcResponse) -> std::io::Result<Vec<u8>> {
-    let id = response.id.clone();
-    let mut encoded = serde_json::to_vec(&response).map_err(std::io::Error::other)?;
-    if encoded.len() > MAX_MCP_RESPONSE_BYTES {
+/// Enforce the transport budget for either stdio or HTTP responses.
+#[must_use]
+pub fn bound_response(response: JsonRpcResponse) -> JsonRpcResponse {
+    if serde_json::to_vec(&response).map_or(true, |encoded| encoded.len() > MAX_MCP_RESPONSE_BYTES)
+    {
         tracing::warn!(
             limit = MAX_MCP_RESPONSE_BYTES,
-            size = encoded.len(),
             "JSON-RPC response exceeded the transport budget"
         );
-        encoded = serde_json::to_vec(&JsonRpcResponse::error(
-            id,
+        let mut bounded = JsonRpcResponse::error(
+            response.id,
             JsonRpcError::internal("response exceeded the transport budget"),
-        ))
-        .map_err(std::io::Error::other)?;
+        );
+        // An untrusted request id can itself exhaust the response budget.
+        if serde_json::to_vec(&bounded)
+            .map_or(true, |encoded| encoded.len() > MAX_MCP_RESPONSE_BYTES)
+        {
+            bounded.id = Value::Null;
+        }
+        bounded
+    } else {
+        response
     }
+}
+
+fn encode_bounded_response(response: &JsonRpcResponse) -> std::io::Result<Vec<u8>> {
+    let mut encoded =
+        serde_json::to_vec(&bound_response(response.clone())).map_err(std::io::Error::other)?;
     encoded.push(b'\n');
     Ok(encoded)
 }

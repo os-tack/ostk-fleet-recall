@@ -30,7 +30,7 @@ use ostk_fleet_recall::collectors::ingress::server::{
     validate_listen,
 };
 use ostk_fleet_recall::config::{
-    IngressConfig, LifecycleConfig, PublicationConfig, model_bundle_sha256,
+    EnrollmentConfig, IngressConfig, LifecycleConfig, PublicationConfig, model_bundle_sha256,
 };
 use ostk_fleet_recall::evidence_recall::start_evidence_recall;
 use ostk_fleet_recall::item_recall::{ItemRecall, start_item_recall_citing};
@@ -150,8 +150,20 @@ impl ChunkEmbedder for PinnedEmbedder {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Serve the Recall MCP protocol over stdin/stdout.
-    Serve,
+    /// Serve the Recall MCP protocol over stdin/stdout, or authenticated HTTP.
+    Serve {
+        /// Enable stateless HTTP MCP at /mcp on this address.
+        #[arg(long, value_name = "ADDRESS")]
+        http: Option<SocketAddr>,
+        /// Admit a non-loopback listener behind a trusted TLS relay.
+        #[arg(long, requires = "http")]
+        allow_non_loopback: bool,
+    },
+    /// Apply, list or revoke identity bindings using the enrollment login.
+    Enroll {
+        #[command(subcommand)]
+        command: EnrollSubcommand,
+    },
     /// Serve the bounded, read-only demo over HTTP.
     Demo {
         /// Address on which the HTTP demo listens.
@@ -284,6 +296,25 @@ enum CollectSubcommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum EnrollSubcommand {
+    /// Apply a declarative registry document idempotently.
+    Apply {
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        /// Revoke existing principals omitted from this complete document.
+        #[arg(long)]
+        prune: bool,
+        /// Initialize each declared scope with the validated pinned model.
+        #[arg(long)]
+        bootstrap_scopes: bool,
+    },
+    /// List the registry, including revoked bindings.
+    List,
+    /// Revoke a principal and invalidate its session grants.
+    Revoke { principal_id: uuid::Uuid },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CollectAudienceArg {
     /// Everything the file holds is visible to the whole project.
@@ -360,6 +391,7 @@ enum RuntimeDatabaseIdentity {
     Migrator,
     Publication,
     Ingress,
+    Enrollment,
     None,
 }
 
@@ -368,9 +400,10 @@ impl Command {
         match self {
             Self::Demo { .. } => RuntimeDatabaseIdentity::Publication,
             Self::Ingress { .. } => RuntimeDatabaseIdentity::Ingress,
+            Self::Enroll { .. } => RuntimeDatabaseIdentity::Enrollment,
             Self::Migrate => RuntimeDatabaseIdentity::Migrator,
             Self::ModelDigest { .. } => RuntimeDatabaseIdentity::None,
-            Self::Serve
+            Self::Serve { .. }
             | Self::Health
             | Self::Ingest { .. }
             | Self::Worker { .. }
@@ -465,11 +498,27 @@ async fn main() -> anyhow::Result<ExitCode> {
             };
             run_migrate(&config).await?;
         }
+        RuntimeDatabaseIdentity::Enrollment => {
+            let config = EnrollmentConfig::from_env()?;
+            let Command::Enroll { command } = cli.command else {
+                unreachable!("only enroll uses the enrollment identity")
+            };
+            run_enroll(&config, command).await?;
+        }
         RuntimeDatabaseIdentity::Writer => {
             let config = FleetConfig::from_writer_env()?;
             match cli.command {
                 Command::Health => run_health(&config).await?,
-                Command::Serve => run_serve(config).await?,
+                Command::Serve {
+                    http,
+                    allow_non_loopback,
+                } => {
+                    if let Some(listen) = http {
+                        run_http(config, validate_listen(listen, allow_non_loopback)?).await?;
+                    } else {
+                        run_serve(config).await?;
+                    }
+                }
                 Command::Ingest { input } => run_ingest(&config, &input).await?,
                 Command::Worker {
                     sources,
@@ -490,6 +539,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 Command::Demo { .. }
                 | Command::Migrate
                 | Command::ModelDigest { .. }
+                | Command::Enroll { .. }
                 | Command::Ingress { .. } => {
                     unreachable!("command identity was classified before configuration load")
                 }
@@ -689,6 +739,90 @@ async fn run_serve(config: FleetConfig) -> anyhow::Result<()> {
     McpServer::new(service, config.default_scope)?
         .run_stdio()
         .await?;
+    Ok(())
+}
+
+async fn run_http(config: FleetConfig, listen: SocketAddr) -> anyhow::Result<()> {
+    use ostk_fleet_recall::{
+        mcp::{http, scopes::ScopeServices},
+        remote::{RemoteBackend, RemoteConfig},
+    };
+    let remote = RemoteConfig::from_env()?;
+    let embedder = Arc::new(load_pinned_embedder(&config)?);
+    let store = connect_store(&config).await?;
+    store.health_check().await?;
+    let pool = store.pool().clone();
+    ostk_fleet_recall::auth::grant::probe_remote_plane(&pool).await?;
+    let services = Arc::new(ScopeServices::new(
+        config,
+        pool.clone(),
+        embedder,
+        remote.scope_cache_max,
+        remote.agent_cache_max,
+    )?);
+    let backend = Arc::new(RemoteBackend::new(&remote, pool, services)?);
+    let router = http::router(remote.http, backend)?;
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .context("bind authenticated HTTP MCP")?;
+    tracing::info!(address = %listener.local_addr()?, "authenticated HTTP MCP listening");
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("serve authenticated HTTP MCP")?;
+    Ok(())
+}
+
+async fn run_enroll(config: &EnrollmentConfig, command: EnrollSubcommand) -> anyhow::Result<()> {
+    use ostk_fleet_recall::{
+        auth::registry::PrincipalRegistry, enroll,
+        private_postgres::enrollment_postgres_connect_options,
+    };
+    let options =
+        enrollment_postgres_connect_options(config.database_url(), config.database_ssl_policy())?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(config.max_connections())
+        .acquire_timeout(Duration::from_secs(10))
+        .connect_with(options)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("enrollment database connection failed; credential redacted")
+        })?;
+    let result = match command {
+        EnrollSubcommand::Apply {
+            file,
+            prune,
+            bootstrap_scopes,
+        } => {
+            let declarations = enroll::read_declarations(&file)?;
+            let model = if bootstrap_scopes {
+                if let Some(principal) = declarations.principals.first() {
+                    let scope = FleetScope::new(
+                        principal.tenant_id,
+                        &principal.project,
+                        "enrollment",
+                        None,
+                        ostk_recall_core::PrivacyTier::T1Project,
+                    )?;
+                    Some(validated_migration_model_identity(
+                        &config.model_config(&scope)?,
+                    )?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            serde_json::to_value(
+                enroll::apply(pool, &declarations, prune, model.as_deref()).await?,
+            )?
+        }
+        EnrollSubcommand::List => serde_json::to_value(PrincipalRegistry::new(pool).list().await?)?,
+        EnrollSubcommand::Revoke { principal_id } => {
+            json!({"revoked":PrincipalRegistry::new(pool).revoke(principal_id).await?})
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 
@@ -2159,6 +2293,32 @@ mod tests {
 
     #[test]
     fn commands_select_only_their_dedicated_database_identity() {
+        for args in [
+            vec!["ostk-fleet-recall", "enroll", "list"],
+            vec![
+                "ostk-fleet-recall",
+                "enroll",
+                "apply",
+                "--file",
+                "principals.json",
+                "--bootstrap-scopes",
+            ],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args)
+                    .unwrap()
+                    .command
+                    .runtime_database_identity(),
+                RuntimeDatabaseIdentity::Enrollment
+            );
+        }
+        assert_eq!(
+            Cli::try_parse_from(["ostk-fleet-recall", "serve", "--http", "127.0.0.1:8080"])
+                .unwrap()
+                .command
+                .runtime_database_identity(),
+            RuntimeDatabaseIdentity::Writer
+        );
         assert_eq!(
             Command::Demo {
                 listen: "127.0.0.1:8080".parse().expect("listen address"),
@@ -2171,7 +2331,10 @@ mod tests {
             RuntimeDatabaseIdentity::Migrator
         );
         for command in [
-            Command::Serve,
+            Command::Serve {
+                http: None,
+                allow_non_loopback: false,
+            },
             Command::Health,
             Command::Ingest { input: "-".into() },
             Command::Worker {
@@ -2361,6 +2524,10 @@ mod tests {
                 RuntimeDatabaseIdentity::Migrator => {
                     ("FLEET_RECALL_DATABASE_URL", MIGRATOR_POSTGRES_USER)
                 }
+                RuntimeDatabaseIdentity::Enrollment => (
+                    "FLEET_RECALL_ENROLLMENT_DATABASE_URL",
+                    ostk_fleet_recall::private_postgres::ENROLLMENT_POSTGRES_USER,
+                ),
                 RuntimeDatabaseIdentity::Writer => {
                     ("FLEET_RECALL_DATABASE_URL", WRITER_POSTGRES_USER)
                 }

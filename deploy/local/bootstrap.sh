@@ -12,7 +12,7 @@ set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$here/../.." && pwd)
-state="$here/.state"
+state=${FLEET_LOCAL_STATE:-$here/.state}
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 
@@ -208,6 +208,11 @@ phase_secrets() {
         } > "$f"
         umask 022
     fi
+    # Enrollment stays on the workstation; never add this password to a pod's
+    # Secret or environment. Existing M1 state gains it without rotating keys.
+    if [ -z "$(env_value "$f" ENROLLMENT_PASSWORD)" ]; then
+        (umask 077; printf 'ENROLLMENT_PASSWORD=%s\n' "$(random_hex 24)" >> "$f")
+    fi
     local ca=/etc/crdb/ca.crt
     local url_tail="fleet_recall?sslmode=verify-full&sslrootcert=$ca"
     kube_upsert create secret generic crdb-passwords -n "$NS" \
@@ -317,6 +322,14 @@ phase_boundary() {
     wait_cluster_network
     wait_cockroach_ready
     run_job boundary 600
+    # The policy leaves enrollment quiesced. Install its workstation-only
+    # credential and enable it only after the complete boundary audit passes.
+    local password
+    password=$(env_value "$state/passwords.env" ENROLLMENT_PASSWORD)
+    [[ "$password" =~ ^[0-9a-f]{48}$ ]] || die "run the secrets phase to provision enrollment"
+    printf "ALTER USER fleet_enrollment WITH PASSWORD '%s' LOGIN NOCREATEDB NOCREATEROLE;\n" "$password" |
+        docker run --rm -i --network host -v "$state/certs:/certs:ro" "$CRDB_IMAGE" \
+            sql --certs-dir=/certs --host=127.0.0.1:26258 --database=fleet_recall >/dev/null
     log "database boundary applied"
 }
 

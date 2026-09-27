@@ -1,12 +1,13 @@
-//! MCP 2025-06-18 transport exposing protocol-compatible `recall` and
-//! `remember` tools.
+//! MCP stdio and Streamable HTTP transports for `recall` and `remember`.
 
+pub mod http;
 mod protocol;
+pub mod scopes;
 mod server;
 mod tools;
 
-pub use protocol::{JsonRpcError, JsonRpcResponse};
-pub use server::{MAX_MCP_FRAME_BYTES, McpServer, PROTOCOL_VERSION};
+pub use protocol::{JsonRpcError, JsonRpcResponse, MODERN_PROTOCOL_VERSION};
+pub use server::{MAX_MCP_FRAME_BYTES, McpServer, PROTOCOL_VERSION, REQUEST_DEADLINE};
 pub use tools::{
     recall_tool, recall_tool_for, recall_tool_for_surfaces, remember_tool, remember_tool_for,
     tool_list, tool_list_for, tool_list_for_surfaces,

@@ -2110,3 +2110,44 @@ fn the_ingress_refuses_every_database_url_but_its_own() {
     );
     assert!(!message.contains("  "), "{message}");
 }
+
+#[test]
+fn enrollment_uses_only_its_dedicated_credential_and_redacts_it() {
+    let mut values = BTreeMap::from([(
+        "FLEET_RECALL_ENROLLMENT_DATABASE_URL",
+        "postgresql://fleet_enrollment:secret@db.example:26257/fleet_recall?sslmode=verify-full"
+            .to_owned(),
+    )]);
+    let config = EnrollmentConfig::from_lookup(|name| values.get(name).cloned()).unwrap();
+    assert!(!format!("{config:?}").contains("secret"));
+    for name in [
+        "FLEET_RECALL_DATABASE_URL",
+        "FLEET_RECALL_PUBLICATION_DATABASE_URL",
+        "FLEET_RECALL_INGRESS_DATABASE_URL",
+        "FLEET_RECALL_CONTENT_KEK_HEX",
+    ] {
+        values.insert(name, "forbidden".into());
+        assert!(EnrollmentConfig::from_lookup(|name| values.get(name).cloned()).is_err());
+        values.remove(name);
+    }
+    for url in [
+        "postgresql://root:secret@db.example:26257/fleet_recall?sslmode=verify-full",
+        "postgresql://fleet_enrollment:secret@db.example:26257/postgres?sslmode=verify-full",
+        "postgresql://fleet_enrollment:secret@db.example:26257/fleet_recall?sslmode=disable",
+    ] {
+        values.insert("FLEET_RECALL_ENROLLMENT_DATABASE_URL", url.into());
+        assert!(EnrollmentConfig::from_lookup(|name| values.get(name).cloned()).is_err());
+    }
+    assert!(
+        FleetConfig::from_lookup(
+            |name| (name == "FLEET_RECALL_ENROLLMENT_DATABASE_URL").then(|| "forbidden".into())
+        )
+        .is_err()
+    );
+    assert!(
+        WriterProcessConfig::from_lookup("test", |name| (name
+            == "FLEET_RECALL_ENROLLMENT_DATABASE_URL")
+            .then(|| "forbidden".into()))
+        .is_err()
+    );
+}

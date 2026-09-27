@@ -1,7 +1,7 @@
 -- Long-lived runtime-writer role boundary for the dedicated fleet_recall
 -- database.
 --
--- Run only after the complete successful migration prefix 1 through 36 (version
+-- Run only after the complete successful migration prefix 1 through 39 (version
 -- 25 is permanently unused). Other later successful migrations are compatible
 -- and cannot mask a missing or failed row in that bounded prefix. Run only as
 -- a cluster admin; database ownership alone is insufficient. This policy is
@@ -69,25 +69,26 @@ $$;
 -- normative activation (24), the CI connector (26), the discrepancy ledger
 -- (27), the conflict lifecycle log (29), worker source status (30), spec
 -- conformance (31), collected items and their withdrawals (33, 34), claim
--- item links (35), and the ingress hint queue (36). Migration 32 adds no table
--- and no grant, but lies inside the bounded prefix. A policy applied before any of them fails here, before
--- any change, rather than on a GRANT.
+-- item links (35), ingress hints (36), remote principals (38), and grants (39).
+-- Migration 32 adds no table or grant but lies inside the bounded prefix. A
+-- policy applied before any prerequisite fails here before any grant change.
 DO $$
 DECLARE
     runtime_schema_ready BOOL;
 BEGIN
-    SELECT count(*) = 35
+    SELECT count(*) = 38
        AND min(version) = 1
-       AND max(version) = 36
+       AND max(version) = 39
+       AND bool_and(version <> 25)
        AND COALESCE(bool_and(success), false)
     INTO runtime_schema_ready
     FROM public._sqlx_migrations
-    WHERE version BETWEEN 1 AND 36;
+    WHERE version BETWEEN 1 AND 39;
 
     IF runtime_schema_ready IS DISTINCT FROM true THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
-            MESSAGE = 'runtime writer role requires successful migrations 1 through 36 (25 is permanently unused)';
+            MESSAGE = 'runtime writer role requires successful migrations 1 through 39 (25 is permanently unused)';
     END IF;
 END
 $$;
@@ -891,6 +892,11 @@ GRANT USAGE ON SEQUENCE
     public.memory_conflict_id_seq
 TO fleet_runtime;
 
+-- ADR 0009: authorization enrollment is a separate administrative boundary.
+-- Runtime resolves principals but cannot enroll, edit, or revoke their policy.
+GRANT SELECT ON TABLE public.memory_principals_v1 TO fleet_runtime;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.memory_session_grants_v1 TO fleet_runtime;
+
 -- Install the sole permitted role edge only after every fail-closed gate and
 -- exact logical-role grant have succeeded. The fixed principal remains
 -- NOLOGIN; enabling its externally managed authentication is a separate,
@@ -898,12 +904,12 @@ TO fleet_runtime;
 GRANT fleet_runtime TO fleet_writer;
 
 -- Exact direct logical-role surface: database CONNECT, public-schema USAGE,
--- one hundred thirty-eight table-privilege rows, and three sequence-USAGE rows.
+-- one hundred forty-three table-privilege rows, and three sequence-USAGE rows.
 -- Because SHOW GRANTS FOR also exposes cluster-global external connections, the
 -- exact count rejects those and every function/type/differently privileged
 -- row.
 SELECT IF(
-    count(*) = 144
+    count(*) = 148
         AND COALESCE(bool_and(
             NOT is_grantable
             AND (
@@ -921,6 +927,8 @@ SELECT IF(
                         (privilege_type = 'SELECT'
                             AND object_name IN (
                                 '_sqlx_migrations',
+                                'memory_principals_v1',
+                                'memory_session_grants_v1',
                                 'memory_corpus_models',
                                 'memory_chunks',
                                 'memory_chunk_history',
@@ -980,6 +988,7 @@ SELECT IF(
                             ))
                         OR (privilege_type = 'INSERT'
                             AND object_name IN (
+                                'memory_session_grants_v1',
                                 'memory_corpus_models',
                                 'memory_chunks',
                                 'memory_claims',
@@ -1035,6 +1044,7 @@ SELECT IF(
                             ))
                         OR (privilege_type = 'UPDATE'
                             AND object_name IN (
+                                'memory_session_grants_v1',
                                 'memory_chunks',
                                 'memory_claims',
                                 'memory_conflicts',
@@ -1082,7 +1092,7 @@ SELECT IF(
     1:::INT8,
     CAST(
         concat(
-            'runtime writer direct-grant postcondition differs from exact one-hundred-forty-four-row matrix: observed=',
+            'runtime writer direct-grant postcondition differs from exact one-hundred-forty-eight-row matrix: observed=',
             count(*)::STRING
         )
         AS INT8

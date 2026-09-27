@@ -35,6 +35,22 @@ pub const INGRESS_POSTGRES_APPLICATION_NAME: &str = "ostk-fleet-recall-ingress";
 /// (ADR 0008 D12): a member of `fleet_ingress_receiver`, which may only read
 /// and insert deliveries and dead letters.
 pub const INGRESS_POSTGRES_USER: &str = "fleet_ingress";
+/// Dedicated declarative enrollment ceremony; never admitted as a runtime writer.
+pub const ENROLLMENT_POSTGRES_USER: &str = "fleet_enrollment";
+pub const ENROLLMENT_POSTGRES_APPLICATION_NAME: &str = "ostk-fleet-recall-enrollment";
+
+pub fn enrollment_postgres_connect_options(
+    database_url: &str,
+    expected_ssl_policy: PrivatePostgresSslPolicy,
+) -> Result<PgConnectOptions> {
+    canonical_private_runtime_connect_options_from_variables(
+        database_url,
+        ENROLLMENT_POSTGRES_USER,
+        ENROLLMENT_POSTGRES_APPLICATION_NAME,
+        expected_ssl_policy,
+        env::vars_os(),
+    )
+}
 
 /// Exact TLS mode expected from a deployment-validated private database URL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

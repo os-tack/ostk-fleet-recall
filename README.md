@@ -240,6 +240,20 @@ The service contract also reserves further Recall actions (for example
 schema. These return an error or are unused today; see the
 [roadmap](docs/ARCHITECTURE.md#roadmap-and-open-work).
 
+## Remote HTTP MCP
+
+`ostk-fleet-recall serve --http 127.0.0.1:8080` serves authenticated MCP at
+`/mcp`; plain `serve` retains its stdio protocol. OIDC, local Ed25519 keys,
+and signed AWS STS proofs resolve through an explicit principal registry.
+Operators receive an enrolled tenant/project/agent binding; launchers mint
+revocable agent or shipper grants. The server also supports the 2026-07-28
+`server/discover` protocol alongside legacy initialization.
+
+See the [remote plane runbook](docs/REMOTE_PLANE.md) for enrollment, HTTP
+configuration, client setup, permission boundaries, and verification. The
+[local environment](deploy/local/README.md) can run HTTP on the Mac against
+secure k0s CockroachDB and Ory without LocalStack.
+
 ## Private operator CLIs
 
 `src/bin` holds private workstation tools. None is copied into the production

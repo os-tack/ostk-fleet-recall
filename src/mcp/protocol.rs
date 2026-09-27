@@ -1,7 +1,11 @@
-//! Minimal JSON-RPC 2.0 types and validation for MCP stdio.
+//! JSON-RPC 2.0 envelopes and per-request MCP protocol validation.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+pub const PROTOCOL_VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
+pub const CLIENT_CAPABILITIES_META: &str = "io.modelcontextprotocol/clientCapabilities";
 
 /// A validated JSON-RPC request. `None` means the `id` member was absent and
 /// the message is a notification; `Some(Value::Null)` remains a request whose
@@ -83,6 +87,67 @@ impl JsonRpcRequest {
     pub const fn is_notification(&self) -> bool {
         self.id.is_none()
     }
+
+    /// Validate modern request metadata, while retaining the historical
+    /// envelope rules for clients without per-request protocol metadata.
+    pub fn validate_protocol(&self) -> Result<bool, JsonRpcError> {
+        let Some(version) = self
+            .params
+            .get("_meta")
+            .and_then(|meta| meta.get(PROTOCOL_VERSION_META))
+        else {
+            if self
+                .params
+                .get("_meta")
+                .is_some_and(|meta| meta.get(CLIENT_CAPABILITIES_META).is_some())
+            {
+                return Err(JsonRpcError::invalid_params(
+                    "missing protocolVersion metadata",
+                ));
+            }
+            return Ok(false);
+        };
+        let version = version
+            .as_str()
+            .ok_or_else(|| JsonRpcError::invalid_params("protocolVersion must be a string"))?;
+        if version != MODERN_PROTOCOL_VERSION {
+            return Err(unsupported_version(version));
+        }
+        if !self.is_notification() {
+            if !self
+                .id
+                .as_ref()
+                .is_some_and(|id| id.is_string() || id.is_i64() || id.is_u64())
+            {
+                return Err(JsonRpcError::invalid_request(
+                    "modern MCP request id must be a string or integer",
+                ));
+            }
+            if !self
+                .params
+                .get("_meta")
+                .and_then(|meta| meta.get(CLIENT_CAPABILITIES_META))
+                .is_some_and(Value::is_object)
+            {
+                return Err(JsonRpcError::invalid_params(
+                    "clientCapabilities must be an object",
+                ));
+            }
+        }
+        Ok(true)
+    }
+}
+
+pub fn unsupported_version(requested: &str) -> JsonRpcError {
+    let mut error = JsonRpcError::new(
+        codes::UNSUPPORTED_PROTOCOL_VERSION,
+        "Unsupported protocol version",
+    );
+    error.data = Some(serde_json::json!({
+        "supported": [MODERN_PROTOCOL_VERSION, super::server::PROTOCOL_VERSION],
+        "requested": bounded_untrusted_label(requested),
+    }));
+    error
 }
 
 fn valid_id(value: &Value) -> bool {
@@ -184,6 +249,8 @@ pub mod codes {
     pub const METHOD_NOT_FOUND: i64 = -32_601;
     pub const INVALID_PARAMS: i64 = -32_602;
     pub const INTERNAL_ERROR: i64 = -32_603;
+    pub const HEADER_MISMATCH: i64 = -32_020;
+    pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32_022;
 }
 
 #[cfg(test)]

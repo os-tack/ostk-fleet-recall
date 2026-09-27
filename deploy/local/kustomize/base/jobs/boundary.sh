@@ -79,6 +79,7 @@ REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM $principal;
 quiesce fleet_writer
 quiesce fleet_publication
 quiesce fleet_ingress
+quiesce fleet_enrollment
 run_root_sql 'retire the migrator' fleet_recall --execute="
 ALTER USER fleet_migrator WITH NOLOGIN NOCREATEDB NOCREATEROLE;
 REVOKE admin FROM fleet_migrator;
@@ -92,17 +93,17 @@ clean_public_defaults 'after the runtime policy'
 run_root_sql 'publication reader policy apply' fleet_recall \
     --file="$policies/publication-reader-role-grants.sql" >/dev/null
 clean_public_defaults 'after the publication policy'
-run_root_sql 'enable writer and publication logins' fleet_recall --execute="
-ALTER USER fleet_writer WITH LOGIN NOCREATEDB NOCREATEROLE;
-ALTER USER fleet_publication WITH LOGIN NOCREATEDB NOCREATEROLE;
-" >/dev/null
-
 clean_public_defaults 'baseline before the ingress policy'
 run_root_sql 'ingress receiver policy apply' fleet_recall \
     --file="$policies/ingress-receiver-role-grants.sql" >/dev/null
 clean_public_defaults 'after the ingress policy'
-run_root_sql 'enable the ingress login' fleet_recall --execute="
+run_root_sql 'enrollment manager policy apply' fleet_recall \
+    --file="$policies/enrollment-role-grants.sql" >/dev/null
+clean_public_defaults 'after the enrollment policy'
+run_root_sql 'enable the runtime logins after every policy passed' fleet_recall --execute="
+ALTER USER fleet_writer WITH LOGIN NOCREATEDB NOCREATEROLE;
+ALTER USER fleet_publication WITH LOGIN NOCREATEDB NOCREATEROLE;
 ALTER USER fleet_ingress WITH LOGIN NOCREATEDB NOCREATEROLE;
 " >/dev/null
 
-printf '%s\n' 'runtime, publication and ingress database boundaries are ready'
+printf '%s\n' 'runtime, publication, ingress and enrollment database boundaries are ready; enrollment remains NOLOGIN until the workstation enables it'

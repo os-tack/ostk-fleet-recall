@@ -30,8 +30,9 @@ use crate::memory_contracts::successor_policy::{
     GenesisSuccessorKeyBridgeDigest, GenesisSuccessorKeyBridgePin,
 };
 use crate::private_postgres::{
-    INGRESS_POSTGRES_USER, MIGRATOR_POSTGRES_USER, PRIVATE_RUNTIME_POSTGRES_DATABASE,
-    PUBLICATION_POSTGRES_USER, PrivatePostgresSslPolicy, WRITER_POSTGRES_USER,
+    ENROLLMENT_POSTGRES_USER, INGRESS_POSTGRES_USER, MIGRATOR_POSTGRES_USER,
+    PRIVATE_RUNTIME_POSTGRES_DATABASE, PUBLICATION_POSTGRES_USER, PrivatePostgresSslPolicy,
+    WRITER_POSTGRES_USER,
 };
 use crate::{FleetError, FleetScope, Result};
 
@@ -831,6 +832,7 @@ impl WriterProcessConfig {
         mut lookup: impl FnMut(&str) -> Option<String>,
         expected_user: &str,
     ) -> Result<Self> {
+        reject_enrollment_credential(&mut lookup)?;
         let database_url = required_from(&mut lookup, "FLEET_RECALL_DATABASE_URL")?;
         let tenant_id = required_from(&mut lookup, "FLEET_RECALL_TENANT_ID")?;
         let project = required_from(&mut lookup, "FLEET_RECALL_PROJECT")?;
@@ -1136,7 +1138,8 @@ impl std::fmt::Debug for FleetConfig {
 
 const MODEL_BUNDLE_DIGEST_DOMAIN: &[u8] = b"ostk-fleet-recall-model-bundle-v1\0";
 const MODEL_BUNDLE_FILES: [&str; 3] = ["config.json", "model.safetensors", "tokenizer.json"];
-const PUBLICATION_FORBIDDEN_DATABASE_URL_ENV_NAMES: [&str; 8] = [
+const PUBLICATION_FORBIDDEN_DATABASE_URL_ENV_NAMES: [&str; 9] = [
+    "FLEET_RECALL_ENROLLMENT_DATABASE_URL",
     "FLEET_RECALL_DATABASE_URL",
     "FLEET_RECALL_CONTROL_DATABASE_URL",
     "FLEET_RECALL_REGISTRY_DATABASE_URL",
@@ -1282,6 +1285,102 @@ pub struct IngressConfig {
     project: String,
     max_connections: u32,
     max_body_bytes: usize,
+}
+
+/// Workstation-only enrollment connection, with no runtime or ceremony credential
+/// admitted beside it. Model configuration is required only for scope bootstrap.
+#[derive(Clone)]
+pub struct EnrollmentConfig {
+    database_url: String,
+    database_ssl_policy: PrivatePostgresSslPolicy,
+    max_connections: u32,
+}
+
+impl std::fmt::Debug for EnrollmentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollmentConfig")
+            .field("database_url", &"<redacted>")
+            .field("max_connections", &self.max_connections)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EnrollmentConfig {
+    pub fn from_env() -> Result<Self> {
+        if env::vars_os().any(|(name, _)| {
+            let name = name.to_string_lossy();
+            (name.ends_with("DATABASE_URL") && name != "FLEET_RECALL_ENROLLMENT_DATABASE_URL")
+                || name == "FLEET_RECALL_CONTENT_KEK_HEX"
+        }) {
+            return Err(FleetError::Configuration(
+                "enrollment requires only its dedicated database credential; other database URLs and content keys are forbidden".into(),
+            ));
+        }
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        for name in PUBLICATION_FORBIDDEN_DATABASE_URL_ENV_NAMES {
+            if name != "FLEET_RECALL_ENROLLMENT_DATABASE_URL" && lookup(name).is_some() {
+                return Err(FleetError::Configuration(
+                    "enrollment forbids other database credentials".into(),
+                ));
+            }
+        }
+        if lookup("FLEET_RECALL_PUBLICATION_DATABASE_URL").is_some()
+            || lookup("FLEET_RECALL_INGRESS_DATABASE_URL").is_some()
+            || lookup("FLEET_RECALL_CONTENT_KEK_HEX").is_some()
+        {
+            return Err(FleetError::Configuration(
+                "enrollment forbids runtime credentials and content keys".into(),
+            ));
+        }
+        let database_url = required_from(&mut lookup, "FLEET_RECALL_ENROLLMENT_DATABASE_URL")?;
+        let database_ssl_policy = validate_dedicated_database_url(
+            &database_url,
+            "FLEET_RECALL_ENROLLMENT_DATABASE_URL",
+            ENROLLMENT_POSTGRES_USER,
+            lookup("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE").as_deref() == Some("1"),
+        )?;
+        let max_connections = lookup("FLEET_RECALL_MAX_CONNECTIONS")
+            .unwrap_or_else(|| "4".into())
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value > 0 && *value <= 128)
+            .ok_or_else(|| {
+                FleetError::Configuration("enrollment max connections must be 1..128".into())
+            })?;
+        Ok(Self {
+            database_url,
+            database_ssl_policy,
+            max_connections,
+        })
+    }
+
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+    pub const fn database_ssl_policy(&self) -> PrivatePostgresSslPolicy {
+        self.database_ssl_policy
+    }
+    pub const fn max_connections(&self) -> u32 {
+        self.max_connections
+    }
+
+    /// Reuse the same pinned-model validation as migration without admitting a
+    /// writer credential. The supplied scope comes from enrollment declarations.
+    pub fn model_config(&self, scope: &FleetScope) -> Result<FleetConfig> {
+        fleet_config_from_lookup(
+            self.database_url.clone(),
+            self.database_ssl_policy,
+            |name| match name {
+                "FLEET_RECALL_TENANT_ID" => Some(scope.tenant_id.to_string()),
+                "FLEET_RECALL_PROJECT" => Some(scope.project.clone()),
+                "FLEET_RECALL_AGENT" => Some(scope.agent.clone()),
+                _ => env::var(name).ok(),
+            },
+        )
+    }
 }
 
 impl std::fmt::Debug for IngressConfig {
@@ -1433,6 +1532,7 @@ impl FleetConfig {
         mut lookup: impl FnMut(&str) -> Option<String>,
         expected_user: &str,
     ) -> Result<Self> {
+        reject_enrollment_credential(&mut lookup)?;
         let database_url = required_from(&mut lookup, "FLEET_RECALL_DATABASE_URL")?;
         let allow_insecure_local =
             lookup("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE").is_some_and(|value| value == "1");
@@ -2369,6 +2469,15 @@ fn validate_dedicated_database_url(
     }
 
     explicit_private_database_ssl_policy(database_url, variable_name)
+}
+
+fn reject_enrollment_credential(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<()> {
+    if lookup("FLEET_RECALL_ENROLLMENT_DATABASE_URL").is_some() {
+        return Err(FleetError::Configuration(
+            "runtime and migrator processes forbid the enrollment credential".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn is_ordinary_dns_host(host: &str) -> bool {
