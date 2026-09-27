@@ -8,6 +8,32 @@ permissions:
   contents: read
 
 jobs:
+  observability:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate dashboards and alert rules
+        run: |
+          python3 deploy/observability/validate_dashboards.py --rules-output /tmp/fleet-dashboard-rules.json
+          docker run --rm --entrypoint promtool \
+            -v /tmp/fleet-dashboard-rules.json:/checks/dashboards.json:ro \
+            prom/prometheus:v3.15.0 check rules /checks/dashboards.json
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/deploy/observability:/checks:ro" \
+            prom/prometheus:v3.15.0 test rules /checks/alerts.test.yml
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/deploy/observability:/checks:ro" \
+            prom/prometheus:v3.15.0 test rules /checks/k0s-alerts.test.yml
+      - name: Validate monitoring collector configurations
+        run: |
+          docker run --rm -v "$PWD/deploy/observability/k0s:/checks:ro" \
+            grafana/alloy:v1.20.0 validate /checks/alloy-config.alloy
+          docker run --rm -v "$PWD/deploy/observability/k0s:/checks:ro" \
+            grafana/loki:3.7.8 -config.file=/checks/loki-config.yaml -verify-config=true
+      - name: Validate installer syntax
+        run: bash -n deploy/observability/install-k0s.sh
+
   rust:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -132,7 +158,13 @@ jobs:
           terraform -chdir=network test
       - name: Validate shell scripts
         working-directory: .
-        run: find deploy demo -type f -name '*.sh' -exec sh -n {} +
+        run: |
+          while IFS= read -r -d '' script; do
+            case "$(head -n 1 "$script")" in
+              *bash*) bash -n "$script" ;;
+              *) sh -n "$script" ;;
+            esac
+          done < <(find deploy demo -type f -name '*.sh' -print0)
       - name: Render the LocalStack Compose contract
         working-directory: .
         env:

@@ -50,6 +50,7 @@ use std::sync::Arc;
 
 use ostk_recall_core::ChunkEmbedder;
 use sqlx::PgPool;
+use tracing::Instrument as _;
 
 use crate::config::WriterAuthorityConfig;
 use crate::context::FleetScope;
@@ -135,6 +136,24 @@ const ONCE_REQUIRED: &str = "the worker runs exactly one tick per invocation and
 /// returns; the writer authority's refusal of the active head; and a failure
 /// to write the report.
 pub async fn run_command<Connect, Connecting>(
+    command: &WorkerCommandV1,
+    process: WorkerProcessV1<'_>,
+    connect: Connect,
+    out: &mut (impl Write + Send),
+) -> Result<WorkerTickReportV1>
+where
+    Connect: FnOnce() -> Connecting + Send,
+    Connecting: Future<Output = Result<(PgPool, DatabaseCapabilities)>> + Send,
+{
+    let operation = crate::telemetry::start("worker", "command");
+    let result = run_command_inner(command, process, connect, out)
+        .instrument(operation.span())
+        .await;
+    operation.finish(super::telemetry::command_outcome(&result));
+    result
+}
+
+async fn run_command_inner<Connect, Connecting>(
     command: &WorkerCommandV1,
     process: WorkerProcessV1<'_>,
     connect: Connect,

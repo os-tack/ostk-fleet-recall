@@ -18,6 +18,7 @@ use crate::private_postgres::{
     WRITER_POSTGRES_USER, ingress_postgres_connect_options, migrator_postgres_connect_options,
     publication_postgres_connect_options, writer_postgres_connect_options,
 };
+use crate::telemetry::{self, Outcome};
 use crate::{FleetError, FleetScope, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -31,6 +32,7 @@ use serde_json::Value;
 use sqlx::migrate::{Migrate, MigrateError, Migration, MigrationType, Migrator};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions, PgRow};
 use sqlx::{ConnectOptions, PgPool, Postgres, Row, Transaction};
+use tracing::Instrument as _;
 
 /// Embedding width used by Recall's `minishlab/potion-retrieval-32M` model.
 pub const EMBEDDING_DIMENSION: usize = 512;
@@ -1735,26 +1737,37 @@ impl CockroachStore {
     /// Lightweight liveness/readiness check that also verifies the scoped
     /// corpus table is present.
     pub async fn health_check(&self) -> Result<()> {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM memory_chunks WHERE tenant_id = $1 AND project = $2 LIMIT 1)",
-        )
-        .bind(self.scope.tenant_id)
-        .bind(&self.scope.project)
-        .fetch_one(&self.pool)
-        .await?;
-        let capabilities = self.capabilities().await?;
-        if !capabilities.supports_schema_version(MINIMUM_RECALL_SCHEMA_VERSION)
-            || !capabilities.vector_index_enabled
-            || !capabilities.lexical_index_enabled
-            || !capabilities.conflict_membership_index_enabled
-            || !capabilities.claim_support_chunk_index_enabled
-            || !capabilities.cosine_distance_supported
-        {
-            return Err(FleetError::Configuration(
-                "CockroachDB schema is incomplete; run the single-migrator deployment job".into(),
-            ));
+        let observation = telemetry::start("database", "health_check");
+        let result = async {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM memory_chunks WHERE tenant_id = $1 AND project = $2 LIMIT 1)",
+            )
+            .bind(self.scope.tenant_id)
+            .bind(&self.scope.project)
+            .fetch_one(&self.pool)
+            .await?;
+            let capabilities = self.capabilities().await?;
+            if !capabilities.supports_schema_version(MINIMUM_RECALL_SCHEMA_VERSION)
+                || !capabilities.vector_index_enabled
+                || !capabilities.lexical_index_enabled
+                || !capabilities.conflict_membership_index_enabled
+                || !capabilities.claim_support_chunk_index_enabled
+                || !capabilities.cosine_distance_supported
+            {
+                return Err(FleetError::Configuration(
+                    "CockroachDB schema is incomplete; run the single-migrator deployment job".into(),
+                ));
+            }
+            Ok(())
         }
-        Ok(())
+        .instrument(observation.span())
+        .await;
+        observation.finish(if result.is_ok() {
+            Outcome::Success
+        } else {
+            Outcome::Error
+        });
+        result
     }
 
     /// Idempotently insert or replace a chunk at its stable Recall ID.
@@ -2627,31 +2640,84 @@ where
         &'transaction mut Transaction<'_, Postgres>,
     ) -> BoxFuture<'transaction, Result<T>>,
 {
-    policy.validate()?;
-    let mut attempt = 0_u32;
-    loop {
-        attempt += 1;
-        let mut transaction = pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-            .execute(&mut *transaction)
-            .await?;
-        let outcome = operation(&mut transaction).await;
-        match outcome {
-            Ok(value) => match transaction.commit().await {
-                Ok(()) => return Ok(value),
-                Err(error) if is_retryable(&error) && attempt < policy.max_attempts => {
+    let observation = telemetry::start("database", "serializable_transaction");
+    for unit in [
+        "attempts",
+        "retries_body",
+        "retries_commit",
+        "retries_exhausted",
+    ] {
+        telemetry::add_units("database", "serializable_transaction", unit, 0);
+    }
+    if let Err(error) = policy.validate() {
+        observation.finish(Outcome::Invalid);
+        return Err(error);
+    }
+    // Observe the whole logical operation, including connection acquisition
+    // and transaction setup; neither early database errors nor cancellation
+    // should leave a transaction looking successful or permanently in flight.
+    let result = async {
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
+            telemetry::add_units("database", "serializable_transaction", "attempts", 1);
+            let mut transaction = pool.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                .execute(&mut *transaction)
+                .await?;
+            let outcome = operation(&mut transaction).await;
+            match outcome {
+                Ok(value) => match transaction.commit().await {
+                    Ok(()) => return Ok(value),
+                    Err(error) if is_retryable(&error) && attempt < policy.max_attempts => {
+                        tokio::time::sleep(policy.delay_for_retry(attempt - 1)).await;
+                        telemetry::add_units(
+                            "database",
+                            "serializable_transaction",
+                            "retries_commit",
+                            1,
+                        );
+                    }
+                    Err(error) => {
+                        if is_retryable(&error) {
+                            telemetry::add_units(
+                                "database",
+                                "serializable_transaction",
+                                "retries_exhausted",
+                                1,
+                            );
+                        }
+                        return Err(error.into());
+                    }
+                },
+                Err(error) if is_retryable_fleet_error(&error) && attempt < policy.max_attempts => {
+                    // Dropping rolls the aborted transaction back before retrying.
+                    drop(transaction);
                     tokio::time::sleep(policy.delay_for_retry(attempt - 1)).await;
+                    telemetry::add_units("database", "serializable_transaction", "retries_body", 1);
                 }
-                Err(error) => return Err(error.into()),
-            },
-            Err(error) if is_retryable_fleet_error(&error) && attempt < policy.max_attempts => {
-                // Dropping rolls the aborted transaction back before retrying.
-                drop(transaction);
-                tokio::time::sleep(policy.delay_for_retry(attempt - 1)).await;
+                Err(error) => {
+                    if is_retryable_fleet_error(&error) {
+                        telemetry::add_units(
+                            "database",
+                            "serializable_transaction",
+                            "retries_exhausted",
+                            1,
+                        );
+                    }
+                    return Err(error);
+                }
             }
-            Err(error) => return Err(error),
         }
     }
+    .instrument(observation.span())
+    .await;
+    observation.finish(if result.is_ok() {
+        Outcome::Success
+    } else {
+        Outcome::Error
+    });
+    result
 }
 
 #[cfg(test)]
@@ -2659,6 +2725,7 @@ mod tests {
     use super::*;
     use ostk_recall_core::{ChunkEmbedder, PrivacyTier, RecallParams};
     use sha2::{Digest, Sha256};
+    use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     static LIVE_DATABASE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2853,6 +2920,96 @@ mod tests {
         assert!(!is_retryable_sqlstate(Some("40P01")));
         assert!(!is_retryable_sqlstate(Some("08006")));
         assert!(!is_retryable_sqlstate(None));
+    }
+
+    #[derive(Clone, Default)]
+    struct TelemetryLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TelemetryLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn telemetry_records_early_database_failures_without_connection_or_scope_details() {
+        crate::telemetry::prepare_test_capture();
+        let log = TelemetryLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        // No socket is opened: a closed lazy pool fails at begin(), before
+        // transaction setup or the supplied closure can run.
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://private-user:private-password@127.0.0.1/private-database")
+            .unwrap();
+        pool.close().await;
+        let failure = with_serializable_retry::<(), _>(&pool, RetryPolicy::default(), |_| {
+            panic!("a closed pool must not execute the transaction body")
+        })
+        .await;
+        assert!(matches!(
+            failure,
+            Err(FleetError::Database(sqlx::Error::PoolClosed))
+        ));
+
+        let failure = with_serializable_retry::<(), _>(
+            &pool,
+            RetryPolicy {
+                max_attempts: 0,
+                ..RetryPolicy::default()
+            },
+            |_| panic!("an invalid policy must not execute the transaction body"),
+        )
+        .await;
+        assert!(matches!(failure, Err(FleetError::Configuration(_))));
+
+        let store = CockroachStore::from_pool(pool, scope("private-project")).unwrap();
+        assert!(matches!(
+            store.health_check().await,
+            Err(FleetError::Database(sqlx::Error::PoolClosed))
+        ));
+
+        let encoded = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        for private in [
+            "private-",
+            "127.0.0.1",
+            "postgresql://",
+            "SELECT",
+            "pool closed",
+        ] {
+            assert!(!encoded.contains(private), "telemetry leaked {private}");
+        }
+        let completions: Vec<_> = encoded
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["fields"]["event"] == "operation.completed")
+            .map(|event| {
+                assert_eq!(event["fields"]["component"], "database");
+                (
+                    event["fields"]["operation"].as_str().unwrap().to_owned(),
+                    event["fields"]["outcome"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            completions,
+            [
+                ("serializable_transaction", "error"),
+                ("serializable_transaction", "invalid"),
+                ("health_check", "error"),
+            ]
+            .map(|(operation, outcome)| (operation.to_owned(), outcome.to_owned()))
+        );
     }
 
     #[test]

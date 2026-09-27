@@ -160,7 +160,7 @@ pub fn router(mut config: HttpConfig, backend: Arc<dyn HttpBackend>) -> Result<R
         config,
         backend,
     };
-    Ok(Router::new()
+    let router = Router::new()
         .route(
             "/mcp",
             post(mcp).get(mcp_unsupported).delete(mcp_unsupported),
@@ -176,7 +176,10 @@ pub fn router(mut config: HttpConfig, backend: Arc<dyn HttpBackend>) -> Result<R
         )
         .route("/healthz", get(health))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
-        .with_state(state))
+        .with_state(state);
+    // Observe outside the origin/concurrency guard and authentication paths,
+    // including requests rejected before a scoped MCP dispatch can begin.
+    Ok(crate::telemetry::http::instrument(router, "http_mcp"))
 }
 
 #[derive(serde::Deserialize)]

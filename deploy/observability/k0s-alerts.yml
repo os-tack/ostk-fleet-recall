@@ -1,0 +1,101 @@
+# Local k0s evaluation only. No Alertmanager or paging route is configured.
+# Change BOTH fixed scope labels when adapting this pack to another cluster.
+groups:
+  - name: fleet-k0s-infrastructure
+    rules:
+      - alert: FleetK0sMetricsUnavailable
+        expr: |
+          (up{cluster="k0s", deployment="local-k0s", job=~"kubernetes-nodes|kubernetes-cadvisor|kube-state-metrics|node-exporter|kubernetes-apiserver|prometheus|loki|alloy|grafana"} == 0)
+          or absent(up{cluster="k0s", deployment="local-k0s", job="kubernetes-nodes"})
+          or absent(up{cluster="k0s", deployment="local-k0s", job="kubernetes-cadvisor"})
+          or absent(up{cluster="k0s", deployment="local-k0s", job="kube-state-metrics"})
+          or absent(up{cluster="k0s", deployment="local-k0s", job="node-exporter"})
+          or absent(up{cluster="k0s", deployment="local-k0s", job="kubernetes-apiserver"})
+          or absent(up{cluster="k0s", deployment="local-k0s", job="prometheus"})
+          or absent(up{cluster="k0s", deployment="local-k0s", job="loki"})
+          or absent(up{cluster="k0s", deployment="local-k0s", job="alloy"})
+          or absent(up{cluster="k0s", deployment="local-k0s", job="grafana"})
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Required k0s metrics job unavailable: {{ $labels.job }}"
+          description: "A target is down or this expected job has no discovered targets. Check discovery, credentials, TLS, and exporter health; missing telemetry is not healthy zero."
+
+      - alert: FleetK0sNodeNotReady
+        expr: kube_node_status_condition{job="kube-state-metrics", cluster="k0s", deployment="local-k0s", condition="Ready", status="true"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "k0s node {{ $labels.node }} is not Ready"
+          description: "Inspect node conditions, kubelet health, and the Kubernetes dashboard. If state metrics are absent, inspect scrape availability and metric coverage instead of assuming readiness."
+
+      - alert: FleetK0sNodePressure
+        expr: kube_node_status_condition{job="kube-state-metrics", cluster="k0s", deployment="local-k0s", condition=~"MemoryPressure|DiskPressure|PIDPressure|NetworkUnavailable", status="true"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "k0s node {{ $labels.node }} reports {{ $labels.condition }}"
+          description: "Inspect node capacity and affected workloads before increasing container budgets or restarting workloads."
+
+      - alert: FleetK0sFilesystemLowAvailable
+        expr: |
+          (
+            node_filesystem_avail_bytes{job="node-exporter", cluster="k0s", deployment="local-k0s", fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup.*", mountpoint!~"/var/lib/kubelet/pods/.+"}
+            /
+            node_filesystem_size_bytes{job="node-exporter", cluster="k0s", deployment="local-k0s", fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup.*", mountpoint!~"/var/lib/kubelet/pods/.+"}
+          ) < 0.10
+          and
+          node_filesystem_readonly{job="node-exporter", cluster="k0s", deployment="local-k0s", fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup.*", mountpoint!~"/var/lib/kubelet/pods/.+"} == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "k0s filesystem {{ $labels.node }}:{{ $labels.mountpoint }} has under 10% available"
+          description: "Check persistent storage, image/cache growth, and metrics/log retention. Virtual, pod-local, and read-only mounts are excluded; bind mounts must not be summed as separate capacity."
+
+  - name: fleet-k0s-workloads
+    rules:
+      - alert: FleetK0sContainerCrashLoop
+        expr: kube_pod_container_status_waiting_reason{job="kube-state-metrics", cluster="k0s", deployment="local-k0s", reason="CrashLoopBackOff"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.namespace }}/{{ $labels.pod }}:{{ $labels.container }} is crash looping"
+          description: "Open pod logs and Kubernetes Events; inspect configuration, startup failures, and resource pressure."
+
+      # A retained OOM reason alone is historical evidence, not a new event.
+      # Require a restart increase AND a recent timestamp for the same pod UID.
+      - alert: FleetK0sContainerRecentOomRestart
+        expr: |
+          (increase(kube_pod_container_status_restarts_total{job="kube-state-metrics", cluster="k0s", deployment="local-k0s"}[10m]) > 0)
+          and on (cluster, deployment, namespace, pod, container, uid)
+          (kube_pod_container_status_last_terminated_reason{job="kube-state-metrics", cluster="k0s", deployment="local-k0s", reason="OOMKilled"} == 1)
+          and on (cluster, deployment, namespace, pod, container, uid)
+          (kube_pod_container_status_last_terminated_timestamp{job="kube-state-metrics", cluster="k0s", deployment="local-k0s"} > time() - 600)
+        labels:
+          severity: warning
+        annotations:
+          summary: "Recent OOM restart in {{ $labels.namespace }}/{{ $labels.pod }}:{{ $labels.container }}"
+          description: "A restart increase and a recent OOM termination agree for this pod UID. Compare working set, explicit memory limit, and pod logs. Missing termination timestamp metrics do not assert an OOM restart."
+
+      # New CronJobs get a 15-minute initial grace. Active executions are
+      # excluded, avoiding false lateness for concurrencyPolicy=Forbid.
+      - alert: FleetK0sCronJobScheduleDelayed
+        expr: |
+          (time() - kube_cronjob_next_schedule_time{job="kube-state-metrics", cluster="k0s", deployment="local-k0s"} > 600)
+          and on (cluster, deployment, namespace, cronjob)
+          (kube_cronjob_spec_suspend{job="kube-state-metrics", cluster="k0s", deployment="local-k0s"} == 0)
+          and on (cluster, deployment, namespace, cronjob)
+          (kube_cronjob_status_active{job="kube-state-metrics", cluster="k0s", deployment="local-k0s"} == 0)
+          and on (cluster, deployment, namespace, cronjob)
+          (time() - kube_cronjob_created{job="kube-state-metrics", cluster="k0s", deployment="local-k0s"} > 900)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CronJob {{ $labels.namespace }}/{{ $labels.cronjob }} is overdue"
+          description: "An unsuspended, inactive CronJob older than 15 minutes is more than 10 minutes past its next schedule for 5 minutes. Inspect scheduler Events and deadlines. This does not assess success of previous executions."

@@ -48,6 +48,7 @@ use ostk_fleet_recall::store::cockroach::{
     PoolConfig, RetryPolicy, ScopedChunk, active_embedding_model, probe_claim_item_links,
     probe_conflict_lifecycle,
 };
+use ostk_fleet_recall::telemetry::{self, Outcome};
 use ostk_fleet_recall::worker::{
     GhCliProviderFactory, WorkerCommandV1, WorkerProcessV1, WorkerSourcesV1,
 };
@@ -59,6 +60,7 @@ use ostk_recall_core::{
 use ostk_recall_embed::Embedder;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use tracing::Instrument as _;
 
 const DEFAULT_SOURCE_CONFIG_ID: &str = "fleet:ndjson:v1";
 const EMBED_BATCH_SIZE: usize = 64;
@@ -144,7 +146,11 @@ impl ChunkEmbedder for PinnedEmbedder {
     }
 
     fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
-        self.inner.encode_batch(texts)
+        let operation = telemetry::start("embedding", "local_batch");
+        let vectors = self.inner.encode_batch(texts);
+        telemetry::add_units("embedding", "local_batch", "texts", texts.len() as u64);
+        operation.finish(Outcome::Success);
+        vectors
     }
 }
 
@@ -447,6 +453,25 @@ enum RuntimeDatabaseIdentity {
 }
 
 impl Command {
+    const fn telemetry_name(&self) -> &'static str {
+        match self {
+            Self::Embed { .. } => "embed",
+            Self::Shim { .. } => "shim",
+            Self::Ship { .. } => "ship",
+            Self::Launch { .. } => "launch",
+            Self::Serve { .. } => "serve",
+            Self::Enroll { .. } => "enroll",
+            Self::Demo { .. } => "demo",
+            Self::Ingress { .. } => "ingress",
+            Self::Migrate => "migrate",
+            Self::ModelDigest { .. } => "model_digest",
+            Self::Health => "health",
+            Self::Ingest { .. } => "ingest",
+            Self::Worker { .. } => "worker",
+            Self::Collect { .. } => "collect",
+        }
+    }
+
     const fn runtime_database_identity(&self) -> RuntimeDatabaseIdentity {
         match self {
             Self::Demo { .. } => RuntimeDatabaseIdentity::Publication,
@@ -567,15 +592,45 @@ async fn run_without_database(command: Command) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ostk_fleet_recall=info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+    telemetry::runtime::init_logging()?;
+    let operation = telemetry::start("process", cli.command.telemetry_name());
+    tracing::info!(parent: &operation.span(), event = "process.started", event_version = 1_u64, version = env!("CARGO_PKG_VERSION"), "fleet recall starting");
+    let runtime = match async {
+        telemetry::runtime::Runtime::start(telemetry::runtime::Config::from_env()?).await
+    }
+    .instrument(operation.span())
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            operation.finish(Outcome::Error);
+            return Err(error);
+        }
+    };
+    let result = run(cli).instrument(operation.span()).await;
+    operation.finish(
+        if result.as_ref().is_ok_and(|code| *code == ExitCode::SUCCESS) {
+            Outcome::Success
+        } else {
+            Outcome::Error
+        },
+    );
+    let exported = runtime.finish().await;
+    if exported.is_err() {
+        tracing::error!(
+            event = "telemetry.export.failed",
+            event_version = 1_u64,
+            "could not finalize telemetry"
+        );
+    }
+    // Preserve the command error if both the command and telemetry failed.
+    let exit = result?;
+    exported?;
+    Ok(exit)
+}
+
+async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command.runtime_database_identity() {
         RuntimeDatabaseIdentity::None => run_without_database(cli.command).await?,
         RuntimeDatabaseIdentity::Publication => {
@@ -841,7 +896,10 @@ async fn run_ingress(
         instances = ?instances.ids().collect::<Vec<_>>(),
         "the ingress is receiving webhooks"
     );
-    let router = ingress_router(store, instances, system_clock(), config.max_body_bytes());
+    let router = telemetry::http::instrument(
+        ingress_router(store, instances, system_clock(), config.max_body_bytes()),
+        "http_ingress",
+    );
     serve_ingress(listener, router, shutdown_signal()).await?;
     Ok(())
 }
@@ -1569,12 +1627,15 @@ fn demo_router(state: DemoState) -> Router {
         )
         .fallback(demo_api_not_found)
         .method_not_allowed_fallback(demo_api_method_not_allowed);
-    Router::new()
-        .route("/", get(demo_index))
-        .route("/healthz", get(demo_health))
-        .nest("/api", api)
-        .layer(DefaultBodyLimit::max(MAX_DEMO_BODY_BYTES))
-        .with_state(state)
+    telemetry::http::instrument(
+        Router::new()
+            .route("/", get(demo_index))
+            .route("/healthz", get(demo_health))
+            .nest("/api", api)
+            .layer(DefaultBodyLimit::max(MAX_DEMO_BODY_BYTES))
+            .with_state(state),
+        "http_demo",
+    )
 }
 
 async fn shutdown_signal() {
@@ -2541,6 +2602,27 @@ mod tests {
                     .runtime_database_identity(),
                 RuntimeDatabaseIdentity::None
             );
+        }
+    }
+
+    #[test]
+    fn remote_command_telemetry_names_exclude_addresses_and_identity_inputs() {
+        for (args, expected) in [
+            (vec!["serve"], "serve"),
+            (vec!["serve", "--http", "127.0.0.1:8080"], "serve"),
+            (vec!["enroll", "list"], "enroll"),
+            (
+                vec!["enroll", "apply", "--file", "/private/principals.json"],
+                "enroll",
+            ),
+            (
+                vec!["enroll", "revoke", "11111111-1111-4111-8111-111111111111"],
+                "enroll",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("ostk-fleet-recall").chain(args))
+                .expect("valid remote command");
+            assert_eq!(cli.command.telemetry_name(), expected);
         }
     }
 

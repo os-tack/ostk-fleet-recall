@@ -1,0 +1,2370 @@
+{
+  "id": null,
+  "uid": "fleet-workers",
+  "title": "Fleet Recall / Workers",
+  "description": "Scheduled worker operations from atomic Prometheus textfile snapshots. Separates collector reachability, snapshot freshness, and the latest worker result; all counters are interpreted per invocation.",
+  "tags": [
+    "fleet-recall"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "15s",
+      "30s",
+      "1m",
+      "5m",
+      "15m"
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Overview",
+      "type": "link",
+      "url": "/d/fleet-overview",
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Open Overview with current filters and time range"
+    },
+    {
+      "title": "MCP and HTTP",
+      "type": "link",
+      "url": "/d/fleet-mcp",
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Open MCP and HTTP with current filters and time range"
+    },
+    {
+      "title": "Dependencies",
+      "type": "link",
+      "url": "/d/fleet-dependencies",
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Open Dependencies with current filters and time range"
+    },
+    {
+      "title": "Kubernetes",
+      "type": "link",
+      "url": "/d/fleet-kubernetes",
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Open Kubernetes with current filters and time range"
+    },
+    {
+      "title": "Logs",
+      "type": "link",
+      "url": "/d/fleet-logs",
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Open Logs with current filters and time range"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "prometheus",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "selected": true,
+          "text": "Prometheus",
+          "value": "fleet-prometheus"
+        },
+        "options": [],
+        "refresh": 1,
+        "hide": 0,
+        "skipUrlSync": false
+      },
+      {
+        "name": "deployment",
+        "label": "Deployment",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus}"
+        },
+        "definition": "label_values(up{job=\"fleet-worker-textfile\"}, deployment)",
+        "query": {
+          "query": "label_values(up{job=\"fleet-worker-textfile\"}, deployment)",
+          "refId": "StandardVariableQuery"
+        },
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "hide": 0,
+        "skipUrlSync": false
+      },
+      {
+        "name": "worker_instance",
+        "label": "Worker collector",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus}"
+        },
+        "definition": "label_values(up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\"}, instance)",
+        "query": {
+          "query": "label_values(up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\"}, instance)",
+          "refId": "StandardVariableQuery"
+        },
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "hide": 0,
+        "skipUrlSync": false
+      },
+      {
+        "name": "snapshot_max_age",
+        "label": "Freshness budget (seconds)",
+        "description": "Numeric seconds: schedule interval plus maximum acceptable run time and collection delay.",
+        "type": "textbox",
+        "query": "900",
+        "current": {
+          "selected": true,
+          "text": "900",
+          "value": "900"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "900",
+            "value": "900"
+          }
+        ],
+        "hide": 0,
+        "skipUrlSync": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "Scheduled work \u00b7 health, progress, and failure context",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Read the latest published invocation.** Collector availability, snapshot freshness, and worker success answer different questions. A fresh file may describe a failed run; a reachable collector may expose an old file.\n\nEvery work count below belongs to the **last published run**, even though the metric is named `_total`. History repeats the most recently observed snapshot between runs; it is not a count of invocations. The freshness budget is **${snapshot_max_age}s**. Unknown stays unknown."
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Collectors reachable",
+      "description": "Availability of selected node-exporter endpoints, not worker success. No discovered targets produces Unknown.",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 99
+              },
+              {
+                "color": "green",
+                "value": 100
+              }
+            ]
+          },
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "100 * sum(max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"})) / count(max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}))",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{deployment}} / {{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Fresh snapshots",
+      "description": "Count of reachable collectors with snapshot age within the selected budget. Fresh does not imply success.",
+      "gridPos": {
+        "x": 4,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1000000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum(((((time() - max by (deployment,instance) (fleet_recall_snapshot_time_seconds{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) > bool ${snapshot_max_age:raw}) and on (deployment,instance) (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1)) or on (deployment,instance) (0 * (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1) + 2) or on (deployment,instance) (0 * (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 0) + 3)) == 0) * 0 + 1) or sum(0 * max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}))",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{deployment}} / {{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Stale snapshots",
+      "description": "Reachable collectors whose snapshot age exceeds the budget. Inspect scheduling and export failures.",
+      "gridPos": {
+        "x": 8,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum(((((time() - max by (deployment,instance) (fleet_recall_snapshot_time_seconds{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) > bool ${snapshot_max_age:raw}) and on (deployment,instance) (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1)) or on (deployment,instance) (0 * (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1) + 2) or on (deployment,instance) (0 * (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 0) + 3)) == 1) * 0 + 1) or sum(0 * max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}))",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{deployment}} / {{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Missing snapshots",
+      "description": "Reachable collectors with no Fleet snapshot. A down collector is tracked separately and remains unknown.",
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum(((((time() - max by (deployment,instance) (fleet_recall_snapshot_time_seconds{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) > bool ${snapshot_max_age:raw}) and on (deployment,instance) (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1)) or on (deployment,instance) (0 * (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1) + 2) or on (deployment,instance) (0 * (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 0) + 3)) == 2) * 0 + 1) or sum(0 * max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}))",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{deployment}} / {{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Failed latest runs",
+      "description": "Count of failed latest process/worker observations among reachable collectors. No known run outcomes yields Unknown, not zero.",
+      "gridPos": {
+        "x": 16,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum(((max by (deployment,instance) (fleet_recall_operations_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"process\",operation=\"worker\",outcome=\"error\"} or (0 * fleet_recall_operations_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"process\",operation=\"worker\",outcome=\"success\"}))) and on (deployment,instance) (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1)) > bool 0)",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{deployment}} / {{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Unknown latest runs",
+      "description": "Selected collectors that are down or have no terminal process/worker outcome. Includes snapshots written by another command.",
+      "gridPos": {
+        "x": 20,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum(((((max by (deployment,instance) (fleet_recall_operations_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"process\",operation=\"worker\",outcome=\"error\"} or (0 * fleet_recall_operations_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"process\",operation=\"worker\",outcome=\"success\"}))) and on (deployment,instance) (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1)) or on (deployment,instance) (0 * max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) + 2)) == 2) * 0 + 1) or sum(0 * max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}))",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{deployment}} / {{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "01 \u00b7 Collector freshness and run outcome",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 24,
+        "h": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "pluginVersion": "10.4.0",
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Snapshot state by instance",
+      "description": "Fresh/stale use the snapshot timestamp and budget. Missing requires an up collector with no snapshot; down collectors remain distinct.",
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Fresh",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "Stale",
+                  "color": "orange"
+                },
+                "2": {
+                  "text": "Missing",
+                  "color": "red"
+                },
+                "3": {
+                  "text": "Collector down",
+                  "color": "#8e8e8e"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Snapshot state"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Instance",
+            "desc": false
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "((time() - max by (deployment,instance) (fleet_recall_snapshot_time_seconds{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) > bool ${snapshot_max_age:raw}) and on (deployment,instance) (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1)) or on (deployment,instance) (0 * (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1) + 2) or on (deployment,instance) (0 * (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 0) + 3)",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{deployment}} / {{instance}}",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true
+            },
+            "indexByName": {
+              "deployment": 0,
+              "instance": 1,
+              "operation": 2,
+              "unit": 3,
+              "outcome": 4,
+              "Value": 5
+            },
+            "renameByName": {
+              "deployment": "Deployment",
+              "instance": "Instance",
+              "operation": "Operation",
+              "unit": "Measure",
+              "outcome": "Outcome",
+              "Value": "Snapshot state"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Latest worker outcome by instance",
+      "description": "Derived directly from process/worker success or error, preserving deployment labels. Unknown is explicit for missing terminal worker observations and collector outages. A succeeded run may still be stale: compare the snapshot state.",
+      "gridPos": {
+        "x": 8,
+        "y": 9,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Succeeded",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "Failed",
+                  "color": "red"
+                },
+                "2": {
+                  "text": "Unknown",
+                  "color": "#8e8e8e"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Latest run"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Instance",
+            "desc": false
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "((max by (deployment,instance) (fleet_recall_operations_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"process\",operation=\"worker\",outcome=\"error\"} or (0 * fleet_recall_operations_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"process\",operation=\"worker\",outcome=\"success\"}))) and on (deployment,instance) (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1)) or on (deployment,instance) (0 * max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) + 2)",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{deployment}} / {{instance}}",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true
+            },
+            "indexByName": {
+              "deployment": 0,
+              "instance": 1,
+              "operation": 2,
+              "unit": 3,
+              "outcome": 4,
+              "Value": 5
+            },
+            "renameByName": {
+              "deployment": "Deployment",
+              "instance": "Instance",
+              "operation": "Operation",
+              "unit": "Measure",
+              "outcome": "Outcome",
+              "Value": "Latest run"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Snapshot age",
+      "description": "Age since atomic snapshot publication. Clock skew may produce negative age. Budget line is shown only when a snapshot exists.",
+      "gridPos": {
+        "x": 16,
+        "y": 9,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "barAlignment": 0,
+            "lineWidth": 2,
+            "fillOpacity": 9,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 4,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Freshness budget"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    6,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "time() - max by (deployment,instance) (fleet_recall_snapshot_time_seconds{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"})",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{deployment}} / {{instance}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "max(0 * max by (deployment,instance) (fleet_recall_snapshot_time_seconds{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"})) + ${snapshot_max_age:raw}",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "legendFormat": "Freshness budget",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "state-timeline",
+      "title": "Snapshot state history",
+      "description": "Collector state and snapshot age at each query step. This makes a stale successful run and an unreachable collector visibly different. Missing intervals are not connected.",
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Fresh",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "Stale",
+                  "color": "orange"
+                },
+                "2": {
+                  "text": "Missing",
+                  "color": "red"
+                },
+                "3": {
+                  "text": "Collector down",
+                  "color": "#8e8e8e"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 90,
+            "spanNulls": false,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.8,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "((time() - max by (deployment,instance) (fleet_recall_snapshot_time_seconds{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) > bool ${snapshot_max_age:raw}) and on (deployment,instance) (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1)) or on (deployment,instance) (0 * (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1) + 2) or on (deployment,instance) (0 * (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 0) + 3)",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{deployment}} / {{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "state-timeline",
+      "title": "Latest-run outcome history",
+      "description": "The last observed run state persists until a new snapshot is published. This is an observation timeline, not an event log, run counter, or duration of the worker process.",
+      "gridPos": {
+        "x": 12,
+        "y": 17,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Succeeded",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "Failed",
+                  "color": "red"
+                },
+                "2": {
+                  "text": "Unknown",
+                  "color": "#8e8e8e"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 90,
+            "spanNulls": false,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.8,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "((max by (deployment,instance) (fleet_recall_operations_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"process\",operation=\"worker\",outcome=\"error\"} or (0 * fleet_recall_operations_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"process\",operation=\"worker\",outcome=\"success\"}))) and on (deployment,instance) (max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) == 1)) or on (deployment,instance) (0 * max by (deployment,instance) (up{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\"}) + 2)",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{deployment}} / {{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "02 \u00b7 Where the latest invocation spent time",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 24,
+        "h": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "pluginVersion": "10.4.0",
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 15,
+      "type": "bargauge",
+      "title": "Step duration \u00b7 latest run",
+      "description": "Direct histogram sum/count within one process, by step and instance. Normally one completed execution per selected step. Unselected/skipped steps are excluded; failures still contribute elapsed time.",
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 16,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (deployment,instance,operation) (fleet_recall_operation_duration_seconds_sum{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker_step\",operation=~\"transcript|git|ci|collect|bodies|lexical|dense\"}) / sum by (deployment,instance,operation) (fleet_recall_operation_duration_seconds_count{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker_step\",operation=~\"transcript|git|ci|collect|bodies|lexical|dense\"}) and on (deployment,instance,operation) (sum by (deployment,instance,operation) (fleet_recall_operations_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker_step\",outcome!=\"skipped\"}) > 0)",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{deployment}} / {{instance}} \u00b7 {{operation}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Command and tick duration \u00b7 observed snapshots",
+      "description": "Per-invocation mean duration from direct histogram sum/count. Command includes configuration and report writing; tick covers the work. Nested durations must not be added together.",
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "barAlignment": 0,
+            "lineWidth": 2,
+            "fillOpacity": 9,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 4,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (deployment,instance,operation) (fleet_recall_operation_duration_seconds_sum{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker\",operation=~\"command|tick\"}) / sum by (deployment,instance,operation) (fleet_recall_operation_duration_seconds_count{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker\",operation=~\"command|tick\"})",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} \u00b7 {{operation}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "row",
+      "title": "03 \u00b7 Work in the last published invocation",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 24,
+        "h": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "pluginVersion": "10.4.0",
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 18,
+      "type": "bargauge",
+      "title": "Admitted and replayed events",
+      "description": "Each bar is a step counter in the latest snapshot. Appended and replayed are separate categories; source-level counts are deliberately excluded to avoid double counting.",
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 16,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (deployment,instance,operation,unit) (fleet_recall_units_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker_step\",unit=~\"appended|replayed\"})",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{instance}} \u00b7 {{operation}} \u00b7 {{unit}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "bargauge",
+      "title": "Admission work requiring attention",
+      "description": "Separate counts for quarantined, dead-lettered, held, and retry-exhausted work in the latest step report. Categories can describe different handling stages; do not sum them into a failure total.",
+      "gridPos": {
+        "x": 12,
+        "y": 35,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 16,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (deployment,instance,operation,unit) (fleet_recall_units_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker_step\",unit=~\"quarantined|dead_lettered|held|retry_exhausted\"})",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{instance}} \u00b7 {{operation}} \u00b7 {{unit}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "bargauge",
+      "title": "Evidence events projected",
+      "description": "Body-plane event counts from the latest invocation. Unprojectable occurrences can be expected for occurrence-form observer records; consult the worker report before treating them as errors.",
+      "gridPos": {
+        "x": 0,
+        "y": 43,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 16,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (deployment,instance,operation,unit) (fleet_recall_units_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker_step\",unit=~\"events_projected|events_unprojectable|events_superseded_erased\"})",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{instance}} \u00b7 {{operation}} \u00b7 {{unit}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "bargauge",
+      "title": "Recall index rows",
+      "description": "Rows processed by lexical and dense steps in the latest invocation. Reprojected rows can overlap rows indexed, so these are separate measures, not additive categories.",
+      "gridPos": {
+        "x": 8,
+        "y": 43,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 16,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (deployment,instance,operation,unit) (fleet_recall_units_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker_step\",unit=~\"rows_indexed|rows_unindexable|rows_reprojected\"})",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{instance}} \u00b7 {{operation}} \u00b7 {{unit}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "bargauge",
+      "title": "Transcript bytes consumed",
+      "description": "Bytes read by the transcript step in the latest invocation. Kept separate from item/event counters. No series means no reported byte counter, not proof of zero activity.",
+      "gridPos": {
+        "x": 16,
+        "y": 43,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 16,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (deployment,instance,operation,unit) (fleet_recall_units_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker_step\",unit=~\"bytes_consumed\"})",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{deployment}} / {{instance}} \u00b7 {{operation}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "row",
+      "title": "04 \u00b7 Source outcomes, retry pressure, and details",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 51,
+        "w": 24,
+        "h": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "pluginVersion": "10.4.0",
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 24,
+      "type": "bargauge",
+      "title": "Sources checked \u00b7 latest outcome",
+      "description": "Per-source outcomes aggregated by the four code-owned source kinds, by instance. Counts refer to sources checked in the latest run, not source identities or the number of accepted events.",
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 16,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (deployment,instance,operation,unit) (fleet_recall_units_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker_source\",unit=~\"sources_ok|sources_unchanged|sources_failed\"})",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{instance}} \u00b7 {{operation}} \u00b7 {{unit}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "bargauge",
+      "title": "Database attempts and retries \u00b7 latest run",
+      "description": "Direct counts from the shared transaction helper in the worker process. Attempts includes the first attempt; retry counters are subsets, not additive to attempts. Missing retry series means not observed. No rate or rolling sum is applied.",
+      "gridPos": {
+        "x": 12,
+        "y": 52,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 16,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (deployment,instance,operation,unit) (fleet_recall_units_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"database\",unit=~\"attempts|retries_body|retries_commit|retries_exhausted\"})",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{deployment}} / {{instance}} \u00b7 {{unit}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "bargauge",
+      "title": "Collector items \u00b7 latest provider pass",
+      "description": "Counts from the collector provider pass, separate from the step outbox drain. Audience-refused can overlap refused; compare categories without stacking or summing them.",
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 16,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (deployment,instance,operation,unit) (fleet_recall_units_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker_source\",unit=~\"items_kept|items_refused|items_audience_refused\"})",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{instance}} \u00b7 {{operation}} \u00b7 {{unit}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "table",
+      "title": "Step completion detail",
+      "description": "One row per reported step/outcome from the latest process. Skipped is explicit. Failure details and source identities remain in the protected worker stdout report.",
+      "gridPos": {
+        "x": 12,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Instance",
+            "desc": false
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (deployment,instance,operation,outcome) (fleet_recall_operations_total{job=\"fleet-worker-textfile\",deployment=~\"$deployment\",instance=~\"$worker_instance\",component=\"worker_step\"})",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{deployment}} / {{instance}}",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true
+            },
+            "indexByName": {
+              "deployment": 0,
+              "instance": 1,
+              "operation": 2,
+              "unit": 3,
+              "outcome": 4,
+              "Value": 5
+            },
+            "renameByName": {
+              "deployment": "Deployment",
+              "instance": "Instance",
+              "operation": "Operation",
+              "unit": "Measure",
+              "outcome": "Outcome",
+              "Value": "Completions"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "text",
+      "title": "How to investigate",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 68,
+        "w": 24,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Collector down / missing snapshot:** inspect node exporter, its private scrape route, the textfile directory, file readability, and scheduler. Snapshots are written with Unix mode `0600`; use one Fleet snapshot identity per collector endpoint.\n\n**Stale snapshot:** inspect job scheduling, overlapping workers, termination, clock agreement, and `telemetry.export.failed` events. A prior healthy snapshot can survive a crashed process or failed export.\n\n**Failed run:** inspect the protected stdout tick report and `operation.completed` JSON events for the same instance/time. Read the failing step and source outcomes before retrying. Source text and identifiers never become telemetry labels.\n\n**Interpretation:** every count and duration is one latest invocation. Never sum samples over calendar time to infer annual work, never apply a counter rate to these snapshots, and never combine step totals with source totals. Missing data is not healthy zero."
+      },
+      "pluginVersion": "10.4.0"
+    }
+  ]
+}

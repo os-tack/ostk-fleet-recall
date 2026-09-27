@@ -5,17 +5,20 @@ use std::{fmt::Write as _, sync::Arc};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tracing::Instrument;
 
 use crate::context::RequestedScope;
 use crate::service::{
     FleetMemoryService, RecallAction, RecallRequest, RecallResult, Refusal, RememberAction,
     RememberRequest, RememberResult, ServiceError,
 };
+use crate::telemetry::{self, Outcome};
 use crate::{FleetScope, Result};
 
 use super::protocol::{
     Frame, JsonRpcError, JsonRpcRequest, JsonRpcResponse, MODERN_PROTOCOL_VERSION, read_frame,
 };
+use super::telemetry as mcp_telemetry;
 use super::tools::tool_list_for_surfaces;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -117,23 +120,27 @@ impl McpServer {
                 continue;
             }
             let response = if oversize {
+                telemetry::start("mcp", "frame.oversize").finish(Outcome::Invalid);
                 Some(JsonRpcResponse::error(
                     Value::Null,
                     JsonRpcError::invalid_request(format!(
                         "MCP frame exceeds {MAX_MCP_FRAME_BYTES} bytes"
                     )),
                 ))
-            } else {
-                match String::from_utf8(frame) {
-                    Ok(line) => match parse_request_line(&line) {
-                        Ok(request) => self.handle_request_with_deadline(request, deadline).await,
-                        Err(response) => Some(*response),
-                    },
-                    Err(_) => Some(JsonRpcResponse::error(
-                        Value::Null,
-                        JsonRpcError::parse("parse error: MCP frame is not valid UTF-8"),
-                    )),
+            } else if let Ok(line) = String::from_utf8(frame) {
+                match parse_request_line(&line) {
+                    Ok(request) => self.dispatch_request(request, Some(deadline)).await,
+                    Err(response) => {
+                        mcp_telemetry::record_invalid(&response);
+                        Some(*response)
+                    }
                 }
+            } else {
+                telemetry::start("mcp", "frame.invalid_utf8").finish(Outcome::Invalid);
+                Some(JsonRpcResponse::error(
+                    Value::Null,
+                    JsonRpcError::parse("parse error: MCP frame is not valid UTF-8"),
+                ))
             };
             if let Some(response) = response {
                 let encoded = encode_bounded_response(&response)?;
@@ -147,8 +154,11 @@ impl McpServer {
     /// Parse and dispatch one wire record.
     pub async fn handle_line(&self, line: &str) -> Option<JsonRpcResponse> {
         match parse_request_line(line) {
-            Ok(request) => self.dispatch_request(request).await,
-            Err(response) => Some(*response),
+            Ok(request) => self.dispatch_request(request, None).await,
+            Err(response) => {
+                mcp_telemetry::record_invalid(&response);
+                Some(*response)
+            }
         }
     }
 
@@ -156,9 +166,12 @@ impl McpServer {
     pub async fn handle_value(&self, value: Value) -> Option<JsonRpcResponse> {
         let request = match JsonRpcRequest::from_value(&value) {
             Ok(request) => request,
-            Err(response) => return Some(*response),
+            Err(response) => {
+                mcp_telemetry::record_invalid(&response);
+                return Some(*response);
+            }
         };
-        self.dispatch_request(request).await
+        self.dispatch_request(request, None).await
     }
 
     /// Dispatch one decoded request with the same timeout and response budget
@@ -169,32 +182,52 @@ impl McpServer {
         deadline: std::time::Duration,
     ) -> Option<JsonRpcResponse> {
         match JsonRpcRequest::from_value(&value) {
-            Ok(request) => self.handle_request_with_deadline(request, deadline).await,
-            Err(response) => Some(bound_response(*response)),
+            Ok(request) => self.dispatch_request(request, Some(deadline)).await,
+            Err(response) => {
+                mcp_telemetry::record_invalid(&response);
+                Some(bound_response(*response))
+            }
         }
     }
 
-    async fn handle_request_with_deadline(
+    async fn dispatch_request(
         &self,
         request: JsonRpcRequest,
-        deadline: std::time::Duration,
+        deadline: Option<std::time::Duration>,
     ) -> Option<JsonRpcResponse> {
-        let id = request.id.clone().unwrap_or(Value::Null);
-        let remember = is_remember_tool_call(&request);
-        tokio::time::timeout(deadline, self.dispatch_request(request))
-            .await
-            .unwrap_or_else(|_| Some(deadline_response(id, remember)))
-            .map(bound_response)
-    }
-
-    async fn dispatch_request(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        let operation = telemetry::start("mcp", mcp_telemetry::operation(&request));
         // MCP notifications are one-way. In particular, never execute a
         // notification-shaped tools/call: a hidden `remember` mutation would
         // have no receipt and would violate the deliberate-write boundary.
         if request.is_notification() {
+            operation.finish(Outcome::Skipped);
             return None;
         }
+        let span = operation.span();
+        let response = if let Some(deadline) = deadline {
+            let id = request.id.clone().unwrap_or(Value::Null);
+            let remember = is_remember_tool_call(&request);
+            // Keep the guard outside the timed future: a deadline has one
+            // terminal timeout, rather than a cancelled + timeout pair.
+            if let Ok(response) =
+                tokio::time::timeout(deadline, self.dispatch_inner(request).instrument(span)).await
+            {
+                response
+            } else {
+                operation.finish(Outcome::Timeout);
+                return Some(bound_response(deadline_response(id, remember)));
+            }
+        } else {
+            self.dispatch_inner(request).instrument(span).await
+        };
+        // Classify the actual bounded response, including transport-budget
+        // failures, before recording the single terminal observation.
+        let response = response.map(bound_response);
+        operation.finish(mcp_telemetry::outcome(response.as_ref()));
+        response
+    }
 
+    async fn dispatch_inner(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
         let modern = match request.validate_protocol() {
             Ok(modern) => modern,
             Err(error) => {

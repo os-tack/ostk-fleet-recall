@@ -1,0 +1,116 @@
+// Discover only explicitly authorized namespaces. API log tailing needs no
+// privileged container, node log mount, or cluster-wide pod-list permission.
+logging {
+  level  = "info"
+  format = "json"
+}
+
+discovery.kubernetes "pods" {
+  role = "pod"
+
+  namespaces {
+    names = ["fleet-recall", "ory", "localstack", "kube-system", "fleet-observability"]
+  }
+}
+
+discovery.relabel "pod_logs" {
+  targets = discovery.kubernetes.pods.targets
+
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    target_label  = "namespace"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_name"]
+    target_label  = "pod"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_container_name"]
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_node_name"]
+    target_label  = "node"
+  }
+  // Prefer the canonical application label, then app, then container name.
+  rule {
+    source_labels = ["__meta_kubernetes_pod_container_name"]
+    target_label  = "app"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_label_app"]
+    regex         = "(.+)"
+    target_label  = "app"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+    regex         = "(.+)"
+    target_label  = "app"
+  }
+  rule {
+    target_label = "cluster"
+    replacement  = "k0s"
+  }
+  rule {
+    target_label = "deployment"
+    replacement  = "local-k0s"
+  }
+  rule {
+    target_label = "job"
+    replacement  = "kubernetes-pods"
+  }
+  // Retain only the API reader's identity fields and approved stream labels.
+  // No annotation/label maps or message-derived labels are admitted.
+  rule {
+    action = "labelkeep"
+    regex  = "__meta_kubernetes_namespace|__meta_kubernetes_pod_container_name|__meta_kubernetes_pod_name|__meta_kubernetes_pod_uid|cluster|deployment|namespace|pod|container|app|node|job"
+  }
+}
+
+loki.source.kubernetes "pods" {
+  targets    = discovery.relabel.pod_logs.output
+  forward_to = [loki.write.local.receiver]
+}
+
+// The pinned source emits JSON with top-level type, kind, name, reason and
+// msg. Object identities stay in the line; event streams group by namespace.
+loki.source.kubernetes_events "events" {
+  namespaces = ["fleet-recall", "ory", "localstack", "kube-system", "fleet-observability"]
+  job_name   = "kubernetes-events"
+  log_format = "json"
+  forward_to = [loki.relabel.events.receiver]
+}
+
+loki.relabel "events" {
+  forward_to = [loki.write.local.receiver]
+
+  rule {
+    target_label = "cluster"
+    replacement  = "k0s"
+  }
+  rule {
+    target_label = "deployment"
+    replacement  = "local-k0s"
+  }
+  rule {
+    action = "labelkeep"
+    regex  = "cluster|deployment|namespace|job"
+  }
+}
+
+// Pod lines flow directly from the Kubernetes API to Loki. There is no JSON
+// rewrite, drop stage, redaction, or operation/request/content-derived index.
+// stdout memory/report content is retained too; Grafana access is sensitive.
+// Positions persist under --storage.path. The GA client has a bounded in-memory
+// send queue and retries; this local monitoring pipeline is not a durable audit.
+loki.write "local" {
+  endpoint {
+    url                 = "http://loki.fleet-observability.svc.cluster.local:3100/loki/api/v1/push"
+    batch_size          = "1MiB"
+    batch_wait          = "1s"
+    remote_timeout      = "10s"
+    min_backoff_period  = "500ms"
+    max_backoff_period  = "30s"
+    max_backoff_retries = 20
+  }
+}

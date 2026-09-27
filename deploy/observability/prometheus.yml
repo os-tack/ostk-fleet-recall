@@ -1,0 +1,27 @@
+# Example: Prometheus, Fleet Recall, and node exporter share a host/network
+# namespace. Replace targets with private addresses for separate containers.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: fleet-recall
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:9091"]
+        labels:
+          deployment: local
+          role: serve
+
+  # Keep exactly one Fleet worker snapshot identity behind this endpoint.
+  # The textfile collector publishes the completed invocation, not a live
+  # cumulative worker counter. Never rate() or increase() these samples.
+  - job_name: fleet-worker-textfile
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+        labels:
+          deployment: local
+          role: worker

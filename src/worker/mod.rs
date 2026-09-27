@@ -97,6 +97,7 @@ mod ingest;
 mod privileges;
 mod project;
 mod sources;
+mod telemetry;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -104,6 +105,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use tracing::Instrument as _;
 
 use crate::body_store::{
     CockroachBodyProjectionRepository, GovernedContentResolver, reference_parser_key_v1,
@@ -599,25 +601,41 @@ impl MemoryWorker {
     /// Run every selected step once. Never fails as a whole: every failure is
     /// in the report.
     pub async fn run_tick(&self) -> WorkerTickReportV1 {
+        let operation = crate::telemetry::start("worker", "tick");
+        let report = self.run_tick_inner().instrument(operation.span()).await;
+        if let Some(retired) = report.retired_sources {
+            crate::telemetry::add_units("worker", "tick", "sources_retired", retired);
+        }
+        operation.finish(telemetry::tick_outcome(&report));
+        report
+    }
+
+    async fn run_tick_inner(&self) -> WorkerTickReportV1 {
         let tick_started_at = ingest::server_time(&self.deps.pool)
             .await
             .unwrap_or_else(|_| Utc::now());
         let mut steps = BTreeMap::new();
         for step in WorkerStepV1::ALL {
             if !self.steps.contains(&step) {
-                steps.insert(step, WorkerStepReportV1::skipped("not selected"));
+                let report =
+                    telemetry::step(step, async { WorkerStepReportV1::skipped("not selected") })
+                        .await;
+                steps.insert(step, report);
             }
         }
         let mut authority = None;
         let mut retired_sources = None;
         if self.steps.iter().any(|step| step.is_ingest()) {
-            let outcome = ingest::run_ingest(self).await;
+            let outcome = Box::pin(ingest::run_ingest(self)).await;
             authority = outcome.authority;
             retired_sources = outcome.retired_sources;
             steps.extend(outcome.steps);
         }
         if self.steps.contains(&WorkerStepV1::Bodies) {
-            steps.insert(WorkerStepV1::Bodies, project::run_bodies(self).await);
+            steps.insert(
+                WorkerStepV1::Bodies,
+                telemetry::step(WorkerStepV1::Bodies, project::run_bodies(self)).await,
+            );
         }
         // Rows stored under an older normalization version make this tick's
         // lexical pass a full re-projection and its dense pass a full
@@ -634,28 +652,34 @@ impl MemoryWorker {
         };
         let mut reembed = false;
         if self.steps.contains(&WorkerStepV1::Lexical) {
-            let report = match &stale {
-                Ok(stale) => project::run_lexical(self, *stale).await,
-                Err(reason) => WorkerStepReportV1::failed(reason.clone()),
-            };
+            let report = telemetry::step(WorkerStepV1::Lexical, async {
+                match &stale {
+                    Ok(stale) => project::run_lexical(self, *stale).await,
+                    Err(reason) => WorkerStepReportV1::failed(reason.clone()),
+                }
+            })
+            .await;
             reembed = stale.as_ref().is_ok_and(|stale| *stale > 0)
                 && report.status == WorkerStepStatusV1::Ok;
             steps.insert(WorkerStepV1::Lexical, report);
         }
         if self.steps.contains(&WorkerStepV1::Dense) {
-            // The dense tier's own count makes a re-embed survive a failed or
-            // skipped dense pass: rows still under the older preprocessing
-            // version are rewritten by whichever later tick selects `embed`.
-            let stale_dense = match &stale {
-                Ok(_) => project::stale_dense_rows(self)
-                    .await
-                    .map_err(|error| format!("the stale dense row count was not read: {error}")),
-                Err(reason) => Err(reason.clone()),
-            };
-            let report = match stale_dense {
-                Ok(stale_dense) => project::run_dense(self, reembed || stale_dense > 0).await,
-                Err(reason) => WorkerStepReportV1::failed(reason),
-            };
+            let report = telemetry::step(WorkerStepV1::Dense, async {
+                // The dense tier's own count makes a re-embed survive a failed or
+                // skipped dense pass: rows still under the older preprocessing
+                // version are rewritten by whichever later tick selects `embed`.
+                let stale_dense = match &stale {
+                    Ok(_) => project::stale_dense_rows(self).await.map_err(|error| {
+                        format!("the stale dense row count was not read: {error}")
+                    }),
+                    Err(reason) => Err(reason.clone()),
+                };
+                match stale_dense {
+                    Ok(stale_dense) => project::run_dense(self, reembed || stale_dense > 0).await,
+                    Err(reason) => WorkerStepReportV1::failed(reason),
+                }
+            })
+            .await;
             steps.insert(WorkerStepV1::Dense, report);
         }
         WorkerTickReportV1 {

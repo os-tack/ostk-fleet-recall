@@ -127,6 +127,38 @@ and other unlisted origins are refused.
 The default inflight cap is 64 and deadline is 30 seconds. Mutation timeouts
 preserve the existing unknown-outcome receipt and idempotency semantics.
 
+## Operational visibility
+
+The HTTP server uses the process telemetry runtime described in
+[Operating telemetry](TELEMETRY.md). JSON completion events go to stderr by
+default. `http_mcp` measures each HTTP response, including origin, capacity,
+and authentication rejections; `mcp` measures the nested protocol dispatch.
+These are separate boundaries, so summing their counters double-counts
+dispatched requests. Generated operation IDs correlate their event spans
+without recording bearer tokens, request IDs, scopes, or payloads.
+
+For the local Mac launcher, explicitly enable a separate loopback metrics port:
+
+```sh
+FLEET_RECALL_METRICS_LISTEN=127.0.0.1:9091 \
+  deploy/local/bin/serve-remote.sh
+```
+
+Scrape `http://127.0.0.1:9091/metrics` from the host. The launcher preserves
+`FLEET_RECALL_LOG_FORMAT` (default `json`) and, only for HTTP serving, the
+metrics listen and non-loopback opt-in settings. It does not inherit the
+worker textfile destination. Enrollment commands retain JSON events without
+starting the HTTP service's metrics listener.
+
+This process runs on the Mac, outside Kubernetes. The k0s stack discovers
+annotated application pods and collects pod stdout/stderr through the API;
+it does not automatically scrape this host endpoint or collect its stderr.
+Configure a private host scrape target or forwarding path and a host log
+collector to include it. The VM's loopback address is not the Mac's loopback
+address. Keep the metrics listener private; opening the application listener
+does not expose metrics, and no public metrics listener is enabled by this
+launcher.
+
 ## Other anchors and grants
 
 `FLEET_RECALL_LOCAL_KEY_ANCHOR_PATH` names a JSON object mapping `kid` to a

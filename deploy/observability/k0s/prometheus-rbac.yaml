@@ -1,0 +1,100 @@
+# No secret access. Pod discovery is bound only in Fleet and observability namespaces.
+# GET nodes/proxy enables kubelet/cAdvisor metrics via the CA-verified Kubernetes API server.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+    app.kubernetes.io/name: prometheus
+  namespace: fleet-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fleet-observability-prometheus-nodes
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ''
+  resources:
+  - nodes/proxy
+  verbs:
+  - get
+- nonResourceURLs:
+  - "/metrics"
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fleet-observability-prometheus-nodes
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fleet-observability-prometheus-nodes
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: fleet-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fleet-observability-prometheus-pods
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-prometheus-discovery
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+  namespace: fleet-recall
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fleet-observability-prometheus-pods
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: fleet-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-prometheus-discovery
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+  namespace: fleet-observability
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fleet-observability-prometheus-pods
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: fleet-observability

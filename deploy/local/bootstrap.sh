@@ -35,6 +35,7 @@ PHASES=(preflight vm images certs secrets cockroach migrate authority boundary o
 usage() {
     sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
     printf '\nphases: %s\n' "${PHASES[*]}"
+    printf 'optional phases: observability (Prometheus, Grafana, Loki, Alloy)\n'
 }
 
 image_tag() { cat "$state/image.tag"; }
@@ -395,6 +396,10 @@ phase_recall() {
 
 phase_verify() {
     "$here/bin/verify.sh"
+}
+
+phase_observability() {
+    "$repo/deploy/observability/install-k0s.sh" up
 }
 
 cmd_up() {

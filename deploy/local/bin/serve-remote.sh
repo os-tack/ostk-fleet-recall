@@ -22,6 +22,7 @@ if arguments in [["--help"], ["-h"]]:
     print("Usage: deploy/local/bin/serve-remote.sh [enroll {apply --file FILE [--bootstrap-scopes]|list|revoke UUID}]")
     print("Defaults to serve --http 127.0.0.1:8080; resource URL is http://localhost:8080/mcp.")
     print("Overrides: FLEET_LOCAL_STATE, FLEET_RECALL_BIN, FLEET_RECALL_MODEL_BUNDLE.")
+    print("Telemetry: FLEET_RECALL_LOG_FORMAT (default json); HTTP service optionally inherits FLEET_RECALL_METRICS_LISTEN and FLEET_RECALL_METRICS_ALLOW_NON_LOOPBACK.")
     sys.exit(0)
 if arguments and arguments[0] != "enroll":
     sys.exit("Only the enroll subcommand is accepted; no arguments starts the HTTP service.")
@@ -55,6 +56,7 @@ try:
     environment = {name: os.environ[name] for name in ["PATH", "HOME"] if name in os.environ}
     environment.update({
         "RUST_LOG": "ostk_fleet_recall=info",
+        "FLEET_RECALL_LOG_FORMAT": os.environ.get("FLEET_RECALL_LOG_FORMAT", "json"),
         "FLEET_RECALL_MAX_CONNECTIONS": "4",
         "FLEET_RECALL_EMBEDDING_MODEL": "minishlab/potion-retrieval-32M",
         "FLEET_RECALL_EMBEDDING_MODEL_PATH": str(bundle),
@@ -65,6 +67,11 @@ try:
         password = hex_value(passwords.get("ENROLLMENT_PASSWORD", ""), 48, "enrollment password (run the updated secrets phase)")
         environment["FLEET_RECALL_ENROLLMENT_DATABASE_URL"] = f"postgresql://fleet_enrollment:{password}@127.0.0.1:26258/fleet_recall?{query}"
     else:
+        # Explicit telemetry opt-ins apply only to the long-running service.
+        # Never inherit the scheduled worker's textfile destination.
+        for name in ["FLEET_RECALL_METRICS_LISTEN", "FLEET_RECALL_METRICS_ALLOW_NON_LOOPBACK"]:
+            if name in os.environ:
+                environment[name] = os.environ[name]
         password = hex_value(passwords.get("WRITER_PASSWORD", ""), 48, "writer password")
         report = json.loads(regular_file(state / "authority.json").read_text())
         pins = report.get("pins", {})

@@ -1,0 +1,201 @@
+# Installer supplies dashboard/provisioning ConfigMaps and a persisted random admin Secret.
+# Provisioning uses subPath mounts: restart this Deployment after provisioning changes.
+# No anonymous access, sign-up, public ingress or plugin installation. Use kubectl port-forward.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+    app.kubernetes.io/name: grafana
+  namespace: fleet-observability
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grafana
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: fleet-observability
+        app.kubernetes.io/name: grafana
+    spec:
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: grafana
+        image: grafana/grafana:13.2.2
+        imagePullPolicy: IfNotPresent
+        args: []
+        ports:
+        - name: http
+          containerPort: 3000
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        volumeMounts:
+        - name: data
+          mountPath: "/var/lib/grafana"
+        - name: provisioning
+          mountPath: "/etc/grafana/provisioning/datasources/datasources.yaml"
+          subPath: datasources.yaml
+          readOnly: true
+        - name: provisioning
+          mountPath: "/etc/grafana/provisioning/dashboards/dashboards.yaml"
+          subPath: dashboards.yaml
+          readOnly: true
+        - name: dashboards
+          mountPath: "/var/lib/grafana/dashboards"
+          readOnly: true
+        - name: tmp
+          mountPath: "/tmp"
+        env:
+        - name: FLEET_PROMETHEUS_URL
+          value: http://prometheus:9090
+        - name: FLEET_LOKI_URL
+          value: http://loki:3100
+        - name: GF_SECURITY_ADMIN_USER
+          valueFrom:
+            secretKeyRef:
+              name: fleet-grafana-admin
+              key: user
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: fleet-grafana-admin
+              key: password
+        - name: GF_AUTH_ANONYMOUS_ENABLED
+          value: 'false'
+        - name: GF_USERS_ALLOW_SIGN_UP
+          value: 'false'
+        - name: GF_ANALYTICS_REPORTING_ENABLED
+          value: 'false'
+        - name: GF_ANALYTICS_CHECK_FOR_UPDATES
+          value: 'false'
+        - name: GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES
+          value: 'false'
+        # Grafana 13 bundles Prometheus as an external plugin. Its default
+        # updater stops that plugin before trying to modify the read-only image.
+        # Use the versions bundled with the pinned image, with no startup installs.
+        - name: GF_PLUGINS_PREINSTALL_DISABLED
+          value: 'true'
+        - name: GF_PLUGINS_PREINSTALL_AUTO_UPDATE
+          value: 'false'
+        - name: GF_PLUGINS_PLUGIN_ADMIN_ENABLED
+          value: 'false'
+        - name: GF_LOG_MODE
+          value: console
+        - name: GF_LOG_CONSOLE_FORMAT
+          value: json
+        - name: GF_METRICS_ENABLED
+          value: 'true'
+        - name: GF_PATHS_DATA
+          value: "/var/lib/grafana"
+        - name: GF_PATHS_LOGS
+          value: "/tmp"
+        - name: GF_PATHS_PLUGINS
+          value: "/var/lib/grafana/plugins"
+        startupProbe:
+          httpGet:
+            path: "/api/health"
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: "/api/health"
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: "/api/health"
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+      volumes:
+      - name: data
+        hostPath:
+          path: "/var/lib/fleet-recall/observability/grafana"
+          type: DirectoryOrCreate
+      - name: provisioning
+        configMap:
+          name: fleet-grafana-provisioning
+      - name: dashboards
+        configMap:
+          name: fleet-grafana-dashboards
+      - name: tmp
+        emptyDir:
+          sizeLimit: 64Mi
+      terminationGracePeriodSeconds: 60
+      initContainers:
+      - name: prepare-data
+        image: busybox:1.37.0
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - "-ec"
+        - chown -R 472:472 /data
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+          runAsNonRoot: false
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - CHOWN
+            - FOWNER
+            - DAC_OVERRIDE
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+        volumeMounts:
+        - name: data
+          mountPath: "/data"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+    app.kubernetes.io/name: grafana
+  namespace: fleet-observability
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: grafana
+  ports:
+  - name: http
+    port: 3000
+    targetPort: http

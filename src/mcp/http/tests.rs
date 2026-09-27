@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use axum::http::Request as HttpRequest;
 use ostk_recall_core::PrivacyTier;
 use tower::ServiceExt as _;
+use tracing::instrument::WithSubscriber as _;
 use uuid::Uuid;
 
 use crate::FleetScope;
@@ -170,6 +171,165 @@ async fn json_body(response: Response) -> Value {
             .unwrap(),
     )
     .unwrap()
+}
+
+#[derive(Clone, Default)]
+struct TelemetryLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for TelemetryLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn telemetry_covers_remote_rejections_and_correlates_dispatch_without_payloads() {
+    crate::telemetry::prepare_test_capture();
+    let log = TelemetryLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    exercise_remote_telemetry()
+        .with_subscriber(subscriber)
+        .await;
+    assert_remote_telemetry(&log);
+}
+
+async fn exercise_remote_telemetry() {
+    let app = router(config(), Backend::new(Arc::new(Memory::default()))).unwrap();
+    let mut untrusted_origin = modern_request(&modern("ping"));
+    untrusted_origin.headers_mut().insert(
+        "origin",
+        HeaderValue::from_static("https://private-origin.example"),
+    );
+    let private_bearer = HttpRequest::get("/mcp")
+        .header("authorization", "Bearer private-token")
+        .body(Body::empty())
+        .unwrap();
+    let unknown_route = HttpRequest::get("/private-path?token=private-query")
+        .body(Body::empty())
+        .unwrap();
+    let invalid_json = HttpRequest::post("/mcp")
+        .header("authorization", "Bearer valid")
+        .header("content-type", "application/json")
+        .body(Body::from("private-invalid-json"))
+        .unwrap();
+    for (request, expected) in [
+        (untrusted_origin, StatusCode::FORBIDDEN),
+        (private_bearer, StatusCode::UNAUTHORIZED),
+        (unknown_route, StatusCode::NOT_FOUND),
+        (invalid_json, StatusCode::BAD_REQUEST),
+    ] {
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            expected
+        );
+    }
+    let mut discover = modern("server/discover");
+    discover["id"] = json!("private-request-id");
+    assert_eq!(
+        app.oneshot(modern_request(&discover))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let remember = json!({"jsonrpc":"2.0","id":"private-request-id","method":"tools/call",
+        "params":{"name":"remember","arguments":{"action":"record",
+            "idempotency_key":"private-key","text":"private-document"}}});
+    for (memory, expected) in [
+        (
+            Memory {
+                forbid_writes: true,
+                ..Memory::default()
+            },
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Memory {
+                delay: Duration::from_secs(1),
+                ..Memory::default()
+            },
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        let mut settings = config();
+        settings.request_deadline = Duration::from_millis(1);
+        let app = router(settings, Backend::new(Arc::new(memory))).unwrap();
+        assert_eq!(
+            app.oneshot(request("/mcp", &remember))
+                .await
+                .unwrap()
+                .status(),
+            expected
+        );
+    }
+}
+
+fn assert_remote_telemetry(log: &TelemetryLog) {
+    let encoded = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    for private in [
+        "private-",
+        "recall.example",
+        "id.example",
+        "\"project\"",
+        "\"agent\"",
+    ] {
+        assert!(!encoded.contains(private), "telemetry leaked {private}");
+    }
+    let events: Vec<Value> = encoded
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| event["fields"]["event"] == "operation.completed")
+        .collect();
+    let actual: Vec<_> = events
+        .iter()
+        .map(|event| {
+            let fields = &event["fields"];
+            (
+                fields["component"].as_str().unwrap(),
+                fields["operation"].as_str().unwrap(),
+                fields["outcome"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            ("http_mcp", "mcp", "refused"),
+            ("http_mcp", "mcp", "refused"),
+            ("http_mcp", "other", "invalid"),
+            ("http_mcp", "mcp", "invalid"),
+            ("mcp", "server.discover", "success"),
+            ("http_mcp", "mcp", "success"),
+            ("mcp", "remember.record", "refused"),
+            ("http_mcp", "mcp", "refused"),
+            ("mcp", "remember.record", "timeout"),
+            ("http_mcp", "mcp", "error"),
+        ],
+        "{encoded}"
+    );
+    // Nested boundaries count different work; their generated IDs correlate
+    // through spans without retaining bearer, caller ID, scope, or payload.
+    for dispatch in [4, 6, 8] {
+        let http_span = &events[dispatch + 1]["span"];
+        let parents = events[dispatch]["spans"].as_array().unwrap();
+        assert!(parents.iter().any(|span| span["component"] == "http_mcp"
+            && span["operation_id"] == http_span["operation_id"]));
+        assert_ne!(
+            events[dispatch]["span"]["operation_id"],
+            http_span["operation_id"]
+        );
+    }
 }
 
 #[tokio::test]

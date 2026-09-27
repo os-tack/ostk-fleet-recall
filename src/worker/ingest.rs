@@ -352,12 +352,15 @@ pub(super) async fn run_ingest(worker: &MemoryWorker) -> IngestOutcome {
     let mut inventory = Some(BTreeSet::new());
     let mut steps = Vec::with_capacity(selected.len());
     for step in &selected {
-        let report = match step {
-            WorkerStepV1::Transcript => ingest.transcript_step(&verified, &mut inventory).await,
-            WorkerStepV1::Git => ingest.git_step(&verified, &mut inventory).await,
-            WorkerStepV1::Ci => ingest.ci_step(&verified, &mut inventory).await,
-            _ => continue,
-        };
+        let report = Box::pin(super::telemetry::step(*step, async {
+            match step {
+                WorkerStepV1::Transcript => ingest.transcript_step(&verified, &mut inventory).await,
+                WorkerStepV1::Git => ingest.git_step(&verified, &mut inventory).await,
+                WorkerStepV1::Ci => ingest.ci_step(&verified, &mut inventory).await,
+                _ => unreachable!("only ingest steps were selected"),
+            }
+        }))
+        .await;
         steps.push((*step, report));
     }
     if collect {
@@ -365,7 +368,11 @@ pub(super) async fn run_ingest(worker: &MemoryWorker) -> IngestOutcome {
         // otherwise carry it inline.
         steps.push((
             WorkerStepV1::Collect,
-            Box::pin(super::collect::run_collect(worker, runtime, kek, &verified)).await,
+            super::telemetry::step(
+                WorkerStepV1::Collect,
+                Box::pin(super::collect::run_collect(worker, runtime, kek, &verified)),
+            )
+            .await,
         ));
     }
 

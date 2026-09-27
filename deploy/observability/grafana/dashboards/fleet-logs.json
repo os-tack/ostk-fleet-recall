@@ -1,0 +1,781 @@
+{
+  "uid": "fleet-logs",
+  "title": "Fleet Recall / Logs & Events",
+  "description": "Container logs, structured Fleet completion events and Kubernetes lifecycle events from Alloy and Loki.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "tags": [
+    "fleet-recall",
+    "kubernetes",
+    "logs"
+  ],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "loki",
+        "label": "Loki",
+        "type": "datasource",
+        "query": "loki",
+        "current": {
+          "text": "Fleet Loki",
+          "value": "fleet-loki"
+        },
+        "refresh": 1
+      },
+      {
+        "name": "deployment",
+        "label": "Deployment",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "$loki"
+        },
+        "definition": "label_values({job=~\"kubernetes-pods|kubernetes-events\"}, deployment)",
+        "query": "label_values({job=~\"kubernetes-pods|kubernetes-events\"}, deployment)",
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "namespace",
+        "label": "Namespace",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "$loki"
+        },
+        "definition": "label_values({job=~\"kubernetes-pods|kubernetes-events\",deployment=~\"$deployment\"}, namespace)",
+        "query": "label_values({job=~\"kubernetes-pods|kubernetes-events\",deployment=~\"$deployment\"}, namespace)",
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "pod",
+        "label": "Pod",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "$loki"
+        },
+        "definition": "label_values({deployment=~\"$deployment\",namespace=~\"$namespace\",job=\"kubernetes-pods\"}, pod)",
+        "query": "label_values({deployment=~\"$deployment\",namespace=~\"$namespace\",job=\"kubernetes-pods\"}, pod)",
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "container",
+        "label": "Container",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "$loki"
+        },
+        "definition": "label_values({deployment=~\"$deployment\",namespace=~\"$namespace\",pod=~\"$pod\",job=\"kubernetes-pods\"}, container)",
+        "query": "label_values({deployment=~\"$deployment\",namespace=~\"$namespace\",pod=~\"$pod\",job=\"kubernetes-pods\"}, container)",
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "search",
+        "label": "Contains text",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "options": []
+      },
+      {
+        "name": "component",
+        "label": "Event component",
+        "type": "custom",
+        "query": "process,mcp,http_demo,http_ingress,http_mcp,database,embedding,worker,worker_step",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "title": "Overview",
+      "type": "link",
+      "url": "/d/fleet-overview",
+      "includeVars": true,
+      "keepTime": true
+    },
+    {
+      "title": "Requests",
+      "type": "link",
+      "url": "/d/fleet-mcp",
+      "includeVars": true,
+      "keepTime": true
+    },
+    {
+      "title": "Dependencies",
+      "type": "link",
+      "url": "/d/fleet-dependencies",
+      "includeVars": true,
+      "keepTime": true
+    },
+    {
+      "title": "Workers",
+      "type": "link",
+      "url": "/d/fleet-workers",
+      "includeVars": true,
+      "keepTime": true
+    },
+    {
+      "title": "Kubernetes",
+      "type": "link",
+      "url": "/d/fleet-kubernetes",
+      "includeVars": true,
+      "keepTime": true
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Log investigation",
+      "type": "row",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 2,
+      "title": "From a symptom to an operation",
+      "type": "text",
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 24,
+        "h": 4
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Filter deployment \u2192 namespace \u2192 pod \u2192 container**, then enter a literal text fragment. The first log view preserves plain and JSON messages.\n\nFor Fleet events, expand a log and inspect `span.operation_id` / `spans` to correlate nested operations, then paste that ID into **Contains text**. Operation IDs and message content are parsed at query time, never indexed labels. Kubernetes Events use namespace filtering; pod/container filters apply only to container logs. Logs may contain sensitive diagnostic output; this local stack retains them for 48 hours."
+      }
+    },
+    {
+      "id": 3,
+      "title": "Container log volume",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 7
+      },
+      "description": "Lines per second after the literal text filter; this is log traffic, not application request rate.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "$loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (namespace, container) (rate({job=\"kubernetes-pods\",deployment=~\"$deployment\",namespace=~\"$namespace\",pod=~\"$pod\",container=~\"$container\"} |= ${search:doublequote}[$__interval]))",
+          "queryType": "range",
+          "editorMode": "code",
+          "datasource": {
+            "type": "loki",
+            "uid": "$loki"
+          }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Structured warning and error volume",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 7
+      },
+      "description": "Counts valid structured JSON log levels only. Plain-text errors remain visible in Container logs.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "$loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (namespace, level) (rate({job=\"kubernetes-pods\",deployment=~\"$deployment\",namespace=~\"$namespace\",pod=~\"$pod\",container=~\"$container\"} |= ${search:doublequote} | json level=\"level\" | __error__=\"\" | level=~\"WARN|ERROR|warn|error\" [$__interval]))",
+          "queryType": "range",
+          "editorMode": "code",
+          "datasource": {
+            "type": "loki",
+            "uid": "$loki"
+          }
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Container logs \u00b7 plain and JSON",
+      "type": "logs",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 13
+      },
+      "description": "Newest 500 lines per query. No automatic deduplication. Expand a line to inspect labels and JSON; use a narrower time range for busy pods.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "$loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{job=\"kubernetes-pods\",deployment=~\"$deployment\",namespace=~\"$namespace\",pod=~\"$pod\",container=~\"$container\"} |= ${search:doublequote}",
+          "queryType": "range",
+          "editorMode": "code",
+          "datasource": {
+            "type": "loki",
+            "uid": "$loki"
+          },
+          "maxLines": 500
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Fleet operational events",
+      "type": "row",
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 24,
+        "h": 1
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 7,
+      "title": "Completed operations by outcome",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 12,
+        "h": 7
+      },
+      "description": "Log-derived operation rates using bounded component/outcome labels. Unique operation IDs and durations are deliberately not extracted into metric-query series. Nested components describe the same request; select one component before interpreting throughput.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "$loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (component, outcome) (rate({job=\"kubernetes-pods\",deployment=~\"$deployment\",namespace=~\"$namespace\",pod=~\"$pod\",container=~\"$container\"} |= ${search:doublequote} | json event=\"fields.event\", component=\"fields.component\", operation=\"fields.operation\", outcome=\"fields.outcome\", level=\"level\" | __error__=\"\" | event=\"operation.completed\" | component=~\"$component\" [$__interval]))",
+          "queryType": "range",
+          "editorMode": "code",
+          "datasource": {
+            "type": "loki",
+            "uid": "$loki"
+          }
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Errors and deadlines by operation",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 12,
+        "h": 7
+      },
+      "description": "Counts per chart interval, not lifetime totals. Refusals are visible in outcome overview; cancellation does not imply rollback.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "$loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (component, operation, outcome) (count_over_time({job=\"kubernetes-pods\",deployment=~\"$deployment\",namespace=~\"$namespace\",pod=~\"$pod\",container=~\"$container\"} |= ${search:doublequote} | json event=\"fields.event\", component=\"fields.component\", operation=\"fields.operation\", outcome=\"fields.outcome\", level=\"level\" | __error__=\"\" | event=\"operation.completed\" | component=~\"$component\" | outcome=~\"error|timeout|cancelled|invalid\" [$__interval]))",
+          "queryType": "range",
+          "editorMode": "code",
+          "datasource": {
+            "type": "loki",
+            "uid": "$loki"
+          }
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Fleet completion events",
+      "type": "logs",
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 24,
+        "h": 12
+      },
+      "description": "Versioned operation.completed records only. Tracing fields are read from fields.* and the generated ID from span.operation_id. Extraction failures and legacy diagnostics stay visible in Container logs; parsed fields are query-time only.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "$loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{job=\"kubernetes-pods\",deployment=~\"$deployment\",namespace=~\"$namespace\",pod=~\"$pod\",container=~\"$container\"} |= ${search:doublequote} | json event=\"fields.event\", component=\"fields.component\", operation=\"fields.operation\", outcome=\"fields.outcome\", duration_seconds=\"fields.duration_seconds\", operation_id=\"span.operation_id\", level=\"level\" | __error__=\"\" | event=\"operation.completed\" | component=~\"$component\"",
+          "queryType": "range",
+          "editorMode": "code",
+          "datasource": {
+            "type": "loki",
+            "uid": "$loki"
+          },
+          "maxLines": 500
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Kubernetes lifecycle and scheduling",
+      "type": "row",
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 24,
+        "h": 1
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 11,
+      "title": "Cluster event volume by namespace",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 46,
+        "w": 12,
+        "h": 7
+      },
+      "description": "Kubernetes Event deliveries, not unique incidents. The Kubernetes API may aggregate/repeat events.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "$loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (namespace) (rate({job=\"kubernetes-events\",deployment=~\"$deployment\",namespace=~\"$namespace\"}[$__interval]))",
+          "queryType": "range",
+          "editorMode": "code",
+          "datasource": {
+            "type": "loki",
+            "uid": "$loki"
+          }
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Warning events",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 46,
+        "w": 12,
+        "h": 7
+      },
+      "description": "Warning events in each chart interval. Includes scheduling/image/restart failures emitted by Kubernetes.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "$loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (namespace) (count_over_time({job=\"kubernetes-events\",deployment=~\"$deployment\",namespace=~\"$namespace\"} | json type=\"type\" | __error__=\"\" | type=\"Warning\" [$__interval]))",
+          "queryType": "range",
+          "editorMode": "code",
+          "datasource": {
+            "type": "loki",
+            "uid": "$loki"
+          }
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Kubernetes Events",
+      "type": "logs",
+      "gridPos": {
+        "x": 0,
+        "y": 53,
+        "w": 24,
+        "h": 12
+      },
+      "description": "Namespace-filtered cluster event stream. Pod/container filters intentionally do not apply; involved-object fields are available in log details.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "$loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{job=\"kubernetes-events\",deployment=~\"$deployment\",namespace=~\"$namespace\"} |= ${search:doublequote}",
+          "queryType": "range",
+          "editorMode": "code",
+          "datasource": {
+            "type": "loki",
+            "uid": "$loki"
+          },
+          "maxLines": 500
+        }
+      ]
+    }
+  ]
+}

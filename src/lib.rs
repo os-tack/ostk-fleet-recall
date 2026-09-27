@@ -43,6 +43,7 @@ pub mod service;
 pub mod shim;
 pub mod spec_conformance;
 pub mod store;
+pub mod telemetry;
 pub mod transcripts;
 pub mod worker;
 

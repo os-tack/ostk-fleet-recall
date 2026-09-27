@@ -1,0 +1,131 @@
+groups:
+  - name: fleet-recall-live
+    rules:
+      - alert: FleetRecallMetricsUnavailable
+        expr: up{job="fleet-recall"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fleet Recall metrics unavailable on {{ $labels.instance }}"
+          description: "Check process health, metrics bind address, and the private scrape network."
+
+      - alert: FleetRecallMcpErrorRate
+        expr: |
+          (
+            sum by (job, instance, operation) (
+              rate(fleet_recall_operations_total{job="fleet-recall", component="mcp", operation=~"recall\\..*|remember\\..*", outcome=~"error|timeout|cancelled"}[5m])
+            )
+            /
+            clamp_min(sum by (job, instance, operation) (
+              rate(fleet_recall_operations_total{job="fleet-recall", component="mcp", operation=~"recall\\..*|remember\\..*"}[5m])
+            ), 0.000001)
+          ) > 0.05
+          and on (job, instance, operation)
+          sum by (job, instance, operation) (
+            increase(fleet_recall_operations_total{job="fleet-recall", component="mcp", operation=~"recall\\..*|remember\\..*"}[5m])
+          ) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP errors exceed 5% for {{ $labels.operation }}"
+          description: "Inspect operation.completed events, database retries, and embedding failures. Refused and invalid requests are excluded from the error numerator."
+
+      - alert: FleetRecallMcpLatency
+        expr: |
+          histogram_quantile(0.95, sum by (le, job, instance, operation) (
+            rate(fleet_recall_operation_duration_seconds_bucket{job="fleet-recall", component="mcp", operation=~"recall\\..*|remember\\..*"}[5m])
+          )) > 2
+          and on (job, instance, operation)
+          sum by (job, instance, operation) (
+            increase(fleet_recall_operations_total{job="fleet-recall", component="mcp", operation=~"recall\\..*|remember\\..*"}[5m])
+          ) >= 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP p95 latency exceeds 2 seconds for {{ $labels.operation }}"
+          description: "Compare database and embedding duration; tune this threshold to the deployed workload."
+
+      - alert: FleetRecallDatabaseRetriesExhausted
+        expr: |
+          sum by (job, instance) (
+            increase(fleet_recall_units_total{job="fleet-recall", component="database", operation="serializable_transaction", unit="retries_exhausted"}[5m])
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fleet Recall exhausted database serialization retries"
+          description: "Inspect contention and concurrent writers before changing the retry policy."
+
+  - name: fleet-recall-worker-snapshot
+    rules:
+      # A snapshot is replaced by each worker process. These are last-run
+      # observations, despite the underlying exported counter type.
+      - record: fleet_recall_worker_last_run_failed
+        expr: |
+          max by (job, instance) (
+            fleet_recall_operations_total{job="fleet-worker-textfile", component="process", operation="worker", outcome="error"}
+            or
+            (0 * fleet_recall_operations_total{job="fleet-worker-textfile", component="process", operation="worker", outcome="success"})
+          )
+
+      - alert: FleetRecallWorkerFailed
+        expr: fleet_recall_worker_last_run_failed{job="fleet-worker-textfile"} > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The last published worker run failed on {{ $labels.instance }}"
+          description: "Inspect process/worker completion and the protected worker stdout report for the failed step or startup check."
+
+      - alert: FleetRecallWorkerSnapshotStale
+        expr: time() - fleet_recall_snapshot_time_seconds{job="fleet-worker-textfile"} > 900
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker snapshot is more than 15 minutes old"
+          description: "Check scheduling, process termination, export errors, and file permissions. Tune the age limit to the schedule and maximum run duration."
+
+      - alert: FleetRecallWorkerSnapshotMissing
+        expr: |
+          (up{job="fleet-worker-textfile"} == 1)
+          unless on (job, instance)
+          fleet_recall_snapshot_time_seconds{job="fleet-worker-textfile"}
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node exporter is up but no Fleet worker snapshot is visible"
+          description: "Check the textfile collector directory, file readability, scheduler, and first-run completion."
+
+      - alert: FleetRecallWorkerSnapshotWrongCommand
+        expr: |
+          fleet_recall_snapshot_time_seconds{job="fleet-worker-textfile"}
+          unless on (job, instance)
+          fleet_recall_operations_total{job="fleet-worker-textfile", component="process", operation="worker", outcome=~"success|error"}
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fleet snapshot has no terminal worker process outcome"
+          description: "Reserve this collector endpoint and snapshot destination for one scheduled worker identity; another command may have overwritten the file."
+
+      - alert: FleetRecallWorkerCollectorUnavailable
+        expr: up{job="fleet-worker-textfile"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker metrics collector unavailable on {{ $labels.instance }}"
+          description: "Check node exporter and the private scrape network; worker freshness cannot be assessed while collection is down."
+
+      - alert: FleetRecallWorkerTextfileError
+        expr: node_textfile_scrape_error{job="fleet-worker-textfile"} > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node exporter could not read a textfile snapshot"
+          description: "Inspect collector logs, permissions, malformed files, and duplicate Fleet metric series across .prom files."

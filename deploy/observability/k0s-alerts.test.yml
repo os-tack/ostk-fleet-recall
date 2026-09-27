@@ -1,0 +1,287 @@
+---
+rule_files:
+- k0s-alerts.yml
+evaluation_interval: 1m
+tests:
+- name: missing and down infrastructure jobs are distinct from healthy zero and recover
+  interval: 1m
+  input_series:
+  - series: up{cluster="k0s",deployment="local-k0s",job="kubernetes-nodes",instance="kubernetes-nodes:9090"}
+    values: 1+0x7
+  - series: up{cluster="k0s",deployment="local-k0s",job="kubernetes-cadvisor",instance="kubernetes-cadvisor:9090"}
+    values: 1+0x7
+  - series: up{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",instance="kube-state-metrics:9090"}
+    values: 0+0x5 1+0x1
+  - series: up{cluster="k0s",deployment="local-k0s",job="node-exporter",instance="node-exporter:9090"}
+    values: _ _ _ _ _ _ 1 1
+  - series: up{cluster="k0s",deployment="local-k0s",job="kubernetes-apiserver",instance="kubernetes-apiserver:9090"}
+    values: 1+0x7
+  - series: up{cluster="k0s",deployment="local-k0s",job="prometheus",instance="prometheus:9090"}
+    values: 1+0x7
+  - series: up{cluster="k0s",deployment="local-k0s",job="loki",instance="loki:9090"}
+    values: 1+0x7
+  - series: up{cluster="k0s",deployment="local-k0s",job="alloy",instance="alloy:9090"}
+    values: 1+0x7
+  - series: up{cluster="k0s",deployment="local-k0s",job="grafana",instance="grafana:9090"}
+    values: 1+0x7
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: FleetK0sMetricsUnavailable
+    exp_alerts: []
+  - eval_time: 5m
+    alertname: FleetK0sMetricsUnavailable
+    exp_alerts:
+    - exp_labels:
+        cluster: k0s
+        deployment: local-k0s
+        job: node-exporter
+        severity: warning
+      exp_annotations:
+        summary: 'Required k0s metrics job unavailable: node-exporter'
+        description: A target is down or this expected job has no discovered targets.
+          Check discovery, credentials, TLS, and exporter health; missing telemetry
+          is not healthy zero.
+    - exp_labels:
+        cluster: k0s
+        deployment: local-k0s
+        job: kube-state-metrics
+        instance: kube-state-metrics:9090
+        severity: warning
+      exp_annotations:
+        summary: 'Required k0s metrics job unavailable: kube-state-metrics'
+        description: A target is down or this expected job has no discovered targets.
+          Check discovery, credentials, TLS, and exporter health; missing telemetry
+          is not healthy zero.
+  - eval_time: 6m
+    alertname: FleetK0sMetricsUnavailable
+    exp_alerts: []
+- name: node conditions require observed unhealthy state and the hold time
+  interval: 1m
+  input_series:
+  - series: kube_node_status_condition{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",node="bad-node",condition="Ready",status="true"}
+    values: 0+0x6
+  - series: kube_node_status_condition{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",node="bad-node",condition="MemoryPressure",status="true"}
+    values: 1+0x6
+  - series: kube_node_status_condition{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",node="good-node",condition="Ready",status="true"}
+    values: 1+0x6
+  - series: kube_node_status_condition{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",node="good-node",condition="MemoryPressure",status="true"}
+    values: 0+0x6
+  - series: kube_node_info{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",node="no-readiness-observation"}
+    values: 1+0x6
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: FleetK0sNodeNotReady
+    exp_alerts: []
+  - eval_time: 5m
+    alertname: FleetK0sNodeNotReady
+    exp_alerts:
+    - exp_labels:
+        cluster: k0s
+        deployment: local-k0s
+        job: kube-state-metrics
+        node: bad-node
+        condition: Ready
+        status: 'true'
+        severity: warning
+      exp_annotations:
+        summary: k0s node bad-node is not Ready
+        description: Inspect node conditions, kubelet health, and the Kubernetes dashboard.
+          If state metrics are absent, inspect scrape availability and metric coverage
+          instead of assuming readiness.
+  - eval_time: 4m
+    alertname: FleetK0sNodePressure
+    exp_alerts: []
+  - eval_time: 5m
+    alertname: FleetK0sNodePressure
+    exp_alerts:
+    - exp_labels:
+        cluster: k0s
+        deployment: local-k0s
+        job: kube-state-metrics
+        node: bad-node
+        condition: MemoryPressure
+        status: 'true'
+        severity: warning
+      exp_annotations:
+        summary: k0s node bad-node reports MemoryPressure
+        description: Inspect node capacity and affected workloads before increasing
+          container budgets or restarting workloads.
+- name: filesystem threshold excludes boundary read-only virtual and absent values
+  interval: 1m
+  input_series:
+  - series: node_filesystem_avail_bytes{cluster="k0s",deployment="local-k0s",job="node-exporter",node="low",device="/dev/vda1",mountpoint="/",fstype="ext4"}
+    values: 5+0x11
+  - series: node_filesystem_size_bytes{cluster="k0s",deployment="local-k0s",job="node-exporter",node="low",device="/dev/vda1",mountpoint="/",fstype="ext4"}
+    values: 100+0x11
+  - series: node_filesystem_readonly{cluster="k0s",deployment="local-k0s",job="node-exporter",node="low",device="/dev/vda1",mountpoint="/",fstype="ext4"}
+    values: 0+0x11
+  - series: node_filesystem_avail_bytes{cluster="k0s",deployment="local-k0s",job="node-exporter",node="boundary",device="/dev/vda1",mountpoint="/",fstype="ext4"}
+    values: 10+0x11
+  - series: node_filesystem_size_bytes{cluster="k0s",deployment="local-k0s",job="node-exporter",node="boundary",device="/dev/vda1",mountpoint="/",fstype="ext4"}
+    values: 100+0x11
+  - series: node_filesystem_readonly{cluster="k0s",deployment="local-k0s",job="node-exporter",node="boundary",device="/dev/vda1",mountpoint="/",fstype="ext4"}
+    values: 0+0x11
+  - series: node_filesystem_avail_bytes{cluster="k0s",deployment="local-k0s",job="node-exporter",node="read-only",device="/dev/vda1",mountpoint="/",fstype="ext4"}
+    values: 5+0x11
+  - series: node_filesystem_size_bytes{cluster="k0s",deployment="local-k0s",job="node-exporter",node="read-only",device="/dev/vda1",mountpoint="/",fstype="ext4"}
+    values: 100+0x11
+  - series: node_filesystem_readonly{cluster="k0s",deployment="local-k0s",job="node-exporter",node="read-only",device="/dev/vda1",mountpoint="/",fstype="ext4"}
+    values: 1+0x11
+  - series: node_filesystem_avail_bytes{cluster="k0s",deployment="local-k0s",job="node-exporter",node="virtual",device="/dev/vda1",mountpoint="/",fstype="tmpfs"}
+    values: 1+0x11
+  - series: node_filesystem_size_bytes{cluster="k0s",deployment="local-k0s",job="node-exporter",node="virtual",device="/dev/vda1",mountpoint="/",fstype="tmpfs"}
+    values: 100+0x11
+  - series: node_filesystem_readonly{cluster="k0s",deployment="local-k0s",job="node-exporter",node="virtual",device="/dev/vda1",mountpoint="/",fstype="tmpfs"}
+    values: 0+0x11
+  - series: node_filesystem_size_bytes{cluster="k0s",deployment="local-k0s",job="node-exporter",node="missing-value",device="/dev/vda1",mountpoint="/",fstype="ext4"}
+    values: 100+0x11
+  - series: node_filesystem_readonly{cluster="k0s",deployment="local-k0s",job="node-exporter",node="missing-value",device="/dev/vda1",mountpoint="/",fstype="ext4"}
+    values: 0+0x11
+  alert_rule_test:
+  - eval_time: 9m
+    alertname: FleetK0sFilesystemLowAvailable
+    exp_alerts: []
+  - eval_time: 10m
+    alertname: FleetK0sFilesystemLowAvailable
+    exp_alerts:
+    - exp_labels:
+        cluster: k0s
+        deployment: local-k0s
+        job: node-exporter
+        node: low
+        device: "/dev/vda1"
+        mountpoint: "/"
+        fstype: ext4
+        severity: warning
+      exp_annotations:
+        summary: k0s filesystem low:/ has under 10% available
+        description: Check persistent storage, image/cache growth, and metrics/log
+          retention. Virtual, pod-local, and read-only mounts are excluded; bind mounts
+          must not be summed as separate capacity.
+- name: recent OOM needs restart timestamp and reason while old evidence expires
+  interval: 1m
+  input_series:
+  - series: kube_pod_container_status_waiting_reason{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="crashing",container="app",uid="uid-crashing",reason="CrashLoopBackOff"}
+    values: 1+0x27
+  - series: kube_pod_container_status_waiting_reason{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="healthy",container="app",uid="uid-healthy",reason="CrashLoopBackOff"}
+    values: 0+0x27
+  - series: kube_pod_container_status_restarts_total{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="new-oom",container="app",uid="uid-new-oom"}
+    values: 0+0x9 1+0x17
+  - series: kube_pod_container_status_last_terminated_reason{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="new-oom",container="app",uid="uid-new-oom",reason="OOMKilled"}
+    values: 1+0x27
+  - series: kube_pod_container_status_last_terminated_timestamp{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="new-oom",container="app",uid="uid-new-oom"}
+    values: 600+0x27
+  - series: kube_pod_container_status_restarts_total{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="old-oom",container="app",uid="uid-old-oom"}
+    values: 0+0x9 1+0x17
+  - series: kube_pod_container_status_last_terminated_reason{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="old-oom",container="app",uid="uid-old-oom",reason="OOMKilled"}
+    values: 1+0x27
+  - series: kube_pod_container_status_last_terminated_timestamp{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="old-oom",container="app",uid="uid-old-oom"}
+    values: 0+0x27
+  - series: kube_pod_container_status_restarts_total{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="no-restart",container="app",uid="uid-no-restart"}
+    values: 0+0x27
+  - series: kube_pod_container_status_last_terminated_reason{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="no-restart",container="app",uid="uid-no-restart",reason="OOMKilled"}
+    values: 1+0x27
+  - series: kube_pod_container_status_last_terminated_timestamp{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="no-restart",container="app",uid="uid-no-restart"}
+    values: 600+0x27
+  - series: kube_pod_container_status_restarts_total{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="missing-timestamp",container="app",uid="uid-missing-timestamp"}
+    values: 0+0x9 1+0x17
+  - series: kube_pod_container_status_last_terminated_reason{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",pod="missing-timestamp",container="app",uid="uid-missing-timestamp",reason="OOMKilled"}
+    values: 1+0x27
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: FleetK0sContainerCrashLoop
+    exp_alerts: []
+  - eval_time: 5m
+    alertname: FleetK0sContainerCrashLoop
+    exp_alerts:
+    - exp_labels:
+        cluster: k0s
+        deployment: local-k0s
+        job: kube-state-metrics
+        namespace: fleet-recall
+        pod: crashing
+        container: app
+        uid: uid-crashing
+        reason: CrashLoopBackOff
+        severity: warning
+      exp_annotations:
+        summary: Container fleet-recall/crashing:app is crash looping
+        description: Open pod logs and Kubernetes Events; inspect configuration, startup
+          failures, and resource pressure.
+  - eval_time: 15m
+    alertname: FleetK0sContainerRecentOomRestart
+    exp_alerts:
+    - exp_labels:
+        cluster: k0s
+        deployment: local-k0s
+        job: kube-state-metrics
+        namespace: fleet-recall
+        pod: new-oom
+        container: app
+        uid: uid-new-oom
+        severity: warning
+      exp_annotations:
+        summary: Recent OOM restart in fleet-recall/new-oom:app
+        description: A restart increase and a recent OOM termination agree for this
+          pod UID. Compare working set, explicit memory limit, and pod logs. Missing
+          termination timestamp metrics do not assert an OOM restart.
+  - eval_time: 26m
+    alertname: FleetK0sContainerRecentOomRestart
+    exp_alerts: []
+- name: CronJob initial grace suspend active execution and hold time are respected
+  interval: 1m
+  input_series:
+  - series: kube_cronjob_created{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="young"}
+    values: 120+0x24
+  - series: kube_cronjob_next_schedule_time{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="young"}
+    values: 180+0x24
+  - series: kube_cronjob_spec_suspend{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="young"}
+    values: 0+0x24
+  - series: kube_cronjob_status_active{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="young"}
+    values: 0+0x24
+  - series: kube_cronjob_created{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="suspended"}
+    values: 0+0x24
+  - series: kube_cronjob_next_schedule_time{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="suspended"}
+    values: 60+0x24
+  - series: kube_cronjob_spec_suspend{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="suspended"}
+    values: 1+0x24
+  - series: kube_cronjob_status_active{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="suspended"}
+    values: 0+0x24
+  - series: kube_cronjob_created{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="active"}
+    values: 0+0x24
+  - series: kube_cronjob_next_schedule_time{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="active"}
+    values: 60+0x24
+  - series: kube_cronjob_spec_suspend{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="active"}
+    values: 0+0x24
+  - series: kube_cronjob_status_active{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="active"}
+    values: 1+0x24
+  - series: kube_cronjob_created{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="future"}
+    values: 0+0x24
+  - series: kube_cronjob_next_schedule_time{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="future"}
+    values: 100000+0x24
+  - series: kube_cronjob_spec_suspend{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="future"}
+    values: 0+0x24
+  - series: kube_cronjob_status_active{cluster="k0s",deployment="local-k0s",job="kube-state-metrics",namespace="fleet-recall",cronjob="future"}
+    values: 0+0x24
+  alert_rule_test:
+  - eval_time: 16m
+    alertname: FleetK0sCronJobScheduleDelayed
+    exp_alerts: []
+  - eval_time: 22m
+    alertname: FleetK0sCronJobScheduleDelayed
+    exp_alerts: []
+  - eval_time: 23m
+    alertname: FleetK0sCronJobScheduleDelayed
+    exp_alerts:
+    - exp_labels:
+        cluster: k0s
+        deployment: local-k0s
+        job: kube-state-metrics
+        namespace: fleet-recall
+        cronjob: young
+        severity: warning
+      exp_annotations:
+        summary: CronJob fleet-recall/young is overdue
+        description: An unsuspended, inactive CronJob older than 15 minutes is more
+          than 10 minutes past its next schedule for 5 minutes. Inspect scheduler
+          Events and deadlines. This does not assess success of previous executions.

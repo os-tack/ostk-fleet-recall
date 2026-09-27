@@ -25,6 +25,28 @@ spec:
           restartPolicy: Never
           enableServiceLinks: false
           automountServiceAccountToken: false
+          # The textfile exporter reads the final, atomic snapshot as UID 10001.
+          # Keep one non-overlapping worker identity in this collector directory.
+          initContainers:
+            - name: prepare-metrics
+              image: busybox:1.37.0
+              command: [sh, -c, "chown 10001:10001 /metrics && chmod 750 /metrics"]
+              securityContext:
+                runAsUser: 0
+                runAsNonRoot: false
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                seccompProfile:
+                  type: RuntimeDefault
+                capabilities:
+                  drop: [ALL]
+                  add: [CHOWN, FOWNER]
+              resources:
+                requests: {cpu: 5m, memory: 8Mi}
+                limits: {cpu: 100m, memory: 32Mi}
+              volumeMounts:
+                - name: metrics
+                  mountPath: /metrics
           containers:
             - name: worker
               image: ostk-fleet-recall:__IMAGE_TAG__
@@ -36,6 +58,9 @@ spec:
                 - /etc/fleet-recall/worker-sources.json
                 - --steps
                 - project,embed
+              env:
+                - name: FLEET_RECALL_METRICS_TEXTFILE
+                  value: /metrics/worker.prom
               envFrom:
                 - configMapRef:
                     name: fleet-env
@@ -50,6 +75,8 @@ spec:
                   cpu: 100m
                   memory: 256Mi
               volumeMounts:
+                - name: metrics
+                  mountPath: /metrics
                 - name: sources
                   mountPath: /etc/fleet-recall
                   readOnly: true
@@ -60,6 +87,10 @@ spec:
                   mountPath: /etc/crdb
                   readOnly: true
           volumes:
+            - name: metrics
+              hostPath:
+                path: /var/lib/fleet-recall/observability/worker
+                type: DirectoryOrCreate
             - name: sources
               configMap:
                 name: fleet-sources

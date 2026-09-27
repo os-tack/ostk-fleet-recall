@@ -17,6 +17,7 @@ data:
   FLEET_RECALL_EMBEDDING_MODEL_PATH: /opt/ostk/models/potion-retrieval-32M
   FLEET_RECALL_EMBEDDING_MODEL_SHA256: __MODEL_SHA256__
   RUST_LOG: ostk_fleet_recall=info
+  FLEET_RECALL_LOG_FORMAT: json
 ---
 # The ingress reads only its own variables; the worker's sources file is
 # minimal because the ingest steps (git, transcripts, CI) run on a host with

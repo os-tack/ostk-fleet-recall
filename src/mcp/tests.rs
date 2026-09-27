@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use ostk_recall_core::PrivacyTier;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tracing::instrument::WithSubscriber as _;
 use uuid::Uuid;
 
 use crate::FleetScope;
@@ -165,11 +166,14 @@ async fn duplex_exchange_bytes_with_deadline(
 ) -> Vec<Value> {
     let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
-    let serve_task = tokio::spawn(async move {
-        server
-            .serve_with_deadline(server_reader, server_writer, deadline)
-            .await
-    });
+    let serve_task = tokio::spawn(
+        async move {
+            server
+                .serve_with_deadline(server_reader, server_writer, deadline)
+                .await
+        }
+        .with_current_subscriber(),
+    );
 
     let (client_reader, mut client_writer) = tokio::io::split(client_stream);
     client_writer.write_all(input).await.unwrap();
@@ -237,6 +241,152 @@ async fn deadline_keeps_request_id_and_marks_remember_outcome_unknown() {
             .as_str()
             .unwrap()
             .contains("same idempotency_key")
+    );
+}
+
+#[derive(Clone, Default)]
+struct TelemetryLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for TelemetryLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Capture actual completion events, including the stdio deadline, so a
+/// timeout cannot silently acquire a second cancelled terminal observation.
+#[tokio::test(flavor = "current_thread")]
+async fn telemetry_covers_dispatch_and_framing_without_recording_payloads() {
+    crate::telemetry::prepare_test_capture();
+    let log = TelemetryLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    exercise_mcp_telemetry().with_subscriber(subscriber).await;
+    assert_mcp_telemetry_events(&log);
+}
+
+async fn exercise_mcp_telemetry() {
+    let fake = Arc::new(FakeService::default());
+    let normal = server(&fake);
+    let tool_request = |name: &str, action: &str| {
+        json!({
+            "jsonrpc": "2.0", "id": "private-request-id", "method": "tools/call",
+            "params": {"name": name, "arguments": {
+                "action": action, "query": "private-query", "text": "private-document"
+            }}
+        })
+    };
+    normal
+        .handle_line(r#"{"jsonrpc":"2.0","id":"private-request-id","method":"ping"}"#)
+        .await;
+    normal.handle_value(tool_request("recall", "search")).await;
+    for failure in [RememberFailure::Unavailable, RememberFailure::Refused] {
+        let service = Arc::new(FakeService {
+            remember_failure: Some(failure),
+            ..FakeService::default()
+        });
+        server(&service)
+            .handle_value(tool_request("remember", "record"))
+            .await;
+    }
+    normal
+        .handle_value(tool_request("recall", "private-action"))
+        .await;
+    normal
+        .handle_value(tool_request("private-tool", "private-action"))
+        .await;
+    normal
+        .handle_value(json!({"jsonrpc": "2.0", "id": 1, "method": "private-method"}))
+        .await;
+    normal.handle_line("private-invalid-json").await;
+    normal
+        .handle_value(json!(["private-invalid-envelope"]))
+        .await;
+    let mut notification = tool_request("remember", "record");
+    notification.as_object_mut().unwrap().remove("id");
+    assert!(normal.handle_value(notification).await.is_none());
+    duplex_exchange_bytes_with_deadline(normal.clone(), &[0xff, b'\n'], Duration::from_secs(1))
+        .await;
+    duplex_exchange_bytes_with_deadline(
+        normal,
+        &vec![b'x'; super::MAX_MCP_FRAME_BYTES + 1],
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let slow = server(&Arc::new(FakeService {
+        delay: Duration::from_millis(100),
+        ..FakeService::default()
+    }));
+    duplex_exchange_with_deadline(
+        slow.clone(),
+        &format!("{}\n", tool_request("remember", "record")),
+        Duration::from_millis(1),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            slow.handle_value(tool_request("recall", "search")),
+        )
+        .await
+        .is_err()
+    );
+}
+
+fn assert_mcp_telemetry_events(log: &TelemetryLog) {
+    let encoded = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    for private in [
+        "private-",
+        "sensitive database detail",
+        "default-project",
+        "default-agent",
+        "default-session",
+        "claim 41",
+        &tenant_id().to_string(),
+    ] {
+        assert!(!encoded.contains(private), "telemetry leaked {private}");
+    }
+    let completions: Vec<_> = encoded
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["fields"]["event"] == "operation.completed")
+        .map(|event| {
+            assert_eq!(event["fields"]["component"], "mcp");
+            (
+                event["fields"]["operation"].as_str().unwrap().to_owned(),
+                event["fields"]["outcome"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let expected = [
+        ("ping", "success"),
+        ("recall.search", "success"),
+        ("remember.record", "error"),
+        ("remember.record", "refused"),
+        ("recall.unknown", "invalid"),
+        ("tools.call.unknown", "invalid"),
+        ("protocol.unknown", "invalid"),
+        ("protocol.parse", "invalid"),
+        ("protocol.invalid", "invalid"),
+        ("notification", "skipped"),
+        ("frame.invalid_utf8", "invalid"),
+        ("frame.oversize", "invalid"),
+        ("remember.record", "timeout"),
+        ("recall.search", "cancelled"),
+    ];
+    assert_eq!(
+        completions,
+        expected.map(|(operation, outcome)| (operation.to_owned(), outcome.to_owned()))
     );
 }
 

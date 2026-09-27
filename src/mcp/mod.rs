@@ -4,6 +4,7 @@ pub mod http;
 pub(crate) mod protocol;
 pub mod scopes;
 mod server;
+mod telemetry;
 mod tools;
 
 pub use protocol::{JsonRpcError, JsonRpcResponse, MODERN_PROTOCOL_VERSION};

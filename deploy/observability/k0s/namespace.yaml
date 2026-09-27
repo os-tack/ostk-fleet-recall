@@ -1,0 +1,9 @@
+# Private single-node observability stack. Services remain ClusterIP; use authenticated kubectl port-forward.
+# HostPath persistence stays on the k0s VM and is not portable HA storage.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fleet-observability
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
