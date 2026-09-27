@@ -37,6 +37,7 @@ use ostk_recall_core::ChunkEmbedder;
 
 use crate::memory_contracts::chunk_identity::DistanceMetricV1;
 use crate::memory_contracts::digest::Sha256Digest;
+use crate::telemetry::{self, Outcome};
 
 use super::dense::{EMBEDDING_DIMENSIONS, EmbeddingModelDescriptorV1, EmbeddingProvider};
 use super::error::{RecallProjectionError, RecallProjectionResult};
@@ -137,32 +138,47 @@ impl EmbeddingProvider for ChunkEmbedderProvider {
     }
 
     async fn embed(&self, lexical_text: &str) -> RecallProjectionResult<Vec<f32>> {
+        let observation = telemetry::start("embedding", "embed");
         let embedder = Arc::clone(&self.embedder);
         let text = lexical_text.to_owned();
         let text_bytes = text.len();
-        let vectors = tokio::task::spawn_blocking(move || embedder.encode_batch(&[text.as_str()]))
-            .await
-            .map_err(|error| {
+        let span = observation.span();
+        let vectors = match tokio::task::spawn_blocking(move || {
+            span.in_scope(|| embedder.encode_batch(&[text.as_str()]))
+        })
+        .await
+        {
+            Ok(vectors) => vectors,
+            Err(error) => {
                 // The panic payload is left out: it is the model's own text and
                 // could quote the input.
                 let outcome = if error.is_panic() {
+                    observation.finish(Outcome::Error);
                     "panicked"
                 } else {
+                    observation.finish(Outcome::Cancelled);
                     "was cancelled"
                 };
-                RecallProjectionError::EmbeddingProvider(format!(
+                return Err(RecallProjectionError::EmbeddingProvider(format!(
                     "model {} {outcome} while encoding a {text_bytes}-byte text",
                     self.embedder.model_id()
-                ))
-            })?;
+                )));
+            }
+        };
         let returned = vectors.len();
         let Ok([vector]) = <[Vec<f32>; 1]>::try_from(vectors) else {
+            observation.finish(Outcome::Invalid);
             return Err(RecallProjectionError::EmbeddingProvider(format!(
                 "model {} returned {returned} vectors for one text",
                 self.embedder.model_id()
             )));
         };
-        self.check_vector(&vector, text_bytes)?;
+        if let Err(error) = self.check_vector(&vector, text_bytes) {
+            observation.finish(Outcome::Invalid);
+            return Err(error);
+        }
+        telemetry::add_units("embedding", "embed", "embeddings", 1);
+        observation.finish(Outcome::Success);
         Ok(vector)
     }
 }
@@ -170,6 +186,7 @@ impl EmbeddingProvider for ChunkEmbedderProvider {
 #[cfg(test)]
 mod tests {
     use sha2::{Digest as _, Sha256};
+    use std::sync::Mutex;
 
     use super::*;
     use crate::projectors::{admit_embedding, embedding_identity};
@@ -368,5 +385,56 @@ mod tests {
                 "neither the text nor a panic payload may reach the error: {message:?}"
             );
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct TelemetryLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TelemetryLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn telemetry_distinguishes_invalid_vectors_and_panics_without_embedding_content() {
+        crate::telemetry::prepare_test_capture();
+        let log = TelemetryLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        for behaviour in [Behaviour::Healthy, Behaviour::Zero, Behaviour::Panic] {
+            let result = provider(behaviour).embed("private-embedding-content").await;
+            assert_eq!(result.is_ok(), matches!(behaviour, Behaviour::Healthy));
+        }
+
+        let encoded = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        for private in [
+            "private-embedding-content",
+            "stub-model2vec-512",
+            "stub encode",
+        ] {
+            assert!(!encoded.contains(private), "telemetry leaked {private}");
+        }
+        let outcomes: Vec<_> = encoded
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["fields"]["event"] == "operation.completed")
+            .map(|event| {
+                assert_eq!(event["fields"]["component"], "embedding");
+                assert_eq!(event["fields"]["operation"], "embed");
+                event["fields"]["outcome"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(outcomes, ["success", "invalid", "error"]);
     }
 }

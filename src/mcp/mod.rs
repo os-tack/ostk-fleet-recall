@@ -3,6 +3,7 @@
 
 mod protocol;
 mod server;
+mod telemetry;
 mod tools;
 
 pub use protocol::{JsonRpcError, JsonRpcResponse};

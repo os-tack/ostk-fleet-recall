@@ -1,0 +1,160 @@
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: a replacement worker snapshot clears the prior failure
+    interval: 1m
+    input_series:
+      - series: 'up{job="fleet-worker-textfile", instance="worker:9100"}'
+        values: '1+0x6'
+      - series: 'fleet_recall_snapshot_time_seconds{job="fleet-worker-textfile", instance="worker:9100"}'
+        values: '0 0 120+60x4'
+      - series: 'fleet_recall_operations_total{job="fleet-worker-textfile", instance="worker:9100", component="process", operation="worker", outcome="error"}'
+        values: '1 1 stale _x3'
+      - series: 'fleet_recall_operations_total{job="fleet-worker-textfile", instance="worker:9100", component="process", operation="worker", outcome="success"}'
+        values: '_ _ 1+0x4'
+    promql_expr_test:
+      - expr: fleet_recall_worker_last_run_failed
+        eval_time: 1m
+        exp_samples:
+          - labels: 'fleet_recall_worker_last_run_failed{job="fleet-worker-textfile", instance="worker:9100"}'
+            value: 1
+      - expr: fleet_recall_worker_last_run_failed
+        eval_time: 2m
+        exp_samples:
+          - labels: 'fleet_recall_worker_last_run_failed{job="fleet-worker-textfile", instance="worker:9100"}'
+            value: 0
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: FleetRecallWorkerFailed
+        exp_alerts:
+          - exp_labels:
+              job: fleet-worker-textfile
+              instance: worker:9100
+              severity: warning
+            exp_annotations:
+              summary: "The last published worker run failed on worker:9100"
+              description: "Inspect process/worker completion and the protected worker stdout report for the failed step or startup check."
+      - eval_time: 2m
+        alertname: FleetRecallWorkerFailed
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: FleetRecallWorkerSnapshotStale
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: FleetRecallWorkerSnapshotMissing
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: FleetRecallWorkerSnapshotWrongCommand
+        exp_alerts: []
+
+  - name: a previously successful worker becomes stale only after the age and hold thresholds
+    interval: 1m
+    input_series:
+      - series: 'up{job="fleet-worker-textfile", instance="stale:9100"}'
+        values: '1+0x17'
+      - series: 'fleet_recall_snapshot_time_seconds{job="fleet-worker-textfile", instance="stale:9100"}'
+        values: '0+0x17'
+      - series: 'fleet_recall_operations_total{job="fleet-worker-textfile", instance="stale:9100", component="process", operation="worker", outcome="success"}'
+        values: '1+0x17'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: FleetRecallWorkerSnapshotStale
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: FleetRecallWorkerSnapshotStale
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: FleetRecallWorkerSnapshotStale
+        exp_alerts:
+          - exp_labels:
+              job: fleet-worker-textfile
+              instance: stale:9100
+              severity: warning
+            exp_annotations:
+              summary: "Worker snapshot is more than 15 minutes old"
+              description: "Check scheduling, process termination, export errors, and file permissions. Tune the age limit to the schedule and maximum run duration."
+      - eval_time: 17m
+        alertname: FleetRecallWorkerFailed
+        exp_alerts: []
+
+  - name: missing snapshots and snapshots from another command remain distinguishable
+    interval: 1m
+    input_series:
+      - series: 'up{job="fleet-worker-textfile", instance="missing:9100"}'
+        values: '1+0x6'
+      - series: 'up{job="fleet-worker-textfile", instance="wrong-command:9100"}'
+        values: '1+0x6'
+      - series: 'fleet_recall_snapshot_time_seconds{job="fleet-worker-textfile", instance="wrong-command:9100"}'
+        values: '0+60x6'
+      - series: 'fleet_recall_operations_total{job="fleet-worker-textfile", instance="wrong-command:9100", component="process", operation="health", outcome="success"}'
+        values: '1+0x6'
+    promql_expr_test:
+      - expr: fleet_recall_worker_last_run_failed
+        eval_time: 6m
+        exp_samples: []
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: FleetRecallWorkerSnapshotMissing
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: FleetRecallWorkerSnapshotMissing
+        exp_alerts:
+          - exp_labels:
+              job: fleet-worker-textfile
+              instance: missing:9100
+              severity: warning
+            exp_annotations:
+              summary: "Node exporter is up but no Fleet worker snapshot is visible"
+              description: "Check the textfile collector directory, file readability, scheduler, and first-run completion."
+      - eval_time: 0m
+        alertname: FleetRecallWorkerSnapshotWrongCommand
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: FleetRecallWorkerSnapshotWrongCommand
+        exp_alerts:
+          - exp_labels:
+              job: fleet-worker-textfile
+              instance: wrong-command:9100
+              severity: warning
+            exp_annotations:
+              summary: "Fleet snapshot has no terminal worker process outcome"
+              description: "Reserve this collector endpoint and snapshot destination for one scheduled worker identity; another command may have overwritten the file."
+      - eval_time: 6m
+        alertname: FleetRecallWorkerFailed
+        exp_alerts: []
+
+  - name: live error alerts require sustained errors above five percent and sufficient traffic
+    interval: 1m
+    input_series:
+      - series: 'fleet_recall_operations_total{job="fleet-recall", instance="high:9091", component="mcp", operation="recall.search", outcome="success"}'
+        values: '0+9x12'
+      - series: 'fleet_recall_operations_total{job="fleet-recall", instance="high:9091", component="mcp", operation="recall.search", outcome="error"}'
+        values: '0+1x12'
+      - series: 'fleet_recall_operations_total{job="fleet-recall", instance="boundary:9091", component="mcp", operation="recall.search", outcome="success"}'
+        values: '0+19x12'
+      - series: 'fleet_recall_operations_total{job="fleet-recall", instance="boundary:9091", component="mcp", operation="recall.search", outcome="error"}'
+        values: '0+1x12'
+      - series: 'fleet_recall_operations_total{job="fleet-recall", instance="low-volume:9091", component="mcp", operation="recall.search", outcome="timeout"}'
+        values: '0+1x12'
+      - series: 'fleet_recall_operations_total{job="fleet-recall", instance="refused:9091", component="mcp", operation="remember.record", outcome="success"}'
+        values: '0+10x12'
+      - series: 'fleet_recall_operations_total{job="fleet-recall", instance="refused:9091", component="mcp", operation="remember.record", outcome="refused"}'
+        values: '0+10x12'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: FleetRecallMcpErrorRate
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: FleetRecallMcpErrorRate
+        exp_alerts:
+          - exp_labels:
+              job: fleet-recall
+              instance: high:9091
+              operation: recall.search
+              severity: warning
+            exp_annotations:
+              summary: "MCP errors exceed 5% for recall.search"
+              description: "Inspect operation.completed events, database retries, and embedding failures. Refused and invalid requests are excluded from the error numerator."

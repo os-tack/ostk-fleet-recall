@@ -36,6 +36,7 @@ pub mod remember_runtime;
 pub mod service;
 pub mod spec_conformance;
 pub mod store;
+pub mod telemetry;
 pub mod worker;
 
 pub use application::CockroachMemoryService;

@@ -2265,6 +2265,8 @@ is `#[ignore]` and documents its environment at the top of the file.
 - [Project primer](docs/PROJECT_PRIMER.md).
 - [Migration operations](docs/MIGRATIONS.md) and
   [security policy](docs/SECURITY.md).
+- [Operational telemetry](docs/TELEMETRY.md): Prometheus metrics, JSON events,
+  worker snapshots, alert examples, and monitoring runbooks.
 - [Collected-items runbook](docs/COLLECTED_ITEMS_RUNBOOK.md): collectors,
   imports, capture, and webhook ingress in order, the first live run against
   each provider, and a recorded end-to-end run.
