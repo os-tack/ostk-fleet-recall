@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: boundary
+  namespace: fleet-recall
+  labels:
+    fleet-recall.dev/phase: boundary
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        job: boundary
+    spec:
+      restartPolicy: Never
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      containers:
+        - name: boundary
+          image: cockroachdb/cockroach:v26.2.3
+          command: ["/bin/sh", "/scripts/boundary.sh"]
+          env:
+            - name: CRDB_HOST
+              value: cockroach.fleet-recall.svc.cluster.local:26257
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: policies
+              mountPath: /policies
+              readOnly: true
+            - name: certs
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: boundary-scripts
+        - name: policies
+          configMap:
+            name: cockroach-policies
+        - name: certs
+          secret:
+            secretName: crdb-root-client
+            defaultMode: 0400

@@ -1,0 +1,18 @@
+# Ory's reference self-service UI (chart ory/kratos-selfservice-ui-node
+# 0.64.0), which is also Hydra's login and consent app when `hydraAdminUrl`
+# is set. Plain http on the loopback, so secure cookies are disabled.
+kratosPublicUrl: http://kratos-public.ory.svc:80
+kratosBrowserUrl: http://localhost:4433
+kratosAdminUrl: http://kratos-admin.ory.svc:80
+hydraAdminUrl: http://hydra-admin.ory.svc:4445
+projectName: Fleet Recall (local)
+config:
+  # Required to enable consent; a __Host- prefix requires HTTPS cookies.
+  csrfCookieName: fleet-recall-local-csrf
+service:
+  type: ClusterIP
+  port: 80
+deployment:
+  extraEnv:
+    - name: DANGEROUSLY_DISABLE_SECURE_CSRF_COOKIES
+      value: "true"

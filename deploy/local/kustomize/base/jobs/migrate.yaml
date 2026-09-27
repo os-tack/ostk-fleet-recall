@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: fleet-recall
+  labels:
+    fleet-recall.dev/phase: migrate
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        job: migrate
+    spec:
+      restartPolicy: Never
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      containers:
+        - name: migrate
+          image: ostk-fleet-recall:__IMAGE_TAG__
+          imagePullPolicy: IfNotPresent
+          args: ["migrate"]
+          envFrom:
+            - configMapRef:
+                name: fleet-env
+            - secretRef:
+                name: db-url-migrator
+          volumeMounts:
+            - name: model
+              mountPath: /opt/ostk/models/potion-retrieval-32M
+              readOnly: true
+            - name: crdb-ca
+              mountPath: /etc/crdb
+              readOnly: true
+      volumes:
+        - name: model
+          hostPath:
+            path: __MODEL_BUNDLE_DIR__
+            type: Directory
+        - name: crdb-ca
+          secret:
+            secretName: crdb-ca

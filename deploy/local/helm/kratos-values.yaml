@@ -1,0 +1,94 @@
+# Ory Kratos (chart ory/kratos 0.64.0): identities, login and consent for
+# Hydra. Kratos answers Hydra's login challenge through `oauth2_provider.url`;
+# the self-service UI renders the flows on the Mac's loopback port 4455.
+# Secrets (dsn, secretsDefault, secretsCookie, secretsCipher) come from the
+# pre-created `kratos-secrets`. No courier: nothing is mailed locally.
+kratos:
+  # Browser flows use HTTP on localhost, so Kratos must issue non-secure cookies.
+  development: true
+  automigration:
+    enabled: true
+    # The chart's migration Job has no volume hooks, so migrate from an init
+    # container in the Kratos pod, which can mount the CockroachDB CA.
+    type: initContainer
+  identitySchemas:
+    "identity.default.schema.json": |
+      {"$id": "https://fleet-recall.local/schemas/identity.default.schema.json", "$schema": "http://json-schema.org/draft-07/schema#", "title": "Operator", "type": "object", "properties": {"traits": {"type": "object", "properties": {"email": {"type": "string", "format": "email", "title": "E-Mail", "minLength": 3, "ory.sh/kratos": {"credentials": {"password": {"identifier": true}}}}}, "required": ["email"], "additionalProperties": false}}}
+  config:
+    serve:
+      public:
+        base_url: http://localhost:4433/
+        cors:
+          enabled: true
+          allowed_origins:
+            - http://localhost:4455
+      admin:
+        base_url: http://kratos-admin.ory.svc/
+    oauth2_provider:
+      url: http://hydra-admin.ory.svc:4445
+    identity:
+      default_schema_id: default
+      schemas:
+        - id: default
+          url: file:///etc/config/identity.default.schema.json
+    selfservice:
+      default_browser_return_url: http://localhost:4455/
+      allowed_return_urls:
+        - http://localhost:4455
+        - http://localhost:4444
+      methods:
+        password:
+          enabled: true
+      flows:
+        error:
+          ui_url: http://localhost:4455/error
+        settings:
+          ui_url: http://localhost:4455/settings
+        recovery:
+          enabled: false
+        verification:
+          enabled: false
+        logout:
+          after:
+            default_browser_return_url: http://localhost:4455/login
+        login:
+          ui_url: http://localhost:4455/login
+        registration:
+          ui_url: http://localhost:4455/registration
+          after:
+            password:
+              hooks:
+                - hook: session
+    session:
+      cookie:
+        same_site: Lax
+    courier:
+      smtp:
+        connection_uri: smtps://unused:unused@mail.invalid:1025/?skip_ssl_verify=true
+courier:
+  enabled: false
+secret:
+  enabled: false
+  nameOverride: kratos-secrets
+service:
+  public:
+    type: ClusterIP
+    port: 80
+  admin:
+    type: ClusterIP
+    port: 80
+deployment:
+  extraVolumes:
+    - name: crdb-ca
+      secret:
+        secretName: crdb-ca
+  extraVolumeMounts:
+    - name: crdb-ca
+      mountPath: /etc/crdb
+      readOnly: true
+  automigration:
+    extraVolumeMounts:
+      - name: crdb-ca
+        mountPath: /etc/crdb
+        readOnly: true
+  automountServiceAccountToken: false

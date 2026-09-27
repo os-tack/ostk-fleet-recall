@@ -1,0 +1,106 @@
+# Lima VM for the local production-shaped Fleet Recall environment.
+#
+#   limactl start --name k0s --tty=false deploy/local/lima/k0s.yaml
+#
+# Apple Virtualization with nested virtualization (M3 or later, macOS 15 or
+# later) so the guest exposes /dev/kvm for Kata and, later, Firecracker. The
+# repository is mounted read-only at the same path so hostPath volumes can
+# reach the model bundle, the policy SQL, and exported image tars. k0s brings
+# its own containerd, so Lima's is disabled. Every port forward binds to the
+# Mac's 127.0.0.1 and targets a fixed NodePort; `static: true` forwards without
+# waiting for a guest listener, which NodePorts (iptables DNAT) never open.
+minimumLimaVersion: "2.0.0"
+base: template://debian-13
+vmType: vz
+nestedVirtualization: true
+cpus: 8
+memory: 24GiB
+disk: 120GiB
+containerd:
+  system: false
+  user: false
+mounts:
+  - location: /Users/scottmeyer/projects/aetia
+    writable: false
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y curl ca-certificates iptables conntrack socat jq
+      test -e /dev/kvm
+      for m in overlay br_netfilter vhost_vsock vhost_net; do
+        modprobe "$m" || echo "WARN: kernel module $m unavailable"
+      done
+      printf 'overlay\nbr_netfilter\nvhost_vsock\nvhost_net\n' >/etc/modules-load.d/fleet-recall.conf
+      printf 'net.bridge.bridge-nf-call-iptables=1\nnet.ipv4.ip_forward=1\n' >/etc/sysctl.d/99-k0s.conf
+      sysctl --system >/dev/null
+      mkdir -p /etc/k0s /var/lib/fleet-recall/crdb /var/lib/fleet-recall/spool
+      cat >/etc/k0s/k0s.yaml <<'K0S'
+      apiVersion: k0s.k0sproject.io/v1beta1
+      kind: ClusterConfig
+      metadata:
+        name: k0s
+      spec:
+        api:
+          sans:
+            - 127.0.0.1
+            - localhost
+            - host.lima.internal
+        telemetry:
+          enabled: false
+        network:
+          provider: kuberouter
+          kubeProxy:
+            mode: iptables
+      K0S
+      if [ ! -x /usr/local/bin/k0s ]; then
+        curl -sSLf https://get.k0s.sh | K0S_VERSION="${K0S_VERSION:-v1.35.8+k0s.1}" sh
+      fi
+      if ! k0s status >/dev/null 2>&1; then
+        k0s install controller --single -c /etc/k0s/k0s.yaml || true
+      fi
+      k0s start || true
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+      # The Lima user, not root, drives Firecracker later; group membership is
+      # a user-mode step so the script never references LIMA_CIDATA_* variables.
+      sudo usermod -aG kvm "$(id -un)"
+portForwards:
+  - guestPort: 6443
+    hostPort: 6443
+    static: true
+  - guestPort: 30257
+    hostPort: 26258
+    static: true
+  - guestPort: 30081
+    hostPort: 8082
+    static: true
+  - guestPort: 30566
+    hostPort: 4566
+    static: true
+  - guestPort: 30444
+    hostPort: 4444
+    static: true
+  - guestPort: 30445
+    hostPort: 4445
+    static: true
+  - guestPort: 30433
+    hostPort: 4433
+    static: true
+  - guestPort: 30455
+    hostPort: 4455
+    static: true
+  - guestPort: 30088
+    hostPort: 8088
+    static: true
+  - guestPort: 30787
+    hostPort: 8787
+    static: true
+  - guestPort: 30080
+    hostPort: 8080
+    static: true

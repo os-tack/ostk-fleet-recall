@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ory-db-bootstrap
+  namespace: fleet-recall
+  labels:
+    fleet-recall.dev/phase: ory-db-bootstrap
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        job: ory-db-bootstrap
+    spec:
+      restartPolicy: Never
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      containers:
+        - name: bootstrap
+          image: cockroachdb/cockroach:v26.2.3
+          command: ["/bin/sh", "/scripts/ory-db-bootstrap.sh"]
+          env:
+            - name: CRDB_HOST
+              value: cockroach.fleet-recall.svc.cluster.local:26257
+          envFrom:
+            - secretRef:
+                name: crdb-passwords
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: certs
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: ory-db-bootstrap-scripts
+        - name: certs
+          secret:
+            secretName: crdb-root-client
+            defaultMode: 0400

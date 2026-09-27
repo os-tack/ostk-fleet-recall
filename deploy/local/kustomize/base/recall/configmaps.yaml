@@ -1,0 +1,56 @@
+# Shared, non-secret runtime environment for every recall workload, and the
+# sources files. Secrets (database URLs, pins, content key) come from Secrets
+# created by bootstrap.sh so each pod mounts only its own.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fleet-env
+  namespace: fleet-recall
+  labels:
+    fleet-recall.dev/phase: config
+data:
+  FLEET_RECALL_TENANT_ID: 0198a849-f6ae-7d61-9800-000000000001
+  FLEET_RECALL_PROJECT: local-k0s
+  FLEET_RECALL_AGENT: k0s
+  FLEET_RECALL_MAX_CONNECTIONS: "4"
+  FLEET_RECALL_EMBEDDING_MODEL: minishlab/potion-retrieval-32M
+  FLEET_RECALL_EMBEDDING_MODEL_PATH: /opt/ostk/models/potion-retrieval-32M
+  FLEET_RECALL_EMBEDDING_MODEL_SHA256: __MODEL_SHA256__
+  RUST_LOG: ostk_fleet_recall=info
+---
+# The ingress reads only its own variables; the worker's sources file is
+# minimal because the ingest steps (git, transcripts, CI) run on a host with
+# git and gh, not in this image. M3 adds the transcript spool group here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fleet-sources
+  namespace: fleet-recall
+  labels:
+    fleet-recall.dev/phase: config
+data:
+  worker-sources.json: |
+    {
+      "schema_version": 1
+    }
+  ingress-sources.json: |
+    {
+      "schema_version": 1,
+      "collectors": [
+        {
+          "provider": "slack",
+          "connector_principal": "principal.slack",
+          "connector_instance": "slack.local",
+          "provider_scope_id": "T0LOCAL000001",
+          "audience": {"private_containers": []},
+          "settings": {
+            "token_env": "FLEET_RECALL_SLACK_BOT_TOKEN",
+            "channels": ["C0LOCAL000001"],
+            "rescan_days": 7,
+            "reconcile_every_seconds": 86400,
+            "max_pages_per_tick": 500
+          },
+          "push": {"signing_secret_env": "FLEET_RECALL_SLACK_SIGNING_SECRET"}
+        }
+      ]
+    }

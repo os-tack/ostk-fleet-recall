@@ -1,0 +1,61 @@
+# The stdio `serve` target: a long-lived writer container, one `kubectl exec
+# … serve` per agent, as the Compose stack does with docker exec. M2 replaces
+# this with `serve --http`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: writer
+  namespace: fleet-recall
+  labels:
+    app: writer
+    fleet-recall.dev/phase: recall
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: writer
+  template:
+    metadata:
+      labels:
+        app: writer
+    spec:
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      containers:
+        - name: writer
+          image: ostk-fleet-recall:__IMAGE_TAG__
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args: ["/usr/local/bin/container-entrypoint health && exec sleep infinity"]
+          envFrom:
+            - configMapRef:
+                name: fleet-env
+            - secretRef:
+                name: db-url-writer
+            - secretRef:
+                name: fleet-pins
+            - secretRef:
+                name: fleet-content-kek
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -r /opt/ostk/models/potion-retrieval-32M/model.safetensors"]
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+          volumeMounts:
+            - name: model
+              mountPath: /opt/ostk/models/potion-retrieval-32M
+              readOnly: true
+            - name: crdb-ca
+              mountPath: /etc/crdb
+              readOnly: true
+      volumes:
+        - name: model
+          hostPath:
+            path: __MODEL_BUNDLE_DIR__
+            type: Directory
+        - name: crdb-ca
+          secret:
+            secretName: crdb-ca
