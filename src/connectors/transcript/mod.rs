@@ -60,6 +60,7 @@
 
 mod canonicalizer;
 mod cockroach;
+mod codex;
 mod collector;
 mod drain;
 mod error;
@@ -73,6 +74,7 @@ pub use canonicalizer::{
     TranscriptTurnBodyV1, TranscriptTurnRevisionPreimageV1, canonicalize_turn, role_label,
 };
 pub use cockroach::CockroachTranscriptOutboxRepository;
+pub use codex::{TranscriptFormat, codex_parser_key_v1, parse_codex_transcript};
 pub use collector::{
     TranscriptCollectionRequestV1, TranscriptCollectionStatsV1, TranscriptIngressClocksV1,
     collect_batch,

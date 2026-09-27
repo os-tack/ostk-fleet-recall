@@ -126,6 +126,7 @@ pub struct CockroachMemoryService {
     corpus: Arc<CockroachStore>,
     ledger: Arc<dyn ClaimLedger>,
     embedder: Arc<dyn ChunkEmbedder>,
+    embedding_tier: Option<Arc<crate::embed_tier::remote::RemoteClient>>,
     lifecycle: LifecycleServing,
     /// What startup decided about `remember(assert)`, reported by
     /// `recall(status)`; `None` when no writer-authority pins are configured.
@@ -220,6 +221,7 @@ impl CockroachMemoryService {
             corpus,
             ledger,
             embedder,
+            embedding_tier: None,
             lifecycle: LifecycleServing::default(),
             assert_status: None,
             withhold_asserted_claims: false,
@@ -229,6 +231,15 @@ impl CockroachMemoryService {
             capture: None,
             capture_status: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_embedding_tier(
+        mut self,
+        tier: Option<Arc<crate::embed_tier::remote::RemoteClient>>,
+    ) -> Self {
+        self.embedding_tier = tier;
+        self
     }
 
     /// The public recall composition: [`Self::new`], serving the record-only
@@ -1327,6 +1338,9 @@ impl CockroachMemoryService {
             "embedding_model": self.embedder.model_id(),
             "embedding_dimension": self.embedder.dim(),
         }));
+        if let Some(tier) = &self.embedding_tier {
+            result.data["embedding_tier"] = tier.status().await;
+        }
         if self.lifecycle.surface.lifecycle_served() {
             result.data["remember_surface"] = json!(self.lifecycle.surface);
         }
@@ -4329,6 +4343,9 @@ fn conflict_coverage(complete: bool, conflicts: &[Conflict]) -> ConflictCoverage
 
 fn service_error(error: FleetError) -> ServiceError {
     match error {
+        FleetError::EmbeddingUnavailable => {
+            ServiceError::Unavailable("embedding tier is unavailable".into())
+        }
         FleetError::InvalidScope(message) | FleetError::IdempotencyConflict(message) => {
             ServiceError::InvalidRequest(message)
         }

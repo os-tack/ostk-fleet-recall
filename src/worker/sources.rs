@@ -48,7 +48,7 @@ use crate::collectors::ingress::CollectorPushV1;
 use crate::collectors::redaction::scan_collected_secrets;
 use crate::connectors::ci::{CiRepositoryIdV1, CiScanRequestV1};
 use crate::connectors::git::{GitRefName, GitRepositoryIdV1};
-use crate::connectors::transcript::MAX_TRANSCRIPT_BYTES;
+use crate::connectors::transcript::{MAX_TRANSCRIPT_BYTES, TranscriptFormat};
 use crate::error::{FleetError, Result};
 use crate::memory_contracts::collected_item::{BoundedTextV1, MAX_SCOPE_ID_BYTES, ProviderKindV1};
 use crate::memory_contracts::common::{CanonicalTimestamp, ContractId};
@@ -183,6 +183,8 @@ pub struct GitSourceV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TranscriptSourceGroupV1 {
+    #[serde(default)]
+    pub format: TranscriptFormat,
     pub connector_principal: ContractId,
     /// Every file's instance id is `<instance_prefix>.<sanitized stem>`.
     #[serde(default = "default_transcript_instance_prefix")]
@@ -195,6 +197,40 @@ pub struct TranscriptSourceGroupV1 {
     pub window_bytes: usize,
     #[serde(default)]
     pub stale_after_seconds: Option<u64>,
+}
+
+impl WorkerSourcesV1 {
+    /// Add the two format directories of this worker's credential-bound scope.
+    /// Original bytes and receiver provenance manifests stay on the spool;
+    /// parsed session/turn ids and byte spans enter the normal redaction path.
+    pub fn add_transcript_spool(&mut self, root: &Path, scope: &crate::FleetScope) -> Result<()> {
+        let receiver = crate::transcripts::TranscriptReceiver::new(
+            crate::transcripts::TranscriptReceiverConfig::new(root.to_owned()),
+        )
+        .map_err(|_| invalid("cannot open transcript spool directory"))?;
+        let directory = receiver
+            .prepare_scope(scope.tenant_id, &scope.project)
+            .map_err(|_| invalid("invalid transcript spool scope"))?;
+        for format in [TranscriptFormat::ClaudeCode, TranscriptFormat::Codex] {
+            let dir = directory.join(format.as_str());
+            if self.transcripts.iter().any(|g| g.dirs.contains(&dir)) {
+                return Err(invalid("transcript spool directory is already configured"));
+            }
+            self.transcripts.push(TranscriptSourceGroupV1 {
+                format,
+                connector_principal: ContractId::new("connector.transcript.sandbox")?,
+                instance_prefix: ContractId::new(format!(
+                    "connector.transcript.sandbox.{}",
+                    format.as_str()
+                ))?,
+                installation_id: 1,
+                dirs: vec![dir],
+                window_bytes: DEFAULT_TRANSCRIPT_WINDOW_BYTES,
+                stale_after_seconds: None,
+            });
+        }
+        self.validate()
+    }
 }
 
 /// One CI workflow on one branch of one provider repository.

@@ -5,10 +5,16 @@ binary=/usr/local/bin/ostk-fleet-recall
 
 # These commands do not open the database or load the deployed model.
 case "${1:-}" in
-    model-digest|-h|--help|-V|--version)
+    model-digest|shim|ship|launch|login|-h|--help|-V|--version)
         exec "$binary" "$@"
         ;;
 esac
+
+# Remote consumers validate the configured digest against the tier at startup.
+# The embedding server itself always loads its local, verified bundle.
+if [ -n "${FLEET_RECALL_EMBEDDING_TIER_URL:-}" ] && [ "${1:-}" != "embed" ]; then
+    exec "$binary" "$@"
+fi
 
 bundle_path=${FLEET_RECALL_EMBEDDING_MODEL_PATH:-/opt/ostk/models/potion-retrieval-32M}
 expected_digest=${FLEET_RECALL_EMBEDDING_MODEL_SHA256:-}

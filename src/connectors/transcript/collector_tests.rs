@@ -66,6 +66,42 @@ fn a_clean_transcript_stages_one_row_per_turn() {
     }
 }
 
+#[test]
+fn codex_uses_its_frozen_parser_identity_and_the_same_redaction_boundary() {
+    let active = active_package();
+    let transcript = format!(
+        "{}\n{}\n",
+        serde_json::json!({"type":"session_meta","payload":{"id":SESSION}}),
+        serde_json::json!({"timestamp":"2026-08-15T12:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("a planted credential {PLANTED_REDACTABLE_SECRET}")}]}})
+    );
+    let key = super::super::codex_parser_key_v1();
+    let (batch, stats) = collect_batch(&TranscriptCollectionRequestV1 {
+        active: &active,
+        binding: &binding(),
+        guarantee: &guarantee(),
+        parser_key: &key,
+        source_id: "codex.jsonl",
+        bytes: transcript.as_bytes(),
+        cursor: None,
+        clocks: &clocks(),
+    })
+    .unwrap();
+    assert_eq!(stats.turns_staged, 1);
+    assert_eq!(stats.turns_redacted, 1);
+    assert_eq!(batch.rows[0].session_id, SESSION);
+    for field in [
+        &batch.rows[0].canonical_candidate,
+        &batch.rows[0].canonical_locators,
+        &batch.rows[0].canonical_payload,
+    ] {
+        assert!(
+            !field
+                .windows(PLANTED_REDACTABLE_SECRET.len())
+                .any(|window| window == PLANTED_REDACTABLE_SECRET.as_bytes())
+        );
+    }
+}
+
 /// THE KILLER PROPERTY (pure half). No byte of either planted secret appears in
 /// any field of any staged row: the unredactable turn is withheld whole and the
 /// redactable one is staged with the secret replaced.

@@ -87,6 +87,8 @@ pub enum FleetError {
     SuccessorActivationCorrupt(String),
     #[error("memory operation failed: {0}")]
     Memory(String),
+    #[error("embedding tier is unavailable")]
+    EmbeddingUnavailable,
     /// A lifecycle mutation was refused before commit; nothing was written and
     /// its idempotency key was not consumed.
     #[error("lifecycle refused: {0}")]

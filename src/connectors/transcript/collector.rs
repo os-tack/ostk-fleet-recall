@@ -113,7 +113,11 @@ pub fn collect_batch(
     let first_ordinal = cursor.map_or(0, |row| row.next_ordinal);
     let batch_seq = cursor.map_or(0, |row| row.batch_seq).saturating_add(1);
 
-    let parsed = parse_transcript(source_id, bytes, resume_from, first_ordinal)?;
+    let parsed = if **parser_key == super::codex_parser_key_v1() {
+        super::parse_codex_transcript(source_id, bytes, resume_from, first_ordinal)?
+    } else {
+        parse_transcript(source_id, bytes, resume_from, first_ordinal)?
+    };
     let mut stats = TranscriptCollectionStatsV1 {
         turns_parsed: u32::try_from(parsed.turns.len()).unwrap_or(u32::MAX),
         records_skipped: parsed.skipped_records,

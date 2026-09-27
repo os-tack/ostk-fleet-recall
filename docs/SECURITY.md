@@ -689,12 +689,41 @@ rewrite migration history, or teach replay to accept a partial shape.
 
 ## Dependency and artifact integrity
 
-The embedding bundle is local, content-addressed, and restricted to three
-regular non-symlink files. The runtime verifies the same domain-separated
-digest before use and does not resolve a model remotely. Release container
+The embedding bundle is local to the embedding process, content-addressed,
+and restricted to three regular non-symlink files. That process verifies the
+domain-separated digest before use. Remote consumers pin the same digest and
+full descriptor at startup and on every embedding reply; they do not resolve
+an arbitrary model remotely. Release container
 images and release source-linked corpus records use immutable revisions;
 Secrets Manager values, database URLs, raw cloud logs, and Terraform state are
 not publication-safe artifacts.
+
+## Sandbox and transcript boundaries
+
+The M3 launcher retains its identity assertion or projected service-account
+token on the launcher host. It mints separate agent and sandbox-bound shipper
+grants. Provider credentials go only to the explicitly selected harness;
+neither the Recall service, shim nor shipper receives them. Sandbox homes
+start without the operator's plugins, hooks, MCP servers or conversation
+history. Only native Claude/Codex transcript directories are shared with the
+shipper. Launcher state and credential files are private and excluded from
+Git and Docker build contexts.
+
+Raw transcript uploads are untrusted reported evidence. Authentication binds
+tenant/project/agent/sandbox; a manifest additionally binds source path,
+format and first-line digest. The receiver uses directory-relative no-follow
+I/O, single-link regular files, advisory locking, bounded quotas, exact byte
+replay and atomic committed-prefix replacement. Worker admission still
+performs redaction and validates the active frozen contract. The shipper also
+refuses symlinks and hard links, so an agent cannot route it to credential
+files through the shared transcript volume.
+
+The local Kubernetes overlay grants anonymous GET only on its public OIDC
+discovery and JWKS paths so Recall can verify projected tokens; it grants no
+API resource access. Its explicit Hydra transport override is restricted to
+a loopback issuer and that issuer's exact original origin. Production uses
+ordinary HTTPS discovery and TLS for MCP/embedding traffic. Metrics listeners
+remain private and do not receive authentication tokens or transcript text.
 
 ## Dependency audit exception
 

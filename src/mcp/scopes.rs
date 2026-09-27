@@ -119,6 +119,7 @@ pub struct ScopeServices {
     config: FleetConfig,
     pool: PgPool,
     embedder: Arc<dyn ChunkEmbedder>,
+    embedding_tier: Option<Arc<crate::embed_tier::remote::RemoteClient>>,
     scopes: Cache<ScopeKey, Prepared>,
     agents: Cache<AgentKey, McpServer>,
 }
@@ -140,9 +141,19 @@ impl ScopeServices {
             config,
             pool,
             embedder,
+            embedding_tier: None,
             scopes: Cache::new(scope_limit),
             agents: Cache::new(agent_limit),
         })
+    }
+
+    #[must_use]
+    pub fn with_embedding_tier(
+        mut self,
+        tier: Option<Arc<crate::embed_tier::remote::RemoteClient>>,
+    ) -> Self {
+        self.embedding_tier = tier;
+        self
     }
 
     pub async fn server(&self, scope: FleetScope, access: Access) -> Result<Arc<McpServer>> {
@@ -269,7 +280,8 @@ impl ScopeServices {
                 prepared.store.clone(),
                 Arc::new(ledger),
                 self.embedder.clone(),
-            )?;
+            )?
+            .with_embedding_tier(self.embedding_tier.clone());
             return McpServer::new(
                 Arc::new(RoleGatedService::new(Arc::new(service), access)),
                 scope,
@@ -302,10 +314,23 @@ impl ScopeServices {
                 }),
             )
         };
-        let provider = Sha256Digest::from_str(&self.config.embedding_model_sha256)
-            .ok()
-            .and_then(|digest| ChunkEmbedderProvider::new(self.embedder.clone(), digest).ok())
-            .map(|provider| Arc::new(provider) as Arc<dyn EmbeddingProvider>);
+        let provider = self.embedding_tier.as_ref().map_or_else(
+            || {
+                Sha256Digest::from_str(&self.config.embedding_model_sha256)
+                    .ok()
+                    .and_then(|digest| {
+                        ChunkEmbedderProvider::new(self.embedder.clone(), digest).ok()
+                    })
+                    .map(|provider| Arc::new(provider) as Arc<dyn EmbeddingProvider>)
+            },
+            |tier| {
+                Some(
+                    Arc::new(crate::embed_tier::remote::RemoteEmbeddingProvider::new(
+                        tier.clone(),
+                    )) as Arc<dyn EmbeddingProvider>,
+                )
+            },
+        );
         let (capture, capture_status) = if pinned {
             start_collected_capture(
                 self.pool.clone(),
@@ -343,6 +368,7 @@ impl ScopeServices {
             Arc::new(ledger),
             self.embedder.clone(),
         )?
+        .with_embedding_tier(self.embedding_tier.clone())
         .with_assert_status(assert_status)
         .with_capture(capture, capture_status)
         .with_lifecycle(LifecycleServing {

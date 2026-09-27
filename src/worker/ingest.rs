@@ -32,7 +32,7 @@ use crate::connectors::transcript::{
     TranscriptCollectionRequestV1, TranscriptCollectionStatsV1, TranscriptConnectorBindingV1,
     TranscriptConnectorError, TranscriptCoverageBindingV1, TranscriptDrainModeV1,
     TranscriptDrainRequest, TranscriptEnqueueOutcome, TranscriptIngressClocksV1,
-    TranscriptOutboxRepository as _, collect_batch, drain_source_outbox, transcript_parser_key_v4,
+    TranscriptOutboxRepository as _, collect_batch, drain_source_outbox,
 };
 use crate::coverage_runtime::{
     CockroachCoverageRuntimeRepository, CoverageObservationOutcome, CoverageRuntimeRepository as _,
@@ -478,7 +478,7 @@ async fn list_jsonl(dir: &Path) -> std::io::Result<Vec<(PathBuf, String)>> {
         {
             continue;
         }
-        if tokio::fs::metadata(entry.path()).await?.is_file() {
+        if entry.file_type().await?.is_file() {
             files.push((entry.path(), name));
         }
     }
@@ -844,7 +844,7 @@ impl Ingest<'_> {
                 group.installation_id.to_string(),
             )]),
         };
-        let parser_key = transcript_parser_key_v4();
+        let parser_key = group.format.parser_key();
         let mut progressed = false;
         let mut bytes: Option<Vec<u8>> = None;
 

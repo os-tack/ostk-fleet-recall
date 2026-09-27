@@ -8,7 +8,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -18,6 +18,9 @@ use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
 use crate::encoding::base64;
+use crate::transcripts::{
+    TranscriptAuthorization, TranscriptError, TranscriptReceiver, TranscriptUpload,
+};
 use crate::{FleetError, Result};
 
 use super::protocol::{
@@ -57,6 +60,13 @@ pub trait HttpBackend: Send + Sync {
     ) -> std::result::Result<Value, HttpError>;
     async fn revoke_grant(&self, bearer: &str, jti: &str) -> std::result::Result<(), HttpError>;
     async fn exchange_aws(&self, request: Value) -> std::result::Result<Value, HttpError>;
+    async fn transcript_receiver(
+        &self,
+        _bearer: &str,
+        _instance: &str,
+    ) -> std::result::Result<(Arc<TranscriptReceiver>, TranscriptAuthorization), HttpError> {
+        Err(HttpError::Forbidden)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -160,9 +170,110 @@ pub fn router(mut config: HttpConfig, backend: Arc<dyn HttpBackend>) -> Result<R
         .route("/v1/grants", post(issue_grant))
         .route("/v1/grants/{jti}", delete(revoke_grant))
         .route("/v1/auth/aws", post(exchange_aws))
+        .route(
+            "/v1/transcripts/{instance}/{file}",
+            get(transcript).put(transcript),
+        )
         .route("/healthz", get(health))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TranscriptQuery {
+    #[serde(default)]
+    offset: u64,
+}
+
+async fn transcript(
+    State(state): State<HttpState>,
+    Path((instance, file)): Path<(String, String)>,
+    Query(query): Query<TranscriptQuery>,
+    request: Request,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let token = match bearer(&parts.headers) {
+        Ok(token) => token,
+        Err(error) => return backend_error(&state, error),
+    };
+    let authorized = tokio::time::timeout(
+        state.config.request_deadline,
+        state.backend.transcript_receiver(token, &instance),
+    )
+    .await;
+    let (receiver, auth) = match authorized {
+        Ok(Ok(bound)) => bound,
+        Ok(Err(error)) => return backend_error(&state, error),
+        Err(_) => return backend_error(&state, HttpError::Unavailable("authentication_timeout")),
+    };
+    let upload = (|| {
+        let header = |name| single_header(&parts.headers, name).ok().flatten().ok_or(());
+        let source = base64::decode_url(header("x-transcript-source")?).ok_or(())?;
+        if source.len() > 1024 {
+            return Err(());
+        }
+        let source = String::from_utf8(source).map_err(|_| ())?;
+        let format = match header("x-transcript-format")? {
+            "claude-code" => crate::connectors::transcript::TranscriptFormat::ClaudeCode,
+            "codex" => crate::connectors::transcript::TranscriptFormat::Codex,
+            _ => return Err(()),
+        };
+        Ok(TranscriptUpload {
+            instance,
+            file,
+            source,
+            format,
+            first_line_sha256: header("x-transcript-first-line-sha256")?.into(),
+            offset: query.offset,
+        })
+    })();
+    let Ok(upload): std::result::Result<TranscriptUpload, ()> = upload else {
+        return error_json(StatusCode::BAD_REQUEST, "invalid_transcript_metadata");
+    };
+    let bytes = if parts.method == axum::http::Method::PUT {
+        if parts.headers.contains_key(header::CONTENT_ENCODING)
+            || single_header(&parts.headers, "content-type").ok().flatten()
+                != Some("application/octet-stream")
+        {
+            return error_json(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "transcript_content_type_required",
+            );
+        }
+        match tokio::time::timeout(
+            state.config.request_deadline,
+            to_bytes(body, receiver.window_bytes()),
+        )
+        .await
+        {
+            Ok(Ok(bytes)) => Some(bytes.to_vec()),
+            Ok(Err(_)) => {
+                return error_json(StatusCode::PAYLOAD_TOO_LARGE, "transcript_window_too_large");
+            }
+            Err(_) => return error_json(StatusCode::REQUEST_TIMEOUT, "request_body_timeout"),
+        }
+    } else {
+        None
+    };
+    match receiver.receive(auth, upload, bytes).await {
+        Ok(progress) => Json(progress).into_response(),
+        Err(TranscriptError::Conflict(length)) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"transcript_offset_conflict","length":length})),
+        )
+            .into_response(),
+        Err(TranscriptError::Invalid) => {
+            error_json(StatusCode::BAD_REQUEST, "invalid_transcript_request")
+        }
+        Err(TranscriptError::Quota) => {
+            error_json(StatusCode::PAYLOAD_TOO_LARGE, "transcript_quota_exceeded")
+        }
+        Err(TranscriptError::Io(_)) => error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "transcript_spool_unavailable",
+        ),
+    }
 }
 
 fn configuration(message: &str) -> FleetError {

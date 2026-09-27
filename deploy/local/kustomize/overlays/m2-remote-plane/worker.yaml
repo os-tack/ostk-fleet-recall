@@ -1,0 +1,34 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: worker
+  namespace: fleet-recall
+  labels:
+    fleet-recall.dev/phase: remote
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+          containers:
+            - name: worker
+              args: [worker, --once, --sources, /etc/fleet-recall/worker-sources.json, --steps, "ingest,project,embed"]
+              env:
+                - {name: FLEET_RECALL_EMBEDDING_TIER_URL, value: "http://embed:8090"}
+                - {name: FLEET_RECALL_TRANSCRIPT_SPOOL_DIR, value: /var/lib/recall/transcripts}
+                - name: FLEET_RECALL_EMBEDDING_TIER_TOKEN
+                  valueFrom:
+                    secretKeyRef: {name: fleet-remote, key: FLEET_RECALL_EMBEDDING_TIER_TOKEN}
+              volumeMounts:
+                - name: model
+                  $patch: delete
+                - {name: transcripts, mountPath: /var/lib/recall/transcripts}
+          volumes:
+            - name: model
+              $patch: delete
+            - name: transcripts
+              persistentVolumeClaim: {claimName: fleet-transcripts}

@@ -1,4 +1,7 @@
 .git
+.fleet-launch
+deploy/local/.state
+**/__pycache__
 .github
 .agents
 .codex

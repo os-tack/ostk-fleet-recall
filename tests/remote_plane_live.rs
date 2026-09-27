@@ -71,6 +71,7 @@ struct Fixture {
     signer: Ed25519Signer,
     local_signer: Ed25519Signer,
     _local_keys: tempfile::NamedTempFile,
+    _transcript_spool: tempfile::TempDir,
     principals: Vec<PrincipalDeclaration>,
 }
 
@@ -213,8 +214,18 @@ impl Fixture {
             ScopeServices::new(fleet, runtime.pool.clone(), Arc::new(RemoteEmbedder), 4, 16)
                 .unwrap(),
         );
-        let backend =
-            Arc::new(RemoteBackend::new(&config, runtime.pool.clone(), services.clone()).unwrap());
+        let transcript_spool = tempfile::tempdir().unwrap();
+        let receiver = ostk_fleet_recall::transcripts::TranscriptReceiver::new(
+            ostk_fleet_recall::transcripts::TranscriptReceiverConfig::new(
+                transcript_spool.path().into(),
+            ),
+        )
+        .unwrap();
+        let backend = Arc::new(
+            RemoteBackend::new(&config, runtime.pool.clone(), services.clone())
+                .unwrap()
+                .with_transcript_receiver(Arc::new(receiver)),
+        );
         let app = http::router(config.http, backend.clone()).unwrap();
         Self {
             owner,
@@ -228,6 +239,7 @@ impl Fixture {
             signer,
             local_signer,
             _local_keys: local_keys,
+            _transcript_spool: transcript_spool,
             principals,
         }
     }
@@ -426,6 +438,76 @@ async fn invalid_bearers(f: &Fixture) {
             f.tool(&token, "recall", json!({"action":"status"})).await.0,
             StatusCode::UNAUTHORIZED
         );
+    }
+}
+
+async fn transcript_grant_binding(f: &Fixture) {
+    let sandbox = Uuid::now_v7().to_string();
+    for index in [0, 2, 4] {
+        assert!(
+            f.backend
+                .transcript_receiver(&f.token(index), &sandbox)
+                .await
+                .is_err(),
+            "operator, launcher and direct shipper identities are not delegated shipper grants"
+        );
+    }
+    let launcher = f.token(2);
+    for (kind, bound, allowed) in [
+        ("agent", Some(sandbox.as_str()), false),
+        ("shipper", None, false),
+        ("shipper", Some(sandbox.as_str()), true),
+    ] {
+        let (status, issued) = f
+            .request(
+                "POST",
+                "/v1/grants",
+                Some(&launcher),
+                json!({"kind":kind,"agent":"sandbox-transcript","sandbox_id":bound}),
+                &[],
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{issued}");
+        let token = issued["token"].as_str().unwrap();
+        assert_eq!(
+            f.backend.transcript_receiver(token, &sandbox).await.is_ok(),
+            allowed
+        );
+        assert!(
+            f.backend
+                .transcript_receiver(token, &Uuid::now_v7().to_string())
+                .await
+                .is_err()
+        );
+        if allowed {
+            let (_, auth) = f
+                .backend
+                .transcript_receiver(token, &sandbox)
+                .await
+                .unwrap();
+            assert_eq!(auth.tenant_id, f.principals[2].tenant_id);
+            assert_eq!(auth.project, f.principals[2].project);
+            assert_eq!(auth.agent, "sandbox-transcript");
+            let jti = issued["grant"]["jti"].as_str().unwrap();
+            assert_eq!(
+                f.request(
+                    "DELETE",
+                    &format!("/v1/grants/{jti}"),
+                    Some(&launcher),
+                    Value::Null,
+                    &[]
+                )
+                .await
+                .0,
+                StatusCode::NO_CONTENT
+            );
+            assert!(
+                f.backend
+                    .transcript_receiver(token, &sandbox)
+                    .await
+                    .is_err()
+            );
+        }
     }
 }
 
@@ -693,6 +775,7 @@ async fn real_remote_plane_enforces_identity_scope_roles_and_revocation() {
     identity_and_isolation(&fixture).await;
     invalid_bearers(&fixture).await;
     protocol_and_bootstrap(&fixture).await;
+    transcript_grant_binding(&fixture).await;
     grants_and_revocations(&fixture).await;
     fixture.cleanup().await;
 }

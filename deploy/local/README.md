@@ -270,15 +270,73 @@ verification uses `ring`). Protected run evidence stays under
 `.state/m2-upgrade-*`, `.state/remote-smoke/`, `.state/native-mcp-smoke/`, and
 `.state/verify-m2.log`. No runtime credential or token is committed.
 
+## M3 sandbox plane
+
+M3 adds a dedicated embedding Deployment, authenticated Recall Deployment,
+retained transcript PV, transcript-aware worker and launcher enrollment. It
+uses the existing M2 database schema and Ory services. LocalStack remains optional.
+From the repository root, with `FLEET_LOCAL_STATE` pointing at the existing
+cluster state when using a worktree:
+
+```sh
+python3 deploy/local/bin/deploy-sandbox-plane.py --image-tag m3-local --prepare-only
+python3 deploy/local/bin/deploy-sandbox-plane.py --image-tag m3-local --build
+docker build -f deploy/local/sandbox/Dockerfile \
+  --build-arg RECALL_IMAGE=ostk-fleet-recall:m3-local -t ostk-sandbox:m3-local .
+```
+
+The helper preserves existing grants by reusing the protected signing key.
+It creates a private local launcher seed and enrolls `local-key/launcher` and
+`k8s/system:serviceaccount:fleet-recall:launcher`, limited to `sandbox-*` agents
+in `local-k0s`. Enrollment runs in its own Job with only its dedicated database
+credential. The embed process receives no database credentials or content key.
+The old stdio writer/demo remain available; the new Recall and worker use the
+remote tier without a bundle mount.
+
+After stopping the Mac M2 HTTP process, restore the previously canceled Lima
+forward (a VM restart also restores it):
+
+```sh
+ssh -F "$HOME/.lima/k0s/ssh.config" -O forward \
+  -L 127.0.0.1:8080:127.0.0.1:30080 lima-k0s
+```
+
+Codex can connect directly:
+
+```sh
+codex mcp add recall-remote --url http://localhost:8080/mcp
+codex mcp login recall-remote --scopes openid,offline_access,fleet-recall
+```
+
+Set the launcher key in the launcher environment only, then follow
+[the sandbox guide](sandbox/README.md) for synthetic, Codex, and Claude runs.
+Docker routes to `http://host.docker.internal:8080/mcp`; Kubernetes routes to
+`http://recall.fleet-recall.svc.cluster.local:8080/mcp`. Both retain audience
+`http://localhost:8080/mcp`. Import the sandbox image into k0s before using
+the Kubernetes backend. A projected Kubernetes identity token must use that
+audience and can be supplied via `--service-account-token-file`; the agent
+and shipper never receive it.
+
+The local overlay explicitly routes Hydra's loopback issuer to its internal
+Service while retaining the original issuer checks. Kubernetes issuer JWKS
+use the cluster CA; the overlay permits anonymous GET only to its public
+discovery and JWKS paths, without granting Kubernetes API resource access.
+The receiver validates sandbox-bound shipper grants and
+stores only appendable, bounded, provenance-bound files. The worker picks up
+the current tenant/project's spool and runs `ingest,project,embed`; empty git
+and CI groups do not need their executables. See
+[remote plane behavior](../../docs/REMOTE_PLANE.md#m3-sandboxes-and-transcripts)
+for parser, quota, retry and revocation semantics.
+
 ## Notes and known limits
 
 - `serve` remains the stdio target; `serve --http` runs the remote endpoint.
   The writer Deployment remains the
   `kubectl exec -i deploy/writer -- container-entrypoint serve` target.
-- Every recall pod mounts the model bundle because the image entrypoint
-  requires it for every command; M3's embedding tier removes that.
-- The worker's ingest steps need `git` and `gh`, which the image lacks; only
-  `project` and `embed` run in the cluster.
+- The base M1 workloads use local bundles. M3 Recall and worker consume the
+  pinned embedding tier; its Deployment owns their model bundle mount.
+- Git/CI ingest still needs `git`/`gh` on the worker host. M3 transcript ingest
+  runs inside the cluster against its private spool without those binaries.
 - The local boundary applies runtime, publication, ingress and enrollment
   policies. The
   control and registry-activation policies (ceremony roles) are not applied

@@ -148,7 +148,10 @@ where
         return Err(FleetError::Configuration(ONCE_REQUIRED.to_owned()));
     }
     let steps = parse_steps(&command.steps)?;
-    let sources = WorkerSourcesV1::load(&command.sources)?;
+    let mut sources = WorkerSourcesV1::load(&command.sources)?;
+    if let Some(root) = (process.lookup)("FLEET_RECALL_TRANSCRIPT_SPOOL_DIR") {
+        sources.add_transcript_spool(std::path::Path::new(&root), &process.scope)?;
+    }
     let ingest = steps.iter().any(|step| step.is_ingest());
     let bodies = steps.contains(&WorkerStepV1::Bodies);
     let pins = if ingest || bodies {
@@ -234,6 +237,21 @@ fn dense_provider(process: &WorkerProcessV1<'_>) -> Result<Arc<dyn EmbeddingProv
             "{EMBEDDING_MODEL_SHA256_ENV} must be a lowercase 64-character hex digest: {error}"
         ))
     })?;
+    if let Some(config) = crate::embed_tier::config::RemoteConfig::from_lookup(process.lookup)
+        .map_err(|error| FleetError::Configuration(error.to_string()))?
+    {
+        let model = (process.lookup)("FLEET_RECALL_EMBEDDING_MODEL")
+            .unwrap_or_else(|| "minishlab/potion-retrieval-32M".into());
+        let client = crate::embed_tier::remote::RemoteClient::connect_sync(
+            config,
+            crate::embed_tier::Descriptor::pinned(digest),
+            format!("{model}@sha256:{}", process.embedding_model_sha256),
+        )
+        .map_err(|_| FleetError::EmbeddingUnavailable)?;
+        return Ok(Arc::new(
+            crate::embed_tier::remote::RemoteEmbeddingProvider::new(client),
+        ));
+    }
     let embedder = (process.load_embedder)()?;
     let provider = ChunkEmbedderProvider::new(embedder, digest).map_err(|error| {
         FleetError::Configuration(format!(

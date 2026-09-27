@@ -1,0 +1,35 @@
+# One-node local PV. The deploy helper creates its UID-10001 directory in Lima.
+# Retain deliberately preserves transcript evidence across redeployment.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: fleet-transcripts-local
+  labels:
+    fleet-recall.dev/phase: remote
+spec:
+  capacity: {storage: 2Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /var/lib/fleet-recall/transcripts
+    type: Directory
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - {key: kubernetes.io/hostname, operator: In, values: [lima-k0s]}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fleet-transcripts
+  namespace: fleet-recall
+  labels:
+    fleet-recall.dev/phase: remote
+spec:
+  storageClassName: ""
+  volumeName: fleet-transcripts-local
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: 2Gi}

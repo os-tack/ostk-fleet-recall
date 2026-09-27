@@ -146,6 +146,33 @@ fn serving_values() -> BTreeMap<&'static str, String> {
 }
 
 #[test]
+fn remote_embedding_config_needs_a_digest_but_no_local_bundle() {
+    let mut values = serving_values();
+    values.remove("FLEET_RECALL_EMBEDDING_MODEL_PATH");
+    let load = |values: &BTreeMap<&str, String>| {
+        fleet_config_from_lookup(
+            "unused".into(),
+            PrivatePostgresSslPolicy::VerifyFull,
+            |name| values.get(name).cloned(),
+        )
+    };
+    assert!(load(&values).is_err());
+    values.insert(
+        "FLEET_RECALL_EMBEDDING_TIER_URL",
+        "http://embedding:8090".into(),
+    );
+    assert!(
+        load(&values)
+            .unwrap()
+            .embedding_model_path
+            .as_os_str()
+            .is_empty()
+    );
+    values.remove("FLEET_RECALL_EMBEDDING_MODEL_SHA256");
+    assert!(load(&values).is_err());
+}
+
+#[test]
 fn publication_config_uses_only_its_dedicated_database_identity() {
     let mut values = serving_values();
     values.insert(

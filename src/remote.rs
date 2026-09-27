@@ -41,6 +41,7 @@ pub struct RemoteConfig {
     pub grant_cache_seconds: u64,
     signing_key: String,
     oidc: BTreeMap<String, String>,
+    oidc_transports: BTreeMap<String, String>,
     scope_substitutes: BTreeMap<String, String>,
     oidc_ca_path: Option<String>,
     local_key_path: Option<String>,
@@ -84,9 +85,12 @@ impl RemoteConfig {
             configuration("FLEET_RECALL_RESOURCE_URL is required for HTTP serving")
         })?;
         let oidc = pairs(&lookup("FLEET_RECALL_OIDC_ISSUERS").unwrap_or_default())?;
+        let oidc_transports =
+            pairs(&lookup("FLEET_RECALL_OIDC_LOCAL_TRANSPORTS").unwrap_or_default())?;
         let scope_substitutes =
             pairs(&lookup("FLEET_RECALL_OIDC_SCOPE_SUBSTITUTES").unwrap_or_default())?;
         if scope_substitutes.keys().any(|key| !oidc.contains_key(key))
+            || oidc_transports.keys().any(|key| !oidc.contains_key(key))
             || oidc.contains_key("local-key")
             || oidc.contains_key("aws-iam")
             || oidc
@@ -154,6 +158,7 @@ impl RemoteConfig {
             grant_cache_seconds,
             signing_key,
             oidc,
+            oidc_transports,
             scope_substitutes,
             oidc_ca_path: lookup("FLEET_RECALL_OIDC_CA_PATH"),
             local_key_path,
@@ -204,9 +209,18 @@ pub struct RemoteBackend {
     // Filled by the AWS anchor integration; the service never forwards an
     // arbitrary client-selected endpoint.
     aws: Option<crate::auth::anchors::aws_iam::AwsIamAnchor>,
+    transcripts: Option<Arc<crate::transcripts::TranscriptReceiver>>,
 }
 
 impl RemoteBackend {
+    #[must_use]
+    pub fn with_transcript_receiver(
+        mut self,
+        receiver: Arc<crate::transcripts::TranscriptReceiver>,
+    ) -> Self {
+        self.transcripts = Some(receiver);
+        self
+    }
     pub fn new(config: &RemoteConfig, pool: PgPool, services: Arc<ScopeServices>) -> Result<Self> {
         let resource = config.http.resource_url.clone();
         let signer = Arc::new(
@@ -233,6 +247,9 @@ impl RemoteBackend {
                         }),
                     ca_pem: ca_pem.clone(),
                     allow_http: true,
+                })
+                .and_then(|anchor| {
+                    anchor.with_local_transport(config.oidc_transports.get(id).map(String::as_str))
                 })
                 .map_err(|_| configuration("invalid OIDC anchor configuration"))?,
             ));
@@ -276,6 +293,7 @@ impl RemoteBackend {
             resource,
             services,
             aws,
+            transcripts: None,
         })
     }
 
@@ -325,6 +343,51 @@ impl RemoteBackend {
 
 #[async_trait]
 impl HttpBackend for RemoteBackend {
+    async fn transcript_receiver(
+        &self,
+        bearer: &str,
+        instance: &str,
+    ) -> std::result::Result<
+        (
+            Arc<crate::transcripts::TranscriptReceiver>,
+            crate::transcripts::TranscriptAuthorization,
+        ),
+        HttpError,
+    > {
+        let claims = self.self_claims(bearer)?;
+        if claims.extra.get("token_kind").and_then(Value::as_str) != Some("session_grant") {
+            return Err(HttpError::Forbidden);
+        }
+        let id = claims
+            .jti
+            .as_deref()
+            .ok_or(HttpError::Unauthorized)?
+            .parse::<Uuid>()
+            .map_err(|_| HttpError::Unauthorized)?;
+        let grant = self.grants.check(id).await.map_err(grant_error)?;
+        if grant.kind != GrantKind::Shipper
+            || grant.ceiling != Ceiling::Project
+            || claims.sub != grant.principal_id.to_string()
+            || grant.sandbox_id.as_deref() != Some(instance)
+            || Uuid::parse_str(instance).is_err()
+        {
+            return Err(HttpError::Forbidden);
+        }
+        let receiver = self
+            .transcripts
+            .clone()
+            .ok_or(HttpError::Unavailable("transcript_spool_disabled"))?;
+        Ok((
+            receiver,
+            crate::transcripts::TranscriptAuthorization {
+                tenant_id: grant.tenant_id,
+                project: grant.project,
+                principal_id: grant.principal_id,
+                agent: grant.agent,
+                sandbox_id: instance.into(),
+            },
+        ))
+    }
     async fn authenticate(&self, bearer: &str) -> std::result::Result<Arc<McpServer>, HttpError> {
         let issuer = jose::unverified_issuer(bearer).map_err(auth_error)?;
         let (scope, access) = if issuer == self.resource {

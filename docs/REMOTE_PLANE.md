@@ -2,8 +2,9 @@
 
 The M2 remote plane serves one authenticated `/mcp` endpoint and resolves each
 request into a tenant, project, agent, role, and visibility ceiling. The stdio
-server continues to use its deployment identity. Embedding remains in process;
-the embedding service, sandbox shim, launcher, and transcript upload are M3.
+server continues to use its deployment identity. M3 adds a pinned embedding
+service, stdio shim, Docker/Kubernetes launcher, and scoped transcript spool
+for Claude Code and Codex. Local in-process embedding remains supported.
 
 ## Prepare the database and enrollment login
 
@@ -46,8 +47,8 @@ ostk-fleet-recall enroll list
 ostk-fleet-recall enroll revoke 0198a849-f6ae-7d61-9800-000000000101
 ```
 
-`--bootstrap-scopes` additionally requires the same pinned model name, path,
-and digest used by the runtime. It initializes each distinct tenant/project
+`--bootstrap-scopes` additionally requires the runtime's pinned model name and
+digest, plus either its local bundle path or embedding tier URL. It initializes each distinct tenant/project
 without replacing an existing active model. Apply validates the complete
 document before writes; unchanged declarations preserve their revisions.
 `--prune` revokes every principal omitted from the file, so use it only for a
@@ -89,6 +90,19 @@ instructions](../deploy/local/README.md#m2-http-service-and-human-enrollment):
 its optional DCR metadata requires the standard `--client-id` path in current
 Claude Code.
 
+Codex supports native HTTP MCP and can register directly with local Hydra:
+
+```sh
+codex mcp add recall-remote --url http://localhost:8080/mcp
+codex mcp login recall-remote --scopes openid,offline_access,fleet-recall
+```
+
+The first command may start OAuth immediately. `--no-browser` on `mcp login`
+supports a pasted callback for headless workstations. Codex's desktop app,
+CLI, and IDE share the MCP configuration on that host. See the
+[official Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp).
+The verified Ory subject must be enrolled before tools are accessible.
+
 The scope substitute above is an explicit exception for local Hydra, which
 issues access tokens without resource audiences. It applies only when the
 audience is empty; a nonempty wrong audience is always refused. Other issuers
@@ -96,6 +110,14 @@ require the exact resource audience by default. Issuer and JWKS fetches require
 HTTPS except literal loopback development, reject redirects, and have bounded
 response sizes/timeouts. JWKS cache lifetime is ten minutes, with unknown-key
 refreshes limited to once per minute.
+
+The local Kubernetes overlay routes Hydra discovery through
+`FLEET_RECALL_OIDC_LOCAL_TRANSPORTS=hydra=http://hydra-public.ory.svc.cluster.local:4444/`.
+This explicit development setting is accepted only for a loopback issuer.
+JWT and discovery issuer checks retain `http://localhost:4444/`; only URLs
+with that exact original origin can be routed. It cannot redirect a production
+issuer or an issuer-supplied cross-origin JWKS URL. Production uses reachable
+HTTPS issuer URLs directly.
 
 HTTP binds loopback unless `--allow-non-loopback` is passed. Production needs
 TLS termination and a matching HTTPS resource URL. Set
@@ -131,7 +153,8 @@ Only launcher principals can `POST /v1/grants`:
 
 The reply contains `token` and the persisted grant. `kind:"shipper"` permits
 only `remember(capture)` and `recall(status|brief)`; capture still requires a
-served capture capability. Agent grants cannot mint further grants. The
+served capture capability. A sandbox-bound shipper grant can also upload its
+own transcripts; a direct shipper principal or agent grant cannot. Agent grants cannot mint further grants. The
 issuer or an operator in the same tenant/project can
 `DELETE /v1/grants/{jti}`. Tokens default to one hour and are capped at one day.
 
@@ -158,3 +181,59 @@ Run `cargo test --locked --all-targets`, then connected tests with
 Provider unit tests use fake OIDC/JWKS and STS servers, including key rotation,
 wrong claims, redirects, XML responses, and signed-request validation. A fake
 STS result is not evidence of a live AWS deployment.
+
+## M3 embedding tier
+
+Start `ostk-fleet-recall embed serve 127.0.0.1:8090` with the model name,
+bundle path and SHA256 pin. It needs no database credentials. The tier serves
+`GET /v1/descriptor` and `POST /v1/embed` (`{"texts":["example"]}`), with at
+most 64 texts of 256 KiB each. Set `FLEET_RECALL_EMBEDDING_TIER_TOKEN` on both
+the tier and consumers to require a static bearer. Keep non-loopback HTTP on
+a private development network; production should use HTTPS.
+
+Consumers set `FLEET_RECALL_EMBEDDING_TIER_URL` and keep their model name and
+digest pin; the bundle path becomes optional. Startup checks the complete
+512-dimensional descriptor, and every embedding response must match it.
+`FLEET_RECALL_EMBEDDING_TIER_TIMEOUT_MS` defaults to 2000. Only connection
+failures retry once within that budget. Redirects and environment proxies
+are disabled.
+
+`recall(status)` includes `embedding_tier.status` (`ready` or `degraded`).
+An outage removes the dense read lane while sparse retrieval remains
+available. Claim writes refuse `Unavailable`, and dense projection stops at
+the affected row; zero-vector outage sentinels are never persisted. Restoring
+the same pinned tier recovers without restarting Recall.
+
+## M3 sandboxes and transcripts
+
+See [sandbox image and launch instructions](../deploy/local/sandbox/README.md)
+and the [local M3 deployment](../deploy/local/README.md#m3-sandbox-plane).
+`launch up` creates separate agent/shipper grants and Docker containers or a
+Kubernetes pod with a native shipper sidecar. `launch down --state PATH`
+stops the runtime and revokes both grants; failed cleanup remains retryable
+in private state. The launcher identity and provider credential stay out of
+the Recall plane. Only the selected model harness receives provider auth.
+
+`shim --url URL` forwards bounded JSONL over HTTP using `FLEET_RECALL_TOKEN`,
+preserving initialization, IDs and notifications. It mirrors the protocol,
+method and encoded name headers and emits diagnostics only on stderr. It
+never retries a mutation after an ambiguous transport failure. Use
+`--allow-http` explicitly for a private non-loopback development endpoint.
+
+With `FLEET_RECALL_TRANSCRIPT_SPOOL_DIR` set, the remote server accepts
+`PUT /v1/transcripts/{sandbox_uuid}/{file}?offset=N` from a matching shipper
+grant. `ship transcripts --dir DIR --url URL --instance UUID --format codex`
+(or `claude-code`) tails complete records, retries temporary outages, and
+flushes on termination. The same token environment variable is used for this
+separate shipper process. Uploads bind the sandbox, source path, format and
+first-line digest to an immutable manifest. Exact byte replays succeed;
+gaps, changed prefixes and cross-sandbox writes are refused. Default limits
+are 4 MiB/window, 64 MiB/file and 1 GiB/scope.
+
+The worker automatically adds the current scope's spool groups when the same
+spool variable is set; run `--steps ingest,project,embed`. Uploaded transcripts
+use `connector.transcript.sandbox`, pass through normal redaction and admission,
+and retain source byte spans. The Codex parser consumes native
+`$CODEX_HOME/sessions/**/*.jsonl`, with a distinct frozen parser identity;
+it does not consume the different `codex exec --json` stdout event stream.
+Unknown content formats fail closed and need a parser revision.

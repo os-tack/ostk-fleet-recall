@@ -1672,6 +1672,7 @@ dependencies = [
  "quick-xml",
  "reqwest",
  "ring",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

@@ -572,6 +572,11 @@ impl CockroachClaimLedger {
         }
         let mut passages = Vec::with_capacity(passage_texts.len());
         for (index, (text, vector)) in passage_texts.into_iter().zip(vectors).enumerate() {
+            // The synchronous remote adapter uses zero vectors to omit failed
+            // dense reads. No such sentinel may reach a durable claim write.
+            if vector.iter().all(|component| *component == 0.0) {
+                return Err(FleetError::EmbeddingUnavailable);
+            }
             let passage_index = i32::try_from(index)
                 .map_err(|_| FleetError::Memory("too many claim passages".into()))?;
             passages.push((passage_index, text, serialize_vector(&vector)?));
@@ -3046,6 +3051,39 @@ mod tests {
     use crate::store::cockroach::ScopedChunk;
 
     struct TestEmbedder;
+
+    struct UnavailableEmbedder;
+    impl ChunkEmbedder for UnavailableEmbedder {
+        fn dim(&self) -> usize {
+            EMBEDDING_DIMENSION
+        }
+        fn model_id(&self) -> &'static str {
+            "unavailable-test-512"
+        }
+        fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+            vec![vec![0.0; EMBEDDING_DIMENSION]; texts.len()]
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_embedding_never_prepares_a_durable_claim_passage() {
+        let scope = scope("embedding-outage");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://root@127.0.0.1:1/unused")
+            .unwrap();
+        let ledger = CockroachClaimLedger::new(
+            pool,
+            scope.clone(),
+            Arc::new(UnavailableEmbedder),
+            RetryPolicy::default(),
+        )
+        .unwrap();
+        let input = polarity_claim("unavailable", serde_json::json!("value"), 1);
+        assert!(matches!(
+            ledger.embed_claim_passages(&scope, &input, &input.prepare().unwrap()),
+            Err(FleetError::EmbeddingUnavailable)
+        ));
+    }
 
     impl ChunkEmbedder for TestEmbedder {
         fn dim(&self) -> usize {

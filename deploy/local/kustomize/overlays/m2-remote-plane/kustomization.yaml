@@ -1,7 +1,12 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-# Reserved for M2/M3: `serve --http`, `embed serve`, the enrolment Job, the
-# transcript spool, and the launcher service account. Inert until those
-# subcommands exist.
+# Apply phase=remote only after M2 schema/policies and the M3 secrets exist.
+# deploy/local/bin/deploy-sandbox-plane.py renders the local placeholders.
 resources:
   - ../../base
+  - remote.yaml
+  - embed.yaml
+  - spool.yaml
+  - launcher.yaml
+patches:
+  - path: worker.yaml

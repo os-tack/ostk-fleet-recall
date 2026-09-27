@@ -9,6 +9,7 @@
 /.env.*
 !/.env.example
 /.fleet-recall/
+/.fleet-launch/
 /.ostk/
 /.model-stage/
 /.models/
@@ -24,3 +25,4 @@
 *.pem
 *.key
 /deploy/local/.state/
+/deploy/local/bin/__pycache__/

@@ -4,7 +4,7 @@ use std::{fmt::Write as _, sync::Arc};
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::context::RequestedScope;
 use crate::service::{
@@ -13,7 +13,9 @@ use crate::service::{
 };
 use crate::{FleetScope, Result};
 
-use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, MODERN_PROTOCOL_VERSION};
+use super::protocol::{
+    Frame, JsonRpcError, JsonRpcRequest, JsonRpcResponse, MODERN_PROTOCOL_VERSION, read_frame,
+};
 use super::tools::tool_list_for_surfaces;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -106,37 +108,11 @@ impl McpServer {
         W: AsyncWrite + Unpin,
     {
         let mut reader = BufReader::new(reader);
-        loop {
-            let mut frame = Vec::with_capacity(8_192);
-            let mut oversize = false;
-            loop {
-                let available = reader.fill_buf().await?;
-                if available.is_empty() {
-                    if frame.is_empty() {
-                        return Ok(());
-                    }
-                    break;
-                }
-                let newline = available.iter().position(|byte| *byte == b'\n');
-                let take = newline.map_or(available.len(), |index| index + 1);
-                if !oversize {
-                    let remaining = MAX_MCP_FRAME_BYTES
-                        .saturating_add(1)
-                        .saturating_sub(frame.len());
-                    frame.extend_from_slice(&available[..take.min(remaining)]);
-                    oversize = frame.len() > MAX_MCP_FRAME_BYTES;
-                }
-                reader.consume(take);
-                if newline.is_some() {
-                    break;
-                }
-            }
-            if frame.last() == Some(&b'\n') {
-                frame.pop();
-                if frame.last() == Some(&b'\r') {
-                    frame.pop();
-                }
-            }
+        while let Some(frame) = read_frame(&mut reader).await? {
+            let (frame, oversize) = match frame {
+                Frame::Data(bytes) => (bytes, false),
+                Frame::Oversize => (Vec::new(), true),
+            };
             if frame.iter().all(u8::is_ascii_whitespace) && !oversize {
                 continue;
             }
@@ -165,6 +141,7 @@ impl McpServer {
                 writer.flush().await?;
             }
         }
+        Ok(())
     }
 
     /// Parse and dispatch one wire record.

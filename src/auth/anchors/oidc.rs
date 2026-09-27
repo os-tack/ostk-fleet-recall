@@ -32,6 +32,7 @@ pub struct OidcAnchor {
     discovery_url: String,
     allow_http: bool,
     client: reqwest::Client,
+    transport_origin: Option<url::Url>,
     cache: Mutex<KeyCache>,
 }
 
@@ -73,14 +74,61 @@ impl OidcAnchor {
             discovery_url,
             allow_http: config.allow_http,
             client: http_client(config.ca_pem.as_deref())?,
+            transport_origin: None,
             cache: Mutex::new(KeyCache::default()),
         })
+    }
+
+    /// Explicit operator routing for a loopback development issuer published
+    /// through a different origin inside the cluster. This never changes JWT
+    /// issuer verification or accepts an origin supplied by a token/client.
+    /// Only same-issuer-origin discovery and JWKS URLs may use this route.
+    pub fn with_local_transport(mut self, origin: Option<&str>) -> Result<Self, AuthError> {
+        if let Some(origin) = origin {
+            let issuer = endpoint(&self.policy.issuer, self.allow_http)?;
+            let local = match issuer.host() {
+                Some(url::Host::Domain(host)) => host == "localhost",
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                None => false,
+            };
+            let target = url::Url::parse(origin).map_err(|_| AuthError::Configuration)?;
+            if !local
+                || !self.allow_http
+                || !target.has_host()
+                || !matches!(target.scheme(), "http" | "https")
+                || !target.username().is_empty()
+                || target.password().is_some()
+                || target.query().is_some()
+                || target.fragment().is_some()
+                || target.path() != "/"
+            {
+                return Err(AuthError::Configuration);
+            }
+            self.transport_origin = Some(target);
+        }
+        Ok(self)
+    }
+
+    fn routed_url(&self, original: &str) -> Result<url::Url, AuthError> {
+        let source = discovery_endpoint(original, self.allow_http)?;
+        let Some(target) = &self.transport_origin else {
+            return Ok(source);
+        };
+        let issuer = endpoint(&self.policy.issuer, self.allow_http)?;
+        if source.origin() != issuer.origin() {
+            return Err(AuthError::Configuration);
+        }
+        let mut routed = target.clone();
+        routed.set_path(source.path());
+        routed.set_query(source.query());
+        Ok(routed)
     }
 
     async fn fetch_keys(&self) -> Result<Vec<Jwk>, AuthError> {
         let response = self
             .client
-            .get(&self.discovery_url)
+            .get(self.routed_url(&self.discovery_url)?)
             .send()
             .await
             .map_err(|_| AuthError::ProviderUnavailable)?;
@@ -89,7 +137,8 @@ impl OidcAnchor {
         if discovery.issuer != self.policy.issuer {
             return Err(AuthError::ProviderUnavailable);
         }
-        let jwks_url = discovery_endpoint(&discovery.jwks_uri, self.allow_http)
+        let jwks_url = self
+            .routed_url(&discovery.jwks_uri)
             .map_err(|_| AuthError::ProviderUnavailable)?;
         let response = self
             .client
@@ -175,6 +224,52 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::sync::RwLock;
+
+    #[test]
+    fn local_transport_preserves_issuer_paths_and_rejects_origin_escape() {
+        let make = |issuer: &str| {
+            OidcAnchor::new(OidcConfig {
+                anchor_id: "hydra".into(),
+                issuer: issuer.into(),
+                resource: "https://recall/mcp".into(),
+                audience_policy: AudiencePolicy::Required,
+                ca_pem: None,
+                allow_http: true,
+            })
+            .unwrap()
+        };
+        let anchor = make("http://localhost:4444/")
+            .with_local_transport(Some("http://hydra-public.ory.svc.cluster.local:4444/"))
+            .unwrap();
+        assert_eq!(anchor.issuer(), "http://localhost:4444/");
+        assert_eq!(
+            anchor
+                .routed_url("http://localhost:4444/.well-known/jwks.json?v=1")
+                .unwrap()
+                .as_str(),
+            "http://hydra-public.ory.svc.cluster.local:4444/.well-known/jwks.json?v=1"
+        );
+        assert!(anchor.routed_url("https://evil.example/keys").is_err());
+        assert!(anchor.routed_url("http://localhost:5555/keys").is_err());
+        assert!(
+            make("https://issuer.example")
+                .with_local_transport(Some("http://internal/"))
+                .is_err()
+        );
+        for target in [
+            "http://user:pass@internal/",
+            "http://internal/prefix",
+            "http://internal/?q=1",
+            "http://internal/#x",
+            "file:///tmp/key",
+        ] {
+            assert!(
+                make("http://localhost:4444/")
+                    .with_local_transport(Some(target))
+                    .is_err()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn discovery_rotation_and_miss_cooldown_are_bounded() {

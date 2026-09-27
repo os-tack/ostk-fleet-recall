@@ -150,6 +150,29 @@ impl ChunkEmbedder for PinnedEmbedder {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Tail complete harness transcript records to the remote spool.
+    Ship {
+        #[command(subcommand)]
+        command: ShipSubcommand,
+    },
+    /// Launch or retire a sandbox and its separately scoped transcript shipper.
+    Launch {
+        #[command(subcommand)]
+        command: ostk_fleet_recall::launch::LaunchCommandV1,
+    },
+    /// Serve a pinned embedding model without database credentials.
+    Embed {
+        #[command(subcommand)]
+        command: EmbedSubcommand,
+    },
+    /// Forward sandbox MCP stdin/stdout to the authenticated remote endpoint.
+    Shim {
+        #[arg(long, env = "FLEET_RECALL_URL")]
+        url: String,
+        /// Permit unencrypted HTTP for a private development endpoint.
+        #[arg(long)]
+        allow_http: bool,
+    },
     /// Serve the Recall MCP protocol over stdin/stdout, or authenticated HTTP.
     Serve {
         /// Enable stateless HTTP MCP at /mcp on this address.
@@ -226,6 +249,34 @@ enum Command {
         /// Listen on an address that is not loopback, behind a relay you run.
         #[arg(long)]
         allow_non_loopback: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EmbedSubcommand {
+    Serve {
+        #[arg(default_value = "127.0.0.1:8090")]
+        listen: SocketAddr,
+        #[arg(long)]
+        allow_non_loopback: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ShipSubcommand {
+    Transcripts {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long, env = "FLEET_RECALL_URL")]
+        url: String,
+        #[arg(long)]
+        instance: String,
+        #[arg(long, default_value = "claude-code", value_parser = ["claude-code", "codex"])]
+        format: String,
+        #[arg(long)]
+        ca_path: Option<PathBuf>,
+        #[arg(long)]
+        once: bool,
     },
 }
 
@@ -402,7 +453,11 @@ impl Command {
             Self::Ingress { .. } => RuntimeDatabaseIdentity::Ingress,
             Self::Enroll { .. } => RuntimeDatabaseIdentity::Enrollment,
             Self::Migrate => RuntimeDatabaseIdentity::Migrator,
-            Self::ModelDigest { .. } => RuntimeDatabaseIdentity::None,
+            Self::ModelDigest { .. }
+            | Self::Shim { .. }
+            | Self::Embed { .. }
+            | Self::Launch { .. }
+            | Self::Ship { .. } => RuntimeDatabaseIdentity::None,
             Self::Serve { .. }
             | Self::Health
             | Self::Ingest { .. }
@@ -452,6 +507,64 @@ impl IngestRole {
     }
 }
 
+async fn run_without_database(command: Command) -> anyhow::Result<()> {
+    match command {
+        Command::Ship {
+            command:
+                ShipSubcommand::Transcripts {
+                    dir,
+                    url,
+                    instance,
+                    format,
+                    ca_path,
+                    once,
+                },
+        } => {
+            let token =
+                std::env::var("FLEET_RECALL_TOKEN").context("FLEET_RECALL_TOKEN is required")?;
+            let format = match format.as_str() {
+                "codex" => ostk_fleet_recall::connectors::transcript::TranscriptFormat::Codex,
+                _ => ostk_fleet_recall::connectors::transcript::TranscriptFormat::ClaudeCode,
+            };
+            let report = ostk_fleet_recall::transcripts::ship_transcripts(
+                ostk_fleet_recall::transcripts::ShipperConfig {
+                    dir,
+                    url,
+                    instance,
+                    format,
+                    token,
+                    ca_path,
+                    once,
+                },
+            )
+            .await?;
+            eprintln!("{}", serde_json::to_string(&report)?);
+        }
+        Command::Launch { command } => {
+            ostk_fleet_recall::launch::run_launch_command(command).await?;
+        }
+        Command::ModelDigest { bundle } => println!("{}", model_bundle_sha256(&bundle)?),
+        Command::Shim { url, allow_http } => {
+            let token =
+                std::env::var("FLEET_RECALL_TOKEN").context("FLEET_RECALL_TOKEN is required")?;
+            ostk_fleet_recall::shim::Shim::new(&url, &token, allow_http)?
+                .serve(tokio::io::stdin(), tokio::io::stdout())
+                .await?;
+        }
+        Command::Embed {
+            command:
+                EmbedSubcommand::Serve {
+                    listen,
+                    allow_non_loopback,
+                },
+        } => {
+            run_embedding_server(validate_listen(listen, allow_non_loopback)?).await?;
+        }
+        _ => unreachable!("command identity was classified before configuration load"),
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     tracing_subscriber::fmt()
@@ -464,12 +577,7 @@ async fn main() -> anyhow::Result<ExitCode> {
 
     let cli = Cli::parse();
     match cli.command.runtime_database_identity() {
-        RuntimeDatabaseIdentity::None => {
-            let Command::ModelDigest { bundle } = cli.command else {
-                unreachable!("only model-digest is configuration-free")
-            };
-            println!("{}", model_bundle_sha256(&bundle)?);
-        }
+        RuntimeDatabaseIdentity::None => run_without_database(cli.command).await?,
         RuntimeDatabaseIdentity::Publication => {
             let config = PublicationConfig::from_env()?;
             let Command::Demo { listen } = cli.command else {
@@ -539,6 +647,10 @@ async fn main() -> anyhow::Result<ExitCode> {
                 Command::Demo { .. }
                 | Command::Migrate
                 | Command::ModelDigest { .. }
+                | Command::Shim { .. }
+                | Command::Embed { .. }
+                | Command::Launch { .. }
+                | Command::Ship { .. }
                 | Command::Enroll { .. }
                 | Command::Ingress { .. } => {
                     unreachable!("command identity was classified before configuration load")
@@ -617,7 +729,7 @@ fn validated_migration_model_identity(config: &FleetConfig) -> anyhow::Result<St
 }
 
 async fn run_health(config: &FleetConfig) -> anyhow::Result<()> {
-    config.verify_embedding_model_bundle()?;
+    load_pinned_embedder(config)?;
     let store = connect_store(config).await?;
     store.health_check().await?;
     let expected_model = config.embedding_model_identity();
@@ -749,18 +861,29 @@ async fn run_http(config: FleetConfig, listen: SocketAddr) -> anyhow::Result<()>
     };
     let remote = RemoteConfig::from_env()?;
     let embedder = Arc::new(load_pinned_embedder(&config)?);
+    let embedding_tier = embedder.remote.clone();
     let store = connect_store(&config).await?;
     store.health_check().await?;
     let pool = store.pool().clone();
     ostk_fleet_recall::auth::grant::probe_remote_plane(&pool).await?;
-    let services = Arc::new(ScopeServices::new(
-        config,
-        pool.clone(),
-        embedder,
-        remote.scope_cache_max,
-        remote.agent_cache_max,
-    )?);
-    let backend = Arc::new(RemoteBackend::new(&remote, pool, services)?);
+    let services = Arc::new(
+        ScopeServices::new(
+            config,
+            pool.clone(),
+            embedder,
+            remote.scope_cache_max,
+            remote.agent_cache_max,
+        )?
+        .with_embedding_tier(embedding_tier),
+    );
+    let mut backend = RemoteBackend::new(&remote, pool, services)?;
+    if let Some(path) = std::env::var_os("FLEET_RECALL_TRANSCRIPT_SPOOL_DIR") {
+        let receiver = ostk_fleet_recall::transcripts::TranscriptReceiver::new(
+            ostk_fleet_recall::transcripts::TranscriptReceiverConfig::new(PathBuf::from(path)),
+        )?;
+        backend = backend.with_transcript_receiver(Arc::new(receiver));
+    }
+    let backend = Arc::new(backend);
     let router = http::router(remote.http, backend)?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -826,10 +949,13 @@ async fn run_enroll(config: &EnrollmentConfig, command: EnrollSubcommand) -> any
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Keep ordered capability and authority gates together.
 async fn build_memory_service(
     config: &FleetConfig,
 ) -> anyhow::Result<(Arc<CockroachMemoryService>, Arc<CockroachStore>)> {
-    let embedder: Arc<dyn ChunkEmbedder> = Arc::new(load_pinned_embedder(config)?);
+    let loaded = load_pinned_embedder(config)?;
+    let embedding_tier = loaded.remote.clone();
+    let embedder: Arc<dyn ChunkEmbedder> = Arc::new(loaded);
     let store = Arc::new(connect_store(config).await?);
     store.health_check().await?;
     // One schema snapshot, read once, feeds every startup capability probe.
@@ -907,7 +1033,8 @@ async fn build_memory_service(
     // `enabled` capture projects what it admits in the call, embedding with
     // the same pinned model the worker's embed step uses; a provider that
     // cannot be built leaves the dense rows to the worker, never stops serve.
-    let capture_embedding = capture_embedding_provider(embedder.clone(), config);
+    let capture_embedding =
+        capture_embedding_provider(embedder.clone(), config, embedding_tier.clone());
     let (capture, capture_status) = start_collected_capture(
         store.pool().clone(),
         &capabilities,
@@ -924,6 +1051,7 @@ async fn build_memory_service(
         Arc::new(ledger),
         embedder,
     )?
+    .with_embedding_tier(embedding_tier)
     .with_assert_status(assert_status)
     .with_capture(capture, capture_status);
     if let Some(evidence) = evidence {
@@ -985,7 +1113,13 @@ fn log_remember_serving(
 fn capture_embedding_provider(
     embedder: Arc<dyn ChunkEmbedder>,
     config: &FleetConfig,
+    remote: Option<Arc<ostk_fleet_recall::embed_tier::remote::RemoteClient>>,
 ) -> Option<Arc<dyn EmbeddingProvider>> {
+    if let Some(client) = remote {
+        return Some(Arc::new(
+            ostk_fleet_recall::embed_tier::remote::RemoteEmbeddingProvider::new(client),
+        ));
+    }
     let provider = Sha256Digest::from_str(&config.embedding_model_sha256)
         .map_err(|error| error.to_string())
         .and_then(|digest| {
@@ -1126,7 +1260,9 @@ async fn start_claim_item_links(
 async fn build_publication_service(
     config: &PublicationConfig,
 ) -> anyhow::Result<(Arc<CockroachMemoryService>, Arc<CockroachStore>)> {
-    let embedder: Arc<dyn ChunkEmbedder> = Arc::new(load_pinned_embedder(config)?);
+    let loaded = load_pinned_embedder(config)?;
+    let embedding_tier = loaded.remote.clone();
+    let embedder: Arc<dyn ChunkEmbedder> = Arc::new(loaded);
     let store = Arc::new(connect_publication_store(config).await?);
     store.health_check().await?;
     let ledger = Arc::new(CockroachClaimLedger::new(
@@ -1136,12 +1272,15 @@ async fn build_publication_service(
         RetryPolicy::default(),
     )?);
     // The public reader withholds every asserted claim (ADR 0005 D8).
-    let service = Arc::new(CockroachMemoryService::publication(
-        config.default_scope().clone(),
-        store.clone(),
-        ledger,
-        embedder,
-    )?);
+    let service = Arc::new(
+        CockroachMemoryService::publication(
+            config.default_scope().clone(),
+            store.clone(),
+            ledger,
+            embedder,
+        )?
+        .with_embedding_tier(embedding_tier),
+    );
     service.verify_embedding_generation().await?;
     Ok((service, store))
 }
@@ -1857,7 +1996,80 @@ impl PinnedEmbeddingConfig for PublicationConfig {
     }
 }
 
-fn load_pinned_embedder(config: &impl PinnedEmbeddingConfig) -> anyhow::Result<PinnedEmbedder> {
+impl PinnedEmbeddingConfig for ostk_fleet_recall::config::EmbeddingModelConfig {
+    fn verified_bundle_path(&self) -> ostk_fleet_recall::Result<PathBuf> {
+        self.verify_embedding_model_bundle()
+    }
+    fn pinned_model_identity(&self) -> String {
+        self.embedding_model_identity()
+    }
+}
+
+struct LoadedEmbedder {
+    inner: Arc<dyn ChunkEmbedder>,
+    remote: Option<Arc<ostk_fleet_recall::embed_tier::remote::RemoteClient>>,
+}
+impl ChunkEmbedder for LoadedEmbedder {
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        self.inner.encode_batch(texts)
+    }
+}
+
+fn load_pinned_embedder(config: &impl PinnedEmbeddingConfig) -> anyhow::Result<LoadedEmbedder> {
+    use ostk_fleet_recall::embed_tier::{
+        config::RemoteConfig,
+        remote::{RemoteClient, RemoteEmbedder},
+    };
+    if let Some(remote_config) = RemoteConfig::from_env()? {
+        let identity = config.pinned_model_identity();
+        let descriptor = model_descriptor(&identity)?;
+        let client = RemoteClient::connect_sync(remote_config, descriptor, identity)?;
+        return Ok(LoadedEmbedder {
+            inner: Arc::new(RemoteEmbedder::new(client.clone())),
+            remote: Some(client),
+        });
+    }
+    Ok(LoadedEmbedder {
+        inner: Arc::new(load_local_pinned_embedder(config)?),
+        remote: None,
+    })
+}
+
+fn model_descriptor(identity: &str) -> anyhow::Result<ostk_fleet_recall::embed_tier::Descriptor> {
+    let (_, digest) = identity
+        .rsplit_once("@sha256:")
+        .context("model identity is missing its digest")?;
+    Ok(ostk_fleet_recall::embed_tier::Descriptor::pinned(
+        Sha256Digest::from_str(digest)?,
+    ))
+}
+
+async fn run_embedding_server(listen: SocketAddr) -> anyhow::Result<()> {
+    let config = ostk_fleet_recall::config::EmbeddingModelConfig::from_env()?;
+    let descriptor = model_descriptor(&config.embedding_model_identity())?;
+    let embedder = Arc::new(load_local_pinned_embedder(&config)?);
+    let token = std::env::var(ostk_fleet_recall::embed_tier::config::TIER_TOKEN_ENV).ok();
+    let router = ostk_fleet_recall::embed_tier::server::router(embedder, descriptor, token)?;
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .context("bind embedding service")?;
+    tracing::info!(address = %listener.local_addr()?, "pinned embedding service listening");
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("serve embedding service")?;
+    Ok(())
+}
+
+fn load_local_pinned_embedder(
+    config: &impl PinnedEmbeddingConfig,
+) -> anyhow::Result<PinnedEmbedder> {
     let canonical = config.verified_bundle_path()?;
     let local_path = canonical.to_str().ok_or_else(|| {
         anyhow::anyhow!("embedding model bundle path must be valid UTF-8 for model2vec")
@@ -2130,7 +2342,7 @@ fn embed_chunks(
     chunks: &[Chunk],
     scope: &FleetScope,
     model_identity: &str,
-    embedder: &PinnedEmbedder,
+    embedder: &dyn ChunkEmbedder,
 ) -> anyhow::Result<Vec<ScopedChunk>> {
     let mut rows = Vec::with_capacity(chunks.len());
     for batch in chunks.chunks(EMBED_BATCH_SIZE) {
@@ -2289,6 +2501,47 @@ mod tests {
         assert!(!claim_only.surface.allows(RememberAction::Acknowledge));
         assert!(!claim_only.surface.allows(RememberAction::Dismiss));
         assert!(!claim_only.lifecycle_overlay);
+    }
+
+    #[test]
+    fn thin_commands_do_not_select_database_credentials() {
+        for args in [
+            vec!["ostk-fleet-recall", "embed", "serve", "127.0.0.1:8090"],
+            vec![
+                "ostk-fleet-recall",
+                "shim",
+                "--url",
+                "https://recall.example/mcp",
+            ],
+            vec![
+                "ostk-fleet-recall",
+                "ship",
+                "transcripts",
+                "--dir",
+                "/transcripts",
+                "--url",
+                "https://recall.example/mcp",
+                "--instance",
+                "sandbox",
+                "--format",
+                "codex",
+            ],
+            vec![
+                "ostk-fleet-recall",
+                "launch",
+                "down",
+                "--state",
+                "launch-state.json",
+            ],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args)
+                    .unwrap()
+                    .command
+                    .runtime_database_identity(),
+                RuntimeDatabaseIdentity::None
+            );
+        }
     }
 
     #[test]

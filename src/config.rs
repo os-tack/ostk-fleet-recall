@@ -1113,8 +1113,8 @@ pub struct FleetConfig {
     pub max_connections: u32,
     /// Stable logical model name used in the embedding registry.
     pub embedding_model: String,
-    /// Baked, local model2vec bundle. Runtime code never resolves the logical
-    /// model name through a remote registry.
+    /// Baked, local model2vec bundle; empty when a pinned embedding tier is
+    /// configured. Runtime never resolves the logical name through a registry.
     pub embedding_model_path: PathBuf,
     pub embedding_model_sha256: String,
     pub lifecycle: LifecycleConfig,
@@ -1568,6 +1568,56 @@ impl FleetConfig {
     }
 }
 
+/// Model-only configuration for the database-free embedding service.
+pub struct EmbeddingModelConfig {
+    model: String,
+    path: PathBuf,
+    digest: String,
+}
+
+impl EmbeddingModelConfig {
+    pub fn from_env() -> Result<Self> {
+        let mut lookup = |name: &str| std::env::var(name).ok();
+        let model = lookup("FLEET_RECALL_EMBEDDING_MODEL")
+            .unwrap_or_else(|| "minishlab/potion-retrieval-32M".into());
+        let path = PathBuf::from(required_from(
+            &mut lookup,
+            "FLEET_RECALL_EMBEDDING_MODEL_PATH",
+        )?);
+        let digest =
+            required_from(&mut lookup, "FLEET_RECALL_EMBEDDING_MODEL_SHA256")?.to_ascii_lowercase();
+        if model.trim().is_empty()
+            || model.len() > 256
+            || model.chars().any(char::is_control)
+            || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(FleetError::Configuration(
+                "invalid pinned embedding model configuration".into(),
+            ));
+        }
+        Ok(Self {
+            model,
+            path,
+            digest,
+        })
+    }
+
+    pub fn embedding_model_identity(&self) -> String {
+        format!("{}@sha256:{}", self.model, self.digest)
+    }
+
+    pub fn verify_embedding_model_bundle(&self) -> Result<PathBuf> {
+        let path = canonical_model_bundle_path(&self.path)?;
+        if model_bundle_sha256_at(&path)? != self.digest {
+            return Err(FleetError::Configuration(
+                "embedding model bundle digest mismatch".into(),
+            ));
+        }
+        Ok(path)
+    }
+}
+
 fn fleet_config_from_lookup(
     database_url: String,
     database_ssl_policy: PrivatePostgresSslPolicy,
@@ -1590,10 +1640,15 @@ fn fleet_config_from_lookup(
         })?;
     let embedding_model = lookup("FLEET_RECALL_EMBEDDING_MODEL")
         .unwrap_or_else(|| "minishlab/potion-retrieval-32M".into());
-    let embedding_model_path = PathBuf::from(required_from(
-        &mut lookup,
-        "FLEET_RECALL_EMBEDDING_MODEL_PATH",
-    )?);
+    let embedding_model_path =
+        if lookup("FLEET_RECALL_EMBEDDING_TIER_URL").is_some_and(|value| !value.is_empty()) {
+            PathBuf::from(lookup("FLEET_RECALL_EMBEDDING_MODEL_PATH").unwrap_or_default())
+        } else {
+            PathBuf::from(required_from(
+                &mut lookup,
+                "FLEET_RECALL_EMBEDDING_MODEL_PATH",
+            )?)
+        };
     let embedding_model_sha256 = required_from(&mut lookup, "FLEET_RECALL_EMBEDDING_MODEL_SHA256")?;
     let lifecycle = LifecycleConfig {
         remember_lifecycle: match lookup("FLEET_RECALL_REMEMBER_LIFECYCLE").as_deref() {

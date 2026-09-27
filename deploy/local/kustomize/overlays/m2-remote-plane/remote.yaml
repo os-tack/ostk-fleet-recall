@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recall
+  namespace: fleet-recall
+  labels:
+    app: recall
+    fleet-recall.dev/phase: remote
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: recall
+  template:
+    metadata:
+      labels:
+        app: recall
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: /metrics
+    spec:
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        runAsNonRoot: true
+      containers:
+        - name: recall
+          image: ostk-fleet-recall:__IMAGE_TAG__
+          imagePullPolicy: IfNotPresent
+          args: [serve, --http, "0.0.0.0:8080", --allow-non-loopback]
+          envFrom:
+            - configMapRef: {name: fleet-env}
+            - secretRef: {name: db-url-writer}
+            - secretRef: {name: fleet-pins}
+            - secretRef: {name: fleet-content-kek}
+            - secretRef: {name: fleet-remote}
+          env:
+            - {name: FLEET_RECALL_METRICS_LISTEN, value: "0.0.0.0:9100"}
+            - {name: FLEET_RECALL_METRICS_ALLOW_NON_LOOPBACK, value: "true"}
+            - {name: FLEET_RECALL_RESOURCE_URL, value: "http://localhost:8080/mcp"}
+            - {name: FLEET_RECALL_OIDC_ISSUERS, value: "hydra=http://localhost:4444/,k8s=https://kubernetes.default.svc"}
+            - {name: FLEET_RECALL_OIDC_SCOPE_SUBSTITUTES, value: "hydra=fleet-recall"}
+            - {name: FLEET_RECALL_OIDC_LOCAL_TRANSPORTS, value: "hydra=http://hydra-public.ory.svc.cluster.local:4444/"}
+            - {name: FLEET_RECALL_OIDC_CA_PATH, value: /etc/kubernetes/ca.crt}
+            - {name: FLEET_RECALL_LOCAL_KEY_ANCHOR_PATH, value: /etc/recall/launcher-keys.json}
+            - {name: FLEET_RECALL_EMBEDDING_TIER_URL, value: "http://embed:8090"}
+            - {name: FLEET_RECALL_TRANSCRIPT_SPOOL_DIR, value: /var/lib/recall/transcripts}
+          ports:
+            - {name: mcp, containerPort: 8080}
+            - {name: metrics, containerPort: 9100}
+          readinessProbe:
+            httpGet: {path: /healthz, port: mcp}
+          livenessProbe:
+            httpGet: {path: /healthz, port: mcp}
+            initialDelaySeconds: 30
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: crdb-ca, mountPath: /etc/crdb, readOnly: true}
+            - {name: cluster-ca, mountPath: /etc/kubernetes, readOnly: true}
+            - {name: launcher-keys, mountPath: /etc/recall, readOnly: true}
+            - {name: transcripts, mountPath: /var/lib/recall/transcripts}
+      volumes:
+        - name: crdb-ca
+          secret: {secretName: crdb-ca}
+        - name: cluster-ca
+          configMap: {name: kube-root-ca.crt}
+        - name: launcher-keys
+          configMap: {name: fleet-launcher-keys}
+        - name: transcripts
+          persistentVolumeClaim: {claimName: fleet-transcripts}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recall
+  namespace: fleet-recall
+  labels:
+    app: recall
+    fleet-recall.dev/phase: remote
+spec:
+  type: NodePort
+  selector: {app: recall}
+  ports:
+    - {name: mcp, port: 8080, targetPort: mcp, nodePort: 30080}

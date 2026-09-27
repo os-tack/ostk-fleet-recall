@@ -1,7 +1,7 @@
 //! MCP stdio and Streamable HTTP transports for `recall` and `remember`.
 
 pub mod http;
-mod protocol;
+pub(crate) mod protocol;
 pub mod scopes;
 mod server;
 mod tools;

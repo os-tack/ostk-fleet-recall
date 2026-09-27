@@ -2,6 +2,51 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt as _};
+
+/// A bounded newline-delimited frame. Oversized input is drained to its next
+/// newline so a subsequent valid request remains independently readable.
+pub enum Frame {
+    Data(Vec<u8>),
+    Oversize,
+}
+
+pub async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Frame>> {
+    let mut frame = Vec::with_capacity(8_192);
+    let mut oversize = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if frame.is_empty() && !oversize {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if !oversize {
+            let remaining = super::server::MAX_MCP_FRAME_BYTES
+                .saturating_add(1)
+                .saturating_sub(frame.len());
+            frame.extend_from_slice(&available[..take.min(remaining)]);
+            oversize = frame.len() > super::server::MAX_MCP_FRAME_BYTES;
+        }
+        reader.consume(take);
+        if newline.is_some() {
+            break;
+        }
+    }
+    if oversize {
+        return Ok(Some(Frame::Oversize));
+    }
+    if frame.last() == Some(&b'\n') {
+        frame.pop();
+        if frame.last() == Some(&b'\r') {
+            frame.pop();
+        }
+    }
+    Ok(Some(Frame::Data(frame)))
+}
 
 pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 pub const PROTOCOL_VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";

@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: embed
+  namespace: fleet-recall
+  labels:
+    app: embed
+    fleet-recall.dev/phase: remote
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: embed}
+  template:
+    metadata:
+      labels: {app: embed}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: /metrics
+    spec:
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      containers:
+        - name: embed
+          image: ostk-fleet-recall:__IMAGE_TAG__
+          imagePullPolicy: IfNotPresent
+          args: [embed, serve, "0.0.0.0:8090", --allow-non-loopback]
+          env:
+            - {name: FLEET_RECALL_METRICS_LISTEN, value: "0.0.0.0:9100"}
+            - {name: FLEET_RECALL_METRICS_ALLOW_NON_LOOPBACK, value: "true"}
+            - {name: FLEET_RECALL_EMBEDDING_MODEL, value: minishlab/potion-retrieval-32M}
+            - {name: FLEET_RECALL_EMBEDDING_MODEL_PATH, value: /opt/ostk/models/potion-retrieval-32M}
+            - {name: FLEET_RECALL_EMBEDDING_MODEL_SHA256, value: __MODEL_SHA256__}
+            - name: FLEET_RECALL_EMBEDDING_TIER_TOKEN
+              valueFrom:
+                secretKeyRef: {name: fleet-remote, key: FLEET_RECALL_EMBEDDING_TIER_TOKEN}
+          ports:
+            - {name: embed, containerPort: 8090}
+            - {name: metrics, containerPort: 9100}
+          readinessProbe:
+            tcpSocket: {port: embed}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+          volumeMounts:
+            - {name: model, mountPath: /opt/ostk/models/potion-retrieval-32M, readOnly: true}
+      volumes:
+        - name: model
+          hostPath:
+            path: __MODEL_BUNDLE_DIR__
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: embed
+  namespace: fleet-recall
+  labels:
+    fleet-recall.dev/phase: remote
+spec:
+  selector: {app: embed}
+  ports:
+    - {name: embed, port: 8090, targetPort: embed}

@@ -523,7 +523,7 @@ fn malformed(source_id: &str, line_ordinal: u32, reason: &'static str) -> Transc
 /// words, in order, and not its layout. A consumer that needs the original
 /// layout or bytes must go back to the source span the turn carries, which
 /// names the exact raw bytes it came from.
-fn normalize(raw: &str) -> String {
+pub(super) fn normalize(raw: &str) -> String {
     let mut normalized = String::with_capacity(raw.len());
     let mut pending_space = false;
     for character in raw.nfc() {
@@ -566,7 +566,7 @@ fn extract_text(content: Option<&TranscriptContentV1>) -> String {
 /// Convert a provider RFC-3339 timestamp into the exact canonical wire form,
 /// truncated to microseconds so it survives a `TIMESTAMPTZ` round trip (the
 /// EVID-03 alignment the admission seam requires).
-fn canonical_micros(raw: &str) -> Option<CanonicalTimestamp> {
+pub(super) fn canonical_micros(raw: &str) -> Option<CanonicalTimestamp> {
     let parsed = chrono::DateTime::parse_from_rfc3339(raw)
         .ok()?
         .with_timezone(&chrono::Utc);
@@ -768,7 +768,7 @@ fn classify_line(context: &LineContext<'_>, line: &[u8]) -> TranscriptConnectorR
 /// A source larger than the batch bound, or one that has SHRUNK below the
 /// offset the cursor already covers, is refused whole: a partial parse of
 /// either would renumber the turns that follow.
-fn bounded_resume_offset(
+pub(super) fn bounded_resume_offset(
     source_id: &str,
     bytes: &[u8],
     resume_from: u64,
